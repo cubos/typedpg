@@ -816,7 +816,8 @@ fn analyze_select_here(
         not_dummy,
         snapshot,
     );
-    set_planned_top(sel, &scope, &mut columns);
+    summary.scan_facts = scan_facts(sel, &scope, &columns, snapshot);
+    set_planned_top(sel, &scope, &mut columns, snapshot);
     set_level_summary(summary);
     Ok((columns, None))
 }
@@ -928,7 +929,17 @@ pub(crate) fn removable_scan(
     }
     while let Some(n) = todo.pop() {
         match n {
-            typedpg_pg_query::NodeRef::FuncCall(fc) if fc.over.is_some() => return false,
+            // A window's PARTITION BY / ORDER BY keys (an `OVER ()` has none).
+            typedpg_pg_query::NodeRef::FuncCall(fc)
+                if fc.over.as_ref().is_some_and(|w| {
+                    !w.partition_clause.is_empty()
+                        || !w.order_clause.is_empty()
+                        || !w.refname.is_empty()
+                        || !w.name.is_empty()
+                }) =>
+            {
+                return false;
+            }
             typedpg_pg_query::NodeRef::RangeVar(rv) => {
                 if rv.schemaname.is_empty() && cte(&rv.relname) {
                     return false;
@@ -976,11 +987,15 @@ fn reads_partitioned(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) -> boo
 
 /// What an output of a query level is to `trivial_subqueryscan`.
 enum TopOutput<'a> {
-    /// A Var of a FROM entry of the level.
+    /// A Var of a FROM entry of the level (or a same-type cast of one,
+    /// which parse analysis drops).
     Var(&'a ScopeColumn),
+    /// An expression planning certainly folds to a Var of a FROM entry of
+    /// the level (a CASE whose branch is decided by constants): a Var in
+    /// the plan, though not as parsed.
+    FoldedVar(&'a ScopeColumn),
     /// An expression planning may reduce to a Var (a CASE or COALESCE it
-    /// folds, a same-type cast, which parse analysis drops) of one of
-    /// these FROM entries' columns.
+    /// folds) of one of these FROM entries' columns.
     MaybeVar(Vec<&'a ScopeColumn>),
     /// Never a Var of the level.
     Other,
@@ -992,23 +1007,50 @@ enum TopOutput<'a> {
 /// nothing else, with no clause that adds a plan node or a qual above the
 /// SubqueryScan, setrefs removes the scan (`trivial_subqueryscan`) and the
 /// subquery's own target list, with the collations planning gave it, is
-/// the plan's. Where the scan certainly stays, a Var of it keeps its parsed
-/// collation; where the analyzer can't tell, the collation is unknown.
-fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [RawColumn]) {
+/// the plan's. Where the scan certainly stays, or a plan node certainly
+/// sits above it, a Var of it keeps its parsed collation; where the
+/// analyzer can't tell, the collation is unknown.
+fn set_planned_top(
+    sel: &protobuf::SelectStmt,
+    scope: &Scope,
+    columns: &mut [RawColumn],
+    snapshot: &PgCatalog,
+) {
     use crate::expr::Planned;
+    use crate::expr::plan_fold::Folded;
+    use crate::scope::ScanVar;
     let local = |c: &ScopeColumn| {
         scope
             .sources
             .iter()
             .any(|s| s.columns.iter().any(|x| std::ptr::eq(x, c)))
     };
+    // The SubqueryScan column a column of the level's entries is a Var of:
+    // a subquery's planned on its own, or (pulled up) one's Var of such a
+    // scan.
+    let scan_of = |c: &ScopeColumn| -> Option<ScanVar> {
+        if let Some(sv) = c.deferred.scan_var {
+            return Some(sv);
+        }
+        if !c.deferred.subquery_scan {
+            return None;
+        }
+        scope.sources.iter().find_map(|s| {
+            let index = s.columns.iter().position(|x| std::ptr::eq(x, c))?;
+            Some(ScanVar {
+                index,
+                len: s.columns.len(),
+                planned_top: c.deferred.planned_top,
+                facts: c.deferred.scan_facts,
+            })
+        })
+    };
     // Nothing to do unless a column of the level's entries is a subquery's.
-    if !scope
-        .sources
-        .iter()
-        .flat_map(|s| &s.columns)
-        .any(|c| c.deferred.planned_top.is_some() || c.deferred.subquery_scan)
-    {
+    if !scope.sources.iter().flat_map(|s| &s.columns).any(|c| {
+        c.deferred.planned_top.is_some()
+            || c.deferred.subquery_scan
+            || c.deferred.scan_var.is_some()
+    }) {
         return;
     }
     let differs = |c: &ScopeColumn| c.deferred.planned_top.is_some_and(|p| p != c.planned());
@@ -1061,6 +1103,17 @@ fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [Raw
             },
             _ => {
                 let i = outputs.len();
+                if let Some((folded, c)) = folds_to_column(val, scope, snapshot)
+                    && local(c)
+                    && columns.get(i).is_some_and(|o| o.type_oid == c.type_oid)
+                {
+                    outputs.push(if folded {
+                        TopOutput::FoldedVar(c)
+                    } else {
+                        TopOutput::Var(c)
+                    });
+                    continue;
+                }
                 let mut cols = Vec::new();
                 let mut todo: Vec<_> = val.node.as_ref().map(|n| n.to_ref()).into_iter().collect();
                 while let Some(n) = todo.pop() {
@@ -1129,7 +1182,24 @@ fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [Raw
     );
     let no_limit = count == Some(None) && matches!(offset, Some(None | Some(0)));
     let limit_node = matches!(count, Some(Some(_))) || matches!(offset, Some(Some(o)) if o != 0);
-    let no_clauses = sel.where_clause.is_none()
+    // What preprocessing makes of the WHERE clause: a TRUE constant is
+    // dropped; a FALSE (or NULL) one makes the relation a dummy one, a
+    // Result over the level's Vars; a qual that is no constant (one no
+    // custom plan's parameter values or sublink may turn into one) stays
+    // above the scan, unless pushed down into the subquery.
+    let where_fold = sel.where_clause.as_deref().map(|w| {
+        let fixed = !contains_node(w, &|n| {
+            matches!(
+                n,
+                typedpg_pg_query::NodeRef::ParamRef(_) | typedpg_pg_query::NodeRef::SubLink(_)
+            )
+        });
+        (crate::expr::plan_fold::fold_qual(w, snapshot), fixed)
+    });
+    let where_none = matches!(where_fold, None | Some((Folded::Bool(true), _)));
+    let where_false = matches!(where_fold, Some((Folded::Bool(false), _)));
+    let where_var = matches!(where_fold, Some((Folded::Var, true)));
+    let no_clauses = where_none
         && sel.group_clause.is_empty()
         && sel.having_clause.is_none()
         && sel.distinct_clause.is_empty()
@@ -1137,14 +1207,137 @@ fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [Raw
         && no_limit
         && sel.locking_clause.is_empty()
         && sel.window_clause.is_empty();
-    if let Some(src) = single {
+    let scan = |o: &TopOutput<'_>| match o {
+        TopOutput::Var(v) | TopOutput::FoldedVar(v) => scan_of(v),
+        _ => None,
+    };
+    // Where the scan certainly stays, or a plan node sits above it: a Var
+    // of it is the plan's as parsed (as long as this level is the top:
+    // pulled up, see `RawColumn::scan_stays`); a folded one is what the
+    // level's own folding makes of it.
+    let keep = |columns: &mut [RawColumn], outputs: &[TopOutput<'_>]| {
+        for (col, o) in columns.iter_mut().zip(outputs) {
+            col.planned_top = match o {
+                TopOutput::Var(_) if scan(o).is_some() => {
+                    col.scan_stays = true;
+                    Some(Planned::AsParsed)
+                }
+                TopOutput::Var(v) | TopOutput::FoldedVar(v) if differs(v) => Some(Planned::Unknown),
+                TopOutput::MaybeVar(cs) if cs.iter().any(|c| differs(c)) => Some(Planned::Unknown),
+                _ => None,
+            };
+        }
+    };
+    if single.is_some()
+        && let Some(first) = outputs.iter().find_map(&scan)
+    {
+        // The level reads a SubqueryScan (pulled up, the level reading
+        // this one reads it, with this target list: no qual of this
+        // level's is left above it).
+        if where_none {
+            for (col, o) in columns.iter_mut().zip(&outputs) {
+                if let TopOutput::Var(v) = o {
+                    col.scan_var = scan_of(v);
+                }
+            }
+        }
+        let (len, facts) = (first.len, first.facts);
+        // The WHERE reads nothing but the scan's Vars: no pulled-up
+        // expression a substitution may fold.
+        let where_reads_scan = sel.where_clause.as_deref().is_some_and(|w| {
+            !contains_node(w, &|n| match n {
+                typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                    column_ref_target(cr, scope).is_none_or(|c| !local(c) || scan_of(c).is_none())
+                }
+                _ => false,
+            })
+        });
+        let trivial = outputs.len() == len
+            && outputs
+                .iter()
+                .enumerate()
+                .all(|(i, o)| scan(o).is_some_and(|sv| sv.index == i && sv.len == len));
+        if trivial && no_clauses && !facts.kept {
+            // The scan is trivial: removed where the subquery allows it.
+            for (col, o) in columns.iter_mut().zip(&outputs) {
+                col.planned_top = scan(o).and_then(|sv| sv.planned_top);
+            }
+            return;
+        }
+        // An ORDER BY on the scan's Vars sorts them in a Sort node above
+        // the scan, unless a path of the subquery is sorted already, or
+        // a WHERE equates a key to a constant (or is pushed down into the
+        // subquery, which may then sort).
+        let key_is_var = |k: &protobuf::Node| match k.node.as_ref() {
+            Some(node::Node::AConst(protobuf::AConst {
+                val: Some(protobuf::a_const::Val::Ival(i)),
+                ..
+            })) => usize::try_from(i.ival)
+                .ok()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| outputs.get(i))
+                .is_some_and(|o| scan(o).is_some()),
+            Some(node::Node::ColumnRef(cr)) => {
+                let by_name = match cr.fields.as_slice() {
+                    [f] => match f.node.as_ref() {
+                        Some(node::Node::String(s)) => {
+                            let named: Vec<_> = columns
+                                .iter()
+                                .zip(&outputs)
+                                .filter(|(c, _)| c.name == s.sval)
+                                .collect();
+                            (!named.is_empty())
+                                .then(|| named.iter().all(|(_, o)| scan(o).is_some()))
+                        }
+                        _ => Some(false),
+                    },
+                    _ => None,
+                };
+                by_name.unwrap_or_else(|| {
+                    column_ref_target(cr, scope).is_some_and(|c| local(c) && scan_of(c).is_some())
+                })
+            }
+            _ => false,
+        };
+        let sorted = !sel.sort_clause.is_empty()
+            && facts.unsorted
+            && sel.where_clause.is_none()
+            && sel.group_clause.is_empty()
+            && sel.having_clause.is_none()
+            && sel.distinct_clause.is_empty()
+            && sel.window_clause.is_empty()
+            && sel.sort_clause.iter().all(|s| match s.node.as_ref() {
+                Some(node::Node::SortBy(sb)) => sb.node.as_deref().is_some_and(key_is_var),
+                _ => false,
+            });
+        // trivial_subqueryscan requires a target list as long as the
+        // subquery's, of its Vars in order (or Consts equal to its
+        // entries), and no qual on the scan; a dummy relation, or a node
+        // above the scan (LockRows, Limit, Sort, a Result gating a FALSE
+        // qual), has the Vars in its own target list.
+        let stays = outputs.len() != len
+            || outputs
+                .iter()
+                .enumerate()
+                .any(|(i, o)| scan(o).is_some_and(|sv| sv.index != i || sv.len != len))
+            || facts.kept
+            || !sel.locking_clause.is_empty()
+            || limit_node
+            || where_false
+            || (where_var && facts.no_pushdown && where_reads_scan)
+            || sorted;
+        if stays {
+            keep(columns, &outputs);
+            return;
+        }
+    } else if let Some(src) = single {
         let all_vars_in_order = outputs.len() == src.columns.len()
             && outputs.iter().zip(&src.columns).all(|(o, c)| match o {
                 TopOutput::Var(v) => std::ptr::eq(*v, c),
                 _ => false,
             });
         if all_vars_in_order && no_clauses {
-            // The scan is trivial: removed where the subquery allows it.
+            // A pulled-up subquery: its own top level's collations.
             for (col, o) in columns.iter_mut().zip(&outputs) {
                 if let TopOutput::Var(v) = o {
                     col.planned_top = v.deferred.planned_top;
@@ -1152,39 +1345,21 @@ fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [Raw
             }
             return;
         }
-        // trivial_subqueryscan requires a target list as long as the
-        // subquery's, of its Vars in order (or Consts equal to its
-        // entries); a LockRows or Limit node above the scan keeps it too.
-        let stays = outputs.len() != src.columns.len()
-            || outputs.iter().enumerate().any(|(i, o)| match o {
-                TopOutput::Var(v) => src.columns.get(i).is_none_or(|c| !std::ptr::eq(*v, c)),
-                _ => false,
-            })
-            || !sel.locking_clause.is_empty()
-            || limit_node;
-        if stays {
-            // Its Vars are the plan's (as long as this level is the top:
-            // pulled up, see `RawColumn::scan_stays`).
-            for (col, o) in columns.iter_mut().zip(&outputs) {
-                col.planned_top = match o {
-                    TopOutput::Var(v) if v.deferred.subquery_scan => {
-                        col.scan_stays = true;
-                        Some(Planned::AsParsed)
-                    }
-                    TopOutput::Var(v) if differs(v) => Some(Planned::Unknown),
-                    TopOutput::MaybeVar(cs) if cs.iter().any(|c| differs(c)) => {
-                        Some(Planned::Unknown)
-                    }
-                    _ => None,
-                };
-            }
-            return;
-        }
+    } else if outputs.iter().any(|o| scan(o).is_some())
+        && sel
+            .from_clause
+            .iter()
+            .any(|f| never_removed(f, scope, snapshot))
+    {
+        // A join with a relation the planner never removes: the scan's
+        // Vars are the join's (or a dummy relation's Result's).
+        keep(columns, &outputs);
+        return;
     }
     // The planner may or may not leave a trivial scan.
     for (col, o) in columns.iter_mut().zip(&outputs) {
         let maybe = match o {
-            TopOutput::Var(c) => differs(c),
+            TopOutput::Var(c) | TopOutput::FoldedVar(c) => differs(c),
             TopOutput::MaybeVar(cs) => cs.iter().any(|c| differs(c)),
             TopOutput::Other => false,
         };
@@ -1192,6 +1367,297 @@ fn set_planned_top(sel: &protobuf::SelectStmt, scope: &Scope, columns: &mut [Raw
             col.planned_top = Some(Planned::Unknown);
         }
     }
+}
+
+/// Whether FROM item `item` holds a relation the planner never removes
+/// from the join tree: a table (a partitioned one may be proven empty,
+/// which makes the join a dummy relation, not the other side alone) not
+/// on the nullable side of an outer join (`join_is_removable`).
+fn never_removed(item: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> bool {
+    use crate::pg_catalog::RelKind;
+    match item.node.as_ref() {
+        Some(node::Node::RangeVar(rv)) => {
+            let name = rv
+                .alias
+                .as_ref()
+                .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
+            scope.sources.iter().any(|s| {
+                s.alias == name
+                    && matches!(s.kind, crate::scope::SourceKind::Relation)
+                    && s.relid.is_some_and(|r| {
+                        snapshot.pg_class.get(&r).is_some_and(|c| {
+                            matches!(
+                                c.relkind,
+                                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+                            )
+                        })
+                    })
+            })
+        }
+        Some(node::Node::JoinExpr(j)) => {
+            let side = |n: &Option<Box<protobuf::Node>>| {
+                n.as_deref()
+                    .is_some_and(|n| never_removed(n, scope, snapshot))
+            };
+            match protobuf::JoinType::try_from(j.jointype) {
+                Ok(protobuf::JoinType::JoinInner | protobuf::JoinType::JoinFull) => {
+                    side(&j.larg) || side(&j.rarg)
+                }
+                Ok(protobuf::JoinType::JoinLeft) => side(&j.larg),
+                Ok(protobuf::JoinType::JoinRight) => side(&j.rarg),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The column of `scope` output expression `n` is once parse analysis and
+/// planning are done with it, if certainly one: a same-type cast of a
+/// column with no typmod (`coerce_type` returns the Var itself), or a CASE
+/// whose branch constants decide (`eval_const_expressions`) — `true`
+/// then — reaching one.
+fn folds_to_column<'a>(
+    n: &protobuf::Node,
+    scope: &'a Scope,
+    snapshot: &PgCatalog,
+) -> Option<(bool, &'a ScopeColumn)> {
+    use crate::expr::plan_fold::{Folded, case_when};
+    let mut folded = false;
+    let mut casts = Vec::new();
+    let mut n = n;
+    loop {
+        match n.node.as_ref()? {
+            node::Node::TypeCast(tc) => {
+                let tn = tc.type_name.as_ref()?;
+                if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() || tn.setof || tn.pct_type
+                {
+                    return None;
+                }
+                casts.push(crate::ddl::util::resolve_type_name(tn, snapshot)?);
+                n = tc.arg.as_deref()?;
+            }
+            node::Node::CaseExpr(c) if c.arg.is_none() => {
+                let mut next = None;
+                for w in &c.args {
+                    let Some(node::Node::CaseWhen(w)) = w.node.as_ref() else {
+                        return None;
+                    };
+                    match case_when(None, w.expr.as_deref(), snapshot) {
+                        Folded::Bool(true) => {
+                            next = w.result.as_deref();
+                            break;
+                        }
+                        Folded::Bool(false) | Folded::Null => {}
+                        _ => return None,
+                    }
+                }
+                n = next.or(c.defresult.as_deref())?;
+                folded = true;
+            }
+            node::Node::ColumnRef(cr) => {
+                let c = column_ref_target(cr, scope)?;
+                return (c.typmod.is_none() && casts.iter().all(|t| *t == c.type_oid))
+                    .then_some((folded, c));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// What `sel`, a query level whose FROM entries `scope` holds and whose
+/// outputs are `columns`, certainly makes of a SubqueryScan over it,
+/// planned on its own (see [`crate::scope::ScanFacts`]).
+fn scan_facts(
+    sel: &protobuf::SelectStmt,
+    scope: &Scope,
+    columns: &[RawColumn],
+    snapshot: &PgCatalog,
+) -> crate::scope::ScanFacts {
+    use crate::expr::plan_fold::Folded;
+    use crate::pg_catalog::RelKind;
+    if sel.op != SetOperation::SetopNone as i32 || !sel.values_lists.is_empty() {
+        return Default::default();
+    }
+    let source_of = |n: &protobuf::Node| match n.node.as_ref() {
+        Some(node::Node::RangeVar(rv)) => {
+            let name = rv
+                .alias
+                .as_ref()
+                .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
+            scope
+                .sources
+                .iter()
+                .find(|s| s.alias == name && matches!(s.kind, crate::scope::SourceKind::Relation))
+        }
+        _ => None,
+    };
+    let relkind = |s: &crate::scope::TableSource| {
+        s.relid
+            .and_then(|r| snapshot.pg_class.get(&r))
+            .map(|c| c.relkind)
+    };
+    let plain_tables = !sel.from_clause.is_empty()
+        && sel
+            .from_clause
+            .iter()
+            .all(|f| source_of(f).is_some_and(|s| matches!(relkind(s), Some(RelKind::Table))));
+    // Tables and partitioned tables (with their partitions), one of them
+    // a partitioned table with no partition to scan: its relation is a
+    // dummy one, and so is the join (`expand_partitioned_rtentry`).
+    let tables = !sel.from_clause.is_empty()
+        && sel.from_clause.iter().all(|f| {
+            matches!(f.node.as_ref(), Some(node::Node::RangeVar(rv)) if rv.inh)
+                && source_of(f).is_some_and(|s| {
+                    matches!(relkind(s), Some(RelKind::Table | RelKind::Partitioned))
+                })
+        });
+    let no_partition = tables
+        && sel.from_clause.iter().any(|f| {
+            source_of(f).and_then(|s| s.relid).is_some_and(|r| {
+                snapshot.pg_class.get(&r).map(|c| c.relkind) == Some(RelKind::Partitioned)
+                    && !has_leaf_partition(snapshot, r)
+            })
+        });
+    let calls_in_target = sel
+        .target_list
+        .iter()
+        .any(|t| contains_node(t, &|n| matches!(n, typedpg_pg_query::NodeRef::FuncCall(_))));
+    let has_aggs = crate::grouping::level_info(sel).is_some_and(|l| l.has_aggs);
+    let plain_level = sel.group_clause.is_empty()
+        && sel.having_clause.is_none()
+        && sel.distinct_clause.is_empty()
+        && sel.window_clause.is_empty()
+        && sel.with_clause.is_none()
+        && !has_aggs
+        && !calls_in_target;
+    // A constant FALSE (or NULL) WHERE over tables: the relation is
+    // excluded (`relation_excluded_by_constraints`) or the join a dummy
+    // one (`restriction_is_constant_false`), and so the subquery's; the
+    // relation reading it is a dummy one too. (A Limit node, a sort,
+    // grouping or row marks above it may keep a plan.)
+    let no_limit_node =
+        |n: Option<&protobuf::Node>, zero_ok: bool| match n.and_then(|n| n.node.as_ref()) {
+            None => true,
+            Some(node::Node::AConst(c)) if c.isnull => true,
+            Some(node::Node::AConst(protobuf::AConst {
+                val: Some(protobuf::a_const::Val::Ival(i)),
+                ..
+            })) => zero_ok && i.ival == 0,
+            _ => false,
+        };
+    let dummy = tables
+        && plain_level
+        && sel.sort_clause.is_empty()
+        && sel.locking_clause.is_empty()
+        && no_limit_node(sel.limit_count.as_deref(), false)
+        && no_limit_node(sel.limit_offset.as_deref(), true)
+        && (no_partition
+            || sel.where_clause.as_deref().is_some_and(|w| {
+                crate::expr::plan_fold::fold_qual(w, snapshot) == Folded::Bool(false)
+            }));
+    // Row marks: each locked table adds a resjunk `ctid` entry.
+    let row_marks = sel.locking_clause.iter().any(|l| match l.node.as_ref() {
+        Some(node::Node::LockingClause(lc)) => sel.from_clause.iter().any(|f| {
+            source_of(f).is_some_and(|s| {
+                matches!(relkind(s), Some(RelKind::Table | RelKind::Partitioned))
+                    && (lc.locked_rels.is_empty()
+                        || lc.locked_rels.iter().any(|r| {
+                            matches!(r.node.as_ref(), Some(node::Node::RangeVar(rv))
+                                if rv.schemaname.is_empty() && rv.relname == s.alias)
+                        }))
+            })
+        }),
+        _ => false,
+    });
+    // A sort key that is a column of the level's entries no output is a
+    // resjunk entry (`findTargetlistEntrySQL99` adds one). An unqualified
+    // name naming an output is that output (SQL92 rule).
+    let resjunk_sort = sel.sort_clause.iter().any(|s| {
+        let Some(node::Node::SortBy(sb)) = s.node.as_ref() else {
+            return false;
+        };
+        let Some(node::Node::ColumnRef(cr)) = sb.node.as_deref().and_then(|k| k.node.as_ref())
+        else {
+            return false;
+        };
+        if let [f] = cr.fields.as_slice()
+            && let Some(node::Node::String(s)) = f.node.as_ref()
+            && columns.iter().any(|c| c.name == s.sval)
+        {
+            return false;
+        }
+        let Some(key) = column_ref_target(cr, scope) else {
+            return false;
+        };
+        !sel.target_list.iter().any(|t| {
+            let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+                return true;
+            };
+            let mut v = rt.val.as_deref();
+            while let Some(node::Node::TypeCast(tc)) = v.and_then(|v| v.node.as_ref()) {
+                v = tc.arg.as_deref();
+            }
+            match v.and_then(|v| v.node.as_ref()) {
+                Some(node::Node::ColumnRef(t)) => {
+                    t.fields
+                        .iter()
+                        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+                        || column_ref_target(t, scope).is_none_or(|c| std::ptr::eq(c, key))
+                }
+                _ => false,
+            }
+        })
+    });
+    // No path of the level is sorted: no index or inheritance child to
+    // scan in order, no join qual to merge join on, nothing it sorts.
+    let unsorted = plain_tables
+        && plain_level
+        && sel.sort_clause.is_empty()
+        && (sel.from_clause.len() == 1 || sel.where_clause.is_none())
+        && sel.from_clause.iter().all(|f| {
+            source_of(f).and_then(|s| s.relid).is_some_and(|r| {
+                !snapshot.pg_index.values().any(|i| i.indrelid == r)
+                    && !snapshot.pg_inherits.iter().any(|i| i.inhparent == r)
+            })
+        });
+    crate::scope::ScanFacts {
+        kept: dummy || row_marks || resjunk_sort,
+        no_pushdown: sel.limit_count.is_some() || sel.limit_offset.is_some(),
+        unsorted,
+    }
+}
+
+/// Whether partitioned table `rel` has a partition holding rows (a table
+/// or a foreign table), at any depth.
+fn has_leaf_partition(snapshot: &PgCatalog, rel: crate::oid::PgClassOid) -> bool {
+    use crate::pg_catalog::RelKind;
+    let mut todo = vec![rel];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(r) = todo.pop() {
+        if !seen.insert(r) {
+            continue;
+        }
+        for i in snapshot.pg_inherits.iter().filter(|i| i.inhparent == r) {
+            match snapshot.pg_class.get(&i.inhrelid).map(|c| c.relkind) {
+                Some(RelKind::Partitioned) => todo.push(i.inhrelid),
+                _ => return true,
+            }
+        }
+    }
+    false
+}
+
+/// Whether `n` holds a node `pred` accepts.
+fn contains_node(n: &protobuf::Node, pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>) -> bool) -> bool {
+    let mut todo: Vec<_> = n.node.as_ref().map(|n| n.to_ref()).into_iter().collect();
+    while let Some(n) = todo.pop() {
+        if pred(n) {
+            return true;
+        }
+        todo.extend(n.children());
+    }
+    false
 }
 
 /// The column a non-star column reference resolves to, if it names one

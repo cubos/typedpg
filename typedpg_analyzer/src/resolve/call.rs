@@ -70,6 +70,7 @@ pub(crate) fn analyze_call(
             planned: crate::expr::Planned::AsParsed,
             planned_top: None,
             scan_stays: false,
+            scan_var: None,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,

@@ -267,6 +267,7 @@ pub(crate) fn analyze_set_operation(
             planned: crate::expr::Planned::AsParsed,
             planned_top: None,
             scan_stays: false,
+            scan_var: None,
             record_fields,
             elem_nullable: match op_label {
                 "EXCEPT" | "INTERSECT" => l.elem_nullable,

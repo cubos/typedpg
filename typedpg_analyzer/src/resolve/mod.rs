@@ -1218,6 +1218,7 @@ fn analyze_raw_node_once(
                     planned: crate::expr::Planned::AsParsed,
                     planned_top: None,
                     scan_stays: false,
+                    scan_var: None,
                     record_fields: None,
                     elem_nullable: None,
                     refine: crate::refine::Refinement::NONE,
@@ -1766,6 +1767,11 @@ pub(crate) struct RawColumn {
     /// stays is decided by that level's flattened target list (which may
     /// drop or reorder this level's other outputs).
     pub scan_stays: bool,
+    /// The output is a Var of the SubqueryScan over a subquery planned on
+    /// its own, read through this level's one FROM entry with no qual of
+    /// the level's above it: pulled up into a level reading it, that
+    /// level's flattened target list is the scan's (see `set_planned_top`).
+    pub scan_var: Option<crate::scope::ScanVar>,
     /// Named-field structure when this column holds a record. Sourced from
     /// SRF out_args, ROW constructors, or propagated through subqueries.
     /// Used both to surface `Type::AnonymousRecord` in the final output and
