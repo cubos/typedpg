@@ -415,6 +415,20 @@ fn relations_that_are_not_plain_tables() {
     );
 }
 
+/// A comparison another clause must match textually: rewriting one of
+/// the two copies would make PG reject the query.
+#[test]
+fn copies_another_clause_must_match() {
+    for sql in [
+        "SELECT (SELECT count(*) FROM u WHERE u.c = t.a) > 0 AS x FROM t \
+         GROUP BY (SELECT count(*) FROM u WHERE u.c = t.a) > 0",
+        "SELECT DISTINCT (SELECT count(*) FROM u WHERE u.c = t.a) > 0 AS x FROM t \
+         ORDER BY (SELECT count(*) FROM u WHERE u.c = t.a) > 0",
+    ] {
+        assert_kept(sql);
+    }
+}
+
 #[test]
 fn other_sublinks() {
     assert_kept("SELECT EXISTS (SELECT count(*) FROM t) AS x");
