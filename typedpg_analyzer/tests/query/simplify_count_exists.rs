@@ -246,6 +246,28 @@ fn top_level_count() {
     }
 }
 
+/// The queries issue #172 measured.
+#[test]
+fn issue_queries() {
+    let db = setup_with(
+        "CREATE TABLE customers (id bigint PRIMARY KEY, name text NOT NULL, region text NOT NULL);
+         CREATE TABLE orders (id bigint PRIMARY KEY,
+                              customer_id bigint NOT NULL REFERENCES customers,
+                              total numeric NOT NULL, created_at timestamptz NOT NULL);
+         CREATE INDEX ON orders (customer_id);",
+    );
+    assert_rewritten_in(
+        &db,
+        "SELECT (SELECT count(*) FROM orders WHERE total > 10) > 0",
+        "SELECT EXISTS (SELECT 1 FROM orders WHERE total > 10) AS \"?column?\"",
+    );
+    assert_rewritten_in(
+        &db,
+        "SELECT count(*) > 0 FROM orders WHERE customer_id = 42",
+        "SELECT EXISTS (SELECT 1 FROM orders WHERE customer_id = 42) AS \"?column?\"",
+    );
+}
+
 #[test]
 fn every_count_of_a_query_is_rewritten() {
     assert_rewritten(
