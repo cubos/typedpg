@@ -215,18 +215,34 @@ pub(super) fn alter_constraint(
             alter.conname
         )));
     }
-    // AlterConstrUpdateConstraintEntry: a constraint made ENFORCED is
-    // validated; a NOT ENFORCED one is not valid.
-    if alter.alter_enforceability {
-        let enforced = alter.is_enforced;
-        if let Some(c) = interp.pg_constraint.get_mut(&con.oid) {
-            c.conenforced = enforced;
-            c.convalidated = enforced;
-        }
-        foreign_keys::for_each_fk_clone(interp, con.oid, &|c| {
-            c.conenforced = enforced;
-            c.convalidated = enforced;
+    // ATExecAlterConstraintInternal: a change of enforceability, or else
+    // one of deferrability, rewrites the row (AlterConstrUpdateConstraintEntry)
+    // with every attribute the command names — a constraint made ENFORCED
+    // is validated, a NOT ENFORCED one is not valid — and so each clone's.
+    // Naming what the constraint already is changes nothing: ENFORCED on an
+    // enforced NOT VALID key leaves it NOT VALID.
+    let details = interp.fk_details.get(&con.oid);
+    let enforceability_changes = alter.alter_enforceability && alter.is_enforced != con.conenforced;
+    let deferrability_changes = alter.alter_deferrability
+        && details.is_none_or(|d| {
+            (d.deferrable(), d.initdeferred()) != (alter.deferrable, alter.initdeferred)
         });
+    if enforceability_changes || deferrability_changes {
+        let clones = std::cell::RefCell::new(Vec::new());
+        foreign_keys::for_each_fk_clone(interp, con.oid, &|c| clones.borrow_mut().push(c.oid));
+        for oid in std::iter::once(con.oid).chain(clones.into_inner()) {
+            if alter.alter_enforceability
+                && let Some(c) = interp.pg_constraint.get_mut(&oid)
+            {
+                c.conenforced = alter.is_enforced;
+                c.convalidated = alter.is_enforced;
+            }
+            if alter.alter_deferrability
+                && let Some(d) = interp.fk_details.get_mut(&oid)
+            {
+                d.set_deferrability(alter.deferrable, alter.initdeferred);
+            }
+        }
     }
     if alter.alter_inheritability {
         inherit::alter_not_null_inheritability(interp, &con, alter.noinherit)?;

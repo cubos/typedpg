@@ -565,6 +565,17 @@ impl FkDetails {
         self.deferrable
     }
 
+    /// `condeferred`.
+    pub(crate) fn initdeferred(&self) -> bool {
+        self.initdeferred
+    }
+
+    /// Set `condeferrable` and `condeferred`.
+    pub(crate) fn set_deferrability(&mut self, deferrable: bool, initdeferred: bool) {
+        self.deferrable = deferrable;
+        self.initdeferred = initdeferred;
+    }
+
     /// `confmatchtype = 'f'`: `MATCH FULL`.
     pub(crate) fn match_full(&self) -> bool {
         self.match_type == "f"
