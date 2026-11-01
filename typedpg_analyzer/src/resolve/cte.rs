@@ -81,8 +81,18 @@ pub(crate) fn analyze_cte(
         }
         _ => None,
     };
-    let to_scope = |rc: RawColumn| ScopeColumn {
+    // An inlined CTE is a subquery: a trivial scan over it may be removed
+    // (`removable`: its level summary says it is, when planned on its own).
+    let plan = match (inlined, cte_query) {
+        (Some(true), node::Node::SelectStmt(sel)) => Some(super::deferred::plan_of(sel, snapshot)),
+        (Some(false), _) => None,
+        _ => Some(super::deferred::Plan::Uncertain),
+    };
+    let to_scope = |rc: RawColumn, removable: bool| ScopeColumn {
         deferred: crate::scope::Deferred {
+            planned_top: plan
+                .and_then(|plan| super::from::subquery_planned_top(plan, &rc, removable)),
+            subquery_scan: plan == Some(super::deferred::Plan::Separate),
             planned: planned_in(rc.planned).unwrap_or_default(),
             // An inlined CTE is a subquery the planner may pull up.
             substitution: if inlined == Some(false) {
@@ -144,7 +154,11 @@ pub(crate) fn analyze_cte(
             register_cte(
                 &mut scopes_with_self,
                 &cte.ctename,
-                seed_cols.iter().cloned().map(to_scope).collect(),
+                seed_cols
+                    .iter()
+                    .cloned()
+                    .map(|c| to_scope(c, false))
+                    .collect(),
                 search_cycle.clone(),
                 owner_depth,
             );
@@ -347,10 +361,13 @@ pub(crate) fn analyze_cte(
         }
         node::Node::SelectStmt(sel) => {
             let (mut cols, _) = analyze_body(sel, params, existing_ctes)?;
-            min_one_row = take_level_summary().min_one_row;
+            let summary = take_level_summary();
+            min_one_row = summary.min_one_row;
             resolve_unknown_outputs(sel, &mut cols, params, snapshot)?;
             let cols = apply_cte_column_aliases(&cte.ctename, cols, &cte.aliascolnames)?;
-            cols.into_iter().map(to_scope).collect()
+            cols.into_iter()
+                .map(|c| to_scope(c, summary.removable_scan))
+                .collect()
         }
         node::Node::InsertStmt(_)
         | node::Node::UpdateStmt(_)
@@ -396,7 +413,7 @@ pub(crate) fn analyze_cte(
             cols.into_iter()
                 .map(|c| ScopeColumn {
                     origin: None,
-                    ..to_scope(c)
+                    ..to_scope(c, false)
                 })
                 .collect()
         }

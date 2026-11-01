@@ -105,6 +105,15 @@ pub(crate) struct Deferred {
     /// estimating the restrictions of an inlined CTE's one relation,
     /// pulled up, raises.
     pub unless_removed: Option<Box<crate::error::AnalyzeError>>,
+    /// For a subquery's output (a FROM subquery, a view, an inlined CTE):
+    /// its collation in the plan a trivial SubqueryScan over the subquery
+    /// leaves once setrefs removes it (see
+    /// [`crate::resolve::RawColumn::planned_top`]), where that may differ
+    /// from [`ScopeColumn::planned`].
+    pub planned_top: Option<crate::expr::Planned>,
+    /// A reference to the column stays a Var of a SubqueryScan: the
+    /// subquery is planned on its own (never pulled up).
+    pub subquery_scan: bool,
 }
 
 /// How the planner plans an inlined CTE it doesn't pull up: on its own,

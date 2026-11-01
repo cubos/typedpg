@@ -1088,7 +1088,8 @@ fn resolve_view_with_params(
                     .collation
                     .or_else(|| interp_type_collation(snapshot, type_oid)),
                 no_collation: col.no_collation.is_some(),
-                planned: col.planned,
+                // The query is the statement's: its top level's plan.
+                planned: col.planned_top.unwrap_or(col.planned),
                 // A column read as is from one whose collation is
                 // uncertain: so is its own.
                 uncertain_collation: col.origin.as_ref().is_some_and(|o| {

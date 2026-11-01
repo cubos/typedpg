@@ -197,6 +197,7 @@ pub(crate) fn resolve_target_list_explicit(
                     collation: col.collation,
                     no_collation: col.no_collation.then_some(crate::expr::NoCollation::Unset),
                     planned: col.planned(),
+                    planned_top: None,
                     record_fields: col.record_fields.clone(),
                     elem_nullable: col.elem_nullable,
                     refine: col.refine.clone(),
@@ -230,6 +231,7 @@ pub(crate) fn resolve_target_list_explicit(
                         crate::expr::Planned::Unknown => crate::expr::Planned::Unknown,
                         _ => crate::expr::Planned::AsParsed,
                     },
+                    planned_top: None,
                     elem_nullable: t.elem_nullable,
                     refine: t.refine.clone(),
                     record_fields: t.record_fields,
@@ -314,6 +316,7 @@ pub(crate) fn resolve_target_list_explicit(
             collation: expr_type.collation,
             no_collation: expr_type.no_collation,
             planned: expr_type.planned,
+            planned_top: None,
             record_fields,
             elem_nullable: expr_type.elem_nullable,
             refine: expr_type.refine.clone(),
@@ -522,6 +525,7 @@ pub(crate) fn analyze_values_lists(
             } else {
                 crate::expr::Planned::AsParsed
             },
+            planned_top: None,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,

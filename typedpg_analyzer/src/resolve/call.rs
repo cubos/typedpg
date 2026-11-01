@@ -68,6 +68,7 @@ pub(crate) fn analyze_call(
             collation: None,
             no_collation: None,
             planned: crate::expr::Planned::AsParsed,
+            planned_top: None,
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,

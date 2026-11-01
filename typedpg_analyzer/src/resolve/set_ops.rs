@@ -265,6 +265,7 @@ pub(crate) fn analyze_set_operation(
             collation,
             no_collation,
             planned: crate::expr::Planned::AsParsed,
+            planned_top: None,
             record_fields,
             elem_nullable: match op_label {
                 "EXCEPT" | "INTERSECT" => l.elem_nullable,

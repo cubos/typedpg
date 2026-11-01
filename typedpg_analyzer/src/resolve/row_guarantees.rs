@@ -19,6 +19,13 @@ pub(crate) struct LevelSummary {
     /// The level yields at least one row, for each row of the entries it
     /// reads as LATERAL or outer references.
     pub min_one_row: bool,
+    /// A SubqueryScan over the level is removed when it is a trivial one
+    /// (`trivial_subqueryscan`): the level's plan is certainly no dummy
+    /// one (a subquery proven empty makes the relation reading it a dummy
+    /// one, whose Result keeps the Vars), and its target list has no
+    /// resjunk entry (a sort or grouping key not among the outputs, a row
+    /// mark), which the SubqueryScan's target list doesn't match.
+    pub removable_scan: bool,
 }
 
 thread_local! {
@@ -535,6 +542,7 @@ pub(crate) fn finish_level(
             && sel.having_clause.is_none()
             && sel.locking_clause.is_empty()
             && (ungrouped_aggregate || input_nonempty),
+        removable_scan: false,
     }
 }
 
