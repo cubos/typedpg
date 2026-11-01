@@ -485,59 +485,6 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     Ok(())
 }
 
-/// Whether statement `stmt` may let rows bypass the triggers enforcing
-/// foreign keys, for the whole database, from then on: it mentions
-/// `session_replication_role` anywhere in its text (`SET`, `set_config`,
-/// a routine's `SET` clause, `ALTER ROLE / DATABASE / SYSTEM SET`, a DO or
-/// routine body), calls `set_config` with a name that isn't a string
-/// constant, or writes to a system catalog (`UPDATE pg_trigger SET
-/// tgenabled = 'D'`). Conservative: [`PgCatalog::fk_checks_bypassed`] only
-/// makes the foreign-key join removal give up.
-pub(crate) fn note_fk_check_bypass(interp: &mut PgCatalog, stmt: &node::Node) {
-    use typedpg_pg_query::NodeRef;
-    if interp.fk_checks_bypassed {
-        return;
-    }
-    let mentions_role = interp
-        .statement_sql
-        .as_deref()
-        .is_some_and(|t| t.to_ascii_lowercase().contains("session_replication_role"));
-    let system_table = |rv: Option<&typedpg_pg_query::protobuf::RangeVar>| {
-        rv.is_some_and(|rv| {
-            rv.schemaname.eq_ignore_ascii_case("pg_catalog")
-                || (rv.schemaname.is_empty() && rv.relname.starts_with("pg_"))
-        })
-    };
-    let bypass = mentions_role
-        || stmt.nodes().iter().any(|(n, _)| match n {
-            NodeRef::FuncCall(fc) => {
-                let name: Vec<&str> = fc
-                    .funcname
-                    .iter()
-                    .filter_map(super::util::node_string)
-                    .collect();
-                matches!(
-                    name.as_slice(),
-                    ["set_config"] | ["pg_catalog", "set_config"]
-                ) && !matches!(
-                    fc.args.first().and_then(|a| a.node.as_ref()),
-                    Some(node::Node::AConst(typedpg_pg_query::protobuf::AConst {
-                        val: Some(a_const::Val::Sval(_)),
-                        ..
-                    }))
-                )
-            }
-            NodeRef::InsertStmt(s) => system_table(s.relation.as_ref()),
-            NodeRef::UpdateStmt(s) => system_table(s.relation.as_ref()),
-            NodeRef::DeleteStmt(s) => system_table(s.relation.as_ref()),
-            NodeRef::MergeStmt(s) => system_table(s.relation.as_ref()),
-            _ => false,
-        });
-    if bypass {
-        interp.fk_checks_bypassed = true;
-    }
-}
-
 /// `ALTER DATABASE name SET / RESET ...`: a setting for the database's new
 /// sessions (pg_db_role_setting). The analyzer can't tell which database
 /// the application connects to, so any name is taken as the migrations'

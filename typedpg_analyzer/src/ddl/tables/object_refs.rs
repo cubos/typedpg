@@ -234,8 +234,17 @@ pub(super) fn alter_constraint(
             if alter.alter_enforceability
                 && let Some(c) = interp.pg_constraint.get_mut(&oid)
             {
+                // NOT ENFORCED → ENFORCED checks the rows (phase 3); a
+                // deferrability change only rewrites the row, marking an
+                // enforced NOT VALID key validated unchecked.
+                let unchecked = !enforceability_changes && !c.convalidated && alter.is_enforced;
                 c.conenforced = alter.is_enforced;
                 c.convalidated = alter.is_enforced;
+                if unchecked {
+                    interp.fk_validity_unproven.insert(oid);
+                } else if enforceability_changes {
+                    interp.fk_validity_unproven.remove(&oid);
+                }
             }
             if alter.alter_deferrability
                 && let Some(d) = interp.fk_details.get_mut(&oid)

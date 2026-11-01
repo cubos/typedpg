@@ -16,12 +16,15 @@
 //!   the key's own equality operators ([`fk_equalities_hold`]);
 //! - the referencing columns are NOT NULL (a validated not-null
 //!   constraint): a NULL matches no parent;
-//! - the key is enforced, validated and NOT DEFERRABLE (a deferred key may
-//!   be violated inside a transaction), and so is each partition's clone;
+//! - the key is enforced, validated — by checking the rows, not by an
+//!   `ALTER CONSTRAINT` rewriting its row as valid — and NOT DEFERRABLE (a
+//!   deferred key may be violated inside a transaction), and so is each
+//!   partition's clone;
 //! - the migrations never disabled the triggers enforcing it (`DISABLE
 //!   TRIGGER ALL` on either table, even if enabled again later: rows
-//!   written meanwhile were never checked) nor set
-//!   `session_replication_role`, which turns them off too;
+//!   written meanwhile were never checked) nor did anything else that may
+//!   turn them off (`crate::ddl::fk_bypass`: `session_replication_role`,
+//!   catalog writes, subscriptions, routines run that might);
 //! - the parent has no row security, which could hide the referenced row;
 //! - the scan of the parent is the relation the key looks rows up in — not
 //!   one with inheritance children, whose rows may repeat the key, nor
@@ -538,6 +541,8 @@ fn enforced_key(
     let strict = |con: &crate::pg_catalog::PgConstraint| {
         con.conenforced
             && con.convalidated
+            // Validated by a row rewrite, not by checking the rows.
+            && !catalog.fk_validity_unproven.contains(&con.oid)
             && !con.conperiod
             && catalog
                 .fk_details

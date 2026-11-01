@@ -327,6 +327,61 @@ fn key_must_be_validated_enforced_and_immediate() {
 }
 
 #[test]
+fn key_validated_without_checking_the_rows_is_not_trusted() {
+    // PG 18 rewrites an enforced NOT VALID key's row as validated, without
+    // checking the rows, when ENFORCED comes with a deferrability change;
+    // NOT DEFERRABLE again, it looks enforced, valid and immediate while
+    // orphans may remain.
+    let tables = "CREATE TABLE cust (id bigint PRIMARY KEY, name text);
+         CREATE TABLE ord (id bigint PRIMARY KEY, cid bigint NOT NULL);";
+    let sql = "SELECT o.id FROM ord o JOIN cust c ON c.id = o.cid";
+    for steps in [
+        "ALTER TABLE ord ADD CONSTRAINT f FOREIGN KEY (cid) REFERENCES cust NOT VALID DEFERRABLE;
+         ALTER TABLE ord ALTER CONSTRAINT f ENFORCED NOT DEFERRABLE;",
+        "ALTER TABLE ord ADD CONSTRAINT f FOREIGN KEY (cid) REFERENCES cust NOT VALID;
+         ALTER TABLE ord ALTER CONSTRAINT f ENFORCED DEFERRABLE;
+         ALTER TABLE ord ALTER CONSTRAINT f NOT DEFERRABLE;",
+        // VALIDATE CONSTRAINT skips a key already marked valid.
+        "ALTER TABLE ord ADD CONSTRAINT f FOREIGN KEY (cid) REFERENCES cust NOT VALID;
+         ALTER TABLE ord ALTER CONSTRAINT f ENFORCED DEFERRABLE;
+         ALTER TABLE ord ALTER CONSTRAINT f NOT DEFERRABLE;
+         ALTER TABLE ord VALIDATE CONSTRAINT f;",
+    ] {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(tables).unwrap();
+        db.apply_sql(steps).unwrap();
+        assert_kept(&db, &[sql]);
+    }
+    // A partitioned child: its partitions' clones too.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE cust (id bigint PRIMARY KEY, name text);
+         CREATE TABLE pord (id bigint, cid bigint NOT NULL) PARTITION BY RANGE (id);
+         CREATE TABLE pord1 PARTITION OF pord FOR VALUES FROM (0) TO (100);
+         ALTER TABLE pord ADD CONSTRAINT pf FOREIGN KEY (cid) REFERENCES cust NOT VALID;
+         ALTER TABLE pord ALTER CONSTRAINT pf ENFORCED DEFERRABLE;
+         ALTER TABLE pord ALTER CONSTRAINT pf NOT DEFERRABLE;",
+    )
+    .unwrap();
+    assert_kept(
+        &db,
+        &["SELECT o.id FROM pord o JOIN cust c ON c.id = o.cid"],
+    );
+    // NOT ENFORCED, then ENFORCED: the rows are checked.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(tables).unwrap();
+    db.apply_sql(
+        "ALTER TABLE ord ADD CONSTRAINT f FOREIGN KEY (cid) REFERENCES cust NOT VALID;
+         ALTER TABLE ord ALTER CONSTRAINT f ENFORCED DEFERRABLE;
+         ALTER TABLE ord ALTER CONSTRAINT f NOT DEFERRABLE;
+         ALTER TABLE ord ALTER CONSTRAINT f NOT ENFORCED;
+         ALTER TABLE ord ALTER CONSTRAINT f ENFORCED;",
+    )
+    .unwrap();
+    assert_simplified(&db, &[(sql, "SELECT o.id FROM ord o")]);
+}
+
+#[test]
 fn parent_must_not_have_row_security() {
     let db = setup();
     assert_kept(
@@ -370,23 +425,81 @@ fn session_replication_role_voids_the_proof() {
         // A write to a system catalog.
         "UPDATE pg_trigger SET tgenabled = 'D' WHERE false;",
         "UPDATE pg_catalog.pg_constraint SET convalidated = true WHERE false;",
+        // The setting's name escaped: compared decoded.
+        "SET U&\"session\\005freplication\\005frole\" = replica; \
+         RESET U&\"session\\005freplication\\005frole\";",
+        "SELECT set_config(U&'session\\005freplication\\005frole', 'origin', false);",
+        // Code run at migration time that may turn the checks off.
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN EXECUTE 'ALTER TABLE orders DISABLE TRIGGER ALL'; END IF; END $$; \
+         SELECT off();",
+        "CREATE PROCEDURE off() LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN UPDATE pg_trigger SET tgenabled = 'D'; END IF; END $$; \
+         CALL off();",
+        "CREATE FUNCTION off() RETURNS text LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN PERFORM set_config('session_replication' || '_role', 'replica', \
+         false); END IF; RETURN ''; END $$; \
+         CREATE FUNCTION calls_off() RETURNS text LANGUAGE sql AS 'SELECT off()'; \
+         SELECT calls_off();",
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN EXECUTE format('SET session_%s_role = replica', 'replication'); \
+         END IF; END $$; \
+         ALTER FUNCTION off() RENAME TO renamed; SELECT renamed();",
+        "DO $$ BEGIN IF false THEN EXECUTE 'ALTER TABLE orders DISABLE TRIGGER ALL'; \
+         END IF; END $$;",
+        "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN EXECUTE 'SELECT 1'; END IF; RETURN NEW; END $$; \
+         CREATE TABLE logged (id int); \
+         CREATE TRIGGER t BEFORE INSERT ON logged FOR EACH ROW EXECUTE FUNCTION trg(); \
+         INSERT INTO logged VALUES (1);",
     ] {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(tables).unwrap();
         db.apply_sql(setting).unwrap();
         assert_kept(&db, &[sql]);
     }
+    // A routine defined but never run by the migrations doesn't count (as
+    // one the application runs).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(tables).unwrap();
+    db.apply_sql(
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
+         BEGIN EXECUTE 'ALTER TABLE orders DISABLE TRIGGER ALL'; END $$;",
+    )
+    .unwrap();
+    assert_simplified(&db, &[(sql, "SELECT o.id FROM orders o")]);
     // Settings for other sessions: not run on the oracle's shared cluster.
     for setting in [
         "ALTER ROLE postgres SET session_replication_role = replica;",
         "ALTER DATABASE postgres SET session_replication_role = replica;",
         "ALTER SYSTEM SET session_replication_role = replica;",
+        "ALTER ROLE postgres SET U&\"session\\005freplication\\005frole\" = replica;",
+        // Logical replication's apply workers run as replicas.
+        "CREATE SUBSCRIPTION s CONNECTION 'dbname=x' PUBLICATION p WITH (connect = false);",
     ] {
         let mut db = PgCatalog::new().unwrap();
         db.skip_pg_sanity();
         db.apply_sql(tables).unwrap();
         db.apply_sql(setting).unwrap();
         assert_kept(&db, &[sql]);
+    }
+    // COPY into or TRUNCATE a system catalog (allow_system_table_mods):
+    // either the migration is rejected, so no schema is built past it, or
+    // the proof is void.
+    for setting in [
+        "COPY pg_catalog.pg_trigger FROM STDIN;",
+        "TRUNCATE pg_catalog.pg_trigger;",
+    ] {
+        let mut db = PgCatalog::new().unwrap();
+        db.skip_pg_sanity();
+        db.apply_sql(tables).unwrap();
+        match db.apply_sql(setting) {
+            Ok(()) => assert_kept(&db, &[sql]),
+            Err(e) => assert!(
+                e.to_string().contains("is a system catalog"),
+                "{setting}: {e}"
+            ),
+        }
     }
 }
 
