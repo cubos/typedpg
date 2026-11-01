@@ -591,7 +591,13 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     }
 
     // 6. Generate typed Rust code.
-    let generated = codegen::generate(&analyzed, resolved, &input.executor, &input.assignments)?;
+    let generated = codegen::generate(
+        &analyzed,
+        &built.catalog,
+        resolved,
+        &input.executor,
+        &input.assignments,
+    )?;
 
     // Cargo must know the crate depends on the migration files: the macro
     // reads them at expansion time, so without this a change to one would

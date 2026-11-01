@@ -4,12 +4,12 @@ use std::ops::Deref;
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
 use tokio_postgres::Row;
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
 use crate::copy::{CopyRow, column_types, write_rows};
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
-use crate::executor::{Executor, slice_iter};
+use crate::executor::{Executor, slice_iter, typed_iter};
 #[cfg(any(feature = "deadpool", feature = "bb8"))]
 use crate::stream::RowStream;
 
@@ -53,6 +53,29 @@ impl Executor for deadpool_postgres::Pool {
         let client = self.get().await?;
         let rows = client.deref().query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::with_connection(rows, client))
+    }
+
+    async fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<RowStream, crate::Error> {
+        // The stream keeps the connection until it is dropped.
+        let client = self.get().await?;
+        let rows = client
+            .deref()
+            .query_typed_raw(sql, typed_iter(params))
+            .await?;
+        Ok(RowStream::with_connection(rows, client))
+    }
+
+    async fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<u64, crate::Error> {
+        let client = self.get().await?;
+        Ok(client.deref().execute_typed(sql, params).await?)
     }
 
     async fn copy_in<'a, I>(
@@ -101,6 +124,26 @@ impl Executor for deadpool_postgres::Object {
     ) -> Result<RowStream, crate::Error> {
         let rows = self.deref().query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::new(rows))
+    }
+
+    async fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<RowStream, crate::Error> {
+        let rows = self
+            .deref()
+            .query_typed_raw(sql, typed_iter(params))
+            .await?;
+        Ok(RowStream::new(rows))
+    }
+
+    async fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<u64, crate::Error> {
+        Ok(self.deref().execute_typed(sql, params).await?)
     }
 
     async fn copy_in<'a, I>(
@@ -155,6 +198,26 @@ impl Executor for deadpool_postgres::Transaction<'_> {
     ) -> Result<RowStream, crate::Error> {
         let rows = self.deref().query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::new(rows))
+    }
+
+    async fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<RowStream, crate::Error> {
+        let rows = self
+            .deref()
+            .query_typed_raw(sql, typed_iter(params))
+            .await?;
+        Ok(RowStream::new(rows))
+    }
+
+    async fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<u64, crate::Error> {
+        Ok(self.deref().execute_typed(sql, params).await?)
     }
 
     async fn copy_in<'a, I>(
@@ -215,6 +278,26 @@ where
         let client = self.get_owned().await?;
         let rows = client.query_raw(sql, slice_iter(params)).await?;
         Ok(RowStream::with_connection(rows, client))
+    }
+
+    async fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<RowStream, crate::Error> {
+        // An owned connection, kept by the stream until it is dropped.
+        let client = self.get_owned().await?;
+        let rows = client.query_typed_raw(sql, typed_iter(params)).await?;
+        Ok(RowStream::with_connection(rows, client))
+    }
+
+    async fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<u64, crate::Error> {
+        let client = self.get().await?;
+        Ok(client.execute_typed(sql, params).await?)
     }
 
     async fn copy_in<'a, I>(

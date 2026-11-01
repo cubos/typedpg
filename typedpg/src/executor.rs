@@ -1,5 +1,5 @@
 use tokio_postgres::Row;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::copy::{CopyRow, column_types, write_rows};
 use crate::stream::RowStream;
@@ -94,6 +94,56 @@ pub trait Executor: Sync {
         async move { Ok(RowStream::from_rows(self.query(sql, params).await?)) }
     }
 
+    /// Executes a query whose parameters' types are given, and returns its
+    /// rows as a stream, as the server sends them.
+    ///
+    /// Used internally by the methods `sql!` generates for a query whose
+    /// parameter types are all built-in: given the types, the server needs
+    /// no separate round trip to infer them (`tokio_postgres`'s
+    /// `query_typed_raw`, on the unnamed statement). Each type is the one
+    /// PostgreSQL itself infers for its parameter.
+    ///
+    /// The default implementation drops the types and calls
+    /// [`query_stream`](Executor::query_stream); the implementations in this
+    /// crate send them.
+    ///
+    /// # Errors
+    ///
+    /// As [`query_stream`](Executor::query_stream).
+    fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> impl std::future::Future<Output = Result<RowStream, crate::Error>> + Send + 'a {
+        async move {
+            let params: Vec<&(dyn ToSql + Sync)> = params.iter().map(|(p, _)| *p).collect();
+            self.query_stream(sql, &params).await
+        }
+    }
+
+    /// Executes a statement whose parameters' types are given, and returns
+    /// the number of affected rows — [`execute`](Executor::execute) in one
+    /// round trip, as [`query_typed_stream`](Executor::query_typed_stream)
+    /// is for queries.
+    ///
+    /// The default implementation drops the types and calls
+    /// [`execute`](Executor::execute); the implementations in this crate
+    /// send them.
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](Executor::execute).
+    fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> impl std::future::Future<Output = Result<u64, crate::Error>> + Send + 'a {
+        async move {
+            let params: Vec<&(dyn ToSql + Sync)> = params.iter().map(|(p, _)| *p).collect();
+            self.execute(sql, &params).await
+        }
+    }
+
     /// Runs `copy_sql` (a binary `COPY ... FROM STDIN`) feeding it `rows`,
     /// and returns the number of rows copied. `describe_sql` is prepared
     /// only for the target columns' types.
@@ -151,6 +201,22 @@ impl<T: Executor + Sync> Executor for &T {
         (**self).query_stream(sql, params).await
     }
 
+    async fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<RowStream, crate::Error> {
+        (**self).query_typed_stream(sql, params).await
+    }
+
+    async fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<u64, crate::Error> {
+        (**self).execute_typed(sql, params).await
+    }
+
     // Not an `async fn`: forwarding the inner future sidesteps rustc
     // rejecting the generic's lifetime bound in one (rust#100013).
     fn copy_in<'a, I>(
@@ -190,6 +256,23 @@ impl Executor for tokio_postgres::Client {
     ) -> Result<RowStream, crate::Error> {
         let rows = tokio_postgres::Client::query_raw(self, sql, slice_iter(params)).await?;
         Ok(RowStream::new(rows))
+    }
+
+    async fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<RowStream, crate::Error> {
+        let rows = tokio_postgres::Client::query_typed_raw(self, sql, typed_iter(params)).await?;
+        Ok(RowStream::new(rows))
+    }
+
+    async fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<u64, crate::Error> {
+        Ok(tokio_postgres::Client::execute_typed(self, sql, params).await?)
     }
 
     async fn copy_in<'a, I>(
@@ -233,6 +316,24 @@ impl Executor for tokio_postgres::Transaction<'_> {
         Ok(RowStream::new(rows))
     }
 
+    async fn query_typed_stream<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<RowStream, crate::Error> {
+        let rows =
+            tokio_postgres::Transaction::query_typed_raw(self, sql, typed_iter(params)).await?;
+        Ok(RowStream::new(rows))
+    }
+
+    async fn execute_typed<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [(&'a (dyn ToSql + Sync), Type)],
+    ) -> Result<u64, crate::Error> {
+        Ok(tokio_postgres::Transaction::execute_typed(self, sql, params).await?)
+    }
+
     async fn copy_in<'a, I>(
         &'a self,
         describe_sql: &'a str,
@@ -253,4 +354,146 @@ pub(crate) fn slice_iter<'a>(
     params: &'a [&'a (dyn ToSql + Sync)],
 ) -> impl ExactSizeIterator<Item = &'a dyn ToSql> + 'a {
     params.iter().map(|p| *p as &dyn ToSql)
+}
+
+/// `params` as the `query_typed_raw` argument iterator.
+pub(crate) fn typed_iter<'a>(
+    params: &'a [(&'a (dyn ToSql + Sync), Type)],
+) -> impl ExactSizeIterator<Item = (&'a dyn ToSql, Type)> + 'a {
+    params.iter().map(|(p, t)| (*p as &dyn ToSql, t.clone()))
+}
+
+/// `params` paired with the types `oids` name, one per parameter — the
+/// arguments of the typed methods. `None` when the lengths differ or an
+/// OID is not a type `tokio_postgres` knows: the caller then sends the
+/// query untyped, as before (one more round trip, never an error).
+pub(crate) fn typed_params<'a>(
+    params: &[&'a (dyn ToSql + Sync)],
+    oids: &[u32],
+) -> Option<Vec<(&'a (dyn ToSql + Sync), Type)>> {
+    if params.len() != oids.len() {
+        return None;
+    }
+    params
+        .iter()
+        .zip(oids)
+        .map(|(p, oid)| Some((*p, Type::from_oid(*oid)?)))
+        .collect()
+}
+
+/// The typed arguments for a query whose rows are decoded: [`typed_params`],
+/// when `columns` gives every result column's type as the server describes
+/// it and `tokio_postgres` knows each one.
+///
+/// `query_typed` reads the row description after the query is already on
+/// its way, and looks up each column type the client doesn't know with a
+/// query of its own — which, behind the pipelined query's rows, never gets
+/// its reply once they fill the response channel: the query hangs. A known
+/// type needs no lookup; anything else is sent untyped, prepared first,
+/// its column types looked up with nothing pending.
+fn typed_query_params<'a>(
+    params: &[&'a (dyn ToSql + Sync)],
+    oids: Option<&[u32]>,
+    columns: Option<&[u32]>,
+) -> Option<Vec<(&'a (dyn ToSql + Sync), Type)>> {
+    if !columns?.iter().all(|oid| Type::from_oid(*oid).is_some()) {
+        return None;
+    }
+    typed_params(params, oids?)
+}
+
+/// What `sql!`'s fetch methods run: the query through
+/// [`Executor::query_typed_stream`] when `oids` gives every parameter's
+/// type and `columns` every result column's (see [`typed_query_params`]),
+/// [`Executor::query`] otherwise.
+#[doc(hidden)]
+pub async fn run_query<E: Executor + ?Sized>(
+    executor: &E,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    oids: Option<&[u32]>,
+    columns: Option<&[u32]>,
+) -> Result<Vec<Row>, crate::Error> {
+    use futures_util::TryStreamExt;
+    match typed_query_params(params, oids, columns) {
+        Some(typed) => {
+            executor
+                .query_typed_stream(sql, &typed)
+                .await?
+                .try_collect()
+                .await
+        }
+        None => executor.query(sql, params).await,
+    }
+}
+
+/// [`run_query`] for `fetch_stream`: [`Executor::query_typed_stream`] or
+/// [`Executor::query_stream`].
+#[doc(hidden)]
+pub async fn run_query_stream<E: Executor + ?Sized>(
+    executor: &E,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    oids: Option<&[u32]>,
+    columns: Option<&[u32]>,
+) -> Result<RowStream, crate::Error> {
+    match typed_query_params(params, oids, columns) {
+        Some(typed) => executor.query_typed_stream(sql, &typed).await,
+        None => executor.query_stream(sql, params).await,
+    }
+}
+
+/// [`run_query`] for `execute`: [`Executor::execute_typed`] or
+/// [`Executor::execute`]. Whatever the result columns: `execute_typed`
+/// discards the rows without looking up their types.
+#[doc(hidden)]
+pub async fn run_execute<E: Executor + ?Sized>(
+    executor: &E,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    oids: Option<&[u32]>,
+) -> Result<u64, crate::Error> {
+    match oids.and_then(|oids| typed_params(params, oids)) {
+        Some(typed) => executor.execute_typed(sql, &typed).await,
+        None => executor.execute(sql, params).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_params_pair_each_value_with_its_type() {
+        let (a, b) = (1i32, "x");
+        let params: [&(dyn ToSql + Sync); 2] = [&a, &b];
+        let typed = typed_params(&params, &[23, 25]).expect("built-in types");
+        let types: Vec<Type> = typed.into_iter().map(|(_, t)| t).collect();
+        assert_eq!(types, [Type::INT4, Type::TEXT]);
+        assert_eq!(typed_params(&[], &[]).map(|t| t.len()), Some(0));
+    }
+
+    /// Never a panic: an OID `tokio_postgres` doesn't know, or a count that
+    /// doesn't match, sends the query untyped.
+    #[test]
+    fn typed_params_fall_back_rather_than_guess() {
+        let a = 1i32;
+        let params: [&(dyn ToSql + Sync); 1] = [&a];
+        assert!(typed_params(&params, &[9999]).is_none());
+        assert!(typed_params(&params, &[23, 23]).is_none());
+        assert!(typed_params(&params, &[]).is_none());
+    }
+
+    /// A result column whose type the client would have to look up keeps
+    /// the query untyped (the lookup would wait behind the query's rows).
+    #[test]
+    fn unknown_result_column_types_keep_a_query_untyped() {
+        let a = 1i32;
+        let params: [&(dyn ToSql + Sync); 1] = [&a];
+        assert!(typed_query_params(&params, Some(&[23]), Some(&[23, 25])).is_some());
+        assert!(typed_query_params(&params, Some(&[23]), Some(&[])).is_some());
+        assert!(typed_query_params(&params, Some(&[23]), Some(&[23, 9999])).is_none());
+        assert!(typed_query_params(&params, Some(&[23]), None).is_none());
+        assert!(typed_query_params(&params, None, Some(&[23])).is_none());
+    }
 }
