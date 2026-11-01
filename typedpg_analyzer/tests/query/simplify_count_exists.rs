@@ -83,7 +83,7 @@ fn every_comparison_with_zero() {
         ),
         (
             "SELECT (SELECT count(*) FROM t WHERE b > 3) = 0 AS x",
-            "SELECT NOT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+            "SELECT (NOT EXISTS (SELECT 1 FROM t WHERE b > 3)) AS x",
         ),
     ] {
         assert_rewritten(sql, expected);
@@ -107,7 +107,7 @@ fn mirrored_comparisons() {
         ),
         (
             "SELECT 0 = (SELECT count(*) FROM t WHERE b > 3) AS x",
-            "SELECT NOT EXISTS (SELECT 1 FROM t WHERE b > 3) AS x",
+            "SELECT (NOT EXISTS (SELECT 1 FROM t WHERE b > 3)) AS x",
         ),
         (
             "SELECT 0<(SELECT count(*) FROM t)AS x",
@@ -135,7 +135,7 @@ fn count_of_a_not_null_expression() {
         ),
         (
             "SELECT (SELECT count(a) FROM t) = 0 AS x",
-            "SELECT NOT EXISTS (SELECT 1 FROM t) AS x",
+            "SELECT (NOT EXISTS (SELECT 1 FROM t)) AS x",
         ),
         // Distinct values: nonzero exactly when `count(a)` is.
         (
@@ -160,7 +160,7 @@ fn correlated_in_where_and_dml() {
     for (sql, expected) in [
         (
             "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) = 0",
-            "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
+            "SELECT id FROM t WHERE (NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id))",
         ),
         (
             "SELECT id FROM t WHERE a = 1 AND(SELECT count(*) FROM u WHERE u.t_id = t.id)>0",
@@ -181,7 +181,7 @@ fn correlated_in_where_and_dml() {
         (
             "DELETE FROM u WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) = 0 \
              RETURNING (SELECT count(*) FROM t) > 0",
-            "DELETE FROM u WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id) \
+            "DELETE FROM u WHERE (NOT EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id)) \
              RETURNING EXISTS (SELECT 1 FROM t) AS \"?column?\"",
         ),
     ] {
@@ -227,7 +227,7 @@ fn top_level_count() {
         ),
         (
             "SELECT count(*) = 0 AS none FROM t WHERE b > 3",
-            "SELECT NOT EXISTS (SELECT 1 FROM t WHERE b > 3) AS \"none\"",
+            "SELECT (NOT EXISTS (SELECT 1 FROM t WHERE b > 3)) AS \"none\"",
         ),
         (
             "SELECT 1 <= count(a) AS has FROM t",
@@ -275,7 +275,7 @@ fn every_count_of_a_query_is_rewritten() {
         "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 \
          AND (SELECT count(*) FROM u WHERE u.c = t.a) = 0",
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) \
-         AND NOT EXISTS (SELECT 1 FROM u WHERE u.c = t.a)",
+         AND (NOT EXISTS (SELECT 1 FROM u WHERE u.c = t.a))",
     );
 }
 
@@ -462,7 +462,7 @@ fn wrappers_keep_the_column_name() {
         ),
         (
             format!("CASE WHEN a > 0 THEN false ELSE {C} = 0 END"),
-            format!("CASE WHEN a > 0 THEN false ELSE NOT {E} END AS \"case\""),
+            format!("CASE WHEN a > 0 THEN false ELSE (NOT {E}) END AS \"case\""),
         ),
         // COALESCE, GREATEST, LEAST, NULLIF.
         (
@@ -601,4 +601,30 @@ fn opt_out() {
         disabled: Default::default(),
     });
     assert_kept_in(&db, "SELECT count(*) > 0 FROM t");
+}
+
+/// `NOT` binds looser than `IS [NOT] NULL`, `ISNULL`, `NOTNULL`, `IS [NOT]
+/// UNKNOWN` and `IS [NOT] DISTINCT FROM`: the `NOT EXISTS` replacing
+/// `count = 0` is parenthesized, so a test after it still applies to the
+/// whole comparison.
+#[test]
+fn not_exists_keeps_a_trailing_test_on_the_comparison() {
+    const C: &str = "(SELECT count(*) FROM u WHERE u.t_id = t.id)";
+    const E: &str = "(NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id))";
+    for test in [
+        "IS NOT NULL",
+        "ISNULL",
+        "NOTNULL",
+        "IS NOT UNKNOWN",
+        "IS NOT DISTINCT FROM NULL::bool",
+    ] {
+        assert_rewritten(
+            &format!("SELECT id FROM t WHERE {C} = 0 {test}"),
+            &format!("SELECT id FROM t WHERE {E} {test}"),
+        );
+        assert_rewritten(
+            &format!("SELECT id FROM t WHERE 0 = {C} {test}"),
+            &format!("SELECT id FROM t WHERE {E} {test}"),
+        );
+    }
 }

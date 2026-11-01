@@ -60,10 +60,22 @@ enum Test {
 }
 
 impl Test {
+    /// What closes [`Test::keyword`] after the subquery.
+    fn close(self) -> &'static str {
+        match self {
+            Test::Any => "",
+            Test::None => ")",
+        }
+    }
+
     fn keyword(self) -> &'static str {
         match self {
             Test::Any => "EXISTS",
-            Test::None => "NOT EXISTS",
+            // Parenthesized, with a `)` after the subquery (see
+            // `sublink_form`): `NOT` binds looser than `IS [NOT] NULL`,
+            // `IS [NOT] DISTINCT FROM` and the like, so a bare `NOT EXISTS
+            // (…) IS NOT NULL` would test the EXISTS, not the comparison.
+            Test::None => "(NOT EXISTS",
         }
     }
 }
@@ -129,6 +141,22 @@ impl<'a> Text<'a> {
             })
             .collect::<Option<Vec<_>>>()?;
         Some(Text { sql, toks })
+    }
+
+    /// The index of the `)` closing the parenthesis token `open`.
+    fn matching_close(&self, open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (i, tok) in self.toks.iter().enumerate().skip(open) {
+            if tok.is(Token::Ascii40) {
+                depth += 1;
+            } else if tok.is(Token::Ascii41) {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     /// The index of the token starting at `at`.
@@ -530,12 +558,19 @@ fn sublink_form(
         });
         edits.push(Edit {
             range: from..to,
-            text: String::new(),
+            text: cmp.test.close().to_owned(),
         });
     } else {
         // `0 < (…)`: drop the literal and the operator, up to the token
         // after the operator.
         let to = text.toks.get(op_tok + 1)?.start;
+        if cmp.test == Test::None {
+            let close = text.toks[text.matching_close(sub_tok)?].end;
+            edits.push(Edit {
+                range: close..close,
+                text: cmp.test.close().to_owned(),
+            });
+        }
         if to == sub_at {
             edits.push(Edit {
                 range: lit_start..to,
@@ -697,7 +732,11 @@ fn top_level_form(
         },
         Edit {
             range: stmt_end..stmt_end,
-            text: format!(") AS {}", typedpg_core::quote_identifier(&column.name)),
+            text: format!(
+                "){} AS {}",
+                cmp.test.close(),
+                typedpg_core::quote_identifier(&column.name)
+            ),
         },
     ])
 }
