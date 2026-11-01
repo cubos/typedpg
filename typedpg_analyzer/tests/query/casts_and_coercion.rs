@@ -635,6 +635,30 @@ fn integer_constants_assigned_out_of_range_are_rejected() {
             "INSERT INTO s (k, a) SELECT 1, x FROM (SELECT 40000 AS x) q WHERE false",
             "smallint out of range",
         ),
+        // So is a FROM subquery an UPDATE or a MERGE action reads, whatever
+        // its WHERE.
+        (
+            "UPDATE s SET a = q.x FROM (SELECT 40000 AS x WHERE false) q",
+            "smallint out of range",
+        ),
+        (
+            "UPDATE s SET a = q.x FROM (SELECT 40000 AS x WHERE false) q WHERE false",
+            "smallint out of range",
+        ),
+        (
+            "UPDATE s SET (a, b) = (q.x, 1) FROM (SELECT 40000 AS x WHERE false) q",
+            "smallint out of range",
+        ),
+        (
+            "MERGE INTO s USING (SELECT 40000 AS x WHERE false) q ON s.b = 1 \
+             WHEN MATCHED THEN UPDATE SET a = q.x",
+            "smallint out of range",
+        ),
+        (
+            "MERGE INTO s USING (SELECT 40000 AS x WHERE false) q ON s.b = 1 \
+             WHEN NOT MATCHED THEN INSERT (k, a) VALUES (1, q.x)",
+            "smallint out of range",
+        ),
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -661,6 +685,9 @@ fn integer_constants_assigned_in_range_or_never_converted_are_accepted() {
         // On the nullable side of an outer join a PlaceHolderVar keeps the
         // pulled-up constant from being folded; an unread one never is.
         "INSERT INTO s (k, a) SELECT s.k, q.x FROM s LEFT JOIN (SELECT 40000 AS x) q ON true",
+        "UPDATE s SET a = q.x FROM s s2 LEFT JOIN (SELECT 40000 AS x) q ON true",
+        // A sublink's output is converted as it is evaluated.
+        "UPDATE s SET a = (SELECT q.x) FROM (SELECT 40000 AS x WHERE false) q",
         "INSERT INTO s (k, a) SELECT 1, 4 FROM (SELECT 40000 AS x) q",
         "INSERT INTO s (k, a) SELECT 1, x FROM (SELECT 4 AS x) q",
         // OVERRIDING USER VALUE discards the value unconverted.

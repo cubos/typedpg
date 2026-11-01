@@ -480,6 +480,7 @@ pub(crate) fn analyze_set_clause<'a>(
                 {
                     return Err(err);
                 }
+                super::deferred::record_read(val, ctx.scope);
                 if !target.indirected
                     && let Some(err) = crate::typmod::check_literal_assignment(
                         snapshot,

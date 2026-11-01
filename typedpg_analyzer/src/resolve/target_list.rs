@@ -253,20 +253,7 @@ pub(crate) fn resolve_target_list_explicit(
             TypeGoal::NONE,
         )?;
         // A column a pulled-up subquery substitutes its output for.
-        if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() {
-            let parts = expr::extract_string_fields(&cr.fields);
-            let (table, column) = match parts.as_slice() {
-                [c] if parts.len() == cr.fields.len() => (None, Some(c.as_str())),
-                [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), Some(c.as_str())),
-                _ => (None, None),
-            };
-            if let Some(column) = column
-                && let Ok(col) = scope.resolve_column(table, column, None)
-                && let Some(e) = col.deferred.expr.clone()
-            {
-                super::deferred::record_substitution(val, e);
-            }
-        }
+        super::deferred::record_read(val, scope);
 
         // Determine column name: explicit alias, or inferred from expression.
         // An explicit alias may carry the `!` / `?` nullability annotation:

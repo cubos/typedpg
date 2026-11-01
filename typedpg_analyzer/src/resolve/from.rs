@@ -65,25 +65,51 @@ thread_local! {
 fn with_nullable_side<R>(
     join: &protobuf::JoinExpr,
     arg: &protobuf::Node,
+    snapshot: &PgCatalog,
     f: impl FnOnce() -> R,
 ) -> R {
-    let equates = join.is_natural
-        || !join.using_clause.is_empty()
-        || join
-            .quals
-            .as_deref()
-            .and_then(|q| q.node.as_ref())
-            .is_some_and(|q| {
-                q.nodes().into_iter().any(|(n, _)| {
-                    matches!(n, typedpg_pg_query::NodeRef::AExpr(e)
-                    if crate::expr::extract_string_fields(&e.name).last().is_some_and(|o| o == "="))
-                })
-            });
+    // The join equates the side, or the side's own query does (a LATERAL
+    // one equating the other side, one restricting its relation to a
+    // constant): it may be proven unique for the join.
+    let has_equality = |q: &protobuf::Node| {
+        q.node.as_ref().is_some_and(|q| {
+            q.nodes().into_iter().any(|(n, _)| {
+                matches!(n, typedpg_pg_query::NodeRef::AExpr(e)
+                    if crate::expr::extract_string_fields(&e.name)
+                        .last()
+                        .is_some_and(|o| o == "="))
+            })
+        })
+    };
+    let equates = crate::expr::plan_fold::join_equates(join)
+        || match arg.node.as_ref() {
+            Some(node::Node::RangeSubselect(s)) => s.subquery.as_deref().is_some_and(has_equality),
+            Some(node::Node::RangeVar(rv)) => snapshot
+                .resolve_table(
+                    (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str()),
+                    &rv.relname,
+                )
+                .filter(|c| c.relkind == crate::pg_catalog::RelKind::View)
+                .and_then(|c| crate::ddl::views::view_query(snapshot, c.oid))
+                .is_some_and(|q| has_equality(&q)),
+            _ => false,
+        };
+    // A column of it read above the join keeps the join.
+    let alias = match arg.node.as_ref() {
+        Some(node::Node::RangeSubselect(s)) => s.alias.as_ref().map(|a| a.aliasname.as_str()),
+        Some(node::Node::RangeVar(rv)) => Some(
+            rv.alias
+                .as_ref()
+                .map_or(rv.relname.as_str(), |a| a.aliasname.as_str()),
+        ),
+        _ => None,
+    };
     let alone = equates
         && matches!(
             arg.node,
             Some(node::Node::RangeSubselect(_) | node::Node::RangeVar(_))
-        );
+        )
+        && !alias.is_some_and(|a| crate::expr::plan_fold::read_above(a, join, snapshot));
     let before = REMOVABLE_SIDE.with(|k| k.replace(alone));
     let out = f();
     REMOVABLE_SIDE.with(|k| k.set(before));
@@ -124,7 +150,8 @@ fn rows_kept() -> bool {
     ROWS_KEPT.with(|k| k.get())
 }
 
-fn with_rows_kept<R>(kept: bool, f: impl FnOnce() -> R) -> R {
+/// Run `f`, processing a FROM item never null-extended when `kept`.
+pub(crate) fn with_rows_kept<R>(kept: bool, f: impl FnOnce() -> R) -> R {
     let before = ROWS_KEPT.with(|k| k.replace(kept));
     let out = f();
     ROWS_KEPT.with(|k| k.set(before));
@@ -184,6 +211,17 @@ pub(crate) fn process_from_item(
                         })
                         .collect()
                 };
+                // An inlined CTE's outputs replace a reference to them only
+                // where it is never null-extended (a PlaceHolderVar wraps
+                // them elsewhere).
+                if !rows_kept() {
+                    for c in &mut cte_cols {
+                        if c.deferred.substitution == crate::scope::Substitution::Certain {
+                            c.deferred.substitution = crate::scope::Substitution::Maybe;
+                            c.deferred.expr = None;
+                        }
+                    }
+                }
                 // Each reference scans the CTE's rows anew.
                 let mut cte_cols = realias(cte_cols);
                 fresh_scans(&mut cte_cols);
@@ -1120,7 +1158,7 @@ fn process_join_expr(
                 let mut process =
                     || process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params);
                 match join_type {
-                    JoinType::JoinRight => with_nullable_side(join, larg, process),
+                    JoinType::JoinRight => with_nullable_side(join, larg, snapshot, process),
                     _ => process(),
                 }
             },
@@ -1147,7 +1185,7 @@ fn process_join_expr(
                 let mut process =
                     || process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params);
                 match join_type {
-                    JoinType::JoinLeft => with_nullable_side(join, rarg, process),
+                    JoinType::JoinLeft => with_nullable_side(join, rarg, snapshot, process),
                     _ => process(),
                 }
             },
@@ -1190,21 +1228,41 @@ fn process_join_expr(
             JoinType::JoinRight => left.sources(scope),
             _ => &[],
         };
-        let removable: Vec<String> = if nullable_side
+        // Not when a column of it is read above the join, nor a table the
+        // join can't prove unique (see `join_may_prove_unique`).
+        let removable: Vec<String> = if nullable_side.iter().any(|s| {
+            expr::plan_fold::may_be_removed(s, snapshot)
+                && (!matches!(s.kind, crate::scope::SourceKind::Relation)
+                    || s.relid.is_none_or(|relid| {
+                        expr::plan_fold::join_may_prove_unique(join, &s.alias, relid, snapshot)
+                    }))
+        }) && !nullable_side
             .iter()
-            .any(|s| expr::plan_fold::may_be_removed(s, snapshot))
+            .any(|s| expr::plan_fold::read_above(&s.alias, join, snapshot))
         {
             nullable_side.iter().map(|s| s.alias.clone()).collect()
         } else {
             Vec::new()
         };
+        // `pull_up_sublinks` turns the IN / EXISTS sublinks of an inner
+        // join's ON clause reading the join's sides into semi-joins above
+        // it, like a WHERE clause's — this level's, when the join is never
+        // null-extended (see `plan_fold::Group::walk`).
+        let pulls_up = join_type == JoinType::JoinInner && kept;
         expr::plan_fold::skip_restrictions_on(removable, || {
-            crate::clause::coerce_clause_expr(
-                quals,
-                expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
-                params,
-                crate::clause::ClauseKind::JoinOn,
-            )
+            let mut coerce = || {
+                crate::clause::coerce_clause_expr(
+                    quals,
+                    expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
+                    params,
+                    crate::clause::ClauseKind::JoinOn,
+                )
+            };
+            if pulls_up {
+                expr::plan_fold::with_where_clause(quals, coerce)
+            } else {
+                coerce()
+            }
         })?;
         check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
         on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log, snapshot);

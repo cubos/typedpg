@@ -693,7 +693,12 @@ fn build_insert_cte_scopes(
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &ins.with_clause {
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
+        let owner = protobuf::Node {
+            node: Some(node::Node::InsertStmt(Box::new(ins.clone()))),
+        };
+        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+            analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
+        })?;
     }
     Ok(cte_scopes)
 }
@@ -2215,7 +2220,15 @@ fn analyze_update_here(
     let _level = QueryLevel::enter();
     // The target is one of the level's relations.
     let from = with_target(upd.relation.as_ref(), &upd.from_clause);
-    let _plan = expr::plan_fold::PlanLevel::enter(upd.where_clause.as_deref(), &from, snapshot);
+    let _plan = expr::plan_fold::PlanLevel::enter_dml(
+        upd.where_clause.as_deref(),
+        &from,
+        upd.relation.as_ref(),
+        upd.with_clause.as_ref(),
+        typedpg_pg_query::NodeRef::UpdateStmt(upd),
+        outer_ctes.keys(),
+        snapshot,
+    );
     let relation = upd
         .relation
         .as_ref()
@@ -2264,7 +2277,12 @@ fn analyze_update_here(
     // reasoning as the corresponding block in `analyze_insert`.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &upd.with_clause {
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
+        let owner = protobuf::Node {
+            node: Some(node::Node::UpdateStmt(Box::new(upd.clone()))),
+        };
+        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+            analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
+        })?;
     }
     check_current_of_on_view(upd.where_clause.as_deref(), snapshot, table_oid)?;
 
@@ -2464,7 +2482,15 @@ fn analyze_delete_here(
     let _level = QueryLevel::enter();
     // The target is one of the level's relations.
     let from = with_target(del.relation.as_ref(), &del.using_clause);
-    let _plan = expr::plan_fold::PlanLevel::enter(del.where_clause.as_deref(), &from, snapshot);
+    let _plan = expr::plan_fold::PlanLevel::enter_dml(
+        del.where_clause.as_deref(),
+        &from,
+        del.relation.as_ref(),
+        del.with_clause.as_ref(),
+        typedpg_pg_query::NodeRef::DeleteStmt(del),
+        outer_ctes.keys(),
+        snapshot,
+    );
     let relation = del
         .relation
         .as_ref()
@@ -2506,7 +2532,12 @@ fn analyze_delete_here(
     // with the collector and the CTE alias is visible to the USING clause.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &del.with_clause {
-        cte_scopes = analyze_with_clause(with, snapshot, params, &cte_scopes, &[])?;
+        let owner = protobuf::Node {
+            node: Some(node::Node::DeleteStmt(Box::new(del.clone()))),
+        };
+        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+            analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
+        })?;
     }
     check_current_of_on_view(del.where_clause.as_deref(), snapshot, table_oid)?;
 

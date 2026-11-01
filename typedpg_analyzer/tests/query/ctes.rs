@@ -287,3 +287,95 @@ fn an_inlined_cte_planned_on_its_own_fails_where_its_reference_is_planned() {
             .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));
     }
 }
+
+#[test]
+fn a_cte_referenced_only_from_unreferenced_ctes_is_still_planned() {
+    // `cterefcount` counts the references in the WITH's other CTE bodies,
+    // planned or not: `a`, referenced twice, isn't inlined, and
+    // `SS_process_ctes` plans it although `b` and `d` are never planned.
+    let mut db = planned_setup();
+    db.apply_sql("CREATE TABLE s9 (a int2, b int);").unwrap();
+    for sql in [
+        "WITH a AS (SELECT 1 / 0 AS x), b AS (SELECT * FROM a), d AS (SELECT * FROM a) SELECT 1",
+        "WITH a AS MATERIALIZED (SELECT 1 / 0 AS x), b AS (SELECT * FROM a) SELECT 1",
+        "WITH a AS MATERIALIZED (SELECT 1 / 0 AS x) SELECT 1 WHERE false AND EXISTS (SELECT 1 FROM a)",
+        "WITH a AS (SELECT x FROM t WHERE 1 / 0 = 1), b AS (SELECT * FROM a), \
+         d AS (SELECT * FROM a) SELECT 1",
+        "SELECT * FROM (WITH a AS (SELECT 1 / 0 AS x), b AS (SELECT * FROM a), \
+         d AS (SELECT * FROM a) SELECT 1) s",
+        "WITH a AS (SELECT 1 / 0 AS x), b AS (SELECT * FROM a), d AS (SELECT * FROM a) \
+         INSERT INTO s9 (a) VALUES (1)",
+        "WITH a AS (SELECT 1 / 0 AS x), b AS (SELECT * FROM a), d AS (SELECT * FROM a) \
+         UPDATE s9 SET a = 1",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DivisionByZero(_),
+            "division by zero"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze(
+            "WITH a AS (SELECT 40000::int2 AS y, x FROM t), b AS (SELECT x FROM a), \
+             d AS (SELECT x FROM a) SELECT 1"
+        ),
+        AnalyzeError::NumericValueOutOfRange(_),
+        "smallint out of range"
+    );
+    for sql in [
+        // Referenced by nothing: never planned.
+        "WITH a AS MATERIALIZED (SELECT 1 / 0 AS x) SELECT 1",
+        // Referenced once, from a CTE nothing references: inlined there.
+        "WITH a AS (SELECT 1 / 0 AS x), b AS (SELECT * FROM a) SELECT 1",
+        // The level owning the WITH is never planned.
+        "SELECT CASE WHEN true THEN 1 ELSE (WITH a AS (SELECT 1 / 0 AS x), \
+         b AS (SELECT * FROM a), d AS (SELECT * FROM a) SELECT 1) END",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));
+    }
+}
+
+#[test]
+fn an_inlined_cte_pulled_up_has_its_outputs_folded_where_they_are_read() {
+    // Inlined and pulled up like a FROM subquery, its outputs replace the
+    // references to them before constant folding: the assignment
+    // conversion of `x` to int2 is folded at plan time.
+    let mut db = planned_setup();
+    db.apply_sql("CREATE TABLE s9 (a int2, b int);").unwrap();
+    for sql in [
+        "WITH c AS (SELECT 40000 AS x WHERE false) INSERT INTO s9 (a) SELECT x FROM c",
+        "WITH c AS (SELECT 40000 AS x WHERE false) INSERT INTO s9 (a) \
+         SELECT x FROM (SELECT x FROM c) q",
+        "WITH c AS (SELECT 40000 AS x WHERE false) SELECT x::int2 FROM c",
+        "WITH c AS (SELECT 40000 AS x WHERE false) UPDATE s9 SET a = c.x FROM c",
+        "WITH c AS (SELECT 40000 AS x WHERE false) MERGE INTO s9 USING c ON s9.b = 1 \
+         WHEN MATCHED THEN UPDATE SET a = c.x",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::NumericValueOutOfRange(_),
+            "smallint out of range"
+        );
+    }
+    for sql in [
+        "WITH c AS (SELECT 0 AS z WHERE false) SELECT 1 / z FROM c",
+        "WITH c AS (SELECT 0 AS z WHERE false) SELECT 1 FROM t JOIN c ON true WHERE 1 / c.z = 1",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DivisionByZero(_),
+            "division by zero"
+        );
+    }
+    for sql in [
+        // Unread.
+        "WITH c AS (SELECT 40000 AS x, 1 AS y WHERE false) INSERT INTO s9 (b) SELECT y FROM c",
+        // Null-extended: a PlaceHolderVar keeps the output from folding.
+        "WITH c AS (SELECT 0 AS z WHERE false) \
+         SELECT 1 FROM t LEFT JOIN c ON true WHERE 1 / c.z = 1",
+    ] {
+        db.analyze(sql)
+            .unwrap_or_else(|e| panic!("{sql}: unexpected error {e}"));
+    }
+}
