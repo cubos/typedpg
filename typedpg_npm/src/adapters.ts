@@ -43,6 +43,9 @@ export interface PostgresJsSql {
 /** Anything a query runs on. */
 export type Executor = Driver | PgQueryable | PostgresJsSql;
 
+/** PostgreSQL's `unknown` pseudo-type: a parameter whose type the server infers. */
+const UNKNOWN_OID = 705;
+
 /** node-postgres: every type parsed as the text it is. */
 const rawTypes = { getTypeParser: () => (value: string) => value };
 
@@ -81,6 +84,10 @@ function nodePostgres(pg: PgQueryable): Driver {
   };
   return {
     async typedpgQuery(text, params) {
+      // One round trip (Parse, Bind, Describe, Execute, Sync), on the
+      // unnamed statement: no `name`, so each execution is planned with its
+      // values. `types` (not an array) declares no parameter type in the
+      // Parse: the server infers each from its placeholder's cast.
       const result = await any.query({ text, values: params, rowMode: "array", types: rawTypes });
       return {
         rows: result.rows,
@@ -150,16 +157,30 @@ function nodePostgres(pg: PgQueryable): Driver {
 
 function postgresJs(sql: PostgresJsSql): Driver {
   const any = sql as any;
-  // postgres.js serializes a parameter by the type the server infers for it
-  // (`JSON.stringify` for a jsonb one), which would encode our text a second
-  // time: declare each as `text` (oid 25), whose serializer leaves it as is
-  // — the placeholder's cast (`($1::pg_catalog.jsonb)`) reads it as its type.
-  const values = (params: (string | null)[]) => params.map((p) => (p === null ? null : any.typed(p, 25)));
+  // Each parameter is declared `unknown` (oid 705). The server resolves an
+  // `unknown` parameter as it does an unspecified one (oid 0): to the type
+  // of the cast after its placeholder (`$1::public.mood`), which reads the
+  // text directly. Declared `text`, the cast would be a text-to-type
+  // conversion, and one through a STABLE input function (enums,
+  // timestamptz, date, arrays…) isn't folded: a seq-scan filter runs it on
+  // every row. Unspecified (`typed(p, 0)`) won't do either: postgres.js
+  // then serializes the value by the type the server reports
+  // (`JSON.stringify` for jsonb, `new Date()` for timestamptz…), encoding
+  // our text a second time. It has no serializer for `unknown`, so the
+  // text goes as is.
+  const values = (params: (string | null)[]) => params.map((p) => (p === null ? null : any.typed(p, UNKNOWN_OID)));
   const text = (v: Uint8Array | null) => (v === null ? null : Buffer.from(v).toString("utf8"));
+  // `prepare: false`, `unsafe()`'s default: the unnamed statement, planned
+  // with each execution's values. A prepared one would be cached on the
+  // connection and, after five executions, planned generically. postgres.js
+  // describes a statement it hasn't prepared before binding it, to learn
+  // its parameter types: a query with parameters costs two round trips,
+  // which nothing in its API avoids short of preparing.
+  const unprepared = { prepare: false };
   return {
     async typedpgQuery(query, params) {
       // `.raw()`: each value's bytes, undecoded.
-      const result = await any.unsafe(query, values(params)).raw();
+      const result = await any.unsafe(query, values(params), unprepared).raw();
       return {
         rows: result.map((row: (Uint8Array | null)[]) => row.map(text)),
         fields: result.columns?.map((c: { name: string }) => c.name),
@@ -167,7 +188,7 @@ function postgresJs(sql: PostgresJsSql): Driver {
       };
     },
     async *typedpgStream(query, params, batchSize) {
-      for await (const rows of any.unsafe(query, values(params)).raw().cursor(batchSize)) {
+      for await (const rows of any.unsafe(query, values(params), unprepared).raw().cursor(batchSize)) {
         yield rows.map((row: (Uint8Array | null)[]) => row.map(text));
       }
     },
