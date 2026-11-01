@@ -429,42 +429,66 @@ fn session_replication_role_voids_the_proof() {
         "SET U&\"session\\005freplication\\005frole\" = replica; \
          RESET U&\"session\\005freplication\\005frole\";",
         "SELECT set_config(U&'session\\005freplication\\005frole', 'origin', false);",
-        // Code run at migration time that may turn the checks off.
+        // A routine or DO block whose body may turn the checks off,
+        // defined — however (and whether) it is ever run.
         "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
-         BEGIN IF false THEN EXECUTE 'ALTER TABLE orders DISABLE TRIGGER ALL'; END IF; END $$; \
-         SELECT off();",
+         BEGIN IF false THEN EXECUTE 'ALTER TABLE orders DISABLE TRIGGER ALL'; END IF; END $$;",
         "CREATE PROCEDURE off() LANGUAGE plpgsql AS $$ \
-         BEGIN IF false THEN UPDATE pg_trigger SET tgenabled = 'D'; END IF; END $$; \
-         CALL off();",
+         BEGIN IF false THEN UPDATE pg_trigger SET tgenabled = 'D'; END IF; END $$;",
         "CREATE FUNCTION off() RETURNS text LANGUAGE plpgsql AS $$ \
          BEGIN IF false THEN PERFORM set_config('session_replication' || '_role', 'replica', \
-         false); END IF; RETURN ''; END $$; \
-         CREATE FUNCTION calls_off() RETURNS text LANGUAGE sql AS 'SELECT off()'; \
-         SELECT calls_off();",
-        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
-         BEGIN IF false THEN EXECUTE format('SET session_%s_role = replica', 'replication'); \
-         END IF; END $$; \
-         ALTER FUNCTION off() RENAME TO renamed; SELECT renamed();",
+         false); END IF; RETURN ''; END $$;",
         "DO $$ BEGIN IF false THEN EXECUTE 'ALTER TABLE orders DISABLE TRIGGER ALL'; \
          END IF; END $$;",
-        "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN IF false THEN EXECUTE 'SELECT 1'; END IF; RETURN NEW; END $$; \
-         CREATE TABLE logged (id int); \
-         CREATE TRIGGER t BEFORE INSERT ON logged FOR EACH ROW EXECUTE FUNCTION trg(); \
-         INSERT INTO logged VALUES (1);",
+        // `DISABLE TRIGGER` split by a newline, a tab, a comment.
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN ALTER TABLE orders DISABLE\nTRIGGER ALL; END IF; END $$;",
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN ALTER TABLE orders DISABLE\tTRIGGER ALL; END IF; END $$;",
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN ALTER TABLE orders DISABLE /**/ TRIGGER ALL; END IF; END $$;",
+        // A SQL body, BEGIN ATOMIC, a catalog named with `U&` escapes.
+        "CREATE FUNCTION n() RETURNS bigint LANGUAGE sql \
+         AS $$ SELECT count(*) FROM U&\"\\0070g_class\" $$;",
+        "CREATE FUNCTION n() RETURNS bigint LANGUAGE sql \
+         BEGIN ATOMIC SELECT count(*) FROM pg_catalog.pg_constraint; END;",
+        // Reached through a column DEFAULT, replaced afterwards.
+        "CREATE FUNCTION d() RETURNS int LANGUAGE sql AS 'SELECT 1'; \
+         CREATE TABLE with_default (a int DEFAULT d()); \
+         CREATE OR REPLACE FUNCTION d() RETURNS int LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN EXECUTE 'SELECT 1'; END IF; RETURN 1; END $$;",
+        // Through an operator.
+        "CREATE FUNCTION opf(int, int) RETURNS bool LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN PERFORM set_config('a.b', 'c', false); END IF; RETURN true; END $$; \
+         CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = opf);",
+        // Through a trigger a cascade fires.
+        "CREATE TABLE lines (id int PRIMARY KEY, \
+         order_id bigint NOT NULL REFERENCES orders ON DELETE CASCADE); \
+         CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN EXECUTE 'SELECT 1'; END IF; RETURN OLD; END $$; \
+         CREATE TRIGGER t BEFORE DELETE ON lines FOR EACH ROW EXECUTE FUNCTION tf();",
+        // Writes through a view over a catalog.
+        "CREATE VIEW trg AS SELECT oid, tgenabled FROM pg_catalog.pg_trigger; \
+         UPDATE trg SET tgenabled = 'D' WHERE false;",
+        "CREATE VIEW trg AS SELECT oid FROM pg_trigger; DELETE FROM trg WHERE false;",
+        "CREATE VIEW cls AS SELECT oid, relhastriggers FROM pg_catalog.pg_class; \
+         UPDATE cls SET relhastriggers = false WHERE false;",
     ] {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(tables).unwrap();
         db.apply_sql(setting).unwrap();
         assert_kept(&db, &[sql]);
     }
-    // A routine defined but never run by the migrations doesn't count (as
-    // one the application runs).
+    // Code without any of the markers leaves the proof alone.
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(tables).unwrap();
     db.apply_sql(
-        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
-         BEGIN EXECUTE 'ALTER TABLE orders DISABLE TRIGGER ALL'; END $$;",
+        "CREATE FUNCTION add_one(i int) RETURNS int LANGUAGE plpgsql AS $$ \
+         BEGIN -- a comment\n RETURN i + 1; END $$; \
+         CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN NEW.id := NEW.id; RETURN NEW; END $$; \
+         CREATE TRIGGER t BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION touch(); \
+         DO $$ BEGIN PERFORM add_one(1); END $$;",
     )
     .unwrap();
     assert_simplified(&db, &[(sql, "SELECT o.id FROM orders o")]);

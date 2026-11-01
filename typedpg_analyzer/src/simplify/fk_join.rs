@@ -24,7 +24,7 @@
 //!   TRIGGER ALL` on either table, even if enabled again later: rows
 //!   written meanwhile were never checked) nor did anything else that may
 //!   turn them off (`crate::ddl::fk_bypass`: `session_replication_role`,
-//!   catalog writes, subscriptions, routines run that might);
+//!   catalog writes, subscriptions, any routine defined that might);
 //! - the parent has no row security, which could hide the referenced row;
 //! - the scan of the parent is the relation the key looks rows up in — not
 //!   one with inheritance children, whose rows may repeat the key, nor

@@ -349,9 +349,6 @@ pub struct PgCatalog {
     /// triggers enforcing foreign keys (in `replica` mode) for whatever
     /// they wrote meanwhile.
     pub(crate) fk_checks_bypassed: bool,
-    /// Routines whose body may turn foreign-key checks off when it runs
-    /// (see `ddl::fk_bypass`).
-    pub(crate) fk_bypass_routines: Shared<std::collections::HashSet<crate::oid::PgProcOid>>,
     /// Foreign keys (and clones) PG marked validated without checking the
     /// rows: `ALTER CONSTRAINT ... ENFORCED` together with a change of
     /// deferrability rewrites an enforced NOT VALID key's row as validated
@@ -761,7 +758,6 @@ impl PgCatalog {
             ri_triggers_disabled: Shared::default(),
             ri_triggers_ever_disabled: Shared::default(),
             fk_checks_bypassed: false,
-            fk_bypass_routines: Shared::default(),
             fk_validity_unproven: Shared::default(),
             clustered_indexes: Shared::default(),
             statistics: Shared::default(),

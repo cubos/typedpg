@@ -425,10 +425,8 @@ fn note_user_code(db: &mut PgCatalog) {
 /// Apply a single parsed statement, noting what it does to foreign-key
 /// checks (`fk_bypass`).
 fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
-    let watch = fk_bypass::note(db, stmt);
-    dispatch_statement(db, stmt)?;
-    fk_bypass::record_routines(db, watch);
-    Ok(())
+    fk_bypass::note(db, stmt);
+    dispatch_statement(db, stmt)
 }
 
 /// Apply a single parsed statement, by kind.
