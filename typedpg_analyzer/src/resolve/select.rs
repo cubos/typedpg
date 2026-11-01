@@ -78,7 +78,9 @@ pub(crate) fn analyze_correlated_select(
         })
     };
     let (mut cols, p) = match semijoin {
-        Some(next) => expr::plan_fold::with_next_level(next, analyze),
+        Some(next) => {
+            expr::plan_fold::with_next_level(next, || expr::plan_fold::with_next_semijoin(analyze))
+        }
         None => analyze(),
     }?;
     // A planned sublink's plan is started — a SubPlan's always, a

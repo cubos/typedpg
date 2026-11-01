@@ -148,6 +148,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             matches!(w.node.as_ref(), Some(node::Node::MergeWhenClause(w))
                 if w.match_kind == protobuf::MergeMatchKind::MergeWhenNotMatchedBySource as i32)
         });
+        let _plan = crate::expr::plan_fold::PlanLevel::enter_merge_source(source_relation);
         super::from::with_rows_kept(kept, || {
             process_from_item(
                 source_relation,

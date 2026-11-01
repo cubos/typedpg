@@ -1144,3 +1144,330 @@ fn a_nullable_side_read_above_the_join_is_not_removed() {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+/// Assert each of `sql` is rejected with the invalid-regex error the
+/// planner raises estimating `rt.s ~ '('`.
+fn assert_regex_estimated(db: &PgCatalog, sqls: &[&str]) {
+    for sql in sqls {
+        match db.analyze(sql) {
+            Err(AnalyzeError::Invalid(m))
+                if m.starts_with("invalid regular expression: parentheses () not balanced") => {}
+            other => panic!("{sql}: expected the invalid-regex error, got {other:?}"),
+        }
+    }
+}
+
+/// Assert each of `sql` is accepted.
+fn assert_accepted(db: &PgCatalog, sqls: &[&str]) {
+    for sql in sqls {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn a_subquerys_select_list_keeps_a_join_only_where_the_query_reading_it_does() {
+    // Pulled up, a subquery's output nothing reads is referenced by
+    // nothing; planned on its own, `remove_unused_subquery_outputs` drops
+    // it. An EXISTS's select list is thrown away (`simplify_EXISTS_query`).
+    // Either way, it doesn't keep the join whose nullable side it reads.
+    let mut db = planner_setup();
+    db.apply_sql("CREATE TABLE s9 (a int2, b int);").unwrap();
+    let sub = "SELECT rt.id FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '('";
+    let accepted = [
+        format!("SELECT 1 FROM ({sub}) q"),
+        format!("WITH c AS ({sub}) SELECT 1 FROM c"),
+        format!("SELECT count(*) FROM ({sub}) q"),
+        format!("SELECT 1 WHERE EXISTS ({sub})"),
+        "SELECT q.id FROM (SELECT rt2.id, rt.id AS rid FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(') q"
+            .to_owned(),
+        format!("SELECT 1 FROM ({sub} OFFSET 0) q"),
+        "SELECT 1 FROM t WHERE EXISTS (SELECT rt.id FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(' WHERE rt2.id = t.id)"
+            .to_owned(),
+        format!("INSERT INTO s9 (b) SELECT 1 FROM ({sub}) q"),
+        format!("SELECT 1 FROM t, LATERAL ({sub}) q"),
+        format!("SELECT 1 FROM t LEFT JOIN ({sub}) q ON true"),
+        "SELECT t.id FROM t JOIN (SELECT rt2.id AS a, rt.id AS b FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(') q ON q.a = t.id"
+            .to_owned(),
+        "SELECT q.z FROM (SELECT rt2.id, rt.id FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(') q(z, a)"
+            .to_owned(),
+        "WITH c(z, a) AS (SELECT rt2.id, rt.id FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(') SELECT c.z FROM c"
+            .to_owned(),
+        format!("SELECT 1 FROM (SELECT q.id FROM ({sub}) q) q2"),
+        format!("SELECT 1 FROM ({sub} UNION ALL SELECT 1) q"),
+        "SELECT 1 FROM (SELECT rt2.id FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(' \
+         WINDOW w AS (ORDER BY rt.id)) q"
+            .to_owned(),
+        "SELECT 1 WHERE EXISTS (SELECT 1 FROM rt2 LEFT JOIN rt ON rt.id = rt2.id \
+         AND rt.s ~ '(' ORDER BY rt.id)"
+            .to_owned(),
+        "SELECT 1 WHERE EXISTS (SELECT 1 FROM rt2 LEFT JOIN rt ON rt.id = rt2.id \
+         AND rt.s ~ '(' GROUP BY rt.id)"
+            .to_owned(),
+        // Planned on its own under a row mark, a subquery's whole row is
+        // needed — its outputs, not what they don't read.
+        "MERGE INTO s9 USING (SELECT t.id FROM t LEFT JOIN rt ON rt.id = t.id \
+         AND rt.s ~ '(' OFFSET 0) q ON s9.b = q.id WHEN MATCHED THEN DELETE"
+            .to_owned(),
+    ];
+    assert_accepted(
+        &db,
+        &accepted.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let rejected = [
+        format!("SELECT q.id FROM ({sub}) q"),
+        format!("SELECT * FROM ({sub}) q"),
+        format!("SELECT q.* FROM ({sub}) q"),
+        format!("SELECT 1 FROM ({sub}) q WHERE q.id = 1"),
+        format!("SELECT 1 FROM t JOIN ({sub}) q ON q.id = t.id"),
+        "SELECT q.a FROM (SELECT rt2.id, rt.id FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(') q(z, a)"
+            .to_owned(),
+        "WITH c(z, a) AS (SELECT rt2.id, rt.id FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(') SELECT c.a FROM c"
+            .to_owned(),
+        format!("WITH c AS ({sub}) SELECT c.id FROM c"),
+        format!("WITH c AS ({sub}) SELECT 1 FROM c z WHERE z.id = 1"),
+        // Scanned, a CTE's every output is planned.
+        format!("WITH c AS MATERIALIZED ({sub}) SELECT 1 FROM c"),
+        format!("WITH c AS ({sub}) SELECT 1 FROM c, c c2"),
+        // A scalar or IN sublink's select list is its value.
+        format!("SELECT ({sub} LIMIT 1)"),
+        format!("SELECT 1 WHERE 1 IN ({sub})"),
+        // ORDER BY, GROUP BY, DISTINCT keep the subquery from being pulled
+        // up, and their columns from being dropped.
+        "SELECT 1 FROM (SELECT rt2.id FROM rt2 LEFT JOIN rt ON rt.id = rt2.id \
+         AND rt.s ~ '(' ORDER BY rt.id) q"
+            .to_owned(),
+        "SELECT 1 FROM (SELECT rt2.id FROM rt2 LEFT JOIN rt ON rt.id = rt2.id \
+         AND rt.s ~ '(' GROUP BY rt2.id, rt.id) q"
+            .to_owned(),
+        "SELECT 1 FROM (SELECT DISTINCT rt.id FROM rt2 LEFT JOIN rt ON rt.id = rt2.id \
+         AND rt.s ~ '(') q"
+            .to_owned(),
+        // An EXISTS whose select list `simplify_EXISTS_query` keeps.
+        "SELECT 1 WHERE EXISTS (SELECT row_number() OVER (ORDER BY rt.id) FROM rt2 \
+         LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(')"
+            .to_owned(),
+        format!("SELECT 1 WHERE EXISTS ({sub} OFFSET 1)"),
+        // The statement's own select list.
+        format!("INSERT INTO s9 (b) {sub}"),
+        format!("{sub} UNION ALL SELECT 1"),
+        // Row marks keep a pulled-up subquery's relations.
+        format!("UPDATE s9 SET b = 1 FROM ({sub}) q"),
+        format!("MERGE INTO s9 USING ({sub}) q ON true WHEN MATCHED THEN DELETE"),
+        format!("WITH c AS ({sub}) UPDATE s9 SET b = 1 FROM c"),
+        format!("SELECT 1 FROM t, ({sub}) q FOR UPDATE OF t"),
+    ];
+    assert_regex_estimated(
+        &db,
+        &rejected.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn a_read_constant_folding_drops_doesnt_keep_the_join() {
+    // `eval_const_expressions` folds `x OR true` to TRUE, a strict operator
+    // over NULL to NULL, a CASE with a constant WHEN to its branch: a
+    // column read only there is no longer needed above the join.
+    let db = planner_setup();
+    let join = "SELECT 1 FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '('";
+    let accepted = [
+        format!("{join} JOIN u ON u.id = rt2.id AND (u.x = rt.id OR true)"),
+        format!("{join} JOIN u ON u.id = rt2.id AND (u.x = rt.id AND NULL)"),
+        format!("{join} WHERE (rt.id = 1 OR true)"),
+        format!("{join} WHERE rt.id + NULL = 1"),
+        format!("{join} WHERE CASE WHEN true THEN true ELSE rt.id = 1 END"),
+        format!("{join} WHERE coalesce(1, rt.id) = 0"),
+        format!("{join} WHERE EXISTS (SELECT 1 FROM u WHERE u.x = rt.id AND false)"),
+        format!("{join} LEFT JOIN u ON u.id = rt.id WHERE u.x = 1 OR true"),
+        // A custom plan folds `rt.id = NULL` (all-NULL parameters).
+        format!("{join} WHERE rt.id = $1"),
+    ];
+    assert_accepted(
+        &db,
+        &accepted.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let rejected = [
+        format!("{join} JOIN u ON u.id = rt2.id AND u.x = rt.id"),
+        format!("{join} JOIN u ON u.id = rt2.id AND (u.x = rt.id OR false)"),
+        format!("{join} WHERE rt2.id = 1 OR rt.id = 2"),
+        format!("{join} WHERE NOT (rt.id = 2)"),
+        format!("{join} WHERE coalesce(rt.id, 0) = 0"),
+        format!("{join} WHERE coalesce(NULL, rt.id, 0) = 0"),
+    ];
+    assert_regex_estimated(
+        &db,
+        &rejected.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn a_nullable_side_certainly_kept_has_its_restrictions_estimated() {
+    // A nullable side kept above its join — read in a sublink, kept by row
+    // marks (UPDATE, DELETE, MERGE, FOR UPDATE), by another kept outer
+    // join's ON clause, or a table the join can't prove unique — is one of
+    // the top join domain's relations: a constant FALSE WHERE is a gating
+    // qual above the join, `col IS NULL` over it (null-extended) restricts
+    // nothing, and its restrictions are estimated.
+    let mut db = planner_setup();
+    db.apply_sql("CREATE TABLE s9 (a int2, b int);").unwrap();
+    let join = "rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '('";
+    let rejected = [
+        format!("SELECT rt.id FROM {join} WHERE false"),
+        format!("SELECT * FROM {join} WHERE false"),
+        format!("SELECT rt.id FROM {join} WHERE NULL"),
+        format!("SELECT rt.id FROM {join} WHERE rt2.id = 1 AND false"),
+        "SELECT x.id FROM rt2 LEFT JOIN (SELECT id FROM rt WHERE s ~ '(') x \
+         ON x.id = rt2.id WHERE x.id IS NULL"
+            .to_owned(),
+        format!("SELECT rt2.id FROM {join} WHERE rt.id IS NULL"),
+        "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' WHERE rt.id IS NULL".to_owned(),
+        "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' WHERE rt.id IS NULL AND t.x = 1".to_owned(),
+        // Read in a sublink.
+        format!("SELECT rt2.id, (SELECT rt.id) FROM {join}"),
+        format!("SELECT (SELECT rt.id FROM u LIMIT 1) FROM {join}"),
+        format!("SELECT 1 FROM {join} WHERE EXISTS (SELECT 1 FROM u WHERE u.x = rt.id)"),
+        format!("SELECT 1 FROM {join} WHERE rt2.id IN (SELECT x FROM u WHERE x = rt.id)"),
+        format!("SELECT 1 FROM {join} WHERE rt2.id IN (SELECT rt.id FROM u)"),
+        format!("SELECT 1 FROM {join} WHERE EXISTS (SELECT 1 FROM u JOIN t ON t.id = rt.id)"),
+        format!(
+            "SELECT 1 FROM {join} WHERE EXISTS \
+             (SELECT 1 FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.id = rt.id))"
+        ),
+        format!(
+            "SELECT 1 FROM {join} WHERE EXISTS \
+             (SELECT 1 FROM generate_series(1, 2) g WHERE rt.id = 1)"
+        ),
+        // Read in the ON clause of an outer join that is kept.
+        format!("SELECT 1 FROM {join} LEFT JOIN u ON u.id = rt.id WHERE u.x = 1"),
+        format!("SELECT 1 FROM {join} LEFT JOIN u ON u.id = rt.id WHERE u.x IS NULL"),
+        format!("SELECT u.x FROM {join} LEFT JOIN u ON u.id = rt.id"),
+        format!("SELECT 1 FROM {join} LEFT JOIN t ON t.x = rt.id"),
+        format!("SELECT 1 FROM {join} FULL JOIN u ON u.id = rt.id"),
+        // Not removable, the nullable side is in the top join domain: two
+        // constants equated there are a gating qual.
+        "SELECT 1 FROM t LEFT JOIN rt ON true WHERE rt.s ~ '(' AND rt.id = 1 AND rt.id = 2"
+            .to_owned(),
+        "SELECT 1 FROM t FULL JOIN rt ON true WHERE rt.s ~ '(' AND rt.id = 1 AND rt.id = 2"
+            .to_owned(),
+        // Row marks.
+        format!("UPDATE s9 SET b = rt.id FROM {join}"),
+        format!("UPDATE s9 SET b = 1 FROM {join}"),
+        format!("DELETE FROM s9 USING {join} WHERE s9.b = rt.id"),
+        format!("DELETE FROM s9 USING {join}"),
+        format!("MERGE INTO s9 USING {join} ON true WHEN MATCHED THEN DELETE"),
+        format!("SELECT rt2.id FROM {join} FOR UPDATE OF rt2"),
+        format!("WITH m AS (DELETE FROM s9 USING {join} RETURNING 1) SELECT 1"),
+        // A semi-join's relation proven empty doesn't keep another of its
+        // relations from being estimated.
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = rt.id AND u.x IS NULL \
+         WHERE rt.id = t.id AND rt.s ~ '(') AND false"
+            .to_owned(),
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = rt.id \
+         WHERE u.id IS NULL AND rt.id = t.id AND rt.s ~ '(') AND false"
+            .to_owned(),
+        "SELECT 1 FROM t WHERE t.x IN (SELECT rt.id FROM rt JOIN u ON u.id = rt.id \
+         WHERE rt.s ~ '(' AND u.id IS NULL)"
+            .to_owned(),
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND rt.s ~ '(') \
+         AND t.id IS NULL"
+            .to_owned(),
+    ];
+    assert_regex_estimated(
+        &db,
+        &rejected.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let accepted = [
+        // Removed (nothing reads it), the join leaves a single relation
+        // the FALSE qual proves empty.
+        format!("SELECT rt2.id FROM {join} WHERE false"),
+        "SELECT 1 FROM (SELECT * FROM t WHERE s ~ '(') q LEFT JOIN rt ON rt.id = q.id WHERE false"
+            .to_owned(),
+        // A strict qual reduces the outer join: `rt.id IS NULL` restricts
+        // `rt` again.
+        format!("SELECT rt2.id FROM {join} WHERE rt.id IS NULL AND rt.s = 'x'"),
+        "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' WHERE rt.id IS NULL AND rt.s = 'x'".to_owned(),
+        "SELECT 1 FROM (SELECT rt.id FROM t LEFT JOIN rt ON rt.s ~ '(' WHERE rt.id IS NULL) q \
+         WHERE q.id = 5"
+            .to_owned(),
+        // In the semi-join, the qual restricts the very relation.
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND rt.s ~ '(' \
+         AND rt.id IS NULL)"
+            .to_owned(),
+        "SELECT 1 FROM t WHERE t.x IN (SELECT rt.id FROM rt WHERE rt.s ~ '(' AND rt.id IS NULL)"
+            .to_owned(),
+        // A sublink naming another `rt`, or keeping no reference.
+        format!("SELECT 1 FROM {join} WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = 1)"),
+        format!("SELECT 1 FROM {join} WHERE rt2.id IN (SELECT rt.id FROM rt)"),
+        format!("SELECT 1 FROM {join} WHERE EXISTS (SELECT rt.id FROM u)"),
+        format!("SELECT 1 FROM {join} WHERE EXISTS (SELECT 1 FROM u, LATERAL (SELECT rt.id) l)"),
+        // The other outer join is removed first.
+        format!("SELECT 1 FROM {join} LEFT JOIN t ON t.id = rt.id"),
+        // A subquery planned on its own is still read through its row.
+        "UPDATE s9 SET b = (SELECT t.id FROM t LEFT JOIN rt ON rt.id = t.id AND rt.s ~ '(' \
+         LIMIT 1)"
+            .to_owned(),
+        "UPDATE s9 SET b = 1 FROM t LEFT JOIN rt ON rt.id = t.id WHERE t.s ~ '(' AND false"
+            .to_owned(),
+    ];
+    assert_accepted(
+        &db,
+        &accepted.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn a_join_proves_its_nullable_side_unique_only_by_equating_a_unique_key() {
+    // `join_is_removable` needs the nullable side proven unique for the
+    // join (`rel_is_distinct_for`): a table has every key column of a
+    // unique index equated by the join (or restricted to a constant), a
+    // subquery planned on its own makes its rows distinct. Otherwise the
+    // join is kept and the side estimated.
+    let db = planner_setup();
+    let q = "(SELECT * FROM t WHERE s ~ '(') q";
+    assert_regex_estimated(
+        &db,
+        &[
+            "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '('",
+            &format!("SELECT 1 FROM {q} LEFT JOIN rt ON rt.s = q.s WHERE false"),
+            &format!("SELECT 1 FROM {q} LEFT JOIN rt USING (s) WHERE false"),
+            &format!("SELECT 1 FROM {q} LEFT JOIN u USING (x) WHERE false"),
+            &format!(
+                "SELECT 1 FROM {q} LEFT JOIN (SELECT * FROM rt OFFSET 0) r ON r.id = q.id \
+                 WHERE false"
+            ),
+            "SELECT 1 FROM t LEFT JOIN (SELECT rt.id FROM rt WHERE rt.s ~ '(' OFFSET 0) r \
+             ON r.id = t.id WHERE false",
+            "SELECT 1 FROM t LEFT JOIN (SELECT rt.id FROM rt WHERE rt.s ~ '(') r ON true",
+        ],
+    );
+    assert_accepted(
+        &db,
+        &[
+            "SELECT 1 FROM t LEFT JOIN rt ON rt.id = 1 AND rt.s ~ '('",
+            &format!("SELECT 1 FROM {q} LEFT JOIN rt ON rt.id = q.x WHERE false"),
+            &format!("SELECT 1 FROM {q} LEFT JOIN rt ON rt.id = 3 WHERE false"),
+            &format!("SELECT 1 FROM {q} LEFT JOIN rt USING (id) WHERE false"),
+            &format!("SELECT 1 FROM {q} NATURAL LEFT JOIN u WHERE false"),
+            &format!(
+                "SELECT 1 FROM {q} LEFT JOIN (SELECT DISTINCT id FROM rt) r ON r.id = q.id \
+                 WHERE false"
+            ),
+            &format!(
+                "SELECT 1 FROM {q} LEFT JOIN (SELECT id FROM rt GROUP BY id) r ON r.id = q.id \
+                 WHERE false"
+            ),
+            // A subquery's own equality (a LATERAL one's, a constant one)
+            // proves its relation unique once it is pulled up.
+            "SELECT 1 FROM t LEFT JOIN LATERAL (SELECT rt.id FROM rt \
+             WHERE rt.id = t.id AND rt.s ~ '(') r ON true",
+            "SELECT 1 FROM t LEFT JOIN (SELECT rt.id FROM rt WHERE rt.id = 1 AND rt.s ~ '(') r \
+             ON true",
+        ],
+    );
+}

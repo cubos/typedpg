@@ -17,7 +17,7 @@ use typedpg_pg_query::protobuf::{self, SetOperation, node};
 
 use crate::error::AnalyzeError;
 use crate::expr::PlanTimeError;
-use crate::expr::plan_fold::NextLevel;
+use crate::expr::plan_fold::{NextLevel, Outputs};
 use crate::pg_catalog::PgCatalog;
 
 /// How the planner plans a FROM subquery (or a CTE's query) the query
@@ -507,6 +507,8 @@ pub(crate) fn analyze<T>(
     snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
 ) -> (T, Split) {
+    // What the query reading it doesn't read of its outputs is dropped.
+    let run = || crate::expr::plan_fold::with_next_outputs(Outputs::Trimmed, run);
     if plan == Plan::Whole {
         return (run(), Split::default());
     }
@@ -614,6 +616,13 @@ pub(crate) fn analyze_cte<T>(
         Plan::Uncertain | Plan::Separate | Plan::PulledUp if scanned => Plan::Whole,
         plan => plan,
     };
+    // Scanned (or recursive), every output is; inlined, a subquery's.
+    let outputs = if scanned || recursive {
+        Outputs::Needed
+    } else {
+        Outputs::Trimmed
+    };
+    let run = || crate::expr::plan_fold::with_next_outputs(outputs, run);
     if plan == Plan::Uncertain || !crate::expr::plan_time_checks() {
         return (crate::expr::may_skip(run), PlannedCte::default());
     }
@@ -698,6 +707,7 @@ pub(crate) fn planned_errors<T>(
     removable_side: bool,
     run: impl FnOnce() -> T,
 ) -> Option<(T, Split)> {
+    let run = || crate::expr::plan_fold::with_next_outputs(Outputs::Trimmed, run);
     let plan = match plan_of(sel, snapshot) {
         _ if barrier && sel.op == SetOperation::SetopNone as i32 && sel.values_lists.is_empty() => {
             Plan::Separate
@@ -801,6 +811,7 @@ pub(crate) fn analyze_exists<T>(
     sel: &protobuf::SelectStmt,
     run: impl FnOnce() -> Result<T, AnalyzeError>,
 ) -> Result<T, AnalyzeError> {
+    let run = || crate::expr::plan_fold::with_next_outputs(Outputs::Exists, run);
     if !crate::expr::plan_time_checks() {
         return run();
     }
