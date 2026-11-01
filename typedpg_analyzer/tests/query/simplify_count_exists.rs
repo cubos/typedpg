@@ -182,7 +182,7 @@ fn correlated_in_where_and_dml() {
             "DELETE FROM u WHERE (SELECT count(*) FROM t WHERE t.id = u.t_id) = 0 \
              RETURNING (SELECT count(*) FROM t) > 0",
             "DELETE FROM u WHERE (NOT EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id)) \
-             RETURNING EXISTS (SELECT 1 FROM t) AS \"?column?\"",
+             RETURNING (SELECT count(*) FROM t) > 0",
         ),
     ] {
         assert_rewritten(sql, expected);
@@ -207,11 +207,6 @@ fn unnamed_output_columns_keep_their_name() {
         (
             "SELECT (0 < ((SELECT count(*) FROM t))) FROM u",
             "SELECT (EXISTS ((SELECT 1 FROM t))) AS \"?column?\" FROM u",
-        ),
-        // In a FROM subquery the name reaches the row's field names.
-        (
-            "SELECT row_to_json(s) AS j FROM (SELECT (SELECT count(*) FROM t) > 0) s",
-            "SELECT row_to_json(s) AS j FROM (SELECT EXISTS (SELECT 1 FROM t) AS \"?column?\") s",
         ),
     ] {
         assert_rewritten(sql, expected);
@@ -524,20 +519,56 @@ fn from_clause_positions_resolve_in_their_own_scope() {
     ] {
         assert_kept_in(&db, sql);
     }
-    // Where the ON's own side is what the name means, it is rewritten.
-    assert_rewritten_in(
+    // An ON condition or a LATERAL item is no place for a site at all
+    // (`rewrite_site_is_safe`), whatever the name resolves to.
+    assert_kept_in(
         &db,
         "SELECT a.id FROM a JOIN c2 ON c2.id = a.id \
          AND (SELECT count(*) FROM s WHERE s.k = a.id AND s.t = c2.t) > 0",
-        "SELECT a.id FROM a JOIN c2 ON c2.id = a.id \
-         AND EXISTS (SELECT 1 FROM s WHERE s.k = a.id AND s.t = c2.t)",
     );
-    assert_rewritten_in(
+    assert_kept_in(
         &db,
         "SELECT a.id FROM c2, a, LATERAL (SELECT 1 FROM s \
          WHERE (SELECT count(*) FROM s s2 WHERE s2.k = a.id AND s2.t = c2.t) > 0) l",
-        "SELECT a.id FROM c2, a, LATERAL (SELECT 1 FROM s \
-         WHERE EXISTS (SELECT 1 FROM s s2 WHERE s2.k = a.id AND s2.t = c2.t)) l",
+    );
+}
+
+/// As a semi- or anti-join the site moves above everything at its level:
+/// a JOIN ON condition that can fail then runs on rows the count used to
+/// veto first (`10 / (u.z * t.a)` on a pair whose count is 0), and the
+/// same holds for any level a nested site's query is pulled up into. Only
+/// the top-level WHERE (stored tables, error-free ON conditions and
+/// siblings) and the top-level target list qualify.
+#[test]
+fn sites_outside_the_top_level_are_kept() {
+    let db = setup_with("CREATE TABLE v (k bigint NOT NULL, z int NOT NULL);");
+    for sql in [
+        // An ON that can fail.
+        "SELECT t.id FROM t JOIN v ON t.id = v.k AND 10 / (v.z * t.a) > 1 \
+         WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0",
+        // A FROM subquery at the level.
+        "SELECT x.id FROM (SELECT id FROM t) x \
+         WHERE (SELECT count(*) FROM u WHERE u.t_id = x.id) > 0",
+        // Nested: in a subquery's WHERE, in a CTE, in a scalar subquery.
+        "SELECT id FROM t WHERE id IN (SELECT t_id FROM u \
+         WHERE (SELECT count(*) FROM t t2 WHERE t2.id = u.t_id) > 0)",
+        "WITH w AS (SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0) \
+         SELECT id FROM w",
+        "SELECT id, (SELECT (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0) AS x FROM t",
+        // HAVING.
+        "SELECT a FROM t GROUP BY a HAVING (SELECT count(*) FROM u WHERE u.c = t.a) > 0",
+        // RETURNING.
+        "DELETE FROM u WHERE c = 0 RETURNING (SELECT count(*) FROM t) > 0 AS x",
+    ] {
+        assert_kept_in(&db, sql);
+    }
+    // An error-free ON is fine.
+    assert_rewritten_in(
+        &db,
+        "SELECT t.id FROM t JOIN v ON t.id = v.k \
+         WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0",
+        "SELECT t.id FROM t JOIN v ON t.id = v.k \
+         WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)",
     );
 }
 
@@ -588,29 +619,21 @@ fn relations_that_are_not_plain_tables() {
 }
 
 /// A comparison another clause must match textually: rewriting one of
-/// the two copies alone would make PG reject the query. The driver applies
-/// a rule's candidates together, so both copies change as one — the same
-/// grouping and ordering, by the same boolean.
+/// the two copies alone would make PG reject the query. A GROUP BY or
+/// ORDER BY site isn't one `rewrite_site_is_safe` accepts, so the target
+/// list's copy can't change alone either: both are kept.
 #[test]
-fn copies_another_clause_must_match_change_together() {
+fn copies_another_clause_must_match_are_kept() {
     const C: &str = "(SELECT count(*) FROM u WHERE u.c = t.a) > 0";
-    const E: &str = "EXISTS (SELECT 1 FROM u WHERE u.c = t.a)";
-    assert_rewritten(
-        &format!("SELECT {C} AS x FROM t GROUP BY {C}"),
-        &format!("SELECT {E} AS x FROM t GROUP BY {E}"),
-    );
-    assert_rewritten(
-        &format!("SELECT DISTINCT {C} AS x FROM t ORDER BY {C}"),
-        &format!("SELECT DISTINCT {E} AS x FROM t ORDER BY {E}"),
-    );
+    assert_kept(&format!("SELECT {C} AS x FROM t GROUP BY {C}"));
+    assert_kept(&format!("SELECT DISTINCT {C} AS x FROM t ORDER BY {C}"));
 }
 
 /// PG names an unnamed column after its expression (FigureColname),
 /// looking through casts, CASE's ELSE, subscripts and scalar subqueries: a
 /// comparison anywhere in one, rewritten, would rename it (`(x > 0)::int`
-/// is `int4`, `(EXISTS …)::int` is `exists`). The column keeps its name —
-/// visible here in `row_to_json`'s keys, which the pg_sanity oracle
-/// compares between the written and the sent query on real rows.
+/// is `int4`, `(EXISTS …)::int` is `exists`). The column keeps its name,
+/// which the driver checks against the written query's.
 #[test]
 fn wrappers_keep_the_column_name() {
     const C: &str = "(SELECT count(*) FROM u WHERE u.t_id = t.id)";
@@ -685,15 +708,10 @@ fn wrappers_keep_the_column_name() {
             format!("a > 1 AND {C} > 0"),
             format!("a > 1 AND {E} AS \"?column?\""),
         ),
-        // A scalar subquery: after its own column, at both levels.
-        (
-            format!("(SELECT ({C} > 0)::int)"),
-            format!("(SELECT ({E})::int AS int4) AS int4"),
-        ),
     ] {
         assert_rewritten(
-            &format!("SELECT row_to_json(s) AS j FROM (SELECT {written} FROM t) s"),
-            &format!("SELECT row_to_json(s) AS j FROM (SELECT {sent} FROM t) s"),
+            &format!("SELECT {written} FROM t"),
+            &format!("SELECT {sent} FROM t"),
         );
     }
 }
@@ -708,27 +726,18 @@ fn column_named_through_a_star_is_kept() {
     );
 }
 
+/// A site inside a FROM subquery, a CTE or RETURNING isn't rewritten,
+/// so the names a record or JSON shows from there can't change.
 #[test]
 fn nested_column_names_in_records() {
-    for (written, sent) in [
-        (
-            "SELECT to_jsonb(s) AS j FROM (SELECT ((SELECT count(*) FROM u) > 0)::int) s",
-            "SELECT to_jsonb(s) AS j FROM (SELECT (EXISTS (SELECT 1 FROM u))::int AS int4) s",
-        ),
-        (
-            "SELECT s FROM (SELECT ((SELECT count(*) FROM u) > 0)::int, 1 AS one) s",
-            "SELECT s FROM (SELECT (EXISTS (SELECT 1 FROM u))::int AS int4, 1 AS one) s",
-        ),
-        (
-            "WITH s AS (SELECT ((SELECT count(*) FROM u) > 0)::int) SELECT row_to_json(s) AS j FROM s",
-            "WITH s AS (SELECT (EXISTS (SELECT 1 FROM u))::int AS int4) SELECT row_to_json(s) AS j FROM s",
-        ),
-        (
-            "DELETE FROM u WHERE c = 0 RETURNING ((SELECT count(*) FROM t) > 0)::int, c",
-            "DELETE FROM u WHERE c = 0 RETURNING (EXISTS (SELECT 1 FROM t))::int AS int4, c",
-        ),
+    for sql in [
+        "SELECT to_jsonb(s) AS j FROM (SELECT ((SELECT count(*) FROM u) > 0)::int) s",
+        "SELECT s FROM (SELECT ((SELECT count(*) FROM u) > 0)::int, 1 AS one) s",
+        "WITH s AS (SELECT ((SELECT count(*) FROM u) > 0)::int) SELECT row_to_json(s) AS j FROM s",
+        "DELETE FROM u WHERE c = 0 RETURNING ((SELECT count(*) FROM t) > 0)::int, c",
+        "SELECT row_to_json(s) AS j FROM (SELECT (SELECT count(*) FROM t) > 0) s",
     ] {
-        assert_rewritten(written, sent);
+        assert_kept(sql);
     }
 }
 

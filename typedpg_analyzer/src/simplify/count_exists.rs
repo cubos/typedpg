@@ -40,6 +40,12 @@
 //!   row of `s`, not only those with `s.k = o.k`), and a top-level
 //!   `EXISTS` gets a plan of its own. A rewrite must never make a
 //!   succeeding query fail.
+//! - A comparison anywhere but the top-level statement's WHERE (stored
+//!   tables, error-free ON conditions and sibling conjuncts) or its target
+//!   list (`proof::rewrite_site_is_safe`): as a semi- or anti-join the site
+//!   moves above everything at its level, which may then run on rows the
+//!   count used to veto first. Nested queries, CTEs, HAVING, ON and
+//!   RETURNING are left as written.
 //! - Anything that may call a volatile function, or reads a relation
 //!   other than a plain table (a view or a CTE may hide one; a foreign
 //!   table may do anything): how many times it runs may change.
@@ -51,8 +57,7 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::proof::{
-    FromScope, cannot_error, error_free_select, has_volatile, siblings_cannot_error,
-    strictly_not_null,
+    self, FromScope, cannot_error, error_free_select, has_volatile, strictly_not_null,
 };
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::oid::{PgOperatorOid, PgProcOid};
@@ -329,19 +334,6 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     out
 }
 
-/// Where an expression is evaluated, for the sibling-conjunct guard.
-#[derive(Clone, Copy)]
-enum Clause<'n> {
-    /// A target list, ORDER BY, VALUES, function arguments…: evaluated as
-    /// written, never pulled up into a join.
-    Free,
-    /// The WHERE, HAVING or JOIN ... ON condition rooted at this node.
-    In(&'n Node),
-    /// A position the walker doesn't model (MERGE, ON CONFLICT): no
-    /// rewrite.
-    Unknown,
-}
-
 /// Walks the statement keeping the FROM scope each expression is evaluated
 /// in, which the error-freedom proof of a counted subquery resolves its
 /// outer references in. Where the scope isn't known, an opaque one stands
@@ -368,7 +360,7 @@ impl Walker<'_, '_> {
                 let scope = FromScope::of_dml(ctx, i.relation.as_ref(), &[], parent);
                 let opaque = FromScope::opaque(parent);
                 if let Some(c) = i.on_conflict_clause.as_deref() {
-                    self.children(NodeRef::OnConflictClause(c), &opaque, Clause::Unknown);
+                    self.children(NodeRef::OnConflictClause(c), &opaque);
                 }
                 self.returning(i.returning_clause.as_ref(), &scope);
             }
@@ -376,21 +368,21 @@ impl Walker<'_, '_> {
                 self.ctes(u.with_clause.as_ref(), parent);
                 self.walk_from_subqueries(&u.from_clause, parent);
                 let scope = FromScope::of_dml(ctx, u.relation.as_ref(), &u.from_clause, parent);
-                self.list(&u.target_list, &scope, Clause::Free);
-                self.clause(u.where_clause.as_deref(), &scope);
+                self.list(&u.target_list, &scope);
+                self.opt(u.where_clause.as_deref(), &scope);
                 self.returning(u.returning_clause.as_ref(), &scope);
             }
             NodeRef::DeleteStmt(d) => {
                 self.ctes(d.with_clause.as_ref(), parent);
                 self.walk_from_subqueries(&d.using_clause, parent);
                 let scope = FromScope::of_dml(ctx, d.relation.as_ref(), &d.using_clause, parent);
-                self.clause(d.where_clause.as_deref(), &scope);
+                self.opt(d.where_clause.as_deref(), &scope);
                 self.returning(d.returning_clause.as_ref(), &scope);
             }
             // Anything else (MERGE, utility statements): no known scope.
             other => {
                 let opaque = FromScope::opaque(parent);
-                self.children(other, &opaque, Clause::Unknown);
+                self.children(other, &opaque);
             }
         }
     }
@@ -466,13 +458,13 @@ impl Walker<'_, '_> {
                     .map(|s| (**s).clone())
                     .collect();
                 let scope = FromScope::of_items(self.ctx, &sides, parent);
-                self.clause(j.quals.as_deref(), &scope);
+                self.opt(j.quals.as_deref(), &scope);
                 left.truncate(mark);
             }
             Some(node::Node::RangeVar(_)) => {}
             Some(n) => {
                 let scope = FromScope::of_items(self.ctx, left, parent);
-                self.children(n.to_ref(), &scope, Clause::Free);
+                self.children(n.to_ref(), &scope);
             }
             None => {}
         }
@@ -498,49 +490,41 @@ impl Walker<'_, '_> {
             &s.distinct_clause,
             &s.values_lists,
         ] {
-            self.list(list, &scope, Clause::Free);
+            self.list(list, &scope);
         }
         for n in [&s.limit_count, &s.limit_offset] {
-            self.opt(n.as_deref(), &scope, Clause::Free);
+            self.opt(n.as_deref(), &scope);
         }
-        self.clause(s.where_clause.as_deref(), &scope);
-        self.clause(s.having_clause.as_deref(), &scope);
+        self.opt(s.where_clause.as_deref(), &scope);
+        self.opt(s.having_clause.as_deref(), &scope);
     }
 
     fn returning(&mut self, clause: Option<&protobuf::ReturningClause>, scope: &FromScope<'_>) {
         if let Some(c) = clause {
-            self.list(&c.exprs, scope, Clause::Free);
+            self.list(&c.exprs, scope);
         }
     }
 
-    /// A WHERE, HAVING or JOIN ... ON condition.
-    fn clause(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
-        if let Some(n) = node {
-            self.opt(Some(n), scope, Clause::In(n));
-        }
-    }
-
-    fn opt(&mut self, node: Option<&Node>, scope: &FromScope<'_>, clause: Clause<'_>) {
+    fn opt(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
         if let Some(n) = node.and_then(|n| n.node.as_ref()) {
-            self.expr(n.to_ref(), scope, clause);
+            self.expr(n.to_ref(), scope);
         }
     }
 
-    fn list(&mut self, nodes: &[Node], scope: &FromScope<'_>, clause: Clause<'_>) {
+    fn list(&mut self, nodes: &[Node], scope: &FromScope<'_>) {
         for n in nodes {
-            self.opt(Some(n), scope, clause);
+            self.opt(Some(n), scope);
         }
     }
 
-    fn children(&mut self, node: NodeRef<'_>, scope: &FromScope<'_>, clause: Clause<'_>) {
+    fn children(&mut self, node: NodeRef<'_>, scope: &FromScope<'_>) {
         for child in node.children() {
-            self.expr(child, scope, clause);
+            self.expr(child, scope);
         }
     }
 
-    /// Look for count comparisons in an expression evaluated in `scope`,
-    /// within `clause`.
-    fn expr(&mut self, node: NodeRef<'_>, scope: &FromScope<'_>, clause: Clause<'_>) {
+    /// Look for count comparisons in an expression evaluated in `scope`.
+    fn expr(&mut self, node: NodeRef<'_>, scope: &FromScope<'_>) {
         match node {
             NodeRef::SelectStmt(_)
             | NodeRef::InsertStmt(_)
@@ -548,16 +532,13 @@ impl Walker<'_, '_> {
             | NodeRef::DeleteStmt(_)
             | NodeRef::MergeStmt(_) => self.statement(node, Some(scope)),
             NodeRef::AExpr(e) => {
-                // In a WHERE, HAVING or ON, the count's SubPlan may run
-                // before a sibling conjunct (a costlier one, or one of equal
-                // cost written after it) and veto a row it would fail on:
-                // pulled up into a join, it no longer does, and the sibling
-                // runs on every row. Every sibling must be error-free.
-                let guarded = match clause {
-                    Clause::Free => true,
-                    Clause::In(root) => siblings_cannot_error(self.ctx, root, e.location, scope),
-                    Clause::Unknown => false,
-                };
+                // As a semi- or anti-join the site moves above everything
+                // at its level (ON conditions, LATERAL items, sibling
+                // conjuncts), which may then run on rows the count used to
+                // veto first: only a top-level WHERE of stored tables with
+                // error-free ON conditions and siblings, or the top-level
+                // target list, qualifies.
+                let guarded = proof::rewrite_site_is_safe(self.ctx, e.location);
                 if guarded
                     && let Some(edits) =
                         sublink_form(self.ctx, self.text, self.cte_names, self.unnamed, e, scope)
@@ -567,9 +548,9 @@ impl Walker<'_, '_> {
                         edits,
                     });
                 }
-                self.children(node, scope, clause);
+                self.children(node, scope);
             }
-            _ => self.children(node, scope, clause),
+            _ => self.children(node, scope),
         }
     }
 }
@@ -981,7 +962,7 @@ fn top_level_form(
     plain_count(ctx, text, select, cmp.count)?;
     // `EXISTS` gets its own plan (one that stops early), which may
     // evaluate a join's conditions over other row pairs. No sibling
-    // conjunct guard ([`siblings_cannot_error`]) is needed: the count isn't a
+    // conjunct or site guard (`proof::rewrite_site_is_safe`) is needed: the count isn't a
     // conjunct of anything — the WHERE is the counted query's own, moved
     // whole into the EXISTS, and `error_free_select` already keeps every
     // conjunct of it free of sublinks, functions and errors.
