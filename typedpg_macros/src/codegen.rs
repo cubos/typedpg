@@ -870,15 +870,14 @@ pub fn generate(
 /// and extension types get theirs from the database's OID counter.
 const FIRST_GENBKI_OBJECT_ID: u32 = 10_000;
 
-/// The type each parameter of a query is sent with, by OID, when every one
-/// has a stable OID (see [`wire_oid`]): the methods `sql!` generates then
-/// send them, so the server parses, binds and executes the query in one
-/// round trip, instead of first preparing it to learn what it already
-/// knows.
+/// The type each parameter of a query is sent with, when every one has a
+/// [`WireType`]: the methods `sql!` generates then send them, so the server
+/// parses, binds and executes the query in one round trip, instead of
+/// first preparing it to learn what it already knows.
 #[derive(Debug, PartialEq)]
 pub(crate) struct WireTypes {
     /// One per regular parameter, `$1` first.
-    pub(crate) params: Vec<u32>,
+    pub(crate) params: Vec<WireType>,
     /// One per spread, in `analyzed.spreads` order.
     pub(crate) spreads: Vec<SpreadWireTypes>,
 }
@@ -887,22 +886,72 @@ pub(crate) struct WireTypes {
 #[derive(Debug, PartialEq)]
 pub(crate) struct SpreadWireTypes {
     /// One per field: an item's placeholders.
-    pub(crate) fields: Vec<u32>,
+    pub(crate) fields: Vec<WireType>,
     /// One per field, the array of its type: the placeholders of the
-    /// spread's array form, when that has stable OIDs too.
+    /// spread's array form, when that has stable OIDs too (an array's
+    /// binary format embeds its element type's OID, so an array is never
+    /// sent unspecified).
     pub(crate) arrays: Option<Vec<u32>>,
 }
 
-/// The parameter types of `analyzed`, or `None` when one has no stable OID
-/// (an enum, a composite, a range or a domain over one of them defined by
-/// the migrations or an extension, an array of one, an anonymous record):
-/// the query is then sent untyped and the server infers them.
+/// How a placeholder's type is sent in the `Parse` message.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WireType {
+    /// A built-in type, by its OID — the same in every database
+    /// ([`FIRST_GENBKI_OBJECT_ID`]).
+    Oid(u32),
+    /// A type whose OID is the database's own (an enum, an extension's
+    /// scalar), sent as OID 0. The protocol treats a zero OID as leaving
+    /// the type unspecified, so the server infers it — from the cast `sql!`
+    /// writes after the placeholder: the type itself, as when the query is
+    /// prepared first. The value still goes in binary to the same receive
+    /// function, and its bytes don't depend on the OID: neither an enum's
+    /// (its label) nor a base type's embeds one. The client builds the type
+    /// from the name, schema and (an enum's) labels, for the bound value's
+    /// `ToSql::accepts` to check.
+    Unspecified {
+        schema: String,
+        name: String,
+        /// An enum's labels; `None` for a base type.
+        labels: Option<Vec<String>>,
+    },
+}
+
+impl WireType {
+    /// The `::typedpg::__private::ParamType` the generated code passes.
+    fn to_tokens(&self) -> TokenStream {
+        let private = quote! { ::typedpg::__private };
+        match self {
+            WireType::Oid(oid) => {
+                let oid = proc_macro2::Literal::u32_unsuffixed(*oid);
+                quote! { #private::ParamType::Oid(#oid) }
+            }
+            WireType::Unspecified {
+                schema,
+                name,
+                labels,
+            } => {
+                let kind = match labels {
+                    Some(labels) => quote! { #private::UnspecifiedKind::Enum(&[#(#labels),*]) },
+                    None => quote! { #private::UnspecifiedKind::Simple },
+                };
+                quote! {
+                    #private::ParamType::Unspecified { schema: #schema, name: #name, kind: #kind }
+                }
+            }
+        }
+    }
+}
+
+/// The parameter types of `analyzed`, or `None` when one has no
+/// [`WireType`] (see [`param_wire_type`]): the query is then sent untyped
+/// and the server infers them.
 pub(crate) fn wire_types(analyzed: &AnalyzedQuery, catalog: &PgCatalog) -> Option<WireTypes> {
     let params = analyzed
         .params
         .iter()
-        .map(|p| wire_oid(catalog, &p.pg_type))
-        .collect::<Option<Vec<u32>>>()?;
+        .map(|p| param_wire_type(catalog, &p.pg_type))
+        .collect::<Option<Vec<WireType>>>()?;
     let spreads = analyzed
         .spreads
         .iter()
@@ -910,8 +959,8 @@ pub(crate) fn wire_types(analyzed: &AnalyzedQuery, catalog: &PgCatalog) -> Optio
             let fields = spread
                 .fields
                 .iter()
-                .map(|f| wire_oid(catalog, &f.pg_type))
-                .collect::<Option<Vec<u32>>>()?;
+                .map(|f| param_wire_type(catalog, &f.pg_type))
+                .collect::<Option<Vec<WireType>>>()?;
             let arrays = spread
                 .fields
                 .iter()
@@ -921,6 +970,50 @@ pub(crate) fn wire_types(analyzed: &AnalyzedQuery, catalog: &PgCatalog) -> Optio
         })
         .collect::<Option<Vec<_>>>()?;
     Some(WireTypes { params, spreads })
+}
+
+/// How a placeholder bound as `ty` is sent: by OID when its cast's type
+/// has a stable one ([`wire_oid`]); unspecified when that type is an enum
+/// or a base scalar type (`citext`, `vector`, …) with an OID of the
+/// database's own — a domain over one included, its cast being the base
+/// type. Any other type with such an OID has none: a composite or an array
+/// (their binary formats embed OIDs: the fields', the element type's, which
+/// `record_recv` and `array_recv` check), a range or multirange, an
+/// anonymous record.
+fn param_wire_type(catalog: &PgCatalog, ty: &Type) -> Option<WireType> {
+    let oid = wire_type(catalog, ty)?.get();
+    if oid < FIRST_GENBKI_OBJECT_ID {
+        return Some(WireType::Oid(oid));
+    }
+    unspecified_type(ty)
+}
+
+/// The [`WireType::Unspecified`] of `ty`'s cast, when that is an enum or a
+/// base scalar type. (A `Basic` type with an OID of the database's own is
+/// a base type: the pseudo-types are all built-in.)
+fn unspecified_type(ty: &Type) -> Option<WireType> {
+    match ty {
+        Type::Domain { base, .. } => unspecified_type(base),
+        Type::Enum {
+            schema,
+            name,
+            labels,
+            ..
+        } => Some(WireType::Unspecified {
+            schema: schema.clone(),
+            name: name.clone(),
+            labels: Some(labels.clone()),
+        }),
+        Type::Basic { schema, name, .. } => Some(WireType::Unspecified {
+            schema: schema.clone(),
+            name: name.clone(),
+            labels: None,
+        }),
+        Type::Array { .. }
+        | Type::Range { .. }
+        | Type::Composite { .. }
+        | Type::AnonymousRecord { .. } => None,
+    }
 }
 
 /// The OID a placeholder bound as `ty` is sent with: its cast's type — the
@@ -1157,11 +1250,8 @@ fn generate_regular(
     let query_context = query_context(analyzed);
     let param_types = match wire {
         Some(wire) => {
-            let oids = wire
-                .params
-                .iter()
-                .map(|o| proc_macro2::Literal::u32_unsuffixed(*o));
-            quote! { ::std::option::Option::Some(&[#(#oids),*]) }
+            let types = wire.params.iter().map(WireType::to_tokens);
+            quote! { ::std::option::Option::Some(&[#(#types),*]) }
         }
         None => quote! { ::std::option::Option::None },
     };
@@ -1171,10 +1261,10 @@ fn generate_regular(
             // ----- the query, for the errors about it -----
             #query_context
 
-            // The parameters' types, by OID, sent with the query (one
-            // round trip); `None` sends it untyped.
+            // The parameters' types, sent with the query (one round
+            // trip); `None` sends it untyped.
             #[allow(dead_code)]
-            const __TYPEDPG_PARAM_TYPES: ::std::option::Option<&[u32]> = #param_types;
+            const __TYPEDPG_PARAM_TYPES: ::std::option::Option<&[::typedpg::__private::ParamType]> = #param_types;
             #column_types
 
             // ----- synthesized composite / record structs -----
@@ -1576,7 +1666,7 @@ fn generate_spread(
                 .iter()
                 .map(|p| p.as_ref() as &(dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync))
                 .collect();
-        let __param_types: ::std::option::Option<::std::vec::Vec<u32>> = #param_types;
+        let __param_types: ::std::option::Option<::std::vec::Vec<::typedpg::__private::ParamType>> = #param_types;
     };
 
     let fetch_value_method = build_fetch_value_method(&analyzed.columns, config, &registry)?;
@@ -1716,40 +1806,47 @@ fn generate_spread(
     Ok(ts)
 }
 
-/// The expression a spread query's `__param_types` is: the OID of each
+/// The expression a spread query's `__param_types` is: the type of each
 /// parameter, in the order the parameters are pushed — the regular ones,
 /// then each spread's: above the threshold, for a spread bound as arrays
 /// (`capable`), an array per field; otherwise a placeholder per field of
-/// each item. `None` (sent untyped) when `wire` is, or when a spread bound
-/// as arrays has no stable array type.
+/// each item. `None` (sent untyped) when `wire` is, or when a spread is
+/// bound as arrays (above the threshold) that have no stable array type.
 fn spread_param_types(wire: Option<&WireTypes>, capable: &[bool]) -> TokenStream {
     let none = quote! { ::std::option::Option::None };
     let Some(wire) = wire else {
         return none;
     };
-    let lits = |oids: &[u32]| -> Vec<proc_macro2::Literal> {
-        oids.iter()
-            .map(|o| proc_macro2::Literal::u32_unsuffixed(*o))
-            .collect()
+    let tokens = |types: &[WireType]| -> Vec<TokenStream> {
+        types.iter().map(WireType::to_tokens).collect()
     };
-    let regular = lits(&wire.params);
+    let regular = tokens(&wire.params);
     let mut pushes = TokenStream::new();
+    // Whether a spread's array form breaks out with `None` (an unused
+    // label would be a warning in the caller's crate).
+    let mut breaks = false;
     for (si, spread) in wire.spreads.iter().enumerate() {
         let len = format_ident!("__len_{}", si);
-        let fields = lits(&spread.fields);
+        let fields = tokens(&spread.fields);
         let per_item = quote! {
             for _ in 0..#len {
                 __types.extend_from_slice(&[#(#fields),*]);
             }
         };
         pushes.extend(if capable[si] {
-            let Some(arrays) = &spread.arrays else {
-                return none;
+            let as_arrays = match &spread.arrays {
+                Some(arrays) => {
+                    let arrays = arrays.iter().map(|oid| WireType::Oid(*oid).to_tokens());
+                    quote! { __types.extend_from_slice(&[#(#arrays),*]); }
+                }
+                None => {
+                    breaks = true;
+                    quote! { break '__typedpg_types ::std::option::Option::None; }
+                }
             };
-            let arrays = lits(arrays);
             quote! {
                 if ::typedpg::__private::uses_arrays(#len, true) {
-                    __types.extend_from_slice(&[#(#arrays),*]);
+                    #as_arrays
                 } else {
                     #per_item
                 }
@@ -1758,12 +1855,16 @@ fn spread_param_types(wire: Option<&WireTypes>, capable: &[bool]) -> TokenStream
             per_item
         });
     }
-    quote! {{
-        let mut __types: ::std::vec::Vec<u32> = ::std::vec::Vec::with_capacity(__params_ref.len());
-        __types.extend_from_slice(&[#(#regular),*]);
-        #pushes
-        ::std::option::Option::Some(__types)
-    }}
+    let label = breaks.then(|| quote! { '__typedpg_types: });
+    quote! {
+        #label {
+            let mut __types: ::std::vec::Vec<::typedpg::__private::ParamType> =
+                ::std::vec::Vec::with_capacity(__params_ref.len());
+            __types.extend_from_slice(&[#(#regular),*]);
+            #pushes
+            ::std::option::Option::Some(__types)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2910,7 +3011,7 @@ fn pg_type_label(ty: &Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SpreadWireTypes, WireTypes, cast_params, check_unique_columns, column_types,
+        SpreadWireTypes, WireType, WireTypes, cast_params, check_unique_columns, column_types,
         make_field_ident, spread_param_types, user_ident, wire_types, wrap_with_limit,
     };
     use typedpg_analyzer::PgCatalog;
@@ -3077,32 +3178,55 @@ mod tests {
         );
     }
 
-    /// The parameter types `sql!` sends with `sql`, by OID (`None`: sent
-    /// untyped, the server inferring them).
-    fn wire(sql: &str) -> Option<WireTypes> {
+    const SCHEMA: &str = "CREATE TYPE mood AS ENUM ('ok', 'sad');
+         CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+         CREATE DOMAIN prefs AS jsonb;
+         CREATE DOMAIN moody AS mood;
+         CREATE DOMAIN moodier AS moody;
+         CREATE TYPE pair AS (x int, y text);
+         CREATE TYPE floatrange AS RANGE (subtype = float8);
+         CREATE EXTENSION vector;
+         CREATE EXTENSION citext;
+         CREATE TABLE t (
+             a int NOT NULL, b text, n numeric, ts timestamptz, r int4range,
+             m mood, ms mood[], md moody, mdd moodier, p pos, ps pos[], j prefs, pr pair,
+             v vector(3), c citext, cs citext[], fr floatrange
+         );";
+
+    fn catalog() -> PgCatalog {
         let mut db = PgCatalog::new().unwrap();
-        db.apply_sql(
-            "CREATE TYPE mood AS ENUM ('ok', 'sad');
-             CREATE DOMAIN pos AS int CHECK (VALUE > 0);
-             CREATE DOMAIN prefs AS jsonb;
-             CREATE DOMAIN moody AS mood;
-             CREATE TYPE pair AS (x int, y text);
-             CREATE EXTENSION vector;
-             CREATE TABLE t (
-                 a int NOT NULL, b text, n numeric, ts timestamptz, r int4range,
-                 m mood, ms mood[], md moody, p pos, ps pos[], j prefs, pr pair,
-                 v vector(3)
-             );",
-        )
-        .unwrap();
+        db.apply_sql(SCHEMA).unwrap();
+        db
+    }
+
+    /// The parameter types `sql!` sends with `sql` (`None`: sent untyped,
+    /// the server inferring them).
+    fn wire(sql: &str) -> Option<WireTypes> {
+        let db = catalog();
         wire_types(&db.analyze(sql).unwrap(), &db)
     }
 
     fn params(oids: &[u32]) -> Option<WireTypes> {
         Some(WireTypes {
-            params: oids.to_vec(),
+            params: oids.iter().map(|o| WireType::Oid(*o)).collect(),
             spreads: Vec::new(),
         })
+    }
+
+    fn mood() -> WireType {
+        WireType::Unspecified {
+            schema: "public".into(),
+            name: "mood".into(),
+            labels: Some(vec!["ok".into(), "sad".into()]),
+        }
+    }
+
+    fn scalar(name: &str) -> WireType {
+        WireType::Unspecified {
+            schema: "public".into(),
+            name: name.into(),
+            labels: None,
+        }
     }
 
     #[test]
@@ -3123,16 +3247,92 @@ mod tests {
         assert_eq!(wire("SELECT a FROM t"), params(&[]));
     }
 
-    /// An enum, a composite or an extension's type has an OID of the
-    /// database's own: the query is sent untyped, whatever the others are.
+    /// An enum, a domain over one (cast to the enum) and an extension's
+    /// base type have OIDs of the database's own, but binary formats that
+    /// embed none: they go unspecified (OID 0), with what the client needs
+    /// to build their `Type`, beside the built-in ones.
     #[test]
-    fn database_specific_types_are_sent_untyped() {
-        assert_eq!(wire("SELECT a FROM t WHERE a = $a AND m = $m"), None);
-        assert_eq!(wire("SELECT a FROM t WHERE ms = $ms"), None);
+    fn enums_and_extension_scalars_are_sent_unspecified() {
+        assert_eq!(
+            wire("SELECT a FROM t WHERE a = $a AND m = $m"),
+            Some(WireTypes {
+                params: vec![WireType::Oid(23), mood()],
+                spreads: vec![],
+            })
+        );
+        assert_eq!(
+            wire("INSERT INTO t (a, md, mdd) VALUES ($a, $md, $mdd)"),
+            Some(WireTypes {
+                params: vec![WireType::Oid(23), mood(), mood()],
+                spreads: vec![],
+            })
+        );
+        assert_eq!(
+            wire("SELECT a FROM t WHERE c = $c AND v = $v"),
+            Some(WireTypes {
+                params: vec![scalar("citext"), scalar("vector")],
+                spreads: vec![],
+            })
+        );
+    }
+
+    /// A composite's binary format embeds its fields' OIDs and an array's
+    /// its element type's (`record_recv` and `array_recv` check them), and
+    /// a user range has an OID of the database's own: the query is sent
+    /// untyped, whatever the other parameters are.
+    #[test]
+    fn composites_arrays_and_ranges_of_database_types_are_sent_untyped() {
+        assert_eq!(wire("SELECT a FROM t WHERE a = $a AND ms = $ms"), None);
         assert_eq!(wire("SELECT a FROM t WHERE m = ANY($ms)"), None);
-        assert_eq!(wire("INSERT INTO t (a, md) VALUES ($a, $md)"), None);
+        assert_eq!(wire("SELECT a FROM t WHERE cs = $cs"), None);
         assert_eq!(wire("INSERT INTO t (a, pr) VALUES ($a, $pr)"), None);
-        assert_eq!(wire("SELECT a FROM t WHERE v = $v"), None);
+        assert_eq!(wire("INSERT INTO t (a, fr) VALUES ($a, $fr)"), None);
+    }
+
+    /// The parameters go unspecified, but a result column the client
+    /// would have to look up keeps a row-returning query untyped; its
+    /// `execute` — which reads no types — and a query returning no rows
+    /// stay typed.
+    #[test]
+    fn an_unspecified_parameter_with_a_database_specific_column() {
+        let db = catalog();
+        let analyzed = db.analyze("SELECT a, m FROM t WHERE m = $m").unwrap();
+        assert!(wire_types(&analyzed, &db).is_some());
+        assert_eq!(column_types(&analyzed, &db), None);
+
+        let analyzed = db.analyze("UPDATE t SET b = $b WHERE m = $m").unwrap();
+        assert_eq!(
+            wire_types(&analyzed, &db),
+            Some(WireTypes {
+                params: vec![WireType::Oid(25), mood()],
+                spreads: vec![],
+            })
+        );
+        assert_eq!(column_types(&analyzed, &db), Some(vec![]));
+    }
+
+    /// What the generated code passes for each kind of [`WireType`].
+    #[test]
+    fn wire_types_render_as_param_types() {
+        assert_eq!(
+            WireType::Oid(23).to_tokens().to_string(),
+            ":: typedpg :: __private :: ParamType :: Oid (23)"
+        );
+        let code = mood().to_tokens().to_string();
+        assert!(
+            code.contains(
+                "ParamType :: Unspecified { schema : \"public\" , name : \"mood\" , \
+                 kind : :: typedpg :: __private :: UnspecifiedKind :: Enum (& [\"ok\" , \"sad\"]) }"
+            ),
+            "{code}"
+        );
+        let code = scalar("citext").to_tokens().to_string();
+        assert!(
+            code.contains(
+                "name : \"citext\" , kind : :: typedpg :: __private :: UnspecifiedKind :: Simple"
+            ),
+            "{code}"
+        );
     }
 
     /// A domain parameter is cast to its base type (`cast_params`), so the
@@ -3153,9 +3353,9 @@ mod tests {
         assert_eq!(
             wire("SELECT a FROM t WHERE b = $b AND a IN $..ids"),
             Some(WireTypes {
-                params: vec![25],
+                params: vec![WireType::Oid(25)],
                 spreads: vec![SpreadWireTypes {
-                    fields: vec![23],
+                    fields: vec![WireType::Oid(23)],
                     arrays: Some(vec![1007]),
                 }],
             })
@@ -3166,14 +3366,33 @@ mod tests {
             Some(WireTypes {
                 params: vec![],
                 spreads: vec![SpreadWireTypes {
-                    fields: vec![23, 25, 23],
+                    fields: vec![WireType::Oid(23), WireType::Oid(25), WireType::Oid(23)],
                     arrays: Some(vec![1007, 1009, 1007]),
                 }],
             })
         );
-        // An enum field: the whole query goes untyped.
-        assert_eq!(wire("SELECT a FROM t WHERE m IN $..moods"), None);
-        assert_eq!(wire("INSERT INTO t (a, m) VALUES $..rows { a, m }"), None);
+        // An enum field: unspecified per item; its array (the form above
+        // the threshold) has no stable type.
+        assert_eq!(
+            wire("SELECT a FROM t WHERE m IN $..moods"),
+            Some(WireTypes {
+                params: vec![],
+                spreads: vec![SpreadWireTypes {
+                    fields: vec![mood()],
+                    arrays: None,
+                }],
+            })
+        );
+        assert_eq!(
+            wire("INSERT INTO t (a, m) VALUES $..rows { a, m }"),
+            Some(WireTypes {
+                params: vec![],
+                spreads: vec![SpreadWireTypes {
+                    fields: vec![WireType::Oid(23), mood()],
+                    arrays: None,
+                }],
+            })
+        );
     }
 
     /// A result column the client would have to look up (an enum, an
@@ -3213,28 +3432,44 @@ mod tests {
     #[test]
     fn spread_parameter_types_follow_the_pushes() {
         let wire = WireTypes {
-            params: vec![25],
+            params: vec![WireType::Oid(25)],
             spreads: vec![
                 SpreadWireTypes {
-                    fields: vec![23],
+                    fields: vec![WireType::Oid(23)],
                     arrays: Some(vec![1007]),
                 },
                 SpreadWireTypes {
-                    fields: vec![23, 25],
+                    fields: vec![WireType::Oid(23), mood()],
                     arrays: None,
                 },
             ],
         };
+        let oid = |o: u32| format!("ParamType :: Oid ({o})");
         let code = spread_param_types(Some(&wire), &[true, false]).to_string();
-        assert!(code.contains("extend_from_slice (& [25])"), "{code}");
+        assert!(
+            code.contains(&format!(
+                "extend_from_slice (& [:: typedpg :: __private :: {}])",
+                oid(25)
+            )),
+            "{code}"
+        );
         assert!(code.contains("uses_arrays (__len_0 , true)"), "{code}");
-        assert!(code.contains("extend_from_slice (& [1007])"), "{code}");
+        assert!(code.contains(&oid(1007)), "{code}");
         assert!(code.contains("for _ in 0 .. __len_1"), "{code}");
-        assert!(code.contains("extend_from_slice (& [23 , 25])"), "{code}");
+        assert!(code.contains("name : \"mood\""), "{code}");
         assert!(!code.contains("uses_arrays (__len_1"), "{code}");
-        // Bound as arrays without a stable array type: untyped.
+        assert!(!code.contains("__typedpg_types"), "{code}");
+        // Bound as arrays without a stable array type: untyped above the
+        // threshold, typed per item below it.
         let code = spread_param_types(Some(&wire), &[true, true]).to_string();
-        assert_eq!(code, ":: std :: option :: Option :: None");
+        assert!(code.starts_with("'__typedpg_types : {"), "{code}");
+        assert!(
+            code.contains(
+                "if :: typedpg :: __private :: uses_arrays (__len_1 , true) { \
+                 break '__typedpg_types :: std :: option :: Option :: None ; } else { for _ in 0 .. __len_1"
+            ),
+            "{code}"
+        );
         let code = spread_param_types(None, &[]).to_string();
         assert_eq!(code, ":: std :: option :: Option :: None");
     }

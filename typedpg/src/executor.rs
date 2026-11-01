@@ -1,5 +1,5 @@
 use tokio_postgres::Row;
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::{Kind, ToSql, Type};
 
 use crate::copy::{CopyRow, column_types, write_rows};
 use crate::stream::RowStream;
@@ -363,21 +363,85 @@ pub(crate) fn typed_iter<'a>(
     params.iter().map(|(p, t)| (*p as &dyn ToSql, t.clone()))
 }
 
-/// `params` paired with the types `oids` name, one per parameter — the
+/// The type a parameter of a `sql!` query is sent with, in the `Parse`
+/// message that carries the query.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamType {
+    /// A built-in type, by its OID: the same in every database.
+    Oid(u32),
+    /// A type whose OID is the database's own (an enum, an extension's
+    /// scalar type), sent as OID 0 — "unspecified": the server infers it
+    /// from the cast `sql!` writes after the placeholder. The client
+    /// builds a [`Type`] of this name, schema and kind (with OID 0) for the
+    /// bound value's `ToSql` to check and encode with.
+    Unspecified {
+        schema: &'static str,
+        name: &'static str,
+        kind: UnspecifiedKind,
+    },
+}
+
+/// The kind of a [`ParamType::Unspecified`] type.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnspecifiedKind {
+    /// A base type (`Kind::Simple`).
+    Simple,
+    /// An enum, with its labels (`Kind::Enum`).
+    Enum(&'static [&'static str]),
+}
+
+impl ParamType {
+    /// The [`Type`] sent and checked for this parameter, or `None` for an
+    /// OID `tokio_postgres` doesn't know.
+    fn to_type(self) -> Option<Type> {
+        match self {
+            ParamType::Oid(oid) => Type::from_oid(oid),
+            ParamType::Unspecified { schema, name, kind } => {
+                let kind = match kind {
+                    UnspecifiedKind::Simple => Kind::Simple,
+                    UnspecifiedKind::Enum(labels) => {
+                        Kind::Enum(labels.iter().map(|l| (*l).to_owned()).collect())
+                    }
+                };
+                Some(Type::new(name.to_owned(), 0, kind, schema.to_owned()))
+            }
+        }
+    }
+}
+
+/// `params` paired with the types `types` name, one per parameter — the
 /// arguments of the typed methods. `None` when the lengths differ or an
 /// OID is not a type `tokio_postgres` knows: the caller then sends the
 /// query untyped, as before (one more round trip, never an error).
 pub(crate) fn typed_params<'a>(
     params: &[&'a (dyn ToSql + Sync)],
-    oids: &[u32],
+    types: &[ParamType],
 ) -> Option<Vec<(&'a (dyn ToSql + Sync), Type)>> {
-    if params.len() != oids.len() {
+    if params.len() != types.len() {
         return None;
     }
+    // A spread repeats its fields' types once per item: each unspecified
+    // one is built once.
+    let mut built: Vec<(ParamType, Type)> = Vec::new();
     params
         .iter()
-        .zip(oids)
-        .map(|(p, oid)| Some((*p, Type::from_oid(*oid)?)))
+        .zip(types)
+        .map(|(p, ty)| {
+            let ty = match ty {
+                ParamType::Oid(_) => ty.to_type()?,
+                ParamType::Unspecified { .. } => match built.iter().find(|(k, _)| k == ty) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        let t = ty.to_type()?;
+                        built.push((*ty, t.clone()));
+                        t
+                    }
+                },
+            };
+            Some((*p, ty))
+        })
         .collect()
 }
 
@@ -393,17 +457,34 @@ pub(crate) fn typed_params<'a>(
 /// its column types looked up with nothing pending.
 fn typed_query_params<'a>(
     params: &[&'a (dyn ToSql + Sync)],
-    oids: Option<&[u32]>,
+    types: Option<&[ParamType]>,
     columns: Option<&[u32]>,
 ) -> Option<Vec<(&'a (dyn ToSql + Sync), Type)>> {
     if !columns?.iter().all(|oid| Type::from_oid(*oid).is_some()) {
         return None;
     }
-    typed_params(params, oids?)
+    typed_params(params, types?)
+}
+
+/// Whether a typed call that failed with `err` is retried untyped: when a
+/// bound value's `ToSql` refused a type built for an unspecified parameter
+/// (a mapped type whose `accepts` wants more than the name, schema and
+/// kind — the database's OID, say). `tokio_postgres` encodes every value
+/// before it sends anything, so nothing reached the server; untyped, the
+/// value is checked against the type the server describes, as before.
+fn retry_untyped(err: &crate::Error, typed: &[(&(dyn ToSql + Sync), Type)]) -> bool {
+    use std::error::Error as _;
+    let crate::Error::Database(err) = err else {
+        return false;
+    };
+    typed.iter().any(|(_, t)| t.oid() == 0)
+        && err
+            .source()
+            .is_some_and(|cause| cause.is::<tokio_postgres::types::WrongType>())
 }
 
 /// What `sql!`'s fetch methods run: the query through
-/// [`Executor::query_typed_stream`] when `oids` gives every parameter's
+/// [`Executor::query_typed_stream`] when `types` gives every parameter's
 /// type and `columns` every result column's (see [`typed_query_params`]),
 /// [`Executor::query`] otherwise.
 #[doc(hidden)]
@@ -411,20 +492,18 @@ pub async fn run_query<E: Executor + ?Sized>(
     executor: &E,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
-    oids: Option<&[u32]>,
+    types: Option<&[ParamType]>,
     columns: Option<&[u32]>,
 ) -> Result<Vec<Row>, crate::Error> {
     use futures_util::TryStreamExt;
-    match typed_query_params(params, oids, columns) {
-        Some(typed) => {
-            executor
-                .query_typed_stream(sql, &typed)
-                .await?
-                .try_collect()
-                .await
+    if let Some(typed) = typed_query_params(params, types, columns) {
+        match executor.query_typed_stream(sql, &typed).await {
+            Ok(rows) => return rows.try_collect().await,
+            Err(err) if retry_untyped(&err, &typed) => {}
+            Err(err) => return Err(err),
         }
-        None => executor.query(sql, params).await,
     }
+    executor.query(sql, params).await
 }
 
 /// [`run_query`] for `fetch_stream`: [`Executor::query_typed_stream`] or
@@ -434,13 +513,16 @@ pub async fn run_query_stream<E: Executor + ?Sized>(
     executor: &E,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
-    oids: Option<&[u32]>,
+    types: Option<&[ParamType]>,
     columns: Option<&[u32]>,
 ) -> Result<RowStream, crate::Error> {
-    match typed_query_params(params, oids, columns) {
-        Some(typed) => executor.query_typed_stream(sql, &typed).await,
-        None => executor.query_stream(sql, params).await,
+    if let Some(typed) = typed_query_params(params, types, columns) {
+        match executor.query_typed_stream(sql, &typed).await {
+            Err(err) if retry_untyped(&err, &typed) => {}
+            result => return result,
+        }
     }
+    executor.query_stream(sql, params).await
 }
 
 /// [`run_query`] for `execute`: [`Executor::execute_typed`] or
@@ -451,23 +533,39 @@ pub async fn run_execute<E: Executor + ?Sized>(
     executor: &E,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
-    oids: Option<&[u32]>,
+    types: Option<&[ParamType]>,
 ) -> Result<u64, crate::Error> {
-    match oids.and_then(|oids| typed_params(params, oids)) {
-        Some(typed) => executor.execute_typed(sql, &typed).await,
-        None => executor.execute(sql, params).await,
+    if let Some(typed) = types.and_then(|types| typed_params(params, types)) {
+        match executor.execute_typed(sql, &typed).await {
+            Err(err) if retry_untyped(&err, &typed) => {}
+            result => return result,
+        }
     }
+    executor.execute(sql, params).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const INT4: ParamType = ParamType::Oid(23);
+    const TEXT: ParamType = ParamType::Oid(25);
+    const MOOD: ParamType = ParamType::Unspecified {
+        schema: "public",
+        name: "mood",
+        kind: UnspecifiedKind::Enum(&["ok", "sad"]),
+    };
+    const CITEXT: ParamType = ParamType::Unspecified {
+        schema: "public",
+        name: "citext",
+        kind: UnspecifiedKind::Simple,
+    };
+
     #[test]
     fn typed_params_pair_each_value_with_its_type() {
         let (a, b) = (1i32, "x");
         let params: [&(dyn ToSql + Sync); 2] = [&a, &b];
-        let typed = typed_params(&params, &[23, 25]).expect("built-in types");
+        let typed = typed_params(&params, &[INT4, TEXT]).expect("built-in types");
         let types: Vec<Type> = typed.into_iter().map(|(_, t)| t).collect();
         assert_eq!(types, [Type::INT4, Type::TEXT]);
         assert_eq!(typed_params(&[], &[]).map(|t| t.len()), Some(0));
@@ -479,8 +577,8 @@ mod tests {
     fn typed_params_fall_back_rather_than_guess() {
         let a = 1i32;
         let params: [&(dyn ToSql + Sync); 1] = [&a];
-        assert!(typed_params(&params, &[9999]).is_none());
-        assert!(typed_params(&params, &[23, 23]).is_none());
+        assert!(typed_params(&params, &[ParamType::Oid(9999)]).is_none());
+        assert!(typed_params(&params, &[INT4, INT4]).is_none());
         assert!(typed_params(&params, &[]).is_none());
     }
 
@@ -490,10 +588,39 @@ mod tests {
     fn unknown_result_column_types_keep_a_query_untyped() {
         let a = 1i32;
         let params: [&(dyn ToSql + Sync); 1] = [&a];
-        assert!(typed_query_params(&params, Some(&[23]), Some(&[23, 25])).is_some());
-        assert!(typed_query_params(&params, Some(&[23]), Some(&[])).is_some());
-        assert!(typed_query_params(&params, Some(&[23]), Some(&[23, 9999])).is_none());
-        assert!(typed_query_params(&params, Some(&[23]), None).is_none());
+        assert!(typed_query_params(&params, Some(&[INT4]), Some(&[23, 25])).is_some());
+        assert!(typed_query_params(&params, Some(&[INT4]), Some(&[])).is_some());
+        assert!(typed_query_params(&params, Some(&[INT4]), Some(&[23, 9999])).is_none());
+        assert!(typed_query_params(&params, Some(&[INT4]), None).is_none());
         assert!(typed_query_params(&params, None, Some(&[23])).is_none());
+    }
+
+    /// An unspecified parameter goes with OID 0 and the name, schema and
+    /// kind `sql!` knows — what the values bound for it check: an enum's
+    /// `EnumString` any `Kind::Enum`, a `String` (bound for a `citext`
+    /// mapped to it) the name `citext`. Their bytes are the same as for
+    /// the type the server describes.
+    #[test]
+    fn unspecified_parameters_go_with_oid_zero() {
+        use crate::__private::{BaseTyped, EnumString};
+        let mood = EnumString("sad".to_owned());
+        let name = BaseTyped("Ann".to_owned());
+        let params: [&(dyn ToSql + Sync); 3] = [&mood, &name, &mood];
+        let typed = typed_params(&params, &[MOOD, CITEXT, MOOD]).expect("unspecified types");
+        let types: Vec<&Type> = typed.iter().map(|(_, t)| t).collect();
+        assert!(types.iter().all(|t| t.oid() == 0), "{types:?}");
+        assert_eq!((types[0].schema(), types[0].name()), ("public", "mood"));
+        assert_eq!(
+            *types[0].kind(),
+            Kind::Enum(vec!["ok".into(), "sad".into()])
+        );
+        assert_eq!((types[1].schema(), types[1].name()), ("public", "citext"));
+        assert_eq!(*types[1].kind(), Kind::Simple);
+        assert_eq!(types[2], types[0]);
+        let mut buf = bytes::BytesMut::new();
+        for (value, ty) in &typed {
+            value.to_sql_checked(ty, &mut buf).expect("accepted");
+        }
+        assert_eq!(&buf[..], b"sadAnnsad");
     }
 }
