@@ -13,7 +13,7 @@ Write plain SQL, get full type safety. The `sql!` macro statically analyzes ever
 - **Zero runtime overhead** -- the macro generates concrete Rust structs with named fields. No runtime reflection, no `Box<dyn Any>`, no string-based column access.
 - **PostgreSQL-native** -- first-class support for JSONB domains (`CREATE DOMAIN ... AS JSONB` mapped to Rust structs), enums (`CREATE TYPE ... AS ENUM` mapped to Rust enums), arrays, composite types, and advisory locks.
 
-> **TypeScript** -- the same analyzer types `sql("...")` queries in TypeScript: install `@cubos/typedpg` as a dependency and `@cubos/typedpg-cli` as a devDependency (for the `typedpg` command and the bundler plugins), then `npx typedpg gen` generates, from your sources and migrations, the module that types and runs them on node-postgres or postgres.js. See [`typedpg_npm/README.md`](typedpg_npm/README.md).
+> **TypeScript** -- the same analyzer types `sql("...")` queries in TypeScript: install `@cubos/typedpg` as a dependency and `@cubos/typedpg-cli` as a devDependency (for the `typedpg` command and the bundler plugins), then `npx typedpg gen` generates, from your sources and migrations, the module that types and runs them on node-postgres or postgres.js. See [`@cubos/typedpg`](https://github.com/cubos/typedpg/blob/main/typedpg_npm/README.md).
 
 ## Quick start
 
@@ -877,7 +877,7 @@ The `sql!` macro performs **fully static analysis** at compile time:
 4. Parses your SQL query and resolves column types, parameter types, and nullability against the snapshot
 5. Generates a concrete Rust struct with correctly typed fields
 
-Everything runs in-process during `cargo build`. No external dependencies, fast builds, fully reproducible.
+Everything runs in-process during `cargo build`: no database, no external process, fully reproducible.
 
 Extensions are supported via built-in SQL definitions that the DDL interpreter processes automatically when it sees `CREATE EXTENSION`.
 
