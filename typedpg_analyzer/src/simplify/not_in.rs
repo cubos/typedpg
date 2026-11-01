@@ -48,7 +48,12 @@ use super::{Candidate, Ctx, Edit, Rule};
 const RESERVED_PREFIX: &str = "__typedpg";
 
 pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
-    if ctx.sql.to_ascii_lowercase().contains(RESERVED_PREFIX) {
+    // Most queries have no `IN (SELECT …)` at all: nothing to scan for.
+    let has_site = ctx.tree.nodes().iter().any(|(n, _)| {
+        matches!(n, NodeRef::SubLink(s)
+            if s.sub_link_type() == SubLinkType::AnySublink && s.oper_name.is_empty())
+    });
+    if !has_site || ctx.sql.to_ascii_lowercase().contains(RESERVED_PREFIX) {
         return Vec::new();
     }
     let Ok(scanned) = typedpg_pg_query::scan(ctx.sql) else {

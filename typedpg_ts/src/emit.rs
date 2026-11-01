@@ -347,6 +347,33 @@ mod tests {
     }
 
     #[test]
+    fn a_simplified_query_is_documented() {
+        let q = Ok(Generated {
+            simplified: Some(
+                "Sent simplified by typedpg (not_in):\n\n```sql\nSELECT 1\n```".into(),
+            ),
+            ..generated("{ params: {}; row: {} }").unwrap()
+        });
+        let queries = [("SELECT a", &q)];
+        let m = Module {
+            runtime: "@cubos/typedpg",
+            imports: &[],
+            checks: &[],
+            queries: &queries,
+            copies: &[],
+            migrations: None,
+        };
+        let ts = &m.files(Path::new("/p/db.ts"), OutKind::TypeScript)[0].1;
+        assert!(
+            ts.contains(
+                "  /**\n   * Sent simplified by typedpg (not_in):\n   *\n   * ```sql\n   * SELECT \
+                 1\n   * ```\n   */\n  \"SELECT a\": { params: {}; row: {} };"
+            ),
+            "{ts}"
+        );
+    }
+
+    #[test]
     fn javascript_modules_come_with_declarations() {
         let q = generated("{ params: {}; row: {} }");
         let queries = [("SELECT", &q)];
