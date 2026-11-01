@@ -9,18 +9,26 @@
 //! view, subquery or CTE that surely yields one; a VALUES list; a UNION
 //! [ALL] of such, or an EXCEPT or INTERSECT that surely reads one. A WHERE
 //! must be provably true over that row (`y = 1` of a view's `1 AS y`: the
-//! planner folds it), or surely fail itself, or — over a set operation —
-//! be pushed down into none of its arms, running over their projected
-//! rows. A LIMIT other than 0 keeps the row, and of several rows the first
-//! one, which every plan fetches, and the ORDER BY keys of every row, which
-//! sorting evaluates; an OFFSET skips it after its evaluation (unless an
-//! ORDER BY could postpone that past the Limit). The planner drops a
+//! planner folds it; over a set operation, a constant every arm gives the
+//! column), or surely fail itself, or — over a set operation — be pushed
+//! down into none of its arms, running over their projected rows, or read
+//! a column every leaf of a flattened UNION ALL computes from no FROM
+//! item, which it evaluates there. A LIMIT other than 0 keeps the row, and
+//! of several rows the first one, which every plan fetches — and past the
+//! rows of an unsorted UNION ALL's left arm, the right one's first — and
+//! the ORDER BY keys of every row, which sorting evaluates whatever the
+//! OFFSET; an OFFSET skips a row after its evaluation (unless an ORDER BY
+//! could postpone that past the Limit). The planner drops a
 //! subquery's (or a view's, or a flattened UNION ALL leaf's) output
 //! columns the query above doesn't use, so a failing column of one fails
 //! only where that query reads it (`x`, `s.x`, `*`, `s.*`, `s`,
 //! `x IS NULL`, `x = 1`); a set operation it doesn't flatten keeps them
 //! all. A scalar or ARRAY subquery reads its column; an operator its
-//! operands, where its function surely evaluates them.
+//! operands, where its function surely evaluates them (an inlined SQL
+//! body is simplified over the constant operands substituted for its
+//! parameters: a CASE's decided WHENs, COALESCE's NULL arguments, an
+//! AND's true ones); a BETWEEN its first comparison, or the second one
+//! when a NULL bound folds the first one away.
 //!
 //! A view's query was analyzed without execution when the view was
 //! created (DefineView), so the expressions of its rows that every
@@ -71,7 +79,12 @@ fn check_rows(
     // dependencies come from its analysis.
     let (rows, _) = crate::ddl::depend::collect(|| query_rows(sel, snapshot, ctes, 0, false));
     // Nothing above the statement pushes a qualification down.
-    match rows.and_then(|r| r.all.any().or(r.projection)) {
+    match rows.and_then(|r| {
+        r.all
+            .any()
+            .or(r.projection)
+            .or(r.fail_after.map(|(_, f)| f))
+    }) {
         Some(f) => Err(AnalyzeError::Invalid(f.message)),
         None => Ok(()),
     }
@@ -188,6 +201,18 @@ struct Rows {
     /// keys' evaluation over every row, which every plan for it does (a
     /// Sort reads every row, a MergeAppend primes each input).
     ordered: Option<Failure>,
+    /// Each output column a qualification pushed down into the query
+    /// (into every leaf of a flattened UNION ALL) evaluates, where it
+    /// reads it: the query's leaves compute it from no FROM item, so the
+    /// qualification is its expression, evaluated over each leaf's row,
+    /// and raises its error.
+    qual_reads: Vec<bool>,
+    /// Its output columns' names, where known (`*` expanded).
+    names: Option<Vec<String>>,
+    /// Fetching more than this many rows surely raises this error: an
+    /// unsorted UNION ALL's Append runs its arms in order, so past the
+    /// rows of its left one it fetches its right one's first row.
+    fail_after: Option<(i64, Failure)>,
     /// The constant each output column surely holds.
     values: Vec<Option<Value>>,
     /// Each output column's type, where known (an operator over it is
@@ -208,6 +233,9 @@ impl Rows {
             first_projection: None,
             leaf_types: Vec::new(),
             ordered: None,
+            qual_reads: Vec::new(),
+            names: None,
+            fail_after: None,
             all,
             first,
             values,
@@ -310,6 +338,16 @@ fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
     let mut rows = rows;
     rows.all.always = rows.all.always.take().or(rows.projection.take());
     rows.first.always = rows.first.always.take().or(rows.first_projection.take());
+    // Fetching more rows than come before a failing one raises its error
+    // (an OFFSET's skipped rows are fetched too).
+    let past = rows.fail_after.take().and_then(|(n, f)| {
+        let fetched = count.map(|c| c.saturating_add(offset));
+        fetched.is_none_or(|k| k > n).then_some(f)
+    });
+    // Sorted, every row's ORDER BY keys are evaluated before the first
+    // one is returned or skipped.
+    let ordered = rows.ordered.clone().filter(|_| !sel.sort_clause.is_empty());
+    let raised = ordered.or(past);
     let rows = Rows {
         sorted: rows.first.any(),
         unpushable: vec![true; rows.all.columns.len()],
@@ -317,14 +355,33 @@ fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
         keeps_columns: rows.keeps_columns || sel.op != protobuf::SetOperation::SetopNone as i32,
         ..rows
     };
+    // Sorting, the planner may postpone an expensive column past the
+    // Limit (make_sort_input_target): a skipped row's, or one of a row
+    // past the first, is not evaluated — only what the keys raise is
+    // known then.
+    let only_raised = |rows: Rows, f: Failure, count: Count| {
+        let errors = Errors {
+            columns: vec![None; rows.all.columns.len()],
+            always: Some(f),
+        };
+        Rows {
+            sorted: errors.any(),
+            first: errors.clone(),
+            all: errors,
+            count,
+            ..rows
+        }
+    };
     if count.is_some() && !rows.count.at_most_one {
         if offset != 0 {
-            return None;
+            let count = Count {
+                at_least_one: false,
+                at_most_one: false,
+            };
+            return raised.map(|f| only_raised(rows, f, count));
         }
-        // Sorted, every row's ORDER BY keys are evaluated before the
-        // first one is returned.
         let mut first = rows.first.clone();
-        first.always = first.always.or_else(|| rows.ordered.clone());
+        first.always = first.always.or(raised);
         return Some(Rows {
             sorted: first.any(),
             first: first.clone(),
@@ -336,21 +393,22 @@ fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
             ..rows
         });
     }
+    let mut rows = rows;
     if offset == 0 {
+        rows.all.always = rows.all.always.take().or(raised.clone());
+        rows.first.always = rows.first.always.take().or(raised);
         return Some(rows);
     }
-    // Sorting, the planner may postpone an expensive column past the
-    // Limit (make_sort_input_target): a skipped row's is not evaluated.
+    let count = Count {
+        at_least_one: false,
+        ..rows.count
+    };
     if !sel.sort_clause.is_empty() {
-        return None;
+        return raised.map(|f| only_raised(rows, f, count));
     }
-    Some(Rows {
-        count: Count {
-            at_least_one: false,
-            ..rows.count
-        },
-        ..rows
-    })
+    rows.all.always = rows.all.always.take().or(raised.clone());
+    rows.first.always = rows.first.always.take().or(raised);
+    Some(Rows { count, ..rows })
 }
 
 /// The rows of a SELECT that isn't a set operation, before its LIMIT.
@@ -402,6 +460,8 @@ fn select_rows(
             let values = row.iter().map(|c| level.value(c)).collect();
             return Some(Rows {
                 types: row.iter().map(|c| level.type_of(c)).collect(),
+                qual_reads: vec![true; row.len()],
+                names: Some((1..=row.len()).map(|i| format!("column{i}")).collect()),
                 ..Rows::new(errors.clone(), errors, values, ONE)
             });
         }
@@ -519,7 +579,18 @@ fn select_rows(
         };
     }
     let projected = source.as_ref().is_some_and(|s| s.rows.projected);
-    let equated = equated_columns(sel.where_clause.as_deref());
+    // Each row the source yields reaches the select list, or a WHERE
+    // over its projected rows that may only make the query fetch more of
+    // them; a set-returning function could yield more rows than it
+    // reads.
+    let fail_after = source
+        .as_ref()
+        .and_then(|s| s.rows.fail_after.clone())
+        .filter(|_| {
+            where_fails.is_none_or(|w| level.unpushed(w))
+                && super::walk::level_srf_calls(sel, snapshot).is_empty()
+        });
+    let equated = equated_exprs(sel.where_clause.as_deref(), snapshot);
     let ordered = sel.sort_clause.iter().find_map(|k| match k.node.as_ref() {
         Some(node::Node::SortBy(sb)) => {
             let key = sb.node.as_deref()?;
@@ -548,8 +619,39 @@ fn select_rows(
         first_projection,
         ordered,
         types: level_types(sel, level),
+        qual_reads: if source.is_none() {
+            vec![true; values.len()]
+        } else {
+            Vec::new()
+        },
+        names: level_names(sel, level),
+        fail_after,
         ..Rows::new(all, first, values, count)
     })
+}
+
+/// The names of the columns `sel`'s select list yields over `level`'s
+/// source (`*` expanded), as FigureColname gives them.
+fn level_names(sel: &protobuf::SelectStmt, level: Level<'_>) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for target in &sel.target_list {
+        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+            return None;
+        };
+        let val = rt.val.as_deref()?;
+        if let (Some(source), Some(node::Node::ColumnRef(cr))) = (level.source, val.node.as_ref())
+            && let Read::All = source.read(cr)
+        {
+            names.extend(source.names.iter().cloned());
+            continue;
+        }
+        names.push(if rt.name.is_empty() {
+            super::target_list::infer_column_name(val).unwrap_or_else(|| "?column?".to_owned())
+        } else {
+            rt.name.clone()
+        });
+    }
+    Some(names)
 }
 
 /// What evaluating ORDER BY key `key` of `sel` over every row of `level`'s
@@ -632,46 +734,102 @@ fn column_name(cr: &protobuf::ColumnRef) -> Option<&str> {
     }
 }
 
-/// The columns read by a conjunct of `qual` that may hold an equality
-/// (see [`may_equate`]): an equivalence class may hold them, with a
-/// constant, which leaves an ORDER BY key over them redundant
-/// (`pathkey_is_redundant`): the Sort by it is dropped, and with it the
-/// key's evaluation over every row.
-fn equated_columns(qual: Option<&protobuf::Node>) -> std::collections::HashSet<&str> {
+/// The key two expressions an equivalence class could hold have alike:
+/// their structure without locations, qualifiers or type-name spellings
+/// (erring towards matching).
+fn equivalence_key(n: &protobuf::Node, snapshot: &PgCatalog) -> String {
+    super::node_fingerprint(&super::predtest_unqualify(
+        &crate::grouping::resolve_type_names(n, snapshot),
+    ))
+}
+
+/// The expressions a conjunct of `qual` that may be an equality (see
+/// [`may_equate`]) compares, as [`equivalence_key`]s: an equivalence
+/// class may hold them, with a constant, which leaves an ORDER BY key
+/// equal to one redundant (`pathkey_is_redundant`): the Sort by it is
+/// dropped, and with it the key's evaluation over every row. Only the
+/// compared expressions are members (`a + 0 = 1` doesn't make `a` one).
+fn equated_exprs(
+    qual: Option<&protobuf::Node>,
+    snapshot: &PgCatalog,
+) -> std::collections::HashSet<String> {
     let mut equated = std::collections::HashSet::new();
     for c in qual.map(conjuncts).unwrap_or_default() {
-        let mut equality = false;
-        let mut columns = Vec::new();
-        super::walk::visit_same_level(c, &mut |x| match x.node.as_ref() {
-            Some(node::Node::AExpr(e)) => equality |= may_equate(e),
-            Some(node::Node::ColumnRef(cr)) => columns.extend(column_name(cr)),
-            _ => {}
-        });
-        if equality {
-            equated.extend(columns);
+        let mut c = c;
+        // A NOT of `<>` is negated into `=`.
+        while let Some(node::Node::BoolExpr(b)) = c.node.as_ref()
+            && b.boolop == protobuf::BoolExprType::NotExpr as i32
+            && let [arg] = b.args.as_slice()
+        {
+            c = arg;
         }
+        // The expressions an equality compares.
+        fn compared(e: &protobuf::AExpr) -> Vec<&protobuf::Node> {
+            let mut members: Vec<&protobuf::Node> = e.lexpr.iter().map(|l| &**l).collect();
+            match e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
+                Some(node::Node::List(l)) => members.extend(l.items.iter()),
+                Some(_) => members.extend(e.rexpr.as_deref()),
+                None => {}
+            }
+            members
+        }
+        let mut members = match c.node.as_ref() {
+            Some(node::Node::AExpr(e)) if may_equate(e) => compared(e),
+            Some(node::Node::AExpr(_)) => continue,
+            // Simplified, another conjunct may become one (`a = 1 OR a =
+            // 1` loses its duplicate arm): any equality in it counts.
+            _ => {
+                let mut members = Vec::new();
+                super::walk::visit_same_level(c, &mut |x| {
+                    if let Some(node::Node::AExpr(e)) = x.node.as_ref()
+                        && may_equate(e)
+                    {
+                        members.extend(compared(e));
+                    }
+                });
+                members
+            }
+        };
+        // A row comparison `(a, b) = (1, 2)` is one equality per column
+        // (make_row_comparison_op).
+        let fields: Vec<&protobuf::Node> = members
+            .iter()
+            .filter_map(|m| match m.node.as_ref() {
+                Some(node::Node::RowExpr(r)) => Some(r.args.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        members.extend(fields);
+        equated.extend(members.into_iter().map(|m| equivalence_key(m, snapshot)));
     }
     equated
 }
 
 /// ORDER BY key `key` of `sel` may be one the planner drops as redundant:
-/// a constant, or one whose every column (through the output column the
-/// key names, by position or alias) is in `equated` (see
-/// [`equated_columns`]).
+/// a constant (one reading no column), or one (through the output column
+/// the key names, by position or alias) in `equated` (see
+/// [`equated_exprs`]).
 fn order_key_redundant(
     sel: &protobuf::SelectStmt,
     level: Level<'_>,
     key: &protobuf::Node,
-    equated: &std::collections::HashSet<&str>,
+    equated: &std::collections::HashSet<String>,
 ) -> bool {
-    let reads_equated = |n: &protobuf::Node| {
-        let mut all = true;
+    let redundant = |n: &protobuf::Node| {
+        let mut reads = false;
         super::walk::visit_same_level(n, &mut |x| {
-            if let Some(node::Node::ColumnRef(cr)) = x.node.as_ref() {
-                all &= column_name(cr).is_some_and(|c| equated.contains(c));
-            }
+            reads |= matches!(x.node, Some(node::Node::ColumnRef(_)));
         });
-        all
+        !reads || equated.contains(&equivalence_key(n, level.snapshot))
+    };
+    let column = |name: &str| protobuf::Node {
+        node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+            fields: vec![protobuf::Node {
+                node: Some(node::Node::String(protobuf::String { sval: name.into() })),
+            }],
+            location: -1,
+        })),
     };
     let position = match key.node.as_ref() {
         Some(node::Node::AConst(protobuf::AConst {
@@ -685,10 +843,10 @@ fn order_key_redundant(
         _ => None,
     };
     if position.is_none() && alias.is_none() {
-        return reads_equated(key);
+        return redundant(key);
     }
     // As [`order_key_error`] resolves it.
-    let mut column = 0;
+    let mut at = 0;
     for target in &sel.target_list {
         let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
             return true;
@@ -699,18 +857,18 @@ fn order_key_redundant(
             && let Read::All = source.read(cr)
         {
             let width = source.names.len();
-            if let Some(p) = position.filter(|p| (column..column + width).contains(p)) {
-                return equated.contains(source.names[p - column].as_str());
+            if let Some(p) = position.filter(|p| (at..at + width).contains(p)) {
+                return redundant(&column(&source.names[p - at]));
             }
-            column += width;
+            at += width;
             continue;
         }
-        if position == Some(column) || alias.is_some_and(|a| a == rt.name) {
-            return val.is_none_or(reads_equated);
+        if position == Some(at) || alias.is_some_and(|a| a == rt.name) {
+            return val.is_none_or(redundant);
         }
-        column += 1;
+        at += 1;
     }
-    position.is_some() || reads_equated(key)
+    position.is_some() || redundant(key)
 }
 
 /// Which columns `sel`'s select list yields over `level`'s projected
@@ -975,15 +1133,68 @@ fn set_op_rows(
             Errors::uniform(first, width),
         )
     };
+    // Flattened, a qualification pushed down into each leaf evaluates the
+    // columns it reads of every one.
+    let qual_reads = if flattened {
+        (0..width)
+            .map(|i| {
+                arms.iter()
+                    .flatten()
+                    .all(|a| a.qual_reads.get(i) == Some(&true))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let names = left.as_ref().and_then(|l| l.names.clone());
+    // A column every row holds the same constant of, of the same type in
+    // each leaf: a UNION's rows are its arms', an EXCEPT's and an
+    // INTERSECT's its left one's.
+    let values: Vec<Option<Value>> = (0..width)
+        .map(|i| {
+            if types_differ(snapshot, &leaf_types, i) {
+                return None;
+            }
+            let from: Vec<&Option<Rows>> = if sel.op == Op::SetopUnion as i32 {
+                arms.iter().collect()
+            } else {
+                vec![left]
+            };
+            let mut values = from
+                .into_iter()
+                .map(|a| a.as_ref().and_then(|a| a.values.get(i).cloned().flatten()));
+            let first = values.next().flatten()?;
+            values.all(|v| v.as_ref() == Some(&first)).then_some(first)
+        })
+        .collect();
+    // Unsorted and kept whole, a UNION ALL's Append runs its arms in
+    // order: past the left one's rows (at most one), the right one's
+    // first row is fetched (see the UNION above for why only a domain's
+    // failure counts).
+    let fail_after =
+        if sel.op == Op::SetopUnion as i32 && sel.all && sel.sort_clause.is_empty() && !flattened {
+            left.as_ref().and_then(|l| {
+                l.fail_after.clone().or_else(|| {
+                    let f = right.as_ref()?.first.any().filter(|f| f.domain)?;
+                    l.count.at_most_one.then_some((1, f))
+                })
+            })
+        } else {
+            None
+        };
     Some(Rows {
+        fail_after,
         sorted,
         projected: true,
+        qual_reads,
+        names,
         whole_row_unpushable: !flattened,
         keeps_columns: !flattened,
         unpushable,
         leaf_types,
         // A Sort reads every row, of each arm a MergeAppend's input.
         ordered: (!sel.sort_clause.is_empty()).then_some(all).flatten(),
+        values,
         ..Rows::unknown_values(all_errors, first_errors, count)
     })
 }
@@ -1089,7 +1300,15 @@ impl Level<'_> {
             node::Node::ColumnRef(cr) => {
                 let source = self.source?;
                 if self.qual && source.rows.projected && !source.rows.unpushable(&source.read(cr)) {
-                    return None;
+                    // Pushed down into the arms, the qualification runs
+                    // before their projection — evaluating the columns it
+                    // reads of each leaf.
+                    return match source.read(cr) {
+                        Read::Column(i) if source.rows.qual_reads.get(i) == Some(&true) => {
+                            source.rows.errors(self.first).column(i)
+                        }
+                        _ => None,
+                    };
                 }
                 let errors = source.rows.errors(self.first);
                 return match source.read(cr) {
@@ -1152,11 +1371,30 @@ impl Level<'_> {
                 let Some(node::Node::List(bounds)) = e.rexpr.as_deref()?.node.as_ref() else {
                     return None;
                 };
-                let op = match e.kind() {
-                    K::AexprBetween | K::AexprBetweenSym => ">=",
-                    _ => "<",
+                let (first, second) = match e.kind() {
+                    K::AexprBetween | K::AexprBetweenSym => (">=", "<="),
+                    _ => ("<", ">"),
                 };
-                self.operator_error(&comparison(op, e.lexpr.as_deref()?, bounds.items.first()?))
+                let [low, high] = bounds.items.as_slice() else {
+                    return None;
+                };
+                let lexpr = e.lexpr.as_deref()?;
+                let low_cmp = comparison(first, lexpr, low);
+                if let Some(f) = self.operator_error(&low_cmp) {
+                    return Some(f);
+                }
+                // A NULL first bound folds a strict comparison to NULL
+                // (evaluate_function), which the AND (OR) drops: the
+                // second one, over the other bound, is evaluated first.
+                let strict = self
+                    .operator(&low_cmp)
+                    .and_then(|op| op.code)
+                    .and_then(|f| self.snapshot.pg_proc.get(&f))
+                    .is_some_and(|p| p.proisstrict);
+                if !(strict && is_null_const(self.snapshot, low)) {
+                    return None;
+                }
+                self.operator_error(&comparison(second, lexpr, high))
             }
             // `a IN (b, ...)` of literals is a ScalarArrayOpExpr `a = ANY
             // (ARRAY[b, ...])`, or `a = b OR ...` where they have no
@@ -1257,7 +1495,15 @@ impl Level<'_> {
             .iter()
             .flatten()
             .all(|f| Some(f) == errors[leftmost].as_ref());
-        let types: Vec<Option<PgTypeOid>> = operands.iter().map(|a| self.type_of(a)).collect();
+        let args: Vec<Arg> = operands
+            .iter()
+            .map(|a| Arg {
+                ty: self.type_of(a),
+                null: is_null_const(self.snapshot, a),
+                not_null: self.not_null_const(a),
+                value: self.value(a),
+            })
+            .collect();
         let resolved = self.operator(e).map(|op| op.code);
         let candidates: Vec<usize> = if ordered {
             (0..operands.len())
@@ -1267,23 +1513,7 @@ impl Level<'_> {
             vec![leftmost]
         };
         let failing = candidates.into_iter().find(|&failing| {
-            // Every other operand surely is no NULL constant: a strict
-            // function over one is folded to NULL (evaluate_function), and
-            // an inlined body gets it substituted.
-            let others = operands
-                .iter()
-                .enumerate()
-                .all(|(i, a)| i == failing || self.not_null_const(a));
-            operator_evaluates(
-                self.snapshot,
-                e,
-                resolved,
-                failing,
-                others,
-                ordered,
-                &types,
-                0,
-            )
+            operator_evaluates(self.snapshot, e, resolved, failing, ordered, &args, 0)
         })?;
         errors[failing].clone()
     }
@@ -1360,12 +1590,6 @@ impl Level<'_> {
     /// The constant `n` surely is.
     fn value(&self, n: &protobuf::Node) -> Option<Value> {
         match n.node.as_ref()? {
-            node::Node::AConst(c) => match c.val.as_ref()? {
-                protobuf::a_const::Val::Ival(i) => Some(Value::Int(i64::from(i.ival))),
-                protobuf::a_const::Val::Sval(s) => Some(Value::Str(s.sval.clone())),
-                protobuf::a_const::Val::Boolval(b) => Some(Value::Bool(b.boolval)),
-                _ => None,
-            },
             node::Node::ColumnRef(cr) => {
                 let source = self.source?;
                 match source.read(cr) {
@@ -1373,76 +1597,14 @@ impl Level<'_> {
                     _ => None,
                 }
             }
-            _ => None,
+            _ => literal_value(n),
         }
     }
 
-    /// What `n`, a qualification, surely evaluates to: comparisons of
-    /// constants, which the planner folds.
+    /// What `n`, a qualification, surely evaluates to (see
+    /// [`truth_with`]).
     fn truth(&self, n: &protobuf::Node) -> Option<bool> {
-        use protobuf::BoolExprType as B;
-        match n.node.as_ref()? {
-            node::Node::AConst(_) => match self.value(n)? {
-                Value::Bool(b) => Some(b),
-                _ => None,
-            },
-            node::Node::BoolExpr(b) => {
-                let args: Vec<Option<bool>> = b.args.iter().map(|a| self.truth(a)).collect();
-                match B::try_from(b.boolop).ok()? {
-                    B::AndExpr if args.contains(&Some(false)) => Some(false),
-                    B::AndExpr => args.iter().all(|a| *a == Some(true)).then_some(true),
-                    B::OrExpr if args.contains(&Some(true)) => Some(true),
-                    B::OrExpr => args.iter().all(|a| *a == Some(false)).then_some(false),
-                    B::NotExpr => match args.as_slice() {
-                        [Some(a)] => Some(!a),
-                        _ => None,
-                    },
-                    B::Undefined => None,
-                }
-            }
-            node::Node::NullTest(nt) => {
-                self.value(nt.arg.as_deref()?)?;
-                Some(nt.nulltesttype == protobuf::NullTestType::IsNotNull as i32)
-            }
-            node::Node::AExpr(e) => {
-                let name = match e.name.as_slice() {
-                    [n] => match n.node.as_ref()? {
-                        node::Node::String(s) => s.sval.as_str(),
-                        _ => return None,
-                    },
-                    _ => return None,
-                };
-                let l = self.value(e.lexpr.as_deref()?)?;
-                match e.kind() {
-                    protobuf::AExprKind::AexprOp => {
-                        compare(name, &l, &self.value(e.rexpr.as_deref()?)?)
-                    }
-                    protobuf::AExprKind::AexprIn => {
-                        let Some(node::Node::List(list)) = e.rexpr.as_deref()?.node.as_ref() else {
-                            return None;
-                        };
-                        let eq: Vec<Option<bool>> = list
-                            .items
-                            .iter()
-                            .map(|r| compare("=", &l, &self.value(r)?))
-                            .collect();
-                        let any = if eq.contains(&Some(true)) {
-                            Some(true)
-                        } else {
-                            eq.iter().all(|e| *e == Some(false)).then_some(false)
-                        };
-                        // `<>` is NOT IN.
-                        match name {
-                            "=" => any,
-                            "<>" => any.map(|a| !a),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        truth_with(n, &|v| self.value(v))
     }
 
     /// The error a qualification surely raises: one testing a failing
@@ -1490,11 +1652,43 @@ impl Level<'_> {
         // equivalence class (`b = 3 AND b = 4`, or `b = c AND b = 3 AND c
         // = 4`): the planner derives a constant false from it, leaving the
         // scan dummy (generate_base_implied_equalities_const).
-        let equalities = conjuncts
+        // Equalities each of a column and a literal, the literals of a
+        // column all equal, make classes of a column and one constant
+        // (`b = 3 AND b = 3`: `3 = 3` is folded to true).
+        let equalities: Vec<&protobuf::AExpr> = conjuncts
             .iter()
-            .filter(|c| matches!(c.node.as_ref(), Some(node::Node::AExpr(e)) if may_equate(e)))
-            .count();
-        if equalities > 1 {
+            .filter_map(|c| match c.node.as_ref() {
+                Some(node::Node::AExpr(e)) if may_equate(e) => Some(e.as_ref()),
+                _ => None,
+            })
+            .collect();
+        let column_const = |e: &protobuf::AExpr| -> Option<(String, Value)> {
+            if e.kind() != protobuf::AExprKind::AexprOp
+                || expr::extract_string_fields(&e.name) != ["="]
+            {
+                return None;
+            }
+            let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+            let (col, lit) = match (l.node.as_ref()?, r.node.as_ref()?) {
+                (node::Node::ColumnRef(cr), _) => (cr, r),
+                (_, node::Node::ColumnRef(cr)) => (cr, l),
+                _ => return None,
+            };
+            Some((column_name(col)?.to_owned(), literal_value(lit)?))
+        };
+        let consistent = || {
+            let pairs: Option<Vec<(String, Value)>> =
+                equalities.iter().map(|e| column_const(e)).collect();
+            pairs.is_some_and(|pairs| {
+                pairs.iter().all(|(c, v)| {
+                    pairs
+                        .iter()
+                        .filter(|(d, _)| d == c)
+                        .all(|(_, w)| compare("=", v, w) == Some(true))
+                })
+            })
+        };
+        if equalities.len() > 1 && !consistent() {
             return false;
         }
         conjuncts.into_iter().all(|c| {
@@ -1589,33 +1783,72 @@ fn casts_evaluate_argument(snapshot: &PgCatalog, target: PgTypeOid) -> bool {
         })
 }
 
+/// What a call is known to get as one of its arguments.
+#[derive(Clone)]
+struct Arg {
+    /// Its type, where known (a polymorphic parameter has it).
+    ty: Option<PgTypeOid>,
+    /// It surely is a NULL constant once simplified.
+    null: bool,
+    /// It surely is no NULL constant once simplified.
+    not_null: bool,
+    /// The constant it surely is.
+    value: Option<Value>,
+}
+
+/// `n` surely is a NULL constant once simplified: a NULL literal, or one
+/// cast to a type that is no domain (a domain's coercion is not folded).
+fn is_null_const(snapshot: &PgCatalog, n: &protobuf::Node) -> bool {
+    match n.node.as_ref() {
+        Some(node::Node::AConst(c)) => c.isnull,
+        Some(node::Node::TypeCast(tc)) => {
+            tc.arg
+                .as_deref()
+                .is_some_and(|a| is_null_const(snapshot, a))
+                && tc
+                    .type_name
+                    .as_ref()
+                    .and_then(|t| crate::ddl::util::resolve_type_name(t, snapshot))
+                    .is_some_and(|t| snapshot.unwrap_domain(t) == t)
+        }
+        _ => false,
+    }
+}
+
 /// The operator `e` evaluates its operand `operand` (counted from its left
 /// one): its function — `code`, where its operands' types resolved it;
 /// else every operator of its name and arity must — evaluates that
-/// argument (see [`call_evaluates`]). `others` tells that every other
-/// operand surely is no NULL constant, which a strict function (or an
-/// inlined body) needs; `ordered`, that it doesn't matter in which order
-/// the operands are evaluated (an inlined body may reorder them).
-#[allow(clippy::too_many_arguments)]
+/// argument (see [`call_evaluates`]). `args` tell what is known of each
+/// operand: a strict function needs every other one to be no NULL
+/// constant, which it is folded to NULL over (evaluate_function); an
+/// inlined body needs each to be known a NULL constant or not, as it gets
+/// it substituted. `ordered`: it doesn't matter in which order the
+/// operands are evaluated (an inlined body may reorder them).
 fn operator_evaluates(
     snapshot: &PgCatalog,
     e: &protobuf::AExpr,
     code: Option<Option<crate::oid::PgProcOid>>,
     operand: usize,
-    others: bool,
     ordered: bool,
-    types: &[Option<PgTypeOid>],
+    args: &[Arg],
     depth: usize,
 ) -> bool {
+    let others = |known: &dyn Fn(&Arg) -> bool| {
+        args.iter()
+            .enumerate()
+            .all(|(i, a)| i == operand || known(a))
+    };
     let evaluates = |code: Option<crate::oid::PgProcOid>| {
         let Some(p) = code.and_then(|f| snapshot.pg_proc.get(&f)) else {
             return false;
         };
         let sql = p.prolang == crate::pg_catalog::SQL_LANGUAGE;
-        if (p.proisstrict || sql) && !others || sql && !ordered {
+        if p.proisstrict && !others(&|a| a.not_null)
+            || sql && (!ordered || !others(&|a| a.not_null || a.null))
+        {
             return false;
         }
-        call_evaluates(snapshot, p, operand, types, depth)
+        call_evaluates(snapshot, p, operand, args, depth)
     };
     if let Some(code) = code {
         return evaluates(code);
@@ -1631,19 +1864,18 @@ fn operator_evaluates(
         .all(|o| evaluates(o.oprcode))
 }
 
-/// A call of `p` evaluates its argument `arg`, none of the others being a
-/// NULL constant: ExecInterpExpr evaluates a call's arguments before it,
-/// and the planner neither folds a domain's coercion
-/// (eval_const_expressions) nor drops an argument — unless a support
-/// function simplifies the call, or `p` is a SQL function it inlines
-/// (`inline_function`), whose body is then evaluated instead: that body
-/// must evaluate the parameter. `types` are the arguments' types, where
-/// known (the body's polymorphic parameters have them).
+/// A call of `p` evaluates its argument `arg`: ExecInterpExpr evaluates a
+/// call's arguments before it, and the planner neither folds a domain's
+/// coercion (eval_const_expressions) nor drops an argument — unless a
+/// support function simplifies the call, or `p` is a SQL function it
+/// inlines (`inline_function`), whose body is then evaluated instead,
+/// with the arguments `args` substituted: that body must evaluate the
+/// parameter.
 fn call_evaluates(
     snapshot: &PgCatalog,
     p: &crate::pg_catalog::PgProc,
     arg: usize,
-    types: &[Option<PgTypeOid>],
+    args: &[Arg],
     depth: usize,
 ) -> bool {
     if !keeps_arguments(snapshot, p) {
@@ -1661,7 +1893,7 @@ fn call_evaluates(
         && Body {
             snapshot,
             proc: p,
-            types,
+            args,
             depth,
         }
         .evaluates(body, arg)
@@ -1672,7 +1904,7 @@ fn call_evaluates(
 struct Body<'a> {
     snapshot: &'a PgCatalog,
     proc: &'a crate::pg_catalog::PgProc,
-    types: &'a [Option<PgTypeOid>],
+    args: &'a [Arg],
     depth: usize,
 }
 
@@ -1694,7 +1926,7 @@ impl Body<'_> {
             },
             _ => None,
         }
-        .filter(|&i| i < self.proc.proargtypes.len())
+        .filter(|&i| i < self.proc.proargtypes.len() && i < self.args.len())
     }
 
     /// The type `n` surely has, where it is simple enough to tell: a
@@ -1704,7 +1936,7 @@ impl Body<'_> {
         if let Some(i) = self.param(n) {
             let declared = self.proc.proargtypes[i];
             return if crate::polymorphic::is_polymorphic(declared) {
-                self.types.get(i).copied().flatten()
+                self.args[i].ty
             } else {
                 Some(declared)
             };
@@ -1734,6 +1966,19 @@ impl Body<'_> {
         }
     }
 
+    /// The constant `n` surely is: a literal, or a parameter given one.
+    fn value(&self, n: &protobuf::Node) -> Option<Value> {
+        match self.param(n) {
+            Some(i) => self.args[i].value.clone(),
+            None => literal_value(n),
+        }
+    }
+
+    /// What `n`, a condition, is folded to (see [`truth_with`]).
+    fn truth(&self, n: &protobuf::Node) -> Option<bool> {
+        truth_with(n, &|v| self.value(v))
+    }
+
     /// `n` surely evaluates parameter `k` (the failing argument, no
     /// constant), and isn't folded away.
     fn evaluates(&self, n: &protobuf::Node, k: usize) -> bool {
@@ -1756,20 +2001,24 @@ impl Body<'_> {
                 let Some(operand) = reading.iter().position(|&r| r) else {
                     return false;
                 };
-                let others = operands
+                let args: Vec<Arg> = operands
                     .iter()
                     .enumerate()
-                    .all(|(i, a)| i == operand || self.not_null_const(a));
-                let types: Vec<Option<PgTypeOid>> =
-                    operands.iter().map(|a| self.type_of(a)).collect();
+                    .map(|(i, a)| Arg {
+                        ty: self.type_of(a),
+                        // The parameter read is no constant.
+                        null: i != operand && self.null_const(a),
+                        not_null: i == operand || self.not_null_const(a),
+                        value: self.value(a),
+                    })
+                    .collect();
                 operator_evaluates(
                     self.snapshot,
                     e,
                     self.operator(e).map(|op| op.code),
                     operand,
-                    others,
                     true,
-                    &types,
+                    &args,
                     self.depth + 1,
                 )
             }
@@ -1787,27 +2036,77 @@ impl Body<'_> {
             {
                 e.lexpr.iter().chain(&e.rexpr).any(|a| self.evaluates(a, k))
             }
-            // COALESCE keeps its first argument, no constant, first.
-            Some(node::Node::CoalesceExpr(c)) => {
-                c.args.first().is_some_and(|a| self.evaluates(a, k))
-            }
-            // An AND or OR is folded to a constant when one of its
-            // arguments is the one deciding it (`$2 > 0` over a constant
-            // `$2`), and stops at the first one deciding it: each must
-            // evaluate the parameter (no constant then).
+            // COALESCE drops its NULL constant arguments, and keeps the
+            // first other one, no constant, first (a non-NULL constant
+            // first is its value).
+            Some(node::Node::CoalesceExpr(c)) => c
+                .args
+                .iter()
+                .find(|a| !self.null_const(a))
+                .is_some_and(|a| self.evaluates(a, k)),
+            // An AND or OR drops its NULL constant arguments and the ones
+            // folded to the value that doesn't decide it (`$2 > 0` over
+            // `1`, in an AND), is folded to a constant when one is folded
+            // to the deciding one, and stops at the first one deciding
+            // it: each one left must evaluate the parameter (no constant
+            // then). A NOT evaluates its argument.
             Some(node::Node::BoolExpr(b)) => {
-                !b.args.is_empty() && b.args.iter().all(|a| self.evaluates(a, k))
+                let deciding = match protobuf::BoolExprType::try_from(b.boolop) {
+                    Ok(protobuf::BoolExprType::AndExpr) => false,
+                    Ok(protobuf::BoolExprType::OrExpr) => true,
+                    _ => return b.args.len() == 1 && self.evaluates(&b.args[0], k),
+                };
+                let mut left = Vec::new();
+                for a in &b.args {
+                    match self.truth(a) {
+                        Some(t) if t == deciding => return false,
+                        Some(_) => {}
+                        None if self.null_const(a) => {}
+                        None => left.push(a),
+                    }
+                }
+                !left.is_empty() && left.iter().all(|a| self.evaluates(a, k))
+            }
+            // A searched CASE drops the WHENs folded to false (or NULL),
+            // and stops at one folded to true, its result then the
+            // CASE's; it evaluates the first WHEN left first
+            // (eval_const_expressions' CaseExpr).
+            Some(node::Node::CaseExpr(c)) if c.arg.is_none() => {
+                for w in &c.args {
+                    let Some(node::Node::CaseWhen(w)) = w.node.as_ref() else {
+                        return false;
+                    };
+                    let Some(cond) = w.expr.as_deref() else {
+                        return false;
+                    };
+                    match self.truth(cond) {
+                        Some(true) => {
+                            return w.result.as_deref().is_some_and(|r| self.evaluates(r, k));
+                        }
+                        Some(false) => continue,
+                        None => return self.evaluates(cond, k),
+                    }
+                }
+                c.defresult.as_deref().is_some_and(|d| self.evaluates(d, k))
             }
             _ => false,
         }
     }
 
-    /// `n` surely is no NULL constant once simplified: a parameter (the
-    /// call's arguments are none), a non-NULL literal, a built-in cast of
-    /// such.
+    /// `n` surely is a NULL constant once simplified: a parameter given
+    /// one, or a NULL literal (maybe cast).
+    fn null_const(&self, n: &protobuf::Node) -> bool {
+        match self.param(n) {
+            Some(i) => self.args[i].null,
+            None => is_null_const(self.snapshot, n),
+        }
+    }
+
+    /// `n` surely is no NULL constant once simplified: a parameter given
+    /// none, a non-NULL literal, a built-in cast of such.
     fn not_null_const(&self, n: &protobuf::Node) -> bool {
-        if self.param(n).is_some() {
-            return true;
+        if let Some(i) = self.param(n) {
+            return self.args[i].not_null;
         }
         match n.node.as_ref() {
             Some(node::Node::AConst(c)) => !c.isnull,
@@ -1821,6 +2120,102 @@ impl Body<'_> {
             }
             _ => false,
         }
+    }
+}
+
+/// What `qual` surely evaluates to over a row whose columns `column`
+/// tells the constants of (a literal each, where known): comparisons of
+/// constants (see [`truth_with`]).
+pub(super) fn qual_truth<'a>(
+    qual: &protobuf::Node,
+    column: &dyn Fn(&protobuf::ColumnRef) -> Option<&'a protobuf::Node>,
+) -> Option<bool> {
+    truth_with(qual, &|n| match n.node.as_ref()? {
+        node::Node::ColumnRef(cr) => literal_value(column(cr)?),
+        _ => literal_value(n),
+    })
+}
+
+/// The constant the literal `n` is.
+fn literal_value(n: &protobuf::Node) -> Option<Value> {
+    match n.node.as_ref()? {
+        node::Node::AConst(c) => match c.val.as_ref()? {
+            protobuf::a_const::Val::Ival(i) => Some(Value::Int(i64::from(i.ival))),
+            protobuf::a_const::Val::Sval(s) => Some(Value::Str(s.sval.clone())),
+            protobuf::a_const::Val::Boolval(b) => Some(Value::Bool(b.boolval)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// What `n`, a condition, surely evaluates to, its operands' constants
+/// told by `value`: comparisons of constants, which the planner folds
+/// (and which evaluate so at run time).
+fn truth_with(
+    n: &protobuf::Node,
+    value: &dyn Fn(&protobuf::Node) -> Option<Value>,
+) -> Option<bool> {
+    use protobuf::BoolExprType as B;
+    match n.node.as_ref()? {
+        node::Node::AConst(_) => match value(n)? {
+            Value::Bool(b) => Some(b),
+            _ => None,
+        },
+        node::Node::BoolExpr(b) => {
+            let args: Vec<Option<bool>> = b.args.iter().map(|a| truth_with(a, value)).collect();
+            match B::try_from(b.boolop).ok()? {
+                B::AndExpr if args.contains(&Some(false)) => Some(false),
+                B::AndExpr => args.iter().all(|a| *a == Some(true)).then_some(true),
+                B::OrExpr if args.contains(&Some(true)) => Some(true),
+                B::OrExpr => args.iter().all(|a| *a == Some(false)).then_some(false),
+                B::NotExpr => match args.as_slice() {
+                    [Some(a)] => Some(!a),
+                    _ => None,
+                },
+                B::Undefined => None,
+            }
+        }
+        node::Node::NullTest(nt) => {
+            value(nt.arg.as_deref()?)?;
+            Some(nt.nulltesttype == protobuf::NullTestType::IsNotNull as i32)
+        }
+        node::Node::AExpr(e) => {
+            let name = match e.name.as_slice() {
+                [n] => match n.node.as_ref()? {
+                    node::Node::String(s) => s.sval.as_str(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let l = value(e.lexpr.as_deref()?)?;
+            match e.kind() {
+                protobuf::AExprKind::AexprOp => compare(name, &l, &value(e.rexpr.as_deref()?)?),
+                protobuf::AExprKind::AexprIn => {
+                    let Some(node::Node::List(list)) = e.rexpr.as_deref()?.node.as_ref() else {
+                        return None;
+                    };
+                    let eq: Vec<Option<bool>> = list
+                        .items
+                        .iter()
+                        .map(|r| compare("=", &l, &value(r)?))
+                        .collect();
+                    let any = if eq.contains(&Some(true)) {
+                        Some(true)
+                    } else {
+                        eq.iter().all(|e| *e == Some(false)).then_some(false)
+                    };
+                    // `<>` is NOT IN.
+                    match name {
+                        "=" => any,
+                        "<>" => any.map(|a| !a),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -2018,6 +2413,11 @@ fn from_item_rows(
             .filter(|a| a.attnum > 0)
             .map(|a| Some(a.atttypid))
             .collect();
+    }
+    if names.is_empty()
+        && let Some(n) = rows.names.as_ref()
+    {
+        names = n.clone();
     }
     if names.is_empty() {
         let named = leftmost(&query);

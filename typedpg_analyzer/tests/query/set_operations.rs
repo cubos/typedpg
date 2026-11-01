@@ -515,9 +515,72 @@ fn a_set_operation_read_whole_fails_every_execution() {
                  WHERE a > 0 ORDER BY a LIMIT 1",
                 domain,
             ),
+            // The Sort reads every row of the subquery, which projects its
+            // arms whole (make_sort_input_target postpones only the
+            // query's own expensive expressions past the Limit).
             (
                 "SELECT * FROM (SELECT 1 AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
                  ORDER BY b OFFSET 1",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 ORDER BY b LIMIT 1 OFFSET 1",
+                domain,
+            ),
+            // No Sort (the key is redundant): the Limit stops before the
+            // second arm, or past it.
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY a LIMIT 2",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY a LIMIT 1 OFFSET 1",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s LIMIT 2",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT 2 UNION ALL SELECT NULL::d) s \
+                 LIMIT 2",
+                None,
+            ),
+            // A row comparison is one equality per column; a duplicate OR
+            // arm is dropped, leaving an equality.
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE (a, 1) = (1, 1) ORDER BY a LIMIT 1",
+                None,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 OR a = 1 ORDER BY a LIMIT 1",
+                None,
+            ),
+            // Only the expressions an equality compares are equated.
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a + 0 = 1 ORDER BY a LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
+                 WHERE a = 1 ORDER BY a + 0 LIMIT 1",
+                domain,
+            ),
+            // `b = 2` holds in both arms: every row reaches the Sort by a.
+            (
+                "SELECT a FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE b = 2 ORDER BY a LIMIT 1",
+                domain,
+            ),
+            (
+                "SELECT a FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 3) s \
+                 WHERE b = 2 ORDER BY a LIMIT 1",
                 None,
             ),
             (
@@ -558,6 +621,17 @@ fn a_set_operation_read_whole_fails_every_execution() {
                 "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
                  WHERE b = 3 AND b = 4",
                 None,
+            ),
+            // Equal constants make no contradiction.
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
+                 WHERE b = 3 AND b = 3",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b, 2 AS c EXCEPT SELECT 1, 2, 3) s \
+                 WHERE b = 3 AND c = 4",
+                domain,
             ),
             (
                 "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b, 2 AS c EXCEPT SELECT 1, 2, 3) s \
@@ -635,47 +709,48 @@ fn a_set_operation_read_whole_fails_every_execution() {
                 "SELECT a FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s",
                 domain,
             ),
+            // A qualification pushed down into each leaf evaluates the
+            // columns it reads there — not the whole row, whose NULL
+            // test is one of each column (`b IS NULL` is false).
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE a = 1",
+                domain,
+            ),
+            (
+                "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE a IS NULL",
+                domain,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE s IS NULL",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE b = 1",
+                None,
+            ),
+            (
+                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b UNION ALL SELECT NULL::d, 2) s \
+                 WHERE a = NULL",
+                None,
+            ),
+            // `*` passes the set operation's columns through.
+            (
+                "SELECT 1 FROM (SELECT * FROM (SELECT NULL::d AS a, 1 AS b UNION ALL \
+                 SELECT 1, 2) s1) s2",
+                domain,
+            ),
+            (
+                "SELECT b FROM (SELECT * FROM (SELECT NULL::d AS a, 1 AS b UNION ALL \
+                 SELECT NULL::d, 2) s1) s2",
+                None,
+            ),
             (
                 "SELECT b FROM (SELECT NULL::d AS a, 1 AS b UNION SELECT NULL::d, 2) s",
                 domain,
-            ),
-        ],
-    );
-}
-
-/// Set operations PostgreSQL 18 reads whole on every execution, which the
-/// analyzer doesn't prove and accepts:
-/// - a LIMIT past the rows of the first arm, with the Sort dropped (a
-///   redundant key) or with no ORDER BY;
-/// - an ORDER BY key reading a column a WHERE equality reads only inside
-///   another expression (`a + 0 = 1` leaves `a` sortable);
-/// - two equalities that agree (`b = 3 AND b = 3`) or a Sort by a key no
-///   WHERE equality reads while the WHERE drops no arm.
-#[test]
-fn known_gaps_in_set_operations_read_whole() {
-    let db = build_db(&[("0001.sql", "CREATE DOMAIN d AS int NOT NULL;")]);
-    assert_outcomes(
-        &db,
-        &[
-            (
-                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
-                 WHERE a = 1 ORDER BY a LIMIT 2",
-                None,
-            ),
-            (
-                "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT NULL::d) s \
-                 WHERE a + 0 = 1 ORDER BY a LIMIT 1",
-                None,
-            ),
-            (
-                "SELECT 1 FROM (SELECT NULL::d AS a, 1 AS b EXCEPT SELECT 1, 2) s \
-                 WHERE b = 3 AND b = 3",
-                None,
-            ),
-            (
-                "SELECT a FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT NULL::d, 2) s \
-                 WHERE b = 2 ORDER BY a LIMIT 1",
-                None,
             ),
         ],
     );

@@ -1,8 +1,9 @@
 //! `INSERT ... SELECT` whose SELECT yields a row on every execution: no
-//! FROM nor WHERE, aggregates without GROUP BY, or a subquery or CTE
-//! doing so.
+//! FROM, aggregates without GROUP BY, or a subquery or CTE doing so, under
+//! a WHERE that holds over the row's constants.
 //! Storing that row fails every execution when it fails — even where the
-//! SELECT isn't pulled up, so that PREPARE succeeds and EXECUTE fails.
+//! SELECT isn't pulled up, so that PREPARE succeeds and EXECUTE fails. A
+//! plain SELECT's select list over such a row fails likewise.
 
 use crate::common::*;
 
@@ -95,6 +96,12 @@ fn insert_select_storing_a_constant_out_of_range_is_rejected() {
     for sql in [
         "INSERT INTO s9 (a, b) SELECT 40000, count(*) FROM s9",
         "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x OFFSET 0) s",
+        // The WHERE holds over the row (pushed down into the subquery, or
+        // evaluated over it).
+        "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x OFFSET 0) s(x) WHERE x > 1",
+        "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x OFFSET 0) s WHERE x = 40000 AND true",
+        "INSERT INTO s9 (a) SELECT s.x FROM (SELECT 40000 AS x, 2 AS y OFFSET 0) s \
+         WHERE s.y IN (1, 2) OR x < 0",
         "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x, random() AS r) s",
         "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x, count(*) FROM s9) s",
         "INSERT INTO s9 (a) SELECT 40000::int8 FROM (SELECT count(*) FROM s9) s",
@@ -150,6 +157,9 @@ fn insert_select_whose_row_may_not_fail_is_accepted() {
         "WITH c AS (SELECT NULL::int AS x) INSERT INTO p (a) SELECT x FROM c WHERE x > 0",
         "WITH c AS MATERIALIZED (SELECT 40000 AS x) INSERT INTO s9 (a) SELECT 1 FROM c",
         "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x OFFSET 0) s WHERE x < 1",
+        "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x OFFSET 0) s WHERE x > 1 AND x < 5",
+        "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x, b FROM s9 LIMIT 1) s WHERE x > 1",
+        "INSERT INTO s9 (a) SELECT x FROM (SELECT 40000 AS x, random() AS r) s WHERE r > 0.5",
         "INSERT INTO s9 (a, b) SELECT 40000, count(*) FROM s9 HAVING count(*) > 5",
         "INSERT INTO tr (a) SELECT NULL",
         "INSERT INTO tr (a, b) SELECT NULL, count(*) FROM tr",
@@ -238,6 +248,50 @@ fn insert_through_a_view_checks_the_row_in_its_base_relation() {
         "INSERT INTO vidt (a, b) OVERRIDING USER VALUE SELECT NULL, count(*) FROM idt",
         "INSERT INTO vidt (a, b) OVERRIDING USER VALUE SELECT 40000, count(*) FROM idt",
         "INSERT INTO vidt (a, b) OVERRIDING USER VALUE VALUES (40000, 1)",
+    ] {
+        if let Err(e) = db.analyze(sql) {
+            panic!("{sql}: {e}");
+        }
+    }
+}
+
+/// A plain SELECT evaluating its select list over the row a subquery the
+/// planner doesn't pull up (a LIMIT, an OFFSET, an aggregate) surely
+/// yields: the subquery's output stays a Var, so `x::int2` is converted by
+/// the executor, out of range on every execution. Neighbours: the row may
+/// not be read (LIMIT 0, OFFSET, a WHERE that may not hold, a FROM table,
+/// a CASE branch never taken), or the statement isn't run (plain EXPLAIN).
+#[test]
+fn a_select_list_over_a_row_a_subquery_surely_yields_fails_every_execution() {
+    let db = setup();
+    for sql in [
+        "SELECT x::int2 FROM (SELECT 40000 AS x LIMIT 1) s",
+        "SELECT x::int2 FROM (SELECT 40000 AS x OFFSET 0) s",
+        "SELECT 1, s.x::int2 FROM (SELECT 40000 AS x OFFSET 0) s WHERE x > 1 LIMIT 5",
+        "SELECT y::int2 FROM (SELECT 40000 AS x, count(*) FROM s9) s(y, c)",
+        "SELECT (x + 1)::int2 FROM (SELECT 32767 AS x LIMIT 1) s",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::NumericValueOutOfRange(_),
+            "smallint out of range"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT x / 0 FROM (SELECT 1 AS x LIMIT 1) s"),
+        AnalyzeError::DivisionByZero(_),
+        "division by zero"
+    );
+    for sql in [
+        "SELECT x::int2 FROM (SELECT 40000 AS x LIMIT 1) s LIMIT 0",
+        "SELECT x::int2 FROM (SELECT 40000 AS x LIMIT 1) s OFFSET 1",
+        "SELECT x::int2 FROM (SELECT 40000 AS x OFFSET 1) s",
+        "SELECT x::int2 FROM (SELECT 40000 AS x LIMIT 1) s WHERE x < 1",
+        "SELECT x::int2 FROM (SELECT 40000 AS x FROM s9 LIMIT 1) s",
+        "SELECT x::int2 FROM (SELECT 4000 AS x LIMIT 1) s",
+        "SELECT CASE WHEN false THEN x::int2 END FROM (SELECT 40000 AS x LIMIT 1) s",
+        "SELECT x::int2 FROM (SELECT 40000 AS x LIMIT 1) s, s9",
+        "EXPLAIN SELECT x::int2 FROM (SELECT 40000 AS x LIMIT 1) s",
     ] {
         if let Err(e) = db.analyze(sql) {
             panic!("{sql}: {e}");

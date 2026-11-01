@@ -1,10 +1,10 @@
 //! The row an `INSERT ... SELECT` surely stores.
 //!
 //! Some SELECTs yield a row on every execution, whatever the tables hold:
-//! one without FROM and WHERE, one computing aggregates without GROUP BY
-//! (or with `GROUP BY ()`) nor HAVING (a row even over no input), one
-//! reading only such a subquery or CTE — when no set-returning function, LIMIT 0
-//! or OFFSET drops it.
+//! one without FROM, one computing aggregates without GROUP BY (or with
+//! `GROUP BY ()`) nor HAVING (a row even over no input), one reading only
+//! such a subquery or CTE — when no set-returning function, LIMIT 0 or
+//! OFFSET drops it, and its WHERE holds over the row's constants.
 //! An INSERT storing that row fails every execution the row fails: a NULL
 //! into a NOT NULL column (or one left to a NULL default), a constant out
 //! of its column's range. Unlike a VALUES row, or a SELECT the planner
@@ -118,6 +118,43 @@ fn sure_row<'a>(
     ctes: &[&'a protobuf::CommonTableExpr],
     depth: usize,
 ) -> Option<Outputs<'a>> {
+    let inner = sure_level(sel, snapshot, ctes, depth)?;
+    let mut out: Outputs<'a> = Vec::with_capacity(sel.target_list.len());
+    for t in &sel.target_list {
+        let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+            return Some(Vec::new());
+        };
+        let Some(val) = rt.val.as_deref() else {
+            return Some(Vec::new());
+        };
+        if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() {
+            if is_star(cr) {
+                // `*` or `s.*` alone reads the subquery's columns as they
+                // are; beside other items, positions are not followed.
+                return Some(match &inner {
+                    Some((outputs, _, _)) if sel.target_list.len() == 1 => outputs.clone(),
+                    _ => Vec::new(),
+                });
+            }
+            out.push(column_value(inner.as_ref(), cr));
+            continue;
+        }
+        out.push(is_constant(val).then_some(val));
+    }
+    Some(out)
+}
+
+/// Whether `sel` yields a row on every execution, its select list
+/// evaluated over it (see the module docs): `Some` of the subquery it
+/// reads alone, if any. A WHERE must hold over that row's constants —
+/// whether the planner pushes it down into the subquery and folds it, or
+/// evaluates it over the row.
+fn sure_level<'a>(
+    sel: &'a protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+    ctes: &[&'a protobuf::CommonTableExpr],
+    depth: usize,
+) -> Option<Option<Subquery<'a>>> {
     if depth > MAX_DEPTH
         || sel.op != SetOperation::SetopNone as i32
         || !sel.values_lists.is_empty()
@@ -135,68 +172,88 @@ fn sure_row<'a>(
     let mut inner: Option<Subquery<'a>> = None;
     if sel.group_clause.is_empty() && !aggregates(sel, snapshot) {
         match sel.from_clause.as_slice() {
-            [] if sel.where_clause.is_none() => {}
-            [from] if sel.where_clause.is_none() => {
-                inner = Some(from_subquery(from, snapshot, ctes, depth)?);
-            }
+            [] => {}
+            [from] => inner = Some(from_subquery(from, snapshot, ctes, depth)?),
             _ => return None,
         }
-    }
-    let mut out: Outputs<'a> = Vec::with_capacity(sel.target_list.len());
-    for t in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
-            return Some(Vec::new());
-        };
-        let Some(val) = rt.val.as_deref() else {
-            return Some(Vec::new());
-        };
-        if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() {
-            let fields: Vec<Option<&str>> = cr
-                .fields
-                .iter()
-                .map(|f| match f.node.as_ref() {
-                    Some(node::Node::String(s)) => Some(s.sval.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let star = cr
-                .fields
-                .last()
-                .is_some_and(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
-            if star {
-                // `*` or `s.*` alone reads the subquery's columns as they
-                // are; beside other items, positions are not followed.
-                return Some(match &inner {
-                    Some((outputs, _, _)) if sel.target_list.len() == 1 => outputs.clone(),
-                    _ => Vec::new(),
-                });
+        if let Some(qual) = sel.where_clause.as_deref() {
+            let column = |cr: &protobuf::ColumnRef| column_value(inner.as_ref(), cr);
+            if crate::resolve::failing_rows::qual_truth(qual, &column) != Some(true) {
+                return None;
             }
-            let column = match (fields.as_slice(), &inner) {
-                ([Some(c)], Some(_)) => Some(*c),
-                ([Some(a), Some(c)], Some((_, _, Some(alias)))) if a == alias => Some(*c),
-                _ => None,
-            };
-            out.push(column.and_then(|c| {
-                let (outputs, names, _) = inner.as_ref()?;
-                let mut at = names
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, n)| **n == Some(c))
-                    .map(|(i, _)| i);
-                let i = at.next().filter(|_| at.next().is_none())?;
-                // An untyped literal is resolved to text as the subquery's
-                // output, no longer read as the column's type.
-                outputs
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .filter(|v| !is_untyped_string(v))
-            }));
-            continue;
         }
-        out.push(is_constant(val).then_some(val));
     }
-    Some(out)
+    Some(inner)
+}
+
+/// A `*` or `s.*` column reference.
+fn is_star(cr: &protobuf::ColumnRef) -> bool {
+    cr.fields
+        .last()
+        .is_some_and(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+}
+
+/// The constant the column `cr` reads of the subquery `inner` holds: one
+/// of its outputs, named once.
+fn column_value<'a>(
+    inner: Option<&Subquery<'a>>,
+    cr: &protobuf::ColumnRef,
+) -> Option<&'a protobuf::Node> {
+    let (outputs, names, alias) = inner?;
+    let fields: Vec<Option<&str>> = cr
+        .fields
+        .iter()
+        .map(|f| match f.node.as_ref() {
+            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let c = match (fields.as_slice(), alias) {
+        ([Some(c)], _) => *c,
+        ([Some(a), Some(c)], Some(alias)) if a == alias => *c,
+        _ => return None,
+    };
+    let mut at = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n == Some(c))
+        .map(|(i, _)| i);
+    let i = at.next().filter(|_| at.next().is_none())?;
+    // An untyped literal is resolved to text as the subquery's output, no
+    // longer read as the column's type.
+    outputs
+        .get(i)
+        .copied()
+        .flatten()
+        .filter(|v| !is_untyped_string(v))
+}
+
+/// The error every execution of the SELECT `sel` raises evaluating its
+/// select list over the row it surely reads of a subquery the planner
+/// doesn't pull up (`x::int2` over `(SELECT 40000 AS x LIMIT 1) s`): the
+/// subquery's output is a constant the executor computes, and converts or
+/// operates on as the select list says — out of range, a division by
+/// zero, on every execution. (Pulled up, the planner folds it, which is
+/// the query's analysis' to report.) The leftmost failing output, as
+/// ExecProject evaluates them in order.
+pub(in crate::resolve) fn sure_select_error(
+    sel: &protobuf::SelectStmt,
+    snapshot: &PgCatalog,
+) -> Option<AnalyzeError> {
+    if !crate::resolve::executes() {
+        return None;
+    }
+    let inner = sure_level(sel, snapshot, &[], 0)??;
+    let columns = |cr: &protobuf::ColumnRef| {
+        column_value(Some(&inner), cr).map(|n| std::sync::Arc::new(n.clone()))
+    };
+    sel.target_list.iter().find_map(|t| {
+        let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let val = rt.val.as_deref()?;
+        crate::fold::error_in(val, snapshot, &columns).map(|e| e.at(val))
+    })
 }
 
 /// FROM item `from` read alone, when it surely yields a row: a subquery,

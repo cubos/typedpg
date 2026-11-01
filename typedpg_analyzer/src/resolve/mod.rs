@@ -1125,6 +1125,9 @@ fn analyze_raw_node_once(
             let (_, p) = analyze_select(sel, snapshot, &mut params)?;
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
             failing_rows::check_null_domain_casts(sel, snapshot)?;
+            if let Some(e) = dml::select_row::sure_select_error(sel, snapshot) {
+                return Err(e);
+            }
             (Vec::new(), p)
         }
         node::Node::SelectStmt(sel) => {
@@ -1132,6 +1135,9 @@ fn analyze_raw_node_once(
             // The statement-level `resolveTargetListUnknowns`.
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
             failing_rows::check_null_domain_casts(sel, snapshot)?;
+            if let Some(e) = dml::select_row::sure_select_error(sel, snapshot) {
+                return Err(e);
+            }
             r
         }
         node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
@@ -1166,6 +1172,9 @@ fn analyze_raw_node_once(
                         let sel = stripped.as_ref().unwrap_or(sel);
                         analyze_select(sel, snapshot, &mut params)?;
                         failing_rows::check_null_domain_casts(sel, snapshot)?;
+                        if let Some(e) = dml::select_row::sure_select_error(sel, snapshot) {
+                            return Err(e);
+                        }
                     }
                     node::Node::InsertStmt(ins) => {
                         analyze_insert(ins, snapshot, &mut params)?;
