@@ -863,7 +863,13 @@ fn assert_outcomes(db: &PgCatalog, cases: &[(&str, Option<&str>)]) {
 /// evaluating the parameter through a NULL test, IS NOT DISTINCT FROM,
 /// COALESCE's first argument or an AND every argument of which reads it.
 /// An AND with another argument may be folded to a constant over the
-/// call's constant arguments (`$2 > 0` over `0`): accepted.
+/// call's constant arguments (`$2 > 0` over `0`): accepted; one folded to
+/// true (`$2 > 0` over `1`) is dropped, leaving the parameter read. A
+/// searched CASE in an inlined body is folded likewise, a WHEN decided by
+/// the constant arguments leaving its result (or the ELSE) evaluated. A
+/// BETWEEN with a NULL first bound folds that comparison to NULL and
+/// evaluates the second one; a SQL operator's body gets a NULL constant
+/// operand substituted (`coalesce($1, NULL)` is `$1`).
 #[test]
 fn more_expressions_evaluate_a_null_domain_operand() {
     let db = build_db(&[(
@@ -885,7 +891,21 @@ fn more_expressions_evaluate_a_null_domain_operand() {
          CREATE FUNCTION andl(d, int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0 AND $2 > 0';
          CREATE OPERATOR %=% (LEFTARG = d, RIGHTARG = int, FUNCTION = andl);
          CREATE FUNCTION elem(anyelement, int) RETURNS bool LANGUAGE sql AS 'SELECT $1 IS NULL';
-         CREATE OPERATOR &=& (LEFTARG = anyelement, RIGHTARG = int, FUNCTION = elem);",
+         CREATE OPERATOR &=& (LEFTARG = anyelement, RIGHTARG = int, FUNCTION = elem);
+         CREATE FUNCTION picks(d, int) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'SELECT CASE WHEN $2 > 0 THEN $1 END';
+         CREATE OPERATOR <%> (LEFTARG = d, RIGHTARG = int, FUNCTION = picks);
+         CREATE FUNCTION picks_else(d, int) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'SELECT CASE WHEN $2 > 5 THEN 0 WHEN $2 < 0 THEN 1 ELSE $1 END';
+         CREATE OPERATOR <%%> (LEFTARG = d, RIGHTARG = int, FUNCTION = picks_else);
+         CREATE FUNCTION picks_first(d, int) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'SELECT CASE WHEN $1 > $2 THEN 0 ELSE 1 END';
+         CREATE OPERATOR <%%%> (LEFTARG = d, RIGHTARG = int, FUNCTION = picks_first);
+         CREATE FUNCTION picks_param(d, int) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'SELECT CASE WHEN $2 > random() THEN $1 END';
+         CREATE OPERATOR <#%> (LEFTARG = d, RIGHTARG = int, FUNCTION = picks_param);
+         CREATE FUNCTION coal2(int, d) RETURNS int LANGUAGE sql AS 'SELECT coalesce($1, $2)';
+         CREATE OPERATOR #<<# (LEFTARG = int, RIGHTARG = d, FUNCTION = coal2);",
     )]);
     let domain = Some("domain d does not allow null values");
     assert_outcomes(
@@ -912,8 +932,35 @@ fn more_expressions_evaluate_a_null_domain_operand() {
             ("SELECT x #<# 1 FROM v", domain),
             ("SELECT x %%% 1 FROM v", domain),
             ("SELECT x &=& 1 FROM v", domain),
+            ("SELECT x %=% 1 FROM v", domain),
+            ("SELECT x <%> 1 FROM v", domain),
+            ("SELECT x <%%> 3 FROM v", domain),
+            ("SELECT x <%%%> 3 FROM v", domain),
+            ("SELECT x BETWEEN NULL AND 2 FROM v", domain),
+            ("SELECT x NOT BETWEEN NULL AND 2 FROM v", domain),
+            ("SELECT x BETWEEN SYMMETRIC NULL AND 2 FROM v", domain),
+            ("SELECT x #># NULL FROM v", domain),
             // `0 > 0` folds the AND to false: x is never read.
             ("SELECT x %=% 0 FROM v", None),
+            ("SELECT x %=% NULL FROM v", None),
+            // No WHEN holds: the CASE is NULL, x never read.
+            ("SELECT x <%> 0 FROM v", None),
+            ("SELECT x <%%> 9 FROM v", None),
+            ("SELECT x <%%> -1 FROM v", None),
+            // The WHEN isn't decided: x may not be read.
+            ("SELECT x <#%> 1 FROM v", None),
+            ("SELECT x <%> y FROM v", domain),
+            ("SELECT x <%> (random() * 2)::int FROM v", None),
+            ("SELECT x BETWEEN NULL AND NULL FROM v", None),
+            ("SELECT x BETWEEN 1 AND NULL FROM v", domain),
+            // coalesce(NULL, x) is x; coalesce(1, x) is 1.
+            ("SELECT NULL #<<# x FROM v", domain),
+            ("SELECT 1 #<<# x FROM v", None),
+            // COALESCE evaluates its first argument that isn't NULL.
+            ("SELECT coalesce(x, 1) FROM v", domain),
+            ("SELECT coalesce(NULL, x) FROM v", domain),
+            ("SELECT coalesce(1, x) FROM v", None),
+            ("SELECT coalesce(y, x) FROM v", None),
             ("SELECT y BETWEEN 1 AND 2 FROM v", None),
             ("SELECT y::text FROM v", None),
         ],
@@ -924,33 +971,20 @@ fn more_expressions_evaluate_a_null_domain_operand() {
 /// execution, which the analyzer doesn't prove and accepts (it never
 /// rejects what it can't prove fails). Each could be rejected by a finer
 /// rule:
-/// - an AND in an inlined body whose other argument is decided by the
-///   call's constant arguments (`$2 > 0` over `1` is dropped);
 /// - a range's `@>` / `<@` (`range_contains_elem_support` folds the call
-///   only over a constant empty range);
-/// - a BETWEEN with a NULL bound, whose first comparison is folded to
-///   NULL and the second one evaluated;
-/// - a SQL operator over a NULL constant, which its body (`coalesce($1,
-///   $2)`) may still evaluate the other operand of.
+///   only over a constant empty range).
 #[test]
 fn known_gaps_in_null_domain_operands() {
     let db = build_db(&[(
         "0001.sql",
         "CREATE DOMAIN d AS int NOT NULL;
-         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;
-         CREATE FUNCTION andl(d, int) RETURNS bool LANGUAGE sql AS 'SELECT $1 > 0 AND $2 > 0';
-         CREATE OPERATOR %=% (LEFTARG = d, RIGHTARG = int, FUNCTION = andl);
-         CREATE FUNCTION coal(d, int) RETURNS int LANGUAGE sql AS 'SELECT coalesce($1, $2)';
-         CREATE OPERATOR #># (LEFTARG = d, RIGHTARG = int, FUNCTION = coal);",
+         CREATE VIEW v AS SELECT NULL::d AS x, 1 AS y;",
     )]);
     assert_outcomes(
         &db,
         &[
-            ("SELECT x %=% 1 FROM v", None),
             ("SELECT int4range(1, 5) @> x::int FROM v", None),
             ("SELECT x::int <@ int4range(1, 5) FROM v", None),
-            ("SELECT x BETWEEN NULL AND 2 FROM v", None),
-            ("SELECT x #># NULL FROM v", None),
         ],
     );
 }

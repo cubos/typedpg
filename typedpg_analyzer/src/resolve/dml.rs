@@ -1,6 +1,6 @@
 use super::*;
 
-mod select_row;
+pub(super) mod select_row;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // INSERT / UPDATE / DELETE
