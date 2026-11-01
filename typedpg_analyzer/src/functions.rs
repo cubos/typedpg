@@ -411,7 +411,7 @@ pub(crate) fn func_get_detail(
 
 /// `proname(typname,…)` over the declared `proargtypes` — the key of the
 /// [`crate::builtin_nullability`] tables.
-fn proc_signature(f: &PgProc, snapshot: &PgCatalog) -> String {
+pub(crate) fn proc_signature(f: &PgProc, snapshot: &PgCatalog) -> String {
     format!(
         "{}({})",
         f.proname,

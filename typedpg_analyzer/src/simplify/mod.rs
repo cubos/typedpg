@@ -15,6 +15,7 @@ use typedpg_pg_query::protobuf::ParseResult;
 use crate::pg_catalog::PgCatalog;
 use crate::resolve::AnalyzedQuery;
 
+mod not_in;
 #[allow(dead_code)] // The rules use them as they land.
 pub(crate) mod proof;
 
@@ -106,7 +107,7 @@ pub(crate) struct Ctx<'a> {
 pub(crate) type RuleFn = fn(&Ctx<'_>) -> Vec<Candidate>;
 
 /// The rules, in the order they run.
-pub(crate) const RULES: &[(Rule, RuleFn)] = &[];
+pub(crate) const RULES: &[(Rule, RuleFn)] = &[(Rule::NotIn, not_in::candidates)];
 
 /// Which rules run.
 #[derive(Debug, Clone, PartialEq, Eq)]
