@@ -20,6 +20,12 @@
 //!   same operator — a built-in one, never NULL between non-NULL
 //!   operands of built-in types. Row-wise `(a, b) NOT IN (SELECT x, y …)` compares
 //!   column by column with `=`, as PG's row comparison does.
+//! - in a WHERE or HAVING, everything next to the site — the other
+//!   conjuncts, the OR / NOT arms around it — can't fail either
+//!   ([`super::proof::siblings_cannot_error`]): the SubPlan may have
+//!   vetoed a row before them (cost order ties keep the written order),
+//!   the anti-join doesn't. So `x NOT IN (…) AND created_at > now() -
+//!   interval '1 day'` is left as written.
 //! - the subquery has no LIMIT or OFFSET: the SubPlan reads it once, an
 //!   anti-join may rescan it, and a LIMIT may return other rows then.
 //! - nothing in it is volatile (the subquery may run a different number
@@ -54,8 +60,8 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::proof::{
-    FromScope, builtin_strict_equality, cheap_siblings, column_collation, column_type,
-    embed_source, error_free_select, has_volatile, qualified_column, strictly_not_null,
+    FromScope, builtin_strict_equality, column_collation, column_type, embed_source,
+    error_free_select, has_volatile, qualified_column, siblings_cannot_error, strictly_not_null,
     written_names_use,
 };
 use super::{Candidate, Ctx, Edit, Rule};
@@ -364,12 +370,13 @@ impl Walker<'_, '_> {
             return None;
         }
         // Nothing the rewrite may newly evaluate can fail: in the
-        // subquery, nor a sibling conjunct the site guarded.
+        // subquery, nor anything next to the site in its WHERE / HAVING,
+        // which the site may have vetoed rows for.
         if !error_free_select(ctx, sub, &sub_scope)
             || self
                 .clause
                 .as_ref()
-                .is_some_and(|clause| !cheap_siblings(ctx, clause, not_at))
+                .is_some_and(|clause| !siblings_cannot_error(ctx, clause, not_at, scope))
         {
             return None;
         }

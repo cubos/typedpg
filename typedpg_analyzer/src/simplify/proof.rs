@@ -1036,39 +1036,37 @@ fn hidden_volatile_calls(catalog: &PgCatalog) -> bool {
         })
 }
 
-/// Whether the conjuncts next to a rewrite site can't lose the guard the
-/// site gave them. `clause` is the WHERE, JOIN ON or HAVING the site sits
-/// in; `site_location` is the location of a node of the site (the
-/// rewritten expression's own, e.g. a NOT IN's `NOT`).
+/// Whether everything evaluated next to a rewrite site can't fail: every
+/// expression of the site's `clause` (the WHERE, JOIN ON or HAVING it sits
+/// in) other than the site itself — the other conjuncts, and the OR / NOT
+/// arms around the site — passes [`cannot_error`] in `scope` (the clause's
+/// level) and runs only built-in code. `site_location` is the location of
+/// the rewritten expression's own node (a NOT IN's `NOT`).
 ///
-/// PG evaluates a scan's (or join's) qual list in cost order, and a
-/// SubPlan is expensive: in the written query a sublink conjunct runs
-/// after the cheap conjuncts but before a more expensive sibling — another
-/// sublink, or a user function with a high COST — and can veto a row
-/// before that sibling runs. Rewritten into a semi- or anti-join, the site
-/// leaves the qual list and the sibling runs on every row, where it may
-/// fail (`(SELECT 1 / min(z) …) > 0` on a row the site would have
-/// filtered). So every other conjunct of the top-level AND list holding the
-/// site must be cheap: no sublink, and only built-in functions, operators
-/// and casts (built-in costs are 1 or 100, below any SubPlan's, so PG runs
-/// them first in both plans — an error in one of them happens in both).
+/// Cost order can't be relied on to run those siblings after the site.
+/// A hashed SubPlan costs one `cpu_operator_cost` per tuple, the same as a
+/// built-in function of procost 1 (most of them, `int4div` and `int4in`
+/// included), and `order_qual_clauses` sorts the qual list stably by
+/// per-tuple cost: on such a tie the written order wins, and a site
+/// written first vetoes the row before `10 / a > 1` divides by zero. As a
+/// semi- or anti-join the site leaves the qual list, and the sibling runs
+/// on every row. An OR evaluates its arms as written, so an arm after the
+/// site was guarded by it too. So the siblings must be unable to fail at
+/// all, not merely cheap — which refuses `created_at > now() - interval
+/// '1 day'` next to a site, among many harmless ones.
+///
 /// A schema with a user cast function or a user function in a domain
-/// CHECK (calls the parse tree doesn't show) counts as expensive
-/// everywhere. Nested ANDs under an OR or NOT are evaluated as written,
-/// left to right, and the site's own conjunct is not a sibling.
+/// CHECK (calls the parse tree doesn't show) refuses every sibling; so does
+/// an operator name some extension shares with a built-in one.
 ///
-/// `false` when the site isn't found in `clause`.
-pub(crate) fn cheap_siblings(ctx: &Ctx<'_>, clause: &Node, site_location: i32) -> bool {
-    fn conjuncts<'n>(node: &'n Node, out: &mut Vec<&'n Node>) {
-        match node.node.as_ref() {
-            Some(N::BoolExpr(b)) if b.boolop() == BoolExprType::AndExpr => {
-                for a in &b.args {
-                    conjuncts(a, out);
-                }
-            }
-            _ => out.push(node),
-        }
-    }
+/// `false` when the site isn't found in `clause`, or is nested in
+/// anything but AND / OR / NOT.
+pub(crate) fn siblings_cannot_error(
+    ctx: &Ctx<'_>,
+    clause: &Node,
+    site_location: i32,
+    scope: &FromScope<'_>,
+) -> bool {
     let holds_site = |n: &Node| {
         n.node.as_ref().is_some_and(|n| {
             n.nodes()
@@ -1076,24 +1074,41 @@ pub(crate) fn cheap_siblings(ctx: &Ctx<'_>, clause: &Node, site_location: i32) -
                 .any(|(n, _)| n.location() == Some(site_location))
         })
     };
-    let mut list = Vec::new();
-    conjuncts(clause, &mut list);
-    let Some(site) = list.iter().position(|n| holds_site(n)) else {
-        return false;
-    };
-    if list.len() == 1 {
-        return true;
-    }
-    if hidden_user_calls(ctx.catalog) {
+    if !holds_site(clause) {
         return false;
     }
-    list.iter()
-        .enumerate()
-        .all(|(i, n)| i == site || cheap(ctx, n))
+    let hidden = hidden_user_calls(ctx.catalog);
+    fn check(
+        ctx: &Ctx<'_>,
+        node: &Node,
+        site_location: i32,
+        scope: &FromScope<'_>,
+        hidden: bool,
+        holds_site: &dyn Fn(&Node) -> bool,
+    ) -> bool {
+        if node
+            .node
+            .as_ref()
+            .is_some_and(|n| n.to_ref().location() == Some(site_location))
+        {
+            return true;
+        }
+        if holds_site(node) {
+            return match node.node.as_ref() {
+                Some(N::BoolExpr(b)) => b
+                    .args
+                    .iter()
+                    .all(|a| check(ctx, a, site_location, scope, hidden, holds_site)),
+                _ => false,
+            };
+        }
+        !hidden && cheap(ctx, node) && cannot_error(ctx, node, scope)
+    }
+    check(ctx, clause, site_location, scope, hidden, &holds_site)
 }
 
 /// Whether evaluating `node` runs only built-in code and no sublink: see
-/// [`cheap_siblings`]. Every same-named candidate counts, being unable to
+/// [`siblings_cannot_error`]. Every same-named candidate counts, being unable to
 /// tell which one PG resolves.
 fn cheap(ctx: &Ctx<'_>, node: &Node) -> bool {
     let catalog = ctx.catalog;

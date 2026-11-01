@@ -382,8 +382,9 @@ mod tests {
         let sites: Vec<String> = (0..200)
             .map(|i| format!("a NOT IN (SELECT b FROM u WHERE b > {i}) AS c{i}"))
             .collect();
-        // In the target list: as WHERE conjuncts each would be the others'
-        // expensive sibling (see `proof::cheap_siblings`).
+        // In the target list: as WHERE conjuncts each would be a sibling
+        // the others can't prove error-free (see
+        // `proof::siblings_cannot_error`).
         let sql = format!("SELECT {} FROM t", sites.join(", "));
         ANALYSES.with(|a| a.set(0));
         let analyzed = db.analyze(&sql).unwrap();

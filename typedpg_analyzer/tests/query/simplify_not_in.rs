@@ -900,24 +900,71 @@ fn an_expensive_sibling_conjunct_keeps_the_site() {
 }
 
 #[test]
-fn a_cheap_built_in_sibling_conjunct_is_fine() {
+fn a_sibling_that_can_fail_keeps_the_site() {
+    // A hashed SubPlan costs as little as `int4div`: the written order
+    // wins the tie and the site vetoes `a = 0` before `10 / a` runs; the
+    // anti-join leaves `10 / a > 1` a filter on every row.
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE t (a int NOT NULL, s text NOT NULL);
+         CREATE TABLE u (b int NOT NULL);",
+    )
+    .unwrap();
+    for cond in [
+        "a NOT IN (SELECT b FROM u) AND 10 / a > 1",
+        "a NOT IN (SELECT b FROM u) AND s::int > 0",
+        "(a NOT IN (SELECT b FROM u) OR a = 1) AND 10 / a > 1",
+        "NOT (a NOT IN (SELECT b FROM u) AND 10 / a > 1)",
+        "a NOT IN (SELECT b FROM u) AND s LIKE 'x%'",
+    ] {
+        assert_kept(&db, &format!("SELECT t.a FROM t WHERE {cond}"));
+        assert_kept(&db, &format!("DELETE FROM t WHERE {cond}"));
+        assert_kept(&db, &format!("UPDATE t SET s = 'y' WHERE {cond}"));
+    }
+    assert_kept(
+        &db,
+        "SELECT t.a FROM t GROUP BY t.a HAVING t.a NOT IN (SELECT b FROM u) AND 10 / t.a > 1",
+    );
+    // Without the sibling, each form is rewritten.
+    for sql in [
+        "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u)",
+        "DELETE FROM t WHERE a NOT IN (SELECT b FROM u)",
+        "UPDATE t SET s = 'y' WHERE a NOT IN (SELECT b FROM u)",
+        "SELECT t.a FROM t GROUP BY t.a HAVING t.a NOT IN (SELECT b FROM u)",
+    ] {
+        assert_eq!(simplified(&db, sql).1, vec![Rule::NotIn], "{sql}");
+    }
+    // Not every harmless sibling is provable: `now()` is a function call.
+    assert_kept(
+        &db,
+        "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u) AND now() > '2000-01-01'",
+    );
+}
+
+#[test]
+fn error_free_siblings_are_fine() {
     let db = setup();
     assert_rewritten(
         &db,
         "SELECT c.id FROM customers c \
          WHERE c.region = 'x' AND c.id NOT IN (SELECT customer_id FROM banned) \
-         AND length(c.name) > 2",
+         AND c.id > 5 AND c.name IS NOT NULL",
         "SELECT c.id FROM customers c \
          WHERE c.region = 'x' AND (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) \
-         AND length(c.name) > 2",
+         AND c.id > 5 AND c.name IS NOT NULL",
     );
-    // A sibling under an OR with the site is evaluated as written.
     assert_rewritten(
         &db,
         "SELECT c.id FROM customers c \
-         WHERE c.id NOT IN (SELECT customer_id FROM banned) OR c.code IN (SELECT b FROM pairs)",
+         WHERE (c.id NOT IN (SELECT customer_id FROM banned) OR c.code = 1) AND NOT c.id < 0",
         "SELECT c.id FROM customers c \
-         WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) OR c.code IN (SELECT b FROM pairs)",
+         WHERE ((NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) OR c.code = 1) AND NOT c.id < 0",
+    );
+    assert_rewritten(
+        &db,
+        "DELETE FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) AND c.code = 3",
+        "DELETE FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) \
+         AND c.code = 3",
     );
 }
 
