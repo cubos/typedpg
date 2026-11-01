@@ -176,20 +176,22 @@ impl<'a> Text<'a> {
         }
     }
 
-    /// Where the unnamed target whose value is a comparison starts at token
-    /// `at` ends: past every token at its own parenthesis depth (the
-    /// comparison's operator and literal, and the groups around them).
-    fn comparison_end(&self, at: i32) -> Option<usize> {
+    /// Where the output column (target-list or RETURNING entry) starting at
+    /// token `at` ends: before the first token, outside every parenthesis
+    /// and bracket it opens, that ends a target-list entry — a `,`, a `)`
+    /// closing a group around the list, or a clause keyword (a `FROM` that
+    /// is not `IS DISTINCT FROM`'s) — or at the statement's end.
+    fn target_end(&self, at: i32) -> Option<usize> {
         let first = self.at(at)?;
         let mut depth = 0usize;
         let mut end = None;
-        for t in &self.toks[first..] {
-            if t.is(Token::Ascii40) {
+        for (i, t) in self.toks.iter().enumerate().skip(first) {
+            if t.is(Token::Ascii40) || t.is(Token::Ascii91) {
                 depth += 1;
-            } else if t.is(Token::Ascii41) {
+            } else if t.is(Token::Ascii41) || t.is(Token::Ascii93) {
                 let Some(d) = depth.checked_sub(1) else { break };
                 depth = d;
-            } else if depth == 0 && !is_comparison_token(*t) {
+            } else if depth == 0 && ends_target(*t, self.toks.get(i.wrapping_sub(1)).copied()) {
                 break;
             }
             end = Some(t.end);
@@ -198,15 +200,30 @@ impl<'a> Text<'a> {
     }
 }
 
-fn is_comparison_token(t: Tok) -> bool {
+/// Whether `t`, outside any group of the entry, ends a target-list entry
+/// (`prev`: the token before it).
+fn ends_target(t: Tok, prev: Option<Tok>) -> bool {
+    if t.is(Token::From) {
+        return !prev.is_some_and(|p| p.is(Token::Distinct));
+    }
     [
-        Token::Iconst,
-        Token::Ascii60,
-        Token::Ascii61,
-        Token::Ascii62,
-        Token::LessEquals,
-        Token::GreaterEquals,
-        Token::NotEquals,
+        Token::Ascii44,
+        Token::Ascii59,
+        Token::Into,
+        Token::Where,
+        Token::GroupP,
+        Token::Having,
+        Token::Window,
+        Token::Order,
+        Token::Limit,
+        Token::Offset,
+        Token::Fetch,
+        Token::For,
+        Token::Union,
+        Token::Intersect,
+        Token::Except,
+        Token::On,
+        Token::Returning,
     ]
     .iter()
     .any(|&k| t.is(k))
@@ -229,16 +246,24 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
             _ => None,
         })
         .collect();
-    // The comparisons that are an unnamed output column: the rewrite names
-    // them as PG did, since `EXISTS` would be named `exists`.
-    let unnamed: Vec<(i32, &ResTarget)> = nodes
+    // Every unnamed output column, at any level (target lists, RETURNING):
+    // PG names one after its expression (FigureColname), and a rewrite
+    // inside it may change that name — `(x > 0)::int` is `int4`, `(EXISTS
+    // …)::int` is `exists` — even where the driver can't see it (a FROM
+    // subquery's column names reach `row_to_json`).
+    let unnamed: Vec<&ResTarget> = nodes
         .iter()
-        .filter_map(|(n, _)| match n {
-            NodeRef::ResTarget(rt) if rt.name.is_empty() && rt.indirection.is_empty() => {
-                match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
-                    Some(node::Node::AExpr(e)) => Some((e.location, *rt)),
-                    _ => None,
-                }
+        .flat_map(|(n, _)| match n {
+            NodeRef::SelectStmt(s) => s.target_list.iter().collect::<Vec<_>>(),
+            NodeRef::InsertStmt(s) => returning(s.returning_clause.as_ref()),
+            NodeRef::UpdateStmt(s) => returning(s.returning_clause.as_ref()),
+            NodeRef::DeleteStmt(s) => returning(s.returning_clause.as_ref()),
+            NodeRef::MergeStmt(s) => returning(s.returning_clause.as_ref()),
+            _ => Vec::new(),
+        })
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::ResTarget(rt)) if rt.name.is_empty() && rt.val.is_some() => {
+                Some(&**rt)
             }
             _ => None,
         })
@@ -442,7 +467,7 @@ fn sublink_form(
     ctx: &Ctx<'_>,
     text: &Text<'_>,
     cte_names: &[&str],
-    unnamed: &[(i32, &ResTarget)],
+    unnamed: &[&ResTarget],
     e: &protobuf::AExpr,
 ) -> Option<Vec<Edit>> {
     let cmp = comparison(ctx, text, e)?;
@@ -489,27 +514,11 @@ fn sublink_form(
         let spaced = at > 0
             && !matches!(
                 ctx.sql.as_bytes()[at - 1],
-                b' ' | b'\t' | b'\n' | b'\r' | b'('
+                b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'[' | b','
             );
         format!("{}{} ", if spaced { " " } else { "" }, cmp.test.keyword())
     };
-    // The comparison's name, when it is an unnamed output column.
-    let alias = unnamed
-        .iter()
-        .find(|(at, _)| *at == e.location)
-        .map(|(_, rt)| {
-            text.comparison_end(rt.location).map(|end| {
-                (
-                    end,
-                    format!(" AS {}", typedpg_core::quote_identifier("?column?")),
-                )
-            })
-        });
-    let alias = match alias {
-        Some(None) => return None,
-        Some(Some(a)) => Some(a),
-        None => None,
-    };
+    let lit_start = text.toks[lit_tok].start;
     if cmp.count_left {
         // `(…) > 0`: drop the operator and the literal, from the end of
         // the token before the operator.
@@ -519,39 +528,22 @@ fn sublink_form(
             range: sub_at..sub_at,
             text: keyword(sub_at),
         });
-        match alias {
-            Some((end, name)) if end == to => edits.push(Edit {
-                range: from..to,
-                text: name,
-            }),
-            Some((end, name)) => {
-                edits.push(Edit {
-                    range: from..to,
-                    text: String::new(),
-                });
-                edits.push(Edit {
-                    range: end..end,
-                    text: name,
-                });
-            }
-            None => edits.push(Edit {
-                range: from..to,
-                text: String::new(),
-            }),
-        }
+        edits.push(Edit {
+            range: from..to,
+            text: String::new(),
+        });
     } else {
         // `0 < (…)`: drop the literal and the operator, up to the token
         // after the operator.
-        let from = text.toks[lit_tok].start;
         let to = text.toks.get(op_tok + 1)?.start;
         if to == sub_at {
             edits.push(Edit {
-                range: from..to,
+                range: lit_start..to,
                 text: format!("{} ", cmp.test.keyword()),
             });
         } else {
             edits.push(Edit {
-                range: from..to,
+                range: lit_start..to,
                 text: String::new(),
             });
             edits.push(Edit {
@@ -559,15 +551,85 @@ fn sublink_form(
                 text: keyword(sub_at),
             });
         }
-        if let Some((end, name)) = alias {
-            edits.push(Edit {
-                range: end..end,
-                text: name,
-            });
+    }
+    // Every unnamed output column the comparison is in keeps the name PG
+    // gave it.
+    let site = sub_at.min(lit_start);
+    let mut names = Vec::new();
+    for rt in unnamed {
+        let start = usize::try_from(rt.location).ok()?;
+        if site < start {
+            continue;
         }
+        let end = text.target_end(rt.location)?;
+        if site >= end {
+            continue;
+        }
+        let val = rt.val.as_deref()?;
+        // A `*` FigureColname would name after a column of what it expands
+        // to: not a name this level alone tells.
+        if val.node.as_ref()?.nodes().iter().any(|(n, _)| {
+            matches!(n, NodeRef::ColumnRef(c)
+                if c.fields.iter().any(|f| matches!(f.node, Some(node::Node::AStar(_)))))
+        }) {
+            return None;
+        }
+        let name = crate::resolve::target_resname(rt);
+        edits.push(Edit {
+            range: end..end,
+            text: format!(" AS {}", typedpg_core::quote_identifier(&name)),
+        });
+        names.push((start, name));
     }
     edits.sort_by_key(|e| (e.range.start, e.range.end));
-    Some(edits)
+    named_as_before(ctx.sql, &edits, &names).then_some(edits)
+}
+
+/// Whether `sql` edited by `edits` parses with an output column named
+/// `name` where each `(start, name)` of `names` started: the aliases landed
+/// on the columns they are for.
+fn named_as_before(sql: &str, edits: &[Edit], names: &[(usize, String)]) -> bool {
+    if names.is_empty() {
+        return true;
+    }
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut last = 0;
+    for e in edits {
+        if e.range.start < last || e.range.end > sql.len() {
+            return false;
+        }
+        out.push_str(&sql[last..e.range.start]);
+        out.push_str(&e.text);
+        last = e.range.end;
+    }
+    out.push_str(&sql[last..]);
+    // Where an offset of `sql` moved to.
+    let moved = |at: usize| {
+        edits
+            .iter()
+            .filter(|e| e.range.end <= at && !(e.range.is_empty() && e.range.start == at))
+            .fold(at as isize, |pos, e| {
+                pos + e.text.len() as isize - e.range.len() as isize
+            })
+    };
+    let Ok(tree) = typedpg_pg_query::parse(&out) else {
+        return false;
+    };
+    let targets: Vec<(i32, &str)> = tree
+        .protobuf
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, _)| match n {
+            NodeRef::ResTarget(rt) => Some((rt.location, rt.name.as_str())),
+            _ => None,
+        })
+        .collect();
+    names.iter().all(|(start, name)| {
+        let at = moved(*start);
+        targets
+            .iter()
+            .any(|(loc, n)| *loc as isize == at && n == name)
+    })
 }
 
 /// `SELECT count(*) > 0 FROM t WHERE p` → `SELECT EXISTS (SELECT 1 FROM t
@@ -638,4 +700,9 @@ fn top_level_form(
             text: format!(") AS {}", typedpg_core::quote_identifier(&column.name)),
         },
     ])
+}
+
+/// A DML statement's RETURNING entries.
+fn returning(clause: Option<&protobuf::ReturningClause>) -> Vec<&Node> {
+    clause.map_or_else(Vec::new, |c| c.exprs.iter().collect())
 }

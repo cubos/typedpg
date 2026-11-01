@@ -12,7 +12,8 @@ fn setup_with(extra: &str) -> PgCatalog {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(
         "CREATE TABLE t (id bigint PRIMARY KEY, a int NOT NULL, b int);
-         CREATE TABLE u (id bigint PRIMARY KEY, t_id bigint NOT NULL, c int);",
+         CREATE TABLE u (id bigint PRIMARY KEY, t_id bigint NOT NULL, c int);
+         CREATE TYPE pair AS (f1 bool, f2 int);",
     )
     .unwrap();
     if !extra.is_empty() {
@@ -426,6 +427,133 @@ fn copies_another_clause_must_match() {
          ORDER BY (SELECT count(*) FROM u WHERE u.c = t.a) > 0",
     ] {
         assert_kept(sql);
+    }
+}
+
+/// PG names an unnamed column after its expression (FigureColname),
+/// looking through casts, CASE's ELSE, subscripts and scalar subqueries: a
+/// comparison anywhere in one, rewritten, would rename it (`(x > 0)::int`
+/// is `int4`, `(EXISTS …)::int` is `exists`). The column keeps its name —
+/// visible here in `row_to_json`'s keys, which the pg_sanity oracle
+/// compares between the written and the sent query on real rows.
+#[test]
+fn wrappers_keep_the_column_name() {
+    const C: &str = "(SELECT count(*) FROM u WHERE u.t_id = t.id)";
+    const E: &str = "EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)";
+    for (written, sent) in [
+        // Cast: named after the type.
+        (format!("({C} > 0)::int"), format!("({E})::int AS int4")),
+        (
+            format!("CAST({C} > 0 AS int)"),
+            format!("CAST({E} AS int) AS int4"),
+        ),
+        // CASE: after its ELSE branch, else `case`.
+        (
+            format!("CASE WHEN a > 0 THEN 1 ELSE ({C} > 0)::int END"),
+            format!("CASE WHEN a > 0 THEN 1 ELSE ({E})::int END AS \"case\""),
+        ),
+        (
+            format!("CASE WHEN {C} > 0 THEN a END"),
+            format!("CASE WHEN {E} THEN a END AS \"case\""),
+        ),
+        (
+            format!("CASE WHEN a > 0 THEN false ELSE {C} = 0 END"),
+            format!("CASE WHEN a > 0 THEN false ELSE NOT {E} END AS \"case\""),
+        ),
+        // COALESCE, GREATEST, LEAST, NULLIF.
+        (
+            format!("COALESCE({C} > 0, false)"),
+            format!("COALESCE({E}, false) AS \"coalesce\""),
+        ),
+        (
+            format!("GREATEST({C} > 0, false)"),
+            format!("GREATEST({E}, false) AS \"greatest\""),
+        ),
+        (
+            format!("LEAST({C} > 0, true)"),
+            format!("LEAST({E}, true) AS \"least\""),
+        ),
+        (
+            format!("NULLIF({C} > 0, false)"),
+            format!("NULLIF({E}, false) AS \"nullif\""),
+        ),
+        // Row constructors.
+        (
+            format!("ROW({C} > 0, 1)"),
+            format!("ROW({E}, 1) AS \"row\""),
+        ),
+        (format!("({C} > 0, 1)"), format!("({E}, 1) AS \"row\"")),
+        // Subscript and field selection.
+        (
+            format!("(ARRAY[{C} > 0])[1]"),
+            format!("(ARRAY[{E}])[1] AS \"array\""),
+        ),
+        (
+            format!("(ROW({C} > 0, 1)::pair).f1"),
+            format!("(ROW({E}, 1)::pair).f1 AS f1"),
+        ),
+        // IS [NOT] NULL, IS DISTINCT FROM, NOT, AND: no name.
+        (
+            format!("({C} > 0) IS NOT NULL"),
+            format!("({E}) IS NOT NULL AS \"?column?\""),
+        ),
+        (
+            format!("{C} > 0 IS NULL"),
+            format!("{E} IS NULL AS \"?column?\""),
+        ),
+        (
+            format!("({C} > 0) IS DISTINCT FROM a > 1"),
+            format!("({E}) IS DISTINCT FROM a > 1 AS \"?column?\""),
+        ),
+        (format!("NOT {C} > 0"), format!("NOT {E} AS \"?column?\"")),
+        (
+            format!("a > 1 AND {C} > 0"),
+            format!("a > 1 AND {E} AS \"?column?\""),
+        ),
+        // A scalar subquery: after its own column, at both levels.
+        (
+            format!("(SELECT ({C} > 0)::int)"),
+            format!("(SELECT ({E})::int AS int4) AS int4"),
+        ),
+    ] {
+        assert_rewritten(
+            &format!("SELECT row_to_json(s) AS j FROM (SELECT {written} FROM t) s"),
+            &format!("SELECT row_to_json(s) AS j FROM (SELECT {sent} FROM t) s"),
+        );
+    }
+}
+
+/// An output column over a `*` is named after what the `*` expands to,
+/// which this level alone doesn't tell: such a column isn't rewritten.
+#[test]
+fn column_named_through_a_star_is_kept() {
+    assert_kept(
+        "SELECT row_to_json(s) AS j FROM \
+         (SELECT (SELECT * FROM (SELECT ((SELECT count(*) FROM u) > 0)::int) x)) s",
+    );
+}
+
+#[test]
+fn nested_column_names_in_records() {
+    for (written, sent) in [
+        (
+            "SELECT to_jsonb(s) AS j FROM (SELECT ((SELECT count(*) FROM u) > 0)::int) s",
+            "SELECT to_jsonb(s) AS j FROM (SELECT (EXISTS (SELECT 1 FROM u))::int AS int4) s",
+        ),
+        (
+            "SELECT s FROM (SELECT ((SELECT count(*) FROM u) > 0)::int, 1 AS one) s",
+            "SELECT s FROM (SELECT (EXISTS (SELECT 1 FROM u))::int AS int4, 1 AS one) s",
+        ),
+        (
+            "WITH s AS (SELECT ((SELECT count(*) FROM u) > 0)::int) SELECT row_to_json(s) AS j FROM s",
+            "WITH s AS (SELECT (EXISTS (SELECT 1 FROM u))::int AS int4) SELECT row_to_json(s) AS j FROM s",
+        ),
+        (
+            "DELETE FROM u WHERE c = 0 RETURNING ((SELECT count(*) FROM t) > 0)::int, c",
+            "DELETE FROM u WHERE c = 0 RETURNING (EXISTS (SELECT 1 FROM t))::int AS int4, c",
+        ),
+    ] {
+        assert_rewritten(written, sent);
     }
 }
 
