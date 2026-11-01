@@ -19,7 +19,7 @@
 //!   are bare output columns determines the relation's row. The key must
 //!   compare under the equality `DISTINCT` uses (the column type's default
 //!   btree operator family, deterministic collations), and a NULL in it must
-//!   not hide a second row: every column `attnotnull`, or the index `NULLS
+//!   not hide a second row: every column under a validated NOT NULL (on every inheritance child or partition too), or the index `NULLS
 //!   NOT DISTINCT` when the relation is never null-extended (a null-extended
 //!   row and a row with a NULL key would then look alike).
 //! - **Equalities to a key** (PG's `innerrel_is_unique`): a relation whose
@@ -219,7 +219,7 @@ fn rows_distinct(
                 if usable.is_some_and(|u| !u.get(p).copied().unwrap_or(false)) {
                     continue;
                 }
-                if let Col::Rel(r, attnum) = scope.resolve(ctx, &names) {
+                if let Col::Rel(r, attnum) = scope.resolve(&names) {
                     output.insert((r, attnum));
                 }
             }
@@ -371,6 +371,22 @@ struct Rel {
     relname: String,
     /// The relation may be null-extended by an outer join above it.
     nullable: bool,
+    /// The columns as this FROM item names them, with their attnums: an
+    /// alias's column list (`t AS x(a, b)`) renames the first ones, in
+    /// order, and the rest keep their names. Dropped columns are gone from
+    /// the catalog, as PG skips them.
+    columns: Vec<(String, i16)>,
+}
+
+impl Rel {
+    /// The attnum of the column this FROM item calls `name`.
+    fn attnum(&self, name: &str) -> Option<i16> {
+        let mut found = self.columns.iter().filter(|(n, _)| n == name);
+        match (found.next(), found.next()) {
+            (Some((_, attnum)), None) => Some(*attnum),
+            _ => None,
+        }
+    }
 }
 
 /// A join in a FROM clause, with its sides' relations as bitmasks.
@@ -481,6 +497,27 @@ impl<'a> Scope<'a> {
                     return None;
                 }
                 let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+                let mut attrs: Vec<_> = ctx
+                    .catalog
+                    .attributes_of(class.oid)
+                    .iter()
+                    .filter(|a| a.attnum > 0)
+                    .collect();
+                attrs.sort_by_key(|a| a.attnum);
+                let mut columns: Vec<(String, i16)> = attrs
+                    .iter()
+                    .map(|a| (a.attname.clone(), a.attnum))
+                    .collect();
+                let renames = rv.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
+                if renames.len() > columns.len() {
+                    return None;
+                }
+                for (column, rename) in columns.iter_mut().zip(renames) {
+                    let Some(Node::String(name)) = &rename.node else {
+                        return None;
+                    };
+                    column.0 = name.sval.clone();
+                }
                 self.rels.push(Rel {
                     oid: class.oid,
                     refname: alias.clone().unwrap_or_else(|| rv.relname.clone()),
@@ -492,6 +529,7 @@ impl<'a> Scope<'a> {
                         .to_owned(),
                     relname: rv.relname.clone(),
                     nullable,
+                    columns,
                 });
                 Some(1 << (self.rels.len() - 1))
             }
@@ -548,12 +586,11 @@ impl<'a> Scope<'a> {
     }
 
     /// Resolve a column reference against this scope alone.
-    fn resolve(&self, ctx: &Ctx<'_>, names: &[&str]) -> Col {
+    fn resolve(&self, names: &[&str]) -> Col {
         let attnum = |r: usize, name: &str| {
-            ctx.catalog
-                .attribute_by_name(self.rels[r].oid, name)
-                .filter(|a| a.attnum > 0)
-                .map_or(Col::Other, |a| Col::Rel(r, a.attnum))
+            self.rels[r]
+                .attnum(name)
+                .map_or(Col::Other, |attnum| Col::Rel(r, attnum))
         };
         match names {
             [name] => {
@@ -561,7 +598,7 @@ impl<'a> Scope<'a> {
                     .rels
                     .iter()
                     .enumerate()
-                    .filter(|(_, rel)| ctx.catalog.attribute_by_name(rel.oid, name).is_some());
+                    .filter(|(_, rel)| rel.columns.iter().any(|(n, _)| n == name));
                 match (found.next(), found.next()) {
                     (Some((r, _)), None) => attnum(r, name),
                     _ => Col::Other,
@@ -592,7 +629,7 @@ impl<'a> Scope<'a> {
                 let Fields::Names(names) = column_ref_fields(cr) else {
                     return None;
                 };
-                let Col::Rel(r, attnum) = self.resolve(ctx, &names) else {
+                let Col::Rel(r, attnum) = self.resolve(&names) else {
                     return None;
                 };
                 let attr = ctx
@@ -657,18 +694,23 @@ impl<'a> Scope<'a> {
         let side = |mask: u64| {
             let mut found = (0..self.rels.len())
                 .filter(|&r| mask & (1 << r) != 0)
-                .filter_map(|r| {
-                    let a = ctx.catalog.attribute_by_name(self.rels[r].oid, name)?;
-                    Some((r, a))
+                .filter(|&r| self.rels[r].columns.iter().any(|(n, _)| n == name))
+                .map(|r| {
+                    let attnum = self.rels[r].attnum(name);
+                    let attr = attnum.and_then(|attnum| {
+                        ctx.catalog
+                            .attributes_of(self.rels[r].oid)
+                            .iter()
+                            .find(|a| a.attnum == attnum)
+                    });
+                    (r, attr)
                 });
             match (found.next(), found.next()) {
-                (Some((r, a)), None) if a.attnum > 0 && deterministic(a.attcollation) => {
-                    Some(Operand {
-                        typ: a.atttypid,
-                        column: Some((r, a.attnum)),
-                        rels: 1 << r,
-                    })
-                }
+                (Some((r, Some(a))), None) if deterministic(a.attcollation) => Some(Operand {
+                    typ: a.atttypid,
+                    column: Some((r, a.attnum)),
+                    rels: 1 << r,
+                }),
                 _ => None,
             }
         };
@@ -766,6 +808,8 @@ fn in_btree_equality(ctx: &Ctx<'_>, family: &(String, PgNamespaceOid), op: PgOpe
 struct KeyColumn {
     attnum: i16,
     typ: PgTypeOid,
+    /// A validated NOT NULL ([`super::proof::column_not_null`]): never raw
+    /// `attnotnull`, which PG 18 sets for a `NOT VALID` one too.
     notnull: bool,
     /// The index's operator family, by name and namespace.
     family: (String, PgNamespaceOid),
@@ -827,7 +871,7 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
             columns.push(KeyColumn {
                 attnum,
                 typ: attr.atttypid,
-                notnull: attr.attnotnull,
+                notnull: super::proof::column_not_null(catalog, relid, attnum),
                 family,
                 default_family,
                 deterministic: deterministic(index.indcollation.get(i).copied().flatten())
@@ -953,7 +997,7 @@ fn arm_value_is_exactly(
             let (Some(scope), Fields::Names(names)) = (scope, column_ref_fields(cr)) else {
                 return false;
             };
-            let Col::Rel(r, attnum) = scope.resolve(ctx, &names) else {
+            let Col::Rel(r, attnum) = scope.resolve(&names) else {
                 return false;
             };
             ctx.catalog

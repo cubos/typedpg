@@ -488,6 +488,103 @@ fn distinct_kept_with_natural_joins_and_ambiguous_using_columns() {
     );
 }
 
+/// `t AS x(k, id)` renames t's columns by position: `x.id` is `t.k`.
+fn aliased_columns_setup() -> PgCatalog {
+    setup_with(
+        "CREATE TABLE t (id int PRIMARY KEY, k int, v text);
+         CREATE TABLE u (id int PRIMARY KEY, tid int);",
+    )
+}
+
+#[test]
+fn distinct_follows_an_alias_column_list() {
+    let db = aliased_columns_setup();
+    // `x.id` is t.k, which repeats.
+    assert_kept(&db, "SELECT DISTINCT x.id FROM t AS x(k, id)");
+    assert_kept(&db, "SELECT DISTINCT id FROM t AS x(k, id)");
+    // `x.k` is t.id, the key.
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT x.k FROM t AS x(k, id)",
+        "SELECT x.k FROM t AS x(k, id)",
+        &[Rule::Distinct],
+    );
+}
+
+#[test]
+fn distinct_join_follows_an_alias_column_list() {
+    let db = aliased_columns_setup();
+    // Equated to t.k: each u row may match several t rows.
+    assert_kept(
+        &db,
+        "SELECT DISTINCT u.id FROM u JOIN t AS x(k, id) ON x.id = u.id",
+    );
+    // Equated to t.id: at most one.
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT u.id, x.v FROM u JOIN t AS x(k, id) ON x.k = u.tid",
+        "SELECT u.id, x.v FROM u JOIN t AS x(k, id) ON x.k = u.tid",
+        &[Rule::Distinct],
+    );
+    // USING reads the alias's names too: `tid` is t.k here, t.id there.
+    assert_kept(
+        &db,
+        "SELECT DISTINCT u.id, x.v FROM u JOIN t AS x(q, tid) USING (tid)",
+    );
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT u.id, x.v FROM u JOIN t AS x(tid) USING (tid)",
+        "SELECT u.id, x.v FROM u JOIN t AS x(tid) USING (tid)",
+        &[Rule::Distinct],
+    );
+}
+
+#[test]
+fn distinct_follows_a_partial_alias_column_list() {
+    let db = aliased_columns_setup();
+    // `x(z)` renames only the first column: `k` keeps its name.
+    assert_kept(&db, "SELECT DISTINCT x.k FROM t AS x(z)");
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT x.z, x.v FROM t AS x(z)",
+        "SELECT x.z, x.v FROM t AS x(z)",
+        &[Rule::Distinct],
+    );
+}
+
+#[test]
+fn union_follows_an_alias_column_list() {
+    let db = aliased_columns_setup();
+    assert_kept(
+        &db,
+        "SELECT 'a' AS kind, x.id FROM t AS x(k, id) UNION SELECT 'b', id FROM u",
+    );
+    assert_rewrites(
+        &db,
+        "SELECT 'a' AS kind, x.k FROM t AS x(k, id) UNION SELECT 'b', id FROM u",
+        "SELECT 'a' AS kind, x.k FROM t AS x(k, id) UNION ALL SELECT 'b', id FROM u",
+        &[Rule::UnionAll],
+    );
+}
+
+#[test]
+fn distinct_kept_on_a_not_valid_not_null() {
+    // PG 18 sets attnotnull for a NOT VALID NOT NULL, while NULLs may stay.
+    let mut db = setup_with(
+        "CREATE TABLE nv (a int, UNIQUE (a));
+         ALTER TABLE nv ADD CONSTRAINT nv_a_not_null NOT NULL a NOT VALID;",
+    );
+    assert_kept(&db, "SELECT DISTINCT a FROM nv");
+    db.apply_sql("ALTER TABLE nv VALIDATE CONSTRAINT nv_a_not_null;")
+        .unwrap();
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT a FROM nv",
+        "SELECT a FROM nv",
+        &[Rule::Distinct],
+    );
+}
+
 // ── UNION: positive shapes ──────────────────────────────────────────────────
 
 #[test]
