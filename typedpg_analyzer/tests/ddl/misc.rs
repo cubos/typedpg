@@ -7396,6 +7396,104 @@ fn truncate_refuses_a_system_catalog() {
 }
 
 #[test]
+fn ddl_refuses_a_system_catalog() {
+    // IsSystemClass (a pinned OID, or a TOAST relation) is off limits to
+    // DDL even for a superuser: RangeVarCallbackForAlterRelation (SET
+    // SCHEMA), renameatt_check (RENAME COLUMN / CONSTRAINT),
+    // RangeVarCallbackOwnsRelation (CREATE INDEX), CreateStatistics,
+    // ATAddForeignKeyConstraint (the referenced table), ATExecAddInherit
+    // (the parent) and RangeVarCallbackForDropRelation (DROP INDEX) all
+    // check it, before the columns, schema or index name are looked at.
+    let setup = "CREATE TABLE u (a oid);";
+    let denied = |rel: &str| format!("permission denied: \"{rel}\" is a system catalog");
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE pg_catalog.pg_trigger RENAME COLUMN tgname TO x;",
+            denied("pg_trigger"),
+        ),
+        (
+            "ALTER TABLE ONLY pg_catalog.pg_trigger RENAME COLUMN nosuch TO x;",
+            denied("pg_trigger"),
+        ),
+        (
+            "ALTER TABLE pg_catalog.pg_trigger RENAME CONSTRAINT pg_trigger_oid_index TO x;",
+            denied("pg_trigger"),
+        ),
+        (
+            "ALTER TABLE pg_catalog.pg_trigger SET SCHEMA public;",
+            denied("pg_trigger"),
+        ),
+        (
+            "ALTER TABLE IF EXISTS pg_catalog.pg_trigger SET SCHEMA nosuch;",
+            denied("pg_trigger"),
+        ),
+        (
+            "ALTER TABLE pg_catalog.pg_trigger_oid_index SET SCHEMA public;",
+            denied("pg_trigger_oid_index"),
+        ),
+        (
+            "CREATE INDEX ON pg_catalog.pg_trigger (tgname);",
+            denied("pg_trigger"),
+        ),
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS i ON pg_catalog.pg_trigger (nosuch);",
+            denied("pg_trigger"),
+        ),
+        (
+            "CREATE INDEX ON pg_toast.pg_toast_2620 (chunk_id);",
+            denied("pg_toast_2620"),
+        ),
+        (
+            "CREATE STATISTICS ON tgname, tgrelid FROM pg_catalog.pg_trigger;",
+            denied("pg_trigger"),
+        ),
+        (
+            "CREATE TABLE r (a oid REFERENCES pg_catalog.pg_trigger (oid));",
+            denied("pg_trigger"),
+        ),
+        (
+            "ALTER TABLE u ADD FOREIGN KEY (a) REFERENCES pg_catalog.pg_class NOT VALID;",
+            denied("pg_class"),
+        ),
+        (
+            "ALTER TABLE u INHERIT pg_catalog.pg_trigger;",
+            denied("pg_trigger"),
+        ),
+        (
+            "DROP INDEX pg_catalog.pg_trigger_oid_index;",
+            denied("pg_trigger_oid_index"),
+        ),
+        (
+            "DROP INDEX IF EXISTS pg_catalog.pg_class_tblspc_relfilenode_index;",
+            denied("pg_class_tblspc_relfilenode_index"),
+        ),
+        // renameatt_check refuses a typed table, then a relation kind
+        // without columns of its own, before the system catalog.
+        (
+            "ALTER TABLE pg_toast.pg_toast_2620 RENAME COLUMN chunk_id TO x;",
+            "cannot rename columns of relation \"pg_toast_2620\"".into(),
+        ),
+        (
+            "CREATE SEQUENCE s; ALTER TABLE s RENAME CONSTRAINT x TO y;",
+            "cannot rename columns of relation \"s\"".into(),
+        ),
+        (
+            "CREATE TYPE ct AS (a int); CREATE TABLE tt OF ct (CHECK (a > 0));
+             ALTER TABLE tt RENAME CONSTRAINT tt_a_check TO x;",
+            "cannot rename column of typed table".into(),
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    // A system view isn't pinned (initdb creates it after bootstrap).
+    build_db(&[(
+        "0001.sql",
+        "ALTER VIEW pg_catalog.pg_tables RENAME COLUMN tablename TO x;",
+    )]);
+}
+
+#[test]
 fn copy_from_refuses_generated_columns_and_views_without_a_trigger() {
     // CopyGetAttnums refuses generated columns; CopyFrom takes a view only
     // through an INSTEAD OF INSERT trigger.

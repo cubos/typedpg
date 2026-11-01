@@ -38,10 +38,7 @@ fn policy_command(cmd_name: &str) -> char {
 fn policy_table(interp: &PgCatalog, rv: &RangeVar) -> Result<PgClassOid, DdlError> {
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
     if interp.is_system_class(relid) {
-        return Err(DdlError::Parse(format!(
-            "permission denied: \"{}\" is a system catalog",
-            rv.relname
-        )));
+        return Err(crate::ddl::util::system_catalog_denied(&rv.relname));
     }
     let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
     if !matches!(relkind, Some(RelKind::Table | RelKind::Partitioned)) {

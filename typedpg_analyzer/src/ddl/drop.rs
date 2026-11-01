@@ -270,9 +270,7 @@ fn drop_relation(
     }
     // RangeVarCallbackForDropRelation.
     if interp.is_system_class(class_oid) {
-        return Err(DdlError::Parse(format!(
-            "permission denied: \"{name}\" is a system catalog"
-        )));
+        return Err(crate::ddl::util::system_catalog_denied(&name));
     }
     // findDependentObjects checks first that the relation may be dropped
     // at all: not part of another object (an identity column's sequence,
@@ -737,6 +735,10 @@ fn drop_index(
         return Err(DdlError::DependencyError(format!(
             "\"{name}\" is not an index"
         )));
+    }
+    // RangeVarCallbackForDropRelation: a system catalog's index stays.
+    if interp.is_system_class(class_oid) {
+        return Err(crate::ddl::util::system_catalog_denied(&name));
     }
 
     // A partition's copy of a partitioned index goes only with its parent

@@ -347,9 +347,7 @@ fn check_relkind(
         _ => return err(format!("relation \"{relname}\" cannot have triggers")),
     }
     if interp.is_system_class(relid) {
-        return err(format!(
-            "permission denied: \"{relname}\" is a system catalog"
-        ));
+        return Err(crate::ddl::util::system_catalog_denied(relname));
     }
     Ok(())
 }
@@ -761,10 +759,7 @@ pub(crate) fn rename_trigger(
             )));
         }
         if interp.is_system_class(relid) {
-            return Err(DdlError::Parse(format!(
-                "permission denied: \"{}\" is a system catalog",
-                rv.relname
-            )));
+            return Err(crate::ddl::util::system_catalog_denied(&rv.relname));
         }
     }
     let Some(trigger) = interp

@@ -51,9 +51,8 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
         // IsCatalogRelationOid) is off limits without
         // allow_system_table_mods.
         if relid.get() < FIRST_UNPINNED_OBJECT_ID {
-            return Err(DdlError::Parse(format!(
-                "permission denied: \"{}\" is a system catalog",
-                relname(interp, relid)
+            return Err(crate::ddl::util::system_catalog_denied(&relname(
+                interp, relid,
             )));
         }
         // ExecuteTruncate: ONLY on a partitioned table truncates nothing.

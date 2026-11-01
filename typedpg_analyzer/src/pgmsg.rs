@@ -332,6 +332,25 @@ pub(crate) fn cannot_change_relation(kind: &str, relation: &str) -> RawError {
     )
 }
 
+/// `permission denied: "r" is a system catalog` — SQLSTATE 42501: a
+/// system catalog (`IsSystemClass`: a pinned OID or a TOAST relation) is
+/// off limits to DDL, even for a superuser, unless
+/// `allow_system_table_mods` is on. PG raises it from many places
+/// (`RangeVarCallbackForAlterRelation`, `RangeVarCallbackOwnsRelation`,
+/// `RangeVarCallbackForDropRelation`, `renameatt_check`,
+/// `truncate_check_rel`, `CreateTriggerFiringOn`, `CreateStatistics`,
+/// `ATAddForeignKeyConstraint`, `ATSimplePermissions`, ...), always with
+/// the bare relation name.
+pub(crate) fn system_catalog_permission_denied(relation: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::InsufficientPrivilege(format!(
+            "permission denied: \"{relation}\" is a system catalog"
+        )),
+        None,
+        None,
+    )
+}
+
 /// RewriteQuery: `infinite recursion detected in rules for relation "r"` —
 /// SQLSTATE 42P17.
 pub(crate) fn infinite_rule_recursion(relation: &str) -> RawError {

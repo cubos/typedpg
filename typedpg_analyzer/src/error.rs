@@ -136,6 +136,12 @@ pub enum AnalyzeError {
     #[error("{0}")]
     InvalidObjectDefinition(String),
 
+    /// Something even a superuser may not do (modify a system catalog
+    /// without `allow_system_table_mods`). Equivalent to PG
+    /// `insufficient_privilege` (SQLSTATE 42501).
+    #[error("{0}")]
+    InsufficientPrivilege(String),
+
     /// Semantic-analysis errors PostgreSQL classifies as `syntax_error`
     /// (SQLSTATE 42601) even though they aren't grammar failures: VALUES
     /// list arity, set-operation column counts.
@@ -324,6 +330,7 @@ impl Clone for AnalyzeError {
             GeneratedAlways(m) => GeneratedAlways(m.clone()),
             ObjectNotInPrerequisiteState(m) => ObjectNotInPrerequisiteState(m.clone()),
             InvalidObjectDefinition(m) => InvalidObjectDefinition(m.clone()),
+            InsufficientPrivilege(m) => InsufficientPrivilege(m.clone()),
             SyntaxError(m) => SyntaxError(m.clone()),
             InvalidEscapeSequence(m) => InvalidEscapeSequence(m.clone()),
             DuplicateColumn(m) => DuplicateColumn(m.clone()),
@@ -406,6 +413,7 @@ impl AnalyzeError {
             GeneratedAlways(_) => Some("428C9"),
             ObjectNotInPrerequisiteState(_) => Some("55000"),
             InvalidObjectDefinition(_) => Some("42P17"),
+            InsufficientPrivilege(_) => Some("42501"),
             InvalidRowCountInLimitClause(_) => Some("2201W"),
             TooManyColumns(_) => Some("54011"),
             StatementTooComplex(_) => Some("54001"),
@@ -1423,6 +1431,7 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
             AnalyzeError::ObjectNotInPrerequisiteState(rendered)
         }
         AnalyzeError::InvalidObjectDefinition(_) => AnalyzeError::InvalidObjectDefinition(rendered),
+        AnalyzeError::InsufficientPrivilege(_) => AnalyzeError::InsufficientPrivilege(rendered),
         AnalyzeError::SyntaxError(_) => AnalyzeError::SyntaxError(rendered),
         AnalyzeError::InvalidEscapeSequence(_) => AnalyzeError::InvalidEscapeSequence(rendered),
         AnalyzeError::UndefinedSchema(_) => AnalyzeError::UndefinedSchema(rendered),

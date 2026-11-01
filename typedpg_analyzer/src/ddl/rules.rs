@@ -301,9 +301,7 @@ fn define_query_rewrite(
         .map(|c| c.relname.clone())
         .unwrap_or_default();
     if interp.is_system_class(relid) {
-        return Err(DdlError::Parse(format!(
-            "permission denied: \"{relname}\" is a system catalog"
-        )));
+        return Err(crate::ddl::util::system_catalog_denied(&relname));
     }
     let unsupported = |msg: &str| Err(DdlError::UnsupportedDdl(msg.to_owned()));
     if event == CmdType::CmdSelect {
@@ -698,10 +696,7 @@ pub(crate) fn rename_rule(
         )));
     }
     if interp.is_system_class(relid) {
-        return Err(DdlError::Parse(format!(
-            "permission denied: \"{}\" is a system catalog",
-            rv.relname
-        )));
+        return Err(crate::ddl::util::system_catalog_denied(&rv.relname));
     }
     let is_view = relkind == Some(RelKind::View);
     let exists = |interp: &PgCatalog, name: &str| {
