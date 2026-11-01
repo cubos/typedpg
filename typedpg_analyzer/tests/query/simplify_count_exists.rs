@@ -417,17 +417,21 @@ fn relations_that_are_not_plain_tables() {
 }
 
 /// A comparison another clause must match textually: rewriting one of
-/// the two copies would make PG reject the query.
+/// the two copies alone would make PG reject the query. The driver applies
+/// a rule's candidates together, so both copies change as one — the same
+/// grouping and ordering, by the same boolean.
 #[test]
-fn copies_another_clause_must_match() {
-    for sql in [
-        "SELECT (SELECT count(*) FROM u WHERE u.c = t.a) > 0 AS x FROM t \
-         GROUP BY (SELECT count(*) FROM u WHERE u.c = t.a) > 0",
-        "SELECT DISTINCT (SELECT count(*) FROM u WHERE u.c = t.a) > 0 AS x FROM t \
-         ORDER BY (SELECT count(*) FROM u WHERE u.c = t.a) > 0",
-    ] {
-        assert_kept(sql);
-    }
+fn copies_another_clause_must_match_change_together() {
+    const C: &str = "(SELECT count(*) FROM u WHERE u.c = t.a) > 0";
+    const E: &str = "EXISTS (SELECT 1 FROM u WHERE u.c = t.a)";
+    assert_rewritten(
+        &format!("SELECT {C} AS x FROM t GROUP BY {C}"),
+        &format!("SELECT {E} AS x FROM t GROUP BY {E}"),
+    );
+    assert_rewritten(
+        &format!("SELECT DISTINCT {C} AS x FROM t ORDER BY {C}"),
+        &format!("SELECT DISTINCT {E} AS x FROM t ORDER BY {E}"),
+    );
 }
 
 /// PG names an unnamed column after its expression (FigureColname),
