@@ -82,6 +82,9 @@ export const visitorKinds = sql(`
 // A timestamp parameter is a Date, never `infinity`: formatting it is never NULL.
 export const yearOf = sql("SELECT to_char($at::timestamptz, 'YYYY') AS year");
 
+// A jsonb parameter, sent as the JSON text its cast reads.
+export const jsonbEcho = sql("SELECT $doc::jsonb AS doc");
+
 // ── type-level checks: `tsc` fails if an inferred type is not the expected one ──
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;

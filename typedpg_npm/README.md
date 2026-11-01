@@ -289,6 +289,13 @@ Every value is read in PostgreSQL's text format with the driver's own type
 parsing off, and decoded by typedpg: the types are what the generated module
 says, whatever `pg.types.setTypeParser` your application set up.
 
+A query is sent on the unnamed statement, never prepared and reused, so
+PostgreSQL plans each execution with its values, and each parameter's type
+is left for the server to infer from its cast, so a value is read as that
+type directly instead of converted from text. node-postgres sends it in one
+round trip; postgres.js takes two when it has parameters, as it describes a
+statement before binding it.
+
 ## Types
 
 | PostgreSQL | TypeScript |
