@@ -381,18 +381,41 @@ pub(crate) fn typed_params<'a>(
         .collect()
 }
 
+/// The typed arguments for a query whose rows are decoded: [`typed_params`],
+/// when `columns` gives every result column's type as the server describes
+/// it and `tokio_postgres` knows each one.
+///
+/// `query_typed` reads the row description after the query is already on
+/// its way, and looks up each column type the client doesn't know with a
+/// query of its own — which, behind the pipelined query's rows, never gets
+/// its reply once they fill the response channel: the query hangs. A known
+/// type needs no lookup; anything else is sent untyped, prepared first,
+/// its column types looked up with nothing pending.
+fn typed_query_params<'a>(
+    params: &[&'a (dyn ToSql + Sync)],
+    oids: Option<&[u32]>,
+    columns: Option<&[u32]>,
+) -> Option<Vec<(&'a (dyn ToSql + Sync), Type)>> {
+    if !columns?.iter().all(|oid| Type::from_oid(*oid).is_some()) {
+        return None;
+    }
+    typed_params(params, oids?)
+}
+
 /// What `sql!`'s fetch methods run: the query through
 /// [`Executor::query_typed_stream`] when `oids` gives every parameter's
-/// type (see [`typed_params`]), [`Executor::query`] otherwise.
+/// type and `columns` every result column's (see [`typed_query_params`]),
+/// [`Executor::query`] otherwise.
 #[doc(hidden)]
 pub async fn run_query<E: Executor + ?Sized>(
     executor: &E,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
     oids: Option<&[u32]>,
+    columns: Option<&[u32]>,
 ) -> Result<Vec<Row>, crate::Error> {
     use futures_util::TryStreamExt;
-    match oids.and_then(|oids| typed_params(params, oids)) {
+    match typed_query_params(params, oids, columns) {
         Some(typed) => {
             executor
                 .query_typed_stream(sql, &typed)
@@ -412,15 +435,17 @@ pub async fn run_query_stream<E: Executor + ?Sized>(
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
     oids: Option<&[u32]>,
+    columns: Option<&[u32]>,
 ) -> Result<RowStream, crate::Error> {
-    match oids.and_then(|oids| typed_params(params, oids)) {
+    match typed_query_params(params, oids, columns) {
         Some(typed) => executor.query_typed_stream(sql, &typed).await,
         None => executor.query_stream(sql, params).await,
     }
 }
 
 /// [`run_query`] for `execute`: [`Executor::execute_typed`] or
-/// [`Executor::execute`].
+/// [`Executor::execute`]. Whatever the result columns: `execute_typed`
+/// discards the rows without looking up their types.
 #[doc(hidden)]
 pub async fn run_execute<E: Executor + ?Sized>(
     executor: &E,
@@ -457,5 +482,18 @@ mod tests {
         assert!(typed_params(&params, &[9999]).is_none());
         assert!(typed_params(&params, &[23, 23]).is_none());
         assert!(typed_params(&params, &[]).is_none());
+    }
+
+    /// A result column whose type the client would have to look up keeps
+    /// the query untyped (the lookup would wait behind the query's rows).
+    #[test]
+    fn unknown_result_column_types_keep_a_query_untyped() {
+        let a = 1i32;
+        let params: [&(dyn ToSql + Sync); 1] = [&a];
+        assert!(typed_query_params(&params, Some(&[23]), Some(&[23, 25])).is_some());
+        assert!(typed_query_params(&params, Some(&[23]), Some(&[])).is_some());
+        assert!(typed_query_params(&params, Some(&[23]), Some(&[23, 9999])).is_none());
+        assert!(typed_query_params(&params, Some(&[23]), None).is_none());
+        assert!(typed_query_params(&params, None, Some(&[23])).is_none());
     }
 }

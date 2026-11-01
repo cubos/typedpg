@@ -460,6 +460,63 @@ async fn enum_parameters_fall_back_to_preparing() {
     assert!(sent.named_parses >= 1, "prepared first: {sent:?}");
 }
 
+/// An enum result column, on a connection that has never seen the enum,
+/// with built-in parameters: sent typed, `tokio_postgres` would look the
+/// column's type up with a query of its own while the pipelined query's
+/// rows fill the response channel, and the lookup's reply — behind them —
+/// would never be read. Such a query is sent untyped, prepared first, and
+/// returns every row. The timeout turns a regression into a failure
+/// instead of a hung run.
+#[tokio::test]
+async fn enum_result_columns_fall_back_and_do_not_hang() {
+    const ROWS: i32 = 2000;
+    let wire = Wire::connect().await;
+    let client = &wire.client;
+    let limit = std::time::Duration::from_secs(20);
+
+    let n = ROWS;
+    let (rows, sent) = tokio::time::timeout(
+        limit,
+        wire.sent(
+            sql!(
+                client,
+                "SELECT g AS id, 'sad'::mood AS mood FROM generate_series(1, $n) AS g"
+            )
+            .fetch_all(),
+        ),
+    )
+    .await
+    .expect("fetch_all hung on the enum column's type lookup");
+    let rows = rows.expect("fetch_all");
+    assert_eq!(rows.len(), ROWS as usize);
+    assert!(rows.iter().all(|r| r.mood == "sad"));
+    assert!(sent.named_parses >= 1, "prepared first: {sent:?}");
+    assert!(sent.round_trips >= 2, "prepared first: {sent:?}");
+
+    // An array of the enum is no more known to the client.
+    let fresh = Wire::connect().await;
+    let client = &fresh.client;
+    let (streamed, sent) = tokio::time::timeout(
+        limit,
+        fresh.sent(async {
+            sql!(
+                client,
+                "SELECT g AS id, ARRAY['ok', 'sad']::mood[] AS moods \
+                 FROM generate_series(1, $n) AS g"
+            )
+            .fetch_stream()
+            .await
+            .expect("fetch_stream")
+            .try_collect::<Vec<_>>()
+            .await
+        }),
+    )
+    .await
+    .expect("fetch_stream hung on the enum array column's type lookup");
+    assert_eq!(streamed.expect("stream rows").len(), ROWS as usize);
+    assert!(sent.named_parses >= 1, "prepared first: {sent:?}");
+}
+
 /// A domain parameter is cast to its base type, so PostgreSQL infers the
 /// base type for it: a domain over a built-in type goes typed, as that
 /// type.
