@@ -447,6 +447,9 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     {
         super::guc::check_value(interp, &setting, &value)?;
     }
+    if stmt.name.eq_ignore_ascii_case("session_replication_role") {
+        interp.fk_checks_bypassed = true;
+    }
     if stmt.name.eq_ignore_ascii_case("constraint_exclusion")
         || stmt.name.eq_ignore_ascii_case("plan_cache_mode")
     {
@@ -510,6 +513,9 @@ pub(crate) fn alter_database_set(
         && let Some(value) = const_arg_string(arg)
     {
         super::guc::check_value(interp, &setting, &value)?;
+    }
+    if set.name.eq_ignore_ascii_case("session_replication_role") {
+        interp.fk_checks_bypassed = true;
     }
     if !set.name.eq_ignore_ascii_case("search_path") {
         return Ok(());
@@ -589,6 +595,11 @@ pub(crate) fn select_side_effects(
         if let Some((setting, value, is_local)) = constant_identity_set_config(fc) {
             set_identity(interp, &setting, Some(&value), is_local)?;
             continue;
+        }
+        if constant_set_config(fc)
+            .is_some_and(|(setting, _)| setting.eq_ignore_ascii_case("session_replication_role"))
+        {
+            interp.fk_checks_bypassed = true;
         }
         if let Some((setting, value)) = constant_set_config(fc)
             && let Some(known) = super::guc::check_settable(interp, &setting)?.cloned()

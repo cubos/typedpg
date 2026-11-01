@@ -591,13 +591,26 @@ fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError
         | node::Node::LoadStmt(_)
         | node::Node::AlterDatabaseStmt(_)
         | node::Node::AlterDatabaseRefreshCollStmt(_)
-        | node::Node::AlterRoleSetStmt(_)
-        | node::Node::AlterSystemStmt(_)
         | node::Node::DropRoleStmt(_)
         | node::Node::ReassignOwnedStmt(_)
         | node::Node::DropOwnedStmt(_)
         | node::Node::AlterTableSpaceOptionsStmt(_)
         | node::Node::AlterObjectDependsStmt(_) => Ok(()),
+        // A role's or the server's `session_replication_role` turns off
+        // the triggers enforcing foreign keys in the sessions it applies to.
+        node::Node::AlterRoleSetStmt(typedpg_pg_query::protobuf::AlterRoleSetStmt {
+            setstmt: Some(set),
+            ..
+        })
+        | node::Node::AlterSystemStmt(typedpg_pg_query::protobuf::AlterSystemStmt {
+            setstmt: Some(set),
+        }) => {
+            if set.name.eq_ignore_ascii_case("session_replication_role") {
+                db.fk_checks_bypassed = true;
+            }
+            Ok(())
+        }
+        node::Node::AlterRoleSetStmt(_) | node::Node::AlterSystemStmt(_) => Ok(()),
         // `ALTER COLLATION name REFRESH VERSION`: only the name matters.
         node::Node::AlterCollationStmt(s) => collations::refresh_version(db, s),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),

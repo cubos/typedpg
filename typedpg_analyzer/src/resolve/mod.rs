@@ -1825,7 +1825,7 @@ mod merge;
 mod predtest;
 mod returning;
 pub(crate) mod rewrite;
-mod row_guarantees;
+pub(crate) mod row_guarantees;
 mod select;
 mod set_ops;
 mod target_list;

@@ -1519,6 +1519,7 @@ fn apply_alter_subtype(
             for rel in targets {
                 if subtype == AlterTableType::AtDisableTrigAll {
                     interp.ri_triggers_disabled.insert(rel);
+                    interp.ri_triggers_ever_disabled.insert(rel);
                 } else {
                     interp.ri_triggers_disabled.remove(&rel);
                 }
