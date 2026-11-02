@@ -303,14 +303,13 @@ fn define_query_rewrite(
     crate::ddl::util::check_not_system_class(interp, relid)?;
     let unsupported = |msg: &str| Err(DdlError::UnsupportedDdl(msg.to_owned()));
     if event == CmdType::CmdSelect {
+        // transformRuleStmt turns NOTHING into one CMD_NOTHING action,
+        // which isn't a SELECT.
+        if stmt.actions.is_empty() {
+            return unsupported("rules on SELECT must have action INSTEAD SELECT");
+        }
         let [action] = stmt.actions.as_slice() else {
-            return if stmt.actions.is_empty() {
-                unsupported(
-                    "INSTEAD NOTHING rules on SELECT are not implemented (Use views instead.)",
-                )
-            } else {
-                unsupported("multiple actions for rules on SELECT are not implemented")
-            };
+            return unsupported("multiple actions for rules on SELECT are not implemented");
         };
         let Some(node::Node::SelectStmt(select)) = action.node.as_ref() else {
             return unsupported("rules on SELECT must have action INSTEAD SELECT");

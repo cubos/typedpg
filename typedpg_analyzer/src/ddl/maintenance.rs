@@ -238,8 +238,9 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                 new_relfilenodes(interp, &[relid]);
             }
         }
+        // get_namespace_oid: the name as written — `pg_temp` is no schema's.
         Ok(ReindexObjectType::ReindexObjectSchema)
-            if interp.namespace_oid(&stmt.name).is_none() =>
+            if stmt.name == "pg_temp" || interp.namespace_oid(&stmt.name).is_none() =>
         {
             return Err(DdlError::TableNotFound(format!(
                 "schema \"{}\" does not exist",
