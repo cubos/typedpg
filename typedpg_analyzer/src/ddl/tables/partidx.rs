@@ -53,11 +53,14 @@ pub(crate) fn foreign_partition_unique_error(interp: &PgCatalog, table: PgClassO
 }
 
 /// Give partition `part` the counterpart of `parent_index`, recursing into
-/// sub-partitions.
+/// sub-partitions. `attach`: for ATTACH PARTITION
+/// (AttachPartitionEnsureIndexes), which also wants an adopted constraint
+/// index's constraint of the parent's type; DefineIndex doesn't.
 pub(crate) fn ensure_partition_index(
     interp: &mut PgCatalog,
     parent_index: PgClassOid,
     part: PgClassOid,
+    attach: bool,
 ) -> Result<(), DdlError> {
     let Some(pi) = interp.pg_index.get(&parent_index).cloned() else {
         return Ok(());
@@ -89,13 +92,36 @@ pub(crate) fn ensure_partition_index(
                 && same_key_classes(interp, &pi, i)
                 && access_method(interp, i.indexrelid) == access_method(interp, parent_index)
                 && !interp.index_parents.contains_key(&i.indexrelid)
-                && !interp.invalid_indexes.contains(&i.indexrelid)
+                // DefineIndex adopts an invalid one (an ON ONLY index whose
+                // partitions lack theirs): the new index is invalid too.
+                // AttachPartitionEnsureIndexes wants a valid one.
+                && (!attach || !interp.invalid_indexes.contains(&i.indexrelid))
         })
         .map(|i| i.indexrelid)
-        .filter(|&i| parent_con.is_none() || backing_constraint(interp, i).is_some())
+        // A constraint's index needs one backing a constraint — on ATTACH
+        // (AttachPartitionEnsureIndexes) of the same type, a PRIMARY KEY for
+        // a PRIMARY KEY, a UNIQUE for a UNIQUE; CompareIndexInfo: the same
+        // NULLS [NOT] DISTINCT.
+        .filter(|&i| {
+            parent_con.as_ref().is_none_or(|pc| {
+                backing_constraint(interp, i).is_some_and(|cc| !attach || cc.contype == pc.contype)
+            })
+        })
+        .filter(|&i| {
+            let nnd = |index| {
+                interp
+                    .index_keys
+                    .get(&index)
+                    .is_some_and(|k| k.nulls_not_distinct)
+            };
+            nnd(i) == nnd(parent_index)
+        })
         .min();
     let child_index = match existing {
         Some(index) => {
+            if interp.invalid_indexes.contains(&index) {
+                interp.invalid_indexes.insert(parent_index);
+            }
             // Its constraint becomes inherited — when the parent index
             // backs one too (else it stays local).
             if parent_con.is_some()
@@ -126,8 +152,11 @@ pub(crate) fn ensure_partition_index(
             // valid one: its partitions already have theirs attached to it.
             if interp.pg_class.get(&part).map(|c| c.relkind) == Some(RelKind::Partitioned) {
                 for sub in inherit::children_of(interp, part) {
-                    ensure_partition_index(interp, clone, sub)?;
+                    ensure_partition_index(interp, clone, sub, false)?;
                 }
+            }
+            if interp.invalid_indexes.contains(&clone) {
+                interp.invalid_indexes.insert(parent_index);
             }
             return Ok(());
         }
@@ -241,7 +270,7 @@ pub(crate) fn clone_parent_indexes(
         .collect();
     indexes.sort();
     for index in indexes {
-        ensure_partition_index(interp, index, part)?;
+        ensure_partition_index(interp, index, part, true)?;
     }
     Ok(())
 }
@@ -257,7 +286,7 @@ pub(crate) fn propagate_new_index(
         return Ok(());
     }
     for part in inherit::children_of(interp, table) {
-        ensure_partition_index(interp, index, part)?;
+        ensure_partition_index(interp, index, part, false)?;
     }
     Ok(())
 }

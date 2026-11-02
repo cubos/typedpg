@@ -1313,7 +1313,7 @@ pub(crate) fn drop_column(
     if let Some(first) = generated_dependents.first()
         && !cascade
     {
-        let relname = relname_of(interp, relid);
+        let relname = crate::ddl::depend::relation_display_name(interp, relid);
         return Err(DdlError::DependencyError(format!(
             "cannot drop column {} of table {relname} because other objects depend on it \
              (column {first} of table {relname} depends on column {} of table {relname})",
@@ -1370,11 +1370,7 @@ pub(crate) fn drop_column(
             .map(|i| i.indexrelid)
             .collect();
         if !blockers.is_empty() && !cascade {
-            let relname = interp
-                .pg_class
-                .get(&relid)
-                .map(|c| c.relname.clone())
-                .unwrap_or_default();
+            let relname = crate::ddl::depend::relation_display_name(interp, relid);
             return Err(DdlError::DependencyError(format!(
                 "cannot drop column {} of table {relname} because other objects depend on it \
                  (constraint(s) {} depend on this column)",
