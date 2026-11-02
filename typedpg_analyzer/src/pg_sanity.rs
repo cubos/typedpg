@@ -238,9 +238,38 @@ impl PgSanityServer {
         sql: &str,
         our_result: &Result<(), E>,
     ) -> Option<Divergence> {
-        let pg_result = self.client.batch_execute(sql);
-        self.soundness.schema_changed();
+        let pg_result = self.run_migration(sql);
         compare_apply_outcome(sql, our_result, &pg_result)
+    }
+
+    /// Send migration `sql` to the migrations' session as one simple query.
+    ///
+    /// A migration that fails leaves the analyzer's catalog as the failed
+    /// transaction found it (`txblock::Transaction::abort` rolls back to
+    /// the transaction's start, session settings included — PG reverts a
+    /// session-level `SET` made in a transaction that aborts, too). The
+    /// server only gets there by itself when the failure hit an implicit
+    /// transaction block: after an explicit `BEGIN` it stays in the aborted
+    /// block (`TBLOCK_ABORT`), refusing every later statement (`current
+    /// transaction is aborted`, 25P02). So a failure is followed by a
+    /// `ROLLBACK`, which ends exactly the transaction the analyzer rolled
+    /// back — what an earlier `COMMIT` in the migration made durable stays
+    /// on both sides.
+    /// Outside a block (the failure ended its implicit one) the `ROLLBACK`
+    /// only draws a warning. The caller compares the migration's own
+    /// outcome, which this returns untouched.
+    fn run_migration(&mut self, sql: &str) -> Result<(), postgres::Error> {
+        let pg_result = self.client.batch_execute(sql);
+        if pg_result.is_err() {
+            self.client.batch_execute("ROLLBACK").unwrap_or_else(|e| {
+                panic!(
+                    "pg_sanity: ROLLBACK after a failed migration failed: {}",
+                    render_pg_error(&e)
+                )
+            });
+        }
+        self.soundness.schema_changed();
+        pg_result
     }
 
     /// [`Self::compare_apply_matches`] for a migration that creates, alters
@@ -253,8 +282,7 @@ impl PgSanityServer {
         sql: &str,
         our_result: &Result<(), E>,
     ) -> Option<Option<Divergence>> {
-        let pg_result = self.client.batch_execute(sql);
-        self.soundness.schema_changed();
+        let pg_result = self.run_migration(sql);
         // extension.c's `extension "%s" is not available`, raised when the
         // control file is missing — for one of the bundled extensions the
         // image doesn't ship. Any other is a divergence.

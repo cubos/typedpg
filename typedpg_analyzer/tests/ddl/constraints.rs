@@ -1629,13 +1629,12 @@ fn detached_partition_gets_its_own_referenced_partition_rows() {
             "cannot drop inherited constraint \"f_2\" of relation \"t2\"",
         ),
         (
-            "BEGIN; SET CONSTRAINTS g_4 DEFERRED;",
+            "BEGIN; SET CONSTRAINTS g_4 DEFERRED; COMMIT;",
             "constraint \"g_4\" is not deferrable",
         ),
     ] {
         let err = db.apply_sql(stmt).unwrap_err().to_string();
         assert!(err.starts_with(msg), "{stmt}\n  got: {err}");
-        db.apply_sql("ROLLBACK;").unwrap();
     }
     db.apply_sql("ALTER TABLE t2 DROP CONSTRAINT f;").unwrap();
     assert_eq!(rows(&db, "t2"), Vec::new());

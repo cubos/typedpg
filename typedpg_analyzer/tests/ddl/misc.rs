@@ -3823,6 +3823,49 @@ fn a_failed_migration_leaves_no_trace() {
 }
 
 #[test]
+fn a_failed_explicit_transaction_leaves_no_trace() {
+    // PG 18: a statement failing inside BEGIN ... COMMIT aborts the block,
+    // and the migration with it; the next migration starts from where the
+    // block started. A session-level SET made in the aborted transaction is
+    // reverted too (AtEOXact_GUC).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int); CREATE SCHEMA s;")
+        .unwrap();
+    let err = db
+        .apply_sql(
+            "BEGIN;
+             ALTER TABLE t ADD COLUMN b int;
+             SET search_path = s;
+             CREATE TABLE public.t (a int);
+             COMMIT;",
+        )
+        .expect_err("duplicate table");
+    assert!(
+        err.to_string().starts_with("relation \"t\" already exists"),
+        "got: {err}"
+    );
+    let err = db
+        .analyze("SELECT b FROM t")
+        .expect_err("the column was rolled back");
+    assert!(
+        err.to_string().starts_with("column \"b\" does not exist"),
+        "got: {err}"
+    );
+    // The search path is the session's again: `u` lands in public.
+    db.apply_sql("CREATE TABLE u (a int);").unwrap();
+    db.analyze("SELECT a FROM public.u").unwrap();
+    // What a COMMIT made durable stays.
+    db.apply_sql(
+        "BEGIN; CREATE TABLE c (a int); COMMIT;
+         BEGIN; CREATE TABLE d (a int); CREATE TABLE c (a int); COMMIT;",
+    )
+    .expect_err("duplicate table");
+    db.apply_sql("CREATE TABLE d (b int);").unwrap();
+    db.analyze("SELECT a FROM c").unwrap();
+    db.analyze("SELECT b FROM d").unwrap();
+}
+
+#[test]
 fn migrations_the_runner_wraps_in_a_transaction() {
     // With `use_transaction`, the runner runs each migration inside a
     // transaction block of its own: savepoints work, and statements that
