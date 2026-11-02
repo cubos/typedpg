@@ -423,7 +423,7 @@ pub(super) fn add_foreign_key(
     // ATAddForeignKeyConstraint: the referenced side first, then the
     // referencing one.
     recurse_referenced(interp, oid, &conname)?;
-    recurse_referencing(interp, relid, oid)
+    recurse_referencing(interp, relid, oid, Some(&conname))
 }
 
 /// addFkRecurseReferenced: a foreign key referencing a partitioned table
@@ -642,26 +642,32 @@ pub(crate) fn fk_root(interp: &PgCatalog, con: PgConstraintOid) -> Option<PgCons
 
 /// addFkRecurseReferencing: a foreign key of a partitioned table reaches
 /// every partition — attached to an equivalent foreign key the partition
-/// has, or cloned.
+/// has, or cloned. `base` is the name clones are named after: ADD FOREIGN
+/// KEY's own, at every level (its Constraint node is passed down); `None`
+/// for CloneFkReferencing's, which names each level after the clone above
+/// it.
 fn recurse_referencing(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     con: PgConstraintOid,
+    base: Option<&str>,
 ) -> Result<(), DdlError> {
     if interp.pg_class.get(&relid).map(|c| c.relkind) != Some(RelKind::Partitioned) {
         return Ok(());
     }
     for part in super::inherit::children_of(interp, relid) {
-        attach_or_clone(interp, part, con)?;
+        attach_or_clone(interp, part, con, base)?;
     }
     Ok(())
 }
 
-/// tryAttachPartitionForeignKey / CloneFkReferencing for one partition.
+/// tryAttachPartitionForeignKey / CloneFkReferencing for one partition
+/// (`base`: see [`recurse_referencing`]).
 fn attach_or_clone(
     interp: &mut PgCatalog,
     part: PgClassOid,
     parent_con: PgConstraintOid,
+    base: Option<&str>,
 ) -> Result<(), DdlError> {
     let Some(parent) = interp.pg_constraint.get(&parent_con).cloned() else {
         return Ok(());
@@ -738,7 +744,7 @@ fn attach_or_clone(
     // (addFkConstraint), under the parent's name unless the partition uses
     // it — then `name_1`, `name_2`, … the first no constraint in the schema
     // has.
-    let name = derived_fk_name(interp, part, &parent.conname);
+    let name = derived_fk_name(interp, part, base.unwrap_or(&parent.conname));
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
         oid,
@@ -759,7 +765,7 @@ fn attach_or_clone(
         details.parent = Some(parent_con);
         interp.fk_details.insert(oid, details);
     }
-    recurse_referencing(interp, part, oid)
+    recurse_referencing(interp, part, oid, base)
 }
 
 /// CloneForeignKeyConstraints (CREATE TABLE ... PARTITION OF, ATTACH
@@ -776,6 +782,12 @@ pub(super) fn clone_parent_fks(
         .filter(|c| c.conrelid == parent && c.contype == ConType::ForeignKey)
         .cloned()
         .collect();
+    // Known limitation: PG visits the keys in pg_constraint's physical
+    // order, where an UPDATE of a row (VALIDATE, ALTER CONSTRAINT, a
+    // rename, ...) moves it to the end; OID order is creation order. When
+    // two of them clash on a name in the partition, the `name_N` numbers
+    // they get may come out swapped. Modelling heap order would mean
+    // tracking a position bumped by every write to a constraint row.
     fks.sort_by_key(|c| c.oid);
     let oids: Vec<PgConstraintOid> = fks.iter().map(|c| c.oid).collect();
     for fk in &fks {
@@ -797,7 +809,7 @@ pub(super) fn clone_parent_fks(
             .and_then(|d| d.parent)
             .is_some_and(|p| oids.contains(&p));
         if !parent_cloned {
-            attach_or_clone(interp, part, fk.oid)?;
+            attach_or_clone(interp, part, fk.oid, None)?;
         }
     }
     clone_referenced_fks(interp, parent, part)
