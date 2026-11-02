@@ -7951,3 +7951,29 @@ fn cluster_and_reindex_take_a_toast_table() {
         );
     }
 }
+
+#[test]
+fn a_system_catalog_is_refused_before_it_is_opened_as_a_table() {
+    // CREATE INDEX looks the table up with RangeVarCallbackOwnsRelation
+    // (no system catalog) before DefineIndex opens it (table_open): a
+    // catalog index is refused as a system catalog, and only with
+    // allow_system_table_mods as an index.
+    let mut db = build_db(&[("0001.sql", "SELECT 1;")]);
+    for (sql, message) in [
+        (
+            "CREATE INDEX ON pg_class_oid_index (oid);",
+            "permission denied: \"pg_class_oid_index\" is a system catalog",
+        ),
+        (
+            "SET allow_system_table_mods = on; CREATE INDEX ON pg_class_oid_index (oid);",
+            "cannot open relation \"pg_class_oid_index\" (This operation is not supported for \
+             indexes.)",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}
