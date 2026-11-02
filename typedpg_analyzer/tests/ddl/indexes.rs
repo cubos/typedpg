@@ -2194,3 +2194,35 @@ fn clones_copy_the_names_an_index_had_when_its_transaction_got_it() {
     )
     .unwrap();
 }
+
+#[test]
+fn expression_index_columns_are_named_as_figure_index_colname_names_them() {
+    // FigureIndexColname: a function's name, a cast's argument's, `case`,
+    // `coalesce`, ...; `expr` for an operator — deduplicated with a
+    // counter. ChooseIndexName names the index after them, and a clone
+    // copies them.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE s (a text, b int);
+         CREATE INDEX e ON s (lower(a::text));
+         CREATE INDEX ON s (abs(b), lower(a), (a::varchar), (a || 'x'), (b + 1), lower(a),
+                            (CASE WHEN b > 0 THEN 1 END), coalesce(b, 0));
+         CREATE TABLE pe (a text, b int) PARTITION BY RANGE (b);
+         CREATE INDEX pei ON pe (abs(b), lower(a), (a::text), (a || 'x'));",
+    )]);
+    db.apply_sql(
+        "ALTER TABLE e RENAME COLUMN lower TO lw;
+         ALTER TABLE s_abs_lower_a_expr_expr1_lower1_case_coalesce_idx RENAME COLUMN expr1 TO e1;
+         ALTER TABLE s_abs_lower_a_expr_expr1_lower1_case_coalesce_idx RENAME COLUMN lower1 TO l1;
+         ALTER TABLE s_abs_lower_a_expr_expr1_lower1_case_coalesce_idx RENAME COLUMN \"case\" TO c;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "CREATE TABLE pe1 PARTITION OF pe FOR VALUES FROM (1) TO (2);
+         ALTER TABLE pe1_abs_lower_a_expr_idx RENAME COLUMN expr TO x;
+         ALTER TABLE pei RENAME COLUMN lower TO lw;
+         CREATE TABLE l (LIKE pe INCLUDING INDEXES);
+         ALTER TABLE l_abs_lw_a_expr_idx RENAME COLUMN lw TO q;",
+    )
+    .unwrap();
+}

@@ -423,12 +423,22 @@ pub(crate) fn index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
         return Vec::new();
     };
     let mut names: Vec<String> = Vec::new();
+    let mut exprs = index.indexprs.iter();
     for &key in &index.indkey {
-        let origname = db
-            .attributes_of(index.indrelid)
-            .iter()
-            .find(|a| key != 0 && a.attnum == key)
-            .map_or_else(|| "expr".to_owned(), |a| a.attname.clone());
+        // A column is named after the table's; an expression as
+        // FigureIndexColname names it (a function's name, a cast's
+        // argument, ...; `expr` for an operator and the like).
+        let origname = if key == 0 {
+            let expr = exprs.next().and_then(|e| {
+                <typedpg_pg_query::protobuf::Node as Message>::decode(e.ast.as_slice()).ok()
+            });
+            figure_index_colname(expr.as_ref())
+        } else {
+            db.attributes_of(index.indrelid)
+                .iter()
+                .find(|a| a.attnum == key)
+                .map_or_else(|| "expr".to_owned(), |a| a.attname.clone())
+        };
         let mut name = origname.clone();
         let mut i = 1;
         while names.contains(&name) {
