@@ -11,7 +11,9 @@
 //! own. The migration runner instead sends the file inside a transaction it
 //! opened (`use_transaction`, unless the file's first line is
 //! `-- no-transaction`) or else one statement at a time, each a query — and
-//! so a transaction — of its own.
+//! so a transaction — of its own. Sent that way, a migration must close
+//! every block it opens: the runner fails one that ends inside its own
+//! `BEGIN`, and so does [`Transaction::finish`].
 //! A statement that fails aborts the transaction it runs in: the catalog
 //! goes back to how that transaction found it — the start of the migration,
 //! or its last `COMMIT` / `ROLLBACK`. The session's cursors follow the
@@ -290,11 +292,26 @@ impl Transaction {
         db.end_transaction_scope();
     }
 
-    /// The end of the migration: whatever transaction is open commits (the
-    /// runner commits its own; an unterminated `BEGIN` of an unwrapped
-    /// migration is taken as committed too).
-    pub(crate) fn finish(mut self, db: &mut PgCatalog) {
+    /// Whether the next statement runs inside `BEGIN` ... `COMMIT`.
+    pub(crate) fn in_explicit_block(&self) -> bool {
+        self.block == Block::Explicit
+    }
+
+    /// The end of the migration: whatever transaction is open commits — the
+    /// runner commits its own, and a bare simple query leaves the session in
+    /// the block its `BEGIN` opened. A migration the runner sends one
+    /// statement at a time must not end inside a block it opened: nothing
+    /// after it would commit, so the runner rolls that block back and fails
+    /// the migration (`typedpg_core::migrations::machine`), and so does this.
+    pub(crate) fn finish(mut self, db: &mut PgCatalog) -> Result<(), DdlError> {
+        if self.per_statement && self.block == Block::Explicit {
+            self.abort(db);
+            return Err(DdlError::UnsupportedDdl(
+                typedpg_core::migrations::machine::left_transaction_open_check_message(),
+            ));
+        }
         self.end(db, false, true);
+        Ok(())
     }
 }
 

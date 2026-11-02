@@ -40,9 +40,13 @@
 //!
 //! The machine owns the cleanup, too: a failure inside a transaction emits
 //! `ROLLBACK`, and the advisory lock is always released before the machine
-//! finishes or fails. A driver that gets [`Failure::Db`] must rethrow the
-//! driver error it replied to the machine with (the original error object,
-//! not a message).
+//! finishes or fails. A file the machine does not wrap in its own
+//! transaction must not leave one open either: after its statements, the
+//! machine checks whether a `BEGIN` of the file is still open
+//! ([`PROBE_SET_SQL`]), and rolls it back and fails the migration if so
+//! ([`left_transaction_open_message`]). A driver that gets [`Failure::Db`]
+//! must rethrow the driver error it replied to the machine with (the
+//! original error object, not a message).
 
 use super::{HASH_VERSION, drift_message, hash, locate_position, split_statements};
 use crate::config::validate_table_name;
@@ -337,6 +341,21 @@ enum Stage {
     UpNoTransactionInsert {
         index: usize,
     },
+    /// The first half of the open-transaction probe ([`PROBE_SET_SQL`]),
+    /// after the statements of a file the machine did not wrap: `down` for
+    /// a down file, and `error` the message of the statement that failed,
+    /// if one did.
+    ProbeSet {
+        index: usize,
+        down: bool,
+        error: Option<String>,
+    },
+    /// The second half ([`PROBE_READ_SQL`]).
+    ProbeRead {
+        index: usize,
+        down: bool,
+        error: Option<String>,
+    },
     /// The rollback emitted before a failure; its own error is ignored.
     UpRollback {
         failure: Failure,
@@ -571,7 +590,7 @@ impl Migrator {
                         sql: (*statement).to_string(),
                     }
                 } else {
-                    self.up_no_transaction_insert(index)
+                    self.probe(index, false, None)
                 }
             }
             (Stage::UpStatement { index, stmt }, Reply::DbError(error)) => {
@@ -586,7 +605,9 @@ impl Migrator {
                     stmt + 1,
                     format_db_error(&error, &migration.sql, base)
                 );
-                self.fail_locked(Failure::Message(message))
+                // The failed statement may have been in a block the file
+                // opened, now aborted: it must not outlive the migration.
+                self.probe(index, false, Some(message))
             }
             (Stage::UpStatement { .. }, _) => self.fail_locked(Failure::Db),
 
@@ -648,8 +669,7 @@ impl Migrator {
                         sql: (*statement).to_string(),
                     }
                 } else {
-                    self.stage = Stage::RevertNoTransactionDelete { index };
-                    self.delete_query(index)
+                    self.probe(index, true, None)
                 }
             }
             (Stage::RevertStatement { index, stmt }, Reply::DbError(error)) => {
@@ -664,9 +684,42 @@ impl Migrator {
                     stmt + 1,
                     format_db_error(&error, &down, base)
                 );
-                self.fail_locked(Failure::Message(message))
+                self.probe(index, true, Some(message))
             }
             (Stage::RevertStatement { .. }, _) => self.fail_locked(Failure::Db),
+
+            (Stage::ProbeSet { index, down, error }, Reply::Rows(_)) => {
+                self.stage = Stage::ProbeRead { index, down, error };
+                Step::Query {
+                    sql: PROBE_READ_SQL.to_string(),
+                    params: Vec::new(),
+                }
+            }
+            // On a live session, only an aborted block makes the probe fail:
+            // a statement of the file failed in a block the file opened.
+            (Stage::ProbeSet { down, error, .. }, _)
+            | (Stage::ProbeRead { down, error, .. }, Reply::DbError(_)) => {
+                self.rollback(down, error.map_or(Failure::Db, Failure::Message))
+            }
+            (Stage::ProbeRead { index, down, error }, Reply::Rows(rows)) => {
+                let token = probe_token(&self.migrations[index].name);
+                let open = first_value(&rows) == Some(token.as_str());
+                match (open, error) {
+                    (true, error) => {
+                        let message = error.unwrap_or_else(|| {
+                            left_transaction_open_message(&self.migrations[index].name, down)
+                        });
+                        self.rollback(down, Failure::Message(message))
+                    }
+                    (false, Some(message)) => self.fail_locked(Failure::Message(message)),
+                    (false, None) if down => {
+                        self.stage = Stage::RevertNoTransactionDelete { index };
+                        self.delete_query(index)
+                    }
+                    (false, None) => self.up_no_transaction_insert(index),
+                }
+            }
+            (Stage::ProbeRead { .. }, _) => self.fail_locked(Failure::Db),
 
             (Stage::RevertNoTransactionDelete { index }, Reply::Rows(_)) => self.release(
                 None,
@@ -1061,6 +1114,25 @@ impl Migrator {
         }
     }
 
+    /// Start the open-transaction probe after the statements of migration
+    /// `index`'s up (or `down`) file, which the machine did not wrap.
+    fn probe(&mut self, index: usize, down: bool, error: Option<String>) -> Step {
+        self.stage = Stage::ProbeSet { index, down, error };
+        Step::Query {
+            sql: PROBE_SET_SQL.to_string(),
+            params: vec![Some(probe_token(&self.migrations[index].name))],
+        }
+    }
+
+    /// Roll back the block an unwrapped file left open, then fail.
+    fn rollback(&mut self, down: bool, failure: Failure) -> Step {
+        if down {
+            self.revert_rollback(failure)
+        } else {
+            self.up_rollback(failure)
+        }
+    }
+
     fn revert_step(&mut self) -> Step {
         let (name, force) = match &self.action {
             Action::Revert { name, force } => (name.clone(), *force),
@@ -1298,6 +1370,87 @@ impl Migrator {
     }
 }
 
+/// The first half of the open-transaction probe: set a placeholder setting
+/// to `$1`, [`probe_token`], for the current transaction only (`is_local`).
+/// Outside a transaction block the query is a transaction of its own, which
+/// the setting does not outlive; inside one the setting lasts until the
+/// block ends, and [`PROBE_READ_SQL`], the next query, still reads the
+/// token.
+///
+/// Neither half fails or warns on a healthy session, in a block or not, and
+/// neither assigns a transaction id — a block with no write has none, so
+/// `pg_current_xact_id_if_assigned()` cannot tell it is open. In a block a
+/// failed statement aborted, the first half fails (`current transaction is
+/// aborted`), which tells as much.
+pub const PROBE_SET_SQL: &str =
+    "SELECT pg_catalog.set_config('typedpg.transaction_probe', $1::pg_catalog.text, true)";
+
+/// The second half of the open-transaction probe: the setting
+/// [`PROBE_SET_SQL`] made, [`probe_token`] when a transaction block is
+/// still open.
+pub const PROBE_READ_SQL: &str =
+    "SELECT pg_catalog.current_setting('typedpg.transaction_probe', true)";
+
+/// The value the probe of migration `name` (its file stem, version
+/// included) sets, and reads back inside a transaction block. Outside one,
+/// [`PROBE_READ_SQL`] reads whatever the setting is at session level — set
+/// by the migration itself (`SET typedpg.transaction_probe = ...`), or a
+/// role or database default — so the value is one such a setting cannot
+/// hold by accident: a fixed prefix and the migration's name, derived from
+/// the input to keep the machine deterministic. A session value spelling
+/// exactly this token for this migration would still read as an open
+/// block; nothing but a deliberate attempt sets one.
+pub fn probe_token(name: &str) -> String {
+    format!("typedpg-open:{name}")
+}
+
+/// The failure of a migration file (its down file when `down`) the machine
+/// did not wrap, which left a transaction block open: a `BEGIN` without
+/// its `COMMIT`. Nothing after it would commit — not the tracking table's
+/// row, the next migrations or the lock's release — so the machine rolls
+/// the block back and fails instead. Only the open block goes: what the
+/// file committed before it (an earlier `COMMIT`, `COMMIT AND CHAIN`, or
+/// statements outside any block) stays.
+pub fn left_transaction_open_message(name: &str, down: bool) -> String {
+    let (action, file, record) = if down {
+        (
+            "revert",
+            format!("{name}.down.sql"),
+            "the migration is still recorded as applied",
+        )
+    } else {
+        (
+            "apply",
+            format!("{name}.sql"),
+            "the migration was not recorded",
+        )
+    };
+    format!(
+        "failed to {action} migration {name}: {file} {LEFT_TRANSACTION_OPEN}; \
+         the open transaction block was rolled back, statements committed before it \
+         (by an earlier COMMIT, or outside any block) stay applied, and {record}. \
+         {LEFT_TRANSACTION_OPEN_HINT}"
+    )
+}
+
+/// What the analyzer reports, at compile time, about a migration the runner
+/// would fail with [`left_transaction_open_message`]. Its location in the
+/// file (the `BEGIN`) and [`LEFT_TRANSACTION_OPEN_HINT`] follow it.
+pub fn left_transaction_open_check_message() -> String {
+    format!(
+        "this migration {LEFT_TRANSACTION_OPEN}, and runs without the runner's \
+         transaction: the runner would roll the block back and fail it"
+    )
+}
+
+/// How the runner and the analyzer both say that a migration file run
+/// without the runner's transaction (`-- no-transaction`, or
+/// `use_transaction` off) ends inside a transaction block it opened.
+pub const LEFT_TRANSACTION_OPEN: &str = "left a transaction block open (a BEGIN with no COMMIT)";
+
+/// What to do about [`LEFT_TRANSACTION_OPEN`].
+pub const LEFT_TRANSACTION_OPEN_HINT: &str = "Add a COMMIT at the end of the transaction block.";
+
 /// The first cell of the first row.
 fn first_value(rows: &[Vec<Option<String>>]) -> Option<&str> {
     rows.first()
@@ -1437,6 +1590,20 @@ mod tests {
 
     fn is_accept_update(sql: &str) -> bool {
         sql.starts_with("UPDATE ") && sql.contains("SET sql_source")
+    }
+
+    fn is_probe_set(sql: &str) -> bool {
+        sql == PROBE_SET_SQL
+    }
+
+    fn is_probe_read(sql: &str) -> bool {
+        sql == PROBE_READ_SQL
+    }
+
+    /// The probe's answer outside a transaction block: the setting went
+    /// with the probe's own transaction.
+    fn closed() -> Reply {
+        rows(vec![one("")])
     }
 
     fn is_status_columns(sql: &str) -> bool {
@@ -1753,6 +1920,8 @@ mod tests {
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_probe_set(sql) => rows(vec![one("open")]),
+                Step::Query { sql, .. } if is_probe_read(sql) => closed(),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),
                 other => panic!("unexpected step: {other:?}"),
             },
@@ -1777,6 +1946,292 @@ mod tests {
             "the unlock comes right before the failure"
         );
         assert!(!queries(&steps).any(is_insert));
+    }
+
+    /// A session, as far as transaction blocks go: the files' `BEGIN`,
+    /// `COMMIT` and `ROLLBACK`, a failing statement (`CREATE TABL`) aborting
+    /// the block it runs in, and the probe's setting: transaction-local for
+    /// as long as the block, else its session value (`SET
+    /// typedpg.transaction_probe = 'open'` in a file).
+    #[derive(Default)]
+    struct Session {
+        /// `Some(aborted)` inside a transaction block.
+        block: Option<bool>,
+        /// The probe's transaction-local value, while its block lasts.
+        probe: Option<String>,
+        /// The setting's session value.
+        session_probe: Option<String>,
+        /// The tracking-table rows the applied select returns.
+        applied: Vec<Vec<Option<String>>>,
+        /// Whether a block was open when the lock was released.
+        unlocked_in_block: Option<bool>,
+    }
+
+    impl Session {
+        fn aborted() -> Reply {
+            Reply::DbError(DbError {
+                code: Some("25P02".to_string()),
+                message: "current transaction is aborted, commands ignored until end of \
+                          transaction block"
+                    .to_string(),
+                severity: Some("ERROR".to_string()),
+                detail: None,
+                hint: None,
+                position: None,
+                internal_position: None,
+                internal_query: None,
+            })
+        }
+
+        fn answer(&mut self, step: &Step) -> Reply {
+            let aborted = self.block == Some(true);
+            match step {
+                Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Execute { sql } if !aborted && sql.contains("AND CHAIN") => {
+                    self.block = Some(false);
+                    self.probe = None;
+                    done()
+                }
+                Step::Execute { sql } if sql.contains("ROLLBACK") || sql.contains("COMMIT") => {
+                    self.block = None;
+                    self.probe = None;
+                    done()
+                }
+                Step::Execute { .. } if aborted => Self::aborted(),
+                Step::Execute { sql } if sql.contains("SET typedpg.transaction_probe") => {
+                    self.session_probe = Some("open".to_string());
+                    done()
+                }
+                Step::Execute { sql } if sql.contains("BEGIN") => {
+                    self.block = Some(false);
+                    done()
+                }
+                Step::Execute { sql } if sql.contains("CREATE TABL ") => {
+                    if self.block.is_some() {
+                        self.block = Some(true);
+                    }
+                    error("syntax error at or near \"TABL\"", Some(8))
+                }
+                Step::Execute { .. } => done(),
+                Step::Query { sql, .. } if is_unlock(sql) => {
+                    self.unlocked_in_block = Some(self.block.is_some());
+                    if aborted { Self::aborted() } else { locked() }
+                }
+                Step::Query { .. } if aborted => Self::aborted(),
+                Step::Query { sql, .. } if is_lock(sql) => locked(),
+                Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_applied_select(sql) => rows(self.applied.clone()),
+                Step::Query { sql, params } if is_probe_set(sql) => {
+                    let value = params[0].clone().expect("no probe token");
+                    // Outside a block the setting ends with the query.
+                    self.probe = self.block.map(|_| value.clone());
+                    rows(vec![one(&value)])
+                }
+                Step::Query { sql, .. } if is_probe_read(sql) => {
+                    match self.probe.clone().or_else(|| self.session_probe.clone()) {
+                        Some(value) => rows(vec![one(&value)]),
+                        None => closed(),
+                    }
+                }
+                Step::Query { sql, .. } if is_insert(sql) || is_delete(sql) => rows(vec![]),
+                other => panic!("unexpected step: {other:?}"),
+            }
+        }
+    }
+
+    fn unwrapped() -> MachineConfig {
+        MachineConfig {
+            use_transaction: false,
+            ..config()
+        }
+    }
+
+    /// A file the runner does not wrap, whose `BEGIN` has no `COMMIT`:
+    /// nothing after it may run inside that block (it would never commit),
+    /// so the block is rolled back before the lock is released, the
+    /// migration is not recorded, and the next one does not run.
+    #[test]
+    fn an_unwrapped_migration_left_open_is_rolled_back_and_fails() {
+        for (config, sql) in [
+            (unwrapped(), "BEGIN;\nCREATE TABLE a (id INT);\n"),
+            (
+                config(),
+                "-- no-transaction\nBEGIN;\nCREATE TABLE a (id INT);\n",
+            ),
+            // A block with no write in it is open all the same.
+            (unwrapped(), "BEGIN;\nSELECT 1;\n"),
+            // So is a block a savepoint is still open in.
+            (
+                unwrapped(),
+                "BEGIN;\nSAVEPOINT s;\nCREATE TABLE a (id INT);\n",
+            ),
+            // And one after a session value of the probe's setting.
+            (
+                unwrapped(),
+                "SET typedpg.transaction_probe = 'open';\nBEGIN;\nCREATE TABLE a (id INT);\n",
+            ),
+            // Only the chained block is open: the message must not claim
+            // what was committed before it is gone.
+            (
+                unwrapped(),
+                "BEGIN;\nCREATE TABLE a (id INT);\nCOMMIT AND CHAIN;\n",
+            ),
+        ] {
+            let mut session = Session::default();
+            let migrations = vec![
+                migration("0001_a", sql, None),
+                migration("0002_b", "CREATE TABLE b (id INT);", None),
+            ];
+            let (steps, result) = drive(input(Action::Up, migrations, config), |step| {
+                session.answer(step)
+            });
+
+            assert_eq!(
+                result,
+                Err(Failure::Message(left_transaction_open_message(
+                    "0001_a", false
+                ))),
+                "{sql}"
+            );
+            assert_eq!(executes(&steps, "ROLLBACK"), 1, "{sql}");
+            assert_eq!(session.unlocked_in_block, Some(false), "{sql}");
+            assert!(!queries(&steps).any(is_insert), "{sql}");
+            assert!(
+                !steps
+                    .iter()
+                    .any(|s| matches!(s, Step::Execute { sql } if sql.contains("TABLE b"))),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            left_transaction_open_message("0001_a", false),
+            "failed to apply migration 0001_a: 0001_a.sql left a transaction block open \
+             (a BEGIN with no COMMIT); the open transaction block was rolled back, statements \
+             committed before it (by an earlier COMMIT, or outside any block) stay applied, and \
+             the migration was not recorded. Add a COMMIT at the end of the transaction block."
+        );
+    }
+
+    /// An unwrapped file that closes its blocks applies as before: the
+    /// probe finds none open, then the migration is recorded.
+    #[test]
+    fn an_unwrapped_migration_that_commits_its_block_applies() {
+        for sql in [
+            "BEGIN;\nCREATE TABLE a (id INT);\nCOMMIT;\n",
+            "BEGIN;\nCREATE TABLE a (id INT);\nROLLBACK;\nCREATE TABLE a (id INT);\n",
+            "CREATE TABLE a (id INT);\n",
+            // The probe's setting at session level is not the token: outside
+            // a block, the probe reads it back and still sees no block.
+            "SET typedpg.transaction_probe = 'open';\nCREATE TABLE a (id INT);\n",
+            "BEGIN;\nSET typedpg.transaction_probe = 'open';\nCOMMIT;\n",
+        ] {
+            let mut session = Session::default();
+            let (steps, result) = drive(
+                input(
+                    Action::Up,
+                    vec![migration("0001_a", sql, None)],
+                    unwrapped(),
+                ),
+                |step| session.answer(step),
+            );
+            assert_eq!(
+                result,
+                Ok(Outcome::Applied(vec!["0001_a".to_string()])),
+                "{sql}"
+            );
+            assert!(
+                steps.iter().any(|s| matches!(
+                    s,
+                    Step::Query { sql, params }
+                        if is_probe_set(sql)
+                            && params == &[Some("typedpg-open:0001_a".to_string())]
+                )),
+                "{sql}"
+            );
+            let all: Vec<&str> = queries(&steps).collect();
+            let set = all.iter().position(|q| is_probe_set(q)).expect("no probe");
+            assert!(is_probe_read(all[set + 1]), "{sql}");
+            assert!(is_insert(all[set + 2]), "{sql}");
+            assert_eq!(executes(&steps, "ROLLBACK"), 0, "{sql}");
+            assert_eq!(session.unlocked_in_block, Some(false), "{sql}");
+        }
+    }
+
+    /// A statement failing inside a block the file opened leaves that block
+    /// aborted: the probe fails on it, and it is rolled back before the
+    /// lock's release — which would fail in it, leaving the lock held. The
+    /// statement's error is the one reported.
+    #[test]
+    fn a_failure_inside_an_unwrapped_block_rolls_it_back() {
+        let sql = "BEGIN;\nCREATE TABLE a (id INT);\nCREATE TABL bad;\nCOMMIT;\n";
+        let mut session = Session::default();
+        let (steps, result) = drive(
+            input(
+                Action::Up,
+                vec![migration("0001_a", sql, None)],
+                unwrapped(),
+            ),
+            |step| session.answer(step),
+        );
+        let Err(Failure::Message(message)) = result else {
+            panic!("expected a migration failure, got {result:?}");
+        };
+        assert!(
+            message.starts_with(
+                "failed to apply migration 0001_a (statement 3): ERROR: syntax error at or near \"TABL\""
+            ),
+            "{message}"
+        );
+        assert_eq!(executes(&steps, "ROLLBACK"), 1);
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, Step::Execute { sql } if sql.contains("COMMIT")))
+        );
+        assert_eq!(session.unlocked_in_block, Some(false));
+        assert!(!queries(&steps).any(is_insert));
+    }
+
+    /// A down file run without the runner's transaction is held to the same
+    /// rule: left open, it is rolled back and the record stays.
+    #[test]
+    fn an_unwrapped_down_left_open_is_rolled_back_and_fails() {
+        let mut session = Session {
+            applied: vec![vec![Some("0001_a".to_string()), None, None]],
+            ..Session::default()
+        };
+        let (steps, result) = drive(
+            input(
+                Action::Revert {
+                    name: None,
+                    force: false,
+                },
+                vec![migration(
+                    "0001_a",
+                    "CREATE TABLE a (id INT);",
+                    Some("-- no-transaction\nBEGIN;\nDROP TABLE a;\n"),
+                )],
+                config(),
+            ),
+            |step| session.answer(step),
+        );
+        assert_eq!(
+            result,
+            Err(Failure::Message(left_transaction_open_message(
+                "0001_a", true
+            )))
+        );
+        assert_eq!(
+            left_transaction_open_message("0001_a", true),
+            "failed to revert migration 0001_a: 0001_a.down.sql left a transaction block \
+             open (a BEGIN with no COMMIT); the open transaction block was rolled back, \
+             statements committed before it (by an earlier COMMIT, or outside any block) stay \
+             applied, and the migration is still recorded as applied. Add a COMMIT at the end \
+             of the transaction block."
+        );
+        assert_eq!(executes(&steps, "ROLLBACK"), 1);
+        assert_eq!(session.unlocked_in_block, Some(false));
+        assert!(!queries(&steps).any(is_delete));
     }
 
     /// A tracking table from before the hash columns: each stale row's text
@@ -2075,6 +2530,8 @@ mod tests {
                     rows(vec![vec![one("0001_a")[0].clone(), None, None]])
                 }
                 Step::Query { sql, .. } if is_delete(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_probe_set(sql) => rows(vec![one("open")]),
+                Step::Query { sql, .. } if is_probe_read(sql) => closed(),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),
                 other => panic!("unexpected step: {other:?}"),
             },

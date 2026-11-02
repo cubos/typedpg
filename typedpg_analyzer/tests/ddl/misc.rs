@@ -4010,6 +4010,68 @@ fn migrations_the_runner_runs_one_statement_at_a_time() {
 }
 
 #[test]
+fn an_unwrapped_migration_must_close_its_transaction_block() {
+    // The runner fails a migration it sends one statement at a time that
+    // ends inside a block it opened (nothing after it would commit), and
+    // rolls that block back: so does the analyzer, before deploy. Wrapped
+    // in the runner's transaction, the file's BEGIN is only a warning.
+    let runner = |use_transaction: bool, sql: &str| {
+        let mut db = PgCatalog::new().unwrap();
+        db.skip_pg_sanity();
+        db.set_migrations_use_transaction(use_transaction);
+        let result = db.apply_sql(sql);
+        (db, result)
+    };
+    let message = typedpg_core::migrations::machine::left_transaction_open_check_message();
+    for (use_transaction, sql) in [
+        (false, "BEGIN; CREATE TABLE u (a int);"),
+        (true, "-- no-transaction\nBEGIN;\nCREATE TABLE u (a int);"),
+        (false, "BEGIN; SELECT 1;"),
+        (
+            false,
+            "BEGIN; SAVEPOINT s; CREATE TABLE u (a int); RELEASE s;",
+        ),
+        (false, "BEGIN; COMMIT AND CHAIN; CREATE TABLE u (a int);"),
+        (
+            false,
+            "BEGIN; CREATE TABLE v (a int); COMMIT; START TRANSACTION; CREATE TABLE u (a int);",
+        ),
+    ] {
+        let (db, result) = runner(use_transaction, sql);
+        let Err(err) = result else {
+            panic!("{sql} left its block open and was accepted");
+        };
+        assert_eq!(err.to_string(), message, "{sql}");
+        assert!(db.resolve_table(None, "u").is_none(), "{sql}");
+    }
+    // What committed before the block stays; the block is rolled back.
+    let (db, result) = runner(
+        false,
+        "CREATE TABLE kept (a int); BEGIN; CREATE TABLE u (a int);",
+    );
+    assert!(result.is_err());
+    assert!(db.resolve_table(None, "kept").is_some());
+    assert!(db.resolve_table(None, "u").is_none());
+
+    for (use_transaction, sql) in [
+        (true, "BEGIN; CREATE TABLE u (a int);"),
+        (false, "BEGIN; CREATE TABLE u (a int); COMMIT;"),
+        (
+            false,
+            "BEGIN; CREATE TABLE w (a int); ROLLBACK; CREATE TABLE u (a int);",
+        ),
+        (
+            true,
+            "-- no-transaction\nBEGIN;\nCREATE TABLE u (a int);\nEND;",
+        ),
+    ] {
+        let (db, result) = runner(use_transaction, sql);
+        result.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert!(db.resolve_table(None, "u").is_some(), "{sql}");
+    }
+}
+
+#[test]
 fn rename_constraint_needs_a_free_name() {
     // PG 18 RenameConstraintById / RenameRelationInternal /
     // get_domain_constraint_oid.

@@ -178,11 +178,15 @@ fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFa
             DdlError::Parse(message)
         })?;
         let mut tx = txblock::Transaction::start(db, sql, &parsed.protobuf.stmts);
+        // The statement that opened the explicit block the next one runs
+        // in, when the file opened it.
+        let mut opened_by = None;
         for raw_stmt in &parsed.protobuf.stmts {
             let Some(stmt) = raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
                 continue;
             };
             crate::error::take_captured();
+            let explicit_before = tx.in_explicit_block();
             let result = tx
                 .check(db, stmt)
                 .and_then(|()| tx.check_setting(stmt))
@@ -199,8 +203,17 @@ fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFa
                 return Err(e);
             }
             tx.after(db, stmt);
+            if !tx.in_explicit_block() {
+                opened_by = None;
+            } else if !explicit_before || matches!(stmt, node::Node::TransactionStmt(t) if t.chain)
+            {
+                opened_by = Some(raw_stmt);
+            }
         }
-        tx.finish(db);
+        if let Err(e) = tx.finish(db) {
+            located = opened_by.map(|raw_stmt| left_open_location(sql, raw_stmt, &e));
+            return Err(e);
+        }
         Ok(())
     });
     result.map_err(|error| MigrationFailure {
@@ -215,6 +228,29 @@ fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFa
 pub(crate) struct MigrationFailure {
     pub error: DdlError,
     pub location: Option<Box<crate::error::CapturedDiagnostic>>,
+}
+
+/// Where a migration that ends inside a transaction block it opened is
+/// wrong: the `BEGIN` (`raw_stmt`) that opened it, with how to fix it.
+fn left_open_location(
+    sql: &str,
+    raw_stmt: &typedpg_pg_query::protobuf::RawStmt,
+    error: &DdlError,
+) -> crate::error::CapturedDiagnostic {
+    let (start, _) = statement_range(sql, raw_stmt);
+    let first = first_token_offset(sql, start);
+    let span = crate::error::SourceSpan::at_token(sql, first)
+        .unwrap_or_else(|| crate::error::SourceSpan::one_char_at(first));
+    crate::error::CapturedDiagnostic {
+        pg_message: error.to_string(),
+        primary: Some(crate::error::DiagnosticLabel::new(
+            span,
+            "this transaction block is never committed",
+        )),
+        secondaries: Vec::new(),
+        hint: Some(typedpg_core::migrations::machine::LEFT_TRANSACTION_OPEN_HINT.to_string()),
+        notes: Vec::new(),
+    }
 }
 
 /// Where `error`, raised by the statement `raw_stmt` of `sql`, is: the
