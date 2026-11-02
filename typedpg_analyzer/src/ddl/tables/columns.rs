@@ -1731,26 +1731,24 @@ pub(crate) fn alter_column_type(
                 .map_or("", |c| c.relname.as_str())
         )));
     }
-    if !rec.recursing && attr.attgenerated != Some(AttGenerated::Virtual) && stores_values {
-        match cd.raw_default.as_deref() {
-            Some(using) => {
-                check_using_expression(interp, relid, &attr, using, new_type_oid, new_typmod)?
-            }
-            None => {
-                if !crate::coerce::can_coerce(
-                    attr.atttypid,
-                    new_type_oid,
-                    crate::coerce::CoercionContext::Assignment,
-                    interp,
-                ) {
-                    return Err(DdlError::Parse(format!(
-                        "column \"{}\" cannot be cast automatically to type {}",
-                        cmd.name,
-                        format_type_for_message(interp, new_type_oid)
-                    )));
-                }
-            }
-        }
+    // A USING expression was checked by `prep_alter_column_using`, against
+    // the table as it was before the statement.
+    if !rec.recursing
+        && attr.attgenerated != Some(AttGenerated::Virtual)
+        && stores_values
+        && cd.raw_default.is_none()
+        && !crate::coerce::can_coerce(
+            attr.atttypid,
+            new_type_oid,
+            crate::coerce::CoercionContext::Assignment,
+            interp,
+        )
+    {
+        return Err(DdlError::Parse(format!(
+            "column \"{}\" cannot be cast automatically to type {}",
+            cmd.name,
+            format_type_for_message(interp, new_type_oid)
+        )));
     }
     // ATExecAlterColumnType: an existing default is re-coerced too.
     if let Some(&default_type) = interp.attr_default_types.get(&(relid, attr.attnum))
@@ -2064,6 +2062,50 @@ fn recheck_dependents_of_retyped_column(
         }
     }
     Ok(())
+}
+
+/// ATPrepAlterColumnType's transform of a USING expression. PG runs it in
+/// the prep phase, for every subcommand, before any of them executes: the
+/// expression reads the table as it was before the statement — a column
+/// another subcommand drops is still there, and one it retypes still has
+/// its old type. Called for each ALTER COLUMN TYPE before the passes run;
+/// what PG refuses ahead of the transform (a missing, inherited, generated
+/// or partition-key column, an unknown type, a relation storing no rows) is
+/// left to `alter_column_type` to report.
+pub(crate) fn prep_alter_column_using(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+) -> Result<(), DdlError> {
+    let Some(node::Node::ColumnDef(cd)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+        return Ok(());
+    };
+    let (Some(using), Some(tn)) = (cd.raw_default.as_deref(), cd.type_name.as_ref()) else {
+        return Ok(());
+    };
+    if !matches!(
+        interp.pg_class.get(&relid).map(|c| c.relkind),
+        Some(RelKind::Table | RelKind::Partitioned)
+    ) {
+        return Ok(());
+    }
+    let Some(attr) = interp.attribute_by_name(relid, &cmd.name).cloned() else {
+        return Ok(());
+    };
+    if attr.attnum <= 0
+        || attr.attgenerated.is_some()
+        || attr.attinhcount > 0
+        || in_partition_key(interp, relid, attr.attnum)
+    {
+        return Ok(());
+    }
+    let Ok(new_type_oid) = crate::ddl::functions::typename_type_id(interp, tn) else {
+        return Ok(());
+    };
+    let Ok(new_typmod) = crate::typmod::encode(interp, new_type_oid, tn) else {
+        return Ok(());
+    };
+    check_using_expression(interp, relid, &attr, using, new_type_oid, new_typmod)
 }
 
 /// The USING expression of ALTER COLUMN TYPE: evaluated over the table's

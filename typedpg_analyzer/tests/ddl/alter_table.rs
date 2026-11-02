@@ -813,6 +813,64 @@ fn alter_column_type_using_rejects_what_transform_expressions_forbid() {
 }
 
 #[test]
+fn alter_column_type_using_reads_the_table_before_the_statement() {
+    // ATPrepAlterColumnType transforms every USING in the prep phase, before
+    // any pass executes: a column the same statement drops is still there,
+    // and one it retypes still has its old type (f1 * 10 reads f1 as int).
+    let snap = build(&[
+        (
+            "0001.sql",
+            "CREATE TABLE another (f1 int, f2 text, f3 text);",
+        ),
+        (
+            "0002.sql",
+            "ALTER TABLE another ALTER f1 TYPE text USING f2 || ' and ' || f3,
+                                 ALTER f2 TYPE bigint USING f1 * 10, DROP COLUMN f3;",
+        ),
+    ]);
+    let table = snap.resolve_table(None, "another").unwrap();
+    let type_of = |name: &str| {
+        snap.attributes_of(table.oid)
+            .iter()
+            .find(|c| c.attname == name)
+            .map(|c| c.atttypid)
+    };
+    let oid_of = |name: &str| {
+        snap.resolve_type_by_name(Some("pg_catalog"), name)
+            .unwrap()
+            .oid
+    };
+    assert_eq!(type_of("f1"), Some(oid_of("text")));
+    assert_eq!(type_of("f2"), Some(oid_of("int8")));
+    assert_eq!(type_of("f3"), None);
+
+    build_db(&[(
+        "0001.sql",
+        // A USING reading only a column the statement drops, whatever order
+        // the subcommands are written in.
+        "CREATE TABLE d (a int, b text);
+         ALTER TABLE d DROP COLUMN b, ALTER a TYPE text USING b;
+         CREATE TABLE e (a int, b text);
+         ALTER TABLE e ALTER a TYPE text USING b, DROP COLUMN b;
+         -- A USING reading a column retyped by an earlier subcommand sees
+         -- its old type: length() takes text, not the new int.
+         CREATE TABLE r (a text, b text);
+         ALTER TABLE r ALTER a TYPE int USING length(a), ALTER b TYPE int USING length(a);",
+    )]);
+
+    // The old type is the only one: an expression valid only over the new
+    // type is refused.
+    let sql = "CREATE TABLE r (a text, b text);
+               ALTER TABLE r ALTER a TYPE int USING length(a), ALTER b TYPE int USING a + 1;";
+    let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+    assert!(
+        err.to_string()
+            .starts_with("operator does not exist: text + integer"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn a_column_may_not_hold_its_own_tables_row_type() {
     // CheckAttributeType within the relation's row type: directly, through
     // an array or through another composite that contains it.
