@@ -714,7 +714,10 @@ fn attach_or_clone(
         if !attachable {
             continue;
         }
-        // AttachPartitionForeignKey.
+        // AttachPartitionForeignKey: the key's own rows for the
+        // partitions of the table it references go (the parent's now
+        // stand for them); its partitions' clones stay.
+        drop_derived_rows_on(interp, candidate.oid, part);
         if let Some(row) = interp.pg_constraint.get_mut(&candidate.oid) {
             row.conislocal = false;
             row.coninhcount = 1;
@@ -800,22 +803,16 @@ pub(super) fn clone_parent_fks(
     clone_referenced_fks(interp, parent, part)
 }
 
-/// DetachPartitionFinalize: the partition's inherited foreign keys become
-/// its own, and the rows derived for it as a referenced partition go (with
-/// those derived from them).
-pub(super) fn detach_fks(interp: &mut PgCatalog, parent: PgClassOid, part: PgClassOid) {
-    let referenced: Vec<PgConstraintOid> = interp
-        .pg_constraint
-        .values()
-        .filter(|c| c.contype == ConType::ForeignKey && c.confrelid == Some(part))
-        .filter(|c| fk_parent(interp, c.oid).is_some_and(|p| p.confrelid == Some(parent)))
-        .map(|c| c.oid)
-        .collect();
-    for oid in referenced {
-        drop_fk_clones(interp, oid);
-        interp.pg_constraint.remove(&oid);
-        interp.fk_details.remove(&oid);
-    }
+/// DetachPartitionFinalize, once `part` has left `parent`: the
+/// partition's inherited foreign keys become its own (with rows for the
+/// partitions of a partitioned table they reference), and the rows derived
+/// for it as a referenced partition go (with those derived from them).
+pub(super) fn detach_fks(
+    interp: &mut PgCatalog,
+    parent: PgClassOid,
+    part: PgClassOid,
+) -> Result<(), DdlError> {
+    // The partition's keys inherited from the parent's become its own.
     let inherited: Vec<PgConstraintOid> = interp
         .pg_constraint
         .values()
@@ -823,15 +820,44 @@ pub(super) fn detach_fks(interp: &mut PgCatalog, parent: PgClassOid, part: PgCla
         .filter(|c| fk_parent(interp, c.oid).is_some_and(|p| p.conrelid == parent))
         .map(|c| c.oid)
         .collect();
-    for oid in inherited {
-        if let Some(row) = interp.pg_constraint.get_mut(&oid) {
+    for oid in &inherited {
+        if let Some(row) = interp.pg_constraint.get_mut(oid) {
             row.conislocal = true;
             row.coninhcount = 0;
         }
-        if let Some(d) = interp.fk_details.get_mut(&oid) {
+        if let Some(d) = interp.fk_details.get_mut(oid) {
             d.parent = None;
         }
     }
+    // A key now standalone that references a partitioned table gets its
+    // own rows for the referenced partitions (addFkRecurseReferenced) — the
+    // parent's stay with the parent; its own partitions' keys still derive
+    // from it, and need none. A self-reference of the parent included:
+    // the partition has left, so the rows are for the others.
+    for oid in inherited {
+        let Some(name) = interp.pg_constraint.get(&oid).map(|c| c.conname.clone()) else {
+            continue;
+        };
+        recurse_referenced(interp, oid, &name)?;
+    }
+    // Then every derived row referencing the partition goes, whatever its
+    // parent references (DetachPartitionFinalize drops each row with
+    // `confrelid` the partition and a `conparentid`), with those derived
+    // from it — after the new rows are named: their names stay taken
+    // until then.
+    let referenced: Vec<PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| c.contype == ConType::ForeignKey && c.confrelid == Some(part))
+        .filter(|c| fk_parent(interp, c.oid).is_some())
+        .map(|c| c.oid)
+        .collect();
+    for oid in referenced {
+        drop_fk_clones(interp, oid);
+        interp.pg_constraint.remove(&oid);
+        interp.fk_details.remove(&oid);
+    }
+    Ok(())
 }
 
 /// A partitioned table's foreign key goes with the clones in its
@@ -903,6 +929,18 @@ pub(crate) fn drop_fk_clones(interp: &mut PgCatalog, con: PgConstraintOid) {
         drop_fk_clones(interp, clone);
         interp.pg_constraint.remove(&clone);
         interp.fk_details.remove(&clone);
+    }
+}
+
+/// Drop the rows deriving from `con` (recursively) that are on relation
+/// `rel` itself: a key's rows for the referenced table's partitions.
+fn drop_derived_rows_on(interp: &mut PgCatalog, con: PgConstraintOid, rel: PgClassOid) {
+    for clone in fk_clones(interp, con) {
+        if interp.pg_constraint.get(&clone).map(|c| c.conrelid) == Some(rel) {
+            drop_fk_clones(interp, clone);
+            interp.pg_constraint.remove(&clone);
+            interp.fk_details.remove(&clone);
+        }
     }
 }
 
