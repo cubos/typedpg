@@ -496,8 +496,10 @@ pub(super) fn detach_partition(
     } else {
         None
     };
-    super::foreign_keys::detach_fks(interp, parent, part)?;
     remove_inheritance(interp, part, parent, "partition")?;
+    // DetachPartitionFinalize runs once the partition has left: the rows
+    // its keys get no longer include it as a referenced partition.
+    super::foreign_keys::detach_fks(interp, parent, part)?;
     super::partidx::detach_partition_indexes(interp, part);
     crate::ddl::triggers::drop_cloned_triggers(interp, part);
     interp.partition_bounds.remove(&part);

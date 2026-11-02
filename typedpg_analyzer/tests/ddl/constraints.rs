@@ -1640,3 +1640,139 @@ fn detached_partition_gets_its_own_referenced_partition_rows() {
     db.apply_sql("ALTER TABLE t2 DROP CONSTRAINT f;").unwrap();
     assert_eq!(rows(&db, "t2"), Vec::new());
 }
+
+/// Attaching a partition whose foreign key is adopted as a clone drops the
+/// key's own rows for the referenced partitions (AttachPartitionForeignKey);
+/// detaching one adds them back, except for a key referencing the table
+/// left (a self-reference of the parent) — as PG 18.6 does.
+#[test]
+fn partition_foreign_key_rows_follow_attach_and_detach() {
+    use typedpg_analyzer::ConType;
+    let rows = |db: &PgCatalog, table: &str| -> Vec<(String, String, bool, i16)> {
+        let mut rows: Vec<_> = db
+            .constraints_of_table(table)
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| {
+                let target = c
+                    .confrelid
+                    .and_then(|r| db.pg_class().get(&r))
+                    .map(|r| r.relname.clone())
+                    .unwrap_or_default();
+                (c.conname, target, c.conislocal, c.coninhcount)
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let row = |name: &str, target: &str, local: bool, inh: i16| {
+        (name.to_owned(), target.to_owned(), local, inh)
+    };
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE rr (id int PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE rr1 PARTITION OF rr FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (id);
+         CREATE TABLE rr11 PARTITION OF rr1 FOR VALUES FROM (0) TO (5);
+         CREATE TABLE rr12 PARTITION OF rr1 FOR VALUES FROM (5) TO (10);
+         -- Detached, then attached again.
+         CREATE TABLE t (a int) PARTITION BY RANGE (a);
+         CREATE TABLE t2 (a int);
+         ALTER TABLE t ATTACH PARTITION t2 FOR VALUES FROM (10) TO (20);
+         ALTER TABLE t ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES rr;
+         ALTER TABLE t DETACH PARTITION t2;
+         ALTER TABLE t ATTACH PARTITION t2 FOR VALUES FROM (10) TO (20);
+         -- Detached, then attached to another table.
+         CREATE TABLE w (a int) PARTITION BY RANGE (a);
+         CREATE TABLE w2 (a int);
+         ALTER TABLE w ATTACH PARTITION w2 FOR VALUES FROM (10) TO (20);
+         ALTER TABLE w ADD CONSTRAINT k FOREIGN KEY (a) REFERENCES rr;
+         ALTER TABLE w DETACH PARTITION w2;
+         CREATE TABLE x (a int) PARTITION BY RANGE (a);
+         ALTER TABLE x ADD CONSTRAINT kx FOREIGN KEY (a) REFERENCES rr;
+         ALTER TABLE x ATTACH PARTITION w2 FOR VALUES FROM (10) TO (20);
+         -- A table with a key of its own, attached.
+         CREATE TABLE y (a int) PARTITION BY RANGE (a);
+         ALTER TABLE y ADD CONSTRAINT ky FOREIGN KEY (a) REFERENCES rr;
+         CREATE TABLE y2 (a int, CONSTRAINT own FOREIGN KEY (a) REFERENCES rr);
+         ALTER TABLE y ATTACH PARTITION y2 FOR VALUES FROM (10) TO (20);
+         -- Attached to a table without a key: nothing adopted.
+         CREATE TABLE z (a int) PARTITION BY RANGE (a);
+         CREATE TABLE z2 (a int, CONSTRAINT zown FOREIGN KEY (a) REFERENCES rr);
+         ALTER TABLE z ATTACH PARTITION z2 FOR VALUES FROM (10) TO (20);
+         -- A self-referencing partitioned table.
+         CREATE TABLE s (id int PRIMARY KEY, p int) PARTITION BY RANGE (id);
+         CREATE TABLE s1 PARTITION OF s FOR VALUES FROM (0) TO (10);
+         CREATE TABLE s2 PARTITION OF s FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (id);
+         CREATE TABLE s21 PARTITION OF s2 FOR VALUES FROM (10) TO (15);
+         CREATE TABLE s22 PARTITION OF s2 FOR VALUES FROM (15) TO (20);
+         ALTER TABLE s ADD CONSTRAINT sf FOREIGN KEY (p) REFERENCES s;
+         ALTER TABLE s DETACH PARTITION s1;
+         ALTER TABLE s DETACH PARTITION s2;
+         -- A self-reference and a key to another table.
+         CREATE TABLE m (id int PRIMARY KEY, p int) PARTITION BY RANGE (id);
+         CREATE TABLE m1 PARTITION OF m FOR VALUES FROM (0) TO (10);
+         ALTER TABLE m ADD CONSTRAINT mf FOREIGN KEY (p) REFERENCES m;
+         ALTER TABLE m ADD CONSTRAINT mr FOREIGN KEY (p) REFERENCES rr;
+         ALTER TABLE m DETACH PARTITION m1;
+         -- Detached from the middle level of a self-reference.
+         CREATE TABLE q (id int PRIMARY KEY, p int) PARTITION BY RANGE (id);
+         CREATE TABLE q2 PARTITION OF q FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (id);
+         CREATE TABLE q21 PARTITION OF q2 FOR VALUES FROM (10) TO (15);
+         CREATE TABLE q22 PARTITION OF q2 FOR VALUES FROM (15) TO (20);
+         ALTER TABLE q ADD CONSTRAINT qf FOREIGN KEY (p) REFERENCES q;
+         ALTER TABLE q2 DETACH PARTITION q21;",
+    )]);
+    assert_eq!(rows(&db, "t2"), vec![row("f", "rr", false, 1)]);
+    assert_eq!(rows(&db, "w2"), vec![row("k", "rr", false, 1)]);
+    assert_eq!(rows(&db, "y2"), vec![row("own", "rr", false, 1)]);
+    assert_eq!(
+        rows(&db, "z2"),
+        vec![
+            row("zown", "rr", true, 0),
+            row("zown_1", "rr1", false, 1),
+            row("zown_2", "rr11", false, 1),
+            row("zown_3", "rr12", false, 1),
+        ]
+    );
+    assert_eq!(rows(&db, "s"), vec![row("sf", "s", true, 0)]);
+    assert_eq!(rows(&db, "s1"), vec![row("sf", "s", true, 0)]);
+    assert_eq!(rows(&db, "s2"), vec![row("sf", "s", true, 0)]);
+    assert_eq!(rows(&db, "s21"), vec![row("sf", "s", false, 1)]);
+    assert_eq!(
+        rows(&db, "m1"),
+        vec![
+            row("mf", "m", true, 0),
+            row("mr", "rr", true, 0),
+            row("mr_4", "rr1", false, 1),
+            row("mr_5", "rr11", false, 1),
+            row("mr_6", "rr12", false, 1),
+        ]
+    );
+    assert_eq!(
+        rows(&db, "q"),
+        vec![
+            row("qf", "q", true, 0),
+            row("qf_1", "q2", false, 1),
+            row("qf_3", "q22", false, 1),
+        ]
+    );
+    assert_eq!(
+        rows(&db, "q21"),
+        vec![
+            row("qf", "q", true, 0),
+            row("qf_4", "q2", false, 1),
+            row("qf_5", "q22", false, 1),
+        ]
+    );
+    // The dropped rows' names are free again.
+    db.apply_sql("ALTER TABLE t2 ADD CONSTRAINT f_5 CHECK (a > 0);")
+        .unwrap();
+    let err = db
+        .apply_sql("ALTER TABLE s1 DROP CONSTRAINT sf_1;")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.starts_with("constraint \"sf_1\" of relation \"s1\" does not exist"),
+        "{err}"
+    );
+}
