@@ -1331,11 +1331,11 @@ pub(crate) fn drop_constraint(
             })
             .copied()
             .filter(|i| interp.pg_index.contains_key(i));
-        let dependent: Option<String> = match index {
+        let dependent: Option<(String, PgClassOid)> = match index {
             Some(index) => super::foreign_keys::fks_relying_on(interp, relid, &target_set, index)
                 .first()
                 .and_then(|fk| interp.pg_constraint.get(fk))
-                .map(|c| c.conname.clone()),
+                .map(|c| (c.conname.clone(), c.conrelid)),
             None => interp.pg_constraint.values().find_map(|c| {
                 if matches!(c.contype, ConType::ForeignKey)
                     && c.confrelid == Some(relid)
@@ -1345,17 +1345,20 @@ pub(crate) fn drop_constraint(
                         .collect::<std::collections::BTreeSet<_>>()
                         == target_set
                 {
-                    Some(c.conname.clone())
+                    Some((c.conname.clone(), c.conrelid))
                 } else {
                     None
                 }
             }),
         };
-        if let Some(dep) = dependent {
+        if let Some((dep, dep_table)) = dependent {
             let relname = crate::ddl::depend::relation_display_name(interp, relid);
+            // The foreign key depends on the constraint's index
+            // (reportDependentObjects' DETAIL).
             return Err(DdlError::DependencyError(format!(
                 "cannot drop constraint {conname} on table {relname} because other objects \
-                 depend on it (foreign key constraint \"{dep}\" depends on this)"
+                 depend on it (constraint {dep} on table {} depends on index {conname})",
+                crate::ddl::depend::relation_display_name(interp, dep_table)
             )));
         }
     }

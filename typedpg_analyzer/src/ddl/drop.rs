@@ -337,19 +337,18 @@ fn drop_relation_oid(
             }
         }
     }
-    if !dependent_views.is_empty() && !cascade {
-        let view_names: Vec<String> = dependent_views
-            .iter()
-            .filter_map(|&v| {
-                let c = interp.pg_class.get(&v)?;
-                let nsname = interp.namespace_name(c.relnamespace).unwrap_or("?");
-                Some(QualifiedName::new(nsname, &c.relname).to_string())
-            })
-            .collect();
+    if let Some(&view) = dependent_views.first()
+        && !cascade
+    {
+        // reportDependentObjects' DETAIL: `view v depends on table t`.
+        let kind = match interp.pg_class.get(&view).map(|c| c.relkind) {
+            Some(RelKind::MaterializedView) => "materialized view",
+            _ => "view",
+        };
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {target} because other objects depend on it \
-             (view(s) {} depend on this)",
-            view_names.join(", "),
+            "cannot drop {target} because other objects depend on it ({kind} {} depends on \
+             {target})",
+            super::depend::relation_display_name(interp, view),
         )));
     }
 
@@ -402,15 +401,15 @@ fn drop_relation_oid(
             ))
         })
         .collect();
-    if !dependent_fks.is_empty() && !cascade {
-        let labels: Vec<String> = dependent_fks
-            .iter()
-            .map(|(c, owner)| format!("{} on {}", c.conname, owner))
-            .collect();
+    if let Some((fk, _)) = dependent_fks.first()
+        && !cascade
+    {
+        // `constraint c_x_fkey on table c depends on table t`.
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {target} because other objects depend on it \
-             (foreign key constraint(s) {} depend on this)",
-            labels.join(", "),
+            "cannot drop {target} because other objects depend on it (constraint {} on table {} \
+             depends on {target})",
+            fk.conname,
+            super::depend::relation_display_name(interp, fk.conrelid),
         )));
     }
 
@@ -969,19 +968,21 @@ fn drop_type(
     }
 
     if !deps.relations.is_empty() && !cascade {
-        let dep_names: Vec<String> = deps
-            .relations
-            .iter()
-            .filter_map(|&v| {
-                let c = interp.pg_class.get(&v)?;
-                let nsname = interp.namespace_name(c.relnamespace).unwrap_or("?");
-                Some(QualifiedName::new(nsname, &c.relname).to_string())
-            })
-            .collect();
+        let detail = column_dependent_detail(interp, &deps.relations, &deps.own_types)
+            .unwrap_or_else(|| {
+                let dep_names: Vec<String> = deps
+                    .relations
+                    .iter()
+                    .filter_map(|&v| {
+                        let c = interp.pg_class.get(&v)?;
+                        let nsname = interp.namespace_name(c.relnamespace).unwrap_or("?");
+                        Some(QualifiedName::new(nsname, &c.relname).to_string())
+                    })
+                    .collect();
+                format!("table(s) {} depend on this type", dep_names.join(", "))
+            });
         return Err(DdlError::DependencyError(format!(
-            "cannot drop type {name} because other objects depend on it \
-             (table(s) {} depend on this type)",
-            dep_names.join(", "),
+            "cannot drop type {name} because other objects depend on it ({detail})"
         )));
     }
 
@@ -989,11 +990,12 @@ fn drop_type(
     // typed literals). Those entries live in pg_depend with refclassid =
     // PG_TYPE_RELID, so a separate lookup catches them — block without
     // CASCADE and drop them transitively otherwise.
-    if !deps.views.is_empty() && !cascade {
-        let view_names = format_view_list(interp, &deps.views);
+    if let Some(&view) = deps.views.first()
+        && !cascade
+    {
         return Err(DdlError::DependencyError(format!(
-            "cannot drop type {name} because other objects depend on it \
-             (view(s) {view_names} depend on this type)",
+            "cannot drop type {name} because other objects depend on it ({})",
+            view_dependent_detail(interp, view, &format!("type {name}")),
         )));
     }
 
@@ -1019,6 +1021,45 @@ fn drop_type(
 }
 
 /// What depends on a type the way `drop_type` handles directly.
+/// reportDependentObjects' DETAIL line for the first of `relations` with a
+/// column of one of `types` (getObjectDescription: `column c of table t
+/// depends on type e[]`); the last such column, as PG lists it first.
+fn column_dependent_detail(
+    interp: &PgCatalog,
+    relations: &[PgClassOid],
+    types: &[PgTypeOid],
+) -> Option<String> {
+    relations.iter().find_map(|&relid| {
+        let attr = interp
+            .attributes_of(relid)
+            .iter()
+            .filter(|a| a.attnum > 0 && types.contains(&a.atttypid))
+            .max_by_key(|a| a.attnum)?;
+        let relation = super::depend::relation_display_name(interp, relid);
+        let type_name = format_type_for_message(interp, attr.atttypid);
+        let kind = match interp.pg_class.get(&relid).map(|c| c.relkind) {
+            Some(RelKind::CompositeType) => "composite type",
+            // A view's rule depends on the type, not its column.
+            Some(RelKind::View) => {
+                return Some(format!("view {relation} depends on type {type_name}"));
+            }
+            Some(RelKind::MaterializedView) => {
+                return Some(format!(
+                    "materialized view {relation} depends on type {type_name}"
+                ));
+            }
+            Some(RelKind::ForeignTable) => "foreign table",
+            _ => "table",
+        };
+        Some(format!(
+            "column {} of {kind} {} depends on type {}",
+            attr.attname,
+            super::depend::relation_display_name(interp, relid),
+            format_type_for_message(interp, attr.atttypid)
+        ))
+    })
+}
+
 struct TypeDependents {
     /// The type, its array type, and a range type's multirange type and
     /// its array.
@@ -1232,6 +1273,26 @@ fn drop_extension(
             .any(|(c, o)| *c == classid && o.get() == oid)
     };
     if !cascade {
+        // An extension that requires this one depends on it
+        // (CreateExtensionInternal records it).
+        let mut dependents: Vec<(crate::oid::PgExtensionOid, String)> = interp
+            .pg_extension
+            .values()
+            .filter(|e| {
+                super::extensions::requires(&e.extname).contains(&name.as_str())
+                    && !together_targets
+                        .iter()
+                        .any(|t| t.classid == PG_EXTENSION_RELID && t.objid.get() == e.oid.get())
+            })
+            .map(|e| (e.oid, e.extname.clone()))
+            .collect();
+        dependents.sort();
+        if let Some((_, dependent)) = dependents.first() {
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop {desc} because other objects depend on it (extension {dependent} \
+                 depends on extension {name})"
+            )));
+        }
         for &(classid, objid) in &owned {
             let Some(type_oid) = PgTypeOid::new(objid.get()).filter(|_| classid == PG_TYPE_RELID)
             else {
@@ -1249,8 +1310,17 @@ fn drop_extension(
                     .iter()
                     .any(|f| !is_member(PG_PROC_RELID, f.get()));
             if outside {
+                let outside_relations: Vec<PgClassOid> = deps
+                    .relations
+                    .iter()
+                    .copied()
+                    .filter(|r| !is_member(PG_CLASS_RELID, r.get()))
+                    .collect();
+                let detail = column_dependent_detail(interp, &outside_relations, &deps.own_types)
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
                 return Err(DdlError::DependencyError(format!(
-                    "cannot drop {desc} because other objects depend on it"
+                    "cannot drop {desc} because other objects depend on it{detail}"
                 )));
             }
         }
@@ -1405,16 +1475,18 @@ fn drop_function(
         }
         interp.event_triggers.retain(|(_, f)| *f != oid);
         let dependent_views = views::find_views_depending_on_function(interp, oid);
-        if !dependent_views.is_empty() && !cascade {
-            let view_names = format_view_list(interp, &dependent_views);
+        if let Some(&view) = dependent_views.first()
+            && !cascade
+        {
             let kind = if want_procedure {
                 "procedure"
             } else {
                 "function"
             };
+            let target = format!("{kind} {signature}");
             return Err(DdlError::DependencyError(format!(
-                "cannot drop {kind} {signature} because other objects depend on it \
-                 (view(s) {view_names} depend on this {kind})",
+                "cannot drop {target} because other objects depend on it ({})",
+                view_dependent_detail(interp, view, &target),
             )));
         }
         // What else depends on it (operators, casts, aggregates, types,
@@ -1433,16 +1505,17 @@ fn drop_function(
 
 /// Comma-join schema-qualified names of the given view OIDs, for error
 /// messages.
-fn format_view_list(snapshot: &PgCatalog, view_oids: &[PgClassOid]) -> String {
-    view_oids
-        .iter()
-        .filter_map(|&v| {
-            let c = snapshot.pg_class.get(&v)?;
-            let nsname = snapshot.namespace_name(c.relnamespace).unwrap_or("?");
-            Some(QualifiedName::new(nsname, &c.relname).to_string())
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+/// reportDependentObjects' DETAIL line for a view (its rule) depending on
+/// `target`: `view v depends on function f(integer)`.
+pub(crate) fn view_dependent_detail(interp: &PgCatalog, view: PgClassOid, target: &str) -> String {
+    let kind = match interp.pg_class.get(&view).map(|c| c.relkind) {
+        Some(RelKind::MaterializedView) => "materialized view",
+        _ => "view",
+    };
+    format!(
+        "{kind} {} depends on {target}",
+        super::depend::relation_display_name(interp, view)
+    )
 }
 
 /// DROP AGGREGATE.
@@ -1480,15 +1553,16 @@ fn drop_aggregate(
         let desc = super::depend::describe(interp, addr);
         super::depend::check_not_owned(interp, addr, &desc)?;
         let dependent_views = views::find_views_depending_on_function(interp, oid);
-        if !dependent_views.is_empty() && !cascade {
+        if let Some(&view) = dependent_views.first()
+            && !cascade
+        {
             // PG renders aggregate-with-deps errors using "function"
             // wording (aggregates live in `pg_proc` like ordinary functions
             // for dependency-tracking purposes).
-            let view_names = format_view_list(interp, &dependent_views);
+            let target = format!("function {name}({})", format_arg_oids(&arg_oids, interp));
             return Err(DdlError::DependencyError(format!(
-                "cannot drop function {name}({}) because other objects depend on it \
-                 (view(s) {view_names} depend on this aggregate)",
-                format_arg_oids(&arg_oids, interp),
+                "cannot drop {target} because other objects depend on it ({})",
+                view_dependent_detail(interp, view, &target),
             )));
         }
         // What else depends on it (operators, casts, aggregates, types,
@@ -1742,8 +1816,49 @@ fn drop_schema(
         || interp.statistics.iter().any(|s| s.namespace == nsoid);
 
     if has_objects && !cascade {
+        // The DETAIL names the oldest object in it (PG lists them in
+        // pg_depend's order, creation order for the analyzer's OIDs): a
+        // relation, a type (not an array or a row type) or a routine.
+        let relations = interp
+            .pg_class
+            .values()
+            .filter(|c| {
+                c.relnamespace == nsoid
+                    && !matches!(
+                        c.relkind,
+                        RelKind::Index | RelKind::PartitionedIndex | RelKind::CompositeType
+                    )
+            })
+            .map(|c| super::depend::ObjectAddress::relation(c.oid));
+        let types = interp
+            .pg_type
+            .values()
+            .filter(|t| {
+                t.typnamespace == nsoid
+                    && (t.typrelid.is_none()
+                        || interp.pg_class.get(&t.typrelid.unwrap()).map(|c| c.relkind)
+                            == Some(RelKind::CompositeType))
+                    && !interp.pg_type.values().any(|e| e.typarray == Some(t.oid))
+            })
+            .map(|t| super::depend::ObjectAddress::type_(t.oid));
+        let routines = interp
+            .pg_proc
+            .values()
+            .filter(|p| p.pronamespace == nsoid)
+            .map(|p| super::depend::ObjectAddress::proc(p.oid));
+        let detail = relations
+            .chain(types)
+            .chain(routines)
+            .min_by_key(|a| a.objid.get())
+            .map(|a| {
+                format!(
+                    " ({} depends on schema {name})",
+                    super::depend::describe(interp, a)
+                )
+            })
+            .unwrap_or_default();
         return Err(DdlError::DependencyError(format!(
-            "cannot drop schema {name} because other objects depend on it"
+            "cannot drop schema {name} because other objects depend on it{detail}"
         )));
     }
     // Objects outside it that refer to it (a `regnamespace` constant) need
@@ -1873,7 +1988,7 @@ fn drop_schema(
             interp
                 .pg_ts_objects
                 .iter()
-                .filter(|o| o.namespace == nsoid && (o.kind == "c" || o.kind == "d"))
+                .filter(|o| o.namespace == nsoid)
                 .map(|o| super::depend::NamedObject::TsObject {
                     kind: o.kind.clone(),
                     name: o.name.clone(),

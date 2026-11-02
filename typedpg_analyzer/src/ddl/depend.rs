@@ -73,8 +73,78 @@ pub(crate) fn drop_target_identity(
             let oid = interp.extension_by_name.get(&s.sval)?;
             Some((kind, oid.get()))
         }
+        (ObjectType::ObjectSchema, node::Node::String(s)) => {
+            let oid = interp.namespace_oid(&s.sval)?;
+            Some((kind, oid.get()))
+        }
+        (
+            ObjectType::ObjectTsconfiguration
+            | ObjectType::ObjectTsdictionary
+            | ObjectType::ObjectTsparser
+            | ObjectType::ObjectTstemplate,
+            node::Node::List(list),
+        ) => {
+            let ts_kind = match obj_type {
+                ObjectType::ObjectTsconfiguration => "c",
+                ObjectType::ObjectTsdictionary => "d",
+                ObjectType::ObjectTsparser => "p",
+                _ => "t",
+            };
+            let oid = super::text_search::drop_target_oid(interp, ts_kind, &list.items)?;
+            Some((kind, oid.get()))
+        }
+        (ObjectType::ObjectFdw, node::Node::String(s)) => {
+            let oid = interp.foreign_data.wrapper_oid(&s.sval)?;
+            Some((kind, oid.get()))
+        }
+        (ObjectType::ObjectAccessMethod, node::Node::String(s)) => {
+            let oid = interp.access_method_oids.get(&s.sval)?;
+            Some((kind, oid.get()))
+        }
+        // Objects the analyzer keeps by name only: an identity stable within
+        // the statement, which no address resolves (`of_drop_target`).
+        (ObjectType::ObjectForeignServer, node::Node::String(s)) => {
+            super::fdw::check_server(interp, &s.sval).ok()?;
+            Some((kind, name_identity(&s.sval)))
+        }
+        (ObjectType::ObjectPublication, node::Node::String(s)) => {
+            interp.publications.iter().find(|p| p.name == s.sval)?;
+            Some((kind, name_identity(&s.sval)))
+        }
+        (ObjectType::ObjectConversion | ObjectType::ObjectStatisticExt, node::Node::List(list)) => {
+            let names: Vec<&str> = list
+                .items
+                .iter()
+                .filter_map(super::util::node_string)
+                .collect();
+            let (schema, name) = match names.as_slice() {
+                [n] => (None, *n),
+                [s, n] => (Some(*s), *n),
+                _ => return None,
+            };
+            let namespace = interp.schemas_for_lookup(schema).into_iter().find(|ns| {
+                if obj_type == ObjectType::ObjectConversion {
+                    interp.conversions.iter().any(|(c, n)| c == name && n == ns)
+                } else {
+                    interp
+                        .statistics
+                        .iter()
+                        .any(|st| st.name == name && st.namespace == *ns)
+                }
+            })?;
+            Some((kind, name_identity(&format!("{}.{name}", namespace.get()))))
+        }
         _ => None,
     }
+}
+
+/// An identity for an object kept by name: FNV-1a over `name`, with the
+/// high bit set so it never collides with an OID the analyzer allocates.
+fn name_identity(name: &str) -> u32 {
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+    hash | 0x8000_0000
 }
 
 /// PG's message when a DROP naming several objects is blocked
@@ -85,9 +155,14 @@ pub(crate) fn multiple_targets_message(err: super::DdlError) -> super::DdlError 
             if msg.starts_with("cannot drop ")
                 && msg.contains(" because other objects depend on it") =>
         {
-            super::DdlError::DependencyError(
-                "cannot drop desired object(s) because other objects depend on them".into(),
-            )
+            // The DETAIL (what depends on what) stays.
+            let detail = msg
+                .split_once(" because other objects depend on it")
+                .map(|(_, rest)| rest)
+                .unwrap_or_default();
+            super::DdlError::DependencyError(format!(
+                "cannot drop desired object(s) because other objects depend on them{detail}"
+            ))
         }
         other => other,
     }
@@ -156,6 +231,13 @@ impl ObjectAddress {
             ObjectType::ObjectOperator => PG_OPERATOR_RELID,
             ObjectType::ObjectCollation => crate::pg_catalog::PG_COLLATION_RELID,
             ObjectType::ObjectExtension => crate::pg_catalog::PG_EXTENSION_RELID,
+            ObjectType::ObjectSchema => crate::pg_catalog::PG_NAMESPACE_RELID,
+            ObjectType::ObjectTsconfiguration => PG_TS_CONFIG_RELID,
+            ObjectType::ObjectTsdictionary => PG_TS_DICT_RELID,
+            ObjectType::ObjectTsparser => PG_TS_PARSER_RELID,
+            ObjectType::ObjectTstemplate => PG_TS_TEMPLATE_RELID,
+            ObjectType::ObjectFdw => PG_FOREIGN_DATA_WRAPPER_RELID,
+            ObjectType::ObjectAccessMethod => PG_AM_RELID,
             _ => return None,
         };
         Some(Self::new(classid, nz, 0))
@@ -1578,19 +1660,33 @@ fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
                 }
             }
         }
+        // Its hard members go with it.
         NamedObject::Opclass {
             name,
             namespace,
             method,
-        } => interp.pg_opclass.retain(|c| {
-            !(&c.opcname == name && c.opcnamespace == *namespace && &c.opcmethod == method)
-        }),
+        } => {
+            if let Some(addr) = named_address_of(interp, object) {
+                super::opfamily_members::forget_owner(interp, addr);
+            }
+            interp.pg_opclass.retain(|c| {
+                !(&c.opcname == name && c.opcnamespace == *namespace && &c.opcmethod == method)
+            });
+        }
         // Its operators go with it.
         NamedObject::Opfamily {
             name,
             namespace,
             method,
         } => {
+            if let Some(addr) = named_address_of(interp, object) {
+                super::opfamily_members::forget_owner(interp, addr);
+            }
+            if let Some(family) =
+                super::opfamily_members::FamilyKey::of(interp, name, *namespace, method)
+            {
+                super::opfamily_members::forget_family(interp, &family);
+            }
             interp.pg_opfamily.retain(|f| {
                 !(&f.opfname == name && f.opfnamespace == *namespace && &f.opfmethod == method)
             });

@@ -1276,14 +1276,6 @@ pub(crate) fn drop_column(
     // Find dependent views from pg_depend.
     let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
     if !dependent_views.is_empty() && !cascade {
-        let view_names: Vec<String> = dependent_views
-            .iter()
-            .filter_map(|&v| {
-                let c = interp.pg_class.get(&v)?;
-                let nsname = interp.namespace_name(c.relnamespace)?;
-                Some(QualifiedName::new(nsname, &c.relname).to_string())
-            })
-            .collect();
         // getObjectDescription: "column b of composite type comp" for an
         // attribute of a composite type.
         let column = crate::ddl::depend::describe(
@@ -1291,9 +1283,8 @@ pub(crate) fn drop_column(
             crate::ddl::depend::ObjectAddress::column(relid, target.attnum),
         );
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {column} because other objects depend on it \
-             (view(s) {} depend on this column)",
-            view_names.join(", "),
+            "cannot drop {column} because other objects depend on it ({})",
+            crate::ddl::drop::view_dependent_detail(interp, dependent_views[0], &column),
         )));
     }
 
@@ -1359,7 +1350,7 @@ pub(crate) fn drop_column(
         // *same* relation (PK, UNIQUE, CHECK, FK source side, indexes) is
         // dropped silently along with the column, no CASCADE needed. This
         // matches PG's `dropdb` cascade-only-external semantics.
-        let mut blockers: Vec<String> = Vec::new();
+        let mut blockers: Vec<(String, PgClassOid)> = Vec::new();
         for c in interp.pg_constraint.values() {
             // FKs in *other* tables referencing this column.
             if matches!(c.contype, ConType::ForeignKey)
@@ -1367,7 +1358,7 @@ pub(crate) fn drop_column(
                 && c.confkey.contains(&an)
                 && c.conrelid != relid
             {
-                blockers.push(c.conname.clone());
+                blockers.push((c.conname.clone(), c.conrelid));
             }
         }
         let dependent_indexes: Vec<PgClassOid> = interp
@@ -1376,13 +1367,17 @@ pub(crate) fn drop_column(
             .filter(|i| i.indrelid == relid && i.indkey.contains(&an))
             .map(|i| i.indexrelid)
             .collect();
-        if !blockers.is_empty() && !cascade {
+        if let Some((fk, fk_table)) = blockers.first()
+            && !cascade
+        {
             let relname = crate::ddl::depend::relation_display_name(interp, relid);
+            // `constraint c_x_fkey on table c depends on column x of table t`.
             return Err(DdlError::DependencyError(format!(
                 "cannot drop column {} of table {relname} because other objects depend on it \
-                 (constraint(s) {} depend on this column)",
+                 (constraint {fk} on table {} depends on column {} of table {relname})",
                 cmd.name,
-                blockers.join(", "),
+                crate::ddl::depend::relation_display_name(interp, *fk_table),
+                cmd.name,
             )));
         }
         // Drop everything local to this column on this relation —

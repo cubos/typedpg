@@ -1143,3 +1143,27 @@ fn a_renamed_exclusion_constraint_takes_its_index_along() {
         ("0005.sql", "CREATE INDEX t_a_excl ON t (a);"),
     ]);
 }
+
+#[test]
+fn a_users_dictionary_on_an_extension_template_blocks_its_drop() {
+    let setup = "CREATE EXTENSION dict_int;
+                 CREATE TEXT SEARCH DICTIONARY mydict (template = intdict_template);";
+    assert_drop_extension_blocked(
+        setup,
+        "dict_int",
+        "cannot drop extension dict_int because other objects depend on it (text search \
+         dictionary mydict depends on text search template intdict_template)",
+    );
+    build(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DROP EXTENSION dict_int CASCADE;"),
+        ("0003.sql", setup),
+    ]);
+    // A column of an extension's type, too.
+    assert_drop_extension_blocked(
+        "CREATE EXTENSION citext; CREATE TABLE t (c citext);",
+        "citext",
+        "cannot drop extension citext because other objects depend on it (column c of table t \
+         depends on type citext)",
+    );
+}

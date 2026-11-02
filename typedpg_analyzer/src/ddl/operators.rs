@@ -288,6 +288,9 @@ pub(crate) fn remove_operator(interp: &mut PgCatalog, oid: PgOperatorOid) {
         let _ = operator_upd(interp, oid, com, neg, true);
     }
     interp.remove_pg_operator(oid);
+    // Its operator families' entries go with it (a loose member
+    // automatically; a class's, with the class).
+    interp.pg_amop.retain(|o| o.amopopr != oid);
 }
 
 /// `get_other_operator`: the commutator / negator an operator names —

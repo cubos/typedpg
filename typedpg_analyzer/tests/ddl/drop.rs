@@ -147,7 +147,7 @@ fn drop_type_with_dependent_column_errors() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop type status because other objects depend on it (table(s) public.t depend on this type)"
+        "cannot drop type status because other objects depend on it (column s of table t depends on type status)"
     );
 }
 
@@ -2132,4 +2132,671 @@ fn a_domain_depends_on_what_its_default_uses() {
         err.to_string().starts_with("type \"d\" does not exist"),
         "{err}"
     );
+}
+
+/// `stmt` after `setup` fails, its message starting with `message` (PG's
+/// errmsg, then its DETAIL in parentheses).
+fn assert_drop_fails(setup: &str, stmt: &str, message: &str) {
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)])
+        .expect_err(&format!("{setup}\n{stmt}"));
+    assert!(
+        err.to_string().starts_with(message),
+        "{setup}\n{stmt}\n  got: {err}"
+    );
+}
+
+#[test]
+fn a_text_search_dictionary_depends_on_its_template() {
+    let template =
+        "CREATE TEXT SEARCH TEMPLATE mytmpl (lexize = dsimple_lexize, init = dsimple_init);
+                    CREATE TEXT SEARCH DICTIONARY d2 (template = mytmpl);";
+    assert_drop_fails(
+        template,
+        "DROP TEXT SEARCH TEMPLATE mytmpl;",
+        "cannot drop text search template mytmpl because other objects depend on it (text \
+         search dictionary d2 depends on text search template mytmpl)",
+    );
+    build(&[
+        ("0001.sql", template),
+        ("0002.sql", "DROP TEXT SEARCH TEMPLATE mytmpl CASCADE;"),
+        ("0003.sql", template),
+    ]);
+    // A configuration depends on the dictionaries it maps to.
+    assert_drop_fails(
+        "CREATE TEXT SEARCH DICTIONARY d3 (template = simple);
+         CREATE TEXT SEARCH CONFIGURATION c3 (copy = english);
+         ALTER TEXT SEARCH CONFIGURATION c3 ALTER MAPPING FOR asciiword WITH d3;",
+        "DROP TEXT SEARCH DICTIONARY d3;",
+        "cannot drop text search dictionary d3 because other objects depend on it (text search \
+         configuration c3 depends on text search dictionary d3)",
+    );
+}
+
+#[test]
+fn an_operator_class_holds_on_to_its_operators() {
+    let setup =
+        "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+                 CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+                 CREATE OPERATOR CLASS c FOR TYPE int USING hash AS
+                     OPERATOR 1 ===(int, int), FUNCTION 1 hashint4(int);";
+    assert_drop_fails(
+        setup,
+        "DROP OPERATOR ===(int, int);",
+        "cannot drop operator ===(integer,integer) because other objects depend on it (operator \
+         class c for access method hash depends on operator ===(integer,integer))",
+    );
+    assert_drop_fails(
+        setup,
+        "DROP FUNCTION f(int, int);",
+        "cannot drop function f(integer,integer) because other objects depend on it",
+    );
+    // CASCADE takes the class along; creating both again works.
+    build(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DROP OPERATOR ===(int, int) CASCADE;"),
+        (
+            "0003.sql",
+            "CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+             CREATE OPERATOR CLASS c FOR TYPE int USING hash AS
+                 OPERATOR 1 ===(int, int), FUNCTION 1 hashint4(int);",
+        ),
+    ]);
+    // A family's loose member goes with its operator, without CASCADE.
+    build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE OPERATOR FAMILY fam USING hash;
+         ALTER OPERATOR FAMILY fam USING hash ADD OPERATOR 1 ===(int, int);
+         DROP OPERATOR ===(int, int);
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         ALTER OPERATOR FAMILY fam USING hash ADD OPERATOR 1 ===(int, int);",
+    )]);
+}
+
+#[test]
+fn a_drop_naming_several_objects_reports_them_together() {
+    // RemoveRelations checks each name's relkind before any dependency.
+    for stmt in ["DROP VIEW v1, a;", "DROP VIEW a, v1;"] {
+        assert_drop_fails(
+            "CREATE TABLE a (x int); CREATE VIEW v1 AS SELECT 1;",
+            stmt,
+            "\"a\" is not a view",
+        );
+    }
+    assert_drop_fails(
+        "CREATE SCHEMA s1; CREATE SCHEMA s2; CREATE TABLE s1.t (x int);",
+        "DROP SCHEMA s1, s2;",
+        "cannot drop desired object(s) because other objects depend on them (table s1.t \
+         depends on schema s1)",
+    );
+    assert_drop_fails(
+        "CREATE SCHEMA s1; CREATE TABLE s1.t (x int);",
+        "DROP SCHEMA s1;",
+        "cannot drop schema s1 because other objects depend on it (table s1.t depends on schema \
+         s1)",
+    );
+    assert_drop_fails(
+        "CREATE TABLE a (x int); CREATE TABLE b (x int); CREATE VIEW v AS SELECT * FROM a;",
+        "DROP TABLE b, a;",
+        "cannot drop desired object(s) because other objects depend on them (view v depends on \
+         table a)",
+    );
+    assert_drop_fails(
+        "CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (c e); CREATE TYPE e2 AS ENUM ('b');",
+        "DROP TYPE e2, e;",
+        "cannot drop desired object(s) because other objects depend on them (column c of table \
+         t depends on type e)",
+    );
+}
+
+#[test]
+fn dependency_details_name_the_dependent_as_pg_does() {
+    assert_drop_fails(
+        "CREATE DOMAIN d AS int; CREATE TABLE t (c d);",
+        "DROP DOMAIN d;",
+        "cannot drop type d because other objects depend on it (column c of table t depends on \
+         type d)",
+    );
+    assert_drop_fails(
+        "CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (c e);",
+        "DROP TYPE e;",
+        "cannot drop type e because other objects depend on it (column c of table t depends on \
+         type e)",
+    );
+    for (key, constraint) in [("PRIMARY KEY", "t_pkey"), ("UNIQUE", "t_id_key")] {
+        assert_drop_fails(
+            &format!("CREATE TABLE t (id int {key}); CREATE TABLE c (x int REFERENCES t (id));"),
+            &format!("ALTER TABLE t DROP CONSTRAINT {constraint};"),
+            &format!(
+                "cannot drop constraint {constraint} on table t because other objects depend on \
+                 it (constraint c_x_fkey on table c depends on index {constraint})"
+            ),
+        );
+    }
+}
+
+// ── Operator family members (amadjustmembers) ───────────────────────────────
+
+const EQ_INT: &str =
+    "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+                      CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);";
+const EQ_BIGINT: &str =
+    "CREATE FUNCTION fb(bigint, bigint) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+                         CREATE OPERATOR === (leftarg = bigint, rightarg = bigint, function = fb);";
+
+#[test]
+fn a_same_type_member_is_tied_to_the_familys_class_for_its_type() {
+    // No bigint class in the family: the operator is a loose member, and
+    // goes with its operator.
+    for class in [
+        "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS
+             OPERATOR 3 ===(bigint, bigint), FUNCTION 1 btint4cmp(int, int);",
+        "CREATE OPERATOR CLASS oc FOR TYPE int USING hash AS
+             OPERATOR 1 ===(bigint, bigint), FUNCTION 1 hashint4(int);",
+    ] {
+        build(&[
+            ("0001.sql", EQ_BIGINT),
+            ("0002.sql", class),
+            ("0003.sql", "DROP OPERATOR ===(bigint, bigint);"),
+        ]);
+    }
+    // A bigint class in the family holds it.
+    assert_drop_fails(
+        &format!(
+            "{EQ_BIGINT}
+             CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS FUNCTION 1 btint4cmp(int, int);
+             CREATE OPERATOR CLASS oc8 FOR TYPE bigint USING btree FAMILY oc AS
+                 FUNCTION 1 btint8cmp(bigint, bigint);
+             CREATE OPERATOR CLASS oc2 FOR TYPE int USING btree FAMILY oc AS
+                 OPERATOR 3 ===(bigint, bigint);"
+        ),
+        "DROP OPERATOR ===(bigint, bigint);",
+        "cannot drop operator ===(bigint,bigint) because other objects depend on it (operator \
+         class oc8 for access method btree depends on operator ===(bigint,bigint))",
+    );
+}
+
+#[test]
+fn alter_operator_family_add_ties_a_member_to_the_class_for_its_type() {
+    let setup =
+        "CREATE FUNCTION lt(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 < $2';
+                 CREATE OPERATOR <<< (leftarg = int, rightarg = int, function = lt);
+                 CREATE OPERATOR FAMILY fam USING btree;
+                 CREATE OPERATOR CLASS oc FOR TYPE int USING btree FAMILY fam AS
+                     FUNCTION 1 btint4cmp(int, int);
+                 ALTER OPERATOR FAMILY fam USING btree ADD OPERATOR 1 <<<(int, int);";
+    assert_drop_fails(
+        setup,
+        "DROP OPERATOR <<<(int, int);",
+        "cannot drop operator <<<(integer,integer) because other objects depend on it (operator \
+         class oc for access method btree depends on operator <<<(integer,integer))",
+    );
+    // CASCADE takes the class; creating it again works.
+    build(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DROP OPERATOR <<<(int, int) CASCADE;"),
+        (
+            "0003.sql",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree FAMILY fam AS
+                 FUNCTION 1 btint4cmp(int, int);",
+        ),
+    ]);
+    // Without a class for int, the member is loose.
+    build(&[(
+        "0001.sql",
+        "CREATE FUNCTION lt(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 < $2';
+         CREATE OPERATOR <<< (leftarg = int, rightarg = int, function = lt);
+         CREATE OPERATOR FAMILY fam USING btree;
+         ALTER OPERATOR FAMILY fam USING btree ADD OPERATOR 1 <<<(int, int);
+         DROP OPERATOR <<<(int, int);",
+    )]);
+}
+
+#[test]
+fn a_member_tied_to_a_class_goes_only_with_it() {
+    for (am, class, stmt, member) in [
+        (
+            "btree",
+            "OPERATOR 3 ===(int, int), FUNCTION 1 btint4cmp(int, int)",
+            "DROP OPERATOR 3 (int, int)",
+            "operator 3 (integer, integer) of operator family fam for access method btree: \
+             ===(integer,integer)",
+        ),
+        (
+            "btree",
+            "OPERATOR 3 ===(int, int), FUNCTION 1 btint4cmp(int, int)",
+            "DROP FUNCTION 1 (int, int)",
+            "function 1 (integer, integer) of operator family fam for access method btree: \
+             btint4cmp(integer,integer)",
+        ),
+        (
+            "brin",
+            "OPERATOR 3 ===(int, int)",
+            "DROP OPERATOR 3 (int, int)",
+            "operator 3 (integer, integer) of operator family fam for access method brin: \
+             ===(integer,integer)",
+        ),
+        (
+            "bloom",
+            "OPERATOR 1 ===(int, int), FUNCTION 1 hashint4(int)",
+            "DROP OPERATOR 1 (int, int)",
+            "operator 1 (integer, integer) of operator family fam for access method bloom: \
+             ===(integer,integer)",
+        ),
+    ] {
+        let setup = format!(
+            "CREATE EXTENSION bloom; {EQ_INT}
+             CREATE OPERATOR FAMILY fam USING {am};
+             CREATE OPERATOR CLASS oc FOR TYPE int USING {am} FAMILY fam AS {class};"
+        );
+        let stmt = format!("ALTER OPERATOR FAMILY fam USING {am} {stmt};");
+        assert_drop_fails(
+            &setup,
+            &stmt,
+            &format!(
+                "cannot drop {member} because operator class oc for access method {am} requires \
+                 it (You can drop operator class oc for access method {am} instead.)"
+            ),
+        );
+        // ... and still holds its operator.
+        if stmt.contains("OPERATOR 3") || stmt.contains("OPERATOR 1") {
+            let err = try_apply(&[
+                ("0001.sql", &setup),
+                ("0002.sql", "DROP OPERATOR ===(int, int);"),
+            ])
+            .expect_err("DROP OPERATOR");
+            assert!(
+                err.to_string()
+                    .starts_with("cannot drop operator ===(integer,integer) because other"),
+                "{err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_operator_class_holds_on_to_its_required_support_functions() {
+    for (am, intype, items, function, proc_args) in [
+        (
+            "btree",
+            "int",
+            "OPERATOR 3 =(int, int), FUNCTION 1 mycmp(int, int)",
+            "CREATE FUNCTION mycmp(int, int) RETURNS int LANGUAGE sql IMMUTABLE AS 'select btint4cmp($1, $2)';",
+            "mycmp(int, int)",
+        ),
+        (
+            "hash",
+            "int",
+            "OPERATOR 1 =(int, int), FUNCTION 1 mycmp(int)",
+            "CREATE FUNCTION mycmp(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'select hashint4($1)';",
+            "mycmp(int)",
+        ),
+    ] {
+        let setup = format!(
+            "{function}
+             CREATE OPERATOR CLASS oc FOR TYPE {intype} USING {am} AS {items};"
+        );
+        let signature = proc_args.replace("int", "integer").replace(", ", ",");
+        assert_drop_fails(
+            &setup,
+            &format!("DROP FUNCTION {proc_args};"),
+            &format!(
+                "cannot drop function {signature} because other objects depend on it (operator \
+                 class oc for access method {am} depends on function {signature})"
+            ),
+        );
+    }
+    // CASCADE takes the class and its indexes.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE FUNCTION mycmp(int, int) RETURNS int LANGUAGE sql IMMUTABLE AS 'select btint4cmp($1, $2)';
+             CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS
+                 OPERATOR 3 =(int, int), FUNCTION 1 mycmp(int, int);
+             CREATE TABLE t (a int);
+             CREATE INDEX i ON t (a oc);",
+        ),
+        ("0002.sql", "DROP FUNCTION mycmp(int, int) CASCADE;"),
+        (
+            "0003.sql",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS
+                 OPERATOR 3 =(int, int), FUNCTION 1 btint4cmp(int, int);",
+        ),
+    ]);
+    assert!(db.resolve_table(None, "i").is_none());
+    // GiST's and GIN's required procs; GIN's comparison proc is optional.
+    let gist = "CREATE EXTENSION btree_gist;
+                CREATE FUNCTION myunion(internal, internal) RETURNS gbtreekey8 LANGUAGE c STRICT
+                    AS '$libdir/btree_gist', 'gbt_int4_union';
+                CREATE OPERATOR CLASS my_int4_ops FOR TYPE int4 USING gist AS
+                    OPERATOR 3 =,
+                    FUNCTION 1 gbt_int4_consistent(internal, int4, int2, oid, internal),
+                    FUNCTION 2 myunion(internal, internal),
+                    FUNCTION 5 gbt_int4_penalty(internal, internal, internal),
+                    FUNCTION 6 gbt_int4_picksplit(internal, internal),
+                    FUNCTION 7 gbt_int4_same(gbtreekey8, gbtreekey8, internal),
+                    STORAGE gbtreekey8;";
+    assert_drop_fails(
+        gist,
+        "DROP FUNCTION myunion(internal, internal);",
+        "cannot drop function myunion(internal,internal) because other objects depend on it \
+         (operator class my_int4_ops for access method gist depends on function \
+         myunion(internal,internal))",
+    );
+    let gin = |compare: &str, extract: &str| {
+        format!(
+            "CREATE EXTENSION btree_gin;
+             CREATE FUNCTION mycmp(int4, int4) RETURNS int LANGUAGE sql IMMUTABLE
+                 AS 'select btint4cmp($1, $2)';
+             CREATE FUNCTION myextract(int4, internal) RETURNS internal LANGUAGE c STRICT IMMUTABLE
+                 AS '$libdir/btree_gin', 'gin_extract_value_int4';
+             CREATE OPERATOR CLASS my_gin_ops FOR TYPE int4 USING gin AS
+                 OPERATOR 3 =,
+                 FUNCTION 1 {compare}(int4, int4),
+                 FUNCTION 2 {extract}(int4, internal),
+                 FUNCTION 3 gin_extract_query_int4(int4, internal, int2, internal, internal),
+                 FUNCTION 4 gin_btree_consistent(internal, int2, anyelement, int4, internal, internal);"
+        )
+    };
+    assert_drop_fails(
+        &gin("btint4cmp", "myextract"),
+        "DROP FUNCTION myextract(int4, internal);",
+        "cannot drop function myextract(integer,internal) because other objects depend on it \
+         (operator class my_gin_ops for access method gin depends on function \
+         myextract(integer,internal))",
+    );
+    build(&[
+        ("0001.sql", &gin("mycmp", "gin_extract_value_int4")),
+        ("0002.sql", "DROP FUNCTION mycmp(int4, int4);"),
+    ]);
+}
+
+#[test]
+fn drop_schema_cascade_takes_what_depends_on_its_text_search_objects() {
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         CREATE TEXT SEARCH TEMPLATE s.tm (lexize = dsimple_lexize, init = dsimple_init);
+         CREATE TEXT SEARCH DICTIONARY public.d1 (template = s.tm);
+         DROP SCHEMA s CASCADE;
+         CREATE TEXT SEARCH DICTIONARY public.d1 (template = simple);",
+    )]);
+}
+
+#[test]
+fn every_multi_target_drop_reports_the_objects_together() {
+    for (setup, stmt, detail) in [
+        (
+            "CREATE TEXT SEARCH TEMPLATE t1 (lexize = dsimple_lexize);
+             CREATE TEXT SEARCH TEMPLATE t2 (lexize = dsimple_lexize);
+             CREATE TEXT SEARCH DICTIONARY d (template = t2);",
+            "DROP TEXT SEARCH TEMPLATE t1, t2;",
+            " (text search dictionary d depends on text search template t2)",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY a (template = simple);
+             CREATE TEXT SEARCH DICTIONARY b (template = simple);
+             CREATE TEXT SEARCH CONFIGURATION c (copy = english);
+             ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword WITH b;",
+            "DROP TEXT SEARCH DICTIONARY a, b;",
+            " (text search configuration c depends on text search dictionary b)",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER w;
+             CREATE SERVER s FOREIGN DATA WRAPPER w;
+             CREATE SERVER s2 FOREIGN DATA WRAPPER w;
+             CREATE USER MAPPING FOR CURRENT_USER SERVER s;",
+            "DROP SERVER s2, s;",
+            "",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER w;
+             CREATE FOREIGN DATA WRAPPER w2;
+             CREATE SERVER s FOREIGN DATA WRAPPER w;",
+            "DROP FOREIGN DATA WRAPPER w2, w;",
+            "",
+        ),
+    ] {
+        assert_drop_fails(
+            setup,
+            stmt,
+            &format!("cannot drop desired object(s) because other objects depend on them{detail}"),
+        );
+    }
+}
+
+#[test]
+fn more_dependency_details_name_the_dependent_as_pg_does() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select $1';
+             CREATE VIEW v AS SELECT f(1);",
+            "DROP FUNCTION f(int);",
+            "cannot drop function f(integer) because other objects depend on it (view v depends \
+             on function f(integer))",
+        ),
+        (
+            "CREATE TABLE t (id int PRIMARY KEY, x int UNIQUE);
+             CREATE TABLE c (x int REFERENCES t (x));",
+            "ALTER TABLE t DROP COLUMN x;",
+            "cannot drop column x of table t because other objects depend on it (constraint \
+             c_x_fkey on table c depends on column x of table t)",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE FUNCTION s.f() RETURNS int LANGUAGE sql AS 'select 1';",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it (function s.f() depends on \
+             schema s)",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TYPE s.e AS ENUM ('a');
+             CREATE FUNCTION s.f() RETURNS int LANGUAGE sql AS 'select 1';
+             CREATE TABLE s.t (a int);",
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it (type s.e depends on schema \
+             s)",
+        ),
+        (
+            "CREATE EXTENSION earthdistance CASCADE;",
+            "DROP EXTENSION cube;",
+            "cannot drop extension cube because other objects depend on it (extension \
+             earthdistance depends on extension cube)",
+        ),
+    ] {
+        assert_drop_fails(setup, stmt, message);
+    }
+}
+
+const C4: &str =
+    "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+                  CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+                  CREATE FUNCTION c4(int4, int4) RETURNS int LANGUAGE sql IMMUTABLE
+                      AS 'select btint4cmp($1, $2)';
+                  CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree AS
+                      OPERATOR 3 ===, FUNCTION 1 c4(int4, int4);";
+
+#[test]
+fn a_renamed_or_moved_family_keeps_its_members() {
+    assert_drop_fails(
+        &format!("{C4} ALTER OPERATOR FAMILY oc USING btree RENAME TO fam2;"),
+        "ALTER OPERATOR FAMILY fam2 USING btree DROP OPERATOR 3 (int4, int4);",
+        "cannot drop operator 3 (integer, integer) of operator family fam2 for access method \
+         btree: ===(integer,integer) because operator class oc for access method btree requires \
+         it",
+    );
+    // A new family by the old name has no members.
+    build(&[
+        ("0001.sql", C4),
+        (
+            "0002.sql",
+            "ALTER OPERATOR FAMILY oc USING btree RENAME TO fam2;
+             CREATE OPERATOR FAMILY oc USING btree;
+             ALTER OPERATOR FAMILY oc USING btree ADD FUNCTION 1 c4(int4, int4);",
+        ),
+    ]);
+    assert_drop_fails(
+        &format!("CREATE SCHEMA s; {C4} ALTER OPERATOR FAMILY oc USING btree SET SCHEMA s;"),
+        "ALTER OPERATOR FAMILY s.oc USING btree DROP FUNCTION 1 (int4, int4);",
+        "cannot drop function 1 (integer, integer) of operator family s.oc for access method \
+         btree: c4(integer,integer) because operator class oc for access method btree requires it",
+    );
+    // Renaming the class leaves its family's name.
+    assert_drop_fails(
+        &format!("{C4} ALTER OPERATOR CLASS oc USING btree RENAME TO oc2;"),
+        "ALTER OPERATOR FAMILY oc USING btree DROP OPERATOR 3 (int4, int4);",
+        "cannot drop operator 3 (integer, integer) of operator family oc for access method \
+         btree: ===(integer,integer) because operator class oc2 for access method btree requires \
+         it",
+    );
+}
+
+#[test]
+fn a_member_is_tied_to_the_first_class_by_name_then_schema() {
+    assert_drop_fails(
+        "CREATE SCHEMA s;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE OPERATOR FAMILY fam USING btree;
+         CREATE OPERATOR CLASS z_oc FOR TYPE int4 USING btree FAMILY fam AS STORAGE int4;
+         CREATE OPERATOR CLASS s.a_oc FOR TYPE int4 USING btree FAMILY fam AS STORAGE int4;
+         ALTER OPERATOR FAMILY fam USING btree ADD OPERATOR 3 ===(int4, int4);",
+        "DROP OPERATOR ===(int4, int4);",
+        "cannot drop operator ===(integer,integer) because other objects depend on it (operator \
+         class s.a_oc for access method btree depends on operator ===(integer,integer))",
+    );
+}
+
+#[test]
+fn create_operator_class_refuses_a_support_function_the_family_has() {
+    assert_drop_fails(
+        "CREATE FUNCTION c4(int4, int4) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'select btint4cmp($1, $2)';
+         CREATE OPERATOR FAMILY fam USING btree;
+         ALTER OPERATOR FAMILY fam USING btree ADD FUNCTION 1 c4(int4, int4);",
+        "CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree FAMILY fam AS FUNCTION 1 c4(int4, int4);",
+        "duplicate key value violates unique constraint \"pg_amproc_fam_proc_index\"",
+    );
+}
+
+#[test]
+fn support_functions_are_checked_as_assign_proc_types_does() {
+    let class = |am: &str, items: &str| {
+        format!("CREATE OPERATOR CLASS oc FOR TYPE int4 USING {am} AS {items};")
+    };
+    for (setup, stmt, message) in [
+        (
+            "",
+            class("btree", "FUNCTION 7 btint4cmp(int4, int4)"),
+            "invalid function number 7, must be between 1 and 6",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 4 hashint4(int4)"),
+            "invalid function number 4, must be between 1 and 3",
+        ),
+        (
+            "",
+            class("gist", "FUNCTION 13 btint4cmp(int4, int4)"),
+            "invalid function number 13, must be between 1 and 12",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 0 nosuch(int4)"),
+            "invalid function number 0, must be between 1 and 6",
+        ),
+        (
+            "CREATE EXTENSION bloom;",
+            class("bloom", "FUNCTION 3 hashint4(int4)"),
+            "invalid function number 3, must be between 1 and 2",
+        ),
+        (
+            "",
+            class("brin", "FUNCTION 16 hashint4(int4)"),
+            "invalid function number 16, must be between 1 and 15",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 2 btint4cmp(int4, int4)"),
+            "ordering sort support functions must accept type \"internal\"",
+        ),
+        (
+            "CREATE FUNCTION ss(internal) RETURNS int LANGUAGE c AS '$libdir/plpgsql', 'plpgsql_call_handler';",
+            class("btree", "FUNCTION 2 ss(internal)"),
+            "ordering sort support functions must return void",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 6 btint4cmp(int4, int4)"),
+            "btree skip support functions must accept type \"internal\"",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 3 btint4cmp(int4, int4)"),
+            "ordering in_range functions must have five arguments",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 1 hashint4(int4)"),
+            "ordering comparison functions must have two arguments",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 1 int4eq(int4, int4)"),
+            "ordering comparison functions must return integer",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 4 (int4, int8) btequalimage(oid)"),
+            "ordering equal image functions must not be cross-type",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 5 btint4cmp(int4, int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 3 hashint4(int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("gist", "FUNCTION 10 btint4cmp(int4, int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("brin", "FUNCTION 5 hashint4(int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 1 btint4cmp(int4, int4)"),
+            "hash function 1 must have one argument",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 2 hashint4(int4)"),
+            "hash function 2 must have two arguments",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING gist;",
+            "ALTER OPERATOR FAMILY fam USING gist ADD FUNCTION 1 btint4cmp(int4, int4);".to_owned(),
+            "associated data types must be specified for index support function",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING gist;",
+            "ALTER OPERATOR FAMILY fam USING gist ADD FUNCTION 13 btint4cmp(int4, int4);"
+                .to_owned(),
+            "invalid function number 13, must be between 1 and 12",
+        ),
+    ] {
+        let setup = if setup.is_empty() { "SELECT 1;" } else { setup };
+        assert_drop_fails(setup, &stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree AS FUNCTION 4 btequalimage(oid);",
+    )]);
 }

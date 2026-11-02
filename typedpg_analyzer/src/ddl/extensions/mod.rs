@@ -357,7 +357,7 @@ fn relocatable(name: &str) -> bool {
 }
 
 /// The control files' `requires`: extensions that must be installed first.
-fn requires(name: &str) -> &'static [&'static str] {
+pub(crate) fn requires(name: &str) -> &'static [&'static str] {
     match name {
         "earthdistance" => &["cube"],
         "hstore_plperl" => &["hstore", "plperl"],

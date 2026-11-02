@@ -33,6 +33,7 @@ pub(crate) mod languages;
 pub(crate) mod maintenance;
 pub(crate) mod opclass;
 pub mod operators;
+pub(crate) mod opfamily_members;
 pub(crate) mod policies;
 pub(crate) mod prepared;
 pub(crate) mod publications;

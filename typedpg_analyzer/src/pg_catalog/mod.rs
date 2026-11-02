@@ -419,6 +419,9 @@ pub struct PgCatalog {
     /// The OIDs of the access methods migrations create (`pg_am.oid`), by
     /// name: the identity `pg_depend` rows name. The seeded ones are pinned.
     pub(crate) access_method_oids: HashMap<String, crate::oid::PgGenericOid>,
+    /// The members of operator families migrations create, with what
+    /// they depend on (see [`crate::ddl::opfamily_members`]).
+    pub(crate) family_members: Vec<crate::ddl::opfamily_members::FamilyMember>,
     /// The extension whose scripts are running.
     pub(crate) installing_extension: Option<String>,
     /// The index of each table's `REPLICA IDENTITY USING INDEX`
@@ -819,6 +822,7 @@ impl PgCatalog {
             sequence_params: Shared::default(),
             foreign_data: Default::default(),
             access_method_oids: HashMap::new(),
+            family_members: Vec::new(),
             installing_extension: None,
             replica_identity_indexes: Shared::default(),
             publications: Shared::default(),
@@ -1850,6 +1854,10 @@ impl PgCatalog {
     }
 
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
+        // A family's soft members go with their function (DEPENDENCY_AUTO).
+        let object = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
+        self.family_members
+            .retain(|m| !(m.is_func && m.object == object && m.hard_owner.is_none()));
         self.inline_sql_bodies.remove(&oid);
         self.procs_with_config.remove(&oid);
         self.inline_body_trust.remove(&oid);
@@ -1906,6 +1914,10 @@ impl PgCatalog {
     }
 
     pub(crate) fn remove_pg_operator(&mut self, oid: PgOperatorOid) -> Option<PgOperator> {
+        // A family's soft members go with their operator (DEPENDENCY_AUTO).
+        let object = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
+        self.family_members
+            .retain(|m| !(!m.is_func && m.object == object && m.hard_owner.is_none()));
         let row = self.pg_operator.remove(&oid)?;
         if let Some(v) = self
             .operator_by_qname
