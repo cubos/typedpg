@@ -45,7 +45,7 @@ pub(super) fn add_inherit(
             "cannot change inheritance of partitioned table".into(),
         ));
     }
-    let parent = super::super::util::lookup_relation(interp, rv)?.1;
+    let parent = super::super::util::lookup_table(interp, rv)?.1;
     let parent_class = interp.pg_class.get(&parent).cloned();
     match parent_class.as_ref().map(|c| c.relkind) {
         Some(RelKind::Table | RelKind::ForeignTable) => {}
@@ -335,7 +335,7 @@ pub(super) fn drop_inherit(
             "cannot change inheritance of a partition".into(),
         ));
     }
-    let parent = super::super::util::lookup_relation(interp, rv)?.1;
+    let parent = super::super::util::lookup_table(interp, rv)?.1;
     remove_inheritance(interp, relid, parent, "parent")
 }
 
@@ -353,7 +353,7 @@ pub(super) fn attach_partition(
     let Some(rv) = pc.name.as_ref() else {
         return Ok(());
     };
-    let attach = super::super::util::lookup_relation(interp, rv)?.1;
+    let attach = super::super::util::lookup_table(interp, rv)?.1;
     let attach_kind = interp.pg_class.get(&attach).map(|c| c.relkind);
     if !matches!(
         attach_kind,
@@ -483,7 +483,7 @@ pub(super) fn detach_partition(
             "cannot detach partitions concurrently when a default partition exists".into(),
         ));
     }
-    let part = super::super::util::lookup_relation(interp, rv)?.1;
+    let part = super::super::util::lookup_table(interp, rv)?.1;
     // DetachAddConstraintIfNeeded: a partition detached concurrently keeps
     // its partition constraint as a CHECK constraint.
     let partition_check = if pc.concurrent
@@ -588,7 +588,7 @@ pub(super) fn detach_partition_finalize(
     let Some(rv) = pc.name.as_ref() else {
         return Ok(());
     };
-    let part = super::super::util::lookup_relation(interp, rv)?.1;
+    let part = super::super::util::lookup_table(interp, rv)?.1;
     let part_name = relname_of(interp, part);
     if interp
         .pg_inherits

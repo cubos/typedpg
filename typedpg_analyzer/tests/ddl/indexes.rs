@@ -1860,3 +1860,521 @@ fn an_adopted_constraint_index_goes_with_its_parent_index() {
             .all(|c| c.conname != "k")
     );
 }
+
+/// Apply `sql` to `db`, expecting it to fail with a message starting with
+/// `message`.
+fn expect_rejected(db: &mut PgCatalog, sql: &str, message: &str) {
+    let err = db.apply_sql(sql).expect_err(sql);
+    assert!(
+        err.to_string().starts_with(message),
+        "{sql}\n  expected: {message}\n       got: {err}"
+    );
+}
+
+#[test]
+fn index_columns_are_renamed_with_alter_table_rename_column() {
+    // renameatt accepts an index (RangeVarCallbackForRenameAttribute):
+    // the index column is the index's own, which statements naming an
+    // index column see afterwards.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int PRIMARY KEY, b int, c int);
+         CREATE INDEX t_b ON t (b) INCLUDE (c);
+         CREATE INDEX t_e ON t ((a + b), (a - b), a, a);",
+    )]);
+    db.apply_sql("ALTER TABLE t_pkey RENAME COLUMN a TO y;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_pkey ALTER COLUMN a SET STATISTICS 10;",
+        "column \"a\" of relation \"t_pkey\" does not exist",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_pkey ALTER COLUMN y SET STATISTICS 10;",
+        "cannot alter statistics on non-expression column \"y\" of index \"t_pkey\"",
+    );
+    // An index column may collide with no other of the index, but takes a
+    // system column's name (an index has none).
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_pkey RENAME COLUMN y TO y;",
+        "column \"y\" of relation \"t_pkey\" already exists",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_pkey RENAME COLUMN a TO z;",
+        "column \"a\" does not exist",
+    );
+    db.apply_sql("ALTER TABLE IF EXISTS t_pkey RENAME COLUMN y TO ctid;")
+        .unwrap();
+    db.apply_sql("ALTER TABLE t_b RENAME COLUMN c TO z;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_b ALTER COLUMN z SET STATISTICS 5;",
+        "cannot alter statistics on included column \"z\" of index \"t_b\"",
+    );
+    expect_rejected(
+        &mut db,
+        "COMMENT ON COLUMN t_b.c IS 'x';",
+        "column \"c\" of relation \"t_b\" does not exist",
+    );
+    expect_rejected(
+        &mut db,
+        "COMMENT ON COLUMN t_b.z IS 'x';",
+        "cannot set comment on relation \"t_b\"",
+    );
+    // Expression columns: `expr`, `expr1`, then the table's names
+    // deduplicated (`a`, `a1`).
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_e RENAME COLUMN expr TO a1;",
+        "column \"a1\" of relation \"t_e\" already exists",
+    );
+    db.apply_sql(
+        "ALTER TABLE t_e RENAME COLUMN expr1 TO e;
+         ALTER INDEX t_e ALTER COLUMN e SET STATISTICS 5;
+         ALTER INDEX t_e ALTER COLUMN 2 SET STATISTICS 5;",
+    )
+    .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_e ALTER COLUMN expr1 SET STATISTICS 5;",
+        "column \"expr1\" of relation \"t_e\" does not exist",
+    );
+}
+
+#[test]
+fn renaming_a_table_column_keeps_its_index_columns_names() {
+    // PG never renames an index column after its table's — until ALTER
+    // COLUMN TYPE rebuilds the index from pg_get_indexdef, which names the
+    // table's columns as they are.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int, c int);
+         CREATE INDEX t_ab ON t (a, b);
+         CREATE INDEX t_inc ON t (a) INCLUDE (c);
+         CREATE INDEX t_pred ON t (a) WHERE c > 0;
+         CREATE INDEX t_other ON t (a);",
+    )]);
+    db.apply_sql("ALTER TABLE t RENAME COLUMN b TO bb; ALTER TABLE t RENAME COLUMN a TO aa;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_ab ALTER COLUMN bb SET STATISTICS 5;",
+        "column \"bb\" of relation \"t_ab\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE t_ab RENAME COLUMN a TO q;
+         ALTER TABLE t ALTER COLUMN bb TYPE bigint;",
+    )
+    .unwrap();
+    // Rebuilt: both of t_ab's columns named after the table's again.
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_ab RENAME COLUMN q TO z;",
+        "column \"q\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE t_ab RENAME COLUMN aa TO a2; ALTER TABLE t_ab RENAME COLUMN bb TO b2;",
+    )
+    .unwrap();
+    // An INCLUDE column or the predicate reading the column rebuilds the
+    // index too; an index not reading it keeps its names.
+    db.apply_sql("ALTER TABLE t RENAME COLUMN c TO cc; ALTER TABLE t ALTER COLUMN cc TYPE bigint;")
+        .unwrap();
+    db.apply_sql(
+        "ALTER TABLE t_inc RENAME COLUMN cc TO c3;
+         ALTER TABLE t_pred RENAME COLUMN aa TO a3;
+         ALTER TABLE t_other RENAME COLUMN a TO a4;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn partitioned_index_columns_are_renamed_in_every_partition() {
+    // A partitioned index's partitions are its inheritors: renameatt
+    // renames the column in each first, or refuses with ONLY. Index
+    // columns are never inherited (attinhcount 0), so a partition's may be
+    // renamed on its own.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX p_b ON p (b);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2) PARTITION BY RANGE (a);
+         CREATE TABLE p11 PARTITION OF p1 FOR VALUES FROM (1) TO (2);",
+    )]);
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE ONLY p_b RENAME COLUMN b TO z;",
+        "inherited column \"b\" must be renamed in child tables too",
+    );
+    db.apply_sql("ALTER TABLE p11_b_idx RENAME COLUMN b TO direct;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE p_b RENAME COLUMN b TO z;",
+        "column \"b\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE p11_b_idx RENAME COLUMN direct TO b;
+         ALTER TABLE p_b RENAME COLUMN b TO z;
+         ALTER TABLE p11_b_idx RENAME COLUMN z TO w;
+         CREATE TABLE p2 (a int, b int);
+         CREATE INDEX p2_b ON p2 (b);
+         ALTER TABLE p2_b RENAME COLUMN b TO qq;
+         ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (2) TO (3);",
+    )
+    .unwrap();
+    // The attached index keeps its own name.
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE p_b RENAME COLUMN z TO k;",
+        "column \"z\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE p2_b RENAME COLUMN qq TO z;
+         ALTER TABLE p11_b_idx RENAME COLUMN w TO z;
+         ALTER TABLE p_b RENAME COLUMN z TO k;
+         ALTER TABLE p1_b_idx RENAME COLUMN k TO j;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn renaming_columns_needs_a_relation_with_renameable_columns() {
+    // renameatt_check: not a sequence's or a TOAST table's columns, nor a
+    // system catalog's (or its index's).
+    let mut db = build_db(&[("0001.sql", "CREATE SEQUENCE s;")]);
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE s RENAME COLUMN last_value TO lv;",
+        "cannot rename columns of relation \"s\"",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pg_class RENAME COLUMN relname TO rn;",
+        "permission denied: \"pg_class\" is a system catalog",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pg_class_oid_index RENAME COLUMN oid TO x;",
+        "permission denied: \"pg_class_oid_index\" is a system catalog",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pg_toast.pg_toast_2620 RENAME COLUMN chunk_id TO x;",
+        "cannot rename columns of relation \"pg_toast_2620\"",
+    );
+}
+
+#[test]
+fn cloned_indexes_take_their_source_index_columns_names() {
+    // generateClonedIndexStmt copies the source index's column names
+    // (indexcolname): the clone keeps them, and ChooseIndexName names it
+    // after them — a partition's index (PARTITION OF, ATTACH PARTITION
+    // building one, a primary key or unique constraint's) and a LIKE ...
+    // INCLUDING INDEXES copy alike.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p ((a + b), b);
+         CREATE INDEX pi2 ON p (b, (a + b));
+         CREATE TABLE pp (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX ppi ON pp (b);
+         CREATE TABLE s (a int PRIMARY KEY, b int UNIQUE, c int);
+         CREATE INDEX si ON s (b) INCLUDE (c);
+         CREATE TABLE pa (a int PRIMARY KEY, b int) PARTITION BY RANGE (a);
+         CREATE TABLE pa1 PARTITION OF pa FOR VALUES FROM (1) TO (2);
+         CREATE TABLE pu (a int, b int, UNIQUE (b)) PARTITION BY LIST (b);",
+    )]);
+    db.apply_sql(
+        "ALTER TABLE pi RENAME COLUMN expr TO x;
+         ALTER TABLE p RENAME COLUMN b TO bb;
+         ALTER TABLE ppi RENAME COLUMN b TO bz;
+         ALTER TABLE si RENAME COLUMN c TO cz;
+         ALTER TABLE s_pkey RENAME COLUMN a TO ka;
+         ALTER TABLE s_b_key RENAME COLUMN b TO kb;
+         ALTER TABLE pa RENAME COLUMN a TO aa;
+         ALTER TABLE pu_b_key RENAME COLUMN b TO kb;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20);
+         ALTER TABLE p2_x_b_idx RENAME COLUMN x TO x2;
+         ALTER TABLE pi2 RENAME COLUMN b TO bz;
+         ALTER TABLE p2_b_expr_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    // ATTACH PARTITION building the partition's index.
+    db.apply_sql(
+        "CREATE TABLE c1 (a int, b int);
+         ALTER TABLE pp ATTACH PARTITION c1 FOR VALUES FROM (1) TO (2);
+         ALTER TABLE c1_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    // LIKE ... INCLUDING INDEXES: INCLUDE columns and constraints' indexes
+    // too (the constraint is named after the index columns).
+    db.apply_sql(
+        "CREATE TABLE s2 (LIKE s INCLUDING INDEXES);
+         ALTER TABLE s2_b_cz_idx RENAME COLUMN cz TO q;
+         ALTER TABLE s2_kb_key RENAME COLUMN kb TO q;
+         ALTER TABLE s2_pkey RENAME COLUMN ka TO q;",
+    )
+    .unwrap();
+    // A partition's primary key keeps the parent index's column name, not
+    // the renamed table column's; a unique constraint's clone is named
+    // after it.
+    db.apply_sql("CREATE TABLE pa2 PARTITION OF pa FOR VALUES FROM (2) TO (3);")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pa2_pkey RENAME COLUMN aa TO z;",
+        "column \"aa\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE pa2_pkey RENAME COLUMN a TO z;
+         CREATE TABLE pu1 PARTITION OF pu FOR VALUES IN (1);
+         ALTER TABLE pu1_kb_key RENAME COLUMN kb TO q;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn clones_copy_the_names_an_index_had_when_its_transaction_got_it() {
+    // generateClonedIndexStmt reads the source index's relcache entry. One
+    // created in the current transaction, or given a new relfilenode in it
+    // (TRUNCATE, REINDEX, CLUSTER, an ALTER COLUMN TYPE rebuild), keeps its
+    // entry, whose tuple descriptor isn't rebuilt: a rename in the same
+    // transaction doesn't reach the clone.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE pp (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX ppi ON pp (b);
+         ALTER TABLE ppi RENAME COLUMN b TO bz;
+         CREATE TABLE c1 (a int, b int);
+         ALTER TABLE pp ATTACH PARTITION c1 FOR VALUES FROM (1) TO (2);
+         ALTER TABLE c1_b_idx RENAME COLUMN b TO q;
+         CREATE TABLE t (a int, b int);
+         CREATE INDEX ti ON t (b);",
+    )]);
+    // In a later transaction the catalog's names are read again.
+    db.apply_sql(
+        "CREATE TABLE c2 (a int, b int);
+         ALTER TABLE pp ATTACH PARTITION c2 FOR VALUES FROM (2) TO (3);
+         ALTER TABLE c2_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "TRUNCATE t;
+         ALTER TABLE ti RENAME COLUMN b TO bz;
+         CREATE TABLE t2 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t2_b_idx RENAME COLUMN b TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "REINDEX INDEX ti;
+         ALTER TABLE ti RENAME COLUMN bz TO bq;
+         CREATE TABLE t3 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t3_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "ALTER TABLE t ALTER COLUMN b TYPE bigint;
+         ALTER TABLE ti RENAME COLUMN b TO bw;
+         CREATE TABLE t4 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t4_b_idx RENAME COLUMN b TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "ALTER TABLE ti RENAME COLUMN bw TO bv;
+         CREATE TABLE t5 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t5_bv_idx RENAME COLUMN bv TO q;",
+    )
+    .unwrap();
+}
+
+/// Whether `op`, run in the transaction that then renames index `ti`'s
+/// column `b` and copies the table, leaves the copy with the old name
+/// (`ti`'s relcache entry kept, its relfilenode new) or the new one.
+fn assert_keeps_relcache(op: &str, kept: bool) {
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int, c int, v varchar(10), n numeric(10, 2), x text,
+                         ts timestamp, i interval(3));
+         CREATE INDEX ti ON t (b);
+         CREATE DOMAIN dcheck AS int CHECK (VALUE > 0);",
+    )]);
+    let name = if kept { "b" } else { "bz" };
+    let sql = format!(
+        "{op};
+         ALTER TABLE ti RENAME COLUMN b TO bz;
+         CREATE TABLE q2 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE q2_{name}_idx RENAME COLUMN {name} TO q;"
+    );
+    if let Err(err) = db.apply_sql(&sql) {
+        panic!("{op}\n  rejected: {err}");
+    }
+}
+
+#[test]
+fn every_rewrite_of_a_table_keeps_its_indexes_relcache_entries() {
+    // finish_heap_swap rebuilds every index of a rewritten table, each in a
+    // new relfilenode, whose relcache entry then stays for the rest of the
+    // transaction: TRUNCATE, CLUSTER, REINDEX, and ALTER TABLE's rewrites —
+    // a column type change that isn't a relabeling (whatever column), a
+    // volatile or constrained-domain default, a stored generated column,
+    // SET LOGGED / UNLOGGED.
+    for op in [
+        "TRUNCATE t",
+        "REINDEX TABLE t",
+        "CLUSTER t USING ti",
+        "ALTER TABLE t ALTER COLUMN c TYPE bigint",
+        "ALTER TABLE t ALTER COLUMN b TYPE bigint",
+        "ALTER TABLE t ALTER COLUMN c TYPE int USING c + 0",
+        "ALTER TABLE t ALTER COLUMN v TYPE varchar(5)",
+        "ALTER TABLE t ALTER COLUMN x TYPE varchar(10)",
+        "ALTER TABLE t ALTER COLUMN n TYPE numeric(12, 3)",
+        "ALTER TABLE t ALTER COLUMN i TYPE interval day",
+        "ALTER TABLE t ALTER COLUMN c TYPE dcheck",
+        "ALTER TABLE t ADD COLUMN d float8 DEFAULT random()",
+        "ALTER TABLE t ADD COLUMN d int GENERATED ALWAYS AS (a + 1) STORED",
+        "ALTER TABLE t ADD COLUMN d dcheck",
+        "ALTER TABLE t ADD COLUMN d serial",
+        "ALTER TABLE t SET UNLOGGED",
+    ] {
+        assert_keeps_relcache(op, true);
+    }
+    // A relabeling, a missing value, a catalog-only change: no rewrite.
+    for op in [
+        "SELECT 1",
+        "ALTER TABLE t ALTER COLUMN v TYPE varchar(20)",
+        "ALTER TABLE t ALTER COLUMN v TYPE text",
+        "ALTER TABLE t ALTER COLUMN v TYPE text USING v::text",
+        "ALTER TABLE t ALTER COLUMN x TYPE varchar",
+        "ALTER TABLE t ALTER COLUMN n TYPE numeric(12, 2)",
+        "ALTER TABLE t ALTER COLUMN n TYPE numeric",
+        "ALTER TABLE t ALTER COLUMN i TYPE interval(6)",
+        "ALTER TABLE t ALTER COLUMN c TYPE int",
+        "ALTER TABLE t ALTER COLUMN c TYPE oid",
+        "ALTER TABLE t ADD COLUMN d int DEFAULT 5",
+        "ALTER TABLE t ADD COLUMN d int GENERATED ALWAYS AS (a + 1) VIRTUAL",
+        "ALTER TABLE t ALTER COLUMN b SET STORAGE PLAIN",
+        "ALTER TABLE t ADD CHECK (a > 0)",
+        "ALTER TABLE t SET LOGGED",
+    ] {
+        assert_keeps_relcache(op, false);
+    }
+}
+
+#[test]
+fn a_partitioned_index_has_no_relfilenode_to_renew() {
+    // TRUNCATE of a partitioned table renews its partitions' indexes, not
+    // its own (they have no storage); REFRESH MATERIALIZED VIEW renews a
+    // materialized view's.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p (b);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2);
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a, 2 AS b;
+         CREATE INDEX mvi ON mv (b);",
+    )]);
+    db.apply_sql(
+        "TRUNCATE p;
+         ALTER TABLE pi RENAME COLUMN b TO bz;
+         CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (2) TO (3);
+         ALTER TABLE p2_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "TRUNCATE p;
+         ALTER TABLE p1_b_idx RENAME COLUMN bz TO bq;
+         CREATE TABLE l (LIKE p1 INCLUDING INDEXES);
+         ALTER TABLE l_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "REFRESH MATERIALIZED VIEW mv;
+         ALTER TABLE mvi RENAME COLUMN b TO bz;
+         CREATE TABLE l2 (LIKE mv INCLUDING INDEXES);
+         ALTER TABLE l2_b_idx RENAME COLUMN b TO q;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn expression_index_columns_are_named_as_figure_index_colname_names_them() {
+    // FigureIndexColname: a function's name, a cast's argument's, `case`,
+    // `coalesce`, ...; `expr` for an operator — deduplicated with a
+    // counter. ChooseIndexName names the index after them, and a clone
+    // copies them.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE s (a text, b int);
+         CREATE INDEX e ON s (lower(a::text));
+         CREATE INDEX ON s (abs(b), lower(a), (a::varchar), (a || 'x'), (b + 1), lower(a),
+                            (CASE WHEN b > 0 THEN 1 END), coalesce(b, 0));
+         CREATE TABLE pe (a text, b int) PARTITION BY RANGE (b);
+         CREATE INDEX pei ON pe (abs(b), lower(a), (a::text), (a || 'x'));",
+    )]);
+    db.apply_sql(
+        "ALTER TABLE e RENAME COLUMN lower TO lw;
+         ALTER TABLE s_abs_lower_a_expr_expr1_lower1_case_coalesce_idx RENAME COLUMN expr1 TO e1;
+         ALTER TABLE s_abs_lower_a_expr_expr1_lower1_case_coalesce_idx RENAME COLUMN lower1 TO l1;
+         ALTER TABLE s_abs_lower_a_expr_expr1_lower1_case_coalesce_idx RENAME COLUMN \"case\" TO c;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "CREATE TABLE pe1 PARTITION OF pe FOR VALUES FROM (1) TO (2);
+         ALTER TABLE pe1_abs_lower_a_expr_idx RENAME COLUMN expr TO x;
+         ALTER TABLE pei RENAME COLUMN lower TO lw;
+         CREATE TABLE l (LIKE pe INCLUDING INDEXES);
+         ALTER TABLE l_abs_lw_a_expr_idx RENAME COLUMN lw TO q;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn reindex_and_cluster_of_partitioned_relations_refuse_a_transaction_block() {
+    // ReindexPartitions and cluster() process each partition in a
+    // transaction of their own (PreventInTransactionBlock), once the
+    // relation is found. (A failed explicit block would leave the mirror's
+    // session aborted, so the refusals are tried in implicit ones.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p (b);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2);",
+    )]);
+    for (sql, message) in [
+        (
+            "SELECT 1; REINDEX TABLE p;",
+            "REINDEX TABLE cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; REINDEX INDEX pi;",
+            "REINDEX INDEX cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; CLUSTER p USING pi;",
+            "CLUSTER cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; REINDEX TABLE nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        ("SELECT 1; REINDEX INDEX p;", "\"p\" is not an index"),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+    db.apply_sql("BEGIN; REINDEX TABLE p1; REINDEX INDEX p1_b_idx; COMMIT;")
+        .unwrap();
+    db.apply_sql("REINDEX TABLE p;").unwrap();
+    db.apply_sql("REINDEX INDEX pi;").unwrap();
+}

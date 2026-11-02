@@ -306,6 +306,9 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     };
 
     renameatt_check(interp, relid)?;
+    if interp.pg_index.contains_key(&relid) {
+        return rename_index_column(interp, relid, &stmt.subname, &stmt.newname, rv.inh, true);
+    }
     let cascade = stmt.behavior == typedpg_pg_query::protobuf::DropBehavior::DropCascade as i32;
     let typed = crate::ddl::tables::typed::typed_table_dependents(interp, relid, cascade)?;
     rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, 0)?;
@@ -380,6 +383,8 @@ fn rename_column_in(
             "column name \"{new}\" conflicts with a system column name"
         )));
     }
+    // The table's indexes keep their columns' names.
+    super::indexes::freeze_index_attnames(interp, relid);
     // The expressions kept as written read the column by its new name
     // (PG's read it by attnum).
     super::stored_exprs::rename_column(interp, relid, old, new);
@@ -391,6 +396,70 @@ fn rename_column_in(
     views::rewrite_views_on_column_rename(interp, relid, old, new);
     Ok(())
 }
+/// `renameatt_internal` on an index: the column is the index's own (a
+/// table column renamed later keeps it). A partitioned index's partitions
+/// are its inheritors — each renamed first, with recursion; without it,
+/// none may exist. Index columns are never inherited (`attinhcount` 0) and
+/// have no system columns to collide with.
+fn rename_index_column(
+    interp: &mut PgCatalog,
+    index: PgClassOid,
+    old: &str,
+    new: &str,
+    recurse: bool,
+    top: bool,
+) -> Result<(), DdlError> {
+    let children_of = |interp: &PgCatalog, parent: PgClassOid| {
+        let mut children: Vec<PgClassOid> = interp
+            .index_parents
+            .iter()
+            .filter(|&(_, &p)| p == parent)
+            .map(|(&child, _)| child)
+            .collect();
+        children.sort();
+        children
+    };
+    if recurse {
+        // find_all_inheritors: every descendant, level by level.
+        let mut tree = vec![index];
+        let mut i = 0;
+        while i < tree.len() {
+            for child in children_of(interp, tree[i]) {
+                if !tree.contains(&child) {
+                    tree.push(child);
+                }
+            }
+            i += 1;
+        }
+        for &child in &tree[1..] {
+            rename_index_column(interp, child, old, new, false, false)?;
+        }
+    } else if top && !children_of(interp, index).is_empty() {
+        return Err(DdlError::Parse(format!(
+            "inherited column \"{old}\" must be renamed in child tables too"
+        )));
+    }
+    let mut names = super::indexes::index_attnames(interp, index);
+    let Some(position) = names.iter().position(|n| n == old) else {
+        return Err(DdlError::Parse(format!("column \"{old}\" does not exist")));
+    };
+    // check_for_column_name_collision.
+    if names.iter().any(|n| n == new) {
+        let relname = interp
+            .pg_class
+            .get(&index)
+            .map(|c| c.relname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::DuplicateObject(format!(
+            "column \"{new}\" of relation \"{relname}\" already exists"
+        )));
+    }
+    super::indexes::pin_relcache_index_attnames(interp, index);
+    names[position] = new.to_owned();
+    interp.index_attnames.insert(index, names);
+    Ok(())
+}
+
 fn rename_function_like(
     interp: &mut PgCatalog,
     stmt: &RenameStmt,

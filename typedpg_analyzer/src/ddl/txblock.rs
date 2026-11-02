@@ -86,6 +86,12 @@ impl Transaction {
         }
     }
 
+    /// Whether the next statement runs inside a transaction block
+    /// (PreventInTransactionBlock's test).
+    pub(crate) fn in_block(&self) -> bool {
+        self.block != Block::Started
+    }
+
     /// The rules the transaction state imposes on `stmt`, before it runs.
     pub(crate) fn check(&self, db: &PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
         if self.block != Block::Started

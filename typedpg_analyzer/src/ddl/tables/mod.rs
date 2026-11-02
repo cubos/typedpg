@@ -1604,6 +1604,8 @@ fn set_persistence(
     } else {
         interp.relpersistence.insert(relid, 'u');
     }
+    // ATRewriteTables: a new persistence is a rewrite.
+    crate::ddl::indexes::table_rewritten(interp, relid);
     Ok(())
 }
 

@@ -401,3 +401,317 @@ fn drop_trigger_if_exists_skips_a_missing_table() {
          DROP POLICY IF EXISTS p ON nosuch;",
     )]);
 }
+
+#[test]
+fn alter_trigger_depends_on_extension_looks_the_trigger_up() {
+    // ExecAlterObjectDependsStmt: get_object_address_rv opens the table
+    // (table_openrv) and finds the trigger, then the extension is looked
+    // up. The same for a routine, an index and a materialized view.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE u (x int);
+         CREATE TABLE t (a int);
+         CREATE INDEX t_a ON t (a);
+         CREATE TYPE ct AS (a int);
+         CREATE VIEW v AS SELECT 1 AS x;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TRIGGER tg BEFORE INSERT ON u FOR EACH ROW EXECUTE FUNCTION trf();",
+    )]);
+    db.apply_sql(
+        "ALTER TRIGGER tg ON u DEPENDS ON EXTENSION plpgsql;
+         ALTER TRIGGER tg ON u DEPENDS ON EXTENSION plpgsql;
+         ALTER TRIGGER tg ON u NO DEPENDS ON EXTENSION plpgsql;
+         ALTER TRIGGER tg ON u NO DEPENDS ON EXTENSION plpgsql;
+         ALTER FUNCTION trf() DEPENDS ON EXTENSION plpgsql;
+         ALTER ROUTINE trf() NO DEPENDS ON EXTENSION plpgsql;
+         ALTER INDEX t_a DEPENDS ON EXTENSION plpgsql;
+         ALTER MATERIALIZED VIEW mv DEPENDS ON EXTENSION plpgsql;",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "ALTER TRIGGER nosuch ON u DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"nosuch\" for table \"u\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER nosuch ON u NO DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"nosuch\" for table \"u\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER nosuch ON u DEPENDS ON EXTENSION nosuch;",
+            "trigger \"nosuch\" for table \"u\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON u DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON u NO DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON nosuch DEPENDS ON EXTENSION nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON nosch.u DEPENDS ON EXTENSION plpgsql;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON t_a DEPENDS ON EXTENSION plpgsql;",
+            "cannot open relation \"t_a\" (This operation is not supported for indexes.)",
+        ),
+        (
+            "ALTER TRIGGER tg ON ct DEPENDS ON EXTENSION plpgsql;",
+            "cannot open relation \"ct\"",
+        ),
+        (
+            "ALTER TRIGGER tg ON v DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"tg\" for table \"v\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON pg_class DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"tg\" for table \"pg_class\" does not exist",
+        ),
+        (
+            "ALTER FUNCTION nosuch() DEPENDS ON EXTENSION nosuch;",
+            "function nosuch() does not exist",
+        ),
+        (
+            "ALTER FUNCTION trf() DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER PROCEDURE trf() DEPENDS ON EXTENSION plpgsql;",
+            "trf() is not a procedure",
+        ),
+        (
+            "ALTER INDEX nosuch DEPENDS ON EXTENSION nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER INDEX u DEPENDS ON EXTENSION plpgsql;",
+            "\"u\" is not an index",
+        ),
+        (
+            "ALTER INDEX t_a DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER MATERIALIZED VIEW t_a DEPENDS ON EXTENSION plpgsql;",
+            "\"t_a\" is not a materialized view",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}
+
+#[test]
+fn drop_extension_takes_along_what_depends_on_it_automatically() {
+    // DEPENDENCY_AUTO_EXTENSION: DROP EXTENSION drops the object without
+    // CASCADE; what depends on the object normally still needs it, and a
+    // partition's trigger clone goes only with its parent's. (CREATE
+    // EXTENSION leaves the pg_sanity mirror out, so the expectations here
+    // were checked by hand against PostgreSQL 18.6.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE TABLE u (x int NOT NULL);
+         CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql
+             AS 'BEGIN NEW.x := 1; RETURN NEW; END';
+         CREATE TRIGGER tg BEFORE INSERT ON u FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE VIEW vv AS SELECT * FROM mv;
+         CREATE TABLE p (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2);
+         CREATE TRIGGER ptg BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE INDEX ui ON u (x);
+         ALTER TABLE u ADD CONSTRAINT upk PRIMARY KEY (x);",
+    )]);
+    let blocked = "cannot drop extension hstore because other objects depend on it";
+    let expect = |db: &mut PgCatalog, sql: &str, message: &str| {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    };
+    db.apply_sql("ALTER MATERIALIZED VIEW mv DEPENDS ON EXTENSION hstore;")
+        .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", blocked);
+    db.apply_sql(
+        "DROP VIEW vv;
+         ALTER FUNCTION trf() DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", blocked);
+    db.apply_sql(
+        "ALTER TRIGGER tg ON u DEPENDS ON EXTENSION hstore;
+         ALTER FUNCTION trf() NO DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER ptg ON p1 DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop trigger ptg on table p1 because trigger ptg on table p requires it",
+    );
+    db.apply_sql(
+        "ALTER TRIGGER ptg ON p1 NO DEPENDS ON EXTENSION hstore;
+         ALTER INDEX upk DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop extension hstore because other objects depend on it (constraint upk on \
+         table u depends on extension hstore)",
+    );
+    db.apply_sql(
+        "ALTER INDEX upk NO DEPENDS ON EXTENSION hstore;
+         ALTER INDEX ui DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER ptg ON p DEPENDS ON EXTENSION hstore;
+         DROP EXTENSION hstore;
+         CREATE TRIGGER tg BEFORE INSERT ON u FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE TRIGGER ptg BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE INDEX ui ON u (x);",
+    )
+    .unwrap();
+    // CASCADE takes along what depends on them.
+    db.apply_sql(
+        "CREATE EXTENSION hstore;
+         CREATE FUNCTION f2() RETURNS int LANGUAGE sql AS 'SELECT 1';
+         ALTER FUNCTION f2() DEPENDS ON EXTENSION hstore;
+         CREATE VIEW v2 AS SELECT f2();",
+    )
+    .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", blocked);
+    db.apply_sql("DROP EXTENSION hstore CASCADE; CREATE VIEW v2 AS SELECT 1;")
+        .unwrap();
+}
+
+#[test]
+fn drop_extension_and_the_marks_of_rebuilt_and_partition_objects() {
+    // A partition's index attached to its parent's goes only with it, like
+    // a trigger clone: marking it alone blocks DROP EXTENSION, CASCADE or
+    // not. A clone may be marked without its parent. An index ALTER COLUMN
+    // TYPE rebuilds is a new object, without the old one's mark; REINDEX
+    // keeps it. (CREATE EXTENSION leaves the pg_sanity mirror out, so the
+    // expectations here were checked by hand against PostgreSQL 18.6.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TABLE q (a int NOT NULL, b int) PARTITION BY RANGE (a);
+         CREATE TABLE q1 PARTITION OF q FOR VALUES FROM (1) TO (2);
+         CREATE INDEX pj ON q (a);
+         CREATE TRIGGER qtg BEFORE INSERT ON q FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE TABLE t (a int, b int);
+         CREATE INDEX i ON t (a);
+         CREATE INDEX k ON t (b) WHERE a > 0;
+         CREATE INDEX j ON t (b);",
+    )]);
+    let expect = |db: &mut PgCatalog, sql: &str, message: &str| {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    };
+    let clone_blocked = "cannot drop index q1_a_idx because index pj requires it";
+    db.apply_sql("ALTER INDEX q1_a_idx DEPENDS ON EXTENSION hstore;")
+        .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", clone_blocked);
+    expect(&mut db, "DROP EXTENSION hstore CASCADE;", clone_blocked);
+    db.apply_sql(
+        "ALTER INDEX q1_a_idx NO DEPENDS ON EXTENSION hstore;
+         ALTER TABLE q ADD PRIMARY KEY (a);
+         ALTER INDEX q1_pkey DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop index q1_pkey because index q_pkey requires it",
+    );
+    // An index ATTACH PARTITION attaches is the parent's too.
+    db.apply_sql(
+        "ALTER INDEX q1_pkey NO DEPENDS ON EXTENSION hstore;
+         CREATE TABLE r (a int NOT NULL, b int);
+         CREATE INDEX ri ON r (a);
+         ALTER INDEX ri DEPENDS ON EXTENSION hstore;
+         ALTER TABLE q ATTACH PARTITION r FOR VALUES FROM (5) TO (6);",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop index ri because index pj requires it",
+    );
+    db.apply_sql(
+        "ALTER INDEX ri NO DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER qtg ON q1 DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop trigger qtg on table q1 because trigger qtg on table q requires it",
+    );
+    // With the parents marked too, everything goes.
+    db.apply_sql(
+        "ALTER INDEX q1_a_idx DEPENDS ON EXTENSION hstore;
+         ALTER INDEX pj DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER qtg ON q DEPENDS ON EXTENSION hstore;
+         ALTER INDEX i DEPENDS ON EXTENSION hstore;
+         ALTER INDEX k DEPENDS ON EXTENSION hstore;
+         ALTER INDEX j DEPENDS ON EXTENSION hstore;
+         ALTER TABLE t ALTER COLUMN a TYPE bigint;
+         REINDEX INDEX j;
+         DROP EXTENSION hstore;
+         ALTER INDEX i RENAME TO i2;
+         ALTER INDEX k RENAME TO k2;
+         CREATE INDEX pj ON q (a);
+         CREATE TRIGGER qtg BEFORE INSERT ON q FOR EACH ROW EXECUTE FUNCTION trf();",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "ALTER INDEX j RENAME TO j2;",
+        "relation \"j\" does not exist",
+    );
+}
+
+#[test]
+fn drop_extension_takes_a_marked_partitioned_index_with_its_partitions_indexes() {
+    // A partition's index is part of its parent's (DEPENDENCY_PARTITION_PRI):
+    // with only the parent marked DEPENDS ON EXTENSION, DROP EXTENSION drops
+    // the clones too. (Checked by hand against PostgreSQL 18.6, CREATE
+    // EXTENSION leaving the pg_sanity mirror out.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2) PARTITION BY RANGE (a);
+         CREATE TABLE p11 PARTITION OF p1 FOR VALUES FROM (1) TO (2);
+         CREATE INDEX pi ON p (b);
+         ALTER INDEX pi DEPENDS ON EXTENSION hstore;
+         DROP EXTENSION hstore;",
+    )]);
+    for index in ["pi", "p1_b_idx", "p11_b_idx"] {
+        let sql = format!("ALTER INDEX {index} RENAME TO x;");
+        let err = db.apply_sql(&sql).expect_err(&sql);
+        assert!(
+            err.to_string()
+                .starts_with(&format!("relation \"{index}\" does not exist")),
+            "{sql}\n  got: {err}"
+        );
+    }
+    db.apply_sql("CREATE INDEX pi ON p (b);").unwrap();
+}

@@ -376,6 +376,28 @@ pub struct PgCatalog {
     /// `indcollation`, `indoption`, `indnullsnotdistinct`) and an exclusion
     /// constraint's operators, for the indexes DDL creates.
     pub(crate) index_keys: Shared<HashMap<PgClassOid, crate::ddl::indexes::IndexKeys>>,
+    /// The `attname`s of the indexes whose columns are no longer named
+    /// after their table's columns (ChooseIndexColumnNames): one renamed
+    /// with ALTER TABLE index RENAME COLUMN, or the table's column renamed
+    /// after the index was built (PG keeps the index's own name). Every
+    /// other index's are derived ([`crate::ddl::indexes::index_attnames`]).
+    pub(crate) index_attnames: Shared<HashMap<PgClassOid, Vec<String>>>,
+    /// The column names the relcache entry of an index keeps for the rest
+    /// of the transaction although they were renamed since: an index
+    /// created in the transaction, or given a new relfilenode in it
+    /// (TRUNCATE, REINDEX, CLUSTER, an ALTER COLUMN TYPE rebuild), keeps
+    /// its entry, whose tuple descriptor RelationReloadIndexInfo doesn't
+    /// rebuild — and generateClonedIndexStmt copies a clone's column names
+    /// from it. See [`crate::ddl::indexes::relcache_index_attnames`].
+    pub(crate) relcache_index_attnames: Shared<HashMap<PgClassOid, Vec<String>>>,
+    /// The indexes given a new relfilenode in the current transaction.
+    pub(crate) indexes_with_new_relfilenode: Shared<std::collections::HashSet<PgClassOid>>,
+    /// The first OID of the current transaction: what has a larger one was
+    /// created in it.
+    pub(crate) transaction_oid_floor: u32,
+    /// The statement being applied runs inside a transaction block
+    /// (explicit or implicit), where PreventInTransactionBlock refuses it.
+    pub(crate) in_transaction_block: bool,
     /// `pg_sequence` rows of the sequences migrations create.
     pub(crate) sequence_params: Shared<HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>>,
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
@@ -588,6 +610,7 @@ impl PgCatalog {
         // always >= `USER_OID_START + 1` — non-zero by construction.
         cat.next_oid = std::num::NonZeroU32::new(max_oid.saturating_add(1).max(USER_OID_START))
             .unwrap_or(USER_OID_START_NZ);
+        cat.transaction_oid_floor = cat.next_oid.get();
 
         for ns in seed.pg_namespace {
             cat.namespace_by_name.insert(ns.nspname.clone(), ns.oid);
@@ -766,6 +789,11 @@ impl PgCatalog {
             nonimmediate_indexes: Shared::default(),
             invalid_indexes: Shared::default(),
             index_keys: Shared::default(),
+            index_attnames: Shared::default(),
+            relcache_index_attnames: Shared::default(),
+            indexes_with_new_relfilenode: Shared::default(),
+            transaction_oid_floor: USER_OID_START_NZ.get(),
+            in_transaction_block: false,
             sequence_params: Shared::default(),
             foreign_data: Default::default(),
             installing_extension: None,
@@ -1367,6 +1395,11 @@ impl PgCatalog {
     /// Errors with [`DdlError::Internal`] only when the OID space (`u32`) is
     /// exhausted — practically unreachable in a single analyzer run since
     /// allocation starts at [`USER_OID_START`] (100_000) and steps by one.
+    /// The OID the next object will get.
+    pub(crate) fn next_oid_value(&self) -> u32 {
+        self.next_oid.get()
+    }
+
     pub(crate) fn alloc_oid(&mut self) -> Result<std::num::NonZeroU32, DdlError> {
         let oid = self.next_oid;
         self.next_oid = self
@@ -1710,6 +1743,9 @@ impl PgCatalog {
         self.nonimmediate_indexes.remove(&oid);
         self.invalid_indexes.remove(&oid);
         self.index_keys.remove(&oid);
+        self.index_attnames.remove(&oid);
+        self.relcache_index_attnames.remove(&oid);
+        self.indexes_with_new_relfilenode.remove(&oid);
         self.sequence_params.remove(&oid);
         self.foreign_data.forget_relation(oid);
         self.relpersistence.remove(&oid);
