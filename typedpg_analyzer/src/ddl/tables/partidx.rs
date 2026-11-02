@@ -102,16 +102,19 @@ pub(crate) fn ensure_partition_index(
             if interp.nonimmediate_indexes.contains(&parent_index) {
                 interp.nonimmediate_indexes.insert(clone);
             }
-            clone
+            interp.index_parents.insert(clone, parent_index);
+            // DefineIndex recurses into the new index's partitions. An
+            // existing index adopted (AttachPartitionEnsureIndexes) is a
+            // valid one: its partitions already have theirs attached to it.
+            if interp.pg_class.get(&part).map(|c| c.relkind) == Some(RelKind::Partitioned) {
+                for sub in inherit::children_of(interp, part) {
+                    ensure_partition_index(interp, clone, sub)?;
+                }
+            }
+            return Ok(());
         }
     };
     interp.index_parents.insert(child_index, parent_index);
-
-    if interp.pg_class.get(&part).map(|c| c.relkind) == Some(RelKind::Partitioned) {
-        for sub in inherit::children_of(interp, part) {
-            ensure_partition_index(interp, child_index, sub)?;
-        }
-    }
     Ok(())
 }
 

@@ -1836,3 +1836,100 @@ fn detach_rows_for_remaining_partitions_and_none_for_the_detached() {
     assert_eq!(rows(&db, "tb"), vec![row("f1", "r2", true, 0)]);
     assert_eq!(rows(&db, "t3"), Vec::new());
 }
+
+/// A clone made by ADD FOREIGN KEY on a partitioned table is named after
+/// the command's name at every level (`name_N` when the partition has it);
+/// one made by ATTACH PARTITION after the clone above it — as PG 18.6
+/// names them.
+#[test]
+fn partition_foreign_key_clones_are_named_per_path() {
+    use typedpg_analyzer::ConType;
+    let fk_names = |db: &PgCatalog, table: &str| -> Vec<(String, String)> {
+        let mut names: Vec<(String, String)> = db
+            .constraints_of_table(table)
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| {
+                let target = c
+                    .confrelid
+                    .and_then(|r| db.pg_class().get(&r))
+                    .map(|r| r.relname.clone())
+                    .unwrap_or_default();
+                (c.conname, target)
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let n = |name: &str, target: &str| (name.to_owned(), target.to_owned());
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE q (id int PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE q11 (id int PRIMARY KEY);
+         CREATE TABLE t (a int) PARTITION BY RANGE (a);
+         CREATE TABLE t1 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE t11 (a int);
+         ALTER TABLE t ATTACH PARTITION t1 FOR VALUES FROM (0) TO (100);
+         ALTER TABLE t1 ADD CONSTRAINT f1 FOREIGN KEY (a) REFERENCES q (id);
+         ALTER TABLE t1 ATTACH PARTITION t11 FOR VALUES FROM (0) TO (50);
+         ALTER TABLE t ADD CONSTRAINT f1 FOREIGN KEY (a) REFERENCES q11 (id);
+         -- ATTACH: each level after the clone above it.
+         CREATE TABLE pk2 (x int PRIMARY KEY);
+         CREATE TABLE other (a int, CONSTRAINT g_1 CHECK (a > 0));
+         CREATE TABLE p7 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p7c (a int CONSTRAINT g NOT NULL) PARTITION BY RANGE (a);
+         CREATE TABLE p7cc (a int CONSTRAINT g_2 NOT NULL);
+         ALTER TABLE p7c ATTACH PARTITION p7cc FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p7 ADD CONSTRAINT g FOREIGN KEY (a) REFERENCES pk2;
+         ALTER TABLE p7 ATTACH PARTITION p7c FOR VALUES FROM (0) TO (10);
+         -- ADD FOREIGN KEY: every level after the command's name.
+         CREATE TABLE other2 (a int, CONSTRAINT h_1 CHECK (a > 0));
+         CREATE TABLE p8 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p8c (a int CONSTRAINT h NOT NULL) PARTITION BY RANGE (a);
+         CREATE TABLE p8cc (a int CONSTRAINT h_2 NOT NULL);
+         ALTER TABLE p8c ATTACH PARTITION p8cc FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p8 ATTACH PARTITION p8c FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p8 ADD CONSTRAINT h FOREIGN KEY (a) REFERENCES pk2;",
+    )]);
+    assert_eq!(fk_names(&db, "t1"), vec![n("f1", "q"), n("f1_1", "q11")]);
+    assert_eq!(fk_names(&db, "t11"), vec![n("f1", "q"), n("f1_2", "q11")]);
+    assert_eq!(fk_names(&db, "p7c"), vec![n("g_3", "pk2")]);
+    assert_eq!(fk_names(&db, "p7cc"), vec![n("g_3", "pk2")]);
+    assert_eq!(fk_names(&db, "p8c"), vec![n("h_3", "pk2")]);
+    assert_eq!(fk_names(&db, "p8cc"), vec![n("h", "pk2")]);
+}
+
+/// Attaching a partitioned table whose partitions already have their
+/// primary key (or unique) index attached adopts its index as is: no copy
+/// for the partitions below, which would be a second primary key.
+#[test]
+fn attaching_a_partitioned_partition_adopts_its_indexes() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE r (id int PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE r1 (id int PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE r12 (id int PRIMARY KEY);
+         ALTER TABLE r1 ATTACH PARTITION r12 FOR VALUES FROM (0) TO (10);
+         ALTER TABLE r ATTACH PARTITION r1 FOR VALUES FROM (0) TO (100);
+         CREATE TABLE u (id int UNIQUE) PARTITION BY RANGE (id);
+         CREATE TABLE u1 (id int UNIQUE) PARTITION BY RANGE (id);
+         CREATE TABLE u12 (id int UNIQUE);
+         ALTER TABLE u1 ATTACH PARTITION u12 FOR VALUES FROM (0) TO (10);
+         ALTER TABLE u ATTACH PARTITION u1 FOR VALUES FROM (0) TO (100);",
+    )]);
+    for (table, expected) in [
+        ("r1", vec!["r1_id_not_null", "r1_pkey"]),
+        ("r12", vec!["r12_id_not_null", "r12_pkey"]),
+        ("u12", vec!["u12_id_key"]),
+    ] {
+        let mut names = db.pg_constraint_names_for_table("public", table);
+        names.sort();
+        assert_eq!(names, expected, "{table}");
+    }
+    let indexes = |table: &str| {
+        let rel = class_oid(&db, None, table);
+        db.pg_index_values().filter(|i| i.indrelid == rel).count()
+    };
+    assert_eq!(indexes("r12"), 1);
+    assert_eq!(indexes("u12"), 1);
+}
