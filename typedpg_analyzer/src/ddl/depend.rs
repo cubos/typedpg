@@ -124,7 +124,10 @@ pub(crate) fn drop_target_identity(
             };
             let namespace = interp.schemas_for_lookup(schema).into_iter().find(|ns| {
                 if obj_type == ObjectType::ObjectConversion {
-                    interp.conversions.iter().any(|(c, n)| c == name && n == ns)
+                    interp
+                        .conversions
+                        .iter()
+                        .any(|c| c.name == name && c.namespace == *ns)
                 } else {
                     interp
                         .statistics
@@ -1079,6 +1082,11 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
 /// as PG's pg_attrdef row is — unless the column is generated, in which case
 /// the column itself is the dependent.
 fn describe_dependent(interp: &PgCatalog, addr: ObjectAddress) -> String {
+    // findDependentObjects: an extension's member stands for its extension,
+    // which the DROP would take instead.
+    if let Some(ext) = owning_extension(interp, addr) {
+        return describe_extension(interp, ext);
+    }
     if addr.classid == PG_CLASS_RELID
         && addr.objsubid > 0
         && let Some(relid) = PgClassOid::new(addr.objid.get())
@@ -1416,14 +1424,7 @@ pub(crate) fn check_not_owned(
             "cannot drop {target_desc} because it is required by the database system"
         )));
     }
-    // The extension whose scripts are running may drop its own members
-    // (findDependentObjects ignores a DEPENDENCY_EXTENSION on
-    // CurrentExtensionObject): an upgrade script replacing a function.
-    let current_extension = interp
-        .installing_extension
-        .as_deref()
-        .and_then(|name| interp.extension_by_name.get(name))
-        .map(|e| PgGenericOid::from_nonzero(e.into_nonzero()));
+    let current_extension = current_extension(interp);
     let owner = interp
         .pg_depend
         .iter()
@@ -1463,6 +1464,52 @@ pub(crate) fn check_not_owned(
         "cannot drop {target_desc} because {owner_desc} requires it (You can drop {owner_desc} \
          instead.)"
     )))
+}
+
+/// The extension whose scripts are running, which may drop its own members
+/// (findDependentObjects ignores a DEPENDENCY_EXTENSION on
+/// CurrentExtensionObject): an upgrade script replacing a function.
+fn current_extension(interp: &PgCatalog) -> Option<PgGenericOid> {
+    interp
+        .installing_extension
+        .as_deref()
+        .and_then(|name| interp.extension_by_name.get(name))
+        .map(|e| PgGenericOid::from_nonzero(e.into_nonzero()))
+}
+
+/// The extension `addr` is a member of (DEPENDENCY_EXTENSION) — created by
+/// its script or added with ALTER EXTENSION ADD — unless it is the one
+/// being installed, or the DROP running now deletes it already.
+pub(crate) fn owning_extension(
+    interp: &PgCatalog,
+    addr: ObjectAddress,
+) -> Option<crate::oid::PgExtensionOid> {
+    let current = current_extension(interp);
+    interp
+        .pg_depend
+        .iter()
+        .find(|d| {
+            d.classid == addr.classid
+                && d.objid == addr.objid
+                && d.deptype == DepType::Extension
+                && d.refclassid == crate::pg_catalog::PG_EXTENSION_RELID
+                && Some(d.refobjid) != current
+        })
+        .and_then(|d| crate::oid::PgExtensionOid::new(d.refobjid.get()))
+        .filter(|&ext| {
+            let ext =
+                ObjectAddress::new(crate::pg_catalog::PG_EXTENSION_RELID, ext.into_nonzero(), 0);
+            !is_drop_target(ext) && !in_progress(ext)
+        })
+}
+
+/// `extension name`, getObjectDescription's words for extension `ext`.
+pub(crate) fn describe_extension(interp: &PgCatalog, ext: crate::oid::PgExtensionOid) -> String {
+    interp
+        .pg_extension
+        .get(&ext)
+        .map(|e| format!("extension {}", e.extname))
+        .unwrap_or_else(|| "extension".into())
 }
 
 /// The owner `GenerateTypeDependencies` records for a type
@@ -1529,6 +1576,16 @@ fn delete_object(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), supe
 }
 
 fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), super::DdlError> {
+    // findDependentObjects: a cascade reaching an extension's member deletes
+    // the whole extension instead (its owning object), with what depends on
+    // any of its members.
+    if let Some(ext) = owning_extension(interp, addr) {
+        let ext_addr =
+            ObjectAddress::new(crate::pg_catalog::PG_EXTENSION_RELID, ext.into_nonzero(), 0);
+        return while_deleting(ext_addr, || {
+            super::drop::drop_extension_oid(interp, ext, true)
+        });
+    }
     let desc = describe(interp, addr);
     drop_dependents(interp, addr, &desc, true)?;
     let oid = addr.objid.get();

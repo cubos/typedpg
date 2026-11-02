@@ -191,14 +191,16 @@ pub(crate) fn find_opclass<'a>(
 
 /// QualifiedNameGetCreationNamespace: the named schema, or the creation
 /// schema.
-fn object_namespace(interp: &PgCatalog, schema: Option<&str>) -> Result<PgNamespaceOid, DdlError> {
+fn object_namespace(
+    interp: &mut PgCatalog,
+    schema: Option<&str>,
+) -> Result<PgNamespaceOid, DdlError> {
     let schema = match schema {
         Some(s) => s.to_owned(),
         None => super::util::creation_schema(interp)?,
     };
-    interp
-        .namespace_oid(&schema)
-        .ok_or_else(|| DdlError::TableNotFound(format!("schema \"{schema}\" does not exist")))
+    // QualifiedNameGetCreationNamespace: `pg_temp` is the temporary schema.
+    super::util::lookup_creation_namespace(interp, &schema)
 }
 
 /// CREATE ACCESS METHOD name TYPE INDEX | TABLE HANDLER fn
@@ -383,6 +385,7 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
             "duplicate key value violates unique constraint \"pg_amproc_fam_proc_index\"".into(),
         ));
     }
+    let storage = storage_type(interp, &am, &stmt.items, intype)?;
     let oid = PgOpclassOid::from_nonzero(interp.alloc_oid()?);
     // The class depends on its family, and goes with it (DEPENDENCY_AUTO).
     let family = super::depend::named_address_of(
@@ -406,12 +409,14 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
     let me =
         super::depend::ObjectAddress::new(super::depend::PG_OPCLASS_RELID, oid.into_nonzero(), 0);
     super::depend::record(interp, me, family, crate::pg_catalog::DepType::Auto);
-    // DefineOpClass: the class depends on its input type (a built-in one
-    // is pinned).
+    // DefineOpClass: the class depends on its input type, and on its
+    // storage type when that differs (a built-in one is pinned).
     super::depend::record(
         interp,
         me,
-        [super::depend::ObjectAddress::type_(intype)],
+        std::iter::once(intype)
+            .chain(storage)
+            .map(super::depend::ObjectAddress::type_),
         crate::pg_catalog::DepType::Normal,
     );
     // Its operators and support functions: hard members tie the class to
@@ -429,6 +434,52 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
     interp.pg_amop.extend(ops);
     super::opfamily_members::store(interp, members);
     Ok(())
+}
+
+/// DefineOpClass: the class's `STORAGE` type (`opckeytype`), when it
+/// differs from the input type — given once, and only to an access method
+/// whose `amstorage` allows it (not btree, hash or bloom).
+fn storage_type(
+    interp: &PgCatalog,
+    am: &str,
+    items: &[typedpg_pg_query::protobuf::Node],
+    intype: PgTypeOid,
+) -> Result<Option<PgTypeOid>, DdlError> {
+    let mut storage = None;
+    for item in items {
+        // OPCLASS_ITEM_STORAGETYPE.
+        let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
+            continue;
+        };
+        if item.itemtype != 3 {
+            continue;
+        }
+        let Some(tn) = item.storedtype.as_ref() else {
+            continue;
+        };
+        if storage.is_some() {
+            return Err(DdlError::Parse(
+                "storage type specified more than once".into(),
+            ));
+        }
+        storage = Some(super::util::lookup_type_name(tn, interp)?);
+    }
+    let Some(storage) = storage.filter(|&s| s != intype) else {
+        return Ok(None);
+    };
+    let handler = interp
+        .pg_am
+        .iter()
+        .find(|a| a.amname == am)
+        .and_then(|a| a.amhandler)
+        .and_then(|h| interp.pg_proc.get(&h))
+        .map(|p| p.proname.as_str());
+    if matches!(handler, Some("bthandler" | "hashhandler" | "blhandler")) {
+        return Err(DdlError::Parse(format!(
+            "storage type cannot be different from data type for access method \"{am}\""
+        )));
+    }
+    Ok(Some(storage))
 }
 
 /// DefineOpClass / AlterOpFamilyAdd: an `OPERATOR n name [(left, right)]`
@@ -463,41 +514,48 @@ fn family_operator(
     let Some(owa) = item.name.as_ref() else {
         return Ok(None);
     };
-    let (left, right) = match owa.objargs.as_slice() {
-        [l, r] => {
-            let resolve = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
-                Some(node::Node::TypeName(tn)) => super::util::resolve_type_name(tn, interp),
-                _ => None,
-            };
-            (resolve(l), resolve(r))
-        }
-        [] => (intype, intype),
-        _ => return Ok(None),
-    };
-    let (Some(left), Some(right)) = (left, right) else {
-        return Ok(None);
-    };
-    let (schema, name) = split_name(&owa.objname);
-    let Some(opr) = interp
-        .schemas_for_lookup(schema.as_deref())
-        .into_iter()
-        .find_map(|ns| {
-            interp.pg_operator.values().find(|o| {
-                o.oprnamespace == ns
-                    && o.oprname == name
-                    && o.oprleft == Some(left)
-                    && o.oprright == right
+    let (opr, left, right) = if owa.objargs.is_empty() {
+        // A binary operator on the input type (LookupOperName).
+        let (Some(left), Some(right)) = (intype, intype) else {
+            return Ok(None);
+        };
+        let (schema, name) = split_name(&owa.objname);
+        let Some(opr) = interp
+            .schemas_for_lookup(schema.as_deref())
+            .into_iter()
+            .find_map(|ns| {
+                interp.pg_operator.values().find(|o| {
+                    o.oprnamespace == ns
+                        && o.oprname == name
+                        && o.oprleft == Some(left)
+                        && o.oprright == right
+                })
             })
-        })
-        .map(|o| o.oid)
-    else {
-        // LookupOperName.
-        return Err(DdlError::TypeNotFound(format!(
-            "operator does not exist: {} {} {}",
-            super::util::format_type_for_message(interp, left),
-            written(&owa.objname),
-            super::util::format_type_for_message(interp, right),
-        )));
+            .map(|o| o.oid)
+        else {
+            return Err(DdlError::TypeNotFound(format!(
+                "operator does not exist: {} {} {}",
+                super::util::format_type_for_message(interp, left),
+                written(&owa.objname),
+                super::util::format_type_for_message(interp, right),
+            )));
+        };
+        (opr, left, right)
+    } else {
+        // LookupOperWithArgs; then assignOperTypes: a binary one.
+        let wrapped = typedpg_pg_query::protobuf::Node {
+            node: Some(node::Node::ObjectWithArgs(owa.clone())),
+        };
+        let Some(opr) = super::drop::lookup_operator(interp, &wrapped)? else {
+            return Ok(None);
+        };
+        let Some(op) = interp.pg_operator.get(&opr) else {
+            return Ok(None);
+        };
+        let Some(left) = op.oprleft else {
+            return Err(DdlError::Parse("index operators must be binary".into()));
+        };
+        (opr, left, op.oprright)
     };
     Ok(Some(PgAmop {
         amopfamily: family.to_owned(),
@@ -836,7 +894,7 @@ pub(crate) fn rename_or_move_am_object(
     is_class: bool,
     obj_node: &typedpg_pg_query::protobuf::Node,
     new_name: Option<&str>,
-    new_namespace: Option<PgNamespaceOid>,
+    new_schema: Option<&str>,
 ) -> Result<(), DdlError> {
     use super::depend::NamedObject;
     let (NamedObject::Opclass {
@@ -856,7 +914,13 @@ pub(crate) fn rename_or_move_am_object(
         return Ok(());
     };
     let to_name = new_name.map_or_else(|| name.clone(), str::to_owned);
-    let to_ns = new_namespace.unwrap_or(namespace);
+    let to_ns = match new_schema {
+        Some(schema) => match super::util::set_schema_target(interp, namespace, schema)? {
+            Some(ns) => ns,
+            None => return Ok(()),
+        },
+        None => namespace,
+    };
     if to_name == name && to_ns == namespace {
         return Ok(());
     }

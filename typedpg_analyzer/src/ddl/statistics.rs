@@ -16,6 +16,7 @@ pub(crate) struct StatisticsObject {
     pub(crate) name: String,
     pub(crate) namespace: PgNamespaceOid,
     pub(crate) relid: PgClassOid,
+    pub(crate) oid: crate::oid::PgGenericOid,
     /// The columns it reads (`stxkeys` and the expressions' columns).
     pub(crate) attnums: Vec<i16>,
 }
@@ -47,8 +48,17 @@ fn find(interp: &PgCatalog, names: &[typedpg_pg_query::protobuf::Node]) -> Optio
         })
 }
 
-fn not_found(names: &[typedpg_pg_query::protobuf::Node]) -> DdlError {
+/// get_statistics_object_oid's error: a schema that doesn't exist first.
+pub(crate) fn not_found(
+    interp: &PgCatalog,
+    names: &[typedpg_pg_query::protobuf::Node],
+) -> DdlError {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
+    if let [schema, _] = parts.as_slice()
+        && interp.namespace_oid(schema).is_none()
+    {
+        return DdlError::TableNotFound(format!("schema \"{schema}\" does not exist"));
+    }
     DdlError::TypeNotFound(format!(
         "statistics object \"{}\" does not exist",
         parts.join(".")
@@ -298,10 +308,12 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
     };
     attnums.sort_unstable();
     attnums.dedup();
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
     interp.statistics.push(StatisticsObject {
         name,
         namespace,
         relid,
+        oid,
         attnums,
     });
     Ok(())
@@ -402,7 +414,7 @@ fn choose_name(
 /// `ALTER STATISTICS [IF EXISTS] name SET STATISTICS n` (AlterStatistics).
 pub fn alter_statistics(interp: &PgCatalog, stmt: &AlterStatsStmt) -> Result<(), DdlError> {
     if find(interp, &stmt.defnames).is_none() && !stmt.missing_ok {
-        return Err(not_found(&stmt.defnames));
+        return Err(not_found(interp, &stmt.defnames));
     }
     Ok(())
 }
@@ -422,7 +434,7 @@ pub(crate) fn drop_statistics(
             Ok(())
         }
         None if missing_ok => Ok(()),
-        None => Err(not_found(&l.items)),
+        None => Err(not_found(interp, &l.items)),
     }
 }
 
@@ -438,7 +450,7 @@ pub(crate) fn rename_statistics(
         if stmt.missing_ok {
             return Ok(());
         }
-        return Err(not_found(&l.items));
+        return Err(not_found(interp, &l.items));
     };
     let namespace = interp.statistics[i].namespace;
     if interp
@@ -469,4 +481,38 @@ pub(crate) fn drop_column_statistics(interp: &mut PgCatalog, relid: PgClassOid, 
     interp
         .statistics
         .retain(|s| !(s.relid == relid && s.attnums.contains(&attnum)));
+}
+
+/// `ALTER STATISTICS name SET SCHEMA s` (AlterObjectNamespace_internal):
+/// its name must be free in the new schema.
+pub(crate) fn set_statistics_schema(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+) -> Result<(), DdlError> {
+    let Some(node::Node::List(l)) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+        return Ok(());
+    };
+    let Some(i) = find(interp, &l.items) else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(not_found(interp, &l.items));
+    };
+    let old_ns = interp.statistics[i].namespace;
+    let Some(new_ns) = super::util::set_schema_target(interp, old_ns, &stmt.newschema)? else {
+        return Ok(());
+    };
+    let name = interp.statistics[i].name.clone();
+    if interp
+        .statistics
+        .iter()
+        .any(|s| s.namespace == new_ns && s.name == name)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "statistics object \"{name}\" already exists in schema \"{}\"",
+            stmt.newschema
+        )));
+    }
+    interp.statistics[i].namespace = new_ns;
+    Ok(())
 }

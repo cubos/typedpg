@@ -455,7 +455,7 @@ pub struct PgCatalog {
     /// Materialized views created or refreshed WITH NO DATA.
     pub(crate) unpopulated_matviews: Shared<std::collections::HashSet<PgClassOid>>,
     /// Encoding conversions created by migrations.
-    pub(crate) conversions: Shared<Vec<(String, PgNamespaceOid)>>,
+    pub(crate) conversions: Shared<Vec<crate::ddl::conversions::Conversion>>,
     /// Event triggers and the function each executes.
     pub(crate) event_triggers: Shared<Vec<(String, crate::oid::PgProcOid)>>,
     /// Enum labels added in the current transaction to a type created

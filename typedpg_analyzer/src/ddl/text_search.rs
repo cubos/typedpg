@@ -692,7 +692,13 @@ pub fn alter_configuration(
     }
     let config = interp.pg_ts_objects[at].oid;
     let mut mapping = config_mapping(interp, at);
-    let tokens: Vec<&str> = stmt.tokentype.iter().filter_map(node_string).collect();
+    // getTokenTypes: a token type named twice counts once.
+    let mut tokens: Vec<&str> = Vec::new();
+    for token in stmt.tokentype.iter().filter_map(node_string) {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
     use typedpg_pg_query::protobuf::AlterTsConfigType as K;
     match K::try_from(stmt.kind).unwrap_or(K::AlterTsconfigTypeUndefined) {
         // MakeConfigurationMapping without override: a token type mapped
@@ -923,7 +929,7 @@ pub(crate) fn set_schema(
     interp: &mut PgCatalog,
     objtype: ObjectType,
     stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
-    new_ns: PgNamespaceOid,
+    new_schema: &str,
 ) -> Result<(), DdlError> {
     let (Some(kind), Some(node::Node::List(l))) = (
         kind_of(objtype),
@@ -937,12 +943,13 @@ pub(crate) fn set_schema(
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
-    if interp.pg_ts_objects[at].namespace == new_ns {
+    let old_ns = interp.pg_ts_objects[at].namespace;
+    let Some(new_ns) = super::util::set_schema_target(interp, old_ns, new_schema)? else {
         return Ok(());
-    }
+    };
     let name = interp.pg_ts_objects[at].name.clone();
     check_free(interp, kind, &name, new_ns)?;
-    let old_ns = std::mem::replace(&mut interp.pg_ts_objects[at].namespace, new_ns);
+    interp.pg_ts_objects[at].namespace = new_ns;
     interp
         .ts_definitions
         .rekey(kind, (old_ns, name.clone()), (new_ns, name));

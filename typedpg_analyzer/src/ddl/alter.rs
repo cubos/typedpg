@@ -521,22 +521,22 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
     if object_type == ObjectType::ObjectCollation {
         return crate::ddl::collations::set_collation_schema(interp, stmt);
     }
-    let new_nsoid = crate::ddl::util::existing_namespace(interp, &new_schema)?;
-
+    // The object is looked up first, then the schema it moves to
+    // (set_schema_target).
     match object_type {
         ObjectType::ObjectFunction
         | ObjectType::ObjectProcedure
         | ObjectType::ObjectRoutine
         | ObjectType::ObjectAggregate => {
-            set_function_like_schema(interp, stmt, new_nsoid, object_type)
+            crate::ddl::functions::set_routine_schema(interp, stmt, &new_schema, object_type)
         }
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
-            set_type_schema(interp, stmt, new_nsoid)
+            crate::ddl::types::set_type_schema(interp, stmt, &new_schema)
         }
         ObjectType::ObjectExtension => match stmt.object.as_deref().and_then(node_string) {
             Some(name) => {
                 let name = name.to_owned();
-                crate::ddl::extensions::set_extension_schema(interp, &name, new_nsoid)
+                crate::ddl::extensions::set_extension_schema(interp, &name, &new_schema)
             }
             None => Ok(()),
         },
@@ -544,7 +544,13 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
         | ObjectType::ObjectTsdictionary
         | ObjectType::ObjectTsparser
         | ObjectType::ObjectTstemplate => {
-            crate::ddl::text_search::set_schema(interp, object_type, stmt, new_nsoid)
+            crate::ddl::text_search::set_schema(interp, object_type, stmt, &new_schema)
+        }
+        ObjectType::ObjectConversion => {
+            crate::ddl::conversions::set_conversion_schema(interp, stmt)
+        }
+        ObjectType::ObjectStatisticExt => {
+            crate::ddl::statistics::set_statistics_schema(interp, stmt)
         }
         // AlterObjectNamespace_oid: the operator keeps its name and operand
         // types, which must be free in the new schema.
@@ -558,9 +564,11 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
             let Some(op) = interp.pg_operator.get(&oid).cloned() else {
                 return Ok(());
             };
-            if op.oprnamespace == new_nsoid {
+            let Some(new_nsoid) =
+                crate::ddl::util::set_schema_target(interp, op.oprnamespace, &new_schema)?
+            else {
                 return Ok(());
-            }
+            };
             if interp.pg_operator.values().any(|o| {
                 o.oprnamespace == new_nsoid
                     && o.oprname == op.oprname
@@ -582,7 +590,7 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
                 object_type == ObjectType::ObjectOpclass,
                 object,
                 None,
-                Some(new_nsoid),
+                Some(&new_schema),
             ),
             None => Ok(()),
         },
@@ -779,23 +787,6 @@ fn set_relation_schema(
 
     views::rewrite_views_on_table_rename(interp, &old_schema, &name, new_schema, &name);
     Ok(())
-}
-
-fn set_function_like_schema(
-    interp: &mut PgCatalog,
-    stmt: &AlterObjectSchemaStmt,
-    new_nsoid: PgNamespaceOid,
-    expected: ObjectType,
-) -> Result<(), DdlError> {
-    crate::ddl::functions::set_routine_schema(interp, stmt, new_nsoid, expected)
-}
-
-fn set_type_schema(
-    interp: &mut PgCatalog,
-    stmt: &AlterObjectSchemaStmt,
-    new_nsoid: PgNamespaceOid,
-) -> Result<(), DdlError> {
-    crate::ddl::types::set_type_schema(interp, stmt, new_nsoid)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

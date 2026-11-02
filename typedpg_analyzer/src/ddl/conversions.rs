@@ -6,8 +6,16 @@ use typedpg_pg_query::protobuf::CreateConversionStmt;
 
 use super::DdlError;
 use super::util::node_string;
-use crate::oid::{PgNamespaceOid, PgTypeOid};
+use crate::oid::{PgGenericOid, PgNamespaceOid, PgTypeOid};
 use crate::pg_catalog::PgCatalog;
+
+/// `pg_conversion`: a conversion a migration created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Conversion {
+    pub(crate) name: String,
+    pub(crate) namespace: PgNamespaceOid,
+    pub(crate) oid: PgGenericOid,
+}
 
 /// pg_encname_tbl (encnames.c): every accepted spelling, cleaned, with
 /// its encoding's canonical name.
@@ -177,13 +185,18 @@ pub fn create_conversion(
     if interp
         .conversions
         .iter()
-        .any(|(n, ns)| *n == name && *ns == nsoid)
+        .any(|c| c.name == name && c.namespace == nsoid)
     {
         return Err(DdlError::DuplicateObject(format!(
             "conversion \"{name}\" already exists"
         )));
     }
-    interp.conversions.push((name, nsoid));
+    let oid = PgGenericOid::from_nonzero(interp.alloc_oid()?);
+    interp.conversions.push(Conversion {
+        name,
+        namespace: nsoid,
+        oid,
+    });
     Ok(())
 }
 
@@ -365,7 +378,17 @@ pub(crate) fn conversion_exists(interp: &PgCatalog, names: &[&str]) -> bool {
     }
 }
 
-fn find(interp: &PgCatalog, names: &[&str]) -> Option<(String, PgNamespaceOid)> {
+/// get_conversion_oid's error: a schema that doesn't exist first.
+pub(crate) fn not_found(interp: &PgCatalog, names: &[&str]) -> DdlError {
+    if let [schema, _] = names
+        && interp.namespace_oid(schema).is_none()
+    {
+        return DdlError::TableNotFound(format!("schema \"{schema}\" does not exist"));
+    }
+    DdlError::TypeNotFound(format!("conversion \"{}\" does not exist", names.join(".")))
+}
+
+fn find(interp: &PgCatalog, names: &[&str]) -> Option<Conversion> {
     let (schema, name) = match names {
         [schema, name] => (Some(*schema), *name),
         [name] => (None, *name),
@@ -378,7 +401,7 @@ fn find(interp: &PgCatalog, names: &[&str]) -> Option<(String, PgNamespaceOid)> 
             interp
                 .conversions
                 .iter()
-                .find(|(n, s)| n == name && *s == ns)
+                .find(|c| c.name == name && c.namespace == ns)
                 .cloned()
         })
 }
@@ -399,10 +422,7 @@ pub(crate) fn drop_conversion(
             Ok(())
         }
         None if missing_ok => Ok(()),
-        None => Err(DdlError::TypeNotFound(format!(
-            "conversion \"{}\" does not exist",
-            names.join(".")
-        ))),
+        None => Err(not_found(interp, &names)),
     }
 }
 
@@ -417,16 +437,18 @@ pub(crate) fn rename_conversion(
         return Ok(());
     };
     let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
-    let Some((old, ns)) = find(interp, &names) else {
-        return Err(DdlError::TypeNotFound(format!(
-            "conversion \"{}\" does not exist",
-            names.join(".")
-        )));
+    let Some(Conversion {
+        name: old,
+        namespace: ns,
+        ..
+    }) = find(interp, &names)
+    else {
+        return Err(not_found(interp, &names));
     };
     if interp
         .conversions
         .iter()
-        .any(|(n, s)| *n == stmt.newname && *s == ns)
+        .any(|c| c.name == stmt.newname && c.namespace == ns)
     {
         let schema = interp.namespace_name(ns).unwrap_or("?").to_owned();
         return Err(DdlError::DuplicateObject(format!(
@@ -437,9 +459,47 @@ pub(crate) fn rename_conversion(
     for c in interp
         .conversions
         .iter_mut()
-        .filter(|(n, s)| *n == old && *s == ns)
+        .filter(|c| c.name == old && c.namespace == ns)
     {
-        c.0.clone_from(&stmt.newname);
+        c.name.clone_from(&stmt.newname);
+    }
+    Ok(())
+}
+
+/// `ALTER CONVERSION name SET SCHEMA s` (AlterObjectNamespace_internal):
+/// its name must be free in the new schema.
+pub(crate) fn set_conversion_schema(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+) -> Result<(), DdlError> {
+    let Some(typedpg_pg_query::protobuf::node::Node::List(l)) =
+        stmt.object.as_deref().and_then(|o| o.node.as_ref())
+    else {
+        return Ok(());
+    };
+    let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+    let Some(found) = find(interp, &names) else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
+        return Err(not_found(interp, &names));
+    };
+    let Some(new_ns) = super::util::set_schema_target(interp, found.namespace, &stmt.newschema)?
+    else {
+        return Ok(());
+    };
+    if interp
+        .conversions
+        .iter()
+        .any(|c| c.name == found.name && c.namespace == new_ns)
+    {
+        return Err(DdlError::DuplicateObject(format!(
+            "conversion \"{}\" already exists in schema \"{}\"",
+            found.name, stmt.newschema
+        )));
+    }
+    for c in interp.conversions.iter_mut().filter(|c| c.oid == found.oid) {
+        c.namespace = new_ns;
     }
     Ok(())
 }

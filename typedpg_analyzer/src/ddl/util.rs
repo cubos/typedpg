@@ -209,6 +209,60 @@ pub(crate) fn check_not_system_class(
     Ok(())
 }
 
+/// `ALTER ... SET SCHEMA name` for an object now in `old`
+/// (ExecAlterObjectSchemaStmt, after the object's lookup): the schema it
+/// moves to — LookupCreationNamespace's, `pg_temp` being the session's
+/// temporary schema — or `None` when it is there already. Otherwise
+/// CheckSetNamespace: nothing moves into or out of the temporary or the
+/// TOAST schema.
+pub fn set_schema_target(
+    interp: &mut PgCatalog,
+    old: PgNamespaceOid,
+    name: &str,
+) -> Result<Option<PgNamespaceOid>, DdlError> {
+    let new = lookup_creation_namespace(interp, name)?;
+    if new == old {
+        return Ok(None);
+    }
+    check_set_namespace(interp, old, new)?;
+    Ok(Some(new))
+}
+
+/// LookupCreationNamespace: `pg_temp` is the session's temporary schema;
+/// any other must exist.
+pub fn lookup_creation_namespace(
+    interp: &mut PgCatalog,
+    name: &str,
+) -> Result<PgNamespaceOid, DdlError> {
+    if name == "pg_temp" {
+        return temp_namespace(interp);
+    }
+    existing_namespace(interp, name)
+}
+
+/// CheckSetNamespace: nothing moves into or out of the temporary or the
+/// TOAST schema.
+pub fn check_set_namespace(
+    interp: &PgCatalog,
+    old: PgNamespaceOid,
+    new: PgNamespaceOid,
+) -> Result<(), DdlError> {
+    if interp.temp_namespace.is_some_and(|t| t == old || t == new) {
+        return Err(DdlError::Parse(
+            "cannot move objects into or out of temporary schemas".into(),
+        ));
+    }
+    if interp
+        .namespace_oid("pg_toast")
+        .is_some_and(|t| t == old || t == new)
+    {
+        return Err(DdlError::Parse(
+            "cannot move objects into or out of TOAST schema".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// LookupCreationNamespace: the schema a new object goes in must exist.
 pub fn existing_namespace(interp: &PgCatalog, name: &str) -> Result<PgNamespaceOid, DdlError> {
     interp
