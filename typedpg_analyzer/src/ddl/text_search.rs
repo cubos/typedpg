@@ -5,11 +5,11 @@
 
 use typedpg_pg_query::protobuf::{AlterTsConfigurationStmt, DefineStmt, ObjectType, node};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::DdlError;
 use super::util::node_string;
-use crate::oid::PgNamespaceOid;
+use crate::oid::{PgGenericOid, PgNamespaceOid};
 use crate::pg_catalog::{PgCatalog, PgTsObject};
 
 fn what(kind: &str) -> &'static str {
@@ -94,6 +94,85 @@ pub(crate) struct TsDefinitions {
     configs: HashMap<(PgNamespaceOid, String), bool>,
     /// A dictionary's template (as `(namespace, name)`) and options.
     dicts: HashMap<(PgNamespaceOid, String), DictDefinition>,
+    /// A configuration's mapping (`pg_ts_config_map`): each token type's
+    /// dictionaries, by the configuration's OID. A seeded configuration,
+    /// absent here, maps [`SEEDED_CONFIG_TOKENS`].
+    mappings: HashMap<PgGenericOid, BTreeMap<String, Vec<PgGenericOid>>>,
+    /// A configuration's parser (`cfgparser`), by the configuration's OID,
+    /// for the configurations migrations create.
+    parsers: HashMap<PgGenericOid, PgGenericOid>,
+}
+
+/// The token types every seeded configuration maps (initdb's
+/// snowball_create.sql and `simple`, PostgreSQL 18.6).
+const SEEDED_CONFIG_TOKENS: &[&str] = &[
+    "asciiword",
+    "word",
+    "numword",
+    "email",
+    "url",
+    "host",
+    "sfloat",
+    "version",
+    "hword_numpart",
+    "hword_part",
+    "hword_asciipart",
+    "numhword",
+    "asciihword",
+    "hword",
+    "url_path",
+    "file",
+    "float",
+    "int",
+    "uint",
+];
+
+/// Configuration `pg_ts_objects[at]`'s mapping.
+fn config_mapping(interp: &PgCatalog, at: usize) -> BTreeMap<String, Vec<PgGenericOid>> {
+    let object = &interp.pg_ts_objects[at];
+    if let Some(mapping) = interp.ts_definitions.mappings.get(&object.oid) {
+        return mapping.clone();
+    }
+    if interp.namespace_name(object.namespace) == Some("pg_catalog") {
+        // The built-in dictionaries are pinned: nothing depends on them.
+        return SEEDED_CONFIG_TOKENS
+            .iter()
+            .map(|t| ((*t).to_owned(), Vec::new()))
+            .collect();
+    }
+    BTreeMap::new()
+}
+
+/// Store configuration `config`'s mapping; it depends on the dictionaries
+/// it maps to, and on nothing else of that kind
+/// (makeConfigurationDependencies with removeOld).
+fn set_config_mapping(
+    interp: &mut PgCatalog,
+    config: PgGenericOid,
+    mapping: BTreeMap<String, Vec<PgGenericOid>>,
+) {
+    let me = crate::ddl::depend::ObjectAddress {
+        classid: crate::ddl::depend::PG_TS_CONFIG_RELID,
+        objid: config,
+        objsubid: 0,
+    };
+    interp.pg_depend.retain(|d| {
+        !(d.classid == me.classid
+            && d.objid == me.objid
+            && d.refclassid == crate::ddl::depend::PG_TS_DICT_RELID
+            && d.deptype == crate::pg_catalog::DepType::Normal)
+    });
+    let dicts: Vec<crate::ddl::depend::ObjectAddress> = mapping
+        .values()
+        .flatten()
+        .map(|&d| crate::ddl::depend::ObjectAddress {
+            classid: crate::ddl::depend::PG_TS_DICT_RELID,
+            objid: d,
+            objsubid: 0,
+        })
+        .collect();
+    crate::ddl::depend::record(interp, me, dicts, crate::pg_catalog::DepType::Normal);
+    interp.ts_definitions.mappings.insert(config, mapping);
 }
 
 #[derive(Clone, Debug)]
@@ -419,6 +498,9 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
     // A configuration's parser (named, or the copied configuration's), a
     // dictionary's template and options.
     let mut default_parser = None;
+    // The configuration's parser and the mapping it starts with (COPY's).
+    let mut parser: Option<PgGenericOid> = None;
+    let mut copied_mapping = BTreeMap::new();
     let mut template = None;
     let mut dict_options = Vec::new();
     for opt in &stmt.definition {
@@ -450,8 +532,13 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
                     object.name == "default"
                         && interp.namespace_name(object.namespace) == Some("pg_catalog"),
                 );
+                parser = Some(object.oid);
             }
-            "c" => default_parser = Some(config_uses_default_parser(interp, at)),
+            "c" => {
+                default_parser = Some(config_uses_default_parser(interp, at));
+                parser = interp.ts_definitions.parsers.get(&object.oid).copied();
+                copied_mapping = config_mapping(interp, at);
+            }
             _ => template = Some((object.namespace, object.name.clone())),
         }
     }
@@ -503,6 +590,30 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
     interp.pg_ts_objects.push(object);
     match (kind, default_parser, template) {
         ("c", Some(default_parser), _) => {
+            // makeConfigurationDependencies: the configuration depends on
+            // its parser (a built-in one is pinned) and on the dictionaries
+            // COPY gave it.
+            let config = interp.pg_ts_objects.last().map(|o| o.oid);
+            if let Some(config) = config {
+                if let Some(parser) = parser {
+                    interp.ts_definitions.parsers.insert(config, parser);
+                    crate::ddl::depend::record(
+                        interp,
+                        crate::ddl::depend::ObjectAddress {
+                            classid: crate::ddl::depend::PG_TS_CONFIG_RELID,
+                            objid: config,
+                            objsubid: 0,
+                        },
+                        [crate::ddl::depend::ObjectAddress {
+                            classid: crate::ddl::depend::PG_TS_PARSER_RELID,
+                            objid: parser,
+                            objsubid: 0,
+                        }],
+                        crate::pg_catalog::DepType::Normal,
+                    );
+                }
+                set_config_mapping(interp, config, copied_mapping);
+            }
             interp
                 .ts_definitions
                 .configs
@@ -572,13 +683,69 @@ pub fn alter_configuration(
             }
         }
     }
+    let mut dicts: Vec<PgGenericOid> = Vec::new();
     for dict in &stmt.dicts {
         if let Some(node::Node::List(l)) = dict.node.as_ref() {
-            find(interp, "d", &names_of(&l.items))?;
+            let d = position(interp, "d", &names_of(&l.items))?;
+            dicts.push(interp.pg_ts_objects[d].oid);
         }
     }
-    // The configuration depends on the dictionaries it maps to.
-    crate::ddl::depend::record_ts_mapping(interp, &names_of(&stmt.cfgname), &stmt.dicts)
+    let config = interp.pg_ts_objects[at].oid;
+    let mut mapping = config_mapping(interp, at);
+    // getTokenTypes: a token type named twice counts once.
+    let mut tokens: Vec<&str> = Vec::new();
+    for token in stmt.tokentype.iter().filter_map(node_string) {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    use typedpg_pg_query::protobuf::AlterTsConfigType as K;
+    match K::try_from(stmt.kind).unwrap_or(K::AlterTsconfigTypeUndefined) {
+        // MakeConfigurationMapping without override: a token type mapped
+        // already trips pg_ts_config_map's unique index.
+        K::AlterTsconfigAddMapping => {
+            for token in &tokens {
+                if mapping.contains_key(*token) {
+                    return Err(DdlError::DuplicateObject(
+                        "duplicate key value violates unique constraint \"pg_ts_config_map_index\""
+                            .into(),
+                    ));
+                }
+                mapping.insert((*token).to_owned(), dicts.clone());
+            }
+        }
+        K::AlterTsconfigAlterMappingForToken => {
+            for token in &tokens {
+                mapping.insert((*token).to_owned(), dicts.clone());
+            }
+        }
+        // REPLACE old WITH new, for every token type or those named.
+        K::AlterTsconfigReplaceDict | K::AlterTsconfigReplaceDictForToken => {
+            if let [old, new] = dicts.as_slice() {
+                let all = stmt.kind == K::AlterTsconfigReplaceDict as i32;
+                for (token, mapped) in &mut mapping {
+                    if all || tokens.contains(&token.as_str()) {
+                        for d in mapped.iter_mut().filter(|d| **d == *old) {
+                            *d = *new;
+                        }
+                    }
+                }
+            }
+        }
+        // DropConfigurationMapping.
+        K::AlterTsconfigDropMapping => {
+            for token in &tokens {
+                if mapping.remove(*token).is_none() && !stmt.missing_ok {
+                    return Err(DdlError::TypeNotFound(format!(
+                        "mapping for token type \"{token}\" does not exist"
+                    )));
+                }
+            }
+        }
+        K::AlterTsconfigTypeUndefined => {}
+    }
+    set_config_mapping(interp, config, mapping);
+    Ok(())
 }
 
 /// ALTER TEXT SEARCH DICTIONARY name (...) (AlterTSDictionary): the options
@@ -762,7 +929,7 @@ pub(crate) fn set_schema(
     interp: &mut PgCatalog,
     objtype: ObjectType,
     stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
-    new_ns: PgNamespaceOid,
+    new_schema: &str,
 ) -> Result<(), DdlError> {
     let (Some(kind), Some(node::Node::List(l))) = (
         kind_of(objtype),
@@ -776,12 +943,13 @@ pub(crate) fn set_schema(
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
-    if interp.pg_ts_objects[at].namespace == new_ns {
+    let old_ns = interp.pg_ts_objects[at].namespace;
+    let Some(new_ns) = super::util::set_schema_target(interp, old_ns, new_schema)? else {
         return Ok(());
-    }
+    };
     let name = interp.pg_ts_objects[at].name.clone();
     check_free(interp, kind, &name, new_ns)?;
-    let old_ns = std::mem::replace(&mut interp.pg_ts_objects[at].namespace, new_ns);
+    interp.pg_ts_objects[at].namespace = new_ns;
     interp
         .ts_definitions
         .rekey(kind, (old_ns, name.clone()), (new_ns, name));

@@ -2442,7 +2442,7 @@ pub(crate) fn rename_type(
 pub(crate) fn set_type_schema(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
-    new_nsoid: PgNamespaceOid,
+    new_schema: &str,
 ) -> Result<(), DdlError> {
     let objtype = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::ObjectType);
     let Some(oid) = alterable_type(interp, stmt.object.as_deref(), objtype, stmt.missing_ok)?
@@ -2452,9 +2452,10 @@ pub(crate) fn set_type_schema(
     let Some(t) = interp.pg_type.get(&oid).cloned() else {
         return Ok(());
     };
-    if t.typnamespace == new_nsoid {
+    let Some(new_nsoid) = super::util::set_schema_target(interp, t.typnamespace, new_schema)?
+    else {
         return Ok(());
-    }
+    };
     let taken = |interp: &PgCatalog, name: &str| {
         interp
             .type_by_qname

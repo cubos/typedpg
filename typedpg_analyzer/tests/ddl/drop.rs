@@ -2800,3 +2800,1290 @@ fn support_functions_are_checked_as_assign_proc_types_does() {
         "CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree AS FUNCTION 4 btequalimage(oid);",
     )]);
 }
+
+// ── Text search configurations, operator classes' types, misc ───────────────
+
+#[test]
+fn a_configuration_depends_on_what_its_mapping_names_now() {
+    let dicts = "CREATE TEXT SEARCH DICTIONARY d1 (template = simple);
+                 CREATE TEXT SEARCH DICTIONARY d2 (template = simple);
+                 CREATE TEXT SEARCH CONFIGURATION c (copy = english);
+                 ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword WITH d1;";
+    // Mapping elsewhere releases d1.
+    for change in [
+        "ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword WITH d2;",
+        "ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING REPLACE d1 WITH d2;",
+        "ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword REPLACE d1 WITH d2;",
+        "ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING FOR asciiword;",
+    ] {
+        build(&[
+            ("0001.sql", dicts),
+            ("0002.sql", change),
+            ("0003.sql", "DROP TEXT SEARCH DICTIONARY d1;"),
+        ]);
+    }
+    // Still mapped for another token type.
+    assert_drop_fails(
+        "CREATE TEXT SEARCH DICTIONARY d1 (template = simple);
+         CREATE TEXT SEARCH CONFIGURATION c (copy = english);
+         ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword, email WITH d1;
+         ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING FOR asciiword;",
+        "DROP TEXT SEARCH DICTIONARY d1;",
+        "cannot drop text search dictionary d1 because other objects depend on it (text search \
+         configuration c depends on text search dictionary d1)",
+    );
+    // A copy depends on the dictionaries it copied.
+    assert_drop_fails(
+        "CREATE TEXT SEARCH DICTIONARY d1 (template = simple);
+         CREATE TEXT SEARCH CONFIGURATION c (parser = default);
+         ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH d1;
+         CREATE TEXT SEARCH CONFIGURATION c2 (copy = c);
+         DROP TEXT SEARCH CONFIGURATION c;",
+        "DROP TEXT SEARCH DICTIONARY d1;",
+        "cannot drop text search dictionary d1 because other objects depend on it (text search \
+         configuration c2 depends on text search dictionary d1)",
+    );
+}
+
+#[test]
+fn a_configuration_mapping_names_each_token_type_once() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c (copy = english);",
+            "ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH simple;",
+            "duplicate key value violates unique constraint \"pg_ts_config_map_index\"",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c (parser = default);
+             ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH simple;",
+            "ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH simple;",
+            "duplicate key value violates unique constraint \"pg_ts_config_map_index\"",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c (parser = default);",
+            "ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING FOR email;",
+            "mapping for token type \"email\" does not exist",
+        ),
+    ] {
+        assert_drop_fails(setup, stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE TEXT SEARCH CONFIGURATION c (parser = default);
+         ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR email WITH simple;
+         ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING IF EXISTS FOR url;",
+    )]);
+}
+
+#[test]
+fn a_configuration_depends_on_its_parser() {
+    let parser = "CREATE TEXT SEARCH PARSER pp (start = prsd_start, gettoken = prsd_nexttoken,
+                      end = prsd_end, lextypes = prsd_lextype);
+                  CREATE TEXT SEARCH CONFIGURATION c (parser = pp);
+                  CREATE TEXT SEARCH CONFIGURATION c2 (copy = c);";
+    assert_drop_fails(
+        parser,
+        "DROP TEXT SEARCH PARSER pp;",
+        "cannot drop text search parser pp because other objects depend on it (text search \
+         configuration c depends on text search parser pp)",
+    );
+    build(&[
+        ("0001.sql", parser),
+        ("0002.sql", "DROP TEXT SEARCH PARSER pp CASCADE;"),
+        ("0003.sql", parser),
+    ]);
+}
+
+#[test]
+fn an_operator_class_depends_on_its_input_type() {
+    let class = "CREATE TYPE ty AS (a int);
+                 CREATE OPERATOR CLASS oc FOR TYPE ty USING hash AS FUNCTION 1 hashint4(int);";
+    assert_drop_fails(
+        class,
+        "DROP TYPE ty;",
+        "cannot drop type ty because other objects depend on it (operator class oc for access \
+         method hash depends on type ty)",
+    );
+    // CASCADE takes the class, not its family — nor the family's loose
+    // hashint4 member (int is not the class's type).
+    build(&[
+        ("0001.sql", class),
+        ("0002.sql", "DROP TYPE ty CASCADE;"),
+        (
+            "0003.sql",
+            "CREATE TYPE ty AS (a int);
+             CREATE OPERATOR CLASS oc FOR TYPE ty USING hash FAMILY oc AS OPERATOR 1 =(int, int);",
+        ),
+    ]);
+    assert_drop_fails(
+        &format!("{class} DROP TYPE ty CASCADE; CREATE TYPE ty AS (a int);"),
+        "CREATE OPERATOR CLASS oc FOR TYPE ty USING hash FAMILY oc AS FUNCTION 1 hashint4(int);",
+        "duplicate key value violates unique constraint \"pg_amproc_fam_proc_index\"",
+    );
+    assert_drop_fails(
+        "CREATE EXTENSION cube;
+         CREATE OPERATOR CLASS my_cube_ops FOR TYPE cube USING gist AS
+             OPERATOR 3 &&,
+             FUNCTION 1 g_cube_consistent(internal, cube, smallint, oid, internal),
+             FUNCTION 2 g_cube_union(internal, internal),
+             FUNCTION 5 g_cube_penalty(internal, internal, internal),
+             FUNCTION 6 g_cube_picksplit(internal, internal),
+             FUNCTION 7 g_cube_same(cube, cube, internal);",
+        "DROP EXTENSION cube;",
+        "cannot drop extension cube because other objects depend on it",
+    );
+}
+
+#[test]
+fn drop_routine_checks_what_depends_on_the_routine() {
+    assert_drop_fails(
+        "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select $1';
+         CREATE VIEW v AS SELECT f(1);",
+        "DROP ROUTINE f(int);",
+        "cannot drop function f(integer) because other objects depend on it (view v depends on \
+         function f(integer))",
+    );
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE PROCEDURE p(int) LANGUAGE sql AS 'select 1';
+         CREATE FUNCTION g(int) RETURNS int LANGUAGE sql AS 'select $1';
+         DROP ROUTINE p(int), g(int);",
+    )]);
+    assert!(db.find_functions(None, "p").is_empty());
+    assert!(db.find_functions(None, "g").is_empty());
+}
+
+#[test]
+fn operator_class_items_are_checked_as_pg_does() {
+    for (setup, stmt, message) in [
+        (
+            "",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS
+                 OPERATOR 1 <<<<(int, int), FUNCTION 1 btint4cmp(int, int);",
+            "operator does not exist: integer <<<< integer",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING btree;",
+            "ALTER OPERATOR FAMILY fam USING btree ADD OPERATOR 1 <<<<(int, int);",
+            "operator does not exist: integer <<<< integer",
+        ),
+        (
+            "",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING hash AS
+                 OPERATOR 3 =(int, int), FUNCTION 1 hashint4(int);",
+            "invalid operator number 3, must be between 1 and 1",
+        ),
+        (
+            "CREATE EXTENSION bloom;",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING bloom AS
+                 OPERATOR 3 =(int, int), FUNCTION 1 hashint4(int);",
+            "invalid operator number 3, must be between 1 and 1",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING hash;",
+            "ALTER OPERATOR FAMILY fam USING hash ADD OPERATOR 2 =(int, int);",
+            "invalid operator number 2, must be between 1 and 1",
+        ),
+        (
+            "",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS
+                 OPERATOR 6 =(int, int), FUNCTION 1 btint4cmp(int, int);",
+            "invalid operator number 6, must be between 1 and 5",
+        ),
+    ] {
+        let setup = if setup.is_empty() { "SELECT 1;" } else { setup };
+        assert_drop_fails(setup, stmt, message);
+    }
+    // GiST takes any strategy number.
+    build(&[(
+        "0001.sql",
+        "CREATE OPERATOR CLASS oc FOR TYPE int USING gist AS OPERATOR 100 =(int, int);",
+    )]);
+}
+
+#[test]
+fn an_operator_moved_to_another_schema_is_found_there() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s2;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         ALTER OPERATOR ===(int, int) SET SCHEMA s2;",
+    )]);
+    db.analyze("SELECT 1 OPERATOR(s2.===) 1").unwrap();
+    assert!(db.analyze("SELECT 1 === 1").is_err());
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA s2;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         ALTER OPERATOR ===(int, int) SET SCHEMA s2;
+         DROP OPERATOR s2.===(int, int);",
+    )]);
+    assert_drop_fails(
+        "CREATE SCHEMA s2;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE OPERATOR s2.=== (leftarg = int, rightarg = int, function = f);",
+        "ALTER OPERATOR ===(int, int) SET SCHEMA s2;",
+        "duplicate key value violates unique constraint \"pg_operator_oprname_l_r_n_index\"",
+    );
+}
+
+#[test]
+fn alter_extension_adds_and_drops_operators() {
+    // Out of the extension, the operator drops on its own — and then
+    // holds on to the extension's type.
+    build(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);
+         DROP OPERATOR ->(hstore, text);",
+    )]);
+    assert_drop_fails(
+        "CREATE EXTENSION hstore; ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);",
+        "DROP EXTENSION hstore;",
+        "cannot drop extension hstore because other objects depend on it",
+    );
+    assert_drop_fails(
+        "CREATE EXTENSION hstore; ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);",
+        "ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);",
+        "operator ->(hstore,text) is not a member of extension \"hstore\"",
+    );
+    assert_drop_fails(
+        "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE EXTENSION hstore;
+         ALTER EXTENSION hstore ADD OPERATOR ===(int, int);",
+        "DROP OPERATOR ===(int, int);",
+        "cannot drop operator ===(integer,integer) because extension hstore requires it",
+    );
+}
+
+#[test]
+fn drop_schema_names_its_oldest_object_of_any_kind() {
+    for (objects, oldest) in [
+        (
+            "CREATE TEXT SEARCH TEMPLATE s.tm (lexize = dsimple_lexize);
+             CREATE FUNCTION s.f() RETURNS int LANGUAGE sql AS 'select 1';",
+            "text search template s.tm",
+        ),
+        (
+            "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+             CREATE OPERATOR s.=== (leftarg = int, rightarg = int, function = f);
+             CREATE TABLE s.t (a int);",
+            "operator s.===(integer,integer)",
+        ),
+        (
+            "CREATE OPERATOR FAMILY s.fam USING btree; CREATE TABLE s.t (a int);",
+            "operator family s.fam for access method btree",
+        ),
+        (
+            "CREATE COLLATION s.c (locale = 'C'); CREATE TABLE s.t (a int);",
+            "collation s.c",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY s.d (template = simple); CREATE TABLE s.t (a int);",
+            "text search dictionary s.d",
+        ),
+    ] {
+        assert_drop_fails(
+            &format!("CREATE SCHEMA s; {objects}"),
+            "DROP SCHEMA s;",
+            &format!(
+                "cannot drop schema s because other objects depend on it ({oldest} depends on \
+                 schema s)"
+            ),
+        );
+    }
+}
+
+#[test]
+fn drop_operator_needs_its_operand_types_to_exist() {
+    for stmt in [
+        "DROP OPERATOR @>(nosuchtype, int4);",
+        "DROP OPERATOR @>(int4, nosuchtype);",
+    ] {
+        assert_drop_fails("SELECT 1;", stmt, "type \"nosuchtype\" does not exist");
+    }
+    build(&[(
+        "0001.sql",
+        "DROP OPERATOR IF EXISTS @>(nosuchtype, int4);
+         DROP OPERATOR IF EXISTS @>(int4, nosuchtype);",
+    )]);
+}
+
+#[test]
+fn a_configuration_mapping_counts_a_repeated_token_type_once() {
+    let mapped = "CREATE TEXT SEARCH CONFIGURATION c2 (copy = english);
+                  ALTER TEXT SEARCH CONFIGURATION c2 DROP MAPPING FOR email;
+                  ALTER TEXT SEARCH CONFIGURATION c2 ADD MAPPING FOR email, email WITH simple;";
+    build(&[
+        ("0001.sql", mapped),
+        (
+            "0002.sql",
+            "ALTER TEXT SEARCH CONFIGURATION c2 DROP MAPPING FOR email, email;",
+        ),
+    ]);
+    assert_drop_fails(
+        &format!("{mapped} ALTER TEXT SEARCH CONFIGURATION c2 DROP MAPPING FOR email, email;"),
+        "ALTER TEXT SEARCH CONFIGURATION c2 DROP MAPPING FOR email;",
+        "mapping for token type \"email\" does not exist",
+    );
+    // A token type mapped already still trips the unique index.
+    assert_drop_fails(
+        "CREATE TEXT SEARCH CONFIGURATION c2 (copy = english);
+         ALTER TEXT SEARCH CONFIGURATION c2 DROP MAPPING FOR email, url;
+         ALTER TEXT SEARCH CONFIGURATION c2 ADD MAPPING FOR email, url, email WITH simple;",
+        "ALTER TEXT SEARCH CONFIGURATION c2 ADD MAPPING FOR url WITH simple;",
+        "duplicate key value violates unique constraint \"pg_ts_config_map_index\"",
+    );
+}
+
+#[test]
+fn an_operator_class_depends_on_its_storage_type() {
+    let class = "CREATE TYPE t2 AS (a int);
+                 CREATE OPERATOR CLASS oc FOR TYPE int4 USING gist AS STORAGE t2;";
+    assert_drop_fails(
+        class,
+        "DROP TYPE t2;",
+        "cannot drop type t2 because other objects depend on it (operator class oc for access \
+         method gist depends on type t2)",
+    );
+    // An array storage type is part of its element type.
+    assert_drop_fails(
+        "CREATE TYPE t2 AS (a int);
+         CREATE OPERATOR CLASS oc FOR TYPE int4 USING gist AS STORAGE t2[];",
+        "DROP TYPE t2;",
+        "cannot drop type t2 because other objects depend on it",
+    );
+    // CASCADE takes the class, not its family.
+    build(&[
+        ("0001.sql", class),
+        ("0002.sql", "DROP TYPE t2 CASCADE;"),
+        (
+            "0003.sql",
+            "CREATE OPERATOR CLASS oc FOR TYPE int4 USING gist FAMILY oc AS STORAGE int4;",
+        ),
+    ]);
+    // A storage type the input type's is no storage type.
+    build(&[(
+        "0001.sql",
+        "CREATE OPERATOR CLASS oc FOR TYPE int4 USING gist AS STORAGE int4;",
+    )]);
+}
+
+#[test]
+fn an_operator_class_storage_type_is_checked_as_pg_does() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE TYPE t2 AS (a int);",
+            "CREATE OPERATOR CLASS oc FOR TYPE int4 USING hash AS
+                 STORAGE t2, FUNCTION 1 hashint4(int);",
+            "storage type cannot be different from data type for access method \"hash\"",
+        ),
+        (
+            "CREATE TYPE t2 AS (a int);",
+            "CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree AS STORAGE t2, OPERATOR 1 <;",
+            "storage type cannot be different from data type for access method \"btree\"",
+        ),
+        (
+            "CREATE TYPE t2 AS (a int); CREATE EXTENSION bloom;",
+            "CREATE OPERATOR CLASS oc FOR TYPE int4 USING bloom AS
+                 STORAGE t2, FUNCTION 1 hashint4(int);",
+            "storage type cannot be different from data type for access method \"bloom\"",
+        ),
+        (
+            "CREATE TYPE t2 AS (a int);",
+            "CREATE OPERATOR CLASS oc FOR TYPE int4 USING gist AS STORAGE t2, STORAGE t2;",
+            "storage type specified more than once",
+        ),
+        (
+            "SELECT 1;",
+            "CREATE OPERATOR CLASS oc FOR TYPE int4 USING gist AS STORAGE nope;",
+            "type \"nope\" does not exist",
+        ),
+    ] {
+        assert_drop_fails(setup, stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE TYPE t2 AS (a int);
+         CREATE OPERATOR CLASS a FOR TYPE int4 USING spgist AS STORAGE t2;
+         CREATE OPERATOR CLASS b FOR TYPE int4 USING gin AS STORAGE t2;
+         CREATE OPERATOR CLASS c FOR TYPE int4 USING brin AS STORAGE t2;
+         CREATE OPERATOR CLASS d FOR TYPE int4 USING btree AS STORAGE int4, OPERATOR 1 <;",
+    )]);
+}
+
+#[test]
+fn a_missing_operator_is_reported_as_pg_does() {
+    let setup = "CREATE SCHEMA s; CREATE SCHEMA \"My S\";";
+    for (stmt, message) in [
+        // op_signature_string: no left side for a prefix operator, the
+        // name as written.
+        (
+            "DROP OPERATOR === (NONE, int);",
+            "operator does not exist: === integer",
+        ),
+        (
+            "ALTER OPERATOR === (NONE, int) SET SCHEMA s;",
+            "operator does not exist: === integer",
+        ),
+        (
+            "DROP OPERATOR s.=== (int, int);",
+            "operator does not exist: integer s.=== integer",
+        ),
+        (
+            "ALTER OPERATOR s.=== (int, int) SET SCHEMA public;",
+            "operator does not exist: integer s.=== integer",
+        ),
+        (
+            "DROP OPERATOR s.=== (NONE, int);",
+            "operator does not exist: s.=== integer",
+        ),
+        (
+            "DROP OPERATOR \"My S\".=== (int, int);",
+            "operator does not exist: integer My S.=== integer",
+        ),
+        (
+            "DROP OPERATOR nosuch.=== (int, int);",
+            "operator does not exist: integer nosuch.=== integer",
+        ),
+        (
+            "DROP OPERATOR === (int[], text);",
+            "operator does not exist: integer[] === text",
+        ),
+        (
+            "ALTER OPERATOR === (NONE, int) SET (restrict = eqsel);",
+            "operator does not exist: === integer",
+        ),
+        (
+            "ALTER OPERATOR s.=== (int, int) SET (restrict = eqsel);",
+            "operator does not exist: integer s.=== integer",
+        ),
+        (
+            "COMMENT ON OPERATOR === (NONE, int) IS 'x';",
+            "operator does not exist: === integer",
+        ),
+        (
+            "ALTER OPERATOR s.=== (int, int) OWNER TO CURRENT_USER;",
+            "operator does not exist: integer s.=== integer",
+        ),
+        (
+            "CREATE FUNCTION neg(int) RETURNS int LANGUAGE sql AS 'select -$1';
+             CREATE OPERATOR ~~~ (rightarg = int, function = neg);
+             ALTER OPERATOR ~~~ (NONE, int) SET (negator = !!!);",
+            "operator does not exist: !!! integer",
+        ),
+        // LookupOperName: no postfix operator exists any more.
+        (
+            "DROP OPERATOR === (int, NONE);",
+            "postfix operators are not supported",
+        ),
+        (
+            "ALTER OPERATOR === (int, NONE) SET SCHEMA s;",
+            "postfix operators are not supported",
+        ),
+        (
+            "ALTER OPERATOR = (int, NONE) SET (restrict = eqsel);",
+            "postfix operators are not supported",
+        ),
+        (
+            "COMMENT ON OPERATOR = (int, NONE) IS 'x';",
+            "postfix operators are not supported",
+        ),
+        (
+            "ALTER OPERATOR = (int, NONE) OWNER TO CURRENT_USER;",
+            "postfix operators are not supported",
+        ),
+        (
+            "ALTER EXTENSION plpgsql ADD OPERATOR = (int, NONE);",
+            "postfix operators are not supported",
+        ),
+        (
+            "DROP OPERATOR === (nosuch, NONE);",
+            "type \"nosuch\" does not exist",
+        ),
+    ] {
+        assert_drop_fails(setup, stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "DROP OPERATOR IF EXISTS === (int, NONE);
+         DROP OPERATOR IF EXISTS === (nosuch, NONE);
+         DROP OPERATOR IF EXISTS nosuch.=== (int, int);",
+    )]);
+}
+
+#[test]
+fn an_operator_family_member_is_looked_up_as_pg_does() {
+    for (stmt, message) in [
+        (
+            "ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 - (NONE, int);",
+            "index operators must be binary",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 === (NONE, int);",
+            "operator does not exist: === integer",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 < (int, NONE);",
+            "postfix operators are not supported",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 === (nosuch, NONE);",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING btree ADD OPERATOR 1 < (int, nosuch);",
+            "type \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS OPERATOR 1 - (NONE, int);",
+            "index operators must be binary",
+        ),
+        (
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS OPERATOR 1 s.=== (int, int);",
+            "operator does not exist: integer s.=== integer",
+        ),
+    ] {
+        assert_drop_fails(
+            "CREATE SCHEMA s; CREATE OPERATOR FAMILY f USING btree;",
+            stmt,
+            message,
+        );
+    }
+}
+
+#[test]
+fn set_schema_never_moves_into_or_out_of_the_temporary_or_toast_schema() {
+    let objects = "CREATE SCHEMA s;
+         CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+         CREATE PROCEDURE p(int) LANGUAGE sql AS 'select 1';
+         CREATE AGGREGATE ag(int) (sfunc = int4pl, stype = int);
+         CREATE TYPE ty AS (a int);
+         CREATE DOMAIN dom AS int;
+         CREATE TYPE en AS ENUM ('a');
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = int4eq);
+         CREATE OPERATOR FAMILY fam USING btree;
+         CREATE OPERATOR CLASS oc FOR TYPE int USING hash AS FUNCTION 1 hashint4(int);
+         CREATE COLLATION co (locale = 'C');
+         CREATE CONVERSION cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+         CREATE TABLE t (a int, b int);
+         CREATE STATISTICS st ON a, b FROM t;
+         CREATE TEXT SEARCH CONFIGURATION tc (copy = english);
+         CREATE TEXT SEARCH DICTIONARY td (template = simple);
+         CREATE TEXT SEARCH PARSER tp (start = prsd_start, gettoken = prsd_nexttoken,
+             end = prsd_end, lextypes = prsd_lextype);
+         CREATE TEXT SEARCH TEMPLATE tt (lexize = dsimple_lexize);
+         CREATE EXTENSION citext SCHEMA s;";
+    let temporary = "cannot move objects into or out of temporary schemas";
+    let toast = "cannot move objects into or out of TOAST schema";
+    for (stmt, message) in [
+        ("ALTER FUNCTION f(int) SET SCHEMA pg_temp;", temporary),
+        ("ALTER PROCEDURE p(int) SET SCHEMA pg_temp;", temporary),
+        ("ALTER ROUTINE f(int) SET SCHEMA pg_temp;", temporary),
+        ("ALTER AGGREGATE ag(int) SET SCHEMA pg_temp;", temporary),
+        ("ALTER TYPE ty SET SCHEMA pg_temp;", temporary),
+        ("ALTER TYPE en SET SCHEMA pg_temp;", temporary),
+        ("ALTER DOMAIN dom SET SCHEMA pg_temp;", temporary),
+        (
+            "ALTER OPERATOR === (int, int) SET SCHEMA pg_temp;",
+            temporary,
+        ),
+        (
+            "ALTER OPERATOR FAMILY fam USING btree SET SCHEMA pg_temp;",
+            temporary,
+        ),
+        (
+            "ALTER OPERATOR CLASS oc USING hash SET SCHEMA pg_temp;",
+            temporary,
+        ),
+        ("ALTER COLLATION co SET SCHEMA pg_temp;", temporary),
+        ("ALTER CONVERSION cv SET SCHEMA pg_temp;", temporary),
+        ("ALTER STATISTICS st SET SCHEMA pg_temp;", temporary),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION tc SET SCHEMA pg_temp;",
+            temporary,
+        ),
+        (
+            "ALTER TEXT SEARCH DICTIONARY td SET SCHEMA pg_temp;",
+            temporary,
+        ),
+        ("ALTER TEXT SEARCH PARSER tp SET SCHEMA pg_temp;", temporary),
+        (
+            "ALTER TEXT SEARCH TEMPLATE tt SET SCHEMA pg_temp;",
+            temporary,
+        ),
+        ("ALTER EXTENSION citext SET SCHEMA pg_temp;", temporary),
+        ("ALTER FUNCTION f(int) SET SCHEMA pg_toast;", toast),
+        ("ALTER TYPE ty SET SCHEMA pg_toast;", toast),
+        ("ALTER CONVERSION cv SET SCHEMA pg_toast;", toast),
+        ("ALTER STATISTICS st SET SCHEMA pg_toast;", toast),
+        (
+            "ALTER OPERATOR FAMILY fam USING btree SET SCHEMA pg_toast;",
+            toast,
+        ),
+        ("ALTER EXTENSION citext SET SCHEMA pg_toast;", toast),
+        // The object is looked up first.
+        (
+            "ALTER FUNCTION nof(int) SET SCHEMA pg_temp;",
+            "function nof(integer) does not exist",
+        ),
+        (
+            "ALTER TYPE noty SET SCHEMA pg_temp;",
+            "type \"noty\" does not exist",
+        ),
+        (
+            "ALTER EXTENSION noext SET SCHEMA nosch;",
+            "extension \"noext\" does not exist",
+        ),
+        (
+            "ALTER TYPE ty SET SCHEMA pg_temp_3;",
+            "schema \"pg_temp_3\" does not exist",
+        ),
+        // The control file is checked before the schema.
+        (
+            "ALTER EXTENSION plpgsql SET SCHEMA pg_temp;",
+            "extension \"plpgsql\" does not support SET SCHEMA",
+        ),
+        // Out of it, too.
+        (
+            "CREATE FUNCTION pg_temp.g(int) RETURNS int LANGUAGE sql AS 'select 1';
+             ALTER FUNCTION pg_temp.g(int) SET SCHEMA public;",
+            temporary,
+        ),
+        (
+            "CREATE TYPE pg_temp.ty2 AS (a int); ALTER TYPE pg_temp.ty2 SET SCHEMA public;",
+            temporary,
+        ),
+        (
+            "CREATE OPERATOR pg_temp.=== (leftarg = int, rightarg = int, function = int4eq);
+             ALTER OPERATOR pg_temp.=== (int, int) SET SCHEMA public;",
+            temporary,
+        ),
+        (
+            "CREATE OPERATOR FAMILY pg_temp.fam2 USING btree;
+             ALTER OPERATOR FAMILY pg_temp.fam2 USING btree SET SCHEMA public;",
+            temporary,
+        ),
+        (
+            "CREATE CONVERSION pg_temp.cv2 FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+             ALTER CONVERSION pg_temp.cv2 SET SCHEMA public;",
+            temporary,
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY pg_temp.td2 (template = simple);
+             ALTER TEXT SEARCH DICTIONARY pg_temp.td2 SET SCHEMA public;",
+            temporary,
+        ),
+    ] {
+        assert_drop_fails(objects, stmt, message);
+    }
+    // Where it is already, nothing moves.
+    build(&[
+        ("0001.sql", objects),
+        (
+            "0002.sql",
+            "ALTER EXTENSION plpgsql SET SCHEMA pg_catalog;
+             CREATE FUNCTION pg_temp.g(int) RETURNS int LANGUAGE sql AS 'select 1';
+             ALTER FUNCTION pg_temp.g(int) SET SCHEMA pg_temp;",
+        ),
+    ]);
+}
+
+#[test]
+fn conversions_and_statistics_objects_move_to_another_schema() {
+    let objects = "CREATE SCHEMA s; CREATE SCHEMA s2;
+                   CREATE TABLE t (a int, b int);
+                   CREATE CONVERSION s.cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+                   CREATE STATISTICS s.st ON a, b FROM t;";
+    build(&[
+        ("0001.sql", objects),
+        (
+            "0002.sql",
+            "ALTER CONVERSION s.cv SET SCHEMA s2;
+             ALTER STATISTICS s.st SET SCHEMA s2;
+             DROP SCHEMA s;
+             DROP CONVERSION s2.cv;
+             DROP STATISTICS s2.st;",
+        ),
+    ]);
+    for (stmt, message) in [
+        (
+            "CREATE CONVERSION s2.cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+             ALTER CONVERSION s.cv SET SCHEMA s2;",
+            "conversion \"cv\" already exists in schema \"s2\"",
+        ),
+        (
+            "CREATE STATISTICS s2.st ON a, b FROM t; ALTER STATISTICS s.st SET SCHEMA s2;",
+            "statistics object \"st\" already exists in schema \"s2\"",
+        ),
+        (
+            "ALTER CONVERSION nocv SET SCHEMA s2;",
+            "conversion \"nocv\" does not exist",
+        ),
+        (
+            "ALTER STATISTICS nost SET SCHEMA s2;",
+            "statistics object \"nost\" does not exist",
+        ),
+        // get_conversion_oid, get_statistics_object_oid: the schema first.
+        (
+            "DROP CONVERSION nosch.cv;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "DROP STATISTICS nosch.st;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "ALTER CONVERSION nosch.cv RENAME TO x;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "ALTER STATISTICS nosch.st RENAME TO x;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "ALTER STATISTICS nosch.st SET STATISTICS 1;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "ALTER CONVERSION nosch.cv SET SCHEMA public;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "COMMENT ON CONVERSION nosch.cv IS 'x';",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "COMMENT ON STATISTICS nosch.st IS 'x';",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "DROP SCHEMA s CASCADE; DROP CONVERSION s.cv;",
+            "schema \"s\" does not exist",
+        ),
+    ] {
+        assert_drop_fails(objects, stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "DROP CONVERSION IF EXISTS nosch.cv;
+         DROP STATISTICS IF EXISTS nosch.st;
+         ALTER STATISTICS IF EXISTS nosch.st SET STATISTICS 1;",
+    )]);
+}
+
+#[test]
+fn drop_schema_names_conversions_statistics_and_extensions() {
+    for (setup, schema, oldest) in [
+        (
+            "CREATE SCHEMA s;
+             CREATE CONVERSION s.cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+             CREATE TABLE s.t (a int, b int);",
+            "s",
+            "conversion s.cv",
+        ),
+        (
+            "CREATE SCHEMA s;
+             CREATE CONVERSION s.cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;",
+            "s",
+            "conversion s.cv",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE t2 (a int, b int);
+             CREATE STATISTICS s.st ON a, b FROM t2;",
+            "s",
+            "statistics object s.st",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE t2 (a int, b int);
+             CREATE STATISTICS s.st ON a, b FROM t2; CREATE TABLE s.t3 (a int);",
+            "s",
+            "statistics object s.st",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE s.t3 (a int, b int);
+             CREATE STATISTICS s.st3 ON a, b FROM s.t3;",
+            "s",
+            "table s.t3",
+        ),
+        (
+            "CREATE SCHEMA \"M s\"; CREATE TABLE t2 (a int, b int);
+             CREATE STATISTICS \"M s\".\"S t\" ON a, b FROM t2;",
+            "\"M s\"",
+            "statistics object \"M s\".\"S t\"",
+        ),
+        (
+            "CREATE CONVERSION \"C v\" FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;",
+            "public",
+            "conversion \"C v\"",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE EXTENSION citext SCHEMA s;",
+            "s",
+            "extension citext",
+        ),
+        (
+            "CREATE SCHEMA s; CREATE EXTENSION hstore SCHEMA s;",
+            "s",
+            "extension hstore",
+        ),
+    ] {
+        let shown = schema.trim_matches('"');
+        assert_drop_fails(
+            setup,
+            &format!("DROP SCHEMA {schema};"),
+            &format!(
+                "cannot drop schema {shown} because other objects depend on it ({oldest} \
+                 depends on schema {shown})"
+            ),
+        );
+    }
+    // CASCADE takes an extension in it along.
+    build(&[
+        (
+            "0001.sql",
+            "CREATE SCHEMA s; CREATE EXTENSION hstore SCHEMA s;",
+        ),
+        (
+            "0002.sql",
+            "DROP SCHEMA s CASCADE; CREATE EXTENSION hstore;",
+        ),
+    ]);
+    assert_drop_fails(
+        "CREATE SCHEMA s; CREATE EXTENSION citext SCHEMA s;",
+        "DROP SCHEMA s CASCADE; DROP EXTENSION citext;",
+        "extension \"citext\" does not exist",
+    );
+}
+
+/// An extension's member that a cascade reaches takes the whole extension
+/// along (findDependentObjects deletes its owning object instead), and
+/// without CASCADE the extension is what is reported.
+#[test]
+fn a_cascade_reaching_an_extension_member_drops_the_extension() {
+    let member = "CREATE EXTENSION citext; CREATE SCHEMA s;
+                  CREATE TYPE ty AS (a int);
+                  CREATE FUNCTION f(ty, int) RETURNS bool LANGUAGE sql AS 'select true';
+                  CREATE OPERATOR s.=== (leftarg = ty, rightarg = int, function = f);
+                  ALTER EXTENSION citext ADD OPERATOR s.===(ty, int);
+                  CREATE TABLE tt (a int, c citext);";
+    for drop in [
+        "DROP SCHEMA s CASCADE;",
+        "DROP FUNCTION f(ty, int) CASCADE;",
+        "DROP TYPE ty CASCADE;",
+    ] {
+        assert_drop_fails(
+            member,
+            &format!("{drop} DROP EXTENSION citext;"),
+            "extension \"citext\" does not exist",
+        );
+        // The extension's own dependents went too.
+        build(&[
+            ("0001.sql", member),
+            (
+                "0002.sql",
+                &format!("{drop} CREATE EXTENSION citext; ALTER TABLE tt ADD COLUMN c int;"),
+            ),
+        ]);
+    }
+    for (drop, message) in [
+        (
+            "DROP SCHEMA s;",
+            "cannot drop schema s because other objects depend on it (extension citext depends \
+             on schema s)",
+        ),
+        (
+            "DROP FUNCTION f(ty, int);",
+            "cannot drop function f(ty,integer) because other objects depend on it (extension \
+             citext depends on function f(ty,integer))",
+        ),
+        (
+            "DROP TYPE ty;",
+            "cannot drop type ty because other objects depend on it (function f(ty,integer) \
+             depends on type ty)",
+        ),
+        (
+            "DROP OPERATOR s.===(ty, int) CASCADE;",
+            "cannot drop operator s.===(ty,integer) because extension citext requires it",
+        ),
+    ] {
+        assert_drop_fails(member, drop, message);
+    }
+    // The oldest object in the schema comes first, the member included.
+    assert_drop_fails(
+        "CREATE EXTENSION citext; CREATE SCHEMA s; CREATE TABLE s.x (a int);
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql AS 'select true';
+         CREATE OPERATOR s.=== (leftarg = int, rightarg = int, function = f);
+         ALTER EXTENSION citext ADD OPERATOR s.===(int, int);",
+        "DROP SCHEMA s;",
+        "cannot drop schema s because other objects depend on it (table s.x depends on schema s)",
+    );
+    // A plain operator goes with the function a type's CASCADE takes.
+    build(&[
+        (
+            "0001.sql",
+            "CREATE TYPE ty2 AS (a int);
+             CREATE FUNCTION g(ty2, int) RETURNS bool LANGUAGE sql AS 'select true';
+             CREATE OPERATOR ==== (leftarg = ty2, rightarg = int, function = g);",
+        ),
+        (
+            "0002.sql",
+            "DROP TYPE ty2 CASCADE;
+             CREATE TYPE ty2 AS (a int);
+             CREATE FUNCTION g(ty2, int) RETURNS bool LANGUAGE sql AS 'select true';
+             CREATE OPERATOR ==== (leftarg = ty2, rightarg = int, function = g);",
+        ),
+    ]);
+}
+
+#[test]
+fn drop_function_does_not_drop_an_aggregate() {
+    let routines = "CREATE AGGREGATE ag(int) (sfunc = int4pl, stype = int);
+                    CREATE PROCEDURE p(int) LANGUAGE sql AS 'select 1';
+                    CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select 1';
+                    CREATE SCHEMA s;
+                    CREATE AGGREGATE s.ag2(int) (sfunc = int4pl, stype = int);";
+    for (stmt, message) in [
+        ("DROP FUNCTION ag(int);", "\"ag\" is an aggregate function"),
+        (
+            "DROP FUNCTION IF EXISTS ag(int);",
+            "\"ag\" is an aggregate function",
+        ),
+        ("DROP FUNCTION ag;", "\"ag\" is an aggregate function"),
+        (
+            "DROP FUNCTION s.ag2(int);",
+            "\"s.ag2\" is an aggregate function",
+        ),
+        (
+            "DROP FUNCTION f(int), ag(int);",
+            "\"ag\" is an aggregate function",
+        ),
+        ("DROP PROCEDURE ag(int);", "ag(integer) is not a procedure"),
+        ("DROP PROCEDURE f(int);", "f(integer) is not a procedure"),
+        ("DROP FUNCTION p(int);", "p(integer) is not a function"),
+        (
+            "DROP AGGREGATE f(int);",
+            "function f(integer) is not an aggregate",
+        ),
+    ] {
+        assert_drop_fails(routines, stmt, message);
+    }
+    build(&[
+        ("0001.sql", routines),
+        (
+            "0002.sql",
+            "DROP ROUTINE ag(int); DROP AGGREGATE s.ag2(int);",
+        ),
+    ]);
+}
+
+#[test]
+fn drop_schema_names_a_schema_not_the_temporary_one() {
+    // DROP SCHEMA looks the name up as is (get_namespace_oid): `pg_temp`
+    // is no alias of the session's temporary schema there.
+    let temporary = "CREATE OPERATOR CLASS pg_temp.oc FOR TYPE int USING btree AS OPERATOR 1 <;";
+    for stmt in [
+        "DROP SCHEMA pg_temp;",
+        "DROP SCHEMA pg_temp CASCADE;",
+        "DROP SCHEMA \"pg_temp\";",
+    ] {
+        assert_drop_fails(temporary, stmt, "schema \"pg_temp\" does not exist");
+    }
+    assert_drop_fails(
+        "",
+        "DROP SCHEMA pg_temp;",
+        "schema \"pg_temp\" does not exist",
+    );
+    build(&[
+        ("0001.sql", temporary),
+        ("0002.sql", "DROP SCHEMA IF EXISTS pg_temp;"),
+        ("0003.sql", "DROP OPERATOR CLASS pg_temp.oc USING btree;"),
+    ]);
+}
+
+#[test]
+fn alter_operator_family_add_takes_no_storage() {
+    let families = "CREATE OPERATOR FAMILY f USING gist; CREATE OPERATOR FAMILY fb USING btree;";
+    let storage = "STORAGE cannot be specified in ALTER OPERATOR FAMILY";
+    for (stmt, message) in [
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD STORAGE int;",
+            storage,
+        ),
+        (
+            "ALTER OPERATOR FAMILY fb USING btree ADD STORAGE int;",
+            storage,
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD STORAGE nosuchtype;",
+            storage,
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD OPERATOR 1 << (box, box), STORAGE int;",
+            storage,
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD STORAGE int, OPERATOR 1 << (box, box);",
+            storage,
+        ),
+        // The items before it are checked first.
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD OPERATOR 1 << (box, box), \
+             OPERATOR 1 << (box, box), STORAGE int;",
+            "operator number 1 for (box,box) appears more than once",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD OPERATOR 1 <<, STORAGE int;",
+            "operator argument types must be specified in ALTER OPERATOR FAMILY",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD FUNCTION 99 lower(text), STORAGE int;",
+            "invalid function number 99, must be between 1 and 12",
+        ),
+        // No input type to default an operator's operands to.
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD OPERATOR 1 <<;",
+            "operator argument types must be specified in ALTER OPERATOR FAMILY",
+        ),
+        (
+            "ALTER OPERATOR FAMILY f USING gist ADD OPERATOR 1 << FOR ORDER BY integer_ops;",
+            "operator argument types must be specified in ALTER OPERATOR FAMILY",
+        ),
+    ] {
+        assert_drop_fails(families, stmt, message);
+    }
+}
+
+#[test]
+fn drop_in_a_missing_schema_reports_the_schema() {
+    let missing = "schema \"s\" does not exist";
+    // The schema existed, and went with what was in it.
+    assert_drop_fails(
+        "CREATE SCHEMA s; CREATE TABLE s.t(a int); DROP SCHEMA s CASCADE;",
+        "DROP TABLE s.t;",
+        missing,
+    );
+    let stmts = [
+        "DROP TABLE s.t;",
+        "DROP VIEW s.t;",
+        "DROP INDEX s.t;",
+        "DROP SEQUENCE s.t;",
+        "DROP MATERIALIZED VIEW s.t;",
+        "DROP FOREIGN TABLE s.t;",
+        "DROP TYPE s.t;",
+        "DROP TYPE s.t[];",
+        "DROP DOMAIN s.t;",
+        "DROP FUNCTION s.f(int);",
+        "DROP FUNCTION s.f;",
+        "DROP FUNCTION f(s.t);",
+        "DROP PROCEDURE s.f(int);",
+        "DROP PROCEDURE p(s.t);",
+        "DROP ROUTINE s.f(int);",
+        "DROP AGGREGATE s.f(int);",
+        "DROP AGGREGATE f(s.t);",
+        "DROP OPERATOR === (s.t, int);",
+        "DROP COLLATION s.c;",
+        "DROP TEXT SEARCH CONFIGURATION s.c;",
+        "DROP TEXT SEARCH DICTIONARY s.c;",
+        "DROP TEXT SEARCH PARSER s.c;",
+        "DROP TEXT SEARCH TEMPLATE s.c;",
+        "DROP OPERATOR CLASS s.c USING btree;",
+        "DROP OPERATOR FAMILY s.c USING btree;",
+        "DROP CONVERSION s.c;",
+        "DROP STATISTICS s.c;",
+        "DROP TRIGGER tr ON s.t;",
+        "DROP POLICY p ON s.t;",
+        "DROP RULE r ON s.t;",
+        "DROP CAST (s.t AS int);",
+        "DROP CAST (int AS s.t);",
+        "DROP TRANSFORM FOR s.t LANGUAGE sql;",
+    ];
+    // `pg_temp` names no schema until the session has a temporary one.
+    let in_pg_temp: Vec<String> = stmts
+        .iter()
+        .map(|s| s.replace(" s.", " pg_temp.").replace("(s.", "(pg_temp."))
+        .collect();
+    for stmt in &in_pg_temp {
+        assert_drop_fails("", stmt, "schema \"pg_temp\" does not exist");
+    }
+    for stmt in stmts {
+        assert_drop_fails("", stmt, missing);
+        // IF EXISTS skips it.
+        let if_exists = stmt
+            .replacen(
+                "DROP TEXT SEARCH CONFIGURATION ",
+                "DROP TEXT SEARCH CONFIGURATION IF EXISTS ",
+                1,
+            )
+            .replacen(
+                "DROP TEXT SEARCH DICTIONARY ",
+                "DROP TEXT SEARCH DICTIONARY IF EXISTS ",
+                1,
+            )
+            .replacen(
+                "DROP TEXT SEARCH PARSER ",
+                "DROP TEXT SEARCH PARSER IF EXISTS ",
+                1,
+            )
+            .replacen(
+                "DROP TEXT SEARCH TEMPLATE ",
+                "DROP TEXT SEARCH TEMPLATE IF EXISTS ",
+                1,
+            )
+            .replacen(
+                "DROP MATERIALIZED VIEW ",
+                "DROP MATERIALIZED VIEW IF EXISTS ",
+                1,
+            )
+            .replacen("DROP FOREIGN TABLE ", "DROP FOREIGN TABLE IF EXISTS ", 1)
+            .replacen("DROP OPERATOR CLASS ", "DROP OPERATOR CLASS IF EXISTS ", 1)
+            .replacen(
+                "DROP OPERATOR FAMILY ",
+                "DROP OPERATOR FAMILY IF EXISTS ",
+                1,
+            )
+            .replacen("DROP TRANSFORM ", "DROP TRANSFORM IF EXISTS ", 1)
+            .replacen("DROP CAST ", "DROP CAST IF EXISTS ", 1);
+        let if_exists = if if_exists == stmt {
+            let (kind, rest) = stmt.split_once(' ').unwrap().1.split_once(' ').unwrap();
+            format!("DROP {kind} IF EXISTS {rest}")
+        } else {
+            if_exists
+        };
+        try_apply(&[("0001.sql", &if_exists)]).unwrap_or_else(|e| panic!("{if_exists}: {e}"));
+    }
+    // An operator is looked up by its name and operand types together.
+    assert_drop_fails(
+        "",
+        "DROP OPERATOR s.=== (int, int);",
+        "operator does not exist: integer s.=== integer",
+    );
+    build(&[("0001.sql", "DROP OPERATOR IF EXISTS s.=== (int, int);")]);
+}
+
+#[test]
+fn a_built_in_object_is_required_by_the_database_system() {
+    for (stmt, desc) in [
+        (
+            "DROP TEXT SEARCH DICTIONARY simple;",
+            "text search dictionary simple",
+        ),
+        (
+            "DROP TEXT SEARCH CONFIGURATION simple;",
+            "text search configuration simple",
+        ),
+        (
+            "DROP TEXT SEARCH PARSER \"default\";",
+            "text search parser \"default\"",
+        ),
+        (
+            "DROP TEXT SEARCH TEMPLATE simple;",
+            "text search template simple",
+        ),
+        ("DROP TYPE int4;", "type integer"),
+        ("DROP TYPE int4 CASCADE;", "type integer"),
+        ("DROP TYPE IF EXISTS int4;", "type integer"),
+        ("DROP TYPE int4[];", "type integer[]"),
+        ("DROP TYPE pg_catalog.record;", "type record"),
+        ("DROP TYPE anyelement;", "type anyelement"),
+        ("DROP TYPE pg_class;", "type pg_class"),
+        ("DROP FUNCTION lower(text);", "function lower(text)"),
+        ("DROP FUNCTION lower(text) CASCADE;", "function lower(text)"),
+        (
+            "DROP FUNCTION pg_catalog.lower(text);",
+            "function lower(text)",
+        ),
+        ("DROP ROUTINE lower(text);", "function lower(text)"),
+        ("DROP AGGREGATE sum(int);", "function sum(integer)"),
+        ("DROP AGGREGATE count(*);", "function count()"),
+        ("DROP COLLATION \"C\";", "collation \"C\""),
+        ("DROP COLLATION \"default\";", "collation \"default\""),
+        ("DROP COLLATION ucs_basic;", "collation ucs_basic"),
+        ("DROP OPERATOR +(int, int);", "operator +(integer,integer)"),
+        ("DROP OPERATOR ||(text, text);", "operator ||(text,text)"),
+        (
+            "DROP OPERATOR CLASS int4_ops USING btree;",
+            "operator class int4_ops for access method btree",
+        ),
+        (
+            "DROP OPERATOR FAMILY integer_ops USING btree;",
+            "operator family integer_ops for access method btree",
+        ),
+        ("DROP ACCESS METHOD btree;", "access method btree"),
+        ("DROP ACCESS METHOD heap;", "access method heap"),
+        ("DROP CAST (int AS bigint);", "cast from integer to bigint"),
+        ("DROP CAST (int AS bool);", "cast from integer to boolean"),
+        (
+            "DROP CONVERSION utf8_to_iso_8859_1;",
+            "conversion utf8_to_iso_8859_1",
+        ),
+        ("DROP LANGUAGE sql;", "language sql"),
+        ("DROP LANGUAGE internal;", "language internal"),
+        ("DROP SCHEMA pg_catalog;", "schema pg_catalog"),
+        (
+            "DROP TEXT SEARCH DICTIONARY IF EXISTS simple;",
+            "text search dictionary simple",
+        ),
+        ("DROP COLLATION IF EXISTS \"C\";", "collation \"C\""),
+    ] {
+        assert_drop_fails(
+            "",
+            stmt,
+            &format!("cannot drop {desc} because it is required by the database system"),
+        );
+    }
+    // A built-in conversion wins over one of the same name a migration
+    // made, unless the path puts pg_catalog after it.
+    let shadowing =
+        "CREATE CONVERSION utf8_to_iso_8859_1 FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;";
+    let pinned = "cannot drop conversion utf8_to_iso_8859_1 because it is required by the \
+                  database system";
+    for stmt in [
+        "DROP CONVERSION utf8_to_iso_8859_1;",
+        "DROP CONVERSION IF EXISTS utf8_to_iso_8859_1;",
+        "DROP CONVERSION pg_catalog.utf8_to_iso_8859_1;",
+        "SET search_path = public, pg_catalog; DROP CONVERSION utf8_to_iso_8859_1; \
+         DROP CONVERSION utf8_to_iso_8859_1;",
+    ] {
+        assert_drop_fails(shadowing, stmt, pinned);
+    }
+    build(&[
+        ("0001.sql", shadowing),
+        (
+            "0002.sql",
+            "SET search_path = public, pg_catalog; DROP CONVERSION utf8_to_iso_8859_1;",
+        ),
+    ]);
+    // What initdb creates after the core (the snowball dictionaries and
+    // their configurations, the public schema) is not pinned, but its
+    // objects depend on one another.
+    for (stmt, desc) in [
+        (
+            "DROP TEXT SEARCH DICTIONARY english_stem;",
+            "text search dictionary english_stem",
+        ),
+        (
+            "DROP TEXT SEARCH TEMPLATE snowball;",
+            "text search template snowball",
+        ),
+    ] {
+        assert_drop_fails(
+            "",
+            stmt,
+            &format!("cannot drop {desc} because other objects depend on it"),
+        );
+    }
+    build(&[
+        ("0001.sql", "DROP TEXT SEARCH CONFIGURATION english;"),
+        (
+            "0002.sql",
+            "DROP TEXT SEARCH DICTIONARY english_stem CASCADE;",
+        ),
+        ("0003.sql", "DROP TEXT SEARCH TEMPLATE snowball CASCADE;"),
+        ("0004.sql", "DROP SCHEMA public;"),
+    ]);
+}

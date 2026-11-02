@@ -1357,7 +1357,7 @@ pub(crate) fn rename_routine(
 pub(crate) fn set_routine_schema(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
-    new_nsoid: PgNamespaceOid,
+    new_schema: &str,
     objtype: ObjectType,
 ) -> Result<(), DdlError> {
     let Some(node::Node::ObjectWithArgs(owa)) =
@@ -1371,9 +1371,11 @@ pub(crate) fn set_routine_schema(
     let Some(proc) = interp.pg_proc.get(&oid).cloned() else {
         return Ok(());
     };
-    if proc.pronamespace != new_nsoid {
-        check_no_function_in_namespace(interp, &proc.proname, &proc.proargtypes, new_nsoid)?;
-    }
+    let Some(new_nsoid) = super::util::set_schema_target(interp, proc.pronamespace, new_schema)?
+    else {
+        return Ok(());
+    };
+    check_no_function_in_namespace(interp, &proc.proname, &proc.proargtypes, new_nsoid)?;
     interp.rename_pg_proc(oid, proc.proname.clone(), new_nsoid);
     Ok(())
 }

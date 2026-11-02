@@ -455,7 +455,7 @@ pub struct PgCatalog {
     /// Materialized views created or refreshed WITH NO DATA.
     pub(crate) unpopulated_matviews: Shared<std::collections::HashSet<PgClassOid>>,
     /// Encoding conversions created by migrations.
-    pub(crate) conversions: Shared<Vec<(String, PgNamespaceOid)>>,
+    pub(crate) conversions: Shared<Vec<crate::ddl::conversions::Conversion>>,
     /// Event triggers and the function each executes.
     pub(crate) event_triggers: Shared<Vec<(String, crate::oid::PgProcOid)>>,
     /// Enum labels added in the current transaction to a type created
@@ -1911,6 +1911,23 @@ impl PgCatalog {
             .or_default()
             .push(row.oid);
         self.pg_operator.insert(row.oid, row);
+    }
+
+    /// ALTER OPERATOR ... SET SCHEMA: operator `oid` now lives in `nsoid`.
+    pub(crate) fn move_pg_operator(&mut self, oid: PgOperatorOid, nsoid: PgNamespaceOid) {
+        let Some(row) = self.pg_operator.get_mut(&oid) else {
+            return;
+        };
+        let old = (row.oprnamespace, row.oprname.clone());
+        row.oprnamespace = nsoid;
+        let new = (nsoid, row.oprname.clone());
+        if let Some(v) = self.operator_by_qname.get_mut(&old) {
+            v.retain(|&o| o != oid);
+            if v.is_empty() {
+                self.operator_by_qname.remove(&old);
+            }
+        }
+        self.operator_by_qname.entry(new).or_default().push(oid);
     }
 
     pub(crate) fn remove_pg_operator(&mut self, oid: PgOperatorOid) -> Option<PgOperator> {

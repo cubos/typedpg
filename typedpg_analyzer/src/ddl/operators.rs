@@ -46,18 +46,20 @@ fn def_bool(de: &DefElem) -> bool {
 }
 
 /// `op_signature_string`: `left op right` (`NONE` for a missing left).
-fn op_signature(
+/// op_signature_string (parse_oper.c): `left name right`, the name as
+/// written (NameListToString), a prefix operator without its left side.
+pub(crate) fn op_signature(
     interp: &PgCatalog,
     names: &[String],
     left: Option<PgTypeOid>,
     right: PgTypeOid,
 ) -> String {
-    let left = left.map_or_else(|| "NONE".to_owned(), |l| format_type_for_message(interp, l));
-    format!(
-        "{left} {} {}",
-        names.join("."),
-        format_type_for_message(interp, right)
-    )
+    let name = names.join(".");
+    let right = format_type_for_message(interp, right);
+    match left {
+        Some(left) => format!("{} {name} {right}", format_type_for_message(interp, left)),
+        None => format!("{name} {right}"),
+    }
 }
 
 /// `validOperatorName` (pg_operator.c).
@@ -533,8 +535,11 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         [r] => (None, arg(r)?),
         _ => return Ok(()),
     };
+    // LookupOperName: postfix operators are gone.
     let Some(right) = right else {
-        return Ok(());
+        return Err(DdlError::Parse(
+            "postfix operators are not supported".into(),
+        ));
     };
     let Some((oid, _)) = operator_lookup(interp, &names, left, right) else {
         return Err(DdlError::TypeNotFound(format!(

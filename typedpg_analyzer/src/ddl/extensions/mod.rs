@@ -716,6 +716,20 @@ fn member_object(
                 format!("function {name}({shown})"),
             ))
         }
+        ObjectType::ObjectOperator => {
+            let wrapped = typedpg_pg_query::protobuf::Node {
+                node: Some(object.clone()),
+            };
+            let Some(oid) = super::drop::lookup_operator(interp, &wrapped)? else {
+                return Ok(None);
+            };
+            let addr = super::depend::ObjectAddress::operator(oid);
+            Some((
+                crate::pg_catalog::PG_OPERATOR_RELID,
+                addr.objid,
+                super::depend::describe(interp, addr),
+            ))
+        }
         _ => None,
     })
 }
@@ -796,11 +810,15 @@ pub fn alter_extension_contents(
 pub(crate) fn set_extension_schema(
     interp: &mut PgCatalog,
     name: &str,
-    new_nsoid: crate::oid::PgNamespaceOid,
+    new_schema: &str,
 ) -> Result<(), DdlError> {
     let ext = extension_oid(interp, name)?;
+    let new_nsoid = super::util::lookup_creation_namespace(interp, new_schema)?;
+    let Some(old_nsoid) = interp.pg_extension.get(&ext).map(|e| e.extnamespace) else {
+        return Ok(());
+    };
     // No change is no work; otherwise the control file must allow it.
-    if interp.pg_extension.get(&ext).map(|e| e.extnamespace) == Some(new_nsoid) {
+    if old_nsoid == new_nsoid {
         return Ok(());
     }
     if !relocatable(name) {
@@ -808,6 +826,7 @@ pub(crate) fn set_extension_schema(
             "extension \"{name}\" does not support SET SCHEMA"
         )));
     }
+    super::util::check_set_namespace(interp, old_nsoid, new_nsoid)?;
     let ext_generic = PgGenericOid::from_nonzero(ext.into_nonzero());
     let members: Vec<(PgClassOid, PgGenericOid)> = interp
         .iter_pg_depend()

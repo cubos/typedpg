@@ -246,10 +246,7 @@ pub(crate) fn resolve_object(
             if let node::Node::List(l) = object
                 && !super::statistics::statistics_exist(interp, &l.items)
             {
-                return Err(DdlError::TypeNotFound(format!(
-                    "statistics object \"{}\" does not exist",
-                    names(object).join(".")
-                )));
+                return Err(super::statistics::not_found(interp, &l.items));
             }
         }
         ObjectType::ObjectCollation => {
@@ -293,41 +290,11 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectOperator => {
-            let node::Node::ObjectWithArgs(owa) = object else {
-                return Ok(());
+            // LookupOperWithArgs.
+            let wrapped = typedpg_pg_query::protobuf::Node {
+                node: Some(object.clone()),
             };
-            let parts: Vec<&str> = owa.objname.iter().filter_map(node_string).collect();
-            let (schema, name) = match parts.as_slice() {
-                [name] => (None, *name),
-                [schema, name] => (Some(*schema), *name),
-                _ => return Ok(()),
-            };
-            // LookupOperWithArgs: NONE is an empty type name.
-            let mut args = Vec::new();
-            for arg in &owa.objargs {
-                match arg.node.as_ref() {
-                    Some(node::Node::TypeName(tn)) if !tn.names.is_empty() => {
-                        args.push(Some(super::util::lookup_type_name(tn, interp)?));
-                    }
-                    _ => args.push(None),
-                }
-            }
-            let [left, Some(right)] = args.as_slice() else {
-                return Ok(());
-            };
-            let (left, right) = (*left, *right);
-            let found = super::drop::find_operator(interp, schema, name, &|o| {
-                o.oprleft == left && o.oprright == right
-            });
-            if found.is_none() {
-                let left_name = left
-                    .map(|t| super::util::format_type_for_message(interp, t))
-                    .unwrap_or_else(|| "NONE".into());
-                return Err(DdlError::DependencyError(format!(
-                    "operator does not exist: {left_name} {name} {}",
-                    super::util::format_type_for_message(interp, right)
-                )));
-            }
+            super::drop::lookup_operator(interp, &wrapped)?;
         }
         ObjectType::ObjectCast => {
             let node::Node::List(l) = object else {
@@ -435,10 +402,7 @@ pub(crate) fn resolve_object(
             let parts = names(object);
             let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
             if !super::conversions::conversion_exists(interp, &parts) {
-                return Err(DdlError::TypeNotFound(format!(
-                    "conversion \"{}\" does not exist",
-                    parts.join(".")
-                )));
+                return Err(super::conversions::not_found(interp, &parts));
             }
         }
         ObjectType::ObjectEventTrigger => {

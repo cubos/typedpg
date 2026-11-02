@@ -215,30 +215,11 @@ pub(crate) fn set_collation_schema(
     let Some(mut row) = interp.pg_collation.get(&oid).cloned() else {
         return Ok(());
     };
-    // LookupCreationNamespace: `pg_temp` is the session's temporary
-    // schema, which CheckSetNamespace refuses.
-    if stmt.newschema == "pg_temp" {
-        return Err(DdlError::Parse(
-            "cannot move objects into or out of temporary schemas".into(),
-        ));
-    }
-    let new_nsoid = super::util::existing_namespace(interp, &stmt.newschema)?;
-    if new_nsoid == row.collnamespace {
+    let Some(new_nsoid) =
+        super::util::set_schema_target(interp, row.collnamespace, &stmt.newschema)?
+    else {
         return Ok(());
-    }
-    // CheckSetNamespace.
-    if interp.temp_namespace == Some(new_nsoid) || interp.temp_namespace == Some(row.collnamespace)
-    {
-        return Err(DdlError::Parse(
-            "cannot move objects into or out of temporary schemas".into(),
-        ));
-    }
-    let toast = interp.namespace_oid("pg_toast");
-    if toast.is_some() && (toast == Some(new_nsoid) || toast == Some(row.collnamespace)) {
-        return Err(DdlError::Parse(
-            "cannot move objects into or out of TOAST schema".into(),
-        ));
-    }
+    };
     check_collation_name_free(interp, &row.collname, new_nsoid)?;
     interp.remove_pg_collation(oid);
     row.collnamespace = new_nsoid;
