@@ -836,11 +836,6 @@ pub(crate) fn check_unique_covers_partition_key(
     let Some(part_key) = interp.partition_keys.get(&relid) else {
         return Ok(());
     };
-    if part_key.contains(&0) {
-        return Err(DdlError::Parse(format!(
-            "unsupported {label} constraint with partition key definition"
-        )));
-    }
     let part_collations = super::partbound::partition_key_collations(interp, relid);
     let eq_ops = super::partbound::partition_key_eqops(interp, relid);
     let covered = |(i, pk): (usize, &i16)| {
@@ -860,10 +855,30 @@ pub(crate) fn check_unique_covers_partition_key(
                 }
         })
     };
-    if !part_key.iter().enumerate().all(covered) {
-        return Err(DdlError::Parse(
-            "unique constraint on partitioned table must include all partitioning columns".into(),
-        ));
+    // DefineIndex walks the key in order: an expression, or a column the
+    // index misses, fails there.
+    for (i, &pk) in part_key.iter().enumerate() {
+        if pk == 0 {
+            return Err(DdlError::Parse(format!(
+                "unsupported {label} constraint with partition key definition ({label} \
+                 constraints cannot be used when partition keys include expressions.)"
+            )));
+        }
+        if covered((i, &pk)) {
+            continue;
+        }
+        let column = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == pk)
+            .map(|a| a.attname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::Parse(format!(
+            "unique constraint on partitioned table must include all partitioning columns \
+             ({label} constraint on table \"{}\" lacks column \"{column}\" which is part of the \
+             partition key.)",
+            relname_of(interp, relid)
+        )));
     }
     Ok(())
 }

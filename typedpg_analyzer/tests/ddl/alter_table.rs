@@ -5030,3 +5030,609 @@ const FOREIGN_PARTITION_CASES: &[(&str, Option<&str>)] = &[
         Some("cannot change inheritance of a partition"),
     ),
 ];
+
+/// The relations [`TOAST_AND_ADD_COLUMN_CASES`] run over.
+const TOAST_AND_ADD_COLUMN_SETUP: &str = "
+    CREATE TABLE t (a int, b text);
+    CREATE TABLE par (a int, b int);
+    CREATE TABLE chi () INHERITS (par);
+    CREATE TABLE lone (a int);
+    CREATE TABLE lp (a int) PARTITION BY LIST (a);
+    CREATE TABLE lp1 PARTITION OF lp FOR VALUES IN (1);
+    CREATE TYPE ct AS (a int);
+    CREATE TABLE tt OF ct;
+    CREATE TABLE pk (a int, b int) PARTITION BY LIST (a);
+    CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';";
+
+#[test]
+fn toast_tables_follow_rewrites_and_add_column_if_not_exists_skips_first() {
+    // A heap rewrite (ALTER TABLE's, CLUSTER, REFRESH MATERIALIZED VIEW)
+    // makes a TOAST table only if the columns then need one, so `toast.`
+    // options go unchecked once none is left; TRUNCATE and a mere DROP
+    // COLUMN or SET STORAGE keep it. ADD COLUMN IF NOT EXISTS skips an
+    // existing column before its type, collation, default or constraints
+    // are looked at. A partition key a unique constraint misses is named in
+    // the DETAIL. What PG runs is tried in a transaction rolled back. (A
+    // tablespace named for placement is taken to exist, which the mirror's
+    // server can't follow: see
+    // `tablespaces_named_for_placement_are_assumed_to_exist`.)
+    let mut db = build_db(&[("0001.sql", TOAST_AND_ADD_COLUMN_SETUP)]);
+    for &(sql, expected) in TOAST_AND_ADD_COLUMN_CASES {
+        match expected {
+            None => {
+                if let Err(err) = db.apply_sql(&format!("BEGIN; {sql}; ROLLBACK;")) {
+                    panic!("{sql}\n  rejected: {err}");
+                }
+            }
+            Some(message) => {
+                let err = db.apply_sql(&format!("{sql};")).expect_err(sql);
+                assert!(
+                    err.to_string().starts_with(message),
+                    "{sql}\n  expected: {message}\n       got: {err}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vacuum_full_makes_the_toast_table_anew() {
+    // VACUUM FULL rewrites the heap (make_new_heap): a TOAST table only
+    // the dropped column needed goes; one a remaining column needs stays.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text); CREATE TABLE u (a int, b text, c text);",
+    )]);
+    db.apply_sql("ALTER TABLE t DROP COLUMN b; ALTER TABLE u DROP COLUMN b;")
+        .unwrap();
+    let toast_fillfactor = "unrecognized parameter \"fillfactor\"";
+    let err = db
+        .apply_sql("ALTER TABLE t SET (toast.fillfactor = 50);")
+        .unwrap_err();
+    assert!(err.to_string().starts_with(toast_fillfactor), "got: {err}");
+    db.apply_sql("VACUUM FULL t;").unwrap();
+    db.apply_sql("VACUUM FULL u;").unwrap();
+    db.apply_sql("ALTER TABLE t SET (toast.fillfactor = 50);")
+        .unwrap();
+    let err = db
+        .apply_sql("ALTER TABLE u SET (toast.fillfactor = 50);")
+        .unwrap_err();
+    assert!(err.to_string().starts_with(toast_fillfactor), "got: {err}");
+}
+
+/// `(statement, PG's error)` — `None` when PG runs it — over
+/// [`TOAST_AND_ADD_COLUMN_SETUP`], each checked on PostgreSQL 18.6.
+const TOAST_AND_ADD_COLUMN_CASES: &[(&str, Option<&str>)] = &[
+    (
+        "alter table t alter column b type int using 1; select 1",
+        None,
+    ),
+    ("alter table t alter column b type int using 1", None),
+    (
+        "alter table t set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b type int using 1; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b type int using 1, add column c text; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; alter table t2 add column c float8 default random(); alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; alter table t2 set unlogged; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; truncate t2; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b set storage plain; alter table t2 alter column a type bigint; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); create index t2i on t2 (a); alter table t2 alter column b set storage plain; cluster t2 using t2i; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b set storage plain; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text storage plain); alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b type varchar(10); alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create materialized view m2 as select 1 as a, 'x'::text as b; alter materialized view m2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; vacuum full t2",
+        Some("VACUUM cannot run inside a transaction block"),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b, alter column a type bigint; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int default nonexist",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a text collate \"nonexist\"",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int references nonexist",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int check (nonexist > 0)",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int generated always as (nonexist) stored",
+        None,
+    ),
+    (
+        "alter table t add column if not exists z nonexisttype",
+        Some("type \"nonexisttype\" does not exist"),
+    ),
+    (
+        "alter table t add column if not exists z int default nonexist",
+        Some("cannot use column reference in DEFAULT expression"),
+    ),
+    (
+        "alter table only par add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table par add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table par add column if not exists a int default nonexist",
+        None,
+    ),
+    (
+        "alter table only lone add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table lp1 add column if not exists a nonexisttype",
+        Some("cannot add column to a partition"),
+    ),
+    (
+        "alter table lp1 add column if not exists a int",
+        Some("cannot add column to a partition"),
+    ),
+    (
+        "alter table lp1 add column if not exists z int",
+        Some("cannot add column to a partition"),
+    ),
+    (
+        "alter table tt add column if not exists a nonexisttype",
+        Some("cannot add column to typed table"),
+    ),
+    (
+        "alter table tt add column if not exists a int",
+        Some("cannot add column to typed table"),
+    ),
+    (
+        "alter table lp add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table only lp add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int primary key using index tablespace nonexist",
+        None,
+    ),
+    (
+        "alter table t add column if not exists ctid int",
+        Some("column name \"ctid\" conflicts with a system column name"),
+    ),
+    ("alter table t add column if not exists a serial", None),
+    (
+        "alter table pk add unique (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table pk add primary key (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create unique index on pk (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table pk add constraint x exclude (b with =)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create table pk2 (a int, b int, unique (b)) partition by list (a)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create table pk2 (a int, b int, primary key (b)) partition by list (a)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create table pk2 (a int, b int, primary key (b)) partition by list ((a + 1))",
+        Some(
+            "unsupported PRIMARY KEY constraint with partition key definition (PRIMARY KEY constraints cannot be used when partition keys include expressions.",
+        ),
+    ),
+    (
+        "alter table pk add unique (b, (a))",
+        Some("syntax error at or near \"(\""),
+    ),
+    ("reindex (tablespace pg_global) table t", None),
+];
+
+/// The relations [`REWRITE_CASES`] run over.
+const REWRITE_SETUP: &str = "
+    CREATE TABLE par (a int, v text); CREATE TABLE ch (b int) INHERITS (par);
+    ALTER TABLE par ALTER COLUMN v SET STORAGE PLAIN;
+    CREATE INDEX i ON par (a);
+    CREATE TABLE t (a int, b text); CREATE INDEX ti ON t (a);
+    CREATE TABLE nt (a int, b text); CREATE INDEX nti ON nt (a);
+    CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a, 'x'::text AS b WITH NO DATA;
+    CREATE DOMAIN dvc AS varchar(10); CREATE DOMAIN dnum AS numeric(10, 2);
+    CREATE DOMAIN dbit AS bit(3);
+    CREATE TABLE pk (a int, b int) PARTITION BY RANGE (a, (b + 1));
+    CREATE TABLE pe (a int, b int) PARTITION BY RANGE ((a + 1), b);";
+
+#[test]
+fn rewrites_vacuum_options_and_tablespaces_follow_pg() {
+    // CLUSTER rewrites the table it names (a partitioned table's leaf
+    // partitions), bare CLUSTER every table with a clustered index, VACUUM
+    // FULL inheritance children too — none of them a materialized view
+    // never populated; ExecVacuum's options (the last FULL, PROCESS_MAIN,
+    // and the combinations it refuses); a domain column's size is
+    // unbounded for needs_toast_table; REINDEX's TABLESPACE needs a value,
+    // checked with the other options; the partition key walked in order
+    // for a unique or exclusion constraint; pg_global's placement rule. Each
+    // case runs on a catalog of its own (VACUUM and bare CLUSTER can't run
+    // in a transaction).
+    for &(steps, expected) in REWRITE_CASES {
+        let mut db = build_db(&[("0001.sql", REWRITE_SETUP)]);
+        let steps: Vec<&str> = steps.split(" ;; ").collect();
+        let (last, before) = steps.split_last().unwrap();
+        for step in before {
+            if let Err(err) = db.apply_sql(&format!("{step};")) {
+                panic!("{step}\n  rejected: {err}");
+            }
+        }
+        match (db.apply_sql(&format!("{last};")), expected) {
+            (Ok(()), None) => {}
+            (Err(err), None) => panic!("{last}\n  rejected: {err}"),
+            (Ok(()), Some(message)) => panic!("{last}\n  accepted, expected: {message}"),
+            (Err(err), Some(message)) => assert!(
+                err.to_string().starts_with(message),
+                "{last}\n  expected: {message}\n       got: {err}"
+            ),
+        }
+    }
+}
+
+/// `(statements, PG's error)` over [`REWRITE_SETUP`]: the statements, `;;`
+/// apart, run one after another, and the last fails with the error (or
+/// none does) — each checked on PostgreSQL 18.6.
+const REWRITE_CASES: &[(&str, Option<&str>)] = &[
+    (
+        "cluster par using i ;; alter table ch set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "cluster par using i ;; alter table par set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "alter table ch alter column v set storage plain ;; vacuum full par ;; alter table ch set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "alter table t alter column b set storage plain ;; alter table t cluster on ti ;; cluster ;; alter table t set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "alter table t alter column b set storage plain ;; alter table t cluster on ti ;; cluster verbose ;; alter table t set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "alter table t alter column b set storage plain ;; cluster ;; alter table t set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "alter table t alter column b set storage plain ;; vacuum (full, full false) t ;; alter table t set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "alter table t alter column b set storage plain ;; vacuum (full, process_main off) t ;; alter table t set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "alter table t alter column b set storage plain ;; vacuum (full false, full) t ;; alter table t set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "vacuum (full, process_toast off) t",
+        Some("PROCESS_TOAST required with VACUUM FULL"),
+    ),
+    (
+        "vacuum (full, disable_page_skipping) t",
+        Some("VACUUM option DISABLE_PAGE_SKIPPING cannot be used with FULL"),
+    ),
+    (
+        "vacuum (full, buffer_usage_limit '256kB') t",
+        Some("BUFFER_USAGE_LIMIT cannot be specified for VACUUM FULL"),
+    ),
+    ("vacuum (full, analyze, buffer_usage_limit '256kB') t", None),
+    (
+        "vacuum (full, parallel 2) t",
+        Some("VACUUM FULL cannot be performed in parallel"),
+    ),
+    ("vacuum (parallel 2) t", None),
+    ("vacuum (only_database_stats, verbose)", None),
+    (
+        "vacuum (only_database_stats, analyze)",
+        Some("ONLY_DATABASE_STATS cannot be specified with other VACUUM options"),
+    ),
+    (
+        "vacuum (only_database_stats) t",
+        Some("ONLY_DATABASE_STATS cannot be specified with a list of tables"),
+    ),
+    ("vacuum (only_database_stats)", None),
+    (
+        "vacuum (full nonsense) t",
+        Some("full requires a Boolean value"),
+    ),
+    (
+        "vacuum full t (a)",
+        Some("ANALYZE option must be specified when a column list is provided"),
+    ),
+    ("vacuum (full, analyze) t (a)", None),
+    (
+        "analyze (full) t",
+        Some("unrecognized ANALYZE option \"full\""),
+    ),
+    ("analyze (verbose, skip_locked) t", None),
+    ("vacuum (foo) t", Some("unrecognized VACUUM option \"foo\"")),
+    (
+        "vacuum (parallel) t",
+        Some("parallel option requires a value between 0 and 1024"),
+    ),
+    (
+        "vacuum (parallel 2000) t",
+        Some("parallel workers for vacuum must be between 0 and 1024"),
+    ),
+    (
+        "vacuum (parallel 'x') t",
+        Some("parallel requires an integer value"),
+    ),
+    (
+        "vacuum (buffer_usage_limit '1kB') t",
+        Some("BUFFER_USAGE_LIMIT option must be 0 or between 128 kB and 16777216 kB"),
+    ),
+    (
+        "vacuum (buffer_usage_limit 'x') t",
+        Some("BUFFER_USAGE_LIMIT option must be 0 or between 128 kB and 16777216 kB"),
+    ),
+    (
+        "vacuum (buffer_usage_limit) t",
+        Some("buffer_usage_limit requires a parameter"),
+    ),
+    ("vacuum (index_cleanup auto, truncate false) t", None),
+    (
+        "vacuum (index_cleanup maybe) t",
+        Some("index_cleanup requires a Boolean value"),
+    ),
+    (
+        "vacuum (truncate maybe) t",
+        Some("truncate requires a Boolean value"),
+    ),
+    (
+        "vacuum (process_toast maybe) t",
+        Some("process_toast requires a Boolean value"),
+    ),
+    (
+        "vacuum (only_database_stats, process_main off, process_toast off)",
+        None,
+    ),
+    (
+        "alter materialized view mv alter column b set storage plain ;; vacuum full mv ;; alter materialized view mv set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create unique index mvi on mv (a) ;; alter materialized view mv alter column b set storage plain ;; cluster mv using mvi ;; alter materialized view mv set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "alter materialized view mv alter column b set storage plain ;; refresh materialized view mv with no data ;; alter materialized view mv set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table d1 (a int, x dvc) ;; alter table d1 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table d2 (a int, x dnum) ;; alter table d2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table d3 (a int, x dbit) ;; alter table d3 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table d4 (a int, x varchar(10)) ;; alter table d4 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table d5 (a int, x dvc storage plain) ;; alter table d5 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "reindex (tablespace nonexist, tablespace pg_default) table t",
+        None,
+    ),
+    (
+        "reindex (tablespace) table t",
+        Some("tablespace requires a parameter"),
+    ),
+    (
+        "reindex (tablespace nonexist, concurrently maybe) table t",
+        Some("concurrently requires a Boolean value"),
+    ),
+    (
+        "alter table pk add unique (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table pk add unique (a)",
+        Some(
+            "unsupported UNIQUE constraint with partition key definition (UNIQUE constraints cannot be used when partition keys include expressions.",
+        ),
+    ),
+    (
+        "alter table pk add unique (a, b)",
+        Some(
+            "unsupported UNIQUE constraint with partition key definition (UNIQUE constraints cannot be used when partition keys include expressions.",
+        ),
+    ),
+    (
+        "create unique index on pk (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table pe add unique (b)",
+        Some(
+            "unsupported UNIQUE constraint with partition key definition (UNIQUE constraints cannot be used when partition keys include expressions.",
+        ),
+    ),
+    (
+        "alter table pk add constraint x exclude (b with =)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table pk add constraint x exclude (a with =)",
+        Some(
+            "unsupported EXCLUDE constraint with partition key definition (EXCLUDE constraints cannot be used when partition keys include expressions.",
+        ),
+    ),
+    (
+        "alter table pe add constraint x exclude (b with =)",
+        Some(
+            "unsupported EXCLUDE constraint with partition key definition (EXCLUDE constraints cannot be used when partition keys include expressions.",
+        ),
+    ),
+    (
+        "create table pke (a int, b int) partition by range (a); alter table pke add constraint x exclude (b with =)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pke\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table t add column c int unique using index tablespace pg_global",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+];
+
+#[test]
+fn tablespaces_named_for_placement_are_assumed_to_exist() {
+    // Tablespaces are cluster objects, created by a DBA outside the
+    // migrations (CREATE TABLESPACE can't even run in a transaction
+    // block): a name a relation or index is placed in is taken to exist,
+    // as role names are. Only pg_global's rule, which PG enforces whatever
+    // the cluster, is checked. The pg_sanity mirror can't follow — its
+    // server has pg_default and pg_global only — so it is left out.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text); CREATE INDEX ti ON t (a);",
+    )]);
+    db.skip_pg_sanity();
+    db.apply_sql(
+        "CREATE TABLE u1 (a int) TABLESPACE fast;
+         CREATE TABLE u2 (a int UNIQUE USING INDEX TABLESPACE fast);
+         CREATE TABLE u3 (a int, PRIMARY KEY (a) USING INDEX TABLESPACE fast);
+         CREATE INDEX ON t (a) TABLESPACE fast;
+         CREATE TABLE u4 TABLESPACE fast AS SELECT 1 AS a;
+         CREATE MATERIALIZED VIEW u5 TABLESPACE fast AS SELECT 1 AS a;
+         ALTER TABLE t ADD COLUMN c int UNIQUE USING INDEX TABLESPACE fast;
+         ALTER TABLE t ADD CONSTRAINT k UNIQUE (a) USING INDEX TABLESPACE fast;
+         ALTER TABLE t SET TABLESPACE fast;
+         ALTER INDEX ti SET TABLESPACE fast;",
+    )
+    .unwrap();
+    for sql in [
+        "REINDEX (TABLESPACE fast) TABLE t;",
+        "REINDEX (TABLESPACE 5) TABLE t;",
+        "REINDEX (TABLESPACE pg_default, TABLESPACE fast) INDEX ti;",
+    ] {
+        if let Err(err) = db.apply_sql(sql) {
+            panic!("{sql}\n  rejected: {err}");
+        }
+    }
+    for (sql, message) in [
+        (
+            "ALTER TABLE t SET TABLESPACE pg_global;",
+            "only shared relations can be placed in pg_global tablespace",
+        ),
+        (
+            "CREATE TABLE u6 (a int UNIQUE USING INDEX TABLESPACE pg_global);",
+            "only shared relations can be placed in pg_global tablespace",
+        ),
+        (
+            "REINDEX (TABLESPACE) TABLE t;",
+            "tablespace requires a parameter",
+        ),
+        (
+            "REINDEX (TABLESPACE fast, CONCURRENTLY maybe) TABLE t;",
+            "concurrently requires a Boolean value",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}

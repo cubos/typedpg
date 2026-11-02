@@ -758,6 +758,7 @@ pub fn refresh_materialized_view(
             // (finish_heap_swap), its indexes rebuilt with it.
             if !stmt.concurrent {
                 super::indexes::table_rewritten(interp, oid);
+                super::tables::toast::heap_rewritten(interp, oid);
             }
             Ok(())
         }

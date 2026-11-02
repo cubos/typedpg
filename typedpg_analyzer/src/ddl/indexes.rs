@@ -1003,11 +1003,6 @@ fn check_exclusion_covers_partition_key(
     let Some(part_key) = db.partition_keys.get(&relid) else {
         return Ok(());
     };
-    if part_key.contains(&0) {
-        return Err(DdlError::Parse(
-            "unsupported EXCLUDE constraint with partition key definition".into(),
-        ));
-    }
     let collations = super::tables::partbound::partition_key_collations(db, relid);
     let eq_ops = super::tables::partbound::partition_key_eqops(db, relid);
     let attname = |attnum: i16| {
@@ -1018,6 +1013,14 @@ fn check_exclusion_covers_partition_key(
             .unwrap_or_default()
     };
     for (i, pk) in part_key.iter().enumerate() {
+        // DefineIndex walks the key in order.
+        if *pk == 0 {
+            return Err(DdlError::Parse(
+                "unsupported EXCLUDE constraint with partition key definition (EXCLUDE \
+                 constraints cannot be used when partition keys include expressions.)"
+                    .into(),
+            ));
+        }
         let ptkey_eqop = eq_ops.get(i).copied().flatten();
         let mut found = false;
         for (j, k) in conkey.iter().enumerate() {

@@ -29,14 +29,14 @@ fn align(len: usize, to: usize) -> usize {
 /// `typid` / `typmod` can hold, `None` when unbounded.
 fn type_maximum_size(interp: &PgCatalog, typid: PgTypeOid, typmod: Option<i32>) -> Option<i32> {
     use crate::pg_catalog::oid;
-    // getBaseTypeAndTypmod: a domain's own typmod when the column has none.
-    let mut typid = typid;
-    let mut typmod = typmod;
-    while let Some(t) = interp.pg_type.get(&typid)
-        && t.typtype == TypType::Domain
+    // A domain's column has no typmod of its own, and type_maximum_size
+    // doesn't look through the domain: its size is unbounded.
+    if interp
+        .pg_type
+        .get(&typid)
+        .is_some_and(|t| t.typtype == TypType::Domain)
     {
-        typmod = typmod.or(t.typtypmod);
-        typid = t.typbasetype?;
+        return None;
     }
     let typmod = typmod.filter(|m| *m >= 0)?;
     match typid {
@@ -116,6 +116,16 @@ fn needs_toast_table(interp: &PgCatalog, relid: PgClassOid) -> bool {
 /// statement that can remove columns or read the TOAST state — a column
 /// the previous statements left in place still counts.
 pub(crate) fn note_toast_tables(interp: &mut PgCatalog) {
+    // A rewritten heap has a TOAST table only if its columns need one.
+    let rewritten: Vec<PgClassOid> = interp.toast_rewrites.iter().copied().collect();
+    interp.toast_rewrites.clear();
+    for relid in rewritten {
+        if needs_toast_table(interp, relid) {
+            interp.toast_tables.insert(relid);
+        } else {
+            interp.toast_tables.remove(&relid);
+        }
+    }
     let tables: Vec<PgClassOid> = interp
         .pg_class
         .values()
@@ -128,4 +138,14 @@ pub(crate) fn note_toast_tables(interp: &mut PgCatalog) {
             interp.toast_tables.insert(relid);
         }
     }
+}
+
+/// A rewrite of `relid`'s heap (make_new_heap: ALTER TABLE's rewrite,
+/// CLUSTER, VACUUM FULL, REFRESH MATERIALIZED VIEW) builds its TOAST table
+/// anew — only if the columns then need one (NewHeapCreateToastTable), so
+/// one that dropped, retyped or PLAIN-stored columns needed goes. Settled
+/// at the next [`note_toast_tables`], once the statement's columns are
+/// final.
+pub(crate) fn heap_rewritten(interp: &mut PgCatalog, relid: PgClassOid) {
+    interp.toast_rewrites.insert(relid);
 }

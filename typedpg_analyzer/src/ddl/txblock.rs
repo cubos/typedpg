@@ -403,7 +403,14 @@ pub(crate) fn reindex_options(
             "verbose" => {
                 super::session::def_get_boolean(de)?;
             }
-            "tablespace" => {}
+            // defGetString needs a value. The tablespace itself, a cluster
+            // object the analyzer doesn't see, is taken to exist (see
+            // check_tablespace_placement): PG looks only the last one up.
+            "tablespace" => {
+                if de.arg.is_none() {
+                    return Err(DdlError::Parse("tablespace requires a parameter".into()));
+                }
+            }
             other => {
                 return Err(DdlError::Parse(format!(
                     "unrecognized REINDEX option \"{other}\""
