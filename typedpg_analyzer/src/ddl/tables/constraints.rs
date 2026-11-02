@@ -1361,13 +1361,7 @@ pub(crate) fn drop_constraint(
             .unwrap_or_default();
         if let Some(&(fk, copy)) = copy_fks.first() {
             if !cascade {
-                let rel = |oid| {
-                    interp
-                        .pg_class
-                        .get(&oid)
-                        .map(|c| c.relname.clone())
-                        .unwrap_or_default()
-                };
+                let rel = |oid| crate::ddl::depend::relation_display_name(interp, oid);
                 let (fk_name, table) = interp
                     .pg_constraint
                     .get(&fk)
@@ -1968,6 +1962,20 @@ fn add_index_constraint(
                 .unwrap_or_default();
             super::inherit::require_pk_not_null(interp, relid, &colname, true)?;
         }
+    }
+    // index_constraint_create inserts the row without checking the name:
+    // one the table's constraints already use trips pg_constraint's unique
+    // index.
+    if interp
+        .pg_constraint
+        .values()
+        .any(|x| x.conrelid == relid && x.conname == conname)
+    {
+        return Err(DdlError::DuplicateObject(
+            "duplicate key value violates unique constraint \
+             \"pg_constraint_conrelid_contypid_conname_index\""
+                .into(),
+        ));
     }
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {

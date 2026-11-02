@@ -743,6 +743,9 @@ fn drop_index(
             "\"{name}\" is not an index"
         )));
     }
+    // The messages name it as getObjectDescription does (quoted when it
+    // needs it, qualified unless visible).
+    let shown = super::depend::relation_display_name(interp, class_oid);
     // RangeVarCallbackForDropRelation: a system catalog's index stays.
     crate::ddl::util::check_not_system_class(interp, class_oid)?;
     // findDependentObjects: a pinned one (allow_system_table_mods let it
@@ -758,13 +761,9 @@ fn drop_index(
     // A partition's copy of a partitioned index goes only with its parent
     // (findDependentObjects); the parent takes its copies along.
     if let Some(parent) = crate::ddl::tables::partidx::parent_index_of(interp, class_oid) {
-        let parent_name = interp
-            .pg_class
-            .get(&parent)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
+        let parent_name = super::depend::relation_display_name(interp, parent);
         return Err(DdlError::DependencyError(format!(
-            "cannot drop index {name} because index {parent_name} requires it (You can drop \
+            "cannot drop index {shown} because index {parent_name} requires it (You can drop \
              index {parent_name} instead.)"
         )));
     }
@@ -781,13 +780,9 @@ fn drop_index(
                 )
         })
     {
-        let table_name = interp
-            .pg_class
-            .get(&table)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
+        let table_name = super::depend::relation_display_name(interp, table);
         return Err(DdlError::DependencyError(format!(
-            "cannot drop index {name} because constraint {name} on table {table_name} requires \
+            "cannot drop index {shown} because constraint {name} on table {table_name} requires \
              it (You can drop constraint {name} on table {table_name} instead.)"
         )));
     }
@@ -813,17 +808,13 @@ fn drop_index(
                 let fk = interp.pg_constraint.get(&first).cloned();
                 let detail = fk.map(|c| {
                     format!(
-                        " (constraint {} on table {} depends on index {name})",
+                        " (constraint {} on table {} depends on index {shown})",
                         c.conname,
-                        interp
-                            .pg_class
-                            .get(&c.conrelid)
-                            .map(|r| r.relname.clone())
-                            .unwrap_or_default()
+                        super::depend::relation_display_name(interp, c.conrelid)
                     )
                 });
                 return Err(DdlError::DependencyError(format!(
-                    "cannot drop index {name} because other objects depend on it{}",
+                    "cannot drop index {shown} because other objects depend on it{}",
                     detail.unwrap_or_default()
                 )));
             }
@@ -837,20 +828,14 @@ fn drop_index(
     let copy_fks = crate::ddl::tables::partidx::fks_relying_on_copies(interp, class_oid);
     if let Some(&(fk, copy)) = copy_fks.first() {
         if !cascade {
-            let rel = |oid| {
-                interp
-                    .pg_class
-                    .get(&oid)
-                    .map(|c| c.relname.clone())
-                    .unwrap_or_default()
-            };
+            let rel = |oid| super::depend::relation_display_name(interp, oid);
             let (conname, table) = interp
                 .pg_constraint
                 .get(&fk)
                 .map(|c| (c.conname.clone(), rel(c.conrelid)))
                 .unwrap_or_default();
             return Err(DdlError::DependencyError(format!(
-                "cannot drop index {name} because other objects depend on it (constraint \
+                "cannot drop index {shown} because other objects depend on it (constraint \
                  {conname} on table {table} depends on index {})",
                 rel(copy)
             )));
@@ -871,14 +856,10 @@ fn drop_index(
     if let Some((_, con)) = child_constraints.iter().find(|(_, c)| c.conislocal)
         && !cascade
     {
-        let table_name = interp
-            .pg_class
-            .get(&con.conrelid)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
+        let table_name = super::depend::relation_display_name(interp, con.conrelid);
         return Err(DdlError::DependencyError(format!(
-            "cannot drop index {name} because other objects depend on it (constraint {} on \
-             table {table_name} depends on index {name})",
+            "cannot drop index {shown} because other objects depend on it (constraint {} on \
+             table {table_name} depends on index {shown})",
             con.conname
         )));
     }

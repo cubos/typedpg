@@ -2358,3 +2358,141 @@ fn retyped_column_keys_pick_their_index_anew() {
         ),
     ]);
 }
+
+/// ATTACH adopts a partition's index for a constraint's only when it backs
+/// a constraint of the same type (AttachPartitionEnsureIndexes) and agrees
+/// on NULLS [NOT] DISTINCT (CompareIndexInfo); else it builds a new one —
+/// and a second primary key is refused. A plain index's adopts any.
+#[test]
+fn attach_adopts_only_matching_constraint_indexes() {
+    use typedpg_analyzer::ConType;
+    let cons = |db: &PgCatalog, table: &str| -> Vec<(String, ConType, bool)> {
+        let mut cons: Vec<_> = db
+            .constraints_of_table(table)
+            .into_iter()
+            .filter(|c| matches!(c.contype, ConType::PrimaryKey | ConType::Unique))
+            .map(|c| (c.conname, c.contype, c.conislocal))
+            .collect();
+        cons.sort_by(|a, b| a.0.cmp(&b.0));
+        cons
+    };
+    let c = |name: &str, contype: ConType, local: bool| (name.to_owned(), contype, local);
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int UNIQUE) PARTITION BY RANGE (a);
+         CREATE TABLE c (a int PRIMARY KEY);
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+         CREATE TABLE p2 (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE c2 (a int NOT NULL UNIQUE);
+         ALTER TABLE p2 ATTACH PARTITION c2 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE p3 (a int UNIQUE) PARTITION BY RANGE (a);
+         CREATE TABLE c3 (a int UNIQUE NULLS NOT DISTINCT);
+         ALTER TABLE p3 ATTACH PARTITION c3 FOR VALUES FROM (0) TO (10);
+         CREATE TABLE p4 (a int) PARTITION BY RANGE (a);
+         CREATE UNIQUE INDEX p4_a ON p4 (a);
+         CREATE TABLE c4 (a int PRIMARY KEY);
+         ALTER TABLE p4 ATTACH PARTITION c4 FOR VALUES FROM (0) TO (10);
+         -- A new index of the parent (DefineIndex) adopts a constraint
+         -- index of any type.
+         CREATE TABLE p5 (a int NOT NULL) PARTITION BY RANGE (a);
+         CREATE TABLE c5 PARTITION OF p5 (CONSTRAINT cu UNIQUE (a)) FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p5 ADD PRIMARY KEY (a);",
+    )]);
+    assert_eq!(
+        cons(&db, "c"),
+        vec![
+            c("c_a_key", ConType::Unique, false),
+            c("c_pkey", ConType::PrimaryKey, true)
+        ]
+    );
+    assert_eq!(
+        cons(&db, "c2"),
+        vec![
+            c("c2_a_key", ConType::Unique, true),
+            c("c2_pkey", ConType::PrimaryKey, false)
+        ]
+    );
+    assert_eq!(
+        cons(&db, "c3"),
+        vec![
+            c("c3_a_key", ConType::Unique, true),
+            c("c3_a_key1", ConType::Unique, false)
+        ]
+    );
+    assert_eq!(
+        cons(&db, "c4"),
+        vec![c("c4_pkey", ConType::PrimaryKey, true)]
+    );
+    assert_eq!(cons(&db, "c5"), vec![c("cu", ConType::Unique, false)]);
+    for table in ["c4", "c5"] {
+        let rel = class_oid(&db, None, table);
+        assert_eq!(
+            db.pg_index_values().filter(|i| i.indrelid == rel).count(),
+            1,
+            "{table}"
+        );
+    }
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int, PRIMARY KEY (a)) PARTITION BY RANGE (a);
+         CREATE TABLE c (a int NOT NULL UNIQUE, b int PRIMARY KEY);
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+    )])
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.starts_with("multiple primary keys for table \"c\" are not allowed"),
+        "{err}"
+    );
+}
+
+/// DROP INDEX names the index as getObjectDescription does: quoted when it
+/// needs it.
+#[test]
+fn drop_index_messages_quote_the_index() {
+    for (setup, stmt, msg) in [
+        (
+            "CREATE TABLE t (a int); CREATE UNIQUE INDEX \"A\" ON t (a);
+             CREATE TABLE s (x int REFERENCES t (a));",
+            "DROP INDEX \"A\";",
+            "cannot drop index \"A\" because other objects depend on it",
+        ),
+        (
+            "CREATE TABLE t2 (a int CONSTRAINT \"Pk\" PRIMARY KEY);",
+            "DROP INDEX \"Pk\";",
+            "cannot drop index \"Pk\" because constraint Pk on table t2 requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+/// ADD CONSTRAINT ... USING INDEX under a name the table's constraints
+/// already use trips pg_constraint's unique index; another table's is
+/// fine.
+#[test]
+fn add_constraint_using_index_needs_a_free_name() {
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int, CONSTRAINT k CHECK (a > 0));
+         CREATE UNIQUE INDEX i ON t (b);
+         ALTER TABLE t ADD CONSTRAINT k UNIQUE USING INDEX i;",
+    )])
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.starts_with(
+            "duplicate key value violates unique constraint \
+             \"pg_constraint_conrelid_contypid_conname_index\""
+        ),
+        "{err}"
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int);
+         CREATE UNIQUE INDEX i2 ON t (a);
+         CREATE TABLE u (z int, CONSTRAINT kk CHECK (z > 0));
+         ALTER TABLE t ADD CONSTRAINT kk UNIQUE USING INDEX i2;",
+    )]);
+}
