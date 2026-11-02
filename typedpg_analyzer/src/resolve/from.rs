@@ -1246,17 +1246,48 @@ fn process_join_expr(
             JoinType::JoinRight => left.sources(scope),
             _ => &[],
         };
+        // `pull_up_sublinks` turns the IN / EXISTS sublinks of an outer
+        // join's ON clause reading only its nullable side into semi-joins
+        // in that side; so it does an inner join's below the nullable side
+        // of one, into the join (see `plan_fold::with_nullable_on_clause`).
+        let available: Option<Vec<String>> = match join_type {
+            JoinType::JoinLeft => Some(right.sources(scope)),
+            JoinType::JoinRight => Some(left.sources(scope)),
+            JoinType::JoinInner if !kept => Some(left.to(right).sources(scope)),
+            _ => None,
+        }
+        .map(|side| side.iter().map(|s| s.alias.clone()).collect());
+        // The semi-join reads the nullable side above it: the join is
+        // never removed (`join_is_removable`, `attr_needed`).
+        let semijoin_below = available.as_ref().is_some_and(|a| {
+            expr::plan_fold::with_nullable_on_clause(quals, a.clone(), || {
+                expr::pulls_up_sublink(quals, expr::Ctx::new(&on_scope, null_ctx, snapshot))
+            })
+        });
         // Not when a column of it is read above the join, nor a table the
         // join can't prove unique (see `join_may_prove_unique`).
-        let removable: Vec<String> = if nullable_side.iter().any(|s| {
-            expr::plan_fold::may_be_removed(s, snapshot)
-                && (!matches!(s.kind, crate::scope::SourceKind::Relation)
-                    || s.relid.is_none_or(|relid| {
-                        expr::plan_fold::join_may_prove_unique(join, &s.alias, relid, snapshot)
-                    }))
-        }) && !nullable_side
-            .iter()
-            .any(|s| expr::plan_fold::read_above(&s.alias, join, snapshot))
+        // An inner join of two tables or more is never removed.
+        let side_node = match join_type {
+            JoinType::JoinLeft => join.rarg.as_deref(),
+            JoinType::JoinRight => join.larg.as_deref(),
+            _ => None,
+        };
+        let joined_side = side_node.is_some_and(|n| {
+            expr::plan_fold::inner_join_tables(n, snapshot, &|name| scope.ctes.contains_key(name))
+                > 0
+        });
+        let removable: Vec<String> = if !semijoin_below
+            && !joined_side
+            && nullable_side.iter().any(|s| {
+                expr::plan_fold::may_be_removed(s, snapshot)
+                    && (!matches!(s.kind, crate::scope::SourceKind::Relation)
+                        || s.relid.is_none_or(|relid| {
+                            expr::plan_fold::join_may_prove_unique(join, &s.alias, relid, snapshot)
+                        }))
+            })
+            && !nullable_side
+                .iter()
+                .any(|s| expr::plan_fold::read_above(&s.alias, join, snapshot))
         {
             nullable_side.iter().map(|s| s.alias.clone()).collect()
         } else {
@@ -1276,10 +1307,12 @@ fn process_join_expr(
                     crate::clause::ClauseKind::JoinOn,
                 )
             };
-            if pulls_up {
-                expr::plan_fold::with_where_clause(quals, coerce)
-            } else {
-                coerce()
+            match available {
+                _ if pulls_up => expr::plan_fold::with_where_clause(quals, coerce),
+                Some(available) => {
+                    expr::plan_fold::with_nullable_on_clause(quals, available, coerce)
+                }
+                None => coerce(),
             }
         })?;
         check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;

@@ -1064,6 +1064,165 @@ fn an_inner_joins_on_clause_sublinks_become_joins_before_it_is_folded() {
 }
 
 #[test]
+fn an_outer_joins_on_clause_sublinks_become_joins_in_its_nullable_side() {
+    // `pull_up_sublinks` turns the IN / EXISTS sublinks of a LEFT (RIGHT)
+    // join's ON clause reading only its right (left) side into semi-joins
+    // in that side, before the clause is folded: their relations are
+    // estimated — the constant FALSE qual left only gates the outer join.
+    // So it does an inner join's below the nullable side of one, and the
+    // join whose nullable side the semi-join reads is never removed.
+    let mut db = planner_setup();
+    db.apply_sql("CREATE TABLE w (id int PRIMARY KEY, x int);")
+        .unwrap();
+    assert_regex_estimated(
+        &db,
+        &[
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON false AND u.x IN (SELECT id FROM rt WHERE s ~ '(')",
+            "SELECT 1 FROM u RIGHT JOIN t ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON EXISTS (SELECT 1 FROM rt WHERE rt.id = u.id \
+             AND rt.s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON NOT EXISTS (SELECT 1 FROM rt WHERE rt.id = u.id \
+             AND s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt r WHERE r.s ~ '(' \
+             AND r.id = u.id) AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(' LIMIT 3) \
+             AND false",
+            "SELECT 1 FROM t LEFT JOIN (u JOIN w ON w.id = u.id) \
+             ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN (u JOIN w ON w.x IN (SELECT id FROM rt WHERE s ~ '(') \
+             AND false) ON true",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false \
+             LEFT JOIN w ON true",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false \
+             WHERE false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false \
+             AND u.id = t.id",
+            // `u.id IS NULL` proves u empty, not the semi-join's rt.
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') \
+             AND u.id IS NULL",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') \
+             AND u.id = t.id AND u.id IS NULL",
+            // rt's key equated, but the semi-join reads rt above it.
+            "SELECT 1 FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(' \
+             AND rt.id IN (SELECT id FROM u)",
+            // u's key equated, but the semi-join keeps the join: its
+            // nullable side is (u SEMI JOIN rt), and the constant WHERE
+            // qual is a gating qual above the join of t, u and rt.
+            "SELECT 1 FROM t LEFT JOIN u ON u.id = t.id \
+             AND u.x IN (SELECT id FROM rt WHERE s ~ '(') WHERE false",
+            "SELECT t.id FROM t LEFT JOIN u ON u.id = t.id \
+             AND u.x IN (SELECT id FROM rt WHERE s ~ '(') WHERE false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.id = t.id \
+             AND u.x IN (SELECT id FROM rt WHERE s ~ '(') WHERE 1 = 2",
+            "SELECT 1 FROM t LEFT JOIN u v ON v.id = t.id \
+             AND v.x IN (SELECT id FROM rt WHERE s ~ '(') WHERE NULL",
+            "SELECT 1 FROM u RIGHT JOIN t ON u.id = t.id \
+             AND u.x IN (SELECT id FROM rt WHERE s ~ '(') WHERE false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.id = t.id AND EXISTS (SELECT 1 FROM rt \
+             WHERE rt.id = u.id AND rt.s ~ '(') WHERE false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.id = t.id AND NOT EXISTS (SELECT 1 FROM rt \
+             WHERE rt.id = u.id AND rt.s ~ '(') WHERE false",
+            "SELECT 1 FROM t LEFT JOIN (SELECT * FROM u) q ON q.id = t.id \
+             AND q.x IN (SELECT id FROM rt WHERE s ~ '(') WHERE false",
+            "SELECT 1 FROM t LEFT JOIN (u JOIN w ON w.id = u.id) ON u.id = t.id \
+             AND u.x IN (SELECT id FROM rt WHERE s ~ '(') WHERE false",
+            "SELECT 1 FROM t LEFT JOIN (u JOIN w ON w.x IN (SELECT id FROM rt WHERE s ~ '(')) \
+             ON u.id = t.id WHERE false",
+        ],
+    );
+    for sql in [
+        "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT 1 / 0 FROM rt) AND false",
+        "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE 1 / 0 = 1) AND false",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DivisionByZero(_),
+            "division by zero"
+        );
+    }
+    assert_accepted(
+        &db,
+        &[
+            // Reading the outer side, in the tested expression or the
+            // query: not pulled up, folded away with the qual.
+            "SELECT 1 FROM t LEFT JOIN u ON t.x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(' \
+             AND rt.id = t.id) AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id \
+             AND s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON 1 IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+            // Nor a FULL join's, nor under an OR, nor NOT IN.
+            "SELECT 1 FROM t FULL JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON (u.x IN (SELECT id FROM rt WHERE s ~ '(') OR true) \
+             AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x NOT IN (SELECT id FROM rt WHERE s ~ '(') AND false",
+            // The semi-join's own quals prove its relation empty.
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(' AND false) \
+             AND false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.id = t.id \
+             AND u.x IN (SELECT id FROM rt WHERE s ~ '(' AND false) WHERE false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.id = t.id \
+             AND u.x IN (SELECT id FROM rt WHERE s ~ '(' AND id IS NULL) WHERE false",
+            "SELECT 1 FROM t LEFT JOIN u ON u.x IN (SELECT id FROM rt WHERE s ~ '(' \
+             AND id IS NULL) AND false",
+            // No sublink: the AND folds whole.
+            "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' AND false",
+            // A SubPlan reading both sides, in a join removed.
+            "SELECT 1 FROM rt2 LEFT JOIN rt ON rt.id = rt2.id AND rt.s ~ '(' \
+             AND rt.id IN (SELECT id FROM u WHERE u.x = rt2.id)",
+        ],
+    );
+}
+
+#[test]
+fn an_outer_joins_constant_qual_proves_no_relation_empty() {
+    // A constant ON qual of an outer join (or of a join below its
+    // nullable side) is attached to that join (`distribute_qual_to_rels`,
+    // `ojscope`): the relations of the level are still estimated.
+    let db = planner_setup();
+    assert_regex_estimated(
+        &db,
+        &[
+            "SELECT 1 FROM t LEFT JOIN u ON false WHERE t.s ~ '('",
+            "SELECT 1 FROM t LEFT JOIN u ON 1 = 2 WHERE t.s ~ '('",
+            "SELECT 1 FROM t LEFT JOIN u ON NULL WHERE t.s ~ '('",
+            "SELECT 1 FROM t FULL JOIN u ON false WHERE t.s ~ '('",
+            "SELECT 1 FROM t LEFT JOIN (u JOIN rt ON false) ON true WHERE t.s ~ '('",
+            "SELECT 1 FROM t LEFT JOIN (SELECT * FROM u WHERE false) q ON true WHERE t.s ~ '('",
+            // An inner join's gates the join of its two relations.
+            "SELECT 1 FROM t JOIN u ON false WHERE t.s ~ '('",
+        ],
+    );
+    // A nullable side that is an inner join of two tables is never
+    // removed (`join_is_removable` needs a single relation there): the
+    // constant WHERE qual gates the join of the level's three relations.
+    let mut db = db;
+    db.apply_sql("CREATE TABLE w (id int PRIMARY KEY, x int, s text);")
+        .unwrap();
+    assert_regex_estimated(
+        &db,
+        &[
+            "SELECT 1 FROM t LEFT JOIN (u JOIN w ON w.id = u.id AND w.s ~ '(') \
+             ON u.id = t.id WHERE false",
+            "SELECT 1 FROM t LEFT JOIN (u CROSS JOIN w) ON u.id = t.id AND w.s ~ '(' \
+             WHERE false",
+            "SELECT 1 FROM t FULL JOIN (u JOIN w ON w.id = u.id AND w.s ~ '(') \
+             ON u.id = t.id WHERE false",
+        ],
+    );
+    assert_accepted(
+        &db,
+        &[
+            // A single table, removed: t alone is proven empty.
+            "SELECT 1 FROM t LEFT JOIN rt ON rt.id = t.id AND rt.s ~ '(' WHERE false",
+            "SELECT 1 FROM t LEFT JOIN u ON false WHERE t.s ~ '(' AND false",
+            "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' AND rt.id = t.id AND false",
+        ],
+    );
+}
+
+#[test]
 fn an_inlined_cte_is_estimated_as_the_from_item_it_is_pulled_up_as() {
     // A CTE referenced once is inlined and pulled up where its reference
     // is: its relations' restrictions are estimated unless that level

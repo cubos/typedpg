@@ -372,6 +372,114 @@ pub(crate) fn joined_exists_sublink(
     false
 }
 
+/// Whether the query of sublink `sub` certainly reads no FROM item of the
+/// level around it that `pull_up_sublinks` doesn't make available where
+/// the sublink is (`available_rels`, see
+/// [`with_nullable_on_clause`]): a column may be told the query's own when
+/// it is qualified by a FROM item of the query's, or (unqualified) a column
+/// of one of its tables; any other qualified by a name `other_alias`
+/// accepts, or unqualified and `other_column`, may be one of those items'.
+/// `outer_cte` tells the CTE names the query sees from around it.
+pub(crate) fn subquery_reads_only(
+    sub: &protobuf::SubLink,
+    snapshot: &PgCatalog,
+    outer_cte: &dyn Fn(&str) -> bool,
+    other_alias: &dyn Fn(&str) -> bool,
+    other_column: &dyn Fn(&str) -> bool,
+) -> bool {
+    let Some(query) = sub.subselect.as_deref().and_then(|s| s.node.as_ref()) else {
+        return false;
+    };
+    let node::Node::SelectStmt(sel) = query else {
+        return false;
+    };
+    // The query's own FROM items, and the columns of its tables (`None`
+    // when one of them isn't a table the catalog tells the columns of).
+    let mut aliases: Vec<&str> = Vec::new();
+    let mut columns: Option<Vec<String>> = Some(Vec::new());
+    let cte_names: Vec<&str> = sel
+        .with_clause
+        .iter()
+        .flat_map(|w| &w.ctes)
+        .filter_map(|c| match c.node.as_ref() {
+            Some(node::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut todo: Vec<&protobuf::Node> = sel.from_clause.iter().collect();
+    while let Some(f) = todo.pop() {
+        match f.node.as_ref() {
+            Some(node::Node::RangeVar(rv)) => {
+                aliases.push(
+                    rv.alias
+                        .as_ref()
+                        .map_or(rv.relname.as_str(), |a| &a.aliasname),
+                );
+                let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+                let cte = schema.is_none()
+                    && (cte_names.contains(&rv.relname.as_str()) || outer_cte(&rv.relname));
+                match snapshot.resolve_table(schema, &rv.relname) {
+                    Some(class)
+                        if !cte && rv.alias.as_ref().is_none_or(|a| a.colnames.is_empty()) =>
+                    {
+                        if let Some(cols) = columns.as_mut() {
+                            cols.extend(
+                                snapshot
+                                    .attributes_of(class.oid)
+                                    .iter()
+                                    .filter(|a| a.attnum > 0)
+                                    .map(|a| a.attname.clone()),
+                            );
+                        }
+                    }
+                    _ => columns = None,
+                }
+            }
+            Some(node::Node::RangeSubselect(r)) => {
+                aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
+                columns = None;
+            }
+            Some(node::Node::RangeFunction(r)) => {
+                aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
+                columns = None;
+            }
+            Some(node::Node::JoinExpr(j)) => {
+                if j.alias.is_some()
+                    || j.join_using_alias.is_some()
+                    || !j.using_clause.is_empty()
+                    || j.is_natural
+                {
+                    columns = None;
+                }
+                aliases.extend(j.alias.as_ref().map(|a| a.aliasname.as_str()));
+                todo.extend(j.larg.as_deref());
+                todo.extend(j.rarg.as_deref());
+            }
+            _ => columns = None,
+        }
+    }
+    let own_column = |c: &str| {
+        columns
+            .as_ref()
+            .is_some_and(|cols| cols.iter().any(|n| n == c))
+    };
+    let other_alias = |t: &str| !aliases.contains(&t) && other_alias(t);
+    query.nodes().into_iter().all(|(n, _)| match n {
+        typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+            let parts = extract_names(&cr.fields);
+            match parts.as_slice() {
+                // A column, or a whole-row reference.
+                [c] if parts.len() == cr.fields.len() => {
+                    own_column(c) || !(other_alias(c) || other_column(c))
+                }
+                [] => true,
+                [t, ..] => !other_alias(t),
+            }
+        }
+        _ => true,
+    })
+}
+
 /// The sublink `pull_up_sublinks` may turn into a join a top-level AND
 /// argument `n` of a WHERE clause holds: `n` itself, or the EXISTS a NOT
 /// negates.
@@ -402,14 +510,46 @@ thread_local! {
     /// alike (reading only the join's sides, which is all the ON clause
     /// sees).
     static WHERE_ROOT: Cell<*const protobuf::Node> = const { Cell::new(std::ptr::null()) };
+    /// The FROM items (by alias) a sublink of [`WHERE_ROOT`] may read to
+    /// be pulled up, when that is the ON clause of a join a semi-join
+    /// below it joins only part of (see [`with_nullable_on_clause`]);
+    /// `None` for any of the level's.
+    static AVAILABLE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 /// Run `f`, the analysis of WHERE clause `n` (or of such an ON clause).
 pub(crate) fn with_where_clause<R>(n: &protobuf::Node, f: impl FnOnce() -> R) -> R {
+    with_root(n, None, f)
+}
+
+/// Run `f`, the analysis of ON clause `n` of a join whose sublinks
+/// `pull_up_sublinks` turns into semi-joins on the nullable side of an
+/// outer join (`pull_up_sublinks_qual_recurse`): a LEFT (RIGHT) join's,
+/// into its right (left) side — those reading only the FROM items
+/// `available` of that side — or an inner join's below the nullable side
+/// of one, into the join (`available`, its two sides).
+pub(crate) fn with_nullable_on_clause<R>(
+    n: &protobuf::Node,
+    available: Vec<String>,
+    f: impl FnOnce() -> R,
+) -> R {
+    with_root(n, Some(available), f)
+}
+
+fn with_root<R>(n: &protobuf::Node, available: Option<Vec<String>>, f: impl FnOnce() -> R) -> R {
     let prev = WHERE_ROOT.with(|w| w.replace(std::ptr::from_ref(n)));
+    let prev_available = AVAILABLE.with(|a| a.replace(available));
     let out = f();
     WHERE_ROOT.with(|w| w.set(prev));
+    AVAILABLE.with(|a| *a.borrow_mut() = prev_available);
     out
+}
+
+/// The FROM items a sublink of the clause [`is_where_clause`] tells of
+/// may read to be pulled up, when not any of the level's (see
+/// [`with_nullable_on_clause`]).
+pub(crate) fn where_available() -> Option<Vec<String>> {
+    AVAILABLE.with(|a| a.borrow().clone())
 }
 
 /// Whether `n` is the WHERE clause being analyzed.
@@ -1643,11 +1783,15 @@ impl Group {
     /// (`relation_excluded_by_constraints`); with several, it is a gating
     /// qual above their join, and each is still estimated.
     fn may_be_empty(&self, rels: usize, snapshot: &PgCatalog) -> Proven {
+        // An outer join's ON qual (or one below its nullable side) is
+        // attached to that join (`distribute_qual_to_rels`, `ojscope`):
+        // a constant there gates the join, never the level's relations.
+        let level_wide = |owner: &Owner, top: bool| top || matches!(owner, Owner::SemiJoin);
         let constant = self.unknown_quals
-            || (self.substitutes && !self.quals.is_empty())
-            || self.quals.iter().any(|(q, _, _)| {
+            || (self.substitutes && self.quals.iter().any(|(_, o, top)| level_wide(o, *top)))
+            || self.quals.iter().any(|(q, o, top)| {
                 let folded = fold_qual(q, snapshot);
-                folded.may_be_const() && folded != Folded::Bool(true)
+                level_wide(o, *top) && folded.may_be_const() && folded != Folded::Bool(true)
             });
         let column_quals: Vec<(&protobuf::Node, &Owner, bool)> = self
             .quals
@@ -2506,8 +2650,9 @@ impl Reads<'_> {
     /// Whether `remove_useless_joins` certainly keeps outer join `j` of
     /// the level, whose nullable side is `side`: a table the join can't
     /// prove unique (see [`join_may_prove_unique`]), a subquery planned
-    /// on its own whose rows may not be distinct, or a FROM item read
-    /// above the join.
+    /// on its own whose rows may not be distinct, a FROM item read above
+    /// the join, or one a sublink of its ON clause is pulled up into (see
+    /// [`Self::pulls_sublink_into`]).
     fn side_kept(
         &self,
         j: &protobuf::JoinExpr,
@@ -2545,25 +2690,61 @@ impl Reads<'_> {
             }
             _ => return false,
         };
-        depth < 3 && self.above(alias, j, depth + 1)
+        self.pulls_sublink_into(j, alias) || (depth < 3 && self.above(alias, j, depth + 1))
+    }
+
+    /// Whether `pull_up_sublinks` certainly turns a sublink of outer join
+    /// `j`'s ON clause into a semi-join in its nullable side, FROM item
+    /// `alias` (see [`with_nullable_on_clause`]): the side is then a join,
+    /// which `join_is_removable` never removes (nor would it, the
+    /// semi-join reading the side above the join). Only references
+    /// qualified by `alias` count as the side's, and the sublink's query
+    /// must certainly read nothing else of the level.
+    fn pulls_sublink_into(&self, j: &protobuf::JoinExpr, alias: &str) -> bool {
+        let Some(quals) = j.quals.as_deref() else {
+            return false;
+        };
+        let side_column = |cr: &protobuf::ColumnRef| {
+            let names = extract_names(&cr.fields);
+            names.len() == cr.fields.len() && matches!(names.as_slice(), [t, _] if t == alias)
+        };
+        // The tested expression reads the side alone.
+        let test_reads_side = |sub: &protobuf::SubLink| {
+            sub.testexpr
+                .as_deref()
+                .and_then(|t| t.node.as_ref())
+                .is_none_or(|t| {
+                    t.nodes().into_iter().all(|(n, _)| match n {
+                        typedpg_pg_query::NodeRef::SubLink(_) => false,
+                        typedpg_pg_query::NodeRef::ColumnRef(cr) => side_column(cr),
+                        _ => true,
+                    })
+                })
+        };
+        let mut conjuncts = Vec::new();
+        flatten_and(quals, &mut conjuncts);
+        conjuncts.into_iter().any(|q| {
+            conjunct_sublink(q).is_some_and(|sub| {
+                (joined_any_sublink(sub, self.snapshot, &side_column)
+                    || joined_exists_sublink(sub, self.snapshot, &side_column))
+                    && test_reads_side(sub)
+                    && subquery_reads_only(
+                        sub,
+                        self.snapshot,
+                        &|name| self.ctes.iter().any(|c| c == name),
+                        &|t| t != alias,
+                        &|_| true,
+                    )
+            })
+        })
     }
 
     /// The relation `rv` names when it certainly is a table (no CTE of
     /// its name).
     fn plain_table(&self, rv: &protobuf::RangeVar) -> Option<crate::oid::PgClassOid> {
-        if rv.schemaname.is_empty() && self.ctes.iter().any(|c| c == &rv.relname) {
-            return None;
-        }
-        let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
-        let class = self.snapshot.resolve_table(schema, &rv.relname)?;
-        matches!(
-            class.relkind,
-            RelKind::Table
-                | RelKind::Partitioned
-                | RelKind::MaterializedView
-                | RelKind::ForeignTable
-        )
-        .then_some(class.oid)
+        plain_table(rv, self.snapshot, &|name| {
+            self.ctes.iter().any(|c| c == name)
+        })
     }
 
     /// Whether the clauses of `sel` (the level's SELECT) certainly read
@@ -2731,7 +2912,11 @@ impl Reads<'_> {
     /// How many base relations on the nullable side of the level's outer
     /// joins are certainly kept: a table (or a subquery with a FROM
     /// clause, pulled up or planned on its own) that is a whole side never
-    /// removed (see [`Self::side_kept`]), or a side of a FULL join.
+    /// removed (see [`Self::side_kept`]), or a side of a FULL join — and
+    /// the distinct tables of a side that is an inner join of two or more
+    /// (`join_is_removable` needs a single relation on the nullable side,
+    /// and an inner join's are all in its `min_righthand`; self-join
+    /// elimination merges only scans of one table).
     fn held_relations(&self) -> usize {
         fn count(r: &Reads<'_>, n: &protobuf::Node) -> usize {
             let Some(node::Node::JoinExpr(j)) = n.node.as_ref() else {
@@ -2749,11 +2934,26 @@ impl Reads<'_> {
                     _ => 0,
                 }
             };
+            let inner_tables = |side: Option<&protobuf::Node>| {
+                side.map_or(0, |side| {
+                    inner_join_tables(side, r.snapshot, &|name| r.ctes.iter().any(|c| c == name))
+                })
+            };
+            let joined = |side: Option<&protobuf::Node>| {
+                matches!(
+                    side.and_then(|s| s.node.as_ref()),
+                    Some(node::Node::JoinExpr(_))
+                )
+            };
             let (l, rr) = (j.larg.as_deref(), j.rarg.as_deref());
             let held = match protobuf::JoinType::try_from(j.jointype) {
+                Ok(protobuf::JoinType::JoinLeft) if joined(rr) => inner_tables(rr),
+                Ok(protobuf::JoinType::JoinRight) if joined(l) => inner_tables(l),
                 Ok(protobuf::JoinType::JoinLeft) if r.side_kept(j, rr, 0) => one(rr),
                 Ok(protobuf::JoinType::JoinRight) if r.side_kept(j, l, 0) => one(l),
-                Ok(protobuf::JoinType::JoinFull) => one(l) + one(rr),
+                Ok(protobuf::JoinType::JoinFull) => {
+                    one(l) + one(rr) + inner_tables(l) + inner_tables(rr)
+                }
                 _ => 0,
             };
             held + l.map_or(0, |s| count(r, s)) + rr.map_or(0, |s| count(r, s))
@@ -2940,6 +3140,60 @@ pub(crate) fn may_be_removed(source: &crate::scope::TableSource, snapshot: &PgCa
             .pg_index
             .values()
             .any(|i| i.indrelid == relid && i.indisunique)
+}
+
+/// The relation `rv` names when it certainly is a table (no CTE of its
+/// name, as `is_cte` tells).
+fn plain_table(
+    rv: &protobuf::RangeVar,
+    snapshot: &PgCatalog,
+    is_cte: &dyn Fn(&str) -> bool,
+) -> Option<crate::oid::PgClassOid> {
+    if rv.schemaname.is_empty() && is_cte(&rv.relname) {
+        return None;
+    }
+    let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+    let class = snapshot.resolve_table(schema, &rv.relname)?;
+    matches!(
+        class.relkind,
+        RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView | RelKind::ForeignTable
+    )
+    .then_some(class.oid)
+}
+
+/// How many distinct tables `side`, the nullable side of an outer join,
+/// certainly has when it is an inner join (of inner joins) of two or more
+/// — 0 otherwise. Such a side is never removed: `join_is_removable` needs
+/// a single relation there, and an inner join's are all in the outer
+/// join's `min_righthand` (self-join elimination merges only scans of one
+/// table). `is_cte` tells the CTE names the level sees.
+pub(crate) fn inner_join_tables(
+    side: &protobuf::Node,
+    snapshot: &PgCatalog,
+    is_cte: &dyn Fn(&str) -> bool,
+) -> usize {
+    if !matches!(side.node.as_ref(), Some(node::Node::JoinExpr(_))) {
+        return 0;
+    }
+    let mut relids = Vec::new();
+    let mut todo = vec![side];
+    while let Some(n) = todo.pop() {
+        match n.node.as_ref() {
+            Some(node::Node::JoinExpr(j)) if j.jointype == protobuf::JoinType::JoinInner as i32 => {
+                todo.extend(j.larg.as_deref());
+                todo.extend(j.rarg.as_deref());
+            }
+            Some(node::Node::RangeVar(rv)) => {
+                if let Some(relid) = plain_table(rv, snapshot, is_cte)
+                    && !relids.contains(&relid)
+                {
+                    relids.push(relid);
+                }
+            }
+            _ => {}
+        }
+    }
+    if relids.len() >= 2 { relids.len() } else { 0 }
 }
 
 /// Whether `query_supports_distinctness` may hold for `sel`, a subquery
