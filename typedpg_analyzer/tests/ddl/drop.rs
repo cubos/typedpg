@@ -3059,3 +3059,56 @@ fn alter_extension_adds_and_drops_operators() {
         "cannot drop operator ===(integer,integer) because extension hstore requires it",
     );
 }
+
+#[test]
+fn drop_schema_names_its_oldest_object_of_any_kind() {
+    for (objects, oldest) in [
+        (
+            "CREATE TEXT SEARCH TEMPLATE s.tm (lexize = dsimple_lexize);
+             CREATE FUNCTION s.f() RETURNS int LANGUAGE sql AS 'select 1';",
+            "text search template s.tm",
+        ),
+        (
+            "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+             CREATE OPERATOR s.=== (leftarg = int, rightarg = int, function = f);
+             CREATE TABLE s.t (a int);",
+            "operator s.===(integer,integer)",
+        ),
+        (
+            "CREATE OPERATOR FAMILY s.fam USING btree; CREATE TABLE s.t (a int);",
+            "operator family s.fam for access method btree",
+        ),
+        (
+            "CREATE COLLATION s.c (locale = 'C'); CREATE TABLE s.t (a int);",
+            "collation s.c",
+        ),
+        (
+            "CREATE TEXT SEARCH DICTIONARY s.d (template = simple); CREATE TABLE s.t (a int);",
+            "text search dictionary s.d",
+        ),
+    ] {
+        assert_drop_fails(
+            &format!("CREATE SCHEMA s; {objects}"),
+            "DROP SCHEMA s;",
+            &format!(
+                "cannot drop schema s because other objects depend on it ({oldest} depends on \
+                 schema s)"
+            ),
+        );
+    }
+}
+
+#[test]
+fn drop_operator_needs_its_operand_types_to_exist() {
+    for stmt in [
+        "DROP OPERATOR @>(nosuchtype, int4);",
+        "DROP OPERATOR @>(int4, nosuchtype);",
+    ] {
+        assert_drop_fails("SELECT 1;", stmt, "type \"nosuchtype\" does not exist");
+    }
+    build(&[(
+        "0001.sql",
+        "DROP OPERATOR IF EXISTS @>(nosuchtype, int4);
+         DROP OPERATOR IF EXISTS @>(int4, nosuchtype);",
+    )]);
+}

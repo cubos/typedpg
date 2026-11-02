@@ -1611,6 +1611,13 @@ fn drop_operator(
         _ => return Ok(()),
     };
 
+    // LookupOperWithArgs: each operand type must exist (IF EXISTS: skip).
+    if let Some(missing) = missing_operand_type(&owa.objargs, interp) {
+        if missing_ok {
+            return Ok(());
+        }
+        return Err(missing);
+    }
     let (left_oid, right_oid) = parse_operator_arg_types(&owa.objargs, interp);
     let Some(right_oid) = right_oid else {
         return Ok(());
@@ -1676,6 +1683,9 @@ pub(crate) fn lookup_operator(
     let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
         return Ok(None);
     };
+    if let Some(missing) = missing_operand_type(&owa.objargs, interp) {
+        return Err(missing);
+    }
     let name = owa
         .objname
         .iter()
@@ -1720,6 +1730,25 @@ pub(crate) fn find_operator(
 /// Parse `(left, right)` type OIDs from the two-element `objargs` of a
 /// `DROP OPERATOR`. A `TypeName` with an empty `names` list stands for
 /// `NONE`, indicating a prefix operator (no left operand).
+/// The `type "x" does not exist` error for an operand type of a DROP /
+/// ALTER OPERATOR that names no type (`NONE` aside).
+fn missing_operand_type(
+    objargs: &[typedpg_pg_query::protobuf::Node],
+    snapshot: &PgCatalog,
+) -> Option<DdlError> {
+    objargs.iter().find_map(|n| match n.node.as_ref() {
+        Some(node::Node::TypeName(tn))
+            if !tn.names.is_empty() && resolve_type_name(tn, snapshot).is_none() =>
+        {
+            Some(DdlError::TypeNotFound(format!(
+                "type \"{}\" does not exist",
+                super::util::type_name_to_string(tn)
+            )))
+        }
+        _ => None,
+    })
+}
+
 fn parse_operator_arg_types(
     objargs: &[typedpg_pg_query::protobuf::Node],
     snapshot: &PgCatalog,
@@ -1886,9 +1915,39 @@ fn drop_schema(
             .values()
             .filter(|p| p.pronamespace == nsoid)
             .map(|p| super::depend::ObjectAddress::proc(p.oid));
+        let operators = interp
+            .pg_operator
+            .values()
+            .filter(|o| o.oprnamespace == nsoid)
+            .map(|o| super::depend::ObjectAddress::operator(o.oid));
+        let collations = interp
+            .pg_collation
+            .values()
+            .filter(|c| c.collnamespace == nsoid)
+            .map(|c| {
+                super::depend::ObjectAddress::new(
+                    crate::pg_catalog::PG_COLLATION_RELID,
+                    c.oid.into_nonzero(),
+                    0,
+                )
+            });
+        // Operator classes and families, text search objects.
+        let named: Vec<super::depend::ObjectAddress> = super::depend::named_objects(interp)
+            .iter()
+            .filter(|o| match o {
+                super::depend::NamedObject::Opclass { namespace, .. }
+                | super::depend::NamedObject::Opfamily { namespace, .. }
+                | super::depend::NamedObject::TsObject { namespace, .. } => *namespace == nsoid,
+                _ => false,
+            })
+            .filter_map(|o| super::depend::named_address_of(interp, o))
+            .collect();
         let detail = relations
             .chain(types)
             .chain(routines)
+            .chain(operators)
+            .chain(collations)
+            .chain(named)
             .min_by_key(|a| a.objid.get())
             .map(|a| {
                 format!(

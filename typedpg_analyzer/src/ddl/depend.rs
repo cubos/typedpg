@@ -895,7 +895,32 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                 return "operator".into();
             };
             let left = o.oprleft.map_or_else(|| "NONE".to_owned(), type_name);
-            format!("operator {}({left},{})", o.oprname, type_name(o.oprright))
+            // format_operator: qualified unless OperatorIsVisible (no
+            // operator of its name and operand types earlier on the path).
+            let visible = interp
+                .schemas_for_function_lookup(None)
+                .into_iter()
+                .find_map(|ns| {
+                    interp
+                        .operator_by_qname
+                        .get(&(ns, o.oprname.clone()))?
+                        .iter()
+                        .copied()
+                        .find(|op| {
+                            interp
+                                .pg_operator
+                                .get(op)
+                                .is_some_and(|x| x.oprleft == o.oprleft && x.oprright == o.oprright)
+                        })
+                })
+                == Some(o.oid);
+            let name = match interp.namespace_name(o.oprnamespace) {
+                Some(ns) if !visible => {
+                    format!("{}.{}", typedpg_core::quote_identifier(ns), o.oprname)
+                }
+                _ => o.oprname.clone(),
+            };
+            format!("operator {name}({left},{})", type_name(o.oprright))
         }
         c if c == crate::pg_catalog::PG_LANGUAGE_RELID => {
             match crate::oid::PgLanguageOid::new(oid).and_then(|o| interp.pg_language.get(&o)) {
