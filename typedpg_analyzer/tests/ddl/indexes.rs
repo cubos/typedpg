@@ -2195,6 +2195,115 @@ fn clones_copy_the_names_an_index_had_when_its_transaction_got_it() {
     .unwrap();
 }
 
+/// Whether `op`, run in the transaction that then renames index `ti`'s
+/// column `b` and copies the table, leaves the copy with the old name
+/// (`ti`'s relcache entry kept, its relfilenode new) or the new one.
+fn assert_keeps_relcache(op: &str, kept: bool) {
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int, c int, v varchar(10), n numeric(10, 2), x text,
+                         ts timestamp, i interval(3));
+         CREATE INDEX ti ON t (b);
+         CREATE DOMAIN dcheck AS int CHECK (VALUE > 0);",
+    )]);
+    let name = if kept { "b" } else { "bz" };
+    let sql = format!(
+        "{op};
+         ALTER TABLE ti RENAME COLUMN b TO bz;
+         CREATE TABLE q2 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE q2_{name}_idx RENAME COLUMN {name} TO q;"
+    );
+    if let Err(err) = db.apply_sql(&sql) {
+        panic!("{op}\n  rejected: {err}");
+    }
+}
+
+#[test]
+fn every_rewrite_of_a_table_keeps_its_indexes_relcache_entries() {
+    // finish_heap_swap rebuilds every index of a rewritten table, each in a
+    // new relfilenode, whose relcache entry then stays for the rest of the
+    // transaction: TRUNCATE, CLUSTER, REINDEX, and ALTER TABLE's rewrites —
+    // a column type change that isn't a relabeling (whatever column), a
+    // volatile or constrained-domain default, a stored generated column,
+    // SET LOGGED / UNLOGGED.
+    for op in [
+        "TRUNCATE t",
+        "REINDEX TABLE t",
+        "CLUSTER t USING ti",
+        "ALTER TABLE t ALTER COLUMN c TYPE bigint",
+        "ALTER TABLE t ALTER COLUMN b TYPE bigint",
+        "ALTER TABLE t ALTER COLUMN c TYPE int USING c + 0",
+        "ALTER TABLE t ALTER COLUMN v TYPE varchar(5)",
+        "ALTER TABLE t ALTER COLUMN x TYPE varchar(10)",
+        "ALTER TABLE t ALTER COLUMN n TYPE numeric(12, 3)",
+        "ALTER TABLE t ALTER COLUMN i TYPE interval day",
+        "ALTER TABLE t ALTER COLUMN c TYPE dcheck",
+        "ALTER TABLE t ADD COLUMN d float8 DEFAULT random()",
+        "ALTER TABLE t ADD COLUMN d int GENERATED ALWAYS AS (a + 1) STORED",
+        "ALTER TABLE t ADD COLUMN d dcheck",
+        "ALTER TABLE t ADD COLUMN d serial",
+        "ALTER TABLE t SET UNLOGGED",
+    ] {
+        assert_keeps_relcache(op, true);
+    }
+    // A relabeling, a missing value, a catalog-only change: no rewrite.
+    for op in [
+        "SELECT 1",
+        "ALTER TABLE t ALTER COLUMN v TYPE varchar(20)",
+        "ALTER TABLE t ALTER COLUMN v TYPE text",
+        "ALTER TABLE t ALTER COLUMN v TYPE text USING v::text",
+        "ALTER TABLE t ALTER COLUMN x TYPE varchar",
+        "ALTER TABLE t ALTER COLUMN n TYPE numeric(12, 2)",
+        "ALTER TABLE t ALTER COLUMN n TYPE numeric",
+        "ALTER TABLE t ALTER COLUMN i TYPE interval(6)",
+        "ALTER TABLE t ALTER COLUMN c TYPE int",
+        "ALTER TABLE t ALTER COLUMN c TYPE oid",
+        "ALTER TABLE t ADD COLUMN d int DEFAULT 5",
+        "ALTER TABLE t ADD COLUMN d int GENERATED ALWAYS AS (a + 1) VIRTUAL",
+        "ALTER TABLE t ALTER COLUMN b SET STORAGE PLAIN",
+        "ALTER TABLE t ADD CHECK (a > 0)",
+        "ALTER TABLE t SET LOGGED",
+    ] {
+        assert_keeps_relcache(op, false);
+    }
+}
+
+#[test]
+fn a_partitioned_index_has_no_relfilenode_to_renew() {
+    // TRUNCATE of a partitioned table renews its partitions' indexes, not
+    // its own (they have no storage); REFRESH MATERIALIZED VIEW renews a
+    // materialized view's.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p (b);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2);
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a, 2 AS b;
+         CREATE INDEX mvi ON mv (b);",
+    )]);
+    db.apply_sql(
+        "TRUNCATE p;
+         ALTER TABLE pi RENAME COLUMN b TO bz;
+         CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (2) TO (3);
+         ALTER TABLE p2_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "TRUNCATE p;
+         ALTER TABLE p1_b_idx RENAME COLUMN bz TO bq;
+         CREATE TABLE l (LIKE p1 INCLUDING INDEXES);
+         ALTER TABLE l_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "REFRESH MATERIALIZED VIEW mv;
+         ALTER TABLE mvi RENAME COLUMN b TO bz;
+         CREATE TABLE l2 (LIKE mv INCLUDING INDEXES);
+         ALTER TABLE l2_b_idx RENAME COLUMN b TO q;",
+    )
+    .unwrap();
+}
+
 #[test]
 fn expression_index_columns_are_named_as_figure_index_colname_names_them() {
     // FigureIndexColname: a function's name, a cast's argument's, `case`,

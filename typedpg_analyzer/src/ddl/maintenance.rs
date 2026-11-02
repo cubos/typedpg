@@ -115,14 +115,8 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
 /// The indexes of `tables` get new relfilenodes (TRUNCATE, CLUSTER,
 /// REINDEX TABLE).
 fn new_relfilenodes(interp: &mut PgCatalog, tables: &[PgClassOid]) {
-    let indexes: Vec<PgClassOid> = interp
-        .pg_index
-        .values()
-        .filter(|i| tables.contains(&i.indrelid))
-        .map(|i| i.indexrelid)
-        .collect();
-    for index in indexes {
-        super::indexes::new_relfilenode(interp, index);
+    for &table in tables {
+        super::indexes::table_rewritten(interp, table);
     }
 }
 

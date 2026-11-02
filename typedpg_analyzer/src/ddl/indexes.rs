@@ -461,6 +461,12 @@ pub(crate) fn index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
 /// given a new relfilenode, for an index created or given one in the
 /// current transaction ([`PgCatalog::relcache_index_attnames`]); the
 /// catalog's otherwise.
+///
+/// Not modelled: an open cursor whose plan scans an index holds that
+/// index's relcache entry open, so a rename doesn't reach a clone made
+/// while it is open either; whether a cursor's plan uses an index scan is
+/// the planner's choice, which the analyzer can't know. Nor are tablespace
+/// moves (ALTER INDEX ... SET TABLESPACE), which the analyzer doesn't track.
 pub(crate) fn relcache_index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
     db.relcache_index_attnames
         .get(&index)
@@ -481,9 +487,30 @@ pub(crate) fn pin_relcache_index_attnames(db: &mut PgCatalog, index: PgClassOid)
 }
 
 /// Index `index` gets a new relfilenode (TRUNCATE, REINDEX, CLUSTER): its
-/// relcache entry stays as it is for the rest of the transaction.
+/// relcache entry stays as it is for the rest of the transaction. A
+/// partitioned index has no storage, and no relfilenode to change.
 pub(crate) fn new_relfilenode(db: &mut PgCatalog, index: PgClassOid) {
-    db.indexes_with_new_relfilenode.insert(index);
+    if db.pg_class.get(&index).map(|c| c.relkind) == Some(RelKind::Index) {
+        db.indexes_with_new_relfilenode.insert(index);
+    }
+}
+
+/// Table `relid`'s storage is rewritten — TRUNCATE, CLUSTER, REINDEX
+/// TABLE, REFRESH MATERIALIZED VIEW, and an ALTER TABLE that rewrites the
+/// rows (ATRewriteTables: a column type change that isn't a relabeling, a
+/// volatile or constrained-domain default, a stored generated column, SET
+/// LOGGED / UNLOGGED): finish_heap_swap rebuilds every index of it, each
+/// in a new relfilenode.
+pub(crate) fn table_rewritten(db: &mut PgCatalog, relid: PgClassOid) {
+    let indexes: Vec<PgClassOid> = db
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == relid)
+        .map(|i| i.indexrelid)
+        .collect();
+    for index in indexes {
+        new_relfilenode(db, index);
+    }
 }
 
 /// Before a column of table `relid` is renamed, its indexes keep the names
@@ -1148,6 +1175,8 @@ pub(crate) fn rebuild_indexes_for_column_type(
             db.index_attnames.remove(&index.indexrelid);
             // A new index, whose relcache entry is built anew.
             db.relcache_index_attnames.remove(&index.indexrelid);
+            // (A new object's entry, partitioned index or not, stays as
+            // created for the rest of the transaction.)
             db.indexes_with_new_relfilenode.insert(index.indexrelid);
             super::depend::forget_auto_extension_marks(
                 db,
