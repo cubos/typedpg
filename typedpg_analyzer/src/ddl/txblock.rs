@@ -388,15 +388,31 @@ fn writes(db: &PgCatalog, stmt: &node::Node) -> Option<&'static str> {
 }
 
 /// PreventInTransactionBlock callers.
+/// REINDEX's CONCURRENTLY option (ExecReindex's defGetBoolean): bare, or a
+/// boolean value — `true` / `false` / `on` / `off` / `1` / `0` ... The
+/// last one given wins.
+pub(crate) fn reindex_concurrently(params: &[typedpg_pg_query::protobuf::Node]) -> bool {
+    let mut on = false;
+    for p in params {
+        let Some(node::Node::DefElem(de)) = p.node.as_ref() else {
+            continue;
+        };
+        if de.defname != "concurrently" {
+            continue;
+        }
+        on = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            None => true,
+            Some(node::Node::Boolean(b)) => b.boolval,
+            Some(node::Node::Integer(i)) => i.ival != 0,
+            Some(node::Node::String(s)) => super::reloptions::parse_bool(&s.sval).unwrap_or(true),
+            Some(_) => true,
+        };
+    }
+    on
+}
+
 fn forbidden_in_block(stmt: &node::Node) -> Option<&'static str> {
-    let concurrently = |params: &[typedpg_pg_query::protobuf::Node]| {
-        params.iter().any(|p| {
-            matches!(p.node.as_ref(), Some(node::Node::DefElem(de))
-                if de.defname == "concurrently"
-                    && !matches!(de.arg.as_deref().and_then(|a| a.node.as_ref()),
-                        Some(node::Node::Boolean(b)) if !b.boolval))
-        })
-    };
+    let concurrently = reindex_concurrently;
     match stmt {
         node::Node::VacuumStmt(v) if v.is_vacuumcmd => Some("VACUUM"),
         node::Node::IndexStmt(i) if i.concurrent => Some("CREATE INDEX CONCURRENTLY"),
