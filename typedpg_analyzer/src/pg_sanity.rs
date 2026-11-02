@@ -240,43 +240,47 @@ impl PgSanityServer {
     ) -> Option<Divergence> {
         let pg_result = self.client.batch_execute(sql);
         self.soundness.schema_changed();
-        match (our_result, &pg_result) {
-            (Ok(()), Ok(())) => None,
-            (Err(_), Err(_)) => {
-                let our_msg = format!("{}", our_result.as_ref().unwrap_err());
-                // DDL errors are `DdlError`, outside `expected_sqlstate`'s
-                // domain — wording-only comparison here.
-                check_error_prefix(
-                    &our_msg,
-                    None,
-                    pg_result.as_ref().unwrap_err(),
-                    sql,
-                    "apply_sql",
-                )
-            }
-            (Ok(()), Err(e)) => {
-                // Treat protocol-level errors (no DbError → the postgres-rs
-                // client received a wire frame it couldn't parse) as "PG
-                // couldn't decide" and skip. Real rejections always carry
-                // a SQLSTATE.
-                e.as_db_error()?;
-                Some(Divergence {
-                    kind: DivergenceKind::ApplyPgRejected,
-                    message: format!(
-                        "pg_sanity: analyzer accepted DDL but PG rejected it.\n\
-                         SQL:\n---\n{sql}\n---\nPG error: {}",
-                        render_pg_error(e),
-                    ),
-                })
-            }
-            (Err(e), Ok(())) => Some(Divergence {
-                kind: DivergenceKind::ApplyAnalyzerRejected,
-                message: format!(
-                    "pg_sanity: analyzer rejected DDL but PG accepted it.\n\
-                     SQL:\n---\n{sql}\n---\nanalyzer error: {e}"
-                ),
-            }),
+        compare_apply_outcome(sql, our_result, &pg_result)
+    }
+
+    /// [`Self::compare_apply_matches`] for a migration that creates, alters
+    /// or drops an extension. `None` when the server doesn't ship an
+    /// extension the analyzer bundles (pgvector, the PL transforms: see
+    /// `outside_postgres_image`) and so rejects the migration with
+    /// `extension "…" is not available`: nothing after it can be mirrored.
+    pub(crate) fn compare_extension_apply_matches<E: std::fmt::Display>(
+        &mut self,
+        sql: &str,
+        our_result: &Result<(), E>,
+    ) -> Option<Option<Divergence>> {
+        let pg_result = self.client.batch_execute(sql);
+        self.soundness.schema_changed();
+        // extension.c's `extension "%s" is not available`, raised when the
+        // control file is missing — for one of the bundled extensions the
+        // image doesn't ship. Any other is a divergence.
+        let unavailable = pg_result
+            .as_ref()
+            .err()
+            .and_then(|e| e.as_db_error())
+            .filter(|db| {
+                *db.code() == postgres::error::SqlState::FEATURE_NOT_SUPPORTED
+                    && db
+                        .message()
+                        .strip_prefix("extension \"")
+                        .and_then(|m| m.strip_suffix("\" is not available"))
+                        .is_some_and(crate::ddl::extensions::outside_postgres_image)
+            });
+        // The analyzer reports the same error for an extension it doesn't
+        // bundle either. Otherwise it installed one the server lacks — and
+        // went on to accept the migration, or to fail a later statement.
+        if let Some(db) = unavailable
+            && !our_result
+                .as_ref()
+                .is_err_and(|e| e.to_string().starts_with(db.message()))
+        {
+            return None;
         }
+        Some(compare_apply_outcome(sql, our_result, &pg_result))
     }
 
     /// Compare `analysis_sql` (the rewritten SQL with `$N` placeholders that
@@ -737,6 +741,51 @@ fn with_dbname(conn_str: &str, dbname: &str) -> Result<String, String> {
     }
     parts.push(format!("dbname={dbname}"));
     Ok(parts.join(" "))
+}
+
+/// Compare the analyzer's outcome for a migration with PG's.
+fn compare_apply_outcome<E: std::fmt::Display>(
+    sql: &str,
+    our_result: &Result<(), E>,
+    pg_result: &Result<(), postgres::Error>,
+) -> Option<Divergence> {
+    match (our_result, pg_result) {
+        (Ok(()), Ok(())) => None,
+        (Err(_), Err(_)) => {
+            let our_msg = format!("{}", our_result.as_ref().unwrap_err());
+            // DDL errors are `DdlError`, outside `expected_sqlstate`'s
+            // domain — wording-only comparison here.
+            check_error_prefix(
+                &our_msg,
+                None,
+                pg_result.as_ref().unwrap_err(),
+                sql,
+                "apply_sql",
+            )
+        }
+        (Ok(()), Err(e)) => {
+            // Treat protocol-level errors (no DbError → the postgres-rs
+            // client received a wire frame it couldn't parse) as "PG
+            // couldn't decide" and skip. Real rejections always carry
+            // a SQLSTATE.
+            e.as_db_error()?;
+            Some(Divergence {
+                kind: DivergenceKind::ApplyPgRejected,
+                message: format!(
+                    "pg_sanity: analyzer accepted DDL but PG rejected it.\n\
+                     SQL:\n---\n{sql}\n---\nPG error: {}",
+                    render_pg_error(e),
+                ),
+            })
+        }
+        (Err(e), Ok(())) => Some(Divergence {
+            kind: DivergenceKind::ApplyAnalyzerRejected,
+            message: format!(
+                "pg_sanity: analyzer rejected DDL but PG accepted it.\n\
+                 SQL:\n---\n{sql}\n---\nanalyzer error: {e}"
+            ),
+        }),
+    }
 }
 
 /// Render a server-side message with the SQLSTATE appended — used for
