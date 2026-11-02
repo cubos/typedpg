@@ -836,12 +836,6 @@ pub(crate) fn check_unique_covers_partition_key(
     let Some(part_key) = interp.partition_keys.get(&relid) else {
         return Ok(());
     };
-    if part_key.contains(&0) {
-        return Err(DdlError::Parse(format!(
-            "unsupported {label} constraint with partition key definition ({label} constraints \
-             cannot be used when partition keys include expressions.)"
-        )));
-    }
     let part_collations = super::partbound::partition_key_collations(interp, relid);
     let eq_ops = super::partbound::partition_key_eqops(interp, relid);
     let covered = |(i, pk): (usize, &i16)| {
@@ -861,7 +855,18 @@ pub(crate) fn check_unique_covers_partition_key(
                 }
         })
     };
-    if let Some((_, &pk)) = part_key.iter().enumerate().find(|&c| !covered(c)) {
+    // DefineIndex walks the key in order: an expression, or a column the
+    // index misses, fails there.
+    for (i, &pk) in part_key.iter().enumerate() {
+        if pk == 0 {
+            return Err(DdlError::Parse(format!(
+                "unsupported {label} constraint with partition key definition ({label} \
+                 constraints cannot be used when partition keys include expressions.)"
+            )));
+        }
+        if covered((i, &pk)) {
+            continue;
+        }
         let column = interp
             .attributes_of(relid)
             .iter()

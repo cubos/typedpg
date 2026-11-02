@@ -395,6 +395,7 @@ pub(crate) fn reindex_options(
     params: &[typedpg_pg_query::protobuf::Node],
 ) -> Result<bool, DdlError> {
     let mut concurrently = false;
+    let mut tablespace: Option<String> = None;
     for p in params {
         let Some(node::Node::DefElem(de)) = p.node.as_ref() else {
             continue;
@@ -404,22 +405,19 @@ pub(crate) fn reindex_options(
             "verbose" => {
                 super::session::def_get_boolean(de)?;
             }
-            // get_tablespace_oid, with the other options.
+            // defGetString: the last one given, looked up after the loop.
             "tablespace" => {
-                let name = de
-                    .arg
-                    .as_deref()
-                    .and_then(|a| a.node.as_ref())
-                    .and_then(|n| match n {
-                        node::Node::String(s) => Some(s.sval.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                if !super::cluster::tablespace_exists(db, &name) {
-                    return Err(DdlError::TableNotFound(format!(
-                        "tablespace \"{name}\" does not exist"
-                    )));
-                }
+                tablespace = Some(match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    Some(node::Node::String(s)) => s.sval.clone(),
+                    Some(node::Node::Integer(i)) => i.ival.to_string(),
+                    Some(node::Node::Float(f)) => f.fval.clone(),
+                    Some(node::Node::Boolean(b)) => {
+                        if b.boolval { "true" } else { "false" }.to_owned()
+                    }
+                    _ => {
+                        return Err(DdlError::Parse("tablespace requires a parameter".into()));
+                    }
+                });
             }
             other => {
                 return Err(DdlError::Parse(format!(
@@ -427,6 +425,14 @@ pub(crate) fn reindex_options(
                 )));
             }
         }
+    }
+    // get_tablespace_oid.
+    if let Some(name) = tablespace
+        && !super::cluster::tablespace_exists(db, &name)
+    {
+        return Err(DdlError::TableNotFound(format!(
+            "tablespace \"{name}\" does not exist"
+        )));
     }
     Ok(concurrently)
 }

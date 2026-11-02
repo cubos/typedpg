@@ -112,15 +112,23 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
     Ok(())
 }
 
-/// CLUSTER / VACUUM FULL of `relid`: the heap of each table under it (a
-/// partitioned table's leaf partitions) is rewritten (make_new_heap), its
-/// indexes rebuilt with it and its TOAST table made anew.
-fn heap_rewrites(interp: &mut PgCatalog, relid: PgClassOid) {
-    for table in super::tables::inherit::all_inheritors(interp, relid) {
+/// CLUSTER / VACUUM FULL of `relid`: its heap is rewritten (make_new_heap),
+/// its indexes rebuilt with it and its TOAST table made anew — for a
+/// partitioned table, its leaf partitions'; with `inheritors` (VACUUM),
+/// its inheritance children's too. cluster_rel / vacuum_rel skip a
+/// materialized view that was never populated.
+fn heap_rewrites(interp: &mut PgCatalog, relid: PgClassOid, inheritors: bool) {
+    let tables = if inheritors || relkind(interp, relid) == Some(RelKind::Partitioned) {
+        super::tables::inherit::all_inheritors(interp, relid)
+    } else {
+        vec![relid]
+    };
+    for table in tables {
         if matches!(
             relkind(interp, table),
             Some(RelKind::Table | RelKind::MaterializedView | RelKind::ToastTable)
-        ) {
+        ) && !interp.unpopulated_matviews.contains(&table)
+        {
             super::indexes::table_rewritten(interp, table);
             super::tables::toast::heap_rewritten(interp, table);
         }
@@ -160,6 +168,12 @@ fn maintained_table(
 /// one, the table must have been clustered before.
 pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
+        // Bare CLUSTER (get_tables_to_cluster): every table with an index
+        // marked clustered is clustered again.
+        let tables: Vec<PgClassOid> = interp.clustered_indexes.keys().copied().collect();
+        for table in tables {
+            heap_rewrites(interp, table, false);
+        }
         return Ok(());
     };
     let relid = maintained_table(interp, rv)?;
@@ -170,7 +184,7 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
                 rv.relname
             )));
         }
-        heap_rewrites(interp, relid);
+        heap_rewrites(interp, relid, false);
         return Ok(());
     }
     // cluster_rel refuses a shared catalog once the index is found by name
@@ -192,7 +206,7 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
         prevent_in_transaction_block(interp, "CLUSTER")?;
     }
     interp.clustered_indexes.insert(relid, index);
-    heap_rewrites(interp, relid);
+    heap_rewrites(interp, relid, false);
     Ok(())
 }
 
@@ -281,12 +295,7 @@ const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 /// WARNING.
 pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError> {
     // VACUUM FULL rewrites what it processes — every table, without a list.
-    let full = stmt.is_vacuumcmd
-        && stmt.options.iter().any(|o| {
-            matches!(o.node.as_ref(), Some(node::Node::DefElem(de))
-                if de.defname == "full"
-                    && super::session::def_get_boolean(de).unwrap_or(false))
-        });
+    let full = vacuum_options(stmt)?;
     let mut rewritten: Vec<PgClassOid> = Vec::new();
     if full && stmt.rels.is_empty() {
         rewritten = interp
@@ -323,9 +332,174 @@ pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError>
         }
     }
     for relid in rewritten {
-        heap_rewrites(interp, relid);
+        heap_rewrites(interp, relid, true);
     }
     Ok(())
+}
+
+/// ExecVacuum's options, as it parses and checks them before anything
+/// else: whether the VACUUM rewrites the tables (FULL, the last one given,
+/// with PROCESS_MAIN).
+fn vacuum_options(stmt: &VacuumStmt) -> Result<bool, DdlError> {
+    use super::session::def_get_boolean;
+    let syntax = |msg: String| Err(DdlError::Parse(msg));
+    let (mut verbose, mut analyze, mut freeze, mut full) = (false, false, false, false);
+    let (mut skip_locked, mut disable_page_skipping) = (false, false);
+    let (mut process_main, mut process_toast) = (true, true);
+    let (mut skip_database_stats, mut only_database_stats) = (false, false);
+    let (mut index_cleanup, mut truncate) = (false, false);
+    let mut nworkers: i64 = -1;
+    let mut buffer_usage_limit = false;
+    // A value as defGetString renders it.
+    let string = |de: &typedpg_pg_query::protobuf::DefElem| -> Option<String> {
+        match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
+            node::Node::String(s) => Some(s.sval.clone()),
+            node::Node::Integer(i) => Some(i.ival.to_string()),
+            node::Node::Float(f) => Some(f.fval.clone()),
+            node::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
+            _ => None,
+        }
+    };
+    for opt in &stmt.options {
+        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+            continue;
+        };
+        match de.defname.as_str() {
+            "verbose" => verbose = def_get_boolean(de)?,
+            "skip_locked" => skip_locked = def_get_boolean(de)?,
+            "buffer_usage_limit" => {
+                let Some(value) = string(de) else {
+                    return syntax("buffer_usage_limit requires a parameter".into());
+                };
+                if buffer_usage_limit_kb(&value).is_none() {
+                    return Err(DdlError::Parse(
+                        "BUFFER_USAGE_LIMIT option must be 0 or between 128 kB and 16777216 kB"
+                            .into(),
+                    ));
+                }
+                buffer_usage_limit = true;
+            }
+            name if !stmt.is_vacuumcmd => {
+                return syntax(format!("unrecognized ANALYZE option \"{name}\""));
+            }
+            "analyze" => analyze = def_get_boolean(de)?,
+            "freeze" => freeze = def_get_boolean(de)?,
+            "full" => full = def_get_boolean(de)?,
+            "disable_page_skipping" => disable_page_skipping = def_get_boolean(de)?,
+            "index_cleanup" => {
+                index_cleanup = match string(de) {
+                    None => false,
+                    Some(v) if v.eq_ignore_ascii_case("auto") => false,
+                    Some(_) => {
+                        vacopt_from_boolean(de)?;
+                        true
+                    }
+                };
+            }
+            "process_main" => process_main = def_get_boolean(de)?,
+            "process_toast" => process_toast = def_get_boolean(de)?,
+            "truncate" => {
+                vacopt_from_boolean(de)?;
+                truncate = true;
+            }
+            "parallel" => {
+                let Some(value) = string(de) else {
+                    return Err(DdlError::Parse(
+                        "parallel option requires a value between 0 and 1024".into(),
+                    ));
+                };
+                let Ok(n) = value.parse::<i64>() else {
+                    return syntax("parallel requires an integer value".into());
+                };
+                if !(0..=1024).contains(&n) {
+                    return Err(DdlError::Parse(
+                        "parallel workers for vacuum must be between 0 and 1024".into(),
+                    ));
+                }
+                nworkers = n;
+            }
+            "skip_database_stats" => skip_database_stats = def_get_boolean(de)?,
+            "only_database_stats" => only_database_stats = def_get_boolean(de)?,
+            name => return syntax(format!("unrecognized VACUUM option \"{name}\"")),
+        }
+    }
+    let _ = (verbose, skip_locked, freeze, skip_database_stats);
+    if !stmt.is_vacuumcmd {
+        return Ok(false);
+    }
+    if full && nworkers > 0 {
+        return Err(DdlError::UnsupportedDdl(
+            "VACUUM FULL cannot be performed in parallel".into(),
+        ));
+    }
+    if buffer_usage_limit && full && !analyze {
+        return Err(DdlError::Parse(
+            "BUFFER_USAGE_LIMIT cannot be specified for VACUUM FULL".into(),
+        ));
+    }
+    if !analyze
+        && stmt.rels.iter().any(|r| {
+            matches!(r.node.as_ref(), Some(node::Node::VacuumRelation(vr)) if !vr.va_cols.is_empty())
+        })
+    {
+        return Err(DdlError::Parse(
+            "ANALYZE option must be specified when a column list is provided".into(),
+        ));
+    }
+    if full && disable_page_skipping {
+        return Err(DdlError::UnsupportedDdl(
+            "VACUUM option DISABLE_PAGE_SKIPPING cannot be used with FULL".into(),
+        ));
+    }
+    if full && !process_toast {
+        return Err(DdlError::UnsupportedDdl(
+            "PROCESS_TOAST required with VACUUM FULL".into(),
+        ));
+    }
+    if only_database_stats {
+        if !stmt.rels.is_empty() {
+            return Err(DdlError::Parse(
+                "ONLY_DATABASE_STATS cannot be specified with a list of tables".into(),
+            ));
+        }
+        if analyze
+            || freeze
+            || full
+            || disable_page_skipping
+            || skip_locked
+            || skip_database_stats
+            || index_cleanup
+            || truncate
+            || nworkers >= 0
+            || buffer_usage_limit
+        {
+            return Err(DdlError::Parse(
+                "ONLY_DATABASE_STATS cannot be specified with other VACUUM options".into(),
+            ));
+        }
+    }
+    Ok(full && process_main)
+}
+
+/// get_vacoptval_from_boolean: defGetBoolean's values.
+fn vacopt_from_boolean(de: &typedpg_pg_query::protobuf::DefElem) -> Result<bool, DdlError> {
+    super::session::def_get_boolean(de)
+}
+
+/// BUFFER_USAGE_LIMIT's value in kB (parse_int with GUC_UNIT_KB): 0, or
+/// between 128 kB and 16 GB.
+fn buffer_usage_limit_kb(value: &str) -> Option<i64> {
+    let v = value.trim();
+    let digits = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let number: i64 = v[..digits].parse().ok()?;
+    let kb = match v[digits..].trim() {
+        "" | "kB" => number,
+        "MB" => number * 1024,
+        "GB" => number * 1024 * 1024,
+        "TB" => number * 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    (kb == 0 || (128..=16_777_216).contains(&kb)).then_some(kb)
 }
 
 /// LOCK TABLE (RangeVarCallbackForLockTable): tables, partitioned tables,

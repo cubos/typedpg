@@ -29,14 +29,14 @@ fn align(len: usize, to: usize) -> usize {
 /// `typid` / `typmod` can hold, `None` when unbounded.
 fn type_maximum_size(interp: &PgCatalog, typid: PgTypeOid, typmod: Option<i32>) -> Option<i32> {
     use crate::pg_catalog::oid;
-    // getBaseTypeAndTypmod: a domain's own typmod when the column has none.
-    let mut typid = typid;
-    let mut typmod = typmod;
-    while let Some(t) = interp.pg_type.get(&typid)
-        && t.typtype == TypType::Domain
+    // A domain's column has no typmod of its own, and type_maximum_size
+    // doesn't look through the domain: its size is unbounded.
+    if interp
+        .pg_type
+        .get(&typid)
+        .is_some_and(|t| t.typtype == TypType::Domain)
     {
-        typmod = typmod.or(t.typtypmod);
-        typid = t.typbasetype?;
+        return None;
     }
     let typmod = typmod.filter(|m| *m >= 0)?;
     match typid {

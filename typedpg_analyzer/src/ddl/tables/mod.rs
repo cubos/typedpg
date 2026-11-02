@@ -185,16 +185,16 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         ));
     }
     super::util::check_relation_name_free(interp, nsoid, &name)?;
-    check_tablespace_placement(&stmt.tablespacename)?;
+    check_tablespace_placement(interp, &stmt.tablespacename)?;
     // The indexes of its PRIMARY KEY / UNIQUE / EXCLUDE constraints
     // (USING INDEX TABLESPACE), created by DefineIndex.
     for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
         match elt.node.as_ref() {
-            Some(node::Node::Constraint(c)) => check_tablespace_placement(&c.indexspace)?,
+            Some(node::Node::Constraint(c)) => check_tablespace_placement(interp, &c.indexspace)?,
             Some(node::Node::ColumnDef(cd)) => {
                 for c in &cd.constraints {
                     if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
-                        check_tablespace_placement(&c.indexspace)?;
+                        check_tablespace_placement(interp, &c.indexspace)?;
                     }
                 }
             }
@@ -874,10 +874,19 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     Ok(())
 }
 
-/// DefineRelation / ATExecSetTableSpace: pg_global holds only the shared
-/// system catalogs. (Other tablespaces are cluster objects the analyzer
-/// doesn't see: any name is taken to exist.)
-pub(crate) fn check_tablespace_placement(tablespace: &str) -> Result<(), DdlError> {
+/// DefineRelation / DefineIndex / ATExecSetTableSpace: the tablespace
+/// must exist (get_tablespace_oid — pg_default, pg_global or one the
+/// migrations create), and pg_global holds only the shared system
+/// catalogs.
+pub(crate) fn check_tablespace_placement(
+    interp: &PgCatalog,
+    tablespace: &str,
+) -> Result<(), DdlError> {
+    if !tablespace.is_empty() && !crate::ddl::cluster::tablespace_exists(interp, tablespace) {
+        return Err(DdlError::TableNotFound(format!(
+            "tablespace \"{tablespace}\" does not exist"
+        )));
+    }
     if tablespace == "pg_global" {
         return Err(DdlError::Parse(
             "only shared relations can be placed in pg_global tablespace".into(),
@@ -1460,7 +1469,7 @@ fn apply_alter_subtype(
             if let Some(node::Node::Constraint(c)) =
                 cmd.def.as_deref().and_then(|d| d.node.as_ref())
             {
-                check_tablespace_placement(&c.indexspace)?;
+                check_tablespace_placement(interp, &c.indexspace)?;
                 // transformIndexConstraint takes a system column as found:
                 // a PRIMARY KEY's not-null constraint on it is refused
                 // first, else DefineIndex refuses the index.
@@ -1540,7 +1549,7 @@ fn apply_alter_subtype(
             interp.clustered_indexes.remove(&relid);
             Ok(())
         }
-        AlterTableType::AtSetTableSpace => check_tablespace_placement(&cmd.name),
+        AlterTableType::AtSetTableSpace => check_tablespace_placement(interp, &cmd.name),
         AlterTableType::AtAddOf => typed::add_of(interp, relid, cmd),
         AlterTableType::AtGenericOptions => crate::ddl::fdw::apply_generic_options(
             interp,
