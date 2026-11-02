@@ -1242,6 +1242,17 @@ fn drop_extension(
             }
         }
     }
+    // A member wrapper's servers (and their user mappings and foreign
+    // tables), which the analyzer keeps by name.
+    for &(classid, objid) in &owned {
+        if classid != super::depend::PG_FOREIGN_DATA_WRAPPER_RELID {
+            continue;
+        }
+        if let Some(wrapper) = interp.foreign_data.wrapper_named(objid) {
+            let servers = interp.foreign_data.servers_of(&wrapper);
+            super::fdw::drop_servers(interp, &servers, true, cascade, &desc)?;
+        }
+    }
     // The objects marked DEPENDS ON EXTENSION go along too
     // (DEPENDENCY_AUTO_EXTENSION).
     let auto = super::depend::auto_extension_dependents(interp, ext_oid);

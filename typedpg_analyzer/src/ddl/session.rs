@@ -343,13 +343,23 @@ impl PgCatalog {
         }
     }
 
-    /// Extension-script / CREATE SCHEMA element scope: `schema` goes in front of the
+    /// CREATE SCHEMA element scope: `schema` goes in front of the
     /// current path until [`Self::restore_search_path`] puts back the
     /// returned settings.
     pub(crate) fn push_search_path_front(&mut self, schema: &str) -> SearchPathGuc {
         let saved = self.search_path_guc.clone();
         let mut names = vec![schema.to_owned()];
         names.extend(saved.effective().iter().filter(|n| *n != schema).cloned());
+        self.search_path_guc.local = Some(names);
+        self.refresh_search_path();
+        saved
+    }
+
+    /// Extension-script scope (execute_extension_script): the path is
+    /// exactly `names` until [`Self::restore_search_path`] puts back the
+    /// returned settings.
+    pub(crate) fn replace_search_path(&mut self, names: Vec<String>) -> SearchPathGuc {
+        let saved = self.search_path_guc.clone();
         self.search_path_guc.local = Some(names);
         self.refresh_search_path();
         saved

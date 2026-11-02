@@ -630,3 +630,203 @@ fn btree_gist_installs_through_its_upgrade_chain() {
     let snap = build(&[("0001.sql", "CREATE EXTENSION btree_gist VERSION '1.6';")]);
     assert!(snap.find_functions(None, "gbt_bool_union").is_empty());
 }
+
+// ── The extension lifecycle: DROP, upgrades, SET SCHEMA ─────────────────────
+
+#[test]
+fn every_pg18_contrib_extension_drops_with_all_its_members() {
+    // DROP EXTENSION takes every member along — access methods, foreign-data
+    // wrappers, text search templates included — so creating it again
+    // succeeds.
+    let failures: Vec<String> = PG18_CONTRIB
+        .iter()
+        .filter_map(|name| {
+            let create = format!("CREATE EXTENSION \"{name}\" CASCADE;");
+            let drop = format!("DROP EXTENSION \"{name}\";");
+            try_apply(&[
+                ("0001.sql", &create),
+                ("0002.sql", &drop),
+                ("0003.sql", &create),
+            ])
+            .err()
+            .map(|e| format!("{name}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Every version of the PG 18 contrib extensions but the default one that
+/// `CREATE EXTENSION ... VERSION` can install (one with an installation
+/// script, or reached from one).
+const PG18_OLDER_VERSIONS: &[(&str, &[&str])] = &[
+    ("amcheck", &["1.0", "1.1", "1.2", "1.3", "1.4"]),
+    ("btree_gin", &["1.0", "1.1", "1.2"]),
+    ("btree_gist", &["1.2", "1.3", "1.4", "1.5", "1.6", "1.7"]),
+    ("citext", &["1.4", "1.5", "1.6", "1.7"]),
+    ("cube", &["1.2", "1.3", "1.4"]),
+    ("earthdistance", &["1.1"]),
+    ("fuzzystrmatch", &["1.1"]),
+    ("hstore", &["1.4", "1.5", "1.6", "1.7"]),
+    ("intarray", &["1.2", "1.3", "1.4"]),
+    ("isn", &["1.1", "1.2"]),
+    ("lo", &["1.1"]),
+    ("ltree", &["1.1", "1.2"]),
+    (
+        "pageinspect",
+        &["1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12"],
+    ),
+    ("pg_buffercache", &["1.2", "1.3", "1.4", "1.5"]),
+    ("pg_freespacemap", &["1.1", "1.2"]),
+    ("pg_prewarm", &["1.1"]),
+    (
+        "pg_stat_statements",
+        &["1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11"],
+    ),
+    ("pg_trgm", &["1.3", "1.4", "1.5"]),
+    ("pg_visibility", &["1.1"]),
+    ("pg_walinspect", &["1.0"]),
+    ("pgcrypto", &["1.3"]),
+    ("pgstattuple", &["1.4"]),
+    ("postgres_fdw", &["1.0", "1.1"]),
+    ("seg", &["1.1", "1.2", "1.3"]),
+    ("xml2", &["1.1"]),
+];
+
+#[test]
+fn every_upgrade_chain_updates_to_the_default_version() {
+    // An upgrade script may drop the extension's own members (cube 1.2 ->
+    // 1.3 drops g_cube_compress(internal)): PG lets the extension being
+    // altered drop them.
+    let failures: Vec<String> = PG18_OLDER_VERSIONS
+        .iter()
+        .flat_map(|(name, versions)| versions.iter().map(move |v| (*name, *v)))
+        .filter_map(|(name, version)| {
+            let create = format!("CREATE EXTENSION \"{name}\" VERSION '{version}' CASCADE;");
+            let update = format!("ALTER EXTENSION \"{name}\" UPDATE;");
+            try_apply(&[("0001.sql", &create), ("0002.sql", &update)])
+                .err()
+                .map(|e| format!("{name} {version}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn upgrades_stop_at_the_version_asked_for() {
+    let snap = build(&[
+        ("0001.sql", "CREATE EXTENSION cube VERSION '1.2';"),
+        ("0002.sql", "ALTER EXTENSION cube UPDATE TO '1.4';"),
+    ]);
+    // 1.2 -> 1.3 dropped it.
+    assert!(snap.find_functions(None, "g_cube_compress").is_empty());
+    // A member the upgrade dropped is gone from the extension too.
+    build(&[
+        ("0001.sql", "CREATE EXTENSION hstore VERSION '1.4';"),
+        ("0002.sql", "ALTER EXTENSION hstore UPDATE TO '1.5';"),
+        ("0003.sql", "ALTER EXTENSION hstore UPDATE TO '1.8';"),
+        ("0004.sql", "DROP EXTENSION hstore;"),
+        ("0005.sql", "CREATE EXTENSION hstore;"),
+    ]);
+}
+
+#[test]
+fn a_member_cannot_be_dropped_outside_its_extension_scripts() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE EXTENSION bloom;",
+            "DROP ACCESS METHOD bloom;",
+            "cannot drop access method bloom because extension bloom requires it",
+        ),
+        (
+            "CREATE EXTENSION file_fdw;",
+            "DROP FOREIGN DATA WRAPPER file_fdw;",
+            "cannot drop foreign-data wrapper file_fdw because extension file_fdw requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
+fn drop_extension_takes_what_depends_on_its_wrapper_or_access_method() {
+    for (setup, message) in [
+        (
+            "CREATE EXTENSION postgres_fdw;
+             CREATE SERVER s FOREIGN DATA WRAPPER postgres_fdw;",
+            "cannot drop extension postgres_fdw because other objects depend on it",
+        ),
+        (
+            "CREATE EXTENSION bloom;
+             CREATE TABLE t (a int);
+             CREATE INDEX ON t USING bloom (a);",
+            "cannot drop extension bloom because other objects depend on it",
+        ),
+    ] {
+        let name = if setup.contains("bloom") {
+            "bloom"
+        } else {
+            "postgres_fdw"
+        };
+        let drop = format!("DROP EXTENSION {name};");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &drop)]).expect_err(&drop);
+        assert!(err.to_string().starts_with(message), "{drop}\n  got: {err}");
+        let cascade = format!("DROP EXTENSION {name} CASCADE;");
+        let create = format!("CREATE EXTENSION {name};");
+        build(&[
+            ("0001.sql", setup),
+            ("0002.sql", &cascade),
+            ("0003.sql", &create),
+        ]);
+    }
+}
+
+#[test]
+fn set_schema_needs_a_relocatable_extension() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE SCHEMA zz;",
+            "ALTER EXTENSION plpgsql SET SCHEMA zz;",
+            "extension \"plpgsql\" does not support SET SCHEMA",
+        ),
+        (
+            "CREATE SCHEMA zz; CREATE EXTENSION xml2;",
+            "ALTER EXTENSION xml2 SET SCHEMA zz;",
+            "extension \"xml2\" does not support SET SCHEMA",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+    // Its own schema is no change, relocatable or not.
+    build(&[
+        ("0001.sql", "CREATE EXTENSION xml2;"),
+        ("0002.sql", "ALTER EXTENSION xml2 SET SCHEMA public;"),
+        ("0003.sql", "ALTER EXTENSION plpgsql SET SCHEMA pg_catalog;"),
+    ]);
+    let snap = build(&[
+        ("0001.sql", "CREATE SCHEMA zz; CREATE EXTENSION citext;"),
+        ("0002.sql", "ALTER EXTENSION citext SET SCHEMA zz;"),
+    ]);
+    assert!(snap.resolve_type_by_name(Some("zz"), "citext").is_some());
+}
+
+#[test]
+fn extension_scripts_see_the_schemas_of_required_extensions() {
+    // The script's search_path is the extension's schema, then its
+    // required extensions' (execute_extension_script).
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA zz;
+         CREATE EXTENSION earthdistance SCHEMA zz CASCADE;
+         DROP EXTENSION earthdistance;
+         CREATE EXTENSION earthdistance;",
+    )]);
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA zz;
+         CREATE EXTENSION cube SCHEMA zz;
+         CREATE EXTENSION earthdistance VERSION '1.1';
+         ALTER EXTENSION earthdistance UPDATE;",
+    )]);
+}

@@ -90,7 +90,7 @@ pub(crate) fn multiple_targets_message(err: super::DdlError) -> super::DdlError 
 }
 
 /// An object `pg_depend` rows point at: `(classid, objid, objsubid)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ObjectAddress {
     pub classid: PgClassOid,
     pub objid: PgGenericOid,
@@ -323,6 +323,24 @@ pub(crate) const PG_OPFAMILY_RELID: PgClassOid = PgClassOid::from_raw(2753);
 pub(crate) const PG_TS_CONFIG_RELID: PgClassOid = PgClassOid::from_raw(3602);
 /// `pg_ts_dict`.
 pub(crate) const PG_TS_DICT_RELID: PgClassOid = PgClassOid::from_raw(3600);
+/// `pg_ts_parser`.
+pub(crate) const PG_TS_PARSER_RELID: PgClassOid = PgClassOid::from_raw(3601);
+/// `pg_ts_template`.
+pub(crate) const PG_TS_TEMPLATE_RELID: PgClassOid = PgClassOid::from_raw(3764);
+/// `pg_am`.
+pub(crate) const PG_AM_RELID: PgClassOid = PgClassOid::from_raw(2601);
+/// `pg_foreign_data_wrapper`.
+pub(crate) const PG_FOREIGN_DATA_WRAPPER_RELID: PgClassOid = PgClassOid::from_raw(2328);
+
+/// The catalog of a text search object of `kind` (`c`, `d`, `p`, `t`).
+fn ts_classid(kind: &str) -> PgClassOid {
+    match kind {
+        "c" => PG_TS_CONFIG_RELID,
+        "d" => PG_TS_DICT_RELID,
+        "p" => PG_TS_PARSER_RELID,
+        _ => PG_TS_TEMPLATE_RELID,
+    }
+}
 
 /// The OID of an object its creation hasn't stored yet (the creation
 /// assigns a fresh one, or keeps the replaced object's).
@@ -366,11 +384,20 @@ pub(crate) enum NamedObject {
         namespace: crate::oid::PgNamespaceOid,
         method: String,
     },
-    /// A text search configuration (`c`) or dictionary (`d`).
+    /// A text search configuration (`c`), dictionary (`d`), parser (`p`)
+    /// or template (`t`).
     TsObject {
         kind: String,
         name: String,
         namespace: crate::oid::PgNamespaceOid,
+    },
+    /// An access method a migration created.
+    AccessMethod {
+        name: String,
+    },
+    /// A foreign-data wrapper.
+    ForeignDataWrapper {
+        name: String,
     },
 }
 
@@ -384,8 +411,9 @@ impl NamedObject {
             NamedObject::PublicationRel { .. } => PG_PUBLICATION_REL_RELID,
             NamedObject::Opclass { .. } => PG_OPCLASS_RELID,
             NamedObject::Opfamily { .. } => PG_OPFAMILY_RELID,
-            NamedObject::TsObject { kind, .. } if kind == "c" => PG_TS_CONFIG_RELID,
-            NamedObject::TsObject { .. } => PG_TS_DICT_RELID,
+            NamedObject::TsObject { kind, .. } => ts_classid(kind),
+            NamedObject::AccessMethod { .. } => PG_AM_RELID,
+            NamedObject::ForeignDataWrapper { .. } => PG_FOREIGN_DATA_WRAPPER_RELID,
         }
     }
 
@@ -452,6 +480,8 @@ impl NamedObject {
                 .iter()
                 .find(|o| &o.kind == kind && &o.name == name && o.namespace == *namespace)
                 .map(|o| o.oid),
+            NamedObject::AccessMethod { name } => interp.access_method_oids.get(name).copied(),
+            NamedObject::ForeignDataWrapper { name } => interp.foreign_data.wrapper_oid(name),
         }
     }
 }
@@ -519,15 +549,33 @@ pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option
                     method: f.opfmethod.clone(),
                 })
         }
-        c if c == PG_TS_CONFIG_RELID || c == PG_TS_DICT_RELID => interp
-            .pg_ts_objects
+        c if [
+            PG_TS_CONFIG_RELID,
+            PG_TS_DICT_RELID,
+            PG_TS_PARSER_RELID,
+            PG_TS_TEMPLATE_RELID,
+        ]
+        .contains(&c) =>
+        {
+            interp
+                .pg_ts_objects
+                .iter()
+                .find(|o| o.oid == oid && ts_classid(&o.kind) == c)
+                .map(|o| NamedObject::TsObject {
+                    kind: o.kind.clone(),
+                    name: o.name.clone(),
+                    namespace: o.namespace,
+                })
+        }
+        c if c == PG_AM_RELID => interp
+            .access_method_oids
             .iter()
-            .find(|o| o.oid == oid)
-            .map(|o| NamedObject::TsObject {
-                kind: o.kind.clone(),
-                name: o.name.clone(),
-                namespace: o.namespace,
-            }),
+            .find(|(_, o)| **o == oid)
+            .map(|(name, _)| NamedObject::AccessMethod { name: name.clone() }),
+        c if c == PG_FOREIGN_DATA_WRAPPER_RELID => interp
+            .foreign_data
+            .wrapper_named(oid)
+            .map(|name| NamedObject::ForeignDataWrapper { name }),
         _ => None,
     }
 }
@@ -893,13 +941,18 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                 }) == Some(namespace);
                 format!(
                     "text search {} {}",
-                    if kind == "c" {
-                        "configuration"
-                    } else {
-                        "dictionary"
+                    match kind.as_str() {
+                        "c" => "configuration",
+                        "d" => "dictionary",
+                        "p" => "parser",
+                        _ => "template",
                     },
                     qualify_unless_visible(interp, namespace, &name, visible)
                 )
+            }
+            Some(NamedObject::AccessMethod { name }) => format!("access method {name}"),
+            Some(NamedObject::ForeignDataWrapper { name }) => {
+                format!("foreign-data wrapper {name}")
             }
             _ => "object".into(),
         },
@@ -1111,6 +1164,7 @@ fn find_blocker(
             // range type's multirange type's constructors).
             let owned = deptype != DepType::Normal
                 || is_drop_target(d)
+                || belongs_to_drop_target(interp, d)
                 || belongs_to_owner_relation(interp, from, d)
                 || (from.objsubid == 0
                     && interp.pg_depend.iter().any(|row| {
@@ -1135,6 +1189,32 @@ fn find_blocker(
     reached
         .into_iter()
         .find_map(|(d, silent, via)| via.filter(|_| !silent).map(|via| (d, via)))
+}
+
+/// Whether `d` belongs (automatically or internally) to another object the
+/// same DROP deletes — a DROP EXTENSION's member domain owning a CHECK
+/// constraint that calls a member function: reached from that target too,
+/// it goes with it (findDependentObjects over all of
+/// performMultipleDeletions' targets).
+fn belongs_to_drop_target(interp: &PgCatalog, d: ObjectAddress) -> bool {
+    let owned_by_target = interp.pg_depend.iter().any(|row| {
+        row.classid == d.classid
+            && row.objid == d.objid
+            && matches!(row.deptype, DepType::Auto | DepType::Internal)
+            && is_drop_target(ObjectAddress {
+                classid: row.refclassid,
+                objid: row.refobjid,
+                objsubid: 0,
+            })
+    });
+    // A domain's constraints, which the analyzer keeps with the domain
+    // rather than as their automatic dependency on its type.
+    owned_by_target
+        || (d.classid == PG_CONSTRAINT_RELID
+            && interp.domain_constraints.iter().any(|(typid, cs)| {
+                cs.iter().any(|c| c.oid == d.objid)
+                    && is_drop_target(ObjectAddress::new(PG_TYPE_RELID, typid.into_nonzero(), 0))
+            }))
 }
 
 /// Whether `d` — an index or a constraint — belongs to the relation
@@ -1192,13 +1272,28 @@ pub(crate) fn check_not_owned(
             "cannot drop {target_desc} because it is required by the database system"
         )));
     }
+    // The extension whose scripts are running may drop its own members
+    // (findDependentObjects ignores a DEPENDENCY_EXTENSION on
+    // CurrentExtensionObject): an upgrade script replacing a function.
+    let current_extension = interp
+        .installing_extension
+        .as_deref()
+        .and_then(|name| interp.extension_by_name.get(name))
+        .map(|e| PgGenericOid::from_nonzero(e.into_nonzero()));
     let owner = interp
         .pg_depend
         .iter()
         .find(|d| {
             d.classid == target.classid
                 && d.objid == target.objid
-                && matches!(d.deptype, DepType::Internal | DepType::Extension)
+                && match d.deptype {
+                    DepType::Internal => true,
+                    DepType::Extension => {
+                        !(d.refclassid == crate::pg_catalog::PG_EXTENSION_RELID
+                            && Some(d.refobjid) == current_extension)
+                    }
+                    _ => false,
+                }
         })
         .map(|owner| ObjectAddress {
             classid: owner.refclassid,
@@ -1475,6 +1570,11 @@ fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
         } => interp
             .pg_ts_objects
             .retain(|o| !(&o.kind == kind && &o.name == name && o.namespace == *namespace)),
+        NamedObject::AccessMethod { name } => {
+            interp.pg_am.retain(|a| &a.amname != name);
+            interp.access_method_oids.remove(name);
+        }
+        NamedObject::ForeignDataWrapper { name } => interp.foreign_data.forget_wrapper(name),
     }
 }
 
@@ -1495,17 +1595,12 @@ pub(crate) fn delete_member(interp: &mut PgCatalog, classid: PgClassOid, objid: 
     interp.remove_dependencies_on(classid, objid);
 }
 
-/// An extension's new objects the analyzer keeps in collections of their
-/// own (operator families and classes, text search objects), as addresses
-/// for its membership rows.
-pub(crate) fn extension_named_members(
-    interp: &mut PgCatalog,
-    opfamilies_before: usize,
-    opclasses_before: usize,
-    ts_before: usize,
-) -> Vec<ObjectAddress> {
-    let mut objects: Vec<NamedObject> = interp.pg_opfamily
-        [opfamilies_before.min(interp.pg_opfamily.len())..]
+/// The objects the analyzer keeps in collections of their own, as named
+/// now: what an extension's scripts may create besides `pg_class`,
+/// `pg_proc`, ... rows.
+pub(crate) fn named_objects(interp: &PgCatalog) -> Vec<NamedObject> {
+    let mut objects: Vec<NamedObject> = interp
+        .pg_opfamily
         .iter()
         .map(|f| NamedObject::Opfamily {
             name: f.opfname.clone(),
@@ -1513,28 +1608,54 @@ pub(crate) fn extension_named_members(
             method: f.opfmethod.clone(),
         })
         .collect();
+    objects.extend(interp.pg_opclass.iter().map(|c| NamedObject::Opclass {
+        name: c.opcname.clone(),
+        namespace: c.opcnamespace,
+        method: c.opcmethod.clone(),
+    }));
+    objects.extend(interp.pg_ts_objects.iter().map(|o| NamedObject::TsObject {
+        kind: o.kind.clone(),
+        name: o.name.clone(),
+        namespace: o.namespace,
+    }));
     objects.extend(
-        interp.pg_opclass[opclasses_before.min(interp.pg_opclass.len())..]
-            .iter()
-            .map(|c| NamedObject::Opclass {
-                name: c.opcname.clone(),
-                namespace: c.opcnamespace,
-                method: c.opcmethod.clone(),
-            }),
+        interp
+            .access_method_oids
+            .keys()
+            .map(|name| NamedObject::AccessMethod { name: name.clone() }),
     );
     objects.extend(
-        interp.pg_ts_objects[ts_before.min(interp.pg_ts_objects.len())..]
-            .iter()
-            .filter(|o| o.kind == "c" || o.kind == "d")
-            .map(|o| NamedObject::TsObject {
-                kind: o.kind.clone(),
-                name: o.name.clone(),
-                namespace: o.namespace,
-            }),
+        interp
+            .foreign_data
+            .wrapper_names()
+            .map(|name| NamedObject::ForeignDataWrapper { name }),
     );
     objects
-        .into_iter()
-        .filter_map(|o| named_address_of(interp, &o))
+}
+
+/// An extension's new objects the analyzer keeps in collections of their
+/// own (operator families and classes, text search objects, access
+/// methods, foreign-data wrappers): those whose identity wasn't among
+/// `before`, as addresses for its membership rows.
+pub(crate) fn extension_named_members(
+    interp: &PgCatalog,
+    before: &std::collections::HashSet<ObjectAddress>,
+) -> Vec<ObjectAddress> {
+    named_objects(interp)
+        .iter()
+        .filter_map(|o| named_address_of(interp, o))
+        .filter(|a| !before.contains(a))
+        .collect()
+}
+
+/// The identities of [`named_objects`], to diff against
+/// [`extension_named_members`].
+pub(crate) fn named_object_addresses(
+    interp: &PgCatalog,
+) -> std::collections::HashSet<ObjectAddress> {
+    named_objects(interp)
+        .iter()
+        .filter_map(|o| named_address_of(interp, o))
         .collect()
 }
 
@@ -1567,6 +1688,25 @@ pub(crate) fn record_index_opclasses(
                 namespace: c.opcnamespace,
                 method: c.opcmethod.clone(),
             }));
+        }
+    }
+    // A key column without one named uses its type's default class
+    // (index_create records each `indclass` entry).
+    let resolved: Vec<crate::oid::PgOpclassOid> = interp
+        .pg_index
+        .get(&index)
+        .map(|i| i.indclass.iter().flatten().copied().collect())
+        .unwrap_or_default();
+    for class in resolved {
+        if let Some(c) = interp.pg_opclass.iter().find(|c| c.oid == class) {
+            let named = Reference::Named(NamedObject::Opclass {
+                name: c.opcname.clone(),
+                namespace: c.opcnamespace,
+                method: c.opcmethod.clone(),
+            });
+            if !refs.contains(&named) {
+                refs.push(named);
+            }
         }
     }
     record_references(

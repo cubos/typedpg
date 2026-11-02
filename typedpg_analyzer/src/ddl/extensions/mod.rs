@@ -135,7 +135,7 @@ pub fn create_extension(
     let others_before = OtherMembers::snapshot(interp);
 
     let installing = interp.installing_extension.replace(name.clone());
-    let applied = apply_with_schema(interp, &target_schema, &path);
+    let applied = apply_with_schema(interp, name, &target_schema, &path);
     interp.installing_extension = installing;
     applied?;
 
@@ -189,7 +189,7 @@ pub fn alter_extension(interp: &mut PgCatalog, stmt: &AlterExtensionStmt) -> Res
     let others_before = OtherMembers::snapshot(interp);
 
     let installing = interp.installing_extension.replace(name.clone());
-    let applied = apply_with_schema(interp, &installed_nsname, &path);
+    let applied = apply_with_schema(interp, name, &installed_nsname, &path);
     interp.installing_extension = installing;
     applied?;
 
@@ -257,16 +257,17 @@ fn record_extension_membership(
 }
 
 /// What an extension's scripts may create besides types, functions and
-/// casts, as it was before they ran: its operators, relations, operator
-/// families and classes and text search objects become members too
+/// casts, as it was before they ran: its languages, operators, relations,
+/// operator families and classes, text search objects, access methods and
+/// foreign-data wrappers become members too
 /// (recordDependencyOnCurrentExtension).
 struct OtherMembers {
     languages: std::collections::HashSet<crate::oid::PgLanguageOid>,
     operators: std::collections::HashSet<crate::oid::PgOperatorOid>,
     relations: std::collections::HashSet<PgClassOid>,
-    opfamilies: usize,
-    opclasses: usize,
-    ts_objects: usize,
+    /// Operator families and classes, text search objects, access methods,
+    /// foreign-data wrappers.
+    named: std::collections::HashSet<crate::ddl::depend::ObjectAddress>,
 }
 
 impl OtherMembers {
@@ -275,9 +276,7 @@ impl OtherMembers {
             languages: interp.pg_language.keys().copied().collect(),
             operators: interp.pg_operator.keys().copied().collect(),
             relations: interp.pg_class.keys().copied().collect(),
-            opfamilies: interp.pg_opfamily.len(),
-            opclasses: interp.pg_opclass.len(),
-            ts_objects: interp.pg_ts_objects.len(),
+            named: crate::ddl::depend::named_object_addresses(interp),
         }
     }
 
@@ -313,9 +312,7 @@ impl OtherMembers {
         );
         members.extend(crate::ddl::depend::extension_named_members(
             interp,
-            self.opfamilies,
-            self.opclasses,
-            self.ts_objects,
+            &self.named,
         ));
         let ext = ObjectAddress {
             classid: PG_EXTENSION_RELID,
@@ -350,6 +347,13 @@ const THIRD_PARTY: &[&str] = &["vector"];
 pub(crate) fn outside_postgres_image(name: &str) -> bool {
     let bundled = |n: &str| REGISTRY.iter().any(|e| e.name == n);
     bundled(name) && (THIRD_PARTY.contains(&name) || requires(name).iter().any(|r| !bundled(r)))
+}
+
+/// The control files' `relocatable`: whether ALTER EXTENSION SET SCHEMA may
+/// move the extension. Every bundled extension's control file says `true`
+/// but these.
+fn relocatable(name: &str) -> bool {
+    !matches!(name, "plpgsql" | "xml2")
 }
 
 /// The control files' `requires`: extensions that must be installed first.
@@ -439,15 +443,30 @@ fn find_upgrade_path<'a>(
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Apply a list of SQL scripts with a temporary `search_path` prepend so
-/// unqualified names in the extension SQL resolve into the target schema.
+/// Apply extension `name`'s scripts with the `search_path`
+/// execute_extension_script gives them: the target schema, the schemas of
+/// the extensions it requires (but `pg_catalog`), then `pg_temp`.
 fn apply_with_schema(
     interp: &mut PgCatalog,
+    name: &str,
     schema: &str,
     scripts: &[&str],
 ) -> Result<(), DdlError> {
     ensure_namespace(interp, schema)?;
-    let original = interp.push_search_path_front(schema);
+    let mut path = vec![schema.to_owned()];
+    for required in requires(name) {
+        if let Some(ns) = interp
+            .extension_by_name
+            .get(*required)
+            .and_then(|oid| interp.pg_extension.get(oid))
+            .and_then(|e| interp.namespace_name(e.extnamespace))
+            .filter(|ns| *ns != "pg_catalog")
+        {
+            path.push(ns.to_owned());
+        }
+    }
+    path.push("pg_temp".to_owned());
+    let original = interp.replace_search_path(path);
 
     let mut result = Ok(());
     for sql in scripts {
@@ -780,6 +799,15 @@ pub(crate) fn set_extension_schema(
     new_nsoid: crate::oid::PgNamespaceOid,
 ) -> Result<(), DdlError> {
     let ext = extension_oid(interp, name)?;
+    // No change is no work; otherwise the control file must allow it.
+    if interp.pg_extension.get(&ext).map(|e| e.extnamespace) == Some(new_nsoid) {
+        return Ok(());
+    }
+    if !relocatable(name) {
+        return Err(DdlError::ExtensionError(format!(
+            "extension \"{name}\" does not support SET SCHEMA"
+        )));
+    }
     let ext_generic = PgGenericOid::from_nonzero(ext.into_nonzero());
     let members: Vec<(PgClassOid, PgGenericOid)> = interp
         .iter_pg_depend()

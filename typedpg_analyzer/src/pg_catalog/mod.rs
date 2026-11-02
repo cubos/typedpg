@@ -412,6 +412,9 @@ pub struct PgCatalog {
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
     /// servers.
     pub(crate) foreign_data: crate::ddl::fdw::ForeignData,
+    /// The OIDs of the access methods migrations create (`pg_am.oid`), by
+    /// name: the identity `pg_depend` rows name. The seeded ones are pinned.
+    pub(crate) access_method_oids: HashMap<String, crate::oid::PgGenericOid>,
     /// The extension whose scripts are running.
     pub(crate) installing_extension: Option<String>,
     /// The index of each table's `REPLICA IDENTITY USING INDEX`
@@ -806,6 +809,7 @@ impl PgCatalog {
             in_transaction_block: false,
             sequence_params: Shared::default(),
             foreign_data: Default::default(),
+            access_method_oids: HashMap::new(),
             installing_extension: None,
             replica_identity_indexes: Shared::default(),
             publications: Shared::default(),

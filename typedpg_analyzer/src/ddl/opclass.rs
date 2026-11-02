@@ -233,6 +233,8 @@ pub fn create_am(interp: &mut PgCatalog, stmt: &CreateAmStmt) -> Result<(), DdlE
             "function {handler} must return type {expected}"
         )));
     }
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
+    interp.access_method_oids.insert(stmt.amname.clone(), oid);
     interp.pg_am.push(PgAm {
         amname: stmt.amname.clone(),
         amtype: stmt.amtype.clone(),
@@ -579,13 +581,21 @@ pub(crate) fn drop_am_object(
             let Some(name) = node_string(obj_node).map(str::to_owned) else {
                 return Ok(());
             };
-            let before = interp.pg_am.len();
-            interp.pg_am.retain(|a| a.amname != name);
-            if interp.pg_am.len() == before && !missing_ok {
+            if !am_exists(interp, &name) {
+                if missing_ok {
+                    return Ok(());
+                }
                 return Err(DdlError::TypeNotFound(format!(
                     "access method \"{name}\" does not exist"
                 )));
             }
+            // An extension's member goes only with it.
+            let object = super::depend::NamedObject::AccessMethod { name: name.clone() };
+            if let Some(addr) = super::depend::named_address_of(interp, &object) {
+                super::depend::check_not_owned(interp, addr, &format!("access method {name}"))?;
+            }
+            interp.pg_am.retain(|a| a.amname != name);
+            interp.access_method_oids.remove(&name);
         }
         ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => {
             let is_class = objtype == ObjectType::ObjectOpclass;
