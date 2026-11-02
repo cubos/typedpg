@@ -604,8 +604,8 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlEr
         | node::Node::DropRoleStmt(_)
         | node::Node::ReassignOwnedStmt(_)
         | node::Node::DropOwnedStmt(_)
-        | node::Node::AlterTableSpaceOptionsStmt(_)
-        | node::Node::AlterObjectDependsStmt(_) => Ok(()),
+        | node::Node::AlterTableSpaceOptionsStmt(_) => Ok(()),
+        node::Node::AlterObjectDependsStmt(s) => extensions::alter_object_depends(db, s),
         // `ALTER COLLATION name REFRESH VERSION`: only the name matters.
         node::Node::AlterCollationStmt(s) => collations::refresh_version(db, s),
         node::Node::AlterTypeStmt(s) => types::alter_type(db, s),

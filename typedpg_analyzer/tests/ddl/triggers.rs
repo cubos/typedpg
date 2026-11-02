@@ -401,3 +401,197 @@ fn drop_trigger_if_exists_skips_a_missing_table() {
          DROP POLICY IF EXISTS p ON nosuch;",
     )]);
 }
+
+#[test]
+fn alter_trigger_depends_on_extension_looks_the_trigger_up() {
+    // ExecAlterObjectDependsStmt: get_object_address_rv opens the table
+    // (table_openrv) and finds the trigger, then the extension is looked
+    // up. The same for a routine, an index and a materialized view.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE u (x int);
+         CREATE TABLE t (a int);
+         CREATE INDEX t_a ON t (a);
+         CREATE TYPE ct AS (a int);
+         CREATE VIEW v AS SELECT 1 AS x;
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TRIGGER tg BEFORE INSERT ON u FOR EACH ROW EXECUTE FUNCTION trf();",
+    )]);
+    db.apply_sql(
+        "ALTER TRIGGER tg ON u DEPENDS ON EXTENSION plpgsql;
+         ALTER TRIGGER tg ON u DEPENDS ON EXTENSION plpgsql;
+         ALTER TRIGGER tg ON u NO DEPENDS ON EXTENSION plpgsql;
+         ALTER TRIGGER tg ON u NO DEPENDS ON EXTENSION plpgsql;
+         ALTER FUNCTION trf() DEPENDS ON EXTENSION plpgsql;
+         ALTER ROUTINE trf() NO DEPENDS ON EXTENSION plpgsql;
+         ALTER INDEX t_a DEPENDS ON EXTENSION plpgsql;
+         ALTER MATERIALIZED VIEW mv DEPENDS ON EXTENSION plpgsql;",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "ALTER TRIGGER nosuch ON u DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"nosuch\" for table \"u\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER nosuch ON u NO DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"nosuch\" for table \"u\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER nosuch ON u DEPENDS ON EXTENSION nosuch;",
+            "trigger \"nosuch\" for table \"u\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON u DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON u NO DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON nosuch DEPENDS ON EXTENSION nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON nosch.u DEPENDS ON EXTENSION plpgsql;",
+            "schema \"nosch\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON t_a DEPENDS ON EXTENSION plpgsql;",
+            "cannot open relation \"t_a\" (This operation is not supported for indexes.)",
+        ),
+        (
+            "ALTER TRIGGER tg ON ct DEPENDS ON EXTENSION plpgsql;",
+            "cannot open relation \"ct\"",
+        ),
+        (
+            "ALTER TRIGGER tg ON v DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"tg\" for table \"v\" does not exist",
+        ),
+        (
+            "ALTER TRIGGER tg ON pg_class DEPENDS ON EXTENSION plpgsql;",
+            "trigger \"tg\" for table \"pg_class\" does not exist",
+        ),
+        (
+            "ALTER FUNCTION nosuch() DEPENDS ON EXTENSION nosuch;",
+            "function nosuch() does not exist",
+        ),
+        (
+            "ALTER FUNCTION trf() DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER PROCEDURE trf() DEPENDS ON EXTENSION plpgsql;",
+            "trf() is not a procedure",
+        ),
+        (
+            "ALTER INDEX nosuch DEPENDS ON EXTENSION nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER INDEX u DEPENDS ON EXTENSION plpgsql;",
+            "\"u\" is not an index",
+        ),
+        (
+            "ALTER INDEX t_a DEPENDS ON EXTENSION nosuch;",
+            "extension \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER MATERIALIZED VIEW t_a DEPENDS ON EXTENSION plpgsql;",
+            "\"t_a\" is not a materialized view",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}
+
+#[test]
+fn drop_extension_takes_along_what_depends_on_it_automatically() {
+    // DEPENDENCY_AUTO_EXTENSION: DROP EXTENSION drops the object without
+    // CASCADE; what depends on the object normally still needs it, and a
+    // partition's trigger clone goes only with its parent's. (CREATE
+    // EXTENSION leaves the pg_sanity mirror out, so the expectations here
+    // were checked by hand against PostgreSQL 18.6.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE TABLE u (x int NOT NULL);
+         CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql
+             AS 'BEGIN NEW.x := 1; RETURN NEW; END';
+         CREATE TRIGGER tg BEFORE INSERT ON u FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE VIEW vv AS SELECT * FROM mv;
+         CREATE TABLE p (a int) PARTITION BY RANGE (a);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2);
+         CREATE TRIGGER ptg BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE INDEX ui ON u (x);
+         ALTER TABLE u ADD CONSTRAINT upk PRIMARY KEY (x);",
+    )]);
+    let blocked = "cannot drop extension hstore because other objects depend on it";
+    let expect = |db: &mut PgCatalog, sql: &str, message: &str| {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    };
+    db.apply_sql("ALTER MATERIALIZED VIEW mv DEPENDS ON EXTENSION hstore;")
+        .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", blocked);
+    db.apply_sql(
+        "DROP VIEW vv;
+         ALTER FUNCTION trf() DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", blocked);
+    db.apply_sql(
+        "ALTER TRIGGER tg ON u DEPENDS ON EXTENSION hstore;
+         ALTER FUNCTION trf() NO DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER ptg ON p1 DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop trigger ptg on table p1 because trigger ptg on table p requires it",
+    );
+    db.apply_sql(
+        "ALTER TRIGGER ptg ON p1 NO DEPENDS ON EXTENSION hstore;
+         ALTER INDEX upk DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop extension hstore because other objects depend on it (constraint upk on \
+         table u depends on extension hstore)",
+    );
+    db.apply_sql(
+        "ALTER INDEX upk NO DEPENDS ON EXTENSION hstore;
+         ALTER INDEX ui DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER ptg ON p DEPENDS ON EXTENSION hstore;
+         DROP EXTENSION hstore;
+         CREATE TRIGGER tg BEFORE INSERT ON u FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE TRIGGER ptg BEFORE INSERT ON p FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+         CREATE INDEX ui ON u (x);",
+    )
+    .unwrap();
+    // CASCADE takes along what depends on them.
+    db.apply_sql(
+        "CREATE EXTENSION hstore;
+         CREATE FUNCTION f2() RETURNS int LANGUAGE sql AS 'SELECT 1';
+         ALTER FUNCTION f2() DEPENDS ON EXTENSION hstore;
+         CREATE VIEW v2 AS SELECT f2();",
+    )
+    .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", blocked);
+    db.apply_sql("DROP EXTENSION hstore CASCADE; CREATE VIEW v2 AS SELECT 1;")
+        .unwrap();
+}
