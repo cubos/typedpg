@@ -318,7 +318,7 @@ fn drop_pk_referenced_by_fk_without_cascade_is_rejected() {
             ("0002.sql", "ALTER TABLE p DROP CONSTRAINT p_pkey;"),
         ]),
         DdlError::DependencyError(_),
-        "cannot drop constraint p_pkey on table p because other objects depend on it (foreign key constraint \"c_p_id_fkey\" depends on this)",
+        "cannot drop constraint p_pkey on table p because other objects depend on it (constraint c_p_id_fkey on table c depends on index p_pkey)",
     );
 }
 
@@ -387,7 +387,7 @@ fn drop_table_referenced_by_fk_without_cascade_is_rejected() {
             ("0002.sql", "DROP TABLE p;"),
         ]),
         DdlError::DependencyError(_),
-        "cannot drop table p because other objects depend on it (foreign key constraint(s) c_p_id_fkey on public.c depend on this)",
+        "cannot drop table p because other objects depend on it (constraint c_p_id_fkey on table c depends on table p)",
     );
 }
 

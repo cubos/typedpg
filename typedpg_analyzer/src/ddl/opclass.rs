@@ -351,6 +351,7 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
     let (family_name, family_ns) = family;
     // storeOperators without the ADD check: an operator the family already
     // has trips pg_amop's unique index.
+    let mut operators = Vec::new();
     for op in family_operators(
         interp,
         &family_name,
@@ -363,6 +364,16 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
             return Err(DdlError::DuplicateObject(
                 "duplicate key value violates unique constraint \"pg_amop_fam_strat_index\"".into(),
             ));
+        }
+        // amadjustmembers: GiST, GIN and SP-GiST make every operator a
+        // soft dependency (it goes with its operator), btree and hash a
+        // cross-type one; the rest, and an access method without the
+        // callback (BRIN, bloom), keep it hard: the class is internal to
+        // it and blocks DROP OPERATOR.
+        let soft = matches!(am.as_str(), "gist" | "gin" | "spgist")
+            || (matches!(am.as_str(), "btree" | "hash") && op.amoplefttype != op.amoprighttype);
+        if !soft {
+            operators.push(super::depend::ObjectAddress::operator(op.amopopr));
         }
         interp.pg_amop.push(op);
     }
@@ -386,12 +397,12 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         opcfamily: family_name,
         opcfamilynamespace: family_ns,
     });
-    super::depend::record(
-        interp,
-        super::depend::ObjectAddress::new(super::depend::PG_OPCLASS_RELID, oid.into_nonzero(), 0),
-        family,
-        crate::pg_catalog::DepType::Auto,
-    );
+    let me =
+        super::depend::ObjectAddress::new(super::depend::PG_OPCLASS_RELID, oid.into_nonzero(), 0);
+    super::depend::record(interp, me, family, crate::pg_catalog::DepType::Auto);
+    // Its operators (pg_amop rows internal to the class, each depending on
+    // its operator): DROP OPERATOR needs CASCADE, which takes the class.
+    super::depend::record(interp, me, operators, crate::pg_catalog::DepType::Normal);
     Ok(())
 }
 
@@ -564,16 +575,55 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
         }
     }
     // dropOperators.
+    let in_family = |o: &PgAmop| {
+        o.amopfamily == family && o.amopfamilynamespace == family_ns && o.amopmethod == stmt.amname
+    };
     for (strategy, left, right) in dropped {
         let before = interp.pg_amop.len();
+        let removed: Vec<crate::oid::PgOperatorOid> = interp
+            .pg_amop
+            .iter()
+            .filter(|o| {
+                in_family(o)
+                    && o.amopstrategy == strategy
+                    && o.amoplefttype == left
+                    && o.amoprighttype == right
+            })
+            .map(|o| o.amopopr)
+            .collect();
         interp.pg_amop.retain(|o| {
-            !(o.amopfamily == family
-                && o.amopfamilynamespace == family_ns
-                && o.amopmethod == stmt.amname
+            !(in_family(o)
                 && o.amopstrategy == strategy
                 && o.amoplefttype == left
                 && o.amoprighttype == right)
         });
+        // A class's entry for the operator was its dependency on it.
+        let classes: Vec<crate::oid::PgGenericOid> = interp
+            .pg_opclass
+            .iter()
+            .filter(|c| {
+                c.opcfamily == family
+                    && c.opcfamilynamespace == family_ns
+                    && c.opcmethod == stmt.amname
+            })
+            .map(|c| crate::oid::PgGenericOid::from_nonzero(c.oid.into_nonzero()))
+            .collect();
+        for op in removed {
+            if interp
+                .pg_amop
+                .iter()
+                .any(|o| in_family(o) && o.amopopr == op)
+            {
+                continue;
+            }
+            let op = crate::oid::PgGenericOid::from_nonzero(op.into_nonzero());
+            interp.pg_depend.retain(|d| {
+                !(d.classid == super::depend::PG_OPCLASS_RELID
+                    && classes.contains(&d.objid)
+                    && d.refclassid == crate::pg_catalog::PG_OPERATOR_RELID
+                    && d.refobjid == op)
+            });
+        }
         if interp.pg_amop.len() == before {
             return Err(DdlError::TypeNotFound(format!(
                 "operator {strategy}({},{}) does not exist in operator family \"{}\"",

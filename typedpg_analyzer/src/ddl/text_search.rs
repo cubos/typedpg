@@ -509,6 +509,27 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
                 .insert((nsoid, name), default_parser);
         }
         ("d", _, Some(template)) => {
+            // DefineTSDictionary: the dictionary depends on its template
+            // (a built-in one is pinned).
+            let me = crate::ddl::depend::NamedObject::TsObject {
+                kind: "d".to_owned(),
+                name: name.clone(),
+                namespace: nsoid,
+            };
+            let referenced = crate::ddl::depend::NamedObject::TsObject {
+                kind: "t".to_owned(),
+                name: template.1.clone(),
+                namespace: template.0,
+            };
+            if let Some(me) = crate::ddl::depend::named_address_of(interp, &me) {
+                let referenced = crate::ddl::depend::named_address_of(interp, &referenced);
+                crate::ddl::depend::record(
+                    interp,
+                    me,
+                    referenced,
+                    crate::pg_catalog::DepType::Normal,
+                );
+            }
             interp.ts_definitions.dicts.insert(
                 (nsoid, name),
                 DictDefinition {

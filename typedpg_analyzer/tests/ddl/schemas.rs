@@ -26,7 +26,7 @@ fn drop_schema_with_objects_fails_without_cascade() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop schema foo because other objects depend on it"
+        "cannot drop schema foo because other objects depend on it (table foo.bar depends on schema foo)"
     );
 }
 

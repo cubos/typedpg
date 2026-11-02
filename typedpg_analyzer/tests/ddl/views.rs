@@ -230,7 +230,7 @@ fn view_drop_table_fails_without_cascade() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop table t because other objects depend on it (view(s) public.v depend on this)"
+        "cannot drop table t because other objects depend on it (view v depends on table t)"
     );
 }
 
@@ -820,7 +820,7 @@ fn drop_view_fails_when_another_view_depends_on_it() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop view v1 because other objects depend on it (view(s) public.v2 depend on this)"
+        "cannot drop view v1 because other objects depend on it (view v2 depends on view v1)"
     );
 }
 
@@ -917,7 +917,7 @@ fn drop_type_referenced_by_view_cast_fails_without_cascade() {
             ("0002.sql", "DROP DOMAIN positive_int;"),
         ]),
         DdlError::DependencyError(_),
-        "cannot drop type positive_int because other objects depend on it (table(s) public.v depend on this type)",
+        "cannot drop type positive_int because other objects depend on it (view v depends on type positive_int)",
     );
 }
 

@@ -39,7 +39,7 @@ fn rename_table_without_cascade_still_blocks_drop() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop table t2 because other objects depend on it (view(s) public.v depend on this)"
+        "cannot drop table t2 because other objects depend on it (view v depends on table t2)"
     );
 }
 

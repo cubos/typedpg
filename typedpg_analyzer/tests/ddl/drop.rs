@@ -147,7 +147,7 @@ fn drop_type_with_dependent_column_errors() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop type status because other objects depend on it (table(s) public.t depend on this type)"
+        "cannot drop type status because other objects depend on it (column s of table t depends on type status)"
     );
 }
 
@@ -2132,4 +2132,146 @@ fn a_domain_depends_on_what_its_default_uses() {
         err.to_string().starts_with("type \"d\" does not exist"),
         "{err}"
     );
+}
+
+/// `stmt` after `setup` fails, its message starting with `message` (PG's
+/// errmsg, then its DETAIL in parentheses).
+fn assert_drop_fails(setup: &str, stmt: &str, message: &str) {
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)])
+        .expect_err(&format!("{setup}\n{stmt}"));
+    assert!(
+        err.to_string().starts_with(message),
+        "{setup}\n{stmt}\n  got: {err}"
+    );
+}
+
+#[test]
+fn a_text_search_dictionary_depends_on_its_template() {
+    let template =
+        "CREATE TEXT SEARCH TEMPLATE mytmpl (lexize = dsimple_lexize, init = dsimple_init);
+                    CREATE TEXT SEARCH DICTIONARY d2 (template = mytmpl);";
+    assert_drop_fails(
+        template,
+        "DROP TEXT SEARCH TEMPLATE mytmpl;",
+        "cannot drop text search template mytmpl because other objects depend on it (text \
+         search dictionary d2 depends on text search template mytmpl)",
+    );
+    build(&[
+        ("0001.sql", template),
+        ("0002.sql", "DROP TEXT SEARCH TEMPLATE mytmpl CASCADE;"),
+        ("0003.sql", template),
+    ]);
+    // A configuration depends on the dictionaries it maps to.
+    assert_drop_fails(
+        "CREATE TEXT SEARCH DICTIONARY d3 (template = simple);
+         CREATE TEXT SEARCH CONFIGURATION c3 (copy = english);
+         ALTER TEXT SEARCH CONFIGURATION c3 ALTER MAPPING FOR asciiword WITH d3;",
+        "DROP TEXT SEARCH DICTIONARY d3;",
+        "cannot drop text search dictionary d3 because other objects depend on it (text search \
+         configuration c3 depends on text search dictionary d3)",
+    );
+}
+
+#[test]
+fn an_operator_class_holds_on_to_its_operators() {
+    let setup =
+        "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+                 CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+                 CREATE OPERATOR CLASS c FOR TYPE int USING hash AS
+                     OPERATOR 1 ===(int, int), FUNCTION 1 hashint4(int);";
+    assert_drop_fails(
+        setup,
+        "DROP OPERATOR ===(int, int);",
+        "cannot drop operator ===(integer,integer) because other objects depend on it (operator \
+         class c for access method hash depends on operator ===(integer,integer))",
+    );
+    assert_drop_fails(
+        setup,
+        "DROP FUNCTION f(int, int);",
+        "cannot drop function f(integer,integer) because other objects depend on it",
+    );
+    // CASCADE takes the class along; creating both again works.
+    build(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DROP OPERATOR ===(int, int) CASCADE;"),
+        (
+            "0003.sql",
+            "CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+             CREATE OPERATOR CLASS c FOR TYPE int USING hash AS
+                 OPERATOR 1 ===(int, int), FUNCTION 1 hashint4(int);",
+        ),
+    ]);
+    // A family's loose member goes with its operator, without CASCADE.
+    build(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE OPERATOR FAMILY fam USING hash;
+         ALTER OPERATOR FAMILY fam USING hash ADD OPERATOR 1 ===(int, int);
+         DROP OPERATOR ===(int, int);
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         ALTER OPERATOR FAMILY fam USING hash ADD OPERATOR 1 ===(int, int);",
+    )]);
+}
+
+#[test]
+fn a_drop_naming_several_objects_reports_them_together() {
+    // RemoveRelations checks each name's relkind before any dependency.
+    for stmt in ["DROP VIEW v1, a;", "DROP VIEW a, v1;"] {
+        assert_drop_fails(
+            "CREATE TABLE a (x int); CREATE VIEW v1 AS SELECT 1;",
+            stmt,
+            "\"a\" is not a view",
+        );
+    }
+    assert_drop_fails(
+        "CREATE SCHEMA s1; CREATE SCHEMA s2; CREATE TABLE s1.t (x int);",
+        "DROP SCHEMA s1, s2;",
+        "cannot drop desired object(s) because other objects depend on them (table s1.t \
+         depends on schema s1)",
+    );
+    assert_drop_fails(
+        "CREATE SCHEMA s1; CREATE TABLE s1.t (x int);",
+        "DROP SCHEMA s1;",
+        "cannot drop schema s1 because other objects depend on it (table s1.t depends on schema \
+         s1)",
+    );
+    assert_drop_fails(
+        "CREATE TABLE a (x int); CREATE TABLE b (x int); CREATE VIEW v AS SELECT * FROM a;",
+        "DROP TABLE b, a;",
+        "cannot drop desired object(s) because other objects depend on them (view v depends on \
+         table a)",
+    );
+    assert_drop_fails(
+        "CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (c e); CREATE TYPE e2 AS ENUM ('b');",
+        "DROP TYPE e2, e;",
+        "cannot drop desired object(s) because other objects depend on them (column c of table \
+         t depends on type e)",
+    );
+}
+
+#[test]
+fn dependency_details_name_the_dependent_as_pg_does() {
+    assert_drop_fails(
+        "CREATE DOMAIN d AS int; CREATE TABLE t (c d);",
+        "DROP DOMAIN d;",
+        "cannot drop type d because other objects depend on it (column c of table t depends on \
+         type d)",
+    );
+    assert_drop_fails(
+        "CREATE TYPE e AS ENUM ('a'); CREATE TABLE t (c e);",
+        "DROP TYPE e;",
+        "cannot drop type e because other objects depend on it (column c of table t depends on \
+         type e)",
+    );
+    for (key, constraint) in [("PRIMARY KEY", "t_pkey"), ("UNIQUE", "t_id_key")] {
+        assert_drop_fails(
+            &format!("CREATE TABLE t (id int {key}); CREATE TABLE c (x int REFERENCES t (id));"),
+            &format!("ALTER TABLE t DROP CONSTRAINT {constraint};"),
+            &format!(
+                "cannot drop constraint {constraint} on table t because other objects depend on \
+                 it (constraint c_x_fkey on table c depends on index {constraint})"
+            ),
+        );
+    }
 }

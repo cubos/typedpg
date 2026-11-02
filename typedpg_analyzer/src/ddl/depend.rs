@@ -73,6 +73,10 @@ pub(crate) fn drop_target_identity(
             let oid = interp.extension_by_name.get(&s.sval)?;
             Some((kind, oid.get()))
         }
+        (ObjectType::ObjectSchema, node::Node::String(s)) => {
+            let oid = interp.namespace_oid(&s.sval)?;
+            Some((kind, oid.get()))
+        }
         _ => None,
     }
 }
@@ -85,9 +89,14 @@ pub(crate) fn multiple_targets_message(err: super::DdlError) -> super::DdlError 
             if msg.starts_with("cannot drop ")
                 && msg.contains(" because other objects depend on it") =>
         {
-            super::DdlError::DependencyError(
-                "cannot drop desired object(s) because other objects depend on them".into(),
-            )
+            // The DETAIL (what depends on what) stays.
+            let detail = msg
+                .split_once(" because other objects depend on it")
+                .map(|(_, rest)| rest)
+                .unwrap_or_default();
+            super::DdlError::DependencyError(format!(
+                "cannot drop desired object(s) because other objects depend on them{detail}"
+            ))
         }
         other => other,
     }
@@ -156,6 +165,7 @@ impl ObjectAddress {
             ObjectType::ObjectOperator => PG_OPERATOR_RELID,
             ObjectType::ObjectCollation => crate::pg_catalog::PG_COLLATION_RELID,
             ObjectType::ObjectExtension => crate::pg_catalog::PG_EXTENSION_RELID,
+            ObjectType::ObjectSchema => crate::pg_catalog::PG_NAMESPACE_RELID,
             _ => return None,
         };
         Some(Self::new(classid, nz, 0))
