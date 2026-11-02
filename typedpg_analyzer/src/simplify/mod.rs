@@ -15,8 +15,8 @@ use typedpg_pg_query::protobuf::ParseResult;
 use crate::pg_catalog::PgCatalog;
 use crate::resolve::AnalyzedQuery;
 
-mod dedup;
 mod count_exists;
+mod dedup;
 mod not_in;
 #[allow(dead_code)] // The rules use them as they land.
 pub(crate) mod proof;

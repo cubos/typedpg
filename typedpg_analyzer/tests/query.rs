@@ -92,10 +92,10 @@ mod select_rules;
 mod set_operations;
 #[path = "query/set_returning_functions.rs"]
 mod set_returning_functions;
-#[path = "query/simplify_dedup.rs"]
-mod simplify_dedup;
 #[path = "query/simplify_count_exists.rs"]
 mod simplify_count_exists;
+#[path = "query/simplify_dedup.rs"]
+mod simplify_dedup;
 #[path = "query/simplify_not_in.rs"]
 mod simplify_not_in;
 #[path = "query/special.rs"]
