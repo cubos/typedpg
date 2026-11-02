@@ -234,6 +234,9 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
         }
         Ok(())
     };
+    // The tablespace the indexes move to (any name is taken to exist, see
+    // check_tablespace_placement).
+    let tablespace = super::txblock::reindex_tablespace(&stmt.params);
     match ReindexObjectType::try_from(stmt.kind) {
         Ok(ReindexObjectType::ReindexObjectIndex) => {
             let Some(rv) = stmt.relation.as_ref() else {
@@ -255,6 +258,9 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                 prevent_in_transaction_block(interp, "REINDEX INDEX")?;
             }
             no_catalog(relid)?;
+            if tablespace.is_some() {
+                reindex_move(interp, &[relid], &[], concurrently, &tablespace)?;
+            }
             super::indexes::new_relfilenode(interp, relid);
         }
         Ok(ReindexObjectType::ReindexObjectTable) => {
@@ -264,6 +270,15 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                     prevent_in_transaction_block(interp, "REINDEX TABLE")?;
                 }
                 no_catalog(relid)?;
+                if tablespace.is_some() {
+                    let tables = if relkind(interp, relid) == Some(RelKind::Partitioned) {
+                        super::tables::inherit::all_inheritors(interp, relid)
+                    } else {
+                        vec![relid]
+                    };
+                    let indexes = indexes_of(interp, &tables);
+                    reindex_move(interp, &indexes, &tables, concurrently, &tablespace)?;
+                }
                 new_relfilenodes(interp, &[relid]);
             }
         }
@@ -281,7 +296,80 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                 "cannot reindex system catalogs concurrently".into(),
             ));
         }
+        // ReindexMultipleTables, with a tablespace: the system relations
+        // are skipped (with a WARNING); every other table's indexes move.
+        // REINDEX SYSTEM moves nothing. (REINDEX DATABASE / SYSTEM name the
+        // database the session is connected to, which the analyzer can't
+        // know: any name is taken as it.)
+        Ok(
+            kind @ (ReindexObjectType::ReindexObjectSchema
+            | ReindexObjectType::ReindexObjectDatabase),
+        ) if tablespace.is_some() => {
+            let schema = (kind == ReindexObjectType::ReindexObjectSchema)
+                .then(|| interp.namespace_oid(&stmt.name))
+                .flatten();
+            let tables: Vec<PgClassOid> = interp
+                .pg_class
+                .values()
+                .filter(|c| matches!(c.relkind, RelKind::Table | RelKind::MaterializedView))
+                .filter(|c| schema.is_none_or(|ns| c.relnamespace == ns))
+                .filter(|c| !interp.is_system_class(c.oid))
+                .map(|c| c.oid)
+                .collect();
+            let indexes = indexes_of(interp, &tables);
+            reindex_move(interp, &indexes, &tables, concurrently, &tablespace)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The indexes on `tables`, in OID order.
+fn indexes_of(interp: &PgCatalog, tables: &[PgClassOid]) -> Vec<PgClassOid> {
+    let mut indexes: Vec<PgClassOid> = interp
+        .pg_index
+        .values()
+        .filter(|i| tables.contains(&i.indrelid))
+        .map(|i| i.indexrelid)
+        .collect();
+    indexes.sort();
+    indexes
+}
+
+/// REINDEX (TABLESPACE ...) moving `indexes` (those of `tables`, for a
+/// TABLE / SCHEMA / DATABASE target): a system relation's indexes don't
+/// move (`cannot move system relation "i"`, without CONCURRENTLY, which
+/// refuses catalogs before), and pg_global takes only shared relations —
+/// rebuilt in place, an index of its own (`only shared relations can be
+/// placed in pg_global tablespace`); concurrently, a table's TOAST index
+/// too (`cannot move non-shared relation to tablespace "pg_global"`).
+fn reindex_move(
+    interp: &mut PgCatalog,
+    indexes: &[PgClassOid],
+    tables: &[PgClassOid],
+    concurrently: bool,
+    tablespace: &Option<String>,
+) -> Result<(), DdlError> {
+    if !concurrently && let Some(&index) = indexes.iter().find(|&&i| interp.is_system_class(i)) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot move system relation \"{}\"",
+            relname(interp, index)
+        )));
+    }
+    if tablespace.as_deref() != Some("pg_global") {
+        return Ok(());
+    }
+    if concurrently {
+        super::tables::toast::note_toast_tables(interp);
+        if !indexes.is_empty() || tables.iter().any(|t| interp.toast_tables.contains(t)) {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot move non-shared relation to tablespace \"pg_global\"".into(),
+            ));
+        }
+    } else if !indexes.is_empty() {
+        return Err(DdlError::Parse(
+            "only shared relations can be placed in pg_global tablespace".into(),
+        ));
     }
     Ok(())
 }
