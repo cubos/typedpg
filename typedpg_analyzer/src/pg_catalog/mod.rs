@@ -401,6 +401,10 @@ pub struct PgCatalog {
     pub(crate) relcache_index_attnames: Shared<HashMap<PgClassOid, Vec<String>>>,
     /// The indexes given a new relfilenode in the current transaction.
     pub(crate) indexes_with_new_relfilenode: Shared<std::collections::HashSet<PgClassOid>>,
+    /// The OID PG gives an index rebuilt by ALTER COLUMN TYPE (a new
+    /// object), where the analyzer keeps the old one: what orders indexes
+    /// as PG's OID order does (see `ddl::indexes::index_order`).
+    pub(crate) rebuilt_index_oids: Shared<HashMap<PgClassOid, u32>>,
     /// The first OID of the current transaction: what has a larger one was
     /// created in it.
     pub(crate) transaction_oid_floor: u32,
@@ -805,6 +809,7 @@ impl PgCatalog {
             index_attnames: Shared::default(),
             relcache_index_attnames: Shared::default(),
             indexes_with_new_relfilenode: Shared::default(),
+            rebuilt_index_oids: Shared::default(),
             transaction_oid_floor: USER_OID_START_NZ.get(),
             in_transaction_block: false,
             sequence_params: Shared::default(),

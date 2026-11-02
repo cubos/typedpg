@@ -2248,3 +2248,113 @@ fn partition_key_adoption_takes_the_first_by_name() {
         );
     }
 }
+
+/// ATTACH pairs the parent's keys with the partition's equivalent ones in
+/// name order on both sides (the relcache foreign-key lists), as PG does.
+#[test]
+fn attach_pairs_partition_keys_in_name_order() {
+    use typedpg_analyzer::ConType;
+    let keys = |db: &PgCatalog, table: &str| -> Vec<(String, bool)> {
+        let mut keys: Vec<(String, bool)> = db
+            .constraints_of_table(table)
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| (c.conname, c.conislocal))
+            .collect();
+        keys.sort();
+        keys
+    };
+    let k = |name: &str, local: bool| (name.to_owned(), local);
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE r (a int PRIMARY KEY);
+         CREATE TABLE p (a int) PARTITION BY LIST (a);
+         ALTER TABLE p ADD CONSTRAINT f_b FOREIGN KEY (a) REFERENCES r;
+         ALTER TABLE p ADD CONSTRAINT f_a FOREIGN KEY (a) REFERENCES r;
+         CREATE TABLE c (a int, CONSTRAINT f_b FOREIGN KEY (a) REFERENCES r,
+                         CONSTRAINT f_a FOREIGN KEY (a) REFERENCES r);
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);
+         ALTER TABLE p DROP CONSTRAINT f_b;
+         CREATE TABLE p2 (a int) PARTITION BY LIST (a);
+         ALTER TABLE p2 ADD CONSTRAINT zz FOREIGN KEY (a) REFERENCES r;
+         ALTER TABLE p2 ADD CONSTRAINT aa FOREIGN KEY (a) REFERENCES r;
+         CREATE TABLE c2 (a int, CONSTRAINT mm FOREIGN KEY (a) REFERENCES r);
+         ALTER TABLE p2 ATTACH PARTITION c2 FOR VALUES IN (1);",
+    )]);
+    assert_eq!(keys(&db, "c"), vec![k("f_a", false)]);
+    assert_eq!(keys(&db, "c2"), vec![k("mm", false), k("zz", false)]);
+    // The table named for a key into the attached tree is the first key's
+    // by name.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE x (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE x2 PARTITION OF x FOR VALUES FROM (0) TO (10);
+         CREATE TABLE x1 PARTITION OF x FOR VALUES FROM (10) TO (20);
+         CREATE TABLE u (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         ALTER TABLE u ADD CONSTRAINT zz FOREIGN KEY (a) REFERENCES x1 (a);
+         ALTER TABLE u ADD CONSTRAINT aa FOREIGN KEY (a) REFERENCES x2 (a);
+         ALTER TABLE u ATTACH PARTITION x FOR VALUES FROM (0) TO (100);",
+    )])
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.starts_with(
+            "cannot ALTER TABLE \"x2\" because it is being used by active queries in this session"
+        ),
+        "{err}"
+    );
+}
+
+/// ALTER COLUMN TYPE rebuilds the indexes over the column under new OIDs
+/// (constraints' first) and re-creates the foreign keys reading it, each
+/// picking its index anew: the first unique one over its columns in the
+/// new OID order.
+#[test]
+fn retyped_column_keys_pick_their_index_anew() {
+    let setup = "CREATE TABLE r (a int NOT NULL);
+         CREATE TABLE s (x int);
+         CREATE UNIQUE INDEX y0 ON r (a);
+         ALTER TABLE r ADD CONSTRAINT p1 PRIMARY KEY (a);
+         ALTER TABLE s ADD CONSTRAINT f FOREIGN KEY (x) REFERENCES r (a);
+         ALTER TABLE r ALTER COLUMN a TYPE bigint;
+         -- The referencing side retyped: the key re-picks too.
+         CREATE TABLE r2 (a int NOT NULL);
+         CREATE TABLE s2 (x int);
+         CREATE UNIQUE INDEX z0 ON r2 (a);
+         ALTER TABLE r2 ADD CONSTRAINT p2 PRIMARY KEY (a);
+         ALTER TABLE s2 ADD CONSTRAINT g FOREIGN KEY (x) REFERENCES r2;
+         ALTER TABLE s2 ALTER COLUMN x TYPE bigint;
+         -- Two plain indexes keep their order.
+         CREATE TABLE r3 (a int NOT NULL);
+         CREATE TABLE s3 (x int);
+         CREATE UNIQUE INDEX y5 ON r3 (a);
+         CREATE UNIQUE INDEX y3 ON r3 (a);
+         ALTER TABLE s3 ADD CONSTRAINT h FOREIGN KEY (x) REFERENCES r3 (a);
+         ALTER TABLE r3 ALTER COLUMN a TYPE bigint;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE r DROP CONSTRAINT p1;",
+            "cannot drop constraint p1 on table r because other objects depend on it",
+        ),
+        (
+            "DROP INDEX z0;",
+            "cannot drop index z0 because other objects depend on it",
+        ),
+        (
+            "DROP INDEX y5;",
+            "cannot drop index y5 because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER INDEX y0 RENAME TO z1; DROP INDEX z1;
+             ALTER TABLE r2 DROP CONSTRAINT p2;
+             DROP INDEX y3;",
+        ),
+    ]);
+}

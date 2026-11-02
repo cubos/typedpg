@@ -86,7 +86,7 @@ fn check_referenced_attrs(
         .values()
         .filter(|i| i.indrelid == target && !interp.invalid_indexes.contains(&i.indexrelid))
         .collect();
-    indexes.sort_by_key(|i| i.indexrelid);
+    indexes.sort_by_key(|i| crate::ddl::indexes::index_order(interp, i.indexrelid));
     let mut found_deferrable = false;
     for index in indexes {
         let key = key_columns(index);
@@ -530,6 +530,86 @@ fn add_referenced_partition_row(
     recurse_referenced(interp, oid, base)
 }
 
+/// ATPostAlterTypeCleanup re-creates the foreign keys reading a retyped
+/// column (`attnum` of `relid`), on either side, from their definition —
+/// which names the referenced columns: each picks its index anew, the first
+/// unique one over them in (the rebuilt indexes') OID order
+/// (transformFkeyCheckAttrs), and its clones and rows for referenced
+/// partitions follow.
+pub(crate) fn repick_indexes_after_retype(interp: &mut PgCatalog, relid: PgClassOid, attnum: i16) {
+    let fks: Vec<PgConstraint> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.contype == ConType::ForeignKey
+                && fk_parent(interp, c.oid).is_none()
+                && ((c.confrelid == Some(relid) && c.confkey.contains(&attnum))
+                    || (c.conrelid == relid && c.conkey.contains(&attnum)))
+        })
+        .cloned()
+        .collect();
+    for fk in fks {
+        let Some(target) = fk.confrelid else {
+            continue;
+        };
+        let wanted: std::collections::BTreeSet<i16> = fk.confkey.iter().copied().collect();
+        let mut indexes: Vec<&PgIndex> = interp
+            .pg_index
+            .values()
+            .filter(|i| {
+                i.indrelid == target
+                    && i.indisunique
+                    && !i.indisexclusion
+                    && i.indpred.is_none()
+                    && i.indexprs.is_empty()
+                    && !interp.invalid_indexes.contains(&i.indexrelid)
+                    && !interp.nonimmediate_indexes.contains(&i.indexrelid)
+                    && key_columns(i)
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        == wanted
+            })
+            .collect();
+        indexes.sort_by_key(|i| crate::ddl::indexes::index_order(interp, i.indexrelid));
+        let Some(index) = indexes.first().map(|i| i.indexrelid) else {
+            continue;
+        };
+        set_fk_index(interp, fk.oid, index);
+    }
+}
+
+/// Record `index` as the referenced index of key `con`, and the matching
+/// one on each row derived from it (its clones', or a referenced
+/// partition's copy).
+fn set_fk_index(interp: &mut PgCatalog, con: PgConstraintOid, index: PgClassOid) {
+    if let Some(d) = interp.fk_details.get_mut(&con) {
+        d.index = Some(index);
+    }
+    let parent_target = interp.pg_constraint.get(&con).and_then(|c| c.confrelid);
+    for clone in fk_clones(interp, con) {
+        let target = interp.pg_constraint.get(&clone).and_then(|c| c.confrelid);
+        let child_index = if target == parent_target {
+            Some(index)
+        } else {
+            interp
+                .index_parents
+                .iter()
+                .find(|(child, p)| {
+                    **p == index
+                        && interp
+                            .pg_index
+                            .get(child)
+                            .is_some_and(|i| Some(i.indrelid) == target)
+                })
+                .map(|(child, _)| *child)
+        };
+        if let Some(child_index) = child_index {
+            set_fk_index(interp, clone, child_index);
+        }
+    }
+}
+
 /// addFkConstraint's name for a derived row: `base` unless the relation
 /// already has a constraint so named, else ChooseConstraintName(base, NULL,
 /// "") — `base_1`, `base_2`, … the first no constraint in the namespace
@@ -568,6 +648,14 @@ fn clone_referenced_fks(
         .filter(|c| c.contype == ConType::ForeignKey && c.confrelid == Some(parent))
         .cloned()
         .collect();
+    // Known limitation: CloneFkReferenced finds these by a heap scan of
+    // pg_constraint (no index on confrelid), in its physical order, where an
+    // UPDATE of a row (ALTER CONSTRAINT, VALIDATE, a rename) moves it to the
+    // end; OID order is creation order. When two of them share a name
+    // (`f` on t and on u, both referencing the table), their rows for the
+    // new partition may get swapped `name_N` numbers. Modelling heap order
+    // would mean tracking a position bumped by every write to a
+    // constraint row.
     fks.sort_by_key(|c| c.oid);
     let oids: Vec<PgConstraintOid> = fks.iter().map(|c| c.oid).collect();
     for fk in fks {
@@ -849,24 +937,17 @@ pub(super) fn clone_parent_fks(
         .filter(|c| c.conrelid == parent && c.contype == ConType::ForeignKey)
         .cloned()
         .collect();
-    // Known limitation: PG visits the keys in pg_constraint's physical
-    // order, where an UPDATE of a row (VALIDATE, ALTER CONSTRAINT, a
-    // rename, ...) moves it to the end; OID order is creation order. When
-    // two of them clash on a name in the partition, the `name_N` numbers
-    // they get may come out swapped. Modelling heap order would mean
-    // tracking a position bumped by every write to a constraint row.
-    fks.sort_by_key(|c| c.oid);
-    let oids: Vec<PgConstraintOid> = fks.iter().map(|c| c.oid).collect();
-    // ATExecAttachPartition walks the table's foreign-key list (relcache,
-    // by name: the pg_constraint index on conrelid, contypid, conname).
-    let mut by_name: Vec<&PgConstraint> = fks.iter().collect();
-    by_name.sort_by(|a, b| {
+    // ATExecAttachPartition and CloneFkReferencing walk the table's
+    // foreign-key list (relcache): by name, the order of the pg_constraint
+    // index on (conrelid, contypid, conname).
+    fks.sort_by(|a, b| {
         a.conname
             .as_bytes()
             .cmp(b.conname.as_bytes())
             .then(a.oid.cmp(&b.oid))
     });
-    if let Some(fk) = by_name.iter().find(|fk| fk.confrelid == Some(part)) {
+    let oids: Vec<PgConstraintOid> = fks.iter().map(|c| c.oid).collect();
+    if let Some(fk) = fks.iter().find(|fk| fk.confrelid == Some(part)) {
         return Err(DdlError::UnsupportedDdl(format!(
             "cannot attach table \"{}\" as a partition because it is referenced by foreign key \
              \"{}\"",
