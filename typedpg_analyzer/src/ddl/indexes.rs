@@ -446,6 +446,36 @@ pub(crate) fn index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
     names
 }
 
+/// The column names of index `index` as its relcache entry has them, which
+/// generateClonedIndexStmt copies: those it was created with, or had when
+/// given a new relfilenode, for an index created or given one in the
+/// current transaction ([`PgCatalog::relcache_index_attnames`]); the
+/// catalog's otherwise.
+pub(crate) fn relcache_index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
+    db.relcache_index_attnames
+        .get(&index)
+        .cloned()
+        .unwrap_or_else(|| index_attnames(db, index))
+}
+
+/// Before an index column is renamed: an index whose relcache entry stays
+/// for the rest of the transaction (created or given a new relfilenode in
+/// it) keeps the names it has now there.
+pub(crate) fn pin_relcache_index_attnames(db: &mut PgCatalog, index: PgClassOid) {
+    let pinned =
+        index.get() >= db.transaction_oid_floor || db.indexes_with_new_relfilenode.contains(&index);
+    if pinned && !db.relcache_index_attnames.contains_key(&index) {
+        let names = index_attnames(db, index);
+        db.relcache_index_attnames.insert(index, names);
+    }
+}
+
+/// Index `index` gets a new relfilenode (TRUNCATE, REINDEX, CLUSTER): its
+/// relcache entry stays as it is for the rest of the transaction.
+pub(crate) fn new_relfilenode(db: &mut PgCatalog, index: PgClassOid) {
+    db.indexes_with_new_relfilenode.insert(index);
+}
+
 /// Before a column of table `relid` is renamed, its indexes keep the names
 /// their columns have now: PG never renames an index column after its
 /// table's.
@@ -1106,6 +1136,9 @@ pub(crate) fn rebuild_indexes_for_column_type(
             || index.indpred.as_ref().is_some_and(reads_column)
         {
             db.index_attnames.remove(&index.indexrelid);
+            // A new index, whose relcache entry is built anew.
+            db.relcache_index_attnames.remove(&index.indexrelid);
+            db.indexes_with_new_relfilenode.insert(index.indexrelid);
             super::depend::forget_auto_extension_marks(
                 db,
                 super::depend::ObjectAddress::relation(index.indexrelid),

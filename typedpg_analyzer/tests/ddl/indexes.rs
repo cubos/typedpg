@@ -2068,3 +2068,129 @@ fn renaming_columns_needs_a_relation_with_renameable_columns() {
         "cannot rename columns of relation \"pg_toast_2620\"",
     );
 }
+
+#[test]
+fn cloned_indexes_take_their_source_index_columns_names() {
+    // generateClonedIndexStmt copies the source index's column names
+    // (indexcolname): the clone keeps them, and ChooseIndexName names it
+    // after them — a partition's index (PARTITION OF, ATTACH PARTITION
+    // building one, a primary key or unique constraint's) and a LIKE ...
+    // INCLUDING INDEXES copy alike.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p ((a + b), b);
+         CREATE INDEX pi2 ON p (b, (a + b));
+         CREATE TABLE pp (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX ppi ON pp (b);
+         CREATE TABLE s (a int PRIMARY KEY, b int UNIQUE, c int);
+         CREATE INDEX si ON s (b) INCLUDE (c);
+         CREATE TABLE pa (a int PRIMARY KEY, b int) PARTITION BY RANGE (a);
+         CREATE TABLE pa1 PARTITION OF pa FOR VALUES FROM (1) TO (2);
+         CREATE TABLE pu (a int, b int, UNIQUE (b)) PARTITION BY LIST (b);",
+    )]);
+    db.apply_sql(
+        "ALTER TABLE pi RENAME COLUMN expr TO x;
+         ALTER TABLE p RENAME COLUMN b TO bb;
+         ALTER TABLE ppi RENAME COLUMN b TO bz;
+         ALTER TABLE si RENAME COLUMN c TO cz;
+         ALTER TABLE s_pkey RENAME COLUMN a TO ka;
+         ALTER TABLE s_b_key RENAME COLUMN b TO kb;
+         ALTER TABLE pa RENAME COLUMN a TO aa;
+         ALTER TABLE pu_b_key RENAME COLUMN b TO kb;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20);
+         ALTER TABLE p2_x_b_idx RENAME COLUMN x TO x2;
+         ALTER TABLE pi2 RENAME COLUMN b TO bz;
+         ALTER TABLE p2_b_expr_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    // ATTACH PARTITION building the partition's index.
+    db.apply_sql(
+        "CREATE TABLE c1 (a int, b int);
+         ALTER TABLE pp ATTACH PARTITION c1 FOR VALUES FROM (1) TO (2);
+         ALTER TABLE c1_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    // LIKE ... INCLUDING INDEXES: INCLUDE columns and constraints' indexes
+    // too (the constraint is named after the index columns).
+    db.apply_sql(
+        "CREATE TABLE s2 (LIKE s INCLUDING INDEXES);
+         ALTER TABLE s2_b_cz_idx RENAME COLUMN cz TO q;
+         ALTER TABLE s2_kb_key RENAME COLUMN kb TO q;
+         ALTER TABLE s2_pkey RENAME COLUMN ka TO q;",
+    )
+    .unwrap();
+    // A partition's primary key keeps the parent index's column name, not
+    // the renamed table column's; a unique constraint's clone is named
+    // after it.
+    db.apply_sql("CREATE TABLE pa2 PARTITION OF pa FOR VALUES FROM (2) TO (3);")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pa2_pkey RENAME COLUMN aa TO z;",
+        "column \"aa\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE pa2_pkey RENAME COLUMN a TO z;
+         CREATE TABLE pu1 PARTITION OF pu FOR VALUES IN (1);
+         ALTER TABLE pu1_kb_key RENAME COLUMN kb TO q;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn clones_copy_the_names_an_index_had_when_its_transaction_got_it() {
+    // generateClonedIndexStmt reads the source index's relcache entry. One
+    // created in the current transaction, or given a new relfilenode in it
+    // (TRUNCATE, REINDEX, CLUSTER, an ALTER COLUMN TYPE rebuild), keeps its
+    // entry, whose tuple descriptor isn't rebuilt: a rename in the same
+    // transaction doesn't reach the clone.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE pp (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX ppi ON pp (b);
+         ALTER TABLE ppi RENAME COLUMN b TO bz;
+         CREATE TABLE c1 (a int, b int);
+         ALTER TABLE pp ATTACH PARTITION c1 FOR VALUES FROM (1) TO (2);
+         ALTER TABLE c1_b_idx RENAME COLUMN b TO q;
+         CREATE TABLE t (a int, b int);
+         CREATE INDEX ti ON t (b);",
+    )]);
+    // In a later transaction the catalog's names are read again.
+    db.apply_sql(
+        "CREATE TABLE c2 (a int, b int);
+         ALTER TABLE pp ATTACH PARTITION c2 FOR VALUES FROM (2) TO (3);
+         ALTER TABLE c2_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "TRUNCATE t;
+         ALTER TABLE ti RENAME COLUMN b TO bz;
+         CREATE TABLE t2 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t2_b_idx RENAME COLUMN b TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "REINDEX INDEX ti;
+         ALTER TABLE ti RENAME COLUMN bz TO bq;
+         CREATE TABLE t3 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t3_bz_idx RENAME COLUMN bz TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "ALTER TABLE t ALTER COLUMN b TYPE bigint;
+         ALTER TABLE ti RENAME COLUMN b TO bw;
+         CREATE TABLE t4 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t4_b_idx RENAME COLUMN b TO q;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "ALTER TABLE ti RENAME COLUMN bw TO bv;
+         CREATE TABLE t5 (LIKE t INCLUDING INDEXES);
+         ALTER TABLE t5_bv_idx RENAME COLUMN bv TO q;",
+    )
+    .unwrap();
+}

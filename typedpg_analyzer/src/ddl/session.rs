@@ -332,6 +332,10 @@ impl PgCatalog {
         // New enum labels are committed.
         self.uncommitted_enum_labels.clear();
         self.enums_created_in_transaction.clear();
+        // Relcache entries are rebuilt from the catalogs again.
+        self.relcache_index_attnames.clear();
+        self.indexes_with_new_relfilenode.clear();
+        self.transaction_oid_floor = self.next_oid_value();
         // ON COMMIT DROP temporary tables go.
         for table in std::mem::take(&mut self.on_commit_drop).into_inner() {
             crate::ddl::drop::drop_relation_by_oid(self, table);
