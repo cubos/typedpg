@@ -8130,3 +8130,182 @@ fn a_system_catalog_is_refused_before_it_is_opened_as_a_table() {
         );
     }
 }
+
+/// The relations [`REINDEX_CASES`] run over.
+const REINDEX_SETUP: &str = "
+    CREATE TABLE t (a int, b text); CREATE INDEX ti ON t (a);
+    CREATE TABLE p (a int) PARTITION BY LIST (a);
+    CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1); CREATE INDEX pi ON p (a);
+    CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a; CREATE INDEX mvi ON mv (a);
+    CREATE TABLE noidx (a int, b text); CREATE TABLE noidx2 (a int);
+    CREATE SCHEMA s; CREATE TABLE s.x (a int);
+    CREATE SCHEMA s2; CREATE TABLE s2.y (a int PRIMARY KEY);
+    CREATE TABLE pk (a int PRIMARY KEY);";
+
+#[test]
+fn reindex_moves_indexes_where_pg_lets_it() {
+    // REINDEX (TABLESPACE ...): a system relation's indexes don't move
+    // (a catalog's, its TOAST table's), and pg_global takes no other
+    // index — rebuilt in place, the indexes a TABLE / INDEX / SCHEMA /
+    // DATABASE names (concurrently, a TOAST index too); REINDEX SYSTEM and
+    // a system schema skip theirs. Without a tablespace a catalog is
+    // reindexed as any table. Each statement runs on its own (CONCURRENTLY
+    // can't run in a transaction) and changes nothing.
+    let mut db = build_db(&[("0001.sql", REINDEX_SETUP)]);
+    for &(sql, expected) in REINDEX_CASES {
+        match (db.apply_sql(&format!("{sql};")), expected) {
+            (Ok(()), None) => {}
+            (Err(err), None) => panic!("{sql}\n  rejected: {err}"),
+            (Ok(()), Some(message)) => panic!("{sql}\n  accepted, expected: {message}"),
+            (Err(err), Some(message)) => assert!(
+                err.to_string().starts_with(message),
+                "{sql}\n  expected: {message}\n       got: {err}"
+            ),
+        }
+    }
+}
+
+/// `(statement, PG's error)` — `None` when PG runs it — over
+/// [`REINDEX_SETUP`], each checked on PostgreSQL 18.6.
+const REINDEX_CASES: &[(&str, Option<&str>)] = &[
+    (
+        "reindex (tablespace pg_global) table t",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    (
+        "reindex (tablespace pg_global) index ti",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    (
+        "reindex (tablespace pg_global) table mv",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    (
+        "reindex (tablespace pg_global) table p",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    (
+        "reindex (tablespace pg_global) index pi",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    ("reindex (tablespace pg_global) table noidx", None),
+    ("reindex (tablespace pg_global) table noidx2", None),
+    ("reindex (tablespace pg_global) schema s", None),
+    (
+        "reindex (tablespace pg_global) schema s2",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    (
+        "reindex (tablespace pg_global) schema public",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    ("reindex (tablespace pg_global) schema pg_catalog", None),
+    (
+        "reindex (tablespace pg_global) schema information_schema",
+        None,
+    ),
+    (
+        "reindex (tablespace pg_global) index pk_pkey",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    (
+        "reindex (tablespace pg_global, concurrently) index pk_pkey",
+        Some("cannot move non-shared relation to tablespace \"pg_global\""),
+    ),
+    (
+        "reindex (tablespace pg_global, concurrently) table noidx",
+        Some("cannot move non-shared relation to tablespace \"pg_global\""),
+    ),
+    (
+        "reindex (tablespace pg_global, concurrently) table noidx2",
+        None,
+    ),
+    (
+        "reindex (tablespace pg_global, concurrently) table t",
+        Some("cannot move non-shared relation to tablespace \"pg_global\""),
+    ),
+    (
+        "reindex (tablespace pg_global, concurrently) table pg_class",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex (tablespace pg_global, tablespace pg_default) table t",
+        None,
+    ),
+    (
+        "reindex (tablespace pg_default, tablespace pg_global) table t",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+    (
+        "reindex (tablespace pg_global) table pg_class",
+        Some("cannot move system relation \"pg_class_oid_index\""),
+    ),
+    (
+        "reindex (tablespace pg_global) table pg_database",
+        Some("cannot move system relation \"pg_database_datname_index\""),
+    ),
+    (
+        "reindex (tablespace pg_global) index pg_database_oid_index",
+        Some("cannot move system relation \"pg_database_oid_index\""),
+    ),
+    (
+        "reindex (tablespace pg_default) table pg_class",
+        Some("cannot move system relation \"pg_class_oid_index\""),
+    ),
+    (
+        "reindex (tablespace pg_default) table pg_database",
+        Some("cannot move system relation \"pg_database_datname_index\""),
+    ),
+    (
+        "reindex (tablespace pg_default) index pg_class_oid_index",
+        Some("cannot move system relation \"pg_class_oid_index\""),
+    ),
+    (
+        "reindex (tablespace pg_default) table pg_toast.pg_toast_2620",
+        Some("cannot move system relation \"pg_toast_2620_index\""),
+    ),
+    (
+        "reindex (tablespace pg_default) index pg_toast.pg_toast_2620_index",
+        Some("cannot move system relation \"pg_toast_2620_index\""),
+    ),
+    (
+        "reindex (tablespace pg_default) table pg_largeobject",
+        Some("cannot move system relation \"pg_largeobject_loid_pn_index\""),
+    ),
+    (
+        "reindex (tablespace pg_default) table information_schema.sql_features",
+        None,
+    ),
+    (
+        "reindex (tablespace pg_global) table information_schema.sql_features",
+        None,
+    ),
+    (
+        "reindex (tablespace pg_default, concurrently) table pk",
+        None,
+    ),
+    ("reindex (tablespace pg_global) system", None),
+    ("reindex (tablespace pg_default) system", None),
+    ("reindex (tablespace pg_default) schema pg_catalog", None),
+    ("reindex table pg_class", None),
+    ("reindex index pg_class_oid_index", None),
+    ("reindex table pg_database", None),
+    ("reindex index pg_database_oid_index", None),
+    ("reindex table pg_toast.pg_toast_2620", None),
+    (
+        "reindex (concurrently) system",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex (verbose maybe) system",
+        Some("verbose requires a Boolean value"),
+    ),
+    (
+        "reindex index concurrently pg_class_oid_index",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex (tablespace pg_global) database",
+        Some("only shared relations can be placed in pg_global tablespace"),
+    ),
+];

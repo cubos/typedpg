@@ -421,6 +421,22 @@ pub(crate) fn reindex_options(
     Ok(concurrently)
 }
 
+/// REINDEX's TABLESPACE: the last one given, as defGetString renders it.
+pub(crate) fn reindex_tablespace(params: &[typedpg_pg_query::protobuf::Node]) -> Option<String> {
+    params.iter().rev().find_map(|p| match p.node.as_ref() {
+        Some(node::Node::DefElem(de)) if de.defname == "tablespace" => {
+            match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
+                node::Node::String(s) => Some(s.sval.clone()),
+                node::Node::Integer(i) => Some(i.ival.to_string()),
+                node::Node::Float(f) => Some(f.fval.clone()),
+                node::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
 /// PreventInTransactionBlock callers. (A REINDEX whose options are invalid
 /// fails on them first, in [`super::maintenance::reindex`].)
 fn forbidden_in_block(stmt: &node::Node) -> Option<&'static str> {
