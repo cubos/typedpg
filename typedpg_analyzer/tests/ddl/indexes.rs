@@ -1860,3 +1860,211 @@ fn an_adopted_constraint_index_goes_with_its_parent_index() {
             .all(|c| c.conname != "k")
     );
 }
+
+/// Apply `sql` to `db`, expecting it to fail with a message starting with
+/// `message`.
+fn expect_rejected(db: &mut PgCatalog, sql: &str, message: &str) {
+    let err = db.apply_sql(sql).expect_err(sql);
+    assert!(
+        err.to_string().starts_with(message),
+        "{sql}\n  expected: {message}\n       got: {err}"
+    );
+}
+
+#[test]
+fn index_columns_are_renamed_with_alter_table_rename_column() {
+    // renameatt accepts an index (RangeVarCallbackForRenameAttribute):
+    // the index column is the index's own, which statements naming an
+    // index column see afterwards.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int PRIMARY KEY, b int, c int);
+         CREATE INDEX t_b ON t (b) INCLUDE (c);
+         CREATE INDEX t_e ON t ((a + b), (a - b), a, a);",
+    )]);
+    db.apply_sql("ALTER TABLE t_pkey RENAME COLUMN a TO y;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_pkey ALTER COLUMN a SET STATISTICS 10;",
+        "column \"a\" of relation \"t_pkey\" does not exist",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_pkey ALTER COLUMN y SET STATISTICS 10;",
+        "cannot alter statistics on non-expression column \"y\" of index \"t_pkey\"",
+    );
+    // An index column may collide with no other of the index, but takes a
+    // system column's name (an index has none).
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_pkey RENAME COLUMN y TO y;",
+        "column \"y\" of relation \"t_pkey\" already exists",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_pkey RENAME COLUMN a TO z;",
+        "column \"a\" does not exist",
+    );
+    db.apply_sql("ALTER TABLE IF EXISTS t_pkey RENAME COLUMN y TO ctid;")
+        .unwrap();
+    db.apply_sql("ALTER TABLE t_b RENAME COLUMN c TO z;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_b ALTER COLUMN z SET STATISTICS 5;",
+        "cannot alter statistics on included column \"z\" of index \"t_b\"",
+    );
+    expect_rejected(
+        &mut db,
+        "COMMENT ON COLUMN t_b.c IS 'x';",
+        "column \"c\" of relation \"t_b\" does not exist",
+    );
+    expect_rejected(
+        &mut db,
+        "COMMENT ON COLUMN t_b.z IS 'x';",
+        "cannot set comment on relation \"t_b\"",
+    );
+    // Expression columns: `expr`, `expr1`, then the table's names
+    // deduplicated (`a`, `a1`).
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_e RENAME COLUMN expr TO a1;",
+        "column \"a1\" of relation \"t_e\" already exists",
+    );
+    db.apply_sql(
+        "ALTER TABLE t_e RENAME COLUMN expr1 TO e;
+         ALTER INDEX t_e ALTER COLUMN e SET STATISTICS 5;
+         ALTER INDEX t_e ALTER COLUMN 2 SET STATISTICS 5;",
+    )
+    .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_e ALTER COLUMN expr1 SET STATISTICS 5;",
+        "column \"expr1\" of relation \"t_e\" does not exist",
+    );
+}
+
+#[test]
+fn renaming_a_table_column_keeps_its_index_columns_names() {
+    // PG never renames an index column after its table's — until ALTER
+    // COLUMN TYPE rebuilds the index from pg_get_indexdef, which names the
+    // table's columns as they are.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int, c int);
+         CREATE INDEX t_ab ON t (a, b);
+         CREATE INDEX t_inc ON t (a) INCLUDE (c);
+         CREATE INDEX t_pred ON t (a) WHERE c > 0;
+         CREATE INDEX t_other ON t (a);",
+    )]);
+    db.apply_sql("ALTER TABLE t RENAME COLUMN b TO bb; ALTER TABLE t RENAME COLUMN a TO aa;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER INDEX t_ab ALTER COLUMN bb SET STATISTICS 5;",
+        "column \"bb\" of relation \"t_ab\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE t_ab RENAME COLUMN a TO q;
+         ALTER TABLE t ALTER COLUMN bb TYPE bigint;",
+    )
+    .unwrap();
+    // Rebuilt: both of t_ab's columns named after the table's again.
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE t_ab RENAME COLUMN q TO z;",
+        "column \"q\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE t_ab RENAME COLUMN aa TO a2; ALTER TABLE t_ab RENAME COLUMN bb TO b2;",
+    )
+    .unwrap();
+    // An INCLUDE column or the predicate reading the column rebuilds the
+    // index too; an index not reading it keeps its names.
+    db.apply_sql("ALTER TABLE t RENAME COLUMN c TO cc; ALTER TABLE t ALTER COLUMN cc TYPE bigint;")
+        .unwrap();
+    db.apply_sql(
+        "ALTER TABLE t_inc RENAME COLUMN cc TO c3;
+         ALTER TABLE t_pred RENAME COLUMN aa TO a3;
+         ALTER TABLE t_other RENAME COLUMN a TO a4;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn partitioned_index_columns_are_renamed_in_every_partition() {
+    // A partitioned index's partitions are its inheritors: renameatt
+    // renames the column in each first, or refuses with ONLY. Index
+    // columns are never inherited (attinhcount 0), so a partition's may be
+    // renamed on its own.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX p_b ON p (b);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2) PARTITION BY RANGE (a);
+         CREATE TABLE p11 PARTITION OF p1 FOR VALUES FROM (1) TO (2);",
+    )]);
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE ONLY p_b RENAME COLUMN b TO z;",
+        "inherited column \"b\" must be renamed in child tables too",
+    );
+    db.apply_sql("ALTER TABLE p11_b_idx RENAME COLUMN b TO direct;")
+        .unwrap();
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE p_b RENAME COLUMN b TO z;",
+        "column \"b\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE p11_b_idx RENAME COLUMN direct TO b;
+         ALTER TABLE p_b RENAME COLUMN b TO z;
+         ALTER TABLE p11_b_idx RENAME COLUMN z TO w;
+         CREATE TABLE p2 (a int, b int);
+         CREATE INDEX p2_b ON p2 (b);
+         ALTER TABLE p2_b RENAME COLUMN b TO qq;
+         ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (2) TO (3);",
+    )
+    .unwrap();
+    // The attached index keeps its own name.
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE p_b RENAME COLUMN z TO k;",
+        "column \"z\" does not exist",
+    );
+    db.apply_sql(
+        "ALTER TABLE p2_b RENAME COLUMN qq TO z;
+         ALTER TABLE p11_b_idx RENAME COLUMN w TO z;
+         ALTER TABLE p_b RENAME COLUMN z TO k;
+         ALTER TABLE p1_b_idx RENAME COLUMN k TO j;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn renaming_columns_needs_a_relation_with_renameable_columns() {
+    // renameatt_check: not a sequence's or a TOAST table's columns, nor a
+    // system catalog's (or its index's).
+    let mut db = build_db(&[("0001.sql", "CREATE SEQUENCE s;")]);
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE s RENAME COLUMN last_value TO lv;",
+        "cannot rename columns of relation \"s\"",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pg_class RENAME COLUMN relname TO rn;",
+        "permission denied: \"pg_class\" is a system catalog",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pg_class_oid_index RENAME COLUMN oid TO x;",
+        "permission denied: \"pg_class_oid_index\" is a system catalog",
+    );
+    expect_rejected(
+        &mut db,
+        "ALTER TABLE pg_toast.pg_toast_2620 RENAME COLUMN chunk_id TO x;",
+        "cannot rename columns of relation \"pg_toast_2620\"",
+    );
+}

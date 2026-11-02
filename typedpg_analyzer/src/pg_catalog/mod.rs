@@ -376,6 +376,12 @@ pub struct PgCatalog {
     /// `indcollation`, `indoption`, `indnullsnotdistinct`) and an exclusion
     /// constraint's operators, for the indexes DDL creates.
     pub(crate) index_keys: Shared<HashMap<PgClassOid, crate::ddl::indexes::IndexKeys>>,
+    /// The `attname`s of the indexes whose columns are no longer named
+    /// after their table's columns (ChooseIndexColumnNames): one renamed
+    /// with ALTER TABLE index RENAME COLUMN, or the table's column renamed
+    /// after the index was built (PG keeps the index's own name). Every
+    /// other index's are derived ([`crate::ddl::indexes::index_attnames`]).
+    pub(crate) index_attnames: Shared<HashMap<PgClassOid, Vec<String>>>,
     /// `pg_sequence` rows of the sequences migrations create.
     pub(crate) sequence_params: Shared<HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>>,
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
@@ -766,6 +772,7 @@ impl PgCatalog {
             nonimmediate_indexes: Shared::default(),
             invalid_indexes: Shared::default(),
             index_keys: Shared::default(),
+            index_attnames: Shared::default(),
             sequence_params: Shared::default(),
             foreign_data: Default::default(),
             installing_extension: None,
@@ -1710,6 +1717,7 @@ impl PgCatalog {
         self.nonimmediate_indexes.remove(&oid);
         self.invalid_indexes.remove(&oid);
         self.index_keys.remove(&oid);
+        self.index_attnames.remove(&oid);
         self.sequence_params.remove(&oid);
         self.foreign_data.forget_relation(oid);
         self.relpersistence.remove(&oid);
