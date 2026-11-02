@@ -416,7 +416,28 @@ pub(crate) fn drop_conversion(
         return Ok(());
     };
     let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
-    match find(interp, &names) {
+    let found = find(interp, &names);
+    // A built-in conversion (all of pg_conversion.dat's are pinned) wins
+    // over one a migration made when pg_catalog comes first in the path.
+    let builtin = match names.as_slice() {
+        ["pg_catalog", name] => Some(*name),
+        [name] => {
+            let path = interp.schemas_for_lookup(None);
+            let at = |ns| path.iter().position(|&p| p == ns);
+            found
+                .as_ref()
+                .is_none_or(|f| interp.pg_catalog_oid().and_then(at) < at(f.namespace))
+                .then_some(*name)
+        }
+        _ => None,
+    }
+    .filter(|name| BUILTIN_CONVERSIONS.contains(name));
+    if let Some(name) = builtin {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop conversion {name} because it is required by the database system"
+        )));
+    }
+    match found {
         Some(found) => {
             interp.conversions.retain(|c| *c != found);
             Ok(())

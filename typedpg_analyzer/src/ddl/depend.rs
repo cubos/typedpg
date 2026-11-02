@@ -670,13 +670,13 @@ pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option
     }
 }
 
-/// The identity of `object`, if it exists. `None` too for a built-in text
-/// search object, operator class or family (pinned in `pg_catalog`), which
-/// nothing records dependencies on.
+/// The identity of `object`, if it exists. `None` too for a built-in
+/// operator class or family (pinned in `pg_catalog`), which nothing
+/// records dependencies on. A built-in text search object has its seeded
+/// OID: initdb's snowball dictionaries and configurations aren't pinned,
+/// and depend on one another.
 pub(crate) fn named_address_of(interp: &PgCatalog, object: &NamedObject) -> Option<ObjectAddress> {
-    if let NamedObject::TsObject { namespace, .. }
-    | NamedObject::Opclass { namespace, .. }
-    | NamedObject::Opfamily { namespace, .. } = object
+    if let NamedObject::Opclass { namespace, .. } | NamedObject::Opfamily { namespace, .. } = object
         && interp.namespace_name(*namespace) == Some("pg_catalog")
     {
         return None;

@@ -507,13 +507,19 @@ fn family_operator(
             item.number
         )));
     }
+    let Some(owa) = item.name.as_ref() else {
+        return Ok(None);
+    };
+    // AlterOpFamilyAdd: no input type to default the operands to.
+    if owa.objargs.is_empty() && intype.is_none() {
+        return Err(DdlError::Parse(
+            "operator argument types must be specified in ALTER OPERATOR FAMILY".into(),
+        ));
+    }
     // Not FOR ORDER BY.
     if !item.order_family.is_empty() {
         return Ok(None);
     }
-    let Some(owa) = item.name.as_ref() else {
-        return Ok(None);
-    };
     let (opr, left, right) = if owa.objargs.is_empty() {
         // A binary operator on the input type (LookupOperName).
         let (Some(left), Some(right)) = (intype, intype) else {
@@ -659,7 +665,21 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
         return Err(DdlError::Internal("operator family vanished".into()));
     };
     if !stmt.is_drop {
-        // AlterOpFamilyAdd → storeOperators(isAdd).
+        // AlterOpFamilyAdd checks the items in order: a STORAGE one is
+        // rejected once those before it passed.
+        let storage = stmt.items.iter().position(|item| {
+            matches!(item.node.as_ref(),
+                Some(node::Node::CreateOpClassItem(i)) if i.itemtype == 3)
+        });
+        if let Some(at) = storage {
+            let before = &stmt.items[..at];
+            family_operators(interp, &family, family_ns, &stmt.amname, before, None)?;
+            super::opfamily_members::function_members(interp, &family_key, before, None)?;
+            return Err(DdlError::Parse(
+                "STORAGE cannot be specified in ALTER OPERATOR FAMILY".into(),
+            ));
+        }
+        // storeOperators(isAdd).
         let ops = family_operators(interp, &family, family_ns, &stmt.amname, &stmt.items, None)?;
         for op in &ops {
             if interp.pg_amop.iter().any(|o| same_member(o, op)) {
@@ -805,14 +825,19 @@ pub(crate) fn drop_am_object(
             }
             // An extension's member goes only with it.
             let object = super::depend::NamedObject::AccessMethod { name: name.clone() };
-            if let Some(addr) = super::depend::named_address_of(interp, &object) {
-                let desc = format!("access method {name}");
-                super::depend::check_not_owned(interp, addr, &desc)?;
-                // Its operator families (and their classes) go with it;
-                // what uses them needs CASCADE.
-                super::depend::drop_dependents(interp, addr, &desc, cascade)?;
-                interp.remove_dependencies_on(addr.classid, addr.objid);
-            }
+            let desc = format!("access method {name}");
+            // Only those CREATE ACCESS METHOD made have an OID here: the
+            // built-in ones (heap, btree, ...) are pinned.
+            let Some(addr) = super::depend::named_address_of(interp, &object) else {
+                return Err(DdlError::DependencyError(format!(
+                    "cannot drop {desc} because it is required by the database system"
+                )));
+            };
+            super::depend::check_not_owned(interp, addr, &desc)?;
+            // Its operator families (and their classes) go with it;
+            // what uses them needs CASCADE.
+            super::depend::drop_dependents(interp, addr, &desc, cascade)?;
+            interp.remove_dependencies_on(addr.classid, addr.objid);
             interp.pg_am.retain(|a| a.amname != name);
             interp.access_method_oids.remove(&name);
         }

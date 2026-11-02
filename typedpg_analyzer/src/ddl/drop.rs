@@ -231,6 +231,12 @@ fn drop_relation(
         if missing_ok {
             return Ok(());
         }
+        // RangeVarGetRelidExtended: a schema named explicitly must exist.
+        if names.len() > 1 {
+            return Err(DdlError::TableNotFound(format!(
+                "schema \"{schema}\" does not exist"
+            )));
+        }
         return Err(DdlError::TableNotFound(format!(
             "{requested_kind} \"{name}\" does not exist"
         )));
@@ -727,6 +733,12 @@ fn drop_index(
     let Some(nsoid) = interp.namespace_oid(&schema) else {
         if missing_ok {
             return Ok(());
+        }
+        // RangeVarGetRelidExtended: a schema named explicitly must exist.
+        if names.len() > 1 {
+            return Err(DdlError::TableNotFound(format!(
+                "schema \"{schema}\" does not exist"
+            )));
         }
         return Err(DdlError::DependencyError(format!(
             "index \"{name}\" does not exist"
@@ -1775,10 +1787,17 @@ fn missing_operand_type(
         Some(node::Node::TypeName(tn))
             if !tn.names.is_empty() && resolve_type_name(tn, snapshot).is_none() =>
         {
-            Some(DdlError::TypeNotFound(format!(
-                "type \"{}\" does not exist",
-                super::util::type_name_to_string(tn)
-            )))
+            // LookupTypeNameOid: a missing schema is reported as such.
+            Some(
+                super::util::lookup_type_name(tn, snapshot)
+                    .err()
+                    .unwrap_or_else(|| {
+                        DdlError::TypeNotFound(format!(
+                            "type \"{}\" does not exist",
+                            super::util::type_name_to_string(tn)
+                        ))
+                    }),
+            )
         }
         _ => None,
     })
@@ -1951,7 +1970,12 @@ fn drop_schema(
         _ => return Ok(()),
     };
 
-    let Some(nsoid) = interp.namespace_oid(&name) else {
+    // get_namespace_oid: the name as is — `pg_temp` is no alias of the
+    // session's temporary schema here.
+    let Some(nsoid) = Some(name.as_str())
+        .filter(|&n| n != "pg_temp")
+        .and_then(|n| interp.namespace_oid(n))
+    else {
         if missing_ok {
             return Ok(());
         }
