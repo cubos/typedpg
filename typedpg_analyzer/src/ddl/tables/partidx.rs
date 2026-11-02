@@ -92,7 +92,10 @@ pub(crate) fn ensure_partition_index(
                 && same_key_classes(interp, &pi, i)
                 && access_method(interp, i.indexrelid) == access_method(interp, parent_index)
                 && !interp.index_parents.contains_key(&i.indexrelid)
-                && !interp.invalid_indexes.contains(&i.indexrelid)
+                // DefineIndex adopts an invalid one (an ON ONLY index whose
+                // partitions lack theirs): the new index is invalid too.
+                // AttachPartitionEnsureIndexes wants a valid one.
+                && (!attach || !interp.invalid_indexes.contains(&i.indexrelid))
         })
         .map(|i| i.indexrelid)
         // A constraint's index needs one backing a constraint — on ATTACH
@@ -116,6 +119,9 @@ pub(crate) fn ensure_partition_index(
         .min();
     let child_index = match existing {
         Some(index) => {
+            if interp.invalid_indexes.contains(&index) {
+                interp.invalid_indexes.insert(parent_index);
+            }
             // Its constraint becomes inherited — when the parent index
             // backs one too (else it stays local).
             if parent_con.is_some()
@@ -148,6 +154,9 @@ pub(crate) fn ensure_partition_index(
                 for sub in inherit::children_of(interp, part) {
                     ensure_partition_index(interp, clone, sub, false)?;
                 }
+            }
+            if interp.invalid_indexes.contains(&clone) {
+                interp.invalid_indexes.insert(parent_index);
             }
             return Ok(());
         }

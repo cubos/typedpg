@@ -710,13 +710,12 @@ pub(crate) fn drop_trigger(
     };
     // A clone depends on its parent's trigger (DEPENDENCY_PARTITION_PRI).
     if let Some(parent) = trigger.parent {
-        let parent_name = interp
-            .pg_class
-            .get(&parent)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
+        // The tables named as getObjectDescription does (quoted when they
+        // need it).
+        let table = super::depend::relation_display_name(interp, relid);
+        let parent_name = super::depend::relation_display_name(interp, parent);
         return Err(DdlError::DependencyError(format!(
-            "cannot drop trigger {trigname} on table {relname} because trigger {trigname} on \
+            "cannot drop trigger {trigname} on table {table} because trigger {trigname} on \
              table {parent_name} requires it (You can drop trigger {trigname} on table \
              {parent_name} instead.)"
         )));

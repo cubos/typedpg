@@ -1281,14 +1281,12 @@ pub(crate) fn drop_constraint(
         && super::partidx::backing_constraint(interp, idx_oid).is_some_and(|c| c.oid == oid)
         && let Some(parent) = super::partidx::parent_index_of(interp, idx_oid)
     {
-        let parent_name = interp
-            .pg_class
-            .get(&parent)
-            .map(|c| c.relname.clone())
-            .unwrap_or_default();
+        // Named as getObjectDescription does (quoted when they need it).
+        let index_name = crate::ddl::depend::relation_display_name(interp, idx_oid);
+        let parent_name = crate::ddl::depend::relation_display_name(interp, parent);
         return Err(DdlError::DependencyError(format!(
-            "cannot drop index {conname} because index {parent_name} requires it (You can drop \
-             index {parent_name} instead.)"
+            "cannot drop index {index_name} because index {parent_name} requires it (You can \
+             drop index {parent_name} instead.)"
         )));
     }
 
@@ -1339,11 +1337,7 @@ pub(crate) fn drop_constraint(
             }),
         };
         if let Some(dep) = dependent {
-            let relname = interp
-                .pg_class
-                .get(&relid)
-                .map(|c| c.relname.as_str())
-                .unwrap_or("?");
+            let relname = crate::ddl::depend::relation_display_name(interp, relid);
             return Err(DdlError::DependencyError(format!(
                 "cannot drop constraint {conname} on table {relname} because other objects \
                  depend on it (foreign key constraint \"{dep}\" depends on this)"
@@ -1935,6 +1929,19 @@ fn add_index_constraint(
         c.conname.clone()
     };
     if conname != c.indexname {
+        // ATExecAddIndexConstraint renames the index to the constraint's
+        // name first (RenameRelationInternal): a relation of the schema
+        // already so named — the index of a same-named constraint, any
+        // other relation — fails there.
+        if interp
+            .class_by_qname
+            .get(&(nsoid, conname.clone()))
+            .is_some_and(|&other| other != index_oid)
+        {
+            return Err(DdlError::DuplicateObject(format!(
+                "relation \"{conname}\" already exists"
+            )));
+        }
         interp.rename_pg_class(index_oid, conname.clone(), nsoid);
     }
     // The fake UNIQUE row CREATE UNIQUE INDEX records for ON CONFLICT is

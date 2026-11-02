@@ -660,7 +660,7 @@ pub(crate) fn drop_rule(
         return Err(DdlError::DependencyError(format!(
             "cannot drop rule {name} on {kind} {rel} because {kind} {rel} requires it (You can \
              drop {kind} {rel} instead.)",
-            rel = rv.relname
+            rel = super::depend::relation_display_name(interp, relid)
         )));
     }
     let rules = interp.rules.entry(relid).or_default();

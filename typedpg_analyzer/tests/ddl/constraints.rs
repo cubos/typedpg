@@ -2496,3 +2496,114 @@ fn add_constraint_using_index_needs_a_free_name() {
          ALTER TABLE t ADD CONSTRAINT kk UNIQUE USING INDEX i2;",
     )]);
 }
+
+/// ADD CONSTRAINT ... USING INDEX renames the index first: a relation of
+/// the schema already so named fails there (the index of a same-named
+/// constraint included), before the constraint row trips pg_constraint's
+/// unique index.
+#[test]
+fn add_constraint_using_index_renames_the_index_first() {
+    for setup in [
+        "CREATE TABLE t (a int, b int, CONSTRAINT kk UNIQUE (a));
+         CREATE UNIQUE INDEX i ON t (b);",
+        "CREATE TABLE t (a int, b int); CREATE UNIQUE INDEX i ON t (b);
+         CREATE TABLE o (z int); CREATE INDEX kk ON o (z);",
+        "CREATE TABLE t (a int, b int, CONSTRAINT kk CHECK (a > 0));
+         CREATE UNIQUE INDEX i ON t (b); CREATE TABLE kk (z int);",
+    ] {
+        let err = try_apply(&[
+            ("0001.sql", setup),
+            (
+                "0002.sql",
+                "ALTER TABLE t ADD CONSTRAINT kk UNIQUE USING INDEX i;",
+            ),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.starts_with("relation \"kk\" already exists"),
+            "{setup}\n  got: {err}"
+        );
+    }
+    // The index's own name is fine.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t3 (a int); CREATE UNIQUE INDEX same ON t3 (a);
+         ALTER TABLE t3 ADD CONSTRAINT same UNIQUE USING INDEX same;",
+    )]);
+}
+
+/// The "requires it" messages name relations as getObjectDescription
+/// does: quoted when they need it.
+#[test]
+fn requires_it_messages_quote_relations() {
+    let setup = "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+         CREATE UNIQUE INDEX \"Pk\" ON ONLY p (a);
+         CREATE TABLE c (a int CONSTRAINT c_pkey PRIMARY KEY);
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+         CREATE TABLE \"P\" (a int) PARTITION BY RANGE (a);
+         CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+         CREATE TRIGGER t BEFORE INSERT ON \"P\" FOR EACH ROW EXECUTE FUNCTION tf();
+         CREATE TABLE \"C\" PARTITION OF \"P\" FOR VALUES FROM (0) TO (10);
+         CREATE VIEW \"V\" AS SELECT 1 AS x;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE c DROP CONSTRAINT c_pkey;",
+            "cannot drop index c_pkey because index \"Pk\" requires it",
+        ),
+        (
+            "DROP TRIGGER t ON \"C\";",
+            "cannot drop trigger t on table \"C\" because trigger t on table \"P\" requires it",
+        ),
+        (
+            "DROP RULE \"_RETURN\" ON \"V\";",
+            "cannot drop rule _RETURN on view \"V\" because view \"V\" requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+/// A new partitioned index adopts a partition's invalid ON ONLY index
+/// (DefineIndex) and is invalid too, without going below it; attaching the
+/// missing child index makes both valid. ATTACH PARTITION wants a valid
+/// one, and builds its own.
+#[test]
+fn new_partitioned_index_adopts_an_invalid_on_only_index() {
+    let count = |db: &PgCatalog, table: &str| {
+        let rel = class_oid(db, None, table);
+        db.pg_index_values().filter(|i| i.indrelid == rel).count()
+    };
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t0 (a int NOT NULL, b int, c int) PARTITION BY LIST (a);
+         CREATE TABLE t1 (a int NOT NULL, b int, c int) PARTITION BY LIST (a);
+         CREATE TABLE t2 (a int NOT NULL, b int, c int);
+         ALTER TABLE t1 ATTACH PARTITION t2 FOR VALUES IN (3);
+         ALTER TABLE t0 ATTACH PARTITION t1 FOR VALUES IN (1);
+         CREATE INDEX ON ONLY t1 (a, c);
+         CREATE INDEX ON t0 (a, c);",
+    )]);
+    assert_eq!(
+        (count(&db, "t0"), count(&db, "t1"), count(&db, "t2")),
+        (1, 1, 0)
+    );
+    db.apply_sql(
+        "CREATE INDEX ON t2 (a, c);
+         ALTER INDEX t1_a_c_idx ATTACH PARTITION t2_a_c_idx;",
+    )
+    .unwrap();
+    assert_eq!(count(&db, "t2"), 1);
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t0 (a int NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE INDEX ON t0 (a, c);
+         CREATE TABLE t1 (a int NOT NULL, c int) PARTITION BY LIST (a);
+         CREATE TABLE t2 (a int NOT NULL, c int);
+         ALTER TABLE t1 ATTACH PARTITION t2 FOR VALUES IN (3);
+         CREATE INDEX ON ONLY t1 (a, c);
+         ALTER TABLE t0 ATTACH PARTITION t1 FOR VALUES IN (1);",
+    )]);
+    assert_eq!((count(&db, "t1"), count(&db, "t2")), (2, 1));
+}
