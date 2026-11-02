@@ -1060,8 +1060,16 @@ pub fn create_foreign_table(
     let Some(base) = stmt.base_stmt.as_ref() else {
         return Ok(());
     };
-    // transformCreateStmt, element by element.
-    for elt in &base.table_elts {
+    let existed = base.relation.as_ref().and_then(|rv| {
+        let (schema, name) = range_var_names(rv, interp);
+        interp
+            .namespace_oid(&schema)
+            .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
+    });
+    // transformCreateStmt, element by element — once IF NOT EXISTS didn't
+    // skip the statement.
+    let skipped = existed.is_some() && base.if_not_exists;
+    for elt in base.table_elts.iter().filter(|_| !skipped) {
         match elt.node.as_ref() {
             Some(node::Node::Constraint(c)) => check_foreign_table_constraint(c)?,
             Some(node::Node::ColumnDef(cd)) => {
@@ -1074,12 +1082,6 @@ pub fn create_foreign_table(
             _ => {}
         }
     }
-    let existed = base.relation.as_ref().and_then(|rv| {
-        let (schema, name) = range_var_names(rv, interp);
-        interp
-            .namespace_oid(&schema)
-            .and_then(|ns| interp.class_by_qname.get(&(ns, name)).copied())
-    });
     create_table(interp, base)?;
     if existed.is_some() {
         return Ok(());

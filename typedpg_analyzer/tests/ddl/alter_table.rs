@@ -4555,3 +4555,163 @@ const RELKIND_CASES: &[(&str, Option<&str>)] = &[
     ),
     ("reindex (concurrently off) table pg_class", None),
 ];
+
+#[test]
+fn a_foreign_table_refuses_index_constraints_only_where_it_is_named() {
+    // transformColumnDefinition / transformTableConstraint refuse a primary
+    // key, unique, exclusion or foreign key constraint on the foreign table
+    // a statement names — not on a foreign inheritance child ADD COLUMN
+    // recurses to (such constraints aren't inherited), and not once IF NOT
+    // EXISTS skipped the statement. An inline foreign key reaches a
+    // partitioned table's partitions, as ADD CONSTRAINT's does.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FOREIGN DATA WRAPPER w; CREATE SERVER srv FOREIGN DATA WRAPPER w;
+         CREATE TABLE par (a int NOT NULL, b int);
+         CREATE FOREIGN TABLE fch (x int) INHERITS (par) SERVER srv;
+         CREATE TABLE gpar (a int NOT NULL, b int);
+         CREATE TABLE gmid () INHERITS (gpar);
+         CREATE FOREIGN TABLE gch () INHERITS (gmid) SERVER srv;
+         CREATE FOREIGN TABLE ft (a int, b int) SERVER srv;
+         CREATE TABLE ref (a int PRIMARY KEY);
+         CREATE TABLE pp (a int NOT NULL, b int) PARTITION BY LIST (a);
+         CREATE FOREIGN TABLE ppf PARTITION OF pp FOR VALUES IN (1) SERVER srv;
+         CREATE TABLE q (a int NOT NULL, b int) PARTITION BY LIST (a);
+         CREATE TABLE q1 PARTITION OF q FOR VALUES IN (1) PARTITION BY LIST (a);
+         CREATE TABLE q11 PARTITION OF q1 FOR VALUES IN (1);",
+    )]);
+    for sql in [
+        "ALTER TABLE par ADD COLUMN z int PRIMARY KEY",
+        "ALTER TABLE par ADD COLUMN z int UNIQUE",
+        "ALTER TABLE par ADD COLUMN z int UNIQUE NOT NULL",
+        "ALTER TABLE par ADD COLUMN z int REFERENCES ref (a)",
+        "ALTER TABLE par ADD COLUMN IF NOT EXISTS z int PRIMARY KEY",
+        "ALTER TABLE gpar ADD COLUMN z int PRIMARY KEY",
+        "ALTER TABLE gpar ADD COLUMN z int REFERENCES ref (a)",
+        "ALTER TABLE q ADD COLUMN z int REFERENCES ref (a)",
+        "ALTER TABLE q ADD COLUMN z int, ADD FOREIGN KEY (z) REFERENCES ref (a)",
+    ] {
+        if let Err(err) = db.apply_sql(&format!("BEGIN; {sql}; ROLLBACK;")) {
+            panic!("{sql}\n  rejected: {err}");
+        }
+    }
+    // Skipped by IF NOT EXISTS: nothing changes.
+    db.apply_sql(
+        "ALTER TABLE par ADD COLUMN IF NOT EXISTS a int PRIMARY KEY;
+         ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS a int UNIQUE;
+         ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS a int PRIMARY KEY;
+         ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS a int REFERENCES ref (a);
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int PRIMARY KEY) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int UNIQUE) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int REFERENCES ref (a)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, PRIMARY KEY (a)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, UNIQUE (a)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, EXCLUDE (a WITH =)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, FOREIGN KEY (a) REFERENCES ref (a))
+             SERVER srv;",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "ALTER TABLE ft ADD COLUMN z int PRIMARY KEY;",
+            "primary key constraints are not supported on foreign tables",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS z int UNIQUE;",
+            "unique constraints are not supported on foreign tables",
+        ),
+        (
+            "ALTER TABLE ft ADD COLUMN z int REFERENCES ref (a);",
+            "foreign key constraints are not supported on foreign tables",
+        ),
+        (
+            "CREATE FOREIGN TABLE IF NOT EXISTS f9 (a int PRIMARY KEY) SERVER srv;",
+            "primary key constraints are not supported on foreign tables",
+        ),
+        (
+            "CREATE FOREIGN TABLE ft (a int PRIMARY KEY) SERVER srv;",
+            "primary key constraints are not supported on foreign tables",
+        ),
+        (
+            "ALTER TABLE pp ADD COLUMN z int PRIMARY KEY;",
+            "unique constraint on partitioned table must include all partitioning columns",
+        ),
+        (
+            "ALTER TABLE ONLY q ADD COLUMN z int REFERENCES ref (a);",
+            "column must be added to child tables too",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}
+
+#[test]
+fn reindex_options_are_read_as_exec_reindex_reads_them() {
+    // defGetBoolean takes no value, true / false / on / off (in any case)
+    // or the integers 1 / 0, and nothing else; an unknown option is
+    // refused — before anything else is looked at.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int); CREATE INDEX ti ON t (a);",
+    )]);
+    for sql in [
+        "REINDEX (CONCURRENTLY 'on') INDEX ti;",
+        "REINDEX (CONCURRENTLY TRUE) INDEX ti;",
+        "REINDEX (CONCURRENTLY 0) INDEX ti;",
+        "REINDEX (TABLESPACE pg_default) INDEX ti;",
+        "SELECT 1; REINDEX (CONCURRENTLY off) INDEX ti;",
+        "SELECT 1; REINDEX (VERBOSE false) INDEX ti;",
+    ] {
+        if let Err(err) = db.apply_sql(sql) {
+            panic!("{sql}\n  rejected: {err}");
+        }
+    }
+    for (sql, message) in [
+        (
+            "REINDEX (CONCURRENTLY maybe) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (CONCURRENTLY yes) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (CONCURRENTLY 2) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (CONCURRENTLY 't') INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (VERBOSE maybe) INDEX ti;",
+            "verbose requires a Boolean value",
+        ),
+        (
+            "REINDEX (foo) INDEX ti;",
+            "unrecognized REINDEX option \"foo\"",
+        ),
+        (
+            "REINDEX (CONCURRENTLY maybe) INDEX nosuch;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "SELECT 1; REINDEX (CONCURRENTLY maybe) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "SELECT 1; REINDEX (CONCURRENTLY) INDEX ti;",
+            "REINDEX CONCURRENTLY cannot run inside a transaction block",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}

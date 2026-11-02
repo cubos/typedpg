@@ -193,7 +193,7 @@ fn prevent_in_transaction_block(interp: &PgCatalog, what: &str) -> Result<(), Dd
 
 /// REINDEX INDEX / TABLE / SCHEMA.
 pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlError> {
-    let concurrently = super::txblock::reindex_concurrently(&stmt.params);
+    let concurrently = super::txblock::reindex_options(&stmt.params)?;
     // ReindexRelationConcurrently / ReindexMultipleTables: a system catalog
     // (IsCatalogRelationOid — its indexes and TOAST table too) can't be
     // rebuilt concurrently.

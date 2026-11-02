@@ -1473,11 +1473,14 @@ pub(crate) fn check_foreign_table_constraint(
 /// The constraints written inline on an `ALTER TABLE ... ADD COLUMN`
 /// definition (PRIMARY KEY, UNIQUE, CHECK, REFERENCES): like
 /// `transformColumnDefinition`, attach the column as the constraint's key and
-/// add each as if by `ADD CONSTRAINT`.
+/// add each as if by `ADD CONSTRAINT` — a foreign key with the statement's
+/// recursion (`recurse`: no ONLY), which a partitioned table's partitions
+/// take.
 pub(crate) fn add_column_constraints(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cd: &typedpg_pg_query::protobuf::ColumnDef,
+    recurse: bool,
 ) -> Result<(), DdlError> {
     let colname_node = typedpg_pg_query::protobuf::Node {
         node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
@@ -1493,7 +1496,15 @@ pub(crate) fn add_column_constraints(
             Ok(ConstrType::ConstrPrimary | ConstrType::ConstrUnique) => {
                 c.keys = vec![colname_node.clone()];
             }
-            Ok(ConstrType::ConstrForeign) => c.fk_attrs = vec![colname_node.clone()],
+            Ok(ConstrType::ConstrForeign) => {
+                c.fk_attrs = vec![colname_node.clone()];
+                let rec = super::inherit::Recursion {
+                    recurse,
+                    recursing: false,
+                };
+                add_constraint_node(interp, relid, &c, &cd.colname, rec, false)?;
+                continue;
+            }
             Ok(ConstrType::ConstrCheck) => {
                 // The column reaches the children, and so does its CHECK.
                 let rec = super::inherit::Recursion {

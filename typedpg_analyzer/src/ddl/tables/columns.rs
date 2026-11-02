@@ -958,13 +958,6 @@ fn add_column_to(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
-    if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::ForeignTable) {
-        for c in &cd.constraints {
-            if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
-                check_foreign_table_constraint(c)?;
-            }
-        }
-    }
     // DefineIndex, for a column constraint's USING INDEX TABLESPACE.
     for c in &cd.constraints {
         if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
@@ -1026,6 +1019,18 @@ fn add_column_to(
             relid,
             &cd.colname,
         )));
+    }
+    // transformColumnDefinition, for the table the statement names (an
+    // inheritance child, a foreign one too, takes no such constraint):
+    // a foreign table has no index.
+    if !rec.recursing
+        && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::ForeignTable)
+    {
+        for c in &cd.constraints {
+            if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+                check_foreign_table_constraint(c)?;
+            }
+        }
     }
 
     // ATExecAddColumn: regular inheritance children don't inherit an
@@ -1195,7 +1200,7 @@ fn add_column_to(
                 },
             )?;
         }
-        add_column_constraints(interp, relid, cd)?;
+        add_column_constraints(interp, relid, cd, rec.recurse)?;
         // transformColumnDefinition: the column's generic options are an
         // ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS run afterwards.
         super::column_generic_options_stmt(interp, relid, &cd.colname, &cd.fdwoptions)?;

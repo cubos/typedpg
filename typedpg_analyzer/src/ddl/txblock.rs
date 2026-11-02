@@ -387,38 +387,45 @@ fn writes(db: &PgCatalog, stmt: &node::Node) -> Option<&'static str> {
     Some(super::cmdtag::command_tag(stmt))
 }
 
-/// PreventInTransactionBlock callers.
-/// REINDEX's CONCURRENTLY option (ExecReindex's defGetBoolean): bare, or a
-/// boolean value — `true` / `false` / `on` / `off` / `1` / `0` ... The
-/// last one given wins.
-pub(crate) fn reindex_concurrently(params: &[typedpg_pg_query::protobuf::Node]) -> bool {
-    let mut on = false;
+/// REINDEX's options as ExecReindex reads them, before anything else:
+/// CONCURRENTLY and VERBOSE booleans (defGetBoolean), TABLESPACE, and no
+/// other. Whether CONCURRENTLY is on (the last one given wins).
+pub(crate) fn reindex_options(
+    params: &[typedpg_pg_query::protobuf::Node],
+) -> Result<bool, DdlError> {
+    let mut concurrently = false;
     for p in params {
         let Some(node::Node::DefElem(de)) = p.node.as_ref() else {
             continue;
         };
-        if de.defname != "concurrently" {
-            continue;
+        match de.defname.as_str() {
+            "concurrently" => concurrently = super::session::def_get_boolean(de)?,
+            "verbose" => {
+                super::session::def_get_boolean(de)?;
+            }
+            "tablespace" => {}
+            other => {
+                return Err(DdlError::Parse(format!(
+                    "unrecognized REINDEX option \"{other}\""
+                )));
+            }
         }
-        on = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            None => true,
-            Some(node::Node::Boolean(b)) => b.boolval,
-            Some(node::Node::Integer(i)) => i.ival != 0,
-            Some(node::Node::String(s)) => super::reloptions::parse_bool(&s.sval).unwrap_or(true),
-            Some(_) => true,
-        };
     }
-    on
+    Ok(concurrently)
 }
 
+/// PreventInTransactionBlock callers. (A REINDEX whose options are invalid
+/// fails on them first, in [`super::maintenance::reindex`].)
 fn forbidden_in_block(stmt: &node::Node) -> Option<&'static str> {
-    let concurrently = reindex_concurrently;
     match stmt {
         node::Node::VacuumStmt(v) if v.is_vacuumcmd => Some("VACUUM"),
         node::Node::IndexStmt(i) if i.concurrent => Some("CREATE INDEX CONCURRENTLY"),
         node::Node::DropStmt(d) if d.concurrent => Some("DROP INDEX CONCURRENTLY"),
         node::Node::ReindexStmt(r) => {
-            if concurrently(&r.params) {
+            let Ok(concurrently) = reindex_options(&r.params) else {
+                return None;
+            };
+            if concurrently {
                 return Some("REINDEX CONCURRENTLY");
             }
             match ReindexObjectType::try_from(r.kind) {
