@@ -595,3 +595,95 @@ fn drop_extension_takes_along_what_depends_on_it_automatically() {
     db.apply_sql("DROP EXTENSION hstore CASCADE; CREATE VIEW v2 AS SELECT 1;")
         .unwrap();
 }
+
+#[test]
+fn drop_extension_and_the_marks_of_rebuilt_and_partition_objects() {
+    // A partition's index attached to its parent's goes only with it, like
+    // a trigger clone: marking it alone blocks DROP EXTENSION, CASCADE or
+    // not. A clone may be marked without its parent. An index ALTER COLUMN
+    // TYPE rebuilds is a new object, without the old one's mark; REINDEX
+    // keeps it. (CREATE EXTENSION leaves the pg_sanity mirror out, so the
+    // expectations here were checked by hand against PostgreSQL 18.6.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TABLE q (a int NOT NULL, b int) PARTITION BY RANGE (a);
+         CREATE TABLE q1 PARTITION OF q FOR VALUES FROM (1) TO (2);
+         CREATE INDEX pj ON q (a);
+         CREATE TRIGGER qtg BEFORE INSERT ON q FOR EACH ROW EXECUTE FUNCTION trf();
+         CREATE TABLE t (a int, b int);
+         CREATE INDEX i ON t (a);
+         CREATE INDEX k ON t (b) WHERE a > 0;
+         CREATE INDEX j ON t (b);",
+    )]);
+    let expect = |db: &mut PgCatalog, sql: &str, message: &str| {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    };
+    let clone_blocked = "cannot drop index q1_a_idx because index pj requires it";
+    db.apply_sql("ALTER INDEX q1_a_idx DEPENDS ON EXTENSION hstore;")
+        .unwrap();
+    expect(&mut db, "DROP EXTENSION hstore;", clone_blocked);
+    expect(&mut db, "DROP EXTENSION hstore CASCADE;", clone_blocked);
+    db.apply_sql(
+        "ALTER INDEX q1_a_idx NO DEPENDS ON EXTENSION hstore;
+         ALTER TABLE q ADD PRIMARY KEY (a);
+         ALTER INDEX q1_pkey DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop index q1_pkey because index q_pkey requires it",
+    );
+    // An index ATTACH PARTITION attaches is the parent's too.
+    db.apply_sql(
+        "ALTER INDEX q1_pkey NO DEPENDS ON EXTENSION hstore;
+         CREATE TABLE r (a int NOT NULL, b int);
+         CREATE INDEX ri ON r (a);
+         ALTER INDEX ri DEPENDS ON EXTENSION hstore;
+         ALTER TABLE q ATTACH PARTITION r FOR VALUES FROM (5) TO (6);",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop index ri because index pj requires it",
+    );
+    db.apply_sql(
+        "ALTER INDEX ri NO DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER qtg ON q1 DEPENDS ON EXTENSION hstore;",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "DROP EXTENSION hstore;",
+        "cannot drop trigger qtg on table q1 because trigger qtg on table q requires it",
+    );
+    // With the parents marked too, everything goes.
+    db.apply_sql(
+        "ALTER INDEX q1_a_idx DEPENDS ON EXTENSION hstore;
+         ALTER INDEX pj DEPENDS ON EXTENSION hstore;
+         ALTER TRIGGER qtg ON q DEPENDS ON EXTENSION hstore;
+         ALTER INDEX i DEPENDS ON EXTENSION hstore;
+         ALTER INDEX k DEPENDS ON EXTENSION hstore;
+         ALTER INDEX j DEPENDS ON EXTENSION hstore;
+         ALTER TABLE t ALTER COLUMN a TYPE bigint;
+         REINDEX INDEX j;
+         DROP EXTENSION hstore;
+         ALTER INDEX i RENAME TO i2;
+         ALTER INDEX k RENAME TO k2;
+         CREATE INDEX pj ON q (a);
+         CREATE TRIGGER qtg BEFORE INSERT ON q FOR EACH ROW EXECUTE FUNCTION trf();",
+    )
+    .unwrap();
+    expect(
+        &mut db,
+        "ALTER INDEX j RENAME TO j2;",
+        "relation \"j\" does not exist",
+    );
+}
