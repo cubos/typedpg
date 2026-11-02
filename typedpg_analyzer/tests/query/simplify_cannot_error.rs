@@ -336,3 +336,32 @@ fn between_in_and_distinct() {
         ],
     );
 }
+
+/// `record`'s comparison operators compare field by field and fail on a
+/// field type without one (`point`) or on composites of different shapes,
+/// whatever the operands' types: every composite comparison is refused.
+#[test]
+fn composite_comparisons_are_refused() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TYPE cpt AS (p point);
+         CREATE TYPE cin AS (a int, b text);
+         CREATE TYPE cin2 AS (a int, b int);
+         CREATE DOMAIN cpt_d AS cpt;
+         CREATE TABLE things (id bigint PRIMARY KEY, c1 cpt, c2 cpt, c3 cin,
+                              c4 cin, c5 cin2, cd cpt_d);",
+    )
+    .unwrap();
+    assert_refused(
+        &db,
+        "things",
+        &[
+            "c1 = c2",
+            "c1 < c2",
+            "c1 IS DISTINCT FROM c2",
+            "cd = cd",
+            "c3 = c5",
+            "c3 = c4",
+        ],
+    );
+}

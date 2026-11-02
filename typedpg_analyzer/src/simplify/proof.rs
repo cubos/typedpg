@@ -972,7 +972,11 @@ fn coerces_safely(
 /// the operator PG resolves is a built-in one, both operands coerce to its
 /// argument types safely ([`coerces_safely`]) — an enum to `anyenum`
 /// too — and their collations can't conflict. Two untyped literals are
-/// refused (PG resolves them as `text`, which isn't worth modelling).
+/// refused (PG resolves them as `text`, which isn't worth modelling). An
+/// operator over a pseudo-type other than `anyenum` is refused: `record`'s
+/// (`record_eq`, `record_cmp`) fails on a composite whose field type has no
+/// comparison (`point`) or on two composites of different shapes, and
+/// `anyarray`'s and `anyrange`'s compare elements the same way.
 fn comparison_cannot_error(catalog: &PgCatalog, op: &str, left: Typed, right: Typed) -> bool {
     let (Some(lt), Some(rt)) = (left.ty, right.ty) else {
         return false;
@@ -989,7 +993,15 @@ fn comparison_cannot_error(catalog: &PgCatalog, op: &str, left: Typed, right: Ty
     let Some(oprleft) = declared.oprleft else {
         return false;
     };
+    let polymorphic = |t: crate::oid::PgTypeOid| {
+        t.get() != ANYENUM
+            && catalog
+                .get_type(t)
+                .is_none_or(|t| t.typtype == TypType::Pseudo)
+    };
     if resolved.oid.get() >= FIRST_GENBKI_OBJECT_ID
+        || polymorphic(oprleft)
+        || polymorphic(declared.oprright)
         || resolved
             .code
             .is_none_or(|p| p.get() >= FIRST_GENBKI_OBJECT_ID)
