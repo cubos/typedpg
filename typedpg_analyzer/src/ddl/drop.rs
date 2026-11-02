@@ -1212,9 +1212,22 @@ fn drop_extension(
             }
         }
     }
-    super::depend::with_drop_targets(members.clone(), || {
+    // The objects marked DEPENDS ON EXTENSION go along too
+    // (DEPENDENCY_AUTO_EXTENSION).
+    let auto = super::depend::auto_extension_dependents(interp, ext_oid);
+    let targets: Vec<super::depend::ObjectAddress> = members.iter().chain(&auto).copied().collect();
+    super::depend::with_drop_targets(targets.clone(), || {
         for member in &members {
             super::depend::drop_member_dependents(interp, *member, &desc, cascade)?;
+        }
+        for &object in &auto {
+            super::depend::check_auto_extension_dependent(interp, object, &desc, cascade)?;
+        }
+        Ok::<(), DdlError>(())
+    })?;
+    super::depend::with_drop_targets(targets, || {
+        for &object in &auto {
+            super::depend::delete_auto_extension_dependent(interp, object)?;
         }
         Ok::<(), DdlError>(())
     })?;

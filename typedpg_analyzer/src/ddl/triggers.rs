@@ -632,7 +632,7 @@ pub(crate) fn drop_cloned_triggers(interp: &mut PgCatalog, part: PgClassOid) {
 }
 
 /// Remove trigger `name` of `relid` and, recursively, its clones.
-fn remove_with_clones(interp: &mut PgCatalog, relid: PgClassOid, name: &str) {
+pub(crate) fn remove_with_clones(interp: &mut PgCatalog, relid: PgClassOid, name: &str) {
     if let Some(triggers) = interp.triggers.get_mut(&relid) {
         let dropped = triggers.iter().find(|t| t.name == name).map(|t| t.oid);
         triggers.retain(|t| t.name != name);
