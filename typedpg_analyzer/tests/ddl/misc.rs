@@ -7888,3 +7888,66 @@ fn an_index_or_composite_type_named_as_a_table_cannot_be_opened() {
         );
     }
 }
+
+#[test]
+fn cluster_and_reindex_take_a_toast_table() {
+    // RangeVarCallbackMaintainsTable admits TOAST tables along with tables
+    // and materialized views; cluster_rel refuses a shared catalog (once
+    // the index named is found), before checking the index.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int PRIMARY KEY, b text); CREATE INDEX t_b ON t (b);",
+    )]);
+    db.apply_sql(
+        "CLUSTER pg_toast.pg_toast_2620 USING pg_toast_2620_index;
+         CLUSTER pg_toast.pg_toast_2620;
+         REINDEX TABLE pg_toast.pg_toast_2620;
+         REINDEX TABLE pg_toast.pg_toast_1262;
+         CLUSTER pg_class USING pg_class_oid_index;",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "CLUSTER pg_toast.pg_toast_2619;",
+            "there is no previously clustered index for table \"pg_toast_2619\"",
+        ),
+        (
+            "CLUSTER pg_toast.pg_toast_2619 USING t_b;",
+            "index \"t_b\" for table \"pg_toast_2619\" does not exist",
+        ),
+        (
+            "CLUSTER pg_toast.pg_toast_2619 USING pg_toast_2620_index;",
+            "\"pg_toast_2620_index\" is not an index for table \"pg_toast_2619\"",
+        ),
+        (
+            "CLUSTER pg_database USING pg_database_oid_index;",
+            "cannot cluster a shared catalog",
+        ),
+        (
+            "CLUSTER pg_database USING pg_class_oid_index;",
+            "cannot cluster a shared catalog",
+        ),
+        (
+            "CLUSTER pg_database USING nosuch;",
+            "index \"nosuch\" for table \"pg_database\" does not exist",
+        ),
+        (
+            "CLUSTER pg_toast.pg_toast_1262 USING pg_toast_1262_index;",
+            "cannot cluster a shared catalog",
+        ),
+        (
+            "CLUSTER t_b;",
+            "\"t_b\" is not a table or materialized view",
+        ),
+        (
+            "ALTER TABLE pg_toast.pg_toast_2620 CLUSTER ON pg_toast_2620_index;",
+            "permission denied: \"pg_toast_2620\" is a system catalog",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}

@@ -90,7 +90,8 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
     Ok(())
 }
 
-/// RangeVarCallbackMaintainsTable: tables and materialized views.
+/// RangeVarCallbackMaintainsTable: tables, TOAST tables and materialized
+/// views (the message names only the first and last).
 fn maintained_table(
     interp: &PgCatalog,
     rv: &typedpg_pg_query::protobuf::RangeVar,
@@ -98,7 +99,9 @@ fn maintained_table(
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
     if !matches!(
         relkind(interp, relid),
-        Some(RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView)
+        Some(
+            RelKind::Table | RelKind::ToastTable | RelKind::Partitioned | RelKind::MaterializedView
+        )
     ) {
         return Err(DdlError::Parse(format!(
             "\"{}\" is not a table or materialized view",
@@ -123,6 +126,18 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
             )));
         }
         return Ok(());
+    }
+    // cluster_rel refuses a shared catalog once the index is found by name
+    // (get_relname_relid, in the table's schema), before checking it.
+    let named_index_exists = interp.pg_class.get(&relid).is_some_and(|c| {
+        interp
+            .class_by_qname
+            .contains_key(&(c.relnamespace, stmt.indexname.clone()))
+    });
+    if named_index_exists && interp.is_shared_relation(relid) {
+        return Err(DdlError::UnsupportedDdl(
+            "cannot cluster a shared catalog".into(),
+        ));
     }
     let index = super::tables::check_clusterable_index(interp, relid, &stmt.indexname)?;
     interp.clustered_indexes.insert(relid, index);

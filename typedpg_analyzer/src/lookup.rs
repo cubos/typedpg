@@ -67,6 +67,33 @@ impl PgCatalog {
         self.pg_namespace.get(&oid).map(|n| n.nspname.as_str())
     }
 
+    /// IsSharedRelation (catalog.c), for tables: the catalogs shared by
+    /// every database of the cluster and their TOAST tables (`relisshared`;
+    /// their indexes aren't listed).
+    pub(crate) fn is_shared_relation(&self, relid: PgClassOid) -> bool {
+        const SHARED: [u32; 18] = [
+            1213, // pg_tablespace
+            1214, // pg_shdepend
+            1260, // pg_authid
+            1261, // pg_auth_members
+            1262, // pg_database
+            2396, // pg_shdescription
+            2846, // pg_toast_2396
+            2964, // pg_db_role_setting
+            2966, // pg_toast_2964
+            3592, // pg_shseclabel
+            4060, // pg_toast_3592
+            4177, // pg_toast_1262
+            4183, // pg_toast_6100
+            4185, // pg_toast_1213
+            6000, // pg_replication_origin
+            6100, // pg_subscription
+            6243, // pg_parameter_acl
+            6244, // pg_toast_6243
+        ];
+        SHARED.contains(&relid.get())
+    }
+
     /// IsSystemClass (catalog.c): a relation with a pinned OID — below
     /// FirstUnpinnedObjectId (12000): the system catalogs, their indexes and
     /// TOAST tables — or one in a TOAST schema. Even a superuser may not
