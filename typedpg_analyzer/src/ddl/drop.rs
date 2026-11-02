@@ -371,6 +371,9 @@ fn drop_relation_oid(
         }
         current = parent;
     }
+    // Its partitions go with it (their DEPENDENCY_AUTO on it), and their
+    // foreign keys with them.
+    let going = crate::ddl::tables::inherit::all_inheritors(interp, class_oid);
     let dependent_fks: Vec<(crate::pg_catalog::PgConstraint, String)> = interp
         .pg_constraint
         .values()
@@ -378,8 +381,8 @@ fn drop_relation_oid(
             matches!(c.contype, crate::pg_catalog::ConType::ForeignKey)
                 && (c.confrelid == Some(class_oid)
                     || c.confrelid.is_some_and(|r| referenced_ancestors.contains(&r)))
-                // Its own foreign keys go with it.
-                && c.conrelid != class_oid
+                // Its own foreign keys, and its partitions', go with it.
+                && !going.contains(&c.conrelid)
                 && !named_relations.contains(&c.conrelid)
                 // A clone goes with its parent.
                 && crate::ddl::tables::foreign_keys::fk_parent(interp, c.oid).is_none()
@@ -821,6 +824,33 @@ fn drop_index(
             for fk in fks {
                 crate::ddl::tables::foreign_keys::drop_fk_cascaded(interp, fk);
             }
+        }
+    }
+    // A foreign key relying on a partition's copy of the index depends on
+    // it too.
+    let copy_fks = crate::ddl::tables::partidx::fks_relying_on_copies(interp, class_oid);
+    if let Some(&(fk, copy)) = copy_fks.first() {
+        if !cascade {
+            let rel = |oid| {
+                interp
+                    .pg_class
+                    .get(&oid)
+                    .map(|c| c.relname.clone())
+                    .unwrap_or_default()
+            };
+            let (conname, table) = interp
+                .pg_constraint
+                .get(&fk)
+                .map(|c| (c.conname.clone(), rel(c.conrelid)))
+                .unwrap_or_default();
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop index {name} because other objects depend on it (constraint \
+                 {conname} on table {table} depends on index {})",
+                rel(copy)
+            )));
+        }
+        for (fk, _) in copy_fks {
+            crate::ddl::tables::foreign_keys::drop_fk_cascaded(interp, fk);
         }
     }
     // A partition's constraint whose index this one adopted depends on it

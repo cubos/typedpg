@@ -1933,3 +1933,171 @@ fn attaching_a_partitioned_partition_adopts_its_indexes() {
     assert_eq!(indexes("r12"), 1);
     assert_eq!(indexes("u12"), 1);
 }
+
+/// A NOT VALID foreign key a valid one adopts is validated
+/// (tryAttachPartitionForeignKey checks its rows); a valid one adopted by
+/// a NOT VALID one stays valid — as PG 18.6 does.
+#[test]
+fn adopted_not_valid_partition_key_is_validated() {
+    use typedpg_analyzer::ConType;
+    let valid = |db: &PgCatalog, table: &str, name: &str| {
+        db.constraints_of_table(table)
+            .into_iter()
+            .find(|c| c.contype == ConType::ForeignKey && c.conname == name)
+            .map(|c| c.convalidated)
+    };
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t2 (a int UNIQUE) PARTITION BY RANGE (a);
+         CREATE TABLE t4 PARTITION OF t2 FOR VALUES FROM (MINVALUE) TO (0)
+             PARTITION BY RANGE (a);
+         ALTER TABLE t4 ADD FOREIGN KEY (a) REFERENCES t2 (a) NOT VALID;
+         ALTER TABLE t2 ADD FOREIGN KEY (a) REFERENCES t2 (a);
+         CREATE TABLE ref (a int PRIMARY KEY);
+         CREATE TABLE p (a int) PARTITION BY RANGE (a);
+         ALTER TABLE p ADD CONSTRAINT pf FOREIGN KEY (a) REFERENCES ref;
+         CREATE TABLE pc (a int);
+         ALTER TABLE pc ADD CONSTRAINT pf FOREIGN KEY (a) REFERENCES ref NOT VALID;
+         ALTER TABLE p ATTACH PARTITION pc FOR VALUES FROM (0) TO (10);
+         CREATE TABLE q (a int) PARTITION BY RANGE (a);
+         ALTER TABLE q ADD CONSTRAINT qf FOREIGN KEY (a) REFERENCES ref NOT VALID;
+         CREATE TABLE qc (a int, CONSTRAINT qf FOREIGN KEY (a) REFERENCES ref);
+         ALTER TABLE q ATTACH PARTITION qc FOR VALUES FROM (0) TO (10);",
+    )]);
+    assert_eq!(valid(&db, "t4", "t4_a_fkey"), Some(true));
+    assert_eq!(valid(&db, "pc", "pf"), Some(true));
+    assert_eq!(valid(&db, "q", "qf"), Some(false));
+    assert_eq!(valid(&db, "qc", "qf"), Some(true));
+}
+
+/// A foreign key relying on a partition's copy of a primary key or unique
+/// index depends on the partitioned one: dropping it needs CASCADE, which
+/// takes the key along.
+#[test]
+fn foreign_key_on_a_partition_copy_blocks_dropping_the_index() {
+    let setup = "CREATE TABLE t2 (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE t4 PARTITION OF t2 FOR VALUES FROM (0) TO (100);
+         ALTER TABLE t4 ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES t4 (a);
+         CREATE TABLE t1 (a int) PARTITION BY RANGE (a);
+         CREATE UNIQUE INDEX k ON t1 (a);
+         CREATE TABLE t1p PARTITION OF t1 FOR VALUES FROM (0) TO (100);
+         ALTER TABLE t1p ADD CONSTRAINT g FOREIGN KEY (a) REFERENCES t1p (a);";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t2 DROP CONSTRAINT t2_pkey;",
+            "cannot drop constraint t2_pkey on table t2 because other objects depend on it",
+        ),
+        (
+            "DROP INDEX k;",
+            "cannot drop index k because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE t2 DROP CONSTRAINT t2_pkey CASCADE; DROP INDEX k CASCADE;",
+        ),
+    ]);
+    for table in ["t4", "t1p"] {
+        assert!(
+            db.pg_constraint_names_for_table("public", table)
+                .iter()
+                .all(|n| n != "f" && n != "g"),
+            "{table}"
+        );
+    }
+}
+
+/// A partitioned table goes with its partitions and their foreign keys,
+/// one referencing the table itself included.
+#[test]
+fn dropping_a_partitioned_table_takes_its_partitions_keys() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t0 (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE t5 PARTITION OF t0 FOR VALUES FROM (50) TO (100);
+         ALTER TABLE t5 ADD FOREIGN KEY (a) REFERENCES t0 (a);
+         DROP TABLE t0;",
+    )]);
+    assert!(db.resolve_table(None, "t5").is_none());
+}
+
+/// A new range partition overlapping several names the one PG's bound
+/// search lands on: holding the new lower bound, else the first after it.
+#[test]
+fn overlapping_range_partition_names_the_lowest_overlap() {
+    let setup = "CREATE TABLE t1 (a int) PARTITION BY RANGE (a);
+         CREATE TABLE t2 PARTITION OF t1 FOR VALUES FROM (50) TO (100);
+         CREATE TABLE t4 PARTITION OF t1 FOR VALUES FROM (0) TO (50);";
+    for (stmt, msg) in [
+        (
+            "CREATE TABLE t6 PARTITION OF t1 FOR VALUES FROM (0) TO (100);",
+            "partition \"t6\" would overlap partition \"t4\"",
+        ),
+        (
+            "CREATE TABLE t7 PARTITION OF t1 FOR VALUES FROM (40) TO (60);",
+            "partition \"t7\" would overlap partition \"t4\"",
+        ),
+        (
+            "CREATE TABLE t8 PARTITION OF t1 FOR VALUES FROM (60) TO (200);",
+            "partition \"t8\" would overlap partition \"t2\"",
+        ),
+        (
+            "CREATE TABLE t9 PARTITION OF t1 FOR VALUES FROM (-10) TO (10);",
+            "partition \"t9\" would overlap partition \"t4\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+/// A partitioned table's foreign key can't reference one of its own
+/// partitions: cloning the key into it, PG finds that partition already
+/// open as the referenced table.
+#[test]
+fn partitioned_table_key_referencing_its_own_partition_is_refused() {
+    let setup = "CREATE TABLE t1 (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE t1a PARTITION OF t1 FOR VALUES FROM (0) TO (100);
+         CREATE TABLE u1 (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TABLE u1a PARTITION OF u1 FOR VALUES FROM (0) TO (100) PARTITION BY RANGE (a);
+         CREATE TABLE u1aa PARTITION OF u1a FOR VALUES FROM (0) TO (50);";
+    for (stmt, rel) in [
+        (
+            "ALTER TABLE t1 ADD FOREIGN KEY (a) REFERENCES t1a (a);",
+            "t1a",
+        ),
+        (
+            "ALTER TABLE u1 ADD FOREIGN KEY (a) REFERENCES u1aa (a);",
+            "u1aa",
+        ),
+        (
+            "ALTER TABLE u1a ADD FOREIGN KEY (a) REFERENCES u1aa (a);",
+            "u1aa",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        let msg = format!(
+            "cannot ALTER TABLE \"{rel}\" because it is being used by active queries in this \
+             session"
+        );
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
+    }
+    // Referencing the table itself, a sibling, or a partition from another
+    // table is fine.
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             ALTER TABLE t1 ADD FOREIGN KEY (a) REFERENCES t1 (a);
+             CREATE TABLE x1b PARTITION OF u1 FOR VALUES FROM (100) TO (200);
+             ALTER TABLE x1b ADD FOREIGN KEY (a) REFERENCES u1aa (a);
+             CREATE TABLE w2 (a int) PARTITION BY RANGE (a);
+             ALTER TABLE w2 ADD FOREIGN KEY (a) REFERENCES t1a (a);"
+        ),
+    )]);
+}

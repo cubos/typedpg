@@ -270,6 +270,34 @@ pub(crate) fn parent_index_of(interp: &PgCatalog, index: PgClassOid) -> Option<P
 }
 
 /// Every partition index below `index`, deepest first.
+/// The foreign keys (not rows derived from another) that rely on a
+/// partition's copy of `index`, at any depth, with that copy: they depend
+/// on it as on the index itself — DROP INDEX / DROP CONSTRAINT of the
+/// partitioned one needs CASCADE (findDependentObjects through the copy's
+/// DEPENDENCY_PARTITION_PRI).
+pub(crate) fn fks_relying_on_copies(
+    interp: &PgCatalog,
+    index: PgClassOid,
+) -> Vec<(crate::oid::PgConstraintOid, PgClassOid)> {
+    let mut out = Vec::new();
+    for child in child_indexes(interp, index) {
+        let Some(ci) = interp.pg_index.get(&child) else {
+            continue;
+        };
+        if !ci.indisunique || ci.indpred.is_some() || !ci.indexprs.is_empty() {
+            continue;
+        }
+        let key: std::collections::BTreeSet<i16> =
+            constraints::key_columns(ci).iter().copied().collect();
+        for fk in super::foreign_keys::fks_relying_on(interp, ci.indrelid, &key, child) {
+            if super::foreign_keys::fk_parent(interp, fk).is_none() {
+                out.push((fk, child));
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn child_indexes(interp: &PgCatalog, index: PgClassOid) -> Vec<PgClassOid> {
     let mut out = Vec::new();
     let direct: Vec<PgClassOid> = interp
