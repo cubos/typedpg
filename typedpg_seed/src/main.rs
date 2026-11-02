@@ -20,11 +20,12 @@ use testcontainers::runners::SyncRunner;
 use typedpg_analyzer::{
     AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
     PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
-    PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgDepend, PgEnum,
-    PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgLanguage,
+    PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgConversion, PgDepend,
+    PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgLanguage,
     PgLanguageOid, PgNamespace, PgNamespaceOid, PgOpclass, PgOpclassOid, PgOperator, PgOperatorOid,
-    PgOpfamily, PgProc, PgProcOid, PgRange, PgSetting, PgTsObject, PgType, PgTypeOid, ProKind,
-    ProVolatile, QualifiedName, RelKind, TypAlign, TypCategory, TypStorage, TypType,
+    PgOpfamily, PgProc, PgProcOid, PgRange, PgSetting, PgTsConfigMap, PgTsObject, PgType,
+    PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypAlign, TypCategory, TypStorage,
+    TypType,
 };
 
 fn main() {
@@ -135,6 +136,8 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let (pg_am, pg_opfamily, pg_opclass, pg_amop) = export_access_methods(client)?;
     let pg_settings = export_settings(client)?;
     let pg_ts_objects = export_ts_objects(client)?;
+    let pg_ts_config_map = export_ts_config_map(client)?;
+    let pg_conversion = export_conversions(client)?;
 
     let _ = nsname_by_oid;
 
@@ -170,6 +173,8 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_amop,
         pg_settings,
         pg_ts_objects,
+        pg_ts_config_map,
+        pg_conversion,
         pg_language,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
@@ -883,6 +888,46 @@ fn export_ts_objects(client: &mut postgres::Client) -> Result<Vec<PgTsObject>, p
             Some(PgTsObject {
                 oid: PgGenericOid::new(r.get::<_, u32>(3))?,
                 kind: r.get(0),
+                name: r.get(1),
+                namespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
+            })
+        })
+        .collect())
+}
+
+/// The text search configurations' mappings (`pg_ts_config_map`).
+fn export_ts_config_map(
+    client: &mut postgres::Client,
+) -> Result<Vec<PgTsConfigMap>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT mapcfg, maptokentype, mapseqno, mapdict FROM pg_catalog.pg_ts_config_map \
+             ORDER BY 1, 2, 3",
+            &[],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgTsConfigMap {
+                mapcfg: PgGenericOid::new(r.get::<_, u32>(0))?,
+                maptokentype: r.get(1),
+                mapseqno: r.get(2),
+                mapdict: PgGenericOid::new(r.get::<_, u32>(3))?,
+            })
+        })
+        .collect())
+}
+
+/// The encoding conversions (`pg_conversion`).
+fn export_conversions(client: &mut postgres::Client) -> Result<Vec<PgConversion>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT oid, conname::text, connamespace FROM pg_catalog.pg_conversion ORDER BY oid",
+            &[],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgConversion {
+                oid: PgGenericOid::new(r.get::<_, u32>(0))?,
                 name: r.get(1),
                 namespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
             })

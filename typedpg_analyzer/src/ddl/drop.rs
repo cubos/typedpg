@@ -1995,6 +1995,13 @@ fn drop_schema(
         )));
     }
 
+    // A built-in conversion ALTER CONVERSION moved here depends on the
+    // schema, but is pinned: findDependentObjects refuses it as it collects
+    // the schema's objects, with or without CASCADE.
+    for conversion in interp.conversions.iter().filter(|c| c.namespace == nsoid) {
+        super::conversions::check_not_pinned(interp, conversion)?;
+    }
+
     // Everything in the schema depends on it (DEPENDENCY_NORMAL): without
     // CASCADE any of it blocks the DROP.
     let has_objects = interp.pg_class.values().any(|c| c.relnamespace == nsoid)
@@ -2049,17 +2056,7 @@ fn drop_schema(
             .conversions
             .iter()
             .filter(|c| c.namespace == nsoid)
-            .map(|c| {
-                let first = |ns: PgNamespaceOid| {
-                    interp
-                        .conversions
-                        .iter()
-                        .find(|o| o.namespace == ns && o.name == c.name)
-                        .map(|o| o.oid.get())
-                };
-                let oid = c.oid.get();
-                (oid, format!("conversion {}", shown(&c.name, oid, &first)))
-            });
+            .map(|c| (c.oid.get(), super::conversions::describe(interp, c)));
         let statistics = interp
             .statistics
             .iter()

@@ -94,10 +94,10 @@ pub use oid::{
 pub use pg_catalog::{
     AggKind, ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod, ConType,
     DepType, EvEnabled, EvType, PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCatalogSeed,
-    PgClass, PgCollation, PgConstraint, PgDepend, PgEnum, PgExtension, PgIndex, PgInherits,
-    PgLanguage, PgNamespace, PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange, PgRewrite,
-    PgSetting, PgTsObject, PgType, ProKind, ProVolatile, RelKind, SerializedAst, TypAlign,
-    TypCategory, TypStorage, TypType,
+    PgClass, PgCollation, PgConstraint, PgConversion, PgDepend, PgEnum, PgExtension, PgIndex,
+    PgInherits, PgLanguage, PgNamespace, PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange,
+    PgRewrite, PgSetting, PgTsConfigMap, PgTsObject, PgType, ProKind, ProVolatile, RelKind,
+    SerializedAst, TypAlign, TypCategory, TypStorage, TypType,
 };
 
 pub use ddl::DdlError;

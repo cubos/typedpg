@@ -166,6 +166,10 @@ pub struct PgCatalogSeed {
     #[serde(default)]
     pub pg_ts_objects: Vec<PgTsObject>,
     #[serde(default)]
+    pub pg_ts_config_map: Vec<PgTsConfigMap>,
+    #[serde(default)]
+    pub pg_conversion: Vec<PgConversion>,
+    #[serde(default)]
     pub pg_language: Vec<PgLanguage>,
 }
 
@@ -209,6 +213,9 @@ pub struct PgCatalog {
     pub(crate) pg_amop: Shared<Vec<PgAmop>>,
     pub(crate) pg_settings: Shared<Vec<PgSetting>>,
     pub(crate) pg_ts_objects: Shared<Vec<PgTsObject>>,
+    /// The seeded configurations' mappings. One a migration changes, or
+    /// creates, is in [`Self::ts_definitions`] instead.
+    pub(crate) pg_ts_config_map: Shared<Vec<PgTsConfigMap>>,
     pub(crate) pg_language: Shared<HashMap<PgLanguageOid, PgLanguage>>,
     /// Parsers, templates and options of the text search objects migrations
     /// create.
@@ -454,8 +461,9 @@ pub struct PgCatalog {
     pub(crate) on_commit_drop: Shared<Vec<PgClassOid>>,
     /// Materialized views created or refreshed WITH NO DATA.
     pub(crate) unpopulated_matviews: Shared<std::collections::HashSet<PgClassOid>>,
-    /// Encoding conversions created by migrations.
-    pub(crate) conversions: Shared<Vec<crate::ddl::conversions::Conversion>>,
+    /// Encoding conversions (`pg_conversion`): the built-in ones and those
+    /// migrations create.
+    pub(crate) conversions: Shared<Vec<PgConversion>>,
     /// Event triggers and the function each executes.
     pub(crate) event_triggers: Shared<Vec<(String, crate::oid::PgProcOid)>>,
     /// Enum labels added in the current transaction to a type created
@@ -715,6 +723,8 @@ impl PgCatalog {
         cat.pg_amop = seed.pg_amop.into();
         cat.pg_settings = seed.pg_settings.into();
         cat.pg_ts_objects = seed.pg_ts_objects.into();
+        cat.pg_ts_config_map = seed.pg_ts_config_map.into();
+        cat.conversions = seed.pg_conversion.into();
         cat.pg_language = seed
             .pg_language
             .into_iter()
@@ -760,6 +770,7 @@ impl PgCatalog {
             pg_amop: Shared::default(),
             pg_settings: Shared::default(),
             pg_ts_objects: Shared::default(),
+            pg_ts_config_map: Shared::default(),
             pg_language: Shared::default(),
             ts_definitions: Default::default(),
             cluster_objects: Default::default(),
@@ -966,6 +977,8 @@ impl PgCatalog {
             pg_amop: Vec::clone(&self.pg_amop),
             pg_settings: Vec::clone(&self.pg_settings),
             pg_ts_objects: Vec::clone(&self.pg_ts_objects),
+            pg_ts_config_map: Vec::clone(&self.pg_ts_config_map),
+            pg_conversion: Vec::clone(&self.conversions),
             pg_language: {
                 let mut rows: Vec<_> = self.pg_language.values().cloned().collect();
                 rows.sort_by_key(|l| l.oid);

@@ -95,52 +95,45 @@ pub(crate) struct TsDefinitions {
     /// A dictionary's template (as `(namespace, name)`) and options.
     dicts: HashMap<(PgNamespaceOid, String), DictDefinition>,
     /// A configuration's mapping (`pg_ts_config_map`): each token type's
-    /// dictionaries, by the configuration's OID. A seeded configuration,
-    /// absent here, maps [`SEEDED_CONFIG_TOKENS`].
+    /// dictionaries, by the configuration's OID. A seeded configuration
+    /// absent here maps what the seeded `pg_ts_config_map` says.
     mappings: HashMap<PgGenericOid, BTreeMap<String, Vec<PgGenericOid>>>,
     /// A configuration's parser (`cfgparser`), by the configuration's OID,
     /// for the configurations migrations create.
     parsers: HashMap<PgGenericOid, PgGenericOid>,
 }
 
-/// The token types every seeded configuration maps (initdb's
-/// snowball_create.sql and `simple`, PostgreSQL 18.6).
-const SEEDED_CONFIG_TOKENS: &[&str] = &[
-    "asciiword",
-    "word",
-    "numword",
-    "email",
-    "url",
-    "host",
-    "sfloat",
-    "version",
-    "hword_numpart",
-    "hword_part",
-    "hword_asciipart",
-    "numhword",
-    "asciihword",
-    "hword",
-    "url_path",
-    "file",
-    "float",
-    "int",
-    "uint",
-];
-
-/// Configuration `pg_ts_objects[at]`'s mapping.
+/// Configuration `pg_ts_objects[at]`'s mapping: a seeded one's is in
+/// `pg_ts_config_map` until a migration changes it, each token type's
+/// dictionaries in `mapseqno` order.
 fn config_mapping(interp: &PgCatalog, at: usize) -> BTreeMap<String, Vec<PgGenericOid>> {
     let object = &interp.pg_ts_objects[at];
     if let Some(mapping) = interp.ts_definitions.mappings.get(&object.oid) {
         return mapping.clone();
     }
-    if interp.namespace_name(object.namespace) == Some("pg_catalog") {
-        // The built-in dictionaries are pinned: nothing depends on them.
-        return SEEDED_CONFIG_TOKENS
-            .iter()
-            .map(|t| ((*t).to_owned(), Vec::new()))
-            .collect();
+    let mut rows: Vec<_> = interp
+        .pg_ts_config_map
+        .iter()
+        .filter(|m| m.mapcfg == object.oid)
+        .collect();
+    rows.sort_by_key(|m| (m.maptokentype, m.mapseqno));
+    let mut mapping: BTreeMap<String, Vec<PgGenericOid>> = BTreeMap::new();
+    for m in rows {
+        // The seeded configurations all use the `default` parser, whose
+        // token ids number DEFAULT_PARSER_TOKENS from 1.
+        let Some(token) = usize::try_from(m.maptokentype)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|i| DEFAULT_PARSER_TOKENS.get(i))
+        else {
+            continue;
+        };
+        mapping
+            .entry((*token).to_owned())
+            .or_default()
+            .push(m.mapdict);
     }
-    BTreeMap::new()
+    mapping
 }
 
 /// Store configuration `config`'s mapping; it depends on the dictionaries
