@@ -1380,9 +1380,14 @@ pub(crate) fn drop_constraint(
     crate::ddl::depend::drop_dependents(interp, addr, &desc, cascade)?;
 
     // Drop the backing index (`<conname>` shares the relname with the
-    // constraint for PK/UNIQUE) before dropping the constraint itself —
-    // with CASCADE, the foreign keys referencing it go too.
-    if is_pkey_or_unique {
+    // constraint for PK/UNIQUE/EXCLUDE) before dropping the constraint
+    // itself — with CASCADE, the foreign keys referencing it go too.
+    let has_index = is_pkey_or_unique
+        || interp
+            .pg_constraint
+            .get(&oid)
+            .is_some_and(|c| c.contype == ConType::Exclusion);
+    if has_index {
         let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
         if let Some(nsoid) = nsoid
             && let Some(idx_oid) = interp
@@ -2214,6 +2219,7 @@ fn copy_index_details_to(interp: &mut PgCatalog, source: PgClassOid, index: PgCl
         copy.indclass = src.indclass;
         copy.indcollation = src.indcollation;
     }
+    crate::ddl::depend::record_index_opclasses(interp, index);
     if let Some(am) = interp.index_access_methods.get(&source).cloned() {
         interp.index_access_methods.insert(index, am);
     }

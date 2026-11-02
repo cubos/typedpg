@@ -630,3 +630,516 @@ fn btree_gist_installs_through_its_upgrade_chain() {
     let snap = build(&[("0001.sql", "CREATE EXTENSION btree_gist VERSION '1.6';")]);
     assert!(snap.find_functions(None, "gbt_bool_union").is_empty());
 }
+
+// ── The extension lifecycle: DROP, upgrades, SET SCHEMA ─────────────────────
+
+#[test]
+fn every_pg18_contrib_extension_drops_with_all_its_members() {
+    // DROP EXTENSION takes every member along — access methods, foreign-data
+    // wrappers, text search templates included — so creating it again
+    // succeeds.
+    let failures: Vec<String> = PG18_CONTRIB
+        .iter()
+        .filter_map(|name| {
+            let create = format!("CREATE EXTENSION \"{name}\" CASCADE;");
+            let drop = format!("DROP EXTENSION \"{name}\";");
+            try_apply(&[
+                ("0001.sql", &create),
+                ("0002.sql", &drop),
+                ("0003.sql", &create),
+            ])
+            .err()
+            .map(|e| format!("{name}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Every version of the PG 18 contrib extensions but the default one that
+/// `CREATE EXTENSION ... VERSION` can install (one with an installation
+/// script, or reached from one).
+const PG18_OLDER_VERSIONS: &[(&str, &[&str])] = &[
+    ("amcheck", &["1.0", "1.1", "1.2", "1.3", "1.4"]),
+    ("btree_gin", &["1.0", "1.1", "1.2"]),
+    ("btree_gist", &["1.2", "1.3", "1.4", "1.5", "1.6", "1.7"]),
+    ("citext", &["1.4", "1.5", "1.6", "1.7"]),
+    ("cube", &["1.2", "1.3", "1.4"]),
+    ("earthdistance", &["1.1"]),
+    ("fuzzystrmatch", &["1.1"]),
+    ("hstore", &["1.4", "1.5", "1.6", "1.7"]),
+    ("intarray", &["1.2", "1.3", "1.4"]),
+    ("isn", &["1.1", "1.2"]),
+    ("lo", &["1.1"]),
+    ("ltree", &["1.1", "1.2"]),
+    (
+        "pageinspect",
+        &["1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12"],
+    ),
+    ("pg_buffercache", &["1.2", "1.3", "1.4", "1.5"]),
+    ("pg_freespacemap", &["1.1", "1.2"]),
+    ("pg_prewarm", &["1.1"]),
+    (
+        "pg_stat_statements",
+        &["1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11"],
+    ),
+    ("pg_trgm", &["1.3", "1.4", "1.5"]),
+    ("pg_visibility", &["1.1"]),
+    ("pg_walinspect", &["1.0"]),
+    ("pgcrypto", &["1.3"]),
+    ("pgstattuple", &["1.4"]),
+    ("postgres_fdw", &["1.0", "1.1"]),
+    ("seg", &["1.1", "1.2", "1.3"]),
+    ("xml2", &["1.1"]),
+];
+
+#[test]
+fn every_upgrade_chain_updates_to_the_default_version() {
+    // An upgrade script may drop the extension's own members (cube 1.2 ->
+    // 1.3 drops g_cube_compress(internal)): PG lets the extension being
+    // altered drop them.
+    let failures: Vec<String> = PG18_OLDER_VERSIONS
+        .iter()
+        .flat_map(|(name, versions)| versions.iter().map(move |v| (*name, *v)))
+        .filter_map(|(name, version)| {
+            let create = format!("CREATE EXTENSION \"{name}\" VERSION '{version}' CASCADE;");
+            let update = format!("ALTER EXTENSION \"{name}\" UPDATE;");
+            try_apply(&[("0001.sql", &create), ("0002.sql", &update)])
+                .err()
+                .map(|e| format!("{name} {version}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn upgrades_stop_at_the_version_asked_for() {
+    let snap = build(&[
+        ("0001.sql", "CREATE EXTENSION cube VERSION '1.2';"),
+        ("0002.sql", "ALTER EXTENSION cube UPDATE TO '1.4';"),
+    ]);
+    // 1.2 -> 1.3 dropped it.
+    assert!(snap.find_functions(None, "g_cube_compress").is_empty());
+    // A member the upgrade dropped is gone from the extension too.
+    build(&[
+        ("0001.sql", "CREATE EXTENSION hstore VERSION '1.4';"),
+        ("0002.sql", "ALTER EXTENSION hstore UPDATE TO '1.5';"),
+        ("0003.sql", "ALTER EXTENSION hstore UPDATE TO '1.8';"),
+        ("0004.sql", "DROP EXTENSION hstore;"),
+        ("0005.sql", "CREATE EXTENSION hstore;"),
+    ]);
+}
+
+#[test]
+fn a_member_cannot_be_dropped_outside_its_extension_scripts() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE EXTENSION bloom;",
+            "DROP ACCESS METHOD bloom;",
+            "cannot drop access method bloom because extension bloom requires it",
+        ),
+        (
+            "CREATE EXTENSION file_fdw;",
+            "DROP FOREIGN DATA WRAPPER file_fdw;",
+            "cannot drop foreign-data wrapper file_fdw because extension file_fdw requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
+fn drop_extension_takes_what_depends_on_its_wrapper_or_access_method() {
+    for (setup, message) in [
+        (
+            "CREATE EXTENSION postgres_fdw;
+             CREATE SERVER s FOREIGN DATA WRAPPER postgres_fdw;",
+            "cannot drop extension postgres_fdw because other objects depend on it",
+        ),
+        (
+            "CREATE EXTENSION bloom;
+             CREATE TABLE t (a int);
+             CREATE INDEX ON t USING bloom (a);",
+            "cannot drop extension bloom because other objects depend on it",
+        ),
+    ] {
+        let name = if setup.contains("bloom") {
+            "bloom"
+        } else {
+            "postgres_fdw"
+        };
+        let drop = format!("DROP EXTENSION {name};");
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &drop)]).expect_err(&drop);
+        assert!(err.to_string().starts_with(message), "{drop}\n  got: {err}");
+        let cascade = format!("DROP EXTENSION {name} CASCADE;");
+        let create = format!("CREATE EXTENSION {name};");
+        build(&[
+            ("0001.sql", setup),
+            ("0002.sql", &cascade),
+            ("0003.sql", &create),
+        ]);
+    }
+}
+
+#[test]
+fn set_schema_needs_a_relocatable_extension() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE SCHEMA zz;",
+            "ALTER EXTENSION plpgsql SET SCHEMA zz;",
+            "extension \"plpgsql\" does not support SET SCHEMA",
+        ),
+        (
+            "CREATE SCHEMA zz; CREATE EXTENSION xml2;",
+            "ALTER EXTENSION xml2 SET SCHEMA zz;",
+            "extension \"xml2\" does not support SET SCHEMA",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+    // Its own schema is no change, relocatable or not.
+    build(&[
+        ("0001.sql", "CREATE EXTENSION xml2;"),
+        ("0002.sql", "ALTER EXTENSION xml2 SET SCHEMA public;"),
+        ("0003.sql", "ALTER EXTENSION plpgsql SET SCHEMA pg_catalog;"),
+    ]);
+    let snap = build(&[
+        ("0001.sql", "CREATE SCHEMA zz; CREATE EXTENSION citext;"),
+        ("0002.sql", "ALTER EXTENSION citext SET SCHEMA zz;"),
+    ]);
+    assert!(snap.resolve_type_by_name(Some("zz"), "citext").is_some());
+}
+
+#[test]
+fn extension_scripts_see_the_schemas_of_required_extensions() {
+    // The script's search_path is the extension's schema, then its
+    // required extensions' (execute_extension_script).
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA zz;
+         CREATE EXTENSION earthdistance SCHEMA zz CASCADE;
+         DROP EXTENSION earthdistance;
+         CREATE EXTENSION earthdistance;",
+    )]);
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA zz;
+         CREATE EXTENSION cube SCHEMA zz;
+         CREATE EXTENSION earthdistance VERSION '1.1';
+         ALTER EXTENSION earthdistance UPDATE;",
+    )]);
+}
+
+#[test]
+fn drop_extension_takes_the_operator_families_of_its_access_method() {
+    // A family for the extension's access method depends on the method
+    // automatically (CreateOpFamily), and a class on its family: both go
+    // with DROP EXTENSION, without CASCADE — creating them again works.
+    let class = "CREATE OPERATOR CLASS my_ops FOR TYPE int8 USING bloom AS
+                     OPERATOR 1 =(int8, int8), FUNCTION 1 hashint8(int8);";
+    let family = "CREATE OPERATOR FAMILY myfam USING bloom;
+                  CREATE OPERATOR CLASS c2 FOR TYPE int8 USING bloom FAMILY myfam AS
+                      OPERATOR 1 =(int8, int8), FUNCTION 1 hashint8(int8);";
+    for objects in [class, family] {
+        build(&[
+            ("0001.sql", "CREATE EXTENSION bloom;"),
+            ("0002.sql", objects),
+            ("0003.sql", "DROP EXTENSION bloom;"),
+            ("0004.sql", "CREATE EXTENSION bloom;"),
+            ("0005.sql", objects),
+        ]);
+    }
+    // An index using such a class depends on it normally: it needs CASCADE.
+    let index = "CREATE TABLE t (a int8); CREATE INDEX t_a_idx ON t USING bloom (a my_ops);";
+    let err = try_apply(&[
+        ("0001.sql", "CREATE EXTENSION bloom;"),
+        ("0002.sql", class),
+        ("0003.sql", index),
+        ("0004.sql", "DROP EXTENSION bloom;"),
+    ])
+    .expect_err("DROP EXTENSION bloom");
+    assert!(
+        err.to_string().starts_with(
+            "cannot drop extension bloom because other objects depend on it (index t_a_idx \
+             depends on operator class my_ops for access method bloom)"
+        ),
+        "{err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", "CREATE EXTENSION bloom;"),
+        ("0002.sql", class),
+        ("0003.sql", index),
+        ("0004.sql", "DROP EXTENSION bloom CASCADE;"),
+        ("0005.sql", "CREATE EXTENSION bloom;"),
+        ("0006.sql", class),
+    ]);
+    assert!(db.resolve_table(None, "t_a_idx").is_none());
+}
+
+/// `DROP EXTENSION name` after `setup` fails, its message starting with
+/// `message` (PG's errmsg, then its DETAIL in parentheses).
+fn assert_drop_extension_blocked(setup: &str, name: &str, message: &str) {
+    let drop = format!("DROP EXTENSION {name};");
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", &drop)])
+        .expect_err(&format!("{setup}\n{drop}"));
+    assert!(
+        err.to_string().starts_with(message),
+        "{setup}\n{drop}\n  got: {err}"
+    );
+}
+
+#[test]
+fn every_index_depends_on_the_operator_classes_it_was_built_with() {
+    // index_create records each key column's class, whatever builds the
+    // index: constraints, LIKE copies, partition clones.
+    for (setup, dependent) in [
+        (
+            "CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));",
+            "constraint t_a_excl on table t",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD EXCLUDE USING gist (a WITH =);",
+            "constraint t_a_excl on table t",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t USING gist (a);
+             CREATE TABLE u (LIKE t INCLUDING INDEXES); DROP INDEX t_a_idx;",
+            "index u_a_idx",
+        ),
+        (
+            "CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));
+             CREATE TABLE u (LIKE t INCLUDING ALL); ALTER TABLE t DROP CONSTRAINT t_a_excl;",
+            "constraint u_a_excl on table u",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a); CREATE INDEX ON p USING gist (a);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);",
+            "index p_a_idx",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);
+             CREATE INDEX ON p USING gist (a); DROP INDEX p_a_idx;
+             CREATE INDEX ON c USING gist (a);",
+            "index c_a_idx",
+        ),
+    ] {
+        let setup = format!("CREATE EXTENSION btree_gist; {setup}");
+        assert_drop_extension_blocked(
+            &setup,
+            "btree_gist",
+            &format!(
+                "cannot drop extension btree_gist because other objects depend on it \
+                 ({dependent} depends on operator class gist_int4_ops for access method gist)"
+            ),
+        );
+    }
+    // Dropping an exclusion constraint drops its index too.
+    build(&[(
+        "0001.sql",
+        "CREATE EXTENSION btree_gist;
+         CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));
+         ALTER TABLE t DROP CONSTRAINT t_a_excl;
+         CREATE INDEX t_a_excl ON t (a);
+         DROP INDEX t_a_excl;
+         DROP EXTENSION btree_gist;",
+    )]);
+}
+
+#[test]
+fn a_rebuilt_index_depends_on_its_new_operator_classes() {
+    // ALTER COLUMN TYPE rebuilds the index with the new type's default
+    // class: the old one no longer holds it.
+    for setup in [
+        "CREATE EXTENSION hstore; CREATE TABLE t (a hstore, b int);
+         CREATE INDEX i ON t USING btree (a);
+         ALTER TABLE t ALTER COLUMN a TYPE text USING a::text;",
+        "CREATE EXTENSION hstore; CREATE TABLE t (a hstore, b int);
+         CREATE INDEX i ON t USING btree (b, a);
+         ALTER TABLE t ALTER COLUMN a TYPE text USING a::text;",
+    ] {
+        build(&[("0001.sql", setup), ("0002.sql", "DROP EXTENSION hstore;")]);
+    }
+    let cube = "CREATE EXTENSION hstore; CREATE EXTENSION cube;
+                CREATE TABLE t (a hstore); CREATE INDEX i ON t USING btree (a);
+                ALTER TABLE t ALTER COLUMN a TYPE cube USING NULL;";
+    build(&[("0001.sql", cube), ("0002.sql", "DROP EXTENSION hstore;")]);
+    assert_drop_extension_blocked(
+        cube,
+        "cube",
+        "cannot drop extension cube because other objects depend on it",
+    );
+    assert_drop_extension_blocked(
+        "CREATE EXTENSION btree_gist; CREATE TABLE t (a int4);
+         CREATE INDEX i ON t USING gist (a); ALTER TABLE t ALTER COLUMN a TYPE int8;",
+        "btree_gist",
+        "cannot drop extension btree_gist because other objects depend on it (index i depends \
+         on operator class gist_int8_ops for access method gist)",
+    );
+}
+
+#[test]
+fn one_drop_extension_takes_every_extension_it_names() {
+    // performMultipleDeletions: dependencies among the named extensions
+    // need no CASCADE, in any order.
+    for drop in [
+        "DROP EXTENSION cube, earthdistance;",
+        "DROP EXTENSION earthdistance, cube;",
+    ] {
+        build(&[
+            ("0001.sql", "CREATE EXTENSION earthdistance CASCADE;"),
+            ("0002.sql", drop),
+            ("0003.sql", "CREATE EXTENSION earthdistance CASCADE;"),
+        ]);
+    }
+    // One target names itself; several are "desired object(s)".
+    assert_drop_extension_blocked(
+        "CREATE EXTENSION earthdistance CASCADE;",
+        "cube",
+        "cannot drop extension cube because other objects depend on it",
+    );
+    for (setup, names) in [
+        (
+            "CREATE EXTENSION hstore; CREATE TABLE t (a hstore); CREATE EXTENSION citext;",
+            "citext, hstore",
+        ),
+        (
+            "CREATE EXTENSION earthdistance CASCADE; CREATE EXTENSION hstore;
+             CREATE TABLE t (a hstore);",
+            "cube, hstore",
+        ),
+    ] {
+        assert_drop_extension_blocked(
+            setup,
+            names,
+            "cannot drop desired object(s) because other objects depend on them",
+        );
+    }
+}
+
+#[test]
+fn a_member_of_any_kind_cannot_be_dropped_on_its_own() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE EXTENSION dict_int;",
+            "DROP TEXT SEARCH TEMPLATE intdict_template;",
+            "cannot drop text search template intdict_template because extension dict_int \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_int;",
+            "DROP TEXT SEARCH TEMPLATE intdict_template CASCADE;",
+            "cannot drop text search template intdict_template because extension dict_int \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_int;",
+            "DROP TEXT SEARCH DICTIONARY intdict;",
+            "cannot drop text search dictionary intdict because extension dict_int requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_xsyn;",
+            "DROP TEXT SEARCH TEMPLATE xsyn_template;",
+            "cannot drop text search template xsyn_template because extension dict_xsyn \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_xsyn;",
+            "DROP TEXT SEARCH DICTIONARY xsyn;",
+            "cannot drop text search dictionary xsyn because extension dict_xsyn requires it",
+        ),
+        (
+            "CREATE EXTENSION unaccent;",
+            "DROP TEXT SEARCH TEMPLATE unaccent;",
+            "cannot drop text search template unaccent because extension unaccent requires it",
+        ),
+        (
+            "CREATE EXTENSION unaccent;",
+            "DROP TEXT SEARCH DICTIONARY unaccent;",
+            "cannot drop text search dictionary unaccent because extension unaccent requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP TYPE hstore;",
+            "cannot drop type hstore because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION earthdistance CASCADE;",
+            "DROP DOMAIN earth;",
+            "cannot drop type earth because extension earthdistance requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP OPERATOR ->(hstore, text);",
+            "cannot drop operator ->(hstore,text) because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP CAST (hstore AS json);",
+            "cannot drop cast from hstore to json because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP FUNCTION akeys(hstore);",
+            "cannot drop function akeys(hstore) because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION intagg;",
+            "DROP AGGREGATE int_array_aggregate(int4);",
+            "cannot drop function int_array_aggregate(integer) because extension intagg \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP OPERATOR CLASS gist_hstore_ops USING gist;",
+            "cannot drop operator class gist_hstore_ops for access method gist because \
+             extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION isn;",
+            "DROP OPERATOR FAMILY isn_ops USING btree;",
+            "cannot drop operator family isn_ops for access method btree because extension isn \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION pg_stat_statements;",
+            "DROP VIEW pg_stat_statements;",
+            "cannot drop view pg_stat_statements because extension pg_stat_statements requires it",
+        ),
+        (
+            "SELECT 1;",
+            "DROP LANGUAGE plpgsql;",
+            "cannot drop language plpgsql because extension plpgsql requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore; CREATE EXTENSION citext;",
+            "DROP TYPE hstore, citext;",
+            "cannot drop type hstore because extension hstore requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
+fn a_renamed_exclusion_constraint_takes_its_index_along() {
+    // RenameConstraintById renames the index backing a PK, UNIQUE or
+    // EXCLUDE constraint with it: dropping the constraint then drops the
+    // index, and its operator classes no longer hold the extension.
+    build(&[
+        (
+            "0001.sql",
+            "CREATE EXTENSION btree_gist;
+             CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));",
+        ),
+        (
+            "0002.sql",
+            "ALTER TABLE t RENAME CONSTRAINT t_a_excl TO nn;",
+        ),
+        ("0003.sql", "ALTER TABLE t DROP CONSTRAINT nn;"),
+        ("0004.sql", "DROP EXTENSION btree_gist;"),
+        ("0005.sql", "CREATE INDEX t_a_excl ON t (a);"),
+    ]);
+}

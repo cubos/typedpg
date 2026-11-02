@@ -18,6 +18,9 @@ use crate::pg_catalog::PgCatalog;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ForeignData {
     wrappers: Vec<String>,
+    /// Each wrapper's OID (`pg_foreign_data_wrapper.oid`): the identity
+    /// `pg_depend` rows name, which no rename changes.
+    wrapper_oids: std::collections::HashMap<String, crate::oid::PgGenericOid>,
     /// `(server, wrapper)`.
     servers: Vec<(String, String)>,
     /// `(user, server)`.
@@ -42,6 +45,40 @@ pub(crate) enum OptionsOwner {
 }
 
 impl ForeignData {
+    /// Wrapper `name`'s OID.
+    pub(crate) fn wrapper_oid(&self, name: &str) -> Option<crate::oid::PgGenericOid> {
+        self.wrapper_oids.get(name).copied()
+    }
+
+    /// The wrapper whose OID is `oid`.
+    pub(crate) fn wrapper_named(&self, oid: crate::oid::PgGenericOid) -> Option<String> {
+        self.wrapper_oids
+            .iter()
+            .find(|(_, o)| **o == oid)
+            .map(|(name, _)| name.clone())
+    }
+
+    pub(crate) fn wrapper_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.wrappers.iter().cloned()
+    }
+
+    /// The servers of wrapper `name`.
+    pub(crate) fn servers_of(&self, name: &str) -> Vec<String> {
+        self.servers
+            .iter()
+            .filter(|(_, w)| w == name)
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
+    /// Forget wrapper `name` and its options (it has no servers left).
+    pub(crate) fn forget_wrapper(&mut self, name: &str) {
+        self.wrappers.retain(|w| w != name);
+        self.wrapper_oids.remove(name);
+        self.options
+            .retain(|owner, _| !matches!(owner, OptionsOwner::Wrapper(w) if w == name));
+    }
+
     /// Forget relation `relid`'s options and its columns' (DROP).
     pub(crate) fn forget_relation(&mut self, relid: PgClassOid) {
         self.table_servers.remove(&relid);
@@ -207,7 +244,12 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
         OptionsOwner::Wrapper(stmt.fdwname.clone()),
         &stmt.options,
     )?;
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
     interp.foreign_data.wrappers.push(stmt.fdwname.clone());
+    interp
+        .foreign_data
+        .wrapper_oids
+        .insert(stmt.fdwname.clone(), oid);
     Ok(())
 }
 
@@ -406,6 +448,39 @@ pub(crate) fn drop_foreign_object(
         }
         vec![name.clone()]
     };
+    let what = if wrapper {
+        // An extension's member goes only with it.
+        let object = super::depend::NamedObject::ForeignDataWrapper { name: name.clone() };
+        if let Some(addr) = super::depend::named_address_of(interp, &object) {
+            super::depend::check_not_owned(interp, addr, &format!("foreign-data wrapper {name}"))?;
+        }
+        "foreign-data wrapper"
+    } else {
+        "server"
+    };
+    drop_servers(
+        interp,
+        &servers,
+        wrapper,
+        cascade,
+        &format!("{what} {name}"),
+    )?;
+    if wrapper {
+        interp.foreign_data.forget_wrapper(&name);
+    }
+    Ok(())
+}
+
+/// Drop `servers` with their user mappings and foreign tables, for the
+/// DROP of `dropped_desc` — their wrapper's when `of_wrapper`, then the
+/// servers themselves are dependents too: any dependent needs CASCADE.
+pub(crate) fn drop_servers(
+    interp: &mut PgCatalog,
+    servers: &[String],
+    of_wrapper: bool,
+    cascade: bool,
+    dropped_desc: &str,
+) -> Result<(), DdlError> {
     let tables: Vec<PgClassOid> = interp
         .foreign_data
         .table_servers
@@ -418,15 +493,10 @@ pub(crate) fn drop_foreign_object(
         .user_mappings
         .iter()
         .any(|(_, s)| servers.contains(s));
-    let has_dependents = !tables.is_empty() || has_mappings || (wrapper && !servers.is_empty());
+    let has_dependents = !tables.is_empty() || has_mappings || (of_wrapper && !servers.is_empty());
     if has_dependents && !cascade {
-        let what = if wrapper {
-            "foreign-data wrapper"
-        } else {
-            "server"
-        };
         return Err(DdlError::DependencyError(format!(
-            "cannot drop {what} {name} because other objects depend on it"
+            "cannot drop {dropped_desc} because other objects depend on it"
         )));
     }
     for table in tables {
@@ -437,12 +507,8 @@ pub(crate) fn drop_foreign_object(
     fd.servers.retain(|(s, _)| !servers.contains(s));
     fd.options.retain(|owner, _| match owner {
         OptionsOwner::Server(s) | OptionsOwner::UserMapping(_, s) => !servers.contains(s),
-        OptionsOwner::Wrapper(w) => !wrapper || *w != name,
         _ => true,
     });
-    if wrapper {
-        fd.wrappers.retain(|w| *w != name);
-    }
     Ok(())
 }
 
@@ -473,6 +539,9 @@ pub(crate) fn rename_foreign_object(
         }
         for w in fd.wrappers.iter_mut().filter(|w| **w == old) {
             w.clone_from(&new);
+        }
+        if let Some(oid) = fd.wrapper_oids.remove(&old) {
+            fd.wrapper_oids.insert(new.clone(), oid);
         }
         for (_, w) in fd.servers.iter_mut().filter(|(_, w)| *w == old) {
             w.clone_from(&new);

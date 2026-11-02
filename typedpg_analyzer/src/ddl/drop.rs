@@ -1212,12 +1212,38 @@ fn drop_extension(
         })
         .collect();
 
+    // The other extensions the same DROP names go together with this one
+    // (performMultipleDeletions): their members are no outside dependents.
+    let outer_targets = super::depend::drop_targets();
+    let together: Vec<(PgClassOid, crate::oid::PgGenericOid)> = outer_targets
+        .iter()
+        .filter(|t| t.classid == PG_EXTENSION_RELID && t.objid.get() != ext_oid.get())
+        .filter_map(|t| crate::oid::PgExtensionOid::new(t.objid.get()))
+        .flat_map(|other| interp.extension_objects(other).collect::<Vec<_>>())
+        .chain(owned.iter().copied())
+        .collect();
+    let together_targets: Vec<super::depend::ObjectAddress> = outer_targets
+        .into_iter()
+        .chain(
+            together
+                .iter()
+                .map(|&(classid, objid)| super::depend::ObjectAddress {
+                    classid,
+                    objid,
+                    objsubid: 0,
+                }),
+        )
+        .collect();
+
     // What depends on a member from outside the extension (a column of its
     // type, an index using its operator class, ...) needs CASCADE, and goes
     // with it.
     let desc = format!("extension {name}");
-    let is_member =
-        |classid: PgClassOid, oid: u32| owned.iter().any(|(c, o)| *c == classid && o.get() == oid);
+    let is_member = |classid: PgClassOid, oid: u32| {
+        together
+            .iter()
+            .any(|(c, o)| *c == classid && o.get() == oid)
+    };
     if !cascade {
         for &(classid, objid) in &owned {
             let Some(type_oid) = PgTypeOid::new(objid.get()).filter(|_| classid == PG_TYPE_RELID)
@@ -1242,10 +1268,22 @@ fn drop_extension(
             }
         }
     }
+    // A member wrapper's servers (and their user mappings and foreign
+    // tables), which the analyzer keeps by name.
+    for &(classid, objid) in &owned {
+        if classid != super::depend::PG_FOREIGN_DATA_WRAPPER_RELID {
+            continue;
+        }
+        if let Some(wrapper) = interp.foreign_data.wrapper_named(objid) {
+            let servers = interp.foreign_data.servers_of(&wrapper);
+            super::fdw::drop_servers(interp, &servers, true, cascade, &desc)?;
+        }
+    }
     // The objects marked DEPENDS ON EXTENSION go along too
     // (DEPENDENCY_AUTO_EXTENSION).
     let auto = super::depend::auto_extension_dependents(interp, ext_oid);
-    let targets: Vec<super::depend::ObjectAddress> = members.iter().chain(&auto).copied().collect();
+    let targets: Vec<super::depend::ObjectAddress> =
+        together_targets.iter().chain(&auto).copied().collect();
     super::depend::with_drop_targets(targets.clone(), || {
         for member in &members {
             super::depend::drop_member_dependents(interp, *member, &desc, cascade)?;
