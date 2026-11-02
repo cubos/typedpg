@@ -52,6 +52,23 @@
 //!   semi- or anti-join doesn't exclude it the way the written SubPlan
 //!   does. An UPDATE's SET values and a locking SELECT's target list,
 //!   evaluated on the rows already chosen, are still rewritten.
+//! - Shapes where `EXISTS` can be the slower plan, since speed is the
+//!   point of the rule:
+//!   - a counted query whose FROM isn't exactly one table (a join or a
+//!     comma list), in every form: `EXISTS` gets fast-start planning, and
+//!     on a misestimate (correlated columns) a nested loop over a
+//!     materialized side turns the no-match case quadratic — `SELECT
+//!     count(*) = 0 FROM y1 x JOIN y2 y ON x.k = y.k WHERE x.c = 1 AND …`
+//!     over two 1.5M-row tables took 32 ms as written and 14.8 s as
+//!     `NOT EXISTS` (33 ms vs 17.3 s as a WHERE site);
+//!   - a correlated subquery in the target list (or an UPDATE's SET):
+//!     the planner may hash the `EXISTS` SubPlan, reading the whole table
+//!     whatever the LIMIT, where the count probed an index per row — 1.0
+//!     ms vs 14.8 ms for `SELECT id, (SELECT count(*) FROM u WHERE u.t_id
+//!     = t.id) > 0 x FROM t ORDER BY id LIMIT 20` (20k / 200k rows), the
+//!     gap growing with `u`. Uncorrelated, it is an InitPlan both ways and
+//!     `EXISTS` only stops earlier. A WHERE site becomes a semi- or
+//!     anti-join, costed with the outer side known.
 //! - Anything that may call a volatile function, or reads a relation
 //!   other than a plain table (a view or a CTE may hide one; a foreign
 //!   table may do anything): how many times it runs may change.
@@ -546,8 +563,15 @@ impl Walker<'_, '_> {
                 // target list, qualifies.
                 let guarded = proof::rewrite_site_is_safe(self.ctx, e.location);
                 if guarded
-                    && let Some(edits) =
-                        sublink_form(self.ctx, self.text, self.cte_names, self.unnamed, e, scope)
+                    && let Some(edits) = sublink_form(
+                        self.ctx,
+                        self.text,
+                        self.cte_names,
+                        self.unnamed,
+                        e,
+                        scope,
+                        in_top_level_where(self.ctx, e.location),
+                    )
                 {
                     self.out.push(Candidate {
                         rule: Rule::CountExists,
@@ -764,6 +788,7 @@ fn sublink_form(
     unnamed: &[&ResTarget],
     e: &protobuf::AExpr,
     scope: &FromScope<'_>,
+    in_where: bool,
 ) -> Option<Vec<Edit>> {
     let cmp = comparison(ctx, text, e)?;
     let Some(node::Node::SubLink(sub)) = cmp.count.node.as_ref() else {
@@ -795,6 +820,12 @@ fn sublink_form(
     if !pure(ctx, cte_names, cmp.count)
         || !counted_error_free(ctx, select, &FromScope::of_select(ctx, select, Some(scope)))
     {
+        return None;
+    }
+    // Where `EXISTS` can be the slower plan: a join in the counted query
+    // (fast-start planning), or a correlated subquery outside the WHERE
+    // (a hashed SubPlan reading the whole table).
+    if !single_table(select) || (!in_where && !uncorrelated(ctx, select)) {
         return None;
     }
 
@@ -952,7 +983,7 @@ fn top_level_form(
     let Some(node::Node::SelectStmt(select)) = stmt_node.node.as_ref() else {
         return None;
     };
-    if !one_row_aggregate(select) || select.from_clause.is_empty() {
+    if !one_row_aggregate(select) || !single_table(select) {
         return None;
     }
     let [target] = select.target_list.as_slice() else {
@@ -1020,6 +1051,70 @@ fn top_level_form(
             ),
         },
     ])
+}
+
+/// Whether `select`'s FROM is exactly one table reference (no join, no
+/// comma list). With a join, `EXISTS` gets a fast-start plan, and on a
+/// misestimate (correlated columns) a nested loop over a materialized side
+/// turns the no-match case quadratic: 32 ms counting, 14.8 s as `EXISTS`
+/// over two 1.5M-row tables. What the reference reads is checked apart
+/// (a stored table, by [`pure`] and [`error_free_select`]).
+fn single_table(select: &SelectStmt) -> bool {
+    matches!(
+        select.from_clause.as_slice(),
+        [Node {
+            node: Some(node::Node::RangeVar(_))
+        }]
+    )
+}
+
+/// Whether `select` reads no column of an enclosing level: every column
+/// reference in it is its own FROM's. (Error-free, it holds no sublink.)
+/// Uncorrelated, it is an InitPlan as a count and as `EXISTS` alike,
+/// evaluated once; correlated, a target-list `EXISTS` may be planned as a
+/// hashed SubPlan that reads the whole table where the count probed an
+/// index per row (1.0 ms → 14.8 ms for 20 rows of `t` over a 200k-row `u`).
+fn uncorrelated(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    let scope = FromScope::of_select(ctx, select, None);
+    [select.where_clause.as_deref(), select.target_list.first()]
+        .into_iter()
+        .flatten()
+        .chain(select.from_clause.iter())
+        .all(|n| {
+            n.node.as_ref().is_none_or(|n| {
+                n.nodes().iter().all(|(n, _)| match n {
+                    NodeRef::ColumnRef(c) => scope.resolve(ctx, c).is_some(),
+                    NodeRef::SubLink(_) => false,
+                    _ => true,
+                })
+            })
+        })
+}
+
+/// Whether the node at `location` is in the top-level statement's WHERE
+/// (outside any sublink), rather than its target list or SET values.
+fn in_top_level_where(ctx: &Ctx<'_>, location: i32) -> bool {
+    fn reaches(node: NodeRef<'_>, at: i32) -> bool {
+        if node.location() == Some(at) {
+            return true;
+        }
+        if matches!(node, NodeRef::SubLink(_) | NodeRef::SelectStmt(_)) {
+            return false;
+        }
+        node.children().into_iter().any(|c| reaches(c, at))
+    }
+    let [stmt] = ctx.tree.stmts.as_slice() else {
+        return false;
+    };
+    let where_clause = match stmt.stmt.as_deref().and_then(|n| n.node.as_ref()) {
+        Some(node::Node::SelectStmt(s)) => s.where_clause.as_deref(),
+        Some(node::Node::UpdateStmt(u)) => u.where_clause.as_deref(),
+        Some(node::Node::DeleteStmt(d)) => d.where_clause.as_deref(),
+        _ => None,
+    };
+    where_clause
+        .and_then(|w| w.node.as_ref())
+        .is_some_and(|w| reaches(w.to_ref(), location))
 }
 
 /// A DML statement's RETURNING entries.

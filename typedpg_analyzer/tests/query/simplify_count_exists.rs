@@ -143,10 +143,6 @@ fn count_of_a_not_null_expression() {
             "SELECT EXISTS (SELECT 1 FROM t) AS x",
         ),
         (
-            "SELECT (SELECT count(x.a) FROM t x JOIN u ON u.t_id = x.id) > 0 AS x",
-            "SELECT EXISTS (SELECT 1 FROM t x JOIN u ON u.t_id = x.id) AS x",
-        ),
-        (
             "SELECT (SELECT pg_catalog.count(*) FROM t) > 0 AS x",
             "SELECT EXISTS (SELECT 1 FROM t) AS x",
         ),
@@ -176,17 +172,63 @@ fn correlated_in_where_and_dml() {
         ),
         // An UPDATE's SET values are evaluated on the rows already chosen.
         (
-            "UPDATE u SET c = ((SELECT count(*) FROM t WHERE t.id = u.t_id) > 0)::int",
-            "UPDATE u SET c = (EXISTS (SELECT 1 FROM t WHERE t.id = u.t_id))::int",
+            "UPDATE u SET c = ((SELECT count(*) FROM t WHERE t.a = 1) > 0)::int",
+            "UPDATE u SET c = (EXISTS (SELECT 1 FROM t WHERE t.a = 1))::int",
         ),
         // A FOR UPDATE SELECT's target list too.
         (
-            "SELECT id, (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 AS x FROM t FOR UPDATE",
-            "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) AS x FROM t FOR UPDATE",
+            "SELECT id, (SELECT count(*) FROM u WHERE u.c = 1) > 0 AS x FROM t FOR UPDATE",
+            "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.c = 1) AS x FROM t FOR UPDATE",
         ),
     ] {
         assert_rewritten(sql, expected);
     }
+}
+
+/// Shapes where `EXISTS` can be the slower plan are kept: a join in the
+/// counted query (fast-start planning turned a no-match count quadratic:
+/// 32 ms → 14.8 s over two 1.5M-row tables), and a correlated count in the
+/// target list or SET values (a hashed SubPlan read all of `u` where the
+/// count probed an index per row: 1.0 ms → 14.8 ms for 20 rows).
+#[test]
+fn shapes_exists_may_plan_worse_are_kept() {
+    let db = setup_with(
+        "CREATE TABLE y1 (k int NOT NULL, c int NOT NULL, d int NOT NULL);
+         CREATE TABLE y2 (k int NOT NULL, c int NOT NULL, d int NOT NULL);",
+    );
+    for sql in [
+        // A join in the counted query: top-level form, WHERE and target list.
+        "SELECT count(*) = 0 FROM y1 x JOIN y2 y ON x.k = y.k \
+         WHERE x.c = 1 AND x.d = 1 AND y.c = 2 AND y.d = 2",
+        "SELECT count(*) > 0 FROM y1, y2 WHERE y1.k = y2.k",
+        "SELECT t.id FROM t WHERE (SELECT count(*) FROM y1 x JOIN y2 y ON x.k = y.k \
+         WHERE x.c = t.a AND y.d = 2) = 0",
+        "SELECT (SELECT count(*) FROM y1 x JOIN y2 y ON x.k = y.k WHERE x.c = 1) > 0 AS x",
+        "SELECT (SELECT count(*) FROM y1, y2 WHERE y1.k = y2.k) > 0 AS x",
+        // A correlated count in the target list or SET values.
+        "SELECT id, (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 AS x \
+         FROM t ORDER BY id LIMIT 20",
+        "UPDATE u SET c = ((SELECT count(*) FROM t WHERE t.id = u.t_id) > 0)::int",
+    ] {
+        assert_kept_in(&db, sql);
+    }
+    // Over one table: a correlated WHERE site, an uncorrelated target-list
+    // site and the top-level form.
+    assert_rewritten_in(
+        &db,
+        "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.t_id = t.id) = 0",
+        "SELECT id FROM t WHERE (NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id))",
+    );
+    assert_rewritten_in(
+        &db,
+        "SELECT id, (SELECT count(*) FROM u WHERE u.c = 3) > 0 AS x FROM t ORDER BY id LIMIT 20",
+        "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.c = 3) AS x FROM t ORDER BY id LIMIT 20",
+    );
+    assert_rewritten_in(
+        &db,
+        "SELECT count(*) = 0 FROM y1 WHERE c = 1 AND d = 1",
+        "SELECT (NOT EXISTS (SELECT 1 FROM y1 WHERE c = 1 AND d = 1)) AS \"?column?\"",
+    );
 }
 
 /// Under READ COMMITTED a row a concurrent transaction updated is rechecked
@@ -254,9 +296,8 @@ fn top_level_count() {
             "SELECT EXISTS (SELECT 1 FROM t WHERE b > 3) AS \"?column?\" -- trailing\n",
         ),
         (
-            "SELECT count(*) <> 0 AS \"Has \"\"it\"\"\" FROM t JOIN u ON u.t_id = t.id WHERE u.c = $1",
-            "SELECT EXISTS (SELECT 1 FROM t JOIN u ON u.t_id = t.id WHERE u.c = $1) \
-             AS \"Has \"\"it\"\"\"",
+            "SELECT count(*) <> 0 AS \"Has \"\"it\"\"\" FROM u WHERE u.c = $1",
+            "SELECT EXISTS (SELECT 1 FROM u WHERE u.c = $1) AS \"Has \"\"it\"\"\"",
         ),
     ] {
         assert_rewritten(sql, expected);
@@ -296,10 +337,10 @@ fn issue_queries() {
 fn every_count_of_a_query_is_rewritten() {
     // In the target list, two counts are rewritten one after the other.
     assert_rewritten(
-        "SELECT id, (SELECT count(*) FROM u WHERE u.t_id = t.id) > 0 AS x, \
-         (SELECT count(*) FROM u WHERE u.c = t.a) = 0 AS y FROM t",
-        "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id) AS x, \
-         (NOT EXISTS (SELECT 1 FROM u WHERE u.c = t.a)) AS y FROM t",
+        "SELECT id, (SELECT count(*) FROM u WHERE u.c = 1) > 0 AS x, \
+         (SELECT count(*) FROM u WHERE u.c = 2) = 0 AS y FROM t",
+        "SELECT id, EXISTS (SELECT 1 FROM u WHERE u.c = 1) AS x, \
+         (NOT EXISTS (SELECT 1 FROM u WHERE u.c = 2)) AS y FROM t",
     );
     // ANDed in a WHERE, each is the other's sibling sublink, whose SubPlan
     // it may keep from running: neither is rewritten.
@@ -657,8 +698,8 @@ fn copies_another_clause_must_match_are_kept() {
 /// which the driver checks against the written query's.
 #[test]
 fn wrappers_keep_the_column_name() {
-    const C: &str = "(SELECT count(*) FROM u WHERE u.t_id = t.id)";
-    const E: &str = "EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)";
+    const C: &str = "(SELECT count(*) FROM u WHERE u.c = 1)";
+    const E: &str = "EXISTS (SELECT 1 FROM u WHERE u.c = 1)";
     for (written, sent) in [
         // Cast: named after the type.
         (format!("({C} > 0)::int"), format!("({E})::int AS int4")),
@@ -810,8 +851,8 @@ fn opt_out() {
 /// whole comparison.
 #[test]
 fn not_exists_keeps_a_trailing_test_on_the_comparison() {
-    const C: &str = "(SELECT count(*) FROM u WHERE u.t_id = t.id)";
-    const E: &str = "(NOT EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id))";
+    const C: &str = "(SELECT count(*) FROM u WHERE u.c = 1)";
+    const E: &str = "(NOT EXISTS (SELECT 1 FROM u WHERE u.c = 1))";
     for test in [
         "IS NOT NULL",
         "ISNULL",
