@@ -349,10 +349,10 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         )));
     }
     let (family_name, family_ns) = family;
-    let family_key = super::opfamily_members::FamilyKey {
-        name: family_name.clone(),
-        namespace: family_ns,
-        method: am.clone(),
+    let Some(family_key) =
+        super::opfamily_members::FamilyKey::of(interp, &family_name, family_ns, &am)
+    else {
+        return Err(DdlError::Internal("operator family vanished".into()));
     };
     // storeOperators without the ADD check: an operator the family already
     // has trips pg_amop's unique index.
@@ -373,6 +373,16 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
     }
     let funcs =
         super::opfamily_members::function_members(interp, &family_key, &stmt.items, Some(intype))?;
+    // storeProcedures: a support function the family already has trips
+    // pg_amproc's unique index.
+    if funcs.iter().any(|f| {
+        super::opfamily_members::find(interp, &family_key, true, f.number, f.left, f.right)
+            .is_some()
+    }) {
+        return Err(DdlError::DuplicateObject(
+            "duplicate key value violates unique constraint \"pg_amproc_fam_proc_index\"".into(),
+        ));
+    }
     let oid = PgOpclassOid::from_nonzero(interp.alloc_oid()?);
     // The class depends on its family, and goes with it (DEPENDENCY_AUTO).
     let family = super::depend::named_address_of(
@@ -535,10 +545,10 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
             stmt.amname
         )));
     };
-    let family_key = super::opfamily_members::FamilyKey {
-        name: family.clone(),
-        namespace: family_ns,
-        method: stmt.amname.clone(),
+    let Some(family_key) =
+        super::opfamily_members::FamilyKey::of(interp, &family, family_ns, &stmt.amname)
+    else {
+        return Err(DdlError::Internal("operator family vanished".into()));
     };
     if !stmt.is_drop {
         // AlterOpFamilyAdd → storeOperators(isAdd).

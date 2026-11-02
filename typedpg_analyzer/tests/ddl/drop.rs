@@ -2607,3 +2607,196 @@ fn more_dependency_details_name_the_dependent_as_pg_does() {
         assert_drop_fails(setup, stmt, message);
     }
 }
+
+const C4: &str =
+    "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+                  CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+                  CREATE FUNCTION c4(int4, int4) RETURNS int LANGUAGE sql IMMUTABLE
+                      AS 'select btint4cmp($1, $2)';
+                  CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree AS
+                      OPERATOR 3 ===, FUNCTION 1 c4(int4, int4);";
+
+#[test]
+fn a_renamed_or_moved_family_keeps_its_members() {
+    assert_drop_fails(
+        &format!("{C4} ALTER OPERATOR FAMILY oc USING btree RENAME TO fam2;"),
+        "ALTER OPERATOR FAMILY fam2 USING btree DROP OPERATOR 3 (int4, int4);",
+        "cannot drop operator 3 (integer, integer) of operator family fam2 for access method \
+         btree: ===(integer,integer) because operator class oc for access method btree requires \
+         it",
+    );
+    // A new family by the old name has no members.
+    build(&[
+        ("0001.sql", C4),
+        (
+            "0002.sql",
+            "ALTER OPERATOR FAMILY oc USING btree RENAME TO fam2;
+             CREATE OPERATOR FAMILY oc USING btree;
+             ALTER OPERATOR FAMILY oc USING btree ADD FUNCTION 1 c4(int4, int4);",
+        ),
+    ]);
+    assert_drop_fails(
+        &format!("CREATE SCHEMA s; {C4} ALTER OPERATOR FAMILY oc USING btree SET SCHEMA s;"),
+        "ALTER OPERATOR FAMILY s.oc USING btree DROP FUNCTION 1 (int4, int4);",
+        "cannot drop function 1 (integer, integer) of operator family s.oc for access method \
+         btree: c4(integer,integer) because operator class oc for access method btree requires it",
+    );
+    // Renaming the class leaves its family's name.
+    assert_drop_fails(
+        &format!("{C4} ALTER OPERATOR CLASS oc USING btree RENAME TO oc2;"),
+        "ALTER OPERATOR FAMILY oc USING btree DROP OPERATOR 3 (int4, int4);",
+        "cannot drop operator 3 (integer, integer) of operator family oc for access method \
+         btree: ===(integer,integer) because operator class oc2 for access method btree requires \
+         it",
+    );
+}
+
+#[test]
+fn a_member_is_tied_to_the_first_class_by_name_then_schema() {
+    assert_drop_fails(
+        "CREATE SCHEMA s;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE OPERATOR FAMILY fam USING btree;
+         CREATE OPERATOR CLASS z_oc FOR TYPE int4 USING btree FAMILY fam AS STORAGE int4;
+         CREATE OPERATOR CLASS s.a_oc FOR TYPE int4 USING btree FAMILY fam AS STORAGE int4;
+         ALTER OPERATOR FAMILY fam USING btree ADD OPERATOR 3 ===(int4, int4);",
+        "DROP OPERATOR ===(int4, int4);",
+        "cannot drop operator ===(integer,integer) because other objects depend on it (operator \
+         class s.a_oc for access method btree depends on operator ===(integer,integer))",
+    );
+}
+
+#[test]
+fn create_operator_class_refuses_a_support_function_the_family_has() {
+    assert_drop_fails(
+        "CREATE FUNCTION c4(int4, int4) RETURNS int LANGUAGE sql IMMUTABLE
+             AS 'select btint4cmp($1, $2)';
+         CREATE OPERATOR FAMILY fam USING btree;
+         ALTER OPERATOR FAMILY fam USING btree ADD FUNCTION 1 c4(int4, int4);",
+        "CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree FAMILY fam AS FUNCTION 1 c4(int4, int4);",
+        "duplicate key value violates unique constraint \"pg_amproc_fam_proc_index\"",
+    );
+}
+
+#[test]
+fn support_functions_are_checked_as_assign_proc_types_does() {
+    let class = |am: &str, items: &str| {
+        format!("CREATE OPERATOR CLASS oc FOR TYPE int4 USING {am} AS {items};")
+    };
+    for (setup, stmt, message) in [
+        (
+            "",
+            class("btree", "FUNCTION 7 btint4cmp(int4, int4)"),
+            "invalid function number 7, must be between 1 and 6",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 4 hashint4(int4)"),
+            "invalid function number 4, must be between 1 and 3",
+        ),
+        (
+            "",
+            class("gist", "FUNCTION 13 btint4cmp(int4, int4)"),
+            "invalid function number 13, must be between 1 and 12",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 0 nosuch(int4)"),
+            "invalid function number 0, must be between 1 and 6",
+        ),
+        (
+            "CREATE EXTENSION bloom;",
+            class("bloom", "FUNCTION 3 hashint4(int4)"),
+            "invalid function number 3, must be between 1 and 2",
+        ),
+        (
+            "",
+            class("brin", "FUNCTION 16 hashint4(int4)"),
+            "invalid function number 16, must be between 1 and 15",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 2 btint4cmp(int4, int4)"),
+            "ordering sort support functions must accept type \"internal\"",
+        ),
+        (
+            "CREATE FUNCTION ss(internal) RETURNS int LANGUAGE c AS '$libdir/plpgsql', 'plpgsql_call_handler';",
+            class("btree", "FUNCTION 2 ss(internal)"),
+            "ordering sort support functions must return void",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 6 btint4cmp(int4, int4)"),
+            "btree skip support functions must accept type \"internal\"",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 3 btint4cmp(int4, int4)"),
+            "ordering in_range functions must have five arguments",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 1 hashint4(int4)"),
+            "ordering comparison functions must have two arguments",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 1 int4eq(int4, int4)"),
+            "ordering comparison functions must return integer",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 4 (int4, int8) btequalimage(oid)"),
+            "ordering equal image functions must not be cross-type",
+        ),
+        (
+            "",
+            class("btree", "FUNCTION 5 btint4cmp(int4, int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 3 hashint4(int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("gist", "FUNCTION 10 btint4cmp(int4, int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("brin", "FUNCTION 5 hashint4(int4)"),
+            "invalid operator class options parsing function",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 1 btint4cmp(int4, int4)"),
+            "hash function 1 must have one argument",
+        ),
+        (
+            "",
+            class("hash", "FUNCTION 2 hashint4(int4)"),
+            "hash function 2 must have two arguments",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING gist;",
+            "ALTER OPERATOR FAMILY fam USING gist ADD FUNCTION 1 btint4cmp(int4, int4);".to_owned(),
+            "associated data types must be specified for index support function",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING gist;",
+            "ALTER OPERATOR FAMILY fam USING gist ADD FUNCTION 13 btint4cmp(int4, int4);"
+                .to_owned(),
+            "invalid function number 13, must be between 1 and 12",
+        ),
+    ] {
+        let setup = if setup.is_empty() { "SELECT 1;" } else { setup };
+        assert_drop_fails(setup, &stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree AS FUNCTION 4 btequalimage(oid);",
+    )]);
+}

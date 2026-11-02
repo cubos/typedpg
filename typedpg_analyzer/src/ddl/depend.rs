@@ -1682,14 +1682,11 @@ fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
             if let Some(addr) = named_address_of(interp, object) {
                 super::opfamily_members::forget_owner(interp, addr);
             }
-            super::opfamily_members::forget_family(
-                interp,
-                &super::opfamily_members::FamilyKey {
-                    name: name.clone(),
-                    namespace: *namespace,
-                    method: method.clone(),
-                },
-            );
+            if let Some(family) =
+                super::opfamily_members::FamilyKey::of(interp, name, *namespace, method)
+            {
+                super::opfamily_members::forget_family(interp, &family);
+            }
             interp.pg_opfamily.retain(|f| {
                 !(&f.opfname == name && f.opfnamespace == *namespace && &f.opfmethod == method)
             });
