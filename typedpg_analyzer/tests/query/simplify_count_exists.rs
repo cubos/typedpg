@@ -314,12 +314,12 @@ fn issue_queries() {
                               total numeric NOT NULL, created_at timestamptz NOT NULL);
          CREATE INDEX ON orders (customer_id);",
     );
-    // `numeric > integer` casts the integer side first: not proved
-    // error-free, so the issue's own spelling is kept; a numeric literal
-    // compares without a cast.
-    assert_kept_in(
+    // `numeric > integer` casts the integer side to numeric first, a cast
+    // that can't fail; a numeric literal compares without one.
+    assert_rewritten_in(
         &db,
         "SELECT (SELECT count(*) FROM orders WHERE total > 10) > 0",
+        "SELECT EXISTS (SELECT 1 FROM orders WHERE total > 10) AS \"?column?\"",
     );
     assert_rewritten_in(
         &db,

@@ -31,9 +31,12 @@
 //!   `count(outer.col)`: not the plain aggregate of this level.
 //! - A `count` or comparison operator some user object could resolve to:
 //!   only `pg_catalog.count` and the built-in `int8`/`int4` comparisons.
-//! - A counting query anything in could raise an error — a cast, an
-//!   arithmetic operator, a function call, a comparison across types or
-//!   collations ([`super::proof::error_free_select`]). `EXISTS` doesn't
+//! - A counting query anything in could raise an error — arithmetic, a
+//!   narrowing or parsing cast, a function call outside the few that
+//!   can't fail, a comparison across collations
+//!   ([`super::proof::error_free_select`], [`super::proof::cannot_error`]:
+//!   `total > 10` over a numeric `total` casts `10` to numeric, which
+//!   can't fail, and is rewritten). `EXISTS` doesn't
 //!   just evaluate fewer rows: the planner may pull it up into a semi- or
 //!   anti-join and evaluate the subquery's conditions over rows the
 //!   correlated count never reached (`1 / s.z > 0` pushed down to every

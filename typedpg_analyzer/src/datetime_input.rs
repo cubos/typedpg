@@ -118,6 +118,22 @@ pub(crate) fn validate_interval(content: &str, typmod: i32) -> Result<(), String
     }
 }
 
+/// The `(months, days, microseconds)` `interval_in` reads `content` as,
+/// with no typmod, when it is a finite interval this decoder decides;
+/// `None` otherwise (infinite, invalid, or decided by server state). The
+/// decoding assumes `IntervalStyle = postgres`; `sql_standard` may give
+/// the later fields the leading field's sign instead, never another
+/// magnitude.
+pub(crate) fn finite_interval(content: &str) -> Option<(i32, i32, i64)> {
+    interval_in_range(content, INTERVAL_FULL_RANGE)
+        .ok()
+        .flatten()
+        .filter(|&(months, days, time)| {
+            (months, days, time) != (i32::MAX, i32::MAX, i64::MAX)
+                && (months, days, time) != (i32::MIN, i32::MIN, i64::MIN)
+        })
+}
+
 /// Whether `content`, read by `interval_in` under any typmod, may be
 /// `±infinity`: spelled so, or with the extreme field values PG 17+
 /// reserves for them (`2147483647 months 2147483647 days

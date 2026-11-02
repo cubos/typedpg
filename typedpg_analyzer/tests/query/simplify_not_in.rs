@@ -754,7 +754,7 @@ fn a_subquery_expression_that_can_fail_is_kept() {
         "SELECT a FROM u WHERE u.k = t.k AND 1/u.b > 0",
         "SELECT a FROM u WHERE u.status LIKE 'x%'",
         "SELECT a FROM u WHERE u.status::int > 0",
-        "SELECT a FROM u WHERE length(u.status) > 0",
+        "SELECT a FROM u WHERE substr(u.status, 2, u.b) > ''",
         "SELECT a FROM u ORDER BY 1/u.b LIMIT 1",
         "SELECT a FROM u GROUP BY a HAVING count(*) > 1",
         "SELECT a FROM u LIMIT $n",
@@ -950,10 +950,14 @@ fn a_sibling_that_can_fail_keeps_the_site() {
         simplified(&db, "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u)").1,
         vec![Rule::NotIn]
     );
-    // Not every harmless sibling is provable: `now()` is a function call.
-    assert_kept(
-        &db,
-        "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u) AND now() > '2000-01-01'",
+    // A sibling that reads the clock can't fail.
+    assert_eq!(
+        simplified(
+            &db,
+            "SELECT t.a FROM t WHERE a NOT IN (SELECT b FROM u) AND now() > '2000-01-01'"
+        )
+        .1,
+        vec![Rule::NotIn]
     );
 }
 
