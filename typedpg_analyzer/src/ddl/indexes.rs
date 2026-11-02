@@ -410,6 +410,60 @@ fn check_index_expression_types(
     Ok(())
 }
 
+/// The `attname`s of index `index`'s columns, key and INCLUDE ones: the
+/// names it was given ([`PgCatalog::index_attnames`]) or, for most
+/// indexes, ChooseIndexColumnNames (indexcmds.c) over the table's columns —
+/// each named after its table column, or "expr", with a numeric suffix
+/// appended until it is unique among the earlier ones.
+pub(crate) fn index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
+    if let Some(names) = db.index_attnames.get(&index) {
+        return names.clone();
+    }
+    let Some(index) = db.pg_index.get(&index) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for &key in &index.indkey {
+        let origname = db
+            .attributes_of(index.indrelid)
+            .iter()
+            .find(|a| key != 0 && a.attnum == key)
+            .map_or_else(|| "expr".to_owned(), |a| a.attname.clone());
+        let mut name = origname.clone();
+        let mut i = 1;
+        while names.contains(&name) {
+            let suffix = i.to_string();
+            let mut base = origname.clone();
+            // NAMEDATALEN - 1 bytes in all.
+            while base.len() + suffix.len() > 63 {
+                base.pop();
+            }
+            name = base + &suffix;
+            i += 1;
+        }
+        names.push(name);
+    }
+    names
+}
+
+/// Before a column of table `relid` is renamed, its indexes keep the names
+/// their columns have now: PG never renames an index column after its
+/// table's.
+pub(crate) fn freeze_index_attnames(db: &mut PgCatalog, relid: PgClassOid) {
+    let indexes: Vec<PgClassOid> = db
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == relid)
+        .map(|i| i.indexrelid)
+        .collect();
+    for index in indexes {
+        if !db.index_attnames.contains_key(&index) {
+            let names = index_attnames(db, index);
+            db.index_attnames.insert(index, names);
+        }
+    }
+}
+
 /// INDEX_MAX_KEYS (pg_config_manual.h): the most columns an index — key
 /// and INCLUDE ones — a partition key or a foreign key may have.
 pub(crate) const INDEX_MAX_KEYS: usize = 32;
@@ -1029,6 +1083,29 @@ pub(crate) fn rebuild_indexes_for_column_type(
         .cloned()
         .collect();
     indexes.sort_by_key(|i| i.indexrelid);
+    // Every index reading the column — as a key or INCLUDE column, in an
+    // expression or in its predicate — is rebuilt from pg_get_indexdef,
+    // which names the table's columns: its columns take their names anew.
+    for index in &indexes {
+        let reads_column = |ast: &SerializedAst| {
+            <typedpg_pg_query::protobuf::Node as Message>::decode(ast.ast.as_slice())
+                .ok()
+                .and_then(|n| n.node)
+                .is_some_and(|inner| {
+                    inner.nodes().into_iter().any(|(n, ..)| {
+                        matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
+                            if cr.fields.last().and_then(super::util::node_string)
+                                == Some(attr.attname.as_str()))
+                    })
+                })
+        };
+        if index.indkey.contains(&attnum)
+            || index.indexprs.iter().any(reads_column)
+            || index.indpred.as_ref().is_some_and(reads_column)
+        {
+            db.index_attnames.remove(&index.indexrelid);
+        }
+    }
     for mut index in indexes {
         let Some(mut keys) = db.index_keys.get(&index.indexrelid).cloned() else {
             continue;

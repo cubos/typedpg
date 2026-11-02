@@ -162,7 +162,14 @@ pub(crate) fn resolve_object(
             let system = crate::pg_catalog::SYSTEM_COLUMNS
                 .iter()
                 .any(|(n, ..)| n == column);
-            if interp.attribute_by_name(oid, column).is_none() && !system {
+            // An index's columns are its own (an index has no system
+            // columns).
+            let exists = if interp.pg_index.contains_key(&oid) {
+                super::indexes::index_attnames(interp, oid).contains(column)
+            } else {
+                interp.attribute_by_name(oid, column).is_some() || system
+            };
+            if !exists {
                 return Err(DdlError::Parse(format!(
                     "column \"{column}\" of relation \"{}\" does not exist",
                     rel.last().cloned().unwrap_or_default()
