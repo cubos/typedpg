@@ -1334,6 +1334,41 @@ pub(crate) fn drop_constraint(
         }
     }
 
+    // A foreign key relying on a partition's copy of the constraint's index
+    // depends on it too.
+    if is_pkey_or_unique {
+        let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
+        let index = nsoid.and_then(|ns| interp.class_by_qname.get(&(ns, conname.clone())).copied());
+        let copy_fks = index
+            .map(|i| super::partidx::fks_relying_on_copies(interp, i))
+            .unwrap_or_default();
+        if let Some(&(fk, copy)) = copy_fks.first() {
+            if !cascade {
+                let rel = |oid| {
+                    interp
+                        .pg_class
+                        .get(&oid)
+                        .map(|c| c.relname.clone())
+                        .unwrap_or_default()
+                };
+                let (fk_name, table) = interp
+                    .pg_constraint
+                    .get(&fk)
+                    .map(|c| (c.conname.clone(), rel(c.conrelid)))
+                    .unwrap_or_default();
+                return Err(DdlError::DependencyError(format!(
+                    "cannot drop constraint {conname} on table {} because other objects depend \
+                     on it (constraint {fk_name} on table {table} depends on index {})",
+                    rel(relid),
+                    rel(copy)
+                )));
+            }
+            for (fk, _) in copy_fks {
+                super::foreign_keys::drop_fk_cascaded(interp, fk);
+            }
+        }
+    }
+
     // What else depends on the constraint: a query relying on a primary key
     // for its GROUP BY (check_functional_grouping's constraintDeps).
     let addr = crate::ddl::depend::ObjectAddress::new(

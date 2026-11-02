@@ -499,6 +499,20 @@ pub(super) fn detach_partition(
     remove_inheritance(interp, part, parent, "partition")?;
     // DetachPartitionFinalize runs once the partition has left: the rows
     // its keys get no longer include it as a referenced partition.
+    //
+    // Known PG quirk, deliberately not mirrored: PG 18.6 can fail a DETACH
+    // with `cannot drop trigger RI_ConstraintTrigger_... because trigger
+    // ... requires it` when the foreign-key triggers it removes depend on
+    // one another (found by the #189/#192 fuzz review; it looks like a
+    // dependency bug in PG, not a rule worth copying). The analyzer
+    // detaches. The fuzz's repro:
+    //   CREATE TABLE t0 (a int PRIMARY KEY) PARTITION BY RANGE (a);
+    //   CREATE TABLE t1 PARTITION OF t0 FOR VALUES FROM (0) TO (50);
+    //   CREATE TABLE t2 (a int PRIMARY KEY) PARTITION BY RANGE (a);
+    //   CREATE TABLE t3 PARTITION OF t2 FOR VALUES FROM (50) TO (100);
+    //   ALTER TABLE t1 ADD FOREIGN KEY (a) REFERENCES t3 (a);
+    //   ALTER TABLE t0 ADD FOREIGN KEY (a) REFERENCES t3 (a);
+    //   ALTER TABLE t2 DETACH PARTITION t3;  -- PG fails here
     super::foreign_keys::detach_fks(interp, parent, part)?;
     super::partidx::detach_partition_indexes(interp, part);
     crate::ddl::triggers::drop_cloned_triggers(interp, part);

@@ -398,6 +398,19 @@ pub(super) fn add_foreign_key(
         }
     }
 
+    // addFkRecurseReferencing opens each partition of the referencing table
+    // to clone the key into it, and CheckTableNotInUse refuses the one the
+    // key references, already open as the referenced table.
+    if target != relid
+        && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned)
+        && super::inherit::all_inheritors(interp, relid).contains(&target)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot ALTER TABLE \"{}\" because it is being used by active queries in this \
+             session",
+            relname_of(interp, target)
+        )));
+    }
     let oid = emit_constraint_with_backing_index(
         interp,
         relid,
@@ -727,9 +740,19 @@ fn attach_or_clone(
         // partitions of the table it references go (the parent's now
         // stand for them); its partitions' clones stay.
         drop_derived_rows_on(interp, candidate.oid, part);
+        // tryAttachPartitionForeignKey: a NOT VALID key adopted by a valid
+        // one is validated (its rows are checked).
+        let validate = parent.convalidated && !candidate.convalidated;
         if let Some(row) = interp.pg_constraint.get_mut(&candidate.oid) {
             row.conislocal = false;
             row.coninhcount = 1;
+            if validate {
+                row.convalidated = true;
+            }
+        }
+        if validate {
+            interp.fk_validity_unproven.remove(&candidate.oid);
+            for_each_fk_clone(interp, candidate.oid, &|c| c.convalidated = true);
         }
         let mut details = details.or(parent_details.clone()).unwrap_or(FkDetails {
             upd_action: "a".into(),

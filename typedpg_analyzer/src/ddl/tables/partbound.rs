@@ -782,16 +782,24 @@ fn check_new_bound(
                     "empty range bound specified for partition \"{part_name}\""
                 )));
             }
-            for (other, b) in &siblings {
-                if let Bound::Range {
+            // check_new_partition_bound reports the partition its bound
+            // search lands on: the one holding the new lower bound, else
+            // the first after it — of those overlapping, the lowest.
+            let overlapping = siblings.iter().filter_map(|(other, b)| match b {
+                Bound::Range {
                     lower: their_lower,
                     upper: their_upper,
-                } = b
-                    && cmp_range(lower, their_upper) == Some(std::cmp::Ordering::Less)
-                    && cmp_range(their_lower, upper) == Some(std::cmp::Ordering::Less)
+                } if cmp_range(lower, their_upper) == Some(std::cmp::Ordering::Less)
+                    && cmp_range(their_lower, upper) == Some(std::cmp::Ordering::Less) =>
                 {
-                    return Err(overlap(*other));
+                    Some((*other, their_lower))
                 }
+                _ => None,
+            });
+            if let Some((other, _)) = overlapping
+                .min_by(|(_, a), (_, b)| cmp_range(a, b).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                return Err(overlap(other));
             }
         }
         Bound::Hash { modulus, remainder } => {
