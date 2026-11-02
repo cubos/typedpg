@@ -1043,11 +1043,11 @@ fn the_e2e_queries_are_rewritten() {
     )
     .unwrap();
     for sql in [
-        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+        "SELECT u.id FROM users u WHERE (u.id = $poster OR u.id = $lurker) \
          AND u.id NOT IN (SELECT user_id FROM posts) ORDER BY u.id",
-        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+        "SELECT u.id FROM users u WHERE (u.id = $poster OR u.id = $lurker) \
          AND u.id NOT IN (SELECT DISTINCT user_id FROM posts)",
-        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+        "SELECT u.id FROM users u WHERE (u.id = $poster OR u.id = $lurker) \
          AND (u.id, u.name) NOT IN (SELECT p.user_id, u2.name FROM posts p \
          JOIN users u2 ON u2.id = p.user_id) ORDER BY u.id",
     ] {
