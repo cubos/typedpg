@@ -832,30 +832,24 @@ pub(super) fn detach_fks(
     // A key now standalone that references a partitioned table gets its
     // own rows for the referenced partitions (addFkRecurseReferenced) — the
     // parent's stay with the parent; its own partitions' keys still derive
-    // from it, and need none. Not a key referencing the table the
-    // partition leaves (a self-reference of the parent): PG 18 adds no rows
-    // for it.
+    // from it, and need none. A self-reference of the parent included:
+    // the partition has left, so the rows are for the others.
     for oid in inherited {
-        let Some((name, confrelid)) = interp
-            .pg_constraint
-            .get(&oid)
-            .map(|c| (c.conname.clone(), c.confrelid))
-        else {
+        let Some(name) = interp.pg_constraint.get(&oid).map(|c| c.conname.clone()) else {
             continue;
         };
-        if confrelid == Some(parent) {
-            continue;
-        }
         recurse_referenced(interp, oid, &name)?;
     }
-    // Then the parent's keys' rows for the partition, as a referenced
-    // one, go (after the new rows are named: their names stay taken
-    // until then).
+    // Then every derived row referencing the partition goes, whatever its
+    // parent references (DetachPartitionFinalize drops each row with
+    // `confrelid` the partition and a `conparentid`), with those derived
+    // from it — after the new rows are named: their names stay taken
+    // until then.
     let referenced: Vec<PgConstraintOid> = interp
         .pg_constraint
         .values()
         .filter(|c| c.contype == ConType::ForeignKey && c.confrelid == Some(part))
-        .filter(|c| fk_parent(interp, c.oid).is_some_and(|p| p.confrelid == Some(parent)))
+        .filter(|c| fk_parent(interp, c.oid).is_some())
         .map(|c| c.oid)
         .collect();
     for oid in referenced {

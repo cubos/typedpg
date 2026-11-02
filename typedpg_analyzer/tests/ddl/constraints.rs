@@ -1776,3 +1776,63 @@ fn partition_foreign_key_rows_follow_attach_and_detach() {
         "{err}"
     );
 }
+
+/// Detaching a partition of a self-referencing table gives its key rows
+/// for the partitions that remain; and every derived row referencing a
+/// detached partition goes, whatever its parent references — as PG 18.6
+/// does.
+#[test]
+fn detach_rows_for_remaining_partitions_and_none_for_the_detached() {
+    use typedpg_analyzer::ConType;
+    let rows = |db: &PgCatalog, table: &str| -> Vec<(String, String, bool, i16)> {
+        let mut rows: Vec<_> = db
+            .constraints_of_table(table)
+            .into_iter()
+            .filter(|c| c.contype == ConType::ForeignKey)
+            .map(|c| {
+                let target = c
+                    .confrelid
+                    .and_then(|r| db.pg_class().get(&r))
+                    .map(|r| r.relname.clone())
+                    .unwrap_or_default();
+                (c.conname, target, c.conislocal, c.coninhcount)
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let row = |name: &str, target: &str, local: bool, inh: i16| {
+        (name.to_owned(), target.to_owned(), local, inh)
+    };
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE sa (id int UNIQUE, pid int) PARTITION BY RANGE (id);
+         CREATE TABLE sa1 (id int UNIQUE, pid int);
+         CREATE TABLE sa2 (id int UNIQUE, pid int);
+         ALTER TABLE sa ATTACH PARTITION sa1 FOR VALUES FROM (0) TO (100);
+         ALTER TABLE sa ATTACH PARTITION sa2 FOR VALUES FROM (100) TO (200);
+         ALTER TABLE sa ADD CONSTRAINT g1 FOREIGN KEY (pid) REFERENCES sa (id);
+         ALTER TABLE sa DETACH PARTITION sa2;
+         -- A referenced partition detached: the clone of a key that
+         -- references it directly goes too.
+         CREATE TABLE r (id int PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TABLE r2 (id int PRIMARY KEY);
+         CREATE TABLE tb (a int) PARTITION BY RANGE (a);
+         CREATE TABLE t3 (a int);
+         ALTER TABLE tb ADD CONSTRAINT f1 FOREIGN KEY (a) REFERENCES r2 (id);
+         ALTER TABLE tb ATTACH PARTITION t3 FOR VALUES FROM (200) TO (300);
+         ALTER TABLE r ATTACH PARTITION r2 FOR VALUES FROM (100) TO (200);
+         ALTER TABLE r DETACH PARTITION r2;",
+    )]);
+    assert_eq!(
+        rows(&db, "sa"),
+        vec![row("g1", "sa", true, 0), row("g1_1", "sa1", false, 1)]
+    );
+    assert_eq!(rows(&db, "sa1"), vec![row("g1", "sa", false, 1)]);
+    assert_eq!(
+        rows(&db, "sa2"),
+        vec![row("g1", "sa", true, 0), row("g1_3", "sa1", false, 1)]
+    );
+    assert_eq!(rows(&db, "tb"), vec![row("f1", "r2", true, 0)]);
+    assert_eq!(rows(&db, "t3"), Vec::new());
+}
