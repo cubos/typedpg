@@ -503,3 +503,130 @@ fn a_created_language_depends_on_its_handler_and_holds_its_routines() {
     ]);
     assert!(db.find_functions(None, "mf").is_empty());
 }
+
+// ── The contrib extensions PostgreSQL 18 ships ──────────────────────────────
+
+/// Every extension the `postgres:18` image ships a control file for
+/// (`/usr/share/postgresql/18/extension/*.control`), but `plpgsql`, which
+/// initdb already installs.
+const PG18_CONTRIB: &[&str] = &[
+    "amcheck",
+    "autoinc",
+    "bloom",
+    "btree_gin",
+    "btree_gist",
+    "citext",
+    "cube",
+    "dblink",
+    "dict_int",
+    "dict_xsyn",
+    "earthdistance",
+    "file_fdw",
+    "fuzzystrmatch",
+    "hstore",
+    "insert_username",
+    "intagg",
+    "intarray",
+    "isn",
+    "lo",
+    "ltree",
+    "moddatetime",
+    "pageinspect",
+    "pg_buffercache",
+    "pg_freespacemap",
+    "pg_logicalinspect",
+    "pg_prewarm",
+    "pg_stat_statements",
+    "pg_surgery",
+    "pg_trgm",
+    "pg_visibility",
+    "pg_walinspect",
+    "pgcrypto",
+    "pgrowlocks",
+    "pgstattuple",
+    "postgres_fdw",
+    "refint",
+    "seg",
+    "sslinfo",
+    "tablefunc",
+    "tcn",
+    "tsm_system_rows",
+    "tsm_system_time",
+    "unaccent",
+    "uuid-ossp",
+    "xml2",
+];
+
+#[test]
+fn every_pg18_contrib_extension_installs() {
+    // PG 18 installs each of these at its default version (CASCADE brings
+    // earthdistance's cube); the oracle runs every statement on the server.
+    let failures: Vec<String> = PG18_CONTRIB
+        .iter()
+        .filter_map(|name| {
+            let sql = format!("CREATE EXTENSION \"{name}\" CASCADE;");
+            try_apply(&[("0001.sql", &sql)])
+                .err()
+                .map(|e| format!("{name}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn create_extension_postgres_fdw() {
+    // PG 18's postgres_fdw stops at 1.2; 1.3's script (`ALTER FOREIGN DATA
+    // WRAPPER ... CONNECTION`) is PostgreSQL 19 grammar.
+    let snap = build(&[("0001.sql", "CREATE EXTENSION postgres_fdw;")]);
+    assert!(!snap.find_functions(None, "postgres_fdw_handler").is_empty());
+    // From the 1.1 -> 1.2 upgrade.
+    assert!(
+        !snap
+            .find_functions(None, "postgres_fdw_get_connections")
+            .is_empty()
+    );
+    assert!(
+        snap.find_functions(None, "postgres_fdw_connection")
+            .is_empty()
+    );
+}
+
+#[test]
+fn postgresql_19_extension_versions_are_not_available() {
+    // Versions only PostgreSQL 19 ships: PG 18 has neither their scripts
+    // nor an update path to them.
+    for (sql, message) in [
+        (
+            "CREATE EXTENSION postgres_fdw VERSION '1.3';",
+            "extension \"postgres_fdw\" has no installation script nor update path for version \"1.3\"",
+        ),
+        (
+            "CREATE EXTENSION btree_gist VERSION '1.9';",
+            "extension \"btree_gist\" has no installation script nor update path for version \"1.9\"",
+        ),
+        (
+            "CREATE EXTENSION pg_stat_statements VERSION '1.13';",
+            "extension \"pg_stat_statements\" has no installation script nor update path for version \"1.13\"",
+        ),
+        (
+            "CREATE EXTENSION pg_stash_advice;",
+            "extension \"pg_stash_advice\" is not available",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
+fn btree_gist_installs_through_its_upgrade_chain() {
+    // PG 18 installs btree_gist 1.2 and upgrades it to 1.8; an older
+    // version stops before the later scripts' objects.
+    let snap = build(&[("0001.sql", "CREATE EXTENSION btree_gist;")]);
+    // From the 1.6 -> 1.7 upgrade.
+    assert!(!snap.find_functions(None, "gbt_bool_union").is_empty());
+    // From the 1.7 -> 1.8 upgrade.
+    assert!(!snap.find_functions(None, "gbt_bool_sortsupport").is_empty());
+    let snap = build(&[("0001.sql", "CREATE EXTENSION btree_gist VERSION '1.6';")]);
+    assert!(snap.find_functions(None, "gbt_bool_union").is_empty());
+}
