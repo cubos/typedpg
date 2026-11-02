@@ -485,10 +485,10 @@ pub struct PgCatalog {
         std::sync::Arc<std::sync::OnceLock<std::sync::Mutex<crate::pg_sanity::PgSanityServer>>>,
     >,
 
-    /// Set once any `CREATE/ALTER/DROP EXTENSION` statement has touched the
-    /// catalog. Our embedded extension SQL diverges from what PG sanity ships
-    /// natively, so once an extension is in play the sanity check skips
-    /// every later mirror call to avoid spurious panics.
+    /// Set once a migration installs an extension the analyzer bundles but
+    /// the mirror's server doesn't ship (pgvector, the PL transforms): PG
+    /// rejected that migration, so the sanity check skips every later
+    /// mirror call, whose schema it no longer has.
     #[cfg(feature = "pg_sanity")]
     pg_sanity_tainted: bool,
 
@@ -989,16 +989,12 @@ impl PgCatalog {
         };
         #[cfg(feature = "pg_sanity")]
         {
-            if sql_touches_extension(sql) {
-                // PG sanity doesn't ship the same extension catalog as real PG
-                // (no uuid-ossp, etc.) — and even ones it does ship would
-                // need explicit `--extensions=...` wiring. Once an extension
-                // is in play, downstream tables/queries reference types
-                // PG sanity doesn't know about, so we taint the catalog and
-                // skip every later mirror call.
-                self.pg_sanity_tainted = true;
-            } else if !self.pg_sanity_tainted && !self.pg_sanity_skip {
-                self.run_pg_sanity_apply_check(sql, &result);
+            if !self.pg_sanity_tainted && !self.pg_sanity_skip {
+                if sql_touches_extension(sql) {
+                    self.run_pg_sanity_extension_apply_check(sql, &result);
+                } else {
+                    self.run_pg_sanity_apply_check(sql, &result);
+                }
             }
         }
         result.map_err(|error| crate::ddl::MigrationFailure { error, location })
@@ -1462,8 +1458,8 @@ impl PgCatalog {
 // ─── PG sanity sanity check (feature-gated) ───────────────────────────────────
 
 /// Quick check: does `sql` contain any `CREATE/ALTER/DROP EXTENSION`
-/// statement? Used to skip the PG sanity mirror when the analyzer's embedded
-/// extension support diverges from what PG sanity ships natively. We parse via
+/// statement? Such a migration may install an extension the mirror's server
+/// doesn't ship, which then taints the catalog. We parse via
 /// `typedpg_pg_query` (cheap — `apply_sql_to` parses anyway) and inspect the AST so
 /// a column or identifier named `extension` doesn't cause a false skip.
 #[cfg(feature = "pg_sanity")]
@@ -1507,6 +1503,17 @@ impl PgCatalog {
 
     fn run_pg_sanity_apply_check(&self, sql: &str, result: &Result<(), DdlError>) {
         self.with_pg_sanity::<()>(|server| server.assert_apply_matches(sql, result));
+    }
+
+    /// [`Self::run_pg_sanity_apply_check`] for a migration that touches an
+    /// extension: one the server doesn't ship taints the catalog, and every
+    /// later mirror call is skipped.
+    fn run_pg_sanity_extension_apply_check(&mut self, sql: &str, result: &Result<(), DdlError>) {
+        match self.with_pg_sanity(|server| server.compare_extension_apply_matches(sql, result)) {
+            Some(Some(Some(divergence))) => panic!("{}", divergence.message),
+            Some(None) => self.pg_sanity_tainted = true,
+            Some(Some(None)) | None => {}
+        }
     }
 
     fn run_pg_sanity_analyze_check(
@@ -1586,16 +1593,23 @@ impl PgCatalog {
         sql: &str,
     ) -> (Result<(), DdlError>, Option<crate::pg_sanity::Divergence>) {
         let result = crate::ddl::apply_migration(self, sql).map_err(|failure| failure.error);
-        if sql_touches_extension(sql) {
-            self.pg_sanity_tainted = true;
-            return (result, None);
-        }
         if self.pg_sanity_tainted || self.pg_sanity_skip {
             return (result, None);
         }
-        let divergence = self
-            .with_pg_sanity(|server| server.compare_apply_matches(sql, &result))
-            .flatten();
+        let divergence = if sql_touches_extension(sql) {
+            match self.with_pg_sanity(|server| server.compare_extension_apply_matches(sql, &result))
+            {
+                Some(Some(divergence)) => divergence,
+                Some(None) => {
+                    self.pg_sanity_tainted = true;
+                    None
+                }
+                None => None,
+            }
+        } else {
+            self.with_pg_sanity(|server| server.compare_apply_matches(sql, &result))
+                .flatten()
+        };
         (result, divergence)
     }
 }
