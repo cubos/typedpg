@@ -74,6 +74,39 @@ pub fn lookup_relation(
     }
 }
 
+/// `table_open`'s check (validate_relation_kind, table.c): an index, a
+/// partitioned index or a composite type can't be opened as a table —
+/// `cannot open relation "i"`, SQLSTATE 42809. Every DDL path that opens
+/// a relation named as a table (a parent, a referenced table, a partition,
+/// the relation of a trigger, rule, policy or constraint) fails so before
+/// any check of its own. `name` is the relation's name as written.
+pub(crate) fn table_open_check(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    name: &str,
+) -> Result<(), DdlError> {
+    use crate::pg_catalog::RelKind;
+    match snapshot.pg_class.get(&relid).map(|c| c.relkind) {
+        Some(kind @ (RelKind::Index | RelKind::PartitionedIndex | RelKind::CompositeType)) => {
+            Err(DdlError::Parse(format!(
+                "cannot open relation \"{name}\" (This operation is not supported for {}.)",
+                kind.plural()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`lookup_relation`], then [`table_open_check`]: `table_openrv`.
+pub(crate) fn lookup_table(
+    snapshot: &PgCatalog,
+    rv: &RangeVar,
+) -> Result<(PgNamespaceOid, crate::oid::PgClassOid), DdlError> {
+    let (nsoid, relid) = lookup_relation(snapshot, rv)?;
+    table_open_check(snapshot, relid, &rv.relname)?;
+    Ok((nsoid, relid))
+}
+
 /// Extract (schema, name) of an *existing* relation or type from a list of
 /// name nodes (e.g. `DROP TABLE` / `DROP TYPE` objects). Handles both
 /// `["name"]` and `["schema", "name"]`; an unqualified name is looked up

@@ -7733,3 +7733,158 @@ fn statements_a_migration_only_stores_are_not_planned() {
          CREATE TABLE c AS SELECT 40000::int2 AS a WITH NO DATA;",
     )]);
 }
+
+#[test]
+fn an_index_or_composite_type_named_as_a_table_cannot_be_opened() {
+    // table_open / table_openrv (validate_relation_kind) refuse an index,
+    // a partitioned index or a composite type before the command checks
+    // the relation itself: `cannot open relation "i"`, SQLSTATE 42809.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int PRIMARY KEY, b int);
+         CREATE INDEX t_b ON t (b);
+         CREATE TABLE u (x int);
+         CREATE TABLE pt (a int PRIMARY KEY) PARTITION BY RANGE (a);
+         CREATE TYPE ct AS (a int);
+         CREATE VIEW v AS SELECT 1 AS x;
+         CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+    )]);
+    let index = |name: &str| {
+        format!("cannot open relation \"{name}\" (This operation is not supported for indexes.)")
+    };
+    let partitioned = "cannot open relation \"pt_pkey\" (This operation is not supported for \
+                       partitioned indexes.)"
+        .to_owned();
+    let composite = "cannot open relation \"ct\" (This operation is not supported for composite \
+                     types.)"
+        .to_owned();
+    for (sql, message) in [
+        ("ALTER TABLE u INHERIT t_b;", index("t_b")),
+        ("ALTER TABLE u INHERIT pt_pkey;", partitioned.clone()),
+        ("ALTER TABLE u INHERIT ct;", composite.clone()),
+        (
+            "ALTER TABLE u INHERIT pg_class_oid_index;",
+            index("pg_class_oid_index"),
+        ),
+        ("ALTER TABLE u NO INHERIT t_b;", index("t_b")),
+        ("ALTER TABLE u NO INHERIT ct;", composite.clone()),
+        ("CREATE TABLE r () INHERITS (t_b);", index("t_b")),
+        ("CREATE TABLE r () INHERITS (u, ct);", composite.clone()),
+        (
+            "CREATE TABLE r () INHERITS (pg_class_oid_index);",
+            index("pg_class_oid_index"),
+        ),
+        // DefineRelation rejects a repeated parent before opening any.
+        (
+            "CREATE TABLE r () INHERITS (t_b, t_b);",
+            "relation \"t_b\" would be inherited from more than once".to_owned(),
+        ),
+        (
+            "CREATE TABLE r PARTITION OF t_b FOR VALUES IN (1);",
+            index("t_b"),
+        ),
+        (
+            "CREATE TABLE r PARTITION OF pt_pkey FOR VALUES IN (1);",
+            partitioned.clone(),
+        ),
+        ("CREATE TABLE r (x int REFERENCES t_b);", index("t_b")),
+        ("CREATE TABLE r (x int REFERENCES ct);", composite.clone()),
+        (
+            "CREATE TABLE r (x oid REFERENCES pg_class_oid_index);",
+            index("pg_class_oid_index"),
+        ),
+        (
+            "ALTER TABLE u ADD FOREIGN KEY (x) REFERENCES pt_pkey;",
+            partitioned.clone(),
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION t_b FOR VALUES FROM (1) TO (2);",
+            index("t_b"),
+        ),
+        (
+            "ALTER TABLE pt ATTACH PARTITION ct FOR VALUES FROM (1) TO (2);",
+            composite.clone(),
+        ),
+        ("ALTER TABLE pt DETACH PARTITION t_b;", index("t_b")),
+        (
+            "ALTER TABLE pt DETACH PARTITION t_b FINALIZE;",
+            index("t_b"),
+        ),
+        ("ALTER TABLE pt DETACH PARTITION ct;", composite.clone()),
+        (
+            "CREATE TRIGGER tg BEFORE INSERT ON t_b FOR EACH ROW EXECUTE FUNCTION trf();",
+            index("t_b"),
+        ),
+        (
+            "CREATE TRIGGER tg BEFORE INSERT ON ct FOR EACH ROW EXECUTE FUNCTION trf();",
+            composite.clone(),
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t_b DO NOTHING;",
+            index("t_b"),
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO ct DO NOTHING;",
+            composite.clone(),
+        ),
+        ("CREATE INDEX ON t_b (b);", index("t_b")),
+        ("CREATE INDEX ON ct (a);", composite.clone()),
+        ("CREATE PUBLICATION pub FOR TABLE t_b;", index("t_b")),
+        ("CREATE PUBLICATION pub FOR TABLE ct;", composite.clone()),
+        // get_object_address_relobject: even under IF EXISTS.
+        ("DROP TRIGGER tg ON t_b;", index("t_b")),
+        ("DROP TRIGGER IF EXISTS tg ON t_b;", index("t_b")),
+        ("DROP TRIGGER tg ON ct;", composite.clone()),
+        ("DROP POLICY IF EXISTS p ON t_b;", index("t_b")),
+        ("DROP RULE IF EXISTS r ON t_b;", index("t_b")),
+        ("DROP RULE r ON ct;", composite.clone()),
+        ("COMMENT ON TRIGGER tg ON t_b IS 'x';", index("t_b")),
+        ("COMMENT ON POLICY p ON t_b IS 'x';", index("t_b")),
+        ("COMMENT ON RULE r ON t_b IS 'x';", index("t_b")),
+        ("COMMENT ON CONSTRAINT c ON t_b IS 'x';", index("t_b")),
+        ("COMMENT ON CONSTRAINT c ON ct IS 'x';", composite.clone()),
+        // Other lookups word it their own way.
+        (
+            "ALTER TABLE t_b INHERIT u;",
+            "ALTER action INHERIT cannot be performed on relation \"t_b\"".to_owned(),
+        ),
+        (
+            "ALTER TABLE u INHERIT v;",
+            "ALTER action INHERIT cannot be performed on relation \"v\"".to_owned(),
+        ),
+        (
+            "CREATE TABLE r (x int REFERENCES v);",
+            "referenced relation \"v\" is not a table".to_owned(),
+        ),
+        (
+            "ALTER TRIGGER tg ON t_b RENAME TO tg2;",
+            "relation \"t_b\" cannot have triggers".to_owned(),
+        ),
+        (
+            "ALTER POLICY p ON t_b RENAME TO p2;",
+            "\"t_b\" is not a table".to_owned(),
+        ),
+        (
+            "ALTER POLICY p ON ct RENAME TO p2;",
+            "\"ct\" is not a table".to_owned(),
+        ),
+        (
+            "ALTER POLICY p ON pg_class RENAME TO p2;",
+            "permission denied: \"pg_class\" is a system catalog".to_owned(),
+        ),
+        (
+            "ALTER POLICY p ON u RENAME TO p2;",
+            "policy \"p\" for table \"u\" does not exist".to_owned(),
+        ),
+        (
+            "SELECT 1; LOCK TABLE t_b;",
+            "cannot lock relation \"t_b\"".to_owned(),
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(&message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}

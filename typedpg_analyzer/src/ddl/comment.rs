@@ -175,6 +175,9 @@ pub(crate) fn resolve_object(
                 return Ok(());
             };
             let oid = relation(rel)?;
+            // get_object_address_relobject: table_openrv.
+            let relname = rel.last().cloned().unwrap_or_default();
+            super::util::table_open_check(interp, oid, &relname)?;
             if !interp
                 .pg_constraint
                 .values()
@@ -255,6 +258,8 @@ pub(crate) fn resolve_object(
             };
             let oid = relation(rel)?;
             let relname = rel.last().cloned().unwrap_or_default();
+            // get_object_address_relobject: table_openrv.
+            super::util::table_open_check(interp, oid, &relname)?;
             let (exists, what, of) = match objtype {
                 ObjectType::ObjectTrigger => (
                     interp

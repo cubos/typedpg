@@ -240,6 +240,9 @@ pub(super) fn add_foreign_key(
                  \"{conname}\")"
             ))
         })?;
+    // ATAddForeignKeyConstraint opens the referenced relation with
+    // table_openrv.
+    crate::ddl::util::table_open_check(interp, target, &pkrv.relname)?;
     if !recurse && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned) {
         return Err(DdlError::Parse(format!(
             "cannot use ONLY for foreign key on partitioned table \"{relname}\" referencing \

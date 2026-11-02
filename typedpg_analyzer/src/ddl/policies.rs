@@ -156,6 +156,9 @@ pub(crate) fn drop_policy(
         Err(_) if missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
+    // get_object_address_relobject opens the relation with
+    // table_openrv_extended: IF EXISTS skips a missing one, not an index.
+    super::util::table_open_check(interp, relid, &rv.relname)?;
     let policies = interp.policies.entry(relid).or_default();
     let dropped = policies.iter().find(|p| p.name == *name).map(|p| p.oid);
     policies.retain(|p| p.name != *name);
@@ -179,11 +182,8 @@ pub(crate) fn rename_policy(
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let relid = match super::util::lookup_relation(interp, rv) {
-        Ok((_, oid)) => oid,
-        Err(_) if stmt.missing_ok => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    // rename_policy looks the table up with RangeVarCallbackForPolicy.
+    let relid = policy_table(interp, rv)?;
     let policies = interp.policies.entry(relid).or_default();
     if policies.iter().any(|p| p.name == stmt.newname) {
         return Err(DdlError::DuplicateObject(format!(
