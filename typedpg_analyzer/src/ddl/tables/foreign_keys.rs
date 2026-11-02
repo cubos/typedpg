@@ -688,6 +688,13 @@ fn attach_or_clone(
     let Some(parent) = interp.pg_constraint.get(&parent_con).cloned() else {
         return Ok(());
     };
+    // addFkRecurseReferencing / CloneFkReferencing: a foreign partition
+    // can't have the key.
+    if interp.pg_class.get(&part).map(|c| c.relkind) == Some(RelKind::ForeignTable) {
+        return Err(DdlError::UnsupportedDdl(
+            "foreign key constraints are not supported on foreign tables".into(),
+        ));
+    }
     let parent_details = interp.fk_details.get(&parent_con).cloned();
     // The key columns, by name in the partition.
     let parent_attrs = interp.attributes_of(parent.conrelid).to_vec();

@@ -450,6 +450,19 @@ pub(super) fn attach_partition(
             }
         }
     }
+    // AttachPartitionEnsureIndexes, first: a foreign table takes no index,
+    // so none of the parent's may be unique.
+    if attach_kind == Some(RelKind::ForeignTable)
+        && interp
+            .pg_index
+            .values()
+            .any(|i| i.indrelid == parent && i.indisunique)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot attach foreign table \"{attach_name}\" as partition of partitioned table \
+             \"{parent_name}\" (Partitioned table \"{parent_name}\" contains unique indexes.)"
+        )));
+    }
     super::foreign_keys::clone_parent_fks(interp, parent, attach)?;
     // AttachPartitionEnsureIndexes.
     super::partidx::clone_parent_indexes(interp, parent, attach)?;

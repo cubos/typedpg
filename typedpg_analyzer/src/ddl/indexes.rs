@@ -33,6 +33,22 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     // catalog. Then table_open: an index or a composite type can't be
     // opened as a table.
     super::util::check_not_system_class(db, indrelid)?;
+    // ProcessUtilitySlow, before DefineIndex: a unique index on a
+    // partitioned table (without ONLY) can't reach a foreign table
+    // anywhere below it.
+    if (stmt.unique || stmt.primary)
+        && rv.inh
+        && db.pg_class.get(&indrelid).map(|c| c.relkind) == Some(RelKind::Partitioned)
+        && super::tables::inherit::all_inheritors(db, indrelid)
+            .iter()
+            .any(|&p| db.pg_class.get(&p).map(|c| c.relkind) == Some(RelKind::ForeignTable))
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot create unique index on partitioned table \"{0}\" (Table \"{0}\" contains \
+             partitions that are foreign tables.)",
+            rv.relname
+        )));
+    }
     super::util::table_open_check(db, indrelid, &rv.relname)?;
     let table_name = rv.relname.clone();
     if let Some(class) = db.pg_class.get(&indrelid) {

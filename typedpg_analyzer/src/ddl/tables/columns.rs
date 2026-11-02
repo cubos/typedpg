@@ -969,11 +969,6 @@ fn add_column_to(
         return Err(DdlError::Parse("cannot add column to a partition".into()));
     }
     let children = inherit::children_of(interp, relid);
-    if !rec.recurse && !children.is_empty() {
-        return Err(DdlError::Parse(
-            "column must be added to child tables too".into(),
-        ));
-    }
 
     let cx = ColumnContext {
         partitioned: interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned),
@@ -1031,6 +1026,14 @@ fn add_column_to(
                 check_foreign_table_constraint(c)?;
             }
         }
+    }
+    // ATExecAddColumn, once the name is free (or IF NOT EXISTS skipped the
+    // column) and the definition transformed: ONLY may not leave the
+    // children without it.
+    if !rec.recurse && !children.is_empty() {
+        return Err(DdlError::Parse(
+            "column must be added to child tables too".into(),
+        ));
     }
 
     // ATExecAddColumn: regular inheritance children don't inherit an

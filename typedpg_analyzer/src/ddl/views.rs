@@ -95,8 +95,9 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     if check_option && let Some(query) = stmt.query.as_deref() {
         check_option_allowed(interp, query)?;
     }
+    // DefineView takes `toast.` options, which nothing checks.
     super::reloptions::check_reloptions(
-        &stmt.options,
+        &super::reloptions::without_toast_options(&stmt.options),
         super::reloptions::RelOptKind::View,
         false,
         false,

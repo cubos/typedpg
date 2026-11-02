@@ -4715,3 +4715,318 @@ fn reindex_options_are_read_as_exec_reindex_reads_them() {
         );
     }
 }
+
+/// The relations [`FOREIGN_PARTITION_CASES`] run over.
+const FOREIGN_PARTITION_SETUP: &str = "
+    CREATE FOREIGN DATA WRAPPER w; CREATE SERVER srv FOREIGN DATA WRAPPER w;
+    CREATE TABLE pp (a int NOT NULL, b int) PARTITION BY LIST (a);
+    CREATE FOREIGN TABLE ppf PARTITION OF pp FOR VALUES IN (1) SERVER srv;
+    CREATE TABLE pk (a int PRIMARY KEY, b int) PARTITION BY LIST (a);
+    CREATE TABLE ref (a int PRIMARY KEY);
+    CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a, NULL::int AS b, 2 AS c;
+    CREATE UNIQUE INDEX mv_b ON mv (b);
+    CREATE UNIQUE INDEX mv_a ON mv (a);
+    CREATE TABLE t (a int, b int);
+    CREATE INDEX ti ON t (a);
+    CREATE VIEW v AS SELECT 1 AS a;
+    CREATE TABLE par (a int, b int);
+    CREATE TABLE chi () INHERITS (par);
+    CREATE TEMP TABLE tmp (a int) PARTITION BY LIST (a);
+    CREATE TABLE lp (a int) PARTITION BY LIST (a);
+    CREATE TABLE lp1 PARTITION OF lp FOR VALUES IN (1);";
+
+#[test]
+fn foreign_partitions_toast_options_and_relation_checks_follow_pg() {
+    // A foreign partition takes none of its parent's indexes (so a unique
+    // one can't be created, attached or inherited) nor foreign keys;
+    // `toast.` options are taken unchecked by a relation without a TOAST
+    // table, checked as a TOAST table's on CREATE TABLE ... PARTITION BY;
+    // a materialized view's columns are nullable for REPLICA IDENTITY;
+    // ONLY ... ADD COLUMN IF NOT EXISTS skips an existing column before
+    // the children are looked at; `pg_temp` is no schema for REINDEX
+    // SCHEMA; NOTHING is no SELECT for a rule on SELECT. What PG runs is
+    // tried in a transaction rolled back; what it refuses changes nothing.
+    let mut db = build_db(&[("0001.sql", FOREIGN_PARTITION_SETUP)]);
+    for &(sql, expected) in FOREIGN_PARTITION_CASES {
+        match expected {
+            None => {
+                if let Err(err) = db.apply_sql(&format!("BEGIN; {sql}; ROLLBACK;")) {
+                    panic!("{sql}\n  rejected: {err}");
+                }
+            }
+            Some(message) => {
+                let err = db.apply_sql(&format!("{sql};")).expect_err(sql);
+                assert!(
+                    err.to_string().starts_with(message),
+                    "{sql}\n  expected: {message}\n       got: {err}"
+                );
+            }
+        }
+    }
+}
+
+/// `(statement, PG's error)` — `None` when PG runs it — over
+/// [`FOREIGN_PARTITION_SETUP`], each checked on PostgreSQL 18.6.
+const FOREIGN_PARTITION_CASES: &[(&str, Option<&str>)] = &[
+    (
+        "alter table pp add primary key (a)",
+        Some(
+            "cannot create unique index on partitioned table \"pp\" (Table \"pp\" contains partitions that are foreign tables.",
+        ),
+    ),
+    (
+        "alter table pp add unique (a)",
+        Some(
+            "cannot create unique index on partitioned table \"pp\" (Table \"pp\" contains partitions that are foreign tables.",
+        ),
+    ),
+    (
+        "alter table pp add constraint u unique (a, b)",
+        Some(
+            "cannot create unique index on partitioned table \"pp\" (Table \"pp\" contains partitions that are foreign tables.",
+        ),
+    ),
+    (
+        "alter table pp add foreign key (b) references ref (a)",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    ("alter table pp add constraint x exclude (a with =)", None),
+    ("alter table only pp add primary key (a)", None),
+    (
+        "create unique index on pp (a)",
+        Some(
+            "cannot create unique index on partitioned table \"pp\" (Table \"pp\" contains partitions that are foreign tables.",
+        ),
+    ),
+    ("create index on pp (a)", None),
+    ("create unique index on only pp (a)", None),
+    (
+        "create foreign table pkf partition of pk for values in (1) server srv",
+        Some(
+            "cannot create foreign partition of partitioned table \"pk\" (Table \"pk\" contains indexes that are unique.",
+        ),
+    ),
+    (
+        "create foreign table ppf2 partition of pp for values in (2) server srv",
+        None,
+    ),
+    (
+        "create table pf (a int not null, b int references ref (a)) partition by list (a); create foreign table pff partition of pf for values in (1) server srv",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "create table pf (a int not null, b int references ref (a)) partition by list (a); create foreign table pff (a int not null, b int) server srv; alter table pf attach partition pff for values in (1)",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "create foreign table pkf (a int not null, b int) server srv; alter table pk attach partition pkf for values in (1)",
+        Some(
+            "cannot attach foreign table \"pkf\" as partition of partitioned table \"pk\" (Partitioned table \"pk\" contains unique indexes.",
+        ),
+    ),
+    (
+        "create table pu (a int not null, b int) partition by list (a); create unique index on pu (a); create foreign table puf (a int not null, b int) server srv; alter table pu attach partition puf for values in (1)",
+        Some(
+            "cannot attach foreign table \"puf\" as partition of partitioned table \"pu\" (Partitioned table \"pu\" contains unique indexes.",
+        ),
+    ),
+    (
+        "create table pu (a int not null, b int) partition by list (a); create index on pu (a); create foreign table puf partition of pu for values in (1) server srv",
+        None,
+    ),
+    (
+        "create table pu (a int not null, b int) partition by list (a); create index pui on pu (a); create foreign table puf partition of pu for values in (1) server srv; alter index puf_a_idx rename to x",
+        Some("relation \"puf_a_idx\" does not exist"),
+    ),
+    (
+        "create table pu (a int not null, b int) partition by list (a); create index pui on pu (a); create foreign table puf (a int not null, b int) server srv; alter table pu attach partition puf for values in (1); alter index puf_a_idx rename to x",
+        Some("relation \"puf_a_idx\" does not exist"),
+    ),
+    (
+        "create table pu (a int not null, b int) partition by list (a); create foreign table puf partition of pu for values in (1) server srv; create index pui on pu (a); alter index puf_a_idx rename to x",
+        Some("relation \"puf_a_idx\" does not exist"),
+    ),
+    (
+        "create table pu (a int not null, b int) partition by list (a); create foreign table puf partition of pu for values in (1) server srv; create index pui on pu (a); alter table pu detach partition puf",
+        None,
+    ),
+    (
+        "create table pn (a int not null, b int) partition by list (a); create table pn1 partition of pn for values in (1) partition by list (a); create foreign table pn11 partition of pn1 for values in (1) server srv; alter table pn add primary key (a)",
+        Some(
+            "cannot create unique index on partitioned table \"pn1\" (Table \"pn1\" contains partitions that are foreign tables.",
+        ),
+    ),
+    (
+        "create table pn (a int not null, b int) partition by list (a); create table pn1 partition of pn for values in (1) partition by list (a); create foreign table pn11 partition of pn1 for values in (1) server srv; alter table pn add unique (a)",
+        Some(
+            "cannot create unique index on partitioned table \"pn1\" (Table \"pn1\" contains partitions that are foreign tables.",
+        ),
+    ),
+    (
+        "create table pn (a int not null, b int) partition by list (a); create table pn1 partition of pn for values in (1) partition by list (a); create foreign table pn11 partition of pn1 for values in (1) server srv; create unique index on pn (a)",
+        Some(
+            "cannot create unique index on partitioned table \"pn\" (Table \"pn\" contains partitions that are foreign tables.",
+        ),
+    ),
+    (
+        "create table pn (a int not null, b int) partition by list (a); create table pn1 partition of pn for values in (1) partition by list (a); create foreign table pn11 partition of pn1 for values in (1) server srv; create unique index on only pn (a)",
+        None,
+    ),
+    (
+        "create table pn (a int not null, b int) partition by list (a); create table pn1 partition of pn for values in (1) partition by list (a); create foreign table pn11 partition of pn1 for values in (1) server srv; alter table pn add foreign key (b) references ref (a)",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter table pp add foreign key (b) references ref (a) not valid",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "create table r9 (a int not null, b int) partition by list (a); alter table r9 add foreign key (b) references ref (a); create foreign table r9f partition of r9 for values in (1) server srv",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter table mv replica identity using index mv_b",
+        Some("index \"mv_b\" cannot be used as replica identity because column \"b\" is nullable"),
+    ),
+    (
+        "alter table mv replica identity using index mv_a",
+        Some("index \"mv_a\" cannot be used as replica identity because column \"a\" is nullable"),
+    ),
+    (
+        "alter table t replica identity using index ti",
+        Some("cannot use non-unique index \"ti\" as replica identity"),
+    ),
+    ("alter view v set (toast.autovacuum_enabled = false)", None),
+    ("alter table v set (toast.autovacuum_enabled = false)", None),
+    (
+        "alter index ti set (toast.autovacuum_enabled = false)",
+        None,
+    ),
+    (
+        "alter table pp set (toast.autovacuum_enabled = false)",
+        None,
+    ),
+    ("alter table t set (toast.autovacuum_enabled = false)", None),
+    (
+        "alter materialized view mv set (toast.autovacuum_enabled = false)",
+        None,
+    ),
+    (
+        "create view v2 with (toast.autovacuum_enabled = false) as select 1",
+        None,
+    ),
+    (
+        "create index ti2 on t (a) with (toast.autovacuum_enabled = false)",
+        Some("unrecognized parameter namespace \"toast\""),
+    ),
+    (
+        "create table pq (a int) partition by list (a) with (toast.autovacuum_enabled = false)",
+        None,
+    ),
+    ("alter view v reset (toast.autovacuum_enabled)", None),
+    ("alter index ti reset (toast.fillfactor)", None),
+    ("alter table v set (toast.foo = 1)", None),
+    ("alter index ti set (toast.foo = 1)", None),
+    ("alter table pp set (toast.foo = 1)", None),
+    ("alter table t set (toast.foo = 1)", None),
+    ("create view v3 with (toast.foo = 1) as select 1", None),
+    (
+        "create table pq (a int) partition by list (a) with (toast.foo = 1)",
+        Some("unrecognized parameter \"foo\""),
+    ),
+    (
+        "create table pq (a int) partition by list (a) with (toast.autovacuum_enabled = maybe)",
+        Some("invalid value for boolean option \"autovacuum_enabled\": maybe"),
+    ),
+    (
+        "create table pq (a int) with (toast.foo = 1)",
+        Some("unrecognized parameter \"foo\""),
+    ),
+    (
+        "create materialized view mv2 with (toast.foo = 1) as select 1",
+        Some("unrecognized parameter \"foo\""),
+    ),
+    (
+        "alter view v set (toast.foo = 1, check_option = local)",
+        Some("WITH CHECK OPTION is supported only on automatically updatable views"),
+    ),
+    (
+        "alter table pp set (toast.autovacuum_enabled = maybe)",
+        None,
+    ),
+    (
+        "alter index ti set (toast.autovacuum_enabled = maybe, fillfactor = 50)",
+        None,
+    ),
+    (
+        "alter table pp set (toast.x = 1, fillfactor = 50)",
+        Some("cannot specify storage parameters for a partitioned table"),
+    ),
+    (
+        "alter view v set (foo.x = 1)",
+        Some("unrecognized parameter namespace \"foo\""),
+    ),
+    ("alter table only par add column if not exists a int", None),
+    (
+        "alter table only par add column if not exists z int",
+        Some("column must be added to child tables too"),
+    ),
+    (
+        "alter table only par add column a int",
+        Some("column \"a\" of relation \"par\" already exists"),
+    ),
+    (
+        "alter table only par add column if not exists a int primary key",
+        None,
+    ),
+    (
+        "reindex schema pg_temp",
+        Some("schema \"pg_temp\" does not exist"),
+    ),
+    (
+        "reindex schema \"pg_temp\"",
+        Some("schema \"pg_temp\" does not exist"),
+    ),
+    (
+        "create table tp partition of tmp for values in (1)",
+        Some("cannot create a permanent relation as partition of temporary relation \"tmp\""),
+    ),
+    (
+        "create temp table tp partition of tmp for values in (1)",
+        None,
+    ),
+    (
+        "create rule \"_RETURN\" as on select to v do instead nothing",
+        Some("rules on SELECT must have action INSTEAD SELECT"),
+    ),
+    (
+        "create rule r as on select to v do instead nothing",
+        Some("rules on SELECT must have action INSTEAD SELECT"),
+    ),
+    (
+        "create rule r as on select to v do also nothing",
+        Some("rules on SELECT must have action INSTEAD SELECT"),
+    ),
+    (
+        "create rule \"_RETURN\" as on select to t do instead nothing",
+        Some(
+            "relation \"t\" cannot have ON SELECT rules (This operation is not supported for tables.",
+        ),
+    ),
+    (
+        "create rule \"_RETURN\" as on select to v do also select 1 as a",
+        Some("rules on SELECT must have action INSTEAD SELECT"),
+    ),
+    (
+        "create rule r as on select to v where true do instead nothing",
+        Some("rules on SELECT must have action INSTEAD SELECT"),
+    ),
+    (
+        "alter table lp1 no inherit lp",
+        Some("cannot change inheritance of a partition"),
+    ),
+    (
+        "alter table lp1 inherit lp",
+        Some("cannot change inheritance of a partition"),
+    ),
+];

@@ -42,6 +42,16 @@ fn map_attnums(interp: &PgCatalog, from: PgClassOid, to: PgClassOid, keys: &[i16
         .collect()
 }
 
+/// DefineIndex: `cannot create unique index on partitioned table "p"` when
+/// one of `table`'s partitions is a foreign table.
+pub(crate) fn foreign_partition_unique_error(interp: &PgCatalog, table: PgClassOid) -> DdlError {
+    let name = relname_of(interp, table);
+    DdlError::UnsupportedDdl(format!(
+        "cannot create unique index on partitioned table \"{name}\" (Table \"{name}\" contains \
+         partitions that are foreign tables.)"
+    ))
+}
+
 /// Give partition `part` the counterpart of `parent_index`, recursing into
 /// sub-partitions.
 pub(crate) fn ensure_partition_index(
@@ -52,6 +62,14 @@ pub(crate) fn ensure_partition_index(
     let Some(pi) = interp.pg_index.get(&parent_index).cloned() else {
         return Ok(());
     };
+    // DefineIndex: a foreign partition gets no index — and can't keep a
+    // unique one's promise.
+    if interp.pg_class.get(&part).map(|c| c.relkind) == Some(RelKind::ForeignTable) {
+        if pi.indisunique {
+            return Err(foreign_partition_unique_error(interp, pi.indrelid));
+        }
+        return Ok(());
+    }
     let parent_con = backing_constraint(interp, parent_index);
     let indkey = map_attnums(interp, pi.indrelid, part, &pi.indkey);
     let am = interp.index_access_methods.get(&parent_index).cloned();

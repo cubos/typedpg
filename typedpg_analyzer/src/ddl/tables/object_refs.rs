@@ -114,12 +114,15 @@ pub(super) fn replica_identity(
         )));
     }
     let key_columns = usize::try_from(index.indnkeyatts).unwrap_or(0);
+    let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
     for &attnum in index.indkey.iter().take(key_columns) {
         if let Some(attr) = interp
             .attributes_of(relid)
             .iter()
             .find(|a| a.attnum == attnum)
-            && !attr.attnotnull
+            // A materialized view's columns are never declared NOT NULL
+            // (what the analyzer infers of them aside).
+            && (!attr.attnotnull || relkind == Some(RelKind::MaterializedView))
         {
             return Err(DdlError::Parse(format!(
                 "index \"{name}\" cannot be used as replica identity because column \"{}\" \

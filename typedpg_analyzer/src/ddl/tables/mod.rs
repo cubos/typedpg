@@ -808,17 +808,30 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     if !stmt.access_method.is_empty() {
         crate::ddl::opclass::check_table_am(interp, &stmt.access_method)?;
     }
-    // heap_reloptions / partitioned_table_reloptions.
-    crate::ddl::reloptions::check_reloptions(
-        &stmt.options,
-        if stmt.partspec.is_some() {
-            crate::ddl::reloptions::RelOptKind::Partitioned
-        } else {
-            crate::ddl::reloptions::RelOptKind::Heap
-        },
-        false,
-        true,
-    )?;
+    // heap_reloptions / partitioned_table_reloptions; a partitioned
+    // table's `toast.` options are checked as a TOAST table's
+    // (heap_reloptions(RELKIND_TOASTVALUE)), though it has none.
+    if stmt.partspec.is_some() {
+        crate::ddl::reloptions::check_reloptions(
+            &crate::ddl::reloptions::without_toast_options(&stmt.options),
+            crate::ddl::reloptions::RelOptKind::Partitioned,
+            false,
+            true,
+        )?;
+        crate::ddl::reloptions::check_reloptions(
+            &crate::ddl::reloptions::toast_options(&stmt.options),
+            crate::ddl::reloptions::RelOptKind::Heap,
+            false,
+            false,
+        )?;
+    } else {
+        crate::ddl::reloptions::check_reloptions(
+            &stmt.options,
+            crate::ddl::reloptions::RelOptKind::Heap,
+            false,
+            true,
+        )?;
+    }
 
     // Type-check CHECK and `GENERATED ... STORED` expressions against the
     // freshly-built table. CHECK must produce `bool`; the generated
@@ -1086,8 +1099,6 @@ pub fn create_foreign_table(
     if existed.is_some() {
         return Ok(());
     }
-    // CreateForeignTable: GetForeignServerByName.
-    crate::ddl::fdw::check_server(interp, &stmt.servername)?;
     let Some(rv) = base.relation.as_ref() else {
         return Ok(());
     };
@@ -1098,6 +1109,43 @@ pub fn create_foreign_table(
     else {
         return Ok(());
     };
+    // DefineRelation, for a foreign partition: it takes none of its
+    // parent's indexes — so none may be unique — nor its foreign keys
+    // (CloneFkReferencing).
+    if base.partbound.is_some()
+        && let Some(parent) = interp
+            .pg_inherits
+            .iter()
+            .find(|i| i.inhrelid == oid)
+            .map(|i| i.inhparent)
+    {
+        let parent_name = relname_of(interp, parent);
+        if interp
+            .pg_index
+            .values()
+            .any(|i| i.indrelid == parent && i.indisunique)
+        {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "cannot create foreign partition of partitioned table \"{parent_name}\" (Table \
+                 \"{parent_name}\" contains indexes that are unique.)"
+            )));
+        }
+        if interp
+            .pg_constraint
+            .values()
+            .any(|c| c.conrelid == parent && c.contype == ConType::ForeignKey)
+        {
+            return Err(DdlError::UnsupportedDdl(
+                "foreign key constraints are not supported on foreign tables".into(),
+            ));
+        }
+        for index in interp.remove_pg_indexes_of(oid) {
+            interp.index_parents.remove(&index);
+            interp.remove_pg_class(index);
+        }
+    }
+    // CreateForeignTable: GetForeignServerByName.
+    crate::ddl::fdw::check_server(interp, &stmt.servername)?;
     if let Some(class) = interp.pg_class.get_mut(&oid) {
         class.relkind = RelKind::ForeignTable;
     }
@@ -1679,19 +1727,14 @@ fn set_reloptions(
     };
     // ATExecSetRelOptions validates the `toast.` options only for a
     // relation that has a TOAST table.
-    let items: Vec<typedpg_pg_query::protobuf::Node> = if kind == RelOptKind::Heap
-        && !interp.toast_tables.contains(&relid)
-    {
-        list.items
-            .iter()
-            .filter(|o| {
-                !matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defnamespace == "toast")
-            })
-            .cloned()
-            .collect()
-    } else {
-        list.items.clone()
-    };
+    // (A view, an index or a partitioned table has none: it takes them
+    // unchecked.)
+    let items: Vec<typedpg_pg_query::protobuf::Node> =
+        if kind == RelOptKind::Heap && interp.toast_tables.contains(&relid) {
+            list.items.clone()
+        } else {
+            crate::ddl::reloptions::without_toast_options(&list.items)
+        };
     crate::ddl::reloptions::check_reloptions(
         &items,
         kind,

@@ -222,6 +222,35 @@ fn check_value(name: &str, typ: OptType, value: &str) -> Result<(), DdlError> {
     Ok(())
 }
 
+/// The options of a `WITH` / `SET` / `RESET` list not in the `toast`
+/// namespace: what a relation without a TOAST table of its own (a view, an
+/// index, a partitioned table, through ALTER) takes unchecked in it
+/// (transformRelOptions keeps them aside, and nothing validates them).
+pub(crate) fn without_toast_options(
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Vec<typedpg_pg_query::protobuf::Node> {
+    options
+        .iter()
+        .filter(|o| {
+            !matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defnamespace == "toast")
+        })
+        .cloned()
+        .collect()
+}
+
+/// The options of a list in the `toast` namespace.
+pub(crate) fn toast_options(
+    options: &[typedpg_pg_query::protobuf::Node],
+) -> Vec<typedpg_pg_query::protobuf::Node> {
+    options
+        .iter()
+        .filter(|o| {
+            matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defnamespace == "toast")
+        })
+        .cloned()
+        .collect()
+}
+
 /// transformRelOptions + the kind's `*_reloptions`: validate a `WITH` /
 /// `SET` list, or the names of a `RESET` list.
 pub(crate) fn check_reloptions(
