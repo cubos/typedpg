@@ -830,3 +830,49 @@ fn extension_scripts_see_the_schemas_of_required_extensions() {
          ALTER EXTENSION earthdistance UPDATE;",
     )]);
 }
+
+#[test]
+fn drop_extension_takes_the_operator_families_of_its_access_method() {
+    // A family for the extension's access method depends on the method
+    // automatically (CreateOpFamily), and a class on its family: both go
+    // with DROP EXTENSION, without CASCADE — creating them again works.
+    let class = "CREATE OPERATOR CLASS my_ops FOR TYPE int8 USING bloom AS
+                     OPERATOR 1 =(int8, int8), FUNCTION 1 hashint8(int8);";
+    let family = "CREATE OPERATOR FAMILY myfam USING bloom;
+                  CREATE OPERATOR CLASS c2 FOR TYPE int8 USING bloom FAMILY myfam AS
+                      OPERATOR 1 =(int8, int8), FUNCTION 1 hashint8(int8);";
+    for objects in [class, family] {
+        build(&[
+            ("0001.sql", "CREATE EXTENSION bloom;"),
+            ("0002.sql", objects),
+            ("0003.sql", "DROP EXTENSION bloom;"),
+            ("0004.sql", "CREATE EXTENSION bloom;"),
+            ("0005.sql", objects),
+        ]);
+    }
+    // An index using such a class depends on it normally: it needs CASCADE.
+    let index = "CREATE TABLE t (a int8); CREATE INDEX t_a_idx ON t USING bloom (a my_ops);";
+    let err = try_apply(&[
+        ("0001.sql", "CREATE EXTENSION bloom;"),
+        ("0002.sql", class),
+        ("0003.sql", index),
+        ("0004.sql", "DROP EXTENSION bloom;"),
+    ])
+    .expect_err("DROP EXTENSION bloom");
+    assert!(
+        err.to_string().starts_with(
+            "cannot drop extension bloom because other objects depend on it (index t_a_idx \
+             depends on operator class my_ops for access method bloom)"
+        ),
+        "{err}"
+    );
+    let db = build_db(&[
+        ("0001.sql", "CREATE EXTENSION bloom;"),
+        ("0002.sql", class),
+        ("0003.sql", index),
+        ("0004.sql", "DROP EXTENSION bloom CASCADE;"),
+        ("0005.sql", "CREATE EXTENSION bloom;"),
+        ("0006.sql", class),
+    ]);
+    assert!(db.resolve_table(None, "t_a_idx").is_none());
+}

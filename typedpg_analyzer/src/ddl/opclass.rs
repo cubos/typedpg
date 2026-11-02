@@ -258,13 +258,38 @@ pub fn create_opfamily(interp: &mut PgCatalog, stmt: &CreateOpFamilyStmt) -> Res
             stmt.amname
         )));
     }
+    insert_opfamily(interp, name, nsoid, &stmt.amname)
+}
+
+/// A new operator family, which depends on its access method and goes
+/// with it (CreateOpFamily: DEPENDENCY_AUTO) — its classes, which depend
+/// on it, too.
+fn insert_opfamily(
+    interp: &mut PgCatalog,
+    name: String,
+    nsoid: crate::oid::PgNamespaceOid,
+    am: &str,
+) -> Result<(), DdlError> {
     let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
     interp.pg_opfamily.push(PgOpfamily {
         oid,
         opfname: name,
         opfnamespace: nsoid,
-        opfmethod: stmt.amname.clone(),
+        opfmethod: am.to_owned(),
     });
+    // A built-in method is pinned: nothing records dependencies on it.
+    let method = super::depend::named_address_of(
+        interp,
+        &super::depend::NamedObject::AccessMethod {
+            name: am.to_owned(),
+        },
+    );
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::new(super::depend::PG_OPFAMILY_RELID, oid.into_nonzero(), 0),
+        method,
+        crate::pg_catalog::DepType::Auto,
+    );
     Ok(())
 }
 
@@ -299,13 +324,7 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
             .iter()
             .any(|f| f.opfnamespace == nsoid && f.opfname == name && f.opfmethod == am)
     {
-        let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
-        interp.pg_opfamily.push(PgOpfamily {
-            oid,
-            opfname: name.clone(),
-            opfnamespace: nsoid,
-            opfmethod: am.clone(),
-        });
+        insert_opfamily(interp, name.clone(), nsoid, &am)?;
     }
     if interp
         .pg_opclass
@@ -592,7 +611,12 @@ pub(crate) fn drop_am_object(
             // An extension's member goes only with it.
             let object = super::depend::NamedObject::AccessMethod { name: name.clone() };
             if let Some(addr) = super::depend::named_address_of(interp, &object) {
-                super::depend::check_not_owned(interp, addr, &format!("access method {name}"))?;
+                let desc = format!("access method {name}");
+                super::depend::check_not_owned(interp, addr, &desc)?;
+                // Its operator families (and their classes) go with it;
+                // what uses them needs CASCADE.
+                super::depend::drop_dependents(interp, addr, &desc, cascade)?;
+                interp.remove_dependencies_on(addr.classid, addr.objid);
             }
             interp.pg_am.retain(|a| a.amname != name);
             interp.access_method_oids.remove(&name);
