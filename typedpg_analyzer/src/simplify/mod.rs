@@ -374,22 +374,33 @@ mod tests {
         assert_eq!(names, typedpg_core::config::SIMPLIFY_RULES);
     }
 
+    /// A rule rewriting each `1 = 1` of the query into `2 = 2`: candidates
+    /// that never overlap and always pass the check.
+    fn equalities(ctx: &Ctx<'_>) -> Vec<Candidate> {
+        ctx.sql
+            .match_indices("1 = 1")
+            .map(|(at, m)| Candidate {
+                rule: Rule::Distinct,
+                edits: vec![Edit {
+                    range: at..at + m.len(),
+                    text: "2 = 2".into(),
+                }],
+            })
+            .collect()
+    }
+
     #[test]
     fn many_sites_cost_one_analysis() {
         let mut db = PgCatalog::new().unwrap();
-        db.apply_sql("CREATE TABLE t (a int NOT NULL); CREATE TABLE u (b int NOT NULL);")
+        db.apply_sql("CREATE TABLE t (a int NOT NULL)").unwrap();
+        let sites = vec!["1 = 1"; 200];
+        let mut analyzed = db
+            .analyze(&format!("SELECT a FROM t WHERE {}", sites.join(" AND ")))
             .unwrap();
-        let sites: Vec<String> = (0..200)
-            .map(|i| format!("a NOT IN (SELECT b FROM u WHERE b > {i}) AS c{i}"))
-            .collect();
-        // In the target list: as WHERE conjuncts each would be a sibling
-        // the others can't prove error-free (see
-        // `proof::siblings_cannot_error`).
-        let sql = format!("SELECT {} FROM t", sites.join(", "));
         ANALYSES.with(|a| a.set(0));
-        let analyzed = db.analyze(&sql).unwrap();
+        run_rules(&db, &mut analyzed, &[], &[(Rule::Distinct, equalities)]);
         assert_eq!(analyzed.simplifications.len(), 200);
-        assert!(!analyzed.sql.contains("NOT IN"));
+        assert!(!analyzed.sql.contains("1 = 1"));
         // One batch, verified by one analysis.
         assert_eq!(ANALYSES.with(|a| a.get()), 1);
     }

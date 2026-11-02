@@ -1078,6 +1078,25 @@ fn hidden_volatile_calls(catalog: &PgCatalog) -> bool {
 /// Anywhere else — HAVING (where a NOT EXISTS isn't pulled up anyway), a
 /// nested query, a CTE — it doesn't.
 pub(crate) fn rewrite_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
+    site_position(ctx, site_location).is_some()
+}
+
+/// [`rewrite_site_is_safe`], for the WHERE only: a target-list or SET-value
+/// site doesn't qualify. For a rewrite that is only a gain as a join — a
+/// NOT EXISTS in a target list stays a correlated SubPlan, scanning the
+/// subquery per row where NOT IN hashed it once.
+pub(crate) fn where_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
+    site_position(ctx, site_location) == Some(SitePosition::Where)
+}
+
+/// Where [`rewrite_site_is_safe`] accepted a site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SitePosition {
+    Where,
+    Values,
+}
+
+fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
     fn reaches(node: NodeRef<'_>, at: i32) -> bool {
         if node.location() == Some(at) {
             return true;
@@ -1092,15 +1111,12 @@ pub(crate) fn rewrite_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
             .as_ref()
             .is_some_and(|n| reaches(n.to_ref(), site_location))
     };
-    let Some(top) = ctx
+    let top = ctx
         .tree
         .stmts
         .first()
         .and_then(|s| s.stmt.as_deref())
-        .and_then(|s| s.node.as_ref())
-    else {
-        return false;
-    };
+        .and_then(|s| s.node.as_ref())?;
     let ctes = cte_names(ctx);
     // The WHERE of a level whose FROM is `from`.
     let where_safe = |from: &[Node], where_clause: &Node, scope: &FromScope<'_>| {
@@ -1126,23 +1142,27 @@ pub(crate) fn rewrite_site_is_safe(ctx: &Ctx<'_>, site_location: i32) -> bool {
     match top {
         N::SelectStmt(s) => {
             if s.op != typedpg_pg_query::protobuf::SetOperation::SetopNone as i32 {
-                return false;
+                return None;
             }
             if s.target_list.iter().any(reaches_in) {
-                return true;
+                return Some(SitePosition::Values);
             }
             match s.where_clause.as_deref() {
                 Some(w) if !locks && reaches_in(w) => {
                     let scope = FromScope::of_select(ctx, s, None);
-                    where_safe(&s.from_clause, w, &scope)
+                    where_safe(&s.from_clause, w, &scope).then_some(SitePosition::Where)
                 }
-                _ => false,
+                _ => None,
             }
         }
         // SET values are evaluated per row to update; the WHERE is
         // rechecked by EvalPlanQual.
-        N::UpdateStmt(u) => u.target_list.iter().any(reaches_in),
-        _ => false,
+        N::UpdateStmt(u) => u
+            .target_list
+            .iter()
+            .any(reaches_in)
+            .then_some(SitePosition::Values),
+        _ => None,
     }
 }
 

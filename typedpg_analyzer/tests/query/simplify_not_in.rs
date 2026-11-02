@@ -142,11 +142,20 @@ fn row_wise() {
 }
 
 #[test]
-fn in_the_target_list() {
-    assert_rewritten(
-        &setup(),
+fn in_the_target_list_is_kept() {
+    // There NOT EXISTS isn't a join: it stays a correlated SubPlan, scanning
+    // the subquery once per row, where NOT IN hashes it once. On PG 18.6,
+    // with 2000 rows on each side and no index, 1 such column took 0.68 ms
+    // written and 0.58 ms rewritten, but 200 of them 100 ms written and
+    // 5545 ms rewritten. In an UPDATE's SET too.
+    let db = setup();
+    assert_kept(
+        &db,
         "SELECT c.id NOT IN (SELECT customer_id FROM banned) AS ok FROM customers c",
-        "SELECT (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) AS ok FROM customers c",
+    );
+    assert_kept(
+        &db,
+        "UPDATE customers c SET name = (c.id NOT IN (SELECT customer_id FROM banned))::text",
     );
 }
 
@@ -160,7 +169,7 @@ fn not_before_the_left_side() {
 }
 
 #[test]
-fn in_an_update_set_but_not_a_dml_or_locking_where() {
+fn not_in_a_dml_or_locking_where() {
     // EvalPlanQual rechecks a row a concurrent transaction updated by
     // re-evaluating a SubPlan qual, but re-joins it with an anti-join's
     // inner side without excluding it: a DML's or a locking SELECT's WHERE
@@ -183,18 +192,11 @@ fn in_an_update_set_but_not_a_dml_or_locking_where() {
     ] {
         assert_kept(&db, sql);
     }
-    // A SubPlan in both forms, evaluated per row: the same rows and values
-    // under a concurrent update (checked on PG 18.6).
-    assert_rewritten(
-        &db,
-        "UPDATE customers c SET name = (c.id NOT IN (SELECT customer_id FROM banned))::text",
-        "UPDATE customers c SET name = ((NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)))::text",
-    );
-    assert_rewritten(
+    // Target-list and SET sites aren't rewritten either (see
+    // `in_the_target_list_is_kept`).
+    assert_kept(
         &db,
         "SELECT c.id NOT IN (SELECT customer_id FROM banned) AS ok FROM customers c FOR UPDATE",
-        "SELECT (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id)) AS ok FROM customers c \
-         FOR UPDATE",
     );
 }
 
@@ -240,8 +242,7 @@ fn with_parameters() {
 #[test]
 fn every_not_in_of_the_query() {
     let db = setup();
-    // One in the target list, one in the WHERE (two NOT IN conjuncts of
-    // one WHERE are each other's sibling sublinks: both stay).
+    // The WHERE's site is rewritten, the target list's kept.
     let (sent, rules) = simplified(
         &db,
         "SELECT c.code NOT IN (SELECT b FROM pairs) AS ok FROM customers c \
@@ -249,10 +250,12 @@ fn every_not_in_of_the_query() {
     );
     assert_eq!(
         sent,
-        "SELECT (NOT EXISTS (SELECT 1 FROM pairs WHERE c.code = b)) AS ok FROM customers c \
+        "SELECT c.code NOT IN (SELECT b FROM pairs) AS ok FROM customers c \
          WHERE (NOT EXISTS (SELECT 1 FROM banned WHERE c.id = customer_id))"
     );
-    assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn]);
+    assert_eq!(rules, vec![Rule::NotIn]);
+    // Two NOT IN conjuncts of one WHERE are each other's sibling
+    // sublinks: both stay.
     assert_kept(
         &db,
         "SELECT c.id FROM customers c WHERE c.id NOT IN (SELECT customer_id FROM banned) \
@@ -634,7 +637,9 @@ fn a_line_comment_at_the_end_of_the_subquery_stays_closed() {
 }
 
 #[test]
-fn two_wrapped_sites_get_their_own_aliases() {
+fn a_wrapped_site_gets_a_numbered_alias() {
+    // (A query has at most one site now; `not_in::tests` covers the
+    // numbering past an earlier rewrite's aliases.)
     let (sent, rules) = simplified(
         &setup(),
         "SELECT c.code NOT IN (SELECT DISTINCT code FROM banned) AS ok FROM customers c \
@@ -642,12 +647,11 @@ fn two_wrapped_sites_get_their_own_aliases() {
     );
     assert_eq!(
         sent,
-        "SELECT (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT code FROM banned) AS __typedpg_s2 \
-         (__typedpg_c1) WHERE c.code = __typedpg_s2.__typedpg_c1)) AS ok FROM customers c \
+        "SELECT c.code NOT IN (SELECT DISTINCT code FROM banned) AS ok FROM customers c \
          WHERE (NOT EXISTS (SELECT 1 FROM (SELECT DISTINCT customer_id FROM banned) AS __typedpg_s1 \
          (__typedpg_c1) WHERE c.id = __typedpg_s1.__typedpg_c1))"
     );
-    assert_eq!(rules, vec![Rule::NotIn, Rule::NotIn]);
+    assert_eq!(rules, vec![Rule::NotIn]);
 }
 
 #[test]
@@ -975,7 +979,7 @@ fn error_free_siblings_are_fine() {
 }
 
 #[test]
-fn only_top_level_where_and_target_list_sites() {
+fn only_top_level_where_sites() {
     // A sublink qual may veto a row on a scan below a join whose ON can
     // fail; the anti-join runs above it.
     let mut db = setup();
@@ -1012,24 +1016,43 @@ fn only_top_level_where_and_target_list_sites() {
         "SELECT t.id FROM t JOIN u ON t.id = u.k WHERE t.a NOT IN (SELECT b FROM sx)",
         "SELECT t.id FROM t JOIN u ON t.id = u.k WHERE (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b))",
     );
-    // The target list, whatever the FROM.
-    assert_rewritten(
+    // Not the target list (a correlated SubPlan there, slower than NOT IN's
+    // hashed one).
+    assert_kept(
         &db,
-        "SELECT t.a NOT IN (SELECT b FROM sx) AS ok \
-         FROM t JOIN u ON t.id = u.k AND 10 / (u.z * t.a) > 1, generate_series(1, 2) g",
-        "SELECT (NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b)) AS ok \
-         FROM t JOIN u ON t.id = u.k AND 10 / (u.z * t.a) > 1, generate_series(1, 2) g",
+        "SELECT t.a NOT IN (SELECT b FROM sx) AS ok FROM t JOIN u ON t.id = u.k",
     );
-    // A DML's WHERE never qualifies (EvalPlanQual); its SET values do.
+    // A DML's WHERE never qualifies (EvalPlanQual), nor its SET values.
     assert_kept(
         &db,
         "DELETE FROM t USING u WHERE t.id = u.k AND t.a NOT IN (SELECT b FROM sx)",
     );
-    assert_rewritten(
+    assert_kept(
         &db,
         "UPDATE t SET a = (t.a NOT IN (SELECT b FROM sx))::int FROM u WHERE t.id = u.k",
-        "UPDATE t SET a = ((NOT EXISTS (SELECT 1 FROM sx WHERE t.a = b)))::int FROM u WHERE t.id = u.k",
     );
+}
+
+#[test]
+fn the_e2e_queries_are_rewritten() {
+    // The shapes `typedpg_e2e/tests/simplify_not_in.rs` runs on PostgreSQL.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE users (id bigint PRIMARY KEY, name text NOT NULL, email text NOT NULL);
+         CREATE TABLE posts (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+         AND u.id NOT IN (SELECT user_id FROM posts) ORDER BY u.id",
+        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+         AND u.id NOT IN (SELECT DISTINCT user_id FROM posts)",
+        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+         AND (u.id, u.name) NOT IN (SELECT p.user_id, u2.name FROM posts p \
+         JOIN users u2 ON u2.id = p.user_id) ORDER BY u.id",
+    ] {
+        assert_eq!(simplified(&db, sql).1, vec![Rule::NotIn], "{sql}");
+    }
 }
 
 // ── Opt-outs ────────────────────────────────────────────────────────────────

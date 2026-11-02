@@ -876,7 +876,7 @@ shows the SQL sent and the rules applied.
 
 | Rule | Rewrite |
 |------|---------|
-| `not_in` | `x NOT IN (SELECT y …)` → `NOT EXISTS (… WHERE x = y)` when neither side can be NULL: an anti-join, instead of a SubPlan that turns quadratic once the subquery outgrows `work_mem`. |
+| `not_in` | `x NOT IN (SELECT y …)` → `NOT EXISTS (… WHERE x = y)` when neither side can be NULL: an anti-join, instead of a SubPlan that turns quadratic once the subquery outgrows `work_mem`. Only in the top-level `SELECT`'s `WHERE` (no `FOR UPDATE`/`SHARE`), over plain tables, next to conditions that can't fail, with a subquery of plain columns, constants and comparisons; elsewhere (target lists, DML, nested queries) `NOT EXISTS` isn't a gain or isn't provably the same. |
 
 They are on by default. Turn them all off, or one by one:
 

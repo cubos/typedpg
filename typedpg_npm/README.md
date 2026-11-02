@@ -74,7 +74,7 @@ into `@cubos/typedpg-cli`:
 | `types` | PG type → TypeScript type, as `"./src/types#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type; an unqualified name is in `public`, a built-in type is `pg_catalog.<name>`. See [Mapping types](#mapping-types). |
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
-| `simplify` | The query simplifications, on by default: `false` turns them off, `{ "notIn": false }` one rule. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent — `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS`, when neither side can be NULL. The generated module's doc comments show the SQL sent. For every database. |
+| `simplify` | The query simplifications, on by default: `false` turns them off, `{ "notIn": false }` one rule. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent — `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS`, when neither side can be NULL, in a top-level `SELECT`'s `WHERE`. The generated module's doc comments show the SQL sent. For every database. |
 
 Unknown keys are errors.
 

@@ -22,16 +22,19 @@
 //!   column by column with `=`, as PG's row comparison does.
 //! - the site is in the top-level SELECT's WHERE (no locking clause
 //!   anywhere), over stored tables joined by ON conditions that can't fail
-//!   and next to nothing that can fail, or in the top-level SELECT's target
-//!   list or an UPDATE's SET values
-//!   ([`super::proof::rewrite_site_is_safe`]). A sublink qual may veto a
-//!   row before a join's ON, a pulled-up subquery's qual or a sibling runs
+//!   and next to nothing that can fail
+//!   ([`super::proof::where_site_is_safe`]). A sublink qual may veto a row
+//!   before a join's ON, a pulled-up subquery's qual or a sibling runs
 //!   (cost ties keep the written order); the anti-join runs above them.
-//!   And EvalPlanQual, rechecking a row a concurrent transaction updated
-//!   under UPDATE, DELETE or FOR UPDATE / SHARE, re-evaluates a SubPlan
-//!   but doesn't re-run the anti-join's exclusion. So `x NOT IN (…) AND
-//!   created_at > now() - interval '1 day'`, a DML or locking SELECT's
-//!   WHERE, HAVING, a CTE or any nested query is left as written.
+//!   EvalPlanQual, rechecking a row a concurrent transaction updated under
+//!   UPDATE, DELETE or FOR UPDATE / SHARE, re-evaluates a SubPlan but
+//!   doesn't re-run the anti-join's exclusion. And in a target list or an
+//!   UPDATE's SET, NOT EXISTS isn't a join at all: it stays a correlated
+//!   SubPlan scanning the subquery per row, where NOT IN hashed it once —
+//!   200 such columns over 2000 × 2000 rows took 100 ms written and 5.5 s
+//!   rewritten (PG 18.6). So `x NOT IN (…) AND created_at > now() -
+//!   interval '1 day'`, a target list, a DML or locking SELECT's WHERE,
+//!   HAVING, a CTE or any nested query is left as written.
 //! - the subquery has no LIMIT or OFFSET: the SubPlan reads it once, an
 //!   anti-join may rescan it, and a LIMIT may return other rows then.
 //! - nothing in it is volatile (the subquery may run a different number
@@ -67,7 +70,7 @@ use typedpg_pg_query::protobuf::{
 
 use super::proof::{
     FromScope, builtin_strict_equality, column_collation, column_type, embed_source,
-    error_free_select, has_volatile, qualified_column, rewrite_site_is_safe, strictly_not_null,
+    error_free_select, has_volatile, qualified_column, strictly_not_null, where_site_is_safe,
     written_names_use,
 };
 use super::{Candidate, Ctx, Edit, Rule};
@@ -370,7 +373,7 @@ impl Walker<'_, '_> {
         // Nothing the rewrite may newly evaluate can fail: in the
         // subquery, nor anything next to the site in its WHERE / HAVING,
         // which the site may have vetoed rows for.
-        if !error_free_select(ctx, sub, &sub_scope) || !rewrite_site_is_safe(ctx, not_at) {
+        if !error_free_select(ctx, sub, &sub_scope) || !where_site_is_safe(ctx, not_at) {
             return None;
         }
         // Nothing volatile, no row security.
@@ -614,4 +617,20 @@ fn reads_row_security(ctx: &Ctx<'_>, node: &Node) -> bool {
             _ => false,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_alias;
+
+    #[test]
+    fn aliases_are_numbered_past_earlier_ones() {
+        assert_eq!(next_alias("SELECT 1"), 1);
+        assert_eq!(
+            next_alias(
+                "SELECT 1 FROM (SELECT 1) AS __typedpg_s1 (__typedpg_c1), x AS __typedpg_s7"
+            ),
+            8
+        );
+    }
 }

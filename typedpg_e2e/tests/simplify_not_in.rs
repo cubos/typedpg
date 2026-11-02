@@ -11,7 +11,6 @@ use typedpg::sql;
 async fn not_in_sent_as_not_exists_returns_the_same_rows() {
     let pool = common::setup().await;
     let tag = common::unique_id(&pool).await;
-    let pattern = format!("simplify-{tag}-%");
     let mut ids = Vec::new();
     for who in ["poster", "lurker"] {
         let name = format!("{who}-{tag}");
@@ -35,12 +34,13 @@ async fn not_in_sent_as_not_exists_returns_the_same_rows() {
     .await
     .expect("insert post");
 
+    // The test's own users, by an id range: a sibling like `LIKE` could
+    // fail, and would keep the NOT IN as written.
     // Inlined: `NOT EXISTS (SELECT 1 FROM posts WHERE u.id = user_id)`.
     let rows = sql!(
         &pool,
-        "SELECT u.id FROM users u WHERE u.email LIKE $pattern \
-         AND u.id NOT IN (SELECT user_id FROM posts) ORDER BY u.id",
-        pattern = pattern.clone()
+        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+         AND u.id NOT IN (SELECT user_id FROM posts) ORDER BY u.id"
     )
     .fetch_all()
     .await
@@ -50,25 +50,23 @@ async fn not_in_sent_as_not_exists_returns_the_same_rows() {
     // Wrapped whole: the DISTINCT stays the subquery's.
     let row = sql!(
         &pool,
-        "SELECT u.id FROM users u WHERE u.email LIKE $pattern \
-         AND u.id NOT IN (SELECT DISTINCT user_id FROM posts)",
-        pattern = pattern.clone()
+        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+         AND u.id NOT IN (SELECT DISTINCT user_id FROM posts)"
     )
     .fetch_one()
     .await
     .expect("not in, wrapped");
     assert_eq!(row.id, lurker);
 
-    // Row-wise, in the target list.
+    // Row-wise.
     let rows = sql!(
         &pool,
-        "SELECT u.id, (u.id, u.name) NOT IN (SELECT p.user_id, u2.name FROM posts p \
-         JOIN users u2 ON u2.id = p.user_id) AS quiet \
-         FROM users u WHERE u.email LIKE $pattern ORDER BY u.id"
+        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+         AND (u.id, u.name) NOT IN (SELECT p.user_id, u2.name FROM posts p \
+         JOIN users u2 ON u2.id = p.user_id) ORDER BY u.id"
     )
     .fetch_all()
     .await
     .expect("row-wise not in");
-    let quiet: Vec<(i64, bool)> = rows.iter().map(|r| (r.id, r.quiet)).collect();
-    assert_eq!(quiet, vec![(poster, false), (lurker, true)]);
+    assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![lurker]);
 }
