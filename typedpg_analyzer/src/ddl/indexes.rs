@@ -1143,6 +1143,15 @@ pub(crate) fn index_eq_operator(
 /// operator classes (and exclusion operators) are resolved again for the
 /// new type. `old_type` / `old_collation` are the column's before the
 /// change, whose new type is already recorded.
+/// Where index `index` stands in PG's OID order: its OID, or the one PG
+/// gave it when ALTER COLUMN TYPE rebuilt it.
+pub(crate) fn index_order(db: &PgCatalog, index: PgClassOid) -> u32 {
+    db.rebuilt_index_oids
+        .get(&index)
+        .copied()
+        .unwrap_or_else(|| index.get())
+}
+
 pub(crate) fn rebuild_indexes_for_column_type(
     db: &mut PgCatalog,
     relid: PgClassOid,
@@ -1164,7 +1173,8 @@ pub(crate) fn rebuild_indexes_for_column_type(
         .filter(|i| i.indrelid == relid)
         .cloned()
         .collect();
-    indexes.sort_by_key(|i| i.indexrelid);
+    indexes.sort_by_key(|i| index_order(db, i.indexrelid));
+    let mut rebuilt: Vec<PgClassOid> = Vec::new();
     // Every index reading the column — as a key or INCLUDE column, in an
     // expression or in its predicate — is rebuilt from pg_get_indexdef,
     // which names the table's columns: its columns take their names anew.
@@ -1193,11 +1203,33 @@ pub(crate) fn rebuild_indexes_for_column_type(
             // (A new object's entry, partitioned index or not, stays as
             // created for the rest of the transaction.)
             db.indexes_with_new_relfilenode.insert(index.indexrelid);
+            rebuilt.push(index.indexrelid);
             super::depend::forget_auto_extension_marks(
                 db,
                 super::depend::ObjectAddress::relation(index.indexrelid),
             );
         }
+    }
+    // ATPostAlterTypeCleanup re-adds the constraints first, then the plain
+    // indexes, each in the order it found them: their new OIDs follow.
+    let backs_constraint = |db: &PgCatalog, index: PgClassOid| {
+        let name = db.pg_class.get(&index).map(|c| c.relname.clone());
+        db.pg_constraint.values().any(|c| {
+            c.conrelid == relid
+                && matches!(
+                    c.contype,
+                    crate::pg_catalog::ConType::PrimaryKey
+                        | crate::pg_catalog::ConType::Unique
+                        | crate::pg_catalog::ConType::Exclusion
+                )
+                && Some(&c.conname) == name.as_ref()
+        })
+    };
+    let (constraints, plain): (Vec<PgClassOid>, Vec<PgClassOid>) =
+        rebuilt.into_iter().partition(|&i| backs_constraint(db, i));
+    for index in constraints.into_iter().chain(plain) {
+        let oid = db.alloc_oid()?.get();
+        db.rebuilt_index_oids.insert(index, oid);
     }
     for mut index in indexes {
         let Some(mut keys) = db.index_keys.get(&index.indexrelid).cloned() else {

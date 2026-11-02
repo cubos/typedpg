@@ -1903,6 +1903,7 @@ pub(crate) fn alter_column_type(
         old_type_oid,
         attr.attcollation,
     )?;
+    super::foreign_keys::repick_indexes_after_retype(interp, relid, attr.attnum);
     recheck_dependents_of_retyped_column(interp, relid, &attr)?;
     super::check_inherit::recook_checks_reading(interp, relid, attr.attnum);
     Ok(())
