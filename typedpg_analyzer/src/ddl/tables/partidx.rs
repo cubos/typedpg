@@ -126,17 +126,9 @@ fn create_clone(
     let Some(class) = interp.pg_class.get(&part).cloned() else {
         return Err(DdlError::Internal(format!("partition {part} missing")));
     };
-    // ChooseIndexName over the partition.
-    let colnames: Vec<String> = indkey
-        .iter()
-        .map(|&an| {
-            interp
-                .attributes_of(part)
-                .iter()
-                .find(|a| a.attnum == an)
-                .map_or_else(|| "expr".to_owned(), |a| a.attname.clone())
-        })
-        .collect();
+    // generateClonedIndexStmt copies the parent index's column names
+    // (indexcolname), which ChooseIndexName reads and the clone keeps.
+    let colnames = crate::ddl::indexes::relcache_index_attnames(interp, pi.indexrelid);
     let (addition, label) = match parent_con.map(|c| c.contype) {
         Some(ConType::PrimaryKey) => (String::new(), "pkey"),
         Some(ConType::Unique) => (super::super::util::index_name_addition(&colnames), "key"),
@@ -188,6 +180,7 @@ fn create_clone(
     if let Some(keys) = interp.index_keys.get(&pi.indexrelid).cloned() {
         interp.index_keys.insert(index, keys);
     }
+    interp.index_attnames.insert(index, colnames);
     if let Some(con) = parent_con {
         let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_constraint(PgConstraint {

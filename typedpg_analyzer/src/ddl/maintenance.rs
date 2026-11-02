@@ -27,7 +27,7 @@ fn relname(interp: &PgCatalog, relid: PgClassOid) -> String {
 /// TRUNCATE (ExecuteTruncate): tables only, and no foreign key from a
 /// table left out may reference one being truncated
 /// (heap_truncate_check_FKs), unless CASCADE.
-pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError> {
+pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError> {
     let mut targets: Vec<PgClassOid> = Vec::new();
     for rel in &stmt.relations {
         let Some(node::Node::RangeVar(rv)) = rel.node.as_ref() else {
@@ -69,6 +69,27 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
         }
     }
     if stmt.behavior == DropBehavior::DropCascade as i32 {
+        // ExecuteTruncate: CASCADE truncates the referencing tables too.
+        let mut i = 0;
+        while i < targets.len() {
+            let referencing: Vec<PgClassOid> = interp
+                .pg_constraint
+                .values()
+                .filter(|c| {
+                    c.contype == ConType::ForeignKey
+                        && c.conenforced
+                        && c.confrelid == Some(targets[i])
+                })
+                .map(|c| c.conrelid)
+                .collect();
+            for table in referencing {
+                if !targets.contains(&table) {
+                    targets.push(table);
+                }
+            }
+            i += 1;
+        }
+        new_relfilenodes(interp, &targets);
         return Ok(());
     }
     for &target in &targets {
@@ -87,7 +108,22 @@ pub fn truncate(interp: &PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError>
             )));
         }
     }
+    new_relfilenodes(interp, &targets);
     Ok(())
+}
+
+/// The indexes of `tables` get new relfilenodes (TRUNCATE, CLUSTER,
+/// REINDEX TABLE).
+fn new_relfilenodes(interp: &mut PgCatalog, tables: &[PgClassOid]) {
+    let indexes: Vec<PgClassOid> = interp
+        .pg_index
+        .values()
+        .filter(|i| tables.contains(&i.indrelid))
+        .map(|i| i.indexrelid)
+        .collect();
+    for index in indexes {
+        super::indexes::new_relfilenode(interp, index);
+    }
 }
 
 /// RangeVarCallbackMaintainsTable: tables, TOAST tables and materialized
@@ -125,6 +161,7 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
                 rv.relname
             )));
         }
+        new_relfilenodes(interp, &[relid]);
         return Ok(());
     }
     // cluster_rel refuses a shared catalog once the index is found by name
@@ -141,11 +178,12 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
     }
     let index = super::tables::check_clusterable_index(interp, relid, &stmt.indexname)?;
     interp.clustered_indexes.insert(relid, index);
+    new_relfilenodes(interp, &[relid]);
     Ok(())
 }
 
 /// REINDEX INDEX / TABLE / SCHEMA.
-pub fn reindex(interp: &PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlError> {
+pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlError> {
     match ReindexObjectType::try_from(stmt.kind) {
         Ok(ReindexObjectType::ReindexObjectIndex) => {
             let Some(rv) = stmt.relation.as_ref() else {
@@ -162,10 +200,12 @@ pub fn reindex(interp: &PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlError> {
                     rv.relname
                 )));
             }
+            super::indexes::new_relfilenode(interp, relid);
         }
         Ok(ReindexObjectType::ReindexObjectTable) => {
             if let Some(rv) = stmt.relation.as_ref() {
-                maintained_table(interp, rv)?;
+                let relid = maintained_table(interp, rv)?;
+                new_relfilenodes(interp, &[relid]);
             }
         }
         Ok(ReindexObjectType::ReindexObjectSchema)

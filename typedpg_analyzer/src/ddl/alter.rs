@@ -454,6 +454,7 @@ fn rename_index_column(
             "column \"{new}\" of relation \"{relname}\" already exists"
         )));
     }
+    super::indexes::pin_relcache_index_attnames(interp, index);
     names[position] = new.to_owned();
     interp.index_attnames.insert(index, names);
     Ok(())

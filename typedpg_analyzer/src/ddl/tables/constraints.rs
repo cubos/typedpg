@@ -2097,17 +2097,9 @@ pub(crate) fn copy_like_constraints(
                 .iter()
                 .map(|&an| if an == 0 { 0 } else { new_attnum(interp, an) })
                 .collect();
-            let colnames: Vec<String> = idx
-                .indkey
-                .iter()
-                .map(|&an| {
-                    source_attrs
-                        .iter()
-                        .find(|a| an != 0 && a.attnum == an)
-                        .map(|a| a.attname.clone())
-                        .unwrap_or_else(|| "expr".to_owned())
-                })
-                .collect();
+            // generateClonedIndexStmt copies the source index's column
+            // names (indexcolname), which ChooseIndexName reads.
+            let colnames = crate::ddl::indexes::relcache_index_attnames(interp, idx.indexrelid);
             let addition = index_name_addition(&colnames);
             match backing {
                 Some((contype, period)) => {
@@ -2142,6 +2134,11 @@ pub(crate) fn copy_like_constraints(
                     )?;
                     let conname = interp.pg_constraint.get(&oid).map(|c| c.conname.clone());
                     copy_index_details(interp, idx.indexrelid, relid, conname.as_deref());
+                    if let Some(index) =
+                        conname.and_then(|n| interp.class_by_qname.get(&(nsoid, n)).copied())
+                    {
+                        interp.index_attnames.insert(index, colnames);
+                    }
                 }
                 None => {
                     let name = choose_relation_name(interp, nsoid, relname, &addition, "idx");
@@ -2162,6 +2159,7 @@ pub(crate) fn copy_like_constraints(
                         ..idx
                     });
                     copy_index_details_to(interp, source, indexrelid);
+                    interp.index_attnames.insert(indexrelid, colnames);
                 }
             }
         }
