@@ -1267,48 +1267,69 @@ fn set_planned_top(
         // An ORDER BY on the scan's Vars sorts them in a Sort node above
         // the scan, unless a path of the subquery is sorted already, or
         // a WHERE equates a key to a constant (or is pushed down into the
-        // subquery, which may then sort).
-        let key_is_var = |k: &protobuf::Node| match k.node.as_ref() {
-            Some(node::Node::AConst(protobuf::AConst {
-                val: Some(protobuf::a_const::Val::Ival(i)),
-                ..
-            })) => usize::try_from(i.ival)
-                .ok()
-                .and_then(|i| i.checked_sub(1))
-                .and_then(|i| outputs.get(i))
-                .is_some_and(|o| scan(o).is_some()),
-            Some(node::Node::ColumnRef(cr)) => {
-                let by_name = match cr.fields.as_slice() {
-                    [f] => match f.node.as_ref() {
-                        Some(node::Node::String(s)) => {
-                            let named: Vec<_> = columns
-                                .iter()
-                                .zip(&outputs)
-                                .filter(|(c, _)| c.name == s.sval)
-                                .collect();
-                            (!named.is_empty())
-                                .then(|| named.iter().all(|(_, o)| scan(o).is_some()))
-                        }
-                        _ => Some(false),
-                    },
-                    _ => None,
-                };
-                by_name.unwrap_or_else(|| {
-                    column_ref_target(cr, scope).is_some_and(|c| local(c) && scan_of(c).is_some())
-                })
+        // subquery, which may then sort). A key with no collation is
+        // sorted by no path of a subquery whose sorts are all collated
+        // (its pathkey has no collation; theirs have one): a Sort, or an
+        // Incremental Sort, is above the scan. `key_var` tells whether a
+        // key is a Var of the scan, and whether it has no collation.
+        let no_collation = |o: &TopOutput<'_>| matches!(o, TopOutput::Var(v) if v.no_collation);
+        let key_var = |k: &protobuf::Node| -> Option<bool> {
+            match k.node.as_ref() {
+                Some(node::Node::AConst(protobuf::AConst {
+                    val: Some(protobuf::a_const::Val::Ival(i)),
+                    ..
+                })) => usize::try_from(i.ival)
+                    .ok()
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| outputs.get(i))
+                    .filter(|o| scan(o).is_some())
+                    .map(no_collation),
+                Some(node::Node::ColumnRef(cr)) => {
+                    let by_name = match cr.fields.as_slice() {
+                        [f] => match f.node.as_ref() {
+                            Some(node::Node::String(s)) => {
+                                let named: Vec<_> = columns
+                                    .iter()
+                                    .zip(&outputs)
+                                    .filter(|(c, _)| c.name == s.sval)
+                                    .map(|(_, o)| o)
+                                    .collect();
+                                (!named.is_empty()).then(|| {
+                                    named
+                                        .iter()
+                                        .all(|o| scan(o).is_some())
+                                        .then(|| named.iter().all(|o| no_collation(o)))
+                                })
+                            }
+                            _ => Some(None),
+                        },
+                        _ => None,
+                    };
+                    by_name.unwrap_or_else(|| {
+                        column_ref_target(cr, scope)
+                            .filter(|c| local(c) && scan_of(c).is_some())
+                            .map(|c| c.no_collation)
+                    })
+                }
+                _ => None,
             }
-            _ => false,
         };
+        let keys: Option<Vec<bool>> = sel
+            .sort_clause
+            .iter()
+            .map(|s| match s.node.as_ref() {
+                Some(node::Node::SortBy(sb)) => sb.node.as_deref().and_then(key_var),
+                _ => None,
+            })
+            .collect();
         let sorted = !sel.sort_clause.is_empty()
-            && facts.unsorted
             && sel.where_clause.is_none()
             && sel.group_clause.is_empty()
             && sel.having_clause.is_none()
             && sel.distinct_clause.is_empty()
             && sel.window_clause.is_empty()
-            && sel.sort_clause.iter().all(|s| match s.node.as_ref() {
-                Some(node::Node::SortBy(sb)) => sb.node.as_deref().is_some_and(key_is_var),
-                _ => false,
+            && keys.is_some_and(|keys| {
+                facts.unsorted || (facts.collated_sorts && keys.iter().any(|&none| none))
             });
         // trivial_subqueryscan requires a target list as long as the
         // subquery's, of its Vars in order (or Consts equal to its
@@ -1349,7 +1370,7 @@ fn set_planned_top(
         && sel
             .from_clause
             .iter()
-            .any(|f| never_removed(f, scope, snapshot))
+            .any(|f| never_removed(f, sel, scope, snapshot))
     {
         // A join with a relation the planner never removes: the scan's
         // Vars are the join's (or a dummy relation's Result's).
@@ -1369,47 +1390,206 @@ fn set_planned_top(
     }
 }
 
-/// Whether FROM item `item` holds a relation the planner never removes
-/// from the join tree: a table (a partitioned one may be proven empty,
-/// which makes the join a dummy relation, not the other side alone) not
-/// on the nullable side of an outer join (`join_is_removable`).
-fn never_removed(item: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> bool {
-    use crate::pg_catalog::RelKind;
+/// Whether FROM item `item` of `sel` holds a relation the planner never
+/// removes from the join tree: a table (a partitioned one may be proven
+/// empty, which makes the join a dummy relation, not the other side
+/// alone) not on the nullable side of an outer join — or on one
+/// `join_is_removable` can't drop (see [`nullable_side_kept`]).
+fn never_removed(
+    item: &protobuf::Node,
+    sel: &protobuf::SelectStmt,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> bool {
     match item.node.as_ref() {
-        Some(node::Node::RangeVar(rv)) => {
-            let name = rv
-                .alias
-                .as_ref()
-                .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
-            scope.sources.iter().any(|s| {
-                s.alias == name
-                    && matches!(s.kind, crate::scope::SourceKind::Relation)
-                    && s.relid.is_some_and(|r| {
-                        snapshot.pg_class.get(&r).is_some_and(|c| {
-                            matches!(
-                                c.relkind,
-                                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
-                            )
-                        })
-                    })
-            })
-        }
+        Some(node::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot).is_some(),
         Some(node::Node::JoinExpr(j)) => {
             let side = |n: &Option<Box<protobuf::Node>>| {
                 n.as_deref()
-                    .is_some_and(|n| never_removed(n, scope, snapshot))
+                    .is_some_and(|n| never_removed(n, sel, scope, snapshot))
+            };
+            let nullable = |n: &Option<Box<protobuf::Node>>| {
+                n.as_deref()
+                    .is_some_and(|n| nullable_side_kept(n, j, sel, scope, snapshot))
             };
             match protobuf::JoinType::try_from(j.jointype) {
                 Ok(protobuf::JoinType::JoinInner | protobuf::JoinType::JoinFull) => {
                     side(&j.larg) || side(&j.rarg)
                 }
-                Ok(protobuf::JoinType::JoinLeft) => side(&j.larg),
-                Ok(protobuf::JoinType::JoinRight) => side(&j.rarg),
+                Ok(protobuf::JoinType::JoinLeft) => side(&j.larg) || nullable(&j.rarg),
+                Ok(protobuf::JoinType::JoinRight) => side(&j.rarg) || nullable(&j.larg),
                 _ => false,
             }
         }
         _ => false,
     }
+}
+
+/// The FROM entry of `scope` RangeVar `rv` is, when it is a table,
+/// partitioned table or materialized view.
+fn relation_source<'a>(
+    rv: &protobuf::RangeVar,
+    scope: &'a Scope,
+    snapshot: &PgCatalog,
+) -> Option<&'a crate::scope::TableSource> {
+    use crate::pg_catalog::RelKind;
+    let name = rv
+        .alias
+        .as_ref()
+        .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
+    scope.sources.iter().find(|s| {
+        s.alias == name
+            && matches!(s.kind, crate::scope::SourceKind::Relation)
+            && s.relid.is_some_and(|r| {
+                snapshot.pg_class.get(&r).is_some_and(|c| {
+                    matches!(
+                        c.relkind,
+                        RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+                    )
+                })
+            })
+    })
+}
+
+/// Whether `item`, the nullable side of outer join `j` of `sel`, certainly
+/// stays in the join tree (and so the join does): `join_is_removable`
+/// drops only a single relation (two tables inner-joined there make its
+/// `min_righthand` no singleton — tables with no unique index, which
+/// self-join elimination can't merge either) that is proven distinct for
+/// the join: a unique index (`rel_supports_distinctness`) each key column
+/// of which a clause of the join equates to the other side or a constant
+/// (`relation_has_unique_index_for`), none of its columns used above the
+/// join (in the target list or a WHERE qual, which is pushed down).
+fn nullable_side_kept(
+    item: &protobuf::Node,
+    j: &protobuf::JoinExpr,
+    sel: &protobuf::SelectStmt,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> bool {
+    let unique_index = |relid| {
+        snapshot
+            .pg_index
+            .values()
+            .any(|i| i.indrelid == relid && i.indisunique)
+    };
+    let rv = match item.node.as_ref() {
+        Some(node::Node::RangeVar(rv)) => rv,
+        Some(node::Node::JoinExpr(inner)) => {
+            let plain = |n: &Option<Box<protobuf::Node>>| match n
+                .as_deref()
+                .and_then(|n| n.node.as_ref())
+            {
+                Some(node::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot)
+                    .and_then(|s| s.relid)
+                    .filter(|&r| !unique_index(r)),
+                _ => None,
+            };
+            return protobuf::JoinType::try_from(inner.jointype)
+                == Ok(protobuf::JoinType::JoinInner)
+                && plain(&inner.larg).is_some()
+                && plain(&inner.rarg).is_some();
+        }
+        _ => return false,
+    };
+    let Some(source) = relation_source(rv, scope, snapshot) else {
+        return false;
+    };
+    let Some(relid) = source.relid else {
+        return false;
+    };
+    if j.is_natural {
+        return false;
+    }
+    // The column names the join's clauses mention, whichever entry's.
+    let mut mentioned: Vec<&str> = j
+        .using_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    if let Some(quals) = j.quals.as_deref() {
+        let mut todo: Vec<_> = quals
+            .node
+            .as_ref()
+            .map(|n| n.to_ref())
+            .into_iter()
+            .collect();
+        while let Some(n) = todo.pop() {
+            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
+                && let Some(node::Node::String(s)) = cr.fields.last().and_then(|f| f.node.as_ref())
+            {
+                mentioned.push(s.sval.as_str());
+            }
+            todo.extend(n.children());
+        }
+    }
+    let attributes = snapshot.attributes_of(relid);
+    let provable = snapshot.pg_index.values().any(|i| {
+        i.indrelid == relid
+            && i.indisunique
+            && i.indkey
+                .iter()
+                .take(usize::try_from(i.indnkeyatts).unwrap_or(0))
+                .all(|&attnum| {
+                    attnum == 0
+                        || attributes
+                            .iter()
+                            .find(|a| a.attnum == attnum)
+                            .is_none_or(|a| mentioned.contains(&a.attname.as_str()))
+                })
+    });
+    if !provable {
+        return true;
+    }
+    // A column of the relation read above the join (outside sublinks,
+    // whose names may be their own entries').
+    let reads = |n: &protobuf::Node| {
+        contains_node_outside_sublinks(n, &|n| match n {
+            typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                let star = cr
+                    .fields
+                    .last()
+                    .is_some_and(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
+                if star {
+                    match cr.fields.as_slice() {
+                        [_] => !source.columns.is_empty(),
+                        [t, _] => matches!(t.node.as_ref(),
+                            Some(node::Node::String(s)) if s.sval == source.alias),
+                        _ => false,
+                    }
+                } else {
+                    column_ref_target(cr, scope)
+                        .is_some_and(|c| source.columns.iter().any(|x| std::ptr::eq(x, c)))
+                }
+            }
+            _ => false,
+        })
+    };
+    sel.target_list.iter().any(reads) || sel.where_clause.as_deref().is_some_and(reads)
+}
+
+/// Whether `n` holds a node `pred` accepts, not looking into sublinks.
+fn contains_node_outside_sublinks(
+    n: &protobuf::Node,
+    pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>) -> bool,
+) -> bool {
+    let Some(n) = n.node.as_ref() else {
+        return false;
+    };
+    let mut todo = vec![n.to_ref()];
+    while let Some(n) = todo.pop() {
+        if matches!(n, typedpg_pg_query::NodeRef::SubLink(_)) {
+            continue;
+        }
+        if pred(n) {
+            return true;
+        }
+        todo.extend(n.children());
+    }
+    false
 }
 
 /// The column of `scope` output expression `n` is once parse analysis and
@@ -1621,10 +1801,29 @@ fn scan_facts(
                     && !snapshot.pg_inherits.iter().any(|i| i.inhparent == r)
             })
         });
+    // Its sorted paths are index scans, or (over partitions or inheritance
+    // children) MergeAppends of them or Appends in partition-key order:
+    // keys of a collatable type have the index's or the partition key's
+    // collation, never none (no join qual a merge join could sort on — a
+    // conflicting CASE equated across tables plans to a comparison with no
+    // collation — and no ORDER BY, grouping or window of its own).
+    let collated_sorts = !sel.from_clause.is_empty()
+        && sel.from_clause.iter().all(|f| {
+            source_of(f).is_some_and(|s| {
+                matches!(
+                    relkind(s),
+                    Some(RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView)
+                )
+            })
+        })
+        && plain_level
+        && sel.sort_clause.is_empty()
+        && (sel.from_clause.len() == 1 || sel.where_clause.is_none());
     crate::scope::ScanFacts {
         kept: dummy || row_marks || resjunk_sort,
         no_pushdown: sel.limit_count.is_some() || sel.limit_offset.is_some(),
         unsorted,
+        collated_sorts,
     }
 }
 
