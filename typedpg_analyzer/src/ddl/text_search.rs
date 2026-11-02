@@ -686,6 +686,16 @@ fn kind_of(objtype: ObjectType) -> Option<&'static str> {
     }
 }
 
+/// The OID of the text search object of `kind` a DROP names, if it exists.
+pub(crate) fn drop_target_oid(
+    interp: &PgCatalog,
+    kind: &str,
+    nodes: &[typedpg_pg_query::protobuf::Node],
+) -> Option<crate::oid::PgGenericOid> {
+    let at = position(interp, kind, &names_of(nodes)).ok()?;
+    Some(interp.pg_ts_objects[at].oid)
+}
+
 /// The index in `pg_ts_objects` of the object `names` resolves to.
 fn position(interp: &PgCatalog, kind: &str, names: &[&str]) -> Result<usize, DdlError> {
     find(interp, kind, names)?;

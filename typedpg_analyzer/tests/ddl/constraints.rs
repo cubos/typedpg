@@ -456,7 +456,7 @@ fn drop_column_with_fk_target_without_cascade_is_rejected() {
             ("0002.sql", "ALTER TABLE p DROP COLUMN id;"),
         ]),
         DdlError::DependencyError(_),
-        "cannot drop column id of table p because other objects depend on it (constraint(s) c_p_id_fkey depend on this column)",
+        "cannot drop column id of table p because other objects depend on it (constraint c_p_id_fkey on table c depends on column id of table p)",
     );
 }
 

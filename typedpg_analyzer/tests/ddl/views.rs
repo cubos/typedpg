@@ -112,7 +112,7 @@ fn view_drop_referenced_column_fails_without_cascade() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop column name of table t because other objects depend on it (view(s) public.v depend on this column)"
+        "cannot drop column name of table t because other objects depend on it (view v depends on column name of table t)"
     );
 }
 
@@ -709,7 +709,7 @@ fn drop_column_referenced_by_view_expression_fails() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop column id of table t because other objects depend on it (view(s) public.v depend on this column)"
+        "cannot drop column id of table t because other objects depend on it (view v depends on column id of table t)"
     );
 }
 
@@ -727,7 +727,7 @@ fn drop_column_referenced_in_view_where_fails() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop column id of table t because other objects depend on it (view(s) public.v depend on this column)"
+        "cannot drop column id of table t because other objects depend on it (view v depends on column id of table t)"
     );
 }
 
@@ -746,7 +746,7 @@ fn drop_column_referenced_in_view_join_on_fails() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop column id of table t2 because other objects depend on it (view(s) public.v depend on this column)"
+        "cannot drop column id of table t2 because other objects depend on it (view v depends on column id of table t2)"
     );
 }
 
@@ -764,7 +764,7 @@ fn drop_column_referenced_in_view_order_by_fails() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop column score of table t because other objects depend on it (view(s) public.v depend on this column)"
+        "cannot drop column score of table t because other objects depend on it (view v depends on column score of table t)"
     );
 }
 
@@ -782,7 +782,7 @@ fn drop_column_aliased_by_view_fails() {
     assert_ddl_err!(
         result,
         DdlError::DependencyError(_),
-        "cannot drop column name of table t because other objects depend on it (view(s) public.v depend on this column)"
+        "cannot drop column name of table t because other objects depend on it (view v depends on column name of table t)"
     );
 }
 
@@ -862,7 +862,7 @@ fn drop_function_referenced_by_view_fails_without_cascade() {
             ("0002.sql", "DROP FUNCTION shout(text);"),
         ]),
         DdlError::DependencyError(_),
-        "cannot drop function shout(text) because other objects depend on it (view(s) public.v depend on this function)",
+        "cannot drop function shout(text) because other objects depend on it (view v depends on function shout(text))",
     );
 }
 
@@ -898,7 +898,7 @@ fn drop_aggregate_referenced_by_view_fails_without_cascade() {
             ("0002.sql", "DROP AGGREGATE custom_sum(int);"),
         ]),
         DdlError::DependencyError(_),
-        "cannot drop function custom_sum(integer) because other objects depend on it (view(s) public.v depend on this aggregate)",
+        "cannot drop function custom_sum(integer) because other objects depend on it (view v depends on function custom_sum(integer))",
     );
 }
 
