@@ -624,6 +624,28 @@ pub struct PgTsObject {
     pub namespace: PgNamespaceOid,
 }
 
+/// `pg_ts_config_map`: a text search configuration maps token type
+/// `maptokentype` (its parser's token id) to dictionary `mapdict`, the
+/// `mapseqno`-th tried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct PgTsConfigMap {
+    /// FK `pg_ts_config.oid`.
+    pub mapcfg: PgGenericOid,
+    pub maptokentype: i32,
+    pub mapseqno: i32,
+    /// FK `pg_ts_dict.oid`.
+    pub mapdict: PgGenericOid,
+}
+
+/// `pg_conversion`: an encoding conversion, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct PgConversion {
+    pub oid: PgGenericOid,
+    pub name: String,
+    /// FK `pg_namespace.oid`.
+    pub namespace: PgNamespaceOid,
+}
+
 /// `pg_am`: an index or table access method, by name (`amtype` `i` / `t`).
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgAm {

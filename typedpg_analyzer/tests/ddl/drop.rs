@@ -4087,3 +4087,232 @@ fn a_built_in_object_is_required_by_the_database_system() {
         ("0004.sql", "DROP SCHEMA public;"),
     ]);
 }
+
+// ── Built-in configurations' mappings, built-in conversions ─────────────────
+
+#[test]
+fn a_copy_of_a_built_in_configuration_depends_on_its_dictionaries() {
+    let copy = "CREATE TEXT SEARCH CONFIGURATION c (copy = english);";
+    assert_drop_fails(
+        copy,
+        "DROP TEXT SEARCH DICTIONARY english_stem;",
+        "cannot drop text search dictionary english_stem because other objects depend on it \
+         (text search configuration english depends on text search dictionary english_stem)",
+    );
+    // With CASCADE the copy goes with english, hindi and russian.
+    build(&[
+        ("0001.sql", copy),
+        (
+            "0002.sql",
+            "DROP TEXT SEARCH DICTIONARY english_stem CASCADE;",
+        ),
+        (
+            "0003.sql",
+            "CREATE TEXT SEARCH CONFIGURATION c (copy = simple);",
+        ),
+    ]);
+    assert_drop_fails(
+        &format!("{copy} DROP TEXT SEARCH DICTIONARY english_stem CASCADE;"),
+        "ALTER TEXT SEARCH CONFIGURATION english ALTER MAPPING FOR word WITH simple;",
+        "text search configuration \"english\" does not exist",
+    );
+    // Only the copy is left once the built-in ones are gone.
+    assert_drop_fails(
+        &format!("{copy} DROP TEXT SEARCH CONFIGURATION english, hindi, russian;"),
+        "DROP TEXT SEARCH DICTIONARY english_stem;",
+        "cannot drop text search dictionary english_stem because other objects depend on it \
+         (text search configuration c depends on text search dictionary english_stem)",
+    );
+    assert_drop_fails(
+        "CREATE TEXT SEARCH CONFIGURATION c (copy = hindi);
+         DROP TEXT SEARCH CONFIGURATION hindi;",
+        "DROP TEXT SEARCH DICTIONARY hindi_stem;",
+        "cannot drop text search dictionary hindi_stem because other objects depend on it \
+         (text search configuration c depends on text search dictionary hindi_stem)",
+    );
+}
+
+#[test]
+fn altering_a_built_in_configuration_changes_its_mapping() {
+    // english maps english_stem for six token types; remapping them all
+    // releases it, remapping some does not.
+    let others = "DROP TEXT SEARCH CONFIGURATION hindi, russian;";
+    build(&[
+        (
+            "0001.sql",
+            "ALTER TEXT SEARCH CONFIGURATION english ALTER MAPPING REPLACE english_stem WITH simple;
+             CREATE TEXT SEARCH CONFIGURATION c (copy = english);",
+        ),
+        ("0002.sql", others),
+        ("0003.sql", "DROP TEXT SEARCH DICTIONARY english_stem;"),
+    ]);
+    build(&[
+        (
+            "0001.sql",
+            "ALTER TEXT SEARCH CONFIGURATION english ALTER MAPPING FOR asciiword, word, hword,
+                 hword_part, hword_asciipart, asciihword WITH simple;",
+        ),
+        ("0002.sql", others),
+        ("0003.sql", "DROP TEXT SEARCH DICTIONARY english_stem;"),
+    ]);
+    assert_drop_fails(
+        &format!(
+            "ALTER TEXT SEARCH CONFIGURATION english ALTER MAPPING FOR asciiword, word, hword,
+                 hword_part, hword_asciipart WITH simple; {others}"
+        ),
+        "DROP TEXT SEARCH DICTIONARY english_stem;",
+        "cannot drop text search dictionary english_stem because other objects depend on it \
+         (text search configuration english depends on text search dictionary english_stem)",
+    );
+    // What it maps, as a copy of it gets it.
+    for (setup, stmt, message) in [
+        (
+            "",
+            "ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR blank;",
+            "mapping for token type \"blank\" does not exist",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR asciiword;",
+            "ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR asciiword;",
+            "mapping for token type \"asciiword\" does not exist",
+        ),
+        (
+            "",
+            "ALTER TEXT SEARCH CONFIGURATION english ADD MAPPING FOR word WITH simple;",
+            "duplicate key value violates unique constraint \"pg_ts_config_map_index\"",
+        ),
+        (
+            "ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR asciiword;
+             ALTER TEXT SEARCH CONFIGURATION english ADD MAPPING FOR blank WITH simple;
+             CREATE TEXT SEARCH CONFIGURATION c (copy = english);",
+            "ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR blank WITH simple;",
+            "duplicate key value violates unique constraint \"pg_ts_config_map_index\"",
+        ),
+    ] {
+        assert_drop_fails(setup, stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "ALTER TEXT SEARCH CONFIGURATION english DROP MAPPING FOR asciiword;
+         ALTER TEXT SEARCH CONFIGURATION english ADD MAPPING FOR blank WITH simple;
+         CREATE TEXT SEARCH CONFIGURATION c (copy = english);
+         ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR asciiword WITH simple;
+         ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING FOR blank;",
+    )]);
+}
+
+#[test]
+fn a_built_in_conversion_can_be_renamed_moved_and_given_away() {
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA s;
+         ALTER CONVERSION utf8_to_iso_8859_1 RENAME TO x;
+         ALTER CONVERSION pg_catalog.x RENAME TO y;
+         COMMENT ON CONVERSION y IS 'c';
+         ALTER CONVERSION y OWNER TO CURRENT_USER;
+         ALTER CONVERSION y SET SCHEMA s;
+         COMMENT ON CONVERSION s.y IS 'c';
+         ALTER CONVERSION s.y SET SCHEMA public;
+         DROP SCHEMA s;
+         CREATE CONVERSION utf8_to_iso_8859_1 FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+         DROP CONVERSION utf8_to_iso_8859_1;",
+    )]);
+    let moved = "CREATE SCHEMA s; ALTER CONVERSION utf8_to_iso_8859_1 SET SCHEMA s;";
+    for (setup, stmt, message) in [
+        (
+            "",
+            "ALTER CONVERSION utf8_to_iso_8859_1 RENAME TO iso_8859_1_to_utf8;",
+            "conversion \"iso_8859_1_to_utf8\" already exists in schema \"pg_catalog\"",
+        ),
+        (
+            "ALTER CONVERSION utf8_to_iso_8859_1 RENAME TO x;",
+            "DROP CONVERSION utf8_to_iso_8859_1;",
+            "conversion \"utf8_to_iso_8859_1\" does not exist",
+        ),
+        // Still pinned, wherever it is: described qualified when not
+        // visible.
+        (
+            "ALTER CONVERSION utf8_to_iso_8859_1 RENAME TO x;",
+            "DROP CONVERSION x;",
+            "cannot drop conversion x because it is required by the database system",
+        ),
+        (
+            "ALTER CONVERSION utf8_to_iso_8859_1 RENAME TO x;
+             CREATE CONVERSION x FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;",
+            "DROP CONVERSION x;",
+            "cannot drop conversion x because it is required by the database system",
+        ),
+        (
+            moved,
+            "DROP CONVERSION utf8_to_iso_8859_1;",
+            "conversion \"utf8_to_iso_8859_1\" does not exist",
+        ),
+        (
+            moved,
+            "DROP CONVERSION s.utf8_to_iso_8859_1;",
+            "cannot drop conversion s.utf8_to_iso_8859_1 because it is required by the database \
+             system",
+        ),
+        (
+            moved,
+            "SET search_path = s, public; DROP CONVERSION utf8_to_iso_8859_1;",
+            "cannot drop conversion utf8_to_iso_8859_1 because it is required by the database \
+             system",
+        ),
+        (
+            moved,
+            "DROP SCHEMA s;",
+            "cannot drop conversion s.utf8_to_iso_8859_1 because it is required by the database \
+             system",
+        ),
+        (
+            moved,
+            "DROP SCHEMA s CASCADE;",
+            "cannot drop conversion s.utf8_to_iso_8859_1 because it is required by the database \
+             system",
+        ),
+        (
+            "",
+            "ALTER CONVERSION utf8_to_iso_8859_1 SET SCHEMA pg_temp;",
+            "cannot move objects into or out of temporary schemas",
+        ),
+    ] {
+        assert_drop_fails(setup, stmt, message);
+    }
+}
+
+#[test]
+fn an_unqualified_conversion_is_never_looked_up_in_the_temporary_schema() {
+    let temp = "CREATE CONVERSION pg_temp.cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;";
+    for stmt in [
+        "DROP CONVERSION cv;",
+        "COMMENT ON CONVERSION cv IS 'x';",
+        "ALTER CONVERSION cv RENAME TO cv2;",
+        "ALTER CONVERSION cv SET SCHEMA public;",
+        "ALTER CONVERSION cv OWNER TO CURRENT_USER;",
+        "SET search_path = pg_temp, public; DROP CONVERSION cv;",
+    ] {
+        assert_drop_fails(temp, stmt, "conversion \"cv\" does not exist");
+    }
+    build(&[(
+        "0001.sql",
+        &format!(
+            "{temp}
+             DROP CONVERSION IF EXISTS cv;
+             CREATE CONVERSION cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+             SET search_path = pg_temp, public;
+             COMMENT ON CONVERSION cv IS 'x';
+             COMMENT ON CONVERSION pg_temp.cv IS 'x';
+             DROP CONVERSION cv;
+             DROP CONVERSION pg_temp.cv;"
+        ),
+    )]);
+    assert_drop_fails(
+        &format!(
+            "{temp} CREATE CONVERSION cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1;
+             SET search_path = pg_temp, public; DROP CONVERSION cv;"
+        ),
+        "DROP CONVERSION cv;",
+        "conversion \"cv\" does not exist",
+    );
+}

@@ -6,16 +6,8 @@ use typedpg_pg_query::protobuf::CreateConversionStmt;
 
 use super::DdlError;
 use super::util::node_string;
-use crate::oid::{PgGenericOid, PgNamespaceOid, PgTypeOid};
-use crate::pg_catalog::PgCatalog;
-
-/// `pg_conversion`: a conversion a migration created.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Conversion {
-    pub(crate) name: String,
-    pub(crate) namespace: PgNamespaceOid,
-    pub(crate) oid: PgGenericOid,
-}
+use crate::oid::{PgGenericOid, PgTypeOid};
+use crate::pg_catalog::{PgCatalog, PgConversion};
 
 /// pg_encname_tbl (encnames.c): every accepted spelling, cleaned, with
 /// its encoding's canonical name.
@@ -192,7 +184,7 @@ pub fn create_conversion(
         )));
     }
     let oid = PgGenericOid::from_nonzero(interp.alloc_oid()?);
-    interp.conversions.push(Conversion {
+    interp.conversions.push(PgConversion {
         name,
         namespace: nsoid,
         oid,
@@ -233,149 +225,13 @@ fn conversion_rejection(proname: &str, pairs: &[(&str, &str)], from: &str, to: &
     format!("unexpected encoding ID {id} for {family} character sets")
 }
 
-/// The conversions of a stock database, in `pg_catalog`
-/// (pg_conversion.dat).
-const BUILTIN_CONVERSIONS: &[&str] = &[
-    "koi8_r_to_mic",
-    "mic_to_koi8_r",
-    "iso_8859_5_to_mic",
-    "mic_to_iso_8859_5",
-    "windows_1251_to_mic",
-    "mic_to_windows_1251",
-    "windows_866_to_mic",
-    "mic_to_windows_866",
-    "koi8_r_to_windows_1251",
-    "windows_1251_to_koi8_r",
-    "koi8_r_to_windows_866",
-    "windows_866_to_koi8_r",
-    "windows_866_to_windows_1251",
-    "windows_1251_to_windows_866",
-    "iso_8859_5_to_koi8_r",
-    "koi8_r_to_iso_8859_5",
-    "iso_8859_5_to_windows_1251",
-    "windows_1251_to_iso_8859_5",
-    "iso_8859_5_to_windows_866",
-    "windows_866_to_iso_8859_5",
-    "euc_cn_to_mic",
-    "mic_to_euc_cn",
-    "euc_jp_to_sjis",
-    "sjis_to_euc_jp",
-    "euc_jp_to_mic",
-    "sjis_to_mic",
-    "mic_to_euc_jp",
-    "mic_to_sjis",
-    "euc_kr_to_mic",
-    "mic_to_euc_kr",
-    "euc_tw_to_big5",
-    "big5_to_euc_tw",
-    "euc_tw_to_mic",
-    "big5_to_mic",
-    "mic_to_euc_tw",
-    "mic_to_big5",
-    "iso_8859_2_to_mic",
-    "mic_to_iso_8859_2",
-    "windows_1250_to_mic",
-    "mic_to_windows_1250",
-    "iso_8859_2_to_windows_1250",
-    "windows_1250_to_iso_8859_2",
-    "iso_8859_1_to_mic",
-    "mic_to_iso_8859_1",
-    "iso_8859_3_to_mic",
-    "mic_to_iso_8859_3",
-    "iso_8859_4_to_mic",
-    "mic_to_iso_8859_4",
-    "big5_to_utf8",
-    "utf8_to_big5",
-    "utf8_to_koi8_r",
-    "koi8_r_to_utf8",
-    "utf8_to_koi8_u",
-    "koi8_u_to_utf8",
-    "utf8_to_windows_866",
-    "windows_866_to_utf8",
-    "utf8_to_windows_874",
-    "windows_874_to_utf8",
-    "utf8_to_windows_1250",
-    "windows_1250_to_utf8",
-    "utf8_to_windows_1251",
-    "windows_1251_to_utf8",
-    "utf8_to_windows_1252",
-    "windows_1252_to_utf8",
-    "utf8_to_windows_1253",
-    "windows_1253_to_utf8",
-    "utf8_to_windows_1254",
-    "windows_1254_to_utf8",
-    "utf8_to_windows_1255",
-    "windows_1255_to_utf8",
-    "utf8_to_windows_1256",
-    "windows_1256_to_utf8",
-    "utf8_to_windows_1257",
-    "windows_1257_to_utf8",
-    "utf8_to_windows_1258",
-    "windows_1258_to_utf8",
-    "euc_cn_to_utf8",
-    "utf8_to_euc_cn",
-    "euc_jp_to_utf8",
-    "utf8_to_euc_jp",
-    "euc_kr_to_utf8",
-    "utf8_to_euc_kr",
-    "euc_tw_to_utf8",
-    "utf8_to_euc_tw",
-    "gb18030_to_utf8",
-    "utf8_to_gb18030",
-    "gbk_to_utf8",
-    "utf8_to_gbk",
-    "utf8_to_iso_8859_2",
-    "iso_8859_2_to_utf8",
-    "utf8_to_iso_8859_3",
-    "iso_8859_3_to_utf8",
-    "utf8_to_iso_8859_4",
-    "iso_8859_4_to_utf8",
-    "utf8_to_iso_8859_9",
-    "iso_8859_9_to_utf8",
-    "utf8_to_iso_8859_10",
-    "iso_8859_10_to_utf8",
-    "utf8_to_iso_8859_13",
-    "iso_8859_13_to_utf8",
-    "utf8_to_iso_8859_14",
-    "iso_8859_14_to_utf8",
-    "utf8_to_iso_8859_15",
-    "iso_8859_15_to_utf8",
-    "utf8_to_iso_8859_16",
-    "iso_8859_16_to_utf8",
-    "utf8_to_iso_8859_5",
-    "iso_8859_5_to_utf8",
-    "utf8_to_iso_8859_6",
-    "iso_8859_6_to_utf8",
-    "utf8_to_iso_8859_7",
-    "iso_8859_7_to_utf8",
-    "utf8_to_iso_8859_8",
-    "iso_8859_8_to_utf8",
-    "iso_8859_1_to_utf8",
-    "utf8_to_iso_8859_1",
-    "johab_to_utf8",
-    "utf8_to_johab",
-    "sjis_to_utf8",
-    "utf8_to_sjis",
-    "uhc_to_utf8",
-    "utf8_to_uhc",
-    "euc_jis_2004_to_utf8",
-    "utf8_to_euc_jis_2004",
-    "shift_jis_2004_to_utf8",
-    "utf8_to_shift_jis_2004",
-    "euc_jis_2004_to_shift_jis_2004",
-    "shift_jis_2004_to_euc_jis_2004",
-];
+/// FirstUnpinnedObjectId: what initdb's bootstrap creates (every
+/// pg_conversion.dat row) is pinned.
+const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 
-/// get_conversion_oid: whether conversion `names` exists — one created by
-/// the migrations, or a built-in one.
+/// get_conversion_oid: whether conversion `names` exists.
 pub(crate) fn conversion_exists(interp: &PgCatalog, names: &[&str]) -> bool {
-    if find(interp, names).is_some() {
-        return true;
-    }
-    match names {
-        [name] | ["pg_catalog", name] => BUILTIN_CONVERSIONS.contains(name),
-        _ => false,
-    }
+    find(interp, names).is_some()
 }
 
 /// get_conversion_oid's error: a schema that doesn't exist first.
@@ -388,14 +244,16 @@ pub(crate) fn not_found(interp: &PgCatalog, names: &[&str]) -> DdlError {
     DdlError::TypeNotFound(format!("conversion \"{}\" does not exist", names.join(".")))
 }
 
-fn find(interp: &PgCatalog, names: &[&str]) -> Option<Conversion> {
+/// get_conversion_oid: the named schema, or the search path — never the
+/// temporary schema, as ConversionGetConid skips it.
+fn find(interp: &PgCatalog, names: &[&str]) -> Option<PgConversion> {
     let (schema, name) = match names {
         [schema, name] => (Some(*schema), *name),
         [name] => (None, *name),
         _ => return None,
     };
     interp
-        .schemas_for_lookup(schema)
+        .schemas_for_function_lookup(schema)
         .into_iter()
         .find_map(|ns| {
             interp
@@ -404,6 +262,38 @@ fn find(interp: &PgCatalog, names: &[&str]) -> Option<Conversion> {
                 .find(|c| c.name == name && c.namespace == ns)
                 .cloned()
         })
+}
+
+/// getObjectDescription of a conversion: qualified unless visible
+/// (ConversionIsVisible: the first of its name along the search path, the
+/// temporary schema skipped).
+pub(crate) fn describe(interp: &PgCatalog, conversion: &PgConversion) -> String {
+    let visible = find(interp, &[conversion.name.as_str()]).map(|c| c.oid) == Some(conversion.oid);
+    match interp.namespace_name(conversion.namespace) {
+        Some(ns) if !visible => format!(
+            "conversion {}",
+            typedpg_core::QualifiedName::new(ns, &conversion.name)
+        ),
+        _ => format!(
+            "conversion {}",
+            typedpg_core::quote_identifier(&conversion.name)
+        ),
+    }
+}
+
+/// findDependentObjects on a pinned conversion (the built-in ones, wherever
+/// ALTER CONVERSION moved them): nothing drops it.
+pub(crate) fn check_not_pinned(
+    interp: &PgCatalog,
+    conversion: &PgConversion,
+) -> Result<(), DdlError> {
+    if conversion.oid.get() < FIRST_UNPINNED_OBJECT_ID {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop {} because it is required by the database system",
+            describe(interp, conversion)
+        )));
+    }
+    Ok(())
 }
 
 /// DROP CONVERSION [IF EXISTS] name.
@@ -416,29 +306,9 @@ pub(crate) fn drop_conversion(
         return Ok(());
     };
     let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
-    let found = find(interp, &names);
-    // A built-in conversion (all of pg_conversion.dat's are pinned) wins
-    // over one a migration made when pg_catalog comes first in the path.
-    let builtin = match names.as_slice() {
-        ["pg_catalog", name] => Some(*name),
-        [name] => {
-            let path = interp.schemas_for_lookup(None);
-            let at = |ns| path.iter().position(|&p| p == ns);
-            found
-                .as_ref()
-                .is_none_or(|f| interp.pg_catalog_oid().and_then(at) < at(f.namespace))
-                .then_some(*name)
-        }
-        _ => None,
-    }
-    .filter(|name| BUILTIN_CONVERSIONS.contains(name));
-    if let Some(name) = builtin {
-        return Err(DdlError::DependencyError(format!(
-            "cannot drop conversion {name} because it is required by the database system"
-        )));
-    }
-    match found {
+    match find(interp, &names) {
         Some(found) => {
+            check_not_pinned(interp, &found)?;
             interp.conversions.retain(|c| *c != found);
             Ok(())
         }
@@ -458,14 +328,10 @@ pub(crate) fn rename_conversion(
         return Ok(());
     };
     let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
-    let Some(Conversion {
-        name: old,
-        namespace: ns,
-        ..
-    }) = find(interp, &names)
-    else {
+    let Some(found) = find(interp, &names) else {
         return Err(not_found(interp, &names));
     };
+    let ns = found.namespace;
     if interp
         .conversions
         .iter()
@@ -477,11 +343,7 @@ pub(crate) fn rename_conversion(
             stmt.newname
         )));
     }
-    for c in interp
-        .conversions
-        .iter_mut()
-        .filter(|c| c.name == old && c.namespace == ns)
-    {
+    for c in interp.conversions.iter_mut().filter(|c| c.oid == found.oid) {
         c.name.clone_from(&stmt.newname);
     }
     Ok(())
