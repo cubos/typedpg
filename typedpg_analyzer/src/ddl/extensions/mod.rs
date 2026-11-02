@@ -716,6 +716,20 @@ fn member_object(
                 format!("function {name}({shown})"),
             ))
         }
+        ObjectType::ObjectOperator => {
+            let wrapped = typedpg_pg_query::protobuf::Node {
+                node: Some(object.clone()),
+            };
+            let Some(oid) = super::drop::lookup_operator(interp, &wrapped)? else {
+                return Ok(None);
+            };
+            let addr = super::depend::ObjectAddress::operator(oid);
+            Some((
+                crate::pg_catalog::PG_OPERATOR_RELID,
+                addr.objid,
+                super::depend::describe(interp, addr),
+            ))
+        }
         _ => None,
     })
 }

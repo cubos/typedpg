@@ -2058,55 +2058,6 @@ pub(crate) fn record_publication_rel(
     Ok(())
 }
 
-/// ALTER TEXT SEARCH CONFIGURATION ... MAPPING ... WITH dicts: the
-/// configuration depends on the dictionaries (MakeConfigurationMapping).
-pub(crate) fn record_ts_mapping(
-    interp: &mut PgCatalog,
-    config: &[&str],
-    dicts: &[typedpg_pg_query::protobuf::Node],
-) -> Result<(), super::DdlError> {
-    let find = |interp: &PgCatalog, kind: &str, names: &[&str]| -> Option<NamedObject> {
-        let (schema, name) = match names {
-            [s, n] => (Some(*s), *n),
-            [.., n] => (None, *n),
-            [] => return None,
-        };
-        let namespace = interp.schemas_for_lookup(schema).into_iter().find(|ns| {
-            interp
-                .pg_ts_objects
-                .iter()
-                .any(|o| o.kind == kind && o.name == name && o.namespace == *ns)
-        })?;
-        Some(NamedObject::TsObject {
-            kind: kind.to_owned(),
-            name: name.to_owned(),
-            namespace,
-        })
-    };
-    let Some(config) = find(interp, "c", config) else {
-        return Ok(());
-    };
-    let Some(depender) = named_address_of(interp, &config) else {
-        return Ok(());
-    };
-    let refs: Vec<Reference> = dicts
-        .iter()
-        .filter_map(|d| match d.node.as_ref() {
-            Some(node::Node::List(l)) => {
-                let names: Vec<&str> = l
-                    .items
-                    .iter()
-                    .filter_map(super::util::node_string)
-                    .collect();
-                find(interp, "d", &names).map(Reference::Named)
-            }
-            _ => None,
-        })
-        .collect();
-    record_references(interp, depender, &refs, DepType::Normal);
-    Ok(())
-}
-
 /// `ALTER … [NO] DEPENDS ON EXTENSION` (ExecAlterObjectDependsStmt): mark
 /// `object` as depending on `extension` automatically
 /// (DEPENDENCY_AUTO_EXTENSION) — a DROP EXTENSION takes it along — once;

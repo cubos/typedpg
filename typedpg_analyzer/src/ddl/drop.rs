@@ -116,7 +116,9 @@ fn drop_each(
                 }
                 drop_type(interp, obj_node, stmt.missing_ok, cascade)?;
             }
-            ObjectType::ObjectFunction | ObjectType::ObjectProcedure => {
+            ObjectType::ObjectFunction
+            | ObjectType::ObjectProcedure
+            | ObjectType::ObjectRoutine => {
                 drop_function(interp, obj_node, stmt.missing_ok, cascade, obj_type)?;
             }
             ObjectType::ObjectExtension => {
@@ -1402,7 +1404,7 @@ fn drop_extension(
     Ok(())
 }
 
-/// `DROP FUNCTION` / `DROP PROCEDURE`.
+/// `DROP FUNCTION` / `DROP PROCEDURE` / `DROP ROUTINE`.
 fn drop_function(
     interp: &mut PgCatalog,
     obj_node: &typedpg_pg_query::protobuf::Node,
@@ -1422,7 +1424,14 @@ fn drop_function(
     else {
         return Ok(());
     };
-    let want_procedure = expected_kind == ObjectType::ObjectProcedure;
+    // A ROUTINE is described as what it is (getObjectDescription).
+    let want_procedure = match expected_kind {
+        ObjectType::ObjectRoutine => {
+            interp.pg_proc.get(&target).map(|p| p.prokind)
+                == Some(crate::pg_catalog::ProKind::Procedure)
+        }
+        kind => kind == ObjectType::ObjectProcedure,
+    };
     let kind_word = if want_procedure {
         "procedure"
     } else {
@@ -1653,6 +1662,37 @@ pub(crate) fn operator_target(
     find_operator(interp, schema, name, &|o: &PgOperator| {
         o.oprleft == left && o.oprright == right
     })
+}
+
+/// LookupOperWithArgs: the operator `obj_node` names, or PG's error when
+/// it doesn't exist.
+pub(crate) fn lookup_operator(
+    interp: &PgCatalog,
+    obj_node: &typedpg_pg_query::protobuf::Node,
+) -> Result<Option<PgOperatorOid>, DdlError> {
+    if let Some(oid) = operator_target(interp, obj_node) {
+        return Ok(Some(oid));
+    }
+    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+        return Ok(None);
+    };
+    let name = owa
+        .objname
+        .iter()
+        .filter_map(node_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    let (left, right) = parse_operator_arg_types(&owa.objargs, interp);
+    let Some(right) = right else {
+        return Ok(None);
+    };
+    let left = left
+        .map(|oid| format_type_for_message(interp, oid))
+        .unwrap_or_else(|| "NONE".to_string());
+    Err(DdlError::DependencyError(format!(
+        "operator does not exist: {left} {name} {}",
+        format_type_for_message(interp, right)
+    )))
 }
 
 pub(crate) fn find_operator(

@@ -406,6 +406,14 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
     let me =
         super::depend::ObjectAddress::new(super::depend::PG_OPCLASS_RELID, oid.into_nonzero(), 0);
     super::depend::record(interp, me, family, crate::pg_catalog::DepType::Auto);
+    // DefineOpClass: the class depends on its input type (a built-in one
+    // is pinned).
+    super::depend::record(
+        interp,
+        me,
+        [super::depend::ObjectAddress::type_(intype)],
+        crate::pg_catalog::DepType::Normal,
+    );
     // Its operators and support functions: hard members tie the class to
     // them (see opfamily_members).
     let mut members: Vec<super::opfamily_members::FamilyMember> = ops
@@ -426,8 +434,8 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
 /// DefineOpClass / AlterOpFamilyAdd: an `OPERATOR n name [(left, right)]`
 /// item becomes a search member (`pg_amop`) of the family — its operand
 /// types default to the opclass's input type. `FOR ORDER BY` operators and
-/// FUNCTION / STORAGE items are not recorded; an operator that doesn't
-/// resolve is skipped.
+/// FUNCTION / STORAGE items are not recorded. The strategy number must be
+/// in the access method's range, and the operator must exist.
 fn family_operator(
     interp: &PgCatalog,
     family: &str,
@@ -435,12 +443,26 @@ fn family_operator(
     am: &str,
     item: &CreateOpClassItem,
     intype: Option<PgTypeOid>,
-) -> Option<PgAmop> {
-    // OPCLASS_ITEM_OPERATOR, not FOR ORDER BY.
-    if item.itemtype != 1 || !item.order_family.is_empty() {
-        return None;
+) -> Result<Option<PgAmop>, DdlError> {
+    // OPCLASS_ITEM_OPERATOR.
+    if item.itemtype != 1 {
+        return Ok(None);
     }
-    let owa = item.name.as_ref()?;
+    if let Some(max) = am_strategies(interp, am)
+        && (item.number <= 0 || item.number > max)
+    {
+        return Err(DdlError::Parse(format!(
+            "invalid operator number {}, must be between 1 and {max}",
+            item.number
+        )));
+    }
+    // Not FOR ORDER BY.
+    if !item.order_family.is_empty() {
+        return Ok(None);
+    }
+    let Some(owa) = item.name.as_ref() else {
+        return Ok(None);
+    };
     let (left, right) = match owa.objargs.as_slice() {
         [l, r] => {
             let resolve = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
@@ -450,13 +472,13 @@ fn family_operator(
             (resolve(l), resolve(r))
         }
         [] => (intype, intype),
-        _ => return None,
+        _ => return Ok(None),
     };
     let (Some(left), Some(right)) = (left, right) else {
-        return None;
+        return Ok(None);
     };
     let (schema, name) = split_name(&owa.objname);
-    let opr = interp
+    let Some(opr) = interp
         .schemas_for_lookup(schema.as_deref())
         .into_iter()
         .find_map(|ns| {
@@ -467,8 +489,17 @@ fn family_operator(
                     && o.oprright == right
             })
         })
-        .map(|o| o.oid)?;
-    Some(PgAmop {
+        .map(|o| o.oid)
+    else {
+        // LookupOperName.
+        return Err(DdlError::TypeNotFound(format!(
+            "operator does not exist: {} {} {}",
+            super::util::format_type_for_message(interp, left),
+            written(&owa.objname),
+            super::util::format_type_for_message(interp, right),
+        )));
+    };
+    Ok(Some(PgAmop {
         amopfamily: family.to_owned(),
         amopfamilynamespace: family_ns,
         amopmethod: am.to_owned(),
@@ -476,7 +507,26 @@ fn family_operator(
         amoprighttype: right,
         amopstrategy: i16::try_from(item.number).unwrap_or_default(),
         amopopr: opr,
-    })
+    }))
+}
+
+/// The access method's `amstrategies`, when it fixes one: btree's 5,
+/// hash's and bloom's 1 (BTMaxStrategyNumber, HTMaxStrategyNumber,
+/// BLOOM_NSTRATEGIES), by its handler. The others (GiST, GIN, SP-GiST,
+/// BRIN) take any positive number.
+fn am_strategies(interp: &PgCatalog, am: &str) -> Option<i32> {
+    let handler = interp
+        .pg_am
+        .iter()
+        .find(|a| a.amname == am)?
+        .amhandler
+        .and_then(|h| interp.pg_proc.get(&h))
+        .map(|p| p.proname.as_str())?;
+    match handler {
+        "bthandler" => Some(5),
+        "hashhandler" | "blhandler" => Some(1),
+        _ => None,
+    }
 }
 
 /// Whether `a` and `b` are the same member of a family: strategy number
@@ -506,7 +556,7 @@ fn family_operators(
         let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
             continue;
         };
-        let Some(op) = family_operator(interp, family, family_ns, am, item, intype) else {
+        let Some(op) = family_operator(interp, family, family_ns, am, item, intype)? else {
             continue;
         };
         if ops.iter().any(|o| same_member(o, &op)) {

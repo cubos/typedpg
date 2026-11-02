@@ -1913,6 +1913,23 @@ impl PgCatalog {
         self.pg_operator.insert(row.oid, row);
     }
 
+    /// ALTER OPERATOR ... SET SCHEMA: operator `oid` now lives in `nsoid`.
+    pub(crate) fn move_pg_operator(&mut self, oid: PgOperatorOid, nsoid: PgNamespaceOid) {
+        let Some(row) = self.pg_operator.get_mut(&oid) else {
+            return;
+        };
+        let old = (row.oprnamespace, row.oprname.clone());
+        row.oprnamespace = nsoid;
+        let new = (nsoid, row.oprname.clone());
+        if let Some(v) = self.operator_by_qname.get_mut(&old) {
+            v.retain(|&o| o != oid);
+            if v.is_empty() {
+                self.operator_by_qname.remove(&old);
+            }
+        }
+        self.operator_by_qname.entry(new).or_default().push(oid);
+    }
+
     pub(crate) fn remove_pg_operator(&mut self, oid: PgOperatorOid) -> Option<PgOperator> {
         // A family's soft members go with their operator (DEPENDENCY_AUTO).
         let object = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());

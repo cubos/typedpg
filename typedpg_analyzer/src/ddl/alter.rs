@@ -546,6 +546,36 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
         | ObjectType::ObjectTstemplate => {
             crate::ddl::text_search::set_schema(interp, object_type, stmt, new_nsoid)
         }
+        // AlterObjectNamespace_oid: the operator keeps its name and operand
+        // types, which must be free in the new schema.
+        ObjectType::ObjectOperator => {
+            let Some(object) = stmt.object.as_deref() else {
+                return Ok(());
+            };
+            let Some(oid) = crate::ddl::drop::lookup_operator(interp, object)? else {
+                return Ok(());
+            };
+            let Some(op) = interp.pg_operator.get(&oid).cloned() else {
+                return Ok(());
+            };
+            if op.oprnamespace == new_nsoid {
+                return Ok(());
+            }
+            if interp.pg_operator.values().any(|o| {
+                o.oprnamespace == new_nsoid
+                    && o.oprname == op.oprname
+                    && o.oprleft == op.oprleft
+                    && o.oprright == op.oprright
+            }) {
+                return Err(DdlError::DuplicateObject(
+                    "duplicate key value violates unique constraint \
+                     \"pg_operator_oprname_l_r_n_index\""
+                        .into(),
+                ));
+            }
+            interp.move_pg_operator(oid, new_nsoid);
+            Ok(())
+        }
         ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match stmt.object.as_deref() {
             Some(object) => crate::ddl::opclass::rename_or_move_am_object(
                 interp,

@@ -2800,3 +2800,262 @@ fn support_functions_are_checked_as_assign_proc_types_does() {
         "CREATE OPERATOR CLASS oc FOR TYPE int4 USING btree AS FUNCTION 4 btequalimage(oid);",
     )]);
 }
+
+// ── Text search configurations, operator classes' types, misc ───────────────
+
+#[test]
+fn a_configuration_depends_on_what_its_mapping_names_now() {
+    let dicts = "CREATE TEXT SEARCH DICTIONARY d1 (template = simple);
+                 CREATE TEXT SEARCH DICTIONARY d2 (template = simple);
+                 CREATE TEXT SEARCH CONFIGURATION c (copy = english);
+                 ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword WITH d1;";
+    // Mapping elsewhere releases d1.
+    for change in [
+        "ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword WITH d2;",
+        "ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING REPLACE d1 WITH d2;",
+        "ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword REPLACE d1 WITH d2;",
+        "ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING FOR asciiword;",
+    ] {
+        build(&[
+            ("0001.sql", dicts),
+            ("0002.sql", change),
+            ("0003.sql", "DROP TEXT SEARCH DICTIONARY d1;"),
+        ]);
+    }
+    // Still mapped for another token type.
+    assert_drop_fails(
+        "CREATE TEXT SEARCH DICTIONARY d1 (template = simple);
+         CREATE TEXT SEARCH CONFIGURATION c (copy = english);
+         ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR asciiword, email WITH d1;
+         ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING FOR asciiword;",
+        "DROP TEXT SEARCH DICTIONARY d1;",
+        "cannot drop text search dictionary d1 because other objects depend on it (text search \
+         configuration c depends on text search dictionary d1)",
+    );
+    // A copy depends on the dictionaries it copied.
+    assert_drop_fails(
+        "CREATE TEXT SEARCH DICTIONARY d1 (template = simple);
+         CREATE TEXT SEARCH CONFIGURATION c (parser = default);
+         ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH d1;
+         CREATE TEXT SEARCH CONFIGURATION c2 (copy = c);
+         DROP TEXT SEARCH CONFIGURATION c;",
+        "DROP TEXT SEARCH DICTIONARY d1;",
+        "cannot drop text search dictionary d1 because other objects depend on it (text search \
+         configuration c2 depends on text search dictionary d1)",
+    );
+}
+
+#[test]
+fn a_configuration_mapping_names_each_token_type_once() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c (copy = english);",
+            "ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH simple;",
+            "duplicate key value violates unique constraint \"pg_ts_config_map_index\"",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c (parser = default);
+             ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH simple;",
+            "ALTER TEXT SEARCH CONFIGURATION c ADD MAPPING FOR email WITH simple;",
+            "duplicate key value violates unique constraint \"pg_ts_config_map_index\"",
+        ),
+        (
+            "CREATE TEXT SEARCH CONFIGURATION c (parser = default);",
+            "ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING FOR email;",
+            "mapping for token type \"email\" does not exist",
+        ),
+    ] {
+        assert_drop_fails(setup, stmt, message);
+    }
+    build(&[(
+        "0001.sql",
+        "CREATE TEXT SEARCH CONFIGURATION c (parser = default);
+         ALTER TEXT SEARCH CONFIGURATION c ALTER MAPPING FOR email WITH simple;
+         ALTER TEXT SEARCH CONFIGURATION c DROP MAPPING IF EXISTS FOR url;",
+    )]);
+}
+
+#[test]
+fn a_configuration_depends_on_its_parser() {
+    let parser = "CREATE TEXT SEARCH PARSER pp (start = prsd_start, gettoken = prsd_nexttoken,
+                      end = prsd_end, lextypes = prsd_lextype);
+                  CREATE TEXT SEARCH CONFIGURATION c (parser = pp);
+                  CREATE TEXT SEARCH CONFIGURATION c2 (copy = c);";
+    assert_drop_fails(
+        parser,
+        "DROP TEXT SEARCH PARSER pp;",
+        "cannot drop text search parser pp because other objects depend on it (text search \
+         configuration c depends on text search parser pp)",
+    );
+    build(&[
+        ("0001.sql", parser),
+        ("0002.sql", "DROP TEXT SEARCH PARSER pp CASCADE;"),
+        ("0003.sql", parser),
+    ]);
+}
+
+#[test]
+fn an_operator_class_depends_on_its_input_type() {
+    let class = "CREATE TYPE ty AS (a int);
+                 CREATE OPERATOR CLASS oc FOR TYPE ty USING hash AS FUNCTION 1 hashint4(int);";
+    assert_drop_fails(
+        class,
+        "DROP TYPE ty;",
+        "cannot drop type ty because other objects depend on it (operator class oc for access \
+         method hash depends on type ty)",
+    );
+    // CASCADE takes the class, not its family — nor the family's loose
+    // hashint4 member (int is not the class's type).
+    build(&[
+        ("0001.sql", class),
+        ("0002.sql", "DROP TYPE ty CASCADE;"),
+        (
+            "0003.sql",
+            "CREATE TYPE ty AS (a int);
+             CREATE OPERATOR CLASS oc FOR TYPE ty USING hash FAMILY oc AS OPERATOR 1 =(int, int);",
+        ),
+    ]);
+    assert_drop_fails(
+        &format!("{class} DROP TYPE ty CASCADE; CREATE TYPE ty AS (a int);"),
+        "CREATE OPERATOR CLASS oc FOR TYPE ty USING hash FAMILY oc AS FUNCTION 1 hashint4(int);",
+        "duplicate key value violates unique constraint \"pg_amproc_fam_proc_index\"",
+    );
+    assert_drop_fails(
+        "CREATE EXTENSION cube;
+         CREATE OPERATOR CLASS my_cube_ops FOR TYPE cube USING gist AS
+             OPERATOR 3 &&,
+             FUNCTION 1 g_cube_consistent(internal, cube, smallint, oid, internal),
+             FUNCTION 2 g_cube_union(internal, internal),
+             FUNCTION 5 g_cube_penalty(internal, internal, internal),
+             FUNCTION 6 g_cube_picksplit(internal, internal),
+             FUNCTION 7 g_cube_same(cube, cube, internal);",
+        "DROP EXTENSION cube;",
+        "cannot drop extension cube because other objects depend on it",
+    );
+}
+
+#[test]
+fn drop_routine_checks_what_depends_on_the_routine() {
+    assert_drop_fails(
+        "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql AS 'select $1';
+         CREATE VIEW v AS SELECT f(1);",
+        "DROP ROUTINE f(int);",
+        "cannot drop function f(integer) because other objects depend on it (view v depends on \
+         function f(integer))",
+    );
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE PROCEDURE p(int) LANGUAGE sql AS 'select 1';
+         CREATE FUNCTION g(int) RETURNS int LANGUAGE sql AS 'select $1';
+         DROP ROUTINE p(int), g(int);",
+    )]);
+    assert!(db.find_functions(None, "p").is_empty());
+    assert!(db.find_functions(None, "g").is_empty());
+}
+
+#[test]
+fn operator_class_items_are_checked_as_pg_does() {
+    for (setup, stmt, message) in [
+        (
+            "",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS
+                 OPERATOR 1 <<<<(int, int), FUNCTION 1 btint4cmp(int, int);",
+            "operator does not exist: integer <<<< integer",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING btree;",
+            "ALTER OPERATOR FAMILY fam USING btree ADD OPERATOR 1 <<<<(int, int);",
+            "operator does not exist: integer <<<< integer",
+        ),
+        (
+            "",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING hash AS
+                 OPERATOR 3 =(int, int), FUNCTION 1 hashint4(int);",
+            "invalid operator number 3, must be between 1 and 1",
+        ),
+        (
+            "CREATE EXTENSION bloom;",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING bloom AS
+                 OPERATOR 3 =(int, int), FUNCTION 1 hashint4(int);",
+            "invalid operator number 3, must be between 1 and 1",
+        ),
+        (
+            "CREATE OPERATOR FAMILY fam USING hash;",
+            "ALTER OPERATOR FAMILY fam USING hash ADD OPERATOR 2 =(int, int);",
+            "invalid operator number 2, must be between 1 and 1",
+        ),
+        (
+            "",
+            "CREATE OPERATOR CLASS oc FOR TYPE int USING btree AS
+                 OPERATOR 6 =(int, int), FUNCTION 1 btint4cmp(int, int);",
+            "invalid operator number 6, must be between 1 and 5",
+        ),
+    ] {
+        let setup = if setup.is_empty() { "SELECT 1;" } else { setup };
+        assert_drop_fails(setup, stmt, message);
+    }
+    // GiST takes any strategy number.
+    build(&[(
+        "0001.sql",
+        "CREATE OPERATOR CLASS oc FOR TYPE int USING gist AS OPERATOR 100 =(int, int);",
+    )]);
+}
+
+#[test]
+fn an_operator_moved_to_another_schema_is_found_there() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s2;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         ALTER OPERATOR ===(int, int) SET SCHEMA s2;",
+    )]);
+    db.analyze("SELECT 1 OPERATOR(s2.===) 1").unwrap();
+    assert!(db.analyze("SELECT 1 === 1").is_err());
+    build(&[(
+        "0001.sql",
+        "CREATE SCHEMA s2;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         ALTER OPERATOR ===(int, int) SET SCHEMA s2;
+         DROP OPERATOR s2.===(int, int);",
+    )]);
+    assert_drop_fails(
+        "CREATE SCHEMA s2;
+         CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE OPERATOR s2.=== (leftarg = int, rightarg = int, function = f);",
+        "ALTER OPERATOR ===(int, int) SET SCHEMA s2;",
+        "duplicate key value violates unique constraint \"pg_operator_oprname_l_r_n_index\"",
+    );
+}
+
+#[test]
+fn alter_extension_adds_and_drops_operators() {
+    // Out of the extension, the operator drops on its own — and then
+    // holds on to the extension's type.
+    build(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);
+         DROP OPERATOR ->(hstore, text);",
+    )]);
+    assert_drop_fails(
+        "CREATE EXTENSION hstore; ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);",
+        "DROP EXTENSION hstore;",
+        "cannot drop extension hstore because other objects depend on it",
+    );
+    assert_drop_fails(
+        "CREATE EXTENSION hstore; ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);",
+        "ALTER EXTENSION hstore DROP OPERATOR ->(hstore, text);",
+        "operator ->(hstore,text) is not a member of extension \"hstore\"",
+    );
+    assert_drop_fails(
+        "CREATE FUNCTION f(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'select $1 = $2';
+         CREATE OPERATOR === (leftarg = int, rightarg = int, function = f);
+         CREATE EXTENSION hstore;
+         ALTER EXTENSION hstore ADD OPERATOR ===(int, int);",
+        "DROP OPERATOR ===(int, int);",
+        "cannot drop operator ===(integer,integer) because extension hstore requires it",
+    );
+}
