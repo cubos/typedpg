@@ -274,6 +274,15 @@ pub struct PgCatalog {
     /// The `allow_system_table_mods` GUC: a superuser may then run DDL on
     /// a system catalog.
     pub(crate) allow_system_table_mods: crate::ddl::session::BoolGuc,
+    /// Whether the session's `TimeZone` is UTC — a zone with the one fixed
+    /// offset 0 (pg_get_timezone_offset), which makes timestamp <->
+    /// timestamptz a relabeling for ALTER COLUMN TYPE
+    /// (TimestampTimestampTzRequiresRewrite). A migration's session starts
+    /// with the server's TimeZone, which the analyzer can't know: it is
+    /// taken as UTC (the default of the official images and of most hosted
+    /// servers, and the pg_sanity mirror's), until a `SET TIME ZONE` /
+    /// `SET timezone` / `set_config('TimeZone', ...)` says otherwise.
+    pub(crate) timezone_utc: crate::ddl::session::BoolGuc,
     /// The migration set `constraint_exclusion` or `plan_cache_mode`: the
     /// planner may then prove more relations empty, or plan an EXECUTE
     /// generically, than the defaults the plan-time checks assume.
@@ -761,6 +770,7 @@ impl PgCatalog {
             generated_refs: Shared::default(),
             check_function_bodies: crate::ddl::session::BoolGuc::new(true),
             allow_system_table_mods: crate::ddl::session::BoolGuc::new(false),
+            timezone_utc: crate::ddl::session::BoolGuc::new(true),
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),

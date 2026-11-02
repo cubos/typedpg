@@ -325,6 +325,7 @@ impl PgCatalog {
     pub(crate) fn end_transaction_scope(&mut self) {
         self.check_function_bodies.local = None;
         self.allow_system_table_mods.local = None;
+        self.timezone_utc.local = None;
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
             self.refresh_search_path();
@@ -435,6 +436,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         interp.set_search_path(None, false);
         interp.check_function_bodies = BoolGuc::new(true);
         interp.allow_system_table_mods = BoolGuc::new(false);
+        interp.timezone_utc = BoolGuc::new(true);
         return Ok(());
     }
     // The parameter must exist and be settable, and a new value valid.
@@ -455,6 +457,23 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         || stmt.name.eq_ignore_ascii_case("plan_cache_mode")
     {
         interp.planner_settings_changed = true;
+    }
+    // `SET TIME ZONE ...` sets `timezone`; LOCAL / DEFAULT resets it.
+    if stmt.name.eq_ignore_ascii_case("timezone") {
+        match kind {
+            VariableSetKind::VarSetValue => {
+                if let [arg] = stmt.args.as_slice() {
+                    interp
+                        .timezone_utc
+                        .set(Some(timezone_arg_is_utc(arg)), stmt.is_local);
+                }
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
+                interp.timezone_utc.set(None, stmt.is_local);
+            }
+            _ => {}
+        }
+        return Ok(());
     }
     if let Some(guc) = interp.bool_guc_mut(&stmt.name) {
         match kind {
@@ -602,6 +621,11 @@ pub(crate) fn select_side_effects(
         if let Some((value, is_local)) = constant_named_set_config(fc, "search_path") {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
         }
+        if let Some((value, is_local)) = constant_named_set_config(fc, "timezone") {
+            interp
+                .timezone_utc
+                .set(Some(timezone_is_utc(&value)), is_local);
+        }
         for name in ["check_function_bodies", "allow_system_table_mods"] {
             if let Some((value, is_local)) = constant_named_set_config(fc, name)
                 && let Some(value) = parse_bool(&value)
@@ -612,6 +636,76 @@ pub(crate) fn select_side_effects(
         }
     }
     Ok(())
+}
+
+/// A `SET TIME ZONE` / `SET timezone` value: a number of hours, an
+/// interval (`INTERVAL '...'`), or a zone name or POSIX specification.
+fn timezone_arg_is_utc(arg: &typedpg_pg_query::protobuf::Node) -> bool {
+    match arg.node.as_ref() {
+        Some(node::Node::TypeCast(tc)) => match tc.arg.as_deref().and_then(const_arg_string) {
+            // An interval: zero when every number in it is.
+            Some(value) => value.chars().filter(char::is_ascii_digit).all(|c| c == '0'),
+            None => false,
+        },
+        _ => const_arg_string(arg).is_some_and(|v| timezone_is_utc(&v)),
+    }
+}
+
+/// Whether TimeZone `value` is a zone with the one fixed offset 0, as
+/// check_timezone reads it: a number of hours; a zone of the tz database
+/// whose only offset is 0 (`UTC`, `GMT`, `Etc/UTC`, ... — case
+/// insensitively); a POSIX specification of offset 0 and no daylight
+/// saving time (`+00`, `00:00`, `UTC0`, `<+00>0`, `XXX+0`). Any other
+/// zone — even one at 0 today, like `Africa/Abidjan`, which had other
+/// offsets before — isn't.
+pub(crate) fn timezone_is_utc(value: &str) -> bool {
+    let value = value.trim();
+    if let Ok(hours) = value.parse::<f64>() {
+        return hours == 0.0;
+    }
+    const UTC_ZONES: &[&str] = &[
+        "utc",
+        "uct",
+        "gmt",
+        "gmt0",
+        "gmt+0",
+        "gmt-0",
+        "greenwich",
+        "universal",
+        "zulu",
+        "etc/utc",
+        "etc/uct",
+        "etc/gmt",
+        "etc/gmt0",
+        "etc/gmt+0",
+        "etc/gmt-0",
+        "etc/greenwich",
+        "etc/universal",
+        "etc/zulu",
+    ];
+    if UTC_ZONES.contains(&value.to_ascii_lowercase().as_str()) {
+        return true;
+    }
+    // A POSIX specification: an abbreviation (letters, or `<...>`), then
+    // the offset — with nothing after it (no daylight saving rule).
+    let offset = if let Some(rest) = value.strip_prefix('<') {
+        match rest.split_once('>') {
+            Some((_, offset)) => offset,
+            None => return false,
+        }
+    } else {
+        let letters = value.chars().take_while(char::is_ascii_alphabetic).count();
+        if letters != 0 && letters < 3 {
+            return false;
+        }
+        &value[letters..]
+    };
+    let digits = offset.strip_prefix(['+', '-']).unwrap_or(offset);
+    !digits.is_empty()
+        && digits.split(':').count() <= 3
+        && digits
+            .split(':')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c == '0'))
 }
 
 /// A constant `SET` argument as the string GUC code parses.

@@ -121,8 +121,15 @@ fn composite_dependencies_of(
     Ok(())
 }
 
-/// contain_volatile_functions over `expr` analyzed over `relid`'s row: a
-/// function it runs — called, through an operator or a cast — is VOLATILE.
+/// contain_volatile_functions_after_planning over `expr` analyzed over
+/// `relid`'s row: a function it runs — called, through an operator or a
+/// cast — is VOLATILE. expression_planner first inlines a simple SQL
+/// function (inline_function, which takes a VOLATILE one too): its body's
+/// calls count instead of its declaration.
+///
+/// Not modelled: the planner's folding of a branch that is never taken
+/// (`CASE WHEN true THEN 1 ELSE random() END`), whose volatile call is
+/// gone after planning; such a default is taken as volatile.
 fn expression_is_volatile(
     interp: &PgCatalog,
     relid: PgClassOid,
@@ -131,22 +138,28 @@ fn expression_is_volatile(
     let used = std::cell::RefCell::new(Vec::new());
     let _ = crate::ddl::volatile::infer_over_relation(interp, relid, expr, Some(&used));
     used.into_inner().into_iter().any(|oid| {
-        interp
-            .pg_proc
-            .get(&oid)
-            .is_some_and(|p| p.provolatile == crate::pg_catalog::ProVolatile::Volatile)
+        let Some(proc) = interp.pg_proc.get(&oid) else {
+            return false;
+        };
+        if proc.provolatile != crate::pg_catalog::ProVolatile::Volatile {
+            return false;
+        }
+        match interp.inline_sql_bodies.get(&oid) {
+            Some(body) => crate::expr::plan_fold::may_be_volatile(body, interp),
+            None => true,
+        }
     })
 }
 
 /// ATColumnChangeRequiresRewrite (tablecmds.c) over the planned
-/// conversion: ALTER COLUMN TYPE rewrites the rows unless the new value is
-/// the old one relabeled — through a binary-coercible cast, a domain
-/// without constraints, a typmod the type's length-coercion support
-/// function finds a no-op (a wider varchar, varbit, numeric of the same
-/// scale, or temporal precision), or timestamp <-> timestamptz (in a UTC
-/// session). `using` is the USING expression, if any; only the bare column
-/// (or a cast of it) is no rewrite by itself. A virtual generated column
-/// has no storage; a stored one is computed anew.
+/// conversion: ALTER COLUMN TYPE rewrites the rows unless, once
+/// expression_planner folded it, the new value is the old column under
+/// RelabelTypes (a binary-coercible cast, a COLLATE, a length coercion the
+/// type's support function finds a no-op), CoerceToDomains of domains
+/// without constraints, and timestamp <-> timestamptz conversions in a
+/// session whose TimeZone is UTC. `using` is the USING expression, if any.
+/// A virtual generated column has no storage; a stored one follows the
+/// same rule.
 pub(crate) fn alter_type_rewrites(
     interp: &PgCatalog,
     attr: &PgAttribute,
@@ -154,44 +167,63 @@ pub(crate) fn alter_type_rewrites(
     new_typmod: Option<i32>,
     using: Option<&typedpg_pg_query::protobuf::Node>,
 ) -> bool {
-    let new_typmod = new_typmod.unwrap_or(-1);
-    let old_typmod = attr.atttypmod.unwrap_or(-1);
-    match attr.attgenerated {
-        Some(AttGenerated::Virtual) => return false,
-        Some(AttGenerated::Stored) => return true,
-        None => {}
+    if attr.attgenerated == Some(AttGenerated::Virtual) {
+        return false;
     }
-    let is_column = |n: &typedpg_pg_query::protobuf::Node| {
-        matches!(n.node.as_ref(), Some(node::Node::ColumnRef(cr))
-            if cr.fields.last().and_then(crate::ddl::util::node_string)
-                == Some(attr.attname.as_str()))
+    let source = match using {
+        None => Some((attr.atttypid, attr.atttypmod.unwrap_or(-1))),
+        Some(using) => using_source(interp, attr, using),
     };
-    let (src_type, src_typmod) = match using.and_then(|u| u.node.as_ref()) {
-        None => (attr.atttypid, old_typmod),
-        Some(_) if using.is_some_and(is_column) => (attr.atttypid, old_typmod),
-        Some(node::Node::TypeCast(tc)) if tc.arg.as_deref().is_some_and(is_column) => {
-            let Some(tn) = tc.type_name.as_ref() else {
-                return true;
-            };
-            let Some(cast) = crate::ddl::util::resolve_type_name(tn, interp) else {
-                return true;
-            };
-            let cast_typmod = crate::typmod::encode(interp, cast, tn)
+    let Some((src, src_typmod)) = source else {
+        return true;
+    };
+    coercion_rewrites(interp, src, src_typmod, new_type, new_typmod.unwrap_or(-1))
+}
+
+/// A USING expression that is the column under casts and COLLATE clauses
+/// none of which computes a new value: the type and typmod it ends with.
+/// `None` for anything else.
+fn using_source(
+    interp: &PgCatalog,
+    attr: &PgAttribute,
+    using: &typedpg_pg_query::protobuf::Node,
+) -> Option<(PgTypeOid, i32)> {
+    match using.node.as_ref()? {
+        node::Node::ColumnRef(cr)
+            if cr.fields.last().and_then(crate::ddl::util::node_string)
+                == Some(attr.attname.as_str()) =>
+        {
+            Some((attr.atttypid, attr.atttypmod.unwrap_or(-1)))
+        }
+        // eval_const_expressions turns a CollateExpr into a RelabelType.
+        node::Node::CollateClause(c) => using_source(interp, attr, c.arg.as_deref()?),
+        node::Node::TypeCast(tc) => {
+            let (from, from_typmod) = using_source(interp, attr, tc.arg.as_deref()?)?;
+            let tn = tc.type_name.as_ref()?;
+            let to = crate::ddl::util::resolve_type_name(tn, interp)?;
+            let to_typmod = crate::typmod::encode(interp, to, tn)
                 .ok()
                 .flatten()
                 .unwrap_or(-1);
-            if coercion_rewrites(interp, attr.atttypid, old_typmod, cast, cast_typmod) {
-                return true;
+            if coercion_rewrites(interp, from, from_typmod, to, to_typmod) {
+                return None;
             }
-            (cast, cast_typmod)
+            // A cast to the same type without a typmod changes nothing.
+            let typmod = if to_typmod >= 0 {
+                to_typmod
+            } else if to == from {
+                from_typmod
+            } else {
+                -1
+            };
+            Some((to, typmod))
         }
-        Some(_) => return true,
-    };
-    coercion_rewrites(interp, src_type, src_typmod, new_type, new_typmod)
+        _ => None,
+    }
 }
 
-/// Whether coercing `(src, src_typmod)` to `(dst, dst_typmod)` computes a
-/// new value (see [`alter_type_rewrites`]).
+/// Whether coercing a value of `(src, src_typmod)` to `(dst, dst_typmod)`
+/// computes a new value (see [`alter_type_rewrites`]).
 fn coercion_rewrites(
     interp: &PgCatalog,
     src: PgTypeOid,
@@ -200,37 +232,58 @@ fn coercion_rewrites(
     dst_typmod: i32,
 ) -> bool {
     use crate::pg_catalog::oid;
-    const VARBIT: PgTypeOid = PgTypeOid::from_raw(1562);
-    const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
-    if domain_has_constraints(interp, dst) {
-        return true;
+    // coerce_to_domain: the base type's typmod is enforced (a length
+    // coercion to it), then the domain's constraints are checked.
+    if interp
+        .pg_type
+        .get(&dst)
+        .is_some_and(|t| t.typtype == TypType::Domain)
+    {
+        if domain_has_constraints(interp, dst) {
+            return true;
+        }
+        let (base, base_typmod) = base_type_and_typmod(interp, dst);
+        return coercion_rewrites(interp, src, src_typmod, base, base_typmod);
     }
-    let s = interp.unwrap_domain(src);
-    let d = interp.unwrap_domain(dst);
-    if s != d {
+    // A domain's value is its base type's (its typmod the column's).
+    let src = interp.unwrap_domain(src);
+    if src != dst {
         let timestamps = [oid::TIMESTAMP, oid::TIMESTAMPTZ];
-        let relabel = (timestamps.contains(&s) && timestamps.contains(&d))
-            || matches!(
+        let relabel = if timestamps.contains(&src) && timestamps.contains(&dst) {
+            // TimestampTimestampTzRequiresRewrite.
+            interp.timezone_utc.get()
+        } else {
+            matches!(
                 crate::coerce::coercion_pathway(
-                    d,
-                    s,
+                    dst,
+                    src,
                     crate::coerce::CoercionContext::Explicit,
                     interp
                 ),
                 Some(crate::coerce::CoercionPath::Relabel)
-            );
-        // A typmod on the other type is a length coercion of a value whose
-        // typmod it doesn't know.
-        return !relabel || dst_typmod >= 0;
+            )
+        };
+        // Then a length coercion of a value whose typmod it doesn't know.
+        return !relabel || typmod_coercion_rewrites(dst, -1, dst_typmod);
     }
+    typmod_coercion_rewrites(dst, src_typmod, dst_typmod)
+}
+
+/// Whether the length coercion of a `typ` value of `src_typmod` to
+/// `dst_typmod` computes a new value: none is applied for no typmod, and
+/// the type's support function (varchar_support, numeric_support,
+/// TemporalSimplify, interval_support, varbit_support) finds some no-ops.
+fn typmod_coercion_rewrites(typ: PgTypeOid, src_typmod: i32, dst_typmod: i32) -> bool {
+    use crate::pg_catalog::oid;
+    const VARBIT: PgTypeOid = PgTypeOid::from_raw(1562);
+    const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
     if dst_typmod < 0 || dst_typmod == src_typmod {
         return false;
     }
-    // The length-coercion support functions' no-ops.
-    match d {
-        // varchar_support, varbit_support: a wider limit.
+    match typ {
+        // A wider limit.
         oid::VARCHAR | VARBIT => src_typmod < 0 || dst_typmod < src_typmod,
-        // numeric_support: the same scale, a precision no smaller.
+        // The same scale, a precision no smaller.
         oid::NUMERIC => {
             if src_typmod < 0 {
                 return true;
@@ -239,11 +292,11 @@ fn coercion_rewrites(
             let (dp, ds) = (((dst_typmod - 4) >> 16) & 0xffff, (dst_typmod - 4) & 0x7ff);
             !(ss == ds && dp >= sp)
         }
-        // TemporalSimplify: the maximum precision, or one no smaller.
+        // The maximum precision, or one no smaller.
         oid::TIMESTAMP | oid::TIMESTAMPTZ | oid::TIME | oid::TIMETZ => {
             !(dst_typmod == 6 || (src_typmod >= 0 && dst_typmod >= src_typmod))
         }
-        // interval_support: the fields' smallest unit and the precision.
+        // The fields' smallest unit and the precision.
         INTERVAL => {
             const FULL_RANGE: i32 = 0x7fff;
             const FULL_PRECISION: i32 = 0xffff;
@@ -261,6 +314,24 @@ fn coercion_rewrites(
         }
         _ => true,
     }
+}
+
+/// getBaseTypeAndTypmod: the type under a domain's chain, with the typmod
+/// the domain over it gives it.
+fn base_type_and_typmod(interp: &PgCatalog, typ: PgTypeOid) -> (PgTypeOid, i32) {
+    let mut current = typ;
+    let mut typmod = -1;
+    while let Some(t) = interp.pg_type.get(&current) {
+        if t.typtype != TypType::Domain {
+            break;
+        }
+        let Some(base) = t.typbasetype else {
+            break;
+        };
+        typmod = t.typtypmod.unwrap_or(-1);
+        current = base;
+    }
+    (current, typmod)
 }
 
 /// DomainHasConstraints: a domain in `typ`'s chain carries a CHECK or NOT

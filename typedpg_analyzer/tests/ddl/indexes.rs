@@ -2378,3 +2378,483 @@ fn reindex_and_cluster_of_partitioned_relations_refuse_a_transaction_block() {
     db.apply_sql("REINDEX TABLE p;").unwrap();
     db.apply_sql("REINDEX INDEX pi;").unwrap();
 }
+
+/// Each case `(rewrites, before, column, op)`: with column `c` of type
+/// `column`, `before` then `op` run in the transaction that then renames
+/// index `ti`'s column `b` and copies the table — the copy keeping the old
+/// name when `op` rewrote the table (the index's relcache entry kept),
+/// the new one otherwise. Every case was checked on PostgreSQL 18.6.
+fn assert_rewrites(cases: &[(bool, &str, &str, &str)]) {
+    for &(rewrites, before, column, op) in cases {
+        let mut db = build_db(&[(
+            "0001.sql",
+            &format!(
+                "CREATE DOMAIN dv AS varchar(10); CREATE DOMAIN dc AS char(5);
+                 CREATE DOMAIN dn AS numeric(10, 2); CREATE DOMAIN dts AS timestamp(3);
+                 CREATE DOMAIN dtz AS timestamptz(0); CREATE DOMAIN db AS bit(3);
+                 CREATE DOMAIN di AS interval day; CREATE DOMAIN dvv AS dv;
+                 CREATE DOMAIN dplain AS int; CREATE DOMAIN dcheck AS int CHECK (VALUE > 0);
+                 CREATE DOMAIN dv20 AS varchar(20); CREATE DOMAIN dts6 AS timestamp(6);
+                 CREATE FUNCTION myvol() RETURNS int VOLATILE LANGUAGE sql AS 'SELECT 1';
+                 CREATE FUNCTION myvol2() RETURNS int VOLATILE LANGUAGE sql
+                     AS 'SELECT (random() * 0)::int';
+                 CREATE FUNCTION myplv() RETURNS int VOLATILE LANGUAGE plpgsql
+                     AS 'BEGIN RETURN 1; END';
+                 CREATE TABLE t (a int, b int, c {column});
+                 CREATE INDEX ti ON t (b);"
+            ),
+        )]);
+        let name = if rewrites { "b" } else { "bz" };
+        let sql = format!(
+            "{before} {op};
+             ALTER TABLE ti RENAME COLUMN b TO bz;
+             CREATE TABLE q2 (LIKE t INCLUDING INDEXES);
+             ALTER TABLE q2_{name}_idx RENAME COLUMN {name} TO q;"
+        );
+        if let Err(err) = db.apply_sql(&sql) {
+            panic!("{before} {op} (c {column}), rewrites: {rewrites}\n  rejected: {err}");
+        }
+    }
+}
+
+#[test]
+fn alter_column_type_to_a_domain_enforces_its_base_types_typmod() {
+    // coerce_to_domain applies the base type's typmod (a length coercion,
+    // a no-op only where the type's support function finds one), then
+    // checks the domain's constraints; a domain over a domain takes the
+    // innermost typmod; a domain-typed column's typmod is unknown.
+    assert_rewrites(REWRITE_CASES_DOMAIN);
+}
+
+#[test]
+fn timestamp_to_timestamptz_is_a_relabeling_only_in_a_utc_session() {
+    // TimestampTimestampTzRequiresRewrite: no rewrite when the session's
+    // TimeZone has the one fixed offset 0 — `SET TIME ZONE`, `SET
+    // timezone`, `set_config`, SET LOCAL, RESET and LOCAL tracked.
+    assert_rewrites(REWRITE_CASES_TIMEZONE);
+}
+
+#[test]
+fn temporal_precision_six_is_no_length_coercion() {
+    // TemporalSimplify: the maximum precision (6) is a no-op whatever the
+    // source's, also after a timestamp <-> timestamptz relabeling.
+    assert_rewrites(REWRITE_CASES_TEMPORAL);
+}
+
+#[test]
+fn a_using_expression_folded_to_the_column_is_no_rewrite() {
+    // eval_const_expressions folds binary-coercible casts and COLLATE into
+    // RelabelTypes, and ATColumnChangeRequiresRewrite strips them down to
+    // the column; a stored generated column follows the same rule.
+    assert_rewrites(REWRITE_CASES_USING);
+}
+
+#[test]
+fn a_default_volatile_only_before_inlining_is_no_rewrite() {
+    // contain_volatile_functions_after_planning: a simple SQL function is
+    // inlined first, and only its body's calls count.
+    assert_rewrites(REWRITE_CASES_DEFAULT);
+}
+
+const REWRITE_CASES_DOMAIN: &[(bool, &str, &str, &str)] = &[
+    (true, "", "text", "alter table t alter column c type dv"),
+    (true, "", "varchar", "alter table t alter column c type dv"),
+    (
+        false,
+        "",
+        "varchar(5)",
+        "alter table t alter column c type dv",
+    ),
+    (
+        false,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type dv",
+    ),
+    (
+        true,
+        "",
+        "varchar(20)",
+        "alter table t alter column c type dv",
+    ),
+    (
+        false,
+        "",
+        "varchar(5)",
+        "alter table t alter column c type dv20",
+    ),
+    (true, "", "varchar", "alter table t alter column c type dc"),
+    (false, "", "char(5)", "alter table t alter column c type dc"),
+    (true, "", "bpchar", "alter table t alter column c type dc"),
+    (true, "", "numeric", "alter table t alter column c type dn"),
+    (
+        false,
+        "",
+        "numeric(10,2)",
+        "alter table t alter column c type dn",
+    ),
+    (
+        false,
+        "",
+        "numeric(8,2)",
+        "alter table t alter column c type dn",
+    ),
+    (
+        true,
+        "",
+        "timestamp",
+        "alter table t alter column c type dts",
+    ),
+    (
+        false,
+        "",
+        "timestamp(3)",
+        "alter table t alter column c type dts",
+    ),
+    (
+        false,
+        "",
+        "timestamp(1)",
+        "alter table t alter column c type dts",
+    ),
+    (
+        true,
+        "",
+        "timestamp",
+        "alter table t alter column c type dtz",
+    ),
+    (
+        false,
+        "",
+        "timestamp",
+        "alter table t alter column c type dts6",
+    ),
+    (true, "", "varbit", "alter table t alter column c type db"),
+    (true, "", "interval", "alter table t alter column c type di"),
+    (true, "", "dvv", "alter table t alter column c type dv"),
+    (true, "", "dv", "alter table t alter column c type dvv"),
+    (false, "", "dv", "alter table t alter column c type varchar"),
+    (false, "", "dv", "alter table t alter column c type text"),
+    (
+        true,
+        "",
+        "dv",
+        "alter table t alter column c type varchar(20)",
+    ),
+    (true, "", "xml", "alter table t alter column c type dv"),
+    (false, "", "int", "alter table t alter column c type dplain"),
+    (true, "", "int", "alter table t alter column c type dcheck"),
+    (
+        false,
+        "",
+        "int generated always as (a + 1) stored",
+        "alter table t alter column c type dplain",
+    ),
+];
+
+const REWRITE_CASES_TIMEZONE: &[(bool, &str, &str, &str)] = &[
+    (
+        true,
+        "set time zone 'Asia/Tokyo';",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "set time zone 'UTC';",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "set time zone 'Etc/GMT-3';",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "set time zone 'Africa/Abidjan';",
+        "timestamptz",
+        "alter table t alter column c type timestamp",
+    ),
+    (
+        false,
+        "set time zone '+00';",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "set time zone 0;",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "set time zone 3;",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "set time zone interval '00:00' hour to minute;",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "set time zone interval '+03:00' hour to minute;",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "set timezone = 'Europe/London'; set time zone local;",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "set timezone = 'Europe/London'; reset timezone;",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "select set_config('TimeZone', 'Asia/Tokyo', false);",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "",
+        "timestamp",
+        "set local time zone 'Asia/Tokyo'; alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "",
+        "timestamp",
+        "select set_config('timezone', 'Asia/Tokyo', true); alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "set time zone 'UTC0';",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        true,
+        "set time zone 'XXX3';",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "set time zone '<+00>0';",
+        "timestamp",
+        "alter table t alter column c type timestamptz",
+    ),
+];
+
+const REWRITE_CASES_USING: &[(bool, &str, &str, &str)] = &[
+    (
+        false,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type text using c::text::text",
+    ),
+    (
+        false,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type text using c::text::varchar",
+    ),
+    (
+        false,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type text using c collate \"C\"",
+    ),
+    (
+        false,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type text using (c collate \"C\")::text",
+    ),
+    (
+        false,
+        "",
+        "int",
+        "alter table t alter column c type int using c::oid::int",
+    ),
+    (
+        false,
+        "",
+        "int",
+        "alter table t alter column c type oid using c::oid",
+    ),
+    (
+        false,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type varchar(20) using c::varchar(20)",
+    ),
+    (
+        true,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type text using c::varchar(5)",
+    ),
+    (
+        true,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type text using c || ''",
+    ),
+    (
+        false,
+        "",
+        "varchar(10)",
+        "alter table t alter column c type text using t.c",
+    ),
+    (
+        true,
+        "",
+        "int",
+        "alter table t alter column c type bigint using c::int",
+    ),
+    (
+        false,
+        "",
+        "timestamp",
+        "alter table t alter column c type timestamptz using c::timestamptz",
+    ),
+    (
+        false,
+        "",
+        "int generated always as (a + 1) stored",
+        "alter table t alter column c type oid",
+    ),
+    (
+        true,
+        "",
+        "int generated always as (a + 1) stored",
+        "alter table t alter column c type bigint",
+    ),
+];
+
+const REWRITE_CASES_DEFAULT: &[(bool, &str, &str, &str)] = &[
+    (
+        false,
+        "",
+        "int",
+        "alter table t add column d int default myvol()",
+    ),
+    (
+        false,
+        "",
+        "int",
+        "alter table t add column d int default myvol() * 0",
+    ),
+    (
+        false,
+        "",
+        "int",
+        "alter table t add column d int default coalesce(null, myvol())",
+    ),
+    (
+        false,
+        "",
+        "int",
+        "alter table t add column d int default case when true then 1 else myvol() end",
+    ),
+    (
+        true,
+        "",
+        "int",
+        "alter table t add column d int default myvol2()",
+    ),
+    (
+        true,
+        "",
+        "int",
+        "alter table t add column d int default myplv()",
+    ),
+    (
+        true,
+        "",
+        "int",
+        "alter table t add column d float8 default random()",
+    ),
+    (
+        false,
+        "",
+        "int",
+        "alter table t add column d int default 1 + myvol()",
+    ),
+];
+
+const REWRITE_CASES_TEMPORAL: &[(bool, &str, &str, &str)] = &[
+    (
+        false,
+        "",
+        "timestamp",
+        "alter table t alter column c type timestamptz(6)",
+    ),
+    (
+        false,
+        "",
+        "timestamptz",
+        "alter table t alter column c type timestamp(6)",
+    ),
+    (
+        false,
+        "",
+        "timestamp(3)",
+        "alter table t alter column c type timestamp(6)",
+    ),
+    (
+        false,
+        "",
+        "timestamp",
+        "alter table t alter column c type timestamp(6)",
+    ),
+    (
+        true,
+        "",
+        "timestamp",
+        "alter table t alter column c type timestamp(3)",
+    ),
+    (
+        true,
+        "",
+        "timestamp(6)",
+        "alter table t alter column c type timestamptz(3)",
+    ),
+    (
+        false,
+        "",
+        "timestamp(3)",
+        "alter table t alter column c type timestamptz",
+    ),
+    (
+        false,
+        "",
+        "time(3)",
+        "alter table t alter column c type time(6)",
+    ),
+    (true, "", "time", "alter table t alter column c type timetz"),
+    (
+        false,
+        "",
+        "interval",
+        "alter table t alter column c type interval(6)",
+    ),
+    (
+        false,
+        "",
+        "interval(2)",
+        "alter table t alter column c type interval(3)",
+    ),
+];
