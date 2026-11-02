@@ -1009,6 +1009,28 @@ pub(crate) struct ExplainOptions {
     pub(crate) result_type: crate::PgTypeOid,
 }
 
+/// defGetBoolean (define.c): no value is true; `true` / `false` / `on` /
+/// `off`, case insensitively, or the integers 1 and 0 — nothing else
+/// (`maybe`, `yes`, `t`, `2`: `<option> requires a Boolean value`,
+/// SQLSTATE 42601).
+pub(crate) fn def_get_boolean(de: &typedpg_pg_query::protobuf::DefElem) -> Result<bool, DdlError> {
+    let value = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+        None => return Ok(true),
+        Some(node::Node::Integer(i)) => match i.ival {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        Some(node::Node::Boolean(b)) => Some(b.boolval),
+        Some(other) => match string_arg(other).map(|s| s.to_ascii_lowercase()) {
+            Some(s) if s == "true" || s == "on" => Some(true),
+            Some(s) if s == "false" || s == "off" => Some(false),
+            _ => None,
+        },
+    };
+    value.ok_or_else(|| DdlError::Parse(format!("{} requires a Boolean value", de.defname)))
+}
+
 /// ParseExplainOptionList, for a migration's EXPLAIN and a query's alike.
 /// An option the grammar of options rejects is a `syntax_error` (an
 /// unknown one, defGetBoolean), a value or combination it doesn't take an
@@ -1017,23 +1039,7 @@ pub(crate) fn explain_options(
     options: &[typedpg_pg_query::protobuf::Node],
 ) -> Result<ExplainOptions, AnalyzeError> {
     let boolean = |de: &typedpg_pg_query::protobuf::DefElem| -> Result<bool, AnalyzeError> {
-        let value = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            None => return Ok(true),
-            Some(node::Node::Integer(i)) => match i.ival {
-                0 => Some(false),
-                1 => Some(true),
-                _ => None,
-            },
-            Some(node::Node::Boolean(b)) => Some(b.boolval),
-            Some(other) => match string_arg(other).map(|s| s.to_ascii_lowercase()) {
-                Some(s) if s == "true" || s == "on" => Some(true),
-                Some(s) if s == "false" || s == "off" => Some(false),
-                _ => None,
-            },
-        };
-        value.ok_or_else(|| {
-            AnalyzeError::SyntaxError(format!("{} requires a Boolean value", de.defname))
-        })
+        def_get_boolean(de).map_err(|e| AnalyzeError::SyntaxError(e.to_string()))
     };
     let (mut analyze, mut wal, mut generic) = (false, false, false);
     let (mut timing, mut serialize) = (None, false);

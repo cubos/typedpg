@@ -193,6 +193,18 @@ fn prevent_in_transaction_block(interp: &PgCatalog, what: &str) -> Result<(), Dd
 
 /// REINDEX INDEX / TABLE / SCHEMA.
 pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlError> {
+    let concurrently = super::txblock::reindex_options(&stmt.params)?;
+    // ReindexRelationConcurrently / ReindexMultipleTables: a system catalog
+    // (IsCatalogRelationOid — its indexes and TOAST table too) can't be
+    // rebuilt concurrently.
+    let no_catalog = |relid: PgClassOid| {
+        if concurrently && relid.get() < FIRST_UNPINNED_OBJECT_ID {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot reindex system catalogs concurrently".into(),
+            ));
+        }
+        Ok(())
+    };
     match ReindexObjectType::try_from(stmt.kind) {
         Ok(ReindexObjectType::ReindexObjectIndex) => {
             let Some(rv) = stmt.relation.as_ref() else {
@@ -213,6 +225,7 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
             if relkind(interp, relid) == Some(RelKind::PartitionedIndex) {
                 prevent_in_transaction_block(interp, "REINDEX INDEX")?;
             }
+            no_catalog(relid)?;
             super::indexes::new_relfilenode(interp, relid);
         }
         Ok(ReindexObjectType::ReindexObjectTable) => {
@@ -221,6 +234,7 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                 if relkind(interp, relid) == Some(RelKind::Partitioned) {
                     prevent_in_transaction_block(interp, "REINDEX TABLE")?;
                 }
+                no_catalog(relid)?;
                 new_relfilenodes(interp, &[relid]);
             }
         }
@@ -232,10 +246,19 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                 stmt.name
             )));
         }
+        Ok(ReindexObjectType::ReindexObjectSystem) if concurrently => {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot reindex system catalogs concurrently".into(),
+            ));
+        }
         _ => {}
     }
     Ok(())
 }
+
+/// FirstUnpinnedObjectId (transam.h): the system catalogs, their indexes
+/// and TOAST tables have smaller OIDs (IsCatalogRelationOid).
+const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 
 /// VACUUM / ANALYZE: the named relations and columns must exist
 /// (vacuum_rel / do_analyze_rel); other relation kinds are skipped with a

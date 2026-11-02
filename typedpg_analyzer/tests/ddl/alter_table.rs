@@ -1613,3 +1613,3105 @@ fn alter_table_plans_what_it_evaluates_over_the_rows() {
          ALTER TABLE p ADD CHECK (a < 40000::int2);",
     )]);
 }
+
+/// The relations [`RELKIND_CASES`] run over: one of each kind.
+const RELKIND_SETUP: &str = "
+    CREATE TABLE t (a int, b int); CREATE INDEX ti ON t (a);
+    CREATE TABLE pt (a int, b int) PARTITION BY RANGE (a); CREATE INDEX pti ON pt (a);
+    CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (1) TO (2);
+    CREATE SEQUENCE s; CREATE VIEW v AS SELECT 1 AS a, 2 AS b;
+    CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a, 2 AS b;
+    CREATE FOREIGN DATA WRAPPER w; CREATE SERVER sv FOREIGN DATA WRAPPER w;
+    CREATE FOREIGN TABLE ft (a int, b int) SERVER sv;
+    CREATE TYPE ct AS (a int, b int);
+    CREATE TABLE tt (a int, b int);
+    CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';";
+
+#[test]
+fn alter_table_actions_and_relation_commands_follow_each_relation_kind() {
+    // ATSimplePermissions (ATWrongRelkindError) for every ALTER TABLE
+    // subcommand over every relation kind, and the relation kind checks of
+    // REINDEX CONCURRENTLY (no system catalog), CREATE RULE, ATTACH /
+    // DETACH PARTITION, PARTITION OF, USING INDEX and ALTER TRIGGER / RULE
+    // ... RENAME — each as PostgreSQL 18.6 answers it. What PG runs is
+    // tried in a transaction rolled back (but REINDEX CONCURRENTLY, which
+    // can't run in one); what it refuses changes nothing.
+    let mut db = build_db(&[("0001.sql", RELKIND_SETUP)]);
+    for &(sql, expected) in RELKIND_CASES {
+        match expected {
+            None => {
+                let wrapped = if sql.contains("concurrently") {
+                    format!("{sql};")
+                } else {
+                    format!("BEGIN; {sql}; ROLLBACK;")
+                };
+                if let Err(err) = db.apply_sql(&wrapped) {
+                    panic!("{sql}\n  rejected: {err}");
+                }
+            }
+            Some(message) => {
+                let err = db.apply_sql(&format!("{sql};")).expect_err(sql);
+                assert!(
+                    err.to_string().starts_with(message),
+                    "{sql}\n  expected: {message}\n       got: {err}"
+                );
+            }
+        }
+    }
+}
+
+/// `(statement, PG's error)` — `None` when PG runs it — over the relations of
+/// [`RELKIND_SETUP`], each checked on PostgreSQL 18.6.
+const RELKIND_CASES: &[(&str, Option<&str>)] = &[
+    ("alter table t add column c int", None),
+    ("alter table t drop column b", None),
+    ("alter table t alter column a set default 1", None),
+    ("alter table t alter column a drop default", None),
+    ("alter table t alter column a set not null", None),
+    ("alter table t alter column a drop not null", None),
+    ("alter table t alter column a type bigint", None),
+    ("alter table t alter column a set statistics 5", None),
+    ("alter table t alter column a set storage plain", None),
+    (
+        "alter table t alter column a set compression pglz",
+        Some("column data type integer does not support compression"),
+    ),
+    ("alter table t alter column a set (n_distinct = 1)", None),
+    ("alter table t alter column a reset (n_distinct)", None),
+    (
+        "alter table t alter column a add generated always as identity",
+        Some(
+            "column \"a\" of relation \"t\" must be declared NOT NULL before identity can be added",
+        ),
+    ),
+    (
+        "alter table t alter column a set generated always",
+        Some("column \"a\" of relation \"t\" is not an identity column"),
+    ),
+    (
+        "alter table t alter column a drop identity",
+        Some("column \"a\" of relation \"t\" is not an identity column"),
+    ),
+    (
+        "alter table t alter column a drop expression",
+        Some("column \"a\" of relation \"t\" is not a generated column"),
+    ),
+    (
+        "alter table t alter column a set expression as (1)",
+        Some("column \"a\" of relation \"t\" is not a generated column"),
+    ),
+    ("alter table t add constraint k check (a > 0)", None),
+    ("alter table t add primary key (a)", None),
+    ("alter table t add unique (a)", None),
+    (
+        "alter table t add foreign key (a) references tt (a)",
+        Some("there is no unique constraint matching given keys for referenced table \"tt\""),
+    ),
+    (
+        "alter table t add constraint k check (a > 0) not valid",
+        None,
+    ),
+    (
+        "alter table t validate constraint k",
+        Some("constraint \"k\" of relation \"t\" does not exist"),
+    ),
+    (
+        "alter table t drop constraint k",
+        Some("constraint \"k\" of relation \"t\" does not exist"),
+    ),
+    (
+        "alter table t alter constraint k deferrable",
+        Some("constraint \"k\" of relation \"t\" does not exist"),
+    ),
+    (
+        "alter table t rename constraint k to k2",
+        Some("constraint \"k\" for table \"t\" does not exist"),
+    ),
+    ("alter table t cluster on ti", None),
+    ("alter table t set without cluster", None),
+    ("alter table t set logged", None),
+    ("alter table t set unlogged", None),
+    ("alter table t set without oids", None),
+    ("alter table t set access method heap", None),
+    ("alter table t set tablespace pg_default", None),
+    ("alter table t set (fillfactor = 50)", None),
+    ("alter table t reset (fillfactor)", None),
+    ("alter table t replica identity full", None),
+    (
+        "alter table t replica identity using index ti",
+        Some("cannot use non-unique index \"ti\" as replica identity"),
+    ),
+    ("alter table t disable trigger all", None),
+    ("alter table t enable trigger all", None),
+    ("alter table t enable trigger user", None),
+    (
+        "alter table t enable always trigger tr",
+        Some("trigger \"tr\" for table \"t\" does not exist"),
+    ),
+    (
+        "alter table t disable trigger tr",
+        Some("trigger \"tr\" for table \"t\" does not exist"),
+    ),
+    (
+        "alter table t enable rule r",
+        Some("rule \"r\" for relation \"t\" does not exist"),
+    ),
+    (
+        "alter table t disable rule r",
+        Some("rule \"r\" for relation \"t\" does not exist"),
+    ),
+    (
+        "alter table t enable replica rule r",
+        Some("rule \"r\" for relation \"t\" does not exist"),
+    ),
+    ("alter table t enable row level security", None),
+    ("alter table t disable row level security", None),
+    ("alter table t force row level security", None),
+    ("alter table t no force row level security", None),
+    ("alter table t inherit tt", None),
+    (
+        "alter table t no inherit tt",
+        Some("relation \"tt\" is not a parent of relation \"t\""),
+    ),
+    ("alter table t of ct", None),
+    ("alter table t not of", Some("\"t\" is not a typed table")),
+    ("alter table t owner to postgres", None),
+    (
+        "alter table t attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"t\" (This operation is not supported for tables.",
+        ),
+    ),
+    (
+        "alter table t detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"t\" (This operation is not supported for tables.",
+        ),
+    ),
+    (
+        "alter table t options (add x 'y')",
+        Some(
+            "ALTER action OPTIONS cannot be performed on relation \"t\" (This operation is not supported for tables.",
+        ),
+    ),
+    (
+        "alter table t alter column a options (add x 'y')",
+        Some(
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"t\" (This operation is not supported for tables.",
+        ),
+    ),
+    ("alter table t rename to zz", None),
+    ("alter table t rename column a to z", None),
+    ("alter table t set schema public", None),
+    ("alter table t alter column a set data type int", None),
+    (
+        "alter table t add column c int generated always as (a + 1) stored",
+        None,
+    ),
+    ("alter table pt add column c int", None),
+    ("alter table pt drop column b", None),
+    ("alter table pt alter column a set default 1", None),
+    ("alter table pt alter column a drop default", None),
+    ("alter table pt alter column a set not null", None),
+    ("alter table pt alter column a drop not null", None),
+    (
+        "alter table pt alter column a type bigint",
+        Some(
+            "cannot alter column \"a\" because it is part of the partition key of relation \"pt\"",
+        ),
+    ),
+    ("alter table pt alter column a set statistics 5", None),
+    ("alter table pt alter column a set storage plain", None),
+    (
+        "alter table pt alter column a set compression pglz",
+        Some("column data type integer does not support compression"),
+    ),
+    ("alter table pt alter column a set (n_distinct = 1)", None),
+    ("alter table pt alter column a reset (n_distinct)", None),
+    (
+        "alter table pt alter column a add generated always as identity",
+        Some(
+            "column \"a\" of relation \"pt\" must be declared NOT NULL before identity can be added",
+        ),
+    ),
+    (
+        "alter table pt alter column a set generated always",
+        Some("column \"a\" of relation \"pt\" is not an identity column"),
+    ),
+    (
+        "alter table pt alter column a drop identity",
+        Some("column \"a\" of relation \"pt\" is not an identity column"),
+    ),
+    (
+        "alter table pt alter column a drop expression",
+        Some("column \"a\" of relation \"pt\" is not a generated column"),
+    ),
+    (
+        "alter table pt alter column a set expression as (1)",
+        Some("column \"a\" of relation \"pt\" is not a generated column"),
+    ),
+    ("alter table pt add constraint k check (a > 0)", None),
+    ("alter table pt add primary key (a)", None),
+    ("alter table pt add unique (a)", None),
+    (
+        "alter table pt add foreign key (a) references tt (a)",
+        Some("there is no unique constraint matching given keys for referenced table \"tt\""),
+    ),
+    (
+        "alter table pt add constraint k check (a > 0) not valid",
+        None,
+    ),
+    (
+        "alter table pt validate constraint k",
+        Some("constraint \"k\" of relation \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt drop constraint k",
+        Some("constraint \"k\" of relation \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt alter constraint k deferrable",
+        Some("constraint \"k\" of relation \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt rename constraint k to k2",
+        Some("constraint \"k\" for table \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt cluster on ti",
+        Some("\"ti\" is not an index for table \"pt\""),
+    ),
+    (
+        "alter table pt set without cluster",
+        Some("cannot mark index clustered in partitioned table"),
+    ),
+    (
+        "alter table pt set logged",
+        Some(
+            "ALTER action SET LOGGED cannot be performed on relation \"pt\" (This operation is not supported for partitioned tables.",
+        ),
+    ),
+    (
+        "alter table pt set unlogged",
+        Some(
+            "ALTER action SET UNLOGGED cannot be performed on relation \"pt\" (This operation is not supported for partitioned tables.",
+        ),
+    ),
+    ("alter table pt set without oids", None),
+    ("alter table pt set access method heap", None),
+    ("alter table pt set tablespace pg_default", None),
+    (
+        "alter table pt set (fillfactor = 50)",
+        Some("cannot specify storage parameters for a partitioned table"),
+    ),
+    ("alter table pt reset (fillfactor)", None),
+    ("alter table pt replica identity full", None),
+    (
+        "alter table pt replica identity using index ti",
+        Some("\"ti\" is not an index for table \"pt\""),
+    ),
+    ("alter table pt disable trigger all", None),
+    ("alter table pt enable trigger all", None),
+    ("alter table pt enable trigger user", None),
+    (
+        "alter table pt enable always trigger tr",
+        Some("trigger \"tr\" for table \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt disable trigger tr",
+        Some("trigger \"tr\" for table \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt enable rule r",
+        Some("rule \"r\" for relation \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt disable rule r",
+        Some("rule \"r\" for relation \"pt\" does not exist"),
+    ),
+    (
+        "alter table pt enable replica rule r",
+        Some("rule \"r\" for relation \"pt\" does not exist"),
+    ),
+    ("alter table pt enable row level security", None),
+    ("alter table pt disable row level security", None),
+    ("alter table pt force row level security", None),
+    ("alter table pt no force row level security", None),
+    (
+        "alter table pt inherit tt",
+        Some("cannot change inheritance of partitioned table"),
+    ),
+    (
+        "alter table pt no inherit tt",
+        Some("relation \"tt\" is not a parent of relation \"pt\""),
+    ),
+    ("alter table pt of ct", None),
+    ("alter table pt not of", Some("\"pt\" is not a typed table")),
+    ("alter table pt owner to postgres", None),
+    (
+        "alter table pt attach partition tt for values from (5) to (6)",
+        None,
+    ),
+    (
+        "alter table pt detach partition tt",
+        Some("relation \"tt\" is not a partition of relation \"pt\""),
+    ),
+    (
+        "alter table pt options (add x 'y')",
+        Some(
+            "ALTER action OPTIONS cannot be performed on relation \"pt\" (This operation is not supported for partitioned tables.",
+        ),
+    ),
+    (
+        "alter table pt alter column a options (add x 'y')",
+        Some(
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"pt\" (This operation is not supported for partitioned tables.",
+        ),
+    ),
+    ("alter table pt rename to zz", None),
+    ("alter table pt rename column a to z", None),
+    ("alter table pt set schema public", None),
+    (
+        "alter table pt alter column a set data type int",
+        Some(
+            "cannot alter column \"a\" because it is part of the partition key of relation \"pt\"",
+        ),
+    ),
+    (
+        "alter table pt add column c int generated always as (a + 1) stored",
+        None,
+    ),
+    (
+        "alter table ti add column c int",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti drop column b",
+        Some(
+            "ALTER action DROP COLUMN cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a set default 1",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a drop default",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a set not null",
+        Some(
+            "ALTER action ALTER COLUMN ... SET NOT NULL cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a drop not null",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP NOT NULL cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a type bigint",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a set statistics 5",
+        Some("cannot alter statistics on non-expression column \"a\" of index \"ti\""),
+    ),
+    (
+        "alter table ti alter column a set storage plain",
+        Some(
+            "ALTER action ALTER COLUMN ... SET STORAGE cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a set compression pglz",
+        Some(
+            "ALTER action ALTER COLUMN ... SET COMPRESSION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a set (n_distinct = 1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a reset (n_distinct)",
+        Some(
+            "ALTER action ALTER COLUMN ... RESET cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a add generated always as identity",
+        Some(
+            "ALTER action ALTER COLUMN ... ADD IDENTITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a set generated always",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a drop identity",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP IDENTITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a drop expression",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP EXPRESSION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a set expression as (1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET EXPRESSION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti add constraint k check (a > 0)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti add primary key (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti add unique (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti add foreign key (a) references tt (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti add constraint k check (a > 0) not valid",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti validate constraint k",
+        Some(
+            "ALTER action VALIDATE CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti drop constraint k",
+        Some(
+            "ALTER action DROP CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter constraint k deferrable",
+        Some(
+            "ALTER action ALTER CONSTRAINT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti rename constraint k to k2",
+        Some("constraint \"k\" for table \"ti\" does not exist"),
+    ),
+    (
+        "alter table ti cluster on ti",
+        Some(
+            "ALTER action CLUSTER ON cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti set without cluster",
+        Some(
+            "ALTER action SET WITHOUT CLUSTER cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti set logged",
+        Some(
+            "ALTER action SET LOGGED cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti set unlogged",
+        Some(
+            "ALTER action SET UNLOGGED cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti set without oids",
+        Some(
+            "ALTER action SET WITHOUT OIDS cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti set access method heap",
+        Some(
+            "ALTER action SET ACCESS METHOD cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    ("alter table ti set tablespace pg_default", None),
+    ("alter table ti set (fillfactor = 50)", None),
+    ("alter table ti reset (fillfactor)", None),
+    (
+        "alter table ti replica identity full",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti replica identity using index ti",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti disable trigger all",
+        Some(
+            "ALTER action DISABLE TRIGGER ALL cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti enable trigger all",
+        Some(
+            "ALTER action ENABLE TRIGGER ALL cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti enable trigger user",
+        Some(
+            "ALTER action ENABLE TRIGGER USER cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti enable always trigger tr",
+        Some(
+            "ALTER action ENABLE ALWAYS TRIGGER cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti disable trigger tr",
+        Some(
+            "ALTER action DISABLE TRIGGER cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti enable rule r",
+        Some(
+            "ALTER action ENABLE RULE cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti disable rule r",
+        Some(
+            "ALTER action DISABLE RULE cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti enable replica rule r",
+        Some(
+            "ALTER action ENABLE REPLICA RULE cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti enable row level security",
+        Some(
+            "ALTER action ENABLE ROW SECURITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti disable row level security",
+        Some(
+            "ALTER action DISABLE ROW SECURITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti force row level security",
+        Some(
+            "ALTER action FORCE ROW SECURITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti no force row level security",
+        Some(
+            "ALTER action NO FORCE ROW SECURITY cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti inherit tt",
+        Some(
+            "ALTER action INHERIT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti no inherit tt",
+        Some(
+            "ALTER action NO INHERIT cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti of ct",
+        Some(
+            "ALTER action OF cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti not of",
+        Some(
+            "ALTER action NOT OF cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    ("alter table ti owner to postgres", None),
+    (
+        "alter table ti attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti options (add x 'y')",
+        Some(
+            "ALTER action OPTIONS cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti alter column a options (add x 'y')",
+        Some(
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    ("alter table ti rename to zz", None),
+    ("alter table ti rename column a to z", None),
+    (
+        "alter table ti set schema public",
+        Some("cannot change schema of index \"ti\""),
+    ),
+    (
+        "alter table ti alter column a set data type int",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table ti add column c int generated always as (a + 1) stored",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table pti add column c int",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti drop column b",
+        Some(
+            "ALTER action DROP COLUMN cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a set default 1",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a drop default",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a set not null",
+        Some(
+            "ALTER action ALTER COLUMN ... SET NOT NULL cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a drop not null",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP NOT NULL cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a type bigint",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a set statistics 5",
+        Some("cannot alter statistics on non-expression column \"a\" of index \"pti\""),
+    ),
+    (
+        "alter table pti alter column a set storage plain",
+        Some(
+            "ALTER action ALTER COLUMN ... SET STORAGE cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a set compression pglz",
+        Some(
+            "ALTER action ALTER COLUMN ... SET COMPRESSION cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a set (n_distinct = 1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a reset (n_distinct)",
+        Some(
+            "ALTER action ALTER COLUMN ... RESET cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a add generated always as identity",
+        Some(
+            "ALTER action ALTER COLUMN ... ADD IDENTITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a set generated always",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a drop identity",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP IDENTITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a drop expression",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP EXPRESSION cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a set expression as (1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET EXPRESSION cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti add constraint k check (a > 0)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti add primary key (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti add unique (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti add foreign key (a) references tt (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti add constraint k check (a > 0) not valid",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti validate constraint k",
+        Some(
+            "ALTER action VALIDATE CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti drop constraint k",
+        Some(
+            "ALTER action DROP CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter constraint k deferrable",
+        Some(
+            "ALTER action ALTER CONSTRAINT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti rename constraint k to k2",
+        Some("constraint \"k\" for table \"pti\" does not exist"),
+    ),
+    (
+        "alter table pti cluster on ti",
+        Some(
+            "ALTER action CLUSTER ON cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti set without cluster",
+        Some(
+            "ALTER action SET WITHOUT CLUSTER cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti set logged",
+        Some(
+            "ALTER action SET LOGGED cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti set unlogged",
+        Some(
+            "ALTER action SET UNLOGGED cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti set without oids",
+        Some(
+            "ALTER action SET WITHOUT OIDS cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti set access method heap",
+        Some(
+            "ALTER action SET ACCESS METHOD cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    ("alter table pti set tablespace pg_default", None),
+    (
+        "alter table pti set (fillfactor = 50)",
+        Some(
+            "ALTER action SET cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti reset (fillfactor)",
+        Some(
+            "ALTER action RESET cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti replica identity full",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti replica identity using index ti",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti disable trigger all",
+        Some(
+            "ALTER action DISABLE TRIGGER ALL cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti enable trigger all",
+        Some(
+            "ALTER action ENABLE TRIGGER ALL cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti enable trigger user",
+        Some(
+            "ALTER action ENABLE TRIGGER USER cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti enable always trigger tr",
+        Some(
+            "ALTER action ENABLE ALWAYS TRIGGER cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti disable trigger tr",
+        Some(
+            "ALTER action DISABLE TRIGGER cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti enable rule r",
+        Some(
+            "ALTER action ENABLE RULE cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti disable rule r",
+        Some(
+            "ALTER action DISABLE RULE cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti enable replica rule r",
+        Some(
+            "ALTER action ENABLE REPLICA RULE cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti enable row level security",
+        Some(
+            "ALTER action ENABLE ROW SECURITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti disable row level security",
+        Some(
+            "ALTER action DISABLE ROW SECURITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti force row level security",
+        Some(
+            "ALTER action FORCE ROW SECURITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti no force row level security",
+        Some(
+            "ALTER action NO FORCE ROW SECURITY cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti inherit tt",
+        Some(
+            "ALTER action INHERIT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti no inherit tt",
+        Some(
+            "ALTER action NO INHERIT cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti of ct",
+        Some(
+            "ALTER action OF cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti not of",
+        Some(
+            "ALTER action NOT OF cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti owner to postgres",
+        Some("cannot change owner of index \"pti\""),
+    ),
+    (
+        "alter table pti attach partition tt for values from (5) to (6)",
+        Some("\"pti\" is not a partitioned table"),
+    ),
+    (
+        "alter table pti detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti options (add x 'y')",
+        Some(
+            "ALTER action OPTIONS cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti alter column a options (add x 'y')",
+        Some(
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    ("alter table pti rename to zz", None),
+    ("alter table pti rename column a to z", None),
+    (
+        "alter table pti set schema public",
+        Some("cannot change schema of index \"pti\""),
+    ),
+    (
+        "alter table pti alter column a set data type int",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table pti add column c int generated always as (a + 1) stored",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table s add column c int",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s drop column b",
+        Some(
+            "ALTER action DROP COLUMN cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set default 1",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a drop default",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set not null",
+        Some(
+            "ALTER action ALTER COLUMN ... SET NOT NULL cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a drop not null",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP NOT NULL cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a type bigint",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set statistics 5",
+        Some(
+            "ALTER action ALTER COLUMN ... SET STATISTICS cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set storage plain",
+        Some(
+            "ALTER action ALTER COLUMN ... SET STORAGE cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set compression pglz",
+        Some(
+            "ALTER action ALTER COLUMN ... SET COMPRESSION cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set (n_distinct = 1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a reset (n_distinct)",
+        Some(
+            "ALTER action ALTER COLUMN ... RESET cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a add generated always as identity",
+        Some(
+            "ALTER action ALTER COLUMN ... ADD IDENTITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set generated always",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a drop identity",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP IDENTITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a drop expression",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP EXPRESSION cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a set expression as (1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET EXPRESSION cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s add constraint k check (a > 0)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s add primary key (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s add unique (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s add foreign key (a) references tt (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s add constraint k check (a > 0) not valid",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s validate constraint k",
+        Some(
+            "ALTER action VALIDATE CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s drop constraint k",
+        Some(
+            "ALTER action DROP CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter constraint k deferrable",
+        Some(
+            "ALTER action ALTER CONSTRAINT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s rename constraint k to k2",
+        Some(
+            "cannot rename columns of relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s cluster on ti",
+        Some(
+            "ALTER action CLUSTER ON cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s set without cluster",
+        Some(
+            "ALTER action SET WITHOUT CLUSTER cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    ("alter table s set logged", None),
+    ("alter table s set unlogged", None),
+    (
+        "alter table s set without oids",
+        Some(
+            "ALTER action SET WITHOUT OIDS cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s set access method heap",
+        Some(
+            "ALTER action SET ACCESS METHOD cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s set tablespace pg_default",
+        Some(
+            "ALTER action SET TABLESPACE cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s set (fillfactor = 50)",
+        Some(
+            "ALTER action SET cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s reset (fillfactor)",
+        Some(
+            "ALTER action RESET cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s replica identity full",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s replica identity using index ti",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s disable trigger all",
+        Some(
+            "ALTER action DISABLE TRIGGER ALL cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s enable trigger all",
+        Some(
+            "ALTER action ENABLE TRIGGER ALL cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s enable trigger user",
+        Some(
+            "ALTER action ENABLE TRIGGER USER cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s enable always trigger tr",
+        Some(
+            "ALTER action ENABLE ALWAYS TRIGGER cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s disable trigger tr",
+        Some(
+            "ALTER action DISABLE TRIGGER cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s enable rule r",
+        Some(
+            "ALTER action ENABLE RULE cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s disable rule r",
+        Some(
+            "ALTER action DISABLE RULE cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s enable replica rule r",
+        Some(
+            "ALTER action ENABLE REPLICA RULE cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s enable row level security",
+        Some(
+            "ALTER action ENABLE ROW SECURITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s disable row level security",
+        Some(
+            "ALTER action DISABLE ROW SECURITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s force row level security",
+        Some(
+            "ALTER action FORCE ROW SECURITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s no force row level security",
+        Some(
+            "ALTER action NO FORCE ROW SECURITY cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s inherit tt",
+        Some(
+            "ALTER action INHERIT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s no inherit tt",
+        Some(
+            "ALTER action NO INHERIT cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s of ct",
+        Some(
+            "ALTER action OF cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s not of",
+        Some(
+            "ALTER action NOT OF cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    ("alter table s owner to postgres", None),
+    (
+        "alter table s attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s options (add x 'y')",
+        Some(
+            "ALTER action OPTIONS cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s alter column a options (add x 'y')",
+        Some(
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    ("alter table s rename to zz", None),
+    (
+        "alter table s rename column a to z",
+        Some(
+            "cannot rename columns of relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    ("alter table s set schema public", None),
+    (
+        "alter table s alter column a set data type int",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table s add column c int generated always as (a + 1) stored",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table v add column c int",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v drop column b",
+        Some(
+            "ALTER action DROP COLUMN cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    ("alter table v alter column a set default 1", None),
+    ("alter table v alter column a drop default", None),
+    (
+        "alter table v alter column a set not null",
+        Some(
+            "ALTER action ALTER COLUMN ... SET NOT NULL cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a drop not null",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP NOT NULL cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a type bigint",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a set statistics 5",
+        Some(
+            "ALTER action ALTER COLUMN ... SET STATISTICS cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a set storage plain",
+        Some(
+            "ALTER action ALTER COLUMN ... SET STORAGE cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a set compression pglz",
+        Some(
+            "ALTER action ALTER COLUMN ... SET COMPRESSION cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a set (n_distinct = 1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a reset (n_distinct)",
+        Some(
+            "ALTER action ALTER COLUMN ... RESET cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a add generated always as identity",
+        Some(
+            "column \"a\" of relation \"v\" must be declared NOT NULL before identity can be added",
+        ),
+    ),
+    (
+        "alter table v alter column a set generated always",
+        Some("column \"a\" of relation \"v\" is not an identity column"),
+    ),
+    (
+        "alter table v alter column a drop identity",
+        Some("column \"a\" of relation \"v\" is not an identity column"),
+    ),
+    (
+        "alter table v alter column a drop expression",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP EXPRESSION cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a set expression as (1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET EXPRESSION cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v add constraint k check (a > 0)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v add primary key (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v add unique (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v add foreign key (a) references tt (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v add constraint k check (a > 0) not valid",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v validate constraint k",
+        Some(
+            "ALTER action VALIDATE CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v drop constraint k",
+        Some(
+            "ALTER action DROP CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter constraint k deferrable",
+        Some(
+            "ALTER action ALTER CONSTRAINT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v rename constraint k to k2",
+        Some("constraint \"k\" for table \"v\" does not exist"),
+    ),
+    (
+        "alter table v cluster on ti",
+        Some(
+            "ALTER action CLUSTER ON cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v set without cluster",
+        Some(
+            "ALTER action SET WITHOUT CLUSTER cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v set logged",
+        Some(
+            "ALTER action SET LOGGED cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v set unlogged",
+        Some(
+            "ALTER action SET UNLOGGED cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v set without oids",
+        Some(
+            "ALTER action SET WITHOUT OIDS cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v set access method heap",
+        Some(
+            "ALTER action SET ACCESS METHOD cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v set tablespace pg_default",
+        Some(
+            "ALTER action SET TABLESPACE cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v set (fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    ("alter table v reset (fillfactor)", None),
+    (
+        "alter table v replica identity full",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v replica identity using index ti",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v disable trigger all",
+        Some(
+            "ALTER action DISABLE TRIGGER ALL cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v enable trigger all",
+        Some(
+            "ALTER action ENABLE TRIGGER ALL cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v enable trigger user",
+        Some(
+            "ALTER action ENABLE TRIGGER USER cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v enable always trigger tr",
+        Some(
+            "ALTER action ENABLE ALWAYS TRIGGER cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v disable trigger tr",
+        Some(
+            "ALTER action DISABLE TRIGGER cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v enable rule r",
+        Some(
+            "ALTER action ENABLE RULE cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v disable rule r",
+        Some(
+            "ALTER action DISABLE RULE cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v enable replica rule r",
+        Some(
+            "ALTER action ENABLE REPLICA RULE cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v enable row level security",
+        Some(
+            "ALTER action ENABLE ROW SECURITY cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v disable row level security",
+        Some(
+            "ALTER action DISABLE ROW SECURITY cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v force row level security",
+        Some(
+            "ALTER action FORCE ROW SECURITY cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v no force row level security",
+        Some(
+            "ALTER action NO FORCE ROW SECURITY cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v inherit tt",
+        Some(
+            "ALTER action INHERIT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v no inherit tt",
+        Some(
+            "ALTER action NO INHERIT cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v of ct",
+        Some(
+            "ALTER action OF cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v not of",
+        Some(
+            "ALTER action NOT OF cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    ("alter table v owner to postgres", None),
+    (
+        "alter table v attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v options (add x 'y')",
+        Some(
+            "ALTER action OPTIONS cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v alter column a options (add x 'y')",
+        Some(
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    ("alter table v rename to zz", None),
+    ("alter table v rename column a to z", None),
+    ("alter table v set schema public", None),
+    (
+        "alter table v alter column a set data type int",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table v add column c int generated always as (a + 1) stored",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table mv add column c int",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv drop column b",
+        Some(
+            "ALTER action DROP COLUMN cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a set default 1",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a drop default",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DEFAULT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a set not null",
+        Some(
+            "ALTER action ALTER COLUMN ... SET NOT NULL cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a drop not null",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP NOT NULL cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a type bigint",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    ("alter table mv alter column a set statistics 5", None),
+    ("alter table mv alter column a set storage plain", None),
+    (
+        "alter table mv alter column a set compression pglz",
+        Some("column data type integer does not support compression"),
+    ),
+    ("alter table mv alter column a set (n_distinct = 1)", None),
+    ("alter table mv alter column a reset (n_distinct)", None),
+    (
+        "alter table mv alter column a add generated always as identity",
+        Some(
+            "ALTER action ALTER COLUMN ... ADD IDENTITY cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a set generated always",
+        Some(
+            "ALTER action ALTER COLUMN ... SET cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a drop identity",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP IDENTITY cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a drop expression",
+        Some(
+            "ALTER action ALTER COLUMN ... DROP EXPRESSION cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a set expression as (1)",
+        Some(
+            "ALTER action ALTER COLUMN ... SET EXPRESSION cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv add constraint k check (a > 0)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv add primary key (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv add unique (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv add foreign key (a) references tt (a)",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv add constraint k check (a > 0) not valid",
+        Some(
+            "ALTER action ADD CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv validate constraint k",
+        Some(
+            "ALTER action VALIDATE CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv drop constraint k",
+        Some(
+            "ALTER action DROP CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter constraint k deferrable",
+        Some(
+            "ALTER action ALTER CONSTRAINT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv rename constraint k to k2",
+        Some("constraint \"k\" for table \"mv\" does not exist"),
+    ),
+    (
+        "alter table mv cluster on ti",
+        Some("\"ti\" is not an index for table \"mv\""),
+    ),
+    ("alter table mv set without cluster", None),
+    (
+        "alter table mv set logged",
+        Some(
+            "ALTER action SET LOGGED cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv set unlogged",
+        Some(
+            "ALTER action SET UNLOGGED cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv set without oids",
+        Some(
+            "ALTER action SET WITHOUT OIDS cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    ("alter table mv set access method heap", None),
+    ("alter table mv set tablespace pg_default", None),
+    ("alter table mv set (fillfactor = 50)", None),
+    ("alter table mv reset (fillfactor)", None),
+    ("alter table mv replica identity full", None),
+    (
+        "alter table mv replica identity using index ti",
+        Some("\"ti\" is not an index for table \"mv\""),
+    ),
+    (
+        "alter table mv disable trigger all",
+        Some(
+            "ALTER action DISABLE TRIGGER ALL cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv enable trigger all",
+        Some(
+            "ALTER action ENABLE TRIGGER ALL cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv enable trigger user",
+        Some(
+            "ALTER action ENABLE TRIGGER USER cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv enable always trigger tr",
+        Some(
+            "ALTER action ENABLE ALWAYS TRIGGER cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv disable trigger tr",
+        Some(
+            "ALTER action DISABLE TRIGGER cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv enable rule r",
+        Some(
+            "ALTER action ENABLE RULE cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv disable rule r",
+        Some(
+            "ALTER action DISABLE RULE cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv enable replica rule r",
+        Some(
+            "ALTER action ENABLE REPLICA RULE cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv enable row level security",
+        Some(
+            "ALTER action ENABLE ROW SECURITY cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv disable row level security",
+        Some(
+            "ALTER action DISABLE ROW SECURITY cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv force row level security",
+        Some(
+            "ALTER action FORCE ROW SECURITY cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv no force row level security",
+        Some(
+            "ALTER action NO FORCE ROW SECURITY cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv inherit tt",
+        Some(
+            "ALTER action INHERIT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv no inherit tt",
+        Some(
+            "ALTER action NO INHERIT cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv of ct",
+        Some(
+            "ALTER action OF cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv not of",
+        Some(
+            "ALTER action NOT OF cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    ("alter table mv owner to postgres", None),
+    (
+        "alter table mv attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv options (add x 'y')",
+        Some(
+            "ALTER action OPTIONS cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv alter column a options (add x 'y')",
+        Some(
+            "ALTER action ALTER COLUMN ... OPTIONS cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    ("alter table mv rename to zz", None),
+    ("alter table mv rename column a to z", None),
+    ("alter table mv set schema public", None),
+    (
+        "alter table mv alter column a set data type int",
+        Some(
+            "ALTER action ALTER COLUMN ... SET DATA TYPE cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table mv add column c int generated always as (a + 1) stored",
+        Some(
+            "ALTER action ADD COLUMN cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    ("alter table ft add column c int", None),
+    ("alter table ft drop column b", None),
+    ("alter table ft alter column a set default 1", None),
+    ("alter table ft alter column a drop default", None),
+    ("alter table ft alter column a set not null", None),
+    ("alter table ft alter column a drop not null", None),
+    ("alter table ft alter column a type bigint", None),
+    ("alter table ft alter column a set statistics 5", None),
+    ("alter table ft alter column a set storage plain", None),
+    (
+        "alter table ft alter column a set compression pglz",
+        Some(
+            "ALTER action ALTER COLUMN ... SET COMPRESSION cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    ("alter table ft alter column a set (n_distinct = 1)", None),
+    ("alter table ft alter column a reset (n_distinct)", None),
+    (
+        "alter table ft alter column a add generated always as identity",
+        Some(
+            "column \"a\" of relation \"ft\" must be declared NOT NULL before identity can be added",
+        ),
+    ),
+    (
+        "alter table ft alter column a set generated always",
+        Some("column \"a\" of relation \"ft\" is not an identity column"),
+    ),
+    (
+        "alter table ft alter column a drop identity",
+        Some("column \"a\" of relation \"ft\" is not an identity column"),
+    ),
+    (
+        "alter table ft alter column a drop expression",
+        Some("column \"a\" of relation \"ft\" is not a generated column"),
+    ),
+    (
+        "alter table ft alter column a set expression as (1)",
+        Some("column \"a\" of relation \"ft\" is not a generated column"),
+    ),
+    ("alter table ft add constraint k check (a > 0)", None),
+    (
+        "alter table ft add primary key (a)",
+        Some("primary key constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter table ft add unique (a)",
+        Some("unique constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter table ft add foreign key (a) references tt (a)",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter table ft add constraint k check (a > 0) not valid",
+        None,
+    ),
+    (
+        "alter table ft validate constraint k",
+        Some("constraint \"k\" of relation \"ft\" does not exist"),
+    ),
+    (
+        "alter table ft drop constraint k",
+        Some("constraint \"k\" of relation \"ft\" does not exist"),
+    ),
+    (
+        "alter table ft alter constraint k deferrable",
+        Some(
+            "ALTER action ALTER CONSTRAINT cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft rename constraint k to k2",
+        Some("constraint \"k\" for table \"ft\" does not exist"),
+    ),
+    (
+        "alter table ft cluster on ti",
+        Some(
+            "ALTER action CLUSTER ON cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft set without cluster",
+        Some(
+            "ALTER action SET WITHOUT CLUSTER cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft set logged",
+        Some(
+            "ALTER action SET LOGGED cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft set unlogged",
+        Some(
+            "ALTER action SET UNLOGGED cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    ("alter table ft set without oids", None),
+    (
+        "alter table ft set access method heap",
+        Some(
+            "ALTER action SET ACCESS METHOD cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft set tablespace pg_default",
+        Some(
+            "ALTER action SET TABLESPACE cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft set (fillfactor = 50)",
+        Some(
+            "ALTER action SET cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft reset (fillfactor)",
+        Some(
+            "ALTER action RESET cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft replica identity full",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft replica identity using index ti",
+        Some(
+            "ALTER action REPLICA IDENTITY cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    ("alter table ft disable trigger all", None),
+    ("alter table ft enable trigger all", None),
+    ("alter table ft enable trigger user", None),
+    (
+        "alter table ft enable always trigger tr",
+        Some("trigger \"tr\" for table \"ft\" does not exist"),
+    ),
+    (
+        "alter table ft disable trigger tr",
+        Some("trigger \"tr\" for table \"ft\" does not exist"),
+    ),
+    (
+        "alter table ft enable rule r",
+        Some(
+            "ALTER action ENABLE RULE cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft disable rule r",
+        Some(
+            "ALTER action DISABLE RULE cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft enable replica rule r",
+        Some(
+            "ALTER action ENABLE REPLICA RULE cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft enable row level security",
+        Some(
+            "ALTER action ENABLE ROW SECURITY cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft disable row level security",
+        Some(
+            "ALTER action DISABLE ROW SECURITY cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft force row level security",
+        Some(
+            "ALTER action FORCE ROW SECURITY cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft no force row level security",
+        Some(
+            "ALTER action NO FORCE ROW SECURITY cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    ("alter table ft inherit tt", None),
+    (
+        "alter table ft no inherit tt",
+        Some("relation \"tt\" is not a parent of relation \"ft\""),
+    ),
+    (
+        "alter table ft of ct",
+        Some(
+            "ALTER action OF cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft not of",
+        Some(
+            "ALTER action NOT OF cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    ("alter table ft owner to postgres", None),
+    (
+        "alter table ft attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table ft detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    ("alter table ft options (add x 'y')", None),
+    ("alter table ft alter column a options (add x 'y')", None),
+    ("alter table ft rename to zz", None),
+    ("alter table ft rename column a to z", None),
+    ("alter table ft set schema public", None),
+    ("alter table ft alter column a set data type int", None),
+    (
+        "alter table ft add column c int generated always as (a + 1) stored",
+        None,
+    ),
+    (
+        "alter table ct add column c int",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct drop column b",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set default 1",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a drop default",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set not null",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a drop not null",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a type bigint",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set statistics 5",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set storage plain",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set compression pglz",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set (n_distinct = 1)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a reset (n_distinct)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a add generated always as identity",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set generated always",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a drop identity",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a drop expression",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set expression as (1)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct add constraint k check (a > 0)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct add primary key (a)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct add unique (a)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct add foreign key (a) references tt (a)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct add constraint k check (a > 0) not valid",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct validate constraint k",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct drop constraint k",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter constraint k deferrable",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct rename constraint k to k2",
+        Some("constraint \"k\" for table \"ct\" does not exist"),
+    ),
+    (
+        "alter table ct cluster on ti",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct set without cluster",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct set logged",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct set unlogged",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct set without oids",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct set access method heap",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct set tablespace pg_default",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct set (fillfactor = 50)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct reset (fillfactor)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct replica identity full",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct replica identity using index ti",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct disable trigger all",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct enable trigger all",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct enable trigger user",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct enable always trigger tr",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct disable trigger tr",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct enable rule r",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct disable rule r",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct enable replica rule r",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct enable row level security",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct disable row level security",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct force row level security",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct no force row level security",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct inherit tt",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct no inherit tt",
+        Some("\"ct\" is a composite type"),
+    ),
+    ("alter table ct of ct", Some("\"ct\" is a composite type")),
+    ("alter table ct not of", Some("\"ct\" is a composite type")),
+    (
+        "alter table ct owner to postgres",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct attach partition tt for values from (5) to (6)",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct detach partition tt",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct options (add x 'y')",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a options (add x 'y')",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct rename to zz",
+        Some("\"ct\" is a composite type"),
+    ),
+    ("alter table ct rename column a to z", None),
+    (
+        "alter table ct set schema public",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct alter column a set data type int",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "alter table ct add column c int generated always as (a + 1) stored",
+        Some("\"ct\" is a composite type"),
+    ),
+    (
+        "reindex table concurrently pg_class",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex index concurrently pg_class_oid_index",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex table concurrently pg_toast.pg_toast_2620",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex index concurrently pg_toast.pg_toast_2620_index",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex table concurrently pg_database",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex index concurrently pg_database_oid_index",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex (concurrently) table pg_class",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    ("reindex table concurrently t", None),
+    ("reindex index concurrently ti", None),
+    ("reindex schema concurrently pg_catalog", None),
+    (
+        "reindex system concurrently",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex table concurrently information_schema.sql_features",
+        None,
+    ),
+    (
+        "reindex index concurrently information_schema.sql_features_pkey",
+        Some("relation \"information_schema.sql_features_pkey\" does not exist"),
+    ),
+    (
+        "create rule r as on insert to ft do nothing",
+        Some(
+            "relation \"ft\" cannot have rules (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "create rule r as on insert to ft do instead nothing",
+        Some(
+            "relation \"ft\" cannot have rules (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "create rule \"_RETURN\" as on select to ft do instead select 1 as a, 2 as b",
+        Some(
+            "relation \"ft\" cannot have rules (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "create rule r as on insert to s do nothing",
+        Some("relation \"s\" cannot have rules (This operation is not supported for sequences."),
+    ),
+    (
+        "create rule r as on insert to mv do nothing",
+        Some("rules on materialized views are not supported"),
+    ),
+    (
+        "create rule r as on insert to ct do nothing",
+        Some("cannot open relation \"ct\" (This operation is not supported for composite types."),
+    ),
+    ("create rule r as on insert to pt do nothing", None),
+    (
+        "alter table pti attach partition tt for values from (5) to (6)",
+        Some("\"pti\" is not a partitioned table"),
+    ),
+    (
+        "alter table ti attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter table s attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"s\" (This operation is not supported for sequences.",
+        ),
+    ),
+    (
+        "alter table v attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"v\" (This operation is not supported for views.",
+        ),
+    ),
+    (
+        "alter table mv attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"mv\" (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table ft attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"ft\" (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter table t attach partition tt for values from (5) to (6)",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"t\" (This operation is not supported for tables.",
+        ),
+    ),
+    (
+        "alter table pti detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "alter table ti detach partition tt",
+        Some(
+            "ALTER action DETACH PARTITION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "alter index pti attach partition ti",
+        Some(
+            "cannot attach index \"ti\" as a partition of index \"pti\" (Index \"ti\" is not an index on any partition of table \"pt\".",
+        ),
+    ),
+    (
+        "alter index ti attach partition pti",
+        Some(
+            "ALTER action ATTACH PARTITION cannot be performed on relation \"ti\" (This operation is not supported for indexes.",
+        ),
+    ),
+    (
+        "create table r partition of s for values in (1)",
+        Some("inherited relation \"s\" is not a table or foreign table"),
+    ),
+    (
+        "create table r partition of v for values in (1)",
+        Some("inherited relation \"v\" is not a table or foreign table"),
+    ),
+    (
+        "create table r partition of mv for values in (1)",
+        Some("inherited relation \"mv\" is not a table or foreign table"),
+    ),
+    (
+        "create table r partition of ft for values in (1)",
+        Some("\"ft\" is not partitioned"),
+    ),
+    (
+        "create table r partition of t for values in (1)",
+        Some("\"t\" is not partitioned"),
+    ),
+    (
+        "create table r partition of ct for values in (1)",
+        Some("cannot open relation \"ct\" (This operation is not supported for composite types."),
+    ),
+    (
+        "create table r () inherits (s)",
+        Some("inherited relation \"s\" is not a table or foreign table"),
+    ),
+    (
+        "create table r () inherits (v)",
+        Some("inherited relation \"v\" is not a table or foreign table"),
+    ),
+    (
+        "create table r () inherits (mv)",
+        Some("inherited relation \"mv\" is not a table or foreign table"),
+    ),
+    (
+        "create foreign table r partition of s for values in (1) server sv",
+        Some("inherited relation \"s\" is not a table or foreign table"),
+    ),
+    (
+        "alter table tt add constraint k primary key using index t",
+        Some("\"t\" is not an index"),
+    ),
+    (
+        "alter table tt add constraint k unique using index s",
+        Some("\"s\" is not an index"),
+    ),
+    (
+        "alter table tt add constraint k unique using index v",
+        Some("\"v\" is not an index"),
+    ),
+    (
+        "alter table tt add constraint k unique using index nosuch",
+        Some("index \"nosuch\" does not exist"),
+    ),
+    (
+        "alter table tt add constraint k unique using index ti",
+        Some("index \"ti\" does not belong to table \"tt\""),
+    ),
+    (
+        "alter table tt add primary key using index mv",
+        Some("\"mv\" is not an index"),
+    ),
+    (
+        "alter table tt add constraint k unique using index pti",
+        Some("index \"pti\" does not belong to table \"tt\""),
+    ),
+    (
+        "alter table tt add constraint k unique using index ct",
+        Some("\"ct\" is not an index"),
+    ),
+    (
+        "alter trigger tr on s rename to tr2",
+        Some("relation \"s\" cannot have triggers (This operation is not supported for sequences."),
+    ),
+    (
+        "alter trigger tr on mv rename to tr2",
+        Some(
+            "relation \"mv\" cannot have triggers (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter trigger tr on ct rename to tr2",
+        Some(
+            "relation \"ct\" cannot have triggers (This operation is not supported for composite types.",
+        ),
+    ),
+    (
+        "alter trigger tr on ti rename to tr2",
+        Some("relation \"ti\" cannot have triggers (This operation is not supported for indexes."),
+    ),
+    (
+        "alter trigger tr on v rename to tr2",
+        Some("trigger \"tr\" for table \"v\" does not exist"),
+    ),
+    (
+        "alter trigger tr on ft rename to tr2",
+        Some("trigger \"tr\" for table \"ft\" does not exist"),
+    ),
+    (
+        "alter rule r on s rename to r2",
+        Some("relation \"s\" cannot have rules (This operation is not supported for sequences."),
+    ),
+    (
+        "alter rule r on mv rename to r2",
+        Some(
+            "relation \"mv\" cannot have rules (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter rule r on ti rename to r2",
+        Some("relation \"ti\" cannot have rules (This operation is not supported for indexes."),
+    ),
+    (
+        "alter rule r on ct rename to r2",
+        Some(
+            "relation \"ct\" cannot have rules (This operation is not supported for composite types.",
+        ),
+    ),
+    (
+        "alter rule r on ft rename to r2",
+        Some(
+            "relation \"ft\" cannot have rules (This operation is not supported for foreign tables.",
+        ),
+    ),
+    (
+        "alter rule r on v rename to r2",
+        Some("rule \"r\" for relation \"v\" does not exist"),
+    ),
+    (
+        "alter rule r on pti rename to r2",
+        Some(
+            "relation \"pti\" cannot have rules (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "create foreign table f2 (a int primary key) server sv",
+        Some("primary key constraints are not supported on foreign tables"),
+    ),
+    (
+        "create foreign table f2 (a int unique) server sv",
+        Some("unique constraints are not supported on foreign tables"),
+    ),
+    (
+        "create foreign table f2 (a int references tt (a)) server sv",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "create foreign table f2 (a int, primary key (a)) server sv",
+        Some("primary key constraints are not supported on foreign tables"),
+    ),
+    (
+        "create foreign table f2 (a int, exclude (a with =)) server sv",
+        Some("exclusion constraints are not supported on foreign tables"),
+    ),
+    (
+        "create foreign table f2 (a int check (a > 0)) server sv",
+        None,
+    ),
+    ("create foreign table f2 (a int not null) server sv", None),
+    (
+        "alter table ft add constraint x exclude (a with =)",
+        Some("exclusion constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter table ft add constraint x check (a > 0) not valid",
+        None,
+    ),
+    (
+        "alter table ft add unique (a) deferrable",
+        Some("unique constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter table pt cluster on pti",
+        Some("cannot mark index clustered in partitioned table"),
+    ),
+    ("alter table pt of ct", None),
+    ("alter table pt not of", Some("\"pt\" is not a typed table")),
+    (
+        "alter table v alter column a add generated always as identity",
+        Some(
+            "column \"a\" of relation \"v\" must be declared NOT NULL before identity can be added",
+        ),
+    ),
+    (
+        "create trigger tg before insert on s for each row execute function trf()",
+        Some("relation \"s\" cannot have triggers (This operation is not supported for sequences."),
+    ),
+    (
+        "create trigger tg before insert on mv for each row execute function trf()",
+        Some(
+            "relation \"mv\" cannot have triggers (This operation is not supported for materialized views.",
+        ),
+    ),
+    (
+        "alter table t replica identity using index nosuch",
+        Some("index \"nosuch\" for table \"t\" does not exist"),
+    ),
+    ("alter table mv replica identity full", None),
+    (
+        "alter table mv cluster on ti",
+        Some("\"ti\" is not an index for table \"mv\""),
+    ),
+    ("alter table ti set (fillfactor = 50)", None),
+    ("alter view v set (security_barrier)", None),
+    ("alter index ti set (fillfactor = 50)", None),
+    ("alter materialized view mv set (fillfactor = 50)", None),
+    (
+        "reindex (concurrently true) index pg_class_oid_index",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex (concurrently false) index pg_class_oid_index",
+        None,
+    ),
+    (
+        "reindex index concurrently pg_class_relname_nsp_index",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex table concurrently pg_catalog.pg_trigger",
+        Some("cannot reindex system catalogs concurrently"),
+    ),
+    (
+        "reindex index concurrently nosuch",
+        Some("relation \"nosuch\" does not exist"),
+    ),
+    (
+        "reindex index concurrently t",
+        Some("\"t\" is not an index"),
+    ),
+    (
+        "alter table ft add column x int primary key",
+        Some("primary key constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter foreign table ft add column x int references tt (a)",
+        Some("foreign key constraints are not supported on foreign tables"),
+    ),
+    (
+        "alter foreign table ft add constraint k unique (a)",
+        Some("unique constraints are not supported on foreign tables"),
+    ),
+    ("alter table ft add column x int check (x > 0)", None),
+    (
+        "alter table pti owner to postgres",
+        Some("cannot change owner of index \"pti\""),
+    ),
+    (
+        "alter index pti owner to postgres",
+        Some("cannot change owner of index \"pti\""),
+    ),
+    ("alter index ti owner to postgres", None),
+    (
+        "alter table pt set without cluster",
+        Some("cannot mark index clustered in partitioned table"),
+    ),
+    (
+        "alter table pt cluster on pti",
+        Some("cannot mark index clustered in partitioned table"),
+    ),
+    (
+        "create table r partition of pti for values in (1)",
+        Some(
+            "cannot open relation \"pti\" (This operation is not supported for partitioned indexes.",
+        ),
+    ),
+    (
+        "create table r partition of ti for values in (1)",
+        Some("cannot open relation \"ti\" (This operation is not supported for indexes."),
+    ),
+    (
+        "alter table tt add constraint k unique using index pt",
+        Some("\"pt\" is not an index"),
+    ),
+    (
+        "alter table tt add constraint k unique using index ft",
+        Some("\"ft\" is not an index"),
+    ),
+    ("reindex (concurrently off) table pg_class", None),
+];
+
+#[test]
+fn a_foreign_table_refuses_index_constraints_only_where_it_is_named() {
+    // transformColumnDefinition / transformTableConstraint refuse a primary
+    // key, unique, exclusion or foreign key constraint on the foreign table
+    // a statement names — not on a foreign inheritance child ADD COLUMN
+    // recurses to (such constraints aren't inherited), and not once IF NOT
+    // EXISTS skipped the statement. An inline foreign key reaches a
+    // partitioned table's partitions, as ADD CONSTRAINT's does.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FOREIGN DATA WRAPPER w; CREATE SERVER srv FOREIGN DATA WRAPPER w;
+         CREATE TABLE par (a int NOT NULL, b int);
+         CREATE FOREIGN TABLE fch (x int) INHERITS (par) SERVER srv;
+         CREATE TABLE gpar (a int NOT NULL, b int);
+         CREATE TABLE gmid () INHERITS (gpar);
+         CREATE FOREIGN TABLE gch () INHERITS (gmid) SERVER srv;
+         CREATE FOREIGN TABLE ft (a int, b int) SERVER srv;
+         CREATE TABLE ref (a int PRIMARY KEY);
+         CREATE TABLE pp (a int NOT NULL, b int) PARTITION BY LIST (a);
+         CREATE FOREIGN TABLE ppf PARTITION OF pp FOR VALUES IN (1) SERVER srv;
+         CREATE TABLE q (a int NOT NULL, b int) PARTITION BY LIST (a);
+         CREATE TABLE q1 PARTITION OF q FOR VALUES IN (1) PARTITION BY LIST (a);
+         CREATE TABLE q11 PARTITION OF q1 FOR VALUES IN (1);",
+    )]);
+    for sql in [
+        "ALTER TABLE par ADD COLUMN z int PRIMARY KEY",
+        "ALTER TABLE par ADD COLUMN z int UNIQUE",
+        "ALTER TABLE par ADD COLUMN z int UNIQUE NOT NULL",
+        "ALTER TABLE par ADD COLUMN z int REFERENCES ref (a)",
+        "ALTER TABLE par ADD COLUMN IF NOT EXISTS z int PRIMARY KEY",
+        "ALTER TABLE gpar ADD COLUMN z int PRIMARY KEY",
+        "ALTER TABLE gpar ADD COLUMN z int REFERENCES ref (a)",
+        "ALTER TABLE q ADD COLUMN z int REFERENCES ref (a)",
+        "ALTER TABLE q ADD COLUMN z int, ADD FOREIGN KEY (z) REFERENCES ref (a)",
+    ] {
+        if let Err(err) = db.apply_sql(&format!("BEGIN; {sql}; ROLLBACK;")) {
+            panic!("{sql}\n  rejected: {err}");
+        }
+    }
+    // Skipped by IF NOT EXISTS: nothing changes.
+    db.apply_sql(
+        "ALTER TABLE par ADD COLUMN IF NOT EXISTS a int PRIMARY KEY;
+         ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS a int UNIQUE;
+         ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS a int PRIMARY KEY;
+         ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS a int REFERENCES ref (a);
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int PRIMARY KEY) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int UNIQUE) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int REFERENCES ref (a)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, PRIMARY KEY (a)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, UNIQUE (a)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, EXCLUDE (a WITH =)) SERVER srv;
+         CREATE FOREIGN TABLE IF NOT EXISTS ft (a int, FOREIGN KEY (a) REFERENCES ref (a))
+             SERVER srv;",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "ALTER TABLE ft ADD COLUMN z int PRIMARY KEY;",
+            "primary key constraints are not supported on foreign tables",
+        ),
+        (
+            "ALTER FOREIGN TABLE ft ADD COLUMN IF NOT EXISTS z int UNIQUE;",
+            "unique constraints are not supported on foreign tables",
+        ),
+        (
+            "ALTER TABLE ft ADD COLUMN z int REFERENCES ref (a);",
+            "foreign key constraints are not supported on foreign tables",
+        ),
+        (
+            "CREATE FOREIGN TABLE IF NOT EXISTS f9 (a int PRIMARY KEY) SERVER srv;",
+            "primary key constraints are not supported on foreign tables",
+        ),
+        (
+            "CREATE FOREIGN TABLE ft (a int PRIMARY KEY) SERVER srv;",
+            "primary key constraints are not supported on foreign tables",
+        ),
+        (
+            "ALTER TABLE pp ADD COLUMN z int PRIMARY KEY;",
+            "unique constraint on partitioned table must include all partitioning columns",
+        ),
+        (
+            "ALTER TABLE ONLY q ADD COLUMN z int REFERENCES ref (a);",
+            "column must be added to child tables too",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}
+
+#[test]
+fn reindex_options_are_read_as_exec_reindex_reads_them() {
+    // defGetBoolean takes no value, true / false / on / off (in any case)
+    // or the integers 1 / 0, and nothing else; an unknown option is
+    // refused — before anything else is looked at.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int); CREATE INDEX ti ON t (a);",
+    )]);
+    for sql in [
+        "REINDEX (CONCURRENTLY 'on') INDEX ti;",
+        "REINDEX (CONCURRENTLY TRUE) INDEX ti;",
+        "REINDEX (CONCURRENTLY 0) INDEX ti;",
+        "REINDEX (TABLESPACE pg_default) INDEX ti;",
+        "SELECT 1; REINDEX (CONCURRENTLY off) INDEX ti;",
+        "SELECT 1; REINDEX (VERBOSE false) INDEX ti;",
+    ] {
+        if let Err(err) = db.apply_sql(sql) {
+            panic!("{sql}\n  rejected: {err}");
+        }
+    }
+    for (sql, message) in [
+        (
+            "REINDEX (CONCURRENTLY maybe) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (CONCURRENTLY yes) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (CONCURRENTLY 2) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (CONCURRENTLY 't') INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "REINDEX (VERBOSE maybe) INDEX ti;",
+            "verbose requires a Boolean value",
+        ),
+        (
+            "REINDEX (foo) INDEX ti;",
+            "unrecognized REINDEX option \"foo\"",
+        ),
+        (
+            "REINDEX (CONCURRENTLY maybe) INDEX nosuch;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "SELECT 1; REINDEX (CONCURRENTLY maybe) INDEX ti;",
+            "concurrently requires a Boolean value",
+        ),
+        (
+            "SELECT 1; REINDEX (CONCURRENTLY) INDEX ti;",
+            "REINDEX CONCURRENTLY cannot run inside a transaction block",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}

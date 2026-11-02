@@ -344,7 +344,13 @@ fn check_relkind(
             ));
         }
         RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable => {}
-        _ => return err(format!("relation \"{relname}\" cannot have triggers")),
+        kind => {
+            return err(format!(
+                "relation \"{relname}\" cannot have triggers (This operation is not supported \
+                 for {}.)",
+                kind.plural()
+            ));
+        }
     }
     crate::ddl::util::check_not_system_class(interp, relid)?;
     Ok(())
@@ -755,8 +761,9 @@ pub(crate) fn rename_trigger(
             RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable
         ) {
             return Err(DdlError::Parse(format!(
-                "relation \"{}\" cannot have triggers",
-                rv.relname
+                "relation \"{}\" cannot have triggers (This operation is not supported for {}.)",
+                rv.relname,
+                class.relkind.plural()
             )));
         }
         crate::ddl::util::check_not_system_class(interp, relid)?;

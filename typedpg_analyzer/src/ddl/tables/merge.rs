@@ -362,6 +362,17 @@ fn inherited_columns(
         let parent = lookup_relation(interp, rv)?;
         crate::ddl::util::table_open_check(interp, parent, &rv.relname)?;
         let relkind = interp.pg_class.get(&parent).map(|c| c.relkind);
+        // MergeAttributes: a parent — of a partition too — is a table or a
+        // foreign table, before it must be a partitioned one.
+        if !matches!(
+            relkind,
+            Some(RelKind::Table | RelKind::Partitioned | RelKind::ForeignTable)
+        ) {
+            return Err(DdlError::Parse(format!(
+                "inherited relation \"{}\" is not a table or foreign table",
+                rv.relname
+            )));
+        }
         if is_partition {
             if relkind != Some(RelKind::Partitioned) {
                 return Err(DdlError::Parse(format!(

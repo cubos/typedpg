@@ -780,6 +780,9 @@ pub(crate) fn set_identity(
         super::check_not_system_column(interp, relid, &cmd.name)?;
     }
     let rel = relname_of(interp, relid);
+    // A view's columns are never declared NOT NULL (what the analyzer
+    // infers of them aside).
+    let is_view = interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::View);
     // ATExecAddIdentity: the column's not-null constraint must be valid.
     if is_add
         && let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
@@ -806,7 +809,7 @@ pub(crate) fn set_identity(
     };
     // ATExecAddIdentity / ATExecSetIdentity (tablecmds.c).
     if is_add {
-        if !col.attnotnull {
+        if !col.attnotnull || is_view {
             return Err(DdlError::Parse(format!(
                 "column \"{}\" of relation \"{rel}\" must be declared NOT NULL before \
                  identity can be added",
@@ -1017,6 +1020,18 @@ fn add_column_to(
             &cd.colname,
         )));
     }
+    // transformColumnDefinition, for the table the statement names (an
+    // inheritance child, a foreign one too, takes no such constraint):
+    // a foreign table has no index.
+    if !rec.recursing
+        && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::ForeignTable)
+    {
+        for c in &cd.constraints {
+            if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+                check_foreign_table_constraint(c)?;
+            }
+        }
+    }
 
     // ATExecAddColumn: regular inheritance children don't inherit an
     // identity column, so one can't be added recursively to a table that
@@ -1185,7 +1200,7 @@ fn add_column_to(
                 },
             )?;
         }
-        add_column_constraints(interp, relid, cd)?;
+        add_column_constraints(interp, relid, cd, rec.recurse)?;
         // transformColumnDefinition: the column's generic options are an
         // ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS run afterwards.
         super::column_generic_options_stmt(interp, relid, &cd.colname, &cd.fdwoptions)?;

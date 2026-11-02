@@ -54,7 +54,22 @@ pub(super) fn cluster_on(
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
     let index = check_clusterable_index(interp, relid, &cmd.name)?;
+    check_markable_clustered(interp, relid)?;
     interp.clustered_indexes.insert(relid, index);
+    Ok(())
+}
+
+/// mark_index_clustered: a partitioned table's indexes are never marked
+/// clustered (nor unmarked).
+pub(super) fn check_markable_clustered(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+) -> Result<(), DdlError> {
+    if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned) {
+        return Err(DdlError::Parse(
+            "cannot mark index clustered in partitioned table".into(),
+        ));
+    }
     Ok(())
 }
 
