@@ -876,3 +876,249 @@ fn drop_extension_takes_the_operator_families_of_its_access_method() {
     ]);
     assert!(db.resolve_table(None, "t_a_idx").is_none());
 }
+
+/// `DROP EXTENSION name` after `setup` fails, its message starting with
+/// `message` (PG's errmsg, then its DETAIL in parentheses).
+fn assert_drop_extension_blocked(setup: &str, name: &str, message: &str) {
+    let drop = format!("DROP EXTENSION {name};");
+    let err = try_apply(&[("0001.sql", setup), ("0002.sql", &drop)])
+        .expect_err(&format!("{setup}\n{drop}"));
+    assert!(
+        err.to_string().starts_with(message),
+        "{setup}\n{drop}\n  got: {err}"
+    );
+}
+
+#[test]
+fn every_index_depends_on_the_operator_classes_it_was_built_with() {
+    // index_create records each key column's class, whatever builds the
+    // index: constraints, LIKE copies, partition clones.
+    for (setup, dependent) in [
+        (
+            "CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));",
+            "constraint t_a_excl on table t",
+        ),
+        (
+            "CREATE TABLE t (a int); ALTER TABLE t ADD EXCLUDE USING gist (a WITH =);",
+            "constraint t_a_excl on table t",
+        ),
+        (
+            "CREATE TABLE t (a int); CREATE INDEX ON t USING gist (a);
+             CREATE TABLE u (LIKE t INCLUDING INDEXES); DROP INDEX t_a_idx;",
+            "index u_a_idx",
+        ),
+        (
+            "CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));
+             CREATE TABLE u (LIKE t INCLUDING ALL); ALTER TABLE t DROP CONSTRAINT t_a_excl;",
+            "constraint u_a_excl on table u",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a); CREATE INDEX ON p USING gist (a);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);",
+            "index p_a_idx",
+        ),
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);
+             CREATE INDEX ON p USING gist (a); DROP INDEX p_a_idx;
+             CREATE INDEX ON c USING gist (a);",
+            "index c_a_idx",
+        ),
+    ] {
+        let setup = format!("CREATE EXTENSION btree_gist; {setup}");
+        assert_drop_extension_blocked(
+            &setup,
+            "btree_gist",
+            &format!(
+                "cannot drop extension btree_gist because other objects depend on it \
+                 ({dependent} depends on operator class gist_int4_ops for access method gist)"
+            ),
+        );
+    }
+    // Dropping an exclusion constraint drops its index too.
+    build(&[(
+        "0001.sql",
+        "CREATE EXTENSION btree_gist;
+         CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));
+         ALTER TABLE t DROP CONSTRAINT t_a_excl;
+         CREATE INDEX t_a_excl ON t (a);
+         DROP INDEX t_a_excl;
+         DROP EXTENSION btree_gist;",
+    )]);
+}
+
+#[test]
+fn a_rebuilt_index_depends_on_its_new_operator_classes() {
+    // ALTER COLUMN TYPE rebuilds the index with the new type's default
+    // class: the old one no longer holds it.
+    for setup in [
+        "CREATE EXTENSION hstore; CREATE TABLE t (a hstore, b int);
+         CREATE INDEX i ON t USING btree (a);
+         ALTER TABLE t ALTER COLUMN a TYPE text USING a::text;",
+        "CREATE EXTENSION hstore; CREATE TABLE t (a hstore, b int);
+         CREATE INDEX i ON t USING btree (b, a);
+         ALTER TABLE t ALTER COLUMN a TYPE text USING a::text;",
+    ] {
+        build(&[("0001.sql", setup), ("0002.sql", "DROP EXTENSION hstore;")]);
+    }
+    let cube = "CREATE EXTENSION hstore; CREATE EXTENSION cube;
+                CREATE TABLE t (a hstore); CREATE INDEX i ON t USING btree (a);
+                ALTER TABLE t ALTER COLUMN a TYPE cube USING NULL;";
+    build(&[("0001.sql", cube), ("0002.sql", "DROP EXTENSION hstore;")]);
+    assert_drop_extension_blocked(
+        cube,
+        "cube",
+        "cannot drop extension cube because other objects depend on it",
+    );
+    assert_drop_extension_blocked(
+        "CREATE EXTENSION btree_gist; CREATE TABLE t (a int4);
+         CREATE INDEX i ON t USING gist (a); ALTER TABLE t ALTER COLUMN a TYPE int8;",
+        "btree_gist",
+        "cannot drop extension btree_gist because other objects depend on it (index i depends \
+         on operator class gist_int8_ops for access method gist)",
+    );
+}
+
+#[test]
+fn one_drop_extension_takes_every_extension_it_names() {
+    // performMultipleDeletions: dependencies among the named extensions
+    // need no CASCADE, in any order.
+    for drop in [
+        "DROP EXTENSION cube, earthdistance;",
+        "DROP EXTENSION earthdistance, cube;",
+    ] {
+        build(&[
+            ("0001.sql", "CREATE EXTENSION earthdistance CASCADE;"),
+            ("0002.sql", drop),
+            ("0003.sql", "CREATE EXTENSION earthdistance CASCADE;"),
+        ]);
+    }
+    // One target names itself; several are "desired object(s)".
+    assert_drop_extension_blocked(
+        "CREATE EXTENSION earthdistance CASCADE;",
+        "cube",
+        "cannot drop extension cube because other objects depend on it",
+    );
+    for (setup, names) in [
+        (
+            "CREATE EXTENSION hstore; CREATE TABLE t (a hstore); CREATE EXTENSION citext;",
+            "citext, hstore",
+        ),
+        (
+            "CREATE EXTENSION earthdistance CASCADE; CREATE EXTENSION hstore;
+             CREATE TABLE t (a hstore);",
+            "cube, hstore",
+        ),
+    ] {
+        assert_drop_extension_blocked(
+            setup,
+            names,
+            "cannot drop desired object(s) because other objects depend on them",
+        );
+    }
+}
+
+#[test]
+fn a_member_of_any_kind_cannot_be_dropped_on_its_own() {
+    for (setup, stmt, message) in [
+        (
+            "CREATE EXTENSION dict_int;",
+            "DROP TEXT SEARCH TEMPLATE intdict_template;",
+            "cannot drop text search template intdict_template because extension dict_int \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_int;",
+            "DROP TEXT SEARCH TEMPLATE intdict_template CASCADE;",
+            "cannot drop text search template intdict_template because extension dict_int \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_int;",
+            "DROP TEXT SEARCH DICTIONARY intdict;",
+            "cannot drop text search dictionary intdict because extension dict_int requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_xsyn;",
+            "DROP TEXT SEARCH TEMPLATE xsyn_template;",
+            "cannot drop text search template xsyn_template because extension dict_xsyn \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION dict_xsyn;",
+            "DROP TEXT SEARCH DICTIONARY xsyn;",
+            "cannot drop text search dictionary xsyn because extension dict_xsyn requires it",
+        ),
+        (
+            "CREATE EXTENSION unaccent;",
+            "DROP TEXT SEARCH TEMPLATE unaccent;",
+            "cannot drop text search template unaccent because extension unaccent requires it",
+        ),
+        (
+            "CREATE EXTENSION unaccent;",
+            "DROP TEXT SEARCH DICTIONARY unaccent;",
+            "cannot drop text search dictionary unaccent because extension unaccent requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP TYPE hstore;",
+            "cannot drop type hstore because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION earthdistance CASCADE;",
+            "DROP DOMAIN earth;",
+            "cannot drop type earth because extension earthdistance requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP OPERATOR ->(hstore, text);",
+            "cannot drop operator ->(hstore,text) because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP CAST (hstore AS json);",
+            "cannot drop cast from hstore to json because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP FUNCTION akeys(hstore);",
+            "cannot drop function akeys(hstore) because extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION intagg;",
+            "DROP AGGREGATE int_array_aggregate(int4);",
+            "cannot drop function int_array_aggregate(integer) because extension intagg \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore;",
+            "DROP OPERATOR CLASS gist_hstore_ops USING gist;",
+            "cannot drop operator class gist_hstore_ops for access method gist because \
+             extension hstore requires it",
+        ),
+        (
+            "CREATE EXTENSION isn;",
+            "DROP OPERATOR FAMILY isn_ops USING btree;",
+            "cannot drop operator family isn_ops for access method btree because extension isn \
+             requires it",
+        ),
+        (
+            "CREATE EXTENSION pg_stat_statements;",
+            "DROP VIEW pg_stat_statements;",
+            "cannot drop view pg_stat_statements because extension pg_stat_statements requires it",
+        ),
+        (
+            "SELECT 1;",
+            "DROP LANGUAGE plpgsql;",
+            "cannot drop language plpgsql because extension plpgsql requires it",
+        ),
+        (
+            "CREATE EXTENSION hstore; CREATE EXTENSION citext;",
+            "DROP TYPE hstore, citext;",
+            "cannot drop type hstore because extension hstore requires it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
+    }
+}

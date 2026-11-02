@@ -69,6 +69,10 @@ pub(crate) fn drop_target_identity(
             let oid = super::drop::operator_target(interp, obj_node)?;
             Some((kind, oid.get()))
         }
+        (ObjectType::ObjectExtension, node::Node::String(s)) => {
+            let oid = interp.extension_by_name.get(&s.sval)?;
+            Some((kind, oid.get()))
+        }
         _ => None,
     }
 }
@@ -151,6 +155,7 @@ impl ObjectAddress {
             | ObjectType::ObjectAggregate => PG_PROC_RELID,
             ObjectType::ObjectOperator => PG_OPERATOR_RELID,
             ObjectType::ObjectCollation => crate::pg_catalog::PG_COLLATION_RELID,
+            ObjectType::ObjectExtension => crate::pg_catalog::PG_EXTENSION_RELID,
             _ => return None,
         };
         Some(Self::new(classid, nz, 0))
@@ -657,6 +662,8 @@ pub(crate) fn drop_ts_object(
         return Ok(());
     };
     let desc = describe(interp, addr);
+    // An extension's member goes only with it.
+    check_not_owned(interp, addr, &desc)?;
     drop_dependents(interp, addr, &desc, cascade)?;
     interp.remove_dependencies_of(addr.classid, addr.objid);
     Ok(())
@@ -688,6 +695,8 @@ fn exists(interp: &PgCatalog, addr: ObjectAddress) -> bool {
         c if c == crate::pg_catalog::PG_NAMESPACE_RELID => {
             crate::oid::PgNamespaceOid::new(oid).is_some_and(|o| interp.namespace_name(o).is_some())
         }
+        c if c == crate::pg_catalog::PG_EXTENSION_RELID => crate::oid::PgExtensionOid::new(oid)
+            .is_some_and(|o| interp.pg_extension.contains_key(&o)),
         c if c == PG_CLASS_RELID => PgClassOid::new(oid).is_some_and(|relid| {
             interp.pg_class.contains_key(&relid)
                 && (addr.objsubid == 0
@@ -979,6 +988,29 @@ fn describe_dependent(interp: &PgCatalog, addr: ObjectAddress) -> String {
             .unwrap_or_default();
         return format!("default value for column {} of table {table}", attr.attname);
     }
+    // An index backing a constraint is part of it (DEPENDENCY_INTERNAL):
+    // reportDependentObjects names the constraint.
+    if addr.classid == PG_CLASS_RELID
+        && addr.objsubid == 0
+        && let Some(index) = PgClassOid::new(addr.objid.get())
+        && let Some(table) = interp.pg_index.get(&index).map(|i| i.indrelid)
+        && let Some(name) = interp.pg_class.get(&index).map(|c| &c.relname)
+        && interp.pg_constraint.values().any(|c| {
+            c.conrelid == table
+                && &c.conname == name
+                && matches!(
+                    c.contype,
+                    crate::pg_catalog::ConType::PrimaryKey
+                        | crate::pg_catalog::ConType::Unique
+                        | crate::pg_catalog::ConType::Exclusion
+                )
+        })
+    {
+        return format!(
+            "constraint {name} on table {}",
+            relation_display_name(interp, table)
+        );
+    }
     describe(interp, addr)
 }
 
@@ -1021,6 +1053,11 @@ fn while_deleting<R>(addr: ObjectAddress, f: impl FnOnce() -> R) -> R {
         p.borrow_mut().pop();
     });
     result
+}
+
+/// The objects the DROP running now deletes together.
+pub(crate) fn drop_targets() -> Vec<ObjectAddress> {
+    DROP_TARGETS.with(|t| t.borrow().clone())
 }
 
 fn is_drop_target(addr: ObjectAddress) -> bool {
@@ -1659,45 +1696,27 @@ pub(crate) fn named_object_addresses(
         .collect()
 }
 
-/// An index depends on the (non-built-in) operator classes its columns
-/// name.
-pub(crate) fn record_index_opclasses(
-    interp: &mut PgCatalog,
-    index: PgClassOid,
-    params: &[typedpg_pg_query::protobuf::Node],
-    am: &str,
-) {
-    let mut refs = Vec::new();
-    for param in params {
-        let Some(node::Node::IndexElem(elem)) = param.node.as_ref() else {
-            continue;
-        };
-        let parts: Vec<&str> = elem
-            .opclass
-            .iter()
-            .filter_map(super::util::node_string)
-            .collect();
-        let (schema, name) = match parts.as_slice() {
-            [s, n] => (Some(*s), *n),
-            [n] => (None, *n),
-            _ => continue,
-        };
-        if let Some(c) = super::opclass::find_opclass(interp, schema, name, am) {
-            refs.push(Reference::Named(NamedObject::Opclass {
-                name: c.opcname.clone(),
-                namespace: c.opcnamespace,
-                method: c.opcmethod.clone(),
-            }));
-        }
-    }
-    // A key column without one named uses its type's default class
-    // (index_create records each `indclass` entry).
-    let resolved: Vec<crate::oid::PgOpclassOid> = interp
+/// index_create: an index depends on each key column's operator class,
+/// named or its type's default (`indclass`; a built-in class is pinned).
+/// Replaces what it recorded before, so every place that builds or
+/// rebuilds an index — CREATE INDEX, constraint indexes, LIKE copies,
+/// partition clones, ALTER COLUMN TYPE — calls this once `indclass` is
+/// final (see [`PgCatalog::insert_pg_index`]).
+pub(crate) fn record_index_opclasses(interp: &mut PgCatalog, index: PgClassOid) {
+    let index_oid = PgGenericOid::from_nonzero(index.into_nonzero());
+    interp.pg_depend.retain(|d| {
+        !(d.classid == PG_CLASS_RELID
+            && d.objid == index_oid
+            && d.refclassid == PG_OPCLASS_RELID
+            && d.deptype == DepType::Normal)
+    });
+    let classes: Vec<crate::oid::PgOpclassOid> = interp
         .pg_index
         .get(&index)
         .map(|i| i.indclass.iter().flatten().copied().collect())
         .unwrap_or_default();
-    for class in resolved {
+    let mut refs = Vec::new();
+    for class in classes {
         if let Some(c) = interp.pg_opclass.iter().find(|c| c.oid == class) {
             let named = Reference::Named(NamedObject::Opclass {
                 name: c.opcname.clone(),

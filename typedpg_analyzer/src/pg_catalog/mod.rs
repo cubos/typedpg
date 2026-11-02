@@ -1952,8 +1952,13 @@ impl PgCatalog {
         self.pg_constraint.retain(|_, c| c.conrelid != relid);
     }
 
+    /// Every index DDL builds goes through here: it depends on its key
+    /// columns' operator classes. Code that changes a row's `indclass`
+    /// afterwards calls [`crate::ddl::depend::record_index_opclasses`].
     pub(crate) fn insert_pg_index(&mut self, row: PgIndex) {
-        self.pg_index.insert(row.indexrelid, row);
+        let index = row.indexrelid;
+        self.pg_index.insert(index, row);
+        crate::ddl::depend::record_index_opclasses(self, index);
     }
 
     pub(crate) fn remove_pg_index(&mut self, indexrelid: PgClassOid) -> Option<PgIndex> {
