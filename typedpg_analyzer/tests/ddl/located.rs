@@ -133,3 +133,27 @@ fn a_carriage_return_ends_a_line_comment() {
         "unexpected location:\n{rendered}"
     );
 }
+
+#[test]
+fn a_transaction_block_left_open_points_at_its_begin() {
+    let sql = "-- no-transaction\nCREATE TABLE kept (a int);\nBEGIN;\nCREATE TABLE u (a int);\n";
+    let mut db = PgCatalog::new().unwrap();
+    db.skip_pg_sanity();
+    db.set_migrations_use_transaction(true);
+    let rendered = match db.apply_migration("0002_open.sql", sql) {
+        Err(e @ DdlError::Migration { .. }) => e.to_string(),
+        other => panic!("expected a located migration error, got {other:?}"),
+    };
+    assert_eq!(
+        rendered,
+        "\
+this migration left a transaction block open (a BEGIN with no COMMIT), and runs without the runner's transaction: the runner would roll the block back and fail it
+  --> 0002_open.sql:3:1
+  ╭────
+3 │ BEGIN;
+  · ──┬──
+  ·   ╰─ this transaction block is never committed
+  ╰────
+  help: Add a COMMIT at the end of the transaction block."
+    );
+}
