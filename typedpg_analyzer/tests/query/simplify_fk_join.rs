@@ -496,6 +496,13 @@ fn session_replication_role_voids_the_proof() {
         // COPY from or to a program.
         "COPY orders FROM PROGRAM 'true';",
         "COPY orders TO PROGRAM 'cat > /dev/null';",
+        // A `LANGUAGE internal` alias of ts_rewrite(tsquery, text), by its
+        // C symbol.
+        "CREATE FUNCTION rw(tsquery, text) RETURNS tsquery \
+         AS 'tsquery_rewrite_query' LANGUAGE internal;",
+        // A `program` option: file_fdw runs it as a shell command.
+        "CREATE FOREIGN DATA WRAPPER w; CREATE SERVER s FOREIGN DATA WRAPPER w; \
+         CREATE FOREIGN TABLE ft (a text) SERVER s OPTIONS (program 'true');",
     ] {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(tables).unwrap();
@@ -535,6 +542,25 @@ fn session_replication_role_voids_the_proof() {
     db.apply_sql(tables).unwrap();
     db.apply_sql("CREATE EXTENSION dblink;").unwrap();
     assert_kept(&db, &[sql]);
+    // file_fdw, whose `program` option runs a shell command.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(tables).unwrap();
+    if db.apply_sql("CREATE EXTENSION file_fdw;").is_ok() {
+        assert_kept(&db, &[sql]);
+    }
+    // A `LANGUAGE c` alias by symbol (not loadable by the oracle's server).
+    let mut db = PgCatalog::new().unwrap();
+    db.skip_pg_sanity();
+    db.apply_sql(tables).unwrap();
+    if db
+        .apply_sql(
+            "CREATE FUNCTION st(text) RETURNS SETOF record \
+             AS '$libdir/postgres', 'ts_stat1' LANGUAGE c;",
+        )
+        .is_ok()
+    {
+        assert_kept(&db, &[sql]);
+    }
     // postgres_fdw's script the analyzer can't apply yet: the migration is
     // rejected, so no schema is built past it.
     let mut db = PgCatalog::new().unwrap();

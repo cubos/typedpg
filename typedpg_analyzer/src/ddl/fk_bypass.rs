@@ -44,7 +44,10 @@
 //! - creates or alters a subscription — logical replication's apply
 //!   workers run with `session_replication_role = replica` — or creates
 //!   an extension that runs SQL on another connection (`dblink`,
-//!   `postgres_fdw`).
+//!   `postgres_fdw`) or a shell command (`file_fdw`), or gives anything a
+//!   `program` option;
+//! - defines a `LANGUAGE internal` or `c` routine aliasing one of the
+//!   built-ins that run SQL given as text, by its C symbol.
 
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{AlterTableType, RangeVar, a_const, node};
@@ -66,6 +69,7 @@ const BODY_MARKERS: &[&str] = &[
     "cursor_to_xml",
     "ts_stat",
     "ts_rewrite",
+    "tsquery_rewrite",
     "dblink",
     "pg_trigger",
     "pg_class",
@@ -88,8 +92,23 @@ const SQL_RUNNING_BUILTINS: &[&str] = &[
     "ts_rewrite",
 ];
 
-/// Extensions that run SQL on another connection.
-const REMOTE_SQL_EXTENSIONS: &[&str] = &["dblink", "postgres_fdw"];
+/// The C symbols (`pg_proc.prosrc`, PG 18.6) of [`SQL_RUNNING_BUILTINS`]:
+/// a `LANGUAGE internal` or `c` routine naming one is an alias of it under
+/// another name (`ts_rewrite(tsquery, text)` is `tsquery_rewrite_query`).
+const SQL_RUNNING_SYMBOLS: &[&str] = &[
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "tsquery_rewrite_query",
+    "ts_stat1",
+    "ts_stat2",
+];
+
+/// Extensions that run SQL on another connection (`dblink`,
+/// `postgres_fdw`) or a shell command (`file_fdw`'s `program` option).
+const REMOTE_SQL_EXTENSIONS: &[&str] = &["dblink", "postgres_fdw", "file_fdw"];
 
 /// The setting that turns foreign-key triggers off.
 const ROLE: &str = "session_replication_role";
@@ -273,6 +292,10 @@ fn bypasses(stmt: &node::Node) -> bool {
             AlterTableType::try_from(c.subtype),
             Ok(AlterTableType::AtEnableReplicaTrig | AlterTableType::AtEnableAlwaysTrig)
         ),
+        // A foreign table's, server's or wrapper's `program` option runs
+        // a shell command (file_fdw), as COPY ... PROGRAM does.
+        NodeRef::DefElem(d) => d.defname.eq_ignore_ascii_case("program"),
+        NodeRef::CreateFunctionStmt(f) => aliases_sql_running_builtin(f),
         NodeRef::CreateExtensionStmt(e) => {
             REMOTE_SQL_EXTENSIONS.contains(&e.extname.to_ascii_lowercase().as_str())
         }
@@ -291,6 +314,32 @@ fn bypasses(stmt: &node::Node) -> bool {
                     .any(|(n, _)| matches!(n, NodeRef::RangeVar(rv) if system_table(rv)))
             }),
         NodeRef::CreateSubscriptionStmt(_) | NodeRef::AlterSubscriptionStmt(_) => true,
+        _ => false,
+    })
+}
+
+/// A `LANGUAGE internal` or `c` routine whose symbol is one of
+/// [`SQL_RUNNING_SYMBOLS`].
+fn aliases_sql_running_builtin(f: &typedpg_pg_query::protobuf::CreateFunctionStmt) -> bool {
+    let defelem = |name: &str| {
+        f.options.iter().find_map(|o| match o.node.as_ref() {
+            Some(node::Node::DefElem(d)) if d.defname == name => d.arg.as_deref(),
+            _ => None,
+        })
+    };
+    let native = defelem("language")
+        .and_then(super::util::node_string)
+        .is_some_and(|l| l.eq_ignore_ascii_case("internal") || l.eq_ignore_ascii_case("c"));
+    if !native {
+        return false;
+    }
+    let Some(body) = defelem("as").and_then(|b| b.node.as_ref()) else {
+        return false;
+    };
+    body.nodes().iter().any(|(n, _)| match n {
+        NodeRef::String(s) => SQL_RUNNING_SYMBOLS
+            .iter()
+            .any(|sym| s.sval.trim().eq_ignore_ascii_case(sym)),
         _ => false,
     })
 }
