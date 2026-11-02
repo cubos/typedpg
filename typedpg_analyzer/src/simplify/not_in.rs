@@ -32,9 +32,9 @@
 //!   UPDATE's SET, NOT EXISTS isn't a join at all: it stays a correlated
 //!   SubPlan scanning the subquery per row, where NOT IN hashed it once —
 //!   200 such columns over 2000 × 2000 rows took 100 ms written and 5.5 s
-//!   rewritten (PG 18.6). So `x NOT IN (…) AND created_at > now() -
-//!   interval '1 day'`, a target list, a DML or locking SELECT's WHERE,
-//!   HAVING, a CTE or any nested query is left as written.
+//!   rewritten (PG 18.6). So `x NOT IN (…) AND 10 / a > 1`, a target
+//!   list, a DML or locking SELECT's WHERE, HAVING, a CTE or any nested
+//!   query is left as written.
 //! - the subquery has no LIMIT or OFFSET: the SubPlan reads it once, an
 //!   anti-join may rescan it, and a LIMIT may return other rows then.
 //! - nothing in it is volatile (the subquery may run a different number
@@ -43,12 +43,15 @@
 //!   the subquery's rows by its WHERE before (or without) looking at the
 //!   outer row, where the SubPlan evaluated it per outer row, in cost
 //!   order, or not at all over an empty outer side. So the subquery reads
-//!   only stored tables, and every expression in it is a column,
-//!   constant, parameter, boolean combination, NULL / boolean test or a
-//!   comparison through a built-in operator needing no cast
-//!   ([`super::proof::error_free_select`]). A subquery with a cast,
-//!   arithmetic, a function call or a pattern match is left as written,
-//!   even where it couldn't fail on the data at hand.
+//!   only stored tables, and every expression in it is one
+//!   [`super::proof::cannot_error`] proves can't fail for any value: a
+//!   column, constant, parameter, boolean combination, NULL / boolean
+//!   test, a comparison through a built-in operator, and only the casts
+//!   and functions that return a value for every input (`int4` to
+//!   `numeric`, `lower(text)`, `now() - interval '1 day'`, …)
+//!   ([`super::proof::error_free_select`]). A subquery with arithmetic, a
+//!   narrowing or parsing cast, another function call or a pattern match
+//!   is left as written, even where it couldn't fail on the data at hand.
 //! - the NOT IN is in a SELECT's target list, WHERE or HAVING, or in an
 //!   UPDATE / DELETE's WHERE (or SET) — where [`FromScope`] knows what
 //!   its columns are — and not repeated in a GROUP BY, ORDER BY or

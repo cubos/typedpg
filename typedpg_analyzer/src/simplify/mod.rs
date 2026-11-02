@@ -21,6 +21,7 @@ mod fk_join;
 mod not_in;
 #[allow(dead_code)] // The rules use them as they land.
 pub(crate) mod proof;
+mod safe_builtins;
 
 /// A text edit on the post-lex SQL ([`AnalyzedQuery::sql`], with `$n`
 /// placeholders): `range` replaced by `text`.

@@ -13,8 +13,9 @@ use typedpg_pg_query::protobuf::{
 };
 
 use super::Ctx;
+use crate::coerce::{CoercionContext, CoercionPath};
 use crate::oid::{PgClassOid, PgProcOid};
-use crate::pg_catalog::{PgCatalog, ProKind, ProVolatile, RelKind};
+use crate::pg_catalog::{PgCatalog, ProKind, ProVolatile, RelKind, TypType};
 
 /// OIDs below this are PG's own objects (`FirstNormalObjectId`).
 const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
@@ -522,71 +523,48 @@ fn builtin_operator_exact(
 /// `unknown`: an untyped literal, which takes the other operand's type.
 const UNKNOWN: u32 = 705;
 
+/// `anyenum`: the operand type of the enum comparison operators.
+const ANYENUM: u32 = 3500;
+
+/// `interval`.
+const INTERVAL: u32 = 1186;
+
 /// The comparison operators [`cannot_error`] accepts.
 const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", "<=", ">", ">="];
 
-/// Where an operand's collation comes from.
+/// Where an expression's collation comes from.
 #[derive(Clone, Copy)]
 enum OperandCollation {
-    /// A column: its own (`attcollation`), with implicit derivation.
+    /// A column's (`attcollation`), with implicit derivation — also when
+    /// a cast or function passes it on (`varchar_col::text`,
+    /// `lower(col)`).
     Column(Option<crate::oid::PgCollationOid>),
-    /// A constant or parameter: its type's (`typcollation`) once coerced,
-    /// with implicit derivation too.
+    /// A constant, parameter, or expression of no collatable input: its
+    /// type's (`typcollation`) once coerced, with implicit derivation too.
     OfType,
+}
+
+/// What an expression [`cannot_error`] accepts evaluates to: its type,
+/// when known (`None`: a parameter of a type the proof doesn't model,
+/// which can't be an operand), and where its collation comes from.
+#[derive(Clone, Copy)]
+struct Typed {
+    ty: Option<crate::oid::PgTypeOid>,
+    coll: OperandCollation,
+}
+
+impl Typed {
+    fn of(ty: crate::oid::PgTypeOid) -> Typed {
+        Typed {
+            ty: Some(ty),
+            coll: OperandCollation::OfType,
+        }
+    }
 }
 
 /// `DEFAULT_COLLATION_OID`: the database default, which an implicit
 /// collation of the other side overrides without a conflict.
 const DEFAULT_COLLATION: u32 = 100;
-
-/// What an operand of a comparison is, for [`cannot_error`]: its type, and
-/// where its collation comes from.
-fn operand(
-    ctx: &Ctx<'_>,
-    node: &Node,
-    scope: &FromScope<'_>,
-) -> Option<(crate::oid::PgTypeOid, OperandCollation)> {
-    use crate::oid::PgTypeOid;
-    use typedpg_pg_query::protobuf::a_const::Val;
-    match node.node.as_ref()? {
-        N::ColumnRef(c) => {
-            let r = scope.resolve(ctx, c)?;
-            let attr = ctx
-                .catalog
-                .attributes_of(r.rel)
-                .iter()
-                .find(|a| a.attnum == r.attnum)?;
-            Some((attr.atttypid, OperandCollation::Column(attr.attcollation)))
-        }
-        N::AConst(c) if c.isnull => Some((PgTypeOid::from_raw(UNKNOWN), OperandCollation::OfType)),
-        N::AConst(c) => Some((
-            PgTypeOid::from_raw(match c.val.as_ref()? {
-                Val::Ival(_) => 23,
-                Val::Fval(_) => 1700,
-                Val::Boolval(_) => 16,
-                Val::Sval(_) => UNKNOWN,
-                Val::Bsval(_) => return None,
-            }),
-            OperandCollation::OfType,
-        )),
-        N::ParamRef(p) => {
-            let param = ctx
-                .analyzed
-                .params
-                .get(usize::try_from(p.number).ok()?.checked_sub(1)?)?;
-            let (schema, name) = match &param.pg_type {
-                crate::types::Type::Basic { schema, name, .. }
-                | crate::types::Type::Domain { schema, name, .. } => (schema, name),
-                _ => return None,
-            };
-            Some((
-                ctx.catalog.resolve_type_by_name(Some(schema), name)?.oid,
-                OperandCollation::OfType,
-            ))
-        }
-        _ => None,
-    }
-}
 
 /// Whether comparing operands of these (coerced) types and collation
 /// sources can't hit a collation conflict at run time. Every side's
@@ -625,64 +603,562 @@ fn collations_agree(
 }
 
 /// Whether evaluating `expr` in `scope` can never raise an error, whatever
-/// the rows: column references (not virtual generated ones), constants,
-/// parameters; AND / OR / NOT, IS [NOT] NULL, IS [NOT] TRUE / FALSE /
-/// UNKNOWN of such; and `= <> < <= > >=` between them through a built-in
-/// operator that takes exactly their types (no cast runs first), between
-/// columns of one collation. Anything else — a cast, arithmetic, a function
-/// call, a pattern match — may fail on some row.
+/// the rows:
+///
+/// - column references (not virtual generated ones), constants,
+///   parameters;
+/// - AND / OR / NOT, IS [NOT] NULL, IS [NOT] TRUE / FALSE / UNKNOWN of
+///   such;
+/// - `= <> < <= > >=`, IS [NOT] DISTINCT FROM, [NOT] BETWEEN and [NOT] IN
+///   a list of constants and parameters, through a built-in operator,
+///   between operands of one collation;
+/// - the casts, implicit (to an operator's or function's argument type)
+///   or written, and the functions of [`super::safe_builtins`]: those that
+///   return a value for every input, like `int4` to `numeric` or
+///   `lower(text)`. A cast with a typmod (`varchar(10)`, `numeric(5,2)`)
+///   or to a domain is refused;
+/// - `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP` (without a
+///   precision), `COALESCE` of such;
+/// - a clock reading shifted by a bounded constant: `now() - interval '1
+///   day'`, `current_date + 7` ([`super::safe_builtins::MAX_SHIFT_YEARS`]).
+///
+/// Anything else — arithmetic, a narrowing or parsing cast, another
+/// function call, a pattern match — may fail on some row.
 pub(crate) fn cannot_error(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> bool {
-    match expr.node.as_ref() {
-        Some(N::ColumnRef(c)) => scope.resolve(ctx, c).is_some_and(|r| {
-            ctx.catalog
+    typed(ctx, expr, scope).is_some()
+}
+
+/// [`cannot_error`], with what the expression evaluates to; `None` when
+/// it may fail.
+fn typed(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> Option<Typed> {
+    use crate::oid::PgTypeOid;
+    use typedpg_pg_query::protobuf::a_const::Val;
+    let catalog = ctx.catalog;
+    let boolean = Typed::of(crate::pg_catalog::oid::BOOL);
+    match expr.node.as_ref()? {
+        N::ColumnRef(c) => {
+            let r = scope.resolve(ctx, c)?;
+            let attr = catalog
                 .attributes_of(r.rel)
                 .iter()
-                .find(|a| a.attnum == r.attnum)
-                .is_some_and(|a| a.attgenerated != Some(crate::pg_catalog::AttGenerated::Virtual))
-        }),
-        Some(N::AConst(_) | N::ParamRef(_)) => true,
-        Some(N::BoolExpr(b)) => b.args.iter().all(|a| cannot_error(ctx, a, scope)),
-        Some(N::NullTest(t)) => t
-            .arg
-            .as_deref()
-            .is_some_and(|a| cannot_error(ctx, a, scope)),
-        Some(N::BooleanTest(t)) => t
-            .arg
-            .as_deref()
-            .is_some_and(|a| cannot_error(ctx, a, scope)),
-        Some(N::AExpr(e)) => {
-            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
-                return false;
-            };
-            let Some((None, op)) = name_parts(&e.name) else {
-                return false;
-            };
-            if e.kind() != AExprKind::AexprOp
-                || !COMPARISONS.contains(&op)
-                || !cannot_error(ctx, l, scope)
-                || !cannot_error(ctx, r, scope)
-            {
-                return false;
-            }
-            let (Some((lt, lc)), Some((rt, rc))) = (operand(ctx, l, scope), operand(ctx, r, scope))
-            else {
-                return false;
-            };
-            // An untyped literal takes the other side's type; its input
-            // function runs as the query is parsed, for both forms alike.
-            let (lt, rt) = match (lt.get() == UNKNOWN, rt.get() == UNKNOWN) {
-                (true, true) => return false,
-                (true, false) => (rt, rt),
-                (false, true) => (lt, lt),
-                (false, false) => (lt, rt),
-            };
-            collations_agree(ctx.catalog, (lt, lc), (rt, rc))
-                && builtin_operator_exact(ctx.catalog, op, lt, rt).is_some()
+                .find(|a| a.attnum == r.attnum)?;
+            (attr.attgenerated != Some(crate::pg_catalog::AttGenerated::Virtual)).then_some(Typed {
+                ty: Some(attr.atttypid),
+                coll: OperandCollation::Column(attr.attcollation),
+            })
         }
-        _ => false,
+        N::AConst(c) if c.isnull => Some(Typed::of(PgTypeOid::from_raw(UNKNOWN))),
+        N::AConst(c) => Some(Typed::of(match c.val.as_ref()? {
+            Val::Ival(_) => crate::pg_catalog::oid::INT4,
+            Val::Fval(f) => float_literal_type(&f.fval),
+            Val::Boolval(_) => crate::pg_catalog::oid::BOOL,
+            Val::Sval(_) => PgTypeOid::from_raw(UNKNOWN),
+            // `bit`: its input runs as the query is parsed.
+            Val::Bsval(_) => PgTypeOid::from_raw(1560),
+        })),
+        N::ParamRef(p) => {
+            let param = ctx
+                .analyzed
+                .params
+                .get(usize::try_from(p.number).ok()?.checked_sub(1)?)?;
+            let ty = match &param.pg_type {
+                crate::types::Type::Basic { schema, name, .. }
+                | crate::types::Type::Domain { schema, name, .. }
+                | crate::types::Type::Enum { schema, name, .. } => catalog
+                    .resolve_type_by_name(Some(schema), name)
+                    .map(|t| t.oid),
+                _ => None,
+            };
+            Some(Typed {
+                ty,
+                coll: OperandCollation::OfType,
+            })
+        }
+        N::BoolExpr(b) => b
+            .args
+            .iter()
+            .all(|a| typed(ctx, a, scope).is_some())
+            .then_some(boolean),
+        N::NullTest(t) => typed(ctx, t.arg.as_deref()?, scope).map(|_| boolean),
+        N::BooleanTest(t) => typed(ctx, t.arg.as_deref()?, scope).map(|_| boolean),
+        N::AExpr(e) => {
+            // `OPERATOR(schema.op)` names one PG's resolution doesn't pick.
+            let (None, op) = name_parts(&e.name)? else {
+                return None;
+            };
+            let l = e.lexpr.as_deref()?;
+            let r = e.rexpr.as_deref()?;
+            match e.kind() {
+                AExprKind::AexprOp if COMPARISONS.contains(&op) => {
+                    let (lt, rt) = (typed(ctx, l, scope)?, typed(ctx, r, scope)?);
+                    comparison_cannot_error(catalog, op, lt, rt).then_some(boolean)
+                }
+                AExprKind::AexprOp if op == "+" || op == "-" => clock_shift(ctx, op, l, r, scope),
+                AExprKind::AexprDistinct | AExprKind::AexprNotDistinct if op == "=" => {
+                    let (lt, rt) = (typed(ctx, l, scope)?, typed(ctx, r, scope)?);
+                    comparison_cannot_error(catalog, "=", lt, rt).then_some(boolean)
+                }
+                // PG transforms `a BETWEEN b AND c` into `a >= b AND a <=
+                // c`, and NOT BETWEEN into `a < b OR a > c`.
+                AExprKind::AexprBetween | AExprKind::AexprNotBetween => {
+                    let Some(N::List(bounds)) = r.node.as_ref() else {
+                        return None;
+                    };
+                    let [lo, hi] = bounds.items.as_slice() else {
+                        return None;
+                    };
+                    let (lower, upper) = if e.kind() == AExprKind::AexprBetween {
+                        (">=", "<=")
+                    } else {
+                        ("<", ">")
+                    };
+                    let x = typed(ctx, l, scope)?;
+                    let (lo, hi) = (typed(ctx, lo, scope)?, typed(ctx, hi, scope)?);
+                    (comparison_cannot_error(catalog, lower, x, lo)
+                        && comparison_cannot_error(catalog, upper, x, hi))
+                    .then_some(boolean)
+                }
+                AExprKind::AexprIn if op == "=" || op == "<>" => {
+                    let Some(N::List(list)) = r.node.as_ref() else {
+                        return None;
+                    };
+                    in_list_cannot_error(ctx, op, l, &list.items, scope).then_some(boolean)
+                }
+                _ => None,
+            }
+        }
+        N::TypeCast(t) => {
+            let target = plain_type_name(catalog, t.type_name.as_ref()?)?;
+            let arg = typed(ctx, t.arg.as_deref()?, scope)?;
+            let source = arg.ty?;
+            if source.get() == UNKNOWN {
+                // An untyped literal is read by the type's input function
+                // as the query is parsed, in both forms alike.
+                return (catalog.get_type(target)?.typtype != TypType::Domain)
+                    .then_some(Typed::of(target));
+            }
+            if target.get() >= FIRST_GENBKI_OBJECT_ID
+                || !coerces_safely(catalog, source, target, CoercionContext::Explicit)
+            {
+                return None;
+            }
+            Some(Typed {
+                ty: Some(target),
+                coll: passed_on_collation(catalog, arg, target),
+            })
+        }
+        N::FuncCall(f) => {
+            if !f.agg_order.is_empty()
+                || f.agg_filter.is_some()
+                || f.over.is_some()
+                || f.agg_within_group
+                || f.agg_star
+                || f.agg_distinct
+                || f.func_variadic
+            {
+                return None;
+            }
+            let (schema, name) = name_parts(&f.funcname)?;
+            let args = f
+                .args
+                .iter()
+                .map(|a| {
+                    if matches!(a.node, Some(N::NamedArgExpr(_))) {
+                        return None;
+                    }
+                    let t = typed(ctx, a, scope)?;
+                    Some((t, t.ty?))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let types: Vec<PgTypeOid> = args.iter().map(|(_, t)| *t).collect();
+            let resolved = crate::functions::resolve_function(
+                catalog,
+                schema,
+                name,
+                &types,
+                &crate::functions::CallNotation::default(),
+                false,
+                None,
+            )
+            .ok()?;
+            if !super::safe_builtins::function(resolved.oid)
+                || resolved.arg_types.len() != types.len()
+                || !types
+                    .iter()
+                    .zip(&resolved.arg_types)
+                    .all(|(&s, &t)| coerces_safely(catalog, s, t, CoercionContext::Implicit))
+                || args.iter().any(|(a, t)| {
+                    matches!(a.coll, OperandCollation::Column(None))
+                        && catalog
+                            .get_type(*t)
+                            .is_none_or(|t| t.typcollation.is_some())
+                })
+            {
+                return None;
+            }
+            // `lower` / `upper` read their argument's collation: a column's
+            // (or the type's default), never a conflict of two.
+            let coll = match args.first() {
+                Some((arg, _)) => passed_on_collation(catalog, *arg, resolved.return_type_oid),
+                None => OperandCollation::OfType,
+            };
+            Some(Typed {
+                ty: Some(resolved.return_type_oid),
+                coll,
+            })
+        }
+        N::SqlvalueFunction(svf) => {
+            use typedpg_pg_query::protobuf::SqlValueFunctionOp as Op;
+            // The transaction's start time, as a date, timestamptz or
+            // timestamp (`GetSQLCurrentDate`, `GetSQLCurrentTimestamp`,
+            // `GetSQLLocalTimestamp`): a real clock reading, far from the
+            // ends of every range. Not with a precision, which rounds.
+            Some(Typed::of(match Op::try_from(svf.op).ok()? {
+                Op::SvfopCurrentDate => crate::pg_catalog::oid::DATE,
+                Op::SvfopCurrentTimestamp => crate::pg_catalog::oid::TIMESTAMPTZ,
+                Op::SvfopLocaltimestamp => crate::pg_catalog::oid::TIMESTAMP,
+                _ => return None,
+            }))
+        }
+        N::CoalesceExpr(c) => {
+            let args = c
+                .args
+                .iter()
+                .map(|a| typed(ctx, a, scope))
+                .collect::<Option<Vec<_>>>()?;
+            let types = args.iter().map(|a| a.ty).collect::<Option<Vec<_>>>()?;
+            let common = crate::coerce::select_common_type(&types, catalog).ok()?;
+            if !types
+                .iter()
+                .all(|&t| coerces_safely(catalog, t, common, CoercionContext::Implicit))
+            {
+                return None;
+            }
+            // Implicit collations of the arguments merge; require them
+            // equal rather than model the default giving way.
+            let mut coll = OperandCollation::OfType;
+            for a in &args {
+                if let OperandCollation::Column(c) = passed_on_collation(catalog, *a, common) {
+                    match coll {
+                        OperandCollation::Column(prev) if prev != c => return None,
+                        _ => coll = OperandCollation::Column(c),
+                    }
+                }
+            }
+            Some(Typed {
+                ty: Some(common),
+                coll,
+            })
+        }
+        _ => None,
     }
 }
 
+/// The type PG gives a `Float`-tagged literal (`make_const`): an integer
+/// too large for the lexer's `int4` that `pg_strtoint64_safe` reads (its
+/// prefixes and underscores included) is `int4` or `int8`, anything else
+/// `numeric`.
+fn float_literal_type(text: &str) -> crate::oid::PgTypeOid {
+    use crate::pg_catalog::oid;
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let lower = digits.to_ascii_lowercase();
+    let (radix, body) = match lower.get(..2) {
+        Some("0x") => (16, &lower[2..]),
+        Some("0o") => (8, &lower[2..]),
+        Some("0b") => (2, &lower[2..]),
+        _ => (10, lower.as_str()),
+    };
+    let body = body.replace('_', "");
+    let value = i128::from_str_radix(&body, radix)
+        .ok()
+        .map(|v| if negative { -v } else { v });
+    match value {
+        Some(v) if i32::try_from(v).is_ok() => oid::INT4,
+        Some(v) if i64::try_from(v).is_ok() => oid::INT8,
+        _ => oid::NUMERIC,
+    }
+}
+
+/// The type a cast's target names, when it is a plain one: no typmod
+/// (a length or precision coercion may fail, or round), no array bounds,
+/// no `%TYPE` or `SETOF`.
+fn plain_type_name(
+    catalog: &PgCatalog,
+    tn: &typedpg_pg_query::protobuf::TypeName,
+) -> Option<crate::oid::PgTypeOid> {
+    if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() || tn.setof || tn.pct_type {
+        return None;
+    }
+    let (schema, name) = name_parts(&tn.names)?;
+    catalog.resolve_type_by_name(schema, name).map(|t| t.oid)
+}
+
+/// The collation an expression of `arg` converted to `result` carries:
+/// PG's `assign_collations` gives a collatable result the merged
+/// collation of its collatable inputs, else the result type's own.
+fn passed_on_collation(
+    catalog: &PgCatalog,
+    arg: Typed,
+    result: crate::oid::PgTypeOid,
+) -> OperandCollation {
+    let collatable = |t: crate::oid::PgTypeOid| {
+        catalog
+            .get_type(t)
+            .is_some_and(|t| t.typcollation.is_some())
+    };
+    match (arg.coll, arg.ty) {
+        (OperandCollation::Column(c), Some(t)) if collatable(t) && collatable(result) => {
+            OperandCollation::Column(c)
+        }
+        _ => OperandCollation::OfType,
+    }
+}
+
+/// Whether coercing a value of `source` to `target` (an operator's or
+/// function's argument type, a common type, or a written cast's target)
+/// can't fail: no coercion, a domain's value read as its base type, a
+/// binary-coercible relabel, a cast function of
+/// [`super::safe_builtins::CAST_FUNCTIONS`], or an I/O conversion to
+/// `text` from [`super::safe_builtins::IO_TO_TEXT`]. An untyped literal
+/// is read by the target's input function as the query is parsed, the
+/// same in both forms. A coercion to a domain (its CHECKs run) is refused.
+fn coerces_safely(
+    catalog: &PgCatalog,
+    source: crate::oid::PgTypeOid,
+    target: crate::oid::PgTypeOid,
+    context: CoercionContext,
+) -> bool {
+    if source == target {
+        return true;
+    }
+    if catalog
+        .get_type(target)
+        .is_none_or(|t| t.typtype == TypType::Domain)
+    {
+        return false;
+    }
+    if source.get() == UNKNOWN {
+        return true;
+    }
+    let source = catalog.unwrap_domain(source);
+    if source == target {
+        return true;
+    }
+    if target.get() == ANYENUM {
+        return catalog
+            .get_type(source)
+            .is_some_and(|t| t.typtype == TypType::Enum);
+    }
+    match crate::coerce::coercion_pathway(target, source, context, catalog) {
+        Some(CoercionPath::Relabel) => true,
+        Some(CoercionPath::Func) => catalog
+            .cast_by_pair
+            .get(&(source, target))
+            .and_then(|c| catalog.pg_cast.get(c))
+            .and_then(|c| c.castfunc)
+            .is_some_and(super::safe_builtins::cast_function),
+        Some(CoercionPath::CoerceViaIo) => {
+            target == crate::pg_catalog::oid::TEXT
+                && super::safe_builtins::IO_TO_TEXT.contains(&source)
+        }
+        Some(CoercionPath::ArrayCoerce) | None => false,
+    }
+}
+
+/// Whether `left op right` (each already proved error-free) can't fail:
+/// the operator PG resolves is a built-in one, both operands coerce to its
+/// argument types safely ([`coerces_safely`]) — an enum to `anyenum`
+/// too — and their collations can't conflict. Two untyped literals are
+/// refused (PG resolves them as `text`, which isn't worth modelling).
+fn comparison_cannot_error(catalog: &PgCatalog, op: &str, left: Typed, right: Typed) -> bool {
+    let (Some(lt), Some(rt)) = (left.ty, right.ty) else {
+        return false;
+    };
+    if lt.get() == UNKNOWN && rt.get() == UNKNOWN {
+        return false;
+    }
+    let Some(resolved) = catalog.find_operator(op, Some(lt), rt) else {
+        return false;
+    };
+    let Some(declared) = catalog.pg_operator.get(&resolved.oid) else {
+        return false;
+    };
+    let Some(oprleft) = declared.oprleft else {
+        return false;
+    };
+    if resolved.oid.get() >= FIRST_GENBKI_OBJECT_ID
+        || resolved
+            .code
+            .is_none_or(|p| p.get() >= FIRST_GENBKI_OBJECT_ID)
+        || !coerces_safely(catalog, lt, oprleft, CoercionContext::Implicit)
+        || !coerces_safely(catalog, rt, declared.oprright, CoercionContext::Implicit)
+    {
+        return false;
+    }
+    // An untyped literal takes the operator's argument type; its input
+    // function runs as the query is parsed, for both forms alike.
+    let as_coerced = |t: crate::oid::PgTypeOid, declared: crate::oid::PgTypeOid| {
+        if t.get() == UNKNOWN {
+            if declared.get() == ANYENUM {
+                // The other side's enum.
+                if lt.get() == UNKNOWN { rt } else { lt }
+            } else {
+                declared
+            }
+        } else {
+            t
+        }
+    };
+    collations_agree(
+        catalog,
+        (as_coerced(lt, oprleft), left.coll),
+        (as_coerced(rt, declared.oprright), right.coll),
+    )
+}
+
+/// Whether `x IN (a, b, …)` (`op` `=`) or `x NOT IN (a, b, …)` (`<>`) can't
+/// fail, for a list of constants and parameters (written casts of them
+/// included). PG's `transformAExprIn` turns two or more such items into
+/// `x op ANY (ARRAY[…])` over their common type with `x`, each item coerced
+/// to it, and compares a single one, or any list without a common array
+/// type, item by item: each comparison, and each coercion, must be one
+/// [`comparison_cannot_error`] and [`coerces_safely`] accept.
+fn in_list_cannot_error(
+    ctx: &Ctx<'_>,
+    op: &str,
+    x: &Node,
+    items: &[Node],
+    scope: &FromScope<'_>,
+) -> bool {
+    let catalog = ctx.catalog;
+    let Some(x) = typed(ctx, x, scope) else {
+        return false;
+    };
+    // An item with a column of this level is compared on its own; keep to
+    // the items that never are.
+    let constant = |n: &Node| {
+        n.node.as_ref().is_some_and(|n| {
+            n.nodes()
+                .iter()
+                .all(|(n, _)| !matches!(n, NodeRef::ColumnRef(_) | NodeRef::SubLink(_)))
+        })
+    };
+    if items.is_empty() || !items.iter().all(constant) {
+        return false;
+    }
+    let Some(typed_items) = items
+        .iter()
+        .map(|i| typed(ctx, i, scope))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let pairwise = || {
+        typed_items
+            .iter()
+            .all(|&i| comparison_cannot_error(catalog, op, x, i))
+    };
+    if typed_items.len() == 1 {
+        return pairwise();
+    }
+    let Some(types) = std::iter::once(x.ty)
+        .chain(typed_items.iter().map(|i| i.ty))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let scalar = crate::coerce::select_common_type(&types, catalog)
+        .ok()
+        .filter(|&s| {
+            crate::coerce::verify_common_type_from_oids(s, &types, catalog)
+                && s != crate::pg_catalog::oid::RECORD
+                && catalog.array_type_of(s).is_some()
+        });
+    match scalar {
+        Some(scalar) => {
+            typed_items.iter().all(|i| {
+                i.ty.is_some_and(|t| coerces_safely(catalog, t, scalar, CoercionContext::Implicit))
+            }) && comparison_cannot_error(catalog, op, x, Typed::of(scalar))
+        }
+        None => pairwise(),
+    }
+}
+
+/// `clock op shift`, `op` `+` or `-`, when it can't fail: `clock` reads the
+/// clock (`now()`, `transaction_timestamp()`, `statement_timestamp()`,
+/// `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, `CURRENT_DATE`), `shift` is a
+/// finite `interval` literal (or, for a date, an integer literal) no field
+/// of which exceeds [`super::safe_builtins::MAX_SHIFT_YEARS`], and the
+/// operator PG resolves is one of
+/// [`super::safe_builtins::CLOCK_SHIFT_OPERATORS`]. Those fail only when
+/// the result leaves the type's range, which a clock reading moved by a
+/// few thousand years can't. A parameter or column shift is unbounded, and
+/// refused.
+fn clock_shift(
+    ctx: &Ctx<'_>,
+    op: &str,
+    clock: &Node,
+    shift: &Node,
+    scope: &FromScope<'_>,
+) -> Option<Typed> {
+    use typedpg_pg_query::protobuf::a_const::Val;
+    let catalog = ctx.catalog;
+    let reads_clock = match clock.node.as_ref()? {
+        N::FuncCall(f) => {
+            let (schema, name) = name_parts(&f.funcname)?;
+            f.args.is_empty()
+                && crate::functions::resolve_function(
+                    catalog,
+                    schema,
+                    name,
+                    &[],
+                    &crate::functions::CallNotation::default(),
+                    false,
+                    None,
+                )
+                .is_ok_and(|r| super::safe_builtins::CLOCK_FUNCTIONS.contains(&r.oid.get()))
+        }
+        N::SqlvalueFunction(_) => true,
+        _ => false,
+    };
+    // `typed` checks the clock call itself (a FuncCall's flags, a
+    // SQLValueFunction without precision).
+    let clock_type = typed(ctx, clock, scope)?.ty?;
+    if !reads_clock {
+        return None;
+    }
+    let years = super::safe_builtins::MAX_SHIFT_YEARS;
+    let shift_type = match shift.node.as_ref()? {
+        N::TypeCast(t) => {
+            let target = plain_type_name(catalog, t.type_name.as_ref()?)?;
+            let Some(N::AConst(c)) = t.arg.as_deref()?.node.as_ref() else {
+                return None;
+            };
+            let Some(Val::Sval(s)) = c.val.as_ref() else {
+                return None;
+            };
+            let (months, days, time) = crate::datetime_input::finite_interval(&s.sval)?;
+            let in_bounds = i64::from(months).abs() <= years * 12
+                && i64::from(days).abs() <= years * 366
+                && time.unsigned_abs() <= (years * 366 * 86_400 * 1_000_000).unsigned_abs();
+            (target.get() == INTERVAL && in_bounds).then_some(target)?
+        }
+        N::AConst(c) => match c.val.as_ref()? {
+            Val::Ival(i) if i64::from(i.ival).abs() <= years * 366 => crate::pg_catalog::oid::INT4,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let resolved = catalog.find_operator(op, Some(clock_type), shift_type)?;
+    let declared = catalog.pg_operator.get(&resolved.oid)?;
+    (super::safe_builtins::clock_shift_operator(resolved.oid)
+        && declared.oprleft == Some(clock_type)
+        && declared.oprright == shift_type)
+        .then_some(Typed::of(resolved.result_type_oid))
+}
 /// Whether running `select` (a subquery, in `scope`'s level: [`FromScope::of_select`]
 /// of it) more or fewer times, or over rows it didn't reach before, can
 /// never raise an error: its FROM only reads stored tables (joined with ON
@@ -1182,8 +1658,8 @@ fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
 /// semi- or anti-join the site leaves the qual list, and the sibling runs
 /// on every row. An OR evaluates its arms as written, so an arm after the
 /// site was guarded by it too. So the siblings must be unable to fail at
-/// all, not merely cheap — which refuses `created_at > now() - interval
-/// '1 day'` next to a site, among many harmless ones.
+/// all, not merely cheap: `created_at > now() - interval '1 day'` is
+/// fine next to a site, `10 / a > 1` or `s::int > 0` is not.
 ///
 /// A schema with a user cast function or a user function in a domain
 /// CHECK (calls the parse tree doesn't show) refuses every sibling; so does
