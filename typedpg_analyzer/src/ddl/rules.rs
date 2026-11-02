@@ -88,7 +88,7 @@ fn define_rule(
                 "rules on materialized views are not supported".into(),
             ));
         }
-        Some(RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable) => {}
+        Some(RelKind::Table | RelKind::Partitioned | RelKind::View) => {}
         Some(kind) => {
             let kinds = kind.plural();
             return Err(DdlError::Parse(format!(
@@ -692,8 +692,9 @@ pub(crate) fn rename_rule(
         Some(RelKind::Table | RelKind::View | RelKind::Partitioned)
     ) {
         return Err(DdlError::Parse(format!(
-            "relation \"{}\" cannot have rules",
-            rv.relname
+            "relation \"{}\" cannot have rules (This operation is not supported for {}.)",
+            rv.relname,
+            relkind.map_or("this relation", RelKind::plural)
         )));
     }
     crate::ddl::util::check_not_system_class(interp, relid)?;

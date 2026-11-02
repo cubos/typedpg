@@ -1060,6 +1060,20 @@ pub fn create_foreign_table(
     let Some(base) = stmt.base_stmt.as_ref() else {
         return Ok(());
     };
+    // transformCreateStmt, element by element.
+    for elt in &base.table_elts {
+        match elt.node.as_ref() {
+            Some(node::Node::Constraint(c)) => check_foreign_table_constraint(c)?,
+            Some(node::Node::ColumnDef(cd)) => {
+                for c in &cd.constraints {
+                    if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+                        check_foreign_table_constraint(c)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     let existed = base.relation.as_ref().and_then(|rv| {
         let (schema, name) = range_var_names(rv, interp);
         interp
@@ -1434,6 +1448,18 @@ fn apply_alter_subtype(
         | AlterTableType::AtResetOptions => {
             column_options::alter_column_setting(interp, relid, cmd, subtype, rec)
         }
+        // ATExecChangeOwner: an index follows its table — a plain one is
+        // skipped with a WARNING, a partitioned one refused.
+        AlterTableType::AtChangeOwner
+            if interp.pg_class.get(&relid).map(|c| c.relkind)
+                == Some(RelKind::PartitionedIndex) =>
+        {
+            Err(DdlError::UnsupportedDdl(format!(
+                "cannot change owner of index \"{}\" (Change the ownership of the index's table \
+                 instead.)",
+                relname_of(interp, relid)
+            )))
+        }
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
         AlterTableType::AtSetLogged | AlterTableType::AtSetUnLogged => {
             set_persistence(interp, relid, subtype == AlterTableType::AtSetLogged)
@@ -1460,6 +1486,7 @@ fn apply_alter_subtype(
             Ok(())
         }
         AlterTableType::AtDropCluster => {
+            object_refs::check_markable_clustered(interp, relid)?;
             interp.clustered_indexes.remove(&relid);
             Ok(())
         }
@@ -1476,6 +1503,17 @@ fn apply_alter_subtype(
         AlterTableType::AtAddInherit => inherit_cmd::add_inherit(interp, relid, cmd),
         AlterTableType::AtDropInherit => inherit_cmd::drop_inherit(interp, relid, cmd),
         AlterTableType::AtAttachPartition if partidx::is_partitioned_index(interp, relid) => {
+            // transformPartitionCmd: a partition bound (ALTER TABLE's
+            // ATTACH PARTITION ... FOR VALUES) is a partitioned table's.
+            if let Some(node::Node::PartitionCmd(pc)) =
+                cmd.def.as_deref().and_then(|d| d.node.as_ref())
+                && pc.bound.is_some()
+            {
+                return Err(DdlError::Parse(format!(
+                    "\"{}\" is not a partitioned table",
+                    relname_of(interp, relid)
+                )));
+            }
             partidx::attach_partition_index(interp, relid, cmd)
         }
         AlterTableType::AtAttachPartition => inherit_cmd::attach_partition(interp, relid, cmd),
@@ -1737,7 +1775,10 @@ fn check_alter_target(
             class.relkind == RelKind::ForeignTable,
             "ALTER COLUMN ... OPTIONS",
         ),
-        At::AtAddOf => (class.relkind == RelKind::Table, "OF"),
+        At::AtAddOf => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "OF",
+        ),
         At::AtSetAccessMethod => (
             matches!(
                 class.relkind,
@@ -1756,7 +1797,10 @@ fn check_alter_target(
             "DETACH PARTITION ... FINALIZE",
         ),
         At::AtDropInherit => (table_like, "NO INHERIT"),
-        At::AtDropOf => (class.relkind == RelKind::Table, "NOT OF"),
+        At::AtDropOf => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "NOT OF",
+        ),
         At::AtDropConstraint => (table_like, "DROP CONSTRAINT"),
         At::AtSetTableSpace => (
             matches!(
@@ -1793,6 +1837,85 @@ fn check_alter_target(
         At::AtNoForceRowSecurity => (
             matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
             "NO FORCE ROW SECURITY",
+        ),
+        At::AtAddIdentity => (
+            table_like || class.relkind == RelKind::View,
+            "ALTER COLUMN ... ADD IDENTITY",
+        ),
+        At::AtSetIdentity => (
+            table_like || class.relkind == RelKind::View,
+            "ALTER COLUMN ... SET",
+        ),
+        At::AtDropIdentity => (
+            table_like || class.relkind == RelKind::View,
+            "ALTER COLUMN ... DROP IDENTITY",
+        ),
+        At::AtValidateConstraint => (table_like, "VALIDATE CONSTRAINT"),
+        At::AtAlterConstraint => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "ALTER CONSTRAINT",
+        ),
+        At::AtClusterOn => (
+            matches!(
+                class.relkind,
+                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+            ),
+            "CLUSTER ON",
+        ),
+        At::AtDropCluster => (
+            matches!(
+                class.relkind,
+                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+            ),
+            "SET WITHOUT CLUSTER",
+        ),
+        At::AtDropOids => (table_like, "SET WITHOUT OIDS"),
+        At::AtSetRelOptions | At::AtResetRelOptions | At::AtReplaceRelOptions => (
+            matches!(
+                class.relkind,
+                RelKind::Table
+                    | RelKind::Partitioned
+                    | RelKind::View
+                    | RelKind::MaterializedView
+                    | RelKind::Index
+            ),
+            if subtype == At::AtResetRelOptions {
+                "RESET"
+            } else {
+                "SET"
+            },
+        ),
+        At::AtReplicaIdentity => (
+            matches!(
+                class.relkind,
+                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
+            ),
+            "REPLICA IDENTITY",
+        ),
+        // Triggers are a table's or a foreign table's; rules a table's.
+        At::AtEnableTrig => (table_like, "ENABLE TRIGGER"),
+        At::AtEnableAlwaysTrig => (table_like, "ENABLE ALWAYS TRIGGER"),
+        At::AtEnableReplicaTrig => (table_like, "ENABLE REPLICA TRIGGER"),
+        At::AtDisableTrig => (table_like, "DISABLE TRIGGER"),
+        At::AtEnableTrigAll => (table_like, "ENABLE TRIGGER ALL"),
+        At::AtDisableTrigAll => (table_like, "DISABLE TRIGGER ALL"),
+        At::AtEnableTrigUser => (table_like, "ENABLE TRIGGER USER"),
+        At::AtDisableTrigUser => (table_like, "DISABLE TRIGGER USER"),
+        At::AtEnableRule => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "ENABLE RULE",
+        ),
+        At::AtEnableAlwaysRule => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "ENABLE ALWAYS RULE",
+        ),
+        At::AtEnableReplicaRule => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "ENABLE REPLICA RULE",
+        ),
+        At::AtDisableRule => (
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
+            "DISABLE RULE",
         ),
         _ => (true, ""),
     };

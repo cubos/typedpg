@@ -1444,9 +1444,30 @@ pub(crate) fn add_constraint(
     let Some(node::Node::Constraint(c)) = def.node.as_ref() else {
         return Ok(());
     };
+    if interp.pg_class.get(&relid).map(|cls| cls.relkind) == Some(RelKind::ForeignTable) {
+        check_foreign_table_constraint(c)?;
+    }
     // ALTER TABLE ONLY: a constraint index isn't built on the partitions
     // (DefineIndex under ONLY).
     add_constraint_node(interp, relid, c, &cmd.name, rec, !rec.recurse)
+}
+
+/// transformTableConstraint / transformColumnDefinition: a foreign table
+/// has no index, so no primary key, unique or exclusion constraint, and no
+/// foreign key either.
+pub(crate) fn check_foreign_table_constraint(
+    c: &typedpg_pg_query::protobuf::Constraint,
+) -> Result<(), DdlError> {
+    let what = match ConstrType::try_from(c.contype) {
+        Ok(ConstrType::ConstrPrimary) => "primary key",
+        Ok(ConstrType::ConstrUnique) => "unique",
+        Ok(ConstrType::ConstrExclusion) => "exclusion",
+        Ok(ConstrType::ConstrForeign) => "foreign key",
+        _ => return Ok(()),
+    };
+    Err(DdlError::UnsupportedDdl(format!(
+        "{what} constraints are not supported on foreign tables"
+    )))
 }
 
 /// The constraints written inline on an `ALTER TABLE ... ADD COLUMN`
@@ -1757,14 +1778,21 @@ fn add_index_constraint(
         .get(&relid)
         .map(|cls| cls.relnamespace)
         .ok_or_else(|| DdlError::Internal(format!("relation oid {relid} missing")))?;
+    // transformIndexConstraint: the name in the table's schema
+    // (get_relname_relid), opened as an index (index_open).
     let index_oid = interp
         .class_by_qname
         .get(&(nsoid, c.indexname.clone()))
         .copied()
-        .filter(|oid| interp.pg_index.contains_key(oid))
         .ok_or_else(|| {
             DdlError::TableNotFound(format!("index \"{}\" does not exist", c.indexname))
         })?;
+    if !interp.pg_index.contains_key(&index_oid) {
+        return Err(DdlError::Parse(format!(
+            "\"{}\" is not an index",
+            c.indexname
+        )));
+    }
     let Some(index) = interp.pg_index.get(&index_oid).cloned() else {
         return Ok(());
     };

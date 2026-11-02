@@ -780,6 +780,9 @@ pub(crate) fn set_identity(
         super::check_not_system_column(interp, relid, &cmd.name)?;
     }
     let rel = relname_of(interp, relid);
+    // A view's columns are never declared NOT NULL (what the analyzer
+    // infers of them aside).
+    let is_view = interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::View);
     // ATExecAddIdentity: the column's not-null constraint must be valid.
     if is_add
         && let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
@@ -806,7 +809,7 @@ pub(crate) fn set_identity(
     };
     // ATExecAddIdentity / ATExecSetIdentity (tablecmds.c).
     if is_add {
-        if !col.attnotnull {
+        if !col.attnotnull || is_view {
             return Err(DdlError::Parse(format!(
                 "column \"{}\" of relation \"{rel}\" must be declared NOT NULL before \
                  identity can be added",
@@ -955,6 +958,13 @@ fn add_column_to(
     let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
         return Ok(());
     };
+    if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::ForeignTable) {
+        for c in &cd.constraints {
+            if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+                check_foreign_table_constraint(c)?;
+            }
+        }
+    }
     // DefineIndex, for a column constraint's USING INDEX TABLESPACE.
     for c in &cd.constraints {
         if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
