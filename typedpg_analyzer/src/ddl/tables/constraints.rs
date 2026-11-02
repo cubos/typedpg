@@ -838,7 +838,8 @@ pub(crate) fn check_unique_covers_partition_key(
     };
     if part_key.contains(&0) {
         return Err(DdlError::Parse(format!(
-            "unsupported {label} constraint with partition key definition"
+            "unsupported {label} constraint with partition key definition ({label} constraints \
+             cannot be used when partition keys include expressions.)"
         )));
     }
     let part_collations = super::partbound::partition_key_collations(interp, relid);
@@ -860,10 +861,19 @@ pub(crate) fn check_unique_covers_partition_key(
                 }
         })
     };
-    if !part_key.iter().enumerate().all(covered) {
-        return Err(DdlError::Parse(
-            "unique constraint on partitioned table must include all partitioning columns".into(),
-        ));
+    if let Some((_, &pk)) = part_key.iter().enumerate().find(|&c| !covered(c)) {
+        let column = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == pk)
+            .map(|a| a.attname.clone())
+            .unwrap_or_default();
+        return Err(DdlError::Parse(format!(
+            "unique constraint on partitioned table must include all partitioning columns \
+             ({label} constraint on table \"{}\" lacks column \"{column}\" which is part of the \
+             partition key.)",
+            relname_of(interp, relid)
+        )));
     }
     Ok(())
 }

@@ -1694,6 +1694,7 @@ fn set_persistence(
     }
     // ATRewriteTables: a new persistence is a rewrite.
     crate::ddl::indexes::table_rewritten(interp, relid);
+    toast::heap_rewritten(interp, relid);
     Ok(())
 }
 

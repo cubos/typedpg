@@ -112,6 +112,21 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
     Ok(())
 }
 
+/// CLUSTER / VACUUM FULL of `relid`: the heap of each table under it (a
+/// partitioned table's leaf partitions) is rewritten (make_new_heap), its
+/// indexes rebuilt with it and its TOAST table made anew.
+fn heap_rewrites(interp: &mut PgCatalog, relid: PgClassOid) {
+    for table in super::tables::inherit::all_inheritors(interp, relid) {
+        if matches!(
+            relkind(interp, table),
+            Some(RelKind::Table | RelKind::MaterializedView | RelKind::ToastTable)
+        ) {
+            super::indexes::table_rewritten(interp, table);
+            super::tables::toast::heap_rewritten(interp, table);
+        }
+    }
+}
+
 /// The indexes of `tables` get new relfilenodes (TRUNCATE, CLUSTER,
 /// REINDEX TABLE).
 fn new_relfilenodes(interp: &mut PgCatalog, tables: &[PgClassOid]) {
@@ -155,7 +170,7 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
                 rv.relname
             )));
         }
-        new_relfilenodes(interp, &[relid]);
+        heap_rewrites(interp, relid);
         return Ok(());
     }
     // cluster_rel refuses a shared catalog once the index is found by name
@@ -177,7 +192,7 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
         prevent_in_transaction_block(interp, "CLUSTER")?;
     }
     interp.clustered_indexes.insert(relid, index);
-    new_relfilenodes(interp, &[relid]);
+    heap_rewrites(interp, relid);
     Ok(())
 }
 
@@ -193,7 +208,7 @@ fn prevent_in_transaction_block(interp: &PgCatalog, what: &str) -> Result<(), Dd
 
 /// REINDEX INDEX / TABLE / SCHEMA.
 pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlError> {
-    let concurrently = super::txblock::reindex_options(&stmt.params)?;
+    let concurrently = super::txblock::reindex_options(interp, &stmt.params)?;
     // ReindexRelationConcurrently / ReindexMultipleTables: a system catalog
     // (IsCatalogRelationOid — its indexes and TOAST table too) can't be
     // rebuilt concurrently.
@@ -264,7 +279,23 @@ const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 /// VACUUM / ANALYZE: the named relations and columns must exist
 /// (vacuum_rel / do_analyze_rel); other relation kinds are skipped with a
 /// WARNING.
-pub fn vacuum(interp: &PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError> {
+pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError> {
+    // VACUUM FULL rewrites what it processes — every table, without a list.
+    let full = stmt.is_vacuumcmd
+        && stmt.options.iter().any(|o| {
+            matches!(o.node.as_ref(), Some(node::Node::DefElem(de))
+                if de.defname == "full"
+                    && super::session::def_get_boolean(de).unwrap_or(false))
+        });
+    let mut rewritten: Vec<PgClassOid> = Vec::new();
+    if full && stmt.rels.is_empty() {
+        rewritten = interp
+            .pg_class
+            .values()
+            .filter(|c| matches!(c.relkind, RelKind::Table | RelKind::MaterializedView))
+            .map(|c| c.oid)
+            .collect();
+    }
     for rel in &stmt.rels {
         let Some(node::Node::VacuumRelation(vr)) = rel.node.as_ref() else {
             continue;
@@ -287,6 +318,12 @@ pub fn vacuum(interp: &PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError> {
                 )));
             }
         }
+        if full {
+            rewritten.push(relid);
+        }
+    }
+    for relid in rewritten {
+        heap_rewrites(interp, relid);
     }
     Ok(())
 }

@@ -5030,3 +5030,288 @@ const FOREIGN_PARTITION_CASES: &[(&str, Option<&str>)] = &[
         Some("cannot change inheritance of a partition"),
     ),
 ];
+
+/// The relations [`TOAST_AND_ADD_COLUMN_CASES`] run over.
+const TOAST_AND_ADD_COLUMN_SETUP: &str = "
+    CREATE TABLE t (a int, b text);
+    CREATE TABLE par (a int, b int);
+    CREATE TABLE chi () INHERITS (par);
+    CREATE TABLE lone (a int);
+    CREATE TABLE lp (a int) PARTITION BY LIST (a);
+    CREATE TABLE lp1 PARTITION OF lp FOR VALUES IN (1);
+    CREATE TYPE ct AS (a int);
+    CREATE TABLE tt OF ct;
+    CREATE TABLE pk (a int, b int) PARTITION BY LIST (a);
+    CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';";
+
+#[test]
+fn toast_tables_follow_rewrites_and_add_column_if_not_exists_skips_first() {
+    // A heap rewrite (ALTER TABLE's, CLUSTER, REFRESH MATERIALIZED VIEW)
+    // makes a TOAST table only if the columns then need one, so `toast.`
+    // options go unchecked once none is left; TRUNCATE and a mere DROP
+    // COLUMN or SET STORAGE keep it. ADD COLUMN IF NOT EXISTS skips an
+    // existing column before its type, collation, default or constraints
+    // are looked at. A partition key a unique constraint misses is named in
+    // the DETAIL, and REINDEX (TABLESPACE ...) wants a tablespace that
+    // exists. What PG runs is tried in a transaction rolled back.
+    let mut db = build_db(&[("0001.sql", TOAST_AND_ADD_COLUMN_SETUP)]);
+    for &(sql, expected) in TOAST_AND_ADD_COLUMN_CASES {
+        match expected {
+            None => {
+                if let Err(err) = db.apply_sql(&format!("BEGIN; {sql}; ROLLBACK;")) {
+                    panic!("{sql}\n  rejected: {err}");
+                }
+            }
+            Some(message) => {
+                let err = db.apply_sql(&format!("{sql};")).expect_err(sql);
+                assert!(
+                    err.to_string().starts_with(message),
+                    "{sql}\n  expected: {message}\n       got: {err}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vacuum_full_makes_the_toast_table_anew() {
+    // VACUUM FULL rewrites the heap (make_new_heap): a TOAST table only
+    // the dropped column needed goes; one a remaining column needs stays.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text); CREATE TABLE u (a int, b text, c text);",
+    )]);
+    db.apply_sql("ALTER TABLE t DROP COLUMN b; ALTER TABLE u DROP COLUMN b;")
+        .unwrap();
+    let toast_fillfactor = "unrecognized parameter \"fillfactor\"";
+    let err = db
+        .apply_sql("ALTER TABLE t SET (toast.fillfactor = 50);")
+        .unwrap_err();
+    assert!(err.to_string().starts_with(toast_fillfactor), "got: {err}");
+    db.apply_sql("VACUUM FULL t;").unwrap();
+    db.apply_sql("VACUUM FULL u;").unwrap();
+    db.apply_sql("ALTER TABLE t SET (toast.fillfactor = 50);")
+        .unwrap();
+    let err = db
+        .apply_sql("ALTER TABLE u SET (toast.fillfactor = 50);")
+        .unwrap_err();
+    assert!(err.to_string().starts_with(toast_fillfactor), "got: {err}");
+}
+
+/// `(statement, PG's error)` — `None` when PG runs it — over
+/// [`TOAST_AND_ADD_COLUMN_SETUP`], each checked on PostgreSQL 18.6.
+const TOAST_AND_ADD_COLUMN_CASES: &[(&str, Option<&str>)] = &[
+    (
+        "alter table t alter column b type int using 1; select 1",
+        None,
+    ),
+    ("alter table t alter column b type int using 1", None),
+    (
+        "alter table t set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b type int using 1; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b type int using 1, add column c text; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; alter table t2 add column c float8 default random(); alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; alter table t2 set unlogged; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; truncate t2; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b set storage plain; alter table t2 alter column a type bigint; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); create index t2i on t2 (a); alter table t2 alter column b set storage plain; cluster t2 using t2i; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b set storage plain; alter table t2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text storage plain); alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 alter column b type varchar(10); alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "create materialized view m2 as select 1 as a, 'x'::text as b; alter materialized view m2 set (toast.fillfactor = 50)",
+        Some("unrecognized parameter \"fillfactor\""),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b; vacuum full t2",
+        Some("VACUUM cannot run inside a transaction block"),
+    ),
+    (
+        "create table t2 (a int, b text); alter table t2 drop column b, alter column a type bigint; alter table t2 set (toast.fillfactor = 50)",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int default nonexist",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a text collate \"nonexist\"",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int references nonexist",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int check (nonexist > 0)",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int generated always as (nonexist) stored",
+        None,
+    ),
+    (
+        "alter table t add column if not exists z nonexisttype",
+        Some("type \"nonexisttype\" does not exist"),
+    ),
+    (
+        "alter table t add column if not exists z int default nonexist",
+        Some("cannot use column reference in DEFAULT expression"),
+    ),
+    (
+        "alter table only par add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table par add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table par add column if not exists a int default nonexist",
+        None,
+    ),
+    (
+        "alter table only lone add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table lp1 add column if not exists a nonexisttype",
+        Some("cannot add column to a partition"),
+    ),
+    (
+        "alter table lp1 add column if not exists a int",
+        Some("cannot add column to a partition"),
+    ),
+    (
+        "alter table lp1 add column if not exists z int",
+        Some("cannot add column to a partition"),
+    ),
+    (
+        "alter table tt add column if not exists a nonexisttype",
+        Some("cannot add column to typed table"),
+    ),
+    (
+        "alter table tt add column if not exists a int",
+        Some("cannot add column to typed table"),
+    ),
+    (
+        "alter table lp add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table only lp add column if not exists a nonexisttype",
+        None,
+    ),
+    (
+        "alter table t add column if not exists a int primary key using index tablespace nonexist",
+        None,
+    ),
+    (
+        "alter table t add column if not exists ctid int",
+        Some("column name \"ctid\" conflicts with a system column name"),
+    ),
+    ("alter table t add column if not exists a serial", None),
+    (
+        "alter table pk add unique (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table pk add primary key (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create unique index on pk (b)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "alter table pk add constraint x exclude (b with =)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create table pk2 (a int, b int, unique (b)) partition by list (a)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create table pk2 (a int, b int, primary key (b)) partition by list (a)",
+        Some(
+            "unique constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
+        ),
+    ),
+    (
+        "create table pk2 (a int, b int, primary key (b)) partition by list ((a + 1))",
+        Some(
+            "unsupported PRIMARY KEY constraint with partition key definition (PRIMARY KEY constraints cannot be used when partition keys include expressions.",
+        ),
+    ),
+    (
+        "alter table pk add unique (b, (a))",
+        Some("syntax error at or near \"(\""),
+    ),
+    (
+        "reindex (tablespace nonexist) schema pg_temp",
+        Some("tablespace \"nonexist\" does not exist"),
+    ),
+    (
+        "reindex (tablespace nonexist) schema public",
+        Some("tablespace \"nonexist\" does not exist"),
+    ),
+    (
+        "reindex (tablespace nonexist) table t",
+        Some("tablespace \"nonexist\" does not exist"),
+    ),
+    ("reindex (tablespace pg_global) table t", None),
+    (
+        "reindex (tablespace nonexist) index nosuch",
+        Some("tablespace \"nonexist\" does not exist"),
+    ),
+];

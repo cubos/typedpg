@@ -968,6 +968,11 @@ fn add_column_to(
     if !rec.recursing && super::inherit_cmd::is_partition(interp, relid) {
         return Err(DdlError::Parse("cannot add column to a partition".into()));
     }
+    // IF NOT EXISTS skips an existing column before its definition (type,
+    // collation, default, constraints) is looked at.
+    if cmd.missing_ok && !rec.recursing && interp.attribute_by_name(relid, &cd.colname).is_some() {
+        return Ok(());
+    }
     let children = inherit::children_of(interp, relid);
 
     let cx = ColumnContext {
@@ -1179,6 +1184,7 @@ fn add_column_to(
                 .is_some_and(|e| expression_is_volatile(interp, relid, e)))
     {
         crate::ddl::indexes::table_rewritten(interp, relid);
+        super::toast::heap_rewritten(interp, relid);
     }
     for child in children {
         add_column_to(interp, child, cmd, rec.child())?;
@@ -1891,6 +1897,7 @@ pub(crate) fn alter_column_type(
         )
     {
         crate::ddl::indexes::table_rewritten(interp, relid);
+        super::toast::heap_rewritten(interp, relid);
     }
     crate::ddl::indexes::rebuild_indexes_for_column_type(
         interp,
@@ -2353,6 +2360,7 @@ pub(crate) fn set_expression(
     // A stored column is computed anew: the rows are rewritten.
     if kind == AttGenerated::Stored {
         crate::ddl::indexes::table_rewritten(interp, relid);
+        super::toast::heap_rewritten(interp, relid);
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {

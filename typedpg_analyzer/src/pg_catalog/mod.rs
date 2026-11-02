@@ -480,6 +480,10 @@ pub struct PgCatalog {
     /// the CREATE or ALTER that first left them with a column needing one
     /// (needs_toast_table) made it, and it stays.
     pub(crate) toast_tables: Shared<std::collections::HashSet<PgClassOid>>,
+    /// The tables whose heap was rewritten since [`Self::toast_tables`] was
+    /// last brought up to date (see
+    /// [`crate::ddl::tables::toast::heap_rewritten`]).
+    pub(crate) toast_rewrites: Shared<std::collections::HashSet<PgClassOid>>,
     /// Views with the `security_barrier` option: the planner doesn't pull
     /// them up into the query reading them.
     pub(crate) security_barrier_views: Shared<std::collections::HashSet<PgClassOid>>,
@@ -835,6 +839,7 @@ impl PgCatalog {
             partition_bounds: Shared::default(),
             check_defs: Shared::default(),
             toast_tables: Shared::default(),
+            toast_rewrites: Shared::default(),
             security_barrier_views: Shared::default(),
             attr_storage: Shared::default(),
             attr_compression: Shared::default(),
@@ -1769,6 +1774,7 @@ impl PgCatalog {
         self.foreign_data.forget_relation(oid);
         self.relpersistence.remove(&oid);
         self.toast_tables.remove(&oid);
+        self.toast_rewrites.remove(&oid);
         self.security_barrier_views.remove(&oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);
         self.attr_compression.retain(|(relid, _), _| *relid != oid);
