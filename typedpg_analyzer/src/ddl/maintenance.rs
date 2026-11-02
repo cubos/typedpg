@@ -171,8 +171,23 @@ pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlErro
         ));
     }
     let index = super::tables::check_clusterable_index(interp, relid, &stmt.indexname)?;
+    // cluster(): a partitioned table's partitions are clustered each in a
+    // transaction of its own.
+    if relkind(interp, relid) == Some(RelKind::Partitioned) {
+        prevent_in_transaction_block(interp, "CLUSTER")?;
+    }
     interp.clustered_indexes.insert(relid, index);
     new_relfilenodes(interp, &[relid]);
+    Ok(())
+}
+
+/// PreventInTransactionBlock: `what` can't run inside a transaction block.
+fn prevent_in_transaction_block(interp: &PgCatalog, what: &str) -> Result<(), DdlError> {
+    if interp.in_transaction_block {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "{what} cannot run inside a transaction block"
+        )));
+    }
     Ok(())
 }
 
@@ -194,11 +209,18 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                     rv.relname
                 )));
             }
+            // ReindexPartitions: each partition in a transaction of its own.
+            if relkind(interp, relid) == Some(RelKind::PartitionedIndex) {
+                prevent_in_transaction_block(interp, "REINDEX INDEX")?;
+            }
             super::indexes::new_relfilenode(interp, relid);
         }
         Ok(ReindexObjectType::ReindexObjectTable) => {
             if let Some(rv) = stmt.relation.as_ref() {
                 let relid = maintained_table(interp, rv)?;
+                if relkind(interp, relid) == Some(RelKind::Partitioned) {
+                    prevent_in_transaction_block(interp, "REINDEX TABLE")?;
+                }
                 new_relfilenodes(interp, &[relid]);
             }
         }

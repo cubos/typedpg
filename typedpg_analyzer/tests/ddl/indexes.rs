@@ -2335,3 +2335,46 @@ fn expression_index_columns_are_named_as_figure_index_colname_names_them() {
     )
     .unwrap();
 }
+
+#[test]
+fn reindex_and_cluster_of_partitioned_relations_refuse_a_transaction_block() {
+    // ReindexPartitions and cluster() process each partition in a
+    // transaction of their own (PreventInTransactionBlock), once the
+    // relation is found. (A failed explicit block would leave the mirror's
+    // session aborted, so the refusals are tried in implicit ones.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p (b);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2);",
+    )]);
+    for (sql, message) in [
+        (
+            "SELECT 1; REINDEX TABLE p;",
+            "REINDEX TABLE cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; REINDEX INDEX pi;",
+            "REINDEX INDEX cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; CLUSTER p USING pi;",
+            "CLUSTER cannot run inside a transaction block",
+        ),
+        (
+            "SELECT 1; REINDEX TABLE nosuch;",
+            "relation \"nosuch\" does not exist",
+        ),
+        ("SELECT 1; REINDEX INDEX p;", "\"p\" is not an index"),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+    db.apply_sql("BEGIN; REINDEX TABLE p1; REINDEX INDEX p1_b_idx; COMMIT;")
+        .unwrap();
+    db.apply_sql("REINDEX TABLE p;").unwrap();
+    db.apply_sql("REINDEX INDEX pi;").unwrap();
+}
