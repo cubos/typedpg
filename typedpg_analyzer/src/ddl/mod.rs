@@ -187,6 +187,7 @@ fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFa
                 .check(db, stmt)
                 .and_then(|()| tx.check_setting(stmt))
                 .and_then(|()| {
+                    db.in_transaction_block = tx.in_block();
                     with_statement_sql(db, sql, raw_stmt, |db| match stmt {
                         node::Node::TransactionStmt(t) => tx.control(db, t),
                         _ => apply_statement(db, stmt),

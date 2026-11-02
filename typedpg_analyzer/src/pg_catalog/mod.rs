@@ -395,6 +395,9 @@ pub struct PgCatalog {
     /// The first OID of the current transaction: what has a larger one was
     /// created in it.
     pub(crate) transaction_oid_floor: u32,
+    /// The statement being applied runs inside a transaction block
+    /// (explicit or implicit), where PreventInTransactionBlock refuses it.
+    pub(crate) in_transaction_block: bool,
     /// `pg_sequence` rows of the sequences migrations create.
     pub(crate) sequence_params: Shared<HashMap<PgClassOid, crate::ddl::seqparams::SeqParams>>,
     /// Foreign-data wrappers, servers, user mappings, foreign tables'
@@ -790,6 +793,7 @@ impl PgCatalog {
             relcache_index_attnames: Shared::default(),
             indexes_with_new_relfilenode: Shared::default(),
             transaction_oid_floor: USER_OID_START_NZ.get(),
+            in_transaction_block: false,
             sequence_params: Shared::default(),
             foreign_data: Default::default(),
             installing_extension: None,
