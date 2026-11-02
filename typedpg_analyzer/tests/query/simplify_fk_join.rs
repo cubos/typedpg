@@ -473,6 +473,29 @@ fn session_replication_role_voids_the_proof() {
         "CREATE VIEW trg AS SELECT oid FROM pg_trigger; DELETE FROM trg WHERE false;",
         "CREATE VIEW cls AS SELECT oid, relhastriggers FROM pg_catalog.pg_class; \
          UPDATE cls SET relhastriggers = false WHERE false;",
+        // Built-ins that run SQL given as text: at top level, in a
+        // marker-free SQL body, in a view, in a DEFAULT.
+        "SELECT query_to_xml('select 1', false, false, '');",
+        "SELECT ts_stat('select ''a''::tsvector');",
+        "SELECT ts_rewrite('a'::tsquery, 'select ''a''::tsquery, ''b''::tsquery');",
+        "CREATE FUNCTION q() RETURNS xml LANGUAGE sql \
+         AS $$ SELECT query_to_xml('select 1', false, false, '') $$;",
+        "CREATE VIEW qx AS SELECT query_to_xmlschema('select 1', false, false, '') AS x;",
+        "CREATE TABLE qd (x xml DEFAULT query_to_xml('select 1', false, false, ''));",
+        // A replica-mode trigger, at top level and in a body.
+        "CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NEW; END $$; \
+         CREATE TRIGGER t BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION touch(); \
+         ALTER TABLE orders ENABLE REPLICA TRIGGER t;",
+        "CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NEW; END $$; \
+         CREATE TRIGGER t BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION touch(); \
+         ALTER TABLE orders ENABLE ALWAYS TRIGGER t;",
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ BEGIN IF false THEN \
+         ALTER TABLE orders ENABLE REPLICA TRIGGER \"RI_ConstraintTrigger_c_1\"; END IF; END $$;",
+        // COPY from or to a program.
+        "COPY orders FROM PROGRAM 'true';",
+        "COPY orders TO PROGRAM 'cat > /dev/null';",
     ] {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(tables).unwrap();
@@ -505,6 +528,18 @@ fn session_replication_role_voids_the_proof() {
         db.skip_pg_sanity();
         db.apply_sql(tables).unwrap();
         db.apply_sql(setting).unwrap();
+        assert_kept(&db, &[sql]);
+    }
+    // Extensions that run SQL on another connection.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(tables).unwrap();
+    db.apply_sql("CREATE EXTENSION dblink;").unwrap();
+    assert_kept(&db, &[sql]);
+    // postgres_fdw's script the analyzer can't apply yet: the migration is
+    // rejected, so no schema is built past it.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(tables).unwrap();
+    if db.apply_sql("CREATE EXTENSION postgres_fdw;").is_ok() {
         assert_kept(&db, &[sql]);
     }
     // COPY into or TRUNCATE a system catalog (allow_system_table_mods):
