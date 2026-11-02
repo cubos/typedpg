@@ -30,17 +30,16 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     // DefineIndex: the table must exist and be indexable.
     let (nsoid, indrelid) = super::util::lookup_relation(db, rv)?;
     // RangeVarCallbackOwnsRelation, as the table is looked up: no system
-    // catalog.
+    // catalog. Then table_open: an index or a composite type can't be
+    // opened as a table.
     super::util::check_not_system_class(db, indrelid)?;
+    super::util::table_open_check(db, indrelid, &rv.relname)?;
     let table_name = rv.relname.clone();
     if let Some(class) = db.pg_class.get(&indrelid) {
         let kinds = match class.relkind {
-            RelKind::View
-            | RelKind::Sequence
-            | RelKind::CompositeType
-            | RelKind::Index
-            | RelKind::PartitionedIndex
-            | RelKind::ForeignTable => Some(class.relkind.plural()),
+            RelKind::View | RelKind::Sequence | RelKind::ForeignTable => {
+                Some(class.relkind.plural())
+            }
             _ => None,
         };
         if let Some(kinds) = kinds {

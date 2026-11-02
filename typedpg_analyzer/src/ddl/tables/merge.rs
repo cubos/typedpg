@@ -339,11 +339,28 @@ fn inherited_columns(
                 interp.namespace_oid(&range_var_names(rv, interp).0) == Some(temp)
             })
     });
+    // DefineRelation looks every parent up, rejecting a repeated one,
+    // before MergeAttributes opens them (table_open).
+    let mut named: Vec<PgClassOid> = Vec::new();
     for parent_node in &stmt.inh_relations {
         let Some(node::Node::RangeVar(rv)) = parent_node.node.as_ref() else {
             continue;
         };
         let parent = lookup_relation(interp, rv)?;
+        if named.contains(&parent) {
+            return Err(DdlError::DuplicateObject(format!(
+                "relation \"{}\" would be inherited from more than once",
+                rv.relname
+            )));
+        }
+        named.push(parent);
+    }
+    for parent_node in &stmt.inh_relations {
+        let Some(node::Node::RangeVar(rv)) = parent_node.node.as_ref() else {
+            continue;
+        };
+        let parent = lookup_relation(interp, rv)?;
+        crate::ddl::util::table_open_check(interp, parent, &rv.relname)?;
         let relkind = interp.pg_class.get(&parent).map(|c| c.relkind);
         if is_partition {
             if relkind != Some(RelKind::Partitioned) {
@@ -400,12 +417,6 @@ fn inherited_columns(
             } else {
                 format!("cannot inherit from temporary relation \"{}\"", rv.relname)
             }));
-        }
-        if parents.contains(&parent) {
-            return Err(DdlError::DuplicateObject(format!(
-                "relation \"{}\" would be inherited from more than once",
-                rv.relname
-            )));
         }
         parents.push(parent);
 

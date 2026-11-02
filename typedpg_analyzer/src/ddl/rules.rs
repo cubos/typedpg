@@ -79,7 +79,7 @@ fn define_rule(
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let (_, relid) = super::util::lookup_relation(interp, rv)?;
+    let (_, relid) = super::util::lookup_table(interp, rv)?;
     let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
     let event = CmdType::try_from(stmt.event).unwrap_or(CmdType::Undefined);
     match relkind {
@@ -645,6 +645,9 @@ pub(crate) fn drop_rule(
         Err(_) if missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
+    // get_object_address_relobject opens the relation with
+    // table_openrv_extended: IF EXISTS skips a missing one, not an index.
+    super::util::table_open_check(interp, relid, &rv.relname)?;
     // A view's `_RETURN` rule is part of it (DEPENDENCY_INTERNAL).
     let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
     if name == VIEW_SELECT_RULE_NAME

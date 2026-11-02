@@ -220,7 +220,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let (_, relid) = super::util::lookup_relation(interp, rv)?;
+    let (_, relid) = super::util::lookup_table(interp, rv)?;
     let Some(class) = interp.pg_class.get(&relid).cloned() else {
         return Ok(());
     };
@@ -686,6 +686,9 @@ pub(crate) fn drop_trigger(
         Err(_) if missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
+    // table_openrv_extended: IF EXISTS skips a missing relation, not an
+    // index.
+    super::util::table_open_check(interp, relid, &rv.relname)?;
     let relname = rv.relname.clone();
     let Some(trigger) = interp
         .triggers
