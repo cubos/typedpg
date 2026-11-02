@@ -34,12 +34,13 @@ async fn not_in_sent_as_not_exists_returns_the_same_rows() {
     .await
     .expect("insert post");
 
-    // The test's own users, by an id range: a sibling like `LIKE` could
-    // fail, and would keep the NOT IN as written.
+    // The test's own two users, by id: a range could take in users other
+    // tests insert concurrently, and a sibling like `LIKE` could fail and
+    // keep the NOT IN as written.
     // Inlined: `NOT EXISTS (SELECT 1 FROM posts WHERE u.id = user_id)`.
     let rows = sql!(
         &pool,
-        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+        "SELECT u.id FROM users u WHERE (u.id = $poster OR u.id = $lurker) \
          AND u.id NOT IN (SELECT user_id FROM posts) ORDER BY u.id"
     )
     .fetch_all()
@@ -50,7 +51,7 @@ async fn not_in_sent_as_not_exists_returns_the_same_rows() {
     // Wrapped whole: the DISTINCT stays the subquery's.
     let row = sql!(
         &pool,
-        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+        "SELECT u.id FROM users u WHERE (u.id = $poster OR u.id = $lurker) \
          AND u.id NOT IN (SELECT DISTINCT user_id FROM posts)"
     )
     .fetch_one()
@@ -61,7 +62,7 @@ async fn not_in_sent_as_not_exists_returns_the_same_rows() {
     // Row-wise.
     let rows = sql!(
         &pool,
-        "SELECT u.id FROM users u WHERE u.id >= $poster AND u.id <= $lurker \
+        "SELECT u.id FROM users u WHERE (u.id = $poster OR u.id = $lurker) \
          AND (u.id, u.name) NOT IN (SELECT p.user_id, u2.name FROM posts p \
          JOIN users u2 ON u2.id = p.user_id) ORDER BY u.id"
     )
