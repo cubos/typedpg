@@ -702,7 +702,8 @@ impl Migrator {
                 self.rollback(down, error.map_or(Failure::Db, Failure::Message))
             }
             (Stage::ProbeRead { index, down, error }, Reply::Rows(rows)) => {
-                let open = first_value(&rows) == Some(PROBE_OPEN);
+                let token = probe_token(&self.migrations[index].name);
+                let open = first_value(&rows) == Some(token.as_str());
                 match (open, error) {
                     (true, error) => {
                         let message = error.unwrap_or_else(|| {
@@ -1119,7 +1120,7 @@ impl Migrator {
         self.stage = Stage::ProbeSet { index, down, error };
         Step::Query {
             sql: PROBE_SET_SQL.to_string(),
-            params: Vec::new(),
+            params: vec![Some(probe_token(&self.migrations[index].name))],
         }
     }
 
@@ -1370,10 +1371,11 @@ impl Migrator {
 }
 
 /// The first half of the open-transaction probe: set a placeholder setting
-/// for the current transaction only (`is_local`). Outside a transaction
-/// block the query is a transaction of its own, which the setting does not
-/// outlive; inside one the setting lasts until the block ends, and
-/// [`PROBE_READ_SQL`], the next query, still sees it.
+/// to `$1`, [`probe_token`], for the current transaction only (`is_local`).
+/// Outside a transaction block the query is a transaction of its own, which
+/// the setting does not outlive; inside one the setting lasts until the
+/// block ends, and [`PROBE_READ_SQL`], the next query, still reads the
+/// token.
 ///
 /// Neither half fails or warns on a healthy session, in a block or not, and
 /// neither assigns a transaction id — a block with no write has none, so
@@ -1381,35 +1383,53 @@ impl Migrator {
 /// failed statement aborted, the first half fails (`current transaction is
 /// aborted`), which tells as much.
 pub const PROBE_SET_SQL: &str =
-    "SELECT pg_catalog.set_config('typedpg.transaction_probe', 'open', true)";
+    "SELECT pg_catalog.set_config('typedpg.transaction_probe', $1::pg_catalog.text, true)";
 
 /// The second half of the open-transaction probe: the setting
-/// [`PROBE_SET_SQL`] made, [`PROBE_OPEN`] when a transaction block is still
-/// open.
+/// [`PROBE_SET_SQL`] made, [`probe_token`] when a transaction block is
+/// still open.
 pub const PROBE_READ_SQL: &str =
     "SELECT pg_catalog.current_setting('typedpg.transaction_probe', true)";
 
-/// What [`PROBE_READ_SQL`] reads inside a transaction block.
-pub const PROBE_OPEN: &str = "open";
+/// The value the probe of migration `name` (its file stem, version
+/// included) sets, and reads back inside a transaction block. Outside one,
+/// [`PROBE_READ_SQL`] reads whatever the setting is at session level — set
+/// by the migration itself (`SET typedpg.transaction_probe = ...`), or a
+/// role or database default — so the value is one such a setting cannot
+/// hold by accident: a fixed prefix and the migration's name, derived from
+/// the input to keep the machine deterministic. A session value spelling
+/// exactly this token for this migration would still read as an open
+/// block; nothing but a deliberate attempt sets one.
+pub fn probe_token(name: &str) -> String {
+    format!("typedpg-open:{name}")
+}
 
 /// The failure of a migration file (its down file when `down`) the machine
 /// did not wrap, which left a transaction block open: a `BEGIN` without
 /// its `COMMIT`. Nothing after it would commit — not the tracking table's
 /// row, the next migrations or the lock's release — so the machine rolls
-/// the block back and fails instead.
+/// the block back and fails instead. Only the open block goes: what the
+/// file committed before it (an earlier `COMMIT`, `COMMIT AND CHAIN`, or
+/// statements outside any block) stays.
 pub fn left_transaction_open_message(name: &str, down: bool) -> String {
     let (action, file, record) = if down {
         (
             "revert",
             format!("{name}.down.sql"),
-            "it is still recorded as applied",
+            "the migration is still recorded as applied",
         )
     } else {
-        ("apply", format!("{name}.sql"), "it was not recorded")
+        (
+            "apply",
+            format!("{name}.sql"),
+            "the migration was not recorded",
+        )
     };
     format!(
         "failed to {action} migration {name}: {file} {LEFT_TRANSACTION_OPEN}; \
-         that transaction was rolled back and {record}. {LEFT_TRANSACTION_OPEN_HINT}"
+         the open transaction block was rolled back, statements committed before it \
+         (by an earlier COMMIT, or outside any block) stay applied, and {record}. \
+         {LEFT_TRANSACTION_OPEN_HINT}"
     )
 }
 
@@ -1930,14 +1950,17 @@ mod tests {
 
     /// A session, as far as transaction blocks go: the files' `BEGIN`,
     /// `COMMIT` and `ROLLBACK`, a failing statement (`CREATE TABL`) aborting
-    /// the block it runs in, and the probe's setting lasting as long as the
-    /// block.
+    /// the block it runs in, and the probe's setting: transaction-local for
+    /// as long as the block, else its session value (`SET
+    /// typedpg.transaction_probe = 'open'` in a file).
     #[derive(Default)]
     struct Session {
         /// `Some(aborted)` inside a transaction block.
         block: Option<bool>,
-        /// The probe's setting is still set.
-        probe: bool,
+        /// The probe's transaction-local value, while its block lasts.
+        probe: Option<String>,
+        /// The setting's session value.
+        session_probe: Option<String>,
         /// The tracking-table rows the applied select returns.
         applied: Vec<Vec<Option<String>>>,
         /// Whether a block was open when the lock was released.
@@ -1964,12 +1987,21 @@ mod tests {
             let aborted = self.block == Some(true);
             match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Execute { sql } if !aborted && sql.contains("AND CHAIN") => {
+                    self.block = Some(false);
+                    self.probe = None;
+                    done()
+                }
                 Step::Execute { sql } if sql.contains("ROLLBACK") || sql.contains("COMMIT") => {
                     self.block = None;
-                    self.probe = false;
+                    self.probe = None;
                     done()
                 }
                 Step::Execute { .. } if aborted => Self::aborted(),
+                Step::Execute { sql } if sql.contains("SET typedpg.transaction_probe") => {
+                    self.session_probe = Some("open".to_string());
+                    done()
+                }
                 Step::Execute { sql } if sql.contains("BEGIN") => {
                     self.block = Some(false);
                     done()
@@ -1989,16 +2021,16 @@ mod tests {
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(self.applied.clone()),
-                Step::Query { sql, .. } if is_probe_set(sql) => {
+                Step::Query { sql, params } if is_probe_set(sql) => {
+                    let value = params[0].clone().expect("no probe token");
                     // Outside a block the setting ends with the query.
-                    self.probe = self.block.is_some();
-                    rows(vec![one(PROBE_OPEN)])
+                    self.probe = self.block.map(|_| value.clone());
+                    rows(vec![one(&value)])
                 }
                 Step::Query { sql, .. } if is_probe_read(sql) => {
-                    if self.probe {
-                        rows(vec![one(PROBE_OPEN)])
-                    } else {
-                        closed()
+                    match self.probe.clone().or_else(|| self.session_probe.clone()) {
+                        Some(value) => rows(vec![one(&value)]),
+                        None => closed(),
                     }
                 }
                 Step::Query { sql, .. } if is_insert(sql) || is_delete(sql) => rows(vec![]),
@@ -2033,6 +2065,17 @@ mod tests {
                 unwrapped(),
                 "BEGIN;\nSAVEPOINT s;\nCREATE TABLE a (id INT);\n",
             ),
+            // And one after a session value of the probe's setting.
+            (
+                unwrapped(),
+                "SET typedpg.transaction_probe = 'open';\nBEGIN;\nCREATE TABLE a (id INT);\n",
+            ),
+            // Only the chained block is open: the message must not claim
+            // what was committed before it is gone.
+            (
+                unwrapped(),
+                "BEGIN;\nCREATE TABLE a (id INT);\nCOMMIT AND CHAIN;\n",
+            ),
         ] {
             let mut session = Session::default();
             let migrations = vec![
@@ -2063,8 +2106,9 @@ mod tests {
         assert_eq!(
             left_transaction_open_message("0001_a", false),
             "failed to apply migration 0001_a: 0001_a.sql left a transaction block open \
-             (a BEGIN with no COMMIT); that transaction was rolled back and it was not \
-             recorded. Add a COMMIT at the end of the transaction block."
+             (a BEGIN with no COMMIT); the open transaction block was rolled back, statements \
+             committed before it (by an earlier COMMIT, or outside any block) stay applied, and \
+             the migration was not recorded. Add a COMMIT at the end of the transaction block."
         );
     }
 
@@ -2076,6 +2120,10 @@ mod tests {
             "BEGIN;\nCREATE TABLE a (id INT);\nCOMMIT;\n",
             "BEGIN;\nCREATE TABLE a (id INT);\nROLLBACK;\nCREATE TABLE a (id INT);\n",
             "CREATE TABLE a (id INT);\n",
+            // The probe's setting at session level is not the token: outside
+            // a block, the probe reads it back and still sees no block.
+            "SET typedpg.transaction_probe = 'open';\nCREATE TABLE a (id INT);\n",
+            "BEGIN;\nSET typedpg.transaction_probe = 'open';\nCOMMIT;\n",
         ] {
             let mut session = Session::default();
             let (steps, result) = drive(
@@ -2089,6 +2137,15 @@ mod tests {
             assert_eq!(
                 result,
                 Ok(Outcome::Applied(vec!["0001_a".to_string()])),
+                "{sql}"
+            );
+            assert!(
+                steps.iter().any(|s| matches!(
+                    s,
+                    Step::Query { sql, params }
+                        if is_probe_set(sql)
+                            && params == &[Some("typedpg-open:0001_a".to_string())]
+                )),
                 "{sql}"
             );
             let all: Vec<&str> = queries(&steps).collect();
@@ -2167,8 +2224,10 @@ mod tests {
         assert_eq!(
             left_transaction_open_message("0001_a", true),
             "failed to revert migration 0001_a: 0001_a.down.sql left a transaction block \
-             open (a BEGIN with no COMMIT); that transaction was rolled back and it is still \
-             recorded as applied. Add a COMMIT at the end of the transaction block."
+             open (a BEGIN with no COMMIT); the open transaction block was rolled back, \
+             statements committed before it (by an earlier COMMIT, or outside any block) stay \
+             applied, and the migration is still recorded as applied. Add a COMMIT at the end \
+             of the transaction block."
         );
         assert_eq!(executes(&steps, "ROLLBACK"), 1);
         assert_eq!(session.unlocked_in_block, Some(false));

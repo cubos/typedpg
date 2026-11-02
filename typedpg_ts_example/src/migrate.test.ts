@@ -220,7 +220,9 @@ describe("migrations", { skip }, () => {
             assert.equal(
               e.message,
               "failed to apply migration 0001_a: 0001_a.sql left a transaction block open (a BEGIN with no COMMIT); " +
-                "that transaction was rolled back and it was not recorded. Add a COMMIT at the end of the transaction block.",
+                "the open transaction block was rolled back, statements committed before it " +
+                "(by an earlier COMMIT, or outside any block) stay applied, and the migration was not recorded. " +
+                "Add a COMMIT at the end of the transaction block.",
             );
             return true;
           });
@@ -238,7 +240,7 @@ describe("migrations", { skip }, () => {
           const leftOpen = set(`${marker}BEGIN;\nCREATE TABLE a (id int);\nCOMMIT;\n`, "-- no-transaction\nBEGIN;\nDROP TABLE b;\n");
           await assert.rejects(
             revertMigration(db, leftOpen),
-            /failed to revert migration 0002_b: 0002_b\.down\.sql left a transaction block open .*it is still recorded as applied/,
+            /failed to revert migration 0002_b: 0002_b\.down\.sql left a transaction block open .*the migration is still recorded as applied/,
           );
           await withPool(url, async (pool) => {
             const { rows } = await pool.query(

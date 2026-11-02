@@ -1070,6 +1070,94 @@ async fn an_unwrapped_migration_left_open_fails_and_leaves_nothing() {
     }
 }
 
+/// The probe's setting set at session level — by a migration, here, or a
+/// role or database default — is not mistaken for an open block: the probe
+/// compares against a token of its own.
+#[tokio::test]
+async fn a_session_value_of_the_probe_setting_is_not_an_open_block() {
+    let (mut client, db) = fresh_db().await;
+    let config = MigrationsConfig {
+        use_transaction: false,
+        ..Default::default()
+    };
+    let source = MigrationSource::from_embedded([
+        (
+            "0001_a",
+            "SET typedpg.transaction_probe = 'open';\nCREATE TABLE a (id INT);\n",
+            None,
+        ),
+        (
+            "0002_b",
+            "BEGIN;\nCREATE TABLE b (id INT);\nCOMMIT;\n",
+            None,
+        ),
+    ])
+    .unwrap();
+    let applied = migrate::run(&mut client, &source, &config).await.unwrap();
+    assert_eq!(applied, ["0001_a", "0002_b"]);
+    let other = second_session(&db).await;
+    assert!(table_exists(&other, "a").await && table_exists(&other, "b").await);
+    assert_eq!(
+        recorded(&other, "public._migrations").await,
+        ["0001_a", "0002_b"]
+    );
+
+    // With the value set, a block left open is still found.
+    let source = MigrationSource::from_embedded([
+        (
+            "0001_a",
+            "SET typedpg.transaction_probe = 'open';\nCREATE TABLE a (id INT);\n",
+            None,
+        ),
+        (
+            "0002_b",
+            "BEGIN;\nCREATE TABLE b (id INT);\nCOMMIT;\n",
+            None,
+        ),
+        ("0003_c", "BEGIN;\nCREATE TABLE c (id INT);\n", None),
+    ])
+    .unwrap();
+    migrate::run(&mut client, &source, &config)
+        .await
+        .unwrap_err();
+    assert!(!table_exists(&other, "c").await);
+    assert!(outside_a_block(&client).await);
+}
+
+/// After `COMMIT AND CHAIN`, only the chained block is open: what the
+/// commit committed stays, and the message says so.
+#[tokio::test]
+async fn a_chained_block_left_open_keeps_what_was_committed() {
+    let (mut client, db) = fresh_db().await;
+    let config = MigrationsConfig {
+        use_transaction: false,
+        ..Default::default()
+    };
+    let source = MigrationSource::from_embedded([(
+        "0001_a",
+        "BEGIN;\nCREATE TABLE a (id INT);\nCOMMIT AND CHAIN;\nCREATE TABLE b (id INT);\n",
+        None,
+    )])
+    .unwrap();
+    let err = migrate::run(&mut client, &source, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        format!(
+            "migration error: {}",
+            typedpg_core::migrations::machine::left_transaction_open_message("0001_a", false)
+        )
+    );
+    assert!(err.contains("statements committed before it"), "{err}");
+    assert!(outside_a_block(&client).await);
+    let other = second_session(&db).await;
+    assert!(table_exists(&other, "a").await);
+    assert!(!table_exists(&other, "b").await);
+    assert!(recorded(&other, "public._migrations").await.is_empty());
+}
+
 /// A statement failing inside a block an unwrapped migration opened aborts
 /// that block: the runner rolls it back, so the lock's release succeeds and
 /// the session is usable again, and reports the statement's error.
