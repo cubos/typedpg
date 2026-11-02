@@ -5052,8 +5052,10 @@ fn toast_tables_follow_rewrites_and_add_column_if_not_exists_skips_first() {
     // COLUMN or SET STORAGE keep it. ADD COLUMN IF NOT EXISTS skips an
     // existing column before its type, collation, default or constraints
     // are looked at. A partition key a unique constraint misses is named in
-    // the DETAIL, and REINDEX (TABLESPACE ...) wants a tablespace that
-    // exists. What PG runs is tried in a transaction rolled back.
+    // the DETAIL. What PG runs is tried in a transaction rolled back. (A
+    // tablespace named for placement is taken to exist, which the mirror's
+    // server can't follow: see
+    // `tablespaces_named_for_placement_are_assumed_to_exist`.)
     let mut db = build_db(&[("0001.sql", TOAST_AND_ADD_COLUMN_SETUP)]);
     for &(sql, expected) in TOAST_AND_ADD_COLUMN_CASES {
         match expected {
@@ -5297,23 +5299,7 @@ const TOAST_AND_ADD_COLUMN_CASES: &[(&str, Option<&str>)] = &[
         "alter table pk add unique (b, (a))",
         Some("syntax error at or near \"(\""),
     ),
-    (
-        "reindex (tablespace nonexist) schema pg_temp",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "reindex (tablespace nonexist) schema public",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "reindex (tablespace nonexist) table t",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
     ("reindex (tablespace pg_global) table t", None),
-    (
-        "reindex (tablespace nonexist) index nosuch",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
 ];
 
 /// The relations [`REWRITE_CASES`] run over.
@@ -5336,9 +5322,9 @@ fn rewrites_vacuum_options_and_tablespaces_follow_pg() {
     // FULL inheritance children too — none of them a materialized view
     // never populated; ExecVacuum's options (the last FULL, PROCESS_MAIN,
     // and the combinations it refuses); a domain column's size is
-    // unbounded for needs_toast_table; REINDEX's last TABLESPACE, looked up
-    // after the other options; the partition key walked in order for a
-    // unique or exclusion constraint; a tablespace that must exist. Each
+    // unbounded for needs_toast_table; REINDEX's TABLESPACE needs a value,
+    // checked with the other options; the partition key walked in order
+    // for a unique or exclusion constraint; pg_global's placement rule. Each
     // case runs on a catalog of its own (VACUUM and bare CLUSTER can't run
     // in a transaction).
     for &(steps, expected) in REWRITE_CASES {
@@ -5523,20 +5509,8 @@ const REWRITE_CASES: &[(&str, Option<&str>)] = &[
         None,
     ),
     (
-        "reindex (tablespace pg_default, tablespace nonexist) table t",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
         "reindex (tablespace) table t",
         Some("tablespace requires a parameter"),
-    ),
-    (
-        "reindex (tablespace 5) table t",
-        Some("tablespace \"5\" does not exist"),
-    ),
-    (
-        "reindex (tablespace 1.5) table t",
-        Some("tablespace \"1.5\" does not exist"),
     ),
     (
         "reindex (tablespace nonexist, concurrently maybe) table t",
@@ -5597,51 +5571,68 @@ const REWRITE_CASES: &[(&str, Option<&str>)] = &[
         ),
     ),
     (
-        "alter table t add column c int unique using index tablespace nonexist",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
         "alter table t add column c int unique using index tablespace pg_global",
         Some("only shared relations can be placed in pg_global tablespace"),
     ),
-    (
-        "create table u (a int unique using index tablespace nonexist)",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "create table u (a int, unique (a) using index tablespace nonexist)",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "create table u (a int, primary key (a) using index tablespace nonexist)",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "alter table t add constraint k unique (a) using index tablespace nonexist",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "create table u (a int) tablespace nonexist",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "create index on t (a) tablespace nonexist",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "alter table t set tablespace nonexist",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "alter index ti set tablespace nonexist",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "create table u tablespace nonexist as select 1",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
-    (
-        "create materialized view u tablespace nonexist as select 1",
-        Some("tablespace \"nonexist\" does not exist"),
-    ),
 ];
+
+#[test]
+fn tablespaces_named_for_placement_are_assumed_to_exist() {
+    // Tablespaces are cluster objects, created by a DBA outside the
+    // migrations (CREATE TABLESPACE can't even run in a transaction
+    // block): a name a relation or index is placed in is taken to exist,
+    // as role names are. Only pg_global's rule, which PG enforces whatever
+    // the cluster, is checked. The pg_sanity mirror can't follow — its
+    // server has pg_default and pg_global only — so it is left out.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b text); CREATE INDEX ti ON t (a);",
+    )]);
+    db.skip_pg_sanity();
+    db.apply_sql(
+        "CREATE TABLE u1 (a int) TABLESPACE fast;
+         CREATE TABLE u2 (a int UNIQUE USING INDEX TABLESPACE fast);
+         CREATE TABLE u3 (a int, PRIMARY KEY (a) USING INDEX TABLESPACE fast);
+         CREATE INDEX ON t (a) TABLESPACE fast;
+         CREATE TABLE u4 TABLESPACE fast AS SELECT 1 AS a;
+         CREATE MATERIALIZED VIEW u5 TABLESPACE fast AS SELECT 1 AS a;
+         ALTER TABLE t ADD COLUMN c int UNIQUE USING INDEX TABLESPACE fast;
+         ALTER TABLE t ADD CONSTRAINT k UNIQUE (a) USING INDEX TABLESPACE fast;
+         ALTER TABLE t SET TABLESPACE fast;
+         ALTER INDEX ti SET TABLESPACE fast;",
+    )
+    .unwrap();
+    for sql in [
+        "REINDEX (TABLESPACE fast) TABLE t;",
+        "REINDEX (TABLESPACE 5) TABLE t;",
+        "REINDEX (TABLESPACE pg_default, TABLESPACE fast) INDEX ti;",
+    ] {
+        if let Err(err) = db.apply_sql(sql) {
+            panic!("{sql}\n  rejected: {err}");
+        }
+    }
+    for (sql, message) in [
+        (
+            "ALTER TABLE t SET TABLESPACE pg_global;",
+            "only shared relations can be placed in pg_global tablespace",
+        ),
+        (
+            "CREATE TABLE u6 (a int UNIQUE USING INDEX TABLESPACE pg_global);",
+            "only shared relations can be placed in pg_global tablespace",
+        ),
+        (
+            "REINDEX (TABLESPACE) TABLE t;",
+            "tablespace requires a parameter",
+        ),
+        (
+            "REINDEX (TABLESPACE fast, CONCURRENTLY maybe) TABLE t;",
+            "concurrently requires a Boolean value",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(message),
+            "{sql}\n  expected: {message}\n       got: {err}"
+        );
+    }
+}

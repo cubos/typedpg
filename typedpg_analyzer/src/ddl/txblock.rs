@@ -97,7 +97,7 @@ impl Transaction {
     /// The rules the transaction state imposes on `stmt`, before it runs.
     pub(crate) fn check(&self, db: &PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
         if self.block != Block::Started
-            && let Some(what) = forbidden_in_block(db, stmt)
+            && let Some(what) = forbidden_in_block(stmt)
         {
             return Err(DdlError::UnsupportedDdl(format!(
                 "{what} cannot run inside a transaction block"
@@ -391,11 +391,9 @@ fn writes(db: &PgCatalog, stmt: &node::Node) -> Option<&'static str> {
 /// CONCURRENTLY and VERBOSE booleans (defGetBoolean), TABLESPACE, and no
 /// other. Whether CONCURRENTLY is on (the last one given wins).
 pub(crate) fn reindex_options(
-    db: &PgCatalog,
     params: &[typedpg_pg_query::protobuf::Node],
 ) -> Result<bool, DdlError> {
     let mut concurrently = false;
-    let mut tablespace: Option<String> = None;
     for p in params {
         let Some(node::Node::DefElem(de)) = p.node.as_ref() else {
             continue;
@@ -405,19 +403,13 @@ pub(crate) fn reindex_options(
             "verbose" => {
                 super::session::def_get_boolean(de)?;
             }
-            // defGetString: the last one given, looked up after the loop.
+            // defGetString needs a value. The tablespace itself, a cluster
+            // object the analyzer doesn't see, is taken to exist (see
+            // check_tablespace_placement): PG looks only the last one up.
             "tablespace" => {
-                tablespace = Some(match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                    Some(node::Node::String(s)) => s.sval.clone(),
-                    Some(node::Node::Integer(i)) => i.ival.to_string(),
-                    Some(node::Node::Float(f)) => f.fval.clone(),
-                    Some(node::Node::Boolean(b)) => {
-                        if b.boolval { "true" } else { "false" }.to_owned()
-                    }
-                    _ => {
-                        return Err(DdlError::Parse("tablespace requires a parameter".into()));
-                    }
-                });
+                if de.arg.is_none() {
+                    return Err(DdlError::Parse("tablespace requires a parameter".into()));
+                }
             }
             other => {
                 return Err(DdlError::Parse(format!(
@@ -426,26 +418,18 @@ pub(crate) fn reindex_options(
             }
         }
     }
-    // get_tablespace_oid.
-    if let Some(name) = tablespace
-        && !super::cluster::tablespace_exists(db, &name)
-    {
-        return Err(DdlError::TableNotFound(format!(
-            "tablespace \"{name}\" does not exist"
-        )));
-    }
     Ok(concurrently)
 }
 
 /// PreventInTransactionBlock callers. (A REINDEX whose options are invalid
 /// fails on them first, in [`super::maintenance::reindex`].)
-fn forbidden_in_block(db: &PgCatalog, stmt: &node::Node) -> Option<&'static str> {
+fn forbidden_in_block(stmt: &node::Node) -> Option<&'static str> {
     match stmt {
         node::Node::VacuumStmt(v) if v.is_vacuumcmd => Some("VACUUM"),
         node::Node::IndexStmt(i) if i.concurrent => Some("CREATE INDEX CONCURRENTLY"),
         node::Node::DropStmt(d) if d.concurrent => Some("DROP INDEX CONCURRENTLY"),
         node::Node::ReindexStmt(r) => {
-            let Ok(concurrently) = reindex_options(db, &r.params) else {
+            let Ok(concurrently) = reindex_options(&r.params) else {
                 return None;
             };
             if concurrently {

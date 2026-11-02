@@ -971,7 +971,7 @@ fn add_column_to(
     // column IF NOT EXISTS didn't skip).
     for c in &cd.constraints {
         if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
-            super::check_tablespace_placement(interp, &c.indexspace)?;
+            super::check_tablespace_placement(&c.indexspace)?;
         }
     }
     let children = inherit::children_of(interp, relid);
