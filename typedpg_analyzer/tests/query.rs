@@ -96,6 +96,8 @@ mod set_returning_functions;
 mod simplify_count_exists;
 #[path = "query/simplify_dedup.rs"]
 mod simplify_dedup;
+#[path = "query/simplify_fk_join.rs"]
+mod simplify_fk_join;
 #[path = "query/simplify_not_in.rs"]
 mod simplify_not_in;
 #[path = "query/special.rs"]

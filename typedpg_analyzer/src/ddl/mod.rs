@@ -24,6 +24,7 @@ pub(crate) mod event_triggers;
 mod expr_kind;
 pub mod extensions;
 pub(crate) mod fdw;
+mod fk_bypass;
 pub(crate) mod function_body;
 pub mod functions;
 mod guc;
@@ -421,8 +422,15 @@ fn note_user_code(db: &mut PgCatalog) {
     }
 }
 
-/// Dispatch a single parsed statement.
+/// Apply a single parsed statement, noting what it does to foreign-key
+/// checks (`fk_bypass`).
 fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+    fk_bypass::note(db, stmt);
+    dispatch_statement(db, stmt)
+}
+
+/// Apply a single parsed statement, by kind.
+fn dispatch_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
     match stmt {
         // ── Tables ──────────────────────────────────────────────────
         node::Node::CreateStmt(s) => tables::create_plain_table(db, s),

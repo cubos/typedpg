@@ -341,6 +341,20 @@ pub struct PgCatalog {
     /// the internal ones enforcing foreign keys included: a foreign key
     /// from or to one no longer promises anything.
     pub(crate) ri_triggers_disabled: Shared<std::collections::HashSet<PgClassOid>>,
+    /// Tables whose triggers were all disabled at some point of the
+    /// migrations, even if enabled again since: rows written meanwhile
+    /// were never checked against their foreign keys.
+    pub(crate) ri_triggers_ever_disabled: Shared<std::collections::HashSet<PgClassOid>>,
+    /// The migrations set `session_replication_role`, which turns off the
+    /// triggers enforcing foreign keys (in `replica` mode) for whatever
+    /// they wrote meanwhile.
+    pub(crate) fk_checks_bypassed: bool,
+    /// Foreign keys (and clones) PG marked validated without checking the
+    /// rows: `ALTER CONSTRAINT ... ENFORCED` together with a change of
+    /// deferrability rewrites an enforced NOT VALID key's row as validated
+    /// (AlterConstrUpdateConstraintEntry), and a later VALIDATE CONSTRAINT
+    /// then skips it. Only NOT ENFORCED → ENFORCED checks them again.
+    pub(crate) fk_validity_unproven: Shared<std::collections::HashSet<PgConstraintOid>>,
     /// The `indisclustered` index of each table (CLUSTER ... USING,
     /// ALTER TABLE ... CLUSTER ON).
     pub(crate) clustered_indexes: Shared<HashMap<PgClassOid, PgClassOid>>,
@@ -742,6 +756,9 @@ impl PgCatalog {
             typed_tables: Shared::default(),
             row_security: Shared::default(),
             ri_triggers_disabled: Shared::default(),
+            ri_triggers_ever_disabled: Shared::default(),
+            fk_checks_bypassed: false,
+            fk_validity_unproven: Shared::default(),
             clustered_indexes: Shared::default(),
             statistics: Shared::default(),
             index_access_methods: Shared::default(),
@@ -1670,6 +1687,7 @@ impl PgCatalog {
         self.typed_tables.remove(&oid);
         self.row_security.remove(&oid);
         self.ri_triggers_disabled.remove(&oid);
+        self.ri_triggers_ever_disabled.remove(&oid);
         self.clustered_indexes.remove(&oid);
         self.clustered_indexes.retain(|_, index| *index != oid);
         self.statistics.retain(|s| s.relid != oid);

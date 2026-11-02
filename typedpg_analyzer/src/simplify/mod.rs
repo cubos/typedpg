@@ -17,6 +17,7 @@ use crate::resolve::AnalyzedQuery;
 
 mod count_exists;
 mod dedup;
+mod fk_join;
 mod not_in;
 #[allow(dead_code)] // The rules use them as they land.
 pub(crate) mod proof;
@@ -114,6 +115,7 @@ pub(crate) const RULES: &[(Rule, RuleFn)] = &[
     (Rule::CountExists, count_exists::candidates),
     (Rule::Distinct, dedup::distinct_candidates),
     (Rule::UnionAll, dedup::union_all_candidates),
+    (Rule::FkJoin, fk_join::candidates),
 ];
 
 /// Which rules run.
