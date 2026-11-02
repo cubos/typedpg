@@ -981,3 +981,175 @@ async fn legacy_tracking_table_without_sql_source() {
         .collect();
     assert_eq!(stored, [None, Some("CREATE TABLE b (id INT);".into())]);
 }
+
+/// Whether `client`'s session is outside any transaction block: a
+/// savepoint is refused there (and only there).
+async fn outside_a_block(client: &Client) -> bool {
+    match client.batch_execute("SAVEPOINT typedpg_test_probe").await {
+        Ok(()) => {
+            client.batch_execute("ROLLBACK").await.unwrap();
+            false
+        }
+        Err(error) => {
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::NO_ACTIVE_SQL_TRANSACTION),
+                "{error}"
+            );
+            true
+        }
+    }
+}
+
+async fn lock_is_free(db: &str, lock_id: i64) -> bool {
+    second_session(db)
+        .await
+        .query_one("SELECT pg_try_advisory_lock($1)", &[&lock_id])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A migration the runner does not wrap — `-- no-transaction`, or
+/// `use_transaction` off — whose `BEGIN` has no `COMMIT` would leave its
+/// block open: the tracking row, the next migrations and the lock's release
+/// would all run inside it and never commit. The runner rolls the block
+/// back and fails instead: nothing is half-applied, for this session or
+/// another, the lock is free, and the session is out of the block. With the
+/// COMMIT added, the run applies both.
+#[tokio::test]
+async fn an_unwrapped_migration_left_open_fails_and_leaves_nothing() {
+    for (marker, use_transaction) in [("-- no-transaction\n", true), ("", false)] {
+        let (mut client, db) = fresh_db().await;
+        let config = MigrationsConfig {
+            use_transaction,
+            ..Default::default()
+        };
+        let open = format!("{marker}BEGIN;\nCREATE TABLE a (id INT);\n");
+        let source = MigrationSource::from_embedded([
+            ("0001_a", open.as_str(), None),
+            ("0002_b", "CREATE TABLE b (id INT);", None),
+        ])
+        .unwrap();
+
+        let err = migrate::run(&mut client, &source, &config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "migration error: {}",
+                typedpg_core::migrations::machine::left_transaction_open_message("0001_a", false)
+            ),
+            "use_transaction = {use_transaction}"
+        );
+        assert!(outside_a_block(&client).await);
+        let other = second_session(&db).await;
+        for session in [&client, &other] {
+            assert!(!table_exists(session, "a").await);
+            assert!(!table_exists(session, "b").await);
+            assert!(recorded(session, "public._migrations").await.is_empty());
+        }
+        assert!(lock_is_free(&db, config.lock_id).await);
+
+        let closed = format!("{marker}BEGIN;\nCREATE TABLE a (id INT);\nCOMMIT;\n");
+        let source = MigrationSource::from_embedded([
+            ("0001_a", closed.as_str(), None),
+            ("0002_b", "CREATE TABLE b (id INT);", None),
+        ])
+        .unwrap();
+        let applied = migrate::run(&mut client, &source, &config).await.unwrap();
+        assert_eq!(applied, ["0001_a", "0002_b"]);
+        assert!(table_exists(&other, "a").await && table_exists(&other, "b").await);
+        assert_eq!(
+            recorded(&other, "public._migrations").await,
+            ["0001_a", "0002_b"]
+        );
+        assert!(lock_is_free(&db, config.lock_id).await);
+    }
+}
+
+/// A statement failing inside a block an unwrapped migration opened aborts
+/// that block: the runner rolls it back, so the lock's release succeeds and
+/// the session is usable again, and reports the statement's error.
+#[tokio::test]
+async fn a_failure_inside_an_unwrapped_block_rolls_it_back() {
+    let (mut client, db) = fresh_db().await;
+    let config = MigrationsConfig {
+        use_transaction: false,
+        ..Default::default()
+    };
+    let source = MigrationSource::from_embedded([(
+        "0001_a",
+        "CREATE TABLE kept (id INT);\nBEGIN;\nCREATE TABLE a (id INT);\nSELECT 1/0;\nCOMMIT;\n",
+        None,
+    )])
+    .unwrap();
+
+    let err = migrate::run(&mut client, &source, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("failed to apply migration 0001_a (statement 4)")
+            && err.contains("division by zero"),
+        "unexpected error: {err}"
+    );
+    assert!(outside_a_block(&client).await);
+    assert!(lock_is_free(&db, config.lock_id).await);
+    let other = second_session(&db).await;
+    assert!(table_exists(&other, "kept").await);
+    assert!(!table_exists(&other, "a").await);
+    assert!(recorded(&other, "public._migrations").await.is_empty());
+}
+
+/// A down file run without the runner's transaction is held to the same
+/// rule: left open, its block is rolled back, and the migration stays
+/// applied.
+#[tokio::test]
+async fn an_unwrapped_down_left_open_fails_and_keeps_the_record() {
+    let (mut client, db) = fresh_db().await;
+    let config = MigrationsConfig::default();
+    let source = MigrationSource::from_embedded([(
+        "0001_a",
+        "CREATE TABLE a (id INT);",
+        Some("-- no-transaction\nBEGIN;\nDROP TABLE a;\n"),
+    )])
+    .unwrap();
+    migrate::run(&mut client, &source, &config).await.unwrap();
+
+    let err = migrate::revert(&mut client, &source, "0001_a", false, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        format!(
+            "migration error: {}",
+            typedpg_core::migrations::machine::left_transaction_open_message("0001_a", true)
+        )
+    );
+    assert!(outside_a_block(&client).await);
+    assert!(lock_is_free(&db, config.lock_id).await);
+    let other = second_session(&db).await;
+    assert!(table_exists(&other, "a").await);
+    assert_eq!(recorded(&other, "public._migrations").await, ["0001_a"]);
+}
+
+/// In the default mode the runner's own transaction wraps the file: its
+/// `BEGIN` is only a warning, and the runner's `COMMIT` ends the block.
+#[tokio::test]
+async fn a_wrapped_migration_without_commit_applies() {
+    let (mut client, db) = fresh_db().await;
+    let source =
+        MigrationSource::from_embedded([("0001_a", "BEGIN;\nCREATE TABLE a (id INT);\n", None)])
+            .unwrap();
+    let applied = migrate::run(&mut client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(applied, ["0001_a"]);
+    let other = second_session(&db).await;
+    assert!(table_exists(&other, "a").await);
+    assert_eq!(recorded(&other, "public._migrations").await, ["0001_a"]);
+}

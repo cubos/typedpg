@@ -44,6 +44,17 @@ function withExtra(set: MigrationSet, name: string, sql: string, down: string | 
   );
 }
 
+const migrationDrivers = [
+  ["pg", (url: string) => {
+    const pool = new pg.Pool({ connectionString: url, max: 4 });
+    return { db: pool as Executor, close: () => pool.end() };
+  }],
+  ["postgres.js", (url: string) => {
+    const sql = postgres(url, { onnotice: () => {}, max: 4 });
+    return { db: sql as Executor, close: () => sql.end() };
+  }],
+] as const;
+
 async function withPool<T>(url: string, f: (pool: pg.Pool) => Promise<T>): Promise<T> {
   const pool = new pg.Pool({ connectionString: url, max: 4 });
   try {
@@ -67,16 +78,7 @@ describe("migrations", { skip }, () => {
     );
   });
 
-  for (const [driver, open] of [
-    ["pg", (url: string) => {
-      const pool = new pg.Pool({ connectionString: url, max: 4 });
-      return { db: pool as Executor, close: () => pool.end() };
-    }],
-    ["postgres.js", (url: string) => {
-      const sql = postgres(url, { onnotice: () => {}, max: 4 });
-      return { db: sql as Executor, close: () => sql.end() };
-    }],
-  ] as const) {
+  for (const [driver, open] of migrationDrivers) {
     test(`apply, status, revert and re-apply (${driver})`, async () => {
       const url = await freshDatabase(`typedpg_migrate_${driver.replace(/\W/g, "")}`, false);
       const { db, close } = open(url);
@@ -200,6 +202,57 @@ describe("migrations", { skip }, () => {
       assert.equal((await migrationStatus(pool, partial)).at(-1)!.applied, false);
     });
   });
+
+  // A file the runner does not wrap (`-- no-transaction`, or
+  // `useTransaction` off) whose BEGIN has no COMMIT: the tracking row, the
+  // next migration and the lock's release would run inside its block and
+  // never commit. The runner rolls the block back and fails instead.
+  for (const [driver, open] of migrationDrivers) {
+    test(`a migration that leaves its BEGIN open fails and leaves nothing (${driver})`, async () => {
+      for (const [marker, useTransaction] of [["-- no-transaction\n", true], ["", false]] as const) {
+        const url = await freshDatabase(`typedpg_migrate_open_${driver.replace(/\W/g, "")}_${useTransaction}`, false);
+        const set = (sql: string, down: string | null = null) =>
+          embedMigrations([["0001_a", sql, null], ["0002_b", "CREATE TABLE b (id int);", down]], { useTransaction });
+        const { db, close } = open(url);
+        try {
+          await assert.rejects(migrate(db, set(`${marker}BEGIN;\nCREATE TABLE a (id int);\n`)), (e: unknown) => {
+            assert.ok(e instanceof MigrationError);
+            assert.equal(
+              e.message,
+              "failed to apply migration 0001_a: 0001_a.sql left a transaction block open (a BEGIN with no COMMIT); " +
+                "that transaction was rolled back and it was not recorded. Add a COMMIT at the end of the transaction block.",
+            );
+            return true;
+          });
+          await withPool(url, async (pool) => {
+            const { rows } = await pool.query(
+              "SELECT to_regclass('a') IS NULL AND to_regclass('b') IS NULL AS none, " +
+                "(SELECT count(*)::int FROM public._migrations) AS recorded, pg_try_advisory_lock(713705) AS free",
+            );
+            assert.deepEqual(rows[0], { none: true, recorded: 0, free: true });
+          });
+
+          // With the COMMIT, both apply, for every session.
+          assert.deepEqual(await migrate(db, set(`${marker}BEGIN;\nCREATE TABLE a (id int);\nCOMMIT;\n`)), ["0001_a", "0002_b"]);
+          // A down file run on its own is held to the same rule.
+          const leftOpen = set(`${marker}BEGIN;\nCREATE TABLE a (id int);\nCOMMIT;\n`, "-- no-transaction\nBEGIN;\nDROP TABLE b;\n");
+          await assert.rejects(
+            revertMigration(db, leftOpen),
+            /failed to revert migration 0002_b: 0002_b\.down\.sql left a transaction block open .*it is still recorded as applied/,
+          );
+          await withPool(url, async (pool) => {
+            const { rows } = await pool.query(
+              "SELECT to_regclass('a') IS NOT NULL AND to_regclass('b') IS NOT NULL AS both, " +
+                "(SELECT count(*)::int FROM public._migrations) AS recorded, pg_try_advisory_lock(713705) AS free",
+            );
+            assert.deepEqual(rows[0], { both: true, recorded: 2, free: true });
+          });
+        } finally {
+          await close();
+        }
+      }
+    });
+  }
 
   test("concurrent runners apply each migration once", async () => {
     const url = await freshDatabase("typedpg_migrate_concurrent", false);
