@@ -121,6 +121,148 @@ fn composite_dependencies_of(
     Ok(())
 }
 
+/// contain_volatile_functions over `expr` analyzed over `relid`'s row: a
+/// function it runs — called, through an operator or a cast — is VOLATILE.
+fn expression_is_volatile(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: &typedpg_pg_query::protobuf::Node,
+) -> bool {
+    let used = std::cell::RefCell::new(Vec::new());
+    let _ = crate::ddl::volatile::infer_over_relation(interp, relid, expr, Some(&used));
+    used.into_inner().into_iter().any(|oid| {
+        interp
+            .pg_proc
+            .get(&oid)
+            .is_some_and(|p| p.provolatile == crate::pg_catalog::ProVolatile::Volatile)
+    })
+}
+
+/// ATColumnChangeRequiresRewrite (tablecmds.c) over the planned
+/// conversion: ALTER COLUMN TYPE rewrites the rows unless the new value is
+/// the old one relabeled — through a binary-coercible cast, a domain
+/// without constraints, a typmod the type's length-coercion support
+/// function finds a no-op (a wider varchar, varbit, numeric of the same
+/// scale, or temporal precision), or timestamp <-> timestamptz (in a UTC
+/// session). `using` is the USING expression, if any; only the bare column
+/// (or a cast of it) is no rewrite by itself. A virtual generated column
+/// has no storage; a stored one is computed anew.
+pub(crate) fn alter_type_rewrites(
+    interp: &PgCatalog,
+    attr: &PgAttribute,
+    new_type: PgTypeOid,
+    new_typmod: Option<i32>,
+    using: Option<&typedpg_pg_query::protobuf::Node>,
+) -> bool {
+    let new_typmod = new_typmod.unwrap_or(-1);
+    let old_typmod = attr.atttypmod.unwrap_or(-1);
+    match attr.attgenerated {
+        Some(AttGenerated::Virtual) => return false,
+        Some(AttGenerated::Stored) => return true,
+        None => {}
+    }
+    let is_column = |n: &typedpg_pg_query::protobuf::Node| {
+        matches!(n.node.as_ref(), Some(node::Node::ColumnRef(cr))
+            if cr.fields.last().and_then(crate::ddl::util::node_string)
+                == Some(attr.attname.as_str()))
+    };
+    let (src_type, src_typmod) = match using.and_then(|u| u.node.as_ref()) {
+        None => (attr.atttypid, old_typmod),
+        Some(_) if using.is_some_and(is_column) => (attr.atttypid, old_typmod),
+        Some(node::Node::TypeCast(tc)) if tc.arg.as_deref().is_some_and(is_column) => {
+            let Some(tn) = tc.type_name.as_ref() else {
+                return true;
+            };
+            let Some(cast) = crate::ddl::util::resolve_type_name(tn, interp) else {
+                return true;
+            };
+            let cast_typmod = crate::typmod::encode(interp, cast, tn)
+                .ok()
+                .flatten()
+                .unwrap_or(-1);
+            if coercion_rewrites(interp, attr.atttypid, old_typmod, cast, cast_typmod) {
+                return true;
+            }
+            (cast, cast_typmod)
+        }
+        Some(_) => return true,
+    };
+    coercion_rewrites(interp, src_type, src_typmod, new_type, new_typmod)
+}
+
+/// Whether coercing `(src, src_typmod)` to `(dst, dst_typmod)` computes a
+/// new value (see [`alter_type_rewrites`]).
+fn coercion_rewrites(
+    interp: &PgCatalog,
+    src: PgTypeOid,
+    src_typmod: i32,
+    dst: PgTypeOid,
+    dst_typmod: i32,
+) -> bool {
+    use crate::pg_catalog::oid;
+    const VARBIT: PgTypeOid = PgTypeOid::from_raw(1562);
+    const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
+    if domain_has_constraints(interp, dst) {
+        return true;
+    }
+    let s = interp.unwrap_domain(src);
+    let d = interp.unwrap_domain(dst);
+    if s != d {
+        let timestamps = [oid::TIMESTAMP, oid::TIMESTAMPTZ];
+        let relabel = (timestamps.contains(&s) && timestamps.contains(&d))
+            || matches!(
+                crate::coerce::coercion_pathway(
+                    d,
+                    s,
+                    crate::coerce::CoercionContext::Explicit,
+                    interp
+                ),
+                Some(crate::coerce::CoercionPath::Relabel)
+            );
+        // A typmod on the other type is a length coercion of a value whose
+        // typmod it doesn't know.
+        return !relabel || dst_typmod >= 0;
+    }
+    if dst_typmod < 0 || dst_typmod == src_typmod {
+        return false;
+    }
+    // The length-coercion support functions' no-ops.
+    match d {
+        // varchar_support, varbit_support: a wider limit.
+        oid::VARCHAR | VARBIT => src_typmod < 0 || dst_typmod < src_typmod,
+        // numeric_support: the same scale, a precision no smaller.
+        oid::NUMERIC => {
+            if src_typmod < 0 {
+                return true;
+            }
+            let (sp, ss) = (((src_typmod - 4) >> 16) & 0xffff, (src_typmod - 4) & 0x7ff);
+            let (dp, ds) = (((dst_typmod - 4) >> 16) & 0xffff, (dst_typmod - 4) & 0x7ff);
+            !(ss == ds && dp >= sp)
+        }
+        // TemporalSimplify: the maximum precision, or one no smaller.
+        oid::TIMESTAMP | oid::TIMESTAMPTZ | oid::TIME | oid::TIMETZ => {
+            !(dst_typmod == 6 || (src_typmod >= 0 && dst_typmod >= src_typmod))
+        }
+        // interval_support: the fields' smallest unit and the precision.
+        INTERVAL => {
+            const FULL_RANGE: i32 = 0x7fff;
+            const FULL_PRECISION: i32 = 0xffff;
+            const SECOND: i32 = 12;
+            let (old_range, old_precis) = if src_typmod < 0 {
+                (FULL_RANGE, FULL_PRECISION)
+            } else {
+                ((src_typmod >> 16) & 0x7fff, src_typmod & 0xffff)
+            };
+            let (new_range, new_precis) = ((dst_typmod >> 16) & 0x7fff, dst_typmod & 0xffff);
+            let fls = |r: i32| 31 - r.leading_zeros() as i32;
+            let (new_fls, old_fls) = (fls(new_range), fls(old_range));
+            !((new_fls >= SECOND || new_fls >= old_fls)
+                && (old_fls < SECOND || new_precis >= 6 || new_precis >= old_precis))
+        }
+        _ => true,
+    }
+}
+
 /// DomainHasConstraints: a domain in `typ`'s chain carries a CHECK or NOT
 /// NULL constraint.
 fn domain_has_constraints(interp: &PgCatalog, typ: PgTypeOid) -> bool {
@@ -935,6 +1077,20 @@ fn add_column_to(
             cooked.record(interp, relid, next_attnum);
         }
     }
+    // ATExecAddColumn: the rows are rewritten (rather than given a missing
+    // value) for a stored generated column, an identity or serial column,
+    // a domain type with constraints, or a volatile default.
+    if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Table)
+        && (col.generated == Some(AttGenerated::Stored)
+            || col.identity.is_some()
+            || col.owned_sequence.is_some()
+            || domain_has_constraints(interp, col.type_oid)
+            || column_default_expr(cd)
+                .filter(|_| col.has_default && !null_default)
+                .is_some_and(|e| expression_is_volatile(interp, relid, e)))
+    {
+        crate::ddl::indexes::table_rewritten(interp, relid);
+    }
     for child in children {
         add_column_to(interp, child, cmd, rec.child())?;
     }
@@ -1639,6 +1795,18 @@ pub(crate) fn alter_column_type(
     interp.attr_compression.remove(&(relid, attr.attnum));
     // The collation is the one the command names (or the type's default).
     interp.uncertain_collations.remove(&(relid, attr.attnum));
+    // A rewrite of the rows gives every index a new relfilenode.
+    if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Table)
+        && alter_type_rewrites(
+            interp,
+            &attr,
+            new_type_oid,
+            new_typmod,
+            cd.raw_default.as_deref(),
+        )
+    {
+        crate::ddl::indexes::table_rewritten(interp, relid);
+    }
     crate::ddl::indexes::rebuild_indexes_for_column_type(
         interp,
         relid,
@@ -2095,6 +2263,10 @@ pub(crate) fn set_expression(
             expr,
         )?;
         cooked.record(interp, relid, attr.attnum);
+    }
+    // A stored column is computed anew: the rows are rewritten.
+    if kind == AttGenerated::Stored {
+        crate::ddl::indexes::table_rewritten(interp, relid);
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {

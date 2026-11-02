@@ -753,6 +753,11 @@ pub fn refresh_materialized_view(
                 check_refill(interp, oid)?;
                 interp.unpopulated_matviews.remove(&oid);
             }
+            // Without CONCURRENTLY the data goes in a new heap
+            // (finish_heap_swap), its indexes rebuilt with it.
+            if !stmt.concurrent {
+                super::indexes::table_rewritten(interp, oid);
+            }
             Ok(())
         }
     }
