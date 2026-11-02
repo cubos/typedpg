@@ -242,7 +242,16 @@ impl PgSanityServer {
         compare_apply_outcome(sql, our_result, &pg_result)
     }
 
-    /// Send migration `sql` to the migrations' session as one simple query.
+    /// Send migration `sql` to the migrations' session as one simple query,
+    /// and end the transaction it leaves open the way the analyzer does.
+    ///
+    /// A migration that succeeds commits whatever transaction is still open
+    /// (`txblock::Transaction::finish`: an unterminated `BEGIN` is taken as
+    /// committed). The server leaves such a block open past the query, out
+    /// of the query session's sight and around the next migration, so the
+    /// migration is followed by a `COMMIT`. That `COMMIT` belongs to the
+    /// migration's outcome: when it fails (a deferred constraint), the
+    /// migration failed.
     ///
     /// A migration that fails leaves the analyzer's catalog as the failed
     /// transaction found it (`txblock::Transaction::abort` rolls back to
@@ -255,11 +264,15 @@ impl PgSanityServer {
     /// `ROLLBACK`, which ends exactly the transaction the analyzer rolled
     /// back — what an earlier `COMMIT` in the migration made durable stays
     /// on both sides.
-    /// Outside a block (the failure ended its implicit one) the `ROLLBACK`
-    /// only draws a warning. The caller compares the migration's own
-    /// outcome, which this returns untouched.
+    ///
+    /// Outside a block (the migration ended its last one) either statement
+    /// only draws a warning. The caller compares the migration's outcome,
+    /// which this returns.
     fn run_migration(&mut self, sql: &str) -> Result<(), postgres::Error> {
-        let pg_result = self.client.batch_execute(sql);
+        let pg_result = self
+            .client
+            .batch_execute(sql)
+            .and_then(|()| self.client.batch_execute("COMMIT"));
         if pg_result.is_err() {
             self.client.batch_execute("ROLLBACK").unwrap_or_else(|e| {
                 panic!(

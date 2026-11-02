@@ -3866,6 +3866,54 @@ fn a_failed_explicit_transaction_leaves_no_trace() {
 }
 
 #[test]
+fn a_migration_ending_inside_its_transaction_block_commits() {
+    // A migration whose BEGIN has no COMMIT is taken as committed: its
+    // changes are there for the queries, and the next migration starts
+    // outside any transaction block.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("BEGIN; CREATE TABLE t (a int);").unwrap();
+    db.analyze("SELECT a FROM t").unwrap();
+    db.apply_sql("VACUUM t;").unwrap();
+}
+
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_compares_the_commit_ending_a_migration() {
+    // The COMMIT that ends a migration's open block is part of its
+    // outcome: a deferred foreign key it fails (the analyzer doesn't look
+    // at rows) is a divergence, as with a COMMIT the migration spells.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE p (a int PRIMARY KEY);
+         CREATE TABLE c (a int REFERENCES p DEFERRABLE INITIALLY DEFERRED);",
+    )
+    .unwrap();
+    for sql in [
+        "BEGIN; INSERT INTO c VALUES (1);",
+        "BEGIN; INSERT INTO c VALUES (1); COMMIT;",
+    ] {
+        let (result, divergence) = db.apply_sql_checked(sql);
+        result.unwrap();
+        let divergence = divergence.expect("PG fails the COMMIT");
+        assert_eq!(
+            divergence.kind,
+            typedpg_analyzer::DivergenceKind::ApplyPgRejected,
+            "{sql}"
+        );
+        assert!(
+            divergence
+                .message
+                .contains("violates foreign key constraint \"c_a_fkey\""),
+            "{sql}\n{divergence}"
+        );
+    }
+    // The failed COMMIT ended the block: the mirror goes on.
+    let (result, divergence) = db.apply_sql_checked("VACUUM c;");
+    result.unwrap();
+    assert!(divergence.is_none(), "{divergence:?}");
+}
+
+#[test]
 fn migrations_the_runner_wraps_in_a_transaction() {
     // With `use_transaction`, the runner runs each migration inside a
     // transaction block of its own: savepoints work, and statements that
