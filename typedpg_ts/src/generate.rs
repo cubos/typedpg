@@ -33,6 +33,10 @@ pub struct Generated {
     /// then has one string type to check per query instead of a tree of
     /// tuples, which halved its check time on 20k queries.
     pub runtime: String,
+    /// When the SQL sent is a simplification of the one written: a note
+    /// naming the rules applied, with the SQL sent, for the generated
+    /// module's doc comments.
+    pub simplified: Option<String>,
 }
 
 /// Why a query has no entries: the message to report, and where in the
@@ -248,6 +252,7 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
         value,
         overrides: Vec::new(),
         runtime: Value::Object(spec).to_string(),
+        simplified: simplified_note(a),
     })
 }
 
@@ -283,7 +288,23 @@ fn generate_copy_in(c: &AnalyzedCopyIn, mapper: &TypeMapper) -> Result<Generated
         value: None,
         overrides: Vec::new(),
         runtime: json!({ "sql": copy_sql, "columns": columns }).to_string(),
+        simplified: None,
     })
+}
+
+/// [`Generated::simplified`]: the rules applied and the SQL sent.
+fn simplified_note(a: &AnalyzedQuery) -> Option<String> {
+    if a.simplifications.is_empty() {
+        return None;
+    }
+    let mut rules: Vec<&str> = a.simplifications.iter().map(|s| s.rule.name()).collect();
+    rules.dedup();
+    Some(format!(
+        "Sent simplified by typedpg ({}), into an equivalent query PostgreSQL plans \
+         better:\n\n```sql\n{}\n```",
+        rules.join(", "),
+        a.sql
+    ))
 }
 
 /// A row object has one property per name.
@@ -506,6 +527,20 @@ mod tests {
 
     fn err(sql: &str) -> GenError {
         run(Kind::Query, sql).unwrap_err()
+    }
+
+    #[test]
+    fn a_simplified_query_sends_the_rewrite_and_says_so() {
+        let g = ok("SELECT id FROM users WHERE big NOT IN (SELECT big FROM users WHERE id > $min)");
+        let note = g.simplified.expect("simplified");
+        assert!(
+            note.starts_with("Sent simplified by typedpg (not_in)"),
+            "{note}"
+        );
+        assert!(note.contains("NOT EXISTS"), "{note}");
+        assert!(g.runtime.contains("NOT EXISTS"), "{}", g.runtime);
+        // Not simplified: no note.
+        assert_eq!(ok("SELECT id FROM users").simplified, None);
     }
 
     #[test]

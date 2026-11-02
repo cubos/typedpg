@@ -69,6 +69,7 @@ mod regex_input;
 mod resolve;
 mod scope;
 mod seed;
+mod simplify;
 mod sql_text;
 mod stack;
 mod suggest;
@@ -107,6 +108,7 @@ pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
 };
+pub use simplify::{AppliedSimplification, Rule, SimplifyOptions};
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the
 /// macros' own errors (an unknown `sql!` argument name).

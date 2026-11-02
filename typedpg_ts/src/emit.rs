@@ -239,6 +239,14 @@ impl Module<'_> {
                 let key = js_string(text);
                 match result {
                     Ok(g) => {
+                        if let Some(note) = &g.simplified {
+                            out.push_str("  /**\n");
+                            for line in note.replace("*/", "*\\/").lines() {
+                                let sep = if line.is_empty() { "" } else { " " };
+                                let _ = writeln!(out, "   *{sep}{line}");
+                            }
+                            out.push_str("   */\n");
+                        }
                         let _ = writeln!(out, "  {key}: {};", g.types);
                     }
                     Err(e) => {
@@ -297,6 +305,7 @@ mod tests {
             value: None,
             overrides: Vec::new(),
             runtime: "{\"sql\":[\"x\"]}".to_owned(),
+            simplified: None,
         })
     }
 
@@ -333,6 +342,33 @@ mod tests {
         assert!(ts.contains("export interface CopyTargets {\n}"), "{ts}");
         assert!(
             ts.contains("export const copyIn = createCopyIn<CopyTargets>({\n});"),
+            "{ts}"
+        );
+    }
+
+    #[test]
+    fn a_simplified_query_is_documented() {
+        let q = Ok(Generated {
+            simplified: Some(
+                "Sent simplified by typedpg (not_in):\n\n```sql\nSELECT 1\n```".into(),
+            ),
+            ..generated("{ params: {}; row: {} }").unwrap()
+        });
+        let queries = [("SELECT a", &q)];
+        let m = Module {
+            runtime: "@cubos/typedpg",
+            imports: &[],
+            checks: &[],
+            queries: &queries,
+            copies: &[],
+            migrations: None,
+        };
+        let ts = &m.files(Path::new("/p/db.ts"), OutKind::TypeScript)[0].1;
+        assert!(
+            ts.contains(
+                "  /**\n   * Sent simplified by typedpg (not_in):\n   *\n   * ```sql\n   * SELECT \
+                 1\n   * ```\n   */\n  \"SELECT a\": { params: {}; row: {} };"
+            ),
             "{ts}"
         );
     }

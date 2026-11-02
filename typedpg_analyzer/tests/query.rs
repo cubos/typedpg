@@ -92,6 +92,8 @@ mod select_rules;
 mod set_operations;
 #[path = "query/set_returning_functions.rs"]
 mod set_returning_functions;
+#[path = "query/simplify_not_in.rs"]
+mod simplify_not_in;
 #[path = "query/special.rs"]
 mod special;
 #[path = "query/sql_function_inlining.rs"]

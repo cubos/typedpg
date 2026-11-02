@@ -536,6 +536,9 @@ impl Project {
                     .filter(|q| !db.overrides.contains_key(q))
                     .collect();
                 catalog.assume_finite_parameters(&finite)?;
+                catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
+                    &db.config.simplify,
+                ));
                 Ok(catalog)
             });
         db.migrations = migrations;

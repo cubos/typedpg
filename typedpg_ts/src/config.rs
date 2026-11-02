@@ -10,6 +10,11 @@
 //! }
 //! ```
 //!
+//! `simplify` turns the query simplifications off: `false` all of them, or
+//! an object with one key per rule (`notIn`, `countExists`, `distinct`,
+//! `unionAll`, `fkJoin`) set to `false`. They are on by default, for every
+//! database.
+//!
 //! `migrations` is the directory, or an object with it and the runner's
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",
 //! "embed" }`. Several databases go under `databases`, each with the
@@ -41,7 +46,7 @@ use std::path::{Path, PathBuf};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use typedpg_core::QualifiedName;
-use typedpg_core::config::MigrationsConfig;
+use typedpg_core::config::{MigrationsConfig, SimplifyConfig};
 
 pub const CONFIG_FILE: &str = "typedpg.config.json";
 
@@ -58,6 +63,71 @@ struct RawConfig {
     extra_migrations: Option<Vec<PathBuf>>,
     types: Option<BTreeMap<String, String>>,
     databases: Option<BTreeMap<String, RawDatabase>>,
+    simplify: Option<RawSimplify>,
+}
+
+/// `simplify`: `false`, or `{ "<rule>": false, … }`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawSimplify {
+    All(bool),
+    Rules(BTreeMap<String, bool>),
+}
+
+/// The `simplify` object's key for each rule: the Rust configuration's
+/// key (`typedpg_core::config::SIMPLIFY_RULES`), in camelCase as the rest
+/// of this file.
+fn simplify_key(rule: &str) -> String {
+    let mut out = String::with_capacity(rule.len());
+    let mut upper = false;
+    for c in rule.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The query simplifications `simplify` asks for.
+fn simplify_config(raw: Option<RawSimplify>) -> Result<SimplifyConfig, String> {
+    use typedpg_core::config::SIMPLIFY_RULES;
+    match raw {
+        None => Ok(SimplifyConfig {
+            enabled: true,
+            disabled: Vec::new(),
+        }),
+        Some(RawSimplify::All(enabled)) => Ok(SimplifyConfig {
+            enabled,
+            disabled: Vec::new(),
+        }),
+        Some(RawSimplify::Rules(rules)) => {
+            let mut disabled = Vec::new();
+            for (key, on) in rules {
+                let Some(rule) = SIMPLIFY_RULES.iter().find(|r| simplify_key(r) == key) else {
+                    let keys: Vec<String> = SIMPLIFY_RULES
+                        .iter()
+                        .map(|r| format!("`{}`", simplify_key(r)))
+                        .collect();
+                    return Err(format!(
+                        "unknown rule `{key}` in `simplify`, expected one of {}",
+                        keys.join(", ")
+                    ));
+                };
+                if !on {
+                    disabled.push((*rule).to_owned());
+                }
+            }
+            Ok(SimplifyConfig {
+                enabled: true,
+                disabled,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -283,6 +353,8 @@ pub struct DatabaseConfig {
     pub embed_migrations: bool,
     /// PG type → the TypeScript type it maps to.
     pub types: HashMap<QualifiedName, TypeOverride>,
+    /// The query simplifications (the top-level `simplify`).
+    pub simplify: SimplifyConfig,
 }
 
 impl DatabaseConfig {
@@ -340,6 +412,7 @@ impl Config {
         // interpretation, so the binary that fills the cache and the runtime
         // that reads it cannot disagree about what an entry depends on.
         let listed = typedpg_core::loader_cache::databases(text)?;
+        let simplify = simplify_config(raw.simplify)?;
         let databases = match raw.databases {
             // Both maps are `BTreeMap`s parsed from the same text, so they
             // iterate in the same order.
@@ -347,7 +420,7 @@ impl Config {
                 .into_iter()
                 .zip(dbs)
                 .map(|(listed, (name, db))| {
-                    database(root, name.clone(), db, listed.dirs)
+                    database(root, name.clone(), db, listed.dirs, &simplify)
                         .map_err(|e| format!("databases.{name}: {e}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -356,7 +429,13 @@ impl Config {
                     .into_iter()
                     .next()
                     .expect("the single-database form lists one database");
-                vec![database(root, "default".to_owned(), single, listed.dirs)?]
+                vec![database(
+                    root,
+                    "default".to_owned(),
+                    single,
+                    listed.dirs,
+                    &simplify,
+                )?]
             }
         };
         let mut outs: Vec<&Path> = databases.iter().filter_map(|d| d.out.as_deref()).collect();
@@ -409,6 +488,7 @@ fn database(
     name: String,
     raw: RawDatabase,
     dirs: Vec<String>,
+    simplify: &SimplifyConfig,
 ) -> Result<DatabaseConfig, String> {
     if raw.out.is_none() && raw.sql.is_none() {
         return Err(
@@ -481,6 +561,7 @@ fn database(
         runner,
         embed_migrations,
         types,
+        simplify: simplify.clone(),
     })
 }
 
@@ -604,6 +685,23 @@ mod tests {
         let o = &db.types[&QualifiedName::new("public", "prefs")];
         assert_eq!(o.module, OverrideModule::Path("/p/./src/domains".into()));
         assert_eq!(o.export, "Prefs");
+    }
+
+    #[test]
+    fn simplify_is_on_by_default_and_turned_off_per_rule() {
+        let parse = |extra: &str| {
+            Config::parse(&format!(r#"{{ "out": "db.ts"{extra} }}"#), Path::new("/p"))
+                .map(|c| c.databases[0].simplify.clone())
+        };
+        let on = parse("").unwrap();
+        assert!(on.enabled && on.disabled.is_empty());
+        assert!(!parse(r#", "simplify": false"#).unwrap().enabled);
+        let some = parse(r#", "simplify": { "notIn": false, "fkJoin": true }"#).unwrap();
+        assert!(some.enabled);
+        assert_eq!(some.disabled, vec!["not_in".to_owned()]);
+        let err = parse(r#", "simplify": { "not_in": false }"#).unwrap_err();
+        assert!(err.contains("unknown rule `not_in` in `simplify`"), "{err}");
+        assert!(err.contains("`notIn`, `countExists`"), "{err}");
     }
 
     #[test]

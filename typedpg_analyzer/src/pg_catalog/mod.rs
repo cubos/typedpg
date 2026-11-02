@@ -297,6 +297,9 @@ pub struct PgCatalog {
     /// them from values that can't be (a JS `Date`), see
     /// [`PgCatalog::assume_finite_parameters`].
     pub(crate) finite_param_types: std::collections::HashSet<PgTypeOid>,
+    /// Which simplifications [`PgCatalog::analyze`] applies (see
+    /// [`PgCatalog::set_simplify_options`]).
+    pub(crate) simplify_options: crate::simplify::SimplifyOptions,
     pub(crate) relation_checks: std::sync::Arc<
         std::sync::Mutex<HashMap<PgClassOid, Option<crate::nonnull::checks::RelationChecks>>>,
     >,
@@ -723,6 +726,7 @@ impl PgCatalog {
             inline_body_trust: Shared::default(),
             relation_checks: Default::default(),
             finite_param_types: Default::default(),
+            simplify_options: Default::default(),
             proc_default_procs: Shared::default(),
             sql_function_defs: HashMap::new(),
             partition_keys: Shared::default(),
@@ -1075,6 +1079,12 @@ impl PgCatalog {
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_where)
     }
 
+    /// Which simplifications [`Self::analyze`] applies to the queries it
+    /// analyzes: all of them unless turned off here.
+    pub fn set_simplify_options(&mut self, options: crate::simplify::SimplifyOptions) {
+        self.simplify_options = options;
+    }
+
     /// Take a parameter of each of `types` (or of a domain over one) to be
     /// finite — never `infinity` / `-infinity` — as when the code generator
     /// binds it from a value that can't be one (a JS `Date`): `to_char`,
@@ -1299,10 +1309,14 @@ impl PgCatalog {
         }
 
         let Some(tree) = sample_tree else {
-            return (
-                analysis_sql,
-                fuse(lex_output, columns, info_params, can_run_as_subquery),
-            );
+            // Simplification runs only without spreads: the rewrite would
+            // move their offsets.
+            let fused =
+                fuse(lex_output, columns, info_params, can_run_as_subquery).map(|mut analyzed| {
+                    crate::simplify::simplify(self, &mut analyzed, &param_nullability);
+                    analyzed
+                });
+            return (analysis_sql, fused);
         };
         let fused = fuse(
             lex_output.clone(),
@@ -1483,6 +1497,28 @@ impl PgCatalog {
         self.with_pg_sanity::<()>(|server| {
             server.assert_analyze_matches(analysis_sql, result, &finite_params)
         });
+    }
+
+    /// Run the simplification oracle on `rewritten` as if the analyzer had
+    /// sent it for `written` (both without spreads): the mirror's
+    /// divergence, if any. For testing the oracle itself with rewrites no
+    /// rule would make.
+    #[cfg(feature = "pg_sanity")]
+    pub fn pg_sanity_check_rewrite(
+        &self,
+        written: &str,
+        rewritten: &str,
+    ) -> Option<crate::pg_sanity::Divergence> {
+        let (analysis_sql, result) = self.analyze_with_sql(written);
+        let mut ours = result.expect("the written query must analyze");
+        ours.simplifications = vec![crate::simplify::AppliedSimplification {
+            rule: crate::simplify::Rule::NotIn,
+            original_sql: analysis_sql.clone(),
+        }];
+        ours.sql = rewritten.to_owned();
+        let finite = self.finite_param_oids();
+        self.with_pg_sanity(|server| server.check_rewrite(&analysis_sql, &ours, &finite))
+            .flatten()
     }
 
     /// Analyze `sql` and cross-check the result against the embedded PG

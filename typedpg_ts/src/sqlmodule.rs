@@ -196,7 +196,11 @@ impl SqlModule<'_> {
         for (i, q) in self.queries.iter().enumerate() {
             out.push('\n');
             self.types(&mut out, q);
-            doc(&mut out, q.text);
+            doc(
+                &mut out,
+                q.text,
+                q.result.as_ref().ok().and_then(|g| g.simplified.as_deref()),
+            );
             out.push_str("export const ");
             exports.push((out.len(), i));
             match q.result {
@@ -278,7 +282,11 @@ impl SqlModule<'_> {
         for q in self.queries {
             out.push('\n');
             self.types(&mut out, q);
-            doc(&mut out, q.text);
+            doc(
+                &mut out,
+                q.text,
+                q.result.as_ref().ok().and_then(|g| g.simplified.as_deref()),
+            );
             match q.result {
                 Ok(g) => {
                     let _ = writeln!(
@@ -357,17 +365,23 @@ fn interface(out: &mut String, name: &str, members: &[String]) {
     out.push_str("}\n");
 }
 
-/// The query's SQL as a doc comment, for the editor's hover.
-fn doc(out: &mut String, sql: &str) {
-    out.push_str("/**\n * ```sql\n");
-    for line in sql.replace("*/", "*\\/").lines() {
+/// The query's SQL as a doc comment, for the editor's hover, with the
+/// note on the SQL sent when it is simplified.
+fn doc(out: &mut String, sql: &str, simplified: Option<&str>) {
+    let mut text = format!("```sql\n{sql}\n```");
+    if let Some(note) = simplified {
+        text.push_str("\n\n");
+        text.push_str(note);
+    }
+    out.push_str("/**\n");
+    for line in text.replace("*/", "*\\/").lines() {
         if line.is_empty() {
             out.push_str(" *\n");
         } else {
             let _ = writeln!(out, " * {line}");
         }
     }
-    out.push_str(" * ```\n */\n");
+    out.push_str(" */\n");
 }
 
 /// An error's first line: the rest is the rendered snippet, which the CLI
@@ -428,6 +442,7 @@ mod tests {
             value: value.map(str::to_owned),
             overrides: overrides.iter().map(|s| s.to_string()).collect(),
             runtime: "{\"sql\":[\"x\"]}".to_owned(),
+            simplified: None,
         })
     }
 

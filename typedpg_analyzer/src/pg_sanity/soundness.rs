@@ -132,6 +132,10 @@ struct Stats {
     seed_skips: BTreeMap<String, u64>,
     /// The runtime errors of `exec_errors`, by SQLSTATE.
     exec_error_codes: BTreeMap<String, u64>,
+    /// Simplified queries executed next to the one written.
+    equivalence_checked: u64,
+    /// Scenarios in which both ran and their results were compared.
+    equivalence_compared: u64,
 }
 
 /// Per-server oracle state.
@@ -204,10 +208,33 @@ impl Soundness {
             return None;
         }
         self.install(client);
+        let Some(values) = self.param_values(client, ours, stmt, finite_params) else {
+            self.stats.no_param_sample += 1;
+            return None;
+        };
+        self.stats.checked += 1;
+        let params: Vec<Param> = values.iter().map(|v| Param(v.clone())).collect();
+        let param_refs: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
-        // Parameter values: NULL where the analyzer allows it, a sample of
-        // the type otherwise. Without a sample for a NOT NULL parameter
-        // there is nothing the caller could pass to check against.
+        let mut tx = client
+            .transaction()
+            .unwrap_or_else(|e| panic!("pg_sanity: BEGIN failed in the nullability check: {e}"));
+        tx.batch_execute("SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '1s'")
+            .unwrap_or_else(|e| panic!("pg_sanity: SET LOCAL failed: {e}"));
+        self.check_scenarios(&mut tx, sql, ours, stmt, &checked, &values, &param_refs)
+    }
+
+    /// Parameter values: NULL where the analyzer allows it, a sample of the
+    /// type otherwise. `None` without a sample for a NOT NULL parameter:
+    /// there is nothing the caller could pass to check against.
+    fn param_values(
+        &mut self,
+        client: &mut Client,
+        ours: &AnalyzedQuery,
+        stmt: &Statement,
+        finite_params: &std::collections::HashSet<u32>,
+    ) -> Option<Vec<Option<String>>> {
         let nullable_params: Vec<bool> = ours
             .params
             .iter()
@@ -232,27 +259,27 @@ impl Soundness {
             } else {
                 1
             };
-            let Some(text) = self.param_text(client, ty.oid(), variant) else {
-                self.stats.no_param_sample += 1;
-                return None;
-            };
-            values.push(Some(text));
+            values.push(Some(self.param_text(client, ty.oid(), variant)?));
         }
-        self.stats.checked += 1;
-        let params: Vec<Param> = values.iter().map(|v| Param(v.clone())).collect();
-        let param_refs: Vec<&(dyn ToSql + Sync)> =
-            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        Some(values)
+    }
 
-        let mut tx = client
-            .transaction()
-            .unwrap_or_else(|e| panic!("pg_sanity: BEGIN failed in the nullability check: {e}"));
-        tx.batch_execute("SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '1s'")
-            .unwrap_or_else(|e| panic!("pg_sanity: SET LOCAL failed: {e}"));
-
+    /// The scenarios of [`Self::check`].
+    #[allow(clippy::too_many_arguments)]
+    fn check_scenarios(
+        &mut self,
+        tx: &mut Transaction<'_>,
+        sql: &str,
+        ours: &AnalyzedQuery,
+        stmt: &Statement,
+        checked: &[bool],
+        values: &[Option<String>],
+        param_refs: &[&(dyn ToSql + Sync)],
+    ) -> Option<Divergence> {
         let mut seeded: Vec<(&str, SeedPlan)> = Vec::new();
         for (scenario, mode) in SCENARIOS {
             if mode > 0 {
-                let plan = self.seed(&mut tx, mode);
+                let plan = self.seed(tx, mode);
                 for skip in &plan.skips {
                     *self.stats.seed_skips.entry(skip.clone()).or_default() += 1;
                 }
@@ -269,7 +296,7 @@ impl Soundness {
                     .transaction()
                     .unwrap_or_else(|e| panic!("pg_sanity: SAVEPOINT failed: {e}"));
                 let rows = sp
-                    .bind(stmt, &param_refs)
+                    .bind(stmt, param_refs)
                     .and_then(|portal| sp.query_portal(&portal, MAX_ROWS));
                 // Dropping `sp` rolls the statement's own effects back, so
                 // the next scenario starts from the seeded rows alone.
@@ -304,8 +331,7 @@ impl Soundness {
                             .or_else(|| refinement_violation(col, bytes)),
                     };
                     if let Some(problem) = problem {
-                        let message = render(sql, ours, i, r, &problem, scenario, &values, &seeded);
-                        drop(tx);
+                        let message = render(sql, ours, i, r, &problem, scenario, values, &seeded);
                         return Some(Divergence {
                             kind: DivergenceKind::Nullability,
                             message,
@@ -314,7 +340,125 @@ impl Soundness {
                 }
             }
         }
-        drop(tx);
+        None
+    }
+
+    /// Execute the query as written (`original`) and as simplified, both
+    /// prepared, over the adversarial scenarios, and return a divergence
+    /// when the simplified one leaves the tables it writes to with other
+    /// contents, or returns other rows — as multisets; in
+    /// order, too, of the outermost ORDER BY's keys when they are output
+    /// columns — or another row count, or fails where the original
+    /// doesn't. The original failing is fine: a rewrite may evaluate less.
+    pub(super) fn equivalence(
+        &mut self,
+        client: &mut Client,
+        original: (&str, &Statement),
+        simplified: (&str, &Statement),
+        ours: &AnalyzedQuery,
+        finite_params: &std::collections::HashSet<u32>,
+    ) -> Option<Divergence> {
+        if !self.enabled || !is_executable(original.0) {
+            return None;
+        }
+        let lower = original.0.to_ascii_lowercase();
+        if UNSAFE_CALLS.iter().any(|f| lower.contains(f)) {
+            return None;
+        }
+        self.install(client);
+        let values = self.param_values(client, ours, original.1, finite_params)?;
+        self.stats.equivalence_checked += 1;
+        let params: Vec<Param> = values.iter().map(|v| Param(v.clone())).collect();
+        let param_refs: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let order_keys = order_keys(original.0, ours);
+        let targets = written_tables(original.0);
+
+        let mut tx = client
+            .transaction()
+            .unwrap_or_else(|e| panic!("pg_sanity: BEGIN failed in the equivalence check: {e}"));
+        tx.batch_execute("SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '1s'")
+            .unwrap_or_else(|e| panic!("pg_sanity: SET LOCAL failed: {e}"));
+        let mut seeded: Vec<(&str, SeedPlan)> = Vec::new();
+        for (scenario, mode) in SCENARIOS {
+            if mode > 0 {
+                let plan = self.seed(&mut tx, mode);
+                let unchanged = mode == 3 && plan.inserts.is_empty();
+                seeded.push((scenario, plan));
+                if unchanged {
+                    continue;
+                }
+            }
+            let (written, written_tables) = run(&mut tx, original.1, &param_refs, &targets);
+            let (sent, sent_tables) = run(&mut tx, simplified.1, &param_refs, &targets);
+            let tables_differ = !matches!(written, Outcome::Failed(_))
+                && !matches!(sent, Outcome::Failed(_))
+                && written_tables != sent_tables;
+            let problem = match (&written, &sent) {
+                _ if tables_differ => Some(format!(
+                    "it leaves other table contents:\n  written:    {written_tables:?}\n  \
+                     simplified: {sent_tables:?}"
+                )),
+                (Outcome::Failed(_), _) | (Outcome::Truncated, _) | (_, Outcome::Truncated) => None,
+                (_, Outcome::Failed(e)) => Some(format!("the simplified query fails: {e}")),
+                (Outcome::Count(a), Outcome::Count(b)) => {
+                    (a != b).then(|| format!("it affects {b} rows, the written one {a}"))
+                }
+                (Outcome::Rows(a), Outcome::Rows(b)) => {
+                    self.stats.equivalence_compared += 1;
+                    let (mut sa, mut sb) = (a.clone(), b.clone());
+                    sa.sort();
+                    sb.sort();
+                    if sa != sb {
+                        Some(format!(
+                            "it returns other rows:\n  written:    {a:?}\n  simplified: {b:?}"
+                        ))
+                    } else if let Some(keys) = &order_keys {
+                        let project = |rows: &[Row]| -> Vec<Row> {
+                            rows.iter()
+                                .map(|r| keys.iter().map(|&k| r[k].clone()).collect())
+                                .collect()
+                        };
+                        (project(a) != project(b)).then(|| {
+                            format!(
+                                "it returns the rows in another order:\n  written:    {a:?}\n  \
+                                 simplified: {b:?}"
+                            )
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => Some("one returns rows, the other a row count".to_owned()),
+            };
+            if let Some(problem) = problem {
+                let params = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| match v {
+                        Some(v) => format!("${} = '{v}'", i + 1),
+                        None => format!("${} = NULL", i + 1),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut seeding = String::new();
+                for (name, plan) in &seeded {
+                    seeding.push_str(&format!("  [{name}]\n"));
+                    for insert in &plan.inserts {
+                        seeding.push_str(&format!("    {insert};\n"));
+                    }
+                }
+                return Some(Divergence {
+                    kind: DivergenceKind::Simplification,
+                    message: format!(
+                        "pg_sanity: simplification changes the result: {problem}\n\
+                         written:\n---\n{}\n---\nsimplified:\n---\n{}\n---\n\
+                         scenario: {scenario}\nparams: {params}\nseeding:\n{seeding}",
+                        original.0, simplified.0
+                    ),
+                });
+            }
+        }
         None
     }
 
@@ -434,6 +578,8 @@ impl Soundness {
             ("not_executable", s.not_executable),
             ("unsafe_calls", s.unsafe_calls),
             ("no_param_sample", s.no_param_sample),
+            ("equivalence_checked", s.equivalence_checked),
+            ("equivalence_compared", s.equivalence_compared),
         ] {
             out.push_str(&format!("count\t{name}\t{n}\n"));
         }
@@ -455,6 +601,170 @@ impl Soundness {
             let _ = f.write_all(out.as_bytes());
         }
     }
+}
+
+/// A result row, each value's raw binary bytes (`None` for NULL).
+type Row = Vec<Option<Vec<u8>>>;
+
+/// What running a statement over one scenario gave.
+enum Outcome {
+    Rows(Vec<Row>),
+    /// More than `MAX_ROWS` rows: not compared.
+    Truncated,
+    /// A statement without output columns: the rows it affected.
+    Count(u64),
+    Failed(String),
+}
+
+/// A table's name and its rows as text, sorted.
+type TableContents = (String, Vec<Option<String>>);
+
+/// The tables `sql` writes to (its INSERT / UPDATE / DELETE / MERGE
+/// targets, in data-modifying CTEs too), as SQL names.
+fn written_tables(sql: &str) -> Vec<String> {
+    use typedpg_pg_query::NodeRef;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(n, _)| match n {
+            NodeRef::InsertStmt(s) => s.relation.as_ref(),
+            NodeRef::UpdateStmt(s) => s.relation.as_ref(),
+            NodeRef::DeleteStmt(s) => s.relation.as_ref(),
+            NodeRef::MergeStmt(s) => s.relation.as_ref(),
+            _ => None,
+        })
+        .map(|rv| {
+            let rel = typedpg_core::quote_identifier(&rv.relname);
+            if rv.schemaname.is_empty() {
+                rel
+            } else {
+                format!("{}.{rel}", typedpg_core::quote_identifier(&rv.schemaname))
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Run `stmt` in a savepoint rolled back afterwards, with the contents of
+/// `tables` it left (each table's rows as text, sorted) before the
+/// rollback.
+fn run(
+    tx: &mut Transaction<'_>,
+    stmt: &Statement,
+    params: &[&(dyn ToSql + Sync)],
+    tables: &[String],
+) -> (Outcome, Vec<TableContents>) {
+    let mut sp = tx
+        .transaction()
+        .unwrap_or_else(|e| panic!("pg_sanity: SAVEPOINT failed: {e}"));
+    let outcome = run_in(&mut sp, stmt, params);
+    let mut contents = Vec::new();
+    if !matches!(outcome, Outcome::Failed(_)) {
+        for table in tables {
+            let rows = sp
+                .query(&format!("SELECT t::pg_catalog.text FROM {table} AS t"), &[])
+                .map(|rows| {
+                    let mut rows: Vec<Option<String>> = rows.iter().map(|r| r.get(0)).collect();
+                    rows.sort();
+                    rows
+                })
+                .unwrap_or_default();
+            contents.push((table.clone(), rows));
+        }
+    }
+    (outcome, contents)
+}
+
+fn run_in(sp: &mut Transaction<'_>, stmt: &Statement, params: &[&(dyn ToSql + Sync)]) -> Outcome {
+    if stmt.columns().is_empty() {
+        return match sp.execute(stmt, params) {
+            Ok(n) => Outcome::Count(n),
+            Err(e) => Outcome::Failed(super::render_pg_error(&e)),
+        };
+    }
+    let rows = sp
+        .bind(stmt, params)
+        .and_then(|portal| sp.query_portal(&portal, MAX_ROWS + 1));
+    match rows {
+        Ok(rows) if rows.len() > MAX_ROWS as usize => Outcome::Truncated,
+        Ok(rows) => Outcome::Rows(
+            rows.iter()
+                .map(|row| {
+                    (0..row.len())
+                        .map(|i| {
+                            row.try_get::<_, Raw>(i)
+                                .ok()
+                                .and_then(|Raw(raw)| raw.map(<[u8]>::to_vec))
+                        })
+                        .collect()
+                })
+                .collect(),
+        ),
+        Err(e) => Outcome::Failed(super::render_pg_error(&e)),
+    }
+}
+
+/// The output columns the outermost ORDER BY of `sql` sorts by, when
+/// every key is one (`ORDER BY 2`, `ORDER BY name` of an output column):
+/// the order of their values is then the query's own. `None` without an
+/// ORDER BY or with a key that isn't an output column (its ties could come
+/// back in any order).
+fn order_keys(sql: &str, ours: &AnalyzedQuery) -> Option<Vec<usize>> {
+    use typedpg_pg_query::protobuf::{a_const::Val, node::Node as N};
+    let parsed = typedpg_pg_query::parse(sql).ok()?;
+    let Some(N::SelectStmt(select)) = parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_deref()?
+        .node
+        .as_ref()
+    else {
+        return None;
+    };
+    if select.sort_clause.is_empty() {
+        return None;
+    }
+    select
+        .sort_clause
+        .iter()
+        .map(|s| {
+            let Some(N::SortBy(by)) = s.node.as_ref() else {
+                return None;
+            };
+            match by.node.as_deref()?.node.as_ref()? {
+                N::AConst(c) => match &c.val {
+                    Some(Val::Ival(i)) => usize::try_from(i.ival).ok()?.checked_sub(1),
+                    _ => None,
+                },
+                N::ColumnRef(c) => match c.fields.as_slice() {
+                    [f] => {
+                        let Some(N::String(name)) = f.node.as_ref() else {
+                            return None;
+                        };
+                        let mut at = ours
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.name == name.sval);
+                        match (at.next(), at.next()) {
+                            (Some((i, _)), None) => Some(i),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Whether `ty` promises something about the inside of a non-NULL value:

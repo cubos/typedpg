@@ -25,6 +25,9 @@
 //! "public.address" = "crate::Address"                   # composite type
 //! "public.citext" = "String"                            # custom scalar type
 //! "extensions.ltree" = "String"                         # schema-qualified
+//!
+//! [package.metadata.typedpg.simplify]
+//! not_in = false                 # turn one query simplification off (all on by default)
 //! ```
 //!
 //! `[types]` is a single unified map from a PostgreSQL type to the Rust type
@@ -76,9 +79,62 @@ pub struct Config {
     /// Used with `sql!(db = name, ...)` syntax.
     #[serde(default)]
     pub(crate) databases: HashMap<String, DatabaseEntry>,
+    /// Query simplifications: `simplify = false` turns them all off,
+    /// `[simplify]` with `<rule> = false` one by one.
+    #[serde(default)]
+    simplify: SimplifySetting,
     /// Keys no field claims, rejected by [`Config::check_unknown_keys`].
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
+}
+
+/// The query simplifications' configuration keys, one per rule: the
+/// `[package.metadata.typedpg.simplify]` keys (and the TypeScript CLI's
+/// `simplify` object's).
+pub const SIMPLIFY_RULES: &[&str] = &["not_in", "count_exists", "distinct", "union_all", "fk_join"];
+
+/// `simplify = <bool>`, or a `[simplify]` table of `<rule> = <bool>`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum SimplifySetting {
+    All(bool),
+    Rules(BTreeMap<String, bool>),
+}
+
+impl Default for SimplifySetting {
+    fn default() -> Self {
+        SimplifySetting::All(true)
+    }
+}
+
+/// Which query simplifications the `sql!` macro applies: the SQL it sends
+/// is rewritten into an equivalent query PostgreSQL plans better, where the
+/// analysis proves it returns the same rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimplifyConfig {
+    /// `false`: none at all.
+    pub enabled: bool,
+    /// The rules turned off one by one (keys of [`SIMPLIFY_RULES`]).
+    pub disabled: Vec<String>,
+}
+
+impl SimplifySetting {
+    fn resolve(&self) -> SimplifyConfig {
+        match self {
+            SimplifySetting::All(enabled) => SimplifyConfig {
+                enabled: *enabled,
+                disabled: Vec::new(),
+            },
+            SimplifySetting::Rules(rules) => SimplifyConfig {
+                enabled: true,
+                disabled: rules
+                    .iter()
+                    .filter(|(_, on)| !**on)
+                    .map(|(rule, _)| rule.clone())
+                    .collect(),
+            },
+        }
+    }
 }
 
 /// A named database entry for multi-database support.
@@ -446,9 +502,25 @@ impl Config {
     /// Reject keys no field reads, at every level of the configuration.
     fn check_unknown_keys(&self) -> Result<(), ConfigError> {
         const TOP: &str = "package.metadata.typedpg";
-        const TOP_KEYS: &str = "`database`, `migrations`, `types`, `databases`";
+        const TOP_KEYS: &str = "`database`, `migrations`, `types`, `databases`, `simplify`";
         const DATABASE_KEYS: &str = "`migrations`, `extra_migrations`";
         reject_unknown(&self.unknown, LEGACY_TOP_LEVEL_KEYS, TOP, TOP_KEYS)?;
+        if let SimplifySetting::Rules(rules) = &self.simplify
+            && let Some(rule) = rules.keys().find(|r| !SIMPLIFY_RULES.contains(&r.as_str()))
+        {
+            return Err(ConfigError::UnknownKey {
+                section: format!("{TOP}.simplify"),
+                key: rule.clone(),
+                hint: format!(
+                    "expected one of {}",
+                    SIMPLIFY_RULES
+                        .iter()
+                        .map(|r| format!("`{r}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
         reject_unknown(
             &self.database.unknown,
             LEGACY_DATABASE_KEYS,
@@ -500,6 +572,7 @@ impl Config {
                 database: &self.database,
                 migrations: &self.migrations,
                 types: qualify_keys(&self.types, "types")?,
+                simplify: self.simplify.resolve(),
             }),
             Some(name) => {
                 let entry = self
@@ -510,6 +583,7 @@ impl Config {
                     database: &entry.database,
                     migrations: &entry.migrations,
                     types: qualify_keys(&entry.types, "types")?,
+                    simplify: self.simplify.resolve(),
                 })
             }
         }
@@ -531,6 +605,9 @@ pub struct ResolvedConfig<'a> {
     /// Unified type map keyed by qualified PG type name. The `sql!` macro
     /// infers the (de)serialization strategy from each type's kind.
     pub types: HashMap<QualifiedName, String>,
+    /// The query simplifications (the top-level `simplify` setting, for
+    /// every database).
+    pub simplify: SimplifyConfig,
 }
 
 /// Parse type-mapping keys into [`QualifiedName`]s.
@@ -739,7 +816,7 @@ migrations = "./migrations"
         assert_eq!(
             parse_err("[package.metadata.typedpg.type]\nfoo = \"crate::Foo\"\n"),
             "unknown key `type` in [package.metadata.typedpg]: expected one of \
-             `database`, `migrations`, `types`, `databases`"
+             `database`, `migrations`, `types`, `databases`, `simplify`"
         );
         assert_eq!(
             parse_err("[package.metadata.typedpg.database]\nmigration = \"./m\"\n"),
@@ -1158,6 +1235,42 @@ event_data = "crate::EventData"
                 .get(&QualifiedName::new("stats", "metric"))
                 .unwrap(),
             "crate::Metric"
+        );
+    }
+
+    #[test]
+    fn simplify_is_on_by_default_and_can_be_turned_off() {
+        let header = "[package]\nname = \"a\"\n[package.metadata.typedpg]\n";
+        let simplify = |extra: &str| {
+            Config::from_str(&format!("{header}{extra}"))
+                .unwrap()
+                .resolve(None)
+                .unwrap()
+                .simplify
+        };
+        assert_eq!(
+            simplify(""),
+            SimplifyConfig {
+                enabled: true,
+                disabled: vec![]
+            }
+        );
+        assert!(!simplify("simplify = false\n").enabled);
+        assert_eq!(
+            simplify("[package.metadata.typedpg.simplify]\nnot_in = false\nfk_join = true\n"),
+            SimplifyConfig {
+                enabled: true,
+                disabled: vec!["not_in".into()]
+            }
+        );
+        let err = Config::from_str(&format!(
+            "{header}[package.metadata.typedpg.simplify]\nnot_inn = false\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("unknown key `not_inn` in [package.metadata.typedpg.simplify]"),
+            "{err}"
         );
     }
 }

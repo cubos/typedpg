@@ -411,6 +411,9 @@ pub(crate) fn catalog_for<'c>(
     catalog
         .assume_finite_parameters(&finite)
         .map_err(|e| syn::Error::new(Span::call_site(), e))?;
+    catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
+        &resolved.simplify,
+    ));
     let missing: Vec<String> = all_dirs
         .iter()
         .filter(|d| !d.is_dir())
