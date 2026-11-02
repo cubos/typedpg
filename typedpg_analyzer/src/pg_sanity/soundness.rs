@@ -98,7 +98,18 @@ const UNSAFE_CALLS: &[&str] = &[
     "pg_wal_replay",
     "pg_import_system_collations",
     "pg_create_restore_point",
+    // Contrib extensions' (PG 18.6's volatile members, from pg_proc):
+    // dblink and postgres_fdw open, close and use connections to servers;
+    // the rest write shared state no rollback undoes, or reach files.
     "dblink",
+    "postgres_fdw_",
+    "pg_stat_statements_reset",
+    "pg_buffercache_evict",
+    "heap_force_",
+    "pg_truncate_visibility_map",
+    "pg_prewarm",
+    "autoprewarm_",
+    "xslt_process",
 ];
 
 /// The cumulative scenarios, in order: name and seeding mode (0 = none).
