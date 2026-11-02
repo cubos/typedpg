@@ -24,37 +24,54 @@
 #   ./update_extensions.sh              # the release libpg_query pins (default)
 #   ./update_extensions.sh REL_18_6     # use a specific tag/branch
 #
-# Output: typedpg_analyzer/src/extensions/*.sql
+# Output: typedpg_analyzer/src/extensions/*.sql. Every file is downloaded
+# into a temporary directory first; the bundled files are replaced only once
+# all downloads succeeded, so a failure leaves them untouched.
 #
 # After running:
 # 1. Review the downloaded files for pg_query compatibility
-#    (remove \echo/\quit, check for reserved-word parameter names)
-# 2. Update the REGISTRY array in typedpg_analyzer/src/ddl/extensions.rs
-#    to include_str! the new files in order
-# 3. Run: cargo test -p typedpg_analyzer --test ddl_tests
+#    (check for reserved-word parameter names)
+# 2. Update the REGISTRY array in
+#    typedpg_analyzer/src/ddl/extensions/registry.rs to include_str! the new
+#    files in order, with each control file's default_version
+# 3. Run: cargo nextest run --release -p typedpg_analyzer
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# `#define PG_VERSION "18.6"` -> REL_18_6.
-PG_VERSION=$(sed -n 's/^#define PG_VERSION "\(.*\)"$/\1/p' typedpg_pg_query/libpg_query/pg_query.h)
-BRANCH="${1:-REL_${PG_VERSION//./_}}"
+if [[ $# -ge 1 ]]; then
+    BRANCH="$1"
+else
+    # `#define PG_VERSION "18.6"` -> REL_18_6, the tag format of every
+    # release since PostgreSQL 10 (REL_<major>_<minor>).
+    PG_VERSION=$(tr -d '\r' < typedpg_pg_query/libpg_query/pg_query.h \
+        | sed -n 's/^[[:space:]]*#[[:space:]]*define[[:space:]]\{1,\}PG_VERSION[[:space:]]\{1,\}"\([^"]*\)"[[:space:]]*$/\1/p')
+    if [[ ! "$PG_VERSION" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        echo "error: cannot derive a release tag from PG_VERSION \"${PG_VERSION}\" in" \
+            "typedpg_pg_query/libpg_query/pg_query.h; pass the tag explicitly" >&2
+        exit 1
+    fi
+    BRANCH="REL_${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"
+fi
 BASE_URL="https://raw.githubusercontent.com/postgres/postgres/${BRANCH}"
 OUT_DIR="typedpg_analyzer/src/extensions"
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-download() {
-    local contrib_path="$1"
+# Download `url` into the temporary directory as `outfile`, without the
+# psql-only \echo and \quit lines. Any failure aborts the script.
+fetch() {
+    local url="$1"
     local outfile="$2"
 
     echo "  ${outfile}..."
-    if curl -sfL "${BASE_URL}/contrib/${contrib_path}" -o /tmp/ext_tmp.sql; then
-        # Strip \echo and \quit lines (psql-specific, not valid SQL)
-        grep -v '^\\\(echo\|quit\)' /tmp/ext_tmp.sql > "${OUT_DIR}/${outfile}" || true
-    else
-        echo "    WARNING: Failed to download contrib/${contrib_path}"
-        return 1
+    if ! curl -sfL "$url" -o "${TMP_DIR}/raw.sql"; then
+        echo "error: failed to download ${url}" >&2
+        exit 1
     fi
+    grep -v '^\\\(echo\|quit\)' "${TMP_DIR}/raw.sql" > "${TMP_DIR}/${outfile}" || true
+    rm -f "${TMP_DIR}/raw.sql"
 }
 
 # Helper: download files for an extension from contrib/<subdir>/
@@ -62,15 +79,12 @@ download_ext() {
     local subdir="$1"
     shift
     for file in "$@"; do
-        download "${subdir}/${file}" "$file"
+        fetch "${BASE_URL}/contrib/${subdir}/${file}" "$file"
     done
 }
 
 echo "==> Downloading extension SQL files from postgres/${BRANCH}..."
 echo "    Target: ${OUT_DIR}/"
-
-# ── Clean output directory ──────────────────────────────────────────────────
-rm -f "${OUT_DIR}"/*.sql
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Extensions (alphabetical order)
@@ -364,24 +378,16 @@ download_ext "xml2" \
     "xml2--1.1--1.2.sql"
 
 echo -e "\n--- plpgsql (1.0, src/pl/plpgsql) ---"
-echo "  plpgsql--1.0.sql..."
-if curl -sfL "${BASE_URL}/src/pl/plpgsql/src/plpgsql--1.0.sql" -o /tmp/ext_tmp.sql; then
-    grep -v '^\\\(echo\|quit\)' /tmp/ext_tmp.sql > "${OUT_DIR}/plpgsql--1.0.sql" || true
-else
-    echo "    WARNING: Failed to download plpgsql"
-fi
+fetch "${BASE_URL}/src/pl/plpgsql/src/plpgsql--1.0.sql" "plpgsql--1.0.sql"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Third-party extensions
 # ═══════════════════════════════════════════════════════════════════════════
 
 echo -e "\n--- vector / pgvector (0.8.2) ---"
-download_url="https://raw.githubusercontent.com/pgvector/pgvector/v0.8.2/sql/vector.sql"
-echo "  vector--0.8.2.sql..."
-if curl -sfL "${download_url}" -o /tmp/ext_tmp.sql; then
-    grep -v '^\\\(echo\|quit\)' /tmp/ext_tmp.sql > "${OUT_DIR}/vector--0.8.2.sql" || true
-else
-    echo "    WARNING: Failed to download pgvector base install"
-fi
+fetch "https://raw.githubusercontent.com/pgvector/pgvector/v0.8.2/sql/vector.sql" \
+    "vector--0.8.2.sql"
 
-rm -f /tmp/ext_tmp.sql
+# ── Every download succeeded: replace the bundled files ────────────────────
+rm -f "${OUT_DIR}"/*.sql
+mv "${TMP_DIR}"/*.sql "${OUT_DIR}/"
