@@ -254,6 +254,8 @@ pub(super) fn add_foreign_key(
             "referenced relation \"{target_name}\" is not a table"
         )));
     }
+    // ATAddForeignKeyConstraint: nor a system catalog.
+    crate::ddl::util::check_not_system_class(interp, target)?;
     check_fk_persistence(interp, relid, c)?;
 
     // The referencing columns.

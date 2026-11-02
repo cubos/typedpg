@@ -86,6 +86,8 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             rv.relname
         )));
     }
+    // CreateStatistics: not on a system catalog.
+    super::util::check_not_system_class(interp, relid)?;
     let Some(class) = class else {
         return Ok(());
     };

@@ -65,6 +65,9 @@ pub(super) fn add_inherit(
         }
         None => return Ok(()),
     }
+    // ATExecAddInherit → ATSimplePermissions on the parent: no system
+    // catalog.
+    super::super::util::check_not_system_class(interp, parent)?;
     if is_partition(interp, parent) {
         return Err(DdlError::Parse("cannot inherit from a partition".into()));
     }

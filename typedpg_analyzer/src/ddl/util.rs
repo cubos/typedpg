@@ -149,6 +149,33 @@ pub fn is_temp_relation(interp: &PgCatalog, relid: crate::oid::PgClassOid) -> bo
         && interp.pg_class.get(&relid).map(|c| c.relnamespace) == interp.temp_namespace
 }
 
+/// `permission denied: "r" is a system catalog`
+/// ([`crate::pgmsg::system_catalog_permission_denied`]) as a DDL error.
+pub(crate) fn system_catalog_denied(relname: &str) -> DdlError {
+    DdlError::Parse(
+        crate::pgmsg::system_catalog_permission_denied(relname)
+            .finalize_implicit()
+            .to_string(),
+    )
+}
+
+/// The check PG repeats wherever DDL names a relation: no system catalog
+/// (`IsSystemClass`) unless `allow_system_table_mods` is on.
+pub(crate) fn check_not_system_class(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+) -> Result<(), DdlError> {
+    if interp.is_system_class(relid) && !interp.allow_system_table_mods.get() {
+        let relname = interp
+            .pg_class
+            .get(&relid)
+            .map(|c| c.relname.as_str())
+            .unwrap_or_default();
+        return Err(system_catalog_denied(relname));
+    }
+    Ok(())
+}
+
 /// LookupCreationNamespace: the schema a new object goes in must exist.
 pub fn existing_namespace(interp: &PgCatalog, name: &str) -> Result<PgNamespaceOid, DdlError> {
     interp

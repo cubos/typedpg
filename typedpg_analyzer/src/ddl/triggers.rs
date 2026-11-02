@@ -346,11 +346,7 @@ fn check_relkind(
         RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable => {}
         _ => return err(format!("relation \"{relname}\" cannot have triggers")),
     }
-    if interp.is_system_class(relid) {
-        return err(format!(
-            "permission denied: \"{relname}\" is a system catalog"
-        ));
-    }
+    crate::ddl::util::check_not_system_class(interp, relid)?;
     Ok(())
 }
 
@@ -760,12 +756,7 @@ pub(crate) fn rename_trigger(
                 rv.relname
             )));
         }
-        if interp.is_system_class(relid) {
-            return Err(DdlError::Parse(format!(
-                "permission denied: \"{}\" is a system catalog",
-                rv.relname
-            )));
-        }
+        crate::ddl::util::check_not_system_class(interp, relid)?;
     }
     let Some(trigger) = interp
         .triggers

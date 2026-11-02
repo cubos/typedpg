@@ -100,6 +100,7 @@ fn rename_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), Dd
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
+    renameatt_check(interp, class_oid)?;
     let relname = rv.relname.clone();
 
     // PG (RENAME CONSTRAINT) emits `constraint "x" for table "t" does not
@@ -228,13 +229,6 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
-    // RangeVarCallbackForAlterRelation.
-    if interp.is_system_class(class_oid) {
-        return Err(DdlError::Parse(format!(
-            "permission denied: \"{}\" is a system catalog",
-            rv.relname
-        )));
-    }
     check_alter_relation_kind(
         interp,
         class_oid,
@@ -278,6 +272,29 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     Ok(())
 }
 
+/// renameatt_check (tablecmds.c), from RangeVarCallbackForRenameAttribute
+/// for RENAME COLUMN and RENAME CONSTRAINT alike: not a typed table, a
+/// relation kind with columns, and no system catalog.
+fn renameatt_check(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+    use crate::pg_catalog::RelKind;
+    if interp.typed_tables.contains_key(&relid) {
+        return Err(DdlError::Parse(
+            "cannot rename column of typed table".into(),
+        ));
+    }
+    if let Some(class) = interp.pg_class.get(&relid)
+        && matches!(class.relkind, RelKind::Sequence | RelKind::ToastTable)
+    {
+        return Err(DdlError::Parse(format!(
+            "cannot rename columns of relation \"{}\" (This operation is not supported for \
+             {}.)",
+            class.relname,
+            class.relkind.plural()
+        )));
+    }
+    crate::ddl::util::check_not_system_class(interp, relid)
+}
+
 fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -288,12 +305,7 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
         Err(e) => return Err(e),
     };
 
-    // renameatt_check / find_typed_table_dependencies.
-    if interp.typed_tables.contains_key(&relid) {
-        return Err(DdlError::Parse(
-            "cannot rename column of typed table".into(),
-        ));
-    }
+    renameatt_check(interp, relid)?;
     let cascade = stmt.behavior == typedpg_pg_query::protobuf::DropBehavior::DropCascade as i32;
     let typed = crate::ddl::tables::typed::typed_table_dependents(interp, relid, cascade)?;
     rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, 0)?;
@@ -475,9 +487,9 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
     }
 }
 
-/// RangeVarCallbackForAlterRelation (tablecmds.c): the relation kinds an
-/// `ALTER {TABLE | VIEW | ...}` may name, and those SET SCHEMA can't move
-/// on their own.
+/// RangeVarCallbackForAlterRelation (tablecmds.c): no system catalog, then
+/// the relation kinds an `ALTER {TABLE | VIEW | ...}` may name, and those
+/// SET SCHEMA can't move on their own.
 fn check_alter_relation_kind(
     interp: &PgCatalog,
     relid: PgClassOid,
@@ -485,6 +497,7 @@ fn check_alter_relation_kind(
     set_schema: bool,
 ) -> Result<(), DdlError> {
     use crate::pg_catalog::RelKind;
+    crate::ddl::util::check_not_system_class(interp, relid)?;
     let Some(class) = interp.pg_class.get(&relid) else {
         return Ok(());
     };

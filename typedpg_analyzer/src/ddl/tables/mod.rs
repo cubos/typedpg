@@ -1175,12 +1175,7 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     };
     // RangeVarCallbackForAlterRelation: no system catalog; ALTER TABLE
     // doesn't reach a composite type, and ALTER TYPE only reaches one.
-    if interp.is_system_class(class_oid) {
-        return Err(DdlError::Parse(format!(
-            "permission denied: \"{}\" is a system catalog",
-            rv.relname
-        )));
-    }
+    crate::ddl::util::check_not_system_class(interp, class_oid)?;
     let relkind = interp.pg_class.get(&class_oid).map(|c| c.relkind);
     super::indexes::check_alter_relation_kind(stmt.objtype, relkind, &rv.relname)?;
     let via_alter_type = typedpg_pg_query::protobuf::ObjectType::try_from(stmt.objtype)

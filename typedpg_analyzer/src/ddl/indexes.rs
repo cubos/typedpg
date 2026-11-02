@@ -29,6 +29,9 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     };
     // DefineIndex: the table must exist and be indexable.
     let (nsoid, indrelid) = super::util::lookup_relation(db, rv)?;
+    // RangeVarCallbackOwnsRelation, as the table is looked up: no system
+    // catalog.
+    super::util::check_not_system_class(db, indrelid)?;
     let table_name = rv.relname.clone();
     if let Some(class) = db.pg_class.get(&indrelid) {
         let kinds = match class.relkind {

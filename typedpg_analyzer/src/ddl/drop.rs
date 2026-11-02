@@ -269,11 +269,7 @@ fn drop_relation(
         )));
     }
     // RangeVarCallbackForDropRelation.
-    if interp.is_system_class(class_oid) {
-        return Err(DdlError::Parse(format!(
-            "permission denied: \"{name}\" is a system catalog"
-        )));
-    }
+    crate::ddl::util::check_not_system_class(interp, class_oid)?;
     // findDependentObjects checks first that the relation may be dropped
     // at all: not part of another object (an identity column's sequence,
     // an extension's member).
@@ -736,6 +732,17 @@ fn drop_index(
     ) {
         return Err(DdlError::DependencyError(format!(
             "\"{name}\" is not an index"
+        )));
+    }
+    // RangeVarCallbackForDropRelation: a system catalog's index stays.
+    crate::ddl::util::check_not_system_class(interp, class_oid)?;
+    // findDependentObjects: a pinned one (allow_system_table_mods let it
+    // through) is required by the database system, before any constraint
+    // that owns it.
+    if super::depend::is_pinned(super::depend::ObjectAddress::relation(class_oid)) {
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop index {} because it is required by the database system",
+            super::depend::relation_display_name(interp, class_oid)
         )));
     }
 
