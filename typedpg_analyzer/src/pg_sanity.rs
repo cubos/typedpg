@@ -281,6 +281,9 @@ impl PgSanityServer {
                 )
             });
         }
+        // A type renamed or moved to another schema keeps its OID: the
+        // names cached for the old catalog may be stale.
+        self.type_name_cache.clear();
         self.soundness.schema_changed();
         pg_result
     }

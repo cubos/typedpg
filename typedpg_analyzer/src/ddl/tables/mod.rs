@@ -1308,6 +1308,14 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
             _ => None,
         })
         .collect();
+    // ATPrepCmd: every ALTER COLUMN TYPE transforms its USING expression in
+    // the prep phase, in statement order, against the table as it is
+    // before any pass executes.
+    for cmd in &cmds {
+        if cmd.subtype == AlterTableType::AtAlterColumnType as i32 {
+            columns::prep_alter_column_using(interp, class_oid, cmd)?;
+        }
+    }
     cmds.sort_by_key(|cmd| alter_table_pass(cmd));
     // ATExecAlterColumnType: a column's type changes once per statement.
     let mut retyped: Vec<String> = Vec::new();
