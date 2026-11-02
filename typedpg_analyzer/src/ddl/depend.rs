@@ -1338,6 +1338,18 @@ fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), 
                         super::views::drop_views(interp, &[relid]);
                     }
                     Some(RelKind::Index | RelKind::PartitionedIndex) => {
+                        // Its partitions' indexes are part of it
+                        // (DEPENDENCY_PARTITION_PRI) and go first.
+                        let mut children: Vec<PgClassOid> = interp
+                            .index_parents
+                            .iter()
+                            .filter(|&(_, &parent)| parent == relid)
+                            .map(|(&child, _)| child)
+                            .collect();
+                        children.sort();
+                        for child in children {
+                            delete_object(interp, ObjectAddress::relation(child))?;
+                        }
                         let table = interp.pg_index.get(&relid).map(|i| i.indrelid);
                         let name = interp.pg_class.get(&relid).map(|c| c.relname.clone());
                         interp.remove_pg_index(relid);

@@ -687,3 +687,31 @@ fn drop_extension_and_the_marks_of_rebuilt_and_partition_objects() {
         "relation \"j\" does not exist",
     );
 }
+
+#[test]
+fn drop_extension_takes_a_marked_partitioned_index_with_its_partitions_indexes() {
+    // A partition's index is part of its parent's (DEPENDENCY_PARTITION_PRI):
+    // with only the parent marked DEPENDS ON EXTENSION, DROP EXTENSION drops
+    // the clones too. (Checked by hand against PostgreSQL 18.6, CREATE
+    // EXTENSION leaving the pg_sanity mirror out.)
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION hstore;
+         CREATE TABLE p (a int, b int) PARTITION BY RANGE (a);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (2) PARTITION BY RANGE (a);
+         CREATE TABLE p11 PARTITION OF p1 FOR VALUES FROM (1) TO (2);
+         CREATE INDEX pi ON p (b);
+         ALTER INDEX pi DEPENDS ON EXTENSION hstore;
+         DROP EXTENSION hstore;",
+    )]);
+    for index in ["pi", "p1_b_idx", "p11_b_idx"] {
+        let sql = format!("ALTER INDEX {index} RENAME TO x;");
+        let err = db.apply_sql(&sql).expect_err(&sql);
+        assert!(
+            err.to_string()
+                .starts_with(&format!("relation \"{index}\" does not exist")),
+            "{sql}\n  got: {err}"
+        );
+    }
+    db.apply_sql("CREATE INDEX pi ON p (b);").unwrap();
+}
