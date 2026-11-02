@@ -7494,6 +7494,79 @@ fn ddl_refuses_a_system_catalog() {
 }
 
 #[test]
+fn allow_system_table_mods_lets_ddl_reach_a_system_catalog() {
+    // Every `!allowSystemTableMods && IsSystemClass` refusal gives way
+    // once a superuser turns the GUC on: SET LOCAL for the rest of the
+    // transaction, SET until RESET / SET ... TO DEFAULT / set_config.
+    let denied = "permission denied: \"pg_trigger\" is a system catalog";
+    let index = "CREATE INDEX ON pg_catalog.pg_trigger (tgname);";
+    let local = "SET LOCAL allow_system_table_mods = on;
+                 CREATE INDEX ON pg_catalog.pg_trigger (tgname);
+                 CREATE STATISTICS ON tgname, tgrelid FROM pg_catalog.pg_trigger;
+                 ALTER TABLE pg_catalog.pg_trigger SET (fillfactor = 50);
+                 CREATE TABLE r (a oid REFERENCES pg_catalog.pg_class (oid));
+                 TRUNCATE pg_catalog.pg_largeobject;
+                 CREATE POLICY p ON pg_catalog.pg_description USING (true);";
+    // SET LOCAL ends with the migration's transaction.
+    let err = try_apply(&[("0001.sql", local), ("0002.sql", index)]).expect_err(index);
+    assert!(err.to_string().starts_with(denied), "got: {err}");
+
+    for reset in [
+        "RESET allow_system_table_mods;",
+        "SET allow_system_table_mods TO DEFAULT;",
+        "SELECT set_config('allow_system_table_mods', 'off', false);",
+    ] {
+        let on = "SET allow_system_table_mods = on;
+                  ALTER TABLE pg_catalog.pg_trigger SET SCHEMA public;
+                  ALTER TABLE public.pg_trigger SET SCHEMA pg_catalog;";
+        let err = try_apply(&[
+            ("0001.sql", on),
+            ("0002.sql", index),
+            ("0003.sql", reset),
+            ("0004.sql", index),
+        ])
+        .expect_err(reset);
+        assert!(err.to_string().starts_with(denied), "{reset}\n  got: {err}");
+    }
+    build_db(&[
+        (
+            "0001.sql",
+            "SELECT set_config('allow_system_table_mods', 'on', true);",
+        ),
+        // set_config(..., true) is SET LOCAL: it lapsed; SET turns it on.
+        ("0002.sql", "SET allow_system_table_mods = on;"),
+        ("0003.sql", index),
+    ]);
+
+    // What isn't a system catalog check stays: renameatt_check's relation
+    // kinds, and a pinned relation is required by the database system.
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE pg_toast.pg_toast_2620 RENAME COLUMN chunk_id TO x;",
+            "cannot rename columns of relation \"pg_toast_2620\"",
+        ),
+        (
+            "DROP TABLE pg_catalog.pg_trigger;",
+            "cannot drop table pg_trigger because it is required by the database system",
+        ),
+        (
+            "DROP INDEX pg_catalog.pg_trigger_oid_index;",
+            "cannot drop index pg_trigger_oid_index because it is required by the database \
+             system",
+        ),
+        (
+            "DROP INDEX pg_catalog.pg_class_tblspc_relfilenode_index;",
+            "cannot drop index pg_class_tblspc_relfilenode_index because it is required by \
+             the database system",
+        ),
+    ] {
+        let sql = format!("SET LOCAL allow_system_table_mods = on; {stmt}");
+        let err = try_apply(&[("0001.sql", &sql)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
 fn copy_from_refuses_generated_columns_and_views_without_a_trigger() {
     // CopyGetAttnums refuses generated columns; CopyFrom takes a view only
     // through an INSTEAD OF INSERT trigger.

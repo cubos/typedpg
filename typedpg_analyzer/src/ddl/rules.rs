@@ -300,9 +300,7 @@ fn define_query_rewrite(
         .get(&relid)
         .map(|c| c.relname.clone())
         .unwrap_or_default();
-    if interp.is_system_class(relid) {
-        return Err(crate::ddl::util::system_catalog_denied(&relname));
-    }
+    crate::ddl::util::check_not_system_class(interp, relid)?;
     let unsupported = |msg: &str| Err(DdlError::UnsupportedDdl(msg.to_owned()));
     if event == CmdType::CmdSelect {
         let [action] = stmt.actions.as_slice() else {
@@ -695,9 +693,7 @@ pub(crate) fn rename_rule(
             rv.relname
         )));
     }
-    if interp.is_system_class(relid) {
-        return Err(crate::ddl::util::system_catalog_denied(&rv.relname));
-    }
+    crate::ddl::util::check_not_system_class(interp, relid)?;
     let is_view = relkind == Some(RelKind::View);
     let exists = |interp: &PgCatalog, name: &str| {
         (is_view && name == VIEW_SELECT_RULE_NAME)

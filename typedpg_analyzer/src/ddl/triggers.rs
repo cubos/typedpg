@@ -346,9 +346,7 @@ fn check_relkind(
         RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable => {}
         _ => return err(format!("relation \"{relname}\" cannot have triggers")),
     }
-    if interp.is_system_class(relid) {
-        return Err(crate::ddl::util::system_catalog_denied(relname));
-    }
+    crate::ddl::util::check_not_system_class(interp, relid)?;
     Ok(())
 }
 
@@ -758,9 +756,7 @@ pub(crate) fn rename_trigger(
                 rv.relname
             )));
         }
-        if interp.is_system_class(relid) {
-            return Err(crate::ddl::util::system_catalog_denied(&rv.relname));
-        }
+        crate::ddl::util::check_not_system_class(interp, relid)?;
     }
     let Some(trigger) = interp
         .triggers

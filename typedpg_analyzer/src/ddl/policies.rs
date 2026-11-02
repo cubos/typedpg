@@ -37,9 +37,7 @@ fn policy_command(cmd_name: &str) -> char {
 /// tables, and not on system catalogs.
 fn policy_table(interp: &PgCatalog, rv: &RangeVar) -> Result<PgClassOid, DdlError> {
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
-    if interp.is_system_class(relid) {
-        return Err(crate::ddl::util::system_catalog_denied(&rv.relname));
-    }
+    crate::ddl::util::check_not_system_class(interp, relid)?;
     let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
     if !matches!(relkind, Some(RelKind::Table | RelKind::Partitioned)) {
         return Err(DdlError::UnsupportedDdl(format!(

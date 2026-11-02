@@ -160,12 +160,12 @@ pub(crate) fn system_catalog_denied(relname: &str) -> DdlError {
 }
 
 /// The check PG repeats wherever DDL names a relation: no system catalog
-/// (`IsSystemClass`) without `allow_system_table_mods`.
+/// (`IsSystemClass`) unless `allow_system_table_mods` is on.
 pub(crate) fn check_not_system_class(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
 ) -> Result<(), DdlError> {
-    if interp.is_system_class(relid) {
+    if interp.is_system_class(relid) && !interp.allow_system_table_mods.get() {
         let relname = interp
             .pg_class
             .get(&relid)

@@ -271,6 +271,9 @@ pub struct PgCatalog {
     pub(crate) generated_refs: Shared<HashMap<(PgClassOid, i16), Vec<i16>>>,
     /// The `check_function_bodies` GUC (pg_dump output turns it off).
     pub(crate) check_function_bodies: crate::ddl::session::BoolGuc,
+    /// The `allow_system_table_mods` GUC: a superuser may then run DDL on
+    /// a system catalog.
+    pub(crate) allow_system_table_mods: crate::ddl::session::BoolGuc,
     /// The migration set `constraint_exclusion` or `plan_cache_mode`: the
     /// planner may then prove more relations empty, or plan an EXECUTE
     /// generically, than the defaults the plan-time checks assume.
@@ -720,6 +723,7 @@ impl PgCatalog {
             attr_default_exprs: HashMap::new(),
             generated_refs: Shared::default(),
             check_function_bodies: crate::ddl::session::BoolGuc::new(true),
+            allow_system_table_mods: crate::ddl::session::BoolGuc::new(false),
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),

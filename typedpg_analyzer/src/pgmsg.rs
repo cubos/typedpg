@@ -1905,6 +1905,7 @@ mod tests {
             (insert_non_default_into_generated("g", false).kind, "428C9"),
             (update_generated_to_non_default("g", true).kind, "428C9"),
             (infinite_rule_recursion("t").kind, "42P17"),
+            (system_catalog_permission_denied("t").kind, "42501"),
             (cannot_change_relation("sequence", "s").kind, "42809"),
             (any_all_operator_not_boolean(None).kind, "42809"),
             (row_comparison_operator_not_boolean("integer"), "42804"),

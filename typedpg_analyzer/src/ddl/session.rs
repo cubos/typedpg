@@ -1,5 +1,5 @@
-//! Session state set by migrations: the `search_path` and
-//! `check_function_bodies` GUCs, and the
+//! Session state set by migrations: the `search_path`,
+//! `check_function_bodies` and `allow_system_table_mods` GUCs, and the
 //! session's user identity (`SET ROLE`, `SET SESSION AUTHORIZATION`), which
 //! `$user` in the search path names.
 //!
@@ -310,9 +310,21 @@ impl PgCatalog {
         self.search_path = resolved;
     }
 
+    /// The boolean GUC the session tracks by that name, if any.
+    fn bool_guc_mut(&mut self, name: &str) -> Option<&mut BoolGuc> {
+        if name.eq_ignore_ascii_case("check_function_bodies") {
+            Some(&mut self.check_function_bodies)
+        } else if name.eq_ignore_ascii_case("allow_system_table_mods") {
+            Some(&mut self.allow_system_table_mods)
+        } else {
+            None
+        }
+    }
+
     /// End of the current transaction: `SET LOCAL` values lapse.
     pub(crate) fn end_transaction_scope(&mut self) {
         self.check_function_bodies.local = None;
+        self.allow_system_table_mods.local = None;
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
             self.refresh_search_path();
@@ -418,6 +430,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     if kind == VariableSetKind::VarResetAll {
         interp.set_search_path(None, false);
         interp.check_function_bodies = BoolGuc::new(true);
+        interp.allow_system_table_mods = BoolGuc::new(false);
         return Ok(());
     }
     // The parameter must exist and be settable, and a new value valid.
@@ -439,17 +452,17 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     {
         interp.planner_settings_changed = true;
     }
-    if stmt.name.eq_ignore_ascii_case("check_function_bodies") {
+    if let Some(guc) = interp.bool_guc_mut(&stmt.name) {
         match kind {
             VariableSetKind::VarSetValue => {
                 if let [arg] = stmt.args.as_slice()
                     && let Some(value) = const_arg_string(arg).and_then(|v| parse_bool(&v))
                 {
-                    interp.check_function_bodies.set(Some(value), stmt.is_local);
+                    guc.set(Some(value), stmt.is_local);
                 }
             }
             VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
-                interp.check_function_bodies.set(None, stmt.is_local);
+                guc.set(None, stmt.is_local);
             }
             _ => {}
         }
@@ -585,10 +598,13 @@ pub(crate) fn select_side_effects(
         if let Some((value, is_local)) = constant_named_set_config(fc, "search_path") {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
         }
-        if let Some((value, is_local)) = constant_named_set_config(fc, "check_function_bodies")
-            && let Some(value) = parse_bool(&value)
-        {
-            interp.check_function_bodies.set(Some(value), is_local);
+        for name in ["check_function_bodies", "allow_system_table_mods"] {
+            if let Some((value, is_local)) = constant_named_set_config(fc, name)
+                && let Some(value) = parse_bool(&value)
+                && let Some(guc) = interp.bool_guc_mut(name)
+            {
+                guc.set(Some(value), is_local);
+            }
         }
     }
     Ok(())
