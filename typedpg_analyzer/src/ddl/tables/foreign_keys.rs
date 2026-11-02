@@ -71,7 +71,7 @@ fn check_referenced_attrs(
     target_name: &str,
     attnums: &[i16],
     with_period: bool,
-) -> Result<bool, DdlError> {
+) -> Result<(bool, Option<PgClassOid>), DdlError> {
     for (i, a) in attnums.iter().enumerate() {
         if attnums[i + 1..].contains(a) {
             return Err(DdlError::Parse(
@@ -114,7 +114,7 @@ fn check_referenced_attrs(
             found_deferrable = true;
             continue;
         }
-        return Ok(index.indisexclusion);
+        return Ok((index.indisexclusion, Some(index.indexrelid)));
     }
     // Constraint-backed keys, for catalogs whose constraints carry no
     // pg_index row.
@@ -131,7 +131,7 @@ fn check_referenced_attrs(
                     == wanted
         })
     {
-        return Ok(false);
+        return Ok((false, None));
     }
     Err(if found_deferrable {
         DdlError::Parse(format!(
@@ -281,6 +281,9 @@ pub(super) fn add_foreign_key(
 
     // The referenced columns: the primary key's, or the named ones.
     let pk_names_given = node_names(&c.pk_attrs);
+    // The referenced index (`conindid`): the primary key's, or the first by
+    // OID matching the named columns (transformFkeyCheckAttrs).
+    let conindid: Option<PgClassOid>;
     let (pk, pk_names, pk_has_without_overlaps) = if pk_names_given.is_empty() {
         // transformFkeyGetPrimaryKey.
         let mut primaries: Vec<&PgIndex> = interp
@@ -289,6 +292,7 @@ pub(super) fn add_foreign_key(
             .filter(|i| i.indrelid == target && i.indisprimary)
             .collect();
         primaries.sort_by_key(|i| i.indexrelid);
+        conindid = primaries.first().map(|i| i.indexrelid);
         let (attnums, without_overlaps) = match primaries.first() {
             Some(index) => {
                 if interp.nonimmediate_indexes.contains(&index.indexrelid) {
@@ -349,8 +353,9 @@ pub(super) fn add_foreign_key(
             ));
         }
         let attnums: Vec<i16> = typed.iter().map(|(an, _)| *an).collect();
-        let without_overlaps =
+        let (without_overlaps, index) =
             check_referenced_attrs(interp, target, &target_name, &attnums, with_period)?;
+        conindid = index;
         (typed, pk_names_given, without_overlaps)
     };
     if pk_has_without_overlaps && !with_period {
@@ -435,7 +440,9 @@ pub(super) fn add_foreign_key(
             c.initially_valid
         };
     }
-    interp.fk_details.insert(oid, FkDetails::of(c));
+    let mut details = FkDetails::of(c);
+    details.index = conindid;
+    interp.fk_details.insert(oid, details);
     // ATAddForeignKeyConstraint: the referenced side first, then the
     // referencing one.
     recurse_referenced(interp, oid, &conname)?;
@@ -505,6 +512,19 @@ fn add_referenced_partition_row(
     });
     if let Some(mut details) = interp.fk_details.get(&parent_con).cloned() {
         details.parent = Some(parent_con);
+        details.index = details.index.and_then(|index| {
+            interp
+                .index_parents
+                .iter()
+                .find(|(child, p)| {
+                    **p == index
+                        && interp
+                            .pg_index
+                            .get(child)
+                            .is_some_and(|i| i.indrelid == part)
+                })
+                .map(|(child, _)| *child)
+        });
         interp.fk_details.insert(oid, details);
     }
     recurse_referenced(interp, oid, base)
@@ -575,6 +595,11 @@ pub(crate) struct FkDetails {
     deferrable: bool,
     initdeferred: bool,
     pub(crate) parent: Option<PgConstraintOid>,
+    /// `conindid`: the referenced table's unique index the key relies on
+    /// (and depends on), chosen when it was created; a clone's is its
+    /// parent's, a row derived for a referenced partition the partition's
+    /// copy of it. `None` for a catalog without index rows.
+    pub(crate) index: Option<PgClassOid>,
 }
 
 impl FkDetails {
@@ -614,6 +639,7 @@ impl FkDetails {
             deferrable: c.deferrable,
             initdeferred: c.initdeferred,
             parent: None,
+            index: None,
         }
     }
 
@@ -725,7 +751,14 @@ fn attach_or_clone(
         })
         .cloned()
         .collect();
-    candidates.sort_by_key(|c| c.oid);
+    // tryAttachPartitionForeignKey takes the partition's keys from its
+    // foreign-key list: by name (the relcache list's index order).
+    candidates.sort_by(|a, b| {
+        a.conname
+            .as_bytes()
+            .cmp(b.conname.as_bytes())
+            .then(a.oid.cmp(&b.oid))
+    });
     for candidate in candidates {
         if candidate.conenforced != parent.conenforced {
             return Err(DdlError::Parse(format!(
@@ -768,6 +801,7 @@ fn attach_or_clone(
             deferrable: false,
             initdeferred: false,
             parent: None,
+            index: None,
         });
         details.parent = Some(parent_con);
         interp.fk_details.insert(candidate.oid, details);
@@ -823,15 +857,37 @@ pub(super) fn clone_parent_fks(
     // tracking a position bumped by every write to a constraint row.
     fks.sort_by_key(|c| c.oid);
     let oids: Vec<PgConstraintOid> = fks.iter().map(|c| c.oid).collect();
-    for fk in &fks {
-        if fk.confrelid == Some(part) {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "cannot attach table \"{}\" as a partition because it is referenced by foreign \
-                 key \"{}\"",
-                relname_of(interp, part),
-                fk.conname
-            )));
-        }
+    // ATExecAttachPartition walks the table's foreign-key list (relcache,
+    // by name: the pg_constraint index on conrelid, contypid, conname).
+    let mut by_name: Vec<&PgConstraint> = fks.iter().collect();
+    by_name.sort_by(|a, b| {
+        a.conname
+            .as_bytes()
+            .cmp(b.conname.as_bytes())
+            .then(a.oid.cmp(&b.oid))
+    });
+    if let Some(fk) = by_name.iter().find(|fk| fk.confrelid == Some(part)) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot attach table \"{}\" as a partition because it is referenced by foreign key \
+             \"{}\"",
+            relname_of(interp, part),
+            fk.conname
+        )));
+    }
+    // Cloning a key that references one of the partition's own partitions
+    // (CloneFkReferencing → CheckTableNotInUse) finds that one already open
+    // as the referenced table.
+    let below = super::inherit::all_inheritors(interp, part);
+    if let Some(target) = fks
+        .iter()
+        .filter_map(|fk| fk.confrelid)
+        .find(|r| *r != part && below.contains(r))
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot ALTER TABLE \"{}\" because it is being used by active queries in this \
+             session",
+            relname_of(interp, target)
+        )));
     }
     // CloneFkReferencing: not a constraint whose parent is cloned too (the
     // rows derived for referenced partitions).
@@ -917,6 +973,30 @@ pub(crate) fn fks_relying_on(
     key: &std::collections::BTreeSet<i16>,
     index: PgClassOid,
 ) -> Vec<PgConstraintOid> {
+    // A key whose referenced index is recorded relies on that one alone.
+    let recorded = |c: &PgConstraint| {
+        interp
+            .fk_details
+            .get(&c.oid)
+            .and_then(|d| d.index)
+            .filter(|i| interp.pg_index.contains_key(i))
+    };
+    let top_level = |c: &PgConstraint| {
+        c.contype == ConType::ForeignKey
+            && c.confrelid == Some(relid)
+            && interp
+                .fk_details
+                .get(&c.oid)
+                .is_none_or(|d| d.parent.is_none())
+    };
+    let mut fks: Vec<PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| top_level(c) && recorded(c) == Some(index))
+        .map(|c| c.oid)
+        .collect();
+    // The others (no index recorded): by their columns, when no other
+    // unique index covers them.
     let covers = |i: &crate::pg_catalog::PgIndex| {
         i.indrelid == relid
             && i.indisunique
@@ -928,31 +1008,27 @@ pub(crate) fn fks_relying_on(
                 .collect::<std::collections::BTreeSet<_>>()
                 == *key
     };
-    if interp
+    if !interp
         .pg_index
         .values()
         .any(|i| i.indexrelid != index && covers(i))
     {
-        return Vec::new();
+        fks.extend(
+            interp
+                .pg_constraint
+                .values()
+                .filter(|c| {
+                    top_level(c)
+                        && recorded(c).is_none()
+                        && c.confkey
+                            .iter()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            == *key
+                })
+                .map(|c| c.oid),
+        );
     }
-    let mut fks: Vec<PgConstraintOid> = interp
-        .pg_constraint
-        .values()
-        .filter(|c| {
-            c.contype == ConType::ForeignKey
-                && c.confrelid == Some(relid)
-                && c.confkey
-                    .iter()
-                    .copied()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    == *key
-                && interp
-                    .fk_details
-                    .get(&c.oid)
-                    .is_none_or(|d| d.parent.is_none())
-        })
-        .map(|c| c.oid)
-        .collect();
     fks.sort();
     fks
 }

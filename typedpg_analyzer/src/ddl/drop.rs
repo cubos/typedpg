@@ -372,8 +372,14 @@ fn drop_relation_oid(
         current = parent;
     }
     // Its partitions go with it (their DEPENDENCY_AUTO on it), and their
-    // foreign keys with them.
-    let going = crate::ddl::tables::inherit::all_inheritors(interp, class_oid);
+    // foreign keys with them — as do the whole trees of what the DROP
+    // names (a partition dropped with its parent: its siblings too).
+    let going: Vec<PgClassOid> = named_relations
+        .iter()
+        .copied()
+        .chain(std::iter::once(class_oid))
+        .flat_map(|r| crate::ddl::tables::inherit::all_inheritors(interp, r))
+        .collect();
     let dependent_fks: Vec<(crate::pg_catalog::PgConstraint, String)> = interp
         .pg_constraint
         .values()

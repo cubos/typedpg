@@ -1307,20 +1307,37 @@ pub(crate) fn drop_constraint(
             .get(&oid)
             .map(|c| c.conkey.iter().copied().collect())
             .unwrap_or_default();
-        let dependent: Option<String> = interp.pg_constraint.values().find_map(|c| {
-            if matches!(c.contype, ConType::ForeignKey)
-                && c.confrelid == Some(relid)
-                && c.confkey
-                    .iter()
-                    .copied()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    == target_set
-            {
-                Some(c.conname.clone())
-            } else {
-                None
-            }
-        });
+        // The keys relying on the constraint's index (their `conindid`).
+        let index = interp
+            .pg_class
+            .get(&relid)
+            .and_then(|c| {
+                interp
+                    .class_by_qname
+                    .get(&(c.relnamespace, conname.clone()))
+            })
+            .copied()
+            .filter(|i| interp.pg_index.contains_key(i));
+        let dependent: Option<String> = match index {
+            Some(index) => super::foreign_keys::fks_relying_on(interp, relid, &target_set, index)
+                .first()
+                .and_then(|fk| interp.pg_constraint.get(fk))
+                .map(|c| c.conname.clone()),
+            None => interp.pg_constraint.values().find_map(|c| {
+                if matches!(c.contype, ConType::ForeignKey)
+                    && c.confrelid == Some(relid)
+                    && c.confkey
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        == target_set
+                {
+                    Some(c.conname.clone())
+                } else {
+                    None
+                }
+            }),
+        };
         if let Some(dep) = dependent {
             let relname = interp
                 .pg_class
