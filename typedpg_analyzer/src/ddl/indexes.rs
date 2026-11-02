@@ -1086,6 +1086,8 @@ pub(crate) fn rebuild_indexes_for_column_type(
     // Every index reading the column — as a key or INCLUDE column, in an
     // expression or in its predicate — is rebuilt from pg_get_indexdef,
     // which names the table's columns: its columns take their names anew.
+    // The rebuilt index is a new object, which no DEPENDS ON EXTENSION
+    // marks.
     for index in &indexes {
         let reads_column = |ast: &SerializedAst| {
             <typedpg_pg_query::protobuf::Node as Message>::decode(ast.ast.as_slice())
@@ -1104,6 +1106,10 @@ pub(crate) fn rebuild_indexes_for_column_type(
             || index.indpred.as_ref().is_some_and(reads_column)
         {
             db.index_attnames.remove(&index.indexrelid);
+            super::depend::forget_auto_extension_marks(
+                db,
+                super::depend::ObjectAddress::relation(index.indexrelid),
+            );
         }
     }
     for mut index in indexes {

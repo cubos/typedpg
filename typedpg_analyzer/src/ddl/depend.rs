@@ -1873,6 +1873,16 @@ pub(crate) fn set_auto_extension_dependency(
     }
 }
 
+/// Drop every DEPENDS ON EXTENSION mark of `object` — what replacing it
+/// with a new one does (an index ALTER COLUMN TYPE rebuilds).
+pub(crate) fn forget_auto_extension_marks(interp: &mut PgCatalog, object: ObjectAddress) {
+    interp.pg_depend.retain(|d| {
+        !(d.classid == object.classid
+            && d.objid == object.objid
+            && d.deptype == DepType::AutoExtension)
+    });
+}
+
 /// The objects marked as depending on `extension` automatically
 /// (DEPENDENCY_AUTO_EXTENSION), which a DROP EXTENSION takes along.
 pub(crate) fn auto_extension_dependents(
@@ -1903,7 +1913,9 @@ pub(crate) fn auto_extension_dependents(
 /// blocks the DROP without CASCADE (and goes with it with CASCADE) — as
 /// does the constraint an index is part of (which, as the index's owner,
 /// takes over its dependency on the extension); a partition's clone of a
-/// trigger is part of its parent's, which blocks it whatever the CASCADE.
+/// trigger, or its index attached to the parent's, is part of its
+/// parent's, which blocks it whatever the CASCADE (unless the parent goes
+/// too).
 pub(crate) fn check_auto_extension_dependent(
     interp: &mut PgCatalog,
     object: ObjectAddress,
@@ -1939,6 +1951,19 @@ pub(crate) fn check_auto_extension_dependent(
                  {parent_table} instead.)"
             )));
         }
+    }
+    // So is a partition's index attached to its parent's.
+    if object.classid == PG_CLASS_RELID
+        && let Some(index) = PgClassOid::new(object.objid.get())
+        && let Some(&parent) = interp.index_parents.get(&index)
+        && !is_drop_target(ObjectAddress::relation(parent))
+    {
+        let name = relation_display_name(interp, index);
+        let parent_name = relation_display_name(interp, parent);
+        return Err(super::DdlError::DependencyError(format!(
+            "cannot drop index {name} because index {parent_name} requires it (You can drop \
+             index {parent_name} instead.)"
+        )));
     }
     if cascade {
         return drop_member_dependents(interp, object, extension_desc, cascade);
