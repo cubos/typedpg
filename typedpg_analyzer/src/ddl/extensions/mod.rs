@@ -336,6 +336,22 @@ impl OtherMembers {
     }
 }
 
+/// Bundled extensions that aren't PostgreSQL's own (the registry's
+/// third-party section).
+#[cfg(any(test, feature = "pg_sanity"))]
+const THIRD_PARTY: &[&str] = &["vector"];
+
+/// Whether `name` is a bundled extension the `postgres` image doesn't ship:
+/// a third-party one, or one requiring a procedural language the registry
+/// doesn't bundle (plperl, plperlu, plpython3u are built separately, and
+/// the image has none of them). The `pg_sanity` mirror stops comparing
+/// after the server rejects one of these as not available.
+#[cfg(any(test, feature = "pg_sanity"))]
+pub(crate) fn outside_postgres_image(name: &str) -> bool {
+    let bundled = |n: &str| REGISTRY.iter().any(|e| e.name == n);
+    bundled(name) && (THIRD_PARTY.contains(&name) || requires(name).iter().any(|r| !bundled(r)))
+}
+
 /// The control files' `requires`: extensions that must be installed first.
 fn requires(name: &str) -> &'static [&'static str] {
     match name {
@@ -865,4 +881,33 @@ pub(crate) fn check_opclass_options(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_extensions_outside_the_postgres_image() {
+        let outside: Vec<&str> = REGISTRY
+            .iter()
+            .map(|e| e.name)
+            .filter(|n| outside_postgres_image(n))
+            .collect();
+        assert_eq!(
+            outside,
+            [
+                "bool_plperl",
+                "bool_plperlu",
+                "hstore_plperl",
+                "hstore_plperlu",
+                "hstore_plpython3u",
+                "jsonb_plperl",
+                "jsonb_plperlu",
+                "jsonb_plpython3u",
+                "ltree_plpython3u",
+                "vector",
+            ]
+        );
+    }
 }

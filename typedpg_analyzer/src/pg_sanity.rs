@@ -245,8 +245,8 @@ impl PgSanityServer {
 
     /// [`Self::compare_apply_matches`] for a migration that creates, alters
     /// or drops an extension. `None` when the server doesn't ship an
-    /// extension the analyzer bundles (pgvector, the PL transforms: the
-    /// `postgres` image has neither) and so rejects the migration with
+    /// extension the analyzer bundles (pgvector, the PL transforms: see
+    /// `outside_postgres_image`) and so rejects the migration with
     /// `extension "…" is not available`: nothing after it can be mirrored.
     pub(crate) fn compare_extension_apply_matches<E: std::fmt::Display>(
         &mut self,
@@ -256,15 +256,19 @@ impl PgSanityServer {
         let pg_result = self.client.batch_execute(sql);
         self.soundness.schema_changed();
         // extension.c's `extension "%s" is not available`, raised when the
-        // control file is missing.
+        // control file is missing — for one of the bundled extensions the
+        // image doesn't ship. Any other is a divergence.
         let unavailable = pg_result
             .as_ref()
             .err()
             .and_then(|e| e.as_db_error())
             .filter(|db| {
                 *db.code() == postgres::error::SqlState::FEATURE_NOT_SUPPORTED
-                    && db.message().starts_with("extension \"")
-                    && db.message().ends_with("\" is not available")
+                    && db
+                        .message()
+                        .strip_prefix("extension \"")
+                        .and_then(|m| m.strip_suffix("\" is not available"))
+                        .is_some_and(crate::ddl::extensions::outside_postgres_image)
             });
         // The analyzer reports the same error for an extension it doesn't
         // bundle either. Otherwise it installed one the server lacks — and
