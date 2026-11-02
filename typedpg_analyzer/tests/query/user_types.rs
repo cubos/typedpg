@@ -1156,3 +1156,31 @@ fn an_array_of_a_domain_is_typed_as_the_domains_array() {
         assert_eq!(q.columns[0].pg_type, expected, "{sql}");
     }
 }
+
+#[test]
+fn a_renamed_or_moved_enum_is_reported_under_its_new_name() {
+    // ALTER TYPE ... RENAME / SET SCHEMA keep the type's OID: each query
+    // after the change reports the current name (and the pg_sanity mirror
+    // must not answer from what it resolved before).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TYPE bogus AS ENUM ('good', 'bad');")
+        .unwrap();
+    let check = |db: &PgCatalog, schema: &str, name: &str| {
+        let qualified = QualifiedName::new(schema, name);
+        let ty = enum_ty(schema, name, &["good", "bad"]);
+        let q = db
+            .analyze(&format!("SELECT 'good'::{qualified} AS v"))
+            .unwrap();
+        assert_eq!(col(&q, "v").pg_type, ty);
+        let q = db
+            .analyze(&format!("SELECT enum_range(null::{qualified}) AS v"))
+            .unwrap();
+        assert_eq!(col(&q, "v").pg_type, array_of(ty));
+    };
+    check(&db, "public", "bogus");
+    db.apply_sql("ALTER TYPE bogus RENAME TO bogon;").unwrap();
+    check(&db, "public", "bogon");
+    db.apply_sql("CREATE SCHEMA s; ALTER TYPE bogon SET SCHEMA s;")
+        .unwrap();
+    check(&db, "s", "bogon");
+}
