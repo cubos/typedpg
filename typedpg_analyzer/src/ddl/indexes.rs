@@ -30,17 +30,16 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     // DefineIndex: the table must exist and be indexable.
     let (nsoid, indrelid) = super::util::lookup_relation(db, rv)?;
     // RangeVarCallbackOwnsRelation, as the table is looked up: no system
-    // catalog.
+    // catalog. Then table_open: an index or a composite type can't be
+    // opened as a table.
     super::util::check_not_system_class(db, indrelid)?;
+    super::util::table_open_check(db, indrelid, &rv.relname)?;
     let table_name = rv.relname.clone();
     if let Some(class) = db.pg_class.get(&indrelid) {
         let kinds = match class.relkind {
-            RelKind::View
-            | RelKind::Sequence
-            | RelKind::CompositeType
-            | RelKind::Index
-            | RelKind::PartitionedIndex
-            | RelKind::ForeignTable => Some(class.relkind.plural()),
+            RelKind::View | RelKind::Sequence | RelKind::ForeignTable => {
+                Some(class.relkind.plural())
+            }
             _ => None,
         };
         if let Some(kinds) = kinds {
@@ -409,6 +408,127 @@ fn check_index_expression_types(
         }
     }
     Ok(())
+}
+
+/// The `attname`s of index `index`'s columns, key and INCLUDE ones: the
+/// names it was given ([`PgCatalog::index_attnames`]) or, for most
+/// indexes, ChooseIndexColumnNames (indexcmds.c) over the table's columns —
+/// each named after its table column, or "expr", with a numeric suffix
+/// appended until it is unique among the earlier ones.
+pub(crate) fn index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
+    if let Some(names) = db.index_attnames.get(&index) {
+        return names.clone();
+    }
+    let Some(index) = db.pg_index.get(&index) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut exprs = index.indexprs.iter();
+    for &key in &index.indkey {
+        // A column is named after the table's; an expression as
+        // FigureIndexColname names it (a function's name, a cast's
+        // argument, ...; `expr` for an operator and the like).
+        let origname = if key == 0 {
+            let expr = exprs.next().and_then(|e| {
+                <typedpg_pg_query::protobuf::Node as Message>::decode(e.ast.as_slice()).ok()
+            });
+            figure_index_colname(expr.as_ref())
+        } else {
+            db.attributes_of(index.indrelid)
+                .iter()
+                .find(|a| a.attnum == key)
+                .map_or_else(|| "expr".to_owned(), |a| a.attname.clone())
+        };
+        let mut name = origname.clone();
+        let mut i = 1;
+        while names.contains(&name) {
+            let suffix = i.to_string();
+            let mut base = origname.clone();
+            // NAMEDATALEN - 1 bytes in all.
+            while base.len() + suffix.len() > 63 {
+                base.pop();
+            }
+            name = base + &suffix;
+            i += 1;
+        }
+        names.push(name);
+    }
+    names
+}
+
+/// The column names of index `index` as its relcache entry has them, which
+/// generateClonedIndexStmt copies: those it was created with, or had when
+/// given a new relfilenode, for an index created or given one in the
+/// current transaction ([`PgCatalog::relcache_index_attnames`]); the
+/// catalog's otherwise.
+///
+/// Not modelled: an open cursor whose plan scans an index holds that
+/// index's relcache entry open, so a rename doesn't reach a clone made
+/// while it is open either; whether a cursor's plan uses an index scan is
+/// the planner's choice, which the analyzer can't know. Nor are tablespace
+/// moves (ALTER INDEX ... SET TABLESPACE), which the analyzer doesn't track.
+pub(crate) fn relcache_index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
+    db.relcache_index_attnames
+        .get(&index)
+        .cloned()
+        .unwrap_or_else(|| index_attnames(db, index))
+}
+
+/// Before an index column is renamed: an index whose relcache entry stays
+/// for the rest of the transaction (created or given a new relfilenode in
+/// it) keeps the names it has now there.
+pub(crate) fn pin_relcache_index_attnames(db: &mut PgCatalog, index: PgClassOid) {
+    let pinned =
+        index.get() >= db.transaction_oid_floor || db.indexes_with_new_relfilenode.contains(&index);
+    if pinned && !db.relcache_index_attnames.contains_key(&index) {
+        let names = index_attnames(db, index);
+        db.relcache_index_attnames.insert(index, names);
+    }
+}
+
+/// Index `index` gets a new relfilenode (TRUNCATE, REINDEX, CLUSTER): its
+/// relcache entry stays as it is for the rest of the transaction. A
+/// partitioned index has no storage, and no relfilenode to change.
+pub(crate) fn new_relfilenode(db: &mut PgCatalog, index: PgClassOid) {
+    if db.pg_class.get(&index).map(|c| c.relkind) == Some(RelKind::Index) {
+        db.indexes_with_new_relfilenode.insert(index);
+    }
+}
+
+/// Table `relid`'s storage is rewritten — TRUNCATE, CLUSTER, REINDEX
+/// TABLE, REFRESH MATERIALIZED VIEW, and an ALTER TABLE that rewrites the
+/// rows (ATRewriteTables: a column type change that isn't a relabeling, a
+/// volatile or constrained-domain default, a stored generated column, SET
+/// LOGGED / UNLOGGED): finish_heap_swap rebuilds every index of it, each
+/// in a new relfilenode.
+pub(crate) fn table_rewritten(db: &mut PgCatalog, relid: PgClassOid) {
+    let indexes: Vec<PgClassOid> = db
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == relid)
+        .map(|i| i.indexrelid)
+        .collect();
+    for index in indexes {
+        new_relfilenode(db, index);
+    }
+}
+
+/// Before a column of table `relid` is renamed, its indexes keep the names
+/// their columns have now: PG never renames an index column after its
+/// table's.
+pub(crate) fn freeze_index_attnames(db: &mut PgCatalog, relid: PgClassOid) {
+    let indexes: Vec<PgClassOid> = db
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == relid)
+        .map(|i| i.indexrelid)
+        .collect();
+    for index in indexes {
+        if !db.index_attnames.contains_key(&index) {
+            let names = index_attnames(db, index);
+            db.index_attnames.insert(index, names);
+        }
+    }
 }
 
 /// INDEX_MAX_KEYS (pg_config_manual.h): the most columns an index — key
@@ -1030,6 +1150,40 @@ pub(crate) fn rebuild_indexes_for_column_type(
         .cloned()
         .collect();
     indexes.sort_by_key(|i| i.indexrelid);
+    // Every index reading the column — as a key or INCLUDE column, in an
+    // expression or in its predicate — is rebuilt from pg_get_indexdef,
+    // which names the table's columns: its columns take their names anew.
+    // The rebuilt index is a new object, which no DEPENDS ON EXTENSION
+    // marks.
+    for index in &indexes {
+        let reads_column = |ast: &SerializedAst| {
+            <typedpg_pg_query::protobuf::Node as Message>::decode(ast.ast.as_slice())
+                .ok()
+                .and_then(|n| n.node)
+                .is_some_and(|inner| {
+                    inner.nodes().into_iter().any(|(n, ..)| {
+                        matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
+                            if cr.fields.last().and_then(super::util::node_string)
+                                == Some(attr.attname.as_str()))
+                    })
+                })
+        };
+        if index.indkey.contains(&attnum)
+            || index.indexprs.iter().any(reads_column)
+            || index.indpred.as_ref().is_some_and(reads_column)
+        {
+            db.index_attnames.remove(&index.indexrelid);
+            // A new index, whose relcache entry is built anew.
+            db.relcache_index_attnames.remove(&index.indexrelid);
+            // (A new object's entry, partitioned index or not, stays as
+            // created for the rest of the transaction.)
+            db.indexes_with_new_relfilenode.insert(index.indexrelid);
+            super::depend::forget_auto_extension_marks(
+                db,
+                super::depend::ObjectAddress::relation(index.indexrelid),
+            );
+        }
+    }
     for mut index in indexes {
         let Some(mut keys) = db.index_keys.get(&index.indexrelid).cloned() else {
             continue;

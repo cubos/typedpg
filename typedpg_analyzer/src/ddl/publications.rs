@@ -174,7 +174,8 @@ fn resolve_objects<'a>(
                 let Some(rv) = pt.relation.as_ref() else {
                     continue;
                 };
-                let (_, relid) = super::util::lookup_relation(interp, rv)?;
+                // OpenTableList: table_openrv.
+                let (_, relid) = super::util::lookup_table(interp, rv)?;
                 let rel = PubRel {
                     oid: None,
                     relid,

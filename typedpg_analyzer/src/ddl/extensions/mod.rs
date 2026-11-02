@@ -536,6 +536,82 @@ fn extension_oid(interp: &PgCatalog, name: &str) -> Result<PgExtensionOid, DdlEr
         .ok_or_else(|| DdlError::TypeNotFound(format!("extension \"{name}\" does not exist")))
 }
 
+/// `ALTER {TRIGGER | FUNCTION | PROCEDURE | ROUTINE | INDEX | MATERIALIZED
+/// VIEW} … [NO] DEPENDS ON EXTENSION e` (ExecAlterObjectDependsStmt): the
+/// object is looked up first (get_object_address_rv — a trigger's table,
+/// then the trigger), then the extension; the object is then marked as
+/// going along with a DROP EXTENSION, or no longer.
+pub fn alter_object_depends(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::protobuf::AlterObjectDependsStmt,
+) -> Result<(), DdlError> {
+    use super::depend::ObjectAddress;
+    use typedpg_pg_query::protobuf::{List, Node, ObjectType};
+    let objtype = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
+    let string = |s: &str| Node {
+        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
+            sval: s.to_owned(),
+        })),
+    };
+    // get_object_address_rv: the relation's name heads the object's.
+    let object = stmt.object.as_deref().and_then(|o| o.node.clone());
+    let object = match (stmt.relation.as_ref(), object) {
+        (Some(rv), object) => {
+            let mut items = Vec::new();
+            if !rv.schemaname.is_empty() {
+                items.push(string(&rv.schemaname));
+            }
+            items.push(string(&rv.relname));
+            if let Some(node::Node::List(l)) = object {
+                items.extend(l.items);
+            }
+            node::Node::List(List { items })
+        }
+        (None, Some(object)) => object,
+        (None, None) => return Ok(()),
+    };
+    super::comment::resolve_object(interp, objtype, &object)?;
+    let Some(extname) = stmt.extname.as_ref().map(|e| e.sval.as_str()) else {
+        return Ok(());
+    };
+    let ext = extension_oid(interp, extname)?;
+
+    let relation = |interp: &PgCatalog| {
+        let rv = stmt.relation.as_ref()?;
+        let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+        interp.resolve_table(schema, &rv.relname).map(|c| c.oid)
+    };
+    let address = match (objtype, &object) {
+        (ObjectType::ObjectTrigger, node::Node::List(l)) => {
+            let name = l.items.last().and_then(super::util::node_string);
+            relation(interp).and_then(|relid| {
+                let trigger = interp
+                    .triggers
+                    .get(&relid)?
+                    .iter()
+                    .find(|t| Some(t.name.as_str()) == name)?;
+                Some(ObjectAddress::new(
+                    super::depend::PG_TRIGGER_RELID,
+                    trigger.oid.into_nonzero(),
+                    0,
+                ))
+            })
+        }
+        (ObjectType::ObjectIndex | ObjectType::ObjectMatview, _) => {
+            relation(interp).map(ObjectAddress::relation)
+        }
+        (_, node::Node::ObjectWithArgs(owa)) => {
+            super::functions::lookup_func_with_args(interp, objtype, owa, false)?
+                .map(ObjectAddress::proc)
+        }
+        _ => None,
+    };
+    if let Some(address) = address {
+        super::depend::set_auto_extension_dependency(interp, address, ext, stmt.remove);
+    }
+    Ok(())
+}
+
 /// The catalog and oid of the object an ALTER EXTENSION ADD / DROP names,
 /// with PG's description of it (getObjectDescription).
 fn member_object(

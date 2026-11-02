@@ -1338,6 +1338,18 @@ fn delete_object_now(interp: &mut PgCatalog, addr: ObjectAddress) -> Result<(), 
                         super::views::drop_views(interp, &[relid]);
                     }
                     Some(RelKind::Index | RelKind::PartitionedIndex) => {
+                        // Its partitions' indexes are part of it
+                        // (DEPENDENCY_PARTITION_PRI) and go first.
+                        let mut children: Vec<PgClassOid> = interp
+                            .index_parents
+                            .iter()
+                            .filter(|&(_, &parent)| parent == relid)
+                            .map(|(&child, _)| child)
+                            .collect();
+                        children.sort();
+                        for child in children {
+                            delete_object(interp, ObjectAddress::relation(child))?;
+                        }
                         let table = interp.pg_index.get(&relid).map(|i| i.indrelid);
                         let name = interp.pg_class.get(&relid).map(|c| c.relname.clone());
                         interp.remove_pg_index(relid);
@@ -1417,10 +1429,10 @@ fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
                 r.retain(|r| &r.name != name);
             }
         }
+        // A partition's clones of the trigger go with it
+        // (DEPENDENCY_PARTITION_PRI).
         NamedObject::Trigger { relid, name } => {
-            if let Some(t) = interp.triggers.get_mut(relid) {
-                t.retain(|t| &t.name != name);
-            }
+            super::triggers::remove_with_clones(interp, *relid, name);
         }
         NamedObject::DomainConstraint { typid, name } => {
             if let Some(c) = interp.domain_constraints.get_mut(typid) {
@@ -1838,4 +1850,209 @@ pub(crate) fn record_ts_mapping(
         .collect();
     record_references(interp, depender, &refs, DepType::Normal);
     Ok(())
+}
+
+/// `ALTER … [NO] DEPENDS ON EXTENSION` (ExecAlterObjectDependsStmt): mark
+/// `object` as depending on `extension` automatically
+/// (DEPENDENCY_AUTO_EXTENSION) — a DROP EXTENSION takes it along — once;
+/// or remove that mark.
+pub(crate) fn set_auto_extension_dependency(
+    interp: &mut PgCatalog,
+    object: ObjectAddress,
+    extension: crate::oid::PgExtensionOid,
+    remove: bool,
+) {
+    let ext = PgGenericOid::from_nonzero(extension.into_nonzero());
+    let is_mark = |d: &PgDepend| {
+        d.classid == object.classid
+            && d.objid == object.objid
+            && d.refclassid == crate::pg_catalog::PG_EXTENSION_RELID
+            && d.refobjid == ext
+            && d.deptype == DepType::AutoExtension
+    };
+    if remove {
+        interp.pg_depend.retain(|d| !is_mark(d));
+    } else if !interp.pg_depend.iter().any(is_mark) {
+        interp.add_dependency(PgDepend {
+            classid: object.classid,
+            objid: object.objid,
+            objsubid: 0,
+            refclassid: crate::pg_catalog::PG_EXTENSION_RELID,
+            refobjid: ext,
+            refobjsubid: 0,
+            deptype: DepType::AutoExtension,
+        });
+    }
+}
+
+/// Drop every DEPENDS ON EXTENSION mark of `object` — what replacing it
+/// with a new one does (an index ALTER COLUMN TYPE rebuilds).
+pub(crate) fn forget_auto_extension_marks(interp: &mut PgCatalog, object: ObjectAddress) {
+    interp.pg_depend.retain(|d| {
+        !(d.classid == object.classid
+            && d.objid == object.objid
+            && d.deptype == DepType::AutoExtension)
+    });
+}
+
+/// The objects marked as depending on `extension` automatically
+/// (DEPENDENCY_AUTO_EXTENSION), which a DROP EXTENSION takes along.
+pub(crate) fn auto_extension_dependents(
+    interp: &PgCatalog,
+    extension: crate::oid::PgExtensionOid,
+) -> Vec<ObjectAddress> {
+    let mut out: Vec<ObjectAddress> = Vec::new();
+    for d in interp.pg_depend.iter() {
+        if d.refclassid == crate::pg_catalog::PG_EXTENSION_RELID
+            && d.refobjid.get() == extension.get()
+            && d.deptype == DepType::AutoExtension
+        {
+            let addr = ObjectAddress {
+                classid: d.classid,
+                objid: d.objid,
+                objsubid: 0,
+            };
+            if exists(interp, addr) && !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
+}
+
+/// DROP EXTENSION's check of an object marked as depending on it
+/// automatically, which goes along: what depends on the object normally
+/// blocks the DROP without CASCADE (and goes with it with CASCADE) — as
+/// does the constraint an index is part of (which, as the index's owner,
+/// takes over its dependency on the extension); a partition's clone of a
+/// trigger, or its index attached to the parent's, is part of its
+/// parent's, which blocks it whatever the CASCADE (unless the parent goes
+/// too).
+pub(crate) fn check_auto_extension_dependent(
+    interp: &mut PgCatalog,
+    object: ObjectAddress,
+    extension_desc: &str,
+    cascade: bool,
+) -> Result<(), super::DdlError> {
+    let blocked = |dependent: String, on: String| {
+        Err(super::DdlError::DependencyError(format!(
+            "cannot drop {extension_desc} because other objects depend on it ({dependent} \
+             depends on {on})"
+        )))
+    };
+    if object.classid == PG_TRIGGER_RELID
+        && let Some((relid, trigger)) = interp.triggers.iter().find_map(|(relid, ts)| {
+            ts.iter()
+                .find(|t| t.oid == object.objid)
+                .map(|t| (*relid, t.clone()))
+        })
+        && let Some(parent) = trigger.parent
+    {
+        let parent_trigger = interp
+            .triggers
+            .get(&parent)
+            .and_then(|ts| ts.iter().find(|t| t.name == trigger.name))
+            .map(|t| ObjectAddress::new(PG_TRIGGER_RELID, t.oid.into_nonzero(), 0));
+        if !parent_trigger.is_some_and(is_drop_target) {
+            let name = &trigger.name;
+            let table = relation_display_name(interp, relid);
+            let parent_table = relation_display_name(interp, parent);
+            return Err(super::DdlError::DependencyError(format!(
+                "cannot drop trigger {name} on table {table} because trigger {name} on table \
+                 {parent_table} requires it (You can drop trigger {name} on table \
+                 {parent_table} instead.)"
+            )));
+        }
+    }
+    // So is a partition's index attached to its parent's.
+    if object.classid == PG_CLASS_RELID
+        && let Some(index) = PgClassOid::new(object.objid.get())
+        && let Some(&parent) = interp.index_parents.get(&index)
+        && !is_drop_target(ObjectAddress::relation(parent))
+    {
+        let name = relation_display_name(interp, index);
+        let parent_name = relation_display_name(interp, parent);
+        return Err(super::DdlError::DependencyError(format!(
+            "cannot drop index {name} because index {parent_name} requires it (You can drop \
+             index {parent_name} instead.)"
+        )));
+    }
+    if cascade {
+        return drop_member_dependents(interp, object, extension_desc, cascade);
+    }
+    if object.classid == PG_CLASS_RELID
+        && let Some(relid) = PgClassOid::new(object.objid.get())
+        && let Some(table) = interp.pg_index.get(&relid).map(|i| i.indrelid)
+        && let Some(name) = interp.pg_class.get(&relid).map(|c| c.relname.clone())
+        && let Some(con) = interp.pg_constraint.values().find(|c| {
+            c.conrelid == table
+                && c.conname == name
+                && matches!(
+                    c.contype,
+                    crate::pg_catalog::ConType::PrimaryKey
+                        | crate::pg_catalog::ConType::Unique
+                        | crate::pg_catalog::ConType::Exclusion
+                )
+        })
+    {
+        let con_desc = describe(
+            interp,
+            ObjectAddress::new(PG_CONSTRAINT_RELID, con.oid.into_nonzero(), 0),
+        );
+        return blocked(con_desc, extension_desc.to_owned());
+    }
+    // A routine's triggers, event triggers and views, which the analyzer
+    // tracks outside pg_depend.
+    if object.classid == PG_PROC_RELID
+        && let Some(proc) = PgProcOid::new(object.objid.get())
+    {
+        let proc_desc = describe(interp, object);
+        for (relid, name) in super::triggers::triggers_using_function(interp, proc) {
+            let trigger = interp
+                .triggers
+                .get(&relid)
+                .and_then(|ts| ts.iter().find(|t| t.name == name))
+                .map(|t| ObjectAddress::new(PG_TRIGGER_RELID, t.oid.into_nonzero(), 0));
+            if !trigger.is_some_and(is_drop_target) {
+                let table = relation_display_name(interp, relid);
+                return blocked(format!("trigger {name} on table {table}"), proc_desc);
+            }
+        }
+        if let Some(name) = super::event_triggers::event_triggers_using(interp, proc).first() {
+            return blocked(format!("event trigger {name}"), proc_desc);
+        }
+        if let Some(&view) = super::views::find_views_depending_on_function(interp, proc)
+            .iter()
+            .find(|&&v| !is_drop_target(ObjectAddress::relation(v)))
+        {
+            return blocked(describe(interp, ObjectAddress::relation(view)), proc_desc);
+        }
+    }
+    drop_member_dependents(interp, object, extension_desc, cascade)
+}
+
+/// Delete an object a DROP EXTENSION takes along, with what depends on it
+/// (a routine's triggers and event triggers too).
+pub(crate) fn delete_auto_extension_dependent(
+    interp: &mut PgCatalog,
+    object: ObjectAddress,
+) -> Result<(), super::DdlError> {
+    if !exists(interp, object) {
+        return Ok(());
+    }
+    if object.classid == PG_PROC_RELID
+        && let Some(proc) = PgProcOid::new(object.objid.get())
+    {
+        for (relid, name) in super::triggers::triggers_using_function(interp, proc) {
+            if let Some(ts) = interp.triggers.get_mut(&relid) {
+                let dropped = ts.iter().find(|t| t.name == name).map(|t| t.oid);
+                ts.retain(|t| t.name != name);
+                if let Some(oid) = dropped {
+                    interp.remove_dependencies_of(PG_TRIGGER_RELID, oid);
+                }
+            }
+        }
+        interp.event_triggers.retain(|(_, f)| *f != proc);
+    }
+    delete_object(interp, object)
 }
