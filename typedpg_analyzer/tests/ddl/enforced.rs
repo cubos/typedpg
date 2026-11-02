@@ -259,14 +259,13 @@ fn alter_constraint_changes_foreign_key_deferrability() {
     .unwrap();
     for name in ["f", "pf"] {
         let err = db
-            .apply_sql(&format!("BEGIN; SET CONSTRAINTS {name} DEFERRED;"))
+            .apply_sql(&format!("BEGIN; SET CONSTRAINTS {name} DEFERRED; COMMIT;"))
             .unwrap_err()
             .to_string();
         assert!(
             err.starts_with(&format!("constraint \"{name}\" is not deferrable")),
             "{err}"
         );
-        db.apply_sql("ROLLBACK;").unwrap();
     }
 }
 

@@ -3823,6 +3823,97 @@ fn a_failed_migration_leaves_no_trace() {
 }
 
 #[test]
+fn a_failed_explicit_transaction_leaves_no_trace() {
+    // PG 18: a statement failing inside BEGIN ... COMMIT aborts the block,
+    // and the migration with it; the next migration starts from where the
+    // block started. A session-level SET made in the aborted transaction is
+    // reverted too (AtEOXact_GUC).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE t (a int); CREATE SCHEMA s;")
+        .unwrap();
+    let err = db
+        .apply_sql(
+            "BEGIN;
+             ALTER TABLE t ADD COLUMN b int;
+             SET search_path = s;
+             CREATE TABLE public.t (a int);
+             COMMIT;",
+        )
+        .expect_err("duplicate table");
+    assert!(
+        err.to_string().starts_with("relation \"t\" already exists"),
+        "got: {err}"
+    );
+    let err = db
+        .analyze("SELECT b FROM t")
+        .expect_err("the column was rolled back");
+    assert!(
+        err.to_string().starts_with("column \"b\" does not exist"),
+        "got: {err}"
+    );
+    // The search path is the session's again: `u` lands in public.
+    db.apply_sql("CREATE TABLE u (a int);").unwrap();
+    db.analyze("SELECT a FROM public.u").unwrap();
+    // What a COMMIT made durable stays.
+    db.apply_sql(
+        "BEGIN; CREATE TABLE c (a int); COMMIT;
+         BEGIN; CREATE TABLE d (a int); CREATE TABLE c (a int); COMMIT;",
+    )
+    .expect_err("duplicate table");
+    db.apply_sql("CREATE TABLE d (b int);").unwrap();
+    db.analyze("SELECT a FROM c").unwrap();
+    db.analyze("SELECT b FROM d").unwrap();
+}
+
+#[test]
+fn a_migration_ending_inside_its_transaction_block_commits() {
+    // A migration whose BEGIN has no COMMIT is taken as committed: its
+    // changes are there for the queries, and the next migration starts
+    // outside any transaction block.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("BEGIN; CREATE TABLE t (a int);").unwrap();
+    db.analyze("SELECT a FROM t").unwrap();
+    db.apply_sql("VACUUM t;").unwrap();
+}
+
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_compares_the_commit_ending_a_migration() {
+    // The COMMIT that ends a migration's open block is part of its
+    // outcome: a deferred foreign key it fails (the analyzer doesn't look
+    // at rows) is a divergence, as with a COMMIT the migration spells.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE p (a int PRIMARY KEY);
+         CREATE TABLE c (a int REFERENCES p DEFERRABLE INITIALLY DEFERRED);",
+    )
+    .unwrap();
+    for sql in [
+        "BEGIN; INSERT INTO c VALUES (1);",
+        "BEGIN; INSERT INTO c VALUES (1); COMMIT;",
+    ] {
+        let (result, divergence) = db.apply_sql_checked(sql);
+        result.unwrap();
+        let divergence = divergence.expect("PG fails the COMMIT");
+        assert_eq!(
+            divergence.kind,
+            typedpg_analyzer::DivergenceKind::ApplyPgRejected,
+            "{sql}"
+        );
+        assert!(
+            divergence
+                .message
+                .contains("violates foreign key constraint \"c_a_fkey\""),
+            "{sql}\n{divergence}"
+        );
+    }
+    // The failed COMMIT ended the block: the mirror goes on.
+    let (result, divergence) = db.apply_sql_checked("VACUUM c;");
+    result.unwrap();
+    assert!(divergence.is_none(), "{divergence:?}");
+}
+
+#[test]
 fn migrations_the_runner_wraps_in_a_transaction() {
     // With `use_transaction`, the runner runs each migration inside a
     // transaction block of its own: savepoints work, and statements that
