@@ -1122,3 +1122,24 @@ fn a_member_of_any_kind_cannot_be_dropped_on_its_own() {
         assert!(err.to_string().starts_with(message), "{stmt}\n  got: {err}");
     }
 }
+
+#[test]
+fn a_renamed_exclusion_constraint_takes_its_index_along() {
+    // RenameConstraintById renames the index backing a PK, UNIQUE or
+    // EXCLUDE constraint with it: dropping the constraint then drops the
+    // index, and its operator classes no longer hold the extension.
+    build(&[
+        (
+            "0001.sql",
+            "CREATE EXTENSION btree_gist;
+             CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =));",
+        ),
+        (
+            "0002.sql",
+            "ALTER TABLE t RENAME CONSTRAINT t_a_excl TO nn;",
+        ),
+        ("0003.sql", "ALTER TABLE t DROP CONSTRAINT nn;"),
+        ("0004.sql", "DROP EXTENSION btree_gist;"),
+        ("0005.sql", "CREATE INDEX t_a_excl ON t (a);"),
+    ]);
+}
