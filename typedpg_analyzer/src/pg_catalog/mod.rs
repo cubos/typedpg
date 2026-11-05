@@ -1300,6 +1300,14 @@ impl PgCatalog {
         }
     }
 
+    /// The predicate of a partial index, or `None` for an index without one.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn index_predicate(&self, index: PgClassOid) -> Option<typedpg_pg_query::protobuf::Node> {
+        use prost::Message;
+        let predicate = self.pg_index.get(&index)?.indpred.as_ref()?;
+        typedpg_pg_query::protobuf::Node::decode(predicate.ast.as_slice()).ok()
+    }
+
     /// Whether the function call is surely VOLATILE (every overload that can
     /// take its arguments is).
     #[cfg(any(test, feature = "internal"))]

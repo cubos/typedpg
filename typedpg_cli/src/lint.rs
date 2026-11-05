@@ -11,7 +11,7 @@
 
 mod scan;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -23,7 +23,9 @@ use typedpg_core::migrations::compare_migration_names;
 use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
-use typedpg_lint::{Finding, LintOptions, MigrationFile, lint_migrations, lint_query};
+use typedpg_lint::{
+    Finding, IgnoreSet, LintOptions, MigrationFile, MigrationLint, lint_migrations, lint_query,
+};
 
 /// The directories under the manifest's directory that hold Rust sources.
 const SOURCE_DIRS: &[&str] = &["src", "tests", "examples", "benches"];
@@ -65,15 +67,28 @@ type CopyResult = Result<(), AnalysisError>;
 
 /// Lint `manifest`'s crate; whether no analysis failed and no finding
 /// reaches `fail_on`. The report goes to stdout, the summary to stderr.
-pub fn run(manifest: &Path, format: Format) -> Result<bool, String> {
+///
+/// With `ignore_migrations_from`, migration files identical to that git ref
+/// have their statement rules skipped; the schema rules still report on the
+/// statements that created the schema's objects.
+pub fn run(
+    manifest: &Path,
+    format: Format,
+    ignore_migrations_from: Option<&str>,
+) -> Result<bool, String> {
     let start = Instant::now();
     let base = manifest_dir(manifest);
     let config = match Config::from_cargo_toml(manifest) {
         Ok(config) => config,
         Err(error) => return finish_with_config_error(error, manifest, &base, start, format),
     };
-    let options = match config.resolve(None) {
-        Ok(resolved) => LintOptions::from_config(&resolved.lint),
+    let resolved = match config.resolve(None) {
+        Ok(resolved) => resolved,
+        Err(error) => return finish_with_config_error(error, manifest, &base, start, format),
+    };
+    let options = LintOptions::from_config(&resolved.lint);
+    let ignore = match IgnoreSet::new(&resolved.lint.ignore) {
+        Ok(ignore) => ignore,
         Err(error) => return finish_with_config_error(error, manifest, &base, start, format),
     };
     let Sources {
@@ -84,6 +99,7 @@ pub fn run(manifest: &Path, format: Format) -> Result<bool, String> {
     let mut report = Report {
         queries: sites.len() + copies.len(),
         failures,
+        migrations_unchanged_from: ignore_migrations_from.map(str::to_owned),
         ..Report::default()
     };
     // The default database, then every configured one: a named database's
@@ -92,9 +108,21 @@ pub fn run(manifest: &Path, format: Format) -> Result<bool, String> {
     databases.extend(config.database_names().into_iter().map(Some));
 
     let mut catalogs: HashMap<Option<String>, Result<PgCatalog, String>> = HashMap::new();
+    let mut migration_paths = HashSet::new();
     for db in &databases {
         let catalog = match config.resolve(db.as_deref()) {
-            Ok(_) => catalog_for(&config, db.as_deref(), &base, &options, &mut report),
+            Ok(_) => catalog_for(
+                &config,
+                db.as_deref(),
+                &base,
+                &MigrationSettings {
+                    options: &options,
+                    ignore: &ignore,
+                    ignore_migrations_from,
+                },
+                &mut migration_paths,
+                &mut report,
+            ),
             Err(error) => {
                 let message = error.to_string();
                 report.failures.push(Failure {
@@ -178,6 +206,12 @@ pub fn run(manifest: &Path, format: Format) -> Result<bool, String> {
         }
     }
 
+    // `lint.ignore` drops findings only: a failure above still fails the run.
+    // A matching migration file is linted schema-only instead, so its schema
+    // findings stay placed in it.
+    report
+        .entries
+        .retain(|entry| !ignore.is_ignored(&entry.path) || migration_paths.contains(&entry.path));
     report.load_failure_sources(&base);
     report.sort();
     report.elapsed = start.elapsed();
@@ -312,15 +346,29 @@ fn collect_rust_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+/// How a run lints the migrations: its rule options, its `lint.ignore`
+/// patterns and the `--ignore-migrations-from` reference.
+struct MigrationSettings<'a> {
+    options: &'a LintOptions,
+    ignore: &'a IgnoreSet,
+    ignore_migrations_from: Option<&'a str>,
+}
+
 /// Build the catalog of database `db` from its migrations, reporting the
 /// failures that keep it from being built.
 fn catalog_for(
     config: &Config,
     db: Option<&str>,
     base: &Path,
-    options: &LintOptions,
+    settings: &MigrationSettings<'_>,
+    migration_paths: &mut HashSet<String>,
     report: &mut Report,
 ) -> Result<PgCatalog, String> {
+    let MigrationSettings {
+        options,
+        ignore,
+        ignore_migrations_from,
+    } = *settings;
     let resolved = config.resolve(db).map_err(|error| error.to_string())?;
     let migrations_dir = resolved.migrations_dir(base);
     let extra_dirs = resolved.extra_migrations_dirs(base);
@@ -339,10 +387,46 @@ fn catalog_for(
         }
     };
     report.migrations += files.len();
-    for file in &files {
+    for (_, file) in &files {
         report.sources.insert(file.path.clone(), file.sql.clone());
+        migration_paths.insert(file.path.clone());
     }
-    let linted = match lint_migrations(&files, resolved.migrations_use_transaction(), options) {
+    let mut lint_files: Vec<MigrationFile> = files.iter().map(|(_, file)| file.clone()).collect();
+    if let Some(reference) = ignore_migrations_from {
+        let candidates: Vec<PathBuf> = files
+            .iter()
+            .filter(|(_, file)| file.lint == MigrationLint::All)
+            .map(|(path, _)| path.clone())
+            .collect();
+        if !candidates.is_empty() {
+            let unchanged = match crate::unchanged_from_ref(reference, &candidates) {
+                Ok(unchanged) => unchanged,
+                Err(error) => {
+                    report.failures.push(Failure {
+                        path: relative(&migrations_dir, base),
+                        start: None,
+                        message: error.clone(),
+                    });
+                    return Err(error);
+                }
+            };
+            for (path, file) in files.iter().zip(&mut lint_files) {
+                if file.lint == MigrationLint::All && unchanged.contains(&path.0) {
+                    file.lint = MigrationLint::SchemaOnly;
+                    report.migrations_unchanged += 1;
+                }
+            }
+        }
+    }
+    // An ignored migration file still builds the schema, and its schema
+    // findings stay placed in it: only its statement rules are skipped.
+    for file in &mut lint_files {
+        if file.lint != MigrationLint::None && ignore.is_ignored(&file.path) {
+            file.lint = MigrationLint::SchemaOnly;
+        }
+    }
+    let linted = match lint_migrations(&lint_files, resolved.migrations_use_transaction(), options)
+    {
         Ok(linted) => linted,
         Err(error) => {
             let message = error.to_string();
@@ -355,7 +439,7 @@ fn catalog_for(
         }
     };
     for migration in &linted.findings {
-        let file = &files[migration.file];
+        let file = &files[migration.file].1;
         report.entries.push(Entry {
             path: file.path.clone(),
             start: position(&file.sql, migration.finding.span.start),
@@ -380,14 +464,14 @@ fn catalog_for(
     Ok(catalog)
 }
 
-/// The database's migration files, in the order the macro applies them:
-/// the runner's directory's files are reported, the extra directories'
-/// are applied but not reported.
+/// The database's migration files, with their paths on disk, in the order the
+/// macro applies them: the runner's directory's files are reported, the extra
+/// directories' are applied but never reported.
 fn collect_migration_files(
     dirs: &[(PathBuf, bool)],
     base: &Path,
-) -> Result<Vec<MigrationFile>, String> {
-    let mut files: Vec<(OsString, String, String, bool)> = Vec::new();
+) -> Result<Vec<(PathBuf, MigrationFile)>, String> {
+    let mut files: Vec<(OsString, PathBuf, String, String, bool)> = Vec::new();
     for (dir, lint) in dirs {
         if !dir.is_dir() {
             continue;
@@ -403,12 +487,31 @@ fn collect_migration_files(
             let sql = std::fs::read_to_string(&path)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             let sql = typedpg_core::migration_marker::strip_bom(&sql).to_owned();
-            files.push((entry.file_name(), relative(&path, base), sql, *lint));
+            files.push((
+                entry.file_name(),
+                path.clone(),
+                relative(&path, base),
+                sql,
+                *lint,
+            ));
         }
     }
     files.sort_by(|a, b| compare_migration_names(&a.0.to_string_lossy(), &b.0.to_string_lossy()));
     Ok(files
         .into_iter()
-        .map(|(_, path, sql, lint)| MigrationFile { path, sql, lint })
+        .map(|(_, source, path, sql, lint)| {
+            (
+                source,
+                MigrationFile {
+                    path,
+                    sql,
+                    lint: if lint {
+                        MigrationLint::All
+                    } else {
+                        MigrationLint::None
+                    },
+                },
+            )
+        })
         .collect())
 }

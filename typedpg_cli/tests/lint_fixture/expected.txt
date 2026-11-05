@@ -17,6 +17,13 @@ error: the SQL of sql! must be a string literal
     ·                ─────
     ╰────
 
+error: column "nope" does not exist
+   ╭─[tests/ignored.rs:9:24]
+ 9 │     sql!(pool, "SELECT nope FROM users").fetch_all().await?;
+   ·                        ──┬─
+   ·                          ╰─ column does not exist
+   ╰────
+
 warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build
    ╭─[migrations/0002_hazards.sql:3:1]
  3 │ CREATE INDEX users_name_idx ON users (name);

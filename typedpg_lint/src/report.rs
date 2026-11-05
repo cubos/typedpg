@@ -98,6 +98,12 @@ pub struct Report {
     pub queries: usize,
     /// How many migration files were applied.
     pub migrations: usize,
+    /// How many of [`Self::migrations`] had their statement rules skipped
+    /// because they are unchanged from [`Self::migrations_unchanged_from`].
+    /// Their schema rules still run.
+    pub migrations_unchanged: usize,
+    /// The git ref `--ignore-migrations-from` named, when it was given.
+    pub migrations_unchanged_from: Option<String>,
     /// The text of each file the human renderer shows a finding in, keyed
     /// by the path the entry shows.
     pub sources: BTreeMap<String, String>,
@@ -201,11 +207,17 @@ impl Report {
             }
         );
         out.push_str(&format!(
-            "\n  checked {} and {} in {}",
+            "\n  checked {} and {}",
             plural(self.queries, "query", "queries"),
             plural(self.migrations, "migration", "migrations"),
-            format_duration(self.elapsed),
         ));
+        if let Some(reference) = &self.migrations_unchanged_from {
+            out.push_str(&format!(
+                " ({} unchanged from {reference}: statement rules skipped)",
+                self.migrations_unchanged
+            ));
+        }
+        out.push_str(&format!(" in {}", format_duration(self.elapsed)));
         if self.schemas.len() == 1 {
             out.push_str(&format!(
                 "\n  schema: {}",
@@ -317,6 +329,7 @@ impl Report {
                 infos: count(Severity::Info),
                 queries: self.queries,
                 migrations: self.migrations,
+                migrations_unchanged: self.migrations_unchanged,
                 failures: self.failures.len(),
                 schema,
             },
@@ -839,6 +852,8 @@ struct JsonSummary<'a> {
     infos: usize,
     queries: usize,
     migrations: usize,
+    #[serde(rename = "migrationsUnchanged")]
+    migrations_unchanged: usize,
     failures: usize,
     schema: BTreeMap<&'a str, &'a UserObjectCounts>,
 }
@@ -994,6 +1009,7 @@ mod tests {
     "infos": 0,
     "queries": 2,
     "migrations": 3,
+    "migrationsUnchanged": 0,
     "failures": 1,
     "schema": {
       "default": {
@@ -1375,6 +1391,29 @@ mod tests {
             report.summary(),
             "typedpg lint: 1 error\n  checked 8 queries and 2 migrations in 0.42s\n  schema: 3 tables, 1 view, 6 indexes, 1 type, 2 functions\n  ✖ failed: 1 finding at or above fail_on (error)"
         );
+    }
+
+    #[test]
+    fn summary_states_the_unchanged_migrations() {
+        let report = Report {
+            queries: 8,
+            migrations: 310,
+            migrations_unchanged: 300,
+            migrations_unchanged_from: Some("origin/main".to_owned()),
+            elapsed: Duration::from_millis(2200),
+            ..Report::default()
+        };
+        assert_eq!(
+            report.summary(),
+            "typedpg lint: no findings\n  checked 8 queries and 310 migrations (300 unchanged \
+             from origin/main: statement rules skipped) in 2.20s\n  ✔ passed"
+        );
+        // The JSON summary carries the count too, and 0 without the flag.
+        let json: serde_json::Value = serde_json::from_str(&report.render(Format::Json)).unwrap();
+        assert_eq!(json["summary"]["migrationsUnchanged"], 300);
+        let json: serde_json::Value =
+            serde_json::from_str(&Report::default().render(Format::Json)).unwrap();
+        assert_eq!(json["summary"]["migrationsUnchanged"], 0);
     }
 
     #[test]

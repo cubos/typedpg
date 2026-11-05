@@ -19,11 +19,15 @@
 //! `typedpg check` boxes in the human format, as one JSON object, or as
 //! SARIF.
 
+mod ignore;
 mod migrations;
 pub mod report;
 mod rules;
 
-pub use migrations::{LintedMigrations, MigrationFile, MigrationFinding, lint_migrations};
+pub use ignore::IgnoreSet;
+pub use migrations::{
+    LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -1064,7 +1068,10 @@ mod tests {
         CREATE TABLE constrained (id integer PRIMARY KEY, x integer);
     "#;
 
-    fn migrations(files: &[(&str, &str, bool)], use_transaction: bool) -> Vec<MigrationFinding> {
+    fn migrations(
+        files: &[(&str, &str, MigrationLint)],
+        use_transaction: bool,
+    ) -> Vec<MigrationFinding> {
         let files: Vec<MigrationFile> = files
             .iter()
             .map(|(path, sql, lint)| MigrationFile {
@@ -1080,7 +1087,10 @@ mod tests {
 
     fn second(sql: &str) -> Vec<MigrationFinding> {
         migrations(
-            &[("001_base.sql", BASE, true), ("002_change.sql", sql, true)],
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                ("002_change.sql", sql, MigrationLint::All),
+            ],
             true,
         )
     }
@@ -1106,7 +1116,7 @@ mod tests {
                      ALTER TABLE posts ADD CONSTRAINT posts_author_fk
                          FOREIGN KEY (author_id) REFERENCES users (id);"
                 ),
-                true,
+                MigrationLint::All,
             )],
             true,
         );
@@ -1132,11 +1142,11 @@ mod tests {
         );
         let findings = migrations(
             &[
-                ("001_base.sql", BASE, true),
+                ("001_base.sql", BASE, MigrationLint::All),
                 (
                     "002_change.sql",
                     "-- no-transaction\nCREATE INDEX CONCURRENTLY users_email_idx ON users (email);",
-                    true,
+                    MigrationLint::All,
                 ),
             ],
             true,
@@ -1144,11 +1154,11 @@ mod tests {
         assert!(only(&findings, Rule::CreateIndexBlocking).is_empty());
         let findings = migrations(
             &[
-                ("001_base.sql", BASE, true),
+                ("001_base.sql", BASE, MigrationLint::All),
                 (
                     "002_change.sql",
                     "CREATE INDEX CONCURRENTLY users_email_idx ON users (email);",
-                    true,
+                    MigrationLint::All,
                 ),
             ],
             false,
@@ -1313,6 +1323,70 @@ mod tests {
     }
 
     #[test]
+    fn fk_without_index_accepts_not_null_partial_indexes() {
+        // A partial index whose predicate only requires the referencing
+        // columns to be NOT NULL serves the foreign-key check: its equality
+        // lookup implies exactly that.
+        for index in [
+            "CREATE INDEX posts_author_partial ON posts (author_id) WHERE author_id IS NOT NULL;",
+            "CREATE INDEX posts_author_partial ON posts (author_id) WHERE (author_id) IS NOT NULL;",
+        ] {
+            let findings = second(&format!(
+                "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);
+                 {index}"
+            ));
+            assert!(
+                only(&findings, Rule::FkWithoutIndex).is_empty(),
+                "{index}: {findings:?}"
+            );
+        }
+        // A composite key's predicate can test each column, with nested ANDs
+        // and parentheses.
+        for index in [
+            "CREATE INDEX pairs_ab_partial ON pairs (a, b) WHERE a IS NOT NULL AND b IS NOT NULL;",
+            "CREATE INDEX pairs_ab_partial ON pairs (a, b) WHERE (a IS NOT NULL AND (b IS NOT NULL));",
+            "CREATE INDEX pairs_ab_partial ON pairs (a, b) WHERE pairs.a IS NOT NULL AND pairs.b IS NOT NULL;",
+        ] {
+            let findings = second(&format!(
+                "ALTER TABLE pairs ADD CONSTRAINT pairs_fk FOREIGN KEY (a, b) REFERENCES parents (a, b);
+                 {index}"
+            ));
+            assert!(
+                only(&findings, Rule::FkWithoutIndex).is_empty(),
+                "{index}: {findings:?}"
+            );
+        }
+        // Anything else does not count.
+        for index in [
+            "CREATE INDEX posts_author_partial ON posts (author_id) WHERE id IS NOT NULL;",
+            "CREATE INDEX posts_author_partial ON posts (author_id) WHERE author_id IS NULL;",
+            "CREATE INDEX posts_author_partial ON posts (author_id) WHERE title = 'x';",
+            "CREATE INDEX posts_author_partial ON posts (author_id) WHERE author_id = 1;",
+            "CREATE INDEX posts_author_partial ON posts (author_id) WHERE NOT author_id IS NULL;",
+            "CREATE INDEX pairs_ab_partial ON pairs (a, b) WHERE a IS NOT NULL OR b IS NOT NULL;",
+            "CREATE INDEX pairs_ab_partial ON pairs (a, b) WHERE (a, b) IS NOT NULL;",
+        ] {
+            let (table, key) = if index.contains("pairs") {
+                (
+                    "pairs",
+                    "ALTER TABLE pairs ADD CONSTRAINT pairs_fk FOREIGN KEY (a, b) REFERENCES parents (a, b);",
+                )
+            } else {
+                (
+                    "posts",
+                    "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);",
+                )
+            };
+            let findings = second(&format!("{key}\n{index}"));
+            assert_eq!(
+                only(&findings, Rule::FkWithoutIndex).len(),
+                1,
+                "{table} {index}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn redundant_index_prefix_exact_and_unique_cases() {
         let prefix = second(
             "CREATE INDEX idx_users_email ON users (email);
@@ -1462,16 +1536,16 @@ mod tests {
         // Adopting an index built concurrently builds nothing.
         let findings = migrations(
             &[
-                ("001_base.sql", BASE, true),
+                ("001_base.sql", BASE, MigrationLint::All),
                 (
                     "002_index.sql",
                     "-- no-transaction\nCREATE UNIQUE INDEX CONCURRENTLY posts_title_key ON posts (title);",
-                    true,
+                    MigrationLint::All,
                 ),
                 (
                     "003_constraint.sql",
                     "ALTER TABLE posts ADD CONSTRAINT posts_title_key UNIQUE USING INDEX posts_title_key;",
-                    true,
+                    MigrationLint::All,
                 ),
             ],
             true,
@@ -1533,22 +1607,123 @@ mod tests {
     }
 
     #[test]
-    fn lint_false_files_are_never_reported() {
+    fn none_files_report_nothing() {
         let findings = migrations(
             &[
-                ("001_base.sql", BASE, true),
+                ("001_base.sql", BASE, MigrationLint::All),
                 (
                     "002_extra.sql",
                     "-- typedpg-lint: allow(no_such_rule)
                      CREATE INDEX posts_author_idx ON posts (author_id);
                      ALTER TABLE posts ADD CONSTRAINT posts_author_fk
                          FOREIGN KEY (author_id) REFERENCES users (id);",
-                    false,
+                    MigrationLint::None,
                 ),
             ],
             true,
         );
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn schema_only_files_skip_statement_rules_and_report_schema_rules() {
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_unchanged.sql",
+                    "CREATE TABLE books (
+                         id integer PRIMARY KEY,
+                         author_id integer REFERENCES users (id)
+                     );
+                     CREATE INDEX users_email_idx ON users (email);",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+        );
+        assert!(
+            only(&findings, Rule::CreateIndexBlocking).is_empty(),
+            "{findings:?}"
+        );
+        let fk = only(&findings, Rule::FkWithoutIndex);
+        assert_eq!(fk.len(), 1, "{findings:?}");
+        assert_eq!(fk[0].file, 1);
+        assert_eq!(
+            fk[0].finding.help.as_deref(),
+            Some(
+                "CREATE INDEX CONCURRENTLY ON public.books (author_id), in a new migration whose \
+                 first line is -- no-transaction"
+            )
+        );
+    }
+
+    #[test]
+    fn schema_only_redundant_indexes_point_at_a_new_migration() {
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_unchanged.sql",
+                    "CREATE INDEX users_email_idx ON users (email);
+                     CREATE INDEX users_email_idx_two ON users (email);",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+        );
+        let redundant = only(&findings, Rule::RedundantIndex);
+        assert_eq!(redundant.len(), 1, "{findings:?}");
+        assert_eq!(redundant[0].file, 1);
+        assert_eq!(
+            redundant[0].finding.help.as_deref(),
+            Some(
+                "DROP INDEX CONCURRENTLY users_email_idx_two, in a new migration whose first line \
+                 is -- no-transaction"
+            )
+        );
+    }
+
+    #[test]
+    fn schema_only_files_honor_allow_comments() {
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_unchanged.sql",
+                    "-- typedpg-lint: allow(fk_without_index)
+                     CREATE TABLE books (
+                         id integer PRIMARY KEY,
+                         author_id integer REFERENCES users (id)
+                     );
+                     -- typedpg-lint: allow(create_index_blocking)
+                     CREATE INDEX users_email_idx ON users (email);",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn schema_only_files_still_validate_allow_comments() {
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_unchanged.sql",
+                    "-- typedpg-lint: allow(no_such_rule)
+                     CREATE INDEX users_email_idx ON users (email);",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+        );
+        let invalid = only(&findings, Rule::InvalidAllow);
+        assert_eq!(invalid.len(), 1, "{findings:?}");
+        assert_eq!(invalid[0].file, 1);
+        assert!(invalid[0].finding.message.contains("unknown lint rule"));
     }
 
     #[test]

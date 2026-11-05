@@ -12,5 +12,8 @@ publish = false
 [package.metadata.typedpg.database]
 migrations = "./migrations"
 
+[package.metadata.typedpg.lint]
+ignore = ["tests/ignored.rs"]
+
 [package.metadata.typedpg.databases.other.database]
 migrations = "./other_migrations"

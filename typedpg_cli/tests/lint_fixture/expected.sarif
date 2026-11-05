@@ -387,6 +387,27 @@
               }
             }
           ]
+        },
+        {
+          "ruleId": "analysis_error",
+          "level": "error",
+          "message": {
+            "text": "column \"nope\" does not exist\n  ╭────\n1 │ SELECT nope FROM users\n  ·        ──┬─\n  ·          ╰─ column does not exist\n  ╰────\n"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "tests/ignored.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 9,
+                  "startColumn": 24
+                }
+              }
+            }
+          ]
         }
       ]
     }

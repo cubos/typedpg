@@ -33,6 +33,7 @@
 //! fail_on = "warning"            # the severity `typedpg lint` fails on (default "error")
 //! null_comparison = "off"        # one rule's level: "error", "warning", "info" or "off"
 //! redundant_index = "info"
+//! ignore = ["tests/**"]          # paths whose statement findings are not reported
 //! ```
 //!
 //! The query rules are `null_comparison`, `unbounded_write` and
@@ -40,6 +41,11 @@
 //! `constraint_validating`, `set_not_null_scan` and `table_rewrite`; and the
 //! schema rules `fk_without_index` and `redundant_index`, evaluated over the
 //! migrations' final schema. [`LINT_RULES`] is the one list of their keys.
+//! `ignore` lists glob patterns, relative to the manifest's directory. A
+//! matching query file's findings are not reported; a matching migration
+//! file keeps its schema findings (`fk_without_index`, `redundant_index`),
+//! placed on the statements that created the objects, but skips the
+//! statement rules. A file that does not compile still fails.
 //!
 //! `[types]` is a single unified map from a PostgreSQL type to the Rust type
 //! it should surface as. Keys are looked up by `schema.name` (or just `name`,
@@ -259,14 +265,20 @@ impl LintLevel {
     }
 }
 
-/// The `lint` section: the severity `typedpg lint` fails on, and each rule's
-/// level. Rules without an override use their default (in `typedpg_lint`).
+/// The `lint` section: the severity `typedpg lint` fails on, each rule's
+/// level, and the paths whose statement findings are not reported. Rules
+/// without an override use their default (in `typedpg_lint`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintConfig {
     /// A finding at or above this severity fails the run.
     pub fail_on: LintSeverity,
     /// The rules whose level is overridden, keyed by [`LINT_RULES`].
     pub levels: BTreeMap<String, LintLevel>,
+    /// Glob patterns, relative to the project root with forward slashes. A
+    /// matching query file's findings are not reported; a matching migration
+    /// file reports only its schema rules, placed on the creating
+    /// statements. A failure in one still fails the run.
+    pub ignore: Vec<String>,
 }
 
 impl Default for LintConfig {
@@ -274,6 +286,7 @@ impl Default for LintConfig {
         Self {
             fail_on: LintSeverity::Error,
             levels: BTreeMap::new(),
+            ignore: Vec::new(),
         }
     }
 }
@@ -283,6 +296,8 @@ impl Default for LintConfig {
 struct LintSettings {
     #[serde(default)]
     fail_on: Option<String>,
+    #[serde(default)]
+    ignore: Option<Vec<String>>,
     /// Every rule key, as written.
     #[serde(flatten)]
     levels: BTreeMap<String, String>,
@@ -313,7 +328,11 @@ impl LintSettings {
                 })?;
             levels.insert(key.clone(), level);
         }
-        Ok(LintConfig { fail_on, levels })
+        Ok(LintConfig {
+            fail_on,
+            levels,
+            ignore: self.ignore.clone().unwrap_or_default(),
+        })
     }
 }
 
@@ -716,6 +735,7 @@ impl Config {
             .find(|r| !LINT_RULES.contains(&r.as_str()))
         {
             let keys = std::iter::once("fail_on")
+                .chain(std::iter::once("ignore"))
                 .chain(LINT_RULES.iter().copied())
                 .map(|r| format!("`{r}`"))
                 .collect::<Vec<_>>()
@@ -1530,13 +1550,37 @@ event_data = "crate::EventData"
         assert_eq!(lint(""), LintConfig::default());
         let config = lint(
             "[package.metadata.typedpg.lint]\nfail_on = \"warning\"\n\
-             null_comparison = \"off\"\nunbounded_write = \"info\"\n",
+             null_comparison = \"off\"\nunbounded_write = \"info\"\n\
+             ignore = [\"tests/**\", \"**/fixtures/*.sql\"]\n",
         );
         assert_eq!(config.fail_on, LintSeverity::Warning);
         assert_eq!(config.levels["null_comparison"], LintLevel::Off);
         assert_eq!(config.levels["unbounded_write"], LintLevel::Info);
+        assert_eq!(config.ignore, ["tests/**", "**/fixtures/*.sql"]);
         assert_eq!(LintLevel::Off.severity(), None);
         assert_eq!(LintLevel::Warning.severity(), Some(LintSeverity::Warning));
+    }
+
+    #[test]
+    fn lint_ignore_is_not_a_rule_and_rejects_non_strings() {
+        // `ignore` is a key of its own, never a rule name.
+        let header = "[package]\nname = \"a\"\n[package.metadata.typedpg]\n";
+        let config = Config::from_str(&format!(
+            "{header}[package.metadata.typedpg.lint]\nignore = [\"tests/**\"]\n"
+        ))
+        .unwrap()
+        .resolve(None)
+        .unwrap()
+        .lint;
+        assert!(config.levels.is_empty());
+        assert_eq!(config.ignore, ["tests/**"]);
+
+        let err = Config::from_str(&format!(
+            "{header}[package.metadata.typedpg.lint]\nignore = [1]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expected a string"), "{err}");
     }
 
     #[test]
@@ -1549,7 +1593,7 @@ event_data = "crate::EventData"
         assert_eq!(
             err.to_string(),
             "unknown key `null_comparisions` in [package.metadata.typedpg.lint]: expected one \
-             of `fail_on`, `null_comparison`, `unbounded_write`, `not_in_nullable`, \
+             of `fail_on`, `ignore`, `null_comparison`, `unbounded_write`, `not_in_nullable`, \
              `create_index_blocking`, `constraint_validating`, `set_not_null_scan`, \
              `table_rewrite`, `fk_without_index`, `redundant_index`"
         );

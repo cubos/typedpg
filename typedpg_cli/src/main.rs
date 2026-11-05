@@ -42,6 +42,11 @@ enum Commands {
         /// How to print the report: `human`, `json` or `sarif`.
         #[arg(long, default_value = "human")]
         format: Format,
+        /// A git ref (e.g. `origin/main`): migrations identical to it skip
+        /// the statement rules; the schema rules still report on the
+        /// statements that created their objects.
+        #[arg(long)]
+        ignore_migrations_from: Option<String>,
     },
 }
 
@@ -71,13 +76,17 @@ async fn run(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         Commands::Lint {
             manifest_path,
             format,
-        } => match typedpg_cli::lint::run(&manifest_path, format) {
-            Ok(ok) => Ok(ok),
-            Err(e) => {
-                eprintln!("error: {e}");
-                Ok(false)
+            ignore_migrations_from,
+        } => {
+            match typedpg_cli::lint::run(&manifest_path, format, ignore_migrations_from.as_deref())
+            {
+                Ok(ok) => Ok(ok),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    Ok(false)
+                }
             }
-        },
+        }
     }
 }
 

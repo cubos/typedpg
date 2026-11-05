@@ -22,7 +22,12 @@
 //! `unboundedWrite` and `notInNullable`; the migration rules
 //! `createIndexBlocking`, `constraintValidating`, `setNotNullScan` and
 //! `tableRewrite`; the schema rules `fkWithoutIndex` and `redundantIndex`.
-//! Rules without an override keep their default severity. A
+//! Rules without an override keep their default severity. `ignore` lists
+//! glob patterns, relative to the config's directory. A matching query
+//! file's findings are not reported; a matching migration file keeps its
+//! schema findings (`fkWithoutIndex`, `redundantIndex`), placed on the
+//! statements that created the objects, but skips the statement rules. A
+//! query that does not compile still fails. A
 //! `-- typedpg-lint: allow(rule)` comment suppresses a rule in the query or
 //! migration statement it is in.
 //!
@@ -80,11 +85,13 @@ struct RawConfig {
     lint: Option<RawLint>,
 }
 
-/// `lint`: the severity the run fails on and each rule's level.
+/// `lint`: the severity the run fails on, each rule's level, and the paths
+/// whose statement findings are not reported.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawLint {
     fail_on: Option<String>,
+    ignore: Option<Vec<String>>,
     #[serde(flatten)]
     rules: BTreeMap<String, String>,
 }
@@ -168,6 +175,7 @@ fn lint_config(raw: Option<RawLint>) -> Result<LintConfig, String> {
     for (key, value) in raw.rules {
         let Some(rule) = LINT_RULES.iter().find(|r| camel_key(r) == key) else {
             let keys = std::iter::once("failOn".to_owned())
+                .chain(std::iter::once("ignore".to_owned()))
                 .chain(LINT_RULES.iter().map(|r| camel_key(r)))
                 .map(|k| format!("`{k}`"))
                 .collect::<Vec<_>>()
@@ -184,7 +192,11 @@ fn lint_config(raw: Option<RawLint>) -> Result<LintConfig, String> {
         })?;
         levels.insert((*rule).to_owned(), level);
     }
-    Ok(LintConfig { fail_on, levels })
+    Ok(LintConfig {
+        fail_on,
+        levels,
+        ignore: raw.ignore.unwrap_or_default(),
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -774,13 +786,16 @@ mod tests {
         assert_eq!(parse("").unwrap(), LintConfig::default());
         let lint = parse(
             r#", "lint": { "failOn": "warning", "nullComparison": "off",
-                           "unboundedWrite": "info" }"#,
+                           "unboundedWrite": "info", "ignore": ["tests/**"] }"#,
         )
         .unwrap();
         assert_eq!(lint.fail_on, LintSeverity::Warning);
         assert_eq!(lint.levels["null_comparison"], LintLevel::Off);
         assert_eq!(lint.levels["unbounded_write"], LintLevel::Info);
+        assert_eq!(lint.ignore, ["tests/**"]);
 
+        let err = parse(r#", "lint": { "ignore": ["tests/**", 1] }"#).unwrap_err();
+        assert!(err.contains("expected a string"), "{err}");
         let err = parse(r#", "lint": { "nullComparison": "fatal" }"#).unwrap_err();
         assert!(
             err.contains("invalid `lint.nullComparison` value `fatal`"),
@@ -792,7 +807,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains("`failOn`, `nullComparison`, `unboundedWrite`"),
+            err.contains("`failOn`, `ignore`, `nullComparison`, `unboundedWrite`"),
             "{err}"
         );
         let err = parse(r#", "lint": { "failOn": "off" }"#).unwrap_err();

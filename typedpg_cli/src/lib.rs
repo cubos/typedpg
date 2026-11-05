@@ -5,8 +5,12 @@
 
 pub mod lint;
 
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use chrono::Utc;
 use typedpg::migrate::{self, MigrationSource, MigrationsConfig};
@@ -79,6 +83,167 @@ fn write_new(path: &Path) -> std::io::Result<()> {
                 e
             }
         })
+}
+
+/// The files among `files` whose content is identical to their version at
+/// git ref `reference` (`--ignore-migrations-from`).
+///
+/// `reference` is resolved to a commit; a file absent from it, or different
+/// from it, is not returned. Files are compared by blob id, so the same
+/// filters a commit applies are applied to the working copies too. Not being
+/// in a git repository, or an unknown ref, is an error.
+pub fn unchanged_from_ref(reference: &str, files: &[PathBuf]) -> Result<HashSet<PathBuf>, String> {
+    let base = files
+        .first()
+        .and_then(|file| file.parent())
+        .unwrap_or(Path::new("."));
+    let top = git_text(base, &["rev-parse", "--show-toplevel"]).map_err(|error| {
+        format!(
+            "{} is not in a git repository (needed by --ignore-migrations-from): {error}",
+            base.display()
+        )
+    })?;
+    let top = PathBuf::from(top.trim_end());
+    let top = fs::canonicalize(&top).map_err(|error| {
+        format!(
+            "failed to resolve the git work tree {}: {error}",
+            top.display()
+        )
+    })?;
+    let commit = git_text(
+        &top,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+    )
+    .map_err(|_| format!("unknown git ref `{reference}`"))?;
+
+    // Each file's path relative to the work tree root, as git writes it (with
+    // forward slashes), mapped back to the path the caller passed.
+    let mut relative: HashMap<String, PathBuf> = HashMap::new();
+    for file in files {
+        let absolute = fs::canonicalize(file)
+            .map_err(|error| format!("failed to read {}: {error}", file.display()))?;
+        let path = absolute.strip_prefix(&top).map_err(|_| {
+            format!(
+                "{} is outside the git work tree {}",
+                file.display(),
+                top.display()
+            )
+        })?;
+        relative.insert(
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+            file.clone(),
+        );
+    }
+    if relative.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // REF's blob for each path, from `ls-tree -z`; a path missing from REF
+    // simply has none.
+    let mut args: Vec<OsString> = vec![
+        "ls-tree".into(),
+        "-r".into(),
+        "-z".into(),
+        "--full-tree".into(),
+        commit.trim().into(),
+        "--".into(),
+    ];
+    args.extend(relative.keys().map(OsString::from));
+    let tree = git_output(&top, &args)?;
+    let mut reference_blobs: HashMap<&str, &str> = HashMap::new();
+    for entry in tree.split(|byte| *byte == 0) {
+        // `<[u8]>::split_once` is unstable: split at the tab by hand.
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let (meta, path) = (&entry[..tab], &entry[tab + 1..]);
+        let mut fields = meta.split(|byte| *byte == b' ');
+        let (Some(_mode), Some(_kind), Some(oid)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Ok(path) = std::str::from_utf8(path) else {
+            continue;
+        };
+        if relative.contains_key(path) {
+            reference_blobs.insert(path, std::str::from_utf8(oid).unwrap_or(""));
+        }
+    }
+    if reference_blobs.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // Hash the working files with the same filters a commit would apply.
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin-paths"])
+        .current_dir(&top)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    let mut stdin = child.stdin.take().expect("git's stdin is piped");
+    let mut input = String::new();
+    for path in reference_blobs.keys() {
+        input.push_str(path);
+        input.push('\n');
+    }
+    stdin
+        .write_all(input.as_bytes())
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    if !output.status.success() {
+        return Err(git_error("hash-object --stdin-paths", &output.stderr));
+    }
+    let working = String::from_utf8_lossy(&output.stdout);
+    let mut unchanged = HashSet::new();
+    for ((path, reference_blob), working_blob) in reference_blobs.iter().zip(working.lines()) {
+        if *reference_blob == working_blob {
+            unchanged.insert(relative[*path].clone());
+        }
+    }
+    Ok(unchanged)
+}
+
+/// Run git in `dir` and return its stdout, or its stderr as the error.
+fn git_output(dir: &Path, args: &[OsString]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    if !output.status.success() {
+        let command = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(git_error(&command, &output.stderr));
+    }
+    Ok(output.stdout)
+}
+
+/// Run git in `dir` and return its stdout as text.
+fn git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    String::from_utf8(git_output(dir, &args)?)
+        .map_err(|error| format!("git printed non-UTF-8 output: {error}"))
+}
+
+fn git_error(command: &str, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("git {command} failed")
+    } else {
+        format!("git {command}: {stderr}")
+    }
 }
 
 /// Connect honoring the URL's `sslmode` as libpq does: `disable` is plain,
@@ -253,4 +418,105 @@ pub async fn run_migrate_action(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+        assert!(status.success(), "git {} failed", args.join(" "));
+    }
+
+    #[test]
+    fn unchanged_from_ref_compares_the_working_files_with_the_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        let first = root.join("0001_first.sql");
+        let second = root.join("0002_second.sql");
+        fs::write(&first, "CREATE TABLE a (id integer);\n").unwrap();
+        fs::write(&second, "CREATE TABLE b (id integer);\n").unwrap();
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "add",
+                ".",
+            ],
+        );
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "two migrations",
+            ],
+        );
+
+        // One identical, one modified, one added.
+        fs::write(&second, "CREATE TABLE b (id bigint);\n").unwrap();
+        let third = root.join("0003_third.sql");
+        fs::write(&third, "CREATE TABLE c (id integer);\n").unwrap();
+        let unchanged =
+            unchanged_from_ref("HEAD", &[first.clone(), second.clone(), third.clone()]).unwrap();
+        assert_eq!(unchanged, HashSet::from([first]));
+    }
+
+    #[test]
+    fn unchanged_from_ref_rejects_an_unknown_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        let file = root.join("0001_first.sql");
+        fs::write(&file, "CREATE TABLE a (id integer);\n").unwrap();
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "add",
+                ".",
+            ],
+        );
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "one migration",
+            ],
+        );
+        let error = unchanged_from_ref("origin/nope", &[file]).unwrap_err();
+        assert!(error.contains("origin/nope"), "{error}");
+    }
+
+    #[test]
+    fn unchanged_from_ref_needs_a_git_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("0001_first.sql");
+        fs::write(&file, "CREATE TABLE a (id integer);\n").unwrap();
+        let error = unchanged_from_ref("HEAD", &[file]).unwrap_err();
+        assert!(error.contains("not in a git repository"), "{error}");
+    }
 }

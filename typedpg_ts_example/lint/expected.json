@@ -131,6 +131,7 @@
     "infos": 1,
     "queries": 10,
     "migrations": 2,
+    "migrationsUnchanged": 0,
     "failures": 2,
     "schema": {
       "default": {

@@ -118,15 +118,22 @@
       "line": 27,
       "column": 16,
       "message": "the SQL of sql! must be a string literal"
+    },
+    {
+      "path": "tests/ignored.rs",
+      "line": 9,
+      "column": 24,
+      "message": "column \"nope\" does not exist\n  ╭────\n1 │ SELECT nope FROM users\n  ·        ──┬─\n  ·          ╰─ column does not exist\n  ╰────\n"
     }
   ],
   "summary": {
     "errors": 4,
     "warnings": 5,
     "infos": 0,
-    "queries": 8,
+    "queries": 10,
     "migrations": 4,
-    "failures": 3,
+    "migrationsUnchanged": 0,
+    "failures": 4,
     "schema": {
       "default": {
         "tables": 2,

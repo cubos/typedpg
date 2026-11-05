@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -9,7 +9,7 @@ use typedpg_cli::{MigrateAction, connect, create_migration, run_migrate_action};
 use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
-use typedpg_lint::{Finding, LintOptions};
+use typedpg_lint::{Finding, IgnoreSet, LintOptions, MigrationLint};
 use typedpg_ts::cache;
 use typedpg_ts::config::{CONFIG_FILE, Config};
 use typedpg_ts::project::Project;
@@ -51,6 +51,11 @@ enum Command {
         /// How to print the report: `human`, `json` or `sarif`.
         #[arg(long, default_value = "human")]
         format: Format,
+        /// A git ref (e.g. `origin/main`): migrations identical to it skip
+        /// the statement rules; the schema rules still report on the
+        /// statements that created their objects.
+        #[arg(long)]
+        ignore_migrations_from: Option<String>,
     },
     /// Compile every .sql file into the cache the loaders and bundler
     /// plugins read, so that importing one runs no analysis.
@@ -93,7 +98,11 @@ fn main() -> ExitCode {
         } => watch::run(&config).map(|()| true),
         Command::Gen { config, .. } => generate(&config, false),
         Command::Check { config } => generate(&config, true),
-        Command::Lint { config, format } => lint(&config, format),
+        Command::Lint {
+            config,
+            format,
+            ignore_migrations_from,
+        } => lint(&config, format, ignore_migrations_from.as_deref()),
         Command::Build { config, json } => build(&config, json),
         Command::Serve { idle_timeout } => typedpg_ts::serve::run(idle_timeout).map(|()| true),
         Command::Migrate {
@@ -157,10 +166,19 @@ fn relative(path: &Path, root: &Path) -> String {
 
 /// Lint every query; whether no analysis failed and no finding reaches
 /// `fail_on`.
-fn lint(config: &Path, format: Format) -> Result<bool, String> {
+///
+/// With `ignore_migrations_from`, migration files identical to that git ref
+/// have their statement rules skipped; the schema rules still report on the
+/// statements that created the schema's objects.
+fn lint(
+    config: &Path,
+    format: Format,
+    ignore_migrations_from: Option<&str>,
+) -> Result<bool, String> {
     let start = Instant::now();
     let config = Config::load(config)?;
     let options = LintOptions::from_config(&config.lint);
+    let ignore = IgnoreSet::new(&config.lint.ignore)?;
     let mut project = Project::new(config, true)?;
     let root = project.config.root.clone();
     // The check `cargo build` would run: every diagnostic it reports is a
@@ -168,7 +186,10 @@ fn lint(config: &Path, format: Format) -> Result<bool, String> {
     // scanner error, a `.sql` layout error, a broken migration). Stale
     // generated modules only need `typedpg gen`.
     let sync = project.sync(true);
-    let mut report = Report::default();
+    let mut report = Report {
+        migrations_unchanged_from: ignore_migrations_from.map(str::to_owned),
+        ..Report::default()
+    };
     for diagnostic in &sync.diagnostics {
         report.failures.push(Failure {
             path: relative(&diagnostic.file, &root),
@@ -182,13 +203,14 @@ fn lint(config: &Path, format: Format) -> Result<bool, String> {
     // `(database, text)` → its findings or analysis error. The same query is
     // often written at several call sites.
     let mut cache: HashMap<(usize, String), LintResult> = HashMap::new();
+    let mut migration_paths = HashSet::new();
     for db in 0..project.database_count() {
         let files = match project.lint_migration_files(db) {
             Ok(files) => files,
             Err(_) => continue,
         };
         report.migrations += files.len();
-        let lint_files: Vec<typedpg_lint::MigrationFile> = files
+        let mut lint_files: Vec<typedpg_lint::MigrationFile> = files
             .iter()
             .map(|file| typedpg_lint::MigrationFile {
                 path: relative(&file.path, &root),
@@ -196,8 +218,32 @@ fn lint(config: &Path, format: Format) -> Result<bool, String> {
                 lint: file.lint,
             })
             .collect();
+        if let Some(reference) = ignore_migrations_from {
+            let candidates: Vec<PathBuf> = files
+                .iter()
+                .filter(|file| file.lint == MigrationLint::All)
+                .map(|file| file.path.clone())
+                .collect();
+            if !candidates.is_empty() {
+                let unchanged = typedpg_cli::unchanged_from_ref(reference, &candidates)?;
+                for (file, lint_file) in files.iter().zip(&mut lint_files) {
+                    if lint_file.lint == MigrationLint::All && unchanged.contains(&file.path) {
+                        lint_file.lint = MigrationLint::SchemaOnly;
+                        report.migrations_unchanged += 1;
+                    }
+                }
+            }
+        }
+        // An ignored migration file still builds the schema, and its schema
+        // findings stay placed in it: only its statement rules are skipped.
+        for lint_file in &mut lint_files {
+            if lint_file.lint != MigrationLint::None && ignore.is_ignored(&lint_file.path) {
+                lint_file.lint = MigrationLint::SchemaOnly;
+            }
+        }
         for file in &lint_files {
             report.sources.insert(file.path.clone(), file.sql.clone());
+            migration_paths.insert(file.path.clone());
         }
         if let Ok(linted) = typedpg_lint::lint_migrations(
             &lint_files,
@@ -253,6 +299,12 @@ fn lint(config: &Path, format: Format) -> Result<bool, String> {
         }
     }
 
+    // `lint.ignore` drops findings only: a failure above still fails the run.
+    // A matching migration file is linted schema-only instead, so its schema
+    // findings stay placed in it.
+    report
+        .entries
+        .retain(|entry| !ignore.is_ignored(&entry.path) || migration_paths.contains(&entry.path));
     report.load_failure_sources(&root);
     report.sort();
     report.elapsed = start.elapsed();

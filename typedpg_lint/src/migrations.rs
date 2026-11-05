@@ -15,10 +15,29 @@ use typedpg_analyzer::{
 };
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::protobuf::{
-    AlterTableType, ConstrType, Node, NullTestType, SortByDir, SortByNulls, node::Node as N,
+    AlterTableType, BoolExprType, ConstrType, Node, NullTestType, SortByDir, SortByNulls,
+    node::Node as N,
 };
 
 use crate::{AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment};
+
+/// What [`lint_migrations`] reports for a migration file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationLint {
+    /// Every rule runs: the statement rules, the schema rules and the
+    /// file's allow comments are validated.
+    All,
+    /// The statement rules are skipped, but the schema rules still run over
+    /// the final catalog and place their findings on the statements that
+    /// created the objects — as do the file's own allow comments, which are
+    /// still validated. Files unchanged from `--ignore-migrations-from` and
+    /// files matched by `lint.ignore` use this: their history cannot be
+    /// changed, but the schema they leave behind is still linted.
+    SchemaOnly,
+    /// Nothing is reported: the file is somebody else's schema
+    /// (`extra_migrations`), applied only so the catalog can be built.
+    None,
+}
 
 /// One migration file given to [`lint_migrations`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,10 +46,8 @@ pub struct MigrationFile {
     pub path: String,
     /// The file's text.
     pub sql: String,
-    /// Whether its statements are reported. `false` for `extra_migrations`:
-    /// they are applied because the schema depends on them, but they are
-    /// somebody else's files.
-    pub lint: bool,
+    /// What the linter reports for this file.
+    pub lint: MigrationLint,
 }
 
 /// A finding in a migration file: an index into the input slice and the
@@ -131,6 +148,15 @@ enum CreatedObject {
     Index(PgClassOid),
 }
 
+/// A schema rule's finding, before it is placed on its creator's statement.
+struct SchemaFinding {
+    object: CreatedObject,
+    raw: RawFinding,
+    /// The help when the creator is in a [`MigrationLint::SchemaOnly`] file:
+    /// its statement cannot change, so the fix is a new migration.
+    help_in_new_migration: Option<String>,
+}
+
 struct MigrationLinter<'a> {
     files: &'a [MigrationFile],
     options: &'a LintOptions,
@@ -180,7 +206,7 @@ impl MigrationLinter<'_> {
     /// Report the invalid allow comments of a file whose statements never
     /// reached them (an empty file, or one that failed to parse).
     fn end_file(&mut self) {
-        if !self.files[self.current].lint {
+        if self.files[self.current].lint == MigrationLint::None {
             return;
         }
         let comments = std::mem::take(&mut self.comments);
@@ -335,7 +361,7 @@ impl MigrationLinter<'_> {
     }
 
     fn statement_rules(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
-        if !self.files[self.current].lint {
+        if self.files[self.current].lint != MigrationLint::All {
             return;
         }
         for rule in [
@@ -665,12 +691,17 @@ impl MigrationLinter<'_> {
         &mut self,
         catalog: &PgCatalog,
         rule: Rule,
-        find: impl Fn(&MigrationLinter<'_>, &PgCatalog) -> Vec<(CreatedObject, RawFinding)>,
+        find: impl Fn(&MigrationLinter<'_>, &PgCatalog) -> Vec<SchemaFinding>,
     ) {
         let Some(severity) = self.options.level(rule) else {
             return;
         };
-        for (object, raw) in find(self, catalog) {
+        for SchemaFinding {
+            object,
+            raw,
+            help_in_new_migration,
+        } in find(self, catalog)
+        {
             let creator = match object {
                 CreatedObject::Constraint(oid) => self.created_constraints.get(&oid),
                 CreatedObject::Index(oid) => self.created_indexes.get(&oid),
@@ -681,6 +712,11 @@ impl MigrationLinter<'_> {
             if creator.suppressed.contains(&rule) {
                 continue;
             }
+            let help = if self.files[creator.file].lint == MigrationLint::SchemaOnly {
+                help_in_new_migration.or(raw.help)
+            } else {
+                raw.help
+            };
             self.findings.push(MigrationFinding {
                 file: creator.file,
                 finding: Finding {
@@ -688,13 +724,13 @@ impl MigrationLinter<'_> {
                     severity,
                     span: creator.span.clone(),
                     message: raw.message,
-                    help: raw.help,
+                    help,
                 },
             });
         }
     }
 
-    fn fk_without_index(&self, catalog: &PgCatalog) -> Vec<(CreatedObject, RawFinding)> {
+    fn fk_without_index(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut out = Vec::new();
         for constraint in catalog
             .iter_constraints()
@@ -721,7 +757,11 @@ impl MigrationLinter<'_> {
             let key_count = key.len();
             let indexed = catalog
                 .iter_indexes()
-                .filter(|index| index.indrelid == constraint.conrelid && keys_plain(index))
+                .filter(|index| {
+                    index.indrelid == constraint.conrelid
+                        && index.indexprs.is_empty()
+                        && index.indkey.iter().all(|&key| key != 0)
+                })
                 // The check looks rows up by equality: a btree serves any
                 // key, a hash index a single column.
                 .filter(
@@ -737,7 +777,10 @@ impl MigrationLinter<'_> {
                     }
                     let leading: HashSet<i16> =
                         index.indkey.iter().take(key_count).copied().collect();
-                    leading == key
+                    // The lookup's equality implies each referencing column
+                    // is NOT NULL, so a partial index that only requires
+                    // that serves it too.
+                    leading == key && index_serves_foreign_key(catalog, index, &columns)
                 });
             if indexed {
                 continue;
@@ -748,9 +791,9 @@ impl MigrationLinter<'_> {
                 .map(|column| quote_identifier(column))
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push((
-                CreatedObject::Constraint(constraint.oid),
-                RawFinding {
+            out.push(SchemaFinding {
+                object: CreatedObject::Constraint(constraint.oid),
+                raw: RawFinding {
                     span: 0..0,
                     message: format!(
                         "foreign key {} on {table} ({columns}) has no index",
@@ -758,12 +801,16 @@ impl MigrationLinter<'_> {
                     ),
                     help: Some(format!("CREATE INDEX ON {table} ({columns})")),
                 },
-            ));
+                help_in_new_migration: Some(format!(
+                    "CREATE INDEX CONCURRENTLY ON {table} ({columns}), in a new migration whose \
+                     first line is -- no-transaction"
+                )),
+            });
         }
         out
     }
 
-    fn redundant_index(&self, catalog: &PgCatalog) -> Vec<(CreatedObject, RawFinding)> {
+    fn redundant_index(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut indexes: Vec<&PgIndex> = catalog.iter_indexes().collect();
         indexes.sort_by_key(|index| index.indexrelid);
         let mut out = Vec::new();
@@ -791,9 +838,9 @@ impl MigrationLinter<'_> {
                 ) else {
                     continue;
                 };
-                out.push((
-                    CreatedObject::Index(index.indexrelid),
-                    RawFinding {
+                out.push(SchemaFinding {
+                    object: CreatedObject::Index(index.indexrelid),
+                    raw: RawFinding {
                         span: 0..0,
                         message: format!(
                             "index {} is redundant with {}",
@@ -802,7 +849,12 @@ impl MigrationLinter<'_> {
                         ),
                         help: None,
                     },
-                ));
+                    help_in_new_migration: Some(format!(
+                        "DROP INDEX CONCURRENTLY {}, in a new migration whose first line is \
+                         -- no-transaction",
+                        quote_identifier(&name.relname)
+                    )),
+                });
             }
         }
         out
@@ -817,7 +869,7 @@ impl MigrationObserver for MigrationLinter<'_> {
             .iter_indexes()
             .map(|index| index.indexrelid)
             .collect();
-        if !self.files[self.current].lint {
+        if self.files[self.current].lint == MigrationLint::None {
             return;
         }
         self.current_span = self.trimmed(&statement.span);
@@ -826,7 +878,9 @@ impl MigrationObserver for MigrationLinter<'_> {
             .iter_constraints()
             .map(|constraint| constraint.oid)
             .collect();
-        self.statement_rules(catalog, statement);
+        if self.files[self.current].lint == MigrationLint::All {
+            self.statement_rules(catalog, statement);
+        }
         self.last_statement_end = statement.span.end;
     }
 
@@ -843,7 +897,7 @@ impl MigrationObserver for MigrationLinter<'_> {
                 self.orderings.insert(*oid, order.clone());
             }
         }
-        if !self.files[self.current].lint {
+        if self.files[self.current].lint == MigrationLint::None {
             return;
         }
         let constraints: HashSet<PgConstraintOid> = catalog
@@ -918,6 +972,60 @@ fn is_not_null(node: &Node, column: &str) -> bool {
 
 fn keys_plain(index: &PgIndex) -> bool {
     index.indpred.is_none() && index.indexprs.is_empty() && index.indkey.iter().all(|&key| key != 0)
+}
+
+/// Whether the foreign-key check can use `index`: it is not partial, or its
+/// predicate only requires that columns among the foreign key's referencing
+/// `columns` are NOT NULL. The check looks rows up with `col = $1 …`, which
+/// implies exactly that.
+fn index_serves_foreign_key(catalog: &PgCatalog, index: &PgIndex, columns: &[&str]) -> bool {
+    if index.indpred.is_none() {
+        return true;
+    }
+    catalog
+        .index_predicate(index.indexrelid)
+        .is_some_and(|predicate| not_null_and(&predicate, columns))
+}
+
+/// Whether `node` is `col IS NOT NULL`, or an AND of such tests (including
+/// nested ANDs and parentheses), for columns among `columns` only.
+fn not_null_and(node: &Node, columns: &[&str]) -> bool {
+    match node.node.as_ref() {
+        Some(N::BoolExpr(expr))
+            if BoolExprType::try_from(expr.boolop) == Ok(BoolExprType::AndExpr) =>
+        {
+            !expr.args.is_empty() && expr.args.iter().all(|arg| not_null_and(arg, columns))
+        }
+        Some(N::NullTest(test)) => {
+            NullTestType::try_from(test.nulltesttype) == Ok(NullTestType::IsNotNull)
+                && !test.argisrow
+                && test
+                    .arg
+                    .as_deref()
+                    .and_then(column_name)
+                    .is_some_and(|name| columns.contains(&name))
+        }
+        _ => false,
+    }
+}
+
+/// The name a `ColumnRef` names, when it is one (a qualified reference's last
+/// field, as an index predicate may spell `t.col`).
+fn column_name(node: &Node) -> Option<&str> {
+    let N::ColumnRef(reference) = node.node.as_ref()? else {
+        return None;
+    };
+    let (last, qualifiers) = reference.fields.split_last()?;
+    if !qualifiers
+        .iter()
+        .all(|field| matches!(field.node.as_ref(), Some(N::String(_))))
+    {
+        return None;
+    }
+    match last.node.as_ref() {
+        Some(N::String(name)) => Some(&name.sval),
+        _ => None,
+    }
 }
 
 /// Another index `index` is redundant with, and whether the two are exact

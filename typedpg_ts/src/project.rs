@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 use typedpg_analyzer::PgCatalog;
 use typedpg_core::QualifiedName;
+use typedpg_lint::MigrationLint;
 
 use crate::config::{
     Config, DatabaseConfig, Emit, OutKind, OverrideModule, declaration_path, out_kind,
@@ -173,13 +174,13 @@ impl QuerySource<'_> {
     }
 }
 
-/// A migration file `typedpg lint` runs, and whether its statements are
-/// reported (`false` for `extra_migrations`).
+/// A migration file `typedpg lint` runs, and what it reports for it
+/// ([`MigrationLint::None`] for `extra_migrations`).
 pub struct LintMigrationFile {
     /// The file's path, as the project resolved it.
     pub path: PathBuf,
     pub sql: String,
-    pub lint: bool,
+    pub lint: MigrationLint,
 }
 
 pub const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts"];
@@ -1049,7 +1050,11 @@ impl Project {
             .map(|migration| LintMigrationFile {
                 path: migration.path,
                 sql: migration.sql,
-                lint: migration.lint,
+                lint: if migration.lint {
+                    MigrationLint::All
+                } else {
+                    MigrationLint::None
+                },
             })
             .collect())
     }

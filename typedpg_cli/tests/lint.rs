@@ -13,6 +13,162 @@ fn bless() -> bool {
         .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty() && s != "0"))
 }
 
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    assert!(status.success(), "git {} failed", args.join(" "));
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn lint_ignores_migrations_unchanged_from_a_ref() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = crate_dir.join("tests/lint_fixture");
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&fixture, dir.path());
+    git(dir.path(), &["init", "-q"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "add",
+            ".",
+        ],
+    );
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--manifest-path"])
+        .arg(dir.path().join("Cargo.toml"))
+        .args(["--ignore-migrations-from", "HEAD"])
+        .output()
+        .expect("run `cargo-typedpg`");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    // Every migration is unchanged from HEAD, so none of their statement
+    // findings is reported...
+    assert!(!stdout.contains("create_index_blocking"), "{stdout}");
+    assert!(!stdout.contains("constraint_validating"), "{stdout}");
+    // ...but the schema rules still report the current schema's problems,
+    // with the fix in a new migration.
+    assert!(stdout.contains("fk_without_index"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "CREATE INDEX CONCURRENTLY ON public.posts (author_id), in a new migration whose \
+             first line is -- no-transaction"
+        ),
+        "{stdout}"
+    );
+    // ...while the queries are still linted, and failures are never dropped.
+    assert!(stdout.contains("unbounded_write"), "{stdout}");
+    assert!(stdout.contains("tests/ignored.rs:9:24"), "{stdout}");
+    assert!(
+        stderr.contains(
+            "checked 10 queries and 4 migrations (4 unchanged from HEAD: statement rules skipped)"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn lint_ignore_keeps_a_migrations_schema_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "lint_ignore_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+
+[package.metadata.typedpg.lint]
+ignore = ["migrations/0002_hazards.sql"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TABLE users (id integer PRIMARY KEY);\n\
+         CREATE TABLE posts (id integer PRIMARY KEY, author_id integer);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0002_hazards.sql"),
+        "CREATE INDEX users_id_idx ON users (id);\n\
+         ALTER TABLE posts ADD CONSTRAINT posts_author_fk\n\
+             FOREIGN KEY (author_id) REFERENCES users (id);\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .output()
+        .expect("run `cargo-typedpg`");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}\n{stdout}");
+    // The statement rules of the ignored migration are skipped...
+    assert!(!stdout.contains("create_index_blocking"), "{stdout}");
+    // ...but the schema rules still report, with the fix in a new migration.
+    assert!(stdout.contains("warning[fk_without_index]"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "CREATE INDEX CONCURRENTLY ON public.posts (author_id), in a new migration whose \
+             first line is -- no-transaction"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("info[redundant_index]"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "DROP INDEX CONCURRENTLY users_id_idx, in a new migration whose first line is \
+             -- no-transaction"
+        ),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn lint_fixture_reports_the_expected_documents() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
