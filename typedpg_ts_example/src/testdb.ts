@@ -4,6 +4,7 @@
 
 import pg from "pg";
 import postgres from "postgres";
+import postgres3 from "postgres-3";
 import { type Executor, migrate } from "@cubos/typedpg";
 
 import { migrations } from "./db.ts";
@@ -59,6 +60,13 @@ export const drivers: [string, (url: string) => Promise<Connection>][] = [
     "postgres.js",
     async (url) => {
       const sql = postgres(url, { onnotice: () => {}, max: 4 });
+      return { db: sql, close: () => sql.end() };
+    },
+  ],
+  [
+    "postgres.js 3",
+    async (url) => {
+      const sql = postgres3(url, { onnotice: () => {}, max: 4 });
       return { db: sql, close: () => sql.end() };
     },
   ],

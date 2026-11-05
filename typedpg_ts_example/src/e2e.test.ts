@@ -7,6 +7,7 @@ import { after, before, describe, test } from "node:test";
 
 import pg from "pg";
 import postgres from "postgres";
+import postgres3 from "postgres-3";
 import { NoRowsError, TooManyRowsError, TypedpgError, type Executor } from "@cubos/typedpg";
 
 import * as q from "./queries.ts";
@@ -218,22 +219,31 @@ describe("pg transaction client", { skip: !baseUrl && "DATABASE_URL is not set" 
   });
 });
 
-describe("postgres.js transaction", { skip: !baseUrl && "DATABASE_URL is not set" }, () => {
-  test("queries run on the transaction", async () => {
-    const sql = postgres(url, { onnotice: () => {} });
-    try {
-      await sql
-        .begin(async (tx) => {
-          await q.insertUsers.execute(tx, {
-            users: [{ name: "Tx", email: null, mood: null, tags: [], prefs: null, visits: 0, avatar: null }],
-          });
-          assert.equal(await q.countUsers.fetchValue(tx), 4n);
-          throw new Error("rollback");
-        })
-        .catch((e: Error) => assert.equal(e.message, "rollback"));
-      assert.equal(await q.countUsers.fetchValue(sql), 3n);
-    } finally {
-      await sql.end();
-    }
+// Both majors' `sql`, typed as far as the test uses it: their own types differ.
+type PostgresJs = Executor & { begin(f: (tx: Executor) => Promise<unknown>): Promise<unknown>; end(): Promise<void> };
+const postgresJs: [string, (url: string) => PostgresJs][] = [
+  ["postgres.js", (url) => postgres(url, { onnotice: () => {} }) as unknown as PostgresJs],
+  ["postgres.js 3", (url) => postgres3(url, { onnotice: () => {} }) as unknown as PostgresJs],
+];
+
+for (const [name, connect] of postgresJs) {
+  describe(`${name} transaction`, { skip: !baseUrl && "DATABASE_URL is not set" }, () => {
+    test("queries run on the transaction", async () => {
+      const sql = connect(url);
+      try {
+        await sql
+          .begin(async (tx) => {
+            await q.insertUsers.execute(tx, {
+              users: [{ name: "Tx", email: null, mood: null, tags: [], prefs: null, visits: 0, avatar: null }],
+            });
+            assert.equal(await q.countUsers.fetchValue(tx), 4n);
+            throw new Error("rollback");
+          })
+          .catch((e: Error) => assert.equal(e.message, "rollback"));
+        assert.equal(await q.countUsers.fetchValue(sql), 3n);
+      } finally {
+        await sql.end();
+      }
+    });
   });
-});
+}
