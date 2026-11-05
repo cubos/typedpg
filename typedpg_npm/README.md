@@ -548,8 +548,54 @@ await sql("UPDATE users SET visits = visits + $by WHERE id = $id").execute(pool,
 npx typedpg gen            # write the generated modules
 npx typedpg gen --watch    # and keep them up to date
 npx typedpg check          # in CI: fail if a module is stale or a query has an error
+npx typedpg lint           # run the lint rules over every query and migration
 npx typedpg build          # compile the .sql files into the loaders' cache
 ```
+
+`lint` runs these rules over the queries and the database's migrations:
+
+| Rule | Default | What it reports |
+|---|---|---|
+| `null_comparison` | error | A comparison with a `NULL` literal, which is never true. |
+| `unbounded_write` | error | An `UPDATE` or `DELETE` with no `WHERE`. |
+| `not_in_nullable` | warning | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
+| `create_index_blocking` | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
+| `constraint_validating` | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
+| `set_not_null_scan` | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
+| `table_rewrite` | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
+| `fk_without_index` | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
+| `redundant_index` | info | An index another index on the table already covers. |
+
+The `lint` object sets each rule's level — `"error"`, `"warning"`, `"info"`
+or `"off"` — and `failOn`, the severity the run fails on (default `"error"`).
+`ignore` lists glob patterns relative to the config file's directory, with
+forward slashes:
+
+```json
+"lint": { "failOn": "warning", "ignore": ["tests/**"] }
+```
+
+Findings in a matching query file are not reported. A matching migration file
+is still applied and its schema rules still report — on the statement that
+created the object — but its statement rules are skipped: the fix belongs in a
+new migration. Failures are never dropped: a query in an ignored file that
+does not compile still fails lint. A comment suppresses a rule for the query
+or migration statement it is in: `-- typedpg-lint: allow(unbounded_write)`
+(the `/* … */` form works too).
+Migration rules only apply to tables that existed before the file started;
+schema rules are placed at the statement that created the index or constraint.
+Findings go to stdout, the summary to stderr, and the run exits non-zero when
+a finding reaches `failOn` or a query or migration fails analysis.
+`--ignore-migrations-from <ref>` (for example `origin/main`) skips the
+statement rules of migration files identical to their version at that git ref:
+they build the schema, but their locks, scans and rewrites are not reported.
+The schema rules still report the current schema's problems, placed on the
+statement that created the object, with a help line that puts the fix in a new
+migration; their allow comments are honored and validated. A file absent from
+the ref, or changed by the branch, is linted as usual; queries are unaffected.
+`--format json` prints one JSON document (findings, failures and the summary)
+and `--format sarif` prints SARIF 2.1.0 for code scanning; both include the
+analysis failures, which the human format keeps on stderr.
 
 `gen` prints each error at its place in your sources, the line and column of
 the offending token inside the SQL:
@@ -874,6 +920,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 | `simplify` | The query simplifications, on by default: `false` turns them all off, or an object sets one rule to `false` — `notIn`, `countExists`, `distinct`, `unionAll`, `fkJoin`. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent: `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS` when neither side can be NULL, `count(…) > 0` as `EXISTS`, a `DISTINCT` that can't remove a row, a `UNION` whose branches can't share a row as `UNION ALL`, or a join a foreign key proves matches exactly one row none of whose columns are read. The generated module's doc comments show the SQL sent. For every database. |
+| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
 
 Unknown keys are errors.
 

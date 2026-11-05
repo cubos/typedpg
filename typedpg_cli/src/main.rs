@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
 use typedpg::migrate::MigrationSource;
 use typedpg_cli::{MigrateAction, connect, create_migration, run_migrate_action};
 use typedpg_core::config::Config;
+use typedpg_lint::report::Format;
 
 /// Entry point for `cargo typedpg`.
 ///
@@ -33,6 +34,20 @@ enum Commands {
         #[command(subcommand)]
         action: MigrateAction,
     },
+    /// Lint every `sql!` query and the database's migrations
+    Lint {
+        /// The crate's Cargo.toml.
+        #[arg(long, default_value = "./Cargo.toml")]
+        manifest_path: PathBuf,
+        /// How to print the report: `human`, `json` or `sarif`.
+        #[arg(long, default_value = "human")]
+        format: Format,
+        /// A git ref (e.g. `origin/main`): migrations identical to it skip
+        /// the statement rules; the schema rules still report on the
+        /// statements that created their objects.
+        #[arg(long)]
+        ignore_migrations_from: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -41,16 +56,37 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    if let Err(e) = run(cli).await {
-        eprintln!("Error: {e}");
-        process::exit(1);
+    match run(cli).await {
+        Ok(true) => {}
+        Ok(false) => process::exit(1),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
     let CargoSubcommand::Typedpg { command } = cli.command;
     match command {
-        Commands::Migrate { action } => handle_migrate(action).await,
+        Commands::Migrate { action } => {
+            handle_migrate(action).await?;
+            Ok(true)
+        }
+        Commands::Lint {
+            manifest_path,
+            format,
+            ignore_migrations_from,
+        } => {
+            match typedpg_cli::lint::run(&manifest_path, format, ignore_migrations_from.as_deref())
+            {
+                Ok(ok) => Ok(ok),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    Ok(false)
+                }
+            }
+        }
     }
 }
 

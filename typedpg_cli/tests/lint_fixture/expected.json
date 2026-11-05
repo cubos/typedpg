@@ -1,0 +1,158 @@
+{
+  "findings": [
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 3,
+      "column": 1,
+      "endLine": 3,
+      "endColumn": 44,
+      "rule": "create_index_blocking",
+      "severity": "warning",
+      "message": "CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build",
+      "help": "use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+    },
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 5,
+      "column": 1,
+      "endLine": 6,
+      "endColumn": 50,
+      "rule": "constraint_validating",
+      "severity": "warning",
+      "message": "adding a constraint validates every row of public.posts under a lock",
+      "help": "add it NOT VALID, then VALIDATE CONSTRAINT in a later migration"
+    },
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 5,
+      "column": 1,
+      "endLine": 6,
+      "endColumn": 50,
+      "rule": "fk_without_index",
+      "severity": "warning",
+      "message": "foreign key posts_author_fk on public.posts (author_id) has no index",
+      "help": "CREATE INDEX ON public.posts (author_id)"
+    },
+    {
+      "path": "other_migrations/0002_hazards.sql",
+      "line": 3,
+      "column": 1,
+      "endLine": 3,
+      "endColumn": 46,
+      "rule": "create_index_blocking",
+      "severity": "warning",
+      "message": "CREATE INDEX without CONCURRENTLY blocks writes on public.things for the whole build",
+      "help": "use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 8,
+      "column": 45,
+      "endLine": 8,
+      "endColumn": 57,
+      "rule": "null_comparison",
+      "severity": "error",
+      "message": "comparison with NULL is never true",
+      "help": "use IS NULL / IS NOT NULL"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 10,
+      "column": 46,
+      "endLine": 10,
+      "endColumn": 58,
+      "rule": "null_comparison",
+      "severity": "error",
+      "message": "comparison with NULL is never true",
+      "help": "use IS NULL / IS NOT NULL"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 12,
+      "column": 44,
+      "endLine": 12,
+      "endColumn": 82,
+      "rule": "not_in_nullable",
+      "severity": "warning",
+      "message": "NOT IN (SELECT …) returns no rows when either side is NULL",
+      "help": "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 16,
+      "column": 17,
+      "endLine": 16,
+      "endColumn": 29,
+      "rule": "unbounded_write",
+      "severity": "error",
+      "message": "UPDATE without WHERE changes every row of users",
+      "help": "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 18,
+      "column": 57,
+      "endLine": 18,
+      "endColumn": 68,
+      "rule": "null_comparison",
+      "severity": "error",
+      "message": "comparison with NULL is never true",
+      "help": "use IS NULL / IS NOT NULL"
+    }
+  ],
+  "failures": [
+    {
+      "path": "src/main.rs",
+      "line": 22,
+      "column": 24,
+      "message": "column \"nope\" does not exist\n  ╭────\n1 │ SELECT nope FROM users\n  ·        ──┬─\n  ·          ╰─ column does not exist\n  ╰────\n"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 24,
+      "column": 21,
+      "message": "relation \"missing\" does not exist"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 27,
+      "column": 16,
+      "message": "the SQL of sql! must be a string literal"
+    },
+    {
+      "path": "tests/ignored.rs",
+      "line": 9,
+      "column": 24,
+      "message": "column \"nope\" does not exist\n  ╭────\n1 │ SELECT nope FROM users\n  ·        ──┬─\n  ·          ╰─ column does not exist\n  ╰────\n"
+    }
+  ],
+  "summary": {
+    "errors": 4,
+    "warnings": 5,
+    "infos": 0,
+    "queries": 10,
+    "migrations": 4,
+    "migrationsUnchanged": 0,
+    "failures": 4,
+    "schema": {
+      "default": {
+        "tables": 2,
+        "views": 0,
+        "indexes": 3,
+        "sequences": 0,
+        "types": 0,
+        "functions": 0,
+        "extensions": 0
+      },
+      "other": {
+        "tables": 1,
+        "views": 0,
+        "indexes": 2,
+        "sequences": 0,
+        "types": 0,
+        "functions": 0,
+        "extensions": 0
+      }
+    }
+  }
+}

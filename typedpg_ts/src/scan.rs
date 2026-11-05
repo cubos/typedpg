@@ -613,6 +613,11 @@ impl LineIndex {
         }
     }
 
+    /// The text the index was built from.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     pub fn position(&self, offset: usize) -> Position {
         let offset = offset.min(self.text.len());
         let line = self.starts.partition_point(|&s| s <= offset) - 1;

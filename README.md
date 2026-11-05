@@ -95,6 +95,73 @@ sql!(pool, "UPDATE users SET age = $flag").execute().await?;
 //  error: type mismatch: bool cannot be coerced to int4
 ```
 
+## Linting
+
+`cargo typedpg lint` analyzes every `sql!` in the crate's `src/`, `tests/`,
+`examples/` and `benches/` against the migrations it is compiled against,
+and lints the migrations themselves:
+
+| Rule | Default | What it reports |
+|---|---|---|
+| `null_comparison` | error | A comparison with a `NULL` literal, which is never true. |
+| `unbounded_write` | error | An `UPDATE` or `DELETE` with no `WHERE`. |
+| `not_in_nullable` | warning | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
+| `create_index_blocking` | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
+| `constraint_validating` | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
+| `set_not_null_scan` | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
+| `table_rewrite` | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
+| `fk_without_index` | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
+| `redundant_index` | info | An index another index on the table already covers. |
+
+The `lint` table sets each rule's level (`"error"`, `"warning"`, `"info"` or
+`"off"`) and `fail_on`, the severity the run fails on (default `"error"`):
+
+```toml
+[package.metadata.typedpg.lint]
+fail_on = "warning"
+null_comparison = "off"
+redundant_index = "warning"
+ignore = ["tests/**"]   # paths whose statement findings are not reported
+```
+
+`ignore` lists glob patterns relative to the manifest's directory, with
+forward slashes. Findings in a matching query file are dropped. A matching
+migration file is still applied and its schema rules still report — on the
+statement that created the object — but its statement rules are skipped, like
+a migration unchanged from `--ignore-migrations-from`: its history cannot be
+changed. Failures are never dropped: a query in an ignored file that does not
+compile still fails lint, as it still fails the build.
+
+A comment suppresses a rule for the query or migration statement it is in:
+`-- typedpg-lint: allow(unbounded_write)` (the `/* … */` form works too).
+
+Migrations already applied in production cannot be changed, so `cargo typedpg
+lint --ignore-migrations-from <ref>` (for example `origin/main`) skips the
+statement rules of every migration file identical to its version at that git
+ref: it is applied for the schema, but its locks, scans and rewrites are not
+reported. The schema rules (`fk_without_index`, `redundant_index`) still
+report problems of the current schema, placed on the statement that created
+the object, with a help line that puts the fix in a new migration; its allow
+comments are honored and validated. A file absent from the ref, or changed by
+the branch, is linted as usual. Queries are unaffected. The summary states how
+many files skipped the statement rules, e.g.
+`300 unchanged from origin/main: statement rules skipped`.
+
+Findings go to stdout, the summary to stderr, and the run exits non-zero when
+a finding reaches `fail_on` or a query or migration fails analysis. Human is
+the default format; `--format json` prints one JSON document and `--format
+sarif` prints SARIF 2.1.0, both with the analysis failures included (the
+human format keeps them on stderr). In CI:
+
+```yaml
+- run: cargo install typedpg_cli --locked
+- run: cargo typedpg lint --format sarif > lint.sarif
+- uses: github/codeql-action/upload-sarif@v4
+  if: always()
+  with:
+    sarif_file: lint.sarif
+```
+
 ## The `sql!` macro
 
 Four terminal methods for different use cases:

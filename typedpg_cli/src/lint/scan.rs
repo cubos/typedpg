@@ -1,0 +1,531 @@
+//! Finding the `sql!` and `copy_in!` invocations of a Rust source.
+//!
+//! The scanner sees syntax only: a macro whose path ends in `sql` is a
+//! query and one ending in `copy_in` a COPY target, and the same grammars
+//! as the macros' inputs read their arguments up to the string literal.
+//! Other macros are descended into on a best-effort basis (`assert!`,
+//! `vec!`, `tokio::try_join!` and the like often wrap a query), by parsing
+//! their tokens as expressions and as statements. A `sql!` whose SQL
+//! argument is not a literal is an error, as the macro's own parse is.
+
+use std::collections::HashSet;
+
+use proc_macro2::{Span, TokenStream};
+use syn::parse::{ParseStream, Parser};
+use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
+use syn::visit::Visit;
+use syn::{Block, Expr, Ident, LitStr, Macro, Token};
+
+/// A query found at one `sql!` site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FoundQuery {
+    /// The named database (`db = name`), or `None` for the default one.
+    pub db: Option<String>,
+    /// The literal's cooked value: the SQL the macro analyzes.
+    pub text: String,
+    /// Where the literal is in the file.
+    pub literal: Literal,
+}
+
+/// A target found at one `copy_in!` site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FoundCopyIn {
+    /// The named database (`db = name`), or `None` for the default one.
+    pub db: Option<String>,
+    /// The literal's cooked value: the `table (columns)` the macro analyzes.
+    pub target: String,
+    /// Where the literal is in the file.
+    pub literal: Literal,
+}
+
+/// A `sql!` the macro itself rejects before analyzing: its SQL argument is
+/// not a string literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FoundError {
+    /// The byte offset in the file of the offending argument.
+    pub offset: usize,
+    pub message: String,
+}
+
+/// Everything a Rust source holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Scan {
+    pub queries: Vec<FoundQuery>,
+    pub copies: Vec<FoundCopyIn>,
+    pub errors: Vec<FoundError>,
+}
+
+/// A string literal as written in the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Literal {
+    /// The byte offset in the file of the literal's contents (after the
+    /// opening delimiter).
+    pub content_start: usize,
+    /// The contents as written, escapes undecoded.
+    pub raw: String,
+    /// The cooked value (what the macro analyzes).
+    pub value: String,
+    /// Whether the literal is a raw string (`r"…"`, `r#"…"#`), whose
+    /// contents have no escapes to decode.
+    pub raw_string: bool,
+}
+
+impl Literal {
+    /// The byte offset in the file of the character at byte `cooked` of the
+    /// literal's value. Past the end maps to the end.
+    pub fn source_offset(&self, cooked: usize) -> usize {
+        let cooked = cooked.min(self.value.len());
+        if self.raw_string {
+            self.content_start + cooked
+        } else {
+            self.content_start + cooked_to_raw(&self.raw, cooked)
+        }
+    }
+}
+
+/// Every `sql!` and `copy_in!` in `text`, in source order; the file's parse
+/// error when it does not parse.
+pub(crate) fn scan(text: &str) -> Result<Scan, syn::Error> {
+    let file = syn::parse_file(text)?;
+    let mut finder = Finder {
+        text,
+        scan: Scan::default(),
+        seen: HashSet::new(),
+    };
+    finder.visit_file(&file);
+    Ok(finder.scan)
+}
+
+struct Finder<'a> {
+    text: &'a str,
+    scan: Scan,
+    /// The path start of each macro already recorded: parsing a macro's
+    /// tokens as both expressions and statements visits it twice.
+    seen: HashSet<usize>,
+}
+
+impl Finder<'_> {
+    fn record_sql(&mut self, mac: &Macro) {
+        let start = span_offset(self.text, mac.path.span());
+        if !self.seen.insert(start) {
+            return;
+        }
+        let Some((db, sql)) = parse_sql_arguments(mac.tokens.clone()) else {
+            return;
+        };
+        match sql {
+            Ok(sql) => {
+                let Some(literal) = literal(self.text, sql.span(), &sql) else {
+                    return;
+                };
+                self.scan.queries.push(FoundQuery {
+                    db,
+                    text: literal.value.clone(),
+                    literal,
+                });
+            }
+            Err(error) => self.scan.errors.push(FoundError {
+                offset: span_offset(self.text, error.span()),
+                message: "the SQL of sql! must be a string literal".to_owned(),
+            }),
+        }
+    }
+
+    fn record_copy_in(&mut self, mac: &Macro) {
+        let start = span_offset(self.text, mac.path.span());
+        if !self.seen.insert(start) {
+            return;
+        }
+        let Some((db, target)) = parse_copy_in_arguments(mac.tokens.clone()) else {
+            return;
+        };
+        let Some(literal) = literal(self.text, target.span(), &target) else {
+            return;
+        };
+        self.scan.copies.push(FoundCopyIn {
+            db,
+            target: literal.value.clone(),
+            literal,
+        });
+    }
+
+    /// Visit the queries inside another macro's tokens, best effort.
+    fn descend(&mut self, tokens: &TokenStream) {
+        if let Ok(expressions) =
+            Punctuated::<Expr, Token![,]>::parse_terminated.parse2(tokens.clone())
+        {
+            for expression in &expressions {
+                self.visit_expr(expression);
+            }
+        }
+        if let Ok(statements) = Block::parse_within.parse2(tokens.clone()) {
+            for statement in &statements {
+                self.visit_stmt(statement);
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Finder<'_> {
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        match mac
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .as_deref()
+        {
+            Some("sql") => self.record_sql(mac),
+            Some("copy_in") => self.record_copy_in(mac),
+            _ => self.descend(&mac.tokens),
+        }
+    }
+}
+
+/// `[db = name,]` from the macro arguments.
+fn parse_db(input: ParseStream<'_>) -> syn::Result<Option<String>> {
+    if input.peek(Ident) {
+        let fork = input.fork();
+        let ident: Ident = fork.parse()?;
+        if ident == "db" && fork.peek(Token![=]) {
+            let _: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let name: Ident = input.parse()?;
+            input.parse::<Token![,]>()?;
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// `(db, sql)` from `[db = name,] executor, "SQL", …`, reading no further
+/// than the literal. The literal is an error when the argument is not a
+/// string literal: the macro rejects it.
+fn parse_sql_arguments(tokens: TokenStream) -> Option<(Option<String>, syn::Result<LitStr>)> {
+    let parser = |input: ParseStream<'_>| -> syn::Result<(Option<String>, syn::Result<LitStr>)> {
+        let db = parse_db(input)?;
+        let _: Expr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let sql = input.parse::<LitStr>();
+        // The parameter assignments after the literal are irrelevant here.
+        let _: TokenStream = input.parse()?;
+        Ok((db, sql))
+    };
+    parser.parse2(tokens).ok()
+}
+
+/// `(db, target)` from `[db = name,] executor, "table (columns)", …`, the
+/// same grammar as the macro's `CopyInInput`.
+fn parse_copy_in_arguments(tokens: TokenStream) -> Option<(Option<String>, LitStr)> {
+    let parser = |input: ParseStream<'_>| -> syn::Result<(Option<String>, LitStr)> {
+        let db = parse_db(input)?;
+        let _: Expr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let target: LitStr = input.parse()?;
+        // The source and its `{ fields }` are irrelevant here.
+        let _: TokenStream = input.parse()?;
+        Ok((db, target))
+    };
+    parser.parse2(tokens).ok()
+}
+
+/// The literal at byte `start` of `text`, as written.
+fn literal(text: &str, span: Span, lit: &LitStr) -> Option<Literal> {
+    let start = span_offset(text, span);
+    let token = lit.token().to_string();
+    let (content_start, raw, raw_string) = if let Some(rest) = token.strip_prefix('r') {
+        let hashes = rest.bytes().take_while(|byte| *byte == b'#').count();
+        let quote = 1 + hashes;
+        if token.as_bytes().get(quote) != Some(&b'"') {
+            return None;
+        }
+        let end = token.len().checked_sub(1 + hashes)?;
+        (
+            start + quote + 1,
+            token.get(quote + 1..end)?.to_owned(),
+            true,
+        )
+    } else {
+        if !token.starts_with('"') || !token.ends_with('"') {
+            return None;
+        }
+        (start + 1, token.get(1..token.len() - 1)?.to_owned(), false)
+    };
+    Some(Literal {
+        content_start,
+        raw,
+        value: lit.value(),
+        raw_string,
+    })
+}
+
+/// The byte offset of a span's start (1-based line, 0-based char column) in
+/// `text`.
+fn span_offset(text: &str, span: Span) -> usize {
+    let start = span.start();
+    line_column_to_offset(text, start.line, start.column).unwrap_or(0)
+}
+
+fn line_column_to_offset(text: &str, line: usize, column: usize) -> Option<usize> {
+    let mut line_start = 0usize;
+    let mut current_line = 1usize;
+    for (i, c) in text.char_indices() {
+        if current_line == line {
+            break;
+        }
+        if c == '\n' {
+            current_line += 1;
+            line_start = i + 1;
+        }
+    }
+    if current_line != line {
+        return None;
+    }
+    let mut offset = line_start;
+    for _ in 0..column {
+        offset += text.get(offset..)?.chars().next()?.len_utf8();
+    }
+    Some(offset)
+}
+
+/// The byte offset in `raw` (a normal string's contents as written) of the
+/// character at byte `cooked` of its value. Past the end maps to the end.
+///
+/// Decodes the escapes a Rust string literal has: `\n`, `\r`, `\t`, `\\`,
+/// `\0`, `\'`, `\"`, `\xNN`, `\u{…}`, and the line continuation (`\` and
+/// the newline and whitespace after it), which produces nothing.
+pub(crate) fn cooked_to_raw(raw: &str, cooked: usize) -> usize {
+    let mut i = 0usize;
+    let mut produced = 0usize;
+    while i < raw.len() {
+        let c = raw[i..].chars().next().expect("in bounds");
+        if c != '\\' {
+            if produced >= cooked {
+                return i;
+            }
+            i += c.len_utf8();
+            produced += c.len_utf8();
+            continue;
+        }
+        let rest = &raw[i + 1..];
+        // A line continuation and its following whitespace produce nothing:
+        // they are stepped over whatever the target offset is.
+        match rest.chars().next() {
+            Some('\n') => {
+                i += 2;
+                i = skip_whitespace(raw, i);
+                continue;
+            }
+            Some('\r') if rest.starts_with("\r\n") => {
+                i += 3;
+                i = skip_whitespace(raw, i);
+                continue;
+            }
+            _ => {}
+        }
+        if produced >= cooked {
+            return i;
+        }
+        match rest.chars().next() {
+            Some('n' | 'r' | 't' | '\\' | '0' | '\'' | '"') => {
+                i += 2;
+                produced += 1;
+            }
+            Some('x') => {
+                let hex = raw.get(i + 2..i + 4).unwrap_or("00");
+                let codepoint = u32::from_str_radix(hex, 16).unwrap_or(0);
+                i = (i + 4).min(raw.len());
+                produced += char::from_u32(codepoint).map_or(1, char::len_utf8);
+            }
+            Some('u') if raw.get(i + 2..i + 3) == Some("{") => {
+                let Some(end) = raw[i + 3..].find('}').map(|end| i + 3 + end) else {
+                    i = (i + 2).min(raw.len());
+                    produced += 1;
+                    continue;
+                };
+                let codepoint = u32::from_str_radix(&raw[i + 3..end], 16).unwrap_or(0xFFFD);
+                let c = char::from_u32(codepoint).unwrap_or('\u{FFFD}');
+                i = end + 1;
+                produced += c.len_utf8();
+            }
+            Some(other) => {
+                i += 1 + other.len_utf8();
+                produced += other.len_utf8();
+            }
+            None => {
+                i += 1;
+                produced += 1;
+            }
+        }
+    }
+    raw.len()
+}
+
+fn skip_whitespace(raw: &str, mut i: usize) -> usize {
+    while let Some(c) = raw.get(i..).and_then(|rest| rest.chars().next()) {
+        if !c.is_whitespace() {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scanned(source: &str) -> Scan {
+        scan(source).unwrap_or_else(|_| panic!("does not parse: {source}"))
+    }
+
+    fn queries(source: &str) -> Vec<FoundQuery> {
+        scanned(source).queries
+    }
+
+    #[test]
+    fn finds_queries_and_their_databases() {
+        let source = r#"
+fn main() {
+    let _ = sql!(pool, "SELECT 1", id = 1);
+    let _ = typedpg::sql!(pool, "SELECT 2");
+    let _ = sql!(db = other, pool, "SELECT 3");
+    assert!(sql!(pool, "SELECT 4") == sql!(pool, "SELECT 5"));
+    let _ = vec![sql!(pool, "SELECT 6")];
+}
+"#;
+        let found = queries(source);
+        let db: Vec<Option<&str>> = found.iter().map(|query| query.db.as_deref()).collect();
+        let sql: Vec<&str> = found.iter().map(|query| query.text.as_str()).collect();
+        assert_eq!(db, [None, None, Some("other"), None, None, None]);
+        assert_eq!(
+            sql,
+            [
+                "SELECT 1", "SELECT 2", "SELECT 3", "SELECT 4", "SELECT 5", "SELECT 6"
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_copy_in_targets_with_their_databases() {
+        let source = r##"
+fn main() {
+    copy_in!(pool, "users (id)", rows { id });
+    copy_in!(db = other, &tx, r#"things (name)"#, rows.iter() { name },);
+}
+"##;
+        let found = scanned(source);
+        assert!(found.queries.is_empty());
+        assert!(found.errors.is_empty());
+        let db: Vec<Option<&str>> = found.copies.iter().map(|copy| copy.db.as_deref()).collect();
+        let targets: Vec<&str> = found
+            .copies
+            .iter()
+            .map(|copy| copy.target.as_str())
+            .collect();
+        assert_eq!(db, [None, Some("other")]);
+        assert_eq!(targets, ["users (id)", "things (name)"]);
+    }
+
+    #[test]
+    fn a_non_literal_sql_argument_is_an_error() {
+        let source = r#"
+fn main() {
+    sql!(pool, query);
+    sql!(pool, concat!("SELECT 1"));
+    sql!(pool, 42);
+}
+"#;
+        let found = scanned(source);
+        assert!(found.queries.is_empty());
+        assert_eq!(found.errors.len(), 3);
+        for error in &found.errors {
+            assert_eq!(error.message, "the SQL of sql! must be a string literal");
+            assert!(error.offset < source.len());
+        }
+        assert!(source[found.errors[0].offset..].starts_with("query"));
+        assert!(source[found.errors[1].offset..].starts_with("concat"));
+    }
+
+    #[test]
+    fn cooked_offsets_map_through_every_escape() {
+        let source = r#"fn main() {
+    let _ = sql!(pool, "a\nb\tc\rd\\e\0f\'g\"h\x41i\u{1F600}j");
+}"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.text, "a\nb\tc\rd\\e\0f'g\"hAi😀j");
+        for (needle, written) in [
+            ("\n", "\\n"),
+            ("\t", "\\t"),
+            ("\r", "\\r"),
+            ("\\", "\\\\"),
+            ("\0", "\\0"),
+            ("'", "\\'"),
+            ("\"", "\\\""),
+            ("A", "\\x41"),
+            ("😀", "\\u{1F600}"),
+        ] {
+            let at = query.text.find(needle).unwrap();
+            let file_at = query.literal.source_offset(at);
+            assert!(
+                source[file_at..].starts_with(written),
+                "{needle:?} maps to {:?}, not {written:?}",
+                &source[file_at..]
+            );
+        }
+        // The end of the value is the closing quote.
+        let end = query.literal.source_offset(query.text.len());
+        assert!(source[end..].starts_with('"'));
+    }
+
+    #[test]
+    fn a_line_continuation_before_the_site_maps_to_the_sql() {
+        let source = r#"fn main() {
+    let _ = sql!(pool, "SELECT \
+        id FROM users WHERE email = NULL");
+}
+"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.text, "SELECT id FROM users WHERE email = NULL");
+        let at = query.literal.source_offset(query.text.find("id").unwrap());
+        assert!(source[at..].starts_with("id FROM"), "{}", &source[at..]);
+        let at = query
+            .literal
+            .source_offset(query.text.find("email").unwrap());
+        assert!(source[at..].starts_with("email = NULL"));
+        assert_eq!(cooked_to_raw("a\\\n  b", 1), 5);
+        assert_eq!(cooked_to_raw("a\\\n  b", 2), 6);
+    }
+
+    #[test]
+    fn multi_byte_characters_before_the_literal_keep_the_columns_right() {
+        let source = r#"fn main() { let _ = ("é", sql!(pool, "SELECT id FROM users WHERE email = NULL")); }"#;
+        let query = &queries(source)[0];
+        let at = query
+            .literal
+            .source_offset(query.text.find("email").unwrap());
+        assert!(source[at..].starts_with("email = NULL"));
+    }
+
+    #[test]
+    fn raw_strings_with_hashes_have_no_escapes() {
+        let source = r####"fn main() {
+    let _ = sql!(pool, r###"SELECT id FROM users WHERE email = NULL"###);
+}"####;
+        let query = &queries(source)[0];
+        assert_eq!(query.text, "SELECT id FROM users WHERE email = NULL");
+        assert!(query.literal.raw_string);
+        let at = query
+            .literal
+            .source_offset(query.text.find("email").unwrap());
+        assert!(source[at..].starts_with("email = NULL"));
+        let end = query.literal.source_offset(query.text.len());
+        assert!(source[end..].starts_with("\"###"));
+    }
+
+    #[test]
+    fn an_unparseable_file_is_an_error() {
+        assert!(scan("fn main( {").is_err());
+    }
+}

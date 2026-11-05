@@ -36,6 +36,9 @@ pub struct NamedQuery {
     pub text: String,
     /// Where `text` starts in the file (bytes).
     pub start: usize,
+    /// Where the `/* @name */` comment block ends in the file (bytes):
+    /// comments between it and [`Self::text`] are the query's.
+    pub after_name: usize,
     pub pos: Position,
 }
 
@@ -51,6 +54,9 @@ pub struct SqlFile {
     pub queries: Vec<NamedQuery>,
     pub diagnostics: Vec<SqlDiagnostic>,
     pub lines: LineIndex,
+    /// The file as read: lint needs the comments before each statement,
+    /// which [`NamedQuery::text`] leaves out.
+    pub(crate) source: String,
 }
 
 /// Words a query can't be named: they can't be a `const`'s name.
@@ -111,6 +117,8 @@ struct Block {
     exported: bool,
     name: String,
     name_span: Range<usize>,
+    /// Where the whole `/* @name */` comment ends.
+    after_name: usize,
     /// The statement's first and past-its-last byte, once it has a token.
     text: Option<(usize, usize)>,
     /// Its `;` was read: anything but comments after it is an error.
@@ -162,6 +170,7 @@ pub fn parse(source: &str, module: &ModuleNames) -> SqlFile {
         queries: p.queries,
         diagnostics: p.diagnostics,
         lines: p.lines,
+        source: source.to_owned(),
     }
 }
 
@@ -346,6 +355,7 @@ impl Parser<'_> {
             exported,
             name: name.to_owned(),
             name_span: name_at..name_at + name_len,
+            after_name: end,
             text: None,
             terminated: false,
         });
@@ -413,6 +423,7 @@ impl Parser<'_> {
                 name_span: block.name_span,
                 text: self.source[start..end].to_owned(),
                 start,
+                after_name: block.after_name,
                 pos: self.lines.position(start),
             }),
         }

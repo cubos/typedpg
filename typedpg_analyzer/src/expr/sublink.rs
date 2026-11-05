@@ -151,12 +151,16 @@ pub(crate) fn infer_sublink(
                 // operator can't yield NULL for non-NULL inputs (an empty
                 // subquery gives FALSE / TRUE).
                 let mut result_nullable = false;
+                let mut lhs_nullable = false;
+                let mut subquery_nullable = false;
                 let mut ops = Vec::with_capacity(lhs_nodes.len());
                 for (lhs_node, col) in lhs_nodes.iter().zip(cols.iter()) {
                     let lhs = infer_expr(lhs_node, ctx, params, TypeGoal::NONE)?;
                     let l_oid = lhs.type_oid;
                     let r_oid = col.type_oid;
                     result_nullable |= lhs.nullable || col.nullable;
+                    lhs_nullable |= lhs.nullable;
+                    subquery_nullable |= col.nullable;
                     let found = snapshot.find_operator(&op_name, Some(l_oid), r_oid);
                     // make_row_comparison_op, which compares even a single
                     // column: each operator must yield boolean (42804).
@@ -229,6 +233,13 @@ pub(crate) fn infer_sublink(
                 // A row is compared by make_row_comparison_op.
                 if lhs_row.is_some() {
                     check_row_comparison_interpretation(snapshot, &op_name, &ops, sub.location)?;
+                }
+                if sub_type == protobuf::SubLinkType::AnySublink && op_name == "=" {
+                    crate::pg_catalog::note_sublink_nullability(
+                        sub.location,
+                        lhs_nullable,
+                        subquery_nullable,
+                    );
                 }
                 ctx.note_strict(sub.location, crate::nonnull::StrictNode::Sublink, strict);
                 return Ok(ExprType::scalar(oid::BOOL, result_nullable));

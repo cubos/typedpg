@@ -146,10 +146,29 @@ impl std::error::Error for DdlError {
 /// On failure, also returns where in `sql` the error is (see
 /// [`MigrationFailure`]).
 pub(crate) fn apply_migration(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFailure> {
-    crate::stack::with_stack(|| apply_migration_here(db, sql))
+    struct Noop;
+    impl crate::pg_catalog::MigrationObserver for Noop {}
+    apply_migration_observed(db, sql, &mut Noop, 0)
 }
 
-fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFailure> {
+/// [`apply_migration`], calling `observer` before and after every statement.
+/// `span_offset` is added to each statement's span (the byte-order mark
+/// `PgCatalog::apply_migration_observed` strips before applying).
+pub(crate) fn apply_migration_observed(
+    db: &mut PgCatalog,
+    sql: &str,
+    observer: &mut dyn crate::pg_catalog::MigrationObserver,
+    span_offset: usize,
+) -> Result<(), MigrationFailure> {
+    crate::stack::with_stack(|| apply_migration_here(db, sql, observer, span_offset))
+}
+
+fn apply_migration_here(
+    db: &mut PgCatalog,
+    sql: &str,
+    observer: &mut dyn crate::pg_catalog::MigrationObserver,
+    span_offset: usize,
+) -> Result<(), MigrationFailure> {
     // Errors the analyzer raises while the statements are applied keep their
     // plain messages (that is what `DdlError` reports), but their spans —
     // AST locations, offsets into `sql` — and hints are captured to locate
@@ -188,22 +207,31 @@ fn apply_migration_here(db: &mut PgCatalog, sql: &str) -> Result<(), MigrationFa
             };
             crate::error::take_captured();
             let explicit_before = tx.in_explicit_block();
-            let result = tx
-                .check(db, stmt)
-                .and_then(|()| tx.check_setting(stmt))
-                .and_then(|()| {
-                    db.in_transaction_block = tx.in_block();
-                    with_statement_sql(db, sql, raw_stmt, |db| match stmt {
-                        node::Node::TransactionStmt(t) => tx.control(db, t),
-                        _ => apply_statement(db, stmt),
-                    })
-                });
+            if let Err(e) = tx.check(db, stmt).and_then(|()| tx.check_setting(stmt)) {
+                located = Some(locate_in_statement(sql, raw_stmt, &e));
+                tx.abort(db);
+                return Err(e);
+            }
+            let (start, end) = statement_range(sql, raw_stmt);
+            let statement = crate::pg_catalog::MigrationStatement {
+                node: stmt,
+                span: start + span_offset..end + span_offset,
+            };
+            observer.before(db, &statement);
+            let result = {
+                db.in_transaction_block = tx.in_block();
+                with_statement_sql(db, sql, raw_stmt, |db| match stmt {
+                    node::Node::TransactionStmt(t) => tx.control(db, t),
+                    _ => apply_statement(db, stmt),
+                })
+            };
             if let Err(e) = result {
                 located = Some(locate_in_statement(sql, raw_stmt, &e));
                 tx.abort(db);
                 return Err(e);
             }
             tx.after(db, stmt);
+            observer.after(db, &statement);
             if !tx.in_explicit_block() {
                 opened_by = None;
             } else if !explicit_before || matches!(stmt, node::Node::TransactionStmt(t) if t.chain)

@@ -557,6 +557,20 @@ pub struct PgCatalog {
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
 const USER_OID_START: u32 = 100_000;
 
+/// How many objects a catalog holds, by kind: the ones its migrations
+/// created (OID >= [`USER_OID_START`]), not the seeded system catalog.
+/// Objects an extension owns count as the extension only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct UserObjectCounts {
+    pub tables: usize,
+    pub views: usize,
+    pub indexes: usize,
+    pub sequences: usize,
+    pub types: usize,
+    pub functions: usize,
+    pub extensions: usize,
+}
+
 /// A relation and its columns — `(relname, [(attname, atttypid, attnotnull)])`
 /// — as surfaced by [`PgCatalog::iter_relations`] for the differential fuzzer.
 #[cfg(any(test, feature = "internal"))]
@@ -1026,43 +1040,74 @@ impl PgCatalog {
     /// message followed by where in the file it is — `--> file:line:col`
     /// and the offending line with a caret — and any hint.
     pub fn apply_migration(&mut self, filename: &str, sql: &str) -> Result<(), DdlError> {
-        self.apply_sql_located(sql).map_err(|failure| {
-            let message = failure.error.to_string();
-            let location =
-                failure
-                    .location
-                    .map(|l| *l)
-                    .unwrap_or_else(|| crate::error::CapturedDiagnostic {
+        struct Noop;
+        impl MigrationObserver for Noop {}
+        self.apply_migration_observed(filename, sql, &mut Noop)
+    }
+
+    /// [`Self::apply_migration`], watching `observer` around every statement:
+    /// `before` sees the catalog the statement will run against, `after` the
+    /// catalog it left. The observer's spans are byte ranges in `sql`.
+    pub fn apply_migration_observed(
+        &mut self,
+        filename: &str,
+        sql: &str,
+        observer: &mut dyn MigrationObserver,
+    ) -> Result<(), DdlError> {
+        self.apply_sql_located_observed(sql, Some(observer))
+            .map_err(|failure| {
+                let message = failure.error.to_string();
+                let location = failure.location.map(|l| *l).unwrap_or_else(|| {
+                    crate::error::CapturedDiagnostic {
                         pg_message: message.clone(),
                         primary: None,
                         secondaries: Vec::new(),
                         hint: None,
                         notes: Vec::new(),
-                    });
-            let diagnostic = crate::diagnostic::render_in_file(&message, filename, sql, &location);
-            DdlError::Migration {
-                filename: filename.to_owned(),
-                source: Box::new(failure.error),
-                diagnostic,
-            }
-        })
+                    }
+                });
+                let diagnostic =
+                    crate::diagnostic::render_in_file(&message, filename, sql, &location);
+                DdlError::Migration {
+                    filename: filename.to_owned(),
+                    source: Box::new(failure.error),
+                    diagnostic,
+                }
+            })
     }
 
     fn apply_sql_located(&mut self, sql: &str) -> Result<(), crate::ddl::MigrationFailure> {
+        self.apply_sql_located_observed(sql, None)
+    }
+
+    fn apply_sql_located_observed(
+        &mut self,
+        sql: &str,
+        observer: Option<&mut dyn MigrationObserver>,
+    ) -> Result<(), crate::ddl::MigrationFailure> {
         // A file edited on Windows starts with a byte-order mark, which the
         // parser rejects as a syntax error.
-        let sql = typedpg_core::migration_marker::strip_bom(sql);
-        let (result, location) = match crate::ddl::apply_migration(self, sql) {
-            Ok(()) => (Ok(()), None),
-            Err(failure) => (Err(failure.error), failure.location),
+        let stripped = typedpg_core::migration_marker::strip_bom(sql);
+        let bom = sql.len() - stripped.len();
+        let (result, location) = match observer {
+            Some(observer) => {
+                match crate::ddl::apply_migration_observed(self, stripped, observer, bom) {
+                    Ok(()) => (Ok(()), None),
+                    Err(failure) => (Err(failure.error), failure.location),
+                }
+            }
+            None => match crate::ddl::apply_migration(self, stripped) {
+                Ok(()) => (Ok(()), None),
+                Err(failure) => (Err(failure.error), failure.location),
+            },
         };
         #[cfg(feature = "pg_sanity")]
         {
             if !self.pg_sanity_tainted && !self.pg_sanity_skip {
-                if sql_touches_extension(sql) {
-                    self.run_pg_sanity_extension_apply_check(sql, &result);
+                if sql_touches_extension(stripped) {
+                    self.run_pg_sanity_extension_apply_check(stripped, &result);
                 } else {
-                    self.run_pg_sanity_apply_check(sql, &result);
+                    self.run_pg_sanity_apply_check(stripped, &result);
                 }
             }
         }
@@ -1119,6 +1164,173 @@ impl PgCatalog {
     #[cfg(any(test, feature = "internal"))]
     pub fn iter_types(&self) -> impl Iterator<Item = &PgType> {
         self.pg_type.values()
+    }
+
+    /// Every `pg_class` row (relations, indexes, sequences, …).
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_classes(&self) -> impl Iterator<Item = &PgClass> {
+        self.pg_class.values()
+    }
+
+    /// How many objects the migrations created, by kind: the catalog's user
+    /// objects (OID >= [`USER_OID_START`]), excluding everything the seed
+    /// holds. Objects belonging to an extension are counted as the
+    /// extension only, not in their own bucket.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn user_object_counts(&self) -> UserObjectCounts {
+        let extension_owned: std::collections::HashSet<(PgClassOid, u32)> = self
+            .pg_depend
+            .iter()
+            .filter(|d| d.deptype == DepType::Extension && d.refclassid == PG_EXTENSION_RELID)
+            .map(|d| (d.classid, d.objid.get()))
+            .collect();
+        let owned = |classid: PgClassOid, oid: u32| extension_owned.contains(&(classid, oid));
+
+        let mut counts = UserObjectCounts::default();
+        for class in self.pg_class.values() {
+            if class.oid.get() < USER_OID_START || owned(PG_CLASS_RELID, class.oid.get()) {
+                continue;
+            }
+            match class.relkind {
+                RelKind::Table | RelKind::Partitioned => counts.tables += 1,
+                RelKind::View | RelKind::MaterializedView => counts.views += 1,
+                RelKind::Index | RelKind::PartitionedIndex => {
+                    // A relation's index is its own, not an extension member:
+                    // skip the ones of a relation the extension owns.
+                    let table_owned = self
+                        .pg_index
+                        .get(&class.oid)
+                        .and_then(|index| self.pg_class.get(&index.indrelid))
+                        .is_some_and(|table| {
+                            owned(PG_CLASS_RELID, table.oid.get())
+                                || table.relkind == RelKind::ToastTable
+                        });
+                    if !table_owned {
+                        counts.indexes += 1;
+                    }
+                }
+                RelKind::Sequence => counts.sequences += 1,
+                _ => {}
+            }
+        }
+        for ty in self.pg_type.values() {
+            if ty.oid.get() < USER_OID_START || owned(PG_TYPE_RELID, ty.oid.get()) {
+                continue;
+            }
+            // Arrays are not separately created types, and a table's or
+            // view's row type comes with the relation: only an explicitly
+            // created composite (`relkind` composite) counts.
+            if ty.typelem.is_some() {
+                continue;
+            }
+            let explicit = match ty.typtype {
+                TypType::Enum | TypType::Domain | TypType::Range | TypType::Multirange => true,
+                TypType::Composite => ty.typrelid.is_some_and(|relid| {
+                    self.pg_class
+                        .get(&relid)
+                        .is_some_and(|class| class.relkind == RelKind::CompositeType)
+                }),
+                _ => false,
+            };
+            if explicit {
+                counts.types += 1;
+            }
+        }
+        for proc in self.pg_proc.values() {
+            if proc.oid.get() >= USER_OID_START && !owned(PG_PROC_RELID, proc.oid.get()) {
+                counts.functions += 1;
+            }
+        }
+        counts.extensions = self
+            .pg_extension
+            .keys()
+            .filter(|oid| oid.get() >= USER_OID_START)
+            .count();
+        counts
+    }
+
+    /// The `pg_class` row for an OID, if present.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn class_row(&self, oid: PgClassOid) -> Option<&PgClass> {
+        self.pg_class.get(&oid)
+    }
+
+    /// Every `pg_index` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_indexes(&self) -> impl Iterator<Item = &PgIndex> {
+        self.pg_index.values()
+    }
+
+    /// Every `pg_constraint` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_constraints(&self) -> impl Iterator<Item = &PgConstraint> {
+        self.pg_constraint.values()
+    }
+
+    /// Every `pg_cast` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_casts(&self) -> impl Iterator<Item = &PgCast> {
+        self.pg_cast.values()
+    }
+
+    /// The access method an index uses (`btree` when it names none).
+    #[cfg(any(test, feature = "internal"))]
+    pub fn index_access_method(&self, index: PgClassOid) -> &str {
+        self.index_access_methods
+            .get(&index)
+            .map_or("btree", String::as_str)
+    }
+
+    /// Whether `index` backs a PRIMARY KEY / UNIQUE / EXCLUDE constraint.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn index_backs_constraint(&self, index: PgClassOid) -> bool {
+        crate::ddl::tables::partidx::backing_constraint(self, index).is_some()
+    }
+
+    /// The CHECK constraint's expression, or `None` for a constraint the
+    /// analyzer keeps no expression for.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn check_expression(
+        &self,
+        constraint: PgConstraintOid,
+    ) -> Option<&typedpg_pg_query::protobuf::Node> {
+        match &self.check_defs.get(&constraint)?.expr {
+            crate::ddl::tables::check_inherit::StoredExpr::Written(expr) => Some(expr),
+            crate::ddl::tables::check_inherit::StoredExpr::Serial(..) => None,
+        }
+    }
+
+    /// The predicate of a partial index, or `None` for an index without one.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn index_predicate(&self, index: PgClassOid) -> Option<typedpg_pg_query::protobuf::Node> {
+        use prost::Message;
+        let predicate = self.pg_index.get(&index)?.indpred.as_ref()?;
+        typedpg_pg_query::protobuf::Node::decode(predicate.ast.as_slice()).ok()
+    }
+
+    /// Whether the function call is surely VOLATILE (every overload that can
+    /// take its arguments is).
+    #[cfg(any(test, feature = "internal"))]
+    pub fn call_is_volatile(&self, call: &typedpg_pg_query::protobuf::FuncCall) -> bool {
+        crate::ddl::volatile::surely_volatile(call, self)
+    }
+
+    /// Whether altering `column` of `relid` to `type_name` rewrites the
+    /// table's rows. `None` when the column or the type can't be resolved.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn column_type_rewrites(
+        &self,
+        relid: PgClassOid,
+        column: &str,
+        type_name: &typedpg_pg_query::protobuf::TypeName,
+        using: Option<&typedpg_pg_query::protobuf::Node>,
+    ) -> Option<bool> {
+        let attr = self.attribute_by_name(relid, column)?;
+        let new_type = crate::ddl::functions::typename_type_id(self, type_name).ok()?;
+        let new_typmod = crate::typmod::encode(self, new_type, type_name).ok()?;
+        Some(crate::ddl::tables::alter_type_rewrites_for_lint(
+            self, attr, new_type, new_typmod, using,
+        ))
     }
 
     /// The `pg_type` row for an OID, if present.
@@ -1246,6 +1458,37 @@ impl PgCatalog {
         self.analyze_copy_in(target).map_err(LocatedError::new)
     }
 
+    /// Analyze `sql` for a tool that reads its parse tree, without applying
+    /// the query simplifications.
+    ///
+    /// The returned [`QueryView::sql`] is the text the analyzer worked on:
+    /// named parameters rewritten to `$n`, and spreads materialized as the
+    /// sample row analysis uses. Its parse tree is [`QueryView::tree`], and
+    /// [`QueryView::original_offset`] maps an offset in that text back to
+    /// `sql` as written. [`Self::analyze`] still simplifies as before; this
+    /// is the view lint rules run over, so a rule sees the query the user
+    /// wrote rather than one a simplification rewrote.
+    pub fn query_view(&self, sql: &str) -> Result<QueryView, LocatedError> {
+        crate::diagnostic::clear_last_primary();
+        let ((analysis, result), sublink_nullability) = collecting_sublink_nullability(|| {
+            crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+        });
+        let analyzed = result.map_err(LocatedError::new)?;
+        let tree = analysis.tree.map(|tree| tree.protobuf).ok_or_else(|| {
+            LocatedError::new(AnalyzeError::Internal(format!(
+                "the analyzed query has no parse tree: {}",
+                analysis.sql
+            )))
+        })?;
+        Ok(QueryView {
+            sql: analysis.sql,
+            tree,
+            analyzed,
+            lex: analysis.lex,
+            sublink_nullability,
+        })
+    }
+
     /// Inner analyze that also returns the rewritten SQL handed to the
     /// static pass — used by [`Self::analyze`] to mirror the same string on
     /// PG sanity under `pg_sanity`.
@@ -1254,6 +1497,20 @@ impl PgCatalog {
     }
 
     fn analyze_with_sql_here(&self, sql: &str) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
+        let (analysis, result) = self.analyze_parts_here(sql, true);
+        (analysis.sql, result)
+    }
+
+    /// The lexing/analysis pipeline behind [`Self::analyze_with_sql_here`],
+    /// with `simplify` deciding whether the query simplifications run.
+    ///
+    /// The text, parse tree and offset map come back even when the analysis
+    /// fails, so callers can point at the same positions the error does.
+    fn analyze_parts_here(
+        &self,
+        sql: &str,
+        simplify: bool,
+    ) -> (QueryAnalysis, Result<AnalyzedQuery, AnalyzeError>) {
         // PG's wording for each lex-level failure — kept verbatim so the
         // `pg_sanity` prefix check matches. `at or near "..."` echoes a
         // snippet of the offending token; we approximate that by taking
@@ -1307,12 +1564,22 @@ impl PgCatalog {
                     spreads: Vec::new(),
                     rewrites: Vec::new(),
                 };
-                let _guard = crate::error::DiagContextGuard::install(sql, &empty_lex);
-                let position = e.position();
-                let span = crate::error::SourceSpan::one_char_at(position);
-                let message = format_lex_error_pg(&e, sql);
-                let raw = crate::error::RawError::lex(message, Some(span));
-                return (sql.to_string(), Err(raw.finalize_implicit()));
+                let error = {
+                    let _guard = crate::error::DiagContextGuard::install(sql, &empty_lex);
+                    let position = e.position();
+                    let span = crate::error::SourceSpan::one_char_at(position);
+                    let message = format_lex_error_pg(&e, sql);
+                    let raw = crate::error::RawError::lex(message, Some(span));
+                    raw.finalize_implicit()
+                };
+                return (
+                    QueryAnalysis {
+                        sql: sql.to_string(),
+                        lex: empty_lex,
+                        tree: None,
+                    },
+                    Err(error),
+                );
             }
         };
 
@@ -1336,32 +1603,61 @@ impl PgCatalog {
         // spread is materialized as a single row of placeholders, so the
         // analyzer can infer the field types from surrounding context. Its
         // offset map leads back to the original SQL like the lexer's does.
-        let sample_lex;
-        let mut sample_tree = None;
-        let analysis_lex = if lex_output.spreads.is_empty() {
-            &lex_output
+        let (analysis_lex, tree) = if lex_output.spreads.is_empty() {
+            (lex_output.clone(), None)
         } else {
-            sample_lex = build_spread_sample_sql(&lex_output);
-            let _guard = crate::error::DiagContextGuard::install(sql, &sample_lex);
-            let tree = typedpg_pg_query::parse(&sample_lex.sql).ok();
-            sample_tree = tree.clone();
-            if let Err(e) =
-                check_spread_positions(tree.as_ref().map(|t| &t.protobuf), &lex_output, &sample_lex)
-            {
-                return (sample_lex.sql.clone(), Err(e));
+            let sample_lex = build_spread_sample_sql(&lex_output);
+            let (tree, error) = {
+                let _guard = crate::error::DiagContextGuard::install(sql, &sample_lex);
+                let tree = typedpg_pg_query::parse(&sample_lex.sql).ok();
+                let error = check_spread_positions(
+                    tree.as_ref().map(|t| &t.protobuf),
+                    &lex_output,
+                    &sample_lex,
+                )
+                .err();
+                (tree, error)
+            };
+            if let Some(error) = error {
+                return (
+                    QueryAnalysis {
+                        sql: sample_lex.sql.clone(),
+                        lex: sample_lex,
+                        tree,
+                    },
+                    Err(error),
+                );
             }
-            &sample_lex
+            (sample_lex, tree)
         };
         let analysis_sql = analysis_lex.sql.clone();
+        // `analyze_static` parses the same text; this copy is what lint and
+        // other tree consumers read, and a failure here is the same parse
+        // failure that analysis reports below.
+        let tree = match tree {
+            Some(tree) => Some(tree),
+            None if !simplify => typedpg_pg_query::parse(&analysis_sql).ok(),
+            None => None,
+        };
 
         // Install the diagnostic context so that error sites deep in the
         // analyzer can render snippet + caret + hint against the original
         // SQL.
-        let (columns, mut info_params, can_run_as_subquery) = {
-            let _guard = crate::error::DiagContextGuard::install(sql, analysis_lex);
-            match analyze_static(self, &analysis_sql, &param_nullability) {
-                Ok(p) => p,
-                Err(e) => return (analysis_sql, Err(e)),
+        let result = {
+            let _guard = crate::error::DiagContextGuard::install(sql, &analysis_lex);
+            analyze_static(self, &analysis_sql, &param_nullability)
+        };
+        let (columns, mut info_params, can_run_as_subquery) = match result {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    QueryAnalysis {
+                        sql: analysis_sql,
+                        lex: analysis_lex,
+                        tree,
+                    },
+                    Err(e),
+                );
             }
         };
 
@@ -1376,7 +1672,11 @@ impl PgCatalog {
                 .sum::<usize>();
         if info_params.len() != expected_param_count {
             return (
-                analysis_sql.clone(),
+                QueryAnalysis {
+                    sql: analysis_sql.clone(),
+                    lex: analysis_lex,
+                    tree,
+                },
                 Err(AnalyzeError::Internal(format!(
                     "analyzer param count ({}) does not match lexer placeholder count ({}) \
                      for SQL: {analysis_sql}",
@@ -1394,16 +1694,30 @@ impl PgCatalog {
             }
         }
 
-        let Some(tree) = sample_tree else {
+        if lex_output.spreads.is_empty() {
             // Simplification runs only without spreads: the rewrite would
             // move their offsets.
-            let fused =
-                fuse(lex_output, columns, info_params, can_run_as_subquery).map(|mut analyzed| {
+            let fused = fuse(
+                lex_output.clone(),
+                columns,
+                info_params,
+                can_run_as_subquery,
+            )
+            .map(|mut analyzed| {
+                if simplify {
                     crate::simplify::simplify(self, &mut analyzed, &param_nullability);
-                    analyzed
-                });
-            return (analysis_sql, fused);
-        };
+                }
+                analyzed
+            });
+            return (
+                QueryAnalysis {
+                    sql: analysis_sql,
+                    lex: analysis_lex,
+                    tree,
+                },
+                fused,
+            );
+        }
         let fused = fuse(
             lex_output.clone(),
             columns.clone(),
@@ -1411,21 +1725,30 @@ impl PgCatalog {
             can_run_as_subquery,
         )
         .map(|mut analyzed| {
-            crate::resolve::prove_array_forms(
-                self,
-                &crate::resolve::Sample {
-                    lex_output: &lex_output,
-                    sample_lex: analysis_lex,
-                    tree: &tree.protobuf,
-                    nullability: &param_nullability,
-                },
-                &columns,
-                &info_params,
-                &mut analyzed,
-            );
+            if let Some(tree) = &tree {
+                crate::resolve::prove_array_forms(
+                    self,
+                    &crate::resolve::Sample {
+                        lex_output: &lex_output,
+                        sample_lex: &analysis_lex,
+                        tree: &tree.protobuf,
+                        nullability: &param_nullability,
+                    },
+                    &columns,
+                    &info_params,
+                    &mut analyzed,
+                );
+            }
             analyzed
         });
-        (analysis_sql, fused)
+        (
+            QueryAnalysis {
+                sql: analysis_sql,
+                lex: analysis_lex,
+                tree,
+            },
+            fused,
+        )
     }
 
     /// Allocate a fresh user-space OID. Returns the [`NonZeroU32`] directly so
@@ -2146,6 +2469,136 @@ fn default_search_path() -> String {
     "\"$user\", public".to_owned()
 }
 
+/// The text, parse tree and offset map [`PgCatalog::analyze_parts_here`]
+/// produced. The tree is absent only when the caller didn't need it (a
+/// plain [`PgCatalog::analyze`] without spreads).
+struct QueryAnalysis {
+    sql: String,
+    lex: crate::param::LexOutput,
+    tree: Option<typedpg_pg_query::ParseResult>,
+}
+
+/// One statement of a migration, as [`MigrationObserver`] sees it.
+pub struct MigrationStatement<'a> {
+    /// The parsed statement.
+    pub node: &'a typedpg_pg_query::protobuf::node::Node,
+    /// The statement's byte range in the migration file's text: the
+    /// `RawStmt`'s `stmt_location .. stmt_location + stmt_len`, or to the
+    /// end of the file when `stmt_len` is 0. libpg_query starts it at the
+    /// statement's first token: the whitespace and comments that lead into
+    /// the statement are outside it.
+    pub span: std::ops::Range<usize>,
+}
+
+/// Watches a migration as [`PgCatalog::apply_migration_observed`] applies it,
+/// one statement at a time.
+pub trait MigrationObserver {
+    /// Runs before `statement` is applied: `catalog` is the state the
+    /// statement will see.
+    fn before(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+        let _ = (catalog, statement);
+    }
+
+    /// Runs after `statement` was applied successfully: `catalog` is the
+    /// state it left.
+    fn after(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+        let _ = (catalog, statement);
+    }
+}
+
+/// What the analyzer proved about the two sides of one `= ANY` / `IN`
+/// sublink (the `location` is an offset in [`QueryView::sql`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SublinkNullability {
+    /// Some left-hand expression may be NULL.
+    pub lhs_nullable: bool,
+    /// Some output column of the subquery may be NULL.
+    pub subquery_nullable: bool,
+}
+
+thread_local! {
+    /// Set while [`PgCatalog::query_view`] analyzes a query: the sublink
+    /// nullability facts it records. A plain [`PgCatalog::analyze`] leaves
+    /// it `None`, so it pays nothing.
+    static SUBLINK_NULLABILITY: std::cell::RefCell<
+        Option<HashMap<i32, SublinkNullability>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, collecting the sublink nullability facts it records.
+fn collecting_sublink_nullability<R>(
+    f: impl FnOnce() -> R,
+) -> (R, HashMap<i32, SublinkNullability>) {
+    let before = SUBLINK_NULLABILITY.with(|facts| facts.replace(Some(HashMap::new())));
+    let out = f();
+    let collected = SUBLINK_NULLABILITY
+        .with(|facts| facts.replace(before))
+        .unwrap_or_default();
+    (out, collected)
+}
+
+/// Record what an `= ANY` / `IN` sublink at `location` compared, merging
+/// with any fact already recorded for it (a sublink may be inferred more
+/// than once).
+pub(crate) fn note_sublink_nullability(location: i32, lhs_nullable: bool, subquery_nullable: bool) {
+    if location < 0 {
+        return;
+    }
+    SUBLINK_NULLABILITY.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            let fact = facts.entry(location).or_insert(SublinkNullability {
+                lhs_nullable: false,
+                subquery_nullable: false,
+            });
+            fact.lhs_nullable |= lhs_nullable;
+            fact.subquery_nullable |= subquery_nullable;
+        }
+    });
+}
+
+/// A query as the analyzer sees it, for tools that read its parse tree.
+///
+/// Returned by [`PgCatalog::query_view`]. Offsets in [`Self::sql`] are what
+/// [`Self::tree`]'s `location` fields (and rules' spans) use;
+/// [`Self::original_offset`] maps them back to the text the user wrote.
+#[derive(Debug, Clone)]
+pub struct QueryView {
+    /// The text the analyzer worked on: `$name` parameters rewritten to
+    /// `$n`, and spreads materialized as the sample row analysis uses.
+    pub sql: String,
+    /// The parse of [`Self::sql`].
+    pub tree: typedpg_pg_query::protobuf::ParseResult,
+    /// The analysis result, before any query simplification.
+    pub analyzed: AnalyzedQuery,
+    /// The offset map from [`Self::sql`] back to the original text.
+    lex: crate::param::LexOutput,
+    /// What the analyzer proved about each `= ANY` / `IN` sublink, by its
+    /// location in [`Self::sql`].
+    sublink_nullability: HashMap<i32, SublinkNullability>,
+}
+
+impl QueryView {
+    /// What the analyzer proved about the `= ANY` / `IN` sublink at
+    /// `location` (a byte offset in [`Self::sql`]): whether some left-hand
+    /// expression and whether some subquery output column may be NULL.
+    /// `None` when no such sublink was inferred there.
+    pub fn sublink_nullability(&self, location: i32) -> Option<SublinkNullability> {
+        self.sublink_nullability.get(&location).copied()
+    }
+
+    /// The byte offset in the original query text of `offset_in_sql`, a
+    /// byte offset in [`Self::sql`].
+    pub fn original_offset(&self, offset_in_sql: usize) -> usize {
+        self.lex.original_offset(offset_in_sql)
+    }
+
+    /// [`Self::original_offset`] for a byte range.
+    pub fn original_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let (start, end) = self.lex.original_span(span.start, span.end);
+        start..end
+    }
+}
+
 /// An [`AnalyzeError`] and where in the analyzed text it is.
 #[derive(Debug)]
 pub struct LocatedError {
@@ -2158,5 +2611,106 @@ impl LocatedError {
     fn new(error: AnalyzeError) -> Self {
         let offset = crate::diagnostic::primary_offset_of(&error.to_string());
         LocatedError { error, offset }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Event {
+        kind: &'static str,
+        span: std::ops::Range<usize>,
+        table_existed: bool,
+    }
+
+    struct Recorder {
+        events: Vec<Event>,
+    }
+
+    impl MigrationObserver for Recorder {
+        fn before(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+            let kind = match statement.node {
+                typedpg_pg_query::protobuf::node::Node::CreateStmt(_) => "create",
+                typedpg_pg_query::protobuf::node::Node::AlterTableStmt(_) => "alter",
+                _ => "other",
+            };
+            self.events.push(Event {
+                kind,
+                span: statement.span.clone(),
+                table_existed: catalog.resolve_table(None, "t").is_some(),
+            });
+        }
+    }
+
+    #[test]
+    fn observed_migration_sees_every_statement_in_order_with_its_span() {
+        let sql =
+            "-- a leading comment\nCREATE TABLE t (id int);\n\nALTER TABLE t ADD COLUMN x int;";
+        let mut catalog = PgCatalog::new().unwrap();
+        let mut recorder = Recorder { events: Vec::new() };
+        catalog
+            .apply_migration_observed("001_t.sql", sql, &mut recorder)
+            .unwrap();
+        assert_eq!(recorder.events.len(), 2);
+        assert_eq!(recorder.events[0].kind, "create");
+        assert_eq!(recorder.events[1].kind, "alter");
+        assert!(!recorder.events[0].table_existed);
+        // `before` of the second statement sees what the first one created.
+        assert!(recorder.events[1].table_existed);
+        // Spans are the `RawStmt` ranges: the statement's text, without the
+        // comments and whitespace that lead into it.
+        for event in &recorder.events {
+            assert!(event.span.start < event.span.end);
+            assert!(event.span.end <= sql.len());
+        }
+        assert_eq!(
+            &sql[recorder.events[0].span.clone()],
+            "CREATE TABLE t (id int)"
+        );
+        assert_eq!(
+            &sql[recorder.events[1].span.clone()],
+            "ALTER TABLE t ADD COLUMN x int"
+        );
+    }
+
+    #[test]
+    fn user_object_counts_are_what_the_migrations_created() {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE TABLE things (id integer PRIMARY KEY, name text);
+                 CREATE VIEW thing_names AS SELECT name FROM things;
+                 CREATE INDEX things_name_idx ON things (name);
+                 CREATE SEQUENCE things_seq;
+                 CREATE TYPE mood AS ENUM ('ok', 'bad');
+                 CREATE DOMAIN email AS text;
+                 CREATE FUNCTION thing_count() RETURNS bigint
+                     LANGUAGE sql AS 'SELECT count(*) FROM things';
+                 CREATE EXTENSION citext;",
+            )
+            .unwrap();
+        let counts = catalog.user_object_counts();
+        // The seed's objects and the extensions' are not the migrations'.
+        assert_eq!(
+            counts,
+            UserObjectCounts {
+                tables: 1,
+                views: 1,
+                // The primary key's index and `things_name_idx`.
+                indexes: 2,
+                sequences: 1,
+                // The enum and the domain: not the arrays, nor the relation
+                // row types.
+                types: 2,
+                functions: 1,
+                extensions: 1,
+            }
+        );
+        // The seed alone has no user objects.
+        assert_eq!(
+            PgCatalog::new().unwrap().user_object_counts(),
+            UserObjectCounts::default()
+        );
     }
 }

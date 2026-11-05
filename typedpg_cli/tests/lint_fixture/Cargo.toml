@@ -1,0 +1,19 @@
+# The crate `typedpg_cli`'s lint integration test reads. It is its own
+# workspace (and excluded from the main one): nothing builds it, the test
+# only runs `cargo typedpg lint` over its sources and migrations.
+[package]
+name = "lint_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+
+[package.metadata.typedpg.lint]
+ignore = ["tests/ignored.rs"]
+
+[package.metadata.typedpg.databases.other.database]
+migrations = "./other_migrations"

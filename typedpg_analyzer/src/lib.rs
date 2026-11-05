@@ -13,6 +13,9 @@
 //! | Item | Role |
 //! |------|------|
 //! | [`PgCatalog`] | Mutable catalog: seed the PG18 catalog, then apply DDL and analyze queries against it. |
+//! | [`QueryView`] | A query's analyzed text, parse tree and offset map, before the simplifications. |
+//! | [`SublinkNullability`] | What the analyzer proved about the two sides of an `= ANY` / `IN` sublink. |
+//! | [`MigrationObserver`] | Watches each statement of a migration as [`PgCatalog::apply_migration_observed`] applies it. |
 //! | [`AnalyzedQuery`] | Result of analysis: rewritten SQL + typed parameters, spreads, and output columns. |
 //! | [`AnalyzedParam`] | A named parameter with its inferred Rust type and the byte offsets where it appears. |
 //! | [`AnalyzedSpread`] | A `$..name { ... }` spread with its insertion offset and typed fields. |
@@ -102,7 +105,10 @@ pub use pg_catalog::{
 
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
-pub use pg_catalog::{LocatedError, PgCatalog};
+pub use pg_catalog::{
+    LocatedError, MigrationObserver, MigrationStatement, PgCatalog, QueryView, SublinkNullability,
+    UserObjectCounts,
+};
 pub use refine::Refinement;
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,

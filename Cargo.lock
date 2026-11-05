@@ -3773,11 +3773,15 @@ dependencies = [
  "dotenvy",
  "native-tls",
  "postgres-native-tls",
+ "proc-macro2",
+ "syn 3.0.9",
  "tempfile",
  "tokio",
  "tokio-postgres",
  "typedpg",
+ "typedpg_analyzer",
  "typedpg_core",
+ "typedpg_lint",
  "typedpg_test_support",
 ]
 
@@ -3832,6 +3836,18 @@ dependencies = [
  "serde",
  "tokio",
  "typedpg",
+]
+
+[[package]]
+name = "typedpg_lint"
+version = "0.5.0"
+dependencies = [
+ "globset",
+ "serde",
+ "serde_json",
+ "typedpg_analyzer",
+ "typedpg_core",
+ "typedpg_pg_query",
 ]
 
 [[package]]
@@ -3917,6 +3933,7 @@ dependencies = [
  "typedpg_analyzer",
  "typedpg_cli",
  "typedpg_core",
+ "typedpg_lint",
 ]
 
 [[package]]

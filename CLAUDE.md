@@ -18,6 +18,7 @@ cargo nextest run --release                          # all tests (no Docker need
 cargo nextest run --release -p typedpg_core        # core crate only
 cargo nextest run --release -p typedpg_macros      # macro crate only
 cargo nextest run --release -p typedpg_analyzer    # analyzer crate only
+cargo nextest run --release -p typedpg_lint        # lint crate only
 cargo nextest run --release -p typedpg             # runtime crate only
 cargo nextest run --release --test migrate_integration  # integration tests (requires Docker)
 cargo nextest run --release test_name                # run a single test by name
@@ -118,13 +119,17 @@ are expected).
 Workspace with crates:
 
 ```
-typedpg_cli (binary: `cargo typedpg migrate up/down/status/create`)
-    └── typedpg (runtime: Pool, Executor, migrate)
-            ├── typedpg_core (shared config and migration helpers — kept small so runtime does not pull pg_query)
-            └── typedpg_macros (proc macro: sql!)
-                    ├── typedpg_core
-                    └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
-                            └── typedpg_pg_query (PostgreSQL parser: our libpg_query binding)
+typedpg_cli (binary: `cargo typedpg migrate …`, `cargo typedpg lint`)
+    ├── typedpg (runtime: Pool, Executor, migrate)
+    │       ├── typedpg_core (shared config and migration helpers — kept small so runtime does not pull pg_query)
+    │       └── typedpg_macros (proc macro: sql!)
+    │               ├── typedpg_core
+    │               └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
+    │                       └── typedpg_pg_query (PostgreSQL parser: our libpg_query binding)
+    └── typedpg_lint (the `typedpg lint` rules: queries, migrations and the final schema)
+            ├── typedpg_analyzer
+            ├── typedpg_core
+            └── typedpg_pg_query
 
 typedpg_wasm (the same migration helpers, compiled to WebAssembly for typedpg_npm)
     └── typedpg_core
