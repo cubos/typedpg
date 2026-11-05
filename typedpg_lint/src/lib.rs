@@ -15,8 +15,9 @@
 //! then the schema rules over the final catalog. Its findings are placed in
 //! the file text; the TypeScript CLI prints them beside the query findings.
 //!
-//! [`report`] builds and renders the one report both CLIs print: the same
-//! lines in the human format, as one JSON object, or as SARIF.
+//! [`report`] builds and renders the one report both CLIs print: the
+//! `typedpg check` boxes in the human format, as one JSON object, or as
+//! SARIF.
 
 mod migrations;
 pub mod report;
@@ -482,40 +483,6 @@ pub fn render(path: &Path, line: u32, column: u32, finding: &Finding) -> String 
     out
 }
 
-/// The summary line [`report::Report::summary`] renders:
-/// `[typedpg] lint: 2 errors, 1 warning, 0 infos in 14 queries and 3 migrations`.
-pub(crate) fn summary_line(
-    errors: usize,
-    warnings: usize,
-    infos: usize,
-    queries: usize,
-    migrations: usize,
-) -> String {
-    let plural = |n: usize, word: &str, words: &str| {
-        if n == 1 {
-            format!("{n} {word}")
-        } else {
-            format!("{n} {words}")
-        }
-    };
-    let queries = if queries == 1 {
-        "1 query".to_owned()
-    } else {
-        format!("{queries} queries")
-    };
-    let migrations = if migrations == 1 {
-        "1 migration".to_owned()
-    } else {
-        format!("{migrations} migrations")
-    };
-    format!(
-        "[typedpg] lint: {}, {}, {} in {queries} and {migrations}",
-        plural(errors, "error", "errors"),
-        plural(warnings, "warning", "warnings"),
-        plural(infos, "info", "infos"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,23 +905,11 @@ mod tests {
         };
         let report = report::Report {
             entries: vec![entry(finding), entry(warning), entry(info)],
-            failures: Vec::new(),
-            queries: 14,
-            migrations: 3,
+            ..report::Report::default()
         };
         assert_eq!(
             report.summary(),
-            "[typedpg] lint: 1 error, 1 warning, 1 info in 14 queries and 3 migrations"
-        );
-        let report = report::Report {
-            entries: Vec::new(),
-            failures: Vec::new(),
-            queries: 1,
-            migrations: 1,
-        };
-        assert_eq!(
-            report.summary(),
-            "[typedpg] lint: 0 errors, 0 warnings, 0 infos in 1 query and 1 migration"
+            "typedpg lint: 1 error, 1 warning, 1 info\n  checked 0 queries and 0 migrations in 0.00s\n  ✖ failed: 1 finding at or above fail_on (error)"
         );
     }
 

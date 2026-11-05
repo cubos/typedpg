@@ -1,19 +1,85 @@
-migrations/0002_hazards.sql:4:1: warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.posts for the whole build
+error: column "nope" does not exist
+    ╭─[src/broken.ts:10:21]
+ 10 │   await sql("SELECT nope FROM users").fetchAll(pool);
+    ·                     ──┬─
+    ·                       ╰─ column does not exist
+    ╰────
+
+error: relation "missing" does not exist
+    ╭─[src/broken.ts:12:16]
+ 12 │   await copyIn("missing (id)").execute(pool, []);
+    ·                ──────────────
+    ╰────
+
+warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.posts for the whole build
+   ╭─[migrations/0002_hazards.sql:4:1]
+ 4 │ CREATE INDEX posts_author_id_idx ON posts (author_id);
+   · ─────────────────────────────────────────────────────
+   ╰────
   help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
-migrations/0002_hazards.sql:8:1: info[redundant_index]: index users_email_idx is redundant with users_email_name_idx
-migrations/0002_hazards.sql:10:1: warning[constraint_validating]: adding a constraint validates every row of public.comments under a lock
-  help: add it NOT VALID, then VALIDATE CONSTRAINT in a later migration
-migrations/0002_hazards.sql:10:1: warning[fk_without_index]: foreign key comments_post_fk on public.comments (post_id) has no index
-  help: CREATE INDEX ON public.comments (post_id)
-migrations/0002_hazards.sql:13:1: warning[set_not_null_scan]: SET NOT NULL scans every row of public.users under a lock
-  help: add CHECK (email IS NOT NULL) NOT VALID, VALIDATE it, then SET NOT NULL
-migrations/0002_hazards.sql:14:1: warning[table_rewrite]: ALTER TABLE rewrites every row of public.users under an ACCESS EXCLUSIVE lock
-  help: rewrite in steps: add a new column, backfill it in batches, then swap
-src/queries.ts:11:41: error[null_comparison]: comparison with NULL is never true
-  help: use IS NULL / IS NOT NULL
-src/queries.ts:19:41: warning[not_in_nullable]: NOT IN (SELECT …) returns no rows when the subquery returns a NULL
-  help: use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL
-src/writes.sql:5:1: warning[unbounded_write]: DELETE without WHERE removes every row of users
+
+info[redundant_index]: index users_email_idx is redundant with users_email_name_idx
+   ╭─[migrations/0002_hazards.sql:8:1]
+ 8 │ CREATE INDEX CONCURRENTLY users_email_idx ON users (email);
+   · ──────────────────────────────────────────────────────────
+   ╰────
+
+warning[constraint_validating]: adding a constraint validates every row of public.comments under a lock
+    ╭─[migrations/0002_hazards.sql:10:1]
+ 10 │ ALTER TABLE comments ADD CONSTRAINT comments_post_fk
+    · ────────────────────────────────────────────────────
+ 11 │     FOREIGN KEY (post_id) REFERENCES posts (id);
+    · ───────────────────────────────────────────────
+    ╰────
+   help: add it NOT VALID, then VALIDATE CONSTRAINT in a later migration
+
+warning[fk_without_index]: foreign key comments_post_fk on public.comments (post_id) has no index
+    ╭─[migrations/0002_hazards.sql:10:1]
+ 10 │ ALTER TABLE comments ADD CONSTRAINT comments_post_fk
+    · ────────────────────────────────────────────────────
+ 11 │     FOREIGN KEY (post_id) REFERENCES posts (id);
+    · ───────────────────────────────────────────────
+    ╰────
+   help: CREATE INDEX ON public.comments (post_id)
+
+warning[set_not_null_scan]: SET NOT NULL scans every row of public.users under a lock
+    ╭─[migrations/0002_hazards.sql:13:1]
+ 13 │ ALTER TABLE users ALTER COLUMN email SET NOT NULL;
+    · ─────────────────────────────────────────────────
+    ╰────
+   help: add CHECK (email IS NOT NULL) NOT VALID, VALIDATE it, then SET NOT NULL
+
+warning[table_rewrite]: ALTER TABLE rewrites every row of public.users under an ACCESS EXCLUSIVE lock
+    ╭─[migrations/0002_hazards.sql:14:1]
+ 14 │ ALTER TABLE users ALTER COLUMN id TYPE bigint;
+    · ─────────────────────────────────────────────
+    ╰────
+   help: rewrite in steps: add a new column, backfill it in batches, then swap
+
+error[null_comparison]: comparison with NULL is never true
+    ╭─[src/queries.ts:11:41]
+ 11 │   await sql("SELECT id FROM users WHERE email = NULL").fetchAll(pool);
+    ·                                         ────────────
+    ╰────
+   help: use IS NULL / IS NOT NULL
+
+warning[not_in_nullable]: NOT IN (SELECT …) returns no rows when the subquery returns a NULL
+    ╭─[src/queries.ts:19:41]
+ 19 │   await sql("SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)").fetchAll(pool);
+    ·                                         ──────────────────────────────────────
+    ╰────
+   help: use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL
+
+warning[unbounded_write]: DELETE without WHERE removes every row of users
+   ╭─[src/writes.sql:5:1]
+ 5 │ DELETE FROM users;
+   · ─────────────────
+   ╰────
   help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
-src/writes.sql:12:1: warning[unbounded_write]: UPDATE without WHERE changes every row of users
-  help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
+
+warning[unbounded_write]: UPDATE without WHERE changes every row of users
+    ╭─[src/writes.sql:12:1]
+ 12 │ UPDATE users SET name = name;
+    · ────────────
+    ╰────
+   help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)

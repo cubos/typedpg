@@ -1012,6 +1012,20 @@ impl Project {
         out
     }
 
+    /// How many `copy_in!` targets the project has: statements `typedpg
+    /// lint` counts beside the queries, though it lints no rules over them.
+    pub fn lint_copy_in_count(&self) -> usize {
+        self.files
+            .values()
+            .map(|scan| {
+                scan.queries
+                    .iter()
+                    .filter(|query| query.kind == Kind::CopyIn)
+                    .count()
+            })
+            .sum()
+    }
+
     /// Database `db`'s catalog, or why it could not be built.
     pub fn catalog(&self, db: usize) -> Result<&PgCatalog, String> {
         self.dbs[db].catalog.as_ref().map_err(Clone::clone)

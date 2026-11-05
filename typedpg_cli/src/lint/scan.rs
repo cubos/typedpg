@@ -1,11 +1,12 @@
-//! Finding the `sql!` invocations of a Rust source.
+//! Finding the `sql!` and `copy_in!` invocations of a Rust source.
 //!
 //! The scanner sees syntax only: a macro whose path ends in `sql` is a
-//! query, and the same grammar as the macro's `QueryInput` reads its
-//! arguments up to the SQL string literal. Other macros are descended into
-//! on a best-effort basis (`assert!`, `vec!`, `tokio::try_join!` and the
-//! like often wrap a query), by parsing their tokens as expressions and as
-//! statements. `copy_in!` and every other macro are not queries.
+//! query and one ending in `copy_in` a COPY target, and the same grammars
+//! as the macros' inputs read their arguments up to the string literal.
+//! Other macros are descended into on a best-effort basis (`assert!`,
+//! `vec!`, `tokio::try_join!` and the like often wrap a query), by parsing
+//! their tokens as expressions and as statements. A `sql!` whose SQL
+//! argument is not a literal is an error, as the macro's own parse is.
 
 use std::collections::HashSet;
 
@@ -25,6 +26,34 @@ pub(crate) struct FoundQuery {
     pub text: String,
     /// Where the literal is in the file.
     pub literal: Literal,
+}
+
+/// A target found at one `copy_in!` site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FoundCopyIn {
+    /// The named database (`db = name`), or `None` for the default one.
+    pub db: Option<String>,
+    /// The literal's cooked value: the `table (columns)` the macro analyzes.
+    pub target: String,
+    /// Where the literal is in the file.
+    pub literal: Literal,
+}
+
+/// A `sql!` the macro itself rejects before analyzing: its SQL argument is
+/// not a string literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FoundError {
+    /// The byte offset in the file of the offending argument.
+    pub offset: usize,
+    pub message: String,
+}
+
+/// Everything a Rust source holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Scan {
+    pub queries: Vec<FoundQuery>,
+    pub copies: Vec<FoundCopyIn>,
+    pub errors: Vec<FoundError>,
 }
 
 /// A string literal as written in the source.
@@ -55,42 +84,68 @@ impl Literal {
     }
 }
 
-/// Every `sql!` query in `text`, in source order; `None` when the file does
-/// not parse.
-pub(crate) fn queries(text: &str) -> Option<Vec<FoundQuery>> {
-    let file = syn::parse_file(text).ok()?;
+/// Every `sql!` and `copy_in!` in `text`, in source order; the file's parse
+/// error when it does not parse.
+pub(crate) fn scan(text: &str) -> Result<Scan, syn::Error> {
+    let file = syn::parse_file(text)?;
     let mut finder = Finder {
         text,
-        queries: Vec::new(),
+        scan: Scan::default(),
         seen: HashSet::new(),
     };
     finder.visit_file(&file);
-    Some(finder.queries)
+    Ok(finder.scan)
 }
 
 struct Finder<'a> {
     text: &'a str,
-    queries: Vec<FoundQuery>,
-    /// The path start of each `sql!` already recorded: parsing a macro's
+    scan: Scan,
+    /// The path start of each macro already recorded: parsing a macro's
     /// tokens as both expressions and statements visits it twice.
     seen: HashSet<usize>,
 }
 
 impl Finder<'_> {
-    fn record(&mut self, mac: &Macro) {
+    fn record_sql(&mut self, mac: &Macro) {
         let start = span_offset(self.text, mac.path.span());
         if !self.seen.insert(start) {
             return;
         }
-        let Some((db, sql)) = parse_arguments(mac.tokens.clone()) else {
+        let Some((db, sql)) = parse_sql_arguments(mac.tokens.clone()) else {
             return;
         };
-        let Some(literal) = literal(self.text, sql.span(), &sql) else {
+        match sql {
+            Ok(sql) => {
+                let Some(literal) = literal(self.text, sql.span(), &sql) else {
+                    return;
+                };
+                self.scan.queries.push(FoundQuery {
+                    db,
+                    text: literal.value.clone(),
+                    literal,
+                });
+            }
+            Err(error) => self.scan.errors.push(FoundError {
+                offset: span_offset(self.text, error.span()),
+                message: "the SQL of sql! must be a string literal".to_owned(),
+            }),
+        }
+    }
+
+    fn record_copy_in(&mut self, mac: &Macro) {
+        let start = span_offset(self.text, mac.path.span());
+        if !self.seen.insert(start) {
+            return;
+        }
+        let Some((db, target)) = parse_copy_in_arguments(mac.tokens.clone()) else {
             return;
         };
-        self.queries.push(FoundQuery {
+        let Some(literal) = literal(self.text, target.span(), &target) else {
+            return;
+        };
+        self.scan.copies.push(FoundCopyIn {
             db,
-            text: literal.value.clone(),
+            target: literal.value.clone(),
             literal,
         });
     }
@@ -114,44 +169,63 @@ impl Finder<'_> {
 
 impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        if mac
+        match mac
             .path
             .segments
             .last()
-            .is_some_and(|segment| segment.ident == "sql")
+            .map(|segment| segment.ident.to_string())
+            .as_deref()
         {
-            self.record(mac);
-        } else {
-            self.descend(&mac.tokens);
+            Some("sql") => self.record_sql(mac),
+            Some("copy_in") => self.record_copy_in(mac),
+            _ => self.descend(&mac.tokens),
         }
     }
 }
 
+/// `[db = name,]` from the macro arguments.
+fn parse_db(input: ParseStream<'_>) -> syn::Result<Option<String>> {
+    if input.peek(Ident) {
+        let fork = input.fork();
+        let ident: Ident = fork.parse()?;
+        if ident == "db" && fork.peek(Token![=]) {
+            let _: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let name: Ident = input.parse()?;
+            input.parse::<Token![,]>()?;
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// `(db, sql)` from `[db = name,] executor, "SQL", …`, reading no further
-/// than the literal.
-fn parse_arguments(tokens: TokenStream) -> Option<(Option<String>, LitStr)> {
-    let parser = |input: ParseStream<'_>| -> syn::Result<(Option<String>, LitStr)> {
-        let db = if input.peek(Ident) {
-            let fork = input.fork();
-            let ident: Ident = fork.parse()?;
-            if ident == "db" && fork.peek(Token![=]) {
-                let _: Ident = input.parse()?;
-                input.parse::<Token![=]>()?;
-                let name: Ident = input.parse()?;
-                input.parse::<Token![,]>()?;
-                Some(name.to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+/// than the literal. The literal is an error when the argument is not a
+/// string literal: the macro rejects it.
+fn parse_sql_arguments(tokens: TokenStream) -> Option<(Option<String>, syn::Result<LitStr>)> {
+    let parser = |input: ParseStream<'_>| -> syn::Result<(Option<String>, syn::Result<LitStr>)> {
+        let db = parse_db(input)?;
         let _: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
-        let sql: LitStr = input.parse()?;
+        let sql = input.parse::<LitStr>();
         // The parameter assignments after the literal are irrelevant here.
         let _: TokenStream = input.parse()?;
         Ok((db, sql))
+    };
+    parser.parse2(tokens).ok()
+}
+
+/// `(db, target)` from `[db = name,] executor, "table (columns)", …`, the
+/// same grammar as the macro's `CopyInInput`.
+fn parse_copy_in_arguments(tokens: TokenStream) -> Option<(Option<String>, LitStr)> {
+    let parser = |input: ParseStream<'_>| -> syn::Result<(Option<String>, LitStr)> {
+        let db = parse_db(input)?;
+        let _: Expr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let target: LitStr = input.parse()?;
+        // The source and its `{ fields }` are irrelevant here.
+        let _: TokenStream = input.parse()?;
+        Ok((db, target))
     };
     parser.parse2(tokens).ok()
 }
@@ -302,8 +376,12 @@ fn skip_whitespace(raw: &str, mut i: usize) -> usize {
 mod tests {
     use super::*;
 
-    fn scan(source: &str) -> Vec<FoundQuery> {
-        queries(source).unwrap_or_else(|| panic!("does not parse: {source}"))
+    fn scanned(source: &str) -> Scan {
+        scan(source).unwrap_or_else(|_| panic!("does not parse: {source}"))
+    }
+
+    fn queries(source: &str) -> Vec<FoundQuery> {
+        scanned(source).queries
     }
 
     #[test]
@@ -317,7 +395,7 @@ fn main() {
     let _ = vec![sql!(pool, "SELECT 6")];
 }
 "#;
-        let found = scan(source);
+        let found = queries(source);
         let db: Vec<Option<&str>> = found.iter().map(|query| query.db.as_deref()).collect();
         let sql: Vec<&str> = found.iter().map(|query| query.text.as_str()).collect();
         assert_eq!(db, [None, None, Some("other"), None, None, None]);
@@ -330,16 +408,44 @@ fn main() {
     }
 
     #[test]
-    fn ignores_copy_in_and_non_literal_arguments() {
+    fn finds_copy_in_targets_with_their_databases() {
+        let source = r##"
+fn main() {
+    copy_in!(pool, "users (id)", rows { id });
+    copy_in!(db = other, &tx, r#"things (name)"#, rows.iter() { name },);
+}
+"##;
+        let found = scanned(source);
+        assert!(found.queries.is_empty());
+        assert!(found.errors.is_empty());
+        let db: Vec<Option<&str>> = found.copies.iter().map(|copy| copy.db.as_deref()).collect();
+        let targets: Vec<&str> = found
+            .copies
+            .iter()
+            .map(|copy| copy.target.as_str())
+            .collect();
+        assert_eq!(db, [None, Some("other")]);
+        assert_eq!(targets, ["users (id)", "things (name)"]);
+    }
+
+    #[test]
+    fn a_non_literal_sql_argument_is_an_error() {
         let source = r#"
 fn main() {
-    copy_in!(pool, "users (id)");
     sql!(pool, query);
     sql!(pool, concat!("SELECT 1"));
     sql!(pool, 42);
 }
 "#;
-        assert!(scan(source).is_empty());
+        let found = scanned(source);
+        assert!(found.queries.is_empty());
+        assert_eq!(found.errors.len(), 3);
+        for error in &found.errors {
+            assert_eq!(error.message, "the SQL of sql! must be a string literal");
+            assert!(error.offset < source.len());
+        }
+        assert!(source[found.errors[0].offset..].starts_with("query"));
+        assert!(source[found.errors[1].offset..].starts_with("concat"));
     }
 
     #[test]
@@ -347,7 +453,7 @@ fn main() {
         let source = r#"fn main() {
     let _ = sql!(pool, "a\nb\tc\rd\\e\0f\'g\"h\x41i\u{1F600}j");
 }"#;
-        let query = &scan(source)[0];
+        let query = &queries(source)[0];
         assert_eq!(query.text, "a\nb\tc\rd\\e\0f'g\"hAi😀j");
         for (needle, written) in [
             ("\n", "\\n"),
@@ -380,7 +486,7 @@ fn main() {
         id FROM users WHERE email = NULL");
 }
 "#;
-        let query = &scan(source)[0];
+        let query = &queries(source)[0];
         assert_eq!(query.text, "SELECT id FROM users WHERE email = NULL");
         let at = query.literal.source_offset(query.text.find("id").unwrap());
         assert!(source[at..].starts_with("id FROM"), "{}", &source[at..]);
@@ -395,7 +501,7 @@ fn main() {
     #[test]
     fn multi_byte_characters_before_the_literal_keep_the_columns_right() {
         let source = r#"fn main() { let _ = ("é", sql!(pool, "SELECT id FROM users WHERE email = NULL")); }"#;
-        let query = &scan(source)[0];
+        let query = &queries(source)[0];
         let at = query
             .literal
             .source_offset(query.text.find("email").unwrap());
@@ -407,7 +513,7 @@ fn main() {
         let source = r####"fn main() {
     let _ = sql!(pool, r###"SELECT id FROM users WHERE email = NULL"###);
 }"####;
-        let query = &scan(source)[0];
+        let query = &queries(source)[0];
         assert_eq!(query.text, "SELECT id FROM users WHERE email = NULL");
         assert!(query.literal.raw_string);
         let at = query
@@ -419,7 +525,7 @@ fn main() {
     }
 
     #[test]
-    fn an_unparseable_file_is_skipped() {
-        assert!(queries("fn main( {").is_none());
+    fn an_unparseable_file_is_an_error() {
+        assert!(scan("fn main( {").is_err());
     }
 }

@@ -768,6 +768,15 @@ impl Config {
         self.database.migrations_dir(base)
     }
 
+    /// The named databases (`[package.metadata.typedpg.databases]`), sorted.
+    /// The default database has no name: it is the configuration outside
+    /// that table.
+    pub fn database_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.databases.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Resolve configuration for a specific database.
     ///
     /// - `None` returns the default (top-level) config.
@@ -1267,6 +1276,30 @@ use_transaction = false
     fn resolve_unknown_db_errors() {
         let config = Config::from_str(MINIMAL_TOML).unwrap();
         assert!(config.resolve(Some("nonexistent")).is_err());
+    }
+
+    #[test]
+    fn database_names_lists_the_named_databases_sorted() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.typedpg.databases.warehouse.database]
+migrations = "./migrations/warehouse"
+
+[package.metadata.typedpg.databases.analytics.database]
+migrations = "./migrations/analytics"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.database_names(), ["analytics", "warehouse"]);
+        assert!(
+            Config::from_str(MINIMAL_TOML)
+                .unwrap()
+                .database_names()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -111,6 +111,11 @@
           ]
         }
       },
+      "invocations": [
+        {
+          "executionSuccessful": false
+        }
+      ],
       "columnKind": "unicodeCodePoints",
       "results": [
         {
@@ -177,6 +182,29 @@
                   "startColumn": 1,
                   "endLine": 6,
                   "endColumn": 50
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "create_index_blocking",
+          "level": "warning",
+          "message": {
+            "text": "CREATE INDEX without CONCURRENTLY blocks writes on public.things for the whole build\nuse CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "other_migrations/0002_hazards.sql",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 3,
+                  "startColumn": 1,
+                  "endLine": 3,
+                  "endColumn": 46
                 }
               }
             }
@@ -292,6 +320,69 @@
                   "startColumn": 57,
                   "endLine": 18,
                   "endColumn": 68
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "analysis_error",
+          "level": "error",
+          "message": {
+            "text": "column \"nope\" does not exist\n  ╭────\n1 │ SELECT nope FROM users\n  ·        ──┬─\n  ·          ╰─ column does not exist\n  ╰────\n"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 22,
+                  "startColumn": 24
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "analysis_error",
+          "level": "error",
+          "message": {
+            "text": "relation \"missing\" does not exist"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 24,
+                  "startColumn": 21
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "analysis_error",
+          "level": "error",
+          "message": {
+            "text": "the SQL of sql! must be a string literal"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 27,
+                  "startColumn": 16
                 }
               }
             }

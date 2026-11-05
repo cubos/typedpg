@@ -111,12 +111,37 @@
       "help": "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
     }
   ],
-  "failures": [],
+  "failures": [
+    {
+      "path": "src/broken.ts",
+      "line": 10,
+      "column": 21,
+      "message": "column \"nope\" does not exist\n  ╭────\n1 │ SELECT nope FROM users\n  ·        ──┬─\n  ·          ╰─ column does not exist\n  ╰────"
+    },
+    {
+      "path": "src/broken.ts",
+      "line": 12,
+      "column": 16,
+      "message": "relation \"missing\" does not exist"
+    }
+  ],
   "summary": {
     "errors": 1,
     "warnings": 8,
     "infos": 1,
-    "queries": 8,
-    "migrations": 2
+    "queries": 10,
+    "migrations": 2,
+    "failures": 2,
+    "schema": {
+      "default": {
+        "tables": 3,
+        "views": 0,
+        "indexes": 7,
+        "sequences": 0,
+        "types": 0,
+        "functions": 0,
+        "extensions": 0
+      }
+    }
   }
 }

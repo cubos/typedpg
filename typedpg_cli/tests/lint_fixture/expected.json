@@ -34,6 +34,17 @@
       "help": "CREATE INDEX ON public.posts (author_id)"
     },
     {
+      "path": "other_migrations/0002_hazards.sql",
+      "line": 3,
+      "column": 1,
+      "endLine": 3,
+      "endColumn": 46,
+      "rule": "create_index_blocking",
+      "severity": "warning",
+      "message": "CREATE INDEX without CONCURRENTLY blocks writes on public.things for the whole build",
+      "help": "use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+    },
+    {
       "path": "src/main.rs",
       "line": 8,
       "column": 45,
@@ -89,12 +100,52 @@
       "help": "use IS NULL / IS NOT NULL"
     }
   ],
-  "failures": [],
+  "failures": [
+    {
+      "path": "src/main.rs",
+      "line": 22,
+      "column": 24,
+      "message": "column \"nope\" does not exist\n  ╭────\n1 │ SELECT nope FROM users\n  ·        ──┬─\n  ·          ╰─ column does not exist\n  ╰────\n"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 24,
+      "column": 21,
+      "message": "relation \"missing\" does not exist"
+    },
+    {
+      "path": "src/main.rs",
+      "line": 27,
+      "column": 16,
+      "message": "the SQL of sql! must be a string literal"
+    }
+  ],
   "summary": {
     "errors": 4,
-    "warnings": 4,
+    "warnings": 5,
     "infos": 0,
-    "queries": 6,
-    "migrations": 3
+    "queries": 8,
+    "migrations": 4,
+    "failures": 3,
+    "schema": {
+      "default": {
+        "tables": 2,
+        "views": 0,
+        "indexes": 3,
+        "sequences": 0,
+        "types": 0,
+        "functions": 0,
+        "extensions": 0
+      },
+      "other": {
+        "tables": 1,
+        "views": 0,
+        "indexes": 2,
+        "sequences": 0,
+        "types": 0,
+        "functions": 0,
+        "extensions": 0
+      }
+    }
   }
 }

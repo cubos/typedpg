@@ -107,6 +107,7 @@ pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{
     LocatedError, MigrationObserver, MigrationStatement, PgCatalog, QueryView, SublinkNullability,
+    UserObjectCounts,
 };
 pub use refine::Refinement;
 pub use resolve::{

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -6,7 +6,9 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use typedpg::migrate::MigrationSource;
 use typedpg_cli::{MigrateAction, connect, create_migration, run_migrate_action};
-use typedpg_lint::report::{Entry, Failure, Format, Report, position};
+use typedpg_lint::report::{
+    Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
+};
 use typedpg_lint::{Finding, LintOptions};
 use typedpg_ts::cache;
 use typedpg_ts::config::{CONFIG_FILE, Config};
@@ -156,28 +158,34 @@ fn relative(path: &Path, root: &Path) -> String {
 /// Lint every query; whether no analysis failed and no finding reaches
 /// `fail_on`.
 fn lint(config: &Path, format: Format) -> Result<bool, String> {
+    let start = Instant::now();
     let config = Config::load(config)?;
     let options = LintOptions::from_config(&config.lint);
-    let project = Project::new(config, true)?;
+    let mut project = Project::new(config, true)?;
     let root = project.config.root.clone();
+    // The check `cargo build` would run: every diagnostic it reports is a
+    // failure here too (a query or COPY target that does not analyze, a
+    // scanner error, a `.sql` layout error, a broken migration). Stale
+    // generated modules only need `typedpg gen`.
+    let sync = project.sync(true);
+    let mut report = Report::default();
+    for diagnostic in &sync.diagnostics {
+        report.failures.push(Failure {
+            path: relative(&diagnostic.file, &root),
+            start: diagnostic.pos.map(|pos| Position {
+                line: pos.line,
+                column: pos.col,
+            }),
+            message: diagnostic.message.clone(),
+        });
+    }
     // `(database, text)` → its findings or analysis error. The same query is
     // often written at several call sites.
     let mut cache: HashMap<(usize, String), LintResult> = HashMap::new();
-    let mut report = Report::default();
-    let mut broken = HashSet::new();
     for db in 0..project.database_count() {
         let files = match project.lint_migration_files(db) {
             Ok(files) => files,
-            Err(error) => {
-                if broken.insert(db) {
-                    report.failures.push(Failure {
-                        path: relative(&project.config.databases[db].migrations_dir, &root),
-                        start: None,
-                        message: error,
-                    });
-                }
-                continue;
-            }
+            Err(_) => continue,
         };
         report.migrations += files.len();
         let lint_files: Vec<typedpg_lint::MigrationFile> = files
@@ -188,47 +196,35 @@ fn lint(config: &Path, format: Format) -> Result<bool, String> {
                 lint: file.lint,
             })
             .collect();
-        match typedpg_lint::lint_migrations(
+        for file in &lint_files {
+            report.sources.insert(file.path.clone(), file.sql.clone());
+        }
+        if let Ok(linted) = typedpg_lint::lint_migrations(
             &lint_files,
             project.migrations_use_transaction(db),
             &options,
         ) {
-            Ok(linted) => {
-                for migration in linted.findings {
-                    let file = &files[migration.file];
-                    report.entries.push(Entry {
-                        path: relative(&file.path, &root),
-                        start: position(&file.sql, migration.finding.span.start),
-                        end: position(&file.sql, migration.finding.span.end),
-                        finding: migration.finding,
-                    });
-                }
-            }
-            Err(error) => {
-                if broken.insert(db) {
-                    report.failures.push(Failure {
-                        path: relative(&project.config.databases[db].migrations_dir, &root),
-                        start: None,
-                        message: error.to_string(),
-                    });
-                }
+            for migration in linted.findings {
+                let file = &files[migration.file];
+                report.entries.push(Entry {
+                    path: relative(&file.path, &root),
+                    start: position(&file.sql, migration.finding.span.start),
+                    end: position(&file.sql, migration.finding.span.end),
+                    finding: migration.finding,
+                });
             }
         }
     }
-    for query in project.lint_queries() {
-        report.queries += 1;
+    let queries = project.lint_queries();
+    report.queries = queries.len() + project.lint_copy_in_count();
+    for query in queries {
+        report
+            .sources
+            .entry(relative(query.file, &root))
+            .or_insert_with(|| query.lines.text().to_owned());
         let catalog = match project.catalog(query.db) {
             Ok(catalog) => catalog,
-            Err(error) => {
-                if broken.insert(query.db) {
-                    report.failures.push(Failure {
-                        path: relative(&project.config.databases[query.db].migrations_dir, &root),
-                        start: None,
-                        message: error,
-                    });
-                }
-                continue;
-            }
+            Err(_) => continue,
         };
         let result = cache
             .entry((query.db, query.text.clone()))
@@ -236,47 +232,35 @@ fn lint(config: &Path, format: Format) -> Result<bool, String> {
                 typedpg_lint::lint_query(catalog, &query.text, &options)
                     .map_err(|error| (error.error.to_string(), error.offset))
             });
-        match result {
-            Ok(findings) => {
-                for finding in findings {
-                    report.entries.push(Entry {
-                        path: relative(query.file, &root),
-                        start: position(
-                            query.lines.text(),
-                            query.source.offset(finding.span.start),
-                        ),
-                        end: position(query.lines.text(), query.source.offset(finding.span.end)),
-                        finding: finding.clone(),
-                    });
-                }
-            }
-            Err((message, offset)) => {
-                let start = offset
-                    .map(|offset| position(query.lines.text(), query.source.offset(offset)))
-                    .unwrap_or(typedpg_lint::report::Position {
-                        line: query.pos.line,
-                        column: query.pos.col,
-                    });
-                report.failures.push(Failure {
+        if let Ok(findings) = result {
+            for finding in findings {
+                report.entries.push(Entry {
                     path: relative(query.file, &root),
-                    start: Some(start),
-                    message: message.clone(),
+                    start: position(query.lines.text(), query.source.offset(finding.span.start)),
+                    end: position(query.lines.text(), query.source.offset(finding.span.end)),
+                    finding: finding.clone(),
                 });
             }
         }
+        // An analysis error was already reported by `sync` above.
+    }
+    for db in 0..project.database_count() {
+        if let Ok(catalog) = project.catalog(db) {
+            report.schemas.push((
+                project.config.databases[db].name.clone(),
+                catalog.user_object_counts(),
+            ));
+        }
     }
 
+    report.load_failure_sources(&root);
     report.sort();
-    let rendered = report.render(format);
+    report.elapsed = start.elapsed();
+    let rendered = report.render_with(format, &options, stdout_colors());
     if !rendered.is_empty() {
         println!("{rendered}");
     }
-    if format == Format::Human {
-        for failure in &report.failures {
-            eprintln!("{}", failure.render());
-        }
-    }
-    eprintln!("{}", report.summary());
+    eprintln!("{}", report.summary_with(&options, stderr_colors()));
     Ok(!report.fails(&options))
 }
 

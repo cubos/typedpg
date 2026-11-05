@@ -557,6 +557,20 @@ pub struct PgCatalog {
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
 const USER_OID_START: u32 = 100_000;
 
+/// How many objects a catalog holds, by kind: the ones its migrations
+/// created (OID >= [`USER_OID_START`]), not the seeded system catalog.
+/// Objects an extension owns count as the extension only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct UserObjectCounts {
+    pub tables: usize,
+    pub views: usize,
+    pub indexes: usize,
+    pub sequences: usize,
+    pub types: usize,
+    pub functions: usize,
+    pub extensions: usize,
+}
+
 /// A relation and its columns — `(relname, [(attname, atttypid, attnotnull)])`
 /// — as surfaced by [`PgCatalog::iter_relations`] for the differential fuzzer.
 #[cfg(any(test, feature = "internal"))]
@@ -1156,6 +1170,83 @@ impl PgCatalog {
     #[cfg(any(test, feature = "internal"))]
     pub fn iter_classes(&self) -> impl Iterator<Item = &PgClass> {
         self.pg_class.values()
+    }
+
+    /// How many objects the migrations created, by kind: the catalog's user
+    /// objects (OID >= [`USER_OID_START`]), excluding everything the seed
+    /// holds. Objects belonging to an extension are counted as the
+    /// extension only, not in their own bucket.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn user_object_counts(&self) -> UserObjectCounts {
+        let extension_owned: std::collections::HashSet<(PgClassOid, u32)> = self
+            .pg_depend
+            .iter()
+            .filter(|d| d.deptype == DepType::Extension && d.refclassid == PG_EXTENSION_RELID)
+            .map(|d| (d.classid, d.objid.get()))
+            .collect();
+        let owned = |classid: PgClassOid, oid: u32| extension_owned.contains(&(classid, oid));
+
+        let mut counts = UserObjectCounts::default();
+        for class in self.pg_class.values() {
+            if class.oid.get() < USER_OID_START || owned(PG_CLASS_RELID, class.oid.get()) {
+                continue;
+            }
+            match class.relkind {
+                RelKind::Table | RelKind::Partitioned => counts.tables += 1,
+                RelKind::View | RelKind::MaterializedView => counts.views += 1,
+                RelKind::Index | RelKind::PartitionedIndex => {
+                    // A relation's index is its own, not an extension member:
+                    // skip the ones of a relation the extension owns.
+                    let table_owned = self
+                        .pg_index
+                        .get(&class.oid)
+                        .and_then(|index| self.pg_class.get(&index.indrelid))
+                        .is_some_and(|table| {
+                            owned(PG_CLASS_RELID, table.oid.get())
+                                || table.relkind == RelKind::ToastTable
+                        });
+                    if !table_owned {
+                        counts.indexes += 1;
+                    }
+                }
+                RelKind::Sequence => counts.sequences += 1,
+                _ => {}
+            }
+        }
+        for ty in self.pg_type.values() {
+            if ty.oid.get() < USER_OID_START || owned(PG_TYPE_RELID, ty.oid.get()) {
+                continue;
+            }
+            // Arrays are not separately created types, and a table's or
+            // view's row type comes with the relation: only an explicitly
+            // created composite (`relkind` composite) counts.
+            if ty.typelem.is_some() {
+                continue;
+            }
+            let explicit = match ty.typtype {
+                TypType::Enum | TypType::Domain | TypType::Range | TypType::Multirange => true,
+                TypType::Composite => ty.typrelid.is_some_and(|relid| {
+                    self.pg_class
+                        .get(&relid)
+                        .is_some_and(|class| class.relkind == RelKind::CompositeType)
+                }),
+                _ => false,
+            };
+            if explicit {
+                counts.types += 1;
+            }
+        }
+        for proc in self.pg_proc.values() {
+            if proc.oid.get() >= USER_OID_START && !owned(PG_PROC_RELID, proc.oid.get()) {
+                counts.functions += 1;
+            }
+        }
+        counts.extensions = self
+            .pg_extension
+            .keys()
+            .filter(|oid| oid.get() >= USER_OID_START)
+            .count();
+        counts
     }
 
     /// The `pg_class` row for an OID, if present.
@@ -2572,6 +2663,46 @@ mod tests {
         assert_eq!(
             &sql[recorder.events[1].span.clone()],
             "ALTER TABLE t ADD COLUMN x int"
+        );
+    }
+
+    #[test]
+    fn user_object_counts_are_what_the_migrations_created() {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE TABLE things (id integer PRIMARY KEY, name text);
+                 CREATE VIEW thing_names AS SELECT name FROM things;
+                 CREATE INDEX things_name_idx ON things (name);
+                 CREATE SEQUENCE things_seq;
+                 CREATE TYPE mood AS ENUM ('ok', 'bad');
+                 CREATE DOMAIN email AS text;
+                 CREATE FUNCTION thing_count() RETURNS bigint
+                     LANGUAGE sql AS 'SELECT count(*) FROM things';
+                 CREATE EXTENSION citext;",
+            )
+            .unwrap();
+        let counts = catalog.user_object_counts();
+        // The seed's objects and the extensions' are not the migrations'.
+        assert_eq!(
+            counts,
+            UserObjectCounts {
+                tables: 1,
+                views: 1,
+                // The primary key's index and `things_name_idx`.
+                indexes: 2,
+                sequences: 1,
+                // The enum and the domain: not the arrays, nor the relation
+                // row types.
+                types: 2,
+                functions: 1,
+                extensions: 1,
+            }
+        );
+        // The seed alone has no user objects.
+        assert_eq!(
+            PgCatalog::new().unwrap().user_object_counts(),
+            UserObjectCounts::default()
         );
     }
 }

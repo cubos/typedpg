@@ -40,6 +40,27 @@ fn lint_fixture_reports_the_expected_documents() {
             !stderr.contains(": error:"),
             "{format}: unexpected failure on stderr:\n{stderr}"
         );
+        // The summary block: its timing is the only non-deterministic part,
+        // so check the shape without pinning it.
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert!(lines[0].starts_with("typedpg lint: "), "{format}: {stderr}");
+        let checked = lines
+            .iter()
+            .find(|line| line.starts_with("  checked "))
+            .unwrap_or_else(|| panic!("{format}: no checked line in:\n{stderr}"));
+        assert!(checked.ends_with('s'), "{format}: {checked}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("  schema (default): ")),
+            "{format}: {stderr}"
+        );
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.starts_with("  ✖ failed: ")),
+            "{format}: {stderr}"
+        );
         let path = fixture.join(expected);
         if bless() {
             std::fs::write(&path, &stdout).expect("write the expected document");
