@@ -17,8 +17,14 @@
 //!
 //! `lint` configures `typedpg lint` for every database: `failOn` is the
 //! severity the run fails on (`"error"`, the default, `"warning"` or
-//! `"info"`), and each rule (`nullComparison`, `unboundedWrite`) is set to
-//! a level: `"error"`, `"warning"`, `"info"` or `"off"`.
+//! `"info"`), and each rule is set to a level: `"error"`, `"warning"`,
+//! `"info"` or `"off"`. The query rules are `nullComparison`,
+//! `unboundedWrite` and `notInNullable`; the migration rules
+//! `createIndexBlocking`, `constraintValidating`, `setNotNullScan` and
+//! `tableRewrite`; the schema rules `fkWithoutIndex` and `redundantIndex`.
+//! Rules without an override keep their default severity. A
+//! `-- typedpg-lint: allow(rule)` comment suppresses a rule in the query or
+//! migration statement it is in.
 //!
 //! `migrations` is the directory, or an object with it and the runner's
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",

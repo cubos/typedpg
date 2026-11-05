@@ -2016,3 +2016,16 @@ use columns::*;
 pub(crate) use columns::{column_collation, drop_column, type_collation};
 pub(crate) use constraints::check_unique_covers_partition_key;
 use constraints::*;
+
+/// [`columns::alter_type_rewrites`] for the lint crate (see
+/// [`crate::pg_catalog::PgCatalog::column_type_rewrites`]).
+#[cfg(any(test, feature = "internal"))]
+pub(crate) fn alter_type_rewrites_for_lint(
+    interp: &PgCatalog,
+    attr: &PgAttribute,
+    new_type: PgTypeOid,
+    new_typmod: Option<i32>,
+    using: Option<&typedpg_pg_query::protobuf::Node>,
+) -> bool {
+    columns::alter_type_rewrites(interp, attr, new_type, new_typmod, using)
+}

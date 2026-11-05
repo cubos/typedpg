@@ -10,10 +10,18 @@
 //! form) in the query suppresses those rules for the whole query. An
 //! unknown rule name in one is an error finding that cannot be configured.
 //!
+//! [`lint_migrations`] applies a database's migration files and runs the
+//! migration rules on tables that already had rows when each file started,
+//! then the schema rules over the final catalog. Its findings are placed in
+//! the file text; the TypeScript CLI prints them beside the query findings.
+//!
 //! Rendering lives here too, so the Rust and TypeScript CLIs report the
 //! same lines.
 
+mod migrations;
 mod rules;
+
+pub use migrations::{MigrationFile, MigrationFinding, lint_migrations};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -62,6 +70,20 @@ pub enum Rule {
     NullComparison,
     /// An `UPDATE` or `DELETE` with no `WHERE` clause.
     UnboundedWrite,
+    /// A `NOT IN (SELECT …)` whose left side or subquery output may be NULL.
+    NotInNullable,
+    /// A `CREATE INDEX` without `CONCURRENTLY` on an existing table.
+    CreateIndexBlocking,
+    /// An `ADD CONSTRAINT` / `ADD COLUMN` that validates existing rows.
+    ConstraintValidating,
+    /// An `ALTER COLUMN … SET NOT NULL` that scans the table.
+    SetNotNullScan,
+    /// An `ALTER TABLE` that rewrites the whole table under a lock.
+    TableRewrite,
+    /// A foreign key whose referencing columns have no index.
+    FkWithoutIndex,
+    /// An index another index on the table already covers.
+    RedundantIndex,
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
@@ -69,7 +91,17 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 2] = [Rule::NullComparison, Rule::UnboundedWrite];
+    pub const ALL: [Rule; 9] = [
+        Rule::NullComparison,
+        Rule::UnboundedWrite,
+        Rule::NotInNullable,
+        Rule::CreateIndexBlocking,
+        Rule::ConstraintValidating,
+        Rule::SetNotNullScan,
+        Rule::TableRewrite,
+        Rule::FkWithoutIndex,
+        Rule::RedundantIndex,
+    ];
 
     /// The rule's configuration key (`[package.metadata.typedpg.lint]`, and
     /// the TypeScript CLI's `lint` object in camelCase).
@@ -77,6 +109,13 @@ impl Rule {
         match self {
             Rule::NullComparison => "null_comparison",
             Rule::UnboundedWrite => "unbounded_write",
+            Rule::NotInNullable => "not_in_nullable",
+            Rule::CreateIndexBlocking => "create_index_blocking",
+            Rule::ConstraintValidating => "constraint_validating",
+            Rule::SetNotNullScan => "set_not_null_scan",
+            Rule::TableRewrite => "table_rewrite",
+            Rule::FkWithoutIndex => "fk_without_index",
+            Rule::RedundantIndex => "redundant_index",
             Rule::InvalidAllow => "invalid_allow",
         }
     }
@@ -90,6 +129,13 @@ impl Rule {
     pub fn default_severity(self) -> Severity {
         match self {
             Rule::NullComparison | Rule::UnboundedWrite | Rule::InvalidAllow => Severity::Error,
+            Rule::NotInNullable
+            | Rule::CreateIndexBlocking
+            | Rule::ConstraintValidating
+            | Rule::SetNotNullScan
+            | Rule::TableRewrite
+            | Rule::FkWithoutIndex => Severity::Warning,
+            Rule::RedundantIndex => Severity::Info,
         }
     }
 }
@@ -106,7 +152,8 @@ pub struct Finding {
     pub rule: Rule,
     pub severity: Severity,
     /// The byte range in the query text as the user wrote it (`$name`
-    /// parameters and `$..spreads` included).
+    /// parameters and `$..spreads` included), or in the migration file's
+    /// text for a [`MigrationFinding`].
     pub span: Range<usize>,
     pub message: String,
     pub help: Option<String>,
@@ -199,6 +246,9 @@ pub(crate) struct Ctx<'a> {
     /// The names of operators with a non-strict implementation: comparing
     /// with `NULL` through one may be meaningful.
     pub non_strict_operators: &'a HashSet<String>,
+    /// The analyzed view, for the facts the analyzer proved (the sublink
+    /// nullability the `not_in_nullable` rule reads).
+    pub view: &'a typedpg_analyzer::QueryView,
 }
 
 /// Lint `sql` against `catalog`.
@@ -233,6 +283,7 @@ pub fn lint_query(
         tree: &view.tree,
         tokens: &tokens,
         non_strict_operators: &non_strict_operators,
+        view: &view,
     };
     for rule in Rule::ALL {
         let Some(severity) = options.level(rule) else {
@@ -410,8 +461,8 @@ pub fn render(path: &Path, line: u32, column: u32, finding: &Finding) -> String 
 }
 
 /// The summary line:
-/// `[typedpg] lint: 2 errors, 1 warning, 0 infos in 14 queries`.
-pub fn summary(findings: &[Finding], queries: usize) -> String {
+/// `[typedpg] lint: 2 errors, 1 warning, 0 infos in 14 queries and 3 migrations`.
+pub fn summary(findings: &[Finding], queries: usize, migrations: usize) -> String {
     let count = |severity| {
         findings
             .iter()
@@ -430,8 +481,13 @@ pub fn summary(findings: &[Finding], queries: usize) -> String {
     } else {
         format!("{queries} queries")
     };
+    let migrations = if migrations == 1 {
+        "1 migration".to_owned()
+    } else {
+        format!("{migrations} migrations")
+    };
     format!(
-        "[typedpg] lint: {}, {}, {} in {queries}",
+        "[typedpg] lint: {}, {}, {} in {queries} and {migrations}",
         plural(count(Severity::Error), "error", "errors"),
         plural(count(Severity::Warning), "warning", "warnings"),
         plural(count(Severity::Info), "info", "infos"),
@@ -551,8 +607,12 @@ mod tests {
             "SELECT id FROM users WHERE id NOT IN (SELECT author_id FROM posts) AND id NOT IN (1, 2, NULL)",
         ] {
             let findings = lint(&db, sql);
-            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
-            let finding = &findings[0];
+            let null_findings: Vec<_> = findings
+                .iter()
+                .filter(|finding| finding.rule == Rule::NullComparison)
+                .collect();
+            assert_eq!(null_findings.len(), 1, "{sql}: {findings:?}");
+            let finding = null_findings[0];
             assert_eq!(
                 finding.message,
                 "NOT IN with a NULL in the list is never true"
@@ -843,12 +903,12 @@ mod tests {
         info.severity = Severity::Info;
         info.help = None;
         assert_eq!(
-            summary(&[finding, warning, info], 14),
-            "[typedpg] lint: 1 error, 1 warning, 1 info in 14 queries"
+            summary(&[finding, warning, info], 14, 3),
+            "[typedpg] lint: 1 error, 1 warning, 1 info in 14 queries and 3 migrations"
         );
         assert_eq!(
-            summary(&[], 1),
-            "[typedpg] lint: 0 errors, 0 warnings, 0 infos in 1 query"
+            summary(&[], 1, 1),
+            "[typedpg] lint: 0 errors, 0 warnings, 0 infos in 1 query and 1 migration"
         );
     }
 
@@ -869,5 +929,652 @@ mod tests {
         assert_eq!(Rule::from_name("nope"), None);
         assert_eq!(Rule::InvalidAllow.name(), "invalid_allow");
         assert_eq!(Rule::InvalidAllow.default_severity(), Severity::Error);
+    }
+    // ── not_in_nullable ────────────────────────────────────────────────────
+
+    fn not_in_findings(db: &PgCatalog, sql: &str) -> Vec<Finding> {
+        lint(db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::NotInNullable)
+            .collect()
+    }
+
+    #[test]
+    fn not_in_nullable_reports_the_nullable_side() {
+        let db = catalog();
+        let cases = [
+            (
+                "SELECT id FROM users WHERE email NOT IN (SELECT id::text FROM users)",
+                "the left side is NULL",
+            ),
+            (
+                "SELECT id FROM users WHERE id NOT IN (SELECT author_id FROM posts)",
+                "the subquery returns a NULL",
+            ),
+            (
+                "SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)",
+                "either side is NULL",
+            ),
+        ];
+        for (sql, side) in cases {
+            let findings = not_in_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(findings[0].severity, Severity::Warning);
+            assert_eq!(
+                findings[0].message,
+                format!("NOT IN (SELECT …) returns no rows when {side}")
+            );
+            assert_eq!(
+                findings[0].help.as_deref(),
+                Some("use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL")
+            );
+        }
+        let sql = "SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)";
+        let findings = not_in_findings(&db, sql);
+        assert_eq!(
+            &sql[findings[0].span.clone()],
+            "email NOT IN (SELECT title FROM posts)"
+        );
+    }
+
+    #[test]
+    fn not_in_nullable_accepts_proven_non_null_sides() {
+        let db = catalog();
+        for sql in [
+            "SELECT id FROM users WHERE id NOT IN (SELECT id FROM posts)",
+            "SELECT id FROM users WHERE id NOT IN (SELECT author_id FROM posts WHERE author_id IS NOT NULL)",
+            "SELECT id FROM users WHERE id::text NOT IN (SELECT title FROM posts WHERE title IS NOT NULL)",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // The left side may still be NULL.
+        let sql = "SELECT id FROM users WHERE email NOT IN (SELECT 'x')";
+        assert_eq!(
+            not_in_findings(&db, sql)[0].message,
+            "NOT IN (SELECT …) returns no rows when the left side is NULL"
+        );
+        // A NOT NULL column on each side is enough for the row form.
+        let sql =
+            "SELECT id FROM users WHERE (id, id::text) NOT IN (SELECT id, id::text FROM users)";
+        assert!(not_in_findings(&db, sql).is_empty(), "{sql}");
+        let sql = "SELECT id FROM users WHERE (id, email) NOT IN (SELECT id, title FROM posts)";
+        assert_eq!(not_in_findings(&db, sql).len(), 1, "{sql}");
+    }
+
+    #[test]
+    fn not_in_nullable_ignores_lists_and_other_operators() {
+        let db = catalog();
+        for sql in [
+            "SELECT id FROM users WHERE id NOT IN (1, NULL)",
+            "SELECT id FROM users WHERE id NOT IN (1, 2)",
+            "SELECT id FROM users WHERE id = ANY (SELECT author_id FROM posts)",
+            "SELECT id FROM users WHERE id NOT IN (SELECT id FROM posts)",
+        ] {
+            assert!(
+                not_in_findings(&db, sql).is_empty(),
+                "{sql}: {:?}",
+                not_in_findings(&db, sql)
+            );
+        }
+    }
+
+    #[test]
+    fn query_view_collects_sublink_facts_without_leaking_from_analyze() {
+        let db = catalog();
+        // A plain analyze records nothing: the next view still finds its own
+        // fact, and a view without a sublink finds none.
+        db.analyze("SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)")
+            .unwrap();
+        let view = db
+            .query_view("SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)")
+            .unwrap();
+        let location = view
+            .tree
+            .nodes()
+            .into_iter()
+            .find_map(|(node, _)| match node {
+                typedpg_pg_query::NodeRef::SubLink(sub) => Some(sub.location),
+                _ => None,
+            })
+            .unwrap();
+        assert!(view.sublink_nullability(location).is_some());
+        let view = db.query_view("SELECT id FROM users").unwrap();
+        assert!(view.sublink_nullability(0).is_none());
+    }
+
+    // ── migration rules ────────────────────────────────────────────────────
+
+    const BASE: &str = r#"
+        CREATE TABLE users (
+            id integer PRIMARY KEY,
+            name text NOT NULL,
+            email text,
+            v varchar(10),
+            b varbit(10),
+            n numeric(10,2),
+            txt text,
+            i integer
+        );
+        CREATE TABLE posts (id integer PRIMARY KEY, author_id integer, title text);
+        CREATE TABLE comments (id integer PRIMARY KEY, post_id integer);
+        CREATE TABLE parents (a integer, b integer, PRIMARY KEY (a, b));
+        CREATE TABLE pairs (id integer PRIMARY KEY, a integer, b integer, c integer);
+        CREATE TABLE constrained (id integer PRIMARY KEY, x integer);
+    "#;
+
+    fn migrations(files: &[(&str, &str, bool)], use_transaction: bool) -> Vec<MigrationFinding> {
+        let files: Vec<MigrationFile> = files
+            .iter()
+            .map(|(path, sql, lint)| MigrationFile {
+                path: (*path).to_owned(),
+                sql: (*sql).to_owned(),
+                lint: *lint,
+            })
+            .collect();
+        lint_migrations(&files, use_transaction, &LintOptions::default()).unwrap()
+    }
+
+    fn second(sql: &str) -> Vec<MigrationFinding> {
+        migrations(
+            &[("001_base.sql", BASE, true), ("002_change.sql", sql, true)],
+            true,
+        )
+    }
+
+    fn only(findings: &[MigrationFinding], rule: Rule) -> Vec<MigrationFinding> {
+        findings
+            .iter()
+            .filter(|finding| finding.finding.rule == rule)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn migration_rules_ignore_tables_created_in_the_same_file() {
+        let findings = migrations(
+            &[(
+                "001_all.sql",
+                &format!(
+                    "{BASE}
+                     CREATE INDEX users_email_idx ON users (email);
+                     ALTER TABLE users ALTER COLUMN i TYPE bigint;
+                     ALTER TABLE users ALTER COLUMN email SET NOT NULL;
+                     ALTER TABLE posts ADD CONSTRAINT posts_author_fk
+                         FOREIGN KEY (author_id) REFERENCES users (id);"
+                ),
+                true,
+            )],
+            true,
+        );
+        for rule in [
+            Rule::CreateIndexBlocking,
+            Rule::ConstraintValidating,
+            Rule::SetNotNullScan,
+            Rule::TableRewrite,
+        ] {
+            assert!(only(&findings, rule).is_empty(), "{rule}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn create_index_blocking_reports_only_non_concurrent_indexes() {
+        let findings = second("CREATE INDEX users_email_idx ON users (email);");
+        assert_eq!(only(&findings, Rule::CreateIndexBlocking).len(), 1);
+        assert_eq!(
+            only(&findings, Rule::CreateIndexBlocking)[0]
+                .finding
+                .message,
+            "CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build"
+        );
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, true),
+                (
+                    "002_change.sql",
+                    "-- no-transaction\nCREATE INDEX CONCURRENTLY users_email_idx ON users (email);",
+                    true,
+                ),
+            ],
+            true,
+        );
+        assert!(only(&findings, Rule::CreateIndexBlocking).is_empty());
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, true),
+                (
+                    "002_change.sql",
+                    "CREATE INDEX CONCURRENTLY users_email_idx ON users (email);",
+                    true,
+                ),
+            ],
+            false,
+        );
+        assert!(only(&findings, Rule::CreateIndexBlocking).is_empty());
+    }
+
+    #[test]
+    fn constraint_validating_reports_foreign_keys_and_checks() {
+        for sql in [
+            "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);",
+            "ALTER TABLE posts ADD CONSTRAINT posts_title_check CHECK (title <> '');",
+            "ALTER TABLE posts ADD COLUMN user_id integer REFERENCES users (id);",
+            "ALTER TABLE posts ADD COLUMN title_len integer CHECK (title_len >= 0);",
+        ] {
+            let findings = second(sql);
+            assert_eq!(
+                only(&findings, Rule::ConstraintValidating).len(),
+                1,
+                "{sql}: {findings:?}"
+            );
+        }
+        for sql in [
+            "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id) NOT VALID;",
+            "ALTER TABLE posts ADD CONSTRAINT posts_title_check CHECK (title <> '') NOT VALID;",
+        ] {
+            let findings = second(sql);
+            assert!(
+                only(&findings, Rule::ConstraintValidating).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_not_null_scan_accepts_a_validated_check() {
+        let findings = second("ALTER TABLE users ALTER COLUMN email SET NOT NULL;");
+        assert_eq!(only(&findings, Rule::SetNotNullScan).len(), 1);
+        for sql in [
+            "ALTER TABLE users ADD CONSTRAINT users_email_nn CHECK (email IS NOT NULL);
+             ALTER TABLE users ALTER COLUMN email SET NOT NULL;",
+            "ALTER TABLE users ADD CONSTRAINT users_email_nn CHECK (email IS NOT NULL) NOT VALID;
+             ALTER TABLE users VALIDATE CONSTRAINT users_email_nn;
+             ALTER TABLE users ALTER COLUMN email SET NOT NULL;",
+        ] {
+            let findings = second(sql);
+            assert!(
+                only(&findings, Rule::SetNotNullScan).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+        // An unvalidated check proves nothing.
+        let findings = second(
+            "ALTER TABLE users ADD CONSTRAINT users_email_nn CHECK (email IS NOT NULL) NOT VALID;
+             ALTER TABLE users ALTER COLUMN email SET NOT NULL;",
+        );
+        assert_eq!(only(&findings, Rule::SetNotNullScan).len(), 1);
+    }
+
+    #[test]
+    fn table_rewrite_reports_rewriting_changes() {
+        for sql in [
+            "ALTER TABLE users ALTER COLUMN i TYPE bigint;",
+            "ALTER TABLE users ALTER COLUMN v TYPE varchar(10) USING v::varchar(10);",
+            "ALTER TABLE users ADD COLUMN created_at timestamptz DEFAULT clock_timestamp();",
+            "ALTER TABLE users ADD COLUMN generated integer GENERATED ALWAYS AS (i * 2) STORED;",
+        ] {
+            let findings = second(sql);
+            assert_eq!(
+                only(&findings, Rule::TableRewrite).len(),
+                1,
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_rewrite_ignores_no_rewrite_changes() {
+        for sql in [
+            "ALTER TABLE users ALTER COLUMN v TYPE varchar(20);",
+            "ALTER TABLE users ALTER COLUMN v TYPE varchar;",
+            "ALTER TABLE users ALTER COLUMN v TYPE text;",
+            "ALTER TABLE users ALTER COLUMN b TYPE varbit(20);",
+            "ALTER TABLE users ALTER COLUMN n TYPE numeric(12,2);",
+            "ALTER TABLE users ALTER COLUMN txt TYPE varchar;",
+            "ALTER TABLE users ADD COLUMN counter integer DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN seen_at timestamptz DEFAULT now();",
+        ] {
+            let findings = second(sql);
+            assert!(
+                only(&findings, Rule::TableRewrite).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A narrower numeric precision does rewrite.
+        let findings = second("ALTER TABLE users ALTER COLUMN n TYPE numeric(8,2);");
+        assert_eq!(only(&findings, Rule::TableRewrite).len(), 1);
+    }
+
+    #[test]
+    fn fk_without_index_matches_leading_index_columns_as_a_set() {
+        let no_index = second(
+            "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);",
+        );
+        assert_eq!(only(&no_index, Rule::FkWithoutIndex).len(), 1);
+        assert_eq!(
+            only(&no_index, Rule::FkWithoutIndex)[0].finding.message,
+            "foreign key posts_author_fk on public.posts (author_id) has no index"
+        );
+        assert_eq!(
+            only(&no_index, Rule::FkWithoutIndex)[0]
+                .finding
+                .help
+                .as_deref(),
+            Some("CREATE INDEX ON public.posts (author_id)")
+        );
+        for index in [
+            "CREATE INDEX pairs_ab_idx ON pairs (a, b);",
+            "CREATE INDEX pairs_ba_idx ON pairs (b, a);",
+            "CREATE INDEX pairs_abc_idx ON pairs (a, b, c);",
+        ] {
+            let findings = second(&format!(
+                "ALTER TABLE pairs ADD CONSTRAINT pairs_fk FOREIGN KEY (a, b) REFERENCES parents (a, b);
+                 {index}"
+            ));
+            assert!(
+                only(&findings, Rule::FkWithoutIndex).is_empty(),
+                "{index}: {findings:?}"
+            );
+        }
+        // A single-column key with a trailing column counts; one where the
+        // key is only a trailing column does not.
+        let trailing = second(
+            "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);
+             CREATE INDEX posts_author_id_idx ON posts (author_id, id);",
+        );
+        assert!(
+            only(&trailing, Rule::FkWithoutIndex).is_empty(),
+            "{trailing:?}"
+        );
+        let not_leading = second(
+            "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);
+             CREATE INDEX posts_id_author_idx ON posts (id, author_id);",
+        );
+        assert_eq!(only(&not_leading, Rule::FkWithoutIndex).len(), 1);
+
+        // A partial index or an expression position doesn't count.
+        for index in [
+            "CREATE INDEX pairs_ab_partial ON pairs (a, b) WHERE a > 0;",
+            "CREATE INDEX pairs_expr ON pairs ((a + 0), b);",
+        ] {
+            let findings = second(&format!(
+                "ALTER TABLE pairs ADD CONSTRAINT pairs_fk FOREIGN KEY (a, b) REFERENCES parents (a, b);
+                 {index}"
+            ));
+            assert_eq!(
+                only(&findings, Rule::FkWithoutIndex).len(),
+                1,
+                "{index}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redundant_index_prefix_exact_and_unique_cases() {
+        let prefix = second(
+            "CREATE INDEX idx_users_email ON users (email);
+             CREATE INDEX idx_users_email_name ON users (email, name);",
+        );
+        assert_eq!(only(&prefix, Rule::RedundantIndex).len(), 1);
+        assert_eq!(
+            only(&prefix, Rule::RedundantIndex)[0].finding.message,
+            "index idx_users_email is redundant with idx_users_email_name"
+        );
+        assert_eq!(
+            only(&prefix, Rule::RedundantIndex)[0].finding.severity,
+            Severity::Info
+        );
+
+        let exact = second(
+            "CREATE INDEX idx_users_email ON users (email);
+             CREATE INDEX idx_users_email_two ON users (email);",
+        );
+        assert_eq!(only(&exact, Rule::RedundantIndex).len(), 1);
+        assert_eq!(
+            only(&exact, Rule::RedundantIndex)[0].finding.message,
+            "index idx_users_email_two is redundant with idx_users_email"
+        );
+
+        let unique = second(
+            "CREATE UNIQUE INDEX idx_users_email ON users (email);
+             CREATE UNIQUE INDEX idx_users_email_two ON users (email);",
+        );
+        assert_eq!(only(&unique, Rule::RedundantIndex).len(), 1);
+        assert_eq!(
+            only(&unique, Rule::RedundantIndex)[0].finding.message,
+            "index idx_users_email_two is redundant with idx_users_email"
+        );
+        // A non-unique index is covered by a broader unique one; a unique
+        // index is not covered by a non-unique exact one.
+        let unique_prefix = second(
+            "CREATE INDEX idx_users_email ON users (email);
+             CREATE UNIQUE INDEX idx_users_email_name ON users (email, name);",
+        );
+        assert_eq!(only(&unique_prefix, Rule::RedundantIndex).len(), 1);
+        let unique_not_covered = second(
+            "CREATE INDEX idx_users_email_name ON users (email, name);
+             CREATE UNIQUE INDEX idx_users_email_unique ON users (email);",
+        );
+        assert!(only(&unique_not_covered, Rule::RedundantIndex).is_empty());
+
+        // A different operator class makes the indexes different.
+        let opclass = second(
+            "CREATE INDEX idx_users_txt ON users (txt);
+             CREATE INDEX idx_users_txt_pattern ON users (txt text_pattern_ops);",
+        );
+        assert!(only(&opclass, Rule::RedundantIndex).is_empty());
+
+        // An index backing a constraint is only reported as an exact
+        // duplicate; a plain index with its columns is still redundant.
+        let constraint = second("CREATE INDEX constrained_id_idx ON constrained (id);");
+        assert_eq!(only(&constraint, Rule::RedundantIndex).len(), 1);
+        assert_eq!(
+            only(&constraint, Rule::RedundantIndex)[0].finding.message,
+            "index constrained_id_idx is redundant with constrained_pkey"
+        );
+    }
+
+    #[test]
+    fn redundant_index_respects_include_columns_and_sort_order() {
+        // A covering index serves index-only scans the plain one can't: it
+        // is not redundant, while the plain one is.
+        let covering = second(
+            "CREATE INDEX idx_users_email ON users (email);
+             CREATE INDEX idx_users_email_cover ON users (email) INCLUDE (name);",
+        );
+        let found = only(&covering, Rule::RedundantIndex);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "index idx_users_email is redundant with idx_users_email_cover"
+        );
+        let two_covering = second(
+            "CREATE INDEX idx_a ON users (email) INCLUDE (name);
+             CREATE INDEX idx_b ON users (email) INCLUDE (txt);",
+        );
+        assert!(only(&two_covering, Rule::RedundantIndex).is_empty());
+
+        // A different order serves different ORDER BYs.
+        for sql in [
+            "CREATE INDEX idx_a ON users (email, name);
+             CREATE INDEX idx_b ON users (email, name DESC);",
+            "CREATE INDEX idx_a ON users (email);
+             CREATE INDEX idx_b ON users (email NULLS FIRST, name);",
+        ] {
+            assert!(only(&second(sql), Rule::RedundantIndex).is_empty(), "{sql}");
+        }
+        // The defaults spelled out are the same order.
+        let spelled = second(
+            "CREATE INDEX idx_a ON users (email DESC NULLS FIRST);
+             CREATE INDEX idx_b ON users (email DESC, name);",
+        );
+        assert_eq!(only(&spelled, Rule::RedundantIndex).len(), 1);
+    }
+
+    #[test]
+    fn set_not_null_scan_ignores_a_column_already_not_null() {
+        let findings = second("ALTER TABLE users ALTER COLUMN name SET NOT NULL;");
+        assert!(
+            only(&findings, Rule::SetNotNullScan).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn fk_without_index_needs_an_index_that_serves_equality() {
+        for (index, indexed) in [
+            ("CREATE INDEX ON posts USING hash (author_id);", true),
+            ("CREATE INDEX ON posts USING brin (author_id);", false),
+        ] {
+            let findings = second(&format!(
+                "{index}
+                 ALTER TABLE posts ADD CONSTRAINT posts_author_fk
+                     FOREIGN KEY (author_id) REFERENCES users (id) NOT VALID;"
+            ));
+            assert_eq!(
+                only(&findings, Rule::FkWithoutIndex).is_empty(),
+                indexed,
+                "{index}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adding_an_index_backed_constraint_blocks_writes() {
+        for sql in [
+            "ALTER TABLE posts ADD CONSTRAINT posts_title_key UNIQUE (title);",
+            "ALTER TABLE comments ADD COLUMN slug text UNIQUE;",
+            "ALTER TABLE pairs ADD CONSTRAINT pairs_ab_key UNIQUE (a, b);",
+        ] {
+            let found = only(&second(sql), Rule::CreateIndexBlocking);
+            assert_eq!(found.len(), 1, "{sql}: {found:?}");
+            assert!(
+                found[0]
+                    .finding
+                    .message
+                    .starts_with("adding the constraint builds its index"),
+                "{found:?}"
+            );
+        }
+        // Adopting an index built concurrently builds nothing.
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, true),
+                (
+                    "002_index.sql",
+                    "-- no-transaction\nCREATE UNIQUE INDEX CONCURRENTLY posts_title_key ON posts (title);",
+                    true,
+                ),
+                (
+                    "003_constraint.sql",
+                    "ALTER TABLE posts ADD CONSTRAINT posts_title_key UNIQUE USING INDEX posts_title_key;",
+                    true,
+                ),
+            ],
+            true,
+        );
+        assert!(
+            only(&findings, Rule::CreateIndexBlocking).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn migration_allow_comments_suppress_per_statement() {
+        for comment in [
+            "-- typedpg-lint: allow(create_index_blocking)",
+            "/* typedpg-lint: allow(create_index_blocking) */",
+        ] {
+            let findings = second(&format!(
+                "{comment}\nCREATE INDEX users_email_idx ON users (email);"
+            ));
+            assert!(
+                only(&findings, Rule::CreateIndexBlocking).is_empty(),
+                "{comment}"
+            );
+        }
+        // The comment applies to the statement it leads into, not the next.
+        let text = "-- typedpg-lint: allow(create_index_blocking)\nCREATE INDEX users_name_idx ON users (name);\n\
+                    CREATE INDEX users_email_idx ON users (email);";
+        let findings = second(text);
+        let blocking = only(&findings, Rule::CreateIndexBlocking);
+        assert_eq!(blocking.len(), 1, "{findings:?}");
+        assert_eq!(
+            &text[blocking[0].finding.span.clone()],
+            "CREATE INDEX users_email_idx ON users (email)"
+        );
+    }
+
+    #[test]
+    fn migration_allow_comments_are_validated() {
+        let findings = second(
+            "-- typedpg-lint: allow(no_such_rule)\nCREATE INDEX users_email_idx ON users (email);",
+        );
+        let invalid = only(&findings, Rule::InvalidAllow);
+        assert_eq!(invalid.len(), 1, "{findings:?}");
+        assert_eq!(invalid[0].finding.severity, Severity::Error);
+        assert!(invalid[0].finding.message.contains("unknown lint rule"));
+        assert_eq!(only(&findings, Rule::CreateIndexBlocking).len(), 1);
+
+        let findings = second(
+            "-- typedpg-lint: alow(create_index_blocking)\nCREATE INDEX users_email_idx ON users (email);",
+        );
+        let invalid = only(&findings, Rule::InvalidAllow);
+        assert_eq!(invalid.len(), 1, "{findings:?}");
+        assert!(
+            invalid[0]
+                .finding
+                .message
+                .starts_with("malformed typedpg-lint comment")
+        );
+    }
+
+    #[test]
+    fn lint_false_files_are_never_reported() {
+        let findings = migrations(
+            &[
+                ("001_base.sql", BASE, true),
+                (
+                    "002_extra.sql",
+                    "-- typedpg-lint: allow(no_such_rule)
+                     CREATE INDEX posts_author_idx ON posts (author_id);
+                     ALTER TABLE posts ADD CONSTRAINT posts_author_fk
+                         FOREIGN KEY (author_id) REFERENCES users (id);",
+                    false,
+                ),
+            ],
+            true,
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn migration_findings_are_trimmed_statements_in_their_file() {
+        let text = "-- lead\n  CREATE INDEX users_email_idx ON users (email);  ";
+        let findings = second(text);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(
+            &text[findings[0].finding.span.clone()],
+            "CREATE INDEX users_email_idx ON users (email)"
+        );
+    }
+
+    #[test]
+    fn migration_rule_names_and_defaults() {
+        assert_eq!(
+            Rule::ALL.iter().map(|rule| rule.name()).collect::<Vec<_>>(),
+            LINT_RULES
+        );
+        for (rule, severity) in [
+            (Rule::NotInNullable, Severity::Warning),
+            (Rule::CreateIndexBlocking, Severity::Warning),
+            (Rule::ConstraintValidating, Severity::Warning),
+            (Rule::SetNotNullScan, Severity::Warning),
+            (Rule::TableRewrite, Severity::Warning),
+            (Rule::FkWithoutIndex, Severity::Warning),
+            (Rule::RedundantIndex, Severity::Info),
+        ] {
+            assert_eq!(rule.default_severity(), severity, "{rule}");
+        }
     }
 }

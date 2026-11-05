@@ -2,6 +2,6 @@
   "include": ["src"],
   "out": "src/db.ts",
   "sql": { "include": ["src/*.sql"] },
-  "migrations": "../migrations",
+  "migrations": "migrations",
   "lint": { "failOn": "warning", "unboundedWrite": "warning" }
 }

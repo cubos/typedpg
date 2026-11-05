@@ -1026,43 +1026,74 @@ impl PgCatalog {
     /// message followed by where in the file it is — `--> file:line:col`
     /// and the offending line with a caret — and any hint.
     pub fn apply_migration(&mut self, filename: &str, sql: &str) -> Result<(), DdlError> {
-        self.apply_sql_located(sql).map_err(|failure| {
-            let message = failure.error.to_string();
-            let location =
-                failure
-                    .location
-                    .map(|l| *l)
-                    .unwrap_or_else(|| crate::error::CapturedDiagnostic {
+        struct Noop;
+        impl MigrationObserver for Noop {}
+        self.apply_migration_observed(filename, sql, &mut Noop)
+    }
+
+    /// [`Self::apply_migration`], watching `observer` around every statement:
+    /// `before` sees the catalog the statement will run against, `after` the
+    /// catalog it left. The observer's spans are byte ranges in `sql`.
+    pub fn apply_migration_observed(
+        &mut self,
+        filename: &str,
+        sql: &str,
+        observer: &mut dyn MigrationObserver,
+    ) -> Result<(), DdlError> {
+        self.apply_sql_located_observed(sql, Some(observer))
+            .map_err(|failure| {
+                let message = failure.error.to_string();
+                let location = failure.location.map(|l| *l).unwrap_or_else(|| {
+                    crate::error::CapturedDiagnostic {
                         pg_message: message.clone(),
                         primary: None,
                         secondaries: Vec::new(),
                         hint: None,
                         notes: Vec::new(),
-                    });
-            let diagnostic = crate::diagnostic::render_in_file(&message, filename, sql, &location);
-            DdlError::Migration {
-                filename: filename.to_owned(),
-                source: Box::new(failure.error),
-                diagnostic,
-            }
-        })
+                    }
+                });
+                let diagnostic =
+                    crate::diagnostic::render_in_file(&message, filename, sql, &location);
+                DdlError::Migration {
+                    filename: filename.to_owned(),
+                    source: Box::new(failure.error),
+                    diagnostic,
+                }
+            })
     }
 
     fn apply_sql_located(&mut self, sql: &str) -> Result<(), crate::ddl::MigrationFailure> {
+        self.apply_sql_located_observed(sql, None)
+    }
+
+    fn apply_sql_located_observed(
+        &mut self,
+        sql: &str,
+        observer: Option<&mut dyn MigrationObserver>,
+    ) -> Result<(), crate::ddl::MigrationFailure> {
         // A file edited on Windows starts with a byte-order mark, which the
         // parser rejects as a syntax error.
-        let sql = typedpg_core::migration_marker::strip_bom(sql);
-        let (result, location) = match crate::ddl::apply_migration(self, sql) {
-            Ok(()) => (Ok(()), None),
-            Err(failure) => (Err(failure.error), failure.location),
+        let stripped = typedpg_core::migration_marker::strip_bom(sql);
+        let bom = sql.len() - stripped.len();
+        let (result, location) = match observer {
+            Some(observer) => {
+                match crate::ddl::apply_migration_observed(self, stripped, observer, bom) {
+                    Ok(()) => (Ok(()), None),
+                    Err(failure) => (Err(failure.error), failure.location),
+                }
+            }
+            None => match crate::ddl::apply_migration(self, stripped) {
+                Ok(()) => (Ok(()), None),
+                Err(failure) => (Err(failure.error), failure.location),
+            },
         };
         #[cfg(feature = "pg_sanity")]
         {
             if !self.pg_sanity_tainted && !self.pg_sanity_skip {
-                if sql_touches_extension(sql) {
-                    self.run_pg_sanity_extension_apply_check(sql, &result);
+                if sql_touches_extension(stripped) {
+                    self.run_pg_sanity_extension_apply_check(stripped, &result);
                 } else {
-                    self.run_pg_sanity_apply_check(sql, &result);
+                    self.run_pg_sanity_apply_check(stripped, &result);
                 }
             }
         }
@@ -1119,6 +1150,88 @@ impl PgCatalog {
     #[cfg(any(test, feature = "internal"))]
     pub fn iter_types(&self) -> impl Iterator<Item = &PgType> {
         self.pg_type.values()
+    }
+
+    /// Every `pg_class` row (relations, indexes, sequences, …).
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_classes(&self) -> impl Iterator<Item = &PgClass> {
+        self.pg_class.values()
+    }
+
+    /// The `pg_class` row for an OID, if present.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn class_row(&self, oid: PgClassOid) -> Option<&PgClass> {
+        self.pg_class.get(&oid)
+    }
+
+    /// Every `pg_index` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_indexes(&self) -> impl Iterator<Item = &PgIndex> {
+        self.pg_index.values()
+    }
+
+    /// Every `pg_constraint` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_constraints(&self) -> impl Iterator<Item = &PgConstraint> {
+        self.pg_constraint.values()
+    }
+
+    /// Every `pg_cast` row.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn iter_casts(&self) -> impl Iterator<Item = &PgCast> {
+        self.pg_cast.values()
+    }
+
+    /// The access method an index uses (`btree` when it names none).
+    #[cfg(any(test, feature = "internal"))]
+    pub fn index_access_method(&self, index: PgClassOid) -> &str {
+        self.index_access_methods
+            .get(&index)
+            .map_or("btree", String::as_str)
+    }
+
+    /// Whether `index` backs a PRIMARY KEY / UNIQUE / EXCLUDE constraint.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn index_backs_constraint(&self, index: PgClassOid) -> bool {
+        crate::ddl::tables::partidx::backing_constraint(self, index).is_some()
+    }
+
+    /// The CHECK constraint's expression, or `None` for a constraint the
+    /// analyzer keeps no expression for.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn check_expression(
+        &self,
+        constraint: PgConstraintOid,
+    ) -> Option<&typedpg_pg_query::protobuf::Node> {
+        match &self.check_defs.get(&constraint)?.expr {
+            crate::ddl::tables::check_inherit::StoredExpr::Written(expr) => Some(expr),
+            crate::ddl::tables::check_inherit::StoredExpr::Serial(..) => None,
+        }
+    }
+
+    /// Whether the function call is surely VOLATILE (every overload that can
+    /// take its arguments is).
+    #[cfg(any(test, feature = "internal"))]
+    pub fn call_is_volatile(&self, call: &typedpg_pg_query::protobuf::FuncCall) -> bool {
+        crate::ddl::volatile::surely_volatile(call, self)
+    }
+
+    /// Whether altering `column` of `relid` to `type_name` rewrites the
+    /// table's rows. `None` when the column or the type can't be resolved.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn column_type_rewrites(
+        &self,
+        relid: PgClassOid,
+        column: &str,
+        type_name: &typedpg_pg_query::protobuf::TypeName,
+        using: Option<&typedpg_pg_query::protobuf::Node>,
+    ) -> Option<bool> {
+        let attr = self.attribute_by_name(relid, column)?;
+        let new_type = crate::ddl::functions::typename_type_id(self, type_name).ok()?;
+        let new_typmod = crate::typmod::encode(self, new_type, type_name).ok()?;
+        Some(crate::ddl::tables::alter_type_rewrites_for_lint(
+            self, attr, new_type, new_typmod, using,
+        ))
     }
 
     /// The `pg_type` row for an OID, if present.
@@ -1258,7 +1371,9 @@ impl PgCatalog {
     /// wrote rather than one a simplification rewrote.
     pub fn query_view(&self, sql: &str) -> Result<QueryView, LocatedError> {
         crate::diagnostic::clear_last_primary();
-        let (analysis, result) = crate::stack::with_stack(|| self.analyze_parts_here(sql, false));
+        let ((analysis, result), sublink_nullability) = collecting_sublink_nullability(|| {
+            crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+        });
         let analyzed = result.map_err(LocatedError::new)?;
         let tree = analysis.tree.map(|tree| tree.protobuf).ok_or_else(|| {
             LocatedError::new(AnalyzeError::Internal(format!(
@@ -1271,6 +1386,7 @@ impl PgCatalog {
             tree,
             analyzed,
             lex: analysis.lex,
+            sublink_nullability,
         })
     }
 
@@ -2263,6 +2379,84 @@ struct QueryAnalysis {
     tree: Option<typedpg_pg_query::ParseResult>,
 }
 
+/// One statement of a migration, as [`MigrationObserver`] sees it.
+pub struct MigrationStatement<'a> {
+    /// The parsed statement.
+    pub node: &'a typedpg_pg_query::protobuf::node::Node,
+    /// The statement's byte range in the migration file's text: the
+    /// `RawStmt`'s `stmt_location .. stmt_location + stmt_len`, or to the
+    /// end of the file when `stmt_len` is 0. libpg_query starts it at the
+    /// statement's first token: the whitespace and comments that lead into
+    /// the statement are outside it.
+    pub span: std::ops::Range<usize>,
+}
+
+/// Watches a migration as [`PgCatalog::apply_migration_observed`] applies it,
+/// one statement at a time.
+pub trait MigrationObserver {
+    /// Runs before `statement` is applied: `catalog` is the state the
+    /// statement will see.
+    fn before(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+        let _ = (catalog, statement);
+    }
+
+    /// Runs after `statement` was applied successfully: `catalog` is the
+    /// state it left.
+    fn after(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+        let _ = (catalog, statement);
+    }
+}
+
+/// What the analyzer proved about the two sides of one `= ANY` / `IN`
+/// sublink (the `location` is an offset in [`QueryView::sql`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SublinkNullability {
+    /// Some left-hand expression may be NULL.
+    pub lhs_nullable: bool,
+    /// Some output column of the subquery may be NULL.
+    pub subquery_nullable: bool,
+}
+
+thread_local! {
+    /// Set while [`PgCatalog::query_view`] analyzes a query: the sublink
+    /// nullability facts it records. A plain [`PgCatalog::analyze`] leaves
+    /// it `None`, so it pays nothing.
+    static SUBLINK_NULLABILITY: std::cell::RefCell<
+        Option<HashMap<i32, SublinkNullability>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, collecting the sublink nullability facts it records.
+fn collecting_sublink_nullability<R>(
+    f: impl FnOnce() -> R,
+) -> (R, HashMap<i32, SublinkNullability>) {
+    let before = SUBLINK_NULLABILITY.with(|facts| facts.replace(Some(HashMap::new())));
+    let out = f();
+    let collected = SUBLINK_NULLABILITY
+        .with(|facts| facts.replace(before))
+        .unwrap_or_default();
+    (out, collected)
+}
+
+/// Record what an `= ANY` / `IN` sublink at `location` compared, merging
+/// with any fact already recorded for it (a sublink may be inferred more
+/// than once).
+pub(crate) fn note_sublink_nullability(location: i32, lhs_nullable: bool, subquery_nullable: bool) {
+    if location < 0 {
+        return;
+    }
+    SUBLINK_NULLABILITY.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            let fact = facts.entry(location).or_insert(SublinkNullability {
+                lhs_nullable: false,
+                subquery_nullable: false,
+            });
+            fact.lhs_nullable |= lhs_nullable;
+            fact.subquery_nullable |= subquery_nullable;
+        }
+    });
+}
+
 /// A query as the analyzer sees it, for tools that read its parse tree.
 ///
 /// Returned by [`PgCatalog::query_view`]. Offsets in [`Self::sql`] are what
@@ -2279,9 +2473,20 @@ pub struct QueryView {
     pub analyzed: AnalyzedQuery,
     /// The offset map from [`Self::sql`] back to the original text.
     lex: crate::param::LexOutput,
+    /// What the analyzer proved about each `= ANY` / `IN` sublink, by its
+    /// location in [`Self::sql`].
+    sublink_nullability: HashMap<i32, SublinkNullability>,
 }
 
 impl QueryView {
+    /// What the analyzer proved about the `= ANY` / `IN` sublink at
+    /// `location` (a byte offset in [`Self::sql`]): whether some left-hand
+    /// expression and whether some subquery output column may be NULL.
+    /// `None` when no such sublink was inferred there.
+    pub fn sublink_nullability(&self, location: i32) -> Option<SublinkNullability> {
+        self.sublink_nullability.get(&location).copied()
+    }
+
     /// The byte offset in the original query text of `offset_in_sql`, a
     /// byte offset in [`Self::sql`].
     pub fn original_offset(&self, offset_in_sql: usize) -> usize {
@@ -2307,5 +2512,66 @@ impl LocatedError {
     fn new(error: AnalyzeError) -> Self {
         let offset = crate::diagnostic::primary_offset_of(&error.to_string());
         LocatedError { error, offset }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Event {
+        kind: &'static str,
+        span: std::ops::Range<usize>,
+        table_existed: bool,
+    }
+
+    struct Recorder {
+        events: Vec<Event>,
+    }
+
+    impl MigrationObserver for Recorder {
+        fn before(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+            let kind = match statement.node {
+                typedpg_pg_query::protobuf::node::Node::CreateStmt(_) => "create",
+                typedpg_pg_query::protobuf::node::Node::AlterTableStmt(_) => "alter",
+                _ => "other",
+            };
+            self.events.push(Event {
+                kind,
+                span: statement.span.clone(),
+                table_existed: catalog.resolve_table(None, "t").is_some(),
+            });
+        }
+    }
+
+    #[test]
+    fn observed_migration_sees_every_statement_in_order_with_its_span() {
+        let sql =
+            "-- a leading comment\nCREATE TABLE t (id int);\n\nALTER TABLE t ADD COLUMN x int;";
+        let mut catalog = PgCatalog::new().unwrap();
+        let mut recorder = Recorder { events: Vec::new() };
+        catalog
+            .apply_migration_observed("001_t.sql", sql, &mut recorder)
+            .unwrap();
+        assert_eq!(recorder.events.len(), 2);
+        assert_eq!(recorder.events[0].kind, "create");
+        assert_eq!(recorder.events[1].kind, "alter");
+        assert!(!recorder.events[0].table_existed);
+        // `before` of the second statement sees what the first one created.
+        assert!(recorder.events[1].table_existed);
+        // Spans are the `RawStmt` ranges: the statement's text, without the
+        // comments and whitespace that lead into it.
+        for event in &recorder.events {
+            assert!(event.span.start < event.span.end);
+            assert!(event.span.end <= sql.len());
+        }
+        assert_eq!(
+            &sql[recorder.events[0].span.clone()],
+            "CREATE TABLE t (id int)"
+        );
+        assert_eq!(
+            &sql[recorder.events[1].span.clone()],
+            "ALTER TABLE t ADD COLUMN x int"
+        );
     }
 }

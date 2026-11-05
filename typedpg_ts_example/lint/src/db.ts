@@ -7,9 +7,9 @@ export interface Queries {
   "-- typedpg-lint: allow(null_comparison)\nSELECT id FROM users WHERE email = NULL": {
     params: {};
     row: {
-      id: number;
+      id: bigint;
     };
-    value: number;
+    value: bigint;
   };
   "/* typedpg-lint: allow(unbounded_write) */ UPDATE users SET name = 'x'": {
     params: {};
@@ -18,16 +18,23 @@ export interface Queries {
   "SELECT id FROM users WHERE email = NULL": {
     params: {};
     row: {
-      id: number;
+      id: bigint;
     };
-    value: number;
+    value: bigint;
   };
   "SELECT id FROM users WHERE email IS NULL": {
     params: {};
     row: {
-      id: number;
+      id: bigint;
     };
-    value: number;
+    value: bigint;
+  };
+  "SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)": {
+    params: {};
+    row: {
+      id: bigint;
+    };
+    value: bigint;
   };
 }
 
@@ -35,10 +42,11 @@ export interface CopyTargets {
 }
 
 export const sql = createSql<Queries>({
-  "-- typedpg-lint: allow(null_comparison)\nSELECT id FROM users WHERE email = NULL": "{\"sql\":[\"-- typedpg-lint: allow(null_comparison)\\nSELECT id FROM users WHERE email = NULL\"],\"params\":[],\"columns\":[[\"id\",\"number\"]],\"subquery\":true}",
+  "-- typedpg-lint: allow(null_comparison)\nSELECT id FROM users WHERE email = NULL": "{\"sql\":[\"-- typedpg-lint: allow(null_comparison)\\nSELECT id FROM users WHERE email = NULL\"],\"params\":[],\"columns\":[[\"id\",\"bigint\"]],\"subquery\":true}",
   "/* typedpg-lint: allow(unbounded_write) */ UPDATE users SET name = 'x'": "{\"sql\":[\"/* typedpg-lint: allow(unbounded_write) */ UPDATE users SET name = 'x'\"],\"params\":[],\"columns\":[]}",
-  "SELECT id FROM users WHERE email = NULL": "{\"sql\":[\"SELECT id FROM users WHERE email = NULL\"],\"params\":[],\"columns\":[[\"id\",\"number\"]],\"subquery\":true}",
-  "SELECT id FROM users WHERE email IS NULL": "{\"sql\":[\"SELECT id FROM users WHERE email IS NULL\"],\"params\":[],\"columns\":[[\"id\",\"number\"]],\"subquery\":true}",
+  "SELECT id FROM users WHERE email = NULL": "{\"sql\":[\"SELECT id FROM users WHERE email = NULL\"],\"params\":[],\"columns\":[[\"id\",\"bigint\"]],\"subquery\":true}",
+  "SELECT id FROM users WHERE email IS NULL": "{\"sql\":[\"SELECT id FROM users WHERE email IS NULL\"],\"params\":[],\"columns\":[[\"id\",\"bigint\"]],\"subquery\":true}",
+  "SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)": "{\"sql\":[\"SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)\"],\"params\":[],\"columns\":[[\"id\",\"bigint\"]],\"subquery\":true}",
 });
 export const copyIn = createCopyIn<CopyTargets>({
 });

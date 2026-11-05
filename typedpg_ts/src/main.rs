@@ -153,7 +153,63 @@ fn lint(config: &Path) -> Result<bool, String> {
     let mut all: Vec<(PathBuf, typedpg_ts::scan::Position, Finding)> = Vec::new();
     let mut broken = HashSet::new();
     let mut queries = 0usize;
+    let mut migrations = 0usize;
     let mut analysis_failed = false;
+    for db in 0..project.database_count() {
+        let files = match project.lint_migration_files(db) {
+            Ok(files) => files,
+            Err(error) => {
+                analysis_failed = true;
+                if broken.insert(db) {
+                    let diagnostic = Diagnostic {
+                        file: project.config.databases[db].migrations_dir.clone(),
+                        pos: None,
+                        message: error,
+                    };
+                    eprintln!("{}", diagnostic.render(&root));
+                }
+                continue;
+            }
+        };
+        migrations += files.len();
+        let lint_files: Vec<typedpg_lint::MigrationFile> = files
+            .iter()
+            .map(|file| typedpg_lint::MigrationFile {
+                path: file
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&file.path)
+                    .display()
+                    .to_string(),
+                sql: file.sql.clone(),
+                lint: file.lint,
+            })
+            .collect();
+        match typedpg_lint::lint_migrations(
+            &lint_files,
+            project.migrations_use_transaction(db),
+            &options,
+        ) {
+            Ok(findings) => {
+                for migration in findings {
+                    let file = &files[migration.file];
+                    let pos = LineIndex::new(&file.sql).position(migration.finding.span.start);
+                    all.push((file.path.clone(), pos, migration.finding));
+                }
+            }
+            Err(error) => {
+                analysis_failed = true;
+                if broken.insert(db) {
+                    let diagnostic = Diagnostic {
+                        file: project.config.databases[db].migrations_dir.clone(),
+                        pos: None,
+                        message: error.to_string(),
+                    };
+                    eprintln!("{}", diagnostic.render(&root));
+                }
+            }
+        }
+    }
     for query in project.lint_queries() {
         queries += 1;
         let catalog = match project.catalog(query.db) {
@@ -200,13 +256,19 @@ fn lint(config: &Path) -> Result<bool, String> {
         }
     }
 
-    all.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    all.sort_by(|a, b| {
+        (a.0.strip_prefix(&root).unwrap_or(&a.0), a.1, a.2.rule).cmp(&(
+            b.0.strip_prefix(&root).unwrap_or(&b.0),
+            b.1,
+            b.2.rule,
+        ))
+    });
     for (file, pos, finding) in &all {
         let file = file.strip_prefix(&root).unwrap_or(file);
         println!("{}", typedpg_lint::render(file, pos.line, pos.col, finding));
     }
     let findings: Vec<Finding> = all.into_iter().map(|(_, _, finding)| finding).collect();
-    eprintln!("{}", typedpg_lint::summary(&findings, queries));
+    eprintln!("{}", typedpg_lint::summary(&findings, queries, migrations));
     Ok(!analysis_failed && !typedpg_lint::fails(&findings, &options))
 }
 

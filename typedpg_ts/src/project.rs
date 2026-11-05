@@ -173,6 +173,15 @@ impl QuerySource<'_> {
     }
 }
 
+/// A migration file `typedpg lint` runs, and whether its statements are
+/// reported (`false` for `extra_migrations`).
+pub struct LintMigrationFile {
+    /// The file's path, as the project resolved it.
+    pub path: PathBuf,
+    pub sql: String,
+    pub lint: bool,
+}
+
 pub const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts"];
 
 /// Modules a re-export can be followed through.
@@ -1008,6 +1017,39 @@ impl Project {
         self.dbs[db].catalog.as_ref().map_err(Clone::clone)
     }
 
+    /// The migrations `typedpg lint` runs for database `i`: the runner's
+    /// directory (reported) and the extra directories (applied, never
+    /// reported), in the order the catalog applies them.
+    pub fn lint_migration_files(&self, i: usize) -> Result<Vec<LintMigrationFile>, String> {
+        let db = &self.dbs[i];
+        let mut dirs = vec![(db.config.migrations_dir.clone(), true)];
+        dirs.extend(
+            db.config
+                .extra_migrations
+                .iter()
+                .cloned()
+                .map(|dir| (dir, false)),
+        );
+        Ok(collect_migration_files(&dirs, &self.config.root)?
+            .into_iter()
+            .map(|migration| LintMigrationFile {
+                path: migration.path,
+                sql: migration.sql,
+                lint: migration.lint,
+            })
+            .collect())
+    }
+
+    /// How many databases the project has.
+    pub fn database_count(&self) -> usize {
+        self.dbs.len()
+    }
+
+    /// Whether database `i`'s migrations run each in a transaction.
+    pub fn migrations_use_transaction(&self, i: usize) -> bool {
+        self.dbs[i].config.runner.use_transaction
+    }
+
     /// Every file database `i`'s catalog is built from.
     pub fn migration_files(&self, i: usize) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -1223,13 +1265,25 @@ fn collect_sources(path: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `(path, SQL)` of each migration, sorted by file name (whatever the
-/// directory), as the Rust side applies them; the path relative to `root`,
-/// as diagnostics show it. A missing directory has none.
-fn collect_migrations(dirs: &[PathBuf], root: &Path) -> Result<Vec<(String, String)>, String> {
+/// A migration file found in one of `dirs`, with whether its statements
+/// are linted.
+struct CollectedMigration {
+    path: PathBuf,
+    shown: String,
+    sql: String,
+    lint: bool,
+}
+
+/// Every migration file in `dirs` (`(directory, linted)`), sorted by file
+/// name whatever the directory — the order the Rust side applies them.
+/// A missing directory has none.
+fn collect_migration_files(
+    dirs: &[(PathBuf, bool)],
+    root: &Path,
+) -> Result<Vec<CollectedMigration>, String> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
-    for dir in dirs {
+    for (dir, lint) in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -1239,8 +1293,17 @@ fn collect_migrations(dirs: &[PathBuf], root: &Path) -> Result<Vec<(String, Stri
             if name.ends_with(".sql") && !name.ends_with(".down.sql") && seen.insert(path.clone()) {
                 let sql = std::fs::read_to_string(&path)
                     .map_err(|e| format!("failed to read migration '{name}': {e}"))?;
-                let shown = path.strip_prefix(root).unwrap_or(&path);
-                files.push((entry.file_name(), shown.display().to_string(), sql));
+                let shown = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                files.push(CollectedMigration {
+                    path,
+                    shown,
+                    sql,
+                    lint: *lint,
+                });
             }
         }
     }
@@ -1248,13 +1311,21 @@ fn collect_migrations(dirs: &[PathBuf], root: &Path) -> Result<Vec<(String, Stri
     // their numeric prefix, not by their name.
     files.sort_by(|a, b| {
         typedpg_core::migrations::compare_migration_names(
-            &a.0.to_string_lossy(),
-            &b.0.to_string_lossy(),
+            &a.path.file_name().unwrap_or_default().to_string_lossy(),
+            &b.path.file_name().unwrap_or_default().to_string_lossy(),
         )
     });
-    Ok(files
+    Ok(files)
+}
+
+/// `(path, SQL)` of each migration, sorted by file name (whatever the
+/// directory), as the Rust side applies them; the path relative to `root`,
+/// as diagnostics show it. A missing directory has none.
+fn collect_migrations(dirs: &[PathBuf], root: &Path) -> Result<Vec<(String, String)>, String> {
+    let dirs: Vec<(PathBuf, bool)> = dirs.iter().cloned().map(|d| (d, true)).collect();
+    Ok(collect_migration_files(&dirs, root)?
         .into_iter()
-        .map(|(_, name, sql)| (name, sql))
+        .map(|migration| (migration.shown, migration.sql))
         .collect())
 }
 

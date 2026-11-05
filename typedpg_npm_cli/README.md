@@ -24,7 +24,7 @@ later.
 |---|---|
 | `typedpg gen [--watch]` | Generate each database's module from the queries in the sources. `--watch` keeps running, regenerating as sources and migrations change. |
 | `typedpg check` | Fail if a generated module is out of date, or a query has an error. |
-| `typedpg lint` | Run the lint rules over every query: `null_comparison` (comparing with `NULL`) and `unbounded_write` (`UPDATE`/`DELETE` without `WHERE`). Each rule's severity is configured in the `lint` object, and a `-- typedpg-lint: allow(rule)` comment suppresses one in a query. Exits non-zero when a finding reaches `lint.failOn` (default `"error"`) or a query fails analysis. |
+| `typedpg lint` | Run the lint rules over every query and the database's migrations. Query rules: `null_comparison` (error) and `unbounded_write` (error), comparisons with `NULL` and writes with no `WHERE`; `not_in_nullable` (warning), a `NOT IN (SELECT …)` whose sides may be NULL. Migration rules: `create_index_blocking` (warning), `CREATE INDEX` without `CONCURRENTLY`; `constraint_validating` (warning), a constraint validated over existing rows; `set_not_null_scan` (warning), `SET NOT NULL` scanning the table; `table_rewrite` (warning), an `ALTER TABLE` rewriting the table. Schema rules: `fk_without_index` (warning) and `redundant_index` (info). Each rule's severity is configured in the `lint` object, and a `-- typedpg-lint: allow(rule)` comment suppresses one in a query or migration statement. Exits non-zero when a finding reaches `lint.failOn` (default `"error"`) or a query or migration fails analysis. |
 | `typedpg build` | Compile the `.sql` files `sql.include` names into the cache the loaders and bundler plugins read, so importing one runs no analysis. `--json` prints the outcome as JSON on stdout, which the loaders read. |
 | `typedpg serve [--idle-timeout <seconds>]` | Serve TypeScript's content mapper and the loaders over JSON-RPC on stdin/stdout. `--idle-timeout` makes it exit after that many seconds without a request; by default it does not exit. |
 | `typedpg migrate up` | Apply all pending migrations. |
@@ -41,7 +41,7 @@ file is read). The migrate actions other than `create` need a connection.
 In CI, `npx typedpg check` exits non-zero when a generated module is stale,
 when a query has an error, or when a module remains for a `.sql` file that is
 gone. `npx typedpg lint` exits non-zero when a finding reaches its configured
-`failOn` severity, or when a query fails analysis.
+`failOn` severity, or when a query or migration fails to apply or analyze.
 
 ## Bundler plugins
 

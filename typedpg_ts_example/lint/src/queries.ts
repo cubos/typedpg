@@ -15,4 +15,6 @@ export async function cases() {
   await sql("SELECT id FROM users WHERE email IS NULL").fetchAll(pool);
   // unbounded_write, allowed through a block comment.
   await sql("/* typedpg-lint: allow(unbounded_write) */ UPDATE users SET name = 'x'").execute(pool);
+  // not_in_nullable: the subquery's title may be NULL.
+  await sql("SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)").fetchAll(pool);
 }

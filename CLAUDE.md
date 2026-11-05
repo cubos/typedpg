@@ -127,7 +127,7 @@ typedpg_cli (binary: `cargo typedpg migrate up/down/status/create`)
                     └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
                             └── typedpg_pg_query (PostgreSQL parser: our libpg_query binding)
 
-typedpg_lint (the `typedpg lint` rules: null comparisons, unbounded writes)
+typedpg_lint (the `typedpg lint` rules: queries, migrations and the final schema)
     ├── typedpg_analyzer
     ├── typedpg_core
     └── typedpg_pg_query

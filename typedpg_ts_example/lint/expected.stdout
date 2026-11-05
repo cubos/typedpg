@@ -1,5 +1,18 @@
+migrations/0002_hazards.sql:4:1: warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.posts for the whole build
+  help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
+migrations/0002_hazards.sql:8:1: info[redundant_index]: index users_email_idx is redundant with users_email_name_idx
+migrations/0002_hazards.sql:10:1: warning[constraint_validating]: adding a constraint validates every row of public.comments under a lock
+  help: add it NOT VALID, then VALIDATE CONSTRAINT in a later migration
+migrations/0002_hazards.sql:10:1: warning[fk_without_index]: foreign key comments_post_fk on public.comments (post_id) has no index
+  help: CREATE INDEX ON public.comments (post_id)
+migrations/0002_hazards.sql:13:1: warning[set_not_null_scan]: SET NOT NULL scans every row of public.users under a lock
+  help: add CHECK (email IS NOT NULL) NOT VALID, VALIDATE it, then SET NOT NULL
+migrations/0002_hazards.sql:14:1: warning[table_rewrite]: ALTER TABLE rewrites every row of public.users under an ACCESS EXCLUSIVE lock
+  help: rewrite in steps: add a new column, backfill it in batches, then swap
 src/queries.ts:11:41: error[null_comparison]: comparison with NULL is never true
   help: use IS NULL / IS NOT NULL
+src/queries.ts:19:41: warning[not_in_nullable]: NOT IN (SELECT …) returns no rows when the subquery returns a NULL
+  help: use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL
 src/writes.sql:5:1: warning[unbounded_write]: DELETE without WHERE removes every row of users
   help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
 src/writes.sql:12:1: warning[unbounded_write]: UPDATE without WHERE changes every row of users

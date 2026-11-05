@@ -32,7 +32,14 @@
 //! [package.metadata.typedpg.lint]
 //! fail_on = "warning"            # the severity `typedpg lint` fails on (default "error")
 //! null_comparison = "off"        # one rule's level: "error", "warning", "info" or "off"
+//! redundant_index = "info"
 //! ```
+//!
+//! The query rules are `null_comparison`, `unbounded_write` and
+//! `not_in_nullable`; the migration rules `create_index_blocking`,
+//! `constraint_validating`, `set_not_null_scan` and `table_rewrite`; and the
+//! schema rules `fk_without_index` and `redundant_index`, evaluated over the
+//! migrations' final schema. [`LINT_RULES`] is the one list of their keys.
 //!
 //! `[types]` is a single unified map from a PostgreSQL type to the Rust type
 //! it should surface as. Keys are looked up by `schema.name` (or just `name`,
@@ -146,8 +153,19 @@ impl SimplifySetting {
 
 /// The lint rules' configuration keys, one per rule: the
 /// `[package.metadata.typedpg.lint]` keys (and the TypeScript CLI's `lint`
-/// object's, in camelCase).
-pub const LINT_RULES: &[&str] = &["null_comparison", "unbounded_write"];
+/// object's, in camelCase). Query rules first, then migration rules, then the
+/// schema rules evaluated over the migrations' final schema.
+pub const LINT_RULES: &[&str] = &[
+    "null_comparison",
+    "unbounded_write",
+    "not_in_nullable",
+    "create_index_blocking",
+    "constraint_validating",
+    "set_not_null_scan",
+    "table_rewrite",
+    "fk_without_index",
+    "redundant_index",
+];
 
 /// A lint finding's severity, ordered from least to most severe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -1489,7 +1507,9 @@ event_data = "crate::EventData"
         assert_eq!(
             err.to_string(),
             "unknown key `null_comparisions` in [package.metadata.typedpg.lint]: expected one \
-             of `fail_on`, `null_comparison`, `unbounded_write`"
+             of `fail_on`, `null_comparison`, `unbounded_write`, `not_in_nullable`, \
+             `create_index_blocking`, `constraint_validating`, `set_not_null_scan`, \
+             `table_rewrite`, `fk_without_index`, `redundant_index`"
         );
     }
 

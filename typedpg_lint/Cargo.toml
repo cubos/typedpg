@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "SQL lint rules for typedpg queries"
+description = "SQL lint rules for typedpg queries, migrations and schema"
 keywords = ["postgres", "postgresql", "sql", "linter"]
 categories = ["database", "development-tools"]
 

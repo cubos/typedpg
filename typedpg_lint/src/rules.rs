@@ -4,7 +4,10 @@
 
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{AExpr, AExprKind, CaseWhen, Node, RangeVar, node::Node as N};
+use typedpg_pg_query::protobuf::{
+    AExpr, AExprKind, BoolExpr, BoolExprType, CaseWhen, Node, RangeVar, SubLinkType,
+    node::Node as N,
+};
 
 use crate::{Ctx, RawFinding, Rule};
 
@@ -16,7 +19,16 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
     match rule {
         Rule::NullComparison => null_comparison(ctx),
         Rule::UnboundedWrite => unbounded_write(ctx),
-        Rule::InvalidAllow => Vec::new(),
+        Rule::NotInNullable => not_in_nullable(ctx),
+        // The migration and schema rules run over a migration's statements,
+        // not over a query.
+        Rule::CreateIndexBlocking
+        | Rule::ConstraintValidating
+        | Rule::SetNotNullScan
+        | Rule::TableRewrite
+        | Rule::FkWithoutIndex
+        | Rule::RedundantIndex
+        | Rule::InvalidAllow => Vec::new(),
     }
 }
 
@@ -260,6 +272,81 @@ fn is_terminator(text: &str) -> bool {
     ]
     .iter()
     .any(|keyword| text.eq_ignore_ascii_case(keyword))
+}
+
+// ── not_in_nullable ────────────────────────────────────────────────────────
+
+fn not_in_nullable(ctx: &Ctx<'_>) -> Vec<RawFinding> {
+    let mut out = Vec::new();
+    for (node, _) in ctx.tree.nodes() {
+        let NodeRef::BoolExpr(expr) = node else {
+            continue;
+        };
+        not_in(ctx, expr, &mut out);
+    }
+    out
+}
+
+fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
+    if BoolExprType::try_from(expr.boolop) != Ok(BoolExprType::NotExpr) || expr.args.len() != 1 {
+        return;
+    }
+    let Some(Node {
+        node: Some(N::SubLink(sub)),
+    }) = expr.args.first()
+    else {
+        return;
+    };
+    if SubLinkType::try_from(sub.sub_link_type) != Ok(SubLinkType::AnySublink) {
+        return;
+    }
+    let operator = sub
+        .oper_name
+        .iter()
+        .filter_map(|node| match &node.node {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    if !operator.is_empty() && operator != "=" {
+        return;
+    }
+    // The analyzer's facts: without one, we don't know either side's
+    // nullability, and never guess.
+    let Some(fact) = ctx.view.sublink_nullability(sub.location) else {
+        return;
+    };
+    let side = match (fact.lhs_nullable, fact.subquery_nullable) {
+        (true, true) => "either side is NULL",
+        (true, false) => "the left side is NULL",
+        (false, true) => "the subquery returns a NULL",
+        (false, false) => return,
+    };
+    let start = sub
+        .testexpr
+        .as_deref()
+        .and_then(operand_start)
+        .or_else(|| location(sub.location))
+        .or_else(|| location(expr.location))
+        .unwrap_or(0);
+    // Scan from the subquery's opening parenthesis: the `NOT` and `IN`
+    // before it are terminators when scanning the left expression.
+    let sub_start = location(sub.location).unwrap_or(start);
+    let end = ctx
+        .tokens
+        .iter()
+        .filter(|token| token.start >= sub_start)
+        .find(|token| &ctx.sql[token.start..token.end] == "(")
+        .map(|token| expression_end(ctx, token.start))
+        .unwrap_or_else(|| expression_end(ctx, start));
+    out.push(RawFinding {
+        span: start..end.max(start + 1),
+        message: format!("NOT IN (SELECT …) returns no rows when {side}"),
+        help: Some(
+            "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL".to_owned(),
+        ),
+    });
 }
 
 // ── unbounded_write ────────────────────────────────────────────────────────
