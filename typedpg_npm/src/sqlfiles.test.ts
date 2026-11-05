@@ -4,6 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
@@ -160,10 +161,21 @@ test("the wasm cache recipe matches the hex the old implementation wrote", () =>
   });
   const identity = cacheSchemaIdentity(config, databases);
   assert.equal(identity, "0c5150f3a5595a50853b2ee0e72de02671b22bf714ac5e86161ddadb89e4db0b");
-  assert.equal(
-    cacheKey(identity, "q/users.sql", readFileSync(join(root, "q/users.sql"), "utf8")),
-    "52cbab702fbc9a811464ba8661d29b45f6a85378c717c294a99e92e60f545d63",
-  );
+  const content = readFileSync(join(root, "q/users.sql"), "utf8");
+  // The key holds the version, so a release changes it on purpose: the
+  // recorded key is the one at 0.5.0, and the old step rebuilds it for this
+  // package's version.
+  const oldKey = (version: string) => {
+    const h = createHash("sha256");
+    for (const part of ["typedpg-cache-1", version, identity, "q/users.sql", content]) {
+      h.update(part);
+      h.update("\n");
+    }
+    return h.digest("hex");
+  };
+  assert.equal(oldKey("0.5.0"), "52cbab702fbc9a811464ba8661d29b45f6a85378c717c294a99e92e60f545d63");
+  const { version } = JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8"));
+  assert.equal(cacheKey(identity, "q/users.sql", content), oldKey(version));
 });
 
 test("two cache misses reuse one serve child", async () => {  const { root, sql } = project();
