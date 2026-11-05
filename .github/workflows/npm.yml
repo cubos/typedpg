@@ -4,7 +4,7 @@ name: npm
 # packages: `@cubos/typedpg` (the runtime, no binary), `@cubos/typedpg-cli`
 # (the command and bundler plugins, with an optional dependency on each
 # platform's binary) and `@cubos/typedpg-cli-<target>`. The release tag
-# (`v0.5.0`, the version of the crates and of the packages) stages them for
+# (`v0.6.0`, the version of the crates and of the packages) stages them for
 # publishing (`npm stage publish`): each goes live once a maintainer approves
 # it with 2FA on npmjs.com (Staged Packages) or with `npm stage approve`. A
 # manual run only packs them (`npm publish --dry-run`), or stages them too
