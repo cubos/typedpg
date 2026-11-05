@@ -12,6 +12,7 @@ import { describe, test } from "node:test";
 
 import pg from "pg";
 import postgres from "postgres";
+import postgres3 from "postgres-3";
 import {
   MigrationError,
   acceptMigration,
@@ -51,6 +52,10 @@ const migrationDrivers = [
   }],
   ["postgres.js", (url: string) => {
     const sql = postgres(url, { onnotice: () => {}, max: 4 });
+    return { db: sql as Executor, close: () => sql.end() };
+  }],
+  ["postgres.js 3", (url: string) => {
+    const sql = postgres3(url, { onnotice: () => {}, max: 4 });
     return { db: sql as Executor, close: () => sql.end() };
   }],
 ] as const;

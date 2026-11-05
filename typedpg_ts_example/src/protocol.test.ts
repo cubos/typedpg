@@ -5,16 +5,17 @@
 // for the server to infer from the cast `sql` writes after its placeholder,
 // so a value is read as that type directly instead of converted from text.
 //
-// node-postgres sends a query in one round trip. postgres.js takes two when
-// it has parameters: it describes a statement it hasn't prepared before
-// binding it, and nothing in its API skips that but preparing it (see
-// adapters.ts).
+// node-postgres and postgres.js 4 send a query in one round trip.
+// postgres.js 3 takes two when it has parameters: it describes a statement
+// it hasn't prepared before binding it, and nothing in its API skips that
+// but preparing it (see adapters.ts).
 
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 
 import pg from "pg";
 import postgres from "postgres";
+import postgres3 from "postgres-3";
 import type { Executor } from "@cubos/typedpg";
 
 import * as q from "./queries.ts";
@@ -72,6 +73,18 @@ const drivers: [string, Driver][] = [
       async connect(url) {
         const sql = postgres(url, { max: 1, onnotice: () => {} });
         // Connect (and fetch the array types) before anything is counted.
+        await sql`SELECT 1`;
+        return { db: sql, close: () => sql.end() };
+      },
+      roundTrips: 1,
+      declared: (inferred) => inferred.map(() => UNKNOWN),
+    },
+  ],
+  [
+    "postgres.js 3",
+    {
+      async connect(url) {
+        const sql = postgres3(url, { max: 1, onnotice: () => {} });
         await sql`SELECT 1`;
         return { db: sql, close: () => sql.end() };
       },

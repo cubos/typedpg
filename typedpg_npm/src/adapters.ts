@@ -167,15 +167,19 @@ function postgresJs(sql: PostgresJsSql): Driver {
   // then serializes the value by the type the server reports
   // (`JSON.stringify` for jsonb, `new Date()` for timestamptz…), encoding
   // our text a second time. It has no serializer for `unknown`, so the
-  // text goes as is.
-  const values = (params: (string | null)[]) => params.map((p) => (p === null ? null : any.typed(p, UNKNOWN_OID)));
+  // text goes as is. A NULL is declared too: postgres.js 4, when any
+  // parameter is unspecified, describes the statement first and serializes
+  // every value by the reported types, the declared ones included.
+  const values = (params: (string | null)[]) => params.map((p) => any.typed(p, UNKNOWN_OID));
   const text = (v: Uint8Array | null) => (v === null ? null : Buffer.from(v).toString("utf8"));
   // `prepare: false`, `unsafe()`'s default: the unnamed statement, planned
   // with each execution's values. A prepared one would be cached on the
   // connection and, after five executions, planned generically. postgres.js
-  // describes a statement it hasn't prepared before binding it, to learn
+  // 3 describes a statement it hasn't prepared before binding it, to learn
   // its parameter types: a query with parameters costs two round trips,
-  // which nothing in its API avoids short of preparing.
+  // which nothing in its API avoids short of preparing. postgres.js 4
+  // skips the description when every parameter's type is declared, as here:
+  // one round trip.
   const unprepared = { prepare: false };
   return {
     async typedpgQuery(query, params) {

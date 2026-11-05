@@ -757,7 +757,7 @@ needs `@cubos/typedpg-cli` and a `DATABASE_URL` in that step.
 | Executor | Notes |
 |----------|-------|
 | node-postgres `Pool`, `Client`, `PoolClient` | `fetchStream` needs `pg-cursor`, `copyIn` `pg-copy-streams` (optional peer dependencies). A pool takes a client for a stream or a COPY. |
-| postgres.js `sql`, a transaction's `sql`, a reserved connection | |
+| postgres.js `sql`, a transaction's `sql`, a reserved connection | Versions 3.4 and 4. |
 | a `Driver` of your own | Implement `typedpgQuery(text, params)` (and the optional methods for streams, COPY and migrations). |
 
 Transactions are the driver's: run queries on the `PoolClient` inside your
@@ -770,9 +770,9 @@ says, whatever `pg.types.setTypeParser` your application set up.
 A query is sent on the unnamed statement, never prepared and reused, so
 PostgreSQL plans each execution with its values, and each parameter's type
 is left for the server to infer from its cast, so a value is read as that
-type directly instead of converted from text. node-postgres sends it in one
-round trip; postgres.js takes two when it has parameters, as it describes a
-statement before binding it.
+type directly instead of converted from text. node-postgres and postgres.js
+4 send it in one round trip; postgres.js 3 takes two when it has parameters,
+as it describes a statement before binding it.
 
 ## Types
 
