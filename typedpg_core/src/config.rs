@@ -167,6 +167,15 @@ pub const LINT_RULES: &[&str] = &[
     "redundant_index",
 ];
 
+/// The types whose default Rust types can't hold `infinity` / `-infinity`
+/// (chrono's `NaiveDate`, `NaiveDateTime` and `DateTime<Utc>`, which
+/// `ToSql` writes as days or microseconds from 2000 — their ±262 000 years
+/// never reach PG's infinity sentinels): a parameter of one is finite, so
+/// the analysis takes it to be (`PgCatalog::assume_finite_parameters`)
+/// unless `[types]` maps the type. Not `interval`: an `Interval` with every
+/// field at its maximum is PG's infinite one.
+pub const FINITE_PARAMETER_TYPES: &[&str] = &["date", "timestamp", "timestamptz"];
+
 /// A lint finding's severity, ordered from least to most severe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum LintSeverity {

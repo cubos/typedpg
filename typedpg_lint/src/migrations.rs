@@ -41,6 +41,14 @@ pub struct MigrationFinding {
     pub finding: Finding,
 }
 
+/// The findings of [`lint_migrations`], and the catalog the migrations
+/// built — the schema their queries are analyzed against.
+#[derive(Clone)]
+pub struct LintedMigrations {
+    pub findings: Vec<MigrationFinding>,
+    pub catalog: PgCatalog,
+}
+
 /// Lint the migrations, applying them in order to build the schema they
 /// leave behind.
 ///
@@ -51,7 +59,7 @@ pub fn lint_migrations(
     files: &[MigrationFile],
     use_transaction: bool,
     options: &LintOptions,
-) -> Result<Vec<MigrationFinding>, DdlError> {
+) -> Result<LintedMigrations, DdlError> {
     let mut catalog = PgCatalog::new().map_err(|error| {
         DdlError::Internal(format!("failed to load the PG catalog seed: {error}"))
     })?;
@@ -95,7 +103,7 @@ pub fn lint_migrations(
                 b.finding.rule,
             ))
     });
-    Ok(findings)
+    Ok(LintedMigrations { findings, catalog })
 }
 
 /// A `typedpg-lint` comment in a migration file.

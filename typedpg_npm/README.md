@@ -574,6 +574,9 @@ Migration rules only apply to tables that existed before the file started;
 schema rules are placed at the statement that created the index or constraint.
 Findings go to stdout, the summary to stderr, and the run exits non-zero when
 a finding reaches `failOn` or a query or migration fails analysis.
+`--format json` prints one JSON document (findings, failures and the summary)
+and `--format sarif` prints SARIF 2.1.0 for code scanning; both include the
+analysis failures, which the human format keeps on stderr.
 
 `gen` prints each error at its place in your sources, the line and column of
 the offending token inside the SQL:

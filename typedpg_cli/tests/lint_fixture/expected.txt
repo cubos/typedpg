@@ -1,0 +1,16 @@
+migrations/0002_hazards.sql:3:1: warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build
+  help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
+migrations/0002_hazards.sql:5:1: warning[constraint_validating]: adding a constraint validates every row of public.posts under a lock
+  help: add it NOT VALID, then VALIDATE CONSTRAINT in a later migration
+migrations/0002_hazards.sql:5:1: warning[fk_without_index]: foreign key posts_author_fk on public.posts (author_id) has no index
+  help: CREATE INDEX ON public.posts (author_id)
+src/main.rs:8:45: error[null_comparison]: comparison with NULL is never true
+  help: use IS NULL / IS NOT NULL
+src/main.rs:10:46: error[null_comparison]: comparison with NULL is never true
+  help: use IS NULL / IS NOT NULL
+src/main.rs:12:44: warning[not_in_nullable]: NOT IN (SELECT …) returns no rows when either side is NULL
+  help: use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL
+src/main.rs:16:17: error[unbounded_write]: UPDATE without WHERE changes every row of users
+  help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
+src/main.rs:18:57: error[null_comparison]: comparison with NULL is never true
+  help: use IS NULL / IS NOT NULL

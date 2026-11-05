@@ -403,7 +403,7 @@ pub(crate) fn catalog_for<'c>(
         resolved.migrations_use_transaction(),
     )?;
     // A parameter bound from a chrono date or timestamp is never infinite.
-    let finite: Vec<typedpg_core::QualifiedName> = crate::pg_type_map::FINITE_PARAMETER_TYPES
+    let finite: Vec<typedpg_core::QualifiedName> = typedpg_core::config::FINITE_PARAMETER_TYPES
         .iter()
         .map(|t| typedpg_core::QualifiedName::new("pg_catalog", *t))
         .filter(|q| !resolved.types.contains_key(q))

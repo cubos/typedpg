@@ -15,3 +15,6 @@ categories = ["database", "development-tools"]
 typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.5.0", features = ["internal"] }
 typedpg_core = { path = "../typedpg_core", version = "0.5.0" }
 typedpg_pg_query = { path = "../typedpg_pg_query", version = "0.5.0" }
+serde = { version = "1", features = ["derive"] }
+# The documents keep the key order the report writes (SARIF readers show it), whatever else the build enables.
+serde_json = { version = "1", features = ["preserve_order"] }

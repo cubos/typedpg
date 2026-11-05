@@ -15,13 +15,14 @@
 //! then the schema rules over the final catalog. Its findings are placed in
 //! the file text; the TypeScript CLI prints them beside the query findings.
 //!
-//! Rendering lives here too, so the Rust and TypeScript CLIs report the
-//! same lines.
+//! [`report`] builds and renders the one report both CLIs print: the same
+//! lines in the human format, as one JSON object, or as SARIF.
 
 mod migrations;
+pub mod report;
 mod rules;
 
-pub use migrations::{MigrationFile, MigrationFinding, lint_migrations};
+pub use migrations::{LintedMigrations, MigrationFile, MigrationFinding, lint_migrations};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -123,6 +124,27 @@ impl Rule {
     /// The configurable rule named `name` (see [`Rule::name`]).
     pub fn from_name(name: &str) -> Option<Rule> {
         Rule::ALL.into_iter().find(|r| r.name() == name)
+    }
+
+    /// A one-line description of what the rule reports, used by the SARIF
+    /// rule metadata.
+    pub fn description(self) -> &'static str {
+        match self {
+            Rule::NullComparison => "comparison with NULL is never true",
+            Rule::UnboundedWrite => "UPDATE or DELETE without a WHERE clause",
+            Rule::NotInNullable => {
+                "NOT IN (SELECT …) that returns no rows because a side may be NULL"
+            }
+            Rule::CreateIndexBlocking => {
+                "CREATE INDEX without CONCURRENTLY on a table that already has rows"
+            }
+            Rule::ConstraintValidating => "a constraint that validates existing rows under a lock",
+            Rule::SetNotNullScan => "SET NOT NULL that scans every row of the table",
+            Rule::TableRewrite => "ALTER TABLE that rewrites every row under a lock",
+            Rule::FkWithoutIndex => "a foreign key whose referencing columns have no index",
+            Rule::RedundantIndex => "an index another index on the table already covers",
+            Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
+        }
     }
 
     /// The severity the rule reports unless the configuration overrides it.
@@ -460,15 +482,15 @@ pub fn render(path: &Path, line: u32, column: u32, finding: &Finding) -> String 
     out
 }
 
-/// The summary line:
+/// The summary line [`report::Report::summary`] renders:
 /// `[typedpg] lint: 2 errors, 1 warning, 0 infos in 14 queries and 3 migrations`.
-pub fn summary(findings: &[Finding], queries: usize, migrations: usize) -> String {
-    let count = |severity| {
-        findings
-            .iter()
-            .filter(|finding| finding.severity == severity)
-            .count()
-    };
+pub(crate) fn summary_line(
+    errors: usize,
+    warnings: usize,
+    infos: usize,
+    queries: usize,
+    migrations: usize,
+) -> String {
     let plural = |n: usize, word: &str, words: &str| {
         if n == 1 {
             format!("{n} {word}")
@@ -488,9 +510,9 @@ pub fn summary(findings: &[Finding], queries: usize, migrations: usize) -> Strin
     };
     format!(
         "[typedpg] lint: {}, {}, {} in {queries} and {migrations}",
-        plural(count(Severity::Error), "error", "errors"),
-        plural(count(Severity::Warning), "warning", "warnings"),
-        plural(count(Severity::Info), "info", "infos"),
+        plural(errors, "error", "errors"),
+        plural(warnings, "warning", "warnings"),
+        plural(infos, "info", "infos"),
     )
 }
 
@@ -902,12 +924,36 @@ mod tests {
         let mut info = finding.clone();
         info.severity = Severity::Info;
         info.help = None;
+        let entry = |finding: Finding| report::Entry {
+            path: "src/users.ts".to_owned(),
+            start: report::Position {
+                line: 12,
+                column: 30,
+            },
+            end: report::Position {
+                line: 12,
+                column: 36,
+            },
+            finding,
+        };
+        let report = report::Report {
+            entries: vec![entry(finding), entry(warning), entry(info)],
+            failures: Vec::new(),
+            queries: 14,
+            migrations: 3,
+        };
         assert_eq!(
-            summary(&[finding, warning, info], 14, 3),
+            report.summary(),
             "[typedpg] lint: 1 error, 1 warning, 1 info in 14 queries and 3 migrations"
         );
+        let report = report::Report {
+            entries: Vec::new(),
+            failures: Vec::new(),
+            queries: 1,
+            migrations: 1,
+        };
         assert_eq!(
-            summary(&[], 1, 1),
+            report.summary(),
             "[typedpg] lint: 0 errors, 0 warnings, 0 infos in 1 query and 1 migration"
         );
     }
@@ -1072,7 +1118,9 @@ mod tests {
                 lint: *lint,
             })
             .collect();
-        lint_migrations(&files, use_transaction, &LintOptions::default()).unwrap()
+        lint_migrations(&files, use_transaction, &LintOptions::default())
+            .unwrap()
+            .findings
     }
 
     fn second(sql: &str) -> Vec<MigrationFinding> {

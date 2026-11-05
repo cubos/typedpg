@@ -1,5 +1,8 @@
 [workspace]
 resolver = "3"
+# `typedpg_cli`'s lint integration test only reads this crate: it must never
+# be built, and its `sql!` calls are deliberately invalid SQL.
+exclude = ["typedpg_cli/tests/lint_fixture"]
 members = [
     "typedpg",
     "typedpg_core",

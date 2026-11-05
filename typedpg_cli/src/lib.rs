@@ -1,6 +1,9 @@
 //! The migration commands behind `cargo typedpg migrate`, shared with the
 //! TypeScript CLI (`typedpg migrate`, in `typedpg_ts`), which configures
-//! them from `typedpg.config.json` instead of `Cargo.toml`.
+//! them from `typedpg.config.json` instead of `Cargo.toml`, and
+//! `cargo typedpg lint` ([`lint`]).
+
+pub mod lint;
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -78,6 +78,23 @@ if [[ "$status" -ne 1 ]]; then
     exit 1
 fi
 
+actual=$(cd "$LINT" && "$TYPEDPG" lint --format json) && status=0 || status=$?
+if [[ "${BLESS:-}" == 1 ]]; then
+    printf '%s\n' "$actual" > "$LINT/expected.json"
+fi
+diff -u "$LINT/expected.json" <(printf '%s\n' "$actual")
+if [[ "$status" -ne 1 ]]; then
+    echo "ts-e2e: typedpg lint --format json exited with $status, expected 1" >&2
+    exit 1
+fi
+
+actual=$(cd "$LINT" && "$TYPEDPG" lint --format sarif) && status=0 || status=$?
+printf '%s\n' "$actual" | python3 -c 'import json, sys; json.load(sys.stdin)'
+if [[ "$status" -ne 1 ]]; then
+    echo "ts-e2e: typedpg lint --format sarif exited with $status, expected 1" >&2
+    exit 1
+fi
+
 echo "ts-e2e: tsc 7 and 5.9"
 (cd "$EXAMPLE" && npm run --silent typecheck)
 

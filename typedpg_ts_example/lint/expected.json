@@ -1,0 +1,122 @@
+{
+  "findings": [
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 4,
+      "column": 1,
+      "endLine": 4,
+      "endColumn": 54,
+      "rule": "create_index_blocking",
+      "severity": "warning",
+      "message": "CREATE INDEX without CONCURRENTLY blocks writes on public.posts for the whole build",
+      "help": "use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+    },
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 8,
+      "column": 1,
+      "endLine": 8,
+      "endColumn": 59,
+      "rule": "redundant_index",
+      "severity": "info",
+      "message": "index users_email_idx is redundant with users_email_name_idx",
+      "help": null
+    },
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 10,
+      "column": 1,
+      "endLine": 11,
+      "endColumn": 48,
+      "rule": "constraint_validating",
+      "severity": "warning",
+      "message": "adding a constraint validates every row of public.comments under a lock",
+      "help": "add it NOT VALID, then VALIDATE CONSTRAINT in a later migration"
+    },
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 10,
+      "column": 1,
+      "endLine": 11,
+      "endColumn": 48,
+      "rule": "fk_without_index",
+      "severity": "warning",
+      "message": "foreign key comments_post_fk on public.comments (post_id) has no index",
+      "help": "CREATE INDEX ON public.comments (post_id)"
+    },
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 13,
+      "column": 1,
+      "endLine": 13,
+      "endColumn": 50,
+      "rule": "set_not_null_scan",
+      "severity": "warning",
+      "message": "SET NOT NULL scans every row of public.users under a lock",
+      "help": "add CHECK (email IS NOT NULL) NOT VALID, VALIDATE it, then SET NOT NULL"
+    },
+    {
+      "path": "migrations/0002_hazards.sql",
+      "line": 14,
+      "column": 1,
+      "endLine": 14,
+      "endColumn": 46,
+      "rule": "table_rewrite",
+      "severity": "warning",
+      "message": "ALTER TABLE rewrites every row of public.users under an ACCESS EXCLUSIVE lock",
+      "help": "rewrite in steps: add a new column, backfill it in batches, then swap"
+    },
+    {
+      "path": "src/queries.ts",
+      "line": 11,
+      "column": 41,
+      "endLine": 11,
+      "endColumn": 53,
+      "rule": "null_comparison",
+      "severity": "error",
+      "message": "comparison with NULL is never true",
+      "help": "use IS NULL / IS NOT NULL"
+    },
+    {
+      "path": "src/queries.ts",
+      "line": 19,
+      "column": 41,
+      "endLine": 19,
+      "endColumn": 79,
+      "rule": "not_in_nullable",
+      "severity": "warning",
+      "message": "NOT IN (SELECT …) returns no rows when the subquery returns a NULL",
+      "help": "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL"
+    },
+    {
+      "path": "src/writes.sql",
+      "line": 5,
+      "column": 1,
+      "endLine": 5,
+      "endColumn": 18,
+      "rule": "unbounded_write",
+      "severity": "warning",
+      "message": "DELETE without WHERE removes every row of users",
+      "help": "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
+    },
+    {
+      "path": "src/writes.sql",
+      "line": 12,
+      "column": 1,
+      "endLine": 12,
+      "endColumn": 13,
+      "rule": "unbounded_write",
+      "severity": "warning",
+      "message": "UPDATE without WHERE changes every row of users",
+      "help": "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
+    }
+  ],
+  "failures": [],
+  "summary": {
+    "errors": 1,
+    "warnings": 8,
+    "infos": 1,
+    "queries": 8,
+    "migrations": 2
+  }
+}
