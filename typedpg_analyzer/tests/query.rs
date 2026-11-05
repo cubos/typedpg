@@ -80,6 +80,8 @@ mod null_narrowing;
 mod nullability_soundness;
 #[path = "query/params.rs"]
 mod params;
+#[path = "query/query_view.rs"]
+mod query_view;
 #[path = "query/records.rs"]
 mod records;
 #[path = "query/refinements.rs"]

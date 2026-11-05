@@ -18,7 +18,9 @@ use crate::config::{
 };
 use crate::emit::{Embedded, Module, TypeCheck};
 use crate::generate::{GenError, Generated, generate};
-use crate::scan::{Export, FileScan, Kind, ModuleExports, Position, module_exports, scan};
+use crate::scan::{
+    Export, FileScan, Kind, LineIndex, Literal, ModuleExports, Position, module_exports, scan,
+};
 use crate::sqlfile::{ModuleNames, SqlFile};
 use crate::sqlmodule::{Mapped, SqlModule, SqlQuery, generated_source, source_from};
 use crate::typemap::{RUNTIME_NS, TypeMapper};
@@ -134,6 +136,42 @@ impl Database {
 
 /// Where a query is used: the file, its scan, the query's index in it.
 type Uses<'a> = Vec<(&'a Path, &'a FileScan, usize)>;
+
+/// A query `typedpg lint` runs: its database, its file and its text, as
+/// analyzed.
+#[derive(Debug, Clone)]
+pub struct LintQuery<'a> {
+    /// The index of the database whose catalog analyzes it.
+    pub db: usize,
+    pub file: &'a Path,
+    /// The query as written, with the comments that precede it (a `.sql`
+    /// query's leading comments carry its lint suppressions).
+    pub text: String,
+    /// Maps an offset in `text` to an offset in the file.
+    pub source: QuerySource<'a>,
+    /// Where to point when the query's analysis has no offset.
+    pub pos: Position,
+    pub lines: &'a LineIndex,
+}
+
+/// How a [`LintQuery`]'s text sits in its file.
+#[derive(Debug, Clone, Copy)]
+pub enum QuerySource<'a> {
+    /// A TypeScript string or template literal, with escapes to decode.
+    Literal(&'a Literal),
+    /// A `.sql` file's slice starting at this byte.
+    File { start: usize },
+}
+
+impl QuerySource<'_> {
+    /// The byte offset in the file of byte `offset` of the query text.
+    pub fn offset(&self, offset: usize) -> usize {
+        match self {
+            QuerySource::Literal(literal) => literal.source_offset(offset),
+            QuerySource::File { start } => start + offset,
+        }
+    }
+}
 
 pub const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts"];
 
@@ -925,6 +963,49 @@ impl Project {
     /// The `.sql` files, with their databases.
     pub fn sql_paths(&self) -> impl Iterator<Item = &Path> {
         self.sql_files.keys().map(PathBuf::as_path)
+    }
+
+    /// Every query `typedpg lint` runs, sorted by file and position:
+    /// `sql()` calls in the sources, and each `.sql` query with the
+    /// comments between its `@name` block and its statement.
+    pub fn lint_queries(&self) -> Vec<LintQuery<'_>> {
+        let mut out = Vec::new();
+        for (path, scan) in &self.files {
+            for query in &scan.queries {
+                if query.kind != Kind::Query {
+                    continue;
+                }
+                out.push(LintQuery {
+                    db: query.db,
+                    file: path,
+                    text: query.text.clone(),
+                    source: QuerySource::Literal(&query.literal),
+                    pos: query.pos,
+                    lines: &scan.lines,
+                });
+            }
+        }
+        for (path, (db, file)) in &self.sql_files {
+            for query in &file.queries {
+                let start = query.after_name;
+                let end = query.start + query.text.len();
+                out.push(LintQuery {
+                    db: *db,
+                    file: path,
+                    text: file.source[start..end].to_owned(),
+                    source: QuerySource::File { start },
+                    pos: query.pos,
+                    lines: &file.lines,
+                });
+            }
+        }
+        out.sort_by(|a, b| (&a.file, a.pos).cmp(&(&b.file, b.pos)));
+        out
+    }
+
+    /// Database `db`'s catalog, or why it could not be built.
+    pub fn catalog(&self, db: usize) -> Result<&PgCatalog, String> {
+        self.dbs[db].catalog.as_ref().map_err(Clone::clone)
     }
 
     /// Every file database `i`'s catalog is built from.

@@ -15,6 +15,11 @@
 //! `unionAll`, `fkJoin`) set to `false`. They are on by default, for every
 //! database.
 //!
+//! `lint` configures `typedpg lint` for every database: `failOn` is the
+//! severity the run fails on (`"error"`, the default, `"warning"` or
+//! `"info"`), and each rule (`nullComparison`, `unboundedWrite`) is set to
+//! a level: `"error"`, `"warning"`, `"info"` or `"off"`.
+//!
 //! `migrations` is the directory, or an object with it and the runner's
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",
 //! "embed" }`. Several databases go under `databases`, each with the
@@ -46,7 +51,9 @@ use std::path::{Path, PathBuf};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use typedpg_core::QualifiedName;
-use typedpg_core::config::{MigrationsConfig, SimplifyConfig};
+use typedpg_core::config::{
+    LINT_RULES, LintConfig, LintLevel, LintSeverity, MigrationsConfig, SimplifyConfig,
+};
 
 pub const CONFIG_FILE: &str = "typedpg.config.json";
 
@@ -64,6 +71,16 @@ struct RawConfig {
     types: Option<BTreeMap<String, String>>,
     databases: Option<BTreeMap<String, RawDatabase>>,
     simplify: Option<RawSimplify>,
+    lint: Option<RawLint>,
+}
+
+/// `lint`: the severity the run fails on and each rule's level.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLint {
+    fail_on: Option<String>,
+    #[serde(flatten)]
+    rules: BTreeMap<String, String>,
 }
 
 /// `simplify`: `false`, or `{ "<rule>": false, … }`.
@@ -74,10 +91,10 @@ enum RawSimplify {
     Rules(BTreeMap<String, bool>),
 }
 
-/// The `simplify` object's key for each rule: the Rust configuration's
-/// key (`typedpg_core::config::SIMPLIFY_RULES`), in camelCase as the rest
-/// of this file.
-fn simplify_key(rule: &str) -> String {
+/// A rule's configuration key in camelCase, as the rest of this file writes
+/// keys: the Rust configuration's snake_case key (`SIMPLIFY_RULES`,
+/// `LINT_RULES`).
+fn camel_key(rule: &str) -> String {
     let mut out = String::with_capacity(rule.len());
     let mut upper = false;
     for c in rule.chars() {
@@ -108,10 +125,10 @@ fn simplify_config(raw: Option<RawSimplify>) -> Result<SimplifyConfig, String> {
         Some(RawSimplify::Rules(rules)) => {
             let mut disabled = Vec::new();
             for (key, on) in rules {
-                let Some(rule) = SIMPLIFY_RULES.iter().find(|r| simplify_key(r) == key) else {
+                let Some(rule) = SIMPLIFY_RULES.iter().find(|r| camel_key(r) == key) else {
                     let keys: Vec<String> = SIMPLIFY_RULES
                         .iter()
-                        .map(|r| format!("`{}`", simplify_key(r)))
+                        .map(|r| format!("`{}`", camel_key(r)))
                         .collect();
                     return Err(format!(
                         "unknown rule `{key}` in `simplify`, expected one of {}",
@@ -128,6 +145,40 @@ fn simplify_config(raw: Option<RawSimplify>) -> Result<SimplifyConfig, String> {
             })
         }
     }
+}
+
+/// The lint settings `lint` asks for.
+fn lint_config(raw: Option<RawLint>) -> Result<LintConfig, String> {
+    let raw = raw.unwrap_or_default();
+    let fail_on = match raw.fail_on.as_deref() {
+        None => LintSeverity::Error,
+        Some(value) => LintSeverity::from_name(value).ok_or_else(|| {
+            format!(
+                "invalid `lint.failOn` value `{value}`: expected one of `error`, `warning`, `info`"
+            )
+        })?,
+    };
+    let mut levels = BTreeMap::new();
+    for (key, value) in raw.rules {
+        let Some(rule) = LINT_RULES.iter().find(|r| camel_key(r) == key) else {
+            let keys = std::iter::once("failOn".to_owned())
+                .chain(LINT_RULES.iter().map(|r| camel_key(r)))
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "unknown rule `{key}` in `lint`, expected one of {keys}"
+            ));
+        };
+        let level = LintLevel::from_name(&value).ok_or_else(|| {
+            format!(
+                "invalid `lint.{key}` value `{value}`: expected one of `error`, `warning`, \
+                 `info`, `off`"
+            )
+        })?;
+        levels.insert((*rule).to_owned(), level);
+    }
+    Ok(LintConfig { fail_on, levels })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -332,6 +383,8 @@ pub struct Config {
     pub include: Vec<PathBuf>,
     /// The module the generated files import the runtime from.
     pub runtime: String,
+    /// The lint settings (top-level, for every database).
+    pub lint: LintConfig,
     pub databases: Vec<DatabaseConfig>,
 }
 
@@ -413,6 +466,7 @@ impl Config {
         // that reads it cannot disagree about what an entry depends on.
         let listed = typedpg_core::loader_cache::databases(text)?;
         let simplify = simplify_config(raw.simplify)?;
+        let lint = lint_config(raw.lint)?;
         let databases = match raw.databases {
             // Both maps are `BTreeMap`s parsed from the same text, so they
             // iterate in the same order.
@@ -454,6 +508,7 @@ impl Config {
             root: root.to_path_buf(),
             include,
             runtime: raw.runtime.unwrap_or_else(|| "@cubos/typedpg".to_owned()),
+            lint,
             databases,
         })
     }
@@ -702,6 +757,49 @@ mod tests {
         let err = parse(r#", "simplify": { "not_in": false }"#).unwrap_err();
         assert!(err.contains("unknown rule `not_in` in `simplify`"), "{err}");
         assert!(err.contains("`notIn`, `countExists`"), "{err}");
+    }
+
+    #[test]
+    fn lint_defaults_and_overrides() {
+        let parse = |extra: &str| {
+            Config::parse(&format!(r#"{{ "out": "db.ts"{extra} }}"#), Path::new("/p"))
+                .map(|c| c.lint.clone())
+        };
+        assert_eq!(parse("").unwrap(), LintConfig::default());
+        let lint = parse(
+            r#", "lint": { "failOn": "warning", "nullComparison": "off",
+                           "unboundedWrite": "info" }"#,
+        )
+        .unwrap();
+        assert_eq!(lint.fail_on, LintSeverity::Warning);
+        assert_eq!(lint.levels["null_comparison"], LintLevel::Off);
+        assert_eq!(lint.levels["unbounded_write"], LintLevel::Info);
+
+        let err = parse(r#", "lint": { "nullComparison": "fatal" }"#).unwrap_err();
+        assert!(
+            err.contains("invalid `lint.nullComparison` value `fatal`"),
+            "{err}"
+        );
+        let err = parse(r#", "lint": { "null_comparison": "off" }"#).unwrap_err();
+        assert!(
+            err.contains("unknown rule `null_comparison` in `lint`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("`failOn`, `nullComparison`, `unboundedWrite`"),
+            "{err}"
+        );
+        let err = parse(r#", "lint": { "failOn": "off" }"#).unwrap_err();
+        assert!(err.contains("invalid `lint.failOn` value `off`"), "{err}");
+    }
+
+    #[test]
+    fn lint_is_accepted_by_the_loader_cache() {
+        let text = r#"{ "out": "db.ts",
+                        "lint": { "failOn": "warning", "nullComparison": "off" } }"#;
+        let databases = typedpg_core::loader_cache::databases(text).unwrap();
+        assert_eq!(databases.len(), 1);
+        assert_eq!(databases[0].name, "default");
     }
 
     #[test]

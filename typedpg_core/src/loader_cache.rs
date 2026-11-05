@@ -322,6 +322,19 @@ mod tests {
         assert_eq!(dbs[0].dirs, ["migrations"]);
     }
 
+    /// The `lint` section is not part of the cache recipe: it must parse
+    /// without changing the databases the loaders see.
+    #[test]
+    fn lint_section_is_ignored() {
+        let dbs = databases(
+            r#"{ "out": "db.ts",
+                 "lint": { "failOn": "warning", "nullComparison": "off",
+                           "unboundedWrite": "info" } }"#,
+        )
+        .unwrap();
+        assert_eq!(dbs[0].dirs, ["migrations"]);
+    }
+
     #[test]
     fn databases_are_sorted_by_name() {
         let dbs = databases(

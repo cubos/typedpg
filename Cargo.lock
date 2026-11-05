@@ -3835,6 +3835,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "typedpg_lint"
+version = "0.5.0"
+dependencies = [
+ "typedpg_analyzer",
+ "typedpg_core",
+ "typedpg_pg_query",
+]
+
+[[package]]
 name = "typedpg_macros"
 version = "0.5.0"
 dependencies = [
@@ -3917,6 +3926,7 @@ dependencies = [
  "typedpg_analyzer",
  "typedpg_cli",
  "typedpg_core",
+ "typedpg_lint",
 ]
 
 [[package]]

@@ -28,6 +28,10 @@
 //!
 //! [package.metadata.typedpg.simplify]
 //! not_in = false                 # turn one query simplification off (all on by default)
+//!
+//! [package.metadata.typedpg.lint]
+//! fail_on = "warning"            # the severity `typedpg lint` fails on (default "error")
+//! null_comparison = "off"        # one rule's level: "error", "warning", "info" or "off"
 //! ```
 //!
 //! `[types]` is a single unified map from a PostgreSQL type to the Rust type
@@ -83,6 +87,9 @@ pub struct Config {
     /// `[simplify]` with `<rule> = false` one by one.
     #[serde(default)]
     simplify: SimplifySetting,
+    /// The lint rules' levels and the severity `typedpg lint` fails on.
+    #[serde(default)]
+    lint: LintSettings,
     /// Keys no field claims, rejected by [`Config::check_unknown_keys`].
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
@@ -134,6 +141,152 @@ impl SimplifySetting {
                     .collect(),
             },
         }
+    }
+}
+
+/// The lint rules' configuration keys, one per rule: the
+/// `[package.metadata.typedpg.lint]` keys (and the TypeScript CLI's `lint`
+/// object's, in camelCase).
+pub const LINT_RULES: &[&str] = &["null_comparison", "unbounded_write"];
+
+/// A lint finding's severity, ordered from least to most severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LintSeverity {
+    Info,
+    Warning,
+    #[default]
+    Error,
+}
+
+impl LintSeverity {
+    /// The severity's configuration key.
+    pub fn name(self) -> &'static str {
+        match self {
+            LintSeverity::Info => "info",
+            LintSeverity::Warning => "warning",
+            LintSeverity::Error => "error",
+        }
+    }
+
+    /// The severity named `name` (see [`LintSeverity::name`]).
+    pub fn from_name(name: &str) -> Option<LintSeverity> {
+        [
+            LintSeverity::Info,
+            LintSeverity::Warning,
+            LintSeverity::Error,
+        ]
+        .into_iter()
+        .find(|s| s.name() == name)
+    }
+}
+
+impl std::fmt::Display for LintSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A rule's configured level: a severity, or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LintLevel {
+    /// The rule never runs.
+    Off,
+    /// The rule runs and its findings have this severity.
+    #[default]
+    Error,
+    Warning,
+    Info,
+}
+
+impl LintLevel {
+    /// The level's configuration key.
+    pub fn name(self) -> &'static str {
+        match self {
+            LintLevel::Off => "off",
+            LintLevel::Error => "error",
+            LintLevel::Warning => "warning",
+            LintLevel::Info => "info",
+        }
+    }
+
+    /// The level named `name` (see [`LintLevel::name`]).
+    pub fn from_name(name: &str) -> Option<LintLevel> {
+        [
+            LintLevel::Off,
+            LintLevel::Error,
+            LintLevel::Warning,
+            LintLevel::Info,
+        ]
+        .into_iter()
+        .find(|l| l.name() == name)
+    }
+
+    /// The severity the rule's findings get, or `None` when it is off.
+    pub fn severity(self) -> Option<LintSeverity> {
+        match self {
+            LintLevel::Off => None,
+            LintLevel::Error => Some(LintSeverity::Error),
+            LintLevel::Warning => Some(LintSeverity::Warning),
+            LintLevel::Info => Some(LintSeverity::Info),
+        }
+    }
+}
+
+/// The `lint` section: the severity `typedpg lint` fails on, and each rule's
+/// level. Rules without an override use their default (in `typedpg_lint`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintConfig {
+    /// A finding at or above this severity fails the run.
+    pub fail_on: LintSeverity,
+    /// The rules whose level is overridden, keyed by [`LINT_RULES`].
+    pub levels: BTreeMap<String, LintLevel>,
+}
+
+impl Default for LintConfig {
+    fn default() -> Self {
+        Self {
+            fail_on: LintSeverity::Error,
+            levels: BTreeMap::new(),
+        }
+    }
+}
+
+/// The `[package.metadata.typedpg.lint]` table as written.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LintSettings {
+    #[serde(default)]
+    fail_on: Option<String>,
+    /// Every rule key, as written.
+    #[serde(flatten)]
+    levels: BTreeMap<String, String>,
+}
+
+impl LintSettings {
+    /// Validate and resolve the table.
+    fn resolve(&self, section: &str) -> Result<LintConfig, ConfigError> {
+        let fail_on = match self.fail_on.as_deref() {
+            None => LintSeverity::Error,
+            Some(value) => {
+                LintSeverity::from_name(value).ok_or_else(|| ConfigError::InvalidLintValue {
+                    section: section.to_owned(),
+                    key: "fail_on".to_owned(),
+                    value: value.to_owned(),
+                    expected: "`error`, `warning`, `info`".to_owned(),
+                })?
+            }
+        };
+        let mut levels = BTreeMap::new();
+        for (key, value) in &self.levels {
+            let level =
+                LintLevel::from_name(value).ok_or_else(|| ConfigError::InvalidLintValue {
+                    section: section.to_owned(),
+                    key: key.clone(),
+                    value: value.clone(),
+                    expected: "`error`, `warning`, `info`, `off`".to_owned(),
+                })?;
+            levels.insert(key.clone(), level);
+        }
+        Ok(LintConfig { fail_on, levels })
     }
 }
 
@@ -446,6 +599,13 @@ pub enum ConfigError {
         key: String,
         hint: String,
     },
+    #[error("invalid value `{value}` for `{key}` in [{section}]: expected one of {expected}")]
+    InvalidLintValue {
+        section: String,
+        key: String,
+        value: String,
+        expected: String,
+    },
     #[error("invalid qualified name in [{section}] key '{key}': {source}")]
     InvalidQualifiedName {
         section: &'static str,
@@ -502,7 +662,7 @@ impl Config {
     /// Reject keys no field reads, at every level of the configuration.
     fn check_unknown_keys(&self) -> Result<(), ConfigError> {
         const TOP: &str = "package.metadata.typedpg";
-        const TOP_KEYS: &str = "`database`, `migrations`, `types`, `databases`, `simplify`";
+        const TOP_KEYS: &str = "`database`, `migrations`, `types`, `databases`, `simplify`, `lint`";
         const DATABASE_KEYS: &str = "`migrations`, `extra_migrations`";
         reject_unknown(&self.unknown, LEGACY_TOP_LEVEL_KEYS, TOP, TOP_KEYS)?;
         if let SimplifySetting::Rules(rules) = &self.simplify
@@ -521,6 +681,25 @@ impl Config {
                 ),
             });
         }
+        let lint_section = format!("{TOP}.lint");
+        if let Some(rule) = self
+            .lint
+            .levels
+            .keys()
+            .find(|r| !LINT_RULES.contains(&r.as_str()))
+        {
+            let keys = std::iter::once("fail_on")
+                .chain(LINT_RULES.iter().copied())
+                .map(|r| format!("`{r}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ConfigError::UnknownKey {
+                section: lint_section,
+                key: rule.clone(),
+                hint: format!("expected one of {keys}"),
+            });
+        }
+        self.lint.resolve(&lint_section)?;
         reject_unknown(
             &self.database.unknown,
             LEGACY_DATABASE_KEYS,
@@ -573,6 +752,7 @@ impl Config {
                 migrations: &self.migrations,
                 types: qualify_keys(&self.types, "types")?,
                 simplify: self.simplify.resolve(),
+                lint: self.lint.resolve("package.metadata.typedpg.lint")?,
             }),
             Some(name) => {
                 let entry = self
@@ -584,6 +764,7 @@ impl Config {
                     migrations: &entry.migrations,
                     types: qualify_keys(&entry.types, "types")?,
                     simplify: self.simplify.resolve(),
+                    lint: self.lint.resolve("package.metadata.typedpg.lint")?,
                 })
             }
         }
@@ -608,6 +789,8 @@ pub struct ResolvedConfig<'a> {
     /// The query simplifications (the top-level `simplify` setting, for
     /// every database).
     pub simplify: SimplifyConfig,
+    /// The lint settings (the top-level `lint` table, for every database).
+    pub lint: LintConfig,
 }
 
 /// Parse type-mapping keys into [`QualifiedName`]s.
@@ -816,7 +999,7 @@ migrations = "./migrations"
         assert_eq!(
             parse_err("[package.metadata.typedpg.type]\nfoo = \"crate::Foo\"\n"),
             "unknown key `type` in [package.metadata.typedpg]: expected one of \
-             `database`, `migrations`, `types`, `databases`, `simplify`"
+             `database`, `migrations`, `types`, `databases`, `simplify`, `lint`"
         );
         assert_eq!(
             parse_err("[package.metadata.typedpg.database]\nmigration = \"./m\"\n"),
@@ -1271,6 +1454,65 @@ event_data = "crate::EventData"
             err.to_string()
                 .starts_with("unknown key `not_inn` in [package.metadata.typedpg.simplify]"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn lint_defaults_and_overrides() {
+        let header = "[package]\nname = \"a\"\n[package.metadata.typedpg]\n";
+        let lint = |extra: &str| {
+            Config::from_str(&format!("{header}{extra}"))
+                .unwrap()
+                .resolve(None)
+                .unwrap()
+                .lint
+        };
+        assert_eq!(lint(""), LintConfig::default());
+        let config = lint(
+            "[package.metadata.typedpg.lint]\nfail_on = \"warning\"\n\
+             null_comparison = \"off\"\nunbounded_write = \"info\"\n",
+        );
+        assert_eq!(config.fail_on, LintSeverity::Warning);
+        assert_eq!(config.levels["null_comparison"], LintLevel::Off);
+        assert_eq!(config.levels["unbounded_write"], LintLevel::Info);
+        assert_eq!(LintLevel::Off.severity(), None);
+        assert_eq!(LintLevel::Warning.severity(), Some(LintSeverity::Warning));
+    }
+
+    #[test]
+    fn lint_unknown_rule_is_rejected() {
+        let header = "[package]\nname = \"a\"\n[package.metadata.typedpg]\n";
+        let err = Config::from_str(&format!(
+            "{header}[package.metadata.typedpg.lint]\nnull_comparisions = \"off\"\n"
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown key `null_comparisions` in [package.metadata.typedpg.lint]: expected one \
+             of `fail_on`, `null_comparison`, `unbounded_write`"
+        );
+    }
+
+    #[test]
+    fn lint_bad_level_and_fail_on_are_rejected() {
+        let header = "[package]\nname = \"a\"\n[package.metadata.typedpg]\n";
+        let err = Config::from_str(&format!(
+            "{header}[package.metadata.typedpg.lint]\nnull_comparison = \"fatal\"\n"
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid value `fatal` for `null_comparison` in [package.metadata.typedpg.lint]: \
+             expected one of `error`, `warning`, `info`, `off`"
+        );
+        let err = Config::from_str(&format!(
+            "{header}[package.metadata.typedpg.lint]\nfail_on = \"off\"\n"
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid value `off` for `fail_on` in [package.metadata.typedpg.lint]: expected one \
+             of `error`, `warning`, `info`"
         );
     }
 }

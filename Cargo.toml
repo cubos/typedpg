@@ -5,6 +5,7 @@ members = [
     "typedpg_core",
     "typedpg_macros",
     "typedpg_analyzer",
+    "typedpg_lint",
     "typedpg_cli",
     "typedpg_example",
     "typedpg_e2e",

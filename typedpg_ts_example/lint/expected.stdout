@@ -1,0 +1,6 @@
+src/queries.ts:11:41: error[null_comparison]: comparison with NULL is never true
+  help: use IS NULL / IS NOT NULL
+src/writes.sql:5:1: warning[unbounded_write]: DELETE without WHERE removes every row of users
+  help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
+src/writes.sql:12:1: warning[unbounded_write]: UPDATE without WHERE changes every row of users
+  help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)

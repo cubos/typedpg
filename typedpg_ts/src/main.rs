@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -5,9 +6,10 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use typedpg::migrate::MigrationSource;
 use typedpg_cli::{MigrateAction, connect, create_migration, run_migrate_action};
+use typedpg_lint::{Finding, LintOptions};
 use typedpg_ts::cache;
 use typedpg_ts::config::{CONFIG_FILE, Config};
-use typedpg_ts::project::Project;
+use typedpg_ts::project::{Diagnostic, Project};
 use typedpg_ts::scan::LineIndex;
 use typedpg_ts::watch;
 
@@ -35,6 +37,12 @@ enum Command {
     },
     /// Fail if a generated module is out of date or a query has an error.
     Check {
+        #[arg(long, default_value = CONFIG_FILE)]
+        config: PathBuf,
+    },
+    /// Lint every query: print each finding and fail on the configured
+    /// severity.
+    Lint {
         #[arg(long, default_value = CONFIG_FILE)]
         config: PathBuf,
     },
@@ -79,6 +87,7 @@ fn main() -> ExitCode {
         } => watch::run(&config).map(|()| true),
         Command::Gen { config, .. } => generate(&config, false),
         Command::Check { config } => generate(&config, true),
+        Command::Lint { config } => lint(&config),
         Command::Build { config, json } => build(&config, json),
         Command::Serve { idle_timeout } => typedpg_ts::serve::run(idle_timeout).map(|()| true),
         Command::Migrate {
@@ -126,6 +135,79 @@ fn generate(config: &Path, check: bool) -> Result<bool, String> {
     }
     watch::print_report(&project, &report, start, "generated");
     Ok(report.diagnostics.is_empty())
+}
+
+/// A query's findings, or its analysis error and offset.
+type LintResult = Result<Vec<Finding>, (String, Option<usize>)>;
+
+/// Lint every query; whether no analysis failed and no finding reaches
+/// `fail_on`.
+fn lint(config: &Path) -> Result<bool, String> {
+    let config = Config::load(config)?;
+    let options = LintOptions::from_config(&config.lint);
+    let project = Project::new(config, true)?;
+    let root = project.config.root.clone();
+    // `(database, text)` → its findings or analysis error. The same query is
+    // often written at several call sites.
+    let mut cache: HashMap<(usize, String), LintResult> = HashMap::new();
+    let mut all: Vec<(PathBuf, typedpg_ts::scan::Position, Finding)> = Vec::new();
+    let mut broken = HashSet::new();
+    let mut queries = 0usize;
+    let mut analysis_failed = false;
+    for query in project.lint_queries() {
+        queries += 1;
+        let catalog = match project.catalog(query.db) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                analysis_failed = true;
+                if broken.insert(query.db) {
+                    let diagnostic = Diagnostic {
+                        file: project.config.databases[query.db].migrations_dir.clone(),
+                        pos: None,
+                        message: error,
+                    };
+                    eprintln!("{}", diagnostic.render(&root));
+                }
+                continue;
+            }
+        };
+        let result = cache
+            .entry((query.db, query.text.clone()))
+            .or_insert_with(|| {
+                typedpg_lint::lint_query(catalog, &query.text, &options)
+                    .map_err(|error| (error.error.to_string(), error.offset))
+            });
+        match result {
+            Ok(findings) => {
+                for finding in findings {
+                    let at = query.source.offset(finding.span.start);
+                    let pos = query.lines.position(at);
+                    all.push((query.file.to_path_buf(), pos, finding.clone()));
+                }
+            }
+            Err((message, offset)) => {
+                analysis_failed = true;
+                let pos = offset
+                    .map(|offset| query.lines.position(query.source.offset(offset)))
+                    .unwrap_or(query.pos);
+                let diagnostic = Diagnostic {
+                    file: query.file.to_path_buf(),
+                    pos: Some(pos),
+                    message: message.clone(),
+                };
+                eprintln!("{}", diagnostic.render(&root));
+            }
+        }
+    }
+
+    all.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    for (file, pos, finding) in &all {
+        let file = file.strip_prefix(&root).unwrap_or(file);
+        println!("{}", typedpg_lint::render(file, pos.line, pos.col, finding));
+    }
+    let findings: Vec<Finding> = all.into_iter().map(|(_, _, finding)| finding).collect();
+    eprintln!("{}", typedpg_lint::summary(&findings, queries));
+    Ok(!analysis_failed && !typedpg_lint::fails(&findings, &options))
 }
 
 /// Compile each .sql file without a cache entry; whether none has an

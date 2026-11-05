@@ -548,8 +548,18 @@ await sql("UPDATE users SET visits = visits + $by WHERE id = $id").execute(pool,
 npx typedpg gen            # write the generated modules
 npx typedpg gen --watch    # and keep them up to date
 npx typedpg check          # in CI: fail if a module is stale or a query has an error
+npx typedpg lint           # run the lint rules over every query
 npx typedpg build          # compile the .sql files into the loaders' cache
 ```
+
+`lint` reports two rules, `null_comparison` (a comparison with a `NULL`
+literal is never true) and `unbounded_write` (an `UPDATE` or `DELETE` with no
+`WHERE`). The `lint` object sets each rule's level — `"error"`, `"warning"`,
+`"info"` or `"off"` — and `failOn`, the severity the run fails on (default
+`"error"`). A comment in a query suppresses a rule for that query:
+`-- typedpg-lint: allow(unbounded_write)` (the `/* … */` form works too).
+Findings go to stdout, the summary to stderr, and the run exits non-zero when
+a finding reaches `failOn` or a query fails analysis.
 
 `gen` prints each error at its place in your sources, the line and column of
 the offending token inside the SQL:
@@ -874,6 +884,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 | `simplify` | The query simplifications, on by default: `false` turns them all off, or an object sets one rule to `false` — `notIn`, `countExists`, `distinct`, `unionAll`, `fkJoin`. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent: `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS` when neither side can be NULL, `count(…) > 0` as `EXISTS`, a `DISTINCT` that can't remove a row, a `UNION` whose branches can't share a row as `UNION ALL`, or a join a foreign key proves matches exactly one row none of whose columns are read. The generated module's doc comments show the SQL sent. For every database. |
+| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`) and each rule's level — `nullComparison`, `unboundedWrite` — as `"error"`, `"warning"`, `"info"` or `"off"`. For every database. |
 
 Unknown keys are errors.
 

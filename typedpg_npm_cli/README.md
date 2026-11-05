@@ -24,6 +24,7 @@ later.
 |---|---|
 | `typedpg gen [--watch]` | Generate each database's module from the queries in the sources. `--watch` keeps running, regenerating as sources and migrations change. |
 | `typedpg check` | Fail if a generated module is out of date, or a query has an error. |
+| `typedpg lint` | Run the lint rules over every query: `null_comparison` (comparing with `NULL`) and `unbounded_write` (`UPDATE`/`DELETE` without `WHERE`). Each rule's severity is configured in the `lint` object, and a `-- typedpg-lint: allow(rule)` comment suppresses one in a query. Exits non-zero when a finding reaches `lint.failOn` (default `"error"`) or a query fails analysis. |
 | `typedpg build` | Compile the `.sql` files `sql.include` names into the cache the loaders and bundler plugins read, so importing one runs no analysis. `--json` prints the outcome as JSON on stdout, which the loaders read. |
 | `typedpg serve [--idle-timeout <seconds>]` | Serve TypeScript's content mapper and the loaders over JSON-RPC on stdin/stdout. `--idle-timeout` makes it exit after that many seconds without a request; by default it does not exit. |
 | `typedpg migrate up` | Apply all pending migrations. |
@@ -32,14 +33,15 @@ later.
 | `typedpg migrate accept <name>` | Record an applied migration's edited file as applied, without running it. |
 | `typedpg migrate create <name>` | Create an empty `<timestamp>_<name>.sql` and `<timestamp>_<name>.down.sql`. It needs no database. |
 
-`gen`, `check` and `build` take `--config <path>`. `migrate` takes
+`gen`, `check`, `lint` and `build` take `--config <path>`. `migrate` takes
 `--config`, `--db <name>` (when the config has several databases) and
 `--url <url>` (the connection URL, defaulting to `DATABASE_URL`; a `.env`
 file is read). The migrate actions other than `create` need a connection.
 
 In CI, `npx typedpg check` exits non-zero when a generated module is stale,
 when a query has an error, or when a module remains for a `.sql` file that is
-gone.
+gone. `npx typedpg lint` exits non-zero when a finding reaches its configured
+`failOn` severity, or when a query fails analysis.
 
 ## Bundler plugins
 

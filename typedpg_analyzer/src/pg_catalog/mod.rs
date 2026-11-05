@@ -1246,6 +1246,34 @@ impl PgCatalog {
         self.analyze_copy_in(target).map_err(LocatedError::new)
     }
 
+    /// Analyze `sql` for a tool that reads its parse tree, without applying
+    /// the query simplifications.
+    ///
+    /// The returned [`QueryView::sql`] is the text the analyzer worked on:
+    /// named parameters rewritten to `$n`, and spreads materialized as the
+    /// sample row analysis uses. Its parse tree is [`QueryView::tree`], and
+    /// [`QueryView::original_offset`] maps an offset in that text back to
+    /// `sql` as written. [`Self::analyze`] still simplifies as before; this
+    /// is the view lint rules run over, so a rule sees the query the user
+    /// wrote rather than one a simplification rewrote.
+    pub fn query_view(&self, sql: &str) -> Result<QueryView, LocatedError> {
+        crate::diagnostic::clear_last_primary();
+        let (analysis, result) = crate::stack::with_stack(|| self.analyze_parts_here(sql, false));
+        let analyzed = result.map_err(LocatedError::new)?;
+        let tree = analysis.tree.map(|tree| tree.protobuf).ok_or_else(|| {
+            LocatedError::new(AnalyzeError::Internal(format!(
+                "the analyzed query has no parse tree: {}",
+                analysis.sql
+            )))
+        })?;
+        Ok(QueryView {
+            sql: analysis.sql,
+            tree,
+            analyzed,
+            lex: analysis.lex,
+        })
+    }
+
     /// Inner analyze that also returns the rewritten SQL handed to the
     /// static pass — used by [`Self::analyze`] to mirror the same string on
     /// PG sanity under `pg_sanity`.
@@ -1254,6 +1282,20 @@ impl PgCatalog {
     }
 
     fn analyze_with_sql_here(&self, sql: &str) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
+        let (analysis, result) = self.analyze_parts_here(sql, true);
+        (analysis.sql, result)
+    }
+
+    /// The lexing/analysis pipeline behind [`Self::analyze_with_sql_here`],
+    /// with `simplify` deciding whether the query simplifications run.
+    ///
+    /// The text, parse tree and offset map come back even when the analysis
+    /// fails, so callers can point at the same positions the error does.
+    fn analyze_parts_here(
+        &self,
+        sql: &str,
+        simplify: bool,
+    ) -> (QueryAnalysis, Result<AnalyzedQuery, AnalyzeError>) {
         // PG's wording for each lex-level failure — kept verbatim so the
         // `pg_sanity` prefix check matches. `at or near "..."` echoes a
         // snippet of the offending token; we approximate that by taking
@@ -1307,12 +1349,22 @@ impl PgCatalog {
                     spreads: Vec::new(),
                     rewrites: Vec::new(),
                 };
-                let _guard = crate::error::DiagContextGuard::install(sql, &empty_lex);
-                let position = e.position();
-                let span = crate::error::SourceSpan::one_char_at(position);
-                let message = format_lex_error_pg(&e, sql);
-                let raw = crate::error::RawError::lex(message, Some(span));
-                return (sql.to_string(), Err(raw.finalize_implicit()));
+                let error = {
+                    let _guard = crate::error::DiagContextGuard::install(sql, &empty_lex);
+                    let position = e.position();
+                    let span = crate::error::SourceSpan::one_char_at(position);
+                    let message = format_lex_error_pg(&e, sql);
+                    let raw = crate::error::RawError::lex(message, Some(span));
+                    raw.finalize_implicit()
+                };
+                return (
+                    QueryAnalysis {
+                        sql: sql.to_string(),
+                        lex: empty_lex,
+                        tree: None,
+                    },
+                    Err(error),
+                );
             }
         };
 
@@ -1336,32 +1388,61 @@ impl PgCatalog {
         // spread is materialized as a single row of placeholders, so the
         // analyzer can infer the field types from surrounding context. Its
         // offset map leads back to the original SQL like the lexer's does.
-        let sample_lex;
-        let mut sample_tree = None;
-        let analysis_lex = if lex_output.spreads.is_empty() {
-            &lex_output
+        let (analysis_lex, tree) = if lex_output.spreads.is_empty() {
+            (lex_output.clone(), None)
         } else {
-            sample_lex = build_spread_sample_sql(&lex_output);
-            let _guard = crate::error::DiagContextGuard::install(sql, &sample_lex);
-            let tree = typedpg_pg_query::parse(&sample_lex.sql).ok();
-            sample_tree = tree.clone();
-            if let Err(e) =
-                check_spread_positions(tree.as_ref().map(|t| &t.protobuf), &lex_output, &sample_lex)
-            {
-                return (sample_lex.sql.clone(), Err(e));
+            let sample_lex = build_spread_sample_sql(&lex_output);
+            let (tree, error) = {
+                let _guard = crate::error::DiagContextGuard::install(sql, &sample_lex);
+                let tree = typedpg_pg_query::parse(&sample_lex.sql).ok();
+                let error = check_spread_positions(
+                    tree.as_ref().map(|t| &t.protobuf),
+                    &lex_output,
+                    &sample_lex,
+                )
+                .err();
+                (tree, error)
+            };
+            if let Some(error) = error {
+                return (
+                    QueryAnalysis {
+                        sql: sample_lex.sql.clone(),
+                        lex: sample_lex,
+                        tree,
+                    },
+                    Err(error),
+                );
             }
-            &sample_lex
+            (sample_lex, tree)
         };
         let analysis_sql = analysis_lex.sql.clone();
+        // `analyze_static` parses the same text; this copy is what lint and
+        // other tree consumers read, and a failure here is the same parse
+        // failure that analysis reports below.
+        let tree = match tree {
+            Some(tree) => Some(tree),
+            None if !simplify => typedpg_pg_query::parse(&analysis_sql).ok(),
+            None => None,
+        };
 
         // Install the diagnostic context so that error sites deep in the
         // analyzer can render snippet + caret + hint against the original
         // SQL.
-        let (columns, mut info_params, can_run_as_subquery) = {
-            let _guard = crate::error::DiagContextGuard::install(sql, analysis_lex);
-            match analyze_static(self, &analysis_sql, &param_nullability) {
-                Ok(p) => p,
-                Err(e) => return (analysis_sql, Err(e)),
+        let result = {
+            let _guard = crate::error::DiagContextGuard::install(sql, &analysis_lex);
+            analyze_static(self, &analysis_sql, &param_nullability)
+        };
+        let (columns, mut info_params, can_run_as_subquery) = match result {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    QueryAnalysis {
+                        sql: analysis_sql,
+                        lex: analysis_lex,
+                        tree,
+                    },
+                    Err(e),
+                );
             }
         };
 
@@ -1376,7 +1457,11 @@ impl PgCatalog {
                 .sum::<usize>();
         if info_params.len() != expected_param_count {
             return (
-                analysis_sql.clone(),
+                QueryAnalysis {
+                    sql: analysis_sql.clone(),
+                    lex: analysis_lex,
+                    tree,
+                },
                 Err(AnalyzeError::Internal(format!(
                     "analyzer param count ({}) does not match lexer placeholder count ({}) \
                      for SQL: {analysis_sql}",
@@ -1394,16 +1479,30 @@ impl PgCatalog {
             }
         }
 
-        let Some(tree) = sample_tree else {
+        if lex_output.spreads.is_empty() {
             // Simplification runs only without spreads: the rewrite would
             // move their offsets.
-            let fused =
-                fuse(lex_output, columns, info_params, can_run_as_subquery).map(|mut analyzed| {
+            let fused = fuse(
+                lex_output.clone(),
+                columns,
+                info_params,
+                can_run_as_subquery,
+            )
+            .map(|mut analyzed| {
+                if simplify {
                     crate::simplify::simplify(self, &mut analyzed, &param_nullability);
-                    analyzed
-                });
-            return (analysis_sql, fused);
-        };
+                }
+                analyzed
+            });
+            return (
+                QueryAnalysis {
+                    sql: analysis_sql,
+                    lex: analysis_lex,
+                    tree,
+                },
+                fused,
+            );
+        }
         let fused = fuse(
             lex_output.clone(),
             columns.clone(),
@@ -1411,21 +1510,30 @@ impl PgCatalog {
             can_run_as_subquery,
         )
         .map(|mut analyzed| {
-            crate::resolve::prove_array_forms(
-                self,
-                &crate::resolve::Sample {
-                    lex_output: &lex_output,
-                    sample_lex: analysis_lex,
-                    tree: &tree.protobuf,
-                    nullability: &param_nullability,
-                },
-                &columns,
-                &info_params,
-                &mut analyzed,
-            );
+            if let Some(tree) = &tree {
+                crate::resolve::prove_array_forms(
+                    self,
+                    &crate::resolve::Sample {
+                        lex_output: &lex_output,
+                        sample_lex: &analysis_lex,
+                        tree: &tree.protobuf,
+                        nullability: &param_nullability,
+                    },
+                    &columns,
+                    &info_params,
+                    &mut analyzed,
+                );
+            }
             analyzed
         });
-        (analysis_sql, fused)
+        (
+            QueryAnalysis {
+                sql: analysis_sql,
+                lex: analysis_lex,
+                tree,
+            },
+            fused,
+        )
     }
 
     /// Allocate a fresh user-space OID. Returns the [`NonZeroU32`] directly so
@@ -2144,6 +2252,47 @@ fn default_languages() -> HashMap<PgLanguageOid, PgLanguage> {
 /// setting.
 fn default_search_path() -> String {
     "\"$user\", public".to_owned()
+}
+
+/// The text, parse tree and offset map [`PgCatalog::analyze_parts_here`]
+/// produced. The tree is absent only when the caller didn't need it (a
+/// plain [`PgCatalog::analyze`] without spreads).
+struct QueryAnalysis {
+    sql: String,
+    lex: crate::param::LexOutput,
+    tree: Option<typedpg_pg_query::ParseResult>,
+}
+
+/// A query as the analyzer sees it, for tools that read its parse tree.
+///
+/// Returned by [`PgCatalog::query_view`]. Offsets in [`Self::sql`] are what
+/// [`Self::tree`]'s `location` fields (and rules' spans) use;
+/// [`Self::original_offset`] maps them back to the text the user wrote.
+#[derive(Debug, Clone)]
+pub struct QueryView {
+    /// The text the analyzer worked on: `$name` parameters rewritten to
+    /// `$n`, and spreads materialized as the sample row analysis uses.
+    pub sql: String,
+    /// The parse of [`Self::sql`].
+    pub tree: typedpg_pg_query::protobuf::ParseResult,
+    /// The analysis result, before any query simplification.
+    pub analyzed: AnalyzedQuery,
+    /// The offset map from [`Self::sql`] back to the original text.
+    lex: crate::param::LexOutput,
+}
+
+impl QueryView {
+    /// The byte offset in the original query text of `offset_in_sql`, a
+    /// byte offset in [`Self::sql`].
+    pub fn original_offset(&self, offset_in_sql: usize) -> usize {
+        self.lex.original_offset(offset_in_sql)
+    }
+
+    /// [`Self::original_offset`] for a byte range.
+    pub fn original_span(&self, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let (start, end) = self.lex.original_span(span.start, span.end);
+        start..end
+    }
 }
 
 /// An [`AnalyzeError`] and where in the analyzed text it is.
