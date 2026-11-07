@@ -1,19 +1,19 @@
 error: column "nope" does not exist
-    ╭─[src/main.rs:22:24]
- 22 │     sql!(pool, "SELECT nope FROM users").fetch_all().await?;
+    ╭─[src/main.rs:26:24]
+ 26 │     sql!(pool, "SELECT nope FROM users").fetch_all().await?;
     ·                        ──┬─
     ·                          ╰─ column does not exist
     ╰────
 
 error: relation "missing" does not exist
-    ╭─[src/main.rs:24:21]
- 24 │     copy_in!(pool, "missing (id)", rows { id }).execute().await?;
+    ╭─[src/main.rs:28:21]
+ 28 │     copy_in!(pool, "missing (id)", rows { id }).execute().await?;
     ·                     ───────
     ╰────
 
 error: the SQL of sql! must be a string literal
-    ╭─[src/main.rs:27:16]
- 27 │     sql!(pool, query).fetch_all().await?;
+    ╭─[src/main.rs:31:16]
+ 31 │     sql!(pool, query).fetch_all().await?;
     ·                ─────
     ╰────
 
@@ -90,3 +90,10 @@ error[null_comparison]: comparison with NULL is never true
     ·                                                         ───────────
     ╰────
    help: use IS NULL / IS NOT NULL
+
+warning[redundant_binding]: `id = id` binds `$id` to the variable it captures without a binding
+    ╭─[src/main.rs:22:55]
+ 22 │     sql!(pool, "SELECT id FROM users WHERE id = $id", id = id)
+    ·                                                       ───────
+    ╰────
+   help: remove the binding: a parameter without one captures the variable of its name (`cargo typedpg lint --fix` removes it)

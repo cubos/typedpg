@@ -76,6 +76,7 @@ mod simplify;
 mod sql_text;
 mod stack;
 mod suggest;
+mod template;
 mod tsearch_input;
 mod types;
 mod typmod;
@@ -119,5 +120,6 @@ pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the
 /// macros' own errors (an unknown `sql!` argument name).
 pub use suggest::suggest_similar;
+pub use template::{TemplateParam, template_params};
 pub use typedpg_core::{ParseQualifiedNameError, QualifiedName};
 pub use types::{RecordField, Type};

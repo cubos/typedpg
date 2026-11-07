@@ -9,10 +9,12 @@
 //! against is the one it was compiled against. Every configured database is
 //! linted, whether or not a query names it.
 
+mod bindings;
 mod scan;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -37,6 +39,21 @@ struct Site {
     db: Option<String>,
     sql: String,
     literal: scan::Literal,
+    bindings: Vec<scan::Binding>,
+}
+
+/// A finding's fix, pending the `lint.ignore` retain and `--fix`.
+struct PendingFix {
+    /// The file the edits apply to, as scanned.
+    path: PathBuf,
+    /// The path the report shows.
+    shown: String,
+    /// The entry the fix belongs to: dropped when the retain drops it.
+    entry: Entry,
+    /// The scanned file text the edits' offsets are in.
+    scanned: String,
+    /// File byte ranges and their replacements.
+    edits: Vec<(Range<usize>, String)>,
 }
 
 /// One `copy_in!` target, with the file text its offsets are in.
@@ -71,25 +88,79 @@ type CopyResult = Result<(), AnalysisError>;
 /// With `ignore_migrations_from`, migration files identical to that git ref
 /// have their statement rules skipped; the schema rules still report on the
 /// statements that created the schema's objects.
+///
+/// With `fix`, the findings that have edits are applied to their files, and
+/// the report is built again from the fixed text so its positions match.
 pub fn run(
     manifest: &Path,
     format: Format,
     ignore_migrations_from: Option<&str>,
+    fix: bool,
 ) -> Result<bool, String> {
     let start = Instant::now();
+    let (report, options, pending) = build(manifest, ignore_migrations_from, start);
+    if !fix || pending.is_empty() {
+        return Ok(finish(&report, &options, format));
+    }
+    let outcome = apply_fixes(&pending);
+    eprintln!(
+        "fixed {} {} in {} {}",
+        outcome.fixed,
+        if outcome.fixed == 1 {
+            "finding"
+        } else {
+            "findings"
+        },
+        outcome.files,
+        if outcome.files == 1 { "file" } else { "files" }
+    );
+    // The findings' positions were in the text before the fixes; build the
+    // report from the files as they are now.
+    let (mut report, options, _) = build(manifest, ignore_migrations_from, start);
+    report.failures.extend(outcome.failures);
+    report.load_failure_sources(&manifest_dir(manifest));
+    report.sort();
+    Ok(finish(&report, &options, format))
+}
+
+/// Scan the crate and lint it, returning the report, the options it was
+/// built with, and the fixes its findings could apply.
+fn build(
+    manifest: &Path,
+    ignore_migrations_from: Option<&str>,
+    start: Instant,
+) -> (Report, LintOptions, Vec<PendingFix>) {
     let base = manifest_dir(manifest);
     let config = match Config::from_cargo_toml(manifest) {
         Ok(config) => config,
-        Err(error) => return finish_with_config_error(error, manifest, &base, start, format),
+        Err(error) => {
+            return (
+                config_error_report(error, manifest, &base, start),
+                LintOptions::default(),
+                Vec::new(),
+            );
+        }
     };
     let resolved = match config.resolve(None) {
         Ok(resolved) => resolved,
-        Err(error) => return finish_with_config_error(error, manifest, &base, start, format),
+        Err(error) => {
+            return (
+                config_error_report(error, manifest, &base, start),
+                LintOptions::default(),
+                Vec::new(),
+            );
+        }
     };
     let options = LintOptions::from_config(&resolved.lint);
     let ignore = match IgnoreSet::new(&resolved.lint.ignore) {
         Ok(ignore) => ignore,
-        Err(error) => return finish_with_config_error(error, manifest, &base, start, format),
+        Err(error) => {
+            return (
+                config_error_report(error, manifest, &base, start),
+                LintOptions::default(),
+                Vec::new(),
+            );
+        }
     };
     let Sources {
         sites,
@@ -142,10 +213,31 @@ pub fn run(
         catalogs.insert(db.clone(), catalog);
     }
 
+    let mut pending = Vec::new();
     let mut cache: HashMap<(Option<String>, String), LintResult> = HashMap::new();
     for site in &sites {
         let path = relative(&site.path, &base);
         report.sources.insert(path.clone(), site.file.clone());
+        // The binding rules read the Rust source alone: report them even
+        // when this database's catalog could not be built.
+        for binding in
+            bindings::binding_findings(&site.sql, &site.literal, &site.bindings, &options)
+        {
+            let entry = Entry {
+                path: path.clone(),
+                start: position(&site.file, binding.finding.span.start),
+                end: position(&site.file, binding.finding.span.end),
+                finding: binding.finding,
+            };
+            report.entries.push(entry.clone());
+            pending.push(PendingFix {
+                path: site.path.clone(),
+                shown: path.clone(),
+                entry,
+                scanned: site.file.clone(),
+                edits: binding.edits,
+            });
+        }
         let Ok(catalog) = catalogs.get(&site.db).expect("every database was built") else {
             continue;
         };
@@ -212,21 +304,21 @@ pub fn run(
     report
         .entries
         .retain(|entry| !ignore.is_ignored(&entry.path) || migration_paths.contains(&entry.path));
+    // A fix whose finding was dropped is not applied either.
+    pending.retain(|fix| report.entries.contains(&fix.entry));
     report.load_failure_sources(&base);
     report.sort();
     report.elapsed = start.elapsed();
-    Ok(finish(&report, &options, format))
+    (report, options, pending)
 }
 
 /// The report of a configuration that could not be read: one failure.
-fn finish_with_config_error(
+fn config_error_report(
     error: impl std::fmt::Display,
     manifest: &Path,
     base: &Path,
     start: Instant,
-    format: Format,
-) -> Result<bool, String> {
-    let options = LintOptions::default();
+) -> Report {
     let mut report = Report {
         elapsed: start.elapsed(),
         ..Report::default()
@@ -236,7 +328,99 @@ fn finish_with_config_error(
         start: None,
         message: error.to_string(),
     });
-    Ok(finish(&report, &options, format))
+    report
+}
+
+/// What applying the pending fixes changed, and the failures that kept a
+/// file from being fixed.
+struct FixOutcome {
+    /// How many findings' edits a written file received.
+    fixed: usize,
+    /// How many files were written.
+    files: usize,
+    /// Files that could not be fixed: changed while linting, or unreadable.
+    failures: Vec<Failure>,
+}
+
+/// Apply the pending fixes file by file.
+///
+/// A finding's edits are all applied or none: one overlapping an edit
+/// accepted before it is skipped. The edits are applied to the text that was
+/// scanned — never to a text read again — and a file that changed in between
+/// is left untouched rather than risk corrupting it.
+fn apply_fixes(pending: &[PendingFix]) -> FixOutcome {
+    let mut outcome = FixOutcome {
+        fixed: 0,
+        files: 0,
+        failures: Vec::new(),
+    };
+    let mut groups: Vec<(&Path, Vec<&PendingFix>)> = Vec::new();
+    for fix in pending {
+        match groups
+            .iter_mut()
+            .find(|(path, _)| *path == fix.path.as_path())
+        {
+            Some((_, fixes)) => fixes.push(fix),
+            None => groups.push((fix.path.as_path(), vec![fix])),
+        }
+    }
+    for (path, mut fixes) in groups {
+        let scanned = fixes[0].scanned.clone();
+        let shown = fixes[0].shown.clone();
+        fixes.sort_by_key(|fix| fix.edits.iter().map(|(range, _)| range.start).min());
+        let mut accepted: Vec<&PendingFix> = Vec::new();
+        let mut accepted_ranges: Vec<Range<usize>> = Vec::new();
+        for fix in fixes {
+            let overlaps = fix.edits.iter().any(|(edit, _)| {
+                accepted_ranges
+                    .iter()
+                    .any(|range| edit.start < range.end && range.start < edit.end)
+            });
+            if !overlaps {
+                accepted_ranges.extend(fix.edits.iter().map(|(range, _)| range.clone()));
+                accepted.push(fix);
+            }
+        }
+        let current = match std::fs::read_to_string(path) {
+            Ok(current) => current,
+            Err(error) => {
+                outcome.failures.push(Failure {
+                    path: shown,
+                    start: None,
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if current != scanned {
+            outcome.failures.push(Failure {
+                path: shown,
+                start: None,
+                message: "changed while linting; not fixed".to_owned(),
+            });
+            continue;
+        }
+        let mut edits: Vec<&(Range<usize>, String)> =
+            accepted.iter().flat_map(|fix| &fix.edits).collect();
+        edits.sort_by_key(|(range, _)| range.start);
+        let mut fixed = scanned.clone();
+        for (range, replacement) in edits.into_iter().rev() {
+            fixed.replace_range(range.clone(), replacement);
+        }
+        if fixed != scanned {
+            if let Err(error) = std::fs::write(path, &fixed) {
+                outcome.failures.push(Failure {
+                    path: shown,
+                    start: None,
+                    message: error.to_string(),
+                });
+                continue;
+            }
+            outcome.fixed += accepted.len();
+            outcome.files += 1;
+        }
+    }
+    outcome
 }
 
 fn finish(report: &Report, options: &LintOptions, format: Format) -> bool {
@@ -315,6 +499,7 @@ fn scan_sources(base: &Path) -> Sources {
                 db: query.db,
                 sql: query.text,
                 literal: query.literal,
+                bindings: query.bindings,
             });
         }
         for copy in scanned.copies {

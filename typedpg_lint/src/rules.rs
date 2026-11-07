@@ -28,6 +28,10 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         | Rule::TableRewrite
         | Rule::FkWithoutIndex
         | Rule::RedundantIndex
+        // The binding rules run over the Rust source of the invocation, in
+        // `typedpg_cli`, which alone sees the bindings.
+        | Rule::RedundantBinding
+        | Rule::RenamingBinding
         | Rule::InvalidAllow => Vec::new(),
     }
 }

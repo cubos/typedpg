@@ -90,6 +90,11 @@ pub enum Rule {
     FkWithoutIndex,
     /// An index another index on the table already covers.
     RedundantIndex,
+    /// A `sql!` binding whose parameter would capture the same variable
+    /// without it (`x = x`, or a bare `x`).
+    RedundantBinding,
+    /// A `sql!` binding that only renames a variable (`p = v`).
+    RenamingBinding,
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
@@ -97,7 +102,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 9] = [
+    pub const ALL: [Rule; 11] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -107,6 +112,8 @@ impl Rule {
         Rule::TableRewrite,
         Rule::FkWithoutIndex,
         Rule::RedundantIndex,
+        Rule::RedundantBinding,
+        Rule::RenamingBinding,
     ];
 
     /// The rule's configuration key (`[package.metadata.typedpg.lint]`, and
@@ -122,6 +129,8 @@ impl Rule {
             Rule::TableRewrite => "table_rewrite",
             Rule::FkWithoutIndex => "fk_without_index",
             Rule::RedundantIndex => "redundant_index",
+            Rule::RedundantBinding => "redundant_binding",
+            Rule::RenamingBinding => "renaming_binding",
             Rule::InvalidAllow => "invalid_allow",
         }
     }
@@ -148,6 +157,8 @@ impl Rule {
             Rule::TableRewrite => "ALTER TABLE that rewrites every row under a lock",
             Rule::FkWithoutIndex => "a foreign key whose referencing columns have no index",
             Rule::RedundantIndex => "an index another index on the table already covers",
+            Rule::RedundantBinding => "a `sql!` binding the parameter would capture without it",
+            Rule::RenamingBinding => "a `sql!` binding that only renames a variable",
             Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
         }
     }
@@ -161,8 +172,9 @@ impl Rule {
             | Rule::ConstraintValidating
             | Rule::SetNotNullScan
             | Rule::TableRewrite
-            | Rule::FkWithoutIndex => Severity::Warning,
-            Rule::RedundantIndex => Severity::Info,
+            | Rule::FkWithoutIndex
+            | Rule::RedundantBinding => Severity::Warning,
+            Rule::RedundantIndex | Rule::RenamingBinding => Severity::Info,
         }
     }
 }
@@ -425,6 +437,16 @@ fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
     (suppressed, errors)
 }
 
+/// The rules the `typedpg-lint: allow(...)` comments of `sql` suppress.
+///
+/// A `sql!` template's binding rules run over its Rust source, outside
+/// [`lint_query`], so the CLI reads the template's own allow comments
+/// through this. Unknown names are not reported here: the query analysis
+/// reports them as [`Rule::InvalidAllow`].
+pub fn allowed_rules(sql: &str) -> HashSet<Rule> {
+    suppressions(sql).0
+}
+
 /// What a comment says to the linter.
 enum AllowComment {
     /// Not a `typedpg-lint:` comment.
@@ -491,7 +513,7 @@ pub fn render(path: &Path, line: u32, column: u32, finding: &Finding) -> String 
 mod tests {
     use super::*;
     use typedpg_analyzer::PgCatalog;
-    use typedpg_core::config::{LINT_RULES, LintLevel, LintSeverity};
+    use typedpg_core::config::{LINT_RULES, LintLevel, LintSeverity, RUST_LINT_RULES};
 
     fn catalog() -> PgCatalog {
         let mut catalog = PgCatalog::new().unwrap();
@@ -533,7 +555,8 @@ mod tests {
     #[test]
     fn config_rule_names_match_the_lint_crate() {
         let names: Vec<&str> = Rule::ALL.iter().map(|rule| rule.name()).collect();
-        assert_eq!(names, LINT_RULES);
+        let expected: Vec<&str> = LINT_RULES.iter().chain(RUST_LINT_RULES).copied().collect();
+        assert_eq!(names, expected);
     }
 
     // ── null_comparison: positive shapes ───────────────────────────────────
@@ -774,6 +797,15 @@ mod tests {
             let findings = lint(&db, sql);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
         }
+    }
+
+    #[test]
+    fn allowed_rules_reads_the_allow_comments() {
+        assert_eq!(
+            allowed_rules("-- typedpg-lint: allow(redundant_binding, renaming_binding)\nSELECT 1"),
+            HashSet::from([Rule::RedundantBinding, Rule::RenamingBinding])
+        );
+        assert!(allowed_rules("SELECT 1").is_empty());
     }
 
     #[test]
@@ -1739,10 +1771,9 @@ mod tests {
 
     #[test]
     fn migration_rule_names_and_defaults() {
-        assert_eq!(
-            Rule::ALL.iter().map(|rule| rule.name()).collect::<Vec<_>>(),
-            LINT_RULES
-        );
+        let names: Vec<&str> = Rule::ALL.iter().map(|rule| rule.name()).collect();
+        let expected: Vec<&str> = LINT_RULES.iter().chain(RUST_LINT_RULES).copied().collect();
+        assert_eq!(names, expected);
         for (rule, severity) in [
             (Rule::NotInNullable, Severity::Warning),
             (Rule::CreateIndexBlocking, Severity::Warning),

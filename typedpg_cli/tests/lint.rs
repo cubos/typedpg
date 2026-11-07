@@ -95,7 +95,7 @@ fn lint_ignores_migrations_unchanged_from_a_ref() {
     assert!(stdout.contains("tests/ignored.rs:9:24"), "{stdout}");
     assert!(
         stderr.contains(
-            "checked 10 queries and 4 migrations (4 unchanged from HEAD: statement rules skipped)"
+            "checked 11 queries and 4 migrations (4 unchanged from HEAD: statement rules skipped)"
         ),
         "{stderr}"
     );
@@ -167,6 +167,75 @@ ignore = ["migrations/0002_hazards.sql"]
         ),
         "{stdout}"
     );
+}
+
+#[test]
+fn lint_fix_rewrites_the_binding_rules() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = crate_dir.join("tests/lint_fixture");
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&fixture, dir.path());
+    // The fixture's own source also has a binding the fix would rewrite;
+    // this test isolates the two in the file it writes.
+    std::fs::remove_file(dir.path().join("src/main.rs")).unwrap();
+    let source = r#"//! The binding rules' fix, end to end.
+
+use typedpg::sql;
+
+pub async fn insert(tx: &typedpg::Transaction<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    sql!(
+        tx,
+        "INSERT INTO users (id, name) \
+         VALUES ($id, $name) \
+         ON CONFLICT (id) DO UPDATE \
+            SET name = EXCLUDED.name",
+        id = id,
+        name = next,
+    )
+    .execute()
+    .await?;
+    Ok(())
+}
+"#;
+    let path = dir.path().join("src/bindings.rs");
+    std::fs::write(&path, source).unwrap();
+    let manifest = dir.path().join("Cargo.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--fix", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .expect("run `cargo-typedpg`");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixed 2 findings in 1 file"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"//! The binding rules' fix, end to end.
+
+use typedpg::sql;
+
+pub async fn insert(tx: &typedpg::Transaction<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    sql!(
+        tx,
+        "INSERT INTO users (id, name) \
+         VALUES ($id, $next) \
+         ON CONFLICT (id) DO UPDATE \
+            SET name = EXCLUDED.name",
+    )
+    .execute()
+    .await?;
+    Ok(())
+}
+"#
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--manifest-path"])
+        .arg(&manifest)
+        .output()
+        .expect("run `cargo-typedpg`");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert!(!stdout.contains("redundant_binding"), "{stdout}");
+    assert!(!stdout.contains("renaming_binding"), "{stdout}");
 }
 
 #[test]

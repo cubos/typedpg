@@ -47,6 +47,11 @@ enum Commands {
         /// statements that created their objects.
         #[arg(long)]
         ignore_migrations_from: Option<String>,
+        /// Apply the fixes of the findings that have one
+        /// (`redundant_binding`, `renaming_binding`), then report what
+        /// remains.
+        #[arg(long)]
+        fix: bool,
     },
 }
 
@@ -77,9 +82,14 @@ async fn run(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             manifest_path,
             format,
             ignore_migrations_from,
+            fix,
         } => {
-            match typedpg_cli::lint::run(&manifest_path, format, ignore_migrations_from.as_deref())
-            {
+            match typedpg_cli::lint::run(
+                &manifest_path,
+                format,
+                ignore_migrations_from.as_deref(),
+                fix,
+            ) {
                 Ok(ok) => Ok(ok),
                 Err(e) => {
                     eprintln!("error: {e}");
