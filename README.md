@@ -112,6 +112,11 @@ and lints the migrations themselves:
 | `table_rewrite` | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
 | `fk_without_index` | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
 | `redundant_index` | info | An index another index on the table already covers. |
+| `redundant_binding` | warning | A `sql!` binding `x = x` (or a bare `x`): the parameter captures the variable without it. |
+| `renaming_binding` | info | A `sql!` binding `p = v` that only renames the variable `v`; write `$v` in the SQL instead. |
+
+The last two rules are about a `sql!` invocation's binding arguments, not the
+SQL text; the TypeScript CLI has no bindings and does not have them.
 
 The `lint` table sets each rule's level (`"error"`, `"warning"`, `"info"` or
 `"off"`) and `fail_on`, the severity the run fails on (default `"error"`):
@@ -134,6 +139,11 @@ compile still fails lint, as it still fails the build.
 
 A comment suppresses a rule for the query or migration statement it is in:
 `-- typedpg-lint: allow(unbounded_write)` (the `/* … */` form works too).
+
+`--fix` applies the fixes of the findings that have one (`redundant_binding`
+and `renaming_binding`): it deletes the binding — and, for a rename, rewrites
+every `$p` of the SQL literal to `$v` — writes the files, then reports what
+remains.
 
 Migrations already applied in production cannot be changed, so `cargo typedpg
 lint --ignore-migrations-from <ref>` (for example `origin/main`) skips the

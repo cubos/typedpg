@@ -18,6 +18,10 @@ pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>>
     sql!(db = other, pool, "SELECT id FROM things WHERE name = NULL").fetch_all().await?;
     // The clean spelling.
     sql!(pool, "SELECT id FROM users WHERE email IS NULL").fetch_all().await?;
+    // A binding the parameter captures without it.
+    sql!(pool, "SELECT id FROM users WHERE id = $id", id = id)
+        .fetch_all()
+        .await?;
     // An analysis error: there is no such column.
     sql!(pool, "SELECT nope FROM users").fetch_all().await?;
     // A COPY target that does not analyze: there is no such table.

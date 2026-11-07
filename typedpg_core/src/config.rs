@@ -41,6 +41,10 @@
 //! `constraint_validating`, `set_not_null_scan` and `table_rewrite`; and the
 //! schema rules `fk_without_index` and `redundant_index`, evaluated over the
 //! migrations' final schema. [`LINT_RULES`] is the one list of their keys.
+//! The `sql!` binding rules `redundant_binding` and `renaming_binding`
+//! ([`RUST_LINT_RULES`]) run over the Rust source of the invocations, so only
+//! `cargo typedpg lint` reports them, and only this configuration accepts
+//! their keys — the TypeScript CLI has no bindings.
 //! `ignore` lists glob patterns, relative to the manifest's directory. A
 //! matching query file's findings are not reported; a matching migration
 //! file keeps its schema findings (`fk_without_index`, `redundant_index`),
@@ -172,6 +176,14 @@ pub const LINT_RULES: &[&str] = &[
     "fk_without_index",
     "redundant_index",
 ];
+
+/// The lint rules over the Rust source of `sql!` invocations: a binding the
+/// parameter would capture without, and one that only renames a variable.
+///
+/// `cargo typedpg lint` reports them; the TypeScript CLI has no bindings and
+/// keeps rejecting them, so they are accepted only in
+/// `[package.metadata.typedpg.lint]`.
+pub const RUST_LINT_RULES: &[&str] = &["redundant_binding", "renaming_binding"];
 
 /// The types whose default Rust types can't hold `infinity` / `-infinity`
 /// (chrono's `NaiveDate`, `NaiveDateTime` and `DateTime<Utc>`, which
@@ -728,15 +740,15 @@ impl Config {
             });
         }
         let lint_section = format!("{TOP}.lint");
-        if let Some(rule) = self
-            .lint
-            .levels
-            .keys()
-            .find(|r| !LINT_RULES.contains(&r.as_str()))
+        if let Some(rule) =
+            self.lint.levels.keys().find(|r| {
+                !LINT_RULES.contains(&r.as_str()) && !RUST_LINT_RULES.contains(&r.as_str())
+            })
         {
             let keys = std::iter::once("fail_on")
                 .chain(std::iter::once("ignore"))
                 .chain(LINT_RULES.iter().copied())
+                .chain(RUST_LINT_RULES.iter().copied())
                 .map(|r| format!("`{r}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1595,7 +1607,8 @@ event_data = "crate::EventData"
             "unknown key `null_comparisions` in [package.metadata.typedpg.lint]: expected one \
              of `fail_on`, `ignore`, `null_comparison`, `unbounded_write`, `not_in_nullable`, \
              `create_index_blocking`, `constraint_validating`, `set_not_null_scan`, \
-             `table_rewrite`, `fk_without_index`, `redundant_index`"
+             `table_rewrite`, `fk_without_index`, `redundant_index`, `redundant_binding`, \
+             `renaming_binding`"
         );
     }
 
