@@ -470,12 +470,69 @@ pub fn lint_query(
         for edit in &mut finding.fix {
             edit.range = view.original_span(edit.range.clone());
         }
+        if !finding.fix.is_empty() && !fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix) {
+            finding.fix.clear();
+        }
     }
     // A deterministic order within a query: by position, then rule.
     findings.sort_by(|a, b| {
         (a.span.start, a.span.end, a.rule).cmp(&(b.span.start, b.span.end, b.rule))
     });
     Ok(findings)
+}
+
+/// Whether `sql` with `fix` applied still analyzes to the same query shape
+/// as `original`: the same output columns (name, type, nullability), the
+/// same parameters (name, type, nullability) and the same embeddability.
+///
+/// A safety net under every rule's own proof that its fix keeps the query's
+/// meaning: a fix that renames a column, changes a type or breaks the query
+/// is dropped (the finding stays). It can't see a change in the rows
+/// themselves; that stays each rule's proof to make.
+fn fix_keeps_shape(
+    catalog: &PgCatalog,
+    sql: &str,
+    original: &typedpg_analyzer::AnalyzedQuery,
+    fix: &[SqlEdit],
+) -> bool {
+    let Some(edited) = apply_edits(sql, fix) else {
+        return false;
+    };
+    let Ok(analyzed) = catalog.analyze(&edited) else {
+        return false;
+    };
+    analyzed.can_run_as_subquery == original.can_run_as_subquery
+        && analyzed.columns.len() == original.columns.len()
+        && analyzed
+            .columns
+            .iter()
+            .zip(&original.columns)
+            .all(|(a, b)| a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable)
+        && analyzed.params.len() == original.params.len()
+        && analyzed
+            .params
+            .iter()
+            .zip(&original.params)
+            .all(|(a, b)| a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable)
+}
+
+/// `text` with `edits` applied, or `None` when they overlap or fall outside
+/// it.
+fn apply_edits(text: &str, edits: &[SqlEdit]) -> Option<String> {
+    let mut edits: Vec<&SqlEdit> = edits.iter().collect();
+    edits.sort_by_key(|edit| edit.range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for edit in edits {
+        if edit.range.start < at || edit.range.end < edit.range.start {
+            return None;
+        }
+        out.push_str(text.get(at..edit.range.start)?);
+        out.push_str(&edit.text);
+        at = edit.range.end;
+    }
+    out.push_str(text.get(at..)?);
+    Some(out)
 }
 
 /// Whether any finding is at or above the configured `fail_on` severity.
@@ -658,6 +715,87 @@ mod tests {
 
     fn lint(catalog: &PgCatalog, sql: &str) -> Vec<Finding> {
         lint_query(catalog, sql, &LintOptions::default()).unwrap()
+    }
+
+    /// Whether deleting `remove` (each a substring of `sql`, found from the
+    /// left) keeps the query's shape.
+    fn keeps_shape(catalog: &PgCatalog, sql: &str, remove: &[&str]) -> bool {
+        let original = catalog.analyze(sql).unwrap();
+        let fix: Vec<SqlEdit> = remove
+            .iter()
+            .map(|part| {
+                let start = sql.find(part).unwrap();
+                SqlEdit {
+                    range: start..start + part.len(),
+                    text: String::new(),
+                }
+            })
+            .collect();
+        fix_keeps_shape(catalog, sql, &original, &fix)
+    }
+
+    #[test]
+    fn a_fix_keeping_the_shape_is_kept() {
+        let db = catalog();
+        assert!(keeps_shape(
+            &db,
+            "SELECT DISTINCT id FROM users WHERE id = $id",
+            &["DISTINCT "]
+        ));
+        assert!(keeps_shape(
+            &db,
+            "SELECT id FROM users WHERE id = $id LIMIT 1",
+            &[" LIMIT 1"]
+        ));
+    }
+
+    #[test]
+    fn a_fix_changing_the_shape_is_dropped() {
+        let db = catalog();
+        // The implicit column name `coalesce` would become `id`.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT COALESCE(id, 0) FROM users",
+            &["COALESCE(", ", 0)"]
+        ));
+        // The bigint result would become integer.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT COALESCE(id, 0::int8) AS v FROM users",
+            &["COALESCE(", ", 0::int8)"]
+        ));
+        // Nullability: name may be NULL, the COALESCE never is.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT COALESCE(name, '') AS v FROM users",
+            &["COALESCE(", ", '')"]
+        ));
+        // A parameter's type.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT id FROM users WHERE id = $id::int8",
+            &["::int8"]
+        ));
+        // A broken query.
+        assert!(!keeps_shape(&db, "SELECT id FROM users", &["FROM "]));
+        // Overlapping edits.
+        let original = db.analyze("SELECT id FROM users").unwrap();
+        let overlapping = [
+            SqlEdit {
+                range: 0..8,
+                text: String::new(),
+            },
+            SqlEdit {
+                range: 4..10,
+                text: String::new(),
+            },
+        ];
+        assert!(!fix_keeps_shape(
+            &db,
+            "SELECT id FROM users",
+            &original,
+            &overlapping
+        ));
     }
 
     fn options(level: Option<Severity>, fail_on: Option<Severity>) -> LintOptions {
