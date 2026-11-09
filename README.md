@@ -873,7 +873,7 @@ cargo typedpg migrate down --force
 cargo typedpg migrate accept 20260406120000_add_posts_table
 ```
 
-The CLI reads configuration from `[package.metadata.typedpg]` in your `Cargo.toml` and connects using the `DATABASE_URL` environment variable (supports `.env` files).
+The CLI reads configuration from `[package.metadata.typedpg]` in your `Cargo.toml` and connects using the `DATABASE_URL` environment variable (supports `.env` files; a variable already set in the environment wins over the file).
 
 Editing an applied migration's statements is drift: with `fail_on_drift` (the
 default) the run aborts before applying anything new, and prints a unified diff

@@ -41,6 +41,43 @@ pub enum MigrateAction {
     },
 }
 
+/// Read `.env` (found from the working directory up) into the environment.
+///
+/// A variable already set wins over the file: `DATABASE_URL=… typedpg
+/// migrate up` runs against that URL whatever `.env` says. Within the file,
+/// the last line setting a variable wins, as when a shell sources it.
+pub fn load_dotenv() {
+    let Ok(entries) = dotenvy::dotenv_iter() else {
+        return;
+    };
+    let entries: Vec<(String, String)> = entries.map_while(Result::ok).collect();
+    let is_set = |key: &str| std::env::var_os(key).is_some();
+    for (key, value) in dotenv_vars(entries, is_set) {
+        // SAFETY: both CLIs call this before spawning any thread (the tokio
+        // runtime included), so nothing reads the environment meanwhile.
+        unsafe { std::env::set_var(key, value) };
+    }
+}
+
+/// The variables `.env`'s `entries` set: the last value of each, leaving out
+/// those `is_set` says the environment already has.
+fn dotenv_vars(
+    entries: impl IntoIterator<Item = (String, String)>,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for (key, value) in entries {
+        if is_set(&key) {
+            continue;
+        }
+        match vars.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = value,
+            None => vars.push((key, value)),
+        }
+    }
+    vars
+}
+
 /// Write an empty `<timestamp>_<name>.sql` and its `.down.sql` in `dir`;
 /// returns the two paths.
 ///
@@ -423,6 +460,30 @@ pub async fn run_migrate_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn dotenv_last_line_wins_and_the_environment_wins_over_it() {
+        let entries = pairs(&[
+            ("DATABASE_URL", "postgres://dev"),
+            ("OTHER", "1"),
+            ("DATABASE_URL", "postgres://prd"),
+        ]);
+        assert_eq!(
+            dotenv_vars(entries.clone(), |_| false),
+            pairs(&[("DATABASE_URL", "postgres://prd"), ("OTHER", "1")])
+        );
+        assert_eq!(
+            dotenv_vars(entries, |key| key == "DATABASE_URL"),
+            pairs(&[("OTHER", "1")])
+        );
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
