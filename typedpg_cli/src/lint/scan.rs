@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{Span, TokenStream, TokenTree};
 use syn::PathArguments;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
@@ -36,8 +36,8 @@ pub(crate) struct FoundQuery {
     /// How many uses of the query the scan saw, method calls included.
     pub uses: usize,
     /// Whether a use is not a method call the scan recognized (`f(q)`,
-    /// `&q`, a reassignment, …). `unused_returning` stays quiet then: the
-    /// query may be used in a way the calls do not show.
+    /// `&q`, `my_macro!(q)`, a reassignment, …). `unused_returning` stays
+    /// quiet then: the query may be used in a way the calls do not show.
     pub escapes: bool,
 }
 
@@ -296,7 +296,7 @@ impl Finder<'_> {
             let Some(&index) = self.queries.get(&start) else {
                 continue;
             };
-            let uses = binding_uses(self.text, &name, &block.stmts[position + 1..]);
+            let uses = binding_uses(self.text, &name, start, &block.stmts[position + 1..]);
             let query = &mut self.scan.queries[index];
             query.calls.extend(uses.calls);
             query.uses += uses.uses;
@@ -371,11 +371,13 @@ struct Uses {
 
 /// Walk `statements` (the rest of the block after `let name = sql!(…)`) and
 /// collect the calls on `name`, stopping at a shadowing binding or a
-/// reassignment.
-fn binding_uses(text: &str, name: &str, statements: &[Stmt]) -> Uses {
+/// reassignment. `own` is the start of the binding's own `sql!` path: it is
+/// not a use of the binding.
+fn binding_uses(text: &str, name: &str, own: usize, statements: &[Stmt]) -> Uses {
     let mut finder = BindingUses {
         text,
         name,
+        own,
         uses: Uses::default(),
         stop: false,
     };
@@ -391,6 +393,8 @@ fn binding_uses(text: &str, name: &str, statements: &[Stmt]) -> Uses {
 struct BindingUses<'a> {
     text: &'a str,
     name: &'a str,
+    /// The start offset of the `sql!` path that produced the binding.
+    own: usize,
     uses: Uses,
     /// A shadowing binding or a reassignment was seen: the rest of this
     /// block is about another value.
@@ -469,6 +473,33 @@ impl<'ast> Visit<'ast> for BindingUses<'_> {
             _ => syn::visit::visit_expr(self, expr),
         }
     }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        if self.stop {
+            return;
+        }
+        // syn does not parse a macro's tokens, so a macro that names the
+        // binding may pass it anywhere — `println!("{}", id!(q))`,
+        // `my_macro!(q);`, even a nested item's invocation. Treat it as an
+        // escape: the calls the scan sees may not be the only uses. The
+        // binding's own `sql!` is not a use of it.
+        if span_offset(self.text, mac.path.span()) != self.own
+            && mentions_ident(&mac.tokens, self.name)
+        {
+            self.uses.uses += 1;
+            self.uses.escapes = true;
+        }
+    }
+}
+
+/// Whether `tokens` contains `name` as an identifier anywhere, through
+/// nested delimiter groups.
+fn mentions_ident(tokens: &TokenStream, name: &str) -> bool {
+    tokens.clone().into_iter().any(|token| match token {
+        TokenTree::Ident(ident) => ident == name,
+        TokenTree::Group(group) => mentions_ident(&group.stream(), name),
+        TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+    })
 }
 
 /// The `sql!` macro expression `expr` is, through parentheses and the
@@ -1176,6 +1207,72 @@ fn main() {
         assert_eq!(query.calls.len(), 1);
         assert_eq!(query.uses, 2);
         assert!(query.escapes);
+    }
+
+    #[test]
+    fn a_macro_that_mentions_the_binding_is_an_escape() {
+        // The reviewer's shape: one branch executes the query, the other
+        // hands it to a macro whose tokens syn does not parse.
+        let source = r#"fn main() {
+    let q = sql!(pool, "INSERT INTO users (id) VALUES (1) RETURNING id");
+    if cond {
+        q.execute().await?;
+    } else {
+        println!("{}", fetch_id!(q));
+    }
+}"#;
+        let query = &queries(source)[0];
+        let methods: Vec<&str> = query
+            .calls
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect();
+        assert_eq!(methods, ["execute"]);
+        assert_eq!(query.uses, 2);
+        assert!(query.escapes);
+    }
+
+    #[test]
+    fn a_macro_mentioning_the_binding_escapes_in_every_position() {
+        for source in [
+            // A macro statement, with the name inside a nested group.
+            r#"fn main() {
+    let q = sql!(pool, "SELECT 1");
+    q.execute().await?;
+    println!("{}", fetch_id!(q));
+}"#,
+            // A macro expression.
+            r#"fn main() {
+    let q = sql!(pool, "SELECT 1");
+    q.execute().await?;
+    let _ = my_macro!(q);
+}"#,
+            // An invocation inside a nested item.
+            r#"fn main() {
+    let q = sql!(pool, "SELECT 1");
+    q.execute().await?;
+    fn nested() { my_macro! { q } }
+}"#,
+        ] {
+            let query = &queries(source)[0];
+            assert!(query.escapes, "{source}");
+            assert_eq!(query.uses, 2, "{source}");
+            assert_eq!(query.calls.len(), 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_macro_without_the_binding_is_not_a_use() {
+        let source = r#"fn main() {
+    let q = sql!(pool, "SELECT 1");
+    q.execute().await?;
+    println!("{}", fetch_id!(other));
+    my_macro!(maybe(q2));
+}"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.calls.len(), 1);
+        assert_eq!(query.uses, 1);
+        assert!(!query.escapes);
     }
 
     #[test]

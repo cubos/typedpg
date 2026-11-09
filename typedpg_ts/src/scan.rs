@@ -1377,6 +1377,33 @@ consume(q);
     }
 
     #[test]
+    fn a_tagged_template_and_a_call_with_the_binding_are_escapes() {
+        // Both are references (not static member calls) to a local query:
+        // the query may be used inside the template or the call in a way the
+        // calls do not show, so `unused_returning` must stay quiet.
+        for source in [
+            r#"
+import { sql } from './db';
+const q = sql('INSERT INTO users (id) VALUES ($1) RETURNING id');
+q.execute(pool);
+tag`${q}`;
+"#,
+            r#"
+import { sql } from './db';
+const q = sql('INSERT INTO users (id) VALUES ($1) RETURNING id');
+q.execute(pool);
+someFn(q);
+"#,
+        ] {
+            let s = run(source);
+            assert_eq!(s.queries.len(), 1, "{source}");
+            assert_eq!(s.queries[0].calls.len(), 1, "{source}");
+            assert_eq!(s.queries[0].uses, 2, "{source}");
+            assert!(s.queries[0].escapes, "{source}");
+        }
+    }
+
+    #[test]
     fn exported_queries_record_their_export_names() {
         let s = run(r#"
 import { sql } from './db';

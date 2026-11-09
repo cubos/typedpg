@@ -476,6 +476,67 @@ pub async fn run(pool: &typedpg::Pool, cond: bool) -> Result<(), Box<dyn std::er
 }
 
 #[test]
+fn a_macro_that_mentions_a_bound_query_does_not_report_its_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "macro_call_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TABLE users (id integer PRIMARY KEY, name text);\n",
+    )
+    .unwrap();
+    // The other branch hands the query to a macro, whose tokens the scan
+    // cannot see into: the RETURNING may be needed there.
+    std::fs::write(
+        root.join("src/main.rs"),
+        r#"//! A macro hides a use of the bound query.
+use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool, cond: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let query = sql!(
+        pool,
+        "INSERT INTO users (id, name) VALUES ($id, $name) RETURNING id",
+        id = &id,
+        name = &name,
+    );
+    if cond {
+        query.execute().await?;
+    } else {
+        println!("{}", fetch_id!(query));
+    }
+    Ok(())
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .output()
+        .expect("run `cargo-typedpg`");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}\n{stdout}");
+    assert!(!stdout.contains("unused_returning"), "{stdout}");
+}
+
+#[test]
 fn lint_fixture_reports_the_expected_documents() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture = crate_dir.join("tests/lint_fixture");

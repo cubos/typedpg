@@ -9,7 +9,6 @@
 //! places, with different methods — while a fix edits the analyzed SQL text.
 
 use typedpg_analyzer::statement_at_most_one_row;
-use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::RawStmt;
 use typedpg_pg_query::protobuf::node::Node;
 
@@ -99,10 +98,13 @@ fn fetch_all_single_row(call: &Call) -> RawFinding {
 ///
 /// Reported only when every call is an `execute()`: the caller leaves a
 /// query that may escape (be exported, passed to another function, …) out of
-/// `calls`. The fix deletes the clause, unless the returning list calls a
-/// function or contains a sublink: removing the call could change what the
-/// statement observes or does, so that one is reported only. The fix is
-/// offered only when the query has exactly one call, the one `execute()`.
+/// `calls`. The fix deletes the clause only when every returning target is a
+/// plain column reference (`id`, `t.id`, `*`, `t.*`) or a plain constant (an
+/// `A_Const`, with no cast): anything else — an operator, a cast, a CASE, a
+/// function call, a sublink, a row constructor, … — can raise an error when
+/// evaluated, so removing it could change what the statement does and it is
+/// reported without a fix. The fix is offered only when the query has exactly
+/// one call, the one `execute()`.
 fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     if calls.is_empty() || calls.iter().any(|call| call.method != CallMethod::Execute) {
         return Vec::new();
@@ -126,7 +128,7 @@ fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     let Some((keyword, end)) = returning_span(ctx, raw) else {
         return Vec::new();
     };
-    let fix = if calls.len() == 1 && !returning.exprs.iter().any(contains_call_or_subquery) {
+    let fix = if calls.len() == 1 && returning.exprs.iter().all(is_plain_returning_target) {
         vec![SqlEdit {
             range: whitespace_start(ctx.sql, keyword)..end,
             text: String::new(),
@@ -209,19 +211,22 @@ fn whitespace_start(sql: &str, at: usize) -> usize {
     start
 }
 
-/// Whether the expression calls a function or contains a sublink anywhere.
-fn contains_call_or_subquery(node: &typedpg_pg_query::protobuf::Node) -> bool {
-    let Some(inner) = node.node.as_ref() else {
+/// Whether `node` is a returning target whose evaluation cannot raise: a
+/// plain column reference (`id`, `t.id`, `*`, `t.*`) or a plain constant (an
+/// `A_Const`, with no cast). Everything else can raise an error at execution
+/// — an operator, a cast, a CASE, a function call, a sublink, a row
+/// constructor, … — so deleting it from a `RETURNING` the caller discards
+/// could still change what the statement does.
+///
+/// A returning target is a `ResTarget`; its `val` is the expression.
+fn is_plain_returning_target(node: &typedpg_pg_query::protobuf::Node) -> bool {
+    let Some(Node::ResTarget(target)) = node.node.as_ref() else {
         return false;
     };
-    let mut stack = vec![inner.to_ref()];
-    while let Some(node) = stack.pop() {
-        match node {
-            NodeRef::FuncCall(_) | NodeRef::SubLink(_) => return true,
-            _ => stack.extend(node.children()),
-        }
-    }
-    false
+    matches!(
+        target.val.as_deref().and_then(|val| val.node.as_ref()),
+        Some(Node::ColumnRef(_) | Node::AConst(_))
+    )
 }
 
 #[cfg(test)]
@@ -470,6 +475,48 @@ mod tests {
             "{:?}",
             findings[0].finding.fix
         );
+    }
+
+    #[test]
+    fn execute_on_a_returning_star_reports_and_fixes() {
+        let db = catalog();
+        for sql in [
+            "UPDATE users SET name = 'x' WHERE id = 1 RETURNING *",
+            "UPDATE users SET name = 'x' WHERE id = 1 RETURNING users.*",
+        ] {
+            let findings = only(
+                lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+                Rule::UnusedReturning,
+            );
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            let expected = sql.split(" RETURNING").next().unwrap();
+            assert_eq!(fixed(sql, &findings[0].finding), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn execute_on_a_returning_value_that_can_raise_reports_without_a_fix() {
+        let db = catalog();
+        for sql in [
+            // An operator: division by zero aborts the statement (and a
+            // transaction) even though the caller discards the row.
+            "UPDATE users SET name = 'x' WHERE id = 1 RETURNING 1 / id",
+            // A cast can raise.
+            "UPDATE users SET name = 'x' WHERE id = 1 RETURNING id::text",
+            // A function call can raise.
+            "UPDATE users SET name = 'x' WHERE id = 1 RETURNING lower(name)",
+        ] {
+            let findings = only(
+                lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+                Rule::UnusedReturning,
+            );
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(
+                findings[0].finding.fix.is_empty(),
+                "{sql}: {:?}",
+                findings[0].finding.fix
+            );
+        }
     }
 
     #[test]
