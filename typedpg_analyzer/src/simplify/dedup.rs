@@ -555,7 +555,7 @@ impl<'a> Scope<'a> {
         ctes: &HashSet<String>,
         from: &'a [protobuf::Node],
     ) -> Option<Scope<'a>> {
-        Self::build_env(ctx, &CteEnv::blocked(ctes), from)
+        Self::build_inner(ctx, &CteEnv::blocked(ctes), from, false)
     }
 
     /// [`Self::build`] with the single-row CTEs visible at this level.
@@ -564,12 +564,23 @@ impl<'a> Scope<'a> {
         env: &CteEnv,
         from: &'a [protobuf::Node],
     ) -> Option<Scope<'a>> {
+        Self::build_inner(ctx, env, from, true)
+    }
+
+    /// [`Self::build`], also accepting a FROM function that can't return a
+    /// set as a one-row relation (`functions`).
+    fn build_inner(
+        ctx: &Ctx<'_>,
+        env: &CteEnv,
+        from: &'a [protobuf::Node],
+        functions: bool,
+    ) -> Option<Scope<'a>> {
         let mut scope = Scope {
             rels: Vec::new(),
             joins: Vec::new(),
         };
         for item in from {
-            scope.add(ctx, env, item, false)?;
+            scope.add(ctx, env, item, false, functions)?;
         }
         Some(scope)
     }
@@ -590,21 +601,27 @@ impl<'a> Scope<'a> {
         // the same name is not one PG lets it write.
         scope.add_table(ctx, relation, false)?;
         for item in from {
-            scope.add(ctx, env, item, false)?;
+            scope.add(ctx, env, item, false, true)?;
         }
         Some(scope)
     }
 
-    /// Add one FROM item; its relations as a bitmask.
+    /// Add one FROM item; its relations as a bitmask. `functions`: a
+    /// function item that can't return a set is a one-row relation
+    /// (otherwise a `FROM` function is a reference the proof gives up on).
     fn add(
         &mut self,
         ctx: &Ctx<'_>,
         env: &CteEnv,
         item: &'a protobuf::Node,
         nullable: bool,
+        functions: bool,
     ) -> Option<u64> {
         match item.node.as_ref()? {
             Node::RangeVar(rv) => self.add_range_var(ctx, env, rv, nullable),
+            Node::RangeFunction(rf) => functions
+                .then(|| self.add_range_function(ctx, rf, nullable))
+                .flatten(),
             Node::JoinExpr(j) => {
                 if j.is_natural || j.alias.is_some() || j.join_using_alias.is_some() {
                     return None;
@@ -618,9 +635,9 @@ impl<'a> Scope<'a> {
                     _ => return None,
                 };
                 let first = self.rels.len();
-                let left = self.add(ctx, env, j.larg.as_deref()?, left_nullable)?;
+                let left = self.add(ctx, env, j.larg.as_deref()?, left_nullable, functions)?;
                 let middle = self.rels.len();
-                let right = self.add(ctx, env, j.rarg.as_deref()?, right_nullable)?;
+                let right = self.add(ctx, env, j.rarg.as_deref()?, right_nullable, functions)?;
                 let single = |side: &Option<Box<protobuf::Node>>, at: usize| {
                     matches!(
                         side.as_deref().and_then(|n| n.node.as_ref()),
@@ -704,6 +721,82 @@ impl<'a> Scope<'a> {
             return Some(1 << (self.rels.len() - 1));
         }
         self.add_table(ctx, rv, nullable)
+    }
+
+    /// Add one FROM function: every item must be a function call that can't
+    /// return a set (every overload, as everywhere else), so it yields
+    /// exactly one row. `ROWS FROM` of several such functions pads the
+    /// shorter results to the longest — still one row — and `WITH
+    /// ORDINALITY` only adds a column.
+    fn add_range_function(
+        &mut self,
+        ctx: &Ctx<'_>,
+        rf: &'a protobuf::RangeFunction,
+        nullable: bool,
+    ) -> Option<u64> {
+        if self.rels.len() == MAX_RELATIONS || rf.functions.is_empty() {
+            return None;
+        }
+        let mut name: Option<&'a str> = None;
+        let mut column_names: Vec<&'a str> = Vec::new();
+        for item in &rf.functions {
+            let Some(Node::List(pair)) = item.node.as_ref() else {
+                return None;
+            };
+            let Some(Node::FuncCall(call)) = pair.items.first().and_then(|n| n.node.as_ref())
+            else {
+                return None;
+            };
+            let (schema, func) = match string_list(&call.funcname).as_slice() {
+                [name] => (None, *name),
+                [schema, name] => (Some(*schema), *name),
+                _ => return None,
+            };
+            let procs = ctx.catalog.find_functions(schema, func);
+            if procs.is_empty() || procs.iter().any(|proc| proc.proretset) {
+                return None;
+            }
+            name.get_or_insert(func);
+            if let Some(Node::List(defs)) = pair.items.get(1).and_then(|n| n.node.as_ref()) {
+                for def in &defs.items {
+                    if let Some(Node::ColumnDef(def)) = def.node.as_ref() {
+                        column_names.push(def.colname.as_str());
+                    }
+                }
+            }
+        }
+        let func = name?;
+        // An alias's column list renames the function's output columns,
+        // when it has one this can read.
+        if let Some(alias) = &rf.alias
+            && !alias.colnames.is_empty()
+        {
+            column_names.clear();
+            for name in &alias.colnames {
+                let Some(Node::String(name)) = &name.node else {
+                    return None;
+                };
+                column_names.push(name.sval.as_str());
+            }
+        }
+        let columns = column_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name.to_owned(), i as i16 + 1))
+            .collect();
+        let alias = rf.alias.as_ref().map(|a| a.aliasname.clone());
+        self.rels.push(Rel {
+            oid: None,
+            refname: alias.clone().unwrap_or_else(|| func.to_owned()),
+            aliased: alias.is_some(),
+            schema: String::new(),
+            relname: func.to_owned(),
+            nullable,
+            single_row: true,
+            columns,
+            cte_columns: Vec::new(),
+        });
+        Some(1 << (self.rels.len() - 1))
     }
 
     /// Add one base-table reference; its relation as a bitmask.
@@ -807,12 +900,14 @@ impl<'a> Scope<'a> {
     /// `expr` as one side of an equality the proof reads: a column of this
     /// scope, a parameter, a constant, or — `outer` being the levels this
     /// one is nested in — a column of an outer query, which is fixed for
-    /// one evaluation of this level.
+    /// one evaluation of this level. With `scalar_sublinks`, also a scalar
+    /// sublink uncorrelated with this level (one value per evaluation).
     fn operand(
         &self,
         ctx: &Ctx<'_>,
         expr: &protobuf::Node,
         outer: Option<&FromScope<'_>>,
+        scalar_sublinks: bool,
     ) -> Option<Operand> {
         match expr.node.as_ref()? {
             Node::ColumnRef(cr) => {
@@ -839,6 +934,7 @@ impl<'a> Scope<'a> {
                     rels: rel.map_or(0, |r| 1 << r),
                 })
             }
+            Node::SubLink(sub) if scalar_sublinks => self.scalar_sublink_operand(ctx, sub),
             Node::ParamRef(p) => {
                 let index = usize::try_from(p.number).ok()?.checked_sub(1)?;
                 let param = ctx.analyzed.params.get(index)?;
@@ -863,12 +959,134 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The one value a scalar sublink yields per evaluation, when it does
+    /// not read a column of this level: it may read outer levels and its
+    /// own, and a volatile function inside it runs once with it. Its type is
+    /// that of the bare column of its own `FROM` its target list selects;
+    /// anything else is left to the proof's give-up answer.
+    fn scalar_sublink_operand(&self, ctx: &Ctx<'_>, sub: &protobuf::SubLink) -> Option<Operand> {
+        if sub.sub_link_type != protobuf::SubLinkType::ExprSublink as i32 {
+            return None;
+        }
+        let Some(Node::SelectStmt(select)) = sub.subselect.as_deref().and_then(|n| n.node.as_ref())
+        else {
+            return None;
+        };
+        if select.op() != SetOperation::SetopNone || !select.values_lists.is_empty() {
+            return None;
+        }
+        let [target] = select.target_list.as_slice() else {
+            return None;
+        };
+        let Some(Node::ResTarget(target)) = &target.node else {
+            return None;
+        };
+        let Some(Node::ColumnRef(column)) = target.val.as_deref().and_then(|v| v.node.as_ref())
+        else {
+            return None;
+        };
+        let Fields::Names(names) = column_ref_fields(column) else {
+            return None;
+        };
+        // Its own FROM only: a CTE name is a reference the proof gives up on,
+        // shadowing a table of the same name it may read.
+        let env = CteEnv::blocked(&cte_names(ctx.tree));
+        let scope = Scope::build_env(ctx, &env, &select.from_clause)?;
+        if !self.sublink_uncorrelated(&scope, sub) {
+            return None;
+        }
+        let Col::Rel(r, attnum) = scope.resolve(&names) else {
+            return None;
+        };
+        let (typ, deterministic_collation) = scope.rels[r].column_info(ctx, attnum)?;
+        deterministic_collation.then_some(Operand {
+            typ,
+            column: None,
+            rels: 0,
+        })
+    }
+
+    /// Whether nothing in the sublink's subquery reads a column of this
+    /// level. A reference its own `local` scope resolves, or one no level
+    /// here has, is fine (its own rows, or an outer level fixed for one
+    /// evaluation of this one). `false` when unsure.
+    fn sublink_uncorrelated(&self, local: &Scope<'_>, sub: &protobuf::SubLink) -> bool {
+        let Some(root) = sub.subselect.as_deref().and_then(|n| n.node.as_ref()) else {
+            return false;
+        };
+        let mut stack = vec![root.to_ref()];
+        while let Some(node) = stack.pop() {
+            if let NodeRef::ColumnRef(column) = node {
+                let Fields::Names(names) = column_ref_fields(column) else {
+                    return false;
+                };
+                if !matches!(local.resolve(&names), Col::Rel(..)) && self.may_reference(&names) {
+                    return false;
+                }
+            }
+            stack.extend(node.children());
+        }
+        true
+    }
+
+    /// Whether a column reference with these fields may bind to one of this
+    /// scope's relations, under [`Self::resolve`]'s rules: a column (a
+    /// system column too), a bare table name (a whole-row reference), or a
+    /// composite column's field (`c.field` and `c.field.subfield` spell the
+    /// column's first name as the reference's first).
+    fn may_reference(&self, names: &[&str]) -> bool {
+        let has = |r: usize, name: &str| {
+            super::proof::is_system_column(name)
+                || self.rels[r].columns.iter().any(|(n, _)| n == name)
+        };
+        if names
+            .first()
+            .is_some_and(|first| (0..self.rels.len()).any(|r| has(r, first)))
+        {
+            return true;
+        }
+        match names {
+            [name] => self.rel_named(name).is_some(),
+            [qualifier, name] => self.rel_named(qualifier).is_some_and(|r| has(r, name)),
+            [schema, table, name] => {
+                let mut found = self.rels.iter().enumerate().filter(|(_, rel)| {
+                    !rel.aliased && rel.schema == *schema && rel.relname == *table
+                });
+                matches!((found.next(), found.next()), (Some((r, _)), None) if has(r, name))
+            }
+            _ => true,
+        }
+    }
+
     /// The facts `column = value` an `=` conjunct proves.
     pub(super) fn equality_facts(
         &self,
         ctx: &Ctx<'_>,
         conjunct: &protobuf::Node,
         outer: Option<&FromScope<'_>>,
+    ) -> Vec<EqFact> {
+        self.facts_from_conjunct(ctx, conjunct, outer, false)
+    }
+
+    /// [`Self::equality_facts`], the cardinality proof's wider form: a scalar
+    /// sublink uncorrelated with this level counts as a value operand, and a
+    /// value a volatile cast decides does not. The `DISTINCT` proof keeps
+    /// the narrow form.
+    pub(super) fn cardinality_facts(
+        &self,
+        ctx: &Ctx<'_>,
+        conjunct: &protobuf::Node,
+        outer: Option<&FromScope<'_>>,
+    ) -> Vec<EqFact> {
+        self.facts_from_conjunct(ctx, conjunct, outer, true)
+    }
+
+    fn facts_from_conjunct(
+        &self,
+        ctx: &Ctx<'_>,
+        conjunct: &protobuf::Node,
+        outer: Option<&FromScope<'_>>,
+        cardinality: bool,
     ) -> Vec<EqFact> {
         let Some(Node::AExpr(e)) = &conjunct.node else {
             return Vec::new();
@@ -884,10 +1102,13 @@ impl<'a> Scope<'a> {
         let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
             return Vec::new();
         };
-        let (Some(l), Some(r)) = (self.operand(ctx, l, outer), self.operand(ctx, r, outer)) else {
+        let (Some(l), Some(r)) = (
+            self.operand(ctx, l, outer, cardinality),
+            self.operand(ctx, r, outer, cardinality),
+        ) else {
             return Vec::new();
         };
-        self.facts_of(ctx, name, &l, &r)
+        self.facts_of(ctx, name, &l, &r, cardinality)
     }
 
     /// The facts `USING (name)` proves between the join's sides.
@@ -897,6 +1118,28 @@ impl<'a> Scope<'a> {
         name: &str,
         left: u64,
         right: u64,
+    ) -> Vec<EqFact> {
+        self.using_facts_with(ctx, name, left, right, false)
+    }
+
+    /// [`Self::using_facts`], refusing a value a volatile cast decides.
+    pub(super) fn cardinality_using_facts(
+        &self,
+        ctx: &Ctx<'_>,
+        name: &str,
+        left: u64,
+        right: u64,
+    ) -> Vec<EqFact> {
+        self.using_facts_with(ctx, name, left, right, true)
+    }
+
+    fn using_facts_with(
+        &self,
+        ctx: &Ctx<'_>,
+        name: &str,
+        left: u64,
+        right: u64,
+        check_casts: bool,
     ) -> Vec<EqFact> {
         let side = |mask: u64| {
             let mut found = (0..self.rels.len())
@@ -916,12 +1159,19 @@ impl<'a> Scope<'a> {
             }
         };
         match (side(left), side(right)) {
-            (Some(l), Some(r)) => self.facts_of(ctx, "=", &l, &r),
+            (Some(l), Some(r)) => self.facts_of(ctx, "=", &l, &r, check_casts),
             _ => Vec::new(),
         }
     }
 
-    fn facts_of(&self, ctx: &Ctx<'_>, name: &str, l: &Operand, r: &Operand) -> Vec<EqFact> {
+    fn facts_of(
+        &self,
+        ctx: &Ctx<'_>,
+        name: &str,
+        l: &Operand,
+        r: &Operand,
+        check_casts: bool,
+    ) -> Vec<EqFact> {
         let Some(op) = ctx.catalog.find_operator(name, Some(l.typ), r.typ) else {
             return Vec::new();
         };
@@ -930,6 +1180,18 @@ impl<'a> Scope<'a> {
             .and_then(|code| ctx.catalog.pg_proc.get(&code))
             .is_some_and(|p| p.proisstrict && p.provolatile != ProVolatile::Volatile);
         if !strict {
+            return Vec::new();
+        }
+        // The value that reaches the operator must be the one the operand
+        // reads: a volatile cast function on the way, run per row, could
+        // turn one value into several. The resolved operand types are what
+        // a polymorphic operator was unified with.
+        if check_casts
+            && (!op
+                .left_type_oid
+                .is_some_and(|target| coercion_is_nonvolatile(ctx, l.typ, target))
+                || !coercion_is_nonvolatile(ctx, r.typ, op.right_type_oid))
+        {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -957,6 +1219,35 @@ impl<'a> Scope<'a> {
             });
         }
         out
+    }
+}
+
+/// Whether converting a value of `source` to the operator's declared
+/// `target` runs no volatile function: no conversion, an untyped literal
+/// (read by the target's input function as the query is parsed), a binary
+/// coercion, or a cast function that isn't VOLATILE. An I/O conversion
+/// through a type's input or output function, and a cast this can't read,
+/// are refused.
+fn coercion_is_nonvolatile(ctx: &Ctx<'_>, source: PgTypeOid, target: PgTypeOid) -> bool {
+    if source == target || source == oid::UNKNOWN {
+        return true;
+    }
+    if ctx.catalog.is_binary_coercible(source, target)
+        || ctx.catalog.unwrap_domain(source) == target
+    {
+        return true;
+    }
+    let cast = ctx
+        .catalog
+        .cast_by_pair
+        .get(&(source, target))
+        .and_then(|oid| ctx.catalog.pg_cast.get(oid));
+    match cast {
+        Some(cast) if cast.castmethod == crate::pg_catalog::CastMethod::Function => cast
+            .castfunc
+            .and_then(|func| ctx.catalog.pg_proc.get(&func))
+            .is_some_and(|proc| proc.provolatile != ProVolatile::Volatile),
+        _ => false,
     }
 }
 
@@ -1128,7 +1419,7 @@ fn canonical_column(attnum: i16) -> protobuf::Node {
 /// Whether `node` is one of the predicate shapes a partial index may count
 /// with: a bare boolean column, `NOT column`, `column IS [NOT] NULL`,
 /// `column = / <> constant`, or `column [NOT] IN (constants)` (also spelled
-/// `= ANY (ARRAY[...])`).
+/// `= ANY` / `<> ALL (ARRAY[...])`).
 fn supported_predicate(node: &protobuf::Node) -> bool {
     let Some(node) = node.node.as_ref() else {
         return false;
@@ -1161,7 +1452,7 @@ fn supported_predicate(node: &protobuf::Node) -> bool {
                         Some(Node::List(list)) if list.items.iter().all(is_const_node)
                     )
             }
-            AExprKind::AexprOpAny => {
+            AExprKind::AexprOpAny | AExprKind::AexprOpAll => {
                 matches!(string_list(&expr.name).last(), Some(&"=" | &"<>"))
                     && is_var(&expr.lexpr)
                     && matches!(

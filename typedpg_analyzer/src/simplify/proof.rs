@@ -307,7 +307,7 @@ impl<'a> FromScope<'a> {
 }
 
 /// PG's system column names, which every table has besides its own.
-fn is_system_column(name: &str) -> bool {
+pub(super) fn is_system_column(name: &str) -> bool {
     matches!(
         name,
         "tableoid" | "ctid" | "xmin" | "xmax" | "cmin" | "cmax" | "oid"

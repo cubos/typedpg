@@ -54,23 +54,33 @@ pub fn redundant_distinct_spans(
 /// - it has no `FROM` (and a bare `VALUES` has exactly one row);
 /// - it has an aggregate or `HAVING` without `GROUP BY` (one group);
 /// - every `FROM` relation is a base table whose unique key is equated,
-///   column by column, to constants, parameters, outer-query columns or
-///   columns of already-determined relations — the `distinct` rule's
-///   "equalities to a key" proof (see [`super::dedup`]), propagated until
-///   every relation is determined — or a single-row CTE (see below).
+///   column by column, to constants, parameters, outer-query columns,
+///   scalar subqueries uncorrelated with this level or columns of
+///   already-determined relations — the `distinct` rule's "equalities to a
+///   key" proof (see [`super::dedup`]), propagated until every relation is
+///   determined — a single-row CTE, or a `FROM` function that can't return
+///   a set (see below).
 ///
 /// A CTE the statement's own `WITH` clause proves yields at most one row is
 /// a relation with no key needed: it is determined from the start, may be
 /// referenced more than once, and its columns are values a key equality may
 /// read. CTEs are judged in declaration order, so a body may use the ones
 /// before it; a recursive `WITH`, a body that isn't proven one-row or a
-/// reference to such a CTE makes the proof give up.
+/// reference to such a CTE makes the proof give up. A `FROM` function call
+/// every overload of which is non-set-returning also yields exactly one row
+/// (`ROWS FROM` of several such calls and `WITH ORDINALITY` included).
+///
+/// A volatile call only matters as an equality's value operand, which
+/// decides which row a key matches: [`super::dedup`] refuses a volatile one.
+/// Volatility anywhere else — the target list, `ORDER BY`, another `WHERE`
+/// conjunct, a DML's `SET` or `RETURNING` — leaves the row count alone. A
+/// locking clause is handled on its own (it needs a single relation).
 ///
 /// Anything else is `false`: `GROUP BY` always is (a group per key), and so
 /// is every relation the proof can't see through (a view, a subquery, a
-/// function, an unproven CTE, an inheritance parent, a partitioned table or
-/// one under row security), a volatile or set-returning call, or an outer
-/// join whose nullable side isn't determined.
+/// function that returns a set, an unproven CTE, an inheritance parent, a
+/// partitioned table or one under row security), a set-returning call, or an
+/// outer join whose nullable side isn't determined.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
     if !view.analyzed.spreads.is_empty() {
         return false;
@@ -755,6 +765,12 @@ fn select_at_most_one_row_in(
     if select.group_distinct || !select.group_clause.is_empty() {
         return false;
     }
+    // A set-returning call multiplies this level's rows wherever it runs:
+    // the target list, a `FROM` function, an operator. A volatile call
+    // elsewhere (a target, ORDER BY, another WHERE conjunct, a DML's SET or
+    // RETURNING) doesn't: only an equality's value operand decides which row
+    // a key matches, and [`dedup::Scope::cardinality_facts`] refuses a
+    // volatile one.
     if has_set_returning(ctx, select) {
         return false;
     }
@@ -771,52 +787,16 @@ fn select_at_most_one_row_in(
     let Some(scope) = Scope::build_env(ctx, env, &select.from_clause) else {
         return false;
     };
-    // Volatile calls (and anything else the distinctness proof cannot see
-    // through) make the proof give up; aggregates are already handled.
-    //
-    // A locking clause counts as volatile there. Over one relation it
-    // doesn't bound anything less: EvalPlanQual re-fetches a locked row's
-    // newest version and rechecks the WHERE on it, so the scan still
-    // returns at most the one row whose key equals the value — and
-    // `SELECT … WHERE id = $1 FOR UPDATE` is what `fetch_one` locks rows
-    // with. With joins, a re-fetched row is re-joined, so they keep the
-    // conservative answer.
-    let unsafe_call = if select.locking_clause.is_empty() || scope.rels.len() != 1 {
-        has_unsafe_call_here(ctx, select)
-    } else {
-        let mut unlocked = select.clone();
-        unlocked.locking_clause.clear();
-        has_unsafe_call_here(ctx, &unlocked)
-    };
-    if unsafe_call {
+    // A locking clause makes EvalPlanQual re-fetch a row's newest version
+    // and recheck the WHERE on it. Over one relation the scan still returns
+    // at most the one row whose key equals the value — and `SELECT … WHERE
+    // id = $1 FOR UPDATE` is what `fetch_one` locks rows with. With joins,
+    // the re-fetched row is re-joined, and may match several rows on the
+    // other side.
+    if !select.locking_clause.is_empty() && scope.rels.len() != 1 {
         return false;
     }
     all_relations_determined(ctx, select, &scope, outer)
-}
-
-/// [`dedup::has_unsafe_call`] over this query level alone: a subquery or a
-/// CTE body is a level of its own whose rows never multiply this one, and
-/// the proof judges it separately when it is referenced.
-fn has_unsafe_call_here(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
-    let mut level = protobuf::Node {
-        node: Some(Node::SelectStmt(Box::new(select.clone()))),
-    };
-    level.rewrite(&mut |_| true, &mut |node| {
-        if matches!(
-            node.node,
-            Some(Node::SubLink(_) | Node::RangeSubselect(_) | Node::CommonTableExpr(_))
-        ) {
-            node.node = Some(Node::AConst(protobuf::AConst {
-                isnull: false,
-                location: 0,
-                val: Some(Val::Ival(protobuf::Integer { ival: 0 })),
-            }));
-        }
-    });
-    let Some(Node::SelectStmt(level)) = level.node else {
-        return true;
-    };
-    dedup::has_unsafe_call(ctx, &level)
 }
 
 /// The [`NodeRef`]s of a list of protobuf nodes, skipping empty slots.
@@ -965,7 +945,7 @@ fn all_relations_determined(
     let where_conjuncts = dedup::conjuncts(select.where_clause.as_deref());
     let where_facts: Vec<dedup::EqFact> = where_conjuncts
         .iter()
-        .flat_map(|conjunct| scope.equality_facts(ctx, conjunct, Some(outer)))
+        .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, Some(outer)))
         .collect();
     let join_facts: Vec<(&dedup::Join<'_>, Vec<dedup::EqFact>, Vec<&protobuf::Node>)> = scope
         .joins
@@ -974,10 +954,10 @@ fn all_relations_determined(
             let conjuncts = dedup::conjuncts(join.quals);
             let mut facts = Vec::new();
             for conjunct in &conjuncts {
-                facts.extend(scope.equality_facts(ctx, conjunct, Some(outer)));
+                facts.extend(scope.cardinality_facts(ctx, conjunct, Some(outer)));
             }
             for name in &join.using {
-                facts.extend(scope.using_facts(ctx, name, join.left, join.right));
+                facts.extend(scope.cardinality_using_facts(ctx, name, join.left, join.right));
             }
             (join, facts, conjuncts)
         })
@@ -1088,7 +1068,7 @@ fn dml_at_most_one_row(
     let conjuncts = dedup::conjuncts(where_clause);
     let facts: Vec<dedup::EqFact> = conjuncts
         .iter()
-        .flat_map(|conjunct| scope.equality_facts(ctx, conjunct, None))
+        .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, None))
         .collect();
     let sources = PredicateSources {
         conjuncts: &conjuncts,
@@ -1192,13 +1172,25 @@ mod tests {
              CREATE TABLE conversations (
                 id bigint PRIMARY KEY,
                 next_seq bigint NOT NULL DEFAULT 1,
-                tenant_id bigint NOT NULL
+                tenant_id bigint NOT NULL,
+                user_id bigint,
+                updated_at timestamptz
              );
+             CREATE TYPE conversation_event_type AS ENUM ('user_message', 'agent_message');
              CREATE TABLE events (
                 tenant_id bigint NOT NULL,
                 conversation_id bigint NOT NULL,
                 seq bigint NOT NULL,
+                type conversation_event_type,
+                content text,
+                created_at timestamptz,
                 PRIMARY KEY (tenant_id, conversation_id, seq)
+             );
+             CREATE TABLE memory (
+                id bigint,
+                tenant_id bigint NOT NULL,
+                user_id bigint NOT NULL,
+                PRIMARY KEY (tenant_id, user_id)
              );
              CREATE TABLE things (
                 id bigint PRIMARY KEY,
@@ -1230,6 +1222,12 @@ mod tests {
              CREATE TABLE any_codes (code text NOT NULL, kind text NOT NULL);
              CREATE UNIQUE INDEX ON any_codes (code) WHERE kind IN ('a', 'b');
              CREATE UNIQUE INDEX ON any_codes (code) WHERE kind = ANY (ARRAY['c', 'd']);
+             CREATE TABLE not_in_codes (conversation_id bigint NOT NULL, state text NOT NULL);
+             CREATE UNIQUE INDEX ON not_in_codes (conversation_id)
+                WHERE state NOT IN ('finished', 'abandoned');
+             CREATE TABLE not_in_all_codes (conversation_id bigint NOT NULL, state text NOT NULL);
+             CREATE UNIQUE INDEX ON not_in_all_codes (conversation_id)
+                WHERE state <> ALL (ARRAY['finished', 'abandoned']);
              CREATE TABLE flags (code text NOT NULL, hidden boolean NOT NULL);
              CREATE UNIQUE INDEX ON flags (code) WHERE hidden;
              CREATE UNIQUE INDEX ON flags (code) WHERE NOT hidden;",
@@ -1472,7 +1470,6 @@ mod tests {
             "SELECT id FROM v WHERE id = $1",
             "SELECT s.id FROM (SELECT id FROM users) s WHERE s.id = $1",
             "WITH c AS (SELECT id FROM users) SELECT id FROM c WHERE id = $1",
-            "SELECT id FROM users WHERE id = $1 AND random() < 0.5",
         ] {
             assert!(!select_one(&db, sql), "{sql}");
         }
@@ -1777,6 +1774,191 @@ mod tests {
             &db,
             "SELECT channel_id FROM lanes \
              WHERE channel_id = $1 AND identity_id = $2 AND key = $3",
+        ));
+    }
+
+    #[test]
+    fn volatile_calls_outside_a_key_equality_do_not_block() {
+        let db = catalog();
+        // A target-list clock read and a cast to a user enum, over the
+        // single-row bump CTE; its SET, RETURNING and the INSERT's RETURNING
+        // are volatile too.
+        assert!(statement_one(
+            &db,
+            "WITH bump AS ( \
+                 UPDATE conversations \
+                 SET next_seq = next_seq + 1, updated_at = clock_timestamp() WHERE id = $1 \
+                 RETURNING next_seq - 1 AS seq, tenant_id \
+             ) \
+             INSERT INTO events (tenant_id, conversation_id, seq, created_at) \
+             SELECT bump.tenant_id, $1, bump.seq, clock_timestamp() FROM bump \
+             RETURNING clock_timestamp()",
+        ));
+        assert!(statement_one(
+            &db,
+            "WITH bump AS ( \
+                 UPDATE conversations SET next_seq = next_seq + 1 WHERE id = $1 \
+                 RETURNING next_seq - 1 AS seq, tenant_id \
+             ) \
+             INSERT INTO events (tenant_id, conversation_id, seq, type) \
+             SELECT bump.tenant_id, $1, bump.seq, 'user_message'::conversation_event_type \
+             FROM bump RETURNING seq",
+        ));
+        // Other WHERE conjuncts, the target list and ORDER BY.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM users WHERE id = $1 AND random() < 0.5"
+        ));
+        assert!(select_one(&db, "SELECT random() FROM users WHERE id = $1"));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM users WHERE id = $1 ORDER BY random()"
+        ));
+        // A volatile value operand decides which rows match: not provable.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE id = (random() * 10)::int"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE id = (random() * 10)::bigint"
+        ));
+    }
+
+    #[test]
+    fn a_volatile_cast_on_the_value_is_not_a_key_equality() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE keyed (id bigint PRIMARY KEY);
+             CREATE TABLE spectral (id bigint PRIMARY KEY, v text NOT NULL);
+             CREATE FUNCTION flaky(text) RETURNS bigint
+                LANGUAGE sql VOLATILE AS 'SELECT length($1)::bigint';
+             CREATE CAST (text AS bigint) WITH FUNCTION flaky(text) AS IMPLICIT;",
+        )
+        .unwrap();
+        // The value is re-cast per candidate row, so several rows may match
+        // the (unique) key even though the other side is determined.
+        assert!(!select_one(
+            &db,
+            "SELECT k.id FROM keyed k JOIN spectral s ON k.id = s.v WHERE s.id = $1",
+        ));
+
+        // A cast that can't change its value per row keeps the proof.
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE keyed (id bigint PRIMARY KEY);
+             CREATE TABLE spectral (id bigint PRIMARY KEY, v text NOT NULL);
+             CREATE FUNCTION steady(text) RETURNS bigint
+                LANGUAGE sql IMMUTABLE AS 'SELECT length($1)::bigint';
+             CREATE CAST (text AS bigint) WITH FUNCTION steady(text) AS IMPLICIT;",
+        )
+        .unwrap();
+        assert!(select_one(
+            &db,
+            "SELECT k.id FROM keyed k JOIN spectral s ON k.id = s.v WHERE s.id = $1",
+        ));
+    }
+
+    #[test]
+    fn an_uncorrelated_scalar_sublink_is_a_value() {
+        let db = catalog();
+        // A row locked by an uncorrelated scalar subquery.
+        assert!(statement_one(
+            &db,
+            "UPDATE things SET name = 'x' \
+             WHERE id = (SELECT id FROM things WHERE name = 'pending' \
+                         ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) \
+             RETURNING id",
+        ));
+        // One half of a composite key read from another table.
+        assert!(select_one(
+            &db,
+            "SELECT m.id FROM memory m \
+             WHERE m.tenant_id = $1 \
+               AND m.user_id = (SELECT user_id FROM conversations WHERE id = $2)",
+        ));
+        // A volatile call inside the still uncorrelated subquery is fine.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM users WHERE id = (SELECT id FROM users WHERE random() < 0.5)",
+        ));
+        // A subquery reading this level decides its value per row.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users u \
+             WHERE id = (SELECT id FROM users WHERE id = u.id)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users u \
+             WHERE id = (SELECT o.id FROM other o WHERE o.note = u.name)",
+        ));
+        // A target that isn't a bare column is not typed here.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE id = (SELECT id + 1 FROM users LIMIT 1)",
+        ));
+        // A non-scalar sublink yields many values.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE id IN (SELECT id FROM users)",
+        ));
+    }
+
+    #[test]
+    fn a_non_set_returning_function_in_from_is_one_row() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "SELECT true AS taken FROM pg_advisory_xact_lock($1::bigint)",
+        ));
+        assert!(select_one(&db, "SELECT 1 FROM abs(1)"));
+        assert!(select_one(
+            &db,
+            "SELECT 1 FROM abs(-1) WITH ORDINALITY AS t(n, ord)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT 1 FROM ROWS FROM (abs(1), length('a'))"
+        ));
+        // A function returning a set multiplies rows.
+        assert!(!select_one(&db, "SELECT 1 FROM generate_series(1, 3)"));
+        assert!(!select_one(&db, "SELECT 1 FROM unnest(ARRAY[1, 2])"));
+        assert!(!select_one(
+            &db,
+            "SELECT 1 FROM ROWS FROM (abs(1), generate_series(1, 2))",
+        ));
+        // A determined table joined to the one-row function stays one row.
+        assert!(select_one(
+            &db,
+            "SELECT u.id FROM users u JOIN pg_advisory_xact_lock($1::bigint) l ON true \
+             WHERE u.id = $2",
+        ));
+    }
+
+    #[test]
+    fn a_not_in_or_not_all_partial_predicate_counts() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "SELECT conversation_id FROM not_in_codes \
+             WHERE conversation_id = $1 AND state NOT IN ('finished', 'abandoned')",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT conversation_id FROM not_in_all_codes \
+             WHERE conversation_id = $1 AND state <> ALL (ARRAY['finished', 'abandoned'])",
+        ));
+        // A different list is not the predicate.
+        assert!(!select_one(
+            &db,
+            "SELECT conversation_id FROM not_in_codes \
+             WHERE conversation_id = $1 AND state NOT IN ('finished', 'other')",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT conversation_id FROM not_in_all_codes \
+             WHERE conversation_id = $1 AND state <> ALL (ARRAY['finished', 'other'])",
         ));
     }
 
