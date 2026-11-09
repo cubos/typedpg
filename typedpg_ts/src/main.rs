@@ -81,7 +81,7 @@ enum Command {
         #[arg(long, global = true)]
         db: Option<String>,
         /// The connection URL; defaults to the DATABASE_URL environment
-        /// variable (a `.env` file is read).
+        /// variable (a `.env` file is read; the environment wins over it).
         #[arg(long, global = true)]
         url: Option<String>,
         #[command(subcommand)]
@@ -410,7 +410,7 @@ fn migrate(
         println!("Created {}", down.display());
         return Ok(());
     }
-    let _ = dotenvy::dotenv_override();
+    typedpg_cli::load_dotenv();
     let url = url
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .ok_or("pass --url or set the DATABASE_URL environment variable")?;

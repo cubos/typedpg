@@ -55,13 +55,17 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() {
-    let _ = dotenvy::dotenv_override();
+fn main() {
+    // Before the runtime starts its threads: it sets environment variables.
+    typedpg_cli::load_dotenv();
 
     let cli = Cli::parse();
 
-    match run(cli).await {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        process::exit(1);
+    });
+    match runtime.block_on(run(cli)) {
         Ok(true) => {}
         Ok(false) => process::exit(1),
         Err(e) => {

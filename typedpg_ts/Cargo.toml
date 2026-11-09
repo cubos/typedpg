@@ -29,7 +29,6 @@ typedpg_cli = { path = "../typedpg_cli", version = "0.6.0" }
 # Only for `vendored-openssl`: the TLS `typedpg migrate` connects with.
 native-tls = "0.2"
 tokio = { version = "1", features = ["rt", "macros"] }
-dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 clap = { version = "4", features = ["derive"] }

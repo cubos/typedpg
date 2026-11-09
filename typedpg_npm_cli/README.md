@@ -37,7 +37,7 @@ later.
 `--ignore-migrations-from <ref>`. `migrate` takes
 `--config`, `--db <name>` (when the config has several databases) and
 `--url <url>` (the connection URL, defaulting to `DATABASE_URL`; a `.env`
-file is read). The migrate actions other than `create` need a connection.
+file is read, and a variable already set in the environment wins over it). The migrate actions other than `create` need a connection.
 
 In CI, `npx typedpg check` exits non-zero when a generated module is stale,
 when a query has an error, or when a module remains for a `.sql` file that is
@@ -83,7 +83,7 @@ in the runtime's README.
 
 | Variable | |
 |---|---|
-| `DATABASE_URL` | The connection URL for `typedpg migrate`, when `--url` is not given. A `.env` file is read. |
+| `DATABASE_URL` | The connection URL for `typedpg migrate`, when `--url` is not given. A `.env` file is read; a variable already set in the environment wins over it. |
 | `TYPEDPG_BINARY` | Run this binary instead of the platform package. |
 | `TYPEDPG_CACHE_DIR` | The `.sql` cache directory. Default: `node_modules/.cache/typedpg` beside the config file. |
 | `TYPEDPG_SERVE_IDLE_TIMEOUT` | Seconds a `typedpg serve` spawned by the loaders or plugins lives without a request. Default: 300. |

@@ -173,6 +173,29 @@ fn database_commands_need_database_url() {
 }
 
 #[tokio::test]
+async fn explicit_database_url_wins_over_dotenv_and_its_last_line_wins() {
+    let url = fresh_url().await;
+    let dir = project(&[("0001_users.sql", "CREATE TABLE users (id INT);")]);
+    let unreachable = "postgres://nobody@127.0.0.1:1/none";
+
+    // Of two lines setting DATABASE_URL, the last one is used.
+    fs::write(
+        dir.path().join(".env"),
+        format!("DATABASE_URL={unreachable}\nDATABASE_URL={url}\n"),
+    )
+    .unwrap();
+    assert!(ok(&cli(dir.path(), None, &["migrate", "status"])).contains("0001_users"));
+
+    // A DATABASE_URL set explicitly wins over the file.
+    fs::write(
+        dir.path().join(".env"),
+        format!("DATABASE_URL={unreachable}\n"),
+    )
+    .unwrap();
+    assert!(ok(&cli(dir.path(), Some(&url), &["migrate", "status"])).contains("0001_users"));
+}
+
+#[tokio::test]
 async fn up_status_and_down() {
     let url = fresh_url().await;
     let dir = project(&[
