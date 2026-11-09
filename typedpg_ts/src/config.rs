@@ -20,20 +20,24 @@
 //! `"info"`), and each rule is set to a level: `"error"`, `"warning"`,
 //! `"info"` or `"off"`. The query rules are `nullComparison`,
 //! `unboundedWrite`, `notInNullable`, `redundantNullCheck`,
-//! `limitWithoutOrder`, `redundantLimit`, `redundantDistinct` and
-//! `likeUnescapedParam`; the migration rules `createIndexBlocking`,
-//! `constraintValidating`, `setNotNullScan`, `tableRewrite` and
-//! `missingLockTimeout`; the schema rules `fkWithoutIndex`, `redundantIndex`,
-//! `fkTypeMismatch`, `preferTimestamptz`, `preferIdentity`, `preferText` and
-//! `preferBigintPk`. `likeUnescapedParam` and the `prefer*` rules are off by
-//! default; set them to a level to enable them. Rules without an override
-//! keep their default severity. `ignore` lists glob patterns, relative to
-//! the config's directory. A matching query file's findings are not
-//! reported; a matching migration file keeps its schema findings, placed on
-//! the statements that created the objects, but skips the statement rules.
-//! A query that does not compile still fails. A `-- typedpg-lint:
-//! allow(rule)` comment suppresses a rule in the query or migration
-//! statement it is in.
+//! `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`,
+//! `likeUnescapedParam` and the call-site rules `fetchMayReturnMany`,
+//! `fetchAllSingleRow` and `unusedReturning`; the migration rules
+//! `createIndexBlocking`, `constraintValidating`, `setNotNullScan`,
+//! `tableRewrite` and `missingLockTimeout`; the schema rules
+//! `fkWithoutIndex`, `redundantIndex`, `fkTypeMismatch`, `preferTimestamptz`,
+//! `preferIdentity`, `preferText` and `preferBigintPk`. `likeUnescapedParam`
+//! and the `prefer*` rules are off by default; set them to a level to enable
+//! them. The call-site rules check how a query is called (`fetchOne`,
+//! `fetchValue`, `fetchOptional`, `fetchAll`, `execute`) against what the
+//! schema proves about its rows, in the same file or through an export from
+//! a `.sql` file or another source. Rules without an override keep their
+//! default severity. `ignore` lists glob patterns, relative to the config's
+//! directory. A matching query file's findings are not reported; a matching
+//! migration file keeps its schema findings, placed on the statements that
+//! created the objects, but skips the statement rules. A query that does not
+//! compile still fails. A `-- typedpg-lint: allow(rule)` comment suppresses
+//! a rule in the query or migration statement it is in.
 //!
 //! `migrations` is the directory, or an object with it and the runner's
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",
@@ -819,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn lint_accepts_the_new_rules_but_not_the_rust_only_ones() {
+    fn lint_accepts_the_call_site_rules_but_not_the_rust_only_ones() {
         let parse = |extra: &str| {
             Config::parse(&format!(r#"{{ "out": "db.ts"{extra} }}"#), Path::new("/p"))
                 .map(|c| c.lint.clone())
@@ -830,21 +834,19 @@ mod tests {
                            "likeUnescapedParam": "off", "fkTypeMismatch": "warning",
                            "missingLockTimeout": "warning", "preferTimestamptz": "off",
                            "preferIdentity": "off", "preferText": "off",
-                           "preferBigintPk": "info" }"#,
+                           "preferBigintPk": "info", "fetchMayReturnMany": "warning",
+                           "fetchAllSingleRow": "info", "unusedReturning": "off" }"#,
         )
         .unwrap();
         assert_eq!(lint.levels["redundant_null_check"], LintLevel::Warning);
         assert_eq!(lint.levels["like_unescaped_param"], LintLevel::Off);
         assert_eq!(lint.levels["prefer_bigint_pk"], LintLevel::Info);
         assert_eq!(lint.levels["missing_lock_timeout"], LintLevel::Warning);
-        // The Rust-only rules are not TS rules.
-        for key in [
-            "redundantBinding",
-            "renamingBinding",
-            "fetchMayReturnMany",
-            "fetchAllSingleRow",
-            "unusedReturning",
-        ] {
+        assert_eq!(lint.levels["fetch_may_return_many"], LintLevel::Warning);
+        assert_eq!(lint.levels["fetch_all_single_row"], LintLevel::Info);
+        assert_eq!(lint.levels["unused_returning"], LintLevel::Off);
+        // The Rust-only binding rules are not TS rules.
+        for key in ["redundantBinding", "renamingBinding"] {
             let err = parse(&format!(r#", "lint": {{ "{key}": "off" }}"#)).unwrap_err();
             assert!(
                 err.contains(&format!("unknown rule `{key}` in `lint`")),

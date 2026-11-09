@@ -26,8 +26,8 @@ use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
 use typedpg_lint::{
-    CallMethod, Finding, IgnoreSet, LintOptions, MigrationFile, MigrationLint, lint_migrations,
-    lint_query_called,
+    Call as LintCall, CallFinding, CallMethod, Finding, IgnoreSet, Language, LintOptions,
+    MigrationFile, MigrationLint, Rule, lint_migrations, lint_query_called,
 };
 
 /// The directories under the manifest's directory that hold Rust sources.
@@ -41,9 +41,11 @@ struct Site {
     sql: String,
     literal: scan::Literal,
     bindings: Vec<scan::Binding>,
-    /// The method called directly on the `sql!` result, as the call-site
-    /// rules read it.
-    call: Option<CallMethod>,
+    /// The methods called on the query, as the call-site rules read them.
+    calls: Vec<scan::Call>,
+    /// A use the scan cannot see as a method call: `unused_returning` stays
+    /// quiet for the site.
+    escapes: bool,
 }
 
 /// A finding's fix, pending the `lint.ignore` retain and `--fix`.
@@ -81,7 +83,7 @@ struct Sources {
 type AnalysisError = (String, Option<usize>);
 
 /// A statement's findings or error.
-type LintResult = Result<Vec<Finding>, AnalysisError>;
+type LintResult = Result<Vec<CallFinding>, AnalysisError>;
 
 /// A COPY target's analysis outcome.
 type CopyResult = Result<(), AnalysisError>;
@@ -218,7 +220,7 @@ fn build(
     }
 
     let mut pending = Vec::new();
-    let mut cache: HashMap<(Option<String>, String, Option<CallMethod>), LintResult> =
+    let mut cache: HashMap<(Option<String>, String, Vec<LintCall>, bool), LintResult> =
         HashMap::new();
     for site in &sites {
         let path = relative(&site.path, &base);
@@ -246,22 +248,62 @@ fn build(
         let Ok(catalog) = catalogs.get(&site.db).expect("every database was built") else {
             continue;
         };
+        let mut calls = Vec::new();
+        let mut call_sites = Vec::new();
+        let mut escapes = site.escapes;
+        for call in &site.calls {
+            match call_method(&call.method) {
+                Some(method) => {
+                    calls.push(LintCall {
+                        method,
+                        name: call.method.clone(),
+                        language: Language::Rust,
+                    });
+                    call_sites.push(call);
+                }
+                // A method the rules do not know still uses the query: it
+                // may be a `fetch_stream()`, so `unused_returning` cannot
+                // be sure every use is an `execute()`.
+                None => escapes = true,
+            }
+        }
+        let mut site_options = options.clone();
+        if escapes {
+            site_options = site_options.with_rule_off(Rule::UnusedReturning);
+        }
         let result = cache
-            .entry((site.db.clone(), site.sql.clone(), site.call))
+            .entry((site.db.clone(), site.sql.clone(), calls.clone(), escapes))
             .or_insert_with(|| {
-                lint_query_called(catalog, &site.sql, site.call, &options)
+                lint_query_called(catalog, &site.sql, &calls, &site_options)
                     .map_err(|error| (error.error.to_string(), error.offset))
             });
         match result {
             Ok(findings) => {
-                for finding in findings {
-                    let entry = Entry {
-                        path: path.clone(),
-                        start: position(&site.file, site.literal.source_offset(finding.span.start)),
-                        end: position(&site.file, site.literal.source_offset(finding.span.end)),
-                        finding: finding.clone(),
+                for placed in findings {
+                    let finding = &placed.finding;
+                    let entry = match placed.call {
+                        Some(index) => {
+                            let call = call_sites[index];
+                            Entry {
+                                path: path.clone(),
+                                start: position(&site.file, call.span.start),
+                                end: position(&site.file, call.span.end),
+                                finding: finding.clone(),
+                            }
+                        }
+                        None => Entry {
+                            path: path.clone(),
+                            start: position(
+                                &site.file,
+                                site.literal.source_offset(finding.span.start),
+                            ),
+                            end: position(&site.file, site.literal.source_offset(finding.span.end)),
+                            finding: finding.clone(),
+                        },
                     };
                     report.entries.push(entry.clone());
+                    // A call-site finding is reported at the call, but its
+                    // fix edits the SQL: write the file the literal is in.
                     if let Some(edits) = sql_fix_edits(finding, &site.literal) {
                         pending.push(PendingFix {
                             path: site.path.clone(),
@@ -511,10 +553,10 @@ fn relative(path: &Path, base: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// The call-site rule's view of a scanned method: only the four methods the
+/// The call-site rule's view of a scanned method: only the seven methods the
 /// rules know are calls; anything else acts like a query with no call site.
-fn call_method(call: Option<&scan::Call>) -> Option<CallMethod> {
-    match call?.method.as_str() {
+fn call_method(name: &str) -> Option<CallMethod> {
+    match name {
         "fetch_one" | "fetch_one_as" => Some(CallMethod::FetchOne),
         "fetch_optional" | "fetch_optional_as" => Some(CallMethod::FetchOptional),
         "fetch_all" | "fetch_all_as" => Some(CallMethod::FetchAll),
@@ -574,7 +616,8 @@ fn scan_sources(base: &Path) -> Sources {
                 sql: query.text,
                 literal: query.literal,
                 bindings: query.bindings,
-                call: call_method(query.call.as_ref()),
+                calls: query.calls,
+                escapes: query.escapes,
             });
         }
         for copy in scanned.copies {

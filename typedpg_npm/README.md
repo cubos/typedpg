@@ -577,6 +577,17 @@ npx typedpg build          # compile the .sql files into the loaders' cache
 | `prefer_identity` | off | A `serial` column instead of an identity column. |
 | `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
 | `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
+| `fetch_may_return_many` | warning | `fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` on a query not proven to return at most one row. |
+| `fetch_all_single_row` | info | `fetchAll` on a query that returns at most one row. |
+| `unused_returning` | info | `execute` on a statement whose `RETURNING` rows are discarded. |
+
+A call-site finding is placed at the method identifier in the calling file,
+which may be a different file from the `.sql` query; `unused_returning`'s fix
+edits the SQL. The rules see calls directly on `sql(…)`, through a local
+`const`/`let` binding, and through an exported `.sql` query or an exported
+TypeScript `sql(…)` binding imported by name, alias or namespace. They stay
+quiet when the query may be used in a way the scan cannot see (exported, or a
+binding passed to a function), except for the per-call fetch checks.
 
 The `lint` object sets each rule's level — `"error"`, `"warning"`, `"info"`
 or `"off"` — and `failOn`, the severity the run fails on (default `"error"`).
@@ -937,7 +948,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 | `simplify` | The query simplifications, on by default: `false` turns them all off, or an object sets one rule to `false` — `notIn`, `countExists`, `distinct`, `unionAll`, `fkJoin`. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent: `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS` when neither side can be NULL, `count(…) > 0` as `EXISTS`, a `DISTINCT` that can't remove a row, a `UNION` whose branches can't share a row as `UNION ALL`, or a join a foreign key proves matches exactly one row none of whose columns are read. The generated module's doc comments show the SQL sent. For every database. |
-| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `likeUnescapedParam`, `fkTypeMismatch`, `missingLockTimeout`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
+| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `likeUnescapedParam`, `fkTypeMismatch`, `missingLockTimeout`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `fetchMayReturnMany`, `fetchAllSingleRow`, `unusedReturning` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
 
 Unknown keys are errors.
 

@@ -3,8 +3,9 @@
 //! [`lint_query`] analyzes a query through [`PgCatalog::query_view`] — the
 //! text and parse tree as written, before the query simplifications — and
 //! runs every enabled [`Rule`] over it. Findings carry the configured
-//! severity, a byte range in the original query text, a message and an
-//! optional help line.
+//! severity, a message and an optional help line; a query finding is placed
+//! at a byte range in the original query text, a call-site finding at the
+//! method identifier the caller saw (see [`lint_query_called`]).
 //!
 //! A comment `-- typedpg-lint: allow(rule_a, rule_b)` (or the `/* … */`
 //! form) in the query suppresses those rules for the whole query. An
@@ -310,33 +311,62 @@ pub struct SqlEdit {
     pub text: String,
 }
 
-/// The method a `sql!` result has called on it directly, as the Rust source
-/// shows it to the CLI.
-///
-/// A query that is first bound to a variable has no call site: the binding
-/// hides it from [`lint_query_called`].
+/// The language a query is called from: its method names, and the methods the
+/// help lines suggest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Language {
+    Rust,
+    TypeScript,
+}
+
+/// A method called on a query result, as the caller's source shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Call {
+    /// What the method does to the query's rows.
+    pub method: CallMethod,
+    /// The method as written: `fetch_one`, `fetch_one_as`, `fetchOne`,
+    /// `fetchValue`, …
+    pub name: String,
+    /// The language whose spelling [`Self::name`] uses, and whose other
+    /// methods the help line suggests.
+    pub language: Language,
+}
+
+/// The method a query result's call has, independent of its spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallMethod {
-    /// `fetch_one()` or `fetch_one_as()`: fails with `TooManyRows` on a
-    /// second row.
+    /// `fetch_one()` / `fetch_one_as()` (Rust), `fetchOne()` / `fetchValue()`
+    /// (TypeScript): fails with `TooManyRows` on a second row.
     FetchOne,
-    /// `fetch_optional()` or `fetch_optional_as()`: fails with
+    /// `fetch_optional()` / `fetch_optional_as()` (Rust),
+    /// `fetchOptional()` / `fetchValueOptional()` (TypeScript): fails with
     /// `TooManyRows` on a second row.
     FetchOptional,
-    /// `fetch_all()` or `fetch_all_as()`.
+    /// `fetch_all()` / `fetch_all_as()` (Rust), `fetchAll()` (TypeScript).
     FetchAll,
     /// `execute()`: runs the statement and discards its `RETURNING` rows.
     Execute,
 }
 
-/// A lint finding, placed in the original query text.
+/// A finding and the call it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallFinding {
+    /// The index in the `calls` slice the finding is placed at: a call-site
+    /// finding is reported at the method identifier in the calling file.
+    /// `None` for a finding in the SQL text.
+    pub call: Option<usize>,
+    pub finding: Finding,
+}
+
+/// A lint finding, placed in the original query text or at a call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub rule: Rule,
     pub severity: Severity,
     /// The byte range in the query text as the user wrote it (`$name`
     /// parameters and `$..spreads` included), or in the migration file's
-    /// text for a [`MigrationFinding`].
+    /// text for a [`MigrationFinding`]. A call-site finding's range is empty:
+    /// its [`CallFinding::call`] says where the caller places it.
     pub span: Range<usize>,
     pub message: String,
     pub help: Option<String>,
@@ -399,6 +429,14 @@ impl LintOptions {
     pub fn fail_on(&self) -> Severity {
         self.fail_on
     }
+
+    /// The same options with `rule` turned off: a caller that knows a rule
+    /// does not apply to one query (its value escapes, so `unused_returning`
+    /// cannot be sure every use is an `execute()`) can silence it there.
+    pub fn with_rule_off(mut self, rule: Rule) -> Self {
+        self.levels.insert(rule, None);
+        self
+    }
 }
 
 fn severity(severity: typedpg_core::config::LintSeverity) -> Severity {
@@ -442,7 +480,7 @@ pub(crate) struct Ctx<'a> {
     pub catalog: &'a PgCatalog,
 }
 
-/// Lint `sql` against `catalog`.
+/// Lint `sql` against `catalog`, without a call site.
 ///
 /// Returns the findings in the text as written, or the analysis error
 /// exactly as `typedpg check` reports it.
@@ -451,24 +489,32 @@ pub fn lint_query(
     sql: &str,
     options: &LintOptions,
 ) -> Result<Vec<Finding>, LocatedError> {
-    lint_query_called(catalog, sql, None, options)
+    Ok(lint_query_called(catalog, sql, &[], options)?
+        .into_iter()
+        .map(|finding| finding.finding)
+        .collect())
 }
 
-/// [`lint_query`], with the method called on the `sql!` result when the
-/// caller can see the Rust source (`cargo typedpg lint` can; the TypeScript
-/// CLI cannot).
+/// [`lint_query`], with the methods the caller saw called on the query.
 ///
 /// The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
-/// `unused_returning`) read `call` and the same
+/// `unused_returning`) read `calls` and the same
 /// [`QueryView`](typedpg_analyzer::QueryView) every other query rule uses,
-/// so no query is analyzed twice. Their findings are placed in the query
-/// text like any other.
+/// so no query is analyzed twice. Their findings carry the index in `calls`
+/// the caller places them at; the caller knows the call's file and span,
+/// which a query can have in several files. Every other finding has `call`
+/// `None` and is placed in the query text.
+///
+/// `unused_returning` is reported only when every call in `calls` is an
+/// `execute()`. The caller must leave out a query whose value may be used in
+/// ways the calls do not show (passed to another function, exported, …):
+/// such a use is not an `execute()` call.
 pub fn lint_query_called(
     catalog: &PgCatalog,
     sql: &str,
-    call: Option<CallMethod>,
+    calls: &[Call],
     options: &LintOptions,
-) -> Result<Vec<Finding>, LocatedError> {
+) -> Result<Vec<CallFinding>, LocatedError> {
     let view = catalog.query_view(sql)?;
     let tokens: Vec<Tok> = typedpg_pg_query::scan(&view.sql)
         .map(|scanned| {
@@ -495,6 +541,13 @@ pub fn lint_query_called(
         view: &view,
         catalog,
     };
+    let mut placed: Vec<CallFinding> = findings
+        .drain(..)
+        .map(|finding| CallFinding {
+            call: None,
+            finding,
+        })
+        .collect();
     for rule in Rule::ALL {
         let Some(severity) = options.level(rule) else {
             continue;
@@ -502,28 +555,51 @@ pub fn lint_query_called(
         if suppressed.contains(&rule) {
             continue;
         }
-        for raw in rules::findings(rule, &ctx)
-            .into_iter()
-            .chain(call_site::findings(rule, &ctx, call))
-        {
-            findings.push(Finding {
-                rule,
-                severity,
-                span: raw.span,
-                message: raw.message,
-                help: raw.help,
-                fix: raw.fix,
+        for raw in rules::findings(rule, &ctx) {
+            placed.push(CallFinding {
+                call: None,
+                finding: Finding {
+                    rule,
+                    severity,
+                    span: raw.span,
+                    message: raw.message,
+                    help: raw.help,
+                    fix: raw.fix,
+                },
             });
         }
+        placed.extend(
+            call_site::findings(rule, &ctx, calls)
+                .into_iter()
+                .map(|raw| CallFinding {
+                    call: raw.call,
+                    finding: Finding {
+                        rule,
+                        severity,
+                        span: raw.finding.span,
+                        message: raw.finding.message,
+                        help: raw.finding.help,
+                        fix: raw.finding.fix,
+                    },
+                }),
+        );
     }
-    for finding in &mut findings {
-        finding.span = view.original_span(finding.span.clone());
-        for edit in &mut finding.fix {
+    for finding in &mut placed {
+        if finding.call.is_some() {
+            // A call-site finding is placed at the method identifier in the
+            // calling file; its span is the caller's to fill. Only its fix
+            // is in the analyzed SQL.
+            finding.finding.span = 0..0;
+        } else {
+            finding.finding.span = view.original_span(finding.finding.span.clone());
+        }
+        for edit in &mut finding.finding.fix {
             edit.range = view.original_span(edit.range.clone());
         }
     }
     let mut bugs = Vec::new();
-    for finding in &mut findings {
+    for placed_finding in &mut placed {
+        let finding = &mut placed_finding.finding;
         if finding.fix.is_empty() {
             continue;
         }
@@ -544,25 +620,43 @@ pub fn lint_query_called(
             if cfg!(test) {
                 panic!("{message}: {sql}");
             }
-            bugs.push(Finding {
-                rule: Rule::InternalError,
-                severity: Severity::Warning,
-                span: finding.span.clone(),
-                message,
-                help: Some(
-                    "please report it at https://github.com/cubos/typedpg/issues with this query"
-                        .to_owned(),
-                ),
-                fix: Vec::new(),
+            bugs.push(CallFinding {
+                call: placed_finding.call,
+                finding: Finding {
+                    rule: Rule::InternalError,
+                    severity: Severity::Warning,
+                    span: finding.span.clone(),
+                    message,
+                    help: Some(
+                        "please report it at https://github.com/cubos/typedpg/issues with this \
+                         query"
+                            .to_owned(),
+                    ),
+                    fix: Vec::new(),
+                },
             });
         }
     }
-    findings.extend(bugs);
-    // A deterministic order within a query: by position, then rule.
-    findings.sort_by(|a, b| {
-        (a.span.start, a.span.end, a.rule).cmp(&(b.span.start, b.span.end, b.rule))
+    placed.extend(bugs);
+    // A deterministic order: the query's own findings by position, then the
+    // call-site findings by call.
+    placed.sort_by(|a, b| {
+        (
+            a.call.is_some(),
+            a.call.unwrap_or(0),
+            a.finding.span.start,
+            a.finding.span.end,
+            a.finding.rule,
+        )
+            .cmp(&(
+                b.call.is_some(),
+                b.call.unwrap_or(0),
+                b.finding.span.start,
+                b.finding.span.end,
+                b.finding.rule,
+            ))
     });
-    Ok(findings)
+    Ok(placed)
 }
 
 /// Whether `sql` with `fix` applied still analyzes to the same query shape
@@ -956,10 +1050,10 @@ mod tests {
     }
 
     /// The config lists name every rule, each in `Rule::ALL`'s order: the
-    /// query, migration and schema rules in [`LINT_RULES`], the Rust-only
-    /// ones in [`RUST_LINT_RULES`]. The two lists are not concatenated in
-    /// `Rule::ALL`'s order (the two original Rust rules come before the new
-    /// rules), so each list is checked as a subsequence.
+    /// query, migration, schema and call-site rules in [`LINT_RULES`], the
+    /// Rust-only binding rules in [`RUST_LINT_RULES`]. The two lists are not
+    /// concatenated in `Rule::ALL`'s order (the two binding rules come before
+    /// the new rules), so each list is checked as a subsequence.
     fn assert_rule_lists_match() {
         let names: Vec<&str> = Rule::ALL.iter().map(|rule| rule.name()).collect();
         let lint: Vec<&str> = names

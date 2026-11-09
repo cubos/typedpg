@@ -125,15 +125,19 @@ and lints the migrations themselves:
 | `prefer_identity` | off | A `serial` column instead of an identity column. |
 | `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
 | `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
-| `fetch_may_return_many` | warning | `fetch_one` / `fetch_optional` on a query not proven to return at most one row (`cargo typedpg lint` only). |
-| `fetch_all_single_row` | info | `fetch_all` on a query that returns at most one row (`cargo typedpg lint` only). |
-| `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded (`cargo typedpg lint` only). |
+| `fetch_may_return_many` | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
+| `fetch_all_single_row` | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
+| `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
 
-The `cargo typedpg lint`-only rules are about the `sql!` invocation in Rust,
-not the SQL text: `redundant_binding` and `renaming_binding` look at its
-bindings, and `fetch_may_return_many`, `fetch_all_single_row` and
-`unused_returning` at its call site. The TypeScript CLI has neither and does
-not have them.
+The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
+`unused_returning`) run in both CLIs: a query can be called directly on the
+`sql!(…)` / `sql(…)` expression, through a local binding, or — in TypeScript
+— through an exported query of a `.sql` file or another source. Their findings
+are placed at the method identifier in the calling file, and their fix edits
+the SQL where the query is written. `redundant_binding` and
+`renaming_binding` are about the `sql!` invocation in Rust, not the SQL text:
+only `cargo typedpg lint` reports them (the TypeScript CLI has no bindings),
+and only `[package.metadata.typedpg.lint]` accepts their keys.
 
 The `lint` table sets each rule's level (`"error"`, `"warning"`, `"info"` or
 `"off"`) and `fail_on`, the severity the run fails on (default `"error"`):

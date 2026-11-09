@@ -38,19 +38,23 @@
 //!
 //! The query rules are `null_comparison`, `unbounded_write`,
 //! `not_in_nullable`, `redundant_null_check`, `limit_without_order`,
-//! `redundant_limit`, `redundant_distinct` and `like_unescaped_param`; the
-//! migration rules `create_index_blocking`, `constraint_validating`,
+//! `redundant_limit`, `redundant_distinct`, `like_unescaped_param`,
+//! `fetch_may_return_many`, `fetch_all_single_row` and `unused_returning`;
+//! the migration rules `create_index_blocking`, `constraint_validating`,
 //! `set_not_null_scan`, `table_rewrite` and `missing_lock_timeout`; and the
 //! schema rules `fk_without_index`, `redundant_index`, `fk_type_mismatch`,
 //! `prefer_timestamptz`, `prefer_identity`, `prefer_text` and
 //! `prefer_bigint_pk`, evaluated over the migrations' final schema.
 //! `like_unescaped_param` and the `prefer_*` rules are off by default; set
 //! them to a level to enable them. [`LINT_RULES`] is the one list of their
-//! keys. The `sql!` rules `redundant_binding`, `renaming_binding`,
-//! `fetch_may_return_many`, `fetch_all_single_row` and `unused_returning`
-//! ([`RUST_LINT_RULES`]) run over the Rust source of the invocations, so only
-//! `cargo typedpg lint` reports them, and only this configuration accepts
-//! their keys — the TypeScript CLI has no bindings or Rust call site.
+//! keys. The call-site rules (`fetch_may_return_many`,
+//! `fetch_all_single_row` and `unused_returning`) run in both CLIs: they
+//! check how a query is called (`fetch_one`, `fetchOne`, `execute`, …)
+//! against what the schema proves about its rows. The `sql!` rules
+//! `redundant_binding` and `renaming_binding` ([`RUST_LINT_RULES`]) run over
+//! the Rust source of the invocations, so only `cargo typedpg lint` reports
+//! them, and only this configuration accepts their keys — the TypeScript CLI
+//! has no bindings.
 //! `ignore` lists glob patterns, relative to the manifest's directory. A
 //! matching query file's findings are not reported; a matching migration
 //! file keeps its schema findings (`fk_without_index`, `redundant_index`),
@@ -169,8 +173,8 @@ impl SimplifySetting {
 
 /// The lint rules' configuration keys, one per rule: the
 /// `[package.metadata.typedpg.lint]` keys (and the TypeScript CLI's `lint`
-/// object's, in camelCase). The query, migration and schema rules, in
-/// `typedpg_lint::Rule::ALL`'s order; the Rust-only rules are in
+/// object's, in camelCase). The query, migration, schema and call-site rules,
+/// in `typedpg_lint::Rule::ALL`'s order; the Rust-only binding rules are in
 /// [`RUST_LINT_RULES`].
 pub const LINT_RULES: &[&str] = &[
     "null_comparison",
@@ -193,22 +197,18 @@ pub const LINT_RULES: &[&str] = &[
     "prefer_identity",
     "prefer_text",
     "prefer_bigint_pk",
-];
-
-/// The lint rules over the Rust source of `sql!` invocations: the binding
-/// rules, and the call-site rules about the fetch method and discarded
-/// `RETURNING` rows.
-///
-/// `cargo typedpg lint` reports them; the TypeScript CLI has no bindings or
-/// Rust call site and keeps rejecting them, so they are accepted only in
-/// `[package.metadata.typedpg.lint]`.
-pub const RUST_LINT_RULES: &[&str] = &[
-    "redundant_binding",
-    "renaming_binding",
     "fetch_may_return_many",
     "fetch_all_single_row",
     "unused_returning",
 ];
+
+/// The lint rules over the Rust source of `sql!` invocations: the binding
+/// rules.
+///
+/// `cargo typedpg lint` reports them; the TypeScript CLI has no `sql!`
+/// bindings and keeps rejecting them, so they are accepted only in
+/// `[package.metadata.typedpg.lint]`.
+pub const RUST_LINT_RULES: &[&str] = &["redundant_binding", "renaming_binding"];
 
 /// The types whose default Rust types can't hold `infinity` / `-infinity`
 /// (chrono's `NaiveDate`, `NaiveDateTime` and `DateTime<Utc>`, which
@@ -309,7 +309,8 @@ impl LintLevel {
 pub struct LintConfig {
     /// A finding at or above this severity fails the run.
     pub fail_on: LintSeverity,
-    /// The rules whose level is overridden, keyed by [`LINT_RULES`].
+    /// The rules whose level is overridden, keyed by [`LINT_RULES`] (or
+    /// [`RUST_LINT_RULES`]).
     pub levels: BTreeMap<String, LintLevel>,
     /// Glob patterns, relative to the project root with forward slashes. A
     /// matching query file's findings are not reported; a matching migration
@@ -1636,8 +1637,8 @@ event_data = "crate::EventData"
              `limit_without_order`, `redundant_limit`, `redundant_distinct`, \
              `like_unescaped_param`, `fk_type_mismatch`, `missing_lock_timeout`, \
              `prefer_timestamptz`, `prefer_identity`, `prefer_text`, `prefer_bigint_pk`, \
-             `redundant_binding`, `renaming_binding`, `fetch_may_return_many`, \
-             `fetch_all_single_row`, `unused_returning`"
+             `fetch_may_return_many`, `fetch_all_single_row`, `unused_returning`, \
+             `redundant_binding`, `renaming_binding`"
         );
     }
 

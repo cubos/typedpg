@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 use typedpg_analyzer::PgCatalog;
 use typedpg_core::QualifiedName;
-use typedpg_lint::{MigrationLint, SqlEdit};
+use typedpg_lint::{Language, MigrationLint, SqlEdit};
 
 use crate::config::{
     Config, DatabaseConfig, Emit, OutKind, OverrideModule, declaration_path, out_kind,
@@ -21,7 +21,8 @@ use crate::config::{
 use crate::emit::{Embedded, Module, TypeCheck};
 use crate::generate::{GenError, Generated, generate};
 use crate::scan::{
-    Export, FileScan, Kind, LineIndex, Literal, ModuleExports, Position, module_exports, scan,
+    Export, FileScan, Kind, LineIndex, Literal, ModuleExports, Position, QueryExport,
+    module_exports, scan,
 };
 use crate::sqlfile::{ModuleNames, SqlFile};
 use crate::sqlmodule::{Mapped, SqlModule, SqlQuery, generated_source, source_from};
@@ -70,6 +71,9 @@ pub struct Project {
     /// Whether TypeScript sources are scanned (not to compile `.sql` files
     /// alone).
     scan_sources: bool,
+    /// Scan the sources even when no database generates a module (lint
+    /// does, for the calls on `.sql` queries; `gen` and `check` don't).
+    scan_without_modules: bool,
     /// Each `.sql` file: its database and its queries.
     sql_files: BTreeMap<PathBuf, (usize, SqlFile)>,
     /// Each module generated for a `.sql` file → the file.
@@ -154,6 +158,33 @@ pub struct LintQuery<'a> {
     /// Where to point when the query's analysis has no offset.
     pub pos: Position,
     pub lines: &'a LineIndex,
+    /// The methods called on the query, wherever the calling file is.
+    pub calls: Vec<LintCall<'a>>,
+    /// A use the scan cannot see as a method call (an exported query, a
+    /// binding passed to a function, …): `unused_returning` stays quiet.
+    pub escapes: bool,
+}
+
+/// A call on a [`LintQuery`], in the file that calls it.
+#[derive(Debug, Clone)]
+pub struct LintCall<'a> {
+    /// The method as written: `fetch_one`, `fetchOne`, `execute`, …
+    pub method: String,
+    /// The byte range of the method identifier in [`Self::file`].
+    pub span: Range<usize>,
+    pub file: &'a Path,
+    pub lines: &'a LineIndex,
+}
+
+impl LintCall<'_> {
+    /// The call as the lint crate reads it.
+    pub fn call(&self) -> typedpg_lint::Call {
+        typedpg_lint::Call {
+            method: call_method(&self.method).expect("only known methods become lint calls"),
+            name: self.method.clone(),
+            language: Language::TypeScript,
+        }
+    }
 }
 
 /// How a [`LintQuery`]'s text sits in its file.
@@ -219,16 +250,28 @@ impl Project {
     /// written empty first: sources import it, and an import that doesn't
     /// resolve can't be told apart from another module's.
     pub fn new(config: Config, check: bool) -> Result<Project, String> {
-        Self::open(config, check, true)
+        Self::open(config, check, true, false)
+    }
+
+    /// A project for `typedpg lint`: like [`Self::new`] in check mode, but
+    /// it scans the sources even when no database generates a module, to
+    /// find the calls on the `.sql` queries they import.
+    pub fn for_lint(config: Config) -> Result<Project, String> {
+        Self::open(config, true, true, true)
     }
 
     /// A project that compiles `.sql` files alone: it scans no TypeScript
     /// source and writes nothing.
     pub fn sql_only(config: Config) -> Result<Project, String> {
-        Self::open(config, true, false)
+        Self::open(config, true, false, false)
     }
 
-    fn open(config: Config, check: bool, scan_sources: bool) -> Result<Project, String> {
+    fn open(
+        config: Config,
+        check: bool,
+        scan_sources: bool,
+        scan_without_modules: bool,
+    ) -> Result<Project, String> {
         let mut dbs = Vec::new();
         for db in &config.databases {
             let kind = db.out.as_deref().map(out_kind).transpose()?;
@@ -315,6 +358,7 @@ impl Project {
             files: BTreeMap::new(),
             modules: RefCell::new(HashMap::new()),
             scan_sources,
+            scan_without_modules,
             sql_files: BTreeMap::new(),
             sql_outputs: BTreeMap::new(),
             sql_generated: BTreeSet::new(),
@@ -485,7 +529,9 @@ impl Project {
         self.resolver.clear_cache();
         self.modules.borrow_mut().clear();
         self.files.clear();
-        if !self.scan_sources || !self.dbs.iter().any(|db| db.config.out.is_some()) {
+        if !self.scan_sources
+            || (!self.scan_without_modules && !self.dbs.iter().any(|db| db.config.out.is_some()))
+        {
             return;
         }
         let mut sources = Vec::new();
@@ -540,6 +586,11 @@ impl Project {
                 n => Kind::of_export(n).map(|kind| Export::Item { db, kind }),
             };
         }
+        // A `.sql` file, or a module generated for one: its queries are
+        // exported by their `@name`.
+        if let Some(export) = self.sql_query_export(path, name) {
+            return Some(export);
+        }
         let followable = path
             .extension()
             .and_then(|e| e.to_str())
@@ -558,6 +609,13 @@ impl Project {
                 })
                 .clone()?
         };
+        // `export const x = sql(…)`, or a local one exported later.
+        if exports.queries.iter().any(|query| query == name) {
+            return Some(Export::Query(QueryExport {
+                file: canonical(path),
+                name: name.to_owned(),
+            }));
+        }
         let dir = path.parent().unwrap_or(Path::new("."));
         for entry in &exports.entries {
             if let crate::scan::ExportEntry::Named {
@@ -579,6 +637,40 @@ impl Project {
             }
             crate::scan::ExportEntry::Named { .. } => None,
         })
+    }
+
+    /// The query `name` of the `.sql` file `path` is, its module, or a
+    /// declaration file generated for it, if it exports one.
+    fn sql_query_export(&self, path: &Path, name: &str) -> Option<Export> {
+        let file = self.sql_file_of(path)?;
+        let (_, parsed) = self.sql_files.get(&file)?;
+        if !parsed.queries.iter().any(|query| query.name == name) {
+            return None;
+        }
+        Some(Export::Query(QueryExport {
+            file: canonical(&file),
+            name: name.to_owned(),
+        }))
+    }
+
+    /// The `.sql` file `path` is (the file itself, a module generated for it,
+    /// or its declaration file), comparing canonical paths for what the
+    /// resolver returned.
+    fn sql_file_of(&self, path: &Path) -> Option<PathBuf> {
+        if self.sql_files.contains_key(path) {
+            return Some(path.to_path_buf());
+        }
+        if let Some(file) = self.sql_outputs.get(path) {
+            return Some(file.clone());
+        }
+        let wanted = canonical(path);
+        if let Some(file) = self.sql_files.keys().find(|file| canonical(file) == wanted) {
+            return Some(file.clone());
+        }
+        self.sql_outputs
+            .iter()
+            .find(|(output, _)| canonical(output) == wanted)
+            .map(|(_, file)| file.clone())
     }
 
     /// Rebuild database `i`'s catalog if its migrations changed.
@@ -1000,14 +1092,46 @@ impl Project {
 
     /// Every query `typedpg lint` runs, sorted by file and position:
     /// `sql()` calls in the sources, and each `.sql` query with the
-    /// comments between its `@name` block and its statement.
+    /// comments between its `@name` block and its statement. The calls on a
+    /// query may come from other files: an exported `.sql` query, or an
+    /// exported TypeScript `sql()` binding.
     pub fn lint_queries(&self) -> Vec<LintQuery<'_>> {
+        // Every call on another module's query, by the query's file and
+        // export name.
+        let mut remote: HashMap<(PathBuf, String), Vec<LintCall<'_>>> = HashMap::new();
+        for (path, scan) in &self.files {
+            for call in &scan.remote_calls {
+                let Some(lint) = lint_call(path, &scan.lines, &call.method, call.span.clone())
+                else {
+                    continue;
+                };
+                remote
+                    .entry((call.query.file.clone(), call.query.name.clone()))
+                    .or_default()
+                    .push(lint);
+            }
+        }
+
         let mut out = Vec::new();
         for (path, scan) in &self.files {
             for query in &scan.queries {
                 if query.kind != Kind::Query {
                     continue;
                 }
+                let mut calls: Vec<LintCall<'_>> = query
+                    .calls
+                    .iter()
+                    .filter_map(|call| {
+                        lint_call(path, &scan.lines, &call.method, call.span.clone())
+                    })
+                    .collect();
+                let key = canonical(path);
+                for name in &query.exports {
+                    if let Some(remote) = remote.get(&(key.clone(), name.clone())) {
+                        calls.extend(remote.iter().cloned());
+                    }
+                }
+                calls.sort_by_key(|call| (call.file.to_path_buf(), call.span.start));
                 out.push(LintQuery {
                     db: query.db,
                     file: path,
@@ -1015,6 +1139,8 @@ impl Project {
                     source: QuerySource::Literal(&query.literal),
                     pos: query.pos,
                     lines: &scan.lines,
+                    calls,
+                    escapes: query.escapes || !query.exports.is_empty(),
                 });
             }
         }
@@ -1022,6 +1148,10 @@ impl Project {
             for query in &file.queries {
                 let start = query.after_name;
                 let end = query.start + query.text.len();
+                let calls = remote
+                    .get(&(canonical(path), query.name.clone()))
+                    .cloned()
+                    .unwrap_or_default();
                 out.push(LintQuery {
                     db: *db,
                     file: path,
@@ -1029,6 +1159,10 @@ impl Project {
                     source: QuerySource::File { start },
                     pos: query.pos,
                     lines: &file.lines,
+                    calls,
+                    // A `.sql` query is the module's export: it can be used
+                    // anywhere, so `unused_returning` cannot be sure.
+                    escapes: true,
                 });
             }
         }
@@ -1108,6 +1242,34 @@ impl Project {
         }
         files.sort();
         files
+    }
+}
+
+/// The lint call the method as written makes, when a rule knows it.
+fn lint_call<'a>(
+    path: &'a Path,
+    lines: &'a LineIndex,
+    method: &str,
+    span: Range<usize>,
+) -> Option<LintCall<'a>> {
+    call_method(method).map(|_| LintCall {
+        method: method.to_owned(),
+        span,
+        file: path,
+        lines,
+    })
+}
+
+/// The call-site rule's view of a TypeScript method: the ones the rules
+/// know; `fetchStream` and anything else is ignored.
+pub fn call_method(name: &str) -> Option<typedpg_lint::CallMethod> {
+    use typedpg_lint::CallMethod;
+    match name {
+        "fetchOne" | "fetchValue" => Some(CallMethod::FetchOne),
+        "fetchOptional" | "fetchValueOptional" => Some(CallMethod::FetchOptional),
+        "fetchAll" => Some(CallMethod::FetchAll),
+        "execute" => Some(CallMethod::Execute),
+        _ => None,
     }
 }
 
