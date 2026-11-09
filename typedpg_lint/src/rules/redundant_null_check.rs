@@ -4,6 +4,8 @@
 //! argument has the call's result type; an `IS [NOT] NULL` test has none
 //! (removing it from a `WHERE` changes which rows are kept).
 
+use std::collections::HashSet;
+
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{CoalesceExpr, Node, NullTest, NullTestType, node::Node as N};
 
@@ -12,10 +14,23 @@ use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     let mut out = Vec::new();
+    // A `COALESCE` directly under an unnamed `ResTarget` names its output
+    // column `coalesce`; removing the call renames it, so its fix is
+    // withheld. Collect them first: a node visited later needs to know.
+    let mut unaliased = HashSet::new();
+    for (node, _) in ctx.tree.nodes() {
+        if let NodeRef::ResTarget(target) = node
+            && target.name.is_empty()
+            && let Some(N::CoalesceExpr(expr)) =
+                target.val.as_deref().and_then(|val| val.node.as_ref())
+        {
+            unaliased.insert(expr.location);
+        }
+    }
     for (node, _) in ctx.tree.nodes() {
         match node {
             NodeRef::NullTest(test) => null_test(ctx, test, &mut out),
-            NodeRef::CoalesceExpr(expr) => coalesce(ctx, expr, &mut out),
+            NodeRef::CoalesceExpr(expr) => coalesce(ctx, expr, &unaliased, &mut out),
             _ => {}
         }
     }
@@ -72,7 +87,12 @@ fn null_keyword_end(ctx: &Ctx<'_>, test_location: i32) -> Option<usize> {
 
 // ── COALESCE ───────────────────────────────────────────────────────────────
 
-fn coalesce(ctx: &Ctx<'_>, expr: &CoalesceExpr, out: &mut Vec<RawFinding>) {
+fn coalesce(
+    ctx: &Ctx<'_>,
+    expr: &CoalesceExpr,
+    unaliased: &HashSet<i32>,
+    out: &mut Vec<RawFinding>,
+) {
     let Some(fact) = ctx.view.coalesce_fact(expr.location) else {
         return;
     };
@@ -99,28 +119,45 @@ fn coalesce(ctx: &Ctx<'_>, expr: &CoalesceExpr, out: &mut Vec<RawFinding>) {
     // The kept argument decides the type once the others are gone: it must
     // already have the result type (`COALESCE('1', int_col)` is integer,
     // `'1'` alone is not).
+    //
+    // A few dropped arguments make the rewrite unsound or surprising, so the
+    // finding stays but the fix is withheld:
+    // - a function call outside a sublink is structural (an aggregate, window
+    //   or set-returning function shapes the rows even when never evaluated:
+    //   `COALESCE(1, max(v))` is one row, `1` is one per row);
+    // - a `COLLATE` clause or a column reference can decide the result's
+    //   collation (`COALESCE('x'::text, 'y'::text COLLATE "C")`);
+    // - an unaliased direct target column is named `coalesce`; any rewrite
+    //   risks its output name (dropping the call renames it outright).
+    let dropped = &expr.args[index + 1..];
+    let structural = dropped.iter().any(has_call_outside_sublink);
+    let collation = dropped.iter().any(has_collation_or_column);
+    let unaliased_target = unaliased.contains(&expr.location);
     if fact.args_share_result_type
         && fact.args_typed_as_result.get(index) == Some(&true)
         && let Some(args) = &args
         && args.len() == expr.args.len()
+        && !structural
+        && !collation
+        && !unaliased_target
     {
         let close_start = ctx.tokens[close].start;
         let arg_end = args[index].1;
         if index > 0 {
             fix.push(SqlEdit {
                 range: arg_end..close_start,
-                text: String::new(),
+                text: removed_separator(ctx, arg_end..close_start),
             });
-        } else if is_simple_argument(ctx, &expr.args[0], args[0].0) {
+        } else if is_simple_argument(ctx, &expr.args[0], args[0].0, args[0].1) {
             // `COALESCE(x, …)` becomes `x` — the call's closing parenthesis
             // goes too.
             fix.push(SqlEdit {
                 range: start..ctx.tokens[open].end,
-                text: String::new(),
+                text: removed_separator(ctx, start..ctx.tokens[open].end),
             });
             fix.push(SqlEdit {
                 range: arg_end..ctx.tokens[close].end,
-                text: String::new(),
+                text: removed_separator(ctx, arg_end..ctx.tokens[close].end),
             });
         } else {
             // `COALESCE(a + b, 0) * 2` becomes `(a + b) * 2`: keep the
@@ -131,7 +168,7 @@ fn coalesce(ctx: &Ctx<'_>, expr: &CoalesceExpr, out: &mut Vec<RawFinding>) {
             });
             fix.push(SqlEdit {
                 range: arg_end..close_start,
-                text: String::new(),
+                text: removed_separator(ctx, arg_end..close_start),
             });
         }
     }
@@ -201,16 +238,98 @@ fn call_parens(ctx: &Ctx<'_>, start: usize) -> Option<(usize, usize)> {
 }
 
 /// Whether replacing `COALESCE(...)` by its first argument can leave the
-/// argument bare: a column, parameter, constant, function call or an already
-/// parenthesized expression binds like the call did.
-fn is_simple_argument(ctx: &Ctx<'_>, node: &Node, start: usize) -> bool {
-    if ctx.sql[start..].starts_with('(') {
+/// argument bare: a column, parameter, constant, function call or an
+/// expression whose own parentheses wrap it binds like the call did.
+fn is_simple_argument(ctx: &Ctx<'_>, node: &Node, start: usize, end: usize) -> bool {
+    if is_parenthesized(ctx, start, end) {
         return true;
     }
     matches!(
         node.node.as_ref(),
         Some(N::ColumnRef(_) | N::ParamRef(_) | N::AConst(_) | N::FuncCall(_))
     )
+}
+
+/// Whether the argument starting at `start` and ending at `end` is one
+/// parenthesized expression: its first token is `(` and the matching `)` is
+/// its last token. `((1) + 2)` is, `(1) + 2` is not.
+fn is_parenthesized(ctx: &Ctx<'_>, start: usize, end: usize) -> bool {
+    let Some(open) = ctx.tokens.iter().position(|token| token.start == start) else {
+        return false;
+    };
+    if &ctx.sql[ctx.tokens[open].start..ctx.tokens[open].end] != "(" {
+        return false;
+    }
+    let mut depth = 0usize;
+    for token in &ctx.tokens[open..] {
+        match &ctx.sql[token.start..token.end] {
+            "(" => depth += 1,
+            ")" => {
+                let Some(remaining) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = remaining;
+                if depth == 0 {
+                    return token.end == end;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a dropped argument holds a function call outside any sublink:
+/// aggregates, window functions and set-returning functions shape the rows
+/// the query returns even when `COALESCE` never evaluates them.
+fn has_call_outside_sublink(node: &Node) -> bool {
+    node.node
+        .as_ref()
+        .is_some_and(|node| call_outside_sublink(node.to_ref()))
+}
+
+fn call_outside_sublink(node: NodeRef<'_>) -> bool {
+    match node {
+        // A call inside a sublink belongs to the subquery: dropping the
+        // whole sublink cannot change the outer query's rows.
+        NodeRef::SubLink(_) => false,
+        NodeRef::FuncCall(_) => true,
+        other => other.children().into_iter().any(call_outside_sublink),
+    }
+}
+
+/// Whether a dropped argument holds a `COLLATE` clause or a column reference:
+/// either can decide the `COALESCE`'s collation, even though the argument is
+/// never evaluated.
+fn has_collation_or_column(node: &Node) -> bool {
+    node.node
+        .as_ref()
+        .is_some_and(|node| collation_or_column(node.to_ref()))
+}
+
+fn collation_or_column(node: NodeRef<'_>) -> bool {
+    match node {
+        NodeRef::CollateClause(_) | NodeRef::ColumnRef(_) => true,
+        other => other.children().into_iter().any(collation_or_column),
+    }
+}
+
+/// The text replacing a removed range: empty, unless the two tokens it makes
+/// adjacent would otherwise merge into one (`1` + `AS` → `1AS`). Then a single
+/// space keeps them apart.
+fn removed_separator(ctx: &Ctx<'_>, range: std::ops::Range<usize>) -> String {
+    let left = ctx.sql[..range.start].chars().next_back();
+    let right = ctx.sql[range.end..].chars().next();
+    match (left, right) {
+        (Some(left), Some(right)) if joins(left) && joins(right) => " ".to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Whether a token can continue, or start, an identifier, number or quoted
+/// token: two of these next to each other lex as one token.
+fn joins(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$' | '\'' | '"' | '.')
 }
 
 // ── text ───────────────────────────────────────────────────────────────────
@@ -429,8 +548,8 @@ mod tests {
         let db = catalog();
         let cases = [
             (
-                "SELECT COALESCE(nn, 0) FROM checks",
-                "SELECT nn FROM checks",
+                "SELECT COALESCE(nn, 0) AS result FROM checks",
+                "SELECT nn AS result FROM checks",
             ),
             (
                 "SELECT COALESCE(a + b, 0) * 2 FROM checks",
@@ -441,12 +560,12 @@ mod tests {
                 "SELECT (a + b) * 2 FROM checks",
             ),
             (
-                "SELECT COALESCE(nullable, nn, 0) FROM checks",
-                "SELECT COALESCE(nullable, nn) FROM checks",
+                "SELECT COALESCE(nullable, nn, 0) AS result FROM checks",
+                "SELECT COALESCE(nullable, nn) AS result FROM checks",
             ),
             (
-                "SELECT COALESCE(nullable, nn, a, b, 0) FROM checks",
-                "SELECT COALESCE(nullable, nn) FROM checks",
+                "SELECT COALESCE(nullable, nn, 5, 6, 0) AS result FROM checks",
+                "SELECT COALESCE(nullable, nn) AS result FROM checks",
             ),
         ];
         for (sql, expected) in cases {
@@ -489,20 +608,148 @@ mod tests {
     #[test]
     fn coalesce_dropping_an_untyped_literal_keeps_the_fix() {
         let db = catalog();
-        let sql = "SELECT COALESCE(name, '') FROM checks";
+        let sql = "SELECT COALESCE(name, '') AS n FROM checks";
         let findings = lint(&db, sql);
         let finding = only(&findings);
-        assert_eq!(fixed(sql, finding), "SELECT name FROM checks");
+        assert_eq!(fixed(sql, finding), "SELECT name AS n FROM checks");
     }
 
     #[test]
     fn coalesce_keeping_an_untyped_literal_has_no_fix() {
         // `COALESCE('1', nn)` is integer; `'1'` alone would be text.
         let db = catalog();
-        let sql = "SELECT COALESCE('1', nn) FROM checks";
+        let sql = "SELECT COALESCE('1', nn) AS x FROM checks";
         let findings = lint(&db, sql);
         let finding = only(&findings);
         assert!(finding.fix.is_empty(), "{finding:?}");
+    }
+
+    #[test]
+    fn coalesce_dropping_a_structural_function_call_has_no_fix() {
+        let db = catalog();
+        // Aggregates and window functions shape the rows even though
+        // `COALESCE` never evaluates them: `COALESCE(1, max(v))` is one row,
+        // while `1` alone is one per row.
+        for sql in [
+            "SELECT COALESCE(1, max(nn)) AS x FROM checks",
+            "SELECT COALESCE(nn, max(nn) OVER ()) AS x FROM checks",
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert!(finding.fix.is_empty(), "{sql}: {finding:?}");
+        }
+        // A call inside a sublink belongs to the subquery, so dropping the
+        // whole sublink is safe.
+        let sql = "SELECT COALESCE(1, (SELECT max(1))) AS x FROM checks";
+        let findings = lint(&db, sql);
+        let finding = only(&findings);
+        assert_eq!(fixed(sql, finding), "SELECT 1 AS x FROM checks");
+    }
+
+    #[test]
+    fn coalesce_parenthesization_requires_the_whole_argument() {
+        let db = catalog();
+        // Only `((1) + 2)` is wholly parenthesized; `(1) + 2` is not, so the
+        // call's grouping must be re-added.
+        let cases = [
+            ("SELECT COALESCE((1) + 2, 0) * 3", "SELECT ((1) + 2) * 3"),
+            ("SELECT COALESCE(((1) + 2), 0) * 3", "SELECT ((1) + 2) * 3"),
+        ];
+        for (sql, expected) in cases {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert_eq!(fixed(sql, finding), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn coalesce_dropping_a_collated_or_column_argument_has_no_fix() {
+        let db = catalog();
+        // A dropped argument's collation can still decide the result's; a
+        // column reference brings its own.
+        for sql in [
+            "SELECT COALESCE(name, 'y'::text COLLATE \"C\") AS x FROM checks",
+            "SELECT COALESCE(name, note) AS x FROM checks",
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert!(finding.fix.is_empty(), "{sql}: {finding:?}");
+        }
+    }
+
+    #[test]
+    fn coalesce_naming_an_unaliased_target_has_no_fix() {
+        let db = catalog();
+        // The unnamed target column would be renamed from `coalesce` to `nn`,
+        // and any rewrite of it is withheld to keep the output name stable.
+        for sql in [
+            "SELECT COALESCE(nn, 0) FROM checks",
+            "SELECT COALESCE(nullable, nn, 0) FROM checks",
+            "SELECT * FROM (SELECT COALESCE(nn, 0) FROM checks) s",
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert!(finding.fix.is_empty(), "{sql}: {finding:?}");
+        }
+        // An alias keeps the output name, and a larger expression is not the
+        // target entry's name.
+        for (sql, expected) in [
+            (
+                "SELECT COALESCE(nn, 0) AS nn FROM checks",
+                "SELECT nn AS nn FROM checks",
+            ),
+            (
+                "SELECT COALESCE(nn, 0) + 1 FROM checks",
+                "SELECT nn + 1 FROM checks",
+            ),
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert_eq!(fixed(sql, finding), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn coalesce_removal_keeps_adjacent_tokens_apart() {
+        let db = catalog();
+        for (sql, expected) in [
+            ("SELECT COALESCE(1,0)AS result", "SELECT 1 AS result"),
+            (
+                "SELECT COALESCE(\"name\", 'y'::text)AS result FROM checks",
+                "SELECT \"name\" AS result FROM checks",
+            ),
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert_eq!(fixed(sql, finding), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn never_null_inference_handles_empty_inputs_and_srf_padding() {
+        let db = catalog();
+        // A scalar subquery returns NULL when it selects no row; an aggregate
+        // over no rows is NULL; a CASE without ELSE is NULL on the else path;
+        // and target-list set-returning functions of different lengths pad
+        // the shorter ones with NULL.
+        for sql in [
+            "SELECT COALESCE((SELECT nn FROM checks WHERE false), 0) AS x FROM checks",
+            "SELECT COALESCE(max(nn), 0) AS x FROM checks",
+            "SELECT COALESCE(CASE WHEN nn > 0 THEN nn END, 0) AS x FROM checks",
+            "SELECT generate_series(1, 2), unnest(ARRAY[1, 2, 3]) IS NULL",
+        ] {
+            let findings = lint(&db, sql);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule != Rule::RedundantNullCheck),
+                "{sql}: {findings:?}"
+            );
+        }
+        // `count(*)` is 0, never NULL, even over an empty input.
+        let sql = "SELECT count(*) IS NULL FROM checks";
+        let findings = lint(&db, sql);
+        assert_eq!(only(&findings).rule, Rule::RedundantNullCheck);
     }
 
     #[test]

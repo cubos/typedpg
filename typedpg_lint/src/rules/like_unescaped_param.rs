@@ -71,7 +71,12 @@ fn classify(node: &Node, bare_param: &mut bool, wildcard: &mut bool) {
     match node.node.as_ref() {
         Some(N::ParamRef(_)) => *bare_param = true,
         Some(N::TypeCast(cast)) => {
-            if let Some(arg) = &cast.arg {
+            // A cast chain through a type that cannot hold `%` or `_`
+            // (`$n::integer::text`, `$id::uuid::text`) validates or converts
+            // the value: no wildcard survives it.
+            if cast.type_name.as_ref().is_none_or(type_carries_wildcards)
+                && let Some(arg) = &cast.arg
+            {
                 classify(arg, bare_param, wildcard);
             }
         }
@@ -101,6 +106,20 @@ fn classify(node: &Node, bare_param: &mut bool, wildcard: &mut bool) {
 
 fn is_concat(expr: &AExpr) -> bool {
     AExprKind::try_from(expr.kind) == Ok(AExprKind::AexprOp) && operator_name(expr) == Some("||")
+}
+
+/// Whether a cast target type keeps a string's `%` and `_`: only the string
+/// and identifier types PG has. A cast to anything else parses the value, so
+/// the wildcard characters cannot reach the pattern.
+fn type_carries_wildcards(type_name: &typedpg_pg_query::protobuf::TypeName) -> bool {
+    let name = type_name.names.last().and_then(|node| match &node.node {
+        Some(N::String(s)) => Some(s.sval.as_str()),
+        _ => None,
+    });
+    matches!(
+        name,
+        Some("text" | "varchar" | "bpchar" | "name" | "citext" | "unknown")
+    )
 }
 
 fn is_concat_call(call: &FuncCall) -> bool {
@@ -238,6 +257,29 @@ mod tests {
                 "{sql}: {findings:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_param_cast_through_a_type_without_wildcards_is_not_reported() {
+        let db = catalog();
+        // The intermediate cast parses the value, so `%` and `_` cannot reach
+        // the pattern.
+        for sql in [
+            "SELECT id FROM users WHERE name LIKE '%' || $n::integer::text || '%'",
+            "SELECT id FROM users WHERE name LIKE '%' || $id::uuid::text || '%'",
+            "SELECT id FROM users WHERE name LIKE concat('%', $n::integer::text, '%')",
+        ] {
+            let findings = lint(&db, sql);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule != Rule::LikeUnescapedParam),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A text cast keeps the parameter's wildcards.
+        let sql = "SELECT id FROM users WHERE name LIKE '%' || $q::text || '%'";
+        assert_eq!(only(&lint(&db, sql)).rule, Rule::LikeUnescapedParam);
     }
 
     #[test]
