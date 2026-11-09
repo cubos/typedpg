@@ -8,7 +8,7 @@
 //! their tokens as expressions and as statements. A `sql!` whose SQL
 //! argument is not a literal is an error, as the macro's own parse is.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Span, TokenStream};
 use syn::PathArguments;
@@ -30,6 +30,19 @@ pub(crate) struct FoundQuery {
     /// The bindings after the literal, exactly as the macro parses them;
     /// empty when that parse fails (the SQL is still linted).
     pub bindings: Vec<Binding>,
+    /// The method called directly on the macro expression, if any: the
+    /// `fetch_one()` of `sql!(…).fetch_one().await`.
+    pub call: Option<Call>,
+}
+
+/// A method called directly on a `sql!` expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Call {
+    /// The method's name (`fetch_one`, `fetch_optional`, `fetch_all`,
+    /// `execute`, …).
+    pub method: String,
+    /// File byte range of the method identifier in the chain.
+    pub span: std::ops::Range<usize>,
 }
 
 /// One `name = expr` or bare `name` binding of a `sql!` invocation.
@@ -123,6 +136,7 @@ pub(crate) fn scan(text: &str) -> Result<Scan, syn::Error> {
         text,
         scan: Scan::default(),
         seen: HashSet::new(),
+        queries: HashMap::new(),
     };
     finder.visit_file(&file);
     Ok(finder.scan)
@@ -134,6 +148,9 @@ struct Finder<'a> {
     /// The path start of each macro already recorded: parsing a macro's
     /// tokens as both expressions and statements visits it twice.
     seen: HashSet<usize>,
+    /// The index in `scan.queries` of the query recorded at each macro path
+    /// start, so a method call on it can attach the call site.
+    queries: HashMap<usize, usize>,
 }
 
 impl Finder<'_> {
@@ -151,11 +168,13 @@ impl Finder<'_> {
                     return;
                 };
                 let bindings = parse_bindings(self.text, rest).unwrap_or_default();
+                self.queries.insert(start, self.scan.queries.len());
                 self.scan.queries.push(FoundQuery {
                     db,
                     text: literal.value.clone(),
                     literal,
                     bindings,
+                    call: None,
                 });
             }
             Err(error) => self.scan.errors.push(FoundError {
@@ -213,6 +232,45 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             Some("copy_in") => self.record_copy_in(mac),
             _ => self.descend(&mac.tokens),
         }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        // A method called on the macro expression names the call site of
+        // the query the macro records. The receiver is visited first, so
+        // the query exists by the time the link is made.
+        if let Expr::MethodCall(method) = expr
+            && let Some(mac) = receiver_macro(&method.receiver)
+            && mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "sql")
+        {
+            let start = span_offset(self.text, mac.path.span());
+            let method_span = method.method.span();
+            let name = method.method.to_string();
+            let span = span_offset(self.text, method_span)..span_end_offset(self.text, method_span);
+            syn::visit::visit_expr(self, expr);
+            if let Some(&index) = self.queries.get(&start)
+                && let query = &mut self.scan.queries[index]
+                && query.call.is_none()
+            {
+                query.call = Some(Call { method: name, span });
+            }
+            return;
+        }
+        syn::visit::visit_expr(self, expr);
+    }
+}
+
+/// The `sql!` macro expression `expr` is, through parentheses and the
+/// invisible groups macro input can create.
+fn receiver_macro(expr: &Expr) -> Option<&Macro> {
+    match expr {
+        Expr::Macro(mac) => Some(&mac.mac),
+        Expr::Paren(paren) => receiver_macro(&paren.expr),
+        Expr::Group(group) => receiver_macro(&group.expr),
+        _ => None,
     }
 }
 
@@ -789,5 +847,63 @@ fn main() {
         let query = &queries(source)[0];
         assert_eq!(query.text, "SELECT 1");
         assert!(query.bindings.is_empty());
+    }
+
+    #[test]
+    fn a_method_called_on_the_macro_is_recorded() {
+        for (source, method) in [
+            (
+                r#"fn main() { let _ = sql!(pool, "SELECT 1").fetch_one().await; }"#,
+                "fetch_one",
+            ),
+            (
+                r#"fn main() { let _ = (sql!(pool, "SELECT 1")).execute(); }"#,
+                "execute",
+            ),
+            (
+                r#"fn main() {
+    let _ = sql!(pool, "SELECT 1")
+        .fetch_optional()
+        .await;
+}"#,
+                "fetch_optional",
+            ),
+            (
+                r#"fn main() {
+    let _ = sql!(pool, "SELECT 1")
+        .fetch_all()
+        .await?;
+}"#,
+                "fetch_all",
+            ),
+            (
+                r#"fn main() { let _ = sql!(pool, "SELECT 1").fetch_one_as::<T>(); }"#,
+                "fetch_one_as",
+            ),
+        ] {
+            let found = queries(source);
+            assert_eq!(found.len(), 1, "{source}");
+            let call = found[0]
+                .call
+                .as_ref()
+                .unwrap_or_else(|| panic!("no call site: {source}"));
+            assert_eq!(call.method, method, "{source}");
+            assert_eq!(&source[call.span.clone()], method, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_method_on_a_bound_query_is_not_a_call_on_the_macro() {
+        let source = r#"fn main() {
+    let query = sql!(pool, "SELECT 1");
+    let _ = query.fetch_one().await;
+}"#;
+        assert!(queries(source)[0].call.is_none());
+    }
+
+    #[test]
+    fn a_plain_query_has_no_call_site() {
+        let source = r#"fn main() { sql!(pool, "SELECT 1").await; }"#;
+        assert!(queries(source)[0].call.is_none());
     }
 }

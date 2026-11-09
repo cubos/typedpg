@@ -26,7 +26,8 @@ use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
 use typedpg_lint::{
-    Finding, IgnoreSet, LintOptions, MigrationFile, MigrationLint, lint_migrations, lint_query,
+    CallMethod, Finding, IgnoreSet, LintOptions, MigrationFile, MigrationLint, lint_migrations,
+    lint_query_called,
 };
 
 /// The directories under the manifest's directory that hold Rust sources.
@@ -40,6 +41,9 @@ struct Site {
     sql: String,
     literal: scan::Literal,
     bindings: Vec<scan::Binding>,
+    /// The method called directly on the `sql!` result, as the call-site
+    /// rules read it.
+    call: Option<CallMethod>,
 }
 
 /// A finding's fix, pending the `lint.ignore` retain and `--fix`.
@@ -214,7 +218,8 @@ fn build(
     }
 
     let mut pending = Vec::new();
-    let mut cache: HashMap<(Option<String>, String), LintResult> = HashMap::new();
+    let mut cache: HashMap<(Option<String>, String, Option<CallMethod>), LintResult> =
+        HashMap::new();
     for site in &sites {
         let path = relative(&site.path, &base);
         report.sources.insert(path.clone(), site.file.clone());
@@ -242,9 +247,9 @@ fn build(
             continue;
         };
         let result = cache
-            .entry((site.db.clone(), site.sql.clone()))
+            .entry((site.db.clone(), site.sql.clone(), site.call))
             .or_insert_with(|| {
-                lint_query(catalog, &site.sql, &options)
+                lint_query_called(catalog, &site.sql, site.call, &options)
                     .map_err(|error| (error.error.to_string(), error.offset))
             });
         match result {
@@ -506,6 +511,18 @@ fn relative(path: &Path, base: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// The call-site rule's view of a scanned method: only the four methods the
+/// rules know are calls; anything else acts like a query with no call site.
+fn call_method(call: Option<&scan::Call>) -> Option<CallMethod> {
+    match call?.method.as_str() {
+        "fetch_one" | "fetch_one_as" => Some(CallMethod::FetchOne),
+        "fetch_optional" | "fetch_optional_as" => Some(CallMethod::FetchOptional),
+        "fetch_all" | "fetch_all_as" => Some(CallMethod::FetchAll),
+        "execute" => Some(CallMethod::Execute),
+        _ => None,
+    }
+}
+
 fn scan_sources(base: &Path) -> Sources {
     let mut paths = Vec::new();
     for dir in SOURCE_DIRS {
@@ -557,6 +574,7 @@ fn scan_sources(base: &Path) -> Sources {
                 sql: query.text,
                 literal: query.literal,
                 bindings: query.bindings,
+                call: call_method(query.call.as_ref()),
             });
         }
         for copy in scanned.copies {
