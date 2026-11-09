@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use typedpg_analyzer::select_at_most_one_row;
+use typedpg_analyzer::{ProVolatile, select_at_most_one_row};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
     self, LockWaitPolicy, SelectStmt, SubLinkType, a_const::Val, node::Node,
@@ -36,6 +36,9 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             continue;
         }
         if has_skip_locked(select) || limit_is_zero(select) {
+            continue;
+        }
+        if constant_target(ctx, select) {
             continue;
         }
         if select_at_most_one_row(ctx.catalog, ctx.view, select) {
@@ -111,6 +114,61 @@ fn limit_is_zero(select: &SelectStmt) -> bool {
             if !value.isnull
                 && matches!(value.val, Some(Val::Ival(ref count)) if count.ival == 0)
     )
+}
+
+/// Whether every output row carries the same values: the target list reads
+/// no column (anywhere, sublinks included) and calls nothing that may vary
+/// per row. Whichever rows the plan picks, the output is then the same.
+fn constant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    // A set operation's rows come from its arms; there is no target list.
+    if select.op() != typedpg_pg_query::protobuf::SetOperation::SetopNone
+        || select.target_list.is_empty()
+    {
+        return false;
+    }
+    let mut stack: Vec<NodeRef<'_>> = select
+        .target_list
+        .iter()
+        .filter_map(|node| node.node.as_ref().map(|inner| inner.to_ref()))
+        .collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            // A star is a column reference too, and any column makes the
+            // output depend on the row.
+            NodeRef::ColumnRef(_) => return false,
+            // An operator may be a volatile user-defined function: give up.
+            NodeRef::AExpr(_) => return false,
+            NodeRef::FuncCall(call) => {
+                let names: Vec<&str> = call
+                    .funcname
+                    .iter()
+                    .filter_map(|node| match &node.node {
+                        Some(Node::String(string)) => Some(string.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let (schema, name) = match names.as_slice() {
+                    [name] => (None, *name),
+                    [schema, name] => (Some(*schema), *name),
+                    _ => return false,
+                };
+                let procs = ctx.catalog.find_functions(schema, name);
+                // Every overload counts, not just the one PG picks: a
+                // volatile or set-returning candidate may make each row
+                // different even when no column is read.
+                if procs.is_empty()
+                    || procs
+                        .iter()
+                        .any(|proc| proc.proretset || proc.provolatile == ProVolatile::Volatile)
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        stack.extend(node.children());
+    }
+    true
 }
 
 /// The `DISTINCT ON (…)` part when it has expressions.
@@ -192,9 +250,18 @@ fn fetch_end(ctx: &Ctx<'_>, index: usize, count_start: usize) -> usize {
         .map_or_else(|| clause_value_end(ctx, count_start), |token| token.end)
 }
 
-/// The `OFFSET …` clause, when there is one.
+/// The `OFFSET …` clause, when there is one that skips rows.
 fn offset_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops::Range<usize>> {
     let offset = select.limit_offset.as_deref()?;
+    // `OFFSET 0` is the optimization-fence idiom: it skips nothing.
+    if matches!(
+        offset.node.as_ref(),
+        Some(Node::AConst(value))
+            if !value.isnull
+                && matches!(value.val, Some(Val::Ival(ref count)) if count.ival == 0)
+    ) {
+        return None;
+    }
     let at = node_start(offset)?;
     let index = ctx.tokens.iter().position(|token| token.start == at)?;
     let previous = ctx.tokens.get(index.checked_sub(1)?)?;
@@ -415,6 +482,55 @@ mod tests {
                 .collect();
             assert!(findings.is_empty(), "{sql}: {findings:?}");
         }
+    }
+
+    #[test]
+    fn a_constant_target_makes_the_choice_irrelevant() {
+        let db = catalog();
+        for sql in [
+            "SELECT 1 AS one FROM users LIMIT 1",
+            "SELECT true FROM users LIMIT 1",
+            "SELECT 1 FROM users OFFSET 10",
+            // A call that is stable within the statement keeps the output
+            // the same too.
+            "SELECT now() FROM users LIMIT 1",
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+                .collect();
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        for sql in [
+            "SELECT id FROM users LIMIT 1",
+            "SELECT name FROM users OFFSET 10",
+            // A set-returning call returns a different value per row.
+            "SELECT generate_series(1, 3) FROM users LIMIT 1",
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+                .collect();
+            assert!(!findings.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_offset_zero_is_not_reported() {
+        let db = catalog();
+        assert!(
+            lint(&db, "SELECT id FROM users OFFSET 0")
+                .into_iter()
+                .all(|finding| finding.rule != Rule::LimitWithoutOrder)
+        );
+        // Next to a LIMIT, the LIMIT is still reported.
+        let sql = "SELECT id FROM users LIMIT 1 OFFSET 0";
+        let findings: Vec<Finding> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+            .collect();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(&sql[findings[0].span.clone()], "LIMIT 1");
     }
 
     #[test]

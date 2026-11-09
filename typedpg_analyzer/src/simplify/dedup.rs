@@ -42,6 +42,8 @@
 
 use std::collections::HashSet;
 
+use prost::Message;
+use typedpg_pg_query::Equal;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
     self, AExprKind, BoolExprType, JoinType, SetOperation, Token, a_const::Val, node::Node,
@@ -209,7 +211,10 @@ fn rows_distinct(
                     Some(q) => scope.rel_named(&q).into_iter().collect(),
                 };
                 for r in rels {
-                    for a in ctx.catalog.attributes_of(scope.rels[r].oid) {
+                    let Some(oid) = scope.rels[r].oid else {
+                        continue;
+                    };
+                    for a in ctx.catalog.attributes_of(oid) {
                         if a.attnum > 0 {
                             output.insert((r, a.attnum));
                         }
@@ -232,10 +237,15 @@ fn rows_distinct(
     let all: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
     let mut known: u64 = 0;
     for (r, rel) in scope.rels.iter().enumerate() {
-        let determined = unique_keys(ctx, rel.oid).iter().any(|key| {
-            key.columns
-                .iter()
-                .all(|c| c.deterministic && c.default_family && output.contains(&(r, c.attnum)))
+        let Some(oid) = rel.oid else {
+            continue;
+        };
+        let determined = unique_keys(ctx, oid).iter().any(|key| {
+            key.predicate.is_none()
+                && key
+                    .columns
+                    .iter()
+                    .all(|c| c.deterministic && c.default_family && output.contains(&(r, c.attnum)))
                 && (key.columns.iter().all(|c| c.notnull)
                     || (key.nulls_not_distinct && !rel.nullable))
         });
@@ -362,9 +372,10 @@ pub(super) fn has_unsafe_call(ctx: &Ctx<'_>, s: &protobuf::SelectStmt) -> bool {
 
 // ── FROM scope ──────────────────────────────────────────────────────────────
 
-/// A base table in a FROM clause.
+/// A FROM item relation: a base table, or a reference to a single-row CTE.
 pub(super) struct Rel {
-    pub(super) oid: PgClassOid,
+    /// The base table's oid; `None` for a single-row CTE reference.
+    pub(super) oid: Option<PgClassOid>,
     /// The alias, or the table's name.
     pub(super) refname: String,
     pub(super) aliased: bool,
@@ -372,11 +383,16 @@ pub(super) struct Rel {
     pub(super) relname: String,
     /// The relation may be null-extended by an outer join above it.
     pub(super) nullable: bool,
+    /// A single-row CTE reference: the proof starts with it determined.
+    pub(super) single_row: bool,
     /// The columns as this FROM item names them, with their attnums: an
     /// alias's column list (`t AS x(a, b)`) renames the first ones, in
     /// order, and the rest keep their names. Dropped columns are gone from
     /// the catalog, as PG skips them.
-    columns: Vec<(String, i16)>,
+    pub(super) columns: Vec<(String, i16)>,
+    /// For a CTE reference: each column's type and whether its collation is
+    /// deterministic, by attnum - 1. Empty for a base table.
+    cte_columns: Vec<(Option<PgTypeOid>, bool)>,
 }
 
 impl Rel {
@@ -387,6 +403,84 @@ impl Rel {
             (Some((_, attnum)), None) => Some(*attnum),
             _ => None,
         }
+    }
+
+    /// The attnum a possibly-qualified reference names, resolved against
+    /// this relation alone (a partial index's predicate).
+    fn resolve_column(&self, names: &[&str]) -> Option<i16> {
+        match names {
+            [name] => self.attnum(name),
+            [qualifier, name] if *qualifier == self.refname || *qualifier == self.relname => {
+                self.attnum(name)
+            }
+            [schema, table, name]
+                if !self.aliased && *schema == self.schema && *table == self.relname =>
+            {
+                self.attnum(name)
+            }
+            _ => None,
+        }
+    }
+
+    /// The column's type and whether its collation compares bytewise.
+    pub(super) fn column_info(&self, ctx: &Ctx<'_>, attnum: i16) -> Option<(PgTypeOid, bool)> {
+        match self.oid {
+            Some(oid) => ctx
+                .catalog
+                .attributes_of(oid)
+                .iter()
+                .find(|a| a.attnum == attnum)
+                .map(|a| (a.atttypid, deterministic(a.attcollation))),
+            None => {
+                let index = usize::try_from(attnum - 1).ok()?;
+                let (typ, deterministic_collation) = self.cte_columns.get(index).copied()?;
+                Some((typ?, deterministic_collation))
+            }
+        }
+    }
+}
+
+/// The CTEs visible at one query level, by name: `Some` when the CTE is
+/// proven to yield at most one row.
+#[derive(Clone, Default)]
+pub(super) struct CteEnv {
+    ctes: std::collections::HashMap<String, Option<CteInfo>>,
+}
+
+/// One single-row CTE: the columns a reference to it yields.
+#[derive(Clone)]
+pub(super) struct CteInfo {
+    pub(super) columns: Vec<CteColumn>,
+}
+
+/// One column of a single-row CTE.
+#[derive(Clone)]
+pub(super) struct CteColumn {
+    pub(super) name: String,
+    /// `None` when the body's expression type isn't proven.
+    pub(super) typ: Option<PgTypeOid>,
+    /// Its collation, when known, compares bytewise.
+    pub(super) deterministic: bool,
+}
+
+impl CteEnv {
+    /// The environment in which every CTE name in `names` is a reference
+    /// the proof gives up on.
+    pub(super) fn blocked(names: &HashSet<String>) -> CteEnv {
+        CteEnv {
+            ctes: names.iter().map(|name| (name.clone(), None)).collect(),
+        }
+    }
+
+    /// The environment `name` refers to: `Some` of its info when it is a
+    /// single-row CTE, `None` when it isn't one or isn't visible.
+    fn get(&self, name: &str) -> Option<Option<&CteInfo>> {
+        self.ctes.get(name).map(Option::as_ref)
+    }
+
+    /// Add `name` to this environment, single-row when `info` is `Some`.
+    pub(super) fn insert(&mut self, name: String, info: Option<CteInfo>) {
+        self.ctes.insert(name, info);
     }
 }
 
@@ -417,7 +511,7 @@ pub(super) struct Scope<'a> {
 }
 
 /// What a column reference names.
-enum Col {
+pub(super) enum Col {
     /// A column of one of the scope's relations.
     Rel(usize, i16),
     /// Anything else: an outer query's column, an ambiguous name, a whole
@@ -425,7 +519,7 @@ enum Col {
     Other,
 }
 
-enum Fields<'a> {
+pub(super) enum Fields<'a> {
     Names(Vec<&'a str>),
     /// `*` or `qualifier.*`.
     Star(Option<String>),
@@ -435,6 +529,7 @@ enum Fields<'a> {
 /// One proven fact `rel.attnum = <value>` with a strict equality operator,
 /// where the value is read from the relations of `other` (constants,
 /// parameters and outer-query columns read none).
+#[derive(Clone)]
 pub(super) struct EqFact {
     rel: usize,
     attnum: i16,
@@ -453,10 +548,20 @@ struct Operand {
 
 impl<'a> Scope<'a> {
     /// The FROM clause's relations, or `None` when it has anything but
-    /// base tables the proof can trust and plain joins of them.
+    /// base tables the proof can trust and plain joins of them. Every CTE
+    /// name in `ctes` makes the proof give up.
     pub(super) fn build(
         ctx: &Ctx<'_>,
         ctes: &HashSet<String>,
+        from: &'a [protobuf::Node],
+    ) -> Option<Scope<'a>> {
+        Self::build_env(ctx, &CteEnv::blocked(ctes), from)
+    }
+
+    /// [`Self::build`] with the single-row CTEs visible at this level.
+    pub(super) fn build_env(
+        ctx: &Ctx<'_>,
+        env: &CteEnv,
         from: &'a [protobuf::Node],
     ) -> Option<Scope<'a>> {
         let mut scope = Scope {
@@ -464,23 +569,29 @@ impl<'a> Scope<'a> {
             joins: Vec::new(),
         };
         for item in from {
-            scope.add(ctx, ctes, item, false)?;
+            scope.add(ctx, env, item, false)?;
         }
         Some(scope)
     }
 
-    /// The scope of a lone relation: an `UPDATE` / `DELETE` target, whose
-    /// `WHERE` sees only it.
-    pub(super) fn single(
+    /// The scope of a whole `UPDATE` or `DELETE`: the target relation and
+    /// its `FROM` / `USING` items.
+    pub(super) fn dml(
         ctx: &Ctx<'_>,
-        ctes: &HashSet<String>,
+        env: &CteEnv,
         relation: &protobuf::RangeVar,
+        from: &'a [protobuf::Node],
     ) -> Option<Scope<'a>> {
         let mut scope = Scope {
             rels: Vec::new(),
             joins: Vec::new(),
         };
-        scope.add_range_var(ctx, ctes, relation, false)?;
+        // A data-modifying statement's target is always a table: a CTE of
+        // the same name is not one PG lets it write.
+        scope.add_table(ctx, relation, false)?;
+        for item in from {
+            scope.add(ctx, env, item, false)?;
+        }
         Some(scope)
     }
 
@@ -488,12 +599,12 @@ impl<'a> Scope<'a> {
     fn add(
         &mut self,
         ctx: &Ctx<'_>,
-        ctes: &HashSet<String>,
+        env: &CteEnv,
         item: &'a protobuf::Node,
         nullable: bool,
     ) -> Option<u64> {
         match item.node.as_ref()? {
-            Node::RangeVar(rv) => self.add_range_var(ctx, ctes, rv, nullable),
+            Node::RangeVar(rv) => self.add_range_var(ctx, env, rv, nullable),
             Node::JoinExpr(j) => {
                 if j.is_natural || j.alias.is_some() || j.join_using_alias.is_some() {
                     return None;
@@ -507,9 +618,9 @@ impl<'a> Scope<'a> {
                     _ => return None,
                 };
                 let first = self.rels.len();
-                let left = self.add(ctx, ctes, j.larg.as_deref()?, left_nullable)?;
+                let left = self.add(ctx, env, j.larg.as_deref()?, left_nullable)?;
                 let middle = self.rels.len();
-                let right = self.add(ctx, ctes, j.rarg.as_deref()?, right_nullable)?;
+                let right = self.add(ctx, env, j.rarg.as_deref()?, right_nullable)?;
                 let single = |side: &Option<Box<protobuf::Node>>, at: usize| {
                     matches!(
                         side.as_deref().and_then(|n| n.node.as_ref()),
@@ -541,18 +652,63 @@ impl<'a> Scope<'a> {
         }
     }
 
-    /// Add one base-table reference; its relation as a bitmask.
+    /// Add one FROM reference: a single-row CTE when `env` has one under
+    /// that name, a base table otherwise. Its relation as a bitmask.
     fn add_range_var(
         &mut self,
         ctx: &Ctx<'_>,
-        ctes: &HashSet<String>,
+        env: &CteEnv,
         rv: &protobuf::RangeVar,
         nullable: bool,
     ) -> Option<u64> {
-        if self.rels.len() == MAX_RELATIONS
-            || !rv.catalogname.is_empty()
-            || (rv.schemaname.is_empty() && ctes.contains(&rv.relname))
+        if self.rels.len() == MAX_RELATIONS || !rv.catalogname.is_empty() {
+            return None;
+        }
+        if rv.schemaname.is_empty()
+            && let Some(info) = env.get(&rv.relname)
         {
+            let info = info?;
+            let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+            let mut columns: Vec<(String, i16)> = info
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| (column.name.clone(), i as i16 + 1))
+                .collect();
+            let renames = rv.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
+            if renames.len() > columns.len() {
+                return None;
+            }
+            for (column, rename) in columns.iter_mut().zip(renames) {
+                let Some(Node::String(name)) = &rename.node else {
+                    return None;
+                };
+                column.0 = name.sval.clone();
+            }
+            let cte_columns = info
+                .columns
+                .iter()
+                .map(|column| (column.typ, column.deterministic))
+                .collect();
+            self.rels.push(Rel {
+                oid: None,
+                refname: alias.clone().unwrap_or_else(|| rv.relname.clone()),
+                aliased: alias.is_some(),
+                schema: String::new(),
+                relname: rv.relname.clone(),
+                nullable,
+                single_row: true,
+                columns,
+                cte_columns,
+            });
+            return Some(1 << (self.rels.len() - 1));
+        }
+        self.add_table(ctx, rv, nullable)
+    }
+
+    /// Add one base-table reference; its relation as a bitmask.
+    fn add_table(&mut self, ctx: &Ctx<'_>, rv: &protobuf::RangeVar, nullable: bool) -> Option<u64> {
+        if self.rels.len() == MAX_RELATIONS || !rv.catalogname.is_empty() {
             return None;
         }
         let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
@@ -590,7 +746,7 @@ impl<'a> Scope<'a> {
             column.0 = name.sval.clone();
         }
         self.rels.push(Rel {
-            oid: class.oid,
+            oid: Some(class.oid),
             refname: alias.clone().unwrap_or_else(|| rv.relname.clone()),
             aliased: alias.is_some(),
             schema: ctx
@@ -600,18 +756,20 @@ impl<'a> Scope<'a> {
                 .to_owned(),
             relname: rv.relname.clone(),
             nullable,
+            single_row: false,
             columns,
+            cte_columns: Vec::new(),
         });
         Some(1 << (self.rels.len() - 1))
     }
 
     /// The relation a qualifier names.
-    fn rel_named(&self, qualifier: &str) -> Option<usize> {
+    pub(super) fn rel_named(&self, qualifier: &str) -> Option<usize> {
         self.rels.iter().position(|r| r.refname == qualifier)
     }
 
     /// Resolve a column reference against this scope alone.
-    fn resolve(&self, names: &[&str]) -> Col {
+    pub(super) fn resolve(&self, names: &[&str]) -> Col {
         let attnum = |r: usize, name: &str| {
             self.rels[r]
                 .attnum(name)
@@ -661,20 +819,22 @@ impl<'a> Scope<'a> {
                 let Fields::Names(names) = column_ref_fields(cr) else {
                     return None;
                 };
-                let (rel, oid, attnum) = match self.resolve(&names) {
-                    Col::Rel(r, attnum) => (Some(r), self.rels[r].oid, attnum),
+                let (rel, attnum, (typ, deterministic_collation)) = match self.resolve(&names) {
+                    Col::Rel(r, attnum) => {
+                        (Some(r), attnum, self.rels[r].column_info(ctx, attnum)?)
+                    }
                     Col::Other => {
                         let resolved = outer?.resolve(ctx, cr)?;
-                        (None, resolved.rel, resolved.attnum)
+                        let attr = ctx
+                            .catalog
+                            .attributes_of(resolved.rel)
+                            .iter()
+                            .find(|a| a.attnum == resolved.attnum)?;
+                        (None, 0, (attr.atttypid, deterministic(attr.attcollation)))
                     }
                 };
-                let attr = ctx
-                    .catalog
-                    .attributes_of(oid)
-                    .iter()
-                    .find(|a| a.attnum == attnum)?;
-                deterministic(attr.attcollation).then_some(Operand {
-                    typ: attr.atttypid,
+                deterministic_collation.then_some(Operand {
+                    typ,
                     column: rel.map(|r| (r, attnum)),
                     rels: rel.map_or(0, |r| 1 << r),
                 })
@@ -742,22 +902,16 @@ impl<'a> Scope<'a> {
             let mut found = (0..self.rels.len())
                 .filter(|&r| mask & (1 << r) != 0)
                 .filter(|&r| self.rels[r].columns.iter().any(|(n, _)| n == name))
-                .map(|r| {
-                    let attnum = self.rels[r].attnum(name);
-                    let attr = attnum.and_then(|attnum| {
-                        ctx.catalog
-                            .attributes_of(self.rels[r].oid)
-                            .iter()
-                            .find(|a| a.attnum == attnum)
-                    });
-                    (r, attr)
-                });
+                .map(|r| (r, self.rels[r].attnum(name)));
             match (found.next(), found.next()) {
-                (Some((r, Some(a))), None) if deterministic(a.attcollation) => Some(Operand {
-                    typ: a.atttypid,
-                    column: Some((r, a.attnum)),
-                    rels: 1 << r,
-                }),
+                (Some((r, Some(attnum))), None) => {
+                    let (typ, deterministic_collation) = self.rels[r].column_info(ctx, attnum)?;
+                    deterministic_collation.then_some(Operand {
+                        typ,
+                        column: Some((r, attnum)),
+                        rels: 1 << r,
+                    })
+                }
                 _ => None,
             }
         };
@@ -804,9 +958,22 @@ impl<'a> Scope<'a> {
         }
         out
     }
+}
 
+/// The conjuncts a set of equality facts was read from, for matching a
+/// partial index's predicate: WHERE conjuncts for WHERE facts, a join's ON
+/// conjuncts for that join's facts.
+pub(super) struct PredicateSources<'a> {
+    pub(super) conjuncts: &'a [&'a protobuf::Node],
+    /// The `=` facts those conjuncts (and the join's `USING`) prove: only
+    /// a strict equality proves its column non-NULL.
+    pub(super) facts: &'a [EqFact],
+}
+
+impl<'a> Scope<'a> {
     /// When `facts` equate every column of a unique key of relation `b` to
     /// values read from relations within `allowed`: the relations read.
+    /// Partial indexes never count (the `DISTINCT` proof's behavior).
     pub(super) fn key_equated(
         &self,
         ctx: &Ctx<'_>,
@@ -814,8 +981,27 @@ impl<'a> Scope<'a> {
         facts: &[EqFact],
         allowed: u64,
     ) -> Option<u64> {
-        let oid = self.rels[b].oid;
+        self.key_equated_with(ctx, b, facts, allowed, None)
+    }
+
+    /// [`Self::key_equated`], also accepting a partial unique index whose
+    /// predicate `sources` imply.
+    pub(super) fn key_equated_with(
+        &self,
+        ctx: &Ctx<'_>,
+        b: usize,
+        facts: &[EqFact],
+        allowed: u64,
+        sources: Option<&PredicateSources<'_>>,
+    ) -> Option<u64> {
+        let oid = self.rels[b].oid?;
         unique_keys(ctx, oid).iter().find_map(|key| {
+            if let Some(predicate) = &key.predicate {
+                let sources = sources?;
+                if !self.predicate_implied(ctx, b, predicate, sources) {
+                    return None;
+                }
+            }
             let mut det = 0u64;
             for c in &key.columns {
                 if !c.deterministic {
@@ -833,6 +1019,168 @@ impl<'a> Scope<'a> {
             Some(det)
         })
     }
+
+    /// Whether every conjunct of a partial index's `predicate` holds on
+    /// every row `sources` describe.
+    fn predicate_implied(
+        &self,
+        ctx: &Ctx<'_>,
+        b: usize,
+        predicate: &protobuf::Node,
+        sources: &PredicateSources<'_>,
+    ) -> bool {
+        let conjuncts = conjuncts(Some(predicate));
+        !conjuncts.is_empty()
+            && conjuncts
+                .iter()
+                .all(|predicate| self.predicate_conjunct_implied(ctx, b, predicate, sources))
+    }
+
+    fn predicate_conjunct_implied(
+        &self,
+        _ctx: &Ctx<'_>,
+        b: usize,
+        predicate: &protobuf::Node,
+        sources: &PredicateSources<'_>,
+    ) -> bool {
+        let Some(predicate) = self.canonical_predicate(b, predicate) else {
+            return false;
+        };
+        // `col IS NOT NULL` holds wherever a strict equality on `col` does:
+        // a fact is only recorded for a strict operator, whose result can't
+        // be true with a NULL operand.
+        if let Some(Node::NullTest(test)) = &predicate.node
+            && test.nulltesttype() == protobuf::NullTestType::IsNotNull
+            && let Some(Node::Var(var)) = test.arg.as_deref().and_then(|a| a.node.as_ref())
+        {
+            let attnum = i16::try_from(var.varattno).ok();
+            if sources
+                .facts
+                .iter()
+                .any(|fact| fact.rel == b && Some(fact.attnum) == attnum)
+            {
+                return true;
+            }
+        }
+        sources.conjuncts.iter().any(|source| {
+            let source = self.canonical_source(b, source);
+            predicate.equal(&source)
+        })
+    }
+
+    /// `node` with every column reference resolved to relation `b` and
+    /// replaced by the column's attnum, when `node` is one of the predicate
+    /// shapes the proof reads.
+    fn canonical_predicate(&self, b: usize, node: &protobuf::Node) -> Option<protobuf::Node> {
+        let mut canonical = node.clone();
+        let mut resolved = true;
+        canonical.rewrite(&mut |_| true, &mut |node| {
+            let Some(Node::ColumnRef(column)) = &node.node else {
+                return;
+            };
+            let fields = column_ref_fields(column);
+            let Fields::Names(names) = fields else {
+                resolved = false;
+                return;
+            };
+            match self.rels[b].resolve_column(&names) {
+                Some(attnum) => *node = canonical_column(attnum),
+                None => resolved = false,
+            }
+        });
+        (resolved && supported_predicate(&canonical)).then_some(canonical)
+    }
+
+    /// `node` with every column reference that resolves to relation `b`
+    /// replaced by the column's attnum; other references are left as they
+    /// are (they can't equal a canonical column).
+    fn canonical_source(&self, b: usize, node: &protobuf::Node) -> protobuf::Node {
+        let mut canonical = node.clone();
+        canonical.rewrite(&mut |_| true, &mut |node| {
+            let Some(Node::ColumnRef(column)) = &node.node else {
+                return;
+            };
+            let Fields::Names(names) = column_ref_fields(column) else {
+                return;
+            };
+            if let Col::Rel(rel, attnum) = self.resolve(&names)
+                && rel == b
+            {
+                *node = canonical_column(attnum);
+            }
+        });
+        canonical
+    }
+}
+
+/// A column reference resolved to an attnum, in a form no raw parse tree
+/// produces: a placeholder `Var`.
+fn canonical_column(attnum: i16) -> protobuf::Node {
+    protobuf::Node {
+        node: Some(Node::Var(Box::new(protobuf::Var {
+            varattno: i32::from(attnum),
+            location: 0,
+            ..Default::default()
+        }))),
+    }
+}
+
+/// Whether `node` is one of the predicate shapes a partial index may count
+/// with: a bare boolean column, `NOT column`, `column IS [NOT] NULL`,
+/// `column = / <> constant`, or `column [NOT] IN (constants)` (also spelled
+/// `= ANY (ARRAY[...])`).
+fn supported_predicate(node: &protobuf::Node) -> bool {
+    let Some(node) = node.node.as_ref() else {
+        return false;
+    };
+    let is_var = |node: &Option<Box<protobuf::Node>>| {
+        matches!(
+            node.as_deref().and_then(|n| n.node.as_ref()),
+            Some(Node::Var(_))
+        )
+    };
+    match node {
+        Node::Var(_) => true,
+        Node::NullTest(test) => is_var(&test.arg),
+        Node::BoolExpr(expr) => {
+            expr.boolop() == BoolExprType::NotExpr
+                && expr.args.len() == 1
+                && matches!(expr.args[0].node.as_ref(), Some(Node::Var(_)))
+        }
+        Node::AExpr(expr) => match expr.kind() {
+            AExprKind::AexprOp => {
+                matches!(string_list(&expr.name).last(), Some(&"=" | &"<>"))
+                    && ((is_var(&expr.lexpr) && is_constant(&expr.rexpr))
+                        || (is_constant(&expr.lexpr) && is_var(&expr.rexpr)))
+            }
+            AExprKind::AexprIn => {
+                matches!(string_list(&expr.name).last(), Some(&"=" | &"<>"))
+                    && is_var(&expr.lexpr)
+                    && matches!(
+                        expr.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+                        Some(Node::List(list)) if list.items.iter().all(is_const_node)
+                    )
+            }
+            AExprKind::AexprOpAny => {
+                matches!(string_list(&expr.name).last(), Some(&"=" | &"<>"))
+                    && is_var(&expr.lexpr)
+                    && matches!(
+                        expr.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+                        Some(Node::AArrayExpr(array)) if array.elements.iter().all(is_const_node)
+                    )
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_constant(node: &Option<Box<protobuf::Node>>) -> bool {
+    node.as_deref().is_some_and(is_const_node)
+}
+
+fn is_const_node(node: &protobuf::Node) -> bool {
+    matches!(node.node, Some(Node::AConst(_)))
 }
 
 /// The equality operator reads the column as its own type: no coercion
@@ -876,11 +1224,15 @@ struct KeyColumn {
 struct UniqueKey {
     columns: Vec<KeyColumn>,
     nulls_not_distinct: bool,
+    /// A partial index's predicate, decoded; `None` for a full index.
+    predicate: Option<Box<protobuf::Node>>,
 }
 
 /// The unique keys PG enforces at every statement on relation `relid`:
 /// unique btree indexes — PRIMARY KEY and UNIQUE constraints' included —
-/// that are immediate, not partial, not exclusion and on plain columns.
+/// that are immediate, not exclusion and on plain columns. A partial
+/// index's predicate is kept for the cardinality proof; the `DISTINCT`
+/// proof still ignores partial indexes.
 fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
     let catalog = ctx.catalog;
     let attrs = catalog.attributes_of(relid);
@@ -889,11 +1241,17 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
         if index.indrelid != relid
             || !index.indisunique
             || index.indisexclusion
-            || index.indpred.is_some()
             || catalog.nonimmediate_indexes.contains(&index.indexrelid)
         {
             continue;
         }
+        let predicate = match &index.indpred {
+            None => None,
+            Some(ast) => match protobuf::Node::decode(ast.ast.as_slice()) {
+                Ok(predicate) => Some(Box::new(predicate)),
+                Err(_) => continue 'index,
+            },
+        };
         let nkeys = usize::try_from(index.indnkeyatts).unwrap_or(0);
         if nkeys == 0 || index.indkey.len() < nkeys {
             continue;
@@ -937,6 +1295,7 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
                 .index_keys
                 .get(&index.indexrelid)
                 .is_some_and(|k| k.nulls_not_distinct),
+            predicate,
         });
     }
     out
@@ -951,7 +1310,7 @@ fn deterministic(collation: Option<PgCollationOid>) -> bool {
 
 /// [`deterministic`] for a type as the analysis reports it (the collation
 /// is named only when not the database default).
-fn deterministic_type_collation(t: &Type) -> bool {
+pub(super) fn deterministic_type_collation(t: &Type) -> bool {
     match t {
         Type::Basic { collation, .. } | Type::Domain { collation, .. } => collation
             .as_deref()
@@ -960,7 +1319,7 @@ fn deterministic_type_collation(t: &Type) -> bool {
     }
 }
 
-fn type_oid(ctx: &Ctx<'_>, t: &Type) -> Option<PgTypeOid> {
+pub(super) fn type_oid(ctx: &Ctx<'_>, t: &Type) -> Option<PgTypeOid> {
     match t {
         Type::Basic { schema, name, .. }
         | Type::Domain { schema, name, .. }
@@ -1053,11 +1412,9 @@ fn arm_value_is_exactly(
             let Col::Rel(r, attnum) = scope.resolve(&names) else {
                 return false;
             };
-            ctx.catalog
-                .attributes_of(scope.rels[r].oid)
-                .iter()
-                .find(|a| a.attnum == attnum)
-                .is_some_and(|a| a.atttypid == typ && deterministic(a.attcollation))
+            scope.rels[r].column_info(ctx, attnum).is_some_and(
+                |(column, deterministic_collation)| column == typ && deterministic_collation,
+            )
         }
         _ => false,
     }
@@ -1222,7 +1579,7 @@ fn string_list(nodes: &[protobuf::Node]) -> Vec<&str> {
         .collect()
 }
 
-fn column_ref_fields(cr: &protobuf::ColumnRef) -> Fields<'_> {
+pub(super) fn column_ref_fields(cr: &protobuf::ColumnRef) -> Fields<'_> {
     let mut names = Vec::with_capacity(cr.fields.len());
     for (i, f) in cr.fields.iter().enumerate() {
         match &f.node {
