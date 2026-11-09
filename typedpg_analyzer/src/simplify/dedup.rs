@@ -61,6 +61,17 @@ const MAX_RELATIONS: usize = 64;
 /// [`Rule::Distinct`]: every plain `SELECT DISTINCT` — at the top level or
 /// nested anywhere — whose rows are provably distinct without it.
 pub(crate) fn distinct_candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
+    distinct_candidates_with_select(ctx)
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+/// [`distinct_candidates`], keeping the `SELECT` each candidate would
+/// rewrite (the lint rule judges its fix on that node).
+pub(super) fn distinct_candidates_with_select<'a>(
+    ctx: &Ctx<'a>,
+) -> Vec<(&'a protobuf::SelectStmt, Candidate)> {
     if !ctx.analyzed.spreads.is_empty() {
         return Vec::new();
     }
@@ -77,10 +88,13 @@ pub(crate) fn distinct_candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
             continue;
         }
         if let Some(edit) = distinct_keyword_edit(ctx.sql, &tokens, s) {
-            out.push(Candidate {
-                rule: Rule::Distinct,
-                edits: vec![edit],
-            });
+            out.push((
+                s,
+                Candidate {
+                    rule: Rule::Distinct,
+                    edits: vec![edit],
+                },
+            ));
         }
     }
     out
@@ -405,21 +419,28 @@ impl Rel {
         }
     }
 
-    /// The attnum a possibly-qualified reference names, resolved against
-    /// this relation alone (a partial index's predicate).
-    fn resolve_column(&self, names: &[&str]) -> Option<i16> {
-        match names {
-            [name] => self.attnum(name),
-            [qualifier, name] if *qualifier == self.refname || *qualifier == self.relname => {
-                self.attnum(name)
-            }
+    /// The attnum a reference in the table's own stored expression (a
+    /// partial index's predicate) names: the catalog's real column names,
+    /// never the query's alias column list (`FROM t AS x(k, active)` renames
+    /// the columns the query sees, but the index predicate is stored with
+    /// the table's `attname`s).
+    fn resolve_table_column(&self, ctx: &Ctx<'_>, names: &[&str]) -> Option<i16> {
+        let oid = self.oid?;
+        let name = match names {
+            [name] => *name,
+            [qualifier, name] if *qualifier == self.refname || *qualifier == self.relname => *name,
             [schema, table, name]
                 if !self.aliased && *schema == self.schema && *table == self.relname =>
             {
-                self.attnum(name)
+                *name
             }
-            _ => None,
-        }
+            _ => return None,
+        };
+        ctx.catalog
+            .attributes_of(oid)
+            .iter()
+            .find(|a| a.attnum > 0 && a.attname == name)
+            .map(|a| a.attnum)
     }
 
     /// The column's type and whether its collation compares bytewise.
@@ -1007,22 +1028,41 @@ impl<'a> Scope<'a> {
     }
 
     /// Whether nothing in the sublink's subquery reads a column of this
-    /// level. A reference its own `local` scope resolves, or one no level
-    /// here has, is fine (its own rows, or an outer level fixed for one
-    /// evaluation of this one). `false` when unsure.
+    /// level, and the subquery is a single plain `SELECT` whose references
+    /// all resolve in its own FROM (or an outer level above this one). A
+    /// nested CTE, sublink or FROM subquery opens another level whose
+    /// references this can't place, so it gives up; `false` when unsure.
     fn sublink_uncorrelated(&self, local: &Scope<'_>, sub: &protobuf::SubLink) -> bool {
         let Some(root) = sub.subselect.as_deref().and_then(|n| n.node.as_ref()) else {
             return false;
         };
+        let NodeRef::SelectStmt(select) = root.to_ref() else {
+            return false;
+        };
+        if select.op() != SetOperation::SetopNone
+            || select.with_clause.is_some()
+            || !select.values_lists.is_empty()
+        {
+            return false;
+        }
         let mut stack = vec![root.to_ref()];
         while let Some(node) = stack.pop() {
-            if let NodeRef::ColumnRef(column) = node {
-                let Fields::Names(names) = column_ref_fields(column) else {
-                    return false;
-                };
-                if !matches!(local.resolve(&names), Col::Rel(..)) && self.may_reference(&names) {
+            match node {
+                // A nested query has its own FROM and may bind a name this
+                // level also has: the reference can't be placed from here.
+                NodeRef::SubLink(_) | NodeRef::RangeSubselect(_) | NodeRef::CommonTableExpr(_) => {
                     return false;
                 }
+                NodeRef::ColumnRef(column) => {
+                    let Fields::Names(names) = column_ref_fields(column) else {
+                        return false;
+                    };
+                    if !matches!(local.resolve(&names), Col::Rel(..)) && self.may_reference(&names)
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
             }
             stack.extend(node.children());
         }
@@ -1329,12 +1369,12 @@ impl<'a> Scope<'a> {
 
     fn predicate_conjunct_implied(
         &self,
-        _ctx: &Ctx<'_>,
+        ctx: &Ctx<'_>,
         b: usize,
         predicate: &protobuf::Node,
         sources: &PredicateSources<'_>,
     ) -> bool {
-        let Some(predicate) = self.canonical_predicate(b, predicate) else {
+        let Some(predicate) = self.canonical_predicate(ctx, b, predicate) else {
             return false;
         };
         // `col IS NOT NULL` holds wherever a strict equality on `col` does:
@@ -1361,8 +1401,14 @@ impl<'a> Scope<'a> {
 
     /// `node` with every column reference resolved to relation `b` and
     /// replaced by the column's attnum, when `node` is one of the predicate
-    /// shapes the proof reads.
-    fn canonical_predicate(&self, b: usize, node: &protobuf::Node) -> Option<protobuf::Node> {
+    /// shapes the proof reads. A stored predicate names the table's real
+    /// columns, so it resolves by `attname`, not by the query's aliases.
+    fn canonical_predicate(
+        &self,
+        ctx: &Ctx<'_>,
+        b: usize,
+        node: &protobuf::Node,
+    ) -> Option<protobuf::Node> {
         let mut canonical = node.clone();
         let mut resolved = true;
         canonical.rewrite(&mut |_| true, &mut |node| {
@@ -1374,7 +1420,7 @@ impl<'a> Scope<'a> {
                 resolved = false;
                 return;
             };
-            match self.rels[b].resolve_column(&names) {
+            match self.rels[b].resolve_table_column(ctx, &names) {
                 Some(attnum) => *node = canonical_column(attnum),
                 None => resolved = false,
             }

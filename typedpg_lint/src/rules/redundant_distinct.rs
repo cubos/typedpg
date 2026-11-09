@@ -1,28 +1,37 @@
 //! The `redundant_distinct` rule: reports a plain `DISTINCT` on rows the
 //! schema proves are already distinct, such as a `SELECT` whose output
 //! contains a unique key of every table it reads. The fix removes the
-//! keyword.
+//! keyword, but only when the select is error-free: a hash aggregate
+//! evaluates the target list on every row, while the scan without
+//! `DISTINCT` may stop earlier, so an expression that can raise would
+//! change the errors the query raises.
 //!
 //! The proof is the `distinct` simplification's (see
 //! [`typedpg_analyzer::redundant_distinct_spans`] and the analyzer's
 //! `simplify::dedup` module): this rule only reports the spans that
 //! simplification would delete.
 
-use typedpg_analyzer::redundant_distinct_spans;
-
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    redundant_distinct_spans(ctx.catalog, ctx.view)
+    ctx.view
+        .redundant_distinct_spans_with_fix(ctx.catalog)
         .into_iter()
-        .map(|span| RawFinding {
+        .map(|(span, error_free)| RawFinding {
             span: span.clone(),
             message: "DISTINCT has no effect: the rows are already distinct".to_owned(),
             help: Some("remove DISTINCT (a unique key of every table is in the output)".to_owned()),
-            fix: vec![SqlEdit {
-                range: span,
-                text: String::new(),
-            }],
+            // Removing DISTINCT lets PG evaluate the target list on more
+            // rows (a hash aggregate reads every row first): the fix is
+            // withheld when an expression could raise on one of them.
+            fix: if error_free {
+                vec![SqlEdit {
+                    range: span,
+                    text: String::new(),
+                }]
+            } else {
+                Vec::new()
+            },
         })
         .collect()
 }
@@ -128,6 +137,18 @@ mod tests {
         let fixed = fixed(sql, &findings);
         assert!(fixed.contains("/* keep */"), "{fixed}");
         assert!(!fixed.contains("DISTINCT"), "{fixed}");
+    }
+
+    #[test]
+    fn a_fix_that_could_change_the_errors_raised_is_withheld() {
+        let db = catalog();
+        // A hash aggregate (DISTINCT) reads both rows and evaluates the
+        // division on each; without DISTINCT the scan may stop at the first.
+        let sql = "SELECT DISTINCT id, 1/(id-2) FROM users";
+        let findings = lint(&db, sql);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, Rule::RedundantDistinct);
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
     }
 
     #[test]

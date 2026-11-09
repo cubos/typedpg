@@ -4,9 +4,10 @@
 //!
 //! Not reported when the choice doesn't matter: a query proven to return at
 //! most one row ([`typedpg_analyzer::select_at_most_one_row`]), a subquery
-//! of `EXISTS` / `IN` (`= ANY`) / `ALL` (existence and membership don't
-//! care which rows), a `LIMIT 0`, or a locking clause with `SKIP LOCKED`
-//! (the queue pattern wants any unlocked row).
+//! of `EXISTS` (existence doesn't care which rows), an `IN` / `= ANY` /
+//! `ALL` in the `WHERE` of an `UPDATE` or `DELETE` (the batching idiom), a
+//! `LIMIT 0`, or a locking clause with `SKIP LOCKED` (the queue pattern
+//! wants any unlocked row).
 
 use std::collections::HashSet;
 
@@ -73,30 +74,79 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     out
 }
 
-/// The selects that are the subquery of an `EXISTS`, `= ANY (…)` / `IN` or
-/// `ALL` sublink: which rows they return doesn't change the answer.
+/// The selects whose arbitrary row choice doesn't matter: the subquery of
+/// an `EXISTS` (existence doesn't care which rows), or an `IN` / `= ANY` /
+/// `ALL` in the `WHERE` of an `UPDATE` or `DELETE` — the batching idiom
+/// (`DELETE … WHERE id IN (SELECT … LIMIT 1000)`) deliberately takes any
+/// batch. An `IN` elsewhere (a `SELECT`'s WHERE, a projection) does care:
+/// the limit changes which values the outer query sees.
 fn batched_subqueries(ctx: &Ctx<'_>) -> HashSet<*const SelectStmt> {
     let mut batched = HashSet::new();
     for (node, _) in ctx.tree.nodes() {
         let NodeRef::SubLink(sublink) = node else {
             continue;
         };
-        if !matches!(
-            sublink.sub_link_type(),
-            SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink
-        ) {
-            continue;
-        }
-        if let Some(Node::SelectStmt(select)) = sublink
-            .subselect
-            .as_deref()
-            .and_then(|node| node.node.as_ref())
-        {
-            let pointer: *const SelectStmt = &**select;
-            batched.insert(pointer);
+        match sublink.sub_link_type() {
+            SubLinkType::ExistsSublink => {
+                insert_sublink_select(&mut batched, sublink);
+            }
+            SubLinkType::AnySublink | SubLinkType::AllSublink if in_dml_where(ctx, sublink) => {
+                insert_sublink_select(&mut batched, sublink);
+            }
+            _ => {}
         }
     }
     batched
+}
+
+fn insert_sublink_select(batched: &mut HashSet<*const SelectStmt>, sublink: &protobuf::SubLink) {
+    if let Some(Node::SelectStmt(select)) = sublink
+        .subselect
+        .as_deref()
+        .and_then(|node| node.node.as_ref())
+    {
+        let pointer: *const SelectStmt = &**select;
+        batched.insert(pointer);
+    }
+}
+
+/// Whether this `IN` / `ANY` / `ALL` sublink sits in the `WHERE` of an
+/// `UPDATE` or `DELETE` at its own query level. Nested `SELECT`s inside the
+/// WHERE are other levels, whose sublinks aren't exempt.
+fn in_dml_where(ctx: &Ctx<'_>, target: &protobuf::SubLink) -> bool {
+    let target: *const protobuf::SubLink = target;
+    for (node, _) in ctx.tree.nodes() {
+        let where_clause = match node {
+            NodeRef::UpdateStmt(update) => update.where_clause.as_deref(),
+            NodeRef::DeleteStmt(delete) => delete.where_clause.as_deref(),
+            _ => continue,
+        };
+        let Some(where_clause) = where_clause.and_then(|node| node.node.as_ref()) else {
+            continue;
+        };
+        if where_contains(where_clause.to_ref(), target) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `target` is a sublink of `node` at this query level (not inside
+/// a nested `SELECT`, which is another level).
+fn where_contains(node: NodeRef<'_>, target: *const protobuf::SubLink) -> bool {
+    match node {
+        NodeRef::SelectStmt(_) => false,
+        NodeRef::SubLink(sublink) => {
+            if std::ptr::eq(sublink, target) {
+                return true;
+            }
+            false
+        }
+        _ => node
+            .children()
+            .into_iter()
+            .any(|child| where_contains(child, target)),
+    }
 }
 
 fn has_skip_locked(select: &SelectStmt) -> bool {
@@ -464,13 +514,14 @@ mod tests {
     }
 
     #[test]
-    fn batched_and_queue_shapes_are_not_reported() {
+    fn exists_and_dml_batching_subqueries_are_not_reported() {
         let db = catalog();
         for sql in [
             "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM posts LIMIT 5)",
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts LIMIT 1000)",
-            "SELECT id FROM users WHERE id = ANY (SELECT user_id FROM posts LIMIT 1000)",
-            "SELECT id FROM users WHERE id > ALL (SELECT user_id FROM posts LIMIT 1000)",
+            "UPDATE users SET name = 'x' WHERE id IN (SELECT user_id FROM posts LIMIT 1000)",
+            "DELETE FROM users WHERE id IN (SELECT user_id FROM posts LIMIT 1000)",
+            "DELETE FROM users WHERE id = ANY (SELECT user_id FROM posts LIMIT 1000)",
+            "DELETE FROM users WHERE id > ALL (SELECT user_id FROM posts LIMIT 1000)",
             "SELECT id FROM users LIMIT 5 FOR UPDATE SKIP LOCKED",
             "SELECT id FROM users LIMIT 0",
             "SELECT id FROM users LIMIT ALL",
@@ -481,6 +532,23 @@ mod tests {
                 .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
                 .collect();
             assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn an_in_sublink_outside_a_dml_where_is_reported() {
+        let db = catalog();
+        for sql in [
+            "SELECT 1 WHERE 1 IN (SELECT id FROM users LIMIT 1)",
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts LIMIT 1000)",
+            "SELECT id FROM users WHERE id = ANY (SELECT user_id FROM posts LIMIT 1000)",
+            "SELECT id FROM users WHERE id > ALL (SELECT user_id FROM posts LIMIT 1000)",
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+                .collect();
+            assert!(!findings.is_empty(), "{sql}: {findings:?}");
         }
     }
 

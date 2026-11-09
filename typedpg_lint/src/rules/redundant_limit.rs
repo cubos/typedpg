@@ -1,6 +1,9 @@
 //! The `redundant_limit` rule: reports a `LIMIT` / `FETCH FIRST` on a query
 //! the analyzer proves returns at most one row, such as one over a primary
-//! key or a `SELECT` without `FROM`. The fix removes the clause.
+//! key or a `SELECT` without `FROM`. The fix removes the clause, but only
+//! when the select is error-free: without the limit the scan may read rows
+//! it previously stopped before, so a WHERE or target-list expression that
+//! can raise would change the errors the query raises.
 //!
 //! `LIMIT 0` (and `LIMIT ALL` / `LIMIT NULL`) are not reported: the first
 //! needs no fix and the others limit nothing.
@@ -32,6 +35,10 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let Some(clause) = limit_clause(ctx, count) else {
             continue;
         };
+        // Removing LIMIT lets PG evaluate the rest of the query on rows the
+        // scan previously stopped before, so withhold the fix when an
+        // expression of the select could raise on one of them.
+        let error_free = ctx.view.select_is_error_free(ctx.catalog, select);
         let count_text = &ctx.sql[clause.count.clone()];
         let message = match clause.fetch {
             None => format!("LIMIT {count_text} has no effect: the query returns at most one row"),
@@ -44,10 +51,14 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             span: clause.keyword..clause.end,
             message,
             help: Some("remove it".to_owned()),
-            fix: vec![SqlEdit {
-                range: start..clause.end,
-                text: String::new(),
-            }],
+            fix: if error_free {
+                vec![SqlEdit {
+                    range: start..clause.end,
+                    text: String::new(),
+                }]
+            } else {
+                Vec::new()
+            },
         });
     }
     out
@@ -321,6 +332,18 @@ mod tests {
             fixed(sql, &findings),
             "SELECT id FROM users WHERE id = $id -- why\n\n"
         );
+    }
+
+    #[test]
+    fn a_fix_that_could_change_the_errors_raised_is_withheld() {
+        let db = catalog();
+        // Without LIMIT PG may evaluate the division on a row the key
+        // lookup never had to read.
+        let sql = "SELECT id FROM users WHERE id = $id AND 1/(id-2) > 0 LIMIT 1";
+        let findings = lint(&db, sql);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, Rule::RedundantLimit);
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
     }
 
     #[test]

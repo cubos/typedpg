@@ -10,14 +10,64 @@
 
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
-    self, CommonTableExpr, DeleteStmt, InsertStmt, LimitOption, MergeStmt, ReturningClause,
-    SelectStmt, SetOperation, UpdateStmt, WithClause, a_const::Val, node::Node,
+    self, CommonTableExpr, DeleteStmt, InsertStmt, JoinType, LimitOption, MergeStmt,
+    ReturningClause, SelectStmt, SetOperation, UpdateStmt, WithClause, a_const::Val, node::Node,
 };
 
 use super::Ctx;
 use super::dedup::{self, CteColumn, CteEnv, CteInfo, Fields, PredicateSources, Scope};
-use super::proof::FromScope;
+use super::proof::{self, FromScope};
 use crate::pg_catalog::{PgCatalog, ProKind, QueryView, oid};
+
+impl QueryView {
+    /// Whether evaluating `select` — a node of this view at any nesting
+    /// depth — can never raise an error: every expression of its target
+    /// list, WHERE, joins, GROUP BY, HAVING, DISTINCT and ORDER BY is one
+    /// [`proof::cannot_error`] accepts, and its FROM reads only stored
+    /// tables. A `false` answer only withholds a rewrite, so anything the
+    /// proof can't see through is `false`.
+    pub fn select_is_error_free(&self, catalog: &PgCatalog, select: &SelectStmt) -> bool {
+        if !self.analyzed.spreads.is_empty() {
+            return false;
+        }
+        let ctx = Ctx {
+            sql: &self.sql,
+            tree: &self.tree,
+            catalog,
+            analyzed: &self.analyzed,
+        };
+        select_is_error_free_in(&ctx, select)
+    }
+
+    /// The spans of the plain `DISTINCT` keywords the `distinct`
+    /// simplification proves redundant, each with whether removing it
+    /// can't change the errors the select raises (the lint fix's
+    /// condition; a finding is still reported when it is `false`).
+    pub fn redundant_distinct_spans_with_fix(
+        &self,
+        catalog: &PgCatalog,
+    ) -> Vec<(std::ops::Range<usize>, bool)> {
+        if !self.analyzed.spreads.is_empty() {
+            return Vec::new();
+        }
+        let ctx = Ctx {
+            sql: &self.sql,
+            tree: &self.tree,
+            catalog,
+            analyzed: &self.analyzed,
+        };
+        dedup::distinct_candidates_with_select(&ctx)
+            .into_iter()
+            .flat_map(|(select, candidate)| {
+                let error_free = select_is_error_free_in(&ctx, select);
+                candidate
+                    .edits
+                    .into_iter()
+                    .map(move |edit| (edit.range, error_free))
+            })
+            .collect()
+    }
+}
 
 /// The ranges in `view.sql` of the plain `DISTINCT` keywords the `distinct`
 /// simplification proves redundant (exactly the spans it would delete).
@@ -79,8 +129,10 @@ pub fn redundant_distinct_spans(
 /// Anything else is `false`: `GROUP BY` always is (a group per key), and so
 /// is every relation the proof can't see through (a view, a subquery, a
 /// function that returns a set, an unproven CTE, an inheritance parent, a
-/// partitioned table or one under row security), a set-returning call, or an
-/// outer join whose nullable side isn't determined.
+/// partitioned table or one under row security), a set-returning call, a
+/// `FULL JOIN` (two one-row sides still produce an unmatched row from each
+/// when their keys differ), or an outer join whose nullable side isn't
+/// determined.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
     if !view.analyzed.spreads.is_empty() {
         return false;
@@ -95,7 +147,15 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
     let env = CteEnv::default();
     for raw in &view.tree.stmts {
         if let Some(root) = raw.stmt.as_deref().and_then(|node| node.node.as_ref()) {
-            find_select(&ctx, root.to_ref(), None, &env, select, &mut found);
+            find_select(
+                &ctx,
+                root.to_ref(),
+                None,
+                &env,
+                select,
+                SelectCheck::OneRow,
+                &mut found,
+            );
             if found.is_some() {
                 break;
             }
@@ -110,6 +170,32 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
     })
 }
 
+/// Whether `select` — a node of `ctx`'s tree at any nesting depth — is
+/// error-free by [`QueryView::select_is_error_free`]'s proof.
+fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    let mut found = None;
+    let env = CteEnv::default();
+    for raw in &ctx.tree.stmts {
+        if let Some(root) = raw.stmt.as_deref().and_then(|node| node.node.as_ref()) {
+            find_select(
+                ctx,
+                root.to_ref(),
+                None,
+                &env,
+                select,
+                SelectCheck::ErrorFree,
+                &mut found,
+            );
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    found.unwrap_or_else(|| {
+        proof::error_free_select_allow_count(ctx, select, &FromScope::opaque(None))
+    })
+}
+
 /// Whether the top-level statement of `view` provably yields at most one
 /// row, counting its own `LIMIT` / `FETCH FIRST`.
 ///
@@ -117,10 +203,10 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
 /// or its `LIMIT` / `FETCH FIRST` is the constant `0` or `1` (without
 /// `WITH TIES`). An `INSERT ... VALUES` with exactly one row is, whatever
 /// its `ON CONFLICT`; an `INSERT ... SELECT` is when its select is. An
-/// `UPDATE` / `DELETE` is when its target and every `FROM` / `USING`
-/// relation are all determined by its `WHERE` equalities. Everything else —
-/// `MERGE`, `INSERT ... DEFAULT VALUES`, a statement the proof can't see
-/// through — is `false`.
+/// `UPDATE` / `DELETE` is when its target relation is determined by its
+/// `WHERE` equalities (a target row is written once however many `FROM` /
+/// `USING` rows match it). Everything else — `MERGE`, `INSERT ... DEFAULT
+/// VALUES`, a statement the proof can't see through — is `false`.
 ///
 /// The statement's own `WITH` clause provides its single-row CTEs, judged in
 /// declaration order (see [`select_at_most_one_row`]).
@@ -238,18 +324,21 @@ fn cte_output_columns(ctx: &Ctx<'_>, body: NodeRef<'_>, env: &CteEnv) -> Vec<Cte
         NodeRef::InsertStmt(insert) => returning_columns(
             ctx,
             insert.relation.as_ref(),
+            &[],
             insert.returning_clause.as_ref(),
             env,
         ),
         NodeRef::UpdateStmt(update) => returning_columns(
             ctx,
             update.relation.as_ref(),
+            &update.from_clause,
             update.returning_clause.as_ref(),
             env,
         ),
         NodeRef::DeleteStmt(delete) => returning_columns(
             ctx,
             delete.relation.as_ref(),
+            &delete.using_clause,
             delete.returning_clause.as_ref(),
             env,
         ),
@@ -345,18 +434,23 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
     out
 }
 
+/// The columns a `RETURNING` clause yields. A star expands the target
+/// table's columns with their types only when it is unqualified and there
+/// is no `FROM` / `USING`, or when it is qualified by the target's name or
+/// alias. Any other star — `s.*` of a `FROM` relation, or a bare `*` that
+/// also merges the `FROM` relations' columns — is still part of a one-row
+/// CTE, but its columns' types are unknown: a key equality can't read them.
 fn returning_columns(
     ctx: &Ctx<'_>,
     relation: Option<&protobuf::RangeVar>,
+    from: &[protobuf::Node],
     returning: Option<&ReturningClause>,
     env: &CteEnv,
 ) -> Vec<CteColumn> {
     let (Some(relation), Some(returning)) = (relation, returning) else {
         return Vec::new();
     };
-    let Some(scope) = Scope::dml(ctx, env, relation, &[]) else {
-        return Vec::new();
-    };
+    let scope = Scope::dml(ctx, env, relation, from);
     let mut out = Vec::new();
     for target in &returning.exprs {
         let Some(Node::ResTarget(target)) = &target.node else {
@@ -366,23 +460,49 @@ fn returning_columns(
             continue;
         };
         if let Some(Node::ColumnRef(column)) = &value.node
-            && let Fields::Star(_) = dedup::column_ref_fields(column)
+            && let Some(qualifier) = star_ref(column)
         {
-            for (name, attnum) in &scope.rels[0].columns {
-                let (typ, deterministic) = scope.rels[0]
-                    .column_info(ctx, *attnum)
-                    .map_or((None, false), |(typ, deterministic)| {
-                        (Some(typ), deterministic)
+            let target_star = match qualifier {
+                Some(qualifier) => scope
+                    .as_ref()
+                    .is_some_and(|scope| target_named(&scope.rels[0], qualifier)),
+                None => from.is_empty(),
+            };
+            let Some(scope) = &scope else {
+                continue;
+            };
+            if target_star {
+                for (name, attnum) in &scope.rels[0].columns {
+                    let (typ, deterministic) = scope.rels[0]
+                        .column_info(ctx, *attnum)
+                        .map_or((None, false), |(typ, deterministic)| {
+                            (Some(typ), deterministic)
+                        });
+                    out.push(CteColumn {
+                        name: name.clone(),
+                        typ,
+                        deterministic,
                     });
-                out.push(CteColumn {
-                    name: name.clone(),
-                    typ,
-                    deterministic,
-                });
+                }
+            } else {
+                // Whose columns the star expands, with every type unknown.
+                let rels: Vec<usize> = match qualifier {
+                    Some(qualifier) => scope.rel_named(qualifier).into_iter().collect(),
+                    None => (0..scope.rels.len()).collect(),
+                };
+                for r in rels {
+                    for (name, _) in &scope.rels[r].columns {
+                        out.push(CteColumn {
+                            name: name.clone(),
+                            typ: None,
+                            deterministic: false,
+                        });
+                    }
+                }
             }
             continue;
         }
-        let (typ, deterministic) = value_type(ctx, Some(&scope), value);
+        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value);
         out.push(CteColumn {
             name: if target.name.is_empty() {
                 output_name(value)
@@ -394,6 +514,31 @@ fn returning_columns(
         });
     }
     out
+}
+
+/// The qualifier of a star reference: `Some(None)` for `*`, `Some(Some(q))`
+/// for `q.*` (or the table part of `schema.q.*`), `None` for anything else.
+fn star_ref(column: &protobuf::ColumnRef) -> Option<Option<&str>> {
+    let (last, names) = column.fields.split_last()?;
+    if !matches!(last.node, Some(Node::AStar(_))) {
+        return None;
+    }
+    match names {
+        [] => Some(None),
+        [qualifier] => match &qualifier.node {
+            Some(Node::String(string)) => Some(Some(string.sval.as_str())),
+            _ => Some(Some("")),
+        },
+        // A schema-qualified star: not the plain target name/alias, so let
+        // it expand no known relation (its columns stay unknown).
+        _ => Some(Some("")),
+    }
+}
+
+/// Whether the target relation is named by `qualifier`: its alias, or its
+/// table name when it has none.
+fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
+    qualifier == rel.refname || (!rel.aliased && qualifier == rel.relname)
 }
 
 /// The type of a value a CTE's output exposes, when it is a column, a
@@ -479,9 +624,18 @@ fn string_list(nodes: &[protobuf::Node]) -> Vec<&str> {
 
 // ── Finding the node's outer scopes ─────────────────────────────────────────
 
+/// What [`find_select`] runs on the target once it finds it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectCheck {
+    /// [`select_at_most_one_row_in`].
+    OneRow,
+    /// [`proof::error_free_select_allow_count`] (the lint fix's proof).
+    ErrorFree,
+}
+
 /// Search `node`'s subtree for `target`, giving each nested query level the
-/// [`FromScope`]s and CTEs it is evaluated in. Once found, run the proof
-/// with that scope and store the answer in `out`.
+/// [`FromScope`]s and CTEs it is evaluated in. Once found, run `check`'s
+/// proof with that scope and store the answer in `out`.
 ///
 /// The scopes may include items a subquery can't actually see without
 /// `LATERAL`; that only matters for queries PG rejects, which never reach
@@ -492,6 +646,7 @@ fn find_select(
     parent: Option<&FromScope<'_>>,
     env: &CteEnv,
     target: &SelectStmt,
+    check: SelectCheck,
     out: &mut Option<bool>,
 ) {
     if out.is_some() {
@@ -502,12 +657,14 @@ fn find_select(
             let visible = visible_ctes(ctx, env, select.with_clause.as_ref());
             if std::ptr::eq(select, target) {
                 let scope = FromScope::of_select(ctx, select, parent);
-                *out = Some(select_at_most_one_row_in(
-                    ctx,
-                    select,
-                    &scope,
-                    &visible.after,
-                ));
+                *out = Some(match check {
+                    SelectCheck::OneRow => {
+                        select_at_most_one_row_in(ctx, select, &scope, &visible.after)
+                    }
+                    SelectCheck::ErrorFree => {
+                        proof::error_free_select_allow_count(ctx, select, &scope)
+                    }
+                });
                 return;
             }
             find_cte_bodies(
@@ -516,6 +673,7 @@ fn find_select(
                 &visible.bodies,
                 parent,
                 target,
+                check,
                 out,
             );
             if select.op() != SetOperation::SetopNone {
@@ -529,6 +687,7 @@ fn find_select(
                         parent,
                         &visible.after,
                         target,
+                        check,
                         out,
                     );
                 }
@@ -536,7 +695,7 @@ fn find_select(
             }
             let scope = FromScope::of_select(ctx, select, parent);
             for child in select_children(select) {
-                find_select(ctx, child, Some(&scope), &visible.after, target, out);
+                find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
         }
         NodeRef::InsertStmt(insert) => {
@@ -547,11 +706,12 @@ fn find_select(
                 &visible.bodies,
                 parent,
                 target,
+                check,
                 out,
             );
             let scope = FromScope::of_dml(ctx, insert.relation.as_ref(), &[], parent);
             for child in insert_children(insert) {
-                find_select(ctx, child, Some(&scope), &visible.after, target, out);
+                find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
         }
         NodeRef::UpdateStmt(update) => {
@@ -562,12 +722,13 @@ fn find_select(
                 &visible.bodies,
                 parent,
                 target,
+                check,
                 out,
             );
             let scope =
                 FromScope::of_dml(ctx, update.relation.as_ref(), &update.from_clause, parent);
             for child in update_children(update) {
-                find_select(ctx, child, Some(&scope), &visible.after, target, out);
+                find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
         }
         NodeRef::DeleteStmt(delete) => {
@@ -578,12 +739,13 @@ fn find_select(
                 &visible.bodies,
                 parent,
                 target,
+                check,
                 out,
             );
             let scope =
                 FromScope::of_dml(ctx, delete.relation.as_ref(), &delete.using_clause, parent);
             for child in delete_children(delete) {
-                find_select(ctx, child, Some(&scope), &visible.after, target, out);
+                find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
         }
         NodeRef::MergeStmt(merge) => {
@@ -594,6 +756,7 @@ fn find_select(
                 &visible.bodies,
                 parent,
                 target,
+                check,
                 out,
             );
             let source: &[protobuf::Node] = merge
@@ -603,12 +766,12 @@ fn find_select(
                 .unwrap_or_default();
             let scope = FromScope::of_dml(ctx, merge.relation.as_ref(), source, parent);
             for child in merge_children(merge) {
-                find_select(ctx, child, Some(&scope), &visible.after, target, out);
+                find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
         }
         _ => {
             for child in node.children() {
-                find_select(ctx, child, parent, env, target, out);
+                find_select(ctx, child, parent, env, target, check, out);
             }
         }
     }
@@ -621,6 +784,7 @@ fn find_cte_bodies(
     bodies: &[CteEnv],
     parent: Option<&FromScope<'_>>,
     target: &SelectStmt,
+    check: SelectCheck,
     out: &mut Option<bool>,
 ) {
     let Some(with) = with else {
@@ -630,7 +794,7 @@ fn find_cte_bodies(
         if let Some(Node::CommonTableExpr(cte)) = &node.node
             && let Some(body) = cte.ctequery.as_deref().and_then(|n| n.node.as_ref())
         {
-            find_select(ctx, body.to_ref(), parent, env, target, out);
+            find_select(ctx, body.to_ref(), parent, env, target, check, out);
         }
     }
 }
@@ -774,13 +938,19 @@ fn select_at_most_one_row_in(
     if has_set_returning(ctx, select) {
         return false;
     }
+    // A FULL JOIN emits the unmatched rows of both sides: two relations that
+    // are each one row can still produce two (one from each side when their
+    // join keys don't match), so no key equality bounds it.
+    if has_full_join(&select.from_clause) {
+        return false;
+    }
     if !select.values_lists.is_empty() {
         return select.from_clause.is_empty() && select.values_lists.len() == 1;
     }
     if select.from_clause.is_empty() {
         return true;
     }
-    if select.having_clause.is_some() || has_own_aggregate(ctx, select) {
+    if select.having_clause.is_some() || has_own_aggregate(ctx, select, env) {
         // One group, and nothing groups it further.
         return true;
     }
@@ -864,9 +1034,18 @@ fn has_set_returning(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     false
 }
 
-/// Whether `select`'s own expressions call an aggregate (a window function
-/// over one doesn't count: `over` is set).
-fn has_own_aggregate(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+/// Whether `select`'s own expressions call an aggregate that belongs to
+/// this level (a window function over one doesn't count: `over` is set).
+///
+/// PG assigns an aggregate to the innermost query level its aggregated
+/// arguments — arguments, ORDER BY and FILTER — read; with no column
+/// reference at all (`count(*)`) that is the level it is written in. So
+/// `count(outer.x)` inside a subquery is the outer level's aggregate and
+/// does not collapse the subquery's rows. Nested queries are separate
+/// levels; when one is found inside the arguments this gives up (a
+/// reference there might still bind to this level).
+fn has_own_aggregate(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> bool {
+    let scope = Scope::build_env(ctx, env, &select.from_clause);
     let mut stack: Vec<NodeRef<'_>> = Vec::new();
     for list in [
         &select.target_list,
@@ -899,7 +1078,9 @@ fn has_own_aggregate(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
                 let procs = ctx.catalog.find_functions(schema, name);
                 // Only when every overload is an aggregate: a same-named
                 // scalar function would not collapse the rows.
-                if !procs.is_empty() && procs.iter().all(|proc| proc.prokind == ProKind::Aggregate)
+                if !procs.is_empty()
+                    && procs.iter().all(|proc| proc.prokind == ProKind::Aggregate)
+                    && aggregate_is_this_level(scope.as_ref(), call)
                 {
                     return true;
                 }
@@ -909,6 +1090,84 @@ fn has_own_aggregate(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
         stack.extend(node.children());
     }
     false
+}
+
+/// Whether every column reference in aggregate call `call`'s aggregated
+/// arguments (arguments, ORDER BY and FILTER) resolves in `scope`, this
+/// select's own FROM — or there is none. Any reference this can't place
+/// (an outer column, a name an opaque item may bind) makes it another
+/// level's aggregate.
+fn aggregate_is_this_level(scope: Option<&Scope<'_>>, call: &protobuf::FuncCall) -> bool {
+    let sort_exprs = call
+        .agg_order
+        .iter()
+        .filter_map(|node| match node.node.as_ref() {
+            Some(Node::SortBy(by)) => by.node.as_deref(),
+            _ => Some(node),
+        });
+    let mut stack: Vec<NodeRef<'_>> = call
+        .args
+        .iter()
+        .filter_map(|n| n.node.as_ref().map(|inner| inner.to_ref()))
+        .collect();
+    stack.extend(sort_exprs.filter_map(|n| n.node.as_ref().map(|inner| inner.to_ref())));
+    stack.extend(
+        call.agg_filter
+            .as_deref()
+            .and_then(|n| n.node.as_ref())
+            .map(|inner| inner.to_ref()),
+    );
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeRef::SubLink(_) => {
+                // Only a subquery that reads no column can't hide a
+                // reference to this level.
+                if contains_column_ref(node) {
+                    return false;
+                }
+                continue;
+            }
+            NodeRef::RangeSubselect(_) | NodeRef::CommonTableExpr(_) => return false,
+            NodeRef::ColumnRef(column) => {
+                let Fields::Names(names) = dedup::column_ref_fields(column) else {
+                    return false;
+                };
+                if !scope.is_some_and(|scope| matches!(scope.resolve(&names), dedup::Col::Rel(..)))
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        stack.extend(node.children());
+    }
+    true
+}
+
+/// Whether any column reference appears anywhere below `node`.
+fn contains_column_ref(node: NodeRef<'_>) -> bool {
+    match node {
+        NodeRef::ColumnRef(_) => true,
+        _ => node.children().into_iter().any(contains_column_ref),
+    }
+}
+
+/// Whether the FROM clause contains a FULL JOIN at any depth.
+fn has_full_join(from: &[protobuf::Node]) -> bool {
+    from.iter().any(node_has_full_join)
+}
+
+fn node_has_full_join(item: &protobuf::Node) -> bool {
+    match item.node.as_ref() {
+        Some(Node::JoinExpr(join)) => {
+            join.jointype() == JoinType::JoinFull
+                || [&join.larg, &join.rarg]
+                    .into_iter()
+                    .flatten()
+                    .any(|side| node_has_full_join(side))
+        }
+        _ => false,
+    }
 }
 
 /// The relations a relation-independent fixed point starts with: every
@@ -1044,9 +1303,12 @@ fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> b
         || limit_bounds_one(select)
 }
 
-/// An `UPDATE ... FROM` / `DELETE ... USING` whose target and every
-/// `FROM` / `USING` relation are determined by the same `WHERE` fixed
-/// point, the target counting as one more relation.
+/// An `UPDATE ... FROM` / `DELETE ... USING` whose target relation is
+/// determined by the `WHERE` fixed point, the target counting as one more
+/// relation. A target row is updated or deleted once however many `FROM` /
+/// `USING` rows match it, so those other relations need not be determined:
+/// mapping their columns into the target's key doesn't multiply the
+/// statement's output rows.
 fn dml_at_most_one_row(
     ctx: &Ctx<'_>,
     env: &CteEnv,
@@ -1064,7 +1326,6 @@ fn dml_at_most_one_row(
     if n == 0 || n > 63 {
         return false;
     }
-    let all: u64 = (1u64 << n) - 1;
     let conjuncts = dedup::conjuncts(where_clause);
     let facts: Vec<dedup::EqFact> = conjuncts
         .iter()
@@ -1090,7 +1351,8 @@ fn dml_at_most_one_row(
             break;
         }
     }
-    known & all == all
+    // Relation 0 is the target (`Scope::dml` adds it first).
+    known & 1 == 1
 }
 
 /// Whether `select`'s `LIMIT` / `FETCH FIRST` is the constant `0` or `1`
@@ -1230,7 +1492,12 @@ mod tests {
                 WHERE state <> ALL (ARRAY['finished', 'abandoned']);
              CREATE TABLE flags (code text NOT NULL, hidden boolean NOT NULL);
              CREATE UNIQUE INDEX ON flags (code) WHERE hidden;
-             CREATE UNIQUE INDEX ON flags (code) WHERE NOT hidden;",
+             CREATE UNIQUE INDEX ON flags (code) WHERE NOT hidden;
+             CREATE TABLE dst (id bigint PRIMARY KEY, z int);
+             CREATE TABLE src (id bigint PRIMARY KEY, dst_id bigint);
+             CREATE TABLE src_empty ();
+             CREATE TABLE alias_partial (k int, active boolean, inactive boolean);
+             CREATE UNIQUE INDEX ON alias_partial (k) WHERE active;",
         )
         .unwrap();
         db
@@ -1677,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn update_from_and_delete_using_need_every_relation_determined() {
+    fn update_from_and_delete_using_need_only_a_determined_target() {
         let db = catalog();
         assert!(statement_one(
             &db,
@@ -1689,14 +1956,181 @@ mod tests {
             "DELETE FROM users USING orgs o \
              WHERE users.id = $1 AND o.id = users.org_id",
         ));
-        // The FROM / USING relation isn't determined by the WHERE.
-        assert!(!statement_one(
+        // The target is determined even though the FROM / USING relation
+        // matches many rows: the target row is written once.
+        assert!(statement_one(
             &db,
             "UPDATE users SET name = 'x' FROM orgs o WHERE users.id = $1",
         ));
-        assert!(!statement_one(
+        assert!(statement_one(
             &db,
             "DELETE FROM users USING orgs o WHERE users.id = $1",
+        ));
+        // The target is not determined by an undetermined FROM relation.
+        assert!(!statement_one(
+            &db,
+            "UPDATE users SET name = o.name FROM orgs o WHERE users.id = o.id",
+        ));
+        assert!(!statement_one(
+            &db,
+            "DELETE FROM users USING orgs o WHERE users.id = o.id",
+        ));
+    }
+
+    #[test]
+    fn a_full_join_is_never_one_row_even_between_single_row_sides() {
+        let db = catalog();
+        assert!(!select_one(
+            &db,
+            "WITH a AS MATERIALIZED (SELECT 1 AS x), b AS MATERIALIZED (SELECT 2 AS y) \
+             SELECT a.x, b.y FROM a FULL JOIN b ON a.x = b.y",
+        ));
+        // LEFT / RIGHT with the nullable side determined stay fine.
+        assert!(select_one(
+            &db,
+            "WITH a AS MATERIALIZED (SELECT 1 AS x) \
+             SELECT u.id FROM users u LEFT JOIN a ON a.x = u.id WHERE u.id = $1",
+        ));
+    }
+
+    #[test]
+    fn an_aggregate_over_outer_columns_is_the_outer_levels() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE u (id bigint PRIMARY KEY);
+             CREATE TABLE v (id bigint PRIMARY KEY);",
+        )
+        .unwrap();
+        // `count(u.id)` reads only the outer `u`, so the inner select is not
+        // an aggregate query: it returns one row per `v` row.
+        let check_inner = |sql: &str| {
+            let view = view(&db, sql);
+            let selects: Vec<&SelectStmt> = view
+                .tree
+                .nodes()
+                .into_iter()
+                .filter_map(|(node, _)| match node {
+                    NodeRef::SelectStmt(select) => Some(select),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(selects.len(), 2, "{sql}");
+            select_at_most_one_row(&db, &view, selects[1])
+        };
+        assert!(!check_inner(
+            "SELECT (SELECT count(u.id) FROM v LIMIT 1) FROM u",
+        ));
+        // `count(*)` and an aggregate over the inner FROM are its own.
+        assert!(check_inner(
+            "SELECT (SELECT count(*) FROM v LIMIT 1) FROM u",
+        ));
+        assert!(check_inner("SELECT (SELECT count(v.id) FROM v) FROM u"));
+    }
+
+    #[test]
+    fn a_partial_index_predicate_resolves_against_the_tables_real_names() {
+        let db = catalog();
+        // The alias renames attnum 2 (`active`) to `inactive` and attnum 3
+        // (`inactive`) to `active`: the stored predicate's `active` is the
+        // boolean column, not the query's `x.active` (an int).
+        assert!(!select_one(
+            &db,
+            "SELECT x.k FROM alias_partial AS x(k, inactive, active) \
+             WHERE x.k = 1 AND x.active",
+        ));
+        // `x.inactive` is the table's `active` boolean, so the predicate
+        // holds.
+        assert!(select_one(
+            &db,
+            "SELECT x.k FROM alias_partial AS x(k, inactive, active) \
+             WHERE x.k = 1 AND x.inactive",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT k FROM alias_partial WHERE k = 1 AND active",
+        ));
+    }
+
+    #[test]
+    fn a_sublink_with_its_own_query_levels_is_not_a_fixed_value() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE u (id bigint PRIMARY KEY);
+             CREATE TABLE v (id bigint PRIMARY KEY);",
+        )
+        .unwrap();
+        // The CTE body's `id` binds to `u.id`, outside the sublink, not to
+        // `v`; the old single-scope read took it as local.
+        assert!(!select_one(
+            &db,
+            "SELECT u.id FROM u WHERE u.id = ( \
+                 WITH c AS (SELECT id) \
+                 SELECT v.id FROM v WHERE v.id = (SELECT id FROM c) LIMIT 1 \
+             )",
+        ));
+        // A nested sublink can read the level being proven too.
+        assert!(!select_one(
+            &db,
+            "SELECT u.id FROM u \
+             WHERE u.id = (SELECT v.id FROM v WHERE v.id = (SELECT u.id))",
+        ));
+        // A plain uncorrelated scalar subquery still counts.
+        assert!(select_one(
+            &db,
+            "SELECT u.id FROM u WHERE u.id = (SELECT v.id FROM v WHERE v.id = $1)",
+        ));
+    }
+
+    #[test]
+    fn a_returning_star_from_another_relation_has_unknown_columns() {
+        let db = catalog();
+        // `s.*` expands the FROM relation, not the target; its columns keep
+        // the CTE single-row but carry no type, so `b.id` can't equate the
+        // joined key.
+        assert!(!statement_one(
+            &db,
+            "WITH r AS ( \
+                 UPDATE dst d SET z = 1 FROM src s WHERE d.id = $1 RETURNING s.* \
+             ) \
+             SELECT b.id FROM r b JOIN other o ON o.id = b.id",
+        ));
+        // A bare `RETURNING *` with a FROM merges the FROM columns too, so
+        // even a from relation with no columns leaves the star unknown.
+        assert!(!statement_one(
+            &db,
+            "WITH r AS ( \
+                 UPDATE dst SET z = 1 FROM src_empty WHERE dst.id = $1 RETURNING * \
+             ) \
+             SELECT b.id FROM r b JOIN other o ON o.id = b.id",
+        ));
+        // A target-qualified star is still the target's typed columns.
+        assert!(statement_one(
+            &db,
+            "WITH r AS ( \
+                 UPDATE dst d SET z = 1 FROM src s WHERE d.id = $1 RETURNING d.* \
+             ) \
+             SELECT b.id FROM r b JOIN other o ON o.id = b.id",
+        ));
+    }
+
+    #[test]
+    fn an_update_from_target_is_one_row_even_with_an_undetermined_source() {
+        let db = catalog();
+        assert!(statement_one(
+            &db,
+            "UPDATE dst SET z = 1 FROM src WHERE dst.id = $1 RETURNING dst.id",
+        ));
+        assert!(statement_one(
+            &db,
+            "DELETE FROM dst USING src WHERE dst.id = $1 RETURNING dst.id",
+        ));
+        assert!(!statement_one(
+            &db,
+            "UPDATE dst SET z = 1 FROM src WHERE dst.id = src.dst_id RETURNING dst.id",
+        ));
+        assert!(!statement_one(
+            &db,
+            "DELETE FROM dst USING src WHERE dst.id = src.dst_id RETURNING dst.id",
         ));
     }
 
