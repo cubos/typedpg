@@ -339,7 +339,10 @@ impl Report {
 
     fn sarif(&self, successful: bool) -> String {
         let mut rules = Vec::new();
-        for rule in Rule::ALL.into_iter().chain([Rule::InvalidAllow]) {
+        for rule in Rule::ALL
+            .into_iter()
+            .chain([Rule::InvalidAllow, Rule::InternalError])
+        {
             rules.push(serde_json::json!({
                 "id": rule.name(),
                 "shortDescription": { "text": rule.description() },
@@ -1083,7 +1086,10 @@ mod tests {
         assert_eq!(driver["version"], env!("CARGO_PKG_VERSION"));
 
         let rules = driver["rules"].as_array().unwrap();
-        for rule in Rule::ALL.into_iter().chain([Rule::InvalidAllow]) {
+        for rule in Rule::ALL
+            .into_iter()
+            .chain([Rule::InvalidAllow, Rule::InternalError])
+        {
             let rule_json = rules
                 .iter()
                 .find(|candidate| candidate["id"] == rule.name())

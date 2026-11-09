@@ -244,6 +244,15 @@
               }
             },
             {
+              "id": "internal_error",
+              "shortDescription": {
+                "text": "a typedpg bug: a fix that would have changed the query"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
               "id": "analysis_error",
               "shortDescription": {
                 "text": "the query or migration could not be analyzed"

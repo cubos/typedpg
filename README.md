@@ -163,6 +163,9 @@ the SQL literal to `$v`), and applies the SQL edits some rules offer:
 `redundant_null_check`'s `COALESCE`, `redundant_limit`,
 `redundant_distinct` and `unused_returning`. It writes the files, then
 reports what remains; only edits that keep the query's meaning are applied.
+Each fix is checked once more before it is offered: the edited query must
+analyze to the same columns and parameters. A fix that doesn't is a typedpg
+bug; it is withheld, and an `internal_error` warning asks you to report it.
 
 Migrations already applied in production cannot be changed, so `cargo typedpg
 lint --ignore-migrations-from <ref>` (for example `origin/main`) skips the

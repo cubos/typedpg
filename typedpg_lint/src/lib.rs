@@ -128,6 +128,10 @@ pub enum Rule {
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
+    /// A rule offered a fix that would change the query: a typedpg bug. The
+    /// fix is withheld and this warning asks for a report. Never
+    /// configurable and never suppressible.
+    InternalError,
 }
 
 impl Rule {
@@ -190,6 +194,7 @@ impl Rule {
             Rule::FetchAllSingleRow => "fetch_all_single_row",
             Rule::UnusedReturning => "unused_returning",
             Rule::InvalidAllow => "invalid_allow",
+            Rule::InternalError => "internal_error",
         }
     }
 
@@ -242,6 +247,7 @@ impl Rule {
             Rule::FetchAllSingleRow => "fetch_all on a query that returns at most one row",
             Rule::UnusedReturning => "execute() on a statement whose RETURNING rows are discarded",
             Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
+            Rule::InternalError => "a typedpg bug: a fix that would have changed the query",
         }
     }
 
@@ -265,6 +271,7 @@ impl Rule {
             | Rule::TableRewrite
             | Rule::FkWithoutIndex
             | Rule::RedundantBinding
+            | Rule::InternalError
             | Rule::RedundantNullCheck
             | Rule::LimitWithoutOrder
             | Rule::FkTypeMismatch
@@ -470,10 +477,36 @@ pub fn lint_query(
         for edit in &mut finding.fix {
             edit.range = view.original_span(edit.range.clone());
         }
-        if !finding.fix.is_empty() && !fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix) {
+    }
+    let mut bugs = Vec::new();
+    for finding in &mut findings {
+        if finding.fix.is_empty() {
+            continue;
+        }
+        if let Err(change) = fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix) {
             finding.fix.clear();
+            let message = format!(
+                "typedpg bug: the {} fix would have changed {change}, so it was not offered",
+                finding.rule
+            );
+            // A rule's own tests must never get here.
+            if cfg!(test) {
+                panic!("{message}: {sql}");
+            }
+            bugs.push(Finding {
+                rule: Rule::InternalError,
+                severity: Severity::Warning,
+                span: finding.span.clone(),
+                message,
+                help: Some(
+                    "please report it at https://github.com/cubos/typedpg/issues with this query"
+                        .to_owned(),
+                ),
+                fix: Vec::new(),
+            });
         }
     }
+    findings.extend(bugs);
     // A deterministic order within a query: by position, then rule.
     findings.sort_by(|a, b| {
         (a.span.start, a.span.end, a.rule).cmp(&(b.span.start, b.span.end, b.rule))
@@ -484,36 +517,43 @@ pub fn lint_query(
 /// Whether `sql` with `fix` applied still analyzes to the same query shape
 /// as `original`: the same output columns (name, type, nullability), the
 /// same parameters (name, type, nullability) and the same embeddability.
+/// The error says what would have changed.
 ///
 /// A safety net under every rule's own proof that its fix keeps the query's
-/// meaning: a fix that renames a column, changes a type or breaks the query
-/// is dropped (the finding stays). It can't see a change in the rows
-/// themselves; that stays each rule's proof to make.
+/// meaning: no rule should ever propose a fix that fails it, so a failure is
+/// a typedpg bug. It can't see a change in the rows themselves; that stays
+/// each rule's proof to make.
 fn fix_keeps_shape(
     catalog: &PgCatalog,
     sql: &str,
     original: &typedpg_analyzer::AnalyzedQuery,
     fix: &[SqlEdit],
-) -> bool {
-    let Some(edited) = apply_edits(sql, fix) else {
-        return false;
-    };
-    let Ok(analyzed) = catalog.analyze(&edited) else {
-        return false;
-    };
-    analyzed.can_run_as_subquery == original.can_run_as_subquery
-        && analyzed.columns.len() == original.columns.len()
+) -> Result<(), &'static str> {
+    let edited = apply_edits(sql, fix).ok_or("the query text (overlapping edits)")?;
+    let analyzed = catalog
+        .analyze(&edited)
+        .map_err(|_| "the query into one that doesn't analyze")?;
+    let same_columns = analyzed.columns.len() == original.columns.len()
         && analyzed
             .columns
             .iter()
             .zip(&original.columns)
-            .all(|(a, b)| a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable)
-        && analyzed.params.len() == original.params.len()
-        && analyzed
-            .params
-            .iter()
-            .zip(&original.params)
-            .all(|(a, b)| a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable)
+            .all(|(a, b)| a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable);
+    if !same_columns {
+        return Err("its output columns");
+    }
+    let same_params =
+        analyzed.params.len() == original.params.len()
+            && analyzed.params.iter().zip(&original.params).all(|(a, b)| {
+                a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable
+            });
+    if !same_params {
+        return Err("its parameters");
+    }
+    if analyzed.can_run_as_subquery != original.can_run_as_subquery {
+        return Err("whether it can run as a subquery");
+    }
+    Ok(())
 }
 
 /// `text` with `edits` applied, or `None` when they overlap or fall outside
@@ -731,7 +771,7 @@ mod tests {
                 }
             })
             .collect();
-        fix_keeps_shape(catalog, sql, &original, &fix)
+        fix_keeps_shape(catalog, sql, &original, &fix).is_ok()
     }
 
     #[test]
@@ -790,12 +830,7 @@ mod tests {
                 text: String::new(),
             },
         ];
-        assert!(!fix_keeps_shape(
-            &db,
-            "SELECT id FROM users",
-            &original,
-            &overlapping
-        ));
+        assert!(fix_keeps_shape(&db, "SELECT id FROM users", &original, &overlapping).is_err());
     }
 
     fn options(level: Option<Severity>, fail_on: Option<Severity>) -> LintOptions {

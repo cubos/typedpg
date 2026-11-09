@@ -52,7 +52,8 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         | Rule::FetchMayReturnMany
         | Rule::FetchAllSingleRow
         | Rule::UnusedReturning
-        | Rule::InvalidAllow => Vec::new(),
+        | Rule::InvalidAllow
+        | Rule::InternalError => Vec::new(),
     }
 }
 
