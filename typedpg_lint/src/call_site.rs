@@ -128,7 +128,10 @@ fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     let Some((keyword, end)) = returning_span(ctx, raw) else {
         return Vec::new();
     };
-    let fix = if calls.len() == 1 && returning.exprs.iter().all(is_plain_returning_target) {
+    let fix = if calls.len() == 1
+        && returning.exprs.iter().all(is_plain_returning_target)
+        && !may_read_virtual_columns(ctx, statement)
+    {
         vec![SqlEdit {
             range: whitespace_start(ctx.sql, keyword)..end,
             text: String::new(),
@@ -227,6 +230,46 @@ fn is_plain_returning_target(node: &typedpg_pg_query::protobuf::Node) -> bool {
         target.val.as_deref().and_then(|val| val.node.as_ref()),
         Some(Node::ColumnRef(_) | Node::AConst(_))
     )
+}
+
+/// Whether the statement's `RETURNING` may read a virtual generated column:
+/// reading one evaluates its expression, which can raise, so removing even a
+/// plain column reference could drop an error. Conservative: any relation
+/// of the statement whose name matches a table with a virtual column (in
+/// any schema), and any `FROM` / `USING` item that is not a plain table
+/// (or a MERGE, whose source can be anything), count.
+fn may_read_virtual_columns(ctx: &Ctx<'_>, statement: &Node) -> bool {
+    let (target, from): (_, &[typedpg_pg_query::protobuf::Node]) = match statement {
+        Node::InsertStmt(stmt) => (stmt.relation.as_ref(), &[]),
+        Node::UpdateStmt(stmt) => (stmt.relation.as_ref(), &stmt.from_clause),
+        Node::DeleteStmt(stmt) => (stmt.relation.as_ref(), &stmt.using_clause),
+        _ => return true,
+    };
+    let Some(target) = target else {
+        return true;
+    };
+    let mut names = vec![target.relname.as_str()];
+    let mut items: Vec<&typedpg_pg_query::protobuf::Node> = from.iter().collect();
+    while let Some(item) = items.pop() {
+        match item.node.as_ref() {
+            Some(Node::RangeVar(range)) => names.push(range.relname.as_str()),
+            Some(Node::JoinExpr(join)) => {
+                items.extend(join.larg.as_deref());
+                items.extend(join.rarg.as_deref());
+            }
+            _ => return true,
+        }
+    }
+    ctx.catalog.iter_classes().any(|class| {
+        names.contains(&class.relname.as_str())
+            && ctx
+                .catalog
+                .attributes_of(class.oid)
+                .iter()
+                .any(|attribute| {
+                    attribute.attgenerated == Some(typedpg_analyzer::AttGenerated::Virtual)
+                })
+    })
 }
 
 #[cfg(test)]
@@ -516,6 +559,28 @@ mod tests {
                 "{sql}: {:?}",
                 findings[0].finding.fix
             );
+        }
+    }
+
+    #[test]
+    fn a_returning_that_may_read_a_virtual_column_has_no_fix() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE t (id int PRIMARY KEY, z int, bad int GENERATED ALWAYS AS (1 / z) VIRTUAL);",
+        )
+        .unwrap();
+        for sql in [
+            "DELETE FROM t WHERE id = 1 RETURNING bad",
+            "DELETE FROM t WHERE id = 1 RETURNING id",
+            "DELETE FROM t WHERE id = 1 RETURNING *",
+            "UPDATE users SET name = 'x' FROM t WHERE users.id = t.id RETURNING users.id",
+        ] {
+            let findings = only(
+                lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+                Rule::UnusedReturning,
+            );
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(findings[0].finding.fix.is_empty(), "{sql}");
         }
     }
 

@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Span, TokenStream, TokenTree};
 use syn::PathArguments;
+use syn::ext::IdentExt;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -321,13 +322,14 @@ fn plain_ident_pattern(pattern: &Pat) -> Option<String> {
     if ident.subpat.is_some() {
         return None;
     }
-    Some(ident.ident.to_string())
+    // `r#q` and `q` name the same binding: compare unraw spellings.
+    Some(ident.ident.unraw().to_string())
 }
 
 /// Whether `pattern` binds `name` anywhere (`let (q, x) = …` shadows it too).
 fn pattern_binds(pattern: &Pat, name: &str) -> bool {
     match pattern {
-        Pat::Ident(ident) => ident.ident == name,
+        Pat::Ident(ident) => ident.ident.unraw() == name,
         Pat::Tuple(tuple) => tuple.elems.iter().any(|pat| pattern_binds(pat, name)),
         Pat::TupleStruct(tuple) => tuple.elems.iter().any(|pat| pattern_binds(pat, name)),
         Pat::Struct(structure) => structure
@@ -439,7 +441,7 @@ impl<'ast> Visit<'ast> for BindingUses<'_> {
         }
         match expr {
             Expr::MethodCall(method) => {
-                if receiver_name(&method.receiver).is_some_and(|name| name == self.name) {
+                if receiver_name(&method.receiver).is_some_and(|name| name.unraw() == self.name) {
                     self.uses.uses += 1;
                     let span = method.method.span();
                     self.uses.calls.push(Call {
@@ -454,7 +456,7 @@ impl<'ast> Visit<'ast> for BindingUses<'_> {
                 syn::visit::visit_expr(self, expr);
             }
             Expr::Assign(assign) => {
-                if receiver_name(&assign.left).is_some_and(|name| name == self.name) {
+                if receiver_name(&assign.left).is_some_and(|name| name.unraw() == self.name) {
                     self.uses.uses += 1;
                     self.uses.escapes = true;
                     self.stop = true;
@@ -463,7 +465,7 @@ impl<'ast> Visit<'ast> for BindingUses<'_> {
                 syn::visit::visit_expr(self, expr);
             }
             Expr::Path(_) => {
-                if receiver_name(expr).is_some_and(|name| name == self.name) {
+                if receiver_name(expr).is_some_and(|name| name.unraw() == self.name) {
                     self.uses.uses += 1;
                     self.uses.escapes = true;
                     return;
@@ -496,7 +498,7 @@ impl<'ast> Visit<'ast> for BindingUses<'_> {
 /// nested delimiter groups.
 fn mentions_ident(tokens: &TokenStream, name: &str) -> bool {
     tokens.clone().into_iter().any(|token| match token {
-        TokenTree::Ident(ident) => ident == name,
+        TokenTree::Ident(ident) => ident.unraw() == name,
         TokenTree::Group(group) => mentions_ident(&group.stream(), name),
         TokenTree::Punct(_) | TokenTree::Literal(_) => false,
     })
@@ -1246,6 +1248,12 @@ fn main() {
     let q = sql!(pool, "SELECT 1");
     q.execute().await?;
     let _ = my_macro!(q);
+}"#,
+            // A raw spelling of the same binding.
+            r#"fn main() {
+    let q = sql!(pool, "SELECT 1");
+    q.execute().await?;
+    let _ = read_id!(r#q);
 }"#,
             // An invocation inside a nested item.
             r#"fn main() {
