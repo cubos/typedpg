@@ -622,8 +622,10 @@ fn escape(s: &str) -> (usize, usize) {
         // one, in either spelling, is one 4-byte character.
         'u' => match unicode_escape(s) {
             Some((len, hi @ 0xD800..=0xDBFF)) => {
-                match s[len..].strip_prefix('\\').and_then(unicode_escape) {
-                    Some((lo_len, 0xDC00..=0xDFFF)) => (len + 1 + lo_len, 4),
+                // Line continuations between the halves produce nothing.
+                let gap = line_continuations(&s[len..]);
+                match s[len + gap..].strip_prefix('\\').and_then(unicode_escape) {
+                    Some((lo_len, 0xDC00..=0xDFFF)) => (len + gap + 1 + lo_len, 4),
                     _ => (len, utf8_len(hi)),
                 }
             }
@@ -632,6 +634,24 @@ fn escape(s: &str) -> (usize, usize) {
         },
         c => (c.len_utf8(), c.len_utf8()),
     }
+}
+
+/// How many bytes of line continuations (`\` and a line terminator) `s`
+/// starts with.
+fn line_continuations(s: &str) -> usize {
+    let mut at = 0;
+    while let Some(rest) = s[at..].strip_prefix('\\') {
+        let len = if rest.starts_with("\r\n") {
+            2
+        } else {
+            match rest.chars().next() {
+                Some(c @ ('\n' | '\r' | '\u{2028}' | '\u{2029}')) => c.len_utf8(),
+                _ => break,
+            }
+        };
+        at += 1 + len;
+    }
+    at
 }
 
 /// A `\u` escape at the start of `s` (after its backslash, so `s` starts
@@ -790,6 +810,8 @@ sql('SELECT 1');
             r"'\u{D83D}\uDE00' AS emoji",
             r"'\uD83D\u{DE00}' AS emoji",
             r"'\u{1F600}' AS emoji",
+            "'\\u{D83D}\\\n\\u{DE00}' AS emoji",
+            "'\\uD83D\\\r\n\\\n\\uDE00' AS emoji",
         ] {
             let cooked = "'😀' AS emoji";
             let at = cooked.find(" AS").unwrap();
