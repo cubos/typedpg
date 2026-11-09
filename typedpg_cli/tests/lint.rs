@@ -239,6 +239,126 @@ pub async fn insert(tx: &typedpg::Transaction<'_>) -> Result<(), Box<dyn std::er
 }
 
 #[test]
+fn lint_fix_removes_an_unused_returning_and_reports_the_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    // No `lint` section: these rules keep their default levels (the shared
+    // fixture turns them off).
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "call_site_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TABLE users (id integer PRIMARY KEY, org_id integer, name text);\n",
+    )
+    .unwrap();
+    let source = r#"//! The call-site rules, end to end.
+
+use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>> {
+    sql!(
+        pool,
+        "SELECT id FROM users WHERE org_id = $org",
+        org = &org,
+    )
+    .fetch_one()
+    .await?;
+    sql!(
+        pool,
+        "INSERT INTO users (id, name) VALUES ($id, $name) RETURNING id",
+        id = &id,
+        name = &name,
+    )
+    .execute()
+    .await?;
+    Ok(())
+}
+"#;
+    let path = root.join("src/main.rs");
+    std::fs::write(&path, source).unwrap();
+    let manifest = root.join("Cargo.toml");
+    let run = |fix: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"));
+        command.args(["typedpg", "lint"]);
+        if fix {
+            command.arg("--fix");
+        }
+        command
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .output()
+            .expect("run `cargo-typedpg`")
+    };
+
+    let output = run(false);
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}\n{stdout}");
+    assert!(
+        stdout.contains("warning[fetch_may_return_many]"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("info[unused_returning]"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "`.fetch_one()` fails with TooManyRows if this query returns a second row, and \
+             nothing in the schema limits it to one"
+        ),
+        "{stdout}"
+    );
+
+    let output = run(true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixed 1 finding in 1 file"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"//! The call-site rules, end to end.
+
+use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>> {
+    sql!(
+        pool,
+        "SELECT id FROM users WHERE org_id = $org",
+        org = &org,
+    )
+    .fetch_one()
+    .await?;
+    sql!(
+        pool,
+        "INSERT INTO users (id, name) VALUES ($id, $name)",
+        id = &id,
+        name = &name,
+    )
+    .execute()
+    .await?;
+    Ok(())
+}
+"#
+    );
+
+    let output = run(false);
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    assert!(!stdout.contains("unused_returning"), "{stdout}");
+    assert!(stdout.contains("fetch_may_return_many"), "{stdout}");
+}
+
+#[test]
 fn lint_fixture_reports_the_expected_documents() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture = crate_dir.join("tests/lint_fixture");

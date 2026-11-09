@@ -19,6 +19,7 @@
 //! `typedpg check` boxes in the human format, as one JSON object, or as
 //! SARIF.
 
+mod call_site;
 mod ignore;
 mod migrations;
 pub mod report;
@@ -309,6 +310,25 @@ pub struct SqlEdit {
     pub text: String,
 }
 
+/// The method a `sql!` result has called on it directly, as the Rust source
+/// shows it to the CLI.
+///
+/// A query that is first bound to a variable has no call site: the binding
+/// hides it from [`lint_query_called`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallMethod {
+    /// `fetch_one()` or `fetch_one_as()`: fails with `TooManyRows` on a
+    /// second row.
+    FetchOne,
+    /// `fetch_optional()` or `fetch_optional_as()`: fails with
+    /// `TooManyRows` on a second row.
+    FetchOptional,
+    /// `fetch_all()` or `fetch_all_as()`.
+    FetchAll,
+    /// `execute()`: runs the statement and discards its `RETURNING` rows.
+    Execute,
+}
+
 /// A lint finding, placed in the original query text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
@@ -431,6 +451,24 @@ pub fn lint_query(
     sql: &str,
     options: &LintOptions,
 ) -> Result<Vec<Finding>, LocatedError> {
+    lint_query_called(catalog, sql, None, options)
+}
+
+/// [`lint_query`], with the method called on the `sql!` result when the
+/// caller can see the Rust source (`cargo typedpg lint` can; the TypeScript
+/// CLI cannot).
+///
+/// The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
+/// `unused_returning`) read `call` and the same
+/// [`QueryView`](typedpg_analyzer::QueryView) every other query rule uses,
+/// so no query is analyzed twice. Their findings are placed in the query
+/// text like any other.
+pub fn lint_query_called(
+    catalog: &PgCatalog,
+    sql: &str,
+    call: Option<CallMethod>,
+    options: &LintOptions,
+) -> Result<Vec<Finding>, LocatedError> {
     let view = catalog.query_view(sql)?;
     let tokens: Vec<Tok> = typedpg_pg_query::scan(&view.sql)
         .map(|scanned| {
@@ -464,7 +502,10 @@ pub fn lint_query(
         if suppressed.contains(&rule) {
             continue;
         }
-        for raw in rules::findings(rule, &ctx) {
+        for raw in rules::findings(rule, &ctx)
+            .into_iter()
+            .chain(call_site::findings(rule, &ctx, call))
+        {
             findings.push(Finding {
                 rule,
                 severity,
