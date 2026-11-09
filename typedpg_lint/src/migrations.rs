@@ -249,6 +249,7 @@ impl MigrationLinter<'_> {
                 span: comment.start..comment.end,
                 message,
                 help: None,
+                fix: Vec::new(),
             },
         });
     }
@@ -338,6 +339,7 @@ impl MigrationLinter<'_> {
                 span,
                 message: raw.message,
                 help: raw.help,
+                fix: Vec::new(),
             },
         });
     }
@@ -421,6 +423,7 @@ impl MigrationLinter<'_> {
                  -- no-transaction"
                     .to_owned(),
             ),
+            fix: Vec::new(),
         }]
     }
 
@@ -480,6 +483,7 @@ impl MigrationLinter<'_> {
                  -- no-transaction), then ADD CONSTRAINT … USING INDEX"
                     .to_owned(),
             ),
+            fix: Vec::new(),
         }]
     }
 
@@ -537,6 +541,7 @@ impl MigrationLinter<'_> {
                 help: Some(
                     "add it NOT VALID, then VALIDATE CONSTRAINT in a later migration".to_owned(),
                 ),
+                fix: Vec::new(),
             }]
         } else {
             Vec::new()
@@ -578,6 +583,7 @@ impl MigrationLinter<'_> {
                     "add CHECK ({} IS NOT NULL) NOT VALID, VALIDATE it, then SET NOT NULL",
                     columns.join(" IS NOT NULL AND ")
                 )),
+                fix: Vec::new(),
             }]
         } else {
             Vec::new()
@@ -672,6 +678,7 @@ impl MigrationLinter<'_> {
                     "rewrite in steps: add a new column, backfill it in batches, then swap"
                         .to_owned(),
                 ),
+                fix: Vec::new(),
             }]
         } else {
             Vec::new()
@@ -725,6 +732,7 @@ impl MigrationLinter<'_> {
                     span: creator.span.clone(),
                     message: raw.message,
                     help,
+                    fix: Vec::new(),
                 },
             });
         }
@@ -800,6 +808,7 @@ impl MigrationLinter<'_> {
                         quote_identifier(&constraint.conname)
                     ),
                     help: Some(format!("CREATE INDEX ON {table} ({columns})")),
+                    fix: Vec::new(),
                 },
                 help_in_new_migration: Some(format!(
                     "CREATE INDEX CONCURRENTLY ON {table} ({columns}), in a new migration whose \
@@ -848,6 +857,7 @@ impl MigrationLinter<'_> {
                             quote_identifier(&other_name.relname)
                         ),
                         help: None,
+                        fix: Vec::new(),
                     },
                     help_in_new_migration: Some(format!(
                         "DROP INDEX CONCURRENTLY {}, in a new migration whose first line is \

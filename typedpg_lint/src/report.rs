@@ -339,11 +339,16 @@ impl Report {
 
     fn sarif(&self, successful: bool) -> String {
         let mut rules = Vec::new();
-        for rule in Rule::ALL.into_iter().chain([Rule::InvalidAllow]) {
+        for rule in Rule::ALL
+            .into_iter()
+            .chain([Rule::InvalidAllow, Rule::InternalError])
+        {
             rules.push(serde_json::json!({
                 "id": rule.name(),
                 "shortDescription": { "text": rule.description() },
-                "defaultConfiguration": { "level": sarif_level(rule.default_severity()) },
+                "defaultConfiguration": {
+                    "level": rule.default_level().map_or("none", sarif_level)
+                },
             }));
         }
         rules.push(serde_json::json!({
@@ -870,6 +875,7 @@ mod tests {
             span: 0..1,
             message: message.to_owned(),
             help: help.map(str::to_owned),
+            fix: Vec::new(),
         }
     }
 
@@ -1080,7 +1086,10 @@ mod tests {
         assert_eq!(driver["version"], env!("CARGO_PKG_VERSION"));
 
         let rules = driver["rules"].as_array().unwrap();
-        for rule in Rule::ALL.into_iter().chain([Rule::InvalidAllow]) {
+        for rule in Rule::ALL
+            .into_iter()
+            .chain([Rule::InvalidAllow, Rule::InternalError])
+        {
             let rule_json = rules
                 .iter()
                 .find(|candidate| candidate["id"] == rule.name())
@@ -1092,7 +1101,7 @@ mod tests {
             );
             assert_eq!(
                 rule_json["defaultConfiguration"]["level"],
-                sarif_level(rule.default_severity()),
+                rule.default_level().map_or("none", sarif_level),
                 "{rule}"
             );
         }

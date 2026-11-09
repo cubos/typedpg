@@ -107,7 +107,8 @@ impl Literal {
     pub fn source_offset(&self, cooked: usize) -> usize {
         let cooked = cooked.min(self.value.len());
         if self.raw_string {
-            self.content_start + cooked
+            // A raw string decodes nothing but the CRLFs Rust reads as LF.
+            self.content_start + crlf_to_raw(&self.raw, cooked, self.value.len())
         } else {
             self.content_start + cooked_to_raw(&self.raw, cooked)
         }
@@ -405,6 +406,12 @@ pub(crate) fn cooked_to_raw(raw: &str, cooked: usize) -> usize {
             if produced >= cooked {
                 return i;
             }
+            // A physical CRLF reads as one LF (rustc and syn normalize it).
+            if raw[i..].starts_with("\r\n") {
+                i += 2;
+                produced += 1;
+                continue;
+            }
             i += c.len_utf8();
             produced += c.len_utf8();
             continue;
@@ -445,7 +452,9 @@ pub(crate) fn cooked_to_raw(raw: &str, cooked: usize) -> usize {
                     produced += 1;
                     continue;
                 };
-                let codepoint = u32::from_str_radix(&raw[i + 3..end], 16).unwrap_or(0xFFFD);
+                // Rust allows underscores between the digits: `\u{0_061}`.
+                let digits: String = raw[i + 3..end].chars().filter(|&c| c != '_').collect();
+                let codepoint = u32::from_str_radix(&digits, 16).unwrap_or(0xFFFD);
                 let c = char::from_u32(codepoint).unwrap_or('\u{FFFD}');
                 i = end + 1;
                 produced += c.len_utf8();
@@ -461,6 +470,26 @@ pub(crate) fn cooked_to_raw(raw: &str, cooked: usize) -> usize {
         }
     }
     raw.len()
+}
+
+/// The byte in a raw string's `raw` contents of byte `cooked` of its value,
+/// whose length is `value_len`: a CRLF reads as one LF (rustc and syn
+/// normalize it), everything else as written.
+fn crlf_to_raw(raw: &str, cooked: usize, value_len: usize) -> usize {
+    if raw.len() == value_len {
+        return cooked;
+    }
+    let bytes = raw.as_bytes();
+    let (mut i, mut produced) = (0, 0);
+    while i < bytes.len() && produced < cooked {
+        i += if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+        produced += 1;
+    }
+    i
 }
 
 fn skip_whitespace(raw: &str, mut i: usize) -> usize {
@@ -578,6 +607,29 @@ fn main() {
         // The end of the value is the closing quote.
         let end = query.literal.source_offset(query.text.len());
         assert!(source[end..].starts_with('"'));
+    }
+
+    #[test]
+    fn a_physical_crlf_in_a_literal_reads_as_one_lf() {
+        for source in [
+            "fn main() { sql!(pool, \"SELECT\r\n1 AS one LIMIT 1\"); }",
+            "fn main() { sql!(pool, r#\"SELECT\r\n1 AS one LIMIT 1\"#); }",
+        ] {
+            let scanned = scan(source).unwrap();
+            let query = &scanned.queries[0];
+            // syn normalizes the CRLF of a normal literal; a raw one keeps
+            // it. Either way the offsets must land on the same text.
+            assert!(query.text.ends_with("1 AS one LIMIT 1"), "{source:?}");
+            let at = query.text.find(" LIMIT").unwrap();
+            let offset = query.literal.source_offset(at);
+            assert!(source[offset..].starts_with(" LIMIT 1"), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_unicode_escape_with_underscores_is_one_character() {
+        let raw = r"\u{0_061}b";
+        assert_eq!(cooked_to_raw(raw, 1), raw.find('b').unwrap());
     }
 
     #[test]

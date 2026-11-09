@@ -250,12 +250,22 @@ fn build(
         match result {
             Ok(findings) => {
                 for finding in findings {
-                    report.entries.push(Entry {
+                    let entry = Entry {
                         path: path.clone(),
                         start: position(&site.file, site.literal.source_offset(finding.span.start)),
                         end: position(&site.file, site.literal.source_offset(finding.span.end)),
                         finding: finding.clone(),
-                    });
+                    };
+                    report.entries.push(entry.clone());
+                    if let Some(edits) = sql_fix_edits(finding, &site.literal) {
+                        pending.push(PendingFix {
+                            path: site.path.clone(),
+                            shown: path.clone(),
+                            entry,
+                            scanned: site.file.clone(),
+                            edits,
+                        });
+                    }
                 }
             }
             Err((message, offset)) => report.failures.push(Failure {
@@ -329,6 +339,53 @@ fn config_error_report(
         message: error.to_string(),
     });
     report
+}
+
+/// The file edits that apply a query finding's SQL fix, or `None` when the
+/// finding has none or its literal cannot hold the replacement text.
+///
+/// The edits' ranges are in the analyzed SQL text; they are mapped into the
+/// file text through `literal`, which also tells a raw string (no escapes to
+/// decode) from a normal one. A replacement written into a normal literal
+/// escapes `\` and `"`; a raw literal cannot hold a `"` without changing its
+/// terminator, so a fix containing one is not applied there.
+fn sql_fix_edits(
+    finding: &Finding,
+    literal: &scan::Literal,
+) -> Option<Vec<(Range<usize>, String)>> {
+    if finding.fix.is_empty() {
+        return None;
+    }
+    let mut edits = Vec::with_capacity(finding.fix.len());
+    for edit in &finding.fix {
+        let text = if literal.raw_string {
+            if edit.text.contains('"') {
+                return None;
+            }
+            edit.text.clone()
+        } else {
+            escape_in_normal_literal(&edit.text)
+        };
+        edits.push((
+            literal.source_offset(edit.range.start)..literal.source_offset(edit.range.end),
+            text,
+        ));
+    }
+    Some(edits)
+}
+
+/// `text` escaped for a normal Rust string literal: `\` and `"` get a
+/// backslash; newlines stay as written.
+fn escape_in_normal_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// What applying the pending fixes changed, and the failures that kept a
@@ -699,4 +756,79 @@ fn collect_migration_files(
             )
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use typedpg_lint::{Rule, Severity, SqlEdit};
+
+    fn finding(fix: Vec<SqlEdit>) -> Finding {
+        Finding {
+            rule: Rule::RedundantLimit,
+            severity: Severity::Info,
+            span: 0..0,
+            message: "redundant LIMIT".to_owned(),
+            help: None,
+            fix,
+        }
+    }
+
+    /// Apply `edits` to `source`.
+    fn apply(source: &str, edits: &[(Range<usize>, String)]) -> String {
+        let mut edits = edits.to_vec();
+        edits.sort_by_key(|(range, _)| range.start);
+        let mut text = source.to_owned();
+        for (range, replacement) in edits.into_iter().rev() {
+            text.replace_range(range, &replacement);
+        }
+        text
+    }
+
+    #[test]
+    fn a_sql_fix_maps_through_an_escape_before_the_range() {
+        let source = r#"fn main() { sql!(pool, "SELECT 'a\tb', 1 FROM t"); }"#;
+        let scanned = scan::scan(source).unwrap();
+        let query = &scanned.queries[0];
+        let start = query.text.find(", 1").unwrap();
+        let finding = finding(vec![SqlEdit {
+            range: start..start + 3,
+            text: String::new(),
+        }]);
+        let edits = sql_fix_edits(&finding, &query.literal).unwrap();
+        assert_eq!(
+            apply(source, &edits),
+            r#"fn main() { sql!(pool, "SELECT 'a\tb' FROM t"); }"#
+        );
+    }
+
+    #[test]
+    fn a_sql_fix_escapes_a_quote_inserted_into_a_normal_literal() {
+        let source = r#"fn main() { sql!(pool, "SELECT 2"); }"#;
+        let scanned = scan::scan(source).unwrap();
+        let query = &scanned.queries[0];
+        let at = query.text.find('2').unwrap();
+        let finding = finding(vec![SqlEdit {
+            range: at..at,
+            text: "\"x\"".to_owned(),
+        }]);
+        let edits = sql_fix_edits(&finding, &query.literal).unwrap();
+        assert_eq!(
+            apply(source, &edits),
+            r#"fn main() { sql!(pool, "SELECT \"x\"2"); }"#
+        );
+    }
+
+    #[test]
+    fn a_sql_fix_with_a_quote_is_skipped_in_a_raw_literal() {
+        let source = r####"fn main() { sql!(pool, r#"SELECT 2"#); }"####;
+        let scanned = scan::scan(source).unwrap();
+        let query = &scanned.queries[0];
+        let at = query.text.find('2').unwrap();
+        let finding = finding(vec![SqlEdit {
+            range: at..at,
+            text: "\"x\"".to_owned(),
+        }]);
+        assert!(sql_fix_edits(&finding, &query.literal).is_none());
+    }
 }

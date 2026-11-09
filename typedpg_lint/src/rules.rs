@@ -11,6 +11,12 @@ use typedpg_pg_query::protobuf::{
 
 use crate::{Ctx, RawFinding, Rule};
 
+mod like_unescaped_param;
+mod limit_without_order;
+mod redundant_distinct;
+mod redundant_limit;
+mod redundant_null_check;
+
 /// The operators `null_comparison` reports: the ordinary comparisons, not
 /// `IS [NOT] DISTINCT FROM` or the pattern operators.
 const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];
@@ -20,6 +26,11 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::NullComparison => null_comparison(ctx),
         Rule::UnboundedWrite => unbounded_write(ctx),
         Rule::NotInNullable => not_in_nullable(ctx),
+        Rule::RedundantNullCheck => redundant_null_check::findings(ctx),
+        Rule::LimitWithoutOrder => limit_without_order::findings(ctx),
+        Rule::RedundantLimit => redundant_limit::findings(ctx),
+        Rule::RedundantDistinct => redundant_distinct::findings(ctx),
+        Rule::LikeUnescapedParam => like_unescaped_param::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking
@@ -28,11 +39,21 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         | Rule::TableRewrite
         | Rule::FkWithoutIndex
         | Rule::RedundantIndex
-        // The binding rules run over the Rust source of the invocation, in
-        // `typedpg_cli`, which alone sees the bindings.
+        | Rule::FkTypeMismatch
+        | Rule::MissingLockTimeout
+        | Rule::PreferTimestamptz
+        | Rule::PreferIdentity
+        | Rule::PreferText
+        | Rule::PreferBigintPk
+        // The binding and call-site rules run over the Rust source of the
+        // invocation, in `typedpg_cli`, which alone sees it.
         | Rule::RedundantBinding
         | Rule::RenamingBinding
-        | Rule::InvalidAllow => Vec::new(),
+        | Rule::FetchMayReturnMany
+        | Rule::FetchAllSingleRow
+        | Rule::UnusedReturning
+        | Rule::InvalidAllow
+        | Rule::InternalError => Vec::new(),
     }
 }
 
@@ -84,6 +105,7 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
                 span: start..end,
                 message: "comparison with NULL is never true".to_owned(),
                 help: Some("use IS NULL / IS NOT NULL".to_owned()),
+                fix: Vec::new(),
             });
         }
         Some(AExprKind::AexprIn) if operator_name(expr) == Some("<>") => {
@@ -116,6 +138,7 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
                 span: start..end,
                 message: "NOT IN with a NULL in the list is never true".to_owned(),
                 help: Some("remove the NULL from the list".to_owned()),
+                fix: Vec::new(),
             });
         }
         _ => {}
@@ -142,19 +165,20 @@ fn case_when(ctx: &Ctx<'_>, when: &CaseWhen, out: &mut Vec<RawFinding>) {
         span: start..end.max(expr_start + 4),
         message: "CASE ... WHEN NULL never matches".to_owned(),
         help: Some("use CASE WHEN x IS NULL".to_owned()),
+        fix: Vec::new(),
     });
 }
 
 /// The operator's name without its schema: `OPERATOR(pg_catalog.=)` is
 /// `=`.
-fn operator_name(expr: &AExpr) -> Option<&str> {
+pub(super) fn operator_name(expr: &AExpr) -> Option<&str> {
     expr.name.iter().rev().find_map(|node| match &node.node {
         Some(N::String(s)) => Some(s.sval.as_str()),
         _ => None,
     })
 }
 
-fn is_null_literal(node: &Node) -> bool {
+pub(super) fn is_null_literal(node: &Node) -> bool {
     match &node.node {
         Some(N::AConst(value)) => value.isnull,
         Some(N::TypeCast(cast)) => cast.arg.as_deref().is_some_and(is_null_literal),
@@ -164,7 +188,7 @@ fn is_null_literal(node: &Node) -> bool {
 
 /// The start of the token sequence of `node`, descending through casts so
 /// `NULL::int` starts at `NULL` (a `TypeCast`'s own location is its `::`).
-fn operand_start(node: &Node) -> Option<usize> {
+pub(super) fn operand_start(node: &Node) -> Option<usize> {
     match &node.node {
         Some(N::AConst(value)) if value.isnull => location(value.location),
         Some(N::TypeCast(cast)) => cast
@@ -176,19 +200,19 @@ fn operand_start(node: &Node) -> Option<usize> {
     }
 }
 
-fn node_start(node: &Node) -> Option<usize> {
+pub(super) fn node_start(node: &Node) -> Option<usize> {
     let node = node.node.as_ref()?;
     typedpg_pg_query::NodeRef::location(node.to_ref())
         .and_then(|location| usize::try_from(location).ok())
 }
 
-fn location(location: i32) -> Option<usize> {
+pub(super) fn location(location: i32) -> Option<usize> {
     usize::try_from(location).ok()
 }
 
 /// The end of the expression starting at `start`, scanning tokens until a
 /// token that can't be part of it at paren depth zero.
-fn expression_end(ctx: &Ctx<'_>, start: usize) -> usize {
+pub(super) fn expression_end(ctx: &Ctx<'_>, start: usize) -> usize {
     let mut depth = 0usize;
     let mut seen = false;
     let mut end = start;
@@ -210,7 +234,7 @@ fn expression_end(ctx: &Ctx<'_>, start: usize) -> usize {
     end
 }
 
-fn is_terminator(text: &str) -> bool {
+pub(super) fn is_terminator(text: &str) -> bool {
     if matches!(
         text,
         "," | ";"
@@ -350,6 +374,7 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
         help: Some(
             "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL".to_owned(),
         ),
+        fix: Vec::new(),
     });
 }
 
@@ -399,6 +424,7 @@ fn write_finding(
             "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
                 .to_owned(),
         ),
+        fix: Vec::new(),
     });
 }
 
@@ -424,7 +450,7 @@ fn relation_end(ctx: &Ctx<'_>, relation: &RangeVar) -> Option<usize> {
 
 /// The table as the message names it, as SQL writes it: `users`,
 /// `public.users`, `"My Users"`.
-fn table_name(relation: &RangeVar) -> String {
+pub(super) fn table_name(relation: &RangeVar) -> String {
     if relation.schemaname.is_empty() {
         quote_identifier(&relation.relname)
     } else {

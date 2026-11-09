@@ -95,14 +95,48 @@ pub enum Rule {
     RedundantBinding,
     /// A `sql!` binding that only renames a variable (`p = v`).
     RenamingBinding,
+    /// `IS [NOT] NULL` or `COALESCE` on a value that is never NULL.
+    RedundantNullCheck,
+    /// `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`.
+    LimitWithoutOrder,
+    /// A `LIMIT` on a query that returns at most one row.
+    RedundantLimit,
+    /// A `DISTINCT` on rows that are already distinct.
+    RedundantDistinct,
+    /// A `LIKE` pattern built from a parameter whose `%` and `_` are not
+    /// escaped.
+    LikeUnescapedParam,
+    /// A foreign key whose column types differ from the referenced columns.
+    FkTypeMismatch,
+    /// A migration taking a blocking lock without `SET lock_timeout`.
+    MissingLockTimeout,
+    /// A `timestamp without time zone` column.
+    PreferTimestamptz,
+    /// A `serial` column instead of an identity column.
+    PreferIdentity,
+    /// A `varchar(n)` or `char(n)` column instead of `text`.
+    PreferText,
+    /// An `int2` or `int4` primary key.
+    PreferBigintPk,
+    /// `fetch_one` / `fetch_optional` on a query not proven to return at most
+    /// one row.
+    FetchMayReturnMany,
+    /// `fetch_all` on a query that returns at most one row.
+    FetchAllSingleRow,
+    /// `execute()` on a statement whose `RETURNING` rows are discarded.
+    UnusedReturning,
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
+    /// A rule offered a fix that would change the query: a typedpg bug. The
+    /// fix is withheld and this warning asks for a report. Never
+    /// configurable and never suppressible.
+    InternalError,
 }
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 11] = [
+    pub const ALL: [Rule; 25] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -114,6 +148,20 @@ impl Rule {
         Rule::RedundantIndex,
         Rule::RedundantBinding,
         Rule::RenamingBinding,
+        Rule::RedundantNullCheck,
+        Rule::LimitWithoutOrder,
+        Rule::RedundantLimit,
+        Rule::RedundantDistinct,
+        Rule::LikeUnescapedParam,
+        Rule::FkTypeMismatch,
+        Rule::MissingLockTimeout,
+        Rule::PreferTimestamptz,
+        Rule::PreferIdentity,
+        Rule::PreferText,
+        Rule::PreferBigintPk,
+        Rule::FetchMayReturnMany,
+        Rule::FetchAllSingleRow,
+        Rule::UnusedReturning,
     ];
 
     /// The rule's configuration key (`[package.metadata.typedpg.lint]`, and
@@ -131,7 +179,22 @@ impl Rule {
             Rule::RedundantIndex => "redundant_index",
             Rule::RedundantBinding => "redundant_binding",
             Rule::RenamingBinding => "renaming_binding",
+            Rule::RedundantNullCheck => "redundant_null_check",
+            Rule::LimitWithoutOrder => "limit_without_order",
+            Rule::RedundantLimit => "redundant_limit",
+            Rule::RedundantDistinct => "redundant_distinct",
+            Rule::LikeUnescapedParam => "like_unescaped_param",
+            Rule::FkTypeMismatch => "fk_type_mismatch",
+            Rule::MissingLockTimeout => "missing_lock_timeout",
+            Rule::PreferTimestamptz => "prefer_timestamptz",
+            Rule::PreferIdentity => "prefer_identity",
+            Rule::PreferText => "prefer_text",
+            Rule::PreferBigintPk => "prefer_bigint_pk",
+            Rule::FetchMayReturnMany => "fetch_may_return_many",
+            Rule::FetchAllSingleRow => "fetch_all_single_row",
+            Rule::UnusedReturning => "unused_returning",
             Rule::InvalidAllow => "invalid_allow",
+            Rule::InternalError => "internal_error",
         }
     }
 
@@ -159,22 +222,73 @@ impl Rule {
             Rule::RedundantIndex => "an index another index on the table already covers",
             Rule::RedundantBinding => "a `sql!` binding the parameter would capture without it",
             Rule::RenamingBinding => "a `sql!` binding that only renames a variable",
+            Rule::RedundantNullCheck => "IS [NOT] NULL or COALESCE on a value that is never NULL",
+            Rule::LimitWithoutOrder => {
+                "LIMIT, OFFSET or DISTINCT ON without ORDER BY picks arbitrary rows"
+            }
+            Rule::RedundantLimit => "a LIMIT on a query that returns at most one row",
+            Rule::RedundantDistinct => "a DISTINCT on rows that are already distinct",
+            Rule::LikeUnescapedParam => {
+                "a LIKE pattern built from a parameter whose % and _ are not escaped"
+            }
+            Rule::FkTypeMismatch => {
+                "a foreign key whose column types differ from the referenced columns"
+            }
+            Rule::MissingLockTimeout => {
+                "a migration taking a blocking lock on an existing table without SET lock_timeout"
+            }
+            Rule::PreferTimestamptz => "a timestamp without time zone column",
+            Rule::PreferIdentity => "a serial column instead of an identity column",
+            Rule::PreferText => "a varchar(n) or char(n) column instead of text",
+            Rule::PreferBigintPk => "an int2 or int4 primary key",
+            Rule::FetchMayReturnMany => {
+                "fetch_one / fetch_optional on a query not proven to return at most one row"
+            }
+            Rule::FetchAllSingleRow => "fetch_all on a query that returns at most one row",
+            Rule::UnusedReturning => "execute() on a statement whose RETURNING rows are discarded",
             Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
+            Rule::InternalError => "a typedpg bug: a fix that would have changed the query",
         }
     }
 
-    /// The severity the rule reports unless the configuration overrides it.
+    /// The severity the rule reports when enabled, whether or not it is on by
+    /// default.
     pub fn default_severity(self) -> Severity {
+        self.default_level().unwrap_or(Severity::Info)
+    }
+
+    /// The severity the rule reports unless the configuration overrides it,
+    /// or `None` when the rule is off by default.
+    pub fn default_level(self) -> Option<Severity> {
         match self {
-            Rule::NullComparison | Rule::UnboundedWrite | Rule::InvalidAllow => Severity::Error,
+            Rule::NullComparison | Rule::UnboundedWrite | Rule::InvalidAllow => {
+                Some(Severity::Error)
+            }
             Rule::NotInNullable
             | Rule::CreateIndexBlocking
             | Rule::ConstraintValidating
             | Rule::SetNotNullScan
             | Rule::TableRewrite
             | Rule::FkWithoutIndex
-            | Rule::RedundantBinding => Severity::Warning,
-            Rule::RedundantIndex | Rule::RenamingBinding => Severity::Info,
+            | Rule::RedundantBinding
+            | Rule::InternalError
+            | Rule::RedundantNullCheck
+            | Rule::LimitWithoutOrder
+            | Rule::FkTypeMismatch
+            | Rule::MissingLockTimeout
+            | Rule::FetchMayReturnMany => Some(Severity::Warning),
+            Rule::RedundantIndex
+            | Rule::RenamingBinding
+            | Rule::RedundantLimit
+            | Rule::RedundantDistinct
+            | Rule::FetchAllSingleRow
+            | Rule::UnusedReturning => Some(Severity::Info),
+            // Off by default: enabled with a level, they report at info.
+            Rule::LikeUnescapedParam
+            | Rule::PreferTimestamptz
+            | Rule::PreferIdentity
+            | Rule::PreferText
+            | Rule::PreferBigintPk => None,
         }
     }
 }
@@ -183,6 +297,16 @@ impl std::fmt::Display for Rule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// An edit to the SQL text, as a fix for a finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlEdit {
+    /// The byte range to replace: in the analyzed SQL text for an internal
+    /// finding, and in the original query text for a [`Finding`].
+    pub range: Range<usize>,
+    /// The replacement text.
+    pub text: String,
 }
 
 /// A lint finding, placed in the original query text.
@@ -196,6 +320,10 @@ pub struct Finding {
     pub span: Range<usize>,
     pub message: String,
     pub help: Option<String>,
+    /// The edits that fix the finding, in the query text as the user wrote
+    /// it; empty when the finding has no fix. All edits of one finding are
+    /// applied together or not at all, and must not overlap.
+    pub fix: Vec<SqlEdit>,
 }
 
 impl Finding {
@@ -218,7 +346,7 @@ impl Default for LintOptions {
         Self {
             levels: Rule::ALL
                 .into_iter()
-                .map(|rule| (rule, Some(rule.default_severity())))
+                .map(|rule| (rule, rule.default_level()))
                 .collect(),
             fail_on: Severity::Error,
         }
@@ -228,7 +356,7 @@ impl Default for LintOptions {
 impl LintOptions {
     /// The options `[package.metadata.typedpg.lint]` (or the TypeScript
     /// config's `lint` object) configures: rules without an override keep
-    /// their [`Rule::default_severity`], and `fail_on` defaults to error.
+    /// their [`Rule::default_level`], and `fail_on` defaults to error.
     pub fn from_config(config: &LintConfig) -> Self {
         let mut options = LintOptions {
             fail_on: severity(config.fail_on),
@@ -266,6 +394,8 @@ pub(crate) struct RawFinding {
     pub span: Range<usize>,
     pub message: String,
     pub help: Option<String>,
+    /// The fixes, with ranges in the analyzed text.
+    pub fix: Vec<SqlEdit>,
 }
 
 /// A non-comment token of the analyzed text.
@@ -338,17 +468,135 @@ pub fn lint_query(
                 span: raw.span,
                 message: raw.message,
                 help: raw.help,
+                fix: raw.fix,
             });
         }
     }
     for finding in &mut findings {
         finding.span = view.original_span(finding.span.clone());
+        for edit in &mut finding.fix {
+            edit.range = view.original_span(edit.range.clone());
+        }
     }
+    let mut bugs = Vec::new();
+    for finding in &mut findings {
+        if finding.fix.is_empty() {
+            continue;
+        }
+        // `unused_returning` drops the RETURNING its call site discards: its
+        // fix is the one meant to leave no output column.
+        let columns = if finding.rule == Rule::UnusedReturning {
+            ExpectedColumns::None
+        } else {
+            ExpectedColumns::Same
+        };
+        if let Err(change) = fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix, columns) {
+            finding.fix.clear();
+            let message = format!(
+                "typedpg bug: the {} fix would have changed {change}, so it was not offered",
+                finding.rule
+            );
+            // A rule's own tests must never get here.
+            if cfg!(test) {
+                panic!("{message}: {sql}");
+            }
+            bugs.push(Finding {
+                rule: Rule::InternalError,
+                severity: Severity::Warning,
+                span: finding.span.clone(),
+                message,
+                help: Some(
+                    "please report it at https://github.com/cubos/typedpg/issues with this query"
+                        .to_owned(),
+                ),
+                fix: Vec::new(),
+            });
+        }
+    }
+    findings.extend(bugs);
     // A deterministic order within a query: by position, then rule.
     findings.sort_by(|a, b| {
         (a.span.start, a.span.end, a.rule).cmp(&(b.span.start, b.span.end, b.rule))
     });
     Ok(findings)
+}
+
+/// Whether `sql` with `fix` applied still analyzes to the same query shape
+/// as `original`: the same output columns (name, type, nullability), the
+/// same parameters (name, type, nullability) and the same embeddability.
+/// The error says what would have changed.
+///
+/// A safety net under every rule's own proof that its fix keeps the query's
+/// meaning: no rule should ever propose a fix that fails it, so a failure is
+/// a typedpg bug. It can't see a change in the rows themselves; that stays
+/// each rule's proof to make.
+fn fix_keeps_shape(
+    catalog: &PgCatalog,
+    sql: &str,
+    original: &typedpg_analyzer::AnalyzedQuery,
+    fix: &[SqlEdit],
+    columns: ExpectedColumns,
+) -> Result<(), &'static str> {
+    let edited = apply_edits(sql, fix).ok_or("the query text (overlapping edits)")?;
+    let analyzed = catalog
+        .analyze(&edited)
+        .map_err(|_| "the query into one that doesn't analyze")?;
+    let same_columns = match columns {
+        ExpectedColumns::None => analyzed.columns.is_empty(),
+        ExpectedColumns::Same => {
+            analyzed.columns.len() == original.columns.len()
+                && analyzed
+                    .columns
+                    .iter()
+                    .zip(&original.columns)
+                    .all(|(a, b)| {
+                        a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable
+                    })
+        }
+    };
+    if !same_columns {
+        return Err("its output columns");
+    }
+    let same_params =
+        analyzed.params.len() == original.params.len()
+            && analyzed.params.iter().zip(&original.params).all(|(a, b)| {
+                a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable
+            });
+    if !same_params {
+        return Err("its parameters");
+    }
+    if analyzed.can_run_as_subquery != original.can_run_as_subquery {
+        return Err("whether it can run as a subquery");
+    }
+    Ok(())
+}
+
+/// The output columns a fixed query must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedColumns {
+    /// The original query's, unchanged.
+    Same,
+    /// None: the fix removes a RETURNING whose rows the caller discards.
+    None,
+}
+
+/// `text` with `edits` applied, or `None` when they overlap or fall outside
+/// it.
+fn apply_edits(text: &str, edits: &[SqlEdit]) -> Option<String> {
+    let mut edits: Vec<&SqlEdit> = edits.iter().collect();
+    edits.sort_by_key(|edit| edit.range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for edit in edits {
+        if edit.range.start < at || edit.range.end < edit.range.start {
+            return None;
+        }
+        out.push_str(text.get(at..edit.range.start)?);
+        out.push_str(&edit.text);
+        at = edit.range.end;
+    }
+    out.push_str(text.get(at..)?);
+    Some(out)
 }
 
 /// Whether any finding is at or above the configured `fail_on` severity.
@@ -405,6 +653,7 @@ fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
                               `typedpg-lint: allow(rule, ...)` and nothing after it"
                         .to_owned(),
                     help: None,
+                    fix: Vec::new(),
                 });
                 continue;
             }
@@ -429,6 +678,7 @@ fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
                              expected one of {valid}"
                         ),
                         help: None,
+                        fix: Vec::new(),
                     });
                 }
             }
@@ -531,6 +781,115 @@ mod tests {
         lint_query(catalog, sql, &LintOptions::default()).unwrap()
     }
 
+    /// Whether deleting `remove` (each a substring of `sql`, found from the
+    /// left) keeps the query's shape.
+    fn keeps_shape(catalog: &PgCatalog, sql: &str, remove: &[&str]) -> bool {
+        let original = catalog.analyze(sql).unwrap();
+        let fix: Vec<SqlEdit> = remove
+            .iter()
+            .map(|part| {
+                let start = sql.find(part).unwrap();
+                SqlEdit {
+                    range: start..start + part.len(),
+                    text: String::new(),
+                }
+            })
+            .collect();
+        fix_keeps_shape(catalog, sql, &original, &fix, ExpectedColumns::Same).is_ok()
+    }
+
+    #[test]
+    fn a_fix_keeping_the_shape_is_kept() {
+        let db = catalog();
+        assert!(keeps_shape(
+            &db,
+            "SELECT DISTINCT id FROM users WHERE id = $id",
+            &["DISTINCT "]
+        ));
+        assert!(keeps_shape(
+            &db,
+            "SELECT id FROM users WHERE id = $id LIMIT 1",
+            &[" LIMIT 1"]
+        ));
+    }
+
+    #[test]
+    fn a_fix_changing_the_shape_is_dropped() {
+        let db = catalog();
+        // The implicit column name `coalesce` would become `id`.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT COALESCE(id, 0) FROM users",
+            &["COALESCE(", ", 0)"]
+        ));
+        // The bigint result would become integer.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT COALESCE(id, 0::int8) AS v FROM users",
+            &["COALESCE(", ", 0::int8)"]
+        ));
+        // Nullability: name may be NULL, the COALESCE never is.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT COALESCE(name, '') AS v FROM users",
+            &["COALESCE(", ", '')"]
+        ));
+        // A parameter's type.
+        assert!(!keeps_shape(
+            &db,
+            "SELECT id FROM users WHERE id = $id::int8",
+            &["::int8"]
+        ));
+        // A broken query.
+        assert!(!keeps_shape(&db, "SELECT id FROM users", &["FROM "]));
+        // Overlapping edits.
+        let original = db.analyze("SELECT id FROM users").unwrap();
+        let overlapping = [
+            SqlEdit {
+                range: 0..8,
+                text: String::new(),
+            },
+            SqlEdit {
+                range: 4..10,
+                text: String::new(),
+            },
+        ];
+        assert!(
+            fix_keeps_shape(
+                &db,
+                "SELECT id FROM users",
+                &original,
+                &overlapping,
+                ExpectedColumns::Same
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_fix_dropping_returning_must_leave_no_column() {
+        let db = catalog();
+        let sql = "DELETE FROM users WHERE id = $id RETURNING id";
+        let original = db.analyze(sql).unwrap();
+        let start = sql.find(" RETURNING").unwrap();
+        let drop_returning = [SqlEdit {
+            range: start..sql.len(),
+            text: String::new(),
+        }];
+        assert!(
+            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::None).is_ok()
+        );
+        assert!(
+            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::Same).is_err()
+        );
+        // Keeping a column is not what such a fix may do.
+        let keep = [SqlEdit {
+            range: start..start,
+            text: String::new(),
+        }];
+        assert!(fix_keeps_shape(&db, sql, &original, &keep, ExpectedColumns::None).is_err());
+    }
+
     fn options(level: Option<Severity>, fail_on: Option<Severity>) -> LintOptions {
         let mut config = LintConfig::default();
         config.levels.insert(
@@ -552,11 +911,35 @@ mod tests {
         LintOptions::from_config(&config)
     }
 
+    /// The config lists name every rule, each in `Rule::ALL`'s order: the
+    /// query, migration and schema rules in [`LINT_RULES`], the Rust-only
+    /// ones in [`RUST_LINT_RULES`]. The two lists are not concatenated in
+    /// `Rule::ALL`'s order (the two original Rust rules come before the new
+    /// rules), so each list is checked as a subsequence.
+    fn assert_rule_lists_match() {
+        let names: Vec<&str> = Rule::ALL.iter().map(|rule| rule.name()).collect();
+        let lint: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| LINT_RULES.contains(name))
+            .collect();
+        assert_eq!(lint, LINT_RULES);
+        let rust: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| RUST_LINT_RULES.contains(name))
+            .collect();
+        assert_eq!(rust, RUST_LINT_RULES);
+        assert_eq!(
+            lint.len() + rust.len(),
+            names.len(),
+            "a rule is in neither config list"
+        );
+    }
+
     #[test]
     fn config_rule_names_match_the_lint_crate() {
-        let names: Vec<&str> = Rule::ALL.iter().map(|rule| rule.name()).collect();
-        let expected: Vec<&str> = LINT_RULES.iter().chain(RUST_LINT_RULES).copied().collect();
-        assert_eq!(names, expected);
+        assert_rule_lists_match();
     }
 
     // ── null_comparison: positive shapes ───────────────────────────────────
@@ -916,6 +1299,7 @@ mod tests {
             span: 0..1,
             message: "comparison with NULL is never true".to_owned(),
             help: Some("use IS NULL / IS NOT NULL".to_owned()),
+            fix: Vec::new(),
         };
         assert_eq!(
             render(Path::new("src/users.ts"), 12, 30, &finding),
@@ -967,6 +1351,32 @@ mod tests {
         assert_eq!(Rule::InvalidAllow.name(), "invalid_allow");
         assert_eq!(Rule::InvalidAllow.default_severity(), Severity::Error);
     }
+
+    #[test]
+    fn off_rules_default_off_and_enable_with_a_level() {
+        let options = LintOptions::default();
+        for rule in [
+            Rule::LikeUnescapedParam,
+            Rule::PreferTimestamptz,
+            Rule::PreferIdentity,
+            Rule::PreferText,
+            Rule::PreferBigintPk,
+        ] {
+            assert_eq!(rule.default_level(), None, "{rule}");
+            assert_eq!(rule.default_severity(), Severity::Info, "{rule}");
+            assert_eq!(options.level(rule), None, "{rule}");
+        }
+        let mut config = LintConfig::default();
+        config
+            .levels
+            .insert("like_unescaped_param".to_owned(), LintLevel::Warning);
+        let options = LintOptions::from_config(&config);
+        assert_eq!(
+            options.level(Rule::LikeUnescapedParam),
+            Some(Severity::Warning)
+        );
+    }
+
     // ── not_in_nullable ────────────────────────────────────────────────────
 
     fn not_in_findings(db: &PgCatalog, sql: &str) -> Vec<Finding> {
@@ -1771,9 +2181,7 @@ mod tests {
 
     #[test]
     fn migration_rule_names_and_defaults() {
-        let names: Vec<&str> = Rule::ALL.iter().map(|rule| rule.name()).collect();
-        let expected: Vec<&str> = LINT_RULES.iter().chain(RUST_LINT_RULES).copied().collect();
-        assert_eq!(names, expected);
+        assert_rule_lists_match();
         for (rule, severity) in [
             (Rule::NotInNullable, Severity::Warning),
             (Rule::CreateIndexBlocking, Severity::Warning),

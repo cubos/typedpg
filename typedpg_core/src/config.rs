@@ -36,15 +36,21 @@
 //! ignore = ["tests/**"]          # paths whose statement findings are not reported
 //! ```
 //!
-//! The query rules are `null_comparison`, `unbounded_write` and
-//! `not_in_nullable`; the migration rules `create_index_blocking`,
-//! `constraint_validating`, `set_not_null_scan` and `table_rewrite`; and the
-//! schema rules `fk_without_index` and `redundant_index`, evaluated over the
-//! migrations' final schema. [`LINT_RULES`] is the one list of their keys.
-//! The `sql!` binding rules `redundant_binding` and `renaming_binding`
+//! The query rules are `null_comparison`, `unbounded_write`,
+//! `not_in_nullable`, `redundant_null_check`, `limit_without_order`,
+//! `redundant_limit`, `redundant_distinct` and `like_unescaped_param`; the
+//! migration rules `create_index_blocking`, `constraint_validating`,
+//! `set_not_null_scan`, `table_rewrite` and `missing_lock_timeout`; and the
+//! schema rules `fk_without_index`, `redundant_index`, `fk_type_mismatch`,
+//! `prefer_timestamptz`, `prefer_identity`, `prefer_text` and
+//! `prefer_bigint_pk`, evaluated over the migrations' final schema.
+//! `like_unescaped_param` and the `prefer_*` rules are off by default; set
+//! them to a level to enable them. [`LINT_RULES`] is the one list of their
+//! keys. The `sql!` rules `redundant_binding`, `renaming_binding`,
+//! `fetch_may_return_many`, `fetch_all_single_row` and `unused_returning`
 //! ([`RUST_LINT_RULES`]) run over the Rust source of the invocations, so only
 //! `cargo typedpg lint` reports them, and only this configuration accepts
-//! their keys — the TypeScript CLI has no bindings.
+//! their keys — the TypeScript CLI has no bindings or Rust call site.
 //! `ignore` lists glob patterns, relative to the manifest's directory. A
 //! matching query file's findings are not reported; a matching migration
 //! file keeps its schema findings (`fk_without_index`, `redundant_index`),
@@ -163,8 +169,9 @@ impl SimplifySetting {
 
 /// The lint rules' configuration keys, one per rule: the
 /// `[package.metadata.typedpg.lint]` keys (and the TypeScript CLI's `lint`
-/// object's, in camelCase). Query rules first, then migration rules, then the
-/// schema rules evaluated over the migrations' final schema.
+/// object's, in camelCase). The query, migration and schema rules, in
+/// `typedpg_lint::Rule::ALL`'s order; the Rust-only rules are in
+/// [`RUST_LINT_RULES`].
 pub const LINT_RULES: &[&str] = &[
     "null_comparison",
     "unbounded_write",
@@ -175,15 +182,33 @@ pub const LINT_RULES: &[&str] = &[
     "table_rewrite",
     "fk_without_index",
     "redundant_index",
+    "redundant_null_check",
+    "limit_without_order",
+    "redundant_limit",
+    "redundant_distinct",
+    "like_unescaped_param",
+    "fk_type_mismatch",
+    "missing_lock_timeout",
+    "prefer_timestamptz",
+    "prefer_identity",
+    "prefer_text",
+    "prefer_bigint_pk",
 ];
 
-/// The lint rules over the Rust source of `sql!` invocations: a binding the
-/// parameter would capture without, and one that only renames a variable.
+/// The lint rules over the Rust source of `sql!` invocations: the binding
+/// rules, and the call-site rules about the fetch method and discarded
+/// `RETURNING` rows.
 ///
-/// `cargo typedpg lint` reports them; the TypeScript CLI has no bindings and
-/// keeps rejecting them, so they are accepted only in
+/// `cargo typedpg lint` reports them; the TypeScript CLI has no bindings or
+/// Rust call site and keeps rejecting them, so they are accepted only in
 /// `[package.metadata.typedpg.lint]`.
-pub const RUST_LINT_RULES: &[&str] = &["redundant_binding", "renaming_binding"];
+pub const RUST_LINT_RULES: &[&str] = &[
+    "redundant_binding",
+    "renaming_binding",
+    "fetch_may_return_many",
+    "fetch_all_single_row",
+    "unused_returning",
+];
 
 /// The types whose default Rust types can't hold `infinity` / `-infinity`
 /// (chrono's `NaiveDate`, `NaiveDateTime` and `DateTime<Utc>`, which
@@ -1607,8 +1632,12 @@ event_data = "crate::EventData"
             "unknown key `null_comparisions` in [package.metadata.typedpg.lint]: expected one \
              of `fail_on`, `ignore`, `null_comparison`, `unbounded_write`, `not_in_nullable`, \
              `create_index_blocking`, `constraint_validating`, `set_not_null_scan`, \
-             `table_rewrite`, `fk_without_index`, `redundant_index`, `redundant_binding`, \
-             `renaming_binding`"
+             `table_rewrite`, `fk_without_index`, `redundant_index`, `redundant_null_check`, \
+             `limit_without_order`, `redundant_limit`, `redundant_distinct`, \
+             `like_unescaped_param`, `fk_type_mismatch`, `missing_lock_timeout`, \
+             `prefer_timestamptz`, `prefer_identity`, `prefer_text`, `prefer_bigint_pk`, \
+             `redundant_binding`, `renaming_binding`, `fetch_may_return_many`, \
+             `fetch_all_single_row`, `unused_returning`"
         );
     }
 

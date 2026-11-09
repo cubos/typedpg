@@ -565,6 +565,17 @@ npx typedpg build          # compile the .sql files into the loaders' cache
 | `table_rewrite` | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
 | `fk_without_index` | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
 | `redundant_index` | info | An index another index on the table already covers. |
+| `redundant_null_check` | warning | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
+| `limit_without_order` | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
+| `redundant_limit` | info | A `LIMIT` on a query that returns at most one row. |
+| `redundant_distinct` | info | A `DISTINCT` on rows that are already distinct. |
+| `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
+| `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
+| `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| `prefer_timestamptz` | off | A `timestamp without time zone` column. |
+| `prefer_identity` | off | A `serial` column instead of an identity column. |
+| `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
+| `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
 
 The `lint` object sets each rule's level — `"error"`, `"warning"`, `"info"`
 or `"off"` — and `failOn`, the severity the run fails on (default `"error"`).
@@ -920,7 +931,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 | `simplify` | The query simplifications, on by default: `false` turns them all off, or an object sets one rule to `false` — `notIn`, `countExists`, `distinct`, `unionAll`, `fkJoin`. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent: `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS` when neither side can be NULL, `count(…) > 0` as `EXISTS`, a `DISTINCT` that can't remove a row, a `UNION` whose branches can't share a row as `UNION ALL`, or a join a foreign key proves matches exactly one row none of whose columns are read. The generated module's doc comments show the SQL sent. For every database. |
-| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
+| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `likeUnescapedParam`, `fkTypeMismatch`, `missingLockTimeout`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
 
 Unknown keys are errors.
 

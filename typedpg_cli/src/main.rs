@@ -47,9 +47,9 @@ enum Commands {
         /// statements that created their objects.
         #[arg(long)]
         ignore_migrations_from: Option<String>,
-        /// Apply the fixes of the findings that have one
-        /// (`redundant_binding`, `renaming_binding`), then report what
-        /// remains.
+        /// Apply the fixes of the findings that have one (the binding
+        /// rules, and the SQL edits some query rules offer), then report
+        /// what remains.
         #[arg(long)]
         fix: bool,
     },

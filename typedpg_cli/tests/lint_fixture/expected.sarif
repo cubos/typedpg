@@ -109,12 +109,147 @@
               }
             },
             {
+              "id": "redundant_null_check",
+              "shortDescription": {
+                "text": "IS [NOT] NULL or COALESCE on a value that is never NULL"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "limit_without_order",
+              "shortDescription": {
+                "text": "LIMIT, OFFSET or DISTINCT ON without ORDER BY picks arbitrary rows"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "redundant_limit",
+              "shortDescription": {
+                "text": "a LIMIT on a query that returns at most one row"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "redundant_distinct",
+              "shortDescription": {
+                "text": "a DISTINCT on rows that are already distinct"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "like_unescaped_param",
+              "shortDescription": {
+                "text": "a LIKE pattern built from a parameter whose % and _ are not escaped"
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              }
+            },
+            {
+              "id": "fk_type_mismatch",
+              "shortDescription": {
+                "text": "a foreign key whose column types differ from the referenced columns"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "missing_lock_timeout",
+              "shortDescription": {
+                "text": "a migration taking a blocking lock on an existing table without SET lock_timeout"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "prefer_timestamptz",
+              "shortDescription": {
+                "text": "a timestamp without time zone column"
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              }
+            },
+            {
+              "id": "prefer_identity",
+              "shortDescription": {
+                "text": "a serial column instead of an identity column"
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              }
+            },
+            {
+              "id": "prefer_text",
+              "shortDescription": {
+                "text": "a varchar(n) or char(n) column instead of text"
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              }
+            },
+            {
+              "id": "prefer_bigint_pk",
+              "shortDescription": {
+                "text": "an int2 or int4 primary key"
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              }
+            },
+            {
+              "id": "fetch_may_return_many",
+              "shortDescription": {
+                "text": "fetch_one / fetch_optional on a query not proven to return at most one row"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "fetch_all_single_row",
+              "shortDescription": {
+                "text": "fetch_all on a query that returns at most one row"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "unused_returning",
+              "shortDescription": {
+                "text": "execute() on a statement whose RETURNING rows are discarded"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
               "id": "invalid_allow",
               "shortDescription": {
                 "text": "a malformed or unknown rule name in a typedpg-lint comment"
               },
               "defaultConfiguration": {
                 "level": "error"
+              }
+            },
+            {
+              "id": "internal_error",
+              "shortDescription": {
+                "text": "a typedpg bug: a fix that would have changed the query"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
               }
             },
             {

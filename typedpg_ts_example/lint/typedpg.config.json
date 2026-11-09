@@ -3,5 +3,14 @@
   "out": "src/db.ts",
   "sql": { "include": ["src/*.sql"] },
   "migrations": "migrations",
-  "lint": { "failOn": "warning", "unboundedWrite": "warning" }
+  "lint": {
+    "failOn": "warning",
+    "unboundedWrite": "warning",
+    "redundantNullCheck": "off",
+    "limitWithoutOrder": "off",
+    "redundantLimit": "off",
+    "redundantDistinct": "off",
+    "fkTypeMismatch": "off",
+    "missingLockTimeout": "off"
+  }
 }

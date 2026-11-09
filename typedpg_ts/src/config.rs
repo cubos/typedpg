@@ -19,17 +19,21 @@
 //! severity the run fails on (`"error"`, the default, `"warning"` or
 //! `"info"`), and each rule is set to a level: `"error"`, `"warning"`,
 //! `"info"` or `"off"`. The query rules are `nullComparison`,
-//! `unboundedWrite` and `notInNullable`; the migration rules
-//! `createIndexBlocking`, `constraintValidating`, `setNotNullScan` and
-//! `tableRewrite`; the schema rules `fkWithoutIndex` and `redundantIndex`.
-//! Rules without an override keep their default severity. `ignore` lists
-//! glob patterns, relative to the config's directory. A matching query
-//! file's findings are not reported; a matching migration file keeps its
-//! schema findings (`fkWithoutIndex`, `redundantIndex`), placed on the
-//! statements that created the objects, but skips the statement rules. A
-//! query that does not compile still fails. A
-//! `-- typedpg-lint: allow(rule)` comment suppresses a rule in the query or
-//! migration statement it is in.
+//! `unboundedWrite`, `notInNullable`, `redundantNullCheck`,
+//! `limitWithoutOrder`, `redundantLimit`, `redundantDistinct` and
+//! `likeUnescapedParam`; the migration rules `createIndexBlocking`,
+//! `constraintValidating`, `setNotNullScan`, `tableRewrite` and
+//! `missingLockTimeout`; the schema rules `fkWithoutIndex`, `redundantIndex`,
+//! `fkTypeMismatch`, `preferTimestamptz`, `preferIdentity`, `preferText` and
+//! `preferBigintPk`. `likeUnescapedParam` and the `prefer*` rules are off by
+//! default; set them to a level to enable them. Rules without an override
+//! keep their default severity. `ignore` lists glob patterns, relative to
+//! the config's directory. A matching query file's findings are not
+//! reported; a matching migration file keeps its schema findings, placed on
+//! the statements that created the objects, but skips the statement rules.
+//! A query that does not compile still fails. A `-- typedpg-lint:
+//! allow(rule)` comment suppresses a rule in the query or migration
+//! statement it is in.
 //!
 //! `migrations` is the directory, or an object with it and the runner's
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",
@@ -812,6 +816,41 @@ mod tests {
         );
         let err = parse(r#", "lint": { "failOn": "off" }"#).unwrap_err();
         assert!(err.contains("invalid `lint.failOn` value `off`"), "{err}");
+    }
+
+    #[test]
+    fn lint_accepts_the_new_rules_but_not_the_rust_only_ones() {
+        let parse = |extra: &str| {
+            Config::parse(&format!(r#"{{ "out": "db.ts"{extra} }}"#), Path::new("/p"))
+                .map(|c| c.lint.clone())
+        };
+        let lint = parse(
+            r#", "lint": { "redundantNullCheck": "warning", "limitWithoutOrder": "off",
+                           "redundantLimit": "info", "redundantDistinct": "info",
+                           "likeUnescapedParam": "off", "fkTypeMismatch": "warning",
+                           "missingLockTimeout": "warning", "preferTimestamptz": "off",
+                           "preferIdentity": "off", "preferText": "off",
+                           "preferBigintPk": "info" }"#,
+        )
+        .unwrap();
+        assert_eq!(lint.levels["redundant_null_check"], LintLevel::Warning);
+        assert_eq!(lint.levels["like_unescaped_param"], LintLevel::Off);
+        assert_eq!(lint.levels["prefer_bigint_pk"], LintLevel::Info);
+        assert_eq!(lint.levels["missing_lock_timeout"], LintLevel::Warning);
+        // The Rust-only rules are not TS rules.
+        for key in [
+            "redundantBinding",
+            "renamingBinding",
+            "fetchMayReturnMany",
+            "fetchAllSingleRow",
+            "unusedReturning",
+        ] {
+            let err = parse(&format!(r#", "lint": {{ "{key}": "off" }}"#)).unwrap_err();
+            assert!(
+                err.contains(&format!("unknown rule `{key}` in `lint`")),
+                "{err}"
+            );
+        }
     }
 
     #[test]
