@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -56,6 +57,10 @@ enum Command {
         /// statements that created their objects.
         #[arg(long)]
         ignore_migrations_from: Option<String>,
+        /// Apply the findings' SQL fixes to the sources and `.sql` files,
+        /// then lint again.
+        #[arg(long)]
+        fix: bool,
     },
     /// Compile every .sql file into the cache the loaders and bundler
     /// plugins read, so that importing one runs no analysis.
@@ -102,7 +107,8 @@ fn main() -> ExitCode {
             config,
             format,
             ignore_migrations_from,
-        } => lint(&config, format, ignore_migrations_from.as_deref()),
+            fix,
+        } => lint(&config, format, ignore_migrations_from.as_deref(), fix),
         Command::Build { config, json } => build(&config, json),
         Command::Serve { idle_timeout } => typedpg_ts::serve::run(idle_timeout).map(|()| true),
         Command::Migrate {
@@ -170,12 +176,48 @@ fn relative(path: &Path, root: &Path) -> String {
 /// With `ignore_migrations_from`, migration files identical to that git ref
 /// have their statement rules skipped; the schema rules still report on the
 /// statements that created the schema's objects.
+///
+/// With `fix`, the findings that have edits are applied to their files, and
+/// the report is built again from the fixed text so its positions match.
 fn lint(
     config: &Path,
     format: Format,
     ignore_migrations_from: Option<&str>,
+    fix: bool,
 ) -> Result<bool, String> {
     let start = Instant::now();
+    let (report, options, pending, root) = build_lint(config, ignore_migrations_from, start)?;
+    if !fix || pending.is_empty() {
+        return Ok(finish(&report, &options, format));
+    }
+    let outcome = apply_fixes(&pending);
+    eprintln!(
+        "fixed {} {} in {} {}",
+        outcome.fixed,
+        if outcome.fixed == 1 {
+            "finding"
+        } else {
+            "findings"
+        },
+        outcome.files,
+        if outcome.files == 1 { "file" } else { "files" }
+    );
+    // The findings' positions were in the text before the fixes; build the
+    // report from the files as they are now.
+    let (mut report, options, _, _) = build_lint(config, ignore_migrations_from, start)?;
+    report.failures.extend(outcome.failures);
+    report.load_failure_sources(&root);
+    report.sort();
+    Ok(finish(&report, &options, format))
+}
+
+/// Lint the project, returning the report, the options it was built with,
+/// the fixes its findings could apply, and the project root.
+fn build_lint(
+    config: &Path,
+    ignore_migrations_from: Option<&str>,
+    start: Instant,
+) -> Result<(Report, LintOptions, Vec<PendingFix>, PathBuf), String> {
     let config = Config::load(config)?;
     let options = LintOptions::from_config(&config.lint);
     let ignore = IgnoreSet::new(&config.lint.ignore)?;
@@ -263,6 +305,7 @@ fn lint(
     }
     let queries = project.lint_queries();
     report.queries = queries.len() + project.lint_copy_in_count();
+    let mut pending = Vec::new();
     for query in queries {
         report
             .sources
@@ -280,12 +323,22 @@ fn lint(
             });
         if let Ok(findings) = result {
             for finding in findings {
-                report.entries.push(Entry {
+                let entry = Entry {
                     path: relative(query.file, &root),
                     start: position(query.lines.text(), query.source.offset(finding.span.start)),
                     end: position(query.lines.text(), query.source.offset(finding.span.end)),
                     finding: finding.clone(),
-                });
+                };
+                report.entries.push(entry.clone());
+                if let Some(edits) = query.source.fix_edits(&finding.fix) {
+                    pending.push(PendingFix {
+                        path: query.file.to_path_buf(),
+                        shown: entry.path.clone(),
+                        entry,
+                        scanned: query.lines.text().to_owned(),
+                        edits,
+                    });
+                }
             }
         }
         // An analysis error was already reported by `sync` above.
@@ -305,15 +358,127 @@ fn lint(
     report
         .entries
         .retain(|entry| !ignore.is_ignored(&entry.path) || migration_paths.contains(&entry.path));
+    // A fix whose finding was dropped is not applied either.
+    pending.retain(|fix| report.entries.contains(&fix.entry));
     report.load_failure_sources(&root);
     report.sort();
     report.elapsed = start.elapsed();
-    let rendered = report.render_with(format, &options, stdout_colors());
+    Ok((report, options, pending, root))
+}
+
+fn finish(report: &Report, options: &LintOptions, format: Format) -> bool {
+    let rendered = report.render_with(format, options, stdout_colors());
     if !rendered.is_empty() {
         println!("{rendered}");
     }
-    eprintln!("{}", report.summary_with(&options, stderr_colors()));
-    Ok(!report.fails(&options))
+    eprintln!("{}", report.summary_with(options, stderr_colors()));
+    !report.fails(options)
+}
+
+/// A finding's fix, pending the `lint.ignore` retain and `--fix`.
+struct PendingFix {
+    /// The file the edits apply to, as read while linting.
+    path: PathBuf,
+    /// The path the report shows.
+    shown: String,
+    /// The entry the fix belongs to: dropped when the retain drops it.
+    entry: Entry,
+    /// The file's text when it was linted: the edits' offsets are in it.
+    scanned: String,
+    /// File byte ranges and their replacements.
+    edits: Vec<(Range<usize>, String)>,
+}
+
+/// What applying the pending fixes changed, and the failures that kept a
+/// file from being fixed.
+struct FixOutcome {
+    /// How many findings' edits a written file received.
+    fixed: usize,
+    /// How many files were written.
+    files: usize,
+    /// Files that could not be fixed: changed while linting, or unreadable.
+    failures: Vec<Failure>,
+}
+
+/// Apply the pending fixes file by file.
+///
+/// A finding's edits are all applied or none: one overlapping an edit
+/// accepted before it is skipped. The edits are applied to the text that was
+/// scanned — never to a text read again — and a file that changed in between
+/// is left untouched rather than risk corrupting it.
+fn apply_fixes(pending: &[PendingFix]) -> FixOutcome {
+    let mut outcome = FixOutcome {
+        fixed: 0,
+        files: 0,
+        failures: Vec::new(),
+    };
+    let mut groups: Vec<(&Path, Vec<&PendingFix>)> = Vec::new();
+    for fix in pending {
+        match groups
+            .iter_mut()
+            .find(|(path, _)| *path == fix.path.as_path())
+        {
+            Some((_, fixes)) => fixes.push(fix),
+            None => groups.push((fix.path.as_path(), vec![fix])),
+        }
+    }
+    for (path, mut fixes) in groups {
+        let scanned = fixes[0].scanned.clone();
+        let shown = fixes[0].shown.clone();
+        fixes.sort_by_key(|fix| fix.edits.iter().map(|(range, _)| range.start).min());
+        let mut accepted: Vec<&PendingFix> = Vec::new();
+        let mut accepted_ranges: Vec<Range<usize>> = Vec::new();
+        for fix in fixes {
+            let overlaps = fix.edits.iter().any(|(edit, _)| {
+                accepted_ranges
+                    .iter()
+                    .any(|range| edit.start < range.end && range.start < edit.end)
+            });
+            if !overlaps {
+                accepted_ranges.extend(fix.edits.iter().map(|(range, _)| range.clone()));
+                accepted.push(fix);
+            }
+        }
+        let current = match std::fs::read_to_string(path) {
+            Ok(current) => current,
+            Err(error) => {
+                outcome.failures.push(Failure {
+                    path: shown,
+                    start: None,
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if current != scanned {
+            outcome.failures.push(Failure {
+                path: shown,
+                start: None,
+                message: "changed while linting; not fixed".to_owned(),
+            });
+            continue;
+        }
+        let mut edits: Vec<&(Range<usize>, String)> =
+            accepted.iter().flat_map(|fix| &fix.edits).collect();
+        edits.sort_by_key(|(range, _)| range.start);
+        let mut fixed = scanned.clone();
+        for (range, replacement) in edits.into_iter().rev() {
+            fixed.replace_range(range.clone(), replacement);
+        }
+        if fixed != scanned {
+            if let Err(error) = std::fs::write(path, &fixed) {
+                outcome.failures.push(Failure {
+                    path: shown,
+                    start: None,
+                    message: error.to_string(),
+                });
+                continue;
+            }
+            outcome.fixed += accepted.len();
+            outcome.files += 1;
+        }
+    }
+    outcome
 }
 
 /// Compile each .sql file without a cache entry; whether none has an
