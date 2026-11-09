@@ -115,7 +115,10 @@ pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
 };
-pub use simplify::{AppliedSimplification, Rule, SimplifyOptions};
+pub use simplify::{
+    AppliedSimplification, Rule, SimplifyOptions, redundant_distinct_spans, select_at_most_one_row,
+    statement_at_most_one_row,
+};
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the
 /// macros' own errors (an unknown `sql!` argument name).

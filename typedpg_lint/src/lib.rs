@@ -418,6 +418,8 @@ pub(crate) struct Ctx<'a> {
     /// The analyzed view, for the facts the analyzer proved (the sublink
     /// nullability the `not_in_nullable` rule reads).
     pub view: &'a typedpg_analyzer::QueryView,
+    /// The catalog the query was analyzed against.
+    pub catalog: &'a PgCatalog,
 }
 
 /// Lint `sql` against `catalog`.
@@ -453,6 +455,7 @@ pub fn lint_query(
         tokens: &tokens,
         non_strict_operators: &non_strict_operators,
         view: &view,
+        catalog,
     };
     for rule in Rule::ALL {
         let Some(severity) = options.level(rule) else {
@@ -1069,7 +1072,10 @@ mod tests {
         let db = catalog();
         let sql = "SELECT (SELECT count(*) FROM users WHERE id IN $..ids) AS c, \
                    (SELECT id FROM users WHERE id = $id AND email = NULL LIMIT 1) AS n";
-        let findings = lint(&db, sql);
+        let findings: Vec<Finding> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::NullComparison)
+            .collect();
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(&sql[findings[0].span.clone()], "email = NULL");
 

@@ -307,7 +307,7 @@ impl<'a> FromScope<'a> {
 }
 
 /// PG's system column names, which every table has besides its own.
-fn is_system_column(name: &str) -> bool {
+pub(super) fn is_system_column(name: &str) -> bool {
     matches!(
         name,
         "tableoid" | "ctid" | "xmin" | "xmax" | "cmin" | "cmax" | "oid"
@@ -854,6 +854,56 @@ fn typed(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> Option<Typed> {
     }
 }
 
+/// `count([*])` as a call that can't fail, when PG resolves it to the
+/// built-in aggregate: it only increments a counter, and a `count(expr)`'s
+/// expression (and a FILTER) must itself be error-free. `DISTINCT` is
+/// refused: it compares values with the type's equality operator, which a
+/// user type may implement so that it raises.
+fn count_call(
+    ctx: &Ctx<'_>,
+    f: &typedpg_pg_query::protobuf::FuncCall,
+    scope: &FromScope<'_>,
+) -> Option<Typed> {
+    if f.over.is_some()
+        || f.agg_distinct
+        || !f.agg_order.is_empty()
+        || f.agg_within_group
+        || f.func_variadic
+    {
+        return None;
+    }
+    let (schema, name) = name_parts(&f.funcname)?;
+    if name != "count" {
+        return None;
+    }
+    let pg_catalog = ctx.catalog.pg_catalog_oid()?;
+    let procs = ctx.catalog.find_functions(schema, name);
+    if procs.is_empty()
+        || procs
+            .iter()
+            .any(|p| p.prokind != ProKind::Aggregate || p.pronamespace != pg_catalog)
+    {
+        return None;
+    }
+    if f.agg_star {
+        if !f.args.is_empty() {
+            return None;
+        }
+    } else {
+        let [arg] = f.args.as_slice() else {
+            return None;
+        };
+        if matches!(arg.node, Some(N::NamedArgExpr(_))) {
+            return None;
+        }
+        typed(ctx, arg, scope)?;
+    }
+    if let Some(filter) = f.agg_filter.as_deref() {
+        typed(ctx, filter, scope)?;
+    }
+    Some(Typed::of(crate::pg_catalog::oid::INT8))
+}
+
 /// The type PG gives a `Float`-tagged literal (`make_const`): an integer
 /// too large for the lexer's `int4` that `pg_strtoint64_safe` reads (its
 /// prefixes and underscores included) is `int4` or `int8`, anything else
@@ -1179,6 +1229,28 @@ fn clock_shift(
 /// ORDER BY — is one [`cannot_error`] accepts; LIMIT / OFFSET are
 /// non-negative integer constants. No WITH, window or set operation.
 pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &FromScope<'_>) -> bool {
+    error_free_select_with(ctx, select, scope, cannot_error)
+}
+
+/// [`error_free_select`] with `count(...)` accepted as an aggregate that
+/// can't fail. The lint rules use it for a `LIMIT` / `DISTINCT` fix: those
+/// rewrites don't change which rows an aggregate consumes, and `count`
+/// only increments a counter. The simplifications keep the stricter
+/// [`error_free_select`].
+pub(crate) fn error_free_select_allow_count(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+    scope: &FromScope<'_>,
+) -> bool {
+    error_free_select_with(ctx, select, scope, cannot_error_or_count)
+}
+
+fn error_free_select_with(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+    scope: &FromScope<'_>,
+    check: fn(&Ctx<'_>, &Node, &FromScope<'_>) -> bool,
+) -> bool {
     use typedpg_pg_query::protobuf::a_const::Val;
     if select.op != typedpg_pg_query::protobuf::SetOperation::SetopNone as i32
         || select.with_clause.is_some()
@@ -1198,7 +1270,7 @@ pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &From
     {
         return false;
     }
-    let ok = |n: &Node| cannot_error(ctx, n, scope);
+    let ok = |n: &Node| check(ctx, n, scope);
     let limit_ok = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
         None => true,
         Some(N::AConst(c)) => c.isnull || matches!(&c.val, Some(Val::Ival(i)) if i.ival >= 0),
@@ -1212,7 +1284,7 @@ pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &From
             .flatten()
             .map(|n| (**n).clone())
             .collect();
-        cannot_error(ctx, q, &FromScope::of_items(ctx, &sides, scope.parent))
+        check(ctx, q, &FromScope::of_items(ctx, &sides, scope.parent))
     }) && select.target_list.iter().all(|t| match t.node.as_ref() {
         Some(N::ResTarget(r)) => r.indirection.is_empty() && r.val.as_deref().is_some_and(ok),
         _ => false,
@@ -1229,6 +1301,14 @@ pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &From
         })
         && limit_ok(select.limit_count.as_deref())
         && limit_ok(select.limit_offset.as_deref())
+}
+
+/// [`cannot_error`], also accepting a whole `count(...)` call.
+fn cannot_error_or_count(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> bool {
+    match expr.node.as_ref() {
+        Some(N::FuncCall(call)) if count_call(ctx, call, scope).is_some() => true,
+        _ => cannot_error(ctx, expr, scope),
+    }
 }
 
 /// Whether a FROM item reads stored tables only (no function, subquery,
