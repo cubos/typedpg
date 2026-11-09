@@ -14,6 +14,16 @@ migrations = "./migrations"
 
 [package.metadata.typedpg.lint]
 ignore = ["tests/ignored.rs"]
+# Pins the original rules' rendering; the new rules have their own unit tests.
+redundant_null_check = "off"
+limit_without_order = "off"
+redundant_limit = "off"
+redundant_distinct = "off"
+fk_type_mismatch = "off"
+missing_lock_timeout = "off"
+fetch_may_return_many = "off"
+fetch_all_single_row = "off"
+unused_returning = "off"
 
 [package.metadata.typedpg.databases.other.database]
 migrations = "./other_migrations"

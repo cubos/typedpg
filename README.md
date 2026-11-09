@@ -114,9 +114,26 @@ and lints the migrations themselves:
 | `redundant_index` | info | An index another index on the table already covers. |
 | `redundant_binding` | warning | A `sql!` binding `x = x` (or a bare `x`): the parameter captures the variable without it. |
 | `renaming_binding` | info | A `sql!` binding `p = v` that only renames the variable `v`; write `$v` in the SQL instead. |
+| `redundant_null_check` | warning | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
+| `limit_without_order` | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
+| `redundant_limit` | info | A `LIMIT` on a query that returns at most one row. |
+| `redundant_distinct` | info | A `DISTINCT` on rows that are already distinct. |
+| `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
+| `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
+| `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| `prefer_timestamptz` | off | A `timestamp without time zone` column. |
+| `prefer_identity` | off | A `serial` column instead of an identity column. |
+| `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
+| `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
+| `fetch_may_return_many` | warning | `fetch_one` / `fetch_optional` on a query not proven to return at most one row (`cargo typedpg lint` only). |
+| `fetch_all_single_row` | info | `fetch_all` on a query that returns at most one row (`cargo typedpg lint` only). |
+| `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded (`cargo typedpg lint` only). |
 
-The last two rules are about a `sql!` invocation's binding arguments, not the
-SQL text; the TypeScript CLI has no bindings and does not have them.
+The `cargo typedpg lint`-only rules are about the `sql!` invocation in Rust,
+not the SQL text: `redundant_binding` and `renaming_binding` look at its
+bindings, and `fetch_may_return_many`, `fetch_all_single_row` and
+`unused_returning` at its call site. The TypeScript CLI has neither and does
+not have them.
 
 The `lint` table sets each rule's level (`"error"`, `"warning"`, `"info"` or
 `"off"`) and `fail_on`, the severity the run fails on (default `"error"`):
@@ -140,10 +157,12 @@ compile still fails lint, as it still fails the build.
 A comment suppresses a rule for the query or migration statement it is in:
 `-- typedpg-lint: allow(unbounded_write)` (the `/* … */` form works too).
 
-`--fix` applies the fixes of the findings that have one (`redundant_binding`
-and `renaming_binding`): it deletes the binding — and, for a rename, rewrites
-every `$p` of the SQL literal to `$v` — writes the files, then reports what
-remains.
+`--fix` applies the fixes of the findings that have one. It deletes a
+`redundant_binding` (and, for a `renaming_binding`, rewrites every `$p` of
+the SQL literal to `$v`), and applies the SQL edits some rules offer:
+`redundant_null_check`'s `COALESCE`, `redundant_limit`,
+`redundant_distinct` and `unused_returning`. It writes the files, then
+reports what remains; only edits that keep the query's meaning are applied.
 
 Migrations already applied in production cannot be changed, so `cargo typedpg
 lint --ignore-migrations-from <ref>` (for example `origin/main`) skips the

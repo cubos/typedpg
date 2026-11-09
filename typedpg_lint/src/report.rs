@@ -343,7 +343,9 @@ impl Report {
             rules.push(serde_json::json!({
                 "id": rule.name(),
                 "shortDescription": { "text": rule.description() },
-                "defaultConfiguration": { "level": sarif_level(rule.default_severity()) },
+                "defaultConfiguration": {
+                    "level": rule.default_level().map_or("none", sarif_level)
+                },
             }));
         }
         rules.push(serde_json::json!({
@@ -870,6 +872,7 @@ mod tests {
             span: 0..1,
             message: message.to_owned(),
             help: help.map(str::to_owned),
+            fix: Vec::new(),
         }
     }
 
@@ -1092,7 +1095,7 @@ mod tests {
             );
             assert_eq!(
                 rule_json["defaultConfiguration"]["level"],
-                sarif_level(rule.default_severity()),
+                rule.default_level().map_or("none", sarif_level),
                 "{rule}"
             );
         }

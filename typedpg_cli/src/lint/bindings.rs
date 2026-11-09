@@ -205,6 +205,7 @@ fn report(
             span: binding.span.clone(),
             message,
             help: Some(help.into()),
+            fix: Vec::new(),
         },
         edits,
     })
