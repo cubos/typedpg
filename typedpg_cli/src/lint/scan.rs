@@ -445,7 +445,9 @@ pub(crate) fn cooked_to_raw(raw: &str, cooked: usize) -> usize {
                     produced += 1;
                     continue;
                 };
-                let codepoint = u32::from_str_radix(&raw[i + 3..end], 16).unwrap_or(0xFFFD);
+                // Rust allows underscores between the digits: `\u{0_061}`.
+                let digits: String = raw[i + 3..end].chars().filter(|&c| c != '_').collect();
+                let codepoint = u32::from_str_radix(&digits, 16).unwrap_or(0xFFFD);
                 let c = char::from_u32(codepoint).unwrap_or('\u{FFFD}');
                 i = end + 1;
                 produced += c.len_utf8();
@@ -578,6 +580,12 @@ fn main() {
         // The end of the value is the closing quote.
         let end = query.literal.source_offset(query.text.len());
         assert!(source[end..].starts_with('"'));
+    }
+
+    #[test]
+    fn a_unicode_escape_with_underscores_is_one_character() {
+        let raw = r"\u{0_061}b";
+        assert_eq!(cooked_to_raw(raw, 1), raw.find('b').unwrap());
     }
 
     #[test]
