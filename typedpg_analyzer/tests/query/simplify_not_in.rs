@@ -534,9 +534,11 @@ fn an_alias_column_list_renames_by_position() {
         "SELECT x.a FROM t AS x(b, a) WHERE x.a NOT IN (SELECT code FROM banned)",
     );
     // A partial list too: `y(m)` renames `t.a` to `m`, `y.b` stays `t.b`.
-    assert_kept(
+    // `y.m` is `t.a`, which is NOT NULL, so the anti-join is sound.
+    assert_rewritten(
         &db,
         "SELECT c.code FROM customers c WHERE c.code NOT IN (SELECT y.m FROM t AS y(m))",
+        "SELECT c.code FROM customers c WHERE (NOT EXISTS (SELECT 1 FROM t AS y(m) WHERE c.code = y.m))",
     );
 }
 
@@ -741,6 +743,30 @@ fn a_cross_type_equality_needing_a_cast_is_kept() {
 }
 
 #[test]
+fn a_using_join_is_trusted_only_when_its_equality_cannot_fail() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (k int NOT NULL, a int NOT NULL);
+         CREATE TABLE u (k int NOT NULL, a int NOT NULL);
+         CREATE TYPE mood AS ENUM ('ok', 'bad');
+         CREATE TABLE moods (k mood NOT NULL, a int NOT NULL);",
+    )
+    .unwrap();
+    // Two int columns: `k = k` is the built-in int4 equality, no cast runs.
+    assert_rewritten(
+        &db,
+        "SELECT t.a FROM t WHERE t.a NOT IN (SELECT u.a FROM u JOIN t AS t2 USING (k))",
+        "SELECT t.a FROM t WHERE (NOT EXISTS (SELECT 1 FROM u JOIN t AS t2 USING (k) WHERE t.a = u.a))",
+    );
+    // An enum's `=` is the polymorphic `anyenum` operator, not one declared
+    // exactly on the column's type, so the proof gives up.
+    assert_kept(
+        &db,
+        "SELECT t.a FROM t WHERE t.a NOT IN (SELECT m.a FROM moods m JOIN moods m2 USING (k))",
+    );
+}
+
+#[test]
 fn a_subquery_expression_that_can_fail_is_kept() {
     // The anti-join filters `u` by `1/u.b > 0` before looking at `t`: on
     // a row the SubPlan never reached, it divides by zero.
@@ -759,7 +785,6 @@ fn a_subquery_expression_that_can_fail_is_kept() {
         "SELECT a FROM u GROUP BY a HAVING count(*) > 1",
         "SELECT a FROM u LIMIT $n",
         "SELECT a FROM u, generate_series(1, 2)",
-        "SELECT u.a FROM u JOIN t AS t2 USING (k)",
     ] {
         assert_kept(&db, &format!("SELECT t.a FROM t WHERE t.a NOT IN ({sub})"));
     }

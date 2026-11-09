@@ -39,10 +39,11 @@ impl QueryView {
         select_is_error_free_in(&ctx, select)
     }
 
-    /// The spans of the plain `DISTINCT` keywords the `distinct`
-    /// simplification proves redundant, each with whether removing it
-    /// can't change the errors the select raises (the lint fix's
-    /// condition; a finding is still reported when it is `false`).
+    /// The spans of the plain `DISTINCT` keywords the `distinct` proof
+    /// finds redundant, each with whether removing it can't change the
+    /// errors the select raises (the lint fix's condition; a finding is
+    /// still reported when it is `false`, the simplification then keeping
+    /// the query as written).
     pub fn redundant_distinct_spans_with_fix(
         &self,
         catalog: &PgCatalog,
@@ -172,7 +173,12 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
 
 /// Whether `select` — a node of `ctx`'s tree at any nesting depth — is
 /// error-free by [`QueryView::select_is_error_free`]'s proof.
-fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+///
+/// The lint rules use it to withhold a fix, and the `distinct` and
+/// `union_all` simplifications to withhold the rewrite itself: dropping a
+/// `DISTINCT` or a `UNION`'s deduplication changes which rows PG evaluates,
+/// so an expression that can raise there must keep the original query.
+pub(super) fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     let mut found = None;
     let env = CteEnv::default();
     for raw in &ctx.tree.stmts {

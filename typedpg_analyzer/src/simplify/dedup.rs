@@ -39,6 +39,25 @@
 //! the proof can't see through — views, subqueries, functions, CTEs,
 //! inheritance parents, partitioned tables, tables under row security —
 //! make it give up, and so do set-returning, aggregate and volatile calls.
+//!
+//! # Errors
+//!
+//! Dropping `DISTINCT` (or a `UNION`'s deduplication) changes *which* rows
+//! PostgreSQL evaluates, not only which it returns: a `DISTINCT` plan must
+//! read every row before it can emit (a hash/sort aggregate), while the
+//! rewritten plan can stop at a `LIMIT` — its own, the `LIMIT 2` the query
+//! runtime adds to `fetch_one`, or one above it — and `UNION` evaluates
+//! every arm fully to deduplicate while `UNION ALL` needn't. So an
+//! expression that can raise on a row the original evaluates but the
+//! rewrite might not would change the error the query raises (or whether
+//! it raises one). Both rules therefore also require the affected select
+//! — the `DISTINCT` one, every `UNION` arm — to be error-free by
+//! [`super::cardinality::select_is_error_free_in`], the same proof the
+//! lint fixes use. The enclosing levels need no extra check: they see the
+//! same output rows either way (the proof replaces only a dedup that
+//! removes none), so their expressions run on the same values; only a
+//! `LIMIT` can stop the *inner* select earlier, which is what the
+//! affected select's own check covers.
 
 use std::collections::HashSet;
 
@@ -59,10 +78,12 @@ use crate::pg_catalog::{ProKind, ProVolatile, RelKind, oid};
 const MAX_RELATIONS: usize = 64;
 
 /// [`Rule::Distinct`]: every plain `SELECT DISTINCT` — at the top level or
-/// nested anywhere — whose rows are provably distinct without it.
+/// nested anywhere — whose rows are provably distinct without it, when the
+/// select is error-free ([`super::cardinality::select_is_error_free_in`]).
 pub(crate) fn distinct_candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     distinct_candidates_with_select(ctx)
         .into_iter()
+        .filter(|(select, _)| super::cardinality::select_is_error_free_in(ctx, select))
         .map(|(_, candidate)| candidate)
         .collect()
 }
@@ -162,6 +183,18 @@ pub(crate) fn union_all_candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
             || (is_plain_distinct(arm) && usable.iter().all(|&u| u))
     });
     if !all_distinct {
+        return Vec::new();
+    }
+    // UNION deduplicates only after evaluating every arm in full; UNION ALL
+    // under a LIMIT can stop an arm early. Only rewrite when nothing an arm
+    // evaluates can raise, so the rows either form skips can't hide (or
+    // expose) an error. The arms' own error-freedom is the whole check: a
+    // set operation has no other expressions of its own, and its ORDER BY
+    // evaluates only the rows both forms produce (the arms' outputs).
+    if !arms
+        .iter()
+        .all(|arm| super::cardinality::select_is_error_free_in(ctx, arm))
+    {
         return Vec::new();
     }
     let edits: Option<Vec<Edit>> = unions
