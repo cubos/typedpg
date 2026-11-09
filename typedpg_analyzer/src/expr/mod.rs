@@ -1407,7 +1407,24 @@ fn infer_expr_unlocated(
         node::Node::BoolExpr(expr) => infer_bool_expr(expr, ctx, params),
         node::Node::NullTest(t) => {
             if let Some(arg) = &t.arg {
-                infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+                let arg_type = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+                // Record the argument's own inferred nullability — the test
+                // itself proves nothing about it — for the lint's
+                // `redundant_null_check` rule. A row / composite value is
+                // skipped: `ROW(NULL, NULL) IS NULL` is true, so its `IS
+                // NULL` follows different semantics.
+                let composite = arg_type.type_oid == oid::RECORD
+                    || arg_type.record_fields.is_some()
+                    || crate::coerce::is_complex(arg_type.type_oid, snapshot);
+                if !composite {
+                    // A parameter may be passed NULL whatever its own
+                    // inferred nullability: `WHERE $1 IS NULL` tests the
+                    // caller's value, not a column.
+                    crate::pg_catalog::note_null_test_arg_nullable(
+                        t.location,
+                        arg_type.nullable || has_param_ref(arg),
+                    );
+                }
                 // IS [NOT] NULL accepts any type, so it pins nothing — and
                 // PG *locks* the parameter's type at this first untyped use:
                 // `SELECT $1 IS NULL, $1 = 1` is `could not determine data
