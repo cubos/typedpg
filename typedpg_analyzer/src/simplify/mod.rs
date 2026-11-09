@@ -15,6 +15,7 @@ use typedpg_pg_query::protobuf::ParseResult;
 use crate::pg_catalog::PgCatalog;
 use crate::resolve::AnalyzedQuery;
 
+mod cardinality;
 mod count_exists;
 mod dedup;
 mod fk_join;
@@ -22,6 +23,10 @@ mod not_in;
 #[allow(dead_code)] // The rules use them as they land.
 pub(crate) mod proof;
 mod safe_builtins;
+
+pub use cardinality::{
+    redundant_distinct_spans, select_at_most_one_row, statement_at_most_one_row,
+};
 
 /// A text edit on the post-lex SQL ([`AnalyzedQuery::sql`], with `$n`
 /// placeholders): `range` replaced by `text`.

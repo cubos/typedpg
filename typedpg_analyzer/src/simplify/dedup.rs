@@ -47,6 +47,7 @@ use typedpg_pg_query::protobuf::{
     self, AExprKind, BoolExprType, JoinType, SetOperation, Token, a_const::Val, node::Node,
 };
 
+use super::proof::FromScope;
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::Type;
 use crate::oid::{PgClassOid, PgCollationOid, PgNamespaceOid, PgOperatorOid, PgTypeOid};
@@ -248,7 +249,7 @@ fn rows_distinct(
     // equates to what other relations determine is determined by them.
     let where_facts = conjuncts(s.where_clause.as_deref())
         .into_iter()
-        .flat_map(|c| scope.equality_facts(ctx, c))
+        .flat_map(|c| scope.equality_facts(ctx, c, None))
         .collect::<Vec<_>>();
     for b in 0..n {
         if let Some(det) = scope.key_equated(ctx, b, &where_facts, all & !(1 << b)) {
@@ -258,7 +259,7 @@ fn rows_distinct(
     for join in &scope.joins {
         let mut facts: Vec<EqFact> = Vec::new();
         for c in conjuncts(join.quals) {
-            facts.extend(scope.equality_facts(ctx, c));
+            facts.extend(scope.equality_facts(ctx, c, None));
         }
         for name in &join.using {
             facts.extend(scope.using_facts(ctx, name, join.left, join.right));
@@ -313,7 +314,7 @@ fn is_plain_distinct(s: &protobuf::SelectStmt) -> bool {
 /// [`super::proof::has_volatile`] flags), anywhere in `s` — or a function
 /// this can't resolve. Every overload of the name counts, not just the one
 /// PG picks.
-fn has_unsafe_call(ctx: &Ctx<'_>, s: &protobuf::SelectStmt) -> bool {
+pub(super) fn has_unsafe_call(ctx: &Ctx<'_>, s: &protobuf::SelectStmt) -> bool {
     let node = protobuf::Node {
         node: Some(Node::SelectStmt(Box::new(s.clone()))),
     };
@@ -362,15 +363,15 @@ fn has_unsafe_call(ctx: &Ctx<'_>, s: &protobuf::SelectStmt) -> bool {
 // ── FROM scope ──────────────────────────────────────────────────────────────
 
 /// A base table in a FROM clause.
-struct Rel {
-    oid: PgClassOid,
+pub(super) struct Rel {
+    pub(super) oid: PgClassOid,
     /// The alias, or the table's name.
-    refname: String,
-    aliased: bool,
-    schema: String,
-    relname: String,
+    pub(super) refname: String,
+    pub(super) aliased: bool,
+    pub(super) schema: String,
+    pub(super) relname: String,
     /// The relation may be null-extended by an outer join above it.
-    nullable: bool,
+    pub(super) nullable: bool,
     /// The columns as this FROM item names them, with their attnums: an
     /// alias's column list (`t AS x(a, b)`) renames the first ones, in
     /// order, and the rest keep their names. Dropped columns are gone from
@@ -390,29 +391,29 @@ impl Rel {
 }
 
 /// A join in a FROM clause, with its sides' relations as bitmasks.
-struct Join<'a> {
-    kind: JoinType,
-    left: u64,
-    right: u64,
+pub(super) struct Join<'a> {
+    pub(super) kind: JoinType,
+    pub(super) left: u64,
+    pub(super) right: u64,
     /// The side, when it is a single relation.
-    left_rel: Option<usize>,
-    right_rel: Option<usize>,
-    quals: Option<&'a protobuf::Node>,
-    using: Vec<&'a str>,
+    pub(super) left_rel: Option<usize>,
+    pub(super) right_rel: Option<usize>,
+    pub(super) quals: Option<&'a protobuf::Node>,
+    pub(super) using: Vec<&'a str>,
     /// The join may be null-extended by an outer join above it.
-    nullable: bool,
+    pub(super) nullable: bool,
 }
 
 impl Join<'_> {
-    fn rels(&self) -> u64 {
+    pub(super) fn rels(&self) -> u64 {
         self.left | self.right
     }
 }
 
 /// The base tables and joins of one FROM clause.
-struct Scope<'a> {
-    rels: Vec<Rel>,
-    joins: Vec<Join<'a>>,
+pub(super) struct Scope<'a> {
+    pub(super) rels: Vec<Rel>,
+    pub(super) joins: Vec<Join<'a>>,
 }
 
 /// What a column reference names.
@@ -432,9 +433,9 @@ enum Fields<'a> {
 }
 
 /// One proven fact `rel.attnum = <value>` with a strict equality operator,
-/// where the value is read from the relations of `other` (constants and
-/// parameters read none).
-struct EqFact {
+/// where the value is read from the relations of `other` (constants,
+/// parameters and outer-query columns read none).
+pub(super) struct EqFact {
     rel: usize,
     attnum: i16,
     op: PgOperatorOid,
@@ -453,7 +454,7 @@ struct Operand {
 impl<'a> Scope<'a> {
     /// The FROM clause's relations, or `None` when it has anything but
     /// base tables the proof can trust and plain joins of them.
-    fn build(
+    pub(super) fn build(
         ctx: &Ctx<'_>,
         ctes: &HashSet<String>,
         from: &'a [protobuf::Node],
@@ -468,6 +469,21 @@ impl<'a> Scope<'a> {
         Some(scope)
     }
 
+    /// The scope of a lone relation: an `UPDATE` / `DELETE` target, whose
+    /// `WHERE` sees only it.
+    pub(super) fn single(
+        ctx: &Ctx<'_>,
+        ctes: &HashSet<String>,
+        relation: &protobuf::RangeVar,
+    ) -> Option<Scope<'a>> {
+        let mut scope = Scope {
+            rels: Vec::new(),
+            joins: Vec::new(),
+        };
+        scope.add_range_var(ctx, ctes, relation, false)?;
+        Some(scope)
+    }
+
     /// Add one FROM item; its relations as a bitmask.
     fn add(
         &mut self,
@@ -477,62 +493,7 @@ impl<'a> Scope<'a> {
         nullable: bool,
     ) -> Option<u64> {
         match item.node.as_ref()? {
-            Node::RangeVar(rv) => {
-                if self.rels.len() == MAX_RELATIONS
-                    || !rv.catalogname.is_empty()
-                    || (rv.schemaname.is_empty() && ctes.contains(&rv.relname))
-                {
-                    return None;
-                }
-                let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
-                let class = ctx.catalog.resolve_table(schema, &rv.relname)?;
-                if class.relkind != RelKind::Table
-                    || ctx
-                        .catalog
-                        .pg_inherits
-                        .iter()
-                        .any(|i| i.inhparent == class.oid)
-                    || ctx.catalog.row_security.contains(&class.oid)
-                {
-                    return None;
-                }
-                let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
-                let mut attrs: Vec<_> = ctx
-                    .catalog
-                    .attributes_of(class.oid)
-                    .iter()
-                    .filter(|a| a.attnum > 0)
-                    .collect();
-                attrs.sort_by_key(|a| a.attnum);
-                let mut columns: Vec<(String, i16)> = attrs
-                    .iter()
-                    .map(|a| (a.attname.clone(), a.attnum))
-                    .collect();
-                let renames = rv.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
-                if renames.len() > columns.len() {
-                    return None;
-                }
-                for (column, rename) in columns.iter_mut().zip(renames) {
-                    let Some(Node::String(name)) = &rename.node else {
-                        return None;
-                    };
-                    column.0 = name.sval.clone();
-                }
-                self.rels.push(Rel {
-                    oid: class.oid,
-                    refname: alias.clone().unwrap_or_else(|| rv.relname.clone()),
-                    aliased: alias.is_some(),
-                    schema: ctx
-                        .catalog
-                        .namespace_name(class.relnamespace)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    relname: rv.relname.clone(),
-                    nullable,
-                    columns,
-                });
-                Some(1 << (self.rels.len() - 1))
-            }
+            Node::RangeVar(rv) => self.add_range_var(ctx, ctes, rv, nullable),
             Node::JoinExpr(j) => {
                 if j.is_natural || j.alias.is_some() || j.join_using_alias.is_some() {
                     return None;
@@ -580,6 +541,70 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// Add one base-table reference; its relation as a bitmask.
+    fn add_range_var(
+        &mut self,
+        ctx: &Ctx<'_>,
+        ctes: &HashSet<String>,
+        rv: &protobuf::RangeVar,
+        nullable: bool,
+    ) -> Option<u64> {
+        if self.rels.len() == MAX_RELATIONS
+            || !rv.catalogname.is_empty()
+            || (rv.schemaname.is_empty() && ctes.contains(&rv.relname))
+        {
+            return None;
+        }
+        let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+        let class = ctx.catalog.resolve_table(schema, &rv.relname)?;
+        if class.relkind != RelKind::Table
+            || ctx
+                .catalog
+                .pg_inherits
+                .iter()
+                .any(|i| i.inhparent == class.oid)
+            || ctx.catalog.row_security.contains(&class.oid)
+        {
+            return None;
+        }
+        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+        let mut attrs: Vec<_> = ctx
+            .catalog
+            .attributes_of(class.oid)
+            .iter()
+            .filter(|a| a.attnum > 0)
+            .collect();
+        attrs.sort_by_key(|a| a.attnum);
+        let mut columns: Vec<(String, i16)> = attrs
+            .iter()
+            .map(|a| (a.attname.clone(), a.attnum))
+            .collect();
+        let renames = rv.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
+        if renames.len() > columns.len() {
+            return None;
+        }
+        for (column, rename) in columns.iter_mut().zip(renames) {
+            let Some(Node::String(name)) = &rename.node else {
+                return None;
+            };
+            column.0 = name.sval.clone();
+        }
+        self.rels.push(Rel {
+            oid: class.oid,
+            refname: alias.clone().unwrap_or_else(|| rv.relname.clone()),
+            aliased: alias.is_some(),
+            schema: ctx
+                .catalog
+                .namespace_name(class.relnamespace)
+                .unwrap_or_default()
+                .to_owned(),
+            relname: rv.relname.clone(),
+            nullable,
+            columns,
+        });
+        Some(1 << (self.rels.len() - 1))
+    }
+
     /// The relation a qualifier names.
     fn rel_named(&self, qualifier: &str) -> Option<usize> {
         self.rels.iter().position(|r| r.refname == qualifier)
@@ -622,25 +647,36 @@ impl<'a> Scope<'a> {
     }
 
     /// `expr` as one side of an equality the proof reads: a column of this
-    /// scope, a parameter or a constant.
-    fn operand(&self, ctx: &Ctx<'_>, expr: &protobuf::Node) -> Option<Operand> {
+    /// scope, a parameter, a constant, or — `outer` being the levels this
+    /// one is nested in — a column of an outer query, which is fixed for
+    /// one evaluation of this level.
+    fn operand(
+        &self,
+        ctx: &Ctx<'_>,
+        expr: &protobuf::Node,
+        outer: Option<&FromScope<'_>>,
+    ) -> Option<Operand> {
         match expr.node.as_ref()? {
             Node::ColumnRef(cr) => {
                 let Fields::Names(names) = column_ref_fields(cr) else {
                     return None;
                 };
-                let Col::Rel(r, attnum) = self.resolve(&names) else {
-                    return None;
+                let (rel, oid, attnum) = match self.resolve(&names) {
+                    Col::Rel(r, attnum) => (Some(r), self.rels[r].oid, attnum),
+                    Col::Other => {
+                        let resolved = outer?.resolve(ctx, cr)?;
+                        (None, resolved.rel, resolved.attnum)
+                    }
                 };
                 let attr = ctx
                     .catalog
-                    .attributes_of(self.rels[r].oid)
+                    .attributes_of(oid)
                     .iter()
                     .find(|a| a.attnum == attnum)?;
                 deterministic(attr.attcollation).then_some(Operand {
                     typ: attr.atttypid,
-                    column: Some((r, attnum)),
-                    rels: 1 << r,
+                    column: rel.map(|r| (r, attnum)),
+                    rels: rel.map_or(0, |r| 1 << r),
                 })
             }
             Node::ParamRef(p) => {
@@ -668,7 +704,12 @@ impl<'a> Scope<'a> {
     }
 
     /// The facts `column = value` an `=` conjunct proves.
-    fn equality_facts(&self, ctx: &Ctx<'_>, conjunct: &protobuf::Node) -> Vec<EqFact> {
+    pub(super) fn equality_facts(
+        &self,
+        ctx: &Ctx<'_>,
+        conjunct: &protobuf::Node,
+        outer: Option<&FromScope<'_>>,
+    ) -> Vec<EqFact> {
         let Some(Node::AExpr(e)) = &conjunct.node else {
             return Vec::new();
         };
@@ -683,14 +724,20 @@ impl<'a> Scope<'a> {
         let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
             return Vec::new();
         };
-        let (Some(l), Some(r)) = (self.operand(ctx, l), self.operand(ctx, r)) else {
+        let (Some(l), Some(r)) = (self.operand(ctx, l, outer), self.operand(ctx, r, outer)) else {
             return Vec::new();
         };
         self.facts_of(ctx, name, &l, &r)
     }
 
     /// The facts `USING (name)` proves between the join's sides.
-    fn using_facts(&self, ctx: &Ctx<'_>, name: &str, left: u64, right: u64) -> Vec<EqFact> {
+    pub(super) fn using_facts(
+        &self,
+        ctx: &Ctx<'_>,
+        name: &str,
+        left: u64,
+        right: u64,
+    ) -> Vec<EqFact> {
         let side = |mask: u64| {
             let mut found = (0..self.rels.len())
                 .filter(|&r| mask & (1 << r) != 0)
@@ -760,7 +807,13 @@ impl<'a> Scope<'a> {
 
     /// When `facts` equate every column of a unique key of relation `b` to
     /// values read from relations within `allowed`: the relations read.
-    fn key_equated(&self, ctx: &Ctx<'_>, b: usize, facts: &[EqFact], allowed: u64) -> Option<u64> {
+    pub(super) fn key_equated(
+        &self,
+        ctx: &Ctx<'_>,
+        b: usize,
+        facts: &[EqFact],
+        allowed: u64,
+    ) -> Option<u64> {
         let oid = self.rels[b].oid;
         unique_keys(ctx, oid).iter().find_map(|key| {
             let mut det = 0u64;
@@ -1134,7 +1187,7 @@ fn union_keyword_edit(tokens: &[protobuf::ScanToken], s: &protobuf::SelectStmt) 
 
 /// Every CTE name defined anywhere in the statement: a table reference
 /// spelled like one may be the CTE.
-fn cte_names(tree: &protobuf::ParseResult) -> HashSet<String> {
+pub(super) fn cte_names(tree: &protobuf::ParseResult) -> HashSet<String> {
     tree.nodes()
         .into_iter()
         .filter_map(|(n, _)| match n {
@@ -1145,7 +1198,7 @@ fn cte_names(tree: &protobuf::ParseResult) -> HashSet<String> {
 }
 
 /// The top-level AND conjuncts of a qualification.
-fn conjuncts(qual: Option<&protobuf::Node>) -> Vec<&protobuf::Node> {
+pub(super) fn conjuncts(qual: Option<&protobuf::Node>) -> Vec<&protobuf::Node> {
     let mut out = Vec::new();
     let mut stack: Vec<&protobuf::Node> = qual.into_iter().collect();
     while let Some(n) = stack.pop() {
