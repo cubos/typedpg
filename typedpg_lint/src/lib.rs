@@ -483,7 +483,14 @@ pub fn lint_query(
         if finding.fix.is_empty() {
             continue;
         }
-        if let Err(change) = fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix) {
+        // `unused_returning` drops the RETURNING its call site discards: its
+        // fix is the one meant to leave no output column.
+        let columns = if finding.rule == Rule::UnusedReturning {
+            ExpectedColumns::None
+        } else {
+            ExpectedColumns::Same
+        };
+        if let Err(change) = fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix, columns) {
             finding.fix.clear();
             let message = format!(
                 "typedpg bug: the {} fix would have changed {change}, so it was not offered",
@@ -528,17 +535,25 @@ fn fix_keeps_shape(
     sql: &str,
     original: &typedpg_analyzer::AnalyzedQuery,
     fix: &[SqlEdit],
+    columns: ExpectedColumns,
 ) -> Result<(), &'static str> {
     let edited = apply_edits(sql, fix).ok_or("the query text (overlapping edits)")?;
     let analyzed = catalog
         .analyze(&edited)
         .map_err(|_| "the query into one that doesn't analyze")?;
-    let same_columns = analyzed.columns.len() == original.columns.len()
-        && analyzed
-            .columns
-            .iter()
-            .zip(&original.columns)
-            .all(|(a, b)| a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable);
+    let same_columns = match columns {
+        ExpectedColumns::None => analyzed.columns.is_empty(),
+        ExpectedColumns::Same => {
+            analyzed.columns.len() == original.columns.len()
+                && analyzed
+                    .columns
+                    .iter()
+                    .zip(&original.columns)
+                    .all(|(a, b)| {
+                        a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable
+                    })
+        }
+    };
     if !same_columns {
         return Err("its output columns");
     }
@@ -554,6 +569,15 @@ fn fix_keeps_shape(
         return Err("whether it can run as a subquery");
     }
     Ok(())
+}
+
+/// The output columns a fixed query must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedColumns {
+    /// The original query's, unchanged.
+    Same,
+    /// None: the fix removes a RETURNING whose rows the caller discards.
+    None,
 }
 
 /// `text` with `edits` applied, or `None` when they overlap or fall outside
@@ -771,7 +795,7 @@ mod tests {
                 }
             })
             .collect();
-        fix_keeps_shape(catalog, sql, &original, &fix).is_ok()
+        fix_keeps_shape(catalog, sql, &original, &fix, ExpectedColumns::Same).is_ok()
     }
 
     #[test]
@@ -830,7 +854,40 @@ mod tests {
                 text: String::new(),
             },
         ];
-        assert!(fix_keeps_shape(&db, "SELECT id FROM users", &original, &overlapping).is_err());
+        assert!(
+            fix_keeps_shape(
+                &db,
+                "SELECT id FROM users",
+                &original,
+                &overlapping,
+                ExpectedColumns::Same
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_fix_dropping_returning_must_leave_no_column() {
+        let db = catalog();
+        let sql = "DELETE FROM users WHERE id = $id RETURNING id";
+        let original = db.analyze(sql).unwrap();
+        let start = sql.find(" RETURNING").unwrap();
+        let drop_returning = [SqlEdit {
+            range: start..sql.len(),
+            text: String::new(),
+        }];
+        assert!(
+            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::None).is_ok()
+        );
+        assert!(
+            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::Same).is_err()
+        );
+        // Keeping a column is not what such a fix may do.
+        let keep = [SqlEdit {
+            range: start..start,
+            text: String::new(),
+        }];
+        assert!(fix_keeps_shape(&db, sql, &original, &keep, ExpectedColumns::None).is_err());
     }
 
     fn options(level: Option<Severity>, fail_on: Option<Severity>) -> LintOptions {
