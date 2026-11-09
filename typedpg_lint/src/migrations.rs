@@ -90,6 +90,7 @@ pub fn lint_migrations(
         created_indexes: HashMap::new(),
         created_constraints: HashMap::new(),
         column_creators: HashMap::new(),
+        before_classes: HashSet::new(),
         before_indexes: HashSet::new(),
         before_constraints: HashSet::new(),
         before_relation: None,
@@ -176,6 +177,10 @@ struct MigrationLinter<'a> {
     /// For each column of a table, the last statement that gave it its
     /// current type: `CREATE TABLE`, `ADD COLUMN` or `ALTER COLUMN TYPE`.
     column_creators: HashMap<(PgClassOid, i16), Creator>,
+    /// The relations that existed before the current statement: a
+    /// `CREATE TABLE IF NOT EXISTS` that found its table already there
+    /// created nothing, so it defines no column's type.
+    before_classes: HashSet<PgClassOid>,
     before_indexes: HashSet<PgClassOid>,
     before_constraints: HashSet<PgConstraintOid>,
     /// The columns of the relation an `ALTER TABLE` targets, before that
@@ -709,9 +714,11 @@ impl MigrationLinter<'_> {
 
     fn missing_lock_timeout(&mut self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
         // A `SET`/`RESET` of the setting changes it for the statements that
-        // follow, whether or not it is this rule's finding.
+        // follow, whether or not it is this rule's finding. `SET LOCAL` only
+        // lasts for the enclosing transaction, so outside one it does
+        // nothing.
         if let N::VariableSetStmt(set) = node
-            && let Some(nonzero) = lock_timeout_setting(set)
+            && let Some(nonzero) = lock_timeout_setting(set, self.file_runs_in_transaction())
         {
             self.lock_timeout_set = nonzero;
         }
@@ -758,7 +765,12 @@ impl MigrationLinter<'_> {
                     .as_ref()
                     .and_then(|relation| resolve_relation(catalog, relation))
                 {
-                    self.record_columns(catalog, class.oid);
+                    // `CREATE TABLE IF NOT EXISTS` on an existing table is
+                    // a no-op: its columns keep the statements that gave
+                    // them their types.
+                    if !self.before_classes.contains(&class.oid) {
+                        self.record_columns(catalog, class.oid);
+                    }
                 }
             }
             // `CREATE TABLE … AS` / `SELECT … INTO` define every column of
@@ -772,7 +784,11 @@ impl MigrationLinter<'_> {
                     .and_then(|into| into.rel.as_ref())
                     .and_then(|relation| resolve_relation(catalog, relation))
                 {
-                    self.record_columns(catalog, class.oid);
+                    // `CREATE TABLE AS … IF NOT EXISTS` on an existing
+                    // relation is a no-op too.
+                    if !self.before_classes.contains(&class.oid) {
+                        self.record_columns(catalog, class.oid);
+                    }
                 }
             }
             N::AlterTableStmt(alter) => {
@@ -1290,6 +1306,9 @@ impl MigrationLinter<'_> {
 
 impl MigrationObserver for MigrationLinter<'_> {
     fn before(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+        // The relations before the statement: a `CREATE TABLE IF NOT
+        // EXISTS` that finds its table already there creates nothing.
+        self.before_classes = catalog.iter_classes().map(|class| class.oid).collect();
         // Every file's indexes are tracked, for their order: an extra
         // migration's index can make one of ours redundant.
         self.before_indexes = catalog
@@ -1464,12 +1483,27 @@ fn type_label(catalog: &PgCatalog, oid: PgTypeOid) -> &str {
 
 /// The effective value of a `SET`/`RESET` of `lock_timeout`, when the
 /// statement sets it: `Some(true)` for a non-zero value, `Some(false)` for
-/// zero, `DEFAULT` or `RESET`, and `None` for another setting.
-fn lock_timeout_setting(set: &typedpg_pg_query::protobuf::VariableSetStmt) -> Option<bool> {
+/// zero, `DEFAULT`, `RESET` or `RESET ALL`, and `None` for another setting.
+///
+/// `SET LOCAL` outside a transaction block is a no-op (PostgreSQL warns and
+/// keeps the session value), so it is `None` when `in_transaction` is false.
+fn lock_timeout_setting(
+    set: &typedpg_pg_query::protobuf::VariableSetStmt,
+    in_transaction: bool,
+) -> Option<bool> {
+    let kind = VariableSetKind::try_from(set.kind).ok()?;
+    // `RESET ALL` carries no setting name: it clears every setting,
+    // `lock_timeout` included.
+    if kind == VariableSetKind::VarResetAll {
+        return Some(false);
+    }
     if !set.name.eq_ignore_ascii_case("lock_timeout") {
         return None;
     }
-    match VariableSetKind::try_from(set.kind).ok()? {
+    if set.is_local && !in_transaction {
+        return None;
+    }
+    match kind {
         VariableSetKind::VarSetValue => Some(set.args.first().is_some_and(lock_timeout_nonzero)),
         VariableSetKind::VarSetDefault
         | VariableSetKind::VarSetCurrent
@@ -1573,7 +1607,13 @@ fn lock_target(
                 "ALTER TABLE",
             )
         }
-        N::LockStmt(lock) => first_relation(catalog, pre_existing, &lock.relations, "LOCK TABLE"),
+        N::LockStmt(lock) => {
+            if lock_mode_blocks_writes(lock.mode) {
+                first_relation(catalog, pre_existing, &lock.relations, "LOCK TABLE")
+            } else {
+                None
+            }
+        }
         N::RefreshMatViewStmt(refresh) => {
             if refresh.concurrent {
                 return None;
@@ -1648,6 +1688,7 @@ fn alter_table_lock_target(
 ) -> Option<(&'static str, PgClassOid)> {
     let mut strong = false;
     let mut referenced = Vec::new();
+    let mut attached = Vec::new();
     for node in &alter.cmds {
         let Some(command) = alter_command(node) else {
             continue;
@@ -1658,6 +1699,18 @@ fn alter_table_lock_target(
         {
             referenced.push(table);
         }
+        // ATTACH PARTITION takes ACCESS EXCLUSIVE on the table being
+        // attached (and on a default partition, whose bound the catalog
+        // does not model), while the parent only gets SHARE UPDATE
+        // EXCLUSIVE. The attached table can hold rows, so it is the lock
+        // worth reporting.
+        if AlterTableType::try_from(command.subtype) == Ok(AlterTableType::AtAttachPartition)
+            && let Some(N::PartitionCmd(partition)) =
+                command.def.as_deref().and_then(|def| def.node.as_ref())
+            && let Some(name) = partition.name.as_ref()
+        {
+            attached.push(name);
+        }
     }
     if strong
         && let Some(relation) = alter.relation.as_ref()
@@ -1665,32 +1718,69 @@ fn alter_table_lock_target(
     {
         return Some(target);
     }
-    referenced
+    attached
         .into_iter()
         .find_map(|relation| existing_relation(catalog, pre_existing, relation, "ALTER TABLE"))
+        .or_else(|| {
+            referenced.into_iter().find_map(|relation| {
+                existing_relation(catalog, pre_existing, relation, "ALTER TABLE")
+            })
+        })
+}
+
+/// `LOCK TABLE` takes the mode it names. `SHARE` is the weakest mode that
+/// conflicts with a writer's `ROW EXCLUSIVE`, so only it and the stronger
+/// modes can block every query on the table; `ACCESS SHARE`, `ROW SHARE`,
+/// `ROW EXCLUSIVE` and `SHARE UPDATE EXCLUSIVE` do not. PostgreSQL's
+/// `LOCKMODE` values come from `lockdefs.h`: `AccessShareLock` is 1 and
+/// `AccessExclusiveLock` 8; `LOCK TABLE` with no mode is the latter.
+fn lock_mode_blocks_writes(mode: i32) -> bool {
+    const SHARE: i32 = 5;
+    mode == 0 || mode >= SHARE
 }
 
 /// Whether an `ALTER TABLE` subcommand only takes `SHARE UPDATE EXCLUSIVE`
-/// on the table (PostgreSQL's lock-strength table).
+/// on the table (PostgreSQL's `AlterTableGetLockLevel`).
 fn only_share_update_exclusive(command: &typedpg_pg_query::protobuf::AlterTableCmd) -> bool {
     match AlterTableType::try_from(command.subtype) {
         Ok(
             AlterTableType::AtValidateConstraint
             | AlterTableType::AtSetStatistics
+            | AlterTableType::AtSetOptions
+            | AlterTableType::AtResetOptions
             | AlterTableType::AtClusterOn
             | AlterTableType::AtDropCluster
-            | AlterTableType::AtSetRelOptions
-            | AlterTableType::AtResetRelOptions
-            | AlterTableType::AtReplaceRelOptions
             | AlterTableType::AtAttachPartition
             | AlterTableType::AtDetachPartitionFinalize,
         ) => true,
+        Ok(AlterTableType::AtSetRelOptions | AlterTableType::AtResetRelOptions) => {
+            rel_options_are_share_update_exclusive(command)
+        }
         Ok(AlterTableType::AtDetachPartition) => matches!(
             command.def.as_deref().and_then(|def| def.node.as_ref()),
             Some(N::PartitionCmd(partition)) if partition.concurrent
         ),
         _ => false,
     }
+}
+
+/// Whether a `SET (storage_parameter)` / `RESET (storage_parameter)` takes
+/// only `SHARE UPDATE EXCLUSIVE`. PostgreSQL picks the lock per option
+/// (`AlterTableGetRelOptionsLockLevel`): every table option the analyzer
+/// models is weak except `user_catalog_table`, which needs `ACCESS
+/// EXCLUSIVE`.
+fn rel_options_are_share_update_exclusive(
+    command: &typedpg_pg_query::protobuf::AlterTableCmd,
+) -> bool {
+    let Some(N::List(list)) = command.def.as_deref().and_then(|def| def.node.as_ref()) else {
+        return false;
+    };
+    list.items.iter().all(|node| {
+        !matches!(
+            node.node.as_ref(),
+            Some(N::DefElem(def)) if def.defname.eq_ignore_ascii_case("user_catalog_table")
+        )
+    })
 }
 
 fn added_foreign_key(
@@ -2219,6 +2309,8 @@ mod tests {
              ALTER TABLE users ADD COLUMN nickname text;",
             "SET lock_timeout TO 5000;
              ALTER TABLE users ADD COLUMN nickname text;",
+            "SET SESSION lock_timeout = '3s';
+             ALTER TABLE users ADD COLUMN nickname text;",
         ] {
             let findings = second(sql);
             assert!(
@@ -2233,7 +2325,17 @@ mod tests {
              ALTER TABLE users ADD COLUMN nickname text;",
             "SET lock_timeout = DEFAULT;
              ALTER TABLE users ADD COLUMN nickname text;",
+            "SET SESSION lock_timeout = 0;
+             ALTER TABLE users ADD COLUMN nickname text;",
             "RESET lock_timeout;
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "RESET ALL;
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SET lock_timeout = '3s';
+             RESET ALL;
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SET lock_timeout = '3s';
+             SET lock_timeout TO DEFAULT;
              ALTER TABLE users ADD COLUMN nickname text;",
         ] {
             let findings = second(sql);
@@ -2241,6 +2343,26 @@ mod tests {
                 only(&findings, Rule::MissingLockTimeout).len(),
                 1,
                 "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_lock_timeout_ignores_set_local_outside_a_transaction() {
+        let sql = "SET LOCAL lock_timeout = '3s';
+                   ALTER TABLE users ADD COLUMN nickname text;";
+        for findings in [
+            second_with(sql, false, &LintOptions::default()),
+            second_with(
+                &format!("-- no-transaction\n{sql}"),
+                true,
+                &LintOptions::default(),
+            ),
+        ] {
+            assert_eq!(
+                only(&findings, Rule::MissingLockTimeout).len(),
+                1,
+                "{findings:?}"
             );
         }
     }
@@ -2278,11 +2400,157 @@ mod tests {
 
     #[test]
     fn missing_lock_timeout_ignores_share_update_exclusive_subcommands() {
-        let findings = second("ALTER TABLE users VALIDATE CONSTRAINT users_email_nn;");
+        for sql in [
+            "ALTER TABLE users VALIDATE CONSTRAINT users_email_nn;",
+            "ALTER TABLE users ALTER COLUMN email SET STATISTICS 100;",
+            "ALTER TABLE users ALTER COLUMN email SET (n_distinct = 100);",
+            "ALTER TABLE users ALTER COLUMN email RESET (n_distinct);",
+            "ALTER TABLE users CLUSTER ON users_email_idx;",
+            "ALTER TABLE users SET WITHOUT CLUSTER;",
+            "ALTER TABLE users SET (fillfactor = 70);",
+            "ALTER TABLE users RESET (fillfactor);",
+        ] {
+            let findings = second(sql);
+            assert!(
+                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_lock_timeout_reports_access_exclusive_storage_options() {
+        let findings = second("ALTER TABLE users SET (user_catalog_table = true);");
+        assert_eq!(
+            only(&findings, Rule::MissingLockTimeout).len(),
+            1,
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_honors_the_lock_table_mode() {
+        for mode in [
+            "ACCESS SHARE",
+            "ROW SHARE",
+            "ROW EXCLUSIVE",
+            "SHARE UPDATE EXCLUSIVE",
+        ] {
+            let sql = format!("LOCK TABLE users IN {mode} MODE;");
+            let findings = second(&sql);
+            assert!(
+                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+        for mode in [
+            "SHARE",
+            "SHARE ROW EXCLUSIVE",
+            "EXCLUSIVE",
+            "ACCESS EXCLUSIVE",
+        ] {
+            let sql = format!("LOCK TABLE users IN {mode} MODE;");
+            let findings = second(&sql);
+            let found = only(&findings, Rule::MissingLockTimeout);
+            assert_eq!(found.len(), 1, "{sql}: {findings:?}");
+            assert!(
+                found[0]
+                    .finding
+                    .message
+                    .starts_with("LOCK TABLE waits for a lock on public.users"),
+                "{sql}: {found:?}"
+            );
+        }
+    }
+
+    const PARTITIONED: &str = r#"
+        CREATE TABLE measurements (id integer, at timestamp) PARTITION BY RANGE (id);
+        CREATE TABLE measurements_1 PARTITION OF measurements FOR VALUES FROM (0) TO (100);
+        CREATE TABLE measurements_new (id integer, at timestamp);
+    "#;
+
+    #[test]
+    fn missing_lock_timeout_reports_an_attached_partition() {
+        let text = "ALTER TABLE measurements ATTACH PARTITION measurements_new \
+                    FOR VALUES FROM (100) TO (200);";
+        let findings = lint(
+            &[
+                ("001_base.sql", PARTITIONED, MigrationLint::All),
+                ("002_attach.sql", text, MigrationLint::All),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::MissingLockTimeout);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "ALTER TABLE waits for a lock on public.measurements_new with no lock_timeout: \
+             queued behind a long transaction, it blocks every query on the table"
+        );
+        assert_eq!(
+            &text[found[0].finding.span.clone()],
+            "ALTER TABLE measurements ATTACH PARTITION measurements_new \
+             FOR VALUES FROM (100) TO (200)"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_reports_a_detached_partition() {
+        let text = "ALTER TABLE measurements DETACH PARTITION measurements_1;";
+        let findings = lint(
+            &[
+                ("001_base.sql", PARTITIONED, MigrationLint::All),
+                ("002_detach.sql", text, MigrationLint::All),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::MissingLockTimeout);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "ALTER TABLE waits for a lock on public.measurements with no lock_timeout: \
+             queued behind a long transaction, it blocks every query on the table"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_ignores_a_concurrent_detach() {
+        let findings = lint(
+            &[
+                ("001_base.sql", PARTITIONED, MigrationLint::All),
+                (
+                    "002_detach.sql",
+                    "ALTER TABLE measurements DETACH PARTITION measurements_1 CONCURRENTLY;",
+                    MigrationLint::All,
+                ),
+            ],
+            false,
+            &LintOptions::default(),
+        );
         assert!(
             only(&findings, Rule::MissingLockTimeout).is_empty(),
             "{findings:?}"
         );
+    }
+
+    #[test]
+    fn missing_lock_timeout_ignores_a_detach_finalize() {
+        let parsed = typedpg_pg_query::parse(
+            "ALTER TABLE measurements DETACH PARTITION measurements_1 FINALIZE",
+        )
+        .unwrap();
+        let node = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|stmt| stmt.node.as_ref())
+            .unwrap();
+        let N::AlterTableStmt(alter) = node else {
+            panic!("expected ALTER TABLE");
+        };
+        let command = alter.cmds.first().and_then(alter_command).unwrap();
+        assert!(only_share_update_exclusive(command), "{command:?}");
     }
 
     #[test]
@@ -2602,6 +2870,57 @@ mod tests {
             1,
             "{findings:?}"
         );
+    }
+
+    #[test]
+    fn opinion_rules_keep_the_original_creator_when_create_table_if_not_exists_is_a_no_op() {
+        let base = "CREATE TABLE names (id integer PRIMARY KEY, at timestamp, short varchar(10));";
+        let no_op = "-- typedpg-lint: allow(prefer_timestamptz, prefer_text, prefer_bigint_pk)\n\
+                     CREATE TABLE IF NOT EXISTS names (
+                         id integer PRIMARY KEY,
+                         at timestamp,
+                         short varchar(10)
+                     );";
+        let rules = [
+            Rule::PreferTimestamptz,
+            Rule::PreferText,
+            Rule::PreferBigintPk,
+        ];
+        let findings = lint(
+            &[
+                ("001_base.sql", base, MigrationLint::All),
+                ("002_noop.sql", no_op, MigrationLint::All),
+            ],
+            true,
+            &opinion_options(&rules),
+        );
+        for rule in rules {
+            let found = only(&findings, rule);
+            assert_eq!(found.len(), 1, "{rule}: {findings:?}");
+            assert_eq!(found[0].file, 0, "{rule}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn opinion_rules_keep_the_original_creator_when_create_table_as_if_not_exists_is_a_no_op() {
+        let base = "CREATE TABLE copies (at timestamp, short varchar(10));";
+        let no_op = "-- typedpg-lint: allow(prefer_timestamptz, prefer_text)\n\
+                     CREATE TABLE IF NOT EXISTS copies AS
+                         SELECT now()::timestamp AS at, 'x'::varchar(10) AS short;";
+        let rules = [Rule::PreferTimestamptz, Rule::PreferText];
+        let findings = lint(
+            &[
+                ("001_base.sql", base, MigrationLint::All),
+                ("002_noop.sql", no_op, MigrationLint::All),
+            ],
+            true,
+            &opinion_options(&rules),
+        );
+        for rule in rules {
+            let found = only(&findings, rule);
+            assert_eq!(found.len(), 1, "{rule}: {findings:?}");
+            assert_eq!(found[0].file, 0, "{rule}: {findings:?}");
+        }
     }
 
     #[test]
