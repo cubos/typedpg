@@ -549,6 +549,7 @@ npx typedpg gen            # write the generated modules
 npx typedpg gen --watch    # and keep them up to date
 npx typedpg check          # in CI: fail if a module is stale or a query has an error
 npx typedpg lint           # run the lint rules over every query and migration
+npx typedpg lint --fix     # apply the findings' SQL fixes, then lint again
 npx typedpg build          # compile the .sql files into the loaders' cache
 ```
 
@@ -604,6 +605,11 @@ The schema rules still report the current schema's problems, placed on the
 statement that created the object, with a help line that puts the fix in a new
 migration; their allow comments are honored and validated. A file absent from
 the ref, or changed by the branch, is linted as usual; queries are unaffected.
+`--fix` writes the SQL fixes findings carry (the ones that have them; migration
+findings never do) into the sources and `.sql` files, then lints again and
+reports what remains. A finding's edits are applied all or none, one
+overlapping an edit already accepted is skipped, and a file that changed while
+linting is not fixed.
 `--format json` prints one JSON document (findings, failures and the summary)
 and `--format sarif` prints SARIF 2.1.0 for code scanning; both include the
 analysis failures, which the human format keeps on stderr.

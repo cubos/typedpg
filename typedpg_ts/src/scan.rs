@@ -78,6 +78,9 @@ pub struct Literal {
     /// The contents as written, escapes undecoded.
     pub raw: String,
     pub template: bool,
+    /// The quote the literal is written with: `'`, `"` or a template's
+    /// backtick.
+    pub quote: char,
 }
 
 impl Literal {
@@ -85,6 +88,42 @@ impl Literal {
     /// the literal's value.
     pub fn source_offset(&self, offset: usize) -> usize {
         self.content_start + cooked_to_raw(&self.raw, self.template, offset)
+    }
+
+    /// `text` escaped so that writing it into this literal gives back
+    /// `text`: a template literal escapes `\`, a backtick and `${`; a quoted
+    /// string escapes `\`, its quote and line breaks. `None` when the
+    /// literal is neither a template nor a quoted string.
+    pub fn escape_replacement(&self, text: &str) -> Option<String> {
+        let mut out = String::with_capacity(text.len());
+        if self.template {
+            let mut chars = text.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '`' => out.push_str("\\`"),
+                    '\r' => out.push_str("\\r"),
+                    '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
+                    c => out.push(c),
+                }
+            }
+        } else if self.quote == '\'' || self.quote == '"' {
+            for c in text.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    c if c == self.quote => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c => out.push(c),
+                }
+            }
+        } else {
+            return None;
+        }
+        Some(out)
     }
 }
 
@@ -449,18 +488,23 @@ impl Finder<'_, '_> {
                 self.diagnostic(s.span.start, LONE_SURROGATE);
                 None
             }
-            [Argument::StringLiteral(s)] => Some((
-                s.value.as_str().unwrap_or_default().to_owned(),
-                s.span.start,
-                Literal {
-                    content_start: s.span.start as usize + 1,
-                    raw: s.raw.map_or_else(String::new, |r| {
-                        let r = r.as_str();
-                        r[1..r.len() - 1].to_owned()
-                    }),
-                    template: false,
-                },
-            )),
+            [Argument::StringLiteral(s)] => {
+                let raw = s.raw.map_or_else(String::new, |r| r.as_str().to_owned());
+                let quote = raw.chars().next().unwrap_or('"');
+                Some((
+                    s.value.as_str().unwrap_or_default().to_owned(),
+                    s.span.start,
+                    Literal {
+                        content_start: s.span.start as usize + 1,
+                        raw: raw
+                            .get(1..raw.len().saturating_sub(1))
+                            .unwrap_or_default()
+                            .to_owned(),
+                        template: false,
+                        quote,
+                    },
+                ))
+            }
             [Argument::TemplateLiteral(t)] if t.expressions.is_empty() => {
                 let quasi = &t.quasis[0];
                 match quasi.value.cooked.map(|c| c.as_str()) {
@@ -475,6 +519,7 @@ impl Finder<'_, '_> {
                             content_start: quasi.span.start as usize,
                             raw: quasi.value.raw.as_str().to_owned(),
                             template: true,
+                            quote: '`',
                         },
                     )),
                     None => {
@@ -573,27 +618,56 @@ fn escape(s: &str) -> (usize, usize) {
             Some(cp) => (3, utf8_len(cp)),
             None => (1, 1),
         },
-        'u' if s[1..].starts_with('{') => match s[2..].find('}') {
-            Some(end) => {
-                let cp = u32::from_str_radix(&s[2..2 + end], 16).unwrap_or(0xFFFD);
-                (3 + end, utf8_len(cp))
+        // `\uXXXX` or `\u{…}`: a high surrogate followed at once by a low
+        // one, in either spelling, is one 4-byte character.
+        'u' => match unicode_escape(s) {
+            Some((len, hi @ 0xD800..=0xDBFF)) => {
+                // Line continuations between the halves produce nothing.
+                let gap = line_continuations(&s[len..]);
+                match s[len + gap..].strip_prefix('\\').and_then(unicode_escape) {
+                    Some((lo_len, 0xDC00..=0xDFFF)) => (len + gap + 1 + lo_len, 4),
+                    _ => (len, utf8_len(hi)),
+                }
             }
-            None => (1, 1),
-        },
-        'u' => match hex(&s[1..], 4) {
-            // A surrogate pair (`😀`) is one 4-byte character.
-            Some(hi @ 0xD800..=0xDBFF)
-                if s[5..].starts_with("\\u")
-                    && hex(&s[7..], 4).is_some_and(|lo| (0xDC00..=0xDFFF).contains(&lo)) =>
-            {
-                let _ = hi;
-                (11, 4)
-            }
-            Some(cp) => (5, utf8_len(cp)),
+            Some((len, cp)) => (len, utf8_len(cp)),
             None => (1, 1),
         },
         c => (c.len_utf8(), c.len_utf8()),
     }
+}
+
+/// How many bytes of line continuations (`\` and a line terminator) `s`
+/// starts with.
+fn line_continuations(s: &str) -> usize {
+    let mut at = 0;
+    while let Some(rest) = s[at..].strip_prefix('\\') {
+        let len = if rest.starts_with("\r\n") {
+            2
+        } else {
+            match rest.chars().next() {
+                Some(c @ ('\n' | '\r' | '\u{2028}' | '\u{2029}')) => c.len_utf8(),
+                _ => break,
+            }
+        };
+        at += 1 + len;
+    }
+    at
+}
+
+/// A `\u` escape at the start of `s` (after its backslash, so `s` starts
+/// with `u`): how many bytes it spans and the code unit or point it names.
+fn unicode_escape(s: &str) -> Option<(usize, u32)> {
+    let rest = s.strip_prefix('u')?;
+    if let Some(braced) = rest.strip_prefix('{') {
+        let end = braced.find('}')?;
+        let cp = u32::from_str_radix(&braced[..end], 16).unwrap_or(0xFFFD);
+        return Some((3 + end, cp));
+    }
+    let digits = rest.get(..4)?;
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((5, u32::from_str_radix(digits, 16).ok()?))
 }
 
 /// Byte offset → line / column.
@@ -728,6 +802,25 @@ sql('SELECT 1');
     }
 
     #[test]
+    fn surrogate_pairs_map_as_one_character_in_every_spelling() {
+        // Each spelling of 😀 cooks to four bytes; the next byte is ` AS`.
+        for raw in [
+            r"'\u{D83D}\u{DE00}' AS emoji",
+            r"'\uD83D\uDE00' AS emoji",
+            r"'\u{D83D}\uDE00' AS emoji",
+            r"'\uD83D\u{DE00}' AS emoji",
+            r"'\u{1F600}' AS emoji",
+            "'\\u{D83D}\\\n\\u{DE00}' AS emoji",
+            "'\\uD83D\\\r\n\\\n\\uDE00' AS emoji",
+        ] {
+            let cooked = "'😀' AS emoji";
+            let at = cooked.find(" AS").unwrap();
+            let mapped = cooked_to_raw(raw, false, at);
+            assert_eq!(&raw[mapped..], " AS emoji", "{raw}");
+        }
+    }
+
+    #[test]
     fn lone_surrogates_are_reported() {
         // A pair is one character; an unpaired half is not UTF-8.
         let s = run(r#"
@@ -843,5 +936,33 @@ export const local = 1;
         let at = q.literal.source_offset(q.text.find("nmae").unwrap());
         assert_eq!(&src[at..at + 4], "nmae");
         assert_eq!(s.lines.position(at), Position { line: 3, col: 11 });
+    }
+
+    #[test]
+    fn a_fix_replacement_is_escaped_for_its_literal() {
+        let s = run("import { sql } from './db';\nsql(`SELECT 1`);\n");
+        assert_eq!(
+            s.queries[0]
+                .literal
+                .escape_replacement("a`b${c}\\d")
+                .unwrap(),
+            "a\\`b\\${c}\\\\d"
+        );
+        let s = run("import { sql } from './db';\nsql('SELECT 1');\n");
+        assert_eq!(
+            s.queries[0]
+                .literal
+                .escape_replacement("a'b\\c\nd")
+                .unwrap(),
+            "a\\'b\\\\c\\nd"
+        );
+        let s = run("import { sql } from './db';\nsql(\"SELECT 1\");\n");
+        assert_eq!(
+            s.queries[0]
+                .literal
+                .escape_replacement("say \"hi\"")
+                .unwrap(),
+            "say \\\"hi\\\""
+        );
     }
 }

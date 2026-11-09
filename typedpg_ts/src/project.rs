@@ -7,12 +7,13 @@
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 use typedpg_analyzer::PgCatalog;
 use typedpg_core::QualifiedName;
-use typedpg_lint::MigrationLint;
+use typedpg_lint::{MigrationLint, SqlEdit};
 
 use crate::config::{
     Config, DatabaseConfig, Emit, OutKind, OverrideModule, declaration_path, out_kind,
@@ -171,6 +172,28 @@ impl QuerySource<'_> {
             QuerySource::Literal(literal) => literal.source_offset(offset),
             QuerySource::File { start } => start + offset,
         }
+    }
+
+    /// The file edits that apply a query finding's SQL fix: each range mapped
+    /// into the file, the replacement escaped for the literal it lands in.
+    /// `None` when the finding has no fix, or a replacement can't be written
+    /// into the literal.
+    pub fn fix_edits(&self, fix: &[SqlEdit]) -> Option<Vec<(Range<usize>, String)>> {
+        if fix.is_empty() {
+            return None;
+        }
+        let mut edits = Vec::with_capacity(fix.len());
+        for edit in fix {
+            let text = match self {
+                QuerySource::Literal(literal) => literal.escape_replacement(&edit.text)?,
+                QuerySource::File { .. } => edit.text.clone(),
+            };
+            edits.push((
+                self.offset(edit.range.start)..self.offset(edit.range.end),
+                text,
+            ));
+        }
+        Some(edits)
     }
 }
 
