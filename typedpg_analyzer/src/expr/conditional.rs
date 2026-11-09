@@ -243,6 +243,34 @@ pub(crate) fn infer_coalesce(
         }
     }
 
+    // Record what the lint's `redundant_null_check` rule reads: each
+    // argument's own nullability (the coercion to the common type included —
+    // it may map a value to NULL), and whether every argument keeps the
+    // common type, which the fix that drops unused arguments requires. An
+    // untyped literal (`COALESCE(name, '')`) takes whatever type the others
+    // resolve to, so dropping it never changes the result type; a domain
+    // argument next to one resolves to the base type and doesn't match.
+    let args_nullable: Vec<bool> = expr
+        .args
+        .iter()
+        .zip(&args)
+        .map(|(arg, t)| match arg.node.as_ref() {
+            // A bare parameter is nullable unless annotated (see above).
+            Some(node::Node::ParamRef(p)) => params.is_nullable(p.number),
+            // So is a parameter anywhere in the argument: the caller may
+            // pass NULL whatever the argument's own inference says.
+            _ => t.nullable || has_param_ref(arg),
+        })
+        .collect();
+    let args_typed_as_result: Vec<bool> = args.iter().map(|t| t.type_oid == type_oid).collect();
+    crate::pg_catalog::note_coalesce_fact(
+        expr.location,
+        &args_nullable,
+        &args_typed_as_result,
+        args.iter()
+            .all(|t| t.type_oid == type_oid || t.type_oid == oid::UNKNOWN),
+    );
+
     let branches: Vec<(&protobuf::Node, &ExprType)> = expr.args.iter().zip(&args).collect();
     let typmod = agreed_typmod(&args, type_oid);
     ctx.note_strict(

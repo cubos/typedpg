@@ -1470,9 +1470,12 @@ impl PgCatalog {
     /// wrote rather than one a simplification rewrote.
     pub fn query_view(&self, sql: &str) -> Result<QueryView, LocatedError> {
         crate::diagnostic::clear_last_primary();
-        let ((analysis, result), sublink_nullability) = collecting_sublink_nullability(|| {
-            crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
-        });
+        let (((analysis, result), sublink_nullability), null_test_arg_nullable, coalesce_facts) =
+            collecting_null_check_facts(|| {
+                collecting_sublink_nullability(|| {
+                    crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+                })
+            });
         let analyzed = result.map_err(LocatedError::new)?;
         let tree = analysis.tree.map(|tree| tree.protobuf).ok_or_else(|| {
             LocatedError::new(AnalyzeError::Internal(format!(
@@ -1486,6 +1489,8 @@ impl PgCatalog {
             analyzed,
             lex: analysis.lex,
             sublink_nullability,
+            null_test_arg_nullable,
+            coalesce_facts,
         })
     }
 
@@ -2516,6 +2521,21 @@ pub struct SublinkNullability {
     pub subquery_nullable: bool,
 }
 
+/// What the analyzer proved about one `COALESCE` call (the `location` is an
+/// offset in [`QueryView::sql`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoalesceFact {
+    /// Per argument, in order: whether it may be NULL.
+    pub args_nullable: Vec<bool>,
+    /// Whether every argument's resolved type is the `COALESCE`'s result
+    /// type or an untyped literal, so dropping arguments keeps the result
+    /// type as long as one kept argument has it.
+    pub args_share_result_type: bool,
+    /// Per argument: whether its resolved type is exactly the result type
+    /// (an untyped literal is not).
+    pub args_typed_as_result: Vec<bool>,
+}
+
 thread_local! {
     /// Set while [`PgCatalog::query_view`] analyzes a query: the sublink
     /// nullability facts it records. A plain [`PgCatalog::analyze`] leaves
@@ -2523,6 +2543,15 @@ thread_local! {
     static SUBLINK_NULLABILITY: std::cell::RefCell<
         Option<HashMap<i32, SublinkNullability>>,
     > = const { std::cell::RefCell::new(None) };
+    /// Set while [`PgCatalog::query_view`] analyzes a query: whether the
+    /// argument of each `IS [NOT] NULL` test may be NULL, by the test's
+    /// location. `None` outside `query_view`, like [`SUBLINK_NULLABILITY`].
+    static NULL_TEST_ARG_NULLABLE: std::cell::RefCell<Option<HashMap<i32, bool>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set while [`PgCatalog::query_view`] analyzes a query: the facts of
+    /// each `COALESCE` call, by its location. `None` outside `query_view`.
+    static COALESCE_FACTS: std::cell::RefCell<Option<HashMap<i32, CoalesceFact>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f`, collecting the sublink nullability facts it records.
@@ -2535,6 +2564,24 @@ fn collecting_sublink_nullability<R>(
         .with(|facts| facts.replace(before))
         .unwrap_or_default();
     (out, collected)
+}
+
+/// Run `f`, collecting the `redundant_null_check` facts it records: per
+/// `NullTest` location whether its argument may be NULL, and per `COALESCE`
+/// location what its arguments are.
+fn collecting_null_check_facts<R>(
+    f: impl FnOnce() -> R,
+) -> (R, HashMap<i32, bool>, HashMap<i32, CoalesceFact>) {
+    let before_null = NULL_TEST_ARG_NULLABLE.with(|facts| facts.replace(Some(HashMap::new())));
+    let before_coalesce = COALESCE_FACTS.with(|facts| facts.replace(Some(HashMap::new())));
+    let out = f();
+    let null_test = NULL_TEST_ARG_NULLABLE
+        .with(|facts| facts.replace(before_null))
+        .unwrap_or_default();
+    let coalesce = COALESCE_FACTS
+        .with(|facts| facts.replace(before_coalesce))
+        .unwrap_or_default();
+    (out, null_test, coalesce)
 }
 
 /// Record what an `= ANY` / `IN` sublink at `location` compared, merging
@@ -2552,6 +2599,66 @@ pub(crate) fn note_sublink_nullability(location: i32, lhs_nullable: bool, subque
             });
             fact.lhs_nullable |= lhs_nullable;
             fact.subquery_nullable |= subquery_nullable;
+        }
+    });
+}
+
+/// Record whether the argument of the `IS [NOT] NULL` test at `location`
+/// may be NULL, OR-merged with a fact already recorded there (a site may be
+/// inferred more than once).
+pub(crate) fn note_null_test_arg_nullable(location: i32, nullable: bool) {
+    if location < 0 {
+        return;
+    }
+    NULL_TEST_ARG_NULLABLE.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.entry(location).or_insert(false) |= nullable;
+        }
+    });
+}
+
+/// Record the facts of the `COALESCE` at `location`, merging with any
+/// already recorded for it: argument nullability OR-merged per index, the
+/// shared result type AND-merged.
+pub(crate) fn note_coalesce_fact(
+    location: i32,
+    args_nullable: &[bool],
+    args_typed_as_result: &[bool],
+    args_share_result_type: bool,
+) {
+    if location < 0 {
+        return;
+    }
+    COALESCE_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            match facts.entry(location) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let fact = entry.get_mut();
+                    if fact.args_nullable.len() != args_nullable.len() {
+                        // One node has one argument list; keep the first
+                        // fact if a different one was ever inferred.
+                        return;
+                    }
+                    for (recorded, nullable) in fact.args_nullable.iter_mut().zip(args_nullable) {
+                        *recorded |= *nullable;
+                    }
+                    for (recorded, typed) in fact
+                        .args_typed_as_result
+                        .iter_mut()
+                        .zip(args_typed_as_result)
+                    {
+                        *recorded &= *typed;
+                    }
+                    fact.args_share_result_type &= args_share_result_type;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(CoalesceFact {
+                        args_nullable: args_nullable.to_vec(),
+                        args_typed_as_result: args_typed_as_result.to_vec(),
+                        args_share_result_type,
+                    });
+                }
+            }
         }
     });
 }
@@ -2575,6 +2682,11 @@ pub struct QueryView {
     /// What the analyzer proved about each `= ANY` / `IN` sublink, by its
     /// location in [`Self::sql`].
     sublink_nullability: HashMap<i32, SublinkNullability>,
+    /// Whether the argument of each `IS [NOT] NULL` test may be NULL, by the
+    /// test's location in [`Self::sql`].
+    null_test_arg_nullable: HashMap<i32, bool>,
+    /// The facts of each `COALESCE` call, by its location in [`Self::sql`].
+    coalesce_facts: HashMap<i32, CoalesceFact>,
 }
 
 impl QueryView {
@@ -2584,6 +2696,20 @@ impl QueryView {
     /// `None` when no such sublink was inferred there.
     pub fn sublink_nullability(&self, location: i32) -> Option<SublinkNullability> {
         self.sublink_nullability.get(&location).copied()
+    }
+
+    /// Whether the argument of the `IS [NOT] NULL` test at `location` (a
+    /// byte offset in [`Self::sql`]) may be NULL. `None` when no such test
+    /// was inferred there, or when its argument is a row / composite value
+    /// (whose `IS NULL` semantics differ).
+    pub fn null_test_arg_nullable(&self, location: i32) -> Option<bool> {
+        self.null_test_arg_nullable.get(&location).copied()
+    }
+
+    /// The facts of the `COALESCE` call at `location` (a byte offset in
+    /// [`Self::sql`]), or `None` when none was inferred there.
+    pub fn coalesce_fact(&self, location: i32) -> Option<CoalesceFact> {
+        self.coalesce_facts.get(&location).cloned()
     }
 
     /// The byte offset in the original query text of `offset_in_sql`, a
