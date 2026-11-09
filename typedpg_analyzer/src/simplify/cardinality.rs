@@ -383,26 +383,34 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
             })
             .collect();
     }
+    // Columns are matched to the CTE's alias list by position, so a target
+    // whose columns can't all be listed makes the whole list unknown (an
+    // empty list: no column of the CTE takes part in a key equality).
     let scope = Scope::build_env(ctx, env, &select.from_clause);
     let mut out = Vec::new();
     for target in &select.target_list {
         let Some(Node::ResTarget(target)) = &target.node else {
-            continue;
+            return Vec::new();
         };
         let Some(value) = target.val.as_deref() else {
-            continue;
+            return Vec::new();
         };
         if let Some(Node::ColumnRef(column)) = &value.node
             && let Fields::Star(qualifier) = dedup::column_ref_fields(column)
         {
             let Some(scope) = scope.as_ref() else {
-                continue;
+                return Vec::new();
             };
             let rels: Vec<usize> = match qualifier {
-                // A bare `*` merges USING columns: leave it out then.
-                None if scope.joins.iter().any(|join| !join.using.is_empty()) => Vec::new(),
+                // A bare `*` merges USING columns: its columns aren't listed.
+                None if scope.joins.iter().any(|join| !join.using.is_empty()) => {
+                    return Vec::new();
+                }
                 None => (0..scope.rels.len()).collect(),
-                Some(qualifier) => scope.rel_named(&qualifier).into_iter().collect(),
+                Some(qualifier) => match scope.rel_named(&qualifier) {
+                    Some(r) => vec![r],
+                    None => return Vec::new(),
+                },
             };
             for r in rels {
                 for (name, attnum) in &scope.rels[r].columns {
@@ -450,14 +458,20 @@ fn returning_columns(
     let (Some(relation), Some(returning)) = (relation, returning) else {
         return Vec::new();
     };
+    // As in `select_output_columns`: a target whose columns can't all be
+    // listed, by position, makes the whole list unknown.
+    if !returning.options.is_empty() {
+        // `RETURNING WITH (OLD AS o, NEW AS n)` renames the row references.
+        return Vec::new();
+    }
     let scope = Scope::dml(ctx, env, relation, from);
     let mut out = Vec::new();
     for target in &returning.exprs {
         let Some(Node::ResTarget(target)) = &target.node else {
-            continue;
+            return Vec::new();
         };
         let Some(value) = target.val.as_deref() else {
-            continue;
+            return Vec::new();
         };
         if let Some(Node::ColumnRef(column)) = &value.node
             && let Some(qualifier) = star_ref(column)
@@ -469,7 +483,7 @@ fn returning_columns(
                 None => from.is_empty(),
             };
             let Some(scope) = &scope else {
-                continue;
+                return Vec::new();
             };
             if target_star {
                 for (name, attnum) in &scope.rels[0].columns {
@@ -487,7 +501,10 @@ fn returning_columns(
             } else {
                 // Whose columns the star expands, with every type unknown.
                 let rels: Vec<usize> = match qualifier {
-                    Some(qualifier) => scope.rel_named(qualifier).into_iter().collect(),
+                    Some(qualifier) => match scope.rel_named(qualifier) {
+                        Some(r) => vec![r],
+                        None => return Vec::new(),
+                    },
                     None => (0..scope.rels.len()).collect(),
                 };
                 for r in rels {
@@ -1660,6 +1677,29 @@ mod tests {
         assert!(!statement_one(
             &db,
             "SELECT u.name FROM users u JOIN orgs o ON o.id = u.org_id WHERE u.id = $1 FOR UPDATE"
+        ));
+    }
+
+    #[test]
+    fn a_cte_whose_columns_cant_all_be_listed_types_none_of_them() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE fdst (v float8);
+             CREATE TABLE bids (id bigint PRIMARY KEY);",
+        )
+        .unwrap();
+        // `n.*` names NEW under another alias: `k` must not take the type
+        // of the column after it (two bigints can equal one float8).
+        assert!(!statement_one(
+            &db,
+            "WITH r(k) AS (INSERT INTO fdst VALUES (9007199254740992) \
+             RETURNING WITH (NEW AS n) n.*, 1 AS tail) \
+             SELECT bids.id FROM r JOIN bids ON bids.id = r.k"
+        ));
+        assert!(!statement_one(
+            &db,
+            "WITH r(k) AS (INSERT INTO fdst VALUES (9007199254740992) RETURNING old.*, 1 AS tail) \
+             SELECT bids.id FROM r JOIN bids ON bids.id = r.k"
         ));
     }
 
