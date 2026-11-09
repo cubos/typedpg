@@ -95,6 +95,7 @@ pub const INTERNAL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(12);
 pub const C_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(13);
 pub const SQL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(14);
 
+mod lint_access;
 mod shared;
 pub use shared::Shared;
 mod pg_query_catalog;

@@ -10,13 +10,13 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use typedpg_analyzer::{
-    ConType, DdlError, MigrationObserver, MigrationStatement, PgCatalog, PgClassOid,
-    PgConstraintOid, PgIndex, RelKind,
+    ConType, DdlError, MigrationObserver, MigrationStatement, PgAttribute, PgCatalog, PgClass,
+    PgClassOid, PgConstraintOid, PgIndex, PgTypeOid, RelKind, TypCategory,
 };
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::protobuf::{
-    AlterTableType, BoolExprType, ConstrType, Node, NullTestType, SortByDir, SortByNulls,
-    node::Node as N,
+    AlterTableType, BoolExprType, ConstrType, Node, NullTestType, ObjectType, SortByDir,
+    SortByNulls, VariableSetKind, a_const::Val, node::Node as N,
 };
 
 use crate::{AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment};
@@ -89,8 +89,11 @@ pub fn lint_migrations(
         findings: Vec::new(),
         created_indexes: HashMap::new(),
         created_constraints: HashMap::new(),
+        column_creators: HashMap::new(),
         before_indexes: HashSet::new(),
         before_constraints: HashSet::new(),
+        before_relation: None,
+        before_columns: HashSet::new(),
         orderings: HashMap::new(),
         comments: Vec::new(),
         used_comments: HashSet::new(),
@@ -98,6 +101,9 @@ pub fn lint_migrations(
         current_suppressed: HashSet::new(),
         current_span: 0..0,
         last_statement_end: 0,
+        use_transaction,
+        lock_timeout_set: false,
+        lock_timeout_reported: false,
     };
     for (file, migration) in files.iter().enumerate() {
         linter.begin_file(file, &catalog);
@@ -146,6 +152,7 @@ struct Creator {
 enum CreatedObject {
     Constraint(PgConstraintOid),
     Index(PgClassOid),
+    Column(PgClassOid, i16),
 }
 
 /// A schema rule's finding, before it is placed on its creator's statement.
@@ -166,8 +173,16 @@ struct MigrationLinter<'a> {
     findings: Vec<MigrationFinding>,
     created_indexes: HashMap<PgClassOid, Creator>,
     created_constraints: HashMap<PgConstraintOid, Creator>,
+    /// For each column of a table, the last statement that gave it its
+    /// current type: `CREATE TABLE`, `ADD COLUMN` or `ALTER COLUMN TYPE`.
+    column_creators: HashMap<(PgClassOid, i16), Creator>,
     before_indexes: HashSet<PgClassOid>,
     before_constraints: HashSet<PgConstraintOid>,
+    /// The columns of the relation an `ALTER TABLE` targets, before that
+    /// statement: an `ADD COLUMN IF NOT EXISTS` that skipped an existing one
+    /// defines no new type.
+    before_relation: Option<PgClassOid>,
+    before_columns: HashSet<i16>,
     /// Each index's key columns' order, `(descending, nulls first)`, from
     /// the `CREATE INDEX` that made it (the catalog keeps no `indoption`).
     /// An index a constraint or `CREATE TABLE` made has none: ascending,
@@ -182,25 +197,30 @@ struct MigrationLinter<'a> {
     /// two lead into this one even when the parser's `stmt_location` starts
     /// at its first token.
     last_statement_end: usize,
+    /// The database runner's setting, which decides whether a file is
+    /// wrapped in a transaction (`used_transaction` also checks the file's
+    /// `-- no-transaction` marker).
+    use_transaction: bool,
+    /// Whether an earlier statement of the current file set `lock_timeout`
+    /// to a non-zero value.
+    lock_timeout_set: bool,
+    /// Whether `missing_lock_timeout` already reported a statement of the
+    /// current file: at most one finding per file.
+    lock_timeout_reported: bool,
 }
 
 impl MigrationLinter<'_> {
     fn begin_file(&mut self, file: usize, catalog: &PgCatalog) {
         self.current = file;
-        self.pre_existing = catalog
-            .iter_classes()
-            .filter(|class| {
-                matches!(
-                    class.relkind,
-                    RelKind::Table | RelKind::Partitioned | RelKind::ForeignTable
-                )
-            })
-            .map(|class| class.oid)
-            .collect();
+        // Every relation, not just the tables: the lock rule also looks at
+        // indexes (`DROP INDEX`) and materialized views (`REFRESH`).
+        self.pre_existing = catalog.iter_classes().map(|class| class.oid).collect();
         self.comments = comments(&self.files[file].sql);
         self.used_comments.clear();
         self.reported_comments.clear();
         self.last_statement_end = 0;
+        self.lock_timeout_set = false;
+        self.lock_timeout_reported = false;
     }
 
     /// Report the invalid allow comments of a file whose statements never
@@ -371,6 +391,7 @@ impl MigrationLinter<'_> {
             Rule::ConstraintValidating,
             Rule::SetNotNullScan,
             Rule::TableRewrite,
+            Rule::MissingLockTimeout,
         ] {
             if self.options.level(rule).is_none() || self.current_suppressed.contains(&rule) {
                 continue;
@@ -391,6 +412,7 @@ impl MigrationLinter<'_> {
                 (Rule::TableRewrite, N::AlterTableStmt(alter)) => {
                     self.table_rewrite(catalog, alter)
                 }
+                (Rule::MissingLockTimeout, _) => self.missing_lock_timeout(catalog, statement.node),
                 _ => Vec::new(),
             };
             for raw in findings {
@@ -685,12 +707,171 @@ impl MigrationLinter<'_> {
         }
     }
 
+    fn missing_lock_timeout(&mut self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
+        // A `SET`/`RESET` of the setting changes it for the statements that
+        // follow, whether or not it is this rule's finding.
+        if let N::VariableSetStmt(set) = node
+            && let Some(nonzero) = lock_timeout_setting(set)
+        {
+            self.lock_timeout_set = nonzero;
+        }
+        if self.lock_timeout_set || self.lock_timeout_reported {
+            return Vec::new();
+        }
+        let Some((kind, relid)) = lock_target(catalog, &self.pre_existing, node) else {
+            return Vec::new();
+        };
+        let Some(class) = catalog.class_row(relid) else {
+            return Vec::new();
+        };
+        self.lock_timeout_reported = true;
+        let table = qualified_name(catalog, class);
+        let help = if self.file_runs_in_transaction() {
+            "start the migration with SET LOCAL lock_timeout = '5s' and retry on timeout"
+        } else {
+            "start the migration with SET lock_timeout = '5s' and retry on timeout"
+        };
+        vec![RawFinding {
+            span: 0..0,
+            message: format!(
+                "{kind} waits for a lock on {table} with no lock_timeout: queued behind a long \
+                 transaction, it blocks every query on the table"
+            ),
+            help: Some(help.to_owned()),
+            fix: Vec::new(),
+        }]
+    }
+
+    /// Whether the current file runs inside the runner's transaction.
+    fn file_runs_in_transaction(&self) -> bool {
+        self.use_transaction
+            && !typedpg_core::migration_marker::has_no_transaction_marker(
+                &self.files[self.current].sql,
+            )
+    }
+
+    fn track_column_creators(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+        match statement.node {
+            N::CreateStmt(stmt) => {
+                if let Some(class) = stmt
+                    .relation
+                    .as_ref()
+                    .and_then(|relation| resolve_relation(catalog, relation))
+                {
+                    self.record_columns(catalog, class.oid);
+                }
+            }
+            // `CREATE TABLE … AS` / `SELECT … INTO` define every column of
+            // the new relation.
+            N::CreateTableAsStmt(stmt)
+                if ObjectType::try_from(stmt.objtype) == Ok(ObjectType::ObjectTable) =>
+            {
+                if let Some(class) = stmt
+                    .into
+                    .as_ref()
+                    .and_then(|into| into.rel.as_ref())
+                    .and_then(|relation| resolve_relation(catalog, relation))
+                {
+                    self.record_columns(catalog, class.oid);
+                }
+            }
+            N::AlterTableStmt(alter) => {
+                let Some(class) = alter
+                    .relation
+                    .as_ref()
+                    .and_then(|relation| resolve_relation(catalog, relation))
+                else {
+                    return;
+                };
+                for command in &alter.cmds {
+                    let Some(command) = alter_command(command) else {
+                        continue;
+                    };
+                    let (Ok(subtype), Some(def)) = (
+                        AlterTableType::try_from(command.subtype),
+                        command.def.as_deref().and_then(|def| def.node.as_ref()),
+                    ) else {
+                        continue;
+                    };
+                    match subtype {
+                        AlterTableType::AtAddColumn => {
+                            let N::ColumnDef(column) = def else {
+                                continue;
+                            };
+                            let Some(attribute) = catalog
+                                .attributes_of(class.oid)
+                                .iter()
+                                .find(|attribute| attribute.attname == column.colname)
+                            else {
+                                continue;
+                            };
+                            // `ADD COLUMN IF NOT EXISTS` on an existing
+                            // column changed no type.
+                            if self.before_relation == Some(class.oid)
+                                && self.before_columns.contains(&attribute.attnum)
+                            {
+                                continue;
+                            }
+                            self.record_column(class.oid, attribute.attnum);
+                        }
+                        AlterTableType::AtAlterColumnType => {
+                            let Some(attribute) = catalog
+                                .attributes_of(class.oid)
+                                .iter()
+                                .find(|attribute| attribute.attname == command.name)
+                            else {
+                                continue;
+                            };
+                            self.record_column(class.oid, attribute.attnum);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_columns(&mut self, catalog: &PgCatalog, relid: PgClassOid) {
+        for attribute in catalog.attributes_of(relid) {
+            if attribute.attnum > 0 {
+                self.record_column(relid, attribute.attnum);
+            }
+        }
+    }
+
+    fn record_column(&mut self, relid: PgClassOid, attnum: i16) {
+        self.column_creators.insert(
+            (relid, attnum),
+            Creator {
+                file: self.current,
+                span: self.current_span.clone(),
+                suppressed: self.current_suppressed.clone(),
+            },
+        );
+    }
+
     fn finish(&mut self, catalog: &PgCatalog) {
         self.schema_rule(catalog, Rule::FkWithoutIndex, |linter, catalog| {
             linter.fk_without_index(catalog)
         });
         self.schema_rule(catalog, Rule::RedundantIndex, |linter, catalog| {
             linter.redundant_index(catalog)
+        });
+        self.schema_rule(catalog, Rule::FkTypeMismatch, |linter, catalog| {
+            linter.fk_type_mismatch(catalog)
+        });
+        self.schema_rule(catalog, Rule::PreferTimestamptz, |linter, catalog| {
+            linter.prefer_timestamptz(catalog)
+        });
+        self.schema_rule(catalog, Rule::PreferIdentity, |linter, catalog| {
+            linter.prefer_identity(catalog)
+        });
+        self.schema_rule(catalog, Rule::PreferText, |linter, catalog| {
+            linter.prefer_text(catalog)
+        });
+        self.schema_rule(catalog, Rule::PreferBigintPk, |linter, catalog| {
+            linter.prefer_bigint_pk(catalog)
         });
     }
 
@@ -712,6 +893,7 @@ impl MigrationLinter<'_> {
             let creator = match object {
                 CreatedObject::Constraint(oid) => self.created_constraints.get(&oid),
                 CreatedObject::Index(oid) => self.created_indexes.get(&oid),
+                CreatedObject::Column(relid, attnum) => self.column_creators.get(&(relid, attnum)),
             };
             let Some(creator) = creator else {
                 continue;
@@ -819,6 +1001,241 @@ impl MigrationLinter<'_> {
         out
     }
 
+    fn fk_type_mismatch(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for constraint in catalog
+            .iter_constraints()
+            .filter(|constraint| constraint.contype == ConType::ForeignKey)
+        {
+            let Some(class) = catalog.class_row(constraint.conrelid) else {
+                continue;
+            };
+            let Some(referenced) = constraint.confrelid.and_then(|oid| catalog.class_row(oid))
+            else {
+                continue;
+            };
+            let mut mismatch = None;
+            for (&conkey, &confkey) in constraint.conkey.iter().zip(&constraint.confkey) {
+                let Some(attribute) = catalog
+                    .attributes_of(constraint.conrelid)
+                    .iter()
+                    .find(|attribute| attribute.attnum == conkey)
+                else {
+                    continue;
+                };
+                let Some(referenced_attribute) = catalog
+                    .attributes_of(referenced.oid)
+                    .iter()
+                    .find(|attribute| attribute.attnum == confkey)
+                else {
+                    continue;
+                };
+                let type_oid = base_type(catalog, attribute.atttypid);
+                let referenced_type_oid = base_type(catalog, referenced_attribute.atttypid);
+                if type_oid != referenced_type_oid {
+                    mismatch = Some((
+                        attribute,
+                        referenced_attribute,
+                        type_oid,
+                        referenced_type_oid,
+                    ));
+                    break;
+                }
+            }
+            let Some((attribute, referenced_attribute, type_oid, referenced_type_oid)) = mismatch
+            else {
+                continue;
+            };
+            let table = qualified_name(catalog, class);
+            let referenced_table = qualified_name(catalog, referenced);
+            let column = quote_identifier(&attribute.attname);
+            let referenced_column = quote_identifier(&referenced_attribute.attname);
+            let type_name = type_label(catalog, type_oid);
+            let referenced_type_name = type_label(catalog, referenced_type_oid);
+            out.push(SchemaFinding {
+                object: CreatedObject::Constraint(constraint.oid),
+                raw: RawFinding {
+                    span: 0..0,
+                    message: format!(
+                        "foreign key {} compares {table}.{column} ({type_name}) with \
+                         {referenced_table}.{referenced_column} ({referenced_type_name})",
+                        quote_identifier(&constraint.conname)
+                    ),
+                    help: Some(format!(
+                        "give {column} the type {referenced_type_name}, so the join compares \
+                         without a cast"
+                    )),
+                    fix: Vec::new(),
+                },
+                help_in_new_migration: Some(format!(
+                    "in a new migration, give {column} the type {referenced_type_name}, so the \
+                     join compares without a cast"
+                )),
+            });
+        }
+        out
+    }
+
+    fn prefer_timestamptz(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for class in reportable_tables(catalog) {
+            let table = qualified_name(catalog, class);
+            for attribute in columns(catalog, class) {
+                if !is_pg_catalog_type(
+                    catalog,
+                    inner_type(catalog, attribute.atttypid),
+                    "timestamp",
+                ) {
+                    continue;
+                }
+                let column = quote_identifier(&attribute.attname);
+                out.push(SchemaFinding {
+                    object: CreatedObject::Column(class.oid, attribute.attnum),
+                    raw: RawFinding {
+                        span: 0..0,
+                        message: format!(
+                            "{table}.{column} is timestamp without time zone: it stores no \
+                             offset, so the same instant reads differently per session TimeZone"
+                        ),
+                        help: Some("use timestamptz".to_owned()),
+                        fix: Vec::new(),
+                    },
+                    help_in_new_migration: Some(
+                        "use timestamptz in a new migration, rewriting the values as it goes"
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+        out
+    }
+
+    fn prefer_identity(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for class in reportable_tables(catalog) {
+            let table = qualified_name(catalog, class);
+            for attribute in columns(catalog, class) {
+                if attribute.attidentity.is_some()
+                    || !catalog.lint_column_is_serial(class.oid, attribute.attnum)
+                {
+                    continue;
+                }
+                let column = quote_identifier(&attribute.attname);
+                out.push(SchemaFinding {
+                    object: CreatedObject::Column(class.oid, attribute.attnum),
+                    raw: RawFinding {
+                        span: 0..0,
+                        message: format!("{table}.{column} is a serial column"),
+                        help: Some(
+                            "use GENERATED BY DEFAULT AS IDENTITY: the sequence then belongs to \
+                             the column (permissions, dumps, ALTER TYPE follow it)"
+                                .to_owned(),
+                        ),
+                        fix: Vec::new(),
+                    },
+                    help_in_new_migration: Some(
+                        "use GENERATED BY DEFAULT AS IDENTITY in a new migration".to_owned(),
+                    ),
+                });
+            }
+        }
+        out
+    }
+
+    fn prefer_text(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for class in reportable_tables(catalog) {
+            let table = qualified_name(catalog, class);
+            for attribute in columns(catalog, class) {
+                let type_oid = inner_type(catalog, attribute.atttypid);
+                let (kind, requires_typmod) = if is_pg_catalog_type(catalog, type_oid, "varchar") {
+                    ("varchar", true)
+                } else if is_pg_catalog_type(catalog, type_oid, "bpchar") {
+                    ("char", false)
+                } else {
+                    continue;
+                };
+                let typmod = catalog.lint_effective_typmod(attribute.atttypid, attribute.atttypmod);
+                let Some(length) = typmod.map(|typmod| typmod - 4).or_else(|| {
+                    // A bare `char` is `char(1)`; a bare `varchar` is
+                    // unlimited and fine.
+                    (!requires_typmod).then_some(1)
+                }) else {
+                    continue;
+                };
+                if length < 1 {
+                    continue;
+                }
+                let column = quote_identifier(&attribute.attname);
+                let message = if kind == "varchar" {
+                    format!("{table}.{column} is varchar({length})")
+                } else {
+                    format!("{table}.{column} is char({length}): char pads with spaces")
+                };
+                let help = format!(
+                    "use text, with a CHECK (char_length({column}) <= {length}) if the limit matters"
+                );
+                out.push(SchemaFinding {
+                    object: CreatedObject::Column(class.oid, attribute.attnum),
+                    raw: RawFinding {
+                        span: 0..0,
+                        message,
+                        help: Some(help.clone()),
+                        fix: Vec::new(),
+                    },
+                    help_in_new_migration: Some(format!("{help}, in a new migration")),
+                });
+            }
+        }
+        out
+    }
+
+    fn prefer_bigint_pk(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for constraint in catalog
+            .iter_constraints()
+            .filter(|constraint| constraint.contype == ConType::PrimaryKey)
+        {
+            let Some(class) = catalog.class_row(constraint.conrelid) else {
+                continue;
+            };
+            if !is_reportable_table(catalog, class) {
+                continue;
+            }
+            let table = qualified_name(catalog, class);
+            for &attnum in &constraint.conkey {
+                let Some(attribute) = columns(catalog, class)
+                    .into_iter()
+                    .find(|attribute| attribute.attnum == attnum)
+                else {
+                    continue;
+                };
+                let type_oid = base_type(catalog, attribute.atttypid);
+                let (type_name, limit) = if is_pg_catalog_type(catalog, type_oid, "int4") {
+                    ("int4", "2147483647")
+                } else if is_pg_catalog_type(catalog, type_oid, "int2") {
+                    ("int2", "32767")
+                } else {
+                    continue;
+                };
+                let column = quote_identifier(&attribute.attname);
+                out.push(SchemaFinding {
+                    object: CreatedObject::Column(class.oid, attribute.attnum),
+                    raw: RawFinding {
+                        span: 0..0,
+                        message: format!(
+                            "{table}.{column} is an {type_name} primary key: it runs out at {limit}"
+                        ),
+                        help: Some("use bigint".to_owned()),
+                        fix: Vec::new(),
+                    },
+                    help_in_new_migration: Some("use bigint in a new migration".to_owned()),
+                });
+            }
+        }
+        out
+    }
+
     fn redundant_index(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut indexes: Vec<&PgIndex> = catalog.iter_indexes().collect();
         indexes.sort_by_key(|index| index.indexrelid);
@@ -884,6 +1301,21 @@ impl MigrationObserver for MigrationLinter<'_> {
         }
         self.current_span = self.trimmed(&statement.span);
         self.current_suppressed = self.suppressions(&statement.span);
+        self.before_relation = None;
+        self.before_columns.clear();
+        if let N::AlterTableStmt(alter) = statement.node
+            && let Some(class) = alter
+                .relation
+                .as_ref()
+                .and_then(|relation| resolve_relation(catalog, relation))
+        {
+            self.before_relation = Some(class.oid);
+            self.before_columns = catalog
+                .attributes_of(class.oid)
+                .iter()
+                .map(|attribute| attribute.attnum)
+                .collect();
+        }
         self.before_constraints = catalog
             .iter_constraints()
             .map(|constraint| constraint.oid)
@@ -910,6 +1342,7 @@ impl MigrationObserver for MigrationLinter<'_> {
         if self.files[self.current].lint == MigrationLint::None {
             return;
         }
+        self.track_column_creators(catalog, statement);
         let constraints: HashSet<PgConstraintOid> = catalog
             .iter_constraints()
             .map(|constraint| constraint.oid)
@@ -947,6 +1380,430 @@ fn validates(constraint: &typedpg_pg_query::protobuf::Constraint) -> bool {
 fn alter_command(node: &Node) -> Option<&typedpg_pg_query::protobuf::AlterTableCmd> {
     match node.node.as_ref()? {
         N::AlterTableCmd(command) => Some(command),
+        _ => None,
+    }
+}
+
+/// Resolve a `RangeVar` to the class the catalog holds now.
+fn resolve_relation<'a>(
+    catalog: &'a PgCatalog,
+    relation: &typedpg_pg_query::protobuf::RangeVar,
+) -> Option<&'a PgClass> {
+    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+    catalog.resolve_table(schema, &relation.relname)
+}
+
+/// The ordinary and partitioned tables the schema opinion rules inspect:
+/// user schemas, never a partition or inheritance child (its parent's columns
+/// already carry the answer).
+fn reportable_tables(catalog: &PgCatalog) -> Vec<&PgClass> {
+    let mut tables: Vec<&PgClass> = catalog
+        .iter_classes()
+        .filter(|class| is_reportable_table(catalog, class))
+        .collect();
+    tables.sort_by_key(|class| class.oid);
+    tables
+}
+
+fn is_reportable_table(catalog: &PgCatalog, class: &PgClass) -> bool {
+    matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
+        && catalog
+            .namespace_name(class.relnamespace)
+            .is_some_and(|name| name != "information_schema" && !name.starts_with("pg_"))
+        && !catalog
+            .pg_inherits()
+            .iter()
+            .any(|inherits| inherits.inhrelid == class.oid)
+}
+
+fn columns<'a>(catalog: &'a PgCatalog, class: &PgClass) -> Vec<&'a PgAttribute> {
+    catalog
+        .attributes_of(class.oid)
+        .iter()
+        .filter(|attribute| attribute.attnum > 0)
+        .collect()
+}
+
+/// A type with its domain chain stripped: a domain over `int8` is `int8`.
+fn base_type(catalog: &PgCatalog, oid: PgTypeOid) -> PgTypeOid {
+    let mut current = oid;
+    for _ in 0..64 {
+        let Some(base) = catalog.type_row(current).and_then(|ty| ty.typbasetype) else {
+            break;
+        };
+        current = base;
+    }
+    current
+}
+
+/// The element type of an array column (after domain resolution), or the
+/// type itself.
+fn inner_type(catalog: &PgCatalog, oid: PgTypeOid) -> PgTypeOid {
+    let base = base_type(catalog, oid);
+    let Some(ty) = catalog.type_row(base) else {
+        return base;
+    };
+    if ty.typcategory != TypCategory::Array {
+        return base;
+    }
+    ty.typelem
+        .map_or(base, |element| base_type(catalog, element))
+}
+
+fn is_pg_catalog_type(catalog: &PgCatalog, oid: PgTypeOid, name: &str) -> bool {
+    catalog.type_row(oid).is_some_and(|ty| {
+        ty.typname == name && catalog.namespace_name(ty.typnamespace) == Some("pg_catalog")
+    })
+}
+
+fn type_label(catalog: &PgCatalog, oid: PgTypeOid) -> &str {
+    catalog
+        .type_row(oid)
+        .map_or("unknown", |ty| ty.typname.as_str())
+}
+
+/// The effective value of a `SET`/`RESET` of `lock_timeout`, when the
+/// statement sets it: `Some(true)` for a non-zero value, `Some(false)` for
+/// zero, `DEFAULT` or `RESET`, and `None` for another setting.
+fn lock_timeout_setting(set: &typedpg_pg_query::protobuf::VariableSetStmt) -> Option<bool> {
+    if !set.name.eq_ignore_ascii_case("lock_timeout") {
+        return None;
+    }
+    match VariableSetKind::try_from(set.kind).ok()? {
+        VariableSetKind::VarSetValue => Some(set.args.first().is_some_and(lock_timeout_nonzero)),
+        VariableSetKind::VarSetDefault
+        | VariableSetKind::VarSetCurrent
+        | VariableSetKind::VarReset => Some(false),
+        _ => None,
+    }
+}
+
+fn lock_timeout_nonzero(node: &Node) -> bool {
+    match node.node.as_ref() {
+        Some(N::AConst(constant)) => match constant.val.as_ref() {
+            Some(Val::Ival(value)) => value.ival != 0,
+            Some(Val::Fval(value)) => duration_nonzero(&value.fval),
+            Some(Val::Sval(value)) => duration_nonzero(&value.sval),
+            _ => true,
+        },
+        Some(N::TypeCast(cast)) => cast.arg.as_deref().is_some_and(lock_timeout_nonzero),
+        _ => true,
+    }
+}
+
+/// Whether a PostgreSQL time value (`5s`, `5000`, `0`, `1min`) is non-zero.
+/// A spelling we cannot parse is taken as non-zero: the rule then stays
+/// quiet rather than reporting a migration that did set a timeout.
+fn duration_nonzero(value: &str) -> bool {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("default") {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    let unit = ["us", "ms", "s", "min", "h", "d"]
+        .into_iter()
+        .find(|unit| lower.ends_with(unit))
+        .map_or(0, str::len);
+    let number = lower[..lower.len() - unit].trim();
+    number.parse::<f64>() != Ok(0.0)
+}
+
+/// The first statement that takes a write-blocking lock on a relation that
+/// existed when the file started, the statement's kind and the relation.
+fn lock_target(
+    catalog: &PgCatalog,
+    pre_existing: &HashSet<PgClassOid>,
+    node: &N,
+) -> Option<(&'static str, PgClassOid)> {
+    match node {
+        N::AlterTableStmt(alter) => alter_table_lock_target(catalog, pre_existing, alter),
+        N::CreateStmt(create) => {
+            create_table_foreign_keys(create)
+                .into_iter()
+                .find_map(|relation| {
+                    existing_relation(catalog, pre_existing, relation, "CREATE TABLE")
+                })
+        }
+        N::IndexStmt(index) => {
+            let relation = index.relation.as_ref()?;
+            if index.concurrent {
+                return None;
+            }
+            existing_relation(catalog, pre_existing, relation, "CREATE INDEX")
+        }
+        N::DropStmt(drop) => drop_lock_target(catalog, pre_existing, drop),
+        N::TruncateStmt(truncate) => {
+            first_relation(catalog, pre_existing, &truncate.relations, "TRUNCATE")
+        }
+        N::CreateTrigStmt(trigger) => existing_relation(
+            catalog,
+            pre_existing,
+            trigger.relation.as_ref()?,
+            "CREATE TRIGGER",
+        ),
+        N::CreatePolicyStmt(policy) => existing_relation(
+            catalog,
+            pre_existing,
+            policy.table.as_ref()?,
+            "CREATE POLICY",
+        ),
+        N::AlterPolicyStmt(policy) => existing_relation(
+            catalog,
+            pre_existing,
+            policy.table.as_ref()?,
+            "ALTER POLICY",
+        ),
+        N::RuleStmt(rule) => existing_relation(
+            catalog,
+            pre_existing,
+            rule.relation.as_ref()?,
+            "CREATE RULE",
+        ),
+        N::RenameStmt(rename) => {
+            if !matches!(
+                ObjectType::try_from(rename.rename_type),
+                Ok(ObjectType::ObjectTable | ObjectType::ObjectColumn)
+            ) {
+                return None;
+            }
+            existing_relation(
+                catalog,
+                pre_existing,
+                rename.relation.as_ref()?,
+                "ALTER TABLE",
+            )
+        }
+        N::LockStmt(lock) => first_relation(catalog, pre_existing, &lock.relations, "LOCK TABLE"),
+        N::RefreshMatViewStmt(refresh) => {
+            if refresh.concurrent {
+                return None;
+            }
+            existing_relation(
+                catalog,
+                pre_existing,
+                refresh.relation.as_ref()?,
+                "REFRESH MATERIALIZED VIEW",
+            )
+        }
+        N::ClusterStmt(cluster) => {
+            existing_relation(catalog, pre_existing, cluster.relation.as_ref()?, "CLUSTER")
+        }
+        N::VacuumStmt(vacuum) => {
+            if !vacuum.is_vacuumcmd || !option_enabled(&vacuum.options, "full") {
+                return None;
+            }
+            vacuum.rels.iter().find_map(|relation| {
+                let N::VacuumRelation(relation) = relation.node.as_ref()? else {
+                    return None;
+                };
+                existing_relation(
+                    catalog,
+                    pre_existing,
+                    relation.relation.as_ref()?,
+                    "VACUUM FULL",
+                )
+            })
+        }
+        N::ReindexStmt(reindex) => {
+            if option_enabled(&reindex.params, "concurrently") {
+                return None;
+            }
+            existing_relation(catalog, pre_existing, reindex.relation.as_ref()?, "REINDEX")
+        }
+        _ => None,
+    }
+}
+
+fn existing_relation(
+    catalog: &PgCatalog,
+    pre_existing: &HashSet<PgClassOid>,
+    relation: &typedpg_pg_query::protobuf::RangeVar,
+    kind: &'static str,
+) -> Option<(&'static str, PgClassOid)> {
+    let class = resolve_relation(catalog, relation)?;
+    pre_existing
+        .contains(&class.oid)
+        .then_some((kind, class.oid))
+}
+
+fn first_relation(
+    catalog: &PgCatalog,
+    pre_existing: &HashSet<PgClassOid>,
+    nodes: &[Node],
+    kind: &'static str,
+) -> Option<(&'static str, PgClassOid)> {
+    nodes
+        .iter()
+        .filter_map(|node| match node.node.as_ref()? {
+            N::RangeVar(relation) => Some(relation),
+            _ => None,
+        })
+        .find_map(|relation| existing_relation(catalog, pre_existing, relation, kind))
+}
+
+fn alter_table_lock_target(
+    catalog: &PgCatalog,
+    pre_existing: &HashSet<PgClassOid>,
+    alter: &typedpg_pg_query::protobuf::AlterTableStmt,
+) -> Option<(&'static str, PgClassOid)> {
+    let mut strong = false;
+    let mut referenced = Vec::new();
+    for node in &alter.cmds {
+        let Some(command) = alter_command(node) else {
+            continue;
+        };
+        strong |= !only_share_update_exclusive(command);
+        if let Some(foreign_key) = added_foreign_key(command)
+            && let Some(table) = foreign_key.pktable.as_ref()
+        {
+            referenced.push(table);
+        }
+    }
+    if strong
+        && let Some(relation) = alter.relation.as_ref()
+        && let Some(target) = existing_relation(catalog, pre_existing, relation, "ALTER TABLE")
+    {
+        return Some(target);
+    }
+    referenced
+        .into_iter()
+        .find_map(|relation| existing_relation(catalog, pre_existing, relation, "ALTER TABLE"))
+}
+
+/// Whether an `ALTER TABLE` subcommand only takes `SHARE UPDATE EXCLUSIVE`
+/// on the table (PostgreSQL's lock-strength table).
+fn only_share_update_exclusive(command: &typedpg_pg_query::protobuf::AlterTableCmd) -> bool {
+    match AlterTableType::try_from(command.subtype) {
+        Ok(
+            AlterTableType::AtValidateConstraint
+            | AlterTableType::AtSetStatistics
+            | AlterTableType::AtClusterOn
+            | AlterTableType::AtDropCluster
+            | AlterTableType::AtSetRelOptions
+            | AlterTableType::AtResetRelOptions
+            | AlterTableType::AtReplaceRelOptions
+            | AlterTableType::AtAttachPartition
+            | AlterTableType::AtDetachPartitionFinalize,
+        ) => true,
+        Ok(AlterTableType::AtDetachPartition) => matches!(
+            command.def.as_deref().and_then(|def| def.node.as_ref()),
+            Some(N::PartitionCmd(partition)) if partition.concurrent
+        ),
+        _ => false,
+    }
+}
+
+fn added_foreign_key(
+    command: &typedpg_pg_query::protobuf::AlterTableCmd,
+) -> Option<&typedpg_pg_query::protobuf::Constraint> {
+    match (
+        AlterTableType::try_from(command.subtype),
+        command.def.as_deref().and_then(|def| def.node.as_ref()),
+    ) {
+        (Ok(AlterTableType::AtAddConstraint), Some(N::Constraint(constraint)))
+            if constraint_is_foreign_key(constraint) =>
+        {
+            Some(&**constraint)
+        }
+        (Ok(AlterTableType::AtAddColumn), Some(N::ColumnDef(column))) => column
+            .constraints
+            .iter()
+            .filter_map(|constraint| match constraint.node.as_ref()? {
+                N::Constraint(constraint) if constraint_is_foreign_key(constraint) => {
+                    Some(&**constraint)
+                }
+                _ => None,
+            })
+            .next(),
+        _ => None,
+    }
+}
+
+fn create_table_foreign_keys(
+    create: &typedpg_pg_query::protobuf::CreateStmt,
+) -> Vec<&typedpg_pg_query::protobuf::RangeVar> {
+    let mut out = Vec::new();
+    for node in create.table_elts.iter().chain(&create.constraints) {
+        match node.node.as_ref() {
+            Some(N::Constraint(constraint)) if constraint_is_foreign_key(constraint) => {
+                out.extend(constraint.pktable.as_ref());
+            }
+            Some(N::ColumnDef(column)) => {
+                for constraint in &column.constraints {
+                    if let Some(N::Constraint(constraint)) = constraint.node.as_ref()
+                        && constraint_is_foreign_key(constraint)
+                    {
+                        out.extend(constraint.pktable.as_ref());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn constraint_is_foreign_key(constraint: &typedpg_pg_query::protobuf::Constraint) -> bool {
+    ConstrType::try_from(constraint.contype) == Ok(ConstrType::ConstrForeign)
+}
+
+fn drop_lock_target(
+    catalog: &PgCatalog,
+    pre_existing: &HashSet<PgClassOid>,
+    drop: &typedpg_pg_query::protobuf::DropStmt,
+) -> Option<(&'static str, PgClassOid)> {
+    let kind = match ObjectType::try_from(drop.remove_type) {
+        Ok(ObjectType::ObjectTable | ObjectType::ObjectForeignTable) => "DROP TABLE",
+        Ok(ObjectType::ObjectIndex) if !drop.concurrent => "DROP INDEX",
+        _ => return None,
+    };
+    for object in &drop.objects {
+        let Some(N::List(list)) = object.node.as_ref() else {
+            continue;
+        };
+        let names: Vec<&str> = list.items.iter().filter_map(string_node).collect();
+        let (schema, name) = match names.as_slice() {
+            [name] => (None, *name),
+            [schema, name] => (Some(*schema), *name),
+            _ => continue,
+        };
+        let Some(class) = catalog.resolve_table(schema, name) else {
+            continue;
+        };
+        if pre_existing.contains(&class.oid) {
+            return Some((kind, class.oid));
+        }
+    }
+    None
+}
+
+fn string_node(node: &Node) -> Option<&str> {
+    match node.node.as_ref()? {
+        N::String(string) => Some(string.sval.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `options` has `name` set to a true value (a bare option counts).
+fn option_enabled(options: &[Node], name: &str) -> bool {
+    options.iter().any(|option| match option.node.as_ref() {
+        Some(N::DefElem(option)) if option.defname.eq_ignore_ascii_case(name) => {
+            def_boolean(option).unwrap_or(true)
+        }
+        _ => false,
+    })
+}
+
+fn def_boolean(option: &typedpg_pg_query::protobuf::DefElem) -> Option<bool> {
+    match option.arg.as_deref().and_then(|arg| arg.node.as_ref()) {
+        None => Some(true),
+        Some(N::Integer(integer)) => Some(integer.ival != 0),
+        Some(N::Boolean(boolean)) => Some(boolean.boolval),
+        Some(N::String(string)) => match string.sval.to_ascii_lowercase().as_str() {
+            "true" | "on" => Some(true),
+            "false" | "off" => Some(false),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1165,4 +2022,691 @@ fn qualified_name(catalog: &PgCatalog, class: &typedpg_analyzer::PgClass) -> Str
         .namespace_name(class.relnamespace)
         .unwrap_or("public");
     QualifiedName::new(schema, &class.relname).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use typedpg_core::config::{LintConfig, LintLevel};
+
+    const BASE: &str = r#"
+        CREATE TABLE users (id integer PRIMARY KEY, email text);
+        CREATE TABLE posts (id integer PRIMARY KEY, author_id integer);
+        CREATE TABLE pairs (a integer, b integer, PRIMARY KEY (a, b));
+        CREATE INDEX users_email_idx ON users (email);
+        ALTER TABLE users ADD CONSTRAINT users_email_nn CHECK (email IS NOT NULL) NOT VALID;
+    "#;
+
+    fn lint(
+        files: &[(&str, &str, MigrationLint)],
+        use_transaction: bool,
+        options: &LintOptions,
+    ) -> Vec<MigrationFinding> {
+        let files: Vec<MigrationFile> = files
+            .iter()
+            .map(|(path, sql, lint)| MigrationFile {
+                path: (*path).to_owned(),
+                sql: (*sql).to_owned(),
+                lint: *lint,
+            })
+            .collect();
+        lint_migrations(&files, use_transaction, options)
+            .unwrap()
+            .findings
+    }
+
+    fn second(sql: &str) -> Vec<MigrationFinding> {
+        second_with(sql, true, &LintOptions::default())
+    }
+
+    fn second_with(
+        sql: &str,
+        use_transaction: bool,
+        options: &LintOptions,
+    ) -> Vec<MigrationFinding> {
+        lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                ("002_change.sql", sql, MigrationLint::All),
+            ],
+            use_transaction,
+            options,
+        )
+    }
+
+    fn opinion_options(rules: &[Rule]) -> LintOptions {
+        let mut config = LintConfig::default();
+        for rule in rules {
+            config
+                .levels
+                .insert(rule.name().to_owned(), LintLevel::Info);
+        }
+        LintOptions::from_config(&config)
+    }
+
+    fn only(findings: &[MigrationFinding], rule: Rule) -> Vec<MigrationFinding> {
+        findings
+            .iter()
+            .filter(|finding| finding.finding.rule == rule)
+            .cloned()
+            .collect()
+    }
+
+    // ── fk_type_mismatch ───────────────────────────────────────────────────
+
+    #[test]
+    fn fk_type_mismatch_reports_differing_base_types() {
+        let findings = second(
+            "ALTER TABLE posts ALTER COLUMN author_id TYPE bigint;
+             ALTER TABLE posts ADD CONSTRAINT posts_author_fk
+                 FOREIGN KEY (author_id) REFERENCES users (id);",
+        );
+        let found = only(&findings, Rule::FkTypeMismatch);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "foreign key posts_author_fk compares public.posts.author_id (int8) with \
+             public.users.id (int4)"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some("give author_id the type int4, so the join compares without a cast")
+        );
+    }
+
+    #[test]
+    fn fk_type_mismatch_resolves_domains_and_ignores_typmod() {
+        let findings = lint(
+            &[(
+                "001_base.sql",
+                "CREATE DOMAIN big_id AS bigint;
+                     CREATE TABLE parents (id bigint PRIMARY KEY);
+                     CREATE TABLE children (id big_id);
+                     ALTER TABLE children ADD CONSTRAINT children_fk
+                         FOREIGN KEY (id) REFERENCES parents (id);",
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::FkTypeMismatch).is_empty(),
+            "{findings:?}"
+        );
+
+        let findings = lint(
+            &[(
+                "001_base.sql",
+                "CREATE TABLE parents (code varchar(10) PRIMARY KEY);
+                     CREATE TABLE children (code varchar(20));
+                     ALTER TABLE children ADD CONSTRAINT children_fk
+                         FOREIGN KEY (code) REFERENCES parents (code);",
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::FkTypeMismatch).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn fk_type_mismatch_reports_text_against_varchar() {
+        let findings = lint(
+            &[(
+                "001_base.sql",
+                "CREATE TABLE parents (code varchar(10) PRIMARY KEY);
+                     CREATE TABLE children (code text);
+                     ALTER TABLE children ADD CONSTRAINT children_fk
+                         FOREIGN KEY (code) REFERENCES parents (code);",
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::FkTypeMismatch);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert!(found[0].finding.message.contains("(text)"));
+        assert!(found[0].finding.message.contains("(varchar)"));
+    }
+
+    // ── missing_lock_timeout ───────────────────────────────────────────────
+
+    #[test]
+    fn missing_lock_timeout_reports_the_first_blocking_statement() {
+        let text = "ALTER TABLE users ADD COLUMN nickname text;";
+        let findings = second(text);
+        let found = only(&findings, Rule::MissingLockTimeout);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "ALTER TABLE waits for a lock on public.users with no lock_timeout: queued behind \
+             a long transaction, it blocks every query on the table"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some("start the migration with SET LOCAL lock_timeout = '5s' and retry on timeout")
+        );
+        assert_eq!(
+            &text[found[0].finding.span.clone()],
+            "ALTER TABLE users ADD COLUMN nickname text"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_ignores_tables_created_in_the_same_file() {
+        let findings = lint(
+            &[(
+                "001_all.sql",
+                &format!("{BASE}\nALTER TABLE users ADD COLUMN nickname text;"),
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_reads_set_lock_timeout() {
+        for sql in [
+            "SET LOCAL lock_timeout = '3s';
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SET lock_timeout TO 5000;
+             ALTER TABLE users ADD COLUMN nickname text;",
+        ] {
+            let findings = second(sql);
+            assert!(
+                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+        for sql in [
+            "SET lock_timeout = 0;
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SET lock_timeout = '0';
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SET lock_timeout = DEFAULT;
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "RESET lock_timeout;
+             ALTER TABLE users ADD COLUMN nickname text;",
+        ] {
+            let findings = second(sql);
+            assert_eq!(
+                only(&findings, Rule::MissingLockTimeout).len(),
+                1,
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_lock_timeout_reports_at_most_once_per_file() {
+        let text = "ALTER TABLE users ADD COLUMN first text;
+                    ALTER TABLE users ADD COLUMN second text;";
+        let found = only(&second(text), Rule::MissingLockTimeout);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            &text[found[0].finding.span.clone()],
+            "ALTER TABLE users ADD COLUMN first text"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_handles_create_table_foreign_keys() {
+        let findings = second(
+            "CREATE TABLE new_posts (
+                 id integer PRIMARY KEY,
+                 author_id integer REFERENCES users (id)
+             );",
+        );
+        let found = only(&findings, Rule::MissingLockTimeout);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert!(
+            found[0]
+                .finding
+                .message
+                .starts_with("CREATE TABLE waits for a lock on public.users"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_ignores_share_update_exclusive_subcommands() {
+        let findings = second("ALTER TABLE users VALIDATE CONSTRAINT users_email_nn;");
+        assert!(
+            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_reports_the_statement_kind() {
+        for (sql, kind) in [
+            ("DROP TABLE posts;", "DROP TABLE"),
+            ("DROP INDEX users_email_idx;", "DROP INDEX"),
+            ("TRUNCATE users;", "TRUNCATE"),
+            ("ALTER TABLE users RENAME TO accounts;", "ALTER TABLE"),
+            ("LOCK TABLE users;", "LOCK TABLE"),
+            ("CLUSTER users USING users_email_idx;", "CLUSTER"),
+            ("VACUUM FULL users;", "VACUUM FULL"),
+            ("REINDEX TABLE users;", "REINDEX"),
+        ] {
+            let findings = if sql.starts_with("VACUUM") {
+                second_with(sql, false, &LintOptions::default())
+            } else {
+                second(sql)
+            };
+            let found = only(&findings, Rule::MissingLockTimeout);
+            assert_eq!(found.len(), 1, "{sql}: {findings:?}");
+            assert!(
+                found[0]
+                    .finding
+                    .message
+                    .starts_with(&format!("{kind} waits for a lock")),
+                "{sql}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_lock_timeout_ignores_concurrent_operations() {
+        let findings = lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_change.sql",
+                    "CREATE INDEX CONCURRENTLY users_email_concurrent_idx ON users (email);",
+                    MigrationLint::All,
+                ),
+            ],
+            false,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_help_depends_on_the_transaction() {
+        let sql = "ALTER TABLE users ADD COLUMN nickname text;";
+        let inside = second(sql);
+        assert_eq!(
+            only(&inside, Rule::MissingLockTimeout)[0]
+                .finding
+                .help
+                .as_deref(),
+            Some("start the migration with SET LOCAL lock_timeout = '5s' and retry on timeout")
+        );
+
+        let outside = second_with(sql, false, &LintOptions::default());
+        assert_eq!(
+            only(&outside, Rule::MissingLockTimeout)[0]
+                .finding
+                .help
+                .as_deref(),
+            Some("start the migration with SET lock_timeout = '5s' and retry on timeout")
+        );
+
+        let marker = second_with(
+            &format!("-- no-transaction\n{sql}"),
+            true,
+            &LintOptions::default(),
+        );
+        assert_eq!(
+            only(&marker, Rule::MissingLockTimeout)[0]
+                .finding
+                .help
+                .as_deref(),
+            Some("start the migration with SET lock_timeout = '5s' and retry on timeout")
+        );
+    }
+
+    // ── opinion rules ──────────────────────────────────────────────────────
+
+    const OPINIONS: &str = r#"
+        CREATE TABLE opinions (
+            id integer PRIMARY KEY,
+            at timestamp,
+            tags timestamp[],
+            short varchar(10),
+            unbound varchar,
+            padded char(3),
+            body text,
+            serial_id serial
+        );
+    "#;
+
+    fn opinion_findings(rules: &[Rule]) -> Vec<MigrationFinding> {
+        lint(
+            &[("001_opinions.sql", OPINIONS, MigrationLint::All)],
+            true,
+            &opinion_options(rules),
+        )
+    }
+
+    #[test]
+    fn opinion_rules_are_off_by_default() {
+        let findings = lint(
+            &[("001_opinions.sql", OPINIONS, MigrationLint::All)],
+            true,
+            &LintOptions::default(),
+        );
+        for rule in [
+            Rule::PreferTimestamptz,
+            Rule::PreferIdentity,
+            Rule::PreferText,
+            Rule::PreferBigintPk,
+        ] {
+            assert!(only(&findings, rule).is_empty(), "{rule}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn prefer_timestamptz_reports_timestamp_and_arrays() {
+        let found = only(
+            &opinion_findings(&[Rule::PreferTimestamptz]),
+            Rule::PreferTimestamptz,
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "public.opinions.at is timestamp without time zone: it stores no offset, so the \
+             same instant reads differently per session TimeZone"
+        );
+        assert_eq!(found[0].finding.help.as_deref(), Some("use timestamptz"));
+        assert_eq!(
+            found[1].finding.message,
+            "public.opinions.tags is timestamp without time zone: it stores no offset, so the \
+             same instant reads differently per session TimeZone"
+        );
+    }
+
+    #[test]
+    fn prefer_identity_reports_serial_columns_only() {
+        let found = only(
+            &opinion_findings(&[Rule::PreferIdentity]),
+            Rule::PreferIdentity,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "public.opinions.serial_id is a serial column"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "use GENERATED BY DEFAULT AS IDENTITY: the sequence then belongs to the column \
+                 (permissions, dumps, ALTER TYPE follow it)"
+            )
+        );
+
+        let findings = lint(
+            &[(
+                "001_identity.sql",
+                "CREATE TABLE identities (id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY);",
+                MigrationLint::All,
+            )],
+            true,
+            &opinion_options(&[Rule::PreferIdentity]),
+        );
+        assert!(
+            only(&findings, Rule::PreferIdentity).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn prefer_text_reports_bounded_varchar_and_char() {
+        let found = only(&opinion_findings(&[Rule::PreferText]), Rule::PreferText);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "public.opinions.short is varchar(10)"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some("use text, with a CHECK (char_length(short) <= 10) if the limit matters")
+        );
+        assert_eq!(
+            found[1].finding.message,
+            "public.opinions.padded is char(3): char pads with spaces"
+        );
+    }
+
+    #[test]
+    fn prefer_text_reports_arrays_and_skips_unlimited_varchar() {
+        let findings = lint(
+            &[(
+                "001_text.sql",
+                "CREATE TABLE texts (a varchar(10)[], b varchar, c text, d char(2)[]);",
+                MigrationLint::All,
+            )],
+            true,
+            &opinion_options(&[Rule::PreferText]),
+        );
+        let found = only(&findings, Rule::PreferText);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].finding.message, "public.texts.a is varchar(10)");
+        assert_eq!(
+            found[1].finding.message,
+            "public.texts.d is char(2): char pads with spaces"
+        );
+    }
+
+    #[test]
+    fn prefer_bigint_pk_reports_smallint_int_and_domain_primary_keys() {
+        let findings = lint(
+            &[(
+                "001_pk.sql",
+                "CREATE DOMAIN int_domain AS integer;
+                 CREATE TABLE pk_small (id smallint PRIMARY KEY);
+                 CREATE TABLE pk_int (id integer PRIMARY KEY);
+                 CREATE TABLE pk_big (id bigint PRIMARY KEY);
+                 CREATE TABLE pk_domain (id int_domain PRIMARY KEY);",
+                MigrationLint::All,
+            )],
+            true,
+            &opinion_options(&[Rule::PreferBigintPk]),
+        );
+        let found = only(&findings, Rule::PreferBigintPk);
+        assert_eq!(found.len(), 3, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "public.pk_small.id is an int2 primary key: it runs out at 32767"
+        );
+        assert_eq!(
+            found[1].finding.message,
+            "public.pk_int.id is an int4 primary key: it runs out at 2147483647"
+        );
+        assert_eq!(
+            found[2].finding.message,
+            "public.pk_domain.id is an int4 primary key: it runs out at 2147483647"
+        );
+        assert_eq!(found[0].finding.help.as_deref(), Some("use bigint"));
+    }
+
+    #[test]
+    fn opinion_rules_follow_a_later_alter_column_type() {
+        let base = "CREATE TABLE events (id bigint PRIMARY KEY, at timestamptz);";
+        let findings = lint(
+            &[
+                ("001_base.sql", base, MigrationLint::All),
+                (
+                    "002_change.sql",
+                    "ALTER TABLE events ALTER COLUMN at TYPE timestamp;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &opinion_options(&[Rule::PreferTimestamptz]),
+        );
+        let found = only(&findings, Rule::PreferTimestamptz);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(found[0].file, 1);
+        let sql = "ALTER TABLE events ALTER COLUMN at TYPE timestamp;";
+        assert_eq!(
+            &sql[found[0].finding.span.clone()],
+            "ALTER TABLE events ALTER COLUMN at TYPE timestamp"
+        );
+
+        let fixed = lint(
+            &[
+                (
+                    "001_base.sql",
+                    "CREATE TABLE events (id bigint PRIMARY KEY, at timestamp);",
+                    MigrationLint::All,
+                ),
+                (
+                    "002_change.sql",
+                    "ALTER TABLE events ALTER COLUMN at TYPE timestamptz;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &opinion_options(&[Rule::PreferTimestamptz]),
+        );
+        assert!(
+            only(&fixed, Rule::PreferTimestamptz).is_empty(),
+            "{fixed:?}"
+        );
+    }
+
+    #[test]
+    fn opinion_rules_report_a_partitioned_table_once() {
+        let findings = lint(
+            &[(
+                "001_partition.sql",
+                "CREATE TABLE events (id integer PRIMARY KEY, at timestamp)
+                     PARTITION BY RANGE (id);
+                 CREATE TABLE events_1 PARTITION OF events FOR VALUES FROM (0) TO (10);",
+                MigrationLint::All,
+            )],
+            true,
+            &opinion_options(&[Rule::PreferTimestamptz, Rule::PreferBigintPk]),
+        );
+        assert_eq!(
+            only(&findings, Rule::PreferTimestamptz).len(),
+            1,
+            "{findings:?}"
+        );
+        assert_eq!(
+            only(&findings, Rule::PreferBigintPk).len(),
+            1,
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn allow_comments_suppress_the_new_rules_per_statement() {
+        let base = ("001_base.sql", BASE, MigrationLint::None);
+
+        let fk_sql = "ALTER TABLE posts ALTER COLUMN author_id TYPE bigint;
+                      -- typedpg-lint: allow(fk_type_mismatch)
+                      ALTER TABLE posts ADD CONSTRAINT posts_author_fk
+                          FOREIGN KEY (author_id) REFERENCES users (id);";
+        let findings = lint(
+            &[base, ("002_fk.sql", fk_sql, MigrationLint::All)],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::FkTypeMismatch).is_empty(),
+            "{findings:?}"
+        );
+
+        let findings = lint(
+            &[
+                base,
+                (
+                    "002_lock.sql",
+                    "-- typedpg-lint: allow(missing_lock_timeout)
+                     ALTER TABLE users ADD COLUMN nickname text;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            "{findings:?}"
+        );
+
+        let findings = lint(
+            &[
+                base,
+                (
+                    "002_opinions.sql",
+                    "-- typedpg-lint: allow(prefer_timestamptz, prefer_identity, prefer_text, prefer_bigint_pk)
+                     CREATE TABLE names (
+                         id integer PRIMARY KEY,
+                         at timestamp,
+                         short varchar(10),
+                         serial_id serial
+                     );",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &opinion_options(&[
+                Rule::PreferTimestamptz,
+                Rule::PreferIdentity,
+                Rule::PreferText,
+                Rule::PreferBigintPk,
+            ]),
+        );
+        for rule in [
+            Rule::PreferTimestamptz,
+            Rule::PreferIdentity,
+            Rule::PreferText,
+            Rule::PreferBigintPk,
+        ] {
+            assert!(only(&findings, rule).is_empty(), "{rule}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn schema_only_files_report_the_new_schema_rules() {
+        let findings = lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_unchanged.sql",
+                    "CREATE TABLE names (
+                         id integer PRIMARY KEY,
+                         at timestamp,
+                         short varchar(10)
+                     );",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+            &opinion_options(&[
+                Rule::PreferTimestamptz,
+                Rule::PreferText,
+                Rule::PreferBigintPk,
+            ]),
+        );
+        assert!(only(&findings, Rule::MissingLockTimeout).is_empty());
+        for rule in [
+            Rule::PreferTimestamptz,
+            Rule::PreferText,
+            Rule::PreferBigintPk,
+        ] {
+            let found: Vec<_> = only(&findings, rule)
+                .into_iter()
+                .filter(|finding| finding.file == 1)
+                .collect();
+            assert_eq!(found.len(), 1, "{rule}: {findings:?}");
+            assert!(found[0].finding.help.is_some(), "{rule}: {findings:?}");
+        }
+    }
 }
