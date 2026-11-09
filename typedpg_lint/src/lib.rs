@@ -2170,7 +2170,10 @@ mod tests {
 
     #[test]
     fn migration_findings_are_trimmed_statements_in_their_file() {
-        let text = "-- lead\n  CREATE INDEX users_email_idx ON users (email);  ";
+        // This test pins `create_index_blocking`'s span; the newer
+        // `missing_lock_timeout` also reports a non-concurrent CREATE INDEX,
+        // so keep it out of this count.
+        let text = "-- typedpg-lint: allow(missing_lock_timeout)\n  CREATE INDEX users_email_idx ON users (email);  ";
         let findings = second(text);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(
