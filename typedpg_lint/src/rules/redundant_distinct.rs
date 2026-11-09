@@ -4,12 +4,13 @@
 //! keyword, but only when the select is error-free: a hash aggregate
 //! evaluates the target list on every row, while the scan without
 //! `DISTINCT` may stop earlier, so an expression that can raise would
-//! change the errors the query raises.
+//! change the errors the query raises. The analyzer's `distinct`
+//! simplification withholds the rewrite for the same reason.
 //!
 //! The proof is the `distinct` simplification's (see
 //! [`typedpg_analyzer::redundant_distinct_spans`] and the analyzer's
-//! `simplify::dedup` module): this rule only reports the spans that
-//! simplification would delete.
+//! `simplify::dedup` module): this rule reports the spans the proof finds
+//! redundant, and offers no fix when the simplification would keep them.
 
 use crate::{Ctx, RawFinding, SqlEdit};
 

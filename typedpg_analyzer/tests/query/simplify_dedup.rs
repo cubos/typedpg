@@ -488,6 +488,47 @@ fn distinct_kept_with_natural_joins_and_ambiguous_using_columns() {
     );
 }
 
+#[test]
+fn distinct_kept_when_the_target_list_can_raise() {
+    // `DISTINCT` (a hash/sort aggregate) evaluates the target list on every
+    // row before it can deduplicate; without it the scan may stop early.
+    // The rows are distinct either way (`id` is a key): only the error would
+    // change, so the rewrite is withheld.
+    let db = setup_with("CREATE TABLE t (id int PRIMARY KEY);");
+    assert_kept(&db, "SELECT DISTINCT id, 1 / (id - 2) AS n FROM t LIMIT 1");
+    // The runtime's `fetch_one` / `fetch_optional` wrap the query in
+    // `LIMIT 2` (see `sql_limited` in typedpg_macros), so the hazard exists
+    // even when the SQL writes no LIMIT.
+    assert_kept(&db, "SELECT DISTINCT id, 1 / (id - 2) AS n FROM t");
+}
+
+#[test]
+fn distinct_kept_when_the_where_or_join_can_raise() {
+    let db = setup_with("CREATE TABLE t (id int PRIMARY KEY);");
+    assert_kept(&db, "SELECT DISTINCT id FROM t WHERE 1 / (id - 2) > 0");
+    let db = setup();
+    // A JOIN ON condition is evaluated per joined pair in the original form.
+    // (An ORDER BY expression of a DISTINCT select must appear in its select
+    // list, so the target-list check already covers it.)
+    assert_kept(
+        &db,
+        "SELECT DISTINCT o.id FROM orders o \
+         JOIN customers c ON c.id = o.customer_id AND 1 / (o.id - 2) > 0",
+    );
+}
+
+#[test]
+fn distinct_still_dropped_when_the_expressions_cannot_raise() {
+    let db = setup();
+    // `lower` returns a value for every input, so it can't change the errors.
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT id, lower(name) FROM customers",
+        "SELECT id, lower(name) FROM customers",
+        &[Rule::Distinct],
+    );
+}
+
 /// `t AS x(k, id)` renames t's columns by position: `x.id` is `t.k`.
 fn aliased_columns_setup() -> PgCatalog {
     setup_with(
@@ -717,6 +758,31 @@ fn union_kept_with_intersect_or_except() {
         &db,
         "SELECT 'o' AS kind, id FROM orders UNION (SELECT 'c', id FROM customers \
          INTERSECT SELECT 'c', id FROM customers)",
+    );
+}
+
+#[test]
+fn union_kept_when_an_arm_can_raise() {
+    // `UNION` evaluates every arm in full to deduplicate; `UNION ALL` under
+    // a LIMIT can stop an arm early, so only error-free arms may change.
+    let db = setup_with("CREATE TABLE t (id int PRIMARY KEY);");
+    assert_kept(
+        &db,
+        "SELECT 'a' AS kind, id, 1 / (id - 2) AS n FROM t \
+         UNION SELECT 'b', id, 0 FROM small LIMIT 1",
+    );
+    // The LIMIT may be the runtime's wrapping (`fetch_one` / `fetch_optional`
+    // add `LIMIT 2`), so a written LIMIT isn't required.
+    assert_kept(
+        &db,
+        "SELECT 'a' AS kind, id, 1 / (id - 2) AS n FROM t \
+         UNION SELECT 'b', id, 0 FROM small",
+    );
+    // An arm's WHERE is evaluated on every row the original form reads.
+    assert_kept(
+        &db,
+        "SELECT 'a' AS kind, id FROM t WHERE 1 / (id - 2) > 0 \
+         UNION SELECT 'b', id FROM small",
     );
 }
 

@@ -40,15 +40,32 @@ enum Item {
         refname: String,
         rel: PgClassOid,
         nullable: bool,
+        /// The names this item exposes, with their attnums: the table's own,
+        /// or as an alias column list (`t AS x(a, b)`) renames the first
+        /// ones by position.
+        columns: Vec<(String, i16)>,
     },
     /// Anything else (a subquery, a function, a CTE, a view, a join with
-    /// an alias, a table with column aliases): its columns are unknown, so
+    /// an alias): its columns are unknown, so
     /// a reference that may be to it resolves to nothing. `refname` is the
     /// name it can be qualified by; `None` when it isn't known — PG names
     /// an unaliased function after the function (`FROM unnest(…)` is
     /// `unnest`), an unaliased subquery, VALUES or table function after
     /// rules of its own — and then it may bind any qualifier.
     Opaque { refname: Option<String> },
+}
+
+impl Item {
+    /// The attnum this item exposes as `column`, when it is a base table.
+    fn attnum(&self, column: &str) -> Option<i16> {
+        match self {
+            Item::Table { columns, .. } => columns
+                .iter()
+                .find(|(name, _)| name == column)
+                .map(|(_, attnum)| *attnum),
+            Item::Opaque { .. } => None,
+        }
+    }
 }
 
 /// The FROM scope of one query level (a SELECT, or an UPDATE/DELETE),
@@ -154,7 +171,7 @@ impl<'a> FromScope<'a> {
     /// own items rather than a parent level's: `false` only when none of
     /// them can bind it. For moving an expression into this level from the
     /// one around it.
-    pub(crate) fn may_bind_here(&self, ctx: &Ctx<'_>, col: &ColumnRef) -> bool {
+    pub(crate) fn may_bind_here(&self, _ctx: &Ctx<'_>, col: &ColumnRef) -> bool {
         let Some(fields) = col
             .fields
             .iter()
@@ -177,9 +194,7 @@ impl<'a> FromScope<'a> {
             (Item::Opaque { .. }, None) => true,
             (Item::Opaque { refname }, Some(t)) => refname.as_deref().is_none_or(|r| r == t),
             (Item::Table { refname, .. }, Some(t)) => refname == t,
-            (Item::Table { rel, .. }, None) => {
-                ctx.catalog.attribute_by_name(*rel, column).is_some() || is_system_column(column)
-            }
+            (Item::Table { .. }, None) => item.attnum(column).is_some() || is_system_column(column),
         })
     }
 
@@ -188,7 +203,7 @@ impl<'a> FromScope<'a> {
     /// the table has no alias.
     pub(crate) fn binding_item(
         &self,
-        ctx: &Ctx<'_>,
+        _ctx: &Ctx<'_>,
         column: &str,
     ) -> Option<(Option<String>, String)> {
         let mut level = Some(self);
@@ -198,14 +213,9 @@ impl<'a> FromScope<'a> {
                 match item {
                     Item::Opaque { .. } => return None,
                     Item::Table {
-                        schema,
-                        refname,
-                        rel,
-                        ..
+                        schema, refname, ..
                     } => {
-                        if ctx.catalog.attribute_by_name(*rel, column).is_some()
-                            || is_system_column(column)
-                        {
+                        if item.attnum(column).is_some() || is_system_column(column) {
                             if found.is_some() {
                                 return None;
                             }
@@ -276,7 +286,7 @@ impl<'a> FromScope<'a> {
                         };
                         named
                             && (table.is_some()
-                                || ctx.catalog.attribute_by_name(*rel, column).is_some()
+                                || item.attnum(column).is_some()
                                 || is_system_column(column))
                     }
                 };
@@ -289,14 +299,11 @@ impl<'a> FromScope<'a> {
                     found = Some(item);
                 }
             }
-            if let Some(Item::Table { rel, nullable, .. }) = found {
-                let attr = ctx.catalog.attribute_by_name(*rel, column)?;
-                if attr.attnum <= 0 {
-                    return None;
-                }
+            if let Some(item @ Item::Table { rel, nullable, .. }) = found {
+                let attnum = item.attnum(column)?;
                 return Some(ResolvedColumn {
                     rel: *rel,
-                    attnum: attr.attnum,
+                    attnum,
                     nullable_side: *nullable || scope.grouping_sets,
                 });
             }
@@ -389,10 +396,7 @@ fn range_var(
     let opaque = || Item::Opaque {
         refname: Some(refname.clone()),
     };
-    if schema.is_none() && ctes.contains(&rv.relname)
-        || !rv.catalogname.is_empty()
-        || alias.is_some_and(|a| !a.colnames.is_empty())
-    {
+    if schema.is_none() && ctes.contains(&rv.relname) || !rv.catalogname.is_empty() {
         items.push(opaque());
         return;
     }
@@ -404,11 +408,36 @@ fn range_var(
         items.push(opaque());
         return;
     }
+    let mut attrs: Vec<_> = ctx
+        .catalog
+        .attributes_of(class.oid)
+        .iter()
+        .filter(|a| a.attnum > 0)
+        .collect();
+    attrs.sort_by_key(|a| a.attnum);
+    let mut columns: Vec<(String, i16)> = attrs
+        .iter()
+        .map(|a| (a.attname.clone(), a.attnum))
+        .collect();
+    if let Some(alias) = alias {
+        if alias.colnames.len() > columns.len() {
+            items.push(opaque());
+            return;
+        }
+        for (column, rename) in columns.iter_mut().zip(&alias.colnames) {
+            let Some(N::String(name)) = &rename.node else {
+                items.push(opaque());
+                return;
+            };
+            column.0 = name.sval.clone();
+        }
+    }
     items.push(Item::Table {
         schema: if alias.is_some() { None } else { schema },
         refname,
         rel: class.oid,
         nullable,
+        columns,
     });
 }
 
@@ -528,6 +557,11 @@ const ANYENUM: u32 = 3500;
 
 /// `interval`.
 const INTERVAL: u32 = 1186;
+
+/// `FRAMEOPTION_DEFAULTS` (`RANGE UNBOUNDED PRECEDING TO CURRENT ROW`),
+/// the frame the parser gives a window that writes none
+/// (`src/include/nodes/parsenodes.h`): no frame expression of its own.
+const FRAMEOPTION_DEFAULTS: i32 = 0x422;
 
 /// The comparison operators [`cannot_error`] accepts.
 const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", "<=", ">", ">="];
@@ -859,16 +893,27 @@ fn typed(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> Option<Typed> {
 /// expression (and a FILTER) must itself be error-free. `DISTINCT` is
 /// refused: it compares values with the type's equality operator, which a
 /// user type may implement so that it raises.
+///
+/// `OVER ()` is accepted: one window over every row, with no partition,
+/// ordering or frame expression to evaluate around the counter. Any other
+/// window (`OVER (PARTITION BY …)`, `ORDER BY`, frames or a named window)
+/// is refused, as are window functions in general.
 fn count_call(
     ctx: &Ctx<'_>,
     f: &typedpg_pg_query::protobuf::FuncCall,
     scope: &FromScope<'_>,
 ) -> Option<Typed> {
-    if f.over.is_some()
-        || f.agg_distinct
-        || !f.agg_order.is_empty()
-        || f.agg_within_group
-        || f.func_variadic
+    if f.agg_distinct || !f.agg_order.is_empty() || f.agg_within_group || f.func_variadic {
+        return None;
+    }
+    if let Some(window) = &f.over
+        && (!window.name.is_empty()
+            || !window.refname.is_empty()
+            || !window.partition_clause.is_empty()
+            || !window.order_clause.is_empty()
+            || window.frame_options != FRAMEOPTION_DEFAULTS
+            || window.start_offset.is_some()
+            || window.end_offset.is_some())
     {
         return None;
     }
@@ -1224,8 +1269,9 @@ fn clock_shift(
 /// Whether running `select` (a subquery, in `scope`'s level: [`FromScope::of_select`]
 /// of it) more or fewer times, or over rows it didn't reach before, can
 /// never raise an error: its FROM only reads stored tables (joined with ON
-/// conditions [`cannot_error`] accepts, in a single FROM item), and every
-/// expression of it — target list, WHERE, GROUP BY, HAVING, DISTINCT ON,
+/// conditions [`cannot_error`] accepts, or `USING` equalities no cast or
+/// user operator runs, in a single FROM item), and every expression of it
+/// — target list (`*` included), WHERE, GROUP BY, HAVING, DISTINCT ON,
 /// ORDER BY — is one [`cannot_error`] accepts; LIMIT / OFFSET are
 /// non-negative integer constants. No WITH, window or set operation.
 pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &FromScope<'_>) -> bool {
@@ -1233,10 +1279,11 @@ pub(crate) fn error_free_select(ctx: &Ctx<'_>, select: &SelectStmt, scope: &From
 }
 
 /// [`error_free_select`] with `count(...)` accepted as an aggregate that
-/// can't fail. The lint rules use it for a `LIMIT` / `DISTINCT` fix: those
-/// rewrites don't change which rows an aggregate consumes, and `count`
-/// only increments a counter. The simplifications keep the stricter
-/// [`error_free_select`].
+/// can't fail. The lint rules use it for a `LIMIT` / `DISTINCT` fix, and the
+/// `distinct` and `union_all` simplifications withhold their rewrite on the
+/// same proof: a `count` only increments a counter (an `OVER ()` adds no
+/// window expression around it), so it can't raise and change the errors a
+/// query reports.
 pub(crate) fn error_free_select_allow_count(
     ctx: &Ctx<'_>,
     select: &SelectStmt,
@@ -1286,7 +1333,12 @@ fn error_free_select_with(
             .collect();
         check(ctx, q, &FromScope::of_items(ctx, &sides, scope.parent))
     }) && select.target_list.iter().all(|t| match t.node.as_ref() {
-        Some(N::ResTarget(r)) => r.indirection.is_empty() && r.val.as_deref().is_some_and(ok),
+        Some(N::ResTarget(r)) => {
+            r.indirection.is_empty()
+                && r.val
+                    .as_deref()
+                    .is_some_and(|v| target_cannot_error(ctx, v, scope, check))
+        }
         _ => false,
     }) && select.where_clause.as_deref().is_none_or(ok)
         && select.group_clause.iter().all(ok)
@@ -1303,6 +1355,90 @@ fn error_free_select_with(
         && limit_ok(select.limit_offset.as_deref())
 }
 
+/// Whether a target-list value can't raise: a `*` or `q.*` expands to
+/// plain columns of the level's base tables (see [`star_cannot_error`]);
+/// anything else is `check`ed.
+fn target_cannot_error(
+    ctx: &Ctx<'_>,
+    value: &Node,
+    scope: &FromScope<'_>,
+    check: fn(&Ctx<'_>, &Node, &FromScope<'_>) -> bool,
+) -> bool {
+    match value.node.as_ref() {
+        Some(N::ColumnRef(column)) => match star_fields(column) {
+            Some(qualifier) => star_cannot_error(ctx, scope, qualifier),
+            None => check(ctx, value, scope),
+        },
+        _ => check(ctx, value, scope),
+    }
+}
+
+/// The qualifier of a `*` or `q.*` column reference (`Some(None)` for a
+/// bare `*`), or `None` when it isn't one.
+fn star_fields(column: &ColumnRef) -> Option<Option<&str>> {
+    let mut names = Vec::new();
+    for (i, field) in column.fields.iter().enumerate() {
+        match field.node.as_ref() {
+            Some(N::String(s)) => names.push(s.sval.as_str()),
+            Some(N::AStar(_)) if i + 1 == column.fields.len() => {
+                return match names.as_slice() {
+                    [] => Some(None),
+                    [qualifier] => Some(Some(*qualifier)),
+                    // `a.b.*` names no relation of this level.
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether every column a `*` or `q.*` expands to can be read without
+/// raising: each is a plain column of a base table, never a virtual
+/// generated one (whose value is computed as it is read). A star over an
+/// item this can't see into gives up.
+fn star_cannot_error(ctx: &Ctx<'_>, scope: &FromScope<'_>, qualifier: Option<&str>) -> bool {
+    let mut matched = false;
+    for item in &scope.items {
+        match item {
+            Item::Table {
+                refname,
+                rel,
+                columns,
+                ..
+            } => {
+                if qualifier.is_some_and(|q| q != refname) {
+                    continue;
+                }
+                matched = true;
+                if !columns
+                    .iter()
+                    .all(|(_, attnum)| column_cannot_error(ctx, *rel, *attnum))
+                {
+                    return false;
+                }
+            }
+            Item::Opaque { refname } => {
+                if qualifier.is_none_or(|q| refname.as_deref().is_none_or(|r| r == q)) {
+                    return false;
+                }
+            }
+        }
+    }
+    matched
+}
+
+/// Whether `attnum` of `rel` is a stored column: a virtual generated one is
+/// computed as it is read, so its expression can raise.
+fn column_cannot_error(ctx: &Ctx<'_>, rel: PgClassOid, attnum: i16) -> bool {
+    ctx.catalog
+        .attributes_of(rel)
+        .iter()
+        .find(|a| a.attnum == attnum)
+        .is_some_and(|a| a.attgenerated != Some(crate::pg_catalog::AttGenerated::Virtual))
+}
+
 /// [`cannot_error`], also accepting a whole `count(...)` call.
 fn cannot_error_or_count(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> bool {
     match expr.node.as_ref() {
@@ -1312,8 +1448,9 @@ fn cannot_error_or_count(ctx: &Ctx<'_>, expr: &Node, scope: &FromScope<'_>) -> b
 }
 
 /// Whether a FROM item reads stored tables only (no function, subquery,
-/// CTE or view, no USING / NATURAL join, whose implicit equality may
-/// coerce), collecting its ON conditions.
+/// CTE or view), collecting its ON conditions. A `USING` join is accepted
+/// only when its implicit equality can't raise
+/// ([`using_join_cannot_error`]).
 fn reads_stored_tables<'n>(
     ctx: &Ctx<'_>,
     ctes: &HashSet<String>,
@@ -1330,7 +1467,9 @@ fn reads_stored_tables<'n>(
                     .is_some_and(|c| stored_tree(ctx.catalog, c.oid))
         }
         Some(N::JoinExpr(j)) => {
-            if j.is_natural || !j.using_clause.is_empty() {
+            if j.is_natural
+                || (!j.using_clause.is_empty() && !using_join_cannot_error(ctx, ctes, j))
+            {
                 return false;
             }
             if let Some(q) = j.quals.as_deref() {
@@ -1343,6 +1482,76 @@ fn reads_stored_tables<'n>(
         }
         _ => false,
     }
+}
+
+/// Whether the equality a `USING (name)` join builds between its two plain
+/// table references can't raise: both sides expose every name, and the `=`
+/// PG resolves between their types is a built-in exact one — no cast and no
+/// user operator runs. A side that isn't a plain table reference (or whose
+/// alias column list can't be read) gives up.
+fn using_join_cannot_error(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    join: &typedpg_pg_query::protobuf::JoinExpr,
+) -> bool {
+    if join.using_clause.is_empty() {
+        return false;
+    }
+    let mut names = Vec::new();
+    for name in &join.using_clause {
+        let Some(N::String(name)) = name.node.as_ref() else {
+            return false;
+        };
+        names.push(name.sval.as_str());
+    }
+    let column_type = |side: Option<&Node>, name: &str| -> Option<crate::oid::PgTypeOid> {
+        let Some(N::RangeVar(rv)) = side?.node.as_ref() else {
+            return None;
+        };
+        let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+        if !rv.catalogname.is_empty() || (schema.is_none() && ctes.contains(&rv.relname)) {
+            return None;
+        }
+        let class = ctx.catalog.resolve_table(schema, &rv.relname)?;
+        if !stored_tree(ctx.catalog, class.oid) {
+            return None;
+        }
+        let mut attrs: Vec<_> = ctx
+            .catalog
+            .attributes_of(class.oid)
+            .iter()
+            .filter(|a| a.attnum > 0)
+            .collect();
+        attrs.sort_by_key(|a| a.attnum);
+        let renames = rv.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
+        if renames.len() > attrs.len() {
+            return None;
+        }
+        let mut found = None;
+        for (i, attr) in attrs.iter().enumerate() {
+            let exposed = match renames.get(i) {
+                Some(rename) => match rename.node.as_ref() {
+                    Some(N::String(name)) => name.sval.as_str(),
+                    _ => return None,
+                },
+                None => attr.attname.as_str(),
+            };
+            if exposed == name {
+                found = Some(attr.atttypid);
+            }
+        }
+        found
+    };
+    names.iter().all(|name| {
+        let (Some(left), Some(right)) = (
+            column_type(join.larg.as_deref(), name),
+            column_type(join.rarg.as_deref(), name),
+        ) else {
+            return false;
+        };
+        builtin_strict_equality(ctx.catalog, left, right)
+            && builtin_strict_equality(ctx.catalog, right, left)
+    })
 }
 
 /// `col` with the qualifier PG resolved it by: the alias (or name, with
