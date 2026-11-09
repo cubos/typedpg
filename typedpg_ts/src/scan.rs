@@ -618,27 +618,36 @@ fn escape(s: &str) -> (usize, usize) {
             Some(cp) => (3, utf8_len(cp)),
             None => (1, 1),
         },
-        'u' if s[1..].starts_with('{') => match s[2..].find('}') {
-            Some(end) => {
-                let cp = u32::from_str_radix(&s[2..2 + end], 16).unwrap_or(0xFFFD);
-                (3 + end, utf8_len(cp))
+        // `\uXXXX` or `\u{…}`: a high surrogate followed at once by a low
+        // one, in either spelling, is one 4-byte character.
+        'u' => match unicode_escape(s) {
+            Some((len, hi @ 0xD800..=0xDBFF)) => {
+                match s[len..].strip_prefix('\\').and_then(unicode_escape) {
+                    Some((lo_len, 0xDC00..=0xDFFF)) => (len + 1 + lo_len, 4),
+                    _ => (len, utf8_len(hi)),
+                }
             }
-            None => (1, 1),
-        },
-        'u' => match hex(&s[1..], 4) {
-            // A surrogate pair (`😀`) is one 4-byte character.
-            Some(hi @ 0xD800..=0xDBFF)
-                if s[5..].starts_with("\\u")
-                    && hex(&s[7..], 4).is_some_and(|lo| (0xDC00..=0xDFFF).contains(&lo)) =>
-            {
-                let _ = hi;
-                (11, 4)
-            }
-            Some(cp) => (5, utf8_len(cp)),
+            Some((len, cp)) => (len, utf8_len(cp)),
             None => (1, 1),
         },
         c => (c.len_utf8(), c.len_utf8()),
     }
+}
+
+/// A `\u` escape at the start of `s` (after its backslash, so `s` starts
+/// with `u`): how many bytes it spans and the code unit or point it names.
+fn unicode_escape(s: &str) -> Option<(usize, u32)> {
+    let rest = s.strip_prefix('u')?;
+    if let Some(braced) = rest.strip_prefix('{') {
+        let end = braced.find('}')?;
+        let cp = u32::from_str_radix(&braced[..end], 16).unwrap_or(0xFFFD);
+        return Some((3 + end, cp));
+    }
+    let digits = rest.get(..4)?;
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((5, u32::from_str_radix(digits, 16).ok()?))
 }
 
 /// Byte offset → line / column.
@@ -770,6 +779,23 @@ sql('SELECT 1');
     fn template_literal_values_are_cooked() {
         let s = run("import { sql } from './db';\nsql(`SELECT\n  'a\\tb'`);\n");
         assert_eq!(texts(&s), vec![(0, Kind::Query, "SELECT\n  'a\tb'")]);
+    }
+
+    #[test]
+    fn surrogate_pairs_map_as_one_character_in_every_spelling() {
+        // Each spelling of 😀 cooks to four bytes; the next byte is ` AS`.
+        for raw in [
+            r"'\u{D83D}\u{DE00}' AS emoji",
+            r"'\uD83D\uDE00' AS emoji",
+            r"'\u{D83D}\uDE00' AS emoji",
+            r"'\uD83D\u{DE00}' AS emoji",
+            r"'\u{1F600}' AS emoji",
+        ] {
+            let cooked = "'😀' AS emoji";
+            let at = cooked.find(" AS").unwrap();
+            let mapped = cooked_to_raw(raw, false, at);
+            assert_eq!(&raw[mapped..], " AS emoji", "{raw}");
+        }
     }
 
     #[test]
