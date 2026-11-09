@@ -16,7 +16,7 @@ use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{Block, Expr, Ident, LitStr, Macro, Token};
+use syn::{Block, Expr, Ident, LitStr, Macro, Pat, Stmt, Token};
 
 /// A query found at one `sql!` site.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,12 +30,18 @@ pub(crate) struct FoundQuery {
     /// The bindings after the literal, exactly as the macro parses them;
     /// empty when that parse fails (the SQL is still linted).
     pub bindings: Vec<Binding>,
-    /// The method called directly on the macro expression, if any: the
-    /// `fetch_one()` of `sql!(…).fetch_one().await`.
-    pub call: Option<Call>,
+    /// The methods called on the query, in source order: directly on the
+    /// macro, or on a plain local binding of it.
+    pub calls: Vec<Call>,
+    /// How many uses of the query the scan saw, method calls included.
+    pub uses: usize,
+    /// Whether a use is not a method call the scan recognized (`f(q)`,
+    /// `&q`, a reassignment, …). `unused_returning` stays quiet then: the
+    /// query may be used in a way the calls do not show.
+    pub escapes: bool,
 }
 
-/// A method called directly on a `sql!` expression.
+/// A method called on a query expression or a local binding of one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Call {
     /// The method's name (`fetch_one`, `fetch_optional`, `fetch_all`,
@@ -174,7 +180,9 @@ impl Finder<'_> {
                     text: literal.value.clone(),
                     literal,
                     bindings,
-                    call: None,
+                    calls: Vec::new(),
+                    uses: 0,
+                    escapes: false,
                 });
             }
             Err(error) => self.scan.errors.push(FoundError {
@@ -234,32 +242,232 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         }
     }
 
+    fn visit_block(&mut self, block: &'ast Block) {
+        self.record_bindings(block);
+        syn::visit::visit_block(self, block);
+    }
+
     fn visit_expr(&mut self, expr: &'ast Expr) {
-        // A method called on the macro expression names the call site of
-        // the query the macro records. The receiver is visited first, so
-        // the query exists by the time the link is made.
+        // A method called on the macro expression names a call site of the
+        // query the macro records. The receiver is visited first, so the
+        // query exists by the time the call is linked.
         if let Expr::MethodCall(method) = expr
             && let Some(mac) = receiver_macro(&method.receiver)
-            && mac
-                .path
-                .segments
-                .last()
-                .is_some_and(|segment| segment.ident == "sql")
+            && is_sql_macro(mac)
         {
             let start = span_offset(self.text, mac.path.span());
             let method_span = method.method.span();
             let name = method.method.to_string();
             let span = span_offset(self.text, method_span)..span_end_offset(self.text, method_span);
             syn::visit::visit_expr(self, expr);
-            if let Some(&index) = self.queries.get(&start)
-                && let query = &mut self.scan.queries[index]
-                && query.call.is_none()
-            {
-                query.call = Some(Call { method: name, span });
+            if let Some(&index) = self.queries.get(&start) {
+                let query = &mut self.scan.queries[index];
+                query.calls.push(Call { method: name, span });
+                query.uses += 1;
             }
             return;
         }
         syn::visit::visit_expr(self, expr);
+    }
+}
+
+impl Finder<'_> {
+    /// Record the calls on a `let q = sql!(…);` in `block`: its following
+    /// statements, up to a shadowing binding or a reassignment of `q`.
+    fn record_bindings(&mut self, block: &Block) {
+        for (position, statement) in block.stmts.iter().enumerate() {
+            let Stmt::Local(local) = statement else {
+                continue;
+            };
+            let Some(name) = plain_ident_pattern(&local.pat) else {
+                continue;
+            };
+            let Some(init) = &local.init else {
+                continue;
+            };
+            let Some(mac) = receiver_macro(&init.expr) else {
+                continue;
+            };
+            if !is_sql_macro(mac) {
+                continue;
+            }
+            self.record_sql(mac);
+            let start = span_offset(self.text, mac.path.span());
+            let Some(&index) = self.queries.get(&start) else {
+                continue;
+            };
+            let uses = binding_uses(self.text, &name, &block.stmts[position + 1..]);
+            let query = &mut self.scan.queries[index];
+            query.calls.extend(uses.calls);
+            query.uses += uses.uses;
+            query.escapes |= uses.escapes;
+        }
+    }
+}
+
+/// Whether `mac` is a `sql!` invocation (its path ends in `sql`).
+fn is_sql_macro(mac: &Macro) -> bool {
+    mac.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "sql")
+}
+
+/// The name a plain `let` pattern binds (`let q = …`), if it is one.
+fn plain_ident_pattern(pattern: &Pat) -> Option<String> {
+    let Pat::Ident(ident) = pattern else {
+        return None;
+    };
+    if ident.subpat.is_some() {
+        return None;
+    }
+    Some(ident.ident.to_string())
+}
+
+/// Whether `pattern` binds `name` anywhere (`let (q, x) = …` shadows it too).
+fn pattern_binds(pattern: &Pat, name: &str) -> bool {
+    match pattern {
+        Pat::Ident(ident) => ident.ident == name,
+        Pat::Tuple(tuple) => tuple.elems.iter().any(|pat| pattern_binds(pat, name)),
+        Pat::TupleStruct(tuple) => tuple.elems.iter().any(|pat| pattern_binds(pat, name)),
+        Pat::Struct(structure) => structure
+            .fields
+            .iter()
+            .any(|field| pattern_binds(&field.pat, name)),
+        Pat::Slice(slice) => slice.elems.iter().any(|pat| pattern_binds(pat, name)),
+        Pat::Or(or) => or.cases.iter().any(|pat| pattern_binds(pat, name)),
+        Pat::Paren(paren) => pattern_binds(&paren.pat, name),
+        Pat::Reference(reference) => pattern_binds(&reference.pat, name),
+        Pat::Type(typed) => pattern_binds(&typed.pat, name),
+        _ => false,
+    }
+}
+
+/// The variable `expr` is, through parentheses, when it is a plain path.
+fn receiver_name(expr: &Expr) -> Option<&Ident> {
+    match expr {
+        Expr::Path(path)
+            if path.attrs.is_empty()
+                && path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && path.path.segments.len() == 1
+                && matches!(path.path.segments[0].arguments, PathArguments::None) =>
+        {
+            Some(&path.path.segments[0].ident)
+        }
+        Expr::Paren(paren) => receiver_name(&paren.expr),
+        Expr::Group(group) => receiver_name(&group.expr),
+        _ => None,
+    }
+}
+
+/// What the scan saw of a bound query's uses.
+#[derive(Default)]
+struct Uses {
+    calls: Vec<Call>,
+    uses: usize,
+    escapes: bool,
+}
+
+/// Walk `statements` (the rest of the block after `let name = sql!(…)`) and
+/// collect the calls on `name`, stopping at a shadowing binding or a
+/// reassignment.
+fn binding_uses(text: &str, name: &str, statements: &[Stmt]) -> Uses {
+    let mut finder = BindingUses {
+        text,
+        name,
+        uses: Uses::default(),
+        stop: false,
+    };
+    for statement in statements {
+        if finder.stop {
+            break;
+        }
+        finder.visit_stmt(statement);
+    }
+    finder.uses
+}
+
+struct BindingUses<'a> {
+    text: &'a str,
+    name: &'a str,
+    uses: Uses,
+    /// A shadowing binding or a reassignment was seen: the rest of this
+    /// block is about another value.
+    stop: bool,
+}
+
+impl<'ast> Visit<'ast> for BindingUses<'_> {
+    fn visit_block(&mut self, block: &'ast Block) {
+        // A shadowing binding inside the block only hides the outer one
+        // until the block ends.
+        let stop = self.stop;
+        self.stop = false;
+        for statement in &block.stmts {
+            if self.stop {
+                break;
+            }
+            self.visit_stmt(statement);
+        }
+        self.stop = stop;
+    }
+
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if self.stop {
+            return;
+        }
+        if let Stmt::Local(local) = statement {
+            // The initializer runs before the new binding takes effect.
+            if let Some(init) = &local.init {
+                self.visit_expr(&init.expr);
+            }
+            if pattern_binds(&local.pat, self.name) {
+                self.stop = true;
+            }
+            return;
+        }
+        syn::visit::visit_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if self.stop {
+            return;
+        }
+        match expr {
+            Expr::MethodCall(method) => {
+                if receiver_name(&method.receiver).is_some_and(|name| name == self.name) {
+                    self.uses.uses += 1;
+                    let span = method.method.span();
+                    self.uses.calls.push(Call {
+                        method: method.method.to_string(),
+                        span: span_offset(self.text, span)..span_end_offset(self.text, span),
+                    });
+                    for argument in &method.args {
+                        self.visit_expr(argument);
+                    }
+                    return;
+                }
+                syn::visit::visit_expr(self, expr);
+            }
+            Expr::Assign(assign) => {
+                if receiver_name(&assign.left).is_some_and(|name| name == self.name) {
+                    self.uses.uses += 1;
+                    self.uses.escapes = true;
+                    self.stop = true;
+                    return;
+                }
+                syn::visit::visit_expr(self, expr);
+            }
+            Expr::Path(_) => {
+                if receiver_name(expr).is_some_and(|name| name == self.name) {
+                    self.uses.uses += 1;
+                    self.uses.escapes = true;
+                    return;
+                }
+                syn::visit::visit_expr(self, expr);
+            }
+            _ => syn::visit::visit_expr(self, expr),
+        }
     }
 }
 
@@ -883,27 +1091,97 @@ fn main() {
         ] {
             let found = queries(source);
             assert_eq!(found.len(), 1, "{source}");
-            let call = found[0]
-                .call
-                .as_ref()
-                .unwrap_or_else(|| panic!("no call site: {source}"));
+            assert_eq!(found[0].calls.len(), 1, "{source}");
+            let call = &found[0].calls[0];
             assert_eq!(call.method, method, "{source}");
             assert_eq!(&source[call.span.clone()], method, "{source}");
+            assert_eq!(found[0].uses, 1, "{source}");
+            assert!(!found[0].escapes, "{source}");
         }
     }
 
     #[test]
-    fn a_method_on_a_bound_query_is_not_a_call_on_the_macro() {
+    fn a_method_on_a_bound_query_is_a_call_on_the_query() {
         let source = r#"fn main() {
     let query = sql!(pool, "SELECT 1");
     let _ = query.fetch_one().await;
 }"#;
-        assert!(queries(source)[0].call.is_none());
+        let query = &queries(source)[0];
+        assert_eq!(query.calls.len(), 1);
+        assert_eq!(query.calls[0].method, "fetch_one");
+        assert_eq!(&source[query.calls[0].span.clone()], "fetch_one");
+        assert_eq!(query.uses, 1);
+        assert!(!query.escapes);
+    }
+
+    #[test]
+    fn every_call_in_branches_is_collected() {
+        let source = r#"fn main() {
+    let query = sql!(pool, "SELECT 1");
+    if cond {
+        query.fetch_one().await?;
+    } else {
+        query.fetch_optional().await?;
+    }
+}"#;
+        let query = &queries(source)[0];
+        let methods: Vec<&str> = query
+            .calls
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect();
+        assert_eq!(methods, ["fetch_one", "fetch_optional"]);
+        assert_eq!(query.uses, 2);
+        assert!(!query.escapes);
+    }
+
+    #[test]
+    fn a_shadowing_binding_stops_the_calls() {
+        let source = r#"fn main() {
+    let query = sql!(pool, "SELECT 1");
+    let _ = query.fetch_one().await?;
+    let query = sql!(pool, "SELECT 2");
+    let _ = query.execute().await?;
+}"#;
+        let found = queries(source);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].calls.len(), 1);
+        assert_eq!(found[0].calls[0].method, "fetch_one");
+        assert_eq!(found[1].calls.len(), 1);
+        assert_eq!(found[1].calls[0].method, "execute");
+    }
+
+    #[test]
+    fn a_reassigned_binding_stops_the_calls() {
+        let source = r#"fn main() {
+    let mut query = sql!(pool, "SELECT 1");
+    let _ = query.fetch_one().await?;
+    query = other;
+    let _ = query.execute().await?;
+}"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.calls.len(), 1);
+        assert_eq!(query.calls[0].method, "fetch_one");
+        assert!(query.escapes);
+    }
+
+    #[test]
+    fn an_escaping_binding_keeps_the_calls_and_marks_the_escape() {
+        let source = r#"fn main() {
+    let query = sql!(pool, "SELECT 1");
+    let _ = query.fetch_one().await?;
+    consume(query);
+}"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.calls.len(), 1);
+        assert_eq!(query.uses, 2);
+        assert!(query.escapes);
     }
 
     #[test]
     fn a_plain_query_has_no_call_site() {
         let source = r#"fn main() { sql!(pool, "SELECT 1").await; }"#;
-        assert!(queries(source)[0].call.is_none());
+        let query = &queries(source)[0];
+        assert!(query.calls.is_empty());
     }
 }

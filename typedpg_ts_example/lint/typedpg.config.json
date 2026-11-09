@@ -11,6 +11,9 @@
     "redundantLimit": "off",
     "redundantDistinct": "off",
     "fkTypeMismatch": "off",
-    "missingLockTimeout": "off"
+    "missingLockTimeout": "off",
+    "fetchMayReturnMany": "off",
+    "fetchAllSingleRow": "off",
+    "unusedReturning": "off"
   }
 }

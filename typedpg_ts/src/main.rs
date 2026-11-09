@@ -10,7 +10,7 @@ use typedpg_cli::{MigrateAction, connect, create_migration, run_migrate_action};
 use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
-use typedpg_lint::{Finding, IgnoreSet, LintOptions, MigrationLint};
+use typedpg_lint::{CallFinding, IgnoreSet, LintOptions, MigrationLint, Rule};
 use typedpg_ts::cache;
 use typedpg_ts::config::{CONFIG_FILE, Config};
 use typedpg_ts::project::Project;
@@ -159,7 +159,7 @@ fn generate(config: &Path, check: bool) -> Result<bool, String> {
 }
 
 /// A query's findings, or its analysis error and offset.
-type LintResult = Result<Vec<Finding>, (String, Option<usize>)>;
+type LintResult = Result<Vec<CallFinding>, (String, Option<usize>)>;
 
 /// `path` as the report shows it: relative to `root`.
 fn relative(path: &Path, root: &Path) -> String {
@@ -221,7 +221,7 @@ fn build_lint(
     let config = Config::load(config)?;
     let options = LintOptions::from_config(&config.lint);
     let ignore = IgnoreSet::new(&config.lint.ignore)?;
-    let mut project = Project::new(config, true)?;
+    let mut project = Project::for_lint(config)?;
     let root = project.config.root.clone();
     // The check `cargo build` would run: every diagnostic it reports is a
     // failure here too (a query or COPY target that does not analyze, a
@@ -242,9 +242,10 @@ fn build_lint(
             message: diagnostic.message.clone(),
         });
     }
-    // `(database, text)` → its findings or analysis error. The same query is
-    // often written at several call sites.
-    let mut cache: HashMap<(usize, String), LintResult> = HashMap::new();
+    // `(database, text, calls)` → its findings or analysis error. The same
+    // query is often written at several call sites.
+    let mut cache: HashMap<(usize, String, Vec<typedpg_lint::Call>, bool), LintResult> =
+        HashMap::new();
     let mut migration_paths = HashSet::new();
     for db in 0..project.database_count() {
         let files = match project.lint_migration_files(db) {
@@ -315,25 +316,52 @@ fn build_lint(
             Ok(catalog) => catalog,
             Err(_) => continue,
         };
+        let calls: Vec<typedpg_lint::Call> = query.calls.iter().map(|call| call.call()).collect();
+        let mut query_options = options.clone();
+        if query.escapes {
+            query_options = query_options.with_rule_off(Rule::UnusedReturning);
+        }
         let result = cache
-            .entry((query.db, query.text.clone()))
+            .entry((query.db, query.text.clone(), calls.clone(), query.escapes))
             .or_insert_with(|| {
-                typedpg_lint::lint_query(catalog, &query.text, &options)
+                typedpg_lint::lint_query_called(catalog, &query.text, &calls, &query_options)
                     .map_err(|error| (error.error.to_string(), error.offset))
             });
         if let Ok(findings) = result {
-            for finding in findings {
-                let entry = Entry {
-                    path: relative(query.file, &root),
-                    start: position(query.lines.text(), query.source.offset(finding.span.start)),
-                    end: position(query.lines.text(), query.source.offset(finding.span.end)),
-                    finding: finding.clone(),
+            for placed in findings {
+                let finding = &placed.finding;
+                let entry = match placed.call {
+                    Some(index) => {
+                        let call = &query.calls[index];
+                        let path = relative(call.file, &root);
+                        report
+                            .sources
+                            .entry(path.clone())
+                            .or_insert_with(|| call.lines.text().to_owned());
+                        Entry {
+                            path,
+                            start: position(call.lines.text(), call.span.start),
+                            end: position(call.lines.text(), call.span.end),
+                            finding: finding.clone(),
+                        }
+                    }
+                    None => Entry {
+                        path: relative(query.file, &root),
+                        start: position(
+                            query.lines.text(),
+                            query.source.offset(finding.span.start),
+                        ),
+                        end: position(query.lines.text(), query.source.offset(finding.span.end)),
+                        finding: finding.clone(),
+                    },
                 };
                 report.entries.push(entry.clone());
+                // A call-site finding is reported at the call, but its fix
+                // edits the SQL: write the file the query is in.
                 if let Some(edits) = query.source.fix_edits(&finding.fix) {
                     pending.push(PendingFix {
                         path: query.file.to_path_buf(),
-                        shown: entry.path.clone(),
+                        shown: relative(query.file, &root),
                         entry,
                         scanned: query.lines.text().to_owned(),
                         edits,

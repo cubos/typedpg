@@ -2,86 +2,111 @@
 //! and `unused_returning`.
 //!
 //! They run over the query's [`QueryView`](typedpg_analyzer::QueryView) like
-//! every other query rule: the method called on the `sql!` result decides
-//! what to report, and the analyzer's cardinality proof decides whether the
-//! statement can return more than one row. A finding's span and fix are in
-//! the analyzed SQL text, which `lint_query_called` maps back to the text
-//! the user wrote.
+//! every other query rule: the methods called on the query result decide what
+//! to report, and the analyzer's cardinality proof decides whether the
+//! statement can return more than one row. A finding is placed at the method
+//! identifier in the calling file — a query can be called from several
+//! places, with different methods — while a fix edits the analyzed SQL text.
 
 use typedpg_analyzer::statement_at_most_one_row;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::RawStmt;
 use typedpg_pg_query::protobuf::node::Node;
 
-use crate::{CallMethod, Ctx, RawFinding, Rule, SqlEdit};
+use crate::{Call, CallMethod, Ctx, Language, RawFinding, Rule, SqlEdit};
 
-/// The findings of `rule` at this call site, if `rule` is a call-site rule
-/// that fires for `call`.
-pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>, call: Option<CallMethod>) -> Vec<RawFinding> {
-    let Some(call) = call else {
-        return Vec::new();
-    };
+/// A raw finding placed at a call (or none), before the crate gives it its
+/// severity and maps its fix.
+pub(crate) struct RawCallFinding {
+    pub call: Option<usize>,
+    pub finding: RawFinding,
+}
+
+/// The findings of `rule` at the call sites `calls`, as written.
+pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     match rule {
-        Rule::FetchMayReturnMany => match call {
-            CallMethod::FetchOne | CallMethod::FetchOptional
-                if !statement_at_most_one_row(ctx.catalog, ctx.view) =>
-            {
-                vec![fetch_may_return_many(call, ctx)]
-            }
-            _ => Vec::new(),
-        },
-        Rule::FetchAllSingleRow => match call {
-            CallMethod::FetchAll if statement_at_most_one_row(ctx.catalog, ctx.view) => {
-                vec![fetch_all_single_row(ctx)]
-            }
-            _ => Vec::new(),
-        },
-        Rule::UnusedReturning => match call {
-            CallMethod::Execute => unused_returning(ctx),
-            _ => Vec::new(),
-        },
+        Rule::FetchMayReturnMany => calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                matches!(
+                    call.method,
+                    CallMethod::FetchOne | CallMethod::FetchOptional
+                ) && !statement_at_most_one_row(ctx.catalog, ctx.view)
+            })
+            .map(|(index, call)| RawCallFinding {
+                call: Some(index),
+                finding: fetch_may_return_many(call, ctx),
+            })
+            .collect(),
+        Rule::FetchAllSingleRow => calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                call.method == CallMethod::FetchAll
+                    && statement_at_most_one_row(ctx.catalog, ctx.view)
+            })
+            .map(|(index, call)| RawCallFinding {
+                call: Some(index),
+                finding: fetch_all_single_row(call),
+            })
+            .collect(),
+        Rule::UnusedReturning => unused_returning(ctx, calls),
         _ => Vec::new(),
     }
 }
 
 /// The finding for `fetch_one` / `fetch_optional` on a statement the proof
-/// does not bound to one row. The span is the statement's first token.
-fn fetch_may_return_many(call: CallMethod, ctx: &Ctx<'_>) -> RawFinding {
-    let method = match call {
-        CallMethod::FetchOptional => "fetch_optional",
-        _ => "fetch_one",
-    };
+/// does not bound to one row.
+fn fetch_may_return_many(call: &Call, ctx: &Ctx<'_>) -> RawFinding {
     RawFinding {
         span: statement_start(ctx),
         message: format!(
-            "`.{method}()` fails with TooManyRows if this query returns a second row, and nothing \
-             in the schema limits it to one"
+            "`.{}()` fails with TooManyRows if this query returns a second row, and nothing \
+             in the schema limits it to one",
+            call.name
         ),
-        help: Some(
-            "filter by a unique key, add LIMIT 1 with an ORDER BY, or use .fetch_all()".to_owned(),
-        ),
+        help: Some(match call.language {
+            Language::Rust => {
+                "filter by a unique key, add LIMIT 1 with an ORDER BY, or use .fetch_all()"
+                    .to_owned()
+            }
+            Language::TypeScript => {
+                "filter by a unique key, add LIMIT 1 with an ORDER BY, or use .fetchAll()"
+                    .to_owned()
+            }
+        }),
         fix: Vec::new(),
     }
 }
 
 /// The finding for `fetch_all` on a statement the proof bounds to one row.
-fn fetch_all_single_row(ctx: &Ctx<'_>) -> RawFinding {
+fn fetch_all_single_row(call: &Call) -> RawFinding {
     RawFinding {
-        span: statement_start(ctx),
-        message: "`.fetch_all()` on a query that returns at most one row".to_owned(),
-        help: Some("use .fetch_optional() (or .fetch_one())".to_owned()),
+        span: 0..0,
+        message: format!("`.{}()` on a query that returns at most one row", call.name),
+        help: Some(match call.language {
+            Language::Rust => "use .fetch_optional() (or .fetch_one())".to_owned(),
+            Language::TypeScript => "use .fetchOptional() (or .fetchOne())".to_owned(),
+        }),
         fix: Vec::new(),
     }
 }
 
-/// The finding for `execute()` on a top-level `INSERT` / `UPDATE` /
+/// The findings for `execute()` on a top-level `INSERT` / `UPDATE` /
 /// `DELETE` / `MERGE` with a `RETURNING` list, whose rows `execute()`
 /// discards.
 ///
-/// The fix deletes the clause, unless the returning list calls a function or
-/// contains a sublink: removing the call could change what the statement
-/// observes or does, so that one is reported only.
-fn unused_returning(ctx: &Ctx<'_>) -> Vec<RawFinding> {
+/// Reported only when every call is an `execute()`: the caller leaves a
+/// query that may escape (be exported, passed to another function, …) out of
+/// `calls`. The fix deletes the clause, unless the returning list calls a
+/// function or contains a sublink: removing the call could change what the
+/// statement observes or does, so that one is reported only. The fix is
+/// offered only when the query has exactly one call, the one `execute()`.
+fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
+    if calls.is_empty() || calls.iter().any(|call| call.method != CallMethod::Execute) {
+        return Vec::new();
+    }
     let Some(raw) = ctx.view.tree.stmts.first() else {
         return Vec::new();
     };
@@ -101,20 +126,27 @@ fn unused_returning(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     let Some((keyword, end)) = returning_span(ctx, raw) else {
         return Vec::new();
     };
-    let fix = if returning.exprs.iter().any(contains_call_or_subquery) {
-        Vec::new()
-    } else {
+    let fix = if calls.len() == 1 && !returning.exprs.iter().any(contains_call_or_subquery) {
         vec![SqlEdit {
             range: whitespace_start(ctx.sql, keyword)..end,
             text: String::new(),
         }]
+    } else {
+        Vec::new()
     };
-    vec![RawFinding {
-        span: keyword..end,
-        message: "`.execute()` discards the RETURNING rows".to_owned(),
-        help: Some("remove RETURNING, or fetch the rows".to_owned()),
-        fix,
-    }]
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| RawCallFinding {
+            call: Some(index),
+            finding: RawFinding {
+                span: keyword..end,
+                message: format!("`.{}()` discards the RETURNING rows", call.name),
+                help: Some("remove RETURNING, or fetch the rows".to_owned()),
+                fix: fix.clone(),
+            },
+        })
+        .collect()
 }
 
 /// The first non-comment token of the query: `SELECT`, `INSERT`, …
@@ -197,7 +229,7 @@ mod tests {
     use super::*;
     use typedpg_analyzer::PgCatalog;
 
-    use crate::{CallMethod, Finding, LintOptions, Severity, lint_query_called};
+    use crate::{CallFinding, Finding, LintOptions, Severity, lint_query_called};
 
     fn catalog() -> PgCatalog {
         let mut catalog = PgCatalog::new().unwrap();
@@ -210,14 +242,30 @@ mod tests {
         catalog
     }
 
-    fn lint(catalog: &PgCatalog, sql: &str, call: Option<CallMethod>) -> Vec<Finding> {
-        lint_query_called(catalog, sql, call, &LintOptions::default()).unwrap()
+    fn rust(method: CallMethod, name: &str) -> Call {
+        Call {
+            method,
+            name: name.to_owned(),
+            language: Language::Rust,
+        }
     }
 
-    fn only(findings: Vec<Finding>, rule: Rule) -> Vec<Finding> {
+    fn ts(method: CallMethod, name: &str) -> Call {
+        Call {
+            method,
+            name: name.to_owned(),
+            language: Language::TypeScript,
+        }
+    }
+
+    fn lint(catalog: &PgCatalog, sql: &str, calls: &[Call]) -> Vec<CallFinding> {
+        lint_query_called(catalog, sql, calls, &LintOptions::default()).unwrap()
+    }
+
+    fn only(findings: Vec<CallFinding>, rule: Rule) -> Vec<CallFinding> {
         findings
             .into_iter()
-            .filter(|finding| finding.rule == rule)
+            .filter(|placed| placed.finding.rule == rule)
             .collect()
     }
 
@@ -234,20 +282,12 @@ mod tests {
     fn fetch_one_on_a_unique_key_is_fine() {
         let db = catalog();
         let sql = "SELECT id, name FROM users WHERE id = $1";
-        assert!(
-            only(
-                lint(&db, sql, Some(CallMethod::FetchOne)),
-                Rule::FetchMayReturnMany
-            )
-            .is_empty()
-        );
-        assert!(
-            only(
-                lint(&db, sql, Some(CallMethod::FetchOptional)),
-                Rule::FetchMayReturnMany
-            )
-            .is_empty()
-        );
+        for call in [
+            rust(CallMethod::FetchOne, "fetch_one"),
+            rust(CallMethod::FetchOptional, "fetch_optional"),
+        ] {
+            assert!(only(lint(&db, sql, &[call]), Rule::FetchMayReturnMany).is_empty());
+        }
     }
 
     #[test]
@@ -255,11 +295,13 @@ mod tests {
         let db = catalog();
         let sql = "SELECT id, name FROM users WHERE org_id = $1";
         let findings = only(
-            lint(&db, sql, Some(CallMethod::FetchOne)),
+            lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
             Rule::FetchMayReturnMany,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
-        let finding = &findings[0];
+        let placed = &findings[0];
+        assert_eq!(placed.call, Some(0));
+        let finding = &placed.finding;
         assert_eq!(finding.severity, Severity::Warning);
         assert_eq!(
             finding.message,
@@ -270,7 +312,35 @@ mod tests {
             finding.help.as_deref(),
             Some("filter by a unique key, add LIMIT 1 with an ORDER BY, or use .fetch_all()")
         );
-        assert_eq!(&sql[finding.span.clone()], "SELECT");
+    }
+
+    #[test]
+    fn each_offending_call_gets_its_own_finding() {
+        let db = catalog();
+        let sql = "SELECT id, name FROM users WHERE org_id = $1";
+        let findings = only(
+            lint(
+                &db,
+                sql,
+                &[
+                    rust(CallMethod::FetchOne, "fetch_one"),
+                    ts(CallMethod::FetchOptional, "fetchOptional"),
+                ],
+            ),
+            Rule::FetchMayReturnMany,
+        );
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert_eq!(findings[0].call, Some(0));
+        assert_eq!(findings[1].call, Some(1));
+        assert_eq!(
+            findings[1].finding.message,
+            "`.fetchOptional()` fails with TooManyRows if this query returns a second row, and \
+             nothing in the schema limits it to one"
+        );
+        assert_eq!(
+            findings[1].finding.help.as_deref(),
+            Some("filter by a unique key, add LIMIT 1 with an ORDER BY, or use .fetchAll()")
+        );
     }
 
     #[test]
@@ -278,16 +348,21 @@ mod tests {
         let db = catalog();
         let sql = "SELECT id, name FROM users WHERE org_id = $1";
         let findings = only(
-            lint(&db, sql, Some(CallMethod::FetchOptional)),
+            lint(
+                &db,
+                sql,
+                &[rust(CallMethod::FetchOptional, "fetch_optional_as")],
+            ),
             Rule::FetchMayReturnMany,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
             findings[0]
+                .finding
                 .message
-                .starts_with("`.fetch_optional()` fails with TooManyRows"),
+                .starts_with("`.fetch_optional_as()` fails with TooManyRows"),
             "{}",
-            findings[0].message
+            findings[0].finding.message
         );
     }
 
@@ -297,7 +372,7 @@ mod tests {
         let sql = "SELECT id, name FROM users LIMIT 1";
         assert!(
             only(
-                lint(&db, sql, Some(CallMethod::FetchOne)),
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
                 Rule::FetchMayReturnMany
             )
             .is_empty()
@@ -310,7 +385,11 @@ mod tests {
         let sql = "SELECT count(*) FROM users";
         assert!(
             only(
-                lint(&db, sql, Some(CallMethod::FetchOptional)),
+                lint(
+                    &db,
+                    sql,
+                    &[rust(CallMethod::FetchOptional, "fetch_optional")]
+                ),
                 Rule::FetchMayReturnMany
             )
             .is_empty()
@@ -322,21 +401,22 @@ mod tests {
         let db = catalog();
         let sql = "SELECT id, name FROM users WHERE id = $1";
         let findings = only(
-            lint(&db, sql, Some(CallMethod::FetchAll)),
+            lint(&db, sql, &[ts(CallMethod::FetchAll, "fetchAll")]),
             Rule::FetchAllSingleRow,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
-        let finding = &findings[0];
+        let placed = &findings[0];
+        assert_eq!(placed.call, Some(0));
+        let finding = &placed.finding;
         assert_eq!(finding.severity, Severity::Info);
         assert_eq!(
             finding.message,
-            "`.fetch_all()` on a query that returns at most one row"
+            "`.fetchAll()` on a query that returns at most one row"
         );
         assert_eq!(
             finding.help.as_deref(),
-            Some("use .fetch_optional() (or .fetch_one())")
+            Some("use .fetchOptional() (or .fetchOne())")
         );
-        assert_eq!(&sql[finding.span.clone()], "SELECT");
     }
 
     #[test]
@@ -345,7 +425,7 @@ mod tests {
         let sql = "SELECT id, name FROM users WHERE org_id = $1";
         assert!(
             only(
-                lint(&db, sql, Some(CallMethod::FetchAll)),
+                lint(&db, sql, &[rust(CallMethod::FetchAll, "fetch_all_as")]),
                 Rule::FetchAllSingleRow
             )
             .is_empty()
@@ -357,18 +437,19 @@ mod tests {
         let db = catalog();
         let sql = "INSERT INTO users (id, name) VALUES (1, 'x') RETURNING id";
         let findings = only(
-            lint(&db, sql, Some(CallMethod::Execute)),
+            lint(&db, sql, &[ts(CallMethod::Execute, "execute")]),
             Rule::UnusedReturning,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
-        let finding = &findings[0];
+        let placed = &findings[0];
+        assert_eq!(placed.call, Some(0));
+        let finding = &placed.finding;
         assert_eq!(finding.severity, Severity::Info);
         assert_eq!(finding.message, "`.execute()` discards the RETURNING rows");
         assert_eq!(
             finding.help.as_deref(),
             Some("remove RETURNING, or fetch the rows")
         );
-        assert_eq!(&sql[finding.span.clone()], "RETURNING id");
         assert_eq!(
             fixed(sql, finding),
             "INSERT INTO users (id, name) VALUES (1, 'x')"
@@ -380,12 +461,15 @@ mod tests {
         let db = catalog();
         let sql = "UPDATE users SET name = 'x' WHERE id = $1 RETURNING now()";
         let findings = only(
-            lint(&db, sql, Some(CallMethod::Execute)),
+            lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
             Rule::UnusedReturning,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].fix.is_empty(), "{:?}", findings[0].fix);
-        assert_eq!(&sql[findings[0].span.clone()], "RETURNING now()");
+        assert!(
+            findings[0].finding.fix.is_empty(),
+            "{:?}",
+            findings[0].finding.fix
+        );
     }
 
     #[test]
@@ -394,11 +478,47 @@ mod tests {
         let sql = "UPDATE users SET name = 'x' WHERE id = $1";
         assert!(
             only(
-                lint(&db, sql, Some(CallMethod::Execute)),
+                lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
                 Rule::UnusedReturning
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn unused_returning_needs_every_call_to_be_execute() {
+        let db = catalog();
+        let sql = "INSERT INTO users (id, name) VALUES (1, 'x') RETURNING id";
+        let findings = lint(
+            &db,
+            sql,
+            &[
+                ts(CallMethod::Execute, "execute"),
+                ts(CallMethod::FetchOne, "fetchOne"),
+            ],
+        );
+        assert!(only(findings, Rule::UnusedReturning).is_empty());
+    }
+
+    #[test]
+    fn unused_returning_with_two_executes_reports_without_a_fix() {
+        let db = catalog();
+        let sql = "INSERT INTO users (id, name) VALUES (1, 'x') RETURNING id";
+        let findings = only(
+            lint(
+                &db,
+                sql,
+                &[
+                    ts(CallMethod::Execute, "execute"),
+                    ts(CallMethod::Execute, "execute"),
+                ],
+            ),
+            Rule::UnusedReturning,
+        );
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings.iter().all(|placed| placed.finding.fix.is_empty()));
+        assert_eq!(findings[0].call, Some(0));
+        assert_eq!(findings[1].call, Some(1));
     }
 
     #[test]
@@ -409,7 +529,7 @@ mod tests {
             "SELECT id, name FROM users WHERE id = $1",
             "INSERT INTO users (id, name) VALUES (1, 'x') RETURNING id",
         ] {
-            let findings = lint(&db, sql, None);
+            let findings = lint(&db, sql, &[]);
             for rule in [
                 Rule::FetchMayReturnMany,
                 Rule::FetchAllSingleRow,
@@ -427,7 +547,7 @@ mod tests {
                    SELECT id, name FROM users WHERE org_id = $1";
         assert!(
             only(
-                lint(&db, sql, Some(CallMethod::FetchOne)),
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
                 Rule::FetchMayReturnMany
             )
             .is_empty()
@@ -436,7 +556,7 @@ mod tests {
                    INSERT INTO users (id, name) VALUES (1, 'x') RETURNING id";
         assert!(
             only(
-                lint(&db, sql, Some(CallMethod::Execute)),
+                lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
                 Rule::UnusedReturning
             )
             .is_empty()

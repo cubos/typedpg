@@ -321,6 +321,9 @@ pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>>
         ),
         "{stdout}"
     );
+    // The findings sit at the methods in the calling file, not in the SQL.
+    assert!(stdout.contains("src/main.rs:11:6]"), "{stdout}");
+    assert!(stdout.contains("src/main.rs:19:6]"), "{stdout}");
 
     let output = run(true);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -356,6 +359,120 @@ pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>>
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
     assert!(!stdout.contains("unused_returning"), "{stdout}");
     assert!(stdout.contains("fetch_may_return_many"), "{stdout}");
+}
+
+#[test]
+fn lint_reports_the_call_of_a_bound_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "bound_call_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TABLE users (id integer PRIMARY KEY, org_id integer, name text);\n",
+    )
+    .unwrap();
+    let path = root.join("src/main.rs");
+    std::fs::write(
+        &path,
+        r#"//! A query bound to a local, called through the binding.
+use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>> {
+    let query = sql!(pool, "SELECT id FROM users WHERE org_id = $org", org = &org);
+    let _ = query.fetch_one().await?;
+    Ok(())
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .output()
+        .expect("run `cargo-typedpg`");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}\n{stdout}");
+    assert!(stdout.contains("src/main.rs:6:19]"), "{stdout}");
+    assert!(
+        stdout.contains("warning[fetch_may_return_many]"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_escaping_bound_query_does_not_report_its_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "escaping_call_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TABLE users (id integer PRIMARY KEY, name text);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        r#"//! The query may be used in a way the calls do not show.
+use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool, cond: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let query = sql!(
+        pool,
+        "INSERT INTO users (id, name) VALUES ($id, $name) RETURNING id",
+        id = &id,
+        name = &name,
+    );
+    if cond {
+        query.execute().await?;
+    } else {
+        drop(query);
+    }
+    Ok(())
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .output()
+        .expect("run `cargo-typedpg`");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}\n{stdout}");
+    assert!(!stdout.contains("unused_returning"), "{stdout}");
 }
 
 #[test]

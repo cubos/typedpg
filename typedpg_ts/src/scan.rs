@@ -8,19 +8,27 @@
 //! taken for it. A use the scan misses still fails to type-check — a query
 //! absent from the generated module is a type error — so the scan can stay
 //! conservative.
+//!
+//! The scan also records how a query is called: the methods on the `sql(…)`
+//! expression, on a local `const`/`let` binding of it, and on a `.sql` query
+//! or an exported `sql()` binding imported from another file. Those calls
+//! are placed at their method identifier, in the file that makes them.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use oxc_allocator::Allocator;
+use oxc_ast::AstKind;
 use oxc_ast::ast::{
-    Argument, CallExpression, ExportSpecifier, Expression, ImportDeclarationSpecifier,
-    ModuleExportName, Statement, TaggedTemplateExpression,
+    Argument, BindingPattern, CallExpression, Declaration, ExportSpecifier, Expression,
+    ImportDeclarationSpecifier, ModuleExportName, Program, Statement, StaticMemberExpression,
+    TaggedTemplateExpression, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
-use oxc_semantic::{Scoping, SemanticBuilder, SymbolId};
-use oxc_span::{GetSpan, SourceType};
+use oxc_semantic::{AstNodes, Scoping, SemanticBuilder, SymbolId};
+use oxc_span::{GetSpan, SourceType, Span};
 
 /// The names a generated module exports its functions as.
 pub const SQL_EXPORT: &str = "sql";
@@ -46,13 +54,43 @@ impl Kind {
     }
 }
 
+/// A query another module exports: a `.sql` file's query, or a TypeScript
+/// source's `export const x = sql(…)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QueryExport {
+    /// The file that declares the query (canonical when the resolver reported
+    /// it).
+    pub file: PathBuf,
+    /// The name it is exported as.
+    pub name: String,
+}
+
 /// What an imported name is, as far as typedpg is concerned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Export {
     /// A generated module's `sql` or `copyIn`.
     Item { db: usize, kind: Kind },
     /// A generated module itself, as a namespace (`import * as db`).
     Namespace { db: usize },
+    /// A query another module exports.
+    Query(QueryExport),
+}
+
+/// A method called on a query result in a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundCall {
+    /// The method as written: `fetchOne`, `fetchValue`, `execute`, …
+    pub method: String,
+    /// Byte range of the method identifier.
+    pub span: Range<usize>,
+}
+
+/// A call on a query another module declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCall {
+    pub query: QueryExport,
+    pub method: String,
+    pub span: Range<usize>,
 }
 
 /// A query found in a source.
@@ -67,6 +105,17 @@ pub struct FoundQuery {
     pub pos: Position,
     /// The literal as written, to locate an offset of `text` in the file.
     pub literal: Literal,
+    /// The methods called on the query expression or a local binding of it,
+    /// in source order.
+    pub calls: Vec<FoundCall>,
+    /// How many uses of the expression or a local binding the scan saw,
+    /// method calls included.
+    pub uses: usize,
+    /// A use that is not a seen method call (`f(q)`, a property read, an
+    /// assignment, …): `unused_returning` stays quiet then.
+    pub escapes: bool,
+    /// The names the query is exported as from this file.
+    pub exports: Vec<String>,
 }
 
 /// A string or template literal as written in the source.
@@ -143,6 +192,8 @@ pub struct ScanDiagnostic {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileScan {
     pub queries: Vec<FoundQuery>,
+    /// Calls on queries declared in other files.
+    pub remote_calls: Vec<RemoteCall>,
     pub diagnostics: Vec<ScanDiagnostic>,
     /// The source's lines, to place a query's errors.
     pub lines: LineIndex,
@@ -204,7 +255,10 @@ pub fn scan(
     }
 
     // Symbols are assigned by the semantic pass.
-    let semantic = SemanticBuilder::new().build(&program).semantic;
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&program)
+        .semantic;
     let bindings: HashMap<SymbolId, Binding> = imported
         .into_iter()
         .filter_map(|(local, spec, name)| Some((local.symbol_id.get()?, Binding { spec, name })))
@@ -212,18 +266,26 @@ pub fn scan(
 
     let mut finder = Finder {
         scoping: semantic.scoping(),
+        nodes: semantic.nodes(),
         bindings: &bindings,
         resolve,
         cache: HashMap::new(),
         lines: &lines,
         queries: Vec::new(),
+        remote_calls: Vec::new(),
+        query_bindings: HashMap::new(),
+        recorded: HashMap::new(),
+        handled: std::collections::HashSet::new(),
+        exporting: false,
         diagnostics: Vec::new(),
     };
     finder.visit_program(&program);
-    let (queries, diagnostics) = (finder.queries, finder.diagnostics);
+    finder.analyze_bindings();
+    finder.record_local_exports(&program);
     Some(FileScan {
-        queries,
-        diagnostics,
+        queries: finder.queries,
+        remote_calls: finder.remote_calls,
+        diagnostics: finder.diagnostics,
         lines,
     })
 }
@@ -232,6 +294,9 @@ pub fn scan(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleExports {
     pub entries: Vec<ExportEntry>,
+    /// The names of the queries the module declares and exports itself
+    /// (`export const x = sql(…)`, or a local one re-exported).
+    pub queries: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,11 +343,50 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
             }
         }
     }
+    // The queries the module declares itself: a local `const x = sql(…)`
+    // (exported with `export`, or by a later `export { x }`).
+    let mut local_queries = HashSet::new();
+    for stmt in &parsed.program.body {
+        let variables = match stmt {
+            Statement::VariableDeclaration(variables) => variables,
+            Statement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::VariableDeclaration(variables) => variables,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        for declarator in &variables.declarations {
+            if let Some(name) = declared_query(declarator, &imports) {
+                local_queries.insert(name.to_owned());
+            }
+        }
+    }
     let mut entries = Vec::new();
+    let mut queries = Vec::new();
     for stmt in &parsed.program.body {
         match stmt {
+            Statement::ExportDeclaration(export) => {
+                if let Declaration::VariableDeclaration(variables) = &export.declaration {
+                    for declarator in &variables.declarations {
+                        if let Some(name) = declared_query(declarator, &imports) {
+                            queries.push(name.to_owned());
+                        }
+                    }
+                }
+            }
             Statement::ExportNamedDeclaration(export) if !export.export_kind.is_type() => {
                 named_exports(&export.specifiers, None, &imports, &mut entries);
+                for specifier in &export.specifiers {
+                    let (Some(local), Some(exported)) = (
+                        export_name(&specifier.local),
+                        export_name(&specifier.exported),
+                    ) else {
+                        continue;
+                    };
+                    if local_queries.contains(local) {
+                        queries.push(exported.to_owned());
+                    }
+                }
             }
             Statement::ExportFromDeclaration(export) if !export.export_kind.is_type() => {
                 if let Some(spec) = export.source.value.as_str() {
@@ -309,7 +413,49 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
             _ => {}
         }
     }
-    Some(ModuleExports { entries })
+    queries.dedup();
+    Some(ModuleExports { entries, queries })
+}
+
+/// The name a `const x = sql(…)` declarator binds, when its initializer is a
+/// `sql()` call.
+fn declared_query<'a>(
+    declarator: &'a VariableDeclarator<'a>,
+    imports: &HashMap<&str, (&str, &str)>,
+) -> Option<&'a str> {
+    let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+        return None;
+    };
+    let init = declarator.init.as_ref()?;
+    is_sql_call(init, imports).then(|| id.name.as_str())
+}
+
+/// Whether `expr` is a `sql(…)` call, with `sql` imported or a generated
+/// module's namespace member. This is the syntax-only check the export scan
+/// can do without the resolver; the full scan resolves the import.
+fn is_sql_call(expr: &Expression, imports: &HashMap<&str, (&str, &str)>) -> bool {
+    let Expression::CallExpression(call) = expr.without_parentheses() else {
+        return false;
+    };
+    match call.callee.without_parentheses() {
+        Expression::Identifier(id) => {
+            id.name == SQL_EXPORT
+                || imports
+                    .get(id.name.as_str())
+                    .is_some_and(|&(_, name)| name == SQL_EXPORT)
+        }
+        Expression::StaticMemberExpression(member) => {
+            member.property.name == SQL_EXPORT
+                && matches!(
+                    member.object.without_parentheses(),
+                    Expression::Identifier(id)
+                        if imports
+                            .get(id.name.as_str())
+                            .is_some_and(|&(_, name)| name == "*")
+                )
+        }
+        _ => false,
+    }
 }
 
 fn named_exports(
@@ -342,6 +488,26 @@ fn named_exports(
     }
 }
 
+/// The method called on `callee`, when it is a static member call
+/// (`q.fetchOne(…)`).
+fn member_call<'a>(
+    callee: &'a Expression<'a>,
+) -> Option<(&'a str, &'a StaticMemberExpression<'a>)> {
+    let Expression::StaticMemberExpression(member) = callee.without_parentheses() else {
+        return None;
+    };
+    Some((member.property.name.as_str(), member))
+}
+
+/// Whether `name` is a method the call-site rules map to a [`CallMethod`].
+fn mapped_method(name: &str) -> Option<()> {
+    matches!(
+        name,
+        "fetchOne" | "fetchValue" | "fetchOptional" | "fetchValueOptional" | "fetchAll" | "execute"
+    )
+    .then_some(())
+}
+
 #[derive(Debug, Clone)]
 struct Binding {
     spec: String,
@@ -361,12 +527,24 @@ fn export_name<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a str> {
 
 struct Finder<'s, 'r> {
     scoping: &'s Scoping,
+    nodes: &'s AstNodes<'s>,
     bindings: &'s HashMap<SymbolId, Binding>,
     resolve: &'r mut dyn FnMut(&str, &str) -> Option<Export>,
     /// `(specifier, name)` → what it is, resolved once per file.
     cache: HashMap<(String, String), Option<Export>>,
     lines: &'s LineIndex,
     queries: Vec<FoundQuery>,
+    remote_calls: Vec<RemoteCall>,
+    /// The queries a local `const q = sql(…)` binds: symbol → query index.
+    query_bindings: HashMap<SymbolId, usize>,
+    /// The byte start of each `sql()` / `copyIn()` call already turned into a
+    /// query, and the query it is.
+    recorded: HashMap<u32, usize>,
+    /// The calls already examined (recorded or rejected), so walking a call
+    /// twice does not report its misuse twice.
+    handled: HashSet<u32>,
+    /// Whether the declaration being visited is `export const …`.
+    exporting: bool,
     diagnostics: Vec<ScanDiagnostic>,
 }
 
@@ -374,10 +552,10 @@ impl Finder<'_, '_> {
     fn resolve(&mut self, spec: &str, name: &str) -> Option<Export> {
         let key = (spec.to_owned(), name.to_owned());
         if let Some(r) = self.cache.get(&key) {
-            return *r;
+            return r.clone();
         }
         let r = (self.resolve)(spec, name);
-        self.cache.insert(key, r);
+        self.cache.insert(key, r.clone());
         r
     }
 
@@ -408,7 +586,7 @@ impl Finder<'_, '_> {
     fn target(&mut self, binding: &Binding, member: Option<&str>) -> Option<(usize, Kind)> {
         let item = |e: Option<Export>| match e? {
             Export::Item { db, kind } => Some((db, kind)),
-            Export::Namespace { .. } => None,
+            Export::Namespace { .. } | Export::Query(_) => None,
         };
         match (binding.name == "*", member) {
             // `ns.sql(...)`: the module's own export.
@@ -418,8 +596,239 @@ impl Finder<'_, '_> {
             // `{ ns }` re-exported as a namespace, then `ns.sql(...)`.
             (false, Some(member)) => match self.resolve(&binding.spec, &binding.name)? {
                 Export::Namespace { db } => Some((db, Kind::of_export(member)?)),
-                Export::Item { .. } => None,
+                Export::Item { .. } | Export::Query(_) => None,
             },
+        }
+    }
+
+    /// The query `binding` (`.member`) is, if it is another module's.
+    fn query_export(&mut self, binding: &Binding, member: Option<&str>) -> Option<QueryExport> {
+        let query = |e: Option<Export>| match e? {
+            Export::Query(query) => Some(query),
+            Export::Item { .. } | Export::Namespace { .. } => None,
+        };
+        match (binding.name == "*", member) {
+            // `ns.userById`: a namespace import's query export.
+            (true, Some(member)) => query(self.resolve(&binding.spec, member)),
+            (true, None) => None,
+            // `userById` or `userById as id`: a named import.
+            (false, None) => query(self.resolve(&binding.spec, &binding.name)),
+            (false, Some(_)) => None,
+        }
+    }
+
+    /// The query `expr` names, when it is an imported binding: a named
+    /// import used directly, or `ns.name` through a namespace import.
+    fn imported_query(&mut self, expr: &Expression) -> Option<QueryExport> {
+        match expr.without_parentheses() {
+            Expression::Identifier(id) => {
+                let symbol = self
+                    .scoping
+                    .get_reference(id.reference_id.get()?)
+                    .symbol_id()?;
+                let binding = self.bindings.get(&symbol)?.clone();
+                if binding.name == "*" {
+                    return None;
+                }
+                self.query_export(&binding, None)
+            }
+            Expression::StaticMemberExpression(member) => {
+                let Expression::Identifier(id) = member.object.without_parentheses() else {
+                    return None;
+                };
+                let symbol = self
+                    .scoping
+                    .get_reference(id.reference_id.get()?)
+                    .symbol_id()?;
+                let binding = self.bindings.get(&symbol)?.clone();
+                if binding.name != "*" {
+                    return None;
+                }
+                self.query_export(&binding, Some(member.property.name.as_str()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The generated `sql()` call `expr` is, when it is the receiver of a
+    /// method call: `sql("…").fetchOne(…)`.
+    fn query_call(&mut self, expr: &Expression) -> Option<(usize, Kind)> {
+        let Expression::CallExpression(call) = expr.without_parentheses() else {
+            return None;
+        };
+        let (binding, member) = self.callee_binding(&call.callee)?;
+        let (db, kind) = self.target(&binding, member)?;
+        (kind == Kind::Query).then_some((db, kind))
+    }
+
+    /// Record `call` as the query it is, once: the walk visits a receiver
+    /// `sql()` call after the outer method call that already recorded it.
+    fn record_once(&mut self, call: &CallExpression, db: usize, kind: Kind) -> Option<usize> {
+        let start = call.span.start;
+        if let Some(&index) = self.recorded.get(&start) {
+            return Some(index);
+        }
+        if !self.handled.insert(start) {
+            return None;
+        }
+        let before = self.queries.len();
+        self.record(call, db, kind);
+        if self.queries.len() > before {
+            self.recorded.insert(start, before);
+            Some(before)
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::record_once`] of the `sql()` call `receiver` is.
+    fn record_receiver(&mut self, receiver: &Expression, db: usize, kind: Kind) -> Option<usize> {
+        let Expression::CallExpression(call) = receiver.without_parentheses() else {
+            return None;
+        };
+        self.record_once(call, db, kind)
+    }
+
+    /// Attach a method call to query `index`.
+    fn attach(&mut self, index: usize, method: &str, span: Span) {
+        let query = &mut self.queries[index];
+        query.calls.push(FoundCall {
+            method: method.to_owned(),
+            span: span.start as usize..span.end as usize,
+        });
+        query.uses += 1;
+        // `fetchStream` (and anything not mapped to a rule) is still a use:
+        // `unused_returning` cannot be sure every use is an `execute()`.
+        if mapped_method(method).is_none() {
+            query.escapes = true;
+        }
+    }
+
+    /// The local `const q = sql(…)` a declarator is, recorded and mapped to
+    /// its symbol so the semantic references can be classified later.
+    fn local_query(&mut self, declarator: &VariableDeclarator) -> Option<usize> {
+        let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+            return None;
+        };
+        let init = declarator.init.as_ref()?;
+        let Expression::CallExpression(call) = init.without_parentheses() else {
+            return None;
+        };
+        let (binding, member) = self.callee_binding(&call.callee)?;
+        let (db, kind) = self.target(&binding, member)?;
+        if kind != Kind::Query {
+            return None;
+        }
+        let index = self.record_once(call, db, kind)?;
+        let symbol = id.symbol_id.get()?;
+        self.query_bindings.insert(symbol, index);
+        Some(index)
+    }
+
+    /// Classify every reference to a local query binding: method calls are
+    /// call sites, anything else means the query escapes.
+    fn analyze_bindings(&mut self) {
+        let mut bindings: Vec<(SymbolId, usize)> = self
+            .query_bindings
+            .iter()
+            .map(|(&symbol, &index)| (symbol, index))
+            .collect();
+        bindings.sort_by_key(|(_, index)| *index);
+        for (symbol, index) in bindings {
+            let mut references: Vec<_> = self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .map(|&reference| self.scoping.get_reference(reference))
+                .collect();
+            references
+                .sort_by_key(|reference| self.nodes.get_node(reference.node_id()).span().start);
+            let mut uses = 0usize;
+            let mut escapes = false;
+            for reference in references {
+                let node = self.nodes.get_node(reference.node_id());
+                if reference.is_write() {
+                    // An assignment replaces the query: later calls are on
+                    // another value.
+                    uses += 1;
+                    escapes = true;
+                    break;
+                }
+                if let Some((method, span)) = self.method_call_at(node) {
+                    uses += 1;
+                    self.queries[index].calls.push(FoundCall {
+                        method: method.clone(),
+                        span: span.start as usize..span.end as usize,
+                    });
+                    if mapped_method(&method).is_none() {
+                        escapes = true;
+                    }
+                } else {
+                    uses += 1;
+                    escapes = true;
+                }
+            }
+            self.queries[index].uses += uses;
+            self.queries[index].escapes |= escapes;
+        }
+    }
+
+    /// The `name` of the `X.name(…)` call `node` is the receiver of, when
+    /// `node` is an identifier reference directly.
+    fn method_call_at(&self, node: &oxc_semantic::AstNode<'_>) -> Option<(String, Span)> {
+        if !matches!(node.kind(), AstKind::IdentifierReference(_)) {
+            return None;
+        }
+        let parent = self.nodes.parent_node(node.id());
+        let AstKind::StaticMemberExpression(member) = parent.kind() else {
+            return None;
+        };
+        if member.object.span() != node.span() {
+            return None;
+        }
+        let call = self.nodes.parent_node(parent.id());
+        let AstKind::CallExpression(call) = call.kind() else {
+            return None;
+        };
+        if call.callee.without_parentheses().span() != member.span {
+            return None;
+        }
+        Some((member.property.name.to_string(), member.property.span))
+    }
+
+    /// A local query exported by `export { q as name }`.
+    fn record_local_exports(&mut self, program: &Program<'_>) {
+        for statement in &program.body {
+            let Statement::ExportNamedDeclaration(export) = statement else {
+                continue;
+            };
+            if export.export_kind.is_type() {
+                continue;
+            }
+            for specifier in &export.specifiers {
+                if specifier.export_kind.is_type() {
+                    continue;
+                }
+                let ModuleExportName::IdentifierReference(local) = &specifier.local else {
+                    continue;
+                };
+                let Some(reference) = local.reference_id.get() else {
+                    continue;
+                };
+                let Some(symbol) = self.scoping.get_reference(reference).symbol_id() else {
+                    continue;
+                };
+                let Some(&index) = self.query_bindings.get(&symbol) else {
+                    continue;
+                };
+                let Some(name) = export_name(&specifier.exported) else {
+                    continue;
+                };
+                if !self.queries[index].exports.iter().any(|e| e == name) {
+                    self.queries[index].exports.push(name.to_owned());
+                }
+                self.queries[index].escapes = true;
+            }
         }
     }
 
@@ -432,7 +841,26 @@ impl Finder<'_, '_> {
 }
 
 impl<'a> Visit<'a> for Finder<'_, '_> {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let Some(index) = self.local_query(declarator)
+            && self.exporting
+            && let BindingPattern::BindingIdentifier(id) = &declarator.id
+        {
+            self.queries[index].exports.push(id.name.to_string());
+            self.queries[index].escapes = true;
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_export_declaration(&mut self, declaration: &oxc_ast::ast::ExportDeclaration<'a>) {
+        let exporting = self.exporting;
+        self.exporting = true;
+        walk::walk_export_declaration(self, declaration);
+        self.exporting = exporting;
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        // The call itself may be a `sql(…)` / `copyIn(…)`.
         if let Some((binding, member)) = self.callee_binding(&call.callee) {
             let literal_arg = match call.arguments.as_slice() {
                 [Argument::StringLiteral(_)] => true,
@@ -447,7 +875,22 @@ impl<'a> Visit<'a> for Finder<'_, '_> {
                 None
             };
             if let Some((db, kind)) = target {
-                self.record(call, db, kind);
+                self.record_once(call, db, kind);
+            }
+        }
+        // A method called on a query expression: `sql("…").fetchOne(…)`, or
+        // on another module's imported query.
+        if let Some((method, member)) = member_call(&call.callee) {
+            if let Some((db, kind)) = self.query_call(&member.object) {
+                if let Some(index) = self.record_receiver(&member.object, db, kind) {
+                    self.attach(index, method, member.property.span);
+                }
+            } else if let Some(query) = self.imported_query(&member.object) {
+                self.remote_calls.push(RemoteCall {
+                    query,
+                    method: method.to_owned(),
+                    span: member.property.span.start as usize..member.property.span.end as usize,
+                });
             }
         }
         walk::walk_call_expression(self, call);
@@ -565,6 +1008,10 @@ impl Finder<'_, '_> {
                 text,
                 pos: self.lines.position(start as usize),
                 literal,
+                calls: Vec::new(),
+                uses: 0,
+                escapes: false,
+                exports: Vec::new(),
             });
         }
     }
@@ -858,6 +1305,152 @@ sql();
         assert!(msgs[2].contains("not as a template tag"));
         assert!(msgs[3].contains("the target passed to copyIn() must be a string literal"));
         assert!(msgs[4].contains("sql() takes exactly one argument"));
+    }
+
+    #[test]
+    fn calls_on_a_direct_query_and_a_local_binding_are_recorded() {
+        let s = run(r#"
+import { sql } from './db';
+sql('SELECT 1').fetchOne(pool);
+const q = sql('SELECT 2');
+q.fetchAll(pool);
+q.execute(pool);
+"#);
+        assert_eq!(s.queries.len(), 2, "{:?}", s.queries);
+        assert_eq!(s.queries[0].calls.len(), 1);
+        assert_eq!(s.queries[0].calls[0].method, "fetchOne");
+        assert_eq!(s.queries[0].uses, 1);
+        assert!(!s.queries[0].escapes);
+        let methods: Vec<&str> = s.queries[1]
+            .calls
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect();
+        assert_eq!(methods, ["fetchAll", "execute"]);
+        assert_eq!(s.queries[1].uses, 2);
+        assert!(!s.queries[1].escapes);
+    }
+
+    #[test]
+    fn scopes_shadowing_and_reassignment_follow_the_semantic_references() {
+        let s = run(r#"
+import { sql } from './db';
+const q = sql('SELECT 1');
+q.fetchOne(pool);
+{
+    const q = sql('SELECT 2');
+    q.execute(pool);
+}
+q.fetchOptional(pool);
+q = other;
+q.fetchAll(pool);
+"#);
+        assert_eq!(s.queries.len(), 2, "{:?}", s.queries);
+        let outer: Vec<&str> = s.queries[0]
+            .calls
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect();
+        assert_eq!(outer, ["fetchOne", "fetchOptional"], "{:?}", s.queries[0]);
+        assert!(s.queries[0].escapes);
+        let inner: Vec<&str> = s.queries[1]
+            .calls
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect();
+        assert_eq!(inner, ["execute"]);
+        assert!(!s.queries[1].escapes);
+    }
+
+    #[test]
+    fn an_escaping_binding_keeps_the_calls_and_marks_the_escape() {
+        let s = run(r#"
+import { sql } from './db';
+const q = sql('SELECT 1');
+q.fetchOne(pool);
+consume(q);
+"#);
+        assert_eq!(s.queries.len(), 1);
+        assert_eq!(s.queries[0].calls.len(), 1);
+        assert_eq!(s.queries[0].uses, 2);
+        assert!(s.queries[0].escapes);
+    }
+
+    #[test]
+    fn exported_queries_record_their_export_names() {
+        let s = run(r#"
+import { sql } from './db';
+export const named = sql('SELECT 1');
+const local = sql('SELECT 2');
+export { local as renamed, local };
+"#);
+        assert_eq!(s.queries.len(), 2, "{:?}", s.queries);
+        assert_eq!(s.queries[0].exports, ["named"]);
+        assert!(s.queries[0].escapes);
+        assert_eq!(s.queries[1].exports, ["renamed", "local"]);
+    }
+
+    #[test]
+    fn calls_on_an_imported_query_are_remote_calls() {
+        let export = |file: &str, name: &str| {
+            Some(Export::Query(QueryExport {
+                file: PathBuf::from(file),
+                name: name.to_owned(),
+            }))
+        };
+        let mut resolve = |spec: &str, name: &str| match (spec, name) {
+            ("./queries", "userById") => export("/p/queries.ts", "userById"),
+            ("./queries.sql", "userById") => export("/p/queries.sql", "userById"),
+            _ => None,
+        };
+        let src = r#"
+import { userById } from './queries';
+import { userById as byId } from './queries.sql';
+import * as queries from './queries';
+userById.fetchOne(pool);
+byId.fetchOptional(pool);
+queries.userById.fetchAll(pool);
+"#;
+        let s = scan(Path::new("a.ts"), src, &mut resolve).unwrap();
+        assert!(s.queries.is_empty());
+        let calls: Vec<(&str, &str)> = s
+            .remote_calls
+            .iter()
+            .map(|call| (call.query.name.as_str(), call.method.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("userById", "fetchOne"),
+                ("userById", "fetchOptional"),
+                ("userById", "fetchAll")
+            ]
+        );
+        assert_eq!(
+            s.remote_calls
+                .iter()
+                .map(|call| &call.query.file)
+                .collect::<Vec<_>>(),
+            [
+                &PathBuf::from("/p/queries.ts"),
+                &PathBuf::from("/p/queries.sql"),
+                &PathBuf::from("/p/queries.ts")
+            ]
+        );
+    }
+
+    #[test]
+    fn module_exports_include_exported_queries_and_their_aliases() {
+        let src = r#"
+import { sql } from './db';
+export const named = sql('SELECT 1');
+const local = sql('SELECT 2');
+export { local as renamed };
+export { userById } from './queries';
+"#;
+        let exports = module_exports(Path::new("a.ts"), src).unwrap();
+        assert_eq!(exports.queries, ["named", "renamed"]);
+        assert_eq!(exports.entries.len(), 1);
     }
 
     #[test]
