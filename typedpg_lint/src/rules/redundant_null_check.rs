@@ -40,11 +40,12 @@ fn null_test(ctx: &Ctx<'_>, test: &NullTest, out: &mut Vec<RawFinding>) {
     let Some(end) = null_keyword_end(ctx, test.location).filter(|end| *end > start) else {
         return;
     };
-    let text = argument_text(ctx, arg);
-    let message = if NullTestType::try_from(test.nulltesttype) == Ok(NullTestType::IsNull) {
-        format!("`{text}` IS NULL is never true: it is never NULL")
-    } else {
-        format!("`{text}` IS NOT NULL is always true: it is never NULL")
+    let is_null = NullTestType::try_from(test.nulltesttype) == Ok(NullTestType::IsNull);
+    let message = match (argument_text(ctx, arg), is_null) {
+        (Some(text), true) => format!("`{text}` IS NULL is never true: it is never NULL"),
+        (Some(text), false) => format!("`{text}` IS NOT NULL is always true: it is never NULL"),
+        (None, true) => "IS NULL is never true here: the value is never NULL".to_owned(),
+        (None, false) => "IS NOT NULL is always true here: the value is never NULL".to_owned(),
     };
     out.push(RawFinding {
         span: start..end,
@@ -136,7 +137,15 @@ fn coalesce(ctx: &Ctx<'_>, expr: &CoalesceExpr, out: &mut Vec<RawFinding>) {
     }
     out.push(RawFinding {
         span: start..ctx.tokens[close].end,
-        message: format!("COALESCE never uses the arguments after `{text}`: it is never NULL"),
+        message: match text {
+            Some(text) => {
+                format!("COALESCE never uses the arguments after `{text}`: it is never NULL")
+            }
+            None => format!(
+                "COALESCE never uses the arguments after its {} one: it is never NULL",
+                ordinal(index)
+            ),
+        },
         help: None,
         fix,
     });
@@ -225,21 +234,26 @@ fn argument_start(node: &Node) -> Option<usize> {
     }
 }
 
-/// The expression as the message shows it, shortened to keep it on one line.
-fn argument_text(ctx: &Ctx<'_>, node: &Node) -> String {
-    let Some(start) = argument_start(node) else {
-        return "this expression".to_owned();
-    };
+/// The expression as the message shows it, on one line; `None` when it is
+/// too long to quote.
+fn argument_text(ctx: &Ctx<'_>, node: &Node) -> Option<String> {
+    let start = argument_start(node)?;
     short_text(ctx, start, expression_end(ctx, start))
 }
 
-fn short_text(ctx: &Ctx<'_>, start: usize, end: usize) -> String {
+fn short_text(ctx: &Ctx<'_>, start: usize, end: usize) -> Option<String> {
     let text = ctx.sql.get(start..end).unwrap_or_default();
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.len() > 40 {
-        "this expression".to_owned()
-    } else {
-        text
+    (!text.is_empty() && text.len() <= 40).then_some(text)
+}
+
+/// `first`, `second`, … for a zero-based argument index.
+fn ordinal(index: usize) -> String {
+    match index {
+        0 => "first".to_owned(),
+        1 => "second".to_owned(),
+        2 => "third".to_owned(),
+        n => format!("{}th", n + 1),
     }
 }
 
@@ -458,6 +472,18 @@ mod tests {
         let findings = lint(&db, sql);
         let finding = only(&findings);
         assert!(finding.fix.is_empty(), "{finding:?}");
+    }
+
+    #[test]
+    fn a_long_argument_is_named_by_its_position() {
+        let db = catalog();
+        let sql = "SELECT COALESCE((SELECT count(*) FROM checks c2 WHERE c2.nullable = checks.id), 0) FROM checks";
+        let findings = lint(&db, sql);
+        let finding = only(&findings);
+        assert_eq!(
+            finding.message,
+            "COALESCE never uses the arguments after its first one: it is never NULL"
+        );
     }
 
     #[test]
