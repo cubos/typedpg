@@ -91,6 +91,24 @@
               }
             },
             {
+              "id": "redundant_binding",
+              "shortDescription": {
+                "text": "a `sql!` binding the parameter would capture without it"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "renaming_binding",
+              "shortDescription": {
+                "text": "a `sql!` binding that only renames a variable"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
               "id": "invalid_allow",
               "shortDescription": {
                 "text": "a malformed or unknown rule name in a typedpg-lint comment"
@@ -326,6 +344,29 @@
           ]
         },
         {
+          "ruleId": "redundant_binding",
+          "level": "warning",
+          "message": {
+            "text": "`id = id` binds `$id` to the variable it captures without a binding\nremove the binding: a parameter without one captures the variable of its name (`cargo typedpg lint --fix` removes it)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/main.rs",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 22,
+                  "startColumn": 55,
+                  "endLine": 22,
+                  "endColumn": 62
+                }
+              }
+            }
+          ]
+        },
+        {
           "ruleId": "analysis_error",
           "level": "error",
           "message": {
@@ -339,7 +380,7 @@
                   "uriBaseId": "%SRCROOT%"
                 },
                 "region": {
-                  "startLine": 22,
+                  "startLine": 26,
                   "startColumn": 24
                 }
               }
@@ -360,7 +401,7 @@
                   "uriBaseId": "%SRCROOT%"
                 },
                 "region": {
-                  "startLine": 24,
+                  "startLine": 28,
                   "startColumn": 21
                 }
               }
@@ -381,7 +422,7 @@
                   "uriBaseId": "%SRCROOT%"
                 },
                 "region": {
-                  "startLine": 27,
+                  "startLine": 31,
                   "startColumn": 16
                 }
               }

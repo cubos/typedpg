@@ -25,6 +25,10 @@ pub(crate) struct Param {
     /// for this parameter. Used by codegen to insert type casts (e.g., `::jsonb`).
     /// A param referenced multiple times will have multiple offsets.
     pub sql_offsets: Vec<usize>,
+    /// Byte ranges in the **original** template of each occurrence's name,
+    /// without the `$` and without its `?`/`!` annotation. A native `$N`
+    /// placeholder has none. Used to rename a parameter in the source.
+    pub name_spans: Vec<std::ops::Range<usize>>,
 }
 
 /// A field inside a spread parameter, with optional nullable annotation.
@@ -62,6 +66,9 @@ impl From<&str> for SpreadField {
 pub(crate) struct SpreadParam {
     /// The spread name without the `$..` prefix (e.g., `"items"`).
     pub name: String,
+    /// Byte range in the **original** template of the name after `$..`
+    /// (without the `{ fields }` list). Used to rename a spread in the source.
+    pub name_span: std::ops::Range<usize>,
     /// Explicit fields when provided inline (e.g., `{ name, email?, age }`),
     /// or `None` if the spread was written without a field list.
     pub fields: Option<Vec<SpreadField>>,

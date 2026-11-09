@@ -266,6 +266,7 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
             name: n.to_string(),
             nullable: None,
             sql_offsets: Vec::new(),
+            name_spans: Vec::new(),
         });
     }
     let mut i = 0;
@@ -367,6 +368,8 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                                 });
                                 spreads.push(SpreadParam {
                                     name,
+                                    name_span: byte_offset_of(ident_start, &char_byte_lens)
+                                        ..byte_offset_of(after_ident, &char_byte_lens),
                                     fields: Some(fields),
                                     offset: out_offset,
                                 });
@@ -382,6 +385,8 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                                 });
                                 spreads.push(SpreadParam {
                                     name,
+                                    name_span: byte_offset_of(ident_start, &char_byte_lens)
+                                        ..byte_offset_of(after_ident, &char_byte_lens),
                                     fields: None,
                                     offset: out_offset,
                                 });
@@ -415,6 +420,8 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                                 None => (None, after),
                             };
 
+                            let name_start = byte_offset_of(i + 1, &char_byte_lens);
+                            let name_end = byte_offset_of(after, &char_byte_lens);
                             // Deduplicate by name. An annotation on any
                             // occurrence applies; opposite ones conflict.
                             let next_idx = if let Some(&idx) = param_indices.get(&ident) {
@@ -429,6 +436,7 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                                     (None, Some(_)) => param.nullable = nullable,
                                     _ => {}
                                 }
+                                param.name_spans.push(name_start..name_end);
                                 idx
                             } else {
                                 let idx = base + param_indices.len() + 1;
@@ -437,6 +445,9 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                                     name: ident,
                                     nullable,
                                     sql_offsets: Vec::new(),
+                                    // Not `vec![…]`: clippy takes a one-range
+                                    // vec for a mistaken range-to-vec.
+                                    name_spans: std::iter::once(name_start..name_end).collect(),
                                 });
                                 idx
                             };
@@ -475,6 +486,7 @@ fn lex_with_base(sql: &str, base: usize) -> Result<(LexOutput, usize), LexError>
                                         name: (params.len() + 1).to_string(),
                                         nullable: None,
                                         sql_offsets: Vec::new(),
+                                        name_spans: Vec::new(),
                                     });
                                 }
                                 if let Some(p) = params.get_mut(n - 1)

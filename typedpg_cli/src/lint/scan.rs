@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use proc_macro2::{Span, TokenStream};
+use syn::PathArguments;
 use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -26,6 +27,35 @@ pub(crate) struct FoundQuery {
     pub text: String,
     /// Where the literal is in the file.
     pub literal: Literal,
+    /// The bindings after the literal, exactly as the macro parses them;
+    /// empty when that parse fails (the SQL is still linted).
+    pub bindings: Vec<Binding>,
+}
+
+/// One `name = expr` or bare `name` binding of a `sql!` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Binding {
+    /// The parameter's name as the macro reads it (`Ident::to_string()`).
+    pub name: String,
+    /// What the binding maps the parameter to.
+    pub value: BindingValue,
+    /// File byte range of the binding (its name through the end of its
+    /// expression).
+    pub span: std::ops::Range<usize>,
+    /// File byte range that deletes the binding: from the comma before it
+    /// through the binding's end.
+    pub removal: std::ops::Range<usize>,
+}
+
+/// The value side of a [`Binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingValue {
+    /// A bare `name`: capture the variable of the same name.
+    Capture,
+    /// An expression that is exactly one plain variable, stored by name.
+    Variable(String),
+    /// Anything else (`&x`, `x.y`, `x.clone()`, a literal, …).
+    Other,
 }
 
 /// A target found at one `copy_in!` site.
@@ -111,7 +141,7 @@ impl Finder<'_> {
         if !self.seen.insert(start) {
             return;
         }
-        let Some((db, sql)) = parse_sql_arguments(mac.tokens.clone()) else {
+        let Some((db, sql, rest)) = parse_sql_arguments(mac.tokens.clone()) else {
             return;
         };
         match sql {
@@ -119,10 +149,12 @@ impl Finder<'_> {
                 let Some(literal) = literal(self.text, sql.span(), &sql) else {
                     return;
                 };
+                let bindings = parse_bindings(self.text, rest).unwrap_or_default();
                 self.scan.queries.push(FoundQuery {
                     db,
                     text: literal.value.clone(),
                     literal,
+                    bindings,
                 });
             }
             Err(error) => self.scan.errors.push(FoundError {
@@ -199,20 +231,83 @@ fn parse_db(input: ParseStream<'_>) -> syn::Result<Option<String>> {
     Ok(None)
 }
 
-/// `(db, sql)` from `[db = name,] executor, "SQL", …`, reading no further
-/// than the literal. The literal is an error when the argument is not a
-/// string literal: the macro rejects it.
-fn parse_sql_arguments(tokens: TokenStream) -> Option<(Option<String>, syn::Result<LitStr>)> {
-    let parser = |input: ParseStream<'_>| -> syn::Result<(Option<String>, syn::Result<LitStr>)> {
-        let db = parse_db(input)?;
-        let _: Expr = input.parse()?;
-        input.parse::<Token![,]>()?;
-        let sql = input.parse::<LitStr>();
-        // The parameter assignments after the literal are irrelevant here.
-        let _: TokenStream = input.parse()?;
-        Ok((db, sql))
+/// `(db, sql, rest)` from `[db = name,] executor, "SQL", …`: the literal,
+/// and the tokens after it. The literal is an error when the argument is not
+/// a string literal: the macro rejects it.
+fn parse_sql_arguments(
+    tokens: TokenStream,
+) -> Option<(Option<String>, syn::Result<LitStr>, TokenStream)> {
+    let parser =
+        |input: ParseStream<'_>| -> syn::Result<(Option<String>, syn::Result<LitStr>, TokenStream)> {
+            let db = parse_db(input)?;
+            let _: Expr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let sql = input.parse::<LitStr>();
+            // Whatever follows the literal: the `sql!` bindings.
+            let rest: TokenStream = input.parse()?;
+            Ok((db, sql, rest))
+        };
+    parser.parse2(tokens).ok()
+}
+
+/// The bindings after the literal, as the macro's `QueryInput::parse` reads
+/// them: each is preceded by a comma and is a bare `name` or `name = expr`.
+fn parse_bindings(text: &str, tokens: TokenStream) -> Option<Vec<Binding>> {
+    let parser = |input: ParseStream<'_>| -> syn::Result<Vec<Binding>> {
+        let mut bindings = Vec::new();
+        while input.peek(Token![,]) {
+            let comma: Token![,] = input.parse()?;
+            let comma_start = span_offset(text, comma.span());
+            if input.is_empty() {
+                break;
+            }
+            let name: Ident = input.parse()?;
+            let name_start = span_offset(text, name.span());
+            let (value, end) = if input.peek(Token![=]) {
+                input.parse::<Token![=]>()?;
+                let expr: Expr = input.parse()?;
+                (binding_value(&expr), span_end_offset(text, expr.span()))
+            } else {
+                (BindingValue::Capture, span_end_offset(text, name.span()))
+            };
+            bindings.push(Binding {
+                name: name.to_string(),
+                value,
+                span: name_start..end,
+                removal: comma_start..end,
+            });
+        }
+        if input.is_empty() {
+            Ok(bindings)
+        } else {
+            Err(input.error("unexpected tokens after the last binding"))
+        }
     };
     parser.parse2(tokens).ok()
+}
+
+/// The variable a binding's expression is, when it is exactly one plain
+/// variable: no attributes, `qself`, leading `::`, qualification or
+/// arguments, and an ordinary identifier that is not a keyword-path.
+fn binding_value(expr: &Expr) -> BindingValue {
+    let Expr::Path(path) = expr else {
+        return BindingValue::Other;
+    };
+    if !path.attrs.is_empty() || path.qself.is_some() || path.path.leading_colon.is_some() {
+        return BindingValue::Other;
+    }
+    let mut segments = path.path.segments.iter();
+    let Some(segment) = segments.next() else {
+        return BindingValue::Other;
+    };
+    if segments.next().is_some() || !matches!(segment.arguments, PathArguments::None) {
+        return BindingValue::Other;
+    }
+    let name = segment.ident.to_string();
+    if name.starts_with("r#") || matches!(name.as_str(), "self" | "Self" | "super" | "crate") {
+        return BindingValue::Other;
+    }
+    BindingValue::Variable(name)
 }
 
 /// `(db, target)` from `[db = name,] executor, "table (columns)", …`, the
@@ -265,6 +360,12 @@ fn literal(text: &str, span: Span, lit: &LitStr) -> Option<Literal> {
 fn span_offset(text: &str, span: Span) -> usize {
     let start = span.start();
     line_column_to_offset(text, start.line, start.column).unwrap_or(0)
+}
+
+/// The byte offset of a span's end (exclusive) in `text`.
+fn span_end_offset(text: &str, span: Span) -> usize {
+    let end = span.end();
+    line_column_to_offset(text, end.line, end.column).unwrap_or(text.len())
 }
 
 fn line_column_to_offset(text: &str, line: usize, column: usize) -> Option<usize> {
@@ -527,5 +628,114 @@ fn main() {
     #[test]
     fn an_unparseable_file_is_an_error() {
         assert!(scan("fn main( {").is_err());
+    }
+
+    #[test]
+    fn bindings_read_their_values_and_spans() {
+        let source = r#"fn main() {
+    let _ = sql!(pool, "SELECT 1", x = x, b, a = c, d = e.f, f = &g);
+}"#;
+        let query = &queries(source)[0];
+        let names: Vec<&str> = query
+            .bindings
+            .iter()
+            .map(|binding| binding.name.as_str())
+            .collect();
+        assert_eq!(names, ["x", "b", "a", "d", "f"]);
+        let values: Vec<&BindingValue> = query
+            .bindings
+            .iter()
+            .map(|binding| &binding.value)
+            .collect();
+        assert_eq!(
+            values,
+            [
+                &BindingValue::Variable("x".into()),
+                &BindingValue::Capture,
+                &BindingValue::Variable("c".into()),
+                &BindingValue::Other,
+                &BindingValue::Other,
+            ]
+        );
+        let written: Vec<&str> = query
+            .bindings
+            .iter()
+            .map(|binding| &source[binding.span.clone()])
+            .collect();
+        assert_eq!(written, ["x = x", "b", "a = c", "d = e.f", "f = &g"]);
+    }
+
+    #[test]
+    fn a_binding_span_ends_after_a_multi_token_expression() {
+        let source = r#"fn main() {
+    let _ = sql!(pool, "SELECT 1", a = b.c(1, 2),);
+}"#;
+        let query = &queries(source)[0];
+        assert_eq!(&source[query.bindings[0].span.clone()], "a = b.c(1, 2)");
+        assert!(source[query.bindings[0].span.end..].starts_with(",);"));
+    }
+
+    /// Delete every binding from `source` through its removal range.
+    fn without_bindings(source: &str, query: &FoundQuery) -> String {
+        let mut text = source.to_owned();
+        for binding in query.bindings.iter().rev() {
+            text.replace_range(binding.removal.clone(), "");
+        }
+        text
+    }
+
+    #[test]
+    fn removal_ranges_leave_the_remaining_arguments() {
+        // The trailing comma after the last binding stays, the way the macro
+        // accepts it: a lone comma after the literal.
+        let source = r#"fn main() { let _ = sql!(pool, "SELECT $a", a = a, b = c,); }"#;
+        let query = &queries(source)[0];
+        assert_eq!(
+            without_bindings(source, query),
+            r#"fn main() { let _ = sql!(pool, "SELECT $a",); }"#
+        );
+
+        // No trailing comma after the last binding.
+        let source = r#"fn main() { let _ = sql!(pool, "SELECT $a", a = a); }"#;
+        let query = &queries(source)[0];
+        assert_eq!(
+            without_bindings(source, query),
+            r#"fn main() { let _ = sql!(pool, "SELECT $a"); }"#
+        );
+    }
+
+    #[test]
+    fn removal_ranges_span_lines_and_a_database_prefix() {
+        let source = r#"fn main() {
+    let _ = sql!(
+        db = other,
+        pool,
+        "SELECT $a, $b",
+        a = a,
+        b = next,
+    );
+}
+"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.db.as_deref(), Some("other"));
+        assert_eq!(
+            without_bindings(source, query),
+            r#"fn main() {
+    let _ = sql!(
+        db = other,
+        pool,
+        "SELECT $a, $b",
+    );
+}
+"#
+        );
+    }
+
+    #[test]
+    fn malformed_bindings_keep_the_query_without_bindings() {
+        let source = r#"fn main() { let _ = sql!(pool, "SELECT 1", 1 = 2); }"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.text, "SELECT 1");
+        assert!(query.bindings.is_empty());
     }
 }
