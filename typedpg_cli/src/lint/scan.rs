@@ -17,7 +17,9 @@ use syn::parse::{ParseStream, Parser};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{Block, Expr, Ident, LitStr, Macro, Pat, Stmt, Token};
+use syn::{
+    Arm, Block, Expr, ExprForLoop, ExprIf, ExprWhile, Ident, LitStr, Macro, Pat, Stmt, Token,
+};
 
 /// A query found at one `sql!` site.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +478,66 @@ impl<'ast> Visit<'ast> for BindingUses<'_> {
         }
     }
 
+    fn visit_arm(&mut self, arm: &'ast Arm) {
+        // The arm's pattern (and a guard, which sees its bindings) shadows
+        // the outer binding inside the arm's body.
+        if pattern_binds(&arm.pat, self.name) {
+            return;
+        }
+        syn::visit::visit_arm(self, arm);
+    }
+
+    fn visit_expr_if(&mut self, expr: &'ast ExprIf) {
+        if self.stop {
+            return;
+        }
+        // A `let` anywhere in the condition (a let-chain: `if let Some(q) =
+        // … && ready`) binds `q` for the rest of the condition and the then
+        // branch; the else branch still sees the outer value.
+        let shadowed = visit_condition_until_binding(self, &expr.cond);
+        if !shadowed {
+            self.visit_block(&expr.then_branch);
+        }
+        if let Some((_, else_branch)) = &expr.else_branch {
+            self.visit_expr(else_branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, expr: &'ast ExprWhile) {
+        if self.stop {
+            return;
+        }
+        if !visit_condition_until_binding(self, &expr.cond) {
+            self.visit_block(&expr.body);
+        }
+    }
+
+    fn visit_expr_for_loop(&mut self, expr: &'ast ExprForLoop) {
+        if self.stop {
+            return;
+        }
+        self.visit_expr(&expr.expr);
+        if !pattern_binds(&expr.pat, self.name) {
+            self.visit_block(&expr.body);
+        }
+    }
+
+    fn visit_expr_closure(&mut self, expr: &'ast syn::ExprClosure) {
+        if self.stop {
+            return;
+        }
+        // A closure parameter shadows the outer binding throughout the
+        // body; the body's references are the parameter's, not the query's.
+        if expr
+            .inputs
+            .iter()
+            .any(|input| pattern_binds(input, self.name))
+        {
+            return;
+        }
+        syn::visit::visit_expr_closure(self, expr);
+    }
+
     fn visit_macro(&mut self, mac: &'ast Macro) {
         if self.stop {
             return;
@@ -490,6 +552,31 @@ impl<'ast> Visit<'ast> for BindingUses<'_> {
         {
             self.uses.uses += 1;
             self.uses.escapes = true;
+        }
+    }
+}
+
+/// Visit the parts of an `if` / `while` condition that run before a `let`
+/// operand binds `name`, and report whether one does. The rest of the
+/// condition and the body then see the new binding, not the query.
+fn visit_condition_until_binding(uses: &mut BindingUses<'_>, cond: &Expr) -> bool {
+    match cond {
+        Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+            if visit_condition_until_binding(uses, &binary.left) {
+                return true;
+            }
+            visit_condition_until_binding(uses, &binary.right)
+        }
+        Expr::Paren(paren) => visit_condition_until_binding(uses, &paren.expr),
+        Expr::Group(group) => visit_condition_until_binding(uses, &group.expr),
+        Expr::Let(let_expr) if pattern_binds(&let_expr.pat, uses.name) => {
+            // The scrutinee runs before the binding takes effect.
+            uses.visit_expr(&let_expr.expr);
+            true
+        }
+        _ => {
+            uses.visit_expr(cond);
+            false
         }
     }
 }
@@ -1196,6 +1283,106 @@ fn main() {
         assert_eq!(query.calls.len(), 1);
         assert_eq!(query.calls[0].method, "fetch_one");
         assert!(query.escapes);
+    }
+
+    #[test]
+    fn a_closure_parameter_shadows_the_binding() {
+        let source = r#"fn main() {
+    let q = sql!(pool, "SELECT 1");
+    let read = |q: Local| q.fetch_one();
+    q.execute().await?;
+}"#;
+        let query = &queries(source)[0];
+        assert_eq!(query.calls.len(), 1, "{:?}", query.calls);
+        assert_eq!(query.calls[0].method, "execute");
+        assert_eq!(query.uses, 1);
+        assert!(!query.escapes);
+    }
+
+    #[test]
+    fn other_pattern_bindings_shadow_the_binding_in_their_scope() {
+        for body in [
+            "match other { q => q.fetch_one(), _ => {} }",
+            "if let Some(q) = other { q.fetch_one(); }",
+            "while let Some(q) = next() { q.fetch_one(); }",
+            "for q in others { q.fetch_one(); }",
+            // Let-chains: the condition is a `&&` tree with the `let` as an
+            // operand.
+            "if let Some(q) = other && ready { q.fetch_one(); }",
+            "while let Some(q) = next() && ready { q.fetch_one(); }",
+            "if ready && let Some(q) = other { q.fetch_one(); }",
+        ] {
+            let source = format!(
+                r#"fn main() {{
+    let q = sql!(pool, "SELECT 1");
+    {body}
+    q.execute().await?;
+}}"#
+            );
+            let query = &queries(&source)[0];
+            assert_eq!(query.calls.len(), 1, "{body}: {:?}", query.calls);
+            assert_eq!(query.calls[0].method, "execute", "{body}");
+            assert_eq!(query.uses, 1, "{body}");
+            assert!(!query.escapes, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_let_chain_still_sees_the_scrutinee_and_the_operands_before_it() {
+        for (body, expected) in [
+            (
+                "if let Some(x) = q.fetch_optional().await? && ready { x }",
+                vec!["fetch_optional"],
+            ),
+            ("if q.ready() && let Some(x) = other { x }", vec!["ready"]),
+            (
+                "if ready && let Some(x) = q.fetch_optional().await? { x } else { q.fetch_one().await?; }",
+                vec!["fetch_optional", "fetch_one"],
+            ),
+        ] {
+            let source = format!(
+                r#"fn main() {{
+    let q = sql!(pool, "SELECT 1");
+    {body}
+}}"#
+            );
+            let query = &queries(&source)[0];
+            let methods: Vec<&str> = query
+                .calls
+                .iter()
+                .map(|call| call.method.as_str())
+                .collect();
+            assert_eq!(methods, expected, "{body}: {methods:?}");
+        }
+    }
+
+    #[test]
+    fn a_pattern_binding_does_not_hide_the_scrutinee_or_else_branch() {
+        for (body, expected) in [
+            (
+                "if let Some(x) = q.fetch_optional().await? { x } else { q.fetch_one().await?; }",
+                vec!["fetch_optional", "fetch_one"],
+            ),
+            (
+                "match q.fetch_optional().await? { Some(x) => x, None => q.fetch_one().await? }",
+                vec!["fetch_optional", "fetch_one"],
+            ),
+            ("for x in q.fetch_all().await? { x }", vec!["fetch_all"]),
+        ] {
+            let source = format!(
+                r#"fn main() {{
+    let q = sql!(pool, "SELECT 1");
+    {body}
+}}"#
+            );
+            let query = &queries(&source)[0];
+            let methods: Vec<&str> = query
+                .calls
+                .iter()
+                .map(|call| call.method.as_str())
+                .collect();
+            assert_eq!(methods, expected, "{body}: {methods:?}");
+        }
     }
 
     #[test]

@@ -344,6 +344,53 @@ fn a_sql_file_imported_through_its_declaration_is_linted_at_the_calls() {
 }
 
 #[test]
+fn a_mutable_module_export_does_not_attribute_remote_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts"
+        }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TABLE users (id int4 PRIMARY KEY);\n",
+    );
+    write(
+        &root.join("src/a.ts"),
+        "import { sql } from './db';\n\
+         export let mutable = sql(`SELECT 1 AS id`);\n\
+         export const one = sql(`SELECT 1 AS id`);\n\
+         export function replace() { mutable = sql(`SELECT id FROM users`); }\n",
+    );
+    write(
+        &root.join("src/b.ts"),
+        "import { mutable, one, replace } from './a';\n\
+         replace();\n\
+         mutable.fetchAll(db);\n\
+         one.fetchAll(db);\n",
+    );
+    generate(root);
+
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    // The `const` export names the single-row query; the `let` one may have
+    // been replaced by `replace()` before the call, so it is not known to be
+    // that query.
+    assert_eq!(
+        stdout.matches("fetch_all_single_row]").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stdout.contains("src/b.ts:4:"), "{stdout}");
+    assert!(!stdout.contains("src/b.ts:3:"), "{stdout}");
+}
+
+#[test]
 fn an_escaping_bound_query_does_not_report_its_returning() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

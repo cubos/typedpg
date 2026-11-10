@@ -21,9 +21,10 @@ use std::path::{Path, PathBuf};
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Declaration, ExportSpecifier, Expression,
-    ImportDeclarationSpecifier, ModuleExportName, Program, Statement, StaticMemberExpression,
-    TaggedTemplateExpression, VariableDeclarator,
+    Argument, AssignmentExpression, BindingPattern, CallExpression, Declaration, ExportSpecifier,
+    Expression, ImportDeclarationSpecifier, ModuleExportName, Program, SimpleAssignmentTarget,
+    Statement, StaticMemberExpression, TaggedTemplateExpression, UpdateExpression,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -277,6 +278,8 @@ pub fn scan(
         recorded: HashMap::new(),
         handled: std::collections::HashSet::new(),
         exporting: false,
+        mutable_declaration: false,
+        unresolved_exports: HashSet::new(),
         diagnostics: Vec::new(),
     };
     finder.visit_program(&program);
@@ -322,6 +325,13 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
     if parsed.diagnostics.has_errors() {
         return None;
     }
+    // Every name written anywhere in the module. A query binding that is
+    // ever reassigned may hold another value at an importing call, so it is
+    // not a resolvable export. Name-based (no semantic pass here) and thus
+    // conservative: a write to an inner binding of the same name withholds
+    // the outer export too.
+    let mut writes = Writes::default();
+    writes.visit_program(&parsed.program);
     // Imported bindings, by local name: module scope, so a name suffices.
     let mut imports: HashMap<&str, (&str, &str)> = HashMap::new();
     for stmt in &parsed.program.body {
@@ -344,7 +354,9 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
         }
     }
     // The queries the module declares itself: a local `const x = sql(…)`
-    // (exported with `export`, or by a later `export { x }`).
+    // (exported with `export`, or by a later `export { x }`). A `let` /
+    // `var` binding, or one ever written, is not immutable: it may hold
+    // another value at an importer's call.
     let mut local_queries = HashSet::new();
     for stmt in &parsed.program.body {
         let variables = match stmt {
@@ -355,8 +367,13 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
             },
             _ => continue,
         };
+        if variables.kind != VariableDeclarationKind::Const {
+            continue;
+        }
         for declarator in &variables.declarations {
-            if let Some(name) = declared_query(declarator, &imports) {
+            if let Some(name) = declared_query(declarator, &imports)
+                && !writes.names.contains(name)
+            {
                 local_queries.insert(name.to_owned());
             }
         }
@@ -366,9 +383,13 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
     for stmt in &parsed.program.body {
         match stmt {
             Statement::ExportDeclaration(export) => {
-                if let Declaration::VariableDeclaration(variables) = &export.declaration {
+                if let Declaration::VariableDeclaration(variables) = &export.declaration
+                    && variables.kind == VariableDeclarationKind::Const
+                {
                     for declarator in &variables.declarations {
-                        if let Some(name) = declared_query(declarator, &imports) {
+                        if let Some(name) = declared_query(declarator, &imports)
+                            && !writes.names.contains(name)
+                        {
                             queries.push(name.to_owned());
                         }
                     }
@@ -415,6 +436,29 @@ pub fn module_exports(path: &Path, source: &str) -> Option<ModuleExports> {
     }
     queries.dedup();
     Some(ModuleExports { entries, queries })
+}
+
+/// The names a module writes with a plain assignment or update (`q = …`,
+/// `q++`). A member write (`obj.q = …`) does not name a module binding.
+#[derive(Default)]
+struct Writes {
+    names: HashSet<String>,
+}
+
+impl<'a> Visit<'a> for Writes {
+    fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &expression.left {
+            self.names.insert(id.name.to_string());
+        }
+        walk::walk_assignment_expression(self, expression);
+    }
+
+    fn visit_update_expression(&mut self, expression: &UpdateExpression<'a>) {
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &expression.argument {
+            self.names.insert(id.name.to_string());
+        }
+        walk::walk_update_expression(self, expression);
+    }
 }
 
 /// The name a `const x = sql(…)` declarator binds, when its initializer is a
@@ -545,6 +589,13 @@ struct Finder<'s, 'r> {
     handled: HashSet<u32>,
     /// Whether the declaration being visited is `export const …`.
     exporting: bool,
+    /// Whether the declaration being visited uses `let` / `var`: the binding
+    /// may then be reassigned.
+    mutable_declaration: bool,
+    /// The queries whose exports cannot be resolved remotely: a `let` /
+    /// `var` binding (which the module, or a later assignment, may replace
+    /// with another query) or one written anywhere.
+    unresolved_exports: HashSet<usize>,
     diagnostics: Vec<ScanDiagnostic>,
 }
 
@@ -743,16 +794,25 @@ impl Finder<'_, '_> {
                 .collect();
             references
                 .sort_by_key(|reference| self.nodes.get_node(reference.node_id()).span().start);
+            // A binding written anywhere, before or after a call, is not
+            // known to hold this query at that call: a closure can run
+            // after the assignment, and a later branch can have replaced
+            // it. Leave every reference unattributed.
+            let reassigned = references.iter().any(|reference| reference.is_write());
+            if reassigned {
+                // A module export of a reassigned binding does not name
+                // this query at a remote call either.
+                self.queries[index].exports.clear();
+                self.unresolved_exports.insert(index);
+            }
             let mut uses = 0usize;
             let mut escapes = false;
             for reference in references {
                 let node = self.nodes.get_node(reference.node_id());
-                if reference.is_write() {
-                    // An assignment replaces the query: later calls are on
-                    // another value.
+                if reassigned {
                     uses += 1;
                     escapes = true;
-                    break;
+                    continue;
                 }
                 if let Some((method, span)) = self.method_call_at(node) {
                     uses += 1;
@@ -821,6 +881,12 @@ impl Finder<'_, '_> {
                 let Some(&index) = self.query_bindings.get(&symbol) else {
                     continue;
                 };
+                // A mutable or reassigned binding can name another query at
+                // the importing call: it is not a resolvable export.
+                if self.unresolved_exports.contains(&index) {
+                    self.queries[index].escapes = true;
+                    continue;
+                }
                 let Some(name) = export_name(&specifier.exported) else {
                     continue;
                 };
@@ -841,20 +907,59 @@ impl Finder<'_, '_> {
 }
 
 impl<'a> Visit<'a> for Finder<'_, '_> {
-    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
-        if let Some(index) = self.local_query(declarator)
-            && self.exporting
-            && let BindingPattern::BindingIdentifier(id) = &declarator.id
-        {
-            self.queries[index].exports.push(id.name.to_string());
-            self.queries[index].escapes = true;
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        // Only the declarators this declaration writes are exported: a
+        // declaration nested in an initializer is a local binding of its
+        // own, not the module's export.
+        let exported = self.exporting;
+        let outer_mutable = self.mutable_declaration;
+        let mutable = declaration.kind != VariableDeclarationKind::Const;
+        for declarator in &declaration.declarations {
+            self.exporting = exported;
+            self.mutable_declaration = mutable;
+            self.visit_variable_declarator(declarator);
         }
+        self.exporting = exported;
+        self.mutable_declaration = outer_mutable;
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let exporting = self.exporting;
+        let mutable = self.mutable_declaration;
+        if let Some(index) = self.local_query(declarator) {
+            if mutable {
+                // A `let` / `var` binding can be reassigned after the
+                // importer resolves it: its calls are not known to be this
+                // query, and neither is the module's export.
+                self.unresolved_exports.insert(index);
+            }
+            if exporting && let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                self.queries[index].escapes = true;
+                if mutable {
+                    // The importer may see another value at the call.
+                    if let Some(symbol) = id.symbol_id.get() {
+                        self.query_bindings.remove(&symbol);
+                    }
+                } else {
+                    self.queries[index].exports.push(id.name.to_string());
+                }
+            }
+        }
+        // An initializer's own declarations are not exported.
+        self.exporting = false;
         walk::walk_variable_declarator(self, declarator);
+        self.exporting = exporting;
     }
 
     fn visit_export_declaration(&mut self, declaration: &oxc_ast::ast::ExportDeclaration<'a>) {
         let exporting = self.exporting;
-        self.exporting = true;
+        // `export function run() { let q = sql(…) }` declares a local, not
+        // an export: only a directly exported variable declaration has
+        // exported bindings.
+        self.exporting = matches!(
+            &declaration.declaration,
+            Declaration::VariableDeclaration(_)
+        );
         walk::walk_export_declaration(self, declaration);
         self.exporting = exporting;
     }
@@ -1346,12 +1451,9 @@ q = other;
 q.fetchAll(pool);
 "#);
         assert_eq!(s.queries.len(), 2, "{:?}", s.queries);
-        let outer: Vec<&str> = s.queries[0]
-            .calls
-            .iter()
-            .map(|call| call.method.as_str())
-            .collect();
-        assert_eq!(outer, ["fetchOne", "fetchOptional"], "{:?}", s.queries[0]);
+        // The outer binding is reassigned later, so none of its references
+        // is known to be this query (call sites included).
+        assert!(s.queries[0].calls.is_empty(), "{:?}", s.queries[0]);
         assert!(s.queries[0].escapes);
         let inner: Vec<&str> = s.queries[1]
             .calls
@@ -1360,6 +1462,83 @@ q.fetchAll(pool);
             .collect();
         assert_eq!(inner, ["execute"]);
         assert!(!s.queries[1].escapes);
+    }
+
+    #[test]
+    fn a_reassigned_binding_is_unresolved_even_inside_a_closure() {
+        let s = run(r#"
+import { sql } from './db';
+let q = sql('SELECT id FROM things WHERE id = 1');
+const run = () => q.fetchAll(db);
+q = sql('SELECT id FROM things');
+"#);
+        assert_eq!(s.queries.len(), 2, "{:?}", s.queries);
+        assert!(
+            s.queries[0].calls.is_empty(),
+            "a binding reassigned anywhere may be another value at the closure: {:?}",
+            s.queries[0]
+        );
+        assert!(s.queries[0].escapes);
+    }
+
+    #[test]
+    fn an_exported_mutable_binding_is_unresolved() {
+        let s = run(r#"
+import { sql } from './db';
+export let q = sql('SELECT 1');
+q.fetchAll(db);
+"#);
+        assert_eq!(s.queries.len(), 1, "{:?}", s.queries);
+        // A mutable export may name another query at an importer's call, so
+        // it is not a resolvable export either.
+        assert!(s.queries[0].exports.is_empty(), "{:?}", s.queries[0]);
+        assert!(
+            s.queries[0].calls.is_empty(),
+            "an exported let binding may be reassigned by an importer: {:?}",
+            s.queries[0]
+        );
+        assert!(s.queries[0].escapes);
+    }
+
+    #[test]
+    fn a_local_query_in_an_exported_function_is_not_exported() {
+        let s = run(r#"
+import { sql } from './db';
+export async function run(db) {
+    let q = sql('SELECT 1');
+    return q.fetchOne(db);
+}
+"#);
+        assert_eq!(s.queries.len(), 1, "{:?}", s.queries);
+        assert!(
+            s.queries[0].exports.is_empty(),
+            "the function is exported, not its local: {:?}",
+            s.queries[0]
+        );
+        let methods: Vec<&str> = s.queries[0]
+            .calls
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect();
+        assert_eq!(methods, ["fetchOne"], "{:?}", s.queries[0]);
+        assert!(!s.queries[0].escapes, "{:?}", s.queries[0]);
+    }
+
+    #[test]
+    fn an_exported_const_initializer_does_not_export_its_locals() {
+        let s = run(r#"
+import { sql } from './db';
+export const value = (() => {
+    const q = sql('SELECT 1');
+    return q.fetchOne(db);
+})();
+"#);
+        assert_eq!(s.queries.len(), 1, "{:?}", s.queries);
+        assert!(
+            s.queries[0].exports.is_empty(),
+            "a declaration inside the initializer is not the export: {:?}",
+            s.queries[0]
+        );
     }
 
     #[test]
@@ -1478,6 +1657,35 @@ export { userById } from './queries';
         let exports = module_exports(Path::new("a.ts"), src).unwrap();
         assert_eq!(exports.queries, ["named", "renamed"]);
         assert_eq!(exports.entries.len(), 1);
+    }
+
+    #[test]
+    fn module_exports_skip_mutable_or_reassigned_queries() {
+        for src in [
+            r#"
+import { sql } from './db';
+export let q = sql('SELECT 1');
+"#,
+            r#"
+import { sql } from './db';
+let q = sql('SELECT 1');
+export { q };
+"#,
+            r#"
+import { sql } from './db';
+export const q = sql('SELECT 1');
+export function replace() { q = sql('SELECT 2'); }
+"#,
+        ] {
+            let exports = module_exports(Path::new("a.ts"), src).unwrap();
+            assert!(exports.queries.is_empty(), "{src}: {:?}", exports.queries);
+        }
+        // A `const` that is never written stays a resolvable query.
+        let src = "import { sql } from './db';\nexport const q = sql('SELECT 1');\n";
+        assert_eq!(
+            module_exports(Path::new("a.ts"), src).unwrap().queries,
+            ["q"]
+        );
     }
 
     #[test]
