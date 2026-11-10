@@ -3,8 +3,11 @@
 //! wildcards. A parameter wrapped in a function call (`replace`, an escaping
 //! helper) is assumed escaped and not counted.
 
+use typedpg_analyzer::Type;
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{AExpr, AExprKind, FuncCall, Node, a_const, node::Node as N};
+use typedpg_pg_query::protobuf::{
+    AExpr, AExprKind, FuncCall, Node, ParamRef, a_const, node::Node as N,
+};
 
 use super::{expression_end, operand_start, operator_name};
 use crate::{Ctx, RawFinding};
@@ -43,7 +46,7 @@ fn pattern(ctx: &Ctx<'_>, expr: &AExpr) -> Option<(usize, usize)> {
     let pattern = expr.rexpr.as_deref()?;
     let mut bare_param = false;
     let mut wildcard = false;
-    classify(pattern, &mut bare_param, &mut wildcard);
+    classify(ctx, pattern, &mut bare_param, &mut wildcard);
     if !bare_param || !wildcard {
         return None;
     }
@@ -67,9 +70,13 @@ fn is_like(expr: &AExpr) -> bool {
 /// What the pattern concatenates: a bare parameter (possibly cast), a string
 /// constant with a wildcard, or a nested `||` / `concat(...)`. Anything else
 /// (a function call's arguments above all) is assumed to escape the value.
-fn classify(node: &Node, bare_param: &mut bool, wildcard: &mut bool) {
+fn classify(ctx: &Ctx<'_>, node: &Node, bare_param: &mut bool, wildcard: &mut bool) {
     match node.node.as_ref() {
-        Some(N::ParamRef(_)) => *bare_param = true,
+        Some(N::ParamRef(param)) => {
+            if param_carries_wildcards(ctx, param) {
+                *bare_param = true;
+            }
+        }
         Some(N::TypeCast(cast)) => {
             // A cast chain through a type that cannot hold `%` or `_`
             // (`$n::integer::text`, `$id::uuid::text`) validates or converts
@@ -77,20 +84,20 @@ fn classify(node: &Node, bare_param: &mut bool, wildcard: &mut bool) {
             if cast.type_name.as_ref().is_none_or(type_carries_wildcards)
                 && let Some(arg) = &cast.arg
             {
-                classify(arg, bare_param, wildcard);
+                classify(ctx, arg, bare_param, wildcard);
             }
         }
         Some(N::AExpr(expr)) if is_concat(expr) => {
             if let Some(left) = &expr.lexpr {
-                classify(left, bare_param, wildcard);
+                classify(ctx, left, bare_param, wildcard);
             }
             if let Some(right) = &expr.rexpr {
-                classify(right, bare_param, wildcard);
+                classify(ctx, right, bare_param, wildcard);
             }
         }
         Some(N::FuncCall(call)) if is_concat_call(call) => {
             for arg in &call.args {
-                classify(arg, bare_param, wildcard);
+                classify(ctx, arg, bare_param, wildcard);
             }
         }
         Some(N::AConst(value)) if !value.isnull => {
@@ -120,6 +127,48 @@ fn type_carries_wildcards(type_name: &typedpg_pg_query::protobuf::TypeName) -> b
         name,
         Some("text" | "varchar" | "bpchar" | "name" | "citext" | "unknown")
     )
+}
+
+/// Whether the parameter's text output can contain `%`, `_` or a backslash.
+/// The types below format to digits and separators only, under every
+/// `DateStyle`: `date` prints as `2026-11-10`, `11/10/2026`,
+/// `Tue Nov 10 2026` or `10.11.2026`, and `timestamp` adds a time and a
+/// time zone-less suffix (`BC`, `infinity` at most), none of which has a
+/// wildcard. Types whose output depends on `TimeZone` (its abbreviation can
+/// contain `_`, as in `TimeZone 'X_Y0'`) or on `IntervalStyle` are not
+/// trusted; an unknown parameter type is assumed text-like.
+fn param_carries_wildcards(ctx: &Ctx<'_>, param: &ParamRef) -> bool {
+    let Some(index) = usize::try_from(param.number)
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+    else {
+        return true;
+    };
+    let Some(param) = ctx.view.analyzed.params.get(index) else {
+        return true;
+    };
+    type_output_carries_wildcards(&param.pg_type)
+}
+
+fn type_output_carries_wildcards(ty: &Type) -> bool {
+    match ty {
+        Type::Basic { schema, name, .. } if schema == "pg_catalog" => !matches!(
+            name.as_str(),
+            "int2"
+                | "int4"
+                | "int8"
+                | "numeric"
+                | "float4"
+                | "float8"
+                | "oid"
+                | "bool"
+                | "uuid"
+                | "date"
+                | "timestamp"
+        ),
+        Type::Domain { base, .. } => type_output_carries_wildcards(base),
+        _ => true,
+    }
 }
 
 fn is_concat_call(call: &FuncCall) -> bool {
@@ -280,6 +329,79 @@ mod tests {
         // A text cast keeps the parameter's wildcards.
         let sql = "SELECT id FROM users WHERE name LIKE '%' || $q::text || '%'";
         assert_eq!(only(&lint(&db, sql)).rule, Rule::LikeUnescapedParam);
+    }
+
+    #[test]
+    fn a_non_text_parameter_cannot_carry_wildcards() {
+        let mut db = catalog();
+        db.apply_sql("ALTER TABLE users ADD COLUMN active boolean, ADD COLUMN uid uuid;")
+            .unwrap();
+        // The parameter also fixes a typed column, so its inferred type is
+        // integer / boolean / uuid: none of their text forms has `%`, `_`
+        // or a backslash.
+        for sql in [
+            "SELECT id FROM users WHERE id = $n AND name LIKE '%' || $n || '%'",
+            "SELECT id FROM users WHERE id = $n AND name ILIKE '%' || $n || '%'",
+            "SELECT id FROM users WHERE active = $flag AND name LIKE '%' || $flag || '%'",
+            "SELECT id FROM users WHERE uid = $u AND name LIKE '%' || $u || '%'",
+        ] {
+            let findings = lint(&db, sql);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule != Rule::LikeUnescapedParam),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A text parameter still carries them.
+        let sql = "SELECT id FROM users WHERE name = $q AND name LIKE '%' || $q || '%'";
+        assert_eq!(
+            only(&lint(&db, sql)).rule,
+            Rule::LikeUnescapedParam,
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_time_zone_or_interval_dependent_parameter_is_reported() {
+        let mut db = catalog();
+        db.apply_sql(
+            "ALTER TABLE users
+                 ADD COLUMN at timestamptz,
+                 ADD COLUMN span interval,
+                 ADD COLUMN clock timetz;",
+        )
+        .unwrap();
+        // Their text output depends on the session: a time zone
+        // abbreviation can contain `_` (`TimeZone 'X_Y0'`), and
+        // `IntervalStyle` changes an interval's words.
+        for column in ["at", "span", "clock"] {
+            let sql =
+                format!("SELECT id FROM users WHERE {column} = $v AND name LIKE '%' || $v || '%'");
+            assert_eq!(
+                only(&lint(&db, &sql)).rule,
+                Rule::LikeUnescapedParam,
+                "{sql}"
+            );
+        }
+        // `date` and `timestamp` (without time zone) print only digits,
+        // separators and, at most, `BC` / `infinity`, under every DateStyle.
+        db.apply_sql(
+            "ALTER TABLE users
+                 ADD COLUMN at_utc timestamp,
+                 ADD COLUMN day date;",
+        )
+        .unwrap();
+        for column in ["at_utc", "day"] {
+            let sql =
+                format!("SELECT id FROM users WHERE {column} = $v AND name LIKE '%' || $v || '%'");
+            assert!(
+                lint(&db, &sql)
+                    .iter()
+                    .all(|finding| finding.rule != Rule::LikeUnescapedParam),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

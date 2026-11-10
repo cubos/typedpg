@@ -7,11 +7,36 @@
 //! and arrays, and whether a relation has row security or rewrite rules.
 //! Everything else they read is already public.
 
-use crate::oid::{PgClassOid, PgTypeOid};
+use crate::oid::{PgClassOid, PgOperatorOid, PgTypeOid};
 
 use super::PgCatalog;
 
 impl PgCatalog {
+    /// Whether operator `operator`, with operands `left` and `right`, is the
+    /// default btree equality of `left`'s type (strategy 3 of the type's
+    /// default btree operator family).
+    pub fn lint_is_default_btree_equality(
+        &self,
+        left: PgTypeOid,
+        right: PgTypeOid,
+        operator: PgOperatorOid,
+    ) -> bool {
+        let Some(opclass) = crate::ddl::opclass::default_opclass_id(self, left, "btree")
+            .and_then(|oid| self.pg_opclass.iter().find(|class| class.oid == oid))
+        else {
+            return false;
+        };
+        self.pg_amop.iter().any(|member| {
+            member.amopmethod == "btree"
+                && member.amopstrategy == 3
+                && member.amopopr == operator
+                && member.amopfamily == opclass.opcfamily
+                && member.amopfamilynamespace == opclass.opcfamilynamespace
+                && member.amoplefttype == left
+                && member.amoprighttype == right
+        })
+    }
+
     /// Whether row-level security is enabled on `relid`
     /// (`pg_class.relrowsecurity`): its SELECT policies then restrict the
     /// rows a statement sees, `RETURNING` included.
