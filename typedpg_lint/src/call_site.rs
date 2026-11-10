@@ -522,6 +522,47 @@ mod tests {
     }
 
     #[test]
+    fn fetch_optional_on_a_stable_call_key_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE owners (id bigint PRIMARY KEY, team bigint NOT NULL, tool_id bigint);
+             CREATE TABLE tools (id bigint PRIMARY KEY, name text NOT NULL);
+             CREATE FUNCTION pick_tool(o bigint) RETURNS bigint STABLE LANGUAGE sql
+                AS $$ SELECT tool_id FROM owners WHERE id = o $$;",
+        )
+        .unwrap();
+        let sql = "SELECT o.id, t.name FROM owners o \
+                   LEFT JOIN tools t ON t.id = pick_tool(o.id) WHERE o.id = $1";
+        assert!(
+            only(
+                lint(
+                    &db,
+                    sql,
+                    &[rust(CallMethod::FetchOptional, "fetch_optional")]
+                ),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+        // The LATERAL form of the same query.
+        let sql_lateral = "SELECT o.id, x.name FROM owners o \
+                   LEFT JOIN LATERAL \
+                      (SELECT t.name FROM tools t WHERE t.id = pick_tool(o.id)) x ON true \
+                   WHERE o.id = $1";
+        assert!(
+            only(
+                lint(
+                    &db,
+                    sql_lateral,
+                    &[rust(CallMethod::FetchOptional, "fetch_optional")]
+                ),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn fetch_one_on_a_system_view_key_is_fine() {
         let db = catalog();
         let sql = "SELECT setting FROM pg_settings WHERE name = 'deadlock_timeout'";

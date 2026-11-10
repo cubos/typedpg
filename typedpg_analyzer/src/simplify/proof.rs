@@ -174,6 +174,17 @@ impl<'a> FromScope<'a> {
         self.parent.is_some()
     }
 
+    /// This scope's items as a nested level: a `LATERAL` subquery reads the
+    /// row they describe but is a query level of its own (its aggregates
+    /// belong to it only when their arguments read its own `FROM`).
+    pub(crate) fn as_nested(&self) -> FromScope<'_> {
+        FromScope {
+            items: self.items.clone(),
+            grouping_sets: self.grouping_sets,
+            parent: Some(self),
+        }
+    }
+
     /// Whether `col`, written at this level, may be resolved by one of its
     /// own items rather than a parent level's: `false` only when none of
     /// them can bind it. For moving an expression into this level from the

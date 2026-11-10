@@ -112,8 +112,8 @@ pub fn redundant_distinct_spans(
 ///   already-determined relations — the `distinct` rule's "equalities to a
 ///   key" proof (see [`super::dedup`]), propagated until every relation is
 ///   determined — a single-row CTE, a `FROM` function that can't return
-///   a set, or a `pg_catalog` system view with a key PostgreSQL itself
-///   guarantees (see below).
+///   a set, a proven one-row `LATERAL` subquery, or a `pg_catalog` system
+///   view with a key PostgreSQL itself guarantees (see below).
 ///
 /// A CTE the statement's own `WITH` clause proves yields at most one row is
 /// a relation with no key needed: it is determined from the start, may be
@@ -132,11 +132,12 @@ pub fn redundant_distinct_spans(
 ///
 /// Anything else is `false`: `GROUP BY` always is (a group per key), and so
 /// is every relation the proof can't see through (a view other than the
-/// trusted `pg_catalog` system views, a subquery, a function that returns a
-/// set, an unproven CTE, an inheritance parent, a partitioned table or one
-/// under row security), a set-returning call, a `FULL JOIN` (two one-row
-/// sides still produce an unmatched row from each when their keys differ),
-/// or an outer join whose nullable side isn't determined.
+/// trusted `pg_catalog` system views, a subquery that isn't a proven
+/// one-row `LATERAL` one, a function that returns a set, an unproven CTE,
+/// an inheritance parent, a partitioned table or one under row security), a
+/// set-returning call, a `FULL JOIN` (two one-row sides still produce an
+/// unmatched row from each when their keys differ), or an outer join whose
+/// nullable side isn't determined.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
     if !view.analyzed.spreads.is_empty() {
         return false;
@@ -414,7 +415,8 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
     // Columns are matched to the CTE's alias list by position, so a target
     // whose columns can't all be listed makes the whole list unknown (an
     // empty list: no column of the CTE takes part in a key equality).
-    let scope = Scope::build_env(ctx, env, &select.from_clause);
+    let root = FromScope::opaque(None);
+    let scope = Scope::build_env(ctx, env, &select.from_clause, &root);
     let mut out = Vec::new();
     for target in &select.target_list {
         let Some(Node::ResTarget(target)) = &target.node else {
@@ -971,7 +973,7 @@ fn statement_at_most_one_row_in(
     }
 }
 
-fn select_at_most_one_row_in(
+pub(super) fn select_at_most_one_row_in(
     ctx: &Ctx<'_>,
     select: &SelectStmt,
     outer: &FromScope<'_>,
@@ -1008,7 +1010,7 @@ fn select_at_most_one_row_in(
         // One group, and nothing groups it further.
         return true;
     }
-    let Some(scope) = Scope::build_env(ctx, env, &select.from_clause) else {
+    let Some(scope) = Scope::build_env(ctx, env, &select.from_clause, outer) else {
         return false;
     };
     // A locking clause makes EvalPlanQual re-fetch a row's newest version
@@ -1113,7 +1115,7 @@ fn has_own_aggregate(
 ) -> bool {
     let top_level = !outer.has_parent();
     let scope = (!top_level)
-        .then(|| Scope::build_env(ctx, env, &select.from_clause))
+        .then(|| Scope::build_env(ctx, env, &select.from_clause, outer))
         .flatten();
     let mut stack: Vec<NodeRef<'_>> = Vec::new();
     for list in [
@@ -1368,8 +1370,8 @@ fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> b
     let NodeRef::SelectStmt(select) = node.to_ref() else {
         return false;
     };
-    select_at_most_one_row_in(ctx, select, &FromScope::opaque(None), env)
-        || limit_bounds_one(select)
+    let scope = FromScope::of_select(ctx, select, None);
+    select_at_most_one_row_in(ctx, select, &scope, env) || limit_bounds_one(select)
 }
 
 /// An `UPDATE ... FROM` / `DELETE ... USING` whose target relation is
@@ -1780,6 +1782,146 @@ mod tests {
         ));
         // Any other view stays a relation the proof can't see through.
         assert!(!select_one(&db, "SELECT name FROM v WHERE id = $1"));
+    }
+
+    #[test]
+    fn a_stable_call_of_determined_columns_is_a_value() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE owners (id bigint PRIMARY KEY, team bigint NOT NULL, tool_id bigint);
+             CREATE TABLE tools (id bigint PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE keyed (id bigint PRIMARY KEY, code text NOT NULL UNIQUE);
+             CREATE TABLE a_keys (id bigint PRIMARY KEY);
+             CREATE TABLE b_keys (id bigint PRIMARY KEY);
+             CREATE SEQUENCE pick_seq;
+             CREATE FUNCTION pick_tool(o bigint) RETURNS bigint STABLE LANGUAGE sql
+                AS $$ SELECT tool_id FROM owners WHERE id = o $$;
+             CREATE FUNCTION pick_tool_volatile(o bigint) RETURNS bigint VOLATILE LANGUAGE sql
+                AS $$ SELECT tool_id FROM owners WHERE id = o $$;
+             CREATE FUNCTION pick_tools(o bigint) RETURNS SETOF bigint STABLE LANGUAGE sql
+                AS $$ SELECT tool_id FROM owners WHERE id = o $$;
+             CREATE FUNCTION pick_default(o bigint DEFAULT nextval('pick_seq'))
+                RETURNS bigint STABLE LANGUAGE sql AS $$ SELECT o $$;
+             CREATE FUNCTION pick_named(a bigint, b bigint) RETURNS bigint STABLE LANGUAGE sql
+                AS $$ SELECT a + b $$;
+             CREATE FUNCTION pick_variadic(VARIADIC xs bigint[]) RETURNS bigint STABLE LANGUAGE sql
+                AS $$ SELECT xs[1] $$;",
+        )
+        .unwrap();
+        // The issue's repro: `t.id` is equated to a STABLE call of the
+        // determined `o` row.
+        assert!(select_one(
+            &db,
+            "SELECT o.id, t.name FROM owners o \
+             LEFT JOIN tools t ON t.id = pick_tool(o.id) WHERE o.id = $1"
+        ));
+        // The same facts in a comma join.
+        assert!(select_one(
+            &db,
+            "SELECT o.id, t.name FROM owners o, tools t \
+             WHERE o.id = $1 AND t.id = pick_tool(o.id)"
+        ));
+        // A cast of a parameter, and of a literal.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM tools WHERE id = $1::bigint"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM keyed WHERE code = 'a'::text"
+        ));
+        // An operator over accepted operands.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM tools WHERE id = ($1::bigint + 0)"
+        ));
+        // A parameter left to its default is replaced by the default
+        // expression at the call site: `nextval` runs per evaluation, so the
+        // value isn't fixed for the statement.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM tools WHERE id = pick_default()"
+        ));
+        // Named notation may leave an earlier parameter to its default even
+        // when the call spells `pronargs` arguments, so it isn't read.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM tools WHERE id = pick_named(b => 1, a => 2)"
+        ));
+        // Every parameter spelled positionally, none defaulted: a value.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM tools WHERE id = pick_named(1, 2)"
+        ));
+        // A VARIADIC routine packs its arguments into an array through a
+        // function this doesn't resolve, with or without the keyword.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM tools WHERE id = pick_variadic(1)"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM tools WHERE id = pick_variadic(VARIADIC ARRAY[1])"
+        ));
+        // A cast to a type with a typmod runs the type's length-coercion
+        // function after the value is made; the bare type runs none.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM keyed WHERE code = 'a'::varchar(10)"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM keyed WHERE code = 'a'::varchar"
+        ));
+        // The issue's LATERAL form: the subquery is proven one row per
+        // `o` row, so the LEFT JOIN yields at most one.
+        let lateral = "SELECT o.id, x.name FROM owners o \
+             LEFT JOIN LATERAL \
+                (SELECT t.name FROM tools t WHERE t.id = pick_tool(o.id)) x ON true \
+             WHERE o.id = $1";
+        assert!(select_one(&db, lateral));
+        assert!(statement_one(&db, lateral));
+        // A LATERAL subquery the proof can't bound stays a give-up.
+        assert!(!select_one(
+            &db,
+            "SELECT o.id, x.name FROM owners o \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t) x ON true \
+             WHERE o.id = $1"
+        ));
+        // A LATERAL subquery's unqualified `id` is its own `USING`-merged
+        // column, not the same-named outer `o.id`: `a.id = id` holds for
+        // every pair the join matches, so the subquery returns a row per
+        // pair and isn't one row.
+        assert!(!select_one(
+            &db,
+            "SELECT o.id, x.id FROM owners o \
+             JOIN LATERAL (SELECT a.id FROM a_keys a JOIN b_keys b USING (id) \
+                           WHERE a.id = id AND b.id = a.id) x ON true \
+             WHERE o.id = $1"
+        ));
+        // A LATERAL subquery with an aggregate of its own is one row.
+        assert!(select_one(
+            &db,
+            "SELECT o.id, x.n FROM owners o \
+             LEFT JOIN LATERAL (SELECT count(*) AS n FROM tools t) x ON true \
+             WHERE o.id = $1"
+        ));
+        // A volatile call is re-evaluated per row pair: refused.
+        assert!(!select_one(
+            &db,
+            "SELECT o.id, t.name FROM owners o \
+             LEFT JOIN tools t ON t.id = pick_tool_volatile(o.id) WHERE o.id = $1"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT o.id, t.name FROM owners o \
+             LEFT JOIN tools t ON t.id = (random() * 10)::bigint WHERE o.id = $1"
+        ));
+        // A set-returning call multiplies rows wherever it runs.
+        assert!(!select_one(
+            &db,
+            "SELECT pick_tools(o.id) FROM owners o WHERE o.id = $1"
+        ));
     }
 
     #[test]

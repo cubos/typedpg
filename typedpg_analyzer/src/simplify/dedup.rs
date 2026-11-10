@@ -38,9 +38,10 @@
 //! the ones behind PRIMARY KEY and UNIQUE constraints included — and, for
 //! the `pg_catalog` system views on [`SYSTEM_VIEW_KEYS`], the keys
 //! PostgreSQL itself guarantees. Relations the proof can't see through —
-//! other views, subqueries, functions, CTEs, inheritance parents,
-//! partitioned tables, tables under row security — make it give up, and so
-//! do set-returning, aggregate and volatile calls.
+//! other views, subqueries it can't prove one row per outer row, functions,
+//! CTEs, inheritance parents, partitioned tables, tables under row security
+//! — make it give up, and so do set-returning, aggregate and volatile
+//! calls.
 //!
 //! # Errors
 //!
@@ -611,32 +612,38 @@ impl<'a> Scope<'a> {
         ctes: &HashSet<String>,
         from: &'a [protobuf::Node],
     ) -> Option<Scope<'a>> {
-        Self::build_inner(ctx, &CteEnv::blocked(ctes), from, false)
+        let root = FromScope::opaque(None);
+        Self::build_inner(ctx, &CteEnv::blocked(ctes), from, false, &root)
     }
 
-    /// [`Self::build`] with the single-row CTEs visible at this level.
+    /// [`Self::build`] with the single-row CTEs visible at this level and
+    /// `outer`, the scope of this level's own items and the levels around
+    /// it (what a `LATERAL` FROM subquery reads).
     pub(super) fn build_env(
         ctx: &Ctx<'_>,
         env: &CteEnv,
         from: &'a [protobuf::Node],
+        outer: &FromScope<'_>,
     ) -> Option<Scope<'a>> {
-        Self::build_inner(ctx, env, from, true)
+        Self::build_inner(ctx, env, from, true, outer)
     }
 
     /// [`Self::build`], also accepting a FROM function that can't return a
-    /// set as a one-row relation (`functions`).
+    /// set and a proven one-row `LATERAL` subquery as one-row relations
+    /// (`functions`).
     fn build_inner(
         ctx: &Ctx<'_>,
         env: &CteEnv,
         from: &'a [protobuf::Node],
         functions: bool,
+        outer: &FromScope<'_>,
     ) -> Option<Scope<'a>> {
         let mut scope = Scope {
             rels: Vec::new(),
             joins: Vec::new(),
         };
         for item in from {
-            scope.add(ctx, env, item, false, functions)?;
+            scope.add(ctx, env, item, false, functions, outer)?;
         }
         Some(scope)
     }
@@ -656,15 +663,17 @@ impl<'a> Scope<'a> {
         // A data-modifying statement's target is always a table: a CTE of
         // the same name is not one PG lets it write.
         scope.add_table(ctx, relation, false)?;
+        let root = FromScope::opaque(None);
         for item in from {
-            scope.add(ctx, env, item, false, true)?;
+            scope.add(ctx, env, item, false, true, &root)?;
         }
         Some(scope)
     }
 
     /// Add one FROM item; its relations as a bitmask. `functions`: a
-    /// function item that can't return a set is a one-row relation
-    /// (otherwise a `FROM` function is a reference the proof gives up on).
+    /// function item that can't return a set and a proven one-row `LATERAL`
+    /// subquery are one-row relations (otherwise a `FROM` function or
+    /// subquery is a reference the proof gives up on).
     fn add(
         &mut self,
         ctx: &Ctx<'_>,
@@ -672,11 +681,15 @@ impl<'a> Scope<'a> {
         item: &'a protobuf::Node,
         nullable: bool,
         functions: bool,
+        outer: &FromScope<'_>,
     ) -> Option<u64> {
         match item.node.as_ref()? {
             Node::RangeVar(rv) => self.add_range_var(ctx, env, rv, nullable),
             Node::RangeFunction(rf) => functions
                 .then(|| self.add_range_function(ctx, rf, nullable))
+                .flatten(),
+            Node::RangeSubselect(sub) => functions
+                .then(|| self.add_range_subselect(ctx, env, sub, nullable, outer))
                 .flatten(),
             Node::JoinExpr(j) => {
                 if j.is_natural || j.alias.is_some() || j.join_using_alias.is_some() {
@@ -691,9 +704,23 @@ impl<'a> Scope<'a> {
                     _ => return None,
                 };
                 let first = self.rels.len();
-                let left = self.add(ctx, env, j.larg.as_deref()?, left_nullable, functions)?;
+                let left = self.add(
+                    ctx,
+                    env,
+                    j.larg.as_deref()?,
+                    left_nullable,
+                    functions,
+                    outer,
+                )?;
                 let middle = self.rels.len();
-                let right = self.add(ctx, env, j.rarg.as_deref()?, right_nullable, functions)?;
+                let right = self.add(
+                    ctx,
+                    env,
+                    j.rarg.as_deref()?,
+                    right_nullable,
+                    functions,
+                    outer,
+                )?;
                 let single = |side: &Option<Box<protobuf::Node>>, at: usize| {
                     matches!(
                         side.as_deref().and_then(|n| n.node.as_ref()),
@@ -855,6 +882,70 @@ impl<'a> Scope<'a> {
         Some(1 << (self.rels.len() - 1))
     }
 
+    /// Add one `LATERAL` FROM subquery as a one-row relation, when this
+    /// level's proof shows it returns at most one row per row of the items
+    /// it reads (see [`super::cardinality::select_at_most_one_row_in`]).
+    /// Its output columns are the subquery's target names — an alias column
+    /// list renames the first ones — and their types are not resolved here
+    /// (a reference to one is an operand the proof gives up on). Any
+    /// target whose name isn't certain, and any subquery that isn't proven
+    /// one row, makes the whole FROM give up, as every subquery did before.
+    fn add_range_subselect(
+        &mut self,
+        ctx: &Ctx<'_>,
+        env: &CteEnv,
+        sub: &'a protobuf::RangeSubselect,
+        nullable: bool,
+        outer: &FromScope<'_>,
+    ) -> Option<u64> {
+        if !sub.lateral || self.rels.len() == MAX_RELATIONS {
+            return None;
+        }
+        let Some(Node::SelectStmt(select)) = sub.subquery.as_deref().and_then(|n| n.node.as_ref())
+        else {
+            return None;
+        };
+        // It reads the current level's row (that is what LATERAL means) but
+        // is a query level of its own.
+        let outer = outer.as_nested();
+        if !super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &outer, env) {
+            return None;
+        }
+        let mut columns: Vec<(String, i16)> = Vec::with_capacity(select.target_list.len());
+        for (index, target) in select.target_list.iter().enumerate() {
+            let Some(Node::ResTarget(target)) = &target.node else {
+                return None;
+            };
+            let name = target_output_name(target)?;
+            columns.push((name, i16::try_from(index).ok()?.checked_add(1)?));
+        }
+        let renames = sub.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
+        if renames.len() > columns.len() {
+            return None;
+        }
+        for (column, rename) in columns.iter_mut().zip(renames) {
+            let Some(Node::String(name)) = &rename.node else {
+                return None;
+            };
+            column.0 = name.sval.clone();
+        }
+        let alias = sub.alias.as_ref().map(|a| a.aliasname.clone());
+        let cte_columns = vec![(None, true); columns.len()];
+        self.rels.push(Rel {
+            oid: None,
+            // Only an aliased subquery has a name a reference can use.
+            refname: alias.clone().unwrap_or_default(),
+            aliased: alias.is_some(),
+            schema: String::new(),
+            relname: alias.clone().unwrap_or_default(),
+            nullable,
+            single_row: true,
+            columns,
+            cte_columns,
+        });
+        Some(1 << (self.rels.len() - 1))
+    }
+
     /// Add one base-table reference, or an allowlisted system view's; its
     /// relation as a bitmask.
     fn add_table(&mut self, ctx: &Ctx<'_>, rv: &protobuf::RangeVar, nullable: bool) -> Option<u64> {
@@ -962,8 +1053,11 @@ impl<'a> Scope<'a> {
     /// `expr` as one side of an equality the proof reads: a column of this
     /// scope, a parameter, a constant, or — `outer` being the levels this
     /// one is nested in — a column of an outer query, which is fixed for
-    /// one evaluation of this level. With `scalar_sublinks`, also a scalar
-    /// sublink uncorrelated with this level (one value per evaluation).
+    /// one evaluation of this level. With `scalar_sublinks` (the cardinality
+    /// proof's wider form), also a scalar sublink uncorrelated with this
+    /// level, a cast and a call to a non-volatile, non-set-returning
+    /// function or operator every argument of which is one of these — each
+    /// one value per evaluation of the row (see [`Self::call_operand`]).
     fn operand(
         &self,
         ctx: &Ctx<'_>,
@@ -1017,8 +1111,163 @@ impl<'a> Scope<'a> {
                 column: None,
                 rels: 0,
             }),
+            Node::TypeCast(cast) if scalar_sublinks => {
+                let type_name = cast.type_name.as_ref()?;
+                // A typmod (`varchar(10)`, `numeric(8,2)`, an array's
+                // bounds) runs the type's length-coercion function after
+                // the value is made: what it yields isn't the inner
+                // expression's value, and a user-defined coercion may be
+                // volatile. The type alone doesn't tell which function it
+                // is, so this refuses rather than resolve it.
+                if !type_name.typmods.is_empty() || !type_name.array_bounds.is_empty() {
+                    return None;
+                }
+                let arg = self.operand(ctx, cast.arg.as_deref()?, outer, scalar_sublinks)?;
+                let typ = type_name_oid(ctx, type_name)?;
+                // A conversion that runs a volatile function could yield
+                // another value each time the row pair is evaluated.
+                let deterministic_collation = deterministic_type(ctx, typ);
+                (deterministic_collation && coercion_is_nonvolatile(ctx, arg.typ, typ)).then_some(
+                    Operand {
+                        typ,
+                        column: None,
+                        rels: arg.rels,
+                    },
+                )
+            }
+            Node::FuncCall(call) if scalar_sublinks => {
+                self.call_operand(ctx, call, outer, scalar_sublinks)
+            }
+            Node::AExpr(expr) if scalar_sublinks && expr.kind() == AExprKind::AexprOp => {
+                self.operator_operand(ctx, expr, outer, scalar_sublinks)
+            }
             _ => None,
         }
+    }
+
+    /// A call's one value per evaluation of the row, when the routine it
+    /// resolves to is neither volatile nor set-returning nor an
+    /// aggregate/window function and every argument is an
+    /// [`Self::operand`]. `rels` is the union of the arguments'.
+    ///
+    /// A STABLE routine returns the same value for the same arguments
+    /// within a statement, so a call whose arguments read only determined
+    /// relations (or fixed outer columns) is one value — which a key
+    /// equality can bound to one row. A VOLATILE one is re-evaluated per
+    /// row pair and may match several rows, so it stays refused.
+    ///
+    /// Only a call that spells every parameter is read: a parameter left to
+    /// its default (`pick()` for `pick(x bigint DEFAULT nextval(…))`) is
+    /// expanded into an expression this doesn't see, evaluated at the call
+    /// site, and a named argument may leave an earlier default in place
+    /// even when the count matches. A `VARIADIC` routine or call packs its
+    /// arguments into an array through a function this doesn't resolve.
+    fn call_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        call: &protobuf::FuncCall,
+        outer: Option<&FromScope<'_>>,
+        scalar_sublinks: bool,
+    ) -> Option<Operand> {
+        if call.over.is_some()
+            || call.agg_star
+            || call.agg_within_group
+            || !call.agg_order.is_empty()
+            || call.agg_filter.is_some()
+            || call.func_variadic
+        {
+            return None;
+        }
+        let (schema, name) = function_name(&call.funcname)?;
+        let notation = crate::functions::CallNotation::of(call).ok()?;
+        if !notation.names.is_empty() {
+            return None;
+        }
+        let mut operands = Vec::with_capacity(call.args.len());
+        for arg in &call.args {
+            operands.push(self.operand(
+                ctx,
+                crate::functions::call_arg_value(arg),
+                outer,
+                scalar_sublinks,
+            )?);
+        }
+        let types: Vec<PgTypeOid> = operands.iter().map(|operand| operand.typ).collect();
+        let resolved = crate::functions::resolve_function(
+            ctx.catalog,
+            schema,
+            name,
+            &types,
+            &notation,
+            false,
+            None,
+        )
+        .ok()?;
+        if resolved.is_aggregate || resolved.is_window || resolved.is_set_returning {
+            return None;
+        }
+        let proc = ctx.catalog.pg_proc.get(&resolved.oid)?;
+        if proc.provolatile == ProVolatile::Volatile {
+            return None;
+        }
+        // `proargtypes` is the routine's declared IN parameters (`pronargs`):
+        // fewer supplied arguments leave any trailing ones to their defaults.
+        if resolved.provariadic.is_some() || proc.proargtypes.len() != operands.len() {
+            return None;
+        }
+        if resolved.arg_types.len() != operands.len()
+            || operands
+                .iter()
+                .zip(&resolved.arg_types)
+                .any(|(operand, target)| !coercion_is_nonvolatile(ctx, operand.typ, *target))
+        {
+            return None;
+        }
+        deterministic_type(ctx, resolved.return_type_oid).then_some(Operand {
+            typ: resolved.return_type_oid,
+            column: None,
+            rels: operands.iter().fold(0, |rels, operand| rels | operand.rels),
+        })
+    }
+
+    /// An operator expression's one value per evaluation: [`Self::call_operand`]
+    /// for the function behind the operator.
+    fn operator_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        expr: &protobuf::AExpr,
+        outer: Option<&FromScope<'_>>,
+        scalar_sublinks: bool,
+    ) -> Option<Operand> {
+        let name = string_list(&expr.name).join(".");
+        let left = match expr.lexpr.as_deref() {
+            Some(left) => Some(self.operand(ctx, left, outer, scalar_sublinks)?),
+            None => None,
+        };
+        let right = self.operand(ctx, expr.rexpr.as_deref()?, outer, scalar_sublinks)?;
+        let op = ctx.catalog.find_operator(
+            &name,
+            left.as_ref().map(|operand| operand.typ),
+            right.typ,
+        )?;
+        let proc = op.code.and_then(|code| ctx.catalog.pg_proc.get(&code))?;
+        if proc.provolatile == ProVolatile::Volatile
+            || proc.proretset
+            || proc.prokind != ProKind::Function
+        {
+            return None;
+        }
+        let coerced = left
+            .as_ref()
+            .zip(op.left_type_oid)
+            .is_none_or(|(operand, target)| coercion_is_nonvolatile(ctx, operand.typ, target))
+            && coercion_is_nonvolatile(ctx, right.typ, op.right_type_oid);
+        deterministic_type(ctx, op.result_type_oid).then_some(())?;
+        coerced.then_some(Operand {
+            typ: op.result_type_oid,
+            column: None,
+            rels: left.map_or(0, |operand| operand.rels) | right.rels,
+        })
     }
 
     /// The one value a scalar sublink yields per evaluation, when it does
@@ -1053,7 +1302,8 @@ impl<'a> Scope<'a> {
         // Its own FROM only: a CTE name is a reference the proof gives up on,
         // shadowing a table of the same name it may read.
         let env = CteEnv::blocked(&cte_names(ctx.tree));
-        let scope = Scope::build_env(ctx, &env, &select.from_clause)?;
+        let root = FromScope::opaque(None);
+        let scope = Scope::build_env(ctx, &env, &select.from_clause, &root)?;
         if !self.sublink_uncorrelated(&scope, sub) {
             return None;
         }
@@ -1813,6 +2063,70 @@ pub(super) fn type_oid(ctx: &Ctx<'_>, t: &Type) -> Option<PgTypeOid> {
             .map(|t| t.oid),
         Type::Array { element, .. } => ctx.catalog.array_type_of(type_oid(ctx, element)?),
         Type::AnonymousRecord { .. } => None,
+    }
+}
+
+/// The type a `TypeCast`'s `TypeName` names, array bounds included.
+fn type_name_oid(ctx: &Ctx<'_>, type_name: &protobuf::TypeName) -> Option<PgTypeOid> {
+    let names = string_list(&type_name.names);
+    let typ = match names.as_slice() {
+        [name] => ctx.catalog.resolve_type_by_name(None, name),
+        [schema, name] => ctx.catalog.resolve_type_by_name(Some(schema), name),
+        _ => None,
+    }?;
+    if type_name.array_bounds.is_empty() {
+        Some(typ.oid)
+    } else {
+        ctx.catalog.array_type_of(typ.oid)
+    }
+}
+
+/// Whether a value of type `typ` is under a deterministic collation: the
+/// type's own (`typcollation`), else its base type's for a domain, is none
+/// or a bytewise one.
+fn deterministic_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
+    let Some(ty) = ctx.catalog.pg_type.get(&typ) else {
+        return false;
+    };
+    let collation = ty.typcollation.or_else(|| {
+        ctx.catalog
+            .pg_type
+            .get(&ctx.catalog.unwrap_domain(typ))
+            .and_then(|base| base.typcollation)
+    });
+    deterministic(collation)
+}
+
+/// The last name of a function call, with its schema when written.
+fn function_name(nodes: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
+    match string_list(nodes).as_slice() {
+        [name] => Some((None, *name)),
+        [schema, name] => Some((Some(*schema), *name)),
+        _ => None,
+    }
+}
+
+/// The name PG gives a subquery target-list entry, when it is known: the
+/// written alias, a bare column's name, or the called function's name.
+/// Anything else gets a name this can't be sure of (a cast keeps its
+/// argument's name, an expression is `?column?`), so the caller gives up.
+fn target_output_name(target: &protobuf::ResTarget) -> Option<String> {
+    if !target.name.is_empty() {
+        return Some(target.name.clone());
+    }
+    match target
+        .val
+        .as_deref()
+        .and_then(|value| value.node.as_ref())?
+    {
+        Node::ColumnRef(column) => match column_ref_fields(column) {
+            Fields::Names(names) => names.last().map(|name| (*name).to_owned()),
+            _ => None,
+        },
+        Node::FuncCall(call) => string_list(&call.funcname)
+            .last()
+            .map(|name| (*name).to_owned()),
+        _ => None,
     }
 }
 
