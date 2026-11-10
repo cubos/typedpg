@@ -72,8 +72,10 @@ const drivers: [string, Driver][] = [
     {
       async connect(url) {
         const sql = postgres(url, { max: 1, onnotice: () => {} });
-        // Connect (and fetch the array types) before anything is counted.
-        await sql`SELECT 1`;
+        // Connect (and fetch the domain, enum and array types) before
+        // anything is counted: 4.1 reads them on the first query that meets
+        // one instead of when the pool starts.
+        await sql`SELECT 'happy'::mood`;
         return { db: sql, close: () => sql.end() };
       },
       roundTrips: 1,

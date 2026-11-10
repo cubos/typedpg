@@ -44,6 +44,9 @@ interface Log {
 
 const newLog = (): Log => ({ flights: [], syncs: 0, parses: [], describedFirst: false, inferred: [] });
 
+/** A socket's data event carries a string only when its encoding was set; these sockets keep the bytes. */
+const bytes = (chunk: Buffer | string): Buffer => (typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+
 class Connection {
   /** The server spoke since the client's last message: the next one starts a round trip. */
   private answered = true;
@@ -173,11 +176,11 @@ export class Wire {
     client.on("data", (chunk) => {
       // Read before the server sees it: by the time the client has its
       // answer, its messages are logged.
-      conn.client(chunk);
+      conn.client(bytes(chunk));
       server.write(chunk);
     });
     server.on("data", (chunk) => {
-      conn.server(chunk);
+      conn.server(bytes(chunk));
       client.write(chunk);
     });
     const close = () => {
