@@ -522,6 +522,29 @@ mod tests {
     }
 
     #[test]
+    fn fetch_one_on_a_system_view_key_is_fine() {
+        let db = catalog();
+        let sql = "SELECT setting FROM pg_settings WHERE name = 'deadlock_timeout'";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+        // A non-key filter is still unbounded.
+        let sql = "SELECT setting FROM pg_settings WHERE category = 'Client Connection Defaults'";
+        assert_eq!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn fetch_one_on_an_aggregate_over_a_subquery_is_fine() {
         let mut db = catalog();
         db.apply_sql(

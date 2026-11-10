@@ -487,6 +487,9 @@ fn distinct_kept_over_relations_it_cannot_see_through() {
          ALTER TABLE secured ENABLE ROW LEVEL SECURITY;",
     );
     assert_kept(&db, "SELECT DISTINCT id FROM v");
+    // A system view's keys are PostgreSQL's, but its columns are not
+    // declared NOT NULL: DISTINCT stays.
+    assert_kept(&db, "SELECT DISTINCT name FROM pg_settings");
     assert_kept(&db, "SELECT DISTINCT id FROM (SELECT id FROM customers) s");
     assert_kept(
         &db,

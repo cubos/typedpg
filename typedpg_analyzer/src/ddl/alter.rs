@@ -248,6 +248,8 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
 
     let class = interp.pg_class.get(&class_oid).cloned();
     interp.rename_pg_class(class_oid, new_name.clone(), nsoid);
+    // A renamed relation is no longer the seeded one of that name.
+    interp.mark_relation_modified(class_oid);
 
     // The relation's row type (and its array) follow the rename.
     if let Some(type_oid) = class.as_ref().and_then(|c| c.reltype) {
@@ -397,6 +399,8 @@ fn rename_column_in(
     {
         col.attname = new.to_owned();
     }
+    // A renamed column is no longer the seeded one of that name.
+    interp.mark_relation_modified(relid);
     views::rewrite_views_on_column_rename(interp, relid, old, new);
     Ok(())
 }

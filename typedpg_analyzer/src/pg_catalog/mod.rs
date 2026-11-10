@@ -499,6 +499,11 @@ pub struct PgCatalog {
     /// Views with the `security_barrier` option: the planner doesn't pull
     /// them up into the query reading them.
     pub(crate) security_barrier_views: Shared<std::collections::HashSet<PgClassOid>>,
+    /// Relations whose definition the migrations replaced or altered
+    /// (`CREATE OR REPLACE VIEW`, `ALTER VIEW ... RENAME`). A seeded
+    /// `pg_catalog` system view among them no longer carries the guarantees
+    /// its seeded definition had (see `simplify::dedup`'s allowlist).
+    pub(crate) modified_relations: Shared<std::collections::HashSet<PgClassOid>>,
     /// `attstorage` of the columns whose storage isn't their type's
     /// `typstorage` (a STORAGE clause, ALTER COLUMN SET STORAGE).
     pub(crate) attr_storage: Shared<HashMap<(PgClassOid, i16), TypStorage>>,
@@ -871,6 +876,7 @@ impl PgCatalog {
             toast_tables: Shared::default(),
             toast_rewrites: Shared::default(),
             security_barrier_views: Shared::default(),
+            modified_relations: Shared::default(),
             attr_storage: Shared::default(),
             attr_compression: Shared::default(),
             uncertain_collations: Shared::default(),

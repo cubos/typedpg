@@ -35,10 +35,12 @@
 //!
 //! Only what PG enforces at every statement counts as a key: unique indexes
 //! that are immediate (not DEFERRABLE), not partial and on plain columns —
-//! the ones behind PRIMARY KEY and UNIQUE constraints included. Relations
-//! the proof can't see through — views, subqueries, functions, CTEs,
-//! inheritance parents, partitioned tables, tables under row security —
-//! make it give up, and so do set-returning, aggregate and volatile calls.
+//! the ones behind PRIMARY KEY and UNIQUE constraints included — and, for
+//! the `pg_catalog` system views on [`SYSTEM_VIEW_KEYS`], the keys
+//! PostgreSQL itself guarantees. Relations the proof can't see through —
+//! other views, subqueries, functions, CTEs, inheritance parents,
+//! partitioned tables, tables under row security — make it give up, and so
+//! do set-returning, aggregate and volatile calls.
 //!
 //! # Errors
 //!
@@ -72,7 +74,7 @@ use super::proof::FromScope;
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::Type;
 use crate::oid::{PgClassOid, PgCollationOid, PgNamespaceOid, PgOperatorOid, PgTypeOid};
-use crate::pg_catalog::{ProKind, ProVolatile, RelKind, oid};
+use crate::pg_catalog::{PgCatalog, ProKind, ProVolatile, RelKind, oid};
 
 /// The most relations one proof follows (a bit each in a `u64`).
 const MAX_RELATIONS: usize = 64;
@@ -853,14 +855,20 @@ impl<'a> Scope<'a> {
         Some(1 << (self.rels.len() - 1))
     }
 
-    /// Add one base-table reference; its relation as a bitmask.
+    /// Add one base-table reference, or an allowlisted system view's; its
+    /// relation as a bitmask.
     fn add_table(&mut self, ctx: &Ctx<'_>, rv: &protobuf::RangeVar, nullable: bool) -> Option<u64> {
         if self.rels.len() == MAX_RELATIONS || !rv.catalogname.is_empty() {
             return None;
         }
         let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
         let class = ctx.catalog.resolve_table(schema, &rv.relname)?;
-        if class.relkind != RelKind::Table
+        // A system view on the fixed allowlist is trusted for its keys
+        // ([`unique_keys`]); every other non-table is a relation the proof
+        // can't see through.
+        let trusted_view =
+            class.relkind == RelKind::View && is_trusted_system_view(ctx.catalog, class);
+        if (class.relkind != RelKind::Table && !trusted_view)
             || ctx
                 .catalog
                 .pg_inherits
@@ -1586,6 +1594,89 @@ fn in_btree_equality(ctx: &Ctx<'_>, family: &(String, PgNamespaceOid), op: PgOpe
     })
 }
 
+// ── System views ────────────────────────────────────────────────────────────
+
+/// The `pg_catalog` system views whose uniqueness PostgreSQL itself
+/// guarantees, with the columns of each such key.
+///
+/// Only these views are trusted; a view of the same name in another schema,
+/// a user view (even one named after these) and every statistics view —
+/// `pg_stat_activity` included, which has no promised key — stay relations
+/// the proof gives up on.
+const SYSTEM_VIEW_KEYS: &[(&str, &[&[&str]])] = &[
+    // One row per configuration parameter.
+    ("pg_settings", &[&["name"]]),
+    // One row per role.
+    ("pg_roles", &[&["oid"], &["rolname"]]),
+    // One row per role that can log in (`pg_user` is `pg_shadow`'s view).
+    ("pg_user", &[&["usename"]]),
+    // One row per table / view / index of a schema.
+    ("pg_tables", &[&["schemaname", "tablename"]]),
+    ("pg_views", &[&["schemaname", "viewname"]]),
+    ("pg_indexes", &[&["schemaname", "indexname"]]),
+];
+
+/// OIDs below this are PG's own objects (`FirstNormalObjectId`): the
+/// allowlist names system views by name, and only the seeded system view of
+/// that name is trusted — a user view in `pg_catalog` (a dropped system view
+/// replaced by one of the same name) gets a normal OID.
+const FIRST_NORMAL_OBJECT_ID: u32 = 16_384;
+
+/// Whether `class` is one of the allowlisted system views: a `pg_catalog`
+/// view seeded as PG's own object (not a user view of the same name), whose
+/// definition the migrations never replaced or altered (it would keep the
+/// OID, so the seeded definition's guarantees would no longer hold).
+fn is_trusted_system_view(catalog: &PgCatalog, class: &crate::pg_catalog::PgClass) -> bool {
+    class.relkind == RelKind::View
+        && class.oid.get() < FIRST_NORMAL_OBJECT_ID
+        && !catalog.relation_was_modified(class.oid)
+        && catalog.namespace_name(class.relnamespace) == Some("pg_catalog")
+        && SYSTEM_VIEW_KEYS
+            .iter()
+            .any(|(name, _)| *name == class.relname)
+}
+
+/// The allowlisted keys of a system view, as unique keys: the view has no
+/// index to name an operator family, so each column's is its type's default
+/// btree one, and its collation must be deterministic like a table's. No
+/// view attribute is a stored validated NOT NULL, so no key column claims
+/// one (the cardinality proof needs none; `DISTINCT` still refuses).
+fn system_view_keys(
+    catalog: &PgCatalog,
+    attrs: &[crate::pg_catalog::PgAttribute],
+    keys: &[&[&str]],
+) -> Vec<UniqueKey> {
+    keys.iter()
+        .filter_map(|key| {
+            let mut columns = Vec::with_capacity(key.len());
+            for name in *key {
+                let attr = attrs.iter().find(|a| a.attnum > 0 && a.attname == *name)?;
+                let family = default_btree_family(catalog, attr.atttypid)?;
+                columns.push(KeyColumn {
+                    attnum: attr.attnum,
+                    typ: attr.atttypid,
+                    notnull: false,
+                    family,
+                    default_family: true,
+                    deterministic: deterministic(attr.attcollation),
+                });
+            }
+            Some(UniqueKey {
+                columns,
+                nulls_not_distinct: false,
+                predicate: None,
+            })
+        })
+        .collect()
+}
+
+/// The operator family of `typ`'s default btree operator class.
+fn default_btree_family(catalog: &PgCatalog, typ: PgTypeOid) -> Option<(String, PgNamespaceOid)> {
+    crate::ddl::opclass::default_opclass_id(catalog, typ, "btree")
+        .and_then(|d| catalog.pg_opclass.iter().find(|c| c.oid == d))
+        .map(|d| (d.opcfamily.clone(), d.opcfamilynamespace))
+}
+
 // ── Unique keys ─────────────────────────────────────────────────────────────
 
 struct KeyColumn {
@@ -1618,6 +1709,15 @@ struct UniqueKey {
 fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
     let catalog = ctx.catalog;
     let attrs = catalog.attributes_of(relid);
+    // A trusted system view has no index: its keys are PostgreSQL's own.
+    if let Some(class) = catalog.pg_class.get(&relid)
+        && is_trusted_system_view(catalog, class)
+    {
+        return SYSTEM_VIEW_KEYS
+            .iter()
+            .find(|(name, _)| *name == class.relname)
+            .map_or_else(Vec::new, |(_, keys)| system_view_keys(catalog, attrs, keys));
+    }
     let mut out = Vec::new();
     'index: for index in catalog.pg_index.values() {
         if index.indrelid != relid

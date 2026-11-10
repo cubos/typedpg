@@ -111,8 +111,9 @@ pub fn redundant_distinct_spans(
 ///   scalar subqueries uncorrelated with this level or columns of
 ///   already-determined relations — the `distinct` rule's "equalities to a
 ///   key" proof (see [`super::dedup`]), propagated until every relation is
-///   determined — a single-row CTE, or a `FROM` function that can't return
-///   a set (see below).
+///   determined — a single-row CTE, a `FROM` function that can't return
+///   a set, or a `pg_catalog` system view with a key PostgreSQL itself
+///   guarantees (see below).
 ///
 /// A CTE the statement's own `WITH` clause proves yields at most one row is
 /// a relation with no key needed: it is determined from the start, may be
@@ -130,12 +131,12 @@ pub fn redundant_distinct_spans(
 /// locking clause is handled on its own (it needs a single relation).
 ///
 /// Anything else is `false`: `GROUP BY` always is (a group per key), and so
-/// is every relation the proof can't see through (a view, a subquery, a
-/// function that returns a set, an unproven CTE, an inheritance parent, a
-/// partitioned table or one under row security), a set-returning call, a
-/// `FULL JOIN` (two one-row sides still produce an unmatched row from each
-/// when their keys differ), or an outer join whose nullable side isn't
-/// determined.
+/// is every relation the proof can't see through (a view other than the
+/// trusted `pg_catalog` system views, a subquery, a function that returns a
+/// set, an unproven CTE, an inheritance parent, a partitioned table or one
+/// under row security), a set-returning call, a `FULL JOIN` (two one-row
+/// sides still produce an unmatched row from each when their keys differ),
+/// or an outer join whose nullable side isn't determined.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
     if !view.analyzed.spreads.is_empty() {
         return false;
@@ -1678,6 +1679,107 @@ mod tests {
             &db,
             "SELECT id FROM paints WHERE shop = $1 AND color::text = 'red'"
         ));
+    }
+
+    #[test]
+    fn allowlisted_system_views_prove_key_lookups() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "SELECT setting FROM pg_settings WHERE name = 'deadlock_timeout'"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT setting FROM pg_settings WHERE name = $1"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT rolname FROM pg_roles WHERE rolname = 'postgres'"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT rolname FROM pg_roles WHERE oid = 10"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT tablename FROM pg_tables \
+             WHERE schemaname = 'public' AND tablename = 't'"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT viewname FROM pg_views \
+             WHERE schemaname = 'public' AND viewname = 'v'"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT indexname FROM pg_indexes \
+             WHERE schemaname = 'public' AND indexname = 'i'"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT usename FROM pg_user WHERE usename = 'postgres'"
+        ));
+        // A non-key column, an operator that isn't equality, and half a
+        // composite key prove nothing.
+        assert!(!select_one(
+            &db,
+            "SELECT setting FROM pg_settings WHERE category = 'x'"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT setting FROM pg_settings WHERE name LIKE 'dead%'"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+        ));
+        // A statistics view has no key PostgreSQL promises.
+        assert!(!select_one(
+            &db,
+            "SELECT pid FROM pg_stat_activity WHERE pid = 1"
+        ));
+    }
+
+    #[test]
+    fn a_replaced_system_view_is_not_trusted() {
+        let mut db = catalog();
+        let sql = "SELECT viewname FROM pg_views \
+                   WHERE schemaname = 'public' AND viewname = 'v'";
+        assert!(select_one(&db, sql));
+        // `CREATE OR REPLACE VIEW` keeps the OID, so the allowlist still
+        // finds the seeded object; its rows are whatever the replacement
+        // selects now.
+        db.apply_sql(
+            "CREATE OR REPLACE VIEW pg_catalog.pg_views AS
+             SELECT n.nspname AS schemaname, c.relname AS viewname,
+                    pg_get_userbyid(c.relowner) AS viewowner,
+                    pg_get_viewdef(c.oid) AS definition
+             FROM pg_class c, pg_namespace n",
+        )
+        .unwrap();
+        assert!(!select_one(&db, sql));
+        // A system view the migrations didn't touch stays trusted.
+        assert!(select_one(
+            &db,
+            "SELECT name FROM pg_settings WHERE name = 'deadlock_timeout'"
+        ));
+    }
+
+    #[test]
+    fn a_user_view_named_like_a_system_view_is_not_trusted() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE settings (name text NOT NULL, setting text NOT NULL);
+             CREATE VIEW public.pg_settings AS SELECT name, setting FROM settings;",
+        )
+        .unwrap();
+        // Same name, another schema: not the system view.
+        assert!(!select_one(
+            &db,
+            "SELECT setting FROM public.pg_settings WHERE name = 'deadlock_timeout'"
+        ));
+        // Any other view stays a relation the proof can't see through.
+        assert!(!select_one(&db, "SELECT name FROM v WHERE id = $1"));
     }
 
     #[test]

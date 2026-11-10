@@ -741,6 +741,19 @@ impl PgCatalog {
         self.attributes_of(relid).iter().find(|a| a.attname == name)
     }
 
+    /// Record that relation `relid`'s definition changed after the seed: a
+    /// view whose query was replaced, or a relation some `ALTER` renames.
+    /// A seeded system relation among them no longer carries the guarantees
+    /// its seeded definition had.
+    pub(crate) fn mark_relation_modified(&mut self, relid: PgClassOid) {
+        self.modified_relations.insert(relid);
+    }
+
+    /// Whether [`Self::mark_relation_modified`] recorded `relid`.
+    pub(crate) fn relation_was_modified(&self, relid: PgClassOid) -> bool {
+        self.modified_relations.contains(&relid)
+    }
+
     /// Enum labels of a type, ordered by `enumsortorder`.
     pub fn enum_labels_of(&self, typid: PgTypeOid) -> Vec<&str> {
         self.pg_enum

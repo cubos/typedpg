@@ -672,6 +672,9 @@ fn replace_view(
         PgGenericOid::from_nonzero(view_oid.into_nonzero()),
     );
     record_view_dependencies(interp, view_oid, &deps);
+    // The view keeps its OID but not its definition: nothing the seed said
+    // about its rows (a system view's guaranteed keys included) holds now.
+    interp.mark_relation_modified(view_oid);
     Ok(())
 }
 
