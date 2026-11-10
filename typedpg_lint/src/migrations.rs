@@ -16,7 +16,7 @@ use typedpg_analyzer::{
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::protobuf::{
     AlterTableType, BoolExprType, ConstrType, Node, NullTestType, ObjectType, SortByDir,
-    SortByNulls, VariableSetKind, a_const::Val, node::Node as N,
+    SortByNulls, TransactionStmtKind, VariableSetKind, a_const::Val, node::Node as N,
 };
 
 use crate::{AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment};
@@ -104,6 +104,10 @@ pub fn lint_migrations(
         last_statement_end: 0,
         use_transaction,
         lock_timeout_set: false,
+        lock_timeout_local: None,
+        transaction_open: false,
+        transaction_snapshot: None,
+        savepoints: Vec::new(),
         lock_timeout_reported: false,
     };
     for (file, migration) in files.iter().enumerate() {
@@ -206,9 +210,22 @@ struct MigrationLinter<'a> {
     /// wrapped in a transaction (`used_transaction` also checks the file's
     /// `-- no-transaction` marker).
     use_transaction: bool,
-    /// Whether an earlier statement of the current file set `lock_timeout`
-    /// to a non-zero value.
+    /// The session's `lock_timeout` is set to a non-zero value.
     lock_timeout_set: bool,
+    /// A `SET LOCAL` / `set_config(…, true)` override in the open
+    /// transaction: `Some(true)` for a proven non-zero timeout, `Some(false)`
+    /// for zero or a value the lint cannot evaluate. `None` when the
+    /// transaction has no local override.
+    lock_timeout_local: Option<bool>,
+    /// Whether a transaction is open: the file's runner transaction, or an
+    /// explicit `BEGIN` / `START TRANSACTION`.
+    transaction_open: bool,
+    /// The `(session, local)` timeout state at `BEGIN`. PostgreSQL rolls GUC
+    /// changes back with the transaction, so a full `ROLLBACK` restores it.
+    transaction_snapshot: Option<(bool, Option<bool>)>,
+    /// The `(session, local)` state at each open `SAVEPOINT`, innermost last:
+    /// `ROLLBACK TO` restores it and `RELEASE` drops it.
+    savepoints: Vec<(String, (bool, Option<bool>))>,
     /// Whether `missing_lock_timeout` already reported a statement of the
     /// current file: at most one finding per file.
     lock_timeout_reported: bool,
@@ -225,6 +242,10 @@ impl MigrationLinter<'_> {
         self.reported_comments.clear();
         self.last_statement_end = 0;
         self.lock_timeout_set = false;
+        self.lock_timeout_local = None;
+        self.transaction_open = self.file_runs_in_transaction();
+        self.transaction_snapshot = self.transaction_open.then_some((false, None));
+        self.savepoints.clear();
         self.lock_timeout_reported = false;
     }
 
@@ -522,9 +543,37 @@ impl MigrationLinter<'_> {
         let Some(relation) = alter.relation.as_ref() else {
             return Vec::new();
         };
-        let Some((_, table)) = self.table(catalog, relation) else {
+        let Some((relid, table)) = self.table(catalog, relation) else {
             return Vec::new();
         };
+        // PostgreSQL decides `skipValidation` once for the whole statement
+        // (`transformAlterTableStmt` / `transformFKConstraints`,
+        // src/backend/parser/parse_utilcmd.c, PG 18): it starts true and
+        // becomes false when any `ADD COLUMN` leaves a `raw_default` on the
+        // column — after `transformColumnDefinition`, which turns
+        // `serial` into a `nextval` DEFAULT and a GENERATED expression into
+        // `raw_default`, while identity does not — or when any
+        // `ADD CONSTRAINT` is a foreign key. Only when it stays true does
+        // `transformFKConstraints` mark every FK of the statement
+        // `skip_validation`, so one defaulted column makes all of them scan.
+        let mut skip_validation = true;
+        for command in &alter.cmds {
+            let Some(command) = alter_command(command) else {
+                continue;
+            };
+            match (
+                AlterTableType::try_from(command.subtype),
+                command.def.as_deref().and_then(|def| def.node.as_ref()),
+            ) {
+                (Ok(AlterTableType::AtAddColumn), Some(N::ColumnDef(column))) => {
+                    skip_validation &= !column_has_raw_default(column);
+                }
+                (Ok(AlterTableType::AtAddConstraint), Some(N::Constraint(constraint))) => {
+                    skip_validation &= !constraint_is_foreign_key(constraint);
+                }
+                _ => {}
+            }
+        }
         let mut found = false;
         for command in &alter.cmds {
             let Some(command) = alter_command(command) else {
@@ -550,9 +599,23 @@ impl MigrationLinter<'_> {
                     else {
                         continue;
                     };
+                    // `ADD COLUMN IF NOT EXISTS` on an existing column adds
+                    // nothing (constraints included).
+                    if catalog
+                        .attributes_of(relid)
+                        .iter()
+                        .any(|attribute| attribute.attname == column.colname)
+                    {
+                        continue;
+                    }
+                    // A foreign key on a column added by this statement has
+                    // nothing to check only when PostgreSQL skips the
+                    // validation: every added column has no default and the
+                    // statement adds no other FK.
                     for node in &column.constraints {
                         if let Some(N::Constraint(constraint)) = node.node.as_ref()
                             && validates(constraint)
+                            && !(skip_validation && constraint_is_foreign_key(constraint))
                         {
                             found = true;
                         }
@@ -643,18 +706,22 @@ impl MigrationLinter<'_> {
                     else {
                         continue;
                     };
-                    // USING always computes a new value, even when the cast
-                    // alone would be a relabeling.
-                    if column.raw_default.is_some() {
-                        found = true;
-                        continue;
-                    }
                     let Some(type_name) = column.type_name.as_ref() else {
                         found = true;
                         continue;
                     };
+                    // The USING expression (`column.raw_default`) is
+                    // planned like PostgreSQL's ATColumnChangeRequiresRewrite
+                    // does: a bare reference to the same column under a
+                    // binary-coercible change computes nothing and does not
+                    // rewrite.
                     if catalog
-                        .column_type_rewrites(relid, &command.name, type_name, None)
+                        .column_type_rewrites(
+                            relid,
+                            &command.name,
+                            type_name,
+                            column.raw_default.as_deref(),
+                        )
                         .unwrap_or(true)
                     {
                         found = true;
@@ -666,6 +733,17 @@ impl MigrationLinter<'_> {
                     else {
                         continue;
                     };
+                    // `ADD COLUMN IF NOT EXISTS` on a column that already
+                    // exists adds nothing: no default to evaluate, no row to
+                    // rewrite.
+                    if command.missing_ok
+                        && catalog
+                            .attributes_of(relid)
+                            .iter()
+                            .any(|attribute| attribute.attname == column.colname)
+                    {
+                        continue;
+                    }
                     let mut volatile_default = false;
                     let mut generated_stored = column.generated == "s";
                     for constraint in &column.constraints {
@@ -713,16 +791,11 @@ impl MigrationLinter<'_> {
     }
 
     fn missing_lock_timeout(&mut self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
-        // A `SET`/`RESET` of the setting changes it for the statements that
-        // follow, whether or not it is this rule's finding. `SET LOCAL` only
-        // lasts for the enclosing transaction, so outside one it does
-        // nothing.
-        if let N::VariableSetStmt(set) = node
-            && let Some(nonzero) = lock_timeout_setting(set, self.file_runs_in_transaction())
-        {
-            self.lock_timeout_set = nonzero;
-        }
-        if self.lock_timeout_set || self.lock_timeout_reported {
+        // A `SET`/`RESET`/`set_config` of the setting changes it for the
+        // statements that follow, whether or not it is this rule's finding,
+        // and `BEGIN`/`COMMIT` decide how long a LOCAL setting lasts.
+        self.track_lock_timeout(catalog, node);
+        if self.lock_timeout_effective() || self.lock_timeout_reported {
             return Vec::new();
         }
         let Some((kind, relid)) = lock_target(catalog, &self.pre_existing, node) else {
@@ -747,6 +820,171 @@ impl MigrationLinter<'_> {
             help: Some(help.to_owned()),
             fix: Vec::new(),
         }]
+    }
+
+    /// Follow the `lock_timeout` and transaction state changes of `node`.
+    fn track_lock_timeout(&mut self, catalog: &PgCatalog, node: &N) {
+        match node {
+            N::TransactionStmt(transaction) => self.track_transaction(transaction),
+            N::VariableSetStmt(set) => {
+                if let Some(value) =
+                    lock_timeout_setting(set, self.transaction_open, self.lock_timeout_effective())
+                {
+                    self.set_lock_timeout(value, set.is_local);
+                }
+            }
+            N::SelectStmt(select) => {
+                if let Some((value, local)) = set_config_lock_timeout(catalog, select) {
+                    self.set_lock_timeout(value, local);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Follow `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` and their
+    /// variants. PostgreSQL rolls GUC changes back with their transaction
+    /// (or subtransaction), so each `BEGIN` snapshots the timeout state,
+    /// `ROLLBACK` restores the `BEGIN` snapshot, `ROLLBACK TO` restores the
+    /// savepoint's, and `RELEASE` drops it. A `COMMIT` keeps the session
+    /// value and drops the local one.
+    fn track_transaction(&mut self, transaction: &typedpg_pg_query::protobuf::TransactionStmt) {
+        let Ok(kind) = TransactionStmtKind::try_from(transaction.kind) else {
+            // An unrecognized transaction control statement can end or
+            // start a transaction in ways this tracker does not model:
+            // forget every proof, so the next blocking statement reports.
+            self.reset_lock_timeout_proof();
+            return;
+        };
+        match kind {
+            TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart => {
+                // `BEGIN` inside an open transaction is a warning and does
+                // nothing; only an outer one starts a new snapshot.
+                if !self.transaction_open {
+                    self.transaction_open = true;
+                    self.transaction_snapshot =
+                        Some((self.lock_timeout_set, self.lock_timeout_local));
+                    self.savepoints.clear();
+                }
+            }
+            TransactionStmtKind::TransStmtCommit => {
+                self.end_transaction(false);
+                self.begin_chain(transaction.chain);
+            }
+            TransactionStmtKind::TransStmtRollback => {
+                self.end_transaction(true);
+                self.begin_chain(transaction.chain);
+            }
+            TransactionStmtKind::TransStmtSavepoint => {
+                if self.transaction_open && !transaction.savepoint_name.is_empty() {
+                    self.savepoints.push((
+                        transaction.savepoint_name.clone(),
+                        (self.lock_timeout_set, self.lock_timeout_local),
+                    ));
+                } else {
+                    self.reset_lock_timeout_proof();
+                }
+            }
+            TransactionStmtKind::TransStmtRelease => {
+                let Some(index) = self.savepoint_index(&transaction.savepoint_name) else {
+                    self.reset_lock_timeout_proof();
+                    return;
+                };
+                self.savepoints.truncate(index);
+            }
+            TransactionStmtKind::TransStmtRollbackTo => {
+                let Some(index) = self.savepoint_index(&transaction.savepoint_name) else {
+                    self.reset_lock_timeout_proof();
+                    return;
+                };
+                // `ROLLBACK TO` keeps the savepoint itself defined (so the
+                // same point can be rolled back to again) and destroys the
+                // ones established after it.
+                let (_, snapshot) = self.savepoints[index].clone();
+                self.lock_timeout_set = snapshot.0;
+                self.lock_timeout_local = snapshot.1;
+                self.savepoints.truncate(index + 1);
+            }
+            // Two-phase commit moves the transaction's changes outside this
+            // file's reach: do not claim any timeout survives it.
+            TransactionStmtKind::TransStmtPrepare
+            | TransactionStmtKind::TransStmtCommitPrepared
+            | TransactionStmtKind::TransStmtRollbackPrepared
+            | TransactionStmtKind::Undefined => self.reset_lock_timeout_proof(),
+        }
+    }
+
+    /// The index of the innermost open savepoint named `name`.
+    fn savepoint_index(&self, name: &str) -> Option<usize> {
+        if !self.transaction_open || name.is_empty() {
+            return None;
+        }
+        self.savepoints.iter().rposition(|(open, _)| open == name)
+    }
+
+    /// Finish the open transaction: `ROLLBACK` restores the state from
+    /// `BEGIN`, `COMMIT` keeps the session value. Either way the local
+    /// override and every savepoint are gone.
+    fn end_transaction(&mut self, rollback: bool) {
+        if self.transaction_open
+            && rollback
+            && let Some((session, _)) = self.transaction_snapshot
+        {
+            self.lock_timeout_set = session;
+        }
+        self.transaction_open = false;
+        self.lock_timeout_local = None;
+        self.transaction_snapshot = None;
+        self.savepoints.clear();
+    }
+
+    /// Start a new transaction after `COMMIT AND CHAIN` / `ROLLBACK AND
+    /// CHAIN`, snapshotting the value the previous transaction left.
+    fn begin_chain(&mut self, chain: bool) {
+        if !chain {
+            return;
+        }
+        self.transaction_open = true;
+        self.transaction_snapshot = Some((self.lock_timeout_set, None));
+        self.lock_timeout_local = None;
+        self.savepoints.clear();
+    }
+
+    /// Forget every proof that a timeout is set: a statement this tracker
+    /// cannot model leaves the state unknown, so the next blocking statement
+    /// reports instead of staying silent on a false claim.
+    fn reset_lock_timeout_proof(&mut self) {
+        self.lock_timeout_set = false;
+        self.lock_timeout_local = None;
+        self.transaction_open = false;
+        self.transaction_snapshot = None;
+        self.savepoints.clear();
+    }
+
+    /// Apply a `SET` (session) or `SET LOCAL` / `set_config(…, true)`
+    /// (transaction) of `lock_timeout`. `None` is a value the lint cannot
+    /// evaluate: it clears any earlier proof.
+    fn set_lock_timeout(&mut self, value: Option<bool>, local: bool) {
+        let value = value.unwrap_or(false);
+        if local {
+            // Outside a transaction block `SET LOCAL` warns and does
+            // nothing.
+            if self.transaction_open {
+                self.lock_timeout_local = Some(value);
+            }
+        } else {
+            self.lock_timeout_set = value;
+            self.lock_timeout_local = None;
+        }
+    }
+
+    /// The timeout the next statement runs with.
+    fn lock_timeout_effective(&self) -> bool {
+        if self.transaction_open {
+            self.lock_timeout_local.unwrap_or(self.lock_timeout_set)
+        } else {
+            self.lock_timeout_set
+        }
     }
 
     /// Whether the current file runs inside the runner's transaction.
@@ -1407,6 +1645,52 @@ fn validates(constraint: &typedpg_pg_query::protobuf::Constraint) -> bool {
     ) && !constraint.skip_validation
 }
 
+/// Whether a `ColumnDef` gives the column a DEFAULT: an explicit one, or the
+/// `nextval()` the `serial` pseudo-types expand to.
+fn column_has_default(column: &typedpg_pg_query::protobuf::ColumnDef) -> bool {
+    column.raw_default.is_some()
+        || column.constraints.iter().any(|node| {
+            matches!(
+                node.node.as_ref(),
+                Some(N::Constraint(constraint))
+                    if ConstrType::try_from(constraint.contype)
+                        == Ok(ConstrType::ConstrDefault)
+            )
+        })
+        || column_type_name(column).is_some_and(|name| {
+            matches!(
+                name,
+                "smallserial" | "serial2" | "serial" | "serial4" | "bigserial" | "serial8"
+            )
+        })
+}
+
+/// The last name of the column's declared type.
+fn column_type_name(column: &typedpg_pg_query::protobuf::ColumnDef) -> Option<&str> {
+    let type_name = column.type_name.as_ref()?;
+    match type_name.names.last()?.node.as_ref()? {
+        N::String(name) => Some(&name.sval),
+        _ => None,
+    }
+}
+
+/// Whether PostgreSQL's `transformColumnDefinition` leaves a `raw_default`
+/// on the column: an explicit or serial DEFAULT, or a GENERATED expression
+/// (stored or virtual, whose expression the parser stores as
+/// `raw_default`). Identity columns do not get one. This is exactly the
+/// condition `transformAlterTableStmt` checks to clear `skipValidation`.
+fn column_has_raw_default(column: &typedpg_pg_query::protobuf::ColumnDef) -> bool {
+    column_has_default(column)
+        || !column.generated.is_empty()
+        || column.constraints.iter().any(|node| {
+            matches!(
+                node.node.as_ref(),
+                Some(N::Constraint(constraint))
+                    if ConstrType::try_from(constraint.contype) == Ok(ConstrType::ConstrGenerated)
+            )
+        })
+}
+
 fn alter_command(node: &Node) -> Option<&typedpg_pg_query::protobuf::AlterTableCmd> {
     match node.node.as_ref()? {
         N::AlterTableCmd(command) => Some(command),
@@ -1492,21 +1776,181 @@ fn type_label(catalog: &PgCatalog, oid: PgTypeOid) -> &str {
         .map_or("unknown", |ty| ty.typname.as_str())
 }
 
+/// `SELECT [pg_catalog.]set_config('lock_timeout', <value>, <is_local>)` as
+/// a plain top-level statement with constant arguments: the value (`Some`
+/// when the lint can evaluate it, `None` when it cannot) and whether it is
+/// local to the transaction.
+///
+/// Only `pg_catalog.set_config` is the built-in; an unqualified name may
+/// resolve to a user function when `search_path` finds one first, so it is
+/// trusted only while the catalog holds no other `set_config`.
+fn set_config_lock_timeout(
+    catalog: &PgCatalog,
+    select: &typedpg_pg_query::protobuf::SelectStmt,
+) -> Option<(Option<bool>, bool)> {
+    use typedpg_pg_query::protobuf::SetOperation;
+
+    if select.op() != SetOperation::SetopNone
+        || !select.from_clause.is_empty()
+        || select.where_clause.is_some()
+        || !select.group_clause.is_empty()
+        || select.having_clause.is_some()
+        || !select.window_clause.is_empty()
+        || !select.distinct_clause.is_empty()
+        || !select.sort_clause.is_empty()
+        || select.limit_count.is_some()
+        || select.limit_offset.is_some()
+    {
+        return None;
+    }
+    let [target] = select.target_list.as_slice() else {
+        return None;
+    };
+    let Some(N::ResTarget(target)) = target.node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(call)) = target.val.as_deref().and_then(|value| value.node.as_ref())
+    else {
+        return None;
+    };
+    let names: Vec<&str> = call
+        .funcname
+        .iter()
+        .filter_map(|node| match &node.node {
+            Some(N::String(string)) => Some(string.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !set_config_is_builtin(catalog, &names) {
+        return None;
+    }
+    let [setting, value, local] = call.args.as_slice() else {
+        return None;
+    };
+    // Only a string literal (optionally cast once to `text`) has text this
+    // lint knows: a cast chain evaluates the value away
+    // (`'0.4'::numeric::integer::text` is `'0'`).
+    if !plain_text_literal(setting)?.eq_ignore_ascii_case("lock_timeout") {
+        return None;
+    }
+    // An unknown `is_local` decides where the assignment lands; drop the
+    // proof rather than guess.
+    let Some(local) = constant_bool(local) else {
+        return Some((None, false));
+    };
+    Some((set_config_value(value), local))
+}
+
+/// Whether the called function is PostgreSQL's `set_config`. `pg_catalog`
+/// always wins when named; an unqualified `set_config` is only known to be
+/// it while no user-defined function of that name exists.
+fn set_config_is_builtin(catalog: &PgCatalog, names: &[&str]) -> bool {
+    match names {
+        ["pg_catalog", "set_config"] => true,
+        ["set_config"] => !catalog.pg_proc().values().any(|proc| {
+            proc.proname == "set_config"
+                && catalog.namespace_name(proc.pronamespace) != Some("pg_catalog")
+        }),
+        _ => false,
+    }
+}
+
+/// The text of a string literal, uncast or cast once to `text`.
+fn plain_text_literal(node: &Node) -> Option<&str> {
+    let node = match node.node.as_ref()? {
+        N::TypeCast(cast) => {
+            if !is_text_type(cast.type_name.as_ref()?) {
+                return None;
+            }
+            cast.arg.as_deref()?
+        }
+        _ => node,
+    };
+    match node.node.as_ref()? {
+        N::AConst(constant) => match constant.val.as_ref()? {
+            Val::Sval(string) => Some(&string.sval),
+            _ => None,
+        },
+        N::String(string) => Some(&string.sval),
+        _ => None,
+    }
+}
+
+/// Whether a cast's target type is `text`.
+fn is_text_type(type_name: &typedpg_pg_query::protobuf::TypeName) -> bool {
+    let names: Vec<&str> = type_name
+        .names
+        .iter()
+        .filter_map(|node| match &node.node {
+            Some(N::String(string)) => Some(string.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    matches!(names.as_slice(), ["text"] | ["pg_catalog", "text"])
+}
+
+/// The value `set_config('lock_timeout', <value>, …)` sets: `Some` for a
+/// string literal (optionally cast once to `text`), `None` when another
+/// expression computes it. A NULL literal resets the setting to its default
+/// (`0`, disabled).
+fn set_config_value(node: &Node) -> Option<bool> {
+    let node = match node.node.as_ref()? {
+        N::TypeCast(cast) => {
+            if !is_text_type(cast.type_name.as_ref()?) {
+                return None;
+            }
+            cast.arg.as_deref()?
+        }
+        _ => node,
+    };
+    match node.node.as_ref()? {
+        N::AConst(constant) if constant.isnull => Some(false),
+        N::AConst(constant) => match constant.val.as_ref()? {
+            Val::Sval(string) => Some(duration_nonzero(&string.sval)),
+            _ => None,
+        },
+        N::String(string) => Some(duration_nonzero(&string.sval)),
+        _ => None,
+    }
+}
+
+/// The constant `node` is, through casts.
+fn constant_node(node: &Node) -> Option<&Node> {
+    match node.node.as_ref()? {
+        N::TypeCast(cast) => constant_node(cast.arg.as_deref()?),
+        _ => Some(node),
+    }
+}
+
+fn constant_bool(node: &Node) -> Option<bool> {
+    match constant_node(node)?.node.as_ref()? {
+        N::AConst(constant) => match constant.val.as_ref()? {
+            Val::Boolval(boolean) => Some(boolean.boolval),
+            _ => None,
+        },
+        N::Boolean(boolean) => Some(boolean.boolval),
+        _ => None,
+    }
+}
+
 /// The effective value of a `SET`/`RESET` of `lock_timeout`, when the
-/// statement sets it: `Some(true)` for a non-zero value, `Some(false)` for
-/// zero, `DEFAULT`, `RESET` or `RESET ALL`, and `None` for another setting.
+/// statement sets it: `Some(Some(true))` for a proven non-zero value,
+/// `Some(Some(false))` for zero, `DEFAULT`, `RESET` or `RESET ALL`,
+/// `Some(None)` for a value the lint cannot evaluate, and `None` for
+/// another setting.
 ///
 /// `SET LOCAL` outside a transaction block is a no-op (PostgreSQL warns and
 /// keeps the session value), so it is `None` when `in_transaction` is false.
 fn lock_timeout_setting(
     set: &typedpg_pg_query::protobuf::VariableSetStmt,
     in_transaction: bool,
-) -> Option<bool> {
+    effective: bool,
+) -> Option<Option<bool>> {
     let kind = VariableSetKind::try_from(set.kind).ok()?;
     // `RESET ALL` carries no setting name: it clears every setting,
     // `lock_timeout` included.
     if kind == VariableSetKind::VarResetAll {
-        return Some(false);
+        return Some(Some(false));
     }
     if !set.name.eq_ignore_ascii_case("lock_timeout") {
         return None;
@@ -1515,42 +1959,110 @@ fn lock_timeout_setting(
         return None;
     }
     match kind {
-        VariableSetKind::VarSetValue => Some(set.args.first().is_some_and(lock_timeout_nonzero)),
-        VariableSetKind::VarSetDefault
-        | VariableSetKind::VarSetCurrent
-        | VariableSetKind::VarReset => Some(false),
+        VariableSetKind::VarSetValue => Some(set.args.first().and_then(setting_value)),
+        VariableSetKind::VarSetDefault | VariableSetKind::VarReset => Some(Some(false)),
+        // `SET … FROM CURRENT` keeps the value the statement runs with.
+        VariableSetKind::VarSetCurrent => Some(Some(effective)),
+        _ => Some(None),
+    }
+}
+
+/// The value of `SET … TO <value>`: `Some` when its text is known, `None`
+/// when an expression computes it.
+fn setting_value(node: &Node) -> Option<bool> {
+    match node.node.as_ref()? {
+        N::AConst(constant) if constant.isnull => None,
+        N::AConst(constant) => match constant.val.as_ref()? {
+            Val::Ival(value) => Some(value.ival != 0),
+            Val::Fval(value) => Some(duration_nonzero(&value.fval)),
+            Val::Sval(value) => Some(duration_nonzero(&value.sval)),
+            _ => None,
+        },
+        N::Integer(value) => Some(value.ival != 0),
+        N::Float(value) => Some(duration_nonzero(&value.fval)),
+        N::String(value) => Some(duration_nonzero(&value.sval)),
         _ => None,
     }
 }
 
-fn lock_timeout_nonzero(node: &Node) -> bool {
-    match node.node.as_ref() {
-        Some(N::AConst(constant)) => match constant.val.as_ref() {
-            Some(Val::Ival(value)) => value.ival != 0,
-            Some(Val::Fval(value)) => duration_nonzero(&value.fval),
-            Some(Val::Sval(value)) => duration_nonzero(&value.sval),
-            _ => true,
-        },
-        Some(N::TypeCast(cast)) => cast.arg.as_deref().is_some_and(lock_timeout_nonzero),
-        _ => true,
-    }
+/// Whether a PostgreSQL time value (`5s`, `5000`, `0`, `1min`) is non-zero
+/// once PostgreSQL has rounded it to whole milliseconds. A spelling we
+/// cannot parse is taken as non-zero: the rule then stays quiet rather than
+/// reporting a migration that did set a timeout.
+fn duration_nonzero(value: &str) -> bool {
+    duration_milliseconds(value).is_none_or(|milliseconds| milliseconds != 0)
 }
 
-/// Whether a PostgreSQL time value (`5s`, `5000`, `0`, `1min`) is non-zero.
-/// A spelling we cannot parse is taken as non-zero: the rule then stays
-/// quiet rather than reporting a migration that did set a timeout.
-fn duration_nonzero(value: &str) -> bool {
+/// A PostgreSQL time value in milliseconds, rounded the way `parse_int` /
+/// `convert_to_base_unit` do for `lock_timeout` (guc.c): the conversion
+/// rounds to the next smaller unit (a microsecond) and then to an integer
+/// millisecond, with ties to even. `None` when the spelling is not a number.
+///
+/// `lock_timeout` is disabled exactly when the result is zero, so
+/// `'0.4ms'` and `'0.5ms'` are zero but `'0.6ms'` is not.
+fn duration_milliseconds(value: &str) -> Option<i64> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("default") {
-        return false;
+        return Some(0);
     }
     let lower = value.to_ascii_lowercase();
-    let unit = ["us", "ms", "s", "min", "h", "d"]
+    // Longest unit first: `min` before `ms`, `ms` / `us` before `s`.
+    let unit = ["min", "us", "ms", "h", "d", "s"]
         .into_iter()
-        .find(|unit| lower.ends_with(unit))
-        .map_or(0, str::len);
-    let number = lower[..lower.len() - unit].trim();
-    number.parse::<f64>() != Ok(0.0)
+        .find(|unit| lower.ends_with(unit));
+    let (number, multiplier) = match unit {
+        Some("min") => (&lower[..lower.len() - 3], 60_000.0),
+        Some("us") => (&lower[..lower.len() - 2], 0.001),
+        Some("ms") => (&lower[..lower.len() - 2], 1.0),
+        Some("h") => (&lower[..lower.len() - 1], 3_600_000.0),
+        Some("d") => (&lower[..lower.len() - 1], 86_400_000.0),
+        Some("s") => (&lower[..lower.len() - 1], 1_000.0),
+        _ => (lower.as_str(), 1.0),
+    };
+    let number = parse_pg_number(number)?;
+    if !number.is_finite() {
+        return Some(i64::MAX);
+    }
+    let microseconds = (number * multiplier * 1000.0).round_ties_even();
+    let milliseconds = (microseconds / 1000.0).round_ties_even();
+    if !milliseconds.is_finite() {
+        return Some(i64::MAX);
+    }
+    Some(milliseconds as i64)
+}
+
+/// The number part of a PostgreSQL setting value: decimal or scientific, or
+/// the `0x` / `0o` / `0b` integer literals `strtol` accepts.
+fn parse_pg_number(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let digits = digits.replace('_', "");
+    let parsed = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        u128::from_str_radix(hex, 16).ok().map(|value| value as f64)
+    } else if let Some(octal) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        u128::from_str_radix(octal, 8)
+            .ok()
+            .map(|value| value as f64)
+    } else if let Some(binary) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        u128::from_str_radix(binary, 2)
+            .ok()
+            .map(|value| value as f64)
+    } else {
+        digits.parse::<f64>().ok()
+    }?;
+    Some(if negative { -parsed } else { parsed })
 }
 
 /// The first statement that takes a write-blocking lock on a relation that
@@ -1915,27 +2427,37 @@ fn proven_not_null(catalog: &PgCatalog, relid: PgClassOid, column: &str) -> bool
             && constraint.contype == ConType::Check
             && constraint.convalidated
             && constraint.conenforced
+            && !constraint.connoinherit
             && catalog
                 .check_expression(constraint.oid)
-                .is_some_and(|expr| is_not_null(expr, column))
+                .is_some_and(|expr| check_proves_not_null(expr, column))
     })
 }
 
-fn is_not_null(node: &Node, column: &str) -> bool {
-    let Some(N::NullTest(test)) = node.node.as_ref() else {
-        return false;
-    };
-    if NullTestType::try_from(test.nulltesttype) != Ok(NullTestType::IsNotNull) || test.argisrow {
-        return false;
+/// Whether `node` is `column IS NOT NULL`, or an AND with such a top-level
+/// conjunct (other conjuncts may test anything).
+fn check_proves_not_null(node: &Node, column: &str) -> bool {
+    match node.node.as_ref() {
+        Some(N::BoolExpr(expr))
+            if BoolExprType::try_from(expr.boolop) == Ok(BoolExprType::AndExpr) =>
+        {
+            !expr.args.is_empty()
+                && expr
+                    .args
+                    .iter()
+                    .any(|arg| check_proves_not_null(arg, column))
+        }
+        Some(N::NullTest(test)) => {
+            NullTestType::try_from(test.nulltesttype) == Ok(NullTestType::IsNotNull)
+                && !test.argisrow
+                && test
+                    .arg
+                    .as_deref()
+                    .and_then(column_name)
+                    .is_some_and(|name| name == column)
+        }
+        _ => false,
     }
-    let Some(N::ColumnRef(reference)) = test.arg.as_deref().and_then(|arg| arg.node.as_ref())
-    else {
-        return false;
-    };
-    let [field] = reference.fields.as_slice() else {
-        return false;
-    };
-    matches!(field.node.as_ref(), Some(N::String(name)) if name.sval == column)
 }
 
 fn keys_plain(index: &PgIndex) -> bool {
@@ -2346,10 +2868,37 @@ mod tests {
              ALTER TABLE users ADD COLUMN nickname text;",
             "SET SESSION lock_timeout = '3s';
              ALTER TABLE users ADD COLUMN nickname text;",
+            // `set_config` sets the same GUC as `SET` (and its third
+            // argument as `SET LOCAL` does).
+            "SELECT set_config('lock_timeout', '3s', false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT pg_catalog.set_config('lock_timeout', '3s', true);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT set_config('lock_timeout'::text, '3s'::text, false);
+             ALTER TABLE users ADD COLUMN nickname text;",
         ] {
             let findings = second(sql);
             assert!(
                 only(&findings, Rule::MissingLockTimeout).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A zero value disables the timeout, and a call whose arguments are
+        // not constants is not trusted.
+        for sql in [
+            "SELECT set_config('lock_timeout', '0', false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT set_config('lock_timeout', 0::text, true);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT set_config('lock_timeout', random()::text, false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT set_config('lock_timeout', '3s', false) WHERE false;
+             ALTER TABLE users ADD COLUMN nickname text;",
+        ] {
+            let findings = second(sql);
+            assert_eq!(
+                only(&findings, Rule::MissingLockTimeout).len(),
+                1,
                 "{sql}: {findings:?}"
             );
         }
@@ -2400,6 +2949,213 @@ mod tests {
                 "{findings:?}"
             );
         }
+    }
+
+    #[test]
+    fn missing_lock_timeout_tracks_an_explicit_transaction() {
+        // An explicit transaction lets SET LOCAL / set_config(…, true) hold
+        // until its end, even in a -- no-transaction file.
+        for sql in [
+            "BEGIN;
+             SET LOCAL lock_timeout = '3s';
+             ALTER TABLE users ADD COLUMN nickname text;
+             COMMIT;",
+            "BEGIN;
+             SELECT set_config('lock_timeout', '3s', true);
+             ALTER TABLE users ADD COLUMN nickname text;
+             COMMIT;",
+            "START TRANSACTION;
+             SET LOCAL lock_timeout = '3s';
+             ALTER TABLE users ADD COLUMN nickname text;
+             END;",
+        ] {
+            for use_transaction in [false, true] {
+                let findings = second_with(
+                    &format!("-- no-transaction\n{sql}"),
+                    use_transaction,
+                    &LintOptions::default(),
+                );
+                assert!(
+                    only(&findings, Rule::MissingLockTimeout).is_empty(),
+                    "{sql}: {findings:?}"
+                );
+            }
+        }
+
+        // After COMMIT the LOCAL value is gone: the next statement has no
+        // timeout again. A session SET, by contrast, survives.
+        let findings = second_with(
+            "-- no-transaction
+             BEGIN;
+             SET LOCAL lock_timeout = '3s';
+             COMMIT;
+             ALTER TABLE users ADD COLUMN nickname text;",
+            false,
+            &LintOptions::default(),
+        );
+        assert_eq!(
+            only(&findings, Rule::MissingLockTimeout).len(),
+            1,
+            "{findings:?}"
+        );
+        let findings = second_with(
+            "-- no-transaction
+             BEGIN;
+             SET lock_timeout = '3s';
+             COMMIT;
+             ALTER TABLE users ADD COLUMN nickname text;",
+            false,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            "{findings:?}"
+        );
+        // A LOCAL zero overrides the session value inside the transaction.
+        let findings = second_with(
+            "-- no-transaction
+             SET lock_timeout = '3s';
+             BEGIN;
+             SET LOCAL lock_timeout = 0;
+             ALTER TABLE users ADD COLUMN nickname text;
+             COMMIT;",
+            false,
+            &LintOptions::default(),
+        );
+        assert_eq!(
+            only(&findings, Rule::MissingLockTimeout).len(),
+            1,
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn missing_lock_timeout_tracks_savepoints_and_rollbacks() {
+        // `-- no-transaction`: the explicit `BEGIN` and its savepoints are
+        // the only transaction state.
+        let reported = [
+            // ROLLBACK TO restores the savepoint: the SET LOCAL after it is
+            // gone.
+            "BEGIN; SAVEPOINT s; SET LOCAL lock_timeout = '3s'; ROLLBACK TO s; \
+             ALTER TABLE users ADD COLUMN nickname text; COMMIT;",
+            // A session SET is rolled back with the transaction.
+            "BEGIN; SET lock_timeout = '3s'; ROLLBACK; \
+             ALTER TABLE users ADD COLUMN nickname text;",
+            // ROLLBACK TO also undoes a session SET made after the savepoint.
+            "BEGIN; SAVEPOINT s; SET lock_timeout = '3s'; ROLLBACK TO s; \
+             ALTER TABLE users ADD COLUMN nickname text; COMMIT;",
+            // A full ROLLBACK restores the state from BEGIN even after a
+            // RELEASE kept the session value for the statement inside.
+            "BEGIN; SAVEPOINT s; SET lock_timeout = '3s'; RELEASE s; ROLLBACK; \
+             ALTER TABLE users ADD COLUMN nickname text;",
+            // Nested savepoints restore the requested one.
+            "BEGIN; SAVEPOINT a; SET LOCAL lock_timeout = '3s'; SAVEPOINT b; \
+             ROLLBACK TO a; ALTER TABLE users ADD COLUMN nickname text; COMMIT;",
+            // ROLLBACK AND CHAIN starts a new transaction from the rolled
+            // back state.
+            "BEGIN; SET lock_timeout = '3s'; ROLLBACK AND CHAIN; \
+             ALTER TABLE users ADD COLUMN nickname text; ROLLBACK;",
+        ];
+        for sql in reported {
+            let findings = second_with(
+                &format!("-- no-transaction\n{sql}"),
+                false,
+                &LintOptions::default(),
+            );
+            assert_eq!(
+                only(&findings, Rule::MissingLockTimeout).len(),
+                1,
+                "{sql}: {findings:?}"
+            );
+        }
+        let not_reported = [
+            // COMMIT keeps the session value.
+            "BEGIN; SET lock_timeout = '3s'; COMMIT; \
+             ALTER TABLE users ADD COLUMN nickname text;",
+            // RELEASE keeps the changes the savepoint saw.
+            "BEGIN; SAVEPOINT s; SET LOCAL lock_timeout = '3s'; RELEASE s; \
+             ALTER TABLE users ADD COLUMN nickname text; COMMIT;",
+            // COMMIT AND CHAIN keeps the session value in the new
+            // transaction.
+            "BEGIN; SET lock_timeout = '3s'; COMMIT AND CHAIN; \
+             ALTER TABLE users ADD COLUMN nickname text; ROLLBACK;",
+        ];
+        for sql in not_reported {
+            let findings = second_with(
+                &format!("-- no-transaction\n{sql}"),
+                false,
+                &LintOptions::default(),
+            );
+            assert!(
+                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_lock_timeout_evaluates_set_config_values_strictly() {
+        // NULL resets the setting to its default (0, disabled).
+        let reported = [
+            "SELECT set_config('lock_timeout', NULL, false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            // An unresolved value clears an earlier proof.
+            "SET lock_timeout = '3s';
+             SELECT set_config('lock_timeout', random()::text, false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            // A cast chain is evaluated: this one is '0'.
+            "SELECT set_config('lock_timeout', '0.4'::numeric::integer::text, false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            // Only a ::text cast of a string literal is trusted.
+            "SELECT set_config('lock_timeout', '3s'::varchar, false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            // PostgreSQL rounds to whole milliseconds: 0.4ms and 0.5ms are
+            // 0 (disabled), 0.6ms is 1ms.
+            "SELECT set_config('lock_timeout', '0.4ms', false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT set_config('lock_timeout', '0.5ms', false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SET lock_timeout = 0.4;
+             ALTER TABLE users ADD COLUMN nickname text;",
+        ];
+        for sql in reported {
+            let findings = second(sql);
+            assert_eq!(
+                only(&findings, Rule::MissingLockTimeout).len(),
+                1,
+                "{sql}: {findings:?}"
+            );
+        }
+        for sql in [
+            "SELECT set_config('lock_timeout', '0.6ms', false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT set_config('lock_timeout', '3s'::text, false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+            "SELECT pg_catalog.set_config('lock_timeout', '3s', false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+        ] {
+            let findings = second(sql);
+            assert!(
+                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_lock_timeout_does_not_trust_a_shadowed_set_config() {
+        let findings = second(
+            "CREATE FUNCTION public.set_config(text, text, boolean) RETURNS text
+                 LANGUAGE sql AS 'SELECT $2';
+             SET search_path = public, pg_catalog;
+             SELECT set_config('lock_timeout', '3s', false);
+             ALTER TABLE users ADD COLUMN nickname text;",
+        );
+        assert_eq!(
+            only(&findings, Rule::MissingLockTimeout).len(),
+            1,
+            "{findings:?}"
+        );
     }
 
     #[test]
