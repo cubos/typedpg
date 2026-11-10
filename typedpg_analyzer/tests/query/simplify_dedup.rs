@@ -391,6 +391,35 @@ fn distinct_kept_when_the_key_is_missing_from_the_output() {
 }
 
 #[test]
+fn distinct_follows_an_enum_key_equality() {
+    let db = setup_with(
+        "CREATE TYPE color AS ENUM ('red', 'green');
+         CREATE TABLE paints (shop text NOT NULL, color color NOT NULL, UNIQUE (shop, color));",
+    );
+    // `enum_eq(anyenum, anyenum)` is the key's own btree equality: the
+    // equality facts determine the relation, so `shop` is already distinct.
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT shop FROM paints WHERE shop = 'a' AND color = 'red'",
+        "SELECT shop FROM paints WHERE shop = 'a' AND color = 'red'",
+        &[Rule::Distinct],
+    );
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT shop FROM paints WHERE shop = 'a' AND color = $1",
+        "SELECT shop FROM paints WHERE shop = 'a' AND color = $1",
+        &[Rule::Distinct],
+    );
+    // Comparing the enum as text is not the key's operator family.
+    assert_kept(
+        &db,
+        "SELECT DISTINCT shop FROM paints WHERE shop = 'a' AND color::text = 'red'",
+    );
+    // Half the key proves nothing.
+    assert_kept(&db, "SELECT DISTINCT shop FROM paints WHERE shop = 'a'");
+}
+
+#[test]
 fn distinct_kept_under_a_nondeterministic_collation() {
     let db = setup_with(
         "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);

@@ -522,6 +522,33 @@ mod tests {
     }
 
     #[test]
+    fn fetch_optional_on_an_enum_key_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TYPE color AS ENUM ('red', 'green');
+             CREATE TABLE paints (
+                id bigint PRIMARY KEY,
+                shop text NOT NULL,
+                color color NOT NULL,
+                UNIQUE (shop, color)
+             );",
+        )
+        .unwrap();
+        let sql = "SELECT id FROM paints WHERE shop = $1 AND color = 'red'";
+        assert!(
+            only(
+                lint(
+                    &db,
+                    sql,
+                    &[rust(CallMethod::FetchOptional, "fetch_optional")]
+                ),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn fetch_all_on_a_single_row_query_is_reported() {
         let db = catalog();
         let sql = "SELECT id, name FROM users WHERE id = $1";

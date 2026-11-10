@@ -1483,6 +1483,13 @@ mod tests {
                 name text
              );
              CREATE TABLE other (id bigint PRIMARY KEY, note text);
+             CREATE TYPE paint_color AS ENUM ('red', 'green');
+             CREATE TABLE paints (
+                id bigint PRIMARY KEY,
+                shop text NOT NULL,
+                color paint_color NOT NULL,
+                UNIQUE (shop, color)
+             );
              CREATE TABLE jobs (
                 tenant_id bigint NOT NULL,
                 model_id bigint NOT NULL,
@@ -1589,6 +1596,29 @@ mod tests {
     fn a_unique_column_equality_is_one_row() {
         let db = catalog();
         assert!(select_one(&db, "SELECT id FROM users WHERE email = $1"));
+    }
+
+    #[test]
+    fn an_enum_column_in_a_unique_key_is_one_row() {
+        let db = catalog();
+        // `color = …` resolves to the polymorphic `enum_eq(anyenum, anyenum)`,
+        // the `enum_ops` family's btree equality: read as the column's type.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM paints WHERE shop = $1 AND color = 'red'"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM paints WHERE shop = $1 AND color = $2"
+        ));
+        // Only part of the key: not one row.
+        assert!(!select_one(&db, "SELECT id FROM paints WHERE shop = $1"));
+        // Comparing the enum as text is not the key's own operator family:
+        // the key equality isn't there.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM paints WHERE shop = $1 AND color::text = 'red'"
+        ));
     }
 
     #[test]

@@ -1301,11 +1301,15 @@ impl<'a> Scope<'a> {
 /// coercion, or a cast function that isn't VOLATILE. An I/O conversion
 /// through a type's input or output function, and a cast this can't read,
 /// are refused.
+///
+/// [`crate::ddl::functions::is_binary_coercible`] also accepts a
+/// polymorphic target the source fits (`anyenum` for an enum): the
+/// operator reads the value as its own type — no conversion runs at all.
 fn coercion_is_nonvolatile(ctx: &Ctx<'_>, source: PgTypeOid, target: PgTypeOid) -> bool {
     if source == target || source == oid::UNKNOWN {
         return true;
     }
-    if ctx.catalog.is_binary_coercible(source, target)
+    if crate::ddl::functions::is_binary_coercible(ctx.catalog, source, target)
         || ctx.catalog.unwrap_domain(source) == target
     {
         return true;
@@ -1555,11 +1559,19 @@ fn is_const_node(node: &protobuf::Node) -> bool {
 
 /// The equality operator reads the column as its own type: no coercion
 /// that could change its value on the way.
+///
+/// [`crate::ddl::functions::is_binary_coercible`] is PG's full rule
+/// (`IsBinaryCoercible`, parse_coerce.c): besides domains and binary casts
+/// it also accepts a polymorphic operator's declared pseudo-type
+/// (`anyenum` for `enum_eq`, `anyarray` for `array_eq`) when the column's
+/// type fits it. That only widens the match to the operator PG resolved the
+/// equality to; [`in_btree_equality`] still requires it to be the btree
+/// equality of the key column's own operator family.
 fn operand_type_matches(ctx: &Ctx<'_>, column: PgTypeOid, declared: Option<PgTypeOid>) -> bool {
     declared.is_some_and(|d| {
         d == column
             || d == ctx.catalog.unwrap_domain(column)
-            || ctx.catalog.is_binary_coercible(column, d)
+            || crate::ddl::functions::is_binary_coercible(ctx.catalog, column, d)
     })
 }
 
