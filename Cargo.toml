@@ -33,7 +33,7 @@ strip = true
 
 # Shared metadata inherited by the publishable crates via `<field>.workspace = true`.
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
