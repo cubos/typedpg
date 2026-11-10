@@ -231,7 +231,7 @@ test("the host exits while its serve child is still alive", async () => {
     env: { ...process.env, ...env },
     timeout: 15_000,
   });
-  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.equal(result.status, 0, result.stderr || result.error?.message || "host exited");
   assert.match(result.stdout, /export const served = 1;/);
   assert.equal(count(log, "spawn "), 1);
 });

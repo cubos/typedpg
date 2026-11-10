@@ -8,21 +8,21 @@
     "test": "node --test --test-timeout=300000 src/*.test.ts"
   },
   "dependencies": {
-    "pg": "^8.16.0",
+    "pg": "^8.23.1",
     "pg-copy-streams": "^7.0.0",
     "pg-cursor": "^2.22.1",
-    "postgres": "^4.0.0",
+    "postgres": "^4.1.0",
     "@cubos/typedpg": "file:../typedpg_npm"
   },
   "devDependencies": {
     "@cubos/typedpg-cli": "file:../typedpg_npm_cli",
-    "@types/node": "^24.0.0",
-    "@types/pg": "^8.15.0",
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
     "esbuild": "^0.28.2",
     "postgres-3": "npm:postgres@^3.4.9",
-    "rollup": "^4.65.0",
-    "typescript": "^7.0.0",
+    "rollup": "^4.68.2",
+    "typescript": "^7.0.2",
     "typescript-5": "npm:typescript@5.9",
-    "typescript-7.1": "npm:typescript@^7.1.0-beta"
+    "typescript-7.1": "npm:typescript@^7.1.0-dev.20261110.1"
   }
 }
