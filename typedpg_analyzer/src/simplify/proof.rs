@@ -167,6 +167,13 @@ impl<'a> FromScope<'a> {
         }
     }
 
+    /// Whether this scope belongs to a level nested in an outer query
+    /// level: `false` for the top level of a statement, a CTE body written
+    /// there or a top-level set-operation branch.
+    pub(crate) fn has_parent(&self) -> bool {
+        self.parent.is_some()
+    }
+
     /// Whether `col`, written at this level, may be resolved by one of its
     /// own items rather than a parent level's: `false` only when none of
     /// them can bind it. For moving an expression into this level from the

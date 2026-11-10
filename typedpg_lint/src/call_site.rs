@@ -522,6 +522,25 @@ mod tests {
     }
 
     #[test]
+    fn fetch_one_on_an_aggregate_over_a_subquery_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE a (id integer PRIMARY KEY, due timestamptz);
+             CREATE TABLE b (id integer PRIMARY KEY, due timestamptz);",
+        )
+        .unwrap();
+        let sql = "SELECT min(due) AS soonest FROM \
+                   (SELECT due FROM a UNION ALL SELECT due FROM b) q";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn fetch_optional_on_an_enum_key_is_fine() {
         let mut db = catalog();
         db.apply_sql(

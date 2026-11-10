@@ -103,7 +103,9 @@ pub fn redundant_distinct_spans(
 /// - it is not a set operation, and no set-returning function can multiply
 ///   its target list, `VALUES` rows or `FROM` functions;
 /// - it has no `FROM` (and a bare `VALUES` has exactly one row);
-/// - it has an aggregate or `HAVING` without `GROUP BY` (one group);
+/// - it has an aggregate or `HAVING` without `GROUP BY` (one group) — at a
+///   level no outer query encloses, whatever the aggregate's arguments read,
+///   a `FROM` subquery included;
 /// - every `FROM` relation is a base table whose unique key is equated,
 ///   column by column, to constants, parameters, outer-query columns,
 ///   scalar subqueries uncorrelated with this level or columns of
@@ -235,7 +237,7 @@ pub fn statement_at_most_one_row(catalog: &PgCatalog, view: &QueryView) -> bool 
     else {
         return false;
     };
-    statement_at_most_one_row_in(&ctx, statement.to_ref(), &CteEnv::default())
+    statement_at_most_one_row_in(&ctx, statement.to_ref(), &CteEnv::default(), None)
 }
 
 // ── CTEs ────────────────────────────────────────────────────────────────────
@@ -251,7 +253,17 @@ struct VisibleCtes {
 /// Extend `env` with `with`'s CTEs, judging them in declaration order. A
 /// recursive `WITH` (or a CTE that references itself) contributes no
 /// single-row CTE.
-fn visible_ctes(ctx: &Ctx<'_>, env: &CteEnv, with: Option<&WithClause>) -> VisibleCtes {
+///
+/// `parent` is the scope of the query level around the one the clause
+/// belongs to: a `WITH` written inside a sublink or subquery makes CTE
+/// bodies that can read that level's columns, so their own aggregate with
+/// no `GROUP BY` need not be theirs (see [`has_own_aggregate`]).
+fn visible_ctes(
+    ctx: &Ctx<'_>,
+    env: &CteEnv,
+    with: Option<&WithClause>,
+    parent: Option<&FromScope<'_>>,
+) -> VisibleCtes {
     let mut after = env.clone();
     let mut bodies = Vec::new();
     let Some(with) = with else {
@@ -269,7 +281,7 @@ fn visible_ctes(ctx: &Ctx<'_>, env: &CteEnv, with: Option<&WithClause>) -> Visib
             continue;
         }
         bodies.push(after.clone());
-        let info = single_row_cte(ctx, cte, &after);
+        let info = single_row_cte(ctx, cte, &after, parent);
         after.insert(cte.ctename.clone(), info);
     }
     VisibleCtes { after, bodies }
@@ -277,8 +289,14 @@ fn visible_ctes(ctx: &Ctx<'_>, env: &CteEnv, with: Option<&WithClause>) -> Visib
 
 /// Whether `cte` is a single-row CTE: a non-recursive body that, with its
 /// `RETURNING` clause for a data-modifying statement, yields at most one
-/// row by [`statement_at_most_one_row`]'s rules.
-fn single_row_cte(ctx: &Ctx<'_>, cte: &CommonTableExpr, env: &CteEnv) -> Option<CteInfo> {
+/// row by [`statement_at_most_one_row`]'s rules. `parent` is the scope
+/// around the query level the `WITH` belongs to.
+fn single_row_cte(
+    ctx: &Ctx<'_>,
+    cte: &CommonTableExpr,
+    env: &CteEnv,
+    parent: Option<&FromScope<'_>>,
+) -> Option<CteInfo> {
     if cte.cterecursive || cte.search_clause.is_some() || cte.cycle_clause.is_some() {
         return None;
     }
@@ -294,11 +312,14 @@ fn single_row_cte(ctx: &Ctx<'_>, cte: &CommonTableExpr, env: &CteEnv) -> Option<
         NodeRef::DeleteStmt(delete) => delete.returning_clause.is_some(),
         _ => false,
     };
-    if !returns_rows || !statement_at_most_one_row_in(ctx, body, env) {
+    if !returns_rows || !statement_at_most_one_row_in(ctx, body, env, parent) {
         return None;
     }
-    let mut columns =
-        cte_output_columns(ctx, body, &visible_ctes(ctx, env, with_clause(body)).after);
+    let mut columns = cte_output_columns(
+        ctx,
+        body,
+        &visible_ctes(ctx, env, with_clause(body), parent).after,
+    );
     for (column, alias) in columns.iter_mut().zip(&cte.aliascolnames) {
         let Some(Node::String(name)) = &alias.node else {
             return None;
@@ -677,7 +698,7 @@ fn find_select(
     }
     match node {
         NodeRef::SelectStmt(select) => {
-            let visible = visible_ctes(ctx, env, select.with_clause.as_ref());
+            let visible = visible_ctes(ctx, env, select.with_clause.as_ref(), parent);
             if std::ptr::eq(select, target) {
                 let scope = FromScope::of_select(ctx, select, parent);
                 *out = Some(match check {
@@ -722,7 +743,7 @@ fn find_select(
             }
         }
         NodeRef::InsertStmt(insert) => {
-            let visible = visible_ctes(ctx, env, insert.with_clause.as_ref());
+            let visible = visible_ctes(ctx, env, insert.with_clause.as_ref(), parent);
             find_cte_bodies(
                 ctx,
                 insert.with_clause.as_ref(),
@@ -738,7 +759,7 @@ fn find_select(
             }
         }
         NodeRef::UpdateStmt(update) => {
-            let visible = visible_ctes(ctx, env, update.with_clause.as_ref());
+            let visible = visible_ctes(ctx, env, update.with_clause.as_ref(), parent);
             find_cte_bodies(
                 ctx,
                 update.with_clause.as_ref(),
@@ -755,7 +776,7 @@ fn find_select(
             }
         }
         NodeRef::DeleteStmt(delete) => {
-            let visible = visible_ctes(ctx, env, delete.with_clause.as_ref());
+            let visible = visible_ctes(ctx, env, delete.with_clause.as_ref(), parent);
             find_cte_bodies(
                 ctx,
                 delete.with_clause.as_ref(),
@@ -772,7 +793,7 @@ fn find_select(
             }
         }
         NodeRef::MergeStmt(merge) => {
-            let visible = visible_ctes(ctx, env, merge.with_clause.as_ref());
+            let visible = visible_ctes(ctx, env, merge.with_clause.as_ref(), parent);
             find_cte_bodies(
                 ctx,
                 merge.with_clause.as_ref(),
@@ -914,12 +935,21 @@ fn merge_children(merge: &MergeStmt) -> Vec<NodeRef<'_>> {
 
 // ── The SELECT proof ────────────────────────────────────────────────────────
 
-fn statement_at_most_one_row_in(ctx: &Ctx<'_>, statement: NodeRef<'_>, env: &CteEnv) -> bool {
-    let env = visible_ctes(ctx, env, with_clause(statement)).after;
+/// Whether `statement` yields at most one row by [`select_at_most_one_row`]'s
+/// rules, judged at the level `parent` encloses (`None` for the top level):
+/// a CTE body written inside a nested `WITH` can read the columns around it,
+/// so an aggregate there may belong to that outer level.
+fn statement_at_most_one_row_in(
+    ctx: &Ctx<'_>,
+    statement: NodeRef<'_>,
+    env: &CteEnv,
+    parent: Option<&FromScope<'_>>,
+) -> bool {
+    let env = visible_ctes(ctx, env, with_clause(statement), parent).after;
     match statement {
         NodeRef::SelectStmt(select) => {
-            select_at_most_one_row_in(ctx, select, &FromScope::opaque(None), &env)
-                || limit_bounds_one(select)
+            let scope = FromScope::of_select(ctx, select, parent);
+            select_at_most_one_row_in(ctx, select, &scope, &env) || limit_bounds_one(select)
         }
         NodeRef::InsertStmt(insert) => insert_at_most_one_row(ctx, insert, &env),
         NodeRef::UpdateStmt(update) => dml_at_most_one_row(
@@ -973,7 +1003,7 @@ fn select_at_most_one_row_in(
     if select.from_clause.is_empty() {
         return true;
     }
-    if select.having_clause.is_some() || has_own_aggregate(ctx, select, env) {
+    if select.having_clause.is_some() || has_own_aggregate(ctx, select, env, outer) {
         // One group, and nothing groups it further.
         return true;
     }
@@ -1067,8 +1097,23 @@ fn has_set_returning(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
 /// does not collapse the subquery's rows. Nested queries are separate
 /// levels; when one is found inside the arguments this gives up (a
 /// reference there might still bind to this level).
-fn has_own_aggregate(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> bool {
-    let scope = Scope::build_env(ctx, env, &select.from_clause);
+///
+/// At a level no outer query encloses — the statement's own `SELECT`, a
+/// top-level CTE body or set-operation branch (`outer.has_parent()` is
+/// false) — there is no other level an aggregate written here could belong
+/// to, whatever its arguments reference (a `FROM` subquery, whose columns
+/// [`Scope::build_env`] can't see, included): an aggregate with no
+/// `GROUP BY` still collapses the level to one group.
+fn has_own_aggregate(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+    env: &CteEnv,
+    outer: &FromScope<'_>,
+) -> bool {
+    let top_level = !outer.has_parent();
+    let scope = (!top_level)
+        .then(|| Scope::build_env(ctx, env, &select.from_clause))
+        .flatten();
     let mut stack: Vec<NodeRef<'_>> = Vec::new();
     for list in [
         &select.target_list,
@@ -1103,7 +1148,7 @@ fn has_own_aggregate(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> bool {
                 // scalar function would not collapse the rows.
                 if !procs.is_empty()
                     && procs.iter().all(|proc| proc.prokind == ProKind::Aggregate)
-                    && aggregate_is_this_level(scope.as_ref(), call)
+                    && (top_level || aggregate_is_this_level(scope.as_ref(), call))
                 {
                     return true;
                 }
@@ -1550,6 +1595,20 @@ mod tests {
         }
     }
 
+    /// The SELECT inside the first target's `ARRAY(...)` sublink.
+    fn array_select(select: &SelectStmt) -> &SelectStmt {
+        let Some(Node::ResTarget(target)) = select.target_list[0].node.as_ref() else {
+            panic!("not a target");
+        };
+        let Some(Node::SubLink(sub)) = target.val.as_deref().and_then(|n| n.node.as_ref()) else {
+            panic!("not an ARRAY sublink");
+        };
+        match sub.subselect.as_deref().and_then(|n| n.node.as_ref()) {
+            Some(Node::SelectStmt(inner)) => inner,
+            other => panic!("not a SELECT: {other:?}"),
+        }
+    }
+
     #[track_caller]
     fn select_one(db: &PgCatalog, sql: &str) -> bool {
         let view = view(db, sql);
@@ -1700,6 +1759,174 @@ mod tests {
         assert!(!select_one(
             &db,
             "SELECT id, count(*) FROM users GROUP BY id"
+        ));
+    }
+
+    #[test]
+    fn an_aggregate_over_a_from_subquery_is_one_row() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE a (id bigint PRIMARY KEY, due timestamptz);
+             CREATE TABLE b (id bigint PRIMARY KEY, due timestamptz);",
+        )
+        .unwrap();
+        // A top-level level has no other level an aggregate written in it
+        // could belong to, whatever its arguments read.
+        assert!(statement_one(
+            &db,
+            "SELECT min(due) AS soonest FROM (SELECT due FROM a) q"
+        ));
+        assert!(statement_one(
+            &db,
+            "SELECT min(due) AS soonest FROM \
+             (SELECT due FROM a UNION ALL SELECT due FROM b) q"
+        ));
+        assert!(statement_one(&db, "SELECT min(due) AS soonest FROM a"));
+        // A top-level CTE body is judged the same way.
+        assert!(statement_one(
+            &db,
+            "WITH c AS (SELECT min(due) AS soonest FROM (SELECT due FROM a) q) \
+             SELECT soonest FROM c"
+        ));
+        // A top-level set-operation branch too.
+        let union = view(
+            &db,
+            "SELECT min(due) AS x FROM (SELECT due FROM a) q \
+             UNION ALL SELECT now()",
+        );
+        let arm = top(&union).larg.as_deref().expect("left arm");
+        assert!(select_at_most_one_row(&db, &union, arm));
+        // A nested level's aggregate over an outer column stays the outer
+        // level's: the inner select returns a row per outer row.
+        let outer = view(&db, "SELECT (SELECT min(o.id) FROM (SELECT 1) s) FROM a o");
+        let aggregate = outer
+            .tree
+            .nodes()
+            .into_iter()
+            .find_map(|(node, _)| match node {
+                NodeRef::SelectStmt(select)
+                    if select.target_list.iter().any(|target| {
+                        matches!(&target.node, Some(Node::ResTarget(target))
+                            if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                                Some(Node::FuncCall(call))
+                                    if string_list(&call.funcname) == ["min"]))
+                    }) =>
+                {
+                    Some(select)
+                }
+                _ => None,
+            })
+            .expect("aggregate select");
+        assert!(!select_at_most_one_row(&db, &outer, aggregate));
+        // The same at a nested level with a FROM subquery: giving up there
+        // is sound even when the arguments read only the subquery.
+        let nested = view(
+            &db,
+            "SELECT (SELECT min(s.due) FROM (SELECT due FROM a) s) FROM b o",
+        );
+        let aggregate = nested
+            .tree
+            .nodes()
+            .into_iter()
+            .find_map(|(node, _)| match node {
+                NodeRef::SelectStmt(select)
+                    if select.target_list.iter().any(|target| {
+                        matches!(&target.node, Some(Node::ResTarget(target))
+                            if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                                Some(Node::FuncCall(call))
+                                    if string_list(&call.funcname) == ["min"]))
+                    }) =>
+                {
+                    Some(select)
+                }
+                _ => None,
+            })
+            .expect("aggregate select");
+        assert!(!select_at_most_one_row(&db, &nested, aggregate));
+    }
+
+    #[test]
+    fn a_nested_ctes_aggregate_may_belong_to_the_level_around_it() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE u (id integer);
+             CREATE TABLE v (id integer);
+             CREATE TABLE keyed (id integer PRIMARY KEY);",
+        )
+        .unwrap();
+        // The issue's repro: `count(u.id)` is the *outer* level's
+        // aggregate, so `c` has one row per `v` row and the ARRAY subquery
+        // has more than one.
+        let repro = view(
+            &db,
+            "SELECT ARRAY(WITH c AS (SELECT count(u.id) AS n FROM v) \
+             SELECT n FROM c) FROM u",
+        );
+        assert!(!select_at_most_one_row(
+            &db,
+            &repro,
+            array_select(top(&repro))
+        ));
+        // The same aggregate written only in the CTE body's ORDER BY.
+        let ordered = view(
+            &db,
+            "SELECT ARRAY(WITH c AS (SELECT v.id FROM v ORDER BY count(u.id)) \
+             SELECT 1 FROM c) FROM u",
+        );
+        assert!(!select_at_most_one_row(
+            &db,
+            &ordered,
+            array_select(top(&ordered))
+        ));
+        // And one written only in a window function's FILTER.
+        let filtered = view(
+            &db,
+            "SELECT ARRAY(WITH c AS (SELECT v.id, \
+                sum(v.id) FILTER (WHERE count(u.id) > 0) OVER () AS s FROM v) \
+             SELECT 1 FROM c) FROM u",
+        );
+        assert!(!select_at_most_one_row(
+            &db,
+            &filtered,
+            array_select(top(&filtered))
+        ));
+        // An aggregate over the nested body's own FROM is still its own.
+        let own = view(
+            &db,
+            "SELECT ARRAY(WITH c AS (SELECT count(v.id) AS n FROM v) \
+             SELECT n FROM c) FROM u",
+        );
+        assert!(select_at_most_one_row(&db, &own, array_select(top(&own))));
+        // A top-level CTE's aggregate still collapses its body to one row.
+        assert!(statement_one(
+            &db,
+            "WITH c AS (SELECT count(v.id) AS n FROM v) SELECT n FROM c"
+        ));
+        assert!(statement_one(
+            &db,
+            "WITH c AS (SELECT min(id) AS n FROM keyed) SELECT n FROM c"
+        ));
+    }
+
+    #[test]
+    fn a_set_operation_or_repeated_grouping_set_is_not_one_row() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql("CREATE TABLE keyed (id integer PRIMARY KEY);")
+            .unwrap();
+        // Each arm matches at most one row; the UNION ALL emits both.
+        assert!(!statement_one(
+            &db,
+            "SELECT id FROM keyed WHERE id = $1 \
+             UNION ALL SELECT id FROM keyed WHERE id = $1"
+        ));
+        // The empty grouping set written twice produces two groups.
+        assert!(!statement_one(
+            &db,
+            "SELECT count(*) FROM keyed GROUP BY GROUPING SETS ((), ())"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT count(*) FROM keyed GROUP BY GROUPING SETS ((), ())"
         ));
     }
 
