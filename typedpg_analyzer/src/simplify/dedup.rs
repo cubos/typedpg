@@ -365,7 +365,7 @@ fn rows_distinct(
 }
 
 /// A plain `DISTINCT` (not `DISTINCT ON`): the parser's one-NIL list.
-fn is_plain_distinct(s: &protobuf::SelectStmt) -> bool {
+pub(super) fn is_plain_distinct(s: &protobuf::SelectStmt) -> bool {
     matches!(s.distinct_clause.as_slice(), [d] if d.node.is_none())
 }
 
@@ -440,6 +440,11 @@ pub(super) struct Rel {
     /// order, and the rest keep their names. Dropped columns are gone from
     /// the catalog, as PG skips them.
     pub(super) columns: Vec<(String, i16)>,
+    /// Whether [`Self::columns`] lists every column's real name. A FROM
+    /// subquery or CTE whose target names aren't all certain doesn't: an
+    /// unknown name can be the one a reference spells, so no lookup may
+    /// bind to this relation.
+    pub(super) columns_known: bool,
     /// For a CTE reference: each column's type and whether its collation is
     /// deterministic, by attnum - 1. Empty for a base table.
     cte_columns: Vec<(Option<PgTypeOid>, bool)>,
@@ -448,6 +453,9 @@ pub(super) struct Rel {
 impl Rel {
     /// The attnum of the column this FROM item calls `name`.
     fn attnum(&self, name: &str) -> Option<i16> {
+        if !self.columns_known {
+            return None;
+        }
         let mut found = self.columns.iter().filter(|(n, _)| n == name);
         match (found.next(), found.next()) {
             (Some((_, attnum)), None) => Some(*attnum),
@@ -497,8 +505,9 @@ impl Rel {
     }
 }
 
-/// The CTEs visible at one query level, by name: `Some` when the CTE is
-/// proven to yield at most one row.
+/// The CTEs visible at one query level, by name: `Some` when the CTE's
+/// output columns are known (whether or not its body is proven one row),
+/// `None` when a reference to it must make the proof give up.
 #[derive(Clone, Default)]
 pub(super) struct CteEnv {
     ctes: std::collections::HashMap<String, Option<CteInfo>>,
@@ -508,12 +517,18 @@ pub(super) struct CteEnv {
 #[derive(Clone)]
 pub(super) struct CteInfo {
     pub(super) columns: Vec<CteColumn>,
+    /// Whether the body yields at most one row (a reference to a CTE that
+    /// doesn't is still listed, so column references in a nested level's
+    /// aggregate can be placed, but the relation is never determined).
+    pub(super) single_row: bool,
 }
 
 /// One column of a single-row CTE.
 #[derive(Clone)]
 pub(super) struct CteColumn {
-    pub(super) name: String,
+    /// `None` when PG's output name isn't certain: an expression PG names
+    /// some way this can't reproduce (`v::int` is `v`, a `CASE` is `case`).
+    pub(super) name: Option<String>,
     /// `None` when the body's expression type isn't proven.
     pub(super) typ: Option<PgTypeOid>,
     /// Its collation, when known, compares bytewise.
@@ -752,8 +767,9 @@ impl<'a> Scope<'a> {
         }
     }
 
-    /// Add one FROM reference: a single-row CTE when `env` has one under
-    /// that name, a base table otherwise. Its relation as a bitmask.
+    /// Add one FROM reference: a CTE when `env` lists one under that name
+    /// (a single-row relation only when its body is proven one row), a base
+    /// table otherwise. Its relation as a bitmask.
     fn add_range_var(
         &mut self,
         ctx: &Ctx<'_>,
@@ -773,9 +789,19 @@ impl<'a> Scope<'a> {
                 .columns
                 .iter()
                 .enumerate()
-                .map(|(i, column)| (column.name.clone(), i as i16 + 1))
+                .map(|(i, column)| {
+                    (
+                        column.name.clone().unwrap_or_else(unknown_column_name),
+                        i as i16 + 1,
+                    )
+                })
                 .collect();
             let renames = rv.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
+            let columns_known = info
+                .columns
+                .iter()
+                .enumerate()
+                .all(|(i, column)| column.name.is_some() || i < renames.len());
             if renames.len() > columns.len() {
                 return None;
             }
@@ -797,8 +823,9 @@ impl<'a> Scope<'a> {
                 schema: String::new(),
                 relname: rv.relname.clone(),
                 nullable,
-                single_row: true,
+                single_row: info.single_row,
                 columns,
+                columns_known,
                 cte_columns,
             });
             return Some(1 << (self.rels.len() - 1));
@@ -877,19 +904,26 @@ impl<'a> Scope<'a> {
             nullable,
             single_row: true,
             columns,
+            columns_known: true,
             cte_columns: Vec::new(),
         });
         Some(1 << (self.rels.len() - 1))
     }
 
-    /// Add one `LATERAL` FROM subquery as a one-row relation, when this
-    /// level's proof shows it returns at most one row per row of the items
-    /// it reads (see [`super::cardinality::select_at_most_one_row_in`]).
-    /// Its output columns are the subquery's target names — an alias column
-    /// list renames the first ones — and their types are not resolved here
-    /// (a reference to one is an operand the proof gives up on). Any
-    /// target whose name isn't certain, and any subquery that isn't proven
-    /// one row, makes the whole FROM give up, as every subquery did before.
+    /// Add one FROM subquery — `LATERAL` or not — with its output columns,
+    /// as a one-row relation when this level's proof shows it yields at most
+    /// one row per evaluation (see
+    /// [`super::cardinality::select_at_most_one_row_in`]).
+    ///
+    /// A subquery the proof can't bound is still listed, so a nested level's
+    /// aggregate argument can be placed on its columns, but it is never
+    /// determined and no proof succeeds through it. Its output names are an
+    /// alias column list's (renaming the first ones), else the subquery's
+    /// own: a bare `VALUES` lists `column1`, `column2`, … and a set operation
+    /// its left arm's. A target name that isn't certain (PG's
+    /// `FigureColname` derives it from the expression) leaves the whole
+    /// column list unknown: a reference spelling that name must not bind
+    /// here.
     fn add_range_subselect(
         &mut self,
         ctx: &Ctx<'_>,
@@ -898,25 +932,25 @@ impl<'a> Scope<'a> {
         nullable: bool,
         outer: &FromScope<'_>,
     ) -> Option<u64> {
-        if !sub.lateral || self.rels.len() == MAX_RELATIONS {
+        if self.rels.len() == MAX_RELATIONS {
             return None;
         }
         let Some(Node::SelectStmt(select)) = sub.subquery.as_deref().and_then(|n| n.node.as_ref())
         else {
             return None;
         };
-        // It reads the current level's row (that is what LATERAL means) but
-        // is a query level of its own.
-        let outer = outer.as_nested();
-        if !super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &outer, env) {
-            return None;
-        }
-        let mut columns: Vec<(String, i16)> = Vec::with_capacity(select.target_list.len());
-        for (index, target) in select.target_list.iter().enumerate() {
-            let Some(Node::ResTarget(target)) = &target.node else {
-                return None;
-            };
-            let name = target_output_name(target)?;
+        // A `LATERAL` subquery reads the current level's row; any subquery is
+        // a query level of its own (and may read levels above this one). Its
+        // own `WITH` shadows the enclosing level's CTE names: proving the
+        // body against the outer environment would read a same-named outer
+        // CTE instead of the one the subquery defines.
+        let nested = outer.as_nested();
+        let env = super::cardinality::subquery_cte_env(ctx, env, select, &nested);
+        let single_row =
+            super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &nested, &env);
+        let (names, mut columns_known) = subquery_output_names(select)?;
+        let mut columns: Vec<(String, i16)> = Vec::with_capacity(names.len());
+        for (index, name) in names.into_iter().enumerate() {
             columns.push((name, i16::try_from(index).ok()?.checked_add(1)?));
         }
         let renames = sub.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
@@ -929,6 +963,11 @@ impl<'a> Scope<'a> {
             };
             column.0 = name.sval.clone();
         }
+        // An alias column list that renames every uncertain target makes
+        // the names certain again.
+        if renames.len() == columns.len() {
+            columns_known = true;
+        }
         let alias = sub.alias.as_ref().map(|a| a.aliasname.clone());
         let cte_columns = vec![(None, true); columns.len()];
         self.rels.push(Rel {
@@ -939,8 +978,9 @@ impl<'a> Scope<'a> {
             schema: String::new(),
             relname: alias.clone().unwrap_or_default(),
             nullable,
-            single_row: true,
+            single_row,
             columns,
+            columns_known,
             cte_columns,
         });
         Some(1 << (self.rels.len() - 1))
@@ -1004,6 +1044,7 @@ impl<'a> Scope<'a> {
             nullable,
             single_row: false,
             columns,
+            columns_known: true,
             cte_columns: Vec::new(),
         });
         Some(1 << (self.rels.len() - 1))
@@ -1016,6 +1057,13 @@ impl<'a> Scope<'a> {
 
     /// Resolve a column reference against this scope alone.
     pub(super) fn resolve(&self, names: &[&str]) -> Col {
+        // A relation whose output names aren't all certain may hold the one
+        // a reference spells: resolving it to another relation could read a
+        // different column (and a key fact on it would be about that other
+        // column), so nothing unqualified resolves here.
+        if self.rels.iter().any(|rel| !rel.columns_known) {
+            return Col::Other;
+        }
         let attnum = |r: usize, name: &str| {
             self.rels[r]
                 .attnum(name)
@@ -1067,6 +1115,13 @@ impl<'a> Scope<'a> {
     ) -> Option<Operand> {
         match expr.node.as_ref()? {
             Node::ColumnRef(cr) => {
+                // A relation whose output names aren't all certain may hold
+                // the column this reference spells. Reading it as an outer
+                // level's would make its per-row value look fixed, so no key
+                // fact is read from such a scope.
+                if self.rels.iter().any(|rel| !rel.columns_known) {
+                    return None;
+                }
                 let Fields::Names(names) = column_ref_fields(cr) else {
                     return None;
                 };
@@ -1366,6 +1421,11 @@ impl<'a> Scope<'a> {
     /// composite column's field (`c.field` and `c.field.subfield` spell the
     /// column's first name as the reference's first).
     fn may_reference(&self, names: &[&str]) -> bool {
+        // An unknown output name could be the first field of any reference,
+        // so a nested query may always bind to such a relation.
+        if self.rels.iter().any(|rel| !rel.columns_known) {
+            return true;
+        }
         let has = |r: usize, name: &str| {
             super::proof::is_system_column(name)
                 || self.rels[r].columns.iter().any(|(n, _)| n == name)
@@ -1475,7 +1535,10 @@ impl<'a> Scope<'a> {
         let side = |mask: u64| {
             let mut found = (0..self.rels.len())
                 .filter(|&r| mask & (1 << r) != 0)
-                .filter(|&r| self.rels[r].columns.iter().any(|(n, _)| n == name))
+                .filter(|&r| {
+                    self.rels[r].columns_known
+                        && self.rels[r].columns.iter().any(|(n, _)| n == name)
+                })
                 .map(|r| (r, self.rels[r].attnum(name)));
             match (found.next(), found.next()) {
                 (Some((r, Some(attnum))), None) => {
@@ -2106,10 +2169,48 @@ fn function_name(nodes: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
     }
 }
 
-/// The name PG gives a subquery target-list entry, when it is known: the
-/// written alias, a bare column's name, or the called function's name.
-/// Anything else gets a name this can't be sure of (a cast keeps its
-/// argument's name, an expression is `?column?`), so the caller gives up.
+/// The names PG gives a subquery's output columns, with whether every one is
+/// certain: a bare `VALUES` names them `column1`, `column2`, …, a set
+/// operation takes its left arm's, and a plain `SELECT` follows
+/// [`target_output_name`]. An uncertain name becomes
+/// [`unknown_column_name`]: no reference can spell it.
+fn subquery_output_names(select: &protobuf::SelectStmt) -> Option<(Vec<String>, bool)> {
+    if select.op() != SetOperation::SetopNone {
+        return subquery_output_names(select.larg.as_deref()?);
+    }
+    if let Some(first) = select.values_lists.first() {
+        let Some(Node::List(list)) = &first.node else {
+            return None;
+        };
+        return Some((
+            (0..list.items.len())
+                .map(|index| format!("column{}", index + 1))
+                .collect(),
+            true,
+        ));
+    }
+    let mut known = true;
+    let names = select
+        .target_list
+        .iter()
+        .map(|target| match &target.node {
+            Some(Node::ResTarget(target)) => {
+                Some(target_output_name(target).unwrap_or_else(|| {
+                    known = false;
+                    unknown_column_name()
+                }))
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((names, known))
+}
+
+/// The name PG gives a subquery target-list entry, when it is certain: the
+/// written alias, or a bare column reference's name. `FigureColname` derives
+/// other names from the expression (a cast from its argument, a call from the
+/// function, `CASE` as `case`), which this doesn't reproduce, so they are
+/// unknown.
 fn target_output_name(target: &protobuf::ResTarget) -> Option<String> {
     if !target.name.is_empty() {
         return Some(target.name.clone());
@@ -2123,11 +2224,15 @@ fn target_output_name(target: &protobuf::ResTarget) -> Option<String> {
             Fields::Names(names) => names.last().map(|name| (*name).to_owned()),
             _ => None,
         },
-        Node::FuncCall(call) => string_list(&call.funcname)
-            .last()
-            .map(|name| (*name).to_owned()),
         _ => None,
     }
+}
+
+/// A placeholder for a column whose PG name isn't certain. No SQL identifier
+/// can spell it, so a reference never binds to it: the relation's column
+/// list stays uncertain for every lookup.
+fn unknown_column_name() -> String {
+    "\0unknown".to_owned()
 }
 
 // ── UNION ───────────────────────────────────────────────────────────────────

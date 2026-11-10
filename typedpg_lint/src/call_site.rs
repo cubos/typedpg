@@ -1002,6 +1002,26 @@ mod tests {
     }
 
     #[test]
+    fn fetch_all_on_a_one_row_derived_result_is_reported() {
+        let db = catalog();
+        for sql in [
+            "SELECT v FROM (VALUES (1)) AS one(v)",
+            "SELECT DISTINCT 1 AS present FROM users",
+            "SELECT count(*) FROM users GROUP BY ()",
+        ] {
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[ts(CallMethod::FetchAll, "fetchAll")]),
+                    Rule::FetchAllSingleRow
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn fetch_one_on_a_rewritten_insert_target_may_return_many() {
         let mut db = catalog();
         db.apply_sql(

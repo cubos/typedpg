@@ -10,8 +10,9 @@
 
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
-    self, CommonTableExpr, DeleteStmt, InsertStmt, JoinType, LimitOption, MergeStmt,
-    ReturningClause, SelectStmt, SetOperation, UpdateStmt, WithClause, a_const::Val, node::Node,
+    self, CommonTableExpr, DeleteStmt, GroupingSetKind, InsertStmt, JoinType, LimitOption,
+    MergeStmt, ReturningClause, SelectStmt, SetOperation, UpdateStmt, WithClause, a_const::Val,
+    node::Node,
 };
 
 use super::Ctx;
@@ -105,22 +106,30 @@ pub fn redundant_distinct_spans(
 /// - it has no `FROM` (and a bare `VALUES` has exactly one row);
 /// - it has an aggregate or `HAVING` without `GROUP BY` (one group) — at a
 ///   level no outer query encloses, whatever the aggregate's arguments read,
-///   a `FROM` subquery included;
+///   a `FROM` subquery included — or only `GROUP BY ()` (one empty grouping
+///   set);
 /// - every `FROM` relation is a base table whose unique key is equated,
 ///   column by column, to constants, parameters, outer-query columns,
 ///   scalar subqueries uncorrelated with this level or columns of
 ///   already-determined relations — the `distinct` rule's "equalities to a
 ///   key" proof (see [`super::dedup`]), propagated until every relation is
 ///   determined — a single-row CTE, a `FROM` function that can't return
-///   a set, a proven one-row `LATERAL` subquery, or a `pg_catalog` system
-///   view with a key PostgreSQL itself guarantees (see below).
+///   a set, a subquery the proof bounds to one row (`LATERAL` or not), or a
+///   `pg_catalog` system view with a key PostgreSQL itself guarantees (see
+///   below);
+/// - it is a plain `DISTINCT` whose targets are all fixed per evaluation:
+///   literals, parameters or non-volatile expressions of them, with no
+///   column reference or window function.
 ///
 /// A CTE the statement's own `WITH` clause proves yields at most one row is
 /// a relation with no key needed: it is determined from the start, may be
 /// referenced more than once, and its columns are values a key equality may
 /// read. CTEs are judged in declaration order, so a body may use the ones
-/// before it; a recursive `WITH`, a body that isn't proven one-row or a
-/// reference to such a CTE makes the proof give up. A `FROM` function call
+/// before it; a recursive `WITH` or a reference to an unproven one makes the
+/// proof give up. A CTE's output columns are listed even when its body isn't
+/// proven one row, and a `FROM` subquery's names likewise, so a nested
+/// level's aggregate argument resolves against them and counts as that
+/// level's aggregate ([`aggregate_is_this_level`]). A `FROM` function call
 /// every overload of which is non-set-returning also yields exactly one row
 /// (`ROWS FROM` of several such calls and `WITH ORDINALITY` included).
 ///
@@ -130,14 +139,14 @@ pub fn redundant_distinct_spans(
 /// conjunct, a DML's `SET` or `RETURNING` — leaves the row count alone. A
 /// locking clause is handled on its own (it needs a single relation).
 ///
-/// Anything else is `false`: `GROUP BY` always is (a group per key), and so
-/// is every relation the proof can't see through (a view other than the
-/// trusted `pg_catalog` system views, a subquery that isn't a proven
-/// one-row `LATERAL` one, a function that returns a set, an unproven CTE,
-/// an inheritance parent, a partitioned table or one under row security), a
-/// set-returning call, a `FULL JOIN` (two one-row sides still produce an
-/// unmatched row from each when their keys differ), or an outer join whose
-/// nullable side isn't determined.
+/// Anything else is `false`: `GROUP BY` other than `()` always is (a group
+/// per key), and so is every relation the proof can't see through (a view
+/// other than the trusted `pg_catalog` system views, a subquery it can't
+/// prove one row, a function that returns a set, an inheritance parent, a
+/// partitioned table or one under row security), a set-returning call, a
+/// `FULL JOIN` (two one-row sides still produce an unmatched row from each
+/// when their keys differ), or an outer join whose nullable side isn't
+/// determined.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
     if !view.analyzed.spreads.is_empty() {
         return false;
@@ -291,10 +300,29 @@ fn visible_ctes(
     VisibleCtes { after, bodies }
 }
 
-/// Whether `cte` is a single-row CTE: a non-recursive body that, with its
-/// `RETURNING` clause for a data-modifying statement, yields at most one
-/// row by [`statement_at_most_one_row`]'s rules. `parent` is the scope
+/// The CTE environment a FROM subquery's own `WITH` clause makes visible:
+/// its CTEs shadow the enclosing level's, and its bodies are judged around
+/// `parent`, the scope of the subquery's own level (nested in the levels
+/// around it). A CTE whose body isn't one row is still listed for the
+/// columns a nested aggregate argument can resolve against (see
+/// [`single_row_cte`]).
+pub(super) fn subquery_cte_env(
+    ctx: &Ctx<'_>,
+    env: &CteEnv,
+    select: &SelectStmt,
+    parent: &FromScope<'_>,
+) -> CteEnv {
+    visible_ctes(ctx, env, select.with_clause.as_ref(), Some(parent)).after
+}
+
+/// Whether `cte`'s output columns are known, and whether its body — with
+/// its `RETURNING` clause for a data-modifying statement — yields at most
+/// one row by [`statement_at_most_one_row`]'s rules. `parent` is the scope
 /// around the query level the `WITH` belongs to.
+///
+/// A CTE whose body isn't one row still lists its columns when they are
+/// known: a reference to it is a relation the proof never determines, but a
+/// nested level's aggregate argument can be placed on its columns.
 fn single_row_cte(
     ctx: &Ctx<'_>,
     cte: &CommonTableExpr,
@@ -316,7 +344,7 @@ fn single_row_cte(
         NodeRef::DeleteStmt(delete) => delete.returning_clause.is_some(),
         _ => false,
     };
-    if !returns_rows || !statement_at_most_one_row_in(ctx, body, env, parent) {
+    if !returns_rows {
         return None;
     }
     let mut columns = cte_output_columns(
@@ -328,12 +356,21 @@ fn single_row_cte(
         let Some(Node::String(name)) = &alias.node else {
             return None;
         };
-        column.name = name.sval.clone();
+        column.name = Some(name.sval.clone());
     }
     if cte.aliascolnames.len() > columns.len() {
         return None;
     }
-    Some(CteInfo { columns })
+    // A body whose output columns can't all be listed is a reference the
+    // proof can't follow: a name it doesn't list may be the one a query uses.
+    if columns.is_empty() {
+        return None;
+    }
+    let single_row = statement_at_most_one_row_in(ctx, body, env, parent);
+    Some(CteInfo {
+        columns,
+        single_row,
+    })
 }
 
 /// The WITH clause a statement node carries.
@@ -407,7 +444,7 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
             .map(|(i, item)| {
                 let (typ, deterministic) = value_type(ctx, None, item);
                 CteColumn {
-                    name: format!("column{}", i + 1),
+                    name: Some(format!("column{}", i + 1)),
                     typ,
                     deterministic,
                 }
@@ -445,6 +482,11 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
                 },
             };
             for r in rels {
+                // A relation whose output names aren't all certain can't be
+                // listed column by column.
+                if !scope.rels[r].columns_known {
+                    return Vec::new();
+                }
                 for (name, attnum) in &scope.rels[r].columns {
                     let (typ, deterministic) = scope.rels[r]
                         .column_info(ctx, *attnum)
@@ -452,7 +494,7 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
                             (Some(typ), deterministic)
                         });
                     out.push(CteColumn {
-                        name: name.clone(),
+                        name: Some(name.clone()),
                         typ,
                         deterministic,
                     });
@@ -465,7 +507,7 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
             name: if target.name.is_empty() {
                 output_name(value)
             } else {
-                target.name.clone()
+                Some(target.name.clone())
             },
             typ,
             deterministic,
@@ -525,7 +567,7 @@ fn returning_columns(
                             (Some(typ), deterministic)
                         });
                     out.push(CteColumn {
-                        name: name.clone(),
+                        name: Some(name.clone()),
                         typ,
                         deterministic,
                     });
@@ -540,9 +582,14 @@ fn returning_columns(
                     None => (0..scope.rels.len()).collect(),
                 };
                 for r in rels {
+                    // A relation whose output names aren't all certain can't
+                    // be listed column by column.
+                    if !scope.rels[r].columns_known {
+                        return Vec::new();
+                    }
                     for (name, _) in &scope.rels[r].columns {
                         out.push(CteColumn {
-                            name: name.clone(),
+                            name: Some(name.clone()),
                             typ: None,
                             deterministic: false,
                         });
@@ -556,7 +603,7 @@ fn returning_columns(
             name: if target.name.is_empty() {
                 output_name(value)
             } else {
-                target.name.clone()
+                Some(target.name.clone())
             },
             typ,
             deterministic,
@@ -645,20 +692,19 @@ fn value_type(
     }
 }
 
-/// The column name PG gives a target that has none written.
-fn output_name(value: &protobuf::Node) -> String {
-    match value.node.as_ref() {
-        Some(Node::ColumnRef(column)) => match dedup::column_ref_fields(column) {
-            Fields::Names(names) => names
-                .last()
-                .map_or_else(|| "?column?".into(), |n| (*n).into()),
-            _ => "?column?".into(),
-        },
-        Some(Node::FuncCall(call)) => string_list(&call.funcname)
-            .last()
-            .map_or_else(|| "?column?".into(), |n| (*n).into()),
-        _ => "?column?".into(),
-    }
+/// The column name PG gives a target that has none written, when it is
+/// certain: a bare column reference's last field. `FigureColname` derives
+/// other names from the expression (a cast from its argument, a function call
+/// from the function, `CASE` as `case`), which this doesn't reproduce, so
+/// anything else is unknown.
+fn output_name(value: &protobuf::Node) -> Option<String> {
+    let Node::ColumnRef(column) = value.node.as_ref()? else {
+        return None;
+    };
+    let Fields::Names(names) = dedup::column_ref_fields(column) else {
+        return None;
+    };
+    names.last().map(|name| (*name).to_owned())
 }
 
 fn string_list(nodes: &[protobuf::Node]) -> Vec<&str> {
@@ -984,7 +1030,11 @@ pub(super) fn select_at_most_one_row_in(
     if select.op() != SetOperation::SetopNone || select.into_clause.is_some() {
         return false;
     }
-    if select.group_distinct || !select.group_clause.is_empty() {
+    // `GROUP BY ()` is a single empty grouping set: one group, like an
+    // aggregate without `GROUP BY`. Any other grouping (including
+    // `GROUPING SETS ((), ())`, which is two groups) makes a group per key.
+    let empty_grouping_set = single_empty_grouping_set(select);
+    if select.group_distinct || (!select.group_clause.is_empty() && !empty_grouping_set) {
         return false;
     }
     // A set-returning call multiplies this level's rows wherever it runs:
@@ -995,6 +1045,12 @@ pub(super) fn select_at_most_one_row_in(
     // volatile one.
     if has_set_returning(ctx, select) {
         return false;
+    }
+    // A plain `DISTINCT` whose targets are all one value per evaluation —
+    // literals, parameters, non-volatile expressions of them, with no
+    // column reference — deduplicates every row to at most one.
+    if dedup::is_plain_distinct(select) && fixed_distinct_targets(ctx, select) {
+        return true;
     }
     // A FULL JOIN emits the unmatched rows of both sides: two relations that
     // are each one row can still produce two (one from each side when their
@@ -1008,7 +1064,10 @@ pub(super) fn select_at_most_one_row_in(
     if select.from_clause.is_empty() {
         return true;
     }
-    if select.having_clause.is_some() || has_own_aggregate(ctx, select, env, outer) {
+    if empty_grouping_set
+        || select.having_clause.is_some()
+        || has_own_aggregate(ctx, select, env, outer)
+    {
         // One group, and nothing groups it further.
         return true;
     }
@@ -1025,6 +1084,67 @@ pub(super) fn select_at_most_one_row_in(
         return false;
     }
     all_relations_determined(ctx, select, &scope, outer)
+}
+
+/// Whether `select` has exactly one `GROUP BY` item and it is the empty
+/// grouping set (`GROUP BY ()`): one group over every input row.
+fn single_empty_grouping_set(select: &SelectStmt) -> bool {
+    let [group] = select.group_clause.as_slice() else {
+        return false;
+    };
+    matches!(
+        &group.node,
+        Some(Node::GroupingSet(set))
+            if set.kind() == GroupingSetKind::GroupingSetEmpty && set.content.is_empty()
+    )
+}
+
+/// Whether every plain-`DISTINCT` target is one value per evaluation of this
+/// level: a literal, a parameter, a clock reading or a non-volatile
+/// expression of those, with no column reference, subquery or window
+/// function. Rows that all evaluate to the same target values deduplicate to
+/// at most one.
+fn fixed_distinct_targets(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    select.target_list.iter().all(|target| {
+        let Some(Node::ResTarget(target)) = &target.node else {
+            return false;
+        };
+        target
+            .val
+            .as_deref()
+            .is_some_and(|value| fixed_per_evaluation(ctx, value))
+    })
+}
+
+/// Whether `value` evaluates to the same result on every row of a query
+/// level: it reads no column and no nested query, and every call it makes is
+/// non-volatile, non-aggregate and non-window.
+fn fixed_per_evaluation(ctx: &Ctx<'_>, value: &protobuf::Node) -> bool {
+    if proof::has_volatile(ctx, value) {
+        return false;
+    }
+    let Some(root) = value.node.as_ref() else {
+        return false;
+    };
+    let mut stack = vec![root.to_ref()];
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeRef::ColumnRef(_)
+            | NodeRef::SubLink(_)
+            | NodeRef::RangeSubselect(_)
+            | NodeRef::CommonTableExpr(_)
+            | NodeRef::SelectStmt(_)
+            | NodeRef::RangeVar(_)
+            | NodeRef::RangeFunction(_)
+            | NodeRef::RangeTableSample(_) => return false,
+            // A window function numbers the rows it sees, so it differs
+            // from one row to the next even over constants.
+            NodeRef::FuncCall(call) if call.over.is_some() => return false,
+            _ => {}
+        }
+        stack.extend(node.children());
+    }
+    true
 }
 
 /// The [`NodeRef`]s of a list of protobuf nodes, skipping empty slots.
@@ -1099,16 +1219,17 @@ fn has_set_returning(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
 /// arguments — arguments, ORDER BY and FILTER — read; with no column
 /// reference at all (`count(*)`) that is the level it is written in. So
 /// `count(outer.x)` inside a subquery is the outer level's aggregate and
-/// does not collapse the subquery's rows. Nested queries are separate
-/// levels; when one is found inside the arguments this gives up (a
-/// reference there might still bind to this level).
+/// does not collapse the subquery's rows, while `count(role)` over
+/// `FROM (SELECT role …) s` or a CTE reference resolves in [`Scope`] and
+/// collapses this level. Nested queries are separate levels; when one is
+/// found inside the arguments this gives up (a reference there might still
+/// bind to this level).
 ///
 /// At a level no outer query encloses — the statement's own `SELECT`, a
 /// top-level CTE body or set-operation branch (`outer.has_parent()` is
 /// false) — there is no other level an aggregate written here could belong
-/// to, whatever its arguments reference (a `FROM` subquery, whose columns
-/// [`Scope::build_env`] can't see, included): an aggregate with no
-/// `GROUP BY` still collapses the level to one group.
+/// to, whatever its arguments reference (a `FROM` subquery included): an
+/// aggregate with no `GROUP BY` still collapses the level to one group.
 fn has_own_aggregate(
     ctx: &Ctx<'_>,
     select: &SelectStmt,
@@ -1415,8 +1536,11 @@ fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> b
     let NodeRef::SelectStmt(select) = node.to_ref() else {
         return false;
     };
+    // The source query's own `WITH` shadows the statement's CTE names, just
+    // as it does in a FROM subquery.
+    let env = visible_ctes(ctx, env, select.with_clause.as_ref(), None).after;
     let scope = FromScope::of_select(ctx, select, None);
-    select_at_most_one_row_in(ctx, select, &scope, env) || limit_bounds_one(select)
+    select_at_most_one_row_in(ctx, select, &scope, &env) || limit_bounds_one(select)
 }
 
 /// An `UPDATE ... FROM` / `DELETE ... USING` whose target relation is
@@ -2182,8 +2306,11 @@ mod tests {
         let arm = top(&union).larg.as_deref().expect("left arm");
         assert!(select_at_most_one_row(&db, &union, arm));
         // A nested level's aggregate over an outer column stays the outer
-        // level's: the inner select returns a row per outer row.
-        let outer = view(&db, "SELECT (SELECT min(o.id) FROM (SELECT 1) s) FROM a o");
+        // level's: the inner select returns a row per `b` row, not one.
+        let outer = view(
+            &db,
+            "SELECT (SELECT min(o.id) FROM (SELECT due FROM b) s) FROM a o",
+        );
         let aggregate = outer
             .tree
             .nodes()
@@ -2203,8 +2330,9 @@ mod tests {
             })
             .expect("aggregate select");
         assert!(!select_at_most_one_row(&db, &outer, aggregate));
-        // The same at a nested level with a FROM subquery: giving up there
-        // is sound even when the arguments read only the subquery.
+        // The same at a nested level with a FROM subquery: the argument
+        // resolves against the subquery's output, so the aggregate is this
+        // level's and the inner select is one row.
         let nested = view(
             &db,
             "SELECT (SELECT min(s.due) FROM (SELECT due FROM a) s) FROM b o",
@@ -2227,7 +2355,7 @@ mod tests {
                 _ => None,
             })
             .expect("aggregate select");
-        assert!(!select_at_most_one_row(&db, &nested, aggregate));
+        assert!(select_at_most_one_row(&db, &nested, aggregate));
     }
 
     #[test]
@@ -2290,6 +2418,239 @@ mod tests {
         assert!(statement_one(
             &db,
             "WITH c AS (SELECT min(id) AS n FROM keyed) SELECT n FROM c"
+        ));
+    }
+
+    #[test]
+    fn a_from_subquery_proven_one_row_is_one_relation() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql("CREATE TABLE a (id bigint PRIMARY KEY, x int);")
+            .unwrap();
+        // A single-row VALUES list, named by its alias column list.
+        assert!(select_one(&db, "SELECT v FROM (VALUES (1)) AS one(v)"));
+        // An aggregate over a table, named by the target alias.
+        assert!(select_one(
+            &db,
+            "SELECT s.m FROM (SELECT min(x) AS m FROM a) s"
+        ));
+        // A key lookup the subquery bounds, with no LATERAL.
+        assert!(select_one(
+            &db,
+            "SELECT s.x FROM (SELECT x FROM a WHERE id = $1) s"
+        ));
+        // A single-row CTE-less derived table in a join.
+        assert!(select_one(
+            &db,
+            "SELECT a.id FROM a JOIN (SELECT 1 AS x) s ON s.x = a.x WHERE a.id = $1"
+        ));
+        // More than one VALUES row, a keyless subquery, and a subquery whose
+        // target names aren't certain (so a reference can't bind to it) stay
+        // unproven.
+        assert!(!select_one(
+            &db,
+            "SELECT v FROM (VALUES (1), (2)) AS two(v)"
+        ));
+        assert!(!select_one(&db, "SELECT x FROM (SELECT x FROM a) s"));
+        assert!(!select_one(
+            &db,
+            "SELECT s.id FROM (SELECT * FROM a) s WHERE s.id = $1"
+        ));
+    }
+
+    #[test]
+    fn a_from_subquery_with_its_own_with_uses_it() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql("CREATE TABLE a (id bigint PRIMARY KEY, x int);")
+            .unwrap();
+        // The review's repro: the subquery's own `c` (two rows) shadows the
+        // outer one-row `c`. Proving the body against the outer environment
+        // would read the outer CTE and call this one row.
+        assert!(!select_one(
+            &db,
+            "WITH c(x) AS (VALUES (0)) \
+             SELECT x FROM (WITH c(x) AS (VALUES (1), (2)) SELECT x FROM c) AS s"
+        ));
+        // Without the inner WITH the outer one-row CTE proves it, so the
+        // shadowing case above is not a proof that always fails.
+        assert!(select_one(
+            &db,
+            "WITH c(x) AS (VALUES (0)) SELECT x FROM (SELECT x FROM c) AS s"
+        ));
+        // An inner one-row `c` shadows the outer one just the same.
+        assert!(select_one(
+            &db,
+            "WITH c(x) AS (VALUES (0)) \
+             SELECT x FROM (WITH c(x) AS (VALUES (1)) SELECT x FROM c) AS s"
+        ));
+        // The SELECT an INSERT reads may carry its own WITH too, with the
+        // same shadowing: the statement inserts two rows, not one.
+        assert!(!statement_one(
+            &db,
+            "WITH c(x) AS (VALUES (0)) \
+             INSERT INTO a (id) WITH c(x) AS (VALUES (1), (2)) SELECT x FROM c"
+        ));
+    }
+
+    #[test]
+    fn a_distinct_constant_projection_is_one_row() {
+        let db = catalog();
+        assert!(select_one(&db, "SELECT DISTINCT 1 AS present FROM users"));
+        assert!(select_one(
+            &db,
+            "SELECT DISTINCT $1::text AS present FROM users"
+        ));
+        assert!(select_one(&db, "SELECT DISTINCT 1, 'x' FROM users"));
+        assert!(select_one(&db, "SELECT DISTINCT 1 + 2 FROM users"));
+        assert!(select_one(&db, "SELECT DISTINCT now() FROM users"));
+        assert!(select_one(&db, "SELECT DISTINCT count(*) FROM users"));
+        // A column can differ from row to row.
+        assert!(!select_one(&db, "SELECT DISTINCT id FROM users"));
+        assert!(!select_one(&db, "SELECT DISTINCT id + 1 FROM users"));
+        // Volatile calls, window functions and set-returning calls.
+        assert!(!select_one(&db, "SELECT DISTINCT random() FROM users"));
+        assert!(!select_one(
+            &db,
+            "SELECT DISTINCT row_number() OVER () FROM users"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT DISTINCT generate_series(1, 3) FROM users"
+        ));
+        // `DISTINCT ON` is not a plain `DISTINCT`.
+        assert!(!select_one(&db, "SELECT DISTINCT ON (id) 1 FROM users"));
+    }
+
+    #[test]
+    fn an_empty_grouping_set_is_one_row() {
+        let db = catalog();
+        assert!(select_one(&db, "SELECT count(*) FROM users GROUP BY ()"));
+        assert!(select_one(&db, "SELECT 1 FROM users GROUP BY ()"));
+        assert!(statement_one(&db, "SELECT count(*) FROM users GROUP BY ()"));
+        // A repeated empty set is two groups.
+        assert!(!select_one(
+            &db,
+            "SELECT count(*) FROM users GROUP BY GROUPING SETS ((), ())"
+        ));
+        // Any real grouping is a group per key.
+        assert!(!select_one(&db, "SELECT count(*) FROM users GROUP BY id"));
+        assert!(!select_one(&db, "SELECT 1 FROM users GROUP BY (), id"));
+    }
+
+    #[test]
+    fn an_aggregate_argument_resolves_against_derived_tables() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE m (
+                tenant_id bigint NOT NULL,
+                user_id bigint NOT NULL,
+                role text NOT NULL,
+                PRIMARY KEY (tenant_id, user_id)
+             );
+             CREATE TABLE u (id bigint PRIMARY KEY);",
+        )
+        .unwrap();
+        let aggregate_is_one_row = |sql: &str| {
+            let view = view(&db, sql);
+            let select = view
+                .tree
+                .nodes()
+                .into_iter()
+                .find_map(|(node, _)| match node {
+                    NodeRef::SelectStmt(select)
+                        if select.target_list.iter().any(|target| {
+                            matches!(&target.node, Some(Node::ResTarget(target))
+                                if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                                    Some(Node::FuncCall(call))
+                                        if string_list(&call.funcname) == ["count"]))
+                        }) =>
+                    {
+                        Some(select)
+                    }
+                    _ => None,
+                })
+                .expect("count select");
+            select_at_most_one_row(&db, &view, select)
+        };
+        // The issue's repro: `role` resolves to the FROM subquery's output,
+        // so the aggregate belongs to this level and collapses it to one row.
+        assert!(aggregate_is_one_row(
+            "SELECT (SELECT count(DISTINCT role) FROM (SELECT role FROM m) s) FROM u"
+        ));
+        // A CTE reference's columns resolve the same way, through an alias
+        // column list too.
+        assert!(aggregate_is_one_row(
+            "WITH c AS (SELECT role FROM m) \
+             SELECT (SELECT count(c.role) FROM c) FROM u"
+        ));
+        assert!(aggregate_is_one_row(
+            "WITH c(role_name) AS (SELECT role FROM m) \
+             SELECT (SELECT count(c.role_name) FROM c) FROM u"
+        ));
+        // A reference to the outer level stays that level's aggregate: the
+        // inner select then returns a row per `u` row.
+        assert!(!aggregate_is_one_row(
+            "SELECT (SELECT count(u.id) FROM (SELECT role FROM m) s) FROM u"
+        ));
+        // A subquery output name that isn't certain refuses placement.
+        assert!(!aggregate_is_one_row(
+            "SELECT (SELECT count(\"?column?\") FROM (SELECT role || '' FROM m) s) FROM u"
+        ));
+    }
+
+    #[test]
+    fn a_cast_or_call_output_name_is_not_trusted() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE src (v int);
+             CREATE TABLE outer_rows (\"?column?\" int);",
+        )
+        .unwrap();
+        let aggregate_is_one_row = |sql: &str| {
+            let view = view(&db, sql);
+            let select = view
+                .tree
+                .nodes()
+                .into_iter()
+                .find_map(|(node, _)| match node {
+                    NodeRef::SelectStmt(select)
+                        if select.target_list.iter().any(|target| {
+                            matches!(&target.node, Some(Node::ResTarget(target))
+                                if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                                    Some(Node::FuncCall(call))
+                                        if string_list(&call.funcname) == ["count"]))
+                        }) =>
+                    {
+                        Some(select)
+                    }
+                    _ => None,
+                })
+                .expect("count select");
+            select_at_most_one_row(&db, &view, select)
+        };
+        // The review's repro: PG names `v::int` `v`, so `"?column?"` is the
+        // outer relation's column. The count is then the outer level's
+        // aggregate and the inner select returns one row per `src` row.
+        assert!(!aggregate_is_one_row(
+            "WITH c AS (SELECT v::int FROM src) \
+             SELECT ARRAY(SELECT count(\"?column?\") FROM c) FROM outer_rows"
+        ));
+        // A function call's name is not trusted either, even when PG names
+        // the column after the function: the relation's columns stay
+        // uncertain, so the count can't be placed on this level.
+        assert!(!aggregate_is_one_row(
+            "WITH c AS (SELECT lower(v::text) FROM src) \
+             SELECT ARRAY(SELECT count(\"lower\") FROM c) FROM outer_rows"
+        ));
+        // An explicit alias makes the name certain, so the same aggregate is
+        // placed on this level and collapses it.
+        assert!(aggregate_is_one_row(
+            "WITH c(x) AS (SELECT v::int FROM src) \
+             SELECT ARRAY(SELECT count(x) FROM c) FROM outer_rows"
+        ));
+        // An alias column list on the derived table does the same.
+        assert!(aggregate_is_one_row(
+            "SELECT ARRAY(SELECT count(x) \
+              FROM (SELECT v::int FROM src) AS c(x)) FROM outer_rows"
         ));
     }
 
