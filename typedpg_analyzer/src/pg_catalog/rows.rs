@@ -579,10 +579,10 @@ pub struct PgInherits {
 /// also keeps a name index so `COLLATE "x"` validation (and column-level
 /// `attcollation`) can resolve names quickly.
 ///
-/// We carry only the fields the analyzer consults: name, namespace,
-/// encoding (`-1` = collation-independent / "any"). `collprovider`,
-/// `collisdeterministic`, `collcollate`, `collctype`, etc. are not modeled
-/// because nothing in the analyzer reads them.
+/// We carry the fields the analyzer consults: name, namespace, encoding
+/// (`-1` = collation-independent / "any") and whether its equality is
+/// deterministic. `collprovider`, `collcollate`, `collctype`, etc. are not
+/// modeled because nothing in the analyzer reads them.
 #[derive(Debug, Clone, Serialize_tuple, Deserialize_tuple)]
 pub struct PgCollation {
     pub oid: PgCollationOid,
@@ -592,6 +592,20 @@ pub struct PgCollation {
     /// PG's `pg_database.encoding` integer for the collation's target
     /// encoding (`-1` = "any encoding"; common for `"C"` and `"POSIX"`).
     pub collencoding: i32,
+    /// `pg_collation.collisdeterministic`: only a deterministic collation
+    /// compares equal strings as equal (so a unique index under it bounds
+    /// the rows). Every seeded collation is deterministic; the serde default
+    /// keeps a seed written before this field was modeled readable, and
+    /// `CREATE COLLATION ... deterministic = false` records the others.
+    #[serde(default = "collation_deterministic_default")]
+    pub collisdeterministic: bool,
+}
+
+/// The [`PgCollation::collisdeterministic`] value for a seed row written
+/// before the field was modeled: every collation PostgreSQL's catalog files
+/// and initdb create is deterministic.
+fn collation_deterministic_default() -> bool {
+    true
 }
 
 /// A configuration parameter (`pg_settings`): its type, when it can be

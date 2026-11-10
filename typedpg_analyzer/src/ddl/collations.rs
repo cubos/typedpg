@@ -30,12 +30,17 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     // arg = List([String("y")]) }`; we use it to resolve the source and
     // inherit its encoding. Option-style `(LOCALE = …, PROVIDER = …)`:
     // a libc collation is for the database encoding, an ICU or builtin
-    // one for any (DefineCollation).
+    // one for any (DefineCollation). `FROM` copies the source's
+    // `collisdeterministic`; an explicit `deterministic` overrides it.
     let mut collencoding: i32 = DATABASE_ENCODING;
+    let mut deterministic = true;
     for opt in &stmt.definition {
         let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
             continue;
         };
+        if de.defname.eq_ignore_ascii_case("deterministic") {
+            deterministic = super::session::def_get_boolean(de)?;
+        }
         if de.defname.eq_ignore_ascii_case("provider") {
             // defGetString: a bare word arrives as a type name.
             let provider = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
@@ -77,6 +82,7 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
                 ))
             })?;
             collencoding = source.collencoding;
+            deterministic = source.collisdeterministic;
         }
     }
 
@@ -105,6 +111,7 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         collname: name,
         collnamespace: nsoid,
         collencoding,
+        collisdeterministic: deterministic,
     });
     Ok(())
 }

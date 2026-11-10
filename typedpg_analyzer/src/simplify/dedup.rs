@@ -41,7 +41,9 @@
 //! other views, subqueries it can't prove one row per outer row, functions,
 //! CTEs, inheritance parents, partitioned tables, tables under row security
 //! — make it give up, and so do set-returning, aggregate and volatile
-//! calls.
+//! calls. (These are the strict scope's rules, which the simplifications
+//! keep; the cardinality proof's scope trusts a partitioned table's global
+//! keys, an `ONLY` parent and row security, see [`KeyScope`].)
 //!
 //! # Errors
 //!
@@ -75,7 +77,7 @@ use super::proof::FromScope;
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::Type;
 use crate::oid::{PgClassOid, PgCollationOid, PgNamespaceOid, PgOperatorOid, PgTypeOid};
-use crate::pg_catalog::{PgCatalog, ProKind, ProVolatile, RelKind, oid};
+use crate::pg_catalog::{ConType, PgCatalog, ProKind, ProVolatile, RelKind, oid};
 
 /// The most relations one proof follows (a bit each in a `u64`).
 const MAX_RELATIONS: usize = 64;
@@ -495,7 +497,7 @@ impl Rel {
                 .attributes_of(oid)
                 .iter()
                 .find(|a| a.attnum == attnum)
-                .map(|a| (a.atttypid, deterministic(a.attcollation))),
+                .map(|a| (a.atttypid, deterministic(ctx.catalog, a.attcollation))),
             None => {
                 let index = usize::try_from(attnum - 1).ok()?;
                 let (typ, deterministic_collation) = self.cte_columns.get(index).copied()?;
@@ -576,10 +578,27 @@ impl Join<'_> {
     }
 }
 
+/// How much a [`Scope`] trusts a relation's unique keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyScope {
+    /// The `DISTINCT` / `UNION` simplifications: only a plain table (or a
+    /// trusted `pg_catalog` view) with no inheritance children and no row
+    /// security. A partitioned table, an `ONLY` parent and an RLS table are
+    /// refused for every key.
+    Strict,
+    /// The cardinality proof: a partitioned table's unique keys are global
+    /// (PG requires the partition key in them), `FROM ONLY parent` reads
+    /// only the parent (whose own keys are unique there), and row security
+    /// only filters rows, so keys still bound the count.
+    Cardinality,
+}
+
 /// The base tables and joins of one FROM clause.
 pub(super) struct Scope<'a> {
     pub(super) rels: Vec<Rel>,
     pub(super) joins: Vec<Join<'a>>,
+    /// Which relation kinds and keys this scope trusts.
+    mode: KeyScope,
 }
 
 /// What a column reference names.
@@ -628,34 +647,44 @@ impl<'a> Scope<'a> {
         from: &'a [protobuf::Node],
     ) -> Option<Scope<'a>> {
         let root = FromScope::opaque(None);
-        Self::build_inner(ctx, &CteEnv::blocked(ctes), from, false, &root)
+        Self::build_inner(
+            ctx,
+            &CteEnv::blocked(ctes),
+            from,
+            false,
+            &root,
+            KeyScope::Strict,
+        )
     }
 
     /// [`Self::build`] with the single-row CTEs visible at this level and
     /// `outer`, the scope of this level's own items and the levels around
-    /// it (what a `LATERAL` FROM subquery reads).
+    /// it (what a `LATERAL` FROM subquery reads). This is the cardinality
+    /// proof's scope: partitioned keys are global, `ONLY` parents and
+    /// row-security tables are usable.
     pub(super) fn build_env(
         ctx: &Ctx<'_>,
         env: &CteEnv,
         from: &'a [protobuf::Node],
         outer: &FromScope<'_>,
     ) -> Option<Scope<'a>> {
-        Self::build_inner(ctx, env, from, true, outer)
+        Self::build_inner(ctx, env, from, true, outer, KeyScope::Cardinality)
     }
 
     /// [`Self::build`], also accepting a FROM function that can't return a
-    /// set and a proven one-row `LATERAL` subquery as one-row relations
-    /// (`functions`).
+    /// set and a FROM subquery as one-row relations (`functions`).
     fn build_inner(
         ctx: &Ctx<'_>,
         env: &CteEnv,
         from: &'a [protobuf::Node],
         functions: bool,
         outer: &FromScope<'_>,
+        mode: KeyScope,
     ) -> Option<Scope<'a>> {
         let mut scope = Scope {
             rels: Vec::new(),
             joins: Vec::new(),
+            mode,
         };
         for item in from {
             scope.add(ctx, env, item, false, functions, outer)?;
@@ -664,7 +693,8 @@ impl<'a> Scope<'a> {
     }
 
     /// The scope of a whole `UPDATE` or `DELETE`: the target relation and
-    /// its `FROM` / `USING` items.
+    /// its `FROM` / `USING` items. The cardinality proof's scope (a target
+    /// row is written once, so `ONLY` and partitioned targets count).
     pub(super) fn dml(
         ctx: &Ctx<'_>,
         env: &CteEnv,
@@ -674,6 +704,7 @@ impl<'a> Scope<'a> {
         let mut scope = Scope {
             rels: Vec::new(),
             joins: Vec::new(),
+            mode: KeyScope::Cardinality,
         };
         // A data-modifying statement's target is always a table: a CTE of
         // the same name is not one PG lets it write.
@@ -999,14 +1030,26 @@ impl<'a> Scope<'a> {
         // can't see through.
         let trusted_view =
             class.relkind == RelKind::View && is_trusted_system_view(ctx.catalog, class);
-        if (class.relkind != RelKind::Table && !trusted_view)
-            || ctx
-                .catalog
-                .pg_inherits
-                .iter()
-                .any(|i| i.inhparent == class.oid)
-            || ctx.catalog.row_security.contains(&class.oid)
-        {
+        // The strict scope trusts only a plain table with nothing reading
+        // rows the index doesn't cover: no inheritance children, no row
+        // security. The cardinality proof may trust more (see [`KeyScope`]):
+        // a partitioned table's parent keys are global, `FROM ONLY parent`
+        // reads the parent row alone, and row security only filters.
+        let has_children = ctx
+            .catalog
+            .pg_inherits
+            .iter()
+            .any(|i| i.inhparent == class.oid);
+        let usable = trusted_view
+            || match (self.mode, class.relkind) {
+                (KeyScope::Strict, RelKind::Table) => {
+                    !has_children && !ctx.catalog.row_security.contains(&class.oid)
+                }
+                (KeyScope::Cardinality, RelKind::Table) => !has_children || !rv.inh,
+                (KeyScope::Cardinality, RelKind::Partitioned) => true,
+                _ => false,
+            };
+        if !usable {
             return None;
         }
         let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
@@ -1136,7 +1179,11 @@ impl<'a> Scope<'a> {
                             .attributes_of(resolved.rel)
                             .iter()
                             .find(|a| a.attnum == resolved.attnum)?;
-                        (None, 0, (attr.atttypid, deterministic(attr.attcollation)))
+                        (
+                            None,
+                            0,
+                            (attr.atttypid, deterministic(ctx.catalog, attr.attcollation)),
+                        )
                     }
                 };
                 deterministic_collation.then_some(Operand {
@@ -1735,6 +1782,31 @@ impl<'a> Scope<'a> {
         let Some(predicate) = self.canonical_predicate(ctx, b, predicate) else {
             return false;
         };
+        // A bare boolean column's predicate is also implied by the
+        // comparisons that force its value: `col = true`, `true = col` and
+        // `col IS TRUE` for `col`; `col = false`, `false = col`,
+        // `col IS FALSE` and `NOT col` for `NOT col`.
+        let boolean_fact = match predicate.node.as_ref() {
+            Some(Node::Var(var)) => i16::try_from(var.varattno)
+                .ok()
+                .map(|attnum| (attnum, true)),
+            Some(Node::BoolExpr(expr))
+                if expr.boolop() == BoolExprType::NotExpr && expr.args.len() == 1 =>
+            {
+                canonical_var_attnum(&expr.args[0]).map(|attnum| (attnum, false))
+            }
+            _ => None,
+        };
+        if let Some((attnum, value)) = boolean_fact
+            && self.boolean_column(ctx, b, attnum)
+            && builtin_boolean_equality(ctx.catalog)
+            && sources.conjuncts.iter().any(|source| {
+                let source = self.canonical_source(b, source);
+                boolean_conjunct_fixes(&source, attnum, value)
+            })
+        {
+            return true;
+        }
         // `col IS NOT NULL` holds wherever a strict equality on `col` does:
         // a fact is only recorded for a strict operator, whose result can't
         // be true with a NULL operand.
@@ -1754,6 +1826,16 @@ impl<'a> Scope<'a> {
         sources.conjuncts.iter().any(|source| {
             let source = self.canonical_source(b, source);
             predicate.equal(&source)
+        })
+    }
+
+    /// Whether relation `b`'s column `attnum` is a `boolean`.
+    fn boolean_column(&self, ctx: &Ctx<'_>, b: usize, attnum: i16) -> bool {
+        self.rels[b].oid.is_some_and(|relid| {
+            ctx.catalog
+                .attributes_of(relid)
+                .iter()
+                .any(|attribute| attribute.attnum == attnum && attribute.atttypid == oid::BOOL)
         })
     }
 
@@ -1817,6 +1899,75 @@ fn canonical_column(attnum: i16) -> protobuf::Node {
             location: 0,
             ..Default::default()
         }))),
+    }
+}
+
+/// The attnum a canonical [`canonical_column`] `Var` names.
+fn canonical_var_attnum(node: &protobuf::Node) -> Option<i16> {
+    let Some(Node::Var(var)) = &node.node else {
+        return None;
+    };
+    i16::try_from(var.varattno).ok()
+}
+
+/// Whether an unqualified `=` between two booleans resolves to PG's own
+/// `booleq`: a user operator of the same signature (allocated above the
+/// built-in range) could return true for any pair, so it proves nothing.
+fn builtin_boolean_equality(catalog: &PgCatalog) -> bool {
+    catalog
+        .find_operator("=", Some(oid::BOOL), oid::BOOL)
+        .is_some_and(|operator| {
+            operator.oid.get() < FIRST_NORMAL_OBJECT_ID
+                && catalog
+                    .pg_operator
+                    .get(&operator.oid)
+                    .is_some_and(|declared| {
+                        declared.oprleft == Some(oid::BOOL) && declared.oprright == oid::BOOL
+                    })
+        })
+}
+
+/// Whether canonical conjunct `node` forces boolean column `attnum` to
+/// `value`: `col = true` or `true = col` and `col IS TRUE` for `true`;
+/// `col = false`, `false = col`, `col IS FALSE` and `NOT col` for `false`.
+/// The equality must be written unqualified as `=`: an unqualified boolean
+/// comparison resolves to `pg_catalog.booleq`, while `OPERATOR(schema.=)`
+/// could name an operator with another meaning.
+fn boolean_conjunct_fixes(node: &protobuf::Node, attnum: i16, value: bool) -> bool {
+    let is_column = |node: &Option<Box<protobuf::Node>>| {
+        node.as_deref().and_then(canonical_var_attnum) == Some(attnum)
+    };
+    let is_value = |node: &Option<Box<protobuf::Node>>| {
+        matches!(
+            node.as_deref().and_then(|node| node.node.as_ref()),
+            Some(Node::AConst(constant))
+                if !constant.isnull
+                    && matches!(constant.val.as_ref(),
+                        Some(Val::Boolval(boolean)) if boolean.boolval == value)
+        )
+    };
+    match node.node.as_ref() {
+        Some(Node::AExpr(expr)) if expr.kind() == AExprKind::AexprOp => {
+            let name = string_list(&expr.name);
+            name.len() == 1
+                && name[0] == "="
+                && ((is_column(&expr.lexpr) && is_value(&expr.rexpr))
+                    || (is_value(&expr.lexpr) && is_column(&expr.rexpr)))
+        }
+        Some(Node::BooleanTest(test)) => {
+            is_column(&test.arg)
+                && matches!(
+                    (value, test.booltesttype()),
+                    (true, protobuf::BoolTestType::IsTrue)
+                        | (false, protobuf::BoolTestType::IsFalse)
+                )
+        }
+        Some(Node::BoolExpr(expr))
+            if !value && expr.boolop() == BoolExprType::NotExpr && expr.args.len() == 1 =>
+        {
+            canonical_var_attnum(&expr.args[0]) == Some(attnum)
+        }
+        _ => false,
     }
 }
 
@@ -1971,7 +2122,7 @@ fn system_view_keys(
                     notnull: false,
                     family,
                     default_family: true,
-                    deterministic: deterministic(attr.attcollation),
+                    deterministic: deterministic(catalog, attr.attcollation),
                 });
             }
             Some(UniqueKey {
@@ -2016,9 +2167,11 @@ struct UniqueKey {
 
 /// The unique keys PG enforces at every statement on relation `relid`:
 /// unique btree indexes — PRIMARY KEY and UNIQUE constraints' included —
-/// that are immediate, not exclusion and on plain columns. A partial
+/// that are immediate, valid, not exclusion and on plain columns. A partial
 /// index's predicate is kept for the cardinality proof; the `DISTINCT`
-/// proof still ignores partial indexes.
+/// proof still ignores partial indexes. An index the catalog marks invalid
+/// enforces nothing yet — a partitioned parent's `ON ONLY` index until every
+/// partition has an attached index — so it is never a key.
 fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
     let catalog = ctx.catalog;
     let attrs = catalog.attributes_of(relid);
@@ -2037,6 +2190,7 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
             || !index.indisunique
             || index.indisexclusion
             || catalog.nonimmediate_indexes.contains(&index.indexrelid)
+            || catalog.invalid_indexes.contains(&index.indexrelid)
         {
             continue;
         }
@@ -2080,8 +2234,8 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
                 notnull: super::proof::column_not_null(catalog, relid, attnum),
                 family,
                 default_family,
-                deterministic: deterministic(index.indcollation.get(i).copied().flatten())
-                    && deterministic(attr.attcollation),
+                deterministic: deterministic(catalog, index.indcollation.get(i).copied().flatten())
+                    && deterministic(catalog, attr.attcollation),
             });
         }
         out.push(UniqueKey {
@@ -2096,11 +2250,191 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
     out
 }
 
-/// A collation whose equality is bytewise: none, the database default
-/// (PG doesn't allow a nondeterministic one), `C` or `POSIX`. Any other is
-/// treated as possibly nondeterministic.
-fn deterministic(collation: Option<PgCollationOid>) -> bool {
-    collation.is_none_or(|c| matches!(c.get(), 100 | 950 | 951))
+/// Whether relation `relid` provably holds at most one row: a complete,
+/// immediate, non-partial unique key of it whose every column is NOT NULL,
+/// compares under a deterministic collation, and is fixed to one value by a
+/// validated, enforced CHECK constraint the relation itself carries.
+///
+/// The check must be `col` (a boolean, fixing it true), `NOT col`, or
+/// `col = <literal>` / `<literal> = col`, possibly inside an `AND`. A CHECK
+/// passes on NULL too, so NOT NULL is required: the check alone would let
+/// the column be NULL or the fixed value, two distinct keys. The collation
+/// must be deterministic, or a case-insensitive comparison in the check
+/// could admit several byte strings while the index tells them apart. The
+/// relation must have no inheritance children — a child may hold rows the
+/// parent's index and check don't cover, and `NO INHERIT` checks need not
+/// reach it.
+pub(super) fn singleton_table(ctx: &Ctx<'_>, relid: PgClassOid) -> bool {
+    if ctx
+        .catalog
+        .pg_inherits
+        .iter()
+        .any(|inherit| inherit.inhparent == relid)
+    {
+        return false;
+    }
+    let attrs = ctx.catalog.attributes_of(relid);
+    unique_keys(ctx, relid).iter().any(|key| {
+        key.predicate.is_none()
+            && key
+                .columns
+                .iter()
+                .all(|column| column.notnull && column.deterministic)
+            && key.columns.iter().all(|column| {
+                let Some(attr) = attrs.iter().find(|attr| attr.attnum == column.attnum) else {
+                    return false;
+                };
+                check_fixes_column(ctx.catalog, relid, &attr.attname, attr.atttypid)
+            })
+    })
+}
+
+/// Whether a validated, enforced CHECK constraint of `relid` forces column
+/// `name` of type `ty` to one value (see [`singleton_table`]).
+fn check_fixes_column(catalog: &PgCatalog, relid: PgClassOid, name: &str, ty: PgTypeOid) -> bool {
+    catalog.pg_constraint.values().any(|constraint| {
+        constraint.conrelid == relid
+            && constraint.contype == ConType::Check
+            && constraint.convalidated
+            && constraint.conenforced
+            && catalog
+                .check_defs
+                .get(&constraint.oid)
+                .is_some_and(|check| {
+                    matches!(&check.expr,
+                    crate::ddl::tables::check_inherit::StoredExpr::Written(expr)
+                        if check_fixes_value(catalog, expr, name, ty))
+                })
+    })
+}
+
+/// Whether check expression `expr` implies that its column `name` has one
+/// value: `col` for a boolean, `NOT col`, `col = <literal>` or the literal
+/// on the left, inside any `AND` (every conjunct holds on a passing row).
+/// The equality is only read when the catalog holds no user-defined `=`
+/// operator at all (see [`user_defined_equality_operator_exists`]); the
+/// boolean forms involve no operator.
+fn check_fixes_value(
+    catalog: &PgCatalog,
+    expr: &protobuf::Node,
+    name: &str,
+    ty: PgTypeOid,
+) -> bool {
+    let is_named = |node: &Option<Box<protobuf::Node>>| {
+        node.as_deref()
+            .and_then(column_name)
+            .is_some_and(|column| column == name)
+    };
+    let Some(expr) = expr.node.as_ref() else {
+        return false;
+    };
+    match expr {
+        Node::BoolExpr(bool) if bool.boolop() == BoolExprType::AndExpr => bool
+            .args
+            .iter()
+            .any(|arg| check_fixes_value(catalog, arg, name, ty)),
+        Node::ColumnRef(column) => {
+            ty == oid::BOOL
+                && matches!(column_ref_fields(column), Fields::Names(names)
+                    if names.last().is_some_and(|column| *column == name))
+        }
+        Node::BoolExpr(bool) if bool.boolop() == BoolExprType::NotExpr && bool.args.len() == 1 => {
+            ty == oid::BOOL
+                && matches!(bool.args[0].node.as_ref(), Some(Node::ColumnRef(column))
+                    if matches!(column_ref_fields(column), Fields::Names(names)
+                        if names.last().is_some_and(|column| *column == name)))
+        }
+        Node::AExpr(expr) if expr.kind() == AExprKind::AexprOp => {
+            let op = string_list(&expr.name);
+            op.len() == 1
+                && op[0] == "="
+                // The CHECK's `=` was bound under the `search_path` in effect
+                // when the constraint was created; re-resolving it under
+                // today's could find another operator than the one stored.
+                // With no user-defined `=` in the catalog there is nothing
+                // else it could have bound to.
+                && !user_defined_equality_operator_exists(catalog)
+                && ((is_named(&expr.lexpr) && fixed_literal(catalog, &expr.rexpr, ty))
+                    || (fixed_literal(catalog, &expr.lexpr, ty) && is_named(&expr.rexpr)))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the catalog holds a user-defined operator named `=` (outside
+/// `pg_catalog`, in the normal OID range). Such an operator can mean
+/// anything — `loose.=` returning true for every pair is a valid one — and a
+/// CHECK expression stores only the name it was written with, so its `=`
+/// may have been bound to one of these under the creating session's
+/// `search_path`.
+fn user_defined_equality_operator_exists(catalog: &PgCatalog) -> bool {
+    catalog.pg_operator.values().any(|operator| {
+        operator.oprname == "="
+            && operator.oid.get() >= FIRST_NORMAL_OBJECT_ID
+            && catalog.namespace_name(operator.oprnamespace) != Some("pg_catalog")
+    })
+}
+
+/// The name a column reference in a stored expression names: its last
+/// string field (`col`, `t.col`, `s.t.col`).
+fn column_name(node: &protobuf::Node) -> Option<&str> {
+    let Node::ColumnRef(column) = node.node.as_ref()? else {
+        return None;
+    };
+    let Fields::Names(names) = column_ref_fields(column) else {
+        return None;
+    };
+    names.last().copied()
+}
+
+/// Whether `node` is a non-NULL literal that fixes a column of type `ty` to
+/// one value under PG's own equality: a boolean literal, an integer literal,
+/// or a string literal for a built-in type (whose input function is PG's
+/// own and deterministic). The `=` PG resolves must be a built-in operator
+/// over `ty` — a user operator named `=` could be true for many values — and
+/// a user type's input function isn't modeled, so its literals are refused.
+fn fixed_literal(catalog: &PgCatalog, node: &Option<Box<protobuf::Node>>, ty: PgTypeOid) -> bool {
+    let Some(Node::AConst(constant)) = node.as_deref().and_then(|node| node.node.as_ref()) else {
+        return false;
+    };
+    if constant.isnull {
+        return false;
+    }
+    let literal = match constant.val.as_ref() {
+        Some(Val::Boolval(_)) if ty == oid::BOOL => oid::BOOL,
+        Some(Val::Ival(_)) if ty.get() < 10_000 => oid::INT4,
+        Some(Val::Sval(_)) if ty.get() < 10_000 => oid::UNKNOWN,
+        _ => return false,
+    };
+    catalog
+        .find_operator("=", Some(ty), literal)
+        .is_some_and(|operator| {
+            operator.oid.get() < FIRST_NORMAL_OBJECT_ID
+                && catalog
+                    .pg_operator
+                    .get(&operator.oid)
+                    .is_some_and(|declared| {
+                        declared.oprleft.is_some_and(|left| {
+                            left == ty
+                                || crate::ddl::functions::is_binary_coercible(catalog, ty, left)
+                        }) && declared.oprright.get() < 10_000
+                    })
+        })
+}
+
+/// Whether a collation compares equal strings as equal: none (the database
+/// default, which PG doesn't allow to be nondeterministic), or one
+/// `pg_collation.collisdeterministic` records as deterministic — `C`,
+/// `POSIX`, a locale or ICU collation, or a user collation copied from them.
+/// A collation the catalog doesn't know, and a nondeterministic one (ICU
+/// with a non-binary level), are refused.
+fn deterministic(catalog: &PgCatalog, collation: Option<PgCollationOid>) -> bool {
+    collation.is_none_or(|c| {
+        catalog
+            .pg_collation
+            .get(&c)
+            .is_some_and(|collation| collation.collisdeterministic)
+    })
 }
 
 /// [`deterministic`] for a type as the analysis reports it (the collation
@@ -2157,7 +2491,7 @@ fn deterministic_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
             .get(&ctx.catalog.unwrap_domain(typ))
             .and_then(|base| base.typcollation)
     });
-    deterministic(collation)
+    deterministic(ctx.catalog, collation)
 }
 
 /// The last name of a function call, with its schema when written.

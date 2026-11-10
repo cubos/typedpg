@@ -795,7 +795,7 @@ fn export_collations(client: &mut postgres::Client) -> Result<Vec<PgCollation>, 
     // with; users that build against a different libc will need to
     // regenerate.
     let rows = client.query(
-        "SELECT oid, collname, collnamespace, collencoding \
+        "SELECT oid, collname, collnamespace, collencoding, collisdeterministic \
          FROM pg_catalog.pg_collation \
          ORDER BY oid",
         &[],
@@ -810,6 +810,7 @@ fn export_collations(client: &mut postgres::Client) -> Result<Vec<PgCollation>, 
                 collname: r.get(1),
                 collnamespace: PgNamespaceOid::new(collnamespace)?,
                 collencoding: r.get(3),
+                collisdeterministic: r.get(4),
             })
         })
         .collect())

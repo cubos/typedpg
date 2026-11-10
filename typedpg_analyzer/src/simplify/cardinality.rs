@@ -137,16 +137,18 @@ pub fn redundant_distinct_spans(
 /// decides which row a key matches: [`super::dedup`] refuses a volatile one.
 /// Volatility anywhere else — the target list, `ORDER BY`, another `WHERE`
 /// conjunct, a DML's `SET` or `RETURNING` — leaves the row count alone. A
-/// locking clause is handled on its own (it needs a single relation).
+/// locking clause doesn't either: under EvalPlanQual each scan node returns
+/// at most one tuple for the re-fetched row, so a recheck of a join still
+/// yields at most one row (see `execScan.c`'s `ExecScanFetch`).
 ///
 /// Anything else is `false`: `GROUP BY` other than `()` always is (a group
 /// per key), and so is every relation the proof can't see through (a view
 /// other than the trusted `pg_catalog` system views, a subquery it can't
-/// prove one row, a function that returns a set, an inheritance parent, a
-/// partitioned table or one under row security), a set-returning call, a
-/// `FULL JOIN` (two one-row sides still produce an unmatched row from each
-/// when their keys differ), or an outer join whose nullable side isn't
-/// determined.
+/// prove one row, a function that returns a set, an inheritance parent read
+/// with its children — a plain reference, not `ONLY` — a foreign table), a
+/// set-returning call, a `FULL JOIN` (two one-row sides still produce an
+/// unmatched row from each when their keys differ), or an outer join whose
+/// nullable side isn't determined.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
     if !view.analyzed.spreads.is_empty() {
         return false;
@@ -1075,14 +1077,14 @@ pub(super) fn select_at_most_one_row_in(
         return false;
     };
     // A locking clause makes EvalPlanQual re-fetch a row's newest version
-    // and recheck the WHERE on it. Over one relation the scan still returns
-    // at most the one row whose key equals the value — and `SELECT … WHERE
-    // id = $1 FOR UPDATE` is what `fetch_one` locks rows with. With joins,
-    // the re-fetched row is re-joined, and may match several rows on the
-    // other side.
-    if !select.locking_clause.is_empty() && scope.rels.len() != 1 {
-        return false;
-    }
+    // and recheck the query on it. That can't multiply the rows: each scan
+    // node under EPQ returns at most one tuple for the re-fetched row
+    // (`ExecScanFetch` in `execScan.c` substitutes the locked tuple or
+    // returns a single `EvalPlanQualFetchRowMark` slot and then sets
+    // `relsubs_done`), so a join of them still yields at most one row per
+    // original row. Only the row equality facts limit the row count, which
+    // they do below; the nullability inference keeps its own, stricter rules
+    // for FK-referenced rows.
     all_relations_determined(ctx, select, &scope, outer)
 }
 
@@ -1365,11 +1367,13 @@ fn node_has_full_join(item: &protobuf::Node) -> bool {
 }
 
 /// The relations a relation-independent fixed point starts with: every
-/// single-row CTE reference is already known to contribute at most one row.
-fn starting_relations(scope: &Scope<'_>) -> u64 {
+/// single-row CTE reference and every singleton table (one whose unique key
+/// a validated CHECK fixes to one value, see [`dedup::singleton_table`]) is
+/// already known to contribute at most one row.
+fn starting_relations(ctx: &Ctx<'_>, scope: &Scope<'_>) -> u64 {
     let mut known = 0u64;
     for (r, rel) in scope.rels.iter().enumerate() {
-        if rel.single_row {
+        if rel.single_row || rel.oid.is_some_and(|oid| dedup::singleton_table(ctx, oid)) {
             known |= 1 << r;
         }
     }
@@ -1427,7 +1431,7 @@ fn all_relations_determined(
             (join, facts, conjuncts)
         })
         .collect();
-    let mut known = starting_relations(scope);
+    let mut known = starting_relations(ctx, scope);
     loop {
         let before = known;
         for b in 0..n {
@@ -1578,7 +1582,7 @@ fn dml_at_most_one_row(
         conjuncts: &conjuncts,
         facts: &facts,
     };
-    let mut known = starting_relations(&scope);
+    let mut known = starting_relations(ctx, &scope);
     loop {
         let before = known;
         for b in 0..n {
@@ -2677,15 +2681,43 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_key_lookup_is_one_row_but_a_locked_join_is_not() {
+    fn a_locked_join_of_determined_rows_is_one_row() {
         let db = catalog();
         assert!(statement_one(
             &db,
             "SELECT name FROM users WHERE id = $1 FOR UPDATE"
         ));
+        // EvalPlanQual rechecks a locked row through each scan node, which
+        // returns at most one tuple; the join doesn't multiply it.
+        assert!(statement_one(
+            &db,
+            "SELECT u.name FROM users u JOIN orgs o ON o.id = u.org_id \
+             WHERE u.id = $1 FOR UPDATE"
+        ));
+        assert!(statement_one(
+            &db,
+            "SELECT u.name FROM users u JOIN orgs o ON o.id = u.org_id \
+             WHERE u.id = $1 FOR UPDATE OF u"
+        ));
+        assert!(statement_one(
+            &db,
+            "SELECT u.name FROM users u JOIN orgs o ON o.id = u.org_id \
+             WHERE u.id = $1 FOR NO KEY UPDATE OF u SKIP LOCKED"
+        ));
+        assert!(statement_one(
+            &db,
+            "SELECT u.name FROM users u JOIN orgs o ON o.id = u.org_id \
+             WHERE u.id = $1 FOR SHARE OF u NOWAIT"
+        ));
+        // The joined rows still have to be determined.
         assert!(!statement_one(
             &db,
-            "SELECT u.name FROM users u JOIN orgs o ON o.id = u.org_id WHERE u.id = $1 FOR UPDATE"
+            "SELECT u.name FROM users u JOIN orgs o ON o.id = u.org_id FOR UPDATE"
+        ));
+        assert!(!statement_one(
+            &db,
+            "SELECT c.id FROM customers c JOIN orders o ON o.customer_id = c.id \
+             WHERE c.id = $1 FOR UPDATE"
         ));
     }
 
@@ -2780,9 +2812,7 @@ mod tests {
         let db = catalog();
         for sql in [
             "SELECT id FROM nondeterministic WHERE code = $1",
-            "SELECT id FROM secured WHERE id = $1",
             "SELECT id FROM parent WHERE id = $1",
-            "SELECT id FROM partitioned WHERE id = $1",
             "SELECT id FROM v WHERE id = $1",
             "SELECT s.id FROM (SELECT id FROM users) s WHERE s.id = $1",
             "WITH c AS (SELECT id FROM users) SELECT id FROM c WHERE id = $1",
@@ -3588,5 +3618,243 @@ mod tests {
         ] {
             assert!(!statement_one(&db, sql), "{sql}");
         }
+    }
+
+    #[test]
+    fn partitioned_only_and_row_security_relations_are_one_row() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE part (id int PRIMARY KEY, v int) PARTITION BY RANGE (id);
+             CREATE TABLE part_a PARTITION OF part FOR VALUES FROM (0) TO (10);
+             CREATE TABLE parent (id int PRIMARY KEY);
+             CREATE TABLE child () INHERITS (parent);
+             CREATE TABLE secured (id int PRIMARY KEY);
+             ALTER TABLE secured ENABLE ROW LEVEL SECURITY;",
+        )
+        .unwrap();
+        // A partitioned table's parent key is global: PG requires the
+        // partition key in it.
+        assert!(select_one(&db, "SELECT v FROM part WHERE id = $1"));
+        assert!(select_one(&db, "SELECT v FROM part_a WHERE id = $1"));
+        // ONLY reads the parent row alone, whose key is unique there.
+        assert!(select_one(&db, "SELECT id FROM ONLY parent WHERE id = $1"));
+        // A plain reference reads the children too, whose keys may repeat.
+        assert!(!select_one(&db, "SELECT id FROM parent WHERE id = $1"));
+        // Row security only filters rows.
+        assert!(select_one(&db, "SELECT id FROM secured WHERE id = $1"));
+        // The same trust applies to a DML target.
+        assert!(statement_one(
+            &db,
+            "UPDATE secured SET id = 2 WHERE id = 1 RETURNING id"
+        ));
+        assert!(statement_one(
+            &db,
+            "UPDATE part SET v = 1 WHERE id = $1 RETURNING id"
+        ));
+    }
+
+    #[test]
+    fn a_deterministic_custom_collation_key_is_one_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE COLLATION alias_c FROM \"C\";
+             CREATE TABLE labels (label text COLLATE alias_c PRIMARY KEY);
+             CREATE COLLATION ci_alias (
+                provider = icu, locale = 'und-u-ks-level2', deterministic = false
+             );
+             CREATE TABLE ci_labels (label text COLLATE ci_alias PRIMARY KEY);",
+        )
+        .unwrap();
+        assert!(select_one(&db, "SELECT label FROM labels WHERE label = $1"));
+        assert!(select_one(
+            &db,
+            "SELECT label FROM labels WHERE label = 'x'"
+        ));
+        // A nondeterministic collation compares unequal strings as equal.
+        assert!(!select_one(
+            &db,
+            "SELECT label FROM ci_labels WHERE label = $1"
+        ));
+    }
+
+    #[test]
+    fn boolean_partial_index_predicates_follow_value_comparisons() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE qv (
+                id bigint PRIMARY KEY, qid bigint NOT NULL, latest boolean NOT NULL
+             );
+             CREATE UNIQUE INDEX qv_latest ON qv (qid) WHERE latest;
+             CREATE TABLE qv_hidden (
+                id bigint PRIMARY KEY, qid bigint NOT NULL, hidden boolean NOT NULL
+             );
+             CREATE UNIQUE INDEX qv_hidden_key ON qv_hidden (qid) WHERE NOT hidden;",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT id FROM qv WHERE qid = $1 AND latest",
+            "SELECT id FROM qv WHERE qid = $1 AND latest = true",
+            "SELECT id FROM qv WHERE qid = $1 AND true = latest",
+            "SELECT id FROM qv WHERE qid = $1 AND latest IS TRUE",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+        for sql in [
+            "SELECT id FROM qv WHERE qid = $1",
+            "SELECT id FROM qv WHERE qid = $1 AND latest = false",
+            "SELECT id FROM qv WHERE qid = $1 AND latest IS NOT TRUE",
+            "SELECT id FROM qv WHERE qid = $1 AND latest IS FALSE",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+        for sql in [
+            "SELECT id FROM qv_hidden WHERE qid = $1 AND hidden = false",
+            "SELECT id FROM qv_hidden WHERE qid = $1 AND false = hidden",
+            "SELECT id FROM qv_hidden WHERE qid = $1 AND hidden IS FALSE",
+            "SELECT id FROM qv_hidden WHERE qid = $1 AND NOT hidden",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+        for sql in [
+            "SELECT id FROM qv_hidden WHERE qid = $1 AND hidden = true",
+            "SELECT id FROM qv_hidden WHERE qid = $1 AND hidden IS NOT FALSE",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+        // The statement proofs read the same conjuncts.
+        assert!(statement_one(
+            &db,
+            "UPDATE qv SET latest = false \
+             WHERE qid = $1 AND latest = true RETURNING id"
+        ));
+        assert!(statement_one(
+            &db,
+            "DELETE FROM qv WHERE qid = $1 AND latest IS TRUE RETURNING id"
+        ));
+        assert!(!statement_one(
+            &db,
+            "UPDATE qv SET latest = false WHERE qid = $1 RETURNING id"
+        ));
+    }
+
+    #[test]
+    fn a_singleton_table_is_one_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE single (
+                singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+                v int
+             );
+             CREATE TABLE single_int (
+                id int NOT NULL, v int, UNIQUE (id), CHECK (id = 7)
+             );
+             CREATE TABLE single_multi (
+                a int NOT NULL, b int NOT NULL, PRIMARY KEY (a, b),
+                CHECK (a = 1), CHECK (b = 2)
+             );
+             CREATE TABLE and_single (
+                id int PRIMARY KEY, flag boolean NOT NULL, CHECK (flag AND id = 3)
+             );
+             CREATE TABLE noinherit_single (
+                id int PRIMARY KEY, CONSTRAINT fixed CHECK (id = 1) NO INHERIT
+             );
+             CREATE TABLE no_check (id int PRIMARY KEY);
+             CREATE TABLE nullable_single (id int UNIQUE, v int, CHECK (id = 1));
+             CREATE TABLE other_check (
+                id int PRIMARY KEY, flag boolean NOT NULL, CHECK (flag)
+             );
+             CREATE TABLE or_single (id int PRIMARY KEY, CHECK (id = 1 OR id = 2));
+             CREATE TABLE not_valid (id int PRIMARY KEY);
+             ALTER TABLE not_valid ADD CONSTRAINT nv CHECK (id = 1) NOT VALID;
+             CREATE TABLE not_enforced (id int PRIMARY KEY);
+             ALTER TABLE not_enforced ADD CONSTRAINT ne CHECK (id = 1) NOT ENFORCED;
+             CREATE TABLE parent_single (id int PRIMARY KEY CHECK (id = 1));
+             CREATE TABLE child_single () INHERITS (parent_single);",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT v FROM single",
+            "SELECT v FROM single WHERE v > 0",
+            "SELECT v FROM single_int",
+            "SELECT a, b FROM single_multi",
+            "SELECT id FROM and_single",
+            "SELECT id FROM noinherit_single",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+        // The relation is determined with no WHERE fact, so the statement
+        // writes at most one row too.
+        assert!(statement_one(&db, "UPDATE single SET v = 1 RETURNING v"));
+        assert!(statement_one(&db, "DELETE FROM single"));
+        for sql in [
+            "SELECT id FROM no_check",
+            "SELECT v FROM nullable_single",
+            "SELECT id FROM other_check",
+            "SELECT id FROM or_single",
+            "SELECT id FROM not_valid",
+            "SELECT id FROM not_enforced",
+            "SELECT id FROM parent_single",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_singleton_check_equality_needs_no_user_defined_operator() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql("CREATE TABLE plain (id int PRIMARY KEY CHECK (id = 1));")
+            .unwrap();
+        assert!(select_one(&db, "SELECT id FROM plain"));
+        db.apply_sql(
+            "CREATE SCHEMA loose;
+             CREATE FUNCTION loose.eq(int, int) RETURNS boolean
+                LANGUAGE sql IMMUTABLE AS $$ SELECT true $$;
+             CREATE OPERATOR loose.=
+                (LEFTARG = int, RIGHTARG = int, FUNCTION = loose.eq);",
+        )
+        .unwrap();
+        // The review's repro: the CHECK's `=` was bound under a `search_path`
+        // that had `loose.=` first, and it always returns true, so the column
+        // isn't fixed at all. The stored expression only keeps the name `=`,
+        // so re-resolving it under `pg_catalog, public` would find the
+        // built-in equality and wrongly prove one row.
+        db.apply_sql(
+            "SET search_path = loose, pg_catalog, public;
+             CREATE TABLE public.singleton (id int PRIMARY KEY CHECK (id = 1));
+             SET search_path = pg_catalog, public;",
+        )
+        .unwrap();
+        assert!(!select_one(&db, "SELECT id FROM public.singleton"));
+        // A boolean CHECK involves no operator, so it stays trusted.
+        db.apply_sql(
+            "CREATE TABLE public.flagged (ok boolean PRIMARY KEY CHECK (ok));
+             CREATE TABLE public.flagged_not (ok boolean PRIMARY KEY CHECK (NOT ok));",
+        )
+        .unwrap();
+        assert!(select_one(&db, "SELECT ok FROM public.flagged"));
+        assert!(select_one(&db, "SELECT ok FROM public.flagged_not"));
+    }
+
+    #[test]
+    fn an_invalid_parent_index_does_not_prove_one_row() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE p (id int) PARTITION BY RANGE (id);
+             CREATE TABLE p0 PARTITION OF p FOR VALUES FROM (0) TO (10);
+             CREATE UNIQUE INDEX p_id ON ONLY p (id);",
+        )
+        .unwrap();
+        // The parent's `ON ONLY` index is invalid — it enforces nothing
+        // until every partition has a matching index attached — so the key
+        // lookup isn't proven.
+        assert!(!select_one(&db, "SELECT id FROM p WHERE id = 1"));
+        // Once every partition's index is attached, the parent index is
+        // valid again and proves the lookup.
+        db.apply_sql(
+            "CREATE UNIQUE INDEX p0_id ON p0 (id);
+             ALTER INDEX p_id ATTACH PARTITION p0_id;",
+        )
+        .unwrap();
+        assert!(select_one(&db, "SELECT id FROM p WHERE id = 1"));
     }
 }

@@ -435,6 +435,28 @@ fn distinct_kept_under_a_nondeterministic_collation() {
 }
 
 #[test]
+fn distinct_follows_a_deterministic_custom_collation() {
+    let db = setup_with(
+        "CREATE COLLATION alias_c FROM \"C\";
+         CREATE TABLE labels (label text COLLATE alias_c PRIMARY KEY);
+         CREATE COLLATION ci_alias (
+            provider = icu, locale = 'und-u-ks-level2', deterministic = false
+         );
+         CREATE TABLE ci_labels (label text COLLATE ci_alias PRIMARY KEY);",
+    );
+    // `pg_collation.collisdeterministic`: a user collation copied from `C`
+    // compares equal strings as equal; an ICU one at a non-binary level
+    // does not, so DISTINCT must stay there.
+    assert_rewrites(
+        &db,
+        "SELECT DISTINCT label FROM labels",
+        "SELECT label FROM labels",
+        &[Rule::Distinct],
+    );
+    assert_kept(&db, "SELECT DISTINCT label FROM ci_labels");
+}
+
+#[test]
 fn distinct_kept_when_the_index_compares_otherwise() {
     // text_pattern_ops is not text's default btree family.
     let db = setup_with(
@@ -502,7 +524,9 @@ fn distinct_kept_over_relations_it_cannot_see_through() {
     );
     // An inheritance parent reads its children, which the index doesn't cover.
     assert_kept(&db, "SELECT DISTINCT id FROM parent");
+    assert_kept(&db, "SELECT DISTINCT id FROM ONLY parent");
     assert_kept(&db, "SELECT DISTINCT id FROM part");
+    assert_kept(&db, "SELECT DISTINCT id FROM ONLY part");
     assert_kept(&db, "SELECT DISTINCT id FROM secured");
 }
 
