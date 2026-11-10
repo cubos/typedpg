@@ -1,16 +1,32 @@
-//! Read-only catalog accessors for the lint crate's migration and schema
-//! rules.
+//! Read-only catalog accessors for the lint crate's query, migration and
+//! schema rules.
 //!
 //! The rules need a few facts the catalog keeps privately: whether a column
 //! default is the `nextval()` of the column's own sequence (the serial
-//! shorthand), and the typmod a column's declared type carries through
-//! domains and arrays. Everything else they read is already public.
+//! shorthand), the typmod a column's declared type carries through domains
+//! and arrays, and whether a relation has row security or rewrite rules.
+//! Everything else they read is already public.
 
 use crate::oid::{PgClassOid, PgTypeOid};
 
 use super::PgCatalog;
 
 impl PgCatalog {
+    /// Whether row-level security is enabled on `relid`
+    /// (`pg_class.relrowsecurity`): its SELECT policies then restrict the
+    /// rows a statement sees, `RETURNING` included.
+    pub fn lint_relation_has_row_security(&self, relid: PgClassOid) -> bool {
+        self.row_security.contains(&relid)
+    }
+
+    /// Whether `relid` has a rewrite rule (`CREATE RULE`): a statement on it
+    /// may then run the rule's actions instead of, or besides, its own.
+    pub fn lint_relation_has_rules(&self, relid: PgClassOid) -> bool {
+        self.rules
+            .get(&relid)
+            .is_some_and(|rules| !rules.is_empty())
+    }
+
     /// Whether the default of column `attnum` of `relid` is `nextval()` of a
     /// sequence owned by that column, i.e. the column was written with the
     /// `serial` / `bigserial` / `smallserial` shorthand.

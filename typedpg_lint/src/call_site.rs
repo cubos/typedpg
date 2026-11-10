@@ -104,7 +104,9 @@ fn fetch_all_single_row(call: &Call) -> RawFinding {
 /// function call, a sublink, a row constructor, … — can raise an error when
 /// evaluated, so removing it could change what the statement does and it is
 /// reported without a fix. The fix is offered only when the query has exactly
-/// one call, the one `execute()`.
+/// one call, the one `execute()`, the target is an ordinary table without
+/// enabled row security or rewrite rules (see [`returning_target_is_safe`]),
+/// and no `RETURNING` expression may evaluate a virtual column.
 fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     if calls.is_empty() || calls.iter().any(|call| call.method != CallMethod::Execute) {
         return Vec::new();
@@ -131,6 +133,7 @@ fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     let fix = if calls.len() == 1
         && returning.exprs.iter().all(is_plain_returning_target)
         && !may_read_virtual_columns(ctx, statement)
+        && returning_target_is_safe(ctx, statement)
     {
         vec![SqlEdit {
             range: whitespace_start(ctx.sql, keyword)..end,
@@ -230,6 +233,80 @@ fn is_plain_returning_target(node: &typedpg_pg_query::protobuf::Node) -> bool {
         target.val.as_deref().and_then(|val| val.node.as_ref()),
         Some(Node::ColumnRef(_) | Node::AConst(_))
     )
+}
+
+/// Whether deleting `RETURNING` from the statement leaves the same rows
+/// affected and the same values evaluated.
+///
+/// Only an ordinary table without rewrite rules or enabled row security
+/// qualifies. On a view (or any other relation kind) `RETURNING` can
+/// evaluate an expression into the view's query that the write itself never
+/// runs, so removing it can drop an error. With row security enabled,
+/// PostgreSQL applies the table's SELECT policies to decide which rows the
+/// write may affect when `RETURNING` is present; without it they don't, so
+/// the rows deleted or updated can differ. A rewrite rule can likewise make
+/// the statement's effect depend on whether `RETURNING` is present.
+///
+/// The same holds for every other relation the statement reads: a
+/// `DELETE … USING v` or `UPDATE … FROM v` only needs the join to run the
+/// write, and a `RETURNING v.bad` may then evaluate a view expression the
+/// write alone never evaluates. A CTE can stand in for any of those
+/// relations. So the fix also requires every `FROM` / `USING` item (and a
+/// join inside one) to be an ordinary table without row security or
+/// rewrite rules, and no `WITH` clause at all.
+fn returning_target_is_safe(ctx: &Ctx<'_>, statement: &Node) -> bool {
+    let (relation, with, items): (_, _, &[typedpg_pg_query::protobuf::Node]) = match statement {
+        Node::InsertStmt(stmt) => (stmt.relation.as_ref(), stmt.with_clause.as_ref(), &[][..]),
+        Node::UpdateStmt(stmt) => (
+            stmt.relation.as_ref(),
+            stmt.with_clause.as_ref(),
+            &stmt.from_clause,
+        ),
+        Node::DeleteStmt(stmt) => (
+            stmt.relation.as_ref(),
+            stmt.with_clause.as_ref(),
+            &stmt.using_clause,
+        ),
+        _ => return false,
+    };
+    if with.is_some() {
+        return false;
+    }
+    let Some(relation) = relation else {
+        return false;
+    };
+    relation_is_safe(ctx, relation) && items.iter().all(|item| from_item_is_safe(ctx, item))
+}
+
+/// Whether `relation` is an ordinary table without row security or rewrite
+/// rules, so reading or writing it cannot make `RETURNING` part of the
+/// statement's effect.
+fn relation_is_safe(ctx: &Ctx<'_>, relation: &typedpg_pg_query::protobuf::RangeVar) -> bool {
+    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+    let Some(class) = ctx.catalog.resolve_table(schema, &relation.relname) else {
+        return false;
+    };
+    class.relkind == typedpg_analyzer::RelKind::Table
+        && !ctx.catalog.lint_relation_has_row_security(class.oid)
+        && !ctx.catalog.lint_relation_has_rules(class.oid)
+}
+
+/// Whether a `FROM` / `USING` item is an ordinary table (or a join of them)
+/// without row security or rewrite rules.
+fn from_item_is_safe(ctx: &Ctx<'_>, item: &typedpg_pg_query::protobuf::Node) -> bool {
+    match item.node.as_ref() {
+        Some(Node::RangeVar(relation)) => relation_is_safe(ctx, relation),
+        Some(Node::JoinExpr(join)) => {
+            join.larg
+                .as_deref()
+                .is_some_and(|left| from_item_is_safe(ctx, left))
+                && join
+                    .rarg
+                    .as_deref()
+                    .is_some_and(|right| from_item_is_safe(ctx, right))
+        }
+        _ => false,
+    }
 }
 
 /// Whether the statement's `RETURNING` may read a virtual generated column:
@@ -501,6 +578,110 @@ mod tests {
         assert_eq!(
             fixed(sql, finding),
             "INSERT INTO users (id, name) VALUES (1, 'x')"
+        );
+    }
+
+    #[test]
+    fn a_row_security_target_keeps_the_finding_without_the_fix() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE secured (id integer PRIMARY KEY);
+             ALTER TABLE secured ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY readable ON secured FOR SELECT USING (id = 1);
+             CREATE POLICY deletable ON secured FOR DELETE USING (true);",
+        )
+        .unwrap();
+        let sql = "DELETE FROM secured WHERE true RETURNING id";
+        let findings = only(
+            lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+            Rule::UnusedReturning,
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].finding.fix.is_empty(),
+            "row security makes RETURNING decide which rows the DELETE sees: {:?}",
+            findings[0].finding.fix
+        );
+    }
+
+    #[test]
+    fn a_view_target_keeps_the_finding_without_the_fix() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE backing (id integer NOT NULL);
+             CREATE VIEW writable AS SELECT id, 1 / (id - 1) AS bad FROM backing;",
+        )
+        .unwrap();
+        let sql = "INSERT INTO writable (id) VALUES ($1) RETURNING bad";
+        let findings = only(
+            lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+            Rule::UnusedReturning,
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].finding.fix.is_empty(),
+            "RETURNING evaluates the view expression the INSERT alone does not: {:?}",
+            findings[0].finding.fix
+        );
+    }
+
+    #[test]
+    fn a_view_in_using_or_from_keeps_the_finding_without_the_fix() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE t (id integer NOT NULL);
+             CREATE VIEW v AS SELECT id, 1 / (id - 1) AS bad FROM t;",
+        )
+        .unwrap();
+        for sql in [
+            // The DELETE only joins `v` for the row identity; `v.bad` is
+            // evaluated by RETURNING alone, so deleting RETURNING would
+            // stop raising the division by zero.
+            "DELETE FROM t USING v WHERE t.id = v.id RETURNING v.bad",
+            "UPDATE users SET name = 'x' FROM v WHERE users.id = v.id RETURNING v.bad",
+            // A CTE can stand in for the view the same way.
+            "WITH c AS (SELECT id, 1 / (id - 1) AS bad FROM t) \
+             DELETE FROM t USING c WHERE t.id = c.id RETURNING c.bad",
+        ] {
+            let findings = only(
+                lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+                Rule::UnusedReturning,
+            );
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(
+                findings[0].finding.fix.is_empty(),
+                "{sql}: RETURNING evaluates an expression the write alone does not: {:?}",
+                findings[0].finding.fix
+            );
+        }
+        // An ordinary table in USING keeps the fix: the join runs either way.
+        let sql = "DELETE FROM t USING users WHERE t.id = users.id RETURNING t.id";
+        let findings = only(
+            lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+            Rule::UnusedReturning,
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(!findings[0].finding.fix.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_table_with_a_rewrite_rule_keeps_the_finding_without_the_fix() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE ruled (id integer PRIMARY KEY);
+             CREATE RULE ruled_noop AS ON UPDATE TO ruled DO INSTEAD NOTHING;",
+        )
+        .unwrap();
+        let sql = "DELETE FROM ruled WHERE true RETURNING id";
+        let findings = only(
+            lint(&db, sql, &[rust(CallMethod::Execute, "execute")]),
+            Rule::UnusedReturning,
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].finding.fix.is_empty(),
+            "a rewrite rule can make RETURNING part of the statement's effect: {:?}",
+            findings[0].finding.fix
         );
     }
 
