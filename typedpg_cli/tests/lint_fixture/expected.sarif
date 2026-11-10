@@ -7,7 +7,7 @@
         "driver": {
           "name": "typedpg",
           "informationUri": "https://github.com/cubos/typedpg",
-          "version": "0.6.0",
+          "version": "0.7.0",
           "rules": [
             {
               "id": "null_comparison",

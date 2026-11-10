@@ -20,10 +20,10 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-typedpg = { path = "../typedpg", version = "0.6.0" }
-typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.6.0" }
-typedpg_core = { path = "../typedpg_core", version = "0.6.0" }
-typedpg_lint = { path = "../typedpg_lint", version = "0.6.0" }
+typedpg = { path = "../typedpg", version = "0.7.0" }
+typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.7.0" }
+typedpg_core = { path = "../typedpg_core", version = "0.7.0" }
+typedpg_lint = { path = "../typedpg_lint", version = "0.7.0" }
 syn = { version = "3", features = ["full", "visit", "parsing"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 tokio = { version = "1", features = ["full"] }
