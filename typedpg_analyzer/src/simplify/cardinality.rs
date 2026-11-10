@@ -17,7 +17,7 @@ use typedpg_pg_query::protobuf::{
 use super::Ctx;
 use super::dedup::{self, CteColumn, CteEnv, CteInfo, Fields, PredicateSources, Scope};
 use super::proof::{self, FromScope};
-use crate::pg_catalog::{PgCatalog, ProKind, QueryView, oid};
+use crate::pg_catalog::{PgCatalog, ProKind, QueryView, RelKind, oid};
 
 impl QueryView {
     /// Whether evaluating `select` — a node of this view at any nesting
@@ -212,11 +212,13 @@ pub(super) fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> boo
 /// A `SELECT` is at most one row when [`select_at_most_one_row`] proves it
 /// or its `LIMIT` / `FETCH FIRST` is the constant `0` or `1` (without
 /// `WITH TIES`). An `INSERT ... VALUES` with exactly one row is, whatever
-/// its `ON CONFLICT`; an `INSERT ... SELECT` is when its select is. An
-/// `UPDATE` / `DELETE` is when its target relation is determined by its
-/// `WHERE` equalities (a target row is written once however many `FROM` /
-/// `USING` rows match it). Everything else — `MERGE`, `INSERT ... DEFAULT
-/// VALUES`, a statement the proof can't see through — is `false`.
+/// its `ON CONFLICT`; `INSERT ... DEFAULT VALUES` is. An `INSERT ... SELECT`
+/// is when its select is. An `UPDATE` / `DELETE` is when its target relation
+/// is determined by its `WHERE` equalities (a target row is written once
+/// however many `FROM` / `USING` rows match it). Every
+/// data-modifying statement also needs a target relation no rewrite rule can
+/// replace (see [`dml_target_without_rules`]). Everything else — `MERGE`, a
+/// statement the proof can't see through — is `false`.
 ///
 /// The statement's own `WITH` clause provides its single-row CTEs, judged in
 /// declaration order (see [`select_at_most_one_row`]).
@@ -1369,15 +1371,46 @@ fn all_relations_determined(
 
 // ── Statements ──────────────────────────────────────────────────────────────
 
-/// `INSERT ... VALUES` with one row, or `INSERT ... SELECT` whose select is
-/// at most one row.
+/// Whether a statement may write `relation` without a rewrite rule changing
+/// what it returns: an ordinary (or partitioned) table with no rewrite rules.
+///
+/// A view is refused even when PostgreSQL would make it auto-updatable: DML
+/// on it runs its `_RETURN` rule's query and the base table's own rules, and
+/// an `INSTEAD OF` trigger decides how many rows the statement's `RETURNING`
+/// clause yields. A table's `INSTEAD` rule likewise replaces the statement
+/// (and its `RETURNING` list) with whatever its actions return, so no rule
+/// at all is allowed. `DO ALSO` rules and triggers can add effects, but a
+/// plain table without rewrite rules writes one row per source row.
+fn dml_target_without_rules(ctx: &Ctx<'_>, relation: &protobuf::RangeVar) -> bool {
+    if !relation.catalogname.is_empty() {
+        return false;
+    }
+    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+    let Some(class) = ctx.catalog.resolve_table(schema, &relation.relname) else {
+        return false;
+    };
+    matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
+        && !ctx.catalog.lint_relation_has_rules(class.oid)
+}
+
+/// `INSERT ... VALUES` with one row, `INSERT ... SELECT` whose select is at
+/// most one row, or `INSERT ... DEFAULT VALUES` (exactly one row). Every
+/// case also needs a target relation no rewrite rule can replace (see
+/// [`dml_target_without_rules`]).
 fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> bool {
+    let Some(relation) = insert.relation.as_ref() else {
+        return false;
+    };
+    if !dml_target_without_rules(ctx, relation) {
+        return false;
+    }
     let Some(node) = insert
         .select_stmt
         .as_deref()
         .and_then(|node| node.node.as_ref())
     else {
-        return false;
+        // `INSERT ... DEFAULT VALUES` writes exactly one row.
+        return true;
     };
     let NodeRef::SelectStmt(select) = node.to_ref() else {
         return false;
@@ -1402,6 +1435,9 @@ fn dml_at_most_one_row(
     let Some(relation) = relation else {
         return false;
     };
+    if !dml_target_without_rules(ctx, relation) {
+        return false;
+    }
     let Some(scope) = Scope::dml(ctx, env, relation, from) else {
         return false;
     };
@@ -2437,7 +2473,8 @@ mod tests {
             &db,
             "INSERT INTO orgs (id, name) SELECT id, name FROM orgs"
         ));
-        assert!(!statement_one(&db, "INSERT INTO defaults DEFAULT VALUES"));
+        // `DEFAULT VALUES` writes exactly one row.
+        assert!(statement_one(&db, "INSERT INTO defaults DEFAULT VALUES"));
     }
 
     #[test]
@@ -3058,5 +3095,137 @@ mod tests {
         assert!(
             redundant_distinct_spans(&db, &view(&db, "SELECT DISTINCT name FROM users")).is_empty()
         );
+    }
+
+    #[test]
+    fn a_data_modifying_statement_on_a_rewritten_relation_is_not_one_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE destination (id integer);
+             CREATE VIEW incoming AS SELECT id FROM destination;
+             CREATE RULE incoming_insert AS ON INSERT TO incoming
+                DO INSTEAD INSERT INTO destination
+                    SELECT n FROM generate_series(1, 2) AS g(n) RETURNING id;
+             CREATE TABLE ruled (id integer PRIMARY KEY);
+             CREATE RULE ruled_noop AS ON UPDATE TO ruled DO INSTEAD NOTHING;
+             CREATE TABLE ruled_parent (id integer PRIMARY KEY);
+             CREATE RULE ruled_parent_noop AS ON DELETE TO ruled_parent DO INSTEAD NOTHING;
+             CREATE VIEW auto_updatable AS SELECT id FROM ruled_parent;",
+        )
+        .unwrap();
+        // The issue's repro: the view's INSTEAD rule inserts two rows.
+        assert!(!statement_one(
+            &db,
+            "INSERT INTO incoming VALUES (99) RETURNING id"
+        ));
+        // An auto-updatable view over a table with a rule is refused too.
+        assert!(!statement_one(
+            &db,
+            "DELETE FROM auto_updatable WHERE id = 1"
+        ));
+        // A table with a rule of its own: its `RETURNING` is the rule's.
+        assert!(!statement_one(&db, "UPDATE ruled SET id = 2 WHERE id = 1"));
+        assert!(!statement_one(&db, "DELETE FROM ruled_parent WHERE id = 1"));
+        // Without rules the same statements stay proven.
+        assert!(statement_one(
+            &db,
+            "INSERT INTO destination VALUES (99) RETURNING id"
+        ));
+    }
+
+    #[test]
+    fn insert_default_values_is_one_row() {
+        let db = catalog();
+        assert!(statement_one(
+            &db,
+            "INSERT INTO defaults DEFAULT VALUES RETURNING id"
+        ));
+        assert!(statement_one(
+            &db,
+            "INSERT INTO defaults DEFAULT VALUES ON CONFLICT DO NOTHING RETURNING id"
+        ));
+    }
+
+    #[test]
+    fn do_nothing_never_proves_a_multirow_values_insert() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE dup_keys (id integer PRIMARY KEY, v text);
+             CREATE TABLE dup_nulls (k integer UNIQUE, v text);
+             CREATE TABLE dup_deferred (k integer UNIQUE DEFERRABLE, v text);
+             CREATE TABLE dup_partial (k integer, v text);
+             CREATE UNIQUE INDEX ON dup_partial (k) WHERE v IS NOT NULL;
+             CREATE TABLE dup_trigger (k integer PRIMARY KEY);
+             CREATE TABLE dup_infer (id integer PRIMARY KEY, v text UNIQUE);
+             CREATE TABLE dup_identity (
+                id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text
+             );
+             CREATE TABLE dup_cast (k text PRIMARY KEY, v text);
+             CREATE TABLE dup_volatile (id integer PRIMARY KEY, v text);
+             CREATE FUNCTION dup_bump() RETURNS trigger LANGUAGE plpgsql
+                AS $$ BEGIN NEW.k := NEW.k + 1; RETURN NEW; END $$;
+             CREATE TRIGGER dup_before BEFORE INSERT ON dup_trigger
+                FOR EACH ROW EXECUTE FUNCTION dup_bump();
+             CREATE FUNCTION dup_cast_fn(integer) RETURNS text LANGUAGE sql VOLATILE
+                AS $$ SELECT $1::text || random()::text $$;
+             CREATE CAST (integer AS text)
+                WITH FUNCTION dup_cast_fn(integer) AS ASSIGNMENT;
+             CREATE FUNCTION dup_wipe() RETURNS text LANGUAGE plpgsql VOLATILE
+                AS $$ BEGIN DELETE FROM dup_volatile; RETURN 'x'; END $$;",
+        )
+        .unwrap();
+        // A duplicate key may make `DO NOTHING` skip the later row, but the
+        // statement still writes one row per `VALUES` row: an identity the
+        // `OVERRIDING USER VALUE` clause replaces, an assignment cast's
+        // function may map equal literals to different keys, a volatile
+        // non-key expression may delete the earlier row before the later
+        // row's uniqueness check (its `RETURNING` row is already counted),
+        // and any other key shape may simply not conflict. None of these is
+        // proven one row.
+        for sql in [
+            // Every row gives the primary key the same literal.
+            "INSERT INTO dup_keys (id, v) VALUES (1, 'a'), (1, 'b') \
+             ON CONFLICT DO NOTHING RETURNING id",
+            "INSERT INTO dup_keys (id, v) VALUES (1, 'a'), (1, 'b') \
+             ON CONFLICT (id) DO NOTHING RETURNING id",
+            // Different keys: both rows insert.
+            "INSERT INTO dup_keys (id, v) VALUES (1, 'a'), (2, 'b') \
+             ON CONFLICT DO NOTHING RETURNING id",
+            // Only the non-key column is equal.
+            "INSERT INTO dup_keys (id, v) VALUES (1, 'a'), (2, 'a') \
+             ON CONFLICT DO NOTHING RETURNING id",
+            // `DO UPDATE` returns the rows that conflicted too.
+            "INSERT INTO dup_keys (id, v) VALUES (1, 'a'), (1, 'b') \
+             ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING id",
+            // NULLs never conflict under a unique index.
+            "INSERT INTO dup_nulls (k, v) VALUES (NULL, 'a'), (NULL, 'b') \
+             ON CONFLICT DO NOTHING RETURNING k",
+            // A deferrable key is checked at commit, not by `DO NOTHING`.
+            "INSERT INTO dup_deferred (k, v) VALUES (1, 'a'), (1, 'b') \
+             ON CONFLICT DO NOTHING RETURNING k",
+            // A partial index does not cover both rows.
+            "INSERT INTO dup_partial (k, v) VALUES (1, 'a'), (1, 'b') \
+             ON CONFLICT DO NOTHING RETURNING k",
+            // A BEFORE INSERT trigger may rewrite the key.
+            "INSERT INTO dup_trigger (k) VALUES (1), (1) \
+             ON CONFLICT DO NOTHING RETURNING k",
+            // A parameter is not a literal the parser fixes once.
+            "INSERT INTO dup_keys (id, v) VALUES ($1, 'a'), ($1, 'b') \
+             ON CONFLICT DO NOTHING RETURNING id",
+            // The infer list must name the key's columns.
+            "INSERT INTO dup_infer (id, v) VALUES (1, 'a'), (1, 'b') \
+             ON CONFLICT (v) DO NOTHING RETURNING id",
+            // The identity generates a different key for the second row.
+            "INSERT INTO dup_identity (id, v) OVERRIDING USER VALUE \
+             VALUES (1, 'a'), (1, 'b') ON CONFLICT DO NOTHING RETURNING id",
+            // The assignment cast can turn both literals into different keys.
+            "INSERT INTO dup_cast (k, v) VALUES (1, 'a'), (1, 'b') \
+             ON CONFLICT DO NOTHING RETURNING k",
+            // A volatile non-key call removes the earlier row first.
+            "INSERT INTO dup_volatile (id, v) VALUES (1, 'a'), (1, dup_wipe()) \
+             ON CONFLICT DO NOTHING RETURNING id",
+        ] {
+            assert!(!statement_one(&db, sql), "{sql}");
+        }
     }
 }

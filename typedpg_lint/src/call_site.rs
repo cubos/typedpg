@@ -1000,4 +1000,43 @@ mod tests {
             .is_empty()
         );
     }
+
+    #[test]
+    fn fetch_one_on_a_rewritten_insert_target_may_return_many() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE destination (id integer);
+             CREATE VIEW incoming AS SELECT id FROM destination;
+             CREATE RULE incoming_insert AS ON INSERT TO incoming
+                DO INSTEAD INSERT INTO destination
+                    SELECT n FROM generate_series(1, 2) AS g(n) RETURNING id;",
+        )
+        .unwrap();
+        // The view's rule returns two rows for one INSERT.
+        let sql = "INSERT INTO incoming VALUES (99) RETURNING id";
+        assert_eq!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .len(),
+            1
+        );
+        // `DEFAULT VALUES` is one row.
+        db.apply_sql(
+            "CREATE TABLE generated_ids (
+                id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+             );",
+        )
+        .unwrap();
+        let sql = "INSERT INTO generated_ids DEFAULT VALUES RETURNING id";
+        assert_eq!(
+            only(
+                lint(&db, sql, &[ts(CallMethod::FetchAll, "fetchAll")]),
+                Rule::FetchAllSingleRow
+            )
+            .len(),
+            1
+        );
+    }
 }
