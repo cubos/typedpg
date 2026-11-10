@@ -74,7 +74,7 @@
       "endColumn": 82,
       "rule": "not_in_nullable",
       "severity": "warning",
-      "message": "NOT IN (SELECT …) returns no rows when either side is NULL",
+      "message": "NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL",
       "help": "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL"
     },
     {

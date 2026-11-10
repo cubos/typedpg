@@ -2,6 +2,7 @@
 //! a subquery, a CTE (data-modifying ones included), a CASE or a JOIN's ON
 //! is visited like any other.
 
+use typedpg_analyzer::{CastMethod, PgTypeOid, TypType};
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
@@ -81,8 +82,14 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
             if !COMPARISONS.contains(&operator) || ctx.non_strict_operators.contains(operator) {
                 return;
             }
-            let left_null = expr.lexpr.as_deref().is_some_and(is_null_literal);
-            let right_null = expr.rexpr.as_deref().is_some_and(is_null_literal);
+            let left_null = expr
+                .lexpr
+                .as_deref()
+                .is_some_and(|node| is_null_literal(ctx, node));
+            let right_null = expr
+                .rexpr
+                .as_deref()
+                .is_some_and(|node| is_null_literal(ctx, node));
             if !left_null && !right_null {
                 return;
             }
@@ -120,7 +127,7 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
             let Some(N::List(list)) = &right.node else {
                 return;
             };
-            if !list.items.iter().any(is_null_literal) {
+            if !list.items.iter().any(|node| is_null_literal(ctx, node)) {
                 return;
             }
             let start = expr
@@ -149,7 +156,7 @@ fn case_when(ctx: &Ctx<'_>, when: &CaseWhen, out: &mut Vec<RawFinding>) {
     let Some(expr) = when.expr.as_deref() else {
         return;
     };
-    if !is_null_literal(expr) || ctx.non_strict_operators.contains("=") {
+    if !is_null_literal(ctx, expr) || ctx.non_strict_operators.contains("=") {
         return;
     }
     let expr_start = operand_start(expr).unwrap_or(0);
@@ -178,12 +185,94 @@ pub(super) fn operator_name(expr: &AExpr) -> Option<&str> {
     })
 }
 
-pub(super) fn is_null_literal(node: &Node) -> bool {
+/// Whether `node` is a NULL literal under casts that keep it NULL.
+///
+/// A cast can turn NULL into a value: a cast function `CALLED ON NULL INPUT`
+/// (`proisstrict = false`) may return anything. Only a binary / I/O cast, a
+/// strict cast function, or a cast the parser resolves without a function
+/// (the `unknown` NULL literal itself, or a built-in I/O conversion) is
+/// known to leave NULL NULL; anything whose path cannot be resolved is not
+/// treated as a NULL literal.
+pub(super) fn is_null_literal(ctx: &Ctx<'_>, node: &Node) -> bool {
     match &node.node {
         Some(N::AConst(value)) => value.isnull,
-        Some(N::TypeCast(cast)) => cast.arg.as_deref().is_some_and(is_null_literal),
+        Some(N::TypeCast(cast)) => {
+            let Some(arg) = cast.arg.as_deref() else {
+                return false;
+            };
+            if !is_null_literal(ctx, arg) {
+                return false;
+            }
+            let Some(target) = cast
+                .type_name
+                .as_ref()
+                .and_then(|name| ctx.catalog.lint_resolve_type_name(name))
+            else {
+                return false;
+            };
+            let source = match arg.node.as_ref() {
+                // A bare NULL literal is `unknown`: the parser makes a NULL
+                // constant of the target type directly, with no function.
+                Some(N::AConst(_)) => None,
+                Some(N::TypeCast(inner)) => inner
+                    .type_name
+                    .as_ref()
+                    .and_then(|name| ctx.catalog.lint_resolve_type_name(name)),
+                _ => return false,
+            };
+            cast_preserves_null(ctx, source, target)
+        }
         _ => false,
     }
+}
+
+/// Whether casting a NULL of type `source` (unknown for a bare NULL literal)
+/// to `target` yields NULL.
+fn cast_preserves_null(ctx: &Ctx<'_>, source: Option<PgTypeOid>, target: PgTypeOid) -> bool {
+    let catalog = ctx.catalog;
+    let Some(target_type) = catalog.type_row(target) else {
+        return false;
+    };
+    // A domain's NOT NULL / CHECK constraints run on the cast's result and
+    // can reject a NULL; the catalog does not expose every check here, so
+    // never treat a domain cast as a plain NULL literal.
+    if target_type.typtype == TypType::Domain {
+        return false;
+    }
+    let Some(source) = source else {
+        // `NULL` written as a literal is `unknown`: the parser makes it a
+        // NULL constant of the target type, without calling a function.
+        return true;
+    };
+    if source == target {
+        return true;
+    }
+    if let Some(cast) = catalog
+        .iter_casts()
+        .find(|cast| cast.castsource == source && cast.casttarget == target)
+    {
+        return match cast.castmethod {
+            CastMethod::Binary | CastMethod::InOut => true,
+            CastMethod::Function => cast.castfunc.is_some_and(|function| {
+                catalog
+                    .pg_proc()
+                    .get(&function)
+                    .is_some_and(|proc| proc.proisstrict)
+            }),
+        };
+    }
+    // No pg_cast row: PostgreSQL may still resolve the cast through the
+    // types' I/O functions, which keep NULL. Trust that only between
+    // built-in types, where no user-defined input/output function is
+    // involved.
+    is_builtin_type(ctx, source) && is_builtin_type(ctx, target)
+}
+
+fn is_builtin_type(ctx: &Ctx<'_>, oid: PgTypeOid) -> bool {
+    ctx.catalog
+        .type_row(oid)
+        .and_then(|ty| ctx.catalog.namespace_name(ty.typnamespace))
+        == Some("pg_catalog")
 }
 
 /// The start of the token sequence of `node`, descending through casts so
@@ -328,6 +417,18 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
     if SubLinkType::try_from(sub.sub_link_type) != Ok(SubLinkType::AnySublink) {
         return;
     }
+    // A row-valued `(a, b) NOT IN (SELECT …)` compares field by field, and
+    // one NULL output column only makes the fields it is compared with
+    // unknown: `(1, 2) NOT IN (SELECT 2, NULL)` still returns the row
+    // because its first fields differ. The scalar null rule does not apply.
+    if sub
+        .testexpr
+        .as_deref()
+        .and_then(|node| node.node.as_ref())
+        .is_some_and(|node| matches!(node, N::RowExpr(_)))
+    {
+        return;
+    }
     let operator = sub
         .oper_name
         .iter()
@@ -345,10 +446,18 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
     let Some(fact) = ctx.view.sublink_nullability(sub.location) else {
         return;
     };
-    let side = match (fact.lhs_nullable, fact.subquery_nullable) {
-        (true, true) => "either side is NULL",
-        (true, false) => "the left side is NULL",
-        (false, true) => "the subquery returns a NULL",
+    let message = match (fact.lhs_nullable, fact.subquery_nullable) {
+        // A NULL left side against an empty subquery returns the row: the
+        // "no rows" claim only holds once the subquery returns one.
+        (true, true) => {
+            "NOT IN (SELECT …) returns no rows for a NULL left side when the \
+                        subquery returns any row, or when the subquery returns a NULL"
+        }
+        (true, false) => {
+            "NOT IN (SELECT …) returns no rows for a NULL left side when the \
+                          subquery returns any row"
+        }
+        (false, true) => "NOT IN (SELECT …) returns no rows when the subquery returns a NULL",
         (false, false) => return,
     };
     let start = sub
@@ -370,7 +479,7 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
         .unwrap_or_else(|| expression_end(ctx, start));
     out.push(RawFinding {
         span: start..end.max(start + 1),
-        message: format!("NOT IN (SELECT …) returns no rows when {side}"),
+        message: message.to_owned(),
         help: Some(
             "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL".to_owned(),
         ),

@@ -70,7 +70,7 @@ error[null_comparison]: comparison with NULL is never true
     ╰────
    help: use IS NULL / IS NOT NULL
 
-warning[not_in_nullable]: NOT IN (SELECT …) returns no rows when either side is NULL
+warning[not_in_nullable]: NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL
     ╭─[src/main.rs:12:44]
  12 │     sql!(pool, "SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)")
     ·                                            ──────────────────────────────────────

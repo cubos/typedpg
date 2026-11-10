@@ -1221,6 +1221,54 @@ mod tests {
     }
 
     #[test]
+    fn null_comparison_only_strips_casts_that_keep_null() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE users (id integer PRIMARY KEY);
+             CREATE TYPE marker AS (v integer);
+             CREATE FUNCTION marker_int(marker) RETURNS integer
+                 LANGUAGE sql AS 'SELECT 1';
+             CREATE CAST (marker AS integer) WITH FUNCTION marker_int(marker) AS ASSIGNMENT;
+             CREATE TYPE strict_marker AS (v integer);
+             CREATE FUNCTION strict_marker_int(strict_marker) RETURNS integer
+                 LANGUAGE sql STRICT AS 'SELECT 1';
+             CREATE CAST (strict_marker AS integer) WITH FUNCTION strict_marker_int(strict_marker)
+                 AS ASSIGNMENT;",
+        )
+        .unwrap();
+        // `marker_int` is CALLED ON NULL INPUT: NULL::marker becomes 1, so
+        // `id = NULL::marker::integer` is `id = 1` and does return rows.
+        for sql in [
+            "SELECT id FROM users WHERE id = NULL::marker::integer",
+            "SELECT id FROM users WHERE NULL::marker::integer < id",
+            "SELECT CASE id WHEN NULL::marker::integer THEN 1 ELSE 0 END FROM users",
+        ] {
+            let findings = lint(&db, sql);
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.rule != Rule::NullComparison),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A strict cast function maps NULL to NULL: the comparison is still
+        // a comparison with NULL.
+        for sql in [
+            "SELECT id FROM users WHERE id = NULL::strict_marker::integer",
+            "SELECT id FROM users WHERE id NOT IN (NULL::strict_marker::integer, 2)",
+            "SELECT CASE id WHEN NULL::strict_marker::integer THEN 1 ELSE 0 END FROM users",
+        ] {
+            let findings = lint(&db, sql);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule == Rule::NullComparison),
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn non_strict_user_operator_is_not_flagged() {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(
@@ -1533,25 +1581,24 @@ mod tests {
         let cases = [
             (
                 "SELECT id FROM users WHERE email NOT IN (SELECT id::text FROM users)",
-                "the left side is NULL",
+                "NOT IN (SELECT …) returns no rows for a NULL left side when the subquery \
+                 returns any row",
             ),
             (
                 "SELECT id FROM users WHERE id NOT IN (SELECT author_id FROM posts)",
-                "the subquery returns a NULL",
+                "NOT IN (SELECT …) returns no rows when the subquery returns a NULL",
             ),
             (
                 "SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)",
-                "either side is NULL",
+                "NOT IN (SELECT …) returns no rows for a NULL left side when the subquery \
+                 returns any row, or when the subquery returns a NULL",
             ),
         ];
-        for (sql, side) in cases {
+        for (sql, message) in cases {
             let findings = not_in_findings(&db, sql);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
             assert_eq!(findings[0].severity, Severity::Warning);
-            assert_eq!(
-                findings[0].message,
-                format!("NOT IN (SELECT …) returns no rows when {side}")
-            );
+            assert_eq!(findings[0].message, message);
             assert_eq!(
                 findings[0].help.as_deref(),
                 Some("use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL")
@@ -1580,14 +1627,21 @@ mod tests {
         let sql = "SELECT id FROM users WHERE email NOT IN (SELECT 'x')";
         assert_eq!(
             not_in_findings(&db, sql)[0].message,
-            "NOT IN (SELECT …) returns no rows when the left side is NULL"
+            "NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns \
+             any row"
         );
         // A NOT NULL column on each side is enough for the row form.
         let sql =
             "SELECT id FROM users WHERE (id, id::text) NOT IN (SELECT id, id::text FROM users)";
         assert!(not_in_findings(&db, sql).is_empty(), "{sql}");
-        let sql = "SELECT id FROM users WHERE (id, email) NOT IN (SELECT id, title FROM posts)";
-        assert_eq!(not_in_findings(&db, sql).len(), 1, "{sql}");
+        // Row-valued NOT IN compares field by field: a NULL in one output
+        // column does not suppress a row whose other fields differ.
+        for sql in [
+            "SELECT id FROM users WHERE (id, email) NOT IN (SELECT id, title FROM posts)",
+            "SELECT id FROM users WHERE (id, email) NOT IN (SELECT 2, NULL::text)",
+        ] {
+            assert!(not_in_findings(&db, sql).is_empty(), "{sql}");
+        }
     }
 
     #[test]

@@ -27,6 +27,15 @@ impl PgCatalog {
             .is_some_and(|rules| !rules.is_empty())
     }
 
+    /// Resolve a `TypeName` AST node to a type OID, the way the analyzer
+    /// resolves casts and column definitions.
+    pub fn lint_resolve_type_name(
+        &self,
+        type_name: &typedpg_pg_query::protobuf::TypeName,
+    ) -> Option<PgTypeOid> {
+        crate::ddl::util::resolve_type_name(type_name, self)
+    }
+
     /// Whether the default of column `attnum` of `relid` is `nextval()` of a
     /// sequence owned by that column, i.e. the column was written with the
     /// `serial` / `bigserial` / `smallserial` shorthand.

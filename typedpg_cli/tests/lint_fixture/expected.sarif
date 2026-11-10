@@ -413,7 +413,7 @@
           "ruleId": "not_in_nullable",
           "level": "warning",
           "message": {
-            "text": "NOT IN (SELECT …) returns no rows when either side is NULL\nuse NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL"
+            "text": "NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL\nuse NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL"
           },
           "locations": [
             {
