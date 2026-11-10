@@ -963,11 +963,7 @@ impl MigrationLinter<'_> {
             let key_count = key.len();
             let indexed = catalog
                 .iter_indexes()
-                .filter(|index| {
-                    index.indrelid == constraint.conrelid
-                        && index.indexprs.is_empty()
-                        && index.indkey.iter().all(|&key| key != 0)
-                })
+                .filter(|index| index.indrelid == constraint.conrelid)
                 // The check looks rows up by equality: a btree serves any
                 // key, a hash index a single column.
                 .filter(
@@ -978,7 +974,16 @@ impl MigrationLinter<'_> {
                     },
                 )
                 .any(|index| {
-                    if index.indkey.len() < key_count {
+                    let key_attributes = usize::try_from(index.indnkeyatts).unwrap_or(0);
+                    if key_attributes < key_count || index.indkey.len() < key_count {
+                        return false;
+                    }
+                    // Only the leading key positions must be plain columns:
+                    // an expression later in the key (or in an INCLUDE
+                    // column) runs after the equality lookup has found the
+                    // rows, so it does not stop the index from serving the
+                    // foreign-key check.
+                    if index.indkey[..key_count].contains(&0) {
                         return false;
                     }
                     let leading: HashSet<i16> =
@@ -1262,16 +1267,22 @@ impl MigrationLinter<'_> {
             };
             if let Some((other, exact)) = redundant_with(catalog, &self.orderings, &indexes, index)
             {
-                // Two exact duplicates: only the one created later is
-                // redundant with the one already there.
+                // A constraint's index cannot be dropped with DROP INDEX,
+                // and ON CONFLICT ON CONSTRAINT depends on it: never report
+                // it as the redundant one. When it duplicates a standalone
+                // index, that standalone index is the one to drop (and its
+                // own turn below reports it).
+                if catalog.index_backs_constraint(index.indexrelid) {
+                    continue;
+                }
+                // Two standalone exact duplicates: only the one created
+                // later is redundant with the one already there.
                 if exact
+                    && !catalog.index_backs_constraint(other.indexrelid)
                     && let Some(other_creator) = self.created_indexes.get(&other.indexrelid)
                     && (other_creator.file, other_creator.span.start)
                         > (creator.file, creator.span.start)
                 {
-                    continue;
-                }
-                if catalog.index_backs_constraint(index.indexrelid) && !exact {
                     continue;
                 }
                 let (Some(name), Some(other_name)) = (
@@ -2005,6 +2016,9 @@ fn redundant_with<'a>(
     }
     let covering = index.indkey.len() > key_count;
     let method = catalog.index_access_method(index.indexrelid);
+    let nulls_not_distinct =
+        |index: &PgIndex| catalog.lint_index_nulls_not_distinct(index.indexrelid);
+    let deferrable = |index: &PgIndex| catalog.lint_index_is_deferrable(index.indexrelid);
     let order = |index: &PgIndex, n: usize| -> Vec<(bool, bool)> {
         let mut order = orderings
             .get(&index.indexrelid)
@@ -2020,6 +2034,10 @@ fn redundant_with<'a>(
             || other.indrelid != index.indrelid
             || !keys_plain(other)
             || catalog.index_access_method(other.indexrelid) != method
+            // An immediate unique index enforces its uniqueness at each
+            // statement, a deferrable one only at commit: neither replaces
+            // the other.
+            || deferrable(index) != deferrable(other)
         {
             continue;
         }
@@ -2034,13 +2052,30 @@ fn redundant_with<'a>(
         {
             continue;
         }
+        let index_nulls = nulls_not_distinct(index);
+        let other_nulls = nulls_not_distinct(other);
         let exact = other_keys == key_count
             && other.indkey == index.indkey
-            && other.indisunique == index.indisunique;
+            && other.indisunique == index.indisunique
+            && other_nulls == index_nulls;
         if exact {
             return Some((other, true));
         }
         if index.indisunique || covering {
+            // A unique NULLS DISTINCT index adds nothing over a unique NULLS
+            // NOT DISTINCT index on the same columns: the latter enforces
+            // strictly more (it also rejects duplicate NULLs) and serves the
+            // same equality lookups. The reverse is not true.
+            if !covering
+                && index.indisunique
+                && other.indisunique
+                && other_keys == key_count
+                && other.indkey == index.indkey
+                && !index_nulls
+                && other_nulls
+            {
+                return Some((other, false));
+            }
             continue;
         }
         if best.is_none() {

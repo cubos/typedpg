@@ -27,6 +27,22 @@ impl PgCatalog {
             .is_some_and(|rules| !rules.is_empty())
     }
 
+    /// Whether the unique index `index` treats NULLs as equal
+    /// (`indnullsnotdistinct`). `false` for a non-unique index, which has no
+    /// such flag.
+    pub fn lint_index_nulls_not_distinct(&self, index: PgClassOid) -> bool {
+        self.index_keys
+            .get(&index)
+            .is_some_and(|keys| keys.nulls_not_distinct)
+    }
+
+    /// Whether the index `index` was created by a DEFERRABLE constraint
+    /// (`pg_index.indimmediate = false`): its uniqueness is checked at the
+    /// end of the transaction, not at each statement.
+    pub fn lint_index_is_deferrable(&self, index: PgClassOid) -> bool {
+        self.nonimmediate_indexes.contains(&index)
+    }
+
     /// Resolve a `TypeName` AST node to a type OID, the way the analyzer
     /// resolves casts and column definitions.
     pub fn lint_resolve_type_name(

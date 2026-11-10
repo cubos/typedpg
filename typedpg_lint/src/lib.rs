@@ -1942,7 +1942,8 @@ mod tests {
         );
         assert_eq!(only(&not_leading, Rule::FkWithoutIndex).len(), 1);
 
-        // A partial index or an expression position doesn't count.
+        // A partial index or an expression in a leading key position
+        // doesn't count.
         for index in [
             "CREATE INDEX pairs_ab_partial ON pairs (a, b) WHERE a > 0;",
             "CREATE INDEX pairs_expr ON pairs ((a + 0), b);",
@@ -1955,6 +1956,29 @@ mod tests {
                 only(&findings, Rule::FkWithoutIndex).len(),
                 1,
                 "{index}: {findings:?}"
+            );
+        }
+        // An expression after the leading key columns runs after the
+        // equality lookup found the rows: it still serves the foreign key.
+        for index in [
+            "CREATE INDEX posts_lookup ON posts (author_id, lower(title));",
+            "CREATE INDEX pairs_lookup ON pairs (a, b, (c + 1));",
+        ] {
+            let (key, table) = if index.contains("pairs") {
+                (
+                    "ALTER TABLE pairs ADD CONSTRAINT pairs_fk FOREIGN KEY (a, b) REFERENCES parents (a, b);",
+                    "pairs",
+                )
+            } else {
+                (
+                    "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);",
+                    "posts",
+                )
+            };
+            let findings = second(&format!("{key}\n{index}"));
+            assert!(
+                only(&findings, Rule::FkWithoutIndex).is_empty(),
+                "{table} {index}: {findings:?}"
             );
         }
     }
@@ -2123,6 +2147,54 @@ mod tests {
              CREATE INDEX idx_b ON users (email DESC, name);",
         );
         assert_eq!(only(&spelled, Rule::RedundantIndex).len(), 1);
+    }
+
+    #[test]
+    fn redundant_index_keeps_nulls_not_distinct_and_deferrability_apart() {
+        // A NULLS NOT DISTINCT unique index rejects duplicate NULLs, which
+        // the NULLS DISTINCT one allows: only the loose one is redundant.
+        let findings = second(
+            "CREATE TABLE codes (code text);
+             CREATE UNIQUE INDEX codes_loose ON codes (code);
+             CREATE UNIQUE INDEX codes_strict ON codes (code) NULLS NOT DISTINCT;",
+        );
+        let found = only(&findings, Rule::RedundantIndex);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "index codes_loose is redundant with codes_strict"
+        );
+
+        // A deferrable unique constraint checks at commit, an immediate
+        // unique index at each statement: neither replaces the other.
+        let findings = second(
+            "CREATE TABLE deferred_codes (code text);
+             ALTER TABLE deferred_codes ADD CONSTRAINT deferred_codes_key
+                 UNIQUE (code) DEFERRABLE INITIALLY DEFERRED;
+             CREATE UNIQUE INDEX immediate_unique ON deferred_codes (code);",
+        );
+        assert!(
+            only(&findings, Rule::RedundantIndex).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn redundant_index_never_names_a_constraint_backed_index() {
+        // The constraint's index cannot be dropped with DROP INDEX, and ON
+        // CONFLICT ON CONSTRAINT depends on it: report the standalone
+        // duplicate instead, even though it was created first.
+        let findings = second(
+            "CREATE TABLE named_keys (id integer);
+             CREATE UNIQUE INDEX standalone_unique ON named_keys (id);
+             ALTER TABLE named_keys ADD CONSTRAINT named_unique UNIQUE (id);",
+        );
+        let found = only(&findings, Rule::RedundantIndex);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "index standalone_unique is redundant with named_unique"
+        );
     }
 
     #[test]
