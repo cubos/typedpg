@@ -522,6 +522,41 @@ mod tests {
     }
 
     #[test]
+    fn fetch_optional_on_a_key_completed_by_join_ons_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE owners (id bigint PRIMARY KEY, team bigint NOT NULL);
+             CREATE TABLE kids (
+                id bigint PRIMARY KEY,
+                team bigint NOT NULL,
+                slug text NOT NULL,
+                UNIQUE (team, slug)
+             );
+             CREATE TABLE links (
+                parent bigint NOT NULL,
+                kid bigint NOT NULL,
+                PRIMARY KEY (parent, kid)
+             );",
+        )
+        .unwrap();
+        let sql = "SELECT k.id FROM owners o \
+                   JOIN links l ON l.parent = o.id \
+                   JOIN kids k ON k.id = l.kid \
+                   WHERE o.id = $1 AND k.team = o.team AND k.slug = $2";
+        assert!(
+            only(
+                lint(
+                    &db,
+                    sql,
+                    &[rust(CallMethod::FetchOptional, "fetch_optional")]
+                ),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn fetch_optional_on_a_stable_call_key_is_fine() {
         let mut db = catalog();
         db.apply_sql(

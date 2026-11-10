@@ -1256,11 +1256,14 @@ fn starting_relations(scope: &Scope<'_>) -> u64 {
 /// The relations of `scope` all determined: a relation is determined when
 /// one of its unique keys is equated to constants, parameters, outer-query
 /// columns or already-determined relations. `WHERE` facts hold on every
-/// output row; a join's `ON` facts hold only on the rows it matches, so
-/// they may determine an inner join's sides and an outer join's nullable
-/// side, never its preserved one. A key may be equated partly by the
-/// `WHERE` and partly by a join's `ON`: both hold on every row the join
-/// contributes.
+/// output row, and so do the `ON` conjuncts of inner joins that no outer
+/// join null-extends: an inner join only emits rows its condition matched.
+/// A join's `ON` facts hold only on the rows it matches, so they may
+/// determine an outer join's nullable side — never its preserved one; an
+/// inner join inside an outer join's nullable side keeps that scoped
+/// treatment too. A key may be equated partly by the `WHERE`, partly by
+/// one join's `ON` and partly by another's: all of them hold on every row
+/// the joins contribute.
 fn all_relations_determined(
     ctx: &Ctx<'_>,
     select: &SelectStmt,
@@ -1272,8 +1275,17 @@ fn all_relations_determined(
         return false;
     }
     let all: u64 = (1u64 << n) - 1;
-    let where_conjuncts = dedup::conjuncts(select.where_clause.as_deref());
-    let where_facts: Vec<dedup::EqFact> = where_conjuncts
+    // The level's facts: WHERE's, plus the ON conjuncts of every inner join
+    // that isn't inside an outer join's nullable side (a null-extended row
+    // never evaluates those, so there they only hold on matched rows and
+    // stay with their join below).
+    let mut level_conjuncts = dedup::conjuncts(select.where_clause.as_deref());
+    for join in &scope.joins {
+        if join.kind == JoinType::JoinInner && !join.nullable {
+            level_conjuncts.extend(dedup::conjuncts(join.quals));
+        }
+    }
+    let level_facts: Vec<dedup::EqFact> = level_conjuncts
         .iter()
         .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, Some(outer)))
         .collect();
@@ -1300,11 +1312,11 @@ fn all_relations_determined(
                 continue;
             }
             let sources = PredicateSources {
-                conjuncts: &where_conjuncts,
-                facts: &where_facts,
+                conjuncts: &level_conjuncts,
+                facts: &level_facts,
             };
             if scope
-                .key_equated_with(ctx, b, &where_facts, known, Some(&sources))
+                .key_equated_with(ctx, b, &level_facts, known, Some(&sources))
                 .is_some()
             {
                 known |= 1 << b;
@@ -1328,9 +1340,9 @@ fn all_relations_determined(
                 continue;
             }
             let mut merged = facts.clone();
-            merged.extend(where_facts.iter().cloned());
+            merged.extend(level_facts.iter().cloned());
             let mut sources = conjuncts.clone();
-            sources.extend(where_conjuncts.iter().copied());
+            sources.extend(level_conjuncts.iter().copied());
             let sources = PredicateSources {
                 conjuncts: &sources,
                 facts: &merged,
@@ -1921,6 +1933,99 @@ mod tests {
         assert!(!select_one(
             &db,
             "SELECT pick_tools(o.id) FROM owners o WHERE o.id = $1"
+        ));
+    }
+
+    #[test]
+    fn an_inner_joins_on_facts_hold_at_the_level() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE owners (id bigint PRIMARY KEY, team bigint NOT NULL);
+             CREATE TABLE kids (
+                id bigint PRIMARY KEY,
+                team bigint NOT NULL,
+                slug text NOT NULL,
+                UNIQUE (team, slug)
+             );
+             CREATE TABLE links (
+                parent bigint NOT NULL,
+                kid bigint NOT NULL,
+                PRIMARY KEY (parent, kid)
+             );
+             CREATE TABLE a (id bigint PRIMARY KEY, k bigint);
+             CREATE TABLE b (id bigint PRIMARY KEY, cid bigint, aid bigint, k bigint);
+             CREATE TABLE c (id bigint PRIMARY KEY, k bigint);
+             CREATE TABLE calls (
+                conversation_id bigint NOT NULL,
+                call_id bigint NOT NULL,
+                type text NOT NULL
+             );
+             CREATE UNIQUE INDEX ON calls (conversation_id, call_id) WHERE type = 'result';
+             CREATE TABLE sinks (call_id bigint PRIMARY KEY);",
+        )
+        .unwrap();
+        // The issue's query: `l.kid = k.id` sits in `k`'s ON and `l.parent
+        // = o.id` in `l`'s; both hold on every output row, so the key of
+        // `links` can be completed from them.
+        assert!(select_one(
+            &db,
+            "SELECT k.id FROM owners o \
+             JOIN links l ON l.parent = o.id \
+             JOIN kids k ON k.id = l.kid \
+             WHERE o.id = $1 AND k.team = o.team AND k.slug = $2"
+        ));
+        // The same conditions with the joins in another order, and all in
+        // WHERE.
+        assert!(select_one(
+            &db,
+            "SELECT k.id FROM owners o \
+             JOIN kids k ON k.team = o.team \
+             JOIN links l ON l.parent = o.id AND l.kid = k.id \
+             WHERE o.id = $1 AND k.slug = $2"
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT k.id FROM owners o, links l, kids k \
+             WHERE o.id = $1 AND l.parent = o.id AND k.id = l.kid \
+               AND k.team = o.team AND k.slug = $2"
+        ));
+        // A parenthesized inner join's ON holds at this level too.
+        assert!(select_one(
+            &db,
+            "SELECT k.id FROM owners o \
+             JOIN (links l JOIN kids k ON k.id = l.kid) ON l.parent = o.id \
+             WHERE o.id = $1 AND k.team = o.team AND k.slug = $2"
+        ));
+        // An inner join inside a LEFT join's nullable side keeps its scoped
+        // treatment: its ON holds only on the rows the outer join matches —
+        // and PG doesn't even let it reference the preserved side.
+        assert!(!select_one(
+            &db,
+            "SELECT a.id FROM a \
+             LEFT JOIN (b JOIN c ON c.id = b.cid AND c.k = b.k) ON b.aid = a.id \
+             WHERE a.id = $1"
+        ));
+        // The same beneath a RIGHT join's nullable side, which is its left:
+        // a null-extended row never evaluates the inner ON either.
+        assert!(!select_one(
+            &db,
+            "SELECT a.id FROM (b JOIN c ON c.id = b.cid AND c.k = b.k) \
+             RIGHT JOIN a ON b.aid = a.id \
+             WHERE a.id = $1"
+        ));
+        // A partial index's predicate written in an inner join's ON holds
+        // on every output row like one written in WHERE.
+        assert!(select_one(
+            &db,
+            "SELECT c.call_id FROM calls c \
+             JOIN sinks s ON s.call_id = c.call_id AND c.type = 'result' \
+             WHERE c.conversation_id = $1 AND c.call_id = $2"
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT c.call_id FROM calls c \
+             JOIN sinks s ON s.call_id = c.call_id AND c.type = 'other' \
+             WHERE c.conversation_id = $1 AND c.call_id = $2"
         ));
     }
 
