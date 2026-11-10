@@ -1,6 +1,6 @@
 {
   "name": "@cubos/typedpg-cli",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "The typedpg command and bundler plugins for TypeScript, checked against your migrations without a database",
   "license": "MIT",
   "repository": {
