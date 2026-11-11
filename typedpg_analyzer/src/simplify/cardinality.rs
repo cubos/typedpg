@@ -98,8 +98,8 @@ pub fn redundant_distinct_spans(
 /// Whether `select`, a node borrowed from `view.tree` at any nesting depth,
 /// provably yields at most one row per evaluation.
 ///
-/// Its own `LIMIT` / `OFFSET` / `FETCH` are ignored (they only remove rows).
-/// At most one row when:
+/// Its own `LIMIT` / `OFFSET` / `FETCH` are ignored (they only remove rows;
+/// `redundant_limit` needs the count before them). At most one row when:
 ///
 /// - it is not a set operation, and no set-returning function can multiply
 ///   its target list, `VALUES` rows or `FROM` functions;
@@ -108,25 +108,44 @@ pub fn redundant_distinct_spans(
 ///   level no outer query encloses, whatever the aggregate's arguments read,
 ///   a `FROM` subquery included — or only `GROUP BY ()` (one empty grouping
 ///   set);
+/// - its plain `GROUP BY` (no `GROUPING SETS` / `ROLLUP` / `CUBE`, no
+///   `GROUP BY DISTINCT`) has every key one value per evaluation: a fixed
+///   expression (a literal, parameter or non-volatile expression of them,
+///   see [`fixed_per_evaluation`]), a plain column of a relation the key
+///   proof determines that no outer join can null-extend, or a plain column
+///   a level equality (`WHERE`, or the `ON` of an inner join nothing
+///   null-extends) equates to such a fixed value through the column type's
+///   default btree equality, under a deterministic collation;
+/// - it has a `DISTINCT ON` whose keys are all such one-value expressions:
+///   every row shares the key values, so it dedups to at most one;
 /// - every `FROM` relation is a base table whose unique key is equated,
 ///   column by column, to constants, parameters, outer-query columns,
 ///   scalar subqueries uncorrelated with this level or columns of
 ///   already-determined relations — the `distinct` rule's "equalities to a
 ///   key" proof (see [`super::dedup`]), propagated until every relation is
 ///   determined — a single-row CTE, a `FROM` function that can't return
-///   a set, a subquery the proof bounds to one row (`LATERAL` or not), or a
-///   `pg_catalog` system view with a key PostgreSQL itself guarantees (see
-///   below);
+///   a set, a subquery the proof bounds to one row (`LATERAL` or not, or one
+///   whose own `LIMIT` / `FETCH FIRST` is the constant `0` or `1` without
+///   `WITH TIES`), or a `pg_catalog` system view with a key PostgreSQL
+///   itself guarantees (see below);
 /// - it is a plain `DISTINCT` whose targets are all fixed per evaluation:
 ///   literals, parameters or non-volatile expressions of them, with no
 ///   column reference or window function.
+///
+/// A row constructor equality `(a, b) = ($1, $2)` is the AND of its columns'
+/// `=`; a one-element `IN` / `= ANY` is that `=`; and an unqualified
+/// reference to an inner join's `USING` column is the join's left input's
+/// (a LEFT join's left, a RIGHT join's right; a FULL join's `COALESCE`
+/// gives up).
 ///
 /// A CTE the statement's own `WITH` clause proves yields at most one row is
 /// a relation with no key needed: it is determined from the start, may be
 /// referenced more than once, and its columns are values a key equality may
 /// read. CTEs are judged in declaration order, so a body may use the ones
-/// before it; a recursive `WITH` or a reference to an unproven one makes the
-/// proof give up. A CTE's output columns are listed even when its body isn't
+/// before it; a reference to an unproven one makes the proof give up. A CTE
+/// of a `WITH RECURSIVE` whose body never references its own name is judged
+/// like a non-recursive one; a truly recursive CTE is a reference the proof
+/// gives up on. A CTE's output columns are listed even when its body isn't
 /// proven one row, and a `FROM` subquery's names likewise, so a nested
 /// level's aggregate argument resolves against them and counts as that
 /// level's aggregate ([`aggregate_is_this_level`]). A `FROM` function call
@@ -149,14 +168,15 @@ pub fn redundant_distinct_spans(
 /// at most one tuple for the re-fetched row, so a recheck of a join still
 /// yields at most one row (see `execScan.c`'s `ExecScanFetch`).
 ///
-/// Anything else is `false`: `GROUP BY` other than `()` always is (a group
-/// per key), and so is every relation the proof can't see through (a view
-/// other than the trusted `pg_catalog` system views, a subquery it can't
-/// prove one row, a function that returns a set, an inheritance parent read
-/// with its children — a plain reference, not `ONLY` — a foreign table), a
-/// set-returning call, a `FULL JOIN` (two one-row sides still produce an
-/// unmatched row from each when their keys differ), or an outer join whose
-/// nullable side isn't determined.
+/// Anything else is `false`: a grouping construct other than a plain
+/// `GROUP BY` / `GROUP BY ()`, a plain `GROUP BY` key that isn't one value,
+/// every relation the proof can't see through (a view other than the trusted
+/// `pg_catalog` system views, a subquery it can't prove one row, a function
+/// that returns a set, an inheritance parent read with its children — a
+/// plain reference, not `ONLY` — a foreign table), a set-returning call, a
+/// `FULL JOIN` (two one-row sides still produce an unmatched row from each
+/// when their keys differ), or an outer join whose nullable side isn't
+/// determined.
 ///
 /// The same "equalities to a key" fixed point backs the DML proofs: an
 /// `UPDATE` / `DELETE` needs only its target determined — a `FROM` /
@@ -304,13 +324,34 @@ fn visible_ctes(
     let Some(with) = with else {
         return VisibleCtes { after, bodies };
     };
+    // In a `WITH RECURSIVE`, a body may read any CTE of the clause, a later
+    // one included (PG orders them by their dependencies): every name is a
+    // reference the proof gives up on until its own body is judged, so a
+    // forward reference never falls through to a table of the same name.
+    if with.recursive {
+        for node in &with.ctes {
+            if let Some(Node::CommonTableExpr(cte)) = &node.node {
+                after.insert(cte.ctename.clone(), None);
+            }
+        }
+    }
     for node in &with.ctes {
         let Some(Node::CommonTableExpr(cte)) = &node.node else {
             continue;
         };
-        if with.recursive {
-            // A recursive CTE may reference itself (and every CTE before
-            // it), so the whole level is a reference the proof gives up on.
+        // `WITH RECURSIVE` only allows recursion; a CTE whose body never
+        // references its own name is still an ordinary one. A body that does
+        // (or a SEARCH / CYCLE clause) is a reference the proof gives up on,
+        // like the whole level used to be.
+        let recursive = with.recursive
+            && (cte.search_clause.is_some()
+                || cte.cycle_clause.is_some()
+                || cte.ctequery.as_deref().is_some_and(|body| {
+                    body.node
+                        .as_ref()
+                        .is_some_and(|body| references_cte(body.to_ref(), &cte.ctename))
+                }));
+        if recursive {
             after.insert(cte.ctename.clone(), None);
             bodies.push(after.clone());
             continue;
@@ -320,6 +361,19 @@ fn visible_ctes(
         after.insert(cte.ctename.clone(), info);
     }
     VisibleCtes { after, bodies }
+}
+
+/// Whether `node` reads the CTE `name` as a relation of its own: a plain
+/// `FROM` reference, however deeply nested (a nested query that shadows the
+/// name only makes this give up more often).
+fn references_cte(node: NodeRef<'_>, name: &str) -> bool {
+    match node {
+        NodeRef::RangeVar(range) => range.schemaname.is_empty() && range.relname == name,
+        _ => node
+            .children()
+            .into_iter()
+            .any(|child| references_cte(child, name)),
+    }
 }
 
 /// The CTE environment a FROM subquery's own `WITH` clause makes visible:
@@ -351,7 +405,7 @@ fn single_row_cte(
     env: &CteEnv,
     parent: Option<&FromScope<'_>>,
 ) -> Option<CteInfo> {
-    if cte.cterecursive || cte.search_clause.is_some() || cte.cycle_clause.is_some() {
+    if cte.search_clause.is_some() || cte.cycle_clause.is_some() {
         return None;
     }
     let body = cte
@@ -1283,10 +1337,17 @@ pub(super) fn select_at_most_one_row_in(
         return false;
     }
     // `GROUP BY ()` is a single empty grouping set: one group, like an
-    // aggregate without `GROUP BY`. Any other grouping (including
-    // `GROUPING SETS ((), ())`, which is two groups) makes a group per key.
+    // aggregate without `GROUP BY`. Any other grouping construct —
+    // `GROUPING SETS`, `ROLLUP`, `CUBE`, `GROUP BY DISTINCT` — multiplies or
+    // redefines the groups in ways this proof doesn't follow.
     let empty_grouping_set = single_empty_grouping_set(select);
-    if select.group_distinct || (!select.group_clause.is_empty() && !empty_grouping_set) {
+    let plain_group = select
+        .group_clause
+        .iter()
+        .all(|group| !matches!(&group.node, Some(Node::GroupingSet(_))));
+    if select.group_distinct
+        || (!select.group_clause.is_empty() && !empty_grouping_set && !plain_group)
+    {
         return false;
     }
     // A set-returning call multiplies this level's rows wherever it runs:
@@ -1316,9 +1377,10 @@ pub(super) fn select_at_most_one_row_in(
     if select.from_clause.is_empty() {
         return true;
     }
+    let grouped = !select.group_clause.is_empty() && !empty_grouping_set;
     if empty_grouping_set
-        || select.having_clause.is_some()
-        || has_own_aggregate(ctx, select, env, outer)
+        || (!grouped
+            && (select.having_clause.is_some() || has_own_aggregate(ctx, select, env, outer)))
     {
         // One group, and nothing groups it further.
         return true;
@@ -1335,7 +1397,141 @@ pub(super) fn select_at_most_one_row_in(
     // original row. Only the row equality facts limit the row count, which
     // they do below; the nullability inference keeps its own, stricter rules
     // for FK-referenced rows.
-    all_relations_determined(ctx, select, &scope, outer)
+    let distinct_on = !dedup::is_plain_distinct(select) && !select.distinct_clause.is_empty();
+    if grouped || distinct_on {
+        let Some(determination) =
+            determined_relations(ctx, select.where_clause.as_deref(), &scope, outer, env)
+        else {
+            return false;
+        };
+        // A plain `GROUP BY` with every key single-valued has one group. So
+        // does a `DISTINCT ON` whose keys are all single-valued: the rows
+        // dedup to one per key value, and there is only one.
+        if grouped {
+            return select
+                .group_clause
+                .iter()
+                .all(|group| grouping_key_single_valued(ctx, &scope, &determination, group, true));
+        }
+        if select.distinct_clause.iter().all(|key| {
+            distinct_on_key_reads_input(select, key)
+                && grouping_key_single_valued(ctx, &scope, &determination, key, true)
+        }) {
+            return true;
+        }
+    }
+    all_relations_determined(ctx, select, &scope, outer, env)
+}
+
+/// Whether a plain `GROUP BY` / `DISTINCT ON` item is one value per
+/// evaluation of its level, so every group / distinct key has one value:
+/// a fixed expression (see [`fixed_per_evaluation`]), a plain column of a
+/// determined relation that isn't on an outer join's nullable side, or a
+/// plain column a level equality fixes to a fixed value (see
+/// [`dedup::Scope::column_fixed_by_facts`]).
+///
+/// `positional` is `GROUP BY`'s: a bare integer constant there names a target
+/// column, not a value.
+fn grouping_key_single_valued(
+    ctx: &Ctx<'_>,
+    scope: &Scope<'_>,
+    determination: &Determination,
+    item: &protobuf::Node,
+    positional: bool,
+) -> bool {
+    // `GROUP BY (a, b)` is the two items `a` and `b` (PG's
+    // `flatten_grouping_sets`), each of them possibly a target position.
+    if positional && let Some(items) = crate::grouping::implicit_row_items(item) {
+        return items
+            .iter()
+            .all(|item| grouping_key_single_valued(ctx, scope, determination, item, positional));
+    }
+    if positional
+        && matches!(
+            item.node.as_ref(),
+            Some(Node::AConst(constant))
+                if !constant.isnull && matches!(constant.val, Some(Val::Ival(_)))
+        )
+    {
+        return false;
+    }
+    if fixed_per_evaluation(ctx, item) {
+        return true;
+    }
+    let Some((rel, attnum)) = plain_column(scope, item) else {
+        return false;
+    };
+    if determination.known & (1 << rel) != 0 && !scope.rels[rel].nullable {
+        return true;
+    }
+    scope.column_fixed_by_facts(
+        ctx,
+        rel,
+        attnum,
+        &determination.level_facts,
+        determination.known,
+    )
+}
+
+/// Whether a `DISTINCT ON` key is an expression over the input rows, as
+/// [`grouping_key_single_valued`] reads it. PG resolves a `DISTINCT ON` key
+/// like an `ORDER BY` one (`findTargetlistEntrySQL92`): a bare integer is a
+/// target position (refused there through `positional`), and a bare name
+/// that is an output column's name means that output column, even when an
+/// input column has the same name. A target whose output name this can't
+/// tell (`FigureColname` derives it from the expression) may be the one a
+/// bare name means, so such a key is refused too.
+fn distinct_on_key_reads_input(select: &SelectStmt, key: &protobuf::Node) -> bool {
+    let Some(Node::ColumnRef(column)) = key.node.as_ref() else {
+        return true;
+    };
+    let Fields::Names(names) = dedup::column_ref_fields(column) else {
+        return true;
+    };
+    let [name] = names.as_slice() else {
+        return true;
+    };
+    select.target_list.iter().all(|target| {
+        let Some(Node::ResTarget(target)) = &target.node else {
+            return false;
+        };
+        let output = if target.name.is_empty() {
+            target.val.as_deref().and_then(output_name)
+        } else {
+            Some(target.name.clone())
+        };
+        match output {
+            // The key names this output column: fine only when the target
+            // is that same bare input column.
+            Some(output) if output == *name => target.val.as_deref().is_some_and(|value| {
+                matches!(
+                    value.node.as_ref(),
+                    Some(Node::ColumnRef(target_column))
+                        if matches!(
+                            dedup::column_ref_fields(target_column),
+                            Fields::Names(target_names) if target_names.as_slice() == [*name]
+                        )
+                )
+            }),
+            Some(_) => true,
+            None => false,
+        }
+    })
+}
+
+/// The relation and attnum a grouping / `DISTINCT ON` item is a plain
+/// column of, resolved in this level's scope.
+fn plain_column(scope: &Scope<'_>, item: &protobuf::Node) -> Option<(usize, i16)> {
+    let Some(Node::ColumnRef(column)) = item.node.as_ref() else {
+        return None;
+    };
+    let Fields::Names(names) = dedup::column_ref_fields(column) else {
+        return None;
+    };
+    match scope.resolve(&names) {
+        dedup::Col::Rel(rel, attnum) => Some((rel, attnum)),
+        dedup::Col::Opaque | dedup::Col::Other => None,
+    }
 }
 
 /// Whether `select` has exactly one `GROUP BY` item and it is the empty
@@ -1395,6 +1591,22 @@ fn fixed_per_evaluation(ctx: &Ctx<'_>, value: &protobuf::Node) -> bool {
             // A call whose parameters aren't all spelled may leave one to a
             // volatile default (`nextval(…)`), evaluated per row.
             NodeRef::FuncCall(call) if !dedup::call_spells_every_parameter(ctx, call) => {
+                return false;
+            }
+            // An aggregate is one value per group, not per evaluation:
+            // `SELECT DISTINCT count(*) ... GROUP BY k` has a row per count.
+            NodeRef::FuncCall(call)
+                if call.agg_star
+                    || call.agg_distinct
+                    || call.agg_filter.is_some()
+                    || !call.agg_order.is_empty()
+                    || function_name(&call.funcname).is_none_or(|(schema, name)| {
+                        ctx.catalog
+                            .find_functions(schema, name)
+                            .iter()
+                            .any(|proc| proc.prokind == ProKind::Aggregate)
+                    }) =>
+            {
                 return false;
             }
             _ => {}
@@ -1544,10 +1756,16 @@ fn has_own_aggregate(
 }
 
 /// Whether every column reference in aggregate call `call`'s aggregated
-/// arguments (arguments, ORDER BY and FILTER) resolves in `scope`, this
-/// select's own FROM — or there is none. Any reference this can't place
-/// (an outer column, a name an opaque item may bind) makes it another
-/// level's aggregate.
+/// arguments (arguments, ORDER BY and FILTER) that binds at this level
+/// resolves in `scope`, this select's own FROM — or the call has no
+/// variable at all.
+///
+/// PG's `check_agg_arguments` places an aggregate at the lowest query level
+/// any variable of it reads (arguments, FILTER and ORDER BY): one local
+/// reference makes it this level's, however many outer columns the call
+/// also reads. With no variable at all (`count(*)`) it belongs to the level
+/// it is written in. A call whose references are all outer is the outer
+/// level's aggregate and does not collapse this level's rows.
 fn aggregate_is_this_level(scope: Option<&Scope<'_>>, call: &protobuf::FuncCall) -> bool {
     let sort_exprs = call
         .agg_order
@@ -1568,6 +1786,8 @@ fn aggregate_is_this_level(scope: Option<&Scope<'_>>, call: &protobuf::FuncCall)
             .and_then(|n| n.node.as_ref())
             .map(|inner| inner.to_ref()),
     );
+    let mut has_column = false;
+    let mut resolved_locally = false;
     while let Some(node) = stack.pop() {
         match node {
             NodeRef::SubLink(_) => {
@@ -1580,19 +1800,19 @@ fn aggregate_is_this_level(scope: Option<&Scope<'_>>, call: &protobuf::FuncCall)
             }
             NodeRef::RangeSubselect(_) | NodeRef::CommonTableExpr(_) => return false,
             NodeRef::ColumnRef(column) => {
+                has_column = true;
                 let Fields::Names(names) = dedup::column_ref_fields(column) else {
                     return false;
                 };
-                if !scope.is_some_and(|scope| matches!(scope.resolve(&names), dedup::Col::Rel(..)))
-                {
-                    return false;
+                if scope.is_some_and(|scope| matches!(scope.resolve(&names), dedup::Col::Rel(..))) {
+                    resolved_locally = true;
                 }
             }
             _ => {}
         }
         stack.extend(node.children());
     }
-    true
+    !has_column || resolved_locally
 }
 
 /// Whether any column reference appears anywhere below `node`.
@@ -1635,44 +1855,40 @@ fn starting_relations(ctx: &Ctx<'_>, scope: &Scope<'_>) -> u64 {
     known
 }
 
-/// The relations of `scope` all determined: a relation is determined when
-/// one of its unique keys is equated to constants, parameters, outer-query
-/// columns or already-determined relations. `WHERE` facts hold on every
-/// output row, and so do the `ON` conjuncts of inner joins that no outer
-/// join null-extends: an inner join only emits rows its condition matched.
+/// The relations of `scope` the key proof determines, with the level facts
+/// (`WHERE` and non-null-extended inner-join `ON` equalities) that proved
+/// them.
+struct Determination {
+    /// One bit per relation the proof determined.
+    known: u64,
+    /// One bit per relation of the scope.
+    all: u64,
+    level_facts: Vec<dedup::EqFact>,
+}
+
+/// The relations of `scope` determined: a relation is determined when one of
+/// its unique keys is equated to constants, parameters, outer-query columns
+/// or already-determined relations. `WHERE` facts hold on every output row,
+/// and so do the `ON` conjuncts of inner joins that no outer join
+/// null-extends: an inner join only emits rows its condition matched.
 /// A join's `ON` facts hold only on the rows it matches, so they may
 /// determine an outer join's nullable side — never its preserved one; an
 /// inner join inside an outer join's nullable side keeps that scoped
 /// treatment too. A key may be equated partly by the `WHERE`, partly by
 /// one join's `ON` and partly by another's: all of them hold on every row
 /// the joins contribute.
-fn all_relations_determined(
-    ctx: &Ctx<'_>,
-    select: &SelectStmt,
-    scope: &Scope<'_>,
-    outer: &FromScope<'_>,
-) -> bool {
-    let n = scope.rels.len();
-    if n == 0 || n > 63 {
-        return false;
-    }
-    let all: u64 = (1u64 << n) - 1;
-    determined_relations(ctx, select.where_clause.as_deref(), scope, outer) & all == all
-}
-
-/// [`all_relations_determined`]'s fixed point: the relations of `scope` it
-/// determines from `where_clause` and the joins' `ON` facts. A statement
-/// counting rows (a `MERGE`) requires only the relation it needs, not all.
 fn determined_relations(
     ctx: &Ctx<'_>,
     where_clause: Option<&protobuf::Node>,
     scope: &Scope<'_>,
     outer: &FromScope<'_>,
-) -> u64 {
+    env: &CteEnv,
+) -> Option<Determination> {
     let n = scope.rels.len();
     if n == 0 || n > 63 {
-        return 0;
+        return None;
     }
+    let all: u64 = (1u64 << n) - 1;
     // The level's facts: WHERE's, plus the ON conjuncts of every inner join
     // that isn't inside an outer join's nullable side (a null-extended row
     // never evaluates those, so there they only hold on matched rows and
@@ -1685,7 +1901,7 @@ fn determined_relations(
     }
     let level_facts: Vec<dedup::EqFact> = level_conjuncts
         .iter()
-        .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, Some(outer)))
+        .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, Some(outer), env))
         .collect();
     let join_facts: Vec<(&dedup::Join<'_>, Vec<dedup::EqFact>, Vec<&protobuf::Node>)> = scope
         .joins
@@ -1694,7 +1910,7 @@ fn determined_relations(
             let conjuncts = dedup::conjuncts(join.quals);
             let mut facts = Vec::new();
             for conjunct in &conjuncts {
-                facts.extend(scope.cardinality_facts(ctx, conjunct, Some(outer)));
+                facts.extend(scope.cardinality_facts(ctx, conjunct, Some(outer), env));
             }
             for name in &join.using {
                 facts.extend(scope.cardinality_using_facts(ctx, name, join.left, join.right));
@@ -1769,7 +1985,24 @@ fn determined_relations(
             break;
         }
     }
-    known
+    Some(Determination {
+        known,
+        all,
+        level_facts,
+    })
+}
+
+/// Whether every relation of `scope` is determined (see
+/// [`determined_relations`]).
+fn all_relations_determined(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+    scope: &Scope<'_>,
+    outer: &FromScope<'_>,
+    env: &CteEnv,
+) -> bool {
+    determined_relations(ctx, select.where_clause.as_deref(), scope, outer, env)
+        .is_some_and(|determination| determination.known & determination.all == determination.all)
 }
 
 // ── Statements ──────────────────────────────────────────────────────────────
@@ -1854,7 +2087,8 @@ fn dml_at_most_one_row(
         return false;
     }
     let root = FromScope::opaque(None);
-    let known = determined_relations(ctx, where_clause, &scope, &root);
+    let known = determined_relations(ctx, where_clause, &scope, &root, env)
+        .map_or(0, |determination| determination.known);
     // Relation 0 is the target (`Scope::dml` adds it first).
     known & 1 == 1
 }
@@ -1930,14 +2164,15 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
         return false;
     }
     let root = FromScope::opaque(None);
-    let known = determined_relations(ctx, merge.join_condition.as_deref(), &scope, &root);
+    let known = determined_relations(ctx, merge.join_condition.as_deref(), &scope, &root, env)
+        .map_or(0, |determination| determination.known);
     // Relation 0 is the target (`Scope::dml` adds it first).
     known & 1 == 1
 }
 
 /// Whether `select`'s `LIMIT` / `FETCH FIRST` is the constant `0` or `1`
 /// (without `WITH TIES`). Its `OFFSET` doesn't affect the bound.
-fn limit_bounds_one(select: &SelectStmt) -> bool {
+pub(super) fn limit_bounds_one(select: &SelectStmt) -> bool {
     if select.limit_option() == LimitOption::WithTies {
         return false;
     }
@@ -1976,9 +2211,14 @@ mod tests {
              CREATE TABLE owners (
                 id bigint PRIMARY KEY,
                 tool_id bigint,
+                email text UNIQUE,
                 org_id bigint
              );
-             CREATE TABLE tools (id bigint PRIMARY KEY, name text);
+             CREATE TABLE tools (
+                id bigint PRIMARY KEY,
+                name text NOT NULL,
+                owner_id bigint
+             );
              CREATE TABLE cache (id bigint PRIMARY KEY, name text);
              CREATE TABLE users (
                 id bigint PRIMARY KEY,
@@ -4641,5 +4881,337 @@ mod tests {
         assert!(!select_one(&db, "SELECT DISTINCT pick() FROM inputs"));
         // Every parameter spelled is one value per evaluation.
         assert!(select_one(&db, "SELECT DISTINCT pick(1) FROM inputs"));
+    }
+
+    #[test]
+    fn a_from_subquerys_limit_bounds_it_to_one_row() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE events (id bigint PRIMARY KEY);
+             CREATE TABLE owners (id bigint PRIMARY KEY);
+             CREATE TABLE tools (id bigint PRIMARY KEY, name text NOT NULL, owner_id bigint);",
+        )
+        .unwrap();
+        assert!(select_one(
+            &db,
+            "SELECT latest.id FROM \
+             (SELECT id FROM events ORDER BY id DESC LIMIT 1) latest",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT o.id, w.name FROM owners o \
+             LEFT JOIN LATERAL \
+                (SELECT t.name FROM tools t WHERE t.owner_id = o.id \
+                 ORDER BY t.id LIMIT 1) w ON true \
+             WHERE o.id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT o.id, w.name FROM owners o \
+             LEFT JOIN LATERAL \
+                (SELECT t.name FROM tools t WHERE t.owner_id = o.id \
+                 ORDER BY t.id FETCH FIRST 1 ROW ONLY) w ON true \
+             WHERE o.id = $1",
+        ));
+        for sql in [
+            "SELECT latest.id FROM \
+             (SELECT id FROM events ORDER BY id DESC FETCH FIRST 1 ROW WITH TIES) latest",
+            "SELECT latest.id FROM (SELECT id FROM events ORDER BY id DESC LIMIT 2) latest",
+            "SELECT latest.id FROM \
+             (SELECT id FROM events WHERE id > $1 ORDER BY id DESC LIMIT $2) latest",
+            "SELECT o.id, w.name FROM owners o \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t ORDER BY t.id LIMIT 2) w ON true \
+             WHERE o.id = $1",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+        // `redundant_limit` still sees the count before the limit: the
+        // select's own LIMIT doesn't prove it redundant.
+        assert!(!select_one(&db, "SELECT id FROM events LIMIT 1"));
+        assert!(statement_one(&db, "SELECT id FROM events LIMIT 1"));
+    }
+
+    #[test]
+    fn a_single_valued_group_key_is_one_group() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "SELECT o.id, count(t.id) FROM owners o \
+             LEFT JOIN tools t ON t.owner_id = o.id \
+             WHERE o.id = $1 GROUP BY o.id",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT o.org_id, count(*) FROM owners o \
+             WHERE o.org_id = $1 GROUP BY o.org_id",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT o.id FROM owners o WHERE o.id = $1 GROUP BY o.id",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT DISTINCT ON (o.org_id) o.id FROM owners o \
+             WHERE o.org_id = $1 ORDER BY o.org_id, o.id",
+        ));
+        // A bare name that is only the input column, or the output column
+        // that is that same column.
+        assert!(select_one(
+            &db,
+            "SELECT DISTINCT ON (org_id) o.id FROM owners o \
+             WHERE o.org_id = $1 ORDER BY org_id, o.id",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT DISTINCT ON (org_id) org_id, o.id FROM owners o \
+             WHERE o.org_id = $1 ORDER BY org_id, o.id",
+        ));
+        // A determined relation's column is one value even without a fact
+        // about it.
+        assert!(select_one(
+            &db,
+            "SELECT o.org_id, count(*) FROM owners o \
+             WHERE o.id = $1 GROUP BY o.org_id",
+        ));
+        for sql in [
+            "SELECT o.org_id, count(*) FROM owners o GROUP BY o.org_id",
+            "SELECT count(*) FROM owners o GROUP BY ROLLUP (o.org_id)",
+            "SELECT count(*) FROM owners o GROUP BY CUBE (o.org_id)",
+            "SELECT count(*) FROM owners o GROUP BY DISTINCT o.org_id",
+            // Only `owners` is determined; `tools` may have many rows.
+            "SELECT count(t.id) FROM owners o \
+             LEFT JOIN tools t ON t.owner_id = o.id \
+             WHERE o.id = $1 GROUP BY t.name",
+            // The nullable side's column isn't single-valued on the
+            // null-extended rows, even when the join determines the side.
+            "SELECT count(*) FROM owners o \
+             LEFT JOIN tools t ON t.id = $1 GROUP BY t.name",
+            // `DISTINCT ON (1)` is the first target, not the constant 1.
+            "SELECT DISTINCT ON (1) o.id FROM owners o",
+            // A bare `DISTINCT ON` name is the output column first: here
+            // `t.owner_id`, not the input `org_id` the WHERE fixes.
+            "SELECT DISTINCT ON (org_id) t.owner_id AS org_id FROM owners o \
+             JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
+            // A target whose output name isn't known may be the one meant.
+            "SELECT DISTINCT ON (org_id) t.owner_id + 0 FROM owners o \
+             JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn grouping_and_key_shortcuts_refuse_what_pg_reads_differently() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE gk (k integer, a integer, b integer);
+             CREATE TABLE ua (id bigint);
+             CREATE TABLE ub (id double precision);
+             CREATE TABLE tz (ts timestamp);
+             CREATE TABLE fwd (id integer PRIMARY KEY);
+             CREATE FUNCTION eq_int_text(integer, text) RETURNS boolean
+                LANGUAGE sql IMMUTABLE STRICT AS 'SELECT true';
+             CREATE OPERATOR public.= (LEFTARG = integer, RIGHTARG = text, FUNCTION = eq_int_text);
+             CREATE TABLE ti (id integer PRIMARY KEY);",
+        )
+        .unwrap();
+        for sql in [
+            // An aggregate is one value per group, not per evaluation.
+            "SELECT DISTINCT count(*) FROM gk GROUP BY k",
+            // `GROUP BY (1, 2)` is the two target positions.
+            "SELECT a, b FROM gk GROUP BY (1, 2)",
+            // The merged `id` is a `double precision` value two `bigint`
+            // ids both convert to.
+            "SELECT ua.id FROM ua JOIN ub USING (id) \
+             WHERE id = '9007199254740992'::bigint GROUP BY ua.id",
+            // A cross-type equality need not fix one grouping value.
+            "SELECT ts FROM tz \
+             WHERE ts = TIMESTAMPTZ '2024-03-10 07:30:00+00' GROUP BY ts",
+            // `fwd` here is the later CTE (two rows), not the table.
+            "WITH RECURSIVE a AS (SELECT id FROM fwd WHERE id = 1), \
+             fwd(id) AS (VALUES (1), (1)) SELECT id FROM a",
+            // `ARRAY['1']` is `text[]`: the user's `(integer, text)` operator.
+            "SELECT id FROM ti WHERE id = ANY(ARRAY['1'])",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+        // The same shapes PG reads as one value still prove one row.
+        db.apply_sql("CREATE TABLE ua2 (id bigint PRIMARY KEY);")
+            .unwrap();
+        for sql in [
+            "SELECT ua.id FROM ua JOIN ua2 USING (id) WHERE id = $1 GROUP BY ua.id",
+            "SELECT k FROM gk WHERE k = 1 GROUP BY (k)",
+            "SELECT id FROM ti WHERE id = ANY(ARRAY[1])",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_aggregate_carries_the_lowest_level_of_its_variables() {
+        let db = catalog();
+        // The FILTER reads this level's `t.owner_id` and the outer `o.id`:
+        // the lowest level is the subquery's, so it collapses its rows.
+        assert!(select_one(
+            &db,
+            "SELECT o.id, totals.n FROM owners o \
+             LEFT JOIN LATERAL ( \
+                SELECT count(*) FILTER (WHERE t.owner_id = o.id) AS n FROM tools t \
+             ) totals ON true \
+             WHERE o.id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT o.id, totals.n FROM owners o \
+             LEFT JOIN LATERAL ( \
+                SELECT count(t.id + o.id) AS n FROM tools t \
+             ) totals ON true \
+             WHERE o.id = $1",
+        ));
+        // Every variable is outer: the aggregate is the outer level's, so a
+        // scalar subquery over it returns a row per `tools` row.
+        let outer = view(
+            &db,
+            "SELECT (SELECT count(o.id) FROM tools t) FROM owners o WHERE o.id = $1",
+        );
+        let selects: Vec<&SelectStmt> = outer
+            .tree
+            .nodes()
+            .into_iter()
+            .filter_map(|(node, _)| match node {
+                NodeRef::SelectStmt(select) => Some(select),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selects.len(), 2);
+        assert!(!select_at_most_one_row(&db, &outer, selects[1]));
+    }
+
+    #[test]
+    fn a_scalar_sublink_uses_the_visible_ctes_and_aggregate_types() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "WITH o AS (SELECT id, tool_id FROM owners WHERE id = $1) \
+             SELECT t.name FROM tools t WHERE t.id = (SELECT tool_id FROM o)",
+        ));
+        assert!(select_one(
+            &db,
+            "WITH o AS (SELECT id, tool_id FROM owners WHERE id = $1) \
+             SELECT t.name FROM tools t WHERE t.id = (SELECT o.tool_id FROM o)",
+        ));
+        assert!(statement_one(
+            &db,
+            "WITH o AS (SELECT id, tool_id FROM owners WHERE id = $1) \
+             UPDATE tools SET name = 'x' \
+             WHERE id = (SELECT tool_id FROM o) RETURNING id",
+        ));
+        // An aggregate target is typed by the resolved function.
+        assert!(select_one(
+            &db,
+            "SELECT o.id FROM owners o WHERE o.id = (SELECT max(id) FROM owners)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT o.id FROM owners o WHERE o.id = (SELECT count(*) FROM tools)",
+        ));
+        // A correlated sublink is still not a fixed value.
+        assert!(!select_one(
+            &db,
+            "SELECT o.id FROM owners o \
+             WHERE o.id = (SELECT tool_id FROM owners WHERE id = o.id)",
+        ));
+    }
+
+    #[test]
+    fn a_row_constructor_equality_is_per_column() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "SELECT p.v FROM pairs p WHERE (p.a, p.b) = ($1, $2)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT p.v FROM pairs p WHERE ROW(p.a, p.b) = ROW($1, $2)",
+        ));
+        for sql in [
+            "SELECT p.v FROM pairs p WHERE (p.a, p.b) <> ($1, $2)",
+            "SELECT p.v FROM pairs p WHERE (p.a, p.b) < ($1, $2)",
+            "SELECT p.v FROM pairs p WHERE \
+             (p.a, p.b) IS NOT DISTINCT FROM ($1, $2)",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_single_element_in_or_any_is_an_equality() {
+        let db = catalog();
+        assert!(select_one(&db, "SELECT id FROM owners WHERE id IN ($1)"));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM owners WHERE id = ANY(ARRAY[$1::bigint])",
+        ));
+        for sql in [
+            "SELECT id FROM owners WHERE id IN ($1, $2)",
+            "SELECT id FROM owners WHERE id = ANY($1::bigint[])",
+            "SELECT id FROM owners WHERE id <> ALL(ARRAY[$1::bigint])",
+            "SELECT id FROM owners WHERE id NOT IN ($1)",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_using_merged_column_is_the_joins_side() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "SELECT o.id FROM owners o JOIN tools t USING (id) WHERE id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT o.id FROM owners o LEFT JOIN tools t USING (id) WHERE id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT t.name FROM owners o RIGHT JOIN tools t USING (id) WHERE id = $1",
+        ));
+        // A FULL join merges the columns with COALESCE, which isn't a plain
+        // column (and the join itself can emit unmatched rows).
+        assert!(!select_one(
+            &db,
+            "SELECT o.id FROM owners o FULL JOIN tools t USING (id) WHERE id = $1",
+        ));
+        // The unqualified name lands on a side whose key isn't fixed.
+        assert!(!select_one(
+            &db,
+            "SELECT o.id FROM owners o JOIN tools t USING (id) WHERE o.org_id = $1",
+        ));
+    }
+
+    #[test]
+    fn a_non_recursive_cte_in_a_recursive_with_is_judged() {
+        let db = catalog();
+        assert!(select_one(
+            &db,
+            "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT n FROM r",
+        ));
+        assert!(statement_one(
+            &db,
+            "WITH RECURSIVE r AS (SELECT 1 AS n) SELECT n FROM r",
+        ));
+        assert!(select_one(
+            &db,
+            "WITH RECURSIVE r AS (SELECT id FROM owners WHERE id = $1) \
+             SELECT id FROM r",
+        ));
+        // A body that reads its own name stays a give-up.
+        assert!(!select_one(
+            &db,
+            "WITH RECURSIVE r AS ( \
+                SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5 \
+             ) SELECT n FROM r",
+        ));
     }
 }
