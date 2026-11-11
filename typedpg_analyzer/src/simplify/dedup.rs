@@ -569,6 +569,10 @@ pub(super) struct Join<'a> {
     pub(super) right_rel: Option<usize>,
     pub(super) quals: Option<&'a protobuf::Node>,
     pub(super) using: Vec<&'a str>,
+    /// The `using` names whose two sides have the same type under a
+    /// deterministic collation: the merged column is then one side's own
+    /// value, with no coercion to a common type (PG's `buildMergedJoinVar`).
+    pub(super) using_uncoerced: Vec<&'a str>,
     /// The join may be null-extended by an outer join above it.
     pub(super) nullable: bool,
 }
@@ -873,6 +877,28 @@ impl<'a> Scope<'a> {
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>()?;
+                let using_uncoerced = using
+                    .iter()
+                    .copied()
+                    .filter(|name| {
+                        let info = |mask: u64| {
+                            let mut found = (0..self.rels.len())
+                                .filter(|&r| mask & (1u64 << r) != 0)
+                                .filter_map(|r| {
+                                    let attnum = self.rels[r].attnum(name)?;
+                                    self.rels[r].column_info(ctx, attnum)
+                                });
+                            match (found.next(), found.next()) {
+                                (Some(info), None) => Some(info),
+                                _ => None,
+                            }
+                        };
+                        matches!(
+                            (info(left), info(right)),
+                            (Some((l, true)), Some((r, true))) if l == r
+                        )
+                    })
+                    .collect();
                 self.joins.push(Join {
                     kind,
                     left,
@@ -881,6 +907,7 @@ impl<'a> Scope<'a> {
                     right_rel: single(&j.rarg, middle),
                     quals: j.quals.as_deref(),
                     using,
+                    using_uncoerced,
                     nullable,
                 });
                 Some(left | right)
@@ -1158,8 +1185,10 @@ impl<'a> Scope<'a> {
 
     /// Add one FROM subquery — `LATERAL` or not — with its output columns,
     /// as a one-row relation when this level's proof shows it yields at most
-    /// one row per evaluation (see
-    /// [`super::cardinality::select_at_most_one_row_in`]).
+    /// one row per evaluation, or its own `LIMIT` / `FETCH FIRST` is the
+    /// constant `0` or `1` without `WITH TIES` (see
+    /// [`super::cardinality::select_at_most_one_row_in`] and
+    /// [`super::cardinality::limit_bounds_one`]).
     ///
     /// The body is judged in PostgreSQL's namespace: a `LATERAL` one sees
     /// exactly the items to its left (each a base table, or a value item
@@ -1217,7 +1246,8 @@ impl<'a> Scope<'a> {
         };
         let env = super::cardinality::subquery_cte_env(ctx, env, select, around);
         let single_row =
-            super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &scope, &env);
+            super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &scope, &env)
+                || super::cardinality::limit_bounds_one(select);
         let (names, mut columns_known) = subquery_output_names(select)?;
         let mut columns: Vec<(String, i16)> = Vec::with_capacity(names.len());
         for (index, name) in names.into_iter().enumerate() {
@@ -1372,7 +1402,7 @@ impl<'a> Scope<'a> {
                     .filter(|(_, rel)| rel.columns.iter().any(|(n, _)| n == name));
                 match (found.next(), found.next()) {
                     (Some((r, _)), None) => attnum(r, name),
-                    _ => Col::Other,
+                    _ => self.resolve_using(name),
                 }
             }
             [qualifier, name] => match self.rel_named(qualifier) {
@@ -1396,6 +1426,41 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The relation and attnum an unqualified reference to a join's USING
+    /// column names (PG merges the two same-named inputs into one output
+    /// column): the left input's for an INNER or LEFT join, the right
+    /// input's for a RIGHT join. A FULL join merges them with `COALESCE`,
+    /// which is not a plain column, so it gives up. `Other` when the name
+    /// isn't a USING column or the side doesn't have exactly one.
+    fn resolve_using(&self, name: &str) -> Col {
+        for join in self.joins.iter().rev() {
+            if !join.using.contains(&name) {
+                continue;
+            }
+            let side = match join.kind {
+                JoinType::JoinInner | JoinType::JoinLeft => join.left,
+                JoinType::JoinRight => join.right,
+                _ => return Col::Other,
+            };
+            // The merged column is that side's own value only when neither
+            // side needs a coercion to the common type: with a `bigint` and
+            // a `double precision` side it is a converted value, which can't
+            // stand for the column.
+            if !join.using_uncoerced.contains(&name) {
+                return Col::Other;
+            }
+            let mut found = (0..self.rels.len())
+                .filter(|&r| side & (1u64 << r) != 0)
+                .filter(|&r| self.rels[r].columns.iter().any(|(n, _)| n == name))
+                .map(|r| (r, self.rels[r].attnum(name)));
+            return match (found.next(), found.next()) {
+                (Some((r, Some(attnum))), None) => Col::Rel(r, attnum),
+                _ => Col::Other,
+            };
+        }
+        Col::Other
+    }
+
     /// `expr` as one side of an equality the proof reads: a column of this
     /// scope, a parameter, a constant, or — `outer` being the levels this
     /// one is nested in — a column of an outer query, which is fixed for
@@ -1413,6 +1478,7 @@ impl<'a> Scope<'a> {
         expr: &protobuf::Node,
         outer: Option<&FromScope<'_>>,
         scalar_sublinks: bool,
+        env: Option<&CteEnv>,
     ) -> Option<Operand> {
         match expr.node.as_ref()? {
             Node::ColumnRef(cr) => {
@@ -1462,7 +1528,9 @@ impl<'a> Scope<'a> {
                     rels: rel.map_or(0, |r| 1 << r),
                 })
             }
-            Node::SubLink(sub) if scalar_sublinks => self.scalar_sublink_operand(ctx, sub),
+            Node::SubLink(sub) if scalar_sublinks => {
+                self.scalar_sublink_operand(ctx, sub, outer, env)
+            }
             Node::ParamRef(p) => {
                 let index = usize::try_from(p.number).ok()?.checked_sub(1)?;
                 let param = ctx.analyzed.params.get(index)?;
@@ -1494,7 +1562,7 @@ impl<'a> Scope<'a> {
                 if !type_name.typmods.is_empty() || !type_name.array_bounds.is_empty() {
                     return None;
                 }
-                let arg = self.operand(ctx, cast.arg.as_deref()?, outer, scalar_sublinks)?;
+                let arg = self.operand(ctx, cast.arg.as_deref()?, outer, scalar_sublinks, env)?;
                 let typ = type_name_oid(ctx, type_name)?;
                 // A conversion that runs a volatile function could yield
                 // another value each time the row pair is evaluated.
@@ -1508,10 +1576,10 @@ impl<'a> Scope<'a> {
                 )
             }
             Node::FuncCall(call) if scalar_sublinks => {
-                self.call_operand(ctx, call, outer, scalar_sublinks)
+                self.call_operand(ctx, call, outer, scalar_sublinks, env)
             }
             Node::AExpr(expr) if scalar_sublinks && expr.kind() == AExprKind::AexprOp => {
-                self.operator_operand(ctx, expr, outer, scalar_sublinks)
+                self.operator_operand(ctx, expr, outer, scalar_sublinks, env)
             }
             _ => None,
         }
@@ -1540,6 +1608,7 @@ impl<'a> Scope<'a> {
         call: &protobuf::FuncCall,
         outer: Option<&FromScope<'_>>,
         scalar_sublinks: bool,
+        env: Option<&CteEnv>,
     ) -> Option<Operand> {
         let (schema, name, notation) = call_syntax(call)?;
         let mut operands = Vec::with_capacity(call.args.len());
@@ -1549,6 +1618,7 @@ impl<'a> Scope<'a> {
                 crate::functions::call_arg_value(arg),
                 outer,
                 scalar_sublinks,
+                env,
             )?);
         }
         let types: Vec<PgTypeOid> = operands.iter().map(|operand| operand.typ).collect();
@@ -1597,13 +1667,14 @@ impl<'a> Scope<'a> {
         expr: &protobuf::AExpr,
         outer: Option<&FromScope<'_>>,
         scalar_sublinks: bool,
+        env: Option<&CteEnv>,
     ) -> Option<Operand> {
         let name = string_list(&expr.name).join(".");
         let left = match expr.lexpr.as_deref() {
-            Some(left) => Some(self.operand(ctx, left, outer, scalar_sublinks)?),
+            Some(left) => Some(self.operand(ctx, left, outer, scalar_sublinks, env)?),
             None => None,
         };
-        let right = self.operand(ctx, expr.rexpr.as_deref()?, outer, scalar_sublinks)?;
+        let right = self.operand(ctx, expr.rexpr.as_deref()?, outer, scalar_sublinks, env)?;
         let op = ctx.catalog.find_operator(
             &name,
             left.as_ref().map(|operand| operand.typ),
@@ -1632,9 +1703,21 @@ impl<'a> Scope<'a> {
     /// The one value a scalar sublink yields per evaluation, when it does
     /// not read a column of this level: it may read outer levels and its
     /// own, and a volatile function inside it runs once with it. Its type is
-    /// that of the bare column of its own `FROM` its target list selects;
-    /// anything else is left to the proof's give-up answer.
-    fn scalar_sublink_operand(&self, ctx: &Ctx<'_>, sub: &protobuf::SubLink) -> Option<Operand> {
+    /// that of the bare column of its own `FROM` its target list selects, or
+    /// of the aggregate it selects; anything else is left to the proof's
+    /// give-up answer.
+    ///
+    /// `visible` is the CTE environment of the level the sublink is written
+    /// in, so a `WITH` CTE is judged as it is there (its own `WITH`, if any,
+    /// shadows it). The `DISTINCT` proof passes none: every CTE name stays a
+    /// reference it gives up on.
+    fn scalar_sublink_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        sub: &protobuf::SubLink,
+        outer: Option<&FromScope<'_>>,
+        visible: Option<&CteEnv>,
+    ) -> Option<Operand> {
         if sub.sub_link_type != protobuf::SubLinkType::ExprSublink as i32 {
             return None;
         }
@@ -1651,30 +1734,87 @@ impl<'a> Scope<'a> {
         let Some(Node::ResTarget(target)) = &target.node else {
             return None;
         };
-        let Some(Node::ColumnRef(column)) = target.val.as_deref().and_then(|v| v.node.as_ref())
-        else {
-            return None;
+        let value = target.val.as_deref()?;
+        // A sublink is a query level of its own (and may read levels above
+        // this one). Its own `WITH` shadows the enclosing level's CTE names.
+        // A sublink sees this whole level, then the levels around it.
+        let opaque = FromScope::opaque(None);
+        let (env, nested) = match visible {
+            Some(visible) => {
+                let nested = outer.unwrap_or(&opaque);
+                let env = super::cardinality::subquery_cte_env(ctx, visible, select, nested);
+                (env, nested)
+            }
+            None => (CteEnv::blocked(&cte_names(ctx.tree)), &opaque),
         };
-        let Fields::Names(names) = column_ref_fields(column) else {
-            return None;
-        };
-        // Its own FROM only: a CTE name is a reference the proof gives up on,
-        // shadowing a table of the same name it may read.
-        let env = CteEnv::blocked(&cte_names(ctx.tree));
-        let root = FromScope::opaque(None);
-        let scope = Scope::build_env(ctx, &env, &select.from_clause, &root)?;
+        let scope = Scope::build_env(ctx, &env, &select.from_clause, nested)?;
         if !self.sublink_uncorrelated(&scope, sub) {
             return None;
         }
-        let Col::Rel(r, attnum) = scope.resolve(&names) else {
-            return None;
+        let (typ, deterministic_collation) = match value.node.as_ref()? {
+            Node::ColumnRef(column) => {
+                let Fields::Names(names) = column_ref_fields(column) else {
+                    return None;
+                };
+                let Col::Rel(r, attnum) = scope.resolve(&names) else {
+                    return None;
+                };
+                scope.rels[r].column_info(ctx, attnum)?
+            }
+            Node::FuncCall(call) => (scope.sublink_aggregate_type(ctx, call, nested, &env)?, true),
+            _ => return None,
         };
-        let (typ, deterministic_collation) = scope.rels[r].column_info(ctx, attnum)?;
         deterministic_collation.then_some(Operand {
             typ,
             column: None,
             rels: 0,
         })
+    }
+
+    /// The return type of the aggregate call `call` in a scalar sublink's
+    /// own level, when the catalog resolves it and its type is not a
+    /// polymorphic pseudo-type left unresolved.
+    fn sublink_aggregate_type(
+        &self,
+        ctx: &Ctx<'_>,
+        call: &protobuf::FuncCall,
+        outer: &FromScope<'_>,
+        env: &CteEnv,
+    ) -> Option<PgTypeOid> {
+        if call.over.is_some() {
+            return None;
+        }
+        let (schema, name) = function_name(&call.funcname)?;
+        let notation = crate::functions::CallNotation::of(call).ok()?;
+        let mut types = Vec::with_capacity(call.args.len());
+        for arg in &call.args {
+            let operand = self.operand(
+                ctx,
+                crate::functions::call_arg_value(arg),
+                Some(outer),
+                true,
+                Some(env),
+            )?;
+            types.push(operand.typ);
+        }
+        let resolved = crate::functions::resolve_function(
+            ctx.catalog,
+            schema,
+            name,
+            &types,
+            &notation,
+            call.agg_star,
+            None,
+        )
+        .ok()?;
+        if !resolved.is_aggregate
+            || resolved.is_window
+            || resolved.is_set_returning
+            || crate::polymorphic::is_polymorphic(resolved.return_type_oid)
+        {
+            return None;
+        }
+        deterministic_type(ctx, resolved.return_type_oid).then_some(resolved.return_type_oid)
     }
 
     /// Whether nothing in the sublink's subquery reads a column of this
@@ -1760,20 +1900,22 @@ impl<'a> Scope<'a> {
         conjunct: &protobuf::Node,
         outer: Option<&FromScope<'_>>,
     ) -> Vec<EqFact> {
-        self.facts_from_conjunct(ctx, conjunct, outer, false)
+        self.facts_from_conjunct(ctx, conjunct, outer, false, None)
     }
 
     /// [`Self::equality_facts`], the cardinality proof's wider form: a scalar
     /// sublink uncorrelated with this level counts as a value operand, and a
     /// value a volatile cast decides does not. The `DISTINCT` proof keeps
-    /// the narrow form.
+    /// the narrow form. `env` is the level's visible CTE environment, which
+    /// the sublink's own body is judged in.
     pub(super) fn cardinality_facts(
         &self,
         ctx: &Ctx<'_>,
         conjunct: &protobuf::Node,
         outer: Option<&FromScope<'_>>,
+        env: &CteEnv,
     ) -> Vec<EqFact> {
-        self.facts_from_conjunct(ctx, conjunct, outer, true)
+        self.facts_from_conjunct(ctx, conjunct, outer, true, Some(env))
     }
 
     fn facts_from_conjunct(
@@ -1782,6 +1924,7 @@ impl<'a> Scope<'a> {
         conjunct: &protobuf::Node,
         outer: Option<&FromScope<'_>>,
         cardinality: bool,
+        env: Option<&CteEnv>,
     ) -> Vec<EqFact> {
         let Some(Node::AExpr(e)) = &conjunct.node else {
             return Vec::new();
@@ -1791,19 +1934,69 @@ impl<'a> Scope<'a> {
             ["pg_catalog", "="] => "pg_catalog.=",
             _ => return Vec::new(),
         };
-        if e.kind() != AExprKind::AexprOp {
-            return Vec::new();
-        }
         let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
             return Vec::new();
         };
-        let (Some(l), Some(r)) = (
-            self.operand(ctx, l, outer, cardinality),
-            self.operand(ctx, r, outer, cardinality),
-        ) else {
-            return Vec::new();
-        };
-        self.facts_of(ctx, name, &l, &r, cardinality)
+        let operand = |expr: &protobuf::Node| self.operand(ctx, expr, outer, cardinality, env);
+        match e.kind() {
+            AExprKind::AexprOp => {
+                // PG's `make_row_comparison_op` turns a row comparison into
+                // the AND of its columns' equalities. Only `=` is read, and
+                // both sides must be rows of the same arity.
+                if let (Some(Node::RowExpr(left)), Some(Node::RowExpr(right))) =
+                    (l.node.as_ref(), r.node.as_ref())
+                {
+                    if left.args.is_empty() || left.args.len() != right.args.len() {
+                        return Vec::new();
+                    }
+                    let mut out = Vec::new();
+                    for (left, right) in left.args.iter().zip(&right.args) {
+                        let (Some(left), Some(right)) = (operand(left), operand(right)) else {
+                            return Vec::new();
+                        };
+                        out.extend(self.facts_of(ctx, name, &left, &right, cardinality));
+                    }
+                    return out;
+                }
+                let (Some(l), Some(r)) = (operand(l), operand(r)) else {
+                    return Vec::new();
+                };
+                self.facts_of(ctx, name, &l, &r, cardinality)
+            }
+            // `x IN (v)` with one element and `x = ANY(ARRAY[v])` with a
+            // one-element array constructor are the equality `x = v`.
+            AExprKind::AexprIn => {
+                let Some(Node::List(list)) = r.node.as_ref() else {
+                    return Vec::new();
+                };
+                let [item] = list.items.as_slice() else {
+                    return Vec::new();
+                };
+                let (Some(l), Some(r)) = (operand(l), operand(item)) else {
+                    return Vec::new();
+                };
+                self.facts_of(ctx, name, &l, &r, cardinality)
+            }
+            AExprKind::AexprOpAny => {
+                let Some(Node::AArrayExpr(array)) = r.node.as_ref() else {
+                    return Vec::new();
+                };
+                let [item] = array.elements.as_slice() else {
+                    return Vec::new();
+                };
+                let (Some(l), Some(r)) = (operand(l), operand(item)) else {
+                    return Vec::new();
+                };
+                // The array constructor resolves its element's type first
+                // (`ARRAY['1']` is `text[]`), so the operator PG picks is
+                // not the one an unknown literal would get on its own.
+                if r.typ == oid::UNKNOWN {
+                    return Vec::new();
+                }
+                self.facts_of(ctx, name, &l, &r, cardinality)
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// The facts `USING (name)` proves between the join's sides.
@@ -2053,6 +2246,38 @@ impl<'a> Scope<'a> {
                 det |= fact.other;
             }
             Some(det)
+        })
+    }
+
+    /// Whether relation `rel`'s column `attnum` is equated by `facts` to a
+    /// value read only from relations in `known` — a constant, a parameter,
+    /// an outer column or a determined relation's column — through the
+    /// column type's default btree equality, under a deterministic
+    /// collation.
+    pub(super) fn column_fixed_by_facts(
+        &self,
+        ctx: &Ctx<'_>,
+        rel: usize,
+        attnum: i16,
+        facts: &[EqFact],
+        known: u64,
+    ) -> bool {
+        let Some((typ, deterministic_collation)) = self.rels[rel].column_info(ctx, attnum) else {
+            return false;
+        };
+        if !deterministic_collation {
+            return false;
+        }
+        let Some(family) = default_btree_family(ctx.catalog, typ) else {
+            return false;
+        };
+        facts.iter().any(|fact| {
+            fact.rel == rel
+                && fact.attnum == attnum
+                && fact.other & !known == 0
+                && operand_type_matches(ctx, typ, fact.declared)
+                && in_btree_equality(ctx, &family, fact.op)
+                && grouping_equality(ctx, fact.op)
         })
     }
 
@@ -2348,6 +2573,22 @@ fn operand_type_matches(ctx: &Ctx<'_>, column: PgTypeOid, declared: Option<PgTyp
 }
 
 /// `op` is the btree equality (strategy 3) of operator family `family`.
+/// Whether rows equal to one value under `op` are equal to each other
+/// under their type's own grouping equality: `op` compares one type with
+/// itself, or two integer types (exact, so `int8 = int4` still fixes one
+/// value). A cross-type equality in general need not: `timestamp =
+/// timestamptz` converts through the session time zone, and two distinct
+/// timestamps can both equal one instant.
+fn grouping_equality(ctx: &Ctx<'_>, op: PgOperatorOid) -> bool {
+    const INTEGERS: [PgTypeOid; 3] = [oid::INT2, oid::INT4, oid::INT8];
+    ctx.catalog.pg_operator.get(&op).is_some_and(|declared| {
+        declared.oprleft.is_some_and(|left| {
+            left == declared.oprright
+                || (INTEGERS.contains(&left) && INTEGERS.contains(&declared.oprright))
+        })
+    })
+}
+
 fn in_btree_equality(ctx: &Ctx<'_>, family: &(String, PgNamespaceOid), op: PgOperatorOid) -> bool {
     ctx.catalog.pg_amop.iter().any(|a| {
         a.amopmethod == "btree"

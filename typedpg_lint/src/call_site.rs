@@ -1165,4 +1165,76 @@ mod tests {
             1
         );
     }
+    #[test]
+    fn fetch_one_on_a_limited_from_subquery_is_fine() {
+        let mut db = catalog();
+        db.apply_sql("CREATE TABLE events (id bigint PRIMARY KEY);")
+            .unwrap();
+        let sql = "SELECT latest.id FROM \
+                   (SELECT id FROM events ORDER BY id DESC LIMIT 1) latest";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+        // Two rows, or `WITH TIES`, is still unbounded.
+        for sql in [
+            "SELECT latest.id FROM \
+             (SELECT id FROM events ORDER BY id DESC LIMIT 2) latest",
+            "SELECT latest.id FROM \
+             (SELECT id FROM events ORDER BY id DESC FETCH FIRST 1 ROW WITH TIES) latest",
+        ] {
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                    Rule::FetchMayReturnMany
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_one_on_a_single_valued_group_key_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE owners (
+                id bigint PRIMARY KEY,
+                tool_id bigint,
+                email text UNIQUE,
+                org_id bigint
+             );
+             CREATE TABLE tools (
+                id bigint PRIMARY KEY,
+                name text NOT NULL,
+                owner_id bigint
+             );",
+        )
+        .unwrap();
+        let sql = "SELECT o.id, count(t.id) FROM owners o \
+                   LEFT JOIN tools t ON t.owner_id = o.id \
+                   WHERE o.id = $1 GROUP BY o.id";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+        // Without the key fact the grouping can emit a group per owner.
+        let sql = "SELECT o.id, count(t.id) FROM owners o \
+                   LEFT JOIN tools t ON t.owner_id = o.id GROUP BY o.id";
+        assert_eq!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .len(),
+            1
+        );
+    }
 }
