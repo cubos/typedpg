@@ -530,23 +530,22 @@ pub(crate) fn process_from_item(
                 // `invalid reference to FROM-clause entry for table "x"`
                 // diagnostic instead of a generic missing-column message.
                 // Lateral visibility is transitive: a LATERAL subquery nested
-                // inside another one still sees the outermost lateral refs,
-                // so pass the enclosing scope's own lateral tier along too.
-                // The lateral tier this level received belongs to the
-                // enclosing level: a non-LATERAL subquery still reaches it
-                // as an outer reference, only this level's own items are
-                // off limits.
-                let mut enclosing = scope.enclosing_sources();
-                let (lateral_sources, mut shadowed_sources): (Vec<_>, Vec<_>) = if sub.lateral {
-                    // This level's own entries carry its nullability down.
-                    let mut visible = scope.lateral_visible();
-                    let own = scope.sources.len();
-                    let baked = null_ctx.bake_sources(&visible[..own]);
-                    visible.splice(..own, baked);
-                    (visible, Vec::new())
+                // inside another one still sees the outermost levels, so the
+                // enclosing scope's tiers pass down too. Each enclosing level
+                // stays a tier of its own: a non-LATERAL subquery reaches all
+                // of them, only this level's own items are off limits.
+                let (outer_tiers, mut shadowed_sources): (Vec<Vec<_>>, Vec<_>) = if sub.lateral {
+                    // This level's own entries (tier 0) carry its nullability
+                    // down; the tiers below are the enclosing levels' own.
+                    let mut tiers = scope.lateral_visible_tiers();
+                    if let Some(own) = tiers.first_mut() {
+                        *own = null_ctx.bake_sources(own);
+                    }
+                    (tiers, Vec::new())
                 } else {
-                    enclosing.splice(0..0, scope.lateral_sources.iter().cloned());
-                    (Vec::new(), scope.sources.clone())
+                    // A non-LATERAL subquery sees none of this level's items,
+                    // only the levels around it, each a tier of its own.
+                    (scope.enclosing_tiers().to_vec(), scope.sources.clone())
                 };
                 // Entries this level already can't reference stay
                 // unreferencable below it: PG's errorMissingRTE finds them
@@ -582,8 +581,7 @@ pub(crate) fn process_from_item(
                                     snapshot,
                                     params,
                                     cte_scopes,
-                                    &lateral_sources,
-                                    &enclosing,
+                                    &outer_tiers,
                                     &shadowed_sources,
                                 )
                             })
@@ -2058,9 +2056,7 @@ fn srf_arg_scope(scope: &Scope) -> Scope {
             s.lateral_blocked |= scope.lateral_blocked_aliases.contains(&s.alias);
             s
         }));
-    arg_scope
-        .lateral_sources
-        .extend(scope.lateral_sources.clone());
+    arg_scope.outer_tiers.extend(scope.outer_tiers.clone());
     arg_scope.outer_sources.extend(scope.outer_sources.clone());
     arg_scope.shadowed_sources = scope.shadowed_sources.clone();
     arg_scope.ctes = scope.ctes.clone();
@@ -2074,7 +2070,7 @@ fn srf_arg_scope(scope: &Scope) -> Scope {
 /// keyword on a `RangeFunction` is a noise word, because the args can already
 /// refer to earlier FROM items implicitly. So we copy the visible sources
 /// unconditionally, not just when `rf.lateral` is set. We also propagate
-/// `outer_sources` so SRF args inside a correlated sublink can reach aliases
+/// `outer_tiers` so SRF args inside a correlated sublink can reach aliases
 /// bound by the enclosing query (e.g. `pg_stats_ext` does
 /// `(SELECT … FROM unnest(s.stxkeys) …)` where `s` is from the outer FROM).
 fn infer_srf_arg_types(
@@ -2968,7 +2964,7 @@ fn process_tablesample(
         )));
     }
     let mut arg_scope = Scope {
-        lateral_sources: scope.lateral_sources.clone(),
+        outer_tiers: scope.outer_tiers.clone(),
         outer_sources: scope.outer_sources.clone(),
         ctes: scope.ctes.clone(),
         ..Scope::default()

@@ -563,13 +563,17 @@ fn ambiguous_column_error(
 #[derive(Debug, Clone)]
 pub(crate) struct Scope {
     pub sources: Vec<TableSource>,
-    /// Same-level FROM items made visible by `LATERAL`. PG resolves them
-    /// like outer references: the subquery's own `sources` win first, these
-    /// come next, and ambiguity is only raised *within* a tier (two lateral
-    /// sources sharing a column name is ambiguous; a lateral source sharing
-    /// a name with an inner source is not). Excluded from `*` expansion —
-    /// `SELECT * FROM b` inside `LATERAL (…)` produces only `b`'s columns.
-    pub lateral_sources: Vec<TableSource>,
+    /// The enclosing query levels, nearest first: tier 0 is the namespace
+    /// the level containing this scope exposes (the items to the left of a
+    /// `LATERAL` item, a sublink's current level), tier 1 the namespace
+    /// around that one, and so on. PG's parse-state chain: a name resolves
+    /// in the nearest level holding it and is ambiguous only *within* one
+    /// tier. Excluded from `*` expansion — `SELECT * FROM b` inside
+    /// `LATERAL (…)` produces only `b`'s columns.
+    pub outer_tiers: Vec<Vec<TableSource>>,
+    /// The rule `OLD` / `NEW` pseudo-relations, which every level reaches as
+    /// outer references (`table_only`: by name, never by an unqualified
+    /// column). Kept apart from [`Self::outer_tiers`] as the farthest tier.
     pub outer_sources: Vec<TableSource>,
     /// Aliases that exist in the enclosing scope but are *not* visible here
     /// — same shape PG uses for non-LATERAL subqueries: a reference like
@@ -653,7 +657,7 @@ impl Default for Scope {
     fn default() -> Self {
         Scope {
             sources: Vec::new(),
-            lateral_sources: Vec::new(),
+            outer_tiers: Vec::new(),
             outer_sources: RULE_PSEUDO_RELATIONS.with(|r| r.borrow().clone()),
             shadowed_sources: Vec::new(),
             lateral_blocked_aliases: Default::default(),
@@ -958,35 +962,46 @@ impl Scope {
     fn all_tiers(&self) -> impl Iterator<Item = &TableSource> {
         self.sources
             .iter()
-            .chain(self.lateral_sources.iter())
+            .chain(self.outer_tiers.iter().flatten())
             .chain(self.outer_sources.iter())
     }
 
+    /// Every tier this level resolves against, nearest first: its own FROM
+    /// items, the enclosing levels it received, then the rule pseudo-relations.
+    fn tiers(&self) -> impl Iterator<Item = &[TableSource]> {
+        std::iter::once(self.sources.as_slice())
+            .chain(self.outer_tiers.iter().map(Vec::as_slice))
+            .chain(std::iter::once(self.outer_sources.as_slice()))
+    }
+
     /// The sources a LATERAL item (or a FROM function's arguments) at this
-    /// point may reference: this level's FROM items so far plus the lateral
-    /// tier it received, with a RIGHT / FULL join's left side marked
-    /// [`TableSource::lateral_blocked`].
-    pub fn lateral_visible(&self) -> Vec<TableSource> {
-        self.sources
-            .iter()
-            .chain(self.lateral_sources.iter())
-            .cloned()
-            .map(|mut s| {
-                if self.lateral_blocked_aliases.contains(&s.alias) {
-                    s.lateral_blocked = true;
-                }
-                s
-            })
+    /// point may reference, as tiers: this level's FROM items so far, then
+    /// the enclosing levels it received, nearest first, with a RIGHT / FULL
+    /// join's left side marked [`TableSource::lateral_blocked`]. A name is
+    /// ambiguous only within one tier.
+    pub fn lateral_visible_tiers(&self) -> Vec<Vec<TableSource>> {
+        let mark = |s: &TableSource| {
+            let mut s = s.clone();
+            if self.lateral_blocked_aliases.contains(&s.alias) {
+                s.lateral_blocked = true;
+            }
+            s
+        };
+        std::iter::once(self.sources.iter().map(mark).collect())
+            .chain(
+                self.outer_tiers
+                    .iter()
+                    .map(|tier| tier.iter().map(mark).collect()),
+            )
             .collect()
     }
 
-    /// The enclosing query levels' entries this level reaches as outer
-    /// references, minus the rule OLD / NEW pseudo-relations every
-    /// [`Scope::default`] already starts with — what a nested subquery
-    /// hands down as its correlated tier.
-    pub fn enclosing_sources(&self) -> Vec<TableSource> {
-        let pseudo = RULE_PSEUDO_RELATIONS.with(|r| r.borrow().len());
-        self.outer_sources.iter().skip(pseudo).cloned().collect()
+    /// The enclosing query levels this level reaches as outer references,
+    /// nearest first — what a nested subquery hands down. The rule OLD / NEW
+    /// pseudo-relations are not included: every [`Scope::default`] starts
+    /// with them.
+    pub fn enclosing_tiers(&self) -> &[Vec<TableSource>] {
+        &self.outer_tiers
     }
 
     /// The column a plain column reference (`c`, `t.c`, `s.t.c`; not `*`)
@@ -1076,8 +1091,8 @@ impl Scope {
         alias: &str,
         span: Option<SourceSpan>,
     ) -> Result<(), AnalyzeError> {
-        let nearest = [&self.sources, &self.lateral_sources, &self.outer_sources]
-            .into_iter()
+        let nearest = self
+            .tiers()
             .find(|tier| tier.iter().any(|s| s.answers_to(alias)));
         if nearest.is_some_and(|tier| tier.iter().filter(|s| s.answers_to(alias)).count() > 1) {
             return Err(crate::pgmsg::ambiguous_table_reference(alias, span).finalize_implicit());
@@ -1086,11 +1101,7 @@ impl Scope {
     }
 
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
-        self.sources
-            .iter()
-            .chain(self.lateral_sources.iter())
-            .chain(self.outer_sources.iter())
-            .find(|s| s.answers_to(alias))
+        self.all_tiers().find(|s| s.answers_to(alias))
     }
 
     pub fn resolve_column(
@@ -1104,10 +1115,10 @@ impl Scope {
             // PG's `refnameNamespaceItem` stops at the nearest level whose
             // namespace has an entry of that name: an inner `u` hides an
             // outer one even when only the outer has the column.
-            let nearest = [&self.sources, &self.lateral_sources, &self.outer_sources]
-                .into_iter()
+            let nearest = self
+                .tiers()
                 .find(|tier| tier.iter().any(|s| s.answers_to(t)))
-                .map_or(&[][..], |tier| tier.as_slice());
+                .unwrap_or(&[]);
             for source in nearest {
                 if !source.answers_to(t) {
                     continue;
@@ -1209,7 +1220,7 @@ impl Scope {
             .finalize_implicit());
         }
 
-        for tier in [&self.sources, &self.lateral_sources, &self.outer_sources] {
+        for tier in self.tiers() {
             let mut matches: Vec<(&TableSource, &ScopeColumn)> = Vec::new();
             for source in tier {
                 // Columns merged away by JOIN USING / NATURAL are only

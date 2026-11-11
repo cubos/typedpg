@@ -379,6 +379,39 @@ mod tests {
     }
 
     #[test]
+    fn a_non_lateral_from_subquery_binds_the_outer_level() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE outer_rows (id int PRIMARY KEY, lookup bigint);
+             CREATE TABLE inner_rows (id int PRIMARY KEY, lookup double precision);
+             CREATE TABLE keys (id bigint PRIMARY KEY);
+             CREATE TABLE exact_rows (id int PRIMARY KEY, lookup bigint);",
+        )
+        .unwrap();
+        // The subquery's `x` is the outer `inner_rows`: its float8 `lookup`
+        // can equal two bigint keys, so the LIMIT still matters.
+        let shadowed = "SELECT ARRAY( \
+             SELECT s.id FROM outer_rows x \
+             CROSS JOIN (SELECT k.id FROM keys k WHERE k.id = x.lookup LIMIT 1) s \
+             WHERE x.id = 1 \
+         ) AS arr FROM inner_rows x WHERE x.id = 1";
+        assert!(
+            limit_findings(&db, shadowed).is_empty(),
+            "{:?}",
+            limit_findings(&db, shadowed)
+        );
+        // Against the outer `exact_rows`' bigint `lookup`, the key lookup is
+        // one row and the LIMIT is redundant.
+        let exact = "SELECT ARRAY( \
+             SELECT s.id FROM exact_rows x \
+             CROSS JOIN (SELECT k.id FROM keys k WHERE k.id = x.lookup LIMIT 1) s \
+             WHERE x.id = 1 \
+         ) AS arr FROM exact_rows x WHERE x.id = 1";
+        let findings = limit_findings(&db, exact);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+    }
+
+    #[test]
     fn an_allow_comment_suppresses_the_rule() {
         let db = catalog();
         let sql = "-- typedpg-lint: allow(redundant_limit)\nSELECT 1 LIMIT 1";

@@ -14,7 +14,7 @@ use typedpg_pg_query::protobuf::{
 
 use super::Ctx;
 use crate::coerce::{CoercionContext, CoercionPath};
-use crate::oid::{PgClassOid, PgProcOid};
+use crate::oid::{PgClassOid, PgCollationOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{PgCatalog, ProKind, ProVolatile, RelKind, TypType};
 
 /// OIDs below this are PG's own objects (`FirstNormalObjectId`).
@@ -32,7 +32,7 @@ pub(crate) struct ResolvedColumn {
 
 /// A FROM item of a [`FromScope`].
 #[derive(Debug, Clone)]
-enum Item {
+pub(crate) enum Item {
     /// A base table: the name it is referenced by (its alias, or its
     /// name, with the schema it was written with when it has no alias).
     Table {
@@ -45,9 +45,18 @@ enum Item {
         /// ones by position.
         columns: Vec<(String, i16)>,
     },
-    /// Anything else (a subquery, a function, a CTE, a view, a join with
-    /// an alias): its columns are unknown, so
-    /// a reference that may be to it resolves to nothing. `refname` is the
+    /// A FROM item that isn't a base table — a CTE reference, a FROM
+    /// subquery, a VALUES list, a FROM function — whose columns' types are
+    /// known: each column's name, its type (`None` when not proven) and
+    /// whether its collation is deterministic. `refname` is the name it can
+    /// be qualified by, empty when it has none.
+    Value {
+        refname: String,
+        columns: Vec<(String, Option<PgTypeOid>, bool)>,
+    },
+    /// Anything else (a subquery, function, CTE or view whose columns aren't
+    /// known, a join with an alias): a reference that may be to it resolves
+    /// to nothing. `refname` is the
     /// name it can be qualified by; `None` when it isn't known — PG names
     /// an unaliased function after the function (`FROM unnest(…)` is
     /// `unnest`), an unaliased subquery, VALUES or table function after
@@ -63,7 +72,16 @@ impl Item {
                 .iter()
                 .find(|(name, _)| name == column)
                 .map(|(_, attnum)| *attnum),
-            Item::Opaque { .. } => None,
+            Item::Value { .. } | Item::Opaque { .. } => None,
+        }
+    }
+
+    /// Whether an unqualified `column` may bind to this item.
+    fn has_column(&self, column: &str) -> bool {
+        match self {
+            Item::Table { .. } => self.attnum(column).is_some() || is_system_column(column),
+            Item::Value { columns, .. } => columns.iter().any(|(name, _, _)| name == column),
+            Item::Opaque { .. } => true,
         }
     }
 }
@@ -78,6 +96,12 @@ pub(crate) struct FromScope<'a> {
     /// GROUPING SETS / ROLLUP / CUBE: a grouped column can read NULL.
     grouping_sets: bool,
     parent: Option<&'a FromScope<'a>>,
+    /// This scope is a query level nested in the level its `parent`
+    /// describes, whose visible namespace is `items` rather than a `FROM`
+    /// of its own: a `LATERAL` FROM subquery sees the items to its left but
+    /// is still nested in the enclosing query level (its aggregates may
+    /// belong to that level).
+    nested: bool,
 }
 
 impl<'a> FromScope<'a> {
@@ -110,6 +134,7 @@ impl<'a> FromScope<'a> {
             items,
             grouping_sets,
             parent,
+            nested: false,
         }
     }
 
@@ -129,7 +154,50 @@ impl<'a> FromScope<'a> {
             items,
             grouping_sets: false,
             parent,
+            nested: false,
         }
+    }
+
+    /// [`Self::of_items`] for the items to the left of a `LATERAL` FROM
+    /// item: a query level nested in the levels around the `FROM` clause,
+    /// seeing exactly those items (see [`Self::has_parent`]).
+    pub(crate) fn of_items_nested(
+        ctx: &Ctx<'_>,
+        from: &[Node],
+        parent: Option<&'a FromScope<'a>>,
+    ) -> FromScope<'a> {
+        FromScope {
+            nested: true,
+            ..Self::of_items(ctx, from, parent)
+        }
+    }
+
+    /// A level of `items` alone (a `LATERAL` FROM subquery's items to its
+    /// left, built from the relations already known): `parent` around it,
+    /// `nested` when it is a query level nested in that parent (see
+    /// [`Self::has_parent`]).
+    pub(crate) fn level(
+        items: Vec<Item>,
+        parent: Option<&'a FromScope<'a>>,
+        nested: bool,
+    ) -> FromScope<'a> {
+        FromScope {
+            items,
+            grouping_sets: false,
+            parent,
+            nested,
+        }
+    }
+
+    /// A level with no items (a `FROM` subquery that could not resolve
+    /// anything against the levels around it), parented by `parent`.
+    pub(crate) fn empty(parent: Option<&'a FromScope<'a>>) -> FromScope<'a> {
+        Self::level(Vec::new(), parent, false)
+    }
+
+    /// The levels around this one.
+    pub(crate) fn parent(&self) -> Option<&'a FromScope<'a>> {
+        self.parent
     }
 
     /// The scope an UPDATE's SET and WHERE, or a DELETE's WHERE, see: the
@@ -153,6 +221,7 @@ impl<'a> FromScope<'a> {
             items,
             grouping_sets: false,
             parent,
+            nested: false,
         }
     }
 
@@ -164,6 +233,7 @@ impl<'a> FromScope<'a> {
             items: vec![Item::Opaque { refname: None }],
             grouping_sets: false,
             parent,
+            nested: false,
         }
     }
 
@@ -171,18 +241,7 @@ impl<'a> FromScope<'a> {
     /// level: `false` for the top level of a statement, a CTE body written
     /// there or a top-level set-operation branch.
     pub(crate) fn has_parent(&self) -> bool {
-        self.parent.is_some()
-    }
-
-    /// This scope's items as a nested level: a `LATERAL` subquery reads the
-    /// row they describe but is a query level of its own (its aggregates
-    /// belong to it only when their arguments read its own `FROM`).
-    pub(crate) fn as_nested(&self) -> FromScope<'_> {
-        FromScope {
-            items: self.items.clone(),
-            grouping_sets: self.grouping_sets,
-            parent: Some(self),
-        }
+        self.nested || self.parent.is_some()
     }
 
     /// Whether `col`, written at this level, may be resolved by one of its
@@ -211,8 +270,8 @@ impl<'a> FromScope<'a> {
         self.items.iter().any(|item| match (item, table) {
             (Item::Opaque { .. }, None) => true,
             (Item::Opaque { refname }, Some(t)) => refname.as_deref().is_none_or(|r| r == t),
-            (Item::Table { refname, .. }, Some(t)) => refname == t,
-            (Item::Table { .. }, None) => item.attnum(column).is_some() || is_system_column(column),
+            (Item::Table { refname, .. } | Item::Value { refname, .. }, Some(t)) => refname == t,
+            (Item::Table { .. } | Item::Value { .. }, None) => item.has_column(column),
         })
     }
 
@@ -229,7 +288,7 @@ impl<'a> FromScope<'a> {
             let mut found = None;
             for item in &scope.items {
                 match item {
-                    Item::Opaque { .. } => return None,
+                    Item::Opaque { .. } | Item::Value { .. } => return None,
                     Item::Table {
                         schema, refname, ..
                     } => {
@@ -253,6 +312,105 @@ impl<'a> FromScope<'a> {
     /// The column `col` reads, or `None` when it isn't provably a plain
     /// column of a base table in this scope or a parent one.
     pub(crate) fn resolve(&self, ctx: &Ctx<'_>, col: &ColumnRef) -> Option<ResolvedColumn> {
+        let fields: Vec<&str> = col
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let (schema, table, column) = match fields.as_slice() {
+            [c] => (None, None, *c),
+            [t, c] => (None, Some(*t), *c),
+            [s, t, c] => (Some(*s), Some(*t), *c),
+            _ => return None,
+        };
+        let mut level = Some(self);
+        while let Some(scope) = level {
+            let mut found = None;
+            for item in &scope.items {
+                let matches = match (item, table) {
+                    (Item::Opaque { .. }, None) => return None,
+                    (Item::Opaque { refname }, Some(t)) => {
+                        if refname.as_deref().is_none_or(|r| r == t) {
+                            return None;
+                        }
+                        false
+                    }
+                    (Item::Value { .. }, None) => return None,
+                    (Item::Value { refname, .. }, Some(t)) => {
+                        if refname == t {
+                            return None;
+                        }
+                        false
+                    }
+                    (
+                        Item::Table {
+                            schema: item_schema,
+                            refname,
+                            rel,
+                            ..
+                        },
+                        _,
+                    ) => {
+                        let named = match (schema, table) {
+                            (None, None) => true,
+                            (None, Some(t)) => refname == t,
+                            (Some(s), Some(t)) => {
+                                refname == t
+                                    && match item_schema {
+                                        Some(is) => is == s,
+                                        None => ctx.catalog.pg_class.get(rel).is_some_and(|c| {
+                                            ctx.catalog.namespace_name(c.relnamespace) == Some(s)
+                                        }),
+                                    }
+                            }
+                            (Some(_), None) => false,
+                        };
+                        named
+                            && (table.is_some()
+                                || item.attnum(column).is_some()
+                                || is_system_column(column))
+                    }
+                };
+                if matches {
+                    if found.is_some() {
+                        // Ambiguous, or a USING / NATURAL join's merged
+                        // column: not one table's.
+                        return None;
+                    }
+                    found = Some(item);
+                }
+            }
+            if let Some(item @ Item::Table { rel, nullable, .. }) = found {
+                let attnum = item.attnum(column)?;
+                return Some(ResolvedColumn {
+                    rel: *rel,
+                    attnum,
+                    nullable_side: *nullable || scope.grouping_sets,
+                });
+            }
+            if found.is_some() {
+                return None;
+            }
+            level = scope.parent;
+        }
+        None
+    }
+
+    /// The type of the column `col` reads, with whether its collation is
+    /// deterministic: a base table's, or one of a [`Item::Value`] item's —
+    /// a CTE reference, a FROM subquery, a VALUES list or a FROM function
+    /// whose columns are known. Walks the levels like [`Self::resolve`]: the
+    /// nearest level a name matches in decides, and an ambiguous match, an
+    /// opaque item or a column whose type isn't known makes it give up. A
+    /// value item has no system columns and no schema-qualified name.
+    pub(crate) fn resolve_value(
+        &self,
+        ctx: &Ctx<'_>,
+        col: &ColumnRef,
+    ) -> Option<(PgTypeOid, bool)> {
         let fields: Vec<&str> = col
             .fields
             .iter()
@@ -307,28 +465,59 @@ impl<'a> FromScope<'a> {
                                 || item.attnum(column).is_some()
                                 || is_system_column(column))
                     }
+                    // A value item never has a schema-qualified name, and
+                    // unqualified references bind only to a column it lists.
+                    (Item::Value { .. }, None) => item.has_column(column),
+                    (Item::Value { refname, .. }, Some(t)) => schema.is_none() && refname == t,
                 };
                 if matches {
                     if found.is_some() {
-                        // Ambiguous, or a USING / NATURAL join's merged
-                        // column: not one table's.
+                        // Ambiguous: not one item's.
                         return None;
                     }
                     found = Some(item);
                 }
             }
-            if let Some(item @ Item::Table { rel, nullable, .. }) = found {
-                let attnum = item.attnum(column)?;
-                return Some(ResolvedColumn {
-                    rel: *rel,
-                    attnum,
-                    nullable_side: *nullable || scope.grouping_sets,
-                });
+            if let Some(item) = found {
+                return match item {
+                    Item::Table { rel, .. } => {
+                        let attnum = item.attnum(column)?;
+                        let attr = ctx
+                            .catalog
+                            .attributes_of(*rel)
+                            .iter()
+                            .find(|a| a.attnum == attnum)?;
+                        Some((
+                            attr.atttypid,
+                            deterministic_collation(ctx.catalog, attr.attcollation),
+                        ))
+                    }
+                    Item::Value { columns, .. } => {
+                        let mut found = columns.iter().filter(|(name, _, _)| name == column);
+                        let (_, typ, deterministic) = match (found.next(), found.next()) {
+                            (Some(column), None) => column,
+                            _ => return None,
+                        };
+                        Some(((*typ)?, *deterministic))
+                    }
+                    Item::Opaque { .. } => None,
+                };
             }
             level = scope.parent;
         }
         None
     }
+}
+
+/// Whether a collation compares equal strings as equal: none (the database
+/// default), or one `pg_collation` records as deterministic.
+fn deterministic_collation(catalog: &PgCatalog, collation: Option<PgCollationOid>) -> bool {
+    collation.is_none_or(|c| {
+        catalog
+            .pg_collation
+            .get(&c)
+            .is_some_and(|collation| collation.collisdeterministic)
+    })
 }
 
 /// PG's system column names, which every table has besides its own.
@@ -1439,6 +1628,14 @@ fn star_cannot_error(ctx: &Ctx<'_>, scope: &FromScope<'_>, qualifier: Option<&st
             }
             Item::Opaque { refname } => {
                 if qualifier.is_none_or(|q| refname.as_deref().is_none_or(|r| r == q)) {
+                    return false;
+                }
+            }
+            Item::Value { refname, .. } => {
+                // A value item's columns are a subquery's, CTE's, VALUES
+                // row's or function's outputs: reading one may evaluate an
+                // expression that can raise.
+                if qualifier.is_none_or(|q| refname == q) {
                     return false;
                 }
             }

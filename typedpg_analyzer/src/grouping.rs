@@ -1397,8 +1397,9 @@ fn current_chain(scope: &Scope) -> Chain {
         let mut visible = vec![None];
         visible.extend(f.iter().rev().skip(1).map(|fr| fr.visible.clone()));
         let reachable: Vec<TableSource> = scope
-            .lateral_sources
+            .outer_tiers
             .iter()
+            .flatten()
             .chain(&scope.outer_sources)
             .cloned()
             .collect();

@@ -9,14 +9,15 @@ pub(crate) fn analyze_select(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &[], &[])
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, &HashMap::new(), &[], &[])
 }
 
-/// Like [`analyze_select`] but seeds the initial scope with `outer_sources`
-/// as **correlated** references — a subquery's column lookup tries its local
-/// FROM first and only falls back to these outer sources when nothing
-/// matched. Used for `EXISTS (...)`, scalar sublinks, and `IN (SELECT ...)`,
-/// where PG's lexical rule says inner aliases shadow outer ones.
+/// Like [`analyze_select`] but seeds the initial scope with the enclosing
+/// levels as **correlated** references — a subquery's column lookup tries
+/// its local FROM first and only falls back to these outer levels when
+/// nothing matched. Used for `EXISTS (...)`, scalar sublinks, and
+/// `IN (SELECT ...)`, where PG's lexical rule says inner aliases shadow
+/// outer ones.
 pub(crate) fn analyze_correlated_select(
     sel: &protobuf::SelectStmt,
     snapshot: &PgCatalog,
@@ -24,44 +25,29 @@ pub(crate) fn analyze_correlated_select(
     outer_scope: &crate::scope::Scope,
     outer_null_ctx: &NullabilityContext,
 ) -> AnalyzeResult {
-    // Everything the enclosing level can see — its own FROM plus any
-    // lateral refs it received — is reachable from the sublink as a
-    // correlated (fallback-only) reference; and so is what *it* reaches
-    // that way, the levels further out (PG searches the whole ParseState
-    // chain). Those come behind the enclosing level's entries: an entry of
-    // the same name there hides them, and so does a column of the same name
-    // for unqualified references. The enclosing level's own entries carry
-    // its nullability (outer joins, quals proven so far) down; the tiers
-    // it received already carry their levels'.
+    // Everything the enclosing level can see — its own FROM items and the
+    // levels around it — is reachable from the sublink as a correlated
+    // (fallback-only) reference, and so is what *it* reaches that way (PG
+    // searches the whole ParseState chain). Each enclosing level stays a
+    // tier of its own, nearest first: an inner `a` hides an outer one
+    // instead of making the reference ambiguous. The enclosing level's own
+    // entries carry its nullability (outer joins, quals proven so far)
+    // down; the tiers it received already carry their levels'.
     // Planned only when the expression around the sublink is.
     let subplan = expr::plan_fold::next_level_is_subplan();
     let outer_ctx = expr::Ctx::new(outer_scope, outer_null_ctx, snapshot);
     // Or turned into a semi-join before the expression is folded.
     let semijoin = expr::semijoin_level(sel, outer_ctx);
     let _skipped = expr::skipped_if(semijoin.is_none() && !expr::sublink_planned(outer_ctx));
-    let mut outer: Vec<crate::scope::TableSource> =
-        outer_null_ctx.bake_sources(&outer_scope.sources);
-    outer.extend(outer_scope.lateral_sources.iter().cloned());
-    let near_aliases: std::collections::HashSet<String> =
-        outer.iter().map(|s| s.alias.clone()).collect();
-    let near_columns: std::collections::HashSet<String> = outer
-        .iter()
-        .flat_map(|s| s.visible_columns().map(|c| c.name.clone()))
-        .collect();
-    let rule_pseudo = crate::scope::Scope::default().outer_sources;
-    for far in &outer_scope.outer_sources {
-        if near_aliases.contains(&far.alias) || rule_pseudo.iter().any(|p| p.alias == far.alias) {
-            continue;
-        }
-        let mut far = far.clone();
-        for c in &far.columns {
-            if near_columns.contains(&c.name) {
-                far.join_hidden.insert(c.name.clone());
-            }
-        }
-        outer.push(far);
-    }
     // The sublink sees the enclosing level's entries its expression does.
+    // Its outer levels keep PG's tiering: the enclosing level's own FROM
+    // items are the nearest tier, then each level that level received in
+    // turn. A name resolves in the nearest tier holding it, so an inner `a`
+    // hides an outer `a` instead of making the reference ambiguous.
+    let mut outer_tiers: Vec<Vec<crate::scope::TableSource>> =
+        Vec::with_capacity(outer_scope.outer_tiers.len() + 1);
+    outer_tiers.push(outer_null_ctx.bake_sources(&outer_scope.sources));
+    outer_tiers.extend(outer_scope.outer_tiers.iter().cloned());
     let mut analyze = || {
         grouping::with_visible_entries(&outer_scope.sources, || {
             analyze_select_with_ctes_and_outer(
@@ -69,8 +55,7 @@ pub(crate) fn analyze_correlated_select(
                 snapshot,
                 params,
                 &outer_scope.ctes,
-                &[],
-                &outer,
+                &outer_tiers,
                 // Unreferencable entries stay so inside the sublink
                 // (errorMissingRTE searches every enclosing range table).
                 &outer_scope.shadowed_sources,
@@ -132,31 +117,27 @@ pub(crate) fn analyze_select_with_ctes(
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
-    analyze_select_with_ctes_and_outer(sel, snapshot, params, outer_ctes, &[], &[], &[])
+    analyze_select_with_ctes_and_outer(sel, snapshot, params, outer_ctes, &[], &[])
 }
 
 /// Core SELECT analyzer.
 ///
-/// Three flavours of outer scope, mirroring PG's distinction:
-/// - `lateral_sources`: pre-visible aliases for `LATERAL` subqueries —
-///   merged into the local FROM scope so the inner query sees them as if
-///   they were declared locally.
-/// - `correlated_sources`: pre-visible aliases for plain sublinks
-///   (`EXISTS`, scalar, `IN`, `ANY`/`ALL`) — only consulted as a fallback
-///   when local resolution fails, so an inner alias of the same name
-///   shadows the outer one.
-/// - `shadowed_sources`: aliases visible in the enclosing FROM but
-///   *unreachable* from inside this query (non-LATERAL FROM subquery). Not
-///   used for resolution — only to upgrade the diagnostic from a generic
-///   missing-column to PG's `invalid reference to FROM-clause entry for
-///   table "x"` when the SQL tries to reach across the boundary.
+/// `outer_tiers` are the enclosing levels this query is nested in, nearest
+/// first — PG's parse-state chain: for a `LATERAL` subquery the items to its
+/// left, for a plain sublink or a non-`LATERAL` `FROM` subquery the levels
+/// around it. A name resolves in the nearest tier holding it and is
+/// ambiguous only within one tier.
+/// `shadowed_sources` are aliases visible in the enclosing FROM but
+/// *unreachable* from inside this query (non-LATERAL FROM subquery). Not
+/// used for resolution — only to upgrade the diagnostic from a generic
+/// missing-column to PG's `invalid reference to FROM-clause entry for
+/// table "x"` when the SQL tries to reach across the boundary.
 pub(crate) fn analyze_select_with_ctes_and_outer(
     sel: &protobuf::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
-    lateral_sources: &[crate::scope::TableSource],
-    correlated_sources: &[crate::scope::TableSource],
+    outer_tiers: &[Vec<crate::scope::TableSource>],
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     crate::stack::step(|| {
@@ -165,8 +146,7 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
             snapshot,
             params,
             outer_ctes,
-            lateral_sources,
-            correlated_sources,
+            outer_tiers,
             shadowed_sources,
         )
     })
@@ -223,8 +203,7 @@ fn analyze_select_here(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
-    lateral_sources: &[crate::scope::TableSource],
-    correlated_sources: &[crate::scope::TableSource],
+    outer_tiers: &[Vec<crate::scope::TableSource>],
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
@@ -251,14 +230,10 @@ fn analyze_select_here(
 
     // Process this SELECT's own CTEs (before UNION check, since WITH wraps UNION).
     if let Some(with) = &sel.with_clause {
-        // The CTE bodies see the enclosing levels (LATERAL or correlated).
-        let outer: Vec<_> = lateral_sources
-            .iter()
-            .chain(correlated_sources)
-            .cloned()
-            .collect();
+        // A CTE body is analyzed before this level's FROM: it sees the
+        // enclosing levels, never this level's own items.
         cte_scopes = super::cte::with_clause_owner(sel, || {
-            analyze_with_clause(with, snapshot, params, &cte_scopes, &outer)
+            analyze_with_clause(with, snapshot, params, &cte_scopes, outer_tiers)
         })?;
     }
 
@@ -266,15 +241,16 @@ fn analyze_select_here(
     // its own, without a FROM clause; its arms are the levels below.
     // Outer references reach the arms and the VALUES rows below like any
     // subquery's.
-    let outer: Vec<crate::scope::TableSource> = lateral_sources
-        .iter()
-        .chain(correlated_sources)
-        .cloned()
-        .collect();
     if sel.op != SetOperation::SetopNone as i32 {
         grouping::register_level(sel, &[], &[]);
-        let result =
-            analyze_set_operation(sel, snapshot, params, &cte_scopes, &outer, shadowed_sources);
+        let result = analyze_set_operation(
+            sel,
+            snapshot,
+            params,
+            &cte_scopes,
+            outer_tiers,
+            shadowed_sources,
+        );
         // The arms' summaries say nothing of the whole.
         set_level_summary(LevelSummary::default());
         return result;
@@ -299,18 +275,13 @@ fn analyze_select_here(
             ctes: cte_scopes.clone(),
             ..Scope::default()
         };
-        values_scope
-            .lateral_sources
-            .extend(lateral_sources.iter().cloned());
-        values_scope
-            .outer_sources
-            .extend(correlated_sources.iter().cloned());
+        values_scope.outer_tiers.extend(outer_tiers.iter().cloned());
         values_scope
             .shadowed_sources
             .extend(shadowed_sources.iter().cloned());
         let columns = analyze_values_lists(&sel.values_lists, snapshot, params, &values_scope)?;
         let sort_sources =
-            values_sort_and_limit(sel, &columns, snapshot, params, &cte_scopes, &outer)?;
+            values_sort_and_limit(sel, &columns, snapshot, params, &cte_scopes, outer_tiers)?;
         grouping::finish_values_level(sel, &values_scope, &sort_sources, snapshot)?;
         set_level_summary(LevelSummary {
             min_one_row: limit_keeps_a_row(sel),
@@ -329,19 +300,13 @@ fn analyze_select_here(
         ctes: cte_scopes.clone(),
         ..Scope::default()
     };
-    // LATERAL: outer aliases resolve like outer references — the subquery's
-    // own FROM wins first, they're excluded from `*` expansion, and two
-    // lateral sources sharing a column name are ambiguous among themselves
-    // (their own tier). Correlated sublinks: outer aliases are only a
-    // fallback so an inner alias of the same name shadows correctly.
+    // LATERAL and correlated outer aliases resolve like outer references:
+    // the subquery's own FROM wins first, they're excluded from `*`
+    // expansion, and two sources sharing a column name are ambiguous only
+    // within their own level. Each enclosing level is a tier, nearest first.
     // Shadowed: aliases live only as a hint for the diagnostic when the SQL
     // reaches across the boundary.
-    scope
-        .lateral_sources
-        .extend(lateral_sources.iter().cloned());
-    scope
-        .outer_sources
-        .extend(correlated_sources.iter().cloned());
+    scope.outer_tiers.extend(outer_tiers.iter().cloned());
     scope
         .shadowed_sources
         .extend(shadowed_sources.iter().cloned());
@@ -436,9 +401,9 @@ fn analyze_select_here(
         // around it up (see `nonnull::capture_correlation`).
         if crate::nonnull::correlation_wanted(sel) {
             let outer: std::collections::HashSet<String> = scope
-                .outer_sources
+                .outer_tiers
                 .iter()
-                .chain(&scope.lateral_sources)
+                .flatten()
                 .map(|s| s.alias.clone())
                 .filter(|a| !own.contains(a))
                 .collect();
@@ -2244,7 +2209,7 @@ fn values_sort_and_limit(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-    outer: &[crate::scope::TableSource],
+    outer_tiers: &[Vec<crate::scope::TableSource>],
 ) -> Result<Vec<crate::scope::TableSource>, AnalyzeError> {
     let alias = crate::scope::hidden_alias("values");
     let cols: Vec<ScopeColumn> = columns
@@ -2269,7 +2234,7 @@ fn values_sort_and_limit(
         ctes: cte_scopes.clone(),
         ..Scope::default()
     };
-    scope.outer_sources.extend(outer.iter().cloned());
+    scope.outer_tiers.extend(outer_tiers.iter().cloned());
     scope.add_derived(&alias, cols, crate::scope::SourceKind::Other)?;
     let null_ctx = NullabilityContext::default();
     // The sort keys see the VALUES' columns, and so do the sublinks in

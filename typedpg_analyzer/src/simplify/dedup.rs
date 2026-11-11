@@ -73,7 +73,7 @@ use typedpg_pg_query::protobuf::{
     self, AExprKind, BoolExprType, JoinType, SetOperation, Token, a_const::Val, node::Node,
 };
 
-use super::proof::FromScope;
+use super::proof::{FromScope, Item};
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::Type;
 use crate::oid::{PgClassOid, PgCollationOid, PgNamespaceOid, PgOperatorOid, PgTypeOid};
@@ -447,7 +447,8 @@ pub(super) struct Rel {
     /// unknown name can be the one a reference spells, so no lookup may
     /// bind to this relation.
     pub(super) columns_known: bool,
-    /// For a CTE reference: each column's type and whether its collation is
+    /// For a CTE reference, a FROM subquery, a VALUES list or a FROM
+    /// function: each column's type and whether its collation is
     /// deterministic, by attnum - 1. Empty for a base table.
     cte_columns: Vec<(Option<PgTypeOid>, bool)>,
 }
@@ -869,6 +870,17 @@ impl<'a> Scope<'a> {
     /// exactly one row. `ROWS FROM` of several such functions pads the
     /// shorter results to the longest — still one row — and `WITH
     /// ORDINALITY` only adds a column.
+    ///
+    /// Its columns' types are known only for the shape this models soundly:
+    /// one function item (no `ROWS FROM` of several), no `WITH ORDINALITY`,
+    /// every overload agreeing on a scalar return type that is neither
+    /// composite, record, `void`, a pseudo-type nor polymorphic, nor a
+    /// domain over a composite, and not collatable (a collatable result can
+    /// carry a nondeterministic collation from its arguments). Its column
+    /// names are known only when an alias column list or a column definition
+    /// list covers every output column; otherwise an unqualified reference
+    /// might name a column this doesn't list and must not escape to a
+    /// farther level.
     fn add_range_function(
         &mut self,
         ctx: &Ctx<'_>,
@@ -879,7 +891,16 @@ impl<'a> Scope<'a> {
             return None;
         }
         let mut name: Option<&'a str> = None;
-        let mut column_names: Vec<&'a str> = Vec::new();
+        // The names a column definition list gives, when it does.
+        let mut defined_names: Vec<&'a str> = Vec::new();
+        // Whether every output column's name is certain.
+        let mut names_known = true;
+        // The total number of output columns, when every item's is known.
+        let mut output_count: Option<usize> = Some(0);
+        // The one column's type, when every item is one scalar function whose
+        // overloads agree on a non-collatable type.
+        let mut column_type: Option<PgTypeOid> = None;
+        let typed = rf.functions.len() == 1 && !rf.ordinality;
         for item in &rf.functions {
             let Some(Node::List(pair)) = item.node.as_ref() else {
                 return None;
@@ -897,34 +918,99 @@ impl<'a> Scope<'a> {
             if procs.is_empty() || procs.iter().any(|proc| proc.proretset) {
                 return None;
             }
-            name.get_or_insert(func);
-            if let Some(Node::List(defs)) = pair.items.get(1).and_then(|n| n.node.as_ref()) {
-                for def in &defs.items {
-                    if let Some(Node::ColumnDef(def)) = def.node.as_ref() {
-                        column_names.push(def.colname.as_str());
-                    }
+            // Every overload the name could resolve to must agree on the
+            // number of output columns and on the scalar return type.
+            let mut item_count: Option<usize> = None;
+            let mut item_type: Option<PgTypeOid> = None;
+            let mut count_agrees = true;
+            let mut type_agrees = true;
+            for (index, proc) in procs.iter().enumerate() {
+                let count = function_output_columns(ctx, proc);
+                let scalar = scalar_function_type(ctx, proc.prorettype);
+                if index == 0 {
+                    item_count = count;
+                    item_type = scalar;
+                } else {
+                    count_agrees &= item_count == count;
+                    type_agrees &= item_type == scalar;
                 }
             }
+            if !count_agrees {
+                item_count = None;
+            }
+            if !type_agrees {
+                item_type = None;
+            }
+            // A column definition list defines this item's columns: how many,
+            // and their names.
+            let defs = pair.items.get(1).and_then(|n| n.node.as_ref());
+            match defs {
+                Some(Node::List(defs)) => {
+                    let mut def_count = 0;
+                    for def in &defs.items {
+                        let Some(Node::ColumnDef(def)) = def.node.as_ref() else {
+                            return None;
+                        };
+                        defined_names.push(def.colname.as_str());
+                        def_count += 1;
+                    }
+                    item_count = Some(def_count);
+                }
+                Some(_) => return None,
+                None => names_known = false,
+            }
+            output_count = match (output_count, item_count) {
+                (Some(total), Some(count)) => Some(total + count),
+                _ => None,
+            };
+            if rf.functions.len() == 1 {
+                column_type = item_type;
+            }
+            name.get_or_insert(func);
         }
         let func = name?;
-        // An alias's column list renames the function's output columns,
-        // when it has one this can read.
+        // `WITH ORDINALITY` appends one output column.
+        if rf.ordinality {
+            output_count = output_count.and_then(|count| count.checked_add(1));
+        }
+        // An alias's column list renames the function's output columns; it
+        // must cover all of them to make the names certain.
+        let mut alias_names: Vec<&'a str> = Vec::new();
         if let Some(alias) = &rf.alias
             && !alias.colnames.is_empty()
         {
-            column_names.clear();
             for name in &alias.colnames {
                 let Some(Node::String(name)) = &name.node else {
                     return None;
                 };
-                column_names.push(name.sval.as_str());
+                alias_names.push(name.sval.as_str());
             }
         }
-        let columns = column_names
-            .into_iter()
-            .enumerate()
-            .map(|(i, name)| (name.to_owned(), i as i16 + 1))
-            .collect();
+        let (column_names, columns_known) = if alias_names.is_empty() {
+            (defined_names, names_known)
+        } else {
+            let known = output_count == Some(alias_names.len());
+            (alias_names, known)
+        };
+        let columns_known = columns_known && output_count == Some(column_names.len());
+        let typed = typed
+            && columns_known
+            && column_names.len() == 1
+            && output_count == Some(1)
+            && column_type.is_some();
+        let columns: Vec<(String, i16)> = if columns_known {
+            column_names
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| (name.to_owned(), i as i16 + 1))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let cte_columns = match column_type {
+            Some(typ) if typed => vec![(Some(typ), deterministic_type(ctx, typ))],
+            _ => vec![(None, false); columns.len()],
+        };
         let alias = rf.alias.as_ref().map(|a| a.aliasname.clone());
         self.rels.push(Rel {
             oid: None,
@@ -935,16 +1021,61 @@ impl<'a> Scope<'a> {
             nullable,
             single_row: true,
             columns,
-            columns_known: true,
-            cte_columns: Vec::new(),
+            columns_known,
+            cte_columns,
         });
         Some(1 << (self.rels.len() - 1))
+    }
+
+    /// The scope a `LATERAL` FROM subquery at this point sees: exactly the
+    /// items to its left, one query level of their own, nested in the
+    /// levels around this one. A base table keeps its columns and attnums;
+    /// a CTE reference, FROM subquery, VALUES list or FROM function is a
+    /// [`Item::Value`] with the types its relation lists.
+    fn lateral_scope<'s>(&self, ctx: &Ctx<'_>, outer: &'s FromScope<'s>) -> FromScope<'s> {
+        let items = self
+            .rels
+            .iter()
+            .map(|rel| match rel.oid {
+                Some(relid) if rel.columns_known => Item::Table {
+                    schema: (!rel.aliased).then(|| rel.schema.clone()),
+                    refname: rel.refname.clone(),
+                    rel: relid,
+                    nullable: rel.nullable,
+                    columns: rel.columns.clone(),
+                },
+                Some(_) => Item::Opaque {
+                    refname: Some(rel.refname.clone()),
+                },
+                None if rel.columns_known => Item::Value {
+                    refname: rel.refname.clone(),
+                    columns: rel
+                        .columns
+                        .iter()
+                        .map(|(name, attnum)| match rel.column_info(ctx, *attnum) {
+                            Some((typ, deterministic)) => (name.clone(), Some(typ), deterministic),
+                            None => (name.clone(), None, false),
+                        })
+                        .collect(),
+                },
+                None => Item::Opaque {
+                    refname: (!rel.refname.is_empty()).then(|| rel.refname.clone()),
+                },
+            })
+            .collect();
+        FromScope::level(items, outer.parent(), true)
     }
 
     /// Add one FROM subquery — `LATERAL` or not — with its output columns,
     /// as a one-row relation when this level's proof shows it yields at most
     /// one row per evaluation (see
     /// [`super::cardinality::select_at_most_one_row_in`]).
+    ///
+    /// The body is judged in PostgreSQL's namespace: a `LATERAL` one sees
+    /// exactly the items to its left (each a base table, or a value item
+    /// with the types [`Rel::column_info`] lists), a plain one none of this
+    /// level's, only the levels around it. Its output columns are typed like
+    /// a CTE's ([`super::cardinality::select_output_columns`]).
     ///
     /// A subquery the proof can't bound is still listed, so a nested level's
     /// aggregate argument can be placed on its columns, but it is never
@@ -970,15 +1101,33 @@ impl<'a> Scope<'a> {
         else {
             return None;
         };
-        // A `LATERAL` subquery reads the current level's row; any subquery is
-        // a query level of its own (and may read levels above this one). Its
-        // own `WITH` shadows the enclosing level's CTE names: proving the
-        // body against the outer environment would read a same-named outer
-        // CTE instead of the one the subquery defines.
-        let nested = outer.as_nested();
-        let env = super::cardinality::subquery_cte_env(ctx, env, select, &nested);
+        // A `LATERAL` subquery reads the row the items to its left describe,
+        // as a namespace of its own; without `LATERAL` it sees none of this
+        // level's FROM items, only the levels around this one. Either way it
+        // is a query level of its own, and its own `WITH` shadows the
+        // enclosing level's CTE names: proving the body against the outer
+        // environment would read a same-named outer CTE instead of the one
+        // the subquery defines.
+        let lateral = sub.lateral.then(|| self.lateral_scope(ctx, outer));
+        let parent = match &lateral {
+            Some(scope) => Some(scope),
+            None => outer.parent(),
+        };
+        let scope = FromScope::of_select(ctx, select, parent);
+        // A CTE body in the subquery is analyzed before its `FROM` clause,
+        // like PG's `transformWithClause`: it reads the levels around the
+        // subquery, never the subquery's own items.
+        let empty;
+        let around = match scope.parent() {
+            Some(parent) => parent,
+            None => {
+                empty = FromScope::empty(None);
+                &empty
+            }
+        };
+        let env = super::cardinality::subquery_cte_env(ctx, env, select, around);
         let single_row =
-            super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &nested, &env);
+            super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &scope, &env);
         let (names, mut columns_known) = subquery_output_names(select)?;
         let mut columns: Vec<(String, i16)> = Vec::with_capacity(names.len());
         for (index, name) in names.into_iter().enumerate() {
@@ -1000,7 +1149,10 @@ impl<'a> Scope<'a> {
             columns_known = true;
         }
         let alias = sub.alias.as_ref().map(|a| a.aliasname.clone());
-        let cte_columns = vec![(None, true); columns.len()];
+        let cte_columns = super::cardinality::select_output_columns(ctx, select, &env)
+            .into_iter()
+            .map(|column| (column.typ, column.deterministic))
+            .collect();
         self.rels.push(Rel {
             oid: None,
             // Only an aliased subquery has a name a reference can use.
@@ -1100,11 +1252,13 @@ impl<'a> Scope<'a> {
 
     /// Resolve a column reference against this scope alone.
     pub(super) fn resolve(&self, names: &[&str]) -> Col {
-        // A relation whose output names aren't all certain may hold the one
-        // a reference spells: resolving it to another relation could read a
-        // different column (and a key fact on it would be about that other
-        // column), so nothing unqualified resolves here.
-        if self.rels.iter().any(|rel| !rel.columns_known) {
+        // A relation whose output names aren't all certain may hold the
+        // column an *unqualified* reference spells: resolving it to another
+        // relation could read a different column (and a key fact on it would
+        // be about that other column), so nothing unqualified resolves here.
+        // A qualified reference names its relation, whose own attnums are
+        // checked below (and `None` while its names aren't all known).
+        if names.len() == 1 && self.rels.iter().any(|rel| !rel.columns_known) {
             return Col::Other;
         }
         let attnum = |r: usize, name: &str| {
@@ -1144,7 +1298,10 @@ impl<'a> Scope<'a> {
     /// `expr` as one side of an equality the proof reads: a column of this
     /// scope, a parameter, a constant, or — `outer` being the levels this
     /// one is nested in — a column of an outer query, which is fixed for
-    /// one evaluation of this level. With `scalar_sublinks` (the cardinality
+    /// one evaluation of this level. An outer column may be a base table's
+    /// or a value item's (a CTE reference, `FROM` subquery, `VALUES` list or
+    /// `FROM` function whose type is known; see [`FromScope::resolve_value`]).
+    /// With `scalar_sublinks` (the cardinality
     /// proof's wider form), also a scalar sublink uncorrelated with this
     /// level, a cast and a call to a non-volatile, non-set-returning
     /// function or operator every argument of which is one of these — each
@@ -1158,32 +1315,39 @@ impl<'a> Scope<'a> {
     ) -> Option<Operand> {
         match expr.node.as_ref()? {
             Node::ColumnRef(cr) => {
-                // A relation whose output names aren't all certain may hold
-                // the column this reference spells. Reading it as an outer
-                // level's would make its per-row value look fixed, so no key
-                // fact is read from such a scope.
-                if self.rels.iter().any(|rel| !rel.columns_known) {
-                    return None;
-                }
                 let Fields::Names(names) = column_ref_fields(cr) else {
                     return None;
                 };
+                // A relation whose output names aren't all certain may hold
+                // the column an unqualified reference spells. Reading it as
+                // an outer level's would make its per-row value look fixed,
+                // so no key fact is read from such a scope.
+                if names.len() == 1 && self.rels.iter().any(|rel| !rel.columns_known) {
+                    return None;
+                }
                 let (rel, attnum, (typ, deterministic_collation)) = match self.resolve(&names) {
                     Col::Rel(r, attnum) => {
                         (Some(r), attnum, self.rels[r].column_info(ctx, attnum)?)
                     }
                     Col::Other => {
-                        let resolved = outer?.resolve(ctx, cr)?;
-                        let attr = ctx
-                            .catalog
-                            .attributes_of(resolved.rel)
-                            .iter()
-                            .find(|a| a.attnum == resolved.attnum)?;
-                        (
-                            None,
-                            0,
-                            (attr.atttypid, deterministic(ctx.catalog, attr.attcollation)),
-                        )
+                        // The nearest level holding the qualifier hides any
+                        // farther one: it can't be an outer relation, even
+                        // when its own columns aren't all known.
+                        if names.len() > 1 {
+                            let qualifier = match names.as_slice() {
+                                [qualifier, _] => *qualifier,
+                                [_, qualifier, _] => *qualifier,
+                                _ => return None,
+                            };
+                            if self.rel_named(qualifier).is_some() {
+                                return None;
+                            }
+                        }
+                        // A column this scope's own relations don't hold:
+                        // an outer level's, either a base table's or a
+                        // value item's (see [`FromScope::resolve_value`]).
+                        let (typ, deterministic_collation) = outer?.resolve_value(ctx, cr)?;
+                        (None, 0, (typ, deterministic_collation))
                     }
                 };
                 deterministic_collation.then_some(Operand {
@@ -1271,20 +1435,7 @@ impl<'a> Scope<'a> {
         outer: Option<&FromScope<'_>>,
         scalar_sublinks: bool,
     ) -> Option<Operand> {
-        if call.over.is_some()
-            || call.agg_star
-            || call.agg_within_group
-            || !call.agg_order.is_empty()
-            || call.agg_filter.is_some()
-            || call.func_variadic
-        {
-            return None;
-        }
-        let (schema, name) = function_name(&call.funcname)?;
-        let notation = crate::functions::CallNotation::of(call).ok()?;
-        if !notation.names.is_empty() {
-            return None;
-        }
+        let (schema, name, notation) = call_syntax(call)?;
         let mut operands = Vec::with_capacity(call.args.len());
         for arg in &call.args {
             operands.push(self.operand(
@@ -1661,6 +1812,49 @@ impl<'a> Scope<'a> {
         }
         out
     }
+}
+
+/// The schema, name and notation of a call whose syntax forms no argument
+/// this can't see: no aggregate or window decoration, and no named notation
+/// (a named argument may leave an earlier parameter to its default even when
+/// the count matches).
+fn call_syntax(
+    call: &protobuf::FuncCall,
+) -> Option<(Option<&str>, &str, crate::functions::CallNotation)> {
+    if call.over.is_some()
+        || call.agg_star
+        || call.agg_within_group
+        || !call.agg_order.is_empty()
+        || call.agg_filter.is_some()
+        || call.func_variadic
+    {
+        return None;
+    }
+    let (schema, name) = function_name(&call.funcname)?;
+    let notation = crate::functions::CallNotation::of(call).ok()?;
+    if !notation.names.is_empty() {
+        return None;
+    }
+    Some((schema, name, notation))
+}
+
+/// Whether every routine `call` may resolve to spells all its parameters at
+/// the call site: no parameter left to a default whose expression would run
+/// per evaluation, no named notation and no `VARIADIC` routine or call.
+/// [`Scope::call_operand`] makes the same refusal with the routine it
+/// resolves; here the call's types aren't known, so every overload counts.
+pub(super) fn call_spells_every_parameter(ctx: &Ctx<'_>, call: &protobuf::FuncCall) -> bool {
+    let Some((schema, name, _)) = call_syntax(call) else {
+        return false;
+    };
+    let procs = ctx.catalog.find_functions(schema, name);
+    !procs.is_empty()
+        && procs.iter().all(|proc| {
+            proc.prokind == ProKind::Function
+                && !proc.proretset
+                && proc.provariadic.is_none()
+                && proc.proargtypes.len() == call.args.len()
+        })
 }
 
 /// Whether converting a value of `source` to the operator's declared
@@ -2492,6 +2686,74 @@ fn deterministic_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
             .and_then(|base| base.typcollation)
     });
     deterministic(ctx.catalog, collation)
+}
+
+/// The number of output columns a non-set-returning function expands to in
+/// `FROM`, when known: its `OUT` / `INOUT` / `TABLE` parameters, the
+/// attributes of a named composite return type (or a domain over one), else
+/// one scalar column. `None` for `record` without such parameters — a column
+/// definition list supplies those.
+fn function_output_columns(ctx: &Ctx<'_>, proc: &crate::pg_catalog::PgProc) -> Option<usize> {
+    let out = proc
+        .proargmodes
+        .iter()
+        .zip(&proc.proallargtypes)
+        .filter(|(mode, _)| {
+            matches!(
+                mode,
+                crate::pg_catalog::ArgMode::Out
+                    | crate::pg_catalog::ArgMode::InOut
+                    | crate::pg_catalog::ArgMode::Table
+            )
+        })
+        .count();
+    if out > 0 {
+        return Some(out);
+    }
+    if proc.prorettype == oid::RECORD {
+        return None;
+    }
+    let base = ctx.catalog.unwrap_domain(proc.prorettype);
+    let ty = ctx.catalog.get_type(base)?;
+    if ty.typtype == crate::pg_catalog::TypType::Composite {
+        return Some(
+            ctx.catalog
+                .attributes_of(ty.typrelid?)
+                .iter()
+                .filter(|attribute| attribute.attnum > 0)
+                .count(),
+        );
+    }
+    Some(1)
+}
+
+/// The type of the single column a non-set-returning function returns, when
+/// the proof may type it: a defined scalar type that is neither composite,
+/// `record`, `void`, a pseudo-type nor polymorphic, nor a domain over a
+/// composite, and not collatable (no `typcollation` on the type or the base
+/// of a domain). A collatable result can carry a nondeterministic collation
+/// from its arguments, which this can't see.
+fn scalar_function_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> Option<PgTypeOid> {
+    let base = ctx.catalog.unwrap_domain(typ);
+    let ty = ctx.catalog.get_type(base)?;
+    if !ty.typisdefined
+        || matches!(
+            ty.typtype,
+            crate::pg_catalog::TypType::Composite | crate::pg_catalog::TypType::Pseudo
+        )
+        || ty.typcollation.is_some()
+    {
+        return None;
+    }
+    if typ != base
+        && ctx
+            .catalog
+            .get_type(typ)
+            .is_some_and(|domain| domain.typcollation.is_some())
+    {
+        return None;
+    }
+    Some(typ)
 }
 
 /// The last name of a function call, with its schema when written.

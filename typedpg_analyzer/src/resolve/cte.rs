@@ -18,8 +18,8 @@ pub(crate) struct AnalyzedCte {
 
 /// Analyze one CTE body, following PG's `analyzeCTE`. `recursive` is PG's
 /// `cterecursive` (the body references the CTE itself, found by
-/// [`analyze_with_clause`]'s dependency walk). `outer_sources` are the FROM
-/// entries of the enclosing query levels: a CTE body is a sub-level of the
+/// [`analyze_with_clause`]'s dependency walk). `outer_tiers` are the
+/// enclosing query levels, nearest first: a CTE body is a sub-level of the
 /// query owning the WITH (whose own FROM isn't transformed yet), so it may
 /// reference them as outer references.
 /// Every nullability flag of `columns` (their own, their array elements',
@@ -50,12 +50,12 @@ pub(crate) fn analyze_cte(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     existing_ctes: &HashMap<String, Vec<ScopeColumn>>,
-    outer_sources: &[crate::scope::TableSource],
+    outer_tiers: &[Vec<crate::scope::TableSource>],
 ) -> Result<AnalyzedCte, AnalyzeError> {
     let analyze_body = |sel: &protobuf::SelectStmt,
                         params: &mut ParamCollector,
                         ctes: &HashMap<String, Vec<ScopeColumn>>| {
-        analyze_select_with_ctes_and_outer(sel, snapshot, params, ctes, &[], outer_sources, &[])
+        analyze_select_with_ctes_and_outer(sel, snapshot, params, ctes, outer_tiers, &[])
     };
     let cte_query = cte
         .ctequery
@@ -133,7 +133,7 @@ pub(crate) fn analyze_cte(
             let _body = QueryLevel::enter();
             let mut body_ctes = existing_ctes.clone();
             if let Some(with) = &sel.with_clause {
-                body_ctes = analyze_with_clause(with, snapshot, params, &body_ctes, outer_sources)?;
+                body_ctes = analyze_with_clause(with, snapshot, params, &body_ctes, outer_tiers)?;
             }
             check_set_op_member_locking(larg)?;
             // Both terms are set-operation arms: they keep their unknowns.
@@ -1115,18 +1115,18 @@ pub(crate) fn inlined(
 /// 0A000) after `checkWellFormedRecursion` validated the self-referencing
 /// ones.
 ///
-/// `outer_sources` are the enclosing levels' FROM entries the CTE bodies
-/// may reference (see [`analyze_cte`]).
+/// `outer_tiers` are the enclosing levels the CTE bodies may reference,
+/// nearest first (see [`analyze_cte`]).
 pub(crate) fn analyze_with_clause(
     with: &protobuf::WithClause,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
-    outer_sources: &[crate::scope::TableSource],
+    outer_tiers: &[Vec<crate::scope::TableSource>],
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     // A CTE body sees none of the entries of the level owning the WITH.
     crate::grouping::with_visible_entries(&[], || {
-        analyze_with_clause_here(with, snapshot, params, outer_ctes, outer_sources)
+        analyze_with_clause_here(with, snapshot, params, outer_ctes, outer_tiers)
     })
 }
 
@@ -1135,7 +1135,7 @@ fn analyze_with_clause_here(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
-    outer_sources: &[crate::scope::TableSource],
+    outer_tiers: &[Vec<crate::scope::TableSource>],
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     let ctes: Vec<&protobuf::CommonTableExpr> = with
         .ctes
@@ -1247,7 +1247,7 @@ fn analyze_with_clause_here(
                     snapshot,
                     params,
                     &cte_scopes,
-                    outer_sources,
+                    outer_tiers,
                 )
             },
         );
