@@ -5214,4 +5214,33 @@ mod tests {
              ) SELECT n FROM r",
         ));
     }
+
+    #[test]
+    fn cross_cutting_rules_hold_together() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE nt (id int PRIMARY KEY);
+             CREATE TABLE np (id int PRIMARY KEY);
+             CREATE TABLE no (id text PRIMARY KEY);",
+        )
+        .unwrap();
+        for sql in [
+            // The scalar operand reads a VALUES column whose type PG
+            // resolves across both rows (`double precision`), not `int`.
+            "WITH c(v) AS (VALUES (1), ('9007199254740992'::double precision)) \
+             SELECT id FROM keys WHERE id = (SELECT max(v) FROM c)",
+            // A grouping key fixed by a nullable side whose preserved side
+            // isn't determined: `quote_nullable(no.id)` differs between the
+            // matched and the null-extended `np` rows.
+            "SELECT nt.id FROM nt, np LEFT JOIN no ON no.id = 'a' AND np.id = 1 \
+             WHERE nt.id = length(quote_nullable(no.id)) GROUP BY nt.id",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+        assert!(select_one(
+            &db,
+            "SELECT nt.id FROM nt, np LEFT JOIN no ON no.id = 'a' \
+             WHERE np.id = 1 AND nt.id = length(quote_nullable(no.id)) GROUP BY nt.id",
+        ));
+    }
 }
