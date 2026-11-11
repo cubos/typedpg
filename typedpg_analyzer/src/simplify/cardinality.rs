@@ -1918,11 +1918,43 @@ fn determined_relations(
             (join, facts, conjuncts)
         })
         .collect();
-    let mut known = starting_relations(ctx, scope);
+    // What a relation needs determined before it is one fixed row of the
+    // level: the items to its left when it may read them (a `LATERAL`
+    // subquery or a `FROM` function is one row per row of theirs), and the
+    // preserved side of every outer join that may null-extend it (until
+    // that side is fixed, some rows match it and others null-extend it, and
+    // an expression mapping NULL to a value, `quote_nullable`, differs
+    // between them).
+    let mut gate = vec![0u64; n];
+    for (b, rel) in scope.rels.iter().enumerate() {
+        if rel.reads_left {
+            gate[b] |= (1u64 << b) - 1;
+        }
+    }
+    for join in &scope.joins {
+        let (nullable, preserved) = match join.kind {
+            JoinType::JoinLeft => (join.right, join.left),
+            JoinType::JoinRight => (join.left, join.right),
+            JoinType::JoinFull => (join.rels(), join.rels()),
+            _ => continue,
+        };
+        for (b, gate) in gate.iter_mut().enumerate() {
+            if nullable & (1 << b) != 0 {
+                *gate |= preserved & !(1u64 << b);
+            }
+        }
+    }
+    let ready = |b: usize, known: u64| gate[b] & !known == 0;
+    let seeded = starting_relations(ctx, scope);
+    let mut known = 0u64;
     loop {
         let before = known;
         for b in 0..n {
-            if known & (1 << b) != 0 {
+            if known & (1 << b) != 0 || !ready(b, known) {
+                continue;
+            }
+            if seeded & (1 << b) != 0 {
+                known |= 1 << b;
                 continue;
             }
             let sources = PredicateSources {
@@ -1969,7 +2001,7 @@ fn determined_relations(
                 facts: &merged,
             };
             for b in 0..n {
-                if targets & (1 << b) == 0 || known & (1 << b) != 0 {
+                if targets & (1 << b) == 0 || known & (1 << b) != 0 || !ready(b, known) {
                     continue;
                 }
                 let allowed = allowed & !(1 << b);
@@ -5241,6 +5273,56 @@ mod tests {
             &db,
             "SELECT nt.id FROM nt, np LEFT JOIN no ON no.id = 'a' \
              WHERE np.id = 1 AND nt.id = length(quote_nullable(no.id)) GROUP BY nt.id",
+        ));
+    }
+
+    #[test]
+    fn per_row_and_nullable_items_are_fixed_only_after_what_they_depend_on() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE sk (k bigint PRIMARY KEY);
+             CREATE TABLE su (id double precision);
+             CREATE TABLE sp (id bigint PRIMARY KEY);
+             CREATE TABLE sq (id bigint PRIMARY KEY);
+             CREATE TABLE lateral_rows (id integer PRIMARY KEY);
+             CREATE TABLE gt (id integer PRIMARY KEY);
+             CREATE TABLE gp (id integer PRIMARY KEY);
+             CREATE TABLE outer_input (lookup bigint PRIMARY KEY);
+             CREATE TABLE star_inputs (x integer, lookup double precision);
+             CREATE TABLE lookup_keys (id bigint PRIMARY KEY);",
+        )
+        .unwrap();
+        for sql in [
+            // `id` in the first join's ON is `su.id` (that ON sees only its
+            // own inputs), not the other join's merged `id`.
+            "SELECT sk.k FROM (sk JOIN su ON sk.k = id) \
+             CROSS JOIN (sp JOIN sq USING (id)) WHERE sp.id = 1 GROUP BY sk.k",
+            // A LATERAL item is one row per row to its left, not one fixed
+            // row of the level.
+            "SELECT x.id FROM lateral_rows t \
+             CROSS JOIN LATERAL (SELECT t.id AS id LIMIT 1) x GROUP BY x.id",
+            "SELECT t.id FROM lateral_rows t CROSS JOIN LATERAL \
+             (SELECT s.id FROM lateral_rows s WHERE s.id = t.id LIMIT 1) x \
+             WHERE t.id = x.id",
+            // A single-row CTE on a nullable side is null-extended on some
+            // rows until its preserved side is fixed.
+            "WITH s AS (SELECT 1 AS id) SELECT gt.id FROM gt \
+             CROSS JOIN (gp LEFT JOIN s ON gp.id = 1) \
+             WHERE gt.id = length(quote_nullable(s.id)) GROUP BY gt.id",
+            // `s(x)` renames the first of `i.*`'s columns only: `lookup` is
+            // still `s`'s (float8), not the outer `o.lookup`.
+            "SELECT z.id FROM outer_input o CROSS JOIN LATERAL ( \
+                SELECT w.id FROM (SELECT i.* FROM star_inputs i LIMIT 1) s(x) \
+                CROSS JOIN LATERAL (SELECT k.id FROM lookup_keys k WHERE k.id = lookup) w \
+             ) z WHERE o.lookup = 1",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
+        // Once the items it reads are fixed, a LATERAL item is too.
+        assert!(select_one(
+            &db,
+            "SELECT x.id FROM lateral_rows t \
+             CROSS JOIN LATERAL (SELECT t.id AS id LIMIT 1) x WHERE t.id = 1 GROUP BY x.id",
         ));
     }
 }

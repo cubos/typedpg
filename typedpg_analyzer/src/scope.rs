@@ -987,12 +987,10 @@ impl Scope {
             }
             s
         };
+        // The blocked aliases are this level's RIGHT / FULL join inputs:
+        // an outer level's entry with the same alias keeps its own flags.
         std::iter::once(self.sources.iter().map(mark).collect())
-            .chain(
-                self.outer_tiers
-                    .iter()
-                    .map(|tier| tier.iter().map(mark).collect()),
-            )
+            .chain(self.outer_tiers.iter().cloned())
             .collect()
     }
 
