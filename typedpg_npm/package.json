@@ -1,6 +1,6 @@
 {
   "name": "@cubos/typedpg",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Typed PostgreSQL queries for TypeScript, checked against your migrations without a database",
   "license": "MIT",
   "repository": {
