@@ -890,3 +890,19 @@ fn row_star_items_expand_in_row_sublink_comparisons() {
         );
     }
 }
+
+#[test]
+fn a_right_join_block_stays_on_its_own_level() {
+    let db = shadowing_levels();
+    // The RIGHT join blocks its left input `a` for the LATERAL item; the
+    // outer level's `a` (same alias) is another entry, and `outer_col` is
+    // its column.
+    let info = db
+        .analyze(
+            "SELECT (SELECT z.v FROM (VALUES (2)) a(inner_col) \
+                     RIGHT JOIN LATERAL (SELECT outer_col AS v) z ON true) AS v \
+             FROM (VALUES (1)) a(outer_col)",
+        )
+        .unwrap();
+    assert_eq!(col(&info, "v").pg_type, int4());
+}

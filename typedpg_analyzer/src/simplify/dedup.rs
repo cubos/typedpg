@@ -451,6 +451,10 @@ pub(super) struct Rel {
     /// function: each column's type and whether its collation is
     /// deterministic, by attnum - 1. Empty for a base table.
     pub(super) cte_columns: Vec<(Option<PgTypeOid>, bool)>,
+    /// The item may read the items to its left (a `LATERAL` subquery, a
+    /// `FROM` function): its one row is per row of theirs, so it is a fixed
+    /// row of the level only once they are.
+    pub(super) reads_left: bool,
 }
 
 impl Rel {
@@ -808,6 +812,7 @@ impl<'a> Scope<'a> {
             columns: Vec::new(),
             columns_known: false,
             cte_columns: Vec::new(),
+            reads_left: false,
         });
     }
 
@@ -976,6 +981,7 @@ impl<'a> Scope<'a> {
                 columns,
                 columns_known,
                 cte_columns,
+                reads_left: false,
             });
             return Some(1 << (self.rels.len() - 1));
         }
@@ -1140,6 +1146,7 @@ impl<'a> Scope<'a> {
             columns,
             columns_known,
             cte_columns,
+            reads_left: !self.rels.is_empty(),
         });
         Some(1 << (self.rels.len() - 1))
     }
@@ -1265,8 +1272,14 @@ impl<'a> Scope<'a> {
         }
         // An alias column list that renames every uncertain target makes
         // the names certain again.
-        if renames.len() == columns.len() {
+        // (Not past a `*` target: it expands to columns this can't count,
+        // so the list may rename only some of them.)
+        let has_star = target_list_has_star(select);
+        if renames.len() == columns.len() && !has_star {
             columns_known = true;
+        }
+        if has_star {
+            columns_known = false;
         }
         let alias = sub.alias.as_ref().map(|a| a.aliasname.clone());
         let cte_columns = super::cardinality::select_output_columns(ctx, select, &env)
@@ -1285,6 +1298,7 @@ impl<'a> Scope<'a> {
             columns,
             columns_known,
             cte_columns,
+            reads_left: sub.lateral,
         });
         Some(1 << (self.rels.len() - 1))
     }
@@ -1361,6 +1375,7 @@ impl<'a> Scope<'a> {
             columns,
             columns_known: true,
             cte_columns: Vec::new(),
+            reads_left: false,
         });
         Some(1 << (self.rels.len() - 1))
     }
@@ -1447,6 +1462,15 @@ impl<'a> Scope<'a> {
             // a `double precision` side it is a converted value, which can't
             // stand for the column.
             if !join.using_uncoerced.contains(&name) {
+                return Col::Other;
+            }
+            // A relation outside the join with the same column makes the
+            // name another binding (in another join's `ON`, which sees only
+            // its own inputs) or ambiguous: not this merged column.
+            let inside = join.left | join.right;
+            if (0..self.rels.len()).any(|r| {
+                inside & (1u64 << r) == 0 && self.rels[r].columns.iter().any(|(n, _)| n == name)
+            }) {
                 return Col::Other;
             }
             let mut found = (0..self.rels.len())
@@ -3125,6 +3149,26 @@ fn function_name(nodes: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
         [schema, name] => Some((Some(*schema), *name)),
         _ => None,
     }
+}
+
+/// Whether `select`'s output (its left arm's, for a set operation) has a
+/// `*` or `t.*` target, which expands to a number of columns the target list
+/// doesn't show.
+fn target_list_has_star(select: &protobuf::SelectStmt) -> bool {
+    if select.op() != SetOperation::SetopNone {
+        return select.larg.as_deref().is_some_and(target_list_has_star);
+    }
+    select.target_list.iter().any(|target| {
+        matches!(
+            &target.node,
+            Some(Node::ResTarget(target))
+                if matches!(
+                    target.val.as_deref().and_then(|value| value.node.as_ref()),
+                    Some(Node::ColumnRef(column))
+                        if matches!(column_ref_fields(column), Fields::Star(_))
+                )
+        )
+    })
 }
 
 /// The names PG gives a subquery's output columns, with whether every one is
