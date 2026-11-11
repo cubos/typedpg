@@ -621,6 +621,89 @@ mod tests {
     }
 
     #[test]
+    fn fetch_one_on_a_delete_with_an_opaque_using_item_is_fine() {
+        let db = catalog();
+        let sql = "DELETE FROM users u USING unnest($2::bigint[]) AS permitted(id) \
+                   WHERE u.id = $1 AND u.id = permitted.id RETURNING u.id";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+        // The target's key is only equated to the opaque item's column: not
+        // determined, so the query may return many.
+        let sql = "DELETE FROM users u USING unnest($1::bigint[]) AS p(id) \
+                   WHERE u.id = p.id RETURNING u.id";
+        assert_eq!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fetch_one_on_an_update_from_join_chain_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE owners (id bigint PRIMARY KEY, tool_id bigint);
+             CREATE TABLE tools (id bigint PRIMARY KEY, name text);
+             CREATE TABLE cache (id bigint PRIMARY KEY, name text);",
+        )
+        .unwrap();
+        let sql = "WITH chosen AS (SELECT tool_id FROM owners WHERE id = $1) \
+                   UPDATE cache c SET name = t.name \
+                   FROM chosen JOIN tools t ON t.id = chosen.tool_id \
+                   WHERE c.id = t.id RETURNING c.id";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+        let sql = "UPDATE cache c SET name = 'x' FROM tools t \
+                   WHERE c.name = t.name RETURNING c.id";
+        assert_eq!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fetch_one_on_a_merge_returning_is_fine() {
+        let db = catalog();
+        let sql = "MERGE INTO orgs g USING (SELECT $1::bigint AS id) s ON g.id = s.id \
+                   WHEN MATCHED THEN DELETE RETURNING g.id";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+        // A base table source is not one row.
+        let sql = "MERGE INTO orgs g USING users s ON g.id = s.org_id \
+                   WHEN MATCHED THEN DELETE RETURNING g.id";
+        assert_eq!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn fetch_one_on_a_system_view_key_is_fine() {
         let db = catalog();
         let sql = "SELECT setting FROM pg_settings WHERE name = 'deadlock_timeout'";
