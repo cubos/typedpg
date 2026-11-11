@@ -133,6 +133,14 @@ pub fn redundant_distinct_spans(
 /// every overload of which is non-set-returning also yields exactly one row
 /// (`ROWS FROM` of several such calls and `WITH ORDINALITY` included).
 ///
+/// A `FROM` subquery is judged in PostgreSQL's namespace: a `LATERAL` one
+/// sees the items to its left (a CTE reference, `FROM` subquery, `VALUES`
+/// list or `FROM` function there is a value item whose columns' types are
+/// known), and a plain one sees none of its own level's — only the levels
+/// around it. A sublink (in the target list or `WHERE`) sees the whole
+/// level. The nearest level a name resolves in decides; an ambiguous name
+/// within one level, or an item whose columns aren't known, gives up.
+///
 /// A volatile call only matters as an equality's value operand, which
 /// decides which row a key matches: [`super::dedup`] refuses a volatile one.
 /// Volatility anywhere else — the target list, `ORDER BY`, another `WHERE`
@@ -304,10 +312,10 @@ fn visible_ctes(
 
 /// The CTE environment a FROM subquery's own `WITH` clause makes visible:
 /// its CTEs shadow the enclosing level's, and its bodies are judged around
-/// `parent`, the scope of the subquery's own level (nested in the levels
-/// around it). A CTE whose body isn't one row is still listed for the
-/// columns a nested aggregate argument can resolve against (see
-/// [`single_row_cte`]).
+/// `parent`, the levels around the subquery (a CTE is analyzed before the
+/// query's `FROM`, so it reads none of that level's own items). A CTE whose
+/// body isn't one row is still listed for the columns a nested aggregate
+/// argument can resolve against (see [`single_row_cte`]).
 pub(super) fn subquery_cte_env(
     ctx: &Ctx<'_>,
     env: &CteEnv,
@@ -416,7 +424,15 @@ fn cte_output_columns(ctx: &Ctx<'_>, body: NodeRef<'_>, env: &CteEnv) -> Vec<Cte
     }
 }
 
-fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Vec<CteColumn> {
+/// The columns a `SELECT` body yields — a plain target list, a `VALUES` list
+/// or a set operation's arms — with each name, type and whether its
+/// collation compares bytewise. Used for a CTE's and a `FROM` subquery's
+/// output columns.
+pub(super) fn select_output_columns(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+    env: &CteEnv,
+) -> Vec<CteColumn> {
     if select.op() != SetOperation::SetopNone {
         let (Some(left), Some(right)) = (select.larg.as_deref(), select.rarg.as_deref()) else {
             return Vec::new();
@@ -434,12 +450,16 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
         }
         return columns;
     }
-    if let Some(Node::List(first)) = select
-        .values_lists
-        .first()
-        .and_then(|node| node.node.as_ref())
-    {
-        return first
+    if !select.values_lists.is_empty() {
+        // A VALUES column's type is the common type of every row's value:
+        // known only when each row's is the same known type under a
+        // deterministic collation. PG coerces the rows to a common type this
+        // doesn't model, so any other shape stays unknown.
+        let mut rows = select.values_lists.iter();
+        let Some(Node::List(first)) = rows.next().and_then(|node| node.node.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out: Vec<CteColumn> = first
             .items
             .iter()
             .enumerate()
@@ -452,6 +472,22 @@ fn select_output_columns(ctx: &Ctx<'_>, select: &SelectStmt, env: &CteEnv) -> Ve
                 }
             })
             .collect();
+        for row in rows {
+            let Some(Node::List(list)) = row.node.as_ref() else {
+                return Vec::new();
+            };
+            if list.items.len() != out.len() {
+                return Vec::new();
+            }
+            for (column, item) in out.iter_mut().zip(&list.items) {
+                let (typ, deterministic) = value_type(ctx, None, item);
+                if column.typ != typ || !column.deterministic || !deterministic {
+                    column.typ = None;
+                    column.deterministic = false;
+                }
+            }
+        }
+        return out;
     }
     // Columns are matched to the CTE's alias list by position, so a target
     // whose columns can't all be listed makes the whole list unknown (an
@@ -639,8 +675,10 @@ fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
     qualifier == rel.refname || (!rel.aliased && qualifier == rel.relname)
 }
 
-/// The type of a value a CTE's output exposes, when it is a column, a
-/// parameter, a constant or a cast of one.
+/// The type of a value an output column exposes, when it is a column, a
+/// parameter, a constant or a cast of one: a cast's target type is known
+/// even when it is collatable, but only a non-collatable one compares
+/// bytewise (`bigint`, `int`, `uuid` — not `text`).
 fn value_type(
     ctx: &Ctx<'_>,
     scope: Option<&Scope<'_>>,
@@ -661,16 +699,24 @@ fn value_type(
                 dedup::Col::Other => (None, false),
             }
         }
-        Some(Node::ParamRef(param)) => usize::try_from(param.number)
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|index| ctx.analyzed.params.get(index))
-            .map_or((None, false), |param| {
-                (
-                    dedup::type_oid(ctx, &param.pg_type),
-                    dedup::deterministic_type_collation(&param.pg_type),
-                )
-            }),
+        Some(Node::ParamRef(param)) => {
+            let (typ, deterministic) = usize::try_from(param.number)
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|index| ctx.analyzed.params.get(index))
+                .map_or((None, false), |param| {
+                    (
+                        dedup::type_oid(ctx, &param.pg_type),
+                        dedup::deterministic_type_collation(&param.pg_type),
+                    )
+                });
+            // A derived output column never has type `unknown`.
+            if typ == Some(oid::UNKNOWN) {
+                (None, false)
+            } else {
+                (typ, deterministic)
+            }
+        }
         Some(Node::AConst(constant)) if !constant.isnull => match constant.val.as_ref() {
             Some(Val::Ival(_)) => (Some(oid::INT4), true),
             Some(Val::Sval(_)) => (Some(oid::TEXT), true),
@@ -678,17 +724,40 @@ fn value_type(
             _ => (None, false),
         },
         Some(Node::TypeCast(cast)) => {
-            let names = cast
-                .type_name
-                .as_ref()
-                .map(|name| string_list(&name.names))
-                .unwrap_or_default();
+            let Some(type_name) = cast.type_name.as_ref() else {
+                return (None, false);
+            };
+            // `%TYPE` and `SETOF` name something this doesn't resolve as a
+            // plain type.
+            if type_name.setof || type_name.pct_type {
+                return (None, false);
+            }
+            let names = string_list(&type_name.names);
             let typ = match names.as_slice() {
                 [name] => ctx.catalog.resolve_type_by_name(None, name),
                 [schema, name] => ctx.catalog.resolve_type_by_name(Some(schema), name),
                 _ => None,
             };
-            (typ.map(|typ| typ.oid), false)
+            // A derived output column never has type `unknown`: PG resolves
+            // an all-unknown VALUES / subquery column to `text`, and an
+            // implicit user cast can then make it something else entirely
+            // (`'1'::unknown` in a `text -> float8` comparison).
+            if typ.is_some_and(|typ| typ.oid == oid::UNKNOWN) {
+                return (None, false);
+            }
+            // An array cast's target is the array type, not its element's.
+            let typ = match typ {
+                Some(typ) if type_name.array_bounds.is_empty() => Some(typ.oid),
+                Some(typ) => ctx.catalog.array_type_of(typ.oid),
+                None => None,
+            };
+            // A cast to a type with no collation (`bigint`, `int`, `uuid`)
+            // gives a value that compares bytewise; a collatable one keeps
+            // whatever collation its input had.
+            let deterministic = typ
+                .and_then(|typ| ctx.catalog.get_type(typ))
+                .is_some_and(|typ| typ.typcollation.is_none());
+            (typ, deterministic)
         }
         _ => (None, false),
     }
@@ -731,12 +800,12 @@ enum SelectCheck {
 }
 
 /// Search `node`'s subtree for `target`, giving each nested query level the
-/// [`FromScope`]s and CTEs it is evaluated in. Once found, run `check`'s
-/// proof with that scope and store the answer in `out`.
-///
-/// The scopes may include items a subquery can't actually see without
-/// `LATERAL`; that only matters for queries PG rejects, which never reach
-/// here (the view analyzed).
+/// [`FromScope`]s and CTEs it is evaluated in. A level's `FROM` clause is
+/// walked entry by entry ([`find_select_from`]): a `LATERAL` item sees the
+/// items to its left of the same level, a plain `FROM` subquery none of its
+/// own level's (only the levels around the clause), and a sublink the whole
+/// level. Once found, run `check`'s proof with that scope and store the
+/// answer in `out`.
 fn find_select(
     ctx: &Ctx<'_>,
     node: NodeRef<'_>,
@@ -794,6 +863,19 @@ fn find_select(
             for child in select_children(select) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
+            // The FROM clause: each entry sees the items to its left in the
+            // same FROM clause (a `LATERAL` item), never its own (a plain
+            // FROM subquery).
+            find_select_from(
+                ctx,
+                &select.from_clause,
+                &[],
+                parent,
+                &visible.after,
+                target,
+                check,
+                out,
+            );
         }
         NodeRef::InsertStmt(insert) => {
             let visible = visible_ctes(ctx, env, insert.with_clause.as_ref(), parent);
@@ -827,6 +909,16 @@ fn find_select(
             for child in update_children(update) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
+            find_select_from(
+                ctx,
+                &update.from_clause,
+                &[],
+                parent,
+                &visible.after,
+                target,
+                check,
+                out,
+            );
         }
         NodeRef::DeleteStmt(delete) => {
             let visible = visible_ctes(ctx, env, delete.with_clause.as_ref(), parent);
@@ -844,6 +936,16 @@ fn find_select(
             for child in delete_children(delete) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
+            find_select_from(
+                ctx,
+                &delete.using_clause,
+                &[],
+                parent,
+                &visible.after,
+                target,
+                check,
+                out,
+            );
         }
         NodeRef::MergeStmt(merge) => {
             let visible = visible_ctes(ctx, env, merge.with_clause.as_ref(), parent);
@@ -865,10 +967,151 @@ fn find_select(
             for child in merge_children(merge) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
+            find_select_from(ctx, source, &[], parent, &visible.after, target, check, out);
+        }
+        // A FROM subquery reached without its level's items to the left (a
+        // DML `FROM` item, say): only the enclosing levels are visible,
+        // which is what a non-`LATERAL` one sees; a `LATERAL` one may see
+        // fewer items than PostgreSQL allows, giving up safely.
+        NodeRef::RangeSubselect(sub) => {
+            if let Some(Node::SelectStmt(select)) =
+                sub.subquery.as_deref().and_then(|n| n.node.as_ref())
+            {
+                find_select(
+                    ctx,
+                    NodeRef::SelectStmt(select),
+                    parent,
+                    env,
+                    target,
+                    check,
+                    out,
+                );
+            }
+        }
+        // A FROM function's arguments see only the enclosing levels here
+        // (see above); a level's own items to its left are added by
+        // [`find_select_from`].
+        NodeRef::RangeFunction(_) => {
+            for child in node.children() {
+                find_select(ctx, child, parent, env, target, check, out);
+            }
         }
         _ => {
             for child in node.children() {
                 find_select(ctx, child, parent, env, target, check, out);
+            }
+        }
+    }
+}
+
+/// Search a `SELECT`'s FROM clause for `target`, giving each entry the
+/// [`FromScope`] PostgreSQL lets it read: the entries to its left of the
+/// same `FROM` clause for a `LATERAL` item, and only the levels around the
+/// clause (`level_parent`) for anything else.
+#[allow(clippy::too_many_arguments)] // one per level's walker state
+fn find_select_from(
+    ctx: &Ctx<'_>,
+    from: &[protobuf::Node],
+    left: &[protobuf::Node],
+    level_parent: Option<&FromScope<'_>>,
+    env: &CteEnv,
+    target: &SelectStmt,
+    check: SelectCheck,
+    out: &mut Option<bool>,
+) {
+    let mut left = left.to_vec();
+    for item in from {
+        find_select_from_item(ctx, item, &left, level_parent, env, target, check, out);
+        left.push(item.clone());
+    }
+}
+
+/// [`find_select_from`] for one FROM entry: a join is two levels' entries
+/// with its own ON scope, a subquery or function a level nested in the
+/// entries to its left.
+#[allow(clippy::too_many_arguments)] // one per level's walker state
+fn find_select_from_item(
+    ctx: &Ctx<'_>,
+    item: &protobuf::Node,
+    left: &[protobuf::Node],
+    level_parent: Option<&FromScope<'_>>,
+    env: &CteEnv,
+    target: &SelectStmt,
+    check: SelectCheck,
+    out: &mut Option<bool>,
+) {
+    if out.is_some() {
+        return;
+    }
+    match item.node.as_ref() {
+        Some(Node::JoinExpr(join)) => {
+            let mut join_left = left.to_vec();
+            if let Some(l) = join.larg.as_deref() {
+                find_select_from_item(ctx, l, &join_left, level_parent, env, target, check, out);
+                join_left.push(l.clone());
+            }
+            if let Some(r) = join.rarg.as_deref() {
+                find_select_from_item(ctx, r, &join_left, level_parent, env, target, check, out);
+            }
+            // An ON condition sees its own join's two sides, not the other
+            // FROM entries of the level.
+            if let Some(quals) = join.quals.as_deref()
+                && let Some(quals) = quals.node.as_ref()
+            {
+                let sides: Vec<protobuf::Node> = [&join.larg, &join.rarg]
+                    .into_iter()
+                    .flatten()
+                    .map(|n| (**n).clone())
+                    .collect();
+                let scope = FromScope::of_items(ctx, &sides, level_parent);
+                find_select(ctx, quals.to_ref(), Some(&scope), env, target, check, out);
+            }
+        }
+        Some(Node::RangeSubselect(sub)) => {
+            if let Some(Node::SelectStmt(select)) =
+                sub.subquery.as_deref().and_then(|n| n.node.as_ref())
+            {
+                if sub.lateral {
+                    let scope = FromScope::of_items_nested(ctx, left, level_parent);
+                    find_select(
+                        ctx,
+                        NodeRef::SelectStmt(select),
+                        Some(&scope),
+                        env,
+                        target,
+                        check,
+                        out,
+                    );
+                } else {
+                    // No item of this level is visible, only the levels
+                    // around it.
+                    find_select(
+                        ctx,
+                        NodeRef::SelectStmt(select),
+                        level_parent,
+                        env,
+                        target,
+                        check,
+                        out,
+                    );
+                }
+            }
+        }
+        Some(Node::RangeFunction(_)) => {
+            // `LATERAL` is a noise word before a function call: its
+            // arguments already read the items to its left.
+            let scope = FromScope::of_items_nested(ctx, left, level_parent);
+            if let Some(root) = item.node.as_ref() {
+                for child in root.to_ref().children() {
+                    find_select(ctx, child, Some(&scope), env, target, check, out);
+                }
+            }
+        }
+        _ => {
+            if let Some(root) = item.node.as_ref() {
+                for child in root.to_ref().children() {
+                    find_select(ctx, child, level_parent, env, target, check, out);
+                }
             }
         }
     }
@@ -896,12 +1139,12 @@ fn find_cte_bodies(
     }
 }
 
-/// A SELECT's direct children, excluding its own WITH clause.
+/// A SELECT's direct children other than its own WITH clause and FROM
+/// clause (which [`find_select_from`] walks with each entry's visibility).
 fn select_children(select: &SelectStmt) -> Vec<NodeRef<'_>> {
     let mut out = Vec::new();
     for list in [
         &select.target_list,
-        &select.from_clause,
         &select.group_clause,
         &select.window_clause,
         &select.values_lists,
@@ -944,7 +1187,6 @@ fn insert_children(insert: &InsertStmt) -> Vec<NodeRef<'_>> {
 
 fn update_children(update: &UpdateStmt) -> Vec<NodeRef<'_>> {
     let mut out: Vec<NodeRef<'_>> = refs(&update.target_list).collect();
-    out.extend(refs(&update.from_clause));
     if let Some(node) = update
         .where_clause
         .as_deref()
@@ -959,7 +1201,7 @@ fn update_children(update: &UpdateStmt) -> Vec<NodeRef<'_>> {
 }
 
 fn delete_children(delete: &DeleteStmt) -> Vec<NodeRef<'_>> {
-    let mut out: Vec<NodeRef<'_>> = refs(&delete.using_clause).collect();
+    let mut out: Vec<NodeRef<'_>> = Vec::new();
     if let Some(node) = delete
         .where_clause
         .as_deref()
@@ -975,10 +1217,12 @@ fn delete_children(delete: &DeleteStmt) -> Vec<NodeRef<'_>> {
 
 fn merge_children(merge: &MergeStmt) -> Vec<NodeRef<'_>> {
     let mut out: Vec<NodeRef<'_>> = refs(&merge.merge_when_clauses).collect();
-    for node in [&merge.source_relation, &merge.join_condition] {
-        if let Some(node) = node.as_deref().and_then(|node| node.node.as_ref()) {
-            out.push(node.to_ref());
-        }
+    if let Some(node) = merge
+        .join_condition
+        .as_deref()
+        .and_then(|node| node.node.as_ref())
+    {
+        out.push(node.to_ref());
     }
     if let Some(returning) = &merge.returning_clause {
         out.push(NodeRef::ReturningClause(returning));
@@ -1142,6 +1386,11 @@ fn fixed_per_evaluation(ctx: &Ctx<'_>, value: &protobuf::Node) -> bool {
             // A window function numbers the rows it sees, so it differs
             // from one row to the next even over constants.
             NodeRef::FuncCall(call) if call.over.is_some() => return false,
+            // A call whose parameters aren't all spelled may leave one to a
+            // volatile default (`nextval(…)`), evaluated per row.
+            NodeRef::FuncCall(call) if !dedup::call_spells_every_parameter(ctx, call) => {
+                return false;
+            }
             _ => {}
         }
         stack.extend(node.children());
@@ -1750,6 +1999,23 @@ mod tests {
              CREATE TABLE dst (id bigint PRIMARY KEY, z int);
              CREATE TABLE src (id bigint PRIMARY KEY, dst_id bigint);
              CREATE TABLE src_empty ();
+             CREATE TABLE owners (id bigint PRIMARY KEY, tool_id bigint);
+             CREATE TABLE tools (id bigint PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE pairs (
+                a bigint NOT NULL,
+                b bigint NOT NULL,
+                v text NOT NULL,
+                PRIMARY KEY (a, b)
+             );
+             CREATE TABLE outer_rows (id int PRIMARY KEY, lookup bigint);
+             CREATE TABLE inner_rows (id int PRIMARY KEY, lookup double precision);
+             CREATE TABLE keys (id bigint PRIMARY KEY);
+             CREATE TABLE inputs (id int);
+             CREATE SEQUENCE picks;
+             CREATE FUNCTION stable_fn(v bigint) RETURNS bigint STABLE LANGUAGE sql
+                AS $$ SELECT v $$;
+             CREATE FUNCTION pick(x bigint DEFAULT nextval('picks')) RETURNS bigint
+                STABLE LANGUAGE sql AS $$ SELECT x $$;
              CREATE TABLE alias_partial (k int, active boolean, inactive boolean);
              CREATE UNIQUE INDEX ON alias_partial (k) WHERE active;",
         )
@@ -3856,5 +4122,244 @@ mod tests {
         )
         .unwrap();
         assert!(select_one(&db, "SELECT id FROM p WHERE id = 1"));
+    }
+
+    /// The first `SELECT` in `view` that carries a `LIMIT`.
+    fn limited_select(view: &QueryView) -> &SelectStmt {
+        view.tree
+            .nodes()
+            .into_iter()
+            .find_map(|(node, _)| match node {
+                NodeRef::SelectStmt(select) if select.limit_count.is_some() => Some(select),
+                _ => None,
+            })
+            .expect("a limited select")
+    }
+
+    #[test]
+    fn a_lateral_scope_sees_the_cte_items_to_its_left() {
+        let db = catalog();
+        // The issue's repro: the lateral subquery is keyed by the
+        // single-row CTE's column, a value item of the level around it.
+        let repro = "WITH o AS (SELECT id, tool_id FROM owners WHERE id = $1) \
+             SELECT o.id, w.name FROM o \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t WHERE t.id = o.tool_id) w \
+             ON true";
+        assert!(select_one(&db, repro), "{repro}");
+        assert!(statement_one(&db, repro), "{repro}");
+        // The same with an unqualified column reference.
+        assert!(select_one(
+            &db,
+            "WITH o AS (SELECT tool_id FROM owners WHERE id = $1) \
+             SELECT o.tool_id, w.name FROM o \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t WHERE t.id = tool_id) w \
+             ON true",
+        ));
+        // A data-modifying CTE's `RETURNING` columns are value items too.
+        assert!(statement_one(
+            &db,
+            "WITH o AS ( \
+                 UPDATE owners SET tool_id = tool_id WHERE id = $1 RETURNING id, tool_id \
+             ) \
+             SELECT o.id, w.name FROM o \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t WHERE t.id = o.tool_id) w \
+             ON true",
+        ));
+        // A STABLE call of the CTE's column is one value per `o` row.
+        assert!(select_one(
+            &db,
+            "WITH o AS (SELECT id, tool_id FROM owners WHERE id = $1) \
+             SELECT o.id, w.name FROM o \
+             LEFT JOIN LATERAL \
+                (SELECT t.name FROM tools t WHERE t.id = stable_fn(o.tool_id)) w \
+             ON true",
+        ));
+    }
+
+    #[test]
+    fn a_lateral_scope_sees_the_derived_items_to_its_left() {
+        let db = catalog();
+        // A FROM subquery's output columns are typed from its target list.
+        assert!(select_one(
+            &db,
+            "SELECT o.id, w.name FROM (SELECT id, tool_id FROM owners WHERE id = $1) o \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t WHERE t.id = o.tool_id) w \
+             ON true",
+        ));
+        // A single-row VALUES list's column, through the alias column list.
+        assert!(select_one(
+            &db,
+            "SELECT v.i, w.name FROM (VALUES ($1::bigint)) v(i) \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t WHERE t.id = v.i) w \
+             ON true",
+        ));
+        // A non-set-returning FROM function's output column.
+        assert!(select_one(
+            &db,
+            "SELECT s.v, w.name FROM stable_fn($1) s(v) \
+             LEFT JOIN LATERAL (SELECT t.name FROM tools t WHERE t.id = s.v) w \
+             ON true",
+        ));
+        // Two laterals: the second is keyed by the first's output column.
+        assert!(select_one(
+            &db,
+            "WITH o AS (SELECT id, tool_id FROM owners WHERE id = $1) \
+             SELECT o.id, y.name FROM o, LATERAL ( \
+                 SELECT t.name, t.id FROM tools t WHERE t.id = o.tool_id \
+             ) x LEFT JOIN LATERAL (SELECT g.name FROM orgs g WHERE g.id = x.id) y \
+             ON true",
+        ));
+    }
+
+    #[test]
+    fn a_from_subquery_sees_no_item_of_its_own_level() {
+        let db = catalog();
+        // The inner `a.lookup` is the float8 one: two bigint keys compare
+        // equal to the same float8 value, so each level of this query can
+        // return two rows.
+        let nested = "SELECT w.id FROM outer_rows a CROSS JOIN LATERAL ( \
+             SELECT z.id FROM inner_rows a CROSS JOIN LATERAL ( \
+                 SELECT k.id FROM keys k WHERE k.id = a.lookup \
+             ) z WHERE a.id = 1 \
+         ) w WHERE a.id = 1";
+        assert!(!select_one(&db, nested), "{nested}");
+        // A non-LATERAL FROM subquery can't see its level's `x`: the
+        // reference binds to the outer level's float8 column, so the LIMIT
+        // is not redundant.
+        let shadowed = "SELECT ARRAY( \
+             SELECT s.id FROM outer_rows x \
+             CROSS JOIN (SELECT k.id FROM keys k WHERE k.id = x.lookup LIMIT 1) s \
+             WHERE x.id = 1 \
+         ) AS arr FROM inner_rows x WHERE x.id = 1";
+        let view = view(&db, shadowed);
+        assert!(
+            !select_at_most_one_row(&db, &view, limited_select(&view)),
+            "{shadowed}"
+        );
+    }
+
+    #[test]
+    fn from_subquery_and_values_columns_carry_their_types() {
+        let db = catalog();
+        // A single-row VALUES list feeding a composite key.
+        assert!(select_one(
+            &db,
+            "SELECT p.v FROM pairs p \
+             JOIN (VALUES ($1::bigint, $2::bigint)) k(a, b) ON p.a = k.a AND p.b = k.b",
+        ));
+        // A FROM subquery's typed output columns.
+        assert!(select_one(
+            &db,
+            "SELECT p.v FROM pairs p, \
+             (SELECT $1::bigint AS a, $2::bigint AS b) k \
+             WHERE p.a = k.a AND p.b = k.b",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT t.id FROM (VALUES (1)) AS r(id) JOIN tools t ON t.id = r.id",
+        ));
+        // A VALUES column is typed only when every row's value has the same
+        // known type: `1` and a float8 (which equal different bigints) are
+        // not one type.
+        let mixed = "WITH chosen(x) AS ( \
+             VALUES (1), (9007199254740992::double precision) ORDER BY 1 DESC LIMIT 1 \
+         ) SELECT k.id FROM chosen JOIN keys k ON k.id = chosen.x";
+        assert!(!select_one(&db, mixed), "{mixed}");
+        // A cast to a non-collatable type compares bytewise.
+        assert!(select_one(
+            &db,
+            "WITH k AS (SELECT $1::bigint AS id) \
+             SELECT u.email FROM users u JOIN k ON u.id = k.id",
+        ));
+    }
+
+    #[test]
+    fn an_unknown_cast_output_column_is_not_typed() {
+        let mut db = catalog();
+        // An implicit user cast can turn the `unknown` PG resolves to
+        // `text` into anything: two bigint keys equal the same float8.
+        db.apply_sql(
+            "CREATE FUNCTION float_from_text(text) RETURNS float8 LANGUAGE sql IMMUTABLE
+                AS $$ SELECT $1::numeric::float8 $$;
+             CREATE CAST (text AS float8) WITH FUNCTION float_from_text(text) AS IMPLICIT;",
+        )
+        .unwrap();
+        let sql = "SELECT k.id FROM (VALUES ('9007199254740992'::unknown)) v(x) \
+                   JOIN keys k ON k.id = v.x";
+        assert!(!select_one(&db, sql), "{sql}");
+        // A plain string literal stays text, and an explicit bigint cast is
+        // the exact key type: the lookup is one row.
+        assert!(select_one(
+            &db,
+            "SELECT k.id FROM (VALUES ('9007199254740992'::bigint)) v(x) \
+             JOIN keys k ON k.id = v.x",
+        ));
+    }
+
+    #[test]
+    fn a_composite_from_function_column_keeps_its_position() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TYPE pair AS (a int, b float8);
+             CREATE FUNCTION make_pair() RETURNS pair LANGUAGE sql IMMUTABLE
+                AS $$ SELECT ROW(0, 9007199254740992::float8)::pair $$;",
+        )
+        .unwrap();
+        // `make_pair()` expands into two columns, so `f.b` is its float8:
+        // two bigint keys equal it.
+        let sql = "SELECT s.id FROM ROWS FROM (make_pair(), hashtextextended('', 0)) AS f(a, b, c) \
+                   CROSS JOIN LATERAL (SELECT k.id FROM keys k WHERE k.id = f.b) s";
+        assert!(!select_one(&db, sql), "{sql}");
+    }
+
+    #[test]
+    fn an_unaliased_from_function_column_does_not_escape_a_level() {
+        let mut db = catalog();
+        db.apply_sql("CREATE TABLE o (ceil bigint PRIMARY KEY);")
+            .unwrap();
+        // The FROM function's column is named `ceil`; it must not resolve to
+        // the outer table's bigint `o.ceil` — its float8 matches two keys.
+        let sql = "SELECT w.id FROM o CROSS JOIN LATERAL ( \
+                       SELECT z.id FROM ceil(9007199254740992::float8) \
+                       CROSS JOIN LATERAL (SELECT k.id FROM keys k WHERE k.id = ceil) z \
+                   ) w WHERE o.ceil = 0";
+        assert!(!select_one(&db, sql), "{sql}");
+    }
+
+    #[test]
+    fn a_collatable_from_function_column_is_not_typed() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE COLLATION ci_f (
+                provider = icu, locale = 'und-u-ks-level2', deterministic = false
+             );
+             CREATE TABLE text_keys (id text PRIMARY KEY);",
+        )
+        .unwrap();
+        // `repeat` is collatable, so its result can carry the argument's
+        // nondeterministic collation: it isn't one key value.
+        let sql = "SELECT s.id FROM repeat('a' COLLATE ci_f, 1) AS f(v) \
+                   CROSS JOIN LATERAL (SELECT k.id FROM text_keys k WHERE k.id = f.v) s";
+        assert!(!select_one(&db, sql), "{sql}");
+    }
+
+    #[test]
+    fn a_non_collatable_scalar_from_function_column_is_typed() {
+        let db = catalog();
+        // The safe shape: one scalar function whose return type has no
+        // collation, with an alias column list naming its only column.
+        let sql = "SELECT w.name FROM stable_fn($1) s(v) \
+                   LEFT JOIN LATERAL (SELECT t.name FROM tools t WHERE t.id = s.v) w ON true";
+        assert!(select_one(&db, sql), "{sql}");
+    }
+
+    #[test]
+    fn a_fixed_distinct_target_refuses_a_defaulted_call() {
+        let db = catalog();
+        // `pick()` leaves `x` to its default, `nextval('picks')`, which PG
+        // evaluates per row: the targets differ, so DISTINCT keeps both.
+        assert!(!select_one(&db, "SELECT DISTINCT pick() FROM inputs"));
+        // Every parameter spelled is one value per evaluation.
+        assert!(select_one(&db, "SELECT DISTINCT pick(1) FROM inputs"));
     }
 }

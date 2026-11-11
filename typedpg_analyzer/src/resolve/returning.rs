@@ -232,6 +232,7 @@ fn namespace_has(scope: &Scope, name: &str) -> bool {
     scope
         .sources
         .iter()
+        .chain(scope.outer_tiers.iter().flatten())
         .chain(scope.outer_sources.iter())
         .any(|s| s.alias == name)
 }

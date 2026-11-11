@@ -29,7 +29,7 @@ pub(crate) fn analyze_set_operation(
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-    outer: &[crate::scope::TableSource],
+    outer_tiers: &[Vec<crate::scope::TableSource>],
     shadowed: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
     let left = sel
@@ -48,7 +48,14 @@ pub(crate) fn analyze_set_operation(
     // entry`).
     check_set_op_member_locking(left)?;
     let (left_cols, _) = super::select::keeping_unknown_outputs(|| {
-        analyze_select_with_ctes_and_outer(left, snapshot, params, cte_scopes, &[], outer, shadowed)
+        analyze_select_with_ctes_and_outer(
+            left,
+            snapshot,
+            params,
+            cte_scopes,
+            outer_tiers,
+            shadowed,
+        )
     })?;
     check_set_op_member_locking(right)?;
     let (right_cols, _) = super::select::keeping_unknown_outputs(|| {
@@ -57,8 +64,7 @@ pub(crate) fn analyze_set_operation(
             snapshot,
             params,
             cte_scopes,
-            &[],
-            outer,
+            outer_tiers,
             shadowed,
         )
     })?;

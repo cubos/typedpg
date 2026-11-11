@@ -290,8 +290,9 @@ fn column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>) -> Foldable {
     };
     let scope = ctx.scope;
     if let Some(t) = table {
-        let nearest = [&scope.sources, &scope.lateral_sources, &scope.outer_sources]
-            .into_iter()
+        let nearest = std::iter::once(&scope.sources)
+            .chain(scope.outer_tiers.iter())
+            .chain(std::iter::once(&scope.outer_sources))
             .find_map(|tier| tier.iter().find(|s| s.alias == t));
         if nearest.is_none_or(|s| s.table_only) {
             return Foldable::ANY;

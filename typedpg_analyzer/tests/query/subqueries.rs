@@ -30,6 +30,116 @@ fn setup() -> PgCatalog {
     db
 }
 
+/// Same column names at two nested `LATERAL` levels, with different types:
+/// PG resolves each reference to the nearest level's item.
+fn shadowing_levels() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE outer_rows (id int PRIMARY KEY, lookup bigint, name text);
+         CREATE TABLE inner_rows (id int PRIMARY KEY, lookup double precision);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn a_nested_lateral_resolves_to_the_nearest_level() {
+    let db = shadowing_levels();
+    // The inner `a` is `inner_rows`, nearer than the outer `a`:
+    // `outer_rows`: PG gives no ambiguity error.
+    let info = db
+        .analyze(
+            "SELECT w.id FROM outer_rows a CROSS JOIN LATERAL ( \
+                 SELECT z.id FROM inner_rows a CROSS JOIN LATERAL (SELECT a.id) z \
+             ) w",
+        )
+        .unwrap();
+    assert_eq!(col(&info, "id").pg_type, int4());
+    let info = db
+        .analyze(
+            "SELECT w.v FROM outer_rows a CROSS JOIN LATERAL ( \
+                 SELECT z.v FROM inner_rows a CROSS JOIN LATERAL (SELECT a.lookup AS v) z \
+             ) w",
+        )
+        .unwrap();
+    assert_eq!(col(&info, "v").pg_type, float8());
+    // The unqualified forms resolve the same way.
+    let info = db
+        .analyze(
+            "SELECT w.id FROM outer_rows a CROSS JOIN LATERAL ( \
+                 SELECT z.id FROM inner_rows a CROSS JOIN LATERAL (SELECT id) z \
+             ) w",
+        )
+        .unwrap();
+    assert_eq!(col(&info, "id").pg_type, int4());
+    let info = db
+        .analyze(
+            "SELECT w.v FROM outer_rows a CROSS JOIN LATERAL ( \
+                 SELECT z.v FROM inner_rows a CROSS JOIN LATERAL (SELECT lookup AS v) z \
+             ) w",
+        )
+        .unwrap();
+    assert_eq!(col(&info, "v").pg_type, float8());
+}
+
+#[test]
+fn a_nearer_lateral_level_hides_a_farther_one() {
+    let db = shadowing_levels();
+    // `name` exists only in the outer `a`: the inner `a` (inner_rows) still
+    // shadows it, so the reference fails against the nearer level instead
+    // of reaching past it.
+    let err = db
+        .analyze(
+            "SELECT z.v FROM outer_rows a CROSS JOIN LATERAL ( \
+                 SELECT z.v FROM inner_rows a CROSS JOIN LATERAL (SELECT a.name AS v) z \
+             ) w",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().starts_with("column a.name does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn a_sublink_keeps_its_enclosing_levels_as_tiers() {
+    let db = shadowing_levels();
+    // The sublink's nearest level is the LATERAL's own `a` (float8), not the
+    // outer `a` (int): PG resolves it with no ambiguity.
+    let info = db
+        .analyze(
+            "SELECT w.v FROM (VALUES (1::int)) a(id) CROSS JOIN LATERAL ( \
+                 SELECT (SELECT a.id) AS v FROM (VALUES (2::float8)) a(id) \
+             ) w",
+        )
+        .unwrap();
+    assert_eq!(col(&info, "v").pg_type, float8());
+    // An unqualified column the nearer level lacks reaches the farther one,
+    // even though its entry has the same alias.
+    let info = db
+        .analyze(
+            "SELECT w.v FROM (VALUES (1::int)) a(id) CROSS JOIN LATERAL ( \
+                 SELECT (SELECT id) AS v FROM (VALUES (2::float8)) a(other) \
+             ) w",
+        )
+        .unwrap();
+    assert_eq!(col(&info, "v").pg_type, int4());
+    // Two columns of the same level are still ambiguous.
+    let err = db
+        .analyze(
+            "SELECT w.v FROM (VALUES (1::int)) a(id) CROSS JOIN LATERAL ( \
+                 SELECT (SELECT id) AS v \
+                 FROM (VALUES (2::float8)) b(id), (VALUES (3::float8)) c(id) \
+             ) w",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("column reference \"id\" is ambiguous"),
+        "got: {err}"
+    );
+}
+
 // ── Subquery in FROM ─────────────────────────────────────────────────────────
 
 #[test]

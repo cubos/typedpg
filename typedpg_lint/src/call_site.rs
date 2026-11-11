@@ -598,6 +598,29 @@ mod tests {
     }
 
     #[test]
+    fn fetch_one_on_a_cte_keyed_lateral_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE owners (id bigint PRIMARY KEY, tool_id bigint);
+             CREATE TABLE tools (id bigint PRIMARY KEY, name text NOT NULL);",
+        )
+        .unwrap();
+        // The issue's repro: the LATERAL subquery is keyed by the single-row
+        // CTE's column.
+        let sql = "WITH o AS (SELECT id, tool_id FROM owners WHERE id = $1) \
+                   SELECT o.id, w.name FROM o \
+                   LEFT JOIN LATERAL \
+                      (SELECT t.name FROM tools t WHERE t.id = o.tool_id) w ON true";
+        assert!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchMayReturnMany
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn fetch_one_on_a_system_view_key_is_fine() {
         let db = catalog();
         let sql = "SELECT setting FROM pg_settings WHERE name = 'deadlock_timeout'";
