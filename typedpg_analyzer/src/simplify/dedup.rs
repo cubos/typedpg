@@ -450,7 +450,7 @@ pub(super) struct Rel {
     /// For a CTE reference, a FROM subquery, a VALUES list or a FROM
     /// function: each column's type and whether its collation is
     /// deterministic, by attnum - 1. Empty for a base table.
-    cte_columns: Vec<(Option<PgTypeOid>, bool)>,
+    pub(super) cte_columns: Vec<(Option<PgTypeOid>, bool)>,
 }
 
 impl Rel {
@@ -606,6 +606,11 @@ pub(super) struct Scope<'a> {
 pub(super) enum Col {
     /// A column of one of the scope's relations.
     Rel(usize, i16),
+    /// A relation whose columns aren't all known (an opaque DML item, or a
+    /// CTE / subquery with an uncertain output name) may hold the column:
+    /// nothing may be proven from it, and it must not fall through to an
+    /// outer level, whose per-row value would look fixed.
+    Opaque,
     /// Anything else: an outer query's column, an ambiguous name, a whole
     /// row, a name this doesn't resolve.
     Other,
@@ -696,6 +701,14 @@ impl<'a> Scope<'a> {
     /// The scope of a whole `UPDATE` or `DELETE`: the target relation and
     /// its `FROM` / `USING` items. The cardinality proof's scope (a target
     /// row is written once, so `ONLY` and partitioned targets count).
+    ///
+    /// A target row is written once however many `FROM` / `USING` rows it
+    /// joins, so only the target must be determined: an item this can't
+    /// model (a set-returning function, a view, a foreign table, a join with
+    /// one) is registered as an opaque relation instead of aborting the
+    /// proof. An opaque relation is never determined and its columns are
+    /// unknown, so a reference to it proves nothing; references qualified by
+    /// the target or by a modelled item keep working.
     pub(super) fn dml(
         ctx: &Ctx<'_>,
         env: &CteEnv,
@@ -712,9 +725,86 @@ impl<'a> Scope<'a> {
         scope.add_table(ctx, relation, false)?;
         let root = FromScope::opaque(None);
         for item in from {
-            scope.add(ctx, env, item, false, true, &root)?;
+            // `add` may have pushed some of a join's relations before
+            // failing on another side: drop them so the item is one opaque
+            // relation, not a partial one a reference could bind to.
+            let rels = scope.rels.len();
+            let joins = scope.joins.len();
+            if scope.add(ctx, env, item, false, true, &root).is_none() {
+                scope.rels.truncate(rels);
+                scope.joins.truncate(joins);
+                scope.add_opaque(item);
+            }
         }
         Some(scope)
+    }
+
+    /// Add one FROM item the proof can't model as a single opaque relation:
+    /// never determined, with no known columns, under the refname a
+    /// reference can use (`alias`, else a table's or function's name).
+    fn add_opaque(&mut self, item: &'a protobuf::Node) {
+        if self.rels.len() == MAX_RELATIONS {
+            return;
+        }
+        let (refname, aliased, relname) = match item.node.as_ref() {
+            Some(Node::RangeVar(rv)) => {
+                let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+                (
+                    alias.clone().unwrap_or_else(|| rv.relname.clone()),
+                    alias.is_some(),
+                    rv.relname.clone(),
+                )
+            }
+            Some(Node::RangeSubselect(sub)) => {
+                let alias = sub.alias.as_ref().map(|a| a.aliasname.clone());
+                (
+                    alias.clone().unwrap_or_default(),
+                    alias.is_some(),
+                    alias.unwrap_or_default(),
+                )
+            }
+            Some(Node::RangeFunction(rf)) => {
+                let alias = rf.alias.as_ref().map(|a| a.aliasname.clone());
+                let func = rf
+                    .functions
+                    .first()
+                    .and_then(|item| match item.node.as_ref() {
+                        Some(Node::List(pair)) => pair.items.first(),
+                        _ => None,
+                    })
+                    .and_then(|item| match item.node.as_ref() {
+                        Some(Node::FuncCall(call)) => string_list(&call.funcname).last().copied(),
+                        _ => None,
+                    });
+                let name = alias.clone().or_else(|| func.map(str::to_owned));
+                (
+                    name.clone().unwrap_or_default(),
+                    alias.is_some(),
+                    name.unwrap_or_default(),
+                )
+            }
+            Some(Node::JoinExpr(j)) => {
+                let alias = j.alias.as_ref().map(|a| a.aliasname.clone());
+                (
+                    alias.clone().unwrap_or_default(),
+                    alias.is_some(),
+                    alias.unwrap_or_default(),
+                )
+            }
+            _ => (String::new(), false, String::new()),
+        };
+        self.rels.push(Rel {
+            oid: None,
+            refname,
+            aliased,
+            schema: String::new(),
+            relname,
+            nullable: false,
+            single_row: false,
+            columns: Vec::new(),
+            columns_known: false,
+            cte_columns: Vec::new(),
+        });
     }
 
     /// Add one FROM item; its relations as a bitmask. `functions`: a
@@ -1251,23 +1341,30 @@ impl<'a> Scope<'a> {
     }
 
     /// Resolve a column reference against this scope alone.
+    ///
+    /// A relation whose output names aren't all certain — an opaque DML
+    /// item always — may hold the column a reference spells: an unqualified
+    /// reference, or one qualified by that relation, is [`Col::Opaque`]
+    /// rather than resolving to another relation (whose column would be a
+    /// different one) or to an outer level (whose per-row value looks fixed).
+    /// References qualified by a relation whose columns are all known still
+    /// resolve as before.
     pub(super) fn resolve(&self, names: &[&str]) -> Col {
-        // A relation whose output names aren't all certain may hold the
-        // column an *unqualified* reference spells: resolving it to another
-        // relation could read a different column (and a key fact on it would
-        // be about that other column), so nothing unqualified resolves here.
-        // A qualified reference names its relation, whose own attnums are
-        // checked below (and `None` while its names aren't all known).
-        if names.len() == 1 && self.rels.iter().any(|rel| !rel.columns_known) {
-            return Col::Other;
-        }
+        let any_unknown = || self.rels.iter().any(|rel| !rel.columns_known);
         let attnum = |r: usize, name: &str| {
+            if !self.rels[r].columns_known {
+                return Col::Opaque;
+            }
             self.rels[r]
                 .attnum(name)
                 .map_or(Col::Other, |attnum| Col::Rel(r, attnum))
         };
         match names {
             [name] => {
+                // The name could bind to a relation that doesn't list it.
+                if any_unknown() {
+                    return Col::Opaque;
+                }
                 let mut found = self
                     .rels
                     .iter()
@@ -1280,6 +1377,9 @@ impl<'a> Scope<'a> {
             }
             [qualifier, name] => match self.rel_named(qualifier) {
                 Some(r) => attnum(r, name),
+                // An opaque item without a refname this lists could still be
+                // the one the qualifier names (a join item, a function).
+                None if any_unknown() => Col::Opaque,
                 None => Col::Other,
             },
             [schema, table, name] => {
@@ -1288,6 +1388,7 @@ impl<'a> Scope<'a> {
                 });
                 match (found.next(), found.next()) {
                     (Some((r, _)), None) => attnum(r, name),
+                    _ if any_unknown() => Col::Opaque,
                     _ => Col::Other,
                 }
             }
@@ -1329,6 +1430,11 @@ impl<'a> Scope<'a> {
                     Col::Rel(r, attnum) => {
                         (Some(r), attnum, self.rels[r].column_info(ctx, attnum)?)
                     }
+                    // A relation whose output names aren't all certain may
+                    // hold the column this reference spells. Reading it as
+                    // an outer level's would make its per-row value look
+                    // fixed, so no key fact is read.
+                    Col::Opaque => return None,
                     Col::Other => {
                         // The nearest level holding the qualifier hides any
                         // farther one: it can't be an outer relation, even
@@ -2658,7 +2764,7 @@ pub(super) fn type_oid(ctx: &Ctx<'_>, t: &Type) -> Option<PgTypeOid> {
 }
 
 /// The type a `TypeCast`'s `TypeName` names, array bounds included.
-fn type_name_oid(ctx: &Ctx<'_>, type_name: &protobuf::TypeName) -> Option<PgTypeOid> {
+pub(super) fn type_name_oid(ctx: &Ctx<'_>, type_name: &protobuf::TypeName) -> Option<PgTypeOid> {
     let names = string_list(&type_name.names);
     let typ = match names.as_slice() {
         [name] => ctx.catalog.resolve_type_by_name(None, name),
@@ -2672,10 +2778,25 @@ fn type_name_oid(ctx: &Ctx<'_>, type_name: &protobuf::TypeName) -> Option<PgType
     }
 }
 
+/// Whether values of type `typ` carry a collation: the type's own
+/// `typcollation`, else its base type's for a domain. An unknown type counts
+/// as collatable.
+pub(super) fn collatable_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
+    let Some(ty) = ctx.catalog.pg_type.get(&typ) else {
+        return true;
+    };
+    ty.typcollation.is_some()
+        || ctx
+            .catalog
+            .pg_type
+            .get(&ctx.catalog.unwrap_domain(typ))
+            .is_none_or(|base| base.typcollation.is_some())
+}
+
 /// Whether a value of type `typ` is under a deterministic collation: the
 /// type's own (`typcollation`), else its base type's for a domain, is none
 /// or a bytewise one.
-fn deterministic_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
+pub(super) fn deterministic_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
     let Some(ty) = ctx.catalog.pg_type.get(&typ) else {
         return false;
     };

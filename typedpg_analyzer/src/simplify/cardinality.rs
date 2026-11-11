@@ -11,8 +11,8 @@
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
     self, CommonTableExpr, DeleteStmt, GroupingSetKind, InsertStmt, JoinType, LimitOption,
-    MergeStmt, ReturningClause, SelectStmt, SetOperation, UpdateStmt, WithClause, a_const::Val,
-    node::Node,
+    MergeMatchKind, MergeStmt, ReturningClause, SelectStmt, SetOperation, UpdateStmt, WithClause,
+    a_const::Val, node::Node,
 };
 
 use super::Ctx;
@@ -157,6 +157,12 @@ pub fn redundant_distinct_spans(
 /// set-returning call, a `FULL JOIN` (two one-row sides still produce an
 /// unmatched row from each when their keys differ), or an outer join whose
 /// nullable side isn't determined.
+///
+/// The same "equalities to a key" fixed point backs the DML proofs: an
+/// `UPDATE` / `DELETE` needs only its target determined — a `FROM` /
+/// `USING` item the proof can't model is an opaque relation, and a
+/// reference to one proves nothing — and a `MERGE` needs its target
+/// determined by the `ON` condition and its source at most one row.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
     if !view.analyzed.spreads.is_empty() {
         return false;
@@ -233,11 +239,17 @@ pub(super) fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> boo
 /// `WITH TIES`). An `INSERT ... VALUES` with exactly one row is, whatever
 /// its `ON CONFLICT`; `INSERT ... DEFAULT VALUES` is. An `INSERT ... SELECT`
 /// is when its select is. An `UPDATE` / `DELETE` is when its target relation
-/// is determined by its `WHERE` equalities (a target row is written once
-/// however many `FROM` / `USING` rows match it). Every
-/// data-modifying statement also needs a target relation no rewrite rule can
-/// replace (see [`dml_target_without_rules`]). Everything else — `MERGE`, a
-/// statement the proof can't see through — is `false`.
+/// is determined by its `WHERE` equalities and the `ON` facts of its
+/// `FROM` / `USING` joins (a target row is written once however many
+/// `FROM` / `USING` rows match it; those relations themselves need not be
+/// determined, and one the proof can't model is an opaque relation that
+/// only withholds facts). A `MERGE` is when its target is determined by a
+/// key equality in its `ON` condition and its source is at most one row,
+/// with no `WHEN NOT MATCHED BY SOURCE` clause (one source row then runs at
+/// most one action, matched or inserted). Every data-modifying statement
+/// also needs a target relation no rewrite rule can replace (see
+/// [`dml_target_without_rules`]); anything the proof can't see through is
+/// `false`.
 ///
 /// The statement's own `WITH` clause provides its single-row CTEs, judged in
 /// declaration order (see [`select_at_most_one_row`]).
@@ -696,7 +708,7 @@ fn value_type(
                     .map_or((None, false), |(typ, deterministic)| {
                         (Some(typ), deterministic)
                     }),
-                dedup::Col::Other => (None, false),
+                dedup::Col::Opaque | dedup::Col::Other => (None, false),
             }
         }
         Some(Node::ParamRef(param)) => {
@@ -732,32 +744,24 @@ fn value_type(
             if type_name.setof || type_name.pct_type {
                 return (None, false);
             }
-            let names = string_list(&type_name.names);
-            let typ = match names.as_slice() {
-                [name] => ctx.catalog.resolve_type_by_name(None, name),
-                [schema, name] => ctx.catalog.resolve_type_by_name(Some(schema), name),
-                _ => None,
-            };
+            // The cast's result type, an array's included (`int[]` is not
+            // `int`: the operator PG picks follows the real type).
+            let typ = dedup::type_name_oid(ctx, type_name);
             // A derived output column never has type `unknown`: PG resolves
             // an all-unknown VALUES / subquery column to `text`, and an
             // implicit user cast can then make it something else entirely
             // (`'1'::unknown` in a `text -> float8` comparison).
-            if typ.is_some_and(|typ| typ.oid == oid::UNKNOWN) {
+            if typ == Some(oid::UNKNOWN) {
                 return (None, false);
             }
-            // An array cast's target is the array type, not its element's.
-            let typ = match typ {
-                Some(typ) if type_name.array_bounds.is_empty() => Some(typ.oid),
-                Some(typ) => ctx.catalog.array_type_of(typ.oid),
-                None => None,
-            };
-            // A cast to a type with no collation (`bigint`, `int`, `uuid`)
-            // gives a value that compares bytewise; a collatable one keeps
-            // whatever collation its input had.
-            let deterministic = typ
-                .and_then(|typ| ctx.catalog.get_type(typ))
-                .is_some_and(|typ| typ.typcollation.is_none());
-            (typ, deterministic)
+            // A cast to a collatable type keeps its input's collation (a
+            // nondeterministic one included, which then wins over a
+            // column's default), so only a type without collation is known
+            // to compare bytewise.
+            (
+                typ,
+                typ.is_some_and(|typ| !dedup::collatable_type(ctx, typ)),
+            )
         }
         _ => (None, false),
     }
@@ -778,6 +782,7 @@ fn output_name(value: &protobuf::Node) -> Option<String> {
     names.last().map(|name| (*name).to_owned())
 }
 
+#[cfg(test)]
 fn string_list(nodes: &[protobuf::Node]) -> Vec<&str> {
     nodes
         .iter()
@@ -1263,6 +1268,7 @@ fn statement_at_most_one_row_in(
             &delete.using_clause,
             delete.where_clause.as_deref(),
         ),
+        NodeRef::MergeStmt(merge) => merge_at_most_one_row(ctx, merge, &env),
         _ => false,
     }
 }
@@ -1651,11 +1657,27 @@ fn all_relations_determined(
         return false;
     }
     let all: u64 = (1u64 << n) - 1;
+    determined_relations(ctx, select.where_clause.as_deref(), scope, outer) & all == all
+}
+
+/// [`all_relations_determined`]'s fixed point: the relations of `scope` it
+/// determines from `where_clause` and the joins' `ON` facts. A statement
+/// counting rows (a `MERGE`) requires only the relation it needs, not all.
+fn determined_relations(
+    ctx: &Ctx<'_>,
+    where_clause: Option<&protobuf::Node>,
+    scope: &Scope<'_>,
+    outer: &FromScope<'_>,
+) -> u64 {
+    let n = scope.rels.len();
+    if n == 0 || n > 63 {
+        return 0;
+    }
     // The level's facts: WHERE's, plus the ON conjuncts of every inner join
     // that isn't inside an outer join's nullable side (a null-extended row
     // never evaluates those, so there they only hold on matched rows and
     // stay with their join below).
-    let mut level_conjuncts = dedup::conjuncts(select.where_clause.as_deref());
+    let mut level_conjuncts = dedup::conjuncts(where_clause);
     for join in &scope.joins {
         if join.kind == JoinType::JoinInner && !join.nullable {
             level_conjuncts.extend(dedup::conjuncts(join.quals));
@@ -1703,12 +1725,19 @@ fn all_relations_determined(
                 typedpg_pg_query::protobuf::JoinType::JoinInner => {
                     (join.rels() & !known, known & join.rels())
                 }
-                typedpg_pg_query::protobuf::JoinType::JoinLeft => {
-                    (join.right_rel.map_or(0, |b| 1 << b), known & join.left)
+                // An outer join's nullable side is one fixed row only once
+                // its preserved side is: before that, some preserved rows may
+                // match it and others null-extend it, and an expression of
+                // its columns that maps NULL to a value (`quote_nullable`)
+                // then differs from row to row.
+                typedpg_pg_query::protobuf::JoinType::JoinLeft if join.left & !known == 0 => {
+                    (join.right_rel.map_or(0, |b| 1 << b), join.left)
                 }
-                typedpg_pg_query::protobuf::JoinType::JoinRight => {
-                    (join.left_rel.map_or(0, |b| 1 << b), known & join.right)
+                typedpg_pg_query::protobuf::JoinType::JoinRight if join.right & !known == 0 => {
+                    (join.left_rel.map_or(0, |b| 1 << b), join.right)
                 }
+                typedpg_pg_query::protobuf::JoinType::JoinLeft
+                | typedpg_pg_query::protobuf::JoinType::JoinRight => (0, 0),
                 // Nothing an ON says bounds a FULL join's unmatched rows.
                 _ => (0, 0),
             };
@@ -1740,7 +1769,7 @@ fn all_relations_determined(
             break;
         }
     }
-    known & all == all
+    known
 }
 
 // ── Statements ──────────────────────────────────────────────────────────────
@@ -1797,11 +1826,13 @@ fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> b
 }
 
 /// An `UPDATE ... FROM` / `DELETE ... USING` whose target relation is
-/// determined by the `WHERE` fixed point, the target counting as one more
-/// relation. A target row is updated or deleted once however many `FROM` /
-/// `USING` rows match it, so those other relations need not be determined:
-/// mapping their columns into the target's key doesn't multiply the
-/// statement's output rows.
+/// determined by the `WHERE` and join `ON` fixed point (the same facts the
+/// SELECT proof reads), the target counting as one more relation. A target
+/// row is updated or deleted once however many `FROM` / `USING` rows match
+/// it, so those other relations need not be determined: mapping their
+/// columns into the target's key doesn't multiply the statement's output
+/// rows. An item the scope can't model is opaque and simply withholds facts
+/// (see [`Scope::dml`]).
 fn dml_at_most_one_row(
     ctx: &Ctx<'_>,
     env: &CteEnv,
@@ -1822,31 +1853,84 @@ fn dml_at_most_one_row(
     if n == 0 || n > 63 {
         return false;
     }
-    let conjuncts = dedup::conjuncts(where_clause);
-    let facts: Vec<dedup::EqFact> = conjuncts
-        .iter()
-        .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, None))
-        .collect();
-    let sources = PredicateSources {
-        conjuncts: &conjuncts,
-        facts: &facts,
+    let root = FromScope::opaque(None);
+    let known = determined_relations(ctx, where_clause, &scope, &root);
+    // Relation 0 is the target (`Scope::dml` adds it first).
+    known & 1 == 1
+}
+
+/// A `MERGE` whose `RETURNING` yields at most one row: one source row
+/// matches at most one target row by a unique key, and runs at most one
+/// action for it (matched → update/delete, not matched → insert). Needs the
+/// target to be an ordinary table, no `WHEN NOT MATCHED BY SOURCE` clause,
+/// a source proven at most one row, and the target determined by a key
+/// equality in the `ON` condition.
+///
+/// The source is a relation of the scope next to the target: a subquery
+/// (`SELECT`, `VALUES`, a set operation) must be at most one row by
+/// [`statement_at_most_one_row_in`], including its own constant `LIMIT 0` /
+/// `1`; a CTE reference must be one of the statement's single-row CTEs. A
+/// base table is never one row here (nothing filters it before the action).
+fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool {
+    let Some(relation) = merge.relation.as_ref() else {
+        return false;
     };
-    let mut known = starting_relations(ctx, &scope);
-    loop {
-        let before = known;
-        for b in 0..n {
-            if known & (1 << b) == 0
-                && scope
-                    .key_equated_with(ctx, b, &facts, known, Some(&sources))
-                    .is_some()
-            {
-                known |= 1 << b;
+    if !dml_target_without_rules(ctx, relation) {
+        return false;
+    }
+    // `WHEN NOT MATCHED BY SOURCE` acts on target rows no source row
+    // matched, so the source's row count no longer bounds the action count.
+    if merge.merge_when_clauses.iter().any(|node| {
+        matches!(
+            &node.node,
+            Some(Node::MergeWhenClause(clause))
+                if clause.match_kind() == MergeMatchKind::MergeWhenNotMatchedBySource
+        )
+    }) {
+        return false;
+    }
+    let Some(source) = merge.source_relation.as_deref() else {
+        return false;
+    };
+    let Some(mut scope) = Scope::dml(ctx, env, relation, std::slice::from_ref(source)) else {
+        return false;
+    };
+    if scope.rels.len() != 2 {
+        return false;
+    }
+    match source.node.as_ref() {
+        Some(Node::RangeSubselect(sub)) => {
+            let Some(Node::SelectStmt(select)) =
+                sub.subquery.as_deref().and_then(|node| node.node.as_ref())
+            else {
+                return false;
+            };
+            if !statement_at_most_one_row_in(ctx, NodeRef::SelectStmt(select), env, None) {
+                return false;
+            }
+            scope.rels[1].single_row = true;
+            // The subquery's output types, so an `ON` key equality can read
+            // its columns. (The FROM-subquery typing may fill these in on
+            // its own; doing it here keeps the MERGE proof independent.)
+            let source_env = visible_ctes(ctx, env, select.with_clause.as_ref(), None).after;
+            let columns = select_output_columns(ctx, select, &source_env);
+            if columns.len() == scope.rels[1].columns.len() {
+                scope.rels[1].cte_columns = columns
+                    .iter()
+                    .map(|column| (column.typ, column.deterministic))
+                    .collect();
             }
         }
-        if known == before {
-            break;
-        }
+        // A CTE reference's one-row flag came from its definition; a base
+        // table (or any other item) is not a single-row source.
+        Some(Node::RangeVar(_)) => {}
+        _ => return false,
     }
+    if !scope.rels[1].single_row {
+        return false;
+    }
+    let root = FromScope::opaque(None);
+    let known = determined_relations(ctx, merge.join_condition.as_deref(), &scope, &root);
     // Relation 0 is the target (`Scope::dml` adds it first).
     known & 1 == 1
 }
@@ -1889,6 +1973,13 @@ mod tests {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(
             "CREATE TABLE orgs (id bigint PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE owners (
+                id bigint PRIMARY KEY,
+                tool_id bigint,
+                org_id bigint
+             );
+             CREATE TABLE tools (id bigint PRIMARY KEY, name text);
+             CREATE TABLE cache (id bigint PRIMARY KEY, name text);
              CREATE TABLE users (
                 id bigint PRIMARY KEY,
                 org_id bigint REFERENCES orgs,
@@ -1999,8 +2090,6 @@ mod tests {
              CREATE TABLE dst (id bigint PRIMARY KEY, z int);
              CREATE TABLE src (id bigint PRIMARY KEY, dst_id bigint);
              CREATE TABLE src_empty ();
-             CREATE TABLE owners (id bigint PRIMARY KEY, tool_id bigint);
-             CREATE TABLE tools (id bigint PRIMARY KEY, name text NOT NULL);
              CREATE TABLE pairs (
                 a bigint NOT NULL,
                 b bigint NOT NULL,
@@ -3175,12 +3264,66 @@ mod tests {
     }
 
     #[test]
-    fn merge_is_not_proved() {
+    fn merge_is_one_row_when_its_source_and_target_are_determined() {
         let db = catalog();
+        // One source row, its key equality on the target's key: at most one
+        // target row, so at most one action.
+        assert!(statement_one(
+            &db,
+            "MERGE INTO orgs g USING (SELECT $1::bigint AS id) s ON g.id = s.id \
+             WHEN MATCHED THEN UPDATE SET name = 'x' \
+             WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, 'x') \
+             RETURNING g.id",
+        ));
+        // A bare VALUES source, renamed by the alias column list.
+        assert!(statement_one(
+            &db,
+            "MERGE INTO orgs g USING (VALUES ($1::bigint)) s(id) ON g.id = s.id \
+             WHEN MATCHED THEN DELETE RETURNING g.id",
+        ));
+        // A single-row CTE source.
+        assert!(statement_one(
+            &db,
+            "WITH s AS (SELECT $1::bigint AS id) \
+             MERGE INTO orgs g USING s ON g.id = s.id \
+             WHEN MATCHED THEN DELETE RETURNING g.id",
+        ));
+        // A subquery the proof bounds only by its constant LIMIT.
+        assert!(statement_one(
+            &db,
+            "MERGE INTO orgs g USING (SELECT id FROM orgs ORDER BY id LIMIT 1) s \
+             ON g.id = s.id WHEN MATCHED THEN DELETE RETURNING g.id",
+        ));
+    }
+
+    #[test]
+    fn merge_is_not_proved_without_one_source_row_and_a_target_key() {
+        let db = catalog();
+        // A base table source is not one row, even when the ON equates its
+        // key to the target's.
         assert!(!statement_one(
             &db,
-            "MERGE INTO users u USING orgs o ON u.id = o.id \
-             WHEN MATCHED THEN UPDATE SET name = o.name"
+            "MERGE INTO orgs g USING owners s ON g.id = s.org_id \
+             WHEN MATCHED THEN DELETE RETURNING g.id",
+        ));
+        // One source row, but no target key.
+        assert!(!statement_one(
+            &db,
+            "MERGE INTO orgs g USING (SELECT $1::text AS name) s \
+             ON g.name = s.name WHEN MATCHED THEN DELETE RETURNING g.id",
+        ));
+        // `WHEN NOT MATCHED BY SOURCE` acts on target rows the source
+        // didn't match, so the source's row count bounds nothing.
+        assert!(!statement_one(
+            &db,
+            "MERGE INTO orgs g USING (SELECT $1::bigint AS id) s ON g.id = s.id \
+             WHEN NOT MATCHED BY SOURCE THEN DELETE RETURNING g.id",
+        ));
+        // A view target's rules can decide the returned rows.
+        assert!(!statement_one(
+            &db,
+            "MERGE INTO v g USING (SELECT $1::bigint AS id) s ON g.id = s.id \
+             WHEN MATCHED THEN DELETE RETURNING g.id",
         ));
     }
 
@@ -3320,6 +3463,81 @@ mod tests {
         assert!(!statement_one(
             &db,
             "DELETE FROM users USING orgs o WHERE users.id = o.id",
+        ));
+    }
+
+    #[test]
+    fn an_opaque_from_item_does_not_abort_the_target_proof() {
+        let db = catalog();
+        // A set-returning function can't be modelled, but it doesn't have to
+        // be: the target is determined on its own.
+        assert!(statement_one(
+            &db,
+            "DELETE FROM users u USING unnest($2::bigint[]) AS permitted(id) \
+             WHERE u.id = $1 AND u.id = permitted.id RETURNING u.id",
+        ));
+        assert!(statement_one(
+            &db,
+            "UPDATE users u SET name = 'x' FROM generate_series(1, 3) g \
+             WHERE u.id = $1 RETURNING u.id",
+        ));
+        // A key equality that reads the opaque item proves nothing, so the
+        // target isn't determined.
+        assert!(!statement_one(
+            &db,
+            "DELETE FROM users u USING unnest($1::bigint[]) AS p(id) \
+             WHERE u.id = p.id RETURNING u.id",
+        ));
+        // An unqualified name could be the opaque item's column.
+        assert!(!statement_one(
+            &db,
+            "DELETE FROM users u USING unnest($1::bigint[]) AS p(k) \
+             WHERE u.id = k RETURNING u.id",
+        ));
+    }
+
+    #[test]
+    fn dml_join_on_facts_determine_the_target() {
+        let db = catalog();
+        // `chosen` is one row; `t.id = chosen.tool_id` sits in the join's
+        // `ON` and `c.id = t.id` in the `WHERE`, together completing the
+        // target's key.
+        assert!(statement_one(
+            &db,
+            "WITH chosen AS (SELECT tool_id FROM owners WHERE id = $1) \
+             UPDATE cache c SET name = t.name \
+             FROM chosen JOIN tools t ON t.id = chosen.tool_id \
+             WHERE c.id = t.id RETURNING c.id",
+        ));
+        assert!(statement_one(
+            &db,
+            "WITH chosen AS (SELECT tool_id FROM owners WHERE id = $1) \
+             DELETE FROM cache c \
+             USING chosen JOIN tools t ON t.id = chosen.tool_id \
+             WHERE c.id = t.id RETURNING c.id",
+        ));
+        // The chain doesn't reach the target's key.
+        assert!(!statement_one(
+            &db,
+            "UPDATE cache c SET name = 'x' FROM tools t \
+             WHERE c.name = t.name RETURNING c.id",
+        ));
+        // A LEFT JOIN's `ON` determines its nullable side (`o`), never the
+        // preserved `t` the target's key would need.
+        assert!(!statement_one(
+            &db,
+            "UPDATE cache c SET name = 'x' FROM tools t \
+             LEFT JOIN owners o ON o.id = t.id \
+             WHERE c.id = t.id RETURNING c.id",
+        ));
+        // The same join with a fact on the nullable side that determines
+        // nothing leaves the target undetermined too.
+        assert!(!statement_one(
+            &db,
+            "WITH chosen AS (SELECT tool_id FROM owners WHERE id = $1) \
+             UPDATE cache c SET name = 'x' \
+             FROM chosen LEFT JOIN tools t ON t.name = chosen.tool_id::text \
+             WHERE c.id = t.id RETURNING c.id",
         ));
     }
 
@@ -3940,6 +4158,68 @@ mod tests {
         assert!(!select_one(
             &db,
             "SELECT label FROM ci_labels WHERE label = $1"
+        ));
+    }
+
+    #[test]
+    fn a_nullable_side_is_fixed_only_once_its_preserved_side_is() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE nt (id int PRIMARY KEY);
+             CREATE TABLE np (id int PRIMARY KEY);
+             CREATE TABLE no (id text PRIMARY KEY);",
+        )
+        .unwrap();
+        // `p` isn't determined, so some `p` rows match `o` and others
+        // null-extend it: `quote_nullable(o.id)` is `'a'` on one and `NULL`
+        // on another, and the target key matches two rows.
+        assert!(!statement_one(
+            &db,
+            "DELETE FROM nt USING np LEFT JOIN no ON no.id = 'a' AND np.id = 1 \
+             WHERE nt.id = length(quote_nullable(no.id)) RETURNING nt.id",
+        ));
+        // With the preserved side determined, the nullable side is one fixed
+        // row (or none) on every output row.
+        assert!(statement_one(
+            &db,
+            "DELETE FROM nt USING np LEFT JOIN no ON no.id = 'a' \
+             WHERE np.id = 1 AND nt.id = length(quote_nullable(no.id)) RETURNING nt.id",
+        ));
+    }
+
+    #[test]
+    fn a_cast_keeps_its_inputs_collation_and_array_type() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE COLLATION ci_cast (
+                provider = icu, locale = 'und-u-ks-level2', deterministic = false
+             );
+             CREATE TABLE ck (k text PRIMARY KEY);
+             CREATE TABLE ak (id int PRIMARY KEY);
+             CREATE FUNCTION eq_array(int, int[]) RETURNS boolean
+                LANGUAGE sql IMMUTABLE STRICT AS 'SELECT true';
+             CREATE OPERATOR public.= (LEFTARG = int, RIGHTARG = int[], FUNCTION = eq_array);",
+        )
+        .unwrap();
+        // The cast to text keeps `ci_cast`, which wins over the key's
+        // default collation: `'a'` matches both `'a'` and `'A'`.
+        assert!(!statement_one(
+            &db,
+            "MERGE INTO ck USING (SELECT ('a'::text COLLATE ci_cast)::text AS k) s \
+             ON ck.k = s.k WHEN MATCHED THEN DELETE RETURNING ck.k",
+        ));
+        // A cast to a type without collation compares bytewise.
+        assert!(statement_one(
+            &db,
+            "MERGE INTO ak USING (SELECT '1'::int AS id) s \
+             ON ak.id = s.id WHEN MATCHED THEN DELETE RETURNING ak.id",
+        ));
+        // `int[]` is an array: `ak.id = s.k` is the user's `(int, int[])`
+        // operator, not the key's equality.
+        assert!(!statement_one(
+            &db,
+            "MERGE INTO ak USING (SELECT ARRAY[1]::int[] AS k) s \
+             ON ak.id = s.k WHEN MATCHED THEN DELETE RETURNING ak.id",
         ));
     }
 
