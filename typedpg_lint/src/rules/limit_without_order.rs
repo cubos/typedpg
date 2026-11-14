@@ -269,12 +269,7 @@ fn in_dml_where(ctx: &Ctx<'_>, target: &protobuf::SubLink) -> bool {
 fn where_contains(node: NodeRef<'_>, target: *const protobuf::SubLink) -> bool {
     match node {
         NodeRef::SelectStmt(_) => false,
-        NodeRef::SubLink(sublink) => {
-            if std::ptr::eq(sublink, target) {
-                return true;
-            }
-            false
-        }
+        NodeRef::SubLink(sublink) => std::ptr::eq(sublink, target),
         _ => node
             .children()
             .into_iter()

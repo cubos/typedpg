@@ -2613,9 +2613,8 @@ fn build_params_slice(
         &(dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync)
     };
 
-    for idx in 0..analyzed.params.len() {
+    for (idx, pi) in analyzed.params.iter().enumerate() {
         let field_name = format_ident!("p{}", idx);
-        let pi = &analyzed.params[idx];
         let mapping = resolve_type_mapping(&pi.pg_type, config, registry)
             .map_err(|e| naming_subject(e, &format!("parameter `${}`", pi.name)))?;
         reject_record_param(&mapping.strategy)?;
