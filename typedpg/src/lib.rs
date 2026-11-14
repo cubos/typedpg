@@ -757,9 +757,22 @@ pub mod __private {
         }
     }
 
-    impl IntoBytes for bytes::Bytes {
+    impl IntoBytes for std::collections::VecDeque<u8> {
         fn into_bytes(self) -> Vec<u8> {
             self.into()
+        }
+    }
+
+    impl IntoBytes for std::collections::BinaryHeap<u8> {
+        fn into_bytes(self) -> Vec<u8> {
+            self.into_vec()
+        }
+    }
+
+    // (`to_vec`, not `From`: `Vec<u8>: From<Bytes>` needs `bytes` 1.2.)
+    impl IntoBytes for bytes::Bytes {
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_vec()
         }
     }
 
@@ -771,7 +784,7 @@ pub mod __private {
 
     impl IntoBytes for bytes::BytesMut {
         fn into_bytes(self) -> Vec<u8> {
-            self.into()
+            self.to_vec()
         }
     }
 

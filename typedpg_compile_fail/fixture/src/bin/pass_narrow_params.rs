@@ -87,6 +87,13 @@ async fn case(db: &tokio_postgres::Client) -> Result<(), typedpg::Error> {
     )
     .execute()
     .await?;
+    typedpg::sql!(
+        db,
+        "SELECT 1 AS one FROM digests WHERE hash = $hash",
+        hash = std::collections::VecDeque::from(vec![1_u8]),
+    )
+    .fetch_all()
+    .await?;
     Ok(())
 }
 
