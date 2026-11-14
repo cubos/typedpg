@@ -1,0 +1,18 @@
+error[E0277]: `$day` expects a value for SQL type date NOT NULL, not `NaiveDateTime`
+  --> src/bin/sql_date_datetime_param.rs:11:15
+   |
+11 |         day = at
+   |               ^^ expected a value for date
+   |
+   = help: the trait `__TypedpgBind0` is not implemented for `NaiveDateTime`
+   = note: `$day` takes a `chrono::NaiveDate`, not a `NaiveDateTime`, whose time would be dropped: call `.date()` if that is meant
+
+error[E0277]: `$days` expects a value for SQL type date[] NOT NULL, not `[NaiveDateTime; 1]`
+  --> src/bin/sql_date_datetime_param.rs:18:16
+   |
+18 |         days = [at]
+   |                ^^^^ expected a value for date[]
+   |
+   = help: the trait `__TypedpgBind1` is not implemented for `[NaiveDateTime; 1]`
+   = note: `$days` takes `Vec<::chrono::NaiveDate>`, or any iterable (array, slice iterator, …) whose items are a `chrono::NaiveDate`, not a `NaiveDateTime`, whose time would be dropped: call `.date()` if that is meant
+

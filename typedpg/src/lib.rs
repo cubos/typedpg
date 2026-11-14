@@ -695,6 +695,160 @@ pub mod __private {
         }
     }
 
+    /// What a `bytea` parameter takes: bytes, and not text. `Vec<u8>` also
+    /// converts from `String` and `&str`, which would bind hex text (say, a
+    /// digest's `Display`) silently as its UTF-8 bytes; a caller that means
+    /// a text's bytes writes `.into_bytes()` / `.as_bytes()`.
+    pub trait IntoBytes {
+        fn into_bytes(self) -> Vec<u8>;
+    }
+
+    impl IntoBytes for Vec<u8> {
+        fn into_bytes(self) -> Vec<u8> {
+            self
+        }
+    }
+
+    impl IntoBytes for &Vec<u8> {
+        fn into_bytes(self) -> Vec<u8> {
+            self.clone()
+        }
+    }
+
+    impl IntoBytes for &[u8] {
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_vec()
+        }
+    }
+
+    impl IntoBytes for &mut [u8] {
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_vec()
+        }
+    }
+
+    impl<const N: usize> IntoBytes for [u8; N] {
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_vec()
+        }
+    }
+
+    impl<const N: usize> IntoBytes for &[u8; N] {
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_vec()
+        }
+    }
+
+    impl<const N: usize> IntoBytes for &mut [u8; N] {
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_vec()
+        }
+    }
+
+    impl IntoBytes for Box<[u8]> {
+        fn into_bytes(self) -> Vec<u8> {
+            self.into_vec()
+        }
+    }
+
+    impl IntoBytes for std::borrow::Cow<'_, [u8]> {
+        fn into_bytes(self) -> Vec<u8> {
+            self.into_owned()
+        }
+    }
+
+    impl IntoBytes for bytes::Bytes {
+        fn into_bytes(self) -> Vec<u8> {
+            self.into()
+        }
+    }
+
+    impl IntoBytes for &bytes::Bytes {
+        fn into_bytes(self) -> Vec<u8> {
+            self.to_vec()
+        }
+    }
+
+    impl IntoBytes for bytes::BytesMut {
+        fn into_bytes(self) -> Vec<u8> {
+            self.into()
+        }
+    }
+
+    /// What a `json` / `jsonb` parameter takes: a JSON value, and neither
+    /// text nor an `Option`. `serde_json::Value` also converts from
+    /// `String` / `&str` (a JSON *string*: JSON text would be stored as one,
+    /// quoted, not parsed) and from `Option<T>` / `()` (JSON `null`: a
+    /// `None` would pass a NOT NULL parameter as `'null'`).
+    pub trait IntoJson {
+        fn into_json(self) -> serde_json::Value;
+    }
+
+    macro_rules! into_json_via_from {
+        ($($t:ty),* $(,)?) => {$(
+            impl IntoJson for $t {
+                fn into_json(self) -> serde_json::Value {
+                    serde_json::Value::from(self)
+                }
+            }
+        )*};
+    }
+
+    into_json_via_from!(
+        serde_json::Value,
+        serde_json::Number,
+        serde_json::Map<String, serde_json::Value>,
+        bool,
+        i8,
+        i16,
+        i32,
+        i64,
+        isize,
+        u8,
+        u16,
+        u32,
+        u64,
+        usize,
+        f32,
+        f64,
+    );
+
+    impl IntoJson for &serde_json::Value {
+        fn into_json(self) -> serde_json::Value {
+            self.clone()
+        }
+    }
+
+    impl<T: Into<serde_json::Value>> IntoJson for Vec<T> {
+        fn into_json(self) -> serde_json::Value {
+            serde_json::Value::from(self)
+        }
+    }
+
+    impl<T: Clone + Into<serde_json::Value>> IntoJson for &[T] {
+        fn into_json(self) -> serde_json::Value {
+            serde_json::Value::from(self)
+        }
+    }
+
+    impl<T: Into<serde_json::Value>, const N: usize> IntoJson for [T; N] {
+        fn into_json(self) -> serde_json::Value {
+            serde_json::Value::from(self)
+        }
+    }
+
+    /// What a `date` parameter takes: a `NaiveDate`, not the
+    /// `NaiveDateTime` it also converts from (dropping the time).
+    pub trait IntoDate {
+        fn into_date(self) -> chrono::NaiveDate;
+    }
+
+    impl IntoDate for chrono::NaiveDate {
+        fn into_date(self) -> chrono::NaiveDate {
+            self
+        }
+    }
+
     /// Collect any `IntoIterator` whose items convert into `T` into a
     /// `Vec<T>`. Used by generated code for `Vec<T>` parameters so callers
     /// can pass `Vec<&str>`, `[&str; N]`, `[T; N]`, etc., in addition to an

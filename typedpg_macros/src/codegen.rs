@@ -348,6 +348,96 @@ fn override_path(ty: &Type, config: &ResolvedConfig) -> Option<String> {
     }
 }
 
+/// A built-in scalar whose parameter takes a closed set of Rust types
+/// instead of everything with `Into<T>`: some of `T`'s `From` impls give the
+/// value another meaning, silently (text into `bytea` binds its UTF-8 bytes,
+/// into `json` a JSON string; a `NaiveDateTime` into `date` drops its time).
+#[derive(Clone, Copy)]
+enum NarrowParam {
+    /// `bytea`: [`IntoBytes`](typedpg::__private::IntoBytes).
+    Bytes,
+    /// `json` / `jsonb`: [`IntoJson`](typedpg::__private::IntoJson).
+    Json,
+    /// `date`: a `NaiveDate` only.
+    Date,
+}
+
+impl NarrowParam {
+    /// The kind of `ty` (behind any domains), when no `[types]` mapping
+    /// replaces its built-in Rust type at any level.
+    fn of(ty: &Type, config: &ResolvedConfig) -> Option<Self> {
+        if override_path(ty, config).is_some() {
+            return None;
+        }
+        let Type::Basic { schema, name, .. } = innermost_type(ty) else {
+            return None;
+        };
+        match (schema.as_str(), name.as_str()) {
+            ("pg_catalog", "bytea") => Some(Self::Bytes),
+            ("pg_catalog", "json" | "jsonb") => Some(Self::Json),
+            ("pg_catalog", "date") => Some(Self::Date),
+            _ => None,
+        }
+    }
+
+    /// The kind of the elements of an array (or a domain over one), when
+    /// they are not NULL-able: a `Vec<Option<T>>` takes `Option`s, which
+    /// the problem conversions never produce.
+    fn of_elements(ty: &Type, config: &ResolvedConfig) -> Option<Self> {
+        match ty {
+            Type::Array {
+                element,
+                element_nullable,
+            } if *element_nullable != Some(true) => Self::of(element, config),
+            Type::Domain { .. } => match innermost_type(ty) {
+                Type::Array { element, .. } => Self::of(element, config),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The runtime trait a value of this kind implements.
+    fn bind_trait(self) -> TokenStream {
+        match self {
+            Self::Bytes => quote! { ::typedpg::__private::IntoBytes },
+            Self::Json => quote! { ::typedpg::__private::IntoJson },
+            Self::Date => quote! { ::typedpg::__private::IntoDate },
+        }
+    }
+
+    /// Its conversion method, on that trait.
+    fn convert(self) -> TokenStream {
+        match self {
+            Self::Bytes => quote! { into_bytes },
+            Self::Json => quote! { into_json },
+            Self::Date => quote! { into_date },
+        }
+    }
+
+    /// What the note says a value of this kind is, and what it is not.
+    fn takes(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Bytes => (
+                "bytes (`Vec<u8>`, `&[u8]`, `[u8; N]` or another byte buffer)",
+                "not text: decode a hex string first, or pass the raw bytes \
+                 (`.into_bytes()` / `.as_bytes()` if the text's own bytes are meant)",
+            ),
+            Self::Json => (
+                "a JSON value (`serde_json::Value`, or a number, `bool`, `Vec` or \
+                 `serde_json::Map` it converts from)",
+                "not text: parse JSON text with `serde_json::from_str` (`Value::String` for a \
+                 JSON string); nor an `Option`, whose `None` would be stored as JSON `null`",
+            ),
+            Self::Date => (
+                "a `chrono::NaiveDate`",
+                "not a `NaiveDateTime`, whose time would be dropped: call `.date()` if that \
+                 is meant",
+            ),
+        }
+    }
+}
+
 /// True for `void` (behind any domains).
 fn is_void(ty: &Type) -> bool {
     matches!(innermost_type(ty), Type::Basic { schema, name, .. }
@@ -2111,48 +2201,87 @@ fn build_field_type_and_value<P: TypedParam>(
     };
     let rt_text = type_text(inner_rt);
     // (bound on `__V`, conversion of `self: __V`, what the note says it takes)
-    let (bound, convert, takes) = match (accepts_into_string, mapping.accepts_iter, is_nullable) {
-        (true, _, true) => (
-            quote! { __V: ::typedpg::__private::IntoOptionString },
-            quote! { ::typedpg::__private::IntoOptionString::into_option_string(self) },
-            "`&str`, `String` or `&String`, or an `Option` of one (`None` for NULL)".to_string(),
-        ),
-        (true, _, false) => (
-            quote! { __V: ::std::convert::Into<::std::string::String> },
-            quote! { ::std::convert::Into::<::std::string::String>::into(self) },
-            "`String`, or any value with `Into<String>` (`&str`, `&String`, …)".to_string(),
-        ),
-        (_, true, false) => {
-            // Vec<T> with a plain element — accept any IntoIterator<Item: Into<T>>.
-            let elem = vec_element(inner_rt).ok_or_else(|| {
-                syn::Error::new(
-                    proc_macro2::Span::call_site(),
-                    "internal error: an iterable parameter's type is not a Vec",
-                )
-            })?;
+    let narrow = (!accepts_into_string && !is_nullable)
+        .then(|| {
+            if mapping.accepts_iter {
+                NarrowParam::of_elements(param.pg_type(), config).map(|k| (k, true))
+            } else {
+                NarrowParam::of(param.pg_type(), config).map(|k| (k, false))
+            }
+        })
+        .flatten();
+    let (bound, convert, takes) = if let Some((kind, iterable)) = narrow {
+        let (tr, method) = (kind.bind_trait(), kind.convert());
+        let (is, is_not) = kind.takes();
+        if iterable {
             (
                 quote! {
                     __V: ::std::iter::IntoIterator,
-                    <__V as ::std::iter::IntoIterator>::Item: ::std::convert::Into<#elem>
+                    <__V as ::std::iter::IntoIterator>::Item: #tr
                 },
-                quote! { ::typedpg::__private::into_flex_vec(self) },
+                quote! {
+                    ::std::iter::Iterator::collect(::std::iter::Iterator::map(
+                        ::std::iter::IntoIterator::into_iter(self),
+                        #tr::#method,
+                    ))
+                },
                 format!(
-                    "`{rt_text}`, or any iterable (array, slice iterator, …) of values with \
-                     `Into<{}>`",
-                    type_text(&elem)
+                    "`{rt_text}`, or any iterable (array, slice iterator, …) whose items are \
+                     {is}, {is_not}"
                 ),
             )
+        } else {
+            (
+                quote! { __V: #tr },
+                quote! { #tr::#method(self) },
+                format!("{is}, {is_not}"),
+            )
         }
-        (false, _, true) => (
-            quote! { ::std::option::Option<#inner_rt>: ::std::convert::From<__V> },
-            quote! { ::std::option::Option::<#inner_rt>::from(self) },
-            format!("`{rt_text}`, or `Option<{rt_text}>` (`None` for NULL)"),
-        ),
-        (false, false, false) => (
-            quote! { __V: ::std::convert::Into<#inner_rt> },
-            quote! { ::std::convert::Into::<#inner_rt>::into(self) },
-            format!("`{rt_text}`, or any value with `Into<{rt_text}>`"),
-        ),
+    } else {
+        match (accepts_into_string, mapping.accepts_iter, is_nullable) {
+            (true, _, true) => (
+                quote! { __V: ::typedpg::__private::IntoOptionString },
+                quote! { ::typedpg::__private::IntoOptionString::into_option_string(self) },
+                "`&str`, `String` or `&String`, or an `Option` of one (`None` for NULL)"
+                    .to_string(),
+            ),
+            (true, _, false) => (
+                quote! { __V: ::std::convert::Into<::std::string::String> },
+                quote! { ::std::convert::Into::<::std::string::String>::into(self) },
+                "`String`, or any value with `Into<String>` (`&str`, `&String`, …)".to_string(),
+            ),
+            (_, true, false) => {
+                // Vec<T> with a plain element — accept any IntoIterator<Item: Into<T>>.
+                let elem = vec_element(inner_rt).ok_or_else(|| {
+                    syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        "internal error: an iterable parameter's type is not a Vec",
+                    )
+                })?;
+                (
+                    quote! {
+                        __V: ::std::iter::IntoIterator,
+                        <__V as ::std::iter::IntoIterator>::Item: ::std::convert::Into<#elem>
+                    },
+                    quote! { ::typedpg::__private::into_flex_vec(self) },
+                    format!(
+                        "`{rt_text}`, or any iterable (array, slice iterator, …) of values with \
+                     `Into<{}>`",
+                        type_text(&elem)
+                    ),
+                )
+            }
+            (false, _, true) => (
+                quote! { ::std::option::Option<#inner_rt>: ::std::convert::From<__V> },
+                quote! { ::std::option::Option::<#inner_rt>::from(self) },
+                format!("`{rt_text}`, or `Option<{rt_text}>` (`None` for NULL)"),
+            ),
+            (false, false, false) => (
+                quote! { __V: ::std::convert::Into<#inner_rt> },
+                quote! { ::std::convert::Into::<#inner_rt>::into(self) },
+                format!("`{rt_text}`, or any value with `Into<{rt_text}>`"),
+            ),
+        }
     };
 
     // The conversion goes through a trait of its own, whose blanket impl

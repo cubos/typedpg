@@ -1,0 +1,27 @@
+error[E0277]: `$hash` expects a value for SQL type bytea NOT NULL, not `String`
+ --> src/bin/sql_bytea_text_param.rs:9:16
+  |
+9 |         hash = hex
+  |                ^^^ expected a value for bytea
+  |
+  = help: the trait `__TypedpgBind0` is not implemented for `String`
+  = note: `$hash` takes bytes (`Vec<u8>`, `&[u8]`, `[u8; N]` or another byte buffer), not text: decode a hex string first, or pass the raw bytes (`.into_bytes()` / `.as_bytes()` if the text's own bytes are meant)
+
+error[E0277]: `$hash` expects a value for SQL type bytea NOT NULL, not `&str`
+  --> src/bin/sql_bytea_text_param.rs:16:16
+   |
+16 |         hash = "00ff"
+   |                ^^^^^^ expected a value for bytea
+   |
+   = help: the trait `__TypedpgBind1` is not implemented for `&str`
+   = note: `$hash` takes bytes (`Vec<u8>`, `&[u8]`, `[u8; N]` or another byte buffer), not text: decode a hex string first, or pass the raw bytes (`.into_bytes()` / `.as_bytes()` if the text's own bytes are meant)
+
+error[E0277]: `$hashes` expects a value for SQL type bytea[] NOT NULL, not `[&str; 2]`
+  --> src/bin/sql_bytea_text_param.rs:23:18
+   |
+23 |         hashes = ["00ff", "ff00"],
+   |                  ^^^^^^^^^^^^^^^^ expected a value for bytea[]
+   |
+   = help: the trait `__TypedpgBind2` is not implemented for `[&str; 2]`
+   = note: `$hashes` takes `Vec<Vec<u8>>`, or any iterable (array, slice iterator, …) whose items are bytes (`Vec<u8>`, `&[u8]`, `[u8; N]` or another byte buffer), not text: decode a hex string first, or pass the raw bytes (`.into_bytes()` / `.as_bytes()` if the text's own bytes are meant)
+
