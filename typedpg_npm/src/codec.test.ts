@@ -72,6 +72,7 @@ test("encode", () => {
   assert.equal(encode("timestamptz", new Date(-62200000000000)), "0003-12-17 14:13:20.000Z BC");
   assert.throws(() => encode("timestamptz", new Date(NaN)), /invalid Date/);
   assert.equal(encode("bytea", new Uint8Array([1, 255])), "\\x01ff");
+  assert.throws(() => encode("bytea", "00ff"), /a bytea parameter must be a Uint8Array, not a string/);
   assert.equal(encode(["array", "text"], ["a", null, 'q"\\']), '{"a",NULL,"q\\"\\\\"}');
   assert.equal(encode("text", null), null);
 });

@@ -146,6 +146,11 @@ export function encode(codec: Codec, value: unknown): string | null {
     case "timestamptz":
       return value instanceof Date ? formatTimestamptz(value) : String(value);
     case "bytea":
+      // Bytes, not text: `Buffer.from` would take a string's UTF-8 bytes,
+      // storing a hex digest's text, silently.
+      if (typeof value === "string") {
+        throw new TypeError("typedpg: a bytea parameter must be a Uint8Array, not a string");
+      }
       return "\\x" + Buffer.from(value as Uint8Array).toString("hex");
     case "interval": {
       if (typeof value === "string") return value;

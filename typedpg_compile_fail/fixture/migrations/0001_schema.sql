@@ -16,3 +16,14 @@ CREATE TABLE users (
     addr  address,
     mood_history moods[]
 );
+
+-- Types whose parameters take a closed set of Rust types: some of their
+-- Rust type's `From` impls would change the value's meaning silently.
+CREATE TABLE digests (
+    hash   BYTEA PRIMARY KEY,
+    hashes BYTEA[] NOT NULL,
+    doc    JSONB NOT NULL,
+    docs   JSONB[] NOT NULL,
+    day    DATE NOT NULL,
+    days   DATE[] NOT NULL
+);

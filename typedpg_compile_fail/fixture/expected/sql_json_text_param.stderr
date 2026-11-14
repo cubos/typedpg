@@ -1,0 +1,36 @@
+error[E0277]: `$doc` expects a value for SQL type jsonb NOT NULL, not `std::string::String`
+  --> src/bin/sql_json_text_param.rs:11:15
+   |
+11 |         doc = text
+   |               ^^^^ expected a value for jsonb
+   |
+   = help: the trait `__TypedpgBind0` is not implemented for `std::string::String`
+   = note: `$doc` takes a JSON value (`serde_json::Value`, or a number, `bool`, `Vec` or `serde_json::Map` it converts from), not text: parse JSON text with `serde_json::from_str` (`Value::String` for a JSON string); nor an `Option`, whose `None` would be stored as JSON `null`
+
+error[E0277]: `$doc` expects a value for SQL type jsonb NOT NULL, not `&str`
+  --> src/bin/sql_json_text_param.rs:18:15
+   |
+18 |         doc = "{}"
+   |               ^^^^ expected a value for jsonb
+   |
+   = help: the trait `__TypedpgBind1` is not implemented for `&str`
+   = note: `$doc` takes a JSON value (`serde_json::Value`, or a number, `bool`, `Vec` or `serde_json::Map` it converts from), not text: parse JSON text with `serde_json::from_str` (`Value::String` for a JSON string); nor an `Option`, whose `None` would be stored as JSON `null`
+
+error[E0277]: `$doc` expects a value for SQL type jsonb NOT NULL, not `Option<serde_json::Value>`
+  --> src/bin/sql_json_text_param.rs:26:15
+   |
+26 |         doc = missing
+   |               ^^^^^^^ expected a value for jsonb
+   |
+   = help: the trait `__TypedpgBind2` is not implemented for `Option<serde_json::Value>`
+   = note: `$doc` takes a JSON value (`serde_json::Value`, or a number, `bool`, `Vec` or `serde_json::Map` it converts from), not text: parse JSON text with `serde_json::from_str` (`Value::String` for a JSON string); nor an `Option`, whose `None` would be stored as JSON `null`
+
+error[E0277]: `$docs` expects a value for SQL type jsonb[] NOT NULL, not `[&str; 1]`
+  --> src/bin/sql_json_text_param.rs:33:16
+   |
+33 |         docs = ["{}"],
+   |                ^^^^^^ expected a value for jsonb[]
+   |
+   = help: the trait `__TypedpgBind3` is not implemented for `[&str; 1]`
+   = note: `$docs` takes `Vec<::serde_json::Value>`, or any iterable (array, slice iterator, …) whose items are a JSON value (`serde_json::Value`, or a number, `bool`, `Vec` or `serde_json::Map` it converts from), not text: parse JSON text with `serde_json::from_str` (`Value::String` for a JSON string); nor an `Option`, whose `None` would be stored as JSON `null`
+
