@@ -1,0 +1,9 @@
+error: permission denied for table machines
+         help: grant it in a migration: GRANT SELECT (id) ON public.machines TO fixture_auditor;
+         note: role fixture_auditor has no SELECT on column(s) id of public.machines
+       
+ --> src/bin/fail_role_call_site_denied.rs:5:61
+  |
+5 |     typedpg::sql!(role = "fixture_auditor", db = roles, db, "SELECT id FROM machines")
+  |                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+

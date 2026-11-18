@@ -963,6 +963,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `sql` | The `.sql` files of queries: `{ "include", "emit", "out", "typeNames" }`, see [Queries in .sql files](#queries-in-sql-files). A database has `out`, `sql` or both. |
 | `migrations` | The migrations directory (default `migrations`), or `{ "dir", "table", "lockId", "useTransaction", "failOnDrift", "embed" }` — the runner's settings, as in Rust. `"embed": true` adds the migrations to the generated module. |
 | `extraMigrations` | More directories the schema is built from but the runner doesn't apply (tables another project owns). |
+| `roles` | The database roles every query is checked against, in addition to the schema's owner. Only roles the migrations create can be checked. In the multi-database form, each entry has its own. See [Role checks](#role-checks). |
 | `types` | PG type → TypeScript type, as `"./src/types.ts#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type; an unqualified name is in `public`, a built-in type is `pg_catalog.<name>`. See [Mapping types](#mapping-types). |
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
@@ -970,6 +971,28 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `likeUnescapedParam`, `fkTypeMismatch`, `missingLockTimeout`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `fetchMayReturnMany`, `fetchAllSingleRow`, `unusedReturning` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
 
 Unknown keys are errors.
+
+### Role checks
+
+`roles` lists the roles the application connects as. Every query is analyzed as the schema's owner, then as each of them, and one that may not run it is an error at the query — PostgreSQL's message, with the grant that would allow it:
+
+```json
+{ "out": "src/db.ts", "migrations": "migrations", "roles": ["app_role"] }
+```
+
+```sql
+-- migrations/0001_app_role.sql
+CREATE ROLE app_role;
+GRANT SELECT ON users TO app_role;
+```
+
+```text
+src/orders.ts:14:5: error: permission denied for table orders
+  help: grant it in a migration: GRANT SELECT ON public.orders TO app_role;
+  note: role app_role has no SELECT on public.orders
+```
+
+The checks are PostgreSQL's own: USAGE on the schemas a query names, SELECT/INSERT/UPDATE/DELETE on its relations (per column where that is what the role is granted), EXECUTE on the routines it calls, and the sequence privileges of serial columns and `nextval`. Unqualified names resolve along the role's search path; views are read as their owner unless `security_invoker`. Only roles the migrations create can be checked — naming another is `role "x" does not exist (typedpg can check only the roles the migrations create)`. Trigger and function bodies, row-level security and `COPY` are not checked. In the multi-database form, `roles` goes in each `databases` entry.
 
 ## Limits
 

@@ -31,3 +31,9 @@ migrations = "./migrations_broken"
 
 [package.metadata.typedpg.databases.missing.database]
 migrations = "./no_such_migrations"
+
+# A database every statement of which is checked against `fixture_app`; the
+# default database above checks no role, so the other cases are unaffected.
+[package.metadata.typedpg.databases.roles.database]
+migrations = "./migrations_roles"
+roles = ["fixture_app"]

@@ -802,7 +802,7 @@ impl Project {
         for (kind, text) in wanted {
             if let Entry::Vacant(e) = db.cache.entry((kind, text.to_owned())) {
                 report.analyzed += 1;
-                e.insert(generate(catalog, &mapper, kind, text));
+                e.insert(generate(catalog, &mapper, kind, text, &db.config.roles));
             }
         }
         let note = missing_dirs_note(&db.missing_dirs, root);
@@ -1024,7 +1024,13 @@ impl Project {
         };
         for q in &file.queries {
             if let Entry::Vacant(e) = db.cache.entry((Kind::Query, q.text.clone())) {
-                e.insert(generate(catalog, &mapper, Kind::Query, &q.text));
+                e.insert(generate(
+                    catalog,
+                    &mapper,
+                    Kind::Query,
+                    &q.text,
+                    &db.config.roles,
+                ));
             }
         }
         let checks: Vec<TypeCheck> = db

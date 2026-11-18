@@ -1,0 +1,6 @@
+error: expected string literal
+ --> src/bin/sql_role_not_a_string.rs:4:38
+  |
+4 |     typedpg::sql!(db = roles, role = 42, db, "SELECT id FROM machines")
+  |                                      ^^
+

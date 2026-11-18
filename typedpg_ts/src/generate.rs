@@ -66,16 +66,26 @@ impl From<LocatedError> for GenError {
     }
 }
 
-/// Analyze `text` and generate its entries.
+/// Analyze `text` and generate its entries. `roles` are the database's
+/// configured roles: each is also checked against the query, and the first
+/// that may not run it is the error (`PgCatalog::analyze_as`). A COPY
+/// target's privileges are not modeled, so its roles are not checked.
 pub fn generate(
     catalog: &PgCatalog,
     mapper: &TypeMapper,
     kind: Kind,
     text: &str,
+    roles: &[String],
 ) -> Result<Generated, GenError> {
     mapper.used.borrow_mut().clear();
     let mut g = match kind {
-        Kind::Query => generate_query(&catalog.analyze_located(text)?, mapper),
+        Kind::Query => {
+            let analyzed = catalog.analyze_located(text)?;
+            for role in roles {
+                catalog.analyze_as_located(text, role)?;
+            }
+            generate_query(&analyzed, mapper)
+        }
         Kind::CopyIn => generate_copy_in(&catalog.analyze_copy_in_located(text)?, mapper),
     }?;
     g.overrides = std::mem::take(&mut *mapper.used.borrow_mut())
@@ -508,9 +518,15 @@ mod tests {
         CREATE TABLE users (id int4 PRIMARY KEY, name text, big int8 NOT NULL, m mood,
                             tags text[] NOT NULL DEFAULT '{}', prefs jsonb, home address,
                             moods mood[], span int4range, period tstzmultirange,
-                            t2 tags_d NOT NULL DEFAULT '{}', homes address[]);";
+                            t2 tags_d NOT NULL DEFAULT '{}', homes address[]);
+        CREATE ROLE gen_app;
+        GRANT SELECT (name) ON users TO gen_app;";
 
     fn run(kind: Kind, sql: &str) -> Result<Generated, GenError> {
+        run_as(kind, sql, &[])
+    }
+
+    fn run_as(kind: Kind, sql: &str, roles: &[String]) -> Result<Generated, GenError> {
         let mut c = PgCatalog::new().unwrap();
         c.apply_migration("0001.sql", DDL).unwrap();
         let overrides = HashMap::new();
@@ -518,7 +534,7 @@ mod tests {
             overrides: &overrides,
             used: Default::default(),
         };
-        generate(&c, &mapper, kind, sql)
+        generate(&c, &mapper, kind, sql, roles)
     }
 
     fn ok(sql: &str) -> Generated {
@@ -696,6 +712,50 @@ mod tests {
         );
         let e = run(Kind::CopyIn, "users (id, nope)").unwrap_err();
         assert!(e.message.contains("\"nope\""), "{}", e.message);
+    }
+
+    #[test]
+    fn role_checks() {
+        let app = ["gen_app".to_owned()];
+        // The role has SELECT on the one column.
+        assert!(run_as(Kind::Query, "SELECT name FROM users", &app).is_ok());
+        assert!(
+            run_as(Kind::Query, "SELECT big FROM users WHERE name = $n", &app).is_err(),
+            "the column the WHERE reads is not granted"
+        );
+        let e = run_as(Kind::Query, "SELECT id FROM users", &app).unwrap_err();
+        assert!(
+            e.message.starts_with("permission denied for table users"),
+            "{}",
+            e.message
+        );
+        assert!(
+            e.message.contains("grant it in a migration"),
+            "{}",
+            e.message
+        );
+        // A privilege denial has no source location of its own: a tool
+        // reports it at the query.
+        assert_eq!(e.offset, None);
+
+        // Only roles the migrations create can be checked.
+        let e = run_as(
+            Kind::Query,
+            "SELECT name FROM users",
+            &["nobody".to_owned()],
+        )
+        .unwrap_err();
+        assert!(
+            e.message.starts_with("role \"nobody\" does not exist"),
+            "{}",
+            e.message
+        );
+
+        // A COPY target's privileges are not modeled: never checked.
+        assert!(
+            run_as(Kind::CopyIn, "users (id, name)", &["nobody".to_owned()]).is_ok(),
+            "a COPY target is not checked against roles"
+        );
     }
 
     #[test]

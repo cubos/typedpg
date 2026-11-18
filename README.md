@@ -866,6 +866,76 @@ let metrics = sql!(db = analytics, warehouse_pool, "SELECT kind, total FROM dail
 
 Each named entry is independent: its own migrations, its own `[migrations]` runner settings, its own `[types]` map. The runtime executor (`app_pool` / `warehouse_pool` above) is still passed by the caller — `typedpg` does not multiplex pools, it only points the compile-time analyzer at the right schema.
 
+## Role checks
+
+`sql!` can also prove that the role your application connects as may run each statement. PostgreSQL checks privileges when a statement executes, so a query that builds against the migrations can still fail in production with `permission denied`; listing the role moves that failure to the build:
+
+```toml
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+roles = ["app_role"]
+```
+
+The migrations create the role and grant what the application is allowed to do:
+
+```sql
+CREATE ROLE app_role;
+GRANT SELECT ON users TO app_role;
+GRANT INSERT, UPDATE ON orders TO app_role;
+```
+
+Every `sql!` statement of that database is analyzed as `app_role` (after the owner's own analysis), and the first statement it may not run is a compile error, with PostgreSQL's message and the grant that would allow it:
+
+```text
+error: permission denied for table orders
+  help: grant it in a migration: GRANT SELECT ON public.orders TO app_role;
+  note: role app_role has no SELECT on public.orders
+ --> src/orders.rs:12:14
+```
+
+The analysis makes the same checks PostgreSQL makes when the role prepares and executes the statement: USAGE on the schemas it names, SELECT/INSERT/UPDATE/DELETE on its relations — per column where that is what the role is granted — EXECUTE on the routines the plan runs, and the sequence privileges of `nextval` and of serial columns' defaults. It resolves unqualified names along the role's own search path (`ALTER ROLE … SET search_path`); a view is read as its owner unless it is `security_invoker`, and a write through an auto-updatable view is checked on the base table, as PostgreSQL does.
+
+`roles` is per database (in `[package.metadata.typedpg.databases.<name>.database]` for a named one). A `role = "..."` prefix at the call site replaces the configured roles for that one statement; the two prefixes go in either order:
+
+```rust
+let recent = sql!(db = analytics, role = "reporting", warehouse_pool,
+    "SELECT id, total FROM daily_metrics WHERE day > $day")
+    .fetch_all().await?;
+```
+
+Only roles the migrations create can be checked: typedpg's catalog knows what those roles own and were granted, and nothing about the rest of the cluster. Naming another one is the compile error `role "x" does not exist (typedpg can check only the roles the migrations create)`.
+
+### Keeping crates out of each other's tables
+
+The same check keeps a workspace split by domain honest, even when every crate connects as one database role in production: give each crate a role of its own that exists only for the analysis. Put the roles and their grants in a directory the crates list in `extra_migrations` — files there build the compile-time schema but are never applied by the migration runner — and configure each crate's `roles`:
+
+```sql
+-- analysis/0001_crate_roles.sql
+CREATE ROLE placement;
+GRANT pg_read_all_data TO placement;           -- reads anything
+GRANT INSERT, UPDATE, DELETE ON machines TO placement;
+
+CREATE ROLE people;
+GRANT pg_read_all_data TO people;
+GRANT INSERT, UPDATE, DELETE ON users, projects TO people;
+
+-- Exception: placement still sets projects.state until the lifecycle
+-- crate takes it over (remove by 2027-03).
+GRANT UPDATE (state) ON projects TO placement;
+```
+
+```toml
+# placement/Cargo.toml
+[package.metadata.typedpg.database]
+migrations = "../migrations"
+extra_migrations = ["../analysis"]
+roles = ["placement"]
+```
+
+A write from `placement` to `users` is now a compile error naming the grant it would take. An exception is that grant, written in the file with its reason: it is reviewed like any other change, and removing it later brings the error back for every statement that still relies on it.
+
+Not checked yet: the bodies of triggers and of the functions a statement calls (their EXECUTE privilege is checked, but what they read and write is not), row-level security policies, and `COPY` — `copy_in!` is not checked against roles.
+
 ## Migrations
 
 ### CLI
@@ -950,6 +1020,8 @@ extra_migrations = ["../shared/migrations"]  # optional — extra migration dirs
                                              # schema only (NOT applied at
                                              # runtime); use when another crate
                                              # owns shared tables
+roles = ["app_role"]               # optional — roles every sql! statement
+                                   # must be runnable by (see Role checks)
 
 [package.metadata.typedpg.migrations]
 table = "public._migrations"       # optional — migration tracking table

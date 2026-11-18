@@ -1,0 +1,9 @@
+error: permission denied for table parts
+         help: grant it in a migration: GRANT SELECT (id) ON public.parts TO fixture_app;
+         note: role fixture_app has no SELECT on column(s) id of public.parts
+       
+ --> src/bin/fail_role_column_denied.rs:4:35
+  |
+4 |     typedpg::sql!(db = roles, db, "SELECT id FROM parts")
+  |                                   ^^^^^^^^^^^^^^^^^^^^^^
+

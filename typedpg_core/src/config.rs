@@ -12,6 +12,7 @@
 //! [package.metadata.typedpg.database]
 //! migrations = "./migrations"    # path to SQL migration files (required)
 //! extra_migrations = ["../other-crate/migrations"]  # extra migrations for compile-time only
+//! roles = ["app_role"]           # roles every sql! statement must be runnable by
 //!
 //! [package.metadata.typedpg.migrations]
 //! table = "public._migrations"   # tracking table name (default: "public._migrations")
@@ -409,6 +410,13 @@ pub struct DatabaseConfig {
     /// Paths are relative to the project root or absolute.
     #[serde(default)]
     extra_migrations: Vec<PathBuf>,
+    /// The roles every `sql!` statement of this database is checked against,
+    /// in addition to the schema's owner: the analyzer reports PostgreSQL's
+    /// `permission denied` at compile time when one of them may not run the
+    /// statement (see `PgCatalog::analyze_as`). Empty by default: nothing is
+    /// checked.
+    #[serde(default)]
+    roles: Vec<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -418,6 +426,7 @@ impl Default for DatabaseConfig {
         Self {
             migrations: Self::default_migrations(),
             extra_migrations: Vec::new(),
+            roles: Vec::new(),
             unknown: BTreeMap::new(),
         }
     }
@@ -747,7 +756,7 @@ impl Config {
     fn check_unknown_keys(&self) -> Result<(), ConfigError> {
         const TOP: &str = "package.metadata.typedpg";
         const TOP_KEYS: &str = "`database`, `migrations`, `types`, `databases`, `simplify`, `lint`";
-        const DATABASE_KEYS: &str = "`migrations`, `extra_migrations`";
+        const DATABASE_KEYS: &str = "`migrations`, `extra_migrations`, `roles`";
         reject_unknown(&self.unknown, LEGACY_TOP_LEVEL_KEYS, TOP, TOP_KEYS)?;
         if let SimplifySetting::Rules(rules) = &self.simplify
             && let Some(rule) = rules.keys().find(|r| !SIMPLIFY_RULES.contains(&r.as_str()))
@@ -929,6 +938,12 @@ impl ResolvedConfig<'_> {
     pub fn extra_migrations_dirs(&self, base: &Path) -> Vec<PathBuf> {
         self.database.extra_migrations_dirs(base)
     }
+
+    /// The roles every `sql!` statement of this database is checked against
+    /// (`[package.metadata.typedpg.database] roles`).
+    pub fn roles(&self) -> &[String] {
+        &self.database.roles
+    }
 }
 
 #[cfg(test)]
@@ -1098,7 +1113,7 @@ migrations = "./migrations"
         assert_eq!(
             parse_err("[package.metadata.typedpg.database]\nmigration = \"./m\"\n"),
             "unknown key `migration` in [package.metadata.typedpg.database]: expected one \
-             of `migrations`, `extra_migrations`"
+             of `migrations`, `extra_migrations`, `roles`"
         );
         assert_eq!(
             parse_err("[package.metadata.typedpg.databases.analytics]\ntype = {}\n"),
@@ -1108,7 +1123,7 @@ migrations = "./migrations"
         assert_eq!(
             parse_err("[package.metadata.typedpg.databases.analytics.database]\npath = \"x\"\n"),
             "unknown key `path` in [package.metadata.typedpg.databases.analytics.database]: \
-             expected one of `migrations`, `extra_migrations`"
+             expected one of `migrations`, `extra_migrations`, `roles`"
         );
         let err = parse_err("[package.metadata.typedpg.migrations]\ntabel = \"x\"\n");
         assert!(
@@ -1327,6 +1342,60 @@ use_transaction = false
                 .resolve(Some("analytics"))
                 .unwrap()
                 .migrations_use_transaction()
+        );
+    }
+
+    #[test]
+    fn roles_are_read_for_the_default_and_named_databases() {
+        let toml = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.typedpg.database]
+roles = ["app_role", "reporting"]
+
+[package.metadata.typedpg.databases.analytics.database]
+roles = ["analytics_role"]
+
+[package.metadata.typedpg.databases.plain.database]
+migrations = "./plain"
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(
+            config.resolve(None).unwrap().roles(),
+            ["app_role", "reporting"]
+        );
+        assert_eq!(
+            config.resolve(Some("analytics")).unwrap().roles(),
+            ["analytics_role"]
+        );
+        assert!(config.resolve(Some("plain")).unwrap().roles().is_empty());
+        // No `roles` anywhere: nothing is checked.
+        assert!(
+            Config::from_str(MINIMAL_TOML)
+                .unwrap()
+                .resolve(None)
+                .unwrap()
+                .roles()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn roles_must_be_an_array_of_strings() {
+        let err = parse_err("[package.metadata.typedpg.database]\nroles = \"app_role\"\n");
+        assert!(
+            err.contains("invalid type: string \"app_role\", expected a sequence"),
+            "{err}"
+        );
+        let err = parse_err(
+            "[package.metadata.typedpg.databases.analytics.database]\nroles = [\"app\", 1]\n",
+        );
+        assert!(
+            err.contains("invalid type: integer `1`, expected a string"),
+            "{err}"
         );
     }
 

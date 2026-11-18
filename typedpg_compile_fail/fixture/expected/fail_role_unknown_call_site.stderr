@@ -1,0 +1,6 @@
+error: role "nobody" does not exist (typedpg can check only the roles the migrations create)
+ --> src/bin/fail_role_unknown_call_site.rs:5:38
+  |
+5 |     typedpg::sql!(db = roles, role = "nobody", db, "SELECT id FROM machines")
+  |                                      ^^^^^^^^
+

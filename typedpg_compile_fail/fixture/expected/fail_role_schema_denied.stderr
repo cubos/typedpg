@@ -1,0 +1,9 @@
+error: permission denied for schema restricted
+         help: grant it in a migration: GRANT USAGE ON SCHEMA restricted TO fixture_app;
+         note: role fixture_app has no USAGE on schema restricted
+       
+ --> src/bin/fail_role_schema_denied.rs:4:35
+  |
+4 |     typedpg::sql!(db = roles, db, "SELECT id FROM restricted.secrets")
+  |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

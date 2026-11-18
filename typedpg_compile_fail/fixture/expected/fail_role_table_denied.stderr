@@ -1,0 +1,9 @@
+error: permission denied for table audits
+         help: grant it in a migration: GRANT DELETE ON public.audits TO fixture_app;
+         note: role fixture_app has no DELETE on public.audits
+       
+ --> src/bin/fail_role_table_denied.rs:4:35
+  |
+4 |     typedpg::sql!(db = roles, db, "DELETE FROM audits")
+  |                                   ^^^^^^^^^^^^^^^^^^^^
+

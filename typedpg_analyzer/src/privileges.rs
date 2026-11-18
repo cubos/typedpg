@@ -284,7 +284,10 @@ pub(crate) fn note_call(
         "setval" if catalog => bits::UPDATE,
         _ => return,
     };
-    if let Some(seq) = args.first().and_then(|a| constant_regclass(snapshot, a)) {
+    if let Some(seq) = args
+        .first()
+        .and_then(|a| constant_regclass(snapshot, a.as_ref()))
+    {
         note_sequence(seq, needed);
     }
 }
@@ -293,10 +296,10 @@ pub(crate) fn note_call(
 /// `'s'::regclass`), as `regclassin` resolves it.
 fn constant_regclass(
     snapshot: &PgCatalog,
-    arg: &Option<typedpg_pg_query::ast::Node>,
+    arg: Option<&typedpg_pg_query::ast::Node>,
 ) -> Option<PgClassOid> {
     use typedpg_pg_query::ast::{self};
-    let text = match arg.as_ref()? {
+    let text = match arg? {
         ast::Node::AConst(c) => match c.val.as_ref()? {
             ast::AConstValue::String(s) => s.sval.clone(),
             _ => return None,

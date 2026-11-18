@@ -181,9 +181,12 @@ fn display_path(path: &Path) -> String {
 // Macro input parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed representation of `sql!([db = name,] executor, "SQL", param = value, ...)`.
+/// Parsed representation of `sql!([db = name,] [role = "role",] executor, "SQL", param = value, ...)`.
 pub struct QueryInput {
     pub db_name: Option<Ident>,
+    /// The role this statement is checked against, replacing the database's
+    /// configured `roles` (a prefix, like `db = name`).
+    pub role: Option<LitStr>,
     pub executor: Expr,
     pub sql: LitStr,
     pub assignments: Vec<ParamAssignment>,
@@ -193,23 +196,49 @@ pub struct QueryInput {
 
 impl Parse for QueryInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        // Check for optional `db = <name>,` prefix.
-        let db_name = if input.peek(Ident) {
+        // Optional `db = <name>,` and `role = "<role>",` prefixes, in either
+        // order. Both are prefixes — a suffix would clash with the named
+        // parameters (`name = value`).
+        let mut db_name = None;
+        let mut role = None;
+        loop {
+            if !input.peek(Ident) {
+                break;
+            }
             let fork = input.fork();
             let ident: Ident = fork.parse()?;
-            if ident == "db" && fork.peek(Token![=]) {
-                // Consume from the real stream.
-                let _: Ident = input.parse()?;
-                input.parse::<Token![=]>()?;
-                let name: Ident = input.parse()?;
-                input.parse::<Token![,]>()?;
-                Some(name)
-            } else {
-                None
+            if !fork.peek(Token![=]) {
+                break;
             }
-        } else {
-            None
-        };
+            match ident.to_string().as_str() {
+                "db" => {
+                    // Consume from the real stream.
+                    let _: Ident = input.parse()?;
+                    input.parse::<Token![=]>()?;
+                    let name: Ident = input.parse()?;
+                    input.parse::<Token![,]>()?;
+                    if db_name.replace(name).is_some() {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            "duplicate `db = <name>` prefix: the database is chosen once",
+                        ));
+                    }
+                }
+                "role" => {
+                    let _: Ident = input.parse()?;
+                    input.parse::<Token![=]>()?;
+                    let value: LitStr = input.parse()?;
+                    input.parse::<Token![,]>()?;
+                    if role.replace(value).is_some() {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            "duplicate `role = \"<role>\"` prefix: the role is chosen once",
+                        ));
+                    }
+                }
+                _ => break,
+            }
+        }
 
         let executor: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
@@ -241,6 +270,7 @@ impl Parse for QueryInput {
 
         Ok(Self {
             db_name,
+            role,
             executor,
             sql,
             assignments,
@@ -517,6 +547,25 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         .map_err(|e| syn::Error::new(input.sql.span(), built.annotate(e.to_string())))?;
     let resolved = &built.resolved;
 
+    // The role the statement runs as, or the database's configured ones. A
+    // call-site role replaces them for this statement.
+    let roles: Vec<String> = match &input.role {
+        Some(role) => vec![role.value()],
+        None => resolved.roles().to_vec(),
+    };
+    for role in &roles {
+        if let Err(e) = built.catalog.analyze_as(&sql_str, role) {
+            // A role the call site names and the migrations don't create is
+            // reported at the role literal: it is the token that names the
+            // missing role. Everything else is about the statement.
+            let span = match &input.role {
+                Some(literal) if !built.catalog.role_exists(role) => literal.span(),
+                _ => input.sql.span(),
+            };
+            return Err(syn::Error::new(span, built.annotate(e.to_string())));
+        }
+    }
+
     // A native `$1` placeholder is a valid PG parameter, but it has no name
     // an argument could bind to.
     if let Some(p) = analyzed
@@ -693,6 +742,51 @@ mod catalog_tests {
                  'public.v') (reported in full at the first sql! of this crate)"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::QueryInput;
+
+    fn parse(src: &str) -> syn::Result<QueryInput> {
+        syn::parse_str(src)
+    }
+
+    #[test]
+    fn parses_db_and_role_prefixes_in_either_order() {
+        let input = parse(r#"db = analytics, role = "app_role", db, "SELECT 1""#).unwrap();
+        assert_eq!(input.db_name.unwrap().to_string(), "analytics");
+        assert_eq!(input.role.unwrap().value(), "app_role");
+
+        let input = parse(r#"role = "app_role", db = analytics, db, "SELECT 1""#).unwrap();
+        assert_eq!(input.db_name.unwrap().to_string(), "analytics");
+        assert_eq!(input.role.unwrap().value(), "app_role");
+
+        let input = parse(r#"role = "app_role", db, "SELECT 1""#).unwrap();
+        assert!(input.db_name.is_none());
+        assert_eq!(input.role.unwrap().value(), "app_role");
+    }
+
+    #[test]
+    fn the_role_is_a_string_literal() {
+        assert!(parse(r#"role = 42, db, "SELECT 1""#).is_err());
+        assert!(parse(r#"role = app_role, db, "SELECT 1""#).is_err());
+    }
+
+    /// `role` after the SQL is a named parameter, not the prefix.
+    #[test]
+    fn a_role_named_parameter_still_binds() {
+        let input = parse(r#"db, "SELECT $role", role = "app_role""#).unwrap();
+        assert!(input.role.is_none());
+        assert_eq!(input.assignments.len(), 1);
+        assert_eq!(input.assignments[0].name, "role");
+    }
+
+    #[test]
+    fn a_prefix_cannot_be_repeated() {
+        assert!(parse(r#"db = a, db = b, db, "SELECT 1""#).is_err());
+        assert!(parse(r#"role = "a", role = "b", db, "SELECT 1""#).is_err());
     }
 }
 
