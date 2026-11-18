@@ -172,6 +172,10 @@ pub struct PgCatalogSeed {
     pub pg_conversion: Vec<PgConversion>,
     #[serde(default)]
     pub pg_language: Vec<PgLanguage>,
+    /// The non-NULL ACLs of the built-in objects (`pg_acl`): only the ones
+    /// whose ACL differs from `acldefault` are listed. See [`SeedAcl`].
+    #[serde(default)]
+    pub pg_acl: Vec<SeedAcl>,
 }
 
 // ─── In-memory catalog ─────────────────────────────────────────────────────
@@ -538,6 +542,18 @@ pub struct PgCatalog {
         Shared<HashMap<String, crate::ddl::prepared::PreparedStatement>>,
     /// The migration session's open cursors (DECLARE).
     pub(crate) cursors: crate::ddl::cursors::Cursors,
+    /// The cluster's roles, their memberships and attributes (`pg_authid` /
+    /// `pg_auth_members`).
+    pub(crate) roles: Shared<crate::ddl::roles::Roles>,
+    /// Object owners, ACLs, column ACLs and default privileges.
+    pub(crate) acls: Shared<crate::ddl::acl::Acls>,
+    /// The seed's `pg_acl` rows, kept verbatim so `to_seed` round-trips the
+    /// seed exporter's output (the internal ACL state also holds ACLs
+    /// migrations created, which the exporter never writes).
+    pub(crate) seed_acls: Vec<SeedAcl>,
+    /// One past the largest OID the seed holds: anything below it is a
+    /// built-in object, owned by the bootstrap superuser.
+    pub(crate) seed_oid_end: u32,
     /// `pg_type.typsubscript` of user base types, as the handler function's
     /// name (`hstore_subscript_handler`), set by `CREATE TYPE (SUBSCRIPT =
     /// …)` / `ALTER TYPE … SET (SUBSCRIPT = …)`. Built-in types aren't
@@ -604,6 +620,15 @@ const USER_OID_START_NZ: std::num::NonZeroU32 = match std::num::NonZeroU32::new(
 // ─── Construction ──────────────────────────────────────────────────────────
 
 impl PgCatalog {
+    /// The pseudo-role the migrations run as when no `SET ROLE` / `SET
+    /// SESSION AUTHORIZATION` is active: the connecting user, unknown to the
+    /// analyzer, taken to be superuser-equivalent and the owner of everything
+    /// created without a named role. Its name carries the reserved `pg_`
+    /// prefix, so a migration can never create a role that collides with it.
+    ///
+    /// The `has_*_privilege` queries accept it where they accept a role name.
+    pub const MIGRATIONS_USER: &'static str = "pg_typedpg_migrations_user";
+
     /// Create a catalog seeded with the embedded PG18 snapshot.
     ///
     /// Returns an [`AnalyzeError`] only if the embedded `seed.json` fails to
@@ -670,6 +695,7 @@ impl PgCatalog {
         // `max_oid` always carries a value >= `USER_OID_START` (the seed
         // bumper started there), so the `+1` cannot wrap and the result is
         // always >= `USER_OID_START + 1` — non-zero by construction.
+        cat.seed_oid_end = max_oid.saturating_add(1);
         cat.next_oid = std::num::NonZeroU32::new(max_oid.saturating_add(1).max(USER_OID_START))
             .unwrap_or(USER_OID_START_NZ);
         cat.transaction_oid_floor = cat.next_oid.get();
@@ -767,6 +793,18 @@ impl PgCatalog {
         }
         for (oid, definition) in seed.sql_function_defs {
             cat.add_sql_function_def(oid, definition);
+        }
+        for acl in &seed.pg_acl {
+            cat.load_seed_acl(acl);
+        }
+        cat.seed_acls = seed.pg_acl;
+        // initdb makes `pg_database_owner` the owner of the `public` schema;
+        // every other built-in object belongs to the bootstrap superuser.
+        if let (Some(public), Some(database_owner)) = (
+            cat.namespace_oid("public"),
+            cat.roles.id("pg_database_owner"),
+        ) {
+            cat.set_object_owner(crate::ddl::acl::AclObject::Schema(public), database_owner);
         }
         cat.search_path_guc = crate::ddl::session::SearchPathGuc::with_default(&seed.search_path);
         cat.refresh_search_path();
@@ -895,6 +933,10 @@ impl PgCatalog {
             attr_compression: Shared::default(),
             uncertain_collations: Shared::default(),
             column_deps: Default::default(),
+            roles: Shared::new(crate::ddl::roles::Roles::new()),
+            acls: Shared::default(),
+            seed_acls: Vec::new(),
+            seed_oid_end: 0,
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
             pg_sanity: None,
@@ -1014,6 +1056,7 @@ impl PgCatalog {
             pg_ts_objects: Vec::clone(&self.pg_ts_objects),
             pg_ts_config_map: Vec::clone(&self.pg_ts_config_map),
             pg_conversion: Vec::clone(&self.conversions),
+            pg_acl: self.seed_acls.clone(),
             pg_language: {
                 let mut rows: Vec<_> = self.pg_language.values().cloned().collect();
                 rows.sort_by_key(|l| l.oid);
@@ -1924,14 +1967,25 @@ impl PgCatalog {
     }
 
     fn run_pg_sanity_apply_check(&self, sql: &str, result: &Result<(), DdlError>) {
-        self.with_pg_sanity::<()>(|server| server.assert_apply_matches(sql, result));
+        let roles = self.created_roles();
+        self.with_pg_sanity::<()>(|server| {
+            server.remember_roles(&roles);
+            server.assert_apply_matches(sql, result);
+            if result.is_ok() {
+                server.assert_privileges_match(self);
+            }
+        });
     }
 
     /// [`Self::run_pg_sanity_apply_check`] for a migration that touches an
     /// extension: one the server doesn't ship taints the catalog, and every
     /// later mirror call is skipped.
     fn run_pg_sanity_extension_apply_check(&mut self, sql: &str, result: &Result<(), DdlError>) {
-        match self.with_pg_sanity(|server| server.compare_extension_apply_matches(sql, result)) {
+        let roles = self.created_roles();
+        match self.with_pg_sanity(|server| {
+            server.remember_roles(&roles);
+            server.compare_extension_apply_matches(sql, result)
+        }) {
             Some(Some(Some(divergence))) => panic!("{}", divergence.message),
             Some(None) => self.pg_sanity_tainted = true,
             Some(Some(None)) | None => {}
@@ -2053,6 +2107,10 @@ impl PgCatalog {
     pub(crate) fn remove_pg_namespace(&mut self, oid: PgNamespaceOid) -> Option<PgNamespace> {
         let row = self.pg_namespace.remove(&oid)?;
         self.namespace_by_name.remove(&row.nspname);
+        self.acls
+            .forget_object(crate::ddl::acl::AclObject::Schema(oid));
+        // `ALTER DEFAULT PRIVILEGES IN SCHEMA` entries depend on the schema.
+        self.acls.forget_schema_defaults(oid);
         self.refresh_search_path();
         Some(row)
     }
@@ -2067,12 +2125,22 @@ impl PgCatalog {
     }
 
     pub(crate) fn insert_pg_type(&mut self, row: PgType) {
+        let oid = row.oid;
         self.type_by_qname
-            .insert((row.typnamespace, row.typname.clone()), row.oid);
-        self.pg_type.insert(row.oid, row);
+            .insert((row.typnamespace, row.typname.clone()), oid);
+        self.pg_type.insert(oid, row);
+        // The creation hooks set the exact owner; this catches the type rows
+        // internal DDL inserts without one (a range's array, a domain's).
+        let object = crate::ddl::acl::AclObject::Type(oid);
+        if !self.acls.has_owner(object) {
+            let owner = crate::ddl::roles::current_role(self);
+            self.set_object_owner(object, owner);
+        }
     }
 
     pub(crate) fn remove_pg_type(&mut self, oid: PgTypeOid) -> Option<PgType> {
+        self.acls
+            .forget_object(crate::ddl::acl::AclObject::Type(oid));
         let row = self.pg_type.remove(&oid)?;
         self.type_by_qname
             .remove(&(row.typnamespace, row.typname.clone()));
@@ -2107,6 +2175,9 @@ impl PgCatalog {
     }
 
     pub(crate) fn remove_pg_class(&mut self, oid: PgClassOid) -> Option<PgClass> {
+        self.acls
+            .forget_object(crate::ddl::acl::AclObject::Relation(oid));
+        self.acls.forget_columns_of(oid);
         self.attr_default_types
             .retain(|(relid, _), _| *relid != oid);
         self.generated_refs.retain(|(relid, _), _| *relid != oid);
@@ -2195,11 +2266,19 @@ impl PgCatalog {
     }
 
     pub(crate) fn insert_pg_proc(&mut self, row: PgProc) {
+        let oid = row.oid;
         self.proc_by_qname
             .entry((row.pronamespace, row.proname.clone()))
             .or_default()
-            .push(row.oid);
-        self.pg_proc.insert(row.oid, row);
+            .push(oid);
+        self.pg_proc.insert(oid, row);
+        // The creation hooks set the exact owner and ACL; this catches the
+        // routines internal DDL inserts (range constructors, casts).
+        let object = crate::ddl::acl::AclObject::Function(oid);
+        if !self.acls.has_owner(object) {
+            let owner = crate::ddl::roles::current_role(self);
+            self.set_object_owner(object, owner);
+        }
     }
 
     /// Forget what the inlinable bodies resolved to: a DDL statement may
@@ -2216,6 +2295,8 @@ impl PgCatalog {
     }
 
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
+        self.acls
+            .forget_object(crate::ddl::acl::AclObject::Function(oid));
         // A family's soft members go with their function (DEPENDENCY_AUTO).
         let object = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
         self.family_members

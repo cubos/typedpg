@@ -651,7 +651,7 @@ fn describe_function(interp: &PgCatalog, oid: crate::oid::PgProcOid) -> String {
 }
 
 /// DROP ... CASCADE of functions: views calling them go too.
-fn drop_functions_cascade(interp: &mut PgCatalog, procs: &[crate::oid::PgProcOid]) {
+pub(crate) fn drop_functions_cascade(interp: &mut PgCatalog, procs: &[crate::oid::PgProcOid]) {
     for &proc_oid in procs {
         // With what depends on it (an operator it implements) — or, for an
         // extension's member, the whole extension.

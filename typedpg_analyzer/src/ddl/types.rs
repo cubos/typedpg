@@ -201,6 +201,8 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     });
 
     // GenerateTypeDependencies: a domain depends on its base type.
+    let owner = super::roles::current_role(interp);
+    super::acl::type_created(interp, oid, nsoid, owner);
     super::depend::record(
         interp,
         super::depend::ObjectAddress::type_(oid),
@@ -735,6 +737,8 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
     }
 
     register_array_type(interp, nsoid, &name, oid)?;
+    let owner = super::roles::current_role(interp);
+    super::acl::type_created(interp, oid, nsoid, owner);
     Ok(())
 }
 
@@ -844,6 +848,13 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
 
     register_array_type(interp, nsoid, &name, type_oid)?;
     register_composite_to_record_cast(interp, type_oid)?;
+
+    // DefineCompositeType: the relation and its type belong to the current
+    // role. The relation's relacl stays NULL (not a RELKIND the default ACLs
+    // cover); the type takes the type default privileges.
+    let owner = super::roles::current_role(interp);
+    super::acl::relation_created_dependent(interp, class_oid, owner);
+    super::acl::type_created(interp, type_oid, nsoid, owner);
 
     Ok(())
 }
@@ -1197,6 +1208,11 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         support.into_iter().map(super::depend::ObjectAddress::proc),
         crate::pg_catalog::DepType::Normal,
     );
+    // DefineRange's TypeCreate: the range type takes the type default
+    // privileges; the multirange is a dependent type.
+    let owner = super::roles::current_role(interp);
+    super::acl::type_created(interp, oid, nsoid, owner);
+    super::acl::type_created_dependent(interp, mr_oid, owner);
     Ok(())
 }
 
@@ -1736,6 +1752,11 @@ fn define_base_type(
     if !has_array {
         register_array_type(interp, nsoid, name, oid)?;
     }
+    // DefineType's TypeCreate: the now-defined type takes the current role as
+    // owner and the type default privileges (TypeShellMake leaves the ACL
+    // NULL).
+    let owner = super::roles::current_role(interp);
+    super::acl::type_created(interp, oid, nsoid, owner);
     Ok(())
 }
 
@@ -1963,6 +1984,10 @@ pub(crate) fn create_base_type(
         typsubscript: phys.typsubscript,
         typisdefined: false,
     });
+    // TypeShellMake: the placeholder belongs to the current role; its typacl
+    // stays NULL until the full CREATE TYPE.
+    let owner = super::roles::current_role(interp);
+    interp.set_object_owner(super::acl::AclObject::Type(oid), owner);
     Ok(oid)
 }
 
@@ -2239,6 +2264,10 @@ fn register_array_type(
     if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
         elem.typarray = Some(array_oid);
     }
+    // An implicit array type is a dependent type: owned like the type it
+    // arrays, which the same statement just created as the current role's.
+    let owner = super::roles::current_role(interp);
+    super::acl::type_created_dependent(interp, array_oid, owner);
     Ok(array_oid)
 }
 

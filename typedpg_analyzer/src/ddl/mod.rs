@@ -4,7 +4,7 @@
 //! This module parses SQL migration files using `typedpg_pg_query` and mutates the
 //! snapshot as if the DDL had been executed against a real PostgreSQL instance.
 
-mod acl;
+pub(crate) mod acl;
 pub mod aggregates;
 pub mod alter;
 pub(crate) mod cluster;
@@ -38,6 +38,7 @@ pub(crate) mod policies;
 pub(crate) mod prepared;
 pub(crate) mod publications;
 pub(crate) mod reloptions;
+pub(crate) mod roles;
 pub(crate) mod rules;
 pub mod schema_stmt;
 pub(crate) mod seqparams;
@@ -592,6 +593,12 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
             triggers::create_trigger(db, s).and_then(|()| coldeps::record_trigger(db, s))
         }
         ast::Node::GrantStmt(s) => acl::grant(db, s),
+        ast::Node::GrantRoleStmt(s) => roles::grant_role(db, s),
+        ast::Node::CreateRoleStmt(s) => roles::create_role(db, s),
+        ast::Node::AlterRoleStmt(s) => roles::alter_role(db, s),
+        ast::Node::DropRoleStmt(s) => roles::drop_role(db, s),
+        ast::Node::ReassignOwnedStmt(s) => roles::reassign_owned(db, s),
+        ast::Node::DropOwnedStmt(s) => roles::drop_owned(db, s),
         ast::Node::CreatePolicyStmt(s) => {
             policies::create_policy(db, s).and_then(|()| coldeps::record_policy(db, s))
         }
@@ -645,16 +652,13 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         ast::Node::AlterSubscriptionStmt(s) => cluster::alter_subscription(db, &s.subname),
         ast::Node::DropSubscriptionStmt(s) => cluster::drop_subscription(db, s),
         ast::Node::AlterOperatorStmt(s) => operators::alter_operator(db, s),
-        ast::Node::GrantRoleStmt(_)
-        | ast::Node::CreateRoleStmt(_)
-        | ast::Node::AlterRoleStmt(_)
-        | ast::Node::VariableShowStmt(_)
+        ast::Node::VariableShowStmt(_)
         | ast::Node::NotifyStmt(_)
         | ast::Node::ListenStmt(_)
         | ast::Node::UnlistenStmt(_)
         // Statements PG accepts in a migration that don't change anything the
         // static analysis reads: DML and procedure calls (like the SELECT /
-        // INSERT above), statistics, database / role / system settings,
+        // INSERT above), statistics, database / system settings,
         // ownership, publications and subscriptions, event triggers,
         // operator families, text search configuration, foreign-data
         // wrappers / servers / user mappings,
@@ -666,9 +670,6 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         | ast::Node::AlterDatabaseRefreshCollStmt(_)
         | ast::Node::AlterRoleSetStmt(_)
         | ast::Node::AlterSystemStmt(_)
-        | ast::Node::DropRoleStmt(_)
-        | ast::Node::ReassignOwnedStmt(_)
-        | ast::Node::DropOwnedStmt(_)
         | ast::Node::AlterTableSpaceOptionsStmt(_) => Ok(()),
         ast::Node::AlterObjectDependsStmt(s) => extensions::alter_object_depends(db, s),
         // `ALTER COLLATION name REFRESH VERSION`: only the name matters.

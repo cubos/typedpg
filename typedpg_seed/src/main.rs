@@ -18,14 +18,14 @@ use testcontainers::core::Mount;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::SyncRunner;
 use typedpg_analyzer::{
-    AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType, DepType,
-    PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass,
-    PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgConversion, PgDepend,
-    PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits, PgLanguage,
-    PgLanguageOid, PgNamespace, PgNamespaceOid, PgOpclass, PgOpclassOid, PgOperator, PgOperatorOid,
-    PgOpfamily, PgProc, PgProcOid, PgRange, PgSetting, PgTsConfigMap, PgTsObject, PgType,
-    PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, TypAlign, TypCategory, TypStorage,
-    TypType,
+    AclCatalog, AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType,
+    DepType, PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed,
+    PgClass, PgClassOid, PgCollation, PgCollationOid, PgConstraint, PgConstraintOid, PgConversion,
+    PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgInherits,
+    PgLanguage, PgLanguageOid, PgNamespace, PgNamespaceOid, PgOpclass, PgOpclassOid, PgOperator,
+    PgOperatorOid, PgOpfamily, PgProc, PgProcOid, PgRange, PgSetting, PgTsConfigMap, PgTsObject,
+    PgType, PgTypeOid, ProKind, ProVolatile, QualifiedName, RelKind, SeedAcl, TypAlign,
+    TypCategory, TypStorage, TypType,
 };
 
 fn main() {
@@ -105,6 +105,7 @@ fn main() {
     eprintln!("  pg_constraint:{}", snapshot.pg_constraint.len());
     eprintln!("  pg_index:     {}", snapshot.pg_index.len());
     eprintln!("  pg_rewrite:   {}", snapshot.pg_rewrite.len());
+    eprintln!("  pg_acl:       {}", snapshot.pg_acl.len());
 }
 
 // ─── Schema export ─────────────────────────────────────────────────────────────
@@ -138,6 +139,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
     let pg_ts_objects = export_ts_objects(client)?;
     let pg_ts_config_map = export_ts_config_map(client)?;
     let pg_conversion = export_conversions(client)?;
+    let pg_acl = export_acls(client)?;
 
     let _ = nsname_by_oid;
 
@@ -176,6 +178,7 @@ fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgr
         pg_ts_config_map,
         pg_conversion,
         pg_language,
+        pg_acl,
     };
     let scratch = PgCatalog::from_seed(seed.clone());
     seed.pg_index = export_indexes(client, &scratch)?;
@@ -931,6 +934,53 @@ fn export_conversions(client: &mut postgres::Client) -> Result<Vec<PgConversion>
                 oid: PgGenericOid::new(r.get::<_, u32>(0))?,
                 name: r.get(1),
                 namespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
+            })
+        })
+        .collect())
+}
+
+/// The non-NULL ACLs of the built-in objects (`pg_acl`): one row per object
+/// whose `relacl` / `attacl` / `proacl` / `nspacl` / `typacl` / `lanacl` is
+/// not NULL, with the `aclitem[]` in its text form.
+fn export_acls(client: &mut postgres::Client) -> Result<Vec<SeedAcl>, postgres::Error> {
+    let rows = client.query(
+        "SELECT 'pg_class', oid::int4, 0::int2, relacl::text \
+           FROM pg_catalog.pg_class WHERE relacl IS NOT NULL \
+         UNION ALL \
+         SELECT 'pg_attribute', attrelid::int4, attnum::int2, attacl::text \
+           FROM pg_catalog.pg_attribute WHERE attacl IS NOT NULL \
+         UNION ALL \
+         SELECT 'pg_proc', oid::int4, 0::int2, proacl::text \
+           FROM pg_catalog.pg_proc WHERE proacl IS NOT NULL \
+         UNION ALL \
+         SELECT 'pg_namespace', oid::int4, 0::int2, nspacl::text \
+           FROM pg_catalog.pg_namespace WHERE nspacl IS NOT NULL \
+         UNION ALL \
+         SELECT 'pg_type', oid::int4, 0::int2, typacl::text \
+           FROM pg_catalog.pg_type WHERE typacl IS NOT NULL \
+         UNION ALL \
+         SELECT 'pg_language', oid::int4, 0::int2, lanacl::text \
+           FROM pg_catalog.pg_language WHERE lanacl IS NOT NULL \
+         ORDER BY 1, 2, 3",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let catalog = match r.get::<_, String>(0).as_str() {
+                "pg_class" => AclCatalog::Class,
+                "pg_attribute" => AclCatalog::Attribute,
+                "pg_proc" => AclCatalog::Proc,
+                "pg_namespace" => AclCatalog::Namespace,
+                "pg_type" => AclCatalog::Type,
+                "pg_language" => AclCatalog::Language,
+                _ => return None,
+            };
+            Some(SeedAcl {
+                catalog,
+                objid: PgGenericOid::new(r.get::<_, i32>(1) as u32)?,
+                objsubid: r.get(2),
+                acl: r.get(3),
             })
         })
         .collect())

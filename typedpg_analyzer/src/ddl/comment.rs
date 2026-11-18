@@ -1,11 +1,13 @@
-//! COMMENT ON and ALTER ... OWNER TO — the comment or owner doesn't
-//! matter to static analysis, but PG resolves the target object first
-//! (`get_object_address`), so a migration naming something that doesn't
-//! exist fails.
+//! COMMENT ON and ALTER ... OWNER TO — the comment doesn't matter to static
+//! analysis, but PG resolves the target object first
+//! (`get_object_address`), and the owner is modeled (object privileges are
+//! checked against it), so a migration naming something that doesn't exist
+//! fails.
 
-use typedpg_pg_query::ast::{self, CommentStmt, ObjectType};
+use typedpg_pg_query::ast::{self, AlterOwnerStmt, CommentStmt, ObjectType};
 
 use super::DdlError;
+use super::acl::{self, AclObject};
 use super::util::node_string;
 use crate::pg_catalog::{PgCatalog, RelKind};
 
@@ -51,32 +53,134 @@ pub fn comment_on(interp: &PgCatalog, stmt: &CommentStmt) -> Result<(), DdlError
     Ok(())
 }
 
-/// `ALTER <object> ... OWNER TO role` (ExecAlterOwnerStmt). The new owner
-/// is not checked: roles live in the cluster, outside what migrations
-/// build.
-pub fn alter_owner(
-    interp: &PgCatalog,
-    stmt: &typedpg_pg_query::ast::AlterOwnerStmt,
-) -> Result<(), DdlError> {
+/// `ALTER <object> ... OWNER TO role` (ExecAlterOwnerStmt): the target must
+/// exist and the new owner is recorded. Roles live in the cluster, outside
+/// what the migrations build, so a role the catalog doesn't know is taken to
+/// exist (see `ddl::session::role_may_exist`).
+pub fn alter_owner(interp: &mut PgCatalog, stmt: &AlterOwnerStmt) -> Result<(), DdlError> {
     let objtype = stmt.object_type;
+    let new_owner = match stmt.newowner.as_ref() {
+        Some(spec) => Some(super::roles::resolve_role_spec(interp, spec)?),
+        None => None,
+    };
     if let Some(rv) = stmt.relation.as_ref() {
-        super::util::lookup_relation(interp, rv)?;
+        let (_, relid) = super::util::lookup_relation(interp, rv)?;
+        if let Some(owner) = new_owner {
+            acl::change_relation_owner(interp, relid, owner);
+        }
         return Ok(());
     }
     let Some(object) = stmt.object.as_ref() else {
         return Ok(());
     };
-    // ALTER TYPE / DOMAIN name the type as a plain name list.
-    if let (ObjectType::ObjectType | ObjectType::ObjectDomain, ast::Node::List(l)) =
-        (objtype, object)
-    {
-        let tn = typedpg_pg_query::ast::TypeName {
-            names: l.items.clone(),
-            ..Default::default()
-        };
-        return resolve_object(interp, objtype, &ast::Node::TypeName(tn.into()));
+    resolve_object(interp, objtype, object)?;
+    let Some(owner) = new_owner else {
+        return Ok(());
+    };
+    match objtype {
+        ObjectType::ObjectTable
+        | ObjectType::ObjectView
+        | ObjectType::ObjectMatview
+        | ObjectType::ObjectSequence
+        | ObjectType::ObjectForeignTable => {
+            let parts = object_names(object);
+            if let Some(relid) = relation_oid(interp, &parts) {
+                acl::change_relation_owner(interp, relid, owner);
+            }
+        }
+        ObjectType::ObjectIndex => {
+            // ATExecChangeOwner's index case: a plain index follows its
+            // table (skipped), a partitioned one is refused.
+            let parts = object_names(object);
+            if let Some(relid) = relation_oid(interp, &parts)
+                && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::PartitionedIndex)
+            {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "cannot change owner of index \"{}\" (Change the ownership of the index's \
+                     table instead.)",
+                    parts.last().cloned().unwrap_or_default()
+                )));
+            }
+        }
+        ObjectType::ObjectType | ObjectType::ObjectDomain => {
+            let tn = typedpg_pg_query::ast::TypeName {
+                names: match object {
+                    ast::Node::List(l) => l.items.clone(),
+                    ast::Node::TypeName(tn) => tn.names.clone(),
+                    _ => return Ok(()),
+                },
+                ..Default::default()
+            };
+            let oid = super::util::lookup_type_name(&tn, interp)?;
+            if let Some(t) = interp.get_type(oid)
+                && t.typtype == crate::pg_catalog::TypType::Composite
+                && let Some(relid) = t.typrelid
+                && interp.pg_class.get(&relid).map(|c| c.relkind) != Some(RelKind::CompositeType)
+            {
+                return Err(DdlError::Parse(format!(
+                    "{} is a table's row type",
+                    super::util::format_type_for_message(interp, oid)
+                )));
+            }
+            interp.change_object_owner(AclObject::Type(oid), owner);
+            if let Some(array) = interp.array_type_of(oid) {
+                interp.change_object_owner(AclObject::Type(array), owner);
+            }
+        }
+        ObjectType::ObjectSchema => {
+            if let ast::Node::String(s) = object
+                && let Some(ns) = interp.namespace_oid(&s.sval)
+            {
+                interp.change_object_owner(AclObject::Schema(ns), owner);
+            }
+        }
+        ObjectType::ObjectFunction
+        | ObjectType::ObjectProcedure
+        | ObjectType::ObjectRoutine
+        | ObjectType::ObjectAggregate => {
+            if let ast::Node::ObjectWithArgs(owa) = object
+                && let Some(oid) =
+                    super::functions::lookup_func_with_args(interp, objtype, owa, false)?
+            {
+                interp.change_object_owner(AclObject::Function(oid), owner);
+            }
+        }
+        ObjectType::ObjectLanguage => {
+            if let ast::Node::String(s) = object
+                && let Some(oid) = interp
+                    .pg_language
+                    .values()
+                    .find(|l| l.lanname == s.sval)
+                    .map(|l| l.oid)
+            {
+                interp.change_object_owner(AclObject::Language(oid), owner);
+            }
+        }
+        _ => {}
     }
-    resolve_object(interp, objtype, object)
+    Ok(())
+}
+
+fn object_names(object: &ast::Node) -> Vec<String> {
+    match object {
+        ast::Node::List(l) => l
+            .items
+            .iter()
+            .filter_map(|n| node_string(n.as_ref()))
+            .map(str::to_owned)
+            .collect(),
+        ast::Node::String(s) => vec![s.sval.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn relation_oid(interp: &PgCatalog, parts: &[String]) -> Option<crate::oid::PgClassOid> {
+    let (schema, name) = match parts {
+        [name] => (None, name.as_str()),
+        [schema, name] => (Some(schema.as_str()), name.as_str()),
+        _ => return None,
+    };
+    interp.resolve_table(schema, name).map(|c| c.oid)
 }
 
 /// get_object_address: the object `objtype` / `object` names must exist.
@@ -85,18 +189,7 @@ pub(crate) fn resolve_object(
     objtype: ObjectType,
     object: &ast::Node,
 ) -> Result<(), DdlError> {
-    let names = |n: &ast::Node| -> Vec<String> {
-        match n {
-            ast::Node::List(l) => l
-                .items
-                .iter()
-                .filter_map(|n| node_string(n.as_ref()))
-                .map(str::to_owned)
-                .collect(),
-            ast::Node::String(s) => vec![s.sval.clone()],
-            _ => Vec::new(),
-        }
-    };
+    let names = object_names;
     let relation = |parts: &[String]| -> Result<crate::oid::PgClassOid, DdlError> {
         let (schema, name) = match parts {
             [name] => (None, name.as_str()),

@@ -90,6 +90,7 @@ pub(crate) mod qualified_name {
     pub use typedpg_core::QualifiedName;
 }
 
+pub use ddl::acl::Privilege;
 pub use oid::{
     PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgEnumOid, PgExtensionOid,
     PgGenericOid, PgLanguageOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid,
@@ -97,12 +98,12 @@ pub use oid::{
 };
 #[cfg(any(test, feature = "internal"))]
 pub use pg_catalog::{
-    AggKind, ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod, ConType,
-    DepType, EvEnabled, EvType, PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCatalogSeed,
-    PgClass, PgCollation, PgConstraint, PgConversion, PgDepend, PgEnum, PgExtension, PgIndex,
-    PgInherits, PgLanguage, PgNamespace, PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange,
-    PgRewrite, PgSetting, PgTsConfigMap, PgTsObject, PgType, ProKind, ProVolatile, RelKind,
-    SerializedAst, TypAlign, TypCategory, TypStorage, TypType,
+    AclCatalog, AggKind, ArgMode, AstBinding, AttGenerated, AttIdentity, CastContext, CastMethod,
+    ConType, DepType, EvEnabled, EvType, PgAggregate, PgAm, PgAmop, PgAttribute, PgCast,
+    PgCatalogSeed, PgClass, PgCollation, PgConstraint, PgConversion, PgDepend, PgEnum, PgExtension,
+    PgIndex, PgInherits, PgLanguage, PgNamespace, PgOpclass, PgOperator, PgOpfamily, PgProc,
+    PgRange, PgRewrite, PgSetting, PgTsConfigMap, PgTsObject, PgType, ProKind, ProVolatile,
+    RelKind, SeedAcl, SerializedAst, TypAlign, TypCategory, TypStorage, TypType,
 };
 
 pub use ddl::DdlError;

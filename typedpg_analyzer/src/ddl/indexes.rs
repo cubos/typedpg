@@ -291,6 +291,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         relkind,
         reltype: None,
     });
+    super::acl::index_created(db, indexrelid, indrelid);
 
     db.index_keys.insert(
         indexrelid,

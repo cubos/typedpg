@@ -56,6 +56,14 @@ pub(crate) fn insert_sequence_relation(
         relkind: RelKind::Sequence,
         reltype: None,
     });
+    let owner = super::roles::current_role(interp);
+    super::acl::relation_created(
+        interp,
+        class_oid,
+        nsoid,
+        owner,
+        super::acl::DefaultAclClass::Sequence,
+    );
     let columns = [
         ("last_value", oid::INT8),
         ("log_cnt", oid::INT8),
@@ -150,6 +158,16 @@ pub(crate) fn create_owned_sequence(
         ),
     };
     let seq_oid = insert_sequence_relation(interp, nsoid, name)?;
+    // An owned sequence belongs to its table's owner, not the current role
+    // (`ATExecAddColumn` / `transformColumnDefinition` make it the table
+    // owner's), and takes that role's sequence default privileges.
+    let table_owner = interp.owner_of(super::acl::AclObject::Relation(relid));
+    interp.object_created(
+        super::acl::AclObject::Relation(seq_oid),
+        table_owner,
+        Some(nsoid),
+        super::acl::DefaultAclClass::Sequence,
+    );
     interp.sequence_params.insert(seq_oid, params);
     record_ownership(interp, seq_oid, relid, attnum, deptype);
     if deptype == DepType::Auto {

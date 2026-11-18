@@ -1011,6 +1011,39 @@ pub struct PgExtension {
     pub extversion: String,
 }
 
+/// The catalog an ACL row of the seed (`pg_acl`) belongs to: PG's
+/// `pg_shdepend.classid` naming, one variant per catalog that stores an
+/// `aclitem[]` the analyzer models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AclCatalog {
+    #[serde(rename = "pg_class")]
+    Class,
+    #[serde(rename = "pg_attribute")]
+    Attribute,
+    #[serde(rename = "pg_proc")]
+    Proc,
+    #[serde(rename = "pg_namespace")]
+    Namespace,
+    #[serde(rename = "pg_type")]
+    Type,
+    #[serde(rename = "pg_language")]
+    Language,
+}
+
+/// One non-NULL ACL of a built-in object, exported from the seed server:
+/// `(catalog, objid, objsubid, aclitem[])`. `objsubid` is the column's
+/// `attnum` for `pg_attribute` rows and 0 otherwise. The ACL is its text form
+/// as PG prints it — `{postgres=arwdDxtm/postgres,=r/postgres}` — parsed when
+/// the seed loads. Only objects whose ACL differs from their default have a
+/// row, so the table stays small.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+pub struct SeedAcl {
+    pub catalog: AclCatalog,
+    pub objid: PgGenericOid,
+    pub objsubid: i16,
+    pub acl: String,
+}
+
 /// `pg_depend`: a dependency between two catalog objects.
 ///
 /// `(classid, objid, objsubid)` identifies the dependent; `(refclassid,
