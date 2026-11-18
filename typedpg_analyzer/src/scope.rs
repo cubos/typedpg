@@ -464,6 +464,7 @@ impl TableSource {
     pub(crate) fn note_column(&self, name: &str) {
         if let Some(relid) = self.relid {
             crate::ddl::depend::note_column(relid, name);
+            crate::privileges::note_column_by_name(relid, name);
         } else if let Some(Some((relid, attname))) = self
             .columns
             .iter()
@@ -792,6 +793,9 @@ impl Scope {
         check_relation_opens(table)?;
         let table_oid = table.oid;
         crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(table_oid));
+        // addRangeTableEntry: a relation read in FROM requires SELECT.
+        crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::SELECT);
+        crate::privileges::note_scan(table_oid);
         let nspname = snapshot
             .namespace_name(table.relnamespace)
             .map(str::to_owned)

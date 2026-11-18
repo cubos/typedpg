@@ -1206,6 +1206,192 @@ impl PgSanityServer {
     }
 }
 
+/// What PG makes of a statement run by a role: planning it
+/// (`EXPLAIN (GENERIC_PLAN)`: parse analysis and the executor's start —
+/// the schema, range-table and EXECUTE checks) and, when that succeeds,
+/// executing it with NULL parameters (the checks made as it runs: a
+/// sequence function, a column default's `nextval`).
+struct RoleOutcome {
+    explain: Result<(), postgres::Error>,
+    execute: Option<Result<(), postgres::Error>>,
+}
+
+impl RoleOutcome {
+    /// The first `insufficient_privilege` (42501) error PG raised.
+    fn denied(&self) -> Option<&postgres::Error> {
+        let denied = |r: &Result<(), postgres::Error>| matches!(r, Err(e) if e.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE));
+        if denied(&self.explain) {
+            return self.explain.as_ref().err();
+        }
+        match &self.execute {
+            Some(r) if denied(r) => r.as_ref().err(),
+            _ => None,
+        }
+    }
+}
+
+impl PgSanityServer {
+    /// Mirror [`crate::PgCatalog::analyze_as`]: run `sql` as `role` on the
+    /// query session and compare. The analyzer accepting means PG raises no
+    /// `insufficient_privilege`; the analyzer denying means PG does, with a
+    /// message the analyzer's starts with. Any other error of the analyzer
+    /// must be PG's when it plans the statement as the role (a name the
+    /// role's search path resolves differently). Errors PG raises only
+    /// executing with NULL parameters (a NOT NULL column) say nothing of
+    /// privileges and are ignored.
+    pub(crate) fn assert_role_matches(
+        &mut self,
+        sql: &str,
+        role: &str,
+        ours: &Result<crate::resolve::AnalyzedQuery, crate::AnalyzeError>,
+    ) {
+        if let Some(div) = self.compare_role_matches(sql, role, ours) {
+            panic!("{}", div.message);
+        }
+    }
+
+    pub(crate) fn compare_role_matches(
+        &mut self,
+        sql: &str,
+        role: &str,
+        ours: &Result<crate::resolve::AnalyzedQuery, crate::AnalyzeError>,
+    ) -> Option<Divergence> {
+        // A role the migrations didn't create has no server-side twin.
+        if matches!(ours, Err(crate::AnalyzeError::UndefinedObject(m)) if m.starts_with("role \""))
+        {
+            return None;
+        }
+        let pg = self.run_as_role(sql, role);
+        let header = format!("SQL:\n---\n{sql}\n---\nrole: {role}");
+        match ours {
+            Ok(_) => {
+                if let Some(e) = pg.denied() {
+                    return Some(Divergence {
+                        kind: DivergenceKind::AnalyzePgRejected,
+                        message: format!(
+                            "pg_sanity: the analyzer lets the role run the statement, PG denies it.\n\
+                             {header}\nPG: {}",
+                            render_pg_error(e)
+                        ),
+                    });
+                }
+                if let Err(e) = &pg.explain {
+                    return Some(Divergence {
+                        kind: DivergenceKind::AnalyzePgRejected,
+                        message: format!(
+                            "pg_sanity: the analyzer accepts the statement as the role, PG \
+                             rejects it.\n{header}\nPG: {}",
+                            render_pg_error(e)
+                        ),
+                    });
+                }
+                None
+            }
+            Err(e @ crate::AnalyzeError::InsufficientPrivilege(msg)) => match pg.denied() {
+                Some(pg_err) => check_error_prefix(msg, e.sqlstate(), pg_err, sql, "privilege"),
+                // Executing failed on something else first: nothing to
+                // compare.
+                None if matches!(pg.execute, Some(Err(_))) => None,
+                None => Some(Divergence {
+                    kind: DivergenceKind::AnalyzeAcceptedExecuted,
+                    message: format!(
+                        "pg_sanity: the analyzer denies the role the statement, PG runs it.\n\
+                         {header}\nanalyzer: {msg}\nPG: {}",
+                        match &pg.explain {
+                            Err(e) => render_pg_error(e),
+                            Ok(()) => "planned and executed".to_owned(),
+                        }
+                    ),
+                }),
+            },
+            Err(e) => match &pg.explain {
+                Err(pg_err) => {
+                    check_error_prefix(&e.to_string(), e.sqlstate(), pg_err, sql, "role")
+                }
+                Ok(()) => Some(Divergence {
+                    kind: DivergenceKind::AnalyzeAcceptedExecuted,
+                    message: format!(
+                        "pg_sanity: the analyzer rejects the statement as the role, PG plans \
+                         it.\n{header}\nanalyzer: {e}"
+                    ),
+                }),
+            },
+        }
+    }
+
+    /// Plan, then execute, `sql` as `role` in a transaction rolled back
+    /// afterwards. `SET ROLE` doesn't apply the role's own settings
+    /// (`ALTER ROLE ... SET`), which a session it logs in with would have:
+    /// its `search_path` is set by hand.
+    fn run_as_role(&mut self, sql: &str, role: &str) -> RoleOutcome {
+        let explainable = typedpg_pg_query::parse(sql).ok().is_some_and(|tree| {
+            use typedpg_pg_query::ast::Node as N;
+            matches!(
+                tree.tree.stmts.first().and_then(|s| s.stmt.as_ref()),
+                Some(
+                    N::SelectStmt(_)
+                        | N::InsertStmt(_)
+                        | N::UpdateStmt(_)
+                        | N::DeleteStmt(_)
+                        | N::MergeStmt(_)
+                )
+            )
+        });
+        let mut tx = self
+            .query_client
+            .transaction()
+            .unwrap_or_else(|e| panic!("pg_sanity: BEGIN failed: {e}"));
+        let search_path: Option<String> = tx
+            .query_opt(
+                "SELECT o.option_value \
+                 FROM pg_catalog.pg_db_role_setting s, \
+                      pg_catalog.pg_options_to_table(s.setconfig) o \
+                 WHERE o.option_name = 'search_path' \
+                   AND s.setrole IN ((SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1), 0) \
+                   AND s.setdatabase IN ((SELECT oid FROM pg_catalog.pg_database \
+                                          WHERE datname = pg_catalog.current_database()), 0) \
+                 ORDER BY s.setrole <> 0 DESC, s.setdatabase <> 0 DESC \
+                 LIMIT 1",
+                &[&role],
+            )
+            .unwrap_or_else(|e| panic!("pg_sanity: reading the role's settings failed: {e}"))
+            .map(|row| row.get(0));
+        let mut setup = format!("SET LOCAL ROLE {}", typedpg_core::quote_identifier(role));
+        if let Some(path) = search_path {
+            setup.push_str(&format!("; SET LOCAL search_path TO {path}"));
+        }
+        tx.batch_execute(&setup)
+            .unwrap_or_else(|e| panic!("pg_sanity: {setup} failed: {}", render_pg_error(&e)));
+        let explain = if explainable {
+            let mut sp = tx
+                .transaction()
+                .unwrap_or_else(|e| panic!("pg_sanity: SAVEPOINT failed: {e}"));
+            let r = sp.batch_execute(&format!("EXPLAIN (GENERIC_PLAN) {sql}"));
+            let _ = sp.rollback();
+            r
+        } else {
+            Ok(())
+        };
+        let execute = if explain.is_ok() && soundness::is_executable_by_role(sql) {
+            let mut sp = tx
+                .transaction()
+                .unwrap_or_else(|e| panic!("pg_sanity: SAVEPOINT failed: {e}"));
+            let r = sp.prepare(sql).and_then(|stmt| {
+                let nulls: Vec<NullParam> = stmt.params().iter().map(|_| NullParam).collect();
+                let params: Vec<&(dyn ToSql + Sync)> =
+                    nulls.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+                sp.query(&stmt, &params).map(|_| ())
+            });
+            let _ = sp.rollback();
+            Some(r)
+        } else {
+            None
+        };
+        let _ = tx.rollback();
+        RoleOutcome { explain, execute }
+    }
+}
+
 /// Whether a schema holds user objects: not `pg_catalog`, a TOAST schema,
 /// the temporary schema or `information_schema`.
 fn is_user_schema(name: &str) -> bool {

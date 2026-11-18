@@ -146,11 +146,25 @@ impl SearchPathGuc {
         }
     }
 
-    fn new_session(&self) -> &[String] {
+    /// The setting a new session of `role` starts with, given the role's
+    /// own (`ALTER ROLE r SET`) and every role's (`ALTER ROLE ALL SET`):
+    /// pg_db_role_setting applies the role's, then the database's, then
+    /// every role's, over the server's.
+    pub(crate) fn new_session_of<'a>(
+        &'a self,
+        role: Option<&'a [String]>,
+        all_roles: Option<&'a [String]>,
+    ) -> &'a [String] {
+        role.or(self.database.as_deref())
+            .or(all_roles)
+            .unwrap_or(&self.default)
+    }
+
+    pub(crate) fn new_session(&self) -> &[String] {
         self.database.as_deref().unwrap_or(&self.default)
     }
 
-    fn effective(&self) -> &[String] {
+    pub(crate) fn effective(&self) -> &[String] {
         self.local
             .as_deref()
             .or(self.session.as_deref())
@@ -561,7 +575,7 @@ pub(crate) fn alter_database_set(
 }
 
 /// The schema names of `SET search_path = ...`, when all are constants.
-fn search_path_args(stmt: &VariableSetStmt) -> Option<Vec<String>> {
+pub(crate) fn search_path_args(stmt: &VariableSetStmt) -> Option<Vec<String>> {
     // Each argument is one schema name: the grammar hands identifiers and
     // string literals over alike, and `flatten_set_variable_args` quotes
     // every one of them (search_path is GUC_LIST_QUOTE), so `SET
@@ -719,7 +733,7 @@ pub(crate) fn timezone_is_utc(value: &str) -> bool {
 }
 
 /// A constant `SET` argument as the string GUC code parses.
-fn const_arg_string(arg: Option<&typedpg_pg_query::ast::Node>) -> Option<String> {
+pub(crate) fn const_arg_string(arg: Option<&typedpg_pg_query::ast::Node>) -> Option<String> {
     match arg {
         Some(ast::Node::AConst(c)) => match c.val.as_ref()? {
             ast::AConstValue::Integer(i) => Some(i.ival.to_string()),

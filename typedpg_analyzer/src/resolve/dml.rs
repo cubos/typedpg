@@ -144,6 +144,7 @@ fn analyze_insert_here(
     }
 
     note_written_columns(&tgt, written.first().map_or(0, Vec::len));
+    note_insert_privileges(ins, &tgt, written.first().map_or(0, Vec::len));
 
     // The columns the INSERT leaves to their default — omitted, or
     // `DEFAULT` in some VALUES row — get the default expression, converted
@@ -437,6 +438,9 @@ fn on_conflict_update_arm(
     for s in &mut holder.sources {
         s.system_columns.clear();
         s.dml_target = false;
+        // EXCLUDED's RTEPermissionInfo is the target relation's: a column
+        // read through it marks that column SELECTed (its `requiredPerms`
+        // starts as ACL_SELECT).
         for c in &mut s.columns {
             c.base_not_null |= insert_not_null.contains(&c.name);
         }
@@ -710,6 +714,47 @@ fn note_written_columns(tgt: &InsertTarget, width: usize) {
     for i in 0..width {
         if let Some(c) = target_col_at(tgt, i) {
             crate::ddl::depend::note_column(tgt.oid, &c.attname);
+        }
+    }
+}
+
+/// What an INSERT requires of its target (`RTEPermissionInfo`): INSERT on
+/// the columns of its target list (`insertedCols` — every position the
+/// rows give, `DEFAULT` included), and the defaults of the columns it
+/// leaves to them, which run with the statement (rewriteTargetListIU).
+fn note_insert_privileges(ins: &ast::InsertStmt, tgt: &InsertTarget, width: usize) {
+    crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::INSERT);
+    for i in 0..width {
+        if let Some(c) = target_col_at(tgt, i) {
+            crate::privileges::note_column(
+                tgt.oid,
+                &c.attname,
+                crate::privileges::ColumnAccess::Insert,
+            );
+        }
+    }
+    let rows: Vec<&[Option<ast::Node>]> = match ins.select_stmt.as_ref() {
+        Some(ast::Node::SelectStmt(sel)) => sel
+            .values_lists
+            .iter()
+            .filter_map(|l| match l.as_ref() {
+                Some(ast::Node::List(list)) => Some(list.items.as_slice()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for c in tgt.attrs.iter().filter(|c| c.attnum > 0) {
+        let position =
+            (0..width).find(|&i| target_col_at(tgt, i).is_some_and(|t| t.attnum == c.attnum));
+        let defaulted = match position {
+            None => true,
+            Some(i) => rows
+                .iter()
+                .any(|r| r.get(i).is_some_and(|n| is_set_to_default(n.as_ref()))),
+        };
+        if defaulted {
+            crate::privileges::note_default(tgt.oid, c.attnum);
         }
     }
 }
@@ -1927,7 +1972,8 @@ fn analyze_insert_on_conflict(
     excluded_holder.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
     // transformOnConflictClause marks the EXCLUDED RTE as
     // RELKIND_COMPOSITE_TYPE, so scanNSItemForColumn offers it no system
-    // columns: `excluded.ctid` does not exist.
+    // columns: `excluded.ctid` does not exist. Its perminfo is still the
+    // target relation's: reading `excluded.a` needs SELECT on `a`.
     for s in &mut excluded_holder.sources {
         s.system_columns.clear();
         s.dml_target = false;
@@ -1971,6 +2017,17 @@ fn analyze_insert_on_conflict(
     // stored INSERT ... ON CONFLICT DO UPDATE depends on every column.
     for a in tgt.attrs.iter().filter(|a| a.attnum > 0) {
         crate::ddl::depend::note_column(tgt.oid, &a.attname);
+    }
+    // DO UPDATE requires UPDATE of the columns its SET list writes.
+    crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::UPDATE);
+    for t in &on_conflict.target_list {
+        if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
+            crate::privileges::note_column(
+                tgt.oid,
+                &rt.name,
+                crate::privileges::ColumnAccess::Update,
+            );
+        }
     }
     let mut conflict_scope = target_scope;
     conflict_scope.sources.extend(excluded_holder.sources);
@@ -2042,8 +2099,9 @@ fn transform_on_conflict_arbiter(
             if let Some(a) = tgt.attrs.iter().find(|a| a.attname == ie.name) {
                 arbiter.cols.insert(a.attnum);
                 elem_attnum = Some(a.attnum);
-                // The inference element is a Var of the column.
+                // The inference element is a Var of the column, read.
                 crate::ddl::depend::note_column(tgt.oid, &a.attname);
+                crate::privileges::note_column_by_name(tgt.oid, &a.attname);
             } else if let Some(&(_, _, attnum)) = crate::pg_catalog::SYSTEM_COLUMNS
                 .iter()
                 .find(|(n, ..)| *n == ie.name)
@@ -2135,6 +2193,14 @@ fn transform_on_conflict_arbiter(
                 c.oid.into_nonzero(),
                 0,
             ));
+            // transformOnConflictArbiter marks the constrained columns as
+            // requiring SELECT, as the inference column list does.
+            crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::SELECT);
+            for attnum in &c.conkey {
+                if let Some(a) = tgt.attrs.iter().find(|a| a.attnum == *attnum) {
+                    crate::privileges::note_column_by_name(tgt.oid, &a.attname);
+                }
+            }
             return Ok(arbiter);
         }
         return Err(crate::error::RawError::new(
@@ -2267,9 +2333,21 @@ fn analyze_update_here(
         .unwrap_or_default();
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
     // The columns the UPDATE writes.
+    crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::UPDATE);
     for target in &upd.target_list {
         if let Some(ast::Node::ResTarget(rt)) = target.as_ref() {
             crate::ddl::depend::note_column(table_oid, &rt.name);
+            crate::privileges::note_column(
+                table_oid,
+                &rt.name,
+                crate::privileges::ColumnAccess::Update,
+            );
+            // `SET c = DEFAULT` runs the column's default.
+            if is_set_to_default(rt.val.as_ref())
+                && let Some(a) = table_attrs.iter().find(|a| a.attname == rt.name)
+            {
+                crate::privileges::note_default(table_oid, a.attnum);
+            }
         }
     }
 
@@ -2520,6 +2598,8 @@ fn analyze_delete_here(
     crate::scope::check_relation_opens(table)?;
 
     let table_oid = table.oid;
+    // transformDeleteStmt: the target requires DELETE.
+    crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
     let table_relname = table.relname.clone();
     let table_nsname = snapshot
         .namespace_name(table.relnamespace)

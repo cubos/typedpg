@@ -2729,6 +2729,19 @@ fn check_goal_compatibility(
         return Ok(());
     }
     if can_coerce(result.type_oid, goal.type_oid, goal.coercion, snapshot) {
+        // coerce_type builds a FuncExpr for a cast implemented by a
+        // function: ExecInitFunc checks its EXECUTE like any other call.
+        if let Some(func) = snapshot
+            .cast_by_pair
+            .get(&(
+                snapshot.unwrap_domain(result.type_oid),
+                snapshot.unwrap_domain(goal.type_oid),
+            ))
+            .and_then(|oid| snapshot.pg_cast.get(oid))
+            .and_then(|c| c.castfunc)
+        {
+            crate::privileges::note_routine(func, crate::privileges::RoutineKind::Function);
+        }
         return Ok(());
     }
     // PG's user-facing type names (e.g. `int4` → `integer`, `bool` →

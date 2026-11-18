@@ -53,6 +53,8 @@ pub(crate) fn analyze_call(
         functions::FuncDetail::Coercion(_) => unreachable!("coercion interpretation not requested"),
     };
     ctx.note_proc(Some(resolved.oid));
+    // ExecuteCallStmt: EXECUTE on the procedure.
+    crate::privileges::note_call(snapshot, resolved.oid, false, &fc.args);
 
     // Coerce each argument to its parameter: pins bare parameters and
     // validates untyped literals (`CALL p('x')` → 22P02 for an integer).

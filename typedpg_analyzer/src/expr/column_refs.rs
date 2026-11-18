@@ -313,6 +313,9 @@ fn whole_row_ref(
     // columns threaded as the record shape. The shape lets downstream
     // `(t.*).field` indirection still resolve, and the `record` OID lines
     // up with what PG's wire-protocol Describe reports for these queries.
+    if let Some(relid) = source.relid {
+        crate::privileges::note_whole_row(relid);
+    }
     if let Some(qn) = source.source_qn.as_ref() {
         let composite_oid = snapshot
             .namespace_oid(&qn.schema)

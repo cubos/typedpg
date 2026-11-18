@@ -359,7 +359,8 @@ pub(crate) fn note_ts_object(interp: &PgCatalog, kind: &str, schema: Option<&str
 /// Run `f` (an analysis) and return what it referred to.
 pub(crate) fn collect<R>(f: impl FnOnce() -> R) -> (R, Vec<Reference>) {
     let outer = COLLECTOR.with(|c| c.replace(Some(Vec::new())));
-    let result = f();
+    // What an internal analysis reads isn't the statement's range table.
+    let result = crate::privileges::suspended(f);
     let refs = COLLECTOR.with(|c| c.replace(outer)).unwrap_or_default();
     (result, refs)
 }

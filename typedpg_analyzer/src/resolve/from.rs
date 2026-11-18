@@ -2475,6 +2475,9 @@ fn function_rte_columns(
         false,
         crate::error::SourceSpan::from_node_qname(func_call.location),
     )?;
+    // ExecInitFunctionScan: the function's EXECUTE, and a constant
+    // sequence argument's privileges, checked as for a call anywhere else.
+    crate::privileges::note_call(snapshot, resolved.oid, false, &func_call.args);
     // Coerce untyped arguments to the chosen signature (pins `$N`,
     // validates literal contents), as for a call anywhere else.
     expr::backfill_call_args(func_call, &arg_types, &resolved, arg_ctx, params)?;

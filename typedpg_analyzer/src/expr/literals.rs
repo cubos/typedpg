@@ -409,6 +409,12 @@ pub(crate) fn infer_type_cast(
         .and_then(|oid| snapshot.pg_cast.get(oid))
         .and_then(|c| c.castfunc);
     ctx.note_proc(cast_func);
+    // A cast function is a FuncExpr in the plan: ExecInitFunc checks its
+    // EXECUTE (`SELECT 1::mytype` fails when the cast's function is
+    // revoked).
+    if let Some(func) = cast_func {
+        crate::privileges::note_routine(func, crate::privileges::RoutineKind::Function);
+    }
     // A cast with no function (binary-coercible, I/O conversion) or a
     // strict one maps NULL to NULL.
     ctx.note_strict(

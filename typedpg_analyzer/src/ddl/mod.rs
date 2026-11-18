@@ -593,6 +593,7 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
             triggers::create_trigger(db, s).and_then(|()| coldeps::record_trigger(db, s))
         }
         ast::Node::GrantStmt(s) => acl::grant(db, s),
+        ast::Node::AlterRoleSetStmt(s) => roles::alter_role_set(db, s),
         ast::Node::GrantRoleStmt(s) => roles::grant_role(db, s),
         ast::Node::CreateRoleStmt(s) => roles::create_role(db, s),
         ast::Node::AlterRoleStmt(s) => roles::alter_role(db, s),
@@ -668,7 +669,6 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         | ast::Node::LoadStmt(_)
         | ast::Node::AlterDatabaseStmt(_)
         | ast::Node::AlterDatabaseRefreshCollStmt(_)
-        | ast::Node::AlterRoleSetStmt(_)
         | ast::Node::AlterSystemStmt(_)
         | ast::Node::AlterTableSpaceOptionsStmt(_) => Ok(()),
         ast::Node::AlterObjectDependsStmt(s) => extensions::alter_object_depends(db, s),

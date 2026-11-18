@@ -514,6 +514,10 @@ pub struct PgCatalog {
     /// Views with the `security_barrier` option: the planner doesn't pull
     /// them up into the query reading them.
     pub(crate) security_barrier_views: Shared<std::collections::HashSet<PgClassOid>>,
+    /// Views with the `security_invoker` option: their query reads its
+    /// relations with the privileges of the statement's role, not the
+    /// view owner's.
+    pub(crate) security_invoker_views: Shared<std::collections::HashSet<PgClassOid>>,
     /// Relations whose definition the migrations replaced or altered
     /// (`CREATE OR REPLACE VIEW`, `ALTER VIEW ... RENAME`). A seeded
     /// `pg_catalog` system view among them no longer carries the guarantees
@@ -928,6 +932,7 @@ impl PgCatalog {
             toast_tables: Shared::default(),
             toast_rewrites: Shared::default(),
             security_barrier_views: Shared::default(),
+            security_invoker_views: Shared::default(),
             modified_relations: Shared::default(),
             attr_storage: Shared::default(),
             attr_compression: Shared::default(),
@@ -1503,6 +1508,59 @@ impl PgCatalog {
         result
     }
 
+    /// [`Self::analyze`] for a statement run by `role`: also fails when the
+    /// role may not run it, with PostgreSQL's `permission denied` error —
+    /// what preparing and executing it as that role (`SET ROLE`) raises.
+    ///
+    /// Only roles the migrations create (and PostgreSQL's predefined roles)
+    /// can be checked: the catalog knows nothing else of a role. The
+    /// statement resolves its unqualified names along the search path the
+    /// role's sessions have.
+    pub fn analyze_as(&self, sql: &str, role: &str) -> Result<AnalyzedQuery, AnalyzeError> {
+        let (_analysis_sql, result) = self.analyze_as_with_sql(sql, role);
+
+        #[cfg(feature = "pg_sanity")]
+        if !self.pg_sanity_tainted && !self.pg_sanity_skip {
+            self.run_pg_sanity_role_check(&_analysis_sql, role, &result);
+        }
+
+        result
+    }
+
+    /// [`Self::analyze_as`], with an error's location (see
+    /// [`Self::analyze_located`]).
+    pub fn analyze_as_located(&self, sql: &str, role: &str) -> Result<AnalyzedQuery, LocatedError> {
+        crate::diagnostic::clear_last_primary();
+        self.analyze_as(sql, role).map_err(LocatedError::new)
+    }
+
+    fn analyze_as_with_sql(
+        &self,
+        sql: &str,
+        role: &str,
+    ) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
+        if !self.role_exists(role) {
+            // check_role's wording for SET ROLE.
+            return (
+                sql.to_owned(),
+                Err(AnalyzeError::UndefinedObject(format!(
+                    "role \"{role}\" does not exist (typedpg can check only the roles the \
+                     migrations create)"
+                ))),
+            );
+        }
+        let path = self.role_search_path(role);
+        crate::privileges::as_role(role, || {
+            if path == self.search_path {
+                self.analyze_with_sql(sql)
+            } else {
+                let mut catalog = self.clone();
+                catalog.search_path = path;
+                catalog.analyze_with_sql(sql)
+            }
+        })
+    }
+
     /// [`Self::analyze`], with an error's location: the byte offset in `sql`
     /// its diagnostic points at, when it has one. For tools that report the
     /// error in the file the query is written in.
@@ -1713,7 +1771,17 @@ impl PgCatalog {
         // SQL.
         let result = {
             let _guard = crate::error::DiagContextGuard::install(sql, &analysis_lex);
-            analyze_static(self, &analysis_sql, &param_nullability)
+            match crate::privileges::checking_role() {
+                None => analyze_static(self, &analysis_sql, &param_nullability),
+                // `analyze_as`: what the statement requires, checked
+                // against the role once it analyzes.
+                Some(role) => {
+                    let (result, required) = crate::privileges::collect(|| {
+                        analyze_static(self, &analysis_sql, &param_nullability)
+                    });
+                    result.and_then(|ok| self.check_requirements(&role, &required).map(|()| ok))
+                }
+            }
         };
         let (columns, mut info_params, can_run_as_subquery) = match result {
             Ok(p) => p,
@@ -1773,7 +1841,10 @@ impl PgCatalog {
             )
             .map(|mut analyzed| {
                 if simplify {
-                    crate::simplify::simplify(self, &mut analyzed, &param_nullability);
+                    // (Its rewrites aren't the statement as written.)
+                    crate::privileges::suspended(|| {
+                        crate::simplify::simplify(self, &mut analyzed, &param_nullability)
+                    });
                 }
                 analyzed
             });
@@ -1992,6 +2063,16 @@ impl PgCatalog {
         }
     }
 
+    fn run_pg_sanity_role_check(
+        &self,
+        analysis_sql: &str,
+        role: &str,
+        result: &Result<AnalyzedQuery, AnalyzeError>,
+    ) {
+        self.with_pg_sanity::<()>(|server| server.assert_role_matches(analysis_sql, role, result));
+    }
+
+    #[cfg(feature = "pg_sanity")]
     fn run_pg_sanity_analyze_check(
         &self,
         analysis_sql: &str,
@@ -2212,6 +2293,7 @@ impl PgCatalog {
         self.toast_tables.remove(&oid);
         self.toast_rewrites.remove(&oid);
         self.security_barrier_views.remove(&oid);
+        self.security_invoker_views.remove(&oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);
         self.attr_compression.retain(|(relid, _), _| *relid != oid);
         self.uncertain_collations.retain(|(relid, _)| *relid != oid);

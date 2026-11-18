@@ -177,6 +177,23 @@ pub(crate) fn infer_func_call(
     check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
     check_not_internal(&resolved, snapshot, func.location)?;
     ctx.note_proc(Some(resolved.oid));
+    // ExecInitFunc / ExecInitAgg / ExecInitWindowAgg: EXECUTE, and the
+    // parameter DEFAULT expressions the call is expanded with run too.
+    crate::privileges::note_call(snapshot, resolved.oid, func.over.is_some(), &func.args);
+    if snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .is_some_and(|p| func.args.len() < p.proargtypes.len())
+    {
+        for &p in snapshot
+            .proc_default_procs
+            .get(&resolved.oid)
+            .into_iter()
+            .flatten()
+        {
+            crate::privileges::note_routine(p, crate::privileges::RoutineKind::Function);
+        }
+    }
     // A call leaving parameters out runs their DEFAULT expressions — unless
     // the function is inlined (a simple SQL body, which CheckMutability
     // judges by itself).

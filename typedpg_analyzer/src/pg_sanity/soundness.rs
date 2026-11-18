@@ -788,6 +788,14 @@ fn has_inner_promise(ty: &Type) -> bool {
 /// Whether `sql` is one plannable statement the oracle may run:
 /// SELECT / VALUES / INSERT / UPDATE / DELETE / MERGE (with or without
 /// WITH).
+/// Whether the role oracle may execute `sql` (see [`is_executable`]):
+/// CALL too, whose procedure's EXECUTE is checked as it runs.
+pub(super) fn is_executable_by_role(sql: &str) -> bool {
+    let head = sql.trim_start().get(..4).unwrap_or("");
+    !UNSAFE_CALLS.iter().any(|c| sql.contains(c))
+        && (is_executable(sql) || head.eq_ignore_ascii_case("call"))
+}
+
 fn is_executable(sql: &str) -> bool {
     use typedpg_pg_query::ast::Node;
     let Ok(parsed) = typedpg_pg_query::parse(sql) else {

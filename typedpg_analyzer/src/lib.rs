@@ -64,6 +64,7 @@ mod pg_catalog;
 mod pg_sanity;
 mod pgmsg;
 mod polymorphic;
+mod privileges;
 #[cfg(feature = "pg_sanity")]
 pub use pg_sanity::{Divergence, DivergenceKind};
 mod range_input;
