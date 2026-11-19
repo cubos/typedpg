@@ -458,8 +458,10 @@ impl QueryParser<'_> {
                         }
                         stack.pop();
                     }
-                    if stack.len() == STACKDEPTH {
-                        return Err(Fail::Msg("tsquery stack too small".to_string()));
+                    // pushOpStack: since PostgreSQL 18.7 a user-facing
+                    // limit, not an internal error.
+                    if stack.len() >= STACKDEPTH {
+                        return Err(Fail::Msg("tsquery is too complex".to_string()));
                     }
                     stack.push(op);
                 }
@@ -550,7 +552,7 @@ mod tests {
         );
         assert_eq!(
             validate_tsquery("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!a").unwrap_err(),
-            "tsquery stack too small"
+            "tsquery is too complex"
         );
     }
 
