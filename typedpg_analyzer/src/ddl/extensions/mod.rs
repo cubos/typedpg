@@ -453,6 +453,7 @@ fn apply_with_schema(
     scripts: &[&str],
 ) -> Result<(), DdlError> {
     ensure_namespace(interp, schema)?;
+    search_path_element_check(schema)?;
     let mut path = vec![schema.to_owned()];
     for required in requires(name) {
         if let Some(ns) = interp
@@ -460,9 +461,11 @@ fn apply_with_schema(
             .get(*required)
             .and_then(|oid| interp.pg_extension.get(oid))
             .and_then(|e| interp.namespace_name(e.extnamespace))
-            .filter(|ns| *ns != "pg_catalog")
         {
-            path.push(ns.to_owned());
+            search_path_element_check(ns)?;
+            if ns != "pg_catalog" {
+                path.push(ns.to_owned());
+            }
         }
     }
     path.push("pg_temp".to_owned());
@@ -476,7 +479,13 @@ fn apply_with_schema(
             // EXTENSION` already went there once and PGlite handles its
             // own internal scripts. Our embedded scripts also use
             // `MODULE_PATHNAME` placeholders that PGlite would reject.
-            let sql = substitute_extschema(interp, schema, sql);
+            let sql = match substitute_extschema(interp, name, schema, sql) {
+                Ok(sql) => sql,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
             result = super::apply_sql_to(interp, &sql);
             if result.is_err() {
                 break;
@@ -488,10 +497,68 @@ fn apply_with_schema(
     result
 }
 
+/// extension_search_path_element_check (extension.c, PostgreSQL 18.7): a
+/// schema the script's `search_path` lists may not be a name that path
+/// treats specially — a temporary schema's, or `$user`.
+fn search_path_element_check(name: &str) -> Result<(), DdlError> {
+    if name.starts_with("pg_temp_")
+        || name.starts_with("pg_toast_temp_")
+        || name == "pg_temp"
+        || name == "$user"
+    {
+        return Err(DdlError::Parse(format!(
+            "unacceptable extension schema name \"{name}\""
+        )));
+    }
+    Ok(())
+}
+
+/// check_substitution_name (extension.c, PostgreSQL 18.7): a schema name
+/// substituted into extension `extname`'s script may not hold what could
+/// break out of its quoting — quotes, `$`, a backslash, a newline, a
+/// comment delimiter or another substitution token. (The owner's name,
+/// `@extowner@`, is checked too; ownership isn't modeled.)
+fn check_substitution_name(name: &str, extname: &str) -> Result<(), DdlError> {
+    const QUOTING_RELEVANT_CHARS: &str = "\"$'\\";
+    if name.chars().any(|c| QUOTING_RELEVANT_CHARS.contains(c)) {
+        return Err(DdlError::Parse(format!(
+            "invalid character in extension \"{extname}\" schema: must not contain any of \
+             \"{QUOTING_RELEVANT_CHARS}\""
+        )));
+    }
+    if name.contains(['\n', '\r'])
+        || name.contains("--")
+        || name.contains("/*")
+        || name.contains("*/")
+    {
+        return Err(DdlError::Parse(format!(
+            "invalid string in extension \"{extname}\" schema: must not contain newline, \
+             carriage return, \"--\", \"/*\", or \"*/\""
+        )));
+    }
+    if name.contains("@extowner@")
+        || name.contains("@extschema")
+        || name.contains("MODULE_PATHNAME")
+    {
+        return Err(DdlError::Parse(format!(
+            "invalid string in extension \"{extname}\" schema: must not contain \
+             \"@extowner@\", \"@extschema\", or \"MODULE_PATHNAME\""
+        )));
+    }
+    Ok(())
+}
+
 /// `execute_extension_script` (extension.c) replaces `@extschema@` with the
 /// extension's schema and `@extschema:name@` with the schema of the required
-/// extension `name`, both as quoted identifiers.
-fn substitute_extschema(interp: &PgCatalog, schema: &str, sql: &str) -> String {
+/// extension `name`, both as quoted identifiers — and checks each name it
+/// substitutes (`@extschema@` only in a script of a non-relocatable
+/// extension, the only ones that may use it).
+fn substitute_extschema(
+    interp: &PgCatalog,
+    name: &str,
+    schema: &str,
+    sql: &str,
+) -> Result<String, DdlError> {
     // `quote_identifier`: bare when a plain lowercase identifier.
     let quote = |s: &str| {
         let plain = s
@@ -506,6 +573,9 @@ fn substitute_extschema(interp: &PgCatalog, schema: &str, sql: &str) -> String {
             format!("\"{}\"", s.replace('"', "\"\""))
         }
     };
+    if !relocatable(name) && sql.contains("@extschema@") {
+        check_substitution_name(schema, name)?;
+    }
     // The owner: the migrations' role (ownership isn't modeled).
     let mut out = sql
         .replace("@extschema@", &quote(schema))
@@ -523,12 +593,13 @@ fn substitute_extschema(interp: &PgCatalog, schema: &str, sql: &str) -> String {
             .and_then(|e| interp.namespace_name(e.extnamespace))
             .unwrap_or(schema)
             .to_owned();
+        check_substitution_name(&ext_schema, ext)?;
         out.replace_range(
             start..start + "@extschema:".len() + end + 1,
             &quote(&ext_schema),
         );
     }
-    out
+    Ok(out)
 }
 
 /// Extract a string option from CREATE/ALTER EXTENSION options.

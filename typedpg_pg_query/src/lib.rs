@@ -10,7 +10,7 @@
 //! - [`NodeRef`] / [`NodeMut`] view a node by kind, and `nodes()` /
 //!   `nodes_mut()` list a tree's nodes.
 //!
-//! The PostgreSQL release the grammar comes from is [`PG_VERSION`]. The
+//! The PostgreSQL release the parser implements is [`PG_VERSION`]. The
 //! generated modules are produced by `typedpg_pg_query_codegen`; see the
 //! crate README for moving to a new release.
 

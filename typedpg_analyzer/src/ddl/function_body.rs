@@ -731,13 +731,31 @@ pub(crate) fn check_pseudo_types(
                     shown(rettype)
                 )));
             }
-            for (_, t) in &inputs {
-                if is_pseudo(*t) && !is_polymorphic(interp, *t) {
-                    return Err(DdlError::Parse(format!(
-                        "SQL functions cannot have arguments of type {}",
-                        shown(*t)
-                    )));
+            // Every parameter, OUT and TABLE ones included (PostgreSQL 18.7,
+            // fmgr_sql_validator over get_func_arg_info), except a record /
+            // record[] output column.
+            let all: Vec<(ArgMode, PgTypeOid)> = if proc.proargmodes.is_empty() {
+                proc.proargtypes.iter().map(|&t| (ArgMode::In, t)).collect()
+            } else {
+                proc.proargmodes
+                    .iter()
+                    .copied()
+                    .zip(proc.proallargtypes.iter().copied())
+                    .collect()
+            };
+            for (mode, t) in all {
+                if !is_pseudo(t) || is_polymorphic(interp, t) {
+                    continue;
                 }
+                if matches!(mode, ArgMode::Out | ArgMode::Table)
+                    && matches!(typname(t).as_deref(), Some("record" | "_record"))
+                {
+                    continue;
+                }
+                return Err(DdlError::Parse(format!(
+                    "SQL functions cannot have arguments of type {}",
+                    shown(t)
+                )));
             }
         }
         Some("plpgsql") => {

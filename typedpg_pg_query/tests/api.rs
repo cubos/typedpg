@@ -291,3 +291,25 @@ fn rewrite_replaces_nodes_bottom_up() {
         "SELECT a + 1, (SELECT b::int), c::text"
     );
 }
+
+#[test]
+fn plpgsql_validates_anycompatiblemultirange_as_postgres_18_7() {
+    // Validation resolves polymorphic types to int4 ones: since PostgreSQL
+    // 18.7 (patches.rs), anycompatiblemultirange to int4multirange, as
+    // anymultirange, for the arguments and the result ($0) alike.
+    let json = typedpg_pg_query::parse_plpgsql(
+        "CREATE FUNCTION f(a anycompatiblemultirange) RETURNS anycompatiblemultirange \
+         LANGUAGE plpgsql AS $$ BEGIN RETURN a; END $$",
+    )
+    .unwrap();
+    let datums = json[0]["PLpgSQL_function"]["datums"].as_array().unwrap();
+    let type_of = |name: &str| {
+        datums
+            .iter()
+            .map(|d| &d["PLpgSQL_var"])
+            .find(|v| v["refname"] == name)
+            .map(|v| v["datatype"]["PLpgSQL_type"]["typname"].clone())
+    };
+    assert_eq!(type_of("a"), Some("int4multirange".into()), "{json}");
+    assert_eq!(type_of("$0"), Some("int4multirange".into()), "{json}");
+}

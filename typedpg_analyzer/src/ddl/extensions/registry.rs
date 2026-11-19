@@ -11,7 +11,7 @@ use super::{ExtensionDef, ExtensionVersion};
 //
 // All PostgreSQL contrib extensions, alphabetical order.
 // SQL files are in typedpg_analyzer/src/extensions/ and fetched via
-// update_extensions.sh from the PostgreSQL release libpg_query pins: the
+// update_extensions.sh from the PostgreSQL release typedpg targets: the
 // versions and default versions here are that release's, as its parser
 // must accept every script and its server has every object they create.
 

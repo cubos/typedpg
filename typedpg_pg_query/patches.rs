@@ -931,4 +931,33 @@ plpgsql_parse_cwordrowtype(List *idents)
 	/* Mirrors the checks in upstream interpret_AS_clause */
 "#,
     },
+    // ── PostgreSQL 18.7 ──
+    //
+    // libpg_query's sources are PostgreSQL 18.6's; POSTGRES_VERSION is 18.7.
+    // Of what 18.7 changed in the functions libpg_query extracts, these are
+    // the changes that reach parsing or PL/pgSQL compilation; the rest harden
+    // the server's memory and concurrency handling, which the parser doesn't
+    // run.
+    Patch {
+        file: "src/postgres/src_pl_plpgsql_src_pl_comp.c",
+        why: "PostgreSQL 18.7 (plpgsql_compile_callback): validating a PL/pgSQL function returning anycompatiblemultirange resolves the result to int4multirange, as for anymultirange, not to int4.",
+        find: r#"					else if (rettypeid == ANYMULTIRANGEOID)
+						rettypeid = INT4MULTIRANGEOID;
+"#,
+        replace: r#"					else if (rettypeid == ANYMULTIRANGEOID ||
+							 rettypeid == ANYCOMPATIBLEMULTIRANGEOID)
+						rettypeid = INT4MULTIRANGEOID;
+"#,
+    },
+    Patch {
+        file: "src/postgres/src_backend_utils_cache_funccache.c",
+        why: "PostgreSQL 18.7 (cfunc_resolve_polymorphic_argtypes): validating a function taking anycompatiblemultirange resolves the argument to int4multirange, as for anymultirange.",
+        find: r#"			case ANYMULTIRANGEOID:
+				argtypes[i] = INT4MULTIRANGEOID;
+"#,
+        replace: r#"			case ANYMULTIRANGEOID:
+			case ANYCOMPATIBLEMULTIRANGEOID:
+				argtypes[i] = INT4MULTIRANGEOID;
+"#,
+    },
 ];

@@ -188,7 +188,8 @@ fn create_operator_follows_operator_create_checks() {
 fn commutator_and_negator_links_are_kept_like_pg() {
     // OperatorUpd links the commutator / negator back — refusing one that
     // already links to a third operator — and a dropped operator's links
-    // are cleared; filling in a shell replaces its row, links included.
+    // are cleared; filling in a shell keeps the links it has (PostgreSQL
+    // 18.7).
     const FNS: &str = "
         CREATE FUNCTION myeq(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';
         CREATE FUNCTION myne(int, int) RETURNS bool LANGUAGE sql AS 'select $1 <> $2';";
@@ -237,7 +238,7 @@ fn commutator_and_negator_links_are_kept_like_pg() {
             .map(|n| ops.get(&n).unwrap().oprname.clone())
     };
     assert_eq!(negator("==="), Some("!==".into()));
-    assert_eq!(negator("!=="), None);
+    assert_eq!(negator("!=="), Some("===".into()));
     assert_eq!(negator("=#="), Some("!#!".into()));
     assert_eq!(negator("!#!"), Some("=#=".into()));
     assert_eq!(negator("=%="), None);

@@ -149,6 +149,10 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             super::util::format_type_for_message(interp, typ)
         ))
     };
+    // The expressions and the types they produce (find_composite_type_
+    // dependencies' view of them).
+    let mut raw_exprs: Vec<&typedpg_pg_query::protobuf::Node> = Vec::new();
+    let mut expr_results: Vec<crate::oid::PgTypeOid> = Vec::new();
     for elem in &stmt.exprs {
         let Some(node::Node::StatsElem(se)) = elem.node.as_ref() else {
             continue;
@@ -241,6 +245,28 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                     }
                 }
             }
+            // CheckAttributeType (PostgreSQL 18.7): a type that can be
+            // stored, as a column's — not a pseudo-type (an anonymous
+            // record's typmod is valid only in the session that built it).
+            if let Some(t) = typ.as_ref()
+                && (t.type_oid != crate::pg_catalog::oid::UNKNOWN
+                    || super::indexes::certainly_unknown(expr, t))
+            {
+                super::tables::check_expression_type(interp, t.type_oid)?;
+                // ... and, of a collatable type, with a collation.
+                if t.no_collation.is_some()
+                    && interp
+                        .pg_type
+                        .get(&t.type_oid)
+                        .is_some_and(|ty| ty.typcollation.is_some())
+                {
+                    return Err(DdlError::Parse(format!(
+                        "no collation was derived for expression with collatable type {} (Use \
+                         the COLLATE clause to set the collation explicitly.)",
+                        super::util::format_type_for_message(interp, t.type_oid)
+                    )));
+                }
+            }
             // A type without `<` — but only when there are several
             // columns: a single expression gets the regular statistics.
             if stmt.exprs.len() > 1
@@ -256,6 +282,12 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                 )));
             }
             exprs.push(super::tables::check_inherit::StoredExpr::written(expr));
+            raw_exprs.push(expr);
+            expr_results.extend(
+                typ.as_ref()
+                    .map(|t| t.type_oid)
+                    .filter(|t| *t != crate::pg_catalog::oid::UNKNOWN),
+            );
             name_parts.push("expr".into());
         }
     }
@@ -309,14 +341,54 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
     attnums.sort_unstable();
     attnums.dedup();
     let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
+    let refs: Vec<super::depend::Reference> = raw_exprs
+        .iter()
+        .flat_map(|e| super::depend::expression_references(interp, e, Some(relid)))
+        .collect();
+    let refers = super::depend::type_references(&refs);
+    super::depend::note_expr_type_use(
+        interp,
+        super::depend::ObjectAddress {
+            classid: super::depend::PG_STATISTIC_EXT_RELID,
+            objid: oid,
+            objsubid: 0,
+        },
+        super::depend::ExprTypeUse {
+            refers,
+            results: expr_results.clone(),
+        },
+    );
     interp.statistics.push(StatisticsObject {
-        name,
+        name: name.clone(),
         namespace,
         relid,
         oid,
         attnums,
     });
-    Ok(())
+    // recordDependencyOnSingleRelExpr: what the expressions refer to
+    // beyond the table (whose columns are dropped with the statistics,
+    // drop_column_statistics), and the types they produce (PostgreSQL
+    // 18.7).
+    let mut outside: Vec<super::depend::Reference> = refs
+        .into_iter()
+        .filter(|r| match r {
+            super::depend::Reference::Column(rel, _) => *rel != relid,
+            super::depend::Reference::Object(a) => {
+                !(a.classid == crate::pg_catalog::PG_CLASS_RELID && a.objid.get() == relid.get())
+            }
+            super::depend::Reference::Named(_) => true,
+        })
+        .collect();
+    outside.extend(
+        expr_results
+            .iter()
+            .map(|t| super::depend::Reference::Object(super::depend::ObjectAddress::type_(*t))),
+    );
+    super::depend::record_named(
+        interp,
+        super::depend::NamedObject::Statistics { name, namespace },
+        &outside,
+    )
 }
 
 /// The column a statistics element `(…)` is when its expression is a bare

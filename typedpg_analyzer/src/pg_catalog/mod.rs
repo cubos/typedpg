@@ -327,6 +327,13 @@ pub struct PgCatalog {
     /// created by the migrations run (PG expands them into a call that
     /// leaves the parameters out). Built-in routines aren't listed.
     pub(crate) proc_default_procs: Shared<HashMap<PgProcOid, Vec<PgProcOid>>>,
+    /// Base types the migrations created with a `TYPMOD_IN` function (the
+    /// built-in ones' are modeled in [`crate::typmod`]).
+    pub(crate) types_with_typmodin: Shared<std::collections::HashSet<PgTypeOid>>,
+    /// What objects' stored expressions say about types (see
+    /// [`crate::ddl::depend::ExprTypeUse`]).
+    pub(crate) expr_type_uses:
+        Shared<HashMap<crate::ddl::depend::ObjectAddress, crate::ddl::depend::ExprTypeUse>>,
     /// Seeded `pg_get_functiondef` sources behind `inline_sql_bodies`,
     /// kept so `to_seed` round-trips them.
     sql_function_defs: HashMap<PgProcOid, String>,
@@ -479,6 +486,10 @@ pub struct PgCatalog {
     /// Every column a partitioned table's key reads — as a key column or
     /// inside a key expression (`has_partition_attrs`).
     pub(crate) partition_key_attrs: Shared<HashMap<PgClassOid, Vec<i16>>>,
+    /// Partitioned tables whose key reads the whole row: an expression
+    /// over every column, which has_partition_attrs doesn't count as
+    /// reading any one of them.
+    pub(crate) partition_key_whole_row: Shared<std::collections::HashSet<PgClassOid>>,
     /// Foreign keys' actions, match type, deferrability and parent
     /// (`confupdtype`, ..., `conparentid`).
     pub(crate) fk_details:
@@ -824,6 +835,8 @@ impl PgCatalog {
             finite_param_types: Default::default(),
             simplify_options: Default::default(),
             proc_default_procs: Shared::default(),
+            types_with_typmodin: Shared::default(),
+            expr_type_uses: Shared::default(),
             sql_function_defs: HashMap::new(),
             partition_keys: Shared::default(),
             triggers: Shared::default(),
@@ -870,6 +883,7 @@ impl PgCatalog {
             enums_created_in_transaction: Shared::default(),
             partition_specs: Shared::default(),
             partition_key_attrs: Shared::default(),
+            partition_key_whole_row: Shared::default(),
             fk_details: Shared::default(),
             partition_bounds: Shared::default(),
             check_defs: Shared::default(),
@@ -2137,6 +2151,7 @@ impl PgCatalog {
         self.index_parents.retain(|_, parent| *parent != oid);
         self.partition_specs.remove(&oid);
         self.partition_key_attrs.remove(&oid);
+        self.partition_key_whole_row.remove(&oid);
         self.partition_bounds.remove(&oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname

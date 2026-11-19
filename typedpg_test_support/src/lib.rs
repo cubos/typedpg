@@ -17,8 +17,9 @@
 //! suites sharing a database (the e2e crate) keep their rows apart with
 //! unique keys.
 //!
-//! The image is `pgvector/pgvector:pg18` (the official image plus the
-//! `vector` extension the e2e migrations need), with PGDATA on tmpfs and
+//! The image is pgvector's (the official image plus the `vector` extension
+//! the e2e migrations need) of the PostgreSQL release typedpg targets
+//! (`typedpg_pg_query/POSTGRES_VERSION`), with PGDATA on tmpfs and
 //! TLS on a self-signed certificate (so TLS fallback paths can be tested;
 //! plain connections are still accepted).
 
@@ -30,7 +31,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-const IMAGE: &str = "pgvector/pgvector:pg18";
+/// pgvector 0.8.7's image of PostgreSQL 18.7: a pgvector release's tags
+/// are built once, on the PostgreSQL release of the day, so they stay on
+/// it (`pg18` alone follows every new minor release).
+const IMAGE: &str = "pgvector/pgvector:0.8.7-pg18-trixie";
+/// The PostgreSQL release typedpg targets, which [`IMAGE`] must run.
+const POSTGRES_VERSION: &str = include_str!("../../typedpg_pg_query/POSTGRES_VERSION");
 const USER: &str = "postgres";
 const PASSWORD: &str = "postgres";
 
@@ -186,6 +192,16 @@ fn start_or_reuse() -> PgServer {
         spawn_watchdog(&name);
     }
     wait_ready(&name);
+    // `postgres (PostgreSQL) 18.7 (Debian 18.7-1.pgdg13+2)`.
+    let out = docker(&["exec", &name, "postgres", "--version"]);
+    let version = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        version.split_whitespace().nth(2),
+        Some(POSTGRES_VERSION.trim()),
+        "{IMAGE} runs {version:?}, but typedpg targets PostgreSQL {} \
+         (typedpg_pg_query/POSTGRES_VERSION): pin an image of that release",
+        POSTGRES_VERSION.trim()
+    );
 
     let out = docker(&["port", &name, "5432/tcp"]);
     let mapping = String::from_utf8_lossy(&out.stdout);

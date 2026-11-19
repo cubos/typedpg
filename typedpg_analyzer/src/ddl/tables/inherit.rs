@@ -194,6 +194,19 @@ fn insert_not_null(
     attnum: i16,
     row: NotNullRow,
 ) -> Result<(), DdlError> {
+    // PostgreSQL 18.7: a partitioned table holds no rows of its own, so a
+    // NO INHERIT not-null constraint means nothing there — whichever path
+    // (LIKE INCLUDING ALL among them) stores it.
+    if row.connoinherit
+        && interp
+            .pg_class
+            .get(&relid)
+            .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::Partitioned)
+    {
+        return Err(DdlError::UnsupportedDdl(
+            "not-null constraints on partitioned tables cannot be NO INHERIT".into(),
+        ));
+    }
     let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_constraint(PgConstraint {
         oid,

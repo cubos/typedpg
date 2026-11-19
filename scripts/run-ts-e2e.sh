@@ -28,7 +28,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EXAMPLE="$ROOT/typedpg_ts_example"
-PG_IMAGE="${PG_IMAGE:-postgres:18}"
+# The release typedpg targets.
+PG_IMAGE="${PG_IMAGE:-postgres:$(tr -d '[:space:]' < "$ROOT/typedpg_pg_query/POSTGRES_VERSION")}"
 CONTAINER_NAME="typedpg-ts-e2e-$$"
 
 LOADERS_CACHE="$(mktemp -d)"
