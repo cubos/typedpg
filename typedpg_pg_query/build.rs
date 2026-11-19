@@ -75,9 +75,11 @@ fn main() {
         // links ws2_32 and secur32 for the server's socket and SSPI code,
         // which this crate does not compile.
         println!("cargo:rustc-link-lib=advapi32");
-    } else if !target.contains("apple") {
-        // d2s.c, int8.c and others call libm (floor, rint, ...).  On macOS
-        // and Windows the functions come with the system libc.
+    } else if !target.contains("apple") && !target.contains("musl") {
+        // d2s.c, int8.c and others call libm (floor, rint, ...).  On macOS,
+        // Windows and musl the functions come with the C library itself (and
+        // asking for -lm on a musl target would find the build machine's
+        // glibc libm.a).
         println!("cargo:rustc-link-lib=m");
     }
 
@@ -128,6 +130,12 @@ fn configure(build: &mut cc::Build, target: &str) {
         // signed overflow wraps and differently-typed pointers may alias.
         build.flag_if_supported("-fno-strict-aliasing");
         build.flag_if_supported("-fwrapv");
+        if target.starts_with("aarch64") && target.contains("musl") {
+            // musl-gcc's aarch64 atomics call libgcc's out-of-line helpers
+            // (__aarch64_swp4_sync, ...), which the musl toolchain the
+            // release builds with doesn't link: inline them.
+            build.flag_if_supported("-mno-outline-atomics");
+        }
         if windows {
             // MinGW: defined before <time.h> for localtime_r() and others.
             build.define("WIN32", None);
