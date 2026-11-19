@@ -744,7 +744,7 @@ fn nodetype_messages(schema: &Schema) -> Vec<Message> {
 
 /// The struct backing node tag `nodetype`: the struct itself, or the struct of
 /// the typedef it aliases (with the alias's name).
-fn node_struct(schema: &Schema, nodetype: &str) -> Option<(StructDef, String)> {
+pub(crate) fn node_struct(schema: &Schema, nodetype: &str) -> Option<(StructDef, String)> {
     for group in ["nodes/parsenodes", "nodes/primnodes"] {
         if let Some(struct_def) = schema.struct_def(group, nodetype) {
             return Some((struct_def.clone(), nodetype.to_string()));

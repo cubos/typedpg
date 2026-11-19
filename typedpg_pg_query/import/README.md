@@ -12,11 +12,14 @@ The crate build still uses `libpg_query/`; later phases switch it over to
 
 - A C compiler, GNU make, perl, python3, curl, tar and sha256sum.
 - **bison** and **flex** (PostgreSQL's `configure` and generated parsers need
-  them). They are often not installed system-wide; with Nix, run everything
-  through a shell that provides them:
+  them), plus **bindgen** and **clang** (the Rust bindings of the node structs
+  are generated with `bindgen`, which loads libclang). They are often not
+  installed system-wide; with Nix, run everything through a shell that provides
+  them:
 
   ```sh
-  nix shell nixpkgs#bison nixpkgs#flex -c typedpg_pg_query/import/import.sh
+  nix shell nixpkgs#bison nixpkgs#flex nixpkgs#rust-bindgen nixpkgs#clang \
+    -c typedpg_pg_query/import/import.sh
   ```
 
 - Network access to `https://ftp.postgresql.org/pub/source/` for the first run
@@ -52,7 +55,13 @@ The script:
 7. writes `postgres/typedpg/stubs_functions.c` and `stubs_variables.c` for the
    symbols the compiled code references but the crate does not define
    ([`gen_stubs.sh`](gen_stubs.sh));
-8. fails if any build-machine path (`/tmp/...`, `/home/...`, `/nix/store/...`)
+8. writes `postgres/typedpg/bindings.rs`, the bindgen bindings of the node
+   structs, `List`/`ListCell`/`Bitmapset`, `NodeTag`, the enums the node fields
+   use and the value nodes. Only those types are allowlisted; bindgen pulls in
+   what they reference. The output uses `::core::ffi` types, `consts`-style
+   enums, wrapped unsafe operations and no layout tests or doc comments, and its
+   version banner is stripped so the file is reproducible;
+9. fails if any build-machine path (`/tmp/...`, `/home/...`, `/nix/store/...`)
    leaked into the tree.
 
 Running it twice produces identical trees; this is safe to diff:
@@ -85,8 +94,8 @@ symbol.
   `*.funcs.c` / `*.switch.c`).
 - `postgres/include/`: only the headers the compiled code uses, plus
   [`EXTRA_HEADERS`](EXTRA_HEADERS).
-- `postgres/typedpg/`: `builtin_catalog.c`, `stubs_functions.c` and
-  `stubs_variables.c` (all generated).
+- `postgres/typedpg/`: `builtin_catalog.c`, `stubs_functions.c`,
+  `stubs_variables.c` and `bindings.rs` (all generated).
 
 The hand-written overrides live in [`csrc/pg/`](../csrc/pg): `vars.c`
 (server globals and `typedpg_unavailable`), `server.c` (superuser ACL checks,

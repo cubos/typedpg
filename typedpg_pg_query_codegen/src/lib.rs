@@ -20,6 +20,10 @@
 //!   `equal_ignore` fields) — and the matching key, a string over the same
 //!   fields.
 //!
+//! [`generate_from_headers`] also emits `src/convert.rs`, the conversion of
+//! the C raw parse tree into those types (there is no C tree to convert from
+//! in the `.proto` path).
+//!
 //! The walkers and the equality impls are shared: each entry point first
 //! builds the same intermediate [`Model`] (messages, fields, the `Node`
 //! variants), and the walker/equality generators work on that.
@@ -33,6 +37,7 @@ use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{DescriptorProto, FileDescriptorSet};
 
 pub mod ast;
+pub mod convert;
 pub mod schema;
 
 /// The `typedpg_pg_query` crate directory, next to this one.
@@ -70,7 +75,7 @@ pub fn generate(crate_dir: &Path) -> Vec<(PathBuf, String)> {
 /// the `gram.h` Bison produced for the grammar.
 ///
 /// The returned paths are relative to the `typedpg_pg_query` crate:
-/// `src/protobuf.rs`, `src/node.rs`, `src/equal.rs`.
+/// `src/protobuf.rs`, `src/node.rs`, `src/equal.rs` and `src/convert.rs`.
 pub fn generate_from_headers(include_dir: &Path, gram_h: &Path) -> Vec<(PathBuf, String)> {
     let parsed = schema::Schema::parse(include_dir, gram_h);
     let program = ast::Program::from_schema(&parsed);
@@ -84,6 +89,10 @@ pub fn generate_from_headers(include_dir: &Path, gram_h: &Path) -> Vec<(PathBuf,
         (
             PathBuf::from("src/equal.rs"),
             rustfmt(&equality(&program.model, &ignored, HEADER_FROM_HEADERS)),
+        ),
+        (
+            PathBuf::from("src/convert.rs"),
+            rustfmt(&convert::generate(&parsed, &program)),
         ),
     ]
 }
