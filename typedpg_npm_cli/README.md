@@ -108,7 +108,6 @@ On another platform, build one from source and point `TYPEDPG_BINARY` at
 it:
 
 ```sh
-git submodule update --init    # the parser, libpg_query, is a submodule
 cargo build --release -p typedpg_ts --bin typedpg
 ```
 

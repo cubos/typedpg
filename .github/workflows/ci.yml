@@ -21,8 +21,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -52,8 +50,6 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -72,8 +68,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       # The runtime's pure migration helpers are Rust compiled to wasm.
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -94,8 +88,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       # Keep in sync with `rust-version` in the workspace Cargo.toml.
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
@@ -113,8 +105,6 @@ jobs:
     container: rust:bookworm
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p typedpg_example
 
@@ -124,8 +114,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Packages and builds every published crate on its own, as crates.io

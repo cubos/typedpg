@@ -139,8 +139,14 @@ typedpg_wasm (the same migration helpers, compiled to WebAssembly for typedpg_np
 `typedpg_pg_query/postgres/` from the release named by `POSTGRES_VERSION`
 (see `typedpg_pg_query/import/README.md`; `cargo run -p typedpg_pg_query_codegen`
 regenerates the AST types, walkers and the C-tree converter from the imported
-headers). Nothing is compiled from `libpg_query/` any more; the submodule
-stays only for a later phase to remove.
+headers). Nothing is compiled from libpg_query any more, and the repository no
+longer carries it as a submodule. The imported tree is portable: the
+configure-generated `pg_config.h` ends with `import/pg_config_overrides.h`
+(per-platform defines, documented there), `import/pg_config_os.h` dispatches to
+`port/linux.h`, `port/darwin.h` or `port/win32.h`, and `import/FILES.windows`
+names the sources only the Windows/MSVC build compiles. All seven release
+targets (glibc and musl Linux on x86_64/aarch64, macOS on x86_64/aarch64,
+Windows x64) build the same imported tree.
 
 PL/pgSQL is compiled by PostgreSQL's own compiler (`pl_comp.c`, `pl_gram.c`),
 driven by `csrc/plpgsql/` — libpg_query's two PL/pgSQL files, BSD-3-Clause,

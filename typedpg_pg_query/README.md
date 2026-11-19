@@ -81,8 +81,14 @@ bindings of the node structs. See [`import/README.md`](import/README.md).
 
 `build.rs` compiles `import/FILES`, `postgres/typedpg/*.c`, `csrc/*.c` (the
 catalog bridge), `csrc/pg/*.c` (the hand-written server services and the
-crate's C entry points, `shim.c`) and `csrc/plpgsql/*.c` into the library.
-Nothing outside `postgres/`, `csrc/` and `import/FILES` is compiled.
+crate's C entry points, `shim.c`) and `csrc/plpgsql/*.c` into the library; on
+Windows it adds `import/FILES.windows` (PostgreSQL's `open.c`,
+`win32gettimeofday.c`, `win32pread.c`/`win32pwrite.c`, ...) and the Win32 APIs
+those need. The same imported tree builds for glibc and musl Linux, macOS and
+MSVC: [`import/pg_config_overrides.h`](import/pg_config_overrides.h) corrects
+the configure-generated `pg_config.h` per platform, and
+[`import/pg_config_os.h`](import/pg_config_os.h) selects the target's port
+header. Nothing outside `postgres/`, `csrc/` and `import/FILES*` is compiled.
 
 `cargo run -p typedpg_pg_query_codegen` regenerates the AST, the walkers,
 `equal()` and the C-tree converter from `postgres/include` and

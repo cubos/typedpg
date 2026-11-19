@@ -69,8 +69,10 @@ src/pl/plpgsql/src/pl_gram.c
 src/pl/plpgsql/src/pl_handler.c
 src/pl/plpgsql/src/pl_scanner.c
 src/port/pg_bitutils.c
+src/port/pg_popcount_aarch64.c
 src/port/pg_popcount_avx512.c
 src/port/pgstrcasecmp.c
 src/port/qsort.c
 src/port/snprintf.c
 src/port/strerror.c
+src/port/strlcpy.c

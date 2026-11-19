@@ -23,6 +23,7 @@ include = [
     "/POSTGRES_VERSION",
     "/POSTGRES_SHA256",
     "/import/FILES",
+    "/import/FILES.windows",
     "/csrc/**/*",
     "/postgres/**/*",
     "/README.md",

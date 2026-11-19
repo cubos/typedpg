@@ -44,6 +44,13 @@ fail() {
 	exit 1
 }
 
+# The entries of a list file (FILES, FILES.windows, EXTRA_HEADERS): one per
+# line, `#` starts a comment, blank lines ignored.  Comments may only appear
+# on their own line; no path contains a space.
+list() {
+	sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$1" | grep -v '^$' || true
+}
+
 for tool in bison flex perl python3 gcc make tar curl sha256sum bindgen clang; do
 	command -v "$tool" >/dev/null 2>&1 || fail "missing tool: $tool"
 done
@@ -91,10 +98,13 @@ make -s -C "$src/src/pl/plpgsql/src" \
 
 # --- check the input lists before deleting anything ------------------------
 
-while IFS= read -r f; do
-	[ -n "$f" ] || continue
-	[ -f "$src/$f" ] || fail "FILES entry not found in the release: $f"
-done <"$here/FILES"
+for listfile in FILES FILES.windows; do
+	while IFS= read -r f; do
+		[ -f "$src/$f" ] || fail "$listfile entry not found in the release: $f"
+	done <<EOF
+$(list "$here/$listfile")
+EOF
+done
 
 # --- copy the sources ------------------------------------------------------
 
@@ -104,15 +114,19 @@ mkdir -p "$out/typedpg"
 printf '%s\n' "$version" >"$out/VERSION"
 cp "$src/COPYRIGHT" "$out/COPYRIGHT"
 
-while IFS= read -r f; do
-	[ -n "$f" ] || continue
-	mkdir -p "$out/$(dirname "$f")"
-	cp "$src/$f" "$out/$f"
-done <"$here/FILES"
+for listfile in FILES FILES.windows; do
+	while IFS= read -r f; do
+		mkdir -p "$out/$(dirname "$f")"
+		cp "$src/$f" "$out/$f"
+	done <<EOF
+$(list "$here/$listfile")
+EOF
+done
 
 # Private headers (generated ones included) next to the copied sources:
 # gram.h, kwlist_d.h, the nodes *.funcs.c / *.switch.c, ...
-sed 's|/[^/]*$||' "$here/FILES" | sort -u >"$work/dirs"
+{ list "$here/FILES"; list "$here/FILES.windows"; } |
+	sed 's|/[^/]*$||' | sort -u >"$work/dirs"
 while IFS= read -r d; do
 	mkdir -p "$out/$d"
 	for f in "$src/$d"/*.h "$src/$d"/*.funcs.c "$src/$d"/*.switch.c; do
@@ -122,18 +136,28 @@ while IFS= read -r d; do
 done <"$work/dirs"
 
 # C files the copied sources #include (levenshtein.c, ...).
-while IFS= read -r f; do
-	[ -n "$f" ] || continue
-	d=$(dirname "$f")
-	for i in $(sed -n 's/^#include "\([^"/]*\.c\)"/\1/p' "$src/$f"); do
-		[ -f "$src/$d/$i" ] || fail "$f includes $i, which does not exist"
-		cp "$src/$d/$i" "$out/$d/"
-	done
-done <"$here/FILES"
+for listfile in FILES FILES.windows; do
+	while IFS= read -r f; do
+		d=$(dirname "$f")
+		for i in $(sed -n 's/^#include "\([^"/]*\.c\)"/\1/p' "$src/$f"); do
+			[ -f "$src/$d/$i" ] || fail "$f includes $i, which does not exist"
+			cp "$src/$d/$i" "$out/$d/"
+		done
+	done <<EOF
+$(list "$here/$listfile")
+EOF
+done
 
 # The whole include tree for now; it is trimmed once the dependency lists are
 # known (after the generated C exists).
 cp -RL "$src/src/include" "$out/include"
+
+# Replace configure's platform answers with the portable ones: pg_config.h is
+# the import machine's (x86_64 Linux, glibc 2.44) plus the committed
+# overrides, and pg_config_os.h dispatches to the target's port file instead
+# of holding linux.h's contents.
+cat "$here/pg_config_overrides.h" >>"$out/include/pg_config.h"
+cp "$here/pg_config_os.h" "$out/include/pg_config_os.h"
 
 # --- generated C -----------------------------------------------------------
 
@@ -147,13 +171,21 @@ sh "$here/gen_stubs.sh" >/dev/null
 # --- trim include/ to the headers actually used ----------------------------
 
 say "trimming include/"
-{
-	while IFS= read -r f; do
-		[ -n "$f" ] && printf 'postgres/%s\n' "$f"
-	done <"$here/FILES"
-	find csrc -type f -name '*.c' | sort
-	find postgres/typedpg -type f -name '*.c' | sort
-} >"$work/compile-files"
+# FILES.windows is deliberately absent: its sources only build on Windows and
+# include Windows SDK headers.  Their platform headers are in EXTRA_HEADERS.
+# The paths are relative to the crate, as gcc -MM below prints them.
+(
+	cd "$crate"
+	{
+		while IFS= read -r f; do
+			printf 'postgres/%s\n' "$f"
+		done <<EOF
+$(list "$here/FILES")
+EOF
+		find csrc -type f -name '*.c' | sort
+		find postgres/typedpg -type f -name '*.c' | sort
+	} >"$work/compile-files"
+)
 
 : >"$work/deps"
 (
@@ -170,7 +202,7 @@ say "trimming include/"
 
 tr '\\' ' ' <"$work/deps" | tr ' ' '\n' |
 	sed -n 's|^postgres/include/||p' | grep -v '^$' | sort -u >"$work/needed"
-cat "$here/EXTRA_HEADERS" >>"$work/needed"
+list "$here/EXTRA_HEADERS" >>"$work/needed"
 grep -v '^$' "$work/needed" | sort -u >"$work/needed.sorted"
 mv "$work/needed.sorted" "$work/needed"
 

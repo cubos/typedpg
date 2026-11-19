@@ -1,7 +1,7 @@
-//! Compile PostgreSQL's own sources — the slice `import/FILES` names — the
-//! generated services under `postgres/typedpg/`, and the crate's C entry
-//! points under `csrc/pg/`, and expose the PostgreSQL release they implement
-//! (POSTGRES_VERSION).
+//! Compile PostgreSQL's own sources — the slice `import/FILES` names, plus
+//! `import/FILES.windows` on Windows — the generated services under
+//! `postgres/typedpg/`, and the crate's C entry points under `csrc/`, and
+//! expose the PostgreSQL release they implement (POSTGRES_VERSION).
 
 use std::path::{Path, PathBuf};
 
@@ -10,19 +10,35 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=csrc");
     println!("cargo:rerun-if-changed=import/FILES");
+    println!("cargo:rerun-if-changed=import/FILES.windows");
     println!("cargo:rerun-if-changed=POSTGRES_VERSION");
     println!("cargo:rerun-if-changed=postgres/src");
     println!("cargo:rerun-if-changed=postgres/include");
     println!("cargo:rerun-if-changed=postgres/typedpg");
 
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let windows = target.contains("windows");
+
     let include = postgres.join("include");
     let parser = postgres.join("src/backend/parser");
     let plpgsql = postgres.join("src/pl/plpgsql/src");
 
-    let mut pg_sources = Vec::new();
-    let files = std::fs::read_to_string("import/FILES").expect("reading import/FILES");
-    for file in files.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        pg_sources.push(postgres.join(file));
+    let mut pg_sources = source_list(&postgres, "import/FILES");
+    if libc_declares_strlcpy(&include, &target) {
+        // postgres/src/port/strlcpy.c is only compiled by PostgreSQL where
+        // the C library does not provide strlcpy (glibc < 2.38, Windows).
+        // Where it does, compiling OpenBSD's definition anyway breaks under
+        // libcs that make strlcpy a macro (<string.h> with _FORTIFY_SOURCE,
+        // as macOS builds sometimes do), so decide with the same macro
+        // port.h uses: HAVE_DECL_STRLCPY, as the target compiler sees it.
+        pg_sources.retain(|source| source != &postgres.join("src/port/strlcpy.c"));
+    }
+    if windows {
+        // Windows-only sources (see import/FILES.windows): open.c,
+        // win32error.c, win32ntdll.c, win32gettimeofday.c and
+        // win32pread.c/win32pwrite.c, with the Win32 APIs the other targets
+        // get from their libc.
+        pg_sources.extend(source_list(&postgres, "import/FILES.windows"));
     }
     pg_sources.extend(c_sources(&postgres.join("typedpg")));
 
@@ -32,25 +48,11 @@ fn main() {
         .include(&include)
         .include(&parser)
         .include(&plpgsql)
-        // PostgreSQL's C is written for C11 with GCC extensions.
-        .std("gnu11")
-        // What PostgreSQL's configure and libpg_query both compile with:
-        // signed overflow wraps and differently-typed pointers may alias.
-        .flag_if_supported("-fno-strict-aliasing")
-        .flag_if_supported("-fwrapv");
-    let target = std::env::var("TARGET").unwrap_or_default();
-    if target.contains("linux") {
-        build.define("_GNU_SOURCE", None);
-    }
-    // The imported sources call the C library's math functions (d2s, int8).
-    if !target.contains("windows") {
-        println!("cargo:rustc-link-lib=m");
-    }
-    // PostgreSQL's own warnings are its maintainers' concern.
-    build.warnings(false);
+        .warnings(false);
+    configure(&mut build, &target);
     build.compile("typedpg_postgres");
 
-    // The crate's entry points are ours: compile them with warnings on.
+    // The crate's entry points are ours: compile them with the same flags.
     let mut shim_sources = c_sources(Path::new("csrc"));
     shim_sources.extend(c_sources(&Path::new("csrc").join("pg")));
     shim_sources.extend(c_sources(&Path::new("csrc").join("plpgsql")));
@@ -60,15 +62,24 @@ fn main() {
         .include(&parser)
         .include(&plpgsql)
         .include("csrc")
-        .std("gnu11")
-        .flag_if_supported("-fno-strict-aliasing")
-        .flag_if_supported("-fwrapv")
-        // PostgreSQL's headers warn under -Wall as much as its sources.
         .warnings(false);
-    if target.contains("linux") {
-        shim.define("_GNU_SOURCE", None);
-    }
+    configure(&mut shim, &target);
     shim.compile("typedpg_shim");
+
+    // What the imported sources call in the C library or the OS.
+    if windows {
+        // elog.c's Windows event log: RegisterEventSource() and
+        // ReportEvent()/ReportEventW() (advapi32).  Everything else the
+        // imported sources call (CreateFile, LoadLibrary, GetACP, ...) is in
+        // kernel32, which Rust links already.  PostgreSQL's meson.build also
+        // links ws2_32 and secur32 for the server's socket and SSPI code,
+        // which this crate does not compile.
+        println!("cargo:rustc-link-lib=advapi32");
+    } else if !target.contains("apple") {
+        // d2s.c, int8.c and others call libm (floor, rint, ...).  On macOS
+        // and Windows the functions come with the system libc.
+        println!("cargo:rustc-link-lib=m");
+    }
 
     let postgres_version =
         std::fs::read_to_string("POSTGRES_VERSION").expect("reading POSTGRES_VERSION");
@@ -87,6 +98,107 @@ fn main() {
         ),
     )
     .expect("writing version.rs");
+}
+
+/// The C compiler flags every target needs, per compiler and OS.
+fn configure(build: &mut cc::Build, target: &str) {
+    let msvc = target.contains("msvc");
+    let windows = target.contains("windows");
+    if msvc {
+        // PostgreSQL's C99/C11: what meson.build asks cl.exe for.
+        build.std("c11");
+        // What PostgreSQL's meson.build passes to cl.exe, plus the warnings
+        // its CRT otherwise emits for POSIX names (`open`, `strdup`, ...),
+        // which PostgreSQL uses on purpose.
+        for define in [
+            "WIN32",
+            "WINDOWS",
+            "__WINDOWS__",
+            "__WIN32__",
+            "_CRT_SECURE_NO_DEPRECATE",
+            "_CRT_NONSTDC_NO_DEPRECATE",
+            "_CRT_SECURE_NO_WARNINGS",
+        ] {
+            build.define(define, None);
+        }
+    } else {
+        // PostgreSQL's C is written for C11 with GCC extensions.
+        build.std("gnu11");
+        // What PostgreSQL's configure and libpg_query both compile with:
+        // signed overflow wraps and differently-typed pointers may alias.
+        build.flag_if_supported("-fno-strict-aliasing");
+        build.flag_if_supported("-fwrapv");
+        if windows {
+            // MinGW: defined before <time.h> for localtime_r() and others.
+            build.define("WIN32", None);
+            build.define("_POSIX_C_SOURCE", None);
+        }
+    }
+    if target.contains("linux") {
+        // strlcpy/strlcat and the other _GNU_SOURCE declarations; the
+        // imported pg_config.h decides which the libc really has.
+        build.define("_GNU_SOURCE", None);
+    }
+    if windows {
+        // PostgreSQL's stand-ins for the Windows SDK's missing headers
+        // (unistd.h, utime.h, sys/time.h, arpa/inet.h, ...) and the MSVC
+        // replacements (dirent.h, ...).  meson.build adds both directories
+        // the same way.  These live under postgres/include/port/, which is
+        // also the include root PostgreSQL's own sources use.
+        build
+            .include("postgres/include/port/win32")
+            .include("postgres/include/port/win32_msvc");
+    }
+}
+
+/// Whether the target's C library declares strlcpy, i.e. whether port.h's
+/// `#if !HAVE_DECL_STRLCPY` prototype (and PostgreSQL's own build of
+/// src/port/strlcpy.c) is off.
+///
+/// musl, macOS and Windows are fixed; glibc only gained strlcpy in 2.38, so
+/// the version the target compiler will see decides.  It is asked through the
+/// preprocessor, with the same macro port.h tests (the imported pg_config.h
+/// computes it from __GLIBC__), rather than guessed from the target triple.
+fn libc_declares_strlcpy(include: &Path, target: &str) -> bool {
+    if target.contains("windows") {
+        return false;
+    }
+    if target.contains("apple") || target.contains("musl") {
+        return true;
+    }
+    let probe = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR")).join("strlcpy_probe.c");
+    std::fs::write(&probe, "#include \"pg_config.h\"\n").expect("writing the strlcpy probe");
+    let mut build = cc::Build::new();
+    build.include(include);
+    configure(&mut build, target);
+    let Ok(compiler) = build.try_get_compiler() else {
+        return false;
+    };
+    let mut cmd = compiler.to_command();
+    let output = cmd
+        .arg("-E")
+        .arg("-dM")
+        .arg("-I")
+        .arg(include)
+        .arg(&probe)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim_end() == "#define HAVE_DECL_STRLCPY 1")
+}
+
+/// The entries of one of import/'s source lists, at their postgres/ path.
+fn source_list(postgres: &Path, list: &str) -> Vec<PathBuf> {
+    let text = std::fs::read_to_string(list).unwrap_or_else(|e| panic!("reading {list}: {e}"));
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .filter(|line| !line.is_empty())
+        .map(|file| postgres.join(file))
+        .collect()
 }
 
 /// The `.c` files of a directory, sorted.

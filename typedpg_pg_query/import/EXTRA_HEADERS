@@ -17,3 +17,37 @@ commands/vacuum.h
 storage/block.h
 access/sdir.h
 mb/pg_wchar.h
+
+# The headers no Linux x86_64 compile can reach: the other platforms'
+# pg_config_os.h files, the atomics backends of the other architectures and
+# compilers, and PostgreSQL's stand-ins for the Windows system headers.  The
+# import's `gcc -MM` trim is the source of the list above; these are the
+# platform-conditional includes that trim cannot see.  (Comment lines are
+# skipped by import.sh.)
+port/linux.h
+port/darwin.h
+port/win32.h
+port/win32_port.h
+port/win32ntdll.h
+port/atomics/arch-arm.h
+port/atomics/arch-ppc.h
+port/atomics/generic-msvc.h
+port/atomics/generic-sunpro.h
+port/win32/arpa/inet.h
+port/win32/dlfcn.h
+port/win32/grp.h
+port/win32/netdb.h
+port/win32/netinet/in.h
+port/win32/netinet/tcp.h
+port/win32/pwd.h
+port/win32/sys/resource.h
+port/win32/sys/select.h
+port/win32/sys/socket.h
+port/win32/sys/un.h
+port/win32/sys/wait.h
+port/win32_msvc/dirent.h
+port/win32_msvc/sys/file.h
+port/win32_msvc/sys/param.h
+port/win32_msvc/sys/time.h
+port/win32_msvc/unistd.h
+port/win32_msvc/utime.h

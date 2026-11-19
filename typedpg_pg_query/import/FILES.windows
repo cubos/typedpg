@@ -1,0 +1,23 @@
+# PostgreSQL sources only the Windows target compiles.  import.sh imports
+# them like FILES (they are copied whole and their headers kept); build.rs
+# adds them to the C build only when the target is Windows, because they
+# include Windows SDK headers, which the import machine and the other targets
+# do not have.  Keeping them out of FILES also keeps them out of the header
+# trim's `gcc -MM` run.
+#
+# - open.c: pgwin32_open()/pgwin32_fopen(), which port.h's `open`/`fopen`
+#   macros select on Windows (elog.c opens its log file through it).
+# - win32error.c: _dosmaperr(), which maps a Win32 error code to errno.
+# - win32ntdll.c: initialize_ntdll() and pg_RtlGetLastNtStatus(), which
+#   open.c uses to tell a deleted-but-not-gone file from a real EACCES.
+# - win32gettimeofday.c: gettimeofday(), which timestamp.c and elog.c call
+#   unconditionally and MSVC does not provide.
+# - win32pread.c, win32pwrite.c: Windows has no pread()/pwrite(); port.h
+#   declares pg_pread()/pg_pwrite() for it, and pg_iovec.h's inline helpers
+#   call them because HAVE_DECL_PREADV/HAVE_DECL_PWRITEV are 0 there.
+src/port/open.c
+src/port/win32error.c
+src/port/win32gettimeofday.c
+src/port/win32ntdll.c
+src/port/win32pread.c
+src/port/win32pwrite.c

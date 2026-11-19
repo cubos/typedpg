@@ -1,22 +1,34 @@
-/* src/include/port/linux.h */
+/*
+ * src/include/pg_config_os.h for typedpg's imported tree.
+ *
+ * PostgreSQL's configure writes this file with the contents of the import
+ * machine's src/include/port/<platform>.h (linux.h here).  The imported tree
+ * must build for several platforms, so import.sh replaces that copy with this
+ * dispatcher; the three files it includes are imported verbatim from the
+ * release (import/EXTRA_HEADERS).
+ *
+ * c.h includes this file before every system header, which is why the
+ * per-platform file must come first: port/win32.h sets _WIN32_WINNT, includes
+ * <crtdefs.h> before its errcode() can collide with PostgreSQL's, and defines
+ * WIN32, which the rest of the tree tests.
+ */
+
+#if defined(_WIN32)
+#include "port/win32.h"
 
 /*
- * As of July 2007, all known versions of the Linux kernel will sometimes
- * return EIDRM for a shmctl() operation when EINVAL is correct (it happens
- * when the low-order 15 bits of the supplied shm ID match the slot number
- * assigned to a newer shmem segment).  We deal with this by assuming that
- * EIDRM means EINVAL in PGSharedMemoryIsInUse().  This is reasonably safe
- * since in fact Linux has no excuse for ever returning EIDRM; it doesn't
- * track removed segments in a way that would allow distinguishing them from
- * private ones.  But someday that code might get upgraded, and we'd have
- * to have a kernel version test here.
+ * typedpg compiles PostgreSQL's sources into a static library inside the
+ * Rust binary, not into a DLL, so PG's own declarations must not become
+ * __declspec(dllimport): a dllimport variable would be referenced through an
+ * __imp_* slot that no import library provides, and the stubs would not link.
+ * libpg_query's pg_config_os.h does the same for its Windows build.
  */
-#define HAVE_LINUX_EIDRM_BUG
+#undef PGDLLIMPORT
+#undef PGDLLEXPORT
 
-/*
- * Set the default wal_sync_method to fdatasync.  With recent Linux versions,
- * xlogdefs.h's normal rules will prefer open_datasync, which (a) doesn't
- * perform better and (b) causes outright failures on ext4 data=journal
- * filesystems, because those don't support O_DIRECT.
- */
-#define PLATFORM_DEFAULT_WAL_SYNC_METHOD	WAL_SYNC_METHOD_FDATASYNC
+#elif defined(__APPLE__)
+#include "port/darwin.h"
+
+#else
+#include "port/linux.h"
+#endif

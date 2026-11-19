@@ -19,6 +19,9 @@
 
 char	   *application_name = NULL;
 char	   *backtrace_functions = NULL;
+/* Read by elog.c's event-log writer on Windows only (guc_tables.c is not
+ * carried). */
+char	   *event_source = NULL;
 bool		ClientAuthInProgress = false;
 int			client_min_messages = NOTICE;
 const char *debug_query_string = NULL;
