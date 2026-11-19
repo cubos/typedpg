@@ -8,3 +8,12 @@ nodes/lockoptions.h
 access/cmptype.h
 parser/scanner.h
 parser/kwlist.h
+nodes/params.h
+access/attnum.h
+c.h
+postgres.h
+postgres_ext.h
+commands/vacuum.h
+storage/block.h
+access/sdir.h
+mb/pg_wchar.h
