@@ -748,7 +748,7 @@ pub struct PgClass {
 /// the same.
 ///
 /// `ev_action` is the SELECT (or DML) AST. PG stores it as `pg_node_tree`;
-/// we keep it as [`SerializedAst`] (protobuf bytes + AstBindings) so
+/// we keep it as [`SerializedAst`] (an AST node + AstBindings) so
 /// dependency renames flow through the same applier the views always
 /// used. `ev_qual` is the rule's WHERE — `None` for views' `_RETURN`
 /// rule.
@@ -768,9 +768,9 @@ pub struct PgRewrite {
     pub(crate) ev_action: SerializedAst,
 }
 
-/// Bundle of a protobuf-encoded `typedpg_pg_query::Node` plus the per-name-slot
-/// binding side-table that resolves every `RangeVar` / `ColumnRef` /
-/// `FuncCall` / `TypeName` in the AST to a catalog OID.
+/// Bundle of a `typedpg_pg_query::Node` plus the per-name-slot binding
+/// side-table that resolves every `RangeVar` / `ColumnRef` / `FuncCall` /
+/// `TypeName` in the AST to a catalog OID.
 ///
 /// Used by [`PgClass::relviewdef`] (the SELECT AST of a view) and — once
 /// `pg_index` lands — by index expressions / predicates, where we also need
@@ -780,11 +780,12 @@ pub struct PgRewrite {
 /// each name-bearing node consumes exactly one [`AstBinding`] entry. RENAME
 /// / SET SCHEMA become no-ops on the AST itself — the OIDs in the bindings
 /// remain valid and the deparser looks up *current* names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct SerializedAst {
-    /// Protobuf-encoded `typedpg_pg_query::Node`. Base64 in JSON.
-    #[serde(with = "serde_base64")]
-    pub ast: Vec<u8>,
+    /// The stored expression or statement. Compact in JSON: postcard bytes,
+    /// in base64, so the seed's stored ASTs stay small.
+    #[serde(with = "serde_compact_ast")]
+    pub ast: typedpg_pg_query::protobuf::Node,
     /// One entry per name slot, walked in lockstep with the AST.
     pub(crate) bindings: Vec<AstBinding>,
 }
@@ -1036,21 +1037,24 @@ pub struct PgDepend {
     pub deptype: DepType,
 }
 
-// ─── Base64 adapter for relviewdef ─────────────────────────────────────────
+// ─── Compact adapter for stored ASTs ───────────────────────────────────────
 
-/// Serde adapter that encodes `Vec<u8>` as a base64 string in JSON while
-/// keeping it as a plain byte buffer in memory. Used by
-/// [`PgClass::relviewdef`] so view ASTs don't blow up the seed JSON.
-mod serde_base64 {
+/// Serde adapter that writes an AST node as postcard bytes in a base64
+/// string, keeping it a plain node in memory. Spelled out as JSON, the seed's
+/// stored rule ASTs would double its size.
+mod serde_compact_ast {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, ser::Error as _};
+    use typedpg_pg_query::protobuf::Node;
 
-    pub fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(node: &Node, ser: S) -> Result<S::Ok, S::Error> {
+        let bytes = postcard::to_allocvec(node).map_err(S::Error::custom)?;
         ser.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Node, D::Error> {
         let s = String::deserialize(de)?;
-        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+        let bytes = STANDARD.decode(&s).map_err(serde::de::Error::custom)?;
+        postcard::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }

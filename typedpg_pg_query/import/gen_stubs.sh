@@ -47,6 +47,10 @@ done <"$work/sources"
 # --- symbols referenced but defined nowhere --------------------------------
 
 nm -g --defined-only "$work"/*.o | awk 'NF == 3 { print $3 }' | sort -u >"$work/defined"
+# Symbols the crate's Rust side defines (src/stack.rs), which the C compiler
+# cannot see.
+printf '%s\n' typedpg_remaining_stack >>"$work/defined"
+sort -u -o "$work/defined" "$work/defined"
 nm -u "$work"/*.o | awk '{ print $NF }' | grep -v ':' | sort -u |
 	comm -23 - "$work/defined" >"$work/undef"
 
@@ -56,7 +60,9 @@ nm -u "$work"/*.o | awk '{ print $NF }' | grep -v ':' | sort -u |
 for s in $(cat "$work/undef"); do
 	printf 'extern char %s; void *p_%s = &%s;\n' "$s" "$s" "$s"
 done >"$work/probe.c"
-if ! gcc -shared -o "$work/probe.so" "$work/probe.c" -Wl,--no-undefined -w 2>"$work/err"; then
+# -lm: the math functions the imported sources use (floor, rint, ...) are
+# libm's, not symbols the crate must stub.
+if ! gcc -shared -o "$work/probe.so" "$work/probe.c" -Wl,--no-undefined -lm -w 2>"$work/err"; then
 	sed -nE "s/.*undefined reference to [\`']([^']*)'.*/\1/p" "$work/err" |
 		sort -u >"$work/missing"
 	[ -s "$work/missing" ] ||

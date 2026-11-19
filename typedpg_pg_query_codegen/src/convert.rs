@@ -114,6 +114,63 @@ const PRELUDE: &str = r#"//! Conversion of PostgreSQL's C raw parse tree into th
 use crate::bindings;
 use crate::protobuf;
 
+/// The deepest message nesting the AST can carry, libpg_query's
+/// `PG_QUERY_PROTOBUF_MAX_DEPTH`: deeper trees could not be encoded to
+/// protobuf (nor decoded back) by the engine this replaces, so they are
+/// refused here too.
+const MAX_DEPTH: usize = 10_000;
+
+thread_local! {
+    /// The message nesting of the conversion in progress. Every `Node`
+    /// wrapper and every message counts one level, as a protobuf encoder
+    /// counts them.
+    static DEPTH: ::core::cell::Cell<usize> = const { ::core::cell::Cell::new(0) };
+    /// Whether [`MAX_DEPTH`] was passed; the conversion then finishes with
+    /// default values and the caller turns this into an error.
+    static TOO_DEEP: ::core::cell::Cell<bool> = const { ::core::cell::Cell::new(false) };
+}
+
+/// Counts one message level for its lifetime.
+struct DepthGuard(());
+
+impl DepthGuard {
+    fn new() -> DepthGuard {
+        DEPTH.with(|depth| {
+            let now = depth.get() + 1;
+            depth.set(now);
+            if now > MAX_DEPTH {
+                TOO_DEEP.with(|flag| flag.set(true));
+            }
+        });
+        DepthGuard(())
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Start a conversion: clears the depth state of a previous one.
+pub(crate) fn begin() {
+    DEPTH.with(|depth| depth.set(0));
+    TOO_DEEP.with(|flag| flag.set(false));
+}
+
+/// Whether the conversion passed [`MAX_DEPTH`].
+pub(crate) fn too_deep() -> bool {
+    TOO_DEEP.with(|flag| flag.get())
+}
+
+/// Run one message's conversion on enough stack: the recursion is as deep as
+/// the tree (up to [`MAX_DEPTH`] levels), so the stack grows in segments as it
+/// goes instead of being reserved up front.
+#[inline(always)]
+fn grow<R>(f: impl FnOnce() -> R) -> R {
+    ::stacker::maybe_grow(64 * 1024, 1024 * 1024, f)
+}
+
 /// A C string as a Rust string; NULL is the empty string (`WRITE_STRING_FIELD`
 /// leaves the default in place).
 ///
@@ -264,6 +321,10 @@ fn emit_node(s: &mut String, program: &Program, schema: &Schema, boxed: &impl Fn
          /// # Safety\n\
          /// `p` must be NULL or point to a live node.\n\
          pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<protobuf::node::Node> {\n\
+         \x20   if too_deep() {\n\
+         \x20       return None;\n\
+         \x20   }\n\
+         \x20   let _depth = DepthGuard::new();\n\
          \x20   if p.is_null() {\n\
          \x20       return None;\n\
          \x20   }\n\
@@ -320,6 +381,7 @@ fn emit_raw_stmts(s: &mut String) {
          /// # Safety\n\
          /// `list` must be NULL or point to a valid `List` of `RawStmt`.\n\
          pub(crate) unsafe fn raw_stmts(list: *const bindings::List) -> ::std::vec::Vec<protobuf::RawStmt> {\n\
+         \x20   begin();\n\
          \x20   let mut out = ::std::vec::Vec::new();\n\
          \x20   if list.is_null() {\n\
          \x20       return out;\n\
@@ -345,6 +407,10 @@ fn emit_value(s: &mut String, message: &Message) {
             let _ = writeln!(
                 s,
                 "pub(crate) unsafe fn {name}(p: *const bindings::Integer) -> protobuf::{ty} {{\n\
+                 \x20   if too_deep() {{\n\
+         \x20       return protobuf::{ty}::default();\n\
+         \x20   }}\n\
+         \x20   let _depth = DepthGuard::new();\n\
                  \x20   let mut out = protobuf::{ty}::default();\n\
                  \x20   out.ival = unsafe {{ (*p).ival as i32 }};\n\
                  \x20   out\n}}\n",
@@ -356,6 +422,10 @@ fn emit_value(s: &mut String, message: &Message) {
             let _ = writeln!(
                 s,
                 "pub(crate) unsafe fn {name}(p: *const bindings::Boolean) -> protobuf::{ty} {{\n\
+                 \x20   if too_deep() {{\n\
+         \x20       return protobuf::{ty}::default();\n\
+         \x20   }}\n\
+         \x20   let _depth = DepthGuard::new();\n\
                  \x20   let mut out = protobuf::{ty}::default();\n\
                  \x20   out.boolval = unsafe {{ (*p).boolval }};\n\
                  \x20   out\n}}\n",
@@ -368,6 +438,10 @@ fn emit_value(s: &mut String, message: &Message) {
             let _ = writeln!(
                 s,
                 "pub(crate) unsafe fn {name}(p: *const bindings::List) -> protobuf::{ty} {{\n\
+                 \x20   if too_deep() {{\n\
+         \x20       return protobuf::{ty}::default();\n\
+         \x20   }}\n\
+         \x20   let _depth = DepthGuard::new();\n\
                  \x20   let mut out = protobuf::{ty}::default();\n\
                  \x20   out.items = unsafe {{ list_items(p as *mut bindings::List) }};\n\
                  \x20   out\n}}\n",
@@ -384,6 +458,10 @@ fn value_string(s: &mut String, message: &Message, c: &str, field: &str) {
     let _ = writeln!(
         s,
         "pub(crate) unsafe fn {name}(p: *const bindings::{c}) -> protobuf::{ty} {{\n\
+         \x20   if too_deep() {{\n\
+         \x20       return protobuf::{ty}::default();\n\
+         \x20   }}\n\
+         \x20   let _depth = DepthGuard::new();\n\
          \x20   let mut out = protobuf::{ty}::default();\n\
          \x20   out.{field} = unsafe {{ c_string((*p).{field}) }};\n\
          \x20   out\n}}\n",
@@ -404,6 +482,10 @@ fn emit_a_const(s: &mut String, message: &Message) {
     let _ = writeln!(
         s,
         "pub(crate) unsafe fn {name}(p: *const bindings::A_Const) -> protobuf::{ty} {{\n\
+         \x20   if too_deep() {{\n\
+         \x20       return protobuf::{ty}::default();\n\
+         \x20   }}\n\
+         \x20   let _depth = DepthGuard::new();\n\
          \x20   let mut out = protobuf::{ty}::default();\n\
          \x20   out.isnull = unsafe {{ (*p).isnull }};\n\
          \x20   out.location = unsafe {{ (*p).location as i32 }};\n\
@@ -486,7 +568,7 @@ fn emit_struct(
     let binding = if body.is_empty() { "let" } else { "let mut" };
     let _ = writeln!(
         s,
-        "    {binding} out = protobuf::{ty}::default();\n{body}    out\n}}\n"
+        "    if too_deep() {{\n        return protobuf::{ty}::default();\n    }}\n    let _depth = DepthGuard::new();\n    grow(|| {{\n    {binding} out = protobuf::{ty}::default();\n{body}    out\n    }})\n}}\n"
     );
 }
 
@@ -514,7 +596,6 @@ fn conversion_expr(
         FieldType::I64 => format!("{value} as i64"),
         FieldType::U32 => format!("{value} as u32"),
         FieldType::U64 => format!("{value} as u64"),
-        FieldType::F32 => format!("{value} as f32"),
         FieldType::F64 => format!("{value} as f64"),
         FieldType::String => {
             if c_type == "char" {

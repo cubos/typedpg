@@ -15,6 +15,8 @@
 #include "pgtime.h"
 #include "utils/guc.h"
 
+#include <stdlib.h>
+
 char	   *application_name = NULL;
 char	   *backtrace_functions = NULL;
 bool		ClientAuthInProgress = false;
@@ -46,3 +48,15 @@ typedpg_unavailable(const char *name)
 bool		check_function_bodies = true;
 ProcessingMode Mode = NormalProcessing;
 int			ParallelWorkerNumber = -1;
+
+/*
+ * proc_exit — what PostgreSQL's error machinery calls for a FATAL error.
+ * Without a server there is nothing to clean up, and re-entering the error
+ * machinery (what the generated stub would do with its ERROR) would recurse
+ * until the stack is gone.  Leave the process instead.
+ */
+void
+proc_exit(int code)
+{
+	exit(code);
+}

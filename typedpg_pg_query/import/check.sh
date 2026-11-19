@@ -25,6 +25,12 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 	find "$pg/typedpg" -type f -name '*.c' | sort
 } >"$work/sources"
 
+# Symbols the crate's Rust side defines (src/stack.rs); this check has no
+# Rust, so stand in for it.
+printf '#include <stddef.h>\nsize_t typedpg_remaining_stack(void) { return 0; }\n' \
+	>"$work/rust_symbols.c"
+printf '%s\n' "$work/rust_symbols.c" >>"$work/sources"
+
 # Same flags the crate compiles with (see phase 1 build), no optimisation, so
 # the symbol set is the one gen_stubs.sh saw.
 CF="-std=gnu11 -D_GNU_SOURCE -fno-strict-aliasing -fwrapv -fPIC -w

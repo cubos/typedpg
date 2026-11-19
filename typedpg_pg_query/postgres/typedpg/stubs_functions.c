@@ -125,7 +125,6 @@ void extractNotNullColumn(void) { typedpg_unavailable("extractNotNullColumn"); }
 void fetch_finfo_record(void) { typedpg_unavailable("fetch_finfo_record"); }
 void find_rendezvous_variable(void) { typedpg_unavailable("find_rendezvous_variable"); }
 void flatten_group_exprs(void) { typedpg_unavailable("flatten_group_exprs"); }
-void floor(void) { typedpg_unavailable("floor"); }
 void fmgr_info(void) { typedpg_unavailable("fmgr_info"); }
 void fmgr_info_cxt(void) { typedpg_unavailable("fmgr_info_cxt"); }
 void fmgr_internal_function(void) { typedpg_unavailable("fmgr_internal_function"); }
@@ -223,7 +222,6 @@ void pq_sendbytes(void) { typedpg_unavailable("pq_sendbytes"); }
 void pq_sendstring(void) { typedpg_unavailable("pq_sendstring"); }
 void pq_sendtext(void) { typedpg_unavailable("pq_sendtext"); }
 void prepare_sql_fn_parse_info(void) { typedpg_unavailable("prepare_sql_fn_parse_info"); }
-void proc_exit(void) { typedpg_unavailable("proc_exit"); }
 void pull_varnos(void) { typedpg_unavailable("pull_varnos"); }
 void quote_literal_cstr(void) { typedpg_unavailable("quote_literal_cstr"); }
 void recordDependencyOnCurrentExtension(void) { typedpg_unavailable("recordDependencyOnCurrentExtension"); }
@@ -234,7 +232,6 @@ void record_object_address_dependencies(void) { typedpg_unavailable("record_obje
 void relation_close(void) { typedpg_unavailable("relation_close"); }
 void relation_open(void) { typedpg_unavailable("relation_open"); }
 void relation_openrv(void) { typedpg_unavailable("relation_openrv"); }
-void rint(void) { typedpg_unavailable("rint"); }
 void sql_fn_parser_setup(void) { typedpg_unavailable("sql_fn_parser_setup"); }
 void ssup_datum_unsigned_cmp(void) { typedpg_unavailable("ssup_datum_unsigned_cmp"); }
 void strtoint(void) { typedpg_unavailable("strtoint"); }

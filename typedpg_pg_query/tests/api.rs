@@ -1,4 +1,4 @@
-//! The binding's API against the vendored libpg_query.
+//! The binding's API against PostgreSQL's own parser.
 
 use typedpg_pg_query::{NodeEnum, NodeRef, protobuf};
 

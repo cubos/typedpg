@@ -18,7 +18,7 @@ fn assert_int4(db: &PgCatalog, sql: &str) {
 
 #[test]
 fn long_operator_chains() {
-    // 47 terms already went past prost's decoding limit (100 levels).
+    // 47 terms went past the protobuf decoder's old 100-level limit.
     assert_int4(&setup(), &format!("SELECT 1{} AS v", " + 1".repeat(2000)));
 }
 

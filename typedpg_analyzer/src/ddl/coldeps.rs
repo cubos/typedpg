@@ -201,7 +201,7 @@ fn select_of(exprs: &[&Node], from: Vec<Node>) -> Node {
         node: Some(node::Node::SelectStmt(Box::new(protobuf::SelectStmt {
             target_list: exprs.iter().map(|e| target(e)).collect(),
             from_clause: from,
-            limit_option: protobuf::LimitOption::Default as i32,
+            limit_option: protobuf::LimitOption::Count as i32,
             op: protobuf::SetOperation::SetopNone as i32,
             ..Default::default()
         }))),

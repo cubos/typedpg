@@ -1,30 +1,31 @@
-//! PostgreSQL parser bindings for typedpg, built on
-//! [libpg_query](https://github.com/pganalyze/libpg_query): the server's own
-//! grammar, extracted into a library, with the parse tree handed over as
-//! protobuf.
+//! PostgreSQL parser bindings for typedpg, built on PostgreSQL's own,
+//! unmodified sources: the parser, the grammar and the scanner of the release
+//! named by [`PG_VERSION`].
 //!
-//! - [`parse`] / [`scan`] / [`parse_plpgsql`] call into the C library;
-//! - [`protobuf`] holds the AST types, generated from libpg_query's
-//!   `pg_query.proto`;
+//! - [`parse`] / [`parse_type_name`] / [`scan`] call into the C parser;
+//! - [`protobuf`] holds the AST types, generated from PostgreSQL's headers
+//!   (the name is historical: they are plain Rust records, not protobuf);
 //! - [`NodeRef`] / [`NodeMut`] view a node by kind, and `nodes()` /
 //!   `nodes_mut()` list a tree's nodes.
 //!
-//! The PostgreSQL release the parser implements is [`PG_VERSION`]. The
-//! generated modules are produced by `typedpg_pg_query_codegen`; see the
-//! crate README for moving to a new release.
+//! The generated modules are produced by `typedpg_pg_query_codegen`; see the
+//! crate README for how the sources are imported and regenerated.
+//!
+//! PL/pgSQL compilation is not available yet: [`parse_plpgsql`] and
+//! [`parse_plpgsql_with_catalog`] return an error saying so.
 
+mod bindings;
 mod catalog;
+mod convert;
 mod equal;
-mod ffi;
 mod node;
 #[allow(clippy::all, missing_docs)]
 pub mod protobuf;
 mod stack;
 
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString};
-
-use prost::Message;
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::sync::Mutex;
 
 pub use catalog::{Catalog, CatalogAttribute, CatalogType};
 pub use equal::Equal;
@@ -40,9 +41,6 @@ pub enum Error {
     /// The input contains a NUL byte, which C strings can't carry.
     #[error("Invalid statement format: {0}")]
     Conversion(#[from] std::ffi::NulError),
-    /// The protobuf the library returned didn't decode.
-    #[error("Error decoding result: {0}")]
-    Decode(#[from] prost::DecodeError),
     /// PostgreSQL's parser rejected the input; the message is the server's.
     #[error("Invalid statement: {message}")]
     Parse {
@@ -78,6 +76,55 @@ pub struct ParseResult {
     pub stderr: String,
 }
 
+/// The parser's globals are process-wide: one call at a time.
+static LOCK: Mutex<()> = Mutex::new(());
+
+/// `ShimError` in csrc/pg/shim.c.
+#[repr(C)]
+struct ShimError {
+    message: *mut c_char,
+    funcname: *mut c_char,
+    filename: *mut c_char,
+    lineno: c_int,
+    cursorpos: c_int,
+}
+
+/// `ShimParseResult` in csrc/pg/shim.c.
+#[repr(C)]
+struct ShimParseResult {
+    /// The `List *` of `RawStmt` (in `context`).
+    tree: *mut c_void,
+    /// WARNING/NOTICE text, malloc'd.
+    notices: *mut c_char,
+    error: *mut ShimError,
+    /// The `MemoryContext` the tree lives in.
+    context: *mut c_void,
+}
+
+/// `ShimToken` in csrc/pg/shim.c.
+#[repr(C)]
+struct ShimToken {
+    start: i32,
+    end: i32,
+    token: i32,
+    keyword_kind: i32,
+}
+
+/// `ShimScanResult` in csrc/pg/shim.c.
+#[repr(C)]
+struct ShimScanResult {
+    tokens: *mut ShimToken,
+    ntokens: c_int,
+    error: *mut ShimError,
+}
+
+unsafe extern "C" {
+    fn shim_parse(sql: *const c_char, mode: c_int) -> ShimParseResult;
+    fn shim_finish(result: ShimParseResult);
+    fn shim_scan(sql: *const c_char) -> ShimScanResult;
+    fn shim_scan_free(result: ShimScanResult);
+}
+
 impl Error {
     /// A [`Error::Parse`] without a position.
     fn parse_message(message: impl Into<String>) -> Self {
@@ -89,29 +136,42 @@ impl Error {
     }
 }
 
-/// The message of a libpg_query error.
-///
-/// # Safety
-/// `error` must be a live `PgQueryError`.
-unsafe fn error_message(error: *const ffi::PgQueryError) -> String {
-    unsafe { CStr::from_ptr((*error).message) }
-        .to_string_lossy()
-        .into_owned()
+/// The error a tree too deep for the AST is refused with: the same message
+/// (and SQLSTATE, 54001, which the analyzer maps it to) PostgreSQL's
+/// `check_stack_depth` raises.
+fn stack_depth_error() -> Error {
+    Error::Parse {
+        message: "stack depth limit exceeded".into(),
+        position: None,
+        funcname: Some("check_stack_depth".into()),
+    }
 }
 
-/// A libpg_query error as an [`Error::Parse`], its position converted to a
-/// byte offset into `input`.
-///
-/// libpg_query's `cursorpos` is PG's `errposition`: a 1-based *character*
-/// index (`pg_mbstrlen_with_len(scanbuf, location) + 1` in
-/// `scanner_errposition`), 0 when the error has none.
+/// A malloc'd C string as a Rust string; NULL is empty.
 ///
 /// # Safety
-/// `error` must be a live `PgQueryError`.
-unsafe fn parse_error(error: *const ffi::PgQueryError, input: &str) -> Error {
-    let message = unsafe { error_message(error) };
-    let cursorpos = unsafe { (*error).cursorpos };
-    let position = usize::try_from(cursorpos)
+/// `p` must be NULL or point to a NUL-terminated string.
+unsafe fn take_string(p: *mut c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+}
+
+/// A shim error as an [`Error::Parse`], its position converted to a byte
+/// offset into `input`.
+///
+/// PG's `cursorpos` is its `errposition`: a 1-based *character* index
+/// (`pg_mbstrlen_with_len(scanbuf, location) + 1` in `scanner_errposition`),
+/// 0 when the error has none.
+///
+/// # Safety
+/// `error` must be a live `ShimError`.
+unsafe fn parse_error(error: *const ShimError, input: &str) -> Error {
+    let error = unsafe { &*error };
+    let message = unsafe { take_string(error.message) };
+    let position = usize::try_from(error.cursorpos)
         .ok()
         .and_then(|pos| pos.checked_sub(1))
         .map(|chars| {
@@ -120,12 +180,7 @@ unsafe fn parse_error(error: *const ffi::PgQueryError, input: &str) -> Error {
                 .nth(chars)
                 .map_or(input.len(), |(byte, _)| byte)
         });
-    let funcname = unsafe { (*error).funcname };
-    let funcname = (!funcname.is_null()).then(|| {
-        unsafe { CStr::from_ptr(funcname) }
-            .to_string_lossy()
-            .into_owned()
-    });
+    let funcname = (!error.funcname.is_null()).then(|| unsafe { take_string(error.funcname) });
     Error::Parse {
         message,
         position,
@@ -138,8 +193,8 @@ pub fn parse(sql: &str) -> Result<ParseResult> {
     parse_with_options(sql, 0)
 }
 
-/// libpg_query's `PG_QUERY_PARSE_TYPE_NAME` mode.
-const PARSE_TYPE_NAME: std::ffi::c_int = 1;
+/// PostgreSQL's `RAW_PARSE_TYPE_NAME` mode.
+const PARSE_TYPE_NAME: c_int = 1;
 
 /// Parse `text` as a lone type name — PG's `raw_parser` in
 /// `RAW_PARSE_TYPE_NAME` mode, what `parseTypeString` (`'…'::regtype`,
@@ -149,75 +204,145 @@ pub fn parse_type_name(text: &str) -> Result<ParseResult> {
     parse_with_options(text, PARSE_TYPE_NAME)
 }
 
-fn parse_with_options(sql: &str, options: std::ffi::c_int) -> Result<ParseResult> {
-    stack::with_stack(|| parse_with_options_here(sql, options))
-}
-
-fn parse_with_options_here(sql: &str, options: std::ffi::c_int) -> Result<ParseResult> {
+fn parse_with_options(sql: &str, mode: c_int) -> Result<ParseResult> {
     let input = CString::new(sql)?;
-    let result = unsafe { ffi::pg_query_parse_protobuf_opts(input.as_ptr(), options) };
-    let parsed = if result.error.is_null() {
-        let data = unsafe {
-            std::slice::from_raw_parts(result.parse_tree.data as *const u8, result.parse_tree.len)
-        };
-        let stderr = if result.stderr_buffer.is_null() {
-            String::new()
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stack::with_stack(|| {
+        let result = unsafe { shim_parse(input.as_ptr(), mode) };
+        let parsed = if result.error.is_null() {
+            // The tree lives in the call's context: convert it before
+            // shim_finish deletes that.
+            let stmts = unsafe { convert::raw_stmts(result.tree as *const bindings::List) };
+            if convert::too_deep() {
+                Err(stack_depth_error())
+            } else {
+                Ok(ParseResult {
+                    protobuf: protobuf::ParseResult {
+                        version: PG_VERSION_NUM,
+                        stmts,
+                    },
+                    stderr: unsafe { take_string(result.notices) },
+                })
+            }
         } else {
-            unsafe { CStr::from_ptr(result.stderr_buffer) }
-                .to_string_lossy()
-                .into_owned()
+            Err(unsafe { parse_error(result.error, sql) })
         };
-        protobuf::ParseResult::decode(data)
-            .map(|protobuf| ParseResult { protobuf, stderr })
-            .map_err(Error::Decode)
-    } else {
-        Err(unsafe { parse_error(result.error, sql) })
-    };
-    unsafe { ffi::pg_query_free_protobuf_parse_result(result) };
-    parsed
+        unsafe { shim_finish(result) };
+        parsed
+    })
 }
 
 /// Split `sql` into PostgreSQL's lexical tokens.
 pub fn scan(sql: &str) -> Result<protobuf::ScanResult> {
-    stack::with_stack(|| scan_here(sql))
-}
-
-fn scan_here(sql: &str) -> Result<protobuf::ScanResult> {
     let input = CString::new(sql)?;
-    let result = unsafe { ffi::pg_query_scan(input.as_ptr()) };
-    let scanned = if result.error.is_null() {
-        let data =
-            unsafe { std::slice::from_raw_parts(result.pbuf.data as *const u8, result.pbuf.len) };
-        protobuf::ScanResult::decode(data).map_err(Error::Decode)
-    } else {
-        Err(Error::Scan(unsafe { error_message(result.error) }))
-    };
-    unsafe { ffi::pg_query_free_scan_result(result) };
-    scanned
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stack::with_stack(|| {
+        let result = unsafe { shim_scan(input.as_ptr()) };
+        let scanned = if result.error.is_null() {
+            let raw = unsafe {
+                std::slice::from_raw_parts(result.tokens, result.ntokens.max(0) as usize)
+            };
+            let tokens = raw
+                .iter()
+                .map(|t| protobuf::ScanToken {
+                    start: t.start,
+                    end: t.end,
+                    token: t.token,
+                    keyword_kind: t.keyword_kind,
+                })
+                .collect();
+            Ok(protobuf::ScanResult {
+                version: PG_VERSION_NUM,
+                tokens: with_comments(sql, tokens),
+            })
+        } else {
+            Err(Error::Scan(unsafe { take_string((*result.error).message) }))
+        };
+        unsafe { shim_scan_free(result) };
+        scanned
+    })
 }
 
-/// Parse a `CREATE FUNCTION … LANGUAGE plpgsql` statement (or a `DO`
-/// block) with PL/pgSQL's compiler, returning libpg_query's JSON rendering
-/// of it. Without a catalog, the compiler only knows the built-in types:
-/// any other type name is assumed to be a row type (see
-/// [`parse_plpgsql_with_catalog`]).
-pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
-    stack::with_stack(|| parse_plpgsql_here(sql))
+/// PostgresQL's scanner drops comments; libpg_query's returned them as
+/// `SQL_COMMENT` / `C_COMMENT` tokens, and the analyzer relies on that (a
+/// comment hides a `--` that would otherwise run to the end of the line, and
+/// splitting a query must know where comments are). Rebuild them from the
+/// text between the tokens: `--` up to but excluding the newline, and
+/// `/* … */` with its nesting.
+fn with_comments(sql: &str, tokens: Vec<protobuf::ScanToken>) -> Vec<protobuf::ScanToken> {
+    fn comment(token: protobuf::Token, start: usize, end: usize) -> protobuf::ScanToken {
+        protobuf::ScanToken {
+            start: i32::try_from(start).unwrap_or(i32::MAX),
+            end: i32::try_from(end).unwrap_or(i32::MAX),
+            token: token as i32,
+            keyword_kind: protobuf::KeywordKind::NoKeyword as i32,
+        }
+    }
+
+    /// Push the comments of `text` (which starts at `base` in the SQL).
+    fn push_comments(text: &str, base: usize, out: &mut Vec<protobuf::ScanToken>) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                    i += 1;
+                }
+                out.push(comment(protobuf::Token::SqlComment, base + start, base + i));
+            } else if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                let start = i;
+                i += 2;
+                let mut depth = 1usize;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push(comment(protobuf::Token::CComment, base + start, base + i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(tokens.len() + 4);
+    let mut cursor = 0usize;
+    for token in tokens {
+        let start = usize::try_from(token.start)
+            .unwrap_or(0)
+            .min(sql.len())
+            .max(cursor);
+        if let Some(gap) = sql.get(cursor..start) {
+            push_comments(gap, cursor, &mut out);
+        }
+        cursor = usize::try_from(token.end)
+            .unwrap_or(start)
+            .max(cursor)
+            .min(sql.len());
+        out.push(token);
+    }
+    if let Some(gap) = sql.get(cursor..) {
+        push_comments(gap, cursor, &mut out);
+    }
+    out
 }
 
-fn parse_plpgsql_here(sql: &str) -> Result<serde_json::Value> {
-    let input = CString::new(sql)?;
-    let result = unsafe { ffi::pg_query_parse_plpgsql(input.as_ptr()) };
-    let parsed = if result.error.is_null() {
-        let json = unsafe { CStr::from_ptr(result.plpgsql_funcs) }.to_string_lossy();
-        serde_json::from_str(&json).map_err(|e| Error::InvalidJson(e.to_string()))
-    } else {
-        // PL/pgSQL's compiler positions its errors in the function body,
-        // not in `sql`: drop the position rather than misplace it.
-        Err(Error::parse_message(unsafe { error_message(result.error) }))
-    };
-    unsafe { ffi::pg_query_free_plpgsql_parse_result(result) };
-    parsed
+/// Parse a `CREATE FUNCTION … LANGUAGE plpgsql` statement (or a `DO` block)
+/// with PL/pgSQL's compiler, returning its JSON rendering. Without a
+/// catalog, the compiler only knows the built-in types.
+///
+/// Not available yet: this returns an error saying so.
+pub fn parse_plpgsql(_sql: &str) -> Result<serde_json::Value> {
+    Err(Error::parse_message(
+        "PL/pgSQL parsing is not available yet",
+    ))
 }
 
 /// [`parse_plpgsql`], with the compiler resolving types, schemas, relations
@@ -225,9 +350,11 @@ fn parse_plpgsql_here(sql: &str) -> Result<serde_json::Value> {
 /// PostgreSQL would for that catalog (`type "x" does not exist`, `relation
 /// "t" does not exist`, …).
 ///
-/// `catalog` must not call back into this crate.
-pub fn parse_plpgsql_with_catalog(sql: &str, catalog: &dyn Catalog) -> Result<serde_json::Value> {
-    catalog::with_catalog(catalog, || parse_plpgsql(sql))
+/// Not available yet: this returns an error saying so.
+pub fn parse_plpgsql_with_catalog(_sql: &str, _catalog: &dyn Catalog) -> Result<serde_json::Value> {
+    Err(Error::parse_message(
+        "PL/pgSQL parsing is not available yet",
+    ))
 }
 
 /// Every node reachable from `roots`, breadth-first, each with its depth

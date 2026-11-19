@@ -15,7 +15,6 @@
 //!    pg_class entries; dropping the underlying table tears down the
 //!    indexes via `pg_index.indrelid`.
 
-use prost::Message;
 use typedpg_pg_query::protobuf::{IndexStmt, node};
 
 use super::DdlError;
@@ -444,10 +443,7 @@ pub(crate) fn index_attnames(db: &PgCatalog, index: PgClassOid) -> Vec<String> {
         // FigureIndexColname names it (a function's name, a cast's
         // argument, ...; `expr` for an operator and the like).
         let origname = if key == 0 {
-            let expr = exprs.next().and_then(|e| {
-                <typedpg_pg_query::protobuf::Node as Message>::decode(e.ast.as_slice()).ok()
-            });
-            figure_index_colname(expr.as_ref())
+            figure_index_colname(exprs.next().map(|e| &e.ast))
         } else {
             db.attributes_of(index.indrelid)
                 .iter()
@@ -1185,16 +1181,13 @@ pub(crate) fn rebuild_indexes_for_column_type(
     // marks.
     for index in &indexes {
         let reads_column = |ast: &SerializedAst| {
-            <typedpg_pg_query::protobuf::Node as Message>::decode(ast.ast.as_slice())
-                .ok()
-                .and_then(|n| n.node)
-                .is_some_and(|inner| {
-                    inner.nodes().into_iter().any(|(n, ..)| {
-                        matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
-                            if cr.fields.last().and_then(super::util::node_string)
-                                == Some(attr.attname.as_str()))
-                    })
+            ast.ast.node.as_ref().is_some_and(|inner| {
+                inner.nodes().into_iter().any(|(n, ..)| {
+                    matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
+                        if cr.fields.last().and_then(super::util::node_string)
+                            == Some(attr.attname.as_str()))
                 })
+            })
         };
         if index.indkey.contains(&attnum)
             || index.indexprs.iter().any(reads_column)
@@ -1253,12 +1246,10 @@ pub(crate) fn rebuild_indexes_for_column_type(
                 (attr.atttypid, old_type)
             } else if k == 0 {
                 // An expression: re-analyzed when it reads the column.
-                let Some(expr) = exprs.next().and_then(|e| {
-                    <typedpg_pg_query::protobuf::Node as Message>::decode(e.ast.as_slice()).ok()
-                }) else {
+                let Some(expr) = exprs.next() else {
                     continue;
                 };
-                let reads = expr.node.as_ref().is_some_and(|inner| {
+                let reads = expr.ast.node.as_ref().is_some_and(|inner| {
                     inner.nodes().into_iter().any(|(n, ..)| {
                         matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
                             if cr.fields.last().and_then(super::util::node_string)
@@ -1268,7 +1259,7 @@ pub(crate) fn rebuild_indexes_for_column_type(
                 let Some(prior) = key.typ.filter(|_| reads) else {
                     continue;
                 };
-                match super::volatile::infer_over_relation(db, relid, &expr, None) {
+                match super::volatile::infer_over_relation(db, relid, &expr.ast, None) {
                     Some(Ok(t)) => (t.type_oid, prior),
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
                     None => continue,
@@ -1519,14 +1510,12 @@ pub(crate) fn figure_index_colname(expr: Option<&typedpg_pg_query::protobuf::Nod
         .unwrap_or_else(|| "expr".to_owned())
 }
 
-/// Encode a `typedpg_pg_query::Node` as a `SerializedAst` (protobuf bytes + an
-/// empty bindings stream — index expressions don't yet flow through the
-/// view-binding walker; that's a separate piece of work).
+/// Store a `typedpg_pg_query::Node` as a `SerializedAst` (an empty bindings
+/// stream — index expressions don't yet flow through the view-binding walker;
+/// that's a separate piece of work).
 fn serialize_node(node: &typedpg_pg_query::protobuf::Node) -> SerializedAst {
-    let mut buf = Vec::with_capacity(64);
-    node.encode(&mut buf).ok();
     SerializedAst {
-        ast: buf,
+        ast: node.clone(),
         bindings: Vec::<AstBinding>::new(),
     }
 }

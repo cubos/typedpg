@@ -1,14 +1,14 @@
 //! typedpg_core renders identifiers the way PG's `quote_identifier` does,
 //! quoting the keywords that aren't unreserved. Its keyword list must match
-//! the grammar this crate vendors.
+//! the grammar this crate compiles.
 
 #[test]
 fn quote_identifier_quotes_exactly_the_non_unreserved_keywords() {
     let kwlist = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/libpg_query/src/postgres/include/parser/kwlist.h"
+        "/postgres/include/parser/kwlist.h"
     ))
-    .expect("the libpg_query submodule is checked out");
+    .expect("the imported PostgreSQL headers are checked in");
     let mut seen = 0;
     for line in kwlist.lines().filter(|l| l.starts_with("PG_KEYWORD(")) {
         let mut fields = line["PG_KEYWORD(".len()..].split(',').map(str::trim);

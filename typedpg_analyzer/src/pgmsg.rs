@@ -1001,17 +1001,15 @@ pub(crate) fn grammar_error(
         "precision for type float must be less than 54 bits",
         "unrecognized JSON encoding: ",
     ];
-    // A query nested too deep: libpg_query either runs out of the stack
-    // budget it sizes like PG (`check_stack_depth`), or reaches its own
-    // 10,000 levels serializing the tree — deeper than PG with its default
-    // `max_stack_depth` takes anyway (`1 + 1 + …` stops there at 4,995
-    // terms): `stack depth limit exceeded`, SQLSTATE 54001, either way.
+    // A query nested too deep: PostgreSQL's `check_stack_depth`, or the
+    // 10,000 message levels the tree converter (like libpg_query's protobuf
+    // encoder) refuses — deeper than PG with its default `max_stack_depth`
+    // takes anyway (`1 + 1 + …` stops there at 4,995 terms): `stack depth
+    // limit exceeded`, SQLSTATE 54001, either way.
     const STACK_DEPTH: &str = "stack depth limit exceeded";
     let kind = if message == "invalid Unicode escape" && funcname == Some("core_yylex") {
         AnalyzeError::InvalidEscapeSequence(message)
-    } else if message.starts_with(STACK_DEPTH)
-        || message == "parse tree is nested too deeply to serialize to protobuf"
-    {
+    } else if message.starts_with(STACK_DEPTH) {
         AnalyzeError::StatementTooComplex(STACK_DEPTH.to_owned())
     } else if WINDOWING.iter().any(|m| message.starts_with(m)) {
         AnalyzeError::WindowingError(message)

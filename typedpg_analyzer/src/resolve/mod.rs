@@ -1482,8 +1482,7 @@ fn validate_on_conflict_target(
     target_exprs.dedup();
 
     let decode = |ast: &crate::pg_catalog::SerializedAst| -> Option<protobuf::Node> {
-        use prost::Message;
-        protobuf::Node::decode(ast.ast.as_slice()).ok()
+        Some(ast.ast.clone())
     };
 
     let types = predtest::Types {

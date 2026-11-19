@@ -793,7 +793,7 @@ fn check_refill(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
 struct ResolvedView {
     columns: Vec<ResolvedColumn>,
     bindings: Vec<AstBinding>,
-    ast: Vec<u8>,
+    ast: protobuf::Node,
     deps: ViewDeps,
 }
 
@@ -1117,22 +1117,13 @@ fn resolve_view_with_params(
 
     let (bindings, mut deps) = collect_view_bindings_and_deps(query_node, snapshot);
     deps.references = references;
-    let ast = encode_ast(query_node);
 
     Ok(ResolvedView {
         columns,
         bindings,
-        ast,
+        ast: query_node.clone(),
         deps,
     })
-}
-
-/// Encode a single AST node as protobuf bytes.
-fn encode_ast(node: &protobuf::Node) -> Vec<u8> {
-    use prost::Message;
-    let mut buf = Vec::with_capacity(256);
-    node.encode(&mut buf).ok();
-    buf
 }
 
 /// Parse `sql` (typically a synthetic `SELECT …`), pluck out a subnode
@@ -1169,7 +1160,7 @@ fn serialize_subnode_here(
     let mut walker = BindingWalker::default();
     walker.walk(target, snapshot);
     Ok(crate::pg_catalog::SerializedAst {
-        ast: encode_ast(target),
+        ast: target.clone(),
         bindings: walker.bindings,
     })
 }
@@ -2489,7 +2480,6 @@ pub(crate) fn view_query(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
 ) -> Option<protobuf::Node> {
-    use prost::Message;
     let body = interp.view_body(relid)?;
-    protobuf::Node::decode(body.ast.as_slice()).ok()
+    Some(body.ast.clone())
 }

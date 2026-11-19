@@ -29,6 +29,42 @@
 //!   libpg_query gets from its grammar patch and typedpg's scanner
 //!   synthesizes);
 //! - the enum renumbering (a dummy zero value first, then 1, 2, …).
+//!
+//! # How this AST differs from the one libpg_query's `.proto` described
+//!
+//! The crate used to commit the AST `prost-build` produced from libpg_query's
+//! `pg_query.proto`. That file is libpg_query's own view of PostgreSQL's
+//! headers, and it is not quite the headers: it carries some patches and
+//! misses some fields. Generating straight from PostgreSQL 18.7's headers
+//! changes exactly these things, and each is intentional:
+//!
+//! - **Fields libpg_query patches in**, which are gone because no PostgreSQL
+//!   file is patched any more: `DefElem.arg_location`,
+//!   `NotifyStmt.payload_location`, `CreateSubscriptionStmt.conninfo_location`
+//!   and `AlterSubscriptionStmt.conninfo_location`
+//!   (`patches/15_node_string_constant_locations.patch`).
+//! - **A field its stale `.proto` lacks**, which is present because the
+//!   headers declare it: `CreateStatsStmt.owner`. The vendored headers had it
+//!   too, in both 18.6 and 18.7; only libpg_query's generated
+//!   `struct_defs.json` was stale.
+//! - **`LimitOption`**: libpg_query's patch adds a leading
+//!   `LIMIT_OPTION_DEFAULT` enumerator (`patches/05_limit_option_enum_value_default.patch`),
+//!   so its enum is `Default = 1, Count = 2, WithTies = 3`. PostgreSQL's own
+//!   enum starts at `LIMIT_OPTION_COUNT`, so here it is `Count = 1,
+//!   WithTies = 2`, and a statement without `LIMIT` (C value 0) maps to
+//!   `Count` where the old AST said `Default`.
+//! - **`WCOKind`** gained `WCO_VIEW_CONFLICT_CHECK` in PostgreSQL 18.7; the
+//!   old AST, generated from libpg_query's older `.proto`, lacked it.
+//! - **`Token` numbers** shift: the named tokens keep `gram.h`'s numbering
+//!   (two lower than libpg_query's for tokens after `NOT_EQUALS`, since its
+//!   grammar patch inserts `SQL_COMMENT` / `C_COMMENT` in the middle), and
+//!   the two comment tokens are numbered after the highest `gram.h` token
+//!   instead of keeping their old 275/276. Use the variant names, never the
+//!   numbers.
+//!
+//! The generated `Debug` impls reproduce `prost`'s output (including enum
+//! fields by variant name) so trees can still be compared textually with
+//! libpg_query's.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -182,7 +218,7 @@ impl Program {
                 if eq {
                     derives.push_str("Eq, Hash, ");
                 }
-                derives.push_str("Debug");
+                derives.push_str("Debug, serde::Serialize, serde::Deserialize");
                 writeln!(s, "#[derive({derives})]").unwrap();
                 writeln!(s, "pub enum {} {{", oneof.enum_rust).unwrap();
                 for field in members {
@@ -211,6 +247,7 @@ impl Program {
                 }
                 s.push_str("}\n");
                 self.emit_accessors(s, nested);
+                emit_debug(s, nested);
             }
             if message.has_nested {
                 emit_enum(s, &self.context);
@@ -219,6 +256,7 @@ impl Program {
         }
 
         self.emit_accessors(s, message);
+        emit_debug(s, message);
     }
 
     fn emit_accessors(&self, s: &mut String, message: &Message) {
@@ -260,10 +298,16 @@ impl Program {
     }
 
     /// `prost-build`'s derive selection for a message: `Clone, [Copy,]
-    /// PartialEq, [Eq, Hash,]`; `Debug` and `Default` come from the derives
-    /// that used to be `::prost::Message`.
+    /// PartialEq, [Eq, Hash,]`, plus `Default` (which `::prost::Message` used
+    /// to provide) and serde. `Debug` is a hand-written impl ([`emit_debug`]):
+    /// enum fields are `i32`s here, and prost's `Debug` printed them by
+    /// variant name.
     fn derives(&self, rust: &str) -> Vec<String> {
-        let mut out = vec!["Clone".to_string()];
+        let mut out = vec![
+            "Clone".to_string(),
+            "serde::Serialize".to_string(),
+            "serde::Deserialize".to_string(),
+        ];
         if self.is_copy(rust) {
             out.push("Copy".to_string());
         }
@@ -272,7 +316,6 @@ impl Program {
             out.push("Eq".to_string());
             out.push("Hash".to_string());
         }
-        out.push("Debug".to_string());
         out.push("Default".to_string());
         out
     }
@@ -288,7 +331,6 @@ impl Program {
             | FieldType::I64
             | FieldType::U32
             | FieldType::U64
-            | FieldType::F32
             | FieldType::F64
             | FieldType::Enum(_) => !field.repeated,
         }
@@ -298,7 +340,7 @@ impl Program {
         match &field.ty {
             FieldType::Message(ty) => !field.repeated && !self.reaches(ty, owner) && self.is_eq(ty),
             FieldType::Map => false,
-            FieldType::F32 | FieldType::F64 => false,
+            FieldType::F64 => false,
             _ => true,
         }
     }
@@ -954,6 +996,54 @@ fn token_enum(schema: &Schema) -> Enum {
     }
 }
 
+/// A message's `Debug` impl, matching `prost`'s derive: the struct's name,
+/// then its fields in declaration order, with an enum-typed `i32` printed as
+/// its variant name (and as the number when no variant matches).
+fn emit_debug(s: &mut String, message: &Message) {
+    writeln!(s, "impl ::core::fmt::Debug for {} {{", message.rust).unwrap();
+    s.push_str(
+        "fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {\n    \
+         let mut builder = f.debug_struct(\"",
+    );
+    s.push_str(&message.rust);
+    s.push_str("\");\n");
+    for field in message.fields.iter().filter(|f| f.oneof.is_none()) {
+        let name = &field.rust;
+        if let FieldType::Enum(enum_rust) = &field.ty {
+            assert!(
+                !field.repeated,
+                "{} has a repeated enum field {name}, which the Debug generator \
+                 doesn't handle",
+                message.rust
+            );
+            // A local wrapper, so several enum fields in one impl don't clash.
+            writeln!(
+                s,
+                "    {{\n        \
+                 struct EnumField<'a>(&'a i32);\n        \
+                 impl ::core::fmt::Debug for EnumField<'_> {{\n            \
+                 fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {{\n                \
+                 match <{enum_rust} as ::core::convert::TryFrom<i32>>::try_from(*self.0) {{\n                    \
+                 ::core::result::Result::Ok(value) => ::core::fmt::Debug::fmt(&value, f),\n                    \
+                 ::core::result::Result::Err(_) => ::core::fmt::Debug::fmt(self.0, f),\n                \
+                 }}\n            \
+                 }}\n        \
+                 }}\n        \
+                 builder.field(\"{name}\", &EnumField(&self.{name}));\n    \
+                 }}"
+            )
+            .unwrap();
+        } else {
+            writeln!(s, "    builder.field(\"{name}\", &self.{name});").unwrap();
+        }
+    }
+    for oneof in &message.oneofs {
+        let name = &oneof.rust;
+        writeln!(s, "    builder.field(\"{name}\", &self.{name});").unwrap();
+    }
+    s.push_str("builder.finish()\n}\n}\n");
+}
+
 /// `prost_build::ident::strip_enum_prefix` on `to_upper_camel`.
 fn variant_name(enum_rust: &str, proto: &str) -> String {
     let name = proto.to_upper_camel_case();
@@ -994,7 +1084,6 @@ fn rust_type(ty: &FieldType, field: &Field) -> String {
         FieldType::I64 => "i64".to_string(),
         FieldType::U32 => "u32".to_string(),
         FieldType::U64 => "u64".to_string(),
-        FieldType::F32 => "f32".to_string(),
         FieldType::F64 => "f64".to_string(),
         FieldType::String => "::std::string::String".to_string(),
         // Enum fields are stored as their `i32` discriminant (`prost`'s
@@ -1026,7 +1115,10 @@ fn rust_type(ty: &FieldType, field: &Field) -> String {
 }
 
 fn emit_enum(s: &mut String, enum_def: &Enum) {
-    s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\n");
+    s.push_str(
+        "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, \
+         serde::Serialize, serde::Deserialize)]\n",
+    );
     s.push_str("#[repr(i32)]\n");
     writeln!(s, "pub enum {} {{", enum_def.rust).unwrap();
     for value in &enum_def.values {
