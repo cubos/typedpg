@@ -12,7 +12,7 @@ pub(crate) fn reductions(sql: &str) -> Vec<String> {
         return Vec::new();
     };
     // The wrapper `ParseResult` isn't `Clone`, but the inner protobuf message
-    // is — work on it and deparse via the free function.
+    // is — work on it and print it with the fuzzer's printer.
     let proto = parsed.protobuf;
     let mut out = Vec::new();
 
@@ -27,9 +27,7 @@ pub(crate) fn reductions(sql: &str) -> Vec<String> {
             } else {
                 return None;
             }
-            typedpg_pg_query::deparse(&clone)
-                .ok()
-                .map(|s| positional_to_named(&s))
+            printer::print(&clone).map(|s| positional_to_named(&s))
         };
 
         // Drop the last projection (keep at least one).

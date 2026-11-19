@@ -1,10 +1,10 @@
 //! Strategy 2 — AST mutation: parse a seed with typedpg_pg_query, tweak leaf
-//! nodes, deparse back to SQL.
+//! nodes, print the tree back to SQL (`printer`).
 
 use super::*;
 
 // ──────────────────────────────────────────────────────────────────────────
-// Strategy 2 — AST mutation via typedpg_pg_query parse → tweak → deparse.
+// Strategy 2 — AST mutation via typedpg_pg_query parse → tweak → print.
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Seed queries for the AST mutator. Named `$pN` params are welcome: the
@@ -80,8 +80,8 @@ pub(crate) fn str_node(s: &str) -> protobuf::Node {
 }
 
 /// Parse `seed`, mutate exactly `n_edits` leaf nodes in the protobuf tree, and
-/// deparse back to SQL. Returns `None` if parse or deparse fails (some
-/// mutations produce un-deparseable trees — we just skip those).
+/// print it back to SQL. Returns `None` if parsing or printing fails (the
+/// printer refuses trees it can't render faithfully — we just skip those).
 ///
 /// With `n_edits == 1` over a *valid* seed this is the single-fault mode: the
 /// one perturbation is usually the sole reason the query diverges, which
@@ -93,8 +93,8 @@ pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<Strin
 
     // SAFETY: `nodes_mut` hands back raw pointers into `parsed`'s owned
     // protobuf tree. They stay valid because `parsed` outlives this block and
-    // we don't move it; we mutate through them and then deparse. The pointers
-    // carry no lifetime, so the `&mut parsed` borrow ends here and `deparse`
+    // we don't move it; we mutate through them and then print. The pointers
+    // carry no lifetime, so the `&mut parsed` borrow ends here and the printer
     // (an immutable borrow) is free to read the mutated tree afterwards.
     let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.protobuf.nodes_mut() }
         .into_iter()
@@ -109,7 +109,7 @@ pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<Strin
         apply_mutation(nodes[idx], rng);
     }
 
-    parsed.deparse().ok()
+    printer::print(&parsed.protobuf)
 }
 
 /// One mutation on a single node, dispatched on its kind.

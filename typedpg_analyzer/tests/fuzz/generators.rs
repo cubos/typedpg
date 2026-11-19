@@ -238,7 +238,7 @@ pub(crate) fn named_to_positional(sql: &str) -> String {
     })
 }
 
-/// Inverse of [`named_to_positional`]: deparsed/mutated SQL carries `$N`;
+/// Inverse of [`named_to_positional`]: printed/mutated SQL carries `$N`;
 /// the analyzer wants `$pN`.
 pub(crate) fn positional_to_named(sql: &str) -> String {
     rewrite_params(sql, |digits, out| {

@@ -8,7 +8,7 @@ protobuf.
 The crate compiles libpg_query from the `libpg_query/` git submodule (pinned
 to a release tag) and exposes:
 
-- `parse`, `scan`, `deparse` and `parse_plpgsql`;
+- `parse`, `scan` and `parse_plpgsql`;
 - `protobuf`, the AST types, generated from libpg_query's `pg_query.proto`;
 - `NodeRef` / `NodeMut`, a view of a node by kind, and `nodes()` /
   `nodes_mut()`, every node of a tree (breadth-first, with its depth);
