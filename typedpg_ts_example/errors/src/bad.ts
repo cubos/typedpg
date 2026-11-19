@@ -36,6 +36,8 @@ export async function cases() {
   await sql("SELECT id FROM things WHERE span @> $n").fetchAll(pool, { n: 5, extra: 1 });
   // @ts-expect-error: a number for an interval
   await sql("SELECT now() - $d AS t").fetchAll(pool, { d: 5 });
+  // @ts-expect-error: a Date for a date: its day depends on a time zone
+  await sql("SELECT id FROM things WHERE day = $day").fetchAll(pool, { day: new Date() });
   // @ts-expect-error: fetchStream checks its parameters too
   for await (const _ of sql("SELECT id FROM users WHERE id = $id").fetchStream(pool, { id: "x" })) break;
   // @ts-expect-error: COPY into a column that doesn't exist

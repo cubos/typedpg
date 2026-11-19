@@ -11,7 +11,7 @@
   "keywords": ["postgres", "postgresql", "sql", "typescript", "typed", "pg", "esbuild", "vite", "rollup", "webpack"],
   "type": "module",
   "engines": {
-    "node": ">=22.12"
+    "node": ">=26"
   },
   "exports": {
     "./esbuild": {

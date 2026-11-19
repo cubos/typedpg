@@ -17,7 +17,7 @@ import { type Executor, type RawResult, driverFor, unsupported } from "./adapter
 import { stripTrailingJunk } from "./sql.js";
 
 export { DecodeError, emptyRange, range } from "./codec.js";
-export type { Codec, Interval, Range, RangeBound } from "./codec.js";
+export type { Codec, Range, RangeBound } from "./codec.js";
 export type { Driver, Executor, PgQueryable, PostgresJsSql, RawResult } from "./adapters.js";
 export {
   MigrationError,

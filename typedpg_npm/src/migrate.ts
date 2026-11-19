@@ -78,7 +78,7 @@ export interface MigrationSet {
 export interface MigrationStatus {
   readonly name: string;
   readonly applied: boolean;
-  readonly appliedAt: Date | null;
+  readonly appliedAt: Temporal.Instant | null;
   /** Applied, and its statements edited since (comments and whitespace are not). */
   readonly drifted: boolean;
 }
@@ -320,7 +320,7 @@ export async function migrationStatus(executor: Executor, set: MigrationSet): Pr
   return outcome.rows.map((row) => ({
     name: row.name,
     applied: row.applied,
-    appliedAt: row.appliedAt === null ? null : new Date(row.appliedAt),
+    appliedAt: row.appliedAt === null ? null : Temporal.Instant.from(row.appliedAt),
     drifted: row.drifted,
   }));
 }

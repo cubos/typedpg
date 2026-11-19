@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "gen": "cargo run -q --release -p typedpg_ts --bin typedpg -- gen",
-    "typecheck": "tsc -p . && node node_modules/typescript-5/bin/tsc -p .",
+    "typecheck": "tsc -p . && node node_modules/typescript-6/bin/tsc -p .",
     "test": "node --test --test-timeout=300000 src/*.test.ts"
   },
   "dependencies": {
@@ -22,7 +22,7 @@
     "postgres-3": "npm:postgres@^3.4.9",
     "rollup": "^4.68.2",
     "typescript": "^7.0.2",
-    "typescript-5": "npm:typescript@5.9",
+    "typescript-6": "npm:typescript@6.0",
     "typescript-7.1": "npm:typescript@^7.1.0-dev.20261110.1"
   }
 }

@@ -37,8 +37,10 @@ you install as a devDependency (see its
 [reference](https://github.com/cubos/typedpg/blob/main/typedpg_npm_cli/README.md)).
 The command runs a native binary, installed for your platform as an optional
 dependency of the CLI (`@cubos/typedpg-cli-linux-x64-gnu`, `-darwin-arm64`,
-…), so `npm install --prod` never downloads it. Node.js 22.12 or later;
-the Node loader for `.sql` files needs 22.15 or later.
+…), so `npm install --prod` never downloads it. Node.js 26 or later, whose
+`Temporal` dates, times and durations are what date and time columns read
+as, and TypeScript 6.0 or later for its declarations of them (the runtime's
+types reference its `esnext.temporal` lib, so no `lib` setting is needed).
 
 ## Quick start
 
@@ -298,7 +300,7 @@ const rows = await sql("SELECT kind, card_last4, coalesce(card_last4, iban) AS r
 
 // CHECK ((status = 'done') = (done_at IS NOT NULL))
 const tasks = await sql("SELECT done_at FROM tasks WHERE status IN ('done')").fetchAll(pool);
-// tasks: { done_at: Date }[]
+// tasks: { done_at: Temporal.Instant }[]
 ```
 
 Besides strict conditions, a condition that can't be true with a column NULL
@@ -329,8 +331,9 @@ came from.
 
 `to_char` and `EXTRACT` / `date_part` of most fields are NULL for an infinite
 date, timestamp or interval. A value is finite when it is the current time, a
-literal other than `infinity`, a `timestamp` / `timestamptz` parameter (a
-`Date` cannot hold an infinity — unless `types` maps the type), arithmetic,
+literal other than `infinity`, a `date` / `timestamp` / `timestamptz`
+parameter (a Temporal value cannot hold an infinity — unless `types` maps
+the type), arithmetic,
 truncation or a conversion of finite values, the `min` / `max` / `lag` of
 them, or a column whose table (or domain) says `CHECK (isfinite(col))`. It
 follows the value through subqueries, CTEs, `UNION`, `CASE` and `COALESCE`:
@@ -764,7 +767,7 @@ and a loader or bundler plugin gives its module:
 
 | Runtime or bundler | |
 |---|---|
-| Node.js 22.15+ | `node --import @cubos/typedpg/register app.ts` |
+| Node.js | `node --import @cubos/typedpg/register app.ts` |
 | Bun | `bun --preload @cubos/typedpg/bun app.ts` (or `preload` in `bunfig.toml`); `Bun.build({ plugins: [typedpg] })` with `import typedpg from "@cubos/typedpg/bun"` |
 | esbuild | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg-cli/esbuild"` |
 | Vite, vitest, Rollup, Rolldown | `plugins: [typedpg()]`, `import typedpg from "@cubos/typedpg-cli/vite"` (or `/rollup`) |
@@ -856,9 +859,13 @@ as it describes a statement before binding it.
 | `int2`, `int4`, `float4`, `float8`, `oid` | `number` |
 | `int8` | `bigint`; parameters also take `number` and `string` |
 | `numeric` | `string` (exact); parameters also take `number` |
-| `text`, `varchar`, `char`, `uuid`, `date`, `time`, `timetz`, `inet`, `money`, … | `string` |
-| `timestamptz`, `timestamp` | `Date`, parameters too (a `timestamp`, which has no time zone, is read and written as UTC). A `Date` is never `infinity`: `to_char` and `extract` of a parameter are never NULL |
-| `interval` | `Interval` (`{ months, days, microseconds: bigint }`, as PostgreSQL stores it); parameters also take `string` |
+| `text`, `varchar`, `char`, `uuid`, `inet`, `money`, … | `string` |
+| `timestamptz` | `Temporal.Instant`; parameters also take `Temporal.ZonedDateTime` and `Date` (their instant). PostgreSQL stores no zone, only the instant: the offset it prints is the session's `TimeZone`, so keep a zone you need in a column of its own (`at.toZonedDateTimeISO(tz)`) |
+| `timestamp` | `Temporal.PlainDateTime`; not a `Date`, whose wall-clock time depends on a zone (`date.toTemporalInstant().toZonedDateTimeISO(tz).toPlainDateTime()` picks one) |
+| `date` | `Temporal.PlainDate`; not a `Date`, likewise |
+| `time` | `Temporal.PlainTime` |
+| `timetz` | `string`: Temporal has no time of day with an offset |
+| `interval` | `Temporal.Duration`: years and months from its months, days, then hours down to microseconds from its time, as PostgreSQL prints it. A parameter's weeks are 7 days |
 | `json`, `jsonb` | `JsonValue`; parameters take `unknown` (stringified) |
 | `bytea` | `Uint8Array` |
 | enum | the union of its labels: `"draft" \| "published"` |
@@ -872,6 +879,18 @@ as it describes a statement before binding it.
 
 A value the query proves holds one of a few values reads as their literal
 union — see [Values and ranges](#values-and-ranges).
+
+Dates, times and durations are exact to PostgreSQL's microsecond: a
+parameter's nanoseconds are sent too, and PostgreSQL rounds them. A Temporal
+value is never `infinity`, so `to_char` and `extract` of a `date`,
+`timestamp` or `timestamptz` parameter are never NULL; read from the
+database, `infinity` and `-infinity` become the type's latest and earliest
+values (`+275760-09-13` and `-271821-04-20`, a `Date`'s bounds).
+PostgreSQL's ranges go further than Temporal's in places: a `timestamptz` or
+`date` past year 275760, a `time` of `24:00:00`, an infinite `interval`, or
+one whose fields disagree in sign (`1 mon -1 days`, which a Duration can't
+hold) is a `DecodeError` — `justify_interval()` makes an interval's signs
+agree.
 
 In a `json`/`jsonb` parameter, `null` is SQL NULL, not the JSON `null`.
 
@@ -964,6 +983,21 @@ Unknown keys are errors.
   the process has read the key `"\\"`, keys of one escaped character
   (`"\t"`, `"\n"`, …) come back as `"\\"`. typedpg's JSON decoding works
   around it; your own `JSON.parse` calls are affected.
+
+## Upgrading from 0.7
+
+Dates, times and intervals are Temporal's types instead of `Date`, strings
+and `Interval` (see [Types](#types)), which needs Node.js 26 and TypeScript
+6.0:
+
+- a `timestamptz` is a `Temporal.Instant` (`new Date(instant.epochMilliseconds)`
+  for a `Date`; a parameter still takes one), a `timestamp` a
+  `Temporal.PlainDateTime` — no longer a `Date` read and written as UTC;
+- a `date` is a `Temporal.PlainDate` and a `time` a `Temporal.PlainTime`,
+  no longer strings;
+- an `interval` is a `Temporal.Duration`, no longer `{ months, days,
+  microseconds }` or a string; the `Interval` type is gone;
+- `MigrationStatus.appliedAt` is a `Temporal.Instant`.
 
 ## Upgrading to 0.6.0
 

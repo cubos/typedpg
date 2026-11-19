@@ -79,7 +79,8 @@ export const visitorKinds = sql(`
   FROM users WHERE mood <> 'neutral'
 `);
 
-// A timestamp parameter is a Date, never `infinity`: formatting it is never NULL.
+// A timestamptz parameter is a Temporal value, never `infinity`: formatting
+// it is never NULL.
 export const yearOf = sql("SELECT to_char($at::timestamptz, 'YYYY') AS year");
 
 // A jsonb parameter, sent as the JSON text its cast reads.
@@ -105,13 +106,13 @@ export type Checks = [
         visits: bigint;
         avatar: Uint8Array | null;
         home: { street: string | null; number: number | null } | null;
-        created_at: Date;
+        created_at: Temporal.Instant;
       }
     >
   >,
   Expect<Equal<Params<typeof userById>, { id: number }>>,
   Expect<Equal<Row<typeof yearOf>, { year: string }>>,
-  Expect<Equal<Params<typeof yearOf>, { at: Date }>>,
+  Expect<Equal<Params<typeof yearOf>, { at: Temporal.Instant | Temporal.ZonedDateTime | Date }>>,
   Expect<Equal<Row<typeof visitorKinds>, { kind: "new" | "regular"; mood: "happy" | "sad"; two: 2n }>>,
   Expect<Equal<Row<typeof countUsers>, { n: bigint }>>,
   Expect<Equal<Awaited<ReturnType<typeof countUsers.fetchValue>>, bigint>>,

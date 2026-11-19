@@ -26,6 +26,6 @@ export type UserId = number & { readonly __brand: "UserId" };
 export interface Prefs {
   theme: "dark" | "light";
 }
-/** Doesn't: a timestamptz is read as a Date. */
+/** Doesn't: a timestamptz is read as a Temporal.Instant. */
 export type Instant = string;
 export type JsonPath = string;

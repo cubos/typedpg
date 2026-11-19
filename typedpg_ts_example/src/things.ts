@@ -1,19 +1,19 @@
 // Queries over the hard types of migrations/0002_types.sql: domains,
-// enums, composites nested in arrays, ranges, multiranges, intervals,
-// hstore. The type-level checks at the bottom fail tsc if an inferred type
+// enums, composites nested in arrays, ranges, multiranges, dates, times
+// and intervals (Temporal's types), hstore. The type-level checks at the bottom fail tsc if an inferred type
 // is not exactly the expected one.
 
-import type { Interval, Params, Range, Row } from "@cubos/typedpg";
+import type { Params, Range, Row } from "@cubos/typedpg";
 import { copyIn, sql } from "./db.ts";
 import type { Point2 } from "./domains.ts";
 
 export const insertThing = sql(`
   INSERT INTO things (label, email, qty, tags, colors, shape, shape_d, shapes, span, periods,
                       amounts, dates, dur, attrs, big, bigs, nums, flags, blobs, stamps, docs,
-                      day, at_local, clock, id_uuid, addr, money_v, bits, ch)
+                      day, at_local, clock, wall, id_uuid, addr, money_v, bits, ch)
   VALUES ($label, $email, $qty, $tags, $colors, $shape, $shape_d, $shapes, $span, $periods,
           $amounts, $dates, $dur, $attrs, $big, $bigs, $nums, $flags, $blobs, $stamps, $docs,
-          $day, $at_local, $clock, $id_uuid, $addr, $money_v, $bits, $ch)
+          $day, $at_local, $clock, $wall, $id_uuid, $addr, $money_v, $bits, $ch)
   RETURNING id
 `);
 
@@ -30,9 +30,15 @@ export const constructed = sql(`
          '(,5]'::numrange AS unbounded,
          'empty'::int4range AS nothing,
          '{[1,3), [5,7)}'::int4multirange AS multi,
-         interval '1 year 2 mons -3 days 04:05:06.789' AS iv,
-         '"a"=>"1", "b c"=>NULL'::hstore AS h
+         interval '1 year 2 mons 3 days 04:05:06.789' AS iv,
+         '"a"=>"1", "b c"=>NULL'::hstore AS h,
+         'infinity'::date AS forever,
+         '-infinity'::timestamp AS dawn,
+         '23:59:59.999999'::time AS last
 `);
+
+/** A Duration's fields share one sign: this interval's don't. */
+export const mixedInterval = sql("SELECT interval '1 mon -1 days' AS iv");
 
 export const copyThings = copyIn("things (label, tags, colors, shape, span, attrs, big, dur)");
 
@@ -69,21 +75,23 @@ export type Checks = [
         shape_d: Shape | null;
         shapes: (Shape | null)[] | null;
         span: Range<number> | null;
-        periods: Range<Date>[] | null;
+        periods: Range<Temporal.Instant>[] | null;
         amounts: Range<string> | null;
-        dates: Range<string> | null;
-        dur: Interval | null;
+        dates: Range<Temporal.PlainDate> | null;
+        dur: Temporal.Duration | null;
         attrs: Record<string, string | null> | null;
         big: bigint | null;
         bigs: (bigint | null)[] | null;
         nums: (string | null)[] | null;
         flags: (boolean | null)[] | null;
         blobs: (Uint8Array | null)[] | null;
-        stamps: (Date | null)[] | null;
+        stamps: (Temporal.Instant | null)[] | null;
         docs: (import("@cubos/typedpg").JsonValue | null)[] | null;
-        day: string | null;
-        at_local: Date | null;
+        day: Temporal.PlainDate | null;
+        at_local: Temporal.PlainDateTime | null;
+        // Temporal has no time of day with an offset.
         clock: string | null;
+        wall: Temporal.PlainTime | null;
         id_uuid: string | null;
         addr: string | null;
         money_v: string | null;
@@ -94,10 +102,17 @@ export type Checks = [
   >,
   // Parameters take the looser input types.
   Expect<Equal<Params<typeof insertThing>["big"], bigint | number | string | null>>,
-  Expect<Equal<Params<typeof insertThing>["dur"], Interval | string | null>>,
-  // A timestamp is a Date in and out.
-  Expect<Equal<Params<typeof insertThing>["stamps"], readonly (Date | null)[] | null>>,
-  Expect<Equal<Params<typeof insertThing>["at_local"], Date | null>>,
+  Expect<Equal<Params<typeof insertThing>["dur"], Temporal.Duration | null>>,
+  // An instant, a zoned date-time or a Date: its instant.
+  Expect<
+    Equal<
+      Params<typeof insertThing>["stamps"],
+      readonly (Temporal.Instant | Temporal.ZonedDateTime | Date | null)[] | null
+    >
+  >,
+  Expect<Equal<Params<typeof insertThing>["at_local"], Temporal.PlainDateTime | null>>,
+  Expect<Equal<Params<typeof insertThing>["day"], Temporal.PlainDate | null>>,
+  Expect<Equal<Params<typeof insertThing>["wall"], Temporal.PlainTime | null>>,
   // A composite parameter: the fields' input types.
   Expect<
     Equal<
@@ -123,8 +138,11 @@ export type Checks = [
         unbounded: Range<string>;
         nothing: Range<number>;
         multi: Range<number>[];
-        iv: Interval;
+        iv: Temporal.Duration;
         h: Record<string, string | null>;
+        forever: Temporal.PlainDate;
+        dawn: Temporal.PlainDateTime;
+        last: Temporal.PlainTime;
       }
     >
   >,

@@ -73,6 +73,19 @@ export const drivers: [string, (url: string) => Promise<Connection>][] = [
 ];
 
 /** A deterministic PRNG (mulberry32), so a failing fuzz case reproduces. */
+/**
+ * `value` with each Temporal value as `Type:its string`, to compare with
+ * `assert.deepEqual`, which sees no fields on a Temporal value: any two
+ * would be equal.
+ */
+export function plain(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(plain);
+  if (value === null || typeof value !== "object" || value instanceof Uint8Array) return value;
+  const tag = Object.prototype.toString.call(value);
+  if (tag.startsWith("[object Temporal.")) return `${tag.slice(17, -1)}:${String(value)}`;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, plain(v)]));
+}
+
 export function prng(seed: number): () => number {
   let a = seed >>> 0;
   return () => {

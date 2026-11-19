@@ -6,11 +6,11 @@
 #   1. the runtime and the CLI build and their unit tests pass;
 #   2. the example's generated modules are up to date (`typedpg check`);
 #   3. the errors fixture reports exactly errors/expected.stderr;
-#   4. tsc (7 and 5.9) accepts the example: its type-level assertions, and
+#   4. tsc (7 and 6.0) accepts the example: its type-level assertions, and
 #      every `@ts-expect-error` of the errors fixture reporting; and rejects
 #      the types errors/mapping maps PG types to that don't fit them;
 #   5. loaders/, which imports a .sql file itself, type-checks from its
-#      users.d.sql.ts (tsc 7 and 5.9) and from the content mapper alone
+#      users.d.sql.ts (tsc 7 and 6.0) and from the content mapper alone
 #      (tsc 7.1, `--runExternalCode`);
 #   6. the queries, COPY, streams and migrations run on a real PostgreSQL
 #      through node-postgres and postgres.js, and the migrations interoperate
@@ -95,17 +95,17 @@ if [[ "$status" -ne 1 ]]; then
     exit 1
 fi
 
-echo "ts-e2e: tsc 7 and 5.9"
+echo "ts-e2e: tsc 7 and 6.0"
 (cd "$EXAMPLE" && npm run --silent typecheck)
 
 echo "ts-e2e: type mapping checks"
 # The types `types` maps to that don't fit what their PG types are read as
-# fail tsc in the generated module: tsc 7's report is pinned, tsc 5.9 (which
+# fail tsc in the generated module: tsc 7's report is pinned, tsc 6.0 (which
 # words one error differently) must fail at the same places.
 MAPPING="$EXAMPLE/errors/mapping"
 actual=$(cd "$MAPPING" && "$TYPEDPG" gen 2>&1 | grep -v '^\[typedpg\]' || true)
 tsc7=$(cd "$MAPPING" && node ../../node_modules/typescript/bin/tsc -p . || true)
-tsc5=$(cd "$MAPPING" && node ../../node_modules/typescript-5/bin/tsc -p . || true)
+tsc6=$(cd "$MAPPING" && node ../../node_modules/typescript-6/bin/tsc -p . || true)
 if [[ "${BLESS:-}" == 1 ]]; then
     printf '%s\n' "$actual" > "$MAPPING/expected.stderr"
     printf '%s\n' "$tsc7" > "$MAPPING/expected.tsc"
@@ -113,13 +113,13 @@ fi
 diff -u "$MAPPING/expected.stderr" <(printf '%s\n' "$actual")
 diff -u "$MAPPING/expected.tsc" <(printf '%s\n' "$tsc7")
 locations() { grep -o '^src/[^:]*' || true; }
-diff -u <(printf '%s\n' "$tsc7" | locations) <(printf '%s\n' "$tsc5" | locations)
+diff -u <(printf '%s\n' "$tsc7" | locations) <(printf '%s\n' "$tsc6" | locations)
 
-echo "ts-e2e: loaders: .d.sql.ts (tsc 7 and 5.9), content mapper (tsc 7.1)"
+echo "ts-e2e: loaders: .d.sql.ts (tsc 7 and 6.0), content mapper (tsc 7.1)"
 LOADERS="$EXAMPLE/loaders"
 (cd "$LOADERS" && "$TYPEDPG" check)
 (cd "$LOADERS" && node ../node_modules/typescript/bin/tsc -p .)
-(cd "$LOADERS" && node ../node_modules/typescript-5/bin/tsc -p .)
+(cd "$LOADERS" && node ../node_modules/typescript-6/bin/tsc -p .)
 (cd "$LOADERS" && TYPEDPG_BINARY="$TYPEDPG" \
     node ../node_modules/typescript-7.1/bin/tsc -p tsconfig.mapper.json --runExternalCode)
 

@@ -12,7 +12,7 @@ npm install --save-dev @cubos/typedpg-cli
 
 The command runs a native binary, installed for your platform as an optional
 dependency (`@cubos/typedpg-cli-linux-x64-gnu`, `-darwin-arm64`, …), so a
-production install of `@cubos/typedpg` never downloads it. Node.js 22.12 or
+production install of `@cubos/typedpg` never downloads it. Node.js 26 or
 later.
 
 ## Commands
