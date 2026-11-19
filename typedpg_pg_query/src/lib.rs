@@ -11,8 +11,11 @@
 //! The generated modules are produced by `typedpg_pg_query_codegen`; see the
 //! crate README for how the sources are imported and regenerated.
 //!
-//! PL/pgSQL compilation is not available yet: [`parse_plpgsql`] and
-//! [`parse_plpgsql_with_catalog`] return an error saying so.
+//! [`parse_plpgsql`] compiles `DO` blocks and `CREATE FUNCTION … LANGUAGE
+//! plpgsql` statements with PostgreSQL's own PL/pgSQL compiler and returns
+//! the compiled functions as JSON; [`parse_plpgsql_with_catalog`] resolves
+//! their types, schemas and relations against a [`Catalog`] instead of only
+//! the built-in `pg_catalog` rows.
 
 mod bindings;
 mod catalog;
@@ -27,6 +30,7 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::Mutex;
 
+use catalog::CatalogFns;
 pub use catalog::{Catalog, CatalogAttribute, CatalogType};
 pub use equal::Equal;
 pub use node::{NodeMut, NodeRef};
@@ -118,22 +122,23 @@ struct ShimScanResult {
     error: *mut ShimError,
 }
 
+/// `ShimPlpgsqlResult` in csrc/plpgsql/parse_plpgsql.c.
+#[repr(C)]
+struct ShimPlpgsqlResult {
+    /// The JSON array of compiled functions, malloc'd; NULL on error.
+    json: *mut c_char,
+    /// WARNING/NOTICE text, malloc'd.
+    notices: *mut c_char,
+    error: *mut ShimError,
+}
+
 unsafe extern "C" {
     fn shim_parse(sql: *const c_char, mode: c_int) -> ShimParseResult;
     fn shim_finish(result: ShimParseResult);
     fn shim_scan(sql: *const c_char) -> ShimScanResult;
     fn shim_scan_free(result: ShimScanResult);
-}
-
-impl Error {
-    /// A [`Error::Parse`] without a position.
-    fn parse_message(message: impl Into<String>) -> Self {
-        Error::Parse {
-            message: message.into(),
-            position: None,
-            funcname: None,
-        }
-    }
+    fn shim_plpgsql(sql: *const c_char, catalog: *const CatalogFns) -> ShimPlpgsqlResult;
+    fn shim_plpgsql_free(result: ShimPlpgsqlResult);
 }
 
 /// The error a tree too deep for the AST is refused with: the same message
@@ -336,25 +341,39 @@ fn with_comments(sql: &str, tokens: Vec<protobuf::ScanToken>) -> Vec<protobuf::S
 
 /// Parse a `CREATE FUNCTION … LANGUAGE plpgsql` statement (or a `DO` block)
 /// with PL/pgSQL's compiler, returning its JSON rendering. Without a
-/// catalog, the compiler only knows the built-in types.
-///
-/// Not available yet: this returns an error saying so.
-pub fn parse_plpgsql(_sql: &str) -> Result<serde_json::Value> {
-    Err(Error::parse_message(
-        "PL/pgSQL parsing is not available yet",
-    ))
+/// catalog, the compiler only knows the built-in `pg_catalog` types and
+/// schemas — an empty database, where anything else is an error.
+pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
+    let input = CString::new(sql)?;
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stack::with_stack(|| plpgsql_result(&input, std::ptr::null(), sql))
 }
 
 /// [`parse_plpgsql`], with the compiler resolving types, schemas, relations
 /// and columns (`%TYPE`, `%ROWTYPE`) against `catalog` — so it reports what
 /// PostgreSQL would for that catalog (`type "x" does not exist`, `relation
 /// "t" does not exist`, …).
-///
-/// Not available yet: this returns an error saying so.
-pub fn parse_plpgsql_with_catalog(_sql: &str, _catalog: &dyn Catalog) -> Result<serde_json::Value> {
-    Err(Error::parse_message(
-        "PL/pgSQL parsing is not available yet",
-    ))
+pub fn parse_plpgsql_with_catalog(sql: &str, catalog: &dyn Catalog) -> Result<serde_json::Value> {
+    let input = CString::new(sql)?;
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stack::with_stack(|| catalog::with_catalog(catalog, |hooks| plpgsql_result(&input, hooks, sql)))
+}
+
+/// One `shim_plpgsql` call: compile, then parse the JSON or take the error.
+fn plpgsql_result(
+    input: &CString,
+    catalog: *const CatalogFns,
+    sql: &str,
+) -> Result<serde_json::Value> {
+    let result = unsafe { shim_plpgsql(input.as_ptr(), catalog) };
+    let compiled = if result.error.is_null() {
+        let json = unsafe { take_string(result.json) };
+        serde_json::from_str(&json).map_err(|e| Error::InvalidJson(e.to_string()))
+    } else {
+        Err(unsafe { parse_error(result.error, sql) })
+    };
+    unsafe { shim_plpgsql_free(result) };
+    compiled
 }
 
 /// Every node reachable from `roots`, breadth-first, each with its depth

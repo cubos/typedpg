@@ -21,7 +21,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 	while IFS= read -r f; do
 		[ -n "$f" ] && printf '%s\n' "$pg/$f"
 	done <"$here/FILES"
-	find "$crate/csrc/pg" -type f -name '*.c' | sort
+	find "$crate/csrc" -type f -name '*.c' | sort
 	find "$pg/typedpg" -type f -name '*.c' | sort
 } >"$work/sources"
 
@@ -34,7 +34,7 @@ printf '%s\n' "$work/rust_symbols.c" >>"$work/sources"
 # Same flags the crate compiles with (see phase 1 build), no optimisation, so
 # the symbol set is the one gen_stubs.sh saw.
 CF="-std=gnu11 -D_GNU_SOURCE -fno-strict-aliasing -fwrapv -fPIC -w
-	-I$pg/include -I$pg/src/backend/parser -I$pg/src/pl/plpgsql/src"
+	-I$pg/include -I$pg/src/backend/parser -I$pg/src/pl/plpgsql/src -I$crate/csrc"
 
 echo "check.sh: linking $(wc -l <"$work/sources") files"
 # shellcheck disable=SC2046,SC2086 # both lists are newline/space separated

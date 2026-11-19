@@ -82,6 +82,7 @@ say "configuring (no ICU, readline, compression or SSL)"
 
 say "generating headers and parsers"
 make -s -C "$src/src/backend" generated-headers >/dev/null
+make -s -C "$src/src/backend/utils" fmgr-stamp >/dev/null
 make -s -C "$src/src/backend/parser" gram.c scan.c >/dev/null
 make -s -C "$src/src/common" kwlist_d.h >/dev/null
 make -s -C "$src/src/pl/plpgsql/src" \
@@ -150,7 +151,7 @@ say "trimming include/"
 	while IFS= read -r f; do
 		[ -n "$f" ] && printf 'postgres/%s\n' "$f"
 	done <"$here/FILES"
-	find csrc/pg -type f -name '*.c' | sort
+	find csrc -type f -name '*.c' | sort
 	find postgres/typedpg -type f -name '*.c' | sort
 } >"$work/compile-files"
 
@@ -162,6 +163,7 @@ say "trimming include/"
 			-Ipostgres/include \
 			-Ipostgres/src/backend/parser \
 			-Ipostgres/src/pl/plpgsql/src \
+			-Icsrc \
 			"$f" >>"$work/deps" || fail "gcc -MM failed on $f"
 	done <"$work/compile-files"
 )

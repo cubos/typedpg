@@ -51,11 +51,15 @@ fn main() {
     build.compile("typedpg_postgres");
 
     // The crate's entry points are ours: compile them with warnings on.
+    let mut shim_sources = c_sources(Path::new("csrc"));
+    shim_sources.extend(c_sources(&Path::new("csrc").join("pg")));
+    shim_sources.extend(c_sources(&Path::new("csrc").join("plpgsql")));
     let mut shim = cc::Build::new();
-    shim.files(c_sources(Path::new("csrc/pg")))
+    shim.files(&shim_sources)
         .include(&include)
         .include(&parser)
         .include(&plpgsql)
+        .include("csrc")
         .std("gnu11")
         .flag_if_supported("-fno-strict-aliasing")
         .flag_if_supported("-fwrapv")

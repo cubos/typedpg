@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 # Our code is MIT; the bundled PostgreSQL sources are under the PostgreSQL
-# License.
-license = "MIT AND PostgreSQL"
+# License, and csrc/plpgsql (libpg_query's PL/pgSQL compiler driver) under
+# BSD-3-Clause.
+license = "MIT AND PostgreSQL AND BSD-3-Clause"
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true

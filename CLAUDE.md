@@ -125,7 +125,7 @@ typedpg_cli (binary: `cargo typedpg migrate …`, `cargo typedpg lint`)
     │       └── typedpg_macros (proc macro: sql!)
     │               ├── typedpg_core
     │               └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
-    │                       └── typedpg_pg_query (PostgreSQL parser: our libpg_query binding)
+    │                       └── typedpg_pg_query (PostgreSQL parser, built from PostgreSQL's own sources)
     └── typedpg_lint (the `typedpg lint` rules: queries, migrations and the final schema)
             ├── typedpg_analyzer
             ├── typedpg_core
@@ -140,9 +140,23 @@ typedpg_wasm (the same migration helpers, compiled to WebAssembly for typedpg_np
 (see `typedpg_pg_query/import/README.md`; `cargo run -p typedpg_pg_query_codegen`
 regenerates the AST types, walkers and the C-tree converter from the imported
 headers). Nothing is compiled from `libpg_query/` any more; the submodule
-stays only for a later phase to remove. PL/pgSQL compilation is not wired in
-yet: `parse_plpgsql` and `parse_plpgsql_with_catalog` return an error saying
-so.
+stays only for a later phase to remove.
+
+PL/pgSQL is compiled by PostgreSQL's own compiler (`pl_comp.c`, `pl_gram.c`),
+driven by `csrc/plpgsql/` — libpg_query's two PL/pgSQL files, BSD-3-Clause,
+with its JSON patches applied — and rendered as JSON by `plpgsqlToJSON`. A
+`CREATE FUNCTION … LANGUAGE plpgsql` builds a fake `pg_proc` row, registers it
+in the syscache and calls `plpgsql_compile` exactly as the validator does; a
+`DO` block calls `plpgsql_compile_inline`. Catalog lookups go through the
+syscache: `csrc/pg/syscache.c` answers TYPEOID / TYPENAMENSP / NAMESPACEOID /
+NAMESPACENAME / RELNAMENSP / RELOID / ATTNAME / ATTNUM / PROCOID from the
+caller's `Catalog` while `parse_plpgsql_with_catalog` runs (the search path is
+handed to `assign_search_path`, and installing or removing the catalog replays
+the syscache invalidation callbacks), and from the release's `postgres.bki`
+rows (`postgres/typedpg/builtin_catalog.c`: `pg_type`, `pg_namespace` and the
+built-in `pg_collation`s) otherwise. Parameter `DEFAULT` expressions are not
+transformed (the expression parser is not carried; the analyzer validates them
+itself), and nothing is executed.
 
 ### Compile-time pipeline (`sql!` macro)
 

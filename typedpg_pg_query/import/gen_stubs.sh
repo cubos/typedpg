@@ -1,12 +1,12 @@
 #!/bin/sh
 # Generate postgres/typedpg/stubs_functions.c and stubs_variables.c: the
-# symbols the imported PostgreSQL sources and the hand-written overrides
-# (csrc/pg/*.c) reference but nothing in the crate defines.  A function stub
-# raises an ERROR if reached; a variable stub is zeroed (csrc/pg/vars.c sets
-# the ones that need a real value).
+# symbols the imported PostgreSQL sources and the hand-written code under
+# csrc/ reference but nothing in the crate defines.  A function stub raises an
+# ERROR if reached; a variable stub is zeroed (csrc/pg/vars.c sets the ones
+# that need a real value).
 #
-# Run from import.sh after builtin_catalog.c exists.  Adding a csrc/pg/*.c
-# file only narrows the list: whatever it defines counts as defined.
+# Run from import.sh after builtin_catalog.c exists.  Adding a file under
+# csrc/ only narrows the list: whatever it defines counts as defined.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -24,7 +24,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/typedpg-stubs.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
 CF="-std=gnu11 -D_GNU_SOURCE -fno-strict-aliasing -fwrapv -fPIC -w
-	-I$pg/include -I$pg/src/backend/parser -I$pg/src/pl/plpgsql/src"
+	-I$pg/include -I$pg/src/backend/parser -I$pg/src/pl/plpgsql/src -I$crate/csrc"
 
 rm -f "$out/stubs_functions.c" "$out/stubs_variables.c"
 
@@ -34,7 +34,7 @@ rm -f "$out/stubs_functions.c" "$out/stubs_variables.c"
 	while IFS= read -r f; do
 		[ -n "$f" ] && printf '%s\n' "$pg/$f"
 	done <"$here/FILES"
-	find "$crate/csrc/pg" -type f -name '*.c' | sort
+	find "$crate/csrc" -type f -name '*.c' | sort
 	find "$out" -type f -name '*.c' | sort
 } >"$work/sources"
 

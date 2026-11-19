@@ -1,14 +1,21 @@
-//! The catalog PL/pgSQL's compiler will read.
+//! Letting PL/pgSQL's compiler read the caller's catalog.
 //!
 //! PL/pgSQL's compiler resolves types (of arguments, the result and declared
 //! variables), schemas and, for `%TYPE` / `%ROWTYPE`, relations and columns.
-//! Outside a server, PostgreSQL has no catalog to consult, so
-//! [`parse_plpgsql_with_catalog`](crate::parse_plpgsql_with_catalog) takes a
-//! [`Catalog`] and the compiler resolves everything — with PostgreSQL's own
-//! errors — against it.
+//! Outside a server there is no catalog to consult, so
+//! [`parse_plpgsql_with_catalog`](crate::parse_plpgsql_with_catalog) installs
+//! a [`Catalog`] for the duration of the call: the syscache (csrc/pg/
+//! syscache.c) answers every lookup from it, building real catalog rows, and
+//! the compiler then resolves everything — with PostgreSQL's own errors —
+//! against it.
 //!
-//! PL/pgSQL parsing is not available yet (see the crate docs); the types stay
-//! here for the phase that brings it back.
+//! The callback struct is `TypedpgCatalog` in csrc/typedpg_catalog.h; keep the
+//! two layouts in sync.
+
+use std::any::Any;
+use std::cell::RefCell;
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 /// A `pg_type` row, with the columns the parser and the PL/pgSQL compiler
 /// read. OIDs of `0` stand for none.
@@ -62,4 +69,243 @@ pub trait Catalog {
     fn relation_type(&self, relation: u32) -> Option<u32>;
     fn attribute_by_name(&self, relation: u32, name: &str) -> Option<CatalogAttribute>;
     fn attribute_by_number(&self, relation: u32, number: i16) -> Option<CatalogAttribute>;
+}
+
+/// `TypedpgType` in csrc/typedpg_catalog.h.
+#[repr(C)]
+struct FfiType {
+    oid: u32,
+    typname: *const c_char,
+    typnamespace: u32,
+    typlen: i16,
+    typbyval: bool,
+    typtype: c_char,
+    typcategory: c_char,
+    typispreferred: bool,
+    typalign: c_char,
+    typrelid: u32,
+    typsubscript: u32,
+    typelem: u32,
+    typarray: u32,
+    typbasetype: u32,
+    typtypmod: i32,
+    typnotnull: bool,
+    typcollation: u32,
+    typisdefined: bool,
+}
+
+/// `TypedpgAttribute` in csrc/typedpg_catalog.h.
+#[repr(C)]
+struct FfiAttribute {
+    attnum: i16,
+    atttypid: u32,
+    atttypmod: i32,
+    attcollation: u32,
+}
+
+/// `TypedpgCatalog` in csrc/typedpg_catalog.h: the callbacks the C syscache
+/// calls back into.
+#[repr(C)]
+pub(crate) struct CatalogFns {
+    ctx: *mut c_void,
+    type_by_oid: extern "C" fn(*mut c_void, u32, *mut FfiType) -> bool,
+    type_by_name: extern "C" fn(*mut c_void, u32, *const c_char) -> u32,
+    namespace_by_name: extern "C" fn(*mut c_void, *const c_char) -> u32,
+    namespace_name: extern "C" fn(*mut c_void, u32) -> *const c_char,
+    search_path: extern "C" fn(*mut c_void, *mut u32, usize) -> usize,
+    relation_by_name: extern "C" fn(*mut c_void, u32, *const c_char) -> u32,
+    relation_type: extern "C" fn(*mut c_void, u32) -> u32,
+    attribute_by_name: extern "C" fn(*mut c_void, u32, *const c_char, *mut FfiAttribute) -> bool,
+    attribute_by_number: extern "C" fn(*mut c_void, u32, i16, *mut FfiAttribute) -> bool,
+}
+
+/// The state one installed catalog carries across callbacks.
+struct Session<'a> {
+    catalog: &'a dyn Catalog,
+    /// Strings handed to C, kept alive until the call returns.
+    strings: RefCell<Vec<CString>>,
+    /// A panic raised by the catalog, re-raised once C has returned.
+    panic: RefCell<Option<Box<dyn Any + Send>>>,
+}
+
+impl Session<'_> {
+    fn keep(&self, s: &str) -> *const c_char {
+        let owned = CString::new(s.replace('\0', "")).expect("NULs removed");
+        let ptr = owned.as_ptr();
+        self.strings.borrow_mut().push(owned);
+        ptr
+    }
+}
+
+/// Run `f` on the session behind `ctx`, never letting a panic unwind into C:
+/// it is stored and `default` returned.
+fn with_session<R>(ctx: *mut c_void, default: R, f: impl FnOnce(&Session<'_>) -> R) -> R {
+    // SAFETY: `ctx` is the `Session` installed by `with_catalog`, alive for
+    // the whole C call these callbacks run in.
+    let session = unsafe { &*(ctx as *const Session<'_>) };
+    if session.panic.borrow().is_some() {
+        return default;
+    }
+    match catch_unwind(AssertUnwindSafe(|| f(session))) {
+        Ok(r) => r,
+        Err(payload) => {
+            *session.panic.borrow_mut() = Some(payload);
+            default
+        }
+    }
+}
+
+/// # Safety
+/// `s` must be a valid NUL-terminated string.
+unsafe fn str_arg<'a>(s: *const c_char) -> std::borrow::Cow<'a, str> {
+    unsafe { CStr::from_ptr(s) }.to_string_lossy()
+}
+
+extern "C" fn type_by_oid(ctx: *mut c_void, oid: u32, out: *mut FfiType) -> bool {
+    with_session(ctx, false, |s| {
+        let Some(t) = s.catalog.type_by_oid(oid) else {
+            return false;
+        };
+        let row = FfiType {
+            oid: t.oid,
+            typname: s.keep(&t.name),
+            typnamespace: t.namespace,
+            typlen: t.len,
+            typbyval: t.by_val,
+            typtype: t.typtype as c_char,
+            typcategory: t.category as c_char,
+            typispreferred: t.preferred,
+            typalign: t.align as c_char,
+            typrelid: t.relid,
+            typsubscript: t.subscript,
+            typelem: t.elem,
+            typarray: t.array,
+            typbasetype: t.base_type,
+            typtypmod: t.typmod,
+            typnotnull: t.not_null,
+            typcollation: t.collation,
+            typisdefined: t.is_defined,
+        };
+        // SAFETY: C passes a writable TypedpgType.
+        unsafe { out.write(row) };
+        true
+    })
+}
+
+extern "C" fn type_by_name(ctx: *mut c_void, namespace: u32, name: *const c_char) -> u32 {
+    with_session(ctx, 0, |s| {
+        s.catalog
+            .type_by_name(namespace, &unsafe { str_arg(name) })
+            .unwrap_or(0)
+    })
+}
+
+extern "C" fn namespace_by_name(ctx: *mut c_void, name: *const c_char) -> u32 {
+    with_session(ctx, 0, |s| {
+        s.catalog
+            .namespace_by_name(&unsafe { str_arg(name) })
+            .unwrap_or(0)
+    })
+}
+
+extern "C" fn namespace_name(ctx: *mut c_void, namespace: u32) -> *const c_char {
+    with_session(ctx, std::ptr::null(), |s| {
+        s.catalog
+            .namespace_name(namespace)
+            .map_or(std::ptr::null(), |n| s.keep(&n))
+    })
+}
+
+extern "C" fn search_path(ctx: *mut c_void, out: *mut u32, capacity: usize) -> usize {
+    with_session(ctx, 0, |s| {
+        let path = s.catalog.search_path();
+        for (i, &oid) in path.iter().take(capacity).enumerate() {
+            // SAFETY: C passes room for `capacity` OIDs.
+            unsafe { out.add(i).write(oid) };
+        }
+        path.len()
+    })
+}
+
+extern "C" fn relation_by_name(ctx: *mut c_void, namespace: u32, name: *const c_char) -> u32 {
+    with_session(ctx, 0, |s| {
+        s.catalog
+            .relation_by_name(namespace, &unsafe { str_arg(name) })
+            .unwrap_or(0)
+    })
+}
+
+extern "C" fn relation_type(ctx: *mut c_void, relation: u32) -> u32 {
+    with_session(ctx, 0, |s| s.catalog.relation_type(relation).unwrap_or(0))
+}
+
+fn write_attribute(out: *mut FfiAttribute, a: Option<CatalogAttribute>) -> bool {
+    let Some(a) = a else {
+        return false;
+    };
+    // SAFETY: C passes a writable TypedpgAttribute.
+    unsafe {
+        out.write(FfiAttribute {
+            attnum: a.number,
+            atttypid: a.type_oid,
+            atttypmod: a.typmod,
+            attcollation: a.collation,
+        })
+    };
+    true
+}
+
+extern "C" fn attribute_by_name(
+    ctx: *mut c_void,
+    relation: u32,
+    name: *const c_char,
+    out: *mut FfiAttribute,
+) -> bool {
+    with_session(ctx, false, |s| {
+        write_attribute(
+            out,
+            s.catalog
+                .attribute_by_name(relation, &unsafe { str_arg(name) }),
+        )
+    })
+}
+
+extern "C" fn attribute_by_number(
+    ctx: *mut c_void,
+    relation: u32,
+    number: i16,
+    out: *mut FfiAttribute,
+) -> bool {
+    with_session(ctx, false, |s| {
+        write_attribute(out, s.catalog.attribute_by_number(relation, number))
+    })
+}
+
+/// Run `f` (the C call) with `catalog` installed, then re-raise a panic the
+/// catalog raised — once C has returned, so it never unwinds through C.
+pub(crate) fn with_catalog<R>(catalog: &dyn Catalog, f: impl FnOnce(*const CatalogFns) -> R) -> R {
+    let session = Session {
+        catalog,
+        strings: RefCell::new(Vec::new()),
+        panic: RefCell::new(None),
+    };
+    let hooks = CatalogFns {
+        ctx: &session as *const Session<'_> as *mut c_void,
+        type_by_oid,
+        type_by_name,
+        namespace_by_name,
+        namespace_name,
+        search_path,
+        relation_by_name,
+        relation_type,
+        attribute_by_name,
+        attribute_by_number,
+    };
+    // SAFETY: `hooks` and `session` outlive the C call, which does not keep
+    // the pointer after it returns (shim_plpgsql uninstalls it).
+    let result = f(&hooks);
+    if let Some(payload) = session.panic.borrow_mut().take() {
+        resume_unwind(payload);
+    }
+    result
 }

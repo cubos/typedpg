@@ -15,5 +15,7 @@ int MyXactFlags;
 uint64 SPI_processed;
 SPITupleTable *SPI_tuptable;
 uint64 SharedInvalidMessageCounter;
+const TupleTableSlotOps TTSOpsHeapTuple;
 object_access_hook_type object_access_hook;
+pg_tz *session_timezone;
 bool trace_sort;

@@ -22,9 +22,12 @@
 #include "parser/parser.h"
 #include "parser/scanner.h"
 #include "utils/elog.h"
+#include "utils/catcache.h"
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
+
+#include "shim_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,15 +38,6 @@ extern size_t typedpg_remaining_stack(void);
 /* The flex entry points scan.c exposes but scanner.h does not declare. */
 extern char *core_yyget_text(core_yyscan_t scanner);
 extern int	core_yyget_leng(core_yyscan_t scanner);
-
-typedef struct ShimError
-{
-	char	   *message;
-	char	   *funcname;
-	char	   *filename;
-	int			lineno;
-	int			cursorpos;
-} ShimError;
 
 typedef struct ShimParseResult
 {
@@ -117,6 +111,10 @@ shim_init(void)
 	SetDatabaseEncoding(PG_UTF8);
 	SetMessageEncoding(PG_UTF8);
 	emit_log_hook = capture_notices;
+	/* plpgsql_compile reparents a compiled function's context here. */
+	CacheMemoryContext = AllocSetContextCreate(TopMemoryContext,
+											   "CacheMemoryContext",
+											   ALLOCSET_DEFAULT_SIZES);
 	namespace_search_path = "\"$user\", public";
 	InitializeSearchPath();
 	initialized = true;
@@ -145,7 +143,7 @@ shim_set_stack_depth(void)
 	assign_max_stack_depth((int) new_limit, NULL);
 }
 
-static void
+void
 shim_enter(void)
 {
 	shim_init();
@@ -153,15 +151,15 @@ shim_enter(void)
 	shim_set_stack_depth();
 }
 
-static void
+void
 shim_leave(void)
 {
 	restore_stack_base(NULL);
 }
 
 /* Copy the caught error out and clear PostgreSQL's error state. */
-static ShimError *
-take_error(void)
+ShimError *
+typedpg_take_error(void)
 {
 	ErrorData  *edata = CopyErrorData();
 	ShimError  *error = calloc(1, sizeof(ShimError));
@@ -174,6 +172,25 @@ take_error(void)
 	FreeErrorData(edata);
 	FlushErrorState();
 	return error;
+}
+
+void
+typedpg_notices_begin(void)
+{
+	initStringInfo(&notices);
+	capturing = true;
+}
+
+/* Stop collecting and hand over what was collected (malloc'd, or NULL). */
+char *
+typedpg_notices_end(void)
+{
+	char	   *text = NULL;
+
+	capturing = false;
+	if (notices.len > 0)
+		text = copy_string(notices.data);
+	return text;
 }
 
 static void
@@ -202,8 +219,7 @@ shim_parse(const char *sql, int mode)
 								ALLOCSET_DEFAULT_SIZES);
 	result.context = ctx;
 	MemoryContextSwitchTo(ctx);
-	initStringInfo(&notices);
-	capturing = true;
+	typedpg_notices_begin();
 	PG_TRY();
 	{
 		result.tree = raw_parser(sql, (RawParseMode) mode);
@@ -211,12 +227,10 @@ shim_parse(const char *sql, int mode)
 	PG_CATCH();
 	{
 		MemoryContextSwitchTo(ctx);
-		result.error = take_error();
+		result.error = typedpg_take_error();
 	}
 	PG_END_TRY();
-	capturing = false;
-	if (notices.len > 0)
-		result.notices = copy_string(notices.data);
+	result.notices = typedpg_notices_end();
 	MemoryContextSwitchTo(TopMemoryContext);
 	shim_leave();
 	return result;
@@ -303,7 +317,7 @@ shim_scan(const char *sql)
 		free(tokens);
 		result.tokens = NULL;
 		result.ntokens = 0;
-		result.error = take_error();
+		result.error = typedpg_take_error();
 	}
 	PG_END_TRY();
 	MemoryContextSwitchTo(TopMemoryContext);
