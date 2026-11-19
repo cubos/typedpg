@@ -4293,20 +4293,17 @@ fn extended_statistics_need_an_ordering_operator() {
              default btree operator class"
         )
     };
+    // PostgreSQL 18.7 checks an expression's type as a column's first
+    // (CheckAttributeType): no pseudo-type.
+    let pseudo = |typ: &str| format!("expression has pseudo-type {typ}");
     let system = "statistics creation on system columns is not supported";
     for (stmt, msg) in [
         (
             "CREATE STATISTICS ON (b::unknown), a FROM t;",
-            expression("unknown"),
+            pseudo("unknown"),
         ),
-        (
-            "CREATE STATISTICS ON ('a'), a FROM t;",
-            expression("unknown"),
-        ),
-        (
-            "CREATE STATISTICS ON (NULL), a FROM t;",
-            expression("unknown"),
-        ),
+        ("CREATE STATISTICS ON ('a'), a FROM t;", pseudo("unknown")),
+        ("CREATE STATISTICS ON (NULL), a FROM t;", pseudo("unknown")),
         (
             "CREATE STATISTICS ON (b::xml), a FROM t;",
             expression("xml"),
@@ -4318,11 +4315,11 @@ fn extended_statistics_need_an_ordering_operator() {
         // Each element is checked in turn, before the duplicates.
         (
             "CREATE STATISTICS ON (a + 1), (b::unknown), (a + 1) FROM t;",
-            expression("unknown"),
+            pseudo("unknown"),
         ),
         (
             "CREATE STATISTICS ON (b::unknown), ctid FROM t;",
-            expression("unknown"),
+            pseudo("unknown"),
         ),
         ("CREATE STATISTICS ON p, a FROM t;", column("p", "point[]")),
         ("CREATE STATISTICS ON q, a FROM t;", column("q", "pc")),
@@ -4366,17 +4363,23 @@ fn extended_statistics_need_an_ordering_operator() {
         // The whole row is attribute 0.
         ("CREATE STATISTICS ON (t), a FROM t;", system.into()),
         ("CREATE STATISTICS ON (t::text), a FROM t;", system.into()),
+        (
+            "CREATE STATISTICS ON (b::unknown) FROM t;",
+            pseudo("unknown"),
+        ),
+        (
+            "CREATE STATISTICS ON (ROW(pt)), a FROM t;",
+            pseudo("record"),
+        ),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
         assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
     }
-    // A single expression gets the regular statistics, whatever its type;
-    // an anonymous record's fields are only compared at run time.
+    // A single expression gets the regular statistics, whatever its
+    // (storable) type.
     for stmt in [
-        "CREATE STATISTICS ON (b::unknown) FROM t;",
         "CREATE STATISTICS ON (ARRAY[pt]) FROM t;",
         "CREATE STATISTICS ON (pt::text) FROM t;",
-        "CREATE STATISTICS ON (ROW(pt)), a FROM t;",
         "CREATE STATISTICS ON (a), b FROM t;",
         "CREATE STATISTICS ON (public.t.a), b FROM t;",
     ] {

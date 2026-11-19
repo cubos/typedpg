@@ -86,6 +86,13 @@ pub fn encode(
     let Some(t) = snapshot.get_type(type_oid) else {
         return Ok(None);
     };
+    // typenameTypeMod: a shell type has no typmodin yet.
+    if !t.typisdefined {
+        return Err(DdlError::Parse(format!(
+            "type modifier cannot be specified for shell type \"{}\"",
+            crate::ddl::util::type_name_to_string(type_name)
+        )));
+    }
     if t.typcategory == crate::pg_catalog::TypCategory::Array
         && let Some(elem) = t.typelem
         && snapshot.array_type_of(elem) == Some(type_oid)
@@ -127,10 +134,13 @@ pub fn encode(
         (_, Some(name @ ("bit" | "varbit"))) => {
             encode_length(&raw()?, name, MAX_ATTR_SIZE * BITS_PER_BYTE, 0).map(Some)
         }
-        // A non-pg_catalog base type (extension / user C type) may have a
-        // typmodin we don't model — drop the typmod rather than reject,
-        // once `typenameTypeMod` has turned the modifiers into strings.
-        (_, None) if t.typtype == crate::pg_catalog::TypType::Base => {
+        // A non-pg_catalog base type created with a typmodin, which the
+        // analyzer doesn't run — drop the typmod rather than reject, once
+        // `typenameTypeMod` has turned the modifiers into strings.
+        (_, None)
+            if t.typtype == crate::pg_catalog::TypType::Base
+                && snapshot.types_with_typmodin.contains(&type_oid) =>
+        {
             typmod_strings(typmods)?;
             Ok(None)
         }

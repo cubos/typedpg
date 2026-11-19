@@ -386,6 +386,9 @@ pub(crate) fn interpret_function_parameter_list(
             }
             other => other,
         })?;
+        // LookupTypeName computes the typmod too (typenameTypeMod), though
+        // a function doesn't keep it.
+        crate::typmod::encode(interp, toid, tn)?;
         if interp.pg_type.get(&toid).is_some_and(|t| !t.typisdefined) {
             if language == Some("sql") {
                 return Err(DdlError::Parse(format!(
@@ -471,6 +474,12 @@ pub(crate) fn interpret_function_parameter_list(
                 });
                 list.default_types.push(default_type?);
                 list.default_refs.extend(refs);
+                // An untyped literal becomes a constant of the parameter's
+                // type.
+                list.default_refs
+                    .extend(super::depend::literal_coercion_references(
+                        interp, expr, toid,
+                    ));
                 list.default_procs.extend(used.into_inner());
                 have_defaults = true;
             }
@@ -674,6 +683,16 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     let addr = super::depend::ObjectAddress::proc(proc.oid);
     super::depend::record_references(interp, addr, &body_refs, DepType::Normal);
     super::depend::record_references(interp, addr, &params.default_refs, DepType::Normal);
+    let mut refers = super::depend::type_references(&body_refs);
+    refers.extend(super::depend::type_references(&params.default_refs));
+    super::depend::note_expr_type_use(
+        interp,
+        addr,
+        super::depend::ExprTypeUse {
+            refers,
+            results: Vec::new(),
+        },
+    );
 
     Ok(())
 }
@@ -702,6 +721,8 @@ fn compute_return_type(
 ) -> Result<PgTypeOid, DdlError> {
     match lookup_type_name(tn, interp) {
         Ok(oid) => {
+            // LookupTypeName's typenameTypeMod.
+            crate::typmod::encode(interp, oid, tn)?;
             if language == "sql" && interp.pg_type.get(&oid).is_some_and(|t| !t.typisdefined) {
                 return Err(DdlError::Parse(format!(
                     "SQL function cannot return shell type {}",
@@ -710,10 +731,13 @@ fn compute_return_type(
             }
             Ok(oid)
         }
+        // Not for a name with `[]`, `%TYPE` or a type modifier (PostgreSQL
+        // 18.7): it's no input function's.
         Err(DdlError::TypeNotFound(msg))
             if msg.starts_with("type \"")
                 && tn.array_bounds.is_empty()
                 && !tn.pct_type
+                && tn.typmods.is_empty()
                 && matches!(language, "c" | "internal") =>
         {
             let (nsoid, name) = ensure_qualified_name(interp, &tn.names)?;
@@ -755,7 +779,7 @@ fn interpret_as_clause(
 
 /// The C function names of the built-in (`LANGUAGE internal`) functions,
 /// sorted (`SELECT DISTINCT prosrc FROM pg_proc WHERE prolang = 12` on
-/// PostgreSQL 18.6 — the entries of `fmgr_builtins`).
+/// PostgreSQL 18.7 — the entries of `fmgr_builtins`).
 const BUILTIN_PROSRC: &str = include_str!("builtin_prosrc.txt");
 
 /// `fmgr_internal_validator` (pg_proc.c): a `LANGUAGE internal` function's

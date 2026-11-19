@@ -236,7 +236,7 @@ fn operator_shell_make(
     Ok(oid)
 }
 
-/// `OperatorUpd`: make the commutator `com` and the negator `neg` of
+/// `UpdateOperatorLinks` (`OperatorUpd`): make the commutator `com` and the negator `neg` of
 /// operator `base` link back to it — an error when one already links to a
 /// third operator — or, for a `base` being dropped, clear their links to
 /// it.
@@ -245,6 +245,7 @@ pub(crate) fn operator_upd(
     base: PgOperatorOid,
     com: Option<PgOperatorOid>,
     neg: Option<PgOperatorOid>,
+    result: Option<PgTypeOid>,
     is_delete: bool,
 ) -> Result<(), DdlError> {
     type Link = fn(&mut PgOperator) -> &mut Option<PgOperatorOid>;
@@ -269,6 +270,23 @@ pub(crate) fn operator_upd(
                 name(other).unwrap_or_default()
             )));
         }
+        // PostgreSQL 18.7: an operator and its commutator or negator
+        // return the same type.
+        if !is_delete
+            && let Some(result) = result
+            && let Some(row) = interp.pg_operator.get(&other)
+            && row.oprresult.is_some_and(|r| r != result)
+        {
+            let base_name = interp
+                .pg_operator
+                .get(&base)
+                .map(|o| o.oprname.clone())
+                .unwrap_or_default();
+            return Err(DdlError::Parse(format!(
+                "{what} operator {} does not return the same data type as operator {base_name}",
+                row.oprname
+            )));
+        }
         if let Some(row) = interp.pg_operator.get_mut(&other) {
             let l = link(row);
             if is_delete && *l == Some(base) {
@@ -287,7 +305,7 @@ pub(crate) fn remove_operator(interp: &mut PgCatalog, oid: PgOperatorOid) {
     if let Some(op) = interp.pg_operator.get(&oid) {
         let (com, neg) = (op.oprcom, op.oprnegate);
         // (Clearing links never fails.)
-        let _ = operator_upd(interp, oid, com, neg, true);
+        let _ = operator_upd(interp, oid, com, neg, None, true);
     }
     interp.remove_pg_operator(oid);
     // Its operator families' entries go with it (a loose member
@@ -421,16 +439,6 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
             "\"{op_name}\" is not a valid operator name"
         )));
     }
-    operator_validate_params(
-        left,
-        result,
-        commutator.is_some(),
-        negator.is_some(),
-        restrict.is_some(),
-        join.is_some(),
-        can_merge,
-        can_hash,
-    )?;
     // OperatorGet: an operator of this name and operand types in the schema.
     let existing = interp
         .operator_by_qname
@@ -445,6 +453,15 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
             "operator {op_name} already exists"
         )));
     }
+    // A shell's links, set by the operators that named it (PostgreSQL 18.7
+    // keeps them).
+    let shell = match existing {
+        Some((shell, false)) => Some(shell),
+        _ => None,
+    };
+    let (old_commutator, old_negator) = shell
+        .and_then(|s| interp.pg_operator.get(&s))
+        .map_or((None, None), |o| (o.oprcom, o.oprnegate));
     // The commutator has the operand types reversed; `None` inside means
     // the operator is its own.
     let mut commutator_oid: Option<Option<PgOperatorOid>> = None;
@@ -460,26 +477,70 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
     }
     let mut negator_oid = None;
     if let Some(names) = negator.as_deref() {
+        // Its own negator: the operator itself, or the shell it fills in.
         match get_other_operator(interp, names, left, right, &op_name, nsoid, left, right)? {
-            None => {
-                return Err(DdlError::Parse("operator cannot be its own negator".into()));
-            }
-            Some(other) => {
+            Some(other) if Some(other) != shell => {
                 referenced.push(ObjectAddress::operator(other));
                 negator_oid = Some(other);
             }
+            _ => {
+                return Err(DdlError::Parse("operator cannot be its own negator".into()));
+            }
         }
     }
-    // A shell of this signature is filled in, keeping its OID. Its row is
-    // replaced whole: a commutator / negator link another operator made to
-    // it is not kept unless restated (OperatorCreate writes the links it
-    // was given).
-    let oid = match existing {
-        Some((shell, false)) => {
+    // PostgreSQL 18.7: a shell's links stay, as the operators they point
+    // at link back to it — another one named instead is an error.
+    let name_of = |interp: &PgCatalog, o: PgOperatorOid| {
+        interp
+            .pg_operator
+            .get(&o)
+            .map_or_else(|| o.get().to_string(), |o| o.oprname.clone())
+    };
+    if let Some(old) = old_commutator {
+        match commutator_oid {
+            // Self-linkage resolves to nothing yet (the shell's own OID
+            // when it names itself).
+            None | Some(None) => commutator_oid = Some(Some(old)),
+            Some(Some(new)) if new != old => {
+                return Err(DdlError::Parse(format!(
+                    "commutator operator {} is already the commutator of operator {op_name}",
+                    name_of(interp, old)
+                )));
+            }
+            Some(Some(_)) => {}
+        }
+    }
+    if let Some(old) = old_negator {
+        match negator_oid {
+            None => negator_oid = Some(old),
+            Some(new) if new != old => {
+                return Err(DdlError::Parse(format!(
+                    "negator operator {} is already the negator of operator {op_name}",
+                    name_of(interp, old)
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    // With the links known for sure (PostgreSQL 18.7: a self-commutator of
+    // a new operator isn't one yet).
+    operator_validate_params(
+        left,
+        result,
+        matches!(commutator_oid, Some(Some(_))),
+        negator_oid.is_some(),
+        restrict.is_some(),
+        join.is_some(),
+        can_merge,
+        can_hash,
+    )?;
+    // A shell of this signature is filled in, keeping its OID.
+    let oid = match shell {
+        Some(shell) => {
             interp.remove_pg_operator(shell);
             shell
         }
-        _ => PgOperatorOid::from_nonzero(interp.alloc_oid()?),
+        None => PgOperatorOid::from_nonzero(interp.alloc_oid()?),
     };
     let oprcom = commutator_oid.map(|other| other.unwrap_or(oid));
     let oprnegate = negator_oid;
@@ -494,9 +555,9 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         oprcom,
         oprnegate,
     });
-    // OperatorUpd: the commutator and the negator point back at the new
-    // operator.
-    operator_upd(interp, oid, oprcom, oprnegate, false)?;
+    // UpdateOperatorLinks: the commutator and the negator point back at
+    // the new operator.
+    operator_upd(interp, oid, oprcom, oprnegate, result, false)?;
     // makeOperatorDependencies: the operator depends on its function and
     // estimators (a commutator / negator link is not a dependency).
     referenced.retain(|r| r.classid == crate::pg_catalog::PG_PROC_RELID);
@@ -647,5 +708,12 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
             row.oprnegate = negator_oid;
         }
     }
-    operator_upd(interp, oid, commutator_oid, negator_oid, false)
+    operator_upd(
+        interp,
+        oid,
+        commutator_oid,
+        negator_oid,
+        op.oprresult,
+        false,
+    )
 }

@@ -273,6 +273,12 @@ fn check_attribute_options(def: Option<&typedpg_pg_query::protobuf::Node>) -> Re
         let Some(node::Node::DefElem(de)) = item.node.as_ref() else {
             continue;
         };
+        // PostgreSQL 18.7 keeps the column's version in the reserved option
+        // `pg_attver`: one given is ignored (ATExecSetOptions), not
+        // rejected, so a dump that has it restores.
+        if de.defnamespace.is_empty() && de.defname == "pg_attver" {
+            continue;
+        }
         // transformRelOptions: no namespaces are valid for columns.
         if !de.defnamespace.is_empty() {
             return Err(DdlError::UnsupportedDdl(format!(

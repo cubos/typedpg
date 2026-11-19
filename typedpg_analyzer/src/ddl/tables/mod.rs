@@ -672,6 +672,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 // all of them through a whole-row reference — may be neither
                 // system nor generated columns.
                 let mut read: Vec<i16> = Vec::new();
+                let mut whole_row_read = false;
                 if let Some(inner) = expr.node.as_ref() {
                     // `(p).a` reads the column `a` (transformIndirection).
                     let selections = super::util::relation_row_selections(interp, class_oid, expr);
@@ -696,7 +697,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                                 _ => false,
                             };
                         if whole_row {
-                            read.extend(interp.attributes_of(class_oid).iter().map(|a| a.attnum));
+                            // Every column, for the generated column check
+                            // (ComputePartitionAttrs); not a key column
+                            // (has_partition_attrs sees attribute 0).
+                            whole_row_read = true;
                             continue;
                         }
                         let Some(col) = selected
@@ -722,6 +726,12 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 }
                 read.sort_unstable();
                 key_attrs.extend(read.iter().copied());
+                if whole_row_read {
+                    interp.partition_key_whole_row.insert(class_oid);
+                    read.extend(interp.attributes_of(class_oid).iter().map(|a| a.attnum));
+                    read.sort_unstable();
+                    read.dedup();
+                }
                 if let Some(generated) = read.iter().find_map(|&attnum| {
                     interp
                         .attributes_of(class_oid)
@@ -2001,7 +2011,7 @@ mod columns;
 mod constraints;
 pub(crate) mod foreign_keys;
 mod generated;
-pub(crate) use generated::{check_attribute_type, generation_not_null};
+pub(crate) use generated::{check_attribute_type, check_expression_type, generation_not_null};
 pub(crate) mod inherit;
 mod inherit_cmd;
 mod merge;

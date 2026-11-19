@@ -1,4 +1,5 @@
 use super::*;
+use crate::ddl::depend::ObjectAddress;
 
 /// The integer type behind a `smallserial` / `serial` / `bigserial` column
 /// type, or `None` for any other type name. Mirrors the check at the top of
@@ -26,19 +27,103 @@ pub(crate) fn serial_base_type(tn: &typedpg_pg_query::protobuf::TypeName) -> Opt
     }
 }
 
-/// find_composite_type_dependencies (tablecmds.c): the relation `orig`'s
-/// row type (or an attribute type of composite type `orig`) can't change
-/// while a stored column holds values of it — directly, or through an
-/// array, domain, range or multirange over it, or a view's or composite
-/// type's row type that contains it. A column of a relation with storage
-/// or partitions blocks; other relations only pass the question on.
+/// find_composite_type_dependencies (tablecmds.c, as PostgreSQL 18.7 has
+/// it): the relation `orig`'s row type (or an attribute type of composite
+/// type `orig`) can't change while something holds values of it, or of a
+/// type containing it (an array, domain, range or multirange over it, a
+/// view's or composite type's row type) — a stored column, or an
+/// expression kept in the catalogs: a function's parameter default or
+/// inline body, a domain's default, a constraint, a column default, an
+/// index's or partition key's expression, a view's query, a trigger, a
+/// policy, extended statistics. A function or operator merely taking or
+/// returning it doesn't.
 pub(crate) fn find_composite_type_dependencies(
     interp: &PgCatalog,
     type_oid: PgTypeOid,
     orig: PgClassOid,
 ) -> Result<(), DdlError> {
     let mut visited = Vec::new();
-    composite_dependencies_of(interp, type_oid, orig, &mut visited)
+    composite_dependencies_of(interp, type_oid, orig, &mut visited)?;
+    missing_composite_dependencies(interp, &visited, orig)
+}
+
+/// report_type_used_in_column.
+fn type_used_in_column(
+    interp: &PgCatalog,
+    orig: PgClassOid,
+    relname: &str,
+    attname: &str,
+) -> DdlError {
+    let orig_name = relname_of(interp, orig);
+    let user = format!("{relname}.{attname}");
+    DdlError::UnsupportedDdl(match interp.pg_class.get(&orig).map(|c| c.relkind) {
+        Some(RelKind::CompositeType) => {
+            format!("cannot alter type \"{orig_name}\" because column \"{user}\" uses it")
+        }
+        Some(RelKind::ForeignTable) => format!(
+            "cannot alter foreign table \"{orig_name}\" because column \"{user}\" uses its row \
+             type"
+        ),
+        _ => format!(
+            "cannot alter table \"{orig_name}\" because column \"{user}\" uses its row type"
+        ),
+    })
+}
+
+/// report_type_used_in_expr: `object` is getObjectDescription's.
+fn type_used_in_expr(interp: &PgCatalog, orig: PgClassOid, object: &str) -> DdlError {
+    let orig_name = relname_of(interp, orig);
+    DdlError::UnsupportedDdl(match interp.pg_class.get(&orig).map(|c| c.relkind) {
+        Some(RelKind::CompositeType) => {
+            format!("cannot alter type \"{orig_name}\" because {object} uses it")
+        }
+        Some(RelKind::ForeignTable) => {
+            format!("cannot alter foreign table \"{orig_name}\" because {object} uses its row type")
+        }
+        _ => format!("cannot alter table \"{orig_name}\" because {object} uses its row type"),
+    })
+}
+
+/// What `addr`'s stored expressions say about types.
+fn expr_type_use(interp: &PgCatalog, addr: ObjectAddress) -> crate::ddl::depend::ExprTypeUse {
+    interp
+        .expr_type_uses
+        .get(&addr)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A relation's columns as `(name, type)`: an index's named as
+/// FigureIndexColname does, typed by its table's column or its expression.
+fn relation_columns(interp: &PgCatalog, relid: PgClassOid) -> Vec<(String, PgTypeOid)> {
+    if let Some(index) = interp.pg_index.get(&relid) {
+        let names = crate::ddl::indexes::index_attnames(interp, relid);
+        let mut results = expr_type_use(interp, ObjectAddress::relation(relid))
+            .results
+            .into_iter();
+        return index
+            .indkey
+            .iter()
+            .zip(names)
+            .filter_map(|(&key, name)| {
+                let t = if key == 0 {
+                    results.next()?
+                } else {
+                    interp
+                        .attributes_of(index.indrelid)
+                        .iter()
+                        .find(|a| a.attnum == key)?
+                        .atttypid
+                };
+                Some((name, t))
+            })
+            .collect();
+    }
+    interp
+        .attributes_of(relid)
+        .iter()
+        .map(|a| (a.attname.clone(), a.atttypid))
+        .collect()
 }
 
 fn composite_dependencies_of(
@@ -47,75 +132,257 @@ fn composite_dependencies_of(
     orig: PgClassOid,
     visited: &mut Vec<PgTypeOid>,
 ) -> Result<(), DdlError> {
+    use crate::ddl::depend;
+    use crate::pg_catalog::{PG_CLASS_RELID, PG_PROC_RELID, PG_TYPE_RELID};
     if visited.contains(&type_oid) {
         return Ok(());
     }
     visited.push(type_oid);
-    // Types containing it.
-    let mut containers: Vec<PgTypeOid> = interp
+    // What depends on the type, as pg_depend's index on the referenced
+    // object lists it (in creation order): the types containing it, the
+    // columns of it, and what else refers to it.
+    let mut dependers: Vec<ObjectAddress> = interp
         .pg_type
         .values()
         .filter(|t| {
             (t.typcategory == TypCategory::Array && t.typelem == Some(type_oid))
                 || t.typbasetype == Some(type_oid)
         })
-        .map(|t| t.oid)
+        .map(|t| ObjectAddress::type_(t.oid))
+        .chain(
+            interp
+                .pg_range
+                .values()
+                .filter(|r| r.rngsubtype == type_oid)
+                .map(|r| ObjectAddress::type_(r.rngtypid)),
+        )
+        .chain(
+            interp
+                .pg_range
+                .get(&type_oid)
+                .and_then(|r| r.rngmultitypid)
+                .map(ObjectAddress::type_),
+        )
         .collect();
-    containers.extend(
-        interp
-            .pg_range
-            .values()
-            .filter(|r| r.rngsubtype == type_oid)
-            .map(|r| r.rngtypid),
-    );
-    containers.extend(interp.pg_range.get(&type_oid).and_then(|r| r.rngmultitypid));
-    containers.sort();
-    for container in containers {
-        composite_dependencies_of(interp, container, orig, visited)?;
+    for (rel, attrs) in interp.pg_attribute.iter() {
+        for a in attrs.iter().filter(|a| a.atttypid == type_oid) {
+            dependers.push(ObjectAddress::column(*rel, a.attnum));
+        }
     }
-    // Relations with a column of it.
-    let mut users: Vec<(PgClassOid, String)> = interp
-        .pg_attribute
-        .iter()
-        .filter_map(|(rel, attrs)| {
-            attrs
-                .iter()
-                .find(|a| a.atttypid == type_oid)
-                .map(|a| (*rel, a.attname.clone()))
-        })
-        .collect();
-    users.sort();
-    for (rel, column) in users {
-        let Some(class) = interp.pg_class.get(&rel) else {
+    let target = ObjectAddress::type_(type_oid);
+    dependers.extend(
+        interp
+            .pg_depend
+            .iter()
+            .filter(|d| {
+                d.refclassid == target.classid
+                    && d.refobjid == target.objid
+                    && !matches!(
+                        d.deptype,
+                        crate::pg_catalog::DepType::Extension | crate::pg_catalog::DepType::Pin
+                    )
+            })
+            .map(|d| ObjectAddress {
+                classid: d.classid,
+                objid: d.objid,
+                objsubid: d.objsubid,
+            })
+            .filter(|a| depend::exists(interp, *a)),
+    );
+    dependers.sort_by_key(|a| (a.objid, a.objsubid));
+    dependers.dedup();
+    for dep in dependers {
+        let classid = dep.classid;
+        if classid == crate::pg_catalog::PG_OPERATOR_RELID
+            || classid == crate::pg_catalog::PG_CAST_RELID
+        {
+            // An operator or a cast: what it runs is checked on its own.
             continue;
-        };
-        if matches!(
-            class.relkind,
-            RelKind::Table | RelKind::MaterializedView | RelKind::Partitioned
-        ) {
-            let orig_class = interp.pg_class.get(&orig);
-            let orig_name = relname_of(interp, orig);
-            let user = format!("{}.{column}", class.relname);
-            return Err(DdlError::UnsupportedDdl(
-                match orig_class.map(|c| c.relkind) {
-                    Some(RelKind::CompositeType) => {
-                        format!(
-                            "cannot alter type \"{orig_name}\" because column \"{user}\" uses it"
-                        )
-                    }
-                    Some(RelKind::ForeignTable) => format!(
-                        "cannot alter foreign table \"{orig_name}\" because column \"{user}\" uses \
-                         its row type"
-                    ),
-                    _ => format!(
-                        "cannot alter table \"{orig_name}\" because column \"{user}\" uses its row \
-                         type"
-                    ),
-                },
+        }
+        if classid == PG_PROC_RELID {
+            // Taking or returning the type is fine; a parameter default or
+            // an inline body using it isn't.
+            if expr_type_use(interp, dep).refers.contains(&type_oid) {
+                return Err(type_used_in_expr(
+                    interp,
+                    orig,
+                    &depend::describe(interp, dep),
+                ));
+            }
+            continue;
+        }
+        if classid == PG_TYPE_RELID {
+            // A container: its own uses count, and a domain's default.
+            let Some(container) = PgTypeOid::new(dep.objid.get()) else {
+                continue;
+            };
+            composite_dependencies_of(interp, container, orig, visited)?;
+            if expr_type_use(interp, dep).refers.contains(&type_oid) {
+                return Err(type_used_in_expr(
+                    interp,
+                    orig,
+                    &depend::describe(interp, dep),
+                ));
+            }
+            continue;
+        }
+        if classid != PG_CLASS_RELID {
+            // A constraint, a trigger, a policy, a rule, ...: its
+            // expression refers to the type.
+            return Err(type_used_in_expr(
+                interp,
+                orig,
+                &depend::describe(interp, dep),
             ));
         }
-        if let Some(row_type) = class.reltype {
-            composite_dependencies_of(interp, row_type, orig, visited)?;
+        let Some(relid) = PgClassOid::new(dep.objid.get()) else {
+            continue;
+        };
+        let Some(class) = interp.pg_class.get(&relid) else {
+            continue;
+        };
+        let columns = relation_columns(interp, relid);
+        if dep.objsubid > 0 {
+            let Some(attr) = interp
+                .attributes_of(relid)
+                .iter()
+                .find(|a| a.attnum == dep.objsubid)
+            else {
+                continue;
+            };
+            if attr.atttypid != type_oid {
+                // The column's default or generation expression.
+                return Err(type_used_in_expr(
+                    interp,
+                    orig,
+                    &format!(
+                        "default value for column {} of {}",
+                        attr.attname,
+                        depend::describe(interp, ObjectAddress::relation(relid))
+                    ),
+                ));
+            }
+        } else if matches!(class.relkind, RelKind::View | RelKind::MaterializedView) {
+            // What the view's query refers to: its rule's.
+            let kind = if class.relkind == RelKind::View {
+                "view"
+            } else {
+                "materialized view"
+            };
+            return Err(type_used_in_expr(
+                interp,
+                orig,
+                &format!("rule _RETURN on {kind} {}", class.relname),
+            ));
+        }
+        // A column of the type (a whole-row dependency counts as one when
+        // the relation has a column of it).
+        let attr = if dep.objsubid > 0 {
+            interp
+                .attributes_of(relid)
+                .iter()
+                .find(|a| a.attnum == dep.objsubid)
+                .map(|a| a.attname.clone())
+        } else {
+            columns
+                .iter()
+                .find(|(_, t)| *t == type_oid)
+                .map(|(n, _)| n.clone())
+        };
+        if let Some(attname) = attr {
+            if matches!(
+                class.relkind,
+                RelKind::Table
+                    | RelKind::MaterializedView
+                    | RelKind::Index
+                    | RelKind::Sequence
+                    | RelKind::Partitioned
+                    | RelKind::PartitionedIndex
+                    | RelKind::ForeignTable
+            ) {
+                return Err(type_used_in_column(interp, orig, &class.relname, &attname));
+            }
+            if let Some(row_type) = class.reltype
+                && row_type != type_oid
+            {
+                composite_dependencies_of(interp, row_type, orig, visited)?;
+            }
+        }
+        if dep.objsubid == 0 {
+            let uses = expr_type_use(interp, ObjectAddress::relation(relid));
+            // A partition key producing the type or using it; an index's
+            // expressions or predicate using it.
+            if (class.relkind == RelKind::Partitioned
+                && (uses.results.contains(&type_oid) || uses.refers.contains(&type_oid)))
+                || (matches!(class.relkind, RelKind::Index | RelKind::PartitionedIndex)
+                    && uses.refers.contains(&type_oid))
+            {
+                return Err(type_used_in_expr(
+                    interp,
+                    orig,
+                    &depend::describe(interp, ObjectAddress::relation(relid)),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// find_missing_composite_type_dependencies: a partition key, an index
+/// expression or a statistics expression producing one of `types` (the
+/// type and those containing it) stores values of it.
+fn missing_composite_dependencies(
+    interp: &PgCatalog,
+    types: &[PgTypeOid],
+    orig: PgClassOid,
+) -> Result<(), DdlError> {
+    use crate::ddl::depend::{self, PG_STATISTIC_EXT_RELID};
+    let produces = |addr: ObjectAddress| {
+        expr_type_use(interp, addr)
+            .results
+            .iter()
+            .any(|t| types.contains(t))
+    };
+    let mut partitioned: Vec<PgClassOid> = interp
+        .partition_specs
+        .keys()
+        .copied()
+        .filter(|r| produces(ObjectAddress::relation(*r)))
+        .collect();
+    partitioned.sort();
+    if let Some(relid) = partitioned.first() {
+        return Err(type_used_in_expr(
+            interp,
+            orig,
+            &depend::describe(interp, ObjectAddress::relation(*relid)),
+        ));
+    }
+    let mut indexes: Vec<PgClassOid> = interp
+        .pg_index
+        .keys()
+        .copied()
+        .filter(|r| produces(ObjectAddress::relation(*r)))
+        .collect();
+    indexes.sort();
+    if let Some(index) = indexes.first() {
+        return Err(type_used_in_expr(
+            interp,
+            orig,
+            &depend::describe(interp, ObjectAddress::relation(*index)),
+        ));
+    }
+    for stats in interp.statistics.iter() {
+        let addr = ObjectAddress {
+            classid: PG_STATISTIC_EXT_RELID,
+            objid: stats.oid,
+            objsubid: 0,
+        };
+        if produces(addr) {
+            return Err(type_used_in_expr(
+                interp,
+                orig,
+                &depend::describe(interp, addr),
+            ));
         }
     }
     Ok(())

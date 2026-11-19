@@ -885,9 +885,19 @@ pub(crate) fn partition_constraint_check(
                 keys.push((quote(name), key));
             }
             None => {
-                let read: Vec<String> = interp
-                    .partition_key_attrs
-                    .get(&parent)
+                // A whole-row reference reads every column.
+                let all: Vec<i16>;
+                let attrs = if interp.partition_key_whole_row.contains(&parent) {
+                    all = interp
+                        .attributes_of(parent)
+                        .iter()
+                        .map(|a| a.attnum)
+                        .collect();
+                    Some(&all)
+                } else {
+                    interp.partition_key_attrs.get(&parent)
+                };
+                let read: Vec<String> = attrs
                     .into_iter()
                     .flatten()
                     .filter_map(|&an| {

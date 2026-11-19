@@ -155,6 +155,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
             });
             checked?;
             default_refs = refs;
+            default_refs.extend(super::depend::literal_coercion_references(
+                interp,
+                expr,
+                base_type_oid,
+            ));
             has_default = !is_null_constant(expr);
         }
         add_domain_constraint(interp, &name, base_type_oid, c, &mut constraints)?;
@@ -206,6 +211,14 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         super::depend::ObjectAddress::type_(oid),
         &default_refs,
         crate::pg_catalog::DepType::Normal,
+    );
+    super::depend::note_expr_type_use(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        super::depend::ExprTypeUse {
+            refers: super::depend::type_references(&default_refs),
+            results: Vec::new(),
+        },
     );
     register_array_type(interp, nsoid, &name, oid)?;
     if has_default {
@@ -579,6 +592,9 @@ pub fn alter_domain(
                 });
                 checked?;
                 default_refs = refs;
+                default_refs.extend(super::depend::literal_coercion_references(
+                    interp, expr, base_type,
+                ));
             }
             // GenerateTypeDependencies(rebuild): the domain's dependencies
             // are recorded anew — on its base type and what the new default
@@ -596,6 +612,14 @@ pub fn alter_domain(
                 addr,
                 &default_refs,
                 crate::pg_catalog::DepType::Normal,
+            );
+            super::depend::note_expr_type_use(
+                interp,
+                addr,
+                super::depend::ExprTypeUse {
+                    refers: super::depend::type_references(&default_refs),
+                    results: Vec::new(),
+                },
             );
             match stmt.def.as_deref() {
                 Some(expr) if !is_null_constant(expr) => {
@@ -1610,6 +1634,7 @@ fn define_base_type(
             &[&[CSTRING_ARRAY]],
             builtin::INT4,
         )?);
+        interp.types_with_typmodin.insert(oid);
     }
     if let Some(typmod_out) = names_of("typmod_out") {
         functions.push(find_type_support_function(
@@ -1858,8 +1883,14 @@ pub fn alter_type(
                         builtin::BOOL,
                     ),
                 }?;
+                if de.defname == "typmod_in" {
+                    interp.types_with_typmodin.insert(oid);
+                }
             }
-            "receive" | "send" | "typmod_in" | "typmod_out" | "analyze" | "analyse" => {}
+            "typmod_in" => {
+                interp.types_with_typmodin.remove(&oid);
+            }
+            "receive" | "send" | "typmod_out" | "analyze" | "analyse" => {}
             "subscript" => subscript = Some(subscript_handler(interp, de)?),
             "internallength" | "input" | "output" | "category" | "preferred" | "default"
             | "element" | "delimiter" | "collatable" => {

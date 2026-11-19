@@ -30,7 +30,21 @@ pub(crate) fn check_attribute_type(
     is_virtual: bool,
 ) -> Result<(), DdlError> {
     let mut containing: Vec<PgTypeOid> = containing.into_iter().collect();
-    check_attribute_type_rec(interp, attname, typid, &mut containing, is_virtual, false)
+    check_attribute_type_rec(
+        interp,
+        Some(attname),
+        typid,
+        &mut containing,
+        is_virtual,
+        false,
+    )
+}
+
+/// `CheckAttributeType` without a column name (PostgreSQL 18.7, for an
+/// extended statistics expression): the checks of a column's type, with
+/// the expression named instead.
+pub(crate) fn check_expression_type(interp: &PgCatalog, typid: PgTypeOid) -> Result<(), DdlError> {
+    check_attribute_type_rec(interp, None, typid, &mut Vec::new(), false, false)
 }
 
 /// `CheckAttributeType` with `CHKATYPE_IS_PARTKEY` (ComputePartitionAttrs),
@@ -43,7 +57,7 @@ pub(crate) fn check_partition_key_type(
 ) -> Result<(), DdlError> {
     check_attribute_type_rec(
         interp,
-        &keycol.to_string(),
+        Some(&keycol.to_string()),
         typid,
         &mut Vec::new(),
         false,
@@ -52,10 +66,11 @@ pub(crate) fn check_partition_key_type(
 }
 
 /// `partkey`: `attname` is a partition key column number
-/// (`CHKATYPE_IS_PARTKEY`, dropped for a composite's attributes).
+/// (`CHKATYPE_IS_PARTKEY`, dropped for a composite's attributes). `None`:
+/// an expression's type.
 fn check_attribute_type_rec(
     interp: &PgCatalog,
-    attname: &str,
+    attname: Option<&str>,
     typid: PgTypeOid,
     containing: &mut Vec<PgTypeOid>,
     is_virtual: bool,
@@ -65,22 +80,21 @@ fn check_attribute_type_rec(
         return Ok(());
     };
     match typ.typtype {
-        TypType::Pseudo if partkey => {
-            return Err(DdlError::Parse(format!(
-                "partition key column {attname} has pseudo-type {}",
-                super::super::util::format_type_for_message(interp, typid)
-            )));
-        }
         TypType::Pseudo => {
-            return Err(DdlError::Parse(format!(
-                "column \"{attname}\" has pseudo-type {}",
-                super::super::util::format_type_for_message(interp, typid)
-            )));
+            let shown = super::super::util::format_type_for_message(interp, typid);
+            return Err(DdlError::Parse(match attname {
+                Some(attname) if partkey => {
+                    format!("partition key column {attname} has pseudo-type {shown}")
+                }
+                Some(attname) => format!("column \"{attname}\" has pseudo-type {shown}"),
+                None => format!("expression has pseudo-type {shown}"),
+            }));
         }
         TypType::Domain => {
             if is_virtual {
                 return Err(DdlError::UnsupportedDdl(format!(
-                    "virtual generated column \"{attname}\" cannot have a domain type"
+                    "virtual generated column \"{}\" cannot have a domain type",
+                    attname.unwrap_or_default()
                 )));
             }
             if let Some(base) = typ.typbasetype {
@@ -99,7 +113,7 @@ fn check_attribute_type_rec(
                 for attr in interp.attributes_of(relid).to_vec() {
                     check_attribute_type_rec(
                         interp,
-                        &attr.attname,
+                        Some(&attr.attname),
                         attr.atttypid,
                         containing,
                         is_virtual,
@@ -148,8 +162,9 @@ fn check_attribute_type_rec(
     // For consistency with check_virtual_generated_security().
     if is_virtual && is_user_defined(typid.get()) {
         return Err(DdlError::UnsupportedDdl(format!(
-            "virtual generated column \"{attname}\" cannot have a user-defined type (Virtual \
-             generated columns that make use of user-defined types are not yet supported.)"
+            "virtual generated column \"{}\" cannot have a user-defined type (Virtual \
+             generated columns that make use of user-defined types are not yet supported.)",
+            attname.unwrap_or_default()
         )));
     }
     Ok(())
