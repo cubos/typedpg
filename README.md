@@ -934,7 +934,7 @@ roles = ["placement"]
 
 A write from `placement` to `users` is now a compile error naming the grant it would take. An exception is that grant, written in the file with its reason: it is reviewed like any other change, and removing it later brings the error back for every statement that still relies on it.
 
-Not checked yet: the bodies of triggers and of the functions a statement calls (their EXECUTE privilege is checked, but what they read and write is not), row-level security policies, and `COPY` — `copy_in!` is not checked against roles.
+The bodies of the triggers a statement fires and of the routines it calls are checked too: a body runs with the statement's role, or with its owner's role under `SECURITY DEFINER`, and what it reads and writes must be allowed as well. Not checked yet: dynamic SQL in those bodies (`EXECUTE`), statements typedpg can't analyze (a name it can't resolve, a construct it doesn't model), row-level security policies, and `COPY` — `copy_in!` is not checked against roles.
 
 ## Migrations
 

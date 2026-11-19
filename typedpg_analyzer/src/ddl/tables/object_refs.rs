@@ -349,20 +349,16 @@ pub(super) fn validate_constraint(
 /// `ALTER TABLE ... ENABLE / DISABLE [ALWAYS | REPLICA] TRIGGER name`
 /// (EnableDisableTrigger).
 pub(super) fn enable_disable_trigger(
-    interp: &PgCatalog,
+    interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let exists = interp
-        .triggers
-        .get(&relid)
-        .is_some_and(|ts| ts.iter().any(|t| t.name == cmd.name));
-    if !exists {
-        return Err(DdlError::TypeNotFound(format!(
-            "trigger \"{}\" for table \"{}\" does not exist",
-            cmd.name,
-            relname_of(interp, relid)
-        )));
-    }
-    Ok(())
+    use crate::ddl::triggers::TriggerState;
+    let state = match cmd.subtype {
+        AlterTableType::AtEnableTrig => TriggerState::Origin,
+        AlterTableType::AtEnableAlwaysTrig => TriggerState::Always,
+        AlterTableType::AtEnableReplicaTrig => TriggerState::Replica,
+        _ => TriggerState::Disabled,
+    };
+    crate::ddl::triggers::set_trigger_state(interp, relid, cmd, state)
 }

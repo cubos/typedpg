@@ -177,12 +177,16 @@ pub(crate) fn infer_column_ref(
     }
 }
 
-/// The parameters of the SQL function whose body is being validated.
+/// The name a SQL function body's parameters are qualified by, and the
+/// variables a body's statements see.
 pub(crate) struct SqlFunctionParams {
     /// The function's name, which may qualify a parameter (`f.x`).
     pub name: String,
     /// Named input parameters and their declared types.
     pub params: Vec<(String, PgTypeOid)>,
+    /// PL/pgSQL variables (parameters, `DECLARE`d ones, `NEW` / `OLD`, ...)
+    /// in scope, which a column reference that matched no column may name.
+    pub locals: Vec<(String, ExprType)>,
 }
 
 thread_local! {
@@ -191,7 +195,8 @@ thread_local! {
 }
 
 /// Run `f` with `params` as the parameter namespace of column references —
-/// what PG installs for a SQL function body (`sql_fn_parser_setup`).
+/// what PG installs for a SQL function body (`sql_fn_parser_setup`), and
+/// what a PL/pgSQL body's variables add to.
 pub(crate) fn with_sql_function_params<R>(params: SqlFunctionParams, f: impl FnOnce() -> R) -> R {
     let prev = SQL_FUNCTION_PARAMS.with(|p| p.replace(Some(params)));
     let out = f();
@@ -201,17 +206,24 @@ pub(crate) fn with_sql_function_params<R>(params: SqlFunctionParams, f: impl FnO
 
 /// PG's `sql_fn_post_column_ref`: consulted only once a column reference
 /// matched no column or relation, so a column always wins over a same-named
-/// parameter. `x` names a parameter; `f.x` a parameter qualified by the
-/// function's name; `x.fld` / `f.x.fld` a field of a composite parameter.
+/// parameter. `x` names a parameter or local variable; `f.x` a parameter
+/// qualified by the function's name; `x.fld` / `f.x.fld` a field of a
+/// composite one.
 fn sql_function_param(parts: &[String], snapshot: &PgCatalog) -> Option<ExprType> {
     SQL_FUNCTION_PARAMS.with(|cell| {
         let guard = cell.borrow();
         let fp = guard.as_ref()?;
         let param = |name: &str| {
-            fp.params
+            fp.locals
                 .iter()
                 .find(|(n, _)| !n.is_empty() && n == name)
-                .map(|&(_, t)| ExprType::scalar(t, true))
+                .map(|(_, t)| t.clone())
+                .or_else(|| {
+                    fp.params
+                        .iter()
+                        .find(|(n, _)| !n.is_empty() && n == name)
+                        .map(|&(_, t)| ExprType::scalar(t, true))
+                })
         };
         let (value, field) = match parts {
             [p] => (param(p)?, None),

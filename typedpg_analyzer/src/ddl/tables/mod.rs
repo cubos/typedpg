@@ -1682,9 +1682,44 @@ fn apply_alter_subtype(
                 if subtype == AlterTableType::AtDisableTrigAll {
                     interp.ri_triggers_disabled.insert(rel);
                     interp.ri_triggers_ever_disabled.insert(rel);
+                    crate::ddl::triggers::set_all_triggers_state(
+                        interp,
+                        rel,
+                        crate::ddl::triggers::TriggerState::Disabled,
+                    );
                 } else {
                     interp.ri_triggers_disabled.remove(&rel);
+                    crate::ddl::triggers::set_all_triggers_state(
+                        interp,
+                        rel,
+                        crate::ddl::triggers::TriggerState::Origin,
+                    );
                 }
+            }
+            Ok(())
+        }
+        // ENABLE / DISABLE TRIGGER USER: the ones the migrations created
+        // (every trigger the analyzer models).
+        AlterTableType::AtDisableTrigUser | AlterTableType::AtEnableTrigUser => {
+            let partitioned = interp
+                .pg_class
+                .get(&relid)
+                .is_some_and(|c| c.relkind == RelKind::Partitioned);
+            let targets = if rec.recurse && partitioned {
+                inherit::all_inheritors(interp, relid)
+            } else {
+                vec![relid]
+            };
+            for rel in targets {
+                crate::ddl::triggers::set_all_triggers_state(
+                    interp,
+                    rel,
+                    if subtype == AlterTableType::AtDisableTrigUser {
+                        crate::ddl::triggers::TriggerState::Disabled
+                    } else {
+                        crate::ddl::triggers::TriggerState::Origin
+                    },
+                );
             }
             Ok(())
         }
