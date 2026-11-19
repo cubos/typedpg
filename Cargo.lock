@@ -3846,6 +3846,9 @@ dependencies = [
  "prost-build",
  "prost-types",
  "protox",
+ "quote",
+ "regex",
+ "syn 2.0.119",
 ]
 
 [[package]]

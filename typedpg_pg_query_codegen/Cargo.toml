@@ -5,10 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Generates typedpg_pg_query's protobuf types and AST walkers from libpg_query's pg_query.proto"
+description = "Generates typedpg_pg_query's AST types and walkers from libpg_query's pg_query.proto or PostgreSQL's headers"
 
 [dependencies]
 heck = "0.5"
 prost-build = "0.14"
 prost-types = "0.14"
 protox = "0.10"
+regex = "1"
+
+[dev-dependencies]
+quote = "1"
+syn = { version = "2", features = ["full"] }
