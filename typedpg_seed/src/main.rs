@@ -4,7 +4,7 @@
 //!   cargo run -p typedpg_seed
 //!
 //! Spins up a disposable `postgres:<PG_VERSION>` container (the release
-//! typedpg_pg_query's grammar comes from, `18.6`) via the Docker daemon
+//! typedpg targets, `typedpg_pg_query/POSTGRES_VERSION`) via the Docker daemon
 //! (using `testcontainers`), waits for it to accept connections, exports each
 //! `pg_catalog` table almost 1:1 into the analyzer's `PgCatalogSeed`, then
 //! stops + removes the container (via `Drop`). The output is written to
@@ -29,8 +29,8 @@ use typedpg_analyzer::{
 };
 
 fn main() {
-    // The PostgreSQL release whose grammar typedpg_pg_query vendors: the
-    // seed must describe the same server the parser speaks for.
+    // The PostgreSQL release typedpg targets: the seed must describe the
+    // same server the parser speaks for.
     let tag = typedpg_pg_query::PG_VERSION;
     eprintln!("Pulling postgres:{tag} from registry...");
     // The official image, as testcontainers-modules' `Postgres` configured

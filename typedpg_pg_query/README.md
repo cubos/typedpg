@@ -33,8 +33,31 @@ and missing objects get PostgreSQL's own errors (`type "x" does not exist`,
 PostgreSQL 18.4's `%TYPE` / `%ROWTYPE` code, which libpg_query replaces with a
 text-only stand-in, is restored while a catalog is installed.
 
-`PG_VERSION` / `PG_VERSION_NUM` name the PostgreSQL release the grammar comes
-from; they are read from the vendored `pg_query.h` at build time.
+`PG_VERSION` / `PG_VERSION_NUM` name the PostgreSQL release the parser
+implements: `POSTGRES_VERSION`, the release typedpg targets. The seed, the
+extension scripts, the `pg_sanity` oracle and the test servers all follow
+that file.
+
+## Moving to a new minor release
+
+PostgreSQL's minor releases leave the grammar alone, and libpg_query
+follows them weeks later, if at all. typedpg moves first: `POSTGRES_VERSION`
+can name a later minor release of the major libpg_query's sources come from,
+and the build rewrites their version defines to it. What the new release
+changed in the code libpg_query extracts is ported into `patches.rs`:
+
+1. Diff the two release tags of PostgreSQL (`REL_18_6`, `REL_18_7`) over
+   the files libpg_query vendors (`libpg_query/src/postgres/src_<path>.c`,
+   whose header lists the functions it took, and the headers under
+   `include/`), function by function.
+2. Port each change to parsing or PL/pgSQL compilation as a patch (see
+   "PostgreSQL 18.7" in `patches.rs`), with a test showing the new
+   behavior. Server-only changes (memory contexts, tuple descriptors,
+   concurrency) don't reach the parser.
+3. Set `POSTGRES_VERSION`, pin `typedpg_test_support`'s image to the
+   release (its test servers check it), regenerate the seed
+   (`cargo run -p typedpg_seed`) and run the suites, including
+   `scripts/run-pg-sanity.sh` on the new release.
 
 ## Moving to a new libpg_query release
 
@@ -48,9 +71,11 @@ from; they are read from the vendored `pg_query.h` at build time.
    the problem.
 4. Adapt typedpg_analyzer to the AST changes, regenerate the seed
    (`cargo run -p typedpg_seed` — the seed stores protobuf-encoded ASTs), and
-   run the test suites, including `scripts/run-pg-sanity.sh`. Both the seed
-   and the oracle run `postgres:<PG_VERSION>`, the release the new tag's
-   grammar comes from, so the catalog, the oracle and the parser agree.
+   run the test suites, including `scripts/run-pg-sanity.sh`. Set
+   `POSTGRES_VERSION` to the release the new tag's sources come from (or a
+   later minor one, as above), and drop the patches porting releases the
+   tag now includes: the seed and the oracle run `postgres:<PG_VERSION>`,
+   so the catalog, the oracle and the parser agree.
 
 ## Patches
 

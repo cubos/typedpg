@@ -20,8 +20,8 @@
 
 set -euo pipefail
 
-# The release typedpg_pg_query's grammar (and the seed) comes from.
-PG_VERSION=$(sed -n 's/^#define PG_VERSION "\(.*\)"$/\1/p' "$(dirname "$0")/../typedpg_pg_query/libpg_query/pg_query.h")
+# The release typedpg targets: the parser's and the seed's.
+PG_VERSION=$(tr -d '[:space:]' < "$(dirname "$0")/../typedpg_pg_query/POSTGRES_VERSION")
 PG_IMAGE="${PG_IMAGE:-postgres:$PG_VERSION}"
 CONTAINER_NAME="typedpg-pg-sanity-$$"
 PG_USER="postgres"

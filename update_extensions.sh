@@ -13,15 +13,15 @@
 #   citext--1.5--1.6.sql (upgrade)
 #   ...
 #
-# The scripts must come from the PostgreSQL release typedpg_pg_query's
-# grammar (and the seed) comes from: a newer branch ships extension versions
+# The scripts must come from the PostgreSQL release typedpg targets
+# (typedpg_pg_query/POSTGRES_VERSION), the parser's and the seed's: a newer branch ships extension versions
 # whose scripts use grammar that release's parser rejects (postgres_fdw 1.3's
 # `ALTER FOREIGN DATA WRAPPER ... CONNECTION` is PostgreSQL 19), and objects
 # its server doesn't have. The file lists below follow that release's
 # contrib/ too.
 #
 # Usage:
-#   ./update_extensions.sh              # the release libpg_query pins (default)
+#   ./update_extensions.sh              # the release typedpg targets (default)
 #   ./update_extensions.sh REL_18_6     # use a specific tag/branch
 #
 # Output: typedpg_analyzer/src/extensions/*.sql. Every file is downloaded
@@ -43,13 +43,12 @@ cd "$(dirname "$0")"
 if [[ $# -ge 1 ]]; then
     BRANCH="$1"
 else
-    # `#define PG_VERSION "18.6"` -> REL_18_6, the tag format of every
-    # release since PostgreSQL 10 (REL_<major>_<minor>).
-    PG_VERSION=$(tr -d '\r' < typedpg_pg_query/libpg_query/pg_query.h \
-        | sed -n 's/^[[:space:]]*#[[:space:]]*define[[:space:]]\{1,\}PG_VERSION[[:space:]]\{1,\}"\([^"]*\)"[[:space:]]*$/\1/p')
+    # `18.7` -> REL_18_7, the tag format of every release since
+    # PostgreSQL 10 (REL_<major>_<minor>).
+    PG_VERSION=$(tr -d '[:space:]' < typedpg_pg_query/POSTGRES_VERSION)
     if [[ ! "$PG_VERSION" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
-        echo "error: cannot derive a release tag from PG_VERSION \"${PG_VERSION}\" in" \
-            "typedpg_pg_query/libpg_query/pg_query.h; pass the tag explicitly" >&2
+        echo "error: cannot derive a release tag from \"${PG_VERSION}\" in" \
+            "typedpg_pg_query/POSTGRES_VERSION; pass the tag explicitly" >&2
         exit 1
     fi
     BRANCH="REL_${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"

@@ -1,4 +1,5 @@
-//! Compile the vendored libpg_query and expose its PostgreSQL version.
+//! Compile the vendored libpg_query and expose the PostgreSQL release it
+//! is brought to (POSTGRES_VERSION).
 
 use std::path::Path;
 
@@ -45,16 +46,20 @@ fn main() {
     // Sources with a patch (patches.rs) are compiled from a patched copy.
     println!("cargo:rerun-if-changed=patches.rs");
     println!("cargo:rerun-if-changed=csrc");
+    println!("cargo:rerun-if-changed=POSTGRES_VERSION");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    // With LF line endings, as the patches are written: a checkout with
+    // `core.autocrlf` (Windows) has CRLF ones.
+    let read = |file: &str| -> String {
+        std::fs::read_to_string(lib.join(file))
+            .unwrap_or_else(|e| panic!("reading libpg_query/{file}: {e}"))
+            .replace("\r\n", "\n")
+    };
     let mut patched: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
     for patch in PATCHES {
-        let text = patched.entry(patch.file).or_insert_with(|| {
-            // With LF line endings, as the patches are written: a checkout
-            // with `core.autocrlf` (Windows) has CRLF ones.
-            std::fs::read_to_string(lib.join(patch.file))
-                .unwrap_or_else(|e| panic!("reading libpg_query/{}: {e}", patch.file))
-                .replace("\r\n", "\n")
-        });
+        let text = patched
+            .entry(patch.file)
+            .or_insert_with(|| read(patch.file));
         let found = text.matches(patch.find).count();
         assert!(
             found == 1,
@@ -64,6 +69,64 @@ fn main() {
             patch.why
         );
         *text = text.replacen(patch.find, patch.replace, 1);
+    }
+
+    // The PostgreSQL release typedpg targets. libpg_query's sources come
+    // from an earlier minor release of the same major, which patches.rs
+    // brings to it where parsing differs; its version defines are rewritten
+    // to it, so the parse results' `version` says the same.
+    let postgres = std::fs::read_to_string("POSTGRES_VERSION").expect("reading POSTGRES_VERSION");
+    let postgres = postgres.trim().to_owned();
+    let release = |version: &str| -> (u32, u32) {
+        version
+            .split_once('.')
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
+            .unwrap_or_else(|| panic!("{version:?} is not a PostgreSQL release (`18.7`)"))
+    };
+    let (major, minor) = release(&postgres);
+    let upstream = define(&read("pg_query.h"), "PG_VERSION");
+    let (upstream_major, upstream_minor) = release(upstream.trim_matches('"'));
+    assert!(
+        upstream_major == major && upstream_minor <= minor,
+        "POSTGRES_VERSION is {postgres}, but libpg_query's sources are PostgreSQL {upstream}: a \
+         target must be a later minor release of their major (see README.md)"
+    );
+    let num = major * 10000 + minor;
+    for (file, defines) in [
+        (
+            "pg_query.h",
+            vec![
+                ("PG_VERSION", format!("\"{postgres}\"")),
+                ("PG_VERSION_NUM", num.to_string()),
+            ],
+        ),
+        (
+            "src/postgres/include/pg_config.h",
+            vec![
+                ("PACKAGE_STRING", format!("\"PostgreSQL {postgres}\"")),
+                ("PACKAGE_VERSION", format!("\"{postgres}\"")),
+                ("PG_MINORVERSION_NUM", minor.to_string()),
+                ("PG_VERSION", format!("\"{postgres}\"")),
+                ("PG_VERSION_NUM", num.to_string()),
+                (
+                    "PG_VERSION_STR",
+                    format!("\"PostgreSQL {postgres} (libpg_query)\""),
+                ),
+            ],
+        ),
+    ] {
+        let text = patched.entry(file).or_insert_with(|| read(file));
+        for (name, value) in defines {
+            let prefix = format!("#define {name} ");
+            let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(&prefix)).collect();
+            assert_eq!(
+                lines.len(),
+                1,
+                "libpg_query/{file} defines {name} {} times",
+                lines.len()
+            );
+            *text = text.replacen(lines[0], &format!("{prefix}{value}"), 1);
+        }
     }
     // A patched header can't just be shadowed through the include path:
     // its neighbours `#include "…"` it, which looks in their own directory
@@ -95,6 +158,8 @@ fn main() {
         // The catalog hooks (patched lookups call into them).
         .file("csrc/catalog.c")
         .include("csrc")
+        // The patched pg_query.h, ahead of the original beside it.
+        .include(out_dir.join("patched"))
         .include(lib)
         // A patched copy's `#include "…"` of its upstream neighbours.
         .include(lib.join("src"))
@@ -120,27 +185,25 @@ fn main() {
     }
     build.compile("pg_query");
 
-    // `#define PG_VERSION "18.4"` / `#define PG_VERSION_NUM 180004`.
-    let header = std::fs::read_to_string(lib.join("pg_query.h")).expect("reading pg_query.h");
-    let define = |name: &str| -> String {
-        header
-            .lines()
-            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
-            .unwrap_or_else(|| panic!("{name} not defined in pg_query.h"))
-            .trim()
-            .to_owned()
-    };
-    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("version.rs");
+    let out = out_dir.join("version.rs");
     std::fs::write(
         out,
         format!(
-            "/// The PostgreSQL release whose grammar this parser implements.\n\
-             pub const PG_VERSION: &str = {};\n\
-             /// [`PG_VERSION`] as `PG_VERSION_NUM` (`180004` for 18.4).\n\
-             pub const PG_VERSION_NUM: i32 = {};\n",
-            define("PG_VERSION"),
-            define("PG_VERSION_NUM"),
+            "/// The PostgreSQL release this parser implements (POSTGRES_VERSION).\n\
+             pub const PG_VERSION: &str = \"{postgres}\";\n\
+             /// [`PG_VERSION`] as `PG_VERSION_NUM` (`180007` for 18.7).\n\
+             pub const PG_VERSION_NUM: i32 = {num};\n",
         ),
     )
     .expect("writing version.rs");
+}
+
+/// The value of `#define name value` in `header`.
+fn define(header: &str, name: &str) -> String {
+    header
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+        .unwrap_or_else(|| panic!("{name} not defined"))
+        .trim()
+        .to_owned()
 }
