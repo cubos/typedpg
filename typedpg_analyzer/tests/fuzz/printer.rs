@@ -204,9 +204,10 @@ fn sort_and_limit(sel: &protobuf::SelectStmt) -> Option<String> {
         } else {
             sql.push_str(&format!(" LIMIT {}", expr(count)?));
         }
-    } else if enumeration::<LimitOption>(sel.limit_option)? == LimitOption::Count {
-        sql.push_str(" LIMIT ALL");
     }
+    // `LIMIT ALL` needs no case of its own: the grammar stores it as a NULL
+    // constant count (`LIMIT NULL` parses the same), and a select without a
+    // LIMIT has no count and `LimitOption::Count`, PostgreSQL's default.
     if let Some(offset) = sel.limit_offset.as_deref() {
         sql.push_str(&format!(" OFFSET {}", expr(offset)?));
     }
