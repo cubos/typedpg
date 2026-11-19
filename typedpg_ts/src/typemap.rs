@@ -7,8 +7,10 @@
 //! which reads the binary format and must know every type it decodes).
 //!
 //! The runtime's own types are written `typedpg.Range<…>` /
-//! `typedpg.Interval` / `typedpg.JsonValue`: the generated module imports
-//! them as a namespace, so a type the user maps to can't collide with them.
+//! `typedpg.JsonValue`: the generated module imports them as a namespace,
+//! so a type the user maps to can't collide with them. Dates, times and
+//! intervals are the global `Temporal`'s types (the runtime's declarations
+//! reference TypeScript's `esnext.temporal` lib).
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -34,12 +36,18 @@ pub enum Codec {
     BigInt,
     /// `json` / `jsonb`, parsed / stringified.
     Json,
-    /// `timestamptz` / `timestamp` ↔ `Date` (a `timestamp`, which has no
-    /// time zone, read and written as UTC).
+    /// `timestamptz` ↔ `Temporal.Instant` (a parameter takes a
+    /// `Temporal.ZonedDateTime` too).
     Timestamptz,
+    /// `timestamp` ↔ `Temporal.PlainDateTime`.
+    Timestamp,
+    /// `date` ↔ `Temporal.PlainDate`.
+    Date,
+    /// `time` ↔ `Temporal.PlainTime`.
+    Time,
     /// `bytea` ↔ `Uint8Array`.
     Bytea,
-    /// `interval` ↔ `{ months, days, microseconds }`.
+    /// `interval` ↔ `Temporal.Duration`.
     Interval,
     /// pgvector's `vector` / `halfvec` (`[1,2,3]`) ↔ `number[]`.
     Vector,
@@ -69,6 +77,9 @@ impl Codec {
             Codec::BigInt => json!("bigint"),
             Codec::Json => json!("json"),
             Codec::Timestamptz => json!("timestamptz"),
+            Codec::Timestamp => json!("timestamp"),
+            Codec::Date => json!("date"),
+            Codec::Time => json!("time"),
             Codec::Bytea => json!("bytea"),
             Codec::Interval => json!("interval"),
             Codec::Vector => json!("vector"),
@@ -99,9 +110,12 @@ impl Codec {
             Codec::Number => "number".into(),
             Codec::BigInt => "bigint".into(),
             Codec::Json => "unknown".into(),
-            Codec::Timestamptz => "Date".into(),
+            Codec::Timestamptz => "Temporal.Instant".into(),
+            Codec::Timestamp => "Temporal.PlainDateTime".into(),
+            Codec::Date => "Temporal.PlainDate".into(),
+            Codec::Time => "Temporal.PlainTime".into(),
             Codec::Bytea => "Uint8Array".into(),
-            Codec::Interval => format!("{RUNTIME_NS}.Interval"),
+            Codec::Interval => "Temporal.Duration".into(),
             Codec::Vector => "readonly number[]".into(),
             Codec::Hstore => "Readonly<Record<string, string | null>>".into(),
             Codec::Void => "undefined".into(),
@@ -127,8 +141,8 @@ pub struct TsType {
     /// The type of the value a column of it decodes to.
     pub output: String,
     /// The type a parameter of it accepts — looser where several JS values
-    /// encode the same way (`number` for an `int8`, `string` for a
-    /// `timestamptz`).
+    /// encode the same way (`number` for an `int8`, a
+    /// `Temporal.ZonedDateTime` for a `timestamptz`).
     pub input: String,
     pub codec: Codec,
 }
@@ -400,16 +414,20 @@ impl TypeMapper<'_> {
                 input: "unknown".into(),
                 codec: Codec::Json,
             },
-            // A `Date` both ways, never a string: a parameter is never
-            // `infinity` (see `FINITE_PARAMETER_TYPES`). A `timestamp` is
-            // read and written as UTC (PG ignores the `Z` it is written
-            // with).
-            "timestamptz" | "timestamp" => same("Date".into(), Codec::Timestamptz),
-            "interval" => TsType {
-                output: format!("{RUNTIME_NS}.Interval"),
-                input: format!("{RUNTIME_NS}.Interval | string"),
-                codec: Codec::Interval,
+            // Temporal's types, never a string: a parameter of one is never
+            // `infinity` (see `FINITE_PARAMETER_TYPES`). An instant is an
+            // instant whatever zone it is seen in.
+            "timestamptz" => TsType {
+                output: "Temporal.Instant".into(),
+                input: "Temporal.Instant | Temporal.ZonedDateTime".into(),
+                codec: Codec::Timestamptz,
             },
+            "timestamp" => same("Temporal.PlainDateTime".into(), Codec::Timestamp),
+            "date" => same("Temporal.PlainDate".into(), Codec::Date),
+            "time" => same("Temporal.PlainTime".into(), Codec::Time),
+            // `timetz` stays text: Temporal has no time of day with an
+            // offset.
+            "interval" => same("Temporal.Duration".into(), Codec::Interval),
             "bytea" => same("Uint8Array".into(), Codec::Bytea),
             "void" => same("undefined".into(), Codec::Void),
             _ => text(),
@@ -417,10 +435,13 @@ impl TypeMapper<'_> {
     }
 }
 
-/// The types whose parameters the generated module binds from a `Date`,
-/// which is never infinite: the analysis takes them finite
-/// (`PgCatalog::assume_finite_parameters`) unless `types` maps them.
-pub const FINITE_PARAMETER_TYPES: &[&str] = &["timestamptz", "timestamp"];
+/// The types whose parameters the generated module binds from a Temporal
+/// value (a `PlainDate`, `PlainDateTime` or `Instant`), which is never
+/// infinite: the analysis takes them finite
+/// (`PgCatalog::assume_finite_parameters`) unless `types` maps them. Not
+/// `interval`, as on the Rust side
+/// (`typedpg_core::config::FINITE_PARAMETER_TYPES`).
+pub const FINITE_PARAMETER_TYPES: &[&str] = &["date", "timestamp", "timestamptz"];
 
 /// Whether `ty` is (an array of) an anonymous record, which PG has no
 /// input for: a value of it can't be a parameter.
@@ -504,10 +525,27 @@ mod tests {
             assert_eq!(m.map(&basic_ty("numeric")).output, "string");
             assert_eq!(m.map(&basic_ty("tsvector")).output, "string");
             assert_eq!(m.map(&basic_ty("timestamptz")).codec, Codec::Timestamptz);
-            assert_eq!(m.map(&basic_ty("timestamptz")).input, "Date");
-            assert_eq!(m.map(&basic_ty("timestamp")).output, "Date");
-            assert_eq!(m.map(&basic_ty("timestamp")).input, "Date");
-            assert_eq!(m.map(&basic_ty("interval")).output, "typedpg.Interval");
+            assert_eq!(m.map(&basic_ty("timestamptz")).output, "Temporal.Instant");
+            assert_eq!(
+                m.map(&basic_ty("timestamptz")).input,
+                "Temporal.Instant | Temporal.ZonedDateTime"
+            );
+            assert_eq!(
+                m.map(&basic_ty("timestamp")).output,
+                "Temporal.PlainDateTime"
+            );
+            assert_eq!(
+                m.map(&basic_ty("timestamp")).input,
+                "Temporal.PlainDateTime"
+            );
+            assert_eq!(m.map(&basic_ty("timestamp")).codec, Codec::Timestamp);
+            assert_eq!(m.map(&basic_ty("date")).output, "Temporal.PlainDate");
+            assert_eq!(m.map(&basic_ty("date")).codec, Codec::Date);
+            assert_eq!(m.map(&basic_ty("time")).output, "Temporal.PlainTime");
+            assert_eq!(m.map(&basic_ty("time")).codec, Codec::Time);
+            assert_eq!(m.map(&basic_ty("timetz")).output, "string");
+            assert_eq!(m.map(&basic_ty("interval")).output, "Temporal.Duration");
+            assert_eq!(m.map(&basic_ty("interval")).input, "Temporal.Duration");
             assert_eq!(m.map(&basic_ty("jsonb")).output, "typedpg.JsonValue");
         });
     }
@@ -525,7 +563,7 @@ mod tests {
         assert_eq!(Codec::Vector.fits(), "readonly number[]");
         assert_eq!(
             Codec::Multirange(Box::new(Codec::Timestamptz)).fits(),
-            "readonly typedpg.Range<Date>[]"
+            "readonly typedpg.Range<Temporal.Instant>[]"
         );
     }
 

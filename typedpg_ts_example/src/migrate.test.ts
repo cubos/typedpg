@@ -92,7 +92,9 @@ describe("migrations", { skip }, () => {
         assert.deepEqual(await migrate(db, migrations), []);
         const status = await migrationStatus(db, migrations);
         assert.deepEqual(status.map((s) => [s.name, s.applied, s.drifted]), names.map((n) => [n, true, false]));
-        assert.ok(status.every((s) => s.appliedAt instanceof Date && Date.now() - s.appliedAt.getTime() < 60_000));
+        assert.ok(
+          status.every((s) => s.appliedAt instanceof Temporal.Instant && Date.now() - s.appliedAt.epochMilliseconds < 60_000),
+        );
         // The no-transaction migration's down runs one statement at a time
         // (DROP INDEX CONCURRENTLY refuses a transaction block).
         assert.equal(await revertMigration(db, migrations), "0003_things_index");

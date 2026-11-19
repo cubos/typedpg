@@ -10,8 +10,8 @@ src/bad.ts:26:13: error: positional placeholder `$1` is not supported: name the 
 src/bad.ts:30:13: error: anonymous record-typed query parameters are not supported — pass the fields individually using a ROW(...) constructor in SQL
 src/bad.ts:32:13: error: duplicate column name "id" in the query's output: a row object has one property per name, so give the columns distinct names (`AS ...`)
 src/bad.ts:34:13: error: duplicate parameter name "ids": a parameter and a spread can't share one name
-src/bad.ts:42:16: error: column "nope" of relation "users" does not exist
-src/bad.ts:46:9: error: sql is called as a function, not as a template tag: sql(`...`)
+src/bad.ts:44:16: error: column "nope" of relation "users" does not exist
+src/bad.ts:48:9: error: sql is called as a function, not as a template tag: sql(`...`)
 src/broken.sql:3:1: error: SQL outside a query: each query starts with a `/* @name queryName */` comment
 src/broken.sql:6:12: error: column "nmae" does not exist
   ╭────

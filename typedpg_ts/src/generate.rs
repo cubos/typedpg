@@ -575,7 +575,7 @@ mod tests {
             "home: { street: string | null; num: number | null } | null;",
             r#"moods: ("happy" | "sad" | null)[] | null;"#,
             "span: typedpg.Range<number> | null;",
-            "period: typedpg.Range<Date>[] | null;",
+            "period: typedpg.Range<Temporal.Instant>[] | null;",
             "t2: (string | null)[];",
             "homes: ({ street: string | null; num: number | null } | null)[] | null;",
         ] {

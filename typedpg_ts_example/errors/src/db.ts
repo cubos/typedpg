@@ -45,12 +45,12 @@ export interface Queries {
   "SELECT id, nmae FROM users": { error: "column \"nmae\" does not exist" };
   "SELECT now() - $d AS t": {
     params: {
-      d: Date;
+      d: Temporal.Instant | Temporal.ZonedDateTime;
     };
     row: {
-      t: typedpg.Interval;
+      t: Temporal.Duration;
     };
-    value: typedpg.Interval;
+    value: Temporal.Duration;
   };
   "SELECT u.id, p.id FROM users u JOIN posts p ON p.author_id = u.id": { error: "duplicate column name \"id\" in the query's output: a row object has one property per name, so give the columns distinct names (`AS ...`)" };
 }

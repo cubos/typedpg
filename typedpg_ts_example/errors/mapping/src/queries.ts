@@ -23,7 +23,7 @@ export interface MappedRow {
  *        now() AS at, $prefs::prefs AS prefs
  * ```
  */
-export const mapped = createQuery<{ params: MappedParams; row: MappedRow }, [typedpg.Fits<Instant, Date>, typedpg.Fits<Address, { readonly street: string | null; readonly number: number | null }>, typedpg.Fits<Prefs, unknown>, typedpg.Fits<ShortAddress, { readonly street: string | null; readonly number: number | null }>, typedpg.Fits<UserId, bigint>]>(
+export const mapped = createQuery<{ params: MappedParams; row: MappedRow }, [typedpg.Fits<Instant, Temporal.Instant>, typedpg.Fits<Address, { readonly street: string | null; readonly number: number | null }>, typedpg.Fits<Prefs, unknown>, typedpg.Fits<ShortAddress, { readonly street: string | null; readonly number: number | null }>, typedpg.Fits<UserId, bigint>]>(
   "SELECT 1::user_id AS id, ROW('a', 1)::short_address AS short, ROW('b', 2)::address AS addr,\n       now() AS at, $prefs::prefs AS prefs",
   "{\"sql\":[\"SELECT 1::user_id AS id, ROW('a', 1)::short_address AS short, ROW('b', 2)::address AS addr,\\n       now() AS at, ($1::pg_catalog.jsonb)::prefs AS prefs\"],\"params\":[[\"prefs\",\"json\"]],\"columns\":[[\"id\",\"bigint\"],[\"short\",[\"record\",[[\"street\",\"text\"],[\"number\",\"number\"]]]],[\"addr\",[\"record\",[[\"street\",\"text\"],[\"number\",\"number\"]]]],[\"at\",\"timestamptz\"],[\"prefs\",\"json\"]],\"subquery\":true}",
 );

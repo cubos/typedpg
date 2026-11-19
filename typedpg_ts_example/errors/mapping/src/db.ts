@@ -7,7 +7,7 @@ import type { Address, Embedding, EmbeddingText, Instant, JsonPath, Mood, Prefs,
 
 // Each type in `types` must fit what its PostgreSQL type is read as.
 export type TypeMappingChecks = [
-  typedpg.Fits<Instant, Date>, // pg_catalog.timestamptz
+  typedpg.Fits<Instant, Temporal.Instant>, // pg_catalog.timestamptz
   typedpg.Fits<Address, { readonly street: string | null; readonly number: number | null }>, // public.address
   typedpg.Fits<Embedding, readonly number[]>, // public.embedding
   typedpg.Fits<EmbeddingText, readonly number[]>, // public.embedding_text

@@ -155,7 +155,7 @@ for (const [name, driver] of drivers) {
     });
 
     test("a timestamptz parameter", async () => {
-      const at = new Date("1999-06-15T12:00:00.123Z");
+      const at = Temporal.Instant.from("1999-06-15T12:00:00.123456Z");
       const [year, sent] = await wire.sent(() => q.yearOf.fetchValue(db, { at }));
       assert.equal(year, "1999");
       assertSent(sent, [TIMESTAMPTZ]);

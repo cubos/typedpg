@@ -7,12 +7,35 @@
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 
-import { type CopyRow, NoRowsError, type Params, range, emptyRange } from "@cubos/typedpg";
+import { type CopyRow, DecodeError, NoRowsError, type Params, range, emptyRange } from "@cubos/typedpg";
 
-import { type Connection, baseUrl, drivers, freshDatabase, prng } from "./testdb.ts";
+import { type Connection, baseUrl, drivers, freshDatabase, plain, prng } from "./testdb.ts";
 import * as t from "./things.ts";
 
 type ThingParams = Params<typeof t.insertThing>;
+
+const instant = (s: string) => Temporal.Instant.from(s);
+const day = (s: string) => Temporal.PlainDate.from(s);
+
+/**
+ * The Duration an interval of these fields reads as: years and months from
+ * its months, hours down to microseconds from its time, as PostgreSQL
+ * prints them.
+ */
+function interval(sign: 1 | -1, months: number, days: number, micros: number): Temporal.Duration {
+  const s = (n: number) => sign * n + 0;
+  return new Temporal.Duration(
+    s(Math.trunc(months / 12)),
+    s(months % 12),
+    0,
+    s(days),
+    s(Math.trunc(micros / 3_600_000_000)),
+    s(Math.trunc(micros / 60_000_000) % 60),
+    s(Math.trunc(micros / 1_000_000) % 60),
+    s(Math.trunc(micros / 1_000) % 1_000),
+    s(micros % 1_000),
+  );
+}
 
 const shape = {
   name: 'sq "uare" (1,2) {x}',
@@ -32,22 +55,30 @@ const fixed: ThingParams = {
   shape_d: { ...shape, name: "domain" },
   shapes: [shape, null, { name: null, color: null, points: null, tags: [], meta: null }],
   span: range(1, 10, "[]"),
-  periods: [range(new Date("2024-01-01T00:00:00Z"), new Date("2024-02-01T12:30:00.5Z")), range(null, new Date(0))],
+  periods: [range(instant("2024-01-01T00:00:00Z"), instant("2024-02-01T12:30:00.5Z")), range(null, instant("1970-01-01T00:00Z"))],
   amounts: range("1.5", null, "(]"),
-  dates: range("2024-01-01", "2024-01-10", "[]"),
-  dur: { months: 14, days: -3, microseconds: 14_706_789_000n },
+  dates: range(day("2024-01-01"), day("2024-01-10"), "[]"),
+  dur: interval(-1, 14, 3, 14_706_789_012),
   attrs: { a: "1", "b c": null, 'q"uote': "back\\slash", "": "empty key", "=>": ",," },
   big: 9223372036854775807n,
   bigs: [-9223372036854775808n, null, 0n],
   nums: ["1.50", null, "-0.000001", "NaN"],
   flags: [true, false, null],
   blobs: [new Uint8Array([0, 255, 92, 34]), null, new Uint8Array([])],
-  stamps: [new Date("2024-02-29T12:34:56.789Z"), null, new Date("0044-03-15T12:00:00Z"), new Date(-62200000000000)],
+  // Microseconds, a year before 1 (PG's BC) and after 9999.
+  stamps: [
+    instant("2024-02-29T12:34:56.789012Z"),
+    null,
+    instant("0044-03-15T12:00:00Z"),
+    instant("-000002-12-17T14:13:20Z"),
+    instant("+012345-01-01T00:00:00Z"),
+  ],
   docs: [{ a: 1, "k\"ey": ["x", { y: null }] }, null, [1, "x"], "str", 42, true],
-  day: "2024-02-29",
-  // No time zone: read and written as UTC.
-  at_local: new Date("2024-02-29T12:34:56.789Z"),
+  day: day("2024-02-29"),
+  // No time zone: a wall-clock date and time.
+  at_local: Temporal.PlainDateTime.from("2024-02-29T12:34:56.789012"),
   clock: "04:05:06+02",
+  wall: Temporal.PlainTime.from("23:59:59.999999"),
   id_uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
   addr: "192.168.0.1/24",
   money_v: "1234.5",
@@ -61,8 +92,8 @@ const fixedRow = {
   // Discrete ranges are canonicalized to `[)`; a multirange's ranges are
   // sorted.
   span: range(1, 11),
-  periods: [range(null, new Date(0)), range(new Date("2024-01-01T00:00:00Z"), new Date("2024-02-01T12:30:00.5Z"))],
-  dates: range("2024-01-01", "2024-01-11"),
+  periods: [range(null, instant("1970-01-01T00:00Z")), range(instant("2024-01-01T00:00:00Z"), instant("2024-02-01T12:30:00.5Z"))],
+  dates: range(day("2024-01-01"), day("2024-01-11")),
   // An unbounded upper bound is never inclusive.
   amounts: range("1.5", null, "()"),
   money_v: "$1,234.50",
@@ -81,7 +112,25 @@ for (const [name, connect] of drivers) {
     test("every hard type round-trips", async () => {
       const id = await t.insertThing.fetchValue(c.db, fixed);
       const row = await t.thingById.fetchOne(c.db, { id });
-      assert.deepEqual(strip(row), fixedRow);
+      assert.deepEqual(plain(strip(row)), plain(fixedRow));
+    });
+
+    test("a Temporal value finer than PostgreSQL's microseconds is rounded", async () => {
+      const id = await t.insertThing.fetchValue(c.db, {
+        ...fixed,
+        stamps: [instant("2024-01-01T00:00:00.0000016Z"), Temporal.ZonedDateTime.from("2024-01-01T00:30-03:00[America/Sao_Paulo]")],
+        at_local: Temporal.PlainDateTime.from("2024-01-01T00:00:00.000000499"),
+        wall: Temporal.PlainTime.from("12:00:00.0000015"),
+        dur: Temporal.Duration.from({ weeks: 1, nanoseconds: 1_600 }),
+      });
+      const row = await t.thingById.fetchOne(c.db, { id });
+      assert.deepEqual(plain([row.stamps, row.at_local, row.wall, row.dur]), [
+        ["Instant:2024-01-01T00:00:00.000002Z", "Instant:2024-01-01T03:30:00Z"],
+        "PlainDateTime:2024-01-01T00:00:00",
+        "PlainTime:12:00:00.000002",
+        // A week is 7 days.
+        "Duration:P7DT0.000002S",
+      ]);
     });
 
     test("PostgreSQL's to_jsonb agrees with the decoded nested values", async () => {
@@ -94,7 +143,7 @@ for (const [name, connect] of drivers) {
     });
 
     test("values PostgreSQL builds decode", async () => {
-      assert.deepEqual(await t.constructed.fetchOne(c.db), {
+      assert.deepEqual(plain(await t.constructed.fetchOne(c.db)), plain({
         r: { f1: 1, f2: "a", f3: null },
         arr_of_row: [{ x: 1, y: 2.5 }],
         strings: ["", null, "NULL", '"', "\\", ",", "{}", " a ", "é"],
@@ -102,9 +151,17 @@ for (const [name, connect] of drivers) {
         unbounded: range(null, "5", "(]"),
         nothing: emptyRange,
         multi: [range(1, 3), range(5, 7)],
-        iv: { months: 14, days: -3, microseconds: 14_706_789_000n },
+        iv: Temporal.Duration.from("P1Y2M3DT4H5M6.789S"),
         h: { a: "1", "b c": null },
-      });
+        // Infinity as a Temporal type's bounds, those of a Date.
+        forever: day("+275760-09-13"),
+        dawn: Temporal.PlainDateTime.from("-271821-04-20T00:00"),
+        last: Temporal.PlainTime.from("23:59:59.999999"),
+      }));
+    });
+
+    test("an interval mixing signs is a DecodeError", async () => {
+      await assert.rejects(t.mixedInterval.fetchOne(c.db), (e) => e instanceof DecodeError && /justify_interval/.test(e.message));
     });
 
     test("seeded fuzz: nested quoting round-trips and matches to_jsonb", async () => {
@@ -137,11 +194,12 @@ for (const [name, connect] of drivers) {
           shape: maybe(randomShape),
           shapes: maybe(() => arr(() => maybe(randomShape))),
           attrs: maybe(() => Object.fromEntries(arr(() => [str(), maybe(str)] as const, 5))),
-          dur: {
-            months: Math.floor(random() * 2000) - 1000,
-            days: Math.floor(random() * 2000) - 1000,
-            microseconds: BigInt(Math.floor(random() * 2e12) - 1e12),
-          },
+          dur: interval(
+            random() < 0.5 ? 1 : -1,
+            Math.floor(random() * 1000),
+            Math.floor(random() * 1000),
+            Math.floor(random() * 1e12),
+          ),
           bigs: arr(() => maybe(() => BigInt.asIntN(64, BigInt(Math.floor(random() * 2 ** 53)) * 1031n))),
           blobs: arr(() => maybe(() => Uint8Array.from(arr(() => Math.floor(random() * 256), 8)))),
         };
@@ -149,7 +207,7 @@ for (const [name, connect] of drivers) {
         const { j, ...row } = await t.thingWithJson.fetchOne(c.db, { id });
         const expected = { ...fixedRow, ...params };
         for (const col of ["label", "tags", "colors", "shape", "shapes", "attrs", "dur", "bigs", "blobs"] as const) {
-          assert.deepEqual(row[col], expected[col], `case ${i}, ${col}: ${JSON.stringify(params[col], (_, v) => (typeof v === "bigint" ? `${v}n` : v))}`);
+          assert.deepEqual(plain(row[col]), plain(expected[col]), `case ${i}, ${col}: ${JSON.stringify(params[col], (_, v) => (typeof v === "bigint" ? `${v}n` : v))}`);
         }
         const oracle = j as Record<string, unknown>;
         for (const col of ["label", "tags", "colors", "shape", "shapes", "attrs"] as const) {
@@ -202,7 +260,7 @@ for (const [name, connect] of drivers) {
           span: range(-5, 5),
           attrs: { "k\tey": "v\nal", n: null },
           big: -42n,
-          dur: "1 day 02:00:00",
+          dur: Temporal.Duration.from({ days: 1, hours: 2 }),
         },
         { label: "", tags: [], colors: [], shape: null, span: emptyRange, attrs: {}, big: 0, dur: null },
       ];
@@ -215,7 +273,7 @@ for (const [name, connect] of drivers) {
       assert.deepEqual(back[0]!.shape, shape);
       assert.deepEqual(back[0]!.attrs, rows[0]!.attrs);
       assert.equal(back[0]!.big, -42n);
-      assert.deepEqual(back[0]!.dur, { months: 0, days: 1, microseconds: 7_200_000_000n });
+      assert.equal(back[0]!.dur?.toString(), "P1DT2H");
       assert.deepEqual(back[1]!.span, emptyRange);
       assert.deepEqual(back[1]!.attrs, {});
 

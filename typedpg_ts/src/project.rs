@@ -692,7 +692,7 @@ impl Project {
         }
         db.catalog =
             build_catalog(&migrations, db.config.runner.use_transaction).and_then(|mut catalog| {
-                // Parameters bound from a `Date` are never infinite.
+                // Parameters bound from a Temporal value are never infinite.
                 let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
                     .iter()
                     .map(|t| QualifiedName::new("pg_catalog", *t))

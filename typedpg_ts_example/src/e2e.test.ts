@@ -58,8 +58,8 @@ for (const [name, connect] of drivers) {
       ]);
 
       const ana = await q.userById.fetchOne(db, { id: 1 });
-      assert.ok(ana.created_at instanceof Date && !Number.isNaN(ana.created_at.getTime()));
-      assert.ok(Math.abs(ana.created_at.getTime() - Date.now()) < 60_000);
+      assert.ok(ana.created_at instanceof Temporal.Instant);
+      assert.ok(Math.abs(ana.created_at.epochMilliseconds - Date.now()) < 60_000);
       assert.deepEqual(
         { ...ana, created_at: null },
         {
@@ -155,7 +155,7 @@ for (const [name, connect] of drivers) {
       const row = await q.valuesQuery.fetchOne(db);
       assert.equal(row.f, 1.5);
       assert.ok(Number.isNaN(row.nan));
-      assert.ok(row.now instanceof Date);
+      assert.ok(row.now instanceof Temporal.Instant);
       assert.deepEqual(row.b, new Uint8Array([0, 255]));
       assert.equal(row.nothing, null);
     });

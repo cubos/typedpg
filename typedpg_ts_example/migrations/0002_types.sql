@@ -40,6 +40,7 @@ CREATE TABLE things (
     day date,
     at_local timestamp,
     clock timetz,
+    wall time,
     id_uuid uuid,
     addr inet,
     money_v money,
