@@ -161,6 +161,12 @@ for (const [name, driver] of drivers) {
       assertSent(sent, [TIMESTAMPTZ]);
     });
 
+    test("a timestamptz parameter from a Date", async () => {
+      const [year, sent] = await wire.sent(() => q.yearOf.fetchValue(db, { at: new Date("1999-06-15T12:00:00Z") }));
+      assert.equal(year, "1999");
+      assertSent(sent, [TIMESTAMPTZ]);
+    });
+
     test("execute", async () => {
       const [count, sent] = await wire.sent(() => q.touch.execute(db, { by: 1n, ids: [1, 2] }));
       assert.equal(count, 2);

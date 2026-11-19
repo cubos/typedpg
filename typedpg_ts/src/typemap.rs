@@ -37,7 +37,7 @@ pub enum Codec {
     /// `json` / `jsonb`, parsed / stringified.
     Json,
     /// `timestamptz` ↔ `Temporal.Instant` (a parameter takes a
-    /// `Temporal.ZonedDateTime` too).
+    /// `Temporal.ZonedDateTime` or a `Date` too).
     Timestamptz,
     /// `timestamp` ↔ `Temporal.PlainDateTime`.
     Timestamp,
@@ -142,7 +142,7 @@ pub struct TsType {
     pub output: String,
     /// The type a parameter of it accepts — looser where several JS values
     /// encode the same way (`number` for an `int8`, a
-    /// `Temporal.ZonedDateTime` for a `timestamptz`).
+    /// `Temporal.ZonedDateTime` or a `Date` for a `timestamptz`).
     pub input: String,
     pub codec: Codec,
 }
@@ -416,10 +416,12 @@ impl TypeMapper<'_> {
             },
             // Temporal's types, never a string: a parameter of one is never
             // `infinity` (see `FINITE_PARAMETER_TYPES`). An instant is an
-            // instant whatever zone it is seen in.
+            // instant whatever zone it is seen in, and a `Date` is one too
+            // (never infinite either). Not for the zoneless types: a `Date`
+            // is a wall-clock time only in a zone someone would have to pick.
             "timestamptz" => TsType {
                 output: "Temporal.Instant".into(),
-                input: "Temporal.Instant | Temporal.ZonedDateTime".into(),
+                input: "Temporal.Instant | Temporal.ZonedDateTime | Date".into(),
                 codec: Codec::Timestamptz,
             },
             "timestamp" => same("Temporal.PlainDateTime".into(), Codec::Timestamp),
@@ -528,7 +530,7 @@ mod tests {
             assert_eq!(m.map(&basic_ty("timestamptz")).output, "Temporal.Instant");
             assert_eq!(
                 m.map(&basic_ty("timestamptz")).input,
-                "Temporal.Instant | Temporal.ZonedDateTime"
+                "Temporal.Instant | Temporal.ZonedDateTime | Date"
             );
             assert_eq!(
                 m.map(&basic_ty("timestamp")).output,

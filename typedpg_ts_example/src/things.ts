@@ -103,11 +103,11 @@ export type Checks = [
   // Parameters take the looser input types.
   Expect<Equal<Params<typeof insertThing>["big"], bigint | number | string | null>>,
   Expect<Equal<Params<typeof insertThing>["dur"], Temporal.Duration | null>>,
-  // An instant, or a zoned date-time: its instant.
+  // An instant, a zoned date-time or a Date: its instant.
   Expect<
     Equal<
       Params<typeof insertThing>["stamps"],
-      readonly (Temporal.Instant | Temporal.ZonedDateTime | null)[] | null
+      readonly (Temporal.Instant | Temporal.ZonedDateTime | Date | null)[] | null
     >
   >,
   Expect<Equal<Params<typeof insertThing>["at_local"], Temporal.PlainDateTime | null>>,

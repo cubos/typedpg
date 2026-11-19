@@ -112,7 +112,7 @@ export type Checks = [
   >,
   Expect<Equal<Params<typeof userById>, { id: number }>>,
   Expect<Equal<Row<typeof yearOf>, { year: string }>>,
-  Expect<Equal<Params<typeof yearOf>, { at: Temporal.Instant | Temporal.ZonedDateTime }>>,
+  Expect<Equal<Params<typeof yearOf>, { at: Temporal.Instant | Temporal.ZonedDateTime | Date }>>,
   Expect<Equal<Row<typeof visitorKinds>, { kind: "new" | "regular"; mood: "happy" | "sad"; two: 2n }>>,
   Expect<Equal<Row<typeof countUsers>, { n: bigint }>>,
   Expect<Equal<Awaited<ReturnType<typeof countUsers.fetchValue>>, bigint>>,

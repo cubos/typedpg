@@ -23,7 +23,7 @@ export interface Queries {
       shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
       shapes: readonly ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null)[] | null;
       span: typedpg.Range<number> | null;
-      periods: readonly typedpg.Range<Temporal.Instant | Temporal.ZonedDateTime>[] | null;
+      periods: readonly typedpg.Range<Temporal.Instant | Temporal.ZonedDateTime | Date>[] | null;
       amounts: typedpg.Range<string | number> | null;
       dates: typedpg.Range<Temporal.PlainDate> | null;
       dur: Temporal.Duration | null;
@@ -33,7 +33,7 @@ export interface Queries {
       nums: readonly (string | number | null)[] | null;
       flags: readonly (boolean | null)[] | null;
       blobs: readonly (Uint8Array | null)[] | null;
-      stamps: readonly (Temporal.Instant | Temporal.ZonedDateTime | null)[] | null;
+      stamps: readonly (Temporal.Instant | Temporal.ZonedDateTime | Date | null)[] | null;
       docs: readonly (unknown | null)[] | null;
       day: Temporal.PlainDate | null;
       at_local: Temporal.PlainDateTime | null;
@@ -348,7 +348,7 @@ export interface Queries {
   };
   "SELECT to_char($at::timestamptz, 'YYYY') AS year": {
     params: {
-      at: Temporal.Instant | Temporal.ZonedDateTime;
+      at: Temporal.Instant | Temporal.ZonedDateTime | Date;
     };
     row: {
       year: string;

@@ -6,6 +6,15 @@ import type * as typedpg from "@cubos/typedpg";
 
 export interface Queries {
   "SELECT $r::record AS r": { error: "anonymous record-typed query parameters are not supported — pass the fields individually using a ROW(...) constructor in SQL" };
+  "SELECT id FROM things WHERE day = $day": {
+    params: {
+      day: Temporal.PlainDate;
+    };
+    row: {
+      id: number;
+    };
+    value: number;
+  };
   "SELECT id FROM things WHERE span @> $n": {
     params: {
       n: typedpg.Range<number>;
@@ -45,7 +54,7 @@ export interface Queries {
   "SELECT id, nmae FROM users": { error: "column \"nmae\" does not exist" };
   "SELECT now() - $d AS t": {
     params: {
-      d: Temporal.Instant | Temporal.ZonedDateTime;
+      d: Temporal.Instant | Temporal.ZonedDateTime | Date;
     };
     row: {
       t: Temporal.Duration;
@@ -66,6 +75,7 @@ export interface CopyTargets {
 }
 
 export const sql = createSql<Queries>({
+  "SELECT id FROM things WHERE day = $day": "{\"sql\":[\"SELECT id FROM things WHERE day = ($1::pg_catalog.date)\"],\"params\":[[\"day\",\"date\"]],\"columns\":[[\"id\",\"number\"]],\"subquery\":true}",
   "SELECT id FROM things WHERE span @> $n": "{\"sql\":[\"SELECT id FROM things WHERE span @> ($1::pg_catalog.int4range)\"],\"params\":[[\"n\",[\"range\",\"number\"]]],\"columns\":[[\"id\",\"number\"]],\"subquery\":true}",
   "SELECT id FROM users WHERE id = $id": "{\"sql\":[\"SELECT id FROM users WHERE id = ($1::pg_catalog.int4)\"],\"params\":[[\"id\",\"number\"]],\"columns\":[[\"id\",\"number\"]],\"subquery\":true}",
   "SELECT id FROM users WHERE mood = $mood": "{\"sql\":[\"SELECT id FROM users WHERE mood = ($1::public.mood)\"],\"params\":[[\"mood\",\"text\"]],\"columns\":[[\"id\",\"number\"]],\"subquery\":true}",

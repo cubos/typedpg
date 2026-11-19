@@ -698,9 +698,12 @@ function formatTimestamptz(value: unknown): string {
   let instant: Temporal.Instant;
   if (value instanceof Temporal.Instant) instant = value;
   else if (value instanceof Temporal.ZonedDateTime) instant = value.toInstant();
-  else {
+  else if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw new RangeError("typedpg: an invalid Date can't be a timestamptz");
+    instant = Temporal.Instant.fromEpochMilliseconds(value.getTime());
+  } else {
     throw new TypeError(
-      `typedpg: a timestamptz parameter must be a Temporal.Instant or a Temporal.ZonedDateTime, not ${describe(value)}`,
+      `typedpg: a timestamptz parameter must be a Temporal.Instant, a Temporal.ZonedDateTime or a Date, not ${describe(value)}`,
     );
   }
   const d = instant.toZonedDateTimeISO("UTC");

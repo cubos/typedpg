@@ -134,7 +134,14 @@ test("encode dates and times", () => {
     encode("timestamptz", Temporal.ZonedDateTime.from("2024-01-02T00:30:00-03:00[America/Sao_Paulo]")),
     "2024-01-02 03:30:00.000000000Z",
   );
-  assert.throws(() => encode("timestamptz", new Date(0)), /must be a Temporal.Instant or a Temporal.ZonedDateTime, not a Date/);
+  // A Date is an instant too, BC included.
+  assert.equal(encode("timestamptz", new Date(0)), "1970-01-01 00:00:00.000000000Z");
+  assert.equal(encode("timestamptz", new Date("2024-01-02T03:04:05.678Z")), "2024-01-02 03:04:05.678000000Z");
+  assert.equal(encode("timestamptz", new Date(-62200000000000)), "0003-12-17 14:13:20.000000000Z BC");
+  assert.throws(() => encode("timestamptz", new Date(NaN)), /invalid Date/);
+  // Not for the zoneless types: which day or time a Date is depends on a zone.
+  assert.throws(() => encode("timestamp", new Date(0)), /must be a Temporal.PlainDateTime, not a Date/);
+  assert.throws(() => encode("date", new Date(0)), /must be a Temporal.PlainDate, not a Date/);
   assert.throws(() => encode("timestamptz", "2024-01-01"), /not string/);
 
   assert.equal(

@@ -860,9 +860,9 @@ as it describes a statement before binding it.
 | `int8` | `bigint`; parameters also take `number` and `string` |
 | `numeric` | `string` (exact); parameters also take `number` |
 | `text`, `varchar`, `char`, `uuid`, `inet`, `money`, … | `string` |
-| `timestamptz` | `Temporal.Instant`; parameters also take `Temporal.ZonedDateTime` (its instant) |
-| `timestamp` | `Temporal.PlainDateTime` |
-| `date` | `Temporal.PlainDate` |
+| `timestamptz` | `Temporal.Instant`; parameters also take `Temporal.ZonedDateTime` and `Date` (their instant). PostgreSQL stores no zone, only the instant: the offset it prints is the session's `TimeZone`, so keep a zone you need in a column of its own (`at.toZonedDateTimeISO(tz)`) |
+| `timestamp` | `Temporal.PlainDateTime`; not a `Date`, whose wall-clock time depends on a zone (`date.toTemporalInstant().toZonedDateTimeISO(tz).toPlainDateTime()` picks one) |
+| `date` | `Temporal.PlainDate`; not a `Date`, likewise |
 | `time` | `Temporal.PlainTime` |
 | `timetz` | `string`: Temporal has no time of day with an offset |
 | `interval` | `Temporal.Duration`: years and months from its months, days, then hours down to microseconds from its time, as PostgreSQL prints it. A parameter's weeks are 7 days |
@@ -990,8 +990,8 @@ Dates, times and intervals are Temporal's types instead of `Date`, strings
 and `Interval` (see [Types](#types)), which needs Node.js 26 and TypeScript
 6.0:
 
-- a `timestamptz` is a `Temporal.Instant` (`date.toTemporalInstant()`
-  from a `Date`, `instant.epochMilliseconds` back), a `timestamp` a
+- a `timestamptz` is a `Temporal.Instant` (`new Date(instant.epochMilliseconds)`
+  for a `Date`; a parameter still takes one), a `timestamp` a
   `Temporal.PlainDateTime` — no longer a `Date` read and written as UTC;
 - a `date` is a `Temporal.PlainDate` and a `time` a `Temporal.PlainTime`,
   no longer strings;

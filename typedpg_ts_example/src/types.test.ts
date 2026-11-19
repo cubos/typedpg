@@ -118,14 +118,18 @@ for (const [name, connect] of drivers) {
     test("a Temporal value finer than PostgreSQL's microseconds is rounded", async () => {
       const id = await t.insertThing.fetchValue(c.db, {
         ...fixed,
-        stamps: [instant("2024-01-01T00:00:00.0000016Z"), Temporal.ZonedDateTime.from("2024-01-01T00:30-03:00[America/Sao_Paulo]")],
+        stamps: [
+          instant("2024-01-01T00:00:00.0000016Z"),
+          Temporal.ZonedDateTime.from("2024-01-01T00:30-03:00[America/Sao_Paulo]"),
+          new Date("2024-01-01T00:00:00.5Z"),
+        ],
         at_local: Temporal.PlainDateTime.from("2024-01-01T00:00:00.000000499"),
         wall: Temporal.PlainTime.from("12:00:00.0000015"),
         dur: Temporal.Duration.from({ weeks: 1, nanoseconds: 1_600 }),
       });
       const row = await t.thingById.fetchOne(c.db, { id });
       assert.deepEqual(plain([row.stamps, row.at_local, row.wall, row.dur]), [
-        ["Instant:2024-01-01T00:00:00.000002Z", "Instant:2024-01-01T03:30:00Z"],
+        ["Instant:2024-01-01T00:00:00.000002Z", "Instant:2024-01-01T03:30:00Z", "Instant:2024-01-01T00:00:00.5Z"],
         "PlainDateTime:2024-01-01T00:00:00",
         "PlainTime:12:00:00.000002",
         // A week is 7 days.
