@@ -1930,23 +1930,28 @@ enum KeyRef<'a> {
 
 /// The expression of expanded select-list entry `i`, a column reference for
 /// a `*` column.
-fn target_expr(targets: &[ExpandedTarget<'_>], i: usize) -> Option<Option<ast::Node>> {
+fn target_expr<'a>(
+    targets: &[ExpandedTarget<'a>],
+    i: usize,
+) -> Option<std::borrow::Cow<'a, ast::Node>> {
     match targets.get(i)? {
-        ExpandedTarget::Expr(rt) => rt.val.is_some().then(|| rt.val.clone()),
+        ExpandedTarget::Expr(rt) => rt.val.as_ref().map(std::borrow::Cow::Borrowed),
         ExpandedTarget::StarColumn {
             column: Some((alias, col)),
             ..
-        } => Some(Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
-            fields: [*alias, *col]
-                .into_iter()
-                .map(|s| {
-                    Some(ast::Node::String(NodeBox::new(ast::String {
-                        sval: s.into(),
-                    })))
-                })
-                .collect(),
-            location: -1,
-        })))),
+        } => Some(std::borrow::Cow::Owned(ast::Node::ColumnRef(NodeBox::new(
+            ast::ColumnRef {
+                fields: [*alias, *col]
+                    .into_iter()
+                    .map(|s| {
+                        Some(ast::Node::String(NodeBox::new(ast::String {
+                            sval: s.into(),
+                        })))
+                    })
+                    .collect(),
+                location: -1,
+            },
+        )))),
         ExpandedTarget::StarColumn { column: None, .. } => None,
     }
 }
@@ -1995,7 +2000,7 @@ fn sql92_key<'a>(
     for &other in &matches[1..] {
         let same = match (&first_expr, target_expr(targets, other)) {
             (Some(a), Some(b)) => {
-                grouping::same_level_exprs_equal(a.as_ref(), b.as_ref(), scope, snapshot)
+                grouping::same_level_exprs_equal(Some(a), Some(&b), scope, snapshot)
             }
             _ => false,
         };
@@ -2157,13 +2162,13 @@ fn check_sort_group_keys(
     for (key, _, _) in &keys {
         let node = match key {
             KeyRef::Target(i) if columns.get(*i).is_some_and(|c| c.unknown_value) => {
-                target_expr(targets, *i)
+                target_expr(targets, *i).map(Some)
             }
             KeyRef::Expr(n)
                 if expr::infer_expr(*n, ctx, &mut params.clone(), TypeGoal::NONE)
                     .is_ok_and(|t| t.unknown_value) =>
             {
-                Some((*n).cloned())
+                Some(n.map(std::borrow::Cow::Borrowed))
             }
             _ => None,
         };
@@ -2172,7 +2177,7 @@ fn check_sort_group_keys(
                 oid::TEXT,
                 crate::coerce::CoercionContext::Implicit,
                 ctx.snapshot,
-                node.as_ref(),
+                node.as_deref(),
             )?;
         }
     }
@@ -2200,11 +2205,11 @@ fn check_sort_group_keys(
             continue;
         }
         let expr = match key {
-            KeyRef::Target(i) => target_expr(targets, *i),
-            KeyRef::Expr(n) => Some((*n).cloned()),
+            KeyRef::Target(i) => target_expr(targets, *i).map(Some),
+            KeyRef::Expr(n) => Some(n.map(std::borrow::Cow::Borrowed)),
         };
         if let Some(e) = expr {
-            crate::clause::collation_state(e.as_ref(), ctx, params)
+            crate::clause::collation_state(e.as_deref(), ctx, params)
                 .check_determinate(ctx.snapshot, Some(*location))?;
         }
     }

@@ -2162,28 +2162,29 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &ast::Node) -> ViewUp
 fn returns_set(interp: &PgCatalog, node: &ast::Node) -> bool {
     match node {
         ast::Node::SubLink(_) => false,
-        ast::Node::FuncCall(fc) => {
-            let parts: Vec<&str> = fc
-                .funcname
-                .iter()
-                .filter_map(|n| super::util::node_string(n.as_ref()))
-                .collect();
-            let (schema, name) = match parts.as_slice() {
-                [name] => (None, *name),
-                [schema, name] => (Some(*schema), *name),
-                _ => return false,
-            };
-            let candidates = interp.find_functions(schema, name);
-            (!candidates.is_empty() && candidates.iter().all(|p| p.proretset))
-                || fc.args.iter().flatten().any(|a| returns_set(interp, a))
-        }
+        ast::Node::FuncCall(fc) => call_returns_set(interp, fc),
         other => other.nodes().skip(1).any(|(n, ..)| match n {
-            typedpg_pg_query::NodeRef::FuncCall(fc) => {
-                returns_set(interp, &ast::Node::FuncCall(NodeBox::new(fc.clone())))
-            }
+            typedpg_pg_query::NodeRef::FuncCall(fc) => call_returns_set(interp, fc),
             _ => false,
         }),
     }
+}
+
+/// [`returns_set`] of function call `fc`.
+fn call_returns_set(interp: &PgCatalog, fc: &ast::FuncCall) -> bool {
+    let parts: Vec<&str> = fc
+        .funcname
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, *name),
+        [schema, name] => (Some(*schema), *name),
+        _ => return false,
+    };
+    let candidates = interp.find_functions(schema, name);
+    (!candidates.is_empty() && candidates.iter().all(|p| p.proretset))
+        || fc.args.iter().flatten().any(|a| returns_set(interp, a))
 }
 
 /// DefineView / ATExecSetRelOptions: a view with a check option must be

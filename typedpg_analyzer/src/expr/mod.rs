@@ -1120,7 +1120,9 @@ fn where_conjunction(chain: &[*const ast::Node]) -> bool {
     let and = ast::BoolExprType::AndExpr;
     chain
         .first()
-        .is_some_and(|&p| plan_fold::is_where_clause(p))
+        // SAFETY: as in `sublink_planned`, each pointer is a node an
+        // `infer_expr` call still on the stack borrows.
+        .is_some_and(|&p| plan_fold::is_where_clause(unsafe { &*p }))
         && chain.iter().all(|&p| {
             // SAFETY: as in `sublink_planned`, each pointer is a node an
             // `infer_expr` call still on the stack borrows.
@@ -1280,7 +1282,7 @@ pub(crate) fn semijoin_level(sel: &ast::SelectStmt, ctx: Ctx<'_>) -> Option<plan
     {
         (top, above) = (not, rest);
     }
-    if !(above.is_empty() && plan_fold::is_where_clause(top) || where_conjunction(above)) {
+    if !(above.is_empty() && plan_fold::is_where_clause(node(top)) || where_conjunction(above)) {
         return None;
     }
     if !sub

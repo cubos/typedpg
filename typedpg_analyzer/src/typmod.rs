@@ -435,8 +435,8 @@ pub(crate) fn assignment_error(
     }
     // A column of a subquery the planner pulled up is the subquery's
     // output expression by the time the conversion is folded.
-    let substituted = crate::resolve::substituted(value).map(|e| (*e).clone());
-    let value = substituted.as_ref().or(value);
+    let substituted = crate::resolve::substituted(value);
+    let value = substituted.as_deref().or(value);
     let e = assignment_error_here(snapshot, type_oid, typmod, value, span)?;
     crate::expr::plan_time_error(location, e)
 }

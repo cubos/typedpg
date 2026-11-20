@@ -77,8 +77,8 @@ pub(crate) fn predicate_implied_by(
         return false;
     };
     implied_by_recurse(
-        normalize(unqualify(Some(clause)).as_ref(), types).as_ref(),
-        normalize(unqualify(Some(predicate)).as_ref(), types).as_ref(),
+        normalize(unqualify(Some(clause.clone())).as_ref(), types).as_ref(),
+        normalize(unqualify(Some(predicate.clone())).as_ref(), types).as_ref(),
     )
 }
 
@@ -517,11 +517,11 @@ fn operator_predicate_proof(clause: Option<&ast::Node>, pred: Option<&ast::Node>
 
 /// `node` with every qualified column reference (`t.v`) reduced to its
 /// column name — both sides refer to the one target relation.
-pub(crate) fn unqualify(node: Option<&ast::Node>) -> Option<ast::Node> {
+pub(crate) fn unqualify(node: Option<ast::Node>) -> Option<ast::Node> {
     let mut tree = ast::ParseResult {
         version: 0,
         stmts: vec![ast::RawStmt {
-            stmt: node.cloned(),
+            stmt: node,
             stmt_location: 0,
             stmt_len: 0,
         }],

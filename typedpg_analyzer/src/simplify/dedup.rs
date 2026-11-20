@@ -370,8 +370,7 @@ pub(super) fn is_plain_distinct(s: &ast::SelectStmt) -> bool {
 /// this can't resolve. Every overload of the name counts, not just the one
 /// PG picks.
 pub(super) fn has_unsafe_call(ctx: &Ctx<'_>, s: &ast::SelectStmt) -> bool {
-    let node = Some(Node::SelectStmt(NodeBox::new(s.clone())));
-    if super::proof::has_volatile(ctx, node.as_ref()) {
+    if super::proof::has_volatile_in(ctx, Some(NodeRef::SelectStmt(s))) {
         return true;
     }
     let mut stack = vec![NodeRef::SelectStmt(s)];

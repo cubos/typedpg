@@ -34,6 +34,7 @@ use std::collections::HashMap;
 
 use typedpg_pg_query::ast;
 
+use crate::node_key::NodeKey;
 use crate::pg_catalog::{PgCatalog, ProVolatile, RelKind};
 
 /// What an expression folds to.
@@ -509,7 +510,7 @@ thread_local! {
     /// never null-extended, whose sublinks `pull_up_sublinks` pulls up
     /// alike (reading only the join's sides, which is all the ON clause
     /// sees).
-    static WHERE_ROOT: Cell<*const ast::Node> = const { Cell::new(std::ptr::null()) };
+    static WHERE_ROOT: Cell<Option<NodeKey<ast::Node>>> = const { Cell::new(None) };
     /// The FROM items (by alias) a sublink of [`WHERE_ROOT`] may read to
     /// be pulled up, when that is the ON clause of a join a semi-join
     /// below it joins only part of (see [`with_nullable_on_clause`]);
@@ -538,7 +539,7 @@ pub(crate) fn with_nullable_on_clause<R>(
 
 fn with_root<R>(n: Option<&ast::Node>, available: Option<Vec<String>>, f: impl FnOnce() -> R) -> R {
     // A missing clause is never one being analyzed (see `is_where_clause`).
-    let root = n.map_or(std::ptr::null(), std::ptr::from_ref);
+    let root = n.map(NodeKey::of);
     let prev = WHERE_ROOT.with(|w| w.replace(root));
     let prev_available = AVAILABLE.with(|a| a.replace(available));
     let out = f();
@@ -555,8 +556,8 @@ pub(crate) fn where_available() -> Option<Vec<String>> {
 }
 
 /// Whether `n` is the WHERE clause being analyzed.
-pub(crate) fn is_where_clause(n: *const ast::Node) -> bool {
-    !n.is_null() && WHERE_ROOT.with(|w| w.get() == n)
+pub(crate) fn is_where_clause(n: &ast::Node) -> bool {
+    WHERE_ROOT.with(|w| w.get() == Some(NodeKey::of(n)))
 }
 
 /// The value of a whole-number literal.
@@ -2177,7 +2178,7 @@ pub(crate) fn read_above(alias: &str, join: &ast::JoinExpr, snapshot: &PgCatalog
         let Some(reads) = (unsafe { last.reads(rest.last(), snapshot) }) else {
             return false;
         };
-        reads.above(alias, join, 0)
+        reads.above(alias, NodeKey::of(join), 0)
     })
 }
 
@@ -2569,12 +2570,12 @@ impl Reads<'_> {
     /// Only a reference qualified by the alias counts (`alias.col`,
     /// `alias.*`), or a `*` of the select list. `depth` bounds the
     /// recursion through other joins' nullable sides.
-    fn above(&self, alias: &str, join: *const ast::JoinExpr, depth: usize) -> bool {
-        fn holds(n: Option<&ast::Node>, join: *const ast::JoinExpr) -> bool {
+    fn above(&self, alias: &str, join: NodeKey<ast::JoinExpr>, depth: usize) -> bool {
+        fn holds(n: Option<&ast::Node>, join: NodeKey<ast::JoinExpr>) -> bool {
             let Some(ast::Node::JoinExpr(j)) = n else {
                 return false;
             };
-            std::ptr::eq(&**j, join)
+            NodeKey::of(&**j) == join
                 || [&j.larg, &j.rarg]
                     .into_iter()
                     .flatten()
@@ -2594,26 +2595,26 @@ impl Reads<'_> {
         };
         self.from
             .iter()
-            .any(|f| self.join_reads(f.as_ref(), join, &target, depth))
+            .any(|f| self.join_reads(f.as_ref(), Some(join), &target, depth))
             || self
                 .select
                 .is_some_and(|sel| self.clauses_read(sel, &target))
     }
 
-    /// Whether the ON clause of a join in FROM item `n` — but `join` and
-    /// what is below it — certainly reads `target`, the join being never
+    /// Whether the ON clause of a join in FROM item `n` — but `join` (if any)
+    /// and what is below it — certainly reads `target`, the join being never
     /// removed.
     fn join_reads(
         &self,
         n: Option<&ast::Node>,
-        join: *const ast::JoinExpr,
+        join: Option<NodeKey<ast::JoinExpr>>,
         target: &Target<'_>,
         depth: usize,
     ) -> bool {
         let Some(ast::Node::JoinExpr(j)) = n else {
             return false;
         };
-        if std::ptr::eq(&**j, join) {
+        if Some(NodeKey::of(&**j)) == join {
             return false;
         }
         let reads = || certainly_reads(j.quals.as_ref(), target, self.snapshot);
@@ -2667,7 +2668,8 @@ impl Reads<'_> {
             }
             _ => return false,
         };
-        self.pulls_sublink_into(j, alias) || (depth < 3 && self.above(alias, j, depth + 1))
+        self.pulls_sublink_into(j, alias)
+            || (depth < 3 && self.above(alias, NodeKey::of(j), depth + 1))
     }
 
     /// Whether `pull_up_sublinks` certainly turns a sublink of outer join
@@ -2879,7 +2881,7 @@ impl Reads<'_> {
             || psel
                 .from_clause
                 .iter()
-                .any(|f| outer.join_reads(f.as_ref(), std::ptr::null(), &target, 0))
+                .any(|f| outer.join_reads(f.as_ref(), None, &target, 0))
     }
 
     /// How many base relations on the nullable side of the level's outer

@@ -1,6 +1,8 @@
 use super::*;
-use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast;
+
+use crate::node_key::NodeKey;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CTE
@@ -890,10 +892,20 @@ pub(crate) fn cte_reference_columns(
 }
 
 thread_local! {
-    /// The statement owning each WITH clause being analyzed (see
-    /// [`with_clause_owner`]).
-    static WITH_OWNERS: std::cell::RefCell<Vec<(usize, ast::Node)>> =
+    /// What the statement owning each WITH clause being analyzed tells of
+    /// its CTEs (see [`with_clause_owner`]).
+    static WITH_OWNERS: std::cell::RefCell<Vec<(NodeKey<ast::WithClause>, Vec<OwnerFacts>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What the statement owning a WITH clause tells of one of its CTEs.
+struct OwnerFacts {
+    /// The CTE's name.
+    name: String,
+    /// See [`owner_references`].
+    references: Option<usize>,
+    /// See [`owner_kept_reference`].
+    kept_reference: Option<String>,
 }
 
 /// Run `f` (the analysis of `sel`'s WITH clause) knowing `sel` owns it:
@@ -903,63 +915,97 @@ pub(crate) fn with_clause_owner<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R)
     let Some(with) = sel.with_clause.as_ref() else {
         return f();
     };
-    let owner = ast::Node::SelectStmt(NodeBox::new(sel.clone()));
-    with_statement_owner(with, owner, f)
+    with_statement_owner(with, NodeRef::SelectStmt(sel), f)
 }
 
-/// [`with_clause_owner`] for `owner` (a copy of the statement), any
-/// statement owning WITH clause `with` (SELECT, INSERT, UPDATE, DELETE,
-/// MERGE). The target relation of a data-modifying statement is never a
-/// reference to a CTE (`setTargetTable` opens a table), so it isn't
-/// counted.
+/// [`with_clause_owner`] for `owner`, any statement owning WITH clause
+/// `with` (SELECT, INSERT, UPDATE, DELETE, MERGE). The target relation of
+/// a data-modifying statement is never a reference to a CTE
+/// (`setTargetTable` opens a table), so it isn't counted.
 pub(crate) fn with_statement_owner<R>(
     with: &ast::WithClause,
-    mut owner: ast::Node,
+    owner: NodeRef<'_>,
     f: impl FnOnce() -> R,
 ) -> R {
-    match &mut owner {
-        ast::Node::InsertStmt(s) => s.relation = None,
-        ast::Node::UpdateStmt(s) => s.relation = None,
-        ast::Node::DeleteStmt(s) => s.relation = None,
-        ast::Node::MergeStmt(s) => s.relation = None,
-        _ => {}
-    }
-    let key = std::ptr::from_ref(with) as usize;
-    WITH_OWNERS.with(|o| o.borrow_mut().push((key, owner)));
+    let target = match owner {
+        NodeRef::InsertStmt(s) => s.relation.as_deref(),
+        NodeRef::UpdateStmt(s) => s.relation.as_deref(),
+        NodeRef::DeleteStmt(s) => s.relation.as_deref(),
+        NodeRef::MergeStmt(s) => s.relation.as_deref(),
+        _ => None,
+    };
+    let facts = with
+        .ctes
+        .iter()
+        .filter_map(|c| match c.as_ref() {
+            Some(ast::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
+            _ => None,
+        })
+        .map(|name| {
+            // `references_in` counts the target relation when it is named
+            // so: it isn't a reference.
+            let target_named =
+                target.is_some_and(|rv| rv.schemaname.is_empty() && rv.relname == name);
+            OwnerFacts {
+                name: name.to_owned(),
+                references: references_in(owner, statement_with(owner), name)
+                    .map(|n| n - usize::from(target_named)),
+                kept_reference: kept_reference(owner, name),
+            }
+        })
+        .collect();
+    let key = NodeKey::of(with);
+    WITH_OWNERS.with(|o| o.borrow_mut().push((key, facts)));
     let out = f();
     WITH_OWNERS.with(|o| o.borrow_mut().pop());
     out
 }
 
 /// The WITH clause statement `n` owns.
-fn statement_with(n: &ast::Node) -> Option<&ast::WithClause> {
+fn statement_with(n: NodeRef<'_>) -> Option<&ast::WithClause> {
     match n {
-        ast::Node::SelectStmt(s) => s.with_clause.as_deref(),
-        ast::Node::InsertStmt(s) => s.with_clause.as_deref(),
-        ast::Node::UpdateStmt(s) => s.with_clause.as_deref(),
-        ast::Node::DeleteStmt(s) => s.with_clause.as_deref(),
-        ast::Node::MergeStmt(s) => s.with_clause.as_deref(),
+        NodeRef::SelectStmt(s) => s.with_clause.as_deref(),
+        NodeRef::InsertStmt(s) => s.with_clause.as_deref(),
+        NodeRef::UpdateStmt(s) => s.with_clause.as_deref(),
+        NodeRef::DeleteStmt(s) => s.with_clause.as_deref(),
+        NodeRef::MergeStmt(s) => s.with_clause.as_deref(),
         _ => None,
     }
+}
+
+/// What the statement owning `with` tells of its CTE `name`, by `get`;
+/// `None` when the owner isn't known (see [`with_clause_owner`]).
+fn owner_fact<T>(
+    with: &ast::WithClause,
+    name: &str,
+    get: impl FnOnce(&OwnerFacts) -> Option<T>,
+) -> Option<T> {
+    let key = NodeKey::of(with);
+    WITH_OWNERS.with(|o| {
+        let owners = o.borrow();
+        let (_, facts) = owners.iter().rev().find(|(k, _)| *k == key)?;
+        get(facts.iter().find(|f| f.name == name)?)
+    })
 }
 
 /// How many references to CTE `name` the statement owning `with` has
 /// (PG's `cterefcount`), as [`references_in`] counts them; `None` when the
 /// owner isn't known (see [`with_clause_owner`]).
 fn owner_references(with: &ast::WithClause, name: &str) -> Option<usize> {
-    let key = std::ptr::from_ref(with) as usize;
-    WITH_OWNERS.with(|o| {
-        let owners = o.borrow();
-        let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
-        let root = owner;
-        references_in(root.to_ref(), statement_with(root), name)
-    })
+    owner_fact(with, name, |f| f.references)
 }
 
 /// The alias of a reference to CTE `name` the SELECT (UPDATE, DELETE)
 /// owning `with` has among its own FROM (USING) items never null-extended (FROM-list items, sides of
 /// inner joins, a LEFT join's left side, a RIGHT join's right one).
 fn owner_kept_reference(with: &ast::WithClause, name: &str) -> Option<String> {
+    owner_fact(with, name, |f| f.kept_reference.clone())
+}
+
+/// The alias of a reference to CTE `name` statement `owner` (a SELECT,
+/// UPDATE or DELETE) has among its own FROM (USING) items never
+/// null-extended (see [`owner_kept_reference`]).
+fn kept_reference(owner: NodeRef<'_>, name: &str) -> Option<String> {
     fn find(n: Option<&ast::Node>, name: &str) -> Option<String> {
         match n? {
             ast::Node::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => Some(
@@ -982,18 +1028,13 @@ fn owner_kept_reference(with: &ast::WithClause, name: &str) -> Option<String> {
             _ => None,
         }
     }
-    let key = std::ptr::from_ref(with) as usize;
-    WITH_OWNERS.with(|o| {
-        let owners = o.borrow();
-        let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
-        let from = match owner {
-            ast::Node::SelectStmt(sel) => &sel.from_clause,
-            ast::Node::UpdateStmt(upd) => &upd.from_clause,
-            ast::Node::DeleteStmt(del) => &del.using_clause,
-            _ => return None,
-        };
-        from.iter().find_map(|f| find(f.as_ref(), name))
-    })
+    let from = match owner {
+        NodeRef::SelectStmt(sel) => &sel.from_clause,
+        NodeRef::UpdateStmt(upd) => &upd.from_clause,
+        NodeRef::DeleteStmt(del) => &del.using_clause,
+        _ => return None,
+    };
+    from.iter().find_map(|f| find(f.as_ref(), name))
 }
 
 /// How many references to CTE `name` of `with` (the WITH clause `root`
@@ -1036,7 +1077,7 @@ pub(crate) fn references_in(
             }
         }
     }
-    let own_with = std::ptr::from_ref(with);
+    let own_with = with;
     let mut count = 0;
     let mut todo = vec![root];
     while let Some(n) = todo.pop() {
@@ -1046,7 +1087,7 @@ pub(crate) fn references_in(
             }
             // Another WITH naming a CTE so: its references are its own.
             NodeRef::WithClause(w)
-                if own_with != std::ptr::from_ref(w)
+                if !std::ptr::eq(own_with, w)
                     && w.ctes.iter().any(|c| {
                         matches!(c.as_ref(),
                             Some(ast::Node::CommonTableExpr(c)) if c.ctename == name)

@@ -553,7 +553,7 @@ fn add_detached_partition_check(
     expr: typedpg_pg_query::ast::Node,
     vars: &[String],
 ) -> Result<(), DdlError> {
-    let stored = super::check_inherit::StoredExpr::Written(Box::new(Some(expr.clone())));
+    let stored = super::check_inherit::StoredExpr::Written(Box::new(Some(expr)));
     if interp.pg_constraint.values().any(|c| {
         c.conrelid == part
             && c.contype == ConType::Check

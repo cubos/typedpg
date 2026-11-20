@@ -339,12 +339,10 @@ pub(crate) fn analyze_values_lists(
     // transformValuesClause: each row goes through transformExpressionList,
     // which expands `rel.*` / `(expr).*` items into one item per column
     // (`VALUES (v.*)` in a LATERAL subquery).
-    let rows: Vec<Vec<Option<ast::Node>>> = values_lists
+    let rows: Vec<std::borrow::Cow<'_, [Option<ast::Node>]>> = values_lists
         .iter()
         .filter_map(|n| match n.as_ref()? {
-            ast::Node::List(l) => {
-                Some(expr::expand_row_args(&l.items, ctx(), params).map(|r| r.into_owned()))
-            }
+            ast::Node::List(l) => Some(expr::expand_row_args(&l.items, ctx(), params)),
             _ => None,
         })
         .collect::<Result<_, _>>()?;

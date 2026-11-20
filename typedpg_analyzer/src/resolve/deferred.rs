@@ -18,6 +18,7 @@ use typedpg_pg_query::ast::{self, SetOperation};
 use crate::error::AnalyzeError;
 use crate::expr::PlanTimeError;
 use crate::expr::plan_fold::{NextLevel, Outputs};
+use crate::node_key::NodeKey;
 use crate::pg_catalog::PgCatalog;
 
 /// How the planner plans a FROM subquery (or a CTE's query) the query
@@ -175,14 +176,17 @@ pub(crate) fn pulled_up(sel: &ast::SelectStmt) -> bool {
 thread_local! {
     /// Per analyzed SELECT (see [`target_list_key`]): whether its select
     /// list is one [`pulled_up_in`] accepts.
-    static SIMPLE_TARGETS: std::cell::RefCell<std::collections::HashMap<(usize, usize, i32), bool>> =
+    static SIMPLE_TARGETS: std::cell::RefCell<std::collections::HashMap<TargetListKey, bool>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// A key telling an analyzed SELECT apart: its address, and its select
+/// See [`target_list_key`].
+type TargetListKey = (NodeKey<ast::SelectStmt>, usize, i32);
+
+/// A key telling an analyzed SELECT apart: its [`NodeKey`], and its select
 /// list's length and first location (so a SELECT later allocated where a
 /// dropped one was isn't taken for it).
-fn target_list_key(sel: &ast::SelectStmt) -> (usize, usize, i32) {
+fn target_list_key(sel: &ast::SelectStmt) -> TargetListKey {
     let first = sel
         .target_list
         .first()
@@ -191,11 +195,7 @@ fn target_list_key(sel: &ast::SelectStmt) -> (usize, usize, i32) {
             _ => None,
         })
         .unwrap_or(-1);
-    (
-        std::ptr::from_ref(sel) as usize,
-        sel.target_list.len(),
-        first,
-    )
+    (NodeKey::of(sel), sel.target_list.len(), first)
 }
 
 /// Record, analyzing `sel`, whether its select list is one the planner
@@ -308,13 +308,17 @@ fn simple_target_list(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
 
 thread_local! {
     /// The expression the planner substitutes for a select-list entry
-    /// that reads a pulled-up subquery's column (keyed by the address of
-    /// the entry's boxed column reference, with the reference itself to
-    /// tell it apart).
+    /// that reads a pulled-up subquery's column (keyed by the entry's
+    /// boxed column reference, with the reference itself to tell it
+    /// apart).
     static SUBSTITUTED: std::cell::RefCell<
-        std::collections::HashMap<usize, (ast::ColumnRef, std::sync::Arc<ast::Node>)>,
+        std::collections::HashMap<NodeKey<ast::ColumnRef>, Substitution>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
+
+/// A select-list entry's column reference, and the expression the planner
+/// substitutes for it (see [`SUBSTITUTED`]).
+type Substitution = (ast::ColumnRef, std::sync::Arc<ast::Node>);
 
 /// Forget what earlier statements recorded.
 pub(crate) fn clear_recorded() {
@@ -327,10 +331,8 @@ pub(crate) fn clear_recorded() {
 pub(crate) fn record_substitution(entry: Option<&ast::Node>, expr: std::sync::Arc<ast::Node>) {
     if let Some(ast::Node::ColumnRef(cr)) = entry {
         SUBSTITUTED.with(|m| {
-            m.borrow_mut().insert(
-                std::ptr::from_ref::<ast::ColumnRef>(cr) as usize,
-                ((**cr).clone(), expr),
-            );
+            m.borrow_mut()
+                .insert(NodeKey::of(&**cr), ((**cr).clone(), expr));
         });
     }
 }
@@ -364,7 +366,7 @@ pub(crate) fn substituted(entry: Option<&ast::Node>) -> Option<std::sync::Arc<as
     };
     SUBSTITUTED.with(|m| {
         m.borrow()
-            .get(&(std::ptr::from_ref::<ast::ColumnRef>(cr) as usize))
+            .get(&NodeKey::of(&**cr))
             .filter(|(r, _)| **cr == *r)
             .map(|(_, e)| e.clone())
     })

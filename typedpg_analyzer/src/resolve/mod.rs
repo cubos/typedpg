@@ -1323,7 +1323,7 @@ fn infer_collation_opclass_match(
     snapshot: &PgCatalog,
     elem: &ArbiterElem,
     idx: &crate::pg_catalog::PgIndex,
-    idx_exprs: &[Option<ast::Node>],
+    idx_exprs: &[Option<&ast::Node>],
 ) -> bool {
     let class_of = |c: crate::oid::PgOpclassOid| crate::ddl::opclass::opclass_by_oid(snapshot, c);
     let infer = elem.opclass.and_then(class_of);
@@ -1355,7 +1355,7 @@ fn infer_collation_opclass_match(
             (None, Some(_))
                 if attno == 0
                     && idx_exprs.get(natt - nplain).is_some_and(|x| {
-                        node_fingerprint(x.as_ref()) == node_fingerprint(elem.expr.as_ref())
+                        node_fingerprint(*x) == node_fingerprint(elem.expr.as_ref())
                     }) =>
             {
                 return true;
@@ -1477,7 +1477,9 @@ fn validate_on_conflict_target(
     target_exprs.sort();
     target_exprs.dedup();
 
-    let decode = |ast: &crate::pg_catalog::SerializedAst| -> Option<ast::Node> { ast.ast.clone() };
+    fn decode(ast: &crate::pg_catalog::SerializedAst) -> Option<&ast::Node> {
+        ast.ast.as_ref()
+    }
 
     let types = predtest::Types {
         snapshot,
@@ -1498,11 +1500,8 @@ fn validate_on_conflict_target(
             .min(idx.indkey.len())];
         let cols: std::collections::BTreeSet<i16> =
             key.iter().copied().filter(|&a| a != 0).collect();
-        let idx_exprs: Vec<Option<ast::Node>> = idx.indexprs.iter().map(decode).collect();
-        let mut exprs: Vec<String> = idx_exprs
-            .iter()
-            .map(|n| node_fingerprint(n.as_ref()))
-            .collect();
+        let idx_exprs: Vec<Option<&ast::Node>> = idx.indexprs.iter().map(decode).collect();
+        let mut exprs: Vec<String> = idx_exprs.iter().map(|n| node_fingerprint(*n)).collect();
         exprs.sort();
         exprs.dedup();
         if cols != target_cols || exprs != target_exprs {
@@ -1515,7 +1514,7 @@ fn validate_on_conflict_target(
             return false;
         }
         let pred = idx.indpred.as_ref().and_then(decode);
-        predtest::predicate_implied_by(pred.as_ref(), where_clause.as_ref(), &types)
+        predtest::predicate_implied_by(pred, where_clause.as_ref(), &types)
     });
     // Constraint-backed keys, for catalogs whose constraints carry no
     // pg_index row (and so no collations or operator classes to match).

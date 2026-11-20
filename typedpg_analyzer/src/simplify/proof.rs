@@ -139,13 +139,13 @@ impl<'a> FromScope<'a> {
     /// its ON condition), within `parent`.
     pub(crate) fn of_items(
         ctx: &Ctx<'_>,
-        from: &[Option<Node>],
+        from: &[Option<&Node>],
         parent: Option<&'a FromScope<'a>>,
     ) -> FromScope<'a> {
         let ctes = cte_names(ctx);
         let mut items = Vec::new();
         for f in from {
-            from_item(ctx, &ctes, f.as_ref(), false, &mut items);
+            from_item(ctx, &ctes, *f, false, &mut items);
         }
         FromScope {
             items,
@@ -160,7 +160,7 @@ impl<'a> FromScope<'a> {
     /// seeing exactly those items (see [`Self::has_parent`]).
     pub(crate) fn of_items_nested(
         ctx: &Ctx<'_>,
-        from: &[Option<Node>],
+        from: &[Option<&Node>],
         parent: Option<&'a FromScope<'a>>,
     ) -> FromScope<'a> {
         FromScope {
@@ -1543,10 +1543,10 @@ fn error_free_select_with(
     // An ON condition sees its own join's items and the levels around the
     // subquery's, not the subquery's other FROM items.
     quals.into_iter().all(|(q, join)| {
-        let sides: Vec<Option<Node>> = [&join.larg, &join.rarg]
+        let sides: Vec<Option<&Node>> = [&join.larg, &join.rarg]
             .into_iter()
             .flatten()
-            .map(|n| Some(n.clone()))
+            .map(Some)
             .collect();
         check(ctx, q, &FromScope::of_items(ctx, &sides, scope.parent))
     }) && select.target_list.iter().all(|t| match t.as_ref() {
@@ -2125,10 +2125,10 @@ fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
         from.iter()
             .all(|f| reads_stored_tables(ctx, &ctes, f.as_ref(), &mut quals))
             && quals.into_iter().all(|(q, join)| {
-                let sides: Vec<Option<Node>> = [&join.larg, &join.rarg]
+                let sides: Vec<Option<&Node>> = [&join.larg, &join.rarg]
                     .into_iter()
                     .flatten()
-                    .map(|n| Some(n.clone()))
+                    .map(Some)
                     .collect();
                 cannot_error(ctx, q, &FromScope::of_items(ctx, &sides, None))
             })
@@ -2299,6 +2299,11 @@ fn hidden_user_calls(catalog: &PgCatalog) -> bool {
 /// looked into) or foreign table, TABLESAMPLE, a locking clause. Errs
 /// towards `true`.
 pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
+    has_volatile_in(ctx, node.map(Node::to_ref))
+}
+
+/// [`has_volatile`] of a tree given as a [`NodeRef`].
+pub(crate) fn has_volatile_in(ctx: &Ctx<'_>, node: Option<NodeRef<'_>>) -> bool {
     let catalog = ctx.catalog;
     let ctes = cte_names(ctx);
     let volatile_proc = |p: PgProcOid| {
@@ -2319,7 +2324,7 @@ pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
     let Some(root) = node else {
         return false;
     };
-    root.nodes().any(|(n, _)| match n {
+    let volatile = |n: NodeRef<'_>| match n {
         NodeRef::FuncCall(f) => match name_parts(&f.funcname) {
             Some((schema, name)) => {
                 let candidates = catalog.find_functions(schema, name);
@@ -2371,5 +2376,13 @@ pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
         }
         NodeRef::RangeTableSample(_) | NodeRef::LockingClause(_) => true,
         _ => false,
-    })
+    };
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if volatile(n) {
+            return true;
+        }
+        stack.extend(n.children());
+    }
+    false
 }
