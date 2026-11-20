@@ -779,7 +779,7 @@ pub struct PgRewrite {
 /// The emitter and the rewrite pass walk the AST in identical pre-order:
 /// each name-bearing node consumes exactly one [`AstBinding`] entry. RENAME
 /// / SET SCHEMA become no-ops on the AST itself — the OIDs in the bindings
-/// remain valid and the deparser looks up *current* names.
+/// remain valid, and a name is looked up by OID when it is needed.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct SerializedAst {
     /// The stored expression or statement. Compact in JSON: postcard bytes,

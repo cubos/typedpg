@@ -774,8 +774,8 @@ fn check_refill(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
 }
 
 /// Bundle of analyzer outputs that [`install_relation`] needs to wire up a
-/// view: column shape, the deparse-time binding side-table, the encoded
-/// AST, and the deps to record in `pg_depend`.
+/// view: column shape, the binding side-table, the encoded AST, and the
+/// deps to record in `pg_depend`.
 #[derive(Default)]
 struct ResolvedView {
     columns: Vec<ResolvedColumn>,
@@ -1637,9 +1637,8 @@ impl BindingWalker {
     }
 
     /// FuncCall.funcname is `[name]` or `[schema, name]`. We look up the
-    /// function (any overload) and emit a Function binding with its OID;
-    /// the applier uses the proc's namespace + proname to rewrite the
-    /// AST literals on deparse.
+    /// function (any overload) and emit a Function binding with its OID,
+    /// which the view's `pg_depend` entries are derived from.
     fn bind_func_name(&mut self, funcname: &[Option<ast::Node>], snapshot: &PgCatalog) {
         let parts: Vec<&str> = funcname
             .iter()
@@ -1936,7 +1935,7 @@ pub(crate) fn refresh_dependent_view_nullability(
 // or schema move doesn't change any view's stored AST, because the bindings
 // keep pointing at the same OIDs. The functions are preserved as named
 // callsites in case we reintroduce a side-effect later (e.g. invalidating a
-// cached deparse).
+// cached analysis).
 
 pub fn rewrite_views_on_table_rename(
     _snapshot: &mut PgCatalog,

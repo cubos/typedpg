@@ -987,7 +987,7 @@ pub(crate) fn returning_exprs(
 /// the raw columns (keyed by OID) and sorted param list without converting to
 /// [`Type`]. Used by [`analyze_static`] (after parsing) and by the DDL view
 /// handling, which only needs OIDs to rebuild catalog entries and reuses a
-/// stored AST to skip the deparse → reparse round-trip.
+/// stored AST instead of parsing the view's text again.
 pub(crate) fn analyze_raw_node(
     snapshot: &PgCatalog,
     stmt: &ast::Node,
