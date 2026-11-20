@@ -40,6 +40,8 @@ mod not_null;
 mod operators;
 #[path = "ddl/postgres_18_7.rs"]
 mod postgres_18_7;
+#[path = "ddl/privileges.rs"]
+mod privileges;
 #[path = "ddl/procedures.rs"]
 mod procedures;
 #[path = "ddl/rename.rs"]

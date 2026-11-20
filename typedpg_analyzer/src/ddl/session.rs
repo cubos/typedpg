@@ -28,7 +28,7 @@ use crate::pg_catalog::PgCatalog;
 
 /// PG 18's predefined roles (`pg_authid` rows every cluster has). Any other
 /// `pg_*` name can't be a role: CREATE ROLE reserves the prefix.
-const PREDEFINED_ROLES: &[&str] = &[
+pub(crate) const PREDEFINED_ROLES: &[&str] = &[
     "pg_checkpoint",
     "pg_create_subscription",
     "pg_database_owner",

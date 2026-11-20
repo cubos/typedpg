@@ -842,6 +842,11 @@ pub(crate) fn procedure_create(
         .filter_map(|oid| interp.pg_proc.get(oid))
         .find(|p| p.proargtypes == proc.proargtypes)
         .cloned();
+    // CREATE OR REPLACE keeps the routine's owner and ACL
+    // (`ProcedureCreate` updates the row in place); removing and re-inserting
+    // it would otherwise reset them.
+    let mut preserved_owner = None;
+    let mut preserved_acl = None;
     let oid = match existing {
         Some(existing) => {
             if !replace {
@@ -851,6 +856,9 @@ pub(crate) fn procedure_create(
                 )));
             }
             check_replacement(&existing, &proc)?;
+            let object = super::acl::AclObject::Function(existing.oid);
+            preserved_owner = Some(interp.owner_of(object));
+            preserved_acl = interp.acls.explicit(object).cloned();
             interp.remove_pg_proc(existing.oid);
             super::depend::forget_dependencies_of(
                 interp,
@@ -862,6 +870,21 @@ pub(crate) fn procedure_create(
     };
     proc.oid = oid;
     interp.insert_pg_proc(proc.clone());
+    match preserved_owner {
+        Some(owner) => {
+            let object = super::acl::AclObject::Function(oid);
+            interp.set_object_owner(object, owner);
+            if let Some(acl) = preserved_acl {
+                interp.acls.set_explicit(object, acl);
+            }
+        }
+        None => {
+            // ProcedureCreate: a new routine is the current role's, with the
+            // function default privileges.
+            let owner = super::roles::current_role(interp);
+            super::acl::function_created(interp, oid, proc.pronamespace, owner);
+        }
+    }
     Ok(proc)
 }
 

@@ -48,8 +48,8 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     };
     // `CREATE SCHEMA AUTHORIZATION role` names the schema after the role.
     let name = if stmt.schemaname.is_empty() {
-        match role {
-            Some(role) => role,
+        match &role {
+            Some(role) => role.clone(),
             None => return Ok(()),
         }
     } else {
@@ -65,6 +65,15 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
         )));
     }
     ensure_namespace(interp, &name)?;
+    // NamespaceCreate: owned by `AUTHORIZATION`'s role, else the current
+    // role, with that role's schema default privileges.
+    let owner = match &role {
+        Some(role) => interp.roles.id_or_intern(role),
+        None => super::roles::current_role(interp),
+    };
+    if let Some(ns) = interp.namespace_oid(&name) {
+        super::acl::schema_created(interp, ns, owner, false);
+    }
 
     // The elements are created in the new schema: an explicit different
     // schema is an error (setSchemaName, parse_utilcmd.c), and they run with

@@ -211,6 +211,7 @@ fn create_clone(
         relkind: RelKind::index_on(Some(class.relkind)),
         reltype: None,
     });
+    super::super::acl::index_created(interp, index, part);
     interp.insert_pg_index(PgIndex {
         indexrelid: index,
         indrelid: part,

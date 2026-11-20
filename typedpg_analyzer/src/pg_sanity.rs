@@ -161,6 +161,9 @@ pub(crate) struct PgSanityServer {
     db_name: String,
     type_name_cache: HashMap<u32, String>,
     soundness: soundness::Soundness,
+    /// Every role the catalog saw created by a migration, so `Drop` can drop
+    /// them from the shared cluster after the scratch database goes.
+    created_roles: Vec<String>,
 }
 
 impl PgSanityServer {
@@ -214,6 +217,7 @@ impl PgSanityServer {
             db_name,
             type_name_cache: HashMap::new(),
             soundness: soundness::Soundness::new(),
+            created_roles: Vec::new(),
         })
     }
 
@@ -664,6 +668,505 @@ impl PgSanityServer {
         }
     }
 
+    /// The privileges of every role the migrations created must agree with
+    /// PostgreSQL's: for each role, every user relation (and column),
+    /// sequence, function, schema and type, plus a small sample of built-ins
+    /// whose seeded ACL isn't the default. Panics on the first disagreement.
+    pub(crate) fn assert_privileges_match(&mut self, db: &crate::pg_catalog::PgCatalog) {
+        let roles = db.created_roles();
+        if roles.is_empty() {
+            return;
+        }
+        // One transaction gives the matrix's reads one snapshot.
+        self.client
+            .batch_execute("BEGIN")
+            .unwrap_or_else(|e| panic!("pg_sanity: privilege comparison BEGIN failed: {e}"));
+        let mut divergence = None;
+        for role in roles {
+            if let Some(message) = self.compare_privileges(db, &role) {
+                divergence = Some(message);
+                break;
+            }
+        }
+        let _ = self.client.batch_execute("COMMIT");
+        if let Some(message) = divergence {
+            panic!("{message}");
+        }
+    }
+
+    /// Remember the roles the catalog has seen created. Called after every
+    /// mirrored migration (even a failed one, whose committed roles stay), so
+    /// `Drop` can clean the shared cluster up.
+    pub(crate) fn remember_roles(&mut self, roles: &[String]) {
+        for role in roles {
+            if !self.created_roles.contains(role) {
+                self.created_roles.push(role.clone());
+            }
+        }
+    }
+
+    /// Compare one role's privilege matrix with the server's,
+    /// `has_*_privilege` by `has_*_privilege`. Objects are matched by name
+    /// (the analyzer's OIDs differ from PG's).
+    fn compare_privileges(
+        &mut self,
+        db: &crate::pg_catalog::PgCatalog,
+        role: &str,
+    ) -> Option<String> {
+        use crate::pg_catalog::RelKind;
+        let param: &(dyn ToSql + Sync) = &role;
+
+        // Relations: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES,
+        // TRIGGER.
+        const RELATION_PRIVS: [&str; 7] = [
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "TRUNCATE",
+            "REFERENCES",
+            "TRIGGER",
+        ];
+        let mut sql = String::from(
+            "SELECT n.nspname, c.relname, \
+                    has_table_privilege($1::name, c.oid, 'SELECT'), \
+                    has_table_privilege($1::name, c.oid, 'INSERT'), \
+                    has_table_privilege($1::name, c.oid, 'UPDATE'), \
+                    has_table_privilege($1::name, c.oid, 'DELETE'), \
+                    has_table_privilege($1::name, c.oid, 'TRUNCATE'), \
+                    has_table_privilege($1::name, c.oid, 'REFERENCES'), \
+                    has_table_privilege($1::name, c.oid, 'TRIGGER') \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'v', 'm', 'f', 'p') \
+               AND n.nspname <> 'information_schema' \
+               AND n.nspname NOT LIKE 'pg\\_%'",
+        );
+        let _ = &mut sql;
+        let pg_rows = self.query(&sql, param);
+        let mut pg_relations: HashMap<(String, String), Vec<bool>> = HashMap::new();
+        for row in &pg_rows {
+            let key = (row.get::<_, String>(0), row.get::<_, String>(1));
+            let privs = (0..RELATION_PRIVS.len())
+                .map(|i| row.get::<_, bool>(i + 2))
+                .collect();
+            pg_relations.insert(key, privs);
+        }
+        for class in db.pg_class.values() {
+            let Some(schema) = db.namespace_name(class.relnamespace) else {
+                continue;
+            };
+            if !is_user_schema(schema) {
+                continue;
+            }
+            if !matches!(
+                class.relkind,
+                RelKind::Table
+                    | RelKind::View
+                    | RelKind::MaterializedView
+                    | RelKind::ForeignTable
+                    | RelKind::Partitioned
+            ) {
+                continue;
+            }
+            let Some(pg_privs) = pg_relations.get(&(schema.to_owned(), class.relname.clone()))
+            else {
+                return Some(format!(
+                    "pg_sanity: relation {} does not exist on PG while comparing role \"{role}\"",
+                    crate::QualifiedName::new(schema, class.relname.clone())
+                ));
+            };
+            let privileges = [
+                crate::Privilege::Select,
+                crate::Privilege::Insert,
+                crate::Privilege::Update,
+                crate::Privilege::Delete,
+                crate::Privilege::Truncate,
+                crate::Privilege::References,
+                crate::Privilege::Trigger,
+            ];
+            for (i, privilege) in privileges.into_iter().enumerate() {
+                let ours = db.has_table_privilege(role, class.oid, privilege);
+                if ours != pg_privs[i] {
+                    return Some(privilege_mismatch(
+                        role,
+                        &crate::QualifiedName::new(schema, class.relname.clone()).to_string(),
+                        RELATION_PRIVS[i],
+                        ours,
+                        pg_privs[i],
+                    ));
+                }
+            }
+        }
+
+        // Columns: SELECT, INSERT, UPDATE, REFERENCES.
+        const COLUMN_PRIVS: [&str; 4] = ["SELECT", "INSERT", "UPDATE", "REFERENCES"];
+        let pg_rows = self.query(
+            "SELECT n.nspname, c.relname, a.attname, \
+                    has_column_privilege($1::name, c.oid, a.attnum, 'SELECT'), \
+                    has_column_privilege($1::name, c.oid, a.attnum, 'INSERT'), \
+                    has_column_privilege($1::name, c.oid, a.attnum, 'UPDATE'), \
+                    has_column_privilege($1::name, c.oid, a.attnum, 'REFERENCES') \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE a.attnum > 0 AND NOT a.attisdropped \
+               AND c.relkind IN ('r', 'v', 'm', 'f', 'p') \
+               AND n.nspname <> 'information_schema' \
+               AND n.nspname NOT LIKE 'pg\\_%'",
+            param,
+        );
+        let mut pg_columns: HashMap<(String, String, String), Vec<bool>> = HashMap::new();
+        for row in &pg_rows {
+            let key = (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+            );
+            let privs = (0..COLUMN_PRIVS.len())
+                .map(|i| row.get::<_, bool>(i + 3))
+                .collect();
+            pg_columns.insert(key, privs);
+        }
+        for class in db.pg_class.values() {
+            let Some(schema) = db.namespace_name(class.relnamespace) else {
+                continue;
+            };
+            if !is_user_schema(schema) {
+                continue;
+            }
+            if !matches!(
+                class.relkind,
+                RelKind::Table
+                    | RelKind::View
+                    | RelKind::MaterializedView
+                    | RelKind::ForeignTable
+                    | RelKind::Partitioned
+            ) {
+                continue;
+            }
+            for attr in db.attributes_of(class.oid) {
+                if attr.attnum <= 0 {
+                    continue;
+                }
+                let Some(pg_privs) = pg_columns.get(&(
+                    schema.to_owned(),
+                    class.relname.clone(),
+                    attr.attname.clone(),
+                )) else {
+                    return Some(format!(
+                        "pg_sanity: column {}.{} does not exist on PG while comparing role \"{role}\"",
+                        crate::QualifiedName::new(schema, class.relname.clone()),
+                        attr.attname
+                    ));
+                };
+                let privileges = [
+                    crate::Privilege::Select,
+                    crate::Privilege::Insert,
+                    crate::Privilege::Update,
+                    crate::Privilege::References,
+                ];
+                for (i, privilege) in privileges.into_iter().enumerate() {
+                    let ours = db.has_column_privilege(role, class.oid, attr.attnum, privilege);
+                    if ours != pg_privs[i] {
+                        return Some(privilege_mismatch(
+                            role,
+                            &format!(
+                                "{}.{}",
+                                crate::QualifiedName::new(schema, class.relname.clone()),
+                                attr.attname
+                            ),
+                            COLUMN_PRIVS[i],
+                            ours,
+                            pg_privs[i],
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Sequences: USAGE, SELECT, UPDATE.
+        const SEQUENCE_PRIVS: [&str; 3] = ["USAGE", "SELECT", "UPDATE"];
+        let pg_rows = self.query(
+            "SELECT n.nspname, c.relname, \
+                    has_sequence_privilege($1::name, c.oid, 'USAGE'), \
+                    has_sequence_privilege($1::name, c.oid, 'SELECT'), \
+                    has_sequence_privilege($1::name, c.oid, 'UPDATE') \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'S' \
+               AND n.nspname <> 'information_schema' \
+               AND n.nspname NOT LIKE 'pg\\_%'",
+            param,
+        );
+        let mut pg_sequences: HashMap<(String, String), Vec<bool>> = HashMap::new();
+        for row in &pg_rows {
+            let key = (row.get::<_, String>(0), row.get::<_, String>(1));
+            let privs = (0..SEQUENCE_PRIVS.len())
+                .map(|i| row.get::<_, bool>(i + 2))
+                .collect();
+            pg_sequences.insert(key, privs);
+        }
+        for class in db.pg_class.values() {
+            if class.relkind != RelKind::Sequence {
+                continue;
+            }
+            let Some(schema) = db.namespace_name(class.relnamespace) else {
+                continue;
+            };
+            if !is_user_schema(schema) {
+                continue;
+            }
+            let Some(pg_privs) = pg_sequences.get(&(schema.to_owned(), class.relname.clone()))
+            else {
+                return Some(format!(
+                    "pg_sanity: sequence {} does not exist on PG while comparing role \"{role}\"",
+                    crate::QualifiedName::new(schema, class.relname.clone())
+                ));
+            };
+            let privileges = [
+                crate::Privilege::Usage,
+                crate::Privilege::Select,
+                crate::Privilege::Update,
+            ];
+            for (i, privilege) in privileges.into_iter().enumerate() {
+                let ours = db.has_sequence_privilege(role, class.oid, privilege);
+                if ours != pg_privs[i] {
+                    return Some(privilege_mismatch(
+                        role,
+                        &crate::QualifiedName::new(schema, class.relname.clone()).to_string(),
+                        SEQUENCE_PRIVS[i],
+                        ours,
+                        pg_privs[i],
+                    ));
+                }
+            }
+        }
+
+        // Functions, procedures and aggregates: EXECUTE.
+        let pg_rows = self.query(
+            // The input argument types only, as `format_type` prints them:
+            // `pg_get_function_identity_arguments` would add names and
+            // modes, which the analyzer's side doesn't carry.
+            "SELECT n.nspname, p.proname, \
+                    pg_catalog.array_to_string(ARRAY( \
+                        SELECT pg_catalog.format_type(a.t, NULL) \
+                        FROM pg_catalog.unnest(p.proargtypes) WITH ORDINALITY a(t, i) \
+                        ORDER BY a.i), ', '), \
+                    has_function_privilege($1::name, p.oid, 'EXECUTE') \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname <> 'information_schema' \
+               AND n.nspname NOT LIKE 'pg\\_%'",
+            param,
+        );
+        let mut pg_functions: HashMap<(String, String, String), bool> = HashMap::new();
+        for row in &pg_rows {
+            pg_functions.insert(
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                ),
+                row.get::<_, bool>(3),
+            );
+        }
+        for proc in db.pg_proc.values() {
+            let Some(schema) = db.namespace_name(proc.pronamespace) else {
+                continue;
+            };
+            if !is_user_schema(schema) {
+                continue;
+            }
+            let signature = proc
+                .proargtypes
+                .iter()
+                .map(|&t| crate::ddl::util::format_type_for_message(db, t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let Some(&pg_priv) =
+                pg_functions.get(&(schema.to_owned(), proc.proname.clone(), signature.clone()))
+            else {
+                return Some(format!(
+                    "pg_sanity: function {}({signature}) does not exist on PG while comparing \
+                     role \"{role}\"",
+                    crate::QualifiedName::new(schema, proc.proname.clone())
+                ));
+            };
+            let ours = db.has_function_privilege(role, proc.oid);
+            if ours != pg_priv {
+                return Some(privilege_mismatch(
+                    role,
+                    &format!(
+                        "{}({signature})",
+                        crate::QualifiedName::new(schema, proc.proname.clone())
+                    ),
+                    "EXECUTE",
+                    ours,
+                    pg_priv,
+                ));
+            }
+        }
+
+        // Schemas: USAGE, CREATE.
+        let pg_rows = self.query(
+            "SELECT n.nspname, \
+                    has_schema_privilege($1::name, n.oid, 'USAGE'), \
+                    has_schema_privilege($1::name, n.oid, 'CREATE') \
+             FROM pg_catalog.pg_namespace n \
+             WHERE n.nspname <> 'information_schema' \
+               AND n.nspname NOT LIKE 'pg\\_%'",
+            param,
+        );
+        let mut pg_schemas: HashMap<String, (bool, bool)> = HashMap::new();
+        for row in &pg_rows {
+            pg_schemas.insert(
+                row.get::<_, String>(0),
+                (row.get::<_, bool>(1), row.get::<_, bool>(2)),
+            );
+        }
+        for namespace in db.pg_namespace.values() {
+            if !is_user_schema(&namespace.nspname) {
+                continue;
+            }
+            let Some(&(pg_usage, pg_create)) = pg_schemas.get(&namespace.nspname) else {
+                return Some(format!(
+                    "pg_sanity: schema {} does not exist on PG while comparing role \"{role}\"",
+                    typedpg_core::quote_identifier(&namespace.nspname)
+                ));
+            };
+            let ours_usage = db.has_schema_privilege(role, namespace.oid, crate::Privilege::Usage);
+            if ours_usage != pg_usage {
+                return Some(privilege_mismatch(
+                    role,
+                    &typedpg_core::quote_identifier(&namespace.nspname),
+                    "USAGE",
+                    ours_usage,
+                    pg_usage,
+                ));
+            }
+            let ours_create =
+                db.has_schema_privilege(role, namespace.oid, crate::Privilege::Create);
+            if ours_create != pg_create {
+                return Some(privilege_mismatch(
+                    role,
+                    &typedpg_core::quote_identifier(&namespace.nspname),
+                    "CREATE",
+                    ours_create,
+                    pg_create,
+                ));
+            }
+        }
+
+        // Types: USAGE.
+        let pg_rows = self.query(
+            "SELECT n.nspname, t.typname, \
+                    has_type_privilege($1::name, t.oid, 'USAGE') \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname <> 'information_schema' \
+               AND n.nspname NOT LIKE 'pg\\_%'",
+            param,
+        );
+        let mut pg_types: HashMap<(String, String), bool> = HashMap::new();
+        for row in &pg_rows {
+            pg_types.insert(
+                (row.get::<_, String>(0), row.get::<_, String>(1)),
+                row.get::<_, bool>(2),
+            );
+        }
+        for typ in db.pg_type.values() {
+            let Some(schema) = db.namespace_name(typ.typnamespace) else {
+                continue;
+            };
+            if !is_user_schema(schema) {
+                continue;
+            }
+            let Some(&pg_priv) = pg_types.get(&(schema.to_owned(), typ.typname.clone())) else {
+                return Some(format!(
+                    "pg_sanity: type {} does not exist on PG while comparing role \"{role}\"",
+                    crate::QualifiedName::new(schema, typ.typname.clone())
+                ));
+            };
+            let ours = db.has_type_privilege(role, typ.oid);
+            if ours != pg_priv {
+                return Some(privilege_mismatch(
+                    role,
+                    &crate::QualifiedName::new(schema, typ.typname.clone()).to_string(),
+                    "USAGE",
+                    ours,
+                    pg_priv,
+                ));
+            }
+        }
+
+        // A fixed sample of built-ins whose seeded ACL isn't the default.
+        for (name, sel) in [
+            ("pg_authid", "SELECT"),
+            ("pg_statistic", "SELECT"),
+            ("pg_subscription", "SELECT"),
+            ("pg_shadow", "SELECT"),
+        ] {
+            let (ours, pg) = (
+                db.resolve_table(Some("pg_catalog"), name)
+                    .map(|c| db.has_table_privilege(role, c.oid, crate::Privilege::Select)),
+                self.query_one_bool(
+                    "SELECT has_table_privilege($2::name, $1::text::regclass, 'SELECT')",
+                    &format!("pg_catalog.{name}"),
+                    role,
+                ),
+            );
+            if let Some(ours) = ours
+                && ours != pg
+            {
+                return Some(privilege_mismatch(
+                    role,
+                    &format!("pg_catalog.{name}"),
+                    sel,
+                    ours,
+                    pg,
+                ));
+            }
+        }
+        for (name, args, sql_name) in [
+            ("pg_read_file", 1, "pg_catalog.pg_read_file(text)"),
+            ("pg_ls_dir", 1, "pg_catalog.pg_ls_dir(text)"),
+            ("lo_import", 1, "pg_catalog.lo_import(text)"),
+            ("now", 0, "pg_catalog.now()"),
+        ] {
+            let ours = db
+                .find_functions(Some("pg_catalog"), name)
+                .into_iter()
+                .find(|p| p.proargtypes.len() == args)
+                .map(|p| db.has_function_privilege(role, p.oid));
+            let pg = self.query_one_bool(
+                "SELECT has_function_privilege($2::name, $1::text::regprocedure, 'EXECUTE')",
+                sql_name,
+                role,
+            );
+            if let Some(ours) = ours
+                && ours != pg
+            {
+                return Some(privilege_mismatch(role, sql_name, "EXECUTE", ours, pg));
+            }
+        }
+
+        None
+    }
+
+    fn query(&mut self, sql: &str, param: &(dyn ToSql + Sync)) -> Vec<postgres::Row> {
+        self.client
+            .query(sql, &[param])
+            .unwrap_or_else(|e| panic!("pg_sanity: privilege query failed: {e}\nSQL:\n{sql}"))
+    }
+
+    fn query_one_bool(&mut self, sql: &str, object: &str, role: &str) -> bool {
+        self.client
+            .query_one(sql, &[&object, &role])
+            .unwrap_or_else(|e| panic!("pg_sanity: privilege query failed: {e}\nSQL:\n{sql}"))
+            .get(0)
+    }
+
     /// Resolve a PG type OID to its qualified name (`schema.type_name`) by
     /// querying `pg_catalog.pg_type`. Array types are flipped from their PG
     /// `_int4` underscore form into the bracketed `pg_catalog.int4[]` form
@@ -703,6 +1206,23 @@ impl PgSanityServer {
     }
 }
 
+/// Whether a schema holds user objects: not `pg_catalog`, a TOAST schema,
+/// the temporary schema or `information_schema`.
+fn is_user_schema(name: &str) -> bool {
+    name != "information_schema" && !name.starts_with("pg_")
+}
+
+/// The panic message of a privilege matrix disagreement.
+fn privilege_mismatch(role: &str, object: &str, privilege: &str, ours: bool, pg: bool) -> String {
+    format!(
+        "pg_sanity: privilege mismatch while comparing role \"{role}\":\n\
+         object:    {object}\n\
+         privilege: {privilege}\n\
+         analyzer:  {ours}\n\
+         PG:        {pg}"
+    )
+}
+
 impl Drop for PgSanityServer {
     fn drop(&mut self) {
         self.soundness.write_stats();
@@ -740,6 +1260,16 @@ impl Drop for PgSanityServer {
         let _ = self
             .client
             .batch_execute(&format!("DROP DATABASE IF EXISTS \"{}\"", self.db_name));
+
+        // Roles are cluster-wide: drop the ones the migrations created so
+        // concurrent test processes don't collide. Errors are swallowed (a
+        // role may already be gone, or still owned by another database).
+        for role in &self.created_roles {
+            let quoted = typedpg_core::quote_identifier(role);
+            let _ = self
+                .client
+                .batch_execute(&format!("DROP ROLE IF EXISTS {quoted}"));
+        }
     }
 }
 

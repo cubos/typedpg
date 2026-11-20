@@ -1731,6 +1731,7 @@ fn drop_column_dependent(interp: &mut PgCatalog, relid: PgClassOid, attnum: i16)
         .any(|a| a.attnum == attnum && a.attgenerated.is_some());
     interp.attr_default_types.remove(&(relid, attnum));
     interp.attr_default_exprs.remove(&(relid, attnum));
+    interp.acls.forget_column(relid, attnum);
     super::defaults::forget_default_dependencies(interp, relid, attnum);
     if generated {
         interp.generated_refs.remove(&(relid, attnum));

@@ -906,6 +906,20 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     }
     constraints::add_pending_foreign_keys(interp, class_oid, pending_fks)?;
 
+    // DefineRelation / heap_create_with_catalog: the relation's owner (the
+    // current role), its default ACL, and — as dependent types — its row
+    // type and that type's array.
+    let owner = super::roles::current_role(interp);
+    super::acl::relation_created(
+        interp,
+        class_oid,
+        nsoid,
+        owner,
+        super::acl::DefaultAclClass::Table,
+    );
+    super::acl::type_created_dependent(interp, composite_oid, owner);
+    super::acl::type_created_dependent(interp, array_oid, owner);
+
     Ok(())
 }
 
@@ -1382,6 +1396,28 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
 /// ATPrepCmd's `pass` for a subcommand (AlterTablePass, tablecmds.c).
 /// transformAlterTableStmt turns an index-backed ADD CONSTRAINT into an
 /// ADD INDEX.
+/// `ALTER TABLE ... OWNER TO` (`ATExecChangeOwner`): the new owner must be a
+/// role, and a plain index's ownership is its table's (skipped, as PG warns);
+/// the relation's row type, indexes and owned sequences follow it.
+fn change_relation_owner(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &typedpg_pg_query::ast::AlterTableCmd,
+) -> Result<(), DdlError> {
+    let Some(spec) = cmd.newowner.as_ref() else {
+        return Ok(());
+    };
+    let new_owner = super::roles::resolve_role_spec(interp, spec)?;
+    if matches!(
+        interp.pg_class.get(&relid).map(|c| c.relkind),
+        Some(RelKind::Index)
+    ) {
+        return Ok(());
+    }
+    super::acl::change_relation_owner(interp, relid, new_owner);
+    Ok(())
+}
+
 fn alter_table_pass(cmd: &AlterTableCmd) -> u8 {
     use AlterTableType as At;
     const DROP: u8 = 0;
@@ -1547,6 +1583,9 @@ fn apply_alter_subtype(
                 relname_of(interp, relid)
             )))
         }
+        // ATExecChangeOwner: the relation (and what follows its owner), or a
+        // plain index — which is skipped with a warning.
+        AlterTableType::AtChangeOwner => change_relation_owner(interp, relid, cmd),
         AlterTableType::AtClusterOn => object_refs::cluster_on(interp, relid, cmd),
         AlterTableType::AtSetLogged | AlterTableType::AtSetUnLogged => {
             set_persistence(interp, relid, subtype == AlterTableType::AtSetLogged)

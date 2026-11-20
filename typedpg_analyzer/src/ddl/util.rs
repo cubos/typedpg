@@ -159,6 +159,8 @@ pub fn ensure_namespace(interp: &mut PgCatalog, name: &str) -> Result<PgNamespac
         oid,
         nspname: name.to_owned(),
     });
+    let owner = crate::ddl::roles::current_role(interp);
+    crate::ddl::acl::schema_created(interp, oid, owner, false);
     Ok(oid)
 }
 
@@ -176,6 +178,8 @@ pub fn temp_namespace(interp: &mut PgCatalog) -> Result<PgNamespaceOid, DdlError
         oid,
         nspname: "pg_temp_1".to_owned(),
     });
+    let owner = crate::ddl::roles::current_role(interp);
+    crate::ddl::acl::schema_created(interp, oid, owner, true);
     Ok(oid)
 }
 

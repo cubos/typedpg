@@ -734,6 +734,7 @@ pub(super) fn emit_constraint_with_backing_index(
             relkind,
             reltype: None,
         });
+        super::super::acl::index_created(interp, indexrelid, relid);
         // The INCLUDE columns follow the key columns.
         let indnkeyatts = conkey.len() as i16;
         let indkey: Vec<i16> = conkey.iter().chain(&include).copied().collect();
@@ -2277,6 +2278,7 @@ pub(crate) fn copy_like_constraints(
                         relkind,
                         reltype: None,
                     });
+                    super::super::acl::index_created(interp, indexrelid, relid);
                     let source = idx.indexrelid;
                     interp.insert_pg_index(PgIndex {
                         indexrelid,

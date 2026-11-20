@@ -927,6 +927,19 @@ fn install_relation(
     if matches!(relkind, RelKind::View | RelKind::MaterializedView) {
         record_view_dependencies(interp, class_oid, &deps);
     }
+    // DefineVirtualRelation / intorel_startup: the view or table is the
+    // current role's, with the relation default privileges; its row type and
+    // array are dependent types, owned alike.
+    let owner = super::roles::current_role(interp);
+    super::acl::relation_created(
+        interp,
+        class_oid,
+        nsoid,
+        owner,
+        super::acl::DefaultAclClass::Table,
+    );
+    super::acl::type_created_dependent(interp, composite_oid, owner);
+    super::acl::type_created_dependent(interp, array_oid, owner);
     Ok(())
 }
 

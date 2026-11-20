@@ -82,6 +82,7 @@ pub fn create_language(interp: &mut PgCatalog, stmt: &CreatePLangStmt) -> Result
         Some(oid) => oid,
         None => PgLanguageOid::from_nonzero(interp.alloc_oid()?),
     };
+    let created = existing.is_none();
     interp.pg_language.insert(
         oid,
         PgLanguage {
@@ -92,6 +93,10 @@ pub fn create_language(interp: &mut PgCatalog, stmt: &CreatePLangStmt) -> Result
             lanplcallfoid: handler,
         },
     );
+    if created {
+        let owner = super::roles::current_role(interp);
+        super::acl::language_created(interp, oid, owner);
+    }
     let addr = super::depend::ObjectAddress::language(oid);
     super::depend::forget_dependencies_of(interp, addr);
     super::depend::record(
