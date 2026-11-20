@@ -70,8 +70,6 @@ jobs:
           - { target: win32-x64-msvc, os: windows-2025, rust: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust }}
@@ -102,8 +100,6 @@ jobs:
       id-token: write # npm provenance
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: true
       - uses: actions/setup-node@v7
         with:
           node-version: 26

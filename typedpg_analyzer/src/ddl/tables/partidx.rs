@@ -407,16 +407,8 @@ fn same_exprs(
     a: &[crate::pg_catalog::SerializedAst],
     b: &[crate::pg_catalog::SerializedAst],
 ) -> bool {
-    use prost::Message;
     use typedpg_pg_query::Equal;
-    let decode = |e: &crate::pg_catalog::SerializedAst| {
-        typedpg_pg_query::protobuf::Node::decode(e.ast.as_slice()).ok()
-    };
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(a, b)| match (decode(a), decode(b)) {
-            (Some(a), Some(b)) => a.equal(&b),
-            _ => a.ast == b.ast,
-        })
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.ast.equal(&b.ast))
 }
 
 /// An index's access method (`relam`; btree unless recorded otherwise).

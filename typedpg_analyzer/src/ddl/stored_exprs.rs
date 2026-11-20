@@ -217,11 +217,7 @@ pub(crate) fn rename_column(interp: &mut PgCatalog, relid: PgClassOid, old: &str
             continue;
         };
         for ast in row.indexprs.iter_mut().chain(row.indpred.as_mut()) {
-            use prost::Message;
-            if let Ok(mut expr) = protobuf::Node::decode(ast.ast.as_slice()) {
-                rename_column_refs(&mut expr, &relname, &columns, old, new);
-                ast.ast = expr.encode_to_vec();
-            }
+            rename_column_refs(&mut ast.ast, &relname, &columns, old, new);
         }
         interp.pg_index.insert(index, row);
     }

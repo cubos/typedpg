@@ -2186,7 +2186,6 @@ fn recheck_dependents_of_retyped_column(
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::pg_catalog::oid;
-    use prost::Message;
     let reads_column = |expr: &typedpg_pg_query::protobuf::Node| {
         expr.node.as_ref().is_some_and(|inner| {
             inner.nodes().into_iter().any(|(n, ..)| {
@@ -2248,11 +2247,10 @@ fn recheck_dependents_of_retyped_column(
     indexes.sort_by_key(|i| i.indexrelid);
     for index in indexes {
         if let Some(pred) = index.indpred.as_ref()
-            && let Ok(expr) = typedpg_pg_query::protobuf::Node::decode(pred.ast.as_slice())
-            && reads_column(&expr)
+            && reads_column(&pred.ast)
         {
             infer_bool(
-                &crate::ddl::stored_exprs::over_own_row(interp, relid, &expr),
+                &crate::ddl::stored_exprs::over_own_row(interp, relid, &pred.ast),
                 "WHERE",
             )?;
         }

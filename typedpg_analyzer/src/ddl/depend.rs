@@ -2224,20 +2224,16 @@ pub(crate) fn record_partition_key_expressions(
 /// An index depends on what its expressions and predicate refer to
 /// (index_create → recordDependencyOnSingleRelExpr).
 pub(crate) fn record_index_expressions(interp: &mut PgCatalog, index: PgClassOid) {
-    use prost::Message;
     let Some(row) = interp.pg_index.get(&index) else {
         return;
     };
     let relid = row.indrelid;
-    let decode = |ast: &crate::pg_catalog::SerializedAst| {
-        typedpg_pg_query::protobuf::Node::decode(ast.ast.as_slice()).ok()
-    };
     let key_exprs: Vec<typedpg_pg_query::protobuf::Node> =
-        row.indexprs.iter().filter_map(decode).collect();
+        row.indexprs.iter().map(|e| e.ast.clone()).collect();
     let exprs: Vec<typedpg_pg_query::protobuf::Node> = key_exprs
         .iter()
         .cloned()
-        .chain(row.indpred.iter().filter_map(decode))
+        .chain(row.indpred.iter().map(|e| e.ast.clone()))
         .collect();
     let refs: Vec<&typedpg_pg_query::protobuf::Node> = exprs.iter().collect();
     // The key expressions produce the index's column types (the predicate

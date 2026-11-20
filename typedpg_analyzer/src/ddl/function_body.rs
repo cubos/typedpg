@@ -403,7 +403,7 @@ fn collect_atomic(node: &protobuf::Node, out: &mut Vec<node::Node>) {
                             ..Default::default()
                         }))),
                     }],
-                    limit_option: protobuf::LimitOption::Default as i32,
+                    limit_option: protobuf::LimitOption::Count as i32,
                     op: protobuf::SetOperation::SetopNone as i32,
                     ..Default::default()
                 })));

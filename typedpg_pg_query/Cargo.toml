@@ -3,45 +3,39 @@ name = "typedpg_pg_query"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# Our code is MIT; the bundled libpg_query is BSD-3-Clause and
-# the PostgreSQL sources it embeds are under the PostgreSQL License.
-license = "MIT AND BSD-3-Clause AND PostgreSQL"
+# Our code is MIT; the bundled PostgreSQL sources are under the PostgreSQL
+# License, and csrc/plpgsql (libpg_query's PL/pgSQL compiler driver) under
+# BSD-3-Clause.
+license = "MIT AND PostgreSQL AND BSD-3-Clause"
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "PostgreSQL parser bindings for typedpg, built on libpg_query"
+description = "PostgreSQL parser bindings for typedpg, built on PostgreSQL's own sources"
 keywords = ["postgres", "postgresql", "sql", "parser"]
 categories = ["database", "parser-implementations"]
-links = "pg_query"
+links = "typedpg_postgres"
 build = "build.rs"
-# Only what the build compiles (the submodule also carries tests, fixtures
-# and generated C++ we don't use).
+# Only what the build compiles (the import tooling and the tarball cache stay
+# out).
 include = [
     "/Cargo.toml",
     "/build.rs",
-    "/patches.rs",
     "/POSTGRES_VERSION",
+    "/POSTGRES_SHA256",
+    "/import/FILES",
+    "/import/FILES.windows",
     "/csrc/**/*",
+    "/postgres/**/*",
     "/README.md",
     "/src/**/*.rs",
     "/tests/**/*.rs",
-    "/libpg_query/LICENSE",
-    "/libpg_query/pg_query.h",
-    "/libpg_query/pg_query_scan_tokens.h",
-    "/libpg_query/postgres_deparse.h",
-    "/libpg_query/src/**/*",
-    "/libpg_query/vendor/**/*",
-    "/libpg_query/protobuf/pg_query.upb.h",
-    "/libpg_query/protobuf/pg_query.upb_minitable.c",
-    "/libpg_query/protobuf/pg_query.upb_minitable.h",
-    "/libpg_query/protobuf/pg_query.proto",
 ]
 
 [dependencies]
-# libpg_query bounds a tree's depth itself (10,000 levels): prost's own limit
-# (100) cut ordinary queries short (47 terms of `1 + 1 + …`). The stack for
-# deeper ones is src/stack.rs's.
-prost = { version = "0.14", features = ["no-recursion-limit"] }
+# A tree's depth is bounded by the converter (10,000 message levels, as
+# libpg_query's protobuf encoder was): the stack for deeper ones is
+# src/stack.rs's.
+serde = { version = "1", features = ["derive"] }
 stacker = "0.1"
 serde_json = "1"
 thiserror = "2"

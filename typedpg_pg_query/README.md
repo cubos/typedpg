@@ -1,102 +1,114 @@
 # typedpg_pg_query
 
-PostgreSQL parser bindings for typedpg, built on
-[libpg_query](https://github.com/pganalyze/libpg_query) — PostgreSQL's own
-grammar extracted into a C library, with the parse tree handed over as
-protobuf.
+PostgreSQL parser bindings for typedpg, built on PostgreSQL's own, unmodified
+sources: the parser, the grammar and the scanner of the release named by
+`POSTGRES_VERSION` (PostgreSQL 18.7), imported into [`postgres/`](postgres)
+by [`import/`](import).
 
-The crate compiles libpg_query from the `libpg_query/` git submodule (pinned
-to a release tag) and exposes:
+The crate exposes:
 
-- `parse`, `scan` and `parse_plpgsql`;
-- `protobuf`, the AST types, generated from libpg_query's `pg_query.proto`;
+- `parse`, `parse_type_name` and `scan`;
+- `protobuf`, the AST types (the name is historical: they are plain Rust
+  records), generated from PostgreSQL's headers by
+  `typedpg_pg_query_codegen`;
 - `NodeRef` / `NodeMut`, a view of a node by kind, and `nodes()` /
   `nodes_mut()`, every node of a tree (breadth-first, with its depth);
 - `Equal`, PostgreSQL's `equal()` over the AST: every field compared except
   source locations and `equal_ignore` fields, both read from the PostgreSQL
-  headers libpg_query vendors;
-- `parse_plpgsql_with_catalog`, which compiles a PL/pgSQL function against a
-  caller-supplied `Catalog` (see below).
+  headers;
+- `parse_plpgsql` / `parse_plpgsql_with_catalog`, which compile `DO` blocks
+  and `CREATE FUNCTION … LANGUAGE plpgsql` statements with PostgreSQL's own
+  PL/pgSQL compiler and return the compiled functions as JSON (see below).
 
-## PL/pgSQL and the catalog
+## PL/pgSQL
 
-SQL parsing is pure grammar, but PL/pgSQL's compiler looks things up: the
-types of the arguments, the result and declared variables, schemas, and — for
-`%TYPE` / `%ROWTYPE` — relations and columns. Outside a server, libpg_query
-answers those lookups from mocks that only know the built-in types.
+The compiler is PostgreSQL's (`postgres/src/pl/plpgsql/src/pl_comp.c`,
+`pl_gram.c`, `pl_funcs.c`, `pl_scanner.c`, `pl_handler.c`). The driver lives in
+[`csrc/plpgsql/`](csrc/plpgsql): libpg_query's `pg_query_parse_plpgsql.c` and
+`pg_query_json_plpgsql.c` — BSD-3-Clause, its [`LICENSE`](csrc/plpgsql/LICENSE)
+sits next to them — adapted to this crate. The JSON patches typedpg used to
+apply at build time are applied to the source directly:
 
-`parse_plpgsql_with_catalog` installs a `Catalog` for the duration of the
-call, and the lookups read it instead (`csrc/catalog.c` plus the redirecting
-patches in `patches.rs`): user-defined types resolve with their real kind,
-and missing objects get PostgreSQL's own errors (`type "x" does not exist`,
-`relation "t" does not exist`, `column "c" of relation "t" does not exist`).
-PostgreSQL 18.4's `%TYPE` / `%ROWTYPE` code, which libpg_query replaces with a
-text-only stand-in, is restored while a catalog is installed.
+- a block's `initvarnos` (the variables it initializes on entry) are dumped;
+- a trigger function's `TG_*` promise datums are dumped as the variables they
+  are (older libpg_query emitted them as empty objects, invalid JSON);
+- `retvarno` is dumped for `RETURN` / `RETURN NEXT` of a row or set variable;
+- `PLpgSQL_type` carries the type name as written (`origtypname`), all that is
+  left of a named composite type for re-lookup;
+- a record variable's declared type is dumped.
 
-`PG_VERSION` / `PG_VERSION_NUM` name the PostgreSQL release the parser
-implements: `POSTGRES_VERSION`, the release typedpg targets. The seed, the
-extension scripts, the `pg_sanity` oracle and the test servers all follow
-that file.
+Compiling a `CREATE FUNCTION` builds the `pg_proc` row PostgreSQL's validator
+would read — parameter types (the `proargtypes` oidvector and the OUT/VARIADIC
+arrays), the result type, the source text — as a real heap tuple, registers it
+in the syscache under a fake OID and calls `plpgsql_compile`, so the compiler
+runs on its normal path. A `DO` block calls `plpgsql_compile_inline`. The
+result is rendered by `plpgsqlToJSON`.
 
-## Moving to a new minor release
+Without a catalog, every lookup the compiler and the parser helpers make is
+answered from the release's built-in `pg_catalog` rows
+([`postgres/typedpg/builtin_catalog.c`](postgres/typedpg/builtin_catalog.c),
+generated from `postgres.bki`): an empty database, where an unknown type or
+relation is an error. `parse_plpgsql_with_catalog` installs the caller's
+[`Catalog`](src/catalog.rs) for the call instead:
+[`csrc/pg/syscache.c`](csrc/pg/syscache.c) builds the `pg_type`,
+`pg_namespace`, `pg_class` and `pg_attribute` rows from it, the search path is
+handed to PostgreSQL's `assign_search_path`, and installing or removing the
+catalog replays the syscache invalidation callbacks so namespace.c rebuilds
+its caches. A panic in a catalog callback never unwinds through C: it is
+stored, the lookup reports "not found", and the panic resumes once the call
+returns.
 
-PostgreSQL's minor releases leave the grammar alone, and libpg_query
-follows them weeks later, if at all. typedpg moves first: `POSTGRES_VERSION`
-can name a later minor release of the major libpg_query's sources come from,
-and the build rewrites their version defines to it. What the new release
-changed in the code libpg_query extracts is ported into `patches.rs`:
+What compilation does not do:
 
-1. Diff the two release tags of PostgreSQL (`REL_18_6`, `REL_18_7`) over
-   the files libpg_query vendors (`libpg_query/src/postgres/src_<path>.c`,
-   whose header lists the functions it took, and the headers under
-   `include/`), function by function.
-2. Port each change to parsing or PL/pgSQL compilation as a patch (see
-   "PostgreSQL 18.7" in `patches.rs`), with a test showing the new
-   behavior. Server-only changes (memory contexts, tuple descriptors,
-   concurrency) don't reach the parser.
-3. Set `POSTGRES_VERSION`, pin `typedpg_test_support`'s image to the
-   release (its test servers check it), regenerate the seed
-   (`cargo run -p typedpg_seed`) and run the suites, including
-   `scripts/run-pg-sanity.sh` on the new release.
+- parameter `DEFAULT` expressions are not transformed (that needs the whole
+  expression parser; [`csrc/pg/parse_defaults.c`](csrc/pg/parse_defaults.c)
+  keeps transformExpr's identity, as libpg_query's extraction did). The
+  analyzer validates defaults itself;
+- nothing is executed: functions and triggers are compiled, never run, and
+  `SPI` is not carried;
+- a composite type's `TupleDesc` is built from the attributes the catalog
+  exposes (the trait has no names), enough for `build_datatype`'s "is it
+  composite" check; compile-time never reads the fields.
 
-## Moving to a new libpg_query release
+## How it is built
 
-1. Check out the new tag in the submodule:
-   `git -C typedpg_pg_query/libpg_query checkout <tag>`.
-2. Regenerate the Rust sources: `cargo run -p typedpg_pg_query_codegen`
-   (writes `src/protobuf.rs`, `src/node.rs` and `src/equal.rs`; the
-   `generated_sources_are_up_to_date` test fails while they are stale).
-3. Build. A patch in `patches.rs` whose spot changed upstream fails the build
-   with the patch's description: re-derive it, or drop it if upstream fixed
-   the problem.
-4. Adapt typedpg_analyzer to the AST changes, regenerate the seed
-   (`cargo run -p typedpg_seed` — the seed stores protobuf-encoded ASTs), and
-   run the test suites, including `scripts/run-pg-sanity.sh`. Set
-   `POSTGRES_VERSION` to the release the new tag's sources come from (or a
-   later minor one, as above), and drop the patches porting releases the
-   tag now includes: the seed and the oracle run `postgres:<PG_VERSION>`,
-   so the catalog, the oracle and the parser agree.
+`import/import.sh` downloads the PostgreSQL release named by
+`POSTGRES_VERSION`, generates its parsers with bison and flex, copies the
+sources the parser needs whole into [`postgres/`](postgres), trims
+`postgres/include/` to the headers they use, generates the built-in catalog
+tables, the stubs for the symbols the crate does not carry and the `bindgen`
+bindings of the node structs. See [`import/README.md`](import/README.md).
 
-## Patches
+`build.rs` compiles `import/FILES`, `postgres/typedpg/*.c`, `csrc/*.c` (the
+catalog bridge), `csrc/pg/*.c` (the hand-written server services and the
+crate's C entry points, `shim.c`) and `csrc/plpgsql/*.c` into the library; on
+Windows it adds `import/FILES.windows` (PostgreSQL's `open.c`,
+`win32gettimeofday.c`, `win32pread.c`/`win32pwrite.c`, ...) and the Win32 APIs
+those need. The same imported tree builds for glibc and musl Linux, macOS and
+MSVC: [`import/pg_config_overrides.h`](import/pg_config_overrides.h) corrects
+the configure-generated `pg_config.h` per platform, and
+[`import/pg_config_os.h`](import/pg_config_os.h) selects the target's port
+header. Nothing outside `postgres/`, `csrc/` and `import/FILES*` is compiled.
 
-`patches.rs` lists exact-text replacements applied to libpg_query's sources
-at build time: the build copies each patched file into `OUT_DIR` and compiles
-the copy. They fall in three groups:
+`cargo run -p typedpg_pg_query_codegen` regenerates the AST, the walkers,
+`equal()` and the C-tree converter from `postgres/include` and
+`postgres/src/backend/parser/gram.h`. `tests/up_to_date.rs` fails when the
+committed files are stale.
 
-- **Catalog hooks** — route the mocked catalog lookups to an installed
-  `Catalog`, and restore PostgreSQL's `%TYPE` / `%ROWTYPE` code while one is.
-- **PL/pgSQL JSON dump fixes** — libpg_query (still in 18.1.0) writes a trigger
-  function's `TG_*` promise datums as empty objects (invalid JSON), and leaves
-  out `retvarno`, a record variable's declared type and the type name as
-  written.
-- **Mock fixes**, for compiling without a catalog: the mock `pg_type` rows
-  had no `typelem` / `typsubscript` (every `VARIADIC` function was rejected),
-  schemas other than `pg_catalog` / `public` failed with "Not implemented",
-  an array of a user-defined type became the pseudo-type `record[]`, and the
-  written type name was never kept.
+## Moving to a new release
 
-## License
+1. Set `POSTGRES_VERSION` and `POSTGRES_SHA256` to the release and its
+   tarball's hash.
+2. Run `typedpg_pg_query/import/import.sh` (with bison, flex, bindgen and
+   clang on `PATH`; see `import/README.md`), then `import/check.sh`.
+3. Run `cargo run -p typedpg_pg_query_codegen` and commit the generated
+   sources with the imported tree.
+4. Pin `typedpg_test_support`'s image to the release (its test servers check
+   it), regenerate the seed (`cargo run -p typedpg_seed`) and run the
+   suites, including `scripts/run-pg-sanity.sh`.
 
-The Rust code is MIT. The bundled libpg_query is BSD-3-Clause
-(`libpg_query/LICENSE`), and the PostgreSQL sources it embeds are under the
-PostgreSQL License.
+A PostgreSQL patch release changes no grammar; a major release may add node
+fields or enum values, which the codegen picks up from the headers. The
+`typedpg_pg_query` crate keeps libpg_query's AST shape (see the module docs
+of `typedpg_pg_query_codegen::ast`) so stored trees and the analyzer keep
+working.

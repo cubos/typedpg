@@ -66,7 +66,6 @@
 
 use std::collections::HashSet;
 
-use prost::Message;
 use typedpg_pg_query::Equal;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::protobuf::{
@@ -2759,13 +2758,7 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
         {
             continue;
         }
-        let predicate = match &index.indpred {
-            None => None,
-            Some(ast) => match protobuf::Node::decode(ast.ast.as_slice()) {
-                Ok(predicate) => Some(Box::new(predicate)),
-                Err(_) => continue 'index,
-            },
-        };
+        let predicate = index.indpred.as_ref().map(|ast| Box::new(ast.ast.clone()));
         let nkeys = usize::try_from(index.indnkeyatts).unwrap_or(0);
         if nkeys == 0 || index.indkey.len() < nkeys {
             continue;

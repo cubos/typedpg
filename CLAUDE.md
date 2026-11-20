@@ -125,7 +125,7 @@ typedpg_cli (binary: `cargo typedpg migrate …`, `cargo typedpg lint`)
     │       └── typedpg_macros (proc macro: sql!)
     │               ├── typedpg_core
     │               └── typedpg_analyzer (compile-time only: lexer, param types, query_info, type_map, static SQL analyzer)
-    │                       └── typedpg_pg_query (PostgreSQL parser: our libpg_query binding)
+    │                       └── typedpg_pg_query (PostgreSQL parser, built from PostgreSQL's own sources)
     └── typedpg_lint (the `typedpg lint` rules: queries, migrations and the final schema)
             ├── typedpg_analyzer
             ├── typedpg_core
@@ -135,13 +135,34 @@ typedpg_wasm (the same migration helpers, compiled to WebAssembly for typedpg_np
     └── typedpg_core
 ```
 
-`typedpg_pg_query` compiles libpg_query from a git submodule pinned to a
-release tag (`git submodule update --init` after cloning). Its AST types and
-walkers are generated from libpg_query's `pg_query.proto` by
-`typedpg_pg_query_codegen` (`cargo run -p typedpg_pg_query_codegen`), and a
-few fixes to libpg_query's sources are applied at build time from
-`typedpg_pg_query/patches.rs`. See `typedpg_pg_query/README.md` for moving to
-a new PostgreSQL release.
+`typedpg_pg_query` compiles PostgreSQL's own sources, imported into
+`typedpg_pg_query/postgres/` from the release named by `POSTGRES_VERSION`
+(see `typedpg_pg_query/import/README.md`; `cargo run -p typedpg_pg_query_codegen`
+regenerates the AST types, walkers and the C-tree converter from the imported
+headers). Nothing is compiled from libpg_query any more, and the repository no
+longer carries it as a submodule. The imported tree is portable: the
+configure-generated `pg_config.h` ends with `import/pg_config_overrides.h`
+(per-platform defines, documented there), `import/pg_config_os.h` dispatches to
+`port/linux.h`, `port/darwin.h` or `port/win32.h`, and `import/FILES.windows`
+names the sources only the Windows/MSVC build compiles. All seven release
+targets (glibc and musl Linux on x86_64/aarch64, macOS on x86_64/aarch64,
+Windows x64) build the same imported tree.
+
+PL/pgSQL is compiled by PostgreSQL's own compiler (`pl_comp.c`, `pl_gram.c`),
+driven by `csrc/plpgsql/` — libpg_query's two PL/pgSQL files, BSD-3-Clause,
+with its JSON patches applied — and rendered as JSON by `plpgsqlToJSON`. A
+`CREATE FUNCTION … LANGUAGE plpgsql` builds a fake `pg_proc` row, registers it
+in the syscache and calls `plpgsql_compile` exactly as the validator does; a
+`DO` block calls `plpgsql_compile_inline`. Catalog lookups go through the
+syscache: `csrc/pg/syscache.c` answers TYPEOID / TYPENAMENSP / NAMESPACEOID /
+NAMESPACENAME / RELNAMENSP / RELOID / ATTNAME / ATTNUM / PROCOID from the
+caller's `Catalog` while `parse_plpgsql_with_catalog` runs (the search path is
+handed to `assign_search_path`, and installing or removing the catalog replays
+the syscache invalidation callbacks), and from the release's `postgres.bki`
+rows (`postgres/typedpg/builtin_catalog.c`: `pg_type`, `pg_namespace` and the
+built-in `pg_collation`s) otherwise. Parameter `DEFAULT` expressions are not
+transformed (the expression parser is not carried; the analyzer validates them
+itself), and nothing is executed.
 
 ### Compile-time pipeline (`sql!` macro)
 
@@ -149,7 +170,7 @@ a new PostgreSQL release.
 2. Lex SQL via `typedpg_analyzer::lexer::lex()` — rewrites `$name` → `$1`, extracts `$..spread`
 3. Load config from `[package.metadata.typedpg]` in consumer's `Cargo.toml`
 4. Build schema snapshot from seed + migrations via DDL interpreter (in-memory, no Docker)
-5. Static analysis: parse SQL with `typedpg_pg_query` (libpg_query), resolve types and nullability against snapshot
+5. Static analysis: parse SQL with `typedpg_pg_query` (PostgreSQL's parser), resolve types and nullability against snapshot
 6. `codegen::generate()` — emit anonymous output struct, typed query builder, `.fetch_all()/.fetch_one()/.fetch_optional()/.execute()` methods
 
 ### Runtime

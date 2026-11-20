@@ -593,10 +593,10 @@ fn create_or_replace_view_replaces_pg_rewrite_body() {
 
     let view = snap.resolve_table(None, "v").unwrap();
     let body = snap.view_body(view.oid).expect("rule must exist");
-    // The rebuilt body's protobuf bytes must end up referencing both
-    // attnums (1 = id, 2 = slug). Cheapest cross-check: attribute count.
+    // The rebuilt body must end up referencing both attnums (1 = id,
+    // 2 = slug). Cheapest cross-check: attribute count.
     assert_eq!(snap.attributes_of(view.oid).len(), 2);
-    assert!(!body.ast.is_empty());
+    assert!(body.ast.node.is_some());
 }
 
 #[test]

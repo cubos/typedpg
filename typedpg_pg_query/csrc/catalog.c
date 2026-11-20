@@ -1,31 +1,97 @@
 /*
- * typedpg catalog hooks — see catalog.h.
+ * catalog.c — the caller's catalog as PostgreSQL's syscache sees it.
  *
- * Besides the dispatch helpers the patched mocks call, this file supplies the
- * catalog functions libpg_query's extraction left out (relation and column
- * lookups), implemented over the installed catalog. They mirror PostgreSQL
- * 18's namespace.c / lsyscache.c / syscache.c, including their error
- * wording.
+ * See typedpg_catalog.h.  This file installs the callbacks, builds the heap
+ * tuples the syscache hands out, and keeps the one fake pg_proc row a
+ * compilation registers.
  */
 #include "postgres.h"
 
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_attribute.h"
-#include "catalog/pg_type.h"
-#include "nodes/pg_list.h"
-#include "utils/lsyscache.h"
-#include "utils/syscache.h"
+#include "lib/stringinfo.h"
+#include "utils/builtins.h"
+#include "utils/guc_hooks.h"
+#include "utils/memutils.h"
+#include "utils/ruleutils.h"
 
-#include "catalog.h"
-#include "typedpg_catalog_internal.h"
+#include "typedpg_catalog.h"
 
-static __thread const TypedpgCatalog *current_catalog = NULL;
+/* The installed catalog, or NULL when the built-in rows answer. */
+static TypedpgCatalog const *current_catalog = NULL;
+
+/* The search path shim_init() sets, the one an empty database has. */
+#define TYPEDPG_DEFAULT_SEARCH_PATH "\"$user\", public"
+
+/* The fake pg_proc row: at most one compilation runs at a time. */
+static Oid	current_proc_oid = InvalidOid;
+static TypedpgTuple *current_proc_tuple = NULL;
+
+/* namespace_search_path's storage, kept in TopMemoryContext. */
+static char *search_path_string = NULL;
+
+static void
+install_search_path(const char *path)
+{
+	if (search_path_string != NULL)
+		pfree(search_path_string);
+	search_path_string = MemoryContextStrdup(TopMemoryContext, path);
+	namespace_search_path = search_path_string;
+	assign_search_path(namespace_search_path, NULL);
+}
 
 void
 typedpg_catalog_install(const TypedpgCatalog *catalog)
 {
+	if (catalog == NULL)
+	{
+		current_catalog = NULL;
+		install_search_path(TYPEDPG_DEFAULT_SEARCH_PATH);
+		typedpg_invalidate_syscaches();
+		return;
+	}
+
+	/*
+	 * PostgreSQL's search path is a GUC string of quoted schema names.
+	 * Rendering the caller's path here and letting namespace.c parse it back
+	 * keeps every consumer (recomputeNamespacePath, preprocessNamespacePath,
+	 * the $user and pg_temp cases) on PostgreSQL's own code.
+	 */
+	{
+		size_t		capacity = 16;
+		Oid		   *oids = palloc(capacity * sizeof(Oid));
+		size_t		n;
+		StringInfoData buf;
+
+		n = catalog->search_path(catalog->ctx, oids, capacity);
+		if (n > capacity)
+		{
+			oids = palloc(n * sizeof(Oid));
+			capacity = n;
+			n = catalog->search_path(catalog->ctx, oids, capacity);
+		}
+		if (n > capacity)
+			n = capacity;
+
+		initStringInfo(&buf);
+		for (size_t i = 0; i < n; i++)
+		{
+			const char *name = catalog->namespace_name(catalog->ctx, oids[i]);
+
+			if (name == NULL)
+				continue;
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, quote_identifier(name));
+		}
+		pfree(oids);
+
+		install_search_path(buf.data);
+		pfree(buf.data);
+	}
+
 	current_catalog = catalog;
+	typedpg_invalidate_syscaches();
 }
 
 bool
@@ -34,256 +100,97 @@ typedpg_catalog_active(void)
 	return current_catalog != NULL;
 }
 
-/* A heap tuple holding `form` (a catalog row struct of `size` bytes), built
- * the way libpg_query's pg_type mock builds its tuples. */
-static HeapTuple
-form_tuple(const void *form, Size size, int natts)
+const TypedpgCatalog *
+typedpg_catalog(void)
 {
-	HeapTuple	tuple;
-	HeapTupleHeader td;
-	Size		len;
-	int			hoff;
-
-	hoff = len = MAXALIGN(offsetof(HeapTupleHeaderData, t_bits));
-	len += MAXALIGN(size);
-	tuple = (HeapTuple) palloc0(HEAPTUPLESIZE + len);
-	tuple->t_data = td = (HeapTupleHeader) ((char *) tuple + HEAPTUPLESIZE);
-	tuple->t_len = len;
-	ItemPointerSetInvalid(&(tuple->t_self));
-	tuple->t_tableOid = InvalidOid;
-	HeapTupleHeaderSetDatumLength(td, len);
-	ItemPointerSetInvalid(&(td->t_ctid));
-	HeapTupleHeaderSetNatts(td, natts);
-	td->t_hoff = hoff;
-	memcpy((char *) td + hoff, form, size);
-	return tuple;
-}
-
-HeapTuple
-typedpg_search_type(Oid typid)
-{
-	TypedpgType row;
-	Form_pg_type t;
-
-	memset(&row, 0, sizeof(row));
-	if (!current_catalog->type_by_oid(current_catalog->ctx, typid, &row))
-		return NULL;
-
-	t = palloc0(sizeof(FormData_pg_type));
-	t->oid = row.oid;
-	strlcpy(NameStr(t->typname), row.typname, NAMEDATALEN);
-	t->typnamespace = row.typnamespace;
-	t->typlen = row.typlen;
-	t->typbyval = row.typbyval;
-	t->typtype = row.typtype;
-	t->typcategory = row.typcategory;
-	t->typispreferred = row.typispreferred;
-	t->typisdefined = row.typisdefined;
-	t->typdelim = ',';
-	t->typrelid = row.typrelid;
-	t->typsubscript = row.typsubscript;
-	t->typelem = row.typelem;
-	t->typarray = row.typarray;
-	t->typalign = row.typalign;
-	t->typstorage = row.typlen == -1 ? TYPSTORAGE_EXTENDED : TYPSTORAGE_PLAIN;
-	t->typnotnull = row.typnotnull;
-	t->typbasetype = row.typbasetype;
-	t->typtypmod = row.typtypmod;
-	t->typcollation = row.typcollation;
-	return form_tuple(t, sizeof(FormData_pg_type), Natts_pg_type);
-}
-
-Oid
-typedpg_type_by_name(Oid namespace_oid, const char *name)
-{
-	return current_catalog->type_by_name(current_catalog->ctx, namespace_oid, name);
-}
-
-/* LookupExplicitNamespace, over the catalog. */
-Oid
-typedpg_lookup_namespace(const char *nspname, bool missing_ok)
-{
-	Oid			nsp = current_catalog->namespace_by_name(current_catalog->ctx, nspname);
-
-	if (!OidIsValid(nsp) && !missing_ok)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_SCHEMA),
-				 errmsg("schema \"%s\" does not exist", nspname)));
-	return nsp;
-}
-
-char *
-typedpg_namespace_name(Oid nspid)
-{
-	const char *name = current_catalog->namespace_name(current_catalog->ctx, nspid);
-
-	return name ? pstrdup(name) : NULL;
-}
-
-List *
-typedpg_search_path(void)
-{
-	uint32_t	oids[64];
-	size_t		n = current_catalog->search_path(current_catalog->ctx, oids, lengthof(oids));
-	List	   *path = NIL;
-
-	for (size_t i = 0; i < n && i < lengthof(oids); i++)
-		path = lappend_oid(path, oids[i]);
-	return path;
-}
-
-/* TypeIsVisible: the type is the one its name finds along the search path. */
-bool
-typedpg_type_is_visible(Oid typid)
-{
-	TypedpgType row;
-	List	   *path;
-	ListCell   *l;
-
-	memset(&row, 0, sizeof(row));
-	if (!current_catalog->type_by_oid(current_catalog->ctx, typid, &row))
-		return false;
-	path = typedpg_search_path();
-	foreach(l, path)
-	{
-		Oid			found = typedpg_type_by_name(lfirst_oid(l), row.typname);
-
-		if (OidIsValid(found))
-			return found == typid;
-	}
-	return false;
+	return current_catalog;
 }
 
 /*
- * Catalog functions the extraction left out, used by the restored %TYPE /
- * %ROWTYPE code. Outside a typedpg catalog they are unreachable.
+ * Build a heap tuple whose fixed payload is `row` (a catalog row struct) and
+ * whose variable-length attributes are set later with
+ * typedpg_tuple_set_attr().  Allocations go to the current context: the
+ * caller deletes it when the call ends.
  */
-
-static void
-require_catalog(const char *function)
+TypedpgTuple *
+typedpg_tuple_create(const void *row, Size size, int natts)
 {
-	if (current_catalog == NULL)
-		elog(ERROR, "Not implemented (%s needs a typedpg catalog)", function);
-}
+	TypedpgTuple *tuple = palloc0(sizeof(TypedpgTuple));
+	Size		hoff = MAXALIGN(SizeofHeapTupleHeader);
+	Size		len = hoff + size;
+	HeapTupleHeader td;
 
-Oid
-get_relname_relid(const char *relname, Oid relnamespace)
-{
-	require_catalog("get_relname_relid");
-	return current_catalog->relation_by_name(current_catalog->ctx, relnamespace, relname);
-}
-
-Oid
-RelnameGetRelid(const char *relname)
-{
-	List	   *path;
-	ListCell   *l;
-
-	require_catalog("RelnameGetRelid");
-	path = typedpg_search_path();
-	foreach(l, path)
+	if (row != NULL)
 	{
-		Oid			relid = get_relname_relid(relname, lfirst_oid(l));
-
-		if (OidIsValid(relid))
-			return relid;
+		tuple->tup.t_data = td = (HeapTupleHeader) palloc0(len);
+		tuple->tup.t_len = len;
+		ItemPointerSetInvalid(&tuple->tup.t_self);
+		tuple->tup.t_tableOid = InvalidOid;
+		HeapTupleHeaderSetDatumLength(td, len);
+		ItemPointerSetInvalid(&td->t_ctid);
+		HeapTupleHeaderSetNatts(td, natts);
+		td->t_hoff = hoff;
+		memcpy((char *) td + hoff, row, size);
 	}
-	return InvalidOid;
+
+	tuple->natts = natts;
+	tuple->values = palloc0(sizeof(Datum) * natts);
+	tuple->nulls = palloc(sizeof(bool) * natts);
+	memset(tuple->nulls, true, sizeof(bool) * natts);
+	return tuple;
 }
 
-/* RangeVarGetRelidExtended without locking or temporary relations: nothing
- * is locked outside a server. */
-Oid
-RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode, uint32 flags,
-						 RangeVarGetRelidCallback callback, void *callback_arg)
+void
+typedpg_tuple_set_attr(TypedpgTuple *tuple, AttrNumber attnum, Datum value)
 {
-	bool		missing_ok = (flags & RVR_MISSING_OK) != 0;
-	Oid			relId;
-
-	require_catalog("RangeVarGetRelidExtended");
-	if (relation->catalogname)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
-						relation->catalogname, relation->schemaname,
-						relation->relname)));
-	if (relation->schemaname)
-	{
-		Oid			namespaceId = typedpg_lookup_namespace(relation->schemaname, missing_ok);
-
-		relId = OidIsValid(namespaceId) ? get_relname_relid(relation->relname, namespaceId)
-			: InvalidOid;
-	}
-	else
-		relId = RelnameGetRelid(relation->relname);
-
-	if (callback)
-		callback(relation, relId, InvalidOid, callback_arg);
-
-	if (!OidIsValid(relId) && !missing_ok)
-	{
-		if (relation->schemaname)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_TABLE),
-					 errmsg("relation \"%s.%s\" does not exist",
-							relation->schemaname, relation->relname)));
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_TABLE),
-					 errmsg("relation \"%s\" does not exist",
-							relation->relname)));
-	}
-	return relId;
+	if (attnum < 1 || attnum > tuple->natts)
+		elog(ERROR, "typedpg: attribute %d out of range", attnum);
+	tuple->values[attnum - 1] = value;
+	tuple->nulls[attnum - 1] = false;
 }
 
-Oid
-get_rel_type_id(Oid relid)
+/* A fresh xmin per compilation: funccache.c keys its cache on it. */
+void
+typedpg_tuple_set_xmin(TypedpgTuple *tuple, TransactionId xmin)
 {
-	require_catalog("get_rel_type_id");
-	return current_catalog->relation_type(current_catalog->ctx, relid);
+	HeapTupleHeaderSetXmin(tuple->tup.t_data, xmin);
+}
+
+Datum
+typedpg_tuple_get_attr(HeapTuple tuple, AttrNumber attnum, bool *isNull)
+{
+	TypedpgTuple *wrapper = (TypedpgTuple *) tuple;
+
+	if (attnum < 1 || attnum > wrapper->natts)
+		elog(ERROR, "invalid attribute number %d for a catalog tuple", attnum);
+	*isNull = wrapper->nulls[attnum - 1];
+	return wrapper->values[attnum - 1];
+}
+
+void
+typedpg_proc_install(Oid oid, TypedpgTuple *tuple)
+{
+	current_proc_oid = oid;
+	current_proc_tuple = tuple;
 }
 
 HeapTuple
-SearchSysCacheAttName(Oid relid, const char *attname)
+typedpg_proc_lookup(Oid oid)
 {
-	TypedpgAttribute att;
-	Form_pg_attribute a;
-
-	require_catalog("SearchSysCacheAttName");
-	memset(&att, 0, sizeof(att));
-	if (!current_catalog->attribute_by_name(current_catalog->ctx, relid, attname, &att))
-		return NULL;
-	a = palloc0(sizeof(FormData_pg_attribute));
-	a->attrelid = relid;
-	strlcpy(NameStr(a->attname), attname, NAMEDATALEN);
-	a->atttypid = att.atttypid;
-	a->attnum = att.attnum;
-	a->atttypmod = att.atttypmod;
-	a->attcollation = att.attcollation;
-	a->attisdropped = false;
-	return form_tuple(a, sizeof(FormData_pg_attribute), Natts_pg_attribute);
+	if (current_proc_tuple != NULL && oid == current_proc_oid)
+		return &current_proc_tuple->tup;
+	return NULL;
 }
 
-AttrNumber
-get_attnum(Oid relid, const char *attname)
+HeapTuple
+typedpg_proc_tuple(void)
 {
-	TypedpgAttribute att;
-
-	require_catalog("get_attnum");
-	memset(&att, 0, sizeof(att));
-	if (!current_catalog->attribute_by_name(current_catalog->ctx, relid, attname, &att))
-		return InvalidAttrNumber;
-	return att.attnum;
+	return current_proc_tuple ? &current_proc_tuple->tup : NULL;
 }
 
-Oid
-get_atttype(Oid relid, AttrNumber attnum)
+void
+typedpg_proc_uninstall(void)
 {
-	TypedpgAttribute att;
-
-	require_catalog("get_atttype");
-	memset(&att, 0, sizeof(att));
-	if (!current_catalog->attribute_by_number(current_catalog->ctx, relid, attnum, &att))
-		return InvalidOid;
-	return att.atttypid;
+	current_proc_oid = InvalidOid;
+	current_proc_tuple = NULL;
 }
