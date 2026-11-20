@@ -41,7 +41,8 @@ impl CallNotation {
         let mut names: Vec<String> = Vec::new();
         for arg in &fc.args {
             let span = || {
-                crate::error::node_location(arg).and_then(crate::error::SourceSpan::from_node_token)
+                crate::error::node_location(arg.as_ref())
+                    .and_then(crate::error::SourceSpan::from_node_token)
             };
             match arg.as_ref() {
                 Some(Node::NamedArgExpr(na)) => {
@@ -74,10 +75,10 @@ impl CallNotation {
 /// The value expression of a call argument — the `x` of a named argument
 /// `a => x`, the node itself otherwise.
 pub(crate) fn call_arg_value(
-    arg: &Option<typedpg_pg_query::ast::Node>,
-) -> &Option<typedpg_pg_query::ast::Node> {
+    arg: Option<&typedpg_pg_query::ast::Node>,
+) -> Option<&typedpg_pg_query::ast::Node> {
     match arg {
-        Some(typedpg_pg_query::ast::Node::NamedArgExpr(na)) if na.arg.is_some() => &na.arg,
+        Some(typedpg_pg_query::ast::Node::NamedArgExpr(na)) if na.arg.is_some() => na.arg.as_ref(),
         _ => arg,
     }
 }

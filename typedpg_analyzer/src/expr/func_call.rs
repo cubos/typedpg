@@ -47,7 +47,7 @@ fn column_notation_call(
     params: &mut ParamCollector,
 ) -> Option<Result<ExprType, AnalyzeError>> {
     let mut scratch = params.clone();
-    let arg_type = infer_expr(&arg, ctx, &mut scratch, TypeGoal::NONE)
+    let arg_type = infer_expr(arg.as_ref(), ctx, &mut scratch, TypeGoal::NONE)
         .ok()?
         .type_oid;
     let call = ast::FuncCall {
@@ -83,7 +83,7 @@ fn column_notation_call(
         }
         Ok(_) => {
             let node = Some(ast::Node::FuncCall(NodeBox::new(call)));
-            Some(infer_expr(&node, ctx, params, TypeGoal::NONE))
+            Some(infer_expr(node.as_ref(), ctx, params, TypeGoal::NONE))
         }
     }
 }
@@ -166,7 +166,7 @@ pub(crate) fn infer_func_call(
                 && let Err(msg) =
                     crate::literal_input::validate_with_typmod(&sv.sval, target, None, snapshot)
             {
-                let span = crate::error::node_location(&func.args[0])
+                let span = crate::error::node_location(func.args[0].as_ref())
                     .and_then(crate::error::SourceSpan::from_node_token);
                 return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
             }
@@ -288,7 +288,8 @@ pub(crate) fn infer_func_call(
     for (i, arg) in func.args.iter().enumerate() {
         if declared_any(i)
             && !hypothetical
-            && let Some(p) = super::bare_param(functions::call_arg_value(arg), ctx.snapshot)
+            && let Some(p) =
+                super::bare_param(functions::call_arg_value(arg.as_ref()), ctx.snapshot)
         {
             params.mark_indeterminate_locked(p.number);
         }
@@ -512,7 +513,7 @@ fn in_declared_order<'a>(
     let values: Vec<Option<ast::Node>> = func
         .args
         .iter()
-        .map(|a| functions::call_arg_value(a).clone())
+        .map(|a| functions::call_arg_value(a.as_ref()).cloned())
         .collect();
     let mut positional = func.clone();
     positional.args = resolved.in_declared_order(&values, None);
@@ -614,7 +615,7 @@ fn check_call_shape(
     // GROUPING(…) count: an outer query's (`FILTER (WHERE sum(outer.x) >
     // 0)`) is a value here.
     if let filter @ Some(_) = &func.agg_filter {
-        crate::clause::check_level_calls(filter, ctx, "FILTER", true)?;
+        crate::clause::check_level_calls(filter.as_ref(), ctx, "FILTER", true)?;
     }
 
     if !is_aggregate && !is_window {
@@ -730,10 +731,13 @@ fn check_call_shape(
             for item in &func.agg_order {
                 if let Some(ast::Node::SortBy(sb)) = item.as_ref()
                     && let inner @ Some(_) = &sb.node
-                    && !func.args.iter().any(|a| same_expression(a, inner, ctx))
+                    && !func
+                        .args
+                        .iter()
+                        .any(|a| same_expression(a.as_ref(), inner.as_ref(), ctx))
                 {
                     return fail(pgmsg::distinct_aggregate_order_by_not_in_args(
-                        crate::error::node_location(inner)
+                        crate::error::node_location(inner.as_ref())
                             .and_then(crate::error::SourceSpan::from_node_qname),
                     ));
                 }
@@ -763,10 +767,8 @@ fn check_call_shape(
 /// transformed trees with `equal()`): structurally equal ignoring source
 /// locations and type-name spellings, or column references resolving to
 /// the same column.
-fn same_expression(a: &Option<ast::Node>, b: &Option<ast::Node>, ctx: Ctx<'_>) -> bool {
-    if let (Some(ast::Node::ColumnRef(ca)), Some(ast::Node::ColumnRef(cb))) =
-        (a.as_ref(), b.as_ref())
-    {
+fn same_expression(a: Option<&ast::Node>, b: Option<&ast::Node>, ctx: Ctx<'_>) -> bool {
+    if let (Some(ast::Node::ColumnRef(ca)), Some(ast::Node::ColumnRef(cb))) = (a, b) {
         let resolve = |cr: &ast::ColumnRef| {
             let parts = extract_string_fields(&cr.fields);
             let (table, col) = match parts.as_slice() {
@@ -822,12 +824,12 @@ fn unify_hypothetical_args(
                 &name(ht),
                 "",
                 None,
-                crate::error::expr_span(harg),
+                crate::error::expr_span(harg.as_ref()),
             )
             .finalize_implicit());
         };
         if ht == oid::UNKNOWN {
-            coerce_unknown_to(harg, ctx, params, common)?;
+            coerce_unknown_to(harg.as_ref(), ctx, params, common)?;
         }
     }
     Ok(())
@@ -853,8 +855,8 @@ fn within_group_collation_inputs(
     let mut aggregated = Vec::new();
     for item in &func.agg_order {
         let inner = match item.as_ref() {
-            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
-            _ => Some(item),
+            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(sb.node.as_ref()),
+            _ => Some(item.as_ref()),
         };
         if let Some(inner) = inner {
             let t = infer_expr(inner, ctx, &mut params.clone(), TypeGoal::NONE)?;
@@ -943,7 +945,7 @@ fn collect_arg_types(
     for arg in &func.args {
         let t = match first.take() {
             Some(t) => t,
-            None => infer_expr(arg, ctx, params, TypeGoal::NONE)?,
+            None => infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)?,
         };
         any_nullable = any_nullable || t.nullable;
         nullable.push(t.nullable);
@@ -956,8 +958,8 @@ fn collect_arg_types(
         for order_item in &func.agg_order {
             // Each item is a `SortBy` wrapping the actual sort expression.
             let sort_inner = match order_item.as_ref() {
-                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
-                _ => Some(order_item),
+                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(sb.node.as_ref()),
+                _ => Some(order_item.as_ref()),
             };
             if let Some(inner) = sort_inner {
                 let t = infer_expr(inner, ctx, params, TypeGoal::NONE)?;
@@ -1036,7 +1038,7 @@ fn narrow_by_filter(
     let filter @ Some(_) = &func.agg_filter else {
         return;
     };
-    let facts = crate::nonnull::nonnullable(filter, true, ctx.scope, log, ctx.snapshot)
+    let facts = crate::nonnull::nonnullable(filter.as_ref(), true, ctx.scope, log, ctx.snapshot)
         .restricted_to(&crate::nonnull::own_aliases(ctx.scope));
     let Some(narrowed) = ctx.null_ctx.with_local_facts(facts) else {
         return;
@@ -1044,13 +1046,17 @@ fn narrow_by_filter(
     let narrowed_ctx = ctx.with_null_ctx(&narrowed);
     let mut scratch = params.clone();
     let sort_exprs = func.agg_order.iter().filter_map(|o| match o.as_ref() {
-        Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
-        _ => Some(o),
+        Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(sb.node.as_ref()),
+        _ => Some(o.as_ref()),
     });
-    let inputs: Vec<&Option<ast::Node>> = if func.agg_within_group {
-        func.args.iter().chain(sort_exprs).collect()
+    let inputs: Vec<Option<&ast::Node>> = if func.agg_within_group {
+        func.args
+            .iter()
+            .map(Option::as_ref)
+            .chain(sort_exprs)
+            .collect()
     } else {
-        func.args.iter().collect()
+        func.args.iter().map(Option::as_ref).collect()
     };
     for (i, arg) in inputs.into_iter().enumerate() {
         let Ok(t) = infer_expr(arg, narrowed_ctx, &mut scratch, TypeGoal::NONE) else {
@@ -1076,7 +1082,7 @@ fn check_no_nested_windows(func: &ast::FuncCall, snapshot: &PgCatalog) -> Result
     if func
         .args
         .iter()
-        .any(|arg| detect_func_kinds(arg, snapshot).has_window)
+        .any(|arg| detect_func_kinds(arg.as_ref(), snapshot).has_window)
     {
         return Err(AnalyzeError::WindowingError(
             "window function calls cannot be nested".into(),
@@ -1096,7 +1102,7 @@ fn check_no_windows_in_aggregate(
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     for arg in &func.args {
-        let kinds = detect_func_kinds(arg, snapshot);
+        let kinds = detect_func_kinds(arg.as_ref(), snapshot);
         if kinds.has_window {
             return Err(crate::pgmsg::window_in_aggregate(kinds.window_span()).finalize_implicit());
         }
@@ -1159,7 +1165,12 @@ fn backfill_func_args(
             // Speculative re-walk: ordinary failures are swallowed, but a
             // literal-content rejection is the parse-time error PG itself
             // raises from this argument coercion (`sqrt('x')`).
-            coerce_unknown_to(functions::call_arg_value(arg), ctx, params, expected)?;
+            coerce_unknown_to(
+                functions::call_arg_value(arg.as_ref()),
+                ctx,
+                params,
+                expected,
+            )?;
         }
         // make_fn_arguments: a `record` argument of a composite parameter
         // (which can_coerce_type let through) is rebuilt by
@@ -1169,7 +1180,7 @@ fn backfill_func_args(
             && crate::coerce::is_complex(expected, ctx.snapshot)
         {
             super::coerce_record_to_complex(
-                functions::call_arg_value(arg),
+                functions::call_arg_value(arg.as_ref()),
                 expected,
                 CoercionContext::Implicit,
                 ctx,
@@ -1195,7 +1206,7 @@ fn walk_func_modifiers(
         // FILTER is a boolean clause like WHERE — wording and ordering live
         // in the shared clause walker.
         crate::clause::coerce_clause_expr(
-            filter,
+            filter.as_ref(),
             ctx.logging_strictness(filter_log),
             params,
             crate::clause::ClauseKind::Filter,
@@ -1211,9 +1222,9 @@ fn walk_func_modifiers(
             if let Some(ast::Node::SortBy(sb)) = order_item.as_ref()
                 && let inner @ Some(_) = &sb.node
             {
-                infer_expr(inner, ctx, params, TypeGoal::NONE)?;
+                infer_expr(inner.as_ref(), ctx, params, TypeGoal::NONE)?;
                 // transformAggregateCall's transformSortClause.
-                crate::expr::resolve_unknown_key(inner, ctx.snapshot, params)?;
+                crate::expr::resolve_unknown_key(inner.as_ref(), ctx.snapshot, params)?;
             }
         }
     }
@@ -1318,12 +1329,12 @@ fn extract_unit_is_infinite_safe(
 /// `[1]` is the first value, `array_length(…, 1)` is defined. (Over
 /// arrays, `array_agg(anyarray)` stacks a dimension: `[1]` is NULL.)
 pub(crate) fn is_nonempty_1d_array_agg(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     t: &ExprType,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> bool {
-    let Some(ast::Node::FuncCall(fc)) = node.as_ref() else {
+    let Some(ast::Node::FuncCall(fc)) = node else {
         return false;
     };
     if t.nullable
@@ -1333,7 +1344,7 @@ pub(crate) fn is_nonempty_1d_array_agg(
         return false;
     }
     let mut scratch = params.clone();
-    infer_expr(&fc.args[0], ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|a| {
+    infer_expr(fc.args[0].as_ref(), ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|a| {
         a.type_oid != oid::UNKNOWN
             && coerce::element_type(ctx.snapshot.unwrap_domain(a.type_oid), ctx.snapshot).is_none()
     })
@@ -1397,19 +1408,19 @@ pub(crate) fn effective_frame_options(wd: &ast::WindowDef) -> i32 {
     const START_OFFSET: i32 = 0x800 | 0x2000;
     const END_OFFSET: i32 = 0x1000 | 0x4000;
     let mut options = wd.frame_options;
-    if options & START_OFFSET != 0 && is_zero_offset(&wd.start_offset) {
+    if options & START_OFFSET != 0 && is_zero_offset(wd.start_offset.as_ref()) {
         options = (options & !START_OFFSET) | START_CURRENT_ROW;
     }
-    if options & END_OFFSET != 0 && is_zero_offset(&wd.end_offset) {
+    if options & END_OFFSET != 0 && is_zero_offset(wd.end_offset.as_ref()) {
         options = (options & !END_OFFSET) | END_CURRENT_ROW;
     }
     options
 }
 
 /// The integer literal `0`.
-fn is_zero_constant(n: &Option<ast::Node>) -> bool {
+fn is_zero_constant(n: Option<&ast::Node>) -> bool {
     matches!(
-        n.as_ref(),
+        n,
         Some(ast::Node::AConst(ac)) if matches!(
             &**ac,
             ast::AConst {
@@ -1422,16 +1433,16 @@ fn is_zero_constant(n: &Option<ast::Node>) -> bool {
 
 /// A frame offset that is the constant zero: `0`, `0.0`, or a literal
 /// such as `'0'` / `'0 day'` cast to the offset type.
-fn is_zero_offset(n: &Option<ast::Node>) -> bool {
+fn is_zero_offset(n: Option<&ast::Node>) -> bool {
     use typedpg_pg_query::ast::{self, AConstValue};
-    match n.as_ref() {
+    match n {
         Some(ast::Node::AConst(c)) if !c.isnull => match &c.val {
             Some(AConstValue::Integer(i)) => i.ival == 0,
             Some(AConstValue::Float(f)) => is_zero_decimal(&f.fval),
             Some(AConstValue::String(s)) => is_zero_string(&s.sval),
             _ => false,
         },
-        Some(ast::Node::TypeCast(c)) => is_zero_offset(&c.arg),
+        Some(ast::Node::TypeCast(c)) => is_zero_offset(c.arg.as_ref()),
         _ => false,
     }
 }
@@ -1538,7 +1549,7 @@ fn value_gated_non_null(
 ) -> bool {
     let proname = resolved.signature.split('(').next().unwrap_or_default();
     // (In positional notation: see [`in_declared_order`].)
-    let positional: Vec<&Option<ast::Node>> = func.args.iter().collect();
+    let positional: Vec<Option<&ast::Node>> = func.args.iter().map(Option::as_ref).collect();
     let declared_types = resolved.in_declared_order(&resolved.arg_types, oid::UNKNOWN);
     let first_type = declared_types.first().copied();
     match proname {
@@ -1546,7 +1557,7 @@ fn value_gated_non_null(
             let silent = positional.get(3).copied();
             silent.is_none_or(|s| {
                 matches!(
-                    s.as_ref(),
+                    s,
                     Some(ast::Node::AConst(ac)) if matches!(
                         &**ac,
                         ast::AConst {
@@ -1616,17 +1627,18 @@ const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
 /// `ARRAY[e1, …, en]` (n ≥ 1, possibly cast to an array type) over
 /// scalar elements: a one-dimensional array of n elements. The elements
 /// are re-inferred on a throwaway collector.
-fn scalar_array_constructor(n: &Option<ast::Node>, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
-    match n.as_ref() {
-        Some(ast::Node::TypeCast(tc)) => scalar_array_constructor(&tc.arg, ctx, params),
+fn scalar_array_constructor(n: Option<&ast::Node>, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
+    match n {
+        Some(ast::Node::TypeCast(tc)) => scalar_array_constructor(tc.arg.as_ref(), ctx, params),
         Some(ast::Node::AArrayExpr(arr)) => {
             !arr.elements.is_empty()
                 && arr.elements.iter().all(|e| {
                     !matches!(e.as_ref(), Some(ast::Node::AArrayExpr(_)))
-                        && infer_expr(e, ctx, &mut params.clone(), TypeGoal::NONE).is_ok_and(|t| {
-                            t.type_oid != oid::UNKNOWN
-                                && array_element_type(ctx.snapshot, t.type_oid).is_none()
-                        })
+                        && infer_expr(e.as_ref(), ctx, &mut params.clone(), TypeGoal::NONE)
+                            .is_ok_and(|t| {
+                                t.type_oid != oid::UNKNOWN
+                                    && array_element_type(ctx.snapshot, t.type_oid).is_none()
+                            })
                 })
         }
         _ => false,
@@ -1675,11 +1687,11 @@ const FRAME_OFFSET: i32 = 0x800 | 0x1000 | 0x2000 | 0x4000;
 const FRAME_DEFAULTS: i32 = 0x2 | 0x20 | 0x400;
 
 /// The expressions of a window's `ORDER BY` items.
-fn window_order_exprs(wd: &ast::WindowDef) -> Vec<&Option<ast::Node>> {
+fn window_order_exprs(wd: &ast::WindowDef) -> Vec<Option<&ast::Node>> {
     wd.order_clause
         .iter()
         .filter_map(|o| match o.as_ref() {
-            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
+            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(sb.node.as_ref()),
             _ => None,
         })
         .collect()
@@ -1696,7 +1708,7 @@ fn infer_window_exprs(
 ) -> Result<(), AnalyzeError> {
     for e in window_order_exprs(wd)
         .into_iter()
-        .chain(&wd.partition_clause)
+        .chain(wd.partition_clause.iter().map(Option::as_ref))
     {
         infer_expr(e, ctx, params, TypeGoal::NONE)?;
         crate::expr::resolve_unknown_key(e, ctx.snapshot, params)?;
@@ -1729,13 +1741,14 @@ fn transform_window_def(
     use crate::pgmsg;
     let span = crate::error::SourceSpan::from_node_qname(wd.location);
     let fail = |e: crate::error::RawError| Err(e.finalize_implicit());
-    let offsets: Vec<&Option<ast::Node>> = [&wd.start_offset, &wd.end_offset]
+    let offsets: Vec<Option<&ast::Node>> = [wd.start_offset.as_ref(), wd.end_offset.as_ref()]
         .into_iter()
         .filter(|o| o.is_some())
         .collect();
     let own_exprs = wd
         .partition_clause
         .iter()
+        .map(Option::as_ref)
         .chain(window_order_exprs(wd))
         .chain(offsets.iter().copied());
     for e in own_exprs {
@@ -1782,7 +1795,7 @@ fn transform_window_def(
         let [key] = order.as_slice() else {
             return fail(pgmsg::range_offset_needs_one_order_by(span));
         };
-        range_key = Some(infer_expr(key, ctx, params, TypeGoal::NONE)?.type_oid);
+        range_key = Some(infer_expr(*key, ctx, params, TypeGoal::NONE)?.type_oid);
     }
     if options & FRAME_GROUPS != 0 && order.is_empty() {
         return fail(pgmsg::groups_needs_order_by(span));
@@ -1823,10 +1836,10 @@ fn transform_window_def(
         }
         // checkExprIsVarFree: only a Var of this query level counts — a
         // SQL function's parameter or an outer reference is fine.
-        let mut var: Option<&Option<ast::Node>> = None;
+        let mut var: Option<Option<&ast::Node>> = None;
         crate::resolve::visit_same_level(offset, &mut |e| {
             if var.is_none()
-                && let Some(ast::Node::ColumnRef(cr)) = e.as_ref()
+                && let Some(ast::Node::ColumnRef(cr)) = e
                 && crate::resolve::references_local_column(cr, ctx.scope)
             {
                 var = Some(e);
@@ -1857,7 +1870,7 @@ fn transform_window_def(
 fn in_range_offset_type(
     key: PgTypeOid,
     offset_type: PgTypeOid,
-    offset: &Option<ast::Node>,
+    offset: Option<&ast::Node>,
     ctx: Ctx<'_>,
 ) -> Result<PgTypeOid, AnalyzeError> {
     let snapshot = ctx.snapshot;
@@ -1968,14 +1981,14 @@ pub(crate) fn check_window_clause(
         .target_list
         .iter()
         .filter_map(|t| match t.as_ref() {
-            Some(ast::Node::ResTarget(rt)) => rt.val.is_some().then_some(&rt.val),
+            Some(ast::Node::ResTarget(rt)) => rt.val.is_some().then_some(rt.val.as_ref()),
             _ => None,
         })
         .chain(sel.sort_clause.iter().filter_map(|s| match s.as_ref() {
-            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
+            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(sb.node.as_ref()),
             _ => None,
         }))
-        .chain(&sel.distinct_clause);
+        .chain(sel.distinct_clause.iter().map(Option::as_ref));
     for e in exprs {
         crate::resolve::visit_same_level(e, &mut |n| {
             if let Some(over) = inline_window(n) {
@@ -1995,8 +2008,8 @@ pub(crate) fn check_window_clause(
 
 /// The inline `OVER (…)` window of a window call (a function's or a JSON
 /// aggregate's).
-fn inline_window(node: &Option<ast::Node>) -> Option<&ast::WindowDef> {
-    let over = match node.as_ref()? {
+fn inline_window(node: Option<&ast::Node>) -> Option<&ast::WindowDef> {
+    let over = match node? {
         ast::Node::FuncCall(f) => f.over.as_deref(),
         ast::Node::JsonObjectAgg(a) => a.constructor.as_deref()?.over.as_deref(),
         ast::Node::JsonArrayAgg(a) => a.constructor.as_deref()?.over.as_deref(),
@@ -2056,7 +2069,14 @@ fn resolve_func_nullability(
         match name {
             // An offset of 0 is the current row itself, whatever the
             // default (`WinGetFuncArgInPartition` at relpos 0).
-            "lag" | "lead" if func.args.get(1).is_some_and(is_zero_constant) => arg_is_nullable(0),
+            "lag" | "lead"
+                if func
+                    .args
+                    .get(1)
+                    .is_some_and(|n| is_zero_constant(n.as_ref())) =>
+            {
+                arg_is_nullable(0)
+            }
             "lag" | "lead" if func.args.len() >= 3 => {
                 arg_is_nullable(0) || arg_is_nullable(1) || arg_is_nullable(2)
             }
@@ -2101,12 +2121,16 @@ fn resolve_func_nullability(
         let plain = func.agg_filter.is_none() && func.over.is_none();
         let proven = |i: usize| {
             let node = if i < args.direct_count {
-                func.args.get(i).map(functions::call_arg_value)
+                func.args
+                    .get(i)
+                    .map(|n| functions::call_arg_value(n.as_ref()))
             } else {
                 func.agg_order
                     .get(i - args.direct_count)
                     .and_then(|o| match o.as_ref() {
-                        Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
+                        Some(ast::Node::SortBy(sb)) => {
+                            sb.node.is_some().then_some(sb.node.as_ref())
+                        }
                         _ => None,
                     })
             };
@@ -2197,7 +2221,7 @@ fn resolve_func_nullability(
         && args
             .exprs
             .first()
-            .is_some_and(|t| is_nonempty_1d_array_agg(&func.args[0], t, ctx, params))
+            .is_some_and(|t| is_nonempty_1d_array_agg(func.args[0].as_ref(), t, ctx, params))
     {
         // The one dimension of a non-empty `array_agg`.
         false

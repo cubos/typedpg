@@ -8,102 +8,102 @@
 //! separate level and is never entered (only its `testexpr` is).
 
 use super::*;
-use typedpg_pg_query::{NodeBox, ast};
+use typedpg_pg_query::ast;
 
 /// The direct sub-expressions of `node` that belong to the same query level.
-pub(crate) fn expr_children(node: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
-    let mut out: Vec<&Option<ast::Node>> = Vec::new();
-    let Some(inner) = node.as_ref() else {
+pub(crate) fn expr_children(node: Option<&ast::Node>) -> Vec<Option<&ast::Node>> {
+    let mut out: Vec<Option<&ast::Node>> = Vec::new();
+    let Some(inner) = node else {
         return out;
     };
-    fn push<'a>(out: &mut Vec<&'a Option<ast::Node>>, n: &'a Option<ast::Node>) {
+    fn push<'a>(out: &mut Vec<Option<&'a ast::Node>>, n: Option<&'a ast::Node>) {
         if n.is_some() {
             out.push(n);
         }
     }
     match inner {
         ast::Node::FuncCall(fc) => {
-            out.extend(fc.args.iter());
-            out.extend(fc.agg_order.iter());
-            push(&mut out, &fc.agg_filter);
+            out.extend(fc.args.iter().map(Option::as_ref));
+            out.extend(fc.agg_order.iter().map(Option::as_ref));
+            push(&mut out, fc.agg_filter.as_ref());
         }
-        ast::Node::NamedArgExpr(na) => push(&mut out, &na.arg),
+        ast::Node::NamedArgExpr(na) => push(&mut out, na.arg.as_ref()),
         ast::Node::AExpr(e) => {
-            push(&mut out, &e.lexpr);
-            push(&mut out, &e.rexpr);
+            push(&mut out, e.lexpr.as_ref());
+            push(&mut out, e.rexpr.as_ref());
         }
-        ast::Node::BoolExpr(b) => out.extend(b.args.iter()),
-        ast::Node::NullTest(t) => push(&mut out, &t.arg),
-        ast::Node::BooleanTest(t) => push(&mut out, &t.arg),
-        ast::Node::CoalesceExpr(c) => out.extend(c.args.iter()),
-        ast::Node::MinMaxExpr(m) => out.extend(m.args.iter()),
+        ast::Node::BoolExpr(b) => out.extend(b.args.iter().map(Option::as_ref)),
+        ast::Node::NullTest(t) => push(&mut out, t.arg.as_ref()),
+        ast::Node::BooleanTest(t) => push(&mut out, t.arg.as_ref()),
+        ast::Node::CoalesceExpr(c) => out.extend(c.args.iter().map(Option::as_ref)),
+        ast::Node::MinMaxExpr(m) => out.extend(m.args.iter().map(Option::as_ref)),
         ast::Node::CaseExpr(c) => {
-            push(&mut out, &c.arg);
-            out.extend(c.args.iter());
-            push(&mut out, &c.defresult);
+            push(&mut out, c.arg.as_ref());
+            out.extend(c.args.iter().map(Option::as_ref));
+            push(&mut out, c.defresult.as_ref());
         }
         ast::Node::CaseWhen(w) => {
-            push(&mut out, &w.expr);
-            push(&mut out, &w.result);
+            push(&mut out, w.expr.as_ref());
+            push(&mut out, w.result.as_ref());
         }
-        ast::Node::TypeCast(c) => push(&mut out, &c.arg),
-        ast::Node::CollateClause(c) => push(&mut out, &c.arg),
+        ast::Node::TypeCast(c) => push(&mut out, c.arg.as_ref()),
+        ast::Node::CollateClause(c) => push(&mut out, c.arg.as_ref()),
         ast::Node::AIndirection(i) => {
-            push(&mut out, &i.arg);
-            out.extend(i.indirection.iter());
+            push(&mut out, i.arg.as_ref());
+            out.extend(i.indirection.iter().map(Option::as_ref));
         }
         ast::Node::AIndices(i) => {
-            push(&mut out, &i.lidx);
-            push(&mut out, &i.uidx);
+            push(&mut out, i.lidx.as_ref());
+            push(&mut out, i.uidx.as_ref());
         }
-        ast::Node::AArrayExpr(a) => out.extend(a.elements.iter()),
-        ast::Node::RowExpr(r) => out.extend(r.args.iter()),
-        ast::Node::List(l) => out.extend(l.items.iter()),
-        ast::Node::SortBy(s) => push(&mut out, &s.node),
-        ast::Node::ResTarget(rt) => push(&mut out, &rt.val),
-        ast::Node::GroupingFunc(g) => out.extend(g.args.iter()),
-        ast::Node::GroupingSet(g) => out.extend(g.content.iter()),
-        ast::Node::SubLink(sl) => push(&mut out, &sl.testexpr),
+        ast::Node::AArrayExpr(a) => out.extend(a.elements.iter().map(Option::as_ref)),
+        ast::Node::RowExpr(r) => out.extend(r.args.iter().map(Option::as_ref)),
+        ast::Node::List(l) => out.extend(l.items.iter().map(Option::as_ref)),
+        ast::Node::SortBy(s) => push(&mut out, s.node.as_ref()),
+        ast::Node::ResTarget(rt) => push(&mut out, rt.val.as_ref()),
+        ast::Node::GroupingFunc(g) => out.extend(g.args.iter().map(Option::as_ref)),
+        ast::Node::GroupingSet(g) => out.extend(g.content.iter().map(Option::as_ref)),
+        ast::Node::SubLink(sl) => push(&mut out, sl.testexpr.as_ref()),
         ast::Node::XmlExpr(x) => {
-            out.extend(x.named_args.iter());
-            out.extend(x.args.iter());
+            out.extend(x.named_args.iter().map(Option::as_ref));
+            out.extend(x.args.iter().map(Option::as_ref));
         }
-        ast::Node::MultiAssignRef(m) => push(&mut out, &m.source),
-        ast::Node::XmlSerialize(x) => push(&mut out, &x.expr),
+        ast::Node::MultiAssignRef(m) => push(&mut out, m.source.as_ref()),
+        ast::Node::XmlSerialize(x) => push(&mut out, x.expr.as_ref()),
         // SQL/JSON constructors: a `JsonValueExpr` wraps its raw expression.
-        ast::Node::JsonValueExpr(v) => push(&mut out, &v.raw_expr),
+        ast::Node::JsonValueExpr(v) => push(&mut out, v.raw_expr.as_ref()),
         ast::Node::JsonKeyValue(kv) => {
-            push(&mut out, &kv.key);
-            push_json_value(&mut out, &kv.value);
+            push(&mut out, kv.key.as_ref());
+            push_json_value(&mut out, kv.value.as_deref());
         }
-        ast::Node::JsonObjectConstructor(c) => out.extend(c.exprs.iter()),
-        ast::Node::JsonArrayConstructor(c) => out.extend(c.exprs.iter()),
-        ast::Node::JsonScalarExpr(s) => push(&mut out, &s.expr),
-        ast::Node::JsonSerializeExpr(s) => push_json_value(&mut out, &s.expr),
-        ast::Node::JsonParseExpr(p) => push_json_value(&mut out, &p.expr),
-        ast::Node::JsonIsPredicate(p) => push(&mut out, &p.expr),
+        ast::Node::JsonObjectConstructor(c) => out.extend(c.exprs.iter().map(Option::as_ref)),
+        ast::Node::JsonArrayConstructor(c) => out.extend(c.exprs.iter().map(Option::as_ref)),
+        ast::Node::JsonScalarExpr(s) => push(&mut out, s.expr.as_ref()),
+        ast::Node::JsonSerializeExpr(s) => push_json_value(&mut out, s.expr.as_deref()),
+        ast::Node::JsonParseExpr(p) => push_json_value(&mut out, p.expr.as_deref()),
+        ast::Node::JsonIsPredicate(p) => push(&mut out, p.expr.as_ref()),
         ast::Node::JsonFuncExpr(f) => {
-            push_json_value(&mut out, &f.context_item);
-            push(&mut out, &f.pathspec);
+            push_json_value(&mut out, f.context_item.as_deref());
+            push(&mut out, f.pathspec.as_ref());
             for p in &f.passing {
                 if let Some(ast::Node::JsonArgument(a)) = p.as_ref() {
-                    push_json_value(&mut out, &a.val);
+                    push_json_value(&mut out, a.val.as_deref());
                 }
             }
             for b in [&f.on_empty, &f.on_error].into_iter().flatten() {
-                push(&mut out, &b.expr);
+                push(&mut out, b.expr.as_ref());
             }
         }
         ast::Node::JsonObjectAgg(a) => {
             if let Some(kv) = a.arg.as_deref() {
-                push(&mut out, &kv.key);
-                push_json_value(&mut out, &kv.value);
+                push(&mut out, kv.key.as_ref());
+                push_json_value(&mut out, kv.value.as_deref());
             }
-            push_json_agg(&mut out, &a.constructor);
+            push_json_agg(&mut out, a.constructor.as_deref());
         }
         ast::Node::JsonArrayAgg(a) => {
-            push_json_value(&mut out, &a.arg);
-            push_json_agg(&mut out, &a.constructor);
+            push_json_value(&mut out, a.arg.as_deref());
+            push_json_agg(&mut out, a.constructor.as_deref());
         }
         _ => {}
     }
@@ -111,35 +111,29 @@ pub(crate) fn expr_children(node: &Option<ast::Node>) -> Vec<&Option<ast::Node>>
 }
 
 /// The raw expression of a `JsonValueExpr` field.
-fn push_json_value<'a>(
-    out: &mut Vec<&'a Option<ast::Node>>,
-    v: &'a Option<NodeBox<ast::JsonValueExpr>>,
-) {
-    if let Some(v) = v.as_deref()
+fn push_json_value<'a>(out: &mut Vec<Option<&'a ast::Node>>, v: Option<&'a ast::JsonValueExpr>) {
+    if let Some(v) = v
         && v.raw_expr.is_some()
     {
-        out.push(&v.raw_expr);
+        out.push(v.raw_expr.as_ref());
     }
 }
 
 /// A JSON aggregate's ORDER BY and FILTER (its window, like a `FuncCall`'s
 /// `OVER`, is not an argument).
-fn push_json_agg<'a>(
-    out: &mut Vec<&'a Option<ast::Node>>,
-    c: &'a Option<NodeBox<ast::JsonAggConstructor>>,
-) {
-    if let Some(c) = c.as_deref() {
-        out.extend(c.agg_order.iter());
+fn push_json_agg<'a>(out: &mut Vec<Option<&'a ast::Node>>, c: Option<&'a ast::JsonAggConstructor>) {
+    if let Some(c) = c {
+        out.extend(c.agg_order.iter().map(Option::as_ref));
         if c.agg_filter.is_some() {
-            out.push(&c.agg_filter);
+            out.push(c.agg_filter.as_ref());
         }
     }
 }
 
 /// Pre-order visit of `node` and every same-level sub-expression.
 pub(crate) fn visit_same_level<'a>(
-    node: &'a Option<ast::Node>,
-    f: &mut dyn FnMut(&'a Option<ast::Node>),
+    node: Option<&'a ast::Node>,
+    f: &mut dyn FnMut(Option<&'a ast::Node>),
 ) {
     f(node);
     for child in expr_children(node) {
@@ -166,16 +160,22 @@ pub(crate) fn is_srf_call(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
 
 /// Number of set-returning function calls in `nodes` at this query level.
 pub(crate) fn count_srf_calls(nodes: &[Option<ast::Node>], snapshot: &PgCatalog) -> usize {
+    nodes
+        .iter()
+        .map(|node| node_srf_calls(node.as_ref(), snapshot))
+        .sum()
+}
+
+/// [`count_srf_calls`] of a single expression.
+pub(crate) fn node_srf_calls(node: Option<&ast::Node>, snapshot: &PgCatalog) -> usize {
     let mut n = 0;
-    for node in nodes {
-        visit_same_level(node, &mut |e| {
-            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
-                && is_srf_call(fc, snapshot)
-            {
-                n += 1;
-            }
-        });
-    }
+    visit_same_level(node, &mut |e| {
+        if let Some(ast::Node::FuncCall(fc)) = e
+            && is_srf_call(fc, snapshot)
+        {
+            n += 1;
+        }
+    });
     n
 }
 
@@ -194,7 +194,7 @@ pub(crate) fn level_srf_calls<'a>(
         .target_list
         .iter()
         .filter_map(|t| match t.as_ref()? {
-            ast::Node::ResTarget(rt) => rt.val.is_some().then(|| node_fingerprint(&rt.val)),
+            ast::Node::ResTarget(rt) => rt.val.is_some().then(|| node_fingerprint(rt.val.as_ref())),
             _ => None,
         })
         .collect();
@@ -202,16 +202,16 @@ pub(crate) fn level_srf_calls<'a>(
         .sort_clause
         .iter()
         .filter_map(|n| match n.as_ref()? {
-            ast::Node::SortBy(sb) => sb.node.is_some().then_some(&sb.node),
-            _ => Some(n),
+            ast::Node::SortBy(sb) => sb.node.is_some().then_some(sb.node.as_ref()),
+            _ => Some(n.as_ref()),
         })
-        .chain(&sel.group_clause)
-        .chain(&sel.distinct_clause)
-        .filter(|n| !targets.contains(&node_fingerprint(n)));
+        .chain(sel.group_clause.iter().map(Option::as_ref))
+        .chain(sel.distinct_clause.iter().map(Option::as_ref))
+        .filter(|n| !targets.contains(&node_fingerprint(*n)));
     let mut out = Vec::new();
-    for n in sel.target_list.iter().chain(extra) {
+    for n in sel.target_list.iter().map(Option::as_ref).chain(extra) {
         visit_same_level(n, &mut |e| {
-            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
+            if let Some(ast::Node::FuncCall(fc)) = e
                 && is_srf_call(fc, snapshot)
             {
                 out.push(&**fc);
@@ -223,10 +223,10 @@ pub(crate) fn level_srf_calls<'a>(
 
 /// True when `node` contains a set-returning function call at this query
 /// level (itself included).
-fn contains_srf(node: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
+fn contains_srf(node: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
     let mut found = false;
     visit_same_level(node, &mut |e| {
-        if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
+        if let Some(ast::Node::FuncCall(fc)) = e
             && is_srf_call(fc, snapshot)
         {
             found = true;
@@ -250,7 +250,7 @@ fn srf_error(msg: String, hint: bool) -> AnalyzeError {
 /// PG's `check_srf_call_placement` for a clause that forbids set-returning
 /// functions (0A000 `set-returning functions are not allowed in WHERE`, …).
 pub(crate) fn check_no_srf_in_clause(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
     clause: &str,
 ) -> Result<(), AnalyzeError> {
@@ -269,7 +269,7 @@ pub(crate) fn check_no_srf_in_clause(
 /// function arguments (`check_agg_arguments_walker` / `ParseFuncOrColumn`)
 /// and an aggregate's FILTER.
 pub(crate) fn check_srf_nesting(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     let mut err: Option<AnalyzeError> = None;
@@ -278,8 +278,8 @@ pub(crate) fn check_srf_nesting(
             return;
         }
         let inner_has_srf =
-            |nodes: Vec<&Option<ast::Node>>| nodes.into_iter().any(|n| contains_srf(n, snapshot));
-        match e.as_ref() {
+            |nodes: Vec<Option<&ast::Node>>| nodes.into_iter().any(|n| contains_srf(n, snapshot));
+        match e {
             Some(ast::Node::CaseExpr(_)) => {
                 if inner_has_srf(expr_children(e)) {
                     err = Some(srf_error(
@@ -297,15 +297,19 @@ pub(crate) fn check_srf_nesting(
                 }
             }
             Some(ast::Node::FuncCall(fc)) => {
-                if fc.agg_filter.is_some() && contains_srf(&fc.agg_filter, snapshot) {
+                if fc.agg_filter.is_some() && contains_srf(fc.agg_filter.as_ref(), snapshot) {
                     err = Some(srf_error(
                         "set-returning functions are not allowed in FILTER".into(),
                         false,
                     ));
                     return;
                 }
-                let args: Vec<&Option<ast::Node>> =
-                    fc.args.iter().chain(fc.agg_order.iter()).collect();
+                let args: Vec<Option<&ast::Node>> = fc
+                    .args
+                    .iter()
+                    .chain(fc.agg_order.iter())
+                    .map(Option::as_ref)
+                    .collect();
                 if fc.over.is_some() {
                     if inner_has_srf(args) {
                         err = Some(srf_error(

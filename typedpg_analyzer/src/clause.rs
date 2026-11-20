@@ -148,7 +148,7 @@ impl ClauseKind {
 /// Coerce a clause expression to the kind's expected type with PG's error
 /// ordering and wording. See the module docs for the three-step order.
 pub(crate) fn coerce_clause_expr(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     kind: ClauseKind,
@@ -229,7 +229,7 @@ pub(crate) fn coerce_clause_expr(
 /// level (its arguments only reference that level) is that level's
 /// business.
 pub(crate) fn check_level_calls(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     context: &str,
     aggregates: bool,
@@ -292,7 +292,7 @@ fn window_not_allowed(context: &str, location: Option<i32>) -> AnalyzeError {
 /// the error message (e.g. `"WHERE"`, `"GROUP BY"`, `"JOIN/ON"`). Blind to
 /// query levels — [`check_level_calls`] is the level-aware form.
 pub(crate) fn check_no_aggregates_or_windows(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
     context: &str,
 ) -> Result<(), AnalyzeError> {
@@ -543,15 +543,15 @@ const DEFAULT_COLLATION: crate::oid::PgCollationOid = crate::oid::PgCollationOid
 /// conflict that bubbles up through every node whose result is
 /// collatable. Types come from inference on scratch parameters.
 pub(crate) fn collation_state(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> CollationState {
-    let infer = |n: &Option<ast::Node>| {
+    let infer = |n: Option<&ast::Node>| {
         let mut scratch = params.clone();
         expr::infer_expr(n, ctx, &mut scratch, TypeGoal::NONE).ok()
     };
-    if let Some(ast::Node::CollateClause(_)) = node.as_ref() {
+    if let Some(ast::Node::CollateClause(_)) = node {
         return infer(node).map_or(CollationState::NONE, |t| {
             CollationState::of_value(ctx.snapshot, t.type_oid, t.collation, true)
         });

@@ -119,7 +119,7 @@ pub(crate) fn check_declare(interp: &PgCatalog, stmt: &DeclareCursorStmt) -> Res
         return Ok(());
     };
     super::dml::check_executed(interp, inner)?;
-    if super::views::has_modifying_cte(&stmt.query) {
+    if super::views::has_modifying_cte(stmt.query.as_ref()) {
         return Err(DdlError::UnsupportedDdl(
             "DECLARE CURSOR must not contain data-modifying statements in WITH".into(),
         ));

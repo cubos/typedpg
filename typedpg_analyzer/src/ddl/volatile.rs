@@ -86,11 +86,11 @@ const MAX_INLINE_DEPTH: usize = 16;
 /// Walk `node` and return `Err` if any `FuncCall` resolves to a function
 /// marked `VOLATILE`. `location` selects PG's wording for that context.
 pub(crate) fn check_no_volatile(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     location: ExprLocation,
     snapshot: &PgCatalog,
 ) -> Result<(), DdlError> {
-    walk(node.as_ref(), location, snapshot, 0)
+    walk(node, location, snapshot, 0)
 }
 
 /// Analyze `expr` with the row of `relid` in scope — the way PG
@@ -99,7 +99,7 @@ pub(crate) fn check_no_volatile(
 pub(crate) fn infer_over_relation(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     used: Option<&std::cell::RefCell<Vec<crate::oid::PgProcOid>>>,
 ) -> Option<Result<crate::expr::ExprType, crate::error::AnalyzeError>> {
     use crate::expr::{TypeGoal, infer_expr};
@@ -127,7 +127,7 @@ pub(crate) fn infer_over_relation(
         ctx = ctx.recording(used);
     }
     let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
-    Some(infer_expr(&expr, ctx, &mut params, TypeGoal::NONE))
+    Some(infer_expr(expr.as_ref(), ctx, &mut params, TypeGoal::NONE))
 }
 
 /// The columns of `relid` an expression over its row is strict in: when
@@ -136,7 +136,7 @@ pub(crate) fn infer_over_relation(
 pub(crate) fn strict_columns_over_relation(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
 ) -> Vec<String> {
     use crate::expr::{TypeGoal, infer_expr};
     let Some(class) = interp.pg_class.get(&relid) else {
@@ -159,15 +159,16 @@ pub(crate) fn strict_columns_over_relation(
     let log = crate::nonnull::StrictLog::default();
     let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).logging_strictness(&log);
     let expr = &crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
-    if infer_expr(expr, ctx, &mut params, TypeGoal::NONE).is_err() {
+    if infer_expr(expr.as_ref(), ctx, &mut params, TypeGoal::NONE).is_err() {
         return Vec::new();
     }
-    let mut cols: Vec<String> = crate::nonnull::nonnullable(expr, false, &scope, &log, interp)
-        .columns
-        .into_iter()
-        .filter(|(a, _)| *a == class.relname)
-        .map(|(_, c)| c)
-        .collect();
+    let mut cols: Vec<String> =
+        crate::nonnull::nonnullable(expr.as_ref(), false, &scope, &log, interp)
+            .columns
+            .into_iter()
+            .filter(|(a, _)| *a == class.relname)
+            .map(|(_, c)| c)
+            .collect();
     cols.sort();
     cols
 }
@@ -180,7 +181,7 @@ pub(crate) fn strict_columns_over_relation(
 pub(crate) fn trusted_over_relation(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
 ) -> Option<crate::nonnull::TrustedNodes> {
     use crate::expr::{TypeGoal, infer_expr};
     let class = interp.pg_class.get(&relid)?;
@@ -203,7 +204,7 @@ pub(crate) fn trusted_over_relation(
     let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
     let (inferred, _) = crate::ddl::depend::collect(|| {
         let _level = crate::resolve::QueryLevel::enter();
-        infer_expr(&expr, ctx, &mut params, TypeGoal::NONE)
+        infer_expr(expr.as_ref(), ctx, &mut params, TypeGoal::NONE)
     });
     inferred.ok().map(|_| log.trusted())
 }
@@ -217,7 +218,7 @@ pub(crate) fn trusted_over_relation(
 pub(crate) fn check_mutability(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     loc: ExprLocation,
 ) -> Result<(), DdlError> {
     let used = std::cell::RefCell::new(Vec::new());

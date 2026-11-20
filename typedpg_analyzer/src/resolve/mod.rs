@@ -883,8 +883,8 @@ pub(crate) fn values_sort_error(
     }
     let mut location = None;
     for n in &sel.sort_clause {
-        visit_same_level(n, &mut |e| {
-            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
+        visit_same_level(n.as_ref(), &mut |e| {
+            if let Some(ast::Node::FuncCall(fc)) = e
                 && location.is_none()
                 && is_srf_call(fc, snapshot)
             {
@@ -977,9 +977,7 @@ fn can_run_as_subquery(stmt: &ast::Node) -> bool {
 pub(crate) type RawParam = (i32, PgTypeOid, bool);
 
 /// The expressions of a `RETURNING` clause (none when there is no clause).
-pub(crate) fn returning_exprs(
-    clause: &Option<typedpg_pg_query::NodeBox<ast::ReturningClause>>,
-) -> &[Option<ast::Node>] {
+pub(crate) fn returning_exprs(clause: Option<&ast::ReturningClause>) -> &[Option<ast::Node>] {
     clause.as_ref().map_or(&[], |c| c.exprs.as_slice())
 }
 
@@ -1275,17 +1273,17 @@ fn analyze_raw_node_once(
 /// `TypeCast { arg: AConst NULL, typename: int }` — we don't treat those as
 /// unconditionally NULL because PG allows `SET col = NULL::t` to perform an
 /// assignment the caller has explicitly typed.
-fn is_sql_null_literal(node: &Option<ast::Node>) -> bool {
+fn is_sql_null_literal(node: Option<&ast::Node>) -> bool {
     matches!(
-        node.as_ref(),
+        node,
         Some(ast::Node::AConst(c)) if c.isnull
     )
 }
 
 /// `true` for the literal `DEFAULT` keyword used in INSERT VALUES /
 /// UPDATE SET. Mirrors PG's `SetToDefault` AST node.
-fn is_set_to_default(node: &Option<ast::Node>) -> bool {
-    matches!(node.as_ref(), Some(ast::Node::SetToDefault(_)))
+fn is_set_to_default(node: Option<&ast::Node>) -> bool {
+    matches!(node, Some(ast::Node::SetToDefault(_)))
 }
 
 /// The ON CONFLICT arbiter specification after parse analysis
@@ -1356,9 +1354,9 @@ fn infer_collation_opclass_match(
             (Some(a), _) if a == attno => return true,
             (None, Some(_))
                 if attno == 0
-                    && idx_exprs
-                        .get(natt - nplain)
-                        .is_some_and(|x| node_fingerprint(x) == node_fingerprint(&elem.expr)) =>
+                    && idx_exprs.get(natt - nplain).is_some_and(|x| {
+                        node_fingerprint(x.as_ref()) == node_fingerprint(elem.expr.as_ref())
+                    }) =>
             {
                 return true;
             }
@@ -1472,7 +1470,10 @@ fn validate_on_conflict_target(
         }
         table_oid = base;
     }
-    let mut target_exprs: Vec<String> = target_expr_nodes.iter().map(node_fingerprint).collect();
+    let mut target_exprs: Vec<String> = target_expr_nodes
+        .iter()
+        .map(|n| node_fingerprint(n.as_ref()))
+        .collect();
     target_exprs.sort();
     target_exprs.dedup();
 
@@ -1498,7 +1499,10 @@ fn validate_on_conflict_target(
         let cols: std::collections::BTreeSet<i16> =
             key.iter().copied().filter(|&a| a != 0).collect();
         let idx_exprs: Vec<Option<ast::Node>> = idx.indexprs.iter().map(decode).collect();
-        let mut exprs: Vec<String> = idx_exprs.iter().map(node_fingerprint).collect();
+        let mut exprs: Vec<String> = idx_exprs
+            .iter()
+            .map(|n| node_fingerprint(n.as_ref()))
+            .collect();
         exprs.sort();
         exprs.dedup();
         if cols != target_cols || exprs != target_exprs {

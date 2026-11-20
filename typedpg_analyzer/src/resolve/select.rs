@@ -387,15 +387,16 @@ fn analyze_select_here(
         // but only after the expression itself resolves; the ordering lives
         // in `coerce_bool_clause`.
         crate::clause::coerce_clause_expr(
-            where_clause,
+            where_clause.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Where,
         )?;
-        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
+        check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
         // What the rows past WHERE have non-NULL — read by everything
         // evaluated after it, and reducing outer joins PG would reduce.
-        let facts = crate::nonnull::nonnullable(where_clause, true, &scope, &log, snapshot);
+        let facts =
+            crate::nonnull::nonnullable(where_clause.as_ref(), true, &scope, &log, snapshot);
         let own = crate::nonnull::own_aliases(&scope);
         // An EXISTS / LATERAL subquery hands what it proves of the levels
         // around it up (see `nonnull::capture_correlation`).
@@ -449,20 +450,20 @@ fn analyze_select_here(
     if let having @ Some(_) = &sel.having_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
-            having,
+            having.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Having,
         )?;
-        check_no_srf_in_clause(having, snapshot, "HAVING")?;
+        check_no_srf_in_clause(having.as_ref(), snapshot, "HAVING")?;
         // A grouped column HAVING proves non-NULL is so in every group
         // left — the groups' rows share it — even one a grouping set
         // omits (those groups are the ones HAVING drops).
-        let facts = crate::nonnull::nonnullable(having, true, &scope, &log, snapshot)
+        let facts = crate::nonnull::nonnullable(having.as_ref(), true, &scope, &log, snapshot)
             .restricted_to(&crate::nonnull::own_aliases(&scope));
         null_ctx.add_having_facts(facts);
         // What the groups left must hold: rows, non-NULL aggregated values.
-        let facts = crate::having::having_facts(having, &scope, snapshot);
+        let facts = crate::having::having_facts(having.as_ref(), &scope, snapshot);
         null_ctx.input_not_empty |= facts.input_not_empty;
         null_ctx.nonnull_agg_inputs = facts.nonnull_inputs;
     }
@@ -488,12 +489,12 @@ fn analyze_select_here(
         if inner.is_none() {
             continue;
         }
-        if let Some(ord) = sql92_position_of(inner, "ORDER BY")? {
+        if let Some(ord) = sql92_position_of(inner.as_ref(), "ORDER BY")? {
             if ord < 1 || ord as usize > n_targets {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "ORDER BY",
                     ord,
-                    crate::error::node_location(inner)
+                    crate::error::node_location(inner.as_ref())
                         .and_then(crate::error::SourceSpan::from_node_token),
                 )
                 .finalize_implicit());
@@ -504,25 +505,31 @@ fn analyze_select_here(
             continue;
         }
         if let Err(e) = expr::infer_expr(
-            inner,
+            inner.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             TypeGoal::NONE,
-        ) && !is_select_alias_reference(inner, &select_aliases, &e)
+        ) && !is_select_alias_reference(inner.as_ref(), &select_aliases, &e)
         {
             return Err(e);
         }
         // addTargetToSortList resolves the key's entry still `unknown` as
         // text, before the next key is transformed.
-        match aliased_target(inner, &targets) {
+        match aliased_target(inner.as_ref(), &targets) {
             Some(rt) => resolve_unknown_target(rt, snapshot, params)?,
-            None => expr::resolve_unknown_key(inner, snapshot, params)?,
+            None => expr::resolve_unknown_key(inner.as_ref(), snapshot, params)?,
         }
         if plain_distinct
-            && !sort_expr_in_select_list(inner, &sel.target_list, &select_aliases, &scope, snapshot)
+            && !sort_expr_in_select_list(
+                inner.as_ref(),
+                &sel.target_list,
+                &select_aliases,
+                &scope,
+                snapshot,
+            )
         {
             return Err(crate::pgmsg::distinct_order_by_not_in_select_list(
-                crate::error::node_location(inner)
+                crate::error::node_location(inner.as_ref())
                     .and_then(crate::error::SourceSpan::from_node_qname),
             )
             .finalize_implicit());
@@ -540,7 +547,7 @@ fn analyze_select_here(
     grouping::with_clause(Some("GROUP BY"), || {
         for group_node in &sel.group_clause {
             walk_group_clause_node(
-                group_node,
+                group_node.as_ref(),
                 expr::Ctx::new(&scope, &null_ctx, snapshot),
                 params,
                 &select_aliases,
@@ -561,12 +568,12 @@ fn analyze_select_here(
     // untyped.
     let mut unknown_keys: Vec<Result<&ast::ResTarget, &ast::ParamRef>> = Vec::new();
     for distinct_node in &sel.distinct_clause {
-        if let Some(ord) = sql92_position_of(distinct_node, "DISTINCT ON")? {
+        if let Some(ord) = sql92_position_of(distinct_node.as_ref(), "DISTINCT ON")? {
             if ord < 1 || ord as usize > n_targets {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "DISTINCT ON",
                     ord,
-                    crate::error::node_location(distinct_node)
+                    crate::error::node_location(distinct_node.as_ref())
                         .and_then(crate::error::SourceSpan::from_node_token),
                 )
                 .finalize_implicit());
@@ -576,9 +583,9 @@ fn analyze_select_here(
             }
             continue;
         }
-        if let Some(rt) = aliased_target(distinct_node, &targets) {
+        if let Some(rt) = aliased_target(distinct_node.as_ref(), &targets) {
             unknown_keys.push(Ok(rt));
-        } else if let Some(p) = expr::bare_param(distinct_node, snapshot)
+        } else if let Some(p) = expr::bare_param(distinct_node.as_ref(), snapshot)
             && params.bound_arg(p.number).is_none()
             && params.get(p.number) == oid::UNKNOWN
         {
@@ -586,12 +593,12 @@ fn analyze_select_here(
         }
         if distinct_node.is_some()
             && let Err(e) = expr::infer_expr(
-                distinct_node,
+                distinct_node.as_ref(),
                 expr::Ctx::new(&scope, &null_ctx, snapshot),
                 params,
                 TypeGoal::NONE,
             )
-            && !is_select_alias_reference(distinct_node, &select_aliases, &e)
+            && !is_select_alias_reference(distinct_node.as_ref(), &select_aliases, &e)
         {
             return Err(e);
         }
@@ -619,18 +626,18 @@ fn analyze_select_here(
         if let Some(ast::Node::ResTarget(rt)) = t.as_ref()
             && rt.val.is_some()
         {
-            check_window_refs(&rt.val, &defined_windows)?;
+            check_window_refs(rt.val.as_ref(), &defined_windows)?;
         }
     }
     for sort_node in &sel.sort_clause {
         if let Some(ast::Node::SortBy(sb)) = sort_node.as_ref()
             && sb.node.is_some()
         {
-            check_window_refs(&sb.node, &defined_windows)?;
+            check_window_refs(sb.node.as_ref(), &defined_windows)?;
         }
     }
     for distinct_node in &sel.distinct_clause {
-        check_window_refs(distinct_node, &defined_windows)?;
+        check_window_refs(distinct_node.as_ref(), &defined_windows)?;
     }
     // The WINDOW clause's own definitions, and the inline windows that
     // inherit from them (PG's transformWindowDefinitions).
@@ -684,7 +691,7 @@ fn analyze_select_here(
         .chain(sel.sort_clause.iter())
         .chain(sel.group_clause.iter())
     {
-        check_srf_nesting(n, snapshot)?;
+        check_srf_nesting(n.as_ref(), snapshot)?;
     }
 
     check_order_by_using(
@@ -822,7 +829,7 @@ pub(crate) fn removable_scan(
                 })
             })
     };
-    let plain_table = |n: &Option<ast::Node>| match n.as_ref() {
+    let plain_table = |n: Option<&ast::Node>| match n {
         Some(ast::Node::RangeVar(rv)) => {
             let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
             (schema.is_some() || !own_cte(&rv.relname))
@@ -838,17 +845,17 @@ pub(crate) fn removable_scan(
     if !not_dummy
         && (sel.where_clause.is_some()
             || sel.having_clause.is_some()
-            || !sel.from_clause.iter().all(plain_table))
+            || !sel.from_clause.iter().all(|n| plain_table(n.as_ref())))
     {
         return false;
     }
-    let ordinal = |n: &Option<ast::Node>| {
+    let ordinal = |n: Option<&ast::Node>| {
         matches!(
-            n.as_ref(),
+            n,
             Some(ast::Node::AConst(c)) if matches!(c.val, Some(ast::AConstValue::Integer(_)))
         )
     };
-    let output_name = |n: &Option<ast::Node>| match n.as_ref() {
+    let output_name = |n: Option<&ast::Node>| match n {
         Some(ast::Node::ColumnRef(cr)) => match cr.fields.as_slice() {
             [f] => matches!(f.as_ref(), Some(ast::Node::String(s))
                 if columns.iter().filter(|c| c.name == s.sval).count() == 1),
@@ -858,7 +865,7 @@ pub(crate) fn removable_scan(
     };
     let sort_keys_are_outputs = sel.sort_clause.iter().all(|s| match s.as_ref() {
         Some(ast::Node::SortBy(sb)) => {
-            sb.node.is_some() && (ordinal(&sb.node) || output_name(&sb.node))
+            sb.node.is_some() && (ordinal(sb.node.as_ref()) || output_name(sb.node.as_ref()))
         }
         _ => false,
     });
@@ -866,8 +873,10 @@ pub(crate) fn removable_scan(
     let distinct_keys_are_outputs = sel
         .distinct_clause
         .iter()
-        .all(|d| d.is_none() || ordinal(d) || output_name(d));
-    if !sort_keys_are_outputs || !distinct_keys_are_outputs || !sel.group_clause.iter().all(ordinal)
+        .all(|d| d.is_none() || ordinal(d.as_ref()) || output_name(d.as_ref()));
+    if !sort_keys_are_outputs
+        || !distinct_keys_are_outputs
+        || !sel.group_clause.iter().all(|n| ordinal(n.as_ref()))
     {
         return false;
     }
@@ -1066,7 +1075,7 @@ fn set_planned_top(
             },
             _ => {
                 let i = outputs.len();
-                if let Some((folded, c)) = folds_to_column(val, scope, snapshot)
+                if let Some((folded, c)) = folds_to_column(val.as_ref(), scope, snapshot)
                     && local(c)
                     && columns.get(i).is_some_and(|o| o.type_oid == c.type_oid)
                 {
@@ -1150,13 +1159,16 @@ fn set_planned_top(
     // above the scan, unless pushed down into the subquery.
     let where_fold = sel.where_clause.is_some().then(|| {
         let w = &sel.where_clause;
-        let fixed = !contains_node(w, &|n| {
+        let fixed = !contains_node(w.as_ref(), &|n| {
             matches!(
                 n,
                 typedpg_pg_query::NodeRef::ParamRef(_) | typedpg_pg_query::NodeRef::SubLink(_)
             )
         });
-        (crate::expr::plan_fold::fold_qual(w, snapshot), fixed)
+        (
+            crate::expr::plan_fold::fold_qual(w.as_ref(), snapshot),
+            fixed,
+        )
     });
     let where_none = matches!(where_fold, None | Some((Folded::Bool(true), _)));
     let where_false = matches!(where_fold, Some((Folded::Bool(false), _)));
@@ -1208,7 +1220,7 @@ fn set_planned_top(
         // expression a substitution may fold.
         let where_reads_scan = sel.where_clause.is_some() && {
             let w = &sel.where_clause;
-            !contains_node(w, &|n| match n {
+            !contains_node(w.as_ref(), &|n| match n {
                 typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                     column_ref_target(cr, scope).is_none_or(|c| !local(c) || scan_of(c).is_none())
                 }
@@ -1236,8 +1248,8 @@ fn set_planned_top(
         // Incremental Sort, is above the scan. `key_var` tells whether a
         // key is a Var of the scan, and whether it has no collation.
         let no_collation = |o: &TopOutput<'_>| matches!(o, TopOutput::Var(v) if v.no_collation);
-        let key_var = |k: &Option<ast::Node>| -> Option<bool> {
-            match k.as_ref() {
+        let key_var = |k: Option<&ast::Node>| -> Option<bool> {
+            match k {
                 Some(ast::Node::AConst(c)) => match &c.val {
                     Some(ast::AConstValue::Integer(i)) => usize::try_from(i.ival)
                         .ok()
@@ -1281,7 +1293,7 @@ fn set_planned_top(
             .sort_clause
             .iter()
             .map(|s| match s.as_ref() {
-                Some(ast::Node::SortBy(sb)) => key_var(&sb.node),
+                Some(ast::Node::SortBy(sb)) => key_var(sb.node.as_ref()),
                 _ => None,
             })
             .collect();
@@ -1333,7 +1345,7 @@ fn set_planned_top(
         && sel
             .from_clause
             .iter()
-            .any(|f| never_removed(f, sel, scope, snapshot))
+            .any(|f| never_removed(f.as_ref(), sel, scope, snapshot))
     {
         // A join with a relation the planner never removes: the scan's
         // Vars are the join's (or a dummy relation's Result's).
@@ -1359,22 +1371,22 @@ fn set_planned_top(
 /// alone) not on the nullable side of an outer join — or on one
 /// `join_is_removable` can't drop (see [`nullable_side_kept`]).
 fn never_removed(
-    item: &Option<ast::Node>,
+    item: Option<&ast::Node>,
     sel: &ast::SelectStmt,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
-    match item.as_ref() {
+    match item {
         Some(ast::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot).is_some(),
         Some(ast::Node::JoinExpr(j)) => {
-            let side = |n: &Option<ast::Node>| never_removed(n, sel, scope, snapshot);
-            let nullable = |n: &Option<ast::Node>| nullable_side_kept(n, j, sel, scope, snapshot);
+            let side = |n: Option<&ast::Node>| never_removed(n, sel, scope, snapshot);
+            let nullable = |n: Option<&ast::Node>| nullable_side_kept(n, j, sel, scope, snapshot);
             match j.jointype {
                 ast::JoinType::JoinInner | ast::JoinType::JoinFull => {
-                    side(&j.larg) || side(&j.rarg)
+                    side(j.larg.as_ref()) || side(j.rarg.as_ref())
                 }
-                ast::JoinType::JoinLeft => side(&j.larg) || nullable(&j.rarg),
-                ast::JoinType::JoinRight => side(&j.rarg) || nullable(&j.larg),
+                ast::JoinType::JoinLeft => side(j.larg.as_ref()) || nullable(j.rarg.as_ref()),
+                ast::JoinType::JoinRight => side(j.rarg.as_ref()) || nullable(j.larg.as_ref()),
                 _ => false,
             }
         }
@@ -1418,7 +1430,7 @@ fn relation_source<'a>(
 /// (`relation_has_unique_index_for`), none of its columns used above the
 /// join (in the target list or a WHERE qual, which is pushed down).
 fn nullable_side_kept(
-    item: &Option<ast::Node>,
+    item: Option<&ast::Node>,
     j: &ast::JoinExpr,
     sel: &ast::SelectStmt,
     scope: &Scope,
@@ -1430,18 +1442,18 @@ fn nullable_side_kept(
             .values()
             .any(|i| i.indrelid == relid && i.indisunique)
     };
-    let rv = match item.as_ref() {
+    let rv = match item {
         Some(ast::Node::RangeVar(rv)) => rv,
         Some(ast::Node::JoinExpr(inner)) => {
-            let plain = |n: &Option<ast::Node>| match n.as_ref() {
+            let plain = |n: Option<&ast::Node>| match n {
                 Some(ast::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot)
                     .and_then(|s| s.relid)
                     .filter(|&r| !unique_index(r)),
                 _ => None,
             };
             return inner.jointype == ast::JoinType::JoinInner
-                && plain(&inner.larg).is_some()
-                && plain(&inner.rarg).is_some();
+                && plain(inner.larg.as_ref()).is_some()
+                && plain(inner.rarg.as_ref()).is_some();
         }
         _ => return false,
     };
@@ -1494,7 +1506,7 @@ fn nullable_side_kept(
     }
     // A column of the relation read above the join (outside sublinks,
     // whose names may be their own entries').
-    let reads = |n: &Option<ast::Node>| {
+    let reads = |n: Option<&ast::Node>| {
         contains_node_outside_sublinks(n, &|n| match n {
             typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                 let star = cr
@@ -1516,15 +1528,15 @@ fn nullable_side_kept(
             _ => false,
         })
     };
-    sel.target_list.iter().any(reads) || reads(&sel.where_clause)
+    sel.target_list.iter().any(|n| reads(n.as_ref())) || reads(sel.where_clause.as_ref())
 }
 
 /// Whether `n` holds a node `pred` accepts, not looking into sublinks.
 fn contains_node_outside_sublinks(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>) -> bool,
 ) -> bool {
-    let Some(n) = n.as_ref() else {
+    let Some(n) = n else {
         return false;
     };
     let mut todo = vec![n.to_ref()];
@@ -1546,7 +1558,7 @@ fn contains_node_outside_sublinks(
 /// whose branch constants decide (`eval_const_expressions`) — `true`
 /// then — reaching one.
 fn folds_to_column<'a>(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     scope: &'a Scope,
     snapshot: &PgCatalog,
 ) -> Option<(bool, &'a ScopeColumn)> {
@@ -1555,7 +1567,7 @@ fn folds_to_column<'a>(
     let mut casts = Vec::new();
     let mut n = n;
     loop {
-        match n.as_ref()? {
+        match n? {
             ast::Node::TypeCast(tc) => {
                 let tn = tc.type_name.as_ref()?;
                 if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() || tn.setof || tn.pct_type
@@ -1563,7 +1575,7 @@ fn folds_to_column<'a>(
                     return None;
                 }
                 casts.push(crate::ddl::util::resolve_type_name(tn, snapshot)?);
-                n = &tc.arg;
+                n = tc.arg.as_ref();
             }
             ast::Node::CaseExpr(c) if c.arg.is_none() => {
                 let mut next = None;
@@ -1573,14 +1585,14 @@ fn folds_to_column<'a>(
                     };
                     match case_when(None, w.expr.as_ref(), snapshot) {
                         Folded::Bool(true) => {
-                            next = Some(&w.result).filter(|r| r.is_some());
+                            next = w.result.as_ref().map(Some);
                             break;
                         }
                         Folded::Bool(false) | Folded::Null => {}
                         _ => return None,
                     }
                 }
-                n = next.or(Some(&c.defresult).filter(|d| d.is_some()))?;
+                n = next.or(c.defresult.as_ref().map(Some))?;
                 folded = true;
             }
             ast::Node::ColumnRef(cr) => {
@@ -1607,7 +1619,7 @@ fn scan_facts(
     if sel.op != SetOperation::SetopNone || !sel.values_lists.is_empty() {
         return Default::default();
     }
-    let source_of = |n: &Option<ast::Node>| match n.as_ref() {
+    let source_of = |n: Option<&ast::Node>| match n {
         Some(ast::Node::RangeVar(rv)) => {
             let name = rv
                 .alias
@@ -1626,31 +1638,33 @@ fn scan_facts(
             .map(|c| c.relkind)
     };
     let plain_tables = !sel.from_clause.is_empty()
-        && sel
-            .from_clause
-            .iter()
-            .all(|f| source_of(f).is_some_and(|s| matches!(relkind(s), Some(RelKind::Table))));
+        && sel.from_clause.iter().all(|f| {
+            source_of(f.as_ref()).is_some_and(|s| matches!(relkind(s), Some(RelKind::Table)))
+        });
     // Tables and partitioned tables (with their partitions), one of them
     // a partitioned table with no partition to scan: its relation is a
     // dummy one, and so is the join (`expand_partitioned_rtentry`).
     let tables = !sel.from_clause.is_empty()
         && sel.from_clause.iter().all(|f| {
             matches!(f.as_ref(), Some(ast::Node::RangeVar(rv)) if rv.inh)
-                && source_of(f).is_some_and(|s| {
+                && source_of(f.as_ref()).is_some_and(|s| {
                     matches!(relkind(s), Some(RelKind::Table | RelKind::Partitioned))
                 })
         });
     let no_partition = tables
         && sel.from_clause.iter().any(|f| {
-            source_of(f).and_then(|s| s.relid).is_some_and(|r| {
-                snapshot.pg_class.get(&r).map(|c| c.relkind) == Some(RelKind::Partitioned)
-                    && !has_leaf_partition(snapshot, r)
-            })
+            source_of(f.as_ref())
+                .and_then(|s| s.relid)
+                .is_some_and(|r| {
+                    snapshot.pg_class.get(&r).map(|c| c.relkind) == Some(RelKind::Partitioned)
+                        && !has_leaf_partition(snapshot, r)
+                })
         });
-    let calls_in_target = sel
-        .target_list
-        .iter()
-        .any(|t| contains_node(t, &|n| matches!(n, typedpg_pg_query::NodeRef::FuncCall(_))));
+    let calls_in_target = sel.target_list.iter().any(|t| {
+        contains_node(t.as_ref(), &|n| {
+            matches!(n, typedpg_pg_query::NodeRef::FuncCall(_))
+        })
+    });
     let has_aggs = crate::grouping::level_info(sel).is_some_and(|l| l.has_aggs);
     let plain_level = sel.group_clause.is_empty()
         && sel.having_clause.is_none()
@@ -1681,12 +1695,12 @@ fn scan_facts(
         && no_limit_node(sel.limit_offset.as_ref(), true)
         && (no_partition
             || (sel.where_clause.is_some()
-                && crate::expr::plan_fold::fold_qual(&sel.where_clause, snapshot)
+                && crate::expr::plan_fold::fold_qual(sel.where_clause.as_ref(), snapshot)
                     == Folded::Bool(false)));
     // Row marks: each locked table adds a resjunk `ctid` entry.
     let row_marks = sel.locking_clause.iter().any(|l| match l.as_ref() {
         Some(ast::Node::LockingClause(lc)) => sel.from_clause.iter().any(|f| {
-            source_of(f).is_some_and(|s| {
+            source_of(f.as_ref()).is_some_and(|s| {
                 matches!(relkind(s), Some(RelKind::Table | RelKind::Partitioned))
                     && (lc.locked_rels.is_empty()
                         || lc.locked_rels.iter().any(|r| {
@@ -1742,10 +1756,12 @@ fn scan_facts(
         && sel.sort_clause.is_empty()
         && (sel.from_clause.len() == 1 || sel.where_clause.is_none())
         && sel.from_clause.iter().all(|f| {
-            source_of(f).and_then(|s| s.relid).is_some_and(|r| {
-                !snapshot.pg_index.values().any(|i| i.indrelid == r)
-                    && !snapshot.pg_inherits.iter().any(|i| i.inhparent == r)
-            })
+            source_of(f.as_ref())
+                .and_then(|s| s.relid)
+                .is_some_and(|r| {
+                    !snapshot.pg_index.values().any(|i| i.indrelid == r)
+                        && !snapshot.pg_inherits.iter().any(|i| i.inhparent == r)
+                })
         });
     // Its sorted paths are index scans, or (over partitions or inheritance
     // children) MergeAppends of them or Appends in partition-key order:
@@ -1755,7 +1771,7 @@ fn scan_facts(
     // collation — and no ORDER BY, grouping or window of its own).
     let collated_sorts = !sel.from_clause.is_empty()
         && sel.from_clause.iter().all(|f| {
-            source_of(f).is_some_and(|s| {
+            source_of(f.as_ref()).is_some_and(|s| {
                 matches!(
                     relkind(s),
                     Some(RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView)
@@ -1795,10 +1811,10 @@ fn has_leaf_partition(snapshot: &PgCatalog, rel: crate::oid::PgClassOid) -> bool
 
 /// Whether `n` holds a node `pred` accepts.
 fn contains_node(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>) -> bool,
 ) -> bool {
-    let mut todo: Vec<_> = n.as_ref().map(|n| n.to_ref()).into_iter().collect();
+    let mut todo: Vec<_> = n.map(|n| n.to_ref()).into_iter().collect();
     while let Some(n) = todo.pop() {
         if pred(n) {
             return true;
@@ -1909,7 +1925,7 @@ enum KeyRef<'a> {
     /// A select-list entry (expanded-target index).
     Target(usize),
     /// An expression of its own.
-    Expr(&'a Option<ast::Node>),
+    Expr(Option<&'a ast::Node>),
 }
 
 /// The expression of expanded select-list entry `i`, a column reference for
@@ -1941,7 +1957,7 @@ fn target_expr(targets: &[ExpandedTarget<'_>], i: usize) -> Option<Option<ast::N
 /// it) — `{clause} "a" is ambiguous` (42702) when several output columns
 /// of that name have differing expressions; anything else is an expression.
 fn sql92_key<'a>(
-    node: &'a Option<ast::Node>,
+    node: Option<&'a ast::Node>,
     clause: &str,
     targets: &[ExpandedTarget<'_>],
     columns: &[RawColumn],
@@ -1954,7 +1970,7 @@ fn sql92_key<'a>(
             _ => KeyRef::Expr(node),
         });
     }
-    let Some(ast::Node::ColumnRef(cr)) = node.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = node else {
         return Ok(KeyRef::Expr(node));
     };
     let parts = expr::extract_string_fields(&cr.fields);
@@ -1978,7 +1994,9 @@ fn sql92_key<'a>(
     let first_expr = target_expr(targets, first);
     for &other in &matches[1..] {
         let same = match (&first_expr, target_expr(targets, other)) {
-            (Some(a), Some(b)) => grouping::same_level_exprs_equal(a, &b, scope, snapshot),
+            (Some(a), Some(b)) => {
+                grouping::same_level_exprs_equal(a.as_ref(), b.as_ref(), scope, snapshot)
+            }
             _ => false,
         };
         if !same {
@@ -2010,14 +2028,15 @@ fn check_sort_group_keys(
     let scope = ctx.scope;
     // `(key, operators needed — None for ORDER BY … USING, location)`.
     let mut keys: Vec<(KeyRef<'_>, Option<KeyUse>, i32)> = Vec::new();
-    let loc = |n: &Option<ast::Node>| crate::error::node_location(n).unwrap_or(-1);
-    fn sort_items(order: &[Option<ast::Node>]) -> Vec<(&Option<ast::Node>, bool)> {
+    let loc = |n: Option<&ast::Node>| crate::error::node_location(n).unwrap_or(-1);
+    fn sort_items(order: &[Option<ast::Node>]) -> Vec<(Option<&ast::Node>, bool)> {
         order
             .iter()
             .filter_map(|o| match o.as_ref()? {
-                ast::Node::SortBy(sb) if sb.node.is_some() => {
-                    Some((&sb.node, sb.sortby_dir == ast::SortByDir::SortbyUsing))
-                }
+                ast::Node::SortBy(sb) if sb.node.is_some() => Some((
+                    sb.node.as_ref(),
+                    sb.sortby_dir == ast::SortByDir::SortbyUsing,
+                )),
                 _ => None,
             })
             .collect()
@@ -2026,12 +2045,13 @@ fn check_sort_group_keys(
         let key = sql92_key(inner, "ORDER BY", targets, columns, scope, ctx.snapshot)?;
         keys.push((key, (!using).then_some(KeyUse::Sort), loc(inner)));
     }
-    let mut stack: Vec<&Option<ast::Node>> = sel.group_clause.iter().rev().collect();
+    let mut stack: Vec<Option<&ast::Node>> =
+        sel.group_clause.iter().map(Option::as_ref).rev().collect();
     while let Some(g) = stack.pop() {
-        if let Some(ast::Node::GroupingSet(gs)) = g.as_ref() {
-            stack.extend(gs.content.iter().rev());
+        if let Some(ast::Node::GroupingSet(gs)) = g {
+            stack.extend(gs.content.iter().map(Option::as_ref).rev());
         } else if let Some(items) = grouping::implicit_row_items(g) {
-            stack.extend(items.iter().rev());
+            stack.extend(items.iter().map(Option::as_ref).rev());
         } else {
             let key = sql92_key(g, "GROUP BY", targets, columns, scope, ctx.snapshot)?;
             keys.push((key, Some(KeyUse::Group), loc(g)));
@@ -2049,8 +2069,15 @@ fn check_sort_group_keys(
         }
     } else {
         for d in sel.distinct_clause.iter().filter(|n| n.is_some()) {
-            let key = sql92_key(d, "DISTINCT ON", targets, columns, scope, ctx.snapshot)?;
-            keys.push((key, Some(KeyUse::Group), loc(d)));
+            let key = sql92_key(
+                d.as_ref(),
+                "DISTINCT ON",
+                targets,
+                columns,
+                scope,
+                ctx.snapshot,
+            )?;
+            keys.push((key, Some(KeyUse::Group), loc(d.as_ref())));
         }
     }
     // Windows and aggregates of this level.
@@ -2062,21 +2089,21 @@ fn check_sort_group_keys(
             _ => None,
         })
         .collect();
-    let mut level_exprs: Vec<&Option<ast::Node>> = sel
+    let mut level_exprs: Vec<Option<&ast::Node>> = sel
         .target_list
         .iter()
         .filter_map(|t| match t.as_ref()? {
-            ast::Node::ResTarget(rt) if rt.val.is_some() => Some(&rt.val),
+            ast::Node::ResTarget(rt) if rt.val.is_some() => Some(rt.val.as_ref()),
             _ => None,
         })
         .collect();
-    level_exprs.extend(Some(&sel.having_clause).filter(|h| h.is_some()));
+    level_exprs.extend(sel.having_clause.as_ref().map(Some));
     level_exprs.extend(sort_items(&sel.sort_clause).into_iter().map(|(n, _)| n));
-    let mut agg_keys: Vec<(&Option<ast::Node>, KeyUse)> = Vec::new();
+    let mut agg_keys: Vec<(Option<&ast::Node>, KeyUse)> = Vec::new();
     for e in level_exprs {
         visit_same_level(e, &mut |n| {
             // SQL/JSON aggregates: their ORDER BY and window.
-            let json_agg = match n.as_ref() {
+            let json_agg = match n {
                 Some(ast::Node::JsonObjectAgg(a)) => a.constructor.as_deref(),
                 Some(ast::Node::JsonArrayAgg(a)) => a.constructor.as_deref(),
                 _ => None,
@@ -2089,14 +2116,14 @@ fn check_sort_group_keys(
                         .map(|(n, _)| (n, KeyUse::Sort)),
                 );
             }
-            let Some(ast::Node::FuncCall(fc)) = n.as_ref() else {
+            let Some(ast::Node::FuncCall(fc)) = n else {
                 return;
             };
             if let Some(over) = fc.over.as_deref() {
                 windows.push(over);
             }
             if fc.agg_distinct {
-                agg_keys.extend(fc.args.iter().map(|a| (a, KeyUse::AggDistinct)));
+                agg_keys.extend(fc.args.iter().map(|a| (a.as_ref(), KeyUse::AggDistinct)));
             }
             agg_keys.extend(
                 sort_items(&fc.agg_order)
@@ -2106,11 +2133,13 @@ fn check_sort_group_keys(
         });
     }
     for wd in windows {
-        keys.extend(
-            wd.partition_clause
-                .iter()
-                .map(|p| (KeyRef::Expr(p), Some(KeyUse::Group), loc(p))),
-        );
+        keys.extend(wd.partition_clause.iter().map(|p| {
+            (
+                KeyRef::Expr(p.as_ref()),
+                Some(KeyUse::Group),
+                loc(p.as_ref()),
+            )
+        }));
         keys.extend(
             sort_items(&wd.order_clause)
                 .into_iter()
@@ -2131,10 +2160,10 @@ fn check_sort_group_keys(
                 target_expr(targets, *i)
             }
             KeyRef::Expr(n)
-                if expr::infer_expr(n, ctx, &mut params.clone(), TypeGoal::NONE)
+                if expr::infer_expr(*n, ctx, &mut params.clone(), TypeGoal::NONE)
                     .is_ok_and(|t| t.unknown_value) =>
             {
-                Some((*n).clone())
+                Some((*n).cloned())
             }
             _ => None,
         };
@@ -2151,7 +2180,7 @@ fn check_sort_group_keys(
         KeyRef::Target(i) => columns.get(*i).map(|c| c.type_oid),
         KeyRef::Expr(n) => {
             let mut scratch = params.clone();
-            expr::infer_expr(n, ctx, &mut scratch, TypeGoal::NONE)
+            expr::infer_expr(*n, ctx, &mut scratch, TypeGoal::NONE)
                 .ok()
                 .map(|t| t.type_oid)
         }
@@ -2172,10 +2201,10 @@ fn check_sort_group_keys(
         }
         let expr = match key {
             KeyRef::Target(i) => target_expr(targets, *i),
-            KeyRef::Expr(n) => Some((*n).clone()),
+            KeyRef::Expr(n) => Some((*n).cloned()),
         };
         if let Some(e) = expr {
-            crate::clause::collation_state(&e, ctx, params)
+            crate::clause::collation_state(e.as_ref(), ctx, params)
                 .check_determinate(ctx.snapshot, Some(*location))?;
         }
     }
@@ -2230,12 +2259,12 @@ fn values_sort_and_limit(
             if inner.is_none() {
                 continue;
             }
-            if let Some(ord) = sql92_position_of(inner, "ORDER BY")? {
+            if let Some(ord) = sql92_position_of(inner.as_ref(), "ORDER BY")? {
                 if ord < 1 || ord as usize > columns.len() {
                     return Err(crate::pgmsg::position_not_in_select_list(
                         "ORDER BY",
                         ord,
-                        crate::error::node_location(inner)
+                        crate::error::node_location(inner.as_ref())
                             .and_then(crate::error::SourceSpan::from_node_token),
                     )
                     .finalize_implicit());
@@ -2243,7 +2272,7 @@ fn values_sort_and_limit(
                 continue;
             }
             expr::infer_expr(
-                inner,
+                inner.as_ref(),
                 expr::Ctx::new(&scope, &null_ctx, snapshot),
                 params,
                 TypeGoal::NONE,
@@ -2261,12 +2290,12 @@ fn values_sort_and_limit(
 /// WINDOW clause. SubLinks are skipped — their windows belong to the inner
 /// query.
 fn check_window_refs(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     defined: &std::collections::HashSet<&str>,
 ) -> Result<(), AnalyzeError> {
     let mut missing: Option<(&str, i32)> = None;
     visit_same_level(node, &mut |n| {
-        let over = match n.as_ref() {
+        let over = match n {
             Some(ast::Node::FuncCall(fc)) => fc.over.as_deref(),
             Some(ast::Node::JsonObjectAgg(a)) => {
                 a.constructor.as_deref().and_then(|c| c.over.as_deref())
@@ -2318,15 +2347,14 @@ pub(crate) fn sql92_position(node: &ast::Node, clause: &str) -> Result<Option<i6
 }
 
 /// [`sql92_position`] of a list cell: a NULL one is no constant.
-fn sql92_position_of(node: &Option<ast::Node>, clause: &str) -> Result<Option<i64>, AnalyzeError> {
-    node.as_ref()
-        .map_or(Ok(None), |n| sql92_position(n, clause))
+fn sql92_position_of(node: Option<&ast::Node>, clause: &str) -> Result<Option<i64>, AnalyzeError> {
+    node.map_or(Ok(None), |n| sql92_position(n, clause))
 }
 
 /// If `node` is a bare integer literal, return its value — GROUP BY / ORDER
 /// BY treat those as 1-based projection ordinals.
-fn ordinal_of(node: &Option<ast::Node>) -> Option<i64> {
-    if let Some(ast::Node::AConst(ac)) = node.as_ref()
+fn ordinal_of(node: Option<&ast::Node>) -> Option<i64> {
+    if let Some(ast::Node::AConst(ac)) = node
         && !ac.isnull
         && let Some(typedpg_pg_query::ast::AConstValue::Integer(i)) = &ac.val
     {
@@ -2341,10 +2369,17 @@ fn ordinal_of(node: &Option<ast::Node>) -> Option<i64> {
 /// `ARRAY[…]` and `IN (…)` lists among them. Used to compare an ORDER BY
 /// expression against the projection entries (PG's "appears in select
 /// list" test), where byte positions necessarily differ.
-pub(crate) fn node_fingerprint(node: &Option<ast::Node>) -> String {
+pub(crate) fn node_fingerprint(node: Option<&ast::Node>) -> String {
     use typedpg_pg_query::Equal;
     let mut out = String::new();
-    node.equal_key(&mut out);
+    // The key of the `Option<Node>` it borrows.
+    match node {
+        Some(n) => {
+            out.push('?');
+            n.equal_key(&mut out);
+        }
+        None => out.push('~'),
+    }
     out
 }
 
@@ -2352,13 +2387,13 @@ pub(crate) fn node_fingerprint(node: &Option<ast::Node>) -> String {
 /// select list — as a structurally equal expression or as a select-list
 /// alias (ordinals are handled by the caller).
 fn sort_expr_in_select_list(
-    inner: &Option<ast::Node>,
+    inner: Option<&ast::Node>,
     target_list: &[Option<ast::Node>],
     select_aliases: &std::collections::HashSet<String>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
-    if let Some(ast::Node::ColumnRef(cr)) = inner.as_ref() {
+    if let Some(ast::Node::ColumnRef(cr)) = inner {
         let parts = expr::extract_string_fields(&cr.fields);
         if let [single] = parts.as_slice()
             && select_aliases.contains(single)
@@ -2367,7 +2402,7 @@ fn sort_expr_in_select_list(
         }
     }
     // Callers pass a present key.
-    let Some(inner) = inner.as_ref() else {
+    let Some(inner) = inner else {
         return false;
     };
     let want = grouping::typed_fingerprint(inner, scope, snapshot);
@@ -2387,7 +2422,7 @@ fn sort_expr_in_select_list(
 /// expressions. The walk type-checks parameters and rejects aggregates /
 /// window calls inside the grouping expressions (PG forbids those too).
 fn walk_group_clause_node(
-    group_node: &Option<ast::Node>,
+    group_node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     select_aliases: &std::collections::HashSet<String>,
@@ -2403,14 +2438,14 @@ fn walk_group_clause_node(
     // A grouping set's members — and the members of an implicit row
     // `(a, b)`, which flatten_grouping_sets turns into a list of grouping
     // expressions — are grouping expressions of their own.
-    let members = match group_node.as_ref() {
+    let members = match group_node {
         Some(ast::Node::GroupingSet(gs)) => Some(&gs.content),
         _ => grouping::implicit_row_items(group_node),
     };
     if let Some(members) = members {
         for inner in members {
             walk_group_clause_node(
-                inner,
+                inner.as_ref(),
                 expr::Ctx::new(scope, null_ctx, snapshot),
                 params,
                 select_aliases,
@@ -2418,7 +2453,7 @@ fn walk_group_clause_node(
             )?;
         }
         // transformGroupingSet: a CUBE over more than 12 elements.
-        if let Some(ast::Node::GroupingSet(gs)) = group_node.as_ref()
+        if let Some(ast::Node::GroupingSet(gs)) = group_node
             && gs.kind == ast::GroupingSetKind::GroupingSetCube
             && gs.content.len() > 12
         {
@@ -2455,7 +2490,7 @@ fn walk_group_clause_node(
     // (colNameToVar — a FROM entry's name doesn't count) but an output
     // column's name stands for that select-list entry. `GROUP BY s` with
     // `SELECT s::c FROM (…) s` groups by `s::c`, not the whole row `s`.
-    if let Some(ast::Node::ColumnRef(cr)) = group_node.as_ref()
+    if let Some(ast::Node::ColumnRef(cr)) = group_node
         && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
         && cr.fields.len() == 1
         && matches!(
@@ -2480,7 +2515,7 @@ fn walk_group_clause_node(
         if !is_select_alias_reference(group_node, select_aliases, &e) {
             return Err(e);
         }
-        let alias = expr::extract_string_fields(match group_node.as_ref() {
+        let alias = expr::extract_string_fields(match group_node {
             Some(ast::Node::ColumnRef(cr)) => &cr.fields,
             _ => &[],
         });
@@ -2509,10 +2544,10 @@ fn walk_group_clause_node(
 /// output name — a bare name, which findTargetlistEntrySQL92 matches
 /// against the output names before the input columns.
 fn aliased_target<'a>(
-    key: &Option<ast::Node>,
+    key: Option<&ast::Node>,
     targets: &[ExpandedTarget<'a>],
 ) -> Option<&'a ast::ResTarget> {
-    let Some(ast::Node::ColumnRef(cr)) = key.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = key else {
         return None;
     };
     let [field] = cr.fields.as_slice() else {
@@ -2537,7 +2572,7 @@ fn resolve_unknown_target(
     snapshot: &crate::pg_catalog::PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    match expr::bare_param(&rt.val, snapshot) {
+    match expr::bare_param(rt.val.as_ref(), snapshot) {
         Some(p) if params.is_untyped_output(p.location) => {
             expr::coerce_untyped_param(p, oid::TEXT, snapshot, params)
         }
@@ -2556,7 +2591,7 @@ fn check_group_target_has_no_aggregates(
     if let Some(rt) = target
         && rt.val.is_some()
     {
-        let kinds = expr::detect_func_kinds(&rt.val, snapshot);
+        let kinds = expr::detect_func_kinds(rt.val.as_ref(), snapshot);
         if kinds.has_aggregate || kinds.has_grouping {
             return Err(crate::error::RawError::new(
                 AnalyzeError::GroupingError(
@@ -2578,14 +2613,14 @@ fn check_group_target_has_no_aggregates(
 /// that isn't visible in the FROM scope. Any other error (type mismatch,
 /// undefined function, etc.) is left to propagate.
 fn is_select_alias_reference(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     aliases: &std::collections::HashSet<String>,
     err: &AnalyzeError,
 ) -> bool {
     if !matches!(err, AnalyzeError::UndefinedColumn(_)) {
         return false;
     }
-    let Some(ast::Node::ColumnRef(cr)) = node.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = node else {
         return false;
     };
     if cr.fields.len() != 1 {
@@ -2629,21 +2664,21 @@ fn select_lock_blocker(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> Option<&'
     if sel.having_clause.is_some() {
         return Some("HAVING clause");
     }
-    let level_exprs: Vec<&Option<ast::Node>> = sel
+    let level_exprs: Vec<Option<&ast::Node>> = sel
         .target_list
         .iter()
         .filter_map(|t| match t.as_ref()? {
-            ast::Node::ResTarget(rt) if rt.val.is_some() => Some(&rt.val),
+            ast::Node::ResTarget(rt) if rt.val.is_some() => Some(rt.val.as_ref()),
             _ => None,
         })
         .chain(sel.sort_clause.iter().filter_map(|n| match n.as_ref()? {
-            ast::Node::SortBy(sb) if sb.node.is_some() => Some(&sb.node),
+            ast::Node::SortBy(sb) if sb.node.is_some() => Some(sb.node.as_ref()),
             _ => None,
         }))
         .collect();
     let kinds: Vec<_> = level_exprs
         .iter()
-        .map(|e| expr::detect_func_kinds(e, snapshot))
+        .map(|e| expr::detect_func_kinds(*e, snapshot))
         .collect();
     if kinds.iter().any(|k| k.has_aggregate) {
         return Some("aggregate functions");
@@ -2665,21 +2700,21 @@ pub(crate) fn subquery_lock_blocker(
     sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Option<&'static str> {
-    fn from_item_blocker(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<&'static str> {
-        match n.as_ref()? {
+    fn from_item_blocker(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<&'static str> {
+        match n? {
             ast::Node::RangeSubselect(rs) => match rs.subquery.as_ref()? {
                 ast::Node::SelectStmt(s) => subquery_lock_blocker(s, snapshot),
                 _ => None,
             },
-            ast::Node::JoinExpr(j) => from_item_blocker(&j.larg, snapshot)
-                .or_else(|| from_item_blocker(&j.rarg, snapshot)),
+            ast::Node::JoinExpr(j) => from_item_blocker(j.larg.as_ref(), snapshot)
+                .or_else(|| from_item_blocker(j.rarg.as_ref(), snapshot)),
             _ => None,
         }
     }
     select_lock_blocker(sel, snapshot).or_else(|| {
         sel.from_clause
             .iter()
-            .find_map(|n| from_item_blocker(n, snapshot))
+            .find_map(|n| from_item_blocker(n.as_ref(), snapshot))
     })
 }
 
@@ -2821,25 +2856,27 @@ pub(crate) fn analyze_limit_offset(
         if limit_node.is_none() {
             continue;
         }
-        crate::clause::coerce_clause_expr(limit_node, ctx, params, kind)?;
+        crate::clause::coerce_clause_expr(limit_node.as_ref(), ctx, params, kind)?;
         // The conversion to `bigint` is folded by the planner.
         if expr::plan_time_checks()
             && let Some(e) = crate::fold::conversion_error(
-                limit_node,
+                limit_node.as_ref(),
                 crate::pg_catalog::oid::INT8,
                 None,
                 ctx.snapshot,
             )
-            && let Some(e) =
-                expr::plan_time_error(crate::error::node_location(limit_node), e.at(limit_node))
+            && let Some(e) = expr::plan_time_error(
+                crate::error::node_location(limit_node.as_ref()),
+                e.at(limit_node.as_ref()),
+            )
         {
             return Err(e);
         }
-        check_no_srf_in_clause(limit_node, ctx.snapshot, label)?;
+        check_no_srf_in_clause(limit_node.as_ref(), ctx.snapshot, label)?;
         let mut var: Option<i32> = None;
-        visit_same_level(limit_node, &mut |e| {
+        visit_same_level(limit_node.as_ref(), &mut |e| {
             if var.is_none()
-                && let Some(ast::Node::ColumnRef(cr)) = e.as_ref()
+                && let Some(ast::Node::ColumnRef(cr)) = e
                 && references_local_column(cr, ctx.scope)
             {
                 var = Some(cr.location);
@@ -2908,7 +2945,7 @@ fn check_order_by_using(
         if inner.is_none() {
             continue;
         }
-        let Some(ty) = sort_expr_type(inner, target_list, columns, ctx, params) else {
+        let Some(ty) = sort_expr_type(inner.as_ref(), target_list, columns, ctx, params) else {
             continue;
         };
         let op = expr::extract_string_fields(&sb.use_op)
@@ -2942,7 +2979,7 @@ fn check_order_by_using(
 /// the target list (`findTargetlistEntrySQL92`), anything else is inferred
 /// on a scratch parameter collector.
 fn sort_expr_type(
-    inner: &Option<ast::Node>,
+    inner: Option<&ast::Node>,
     target_list: &[Option<ast::Node>],
     columns: &[RawColumn],
     ctx: Ctx<'_>,
@@ -2973,7 +3010,7 @@ enum SortKey {
 /// bare name matching an output column is that column, and otherwise the
 /// expression matches a select-list entry it is equal to.
 fn sort_target_key(
-    inner: &Option<ast::Node>,
+    inner: Option<&ast::Node>,
     target_list: &[Option<ast::Node>],
     columns: &[RawColumn],
     scope: &Scope,
@@ -2984,14 +3021,14 @@ fn sort_target_key(
     {
         return SortKey::Target(ord as usize - 1);
     }
-    if let Some(ast::Node::ColumnRef(cr)) = inner.as_ref()
+    if let Some(ast::Node::ColumnRef(cr)) = inner
         && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
         && let Some(i) = columns.iter().position(|c| &c.name == name)
     {
         return SortKey::Target(i);
     }
     // Callers pass a present key.
-    let Some(inner) = inner.as_ref() else {
+    let Some(inner) = inner else {
         return SortKey::Expr(node_fingerprint(inner));
     };
     let fp = grouping::typed_fingerprint(inner, scope, snapshot);
@@ -3027,7 +3064,7 @@ fn check_distinct_on_matches_order_by(
         .distinct_clause
         .iter()
         .filter(|n| n.is_some())
-        .map(|n| sort_target_key(n, &sel.target_list, columns, scope, snapshot))
+        .map(|n| sort_target_key(n.as_ref(), &sel.target_list, columns, scope, snapshot))
         .collect();
     if distinct.is_empty() || sel.sort_clause.is_empty() {
         return Ok(());
@@ -3052,7 +3089,7 @@ fn check_distinct_on_matches_order_by(
         if inner.is_none() {
             continue;
         }
-        let key = sort_target_key(inner, &sel.target_list, columns, scope, snapshot);
+        let key = sort_target_key(inner.as_ref(), &sel.target_list, columns, scope, snapshot);
         if let Some(d) = distinct.iter().find(|d| **d == key) {
             if skipped {
                 return Err(err());

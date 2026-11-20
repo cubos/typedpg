@@ -36,7 +36,11 @@ pub fn create_event_trigger(
             stmt.trigname
         )));
     }
-    let parts: Vec<&str> = stmt.funcname.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = stmt
+        .funcname
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     let (schema, name) = match parts.as_slice() {
         [name] => (None, *name),
         [schema, name] => (Some(*schema), *name),
@@ -92,7 +96,11 @@ fn check_filters(stmt: &CreateEventTrigStmt) -> Result<(), DdlError> {
             )));
         }
         tags = Some(match def.arg.as_ref() {
-            Some(ast::Node::List(list)) => list.items.iter().filter_map(node_string).collect(),
+            Some(ast::Node::List(list)) => list
+                .items
+                .iter()
+                .filter_map(|n| node_string(n.as_ref()))
+                .collect(),
             _ => Vec::new(),
         });
     }
@@ -148,7 +156,7 @@ pub fn alter_event_trigger(interp: &PgCatalog, stmt: &AlterEventTrigStmt) -> Res
 /// DROP EVENT TRIGGER [IF EXISTS] name.
 pub(crate) fn drop_event_trigger(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = node_string(obj_node).map(str::to_owned) else {
@@ -167,7 +175,7 @@ pub(crate) fn rename_event_trigger(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = node_string(&stmt.object).map(str::to_owned) else {
+    let Some(old) = node_string(stmt.object.as_ref()).map(str::to_owned) else {
         return Ok(());
     };
     if interp

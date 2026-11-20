@@ -740,8 +740,8 @@ pub(crate) fn own_aliases(scope: &Scope) -> HashSet<String> {
 
 /// Intersection of the facts of every node (`None` when there is none).
 fn intersection<'a>(
-    nodes: impl IntoIterator<Item = &'a Option<ast::Node>>,
-    mut f: impl FnMut(&'a Option<ast::Node>) -> Facts,
+    nodes: impl IntoIterator<Item = Option<&'a ast::Node>>,
+    mut f: impl FnMut(Option<&'a ast::Node>) -> Facts,
 ) -> Facts {
     let mut acc: Option<Facts> = None;
     for n in nodes {
@@ -759,7 +759,7 @@ fn intersection<'a>(
 /// non-NULL (below the top level) — proves non-NULL. Column references
 /// resolve against `scope`, as the qual's own resolution did.
 pub(crate) fn nonnullable(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     top_level: bool,
     scope: &Scope,
     log: &StrictLog,
@@ -784,15 +784,15 @@ pub(crate) fn nonnullable(
     facts
 }
 
-fn is_and_or(n: &Option<ast::Node>) -> bool {
-    matches!(n.as_ref(), Some(ast::Node::BoolExpr(b))
+fn is_and_or(n: Option<&ast::Node>) -> bool {
+    matches!(n, Some(ast::Node::BoolExpr(b))
         if b.boolop != ast::BoolExprType::NotExpr)
 }
 
 /// The columns of `node` that, replaced by NULL, make it evaluate to a
 /// value `excluded` says it doesn't have (see [`subst`]).
 fn substituted(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
@@ -829,18 +829,17 @@ fn distinct_facts(
         return Facts::default();
     }
     let (l, r) = (&e.lexpr, &e.rexpr);
-    let is_null =
-        |n: &Option<ast::Node>| matches!(n.as_ref(), Some(ast::Node::AConst(c)) if c.isnull);
-    let walk = |n: &Option<ast::Node>| nonnullable(n, false, scope, log, snapshot);
-    let other = if is_null(r) {
+    let is_null = |n: Option<&ast::Node>| matches!(n, Some(ast::Node::AConst(c)) if c.isnull);
+    let walk = |n: Option<&ast::Node>| nonnullable(n, false, scope, log, snapshot);
+    let other = if is_null(r.as_ref()) {
         Some(l)
-    } else if is_null(l) {
+    } else if is_null(l.as_ref()) {
         Some(r)
     } else {
         None
     };
     match other {
-        Some(x) if distinct => walk(x),
+        Some(x) if distinct => walk(x.as_ref()),
         Some(x) => match scalar_column(x.as_ref(), scope, snapshot) {
             Some(col) => Facts::null(col),
             None => Facts::default(),
@@ -849,10 +848,10 @@ fn distinct_facts(
         None => {
             let mut f = Facts::default();
             if log.is_strict(e.location, StrictNode::DistinctRightNonNull) {
-                f = f.union(walk(l));
+                f = f.union(walk(l.as_ref()));
             }
             if log.is_strict(e.location, StrictNode::DistinctLeftNonNull) {
-                f = f.union(walk(r));
+                f = f.union(walk(r.as_ref()));
             }
             f
         }
@@ -861,11 +860,11 @@ fn distinct_facts(
 
 /// A row constructor's fields, unless one expands into several (`t.*`,
 /// `(x).*`): then they don't pair up with the other side's.
-fn plain_row_fields(n: &Option<ast::Node>) -> Option<&[Option<ast::Node>]> {
-    let Some(ast::Node::RowExpr(r)) = n.as_ref() else {
+fn plain_row_fields(n: Option<&ast::Node>) -> Option<&[Option<ast::Node>]> {
+    let Some(ast::Node::RowExpr(r)) = n else {
         return None;
     };
-    let star = |f: &Option<ast::Node>| match f.as_ref() {
+    let star = |f: Option<&ast::Node>| match f {
         Some(ast::Node::ColumnRef(c)) => c
             .fields
             .iter()
@@ -876,24 +875,23 @@ fn plain_row_fields(n: &Option<ast::Node>) -> Option<&[Option<ast::Node>]> {
             .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_)))),
         _ => false,
     };
-    (!r.args.iter().any(star)).then_some(r.args.as_slice())
+    (!r.args.iter().any(|n| star(n.as_ref()))).then_some(r.args.as_slice())
 }
 
-fn is_row(n: &Option<ast::Node>) -> bool {
-    matches!(n.as_ref(), Some(ast::Node::RowExpr(_)))
+fn is_row(n: Option<&ast::Node>) -> bool {
+    matches!(n, Some(ast::Node::RowExpr(_)))
 }
 
 fn nonnullable_node(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     top_level: bool,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> Facts {
-    let walk = |n: &Option<ast::Node>, top: bool| nonnullable(n, top, scope, log, snapshot);
-    let walk_opt =
-        |n: &Option<ast::Node>, top: bool| n.as_ref().map(|_| walk(n, top)).unwrap_or_default();
-    let Some(inner) = node.as_ref() else {
+    let walk = |n: Option<&ast::Node>, top: bool| nonnullable(n, top, scope, log, snapshot);
+    let walk_opt = |n: Option<&ast::Node>, top: bool| n.map(|_| walk(n, top)).unwrap_or_default();
+    let Some(inner) = node else {
         return Facts::default();
     };
     match inner {
@@ -912,21 +910,25 @@ fn nonnullable_node(
             ast::BoolExprType::AndExpr if top_level => b
                 .args
                 .iter()
-                .fold(Facts::default(), |acc, a| acc.union(walk(a, true))),
+                .fold(Facts::default(), |acc, a| acc.union(walk(a.as_ref(), true))),
             ast::BoolExprType::AndExpr | ast::BoolExprType::OrExpr => {
-                intersection(&b.args, |a| walk(a, top_level))
+                intersection(b.args.iter().map(Option::as_ref), |a| walk(a, top_level))
             }
             // NOT is strict. At the top level `NOT e` TRUE also means `e`
             // FALSE, so not TRUE: `NOT (x IS NULL)` proves `x`.
             ast::BoolExprType::NotExpr => b.args.iter().fold(Facts::default(), |acc, a| {
-                let mut below = walk(a, false);
+                let mut below = walk(a.as_ref(), false);
                 if top_level && let Some((col, _)) = a.as_ref().and_then(|a| plain_column(a, scope))
                 {
                     below.equals.insert(col, Literal::boolean(false));
                 }
                 if top_level {
-                    acc.union(below)
-                        .union(nonnullable_unless_true(a, scope, log, snapshot))
+                    acc.union(below).union(nonnullable_unless_true(
+                        a.as_ref(),
+                        scope,
+                        log,
+                        snapshot,
+                    ))
                 } else {
                     acc.union(below)
                 }
@@ -956,26 +958,32 @@ fn nonnullable_node(
                 // top level. Below it a FALSE pair hides a NULL one. An
                 // ordering comparison is NULL when its first pair is (the
                 // row comparison stops at the first NULL pair).
-                K::AexprOp if is_row(&e.lexpr) && is_row(&e.rexpr) => {
-                    let (Some(l), Some(r)) =
-                        (plain_row_fields(&e.lexpr), plain_row_fields(&e.rexpr))
-                    else {
+                K::AexprOp if is_row(e.lexpr.as_ref()) && is_row(e.rexpr.as_ref()) => {
+                    let (Some(l), Some(r)) = (
+                        plain_row_fields(e.lexpr.as_ref()),
+                        plain_row_fields(e.rexpr.as_ref()),
+                    ) else {
                         return Facts::default();
                     };
                     if !top_level || l.len() != r.len() {
                         return Facts::default();
                     }
-                    let pair = |(a, b): (&Option<ast::Node>, &Option<ast::Node>)| {
+                    let pair = |(a, b): (Option<&ast::Node>, Option<&ast::Node>)| {
                         walk(a, false).union(walk(b, false))
                     };
                     match op.as_str() {
                         "=" => l
                             .iter()
-                            .zip(r)
+                            .map(Option::as_ref)
+                            .zip(r.iter().map(Option::as_ref))
                             .fold(Facts::default(), |acc, p| acc.union(pair(p))),
                         "<>" => {
                             let mut acc: Option<Facts> = None;
-                            for p in l.iter().zip(r) {
+                            for p in l
+                                .iter()
+                                .map(Option::as_ref)
+                                .zip(r.iter().map(Option::as_ref))
+                            {
                                 let f = pair(p);
                                 acc = Some(match acc {
                                     None => f,
@@ -984,30 +992,37 @@ fn nonnullable_node(
                             }
                             acc.unwrap_or_default()
                         }
-                        "<" | "<=" | ">" | ">=" => {
-                            l.iter().zip(r).next().map(pair).unwrap_or_default()
-                        }
+                        "<" | "<=" | ">" | ">=" => l
+                            .iter()
+                            .map(Option::as_ref)
+                            .zip(r.iter().map(Option::as_ref))
+                            .next()
+                            .map(pair)
+                            .unwrap_or_default(),
                         _ => Facts::default(),
                     }
                 }
                 // `(a, b) IN ((1, 2), (5, -5))`: an OR of row equalities,
                 // each needing every field of the left row non-NULL.
-                K::AexprIn if is_row(&e.lexpr) => {
+                K::AexprIn if is_row(e.lexpr.as_ref()) => {
                     let items_are_rows = matches!(
                         e.rexpr.as_ref(),
                         Some(ast::Node::List(l))
                             if !l.items.is_empty()
-                                && l.items.iter().all(|i| plain_row_fields(i).is_some())
+                                && l.items.iter().all(|i| plain_row_fields(i.as_ref()).is_some())
                     );
-                    match plain_row_fields(&e.lexpr) {
-                        Some(fields) if top_level && op == "=" && items_are_rows => fields
-                            .iter()
-                            .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
+                    match plain_row_fields(e.lexpr.as_ref()) {
+                        Some(fields) if top_level && op == "=" && items_are_rows => {
+                            fields.iter().fold(Facts::default(), |acc, a| {
+                                acc.union(walk(a.as_ref(), false))
+                            })
+                        }
                         _ => Facts::default(),
                     }
                 }
                 K::AexprOp => {
-                    let strict = walk_opt(&e.lexpr, false).union(walk_opt(&e.rexpr, false));
+                    let strict =
+                        walk_opt(e.lexpr.as_ref(), false).union(walk_opt(e.rexpr.as_ref(), false));
                     if top_level {
                         strict.union(comparison_facts(e, scope, log, snapshot))
                     } else {
@@ -1015,28 +1030,27 @@ fn nonnullable_node(
                     }
                 }
                 K::AexprLike | K::AexprIlike | K::AexprSimilar => {
-                    walk_opt(&e.lexpr, false).union(walk_opt(&e.rexpr, false))
+                    walk_opt(e.lexpr.as_ref(), false).union(walk_opt(e.rexpr.as_ref(), false))
                 }
                 // `x IN (…)` is `x = ANY(ARRAY[…])` or an OR of `x = item`
                 // (NOT IN: `<> ALL` over a non-empty array, or an AND of
                 // `x <> item`), BETWEEN an AND / OR of comparisons on `x`:
                 // all strict in `x` at any level.
-                K::AexprIn if top_level => {
-                    walk_opt(&e.lexpr, false).union(comparison_facts(e, scope, log, snapshot))
-                }
+                K::AexprIn if top_level => walk_opt(e.lexpr.as_ref(), false)
+                    .union(comparison_facts(e, scope, log, snapshot)),
                 K::AexprBetween if top_level => {
-                    walk_opt(&e.lexpr, false).union(between_facts(e, scope, log, snapshot))
+                    walk_opt(e.lexpr.as_ref(), false).union(between_facts(e, scope, log, snapshot))
                 }
                 K::AexprIn
                 | K::AexprBetween
                 | K::AexprNotBetween
                 | K::AexprBetweenSym
-                | K::AexprNotBetweenSym => walk_opt(&e.lexpr, false),
+                | K::AexprNotBetweenSym => walk_opt(e.lexpr.as_ref(), false),
                 // `is_strict_saop(expr, falseOK)`: `x op ANY(array)` is NULL
                 // or FALSE when an input is NULL, enough at the top level.
                 // `ALL` over an empty array is TRUE whatever `x` is.
-                K::AexprOpAny if top_level => walk_opt(&e.lexpr, false)
-                    .union(walk_opt(&e.rexpr, false))
+                K::AexprOpAny if top_level => walk_opt(e.lexpr.as_ref(), false)
+                    .union(walk_opt(e.rexpr.as_ref(), false))
                     .union(comparison_facts(e, scope, log, snapshot)),
                 K::AexprOpAll if top_level => comparison_facts(e, scope, log, snapshot),
                 _ => Facts::default(),
@@ -1046,23 +1060,23 @@ fn nonnullable_node(
             if !log.is_strict(f.location, StrictNode::Func) {
                 return Facts::default();
             }
-            f.args
-                .iter()
-                .fold(Facts::default(), |acc, a| acc.union(walk(a, false)))
+            f.args.iter().fold(Facts::default(), |acc, a| {
+                acc.union(walk(a.as_ref(), false))
+            })
         }
-        ast::Node::NamedArgExpr(na) => walk_opt(&na.arg, top_level),
+        ast::Node::NamedArgExpr(na) => walk_opt(na.arg.as_ref(), top_level),
         ast::Node::TypeCast(tc) => {
             if !log.is_strict(tc.location, StrictNode::Cast) {
                 return Facts::default();
             }
-            walk_opt(&tc.arg, false)
+            walk_opt(tc.arg.as_ref(), false)
         }
-        ast::Node::CollateClause(c) => walk_opt(&c.arg, top_level),
+        ast::Node::CollateClause(c) => walk_opt(c.arg.as_ref(), top_level),
         ast::Node::AIndirection(i) => match crate::expr::whole_row_field_column(i, scope) {
             // A field of a FROM entry's whole row is its column.
-            Some(column) => walk(&Some(column), top_level),
+            Some(column) => walk(Some(&column), top_level),
             // A field or an element of a NULL value is NULL.
-            None => walk_opt(&i.arg, false),
+            None => walk_opt(i.arg.as_ref(), false),
         },
         ast::Node::NullTest(t) if top_level && t.nulltesttype == ast::NullTestType::IsNotNull => {
             let Some(arg) = t.arg.as_ref() else {
@@ -1070,10 +1084,9 @@ fn nonnullable_node(
             };
             match arg {
                 // `ROW(a, b) IS NOT NULL`: every field is non-NULL.
-                ast::Node::RowExpr(r) => r
-                    .args
-                    .iter()
-                    .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
+                ast::Node::RowExpr(r) => r.args.iter().fold(Facts::default(), |acc, a| {
+                    acc.union(walk(a.as_ref(), false))
+                }),
                 // `t IS NOT NULL` over a whole-row reference: so is every
                 // column of `t`.
                 _ => match whole_row_source(arg, scope) {
@@ -1083,7 +1096,7 @@ fn nonnullable_node(
                             acc.union(Facts::column(&src.alias, &c.name))
                         }),
                     None => {
-                        let mut f = walk(&t.arg, false);
+                        let mut f = walk(t.arg.as_ref(), false);
                         f.exprs.extend(composite_field_keys(arg, scope, snapshot));
                         f
                     }
@@ -1112,11 +1125,10 @@ fn nonnullable_node(
             let tested = if log.is_strict(sub.location, StrictNode::Sublink) {
                 match sub.testexpr.as_ref() {
                     Some(t) => match t {
-                        ast::Node::RowExpr(r) => r
-                            .args
-                            .iter()
-                            .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
-                        _ => walk(&sub.testexpr, false),
+                        ast::Node::RowExpr(r) => r.args.iter().fold(Facts::default(), |acc, a| {
+                            acc.union(walk(a.as_ref(), false))
+                        }),
+                        _ => walk(sub.testexpr.as_ref(), false),
                     },
                     None => Facts::default(),
                 }
@@ -1135,7 +1147,7 @@ fn nonnullable_node(
                         | ast::BoolTestType::IsNotUnknown
                 ) =>
         {
-            walk_opt(&t.arg, false)
+            walk_opt(t.arg.as_ref(), false)
         }
         _ => Facts::default(),
     }
@@ -1146,7 +1158,7 @@ fn nonnullable_node(
 /// anything: `x IS NULL` not TRUE is `x` non-NULL, while `x > 0` not TRUE
 /// may well be `x` NULL.
 pub(crate) fn nonnullable_unless_true(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
@@ -1167,7 +1179,7 @@ pub(crate) fn nonnullable_unless_true(
 /// What `node` *not* being FALSE (TRUE or NULL) proves non-NULL — an AND
 /// operand after it: a test that is never NULL is then TRUE.
 pub(crate) fn nonnullable_unless_false(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
@@ -1175,7 +1187,7 @@ pub(crate) fn nonnullable_unless_false(
     if disabled() {
         return Facts::default();
     }
-    let mut facts = match node.as_ref() {
+    let mut facts = match node {
         Some(ast::Node::NullTest(_) | ast::Node::BooleanTest(_)) => {
             nonnullable(node, true, scope, log, snapshot)
         }
@@ -1190,15 +1202,15 @@ pub(crate) fn nonnullable_unless_false(
         Some(ast::Node::BoolExpr(b)) => match b.boolop {
             // Not FALSE: no arm is FALSE.
             ast::BoolExprType::AndExpr => b.args.iter().fold(Facts::default(), |acc, a| {
-                acc.union(nonnullable_unless_false(a, scope, log, snapshot))
+                acc.union(nonnullable_unless_false(a.as_ref(), scope, log, snapshot))
             }),
             // Not FALSE: some arm isn't.
-            ast::BoolExprType::OrExpr => intersection(&b.args, |a| {
+            ast::BoolExprType::OrExpr => intersection(b.args.iter().map(Option::as_ref), |a| {
                 nonnullable_unless_false(a, scope, log, snapshot)
             }),
             // `NOT e` not FALSE: `e` not TRUE.
             ast::BoolExprType::NotExpr => match b.args.as_slice() {
-                [e] => nonnullable_unless_true(e, scope, log, snapshot),
+                [e] => nonnullable_unless_true(e.as_ref(), scope, log, snapshot),
                 _ => Facts::default(),
             },
         },
@@ -1213,12 +1225,12 @@ pub(crate) fn nonnullable_unless_false(
 }
 
 fn unless_true_node(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> Facts {
-    let Some(inner) = node.as_ref() else {
+    let Some(inner) = node else {
         return Facts::default();
     };
     match inner {
@@ -1244,7 +1256,7 @@ fn unless_true_node(
                 // only the entry itself is present.
                 Some(a) => match whole_row_source(a, scope) {
                     Some(src) => Facts::rel(&src.alias),
-                    None => nonnullable(&t.arg, false, scope, log, snapshot),
+                    None => nonnullable(t.arg.as_ref(), false, scope, log, snapshot),
                 },
                 None => Facts::default(),
             }
@@ -1256,10 +1268,12 @@ fn unless_true_node(
             let arg = &t.arg;
             match t.booltesttype {
                 // Not (NOT TRUE): TRUE.
-                ast::BoolTestType::IsNotTrue => nonnullable(arg, true, scope, log, snapshot),
+                ast::BoolTestType::IsNotTrue => {
+                    nonnullable(arg.as_ref(), true, scope, log, snapshot)
+                }
                 // Not UNKNOWN / not (NOT FALSE), i.e. FALSE: non-NULL.
                 ast::BoolTestType::IsUnknown | ast::BoolTestType::IsNotFalse => {
-                    nonnullable(arg, false, scope, log, snapshot)
+                    nonnullable(arg.as_ref(), false, scope, log, snapshot)
                 }
                 _ => Facts::default(),
             }
@@ -1267,19 +1281,19 @@ fn unless_true_node(
         ast::Node::BoolExpr(b) => match b.boolop {
             // Not TRUE: no arm is TRUE.
             ast::BoolExprType::OrExpr => b.args.iter().fold(Facts::default(), |acc, a| {
-                acc.union(nonnullable_unless_true(a, scope, log, snapshot))
+                acc.union(nonnullable_unless_true(a.as_ref(), scope, log, snapshot))
             }),
             // Not TRUE: some arm isn't.
-            ast::BoolExprType::AndExpr => intersection(&b.args, |a| {
+            ast::BoolExprType::AndExpr => intersection(b.args.iter().map(Option::as_ref), |a| {
                 nonnullable_unless_true(a, scope, log, snapshot)
             }),
             // `NOT e` not TRUE: `e` not FALSE.
             ast::BoolExprType::NotExpr => match b.args.as_slice() {
                 [e] => {
-                    let f = nonnullable_unless_false(e, scope, log, snapshot);
+                    let f = nonnullable_unless_false(e.as_ref(), scope, log, snapshot);
                     // `NOT e` not TRUE: `e` not FALSE, so what `e` says
                     // holds of its column unless that is NULL.
-                    match value_pred(e, scope, log, snapshot) {
+                    match value_pred(e.as_ref(), scope, log, snapshot) {
                         Some((col, p)) => f.union(Facts::pred(col, p)),
                         None => f,
                     }
@@ -1304,12 +1318,12 @@ fn unless_true_node(
 /// column's value when it is TRUE — and, for a non-NULL column, its
 /// negation when it isn't.
 fn value_pred(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> Option<(Col, ValPred)> {
-    match n.as_ref()? {
+    match n? {
         n @ ast::Node::ColumnRef(_) => {
             let (col, t) = plain_column(n, scope)?;
             (snapshot.unwrap_domain(t) == crate::pg_catalog::oid::BOOL)
@@ -1342,14 +1356,15 @@ fn composite_field_keys(arg: &ast::Node, scope: &Scope, snapshot: &PgCatalog) ->
         .attributes_of(relid)
         .iter()
         .map(|a| {
-            exprs::key(&Some(ast::Node::AIndirection(NodeBox::new(
-                ast::AIndirection {
+            exprs::key(
+                Some(ast::Node::AIndirection(NodeBox::new(ast::AIndirection {
                     arg: Some(arg.clone()),
                     indirection: vec![Some(ast::Node::String(NodeBox::new(ast::String {
                         sval: a.attname.clone(),
                     })))],
-                },
-            ))))
+                })))
+                .as_ref(),
+            )
         })
         .collect()
 }
@@ -1446,9 +1461,9 @@ pub(crate) fn plain_column(n: &ast::Node, scope: &Scope) -> Option<(Col, crate::
 }
 
 /// A bare constant operand.
-pub(crate) fn literal(n: &Option<ast::Node>) -> Option<Literal> {
+pub(crate) fn literal(n: Option<&ast::Node>) -> Option<Literal> {
     use typedpg_pg_query::ast::AConstValue;
-    match n.as_ref()? {
+    match n? {
         ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
             AConstValue::Integer(i) => Some(Literal {
                 text: i.ival.to_string(),
@@ -1473,14 +1488,16 @@ pub(crate) fn literal(n: &Option<ast::Node>) -> Option<Literal> {
 /// CHECK on the column can use. Nor one cast with a type modifier
 /// ([`cast_target`]): `'abc'::varchar(2)` is `'ab'`.
 pub(crate) fn literal_for(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     column_type: crate::oid::PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Option<Literal> {
-    match n.as_ref()? {
+    match n? {
         ast::Node::TypeCast(tc) => {
             let target = cast_target(tc, snapshot)?;
-            (target == column_type).then(|| literal(&tc.arg)).flatten()
+            (target == column_type)
+                .then(|| literal(tc.arg.as_ref()))
+                .flatten()
         }
         _ => literal(n),
     }
@@ -1540,7 +1557,11 @@ fn between_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCa
     let (Some((c, t)), ast::Node::List(list)) = (plain_column(l, scope), r) else {
         return Facts::default();
     };
-    let bound = |i: usize| list.items.get(i).and_then(|n| literal_for(n, t, snapshot));
+    let bound = |i: usize| {
+        list.items
+            .get(i)
+            .and_then(|n| literal_for(n.as_ref(), t, snapshot))
+    };
     let (Some(a), Some(b)) = (bound(0), bound(1)) else {
         return Facts::default();
     };
@@ -1572,8 +1593,8 @@ pub(crate) fn column_pred(
     match e.kind {
         K::AexprOp => {
             let (c, v, flipped) = match (plain_column(l, scope), plain_column(r, scope)) {
-                (Some((c, t)), None) => (c, literal_for(&e.rexpr, t, snapshot)?, false),
-                (None, Some((c, t))) => (c, literal_for(&e.lexpr, t, snapshot)?, true),
+                (Some((c, t)), None) => (c, literal_for(e.rexpr.as_ref(), t, snapshot)?, false),
+                (None, Some((c, t))) => (c, literal_for(e.lexpr.as_ref(), t, snapshot)?, true),
                 _ => return None,
             };
             let p = match op.as_str() {
@@ -1596,7 +1617,7 @@ pub(crate) fn column_pred(
                 "<>" => false,
                 _ => return None,
             };
-            let vs = constants(list.items.iter(), t, positive, snapshot)?;
+            let vs = constants(list.items.iter().map(Option::as_ref), t, positive, snapshot)?;
             Some((
                 c,
                 if positive {
@@ -1613,7 +1634,7 @@ pub(crate) fn column_pred(
                 (K::AexprOpAll, "<>") => false,
                 _ => return None,
             };
-            let vs = array_constants(&e.rexpr, t, positive, snapshot)?;
+            let vs = array_constants(e.rexpr.as_ref(), t, positive, snapshot)?;
             Some((
                 c,
                 if positive {
@@ -1630,14 +1651,14 @@ pub(crate) fn column_pred(
 /// The constants of an IN list or an array, for a column of type `t`
 /// (NULLs dropped when `drop_nulls`, else refused).
 pub(crate) fn constants<'n>(
-    items: impl Iterator<Item = &'n Option<ast::Node>>,
+    items: impl Iterator<Item = Option<&'n ast::Node>>,
     t: crate::oid::PgTypeOid,
     drop_nulls: bool,
     snapshot: &PgCatalog,
 ) -> Option<Vec<Literal>> {
     let mut out = Vec::new();
     for i in items {
-        if let Some(ast::Node::AConst(c)) = i.as_ref()
+        if let Some(ast::Node::AConst(c)) = i
             && c.isnull
         {
             if drop_nulls {
@@ -1661,21 +1682,26 @@ pub(crate) fn constants<'n>(
 /// varchar, enums, integers: `array_in` with `,` as the delimiter,
 /// trimming the blanks around an element).
 pub(crate) fn array_constants(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     t: crate::oid::PgTypeOid,
     drop_nulls: bool,
     snapshot: &PgCatalog,
 ) -> Option<Vec<Literal>> {
     use typedpg_pg_query::ast::AConstValue;
-    match n.as_ref()? {
-        ast::Node::AArrayExpr(a) => constants(a.elements.iter(), t, drop_nulls, snapshot),
+    match n? {
+        ast::Node::AArrayExpr(a) => constants(
+            a.elements.iter().map(Option::as_ref),
+            t,
+            drop_nulls,
+            snapshot,
+        ),
         ast::Node::TypeCast(tc) => {
             let target = cast_target(tc, snapshot)?;
             if snapshot.pg_type.get(&t).and_then(|ty| ty.typarray) != Some(target) {
                 return None;
             }
             match tc.arg.as_ref()? {
-                ast::Node::AConst(_) => array_constants(&tc.arg, t, drop_nulls, snapshot),
+                ast::Node::AConst(_) => array_constants(tc.arg.as_ref(), t, drop_nulls, snapshot),
                 _ => None,
             }
         }
@@ -1750,11 +1776,11 @@ pub(crate) fn null_count_bounds<'e>(
     let op = crate::expr::extract_string_fields(&e.name).join(".");
     let (l, r) = (e.lexpr.as_ref()?, e.rexpr.as_ref()?);
     // `f(args) op n` or `n op f(args)` (flipped).
-    let (call, n, op) = match (l, literal(&e.rexpr)) {
+    let (call, n, op) = match (l, literal(e.rexpr.as_ref())) {
         (ast::Node::FuncCall(fc), Some(v)) if v.is_integer() => {
             (fc, v.text.parse::<i64>().ok()?, op)
         }
-        _ => match (r, literal(&e.lexpr)) {
+        _ => match (r, literal(e.lexpr.as_ref())) {
             (ast::Node::FuncCall(fc), Some(v)) if v.is_integer() => {
                 let flipped = match op.as_str() {
                     "<" => ">",

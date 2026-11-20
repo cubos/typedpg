@@ -365,7 +365,10 @@ fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<ast::Node>, 
     }
     let source = stmt.options.iter().find_map(|n| match n.as_ref()? {
         ast::Node::DefElem(de) if de.defname == "as" => match de.arg.as_ref()? {
-            ast::Node::List(l) => l.items.first().and_then(super::util::node_string),
+            ast::Node::List(l) => l
+                .items
+                .first()
+                .and_then(|n| super::util::node_string(n.as_ref())),
             ast::Node::String(s) => Some(s.sval.as_str()),
             _ => None,
         },
@@ -541,15 +544,17 @@ fn returns_rows(stmt: &ast::Node) -> bool {
     match stmt {
         ast::Node::SelectStmt(_) => true,
         ast::Node::InsertStmt(s) => {
-            !crate::resolve::returning_exprs(&s.returning_clause).is_empty()
+            !crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty()
         }
         ast::Node::UpdateStmt(s) => {
-            !crate::resolve::returning_exprs(&s.returning_clause).is_empty()
+            !crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty()
         }
         ast::Node::DeleteStmt(s) => {
-            !crate::resolve::returning_exprs(&s.returning_clause).is_empty()
+            !crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty()
         }
-        ast::Node::MergeStmt(s) => !crate::resolve::returning_exprs(&s.returning_clause).is_empty(),
+        ast::Node::MergeStmt(s) => {
+            !crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty()
+        }
         _ => false,
     }
 }

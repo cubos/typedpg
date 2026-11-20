@@ -98,7 +98,7 @@ impl ValueInfo {
     /// ([`crate::typmod::keeps_literal`]: `varchar(2)` drops `'ab '`'s
     /// trailing space, `numeric(2,-1)` rounds 15 to 20).
     pub(crate) fn assigned(
-        val: &Option<ast::Node>,
+        val: Option<&ast::Node>,
         t: &expr::ExprType,
         attr: &crate::pg_catalog::PgAttribute,
         snapshot: &PgCatalog,
@@ -412,7 +412,7 @@ pub(crate) fn default_value(
                 let _level = QueryLevel::enter();
                 let _skipped = expr::skipped_if(true);
                 expr::infer_expr(
-                    expr,
+                    (**expr).as_ref(),
                     expr::Ctx::new(&scope, &null_ctx, snapshot),
                     &mut params,
                     TypeGoal::assignment(attr.atttypid)
@@ -420,7 +420,7 @@ pub(crate) fn default_value(
                 )
             });
             match inferred {
-                Ok(t) => ValueInfo::assigned(expr, &t, attr, snapshot),
+                Ok(t) => ValueInfo::assigned((**expr).as_ref(), &t, attr, snapshot),
                 Err(_) => ValueInfo::default(),
             }
         }
@@ -565,13 +565,13 @@ pub(crate) fn set_values(
         let Some(attr) = table_attrs.iter().find(|a| a.attname == rt.name) else {
             continue;
         };
-        let info = if is_set_to_default(val) {
+        let info = if is_set_to_default(val.as_ref()) {
             target.default_of(ctx.snapshot, &attr.attname)
         } else {
             let goal = TypeGoal::assignment(attr.atttypid)
                 .with_typmod(ctx.snapshot.effective_typmod(attr.atttypid, attr.atttypmod));
-            match expr::infer_expr(val, ctx, &mut scratch, goal) {
-                Ok(t) => ValueInfo::assigned(val, &t, attr, ctx.snapshot),
+            match expr::infer_expr(val.as_ref(), ctx, &mut scratch, goal) {
+                Ok(t) => ValueInfo::assigned(val.as_ref(), &t, attr, ctx.snapshot),
                 Err(_) => continue,
             }
         };

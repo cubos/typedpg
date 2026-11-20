@@ -324,8 +324,8 @@ pub(crate) fn clear_recorded() {
 
 /// Record that the planner substitutes `expr` for `entry`, a column
 /// reference of a select list reading a pulled-up subquery's column.
-pub(crate) fn record_substitution(entry: &Option<ast::Node>, expr: std::sync::Arc<ast::Node>) {
-    if let Some(ast::Node::ColumnRef(cr)) = entry.as_ref() {
+pub(crate) fn record_substitution(entry: Option<&ast::Node>, expr: std::sync::Arc<ast::Node>) {
+    if let Some(ast::Node::ColumnRef(cr)) = entry {
         SUBSTITUTED.with(|m| {
             m.borrow_mut().insert(
                 std::ptr::from_ref::<ast::ColumnRef>(cr) as usize,
@@ -340,8 +340,8 @@ pub(crate) fn record_substitution(entry: &Option<ast::Node>, expr: std::sync::Ar
 /// planner pulls up where it is never null-extended (a FROM subquery, an
 /// inlined CTE), the output expression the planner substitutes for it:
 /// its conversion to the type it is assigned to is folded.
-pub(crate) fn record_read(val: &Option<ast::Node>, scope: &crate::scope::Scope) {
-    let Some(ast::Node::ColumnRef(cr)) = val.as_ref() else {
+pub(crate) fn record_read(val: Option<&ast::Node>, scope: &crate::scope::Scope) {
+    let Some(ast::Node::ColumnRef(cr)) = val else {
         return;
     };
     let parts = crate::expr::extract_string_fields(&cr.fields);
@@ -358,8 +358,8 @@ pub(crate) fn record_read(val: &Option<ast::Node>, scope: &crate::scope::Scope) 
 }
 
 /// What the planner substitutes for `entry` (see [`record_substitution`]).
-pub(crate) fn substituted(entry: &Option<ast::Node>) -> Option<std::sync::Arc<ast::Node>> {
-    let Some(ast::Node::ColumnRef(cr)) = entry.as_ref() else {
+pub(crate) fn substituted(entry: Option<&ast::Node>) -> Option<std::sync::Arc<ast::Node>> {
+    let Some(ast::Node::ColumnRef(cr)) = entry else {
         return None;
     };
     SUBSTITUTED.with(|m| {
@@ -375,20 +375,21 @@ pub(crate) fn substituted(entry: &Option<ast::Node>) -> Option<std::sync::Arc<as
 /// single VALUES row's item) — itself what it substitutes, when it reads
 /// a column pulled up from below. `None` past a `*`.
 pub(crate) fn output_exprs(sel: &ast::SelectStmt) -> Vec<Option<std::sync::Arc<ast::Node>>> {
-    let entry = |n: &Option<ast::Node>| {
-        n.as_ref()
-            .map(|inner| substituted(n).unwrap_or_else(|| std::sync::Arc::new(inner.clone())))
+    let entry = |n: Option<&ast::Node>| {
+        n.map(|inner| substituted(n).unwrap_or_else(|| std::sync::Arc::new(inner.clone())))
     };
     match sel.values_lists.as_slice() {
         [row] => match row.as_ref() {
-            Some(ast::Node::List(l)) => l.items.iter().map(entry).collect(),
+            Some(ast::Node::List(l)) => l.items.iter().map(|n| entry(n.as_ref())).collect(),
             _ => Vec::new(),
         },
         [] => sel
             .target_list
             .iter()
             .map_while(|t| match t.as_ref() {
-                Some(ast::Node::ResTarget(rt)) if !is_star(t) => Some(entry(&rt.val)),
+                Some(ast::Node::ResTarget(rt)) if !is_star(t.as_ref()) => {
+                    Some(entry(rt.val.as_ref()))
+                }
                 _ => None,
             })
             .collect(),
@@ -420,7 +421,7 @@ pub(crate) fn split(sel: &ast::SelectStmt, errors: Vec<PlanTimeError>) -> Split 
                 .items
                 .iter()
                 .enumerate()
-                .map(|(i, n)| (span(n), Some(i)))
+                .map(|(i, n)| (span(n.as_ref()), Some(i)))
                 .collect(),
             _ => Vec::new(),
         },
@@ -430,8 +431,8 @@ pub(crate) fn split(sel: &ast::SelectStmt, errors: Vec<PlanTimeError>) -> Split 
                 .iter()
                 .enumerate()
                 .map(|(i, t)| {
-                    known &= !is_star(t);
-                    (span(t), known.then_some(i))
+                    known &= !is_star(t.as_ref());
+                    (span(t.as_ref()), known.then_some(i))
                 })
                 .collect()
         }
@@ -471,8 +472,8 @@ pub(crate) fn split(sel: &ast::SelectStmt, errors: Vec<PlanTimeError>) -> Split 
 type Span = (i32, i32);
 
 /// The first and last location of the nodes in `n`.
-fn span(n: &Option<ast::Node>) -> Option<Span> {
-    let inner = n.as_ref()?;
+fn span(n: Option<&ast::Node>) -> Option<Span> {
+    let inner = n?;
     let mut range: Option<(i32, i32)> = None;
     for (n, _) in inner.nodes() {
         if let Some(l) = n.location().filter(|l| *l >= 0) {
@@ -486,8 +487,8 @@ fn span(n: &Option<ast::Node>) -> Option<Span> {
 }
 
 /// A `*` or `t.*` target entry.
-fn is_star(t: &Option<ast::Node>) -> bool {
-    matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+fn is_star(t: Option<&ast::Node>) -> bool {
+    matches!(t, Some(ast::Node::ResTarget(rt))
         if matches!(rt.val.as_ref(),
             Some(ast::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
                 matches!(f.as_ref(), Some(ast::Node::AStar(_))))))
@@ -820,7 +821,7 @@ pub(crate) fn analyze_exists<T>(
         .from_clause
         .iter()
         .chain(std::iter::once(&sel.where_clause))
-        .filter_map(span)
+        .filter_map(|n| span(n.as_ref()))
         .collect();
     for (location, e) in errors {
         if location.is_some_and(|at| planned.iter().any(|(lo, hi)| (*lo..=*hi).contains(&at)))

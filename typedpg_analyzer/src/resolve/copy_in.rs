@@ -117,7 +117,7 @@ impl PgCatalog {
         let names: Vec<&str> = stmt
             .attlist
             .iter()
-            .filter_map(crate::ddl::util::node_string)
+            .filter_map(|n| crate::ddl::util::node_string(n.as_ref()))
             .collect();
         // CopyGetAttnums: no list means every column but the generated ones.
         let targets: Vec<&crate::pg_catalog::PgAttribute> = if names.is_empty() {

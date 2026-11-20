@@ -91,10 +91,10 @@ const MAX_COLUMNS: usize = 16;
 
 /// The plain columns of this level `n` references (not those inside a
 /// sublink), if it is small enough to evaluate once per column.
-pub(crate) fn candidate_columns(n: &Option<ast::Node>, scope: &Scope) -> Vec<Col> {
+pub(crate) fn candidate_columns(n: Option<&ast::Node>, scope: &Scope) -> Vec<Col> {
     let mut out = BTreeSet::new();
     let mut count = 0usize;
-    if !collect(n.as_ref(), scope, &mut out, &mut count) || out.len() > MAX_COLUMNS {
+    if !collect(n, scope, &mut out, &mut count) || out.len() > MAX_COLUMNS {
         return Vec::new();
     }
     out.into_iter().collect()
@@ -158,8 +158,8 @@ fn collect(
 }
 
 impl Subst<'_> {
-    pub(crate) fn eval(&self, n: &Option<ast::Node>) -> Val {
-        let Some(inner) = n.as_ref() else {
+    pub(crate) fn eval(&self, n: Option<&ast::Node>) -> Val {
+        let Some(inner) = n else {
             return Val::Unknown;
         };
         match inner {
@@ -180,7 +180,7 @@ impl Subst<'_> {
                 }
             }
             ast::Node::TypeCast(tc) => {
-                let v = self.eval(&tc.arg);
+                let v = self.eval(tc.arg.as_ref());
                 if v == Val::Null {
                     // A strict cast (or one with no function) of NULL.
                     return if self.log.is_strict(tc.location, StrictNode::Cast) {
@@ -212,7 +212,7 @@ impl Subst<'_> {
                 }
             }
             ast::Node::NullTest(t) => {
-                let v = self.eval(&t.arg);
+                let v = self.eval(t.arg.as_ref());
                 let is_null = match v {
                     Val::Null => true,
                     v if v.known_non_null() => false,
@@ -225,7 +225,7 @@ impl Subst<'_> {
             }
             ast::Node::BooleanTest(t) => {
                 use ast::BoolTestType as B;
-                let v = self.eval(&t.arg);
+                let v = self.eval(t.arg.as_ref());
                 let v = match v {
                     Val::Null => None,
                     Val::Bool(b) => Some(b),
@@ -241,7 +241,7 @@ impl Subst<'_> {
                 })
             }
             ast::Node::BoolExpr(b) => {
-                let vals: Vec<Val> = b.args.iter().map(|a| self.eval(a)).collect();
+                let vals: Vec<Val> = b.args.iter().map(|a| self.eval(a.as_ref())).collect();
                 match b.boolop {
                     ast::BoolExprType::NotExpr => match vals.as_slice() {
                         [Val::Null] => Val::Null,
@@ -254,7 +254,7 @@ impl Subst<'_> {
             }
             ast::Node::CoalesceExpr(c) => {
                 for a in &c.args {
-                    match self.eval(a) {
+                    match self.eval(a.as_ref()) {
                         Val::Null => continue,
                         v => return self.converted(c.location, v),
                     }
@@ -267,7 +267,7 @@ impl Subst<'_> {
                 let mut non_null = false;
                 let mut unknown = false;
                 for a in &m.args {
-                    match self.eval(a) {
+                    match self.eval(a.as_ref()) {
                         Val::Null => {}
                         Val::Int(i) => ints.push(i),
                         Val::Unknown => unknown = true,
@@ -328,8 +328,8 @@ impl Subst<'_> {
 
     fn eval_a_expr(&self, e: &ast::AExpr) -> Val {
         use ast::AExprKind as K;
-        let l = e.lexpr.is_some().then(|| self.eval(&e.lexpr));
-        let r = e.rexpr.is_some().then(|| self.eval(&e.rexpr));
+        let l = e.lexpr.is_some().then(|| self.eval(e.lexpr.as_ref()));
+        let r = e.rexpr.is_some().then(|| self.eval(e.rexpr.as_ref()));
         let strict = self.log.is_strict(e.location, StrictNode::Op);
         match e.kind {
             K::AexprOp => {
@@ -429,7 +429,7 @@ impl Subst<'_> {
     }
 
     fn eval_func(&self, f: &ast::FuncCall) -> Val {
-        let vals: Vec<Val> = f.args.iter().map(|a| self.eval(a)).collect();
+        let vals: Vec<Val> = f.args.iter().map(|a| self.eval(a.as_ref())).collect();
         if self.log.is_strict(f.location, StrictNode::Func) {
             return if vals.contains(&Val::Null) {
                 Val::Null

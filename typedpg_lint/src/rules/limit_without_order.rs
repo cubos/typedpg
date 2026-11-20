@@ -294,15 +294,15 @@ fn constant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     }
     select.target_list.iter().all(|node| {
         node.as_ref()
-            .is_some_and(|_| constant_expression(ctx, node))
+            .is_some_and(|_| constant_expression(ctx, node.as_ref()))
     })
 }
 
 /// Whether every output row carries the same values: the expression reads
 /// no column (anywhere, sublinks included) and calls nothing that may vary
 /// per row.
-fn constant_expression(ctx: &Ctx<'_>, expression: &Option<ast::Node>) -> bool {
-    let Some(root) = expression.as_ref() else {
+fn constant_expression(ctx: &Ctx<'_>, expression: Option<&ast::Node>) -> bool {
+    let Some(root) = expression else {
         return false;
     };
     let mut stack = vec![root.to_ref()];
@@ -385,7 +385,7 @@ fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     let mut equated = HashSet::new();
     let mut conjuncts = Vec::new();
     if select.where_clause.is_some() {
-        and_conjuncts(&select.where_clause, &mut conjuncts);
+        and_conjuncts(select.where_clause.as_ref(), &mut conjuncts);
     }
     for conjunct in conjuncts {
         if let Some(column) = equated_column(ctx, relation, class, conjunct) {
@@ -400,10 +400,11 @@ fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
         if value.is_none() {
             return false;
         }
-        if constant_expression(ctx, value) {
+        if constant_expression(ctx, value.as_ref()) {
             return true;
         }
-        relation_column(ctx, value, relation, class).is_some_and(|column| equated.contains(&column))
+        relation_column(ctx, value.as_ref(), relation, class)
+            .is_some_and(|column| equated.contains(&column))
     })
 }
 
@@ -411,11 +412,11 @@ fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
 /// the relation's name or alias.
 fn relation_column(
     ctx: &Ctx<'_>,
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     relation: &typedpg_pg_query::ast::RangeVar,
     class: &typedpg_analyzer::PgClass,
 ) -> Option<String> {
-    let Node::ColumnRef(reference) = node.as_ref()? else {
+    let Node::ColumnRef(reference) = node? else {
         return None;
     };
     let (last, qualifiers) = reference.fields.split_last()?;
@@ -449,9 +450,9 @@ fn equated_column(
     ctx: &Ctx<'_>,
     relation: &typedpg_pg_query::ast::RangeVar,
     class: &typedpg_analyzer::PgClass,
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
 ) -> Option<String> {
-    let Node::AExpr(expr) = node.as_ref()? else {
+    let Node::AExpr(expr) = node? else {
         return None;
     };
     if expr.kind != AExprKind::AexprOp
@@ -475,8 +476,8 @@ fn equated_column(
         return None;
     }
     let (name, other) = match (
-        relation_column(ctx, left, relation, class),
-        relation_column(ctx, right, relation, class),
+        relation_column(ctx, left.as_ref(), relation, class),
+        relation_column(ctx, right.as_ref(), relation, class),
     ) {
         (Some(name), _) => (name, right),
         (None, Some(name)) => (name, left),
@@ -587,11 +588,11 @@ fn param_type(
 }
 
 /// The top-level AND conjuncts of `node`.
-fn and_conjuncts<'a>(node: &'a Option<ast::Node>, out: &mut Vec<&'a Option<ast::Node>>) {
-    match node.as_ref() {
+fn and_conjuncts<'a>(node: Option<&'a ast::Node>, out: &mut Vec<Option<&'a ast::Node>>) {
+    match node {
         Some(Node::BoolExpr(expr)) if expr.boolop == BoolExprType::AndExpr => {
             for arg in &expr.args {
-                and_conjuncts(arg, out);
+                and_conjuncts(arg.as_ref(), out);
             }
         }
         _ => out.push(node),

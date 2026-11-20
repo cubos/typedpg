@@ -34,7 +34,7 @@ pub fn create_sequence(interp: &mut PgCatalog, stmt: &CreateSeqStmt) -> Result<(
     let seq_oid = insert_sequence_relation(interp, nsoid, name)?;
     interp.sequence_params.insert(seq_oid, params);
     for opt in &stmt.options {
-        apply_owned_by(interp, seq_oid, opt)?;
+        apply_owned_by(interp, seq_oid, opt.as_ref())?;
     }
     Ok(())
 }
@@ -104,7 +104,11 @@ pub(crate) fn create_owned_sequence(
     let explicit_name = options.iter().find_map(|o| match o.as_ref() {
         Some(ast::Node::DefElem(de)) if de.defname == "sequence_name" => match de.arg.as_ref() {
             Some(ast::Node::List(l)) => {
-                let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+                let parts: Vec<&str> = l
+                    .items
+                    .iter()
+                    .filter_map(|n| node_string(n.as_ref()))
+                    .collect();
                 match parts.as_slice() {
                     [schema, name] => Some((Some((*schema).to_owned()), (*name).to_owned())),
                     [.., name] => Some((None, (*name).to_owned())),
@@ -231,9 +235,9 @@ fn owned_sequences_by(
 fn apply_owned_by(
     interp: &mut PgCatalog,
     seq_oid: PgClassOid,
-    opt: &Option<typedpg_pg_query::ast::Node>,
+    opt: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
-    let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+    let Some(ast::Node::DefElem(de)) = opt else {
         return Ok(());
     };
     if de.defname != "owned_by" {
@@ -243,7 +247,7 @@ fn apply_owned_by(
         Some(ast::Node::List(l)) => l
             .items
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         _ => return Ok(()),
@@ -395,7 +399,7 @@ pub fn alter_sequence(interp: &mut PgCatalog, stmt: &AlterSeqStmt) -> Result<(),
     let params = super::seqparams::init_params(interp, &stmt.options, Some(current))?;
     interp.sequence_params.insert(seq_oid, params);
     for opt in &stmt.options {
-        apply_owned_by(interp, seq_oid, opt)?;
+        apply_owned_by(interp, seq_oid, opt.as_ref())?;
     }
     Ok(())
 }

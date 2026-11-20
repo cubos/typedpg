@@ -53,15 +53,15 @@ pub(crate) fn infer_bool_expr(
             Some(n) => ctx.with_null_ctx(n),
             None => ctx,
         };
-        let arg_dead = dead && !(!or && and_or && super::joined_before_folding(arg, ctx));
+        let arg_dead = dead && !(!or && and_or && super::joined_before_folding(arg.as_ref(), ctx));
         let t = super::plan_fold::unless_dead(arg_dead, || {
-            crate::clause::coerce_clause_expr(arg, arg_ctx, params, kind)
+            crate::clause::coerce_clause_expr(arg.as_ref(), arg_ctx, params, kind)
         })?;
         if and_or {
-            let folded = super::plan_fold::fold(arg, ctx.snapshot);
+            let folded = super::plan_fold::fold(arg.as_ref(), ctx.snapshot);
             dead = dead
                 || super::plan_fold::stops_after(folded, or)
-                || (!folded.known() && super::foldable::foldable(arg, ctx).value);
+                || (!folded.known() && super::foldable::foldable(arg.as_ref(), ctx).value);
         }
         any_nullable = any_nullable || t.nullable;
         if and_or {
@@ -77,9 +77,9 @@ pub(crate) fn infer_bool_expr(
                 )
             );
             let facts = if or {
-                crate::nonnull::nonnullable_unless_true(arg, ctx.scope, log, ctx.snapshot)
+                crate::nonnull::nonnullable_unless_true(arg.as_ref(), ctx.scope, log, ctx.snapshot)
             } else {
-                crate::nonnull::nonnullable_unless_false(arg, ctx.scope, log, ctx.snapshot)
+                crate::nonnull::nonnullable_unless_false(arg.as_ref(), ctx.scope, log, ctx.snapshot)
             };
             before = before.union(facts);
         }
@@ -103,7 +103,7 @@ pub(crate) fn infer_bool_expr(
 pub(crate) fn select_common_type(
     label: &str,
     types: &[PgTypeOid],
-    nodes: &[&Option<ast::Node>],
+    nodes: &[Option<&ast::Node>],
     snapshot: &PgCatalog,
 ) -> Result<PgTypeOid, AnalyzeError> {
     let name = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
@@ -147,12 +147,12 @@ pub(crate) fn select_common_type(
 /// input of that type — `nodes` parallel to `types`.
 pub(crate) fn failing_input_span(
     types: &[PgTypeOid],
-    nodes: &[&Option<ast::Node>],
+    nodes: &[Option<&ast::Node>],
     failing: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Option<crate::error::SourceSpan> {
     let i = failing_input(types, failing, snapshot)?;
-    nodes.get(i).and_then(|n| crate::error::expr_span(n))
+    nodes.get(i).and_then(|n| crate::error::expr_span(*n))
 }
 
 /// The position of the first input of (base) type `failing`.
@@ -182,12 +182,12 @@ pub(crate) fn agreed_typmod(inputs: &[ExprType], common: PgTypeOid) -> Option<i3
 /// non-NULL where they are read (a disjunction: `a IS NOT NULL OR b IS NOT
 /// NULL`, `CHECK (num_nonnulls(a, b) = 1)`).
 pub(crate) fn some_column_non_null<'a>(
-    args: impl IntoIterator<Item = &'a Option<ast::Node>>,
+    args: impl IntoIterator<Item = Option<&'a ast::Node>>,
     ctx: Ctx<'_>,
 ) -> bool {
     let cols: Vec<crate::nonnull::Col> = args
         .into_iter()
-        .filter_map(|a| crate::nonnull::plain_column(a.as_ref()?, ctx.scope).map(|(c, _)| c))
+        .filter_map(|a| crate::nonnull::plain_column(a?, ctx.scope).map(|(c, _)| c))
         .collect();
     cols.len() > 1 && ctx.null_ctx.some_non_null(&cols)
 }
@@ -209,19 +209,19 @@ pub(crate) fn infer_coalesce(
     let mut dead = false;
     for arg in &expr.args {
         args.push(super::plan_fold::unless_dead(dead, || {
-            infer_expr(arg, ctx, params, TypeGoal::NONE)
+            infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)
         })?);
-        let folded = super::plan_fold::fold(arg, snapshot);
+        let folded = super::plan_fold::fold(arg.as_ref(), snapshot);
         dead = dead
             || super::plan_fold::coalesce_stops_after(folded)
-            || (!folded.known() && super::foldable::foldable(arg, ctx).value);
+            || (!folded.known() && super::foldable::foldable(arg.as_ref(), ctx).value);
     }
 
     // Resolve over the *full* arg list (unknowns included): the
     // all-identical fast path that preserves domains must see a NULL branch
     // — `COALESCE(d, NULL)` is the base type, `COALESCE(d, d)` stays `d`.
     let types: Vec<PgTypeOid> = args.iter().map(|t| t.type_oid).collect();
-    let nodes: Vec<&Option<ast::Node>> = expr.args.iter().collect();
+    let nodes: Vec<Option<&ast::Node>> = expr.args.iter().map(Option::as_ref).collect();
     let type_oid = select_common_type("COALESCE", &types, &nodes, snapshot)?;
     // Each argument is coerced to the common type, which may map it to NULL.
     let kept = coerce_branches(&mut args, type_oid, snapshot);
@@ -234,7 +234,7 @@ pub(crate) fn infer_coalesce(
     // content rejections propagate (PG raises them from this coercion).
     for (arg, t) in expr.args.iter().zip(&args) {
         if t.type_oid == oid::UNKNOWN {
-            coerce_unknown_to(arg, ctx, params, type_oid)?;
+            coerce_unknown_to(arg.as_ref(), ctx, params, type_oid)?;
         }
     }
 
@@ -263,7 +263,7 @@ pub(crate) fn infer_coalesce(
             Some(ast::Node::ParamRef(p)) => params.is_nullable(p.number),
             // So is a parameter anywhere in the argument: the caller may
             // pass NULL whatever the argument's own inference says.
-            _ => t.nullable || has_param_ref(arg),
+            _ => t.nullable || has_param_ref(arg.as_ref()),
         })
         .collect();
     let args_typed_as_result: Vec<bool> = args.iter().map(|t| t.type_oid == type_oid).collect();
@@ -275,7 +275,8 @@ pub(crate) fn infer_coalesce(
             .all(|t| t.type_oid == type_oid || t.type_oid == oid::UNKNOWN),
     );
 
-    let branches: Vec<(&Option<ast::Node>, &ExprType)> = expr.args.iter().zip(&args).collect();
+    let branches: Vec<(Option<&ast::Node>, &ExprType)> =
+        expr.args.iter().map(Option::as_ref).zip(&args).collect();
     let typmod = agreed_typmod(&args, type_oid);
     ctx.note_strict(
         expr.location,
@@ -317,8 +318,11 @@ pub(crate) fn coerce_branches(
 pub(crate) fn kept_nodes<'a>(
     args: &'a [Option<ast::Node>],
     kept: &'a [bool],
-) -> impl Iterator<Item = &'a Option<ast::Node>> {
-    args.iter().zip(kept).filter(|(_, k)| **k).map(|(a, _)| a)
+) -> impl Iterator<Item = Option<&'a ast::Node>> {
+    args.iter()
+        .zip(kept)
+        .filter(|(_, k)| **k)
+        .map(|(a, _)| a.as_ref())
 }
 
 /// The columns a condition proves part of the current grouping set:
@@ -327,23 +331,23 @@ pub(crate) fn kept_nodes<'a>(
 /// column's bit when the set omits it — where those columns carry the
 /// group's own value, not a NULL standing for "all".
 fn grouping_present_columns(
-    cond: &Option<ast::Node>,
+    cond: Option<&ast::Node>,
     scope: &crate::scope::Scope,
 ) -> Vec<crate::nonnull::Col> {
     let mut out = Vec::new();
-    match cond.as_ref() {
+    match cond {
         Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
             for a in &b.args {
-                out.extend(grouping_present_columns(a, scope));
+                out.extend(grouping_present_columns(a.as_ref(), scope));
             }
         }
         Some(ast::Node::AExpr(e))
             if e.kind == ast::AExprKind::AexprOp
                 && extract_string_fields(&e.name).as_slice() == ["="] =>
         {
-            let zero = |n: &Option<ast::Node>| {
+            let zero = |n: Option<&ast::Node>| {
                 matches!(
-                    n.as_ref(),
+                    n,
                     Some(ast::Node::AConst(c)) if matches!(
                         &**c,
                         ast::AConst {
@@ -353,8 +357,8 @@ fn grouping_present_columns(
                     )
                 )
             };
-            fn grouping(n: &Option<ast::Node>) -> Option<&ast::GroupingFunc> {
-                match n.as_ref() {
+            fn grouping(n: Option<&ast::Node>) -> Option<&ast::GroupingFunc> {
+                match n {
                     Some(ast::Node::GroupingFunc(g)) => Some(g),
                     _ => None,
                 }
@@ -362,13 +366,13 @@ fn grouping_present_columns(
             let (l @ Some(_), r @ Some(_)) = (&e.lexpr, &e.rexpr) else {
                 return out;
             };
-            let g = match (grouping(l), grouping(r)) {
-                (Some(g), _) if zero(r) => g,
-                (_, Some(g)) if zero(l) => g,
+            let g = match (grouping(l.as_ref()), grouping(r.as_ref())) {
+                (Some(g), _) if zero(r.as_ref()) => g,
+                (_, Some(g)) if zero(l.as_ref()) => g,
                 _ => return out,
             };
             for a in &g.args {
-                if let Some(c) = crate::having::column_of(a, scope) {
+                if let Some(c) = crate::having::column_of(a.as_ref(), scope) {
                     out.push(c);
                 }
             }
@@ -385,7 +389,7 @@ fn grouping_present_columns(
 /// (`'{}'`) says by its content, a branch of the result's type by its own
 /// knowledge; a converted one says nothing.
 pub(crate) fn branches_elem_nullable(
-    branches: &[(&Option<ast::Node>, &ExprType)],
+    branches: &[(Option<&ast::Node>, &ExprType)],
     common: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Option<bool> {
@@ -416,7 +420,7 @@ pub(crate) fn branches_elem_nullable(
 /// whose result has type `common`: what every branch that can be the
 /// (non-NULL) result is, converted to `common`. A NULL constant never is.
 pub(crate) fn branches_refine(
-    branches: &[(&Option<ast::Node>, &ExprType)],
+    branches: &[(Option<&ast::Node>, &ExprType)],
     common: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> crate::refine::Refinement {
@@ -451,9 +455,9 @@ pub(crate) fn infer_case(
     let Ctx { snapshot, .. } = ctx;
     let test_oid = match &expr.arg {
         arg @ Some(_) => {
-            let t = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+            let t = infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)?;
             if t.type_oid == oid::UNKNOWN {
-                coerce_unknown_to(arg, ctx, params, oid::TEXT)?;
+                coerce_unknown_to(arg.as_ref(), ctx, params, oid::TEXT)?;
                 Some(oid::TEXT)
             } else {
                 Some(t.type_oid)
@@ -467,13 +471,13 @@ pub(crate) fn infer_case(
     // TRUE, proves non-NULL. Facts are kept to this level's FROM entries.
     let own = crate::nonnull::own_aliases(ctx.scope);
     let mut not_taken = crate::nonnull::Facts::default();
-    let mut results: Vec<(&Option<ast::Node>, ExprType)> = Vec::new();
+    let mut results: Vec<(Option<&ast::Node>, ExprType)> = Vec::new();
     // Folding skips a branch whose WHEN is FALSE or NULL, and stops at one
     // that is TRUE: the planner never reaches what it drops.
     let test_fold = expr
         .arg
         .is_some()
-        .then(|| super::plan_fold::fold(&expr.arg, snapshot));
+        .then(|| super::plan_fold::fold(expr.arg.as_ref(), snapshot));
     let mut stopped = false;
     // The planner drops a WHEN whose condition it folds to FALSE (its
     // result unfolded), and every one after a condition it folds to TRUE
@@ -499,8 +503,8 @@ pub(crate) fn infer_case(
                     super::plan_fold::unless_dead(cond_dead, || {
                         infer_synthetic_op(
                             "=",
-                            &typed_null(test_oid),
-                            cond,
+                            typed_null(test_oid).as_ref(),
+                            cond.as_ref(),
                             when.location,
                             cond_ctx,
                             params,
@@ -510,10 +514,20 @@ pub(crate) fn infer_case(
                     // — and a column test equals a constant value. Not
                     // TRUE, a non-NULL test column isn't that value.
                     if log.is_strict(when.location, crate::nonnull::StrictNode::Op) {
-                        taken = crate::nonnull::nonnullable(test, false, ctx.scope, &log, snapshot)
-                            .union(crate::nonnull::nonnullable(
-                                cond, false, ctx.scope, &log, snapshot,
-                            ));
+                        taken = crate::nonnull::nonnullable(
+                            test.as_ref(),
+                            false,
+                            ctx.scope,
+                            &log,
+                            snapshot,
+                        )
+                        .union(crate::nonnull::nonnullable(
+                            cond.as_ref(),
+                            false,
+                            ctx.scope,
+                            &log,
+                            snapshot,
+                        ));
                         // Only the built-in `=` says the column holds
                         // that value (or, not TRUE, doesn't).
                         if !crate::nonnull::disabled()
@@ -523,7 +537,7 @@ pub(crate) fn infer_case(
                             )
                             && let Some(test) = test.as_ref()
                             && let Some((col, t)) = crate::nonnull::plain_column(test, ctx.scope)
-                            && let Some(v) = crate::nonnull::literal_for(cond, t, snapshot)
+                            && let Some(v) = crate::nonnull::literal_for(cond.as_ref(), t, snapshot)
                         {
                             let p = crate::nonnull::ValPred::In(vec![v.clone()]);
                             taken.equals.insert(col.clone(), v);
@@ -537,13 +551,14 @@ pub(crate) fn infer_case(
                 _ => {
                     super::plan_fold::unless_dead(cond_dead, || {
                         crate::clause::coerce_clause_expr(
-                            cond,
+                            cond.as_ref(),
                             cond_ctx,
                             params,
                             crate::clause::ClauseKind::CaseWhen,
                         )
                     })?;
-                    taken = crate::nonnull::nonnullable(cond, true, ctx.scope, &log, snapshot);
+                    taken =
+                        crate::nonnull::nonnullable(cond.as_ref(), true, ctx.scope, &log, snapshot);
                 }
             }
         }
@@ -558,7 +573,7 @@ pub(crate) fn infer_case(
             let mut narrowed = ctx.null_ctx.with_local_facts(facts);
             // `WHEN grouping(g) = 0`: the row's grouping set holds `g`.
             let present = match (&expr.arg, &when.expr) {
-                (None, cond @ Some(_)) => grouping_present_columns(cond, ctx.scope),
+                (None, cond @ Some(_)) => grouping_present_columns(cond.as_ref(), ctx.scope),
                 _ => Vec::new(),
             };
             if !present.is_empty() {
@@ -573,15 +588,18 @@ pub(crate) fn infer_case(
                 None => ctx,
             };
             results.push((
-                result,
+                result.as_ref(),
                 super::plan_fold::unless_dead(result_dead, || {
-                    infer_expr(result, result_ctx, params, TypeGoal::NONE)
+                    infer_expr(result.as_ref(), result_ctx, params, TypeGoal::NONE)
                 })?,
             ));
         }
         if let (None, cond @ Some(_)) = (&expr.arg, &when.expr) {
             not_taken = not_taken.union(crate::nonnull::nonnullable_unless_true(
-                cond, ctx.scope, &log, snapshot,
+                cond.as_ref(),
+                ctx.scope,
+                &log,
+                snapshot,
             ));
         }
         // The WHEN is part of whatever expression the caller logs.
@@ -623,9 +641,9 @@ pub(crate) fn infer_case(
                 None => ctx,
             };
             Some((
-                d,
+                d.as_ref(),
                 super::plan_fold::unless_dead(stopped, || {
-                    infer_expr(d, default_ctx, params, TypeGoal::NONE)
+                    infer_expr(d.as_ref(), default_ctx, params, TypeGoal::NONE)
                 })?,
             ))
         }
@@ -643,18 +661,16 @@ pub(crate) fn infer_case(
     let types: Vec<PgTypeOid> = inputs.iter().map(|t| t.type_oid).collect();
     // Parallel to `types` (the implicit ELSE NULL has no node: an untyped
     // NULL never fails the match).
-    let null_node: Option<ast::Node> = None;
-    let nodes: Vec<&Option<ast::Node>> =
-        std::iter::once(default.as_ref().map_or(&null_node, |(n, _)| *n))
-            .chain(results.iter().map(|(n, _)| *n))
-            .collect();
+    let nodes: Vec<Option<&ast::Node>> = std::iter::once(default.as_ref().and_then(|(n, _)| *n))
+        .chain(results.iter().map(|(n, _)| *n))
+        .collect();
     let type_oid = select_common_type("CASE", &types, &nodes, snapshot)?;
 
     // Pass 2: back-fill UNKNOWN results with the common type. Literal
     // content rejections propagate (PG raises them from this coercion).
     for (node, t) in default.iter().chain(results.iter()) {
         if t.type_oid == oid::UNKNOWN {
-            coerce_unknown_to(node, ctx, params, type_oid)?;
+            coerce_unknown_to(*node, ctx, params, type_oid)?;
         }
     }
     // Each result is coerced to the common type, which may map it to NULL.
@@ -668,7 +684,7 @@ pub(crate) fn infer_case(
     // Collations merge in tree order: THEN results, then ELSE.
     let collation = derive_collation(inputs[1..].iter().chain(&inputs[..1]), type_oid, snapshot)?;
     // (The implicit ELSE NULL is never a non-NULL array.)
-    let branches: Vec<(&Option<ast::Node>, &ExprType)> = default
+    let branches: Vec<(Option<&ast::Node>, &ExprType)> = default
         .iter()
         .chain(results.iter())
         .map(|(n, t)| (*n, t))

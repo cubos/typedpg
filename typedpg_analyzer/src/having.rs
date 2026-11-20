@@ -76,10 +76,10 @@ pub(crate) fn builtin_aggregate_name<'a>(
     }
     let (schema, name) = match fc.funcname.as_slice() {
         [n] => (None, n),
-        [s, n] => (Some(string_of(s)?), n),
+        [s, n] => (Some(string_of(s.as_ref())?), n),
         _ => return None,
     };
-    let name = string_of(name)?;
+    let name = string_of(name.as_ref())?;
     if schema.is_some_and(|s| s != "pg_catalog") {
         return None;
     }
@@ -97,10 +97,10 @@ pub(crate) fn builtin_aggregate_name<'a>(
 /// outer columns only (`count(outer.x)`) is the outer query's — its value
 /// says nothing of this level's groups. A call holding a subquery is not
 /// looked into.
-fn is_current_level(fc_node: &Option<ast::Node>, scope: &Scope) -> bool {
+fn is_current_level(fc_node: Option<&ast::Node>, scope: &Scope) -> bool {
     let own = crate::nonnull::own_aliases(scope);
     let (mut refs, mut current, mut opaque) = (0, false, false);
-    crate::resolve::visit_same_level(fc_node, &mut |e| match e.as_ref() {
+    crate::resolve::visit_same_level(fc_node, &mut |e| match e {
         Some(ast::Node::ColumnRef(_)) => {
             refs += 1;
             match column_of(e, scope) {
@@ -115,8 +115,8 @@ fn is_current_level(fc_node: &Option<ast::Node>, scope: &Scope) -> bool {
     !opaque && (refs == 0 || current)
 }
 
-fn string_of(n: &Option<ast::Node>) -> Option<&str> {
-    match n.as_ref()? {
+fn string_of(n: Option<&ast::Node>) -> Option<&str> {
+    match n? {
         ast::Node::String(s) => Some(s.sval.as_str()),
         _ => None,
     }
@@ -124,26 +124,26 @@ fn string_of(n: &Option<ast::Node>) -> Option<&str> {
 
 /// The values an aggregate reads (`string_agg`'s delimiter and an
 /// ordered-set aggregate's direct arguments aside).
-pub(crate) fn aggregated_args<'a>(fc: &'a ast::FuncCall, name: &str) -> Vec<&'a Option<ast::Node>> {
+pub(crate) fn aggregated_args<'a>(fc: &'a ast::FuncCall, name: &str) -> Vec<Option<&'a ast::Node>> {
     if fc.agg_within_group {
         return fc
             .agg_order
             .iter()
             .filter_map(|o| match o.as_ref() {
-                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
+                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(sb.node.as_ref()),
                 _ => None,
             })
             .collect();
     }
     if name == "string_agg" {
-        return fc.args.first().into_iter().collect();
+        return fc.args.first().map(Option::as_ref).into_iter().collect();
     }
-    fc.args.iter().collect()
+    fc.args.iter().map(Option::as_ref).collect()
 }
 
 /// The column a plain column reference resolves to.
-pub(crate) fn column_of(n: &Option<ast::Node>, scope: &Scope) -> Option<Col> {
-    let ast::Node::ColumnRef(cr) = n.as_ref()? else {
+pub(crate) fn column_of(n: Option<&ast::Node>, scope: &Scope) -> Option<Col> {
+    let ast::Node::ColumnRef(cr) = n? else {
         return None;
     };
     let parts = expr::extract_string_fields(&cr.fields);
@@ -166,13 +166,13 @@ pub(crate) fn column_of(n: &Option<ast::Node>, scope: &Scope) -> Option<Col> {
 /// A hypothesis under which HAVING can only be FALSE or NULL is refuted
 /// for every group it keeps.
 pub(crate) fn having_facts(
-    having: &Option<ast::Node>,
+    having: Option<&ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> HavingFacts {
     let mut candidates: Vec<Col> = Vec::new();
     crate::resolve::visit_same_level(having, &mut |e| {
-        if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
+        if let Some(ast::Node::FuncCall(fc)) = e
             && let Some(name) = builtin_aggregate_name(fc, snapshot)
             && is_current_level(e, scope)
         {
@@ -260,10 +260,10 @@ fn builtin_strict_operator(name: &str, snapshot: &PgCatalog) -> bool {
     any
 }
 
-fn eval(node: &Option<ast::Node>, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgCatalog) -> Val {
+fn eval(node: Option<&ast::Node>, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgCatalog) -> Val {
     use typedpg_pg_query::ast::AConstValue as C;
-    let sub = |n: &Option<ast::Node>| eval(n, h, scope, snapshot);
-    let Some(inner) = node.as_ref() else {
+    let sub = |n: Option<&ast::Node>| eval(n, h, scope, snapshot);
+    let Some(inner) = node else {
         return Val::Any;
     };
     match inner {
@@ -288,7 +288,7 @@ fn eval(node: &Option<ast::Node>, h: &Hypothesis<'_>, scope: &Scope, snapshot: &
                     _ => None,
                 }
             });
-            match (c.arg.is_some().then(|| sub(&c.arg)), target) {
+            match (c.arg.is_some().then(|| sub(c.arg.as_ref())), target) {
                 // A cast of NULL is NULL (or fails, to a domain): not TRUE.
                 (Some(Val::Null), _) => Val::Null,
                 (Some(v @ Val::Num(_)), Some(true)) => v,
@@ -326,16 +326,16 @@ fn eval(node: &Option<ast::Node>, h: &Hypothesis<'_>, scope: &Scope, snapshot: &
         }
         ast::Node::AExpr(e) if e.kind == ast::AExprKind::AexprOp => {
             let op = match e.name.as_slice() {
-                [n] => string_of(n),
-                [s, n] if string_of(s) == Some("pg_catalog") => string_of(n),
+                [n] => string_of(n.as_ref()),
+                [s, n] if string_of(s.as_ref()) == Some("pg_catalog") => string_of(n.as_ref()),
                 _ => None,
             };
             let Some(op) = op.filter(|op| builtin_strict_operator(op, snapshot)) else {
                 return Val::Any;
             };
-            let r = sub(&e.rexpr);
+            let r = sub(e.rexpr.as_ref());
             let l = match e.lexpr.as_ref() {
-                Some(_) => sub(&e.lexpr),
+                Some(_) => sub(e.lexpr.as_ref()),
                 // A prefix operator.
                 None => {
                     return match (op, r) {
@@ -371,7 +371,7 @@ fn eval(node: &Option<ast::Node>, h: &Hypothesis<'_>, scope: &Scope, snapshot: &
             }
         }
         ast::Node::BoolExpr(b) => {
-            let masks: Vec<u8> = b.args.iter().map(|a| sub(a).mask()).collect();
+            let masks: Vec<u8> = b.args.iter().map(|a| sub(a.as_ref()).mask()).collect();
             match b.boolop {
                 ast::BoolExprType::NotExpr => {
                     let m = masks.first().copied().unwrap_or(T | F | N);
@@ -399,7 +399,7 @@ fn eval(node: &Option<ast::Node>, h: &Hypothesis<'_>, scope: &Scope, snapshot: &
             if matches!(arg, ast::Node::RowExpr(_)) {
                 return Val::Any;
             }
-            let m = sub(&t.arg).mask();
+            let m = sub(t.arg.as_ref()).mask();
             let is_null_test = t.nulltesttype == ast::NullTestType::IsNull;
             let mut out = 0;
             if m & N != 0 {

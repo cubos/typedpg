@@ -407,7 +407,11 @@ pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError>
         ) {
             continue;
         }
-        for col in vr.va_cols.iter().filter_map(super::util::node_string) {
+        for col in vr
+            .va_cols
+            .iter()
+            .filter_map(|n| super::util::node_string(n.as_ref()))
+        {
             if interp.attribute_by_name(relid, col).is_none() {
                 return Err(DdlError::Parse(format!(
                     "column \"{col}\" of relation \"{}\" does not exist",
@@ -723,7 +727,11 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
         return Err(DdlError::Parse(format!("{msg} \"{}\"{hint}", rv.relname)));
     }
     let mut seen: Vec<&str> = Vec::new();
-    for col in stmt.attlist.iter().filter_map(super::util::node_string) {
+    for col in stmt
+        .attlist
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+    {
         if interp.attribute_by_name(relid, col).is_none() {
             return Err(DdlError::Parse(format!(
                 "column \"{col}\" of relation \"{}\" does not exist",

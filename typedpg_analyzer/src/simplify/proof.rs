@@ -121,7 +121,7 @@ impl<'a> FromScope<'a> {
         let ctes = cte_names(ctx);
         let mut items = Vec::new();
         for from in &select.from_clause {
-            from_item(ctx, &ctes, from, false, &mut items);
+            from_item(ctx, &ctes, from.as_ref(), false, &mut items);
         }
         let grouping_sets = select.group_clause.iter().any(|g| {
             g.as_ref().is_some_and(|g| {
@@ -148,7 +148,7 @@ impl<'a> FromScope<'a> {
         let ctes = cte_names(ctx);
         let mut items = Vec::new();
         for f in from {
-            from_item(ctx, &ctes, f, false, &mut items);
+            from_item(ctx, &ctes, f.as_ref(), false, &mut items);
         }
         FromScope {
             items,
@@ -215,7 +215,7 @@ impl<'a> FromScope<'a> {
             None => items.push(Item::Opaque { refname: None }),
         }
         for f in from {
-            from_item(ctx, &ctes, f, false, &mut items);
+            from_item(ctx, &ctes, f.as_ref(), false, &mut items);
         }
         FromScope {
             items,
@@ -546,11 +546,11 @@ fn cte_names(ctx: &Ctx<'_>) -> HashSet<String> {
 fn from_item(
     ctx: &Ctx<'_>,
     ctes: &HashSet<String>,
-    from: &Option<Node>,
+    from: Option<&Node>,
     nullable: bool,
     items: &mut Vec<Item>,
 ) {
-    match from.as_ref() {
+    match from {
         Some(N::RangeVar(rv)) => range_var(ctx, ctes, rv, nullable, items),
         Some(N::JoinExpr(j)) => {
             if let Some(alias) = &j.alias {
@@ -573,7 +573,7 @@ fn from_item(
             };
             for (side, side_nullable) in [(&j.larg, left_nullable), (&j.rarg, right_nullable)] {
                 // A missing side falls to the opaque arm, as before.
-                from_item(ctx, ctes, side, nullable || side_nullable, items);
+                from_item(ctx, ctes, side.as_ref(), nullable || side_nullable, items);
             }
         }
         Some(N::RangeSubselect(s)) => items.push(Item::Opaque {
@@ -863,18 +863,18 @@ fn collations_agree(
 ///
 /// Anything else — arithmetic, a narrowing or parsing cast, another
 /// function call, a pattern match — may fail on some row.
-pub(crate) fn cannot_error(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> bool {
+pub(crate) fn cannot_error(ctx: &Ctx<'_>, expr: Option<&Node>, scope: &FromScope<'_>) -> bool {
     typed(ctx, expr, scope).is_some()
 }
 
 /// [`cannot_error`], with what the expression evaluates to; `None` when
 /// it may fail.
-fn typed(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> Option<Typed> {
+fn typed(ctx: &Ctx<'_>, expr: Option<&Node>, scope: &FromScope<'_>) -> Option<Typed> {
     use crate::oid::PgTypeOid;
     use typedpg_pg_query::ast::AConstValue;
     let catalog = ctx.catalog;
     let boolean = Typed::of(crate::pg_catalog::oid::BOOL);
-    match expr.as_ref()? {
+    match expr? {
         N::ColumnRef(c) => {
             let r = scope.resolve(ctx, c)?;
             let attr = catalog
@@ -916,10 +916,10 @@ fn typed(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> Option<Ty
         N::BoolExpr(b) => b
             .args
             .iter()
-            .all(|a| typed(ctx, a, scope).is_some())
+            .all(|a| typed(ctx, a.as_ref(), scope).is_some())
             .then_some(boolean),
-        N::NullTest(t) => typed(ctx, &t.arg, scope).map(|_| boolean),
-        N::BooleanTest(t) => typed(ctx, &t.arg, scope).map(|_| boolean),
+        N::NullTest(t) => typed(ctx, t.arg.as_ref(), scope).map(|_| boolean),
+        N::BooleanTest(t) => typed(ctx, t.arg.as_ref(), scope).map(|_| boolean),
         N::AExpr(e) => {
             // `OPERATOR(schema.op)` names one PG's resolution doesn't pick.
             let (None, op) = name_parts(&e.name)? else {
@@ -931,12 +931,20 @@ fn typed(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> Option<Ty
             }
             match e.kind {
                 AExprKind::AexprOp if COMPARISONS.contains(&op) => {
-                    let (lt, rt) = (typed(ctx, l, scope)?, typed(ctx, r, scope)?);
+                    let (lt, rt) = (
+                        typed(ctx, l.as_ref(), scope)?,
+                        typed(ctx, r.as_ref(), scope)?,
+                    );
                     comparison_cannot_error(catalog, op, lt, rt).then_some(boolean)
                 }
-                AExprKind::AexprOp if op == "+" || op == "-" => clock_shift(ctx, op, l, r, scope),
+                AExprKind::AexprOp if op == "+" || op == "-" => {
+                    clock_shift(ctx, op, l.as_ref(), r.as_ref(), scope)
+                }
                 AExprKind::AexprDistinct | AExprKind::AexprNotDistinct if op == "=" => {
-                    let (lt, rt) = (typed(ctx, l, scope)?, typed(ctx, r, scope)?);
+                    let (lt, rt) = (
+                        typed(ctx, l.as_ref(), scope)?,
+                        typed(ctx, r.as_ref(), scope)?,
+                    );
                     comparison_cannot_error(catalog, "=", lt, rt).then_some(boolean)
                 }
                 // PG transforms `a BETWEEN b AND c` into `a >= b AND a <=
@@ -953,8 +961,11 @@ fn typed(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> Option<Ty
                     } else {
                         ("<", ">")
                     };
-                    let x = typed(ctx, l, scope)?;
-                    let (lo, hi) = (typed(ctx, lo, scope)?, typed(ctx, hi, scope)?);
+                    let x = typed(ctx, l.as_ref(), scope)?;
+                    let (lo, hi) = (
+                        typed(ctx, lo.as_ref(), scope)?,
+                        typed(ctx, hi.as_ref(), scope)?,
+                    );
                     (comparison_cannot_error(catalog, lower, x, lo)
                         && comparison_cannot_error(catalog, upper, x, hi))
                     .then_some(boolean)
@@ -963,14 +974,14 @@ fn typed(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> Option<Ty
                     let Some(N::List(list)) = r.as_ref() else {
                         return None;
                     };
-                    in_list_cannot_error(ctx, op, l, &list.items, scope).then_some(boolean)
+                    in_list_cannot_error(ctx, op, l.as_ref(), &list.items, scope).then_some(boolean)
                 }
                 _ => None,
             }
         }
         N::TypeCast(t) => {
             let target = plain_type_name(catalog, t.type_name.as_ref()?)?;
-            let arg = typed(ctx, &t.arg, scope)?;
+            let arg = typed(ctx, t.arg.as_ref(), scope)?;
             let source = arg.ty?;
             if source.get() == UNKNOWN {
                 // An untyped literal is read by the type's input function
@@ -1007,7 +1018,7 @@ fn typed(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> Option<Ty
                     if matches!(a, Some(N::NamedArgExpr(_))) {
                         return None;
                     }
-                    let t = typed(ctx, a, scope)?;
+                    let t = typed(ctx, a.as_ref(), scope)?;
                     Some((t, t.ty?))
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -1065,7 +1076,7 @@ fn typed(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> Option<Ty
             let args = c
                 .args
                 .iter()
-                .map(|a| typed(ctx, a, scope))
+                .map(|a| typed(ctx, a.as_ref(), scope))
                 .collect::<Option<Vec<_>>>()?;
             let types = args.iter().map(|a| a.ty).collect::<Option<Vec<_>>>()?;
             let common = crate::coerce::select_common_type(&types, catalog).ok()?;
@@ -1148,10 +1159,10 @@ fn count_call(
         if matches!(arg, Some(N::NamedArgExpr(_))) {
             return None;
         }
-        typed(ctx, arg, scope)?;
+        typed(ctx, arg.as_ref(), scope)?;
     }
     if f.agg_filter.is_some() {
-        typed(ctx, &f.agg_filter, scope)?;
+        typed(ctx, f.agg_filter.as_ref(), scope)?;
     }
     Some(Typed::of(crate::pg_catalog::oid::INT8))
 }
@@ -1343,7 +1354,7 @@ fn comparison_cannot_error(catalog: &PgCatalog, op: &str, left: Typed, right: Ty
 fn in_list_cannot_error(
     ctx: &Ctx<'_>,
     op: &str,
-    x: &Option<Node>,
+    x: Option<&Node>,
     items: &[Option<Node>],
     scope: &FromScope<'_>,
 ) -> bool {
@@ -1353,19 +1364,19 @@ fn in_list_cannot_error(
     };
     // An item with a column of this level is compared on its own; keep to
     // the items that never are.
-    let constant = |n: &Option<Node>| {
-        n.as_ref().is_some_and(|n| {
+    let constant = |n: Option<&Node>| {
+        n.is_some_and(|n| {
             n.nodes()
                 .iter()
                 .all(|(n, _)| !matches!(n, NodeRef::ColumnRef(_) | NodeRef::SubLink(_)))
         })
     };
-    if items.is_empty() || !items.iter().all(constant) {
+    if items.is_empty() || !items.iter().all(|n| constant(n.as_ref())) {
         return false;
     }
     let Some(typed_items) = items
         .iter()
-        .map(|i| typed(ctx, i, scope))
+        .map(|i| typed(ctx, i.as_ref(), scope))
         .collect::<Option<Vec<_>>>()
     else {
         return false;
@@ -1414,13 +1425,13 @@ fn in_list_cannot_error(
 fn clock_shift(
     ctx: &Ctx<'_>,
     op: &str,
-    clock: &Option<Node>,
-    shift: &Option<Node>,
+    clock: Option<&Node>,
+    shift: Option<&Node>,
     scope: &FromScope<'_>,
 ) -> Option<Typed> {
     use typedpg_pg_query::ast::AConstValue;
     let catalog = ctx.catalog;
-    let reads_clock = match clock.as_ref()? {
+    let reads_clock = match clock? {
         N::FuncCall(f) => {
             let (schema, name) = name_parts(&f.funcname)?;
             f.args.is_empty()
@@ -1445,7 +1456,7 @@ fn clock_shift(
         return None;
     }
     let years = super::safe_builtins::MAX_SHIFT_YEARS;
-    let shift_type = match shift.as_ref()? {
+    let shift_type = match shift? {
         N::TypeCast(t) => {
             let target = plain_type_name(catalog, t.type_name.as_ref()?)?;
             let Some(N::AConst(c)) = t.arg.as_ref() else {
@@ -1505,7 +1516,7 @@ fn error_free_select_with(
     ctx: &Ctx<'_>,
     select: &SelectStmt,
     scope: &FromScope<'_>,
-    check: fn(&Ctx<'_>, &Option<Node>, &FromScope<'_>) -> bool,
+    check: fn(&Ctx<'_>, Option<&Node>, &FromScope<'_>) -> bool,
 ) -> bool {
     use typedpg_pg_query::ast::AConstValue;
     if select.op != typedpg_pg_query::ast::SetOperation::SetopNone
@@ -1521,13 +1532,13 @@ fn error_free_select_with(
     if !select
         .from_clause
         .iter()
-        .all(|f| reads_stored_tables(ctx, &ctes, f, &mut quals))
+        .all(|f| reads_stored_tables(ctx, &ctes, f.as_ref(), &mut quals))
         || (!quals.is_empty() && select.from_clause.len() != 1)
     {
         return false;
     }
-    let ok = |n: &Option<Node>| check(ctx, n, scope);
-    let limit_ok = |n: &Option<Node>| match n.as_ref() {
+    let ok = |n: Option<&Node>| check(ctx, n, scope);
+    let limit_ok = |n: Option<&Node>| match n {
         None => true,
         Some(N::AConst(c)) => {
             c.isnull || matches!(&c.val, Some(AConstValue::Integer(i)) if i.ival >= 0)
@@ -1547,19 +1558,24 @@ fn error_free_select_with(
         Some(N::ResTarget(r)) => {
             r.indirection.is_empty()
                 && r.val.is_some()
-                && target_cannot_error(ctx, &r.val, scope, check)
+                && target_cannot_error(ctx, r.val.as_ref(), scope, check)
         }
         _ => false,
-    }) && (select.where_clause.is_none() || ok(&select.where_clause))
-        && select.group_clause.iter().all(ok)
-        && (select.having_clause.is_none() || ok(&select.having_clause))
-        && select.distinct_clause.iter().all(|d| d.is_none() || ok(d))
+    }) && (select.where_clause.is_none() || ok(select.where_clause.as_ref()))
+        && select.group_clause.iter().all(|n| ok(n.as_ref()))
+        && (select.having_clause.is_none() || ok(select.having_clause.as_ref()))
+        && select
+            .distinct_clause
+            .iter()
+            .all(|d| d.is_none() || ok(d.as_ref()))
         && select.sort_clause.iter().all(|s| match s.as_ref() {
-            Some(N::SortBy(by)) => by.use_op.is_empty() && by.node.is_some() && ok(&by.node),
+            Some(N::SortBy(by)) => {
+                by.use_op.is_empty() && by.node.is_some() && ok(by.node.as_ref())
+            }
             _ => false,
         })
-        && limit_ok(&select.limit_count)
-        && limit_ok(&select.limit_offset)
+        && limit_ok(select.limit_count.as_ref())
+        && limit_ok(select.limit_offset.as_ref())
 }
 
 /// Whether a target-list value can't raise: a `*` or `q.*` expands to
@@ -1567,11 +1583,11 @@ fn error_free_select_with(
 /// anything else is `check`ed.
 fn target_cannot_error(
     ctx: &Ctx<'_>,
-    value: &Option<Node>,
+    value: Option<&Node>,
     scope: &FromScope<'_>,
-    check: fn(&Ctx<'_>, &Option<Node>, &FromScope<'_>) -> bool,
+    check: fn(&Ctx<'_>, Option<&Node>, &FromScope<'_>) -> bool,
 ) -> bool {
-    match value.as_ref() {
+    match value {
         Some(N::ColumnRef(column)) => match star_fields(column) {
             Some(qualifier) => star_cannot_error(ctx, scope, qualifier),
             None => check(ctx, value, scope),
@@ -1655,8 +1671,8 @@ fn column_cannot_error(ctx: &Ctx<'_>, rel: PgClassOid, attnum: i16) -> bool {
 }
 
 /// [`cannot_error`], also accepting a whole `count(...)` call.
-fn cannot_error_or_count(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> bool {
-    match expr.as_ref() {
+fn cannot_error_or_count(ctx: &Ctx<'_>, expr: Option<&Node>, scope: &FromScope<'_>) -> bool {
+    match expr {
         Some(N::FuncCall(call)) if count_call(ctx, call, scope).is_some() => true,
         _ => cannot_error(ctx, expr, scope),
     }
@@ -1669,10 +1685,10 @@ fn cannot_error_or_count(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'
 fn reads_stored_tables<'n>(
     ctx: &Ctx<'_>,
     ctes: &HashSet<String>,
-    from: &'n Option<Node>,
-    quals: &mut Vec<(&'n Option<Node>, &'n typedpg_pg_query::ast::JoinExpr)>,
+    from: Option<&'n Node>,
+    quals: &mut Vec<(Option<&'n Node>, &'n typedpg_pg_query::ast::JoinExpr)>,
 ) -> bool {
-    match from.as_ref() {
+    match from {
         Some(N::RangeVar(rv)) => {
             let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
             !(schema.is_none() && ctes.contains(&rv.relname))
@@ -1688,11 +1704,11 @@ fn reads_stored_tables<'n>(
                 return false;
             }
             if j.quals.is_some() {
-                quals.push((&j.quals, j));
+                quals.push((j.quals.as_ref(), j));
             }
             [&j.larg, &j.rarg]
                 .into_iter()
-                .all(|side| side.is_some() && reads_stored_tables(ctx, ctes, side, quals))
+                .all(|side| side.is_some() && reads_stored_tables(ctx, ctes, side.as_ref(), quals))
         }
         _ => false,
     }
@@ -1816,7 +1832,7 @@ pub(crate) fn written_names_use(ctx: &Ctx<'_>, prefix: &str) -> bool {
         return true;
     };
     let hit = |s: &str| s.to_ascii_lowercase().starts_with(prefix);
-    let alias_hit = |a: &Option<typedpg_pg_query::NodeBox<typedpg_pg_query::ast::Alias>>| {
+    let alias_hit = |a: Option<&typedpg_pg_query::ast::Alias>| {
         a.as_ref().is_some_and(|a| {
             hit(&a.aliasname)
                 || a.colnames
@@ -1826,10 +1842,14 @@ pub(crate) fn written_names_use(ctx: &Ctx<'_>, prefix: &str) -> bool {
     };
     parsed.tree.nodes().iter().any(|(n, _)| match n {
         NodeRef::String(s) => hit(&s.sval),
-        NodeRef::RangeVar(r) => hit(&r.relname) || hit(&r.schemaname) || alias_hit(&r.alias),
-        NodeRef::RangeSubselect(r) => alias_hit(&r.alias),
-        NodeRef::RangeFunction(r) => alias_hit(&r.alias),
-        NodeRef::JoinExpr(j) => alias_hit(&j.alias) || alias_hit(&j.join_using_alias),
+        NodeRef::RangeVar(r) => {
+            hit(&r.relname) || hit(&r.schemaname) || alias_hit(r.alias.as_deref())
+        }
+        NodeRef::RangeSubselect(r) => alias_hit(r.alias.as_deref()),
+        NodeRef::RangeFunction(r) => alias_hit(r.alias.as_deref()),
+        NodeRef::JoinExpr(j) => {
+            alias_hit(j.alias.as_deref()) || alias_hit(j.join_using_alias.as_deref())
+        }
         NodeRef::ResTarget(r) => hit(&r.name),
         NodeRef::CommonTableExpr(c) => hit(&c.ctename),
         _ => false,
@@ -1890,8 +1910,8 @@ pub(crate) fn embed_source(sql: &str, range: std::ops::Range<usize>) -> String {
 /// nullable; a non-NULL constant (cast from a string literal, too); an
 /// AND / OR / NOT of such; or a built-in operator or function every
 /// overload of which returns NULL only for a NULL argument, over such.
-pub(crate) fn strictly_not_null(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &FromScope<'_>) -> bool {
-    match expr.as_ref() {
+pub(crate) fn strictly_not_null(ctx: &Ctx<'_>, expr: Option<&Node>, scope: &FromScope<'_>) -> bool {
+    match expr {
         Some(N::ColumnRef(c)) => scope
             .resolve(ctx, c)
             .is_some_and(|r| !r.nullable_side && column_not_null(ctx.catalog, r.rel, r.attnum)),
@@ -1905,7 +1925,10 @@ pub(crate) fn strictly_not_null(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &From
             matches!(
                 b.boolop,
                 BoolExprType::AndExpr | BoolExprType::OrExpr | BoolExprType::NotExpr
-            ) && b.args.iter().all(|a| strictly_not_null(ctx, a, scope))
+            ) && b
+                .args
+                .iter()
+                .all(|a| strictly_not_null(ctx, a.as_ref(), scope))
         }
         Some(N::AExpr(e)) => {
             e.kind == AExprKind::AexprOp
@@ -1913,7 +1936,7 @@ pub(crate) fn strictly_not_null(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &From
                 && [&e.lexpr, &e.rexpr]
                     .into_iter()
                     .filter(|a| a.is_some())
-                    .all(|a| strictly_not_null(ctx, a, scope))
+                    .all(|a| strictly_not_null(ctx, a.as_ref(), scope))
         }
         Some(N::FuncCall(f)) => {
             f.agg_order.is_empty()
@@ -1925,7 +1948,8 @@ pub(crate) fn strictly_not_null(ctx: &Ctx<'_>, expr: &Option<Node>, scope: &From
                 && !f.func_variadic
                 && null_only_on_null_function(ctx.catalog, &f.funcname)
                 && f.args.iter().all(|a| {
-                    !matches!(a, Some(N::NamedArgExpr(_))) && strictly_not_null(ctx, a, scope)
+                    !matches!(a, Some(N::NamedArgExpr(_)))
+                        && strictly_not_null(ctx, a.as_ref(), scope)
                 })
         }
         _ => false,
@@ -2097,17 +2121,14 @@ fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
         }
         node.children().into_iter().any(|c| reaches(c, at))
     }
-    let reaches_in = |n: &Option<Node>| {
-        n.as_ref()
-            .is_some_and(|n| reaches(n.to_ref(), site_location))
-    };
+    let reaches_in = |n: Option<&Node>| n.is_some_and(|n| reaches(n.to_ref(), site_location));
     let top = ctx.tree.stmts.first().and_then(|s| s.stmt.as_ref())?;
     let ctes = cte_names(ctx);
     // The WHERE of a level whose FROM is `from`.
-    let where_safe = |from: &[Option<Node>], where_clause: &Option<Node>, scope: &FromScope<'_>| {
+    let where_safe = |from: &[Option<Node>], where_clause: Option<&Node>, scope: &FromScope<'_>| {
         let mut quals = Vec::new();
         from.iter()
-            .all(|f| reads_stored_tables(ctx, &ctes, f, &mut quals))
+            .all(|f| reads_stored_tables(ctx, &ctes, f.as_ref(), &mut quals))
             && quals.into_iter().all(|(q, join)| {
                 let sides: Vec<Option<Node>> = [&join.larg, &join.rarg]
                     .into_iter()
@@ -2129,13 +2150,13 @@ fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
             if s.op != typedpg_pg_query::ast::SetOperation::SetopNone {
                 return None;
             }
-            if s.target_list.iter().any(reaches_in) {
+            if s.target_list.iter().any(|n| reaches_in(n.as_ref())) {
                 return Some(SitePosition::Values);
             }
             match &s.where_clause {
-                w @ Some(_) if !locks && reaches_in(w) => {
+                w @ Some(_) if !locks && reaches_in(w.as_ref()) => {
                     let scope = FromScope::of_select(ctx, s, None);
-                    where_safe(&s.from_clause, w, &scope).then_some(SitePosition::Where)
+                    where_safe(&s.from_clause, w.as_ref(), &scope).then_some(SitePosition::Where)
                 }
                 _ => None,
             }
@@ -2145,7 +2166,7 @@ fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
         N::UpdateStmt(u) => u
             .target_list
             .iter()
-            .any(reaches_in)
+            .any(|n| reaches_in(n.as_ref()))
             .then_some(SitePosition::Values),
         _ => None,
     }
@@ -2178,12 +2199,12 @@ fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
 /// anything but AND / OR / NOT.
 pub(crate) fn siblings_cannot_error(
     ctx: &Ctx<'_>,
-    clause: &Option<Node>,
+    clause: Option<&Node>,
     site_location: i32,
     scope: &FromScope<'_>,
 ) -> bool {
-    let holds_site = |n: &Option<Node>| {
-        n.as_ref().is_some_and(|n| {
+    let holds_site = |n: Option<&Node>| {
+        n.is_some_and(|n| {
             n.nodes()
                 .iter()
                 .any(|(n, _)| n.location() == Some(site_location))
@@ -2195,11 +2216,11 @@ pub(crate) fn siblings_cannot_error(
     let hidden = hidden_user_calls(ctx.catalog);
     fn check(
         ctx: &Ctx<'_>,
-        node: &Option<Node>,
+        node: Option<&Node>,
         site_location: i32,
         scope: &FromScope<'_>,
         hidden: bool,
-        holds_site: &dyn Fn(&Option<Node>) -> bool,
+        holds_site: &dyn Fn(Option<&Node>) -> bool,
     ) -> bool {
         if node
             .as_ref()
@@ -2208,11 +2229,11 @@ pub(crate) fn siblings_cannot_error(
             return true;
         }
         if holds_site(node) {
-            return match node.as_ref() {
+            return match node {
                 Some(N::BoolExpr(b)) => b
                     .args
                     .iter()
-                    .all(|a| check(ctx, a, site_location, scope, hidden, holds_site)),
+                    .all(|a| check(ctx, a.as_ref(), site_location, scope, hidden, holds_site)),
                 _ => false,
             };
         }
@@ -2224,7 +2245,7 @@ pub(crate) fn siblings_cannot_error(
 /// Whether evaluating `node` runs only built-in code and no sublink: see
 /// [`siblings_cannot_error`]. Every same-named candidate counts, being unable to
 /// tell which one PG resolves.
-fn cheap(ctx: &Ctx<'_>, node: &Option<Node>) -> bool {
+fn cheap(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
     let catalog = ctx.catalog;
     let builtin = |oid: u32| oid < FIRST_GENBKI_OBJECT_ID;
     let operator_builtin = |name: &str| {
@@ -2234,7 +2255,7 @@ fn cheap(ctx: &Ctx<'_>, node: &Option<Node>) -> bool {
             .filter(|o| o.oprname == name)
             .all(|o| builtin(o.oid.get()) && o.oprcode.is_none_or(|p| builtin(p.get())))
     };
-    let Some(root) = node.as_ref() else {
+    let Some(root) = node else {
         return true;
     };
     root.nodes().iter().all(|(n, _)| match n {
@@ -2287,7 +2308,7 @@ fn hidden_user_calls(catalog: &PgCatalog) -> bool {
 /// built-in or through a volatile cast function, a view (its body is not
 /// looked into) or foreign table, TABLESAMPLE, a locking clause. Errs
 /// towards `true`.
-pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: &Option<Node>) -> bool {
+pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
     let catalog = ctx.catalog;
     let ctes = cte_names(ctx);
     let volatile_proc = |p: PgProcOid| {
@@ -2305,7 +2326,7 @@ pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: &Option<Node>) -> bool {
     if hidden_volatile_calls(catalog) {
         return true;
     }
-    let Some(root) = node.as_ref() else {
+    let Some(root) = node else {
         return false;
     };
     root.nodes().iter().any(|(n, _)| match n {

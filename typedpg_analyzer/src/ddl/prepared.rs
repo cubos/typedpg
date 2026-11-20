@@ -126,12 +126,17 @@ pub(crate) fn lookup_execute(
     let ctx = || crate::expr::Ctx::new(&scope, &null_ctx, interp);
     for (i, (arg, &target)) in stmt.params.iter().zip(&prepared.param_types).enumerate() {
         let mut params = crate::param_collector::ParamCollector::default();
-        let given = crate::expr::infer_expr(arg, ctx(), &mut params, crate::expr::TypeGoal::NONE)
-            .map_err(|e| DdlError::Parse(e.to_string()))?;
+        let given = crate::expr::infer_expr(
+            arg.as_ref(),
+            ctx(),
+            &mut params,
+            crate::expr::TypeGoal::NONE,
+        )
+        .map_err(|e| DdlError::Parse(e.to_string()))?;
         if given.type_oid == crate::pg_catalog::oid::UNKNOWN {
             // An untyped literal goes through the type's input function.
             crate::expr::infer_expr(
-                arg,
+                arg.as_ref(),
                 ctx(),
                 &mut params,
                 crate::expr::TypeGoal::assignment(target),
@@ -199,7 +204,10 @@ pub(crate) fn planned_for_arguments<R>(
         })
         .filter_map(|(i, (arg, _))| {
             let number = i32::try_from(i + 1).ok()?;
-            Some((number, crate::expr::operators::const_string(arg, interp)?))
+            Some((
+                number,
+                crate::expr::operators::const_string(arg.as_ref(), interp)?,
+            ))
         })
         .collect();
     crate::expr::plan_fold::with_custom_plan(values, || plan(interp))

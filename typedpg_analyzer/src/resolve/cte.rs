@@ -492,13 +492,16 @@ fn search_cycle_columns(
         let scope = Scope::default();
         let null_ctx = NullabilityContext::default();
         let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
-        let values: Vec<&Option<ast::Node>> = [&cycle.cycle_mark_value, &cycle.cycle_mark_default]
-            .into_iter()
-            .filter(|v| v.is_some())
-            .collect();
+        let values: Vec<Option<&ast::Node>> = [
+            cycle.cycle_mark_value.as_ref(),
+            cycle.cycle_mark_default.as_ref(),
+        ]
+        .into_iter()
+        .filter(|v| v.is_some())
+        .collect();
         let mut types = Vec::with_capacity(values.len());
         for v in &values {
-            types.push(expr::infer_expr(v, ctx, params, TypeGoal::NONE)?.type_oid);
+            types.push(expr::infer_expr(*v, ctx, params, TypeGoal::NONE)?.type_oid);
         }
         let mark_type = if types.is_empty() {
             oid::BOOL
@@ -564,10 +567,10 @@ fn check_search_cycle_clauses(
         return Err(syntax("WITH query is not recursive".into()));
     }
     if let Some(ast::Node::SelectStmt(sel)) = cte.ctequery.as_ref() {
-        let is_leaf = |s: &Option<NodeBox<ast::SelectStmt>>| {
+        let is_leaf = |s: Option<&ast::SelectStmt>| {
             s.as_ref().is_none_or(|s| s.op == SetOperation::SetopNone)
         };
-        if !is_leaf(&sel.larg) {
+        if !is_leaf(sel.larg.as_deref()) {
             return Err(crate::error::RawError::new(
                 AnalyzeError::FeatureNotSupported(
                     "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT"
@@ -578,7 +581,7 @@ fn check_search_cycle_clauses(
             )
             .finalize_implicit());
         }
-        if !is_leaf(&sel.rarg) {
+        if !is_leaf(sel.rarg.as_deref()) {
             return Err(syntax(
                 "with a SEARCH or CYCLE clause, the right side of the UNION must be a SELECT"
                     .into(),
@@ -957,8 +960,8 @@ fn owner_references(with: &ast::WithClause, name: &str) -> Option<usize> {
 /// owning `with` has among its own FROM (USING) items never null-extended (FROM-list items, sides of
 /// inner joins, a LEFT join's left side, a RIGHT join's right one).
 fn owner_kept_reference(with: &ast::WithClause, name: &str) -> Option<String> {
-    fn find(n: &Option<ast::Node>, name: &str) -> Option<String> {
-        match n.as_ref()? {
+    fn find(n: Option<&ast::Node>, name: &str) -> Option<String> {
+        match n? {
             ast::Node::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => Some(
                 rv.alias
                     .as_ref()
@@ -971,10 +974,10 @@ fn owner_kept_reference(with: &ast::WithClause, name: &str) -> Option<String> {
                     ast::JoinType::JoinRight => (false, true),
                     _ => (false, false),
                 };
-                let side = |s: &Option<ast::Node>, kept: bool| {
+                let side = |s: Option<&ast::Node>, kept: bool| {
                     if kept { find(s, name) } else { None }
                 };
-                side(&j.larg, left).or_else(|| side(&j.rarg, right))
+                side(j.larg.as_ref(), left).or_else(|| side(j.rarg.as_ref(), right))
             }
             _ => None,
         }
@@ -989,7 +992,7 @@ fn owner_kept_reference(with: &ast::WithClause, name: &str) -> Option<String> {
             ast::Node::DeleteStmt(del) => &del.using_clause,
             _ => return None,
         };
-        from.iter().find_map(|f| find(f, name))
+        from.iter().find_map(|f| find(f.as_ref(), name))
     })
 }
 
@@ -1080,7 +1083,7 @@ pub(crate) fn inlined(
     };
     match once {
         Some(false) => Some(false),
-        Some(true) if !crate::expr::plan_fold::may_be_volatile(&cte.ctequery, snapshot) => {
+        Some(true) if !crate::expr::plan_fold::may_be_volatile(cte.ctequery.as_ref(), snapshot) => {
             Some(true)
         }
         _ => None,
@@ -1177,16 +1180,16 @@ fn analyze_with_clause_here(
         let cte = ctes[i];
         let returning = match cte.ctequery.as_ref() {
             Some(ast::Node::InsertStmt(s)) => {
-                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+                Some(!crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty())
             }
             Some(ast::Node::UpdateStmt(s)) => {
-                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+                Some(!crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty())
             }
             Some(ast::Node::DeleteStmt(s)) => {
-                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+                Some(!crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty())
             }
             Some(ast::Node::MergeStmt(s)) => {
-                Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
+                Some(!crate::resolve::returning_exprs(s.returning_clause.as_deref()).is_empty())
             }
             _ => None,
         };
@@ -1508,9 +1511,9 @@ impl RecursionWalker<'_> {
                         ctx
                     }
                 };
-                let side = |w: &mut Self, n: &Option<ast::Node>, ctx| {
+                let side = |w: &mut Self, n: Option<&ast::Node>, ctx| {
                     w.context = ctx;
-                    let r = match n.as_ref() {
+                    let r = match n {
                         Some(n) => w.walk(n.to_ref()),
                         None => Ok(()),
                     };
@@ -1523,9 +1526,9 @@ impl RecursionWalker<'_> {
                     JoinType::JoinRight => (outer(save), save),
                     _ => (save, save),
                 };
-                side(self, &j.larg, l)?;
-                side(self, &j.rarg, r)?;
-                side(self, &j.quals, save)?;
+                side(self, j.larg.as_ref(), l)?;
+                side(self, j.rarg.as_ref(), r)?;
+                side(self, j.quals.as_ref(), save)?;
             }
             NodeRef::SubLink(sl) => {
                 // The subquery is independent of the outer context.
@@ -1561,7 +1564,7 @@ impl RecursionWalker<'_> {
             }
             return Ok(());
         }
-        let arg = |w: &mut Self, s: &Option<NodeBox<ast::SelectStmt>>| match s {
+        let arg = |w: &mut Self, s: Option<&ast::SelectStmt>| match s {
             Some(s) => w.walk(typedpg_pg_query::NodeRef::SelectStmt(s)),
             None => Ok(()),
         };
@@ -1572,11 +1575,11 @@ impl RecursionWalker<'_> {
                 RecursionContext::Except
             };
         }
-        arg(self, &stmt.larg)?;
+        arg(self, stmt.larg.as_deref())?;
         if op == SetOperation::SetopExcept {
             self.context = RecursionContext::Except;
         }
-        arg(self, &stmt.rarg)?;
+        arg(self, stmt.rarg.as_deref())?;
         self.context = save;
         for n in stmt
             .sort_clause
@@ -1679,7 +1682,7 @@ fn check_no_aggregates_in_recursive_term(
             _ => None,
         })
         .chain(std::iter::once(&rarg.having_clause))
-        .any(|n| expr::detect_func_kinds(n, snapshot).has_aggregate);
+        .any(|n| expr::detect_func_kinds(n.as_ref(), snapshot).has_aggregate);
     if has_agg {
         return Err(crate::error::RawError::new(
             AnalyzeError::InvalidRecursion(

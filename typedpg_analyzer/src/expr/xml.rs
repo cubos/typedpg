@@ -13,7 +13,7 @@ const XML: PgTypeOid = PgTypeOid::from_raw(142);
 /// type; a typed one needs an assignment cast, else `argument of X must be
 /// type T, not type U` (42804).
 fn coerce_to_specific_type(
-    e: &Option<ast::Node>,
+    e: Option<&ast::Node>,
     target: PgTypeOid,
     construct: &str,
     ctx: Ctx<'_>,
@@ -60,8 +60,8 @@ pub(crate) fn infer_xml_expr(
         if val.is_none() {
             continue;
         }
-        let t = infer_expr(val, ctx, params, TypeGoal::NONE)?;
-        if let Some(p) = super::bare_param(val, ctx.snapshot) {
+        let t = infer_expr(val.as_ref(), ctx, params, TypeGoal::NONE)?;
+        if let Some(p) = super::bare_param(val.as_ref(), ctx.snapshot) {
             params.mark_indeterminate_locked(p.number);
         }
         named_nullable.push(t.nullable);
@@ -92,14 +92,14 @@ pub(crate) fn infer_xml_expr(
     let mut args = Vec::with_capacity(x.args.len());
     for (i, e) in x.args.iter().enumerate() {
         let t = match op {
-            Op::IsXmlconcat => coerce_to_specific_type(e, XML, "XMLCONCAT", ctx, params)?,
-            Op::IsXmlforest => coerce_to_specific_type(e, XML, "XMLFOREST", ctx, params)?,
+            Op::IsXmlconcat => coerce_to_specific_type(e.as_ref(), XML, "XMLCONCAT", ctx, params)?,
+            Op::IsXmlforest => coerce_to_specific_type(e.as_ref(), XML, "XMLFOREST", ctx, params)?,
             Op::IsXmlparse if i == 0 => {
-                coerce_to_specific_type(e, oid::TEXT, "XMLPARSE", ctx, params)?
+                coerce_to_specific_type(e.as_ref(), oid::TEXT, "XMLPARSE", ctx, params)?
             }
             // The grammar's PRESERVE / STRIP WHITESPACE boolean constant.
-            Op::IsXmlparse => infer_expr(e, ctx, params, TypeGoal::NONE)?,
-            Op::IsXmlpi => coerce_to_specific_type(e, oid::TEXT, "XMLPI", ctx, params)?,
+            Op::IsXmlparse => infer_expr(e.as_ref(), ctx, params, TypeGoal::NONE)?,
+            Op::IsXmlpi => coerce_to_specific_type(e.as_ref(), oid::TEXT, "XMLPI", ctx, params)?,
             // XMLROOT(xml, VERSION text, STANDALONE int4 constant).
             Op::IsXmlroot => {
                 let target = match i {
@@ -107,13 +107,13 @@ pub(crate) fn infer_xml_expr(
                     1 => oid::TEXT,
                     _ => oid::INT4,
                 };
-                coerce_to_specific_type(e, target, "XMLROOT", ctx, params)?
+                coerce_to_specific_type(e.as_ref(), target, "XMLROOT", ctx, params)?
             }
-            Op::IsDocument => coerce_to_specific_type(e, XML, "IS DOCUMENT", ctx, params)?,
+            Op::IsDocument => coerce_to_specific_type(e.as_ref(), XML, "IS DOCUMENT", ctx, params)?,
             // XMLELEMENT content: no coercion.
             _ => {
-                let t = infer_expr(e, ctx, params, TypeGoal::NONE)?;
-                if let Some(p) = super::bare_param(e, ctx.snapshot) {
+                let t = infer_expr(e.as_ref(), ctx, params, TypeGoal::NONE)?;
+                if let Some(p) = super::bare_param(e.as_ref(), ctx.snapshot) {
                     params.mark_indeterminate_locked(p.number);
                 }
                 t
@@ -148,7 +148,7 @@ pub(crate) fn infer_xml_serialize(
     let e = &xs.expr;
     e.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("XMLSERIALIZE without argument".into()))?;
-    let arg = coerce_to_specific_type(e, XML, "XMLSERIALIZE", ctx, params)?;
+    let arg = coerce_to_specific_type(e.as_ref(), XML, "XMLSERIALIZE", ctx, params)?;
     let target = resolve_type_name(xs.type_name.as_deref(), snapshot)?;
     let typmod = match xs.type_name.as_ref() {
         Some(tn) => crate::typmod::encode(snapshot, target, tn)

@@ -109,7 +109,7 @@ impl FoldError {
     }
 
     /// The error, pointing at `node`.
-    pub(crate) fn at(&self, node: &Option<ast::Node>) -> AnalyzeError {
+    pub(crate) fn at(&self, node: Option<&ast::Node>) -> AnalyzeError {
         self.raw(crate::error::expr_span(node)).finalize_implicit()
     }
 }
@@ -119,7 +119,7 @@ impl FoldError {
 pub(crate) type Folded = Option<Result<Value, FoldError>>;
 
 /// The error the planner raises folding `node`, if it certainly does.
-pub(crate) fn error(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<FoldError> {
+pub(crate) fn error(node: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<FoldError> {
     fold(node, snapshot)?.err()
 }
 
@@ -131,23 +131,23 @@ pub(crate) type Columns<'a> = dyn Fn(&ast::ColumnRef) -> Option<std::sync::Arc<a
 /// `x::int2` over `(SELECT 40000 AS x) s` is `40000::int2` once `s` is
 /// pulled up (`pullup_replace_vars` precedes `eval_const_expressions`).
 pub(crate) fn error_in(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
     columns: &Columns<'_>,
 ) -> Option<FoldError> {
-    fold_with(node.as_ref(), snapshot, columns)?.err()
+    fold_with(node, snapshot, columns)?.err()
 }
 
 /// The error the planner raises folding `node` once converted to `target`
 /// (of typmod `typmod`) — an assignment to a column of that type, or a
 /// LIMIT's conversion to `bigint` — if it certainly does.
 pub(crate) fn conversion_error(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     target: PgTypeOid,
     typmod: Option<i32>,
     snapshot: &PgCatalog,
 ) -> Option<FoldError> {
-    let value = match node.as_ref()? {
+    let value = match node? {
         // An untyped literal is read as the target type at parse time
         // (that reading's errors are the literal's), then converted.
         ast::Node::AConst(c) if matches!(c.val, Some(ast::AConstValue::String(_))) => {
@@ -162,8 +162,8 @@ pub(crate) fn conversion_error(
 }
 
 /// Fold `node`.
-pub(crate) fn fold(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Folded {
-    fold_with(node.as_ref(), snapshot, &|_| None)
+pub(crate) fn fold(node: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
+    fold_with(node, snapshot, &|_| None)
 }
 
 fn fold_with(node: Option<&ast::Node>, snapshot: &PgCatalog, columns: &Columns<'_>) -> Folded {

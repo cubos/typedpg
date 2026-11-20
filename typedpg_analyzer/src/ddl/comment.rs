@@ -20,7 +20,11 @@ pub fn comment_on(interp: &PgCatalog, stmt: &CommentStmt) -> Result<(), DdlError
     if objtype == ObjectType::ObjectColumn
         && let ast::Node::List(l) = object
     {
-        let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+        let parts: Vec<&str> = l
+            .items
+            .iter()
+            .filter_map(|n| node_string(n.as_ref()))
+            .collect();
         let (schema, name) = match parts.as_slice() {
             [schema, name, _] => (Some(*schema), *name),
             [name, _] => (None, *name),
@@ -86,7 +90,7 @@ pub(crate) fn resolve_object(
             ast::Node::List(l) => l
                 .items
                 .iter()
-                .filter_map(node_string)
+                .filter_map(|n| node_string(n.as_ref()))
                 .map(str::to_owned)
                 .collect(),
             ast::Node::String(s) => vec![s.sval.clone()],
@@ -250,8 +254,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectCollation => {
-            let list = Some(object.clone());
-            super::collations::lookup_collation(interp, &list, false)?;
+            super::collations::lookup_collation(interp, Some(object), false)?;
         }
         ObjectType::ObjectTrigger | ObjectType::ObjectPolicy | ObjectType::ObjectRule => {
             let parts = names(object);
@@ -289,8 +292,7 @@ pub(crate) fn resolve_object(
         }
         ObjectType::ObjectOperator => {
             // LookupOperWithArgs.
-            let wrapped = Some(object.clone());
-            super::drop::lookup_operator(interp, &wrapped)?;
+            super::drop::lookup_operator(interp, Some(object))?;
         }
         ObjectType::ObjectCast => {
             let ast::Node::List(l) = object else {
@@ -389,8 +391,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectTransform => {
-            let wrapped = Some(object.clone());
-            super::languages::find_transform(interp, &wrapped)?;
+            super::languages::find_transform(interp, Some(object))?;
         }
         ObjectType::ObjectConversion => {
             let parts = names(object);

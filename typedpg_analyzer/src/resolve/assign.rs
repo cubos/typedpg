@@ -124,7 +124,7 @@ impl AssignTarget {
     /// reports PG's subscript / subfield wording on a coercion failure.
     pub(crate) fn infer_value(
         &self,
-        val: &Option<ast::Node>,
+        val: Option<&ast::Node>,
         goal: TypeGoal,
         ctx: Ctx<'_>,
         params: &mut ParamCollector,
@@ -228,7 +228,7 @@ enum SetValue<'a> {
     /// `col = expr`, or one element of `(a, b) = ROW(x, y)`; and whether
     /// it is a bare `$N` transformed while `$N` was untyped
     /// ([`crate::expr::replay_transform`]).
-    Expr(&'a Option<ast::Node>, bool),
+    Expr(Option<&'a ast::Node>, bool),
     /// Column `n` of `(a, b) = (SELECT …)`.
     SubqueryColumn(Box<RawColumn>),
 }
@@ -243,8 +243,8 @@ pub(crate) fn expand_multi_assign_rows<'a>(
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Result<std::borrow::Cow<'a, [Option<ast::Node>]>, AnalyzeError> {
-    let expanded_row = |item: &Option<ast::Node>| {
-        let Some(ast::Node::ResTarget(rt)) = item.as_ref() else {
+    let expanded_row = |item: Option<&ast::Node>| {
+        let Some(ast::Node::ResTarget(rt)) = item else {
             return Ok(None);
         };
         let Some(ast::Node::MultiAssignRef(mar)) = rt.val.as_ref() else {
@@ -267,7 +267,7 @@ pub(crate) fn expand_multi_assign_rows<'a>(
     };
     let expanded: Vec<Option<ast::Node>> = target_list
         .iter()
-        .map(expanded_row)
+        .map(|n| expanded_row(n.as_ref()))
         .collect::<Result<_, AnalyzeError>>()?;
     if expanded.iter().all(Option::is_none) {
         return Ok(std::borrow::Cow::Borrowed(target_list));
@@ -318,8 +318,8 @@ fn expand_set_items_replayed<'a>(
         };
         let val = &rt.val;
         let ast::Node::MultiAssignRef(mar) = val_node else {
-            let untyped = replay.item(val, ctx, params);
-            out.push((rt.as_ref(), SetValue::Expr(val, untyped)));
+            let untyped = replay.item(val.as_ref(), ctx, params);
+            out.push((rt.as_ref(), SetValue::Expr(val.as_ref(), untyped)));
             continue;
         };
         let source = mar.source.as_ref();
@@ -341,8 +341,8 @@ fn expand_set_items_replayed<'a>(
                     return Err(count_mismatch());
                 }
                 let elem = &row.args[colno - 1];
-                let untyped = replay.item(elem, ctx, params);
-                out.push((rt.as_ref(), SetValue::Expr(elem, untyped)));
+                let untyped = replay.item(elem.as_ref(), ctx, params);
+                out.push((rt.as_ref(), SetValue::Expr(elem.as_ref(), untyped)));
             }
             Some(ast::Node::SubLink(sl))
                 if matches!(sl.subselect.as_ref(), Some(ast::Node::SelectStmt(_))) =>
@@ -496,7 +496,7 @@ pub(crate) fn analyze_set_clause<'a>(
                 })?;
                 crate::clause::check_no_aggregates_or_windows(val, snapshot, "UPDATE")?;
                 check_no_srf_in_clause(val, snapshot, "UPDATE")?;
-                if let Some(ast::Node::ParamRef(p)) = val.as_ref()
+                if let Some(ast::Node::ParamRef(p)) = val
                     && (!tc.attnotnull || target.indirected)
                 {
                     params.infer_nullable(p.number, true);

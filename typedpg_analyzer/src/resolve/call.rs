@@ -33,8 +33,8 @@ pub(crate) fn analyze_call(
     let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
     let mut arg_types = Vec::with_capacity(fc.args.len());
     for a in &fc.args {
-        check_call_argument(a, snapshot)?;
-        arg_types.push(expr::infer_expr(a, ctx, params, TypeGoal::NONE)?.type_oid);
+        check_call_argument(a.as_ref(), snapshot)?;
+        arg_types.push(expr::infer_expr(a.as_ref(), ctx, params, TypeGoal::NONE)?.type_oid);
     }
     let notation = functions::CallNotation {
         proc_call: true,
@@ -84,10 +84,10 @@ pub(crate) fn analyze_call(
 
 /// EXPR_KIND_CALL_ARGUMENT: no sub-select (transformSubLink, 0A000), no
 /// aggregate, window or set-returning function.
-fn check_call_argument(arg: &Option<ast::Node>, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
+fn check_call_argument(arg: Option<&ast::Node>, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
     let mut sublink = None;
     visit_same_level(arg, &mut |n| {
-        if let Some(ast::Node::SubLink(sl)) = n.as_ref() {
+        if let Some(ast::Node::SubLink(sl)) = n {
             sublink.get_or_insert(sl.location);
         }
     });

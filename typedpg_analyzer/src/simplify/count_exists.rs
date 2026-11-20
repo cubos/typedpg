@@ -325,14 +325,14 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     let unnamed: Vec<&ResTarget> = nodes
         .iter()
         .flat_map(|(n, _)| match n {
-            NodeRef::SelectStmt(s) => s.target_list.iter().collect::<Vec<_>>(),
+            NodeRef::SelectStmt(s) => s.target_list.iter().map(Option::as_ref).collect::<Vec<_>>(),
             NodeRef::InsertStmt(s) => returning(s.returning_clause.as_deref()),
             NodeRef::UpdateStmt(s) => returning(s.returning_clause.as_deref()),
             NodeRef::DeleteStmt(s) => returning(s.returning_clause.as_deref()),
             NodeRef::MergeStmt(s) => returning(s.returning_clause.as_deref()),
             _ => Vec::new(),
         })
-        .filter_map(|n| match n.as_ref() {
+        .filter_map(|n| match n {
             Some(ast::Node::ResTarget(rt)) if rt.name.is_empty() && rt.val.is_some() => Some(&**rt),
             _ => None,
         })
@@ -449,18 +449,18 @@ impl Walker<'_, '_> {
     fn walk_from_rest(&mut self, from: &[Option<Node>], parent: Option<&FromScope<'_>>) {
         let mut left: Vec<Option<Node>> = Vec::new();
         for item in from {
-            self.walk_from_item(item, &mut left, parent);
+            self.walk_from_item(item.as_ref(), &mut left, parent);
         }
     }
 
     /// One FROM item, `left` holding the items before it (and getting it).
     fn walk_from_item(
         &mut self,
-        item: &Option<Node>,
+        item: Option<&Node>,
         left: &mut Vec<Option<Node>>,
         parent: Option<&FromScope<'_>>,
     ) {
-        match item.as_ref() {
+        match item {
             Some(ast::Node::RangeSubselect(s)) => {
                 if s.lateral
                     && let Some(q) = s.subquery.as_ref()
@@ -474,7 +474,7 @@ impl Walker<'_, '_> {
                 // The right side sees the left one (and what precedes the
                 // join): a LATERAL there may read it.
                 for side in [&j.larg, &j.rarg].into_iter().filter(|s| s.is_some()) {
-                    self.walk_from_item(side, left, parent);
+                    self.walk_from_item(side.as_ref(), left, parent);
                 }
                 let sides: Vec<Option<Node>> = [&j.larg, &j.rarg]
                     .into_iter()
@@ -492,7 +492,7 @@ impl Walker<'_, '_> {
             }
             None => {}
         }
-        left.push(item.clone());
+        left.push(item.cloned());
     }
 
     fn select(&mut self, s: &SelectStmt, parent: Option<&FromScope<'_>>) {
@@ -610,7 +610,7 @@ struct Comparison<'a> {
     test: Test,
     /// The count side is the left operand.
     count_left: bool,
-    count: &'a Option<Node>,
+    count: Option<&'a Node>,
     /// The literal's location.
     lit_at: i32,
 }
@@ -631,7 +631,7 @@ fn comparison<'a>(ctx: &Ctx<'_>, text: &Text<'_>, e: &'a ast::AExpr) -> Option<C
     if l.is_none() || r.is_none() {
         return None;
     }
-    let literal = |n: &Option<Node>| match n.as_ref() {
+    let literal = |n: Option<&Node>| match n {
         Some(ast::Node::AConst(c))
             if !c.isnull && matches!(c.val, Some(ast::AConstValue::Integer(_))) =>
         {
@@ -639,10 +639,11 @@ fn comparison<'a>(ctx: &Ctx<'_>, text: &Text<'_>, e: &'a ast::AExpr) -> Option<C
         }
         _ => None,
     };
-    let (count_left, count, (_, lit_at), (test, builtin)) = if let Some(l_lit) = literal(r) {
+    let (count_left, count, (_, lit_at), (test, builtin)) = if let Some(l_lit) = literal(r.as_ref())
+    {
         (true, l, l_lit, count_left(op, l_lit.0)?)
     } else {
-        let r_lit = literal(l)?;
+        let r_lit = literal(l.as_ref())?;
         (false, r, r_lit, count_right(op, r_lit.0)?)
     };
     // The operator the comparison resolves to: count is `bigint`, the
@@ -659,7 +660,7 @@ fn comparison<'a>(ctx: &Ctx<'_>, text: &Text<'_>, e: &'a ast::AExpr) -> Option<C
     Some(Comparison {
         test,
         count_left,
-        count,
+        count: count.as_ref(),
         lit_at,
     })
 }
@@ -672,9 +673,9 @@ fn plain_count(
     ctx: &Ctx<'_>,
     text: &Text<'_>,
     select: &SelectStmt,
-    n: &Option<Node>,
+    n: Option<&Node>,
 ) -> Option<std::ops::Range<usize>> {
-    let Some(ast::Node::FuncCall(fc)) = n.as_ref() else {
+    let Some(ast::Node::FuncCall(fc)) = n else {
         return None;
     };
     let names: Option<Vec<&str>> = fc
@@ -719,7 +720,8 @@ fn plain_count(
             return None;
         };
         let scope = FromScope::of_select(ctx, select, None);
-        if !strictly_not_null(ctx, arg, &scope) || !cannot_error(ctx, arg, &scope) {
+        if !strictly_not_null(ctx, arg.as_ref(), &scope) || !cannot_error(ctx, arg.as_ref(), &scope)
+        {
             return None;
         }
     }
@@ -750,11 +752,11 @@ fn one_row_aggregate(select: &SelectStmt) -> bool {
 /// (whose policies run per row). A CTE read from inside `node` is refused
 /// too: [`has_volatile`] doesn't look into one declared outside it, and
 /// `EXISTS` reads a materialized CTE's rows only as far as it needs them.
-fn pure(ctx: &Ctx<'_>, cte_names: &[&str], node: &Option<Node>) -> bool {
+fn pure(ctx: &Ctx<'_>, cte_names: &[&str], node: Option<&Node>) -> bool {
     if has_volatile(ctx, node) {
         return false;
     }
-    let Some(inner) = node.as_ref() else {
+    let Some(inner) = node else {
         return true;
     };
     inner.nodes().iter().all(|(n, _)| match n {
@@ -808,7 +810,7 @@ fn sublink_form(
     if !target.indirection.is_empty() {
         return None;
     }
-    let call = plain_count(ctx, text, select, &target.val)?;
+    let call = plain_count(ctx, text, select, target.val.as_ref())?;
     // The planner may pull `EXISTS` up into a semi- or anti-join and run
     // the subquery's conditions over rows the correlated count never
     // reached (`1 / s.z > 0` on every row of `s`, not just those with
@@ -999,7 +1001,7 @@ fn top_level_form(
     // conjunct of anything — the WHERE is the counted query's own, moved
     // whole into the EXISTS, and `error_free_select` already keeps every
     // conjunct of it free of sublinks, functions and errors.
-    if !pure(ctx, cte_names, stmt_node)
+    if !pure(ctx, cte_names, stmt_node.as_ref())
         || !counted_error_free(ctx, select, &FromScope::of_select(ctx, select, None))
     {
         return None;
@@ -1110,6 +1112,6 @@ fn in_top_level_where(ctx: &Ctx<'_>, location: i32) -> bool {
 }
 
 /// A DML statement's RETURNING entries.
-fn returning(clause: Option<&ast::ReturningClause>) -> Vec<&Option<Node>> {
-    clause.map_or_else(Vec::new, |c| c.exprs.iter().collect())
+fn returning(clause: Option<&ast::ReturningClause>) -> Vec<Option<&Node>> {
+    clause.map_or_else(Vec::new, |c| c.exprs.iter().map(Option::as_ref).collect())
 }

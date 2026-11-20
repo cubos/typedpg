@@ -61,7 +61,7 @@ pub(crate) fn collation_clause(
 ) -> Option<crate::oid::PgCollationOid> {
     let names: Vec<&str> = names
         .iter()
-        .filter_map(super::super::util::node_string)
+        .filter_map(|n| super::super::util::node_string(n.as_ref()))
         .collect();
     match names.as_slice() {
         [schema, name] => interp.resolve_collation(Some(schema), name),
@@ -226,7 +226,8 @@ pub(super) fn record_partition_spec(
         } else if pe.expr.is_some() {
             let expr = &pe.expr;
             let (typ, expr_collation) =
-                match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
+                match crate::ddl::volatile::infer_over_relation(interp, relid, expr.as_ref(), None)
+                {
                     // The expression's collation (exprCollation), else its
                     // type's default.
                     Some(Ok(t)) => (
@@ -239,7 +240,7 @@ pub(super) fn record_partition_spec(
             let collation = explicit.unwrap_or(expr_collation);
             let opclass = opclass_of(typ, pe);
             let strict_attnums =
-                crate::ddl::volatile::strict_columns_over_relation(interp, relid, expr)
+                crate::ddl::volatile::strict_columns_over_relation(interp, relid, expr.as_ref())
                     .iter()
                     .filter_map(|c| interp.attribute_by_name(relid, c).map(|a| a.attnum))
                     .collect();
@@ -337,7 +338,7 @@ fn transform_bound(
             });
             let mut values: Vec<Option<Datum>> = Vec::new();
             for v in &spec.listdatums {
-                let d = bound_value(interp, v, &key)?;
+                let d = bound_value(interp, v.as_ref(), &key)?;
                 // Duplicates within one list are dropped.
                 if d.as_ref().is_some_and(|d| *d == Datum::Opaque) || !values.contains(&d) {
                     values.push(d);
@@ -376,7 +377,11 @@ fn range_datums(
     for (v, key) in values.iter().zip(keys) {
         let infinite = match v.as_ref() {
             Some(ast::Node::ColumnRef(cr)) if cr.fields.len() == 1 => {
-                match cr.fields.first().and_then(super::super::util::node_string) {
+                match cr
+                    .fields
+                    .first()
+                    .and_then(|n| super::super::util::node_string(n.as_ref()))
+                {
                     Some(n) if n.eq_ignore_ascii_case("minvalue") => Some(RangeDatum::MinValue),
                     Some(n) if n.eq_ignore_ascii_case("maxvalue") => Some(RangeDatum::MaxValue),
                     _ => None,
@@ -386,7 +391,7 @@ fn range_datums(
         };
         let d = match infinite {
             Some(d) => d,
-            None => match bound_value(interp, v, key)? {
+            None => match bound_value(interp, v.as_ref(), key)? {
                 Some(d) => RangeDatum::Value(d),
                 None => {
                     return Err(DdlError::Parse("cannot specify NULL in range bound".into()));
@@ -424,7 +429,7 @@ fn range_datums(
 /// type. `None` is NULL.
 fn bound_value(
     interp: &PgCatalog,
-    v: &Option<typedpg_pg_query::ast::Node>,
+    v: Option<&typedpg_pg_query::ast::Node>,
     key: &PartKey,
 ) -> Result<Option<Datum>, DdlError> {
     let (key_type, key_name) = (&key.type_oid, &key.name);
@@ -432,7 +437,7 @@ fn bound_value(
     use crate::expr::{TypeGoal, infer_expr};
     use crate::pg_catalog::oid;
 
-    if let Some(inner) = v.as_ref()
+    if let Some(inner) = v
         && (matches!(inner, ast::Node::ColumnRef(_))
             || inner
                 .nodes()
@@ -448,7 +453,7 @@ fn bound_value(
         v,
         crate::ddl::expr_kind::ExprKind::PartitionBound,
     )?;
-    if let Some(ast::Node::AConst(c)) = v.as_ref()
+    if let Some(ast::Node::AConst(c)) = v
         && c.isnull
     {
         return Ok(None);
@@ -648,7 +653,10 @@ fn fold_integer(v: &typedpg_pg_query::ast::Node) -> Option<i128> {
             _ => None,
         },
         ast::Node::AExpr(e) if e.kind == typedpg_pg_query::ast::AExprKind::AexprOp => {
-            let op = e.name.first().and_then(super::super::util::node_string)?;
+            let op = e
+                .name
+                .first()
+                .and_then(|n| super::super::util::node_string(n.as_ref()))?;
             let r = fold_integer(e.rexpr.as_ref()?)?;
             match e.lexpr.as_ref() {
                 None if op == "-" => Some(-r),

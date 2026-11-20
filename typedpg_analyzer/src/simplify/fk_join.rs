@@ -76,7 +76,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     }
     let stmt = &raw.stmt;
     // Views and row locking count as volatile there too.
-    if has_volatile(ctx, stmt) || has_using_or_natural(root) {
+    if has_volatile(ctx, stmt.as_ref()) || has_using_or_natural(root) {
         return Vec::new();
     }
     let Some(tokens) = Tokens::scan(ctx.sql) else {
@@ -89,13 +89,13 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     };
     let mut out = Vec::new();
     for item in &sel.from_clause {
-        site.join_sites(item, &mut out);
+        site.join_sites(item.as_ref(), &mut out);
     }
     if sel.where_clause.is_some() {
         let quals = &sel.where_clause;
         for (i, item) in sel.from_clause.iter().enumerate() {
             if let Some(Node::RangeVar(rv)) = item.as_ref()
-                && let Some(edits) = site.comma_site(sel, i, rv, quals)
+                && let Some(edits) = site.comma_site(sel, i, rv, quals.as_ref())
                 && site.tokens.clear_of_comments(&edits)
             {
                 out.push(Candidate {
@@ -211,8 +211,8 @@ impl<'a> Tokens<'a> {
 // ─── Shapes ───────────────────────────────────────────────────────────────
 
 /// A `q.col` column reference's qualifier and column.
-fn qualified(n: &Option<ast::Node>) -> Option<(&ast::ColumnRef, &str, &str)> {
-    let Some(Node::ColumnRef(cr)) = n.as_ref() else {
+fn qualified(n: Option<&ast::Node>) -> Option<(&ast::ColumnRef, &str, &str)> {
+    let Some(Node::ColumnRef(cr)) = n else {
         return None;
     };
     match cr.fields.as_slice() {
@@ -239,8 +239,8 @@ struct KeyEquality<'a> {
 
 /// `node` as an equality between a column of `parent` (by its range
 /// name) and a column of another range name.
-fn key_equality<'a>(node: &'a Option<ast::Node>, parent: &str) -> Option<KeyEquality<'a>> {
-    let Some(Node::AExpr(e)) = node.as_ref() else {
+fn key_equality<'a>(node: Option<&'a ast::Node>, parent: &str) -> Option<KeyEquality<'a>> {
+    let Some(Node::AExpr(e)) = node else {
         return None;
     };
     if e.kind != AExprKind::AexprOp {
@@ -250,8 +250,8 @@ fn key_equality<'a>(node: &'a Option<ast::Node>, parent: &str) -> Option<KeyEqua
         [op] if matches!(op.as_ref(), Some(Node::String(s)) if s.sval == "=") => {}
         _ => return None,
     }
-    let (left, lq, lc) = qualified(&e.lexpr)?;
-    let (right, rq, rc) = qualified(&e.rexpr)?;
+    let (left, lq, lc) = qualified(e.lexpr.as_ref())?;
+    let (right, rq, rc) = qualified(e.rexpr.as_ref())?;
     let (parent_left, parent_col, child, child_col) = if lq == parent && rq != parent {
         (true, lc, rq, rc)
     } else if rq == parent && lq != parent {
@@ -272,9 +272,11 @@ fn key_equality<'a>(node: &'a Option<ast::Node>, parent: &str) -> Option<KeyEqua
 
 /// The conjuncts of `quals`: the arguments of a top-level AND, or `quals`
 /// itself.
-fn conjuncts(quals: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
-    match quals.as_ref() {
-        Some(Node::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr => b.args.iter().collect(),
+fn conjuncts(quals: Option<&ast::Node>) -> Vec<Option<&ast::Node>> {
+    match quals {
+        Some(Node::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr => {
+            b.args.iter().map(Option::as_ref).collect()
+        }
         _ => vec![quals],
     }
 }
@@ -318,8 +320,8 @@ enum Found<'a> {
 /// The range named `name` in the join tree `node`, when every row of the
 /// tree has one of its rows (it's never on the nullable side of an outer
 /// join).
-fn find_range<'a>(node: &'a Option<ast::Node>, name: &str) -> Found<'a> {
-    match node.as_ref() {
+fn find_range<'a>(node: Option<&'a ast::Node>, name: &str) -> Found<'a> {
+    match node {
         Some(Node::RangeVar(rv)) if refname(rv) == name => Found::Here(rv),
         Some(Node::RangeVar(_)) => Found::Absent,
         Some(Node::JoinExpr(j)) => {
@@ -341,7 +343,7 @@ fn find_range<'a>(node: &'a Option<ast::Node>, name: &str) -> Found<'a> {
             for (side, preserved) in sides {
                 let found = match side {
                     None => Found::Absent,
-                    Some(_) => find_range(side, name),
+                    Some(_) => find_range(side.as_ref(), name),
                 };
                 match found {
                     Found::Here(rv) if preserved => return Found::Here(rv),
@@ -595,12 +597,12 @@ impl Site<'_, '_> {
     /// all against the same child range name.
     fn all_key_equalities<'n>(
         &self,
-        quals: &[&'n Option<ast::Node>],
+        quals: &[Option<&'n ast::Node>],
         parent: &str,
     ) -> Option<Vec<KeyEquality<'n>>> {
         let eqs: Vec<KeyEquality<'n>> = quals
             .iter()
-            .map(|q| key_equality(q, parent))
+            .map(|q| key_equality(*q, parent))
             .collect::<Option<_>>()?;
         let child = eqs.first()?.child;
         eqs.iter().all(|e| e.child == child).then_some(eqs)
@@ -608,12 +610,12 @@ impl Site<'_, '_> {
 
     /// The JOIN form at every INNER JoinExpr of the tree `node` whose
     /// right-hand side is the parent.
-    fn join_sites(&self, node: &Option<ast::Node>, out: &mut Vec<Candidate>) {
-        let Some(Node::JoinExpr(j)) = node.as_ref() else {
+    fn join_sites(&self, node: Option<&ast::Node>, out: &mut Vec<Candidate>) {
+        let Some(Node::JoinExpr(j)) = node else {
             return;
         };
         for side in [&j.larg, &j.rarg] {
-            self.join_sites(side, out);
+            self.join_sites(side.as_ref(), out);
         }
         if let Some(edits) = self.join_site(j)
             && self.tokens.clear_of_comments(&edits)
@@ -639,9 +641,9 @@ impl Site<'_, '_> {
         };
         let parent = relation(self.ctx, prv)?;
         j.quals.as_ref()?;
-        let quals = conjuncts(&j.quals);
+        let quals = conjuncts(j.quals.as_ref());
         let equalities = self.all_key_equalities(&quals, refname(prv))?;
-        let Found::Here(crv) = find_range(&j.larg, equalities[0].child) else {
+        let Found::Here(crv) = find_range(j.larg.as_ref(), equalities[0].child) else {
             return None;
         };
         let child = relation(self.ctx, crv)?;
@@ -679,7 +681,7 @@ impl Site<'_, '_> {
         sel: &ast::SelectStmt,
         i: usize,
         prv: &ast::RangeVar,
-        where_clause: &Option<ast::Node>,
+        where_clause: Option<&ast::Node>,
     ) -> Option<Vec<Edit>> {
         let parent = relation(self.ctx, prv)?;
         let pname = refname(prv);
@@ -687,7 +689,7 @@ impl Site<'_, '_> {
         let keyed: Vec<(usize, KeyEquality<'_>)> = all
             .iter()
             .enumerate()
-            .filter_map(|(k, q)| Some((k, key_equality(q, pname)?)))
+            .filter_map(|(k, q)| Some((k, key_equality(*q, pname)?)))
             .collect();
         let child_name = keyed.first()?.1.child;
         if keyed.iter().any(|(_, e)| e.child != child_name) {
@@ -699,7 +701,7 @@ impl Site<'_, '_> {
             if k == i {
                 continue;
             }
-            match find_range(item, child_name) {
+            match find_range(item.as_ref(), child_name) {
                 Found::Here(rv) if found.is_none() => found = Some(rv),
                 Found::Absent => {}
                 _ => return None,

@@ -103,7 +103,7 @@ pub(crate) fn inline_call(
     let (result, _) = crate::ddl::depend::collect(|| {
         let _level = crate::resolve::QueryLevel::enter();
         infer_expr(
-            body,
+            body.as_ref(),
             Ctx::new(&scope, &null_ctx, snapshot),
             &mut params,
             TypeGoal::NONE,
@@ -175,7 +175,7 @@ fn body_scope(proc: &crate::pg_catalog::PgProc, bound: &[ExprType]) -> Option<cr
 pub(crate) fn body_trust(
     snapshot: &crate::pg_catalog::PgCatalog,
     proc: &crate::pg_catalog::PgProc,
-    body: &Option<typedpg_pg_query::ast::Node>,
+    body: Option<&typedpg_pg_query::ast::Node>,
 ) -> Option<crate::nonnull::TrustedNodes> {
     let bound: Option<Vec<ExprType>> = proc
         .proargtypes
@@ -223,7 +223,7 @@ pub(crate) fn cached_body_trust(
     let compute = || {
         let proc = snapshot.pg_proc.get(&oid)?;
         let body = snapshot.inline_sql_bodies.get(&oid)?;
-        body_trust(snapshot, proc, body)
+        body_trust(snapshot, proc, body.as_ref())
     };
     if resolving() {
         return compute().map(std::borrow::Cow::Owned);

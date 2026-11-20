@@ -72,7 +72,7 @@ pub(super) fn sure_row_violation(
                 snapshot,
                 tc.atttypid,
                 snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-                v,
+                v.as_ref(),
             )?;
             Some(RowViolation {
                 order: (false, tc.attnum),
@@ -85,10 +85,10 @@ pub(super) fn sure_row_violation(
     let known = |i: usize| match (known_at(i), target_col_at(tgt, i), column_types.get(i)) {
         (true, Some(tc), Some(&t)) => {
             let source = (t != oid::UNKNOWN).then_some(t);
-            if is_null_value(&items[i], tc, source, snapshot) {
+            if is_null_value(items[i].as_ref(), tc, source, snapshot) {
                 Known::Null
             } else if t == snapshot.unwrap_domain(tc.atttypid) {
-                Known::Value(&items[i])
+                Known::Value(items[i].as_ref())
             } else {
                 Known::Unknown
             }
@@ -154,7 +154,10 @@ fn sure_level<'a>(
         || sel.with_clause.is_some()
         || sel.into_clause.is_some()
         || !sel.locking_clause.is_empty()
-        || !sel.group_clause.iter().all(empty_grouping_set)
+        || !sel
+            .group_clause
+            .iter()
+            .all(|n| empty_grouping_set(n.as_ref()))
         || sel.having_clause.is_some()
         || !keeps_first_row(sel)
         || !crate::resolve::walk::level_srf_calls(sel, snapshot).is_empty()
@@ -166,12 +169,14 @@ fn sure_level<'a>(
     if sel.group_clause.is_empty() && !aggregates(sel, snapshot) {
         match sel.from_clause.as_slice() {
             [] => {}
-            [from] => inner = Some(from_subquery(from, snapshot, ctes, depth)?),
+            [from] => inner = Some(from_subquery(from.as_ref(), snapshot, ctes, depth)?),
             _ => return None,
         }
         if sel.where_clause.is_some() {
             let column = |cr: &ast::ColumnRef| column_value(inner.as_ref(), cr);
-            if crate::resolve::failing_rows::qual_truth(&sel.where_clause, &column) != Some(true) {
+            if crate::resolve::failing_rows::qual_truth(sel.where_clause.as_ref(), &column)
+                != Some(true)
+            {
                 return None;
             }
         }
@@ -243,7 +248,7 @@ pub(in crate::resolve) fn sure_select_error(
         };
         let val = &rt.val;
         val.as_ref()?;
-        crate::fold::error_in(val, snapshot, &columns).map(|e| e.at(val))
+        crate::fold::error_in(val.as_ref(), snapshot, &columns).map(|e| e.at(val.as_ref()))
     })
 }
 
@@ -251,12 +256,12 @@ pub(in crate::resolve) fn sure_select_error(
 /// or a reference to one of `ctes` (inlined or materialized, a CTE yields
 /// its query's rows).
 fn from_subquery<'a>(
-    from: &'a Option<ast::Node>,
+    from: Option<&'a ast::Node>,
     snapshot: &PgCatalog,
     ctes: &[&'a ast::CommonTableExpr],
     depth: usize,
 ) -> Option<Subquery<'a>> {
-    let (sub, renames, alias, visible) = match from.as_ref()? {
+    let (sub, renames, alias, visible) = match from? {
         ast::Node::RangeSubselect(rs) => {
             (rs.subquery.as_ref()?, Vec::new(), rs.alias.as_ref(), ctes)
         }
@@ -287,7 +292,7 @@ fn from_subquery<'a>(
             };
         }
     }
-    let alias = match (alias, from.as_ref()) {
+    let alias = match (alias, from) {
         (Some(a), _) => Some(a.aliasname.as_str()),
         (None, Some(ast::Node::RangeVar(rv))) => Some(rv.relname.as_str()),
         (None, _) => None,
@@ -315,8 +320,8 @@ fn aggregates(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
     };
     let mut found = false;
     for t in &sel.target_list {
-        crate::resolve::walk::visit_same_level(t, &mut |e| {
-            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
+        crate::resolve::walk::visit_same_level(t.as_ref(), &mut |e| {
+            if let Some(ast::Node::FuncCall(fc)) = e
                 && surely_aggregate(fc)
             {
                 found = true;
@@ -327,8 +332,8 @@ fn aggregates(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
 }
 
 /// `GROUP BY ()`: one group, even over no input.
-fn empty_grouping_set(n: &Option<ast::Node>) -> bool {
-    matches!(n.as_ref(), Some(ast::Node::GroupingSet(gs))
+fn empty_grouping_set(n: Option<&ast::Node>) -> bool {
+    matches!(n, Some(ast::Node::GroupingSet(gs))
         if gs.kind == ast::GroupingSetKind::GroupingSetEmpty)
 }
 

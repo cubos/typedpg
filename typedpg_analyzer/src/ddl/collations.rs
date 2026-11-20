@@ -45,7 +45,10 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
             // defGetString: a bare word arrives as a type name.
             let provider = match de.arg.as_ref() {
                 Some(ast::Node::String(s)) => Some(s.sval.as_str()),
-                Some(ast::Node::TypeName(tn)) => tn.names.last().and_then(super::util::node_string),
+                Some(ast::Node::TypeName(tn)) => tn
+                    .names
+                    .last()
+                    .and_then(|n| super::util::node_string(n.as_ref())),
                 _ => None,
             };
             if provider.is_some_and(|p| !p.eq_ignore_ascii_case("libc")) {
@@ -119,16 +122,16 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
 /// collation. `Ok(None)` when it's missing and `missing_ok`.
 pub(crate) fn lookup_collation(
     interp: &PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<Option<PgCollationOid>, DdlError> {
-    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node else {
         return Ok(None);
     };
     let names: Vec<&str> = list
         .items
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .collect();
     let (schema, name) = match names.as_slice() {
         [n] => (None, *n),
@@ -188,7 +191,7 @@ pub(crate) fn rename_collation(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(oid) = lookup_collation(interp, &stmt.object, stmt.missing_ok)? else {
+    let Some(oid) = lookup_collation(interp, stmt.object.as_ref(), stmt.missing_ok)? else {
         return Ok(());
     };
     let Some(mut row) = interp.pg_collation.get(&oid).cloned() else {
@@ -208,7 +211,7 @@ pub(crate) fn set_collation_schema(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::AlterObjectSchemaStmt,
 ) -> Result<(), DdlError> {
-    let Some(oid) = lookup_collation(interp, &stmt.object, stmt.missing_ok)? else {
+    let Some(oid) = lookup_collation(interp, stmt.object.as_ref(), stmt.missing_ok)? else {
         return Ok(());
     };
     let Some(mut row) = interp.pg_collation.get(&oid).cloned() else {
@@ -238,14 +241,14 @@ pub(crate) fn refresh_version(
         }
         .into(),
     ));
-    lookup_collation(interp, &list, false).map(|_| ())
+    lookup_collation(interp, list.as_ref(), false).map(|_| ())
 }
 
 /// DROP COLLATION name [CASCADE | RESTRICT] (`RemoveObjects` →
 /// `performDeletion`).
 pub(crate) fn drop_collation(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {

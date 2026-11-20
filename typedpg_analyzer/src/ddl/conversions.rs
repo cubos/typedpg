@@ -135,7 +135,11 @@ pub fn create_conversion(
             "encoding conversion to or from \"SQL_ASCII\" is not supported".into(),
         ));
     }
-    let parts: Vec<&str> = stmt.func_name.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = stmt
+        .func_name
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     let (schema, func) = match parts.as_slice() {
         [schema, func] => (Some(*schema), *func),
         [func] => (None, *func),
@@ -299,13 +303,17 @@ pub(crate) fn check_not_pinned(
 /// DROP CONVERSION [IF EXISTS] name.
 pub(crate) fn drop_conversion(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(typedpg_pg_query::ast::Node::List(l)) = obj_node.as_ref() else {
+    let Some(typedpg_pg_query::ast::Node::List(l)) = obj_node else {
         return Ok(());
     };
-    let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+    let names: Vec<&str> = l
+        .items
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     match find(interp, &names) {
         Some(found) => {
             check_not_pinned(interp, &found)?;
@@ -325,7 +333,11 @@ pub(crate) fn rename_conversion(
     let Some(typedpg_pg_query::ast::Node::List(l)) = stmt.object.as_ref() else {
         return Ok(());
     };
-    let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+    let names: Vec<&str> = l
+        .items
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     let Some(found) = find(interp, &names) else {
         return Err(not_found(interp, &names));
     };
@@ -356,7 +368,11 @@ pub(crate) fn set_conversion_schema(
     let Some(typedpg_pg_query::ast::Node::List(l)) = stmt.object.as_ref() else {
         return Ok(());
     };
-    let names: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+    let names: Vec<&str> = l
+        .items
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     let Some(found) = find(interp, &names) else {
         if stmt.missing_ok {
             return Ok(());

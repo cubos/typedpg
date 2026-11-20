@@ -100,7 +100,7 @@ pub(crate) fn emit_constraints(
                         Vec::new(),
                         Some((
                             check_inherit::CheckDef::new(
-                                check_inherit::StoredExpr::written(&c.raw_expr),
+                                check_inherit::StoredExpr::written(c.raw_expr.as_ref()),
                                 c.is_no_inherit,
                             ),
                             c.is_enforced,
@@ -204,7 +204,7 @@ pub(crate) fn emit_constraints(
                     Vec::new(),
                     Some((
                         check_inherit::CheckDef::new(
-                            check_inherit::StoredExpr::written(&c.raw_expr),
+                            check_inherit::StoredExpr::written(c.raw_expr.as_ref()),
                             c.is_no_inherit,
                         ),
                         c.is_enforced,
@@ -456,7 +456,11 @@ fn include_attnums(
 ) -> Result<(Vec<i16>, Vec<String>), DdlError> {
     let mut attnums = Vec::new();
     let mut names = Vec::new();
-    for name in c.including.iter().filter_map(crate::ddl::util::node_string) {
+    for name in c
+        .including
+        .iter()
+        .filter_map(|n| crate::ddl::util::node_string(n.as_ref()))
+    {
         let attnum = interp
             .attribute_by_name(relid, name)
             .map(|a| a.attnum)
@@ -918,17 +922,17 @@ fn exclusion_keys(
     }
     // DefineIndex: nor may its expressions or predicate read a virtual
     // generated column.
-    let exprs: Vec<&Option<typedpg_pg_query::ast::Node>> = c
+    let exprs: Vec<Option<&typedpg_pg_query::ast::Node>> = c
         .exclusions
         .iter()
         .filter_map(|pair| match pair.as_ref()? {
             ast::Node::List(l) => match l.items.first()?.as_ref()? {
-                ast::Node::IndexElem(elem) => elem.expr.is_some().then_some(&elem.expr),
+                ast::Node::IndexElem(elem) => elem.expr.is_some().then_some(elem.expr.as_ref()),
                 _ => None,
             },
             _ => None,
         })
-        .chain(c.where_clause.is_some().then_some(&c.where_clause))
+        .chain(c.where_clause.is_some().then_some(c.where_clause.as_ref()))
         .collect();
     crate::ddl::indexes::check_index_columns(
         interp,
@@ -1106,7 +1110,7 @@ pub(crate) fn validate_constraint_expressions(
                 interp,
                 class_oid,
                 attr.attnum,
-                stored.and_then(|e| e.as_ref()),
+                stored.flatten(),
             );
         }
         for c_node in &cd.constraints {
@@ -1119,16 +1123,16 @@ pub(crate) fn validate_constraint_expressions(
                         let expr = &c.raw_expr;
                         crate::ddl::expr_kind::check_expr_kind(
                             interp,
-                            expr,
+                            expr.as_ref(),
                             crate::ddl::expr_kind::ExprKind::CheckConstraint,
                         )?;
-                        check_system_column_refs(interp, class_oid, expr)?;
+                        check_system_column_refs(interp, class_oid, expr.as_ref())?;
                         // Infer with no type goal so a non-bool result
                         // doesn't surface as a TypeMismatch — we want PG's
                         // exact wording (`argument of CHECK must be type
                         // boolean, not type X`).
                         let result = infer_expr(
-                            expr,
+                            expr.as_ref(),
                             crate::expr::Ctx::new(&scope, &null_ctx, interp),
                             &mut params,
                             TypeGoal::NONE,
@@ -1138,7 +1142,7 @@ pub(crate) fn validate_constraint_expressions(
                                 oid::BOOL,
                                 crate::coerce::CoercionContext::Assignment,
                                 interp,
-                                expr,
+                                expr.as_ref(),
                             )?;
                             Ok(r)
                         })
@@ -1173,7 +1177,7 @@ pub(crate) fn validate_constraint_expressions(
                             attr.atttypid,
                             attr.attgenerated
                                 .unwrap_or(crate::pg_catalog::AttGenerated::Stored),
-                            &c.raw_expr,
+                            c.raw_expr.as_ref(),
                         )?;
                         cooked.record(interp, class_oid, attr.attnum);
                     }
@@ -1193,12 +1197,12 @@ pub(crate) fn validate_constraint_expressions(
             let expr = &c.raw_expr;
             crate::ddl::expr_kind::check_expr_kind(
                 interp,
-                expr,
+                expr.as_ref(),
                 crate::ddl::expr_kind::ExprKind::CheckConstraint,
             )?;
-            check_system_column_refs(interp, class_oid, expr)?;
+            check_system_column_refs(interp, class_oid, expr.as_ref())?;
             let result = infer_expr(
-                expr,
+                expr.as_ref(),
                 crate::expr::Ctx::new(&scope, &null_ctx, interp),
                 &mut params,
                 TypeGoal::NONE,
@@ -1208,7 +1212,7 @@ pub(crate) fn validate_constraint_expressions(
                     oid::BOOL,
                     crate::coerce::CoercionContext::Assignment,
                     interp,
-                    expr,
+                    expr.as_ref(),
                 )?;
                 Ok(r)
             })
@@ -1724,7 +1728,7 @@ fn add_constraint_node(
         let expr = &c.raw_expr;
         // No volatility walk for CHECK — PG accepts volatile expressions at
         // DDL time, only the type-must-be-bool check below has teeth.
-        validate_check_expression_for_table(interp, relid, expr)?;
+        validate_check_expression_for_table(interp, relid, expr.as_ref())?;
         // ATRewriteTables validates a new constraint over a table's rows
         // (validateCheckConstraint), planning it first: what the planner
         // folds of it fails the statement, rows or not.
@@ -1732,7 +1736,7 @@ fn add_constraint_node(
             && c.is_enforced
             && interp.pg_class.get(&relid).map(|r| r.relkind) == Some(RelKind::Table)
             && let Some(Err(e)) = crate::expr::with_plan_time_checks(|| {
-                crate::ddl::volatile::infer_over_relation(interp, relid, expr, None)
+                crate::ddl::volatile::infer_over_relation(interp, relid, expr.as_ref(), None)
             })
         {
             return Err(DdlError::UnsupportedDdl(e.to_string()));
@@ -1750,7 +1754,7 @@ fn add_constraint_node(
             interp,
             relid,
             &conname,
-            expr,
+            expr.as_ref(),
             c.is_no_inherit,
             rec,
             check_conkey(interp, relid, expr.as_ref()),
@@ -2023,9 +2027,9 @@ fn add_index_constraint(
 fn check_system_column_refs(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
-    let Some(inner) = expr.as_ref() else {
+    let Some(inner) = expr else {
         return Ok(());
     };
     // A column by name, or selected from the whole row (`(t).ctid`).
@@ -2033,9 +2037,10 @@ fn check_system_column_refs(
         .nodes()
         .into_iter()
         .filter_map(|(n, ..)| match n {
-            typedpg_pg_query::NodeRef::ColumnRef(cr) => {
-                cr.fields.last().and_then(crate::ddl::util::node_string)
-            }
+            typedpg_pg_query::NodeRef::ColumnRef(cr) => cr
+                .fields
+                .last()
+                .and_then(|n| crate::ddl::util::node_string(n.as_ref())),
             _ => None,
         })
         .chain(
@@ -2065,7 +2070,7 @@ fn check_system_column_refs(
 fn validate_check_expression_for_table(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;

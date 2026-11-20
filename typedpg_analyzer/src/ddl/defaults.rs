@@ -22,7 +22,7 @@ use crate::scope::Scope;
 /// column type for an untyped literal).
 pub(crate) fn check_default(
     interp: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     name: &str,
     type_oid: PgTypeOid,
 ) -> Result<PgTypeOid, DdlError> {
@@ -70,7 +70,7 @@ pub(crate) fn check_default(
 /// default's type.
 pub(crate) fn check_function_default(
     interp: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     param_type: PgTypeOid,
     polymorphic: bool,
     used: &std::cell::RefCell<Vec<crate::oid::PgProcOid>>,
@@ -122,7 +122,7 @@ pub(crate) fn record_to_complex(interp: &PgCatalog, source: PgTypeOid, target: P
 /// the column gets no default, so ADD COLUMN rewrites nothing.
 pub(crate) fn is_null_default(
     interp: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     type_oid: PgTypeOid,
     typmod: Option<i32>,
 ) -> bool {
@@ -131,15 +131,15 @@ pub(crate) fn is_null_default(
 
 /// The `(type, typmod)` of the null `Const` that `expr` transforms to:
 /// `NULL`, or `NULL` under casts that each stay a constant.
-fn null_const(interp: &PgCatalog, expr: &Option<ast::Node>) -> Option<(PgTypeOid, i32)> {
-    match expr.as_ref()? {
+fn null_const(interp: &PgCatalog, expr: Option<&ast::Node>) -> Option<(PgTypeOid, i32)> {
+    match expr? {
         ast::Node::AConst(c) if c.isnull => Some((oid::UNKNOWN, -1)),
         ast::Node::TypeCast(tc) => {
             let tn = tc.type_name.as_ref()?;
             let target = super::util::resolve_type_name(tn, interp)?;
             let typmod = crate::typmod::encode(interp, target, tn).ok()?;
             tc.arg.as_ref()?;
-            null_const_coerced(interp, null_const(interp, &tc.arg), target, typmod)
+            null_const_coerced(interp, null_const(interp, tc.arg.as_ref()), target, typmod)
         }
         _ => None,
     }
@@ -187,7 +187,7 @@ fn null_const_coerced(
 /// `check_srf_call_placement`).
 fn check_default_kind(
     interp: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     column_default: bool,
 ) -> Result<(), DdlError> {
     check_default_kind_node(interp, expr, column_default)?;
@@ -197,12 +197,12 @@ fn check_default_kind(
 
 fn check_default_kind_node(
     interp: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     column_default: bool,
 ) -> Result<(), DdlError> {
     let check_default_kind =
-        |e: &Option<ast::Node>| check_default_kind_node(interp, e, column_default);
-    let Some(inner) = expr.as_ref() else {
+        |e: Option<&ast::Node>| check_default_kind_node(interp, e, column_default);
+    let Some(inner) = expr else {
         return Ok(());
     };
     match inner {
@@ -227,7 +227,7 @@ fn check_default_kind_node(
             let parts: Vec<&str> = fc
                 .funcname
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect();
             let (schema, name) = match parts.as_slice() {
                 [name] => (None, *name),
@@ -246,47 +246,47 @@ fn check_default_kind_node(
                 ));
             }
             for arg in &fc.args {
-                check_default_kind(arg)?;
+                check_default_kind(arg.as_ref())?;
             }
         }
         ast::Node::AExpr(e) => {
             for side in [&e.lexpr, &e.rexpr] {
-                check_default_kind(side)?;
+                check_default_kind(side.as_ref())?;
             }
         }
         ast::Node::BoolExpr(b) => {
             for arg in &b.args {
-                check_default_kind(arg)?;
+                check_default_kind(arg.as_ref())?;
             }
         }
         ast::Node::TypeCast(tc) => {
-            check_default_kind(&tc.arg)?;
+            check_default_kind(tc.arg.as_ref())?;
         }
         ast::Node::CoalesceExpr(c) => {
             for arg in &c.args {
-                check_default_kind(arg)?;
+                check_default_kind(arg.as_ref())?;
             }
         }
         ast::Node::CaseExpr(c) => {
             for part in [&c.arg, &c.defresult] {
-                check_default_kind(part)?;
+                check_default_kind(part.as_ref())?;
             }
             for when in &c.args {
                 if let Some(ast::Node::CaseWhen(w)) = when.as_ref() {
                     for part in [&w.expr, &w.result] {
-                        check_default_kind(part)?;
+                        check_default_kind(part.as_ref())?;
                     }
                 }
             }
         }
         ast::Node::ArrayExpr(a) => {
             for elem in &a.elements {
-                check_default_kind(elem)?;
+                check_default_kind(elem.as_ref())?;
             }
         }
         ast::Node::RowExpr(r) => {
             for arg in &r.args {
-                check_default_kind(arg)?;
+                check_default_kind(arg.as_ref())?;
             }
         }
         _ => {}
@@ -305,12 +305,9 @@ pub(crate) fn record_default_dependencies(
     expr: Option<&ast::Node>,
 ) {
     forget_default_dependencies(interp, relid, attnum);
-    // The walks below take a nullable node.
-    let expr = expr.map(|e| Some(e.clone()));
-    let expr = expr.as_ref();
     let mut sequences = Vec::new();
     if let Some(expr) = expr {
-        collect_sequence_refs(interp, expr, &mut sequences);
+        collect_sequence_refs(interp, Some(expr), &mut sequences);
     }
     for seq in sequences {
         record_default_sequence(interp, relid, attnum, seq);
@@ -322,7 +319,8 @@ pub(crate) fn record_default_dependencies(
             .iter()
             .find(|a| a.attnum == attnum)
             .map(|a| a.atttypid);
-        let refs = super::depend::coerced_expression_references(interp, expr, Some(relid), target);
+        let refs =
+            super::depend::coerced_expression_references(interp, Some(expr), Some(relid), target);
         super::depend::record_references(
             interp,
             super::depend::ObjectAddress::column(relid, attnum),
@@ -371,10 +369,10 @@ pub(crate) fn forget_default_dependencies(
 
 fn collect_sequence_refs(
     interp: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     out: &mut Vec<crate::oid::PgClassOid>,
 ) {
-    let Some(inner) = expr.as_ref() else {
+    let Some(inner) = expr else {
         return;
     };
     match inner {
@@ -382,7 +380,7 @@ fn collect_sequence_refs(
             let name: Vec<&str> = fc
                 .funcname
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect();
             let is_seq_fn = matches!(
                 name.as_slice(),
@@ -391,26 +389,26 @@ fn collect_sequence_refs(
             );
             if is_seq_fn
                 && let Some(first) = fc.args.first()
-                && let Some(text) = regclass_literal(first)
+                && let Some(text) = regclass_literal(first.as_ref())
                 && let Some(seq) = resolve_regclass(interp, text)
             {
                 out.push(seq);
             }
             for arg in &fc.args {
-                collect_sequence_refs(interp, arg, out);
+                collect_sequence_refs(interp, arg.as_ref(), out);
             }
         }
         ast::Node::TypeCast(tc) => {
-            collect_sequence_refs(interp, &tc.arg, out);
+            collect_sequence_refs(interp, tc.arg.as_ref(), out);
         }
         ast::Node::AExpr(e) => {
             for side in [&e.lexpr, &e.rexpr] {
-                collect_sequence_refs(interp, side, out);
+                collect_sequence_refs(interp, side.as_ref(), out);
             }
         }
         ast::Node::CoalesceExpr(c) => {
             for arg in &c.args {
-                collect_sequence_refs(interp, arg, out);
+                collect_sequence_refs(interp, arg.as_ref(), out);
             }
         }
         _ => {}
@@ -421,8 +419,8 @@ fn collect_sequence_refs(
 /// only argument find_expr_references_walker records a relation for. A
 /// literal cast to another type first (`'name'::text`) reaches the
 /// function through a run-time cast, which names no relation.
-fn regclass_literal(node: &Option<ast::Node>) -> Option<&str> {
-    match node.as_ref()? {
+fn regclass_literal(node: Option<&ast::Node>) -> Option<&str> {
+    match node? {
         ast::Node::AConst(c) => match c.val.as_ref()? {
             typedpg_pg_query::ast::AConstValue::String(s) => Some(s.sval.as_str()),
             _ => None,
@@ -435,10 +433,10 @@ fn regclass_literal(node: &Option<ast::Node>) -> Option<&str> {
             let names: Vec<&str> = type_name
                 .names
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect();
             match names.as_slice() {
-                ["regclass"] | ["pg_catalog", "regclass"] => regclass_literal(&tc.arg),
+                ["regclass"] | ["pg_catalog", "regclass"] => regclass_literal(tc.arg.as_ref()),
                 _ => None,
             }
         }

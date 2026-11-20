@@ -238,7 +238,7 @@ impl Walker<'_, '_> {
         let matched = [&s.group_clause, &s.sort_clause, &s.distinct_clause]
             .into_iter()
             .flatten()
-            .any(contains_sublink);
+            .any(|n| contains_sublink(n.as_ref()));
         if !matched {
             self.values(&s.target_list, &scope);
             self.qual(s.having_clause.as_ref(), &scope);
@@ -363,10 +363,10 @@ impl Walker<'_, '_> {
             |c: &ColumnRef| Some(N::ColumnRef(typedpg_pg_query::NodeBox::new(c.clone())));
         if !lhs
             .iter()
-            .all(|c| strictly_not_null(ctx, &col_node(c), scope))
+            .all(|c| strictly_not_null(ctx, col_node(c).as_ref(), scope))
             || !rhs
                 .iter()
-                .all(|c| strictly_not_null(ctx, &col_node(c), &sub_scope))
+                .all(|c| strictly_not_null(ctx, col_node(c).as_ref(), &sub_scope))
         {
             return None;
         }
@@ -378,9 +378,9 @@ impl Walker<'_, '_> {
         }
         // Nothing volatile, no row security.
         let sub_node = &s.subselect;
-        if has_volatile(ctx, sub_node)
-            || has_volatile(ctx, &s.testexpr)
-            || reads_row_security(ctx, sub_node)
+        if has_volatile(ctx, sub_node.as_ref())
+            || has_volatile(ctx, s.testexpr.as_ref())
+            || reads_row_security(ctx, sub_node.as_ref())
         {
             return None;
         }
@@ -596,8 +596,8 @@ fn render(c: &ColumnRef) -> Option<String> {
 }
 
 /// Whether `node` holds a sublink.
-fn contains_sublink(node: &Option<Node>) -> bool {
-    node.as_ref().is_some_and(|n| {
+fn contains_sublink(node: Option<&Node>) -> bool {
+    node.is_some_and(|n| {
         n.nodes()
             .iter()
             .any(|(n, _)| matches!(n, NodeRef::SubLink(_)))
@@ -605,8 +605,8 @@ fn contains_sublink(node: &Option<Node>) -> bool {
 }
 
 /// Whether a relation `node` reads (by name) has row security.
-fn reads_row_security(ctx: &Ctx<'_>, node: &Option<Node>) -> bool {
-    node.as_ref().is_some_and(|n| {
+fn reads_row_security(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
+    node.is_some_and(|n| {
         n.nodes().iter().any(|(n, _)| match n {
             NodeRef::RangeVar(rv) => {
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());

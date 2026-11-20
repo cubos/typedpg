@@ -145,7 +145,11 @@ fn check_functions(
         let Some(ast::Node::List(l)) = de.arg.as_ref() else {
             continue;
         };
-        let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+        let parts: Vec<&str> = l
+            .items
+            .iter()
+            .filter_map(|n| node_string(n.as_ref()))
+            .collect();
         let (schema, name) = match parts.as_slice() {
             [name] => (None, *name),
             [schema, name] => (Some(*schema), *name),
@@ -414,7 +418,7 @@ pub fn import_foreign_schema(
 pub(crate) fn drop_foreign_object(
     interp: &mut PgCatalog,
     wrapper: bool,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -516,7 +520,7 @@ pub(crate) fn rename_foreign_object(
     wrapper: bool,
     stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = node_string(&stmt.object).map(str::to_owned) else {
+    let Some(old) = node_string(stmt.object.as_ref()).map(str::to_owned) else {
         return Ok(());
     };
     let new = stmt.newname.clone();

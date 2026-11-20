@@ -223,7 +223,7 @@ impl RoutineSettings {
                     // FROM CURRENT: the session's value, which is on here.
                     VariableSetKind::VarSetCurrent => Some(session),
                     VariableSetKind::VarSetValue => match set.args.as_slice() {
-                        [arg] => const_arg_string(arg).and_then(|v| parse_bool(&v)),
+                        [arg] => const_arg_string(arg.as_ref()).and_then(|v| parse_bool(&v)),
                         _ => None,
                     },
                     _ => None,
@@ -429,7 +429,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     {
         return match kind {
             VariableSetKind::VarSetValue => match stmt.args.as_slice() {
-                [arg] => match const_arg_string(arg) {
+                [arg] => match const_arg_string(arg.as_ref()) {
                     Some(value) => set_identity(interp, &stmt.name, Some(&value), stmt.is_local),
                     None => Ok(()),
                 },
@@ -459,7 +459,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     ) && let Some(setting) = super::guc::check_settable(interp, &stmt.name)?.cloned()
         && kind == VariableSetKind::VarSetValue
         && let [arg] = stmt.args.as_slice()
-        && let Some(value) = const_arg_string(arg)
+        && let Some(value) = const_arg_string(arg.as_ref())
     {
         super::guc::check_value(interp, &setting, &value)?;
     }
@@ -475,7 +475,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
                 if let [arg] = stmt.args.as_slice() {
                     interp
                         .timezone_utc
-                        .set(Some(timezone_arg_is_utc(arg)), stmt.is_local);
+                        .set(Some(timezone_arg_is_utc(arg.as_ref())), stmt.is_local);
                 }
             }
             VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
@@ -489,7 +489,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         match kind {
             VariableSetKind::VarSetValue => {
                 if let [arg] = stmt.args.as_slice()
-                    && let Some(value) = const_arg_string(arg).and_then(|v| parse_bool(&v))
+                    && let Some(value) = const_arg_string(arg.as_ref()).and_then(|v| parse_bool(&v))
                 {
                     guc.set(Some(value), stmt.is_local);
                 }
@@ -540,7 +540,7 @@ pub(crate) fn alter_database_set(
     if let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned()
         && kind == VariableSetKind::VarSetValue
         && let [arg] = set.args.as_slice()
-        && let Some(value) = const_arg_string(arg)
+        && let Some(value) = const_arg_string(arg.as_ref())
     {
         super::guc::check_value(interp, &setting, &value)?;
     }
@@ -650,9 +650,9 @@ pub(crate) fn select_side_effects(
 
 /// A `SET TIME ZONE` / `SET timezone` value: a number of hours, an
 /// interval (`INTERVAL '...'`), or a zone name or POSIX specification.
-fn timezone_arg_is_utc(arg: &Option<typedpg_pg_query::ast::Node>) -> bool {
-    match arg.as_ref() {
-        Some(ast::Node::TypeCast(tc)) => match const_arg_string(&tc.arg) {
+fn timezone_arg_is_utc(arg: Option<&typedpg_pg_query::ast::Node>) -> bool {
+    match arg {
+        Some(ast::Node::TypeCast(tc)) => match const_arg_string(tc.arg.as_ref()) {
             // An interval: zero when every number in it is.
             Some(value) => value.chars().filter(char::is_ascii_digit).all(|c| c == '0'),
             None => false,
@@ -719,8 +719,8 @@ pub(crate) fn timezone_is_utc(value: &str) -> bool {
 }
 
 /// A constant `SET` argument as the string GUC code parses.
-fn const_arg_string(arg: &Option<typedpg_pg_query::ast::Node>) -> Option<String> {
-    match arg.as_ref() {
+fn const_arg_string(arg: Option<&typedpg_pg_query::ast::Node>) -> Option<String> {
+    match arg {
         Some(ast::Node::AConst(c)) => match c.val.as_ref()? {
             ast::AConstValue::Integer(i) => Some(i.ival.to_string()),
             ast::AConstValue::Float(f) => Some(f.fval.clone()),
@@ -737,7 +737,7 @@ fn constant_set_config(fc: &FuncCall) -> Option<(String, String)> {
     let name: Vec<&str> = fc
         .funcname
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .collect();
     if !matches!(
         name.as_slice(),
@@ -748,14 +748,14 @@ fn constant_set_config(fc: &FuncCall) -> Option<(String, String)> {
     let [setting, value, _] = fc.args.as_slice() else {
         return None;
     };
-    let as_str = |n: &Option<typedpg_pg_query::ast::Node>| match n.as_ref() {
+    let as_str = |n: Option<&typedpg_pg_query::ast::Node>| match n {
         Some(ast::Node::AConst(c)) => match c.val.as_ref() {
             Some(ast::AConstValue::String(s)) => Some(s.sval.clone()),
             _ => None,
         },
         _ => None,
     };
-    Some((as_str(setting)?, as_str(value)?))
+    Some((as_str(setting.as_ref())?, as_str(value.as_ref())?))
 }
 
 /// `set_config('role' | 'session_authorization', '<name>', <is_local>)`
@@ -764,7 +764,7 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     let name: Vec<&str> = fc
         .funcname
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .collect();
     if !matches!(
         name.as_slice(),
@@ -775,11 +775,11 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     let [setting, value, is_local] = fc.args.as_slice() else {
         return None;
     };
-    let as_const = |n: &Option<typedpg_pg_query::ast::Node>| match n.as_ref() {
+    let as_const = |n: Option<&typedpg_pg_query::ast::Node>| match n {
         Some(ast::Node::AConst(c)) => c.val.clone(),
         _ => None,
     };
-    let Some(ast::AConstValue::String(setting)) = as_const(setting) else {
+    let Some(ast::AConstValue::String(setting)) = as_const(setting.as_ref()) else {
         return None;
     };
     if !setting.sval.eq_ignore_ascii_case("role")
@@ -787,10 +787,10 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     {
         return None;
     }
-    let Some(ast::AConstValue::String(value)) = as_const(value) else {
+    let Some(ast::AConstValue::String(value)) = as_const(value.as_ref()) else {
         return None;
     };
-    let is_local = match as_const(is_local)? {
+    let is_local = match as_const(is_local.as_ref())? {
         ast::AConstValue::Boolean(b) => b.boolval,
         _ => return None,
     };
@@ -803,7 +803,7 @@ fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(Strin
     let name: Vec<&str> = fc
         .funcname
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .collect();
     if !matches!(
         name.as_slice(),
@@ -814,20 +814,20 @@ fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(Strin
     let [setting, value, is_local] = fc.args.as_slice() else {
         return None;
     };
-    let as_const = |n: &Option<typedpg_pg_query::ast::Node>| match n.as_ref() {
+    let as_const = |n: Option<&typedpg_pg_query::ast::Node>| match n {
         Some(ast::Node::AConst(c)) => c.val.clone(),
         _ => None,
     };
-    let Some(ast::AConstValue::String(setting)) = as_const(setting) else {
+    let Some(ast::AConstValue::String(setting)) = as_const(setting.as_ref()) else {
         return None;
     };
     if !setting.sval.eq_ignore_ascii_case(setting_name) {
         return None;
     }
-    let Some(ast::AConstValue::String(value)) = as_const(value) else {
+    let Some(ast::AConstValue::String(value)) = as_const(value.as_ref()) else {
         return None;
     };
-    let is_local = match as_const(is_local)? {
+    let is_local = match as_const(is_local.as_ref())? {
         ast::AConstValue::Boolean(b) => b.boolval,
         _ => return None,
     };
@@ -956,7 +956,7 @@ pub(super) fn first_row_mark_strength(stmt: &ast::Node) -> Option<&'static str> 
         None => sel
             .from_clause
             .iter()
-            .find_map(|item| first_lockable(item, &ctes))?,
+            .find_map(|item| first_lockable(item.as_ref(), &ctes))?,
     };
     let strongest = clauses
         .iter()
@@ -972,8 +972,8 @@ pub(super) fn first_row_mark_strength(stmt: &ast::Node) -> Option<&'static str> 
 /// range-table order (a join's left side first): what a locking clause
 /// without `OF` marks first. Functions, VALUES and CTE references take no
 /// mark.
-fn first_lockable(item: &Option<typedpg_pg_query::ast::Node>, ctes: &[&str]) -> Option<String> {
-    match item.as_ref()? {
+fn first_lockable(item: Option<&typedpg_pg_query::ast::Node>, ctes: &[&str]) -> Option<String> {
+    match item? {
         ast::Node::RangeVar(rv) => {
             if rv.schemaname.is_empty() && ctes.contains(&rv.relname.as_str()) {
                 return None;
@@ -992,7 +992,7 @@ fn first_lockable(item: &Option<typedpg_pg_query::ast::Node>, ctes: &[&str]) -> 
                 .unwrap_or_default(),
         ),
         ast::Node::JoinExpr(j) => {
-            first_lockable(&j.larg, ctes).or_else(|| first_lockable(&j.rarg, ctes))
+            first_lockable(j.larg.as_ref(), ctes).or_else(|| first_lockable(j.rarg.as_ref(), ctes))
         }
         _ => None,
     }
@@ -1121,7 +1121,7 @@ fn string_arg(n: &ast::Node) -> Option<String> {
         ast::Node::TypeName(tn) => Some(
             tn.names
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect::<Vec<_>>()
                 .join("."),
         ),

@@ -516,12 +516,12 @@ fn select_rows(
         // VALUES scan evaluates every cell of the rows it yields, in order.
         if let [row] = rows.as_slice() {
             let errors = Errors {
-                columns: row.iter().map(|c| level.error(c)).collect(),
+                columns: row.iter().map(|c| level.error(c.as_ref())).collect(),
                 always: None,
             };
-            let values = row.iter().map(|c| level.value(c)).collect();
+            let values = row.iter().map(|c| level.value(c.as_ref())).collect();
             return Some(Rows {
-                types: row.iter().map(|c| level.type_of(c)).collect(),
+                types: row.iter().map(|c| level.type_of(c.as_ref())).collect(),
                 qual_reads: vec![true; row.len()],
                 names: Some((1..=row.len()).map(|i| format!("column{i}")).collect()),
                 ..Rows::new(errors.clone(), errors, values, ONE)
@@ -530,10 +530,10 @@ fn select_rows(
         let all = rows
             .iter()
             .flat_map(|r| r.iter())
-            .find_map(|c| level.error(c));
+            .find_map(|c| level.error(c.as_ref()));
         let first = rows
             .first()
-            .and_then(|r| r.iter().find_map(|c| level.error(c)));
+            .and_then(|r| r.iter().find_map(|c| level.error(c.as_ref())));
         return Some(Rows {
             // Sorted or hashed, they are all read.
             sorted: all.clone(),
@@ -584,7 +584,13 @@ fn select_rows(
     }
     let source = match sel.from_clause.as_slice() {
         [] => None,
-        [item] => Some(from_item_rows(item, snapshot, &visible, depth, stored)?),
+        [item] => Some(from_item_rows(
+            item.as_ref(),
+            snapshot,
+            &visible,
+            depth,
+            stored,
+        )?),
         _ => return None,
     };
     let level = Level {
@@ -606,14 +612,16 @@ fn select_rows(
     // evaluates it. One that is pushed down into no arm runs over the
     // projected rows, all of them (the set operation runs whole below
     // it), whatever it lets through.
-    let where_fails =
-        Some(&sel.where_clause).filter(|w| w.is_some() && level.truth(w) != Some(true));
+    let where_fails = sel
+        .where_clause
+        .as_ref()
+        .filter(|w| level.truth(Some(w)) != Some(true));
     let unpushed = where_fails
-        .filter(|w| level.unpushed(w))
+        .filter(|w| level.unpushed(Some(w)))
         .map(|_| projection.clone());
     // Pushed down into a set operation's leaves, it is evaluated in each.
     let pushed = where_fails
-        .and_then(|w| level.pushed_down(sel, w))
+        .and_then(|w| level.pushed_down(sel, Some(w)))
         .unwrap_or_default();
     if where_fails.is_some() {
         if !count.at_least_one
@@ -655,20 +663,20 @@ fn select_rows(
     let fail_after = source
         .as_ref()
         .and_then(|s| s.rows.fail_after.clone())
-        .filter(|_| where_fails.is_none_or(|w| level.unpushed(w)))
+        .filter(|_| where_fails.is_none_or(|w| level.unpushed(Some(w))))
         .or(pushed.fail_after)
         .filter(|_| super::walk::level_srf_calls(sel, snapshot).is_empty());
-    let equated = equated_exprs(&sel.where_clause, snapshot);
+    let equated = equated_exprs(sel.where_clause.as_ref(), snapshot);
     let mut sorted_by = false;
     let ordered = sel.sort_clause.iter().find_map(|k| match k.as_ref() {
         Some(ast::Node::SortBy(sb)) => {
             sb.node.as_ref()?;
             let key = &sb.node;
-            if order_key_redundant(sel, level, key, &equated) {
+            if order_key_redundant(sel, level, key.as_ref(), &equated) {
                 return None;
             }
             sorted_by = true;
-            order_key_error(sel, level, &all, key)
+            order_key_error(sel, level, &all, key.as_ref())
         }
         _ => None,
     });
@@ -722,7 +730,8 @@ fn level_names(sel: &ast::SelectStmt, level: Level<'_>) -> Option<Vec<String>> {
             continue;
         }
         names.push(if rt.name.is_empty() {
-            super::target_list::infer_column_name(val).unwrap_or_else(|| "?column?".to_owned())
+            super::target_list::infer_column_name(val.as_ref())
+                .unwrap_or_else(|| "?column?".to_owned())
         } else {
             rt.name.clone()
         });
@@ -737,9 +746,9 @@ fn order_key_error(
     sel: &ast::SelectStmt,
     level: Level<'_>,
     all: &Errors,
-    key: &Option<ast::Node>,
+    key: Option<&ast::Node>,
 ) -> Option<Failure> {
-    match key.as_ref()? {
+    match key? {
         ast::Node::AConst(c) => {
             if let Some(ast::AConstValue::Integer(i)) = &c.val {
                 return all.column(usize::try_from(i.ival).ok()?.checked_sub(1)?);
@@ -776,10 +785,10 @@ fn order_key_error(
 }
 
 /// The conjuncts of the qualification `n`: its ANDed terms, flattened.
-fn conjuncts(n: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
-    match n.as_ref() {
+fn conjuncts(n: Option<&ast::Node>) -> Vec<Option<&ast::Node>> {
+    match n {
         Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
-            b.args.iter().flat_map(conjuncts).collect()
+            b.args.iter().flat_map(|n| conjuncts(n.as_ref())).collect()
         }
         _ => vec![n],
     }
@@ -810,10 +819,11 @@ fn column_name(cr: &ast::ColumnRef) -> Option<&str> {
 /// The key two expressions an equivalence class could hold have alike:
 /// their structure without locations, qualifiers or type-name spellings
 /// (erring towards matching).
-fn equivalence_key(n: &Option<ast::Node>, snapshot: &PgCatalog) -> String {
-    super::node_fingerprint(&super::predtest_unqualify(
-        crate::grouping::resolve_type_names(n, snapshot).as_ref(),
-    ))
+fn equivalence_key(n: Option<&ast::Node>, snapshot: &PgCatalog) -> String {
+    super::node_fingerprint(
+        super::predtest_unqualify(crate::grouping::resolve_type_names(n, snapshot).as_ref())
+            .as_ref(),
+    )
 }
 
 /// The expressions a conjunct of `qual` that may be an equality (see
@@ -823,7 +833,7 @@ fn equivalence_key(n: &Option<ast::Node>, snapshot: &PgCatalog) -> String {
 /// dropped, and with it the key's evaluation over every row. Only the
 /// compared expressions are members (`a + 0 = 1` doesn't make `a` one).
 fn equated_exprs(
-    qual: &Option<ast::Node>,
+    qual: Option<&ast::Node>,
     snapshot: &PgCatalog,
 ) -> std::collections::HashSet<String> {
     let mut equated = std::collections::HashSet::new();
@@ -834,26 +844,26 @@ fn equated_exprs(
     } {
         let mut c = c;
         // A NOT of `<>` is negated into `=`.
-        while let Some(ast::Node::BoolExpr(b)) = c.as_ref()
+        while let Some(ast::Node::BoolExpr(b)) = c
             && b.boolop == ast::BoolExprType::NotExpr
             && let [arg] = b.args.as_slice()
         {
-            c = arg;
+            c = arg.as_ref();
         }
         // The expressions an equality compares.
-        fn compared(e: &ast::AExpr) -> Vec<&Option<ast::Node>> {
-            let mut members: Vec<&Option<ast::Node>> = Vec::new();
+        fn compared(e: &ast::AExpr) -> Vec<Option<&ast::Node>> {
+            let mut members: Vec<Option<&ast::Node>> = Vec::new();
             if e.lexpr.is_some() {
-                members.push(&e.lexpr);
+                members.push(e.lexpr.as_ref());
             }
             match e.rexpr.as_ref() {
-                Some(ast::Node::List(l)) => members.extend(l.items.iter()),
-                Some(_) => members.push(&e.rexpr),
+                Some(ast::Node::List(l)) => members.extend(l.items.iter().map(Option::as_ref)),
+                Some(_) => members.push(e.rexpr.as_ref()),
                 None => {}
             }
             members
         }
-        let mut members = match c.as_ref() {
+        let mut members = match c {
             Some(ast::Node::AExpr(e)) if may_equate(e) => compared(e),
             Some(ast::Node::AExpr(_)) => continue,
             // Simplified, another conjunct may become one (`a = 1 OR a =
@@ -861,7 +871,7 @@ fn equated_exprs(
             _ => {
                 let mut members = Vec::new();
                 super::walk::visit_same_level(c, &mut |x| {
-                    if let Some(ast::Node::AExpr(e)) = x.as_ref()
+                    if let Some(ast::Node::AExpr(e)) = x
                         && may_equate(e)
                     {
                         members.extend(compared(e));
@@ -872,10 +882,10 @@ fn equated_exprs(
         };
         // A row comparison `(a, b) = (1, 2)` is one equality per column
         // (make_row_comparison_op).
-        let fields: Vec<&Option<ast::Node>> = members
+        let fields: Vec<Option<&ast::Node>> = members
             .iter()
             .filter_map(|m| match m.as_ref() {
-                Some(ast::Node::RowExpr(r)) => Some(r.args.iter()),
+                Some(ast::Node::RowExpr(r)) => Some(r.args.iter().map(Option::as_ref)),
                 _ => None,
             })
             .flatten()
@@ -891,23 +901,23 @@ fn equated_exprs(
 /// an AND's, and those every arm of an OR has (find_duplicate_ors drops a
 /// duplicate arm, and pulls out what all of them AND); under a NOT or a
 /// cast, any (a NOT of `<>` is negated into `=`).
-fn promoted_equalities<'a>(c: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Vec<&'a ast::AExpr> {
+fn promoted_equalities<'a>(c: Option<&'a ast::Node>, snapshot: &PgCatalog) -> Vec<&'a ast::AExpr> {
     use ast::BoolExprType as B;
-    match c.as_ref() {
+    match c {
         Some(ast::Node::AExpr(e)) if may_equate(e) => vec![&**e],
         Some(ast::Node::BoolExpr(b)) if b.boolop == B::AndExpr => b
             .args
             .iter()
-            .flat_map(|a| promoted_equalities(a, snapshot))
+            .flat_map(|a| promoted_equalities(a.as_ref(), snapshot))
             .collect(),
         Some(ast::Node::BoolExpr(b)) if b.boolop == B::OrExpr => {
             let key = |e: &ast::AExpr| {
-                equivalence_key(&Some(ast::Node::AExpr(NodeBox::new(e.clone()))), snapshot)
+                equivalence_key(Some(&ast::Node::AExpr(NodeBox::new(e.clone()))), snapshot)
             };
             let arms: Vec<Vec<&ast::AExpr>> = b
                 .args
                 .iter()
-                .map(|a| promoted_equalities(a, snapshot))
+                .map(|a| promoted_equalities(a.as_ref(), snapshot))
                 .collect();
             let Some((first, rest)) = arms.split_first() else {
                 return Vec::new();
@@ -929,7 +939,7 @@ fn promoted_equalities<'a>(c: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Ve
         Some(_) => {
             let mut all = Vec::new();
             super::walk::visit_same_level(c, &mut |x| {
-                if let Some(ast::Node::AExpr(e)) = x.as_ref()
+                if let Some(ast::Node::AExpr(e)) = x
                     && may_equate(e)
                 {
                     all.push(e.as_ref());
@@ -948,10 +958,10 @@ fn promoted_equalities<'a>(c: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Ve
 fn order_key_redundant(
     sel: &ast::SelectStmt,
     level: Level<'_>,
-    key: &Option<ast::Node>,
+    key: Option<&ast::Node>,
     equated: &std::collections::HashSet<String>,
 ) -> bool {
-    let redundant = |n: &Option<ast::Node>| {
+    let redundant = |n: Option<&ast::Node>| {
         let mut reads = false;
         super::walk::visit_same_level(n, &mut |x| {
             reads |= matches!(x, Some(ast::Node::ColumnRef(_)));
@@ -966,7 +976,7 @@ fn order_key_redundant(
             location: -1,
         })))
     };
-    let position = match key.as_ref() {
+    let position = match key {
         Some(ast::Node::AConst(c)) => match &c.val {
             Some(ast::AConstValue::Integer(i)) => {
                 usize::try_from(i.ival).ok().and_then(|i| i.checked_sub(1))
@@ -975,7 +985,7 @@ fn order_key_redundant(
         },
         _ => None,
     };
-    let alias = match key.as_ref() {
+    let alias = match key {
         Some(ast::Node::ColumnRef(cr)) if cr.fields.len() == 1 => column_name(cr),
         _ => None,
     };
@@ -988,14 +998,13 @@ fn order_key_redundant(
         let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             return true;
         };
-        let val = Some(&rt.val).filter(|v| v.is_some());
-        if let (Some(source), Some(ast::Node::ColumnRef(cr))) =
-            (level.source, val.and_then(|v| v.as_ref()))
+        let val = rt.val.as_ref().map(Some);
+        if let (Some(source), Some(ast::Node::ColumnRef(cr))) = (level.source, val.flatten())
             && let Read::All = source.read(cr)
         {
             let width = source.names.len();
             if let Some(p) = position.filter(|p| (at..at + width).contains(p)) {
-                return redundant(&column(&source.names[p - at]));
+                return redundant(column(&source.names[p - at]).as_ref());
             }
             at += width;
             continue;
@@ -1015,12 +1024,10 @@ fn level_unpushable(sel: &ast::SelectStmt, level: Level<'_>) -> Vec<bool> {
     let mut unpushable = Vec::new();
     for target in &sel.target_list {
         let val = match target.as_ref() {
-            Some(ast::Node::ResTarget(rt)) => Some(&rt.val).filter(|v| v.is_some()),
+            Some(ast::Node::ResTarget(rt)) => rt.val.as_ref().map(Some),
             _ => None,
         };
-        let (Some(source), Some(ast::Node::ColumnRef(cr))) =
-            (level.source, val.and_then(|v| v.as_ref()))
-        else {
+        let (Some(source), Some(ast::Node::ColumnRef(cr))) = (level.source, val.flatten()) else {
             unpushable.push(false);
             continue;
         };
@@ -1041,7 +1048,7 @@ fn level_unpushable(sel: &ast::SelectStmt, level: Level<'_>) -> Vec<bool> {
 fn level_errors(
     sel: &ast::SelectStmt,
     level: Level<'_>,
-    where_fails: Option<&Option<ast::Node>>,
+    where_fails: Option<&ast::Node>,
     unpushed: Option<Failure>,
     pushed: Option<Failure>,
 ) -> Option<(Errors, Vec<Option<Value>>)> {
@@ -1050,7 +1057,7 @@ fn level_errors(
     if let Some(w) = where_fails {
         always = match unpushed {
             Some(p) => Some(p),
-            None => always.or(Some(level.surely_fails(w).or(pushed)?)),
+            None => always.or(Some(level.surely_fails(Some(w)).or(pushed)?)),
         };
     }
     // The select list's own expressions are evaluated for the rows that
@@ -1072,12 +1079,12 @@ fn level_errors(
             values.extend(source.rows.values.iter().cloned());
             continue;
         }
-        columns.push(if evaluated || is_column_ref(val) {
-            level.error(val)
+        columns.push(if evaluated || is_column_ref(val.as_ref()) {
+            level.error(val.as_ref())
         } else {
             None
         });
-        values.push(level.value(val));
+        values.push(level.value(val.as_ref()));
     }
     Some((Errors { columns, always }, values))
 }
@@ -1088,11 +1095,10 @@ fn level_types(sel: &ast::SelectStmt, level: Level<'_>) -> Vec<Option<PgTypeOid>
     let mut types = Vec::new();
     for target in &sel.target_list {
         let val = match target.as_ref() {
-            Some(ast::Node::ResTarget(rt)) => Some(&rt.val).filter(|v| v.is_some()),
+            Some(ast::Node::ResTarget(rt)) => rt.val.as_ref().map(Some),
             _ => None,
         };
-        if let (Some(source), Some(ast::Node::ColumnRef(cr))) =
-            (level.source, val.and_then(|v| v.as_ref()))
+        if let (Some(source), Some(ast::Node::ColumnRef(cr))) = (level.source, val.flatten())
             && let Read::All = source.read(cr)
         {
             types.extend((0..source.names.len()).map(|i| source.rows.type_of(i)));
@@ -1103,7 +1109,7 @@ fn level_types(sel: &ast::SelectStmt, level: Level<'_>) -> Vec<Option<PgTypeOid>
     types
 }
 
-fn is_column_ref(n: &Option<ast::Node>) -> bool {
+fn is_column_ref(n: Option<&ast::Node>) -> bool {
     matches!(n, Some(ast::Node::ColumnRef(_)))
 }
 
@@ -1445,7 +1451,7 @@ fn plain_leaf(s: &ast::SelectStmt, snapshot: &PgCatalog) -> Option<Vec<Option<as
         .iter()
         .map(|t| match t.as_ref() {
             Some(ast::Node::ResTarget(rt)) => Some(&rt.val)
-                .filter(|v| v.is_some() && !is_column_ref(v))
+                .filter(|v| v.is_some() && !is_column_ref(v.as_ref()))
                 .cloned(),
             _ => None,
         })
@@ -1507,15 +1513,15 @@ struct Level<'a> {
 
 impl Level<'_> {
     /// The error evaluating `n` surely raises.
-    fn error(&self, n: &Option<ast::Node>) -> Option<Failure> {
-        match n.as_ref()? {
+    fn error(&self, n: Option<&ast::Node>) -> Option<Failure> {
+        match n? {
             ast::Node::TypeCast(tc) => {
                 if let Some(e) = self.null_cast(tc) {
                     return Some(e);
                 }
                 // A cast evaluates its argument where no cast into the
                 // target could drop it (see [`casts_evaluate_argument`]).
-                if let Some(e) = self.error(&tc.arg)
+                if let Some(e) = self.error(tc.arg.as_ref())
                     && tc
                         .type_name
                         .as_ref()
@@ -1547,7 +1553,7 @@ impl Level<'_> {
             }
             // Its argument is evaluated (a domain's coercion is not
             // folded).
-            ast::Node::NullTest(nt) => return self.error(&nt.arg),
+            ast::Node::NullTest(nt) => return self.error(nt.arg.as_ref()),
             ast::Node::SubLink(sl) => return self.sublink_error(sl),
             // COALESCE drops its NULL constant arguments, and evaluates the
             // first one left first.
@@ -1555,8 +1561,8 @@ impl Level<'_> {
                 if let Some(f) = c
                     .args
                     .iter()
-                    .find(|a| !is_null_const(self.snapshot, a))
-                    .and_then(|a| self.error(a))
+                    .find(|a| !is_null_const(self.snapshot, a.as_ref()))
+                    .and_then(|a| self.error(a.as_ref()))
                 {
                     return Some(f);
                 }
@@ -1593,7 +1599,11 @@ impl Level<'_> {
     /// The error evaluating the operator expression `e` surely raises.
     fn a_expr_error(&self, e: &ast::AExpr) -> Option<Failure> {
         use ast::AExprKind as K;
-        let operands = || [&e.lexpr, &e.rexpr].into_iter().find_map(|a| self.error(a));
+        let operands = || {
+            [&e.lexpr, &e.rexpr]
+                .into_iter()
+                .find_map(|a| self.error(a.as_ref()))
+        };
         match e.kind {
             K::AexprOp => self.operator_error(e),
             // A DistinctExpr is folded only when every argument is a
@@ -1620,7 +1630,7 @@ impl Level<'_> {
                 };
                 e.lexpr.as_ref()?;
                 let lexpr = &e.lexpr;
-                let low_cmp = comparison(first, lexpr, low);
+                let low_cmp = comparison(first, lexpr.as_ref(), low.as_ref());
                 if let Some(f) = self.operator_error(&low_cmp) {
                     return Some(f);
                 }
@@ -1632,10 +1642,10 @@ impl Level<'_> {
                     .and_then(|op| op.code)
                     .and_then(|f| self.snapshot.pg_proc.get(&f))
                     .is_some_and(|p| p.proisstrict);
-                if !(strict && is_null_const(self.snapshot, low)) {
+                if !(strict && is_null_const(self.snapshot, low.as_ref())) {
                     return None;
                 }
-                self.operator_error(&comparison(second, lexpr, high))
+                self.operator_error(&comparison(second, lexpr.as_ref(), high.as_ref()))
             }
             // `a IN (b, ...)` of literals is a ScalarArrayOpExpr `a = ANY
             // (ARRAY[b, ...])`, or `a = b OR ...` where they have no
@@ -1660,7 +1670,11 @@ impl Level<'_> {
                     _ => return None,
                 };
                 e.lexpr.as_ref()?;
-                self.operator_error(&comparison(name, &e.lexpr, list.items.first()?))
+                self.operator_error(&comparison(
+                    name,
+                    e.lexpr.as_ref(),
+                    list.items.first()?.as_ref(),
+                ))
             }
             _ => None,
         }
@@ -1669,8 +1683,8 @@ impl Level<'_> {
     /// The type `n` surely has, where it is simple enough to tell: a
     /// constant, a cast, a column of the source, an operator over such or
     /// a scalar subquery.
-    fn type_of(&self, n: &Option<ast::Node>) -> Option<PgTypeOid> {
-        match n.as_ref()? {
+    fn type_of(&self, n: Option<&ast::Node>) -> Option<PgTypeOid> {
+        match n? {
             ast::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
             ast::Node::TypeCast(tc) => {
                 crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)
@@ -1708,11 +1722,11 @@ impl Level<'_> {
     fn operator(&self, e: &ast::AExpr) -> Option<crate::lookup::ResolvedOperator> {
         let name = expr::extract_string_fields(&e.name).join(".");
         let left = match e.lexpr.as_ref() {
-            Some(_) => Some(self.type_of(&e.lexpr)?),
+            Some(_) => Some(self.type_of(e.lexpr.as_ref())?),
             None => None,
         };
         e.rexpr.as_ref()?;
-        let right = self.type_of(&e.rexpr)?;
+        let right = self.type_of(e.rexpr.as_ref())?;
         match self.snapshot.find_operator_detailed(&name, left, right) {
             crate::lookup::OperatorMatch::Found(op) => Some(op),
             _ => None,
@@ -1726,11 +1740,11 @@ impl Level<'_> {
     /// them in another order: then the failing ones must raise the same
     /// error.
     fn operator_error(&self, e: &ast::AExpr) -> Option<Failure> {
-        let operands: Vec<&Option<ast::Node>> = [&e.lexpr, &e.rexpr]
+        let operands: Vec<Option<&ast::Node>> = [e.lexpr.as_ref(), e.rexpr.as_ref()]
             .into_iter()
             .filter(|a| a.is_some())
             .collect();
-        let errors: Vec<Option<Failure>> = operands.iter().map(|a| self.error(a)).collect();
+        let errors: Vec<Option<Failure>> = operands.iter().map(|a| self.error(*a)).collect();
         let leftmost = errors.iter().position(Option::is_some)?;
         // Failing operands all raising the same error, the order they are
         // evaluated in doesn't matter: any one an inlined body evaluates
@@ -1742,11 +1756,11 @@ impl Level<'_> {
         let args: Vec<Arg> = operands
             .iter()
             .map(|a| Arg {
-                ty: self.type_of(a),
-                null: is_null_const(self.snapshot, a),
-                not_null: self.not_null_const(a),
-                value: self.value(a),
-                range: range_const(self.snapshot, a).map(|(_, shape)| shape),
+                ty: self.type_of(*a),
+                null: is_null_const(self.snapshot, *a),
+                not_null: self.not_null_const(*a),
+                value: self.value(*a),
+                range: range_const(self.snapshot, *a).map(|(_, shape)| shape),
             })
             .collect();
         let resolved = self.operator(e).map(|op| op.code);
@@ -1768,12 +1782,12 @@ impl Level<'_> {
     /// function, which can't return NULL for one), a built-in cast of one,
     /// a stable SQL value function (`CURRENT_DATE`, not folded), a column
     /// holding a constant, or an expression whose evaluation surely fails.
-    fn not_null_const(&self, n: &Option<ast::Node>) -> bool {
-        match n.as_ref() {
+    fn not_null_const(&self, n: Option<&ast::Node>) -> bool {
+        match n {
             Some(ast::Node::AConst(c)) => !c.isnull,
             Some(ast::Node::TypeCast(tc))
                 if tc.arg.is_some()
-                    && self.not_null_const(&tc.arg)
+                    && self.not_null_const(tc.arg.as_ref())
                     && tc
                         .type_name
                         .as_ref()
@@ -1834,8 +1848,8 @@ impl Level<'_> {
     }
 
     /// The constant `n` surely is.
-    fn value(&self, n: &Option<ast::Node>) -> Option<Value> {
-        match n.as_ref()? {
+    fn value(&self, n: Option<&ast::Node>) -> Option<Value> {
+        match n? {
             ast::Node::ColumnRef(cr) => {
                 let source = self.source?;
                 match source.read(cr) {
@@ -1871,34 +1885,34 @@ impl Level<'_> {
                 });
                 (fits && !checked).then_some(Value::Int(i))
             }
-            _ => literal_value(n.as_ref()),
+            _ => literal_value(n),
         }
     }
 
     /// What `n`, a qualification, surely evaluates to (see
     /// [`truth_with`]).
-    fn truth(&self, n: &Option<ast::Node>) -> Option<bool> {
+    fn truth(&self, n: Option<&ast::Node>) -> Option<bool> {
         truth_with(n, &|v| self.value(v))
     }
 
     /// The error a qualification surely raises: one testing a failing
     /// value, ANDed with ones that hold (the planner orders the others by
     /// cost, so one that may be false could run first and skip it).
-    fn surely_fails(&self, n: &Option<ast::Node>) -> Option<Failure> {
+    fn surely_fails(&self, n: Option<&ast::Node>) -> Option<Failure> {
         let level = Level {
             qual: true,
             ..*self
         };
-        match n.as_ref()? {
+        match n? {
             ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::AndExpr => {
                 let mut failing = None;
                 let mut left = Vec::new();
                 for a in &b.args {
-                    if self.truth(a) == Some(true) {
+                    if self.truth(a.as_ref()) == Some(true) {
                         continue;
                     }
-                    failing = Some(self.surely_fails(a)?);
-                    left.push(a);
+                    failing = Some(self.surely_fails(a.as_ref())?);
+                    left.push(a.as_ref());
                 }
                 // Over a flattened UNION ALL, each leaf is an appendrel
                 // member, whose restrictions contradicting each other
@@ -1906,7 +1920,7 @@ impl Level<'_> {
                 let member = self
                     .source
                     .is_some_and(|s| s.rows.projected && !s.rows.qual_reads.is_empty());
-                let args: Vec<&Option<ast::Node>> = b.args.iter().collect();
+                let args: Vec<Option<&ast::Node>> = b.args.iter().map(Option::as_ref).collect();
                 if !self.equalities_consistent(&args) || member && refutable(&left, self.snapshot) {
                     return None;
                 }
@@ -1918,20 +1932,20 @@ impl Level<'_> {
             ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::OrExpr => {
                 let mut failing = None;
                 for a in &b.args {
-                    match self.truth(a) {
+                    match self.truth(a.as_ref()) {
                         Some(true) => return None,
                         Some(false) => continue,
-                        None if is_null_const(self.snapshot, a) => continue,
+                        None if is_null_const(self.snapshot, a.as_ref()) => continue,
                         None => {}
                     }
-                    let f = self.surely_fails(a)?;
+                    let f = self.surely_fails(a.as_ref())?;
                     failing.get_or_insert(f);
                 }
                 failing
             }
             ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::NotExpr => {
                 match b.args.as_slice() {
-                    [a] => self.surely_fails(a),
+                    [a] => self.surely_fails(a.as_ref()),
                     _ => None,
                 }
             }
@@ -1954,10 +1968,10 @@ impl Level<'_> {
     /// equality operators of different input types, which no class
     /// shares). Over no FROM item, a qualification reads no Var: each
     /// conjunct is a gating qual, in no class.
-    fn equalities_consistent(&self, conjuncts: &[&Option<ast::Node>]) -> bool {
+    fn equalities_consistent(&self, conjuncts: &[Option<&ast::Node>]) -> bool {
         let equalities: Vec<&ast::AExpr> = conjuncts
             .iter()
-            .flat_map(|c| promoted_equalities(c, self.snapshot))
+            .flat_map(|c| promoted_equalities(*c, self.snapshot))
             .collect();
         if equalities.len() < 2 {
             return true;
@@ -1999,21 +2013,26 @@ impl Level<'_> {
                 return None;
             };
             let column_type = source.rows.type_of(i);
-            let operand = column_type.zip(self.type_of(lit)).and_then(|(c, k)| {
-                let (left, right) = if col_left { (c, k) } else { (k, c) };
-                match self.snapshot.find_operator_detailed("=", Some(left), right) {
-                    crate::lookup::OperatorMatch::Found(op) => {
-                        let o = self.snapshot.pg_operator.get(&op.oid)?;
-                        // A polymorphic operand takes the column as it is.
-                        let t = if col_left { o.oprleft? } else { o.oprright };
-                        (!crate::polymorphic::is_polymorphic(t)).then_some(t)
+            let operand = column_type
+                .zip(self.type_of(lit.as_ref()))
+                .and_then(|(c, k)| {
+                    let (left, right) = if col_left { (c, k) } else { (k, c) };
+                    match self.snapshot.find_operator_detailed("=", Some(left), right) {
+                        crate::lookup::OperatorMatch::Found(op) => {
+                            let o = self.snapshot.pg_operator.get(&op.oid)?;
+                            // A polymorphic operand takes the column as it is.
+                            let t = if col_left { o.oprleft? } else { o.oprright };
+                            (!crate::polymorphic::is_polymorphic(t)).then_some(t)
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            });
+                });
             let numeric = column_type
                 .is_some_and(|t| [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t));
-            Some(((i, operand), eq_const(lit, numeric, self.snapshot)?))
+            Some((
+                (i, operand),
+                eq_const(lit.as_ref(), numeric, self.snapshot)?,
+            ))
         };
         let pairs: Option<Vec<(Member, EqConst)>> =
             equalities.iter().map(|e| column_const(e)).collect();
@@ -2032,7 +2051,7 @@ impl Level<'_> {
     /// What the WHERE `w` of `sel` raises where it is pushed down into the
     /// leaves of the set operation `sel` reads (see [`Leaf`]): reading
     /// every row, fetching the first one, and past how many rows.
-    fn pushed_down(&self, sel: &ast::SelectStmt, w: &Option<ast::Node>) -> Option<Pushed> {
+    fn pushed_down(&self, sel: &ast::SelectStmt, w: Option<&ast::Node>) -> Option<Pushed> {
         let source = self.source?;
         let leaves = source.rows.leaves.as_ref()?;
         // Not flattened, the qualification goes down only where
@@ -2040,7 +2059,7 @@ impl Level<'_> {
         // that can't be, no whole row, no subquery); a volatile function
         // could be left above, or run first in the leaf's filter.
         let mut safe = true;
-        super::walk::visit_same_level(w, &mut |x| match x.as_ref() {
+        super::walk::visit_same_level(w, &mut |x| match x {
             Some(ast::Node::ColumnRef(cr)) => {
                 let read = source.read(cr);
                 safe &= matches!(read, Read::Column(_) | Read::WholeRow)
@@ -2082,7 +2101,7 @@ impl Level<'_> {
             .iter()
             .map(|leaf| {
                 let q = substitute(w, source, leaf)?;
-                Some(match level.leaf_outcome(&q, leaves.flattened) {
+                Some(match level.leaf_outcome(q.as_ref(), leaves.flattened) {
                     LeafOutcome::Dummy => Err(true),
                     LeafOutcome::Unknown => Err(false),
                     LeafOutcome::Fails(f) => Ok(Some(f)),
@@ -2143,22 +2162,23 @@ impl Level<'_> {
     /// The conjuncts the qualification `q` is split into once folded over
     /// a leaf's constants: an AND's, and those of an OR left with one
     /// argument (the others folded to false or NULL).
-    fn leaf_conjuncts<'n>(&self, q: &'n Option<ast::Node>, out: &mut Vec<&'n Option<ast::Node>>) {
+    fn leaf_conjuncts<'n>(&self, q: Option<&'n ast::Node>, out: &mut Vec<Option<&'n ast::Node>>) {
         use ast::BoolExprType as B;
-        match q.as_ref() {
+        match q {
             Some(ast::Node::BoolExpr(b)) if b.boolop == B::AndExpr => {
                 for a in &b.args {
-                    self.leaf_conjuncts(a, out);
+                    self.leaf_conjuncts(a.as_ref(), out);
                 }
             }
             Some(ast::Node::BoolExpr(b)) if b.boolop == B::OrExpr => {
-                let left: Vec<&Option<ast::Node>> = b
+                let left: Vec<Option<&ast::Node>> = b
                     .args
                     .iter()
-                    .filter(|a| self.truth(a) != Some(false) && !is_null_const(self.snapshot, a))
+                    .map(Option::as_ref)
+                    .filter(|a| self.truth(*a) != Some(false) && !is_null_const(self.snapshot, *a))
                     .collect();
                 match left.as_slice() {
-                    [only] if self.truth(only).is_none() => self.leaf_conjuncts(only, out),
+                    [only] if self.truth(*only).is_none() => self.leaf_conjuncts(*only, out),
                     _ => out.push(q),
                 }
             }
@@ -2172,7 +2192,7 @@ impl Level<'_> {
     /// its One-Time Filter, run in an order of their costs — every one
     /// must surely fail. Flattened, a volatile conjunct is in a filter of
     /// its own, run after.
-    fn leaf_outcome(&self, q: &Option<ast::Node>, flattened: bool) -> LeafOutcome {
+    fn leaf_outcome(&self, q: Option<&ast::Node>, flattened: bool) -> LeafOutcome {
         let mut failure = None;
         let mut unknown = false;
         let mut volatile = false;
@@ -2217,21 +2237,21 @@ impl Level<'_> {
     /// surely true reads a column that can't be pushed down
     /// (`qual_is_pushdown_safe`), through nothing but operators, casts
     /// and NULL tests of columns and non-NULL literals.
-    fn unpushed(&self, n: &Option<ast::Node>) -> bool {
+    fn unpushed(&self, n: Option<&ast::Node>) -> bool {
         let Some(source) = self
             .source
             .filter(|s| s.rows.keeps_columns || s.rows.projection.is_some())
         else {
             return false;
         };
-        let conjuncts: Vec<&Option<ast::Node>> = conjuncts(n)
+        let conjuncts: Vec<Option<&ast::Node>> = conjuncts(n)
             .into_iter()
-            .filter(|c| self.truth(c) != Some(true))
+            .filter(|c| self.truth(*c) != Some(true))
             .collect();
         if !self.equalities_consistent(&conjuncts) {
             return false;
         }
-        let reads_column = |n: &Option<ast::Node>| {
+        let reads_column = |n: Option<&ast::Node>| {
             let mut reads = false;
             super::walk::visit_same_level(n, &mut |x| {
                 reads |= matches!(x, Some(ast::Node::ColumnRef(_)));
@@ -2241,7 +2261,7 @@ impl Level<'_> {
         conjuncts.into_iter().all(|c| {
             let mut simple = true;
             let mut reads = false;
-            super::walk::visit_same_level(c, &mut |x| match x.as_ref() {
+            super::walk::visit_same_level(c, &mut |x| match x {
                 Some(ast::Node::ColumnRef(cr)) => {
                     reads |= source.rows.unpushable(&source.read(cr));
                 }
@@ -2259,7 +2279,9 @@ impl Level<'_> {
                 }
                 // Each argument reading a column, none is folded to a
                 // constant.
-                Some(ast::Node::BoolExpr(b)) => simple &= b.args.iter().all(reads_column),
+                Some(ast::Node::BoolExpr(b)) => {
+                    simple &= b.args.iter().all(|n| reads_column(n.as_ref()))
+                }
                 Some(ast::Node::TypeCast(_) | ast::Node::NullTest(_)) => {}
                 Some(ast::Node::TypeName(_) | ast::Node::String(_)) => {}
                 _ => simple = false,
@@ -2274,16 +2296,16 @@ impl Level<'_> {
 /// into several (an AND inside, or a NOT of an AND or OR, which
 /// eval_const_expressions negates into one). One alone, or repeated,
 /// refutes nothing.
-fn refutable(failing: &[&Option<ast::Node>], snapshot: &PgCatalog) -> bool {
+fn refutable(failing: &[Option<&ast::Node>], snapshot: &PgCatalog) -> bool {
     let distinct: std::collections::HashSet<String> = failing
         .iter()
-        .map(|c| equivalence_key(c, snapshot))
+        .map(|c| equivalence_key(*c, snapshot))
         .collect();
     distinct.len() > 1
         || failing.iter().any(|c| {
             let mut compound = false;
-            super::walk::visit_same_level(c, &mut |x| {
-                if let Some(ast::Node::BoolExpr(b)) = x.as_ref() {
+            super::walk::visit_same_level(*c, &mut |x| {
+                if let Some(ast::Node::BoolExpr(b)) = x {
                     compound |= b.boolop == ast::BoolExprType::AndExpr
                         || b.boolop == ast::BoolExprType::NotExpr
                             && matches!(
@@ -2306,10 +2328,10 @@ struct Pushed {
 }
 
 /// `n` calls a function every overload of which is volatile.
-fn surely_volatile(n: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
+fn surely_volatile(n: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
     let mut volatile = false;
     super::walk::visit_same_level(n, &mut |x| {
-        if let Some(ast::Node::FuncCall(fc)) = x.as_ref() {
+        if let Some(ast::Node::FuncCall(fc)) = x {
             volatile |= crate::ddl::volatile::surely_volatile(fc, snapshot);
         }
     });
@@ -2321,18 +2343,22 @@ fn surely_volatile(n: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
 /// one of each column (eval_const_expressions expands a ROW's); `None`
 /// where it reads something else, or through an expression not followed.
 fn substitute(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     source: &SourceRows,
     leaf: &Leaf,
 ) -> Option<Option<ast::Node>> {
-    let sub = |n: &Option<ast::Node>| substitute(n, source, leaf);
-    let subs = |ns: &[Option<ast::Node>]| ns.iter().map(sub).collect::<Option<Vec<_>>>();
-    let boxed = |n: &Option<ast::Node>| match n {
+    let sub = |n: Option<&ast::Node>| substitute(n, source, leaf);
+    let subs = |ns: &[Option<ast::Node>]| {
+        ns.iter()
+            .map(|n| sub(n.as_ref()))
+            .collect::<Option<Vec<_>>>()
+    };
+    let boxed = |n: Option<&ast::Node>| match n {
         Some(_) => sub(n),
         None => Some(None),
     };
     let wrap = |n: ast::Node| Some(n);
-    let inner = n.as_ref()?;
+    let inner = n?;
     Some(match inner {
         ast::Node::ColumnRef(cr) => match source.read(cr) {
             Read::Column(i) => leaf.exprs.get(i)?.clone(),
@@ -2365,12 +2391,12 @@ fn substitute(
             }
         }
         ast::Node::NullTest(nt) => wrap(ast::Node::NullTest(NodeBox::new(ast::NullTest {
-            arg: boxed(&nt.arg)?,
+            arg: boxed(nt.arg.as_ref())?,
             ..(**nt).clone()
         }))),
         ast::Node::AExpr(e) => wrap(ast::Node::AExpr(NodeBox::new(ast::AExpr {
-            lexpr: boxed(&e.lexpr)?,
-            rexpr: boxed(&e.rexpr)?,
+            lexpr: boxed(e.lexpr.as_ref())?,
+            rexpr: boxed(e.rexpr.as_ref())?,
             ..(**e).clone()
         }))),
         ast::Node::List(l) => wrap(ast::Node::List(NodeBox::new(ast::List {
@@ -2381,7 +2407,7 @@ fn substitute(
             ..(**b).clone()
         }))),
         ast::Node::TypeCast(tc) => wrap(ast::Node::TypeCast(NodeBox::new(ast::TypeCast {
-            arg: boxed(&tc.arg)?,
+            arg: boxed(tc.arg.as_ref())?,
             ..(**tc).clone()
         }))),
         ast::Node::CoalesceExpr(c) => {
@@ -2406,7 +2432,7 @@ fn substitute(
             if reads {
                 return None;
             }
-            n.clone()
+            n.cloned()
         }
     })
 }
@@ -2534,8 +2560,8 @@ fn range_support_keeps(
 /// built-in range constructor (`int4range(1, 5)`, `numrange(1, NULL,
 /// '[]')`) over literals — immutable, folded by the planner
 /// (`evaluate_function`) into the range its bounds' text makes.
-fn range_const(snapshot: &PgCatalog, n: &Option<ast::Node>) -> Option<(PgTypeOid, RangeShape)> {
-    match n.as_ref()? {
+fn range_const(snapshot: &PgCatalog, n: Option<&ast::Node>) -> Option<(PgTypeOid, RangeShape)> {
+    match n? {
         ast::Node::TypeCast(tc) => {
             let Some(ast::Node::AConst(c)) = tc.arg.as_ref() else {
                 return None;
@@ -2590,8 +2616,13 @@ fn range_const(snapshot: &PgCatalog, n: &Option<ast::Node>) -> Option<(PgTypeOid
                 .iter()
                 .map(|a| {
                     let ctx = Ctx::new(&scope, &null_ctx, snapshot);
-                    expr::infer_expr(a, ctx, &mut ParamCollector::default(), TypeGoal::NONE)
-                        .map(|t| t.type_oid)
+                    expr::infer_expr(
+                        a.as_ref(),
+                        ctx,
+                        &mut ParamCollector::default(),
+                        TypeGoal::NONE,
+                    )
+                    .map(|t| t.type_oid)
                 })
                 .collect::<Result<_, _>>()
                 .ok()?;
@@ -2633,12 +2664,12 @@ fn flags_str(flags: &str) -> Option<&'static str> {
 
 /// `n` surely is a NULL constant once simplified: a NULL literal, or one
 /// cast to a type that is no domain (a domain's coercion is not folded).
-fn is_null_const(snapshot: &PgCatalog, n: &Option<ast::Node>) -> bool {
-    match n.as_ref() {
+fn is_null_const(snapshot: &PgCatalog, n: Option<&ast::Node>) -> bool {
+    match n {
         Some(ast::Node::AConst(c)) => c.isnull,
         Some(ast::Node::TypeCast(tc)) => {
             tc.arg.is_some()
-                && is_null_const(snapshot, &tc.arg)
+                && is_null_const(snapshot, tc.arg.as_ref())
                 && tc
                     .type_name
                     .as_ref()
@@ -2730,7 +2761,7 @@ fn call_evaluates(
             args,
             depth,
         }
-        .evaluates(body, arg)
+        .evaluates(body.as_ref(), arg)
 }
 
 /// The expression of an inlinable SQL function's body, its parameters
@@ -2744,8 +2775,8 @@ struct Body<'a> {
 
 impl Body<'_> {
     /// The parameter `n` refers to: `$n`, or its name.
-    fn param(&self, n: &Option<ast::Node>) -> Option<usize> {
-        match n.as_ref()? {
+    fn param(&self, n: Option<&ast::Node>) -> Option<usize> {
+        match n? {
             ast::Node::ParamRef(p) => usize::try_from(p.number).ok()?.checked_sub(1),
             ast::Node::ColumnRef(cr) => match cr.fields.as_slice() {
                 [f] => match f.as_ref()? {
@@ -2766,7 +2797,7 @@ impl Body<'_> {
     /// The type `n` surely has, where it is simple enough to tell: a
     /// parameter's (a polymorphic one's is its argument's), a literal's,
     /// a cast's, an operator's result.
-    fn type_of(&self, n: &Option<ast::Node>) -> Option<PgTypeOid> {
+    fn type_of(&self, n: Option<&ast::Node>) -> Option<PgTypeOid> {
         if let Some(i) = self.param(n) {
             let declared = self.proc.proargtypes[i];
             return if crate::polymorphic::is_polymorphic(declared) {
@@ -2775,7 +2806,7 @@ impl Body<'_> {
                 Some(declared)
             };
         }
-        match n.as_ref()? {
+        match n? {
             ast::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
             ast::Node::TypeCast(tc) => {
                 crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)
@@ -2790,7 +2821,7 @@ impl Body<'_> {
 
     /// The range constant `n` surely is, by its shape: a parameter given
     /// one, or one written out (see [`range_const`]).
-    fn range(&self, n: &Option<ast::Node>) -> Option<RangeShape> {
+    fn range(&self, n: Option<&ast::Node>) -> Option<RangeShape> {
         match self.param(n) {
             Some(i) => self.args[i].range,
             None => range_const(self.snapshot, n).map(|(_, shape)| shape),
@@ -2800,11 +2831,11 @@ impl Body<'_> {
     fn operator(&self, e: &ast::AExpr) -> Option<crate::lookup::ResolvedOperator> {
         let name = expr::extract_string_fields(&e.name).join(".");
         let left = match e.lexpr.as_ref() {
-            Some(_) => Some(self.type_of(&e.lexpr)?),
+            Some(_) => Some(self.type_of(e.lexpr.as_ref())?),
             None => None,
         };
         e.rexpr.as_ref()?;
-        let right = self.type_of(&e.rexpr)?;
+        let right = self.type_of(e.rexpr.as_ref())?;
         match self.snapshot.find_operator_detailed(&name, left, right) {
             crate::lookup::OperatorMatch::Found(op) => Some(op),
             _ => None,
@@ -2812,28 +2843,28 @@ impl Body<'_> {
     }
 
     /// The constant `n` surely is: a literal, or a parameter given one.
-    fn value(&self, n: &Option<ast::Node>) -> Option<Value> {
+    fn value(&self, n: Option<&ast::Node>) -> Option<Value> {
         match self.param(n) {
             Some(i) => self.args[i].value.clone(),
-            None => literal_value(n.as_ref()),
+            None => literal_value(n),
         }
     }
 
     /// What `n`, a condition, is folded to (see [`truth_with`]).
-    fn truth(&self, n: &Option<ast::Node>) -> Option<bool> {
+    fn truth(&self, n: Option<&ast::Node>) -> Option<bool> {
         truth_with(n, &|v| self.value(v))
     }
 
     /// `n` surely evaluates parameter `k` (the failing argument, no
     /// constant), and isn't folded away.
-    fn evaluates(&self, n: &Option<ast::Node>, k: usize) -> bool {
+    fn evaluates(&self, n: Option<&ast::Node>, k: usize) -> bool {
         if self.param(n) == Some(k) {
             return true;
         }
-        match n.as_ref() {
+        match n {
             Some(ast::Node::TypeCast(tc)) => {
                 tc.arg.is_some()
-                    && self.evaluates(&tc.arg, k)
+                    && self.evaluates(tc.arg.as_ref(), k)
                     && tc
                         .type_name
                         .as_ref()
@@ -2841,11 +2872,11 @@ impl Body<'_> {
                         .is_some_and(|t| casts_evaluate_argument(self.snapshot, t))
             }
             Some(ast::Node::AExpr(e)) if e.kind == ast::AExprKind::AexprOp => {
-                let operands: Vec<&Option<ast::Node>> = [&e.lexpr, &e.rexpr]
+                let operands: Vec<Option<&ast::Node>> = [e.lexpr.as_ref(), e.rexpr.as_ref()]
                     .into_iter()
                     .filter(|a| a.is_some())
                     .collect();
-                let reading: Vec<bool> = operands.iter().map(|a| self.evaluates(a, k)).collect();
+                let reading: Vec<bool> = operands.iter().map(|a| self.evaluates(*a, k)).collect();
                 let Some(operand) = reading.iter().position(|&r| r) else {
                     return false;
                 };
@@ -2853,12 +2884,12 @@ impl Body<'_> {
                     .iter()
                     .enumerate()
                     .map(|(i, a)| Arg {
-                        ty: self.type_of(a),
+                        ty: self.type_of(*a),
                         // The parameter read is no constant.
-                        null: i != operand && self.null_const(a),
-                        not_null: i == operand || self.not_null_const(a),
-                        value: self.value(a),
-                        range: self.range(a),
+                        null: i != operand && self.null_const(*a),
+                        not_null: i == operand || self.not_null_const(*a),
+                        value: self.value(*a),
+                        range: self.range(*a),
                     })
                     .collect();
                 operator_evaluates(
@@ -2874,7 +2905,7 @@ impl Body<'_> {
             // A NullTest of no constant isn't folded; a DistinctExpr is
             // folded only when every argument is a constant (see
             // [`Level::a_expr_error`]).
-            Some(ast::Node::NullTest(nt)) => nt.arg.is_some() && self.evaluates(&nt.arg, k),
+            Some(ast::Node::NullTest(nt)) => nt.arg.is_some() && self.evaluates(nt.arg.as_ref(), k),
             Some(ast::Node::AExpr(e))
                 if matches!(
                     e.kind,
@@ -2884,7 +2915,7 @@ impl Body<'_> {
                 [&e.lexpr, &e.rexpr]
                     .into_iter()
                     .filter(|a| a.is_some())
-                    .any(|a| self.evaluates(a, k))
+                    .any(|a| self.evaluates(a.as_ref(), k))
             }
             // COALESCE drops its NULL constant arguments, and keeps the
             // first other one, no constant, first (a non-NULL constant
@@ -2892,8 +2923,8 @@ impl Body<'_> {
             Some(ast::Node::CoalesceExpr(c)) => c
                 .args
                 .iter()
-                .find(|a| !self.null_const(a))
-                .is_some_and(|a| self.evaluates(a, k)),
+                .find(|a| !self.null_const(a.as_ref()))
+                .is_some_and(|a| self.evaluates(a.as_ref(), k)),
             // An AND or OR drops its NULL constant arguments and the ones
             // folded to the value that doesn't decide it (`$2 > 0` over
             // `1`, in an AND), is folded to a constant when one is folded
@@ -2904,18 +2935,18 @@ impl Body<'_> {
                 let deciding = match b.boolop {
                     ast::BoolExprType::AndExpr => false,
                     ast::BoolExprType::OrExpr => true,
-                    _ => return b.args.len() == 1 && self.evaluates(&b.args[0], k),
+                    _ => return b.args.len() == 1 && self.evaluates(b.args[0].as_ref(), k),
                 };
                 let mut left = Vec::new();
                 for a in &b.args {
-                    match self.truth(a) {
+                    match self.truth(a.as_ref()) {
                         Some(t) if t == deciding => return false,
                         Some(_) => {}
-                        None if self.null_const(a) => {}
+                        None if self.null_const(a.as_ref()) => {}
                         None => left.push(a),
                     }
                 }
-                !left.is_empty() && left.iter().all(|a| self.evaluates(a, k))
+                !left.is_empty() && left.iter().all(|a| self.evaluates(a.as_ref(), k))
             }
             // A searched CASE drops the WHENs folded to false (or NULL),
             // and stops at one folded to true, its result then the
@@ -2930,15 +2961,15 @@ impl Body<'_> {
                         return false;
                     }
                     let cond = &w.expr;
-                    match self.truth(cond) {
+                    match self.truth(cond.as_ref()) {
                         Some(true) => {
-                            return w.result.is_some() && self.evaluates(&w.result, k);
+                            return w.result.is_some() && self.evaluates(w.result.as_ref(), k);
                         }
                         Some(false) => continue,
-                        None => return self.evaluates(cond, k),
+                        None => return self.evaluates(cond.as_ref(), k),
                     }
                 }
-                c.defresult.is_some() && self.evaluates(&c.defresult, k)
+                c.defresult.is_some() && self.evaluates(c.defresult.as_ref(), k)
             }
             _ => false,
         }
@@ -2946,7 +2977,7 @@ impl Body<'_> {
 
     /// `n` surely is a NULL constant once simplified: a parameter given
     /// one, or a NULL literal (maybe cast).
-    fn null_const(&self, n: &Option<ast::Node>) -> bool {
+    fn null_const(&self, n: Option<&ast::Node>) -> bool {
         match self.param(n) {
             Some(i) => self.args[i].null,
             None => is_null_const(self.snapshot, n),
@@ -2955,15 +2986,15 @@ impl Body<'_> {
 
     /// `n` surely is no NULL constant once simplified: a parameter given
     /// none, a non-NULL literal, a built-in cast of such.
-    fn not_null_const(&self, n: &Option<ast::Node>) -> bool {
+    fn not_null_const(&self, n: Option<&ast::Node>) -> bool {
         if let Some(i) = self.param(n) {
             return self.args[i].not_null;
         }
-        match n.as_ref() {
+        match n {
             Some(ast::Node::AConst(c)) => !c.isnull,
             Some(ast::Node::TypeCast(tc)) => {
                 tc.arg.is_some()
-                    && self.not_null_const(&tc.arg)
+                    && self.not_null_const(tc.arg.as_ref())
                     && tc
                         .type_name
                         .as_ref()
@@ -2979,12 +3010,12 @@ impl Body<'_> {
 /// tells the constants of (a literal each, where known): comparisons of
 /// constants (see [`truth_with`]).
 pub(super) fn qual_truth<'a>(
-    qual: &Option<ast::Node>,
+    qual: Option<&ast::Node>,
     column: &dyn Fn(&ast::ColumnRef) -> Option<&'a ast::Node>,
 ) -> Option<bool> {
-    truth_with(qual, &|n| match n.as_ref()? {
+    truth_with(qual, &|n| match n? {
         ast::Node::ColumnRef(cr) => literal_value(Some(column(cr)?)),
-        _ => literal_value(n.as_ref()),
+        _ => literal_value(n),
     })
 }
 
@@ -2999,11 +3030,11 @@ enum EqConst {
 /// The constant `n` is, compared with a column — of an integer or numeric
 /// type where `numeric`: a literal, or a number (a literal one, or one
 /// cast to such a type, maybe a string).
-fn eq_const(n: &Option<ast::Node>, numeric: bool, snapshot: &PgCatalog) -> Option<EqConst> {
+fn eq_const(n: Option<&ast::Node>, numeric: bool, snapshot: &PgCatalog) -> Option<EqConst> {
     // Equal numbers are one value of whatever type they are read as, a
     // string only of a numeric one.
     let string = matches!(
-        n.as_ref(),
+        n,
         Some(ast::Node::AConst(c)) if matches!(c.val, Some(ast::AConstValue::String(_)))
     );
     if (numeric || !string)
@@ -3011,12 +3042,12 @@ fn eq_const(n: &Option<ast::Node>, numeric: bool, snapshot: &PgCatalog) -> Optio
     {
         return Some(EqConst::Number(number));
     }
-    literal_value(n.as_ref()).map(EqConst::Literal)
+    literal_value(n).map(EqConst::Literal)
 }
 
 /// The canonical decimal form of the number `n` surely is.
-fn number_const(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
-    match n.as_ref()? {
+fn number_const(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<String> {
+    match n? {
         ast::Node::AConst(c) => match c.val.as_ref()? {
             ast::AConstValue::Integer(i) => Some(i.ival.to_string()),
             ast::AConstValue::Float(f) => canonical_decimal(&f.fval),
@@ -3030,7 +3061,7 @@ fn number_const(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
             {
                 return None;
             }
-            number_const(&tc.arg, snapshot)
+            number_const(tc.arg.as_ref(), snapshot)
         }
         _ => None,
     }
@@ -3083,17 +3114,21 @@ fn literal_value(n: Option<&ast::Node>) -> Option<Value> {
 /// told by `value`: comparisons of constants, which the planner folds
 /// (and which evaluate so at run time).
 fn truth_with(
-    n: &Option<ast::Node>,
-    value: &dyn Fn(&Option<ast::Node>) -> Option<Value>,
+    n: Option<&ast::Node>,
+    value: &dyn Fn(Option<&ast::Node>) -> Option<Value>,
 ) -> Option<bool> {
     use ast::BoolExprType as B;
-    match n.as_ref()? {
+    match n? {
         ast::Node::AConst(_) => match value(n)? {
             Value::Bool(b) => Some(b),
             _ => None,
         },
         ast::Node::BoolExpr(b) => {
-            let args: Vec<Option<bool>> = b.args.iter().map(|a| truth_with(a, value)).collect();
+            let args: Vec<Option<bool>> = b
+                .args
+                .iter()
+                .map(|a| truth_with(a.as_ref(), value))
+                .collect();
             match b.boolop {
                 B::AndExpr if args.contains(&Some(false)) => Some(false),
                 B::AndExpr => args.iter().all(|a| *a == Some(true)).then_some(true),
@@ -3107,7 +3142,7 @@ fn truth_with(
         }
         ast::Node::NullTest(nt) => {
             nt.arg.as_ref()?;
-            value(&nt.arg)?;
+            value(nt.arg.as_ref())?;
             Some(nt.nulltesttype == ast::NullTestType::IsNotNull)
         }
         ast::Node::AExpr(e) => {
@@ -3119,11 +3154,11 @@ fn truth_with(
                 _ => return None,
             };
             e.lexpr.as_ref()?;
-            let l = value(&e.lexpr)?;
+            let l = value(e.lexpr.as_ref())?;
             match e.kind {
                 ast::AExprKind::AexprOp => {
                     e.rexpr.as_ref()?;
-                    compare(name, &l, &value(&e.rexpr)?)
+                    compare(name, &l, &value(e.rexpr.as_ref())?)
                 }
                 ast::AExprKind::AexprIn => {
                     let Some(ast::Node::List(list)) = e.rexpr.as_ref() else {
@@ -3132,7 +3167,7 @@ fn truth_with(
                     let eq: Vec<Option<bool>> = list
                         .items
                         .iter()
-                        .map(|r| compare("=", &l, &value(r)?))
+                        .map(|r| compare("=", &l, &value(r.as_ref())?))
                         .collect();
                     let any = if eq.contains(&Some(true)) {
                         Some(true)
@@ -3155,14 +3190,14 @@ fn truth_with(
 
 /// The operator expression `l <op> r`, as the parser builds out of a
 /// BETWEEN or an IN.
-fn comparison(op: &str, l: &Option<ast::Node>, r: &Option<ast::Node>) -> ast::AExpr {
+fn comparison(op: &str, l: Option<&ast::Node>, r: Option<&ast::Node>) -> ast::AExpr {
     ast::AExpr {
         kind: ast::AExprKind::AexprOp,
         name: vec![Some(ast::Node::String(NodeBox::new(ast::String {
             sval: op.into(),
         })))],
-        lexpr: l.clone(),
-        rexpr: r.clone(),
+        lexpr: l.cloned(),
+        rexpr: r.cloned(),
 
         ..Default::default()
     }
@@ -3218,25 +3253,27 @@ enum Read {
 
 impl SourceRows {
     fn read(&self, cr: &ast::ColumnRef) -> Read {
-        let star = |n: &Option<ast::Node>| matches!(n, Some(ast::Node::AStar(_)));
-        fn name(n: &Option<ast::Node>) -> Option<&str> {
-            match n.as_ref() {
+        let star = |n: Option<&ast::Node>| matches!(n, Some(ast::Node::AStar(_)));
+        fn name(n: Option<&ast::Node>) -> Option<&str> {
+            match n {
                 Some(ast::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             }
         }
         let column = |col: &str| self.names.iter().position(|n| n == col).map(Read::Column);
         match cr.fields.as_slice() {
-            [f] if star(f) => Read::All,
-            [rel, f] if star(f) && name(rel) == Some(self.name.as_str()) => Read::All,
-            [col] => match name(col).and_then(column) {
+            [f] if star(f.as_ref()) => Read::All,
+            [rel, f] if star(f.as_ref()) && name(rel.as_ref()) == Some(self.name.as_str()) => {
+                Read::All
+            }
+            [col] => match name(col.as_ref()).and_then(column) {
                 Some(c) => c,
                 // A whole-row reference by the item's name.
-                None if name(col) == Some(self.name.as_str()) => Read::WholeRow,
+                None if name(col.as_ref()) == Some(self.name.as_str()) => Read::WholeRow,
                 None => Read::Other,
             },
-            [rel, col] if name(rel) == Some(self.name.as_str()) => {
-                name(col).and_then(column).unwrap_or(Read::Other)
+            [rel, col] if name(rel.as_ref()) == Some(self.name.as_str()) => {
+                name(col.as_ref()).and_then(column).unwrap_or(Read::Other)
             }
             _ => Read::Other,
         }
@@ -3245,7 +3282,7 @@ impl SourceRows {
 /// The FROM item `item` as [`SourceRows`]: a view, a CTE or a subquery
 /// whose query's rows are surely evaluated.
 fn from_item_rows(
-    item: &Option<ast::Node>,
+    item: Option<&ast::Node>,
     snapshot: &PgCatalog,
     ctes: &[&ast::CommonTableExpr],
     depth: usize,
@@ -3265,7 +3302,7 @@ fn from_item_rows(
         &[&ast::CommonTableExpr],
         _,
         _,
-    ) = match item.as_ref()? {
+    ) = match item? {
         ast::Node::RangeVar(rv) => {
             let cte = rv
                 .schemaname
@@ -3374,7 +3411,7 @@ fn from_item_rows(
                 Some(ast::Node::ResTarget(rt)) => rt
                     .val
                     .as_ref()
-                    .and_then(|_| super::target_list::infer_column_name(&rt.val))
+                    .and_then(|_| super::target_list::infer_column_name(rt.val.as_ref()))
                     .unwrap_or_else(|| "?column?".to_owned()),
 
                 _ => String::new(),

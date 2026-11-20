@@ -117,9 +117,9 @@ fn json_value_expr(
     let raw = &ve.raw_expr;
     raw.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("JSON value expression without expr".into()))?;
-    let mut t = infer_expr(raw, ctx, params, TypeGoal::NONE)?;
+    let mut t = infer_expr(raw.as_ref(), ctx, params, TypeGoal::NONE)?;
     if t.type_oid == oid::UNKNOWN {
-        coerce_unknown_to(raw, ctx, params, oid::TEXT)?;
+        coerce_unknown_to(raw.as_ref(), ctx, params, oid::TEXT)?;
         t.type_oid = oid::TEXT;
     }
     let ty = snapshot.unwrap_domain(t.type_oid);
@@ -195,7 +195,8 @@ fn json_value_expr(
                 type_name(snapshot, source),
                 type_name(snapshot, target)
             ),
-            crate::error::node_location(raw).and_then(crate::error::SourceSpan::from_node_qname),
+            crate::error::node_location(raw.as_ref())
+                .and_then(crate::error::SourceSpan::from_node_qname),
             None,
         )
         .finalize_implicit());
@@ -234,7 +235,7 @@ fn constructor_result(
 /// no coercion — it is an `"any"` argument of the builder — so a bare `$N`
 /// stays untypable.
 fn object_key(
-    key: &Option<ast::Node>,
+    key: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -257,7 +258,7 @@ pub(crate) fn infer_json_object(
             continue;
         };
         if let key @ Some(_) = &kv.key {
-            args.push(object_key(key, ctx, params)?.type_oid);
+            args.push(object_key(key.as_ref(), ctx, params)?.type_oid);
         }
         if let Some(v) = kv.value.as_deref() {
             let t = json_value_expr(
@@ -333,15 +334,20 @@ fn json_agg_modifiers(
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
     if let filter @ Some(_) = &ac.agg_filter {
-        crate::clause::coerce_clause_expr(filter, ctx, params, crate::clause::ClauseKind::Filter)?;
+        crate::clause::coerce_clause_expr(
+            filter.as_ref(),
+            ctx,
+            params,
+            crate::clause::ClauseKind::Filter,
+        )?;
     }
     for item in &ac.agg_order {
         if let Some(ast::Node::SortBy(sb)) = item.as_ref()
             && let inner @ Some(_) = &sb.node
         {
-            infer_expr(inner, ctx, params, TypeGoal::NONE)?;
+            infer_expr(inner.as_ref(), ctx, params, TypeGoal::NONE)?;
             // transformJsonAggConstructor's transformSortClause.
-            crate::expr::resolve_unknown_key(inner, ctx.snapshot, params)?;
+            crate::expr::resolve_unknown_key(inner.as_ref(), ctx.snapshot, params)?;
         }
     }
     // Its window, like a function's, is transformed with the query's
@@ -356,18 +362,25 @@ fn json_agg_modifiers(
 /// which this level knows nothing of.
 fn json_agg_nullable(
     ac: Option<&ast::JsonAggConstructor>,
-    values: &[&Option<ast::Node>],
+    values: &[Option<&ast::Node>],
     ctx: Ctx<'_>,
 ) -> bool {
     let over = ac.and_then(|c| c.over.as_deref());
     if over.is_none() {
         let mut aggregated = values.to_vec();
         if let Some(ac) = ac {
-            aggregated.extend(ac.agg_order.iter().filter_map(|o| match o.as_ref() {
-                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
-                _ => Some(o),
-            }));
-            aggregated.extend(ac.agg_filter.is_some().then_some(&ac.agg_filter));
+            aggregated.extend(
+                ac.agg_order
+                    .iter()
+                    .map(Option::as_ref)
+                    .filter_map(|o| match o {
+                        Some(ast::Node::SortBy(sb)) => {
+                            sb.node.is_some().then_some(sb.node.as_ref())
+                        }
+                        _ => Some(o),
+                    }),
+            );
+            aggregated.extend(ac.agg_filter.is_some().then_some(ac.agg_filter.as_ref()));
         }
         if crate::grouping::levels_up_of(&aggregated, ctx.scope) > 0 {
             return true;
@@ -390,7 +403,7 @@ pub(crate) fn infer_json_objectagg(
     let mut args = Vec::new();
     if let Some(kv) = a.arg.as_deref() {
         if let key @ Some(_) = &kv.key {
-            args.push(object_key(key, ctx, params)?.type_oid);
+            args.push(object_key(key.as_ref(), ctx, params)?.type_oid);
         }
         if let Some(v) = kv.value.as_deref() {
             let t = json_value_expr(
@@ -408,17 +421,19 @@ pub(crate) fn infer_json_objectagg(
     if let Some(ac) = ac {
         json_agg_modifiers(ac, ctx, params)?;
     }
-    let values: Vec<&Option<ast::Node>> = a
+    let values: Vec<Option<&ast::Node>> = a
         .arg
         .as_deref()
         .into_iter()
         .flat_map(|kv| {
-            std::iter::once(&kv.key).filter(|k| k.is_some()).chain(
-                kv.value
-                    .as_deref()
-                    .map(|v| &v.raw_expr)
-                    .filter(|e| e.is_some()),
-            )
+            std::iter::once(kv.key.as_ref())
+                .filter(|k| k.is_some())
+                .chain(
+                    kv.value
+                        .as_deref()
+                        .map(|v| v.raw_expr.as_ref())
+                        .filter(|e| e.is_some()),
+                )
         })
         .collect();
     constructor_result(
@@ -451,10 +466,10 @@ pub(crate) fn infer_json_arrayagg(
     if let Some(ac) = ac {
         json_agg_modifiers(ac, ctx, params)?;
     }
-    let values: Vec<&Option<ast::Node>> = a
+    let values: Vec<Option<&ast::Node>> = a
         .arg
         .as_deref()
-        .map(|v| &v.raw_expr)
+        .map(|v| v.raw_expr.as_ref())
         .filter(|e| e.is_some())
         .into_iter()
         .collect();
@@ -485,7 +500,7 @@ pub(crate) fn infer_json_parse(
         let raw = &ve.raw_expr;
         raw.as_ref()
             .ok_or_else(|| AnalyzeError::Internal("JSON value expression without expr".into()))?;
-        let (ty, t) = json_parse_arg(raw, ve.format.as_deref(), ctx, params)?;
+        let (ty, t) = json_parse_arg(raw.as_ref(), ve.format.as_deref(), ctx, params)?;
         if ty != oid::TEXT {
             return Err(AnalyzeError::DatatypeMismatch(
                 "cannot use non-string types with WITH UNIQUE KEYS clause".into(),
@@ -518,9 +533,9 @@ pub(crate) fn infer_json_scalar(
     let e = &s.expr;
     e.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("JSON_SCALAR() without argument".into()))?;
-    let t = infer_expr(e, ctx, params, TypeGoal::NONE)?;
+    let t = infer_expr(e.as_ref(), ctx, params, TypeGoal::NONE)?;
     if t.type_oid == oid::UNKNOWN {
-        coerce_unknown_to(e, ctx, params, oid::TEXT)?;
+        coerce_unknown_to(e.as_ref(), ctx, params, oid::TEXT)?;
     }
     match json_output(s.output.as_deref(), ctx.snapshot, true)? {
         Some((ty, typmod)) => Ok(ExprType::scalar_with_typmod(ty, t.nullable, typmod)),
@@ -581,7 +596,7 @@ pub(crate) fn infer_json_is_predicate(
     let e = &p.expr;
     e.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("IS JSON without operand".into()))?;
-    let (ty, t) = json_parse_arg(e, p.format.as_deref(), ctx, params)?;
+    let (ty, t) = json_parse_arg(e.as_ref(), p.format.as_deref(), ctx, params)?;
     if ty != oid::TEXT && ty != JSON && ty != JSONB {
         return Err(AnalyzeError::DatatypeMismatch(format!(
             "cannot use type {} in IS JSON predicate",
@@ -597,7 +612,7 @@ pub(crate) fn infer_json_is_predicate(
 /// returned as its base type, for the caller to judge. Returns that type
 /// and the input's own inference.
 fn json_parse_arg(
-    e: &Option<ast::Node>,
+    e: Option<&ast::Node>,
     format: Option<&ast::JsonFormat>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -661,10 +676,10 @@ pub(crate) fn infer_json_func_expr(
 
     let mut path_nullable = false;
     if let path @ Some(_) = &f.pathspec {
-        let t = infer_expr(path, ctx, params, TypeGoal::NONE)?;
+        let t = infer_expr(path.as_ref(), ctx, params, TypeGoal::NONE)?;
         path_nullable = t.nullable;
         if t.type_oid == oid::UNKNOWN {
-            coerce_unknown_to(path, ctx, params, JSONPATH)?;
+            coerce_unknown_to(path.as_ref(), ctx, params, JSONPATH)?;
         } else if t.type_oid != JSONPATH
             && !coerce::can_cast_explicit(t.type_oid, JSONPATH, snapshot)
         {
@@ -826,7 +841,7 @@ pub(crate) fn json_behaviors(
         if btype == B::JsonBehaviorDefault
             && let e @ Some(_) = &b.expr
         {
-            json_behavior_default(e, ret, ctx, params)?;
+            json_behavior_default(e.as_ref(), ret, ctx, params)?;
         }
     }
     Ok(unknown_on_error)
@@ -836,7 +851,7 @@ pub(crate) fn json_behaviors(
 /// a (non-aggregate) function or an operator expression, with no column
 /// references, cast (explicitly) to the function's result type.
 fn json_behavior_default(
-    e: &Option<ast::Node>,
+    e: Option<&ast::Node>,
     ret: PgTypeOid,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -844,16 +859,16 @@ fn json_behavior_default(
     let snapshot = ctx.snapshot;
     // The transformed node PG checks: a cast of a constant is a constant,
     // any other cast (of a column / parameter) is not.
-    let shape_ok = |n: &Option<ast::Node>| -> bool {
-        fn go(n: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
-            match n.as_ref() {
+    let shape_ok = |n: Option<&ast::Node>| -> bool {
+        fn go(n: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
+            match n {
                 Some(ast::Node::AConst(_) | ast::Node::AExpr(_)) => true,
                 // An aggregate / window call is not a FuncExpr.
                 Some(ast::Node::FuncCall(_)) => {
                     let kinds = detect_func_kinds(n, snapshot);
                     !kinds.has_aggregate && !kinds.has_window
                 }
-                Some(ast::Node::TypeCast(c)) => go(&c.arg, snapshot),
+                Some(ast::Node::TypeCast(c)) => go(c.arg.as_ref(), snapshot),
                 _ => false,
             }
         }
@@ -881,10 +896,10 @@ fn json_behavior_default(
     // jsonb value and a boolean — unless the result is (a domain over)
     // integer, which has a cast from boolean — are coerced at run time,
     // by json_populate_type.
-    fn null_const(n: &Option<ast::Node>) -> bool {
-        match n.as_ref() {
+    fn null_const(n: Option<&ast::Node>) -> bool {
+        match n {
             Some(ast::Node::AConst(c)) => c.isnull,
-            Some(ast::Node::TypeCast(c)) => null_const(&c.arg),
+            Some(ast::Node::TypeCast(c)) => null_const(c.arg.as_ref()),
             _ => false,
         }
     }

@@ -150,7 +150,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         let _plan = crate::expr::plan_fold::PlanLevel::enter_merge_source(source_relation);
         super::from::with_rows_kept(kept, || {
             process_from_item(
-                source_relation,
+                source_relation.as_ref(),
                 &mut source_scope,
                 &mut null_ctx,
                 snapshot,
@@ -160,7 +160,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         })?;
         // transformMergeStmt: the target and the source RTE may not share a
         // name (a dedicated checkNameSpaceConflicts, 42712).
-        if from_item_refname(source_relation).as_deref() == Some(target_alias.as_str()) {
+        if from_item_refname(source_relation.as_ref()).as_deref() == Some(target_alias.as_str()) {
             return Err(crate::pgmsg::merge_name_specified_twice(&target_alias).finalize_implicit());
         }
     }
@@ -184,14 +184,18 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     let on_log = crate::nonnull::StrictLog::default();
     if let join_condition @ Some(_) = &merge.join_condition {
         expr::infer_expr(
-            join_condition,
+            join_condition.as_ref(),
             expr::Ctx::new(&both, &null_ctx, snapshot).logging_strictness(&on_log),
             params,
             TypeGoal::assignment(oid::BOOL),
         )?;
         // transformMergeStmt analyzes it as EXPR_KIND_JOIN_ON.
-        crate::clause::check_no_aggregates_or_windows(join_condition, snapshot, "JOIN conditions")?;
-        check_no_srf_in_clause(join_condition, snapshot, "JOIN conditions")?;
+        crate::clause::check_no_aggregates_or_windows(
+            join_condition.as_ref(),
+            snapshot,
+            "JOIN conditions",
+        )?;
+        check_no_srf_in_clause(join_condition.as_ref(), snapshot, "JOIN conditions")?;
     }
 
     // Rows inserted or updated through a view are not the view's rows.
@@ -220,7 +224,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     // first of them to type a `$N` fixes its type.
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
     let typed = super::returning::type_returning_params(
-        &merge.returning_clause,
+        merge.returning_clause.as_deref(),
         &target_alias,
         expr::Ctx::new(&ret_scope, &null_ctx, snapshot),
         params,
@@ -272,8 +276,10 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                 )));
             }
             when_facts.push(match &when.condition {
-                c @ Some(_) => crate::nonnull::nonnullable(c, true, when_scope, &log, snapshot)
-                    .restricted_to(&crate::nonnull::own_aliases(when_scope)),
+                c @ Some(_) => {
+                    crate::nonnull::nonnullable(c.as_ref(), true, when_scope, &log, snapshot)
+                        .restricted_to(&crate::nonnull::own_aliases(when_scope))
+                }
                 None => crate::nonnull::Facts::default(),
             });
         }
@@ -299,12 +305,18 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     if source_may_be_null {
         ret_null_ctx.mark_all_nullable(&nullability::collect_aliases(&source_scope.sources));
     }
-    if has_returning(&merge.returning_clause)
+    if has_returning(merge.returning_clause.as_deref())
         && let Some(wt) = WriteTarget::resolve(snapshot, table_oid)
     {
         let on_facts = if merge.join_condition.is_some() {
-            crate::nonnull::nonnullable(&merge.join_condition, true, &both, &on_log, snapshot)
-                .restricted_to(&crate::nonnull::own_aliases(&both))
+            crate::nonnull::nonnullable(
+                merge.join_condition.as_ref(),
+                true,
+                &both,
+                &on_log,
+                snapshot,
+            )
+            .restricted_to(&crate::nonnull::own_aliases(&both))
         } else {
             Default::default()
         };
@@ -340,7 +352,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     }
     MERGE_RETURNING_DEPTH.with(|d| d.set(d.get() + 1));
     let columns = resolve_returning(
-        &merge.returning_clause,
+        merge.returning_clause.as_deref(),
         &target_alias,
         rows,
         expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
@@ -379,8 +391,8 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                         .zip(&when.values)
                         .map(|(column, v)| Assign {
                             column,
-                            default: is_set_to_default(v),
-                            null: is_sql_null_literal(v),
+                            default: is_set_to_default(v.as_ref()),
+                            null: is_sql_null_literal(v.as_ref()),
                         })
                         .collect(),
                     overriding: Overriding::from_kind(when.r#override),
@@ -411,7 +423,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             .collect(),
         actions,
         on_conflict: None,
-        returning: has_returning(&merge.returning_clause),
+        returning: has_returning(merge.returning_clause.as_deref()),
         row_error: None,
     };
     check_rewrite(snapshot, table_oid, &rw)?;
@@ -429,16 +441,16 @@ fn walk_merge_when_clause(
     table_relname: &str,
 ) -> Result<Option<Vec<Option<ast::Node>>>, AnalyzeError> {
     if let condition @ Some(_) = &when.condition {
-        check_no_system_columns(condition, ctx.scope)?;
+        check_no_system_columns(condition.as_ref(), ctx.scope)?;
         // transformMergeStmt: transformWhereClause(…, EXPR_KIND_MERGE_WHEN,
         // "WHEN").
         crate::clause::coerce_clause_expr(
-            condition,
+            condition.as_ref(),
             ctx.logging_strictness(log),
             params,
             crate::clause::ClauseKind::MergeWhen,
         )?;
-        check_no_srf_in_clause(condition, ctx.snapshot, "MERGE WHEN conditions")?;
+        check_no_srf_in_clause(condition.as_ref(), ctx.snapshot, "MERGE WHEN conditions")?;
     }
 
     let cmd = when.command_type;
@@ -463,12 +475,12 @@ fn walk_merge_when_clause(
 /// not read a relation's system column but `tableoid` (42P10). A sub-select
 /// is a query level of its own, where they are allowed.
 fn check_no_system_columns(
-    condition: &Option<ast::Node>,
+    condition: Option<&ast::Node>,
     scope: &Scope,
 ) -> Result<(), AnalyzeError> {
     let mut found: Option<(&str, i32)> = None;
     visit_same_level(condition, &mut |n| {
-        let Some(ast::Node::ColumnRef(cr)) = n.as_ref() else {
+        let Some(ast::Node::ColumnRef(cr)) = n else {
             return;
         };
         if found.is_some() {
@@ -577,7 +589,11 @@ fn merge_when_insert(
     };
     // The row is transformed whole, then coerced to its columns
     // (transformInsertRow), as in a plain INSERT.
-    let untyped = expr::replay_transform(&when.values.iter().collect::<Vec<_>>(), ctx, params);
+    let untyped = expr::replay_transform(
+        &when.values.iter().map(Option::as_ref).collect::<Vec<_>>(),
+        ctx,
+        params,
+    );
     // ExecMergeNotMatched inserts through ExecInsert: a row for a
     // partitioned target is routed first, and checked in (and named after)
     // its partition.
@@ -594,10 +610,10 @@ fn merge_when_insert(
             }
             Some(i) => {
                 let v = when.values.get(i)?;
-                if is_set_to_default(v) {
+                if is_set_to_default(v.as_ref()) {
                     null_default(c, snapshot).then_some(None)
                 } else {
-                    Some((!is_sql_null_literal(v)).then_some(v.as_ref()?))
+                    Some((!is_sql_null_literal(v.as_ref())).then_some(v.as_ref()?))
                 }
             }
             None => null_default(c, snapshot).then_some(None),
@@ -620,7 +636,10 @@ fn merge_when_insert(
     for c in table_attrs.iter().filter(|c| c.attnum > 0) {
         let defaulted = match target_attrs.iter().position(|t| t.attnum == c.attnum) {
             None => true,
-            Some(i) => when.values.get(i).is_none_or(is_set_to_default),
+            Some(i) => when
+                .values
+                .get(i)
+                .is_none_or(|n| is_set_to_default(n.as_ref())),
         };
         if defaulted && let Some(err) = super::dml::default_fold_error(c, snapshot) {
             return Err(err);
@@ -640,7 +659,7 @@ fn merge_when_insert(
             None => None,
         };
         if untyped[i]
-            && let Some(p) = expr::bare_param(val, snapshot)
+            && let Some(p) = expr::bare_param(val.as_ref(), snapshot)
             && let Some(t) = &target
         {
             expr::coerce_untyped_param(p, t.type_oid, snapshot, params)?;
@@ -649,7 +668,7 @@ fn merge_when_insert(
         if let Some(tc) = target_col
             && !indirected
         {
-            if is_sql_null_literal(val)
+            if is_sql_null_literal(val.as_ref())
                 && !discards(tc)
                 && let Some(err) = match &lands_in {
                     Some(lands_in) => super::dml::insert_null_error(tc, snapshot, lands_in),
@@ -658,13 +677,13 @@ fn merge_when_insert(
             {
                 return Err(err);
             }
-            super::deferred::record_read(val, ctx.scope);
+            super::deferred::record_read(val.as_ref(), ctx.scope);
             if !discards(tc)
                 && let Some(err) = crate::typmod::check_literal_assignment(
                     snapshot,
                     tc.atttypid,
                     snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-                    val,
+                    val.as_ref(),
                 )
             {
                 return Err(err);
@@ -675,16 +694,16 @@ fn merge_when_insert(
         match (target_col, &target) {
             (Some(tc), Some(t)) => {
                 let goal = TypeGoal::assignment(t.type_oid).with_source_column(&tc.attname);
-                t.infer_value(val, goal, ctx, params)?;
+                t.infer_value(val.as_ref(), goal, ctx, params)?;
             }
-            _ if is_set_to_default(val) => {}
+            _ if is_set_to_default(val.as_ref()) => {}
             _ => {
-                expr::infer_expr(val, ctx, params, TypeGoal::NONE)?;
+                expr::infer_expr(val.as_ref(), ctx, params, TypeGoal::NONE)?;
             }
         }
-        if !is_set_to_default(val) {
+        if !is_set_to_default(val.as_ref()) {
             // EXPR_KIND_VALUES_SINGLE.
-            crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
+            crate::clause::check_no_aggregates_or_windows(val.as_ref(), snapshot, "VALUES")?;
         }
         if let Some(ast::Node::ParamRef(p)) = val.as_ref()
             && let Some(tc) = target_col
@@ -703,7 +722,7 @@ fn merge_when_insert(
                 when.values.len(),
                 when.values
                     .get(target_attrs.len())
-                    .and_then(crate::error::expr_span),
+                    .and_then(|n| crate::error::expr_span(n.as_ref())),
             )
             .finalize_implicit());
         }
@@ -744,15 +763,15 @@ fn check_unreachable_when_clauses(clauses: &[Option<ast::Node>]) -> Result<(), A
 /// alias): the alias when given, else the relation / CTE name, the first
 /// function's name, `json_table`, or PG's `unnamed_subquery` /
 /// `unnamed_join` placeholders.
-fn from_item_refname(item: &Option<ast::Node>) -> Option<String> {
-    let alias = |a: &Option<NodeBox<ast::Alias>>| a.as_deref().map(|a| a.aliasname.clone());
-    match item.as_ref()? {
-        ast::Node::RangeVar(rv) => alias(&rv.alias).or_else(|| Some(rv.relname.clone())),
+fn from_item_refname(item: Option<&ast::Node>) -> Option<String> {
+    let alias = |a: Option<&ast::Alias>| a.map(|a| a.aliasname.clone());
+    match item? {
+        ast::Node::RangeVar(rv) => alias(rv.alias.as_deref()).or_else(|| Some(rv.relname.clone())),
         ast::Node::RangeSubselect(rs) => {
-            alias(&rs.alias).or_else(|| Some("unnamed_subquery".into()))
+            alias(rs.alias.as_deref()).or_else(|| Some("unnamed_subquery".into()))
         }
-        ast::Node::JoinExpr(j) => alias(&j.alias).or_else(|| Some("unnamed_join".into())),
-        ast::Node::RangeFunction(rf) => alias(&rf.alias).or_else(|| {
+        ast::Node::JoinExpr(j) => alias(j.alias.as_deref()).or_else(|| Some("unnamed_join".into())),
+        ast::Node::RangeFunction(rf) => alias(rf.alias.as_deref()).or_else(|| {
             let Some(ast::Node::List(pair)) = rf.functions.first()?.as_ref() else {
                 return None;
             };
@@ -761,8 +780,10 @@ fn from_item_refname(item: &Option<ast::Node>) -> Option<String> {
                 _ => None,
             }
         }),
-        ast::Node::JsonTable(jt) => alias(&jt.alias).or_else(|| Some("json_table".into())),
-        ast::Node::RangeTableSample(ts) => from_item_refname(&ts.relation),
+        ast::Node::JsonTable(jt) => {
+            alias(jt.alias.as_deref()).or_else(|| Some("json_table".into()))
+        }
+        ast::Node::RangeTableSample(ts) => from_item_refname(ts.relation.as_ref()),
         _ => None,
     }
 }
@@ -931,7 +952,7 @@ impl MergeArms<'_> {
             let Some(attr) = self.table_attrs.iter().find(|a| &a.attname == name) else {
                 continue;
             };
-            let info = if is_set_to_default(val) {
+            let info = if is_set_to_default(val.as_ref()) {
                 None
             } else if *indirected {
                 Some(ValueInfo::default())
@@ -941,12 +962,12 @@ impl MergeArms<'_> {
                         .effective_typmod(attr.atttypid, attr.atttypmod),
                 );
                 match expr::infer_expr(
-                    val,
+                    val.as_ref(),
                     expr::Ctx::new(self.source_only, &ctx, self.snapshot),
                     &mut scratch,
                     goal,
                 ) {
-                    Ok(t) => Some(ValueInfo::assigned(val, &t, attr, self.snapshot)),
+                    Ok(t) => Some(ValueInfo::assigned(val.as_ref(), &t, attr, self.snapshot)),
                     Err(_) => Some(ValueInfo::default()),
                 }
             };

@@ -13,7 +13,7 @@
 use super::*;
 use crate::ddl::triggers::{TRIGGER_TYPE_DELETE, TRIGGER_TYPE_INSERT, TRIGGER_TYPE_UPDATE};
 use crate::pg_catalog::RelKind;
-use typedpg_pg_query::NodeBox;
+
 use typedpg_pg_query::ast::{self, CmdType};
 
 /// A data-modifying event (`CMD_INSERT` / `CMD_UPDATE` / `CMD_DELETE`).
@@ -125,8 +125,8 @@ impl Rewrite {
 }
 
 /// Whether a RETURNING clause returns anything.
-pub(crate) fn has_returning(clause: &Option<NodeBox<ast::ReturningClause>>) -> bool {
-    clause.as_deref().is_some_and(|c| !c.exprs.is_empty())
+pub(crate) fn has_returning(clause: Option<&ast::ReturningClause>) -> bool {
+    clause.is_some_and(|c| !c.exprs.is_empty())
 }
 
 /// The assignments of an UPDATE-style SET list (`col = v`, `col[i] = v`,
@@ -147,7 +147,7 @@ pub(crate) fn set_list_assigns(target_list: &[Option<ast::Node>]) -> Vec<Assign>
                         Some(ast::Node::RowExpr(row)) => row
                             .args
                             .get((m.colno as usize).wrapping_sub(1))
-                            .is_some_and(is_set_to_default),
+                            .is_some_and(|n| is_set_to_default(n.as_ref())),
                         _ => false,
                     },
                     _ => false,
@@ -155,7 +155,7 @@ pub(crate) fn set_list_assigns(target_list: &[Option<ast::Node>]) -> Vec<Assign>
             Assign {
                 column: rt.name.clone(),
                 default,
-                null: rt.indirection.is_empty() && is_sql_null_literal(&rt.val),
+                null: rt.indirection.is_empty() && is_sql_null_literal(rt.val.as_ref()),
             }
         })
         .collect()

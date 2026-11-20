@@ -83,7 +83,7 @@ fn def_get_string(arg: Option<&ast::Node>) -> Option<String> {
         ast::Node::TypeName(tn) => Some(
             tn.names
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect::<Vec<_>>()
                 .join("."),
         ),
@@ -265,7 +265,7 @@ fn check_tables_to_add(
                 relname(interp, relid)
             )));
         }
-        check_row_filter(interp, relid, filter)?;
+        check_row_filter(interp, relid, filter.as_ref())?;
     }
     for (relid, _) in tables().filter(|(_, pt)| !pt.columns.is_empty()) {
         let detail = if with_schemas {
@@ -323,7 +323,11 @@ fn check_tables_to_add(
         }
         // pub_collist_validate.
         let mut seen: Vec<&str> = Vec::new();
-        for col in pt.columns.iter().filter_map(super::util::node_string) {
+        for col in pt
+            .columns
+            .iter()
+            .filter_map(|n| super::util::node_string(n.as_ref()))
+        {
             if interp.attribute_by_name(relid, col).is_none() {
                 if crate::pg_catalog::SYSTEM_COLUMNS
                     .iter()
@@ -413,7 +417,7 @@ fn check_alter_all_tables(
 fn check_row_filter(
     interp: &PgCatalog,
     relid: PgClassOid,
-    filter: &Option<typedpg_pg_query::ast::Node>,
+    filter: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     let unsupported = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(e.to_string());
     let used = std::cell::RefCell::new(Vec::new());
@@ -473,26 +477,30 @@ fn invalid_row_filter(detail: &str) -> DdlError {
 fn check_simple_rowfilter_expr(
     interp: &PgCatalog,
     relid: PgClassOid,
-    node: &Option<typedpg_pg_query::ast::Node>,
+    node: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     const ONLY_SIMPLE: &str = "Only columns, constants, built-in operators, built-in data types, \
                                built-in collations, and immutable built-in functions are allowed.";
-    let Some(inner) = node.as_ref() else {
+    let Some(inner) = node else {
         return Ok(());
     };
-    let type_of = |n: &Option<typedpg_pg_query::ast::Node>| {
+    let type_of = |n: Option<&typedpg_pg_query::ast::Node>| {
         super::volatile::infer_over_relation(interp, relid, n, None)
             .and_then(Result::ok)
             .map(|t| t.type_oid)
     };
     let user_type =
         |t: Option<crate::oid::PgTypeOid>| t.is_some_and(|t| t.get() >= FIRST_NORMAL_OBJECT_ID);
-    fn opt(n: &Option<typedpg_pg_query::ast::Node>) -> Vec<&Option<typedpg_pg_query::ast::Node>> {
+    fn opt(n: Option<&typedpg_pg_query::ast::Node>) -> Vec<Option<&typedpg_pg_query::ast::Node>> {
         if n.is_some() { vec![n] } else { Vec::new() }
     }
-    let children: Vec<&Option<typedpg_pg_query::ast::Node>> = match inner {
+    let children: Vec<Option<&typedpg_pg_query::ast::Node>> = match inner {
         ast::Node::ColumnRef(cr) => {
-            let Some(name) = cr.fields.last().and_then(super::util::node_string) else {
+            let Some(name) = cr
+                .fields
+                .last()
+                .and_then(|n| super::util::node_string(n.as_ref()))
+            else {
                 return Err(invalid_row_filter(ONLY_SIMPLE));
             };
             if interp.attribute_by_name(relid, name).is_none()
@@ -529,7 +537,7 @@ fn check_simple_rowfilter_expr(
             };
             if !literal
                 && let (Some(target), Some(source)) =
-                    (target, arg.as_ref().and_then(|_| type_of(arg)))
+                    (target, arg.as_ref().and_then(|_| type_of(arg.as_ref())))
                 && !matches!(
                     crate::coerce::coercion_pathway(
                         target,
@@ -545,38 +553,43 @@ fn check_simple_rowfilter_expr(
             if user_type(target) {
                 return Err(invalid_row_filter("User-defined types are not allowed."));
             }
-            opt(arg)
+            opt(arg.as_ref())
         }
         ast::Node::AExpr(e) => {
-            let mut c: Vec<_> = opt(&e.lexpr);
-            c.extend(opt(&e.rexpr));
+            let mut c: Vec<_> = opt(e.lexpr.as_ref());
+            c.extend(opt(e.rexpr.as_ref()));
             c
         }
-        ast::Node::List(l) => l.items.iter().collect(),
-        ast::Node::BoolExpr(b) => b.args.iter().collect(),
-        ast::Node::NullTest(t) => opt(&t.arg),
-        ast::Node::BooleanTest(t) => opt(&t.arg),
+        ast::Node::List(l) => l.items.iter().map(Option::as_ref).collect(),
+        ast::Node::BoolExpr(b) => b.args.iter().map(Option::as_ref).collect(),
+        ast::Node::NullTest(t) => opt(t.arg.as_ref()),
+        ast::Node::BooleanTest(t) => opt(t.arg.as_ref()),
         ast::Node::CaseExpr(c) => {
-            let mut out: Vec<_> = opt(&c.arg);
-            out.extend(c.args.iter());
-            out.extend(opt(&c.defresult));
+            let mut out: Vec<_> = opt(c.arg.as_ref());
+            out.extend(c.args.iter().map(Option::as_ref));
+            out.extend(opt(c.defresult.as_ref()));
             out
         }
         ast::Node::CaseWhen(w) => {
-            let mut out: Vec<_> = opt(&w.expr);
-            out.extend(opt(&w.result));
+            let mut out: Vec<_> = opt(w.expr.as_ref());
+            out.extend(opt(w.result.as_ref()));
             out
         }
-        ast::Node::CoalesceExpr(c) => c.args.iter().collect(),
-        ast::Node::MinMaxExpr(m) => m.args.iter().collect(),
-        ast::Node::RowExpr(r) => r.args.iter().collect(),
-        ast::Node::AArrayExpr(a) => a.elements.iter().collect(),
-        ast::Node::XmlExpr(x) => x.named_args.iter().chain(x.args.iter()).collect(),
-        ast::Node::CollateClause(c) => opt(&c.arg),
-        ast::Node::FuncCall(f) => f.args.iter().collect(),
-        ast::Node::NamedArgExpr(n) => opt(&n.arg),
+        ast::Node::CoalesceExpr(c) => c.args.iter().map(Option::as_ref).collect(),
+        ast::Node::MinMaxExpr(m) => m.args.iter().map(Option::as_ref).collect(),
+        ast::Node::RowExpr(r) => r.args.iter().map(Option::as_ref).collect(),
+        ast::Node::AArrayExpr(a) => a.elements.iter().map(Option::as_ref).collect(),
+        ast::Node::XmlExpr(x) => x
+            .named_args
+            .iter()
+            .chain(x.args.iter())
+            .map(Option::as_ref)
+            .collect(),
+        ast::Node::CollateClause(c) => opt(c.arg.as_ref()),
+        ast::Node::FuncCall(f) => f.args.iter().map(Option::as_ref).collect(),
+        ast::Node::NamedArgExpr(n) => opt(n.arg.as_ref()),
         // ResTarget: an XMLELEMENT / XMLFOREST named argument.
-        ast::Node::ResTarget(r) => opt(&r.val),
+        ast::Node::ResTarget(r) => opt(r.val.as_ref()),
         _ => return Err(invalid_row_filter(ONLY_SIMPLE)),
     };
     if matches!(
@@ -824,7 +837,7 @@ pub(crate) fn relation_in_publication(interp: &PgCatalog, relid: PgClassOid) -> 
 
 pub(crate) fn drop_publication(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = super::util::node_string(obj_node).map(str::to_owned) else {
@@ -852,7 +865,7 @@ pub(crate) fn rename_publication(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = super::util::node_string(&stmt.object) else {
+    let Some(old) = super::util::node_string(stmt.object.as_ref()) else {
         return Ok(());
     };
     let old = old.to_owned();

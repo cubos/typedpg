@@ -131,7 +131,10 @@ fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
         return Vec::new();
     };
     let fix = if calls.len() == 1
-        && returning.exprs.iter().all(is_plain_returning_target)
+        && returning
+            .exprs
+            .iter()
+            .all(|n| is_plain_returning_target(n.as_ref()))
         && !may_read_virtual_columns(ctx, statement)
         && returning_target_is_safe(ctx, statement)
     {
@@ -225,8 +228,8 @@ fn whitespace_start(sql: &str, at: usize) -> usize {
 /// could still change what the statement does.
 ///
 /// A returning target is a `ResTarget`; its `val` is the expression.
-fn is_plain_returning_target(node: &Option<typedpg_pg_query::ast::Node>) -> bool {
-    let Some(Node::ResTarget(target)) = node.as_ref() else {
+fn is_plain_returning_target(node: Option<&typedpg_pg_query::ast::Node>) -> bool {
+    let Some(Node::ResTarget(target)) = node else {
         return false;
     };
     matches!(
@@ -275,7 +278,10 @@ fn returning_target_is_safe(ctx: &Ctx<'_>, statement: &Node) -> bool {
     let Some(relation) = relation else {
         return false;
     };
-    relation_is_safe(ctx, relation) && items.iter().all(|item| from_item_is_safe(ctx, item))
+    relation_is_safe(ctx, relation)
+        && items
+            .iter()
+            .all(|item| from_item_is_safe(ctx, item.as_ref()))
 }
 
 /// Whether `relation` is an ordinary table without row security or rewrite
@@ -293,11 +299,11 @@ fn relation_is_safe(ctx: &Ctx<'_>, relation: &typedpg_pg_query::ast::RangeVar) -
 
 /// Whether a `FROM` / `USING` item is an ordinary table (or a join of them)
 /// without row security or rewrite rules.
-fn from_item_is_safe(ctx: &Ctx<'_>, item: &Option<typedpg_pg_query::ast::Node>) -> bool {
-    match item.as_ref() {
+fn from_item_is_safe(ctx: &Ctx<'_>, item: Option<&typedpg_pg_query::ast::Node>) -> bool {
+    match item {
         Some(Node::RangeVar(relation)) => relation_is_safe(ctx, relation),
         Some(Node::JoinExpr(join)) => {
-            from_item_is_safe(ctx, &join.larg) && from_item_is_safe(ctx, &join.rarg)
+            from_item_is_safe(ctx, join.larg.as_ref()) && from_item_is_safe(ctx, join.rarg.as_ref())
         }
         _ => false,
     }

@@ -17,7 +17,7 @@ pub(crate) fn process_from_clause(
     for node in from_clause {
         let (asides, start) = (scope.asides.len(), scope.sources.len());
         with_rows_kept(true, || {
-            process_from_item(node, scope, null_ctx, snapshot, cte_scopes, params)
+            process_from_item(node.as_ref(), scope, null_ctx, snapshot, cte_scopes, params)
         })?;
         restore_asides(scope, null_ctx, asides, 0..start)?;
     }
@@ -66,7 +66,7 @@ thread_local! {
 /// (see [`REMOVABLE_SIDE`]).
 fn with_nullable_side<R>(
     join: &ast::JoinExpr,
-    arg: &Option<ast::Node>,
+    arg: Option<&ast::Node>,
     snapshot: &PgCatalog,
     f: impl FnOnce() -> R,
 ) -> R {
@@ -82,7 +82,7 @@ fn with_nullable_side<R>(
         })
     };
     let equates = crate::expr::plan_fold::join_equates(join)
-        || match arg.as_ref() {
+        || match arg {
             Some(ast::Node::RangeSubselect(s)) => s.subquery.as_ref().is_some_and(has_equality),
             Some(ast::Node::RangeVar(rv)) => snapshot
                 .resolve_table(
@@ -95,7 +95,7 @@ fn with_nullable_side<R>(
             _ => false,
         };
     // A column of it read above the join keeps the join.
-    let alias = match arg.as_ref() {
+    let alias = match arg {
         Some(ast::Node::RangeSubselect(s)) => s.alias.as_deref().map(|a| a.aliasname.as_str()),
         Some(ast::Node::RangeVar(rv)) => Some(
             rv.alias
@@ -159,7 +159,7 @@ pub(crate) fn with_rows_kept<R>(kept: bool, f: impl FnOnce() -> R) -> R {
 }
 
 pub(crate) fn process_from_item(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &mut Scope,
     null_ctx: &mut NullabilityContext,
     snapshot: &PgCatalog,
@@ -726,7 +726,14 @@ pub(crate) fn process_from_item(
                     "RangeTableSample without relation".into(),
                 ));
             }
-            process_from_item(relation, scope, null_ctx, snapshot, cte_scopes, params)?;
+            process_from_item(
+                relation.as_ref(),
+                scope,
+                null_ctx,
+                snapshot,
+                cte_scopes,
+                params,
+            )?;
             if let Some(src) = scope.sources.last_mut() {
                 src.partial_scan = true;
                 for o in src.columns.iter_mut().filter_map(|c| c.origin.as_mut()) {
@@ -828,7 +835,7 @@ fn process_range_function(
             // `CAST(…)`, `CURRENT_DATE`, … — are plain expressions.
             Some(n @ Some(_)) => {
                 funcs.push(RteFunction {
-                    call: RteCall::Expr(n),
+                    call: RteCall::Expr(n.as_ref()),
                     coldeflist,
                 });
                 continue;
@@ -928,7 +935,12 @@ fn process_range_function(
                     .iter()
                     .map(|c| rowtype.map(|relid| (relid, c.name.clone()))),
             );
-            crate::clause::check_level_calls(&f.node(), arg_ctx, "functions in FROM", true)?;
+            crate::clause::check_level_calls(
+                f.node().as_ref(),
+                arg_ctx,
+                "functions in FROM",
+                true,
+            )?;
         }
         Ok::<(), AnalyzeError>(())
     })?;
@@ -1004,7 +1016,11 @@ fn process_range_function(
             .iter()
             .fold(crate::nonnull::Facts::default(), |acc, a| {
                 acc.union(crate::nonnull::nonnullable(
-                    a, false, &arg_scope, &log, snapshot,
+                    a.as_ref(),
+                    false,
+                    &arg_scope,
+                    &log,
+                    snapshot,
                 ))
             })
             .restricted_to(&own);
@@ -1032,7 +1048,7 @@ struct RteFunctionRows {
 /// `generate_series(start, stop [, step])` over integer constants that
 /// make a non-empty series.
 fn constant_series_is_non_empty(args: &[Option<ast::Node>]) -> bool {
-    let int = |n: &Option<ast::Node>| match n.as_ref() {
+    let int = |n: Option<&ast::Node>| match n {
         Some(ast::Node::AConst(c)) => match &**c {
             ast::AConst {
                 val: Some(ast::AConstValue::Integer(i)),
@@ -1043,7 +1059,7 @@ fn constant_series_is_non_empty(args: &[Option<ast::Node>]) -> bool {
         },
         _ => None,
     };
-    let vals: Option<Vec<i64>> = args.iter().map(int).collect();
+    let vals: Option<Vec<i64>> = args.iter().map(|n| int(n.as_ref())).collect();
     match vals.as_deref() {
         Some([start, stop]) => start <= stop,
         Some([start, stop, step]) => (*step > 0 && start <= stop) || (*step < 0 && start >= stop),
@@ -1062,7 +1078,7 @@ struct RteFunction<'a> {
 /// expression of the function-call syntax (`COALESCE(…)`, `CAST(…)`, …).
 enum RteCall<'a> {
     Func(std::borrow::Cow<'a, ast::FuncCall>),
-    Expr(&'a Option<ast::Node>),
+    Expr(Option<&'a ast::Node>),
 }
 
 impl RteFunction<'_> {
@@ -1076,7 +1092,7 @@ impl RteFunction<'_> {
     fn node(&self) -> Option<ast::Node> {
         match &self.call {
             RteCall::Func(fc) => Some(ast::Node::FuncCall(NodeBox::new(fc.clone().into_owned()))),
-            RteCall::Expr(n) => (*n).clone(),
+            RteCall::Expr(n) => (*n).cloned(),
         }
     }
 
@@ -1088,7 +1104,7 @@ impl RteFunction<'_> {
                 .pop()
                 .unwrap_or_default(),
             RteCall::Expr(n) => {
-                super::target_list::infer_column_name(n).unwrap_or_else(|| "?column?".into())
+                super::target_list::infer_column_name(*n).unwrap_or_else(|| "?column?".into())
             }
         }
     }
@@ -1167,10 +1183,13 @@ fn process_join_expr(
         larg @ Some(_) => with_rows_kept(
             kept && matches!(join_type, JoinType::JoinInner | JoinType::JoinLeft),
             || {
-                let mut process =
-                    || process_from_item(larg, scope, null_ctx, snapshot, cte_scopes, params);
+                let mut process = || {
+                    process_from_item(larg.as_ref(), scope, null_ctx, snapshot, cte_scopes, params)
+                };
                 match join_type {
-                    JoinType::JoinRight => with_nullable_side(join, larg, snapshot, process),
+                    JoinType::JoinRight => {
+                        with_nullable_side(join, larg.as_ref(), snapshot, process)
+                    }
                     _ => process(),
                 }
             },
@@ -1194,10 +1213,13 @@ fn process_join_expr(
         rarg @ Some(_) => with_rows_kept(
             kept && matches!(join_type, JoinType::JoinInner | JoinType::JoinRight),
             || {
-                let mut process =
-                    || process_from_item(rarg, scope, null_ctx, snapshot, cte_scopes, params);
+                let mut process = || {
+                    process_from_item(rarg.as_ref(), scope, null_ctx, snapshot, cte_scopes, params)
+                };
                 match join_type {
-                    JoinType::JoinLeft => with_nullable_side(join, rarg, snapshot, process),
+                    JoinType::JoinLeft => {
+                        with_nullable_side(join, rarg.as_ref(), snapshot, process)
+                    }
                     _ => process(),
                 }
             },
@@ -1254,8 +1276,11 @@ fn process_join_expr(
         // The semi-join reads the nullable side above it: the join is
         // never removed (`join_is_removable`, `attr_needed`).
         let semijoin_below = available.as_ref().is_some_and(|a| {
-            expr::plan_fold::with_nullable_on_clause(quals, a.clone(), || {
-                expr::pulls_up_sublink(quals, expr::Ctx::new(&on_scope, null_ctx, snapshot))
+            expr::plan_fold::with_nullable_on_clause(quals.as_ref(), a.clone(), || {
+                expr::pulls_up_sublink(
+                    quals.as_ref(),
+                    expr::Ctx::new(&on_scope, null_ctx, snapshot),
+                )
             })
         });
         // Not when a column of it is read above the join, nor a table the
@@ -1267,8 +1292,9 @@ fn process_join_expr(
             _ => None,
         };
         let joined_side = side_node.is_some_and(|n| {
-            expr::plan_fold::inner_join_tables(n, snapshot, &|name| scope.ctes.contains_key(name))
-                > 0
+            expr::plan_fold::inner_join_tables(n.as_ref(), snapshot, &|name| {
+                scope.ctes.contains_key(name)
+            }) > 0
         });
         let removable: Vec<String> = if !semijoin_below
             && !joined_side
@@ -1295,23 +1321,23 @@ fn process_join_expr(
         expr::plan_fold::skip_restrictions_on(removable, || {
             let mut coerce = || {
                 crate::clause::coerce_clause_expr(
-                    quals,
+                    quals.as_ref(),
                     expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
                     params,
                     crate::clause::ClauseKind::JoinOn,
                 )
             };
             match available {
-                _ if pulls_up => expr::plan_fold::with_where_clause(quals, coerce),
+                _ if pulls_up => expr::plan_fold::with_where_clause(quals.as_ref(), coerce),
                 Some(available) => {
-                    expr::plan_fold::with_nullable_on_clause(quals, available, coerce)
+                    expr::plan_fold::with_nullable_on_clause(quals.as_ref(), available, coerce)
                 }
                 None => coerce(),
             }
         })?;
-        check_no_srf_in_clause(quals, snapshot, "JOIN conditions")?;
-        on_facts = crate::nonnull::nonnullable(quals, true, &on_scope, &log, snapshot);
-        equalities = on_equalities(quals, &on_scope, &log, snapshot);
+        check_no_srf_in_clause(quals.as_ref(), snapshot, "JOIN conditions")?;
+        on_facts = crate::nonnull::nonnullable(quals.as_ref(), true, &on_scope, &log, snapshot);
+        equalities = on_equalities(quals.as_ref(), &on_scope, &log, snapshot);
     }
 
     // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns: the
@@ -1369,7 +1395,7 @@ fn process_join_expr(
         .and_then(|eqs| fk_match(eqs, scope, left, right, null_ctx, snapshot));
     // `ON true` to a side that always yields a row (for each row of the
     // other, when LATERAL): that side always matches.
-    let on_true = is_true_const(&join.quals);
+    let on_true = is_true_const(join.quals.as_ref());
     let always = |side: SourceSpan| on_true && matches!(side.sources(scope), [s] if s.min_one_row);
     let always_matches = (always(left), always(right));
     // A FULL join's row has one side or the other: what each side has
@@ -1481,15 +1507,15 @@ pub(crate) fn inheritance_descendants(
 /// foreign key needs of its child keys anyway), and either side may be
 /// cast to its own type (a no-op).
 fn on_equalities(
-    quals: &Option<ast::Node>,
+    quals: Option<&ast::Node>,
     on_scope: &Scope,
     log: &crate::nonnull::StrictLog,
     snapshot: &PgCatalog,
 ) -> Option<Vec<(crate::nonnull::Col, crate::nonnull::Col)>> {
     let mut cs = Vec::new();
     conjuncts(quals, &mut cs);
-    let column = |n: &Option<ast::Node>| -> Option<crate::nonnull::Col> {
-        let n = match n.as_ref()? {
+    let column = |n: Option<&ast::Node>| -> Option<crate::nonnull::Col> {
+        let n = match n? {
             // `col::its_type` (no typmod: a length coercion is no no-op).
             ast::Node::TypeCast(tc) => {
                 let tn = tc.type_name.as_ref()?;
@@ -1508,7 +1534,7 @@ fn on_equalities(
     };
     cs.into_iter()
         .map(|c| {
-            let Some(ast::Node::AExpr(e)) = c.as_ref() else {
+            let Some(ast::Node::AExpr(e)) = c else {
                 return None;
             };
             if !matches!(
@@ -1519,8 +1545,8 @@ fn on_equalities(
             {
                 return None;
             }
-            let l = column(&e.lexpr)?;
-            let r = column(&e.rexpr)?;
+            let l = column(e.lexpr.as_ref())?;
+            let r = column(e.rexpr.as_ref())?;
             Some((l, r))
         })
         .collect()
@@ -2080,7 +2106,7 @@ fn infer_srf_arg_types(
         // `transformRangeFunction`: an unknown column, a FROM item that isn't
         // visible yet (`FROM f(t.c), t`), the left side of a RIGHT / FULL join.
         exprs.push(expr::infer_expr(
-            arg,
+            arg.as_ref(),
             arg_ctx,
             params,
             crate::expr::TypeGoal::NONE,
@@ -2128,7 +2154,7 @@ pub(crate) fn srf_elements_nullable(
         // their elements).
         let elements_not_null = args
             .first()
-            .map(functions::call_arg_value)
+            .map(|n| functions::call_arg_value(n.as_ref()))
             .is_some_and(|a| {
                 let mut scratch = params.clone();
                 expr::infer_expr(a, ctx, &mut scratch, TypeGoal::NONE)
@@ -2175,7 +2201,7 @@ pub(crate) fn static_srf_rows(
     let mut types = Vec::with_capacity(fc.args.len());
     for a in &fc.args {
         types.push(
-            expr::infer_expr(a, ctx, &mut scratch, TypeGoal::NONE)
+            expr::infer_expr(a.as_ref(), ctx, &mut scratch, TypeGoal::NONE)
                 .ok()?
                 .type_oid,
         );
@@ -2193,22 +2219,26 @@ pub(crate) fn static_srf_rows(
     if resolved.schema != "pg_catalog" || !resolved.is_set_returning {
         return None;
     }
-    let args: Vec<&Option<ast::Node>> = fc.args.iter().map(functions::call_arg_value).collect();
+    let args: Vec<Option<&ast::Node>> = fc
+        .args
+        .iter()
+        .map(|n| functions::call_arg_value(n.as_ref()))
+        .collect();
     match resolved.signature.as_str() {
-        "unnest(anyarray)" => static_array_len(args.first()?, ctx, params),
+        "unnest(anyarray)" => static_array_len(*args.first()?, ctx, params),
         "generate_series(int4,int4)"
         | "generate_series(int8,int8)"
         | "generate_series(int4,int4,int4)"
         | "generate_series(int8,int8,int8)" => {
-            let int = |n: &Option<ast::Node>| -> Option<i128> {
+            let int = |n: Option<&ast::Node>| -> Option<i128> {
                 crate::nonnull::literal(n)
                     .filter(|l| l.is_integer())
                     .and_then(|l| l.text.parse::<i128>().ok())
             };
-            let start = int(args.first()?)?;
-            let stop = int(args.get(1)?)?;
+            let start = int(*args.first()?)?;
+            let stop = int(*args.get(1)?)?;
             let step = match args.get(2) {
-                Some(s) => int(s)?,
+                Some(s) => int(*s)?,
                 None => 1,
             };
             let rows = match step {
@@ -2227,12 +2257,12 @@ pub(crate) fn static_srf_rows(
 /// depend on the data (see [`static_srf_rows`]); a cast to an array type
 /// keeps it (an element conversion maps elements one to one).
 fn static_array_len(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Option<u64> {
-    match node.as_ref()? {
-        ast::Node::TypeCast(c) => static_array_len(&c.arg, ctx, params),
+    match node? {
+        ast::Node::TypeCast(c) => static_array_len(c.arg.as_ref(), ctx, params),
         ast::Node::AArrayExpr(a) => {
             // `ARRAY[x, y]` over arrays builds a multidimensional array.
             let mut scratch = params.clone();
@@ -2240,7 +2270,7 @@ fn static_array_len(
                 if matches!(e.as_ref(), Some(ast::Node::AArrayExpr(_))) {
                     return None;
                 }
-                let t = expr::infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+                let t = expr::infer_expr(e.as_ref(), ctx, &mut scratch, TypeGoal::NONE).ok()?;
                 if t.type_oid == oid::UNKNOWN && !matches!(e.as_ref(), Some(ast::Node::AConst(_))) {
                     return None;
                 }
@@ -2303,11 +2333,11 @@ pub(crate) fn select_input_never_empty(
         && sel
             .from_clause
             .iter()
-            .all(|item| from_item_never_empty(item, ctx, params))
+            .all(|item| from_item_never_empty(item.as_ref(), ctx, params))
 }
 
-fn from_item_never_empty(item: &Option<ast::Node>, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
-    match item.as_ref() {
+fn from_item_never_empty(item: Option<&ast::Node>, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
+    match item {
         Some(ast::Node::RangeFunction(rf)) => rf.functions.iter().any(|f| {
             let Some(ast::Node::List(pair)) = f.as_ref() else {
                 return false;
@@ -2340,18 +2370,18 @@ fn from_item_never_empty(item: &Option<ast::Node>, ctx: Ctx<'_>, params: &ParamC
             _ => false,
         },
         Some(ast::Node::JoinExpr(j)) => {
-            let side = |n: &Option<ast::Node>| from_item_never_empty(n, ctx, params);
+            let side = |n: Option<&ast::Node>| from_item_never_empty(n, ctx, params);
             match j.jointype {
                 ast::JoinType::JoinInner => {
                     j.quals.is_none()
                         && !j.is_natural
                         && j.using_clause.is_empty()
-                        && side(&j.larg)
-                        && side(&j.rarg)
+                        && side(j.larg.as_ref())
+                        && side(j.rarg.as_ref())
                 }
-                ast::JoinType::JoinLeft => side(&j.larg),
-                ast::JoinType::JoinRight => side(&j.rarg),
-                ast::JoinType::JoinFull => side(&j.larg) || side(&j.rarg),
+                ast::JoinType::JoinLeft => side(j.larg.as_ref()),
+                ast::JoinType::JoinRight => side(j.rarg.as_ref()),
+                ast::JoinType::JoinFull => side(j.larg.as_ref()) || side(j.rarg.as_ref()),
                 _ => false,
             }
         }
@@ -2401,7 +2431,7 @@ fn function_rte_columns(
     let func_call: &ast::FuncCall = match &f.call {
         RteCall::Func(fc) => fc,
         RteCall::Expr(node) => {
-            if let Some(fc) = noop_cast_of_call(node, arg_ctx, params) {
+            if let Some(fc) = noop_cast_of_call(*node, arg_ctx, params) {
                 let call = RteFunction {
                     call: RteCall::Func(std::borrow::Cow::Borrowed(fc)),
                     coldeflist: f.coldeflist,
@@ -2410,7 +2440,7 @@ fn function_rte_columns(
                     &call, alias, nfuncs, arg_ctx, params, whole_row, rows,
                 );
             }
-            return expr_rte_columns(f, node, alias, nfuncs, arg_ctx, params, whole_row);
+            return expr_rte_columns(f, *node, alias, nfuncs, arg_ctx, params, whole_row);
         }
     };
     let func_name_parts = expr::extract_string_fields(&func_call.funcname);
@@ -2615,7 +2645,7 @@ fn function_rte_columns(
 /// scalar column after the alias or the item's `FigureColname`.
 fn expr_rte_columns(
     f: &RteFunction<'_>,
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     alias: &str,
     nfuncs: usize,
     arg_ctx: Ctx<'_>,
@@ -2626,7 +2656,7 @@ fn expr_rte_columns(
     crate::resolve::walk::check_srf_nesting(node, snapshot)?;
     let value = expr::infer_expr(node, arg_ctx, params, TypeGoal::NONE)?;
     // transformRangeFunction: only the top-level call may return a set.
-    if count_srf_calls(std::slice::from_ref(node), snapshot) > 0 {
+    if super::walk::node_srf_calls(node, snapshot) > 0 {
         return Err(crate::error::RawError::new(
             AnalyzeError::FeatureNotSupported(
                 "set-returning functions must appear at top level of FROM".into(),
@@ -2686,11 +2716,11 @@ fn expr_rte_columns(
 /// The call under a cast to its own type — no cast at all
 /// (`coerce_type`), so the item is the call, which may return a set.
 fn noop_cast_of_call<'a>(
-    node: &'a Option<ast::Node>,
+    node: Option<&'a ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Option<&'a ast::FuncCall> {
-    let ast::Node::TypeCast(tc) = node.as_ref()? else {
+    let ast::Node::TypeCast(tc) = node? else {
         return None;
     };
     let call = &tc.arg;
@@ -2699,7 +2729,7 @@ fn noop_cast_of_call<'a>(
     };
     let mut scratch = params.clone();
     let cast = expr::infer_expr(node, ctx, &mut scratch, TypeGoal::NONE).ok()?;
-    let value = expr::infer_expr(call, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+    let value = expr::infer_expr(call.as_ref(), ctx, &mut scratch, TypeGoal::NONE).ok()?;
     (cast.type_oid == value.type_oid && cast.typmod == value.typmod).then_some(&**fc)
 }
 
@@ -2790,11 +2820,11 @@ fn check_rte_scalar_type(
 /// `COALESCE` whose first argument not a NULL literal is such a row (and
 /// never NULL, so it is the one returned). `None` when unknown.
 fn static_row_shape(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Option<Vec<PgTypeOid>> {
-    match node.as_ref()? {
+    match node? {
         ast::Node::RowExpr(_) => {
             let mut scratch = params.clone();
             let row = expr::infer_expr(node, ctx, &mut scratch, TypeGoal::NONE).ok()?;
@@ -2809,11 +2839,11 @@ fn static_row_shape(
                 )
             })?;
             let mut scratch = params.clone();
-            let value = expr::infer_expr(first, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+            let value = expr::infer_expr(first.as_ref(), ctx, &mut scratch, TypeGoal::NONE).ok()?;
             if value.nullable {
                 return None;
             }
-            static_row_shape(first, ctx, params)
+            static_row_shape(first.as_ref(), ctx, params)
         }
         _ => None,
     }
@@ -2967,7 +2997,7 @@ fn process_tablesample(
         .extend(scope.shadowed_sources.iter().cloned());
     let null_ctx = NullabilityContext::default();
     let ctx = expr::Ctx::new(&arg_scope, &null_ctx, snapshot);
-    let coerce = |arg: &Option<ast::Node>,
+    let coerce = |arg: Option<&ast::Node>,
                   target: PgTypeOid,
                   clause: &str,
                   params: &mut ParamCollector|
@@ -2995,12 +3025,16 @@ fn process_tablesample(
     // The arguments are EXPR_KIND_FROM_FUNCTION expressions: no aggregates
     // or window functions.
     for (arg, &target) in ts.args.iter().zip(param_types) {
-        coerce(arg, target, "TABLESAMPLE", params)?;
-        crate::clause::check_no_aggregates_or_windows(arg, snapshot, "functions in FROM")?;
+        coerce(arg.as_ref(), target, "TABLESAMPLE", params)?;
+        crate::clause::check_no_aggregates_or_windows(arg.as_ref(), snapshot, "functions in FROM")?;
     }
     if let seed @ Some(_) = &ts.repeatable {
-        coerce(seed, oid::FLOAT8, "REPEATABLE", params)?;
-        crate::clause::check_no_aggregates_or_windows(seed, snapshot, "functions in FROM")?;
+        coerce(seed.as_ref(), oid::FLOAT8, "REPEATABLE", params)?;
+        crate::clause::check_no_aggregates_or_windows(
+            seed.as_ref(),
+            snapshot,
+            "functions in FROM",
+        )?;
     }
     Ok(())
 }
@@ -3058,7 +3092,7 @@ fn process_json_table(
         .map(|v| &v.raw_expr)
         .filter(|e| e.is_some())
     {
-        let t = expr::infer_expr(item, ctx, params, TypeGoal::NONE)?;
+        let t = expr::infer_expr(item.as_ref(), ctx, params, TypeGoal::NONE)?;
         if t.type_oid == oid::UNKNOWN {
             if let Some(ast::Node::ParamRef(p)) = item.as_ref()
                 && params.get(p.number) == oid::UNKNOWN
@@ -3088,7 +3122,7 @@ fn process_json_table(
                 .map(|v| &v.raw_expr)
                 .filter(|e| e.is_some())
         {
-            let t = expr::infer_expr(val, ctx, params, TypeGoal::NONE)?;
+            let t = expr::infer_expr(val.as_ref(), ctx, params, TypeGoal::NONE)?;
             if t.type_oid == oid::UNKNOWN
                 && let Some(ast::Node::ParamRef(p)) = val.as_ref()
                 && params.get(p.number) == oid::UNKNOWN
@@ -3146,7 +3180,7 @@ fn json_table_path_literal(
     const JSONPATH: PgTypeOid = PgTypeOid::from_raw(4072);
     match pathspec {
         Some(ps) if ps.string.is_some() => {
-            expr::coerce_unknown_to(&ps.string, ctx, params, JSONPATH)
+            expr::coerce_unknown_to(ps.string.as_ref(), ctx, params, JSONPATH)
         }
         _ => Ok(()),
     }
@@ -3319,13 +3353,13 @@ pub(crate) fn pushed_lock_error(
         })
         .unwrap_or_default();
     fn item(
-        n: &Option<ast::Node>,
+        n: Option<&ast::Node>,
         nullable: bool,
         ctes: &[String],
         snapshot: &PgCatalog,
     ) -> Option<crate::scope::LockBlock> {
         use crate::scope::LockBlock;
-        match n.as_ref()? {
+        match n? {
             ast::Node::RangeVar(rv) => {
                 if rv.schemaname.is_empty() && ctes.contains(&rv.relname) {
                     return None;
@@ -3346,7 +3380,7 @@ pub(crate) fn pushed_lock_error(
                     _ => None,
                 }
             }
-            ast::Node::RangeTableSample(ts) => item(&ts.relation, nullable, ctes, snapshot),
+            ast::Node::RangeTableSample(ts) => item(ts.relation.as_ref(), nullable, ctes, snapshot),
             ast::Node::JoinExpr(j) => {
                 let (l, r) = match j.jointype {
                     JoinType::JoinLeft => (nullable, true),
@@ -3354,7 +3388,8 @@ pub(crate) fn pushed_lock_error(
                     JoinType::JoinFull => (true, true),
                     _ => (nullable, nullable),
                 };
-                item(&j.larg, l, ctes, snapshot).or_else(|| item(&j.rarg, r, ctes, snapshot))
+                item(j.larg.as_ref(), l, ctes, snapshot)
+                    .or_else(|| item(j.rarg.as_ref(), r, ctes, snapshot))
             }
             // Functions, VALUES, JSON_TABLE… are unaffected by FOR UPDATE.
             _ => None,
@@ -3362,7 +3397,7 @@ pub(crate) fn pushed_lock_error(
     }
     sel.from_clause
         .iter()
-        .find_map(|n| item(n, false, &ctes, snapshot))
+        .find_map(|n| item(n.as_ref(), false, &ctes, snapshot))
 }
 
 /// [`pushed_lock_error`] for a view's stored query (`None` for a table).

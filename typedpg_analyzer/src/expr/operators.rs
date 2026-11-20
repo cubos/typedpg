@@ -66,8 +66,8 @@ fn handle_nullif(
     let (lexpr @ Some(_), rexpr @ Some(_)) = (&expr.lexpr, &expr.rexpr) else {
         return Err(AnalyzeError::Internal("NULLIF without operands".into()));
     };
-    let left = infer_expr(lexpr, ctx, params, TypeGoal::NONE)?;
-    let right = infer_expr(rexpr, ctx, params, TypeGoal::NONE)?;
+    let left = infer_expr(lexpr.as_ref(), ctx, params, TypeGoal::NONE)?;
+    let right = infer_expr(rexpr.as_ref(), ctx, params, TypeGoal::NONE)?;
     let name = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
     let op = match snapshot.find_operator_detailed("=", Some(left.type_oid), right.type_oid) {
         crate::lookup::OperatorMatch::Found(op) => op,
@@ -91,10 +91,10 @@ fn handle_nullif(
     // The coercion make_op performs: untyped sides take the declared types.
     let declared_left = op.left_type_oid.unwrap_or(left.type_oid);
     if left.type_oid == oid::UNKNOWN {
-        coerce_unknown_to(lexpr, ctx, params, declared_left)?;
+        coerce_unknown_to(lexpr.as_ref(), ctx, params, declared_left)?;
     }
     if right.type_oid == oid::UNKNOWN {
-        coerce_unknown_to(rexpr, ctx, params, op.right_type_oid)?;
+        coerce_unknown_to(rexpr.as_ref(), ctx, params, op.right_type_oid)?;
     }
     if op.result_type_oid != oid::BOOL {
         return Err(AnalyzeError::DatatypeMismatch(
@@ -205,11 +205,10 @@ fn handle_distinct_from(
             "IS DISTINCT FROM without operands".into(),
         ));
     };
-    let is_null_const =
-        |n: &Option<ast::Node>| matches!(n.as_ref(), Some(ast::Node::AConst(c)) if c.isnull);
-    let null_test_of = if is_null_const(rexpr) {
+    let is_null_const = |n: Option<&ast::Node>| matches!(n, Some(ast::Node::AConst(c)) if c.isnull);
+    let null_test_of = if is_null_const(rexpr.as_ref()) {
         Some(lexpr)
-    } else if is_null_const(lexpr) {
+    } else if is_null_const(lexpr.as_ref()) {
         Some(rexpr)
     } else {
         None
@@ -224,7 +223,7 @@ fn handle_distinct_from(
             ..Default::default()
         };
         let n = Some(ast::Node::NullTest(NodeBox::new(t)));
-        infer_expr(&n, ctx, params, TypeGoal::NONE)?;
+        infer_expr(n.as_ref(), ctx, params, TypeGoal::NONE)?;
     } else if let (Some(ast::Node::RowExpr(l)), Some(ast::Node::RowExpr(r))) =
         (lexpr.as_ref(), rexpr.as_ref())
     {
@@ -239,10 +238,18 @@ fn handle_distinct_from(
             functions::operator_result_nullable(ctx.snapshot, "=", o.code, &[false, false])
         });
     } else {
-        infer_synthetic_op("=", lexpr, rexpr, expr.location, ctx, params)?;
-        nullable = pair_operator("=", lexpr, rexpr, ctx, params).is_some_and(|o| {
-            functions::operator_result_nullable(ctx.snapshot, "=", o.code, &[false, false])
-        });
+        infer_synthetic_op(
+            "=",
+            lexpr.as_ref(),
+            rexpr.as_ref(),
+            expr.location,
+            ctx,
+            params,
+        )?;
+        nullable =
+            pair_operator("=", lexpr.as_ref(), rexpr.as_ref(), ctx, params).is_some_and(|o| {
+                functions::operator_result_nullable(ctx.snapshot, "=", o.code, &[false, false])
+            });
         // Not distinct from a non-NULL side, the other side is non-NULL
         // too (see `nonnull::distinct_facts`). A peek, on a throwaway
         // collector.
@@ -252,8 +259,8 @@ fn handle_distinct_from(
                 (rexpr, crate::nonnull::StrictNode::DistinctRightNonNull),
             ] {
                 let mut scratch = params.clone();
-                let non_null =
-                    infer_expr(side, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| !t.nullable);
+                let non_null = infer_expr(side.as_ref(), ctx, &mut scratch, TypeGoal::NONE)
+                    .is_ok_and(|t| !t.nullable);
                 ctx.note_strict(expr.location, kind, non_null);
             }
         }
@@ -300,15 +307,25 @@ fn handle_between(
     let [b, c] = list.items.as_slice() else {
         return Err(AnalyzeError::Internal("BETWEEN needs two bounds".into()));
     };
-    let comparisons: &[(&str, &Option<ast::Node>)] = match kind {
-        Kind::AexprBetween => &[(">=", b), ("<=", c)],
-        Kind::AexprNotBetween => &[("<", b), (">", c)],
-        Kind::AexprBetweenSym => &[(">=", b), ("<=", c), (">=", c), ("<=", b)],
-        _ => &[("<", b), (">", c), ("<", c), (">", b)],
+    let comparisons: &[(&str, Option<&ast::Node>)] = match kind {
+        Kind::AexprBetween => &[(">=", b.as_ref()), ("<=", c.as_ref())],
+        Kind::AexprNotBetween => &[("<", b.as_ref()), (">", c.as_ref())],
+        Kind::AexprBetweenSym => &[
+            (">=", b.as_ref()),
+            ("<=", c.as_ref()),
+            (">=", c.as_ref()),
+            ("<=", b.as_ref()),
+        ],
+        _ => &[
+            ("<", b.as_ref()),
+            (">", c.as_ref()),
+            ("<", c.as_ref()),
+            (">", b.as_ref()),
+        ],
     };
     let mut nullable = false;
     for &(op, bound) in comparisons {
-        let t = infer_synthetic_op(op, a, bound, expr.location, ctx, params)?;
+        let t = infer_synthetic_op(op, a.as_ref(), bound, expr.location, ctx, params)?;
         nullable |= t.nullable;
     }
     Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
@@ -340,13 +357,13 @@ fn handle_in_list(
     let op_name = extract_string_fields(&expr.name).join(".");
     let op = if op_name == "<>" { "<>" } else { "=" };
 
-    let left = infer_expr(a, ctx, params, TypeGoal::NONE)?;
+    let left = infer_expr(a.as_ref(), ctx, params, TypeGoal::NONE)?;
     let mut nullable = left.nullable;
     let mut items = Vec::with_capacity(list.items.len());
     for item in &list.items {
-        let t = infer_expr(item, ctx, params, TypeGoal::NONE)?;
+        let t = infer_expr(item.as_ref(), ctx, params, TypeGoal::NONE)?;
         nullable |= t.nullable;
-        items.push((item, t, contains_level0_column_ref(item)));
+        items.push((item, t, contains_level0_column_ref(item.as_ref())));
     }
 
     let nonvars: Vec<usize> = (0..items.len()).filter(|&i| !items[i].2).collect();
@@ -360,14 +377,21 @@ fn handle_in_list(
         {
             for &i in &nonvars {
                 if items[i].1.type_oid == oid::UNKNOWN {
-                    coerce_unknown_to(items[i].0, ctx, params, common)?;
+                    coerce_unknown_to(items[i].0.as_ref(), ctx, params, common)?;
                 }
                 folded[i] = true;
                 // Each item is coerced to the common type.
                 nullable |= super::coercion_can_return_null(items[i].1.type_oid, common, snapshot);
             }
             // `a op ANY(common[])` resolves `a op common`.
-            infer_synthetic_op(op, a, &typed_null(common), expr.location, ctx, params)?;
+            infer_synthetic_op(
+                op,
+                a.as_ref(),
+                typed_null(common).as_ref(),
+                expr.location,
+                ctx,
+                params,
+            )?;
             // That comparison is itself a call, on the operands coerced to
             // its declared types.
             let left_oid = if left.type_oid == oid::UNKNOWN {
@@ -402,11 +426,13 @@ fn handle_in_list(
         // Each remaining comparison is an operator call: NULL-able when it
         // can yield NULL (on top of its operands being so).
         let Some(p) = untyped_param else {
-            nullable |= infer_synthetic_op(op, a, item, expr.location, ctx, params)?.nullable;
+            nullable |=
+                infer_synthetic_op(op, a.as_ref(), item.as_ref(), expr.location, ctx, params)?
+                    .nullable;
             continue;
         };
         let (r, deduced) = params.with_param_untyped(p.number, |scratch| {
-            infer_synthetic_op(op, a, item, expr.location, ctx, scratch)
+            infer_synthetic_op(op, a.as_ref(), item.as_ref(), expr.location, ctx, scratch)
         });
         nullable |= r?.nullable;
         if deduced != oid::UNKNOWN
@@ -428,8 +454,8 @@ fn handle_in_list(
 /// rewrite target of BETWEEN / IN (PG's `makeSimpleA_Expr` + transform).
 pub(crate) fn infer_synthetic_op(
     op: &str,
-    l: &Option<ast::Node>,
-    r: &Option<ast::Node>,
+    l: Option<&ast::Node>,
+    r: Option<&ast::Node>,
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -439,8 +465,8 @@ pub(crate) fn infer_synthetic_op(
         name: vec![Some(ast::Node::String(NodeBox::new(ast::String {
             sval: op.into(),
         })))],
-        lexpr: l.clone(),
-        rexpr: r.clone(),
+        lexpr: l.cloned(),
+        rexpr: r.cloned(),
         // No IN list: `makeSimpleA_Expr` leaves the list bounds unset.
         rexpr_list_start: -1,
         rexpr_list_end: -1,
@@ -455,8 +481,8 @@ pub(crate) fn infer_synthetic_op(
 /// `record = record` and their contents are not typed pairwise.
 fn infer_plain_op(
     op: &str,
-    l: &Option<ast::Node>,
-    r: &Option<ast::Node>,
+    l: Option<&ast::Node>,
+    r: Option<&ast::Node>,
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -466,8 +492,8 @@ fn infer_plain_op(
         name: vec![Some(ast::Node::String(NodeBox::new(ast::String {
             sval: op.into(),
         })))],
-        lexpr: l.clone(),
-        rexpr: r.clone(),
+        lexpr: l.cloned(),
+        rexpr: r.cloned(),
         // No IN list: `makeSimpleA_Expr` leaves the list bounds unset.
         rexpr_list_start: -1,
         rexpr_list_end: -1,
@@ -498,27 +524,29 @@ pub(crate) fn typed_null(t: PgTypeOid) -> Option<ast::Node> {
 /// outside any sub-select. (A correlated reference *inside* a sub-select
 /// would also count in PG; treating those items as Var-free only changes
 /// which IN items get folded together.)
-pub(crate) fn contains_level0_column_ref(n: &Option<ast::Node>) -> bool {
-    let any = |ns: &[Option<ast::Node>]| ns.iter().any(contains_level0_column_ref);
+pub(crate) fn contains_level0_column_ref(n: Option<&ast::Node>) -> bool {
+    let any = |ns: &[Option<ast::Node>]| ns.iter().any(|n| contains_level0_column_ref(n.as_ref()));
     let opt = contains_level0_column_ref;
-    match n.as_ref() {
+    match n {
         Some(ast::Node::ColumnRef(_)) => true,
-        Some(ast::Node::AExpr(e)) => opt(&e.lexpr) || opt(&e.rexpr),
+        Some(ast::Node::AExpr(e)) => opt(e.lexpr.as_ref()) || opt(e.rexpr.as_ref()),
         Some(ast::Node::BoolExpr(b)) => any(&b.args),
-        Some(ast::Node::FuncCall(f)) => any(&f.args) || opt(&f.agg_filter),
-        Some(ast::Node::NamedArgExpr(na)) => opt(&na.arg),
-        Some(ast::Node::TypeCast(c)) => opt(&c.arg),
-        Some(ast::Node::CollateClause(c)) => opt(&c.arg),
-        Some(ast::Node::NullTest(t)) => opt(&t.arg),
-        Some(ast::Node::BooleanTest(t)) => opt(&t.arg),
+        Some(ast::Node::FuncCall(f)) => any(&f.args) || opt(f.agg_filter.as_ref()),
+        Some(ast::Node::NamedArgExpr(na)) => opt(na.arg.as_ref()),
+        Some(ast::Node::TypeCast(c)) => opt(c.arg.as_ref()),
+        Some(ast::Node::CollateClause(c)) => opt(c.arg.as_ref()),
+        Some(ast::Node::NullTest(t)) => opt(t.arg.as_ref()),
+        Some(ast::Node::BooleanTest(t)) => opt(t.arg.as_ref()),
         Some(ast::Node::CoalesceExpr(c)) => any(&c.args),
         Some(ast::Node::MinMaxExpr(m)) => any(&m.args),
         Some(ast::Node::RowExpr(r)) => any(&r.args),
         Some(ast::Node::AArrayExpr(a)) => any(&a.elements),
-        Some(ast::Node::AIndirection(i)) => opt(&i.arg),
+        Some(ast::Node::AIndirection(i)) => opt(i.arg.as_ref()),
         Some(ast::Node::List(l)) => any(&l.items),
-        Some(ast::Node::CaseExpr(c)) => opt(&c.arg) || any(&c.args) || opt(&c.defresult),
-        Some(ast::Node::CaseWhen(w)) => opt(&w.expr) || opt(&w.result),
+        Some(ast::Node::CaseExpr(c)) => {
+            opt(c.arg.as_ref()) || any(&c.args) || opt(c.defresult.as_ref())
+        }
+        Some(ast::Node::CaseWhen(w)) => opt(w.expr.as_ref()) || opt(w.result.as_ref()),
         _ => false,
     }
 }
@@ -541,12 +569,12 @@ fn handle_any_all(
     let left = expr
         .lexpr
         .is_some()
-        .then(|| infer_expr(&expr.lexpr, ctx, params, TypeGoal::NONE))
+        .then(|| infer_expr(expr.lexpr.as_ref(), ctx, params, TypeGoal::NONE))
         .transpose()?;
     let right = expr
         .rexpr
         .is_some()
-        .then(|| infer_expr(&expr.rexpr, ctx, params, TypeGoal::NONE))
+        .then(|| infer_expr(expr.rexpr.as_ref(), ctx, params, TypeGoal::NONE))
         .transpose()?;
 
     let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
@@ -633,14 +661,14 @@ fn handle_any_all(
         let left_type = match op.left_type_oid {
             Some(declared) if left_oid == oid::UNKNOWN => {
                 if let lexpr @ Some(_) = &expr.lexpr {
-                    coerce_unknown_operand(lexpr, ctx, params, declared)?;
+                    coerce_unknown_operand(lexpr.as_ref(), ctx, params, declared)?;
                 }
                 declared
             }
             _ => left_oid,
         };
         if let (Some(array), rexpr @ Some(_)) = (array, &expr.rexpr) {
-            coerce_unknown_operand(rexpr, ctx, params, array)?;
+            coerce_unknown_operand(rexpr.as_ref(), ctx, params, array)?;
         }
         let elem = if right_oid == oid::UNKNOWN {
             op.right_type_oid
@@ -672,7 +700,7 @@ fn handle_any_all(
         // Elements known non-NULL from the value's own type (`ARRAY(SELECT
         // nn_col …)`), or from its constructor / literal.
         || (right.as_ref().and_then(|r| r.elem_nullable) != Some(false)
-            && array_elements_may_be_null(&expr.rexpr, ctx, params));
+            && array_elements_may_be_null(expr.rexpr.as_ref(), ctx, params));
     Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
 }
 
@@ -703,23 +731,23 @@ pub(crate) fn operator_call_nullable(
 /// no NOT NULL constraint on elements. The elements are re-inferred against
 /// a throwaway collector, so the peek has no side effects.
 pub(crate) fn array_elements_may_be_null(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> bool {
-    match node.as_ref() {
+    match node {
         Some(ast::Node::AArrayExpr(arr)) => arr.elements.iter().any(|e| {
             if matches!(e.as_ref(), Some(ast::Node::AArrayExpr(_))) {
-                return array_elements_may_be_null(e, ctx, params);
+                return array_elements_may_be_null(e.as_ref(), ctx, params);
             }
             let mut scratch = params.clone();
             // An array-valued element makes a multi-dimensional array whose
             // inner elements are that value's — unknown here.
-            !infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| {
+            !infer_expr(e.as_ref(), ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| {
                 !t.nullable && array_element_type(ctx.snapshot, t.type_oid).is_none()
             })
         }),
-        Some(ast::Node::TypeCast(c)) => array_elements_may_be_null(&c.arg, ctx, params),
+        Some(ast::Node::TypeCast(c)) => array_elements_may_be_null(c.arg.as_ref(), ctx, params),
         // An untyped literal (`'{1,2}'`, cast or coerced to the array type).
         Some(ast::Node::AConst(ac)) => match &ac.val {
             Some(ast::AConstValue::String(sv)) if !ac.isnull => {
@@ -792,25 +820,34 @@ pub(crate) fn row_pairwise_op(
     // Both rows are transformed before any column pair is resolved; a bare
     // `$N` still untyped then is an `unknown` operand of its pair, coerced
     // to the pair operator's declared type.
-    let untyped =
-        super::replay_transform(&largs.iter().chain(rargs).collect::<Vec<_>>(), ctx, params);
+    let untyped = super::replay_transform(
+        &largs
+            .iter()
+            .chain(rargs)
+            .map(Option::as_ref)
+            .collect::<Vec<_>>(),
+        ctx,
+        params,
+    );
     let (luntyped, runtyped) = untyped.split_at(largs.len());
     let mut nullable = false;
     let mut ops = Vec::with_capacity(largs.len());
     for (i, (l, r)) in largs.iter().zip(rargs).enumerate() {
         let untyped_param =
             |n, untyped: bool| super::bare_param(n, ctx.snapshot).filter(|_| untyped);
-        let pair_params: Vec<&ast::ParamRef> =
-            [untyped_param(l, luntyped[i]), untyped_param(r, runtyped[i])]
-                .into_iter()
-                .flatten()
-                .collect();
+        let pair_params: Vec<&ast::ParamRef> = [
+            untyped_param(l.as_ref(), luntyped[i]),
+            untyped_param(r.as_ref(), runtyped[i]),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let t = if pair_params.is_empty() {
-            infer_plain_op(op_name, l, r, location, ctx, params)?
+            infer_plain_op(op_name, l.as_ref(), r.as_ref(), location, ctx, params)?
         } else {
             let nums: Vec<i32> = pair_params.iter().map(|p| p.number).collect();
             let (t, deduced) = params.with_params_untyped(&nums, |scratch| {
-                infer_plain_op(op_name, l, r, location, ctx, scratch)
+                infer_plain_op(op_name, l.as_ref(), r.as_ref(), location, ctx, scratch)
             });
             let t = t?;
             for (p, deduced) in pair_params.into_iter().zip(deduced) {
@@ -825,7 +862,7 @@ pub(crate) fn row_pairwise_op(
             return Err(not_bool(&name));
         }
         nullable |= t.nullable;
-        ops.push(pair_operator(op_name, l, r, ctx, params));
+        ops.push(pair_operator(op_name, l.as_ref(), r.as_ref(), ctx, params));
     }
     Ok((ExprType::scalar(oid::BOOL, nullable), ops))
 }
@@ -834,8 +871,8 @@ pub(crate) fn row_pairwise_op(
 /// types re-read on a scratch collector): `None` when it can't be told.
 fn pair_operator(
     op_name: &str,
-    l: &Option<ast::Node>,
-    r: &Option<ast::Node>,
+    l: Option<&ast::Node>,
+    r: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Option<crate::lookup::ResolvedOperator> {
@@ -932,7 +969,7 @@ fn handle_row_subselect(
     // transformExpressionList expands the ROW's `t.*` / `(expr).*` items.
     let largs = expand_row_args(&lrow.args, ctx, params)?;
     for la in largs.iter() {
-        let _ = infer_expr(la, ctx, params, TypeGoal::NONE);
+        let _ = infer_expr(la.as_ref(), ctx, params, TypeGoal::NONE);
     }
     let (cols, _) =
         crate::resolve::analyze_correlated_select(sel, snapshot, params, scope, ctx.null_ctx)?;
@@ -954,7 +991,7 @@ fn handle_row_subselect(
         .zip(&cols)
         .map(|(la, col)| {
             let mut scratch = params.clone();
-            let lt = infer_expr(la, ctx, &mut scratch, TypeGoal::NONE).ok()?;
+            let lt = infer_expr(la.as_ref(), ctx, &mut scratch, TypeGoal::NONE).ok()?;
             snapshot.find_operator(op_name, Some(lt.type_oid), col.type_oid)
         })
         .collect();
@@ -976,12 +1013,12 @@ fn infer_generic_binary_op(
     let left = expr
         .lexpr
         .is_some()
-        .then(|| infer_expr(&expr.lexpr, ctx, params, TypeGoal::NONE))
+        .then(|| infer_expr(expr.lexpr.as_ref(), ctx, params, TypeGoal::NONE))
         .transpose()?;
     let right = expr
         .rexpr
         .is_some()
-        .then(|| infer_expr(&expr.rexpr, ctx, params, TypeGoal::NONE))
+        .then(|| infer_expr(expr.rexpr.as_ref(), ctx, params, TypeGoal::NONE))
         .transpose()?;
 
     let left_oid = left.as_ref().map(|l| l.type_oid);
@@ -1053,12 +1090,12 @@ fn infer_generic_binary_op(
             if left_oid_resolved == Some(oid::UNKNOWN)
                 && let (Some(expected), lexpr @ Some(_)) = (op.left_type_oid, &expr.lexpr)
             {
-                coerce_unknown_to(lexpr, ctx, params, expected)?;
+                coerce_unknown_to(lexpr.as_ref(), ctx, params, expected)?;
             }
             if right_oid_resolved == oid::UNKNOWN
                 && let rexpr @ Some(_) = &expr.rexpr
             {
-                coerce_unknown_to(rexpr, ctx, params, op.right_type_oid)?;
+                coerce_unknown_to(rexpr.as_ref(), ctx, params, op.right_type_oid)?;
             }
             let state = derive_collation(
                 left.iter().chain(right.iter()),
@@ -1071,8 +1108,8 @@ fn infer_generic_binary_op(
             if plan_time_checks()
                 && let Some(icase) = regex_operator_icase(snapshot, op.code)
                 && let (l @ Some(_), r @ Some(_)) = (&expr.lexpr, &expr.rexpr)
-                && const_string(l, snapshot).is_some()
-                && let Some(pattern) = const_regex_pattern(r, snapshot)
+                && const_string(l.as_ref(), snapshot).is_some()
+                && let Some(pattern) = const_regex_pattern(r.as_ref(), snapshot)
             {
                 super::plan_time_result(Some(expr.location), check_regex_pattern(pattern, icase))?;
             }
@@ -1253,8 +1290,8 @@ fn regex_operator_icase(snapshot: &PgCatalog, code: Option<crate::oid::PgProcOid
 /// matter: ASCII without `i`, which a Turkish locale maps apart), or a
 /// parameter of an EXECUTE's custom plan bound to one. `None` for
 /// anything else.
-pub(crate) fn const_string(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
-    match node.as_ref()? {
+pub(crate) fn const_string(node: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<String> {
+    match node? {
         ast::Node::AConst(ac) if !ac.isnull => match &ac.val {
             Some(ast::AConstValue::String(sv)) => Some(sv.sval.clone()),
             _ => None,
@@ -1262,10 +1299,10 @@ pub(crate) fn const_string(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Op
         ast::Node::ParamRef(p) => super::plan_fold::bound_param(p.number),
         ast::Node::CoalesceExpr(c) => {
             for a in &c.args {
-                if super::plan_fold::fold(a, snapshot) == super::plan_fold::Folded::Null {
+                if super::plan_fold::fold(a.as_ref(), snapshot) == super::plan_fold::Folded::Null {
                     continue;
                 }
-                return const_string(a, snapshot);
+                return const_string(a.as_ref(), snapshot);
             }
             None
         }
@@ -1292,7 +1329,7 @@ pub(crate) fn const_string(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Op
             {
                 return None;
             }
-            let v = const_string(fc.args.first()?, snapshot)?;
+            let v = const_string(fc.args.first()?.as_ref(), snapshot)?;
             if !v.is_ascii() || v.contains(['i', 'I']) {
                 return None;
             }
@@ -1312,13 +1349,13 @@ pub(crate) fn const_string(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Op
             let t = snapshot
                 .resolve_type_by_name((names.len() == 2).then(|| names[0].as_str()), name)?;
             (t.typcategory == TypCategory::String).then_some(())?;
-            const_string(&c.arg, snapshot)
+            const_string(c.arg.as_ref(), snapshot)
         }
         ast::Node::AExpr(e)
             if e.kind == ast::AExprKind::AexprOp && extract_string_fields(&e.name) == ["||"] =>
         {
-            let l = const_string(&e.lexpr, snapshot)?;
-            let r = const_string(&e.rexpr, snapshot)?;
+            let l = const_string(e.lexpr.as_ref(), snapshot)?;
+            let r = const_string(e.rexpr.as_ref(), snapshot)?;
             Some(l + &r)
         }
         _ => None,
@@ -1329,15 +1366,15 @@ pub(crate) fn const_string(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Op
 /// SIMILAR TO's `similar_to_escape(pattern [, escape])` over constants
 /// (its own errors are plan-time errors too, hence the inner `Result`).
 fn const_regex_pattern(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
 ) -> Option<Result<String, AnalyzeError>> {
-    if let Some(ast::Node::FuncCall(fc)) = node.as_ref()
+    if let Some(ast::Node::FuncCall(fc)) = node
         && is_builtin_similar_to_escape(fc, snapshot)
     {
-        let pattern = const_string(fc.args.first()?, snapshot)?;
+        let pattern = const_string(fc.args.first()?.as_ref(), snapshot)?;
         let escape = match fc.args.get(1) {
-            Some(e) => Some(const_string(e, snapshot)?),
+            Some(e) => Some(const_string(e.as_ref(), snapshot)?),
             None => None,
         };
         return Some(similar_escape(&pattern, escape.as_deref()));
@@ -1471,7 +1508,7 @@ fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String, Analyze
 /// constant folding leaves it; only relations the planner certainly
 /// estimates count (see [`super::plan_fold`]).
 pub(crate) fn check_regex_restrictions(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
 ) -> Result<(), AnalyzeError> {
     if !plan_time_checks() {
@@ -1483,7 +1520,7 @@ pub(crate) fn check_regex_restrictions(
 /// [`check_regex_restrictions`] for a part of the qual, under an odd
 /// number of NOTs when `negated`.
 fn regex_restrictions(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     negated: bool,
 ) -> Result<(), AnalyzeError> {
@@ -1492,11 +1529,11 @@ fn regex_restrictions(
     if super::plan_fold::fold_qual_in(node, ctx, negated) != super::plan_fold::Folded::Var {
         return Ok(());
     }
-    match node.as_ref() {
+    match node {
         Some(ast::Node::BoolExpr(b)) => {
             let negated = negated != (b.boolop == ast::BoolExprType::NotExpr);
             for a in &b.args {
-                regex_restrictions(a, ctx, negated)?;
+                regex_restrictions(a.as_ref(), ctx, negated)?;
             }
             Ok(())
         }
@@ -1511,10 +1548,10 @@ fn regex_restrictions(
             let (l @ Some(_), r @ Some(_)) = (&e.lexpr, &e.rexpr) else {
                 return Ok(());
             };
-            let Some(pattern) = const_regex_pattern(r, ctx.snapshot) else {
+            let Some(pattern) = const_regex_pattern(r.as_ref(), ctx.snapshot) else {
                 return Ok(());
             };
-            let Some(alias) = restriction_variable(l, ctx) else {
+            let Some(alias) = restriction_variable(l.as_ref(), ctx) else {
                 return Ok(());
             };
             let Some(source) = ctx.scope.sources.iter().find(|s| s.alias == alias) else {
@@ -1530,7 +1567,7 @@ fn regex_restrictions(
                 } else {
                     // A subquery the planner pulls up: its columns are the
                     // table's they pass through.
-                    pulled_up_relation(l, ctx).is_some_and(|relid| {
+                    pulled_up_relation(l.as_ref(), ctx).is_some_and(|relid| {
                         super::plan_fold::table_restriction_estimated(&alias, relid, ctx.snapshot)
                     })
                 }
@@ -1544,7 +1581,7 @@ fn regex_restrictions(
             }
             // Only the string types' regex operators (not, e.g., ltree's `~`).
             let mut scratch = ParamCollector::default();
-            let Ok(t) = infer_expr(l, ctx, &mut scratch, TypeGoal::NONE) else {
+            let Ok(t) = infer_expr(l.as_ref(), ctx, &mut scratch, TypeGoal::NONE) else {
                 return Ok(());
             };
             let base = ctx.snapshot.unwrap_domain(t.type_oid);
@@ -1570,9 +1607,9 @@ fn regex_restrictions(
 /// planner pulled up the subquery they are columns of (never
 /// null-extended there): each is one of its outputs passed through from
 /// that one scan of the table.
-fn pulled_up_relation(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Option<crate::oid::PgClassOid> {
+fn pulled_up_relation(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Option<crate::oid::PgClassOid> {
     let mut scan: Option<(u32, crate::oid::PgClassOid)> = None;
-    let mut todo = vec![node.as_ref()];
+    let mut todo = vec![node];
     while let Some(n) = todo.pop() {
         match n {
             Some(ast::Node::ColumnRef(cr)) => {
@@ -1609,7 +1646,7 @@ fn pulled_up_relation(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Option<crate::o
 /// `get_restriction_variable`'s test: the expression references columns
 /// of exactly one relation of this query level (and nothing we can't
 /// classify) — that relation's alias.
-fn restriction_variable(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Option<String> {
+fn restriction_variable(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Option<String> {
     fn walk(n: Option<&ast::Node>, ctx: Ctx<'_>, rel: &mut Option<String>) -> bool {
         match n {
             Some(ast::Node::ColumnRef(cr)) => {
@@ -1651,11 +1688,7 @@ fn restriction_variable(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Option<String
         }
     }
     let mut rel = None;
-    if walk(node.as_ref(), ctx, &mut rel) {
-        rel
-    } else {
-        None
-    }
+    if walk(node, ctx, &mut rel) { rel } else { None }
 }
 
 /// A `pg_catalog` operator run by a `pg_catalog` function.

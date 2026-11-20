@@ -1,5 +1,5 @@
 use super::*;
-use typedpg_pg_query::NodeBox;
+
 use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ pub(crate) struct ReturningRows {
 /// table-only), so unqualified names and the bare `*` still mean the
 /// target. They exist only for the RETURNING list.
 pub(crate) fn resolve_returning(
-    clause: &Option<NodeBox<ast::ReturningClause>>,
+    clause: Option<&ast::ReturningClause>,
     target_alias: &str,
     rows: ReturningRows,
     ctx: Ctx<'_>,
@@ -51,17 +51,17 @@ pub(crate) fn resolve_returning(
             && rt.val.is_some()
         {
             let val = &rt.val;
-            crate::clause::check_no_aggregates_or_windows(val, ctx.snapshot, "RETURNING")?;
-            check_no_srf_in_clause(val, ctx.snapshot, "RETURNING")?;
+            crate::clause::check_no_aggregates_or_windows(val.as_ref(), ctx.snapshot, "RETURNING")?;
+            check_no_srf_in_clause(val.as_ref(), ctx.snapshot, "RETURNING")?;
         }
     }
     // (Only a bare `$N` changes anything here: any other parameter is typed
     // alike by the walk below.)
-    let is_bare_param = |t: &Option<ast::Node>| {
-        matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
-            if expr::bare_param(&rt.val, ctx.snapshot).is_some())
+    let is_bare_param = |t: Option<&ast::Node>| {
+        matches!(t, Some(ast::Node::ResTarget(rt))
+            if expr::bare_param(rt.val.as_ref(), ctx.snapshot).is_some())
     };
-    if clause.exprs.iter().any(is_bare_param) {
+    if clause.exprs.iter().any(|n| is_bare_param(n.as_ref())) {
         resolve_unknown_returning_params(
             clause,
             expr::Ctx::new(&scope, ctx.null_ctx, ctx.snapshot),
@@ -81,8 +81,8 @@ pub(crate) fn resolve_returning(
     if columns.is_empty()
         && let Some(first) = clause.exprs.first()
     {
-        let span =
-            crate::error::node_location(first).and_then(crate::error::SourceSpan::from_node_token);
+        let span = crate::error::node_location(first.as_ref())
+            .and_then(crate::error::SourceSpan::from_node_token);
         return Err(crate::pgmsg::returning_without_columns(span).finalize_implicit());
     }
     // transformReturningClause's resolveTargetListUnknowns.
@@ -94,7 +94,7 @@ pub(crate) fn resolve_returning(
 /// the analyzer resolves it: ahead of an UPDATE's SET list
 /// (transformUpdateStmt). Errors are left to [`resolve_returning`].
 pub(crate) fn type_returning_params(
-    clause: &Option<NodeBox<ast::ReturningClause>>,
+    clause: Option<&ast::ReturningClause>,
     target_alias: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -122,11 +122,11 @@ fn resolve_unknown_returning_params(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let items: Vec<&Option<ast::Node>> = clause
+    let items: Vec<Option<&ast::Node>> = clause
         .exprs
         .iter()
         .filter_map(|t| match t.as_ref() {
-            Some(ast::Node::ResTarget(rt)) if rt.val.is_some() => Some(&rt.val),
+            Some(ast::Node::ResTarget(rt)) if rt.val.is_some() => Some(rt.val.as_ref()),
             _ => None,
         })
         .collect();
