@@ -53,8 +53,8 @@ impl Foldable {
 }
 
 /// What `node` may fold to, in the scope of `ctx`.
-pub(crate) fn foldable(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Foldable {
-    foldable_node(node.as_ref(), ctx)
+pub(crate) fn foldable(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
+    foldable_node(node, ctx)
 }
 
 fn foldable_node(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
@@ -92,8 +92,8 @@ fn shape_here(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
     let Some(inner) = node else {
         return Foldable::ANY;
     };
-    let all = |nodes: &mut dyn Iterator<Item = &Option<ast::Node>>| {
-        nodes.map(|n| shape(n.as_ref(), ctx)).collect::<Vec<_>>()
+    let all = |nodes: &mut dyn Iterator<Item = Option<&ast::Node>>| {
+        nodes.map(|n| shape(n, ctx)).collect::<Vec<_>>()
     };
     match inner {
         ast::Node::AConst(c) => {
@@ -143,7 +143,7 @@ fn shape_here(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
             strict(operands.into_iter().map(|n| shape(n, ctx)))
         }
         ast::Node::BoolExpr(b) => {
-            let args = all(&mut b.args.iter());
+            let args = all(&mut b.args.iter().map(Option::as_ref));
             match b.boolop {
                 ast::BoolExprType::NotExpr => args.first().copied().unwrap_or(Foldable::ANY),
                 // `simplify_and_arguments` / `simplify_or_arguments`: a FALSE

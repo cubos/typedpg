@@ -99,7 +99,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     }
 
     if stmt.where_clause.is_some() {
-        check_index_predicate(db, indrelid, &stmt.where_clause)?;
+        check_index_predicate(db, indrelid, stmt.where_clause.as_ref())?;
     }
 
     // ── Mutability check on expression indexes (ComputeIndexAttrs) ──
@@ -108,7 +108,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             continue;
         };
         if elem.expr.is_some() {
-            check_index_expression(db, indrelid, &elem.expr)?;
+            check_index_expression(db, indrelid, elem.expr.as_ref())?;
         }
     }
 
@@ -150,9 +150,9 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         } else if elem.expr.is_some() {
             let expr = &elem.expr;
             indkey.push(0);
-            indexprs.push(serialize_node(expr));
-            match super::volatile::infer_over_relation(db, indrelid, expr, None) {
-                Some(Ok(t)) if known_key_type(expr, &t) => {
+            indexprs.push(serialize_node(expr.as_ref()));
+            match super::volatile::infer_over_relation(db, indrelid, expr.as_ref(), None) {
+                Some(Ok(t)) if known_key_type(expr.as_ref(), &t) => {
                     expr_types.push((key_columns.len(), t.type_oid));
                     Some((t.type_oid, expression_collation(db, &t)))
                 }
@@ -202,7 +202,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     let indpred = stmt
         .where_clause
         .is_some()
-        .then(|| serialize_node(&stmt.where_clause));
+        .then(|| serialize_node(stmt.where_clause.as_ref()));
     let usage = if stmt.primary {
         IndexUse::Primary
     } else if stmt.isconstraint {
@@ -210,14 +210,14 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
     } else {
         IndexUse::Index
     };
-    let key_exprs: Vec<&Option<typedpg_pg_query::ast::Node>> = stmt
+    let key_exprs: Vec<Option<&typedpg_pg_query::ast::Node>> = stmt
         .index_params
         .iter()
         .filter_map(|p| match p.as_ref()? {
-            ast::Node::IndexElem(elem) => Some(&elem.expr).filter(|e| e.is_some()),
+            ast::Node::IndexElem(elem) => elem.expr.as_ref().map(Some),
             _ => None,
         })
-        .chain(Some(&stmt.where_clause).filter(|w| w.is_some()))
+        .chain(stmt.where_clause.as_ref().map(Some))
         .collect();
     if stmt.unique || stmt.primary {
         let label = if stmt.primary {
@@ -334,7 +334,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
 fn check_index_predicate(
     db: &PgCatalog,
     relid: PgClassOid,
-    pred: &Option<typedpg_pg_query::ast::Node>,
+    pred: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     super::expr_kind::check_expr_kind(db, pred, super::expr_kind::ExprKind::IndexPredicate)?;
     // transformWhereClause: a boolean over the table's row.
@@ -371,7 +371,7 @@ fn check_index_predicate(
 fn check_index_expression(
     db: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     super::expr_kind::check_expr_kind(db, expr, super::expr_kind::ExprKind::IndexExpression)?;
     // transformIndexStmt: the expression is analyzed over the row.
@@ -388,14 +388,14 @@ fn check_index_expression(
 /// of a record over a literal — see [`crate::expr::ExprType::unknown_value`]).
 /// The analyzer also infers `unknown` where it can't tell a type.
 pub(crate) fn certainly_unknown(
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     t: &crate::expr::ExprType,
 ) -> bool {
     use typedpg_pg_query::ast;
     t.type_oid == crate::pg_catalog::oid::UNKNOWN
         && (t.unknown_value
             || matches!(
-                expr.as_ref(),
+                expr,
                 Some(ast::Node::AConst(c))
                     if c.isnull || matches!(c.val, Some(ast::AConstValue::String(_)))
             ))
@@ -405,7 +405,7 @@ pub(crate) fn certainly_unknown(
 /// but `unknown`, which only [`certainly_unknown`] keys are — PG resolves
 /// their operator class (ComputeIndexAttrs) and fails, `unknown` having
 /// none. Other keys are left unchecked.
-fn known_key_type(expr: &Option<typedpg_pg_query::ast::Node>, t: &crate::expr::ExprType) -> bool {
+fn known_key_type(expr: Option<&typedpg_pg_query::ast::Node>, t: &crate::expr::ExprType) -> bool {
     t.type_oid != crate::pg_catalog::oid::UNKNOWN || certainly_unknown(expr, t)
 }
 
@@ -708,8 +708,10 @@ fn compute_key_column(
         // get_collation_oid(attribute->collation, false).
         collation = Some(
             super::tables::partbound::collation_clause(db, names).ok_or_else(|| {
-                let written: Vec<&str> =
-                    names.iter().filter_map(super::util::node_string).collect();
+                let written: Vec<&str> = names
+                    .iter()
+                    .filter_map(|n| super::util::node_string(n.as_ref()))
+                    .collect();
                 DdlError::TypeNotFound(format!(
                     "collation \"{}\" for encoding \"UTF8\" does not exist",
                     written.join(".")
@@ -742,7 +744,7 @@ fn compute_key_column(
     let exclusion_op: Option<Vec<String>> = exclusion_op.map(|names| {
         names
             .iter()
-            .filter_map(super::util::node_string)
+            .filter_map(|n| super::util::node_string(n.as_ref()))
             .map(str::to_owned)
             .collect()
     });
@@ -912,7 +914,7 @@ pub(crate) fn define_constraint_index(
     // transformIndexConstraint: an EXCLUDE constraint's WHERE is the
     // index's predicate.
     if c.where_clause.is_some() {
-        check_index_predicate(db, relid, &c.where_clause)?;
+        check_index_predicate(db, relid, c.where_clause.as_ref())?;
     }
     let attrs = db.attributes_of(relid);
     let mut columns = Vec::with_capacity(conkey.len());
@@ -948,10 +950,10 @@ pub(crate) fn define_constraint_index(
             }
             (None, Some(expr)) => {
                 colnames.push(figure_index_colname(expr.as_ref()));
-                check_index_expression(db, relid, expr)?;
-                match super::volatile::infer_over_relation(db, relid, expr, None) {
+                check_index_expression(db, relid, expr.as_ref())?;
+                match super::volatile::infer_over_relation(db, relid, expr.as_ref(), None) {
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
-                    Some(Ok(t)) if known_key_type(expr, &t) => {
+                    Some(Ok(t)) if known_key_type(expr.as_ref(), &t) => {
                         expr_types.push((i, t.type_oid));
                         (Some(t.type_oid), expression_collation(db, &t))
                     }
@@ -1185,7 +1187,7 @@ pub(crate) fn rebuild_indexes_for_column_type(
             ast.ast.as_ref().is_some_and(|inner| {
                 inner.nodes().into_iter().any(|(n, ..)| {
                     matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
-                        if cr.fields.last().and_then(super::util::node_string)
+                        if cr.fields.last().and_then(|n| super::util::node_string(n.as_ref()))
                             == Some(attr.attname.as_str()))
                 })
             })
@@ -1253,14 +1255,14 @@ pub(crate) fn rebuild_indexes_for_column_type(
                 let reads = expr.ast.as_ref().is_some_and(|inner| {
                     inner.nodes().into_iter().any(|(n, ..)| {
                         matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
-                            if cr.fields.last().and_then(super::util::node_string)
+                            if cr.fields.last().and_then(|n| super::util::node_string(n.as_ref()))
                                 == Some(attr.attname.as_str()))
                     })
                 });
                 let Some(prior) = key.typ.filter(|_| reads) else {
                     continue;
                 };
-                match super::volatile::infer_over_relation(db, relid, &expr.ast, None) {
+                match super::volatile::infer_over_relation(db, relid, expr.ast.as_ref(), None) {
                     Some(Ok(t)) => (t.type_oid, prior),
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
                     None => continue,
@@ -1431,7 +1433,7 @@ pub(crate) fn check_index_columns(
     db: &PgCatalog,
     relid: PgClassOid,
     attnums: &[i16],
-    exprs: &[&Option<typedpg_pg_query::ast::Node>],
+    exprs: &[Option<&typedpg_pg_query::ast::Node>],
     usage: IndexUse,
 ) -> Result<(), DdlError> {
     use crate::pg_catalog::AttGenerated;
@@ -1474,13 +1476,14 @@ pub(crate) fn check_index_columns(
             .nodes()
             .into_iter()
             .filter_map(|(n, ..)| match n {
-                typedpg_pg_query::NodeRef::ColumnRef(cr) => {
-                    cr.fields.last().and_then(super::util::node_string)
-                }
+                typedpg_pg_query::NodeRef::ColumnRef(cr) => cr
+                    .fields
+                    .last()
+                    .and_then(|n| super::util::node_string(n.as_ref())),
                 _ => None,
             })
             .chain(
-                super::util::relation_row_selections(db, relid, expr)
+                super::util::relation_row_selections(db, relid, *expr)
                     .into_iter()
                     .map(|(_, field)| field),
             );
@@ -1505,16 +1508,16 @@ pub(crate) fn check_index_columns(
 /// expression as a select-list item — a column, a function, a cast's
 /// type, `case`, ... — or `expr` when it has none.
 pub(crate) fn figure_index_colname(expr: Option<&typedpg_pg_query::ast::Node>) -> String {
-    expr.and_then(|e| crate::resolve::infer_column_name(&Some(e.clone())))
+    expr.and_then(|e| crate::resolve::infer_column_name(Some(e)))
         .unwrap_or_else(|| "expr".to_owned())
 }
 
 /// Store a `typedpg_pg_query::ast::Node` as a `SerializedAst` (an empty bindings
 /// stream — index expressions don't yet flow through the view-binding walker;
 /// that's a separate piece of work).
-fn serialize_node(node: &Option<typedpg_pg_query::ast::Node>) -> SerializedAst {
+fn serialize_node(node: Option<&typedpg_pg_query::ast::Node>) -> SerializedAst {
     SerializedAst {
-        ast: node.clone(),
+        ast: node.cloned(),
         bindings: Vec::<AstBinding>::new(),
     }
 }

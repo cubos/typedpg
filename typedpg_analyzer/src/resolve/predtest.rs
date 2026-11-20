@@ -77,8 +77,8 @@ pub(crate) fn predicate_implied_by(
         return false;
     };
     implied_by_recurse(
-        &normalize(&unqualify(Some(clause)), types),
-        &normalize(&unqualify(Some(predicate)), types),
+        normalize(unqualify(Some(clause)).as_ref(), types).as_ref(),
+        normalize(unqualify(Some(predicate)).as_ref(), types).as_ref(),
     )
 }
 
@@ -89,28 +89,32 @@ const MAX_SAOP_ARRAY_SIZE: usize = 100;
 /// (ARRAY[...])` expanded into the OR / AND of `x op element` (as
 /// `predicate_classify` reads a ScalarArrayOpExpr), and each comparison
 /// typed ([`typed_comparison`]).
-fn normalize(n: &Option<ast::Node>, types: &Types) -> Option<ast::Node> {
+fn normalize(n: Option<&ast::Node>, types: &Types) -> Option<ast::Node> {
     use ast::AExprKind as K;
-    let Some(inner) = n.as_ref() else {
-        return n.clone();
+    let Some(inner) = n else {
+        return n.cloned();
     };
     match inner {
         ast::Node::BoolExpr(b) => {
             let mut b = (**b).clone();
-            b.args = b.args.iter().map(|a| normalize(a, types)).collect();
+            b.args = b
+                .args
+                .iter()
+                .map(|a| normalize(a.as_ref(), types))
+                .collect();
             Some(ast::Node::BoolExpr(NodeBox::new(b)))
         }
         ast::Node::AExpr(e) if matches!(e.kind, K::AexprIn | K::AexprOpAny | K::AexprOpAll) => {
             let elements = match (e.kind, e.rexpr.as_ref()) {
                 (K::AexprIn, Some(ast::Node::List(l))) => &l.items,
                 (K::AexprOpAny | K::AexprOpAll, Some(ast::Node::AArrayExpr(a))) => &a.elements,
-                _ => return n.clone(),
+                _ => return n.cloned(),
             };
             let Some(x) = e.lexpr.as_ref() else {
-                return n.clone();
+                return n.cloned();
             };
             if elements.is_empty() || elements.len() > MAX_SAOP_ARRAY_SIZE {
-                return n.clone();
+                return n.cloned();
             }
             // `IN` is `= ANY`, `NOT IN` is `<> ALL`.
             let any = match e.kind {
@@ -142,7 +146,7 @@ fn normalize(n: &Option<ast::Node>, types: &Types) -> Option<ast::Node> {
             })))
         }
         ast::Node::AExpr(e) if e.kind == K::AexprOp => typed_comparison((**e).clone(), types),
-        _ => n.clone(),
+        _ => n.cloned(),
     }
 }
 
@@ -308,8 +312,8 @@ enum Shape<'a> {
     Atom,
 }
 
-fn shape(n: &Option<ast::Node>) -> Shape<'_> {
-    match n.as_ref() {
+fn shape(n: Option<&ast::Node>) -> Shape<'_> {
+    match n {
         Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
             Shape::And(&b.args)
         }
@@ -318,35 +322,36 @@ fn shape(n: &Option<ast::Node>) -> Shape<'_> {
     }
 }
 
-fn implied_by_recurse(clause: &Option<ast::Node>, pred: &Option<ast::Node>) -> bool {
+fn implied_by_recurse(clause: Option<&ast::Node>, pred: Option<&ast::Node>) -> bool {
     match (shape(clause), shape(pred)) {
-        (_, Shape::And(ps)) => ps.iter().all(|p| implied_by_recurse(clause, p)),
+        (_, Shape::And(ps)) => ps.iter().all(|p| implied_by_recurse(clause, p.as_ref())),
         (Shape::And(cs), Shape::Or(ps)) => {
-            ps.iter().any(|p| implied_by_recurse(clause, p))
-                || cs.iter().any(|c| implied_by_recurse(c, pred))
+            ps.iter().any(|p| implied_by_recurse(clause, p.as_ref()))
+                || cs.iter().any(|c| implied_by_recurse(c.as_ref(), pred))
         }
-        (Shape::And(cs), Shape::Atom) => cs.iter().any(|c| implied_by_recurse(c, pred)),
-        (Shape::Or(cs), Shape::Or(ps)) => cs
-            .iter()
-            .all(|c| ps.iter().any(|p| implied_by_recurse(c, p))),
-        (Shape::Or(cs), Shape::Atom) => cs.iter().all(|c| implied_by_recurse(c, pred)),
-        (Shape::Atom, Shape::Or(ps)) => ps.iter().any(|p| implied_by_recurse(clause, p)),
+        (Shape::And(cs), Shape::Atom) => cs.iter().any(|c| implied_by_recurse(c.as_ref(), pred)),
+        (Shape::Or(cs), Shape::Or(ps)) => cs.iter().all(|c| {
+            ps.iter()
+                .any(|p| implied_by_recurse(c.as_ref(), p.as_ref()))
+        }),
+        (Shape::Or(cs), Shape::Atom) => cs.iter().all(|c| implied_by_recurse(c.as_ref(), pred)),
+        (Shape::Atom, Shape::Or(ps)) => ps.iter().any(|p| implied_by_recurse(clause, p.as_ref())),
         (Shape::Atom, Shape::Atom) => simple_clause_implied(clause, pred),
     }
 }
 
 /// `predicate_implied_by_simple_clause`.
-fn simple_clause_implied(clause: &Option<ast::Node>, pred: &Option<ast::Node>) -> bool {
+fn simple_clause_implied(clause: Option<&ast::Node>, pred: Option<&ast::Node>) -> bool {
     if node_fingerprint(clause) == node_fingerprint(pred) {
         return true;
     }
     // `x IS NOT NULL` follows from any strict comparison on x.
-    if let Some(ast::Node::NullTest(nt)) = pred.as_ref()
+    if let Some(ast::Node::NullTest(nt)) = pred
         && nt.nulltesttype == ast::NullTestType::IsNotNull
         && !nt.argisrow
         && nt.arg.is_some()
         && let Some((x, _, _)) = comparison(clause)
-        && node_fingerprint(&x) == node_fingerprint(&nt.arg)
+        && node_fingerprint(x.as_ref()) == node_fingerprint(nt.arg.as_ref())
     {
         return true;
     }
@@ -421,9 +426,9 @@ enum Constant {
 }
 
 impl Constant {
-    fn of(n: &Option<ast::Node>) -> Option<Constant> {
+    fn of(n: Option<&ast::Node>) -> Option<Constant> {
         use ast::AConstValue;
-        let Some(ast::Node::AConst(c)) = n.as_ref() else {
+        let Some(ast::Node::AConst(c)) = n else {
             return None;
         };
         if c.isnull {
@@ -451,8 +456,8 @@ impl Constant {
 }
 
 /// `x op c` / `c op x` as `(x, op, c)` with the constant on the right.
-fn comparison(n: &Option<ast::Node>) -> Option<(Option<ast::Node>, Cmp, Constant)> {
-    let Some(ast::Node::AExpr(e)) = n.as_ref() else {
+fn comparison(n: Option<&ast::Node>) -> Option<(Option<ast::Node>, Cmp, Constant)> {
+    let Some(ast::Node::AExpr(e)) = n else {
         return None;
     };
     if e.kind != ast::AExprKind::AexprOp {
@@ -467,7 +472,7 @@ fn comparison(n: &Option<ast::Node>) -> Option<(Option<ast::Node>, Cmp, Constant
         return None;
     }
     let (l, r) = (&e.lexpr, &e.rexpr);
-    match (Constant::of(l), Constant::of(r)) {
+    match (Constant::of(l.as_ref()), Constant::of(r.as_ref())) {
         (None, Some(c)) => Some((l.clone(), op, c)),
         (Some(c), None) => Some((r.clone(), op.commute(), c)),
         _ => None,
@@ -477,11 +482,11 @@ fn comparison(n: &Option<ast::Node>) -> Option<(Option<ast::Node>, Cmp, Constant
 /// `operator_predicate_proof`: does `x op1 c1` imply `x op2 c2`? Decided
 /// as containment of the value sets on an ordered domain, which is what
 /// `BT_implic_table`'s test operators encode.
-fn operator_predicate_proof(clause: &Option<ast::Node>, pred: &Option<ast::Node>) -> bool {
+fn operator_predicate_proof(clause: Option<&ast::Node>, pred: Option<&ast::Node>) -> bool {
     let (Some((cx, op1, c1)), Some((px, op2, c2))) = (comparison(clause), comparison(pred)) else {
         return false;
     };
-    if node_fingerprint(&cx) != node_fingerprint(&px) {
+    if node_fingerprint(cx.as_ref()) != node_fingerprint(px.as_ref()) {
         return false;
     }
     let test = |op: Cmp, a: &Constant, b: &Constant| op.holds(a, b).unwrap_or(false);

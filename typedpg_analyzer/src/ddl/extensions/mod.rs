@@ -672,7 +672,10 @@ pub fn alter_object_depends(
     };
     let address = match (objtype, &object) {
         (ObjectType::ObjectTrigger, ast::Node::List(l)) => {
-            let name = l.items.last().and_then(super::util::node_string);
+            let name = l
+                .items
+                .last()
+                .and_then(|n| super::util::node_string(n.as_ref()));
             relation(interp).and_then(|relid| {
                 let trigger = interp
                     .triggers
@@ -716,7 +719,7 @@ fn member_object(
             Node::List(l) => l
                 .items
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .map(str::to_owned)
                 .collect(),
             Node::String(s) => vec![s.sval.clone()],
@@ -763,8 +766,8 @@ fn member_object(
             ))
         }
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => {
-            let wrapped = Some(object.clone());
-            let Some((schema, name, args)) = super::alter::extract_func_target(&wrapped, interp)
+            let Some((schema, name, args)) =
+                super::alter::extract_func_target(Some(object), interp)
             else {
                 return Ok(None);
             };
@@ -785,8 +788,7 @@ fn member_object(
             ))
         }
         ObjectType::ObjectOperator => {
-            let wrapped = Some(object.clone());
-            let Some(oid) = super::drop::lookup_operator(interp, &wrapped)? else {
+            let Some(oid) = super::drop::lookup_operator(interp, Some(object))? else {
                 return Ok(None);
             };
             let addr = super::depend::ObjectAddress::operator(oid);
@@ -980,7 +982,7 @@ pub(crate) fn check_opclass_options(
     }
     let parts: Vec<&str> = opclass
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .collect();
     let (schema, name) = match parts.as_slice() {
         [s, n] => (Some(*s), *n),

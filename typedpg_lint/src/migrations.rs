@@ -497,7 +497,7 @@ impl MigrationLinter<'_> {
         };
         let mut found = false;
         for command in &alter.cmds {
-            let Some(command) = alter_command(command) else {
+            let Some(command) = alter_command(command.as_ref()) else {
                 continue;
             };
             match (command.subtype, command.def.as_ref()) {
@@ -553,7 +553,7 @@ impl MigrationLinter<'_> {
         // `skip_validation`, so one defaulted column makes all of them scan.
         let mut skip_validation = true;
         for command in &alter.cmds {
-            let Some(command) = alter_command(command) else {
+            let Some(command) = alter_command(command.as_ref()) else {
                 continue;
             };
             match (command.subtype, command.def.as_ref()) {
@@ -568,7 +568,7 @@ impl MigrationLinter<'_> {
         }
         let mut found = false;
         for command in &alter.cmds {
-            let Some(command) = alter_command(command) else {
+            let Some(command) = alter_command(command.as_ref()) else {
                 continue;
             };
             match command.subtype {
@@ -636,7 +636,7 @@ impl MigrationLinter<'_> {
         };
         let mut columns = Vec::new();
         for command in &alter.cmds {
-            let Some(command) = alter_command(command) else {
+            let Some(command) = alter_command(command.as_ref()) else {
                 continue;
             };
             if command.subtype != AlterTableType::AtSetNotNull {
@@ -678,7 +678,7 @@ impl MigrationLinter<'_> {
         };
         let mut found = false;
         for command in &alter.cmds {
-            let Some(command) = alter_command(command) else {
+            let Some(command) = alter_command(command.as_ref()) else {
                 continue;
             };
             match command.subtype {
@@ -730,7 +730,7 @@ impl MigrationLinter<'_> {
                         };
                         match constraint.contype {
                             ConstrType::ConstrDefault => {
-                                volatile_default |= volatile(catalog, &constraint.raw_expr);
+                                volatile_default |= volatile(catalog, constraint.raw_expr.as_ref());
                             }
                             ConstrType::ConstrGenerated => {
                                 // `generated_kind` is `s` for a stored
@@ -1003,7 +1003,7 @@ impl MigrationLinter<'_> {
                     return;
                 };
                 for command in &alter.cmds {
-                    let Some(command) = alter_command(command) else {
+                    let Some(command) = alter_command(command.as_ref()) else {
                         continue;
                     };
                     let Some(def) = command.def.as_ref() else {
@@ -1652,8 +1652,8 @@ fn column_has_raw_default(column: &typedpg_pg_query::ast::ColumnDef) -> bool {
         })
 }
 
-fn alter_command(node: &Option<Node>) -> Option<&typedpg_pg_query::ast::AlterTableCmd> {
-    match node.as_ref()? {
+fn alter_command(node: Option<&Node>) -> Option<&typedpg_pg_query::ast::AlterTableCmd> {
+    match node? {
         N::AlterTableCmd(command) => Some(command),
         _ => None,
     }
@@ -1790,15 +1790,15 @@ fn set_config_lock_timeout(
     // Only a string literal (optionally cast once to `text`) has text this
     // lint knows: a cast chain evaluates the value away
     // (`'0.4'::numeric::integer::text` is `'0'`).
-    if !plain_text_literal(setting)?.eq_ignore_ascii_case("lock_timeout") {
+    if !plain_text_literal(setting.as_ref())?.eq_ignore_ascii_case("lock_timeout") {
         return None;
     }
     // An unknown `is_local` decides where the assignment lands; drop the
     // proof rather than guess.
-    let Some(local) = constant_bool(local) else {
+    let Some(local) = constant_bool(local.as_ref()) else {
         return Some((None, false));
     };
-    Some((set_config_value(value), local))
+    Some((set_config_value(value.as_ref()), local))
 }
 
 /// Whether the called function is PostgreSQL's `set_config`. `pg_catalog`
@@ -1816,8 +1816,8 @@ fn set_config_is_builtin(catalog: &PgCatalog, names: &[&str]) -> bool {
 }
 
 /// The text of a string literal, uncast or cast once to `text`.
-fn plain_text_literal(node: &Option<Node>) -> Option<&str> {
-    let node = match node.as_ref()? {
+fn plain_text_literal(node: Option<&Node>) -> Option<&str> {
+    let node = match node? {
         N::TypeCast(cast) => {
             if !is_text_type(cast.type_name.as_ref()?) {
                 return None;
@@ -1853,8 +1853,8 @@ fn is_text_type(type_name: &typedpg_pg_query::ast::TypeName) -> bool {
 /// string literal (optionally cast once to `text`), `None` when another
 /// expression computes it. A NULL literal resets the setting to its default
 /// (`0`, disabled).
-fn set_config_value(node: &Option<Node>) -> Option<bool> {
-    let node = match node.as_ref()? {
+fn set_config_value(node: Option<&Node>) -> Option<bool> {
+    let node = match node? {
         N::TypeCast(cast) => {
             if !is_text_type(cast.type_name.as_ref()?) {
                 return None;
@@ -1882,8 +1882,8 @@ fn constant_node(node: &Node) -> Option<&Node> {
     }
 }
 
-fn constant_bool(node: &Option<Node>) -> Option<bool> {
-    match constant_node(node.as_ref()?)? {
+fn constant_bool(node: Option<&Node>) -> Option<bool> {
+    match constant_node(node?)? {
         N::AConst(constant) => match constant.val.as_ref()? {
             AConstValue::Boolean(boolean) => Some(boolean.boolval),
             _ => None,
@@ -1919,7 +1919,9 @@ fn lock_timeout_setting(
         return None;
     }
     match kind {
-        VariableSetKind::VarSetValue => Some(set.args.first().and_then(setting_value)),
+        VariableSetKind::VarSetValue => {
+            Some(set.args.first().and_then(|n| setting_value(n.as_ref())))
+        }
         VariableSetKind::VarSetDefault | VariableSetKind::VarReset => Some(Some(false)),
         // `SET … FROM CURRENT` keeps the value the statement runs with.
         VariableSetKind::VarSetCurrent => Some(Some(effective)),
@@ -1929,8 +1931,8 @@ fn lock_timeout_setting(
 
 /// The value of `SET … TO <value>`: `Some` when its text is known, `None`
 /// when an expression computes it.
-fn setting_value(node: &Option<Node>) -> Option<bool> {
-    match node.as_ref()? {
+fn setting_value(node: Option<&Node>) -> Option<bool> {
+    match node? {
         N::AConst(constant) if constant.isnull => None,
         N::AConst(constant) => match constant.val.as_ref()? {
             AConstValue::Integer(value) => Some(value.ival != 0),
@@ -2173,7 +2175,7 @@ fn alter_table_lock_target(
     let mut referenced = Vec::new();
     let mut attached = Vec::new();
     for node in &alter.cmds {
-        let Some(command) = alter_command(node) else {
+        let Some(command) = alter_command(node.as_ref()) else {
             continue;
         };
         strong |= !only_share_update_exclusive(command);
@@ -2326,7 +2328,11 @@ fn drop_lock_target(
         let Some(N::List(list)) = object.as_ref() else {
             continue;
         };
-        let names: Vec<&str> = list.items.iter().filter_map(string_node).collect();
+        let names: Vec<&str> = list
+            .items
+            .iter()
+            .filter_map(|n| string_node(n.as_ref()))
+            .collect();
         let (schema, name) = match names.as_slice() {
             [name] => (None, *name),
             [schema, name] => (Some(*schema), *name),
@@ -2342,8 +2348,8 @@ fn drop_lock_target(
     None
 }
 
-fn string_node(node: &Option<Node>) -> Option<&str> {
-    match node.as_ref()? {
+fn string_node(node: Option<&Node>) -> Option<&str> {
+    match node? {
         N::String(string) => Some(string.sval.as_str()),
         _ => None,
     }
@@ -2579,8 +2585,8 @@ fn key_order(stmt: &typedpg_pg_query::ast::IndexStmt) -> Vec<(bool, bool)> {
         .collect()
 }
 
-fn volatile(catalog: &PgCatalog, node: &Option<Node>) -> bool {
-    let Some(inner) = node.as_ref() else {
+fn volatile(catalog: &PgCatalog, node: Option<&Node>) -> bool {
+    let Some(inner) = node else {
         return false;
     };
     inner
@@ -3287,7 +3293,11 @@ mod tests {
         let N::AlterTableStmt(alter) = node else {
             panic!("expected ALTER TABLE");
         };
-        let command = alter.cmds.first().and_then(alter_command).unwrap();
+        let command = alter
+            .cmds
+            .first()
+            .and_then(|n| alter_command(n.as_ref()))
+            .unwrap();
         assert!(only_share_update_exclusive(command), "{command:?}");
     }
 

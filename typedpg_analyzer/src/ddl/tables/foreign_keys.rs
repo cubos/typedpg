@@ -55,7 +55,7 @@ fn column_attnums(
 fn node_names(nodes: &[Option<typedpg_pg_query::ast::Node>]) -> Vec<String> {
     nodes
         .iter()
-        .filter_map(crate::ddl::util::node_string)
+        .filter_map(|n| crate::ddl::util::node_string(n.as_ref()))
         .map(str::to_owned)
         .collect()
 }

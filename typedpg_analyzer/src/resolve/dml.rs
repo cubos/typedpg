@@ -102,17 +102,19 @@ fn analyze_insert_here(
             row_error = rows
                 .iter()
                 .flat_map(|r| r.iter())
-                .find_map(|v| null_domain_cast_error(v, snapshot));
+                .find_map(|v| null_domain_cast_error(v.as_ref(), snapshot));
             let width = rows.first().map_or(0, |r| r.len());
             assigns = (0..width)
                 .filter_map(|i| {
                     Some(Assign {
                         column: target_col_at(&tgt, i)?.attname.clone(),
-                        default: rows.iter().all(|r| r.get(i).is_some_and(is_set_to_default)),
+                        default: rows
+                            .iter()
+                            .all(|r| r.get(i).is_some_and(|n| is_set_to_default(n.as_ref()))),
                         null: tgt.col_indirection.get(i).is_none_or(Vec::is_empty)
                             && rows
                                 .iter()
-                                .any(|r| r.get(i).is_some_and(is_sql_null_literal)),
+                                .any(|r| r.get(i).is_some_and(|n| is_sql_null_literal(n.as_ref()))),
                     })
                 })
                 .collect();
@@ -164,7 +166,9 @@ fn analyze_insert_here(
                 .find(|&i| target_col_at(&tgt, i).is_some_and(|t| t.attnum == c.attnum));
             let defaulted = match position {
                 None => true,
-                Some(i) => rows.iter().any(|r| r.get(i).is_some_and(is_set_to_default)),
+                Some(i) => rows
+                    .iter()
+                    .any(|r| r.get(i).is_some_and(|n| is_set_to_default(n.as_ref()))),
             };
             if defaulted && let Some(err) = default_fold_error(c, snapshot) {
                 return Err(err);
@@ -242,7 +246,7 @@ fn analyze_insert_here(
     };
     // A returned row is an inserted one, or — ON CONFLICT DO UPDATE — an
     // updated one (DO NOTHING returns only the inserted rows).
-    if has_returning(&ins.returning_clause)
+    if has_returning(ins.returning_clause.as_deref())
         && let Some(wt) = WriteTarget::resolve(snapshot, tgt.oid)
     {
         let insert_arm = if wt.insert_keeps(snapshot) {
@@ -272,7 +276,7 @@ fn analyze_insert_here(
         rows.new_proven = not_null;
     }
     let columns = resolve_returning(
-        &ins.returning_clause,
+        ins.returning_clause.as_deref(),
         insert_target_alias(relation),
         rows,
         expr::Ctx::new(&ret_scope, &ret_null_ctx, snapshot),
@@ -281,7 +285,7 @@ fn analyze_insert_here(
 
     let mut rw = Rewrite::single(DmlEvent::Insert, assigns, tgt.overriding);
     rw.row_error = row_error;
-    rw.returning = has_returning(&ins.returning_clause);
+    rw.returning = has_returning(ins.returning_clause.as_deref());
     rw.on_conflict = ins
         .on_conflict_clause
         .as_ref()
@@ -444,14 +448,14 @@ fn on_conflict_update_arm(
         let log = crate::nonnull::StrictLog::default();
         let mut scratch = params.clone();
         let typed = expr::infer_expr(
-            w,
+            w.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             &mut scratch,
             TypeGoal::implicit(oid::BOOL),
         );
         if typed.is_ok() {
             params.absorb_non_null_reads(&scratch);
-            let facts = crate::nonnull::nonnullable(w, true, &scope, &log, snapshot)
+            let facts = crate::nonnull::nonnullable(w.as_ref(), true, &scope, &log, snapshot)
                 .restricted_to(&crate::nonnull::own_aliases(&scope));
             k = RowKnowledge::from_facts(&facts, alias, |c| Some(c.to_owned()));
             null_ctx.add_where_facts(facts);
@@ -852,7 +856,10 @@ fn analyze_insert_values(
             None => first_len = Some(list.items.len()),
             Some(n) if n != list.items.len() => {
                 // PG positions it at the row's first value.
-                let span = list.items.first().and_then(crate::error::expr_span);
+                let span = list
+                    .items
+                    .first()
+                    .and_then(|n| crate::error::expr_span(n.as_ref()));
                 return Err(crate::pgmsg::values_lists_length(n, list.items.len(), span)
                     .finalize_implicit());
             }
@@ -869,13 +876,13 @@ fn analyze_insert_values(
                 list.items.len(),
                 list.items
                     .get(expected_len)
-                    .and_then(crate::error::expr_span),
+                    .and_then(|n| crate::error::expr_span(n.as_ref())),
             ));
         }
         // The row is transformed whole, then coerced to its columns
         // (transformInsertRow).
         let untyped = expr::replay_transform(
-            &list.items.iter().collect::<Vec<_>>(),
+            &list.items.iter().map(Option::as_ref).collect::<Vec<_>>(),
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
         );
@@ -902,7 +909,7 @@ fn analyze_insert_values(
                     snapshot,
                     tc.atttypid,
                     snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-                    val,
+                    val.as_ref(),
                 )
             {
                 return Err(err);
@@ -922,26 +929,28 @@ fn analyze_insert_values(
             // set-returning functions; a single row is the INSERT's own
             // target list.
             if val_sel.values_lists.len() > 1 {
-                check_no_srf_in_clause(val, snapshot, "VALUES")?;
+                check_no_srf_in_clause(val.as_ref(), snapshot, "VALUES")?;
             }
             // EXPR_KIND_VALUES / EXPR_KIND_VALUES_SINGLE.
-            crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
+            crate::clause::check_no_aggregates_or_windows(val.as_ref(), snapshot, "VALUES")?;
             if untyped[i]
-                && let Some(p) = expr::bare_param(val, snapshot)
+                && let Some(p) = expr::bare_param(val.as_ref(), snapshot)
                 && let Some(t) = &target
             {
                 expr::coerce_untyped_param(p, t.type_oid, snapshot, params)?;
             }
             let inferred = match &target {
-                Some(t) => t.infer_value(val, goal, ctx, params)?,
-                None if is_set_to_default(val) => expr::ExprType::scalar(oid::UNKNOWN, false),
-                None => expr::infer_expr(val, ctx, params, goal)?,
+                Some(t) => t.infer_value(val.as_ref(), goal, ctx, params)?,
+                None if is_set_to_default(val.as_ref()) => {
+                    expr::ExprType::scalar(oid::UNKNOWN, false)
+                }
+                None => expr::infer_expr(val.as_ref(), ctx, params, goal)?,
             };
             row_written.push(match target_col {
-                _ if is_set_to_default(val) => None,
+                _ if is_set_to_default(val.as_ref()) => None,
                 // A value stored inside the column says nothing of it.
                 Some(_) if indirected => Some(ValueInfo::default()),
-                Some(tc) => Some(ValueInfo::assigned(val, &inferred, tc, snapshot)),
+                Some(tc) => Some(ValueInfo::assigned(val.as_ref(), &inferred, tc, snapshot)),
                 None => Some(ValueInfo::default()),
             });
 
@@ -954,8 +963,10 @@ fn analyze_insert_values(
         }
         if violation.is_none() {
             let known = |i: usize| match target_col_at(tgt, i) {
-                Some(tc) if is_null_value(&list.items[i], tc, None, snapshot) => Known::Null,
-                _ => Known::Value(&list.items[i]),
+                Some(tc) if is_null_value(list.items[i].as_ref(), tc, None, snapshot) => {
+                    Known::Null
+                }
+                _ => Known::Value(list.items[i].as_ref()),
             };
             violation = row_violation(tgt, &list.items, &known, snapshot);
         }
@@ -1013,7 +1024,7 @@ enum Known<'a> {
     /// A NULL, stored as is.
     Null,
     /// This expression, stored as the column's type reads it.
-    Value(&'a Option<ast::Node>),
+    Value(Option<&'a ast::Node>),
     /// Nothing.
     Unknown,
 }
@@ -1058,7 +1069,7 @@ fn row_violation<'a>(
         if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) {
             continue;
         }
-        if is_set_to_default(val) {
+        if is_set_to_default(val.as_ref()) {
             // An explicit DEFAULT that is NULL competes like an omitted
             // column.
             violations.extend(null_default_violation(tc, snapshot, &lands_in));
@@ -1076,7 +1087,7 @@ fn row_violation<'a>(
             // `NULL::d`, for a domain `d` rejecting NULL, fails as the row
             // is built, whatever the column.
             Known::Value(_) | Known::Unknown => {
-                if let Some(msg) = null_domain_cast(val, snapshot) {
+                if let Some(msg) = null_domain_cast(val.as_ref(), snapshot) {
                     let attnum = snapshot
                         .attribute_by_name(lands_in.0, &tc.attname)
                         .map_or(tc.attnum, |a| a.attnum);
@@ -1150,7 +1161,7 @@ fn through_view(
         given.push(tc.attname.as_str());
         col_names.push(base_col(tc)?);
         col_indirection.push(tgt.col_indirection.get(i).cloned().unwrap_or_default());
-        if is_set_to_default(item) && tc.atthasdef {
+        if is_set_to_default(item.as_ref()) && tc.atthasdef {
             opaque.push(i);
             base_items.push(None);
         } else {
@@ -1187,7 +1198,7 @@ fn through_view(
 /// mapping NULL to NULL (see [`null_under_casts`]) — then coerced to
 /// `source` (a VALUES column's common type) and to the column's type.
 fn is_null_value(
-    val: &Option<ast::Node>,
+    val: Option<&ast::Node>,
     column: &crate::pg_catalog::PgAttribute,
     source: Option<PgTypeOid>,
     snapshot: &PgCatalog,
@@ -1216,7 +1227,7 @@ fn is_null_value(
 /// (`NULL::d`, also under further casts). None when the statement is not
 /// run (a view, rule action, SQL function body, prepared statement or
 /// plain EXPLAIN).
-fn null_domain_cast(val: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
+fn null_domain_cast(val: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<String> {
     if !super::executes() {
         return None;
     }
@@ -1224,7 +1235,7 @@ fn null_domain_cast(val: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<Str
 }
 
 /// [`null_domain_cast`]'s error, whether or not the statement runs.
-fn null_domain_cast_error(val: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
+fn null_domain_cast_error(val: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<String> {
     match null_under_casts(val, snapshot)? {
         (NullCast::Fails(msg), _) => Some(msg),
         (NullCast::Null, _) => None,
@@ -1253,9 +1264,9 @@ fn row_relation<'a>(
             Some(i) if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) || tgt.discards(c) => {
                 None
             }
-            Some(i) if !is_set_to_default(&items[i]) => match known(i) {
+            Some(i) if !is_set_to_default(items[i].as_ref()) => match known(i) {
                 Known::Null => Some(None),
-                Known::Value(v) => v.as_ref().map(Some),
+                Known::Value(v) => v.map(Some),
                 Known::Unknown => None,
             },
             _ => null_default(c, snapshot).then_some(None),
@@ -1296,14 +1307,14 @@ pub(crate) fn default_fold_error(
         return None;
     };
     // (The default isn't in the statement's text: no location.)
-    if let Some(err) = crate::fold::error(e, snapshot) {
+    if let Some(err) = crate::fold::error((**e).as_ref(), snapshot) {
         return crate::expr::plan_time_error(None, err.raw(None).finalize_implicit());
     }
     crate::typmod::assignment_error(
         snapshot,
         c.atttypid,
         snapshot.effective_typmod(c.atttypid, c.atttypmod),
-        e,
+        (**e).as_ref(),
         None,
         || None,
     )
@@ -1346,7 +1357,7 @@ fn stored_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> O
     else {
         return None;
     };
-    match null_under_casts(e, snapshot)? {
+    match null_under_casts((**e).as_ref(), snapshot)? {
         // cookDefault's coerce_to_target_type, to the column's type.
         (NullCast::Null, t) => null_coercion(
             t,
@@ -1363,11 +1374,11 @@ fn stored_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> O
 /// What `e` evaluates to when it is `NULL` under casts (`NULL::int8`,
 /// `CAST(NULL::int8 AS text)`), with the type of the result: `None` when
 /// it is something else, or when a cast may turn the NULL into a value.
-fn null_under_casts(e: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<(NullCast, PgTypeOid)> {
-    match e.as_ref()? {
+fn null_under_casts(e: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<(NullCast, PgTypeOid)> {
+    match e? {
         ast::Node::AConst(k) if k.isnull => Some((NullCast::Null, oid::UNKNOWN)),
         ast::Node::TypeCast(tc) => {
-            let (inner, from) = null_under_casts(&tc.arg, snapshot)?;
+            let (inner, from) = null_under_casts(tc.arg.as_ref(), snapshot)?;
             let tn = tc.type_name.as_ref()?;
             let target = crate::ddl::util::resolve_type_name(tn, snapshot)?;
             if inner != NullCast::Null {
@@ -1454,7 +1465,7 @@ fn omitted_domain_nulls(
     let given: Vec<&str> = items
         .iter()
         .enumerate()
-        .filter(|(_, v)| !is_set_to_default(v))
+        .filter(|(_, v)| !is_set_to_default(v.as_ref()))
         .filter_map(|(i, _)| target_col_at(tgt, i).map(|c| c.attname.as_str()))
         .collect();
     tgt.attrs
@@ -1628,7 +1639,7 @@ fn analyze_insert_select(
         // `variable_coerce_param_hook` (42P08 if WHERE & co. deduced
         // another type — see `expr::note_untyped_output_params`).
         if let Some(ast::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.as_ref())
-            && let Some(p) = expr::bare_param(&rt.val, snapshot)
+            && let Some(p) = expr::bare_param(rt.val.as_ref(), snapshot)
             && params.is_untyped_output(p.location)
         {
             if let Err(prev) = params.coerce_untyped(p.number, target_oid) {
@@ -1729,7 +1740,7 @@ fn analyze_insert_select(
                     snapshot,
                     tc.atttypid,
                     snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-                    val,
+                    val.as_ref(),
                 )
             {
                 return Err(err);
@@ -1740,23 +1751,23 @@ fn analyze_insert_select(
     // The expressions each output column takes its value from: the select
     // list's entries, or — a VALUES source with ORDER BY / LIMIT & co. —
     // every row's value at that position.
-    let mut outputs: Vec<(usize, &Option<ast::Node>)> = direct_targets
+    let mut outputs: Vec<(usize, Option<&ast::Node>)> = direct_targets
         .iter()
         .enumerate()
         .filter_map(|(i, t)| match t.as_ref() {
-            Some(ast::Node::ResTarget(rt)) => rt.val.is_some().then_some((i, &rt.val)),
+            Some(ast::Node::ResTarget(rt)) => rt.val.is_some().then_some((i, rt.val.as_ref())),
             _ => None,
         })
         .collect();
     if val_sel.op == SetOperation::SetopNone {
         for row in &val_sel.values_lists {
             if let Some(ast::Node::List(list)) = row.as_ref() {
-                outputs.extend(list.items.iter().enumerate());
+                outputs.extend(list.items.iter().map(Option::as_ref).enumerate());
             }
         }
     }
     for (i, val) in outputs {
-        if let Some(ast::Node::ParamRef(p)) = val.as_ref()
+        if let Some(ast::Node::ParamRef(p)) = val
             && let Some(tc) = target_col_at(tgt, i)
             && let Some(Some(target_oid)) = target_types.get(i)
         {
@@ -1845,10 +1856,10 @@ fn general_values_violation(
         .map(|items| {
             let known = |i: usize| match (target_col_at(tgt, i), column_types.get(i)) {
                 (Some(tc), Some(&t)) if t == snapshot.unwrap_domain(tc.atttypid) => {
-                    if is_null_value(&items[i], tc, Some(t), snapshot) {
+                    if is_null_value(items[i].as_ref(), tc, Some(t), snapshot) {
                         Known::Null
                     } else {
-                        Known::Value(&items[i])
+                        Known::Value(items[i].as_ref())
                     }
                 }
                 _ => Known::Unknown,
@@ -1975,13 +1986,13 @@ fn analyze_insert_on_conflict(
     .into_owned();
     if let where_clause @ Some(_) = &on_conflict.where_clause {
         expr::infer_expr(
-            where_clause,
+            where_clause.as_ref(),
             expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
             params,
             TypeGoal::implicit(oid::BOOL),
         )?;
-        crate::clause::check_no_aggregates_or_windows(where_clause, snapshot, "WHERE")?;
-        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
+        crate::clause::check_no_aggregates_or_windows(where_clause.as_ref(), snapshot, "WHERE")?;
+        check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
     }
     Ok((arbiter, set_list))
 }
@@ -2045,9 +2056,19 @@ fn transform_on_conflict_arbiter(
                 ctx.scope.resolve_column(None, &ie.name, None)?;
             }
         } else if let e @ Some(_) = &ie.expr {
-            check_index_expr_kind(e, snapshot, "index expressions", "index expression")?;
-            expr::infer_expr(e, ctx, params, TypeGoal::NONE)?;
-            check_index_expr_kind(e, snapshot, "index expressions", "index expression")?;
+            check_index_expr_kind(
+                e.as_ref(),
+                snapshot,
+                "index expressions",
+                "index expression",
+            )?;
+            expr::infer_expr(e.as_ref(), ctx, params, TypeGoal::NONE)?;
+            check_index_expr_kind(
+                e.as_ref(),
+                snapshot,
+                "index expressions",
+                "index expression",
+            )?;
             arbiter.exprs.push(e.clone());
         }
         let mut collation = None;
@@ -2098,9 +2119,9 @@ fn transform_on_conflict_arbiter(
         }
     }
     if let w @ Some(_) = &infer.where_clause {
-        check_index_expr_kind(w, snapshot, "index predicates", "index predicate")?;
-        expr::infer_expr(w, ctx, params, TypeGoal::NONE)?;
-        check_index_expr_kind(w, snapshot, "index predicates", "index predicate")?;
+        check_index_expr_kind(w.as_ref(), snapshot, "index predicates", "index predicate")?;
+        expr::infer_expr(w.as_ref(), ctx, params, TypeGoal::NONE)?;
+        check_index_expr_kind(w.as_ref(), snapshot, "index predicates", "index predicate")?;
         arbiter.where_clause = w.clone();
     }
     if !infer.conname.is_empty() {
@@ -2134,14 +2155,14 @@ fn transform_on_conflict_arbiter(
 /// (transformSubLink, 0A000), aggregates and window functions, and
 /// set-returning functions.
 fn check_index_expr_kind(
-    e: &Option<ast::Node>,
+    e: Option<&ast::Node>,
     snapshot: &PgCatalog,
     kind: &str,
     subquery_context: &str,
 ) -> Result<(), AnalyzeError> {
     let mut has_sublink = false;
     visit_same_level(e, &mut |n| {
-        has_sublink |= matches!(n.as_ref(), Some(ast::Node::SubLink(_)));
+        has_sublink |= matches!(n, Some(ast::Node::SubLink(_)));
     });
     if has_sublink {
         return Err(crate::error::RawError::new(
@@ -2308,12 +2329,12 @@ fn analyze_update_here(
     if let where_clause @ Some(_) = &upd.where_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
-            where_clause,
+            where_clause.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Where,
         )?;
-        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
+        check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
         // The FROM entries keep what WHERE saw. The target's new row keeps
         // it only in the columns nothing rewrites: not SET, not generated
         // (recomputed), with no BEFORE ROW trigger, rule or row movement
@@ -2328,7 +2349,7 @@ fn analyze_update_here(
         let old_as_is = rows_returned_as_is(snapshot, table_oid);
         let (facts, all) = where_facts(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
-            where_clause,
+            where_clause.as_ref(),
             &log,
             alias,
             &mut rows,
@@ -2354,7 +2375,7 @@ fn analyze_update_here(
         &[DmlEvent::Update],
     );
     super::returning::type_returning_params(
-        &upd.returning_clause,
+        upd.returning_clause.as_deref(),
         alias,
         expr::Ctx::new(&ret_scope, &null_ctx, snapshot),
         params,
@@ -2373,7 +2394,7 @@ fn analyze_update_here(
     // The old row is a stored row past WHERE; the new one, with no BEFORE
     // ROW trigger or row movement, that row with the SET values (computed
     // from the old row) and the generated columns recomputed.
-    if has_returning(&upd.returning_clause)
+    if has_returning(upd.returning_clause.as_deref())
         && let Some(wt) = WriteTarget::resolve(snapshot, table_oid)
     {
         let old_k = old_row_knowledge(&wt, old_facts.as_ref(), alias);
@@ -2412,7 +2433,7 @@ fn analyze_update_here(
     }
 
     let columns = resolve_returning(
-        &upd.returning_clause,
+        upd.returning_clause.as_deref(),
         alias,
         rows,
         expr::Ctx::new(&ret_scope, &null_ctx, snapshot),
@@ -2423,7 +2444,7 @@ fn analyze_update_here(
         set_list_assigns(&set_list),
         Overriding::NotSet,
     );
-    rw.returning = has_returning(&upd.returning_clause);
+    rw.returning = has_returning(upd.returning_clause.as_deref());
     check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
 }
@@ -2560,18 +2581,18 @@ fn analyze_delete_here(
     if let where_clause @ Some(_) = &del.where_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
-            where_clause,
+            where_clause.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
             params,
             crate::clause::ClauseKind::Where,
         )?;
-        check_no_srf_in_clause(where_clause, snapshot, "WHERE")?;
+        check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
         // RETURNING reads the deleted row as WHERE saw it, unless a rule
         // rewrites the statement or the target is a view.
         let keeps = rows_returned_as_is(snapshot, table_oid);
         let (facts, all) = where_facts(
             expr::Ctx::new(&scope, &null_ctx, snapshot),
-            where_clause,
+            where_clause.as_ref(),
             &log,
             alias,
             &mut rows,
@@ -2583,7 +2604,7 @@ fn analyze_delete_here(
     }
     // A deleted row is a stored row past WHERE: its CHECK constraints and
     // generated columns hold too.
-    if has_returning(&del.returning_clause)
+    if has_returning(del.returning_clause.as_deref())
         && let Some(wt) = WriteTarget::resolve(snapshot, table_oid)
     {
         let old_nn = wt.row_not_null(snapshot, &old_row_knowledge(&wt, old_facts.as_ref(), alias));
@@ -2591,7 +2612,7 @@ fn analyze_delete_here(
         rows.old_proven.extend(old_nn);
     }
     // A DO INSTEAD rule (or an INSTEAD OF trigger) returns rows of its own.
-    if has_returning(&del.returning_clause)
+    if has_returning(del.returning_clause.as_deref())
         && returning_rewritten(snapshot, table_oid, &[DmlEvent::Delete])
         && let Some(target) = scope.sources.iter_mut().find(|s| s.alias == alias)
     {
@@ -2601,14 +2622,14 @@ fn analyze_delete_here(
     }
 
     let columns = resolve_returning(
-        &del.returning_clause,
+        del.returning_clause.as_deref(),
         alias,
         rows,
         expr::Ctx::new(&scope, &null_ctx, snapshot),
         params,
     )?;
     let mut rw = Rewrite::single(DmlEvent::Delete, Vec::new(), Overriding::NotSet);
-    rw.returning = has_returning(&del.returning_clause);
+    rw.returning = has_returning(del.returning_clause.as_deref());
     check_rewrite(snapshot, table_oid, &rw)?;
     Ok((columns, None))
 }
@@ -2779,7 +2800,7 @@ pub(crate) fn take_written_relation(relid: crate::oid::PgClassOid) -> Option<Vec
 /// hold of the old row.
 fn where_facts(
     ctx: expr::Ctx<'_>,
-    where_clause: &Option<ast::Node>,
+    where_clause: Option<&ast::Node>,
     log: &crate::nonnull::StrictLog,
     target_alias: &str,
     rows: &mut ReturningRows,

@@ -81,7 +81,7 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
             object @ Some(_) => crate::ddl::opclass::rename_or_move_am_object(
                 interp,
                 rename_type == ObjectType::ObjectOpclass,
-                object,
+                object.as_ref(),
                 Some(&stmt.newname),
                 None,
             ),
@@ -532,7 +532,7 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
             crate::ddl::types::set_type_schema(interp, stmt, &new_schema)
         }
-        ObjectType::ObjectExtension => match node_string(&stmt.object) {
+        ObjectType::ObjectExtension => match node_string(stmt.object.as_ref()) {
             Some(name) => {
                 let name = name.to_owned();
                 crate::ddl::extensions::set_extension_schema(interp, &name, &new_schema)
@@ -557,7 +557,7 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
             if stmt.object.is_none() {
                 return Ok(());
             }
-            let Some(oid) = crate::ddl::drop::lookup_operator(interp, &stmt.object)? else {
+            let Some(oid) = crate::ddl::drop::lookup_operator(interp, stmt.object.as_ref())? else {
                 return Ok(());
             };
             let Some(op) = interp.pg_operator.get(&oid).cloned() else {
@@ -587,7 +587,7 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
             object @ Some(_) => crate::ddl::opclass::rename_or_move_am_object(
                 interp,
                 object_type == ObjectType::ObjectOpclass,
-                object,
+                object.as_ref(),
                 None,
                 Some(&new_schema),
             ),
@@ -792,15 +792,19 @@ fn set_relation_schema(
 
 /// Extract `(schema_opt, name, arg_oids)` from an `ObjectWithArgs` target.
 pub(crate) fn extract_func_target(
-    object: &Option<typedpg_pg_query::ast::Node>,
+    object: Option<&typedpg_pg_query::ast::Node>,
     interp: &PgCatalog,
 ) -> Option<(Option<String>, String, Vec<PgTypeOid>)> {
-    let owa = match object.as_ref()? {
+    let owa = match object? {
         ast::Node::ObjectWithArgs(owa) => owa,
         _ => return None,
     };
 
-    let parts: Vec<&str> = owa.objname.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = owa
+        .objname
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     let (schema, name) = match parts.as_slice() {
         [s, n] => (Some((*s).to_owned()), (*n).to_owned()),
         [n] => (None, (*n).to_owned()),

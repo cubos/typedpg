@@ -39,7 +39,7 @@ impl CheckDef {
             && let StoredExpr::Written(expr) = &self.expr
         {
             self.trusted = Some(
-                crate::ddl::volatile::trusted_over_relation(interp, relid, expr)
+                crate::ddl::volatile::trusted_over_relation(interp, relid, (**expr).as_ref())
                     .unwrap_or_default(),
             );
         }
@@ -76,8 +76,8 @@ pub(crate) enum StoredExpr {
 }
 
 impl StoredExpr {
-    pub(crate) fn written(expr: &Option<typedpg_pg_query::ast::Node>) -> Self {
-        StoredExpr::Written(Box::new(expr.clone()))
+    pub(crate) fn written(expr: Option<&typedpg_pg_query::ast::Node>) -> Self {
+        StoredExpr::Written(Box::new(expr.cloned()))
     }
 }
 
@@ -112,8 +112,8 @@ pub(crate) fn recook_checks_reading(interp: &mut PgCatalog, relid: PgClassOid, a
         let StoredExpr::Written(expr) = &def.expr else {
             continue;
         };
-        let now =
-            crate::ddl::volatile::trusted_over_relation(interp, relid, expr).unwrap_or_default();
+        let now = crate::ddl::volatile::trusted_over_relation(interp, relid, (**expr).as_ref())
+            .unwrap_or_default();
         def.trusted = Some(match def.trusted.take() {
             Some(before) => crate::nonnull::TrustedNodes {
                 nodes: before.nodes.intersection(&now.nodes).copied().collect(),
@@ -334,7 +334,7 @@ pub(super) fn add_check(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     name: &str,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     no_inherit: bool,
     rec: super::inherit::Recursion,
     conkey: Vec<i16>,

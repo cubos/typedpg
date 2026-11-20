@@ -25,7 +25,10 @@ pub(crate) struct StatisticsObject {
 const MAX_DIMENSIONS: usize = 8;
 
 fn split(names: &[Option<typedpg_pg_query::ast::Node>]) -> (Option<String>, String) {
-    let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = names
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     match parts.as_slice() {
         [schema, name] => (Some((*schema).to_owned()), (*name).to_owned()),
         [.., name] => (None, (*name).to_owned()),
@@ -53,7 +56,10 @@ pub(crate) fn not_found(
     interp: &PgCatalog,
     names: &[Option<typedpg_pg_query::ast::Node>],
 ) -> DdlError {
-    let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = names
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     if let [schema, _] = parts.as_slice()
         && interp.namespace_oid(schema).is_none()
     {
@@ -151,7 +157,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
     };
     // The expressions and the types they produce (find_composite_type_
     // dependencies' view of them).
-    let mut raw_exprs: Vec<&Option<typedpg_pg_query::ast::Node>> = Vec::new();
+    let mut raw_exprs: Vec<Option<&typedpg_pg_query::ast::Node>> = Vec::new();
     let mut expr_results: Vec<crate::oid::PgTypeOid> = Vec::new();
     for elem in &stmt.exprs {
         let Some(ast::Node::StatsElem(se)) = elem.as_ref() else {
@@ -162,7 +168,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
         let column = if !se.name.is_empty() {
             Some(se.name.as_str())
         } else {
-            parenthesized_column(interp, relid, &se.expr)
+            parenthesized_column(interp, relid, se.expr.as_ref())
         };
         if let Some(column) = column {
             if SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == column) {
@@ -195,7 +201,8 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             });
         } else if se.expr.is_some() {
             let expr = &se.expr;
-            let typ = match super::volatile::infer_over_relation(interp, relid, expr, None) {
+            let typ = match super::volatile::infer_over_relation(interp, relid, expr.as_ref(), None)
+            {
                 Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
                 Some(Ok(t)) => Some(t),
                 None => None,
@@ -220,7 +227,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                         {
                             cr.fields
                                 .last()
-                                .and_then(node_string)
+                                .and_then(|n| node_string(n.as_ref()))
                                 .map(|c| (c, cr.fields.len() == 1))
                         }
                         typedpg_pg_query::NodeRef::AIndirection(ind) => {
@@ -249,7 +256,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             // record's typmod is valid only in the session that built it).
             if let Some(t) = typ.as_ref()
                 && (t.type_oid != crate::pg_catalog::oid::UNKNOWN
-                    || super::indexes::certainly_unknown(expr, t))
+                    || super::indexes::certainly_unknown(expr.as_ref(), t))
             {
                 super::tables::check_expression_type(interp, t.type_oid)?;
                 // ... and, of a collatable type, with a collation.
@@ -270,7 +277,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             // columns: a single expression gets the regular statistics.
             if stmt.exprs.len() > 1
                 && let Some(t) = typ.as_ref()
-                && (super::indexes::certainly_unknown(expr, t)
+                && (super::indexes::certainly_unknown(expr.as_ref(), t)
                     || (t.type_oid != crate::pg_catalog::oid::UNKNOWN
                         && !crate::clause::has_ordering_operator(interp, t.type_oid)))
             {
@@ -280,8 +287,10 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                     super::util::format_type_for_message(interp, t.type_oid)
                 )));
             }
-            exprs.push(super::tables::check_inherit::StoredExpr::written(expr));
-            raw_exprs.push(expr);
+            exprs.push(super::tables::check_inherit::StoredExpr::written(
+                expr.as_ref(),
+            ));
+            raw_exprs.push(expr.as_ref());
             expr_results.extend(
                 typ.as_ref()
                     .map(|t| t.type_oid)
@@ -296,7 +305,11 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
         )));
     }
     // Statistic kinds.
-    for kind in stmt.stat_types.iter().filter_map(node_string) {
+    for kind in stmt
+        .stat_types
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+    {
         if !matches!(kind, "ndistinct" | "dependencies" | "mcv") {
             return Err(DdlError::Parse(format!(
                 "unrecognized statistics kind \"{kind}\""
@@ -342,7 +355,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
     let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
     let refs: Vec<super::depend::Reference> = raw_exprs
         .iter()
-        .flat_map(|e| super::depend::expression_references(interp, e, Some(relid)))
+        .flat_map(|e| super::depend::expression_references(interp, *e, Some(relid)))
         .collect();
     let refers = super::depend::type_references(&refs);
     super::depend::note_expr_type_use(
@@ -397,9 +410,9 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
 fn parenthesized_column<'a>(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &'a Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&'a typedpg_pg_query::ast::Node>,
 ) -> Option<&'a str> {
-    let cr = match expr.as_ref()? {
+    let cr = match expr? {
         ast::Node::ColumnRef(cr) => cr,
         // `((t).a)`: the field selection is the Var of `a`.
         ast::Node::AIndirection(ind) if ind.indirection.len() == 1 => {
@@ -412,7 +425,11 @@ fn parenthesized_column<'a>(
         }
         _ => return None,
     };
-    let fields: Vec<&str> = cr.fields.iter().map(node_string).collect::<Option<_>>()?;
+    let fields: Vec<&str> = cr
+        .fields
+        .iter()
+        .map(|n| node_string(n.as_ref()))
+        .collect::<Option<_>>()?;
     let (&last, qualifiers) = fields.split_last()?;
     if interp.attribute_by_name(relid, last).is_some()
         || SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == last)
@@ -434,14 +451,14 @@ fn whole_row_field<'a>(
     relid: PgClassOid,
     ind: &'a typedpg_pg_query::ast::AIndirection,
 ) -> Option<(&'a typedpg_pg_query::ast::ColumnRef, &'a str)> {
-    let field = node_string(ind.indirection.first()?)?;
+    let field = node_string(ind.indirection.first()?.as_ref())?;
     let Some(ast::Node::ColumnRef(cr)) = ind.arg.as_ref() else {
         return None;
     };
     let [name] = cr.fields.as_slice() else {
         return None;
     };
-    let name = node_string(name)?;
+    let name = node_string(name.as_ref())?;
     let relname = interp.pg_class.get(&relid).map(|c| c.relname.as_str());
     (Some(name) == relname && interp.attribute_by_name(relid, name).is_none())
         .then_some((cr, field))
@@ -493,10 +510,10 @@ pub fn alter_statistics(interp: &PgCatalog, stmt: &AlterStatsStmt) -> Result<(),
 /// `DROP STATISTICS [IF EXISTS] name`.
 pub(crate) fn drop_statistics(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(ast::Node::List(l)) = obj_node.as_ref() else {
+    let Some(ast::Node::List(l)) = obj_node else {
         return Ok(());
     };
     match find(interp, &l.items) {

@@ -209,7 +209,7 @@ pub(crate) fn cook_generation_expr(
     attname: &str,
     atttypid: PgTypeOid,
     kind: AttGenerated,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<CookedGeneration, DdlError> {
     use crate::ddl::expr_kind::{ExprKind, check_expr_kind};
     use crate::ddl::volatile::{ExprLocation, check_mutability, infer_over_relation};
@@ -240,7 +240,11 @@ pub(crate) fn cook_generation_expr(
     // selected from the whole row.
     let names = column_refs
         .iter()
-        .filter_map(|cr| cr.fields.last().and_then(crate::ddl::util::node_string))
+        .filter_map(|cr| {
+            cr.fields
+                .last()
+                .and_then(|n| crate::ddl::util::node_string(n.as_ref()))
+        })
         .chain(selections.iter().map(|&(_, field)| field));
     for name in names {
         if name != "tableoid"
@@ -284,7 +288,7 @@ pub(crate) fn cook_generation_expr(
         let whole_row = selected(cr).is_none()
             && match cr.fields.as_slice() {
                 [.., last] if matches!(last.as_ref(), Some(ast::Node::AStar(_))) => true,
-                [only] => crate::ddl::util::node_string(only)
+                [only] => crate::ddl::util::node_string(only.as_ref())
                     .is_some_and(|n| n == relname && interp.attribute_by_name(relid, n).is_none()),
                 _ => false,
             };
@@ -296,9 +300,11 @@ pub(crate) fn cook_generation_expr(
             ));
         }
         // `(t).a` reads the column `a`.
-        let Some(name) =
-            selected(cr).or_else(|| cr.fields.last().and_then(crate::ddl::util::node_string))
-        else {
+        let Some(name) = selected(cr).or_else(|| {
+            cr.fields
+                .last()
+                .and_then(|n| crate::ddl::util::node_string(n.as_ref()))
+        }) else {
             continue;
         };
         let Some(attr) = interp.attribute_by_name(relid, name) else {
@@ -375,7 +381,7 @@ pub(crate) fn cook_generation_expr(
 fn infer_with_goal(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     goal: crate::expr::TypeGoal,
 ) -> Result<crate::expr::ExprType, crate::error::AnalyzeError> {
     use crate::nullability::NullabilityContext;
@@ -415,7 +421,7 @@ fn infer_with_goal(
 fn check_virtual_generated_security(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     used: &[crate::oid::PgProcOid],
     result: &crate::expr::ExprType,
 ) -> Result<(), DdlError> {
@@ -431,14 +437,14 @@ fn check_virtual_generated_security(
         used.iter()
             .filter_map(|f| interp.pg_proc.get(f).map(|p| p.prorettype)),
     );
-    if let Some(inner) = expr.as_ref() {
+    if let Some(inner) = expr {
         for (n, ..) in inner.nodes() {
             match n {
                 typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                     if let Some(attr) = cr
                         .fields
                         .last()
-                        .and_then(crate::ddl::util::node_string)
+                        .and_then(|n| crate::ddl::util::node_string(n.as_ref()))
                         .and_then(|name| interp.attribute_by_name(relid, name))
                     {
                         types.push(attr.atttypid);
@@ -517,13 +523,13 @@ pub(crate) fn generation_not_null(
     scope.sources.push(TableSource::derived(&relname, columns));
     let null_ctx = NullabilityContext::default();
     let mut params = ParamCollector::default();
-    let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
+    let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, (**expr).as_ref());
     // Analyzed on a level of its own, and without noting what it refers
     // to as a dependency of the statement being analyzed.
     let (inferred, _) = crate::ddl::depend::collect(|| {
         let _level = crate::resolve::QueryLevel::enter();
         crate::expr::infer_expr(
-            &expr,
+            expr.as_ref(),
             crate::expr::Ctx::new(&scope, &null_ctx, interp),
             &mut params,
             crate::expr::TypeGoal::assignment(attr.atttypid)

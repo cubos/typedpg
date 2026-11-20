@@ -144,7 +144,10 @@ fn am_must_exist(interp: &PgCatalog, amname: &str) -> Result<(), DdlError> {
 
 /// `(schema, name)` of a possibly qualified name list.
 fn split_name(names: &[Option<typedpg_pg_query::ast::Node>]) -> (Option<String>, String) {
-    let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = names
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     match parts.as_slice() {
         [schema, name] => (Some((*schema).to_owned()), (*name).to_owned()),
         [.., name] => (None, (*name).to_owned()),
@@ -550,7 +553,7 @@ fn family_operator(
     } else {
         // LookupOperWithArgs; then assignOperTypes: a binary one.
         let wrapped = Some(typedpg_pg_query::ast::Node::ObjectWithArgs(owa.clone()));
-        let Some(opr) = super::drop::lookup_operator(interp, &wrapped)? else {
+        let Some(opr) = super::drop::lookup_operator(interp, wrapped.as_ref())? else {
             return Ok(None);
         };
         let Some(op) = interp.pg_operator.get(&opr) else {
@@ -638,7 +641,7 @@ fn family_operators(
 fn written(names: &[Option<typedpg_pg_query::ast::Node>]) -> String {
     names
         .iter()
-        .filter_map(node_string)
+        .filter_map(|n| node_string(n.as_ref()))
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -803,7 +806,7 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
 pub(crate) fn drop_am_object(
     interp: &mut PgCatalog,
     objtype: typedpg_pg_query::ast::ObjectType,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -858,17 +861,17 @@ pub(crate) fn drop_am_object(
 fn resolve_am_object(
     interp: &PgCatalog,
     is_class: bool,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<Option<super::depend::NamedObject>, DdlError> {
     use super::depend::NamedObject;
-    let Some(ast::Node::List(l)) = obj_node.as_ref() else {
+    let Some(ast::Node::List(l)) = obj_node else {
         return Ok(None);
     };
     let Some((am, names)) = l.items.split_first() else {
         return Ok(None);
     };
-    let am = node_string(am).unwrap_or_default().to_owned();
+    let am = node_string(am.as_ref()).unwrap_or_default().to_owned();
     am_must_exist(interp, &am)?;
     let (schema, name) = split_name(names);
     if let Some(schema) = schema.as_deref()
@@ -915,7 +918,7 @@ fn resolve_am_object(
 pub(crate) fn rename_or_move_am_object(
     interp: &mut PgCatalog,
     is_class: bool,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     new_name: Option<&str>,
     new_schema: Option<&str>,
 ) -> Result<(), DdlError> {

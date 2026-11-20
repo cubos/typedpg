@@ -18,11 +18,16 @@ pub(crate) fn branch_column_span(
     }
     if let Some(row) = node.values_lists.first() {
         return match row.as_ref()? {
-            ast::Node::List(l) => l.items.get(i).and_then(crate::error::expr_span),
+            ast::Node::List(l) => l
+                .items
+                .get(i)
+                .and_then(|n| crate::error::expr_span(n.as_ref())),
             _ => None,
         };
     }
-    node.target_list.get(i).and_then(crate::error::expr_span)
+    node.target_list
+        .get(i)
+        .and_then(|n| crate::error::expr_span(n.as_ref()))
 }
 
 pub(crate) fn analyze_set_operation(
@@ -116,7 +121,7 @@ pub(crate) fn analyze_set_operation(
             // and its coercion then fails with 42P08
             // (`expr::note_untyped_output_params`).
             if let Some(ast::Node::ResTarget(rt)) = target.as_ref()
-                && let Some(p) = expr::bare_param(&rt.val, snapshot)
+                && let Some(p) = expr::bare_param(rt.val.as_ref(), snapshot)
                 && (own_cols.get(i).is_some_and(|c| c.type_oid == oid::UNKNOWN)
                     || params.is_untyped_output(p.location))
                 && let Some(peer) = peer_cols.get(i)
@@ -343,7 +348,7 @@ fn set_operation_sort_and_limit(
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "ORDER BY",
                     ord,
-                    crate::error::node_location(&sb.node)
+                    crate::error::node_location(sb.node.as_ref())
                         .and_then(crate::error::SourceSpan::from_node_token),
                 )
                 .finalize_implicit());
@@ -353,7 +358,7 @@ fn set_operation_sort_and_limit(
                     snapshot,
                     columns[ord as usize - 1].type_oid,
                     crate::clause::KeyUse::Sort,
-                    crate::error::node_location(&sb.node),
+                    crate::error::node_location(sb.node.as_ref()),
                 )?;
             }
             continue;
@@ -385,7 +390,7 @@ fn set_operation_sort_and_limit(
             }
         }
         expr::infer_expr(
-            &sb.node,
+            sb.node.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             TypeGoal::NONE,
@@ -397,7 +402,7 @@ fn set_operation_sort_and_limit(
                 AnalyzeError::FeatureNotSupported(
                     "invalid UNION/INTERSECT/EXCEPT ORDER BY clause".into(),
                 ),
-                crate::error::node_location(&sb.node)
+                crate::error::node_location(sb.node.as_ref())
                     .and_then(crate::error::SourceSpan::from_node_token),
                 Some(
                     "Add the expression/function to every SELECT, or move the UNION into a \
@@ -492,10 +497,10 @@ pub(crate) fn check_set_op_member_locking(arm: &ast::SelectStmt) -> Result<(), A
 /// [`level_srf_calls`]) — exactly one row — or a VALUES list with a
 /// `(NULL)` row.
 fn always_yields_null(arm: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
-    fn is_null_constant(n: &Option<ast::Node>) -> bool {
-        match n.as_ref() {
+    fn is_null_constant(n: Option<&ast::Node>) -> bool {
+        match n {
             Some(ast::Node::AConst(c)) => c.isnull,
-            Some(ast::Node::TypeCast(c)) => is_null_constant(&c.arg),
+            Some(ast::Node::TypeCast(c)) => is_null_constant(c.arg.as_ref()),
             _ => false,
         }
     }
@@ -512,7 +517,9 @@ fn always_yields_null(arm: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
     }
     if !arm.values_lists.is_empty() {
         return arm.values_lists.iter().any(|row| match row.as_ref() {
-            Some(ast::Node::List(l)) => matches!(l.items.as_slice(), [v] if is_null_constant(v)),
+            Some(ast::Node::List(l)) => {
+                matches!(l.items.as_slice(), [v] if is_null_constant(v.as_ref()))
+            }
             _ => false,
         });
     }
@@ -521,7 +528,7 @@ fn always_yields_null(arm: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
             arm.target_list.as_slice(),
             [t] if matches!(
                 t.as_ref(),
-                Some(ast::Node::ResTarget(rt)) if is_null_constant(&rt.val)
+                Some(ast::Node::ResTarget(rt)) if is_null_constant(rt.val.as_ref())
             )
         )
 }

@@ -266,7 +266,7 @@ fn bypasses(stmt: &ast::Node) -> bool {
             let name: Vec<&str> = fc
                 .funcname
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect();
             let set_config = matches!(
                 name.as_slice(),

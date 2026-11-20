@@ -580,8 +580,8 @@ fn check_no_parameters(query: &ast::Node) -> Result<(), DdlError> {
 
 /// Whether a CTE of the query's WITH is an INSERT / UPDATE / DELETE /
 /// MERGE (`hasModifyingCTE`).
-pub(crate) fn has_modifying_cte(query: &Option<ast::Node>) -> bool {
-    query.as_ref().is_some_and(modifying_cte)
+pub(crate) fn has_modifying_cte(query: Option<&ast::Node>) -> bool {
+    query.is_some_and(modifying_cte)
 }
 
 /// [`has_modifying_cte`] of a present query.
@@ -1120,7 +1120,7 @@ fn resolve_view_with_params(
 pub(crate) fn serialize_subnode(
     snapshot: &PgCatalog,
     sql: &str,
-    pick: impl Fn(&Option<ast::Node>) -> Option<&ast::Node>,
+    pick: impl Fn(Option<&ast::Node>) -> Option<&ast::Node>,
 ) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
     crate::stack::with_stack(|| serialize_subnode_here(snapshot, sql, pick))
 }
@@ -1129,7 +1129,7 @@ pub(crate) fn serialize_subnode(
 fn serialize_subnode_here(
     snapshot: &PgCatalog,
     sql: &str,
-    pick: impl Fn(&Option<ast::Node>) -> Option<&ast::Node>,
+    pick: impl Fn(Option<&ast::Node>) -> Option<&ast::Node>,
 ) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
     let parsed = typedpg_pg_query::parse(sql)
         .map_err(|e| super::DdlError::Parse(format!("failed to parse `{sql}`: {e}")))?;
@@ -1139,7 +1139,7 @@ fn serialize_subnode_here(
         .first()
         .map(|s| &s.stmt)
         .ok_or_else(|| super::DdlError::Parse(format!("`{sql}` produced no statement")))?;
-    let target = pick(stmt)
+    let target = pick(stmt.as_ref())
         .ok_or_else(|| super::DdlError::Parse(format!("`{sql}` has no expression to extract")))?;
     let mut walker = BindingWalker::default();
     walker.walk(target, snapshot);
@@ -1153,8 +1153,8 @@ fn serialize_subnode_here(
 /// in `SELECT <expr>`. Returns `None` if the input wasn't a `SelectStmt`
 /// or has no targets.
 #[cfg(any(test, feature = "internal"))]
-pub(crate) fn extract_first_target(stmt: &Option<ast::Node>) -> Option<&ast::Node> {
-    let ast::Node::SelectStmt(sel) = stmt.as_ref()? else {
+pub(crate) fn extract_first_target(stmt: Option<&ast::Node>) -> Option<&ast::Node> {
+    let ast::Node::SelectStmt(sel) = stmt? else {
         return None;
     };
     let target = sel.target_list.first()?;
@@ -1167,8 +1167,8 @@ pub(crate) fn extract_first_target(stmt: &Option<ast::Node>) -> Option<&ast::Nod
 /// `pick` for `serialize_predicate`: extracts the WHERE clause of
 /// `SELECT 1 WHERE <pred>`. Returns `None` if there is no WHERE.
 #[cfg(any(test, feature = "internal"))]
-pub(crate) fn extract_where(stmt: &Option<ast::Node>) -> Option<&ast::Node> {
-    let ast::Node::SelectStmt(sel) = stmt.as_ref()? else {
+pub(crate) fn extract_where(stmt: Option<&ast::Node>) -> Option<&ast::Node> {
+    let ast::Node::SelectStmt(sel) = stmt? else {
         return None;
     };
     sel.where_clause.as_ref()
@@ -2054,13 +2054,13 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &ast::Node) -> ViewUp
         let Some(val) = rt.val.as_ref() else {
             continue;
         };
-        let found = crate::expr::detect_func_kinds(&rt.val, interp);
+        let found = crate::expr::detect_func_kinds(rt.val.as_ref(), interp);
         kinds.has_aggregate |= found.has_aggregate;
         kinds.has_window |= found.has_window;
         srf |= returns_set(interp, val);
     }
     for sort in &sel.sort_clause {
-        let found = crate::expr::detect_func_kinds(sort, interp);
+        let found = crate::expr::detect_func_kinds(sort.as_ref(), interp);
         kinds.has_aggregate |= found.has_aggregate;
         kinds.has_window |= found.has_window;
     }
@@ -2134,7 +2134,7 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &ast::Node) -> ViewUp
         let parts: Vec<&str> = cr
             .fields
             .iter()
-            .filter_map(super::util::node_string)
+            .filter_map(|n| super::util::node_string(n.as_ref()))
             .collect();
         let star = matches!(
             cr.fields.last().and_then(|f| f.as_ref()),
@@ -2166,7 +2166,7 @@ fn returns_set(interp: &PgCatalog, node: &ast::Node) -> bool {
             let parts: Vec<&str> = fc
                 .funcname
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect();
             let (schema, name) = match parts.as_slice() {
                 [name] => (None, *name),

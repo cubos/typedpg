@@ -47,7 +47,7 @@ fn clause_function(
 ) -> Result<Option<PgProcOid>, DdlError> {
     let parts: Vec<String> = names
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .map(str::to_owned)
         .collect();
     if parts.is_empty() {
@@ -111,7 +111,7 @@ pub fn create_language(interp: &mut PgCatalog, stmt: &CreatePLangStmt) -> Result
 /// routines written in it need CASCADE.
 pub(crate) fn drop_language(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -150,7 +150,7 @@ pub(crate) fn rename_language(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = super::util::node_string(&stmt.object).map(str::to_owned) else {
+    let Some(old) = super::util::node_string(stmt.object.as_ref()).map(str::to_owned) else {
         return Ok(());
     };
     let oid = check(interp, &old)?;
@@ -204,17 +204,17 @@ pub(crate) fn transform_exists(interp: &PgCatalog, typeid: PgTypeOid, language: 
 /// LANGUAGE lang` (a `[TypeName, lang]` list). Returns where it is.
 pub(crate) fn find_transform(
     interp: &PgCatalog,
-    object: &Option<typedpg_pg_query::ast::Node>,
+    object: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<Option<usize>, DdlError> {
     use typedpg_pg_query::ast;
-    let Some(ast::Node::List(l)) = object.as_ref() else {
+    let Some(ast::Node::List(l)) = object else {
         return Ok(None);
     };
     let [typ, lang] = l.items.as_slice() else {
         return Ok(None);
     };
     let (Some(ast::Node::TypeName(tn)), Some(lang)) =
-        (typ.as_ref(), super::util::node_string(lang))
+        (typ.as_ref(), super::util::node_string(lang.as_ref()))
     else {
         return Ok(None);
     };
@@ -236,7 +236,7 @@ pub(crate) fn find_transform(
 /// DROP TRANSFORM [IF EXISTS] FOR type LANGUAGE lang.
 pub(crate) fn drop_transform(
     interp: &mut PgCatalog,
-    object: &Option<typedpg_pg_query::ast::Node>,
+    object: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     match find_transform(interp, object) {

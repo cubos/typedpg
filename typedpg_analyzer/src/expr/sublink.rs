@@ -111,9 +111,9 @@ pub(crate) fn infer_sublink(
                 // `operator does not exist: integer = text`. The LHS lives in
                 // `testexpr` and is *only* reachable through this SubLink, so we
                 // must walk it here — that also pins LHS params/columns.
-                let lhs_nodes: Vec<&Option<ast::Node>> = match &lhs_row {
-                    Some(r) => r.iter().collect(),
-                    None => std::iter::once(&sub.testexpr)
+                let lhs_nodes: Vec<Option<&ast::Node>> = match &lhs_row {
+                    Some(r) => r.iter().map(Option::as_ref).collect(),
+                    None => std::iter::once(sub.testexpr.as_ref())
                         .filter(|t| t.is_some())
                         .collect(),
                 };
@@ -149,7 +149,7 @@ pub(crate) fn infer_sublink(
                 let mut subquery_nullable = false;
                 let mut ops = Vec::with_capacity(lhs_nodes.len());
                 for (lhs_node, col) in lhs_nodes.iter().zip(cols.iter()) {
-                    let lhs = infer_expr(lhs_node, ctx, params, TypeGoal::NONE)?;
+                    let lhs = infer_expr(*lhs_node, ctx, params, TypeGoal::NONE)?;
                     let l_oid = lhs.type_oid;
                     let r_oid = col.type_oid;
                     result_nullable |= lhs.nullable || col.nullable;
@@ -194,7 +194,7 @@ pub(crate) fn infer_sublink(
                     if l_oid == oid::UNKNOWN {
                         if r_oid != oid::UNKNOWN {
                             coerce_unknown_to(
-                                lhs_node,
+                                *lhs_node,
                                 ctx,
                                 params,
                                 snapshot.unwrap_domain(r_oid),

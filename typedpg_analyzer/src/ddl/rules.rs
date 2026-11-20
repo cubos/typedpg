@@ -122,8 +122,8 @@ fn define_rule(
     // In the WHERE condition the missing one is an invisible range entry
     // (errorMissingRTE); in an action, transformRuleStmt names the event.
     let pseudo_refs =
-        |n: &Option<typedpg_pg_query::ast::Node>, in_qual: bool| -> Result<(), DdlError> {
-            let Some(inner) = n.as_ref() else {
+        |n: Option<&typedpg_pg_query::ast::Node>, in_qual: bool| -> Result<(), DdlError> {
+            let Some(inner) = n else {
                 return Ok(());
             };
             for (node, ..) in inner.nodes() {
@@ -133,7 +133,11 @@ fn define_rule(
                 if cr.fields.len() < 2 {
                     continue;
                 }
-                let missing = match cr.fields.first().and_then(super::util::node_string) {
+                let missing = match cr
+                    .fields
+                    .first()
+                    .and_then(|n| super::util::node_string(n.as_ref()))
+                {
                     Some("old") if !has_old => ("old", "ON INSERT rule cannot use OLD"),
                     Some("new") if !has_new => ("new", "ON DELETE rule cannot use NEW"),
                     _ => continue,
@@ -153,9 +157,10 @@ fn define_rule(
         };
     if stmt.where_clause.is_some() {
         let qual = &stmt.where_clause;
-        pseudo_refs(qual, true)?;
-        let (checked, refs) =
-            super::depend::collect(|| check_rule_qual(interp, relid, qual, has_old, has_new));
+        pseudo_refs(qual.as_ref(), true)?;
+        let (checked, refs) = super::depend::collect(|| {
+            check_rule_qual(interp, relid, qual.as_ref(), has_old, has_new)
+        });
         checked?;
         references.extend(refs);
     }
@@ -164,12 +169,12 @@ fn define_rule(
     // Each action's output columns, when the analysis could tell them.
     let mut outputs = Vec::new();
     for action in &stmt.actions {
-        pseudo_refs(action, false)?;
-        check_action_relations(interp, action)?;
+        pseudo_refs(action.as_ref(), false)?;
+        check_action_relations(interp, action.as_ref())?;
         let ((checked, refs), rewrites) = crate::resolve::rewrite::collect_rule_actions(|| {
             super::depend::collect(|| {
                 crate::resolve::without_execution(|| {
-                    check_action_query(interp, relid, action, has_old, has_new)
+                    check_action_query(interp, relid, action.as_ref(), has_old, has_new)
                 })
             })
         });
@@ -186,7 +191,13 @@ fn define_rule(
                     .into(),
             ));
         }
-        plan_errors.extend(action_plan_error(interp, relid, action, has_old, has_new));
+        plan_errors.extend(action_plan_error(
+            interp,
+            relid,
+            action.as_ref(),
+            has_old,
+            has_new,
+        ));
     }
     define_query_rewrite(interp, relid, stmt, event, &outputs)?;
     if event == CmdType::CmdSelect {
@@ -349,7 +360,7 @@ fn define_query_rewrite(
     }
     let mut have_returning = false;
     for (action, output) in stmt.actions.iter().zip(outputs) {
-        if !has_returning(action) {
+        if !has_returning(action.as_ref()) {
             continue;
         }
         if have_returning {
@@ -375,8 +386,8 @@ fn define_query_rewrite(
 }
 
 /// The action has a RETURNING list.
-fn has_returning(action: &Option<typedpg_pg_query::ast::Node>) -> bool {
-    let returning = match action.as_ref() {
+fn has_returning(action: Option<&typedpg_pg_query::ast::Node>) -> bool {
+    let returning = match action {
         Some(ast::Node::InsertStmt(s)) => s.returning_clause.as_ref(),
         Some(ast::Node::UpdateStmt(s)) => s.returning_clause.as_ref(),
         Some(ast::Node::DeleteStmt(s)) => s.returning_clause.as_ref(),
@@ -453,7 +464,7 @@ fn check_rule_result_list(
 fn check_rule_qual(
     interp: &PgCatalog,
     relid: PgClassOid,
-    qual: &Option<typedpg_pg_query::ast::Node>,
+    qual: Option<&typedpg_pg_query::ast::Node>,
     has_old: bool,
     has_new: bool,
 ) -> Result<(), DdlError> {
@@ -509,9 +520,9 @@ fn check_rule_qual(
 /// defined by the action don't count.
 fn check_action_relations(
     interp: &PgCatalog,
-    action: &Option<typedpg_pg_query::ast::Node>,
+    action: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
-    let Some(inner) = action.as_ref() else {
+    let Some(inner) = action else {
         return Ok(());
     };
     let nodes = inner.nodes();
@@ -542,11 +553,11 @@ fn check_action_relations(
 fn check_action_query(
     interp: &PgCatalog,
     relid: PgClassOid,
-    action: &Option<typedpg_pg_query::ast::Node>,
+    action: Option<&typedpg_pg_query::ast::Node>,
     has_old: bool,
     has_new: bool,
 ) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
-    let Some(inner) = action.as_ref() else {
+    let Some(inner) = action else {
         return Ok(None);
     };
     if !matches!(
@@ -585,11 +596,11 @@ fn check_action_query(
 fn action_plan_error(
     interp: &PgCatalog,
     relid: PgClassOid,
-    action: &Option<typedpg_pg_query::ast::Node>,
+    action: Option<&typedpg_pg_query::ast::Node>,
     has_old: bool,
     has_new: bool,
 ) -> Option<ActionPlanError> {
-    let target = match action.as_ref()? {
+    let target = match action? {
         ast::Node::SelectStmt(_) => None,
         ast::Node::InsertStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdInsert)),
         ast::Node::UpdateStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdUpdate)),
@@ -614,16 +625,16 @@ fn action_plan_error(
 /// `DROP RULE [IF EXISTS] name ON table`.
 pub(crate) fn drop_rule(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node else {
         return Ok(());
     };
     let parts: Vec<String> = list
         .items
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .map(str::to_owned)
         .collect();
     let Some((name, rel)) = parts.split_last() else {

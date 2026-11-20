@@ -519,7 +519,7 @@ pub(super) fn select_output_columns(
             .iter()
             .enumerate()
             .map(|(i, item)| {
-                let (typ, deterministic) = value_type(ctx, None, item);
+                let (typ, deterministic) = value_type(ctx, None, item.as_ref());
                 CteColumn {
                     name: Some(format!("column{}", i + 1)),
                     typ,
@@ -535,7 +535,7 @@ pub(super) fn select_output_columns(
                 return Vec::new();
             }
             for (column, item) in out.iter_mut().zip(&list.items) {
-                let (typ, deterministic) = value_type(ctx, None, item);
+                let (typ, deterministic) = value_type(ctx, None, item.as_ref());
                 if column.typ != typ || !column.deterministic || !deterministic {
                     column.typ = None;
                     column.deterministic = false;
@@ -596,10 +596,10 @@ pub(super) fn select_output_columns(
             }
             continue;
         }
-        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value);
+        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value.as_ref());
         out.push(CteColumn {
             name: if target.name.is_empty() {
-                output_name(value)
+                output_name(value.as_ref())
             } else {
                 Some(target.name.clone())
             },
@@ -693,10 +693,10 @@ fn returning_columns(
             }
             continue;
         }
-        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value);
+        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value.as_ref());
         out.push(CteColumn {
             name: if target.name.is_empty() {
-                output_name(value)
+                output_name(value.as_ref())
             } else {
                 Some(target.name.clone())
             },
@@ -736,9 +736,9 @@ fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
 fn value_type(
     ctx: &Ctx<'_>,
     scope: Option<&Scope<'_>>,
-    value: &Option<ast::Node>,
+    value: Option<&ast::Node>,
 ) -> (Option<crate::oid::PgTypeOid>, bool) {
-    match value.as_ref() {
+    match value {
         Some(Node::ColumnRef(column)) => {
             let (Some(scope), Fields::Names(names)) = (scope, dedup::column_ref_fields(column))
             else {
@@ -814,8 +814,8 @@ fn value_type(
 /// other names from the expression (a cast from its argument, a function call
 /// from the function, `CASE` as `case`), which this doesn't reproduce, so
 /// anything else is unknown.
-fn output_name(value: &Option<ast::Node>) -> Option<String> {
-    let Node::ColumnRef(column) = value.as_ref()? else {
+fn output_name(value: Option<&ast::Node>) -> Option<String> {
+    let Node::ColumnRef(column) = value? else {
         return None;
     };
     let Fields::Names(names) = dedup::column_ref_fields(column) else {
@@ -1070,7 +1070,16 @@ fn find_select_from(
 ) {
     let mut left = left.to_vec();
     for item in from {
-        find_select_from_item(ctx, item, &left, level_parent, env, target, check, out);
+        find_select_from_item(
+            ctx,
+            item.as_ref(),
+            &left,
+            level_parent,
+            env,
+            target,
+            check,
+            out,
+        );
         left.push(item.clone());
     }
 }
@@ -1081,7 +1090,7 @@ fn find_select_from(
 #[allow(clippy::too_many_arguments)] // one per level's walker state
 fn find_select_from_item(
     ctx: &Ctx<'_>,
-    item: &Option<ast::Node>,
+    item: Option<&ast::Node>,
     left: &[Option<ast::Node>],
     level_parent: Option<&FromScope<'_>>,
     env: &CteEnv,
@@ -1092,17 +1101,35 @@ fn find_select_from_item(
     if out.is_some() {
         return;
     }
-    match item.as_ref() {
+    match item {
         Some(Node::JoinExpr(join)) => {
             let mut join_left = left.to_vec();
             if join.larg.is_some() {
                 let l = &join.larg;
-                find_select_from_item(ctx, l, &join_left, level_parent, env, target, check, out);
+                find_select_from_item(
+                    ctx,
+                    l.as_ref(),
+                    &join_left,
+                    level_parent,
+                    env,
+                    target,
+                    check,
+                    out,
+                );
                 join_left.push(l.clone());
             }
             if join.rarg.is_some() {
                 let r = &join.rarg;
-                find_select_from_item(ctx, r, &join_left, level_parent, env, target, check, out);
+                find_select_from_item(
+                    ctx,
+                    r.as_ref(),
+                    &join_left,
+                    level_parent,
+                    env,
+                    target,
+                    check,
+                    out,
+                );
             }
             // An ON condition sees its own join's two sides, not the other
             // FROM entries of the level.
@@ -1148,14 +1175,14 @@ fn find_select_from_item(
             // `LATERAL` is a noise word before a function call: its
             // arguments already read the items to its left.
             let scope = FromScope::of_items_nested(ctx, left, level_parent);
-            if let Some(root) = item.as_ref() {
+            if let Some(root) = item {
                 for child in root.to_ref().children() {
                     find_select(ctx, child, Some(&scope), env, target, check, out);
                 }
             }
         }
         _ => {
-            if let Some(root) = item.as_ref() {
+            if let Some(root) = item {
                 for child in root.to_ref().children() {
                     find_select(ctx, child, level_parent, env, target, check, out);
                 }
@@ -1285,14 +1312,14 @@ fn statement_at_most_one_row_in(
             &env,
             update.relation.as_deref(),
             &update.from_clause,
-            &update.where_clause,
+            update.where_clause.as_ref(),
         ),
         NodeRef::DeleteStmt(delete) => dml_at_most_one_row(
             ctx,
             &env,
             delete.relation.as_deref(),
             &delete.using_clause,
-            &delete.where_clause,
+            delete.where_clause.as_ref(),
         ),
         NodeRef::MergeStmt(merge) => merge_at_most_one_row(ctx, merge, &env),
         _ => false,
@@ -1372,7 +1399,7 @@ pub(super) fn select_at_most_one_row_in(
     let distinct_on = !dedup::is_plain_distinct(select) && !select.distinct_clause.is_empty();
     if grouped || distinct_on {
         let Some(determination) =
-            determined_relations(ctx, &select.where_clause, &scope, outer, env)
+            determined_relations(ctx, select.where_clause.as_ref(), &scope, outer, env)
         else {
             return false;
         };
@@ -1380,14 +1407,13 @@ pub(super) fn select_at_most_one_row_in(
         // does a `DISTINCT ON` whose keys are all single-valued: the rows
         // dedup to one per key value, and there is only one.
         if grouped {
-            return select
-                .group_clause
-                .iter()
-                .all(|group| grouping_key_single_valued(ctx, &scope, &determination, group, true));
+            return select.group_clause.iter().all(|group| {
+                grouping_key_single_valued(ctx, &scope, &determination, group.as_ref(), true)
+            });
         }
         if select.distinct_clause.iter().all(|key| {
-            distinct_on_key_reads_input(select, key)
-                && grouping_key_single_valued(ctx, &scope, &determination, key, true)
+            distinct_on_key_reads_input(select, key.as_ref())
+                && grouping_key_single_valued(ctx, &scope, &determination, key.as_ref(), true)
         }) {
             return true;
         }
@@ -1408,19 +1434,19 @@ fn grouping_key_single_valued(
     ctx: &Ctx<'_>,
     scope: &Scope<'_>,
     determination: &Determination,
-    item: &Option<ast::Node>,
+    item: Option<&ast::Node>,
     positional: bool,
 ) -> bool {
     // `GROUP BY (a, b)` is the two items `a` and `b` (PG's
     // `flatten_grouping_sets`), each of them possibly a target position.
     if positional && let Some(items) = crate::grouping::implicit_row_items(item) {
-        return items
-            .iter()
-            .all(|item| grouping_key_single_valued(ctx, scope, determination, item, positional));
+        return items.iter().all(|item| {
+            grouping_key_single_valued(ctx, scope, determination, item.as_ref(), positional)
+        });
     }
     if positional
         && matches!(
-            item.as_ref(),
+            item,
             Some(Node::AConst(constant))
                 if !constant.isnull && matches!(constant.val, Some(AConstValue::Integer(_)))
         )
@@ -1453,8 +1479,8 @@ fn grouping_key_single_valued(
 /// input column has the same name. A target whose output name this can't
 /// tell (`FigureColname` derives it from the expression) may be the one a
 /// bare name means, so such a key is refused too.
-fn distinct_on_key_reads_input(select: &SelectStmt, key: &Option<ast::Node>) -> bool {
-    let Some(Node::ColumnRef(column)) = key.as_ref() else {
+fn distinct_on_key_reads_input(select: &SelectStmt, key: Option<&ast::Node>) -> bool {
+    let Some(Node::ColumnRef(column)) = key else {
         return true;
     };
     let Fields::Names(names) = dedup::column_ref_fields(column) else {
@@ -1468,7 +1494,7 @@ fn distinct_on_key_reads_input(select: &SelectStmt, key: &Option<ast::Node>) -> 
             return false;
         };
         let output = if target.name.is_empty() {
-            output_name(&target.val)
+            output_name(target.val.as_ref())
         } else {
             Some(target.name.clone())
         };
@@ -1491,8 +1517,8 @@ fn distinct_on_key_reads_input(select: &SelectStmt, key: &Option<ast::Node>) -> 
 
 /// The relation and attnum a grouping / `DISTINCT ON` item is a plain
 /// column of, resolved in this level's scope.
-fn plain_column(scope: &Scope<'_>, item: &Option<ast::Node>) -> Option<(usize, i16)> {
-    let Some(Node::ColumnRef(column)) = item.as_ref() else {
+fn plain_column(scope: &Scope<'_>, item: Option<&ast::Node>) -> Option<(usize, i16)> {
+    let Some(Node::ColumnRef(column)) = item else {
         return None;
     };
     let Fields::Names(names) = dedup::column_ref_fields(column) else {
@@ -1527,18 +1553,18 @@ fn fixed_distinct_targets(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
         let Some(Node::ResTarget(target)) = target else {
             return false;
         };
-        target.val.is_some() && fixed_per_evaluation(ctx, &target.val)
+        target.val.is_some() && fixed_per_evaluation(ctx, target.val.as_ref())
     })
 }
 
 /// Whether `value` evaluates to the same result on every row of a query
 /// level: it reads no column and no nested query, and every call it makes is
 /// non-volatile, non-aggregate and non-window.
-fn fixed_per_evaluation(ctx: &Ctx<'_>, value: &Option<ast::Node>) -> bool {
+fn fixed_per_evaluation(ctx: &Ctx<'_>, value: Option<&ast::Node>) -> bool {
     if proof::has_volatile(ctx, value) {
         return false;
     }
-    let Some(root) = value.as_ref() else {
+    let Some(root) = value else {
         return false;
     };
     let mut stack = vec![root.to_ref()];
@@ -1787,14 +1813,16 @@ fn contains_column_ref(node: NodeRef<'_>) -> bool {
 
 /// Whether the FROM clause contains a FULL JOIN at any depth.
 fn has_full_join(from: &[Option<ast::Node>]) -> bool {
-    from.iter().any(node_has_full_join)
+    from.iter().any(|n| node_has_full_join(n.as_ref()))
 }
 
-fn node_has_full_join(item: &Option<ast::Node>) -> bool {
-    match item.as_ref() {
+fn node_has_full_join(item: Option<&ast::Node>) -> bool {
+    match item {
         Some(Node::JoinExpr(join)) => {
             join.jointype == JoinType::JoinFull
-                || [&join.larg, &join.rarg].into_iter().any(node_has_full_join)
+                || [&join.larg, &join.rarg]
+                    .into_iter()
+                    .any(|n| node_has_full_join(n.as_ref()))
         }
         _ => false,
     }
@@ -1830,7 +1858,7 @@ struct Determination {
 type JoinFacts<'j, 'a, 'q> = (
     &'j dedup::Join<'a>,
     Vec<dedup::EqFact>,
-    Vec<&'q Option<ast::Node>>,
+    Vec<Option<&'q ast::Node>>,
 );
 
 /// The relations of `scope` determined: a relation is determined when one of
@@ -1846,7 +1874,7 @@ type JoinFacts<'j, 'a, 'q> = (
 /// the joins contribute.
 fn determined_relations(
     ctx: &Ctx<'_>,
-    where_clause: &Option<ast::Node>,
+    where_clause: Option<&ast::Node>,
     scope: &Scope<'_>,
     outer: &FromScope<'_>,
     env: &CteEnv,
@@ -1868,7 +1896,7 @@ fn determined_relations(
     }
     let level_facts: Vec<dedup::EqFact> = level_conjuncts
         .iter()
-        .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, Some(outer), env))
+        .flat_map(|conjunct| scope.cardinality_facts(ctx, *conjunct, Some(outer), env))
         .collect();
     let join_facts: Vec<JoinFacts<'_, '_, '_>> = scope
         .joins
@@ -1877,7 +1905,7 @@ fn determined_relations(
             let conjuncts = dedup::conjuncts(join.quals);
             let mut facts = Vec::new();
             for conjunct in &conjuncts {
-                facts.extend(scope.cardinality_facts(ctx, conjunct, Some(outer), env));
+                facts.extend(scope.cardinality_facts(ctx, *conjunct, Some(outer), env));
             }
             for name in &join.using {
                 facts.extend(scope.cardinality_using_facts(ctx, name, join.left, join.right));
@@ -2000,7 +2028,7 @@ fn all_relations_determined(
     outer: &FromScope<'_>,
     env: &CteEnv,
 ) -> bool {
-    determined_relations(ctx, &select.where_clause, scope, outer, env)
+    determined_relations(ctx, select.where_clause.as_ref(), scope, outer, env)
         .is_some_and(|determination| determination.known & determination.all == determination.all)
 }
 
@@ -2066,7 +2094,7 @@ fn dml_at_most_one_row(
     env: &CteEnv,
     relation: Option<&ast::RangeVar>,
     from: &[Option<ast::Node>],
-    where_clause: &Option<ast::Node>,
+    where_clause: Option<&ast::Node>,
 ) -> bool {
     let Some(relation) = relation else {
         return false;
@@ -2158,7 +2186,7 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
         return false;
     }
     let root = FromScope::opaque(None);
-    let known = determined_relations(ctx, &merge.join_condition, &scope, &root, env)
+    let known = determined_relations(ctx, merge.join_condition.as_ref(), &scope, &root, env)
         .map_or(0, |determination| determination.known);
     // Relation 0 is the target (`Scope::dml` adds it first).
     known & 1 == 1

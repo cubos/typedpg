@@ -40,7 +40,7 @@ pub(crate) fn expanded_target_entries<'a>(
             continue;
         }
         let val = &rt.val;
-        let param_star = param_star(val, scope, ctx.snapshot);
+        let param_star = param_star(val.as_ref(), scope, ctx.snapshot);
         let val = param_star.as_ref().unwrap_or(val);
         match val.as_ref() {
             Some(ast::Node::ColumnRef(cr))
@@ -75,7 +75,7 @@ pub(crate) fn expanded_target_entries<'a>(
                     .ok()
                     .flatten()
                 {
-                    let location = crate::error::node_location(val).unwrap_or(-1);
+                    let location = crate::error::node_location(val.as_ref()).unwrap_or(-1);
                     out.extend(fields.iter().map(|_| ExpandedTarget::StarColumn {
                         column: None,
                         location,
@@ -93,11 +93,11 @@ pub(crate) fn expanded_target_entries<'a>(
 /// A SQL function parameter's `v.*` as the `(v).*` it stands for
 /// ([`expr::sql_function_param_star`]).
 fn param_star(
-    val: &Option<ast::Node>,
+    val: Option<&ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> Option<Option<ast::Node>> {
-    let Some(ast::Node::ColumnRef(cr)) = val.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = val else {
         return None;
     };
     let ind = expr::sql_function_param_star(cr, scope, snapshot)?;
@@ -139,7 +139,7 @@ pub(crate) fn resolve_target_list_explicit(
             continue;
         }
         let val = &rt.val;
-        let param_star = param_star(val, scope, snapshot);
+        let param_star = param_star(val.as_ref(), scope, snapshot);
         let val = param_star.as_ref().unwrap_or(val);
 
         // Check for SELECT * or t.*.
@@ -249,13 +249,13 @@ pub(crate) fn resolve_target_list_explicit(
 
         // No type expectation for SELECT expressions.
         let expr_type = expr::infer_expr(
-            val,
+            val.as_ref(),
             expr::Ctx::new(scope, null_ctx, snapshot),
             params,
             TypeGoal::NONE,
         )?;
         // A column a pulled-up subquery substitutes its output for.
-        super::deferred::record_read(val, scope);
+        super::deferred::record_read(val.as_ref(), scope);
 
         // Determine column name: explicit alias, or inferred from expression.
         // An explicit alias may carry the `!` / `?` nullability annotation:
@@ -275,7 +275,7 @@ pub(crate) fn resolve_target_list_explicit(
             // of position. Using the position would diverge from the
             // wire-protocol RowDescription that `pglite_sanity` checks.
             let _ = i;
-            infer_column_name(val).unwrap_or_else(|| "?column?".to_string())
+            infer_column_name(val.as_ref()).unwrap_or_else(|| "?column?".to_string())
         };
 
         // Inferred shape from the expression (ROW(...), nested indirection,
@@ -359,14 +359,16 @@ pub(crate) fn analyze_values_lists(
     let mut column_types: Vec<Vec<PgTypeOid>> = vec![Vec::new(); arity];
     let mut column_typmods: Vec<Vec<Option<i32>>> = vec![Vec::new(); arity];
     let mut column_nullable: Vec<bool> = vec![false; arity];
-    let mut unknown_values: Vec<(usize, &Option<ast::Node>)> = Vec::new();
+    let mut unknown_values: Vec<(usize, Option<&ast::Node>)> = Vec::new();
     let mut column_exprs: Vec<Vec<expr::ExprType>> = vec![Vec::new(); arity];
 
     for row in &rows {
         // PG (SQLSTATE 42601): every row must have the first row's arity.
         if row.len() != arity {
             // PG positions it at the row's first value.
-            let span = row.first().and_then(crate::error::expr_span);
+            let span = row
+                .first()
+                .and_then(|n| crate::error::expr_span(n.as_ref()));
             return Err(
                 crate::pgmsg::values_lists_length(arity, row.len(), span).finalize_implicit()
             );
@@ -375,15 +377,15 @@ pub(crate) fn analyze_values_lists(
             // EXPR_KIND_VALUES: no aggregate, GROUPING(…) or window call of
             // this level, in the row or (an aggregate) in a sublink of it.
             let t = crate::grouping::with_clause(Some("VALUES"), || {
-                expr::infer_expr(item, ctx(), params, TypeGoal::NONE)
+                expr::infer_expr(item.as_ref(), ctx(), params, TypeGoal::NONE)
             })?;
-            crate::clause::check_level_calls(item, ctx(), "VALUES", true)?;
-            check_no_srf_in_clause(item, snapshot, "VALUES")?;
+            crate::clause::check_level_calls(item.as_ref(), ctx(), "VALUES", true)?;
+            check_no_srf_in_clause(item.as_ref(), snapshot, "VALUES")?;
             column_types[i].push(t.type_oid);
             column_typmods[i].push(t.typmod);
             column_nullable[i] |= t.nullable;
             if t.unknown_value {
-                unknown_values.push((i, item));
+                unknown_values.push((i, item.as_ref()));
             }
             column_exprs[i].push(t);
         }
@@ -408,7 +410,11 @@ pub(crate) fn analyze_values_lists(
         }
         let name = |t| crate::ddl::util::format_type_for_message(snapshot, t);
         // The column's cells, parallel to `types`, to point at the failing one.
-        let cells: Vec<&Option<ast::Node>> = rows.iter().filter_map(|r| r.get(column)).collect();
+        let cells: Vec<Option<&ast::Node>> = rows
+            .iter()
+            .filter_map(|r| r.get(column))
+            .map(Option::as_ref)
+            .collect();
         let span = |failing| crate::expr::failing_input_span(types, &cells, failing, snapshot);
         match crate::coerce::select_common_type(&concrete, snapshot) {
             Ok(t) => common.push(t),
@@ -444,7 +450,7 @@ pub(crate) fn analyze_values_lists(
                 oid::TEXT,
                 crate::coerce::CoercionContext::Implicit,
                 snapshot,
-                item.as_ref(),
+                item,
             )?;
         }
     }
@@ -468,7 +474,7 @@ pub(crate) fn analyze_values_lists(
                 continue;
             }
             if column_types[i].get(row_idx) == Some(&oid::UNKNOWN) {
-                expr::coerce_unknown_to(item, ctx(), params, common[i])?;
+                expr::coerce_unknown_to(item.as_ref(), ctx(), params, common[i])?;
             }
         }
     }
@@ -556,7 +562,7 @@ fn resolve_funccall_record_fields(
     let mut arg_types = Vec::with_capacity(fc.args.len());
     for a in &fc.args {
         let t = expr::infer_expr(
-            a,
+            a.as_ref(),
             expr::Ctx::new(&empty_scope, &empty_null, snapshot),
             params,
             TypeGoal::NONE,
@@ -584,12 +590,12 @@ pub(crate) fn target_resname(rt: &ast::ResTarget) -> String {
     if !rt.name.is_empty() {
         return rt.name.clone();
     }
-    infer_column_name(&rt.val).unwrap_or_else(|| "?column?".to_string())
+    infer_column_name(rt.val.as_ref()).unwrap_or_else(|| "?column?".to_string())
 }
 
 /// Try to infer a default column name from an expression (for unaliased
 /// columns, and an index expression's column, `FigureIndexColname`).
-pub(crate) fn infer_column_name(node: &Option<ast::Node>) -> Option<String> {
+pub(crate) fn infer_column_name(node: Option<&ast::Node>) -> Option<String> {
     figure_colname(node).1
 }
 
@@ -605,8 +611,8 @@ pub(crate) fn infer_column_name(node: &Option<ast::Node>) -> Option<String> {
 /// argument produced a strong one, otherwise it falls back to the type name.
 /// The same rule lets `CASE … ELSE col END` be named after the `ELSE` branch
 /// and `arr[1]` after the subscripted array.
-fn figure_colname(node: &Option<ast::Node>) -> (i32, Option<String>) {
-    let Some(inner) = node.as_ref() else {
+fn figure_colname(node: Option<&ast::Node>) -> (i32, Option<String>) {
+    let Some(inner) = node else {
         return (0, None);
     };
     match inner {
@@ -622,7 +628,7 @@ fn figure_colname(node: &Option<ast::Node>) -> (i32, Option<String>) {
             if let Some(field) = expr::extract_string_fields(&ind.indirection).pop() {
                 (2, Some(field))
             } else {
-                figure_colname(&ind.arg)
+                figure_colname(ind.arg.as_ref())
             }
         }
         ast::Node::FuncCall(fc) => match expr::extract_string_fields(&fc.funcname).pop() {
@@ -634,7 +640,7 @@ fn figure_colname(node: &Option<ast::Node>) -> (i32, Option<String>) {
         // yielded a strong one; otherwise it falls back to the target type's
         // (last) name with the weak strength `1`.
         ast::Node::TypeCast(tc) => {
-            let arg = figure_colname(&tc.arg);
+            let arg = figure_colname(tc.arg.as_ref());
             if arg.0 <= 1
                 && let Some(ty) = tc
                     .type_name
@@ -645,11 +651,11 @@ fn figure_colname(node: &Option<ast::Node>) -> (i32, Option<String>) {
             }
             arg
         }
-        ast::Node::CollateClause(cc) => figure_colname(&cc.arg),
+        ast::Node::CollateClause(cc) => figure_colname(cc.arg.as_ref()),
         // PG names a CASE after its `ELSE` branch when that branch has a strong
         // name, else after the construct itself (lowercased `case`).
         ast::Node::CaseExpr(case) => {
-            let els = figure_colname(&case.defresult);
+            let els = figure_colname(case.defresult.as_ref());
             if els.0 <= 1 {
                 (1, Some("case".to_string()))
             } else {
@@ -772,7 +778,7 @@ fn sublink_target_colname(sl: &ast::SubLink) -> (i32, Option<String>) {
     }
     // (Named once: before the subquery is analyzed, each level would
     // otherwise name the one below it twice — 2^depth.)
-    match figure_colname(&rt.val) {
+    match figure_colname(rt.val.as_ref()) {
         (strength, name) if strength > 0 => (2, name),
         _ => (0, None),
     }

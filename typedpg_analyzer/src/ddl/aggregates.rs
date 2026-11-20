@@ -54,13 +54,13 @@ fn def_qualified_name(de: &DefElem) -> Vec<String> {
         Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::List(l)) => l
             .items
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::String(s)) => vec![s.sval.clone()],
@@ -92,7 +92,7 @@ fn def_string(de: &DefElem) -> Option<String> {
         ast::Node::List(l) => Some(
             l.items
                 .iter()
-                .filter_map(node_string)
+                .filter_map(|n| node_string(n.as_ref()))
                 .collect::<Vec<_>>()
                 .join("."),
         ),

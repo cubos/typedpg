@@ -207,7 +207,7 @@ fn def_string(de: &DefElem) -> Option<String> {
         ast::Node::List(l) => Some(
             l.items
                 .iter()
-                .filter_map(node_string)
+                .filter_map(|n| node_string(n.as_ref()))
                 .collect::<Vec<_>>()
                 .join("."),
         ),
@@ -252,13 +252,13 @@ fn interpret_func_support(interp: &PgCatalog, de: &DefElem) -> Result<PgProcOid,
         Some(ast::Node::List(l)) => l
             .items
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::String(s)) => vec![s.sval.clone()],
@@ -470,7 +470,13 @@ pub(crate) fn interpret_function_parameter_list(
                 let polymorphic = crate::polymorphic::is_polymorphic(toid);
                 let used = std::cell::RefCell::new(Vec::new());
                 let (default_type, refs) = super::depend::collect(|| {
-                    super::defaults::check_function_default(interp, expr, toid, polymorphic, &used)
+                    super::defaults::check_function_default(
+                        interp,
+                        expr.as_ref(),
+                        toid,
+                        polymorphic,
+                        &used,
+                    )
                 });
                 list.default_types.push(default_type?);
                 list.default_refs.extend(refs);
@@ -478,7 +484,9 @@ pub(crate) fn interpret_function_parameter_list(
                 // type.
                 list.default_refs
                     .extend(super::depend::literal_coercion_references(
-                        interp, expr, toid,
+                        interp,
+                        expr.as_ref(),
+                        toid,
                     ));
                 list.default_procs.extend(used.into_inner());
                 have_defaults = true;
@@ -785,7 +793,11 @@ const BUILTIN_PROSRC: &str = include_str!("builtin_prosrc.txt");
 /// body names a built-in C function.
 fn fmgr_internal_validator(as_clause: Option<&DefElem>, proc: &PgProc) -> Result<(), DdlError> {
     let prosrc = match as_clause.and_then(|de| de.arg.as_ref()) {
-        Some(ast::Node::List(l)) => l.items.first().and_then(node_string).map(str::to_owned),
+        Some(ast::Node::List(l)) => l
+            .items
+            .first()
+            .and_then(|n| node_string(n.as_ref()))
+            .map(str::to_owned),
         Some(ast::Node::String(s)) => Some(s.sval.clone()),
         _ => None,
     }
@@ -1117,7 +1129,7 @@ fn lookup_func_name_internal(
 pub(crate) fn object_name(owa: &ObjectWithArgs) -> Vec<String> {
     owa.objname
         .iter()
-        .filter_map(node_string)
+        .filter_map(|n| node_string(n.as_ref()))
         .map(str::to_owned)
         .collect()
 }

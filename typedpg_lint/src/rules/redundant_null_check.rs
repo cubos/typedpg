@@ -49,14 +49,14 @@ fn null_test(ctx: &Ctx<'_>, test: &NullTest, out: &mut Vec<RawFinding>) {
     if ctx.view.null_test_arg_nullable(test.location) != Some(false) {
         return;
     }
-    let Some(start) = argument_start(arg).or_else(|| location(test.location)) else {
+    let Some(start) = argument_start(arg.as_ref()).or_else(|| location(test.location)) else {
         return;
     };
     let Some(end) = null_keyword_end(ctx, test.location).filter(|end| *end > start) else {
         return;
     };
     let is_null = test.nulltesttype == NullTestType::IsNull;
-    let message = match (argument_text(ctx, arg), is_null) {
+    let message = match (argument_text(ctx, arg.as_ref()), is_null) {
         (Some(text), true) => format!("`{text}` IS NULL is never true: it is never NULL"),
         (Some(text), false) => format!("`{text}` IS NOT NULL is always true: it is never NULL"),
         (None, true) => "IS NULL is never true here: the value is never NULL".to_owned(),
@@ -114,7 +114,7 @@ fn coalesce(
         .as_ref()
         .and_then(|args| args.get(index))
         .map(|(start, end)| short_text(ctx, *start, *end))
-        .unwrap_or_else(|| argument_text(ctx, &expr.args[index]));
+        .unwrap_or_else(|| argument_text(ctx, expr.args[index].as_ref()));
     let mut fix = Vec::new();
     // The kept argument decides the type once the others are gone: it must
     // already have the result type (`COALESCE('1', int_col)` is integer,
@@ -130,8 +130,8 @@ fn coalesce(
     // - an unaliased direct target column is named `coalesce`; any rewrite
     //   risks its output name (dropping the call renames it outright).
     let dropped = &expr.args[index + 1..];
-    let structural = dropped.iter().any(has_call_outside_sublink);
-    let collation = dropped.iter().any(has_collation_or_column);
+    let structural = dropped.iter().any(|n| has_call_outside_sublink(n.as_ref()));
+    let collation = dropped.iter().any(|n| has_collation_or_column(n.as_ref()));
     let unaliased_target = unaliased.contains(&expr.location);
     if fact.args_share_result_type
         && fact.args_typed_as_result.get(index) == Some(&true)
@@ -148,7 +148,7 @@ fn coalesce(
                 range: arg_end..close_start,
                 text: removed_separator(ctx, arg_end..close_start),
             });
-        } else if is_simple_argument(ctx, &expr.args[0], args[0].0, args[0].1) {
+        } else if is_simple_argument(ctx, expr.args[0].as_ref(), args[0].0, args[0].1) {
             // `COALESCE(x, …)` becomes `x` — the call's closing parenthesis
             // goes too.
             fix.push(SqlEdit {
@@ -240,12 +240,12 @@ fn call_parens(ctx: &Ctx<'_>, start: usize) -> Option<(usize, usize)> {
 /// Whether replacing `COALESCE(...)` by its first argument can leave the
 /// argument bare: a column, parameter, constant, function call or an
 /// expression whose own parentheses wrap it binds like the call did.
-fn is_simple_argument(ctx: &Ctx<'_>, node: &Option<Node>, start: usize, end: usize) -> bool {
+fn is_simple_argument(ctx: &Ctx<'_>, node: Option<&Node>, start: usize, end: usize) -> bool {
     if is_parenthesized(ctx, start, end) {
         return true;
     }
     matches!(
-        node.as_ref(),
+        node,
         Some(N::ColumnRef(_) | N::ParamRef(_) | N::AConst(_) | N::FuncCall(_))
     )
 }
@@ -282,9 +282,8 @@ fn is_parenthesized(ctx: &Ctx<'_>, start: usize, end: usize) -> bool {
 /// Whether a dropped argument holds a function call outside any sublink:
 /// aggregates, window functions and set-returning functions shape the rows
 /// the query returns even when `COALESCE` never evaluates them.
-fn has_call_outside_sublink(node: &Option<Node>) -> bool {
-    node.as_ref()
-        .is_some_and(|node| call_outside_sublink(node.to_ref()))
+fn has_call_outside_sublink(node: Option<&Node>) -> bool {
+    node.is_some_and(|node| call_outside_sublink(node.to_ref()))
 }
 
 fn call_outside_sublink(node: NodeRef<'_>) -> bool {
@@ -300,9 +299,8 @@ fn call_outside_sublink(node: NodeRef<'_>) -> bool {
 /// Whether a dropped argument holds a `COLLATE` clause or a column reference:
 /// either can decide the `COALESCE`'s collation, even though the argument is
 /// never evaluated.
-fn has_collation_or_column(node: &Option<Node>) -> bool {
-    node.as_ref()
-        .is_some_and(|node| collation_or_column(node.to_ref()))
+fn has_collation_or_column(node: Option<&Node>) -> bool {
+    node.is_some_and(|node| collation_or_column(node.to_ref()))
 }
 
 fn collation_or_column(node: NodeRef<'_>) -> bool {
@@ -335,18 +333,18 @@ fn joins(character: char) -> bool {
 /// The start of the token sequence of `node`, descending through casts and a
 /// binary expression's left side so `a + b` starts at `a` (an `AExpr`'s own
 /// location is its operator).
-fn argument_start(node: &Option<Node>) -> Option<usize> {
-    let node = node.as_ref()?;
+fn argument_start(node: Option<&Node>) -> Option<usize> {
+    let node = node?;
     match node {
-        N::TypeCast(cast) => argument_start(&cast.arg).or_else(|| operand_start(node)),
-        N::AExpr(expr) => argument_start(&expr.lexpr).or_else(|| operand_start(node)),
+        N::TypeCast(cast) => argument_start(cast.arg.as_ref()).or_else(|| operand_start(node)),
+        N::AExpr(expr) => argument_start(expr.lexpr.as_ref()).or_else(|| operand_start(node)),
         _ => operand_start(node),
     }
 }
 
 /// The expression as the message shows it, on one line; `None` when it is
 /// too long to quote.
-fn argument_text(ctx: &Ctx<'_>, node: &Option<Node>) -> Option<String> {
+fn argument_text(ctx: &Ctx<'_>, node: Option<&Node>) -> Option<String> {
     let start = argument_start(node)?;
     short_text(ctx, start, expression_end(ctx, start))
 }

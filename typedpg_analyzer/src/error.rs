@@ -903,9 +903,9 @@ pub(crate) fn naming_param(message: String, num: i32) -> String {
 /// Extract the `location` byte offset (post-lex SQL) from any AST node
 /// variant that carries one. Returns `None` for nodes without location
 /// info (e.g. `BoolExpr` — `typedpg_pg_query` doesn't track its position).
-pub(crate) fn node_location(node: &Option<typedpg_pg_query::ast::Node>) -> Option<i32> {
+pub(crate) fn node_location(node: Option<&typedpg_pg_query::ast::Node>) -> Option<i32> {
     use typedpg_pg_query::ast::Node;
-    let inner = node.as_ref()?;
+    let inner = node?;
     let loc = match inner {
         Node::ColumnRef(n) => n.location,
         Node::AConst(n) => n.location,
@@ -929,12 +929,12 @@ pub(crate) fn node_location(node: &Option<typedpg_pg_query::ast::Node>) -> Optio
 /// `node` at: its leftmost token — for `'x'::text` the literal, not the
 /// `::` the cast's own location points at; for `a + b`, `a`. A `ResTarget`
 /// stands for its value. `None` when no part of it has a location.
-pub(crate) fn expr_span(node: &Option<typedpg_pg_query::ast::Node>) -> Option<SourceSpan> {
+pub(crate) fn expr_span(node: Option<&typedpg_pg_query::ast::Node>) -> Option<SourceSpan> {
     use typedpg_pg_query::ast::Node;
-    let leftmost = match node.as_ref()? {
-        Node::TypeCast(tc) => expr_span(&tc.arg),
-        Node::AExpr(e) => expr_span(&e.lexpr),
-        Node::ResTarget(rt) => expr_span(&rt.val),
+    let leftmost = match node? {
+        Node::TypeCast(tc) => expr_span(tc.arg.as_ref()),
+        Node::AExpr(e) => expr_span(e.lexpr.as_ref()),
+        Node::ResTarget(rt) => expr_span(rt.val.as_ref()),
         _ => None,
     };
     leftmost.or_else(|| {

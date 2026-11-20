@@ -501,10 +501,10 @@ impl ExprType {
         target: PgTypeOid,
         context: CoercionContext,
         snapshot: &PgCatalog,
-        node: &Option<ast::Node>,
+        node: Option<&ast::Node>,
     ) -> Result<(), AnalyzeError> {
         if self.unknown_value {
-            unknown_value_coercion(target, context, snapshot, node.as_ref())
+            unknown_value_coercion(target, context, snapshot, node)
         } else {
             Ok(())
         }
@@ -806,7 +806,7 @@ impl FuncKindPresence {
 }
 
 pub(crate) fn detect_func_kinds(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
 ) -> FuncKindPresence {
     let mut out = FuncKindPresence::default();
@@ -1030,7 +1030,7 @@ fn walk(inner: &ast::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence) {
 /// recorded as a constraint.  After inference, the result is checked for
 /// compatibility with the goal (raising `TypeMismatch` on failure).
 pub(crate) fn infer_expr(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     goal: TypeGoal,
@@ -1042,30 +1042,37 @@ pub(crate) fn infer_expr(
 thread_local! {
     /// The expressions being inferred, innermost last, each query level's
     /// behind a null boundary (see [`sublink_planned`]).
-    static ENCLOSING: std::cell::RefCell<Vec<*const Option<ast::Node>>> =
+    static ENCLOSING: std::cell::RefCell<Vec<*const ast::Node>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// An entry of [`ENCLOSING`], popped when dropped.
-pub(crate) struct Enclosing;
+/// An entry of [`ENCLOSING`], popped when dropped — when one was pushed.
+pub(crate) struct Enclosing(bool);
 
 impl Enclosing {
-    fn push(node: &Option<ast::Node>) -> Enclosing {
-        ENCLOSING.with(|e| e.borrow_mut().push(node));
-        Enclosing
+    /// A missing expression is not pushed: inferring it fails at once,
+    /// enclosing nothing.
+    fn push(node: Option<&ast::Node>) -> Enclosing {
+        let Some(node) = node else {
+            return Enclosing(false);
+        };
+        ENCLOSING.with(|e| e.borrow_mut().push(std::ptr::from_ref(node)));
+        Enclosing(true)
     }
 
     /// A query level's start: the expressions enclosing it are another
     /// level's.
     pub(crate) fn boundary() -> Enclosing {
         ENCLOSING.with(|e| e.borrow_mut().push(std::ptr::null()));
-        Enclosing
+        Enclosing(true)
     }
 }
 
 impl Drop for Enclosing {
     fn drop(&mut self) {
-        ENCLOSING.with(|e| e.borrow_mut().pop());
+        if self.0 {
+            ENCLOSING.with(|e| e.borrow_mut().pop());
+        }
     }
 }
 
@@ -1079,7 +1086,7 @@ pub(crate) fn sublink_planned(ctx: Ctx<'_>) -> bool {
     if !plan_time_checks() {
         return false;
     }
-    let enclosing: Vec<*const Option<ast::Node>> = ENCLOSING.with(|e| {
+    let enclosing: Vec<*const ast::Node> = ENCLOSING.with(|e| {
         e.borrow()
             .iter()
             .rev()
@@ -1092,13 +1099,13 @@ pub(crate) fn sublink_planned(ctx: Ctx<'_>) -> bool {
         // the stack (its entry is popped when the call returns), borrowing
         // the node for the whole call: the node is alive and unchanged.
         let node = unsafe { &*p };
-        !foldable::foldable(node, ctx).may_fold()
+        !foldable::foldable(Some(node), ctx).may_fold()
     })
 }
 
 /// The expressions of the current query level being inferred, innermost
 /// last (see [`ENCLOSING`]).
-fn level_enclosing() -> Vec<*const Option<ast::Node>> {
+fn level_enclosing() -> Vec<*const ast::Node> {
     ENCLOSING.with(|e| {
         let e = e.borrow();
         let start = e.iter().rposition(|p| p.is_null()).map_or(0, |i| i + 1);
@@ -1109,7 +1116,7 @@ fn level_enclosing() -> Vec<*const Option<ast::Node>> {
 /// Whether `chain` (expressions, outermost first) is the level's WHERE
 /// clause and AND arguments down from it: what reaches its innermost one
 /// is a top-level AND argument of the WHERE.
-fn where_conjunction(chain: &[*const Option<ast::Node>]) -> bool {
+fn where_conjunction(chain: &[*const ast::Node]) -> bool {
     let and = ast::BoolExprType::AndExpr;
     chain
         .first()
@@ -1118,7 +1125,7 @@ fn where_conjunction(chain: &[*const Option<ast::Node>]) -> bool {
             // SAFETY: as in `sublink_planned`, each pointer is a node an
             // `infer_expr` call still on the stack borrows.
             let n = unsafe { &*p };
-            matches!(n.as_ref(), Some(ast::Node::BoolExpr(b)) if b.boolop == and)
+            matches!(n, ast::Node::BoolExpr(b) if b.boolop == and)
         })
 }
 
@@ -1217,7 +1224,7 @@ fn reads_only_available(sub: &ast::SubLink, ctx: Ctx<'_>, available: &[String]) 
 /// Whether `arg`, an argument of the AND being inferred, is a sublink
 /// `pull_up_sublinks` turns into a semi-join before the AND is folded:
 /// one folding to FALSE before it doesn't drop it.
-pub(crate) fn joined_before_folding(arg: &Option<ast::Node>, ctx: Ctx<'_>) -> bool {
+pub(crate) fn joined_before_folding(arg: Option<&ast::Node>, ctx: Ctx<'_>) -> bool {
     plan_fold::conjunct_sublink(arg).is_some_and(|sub| {
         where_conjunction(&level_enclosing())
             && (joined_sublink(sub, ctx) || joined_exists(sub, ctx))
@@ -1228,12 +1235,14 @@ pub(crate) fn joined_before_folding(arg: &Option<ast::Node>, ctx: Ctx<'_>) -> bo
 /// argument of `quals`, the clause [`plan_fold::is_where_clause`] tells
 /// of (an ON clause, see [`plan_fold::with_nullable_on_clause`]), into a
 /// semi-join, in the scope of `ctx`.
-pub(crate) fn pulls_up_sublink(quals: &Option<ast::Node>, ctx: Ctx<'_>) -> bool {
+pub(crate) fn pulls_up_sublink(quals: Option<&ast::Node>, ctx: Ctx<'_>) -> bool {
     let and = ast::BoolExprType::AndExpr;
     let mut todo = vec![quals];
     while let Some(q) = todo.pop() {
-        match q.as_ref() {
-            Some(ast::Node::BoolExpr(b)) if b.boolop == and => todo.extend(&b.args),
+        match q {
+            Some(ast::Node::BoolExpr(b)) if b.boolop == and => {
+                todo.extend(b.args.iter().map(Option::as_ref))
+            }
             _ => {
                 if plan_fold::conjunct_sublink(q)
                     .is_some_and(|sub| joined_sublink(sub, ctx) || joined_exists(sub, ctx))
@@ -1260,14 +1269,14 @@ pub(crate) fn semijoin_level(sel: &ast::SelectStmt, ctx: Ctx<'_>) -> Option<plan
     let (&last, mut above) = enclosing.split_last()?;
     // SAFETY: as in `sublink_planned`, each pointer is a node an
     // `infer_expr` call still on the stack borrows.
-    let node = |p: *const Option<ast::Node>| unsafe { &*p };
-    let Some(ast::Node::SubLink(sub)) = node(last).as_ref() else {
+    let node = |p: *const ast::Node| unsafe { &*p };
+    let ast::Node::SubLink(sub) = node(last) else {
         return None;
     };
     // A NOT EXISTS is an anti-join.
     let mut top = last;
     if let Some((&not, rest)) = above.split_last()
-        && plan_fold::conjunct_sublink(node(not)).is_some_and(|s| std::ptr::eq(s, &**sub))
+        && plan_fold::conjunct_sublink(Some(node(not))).is_some_and(|s| std::ptr::eq(s, &**sub))
     {
         (top, above) = (not, rest);
     }
@@ -1309,7 +1318,7 @@ pub(crate) fn semijoin_level(sel: &ast::SelectStmt, ctx: Ctx<'_>) -> Option<plan
 }
 
 fn infer_expr_here(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     goal: TypeGoal,
@@ -1323,7 +1332,7 @@ fn infer_expr_here(
     if t.nullable
         && ctx.null_ctx.has_expr_facts()
         && !matches!(
-            node.as_ref(),
+            node,
             Some(ast::Node::ColumnRef(_) | ast::Node::AConst(_) | ast::Node::ParamRef(_))
         )
         && ctx
@@ -1349,7 +1358,7 @@ fn infer_expr_here(
 }
 
 fn infer_expr_unlocated(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     goal: TypeGoal,
@@ -1364,7 +1373,7 @@ fn infer_expr_unlocated(
         ast::Node::AConst(a_const) => infer_a_const(a_const),
         ast::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
             Some(operand) => {
-                if let Some(ast::Node::ParamRef(p)) = operand.as_ref()
+                if let Some(ast::Node::ParamRef(p)) = operand
                     && params.get(p.number) == oid::UNKNOWN
                 {
                     params.mark_untyped_cast_operand(p.location);
@@ -1379,7 +1388,7 @@ fn infer_expr_unlocated(
         // `name => value` only occurs as a function-call argument; its type is
         // the value's. The enclosing call resolves the name.
         ast::Node::NamedArgExpr(na) => match &na.arg {
-            arg @ Some(_) => infer_expr(arg, ctx, params, goal.clone()),
+            arg @ Some(_) => infer_expr(arg.as_ref(), ctx, params, goal.clone()),
             None => Err(AnalyzeError::Unsupported(
                 "named argument without a value".into(),
             )),
@@ -1390,7 +1399,7 @@ fn infer_expr_unlocated(
             // set. Always defined → NOT NULL. Walk the args so params get
             // typed and column refs / typos surface as errors.
             for arg in &g.args {
-                infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+                infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)?;
             }
             Ok(ExprType::scalar(oid::INT4, false))
         }
@@ -1400,7 +1409,7 @@ fn infer_expr_unlocated(
         ast::Node::BoolExpr(expr) => infer_bool_expr(expr, ctx, params),
         ast::Node::NullTest(t) => {
             if let arg @ Some(_) = &t.arg {
-                let arg_type = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
+                let arg_type = infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)?;
                 // Record the argument's own inferred nullability — the test
                 // itself proves nothing about it — for the lint's
                 // `redundant_null_check` rule. A row / composite value is
@@ -1415,7 +1424,7 @@ fn infer_expr_unlocated(
                     // caller's value, not a column.
                     crate::pg_catalog::note_null_test_arg_nullable(
                         t.location,
-                        arg_type.nullable || has_param_ref(arg),
+                        arg_type.nullable || has_param_ref(arg.as_ref()),
                     );
                 }
                 // IS [NOT] NULL accepts any type, so it pins nothing — and
@@ -1423,7 +1432,7 @@ fn infer_expr_unlocated(
                 // `SELECT $1 IS NULL, $1 = 1` is `could not determine data
                 // type of parameter $1` (42P08) even though the later use
                 // would pin int4. A param typed *before* this point is fine.
-                if let Some(p) = bare_param(arg, snapshot) {
+                if let Some(p) = bare_param(arg.as_ref(), snapshot) {
                     params.mark_indeterminate_locked(p.number);
                 }
             }
@@ -1444,7 +1453,7 @@ fn infer_expr_unlocated(
                     _ => "IS NOT UNKNOWN",
                 };
                 crate::clause::coerce_clause_expr(
-                    arg,
+                    arg.as_ref(),
                     ctx,
                     params,
                     crate::clause::ClauseKind::BoolTest(label),
@@ -1486,13 +1495,14 @@ fn infer_expr_unlocated(
             };
             let mut args = Vec::with_capacity(mm.args.len());
             for arg in &mm.args {
-                args.push(infer_expr(arg, ctx, params, TypeGoal::NONE)?);
+                args.push(infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)?);
             }
             let types: Vec<PgTypeOid> = args.iter().map(|t| t.type_oid).collect();
             let resolved_type = match PgTypeOid::new(mm.minmaxtype) {
                 Some(t) if t != oid::UNKNOWN => t,
                 _ => {
-                    let nodes: Vec<&Option<ast::Node>> = mm.args.iter().collect();
+                    let nodes: Vec<Option<&ast::Node>> =
+                        mm.args.iter().map(Option::as_ref).collect();
                     select_common_type(label, &types, &nodes, snapshot)?
                 }
             };
@@ -1509,7 +1519,7 @@ fn infer_expr_unlocated(
             // validated (PG rejects `GREATEST(1, 'x')` at parse time).
             for (arg, t) in mm.args.iter().zip(&args) {
                 if t.type_oid == oid::UNKNOWN {
-                    coerce_unknown_to(arg, ctx, params, resolved_type)?;
+                    coerce_unknown_to(arg.as_ref(), ctx, params, resolved_type)?;
                 }
             }
             // Each argument is coerced to the common type, which may map it
@@ -1533,8 +1543,8 @@ fn infer_expr_unlocated(
                 crate::nonnull::StrictNode::FloatFold,
                 crate::nonnull::subst::folds_as_float(resolved_type, snapshot),
             );
-            let branches: Vec<(&Option<ast::Node>, &ExprType)> =
-                mm.args.iter().zip(&args).collect();
+            let branches: Vec<(Option<&ast::Node>, &ExprType)> =
+                mm.args.iter().map(Option::as_ref).zip(&args).collect();
             let mut refine = conditional::branches_refine(&branches, resolved_type, snapshot);
             // GREATEST is at least each non-NULL argument (LEAST at most):
             // a NOT NULL one bounds it whatever the others are.
@@ -1599,8 +1609,8 @@ fn infer_expr_unlocated(
             // the param to a concrete type.
             let mut fields = Vec::with_capacity(row.args.len());
             for (i, arg) in row.args.iter().enumerate() {
-                let ty = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
-                if let Some(p) = bare_param(arg, snapshot) {
+                let ty = infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)?;
+                if let Some(p) = bare_param(arg.as_ref(), snapshot) {
                     params.mark_indeterminate_required(p.number);
                 }
                 fields.push(RecordField {
@@ -1677,7 +1687,7 @@ fn infer_expr_unlocated(
                 crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::collation(r.oid));
                 Some(r.oid)
             };
-            let result = infer_expr(arg, ctx, params, goal)?;
+            let result = infer_expr(arg.as_ref(), ctx, params, goal)?;
             // PG rejects `COLLATE` on non-collatable types with
             // `collations are not supported by type X`. Collatable means
             // string-category — or an *array* of a collatable element
@@ -1710,7 +1720,7 @@ fn infer_expr_unlocated(
                         Some((_, bare)) => bare.to_owned(),
                         None => formatted,
                     };
-                    let span = crate::error::node_location(arg)
+                    let span = crate::error::node_location(arg.as_ref())
                         .and_then(crate::error::SourceSpan::from_node_qname);
                     return Err(crate::error::RawError::invalid(
                         format!("collations are not supported by type {type_name}"),
@@ -1804,7 +1814,7 @@ fn infer_expr_unlocated(
     // gets its *content* validated here.
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN
-        && let Some(ast::Node::AConst(ac)) = node.as_ref()
+        && let Some(ast::Node::AConst(ac)) = node
         && !ac.isnull
         && matches!(ac.val, Some(ast::AConstValue::String(_)))
     {
@@ -1812,7 +1822,7 @@ fn infer_expr_unlocated(
     }
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN
-        && let Some(ast::Node::AConst(ac)) = node.as_ref()
+        && let Some(ast::Node::AConst(ac)) = node
         && !ac.isnull
         && let Some(ast::AConstValue::String(sv)) = &ac.val
         && let Err(msg) = crate::literal_input::validate_with_typmod(
@@ -1838,7 +1848,7 @@ fn infer_expr_unlocated(
     }
 
     if goal.has_expectation() && result.unknown_value {
-        unknown_value_coercion(goal.type_oid, goal.coercion, snapshot, node.as_ref())?;
+        unknown_value_coercion(goal.type_oid, goal.coercion, snapshot, node)?;
     }
 
     // Verify result is compatible with the goal type. Pass the location
@@ -1869,7 +1879,7 @@ pub(crate) fn unknown_value_coercion(
     {
         return Ok(());
     }
-    let span = crate::error::node_location(&node.cloned()).and_then(|loc| {
+    let span = crate::error::node_location(node).and_then(|loc| {
         crate::error::SourceSpan::from_node_qname(loc)
             .or_else(|| crate::error::SourceSpan::from_node_token(loc))
     });
@@ -1941,7 +1951,7 @@ fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeEr
 /// open-coded goal walks are how parameters historically ended up typed
 /// differently from PG's Describe.
 pub(crate) fn coerce_unknown_to(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     target: PgTypeOid,
@@ -1981,14 +1991,14 @@ pub(crate) fn note_untyped_output_params(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let is_bare_param = |target: &Option<ast::Node>| {
+    let is_bare_param = |target: Option<&ast::Node>| {
         matches!(
-            target.as_ref(),
+            target,
             Some(ast::Node::ResTarget(rt))
-                if bare_param(&rt.val, ctx.snapshot).is_some()
+                if bare_param(rt.val.as_ref(), ctx.snapshot).is_some()
         )
     };
-    let last_bare_param = target_list.iter().rposition(is_bare_param);
+    let last_bare_param = target_list.iter().rposition(|t| is_bare_param(t.as_ref()));
     let replayed = TARGETS_REPLAYED.with(std::cell::Cell::get);
     let mut scratch = params.clone();
     replay_targets(
@@ -2039,7 +2049,7 @@ fn replay_targets(
         if val.is_none() {
             continue;
         }
-        if let Some(p) = bare_param(val, ctx.snapshot) {
+        if let Some(p) = bare_param(val.as_ref(), ctx.snapshot) {
             if scratch.get(p.number) == oid::UNKNOWN {
                 params.mark_untyped_output(p.location);
                 params.mark_untyped_cast_operand(p.location);
@@ -2059,12 +2069,13 @@ fn replay_targets(
             Some(ast::Node::AIndirection(i)) if star(&i.indirection) => continue,
             _ => {}
         }
-        if has_sublink(val)
-            && (replayed || (last_bare_param.is_none_or(|last| i > last) && !has_param_ref(val)))
+        if has_sublink(val.as_ref())
+            && (replayed
+                || (last_bare_param.is_none_or(|last| i > last) && !has_param_ref(val.as_ref())))
         {
             continue;
         }
-        infer_expr(val, ctx, scratch, TypeGoal::NONE)?;
+        infer_expr(val.as_ref(), ctx, scratch, TypeGoal::NONE)?;
     }
     Ok(())
 }
@@ -2083,14 +2094,14 @@ fn replay_targets(
 /// coerce with [`coerce_untyped_param`]. An item failing here is left to
 /// the caller's own pass, which reports it in its context.
 pub(crate) fn replay_transform(
-    items: &[&Option<ast::Node>],
+    items: &[Option<&ast::Node>],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Vec<bool> {
     let mut replay = TransformReplay::new(params);
     let untyped = items
         .iter()
-        .map(|item| replay.item(item, ctx, params))
+        .map(|item| replay.item(*item, ctx, params))
         .collect();
     replay.finish(params);
     untyped
@@ -2116,7 +2127,7 @@ impl TransformReplay {
     /// transformed while `$N` was untyped.
     pub(crate) fn item(
         &mut self,
-        item: &Option<ast::Node>,
+        item: Option<&ast::Node>,
         ctx: Ctx<'_>,
         params: &ParamCollector,
     ) -> bool {
@@ -2178,7 +2189,7 @@ pub(crate) fn coerce_untyped_param(
 /// any later key or clause is looked at (`ORDER BY $1, x = $1` with an
 /// integer `x` is `integer = text`).
 pub(crate) fn resolve_unknown_key(
-    key: &Option<ast::Node>,
+    key: Option<&ast::Node>,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -2196,7 +2207,7 @@ pub(crate) fn resolve_unknown_key(
 /// bare `$N` among them is an untyped parameter node, coerced through
 /// [`coerce_untyped_param`] (`$1 = ANY($1)` deduces text, then text[]).
 pub(crate) fn coerce_unknown_operand(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     target: PgTypeOid,
@@ -2212,8 +2223,8 @@ pub(crate) fn coerce_unknown_operand(
 }
 
 /// Whether `expr` is or holds a `$N`.
-fn has_param_ref(expr: &Option<ast::Node>) -> bool {
-    expr.as_ref().is_some_and(|inner| {
+fn has_param_ref(expr: Option<&ast::Node>) -> bool {
+    expr.is_some_and(|inner| {
         matches!(inner, ast::Node::ParamRef(_))
             || inner
                 .nodes()
@@ -2223,8 +2234,8 @@ fn has_param_ref(expr: &Option<ast::Node>) -> bool {
 }
 
 /// Whether `expr` is or holds a subquery.
-fn has_sublink(expr: &Option<ast::Node>) -> bool {
-    expr.as_ref().is_some_and(|inner| {
+fn has_sublink(expr: Option<&ast::Node>) -> bool {
+    expr.is_some_and(|inner| {
         matches!(inner, ast::Node::SubLink(_))
             || inner
                 .nodes()
@@ -2253,7 +2264,7 @@ pub(crate) fn resolve_untyped_output_params(
         let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             continue;
         };
-        let Some(p) = bare_param(&rt.val, snapshot) else {
+        let Some(p) = bare_param(rt.val.as_ref(), snapshot) else {
             continue;
         };
         if !params.is_untyped_output(p.location) {
@@ -2494,7 +2505,7 @@ pub(crate) fn capture_plan_time_errors<R>(f: impl FnOnce() -> R) -> (R, Vec<Plan
 /// or an operator, its operands already checked), under
 /// [`with_plan_time_checks`]: `40000::int2`, `2147483647 + 1`, `1 / 0`
 /// fail every execution (see [`crate::fold`]).
-fn check_folding(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
+fn check_folding(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
     if plan_time_checks()
         && let Some(e) = crate::fold::error_in(node, ctx.snapshot, &|cr| {
             plan_fold::substituted_column(cr, ctx)
@@ -2550,7 +2561,7 @@ fn check_io_coercion(cast: &ast::TypeCast, ctx: Ctx<'_>) -> Result<(), AnalyzeEr
     match crate::literal_input::validate_with_typmod(&text, target, None, snapshot) {
         Ok(()) => Ok(()),
         Err(msg) => {
-            let location = crate::error::node_location(&cast.arg);
+            let location = crate::error::node_location(cast.arg.as_ref());
             let span = location.and_then(crate::error::SourceSpan::from_node_token);
             let e = crate::error::RawError::invalid_literal(msg, span).finalize_implicit();
             plan_time_error(location, e).map_or(Ok(()), Err)
@@ -2620,12 +2631,12 @@ pub(crate) fn expand_row_args<'a>(
             Some(ast::Node::AStar(_))
         )
     };
-    let is_star = |a: &Option<ast::Node>| match a.as_ref() {
+    let is_star = |a: Option<&ast::Node>| match a {
         Some(ast::Node::ColumnRef(cr)) => ends_in_star(&cr.fields),
         Some(ast::Node::AIndirection(ind)) => ends_in_star(&ind.indirection),
         _ => false,
     };
-    if !args.iter().any(is_star) {
+    if !args.iter().any(|a| is_star(a.as_ref())) {
         return Ok(std::borrow::Cow::Borrowed(args));
     }
     let string = |s: &str| {
@@ -2635,7 +2646,7 @@ pub(crate) fn expand_row_args<'a>(
     };
     // `(expr).*`: one field selection per field of `expr`'s composite type.
     let expand_indirection = |ind: &ast::AIndirection,
-                              arg: &Option<ast::Node>,
+                              arg: Option<&ast::Node>,
                               out: &mut Vec<Option<ast::Node>>|
      -> Result<(), AnalyzeError> {
         let mut scratch = params.clone();
@@ -2653,7 +2664,7 @@ pub(crate) fn expand_row_args<'a>(
                     })))
                 }));
             }
-            None => out.push(arg.clone()),
+            None => out.push(arg.cloned()),
         }
         Ok(())
     };
@@ -2677,13 +2688,13 @@ pub(crate) fn expand_row_args<'a>(
                     })),
                     // A SQL function parameter's `v.*` is `(v).*`.
                     None => match sql_function_param_star(cr, ctx.scope, ctx.snapshot) {
-                        Some(ind) => expand_indirection(&ind, arg, &mut out)?,
+                        Some(ind) => expand_indirection(&ind, arg.as_ref(), &mut out)?,
                         None => out.push(arg.clone()),
                     },
                 }
             }
             Some(ast::Node::AIndirection(ind)) if ends_in_star(&ind.indirection) => {
-                expand_indirection(ind, arg, &mut out)?;
+                expand_indirection(ind, arg.as_ref(), &mut out)?;
             }
             _ => out.push(arg.clone()),
         }

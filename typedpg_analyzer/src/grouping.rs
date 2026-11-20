@@ -81,7 +81,13 @@ pub(crate) fn expand_grouping_sets(
     let mut per_entry: Vec<Vec<HashSet<GroupItem>>> = Vec::new();
     let mut saw_grouping_set = false;
     for node in group_clause {
-        let alts = alternatives_for(node, scope, targets, snapshot, &mut saw_grouping_set);
+        let alts = alternatives_for(
+            node.as_ref(),
+            scope,
+            targets,
+            snapshot,
+            &mut saw_grouping_set,
+        );
         per_entry.push(alts);
     }
 
@@ -172,8 +178,8 @@ const MAX_GROUPING_SETS: u64 = 4096;
 /// its entries' alternatives, as PG's expand_grouping_sets counts them
 /// (saturating).
 fn grouping_set_count(group_clause: &[Option<ast::Node>]) -> u64 {
-    fn alternatives(node: &Option<ast::Node>) -> u64 {
-        let Some(ast::Node::GroupingSet(gs)) = node.as_ref() else {
+    fn alternatives(node: Option<&ast::Node>) -> u64 {
+        let Some(ast::Node::GroupingSet(gs)) = node else {
             return 1;
         };
         let n = gs.content.len() as u64;
@@ -183,25 +189,25 @@ fn grouping_set_count(group_clause: &[Option<ast::Node>]) -> u64 {
             GroupingSetKind::GroupingSetSets => gs
                 .content
                 .iter()
-                .fold(0u64, |acc, c| acc.saturating_add(alternatives(c)))
+                .fold(0u64, |acc, c| acc.saturating_add(alternatives(c.as_ref())))
                 .max(1),
             _ => 1,
         }
     }
     group_clause
         .iter()
-        .fold(1u64, |acc, n| acc.saturating_mul(alternatives(n)))
+        .fold(1u64, |acc, n| acc.saturating_mul(alternatives(n.as_ref())))
 }
 
 /// Alternatives contributed by one node in the top-level `group_clause`.
 fn alternatives_for(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
     saw_grouping_set: &mut bool,
 ) -> Vec<HashSet<GroupItem>> {
-    match node.as_ref() {
+    match node {
         Some(ast::Node::GroupingSet(gs)) => {
             *saw_grouping_set = true;
             alternatives_for_grouping_set(gs, scope, targets, snapshot, saw_grouping_set)
@@ -224,7 +230,7 @@ fn alternatives_for_grouping_set(
             // `(a, b)` — a single set with the union of its members.
             let mut set = HashSet::new();
             for item in &gs.content {
-                set.extend(singleton_set(item, scope, targets, snapshot));
+                set.extend(singleton_set(item.as_ref(), scope, targets, snapshot));
             }
             vec![set]
         }
@@ -233,7 +239,7 @@ fn alternatives_for_grouping_set(
             let items: Vec<HashSet<GroupItem>> = gs
                 .content
                 .iter()
-                .map(|n| singleton_set(n, scope, targets, snapshot))
+                .map(|n| singleton_set(n.as_ref(), scope, targets, snapshot))
                 .collect();
             let mut alts = Vec::with_capacity(items.len() + 1);
             for cut in (0..=items.len()).rev() {
@@ -250,7 +256,7 @@ fn alternatives_for_grouping_set(
             let items: Vec<HashSet<GroupItem>> = gs
                 .content
                 .iter()
-                .map(|n| singleton_set(n, scope, targets, snapshot))
+                .map(|n| singleton_set(n.as_ref(), scope, targets, snapshot))
                 .collect();
             let n = items.len();
             let mut alts = Vec::with_capacity(1usize << n.min(16));
@@ -272,7 +278,7 @@ fn alternatives_for_grouping_set(
             let mut alts = Vec::new();
             for child in &gs.content {
                 alts.extend(alternatives_for(
-                    child,
+                    child.as_ref(),
                     scope,
                     targets,
                     snapshot,
@@ -293,8 +299,8 @@ fn alternatives_for_grouping_set(
 /// expressions (`GROUP BY (a, b)` is `GROUP BY a, b`; `ROLLUP((a, b))`
 /// rolls the pair up as one unit). An explicit `ROW(a, b)` stays one
 /// composite expression.
-pub(crate) fn implicit_row_items(node: &Option<ast::Node>) -> Option<&Vec<Option<ast::Node>>> {
-    match node.as_ref() {
+pub(crate) fn implicit_row_items(node: Option<&ast::Node>) -> Option<&Vec<Option<ast::Node>>> {
+    match node {
         Some(ast::Node::RowExpr(r)) if r.row_format == ast::CoercionForm::CoerceImplicitCast => {
             Some(&r.args)
         }
@@ -308,7 +314,7 @@ pub(crate) fn implicit_row_items(node: &Option<ast::Node>) -> Option<&Vec<Option
 /// ([`group_leaf`]) — or an empty set otherwise (does not drive
 /// nullability promotion).
 fn singleton_set(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
@@ -316,7 +322,7 @@ fn singleton_set(
     if let Some(items) = implicit_row_items(node) {
         return items
             .iter()
-            .flat_map(|i| singleton_set(i, scope, targets, snapshot))
+            .flat_map(|i| singleton_set(i.as_ref(), scope, targets, snapshot))
             .collect();
     }
     let (leaf, target) = group_leaf(node, scope, targets, snapshot);
@@ -348,7 +354,7 @@ enum GroupLeaf {
 /// the first target-list entry equal to it. Returns what the leaf denotes
 /// and the position of the entry it is, if any.
 fn group_leaf(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
@@ -356,16 +362,16 @@ fn group_leaf(
     let target_column = |rt: &ast::ResTarget| match rt.val.as_ref() {
         Some(v) => match resolve_group_column(Some(v), scope, snapshot) {
             Some(key) => GroupLeaf::Column(key),
-            None => GroupLeaf::Expr(expr_key(&rt.val, scope, snapshot)),
+            None => GroupLeaf::Expr(expr_key(rt.val.as_ref(), scope, snapshot)),
         },
         None => GroupLeaf::Other,
     };
     // findTargetlistEntrySQL99: the first entry equal to the expression.
-    let equal_target = |node: &Option<ast::Node>, column: Option<&ColKey>| {
+    let equal_target = |node: Option<&ast::Node>, column: Option<&ColKey>| {
         targets.iter().position(|t| match t {
             ExpandedTarget::Expr(rt) => rt.val.as_ref().is_some_and(|v| match column {
                 Some(key) => resolve_group_column(Some(v), scope, snapshot).as_ref() == Some(key),
-                None => same_level_exprs_equal(&rt.val, node, scope, snapshot),
+                None => same_level_exprs_equal(rt.val.as_ref(), node, scope, snapshot),
             }),
             ExpandedTarget::StarColumn {
                 column: Some((alias, col)),
@@ -374,18 +380,17 @@ fn group_leaf(
             ExpandedTarget::StarColumn { column: None, .. } => false,
         })
     };
-    let expression =
-        |node: &Option<ast::Node>| match resolve_group_column(node.as_ref(), scope, snapshot) {
-            Some(key) => {
-                let target = equal_target(node, Some(&key));
-                (GroupLeaf::Column(key), target)
-            }
-            None => (
-                GroupLeaf::Expr(expr_key(node, scope, snapshot)),
-                equal_target(node, None),
-            ),
-        };
-    match node.as_ref() {
+    let expression = |node: Option<&ast::Node>| match resolve_group_column(node, scope, snapshot) {
+        Some(key) => {
+            let target = equal_target(node, Some(&key));
+            (GroupLeaf::Column(key), target)
+        }
+        None => (
+            GroupLeaf::Expr(expr_key(node, scope, snapshot)),
+            equal_target(node, None),
+        ),
+    };
+    match node {
         Some(ast::Node::AConst(ac)) => match &ac.val {
             Some(ast::AConstValue::Integer(i)) => {
                 let position = (i.ival as usize).wrapping_sub(1);
@@ -404,7 +409,7 @@ fn group_leaf(
             _ => (GroupLeaf::Other, None),
         },
         Some(ast::Node::ColumnRef(cr)) => {
-            if resolve_group_column(node.as_ref(), scope, snapshot).is_some() {
+            if resolve_group_column(node, scope, snapshot).is_some() {
                 return expression(node);
             }
             let alias = match cr.fields.as_slice() {
@@ -443,12 +448,13 @@ pub(crate) const EXPR_KEY: &str = "\u{0}expr";
 /// as the columns they are ([`whole_row_fields`]: `(t).g` is `t.g`) and its
 /// type names resolved as the GROUP BY check compares them
 /// ([`resolve_type_names`]: `CAST(g AS bigint)` is `g::int8`).
-pub(crate) fn expr_key(node: &Option<ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> String {
-    let node = own_whole_row_fields(node.as_ref(), scope);
+pub(crate) fn expr_key(node: Option<&ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> String {
+    let node = own_whole_row_fields(node, scope);
     let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
-    crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(
-        resolve_type_names(&node, snapshot).as_ref(),
-    ))
+    crate::resolve::node_fingerprint(
+        crate::resolve::predtest_unqualify(resolve_type_names(node.as_ref(), snapshot).as_ref())
+            .as_ref(),
+    )
 }
 
 /// [`crate::resolve::node_fingerprint`] of `node` with its casts that are
@@ -459,7 +465,7 @@ pub(crate) fn expr_key(node: &Option<ast::Node>, scope: &Scope, snapshot: &PgCat
 pub(crate) fn typed_fingerprint(node: &ast::Node, scope: &Scope, snapshot: &PgCatalog) -> String {
     let node = own_whole_row_fields(Some(node), scope);
     let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
-    crate::resolve::node_fingerprint(&resolve_type_names(&node, snapshot))
+    crate::resolve::node_fingerprint(resolve_type_names(node.as_ref(), snapshot).as_ref())
 }
 
 /// `node` with every type name it holds resolved to its type — PG
@@ -469,14 +475,14 @@ pub(crate) fn typed_fingerprint(node: &ast::Node, scope: &Scope, snapshot: &PgCa
 /// bounds it accounts for; a typmod stays). A name that doesn't resolve
 /// stays as written.
 pub(crate) fn resolve_type_names(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
 ) -> Option<ast::Node> {
     use typedpg_pg_query::NodeMut;
     let mut tree = ast::ParseResult {
         version: 0,
         stmts: vec![ast::RawStmt {
-            stmt: node.clone(),
+            stmt: node.cloned(),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -553,7 +559,7 @@ fn strip_noop_casts(
                 && tc
                     .type_name
                     .as_ref()
-                    .is_some_and(|tn| is_noop_cast(&tc.arg, tn, scope, snapshot, own))
+                    .is_some_and(|tn| is_noop_cast(tc.arg.as_ref(), tn, scope, snapshot, own))
                 && let Some(arg) = tc.arg.take()
             {
                 *n = arg;
@@ -569,14 +575,14 @@ fn strip_noop_casts(
 /// a subquery or a column `own` refuses isn't typed here: neither is
 /// reported.
 fn is_noop_cast(
-    arg: &Option<ast::Node>,
+    arg: Option<&ast::Node>,
     tn: &ast::TypeName,
     scope: &Scope,
     snapshot: &PgCatalog,
     own: &dyn Fn(&ast::ColumnRef) -> bool,
 ) -> bool {
     use typedpg_pg_query::NodeRef;
-    let (type_oid, typmod) = match arg.as_ref() {
+    let (type_oid, typmod) = match arg {
         None | Some(ast::Node::AConst(_) | ast::Node::ParamRef(_)) => return false,
         Some(ast::Node::ColumnRef(cr)) => {
             if !own(cr) {
@@ -805,19 +811,21 @@ fn join_flattening(
 
     /// How many scope entries a FROM item yields (an aliased join is one);
     /// `None` when unsure.
-    fn count(n: &Option<ast::Node>) -> Option<usize> {
-        match n.as_ref()? {
+    fn count(n: Option<&ast::Node>) -> Option<usize> {
+        match n? {
             ast::Node::JoinExpr(j) if j.alias.is_some() => Some(1),
-            ast::Node::JoinExpr(j) => {
-                Some(count(&j.larg)? + count(&j.rarg)? + usize::from(!j.using_clause.is_empty()))
-            }
+            ast::Node::JoinExpr(j) => Some(
+                count(j.larg.as_ref())?
+                    + count(j.rarg.as_ref())?
+                    + usize::from(!j.using_clause.is_empty()),
+            ),
             _ => Some(1),
         }
     }
 
     /// The name PG gives a FROM item's entry.
-    fn entry_name(n: &Option<ast::Node>) -> Option<String> {
-        match n.as_ref()? {
+    fn entry_name(n: Option<&ast::Node>) -> Option<String> {
+        match n? {
             ast::Node::RangeVar(rv) => Some(
                 rv.alias
                     .as_ref()
@@ -825,7 +833,7 @@ fn join_flattening(
             ),
             ast::Node::RangeSubselect(rs) => rs.alias.as_ref().map(|a| a.aliasname.clone()),
             ast::Node::RangeFunction(rf) => rf.alias.as_ref().map(|a| a.aliasname.clone()),
-            ast::Node::RangeTableSample(ts) => entry_name(&ts.relation),
+            ast::Node::RangeTableSample(ts) => entry_name(ts.relation.as_ref()),
             _ => None,
         }
     }
@@ -834,7 +842,7 @@ fn join_flattening(
     /// USING columns, then the left side's others, then the right side's),
     /// recording what the USING and aliased-join columns stand for.
     fn item<'a>(
-        n: &Option<ast::Node>,
+        n: Option<&ast::Node>,
         place: Place<'a>,
         cx: &mut Ctx<'a>,
     ) -> Option<Vec<OutColumn>> {
@@ -845,7 +853,7 @@ fn join_flattening(
                     .is_some_and(|h| h.join == join && h.name == name)
             })
         };
-        let ast::Node::JoinExpr(j) = n.as_ref()? else {
+        let ast::Node::JoinExpr(j) = n? else {
             let source = match place {
                 Place::Span(start) => cx.sources.get(start)?,
                 Place::Shadowed(join) => hidden(cx.shadowed, join, &entry_name(n)?)?,
@@ -888,11 +896,11 @@ fn join_flattening(
             }
         };
         let right_place = match inner {
-            Place::Span(left) => Place::Span(left + count(larg)?),
+            Place::Span(left) => Place::Span(left + count(larg.as_ref())?),
             shadowed => shadowed,
         };
-        let left = item(larg, inner, cx)?;
-        let right = item(rarg, right_place, cx)?;
+        let left = item(larg.as_ref(), inner, cx)?;
+        let right = item(rarg.as_ref(), right_place, cx)?;
         let mut output: Vec<OutColumn> = Vec::new();
         let merged_entry: Option<&TableSource> = match merged_at {
             Some(at) => Some(cx.sources.get(at)?),
@@ -961,10 +969,10 @@ fn join_flattening(
     };
     let mut start = 0;
     for from_item in &sel.from_clause {
-        if item(from_item, Place::Span(start), &mut cx).is_none() {
+        if item(from_item.as_ref(), Place::Span(start), &mut cx).is_none() {
             return HashMap::new();
         }
-        match count(from_item) {
+        match count(from_item.as_ref()) {
             Some(n) => start += n,
             None => return HashMap::new(),
         }
@@ -1396,8 +1404,8 @@ fn current_chain(scope: &Scope) -> Chain {
 }
 
 /// `n` itself when it holds a node: an absent field yields nothing.
-fn present(n: &Option<ast::Node>) -> Option<&Option<ast::Node>> {
-    n.as_ref().map(|_| n)
+fn present(n: Option<&ast::Node>) -> Option<Option<&ast::Node>> {
+    n.map(Some)
 }
 
 /// An aggregate, `GROUPING(…)` or window call written at some level.
@@ -1406,36 +1414,40 @@ enum Call<'a> {
     /// its level, and its direct arguments (an ordered-set aggregate's),
     /// which are evaluated once per group like any grouped expression.
     Aggregate {
-        aggregated: Vec<&'a Option<ast::Node>>,
-        direct: Vec<&'a Option<ast::Node>>,
+        aggregated: Vec<Option<&'a ast::Node>>,
+        direct: Vec<Option<&'a ast::Node>>,
         location: i32,
     },
     Grouping(&'a ast::GroupingFunc),
     Window(i32),
 }
 
-fn call_of<'a>(node: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Option<Call<'a>> {
-    fn sort_exprs(order: &[Option<ast::Node>]) -> impl Iterator<Item = &Option<ast::Node>> {
+fn call_of<'a>(node: Option<&'a ast::Node>, snapshot: &PgCatalog) -> Option<Call<'a>> {
+    fn sort_exprs(order: &[Option<ast::Node>]) -> impl Iterator<Item = Option<&ast::Node>> {
         order.iter().filter_map(|o| match o.as_ref() {
-            Some(ast::Node::SortBy(sb)) => present(&sb.node),
-            _ => Some(o),
+            Some(ast::Node::SortBy(sb)) => present(sb.node.as_ref()),
+            _ => Some(o.as_ref()),
         })
     }
-    match node.as_ref()? {
+    match node? {
         ast::Node::FuncCall(fc) if fc.over.is_some() => Some(Call::Window(fc.location)),
         ast::Node::FuncCall(fc) if crate::resolve::is_aggregate_call(fc, snapshot) => {
             let (mut aggregated, direct): (Vec<_>, Vec<_>) = if fc.agg_within_group {
                 (
                     sort_exprs(&fc.agg_order).collect(),
-                    fc.args.iter().collect(),
+                    fc.args.iter().map(Option::as_ref).collect(),
                 )
             } else {
                 (
-                    fc.args.iter().chain(sort_exprs(&fc.agg_order)).collect(),
+                    fc.args
+                        .iter()
+                        .map(Option::as_ref)
+                        .chain(sort_exprs(&fc.agg_order))
+                        .collect(),
                     Vec::new(),
                 )
             };
-            aggregated.extend(present(&fc.agg_filter));
+            aggregated.extend(present(fc.agg_filter.as_ref()));
             Some(Call::Aggregate {
                 aggregated,
                 direct,
@@ -1443,7 +1455,7 @@ fn call_of<'a>(node: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Option<Call
             })
         }
         ast::Node::JsonObjectAgg(_) | ast::Node::JsonArrayAgg(_) => {
-            let ctor = match node.as_ref()? {
+            let ctor = match node? {
                 ast::Node::JsonObjectAgg(a) => a.constructor.as_deref(),
                 ast::Node::JsonArrayAgg(a) => a.constructor.as_deref(),
                 _ => None,
@@ -1464,27 +1476,28 @@ fn call_of<'a>(node: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Option<Call
 }
 
 /// The PARTITION BY / ORDER BY expressions of a window definition.
-fn window_key_exprs(wd: &ast::WindowDef) -> impl Iterator<Item = &Option<ast::Node>> {
+fn window_key_exprs(wd: &ast::WindowDef) -> impl Iterator<Item = Option<&ast::Node>> {
     wd.partition_clause
         .iter()
+        .map(Option::as_ref)
         .chain(wd.order_clause.iter().filter_map(|o| match o.as_ref() {
-            Some(ast::Node::SortBy(sb)) => present(&sb.node),
+            Some(ast::Node::SortBy(sb)) => present(sb.node.as_ref()),
             _ => None,
         }))
 }
 
 /// The expressions of a window definition, frame offsets included.
-fn window_def_exprs(wd: &ast::WindowDef) -> impl Iterator<Item = &Option<ast::Node>> {
+fn window_def_exprs(wd: &ast::WindowDef) -> impl Iterator<Item = Option<&ast::Node>> {
     window_key_exprs(wd)
-        .chain(present(&wd.start_offset))
-        .chain(present(&wd.end_offset))
+        .chain(present(wd.start_offset.as_ref()))
+        .chain(present(wd.end_offset.as_ref()))
 }
 
 /// The direct sub-expressions of `node` at its own query level — a window
 /// call's window definition included.
-fn level_children(node: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
+fn level_children(node: Option<&ast::Node>) -> Vec<Option<&ast::Node>> {
     let mut out = crate::resolve::expr_children(node);
-    let over = match node.as_ref() {
+    let over = match node {
         Some(ast::Node::FuncCall(fc)) => fc.over.as_deref(),
         Some(ast::Node::JsonObjectAgg(a)) => {
             a.constructor.as_deref().and_then(|c| c.over.as_deref())
@@ -1501,60 +1514,68 @@ fn level_children(node: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
 /// Every expression SELECT `sel` evaluates at its own level: its clauses,
 /// its FROM items' join conditions and function arguments; not the
 /// subqueries it contains.
-fn select_level_exprs(sel: &ast::SelectStmt) -> Vec<&Option<ast::Node>> {
-    fn from_item<'a>(n: &'a Option<ast::Node>, out: &mut Vec<&'a Option<ast::Node>>) {
-        match n.as_ref() {
+fn select_level_exprs(sel: &ast::SelectStmt) -> Vec<Option<&ast::Node>> {
+    fn from_item<'a>(n: Option<&'a ast::Node>, out: &mut Vec<Option<&'a ast::Node>>) {
+        match n {
             Some(ast::Node::JoinExpr(j)) => {
-                for side in [&j.larg, &j.rarg].into_iter().filter_map(present) {
+                for side in [&j.larg, &j.rarg]
+                    .into_iter()
+                    .filter_map(|n| present(n.as_ref()))
+                {
                     from_item(side, out);
                 }
-                out.extend(present(&j.quals));
+                out.extend(present(j.quals.as_ref()));
             }
             Some(ast::Node::RangeFunction(rf)) => {
                 for f in &rf.functions {
                     if let Some(ast::Node::List(pair)) = f.as_ref() {
-                        out.extend(pair.items.first());
+                        out.extend(pair.items.first().map(Option::as_ref));
                     }
                 }
             }
             Some(ast::Node::RangeTableSample(ts)) => {
                 if ts.relation.is_some() {
-                    from_item(&ts.relation, out);
+                    from_item(ts.relation.as_ref(), out);
                 }
-                out.extend(ts.args.iter());
-                out.extend(present(&ts.repeatable));
+                out.extend(ts.args.iter().map(Option::as_ref));
+                out.extend(present(ts.repeatable.as_ref()));
             }
             _ => {}
         }
     }
-    let mut out: Vec<&Option<ast::Node>> = Vec::new();
+    let mut out: Vec<Option<&ast::Node>> = Vec::new();
     for t in &sel.target_list {
         if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
-            out.extend(present(&rt.val));
+            out.extend(present(rt.val.as_ref()));
         }
     }
     for f in &sel.from_clause {
-        from_item(f, &mut out);
+        from_item(f.as_ref(), &mut out);
     }
-    out.extend(present(&sel.where_clause));
-    out.extend(sel.group_clause.iter());
-    out.extend(present(&sel.having_clause));
+    out.extend(present(sel.where_clause.as_ref()));
+    out.extend(sel.group_clause.iter().map(Option::as_ref));
+    out.extend(present(sel.having_clause.as_ref()));
     for w in &sel.window_clause {
         if let Some(ast::Node::WindowDef(wd)) = w.as_ref() {
             out.extend(window_def_exprs(wd));
         }
     }
-    out.extend(sel.distinct_clause.iter().filter(|n| n.is_some()));
+    out.extend(
+        sel.distinct_clause
+            .iter()
+            .map(Option::as_ref)
+            .filter(|n| n.is_some()),
+    );
     for s in &sel.sort_clause {
         if let Some(ast::Node::SortBy(sb)) = s.as_ref() {
-            out.extend(present(&sb.node));
+            out.extend(present(sb.node.as_ref()));
         }
     }
-    out.extend(present(&sel.limit_offset));
-    out.extend(present(&sel.limit_count));
+    out.extend(present(sel.limit_offset.as_ref()));
+    out.extend(present(sel.limit_count.as_ref()));
     for row in &sel.values_lists {
         if let Some(ast::Node::List(l)) = row.as_ref() {
-            out.extend(l.items.iter());
+            out.extend(l.items.iter().map(Option::as_ref));
         }
     }
     out
@@ -1562,7 +1583,7 @@ fn select_level_exprs(sel: &ast::SelectStmt) -> Vec<&Option<ast::Node>> {
 
 /// Post-order visit of `node` and its same-level sub-expressions: PG's
 /// order of transforming the calls, each after its arguments.
-fn visit_level_post<'a>(node: &'a Option<ast::Node>, f: &mut dyn FnMut(&'a Option<ast::Node>)) {
+fn visit_level_post<'a>(node: Option<&'a ast::Node>, f: &mut dyn FnMut(Option<&'a ast::Node>)) {
     for c in level_children(node) {
         visit_level_post(c, f);
     }
@@ -1575,12 +1596,12 @@ fn visit_level_post<'a>(node: &'a Option<ast::Node>, f: &mut dyn FnMut(&'a Optio
 /// expressions are `f`'s business). Levels the analysis never registered
 /// are skipped.
 fn visit_select(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     depth: usize,
     chain: &mut Chain,
-    f: &mut dyn FnMut(&Option<ast::Node>, usize, &mut Chain),
+    f: &mut dyn FnMut(Option<&ast::Node>, usize, &mut Chain),
 ) {
-    if let Some(ast::Node::SelectStmt(sel)) = node.as_ref() {
+    if let Some(ast::Node::SelectStmt(sel)) = node {
         visit_select_stmt(sel, depth, chain, f);
     }
 }
@@ -1589,16 +1610,19 @@ fn visit_select_stmt(
     sel: &ast::SelectStmt,
     depth: usize,
     chain: &mut Chain,
-    f: &mut dyn FnMut(&Option<ast::Node>, usize, &mut Chain),
+    f: &mut dyn FnMut(Option<&ast::Node>, usize, &mut Chain),
 ) {
-    fn from_subqueries<'a>(n: &'a Option<ast::Node>, out: &mut Vec<&'a Option<ast::Node>>) {
-        match n.as_ref() {
+    fn from_subqueries<'a>(n: Option<&'a ast::Node>, out: &mut Vec<Option<&'a ast::Node>>) {
+        match n {
             Some(ast::Node::JoinExpr(j)) => {
-                for side in [&j.larg, &j.rarg].into_iter().filter_map(present) {
+                for side in [&j.larg, &j.rarg]
+                    .into_iter()
+                    .filter_map(|n| present(n.as_ref()))
+                {
                     from_subqueries(side, out);
                 }
             }
-            Some(ast::Node::RangeSubselect(rs)) => out.extend(present(&rs.subquery)),
+            Some(ast::Node::RangeSubselect(rs)) => out.extend(present(rs.subquery.as_ref())),
             _ => {}
         }
     }
@@ -1612,13 +1636,13 @@ fn visit_select_stmt(
     if let Some(with) = &sel.with_clause {
         for cte in &with.ctes {
             if let Some(ast::Node::CommonTableExpr(c)) = cte.as_ref() {
-                visit_select(&c.ctequery, depth + 1, chain, f);
+                visit_select(c.ctequery.as_ref(), depth + 1, chain, f);
             }
         }
     }
     let mut subs = Vec::new();
     for item in &sel.from_clause {
-        from_subqueries(item, &mut subs);
+        from_subqueries(item.as_ref(), &mut subs);
     }
     for s in subs {
         visit_select(s, depth + 1, chain, f);
@@ -1633,9 +1657,9 @@ fn visit_select_stmt(
 /// from the innermost level of `chain` a call with these arguments belongs
 /// to — the nearest level any column reference in them reaches (a
 /// sublink's references to its own levels aside), or 0 without any.
-fn call_level(args: &[&Option<ast::Node>], chain: &mut Chain) -> usize {
-    fn walk(node: &Option<ast::Node>, depth: usize, chain: &mut Chain, min: &mut Option<usize>) {
-        match node.as_ref() {
+fn call_level(args: &[Option<&ast::Node>], chain: &mut Chain) -> usize {
+    fn walk(node: Option<&ast::Node>, depth: usize, chain: &mut Chain, min: &mut Option<usize>) {
+        match node {
             Some(ast::Node::ColumnRef(cr)) => {
                 if let Some(t) = chain.resolve(cr)
                     && t.level >= depth
@@ -1646,17 +1670,17 @@ fn call_level(args: &[&Option<ast::Node>], chain: &mut Chain) -> usize {
             }
             Some(ast::Node::SubLink(sl)) => {
                 if sl.testexpr.is_some() {
-                    walk(&sl.testexpr, depth, chain, min);
+                    walk(sl.testexpr.as_ref(), depth, chain, min);
                 }
                 if sl.subselect.is_some() {
-                    visit_select(&sl.subselect, depth + 1, chain, &mut |e, d, c| {
+                    visit_select(sl.subselect.as_ref(), depth + 1, chain, &mut |e, d, c| {
                         walk(e, d, c, min)
                     });
                 }
             }
             Some(ast::Node::JsonArrayQueryConstructor(q)) => {
                 if q.query.is_some() {
-                    visit_select(&q.query, depth + 1, chain, &mut |e, d, c| {
+                    visit_select(q.query.as_ref(), depth + 1, chain, &mut |e, d, c| {
                         walk(e, d, c, min)
                     });
                 }
@@ -1670,7 +1694,7 @@ fn call_level(args: &[&Option<ast::Node>], chain: &mut Chain) -> usize {
     }
     let mut min = None;
     for a in args {
-        walk(a, 0, chain, &mut min);
+        walk(*a, 0, chain, &mut min);
     }
     min.unwrap_or(0)
 }
@@ -1685,20 +1709,20 @@ struct ArgLevels {
     agg: Option<(usize, i32)>,
 }
 
-fn arg_levels(args: &[&Option<ast::Node>], chain: &mut Chain, snapshot: &PgCatalog) -> ArgLevels {
+fn arg_levels(args: &[Option<&ast::Node>], chain: &mut Chain, snapshot: &PgCatalog) -> ArgLevels {
     fn lower(slot: &mut Option<(usize, i32)>, level: usize, location: i32) {
         if slot.is_none_or(|(l, _)| level < l) {
             *slot = Some((level, location));
         }
     }
     fn walk(
-        node: &Option<ast::Node>,
+        node: Option<&ast::Node>,
         depth: usize,
         chain: &mut Chain,
         snapshot: &PgCatalog,
         out: &mut ArgLevels,
     ) {
-        match node.as_ref() {
+        match node {
             Some(ast::Node::ColumnRef(cr)) => {
                 if let Some(t) = chain.resolve(cr)
                     && t.level >= depth
@@ -1709,10 +1733,10 @@ fn arg_levels(args: &[&Option<ast::Node>], chain: &mut Chain, snapshot: &PgCatal
             }
             Some(ast::Node::SubLink(sl)) => {
                 if sl.testexpr.is_some() {
-                    walk(&sl.testexpr, depth, chain, snapshot, out);
+                    walk(sl.testexpr.as_ref(), depth, chain, snapshot, out);
                 }
                 if sl.subselect.is_some() {
-                    visit_select(&sl.subselect, depth + 1, chain, &mut |e, d, c| {
+                    visit_select(sl.subselect.as_ref(), depth + 1, chain, &mut |e, d, c| {
                         walk(e, d, c, snapshot, out)
                     });
                 }
@@ -1720,7 +1744,7 @@ fn arg_levels(args: &[&Option<ast::Node>], chain: &mut Chain, snapshot: &PgCatal
             }
             Some(ast::Node::JsonArrayQueryConstructor(q)) => {
                 if q.query.is_some() {
-                    visit_select(&q.query, depth + 1, chain, &mut |e, d, c| {
+                    visit_select(q.query.as_ref(), depth + 1, chain, &mut |e, d, c| {
                         walk(e, d, c, snapshot, out)
                     });
                 }
@@ -1737,7 +1761,7 @@ fn arg_levels(args: &[&Option<ast::Node>], chain: &mut Chain, snapshot: &PgCatal
                 ..
             }) => Some((call_level(&aggregated, chain), location)),
             Some(Call::Grouping(g)) => {
-                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
+                let args: Vec<Option<&ast::Node>> = g.args.iter().map(Option::as_ref).collect();
                 Some((call_level(&args, chain), g.location))
             }
             Some(Call::Window(_)) | None => None,
@@ -1753,7 +1777,7 @@ fn arg_levels(args: &[&Option<ast::Node>], chain: &mut Chain, snapshot: &PgCatal
     }
     let mut out = ArgLevels::default();
     for a in args {
-        walk(a, 0, chain, snapshot, &mut out);
+        walk(*a, 0, chain, snapshot, &mut out);
     }
     out
 }
@@ -1765,8 +1789,8 @@ fn arg_levels(args: &[&Option<ast::Node>], chain: &mut Chain, snapshot: &PgCatal
 /// sublinks included (`avg((SELECT count(t.x) FROM u))` nests `t`'s
 /// aggregates).
 fn check_agg_arguments(
-    aggregated: &[&Option<ast::Node>],
-    direct: &[&Option<ast::Node>],
+    aggregated: &[Option<&ast::Node>],
+    direct: &[Option<&ast::Node>],
     level: usize,
     chain: &mut Chain,
     snapshot: &PgCatalog,
@@ -1808,14 +1832,14 @@ fn check_agg_arguments(
 /// that are no coercion are dropped too ([`strip_noop_casts`]), as PG's
 /// transformation drops them.
 fn canonical(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     chain: &Chain,
     level: usize,
     scope: Option<&Scope>,
     snapshot: &PgCatalog,
 ) -> Option<ast::Node> {
     use typedpg_pg_query::{NodeMut, NodeRef};
-    let node = &column_notation_calls(whole_row_fields(node.as_ref(), chain).as_ref(), chain);
+    let node = &column_notation_calls(whole_row_fields(node, chain).as_ref(), chain);
     let stripped;
     let node = match scope {
         Some(scope) => {
@@ -1829,7 +1853,7 @@ fn canonical(
     let mut tree = ast::ParseResult {
         version: 0,
         stmts: vec![ast::RawStmt {
-            stmt: resolve_type_names(node, snapshot),
+            stmt: resolve_type_names(node.as_ref(), snapshot),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -1945,8 +1969,8 @@ fn string_node(s: &str) -> ast::Node {
 /// Whether two expressions of the current level are PG-`equal()` (up to
 /// how their column references are spelled).
 pub(crate) fn same_level_exprs_equal(
-    a: &Option<ast::Node>,
-    b: &Option<ast::Node>,
+    a: Option<&ast::Node>,
+    b: Option<&ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
@@ -1974,7 +1998,7 @@ pub(crate) struct LevelCalls {
 }
 
 pub(crate) fn level_calls(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> LevelCalls {
@@ -1994,7 +2018,7 @@ pub(crate) fn level_calls(
                 }
             }
             Call::Grouping(g) => {
-                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
+                let args: Vec<Option<&ast::Node>> = g.args.iter().map(Option::as_ref).collect();
                 if out.grouping.is_none() && call_level(&args, &mut chain) == 0 {
                     out.grouping = Some(g.location);
                 }
@@ -2012,21 +2036,25 @@ pub(crate) fn level_calls(
 /// (ORDER BY and FILTER included) read — `0` for this level's own.
 pub(crate) fn aggregate_levels_up(fc: &ast::FuncCall, scope: &Scope) -> usize {
     let sort_exprs = fc.agg_order.iter().filter_map(|o| match o.as_ref() {
-        Some(ast::Node::SortBy(sb)) => present(&sb.node),
-        _ => Some(o),
+        Some(ast::Node::SortBy(sb)) => present(sb.node.as_ref()),
+        _ => Some(o.as_ref()),
     });
-    let mut aggregated: Vec<&Option<ast::Node>> = if fc.agg_within_group {
+    let mut aggregated: Vec<Option<&ast::Node>> = if fc.agg_within_group {
         sort_exprs.collect()
     } else {
-        fc.args.iter().chain(sort_exprs).collect()
+        fc.args
+            .iter()
+            .map(Option::as_ref)
+            .chain(sort_exprs)
+            .collect()
     };
-    aggregated.extend(present(&fc.agg_filter));
+    aggregated.extend(present(fc.agg_filter.as_ref()));
     levels_up_of(&aggregated, scope)
 }
 
 /// How many levels out an aggregate whose aggregated expressions are
 /// `aggregated`, written at the current level, belongs.
-pub(crate) fn levels_up_of(aggregated: &[&Option<ast::Node>], scope: &Scope) -> usize {
+pub(crate) fn levels_up_of(aggregated: &[Option<&ast::Node>], scope: &Scope) -> usize {
     call_level(aggregated, &mut current_chain(scope))
 }
 
@@ -2120,14 +2148,14 @@ pub(crate) fn finish_select_level(
                     )
                     .finalize_implicit());
                 }
-                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
+                let args: Vec<Option<&ast::Node>> = g.args.iter().map(Option::as_ref).collect();
                 match call_level(&args, &mut chain) {
                     0 => own_grouping.push(g),
                     up => {
                         let canon = g
                             .args
                             .iter()
-                            .map(|a| canonical(a, &chain, up, None, snapshot))
+                            .map(|a| canonical(a.as_ref(), &chain, up, None, snapshot))
                             .collect();
                         attribute_outer(up, Some(canon), g.location)?;
                     }
@@ -2172,15 +2200,14 @@ pub(crate) fn finish_select_level(
         .finalize_implicit()
     };
     for g in own_grouping {
-        if g.args
-            .iter()
-            .any(|a| !group.contains(&canonical(a, &own, 0, Some(scope), snapshot)))
-        {
+        if g.args.iter().any(|a| {
+            !group.contains(canonical(a.as_ref(), &own, 0, Some(scope), snapshot).as_ref())
+        }) {
             return Err(grouping_error(g.location));
         }
     }
     for (args, location) in &outer_grouping {
-        if args.iter().any(|a| !group.contains(a)) {
+        if args.iter().any(|a| !group.contains(a.as_ref())) {
             return Err(grouping_error(*location));
         }
     }
@@ -2247,7 +2274,7 @@ pub(crate) fn finish_select_level(
             _ => None,
         })
         .collect();
-    let names_target = |n: &Option<ast::Node>| match n.as_ref() {
+    let names_target = |n: Option<&ast::Node>| match n {
         Some(ast::Node::AConst(_)) => true,
         Some(ast::Node::ColumnRef(cr)) => matches!(
             expr::extract_string_fields(&cr.fields).as_slice(),
@@ -2259,7 +2286,7 @@ pub(crate) fn finish_select_level(
         match *t {
             ExpandedTarget::Expr(rt) => {
                 if rt.val.is_some() {
-                    check.expr(&rt.val, 0, &mut own)?;
+                    check.expr(rt.val.as_ref(), 0, &mut own)?;
                 }
             }
             ExpandedTarget::StarColumn {
@@ -2276,14 +2303,14 @@ pub(crate) fn finish_select_level(
     for s in &sel.sort_clause {
         if let Some(ast::Node::SortBy(sb)) = s.as_ref()
             && sb.node.is_some()
-            && !names_target(&sb.node)
+            && !names_target(sb.node.as_ref())
         {
-            check.expr(&sb.node, 0, &mut own)?;
+            check.expr(sb.node.as_ref(), 0, &mut own)?;
         }
     }
     for d in sel.distinct_clause.iter().filter(|n| n.is_some()) {
-        if !names_target(d) {
-            check.expr(d, 0, &mut own)?;
+        if !names_target(d.as_ref()) {
+            check.expr(d.as_ref(), 0, &mut own)?;
         }
     }
     for w in &sel.window_clause {
@@ -2294,7 +2321,7 @@ pub(crate) fn finish_select_level(
         }
     }
     if sel.having_clause.is_some() {
-        check.expr(&sel.having_clause, 0, &mut own)?;
+        check.expr(sel.having_clause.as_ref(), 0, &mut own)?;
     }
     Ok(())
 }
@@ -2371,20 +2398,20 @@ pub(crate) fn finish_values_level(
     let rows_chain = current_chain(rows_scope);
     let mut sort_chain = rows_chain.clone();
     sort_chain.levels[0] = Some(Rc::new(Namespace::of(sort_sources)));
-    let rows: Vec<&Option<ast::Node>> = sel
+    let rows: Vec<Option<&ast::Node>> = sel
         .values_lists
         .iter()
         .filter_map(|row| match row.as_ref() {
-            Some(ast::Node::List(l)) => Some(l.items.iter()),
+            Some(ast::Node::List(l)) => Some(l.items.iter().map(Option::as_ref)),
             _ => None,
         })
         .flatten()
         .collect();
-    let sort: Vec<&Option<ast::Node>> = sel
+    let sort: Vec<Option<&ast::Node>> = sel
         .sort_clause
         .iter()
         .filter_map(|s| match s.as_ref() {
-            Some(ast::Node::SortBy(sb)) => present(&sb.node),
+            Some(ast::Node::SortBy(sb)) => present(sb.node.as_ref()),
             _ => None,
         })
         .collect();
@@ -2407,13 +2434,13 @@ pub(crate) fn finish_values_level(
                     }
                 }
                 Call::Grouping(g) => {
-                    let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
+                    let args: Vec<Option<&ast::Node>> = g.args.iter().map(Option::as_ref).collect();
                     let up = call_level(&args, &mut chain);
                     if up > 0 {
                         let canon = g
                             .args
                             .iter()
-                            .map(|a| canonical(a, &chain, up, None, snapshot))
+                            .map(|a| canonical(a.as_ref(), &chain, up, None, snapshot))
                             .collect();
                         attribute_outer(up, Some(canon), g.location)?;
                     }
@@ -2424,7 +2451,7 @@ pub(crate) fn finish_values_level(
     }
     // The executor initializes the sort keys in order, each top-down.
     fn first(
-        node: &Option<ast::Node>,
+        node: Option<&ast::Node>,
         chain: &mut Chain,
         snapshot: &PgCatalog,
     ) -> Option<(UnplannedCall, i32)> {
@@ -2437,7 +2464,7 @@ pub(crate) fn finish_values_level(
             }) => (call_level(&aggregated, chain) == 0)
                 .then_some((UnplannedCall::Aggregate, location)),
             Some(Call::Grouping(g)) => {
-                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
+                let args: Vec<Option<&ast::Node>> = g.args.iter().map(Option::as_ref).collect();
                 (call_level(&args, chain) == 0).then_some((UnplannedCall::Grouping, g.location))
             }
             None => None,
@@ -2449,7 +2476,7 @@ pub(crate) fn finish_values_level(
         })
     }
     let mut chain = sort_chain;
-    let own = sort.iter().find_map(|e| first(e, &mut chain, snapshot));
+    let own = sort.iter().find_map(|e| first(*e, &mut chain, snapshot));
     // An aggregate of the level in a sublink of the ORDER BY: the sublink's
     // parameter holds it.
     let (outer_aggs, outer_grouping) = FRAMES.with(|f| {
@@ -2497,20 +2524,21 @@ impl GroupExprs {
             .first()
             .and_then(|n| n.as_deref())
             .unwrap_or(&empty);
-        let mut stack: Vec<&Option<ast::Node>> = sel.group_clause.iter().rev().collect();
+        let mut stack: Vec<Option<&ast::Node>> =
+            sel.group_clause.iter().map(Option::as_ref).rev().collect();
         while let Some(g) = stack.pop() {
-            if let Some(ast::Node::GroupingSet(gs)) = g.as_ref() {
-                stack.extend(gs.content.iter().rev());
+            if let Some(ast::Node::GroupingSet(gs)) = g {
+                stack.extend(gs.content.iter().map(Option::as_ref).rev());
                 continue;
             }
             if let Some(items) = implicit_row_items(g) {
-                stack.extend(items.iter().rev());
+                stack.extend(items.iter().map(Option::as_ref).rev());
                 continue;
             }
             // findTargetlistEntrySQL92: a position, or a name that is no
             // input column but an output column, stands for that
             // select-list entry.
-            let target = match g.as_ref() {
+            let target = match g {
                 Some(ast::Node::AConst(ac)) => match &ac.val {
                     Some(ast::AConstValue::Integer(i)) => {
                         targets.get((i.ival as usize).wrapping_sub(1)).copied()
@@ -2518,7 +2546,7 @@ impl GroupExprs {
                     _ => None,
                 },
                 Some(ast::Node::ColumnRef(cr))
-                    if resolve_group_column(g.as_ref(), scope, snapshot).is_none() =>
+                    if resolve_group_column(g, scope, snapshot).is_none() =>
                 {
                     match expr::extract_string_fields(&cr.fields).as_slice() {
                         [name] => targets
@@ -2535,7 +2563,7 @@ impl GroupExprs {
             };
             let expr = match target {
                 Some(ExpandedTarget::Expr(rt)) => match rt.val.as_ref() {
-                    Some(_) => &rt.val,
+                    Some(_) => rt.val.as_ref(),
                     None => continue,
                 },
                 Some(ExpandedTarget::StarColumn {
@@ -2550,7 +2578,7 @@ impl GroupExprs {
             };
             // A cast that is no coercion is the column itself, and so is a
             // field selected from the whole row.
-            let expr = &whole_row_fields(expr.as_ref(), own);
+            let expr = &whole_row_fields(expr, own);
             let expr = &strip_noop_casts(expr.as_ref(), scope, snapshot, &|cr| {
                 matches!(own.resolve(cr), Some(RefTarget { level: 0, .. }))
             });
@@ -2566,7 +2594,7 @@ impl GroupExprs {
             }
             out.have_non_var = true;
             out.exprs
-                .push(canonical(expr, own, 0, Some(scope), snapshot));
+                .push(canonical(expr.as_ref(), own, 0, Some(scope), snapshot));
         }
         out
     }
@@ -2590,8 +2618,12 @@ impl GroupExprs {
             }))));
     }
 
-    fn contains(&self, canonical_expr: &Option<ast::Node>) -> bool {
-        self.exprs.iter().any(|e| e.equal(canonical_expr))
+    fn contains(&self, canonical_expr: Option<&ast::Node>) -> bool {
+        self.exprs.iter().any(|e| match (e, canonical_expr) {
+            (Some(e), Some(c)) => e.equal(c),
+            (None, None) => true,
+            _ => false,
+        })
     }
 }
 
@@ -2608,11 +2640,11 @@ impl UngroupedCheck<'_> {
     /// `chain` starts at `node`'s level and ends at the grouped one.
     fn expr(
         &self,
-        node: &Option<ast::Node>,
+        node: Option<&ast::Node>,
         depth: usize,
         chain: &mut Chain,
     ) -> Result<(), AnalyzeError> {
-        match node.as_ref() {
+        match node {
             None | Some(ast::Node::AConst(_)) | Some(ast::Node::ParamRef(_)) => {
                 return Ok(());
             }
@@ -2636,7 +2668,7 @@ impl UngroupedCheck<'_> {
                 }
             }
             Some(Call::Grouping(g)) => {
-                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
+                let args: Vec<Option<&ast::Node>> = g.args.iter().map(Option::as_ref).collect();
                 if call_level(&args, chain) == depth {
                     return Ok(());
                 }
@@ -2645,7 +2677,7 @@ impl UngroupedCheck<'_> {
         }
         // A whole row coerced to a composite is no longer the whole-row
         // reference a `GROUP BY s` groups by, but its columns (below).
-        let expanded_row = match node.as_ref() {
+        let expanded_row = match node {
             Some(ast::Node::ColumnRef(cr)) => matches!(
                 chain.resolve(cr),
                 Some(RefTarget { target: Some((alias, None)), .. })
@@ -2658,11 +2690,11 @@ impl UngroupedCheck<'_> {
             && self.group.have_non_var
             && self
                 .group
-                .contains(&canonical(node, chain, 0, Some(self.scope), self.snapshot))
+                .contains(canonical(node, chain, 0, Some(self.scope), self.snapshot).as_ref())
         {
             return Ok(());
         }
-        match node.as_ref() {
+        match node {
             Some(ast::Node::ColumnRef(cr)) => {
                 if let Some(RefTarget {
                     level,
@@ -2673,7 +2705,7 @@ impl UngroupedCheck<'_> {
                     // Column notation `t.f` is the call `f(t.*)`: it reads
                     // the whole row.
                     if let Some((_, whole_row)) = chain.column_notation(cr) {
-                        return self.expr(&Some(whole_row), depth, chain);
+                        return self.expr(Some(&whole_row), depth, chain);
                     }
                     let named = match col {
                         Some(col) => vec![col],
@@ -2700,19 +2732,19 @@ impl UngroupedCheck<'_> {
             // A field selected from a whole row reads that column only.
             Some(ast::Node::AIndirection(ind)) if chain.whole_row_field(ind).is_some() => {
                 let column = chain.whole_row_field(ind).expect("checked above");
-                self.expr(&Some(column), depth, chain)
+                self.expr(Some(&column), depth, chain)
             }
             Some(ast::Node::SubLink(sl)) => {
                 if sl.testexpr.is_some() {
-                    self.expr(&sl.testexpr, depth, chain)?;
+                    self.expr(sl.testexpr.as_ref(), depth, chain)?;
                 }
                 match sl.subselect.as_ref() {
-                    Some(_) => self.select(&sl.subselect, depth + 1, chain),
+                    Some(_) => self.select(sl.subselect.as_ref(), depth + 1, chain),
                     None => Ok(()),
                 }
             }
             Some(ast::Node::JsonArrayQueryConstructor(q)) => match q.query.as_ref() {
-                Some(_) => self.select(&q.query, depth + 1, chain),
+                Some(_) => self.select(q.query.as_ref(), depth + 1, chain),
                 None => Ok(()),
             },
             _ => {
@@ -2727,7 +2759,7 @@ impl UngroupedCheck<'_> {
     /// Check every expression of the sublink query `node`.
     fn select(
         &self,
-        node: &Option<ast::Node>,
+        node: Option<&ast::Node>,
         depth: usize,
         chain: &mut Chain,
     ) -> Result<(), AnalyzeError> {

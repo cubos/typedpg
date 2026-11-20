@@ -48,9 +48,9 @@ pub(crate) fn take_level_summary() -> LevelSummary {
 }
 
 /// A literal `TRUE` (`WHERE true`, `ON true`).
-pub(crate) fn is_true_const(n: &Option<ast::Node>) -> bool {
+pub(crate) fn is_true_const(n: Option<&ast::Node>) -> bool {
     matches!(
-        n.as_ref(),
+        n,
         Some(ast::Node::AConst(c)) if !c.isnull
             && matches!(&c.val, Some(ast::AConstValue::Boolean(b)) if b.boolval)
     )
@@ -58,8 +58,8 @@ pub(crate) fn is_true_const(n: &Option<ast::Node>) -> bool {
 
 /// A LIMIT / OFFSET operand that is a constant: `Some(None)` when absent,
 /// `ALL` or NULL, `Some(Some(n))` for an integer.
-fn const_count(n: &Option<ast::Node>) -> Option<Option<i64>> {
-    match n.as_ref() {
+fn const_count(n: Option<&ast::Node>) -> Option<Option<i64>> {
+    match n {
         None => Some(None),
         Some(ast::Node::AConst(ac)) if ac.isnull => Some(None),
         Some(ast::Node::AConst(ac)) => match &ac.val {
@@ -73,14 +73,22 @@ fn const_count(n: &Option<ast::Node>) -> Option<Option<i64>> {
 /// LIMIT ALL / NULL / n ≥ 1 and OFFSET NULL / 0: a non-empty result
 /// stays non-empty.
 pub(crate) fn limit_keeps_a_row(sel: &ast::SelectStmt) -> bool {
-    matches!(const_count(&sel.limit_count), Some(None) | Some(Some(1..)))
-        && matches!(const_count(&sel.limit_offset), Some(None) | Some(Some(0)))
+    matches!(
+        const_count(sel.limit_count.as_ref()),
+        Some(None) | Some(Some(1..))
+    ) && matches!(
+        const_count(sel.limit_offset.as_ref()),
+        Some(None) | Some(Some(0))
+    )
 }
 
 /// No LIMIT (or ALL / NULL) and OFFSET NULL / 0: every row stays.
 fn limit_keeps_every_row(sel: &ast::SelectStmt) -> bool {
-    matches!(const_count(&sel.limit_count), Some(None))
-        && matches!(const_count(&sel.limit_offset), Some(None) | Some(Some(0)))
+    matches!(const_count(sel.limit_count.as_ref()), Some(None))
+        && matches!(
+            const_count(sel.limit_offset.as_ref()),
+            Some(None) | Some(Some(0))
+        )
 }
 
 /// A table a foreign key can be relied on to find a referenced row in:
@@ -330,11 +338,11 @@ pub(crate) fn scan_contains(outer: &Origin, inner: &Origin) -> bool {
 }
 
 /// The conjuncts of an AND (the node itself otherwise).
-pub(crate) fn conjuncts<'a>(n: &'a Option<ast::Node>, out: &mut Vec<&'a Option<ast::Node>>) {
-    match n.as_ref() {
+pub(crate) fn conjuncts<'a>(n: Option<&'a ast::Node>, out: &mut Vec<Option<&'a ast::Node>>) {
+    match n {
         Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
             for a in &b.args {
-                conjuncts(a, out);
+                conjuncts(a.as_ref(), out);
             }
         }
         _ => out.push(n),
@@ -364,7 +372,7 @@ pub(crate) fn input_nonempty(
     where_log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> bool {
-    let where_true = sel.where_clause.is_none() || is_true_const(&sel.where_clause);
+    let where_true = sel.where_clause.is_none() || is_true_const(sel.where_clause.as_ref());
     if where_true
         && sel
             .from_clause
@@ -397,14 +405,14 @@ pub(crate) fn input_nonempty(
     }
     let mut conj = Vec::new();
     if sel.where_clause.is_some() && !where_true {
-        conjuncts(&sel.where_clause, &mut conj);
+        conjuncts(sel.where_clause.as_ref(), &mut conj);
     }
     // (p's column, the enclosing entry's column) per equality, and
     // whether p's column is the left operand.
     let mut pairs: Vec<(&ScopeColumn, &ScopeColumn)> = Vec::new();
     let mut p_left: Vec<bool> = Vec::new();
     for c in conj {
-        let Some(ast::Node::AExpr(e)) = c.as_ref() else {
+        let Some(ast::Node::AExpr(e)) = c else {
             return false;
         };
         if e.kind != ast::AExprKind::AexprOp
@@ -513,7 +521,7 @@ pub(crate) fn finish_level(
     let keeps_every_row = sel.from_clause.len() == 1
         && scope.sources.len() == 1
         && !matches!(sel.from_clause[0].as_ref(), Some(ast::Node::JoinExpr(_)))
-        && (sel.where_clause.is_none() || is_true_const(&sel.where_clause))
+        && (sel.where_clause.is_none() || is_true_const(sel.where_clause.as_ref()))
         && sel.group_clause.is_empty()
         && !has_aggs
         && sel.having_clause.is_none()

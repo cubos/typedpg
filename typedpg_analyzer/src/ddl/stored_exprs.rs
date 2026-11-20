@@ -99,7 +99,7 @@ fn rename_column_refs(
 pub(crate) fn over_own_row(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
 ) -> Option<ast::Node> {
     let relname = interp
         .pg_class
@@ -115,7 +115,7 @@ pub(crate) fn over_own_row(
     let mut tree = ast::ParseResult {
         version: 0,
         stmts: vec![ast::RawStmt {
-            stmt: expr.clone(),
+            stmt: expr.cloned(),
             stmt_location: 0,
             stmt_len: 0,
         }],

@@ -108,8 +108,8 @@ pub(crate) fn never_folded(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
 /// Whether `n` may call a volatile function (`contain_volatile_functions`):
 /// a function or operator some candidate of which is volatile, or one the
 /// analyzer can't find.
-pub(crate) fn may_be_volatile(n: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
-    let Some(inner) = n.as_ref() else {
+pub(crate) fn may_be_volatile(n: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
+    let Some(inner) = n else {
         return false;
     };
     let volatile = |p: &crate::pg_catalog::PgProc| p.provolatile == ProVolatile::Volatile;
@@ -182,7 +182,7 @@ pub(crate) fn joined_any_sublink(
     let test @ Some(_) = &sub.testexpr else {
         return false;
     };
-    if may_be_volatile(test, snapshot)
+    if may_be_volatile(test.as_ref(), snapshot)
         || (!sub.oper_name.is_empty() && operator_may_be_volatile(&sub.oper_name, snapshot))
     {
         return false;
@@ -246,7 +246,7 @@ pub(crate) fn joined_exists_sublink(
         // A positive or NULL (ALL) constant LIMIT is dropped.
         || (sel.limit_count.is_some()
             && !matches!(sel.limit_count.as_ref(), Some(ast::Node::AConst(c)) if c.isnull)
-            && int_literal(&sel.limit_count).is_none_or(|n| n <= 0))
+            && int_literal(sel.limit_count.as_ref()).is_none_or(|n| n <= 0))
         || !sel.locking_clause.is_empty()
     {
         return false;
@@ -341,7 +341,7 @@ pub(crate) fn joined_exists_sublink(
     let qual @ Some(_) = &sel.where_clause else {
         return false;
     };
-    if may_be_volatile(qual, snapshot) {
+    if may_be_volatile(qual.as_ref(), snapshot) {
         return false;
     }
     let Some(qual) = qual.as_ref() else {
@@ -479,8 +479,8 @@ pub(crate) fn subquery_reads_only(
 /// The sublink `pull_up_sublinks` may turn into a join a top-level AND
 /// argument `n` of a WHERE clause holds: `n` itself, or the EXISTS a NOT
 /// negates.
-pub(crate) fn conjunct_sublink(n: &Option<ast::Node>) -> Option<&ast::SubLink> {
-    conjunct_sublink_node(n.as_ref())
+pub(crate) fn conjunct_sublink(n: Option<&ast::Node>) -> Option<&ast::SubLink> {
+    conjunct_sublink_node(n)
 }
 
 /// [`conjunct_sublink`] of a node held by reference.
@@ -510,7 +510,7 @@ thread_local! {
     /// never null-extended, whose sublinks `pull_up_sublinks` pulls up
     /// alike (reading only the join's sides, which is all the ON clause
     /// sees).
-    static WHERE_ROOT: Cell<*const Option<ast::Node>> = const { Cell::new(std::ptr::null()) };
+    static WHERE_ROOT: Cell<*const ast::Node> = const { Cell::new(std::ptr::null()) };
     /// The FROM items (by alias) a sublink of [`WHERE_ROOT`] may read to
     /// be pulled up, when that is the ON clause of a join a semi-join
     /// below it joins only part of (see [`with_nullable_on_clause`]);
@@ -519,7 +519,7 @@ thread_local! {
 }
 
 /// Run `f`, the analysis of WHERE clause `n` (or of such an ON clause).
-pub(crate) fn with_where_clause<R>(n: &Option<ast::Node>, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_where_clause<R>(n: Option<&ast::Node>, f: impl FnOnce() -> R) -> R {
     with_root(n, None, f)
 }
 
@@ -530,15 +530,17 @@ pub(crate) fn with_where_clause<R>(n: &Option<ast::Node>, f: impl FnOnce() -> R)
 /// `available` of that side — or an inner join's below the nullable side
 /// of one, into the join (`available`, its two sides).
 pub(crate) fn with_nullable_on_clause<R>(
-    n: &Option<ast::Node>,
+    n: Option<&ast::Node>,
     available: Vec<String>,
     f: impl FnOnce() -> R,
 ) -> R {
     with_root(n, Some(available), f)
 }
 
-fn with_root<R>(n: &Option<ast::Node>, available: Option<Vec<String>>, f: impl FnOnce() -> R) -> R {
-    let prev = WHERE_ROOT.with(|w| w.replace(std::ptr::from_ref(n)));
+fn with_root<R>(n: Option<&ast::Node>, available: Option<Vec<String>>, f: impl FnOnce() -> R) -> R {
+    // A missing clause is never one being analyzed (see `is_where_clause`).
+    let root = n.map_or(std::ptr::null(), std::ptr::from_ref);
+    let prev = WHERE_ROOT.with(|w| w.replace(root));
     let prev_available = AVAILABLE.with(|a| a.replace(available));
     let out = f();
     WHERE_ROOT.with(|w| w.set(prev));
@@ -554,13 +556,13 @@ pub(crate) fn where_available() -> Option<Vec<String>> {
 }
 
 /// Whether `n` is the WHERE clause being analyzed.
-pub(crate) fn is_where_clause(n: *const Option<ast::Node>) -> bool {
+pub(crate) fn is_where_clause(n: *const ast::Node) -> bool {
     !n.is_null() && WHERE_ROOT.with(|w| w.get() == n)
 }
 
 /// The value of a whole-number literal.
-fn int_literal(n: &Option<ast::Node>) -> Option<i64> {
-    match n.as_ref()? {
+fn int_literal(n: Option<&ast::Node>) -> Option<i64> {
+    match n? {
         ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
             ast::AConstValue::Integer(i) => Some(i64::from(i.ival)),
             _ => None,
@@ -570,8 +572,8 @@ fn int_literal(n: &Option<ast::Node>) -> Option<i64> {
 }
 
 /// What `n` folds to.
-pub(crate) fn fold(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Folded {
-    fold_node(n.as_ref(), snapshot)
+pub(crate) fn fold(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
+    fold_node(n, snapshot)
 }
 
 /// [`fold`] of a node held by reference.
@@ -581,8 +583,8 @@ fn fold_node(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
 
 /// What qual `n` — a WHERE or JOIN ON clause, a HAVING one — folds to
 /// once the planner preprocessed it.
-pub(crate) fn fold_qual(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Folded {
-    fold_qual_node(n.as_ref(), snapshot)
+pub(crate) fn fold_qual(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
+    fold_qual_node(n, snapshot)
 }
 
 /// [`fold_qual`] of a node held by reference.
@@ -594,8 +596,8 @@ fn fold_qual_node(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
 /// number of NOTs when `negated`, in the scope of `ctx`: a column the
 /// planner replaces by a pulled-up subquery's output is what that folds to
 /// (see [`crate::scope::Substitution`]).
-pub(crate) fn fold_qual_in(n: &Option<ast::Node>, ctx: super::Ctx<'_>, negated: bool) -> Folded {
-    qual_with(n.as_ref(), ctx.snapshot, &|cr| column_in(cr, ctx), negated)
+pub(crate) fn fold_qual_in(n: Option<&ast::Node>, ctx: super::Ctx<'_>, negated: bool) -> Folded {
+    qual_with(n, ctx.snapshot, &|cr| column_in(cr, ctx), negated)
 }
 
 /// `eval_const_expressions` pushes a NOT down an AND / OR (`negate_clause`,
@@ -829,7 +831,7 @@ fn fold_with(
             }
             if kind == ast::AExprKind::AexprOp
                 && let (l @ Some(_), r @ Some(_)) = (&e.lexpr, &e.rexpr)
-                && let (Some(l), Some(r)) = (int_literal(l), int_literal(r))
+                && let (Some(l), Some(r)) = (int_literal(l.as_ref()), int_literal(r.as_ref()))
             {
                 let v = match extract_names(&e.name).as_slice() {
                     [o] if o == "=" => Some(l == r),
@@ -1530,7 +1532,7 @@ impl Group {
         joined.extend(self.on_quals.drain(on_quals..));
         let owner = Owner::SemiJoin;
         for (i, q) in joined.iter().enumerate() {
-            let Some(sub) = conjunct_sublink(q) else {
+            let Some(sub) = conjunct_sublink(q.as_ref()) else {
                 continue;
             };
             let Some(ast::Node::SelectStmt(sel)) = sub.subselect.as_ref() else {
@@ -1795,14 +1797,14 @@ impl Group {
         let constant = self.unknown_quals
             || (self.substitutes && self.quals.iter().any(|(_, o, top)| level_wide(o, *top)))
             || self.quals.iter().any(|(q, o, top)| {
-                let folded = fold_qual(q, snapshot);
+                let folded = fold_qual(q.as_ref(), snapshot);
                 level_wide(o, *top) && folded.may_be_const() && folded != Folded::Bool(true)
             });
-        let column_quals: Vec<(&Option<ast::Node>, &Owner, bool)> = self
+        let column_quals: Vec<(Option<&ast::Node>, &Owner, bool)> = self
             .quals
             .iter()
-            .filter(|(q, _, _)| !fold_qual(q, snapshot).may_be_const())
-            .map(|(q, o, top)| (q, o, *top))
+            .filter(|(q, _, _)| !fold_qual(q.as_ref(), snapshot).may_be_const())
+            .map(|(q, o, top)| (q.as_ref(), o, *top))
             .collect();
         let mut proven = Proven::default();
         let mut equalities = Vec::new();
@@ -1813,7 +1815,7 @@ impl Group {
                         && matches!(t.arg.as_ref(), Some(ast::Node::ColumnRef(_))) =>
                 {
                     if !(*top && matches!(owner, Owner::Level) && self.null_extended(t)) {
-                        self.prove_about(q, owner, &mut proven);
+                        self.prove_about(*q, owner, &mut proven);
                     }
                 }
                 // Two constants an equivalence class of the top join domain
@@ -1831,7 +1833,7 @@ impl Group {
             }
         }
         // An equivalence class's members may be any equality's columns.
-        let quals: Vec<Option<&ast::Node>> = equalities.iter().map(|(q, _)| q.as_ref()).collect();
+        let quals: Vec<Option<&ast::Node>> = equalities.iter().map(|(q, _)| *q).collect();
         if equates_constants(&quals, snapshot) {
             for (q, owner) in equalities {
                 self.prove_about(q, owner, &mut proven);
@@ -1859,14 +1861,14 @@ impl Group {
         if !self.own_level || names.len() != cr.fields.len() || !self.nullable.contains(alias) {
             return false;
         }
-        let tested = |q: &Option<ast::Node>| {
-            matches!(q.as_ref(), Some(ast::Node::NullTest(t))
+        let tested = |q: Option<&ast::Node>| {
+            matches!(q, Some(ast::Node::NullTest(t))
                 if t.nulltesttype == ast::NullTestType::IsNull
                     && matches!(t.arg.as_ref(),
                         Some(ast::Node::ColumnRef(_))))
         };
         !self.quals.iter().any(|(q, _, top)| {
-            *top && !tested(q)
+            *top && !tested(q.as_ref())
                 && q.as_ref().is_some_and(|q| {
                     q.nodes().into_iter().any(|(n, _)| match n {
                         typedpg_pg_query::NodeRef::ColumnRef(cr) => {
@@ -1889,7 +1891,7 @@ impl Group {
     /// FROM items, that item (and, under LATERAL, the level's items it
     /// names); in the level's own quals, the item a column names — any,
     /// when one can't be told (an unqualified column, a join's alias).
-    fn prove_about(&self, n: &Option<ast::Node>, owner: &Owner, proven: &mut Proven) {
+    fn prove_about(&self, n: Option<&ast::Node>, owner: &Owner, proven: &mut Proven) {
         let (outer, lateral) = match owner {
             Owner::Level => (true, false),
             Owner::Item { alias, lateral } => {
@@ -1907,7 +1909,7 @@ impl Group {
         if !outer && !lateral {
             return;
         }
-        let Some(inner) = n.as_ref() else {
+        let Some(inner) = n else {
             return;
         };
         let mut todo = vec![inner.to_ref()];
@@ -2357,7 +2359,7 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
         // argument that may fold to another constant.
         R::CoalesceExpr(c) => {
             for a in &c.args {
-                match fold(a, snapshot) {
+                match fold(a.as_ref(), snapshot) {
                     Folded::Null => {}
                     Folded::Var => {
                         if certainly_reads(a.as_ref(), target, snapshot) {
@@ -2377,7 +2379,7 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
             };
             if identity.is_some()
                 && b.args.iter().any(|a| {
-                    let f = fold(a, snapshot);
+                    let f = fold(a.as_ref(), snapshot);
                     (f != Folded::Var && Some(f) != identity) || params_only(a.as_ref())
                 })
             {
@@ -2405,7 +2407,7 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
         R::FuncCall(fc) => {
             !fc.args
                 .iter()
-                .any(|a| fold(a, snapshot) == Folded::Null || params_only(a.as_ref()))
+                .any(|a| fold(a.as_ref(), snapshot) == Folded::Null || params_only(a.as_ref()))
                 && n.children()
                     .into_iter()
                     .any(|c| reads_ref(c, target, snapshot))
@@ -3141,11 +3143,11 @@ fn plain_table(
 /// join's `min_righthand` (self-join elimination merges only scans of one
 /// table). `is_cte` tells the CTE names the level sees.
 pub(crate) fn inner_join_tables(
-    side: &Option<ast::Node>,
+    side: Option<&ast::Node>,
     snapshot: &PgCatalog,
     is_cte: &dyn Fn(&str) -> bool,
 ) -> usize {
-    inner_join_tables_node(side.as_ref(), snapshot, is_cte)
+    inner_join_tables_node(side, snapshot, is_cte)
 }
 
 /// [`inner_join_tables`] of a node held by reference.

@@ -588,11 +588,11 @@ impl Subject {
 impl Cx<'_> {
     /// What `n` is about, when a literal can be: a column, a parameter
     /// standing for one, or a key / JSON type of one.
-    fn subject_of(&self, n: &Option<ast::Node>) -> Option<Subject> {
+    fn subject_of(&self, n: Option<&ast::Node>) -> Option<Subject> {
         use crate::nonnull::{JsonbBuiltin as J, StrictNode as S};
-        match n.as_ref()? {
+        match n? {
             ast::Node::ColumnRef(_) => {
-                let c = column_name(n.as_ref())?;
+                let c = column_name(n)?;
                 match self.env {
                     // A body's names are its parameters.
                     Some(env) => env.get(&c).cloned(),
@@ -604,7 +604,7 @@ impl Cx<'_> {
             // A conversion of a jsonb value (of a domain over jsonb) to
             // jsonb changes nothing.
             ast::Node::TypeCast(tc) => {
-                let inner = self.subject_of(&tc.arg)?;
+                let inner = self.subject_of(tc.arg.as_ref())?;
                 let target =
                     crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)?;
                 let jsonb = crate::pg_catalog::oid::JSONB;
@@ -621,22 +621,22 @@ impl Cx<'_> {
                     "->>" if self.trust.trusts(e.location, S::Jsonb(J::FieldText)) => true,
                     _ => return None,
                 };
-                let x = self.subject_of(&e.lexpr)?;
-                let key = string_constant(&e.rexpr)?;
+                let x = self.subject_of(e.lexpr.as_ref())?;
+                let key = string_constant(e.rexpr.as_ref())?;
                 Some(Subject::Field(Box::new(x), key, text))
             }
             ast::Node::FuncCall(f) if self.trust.trusts(f.location, S::Jsonb(J::Typeof)) => {
                 let [arg] = f.args.as_slice() else {
                     return None;
                 };
-                Some(Subject::Typeof(Box::new(self.subject_of(arg)?)))
+                Some(Subject::Typeof(Box::new(self.subject_of(arg.as_ref())?)))
             }
             _ => None,
         }
     }
 
     /// The name of what `n` is about (see [`Cx::subject_of`]), registered.
-    fn subject(&self, n: &Option<ast::Node>) -> Option<String> {
+    fn subject(&self, n: Option<&ast::Node>) -> Option<String> {
         let s = self.subject_of(n)?;
         let name = s.name();
         if !matches!(s, Subject::Column(_)) {
@@ -679,8 +679,8 @@ fn typeof_of(subjects: &HashMap<String, Subject>) -> HashMap<String, String> {
 }
 
 /// A string constant (`'k'`).
-fn string_constant(n: &Option<ast::Node>) -> Option<String> {
-    match n.as_ref()? {
+fn string_constant(n: Option<&ast::Node>) -> Option<String> {
+    match n? {
         ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
             ast::AConstValue::String(s) => Some(s.sval.clone()),
             _ => None,
@@ -1120,7 +1120,7 @@ impl RelationChecks {
     fn expression_facts(&self, alias: &str, k: &Knowledge<'_>, s: &Solved) -> HashSet<String> {
         let keys = |subject: &Subject| {
             [Some(alias), None]
-                .map(|q| super::exprs::key(&Some(subject.node(q))))
+                .map(|q| super::exprs::key(Some(&subject.node(q))))
                 .into_iter()
         };
         let mut out = HashSet::new();
@@ -1390,7 +1390,7 @@ pub(crate) fn finite_column(n: Option<&ast::Node>, trust: &impl Trust) -> Option
 /// when the type doesn't print values as they compare
 /// ([`crate::refine::Exact`]).
 pub(crate) fn allowed_values(
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     c: &str,
     t: PgTypeOid,
     collation: Option<crate::oid::PgCollationOid>,
@@ -1412,7 +1412,7 @@ pub(crate) fn allowed_values(
     };
     let space = Space::of(t, collation, snapshot);
     let mut preds = Vec::new();
-    for conjunct in conjuncts(expr.as_ref()) {
+    for conjunct in conjuncts(expr) {
         let Some(arms) = dnf(conjunct, true, &cx) else {
             continue;
         };
@@ -1451,8 +1451,8 @@ pub(crate) fn allowed_values(
 }
 
 /// The columns a constraint expression keeps finite (see [`finite_column`]).
-pub(crate) fn finite_columns_of(expr: &Option<ast::Node>, trust: &impl Trust) -> Vec<String> {
-    conjuncts(expr.as_ref())
+pub(crate) fn finite_columns_of(expr: Option<&ast::Node>, trust: &impl Trust) -> Vec<String> {
+    conjuncts(expr)
         .into_iter()
         .filter_map(|c| finite_column(c, trust))
         .collect()
@@ -1460,8 +1460,8 @@ pub(crate) fn finite_columns_of(expr: &Option<ast::Node>, trust: &impl Trust) ->
 
 /// The columns a constraint expression says hold no NULL element (see
 /// [`null_free_array`]).
-pub(crate) fn null_free_arrays(expr: &Option<ast::Node>, trust: &impl Trust) -> Vec<String> {
-    conjuncts(expr.as_ref())
+pub(crate) fn null_free_arrays(expr: Option<&ast::Node>, trust: &impl Trust) -> Vec<String> {
+    conjuncts(expr)
         .into_iter()
         .filter_map(|c| null_free_array(c, trust))
         .collect()
@@ -1473,7 +1473,7 @@ pub(crate) fn null_free_arrays(expr: &Option<ast::Node>, trust: &impl Trust) -> 
 /// — `c` is NULL, or a one-dimensional array (a multidimensional one fails
 /// the search) none of whose elements is.
 fn null_free_array(n: Option<&ast::Node>, trust: &impl Trust) -> Option<String> {
-    let is_null_const = |n: &Option<ast::Node>| match n.as_ref() {
+    let is_null_const = |n: Option<&ast::Node>| match n {
         Some(ast::Node::AConst(c)) => c.isnull,
         Some(ast::Node::TypeCast(tc)) => tc
             .arg
@@ -1493,7 +1493,7 @@ fn null_free_array(n: Option<&ast::Node>, trust: &impl Trust) -> Option<String> 
     let [array, needle] = f.args.as_slice() else {
         return None;
     };
-    (trust.trusts(f.location, StrictNode::ArrayPosition) && is_null_const(needle))
+    (trust.trusts(f.location, StrictNode::ArrayPosition) && is_null_const(needle.as_ref()))
         .then(|| column_name(array.as_ref()))
         .flatten()
 }
@@ -1765,7 +1765,7 @@ fn inline_cnf(f: &ast::FuncCall, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
     let mut env = HashMap::new();
     let mut strict_nulls: Vec<Vec<Lit>> = Vec::new();
     for (i, arg) in f.args.iter().enumerate() {
-        let s = cx.subject_of(arg);
+        let s = cx.subject_of(arg.as_ref());
         if proc.proisstrict {
             strict_nulls.push(match &s {
                 Some(s) => {
@@ -1944,10 +1944,10 @@ fn is_condition(n: &ast::Node, cx: &Cx<'_>) -> bool {
 /// omitted one is NULL) applies when none is. A WHEN being TRUE is read as
 /// it being not FALSE (more rows).
 fn case_dnf(c: &ast::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
-    let test = c.arg.is_some().then(|| cx.subject(&c.arg));
-    let when_dnf = |when: &ast::CaseWhen, w: &Option<ast::Node>, pos: bool| {
+    let test = c.arg.is_some().then(|| cx.subject(c.arg.as_ref()));
+    let when_dnf = |when: &ast::CaseWhen, w: Option<&ast::Node>, pos: bool| {
         match &test {
-            None => dnf(w.as_ref(), pos, cx),
+            None => dnf(w, pos, cx),
             Some(None) => Some(one(Lit::Other)),
             // `test = value`, by the built-in `=` (resolved at the WHEN).
             Some(Some(_)) if !cx.trust.trusts(when.location, StrictNode::BuiltinCompare) => {
@@ -1977,9 +1977,9 @@ fn case_dnf(c: &ast::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Li
             return Some(one(Lit::Other));
         }
         let (cond, result) = (&w.expr, &w.result);
-        let taken = product(&none_before, &when_dnf(w, cond, true)?)?;
+        let taken = product(&none_before, &when_dnf(w, cond.as_ref(), true)?)?;
         out = either(out, product(&taken, &dnf(result.as_ref(), positive, cx)?)?)?;
-        none_before = product(&none_before, &when_dnf(w, cond, false)?)?;
+        none_before = product(&none_before, &when_dnf(w, cond.as_ref(), false)?)?;
     }
     let default = match c.defresult.as_ref() {
         Some(d) => dnf(Some(d), positive, cx)?,
@@ -2012,8 +2012,8 @@ fn column_name(n: Option<&ast::Node>) -> Option<String> {
 fn json_key_atom(
     e: &ast::AExpr,
     op: &str,
-    l: &Option<ast::Node>,
-    r: &Option<ast::Node>,
+    l: Option<&ast::Node>,
+    r: Option<&ast::Node>,
     positive: bool,
     cx: &Cx<'_>,
 ) -> Option<Vec<Vec<Lit>>> {
@@ -2057,10 +2057,14 @@ fn json_type(t: &str) -> Literal {
 }
 
 /// `ARRAY['a', 'b']` (maybe cast to `text[]`) of string constants.
-fn string_array_constant(n: &Option<ast::Node>) -> Option<Vec<String>> {
-    match n.as_ref()? {
-        ast::Node::TypeCast(tc) => string_array_constant(&tc.arg),
-        ast::Node::AArrayExpr(a) => a.elements.iter().map(string_constant).collect(),
+fn string_array_constant(n: Option<&ast::Node>) -> Option<Vec<String>> {
+    match n? {
+        ast::Node::TypeCast(tc) => string_array_constant(tc.arg.as_ref()),
+        ast::Node::AArrayExpr(a) => a
+            .elements
+            .iter()
+            .map(|n| string_constant(n.as_ref()))
+            .collect(),
         _ => None,
     }
 }
@@ -2068,8 +2072,8 @@ fn string_array_constant(n: &Option<ast::Node>) -> Option<Vec<String>> {
 /// A literal (or arms of literals) for `n`, not FALSE (`positive`) or not
 /// TRUE.
 fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
-    let scalar = |a: &Option<ast::Node>| cx.subject(a);
-    let lit = |n: &Option<ast::Node>, c: &str| {
+    let scalar = |a: Option<&ast::Node>| cx.subject(a);
+    let lit = |n: Option<&ast::Node>, c: &str| {
         cx.subject_type(c)
             .and_then(|t| super::literal_for(n, t, cx.snapshot))
     };
@@ -2098,7 +2102,7 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             };
             // `x IS NULL` is never NULL: not FALSE is TRUE, not TRUE FALSE.
             let null_wanted = is_null == positive;
-            if let Some(c) = scalar(arg) {
+            if let Some(c) = scalar(arg.as_ref()) {
                 return one(if null_wanted {
                     Lit::IsNull(c)
                 } else {
@@ -2107,7 +2111,8 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             }
             // `coalesce(a, b) IS NOT NULL`: one of them is non-NULL.
             if let Some(ast::Node::CoalesceExpr(co)) = arg.as_ref() {
-                let cols: Option<BTreeSet<String>> = co.args.iter().map(scalar).collect();
+                let cols: Option<BTreeSet<String>> =
+                    co.args.iter().map(|n| scalar(n.as_ref())).collect();
                 if let Some(cols) = cols.filter(|c| !c.is_empty()) {
                     return if null_wanted {
                         all_null(&cols)
@@ -2155,7 +2160,7 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 return other;
             }
             let (l, r) = (&e.lexpr, &e.rexpr);
-            if let Some(arms) = json_key_atom(e, &op, l, r, positive, cx) {
+            if let Some(arms) = json_key_atom(e, &op, l.as_ref(), r.as_ref(), positive, cx) {
                 return arms;
             }
             // Every comparison read below, as the built-in one: a
@@ -2165,12 +2170,12 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             }
             match e.kind {
                 K::AexprOp => {
-                    let (c, v, flipped) = match (scalar(l), scalar(r)) {
-                        (Some(c), None) => match lit(r, &c) {
+                    let (c, v, flipped) = match (scalar(l.as_ref()), scalar(r.as_ref())) {
+                        (Some(c), None) => match lit(r.as_ref(), &c) {
                             Some(v) => (c, v, false),
                             None => return other,
                         },
-                        (None, Some(c)) => match lit(l, &c) {
+                        (None, Some(c)) => match lit(l.as_ref(), &c) {
                             Some(v) => (c, v, true),
                             None => return other,
                         },
@@ -2189,14 +2194,20 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 // A NULL in the list makes `IN` NULL rather than FALSE:
                 // such a list says nothing.
                 K::AexprIn => {
-                    let (Some(c), Some(ast::Node::List(list))) = (scalar(l), r.as_ref()) else {
+                    let (Some(c), Some(ast::Node::List(list))) = (scalar(l.as_ref()), r.as_ref())
+                    else {
                         return other;
                     };
                     let Some(t) = cx.subject_type(&c) else {
                         return other;
                     };
                     match (
-                        super::constants(list.items.iter(), t, false, cx.snapshot),
+                        super::constants(
+                            list.items.iter().map(Option::as_ref),
+                            t,
+                            false,
+                            cx.snapshot,
+                        ),
                         op.as_str(),
                     ) {
                         (Some(vs), "=") => val(c, ValPred::In(vs)),
@@ -2205,7 +2216,7 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                     }
                 }
                 kind @ (K::AexprOpAny | K::AexprOpAll) => {
-                    let Some(c) = scalar(l) else {
+                    let Some(c) = scalar(l.as_ref()) else {
                         return other;
                     };
                     let Some(t) = cx.subject_type(&c) else {
@@ -2214,7 +2225,7 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                     match (
                         kind,
                         op.as_str(),
-                        super::array_constants(r, t, false, cx.snapshot),
+                        super::array_constants(r.as_ref(), t, false, cx.snapshot),
                     ) {
                         (K::AexprOpAny, "=", Some(vs)) => val(c, ValPred::In(vs)),
                         (K::AexprOpAll, "<>", Some(vs)) => val(c, ValPred::NotIn(vs)),
@@ -2224,12 +2235,12 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 // `c IS DISTINCT FROM v` (never NULL): `c` is NULL, or
                 // non-NULL and not `v`.
                 kind @ (K::AexprDistinct | K::AexprNotDistinct) => {
-                    let (c, v) = match (scalar(l), scalar(r)) {
-                        (Some(c), None) => match lit(r, &c) {
+                    let (c, v) = match (scalar(l.as_ref()), scalar(r.as_ref())) {
+                        (Some(c), None) => match lit(r.as_ref(), &c) {
                             Some(v) => (c, v),
                             None => return other,
                         },
-                        (None, Some(c)) => match lit(l, &c) {
+                        (None, Some(c)) => match lit(l.as_ref(), &c) {
                             Some(v) => (c, v),
                             None => return other,
                         },
@@ -2253,12 +2264,13 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 }
                 // `c BETWEEN a AND b` is `c >= a AND c <= b`.
                 kind @ (K::AexprBetween | K::AexprNotBetween) => {
-                    let (Some(c), Some(ast::Node::List(list))) = (scalar(l), r.as_ref()) else {
+                    let (Some(c), Some(ast::Node::List(list))) = (scalar(l.as_ref()), r.as_ref())
+                    else {
                         return other;
                     };
                     let (Some(a), Some(b)) = (
-                        list.items.first().and_then(|n| lit(n, &c)),
-                        list.items.get(1).and_then(|n| lit(n, &c)),
+                        list.items.first().and_then(|n| lit(n.as_ref(), &c)),
+                        list.items.get(1).and_then(|n| lit(n.as_ref(), &c)),
                     ) else {
                         return other;
                     };

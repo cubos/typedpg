@@ -21,14 +21,14 @@ use crate::scope::Scope;
 /// source locations dropped. Column references are kept as written, so
 /// `t.j ->> 'k'` and `u.j ->> 'k'` never meet (an unqualified `j` and a
 /// qualified `t.j` simply don't match).
-pub(crate) fn key(n: &Option<ast::Node>) -> String {
+pub(crate) fn key(n: Option<&ast::Node>) -> String {
     crate::resolve::node_fingerprint(n)
 }
 
 /// Whether `n` may carry an expression fact: an expression other than a
 /// bare column, constant or parameter, evaluating the same way each time
 /// for one row of one statement.
-pub(crate) fn reusable(n: &Option<ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> bool {
+pub(crate) fn reusable(n: Option<&ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> bool {
     // An implicit cast may run anywhere an argument meets a parameter of
     // another type (`fc(x)` over an `int` `x` for `fc(c)`): with a volatile
     // one in the catalog, no expression is assumed to give the same value
@@ -36,7 +36,7 @@ pub(crate) fn reusable(n: &Option<ast::Node>, scope: &Scope, snapshot: &PgCatalo
     if has_volatile_cast(snapshot, true) {
         return false;
     }
-    match n.as_ref() {
+    match n {
         None
         | Some(
             ast::Node::ColumnRef(_)
@@ -47,7 +47,7 @@ pub(crate) fn reusable(n: &Option<ast::Node>, scope: &Scope, snapshot: &PgCatalo
         ) => return false,
         Some(_) => {}
     }
-    let Some(root) = n.as_ref() else {
+    let Some(root) = n else {
         return false;
     };
     let nodes = Node::nodes(root);

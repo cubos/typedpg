@@ -99,7 +99,10 @@ fn check_conkey(
     if let Some(inner) = expr {
         for (n, ..) in inner.nodes() {
             if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
-                && let Some(name) = cr.fields.last().and_then(super::util::node_string)
+                && let Some(name) = cr
+                    .fields
+                    .last()
+                    .and_then(|n| super::util::node_string(n.as_ref()))
                 && let Some(attr) = interp.attribute_by_name(relid, name)
                 && !attnums.contains(&attr.attnum)
             {
@@ -123,7 +126,10 @@ fn check_name_addition(
     if let Some(inner) = expr {
         for (n, ..) in inner.nodes() {
             if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
-                && let Some(name) = cr.fields.last().and_then(super::util::node_string)
+                && let Some(name) = cr
+                    .fields
+                    .last()
+                    .and_then(|n| super::util::node_string(n.as_ref()))
                 && interp.attribute_by_name(relid, name).is_some()
                 && !columns.iter().any(|c| c == name)
             {
@@ -278,7 +284,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         if !is_primary && !is_not_null && c.contype != ConstrType::ConstrUnique {
             continue;
         }
-        for key in c.keys.iter().filter_map(super::util::node_string) {
+        for key in c
+            .keys
+            .iter()
+            .filter_map(|n| super::util::node_string(n.as_ref()))
+        {
             // transformIndexConstraint takes a system column as found, and
             // DefineIndex refuses it; AddRelationNotNullConstraints refuses
             // a not-null constraint on one.
@@ -351,7 +361,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         let Some(ast::Node::Constraint(c)) = elt.as_ref() else {
             continue;
         };
-        for key in c.including.iter().filter_map(super::util::node_string) {
+        for key in c
+            .including
+            .iter()
+            .filter_map(|n| super::util::node_string(n.as_ref()))
+        {
             if !columns.iter().any(|col| col.name == key) {
                 return Err(DdlError::Parse(format!(
                     "column \"{key}\" named in key does not exist"
@@ -641,11 +655,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 let expr = &pe.expr;
                 crate::ddl::expr_kind::check_expr_kind(
                     interp,
-                    expr,
+                    expr.as_ref(),
                     crate::ddl::expr_kind::ExprKind::PartitionExpression,
                 )?;
                 let typ = match crate::ddl::volatile::infer_over_relation(
-                    interp, class_oid, expr, None,
+                    interp,
+                    class_oid,
+                    expr.as_ref(),
+                    None,
                 ) {
                     Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
                     Some(Ok(t)) => {
@@ -676,7 +693,8 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 let mut whole_row_read = false;
                 if let Some(inner) = expr.as_ref() {
                     // `(p).a` reads the column `a` (transformIndirection).
-                    let selections = super::util::relation_row_selections(interp, class_oid, expr);
+                    let selections =
+                        super::util::relation_row_selections(interp, class_oid, expr.as_ref());
                     for (n, ..) in inner.nodes() {
                         let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
                             continue;
@@ -692,9 +710,12 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                                 {
                                     true
                                 }
-                                [only] => super::util::node_string(only).is_some_and(|f| {
-                                    f == name && interp.attribute_by_name(class_oid, f).is_none()
-                                }),
+                                [only] => {
+                                    super::util::node_string(only.as_ref()).is_some_and(|f| {
+                                        f == name
+                                            && interp.attribute_by_name(class_oid, f).is_none()
+                                    })
+                                }
                                 _ => false,
                             };
                         if whole_row {
@@ -704,9 +725,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                             whole_row_read = true;
                             continue;
                         }
-                        let Some(col) = selected
-                            .or_else(|| cr.fields.last().and_then(super::util::node_string))
-                        else {
+                        let Some(col) = selected.or_else(|| {
+                            cr.fields
+                                .last()
+                                .and_then(|n| super::util::node_string(n.as_ref()))
+                        }) else {
                             continue;
                         };
                         match interp.attribute_by_name(class_oid, col) {
@@ -757,14 +780,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     ));
                 }
                 crate::ddl::volatile::check_no_volatile(
-                    expr,
+                    expr.as_ref(),
                     crate::ddl::volatile::ExprLocation::PartitionKey,
                     interp,
                 )?;
                 crate::ddl::volatile::check_mutability(
                     interp,
                     class_oid,
-                    expr,
+                    expr.as_ref(),
                     crate::ddl::volatile::ExprLocation::PartitionKey,
                 )?;
                 typ
@@ -804,12 +827,12 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         key_attrs.dedup();
         interp.partition_key_attrs.insert(class_oid, key_attrs);
         partbound::record_partition_spec(interp, class_oid, spec);
-        let key_exprs: Vec<&Option<typedpg_pg_query::ast::Node>> = spec
+        let key_exprs: Vec<Option<&typedpg_pg_query::ast::Node>> = spec
             .part_params
             .iter()
             .filter_map(|elem| match elem.as_ref() {
                 Some(ast::Node::PartitionElem(pe)) if pe.name.is_empty() => {
-                    pe.expr.is_some().then_some(&pe.expr)
+                    pe.expr.is_some().then_some(pe.expr.as_ref())
                 }
                 _ => None,
             })
@@ -1485,7 +1508,7 @@ fn apply_alter_subtype(
                         .keys
                         .iter()
                         .chain(c.including.iter())
-                        .filter_map(super::util::node_string)
+                        .filter_map(|n| super::util::node_string(n.as_ref()))
                         .find(|k| {
                             interp.attribute_by_name(relid, k).is_none()
                                 && is_system_column_of(interp, relid, k)

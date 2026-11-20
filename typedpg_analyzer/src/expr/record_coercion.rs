@@ -32,8 +32,8 @@ fn cannot_cast(
 }
 
 /// Where PG's `exprLocation` puts an error about the record `node`.
-fn record_span(node: &Option<ast::Node>) -> Option<crate::error::SourceSpan> {
-    match node.as_ref() {
+fn record_span(node: Option<&ast::Node>) -> Option<crate::error::SourceSpan> {
+    match node {
         Some(ast::Node::RowExpr(row)) => crate::error::SourceSpan::from_node_token(row.location),
         Some(ast::Node::ColumnRef(cr)) => crate::error::SourceSpan::from_node_qname(cr.location),
         _ => crate::error::expr_span(node),
@@ -47,16 +47,16 @@ fn whole_row_source<'s>(
     cr: &ast::ColumnRef,
     scope: &'s Scope,
 ) -> Option<&'s crate::scope::TableSource> {
-    let name = |n: &Option<ast::Node>| match n.as_ref() {
+    let name = |n: Option<&ast::Node>| match n {
         Some(ast::Node::String(s)) => Some(s.sval.clone()),
         _ => None,
     };
     let alias = match cr.fields.as_slice() {
         [.., qualifier, last] if matches!(last.as_ref(), Some(ast::Node::AStar(_))) => {
-            name(qualifier)?
+            name(qualifier.as_ref())?
         }
         [only] => {
-            let only = name(only)?;
+            let only = name(only.as_ref())?;
             if !matches!(
                 scope.resolve_column(None, &only, None),
                 Err(AnalyzeError::UndefinedColumn(_))
@@ -77,7 +77,7 @@ fn whole_row_source<'s>(
 /// does. Returns the rebuilt row, typed as the composite (domains
 /// smashed), its fields carrying the coerced values' nullability.
 pub(crate) fn coerce_record_to_complex(
-    node: &Option<ast::Node>,
+    node: Option<&ast::Node>,
     target: PgTypeOid,
     context: CoercionContext,
     ctx: Ctx<'_>,
@@ -87,13 +87,13 @@ pub(crate) fn coerce_record_to_complex(
     // coerce_type hands a `record` cast to `record` back as it is, so
     // `ROW(1, 'a')::record::t` and `s::record::t` still name their fields.
     let mut node = node;
-    while let Some(ast::Node::TypeCast(cast)) = node.as_ref()
+    while let Some(ast::Node::TypeCast(cast)) = node
         && let Some(tn) = cast.type_name.as_ref()
         && tn.array_bounds.is_empty()
         && crate::ddl::util::resolve_type_name(tn, snapshot) == Some(oid::RECORD)
         && cast.arg.is_some()
     {
-        node = &cast.arg;
+        node = cast.arg.as_ref();
     }
     let composite = snapshot.unwrap_domain(target);
     let fields = snapshot
@@ -131,11 +131,11 @@ pub(crate) fn coerce_record_to_complex(
         )
     };
     let mut shape = Vec::with_capacity(fields.len());
-    let whole_row = match node.as_ref() {
+    let whole_row = match node {
         Some(ast::Node::ColumnRef(cr)) => whole_row_source(cr, ctx.scope).map(|s| (cr, s)),
         _ => None,
     };
-    match (node.as_ref(), whole_row) {
+    match (node, whole_row) {
         (Some(ast::Node::RowExpr(row)), _) => {
             // transformRowExpr has expanded the stars already.
             let args = expand_row_args(&row.args, ctx, params)?;
@@ -144,7 +144,7 @@ pub(crate) fn coerce_record_to_complex(
                     return Err(too_few());
                 };
                 let mut scratch = params.clone();
-                let own = infer_expr(arg, ctx, &mut scratch, TypeGoal::NONE)?;
+                let own = infer_expr(arg.as_ref(), ctx, &mut scratch, TypeGoal::NONE)?;
                 // A nested `record` goes through coerce_record_to_complex
                 // again (the goal below), failing for the nested type.
                 let nested = own.type_oid == oid::RECORD
@@ -156,7 +156,7 @@ pub(crate) fn coerce_record_to_complex(
                     return Err(mismatch(own.type_oid, field.atttypid, i + 1));
                 }
                 let t = infer_expr(
-                    arg,
+                    arg.as_ref(),
                     ctx,
                     params,
                     TypeGoal {

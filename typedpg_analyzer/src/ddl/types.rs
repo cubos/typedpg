@@ -44,7 +44,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .and_then(|t| t.typcollation);
     let domain_collation = match stmt.coll_clause.as_deref() {
         Some(coll) => {
-            let parts: Vec<&str> = coll.collname.iter().filter_map(node_string).collect();
+            let parts: Vec<&str> = coll
+                .collname
+                .iter()
+                .filter_map(|n| node_string(n.as_ref()))
+                .collect();
             let (schema, cname) = match parts.as_slice() {
                 [n] => (None, *n),
                 [s, n] => (Some(*s), *n),
@@ -146,7 +150,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         // domainAddDefault: cooked like a column default named after the
         // domain, against the base type.
         if c.contype == ConstrType::ConstrDefault
-            && let Some(expr) = Some(&c.raw_expr).filter(|e| e.is_some())
+            && let Some(expr) = c.raw_expr.as_ref().map(Some)
         {
             let (checked, refs) = super::depend::collect(|| {
                 super::defaults::check_default(interp, expr, &name, base_type_oid)
@@ -228,10 +232,10 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
 }
 
 /// A bare `NULL`, cast or not: a default that is no default.
-fn is_null_constant(expr: &Option<typedpg_pg_query::ast::Node>) -> bool {
-    match expr.as_ref() {
+fn is_null_constant(expr: Option<&typedpg_pg_query::ast::Node>) -> bool {
+    match expr {
         Some(ast::Node::AConst(c)) => c.isnull,
-        Some(ast::Node::TypeCast(tc)) => is_null_constant(&tc.arg),
+        Some(ast::Node::TypeCast(tc)) => is_null_constant(tc.arg.as_ref()),
         _ => false,
     }
 }
@@ -290,7 +294,8 @@ fn add_domain_constraint(
         }
         ConstrType::ConstrCheck => {
             if c.raw_expr.is_some() {
-                let checked = check_domain_check_expression(interp, base_type, &c.raw_expr)?;
+                let checked =
+                    check_domain_check_expression(interp, base_type, c.raw_expr.as_ref())?;
                 (refs, rejects_null, null_free_elements, finite, allowed) = (
                     checked.refs,
                     checked.rejects_null,
@@ -397,7 +402,7 @@ struct DomainCheck {
 fn check_domain_check_expression(
     interp: &PgCatalog,
     base_type: PgTypeOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<DomainCheck, DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
@@ -514,7 +519,11 @@ pub fn alter_domain(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::AlterDomainStmt,
 ) -> Result<(), DdlError> {
-    let parts: Vec<&str> = stmt.type_name.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = stmt
+        .type_name
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     let (schema, name) = match parts.as_slice() {
         [schema, name] => (Some(*schema), *name),
         [name] => (None, *name),
@@ -584,12 +593,14 @@ pub fn alter_domain(
             if stmt.def.is_some() {
                 let expr = &stmt.def;
                 let (checked, refs) = super::depend::collect(|| {
-                    super::defaults::check_default(interp, expr, name, base_type)
+                    super::defaults::check_default(interp, expr.as_ref(), name, base_type)
                 });
                 checked?;
                 default_refs = refs;
                 default_refs.extend(super::depend::literal_coercion_references(
-                    interp, expr, base_type,
+                    interp,
+                    expr.as_ref(),
+                    base_type,
                 ));
             }
             // GenerateTypeDependencies(rebuild): the domain's dependencies
@@ -618,7 +629,7 @@ pub fn alter_domain(
                 },
             );
             match &stmt.def {
-                expr @ Some(_) if !is_null_constant(expr) => {
+                expr @ Some(_) if !is_null_constant(expr.as_ref()) => {
                     interp.domain_defaults.insert(type_oid);
                 }
                 _ => {
@@ -675,7 +686,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
     let labels: Vec<String> = stmt
         .vals
         .iter()
-        .filter_map(|n| node_string(n).map(|s| s.to_owned()))
+        .filter_map(|n| node_string(n.as_ref()).map(|s| s.to_owned()))
         .collect();
     // EnumValuesCreate inserts the labels one by one; a repeat trips
     // pg_enum's unique index.
@@ -850,13 +861,13 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             Some(ast::Node::TypeName(tn)) => tn
                 .names
                 .iter()
-                .filter_map(node_string)
+                .filter_map(|n| node_string(n.as_ref()))
                 .map(str::to_owned)
                 .collect(),
             Some(ast::Node::List(l)) => l
                 .items
                 .iter()
-                .filter_map(node_string)
+                .filter_map(|n| node_string(n.as_ref()))
                 .map(str::to_owned)
                 .collect(),
             Some(ast::Node::String(s)) => vec![s.sval.clone()],
@@ -1390,7 +1401,7 @@ fn option_word(de: &typedpg_pg_query::ast::DefElem) -> Option<String> {
         ast::Node::TypeName(tn) => tn
             .names
             .last()
-            .and_then(super::util::node_string)
+            .and_then(|n| super::util::node_string(n.as_ref()))
             .map(str::to_ascii_lowercase),
         ast::Node::String(s) => Some(s.sval.to_ascii_lowercase()),
         ast::Node::Integer(i) => Some(i.ival.to_string()),
@@ -1404,13 +1415,13 @@ fn option_names(de: &typedpg_pg_query::ast::DefElem) -> Vec<String> {
         Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::List(l)) => l
             .items
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::String(s)) => vec![s.sval.clone()],
@@ -1750,7 +1761,7 @@ fn subscript_handler(
         Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
-            .filter_map(super::util::node_string)
+            .filter_map(|n| super::util::node_string(n.as_ref()))
             .collect(),
         Some(ast::Node::String(s)) => vec![s.sval.as_str()],
         _ => return Ok(None),
@@ -2324,7 +2335,10 @@ pub(crate) fn check_is_domain(
     interp: &PgCatalog,
     names: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
-    let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
+    let parts: Vec<&str> = names
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect();
     let (schema, name) = match parts.as_slice() {
         [n] => (None, *n),
         [s, n] => (Some(*s), *n),

@@ -17,10 +17,10 @@ use crate::pg_catalog::{
 pub(crate) fn drop_target_identity(
     interp: &PgCatalog,
     obj_type: ObjectType,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
 ) -> Option<(i32, u32)> {
     let kind = obj_type as i32;
-    match (obj_type, obj_node.as_ref()?) {
+    match (obj_type, obj_node?) {
         (
             ObjectType::ObjectTable
             | ObjectType::ObjectView
@@ -55,7 +55,7 @@ pub(crate) fn drop_target_identity(
             let names: Vec<&str> = list
                 .items
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect();
             let (schema, name) = match names.as_slice() {
                 [n] => (None, *n),
@@ -115,7 +115,7 @@ pub(crate) fn drop_target_identity(
             let names: Vec<&str> = list
                 .items
                 .iter()
-                .filter_map(super::util::node_string)
+                .filter_map(|n| super::util::node_string(n.as_ref()))
                 .collect();
             let (schema, name) = match names.as_slice() {
                 [n] => (None, *n),
@@ -1975,7 +1975,7 @@ pub(crate) fn drop_column_dependents(
 /// nothing the analyzer can tell.
 pub(crate) fn expression_references(
     interp: &PgCatalog,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     relid: Option<PgClassOid>,
 ) -> Vec<Reference> {
     let mut scope = crate::scope::Scope::default();
@@ -2012,14 +2012,14 @@ pub(crate) fn expression_references(
 /// becomes a constant naming its object.
 pub(crate) fn coerced_expression_references(
     interp: &PgCatalog,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     relid: Option<PgClassOid>,
     target: Option<crate::oid::PgTypeOid>,
 ) -> Vec<Reference> {
     use typedpg_pg_query::ast;
     let mut refs = expression_references(interp, expr, relid);
     if let Some(target) = target
-        && let Some(ast::Node::AConst(ac)) = expr.as_ref()
+        && let Some(ast::Node::AConst(ac)) = expr
         && !ac.isnull
         && let Some(ast::AConstValue::String(sv)) = &ac.val
     {
@@ -2068,12 +2068,12 @@ pub(crate) fn note_expr_type_use(interp: &mut PgCatalog, addr: ObjectAddress, us
 /// target's base type, wrapped in a CoerceToDomain for each domain over it.
 pub(crate) fn literal_coercion_references(
     interp: &PgCatalog,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     target: crate::oid::PgTypeOid,
 ) -> Vec<Reference> {
     use typedpg_pg_query::ast;
     let literal = matches!(
-        expr.as_ref(),
+        expr,
         Some(ast::Node::AConst(ac)) if !ac.isnull && matches!(ac.val, Some(ast::AConstValue::String(_)))
     );
     let mut refs = Vec::new();
@@ -2089,12 +2089,12 @@ pub(crate) fn literal_coercion_references(
 /// analyzer can type).
 fn result_types(
     interp: &PgCatalog,
-    exprs: &[&Option<typedpg_pg_query::ast::Node>],
+    exprs: &[Option<&typedpg_pg_query::ast::Node>],
     relid: PgClassOid,
 ) -> Vec<crate::oid::PgTypeOid> {
     exprs
         .iter()
-        .filter_map(|e| super::volatile::infer_over_relation(interp, relid, e, None)?.ok())
+        .filter_map(|e| super::volatile::infer_over_relation(interp, relid, *e, None)?.ok())
         .map(|t| t.type_oid)
         .filter(|t| *t != crate::pg_catalog::oid::UNKNOWN)
         .collect()
@@ -2107,7 +2107,7 @@ fn result_types(
 fn record_expressions(
     interp: &mut PgCatalog,
     depender: ObjectAddress,
-    exprs: &[&Option<typedpg_pg_query::ast::Node>],
+    exprs: &[Option<&typedpg_pg_query::ast::Node>],
     relid: Option<PgClassOid>,
     results: &[crate::oid::PgTypeOid],
 ) {
@@ -2119,14 +2119,14 @@ fn record_expressions(
 fn record_coerced_expressions(
     interp: &mut PgCatalog,
     depender: ObjectAddress,
-    exprs: &[&Option<typedpg_pg_query::ast::Node>],
+    exprs: &[Option<&typedpg_pg_query::ast::Node>],
     relid: Option<PgClassOid>,
     target: Option<crate::oid::PgTypeOid>,
     results: &[crate::oid::PgTypeOid],
 ) {
     let refs: Vec<Reference> = exprs
         .iter()
-        .flat_map(|e| coerced_expression_references(interp, e, relid, target))
+        .flat_map(|e| coerced_expression_references(interp, *e, relid, target))
         .chain(
             results
                 .iter()
@@ -2164,7 +2164,7 @@ pub(crate) fn record_check_constraint(interp: &mut PgCatalog, oid: crate::oid::P
     let addr = ObjectAddress::new(PG_CONSTRAINT_RELID, oid.into_nonzero(), 0);
     forget_dependencies_of(interp, addr);
     // (Its result, boolean, is pinned.)
-    record_expressions(interp, addr, &[&expr], Some(relid), &[]);
+    record_expressions(interp, addr, &[(*expr).as_ref()], Some(relid), &[]);
 }
 
 /// A column default or generation expression (`attr_default_exprs`)
@@ -2185,7 +2185,7 @@ pub(crate) fn record_column_expression(interp: &mut PgCatalog, relid: PgClassOid
     record_coerced_expressions(
         interp,
         ObjectAddress::column(relid, attnum),
-        &[&expr],
+        &[(*expr).as_ref()],
         Some(relid),
         target,
         &results,
@@ -2198,13 +2198,13 @@ pub(crate) fn record_column_expression(interp: &mut PgCatalog, relid: PgClassOid
 pub(crate) fn record_partition_key_expressions(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    exprs: &[&Option<typedpg_pg_query::ast::Node>],
+    exprs: &[Option<&typedpg_pg_query::ast::Node>],
 ) {
     let results = result_types(interp, exprs, relid);
     let refers = type_references(
         &exprs
             .iter()
-            .flat_map(|e| expression_references(interp, e, Some(relid)))
+            .flat_map(|e| expression_references(interp, *e, Some(relid)))
             .collect::<Vec<_>>(),
     );
     record_expressions(
@@ -2235,14 +2235,19 @@ pub(crate) fn record_index_expressions(interp: &mut PgCatalog, index: PgClassOid
         .cloned()
         .chain(row.indpred.iter().map(|e| e.ast.clone()))
         .collect();
-    let refs: Vec<&Option<typedpg_pg_query::ast::Node>> = exprs.iter().collect();
+    let refs: Vec<Option<&typedpg_pg_query::ast::Node>> =
+        exprs.iter().map(Option::as_ref).collect();
     // The key expressions produce the index's column types (the predicate
     // a boolean, pinned).
-    let results = result_types(interp, &key_exprs.iter().collect::<Vec<_>>(), relid);
+    let results = result_types(
+        interp,
+        &key_exprs.iter().map(Option::as_ref).collect::<Vec<_>>(),
+        relid,
+    );
     let refers = type_references(
         &refs
             .iter()
-            .flat_map(|e| expression_references(interp, e, Some(relid)))
+            .flat_map(|e| expression_references(interp, *e, Some(relid)))
             .collect::<Vec<_>>(),
     );
     record_expressions(
@@ -2281,13 +2286,13 @@ pub(crate) fn record_publication_rel(
     let mut refs: Vec<Reference> = table
         .columns
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .map(|c| Reference::Column(relid, c.to_owned()))
         .collect();
     if table.where_clause.is_some() {
         refs.extend(expression_references(
             interp,
-            &table.where_clause,
+            table.where_clause.as_ref(),
             Some(relid),
         ));
     }

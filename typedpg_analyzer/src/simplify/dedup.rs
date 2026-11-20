@@ -302,7 +302,7 @@ fn rows_distinct(
     let mut deps: Vec<(u64, usize)> = Vec::new();
     // WHERE holds on every output row: a relation whose key the WHERE
     // equates to what other relations determine is determined by them.
-    let where_facts = conjuncts(&s.where_clause)
+    let where_facts = conjuncts(s.where_clause.as_ref())
         .into_iter()
         .flat_map(|c| scope.equality_facts(ctx, c, None))
         .collect::<Vec<_>>();
@@ -371,7 +371,7 @@ pub(super) fn is_plain_distinct(s: &ast::SelectStmt) -> bool {
 /// PG picks.
 pub(super) fn has_unsafe_call(ctx: &Ctx<'_>, s: &ast::SelectStmt) -> bool {
     let node = Some(Node::SelectStmt(NodeBox::new(s.clone())));
-    if super::proof::has_volatile(ctx, &node) {
+    if super::proof::has_volatile(ctx, node.as_ref()) {
         return true;
     }
     let mut stack = vec![NodeRef::SelectStmt(s)];
@@ -562,7 +562,7 @@ pub(super) struct Join<'a> {
     /// The side, when it is a single relation.
     pub(super) left_rel: Option<usize>,
     pub(super) right_rel: Option<usize>,
-    pub(super) quals: &'a Option<ast::Node>,
+    pub(super) quals: Option<&'a ast::Node>,
     pub(super) using: Vec<&'a str>,
     /// The `using` names whose two sides have the same type under a
     /// deterministic collation: the merged column is then one side's own
@@ -692,7 +692,7 @@ impl<'a> Scope<'a> {
             mode,
         };
         for item in from {
-            scope.add(ctx, env, item, false, functions, outer)?;
+            scope.add(ctx, env, item.as_ref(), false, functions, outer)?;
         }
         Some(scope)
     }
@@ -729,10 +729,13 @@ impl<'a> Scope<'a> {
             // relation, not a partial one a reference could bind to.
             let rels = scope.rels.len();
             let joins = scope.joins.len();
-            if scope.add(ctx, env, item, false, true, &root).is_none() {
+            if scope
+                .add(ctx, env, item.as_ref(), false, true, &root)
+                .is_none()
+            {
                 scope.rels.truncate(rels);
                 scope.joins.truncate(joins);
-                scope.add_opaque(item);
+                scope.add_opaque(item.as_ref());
             }
         }
         Some(scope)
@@ -741,11 +744,11 @@ impl<'a> Scope<'a> {
     /// Add one FROM item the proof can't model as a single opaque relation:
     /// never determined, with no known columns, under the refname a
     /// reference can use (`alias`, else a table's or function's name).
-    fn add_opaque(&mut self, item: &'a Option<ast::Node>) {
+    fn add_opaque(&mut self, item: Option<&'a ast::Node>) {
         if self.rels.len() == MAX_RELATIONS {
             return;
         }
-        let (refname, aliased, relname) = match item.as_ref() {
+        let (refname, aliased, relname) = match item {
             Some(Node::RangeVar(rv)) => {
                 let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
                 (
@@ -815,12 +818,12 @@ impl<'a> Scope<'a> {
         &mut self,
         ctx: &Ctx<'_>,
         env: &CteEnv,
-        item: &'a Option<ast::Node>,
+        item: Option<&'a ast::Node>,
         nullable: bool,
         functions: bool,
         outer: &FromScope<'_>,
     ) -> Option<u64> {
-        match item.as_ref()? {
+        match item? {
             Node::RangeVar(rv) => self.add_range_var(ctx, env, rv, nullable),
             Node::RangeFunction(rf) => functions
                 .then(|| self.add_range_function(ctx, rf, nullable))
@@ -841,11 +844,12 @@ impl<'a> Scope<'a> {
                     _ => return None,
                 };
                 let first = self.rels.len();
-                let left = self.add(ctx, env, &j.larg, left_nullable, functions, outer)?;
+                let left = self.add(ctx, env, j.larg.as_ref(), left_nullable, functions, outer)?;
                 let middle = self.rels.len();
-                let right = self.add(ctx, env, &j.rarg, right_nullable, functions, outer)?;
-                let single = |side: &Option<ast::Node>, at: usize| {
-                    matches!(side.as_ref(), Some(Node::RangeVar(_))).then_some(at)
+                let right =
+                    self.add(ctx, env, j.rarg.as_ref(), right_nullable, functions, outer)?;
+                let single = |side: Option<&ast::Node>, at: usize| {
+                    matches!(side, Some(Node::RangeVar(_))).then_some(at)
                 };
                 let using = j
                     .using_clause
@@ -881,9 +885,9 @@ impl<'a> Scope<'a> {
                     kind,
                     left,
                     right,
-                    left_rel: single(&j.larg, first),
-                    right_rel: single(&j.rarg, middle),
-                    quals: &j.quals,
+                    left_rel: single(j.larg.as_ref(), first),
+                    right_rel: single(j.rarg.as_ref(), middle),
+                    quals: j.quals.as_ref(),
                     using,
                     using_uncoerced,
                     nullable,
@@ -1470,12 +1474,12 @@ impl<'a> Scope<'a> {
     fn operand(
         &self,
         ctx: &Ctx<'_>,
-        expr: &Option<ast::Node>,
+        expr: Option<&ast::Node>,
         outer: Option<&FromScope<'_>>,
         scalar_sublinks: bool,
         env: Option<&CteEnv>,
     ) -> Option<Operand> {
-        match expr.as_ref()? {
+        match expr? {
             Node::ColumnRef(cr) => {
                 let Fields::Names(names) = column_ref_fields(cr) else {
                     return None;
@@ -1557,7 +1561,7 @@ impl<'a> Scope<'a> {
                 if !type_name.typmods.is_empty() || !type_name.array_bounds.is_empty() {
                     return None;
                 }
-                let arg = self.operand(ctx, &cast.arg, outer, scalar_sublinks, env)?;
+                let arg = self.operand(ctx, cast.arg.as_ref(), outer, scalar_sublinks, env)?;
                 let typ = type_name_oid(ctx, type_name)?;
                 // A conversion that runs a volatile function could yield
                 // another value each time the row pair is evaluated.
@@ -1610,7 +1614,7 @@ impl<'a> Scope<'a> {
         for arg in &call.args {
             operands.push(self.operand(
                 ctx,
-                crate::functions::call_arg_value(arg),
+                crate::functions::call_arg_value(arg.as_ref()),
                 outer,
                 scalar_sublinks,
                 env,
@@ -1666,10 +1670,12 @@ impl<'a> Scope<'a> {
     ) -> Option<Operand> {
         let name = string_list(&expr.name).join(".");
         let left = match &expr.lexpr {
-            left @ Some(_) => Some(self.operand(ctx, left, outer, scalar_sublinks, env)?),
+            left @ Some(_) => {
+                Some(self.operand(ctx, left.as_ref(), outer, scalar_sublinks, env)?)
+            }
             None => None,
         };
-        let right = self.operand(ctx, &expr.rexpr, outer, scalar_sublinks, env)?;
+        let right = self.operand(ctx, expr.rexpr.as_ref(), outer, scalar_sublinks, env)?;
         let op = ctx.catalog.find_operator(
             &name,
             left.as_ref().map(|operand| operand.typ),
@@ -1784,7 +1790,7 @@ impl<'a> Scope<'a> {
         for arg in &call.args {
             let operand = self.operand(
                 ctx,
-                crate::functions::call_arg_value(arg),
+                crate::functions::call_arg_value(arg.as_ref()),
                 Some(outer),
                 true,
                 Some(env),
@@ -1891,7 +1897,7 @@ impl<'a> Scope<'a> {
     pub(super) fn equality_facts(
         &self,
         ctx: &Ctx<'_>,
-        conjunct: &Option<ast::Node>,
+        conjunct: Option<&ast::Node>,
         outer: Option<&FromScope<'_>>,
     ) -> Vec<EqFact> {
         self.facts_from_conjunct(ctx, conjunct, outer, false, None)
@@ -1905,7 +1911,7 @@ impl<'a> Scope<'a> {
     pub(super) fn cardinality_facts(
         &self,
         ctx: &Ctx<'_>,
-        conjunct: &Option<ast::Node>,
+        conjunct: Option<&ast::Node>,
         outer: Option<&FromScope<'_>>,
         env: &CteEnv,
     ) -> Vec<EqFact> {
@@ -1915,7 +1921,7 @@ impl<'a> Scope<'a> {
     fn facts_from_conjunct(
         &self,
         ctx: &Ctx<'_>,
-        conjunct: &Option<ast::Node>,
+        conjunct: Option<&ast::Node>,
         outer: Option<&FromScope<'_>>,
         cardinality: bool,
         env: Option<&CteEnv>,
@@ -1932,7 +1938,7 @@ impl<'a> Scope<'a> {
         if l.is_none() || r.is_none() {
             return Vec::new();
         }
-        let operand = |expr: &Option<ast::Node>| self.operand(ctx, expr, outer, cardinality, env);
+        let operand = |expr: Option<&ast::Node>| self.operand(ctx, expr, outer, cardinality, env);
         match e.kind {
             AExprKind::AexprOp => {
                 // PG's `make_row_comparison_op` turns a row comparison into
@@ -1946,14 +1952,16 @@ impl<'a> Scope<'a> {
                     }
                     let mut out = Vec::new();
                     for (left, right) in left.args.iter().zip(&right.args) {
-                        let (Some(left), Some(right)) = (operand(left), operand(right)) else {
+                        let (Some(left), Some(right)) =
+                            (operand(left.as_ref()), operand(right.as_ref()))
+                        else {
                             return Vec::new();
                         };
                         out.extend(self.facts_of(ctx, name, &left, &right, cardinality));
                     }
                     return out;
                 }
-                let (Some(l), Some(r)) = (operand(l), operand(r)) else {
+                let (Some(l), Some(r)) = (operand(l.as_ref()), operand(r.as_ref())) else {
                     return Vec::new();
                 };
                 self.facts_of(ctx, name, &l, &r, cardinality)
@@ -1967,7 +1975,7 @@ impl<'a> Scope<'a> {
                 let [item] = list.items.as_slice() else {
                     return Vec::new();
                 };
-                let (Some(l), Some(r)) = (operand(l), operand(item)) else {
+                let (Some(l), Some(r)) = (operand(l.as_ref()), operand(item.as_ref())) else {
                     return Vec::new();
                 };
                 self.facts_of(ctx, name, &l, &r, cardinality)
@@ -1979,7 +1987,7 @@ impl<'a> Scope<'a> {
                 let [item] = array.elements.as_slice() else {
                     return Vec::new();
                 };
-                let (Some(l), Some(r)) = (operand(l), operand(item)) else {
+                let (Some(l), Some(r)) = (operand(l.as_ref()), operand(item.as_ref())) else {
                     return Vec::new();
                 };
                 // The array constructor resolves its element's type first
@@ -2188,7 +2196,7 @@ fn coercion_is_nonvolatile(ctx: &Ctx<'_>, source: PgTypeOid, target: PgTypeOid) 
 /// partial index's predicate: WHERE conjuncts for WHERE facts, a join's ON
 /// conjuncts for that join's facts.
 pub(super) struct PredicateSources<'a> {
-    pub(super) conjuncts: &'a [&'a Option<ast::Node>],
+    pub(super) conjuncts: &'a [Option<&'a ast::Node>],
     /// The `=` facts those conjuncts (and the join's `USING`) prove: only
     /// a strict equality proves its column non-NULL.
     pub(super) facts: &'a [EqFact],
@@ -2222,7 +2230,7 @@ impl<'a> Scope<'a> {
         unique_keys(ctx, oid).iter().find_map(|key| {
             if key.predicate.is_some() {
                 let sources = sources?;
-                if !self.predicate_implied(ctx, b, &key.predicate, sources) {
+                if !self.predicate_implied(ctx, b, key.predicate.as_ref(), sources) {
                     return None;
                 }
             }
@@ -2282,21 +2290,21 @@ impl<'a> Scope<'a> {
         &self,
         ctx: &Ctx<'_>,
         b: usize,
-        predicate: &Option<ast::Node>,
+        predicate: Option<&ast::Node>,
         sources: &PredicateSources<'_>,
     ) -> bool {
         let conjuncts = conjuncts(predicate);
         !conjuncts.is_empty()
             && conjuncts
                 .iter()
-                .all(|predicate| self.predicate_conjunct_implied(ctx, b, predicate, sources))
+                .all(|predicate| self.predicate_conjunct_implied(ctx, b, *predicate, sources))
     }
 
     fn predicate_conjunct_implied(
         &self,
         ctx: &Ctx<'_>,
         b: usize,
-        predicate: &Option<ast::Node>,
+        predicate: Option<&ast::Node>,
         sources: &PredicateSources<'_>,
     ) -> bool {
         let Some(predicate) = self.canonical_predicate(ctx, b, predicate) else {
@@ -2313,7 +2321,7 @@ impl<'a> Scope<'a> {
             Node::BoolExpr(expr)
                 if expr.boolop == BoolExprType::NotExpr && expr.args.len() == 1 =>
             {
-                canonical_var_attnum(&expr.args[0]).map(|attnum| (attnum, false))
+                canonical_var_attnum(expr.args[0].as_ref()).map(|attnum| (attnum, false))
             }
             _ => None,
         };
@@ -2321,8 +2329,8 @@ impl<'a> Scope<'a> {
             && self.boolean_column(ctx, b, attnum)
             && builtin_boolean_equality(ctx.catalog)
             && sources.conjuncts.iter().any(|source| {
-                let source = self.canonical_source(b, source);
-                boolean_conjunct_fixes(&source, attnum, value)
+                let source = self.canonical_source(b, *source);
+                boolean_conjunct_fixes(source.as_ref(), attnum, value)
             })
         {
             return true;
@@ -2344,7 +2352,7 @@ impl<'a> Scope<'a> {
             }
         }
         sources.conjuncts.iter().any(|source| {
-            let source = self.canonical_source(b, source);
+            let source = self.canonical_source(b, *source);
             source
                 .as_ref()
                 .is_some_and(|source| predicate.equal(source))
@@ -2369,10 +2377,10 @@ impl<'a> Scope<'a> {
         &self,
         ctx: &Ctx<'_>,
         b: usize,
-        node: &Option<ast::Node>,
+        node: Option<&ast::Node>,
     ) -> Option<ast::Node> {
         // A missing predicate is no shape the proof reads.
-        let mut canonical = node.clone()?;
+        let mut canonical = node.cloned()?;
         let mut resolved = true;
         canonical.rewrite(&mut |_| true, &mut |node| {
             let Node::ColumnRef(column) = &*node else {
@@ -2394,8 +2402,8 @@ impl<'a> Scope<'a> {
     /// `node` with every column reference that resolves to relation `b`
     /// replaced by the column's attnum; other references are left as they
     /// are (they can't equal a canonical column).
-    fn canonical_source(&self, b: usize, node: &Option<ast::Node>) -> Option<ast::Node> {
-        let mut canonical = node.clone();
+    fn canonical_source(&self, b: usize, node: Option<&ast::Node>) -> Option<ast::Node> {
+        let mut canonical = node.cloned();
         if let Some(canonical) = canonical.as_mut() {
             canonical.rewrite(&mut |_| true, &mut |node| {
                 let Node::ColumnRef(column) = &*node else {
@@ -2426,7 +2434,7 @@ fn canonical_column(attnum: i16) -> ast::Node {
 }
 
 /// The attnum a canonical [`canonical_column`] `Var` names.
-fn canonical_var_attnum(node: &Option<ast::Node>) -> Option<i16> {
+fn canonical_var_attnum(node: Option<&ast::Node>) -> Option<i16> {
     let Some(Node::Var(var)) = node else {
         return None;
     };
@@ -2456,27 +2464,27 @@ fn builtin_boolean_equality(catalog: &PgCatalog) -> bool {
 /// The equality must be written unqualified as `=`: an unqualified boolean
 /// comparison resolves to `pg_catalog.booleq`, while `OPERATOR(schema.=)`
 /// could name an operator with another meaning.
-fn boolean_conjunct_fixes(node: &Option<ast::Node>, attnum: i16, value: bool) -> bool {
-    let is_column = |node: &Option<ast::Node>| canonical_var_attnum(node) == Some(attnum);
-    let is_value = |node: &Option<ast::Node>| {
+fn boolean_conjunct_fixes(node: Option<&ast::Node>, attnum: i16, value: bool) -> bool {
+    let is_column = |node: Option<&ast::Node>| canonical_var_attnum(node) == Some(attnum);
+    let is_value = |node: Option<&ast::Node>| {
         matches!(
-            node.as_ref(),
+            node,
             Some(Node::AConst(constant))
                 if !constant.isnull
                     && matches!(constant.val.as_ref(),
                         Some(AConstValue::Boolean(boolean)) if boolean.boolval == value)
         )
     };
-    match node.as_ref() {
+    match node {
         Some(Node::AExpr(expr)) if expr.kind == AExprKind::AexprOp => {
             let name = string_list(&expr.name);
             name.len() == 1
                 && name[0] == "="
-                && ((is_column(&expr.lexpr) && is_value(&expr.rexpr))
-                    || (is_value(&expr.lexpr) && is_column(&expr.rexpr)))
+                && ((is_column(expr.lexpr.as_ref()) && is_value(expr.rexpr.as_ref()))
+                    || (is_value(expr.lexpr.as_ref()) && is_column(expr.rexpr.as_ref())))
         }
         Some(Node::BooleanTest(test)) => {
-            is_column(&test.arg)
+            is_column(test.arg.as_ref())
                 && matches!(
                     (value, test.booltesttype),
                     (true, ast::BoolTestType::IsTrue) | (false, ast::BoolTestType::IsFalse)
@@ -2485,7 +2493,7 @@ fn boolean_conjunct_fixes(node: &Option<ast::Node>, attnum: i16, value: bool) ->
         Some(Node::BoolExpr(expr))
             if !value && expr.boolop == BoolExprType::NotExpr && expr.args.len() == 1 =>
         {
-            canonical_var_attnum(&expr.args[0]) == Some(attnum)
+            canonical_var_attnum(expr.args[0].as_ref()) == Some(attnum)
         }
         _ => false,
     }
@@ -2496,10 +2504,10 @@ fn boolean_conjunct_fixes(node: &Option<ast::Node>, attnum: i16, value: bool) ->
 /// `column = / <> constant`, or `column [NOT] IN (constants)` (also spelled
 /// `= ANY` / `<> ALL (ARRAY[...])`).
 fn supported_predicate(node: &ast::Node) -> bool {
-    let is_var = |node: &Option<ast::Node>| matches!(node.as_ref(), Some(Node::Var(_)));
+    let is_var = |node: Option<&ast::Node>| matches!(node, Some(Node::Var(_)));
     match node {
         Node::Var(_) => true,
-        Node::NullTest(test) => is_var(&test.arg),
+        Node::NullTest(test) => is_var(test.arg.as_ref()),
         Node::BoolExpr(expr) => {
             expr.boolop == BoolExprType::NotExpr
                 && expr.args.len() == 1
@@ -2508,23 +2516,23 @@ fn supported_predicate(node: &ast::Node) -> bool {
         Node::AExpr(expr) => match expr.kind {
             AExprKind::AexprOp => {
                 matches!(string_list(&expr.name).last(), Some(&"=" | &"<>"))
-                    && ((is_var(&expr.lexpr) && is_constant(&expr.rexpr))
-                        || (is_constant(&expr.lexpr) && is_var(&expr.rexpr)))
+                    && ((is_var(expr.lexpr.as_ref()) && is_constant(expr.rexpr.as_ref()))
+                        || (is_constant(expr.lexpr.as_ref()) && is_var(expr.rexpr.as_ref())))
             }
             AExprKind::AexprIn => {
                 matches!(string_list(&expr.name).last(), Some(&"=" | &"<>"))
-                    && is_var(&expr.lexpr)
+                    && is_var(expr.lexpr.as_ref())
                     && matches!(
                         expr.rexpr.as_ref(),
-                        Some(Node::List(list)) if list.items.iter().all(is_const_node)
+                        Some(Node::List(list)) if list.items.iter().all(|n| is_const_node(n.as_ref()))
                     )
             }
             AExprKind::AexprOpAny | AExprKind::AexprOpAll => {
                 matches!(string_list(&expr.name).last(), Some(&"=" | &"<>"))
-                    && is_var(&expr.lexpr)
+                    && is_var(expr.lexpr.as_ref())
                     && matches!(
                         expr.rexpr.as_ref(),
-                        Some(Node::AArrayExpr(array)) if array.elements.iter().all(is_const_node)
+                        Some(Node::AArrayExpr(array)) if array.elements.iter().all(|n| is_const_node(n.as_ref()))
                     )
             }
             _ => false,
@@ -2533,11 +2541,11 @@ fn supported_predicate(node: &ast::Node) -> bool {
     }
 }
 
-fn is_constant(node: &Option<ast::Node>) -> bool {
+fn is_constant(node: Option<&ast::Node>) -> bool {
     is_const_node(node)
 }
 
-fn is_const_node(node: &Option<ast::Node>) -> bool {
+fn is_const_node(node: Option<&ast::Node>) -> bool {
     matches!(node, Some(Node::AConst(_)))
 }
 
@@ -2832,7 +2840,7 @@ fn check_fixes_column(catalog: &PgCatalog, relid: PgClassOid, name: &str, ty: Pg
                 .is_some_and(|check| {
                     matches!(&check.expr,
                     crate::ddl::tables::check_inherit::StoredExpr::Written(expr)
-                        if check_fixes_value(catalog, expr, name, ty))
+                        if check_fixes_value(catalog, (**expr).as_ref(), name, ty))
                 })
     })
 }
@@ -2845,20 +2853,20 @@ fn check_fixes_column(catalog: &PgCatalog, relid: PgClassOid, name: &str, ty: Pg
 /// boolean forms involve no operator.
 fn check_fixes_value(
     catalog: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     name: &str,
     ty: PgTypeOid,
 ) -> bool {
     let is_named =
-        |node: &Option<ast::Node>| column_name(node).is_some_and(|column| column == name);
-    let Some(expr) = expr.as_ref() else {
+        |node: Option<&ast::Node>| column_name(node).is_some_and(|column| column == name);
+    let Some(expr) = expr else {
         return false;
     };
     match expr {
         Node::BoolExpr(bool) if bool.boolop == BoolExprType::AndExpr => bool
             .args
             .iter()
-            .any(|arg| check_fixes_value(catalog, arg, name, ty)),
+            .any(|arg| check_fixes_value(catalog, arg.as_ref(), name, ty)),
         Node::ColumnRef(column) => {
             ty == oid::BOOL
                 && matches!(column_ref_fields(column), Fields::Names(names)
@@ -2880,8 +2888,8 @@ fn check_fixes_value(
                 // With no user-defined `=` in the catalog there is nothing
                 // else it could have bound to.
                 && !user_defined_equality_operator_exists(catalog)
-                && ((is_named(&expr.lexpr) && fixed_literal(catalog, &expr.rexpr, ty))
-                    || (fixed_literal(catalog, &expr.lexpr, ty) && is_named(&expr.rexpr)))
+                && ((is_named(expr.lexpr.as_ref()) && fixed_literal(catalog, expr.rexpr.as_ref(), ty))
+                    || (fixed_literal(catalog, expr.lexpr.as_ref(), ty) && is_named(expr.rexpr.as_ref())))
         }
         _ => false,
     }
@@ -2903,8 +2911,8 @@ fn user_defined_equality_operator_exists(catalog: &PgCatalog) -> bool {
 
 /// The name a column reference in a stored expression names: its last
 /// string field (`col`, `t.col`, `s.t.col`).
-fn column_name(node: &Option<ast::Node>) -> Option<&str> {
-    let Node::ColumnRef(column) = node.as_ref()? else {
+fn column_name(node: Option<&ast::Node>) -> Option<&str> {
+    let Node::ColumnRef(column) = node? else {
         return None;
     };
     let Fields::Names(names) = column_ref_fields(column) else {
@@ -2919,8 +2927,8 @@ fn column_name(node: &Option<ast::Node>) -> Option<&str> {
 /// own and deterministic). The `=` PG resolves must be a built-in operator
 /// over `ty` — a user operator named `=` could be true for many values — and
 /// a user type's input function isn't modeled, so its literals are refused.
-fn fixed_literal(catalog: &PgCatalog, node: &Option<ast::Node>, ty: PgTypeOid) -> bool {
-    let Some(Node::AConst(constant)) = node.as_ref() else {
+fn fixed_literal(catalog: &PgCatalog, node: Option<&ast::Node>, ty: PgTypeOid) -> bool {
+    let Some(Node::AConst(constant)) = node else {
         return false;
     };
     if constant.isnull {
@@ -3415,17 +3423,17 @@ pub(super) fn cte_names(tree: &ast::ParseResult) -> HashSet<String> {
 }
 
 /// The top-level AND conjuncts of a qualification.
-pub(super) fn conjuncts(qual: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
+pub(super) fn conjuncts(qual: Option<&ast::Node>) -> Vec<Option<&ast::Node>> {
     let mut out = Vec::new();
     // A missing qualification has no conjuncts.
-    let mut stack: Vec<&Option<ast::Node>> = Vec::new();
+    let mut stack: Vec<Option<&ast::Node>> = Vec::new();
     if qual.is_some() {
         stack.push(qual);
     }
     while let Some(n) = stack.pop() {
         match n {
             Some(Node::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr => {
-                stack.extend(b.args.iter().rev());
+                stack.extend(b.args.iter().map(Option::as_ref).rev());
             }
             _ => out.push(n),
         }

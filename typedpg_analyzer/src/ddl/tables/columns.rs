@@ -15,7 +15,7 @@ pub(crate) fn serial_base_type(tn: &typedpg_pg_query::ast::TypeName) -> Option<P
     let parts: Vec<&str> = tn
         .names
         .iter()
-        .filter_map(super::super::util::node_string)
+        .filter_map(|n| super::super::util::node_string(n.as_ref()))
         .collect();
     let name = match parts.as_slice() {
         [name] | ["pg_catalog", name] => *name,
@@ -402,7 +402,7 @@ fn missing_composite_dependencies(
 fn expression_is_volatile(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> bool {
     let used = std::cell::RefCell::new(Vec::new());
     let _ = crate::ddl::volatile::infer_over_relation(interp, relid, expr, Some(&used));
@@ -414,7 +414,7 @@ fn expression_is_volatile(
             return false;
         }
         match interp.inline_sql_bodies.get(&oid) {
-            Some(body) => crate::expr::plan_fold::may_be_volatile(body, interp),
+            Some(body) => crate::expr::plan_fold::may_be_volatile(body.as_ref(), interp),
             None => true,
         }
     })
@@ -459,7 +459,10 @@ fn using_source(
 ) -> Option<(PgTypeOid, i32)> {
     match using {
         ast::Node::ColumnRef(cr)
-            if cr.fields.last().and_then(crate::ddl::util::node_string)
+            if cr
+                .fields
+                .last()
+                .and_then(|n| crate::ddl::util::node_string(n.as_ref()))
                 == Some(attr.attname.as_str()) =>
         {
             Some((attr.atttypid, attr.atttypmod.unwrap_or(-1)))
@@ -639,14 +642,14 @@ fn in_partition_key(interp: &PgCatalog, relid: PgClassOid, attnum: i16) -> bool 
 /// The DEFAULT expression written on a column definition, if any.
 pub(crate) fn column_default_expr(
     cd: &typedpg_pg_query::ast::ColumnDef,
-) -> Option<&Option<typedpg_pg_query::ast::Node>> {
+) -> Option<Option<&typedpg_pg_query::ast::Node>> {
     cd.raw_default
         .is_some()
-        .then_some(&cd.raw_default)
+        .then_some(cd.raw_default.as_ref())
         .or_else(|| {
             cd.constraints.iter().find_map(|n| match n.as_ref()? {
                 ast::Node::Constraint(c) if c.contype == ConstrType::ConstrDefault => {
-                    c.raw_expr.is_some().then_some(&c.raw_expr)
+                    c.raw_expr.is_some().then_some(c.raw_expr.as_ref())
                 }
                 _ => None,
             })
@@ -865,7 +868,7 @@ pub(crate) fn parse_column_def(
                 });
                 if c.raw_expr.is_some() {
                     crate::ddl::volatile::check_no_volatile(
-                        &c.raw_expr,
+                        c.raw_expr.as_ref(),
                         crate::ddl::volatile::ExprLocation::Generated,
                         interp,
                     )?;
@@ -1412,9 +1415,7 @@ fn add_column_to(
         interp,
         relid,
         next_attnum,
-        column_default_expr(cd)
-            .filter(|_| !null_default)
-            .and_then(|e| e.as_ref()),
+        column_default_expr(cd).filter(|_| !null_default).flatten(),
     );
     if !rec.recursing
         && let Some(deptype) = col.owned_sequence
@@ -1440,7 +1441,7 @@ fn add_column_to(
                 &col.name,
                 col.type_oid,
                 kind,
-                &c.raw_expr,
+                c.raw_expr.as_ref(),
             )?;
             cooked.record(interp, relid, next_attnum);
         }
@@ -1808,7 +1809,7 @@ pub(crate) fn set_default(
     }
     // ATExecColumnDefault → AddRelationNewConstraints: a default cooking
     // to a null constant is stored as none (the column's default is NULL).
-    let mut stored = cmd.def.is_some().then_some(&cmd.def);
+    let mut stored = cmd.def.is_some().then_some(cmd.def.as_ref());
     if let Some(attr) = &attr {
         if let Some(expr) = stored {
             let default_type =
@@ -1833,7 +1834,7 @@ pub(crate) fn set_default(
             interp,
             relid,
             attr.attnum,
-            stored.and_then(|e| e.as_ref()),
+            stored.flatten(),
         );
     }
     if rec.recurse {
@@ -2190,11 +2191,11 @@ fn recheck_dependents_of_retyped_column(
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::pg_catalog::oid;
-    let reads_column = |expr: &Option<typedpg_pg_query::ast::Node>| {
-        expr.as_ref().is_some_and(|inner| {
+    let reads_column = |expr: Option<&typedpg_pg_query::ast::Node>| {
+        expr.is_some_and(|inner| {
             inner.nodes().into_iter().any(|(n, ..)| {
                 matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
-                    if cr.fields.last().and_then(super::super::util::node_string)
+                    if cr.fields.last().and_then(|n| super::super::util::node_string(n.as_ref()))
                         == Some(attr.attname.as_str()))
             })
         })
@@ -2215,7 +2216,7 @@ fn recheck_dependents_of_retyped_column(
         &attrs,
     );
     let null_ctx = crate::nullability::NullabilityContext::default();
-    let infer_bool = |expr: &Option<typedpg_pg_query::ast::Node>, clause: &str| {
+    let infer_bool = |expr: Option<&typedpg_pg_query::ast::Node>, clause: &str| {
         let mut params = crate::param_collector::ParamCollector::default();
         let found = infer_expr(
             expr,
@@ -2251,10 +2252,10 @@ fn recheck_dependents_of_retyped_column(
     indexes.sort_by_key(|i| i.indexrelid);
     for index in indexes {
         if let Some(pred) = index.indpred.as_ref()
-            && reads_column(&pred.ast)
+            && reads_column(pred.ast.as_ref())
         {
             infer_bool(
-                &crate::ddl::stored_exprs::over_own_row(interp, relid, &pred.ast),
+                crate::ddl::stored_exprs::over_own_row(interp, relid, pred.ast.as_ref()).as_ref(),
                 "WHERE",
             )?;
         }
@@ -2282,7 +2283,8 @@ fn recheck_dependents_of_retyped_column(
                 }) = interp.check_defs.get(&con.oid)
                 {
                     infer_bool(
-                        &crate::ddl::stored_exprs::over_own_row(interp, relid, expr),
+                        crate::ddl::stored_exprs::over_own_row(interp, relid, (**expr).as_ref())
+                            .as_ref(),
                         "CHECK",
                     )?;
                 }
@@ -2370,7 +2372,14 @@ pub(crate) fn prep_alter_column_using(
     let Ok(new_typmod) = crate::typmod::encode(interp, new_type_oid, tn) else {
         return Ok(());
     };
-    check_using_expression(interp, relid, &attr, using, new_type_oid, new_typmod)
+    check_using_expression(
+        interp,
+        relid,
+        &attr,
+        using.as_ref(),
+        new_type_oid,
+        new_typmod,
+    )
 }
 
 /// The USING expression of ALTER COLUMN TYPE: evaluated over the table's
@@ -2380,7 +2389,7 @@ fn check_using_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
     attr: &PgAttribute,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
     new_type: PgTypeOid,
     new_typmod: Option<i32>,
 ) -> Result<(), DdlError> {
@@ -2661,7 +2670,7 @@ pub(crate) fn set_expression(
             &attr.attname,
             attr.atttypid,
             kind,
-            &cmd.def,
+            cmd.def.as_ref(),
         )?;
         cooked.record(interp, relid, attr.attnum);
     }

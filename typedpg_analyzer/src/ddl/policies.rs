@@ -65,8 +65,8 @@ pub fn create_policy(interp: &mut PgCatalog, stmt: &CreatePolicyStmt) -> Result<
         ));
     }
     let relid = policy_table(interp, rv)?;
-    check_policy_expression(interp, relid, &stmt.qual)?;
-    check_policy_expression(interp, relid, &stmt.with_check)?;
+    check_policy_expression(interp, relid, stmt.qual.as_ref())?;
+    check_policy_expression(interp, relid, stmt.with_check.as_ref())?;
     if interp
         .policies
         .get(&relid)
@@ -92,8 +92,8 @@ pub fn alter_policy(interp: &mut PgCatalog, stmt: &AlterPolicyStmt) -> Result<()
     };
     let relid = policy_table(interp, rv)?;
     // AlterPolicy transforms the new expressions, then finds the policy.
-    check_policy_expression(interp, relid, &stmt.qual)?;
-    check_policy_expression(interp, relid, &stmt.with_check)?;
+    check_policy_expression(interp, relid, stmt.qual.as_ref())?;
+    check_policy_expression(interp, relid, stmt.with_check.as_ref())?;
     let relname = interp
         .pg_class
         .get(&relid)
@@ -125,16 +125,16 @@ pub fn alter_policy(interp: &mut PgCatalog, stmt: &AlterPolicyStmt) -> Result<()
 /// `DROP POLICY [IF EXISTS] name ON table`.
 pub(crate) fn drop_policy(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node else {
         return Ok(());
     };
     let parts: Vec<String> = list
         .items
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .map(str::to_owned)
         .collect();
     let Some((name, rel)) = parts.split_last() else {
@@ -205,7 +205,7 @@ pub(crate) fn rename_policy(
 fn check_policy_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &Option<typedpg_pg_query::ast::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     if expr.is_none() {
         return Ok(());

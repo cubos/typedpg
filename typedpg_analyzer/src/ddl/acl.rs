@@ -168,8 +168,13 @@ fn check_privileges<'a>(
             } else {
                 Some(privilege(&ap.priv_name)?)
             };
-            out.columns
-                .push((mask, ap.cols.iter().filter_map(node_string).collect()));
+            out.columns.push((
+                mask,
+                ap.cols
+                    .iter()
+                    .filter_map(|n| node_string(n.as_ref()))
+                    .collect(),
+            ));
             continue;
         }
         if ap.priv_name.is_empty() {
@@ -226,7 +231,7 @@ pub fn grant(interp: &PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
     match targtype {
         GrantTargetType::AclTargetAllInSchema => {
             for obj in &stmt.objects {
-                let Some(schema) = node_string(obj) else {
+                let Some(schema) = node_string(obj.as_ref()) else {
                     continue;
                 };
                 let Some(ns) = interp.namespace_oid(schema) else {
@@ -243,7 +248,8 @@ pub fn grant(interp: &PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
         }
         GrantTargetType::AclTargetObject => {
             for obj in &stmt.objects {
-                if let Some(target) = resolve_target(interp, objtype, obj, stmt.is_grant)? {
+                if let Some(target) = resolve_target(interp, objtype, obj.as_ref(), stmt.is_grant)?
+                {
                     targets.push(target);
                 }
             }
@@ -299,7 +305,7 @@ fn relations_in_schema(
 fn resolve_target(
     interp: &PgCatalog,
     objtype: ObjectType,
-    obj: &Option<typedpg_pg_query::ast::Node>,
+    obj: Option<&typedpg_pg_query::ast::Node>,
     is_grant: bool,
 ) -> Result<Option<Target>, DdlError> {
     use ObjectType as O;
@@ -308,7 +314,7 @@ fn resolve_target(
             "{what} \"{name}\" does not exist"
         )))
     };
-    Ok(Some(match (objtype, obj.as_ref()) {
+    Ok(Some(match (objtype, obj) {
         (O::ObjectTable | O::ObjectSequence, Some(ast::Node::RangeVar(rv))) => {
             Target::Relation(super::util::lookup_relation(interp, rv)?.1)
         }
@@ -521,7 +527,7 @@ pub fn alter_default_privileges(
         let Some(ast::Node::List(list)) = de.arg.as_ref() else {
             continue;
         };
-        schemas.extend(list.items.iter().filter_map(node_string));
+        schemas.extend(list.items.iter().filter_map(|n| node_string(n.as_ref())));
     }
     let Some(action) = stmt.action.as_ref() else {
         return Ok(());

@@ -71,11 +71,11 @@ impl ExprKind {
 /// Reject the constructs `kind` forbids anywhere in `expr`.
 pub(crate) fn check_expr_kind(
     interp: &PgCatalog,
-    expr: &Option<ast::Node>,
+    expr: Option<&ast::Node>,
     kind: ExprKind,
 ) -> Result<(), DdlError> {
     if let Some(context) = kind.subquery_context()
-        && let Some(inner) = expr.as_ref()
+        && let Some(inner) = expr
         && (matches!(inner, ast::Node::SubLink(_))
             || inner
                 .nodes()

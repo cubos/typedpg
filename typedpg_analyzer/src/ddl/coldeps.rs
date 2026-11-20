@@ -204,9 +204,8 @@ fn select_of(exprs: &[&Node], from: Vec<Option<Node>>) -> Node {
 }
 
 /// The expressions of a RETURNING list.
-fn returning_vals(clause: &Option<NodeBox<ast::ReturningClause>>) -> Vec<&Node> {
+fn returning_vals(clause: Option<&ast::ReturningClause>) -> Vec<&Node> {
     clause
-        .as_deref()
         .map_or(&[][..], |c| c.exprs.as_slice())
         .iter()
         .filter_map(|t| match t.as_ref()? {
@@ -286,7 +285,7 @@ fn statement_refs(
             if let Some(source) = ins.select_stmt.as_ref() {
                 refs.extend(statement_refs(interp, source, extra_from));
             }
-            let returning: Vec<&Node> = returning_vals(&ins.returning_clause);
+            let returning: Vec<&Node> = returning_vals(ins.returning_clause.as_deref());
             if let Some(rv) = ins.relation.as_ref()
                 && !returning.is_empty()
             {
@@ -310,7 +309,7 @@ fn statement_refs(
                     })
                     .collect();
                 exprs.extend(upd.where_clause.as_ref());
-                exprs.extend(returning_vals(&upd.returning_clause));
+                exprs.extend(returning_vals(upd.returning_clause.as_deref()));
                 let mut from = vec![Some(range_var_node(rv, None))];
                 from.extend(upd.from_clause.iter().cloned());
                 from.extend(extra_from.iter().cloned());
@@ -323,7 +322,7 @@ fn statement_refs(
             {
                 refs.push((relid, 0));
                 let mut exprs: Vec<&Node> = del.where_clause.as_ref().into_iter().collect();
-                exprs.extend(returning_vals(&del.returning_clause));
+                exprs.extend(returning_vals(del.returning_clause.as_deref()));
                 let mut from = vec![Some(range_var_node(rv, None))];
                 from.extend(del.using_clause.iter().cloned());
                 from.extend(extra_from.iter().cloned());
@@ -373,7 +372,7 @@ fn statement_functions(
                 .as_ref()
                 .map(|s| statement_functions(interp, s, extra_from))
                 .unwrap_or_default();
-            let returning = returning_vals(&ins.returning_clause);
+            let returning = returning_vals(ins.returning_clause.as_deref());
             if let Some(rv) = ins.relation.as_ref()
                 && !returning.is_empty()
             {
@@ -394,7 +393,7 @@ fn statement_functions(
                 })
                 .collect();
             exprs.extend(upd.where_clause.as_ref());
-            exprs.extend(returning_vals(&upd.returning_clause));
+            exprs.extend(returning_vals(upd.returning_clause.as_deref()));
             walk(&select_of(&exprs, with_target(rv, &upd.from_clause)))
         }
         ast::Node::DeleteStmt(del) => {
@@ -402,7 +401,7 @@ fn statement_functions(
                 return Vec::new();
             };
             let mut exprs: Vec<&Node> = del.where_clause.as_ref().into_iter().collect();
-            exprs.extend(returning_vals(&del.returning_clause));
+            exprs.extend(returning_vals(del.returning_clause.as_deref()));
             walk(&select_of(&exprs, with_target(rv, &del.using_clause)))
         }
         _ => Vec::new(),

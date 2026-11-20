@@ -20,13 +20,13 @@ fn def_qualified_name(de: &DefElem) -> Vec<String> {
         Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::List(l)) => l
             .items
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::String(s)) => vec![s.sval.clone()],
@@ -580,11 +580,11 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
     let names: Vec<String> = owa
         .objname
         .iter()
-        .filter_map(node_string)
+        .filter_map(|n| node_string(n.as_ref()))
         .map(str::to_owned)
         .collect();
-    let arg = |n: &Option<typedpg_pg_query::ast::Node>| -> Result<Option<PgTypeOid>, DdlError> {
-        match n.as_ref() {
+    let arg = |n: Option<&typedpg_pg_query::ast::Node>| -> Result<Option<PgTypeOid>, DdlError> {
+        match n {
             Some(ast::Node::TypeName(tn)) if !tn.names.is_empty() => {
                 typename_type_id(interp, tn).map(Some)
             }
@@ -592,8 +592,8 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         }
     };
     let (left, right) = match owa.objargs.as_slice() {
-        [l, r] => (arg(l)?, arg(r)?),
-        [r] => (None, arg(r)?),
+        [l, r] => (arg(l.as_ref())?, arg(r.as_ref())?),
+        [r] => (None, arg(r.as_ref())?),
         _ => return Ok(()),
     };
     // LookupOperName: postfix operators are gone.

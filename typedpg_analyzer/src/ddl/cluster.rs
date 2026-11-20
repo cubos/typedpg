@@ -125,13 +125,13 @@ pub(crate) fn large_object_calls(interp: &mut PgCatalog, fc: &FuncCall) {
     let name: Vec<&str> = fc
         .funcname
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .collect();
     let name = match name.as_slice() {
         [name] | ["pg_catalog", name] => *name,
         _ => return,
     };
-    let constant = |n: Option<&Option<typedpg_pg_query::ast::Node>>| match n?.as_ref()? {
+    let constant = |n: Option<&typedpg_pg_query::ast::Node>| match n? {
         ast::Node::AConst(c) => match c.val.as_ref()? {
             ast::AConstValue::Integer(i) => u32::try_from(i.ival).ok().filter(|&v| v != 0),
             ast::AConstValue::Float(f) => f.fval.parse::<u32>().ok().filter(|&v| v != 0),
@@ -142,17 +142,17 @@ pub(crate) fn large_object_calls(interp: &mut PgCatalog, fc: &FuncCall) {
     let objects = &mut interp.cluster_objects.large_objects;
     match name {
         "lo_create" | "lo_from_bytea" => {
-            if let Some(oid) = constant(fc.args.first()) {
+            if let Some(oid) = constant(fc.args.first().and_then(Option::as_ref)) {
                 objects.push(oid);
             }
         }
         "lo_import" => {
-            if let Some(oid) = constant(fc.args.get(1)) {
+            if let Some(oid) = constant(fc.args.get(1).and_then(Option::as_ref)) {
                 objects.push(oid);
             }
         }
         "lo_unlink" => {
-            if let Some(oid) = constant(fc.args.first()) {
+            if let Some(oid) = constant(fc.args.first().and_then(Option::as_ref)) {
                 objects.retain(|&o| o != oid);
             }
         }

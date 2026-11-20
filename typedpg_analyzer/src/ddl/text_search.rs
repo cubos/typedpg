@@ -60,7 +60,10 @@ pub(crate) fn find(interp: &PgCatalog, kind: &str, names: &[&str]) -> Result<(),
 }
 
 fn names_of(nodes: &[Option<typedpg_pg_query::ast::Node>]) -> Vec<&str> {
-    nodes.iter().filter_map(node_string).collect()
+    nodes
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+        .collect()
 }
 
 /// A definition option naming another text search object
@@ -70,13 +73,13 @@ fn option_names(de: &typedpg_pg_query::ast::DefElem) -> Vec<String> {
         Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::List(l)) => l
             .items
             .iter()
-            .filter_map(node_string)
+            .filter_map(|n| node_string(n.as_ref()))
             .map(str::to_owned)
             .collect(),
         Some(ast::Node::String(s)) => vec![s.sval.clone()],
@@ -281,14 +284,14 @@ fn option_value(de: &typedpg_pg_query::ast::DefElem) -> Option<String> {
         ast::Node::TypeName(tn) => Some(
             tn.names
                 .iter()
-                .filter_map(node_string)
+                .filter_map(|n| node_string(n.as_ref()))
                 .collect::<Vec<_>>()
                 .join("."),
         ),
         ast::Node::List(l) => Some(
             l.items
                 .iter()
-                .filter_map(node_string)
+                .filter_map(|n| node_string(n.as_ref()))
                 .collect::<Vec<_>>()
                 .join("."),
         ),
@@ -668,7 +671,11 @@ pub fn alter_configuration(
 ) -> Result<(), DdlError> {
     let at = position(interp, "c", &names_of(&stmt.cfgname))?;
     if config_uses_default_parser(interp, at) {
-        for token in stmt.tokentype.iter().filter_map(node_string) {
+        for token in stmt
+            .tokentype
+            .iter()
+            .filter_map(|n| node_string(n.as_ref()))
+        {
             if !DEFAULT_PARSER_TOKENS.contains(&token) {
                 return Err(DdlError::Parse(format!(
                     "token type \"{token}\" does not exist"
@@ -687,7 +694,11 @@ pub fn alter_configuration(
     let mut mapping = config_mapping(interp, at);
     // getTokenTypes: a token type named twice counts once.
     let mut tokens: Vec<&str> = Vec::new();
-    for token in stmt.tokentype.iter().filter_map(node_string) {
+    for token in stmt
+        .tokentype
+        .iter()
+        .filter_map(|n| node_string(n.as_ref()))
+    {
         if !tokens.contains(&token) {
             tokens.push(token);
         }
@@ -780,7 +791,7 @@ pub fn alter_dictionary(
 pub(crate) fn drop(
     interp: &mut PgCatalog,
     objtype: ObjectType,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -790,7 +801,7 @@ pub(crate) fn drop(
         ObjectType::ObjectTsparser => "p",
         _ => "t",
     };
-    let Some(ast::Node::List(l)) = obj_node.as_ref() else {
+    let Some(ast::Node::List(l)) = obj_node else {
         return Ok(());
     };
     let names = names_of(&l.items);

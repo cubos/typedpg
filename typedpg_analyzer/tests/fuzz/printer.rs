@@ -26,14 +26,14 @@ use typedpg_pg_query::ast::{
 pub(crate) fn print(tree: &ast::ParseResult) -> Option<String> {
     let mut stmts = Vec::with_capacity(tree.stmts.len());
     for raw in &tree.stmts {
-        stmts.push(statement(&raw.stmt)?);
+        stmts.push(statement(raw.stmt.as_ref())?);
     }
     Some(stmts.join("; "))
 }
 
 /// One statement (a CTE body included): the node kinds the fuzzer produces.
-fn statement(node: &Option<ast::Node>) -> Option<String> {
-    match node.as_ref()? {
+fn statement(node: Option<&ast::Node>) -> Option<String> {
+    match node? {
         Node::SelectStmt(sel) => select_stmt(sel),
         Node::InsertStmt(ins) => insert_stmt(ins),
         Node::UpdateStmt(upd) => update_stmt(upd),
@@ -82,7 +82,11 @@ fn select_stmt(sel: &ast::SelectStmt) -> Option<String> {
                 let Node::List(list) = row.as_ref()? else {
                     return None;
                 };
-                let exprs: Vec<String> = list.items.iter().map(expr).collect::<Option<_>>()?;
+                let exprs: Vec<String> = list
+                    .items
+                    .iter()
+                    .map(|n| expr(n.as_ref()))
+                    .collect::<Option<_>>()?;
                 Some(format!("({})", exprs.join(", ")))
             })
             .collect::<Option<_>>()?;
@@ -119,7 +123,7 @@ fn select_stmt(sel: &ast::SelectStmt) -> Option<String> {
             let items: Vec<String> = sel
                 .distinct_clause
                 .iter()
-                .map(expr)
+                .map(|n| expr(n.as_ref()))
                 .collect::<Option<_>>()?;
             sql.push_str(&format!("DISTINCT ON ({}) ", items.join(", ")));
         }
@@ -128,7 +132,7 @@ fn select_stmt(sel: &ast::SelectStmt) -> Option<String> {
     let targets: Vec<String> = sel
         .target_list
         .iter()
-        .map(res_target)
+        .map(|n| res_target(n.as_ref()))
         .collect::<Option<_>>()?;
     if targets.is_empty() {
         return None;
@@ -139,20 +143,20 @@ fn select_stmt(sel: &ast::SelectStmt) -> Option<String> {
         let from: Vec<String> = sel
             .from_clause
             .iter()
-            .map(from_item)
+            .map(|n| from_item(n.as_ref()))
             .collect::<Option<_>>()?;
         sql.push_str(" FROM ");
         sql.push_str(&from.join(", "));
     }
     if let where_clause @ Some(_) = &sel.where_clause {
         sql.push_str(" WHERE ");
-        sql.push_str(&expr(where_clause)?);
+        sql.push_str(&expr(where_clause.as_ref())?);
     }
     if !sel.group_clause.is_empty() {
         let groups: Vec<String> = sel
             .group_clause
             .iter()
-            .map(grouping_element)
+            .map(|n| grouping_element(n.as_ref()))
             .collect::<Option<_>>()?;
         sql.push_str(" GROUP BY ");
         if sel.group_distinct {
@@ -162,7 +166,7 @@ fn select_stmt(sel: &ast::SelectStmt) -> Option<String> {
     }
     if let having @ Some(_) = &sel.having_clause {
         sql.push_str(" HAVING ");
-        sql.push_str(&expr(having)?);
+        sql.push_str(&expr(having.as_ref())?);
     }
     if !sel.window_clause.is_empty() {
         let windows: Vec<String> = sel
@@ -193,22 +197,29 @@ fn select_stmt(sel: &ast::SelectStmt) -> Option<String> {
 fn sort_and_limit(sel: &ast::SelectStmt) -> Option<String> {
     let mut sql = String::new();
     if !sel.sort_clause.is_empty() {
-        let sorts: Vec<String> = sel.sort_clause.iter().map(sort_by).collect::<Option<_>>()?;
+        let sorts: Vec<String> = sel
+            .sort_clause
+            .iter()
+            .map(|n| sort_by(n.as_ref()))
+            .collect::<Option<_>>()?;
         sql.push_str(" ORDER BY ");
         sql.push_str(&sorts.join(", "));
     }
     if let count @ Some(_) = &sel.limit_count {
         if sel.limit_option == LimitOption::WithTies {
-            sql.push_str(&format!(" FETCH FIRST {} ROWS WITH TIES", expr(count)?));
+            sql.push_str(&format!(
+                " FETCH FIRST {} ROWS WITH TIES",
+                expr(count.as_ref())?
+            ));
         } else {
-            sql.push_str(&format!(" LIMIT {}", expr(count)?));
+            sql.push_str(&format!(" LIMIT {}", expr(count.as_ref())?));
         }
     }
     // `LIMIT ALL` needs no case of its own: the grammar stores it as a NULL
     // constant count (`LIMIT NULL` parses the same), and a select without a
     // LIMIT has no count and `LimitOption::Count`, PostgreSQL's default.
     if let offset @ Some(_) = &sel.limit_offset {
-        sql.push_str(&format!(" OFFSET {}", expr(offset)?));
+        sql.push_str(&format!(" OFFSET {}", expr(offset.as_ref())?));
     }
     Some(sql)
 }
@@ -238,7 +249,7 @@ fn insert_stmt(ins: &ast::InsertStmt) -> Option<String> {
         sql.push_str(&format!(" ({})", cols.join(", ")));
     }
     sql.push(' ');
-    sql.push_str(&statement(&ins.select_stmt)?);
+    sql.push_str(&statement(ins.select_stmt.as_ref())?);
     if let Some(on_conflict) = ins.on_conflict_clause.as_ref() {
         sql.push(' ');
         sql.push_str(&on_conflict_clause(on_conflict)?);
@@ -261,7 +272,7 @@ fn update_stmt(upd: &ast::UpdateStmt) -> Option<String> {
     let sets: Vec<String> = upd
         .target_list
         .iter()
-        .map(set_target)
+        .map(|n| set_target(n.as_ref()))
         .collect::<Option<_>>()?;
     if sets.is_empty() {
         return None;
@@ -272,14 +283,14 @@ fn update_stmt(upd: &ast::UpdateStmt) -> Option<String> {
         let from: Vec<String> = upd
             .from_clause
             .iter()
-            .map(from_item)
+            .map(|n| from_item(n.as_ref()))
             .collect::<Option<_>>()?;
         sql.push_str(" FROM ");
         sql.push_str(&from.join(", "));
     }
     if let where_clause @ Some(_) = &upd.where_clause {
         sql.push_str(" WHERE ");
-        sql.push_str(&expr(where_clause)?);
+        sql.push_str(&expr(where_clause.as_ref())?);
     }
     if let Some(returning) = upd.returning_clause.as_ref() {
         sql.push(' ');
@@ -300,14 +311,14 @@ fn delete_stmt(del: &ast::DeleteStmt) -> Option<String> {
         let using: Vec<String> = del
             .using_clause
             .iter()
-            .map(from_item)
+            .map(|n| from_item(n.as_ref()))
             .collect::<Option<_>>()?;
         sql.push_str(" USING ");
         sql.push_str(&using.join(", "));
     }
     if let where_clause @ Some(_) = &del.where_clause {
         sql.push_str(" WHERE ");
-        sql.push_str(&expr(where_clause)?);
+        sql.push_str(&expr(where_clause.as_ref())?);
     }
     if let Some(returning) = del.returning_clause.as_ref() {
         sql.push(' ');
@@ -325,12 +336,12 @@ fn merge_stmt(mrg: &ast::MergeStmt) -> Option<String> {
     sql.push_str("MERGE INTO ");
     sql.push_str(&range_var(mrg.relation.as_ref()?)?);
     sql.push_str(" USING ");
-    sql.push_str(&from_item(&mrg.source_relation)?);
+    sql.push_str(&from_item(mrg.source_relation.as_ref())?);
     sql.push_str(" ON ");
-    sql.push_str(&expr(&mrg.join_condition)?);
+    sql.push_str(&expr(mrg.join_condition.as_ref())?);
     for when in &mrg.merge_when_clauses {
         sql.push(' ');
-        sql.push_str(&merge_when_clause(when)?);
+        sql.push_str(&merge_when_clause(when.as_ref())?);
     }
     if let Some(returning) = mrg.returning_clause.as_ref() {
         sql.push(' ');
@@ -339,8 +350,8 @@ fn merge_stmt(mrg: &ast::MergeStmt) -> Option<String> {
     Some(sql)
 }
 
-fn merge_when_clause(node: &Option<ast::Node>) -> Option<String> {
-    let Node::MergeWhenClause(when) = node.as_ref()? else {
+fn merge_when_clause(node: Option<&ast::Node>) -> Option<String> {
+    let Node::MergeWhenClause(when) = node? else {
         return None;
     };
     let mut sql = String::from("WHEN ");
@@ -351,7 +362,7 @@ fn merge_when_clause(node: &Option<ast::Node>) -> Option<String> {
     });
     if let condition @ Some(_) = &when.condition {
         sql.push_str(" AND ");
-        sql.push_str(&expr(condition)?);
+        sql.push_str(&expr(condition.as_ref())?);
     }
     sql.push_str(" THEN ");
     match when.command_type {
@@ -359,7 +370,7 @@ fn merge_when_clause(node: &Option<ast::Node>) -> Option<String> {
             let sets: Vec<String> = when
                 .target_list
                 .iter()
-                .map(set_target)
+                .map(|n| set_target(n.as_ref()))
                 .collect::<Option<_>>()?;
             if sets.is_empty() {
                 return None;
@@ -384,7 +395,11 @@ fn merge_when_clause(node: &Option<ast::Node>) -> Option<String> {
                     .collect::<Option<_>>()?;
                 sql.push_str(&format!(" ({})", cols.join(", ")));
             }
-            let values: Vec<String> = when.values.iter().map(expr).collect::<Option<_>>()?;
+            let values: Vec<String> = when
+                .values
+                .iter()
+                .map(|n| expr(n.as_ref()))
+                .collect::<Option<_>>()?;
             sql.push_str(&format!(" VALUES ({})", values.join(", ")));
         }
         _ => return None,
@@ -398,12 +413,12 @@ fn on_conflict_clause(clause: &ast::OnConflictClause) -> Option<String> {
         let elems: Vec<String> = infer
             .index_elems
             .iter()
-            .map(index_elem)
+            .map(|n| index_elem(n.as_ref()))
             .collect::<Option<_>>()?;
         sql.push_str(&format!(" ({})", elems.join(", ")));
         if let where_clause @ Some(_) = &infer.where_clause {
             sql.push_str(" WHERE ");
-            sql.push_str(&expr(where_clause)?);
+            sql.push_str(&expr(where_clause.as_ref())?);
         }
     }
     match clause.action {
@@ -412,7 +427,7 @@ fn on_conflict_clause(clause: &ast::OnConflictClause) -> Option<String> {
             let sets: Vec<String> = clause
                 .target_list
                 .iter()
-                .map(set_target)
+                .map(|n| set_target(n.as_ref()))
                 .collect::<Option<_>>()?;
             if sets.is_empty() {
                 return None;
@@ -421,7 +436,7 @@ fn on_conflict_clause(clause: &ast::OnConflictClause) -> Option<String> {
             sql.push_str(&sets.join(", "));
             if let where_clause @ Some(_) = &clause.where_clause {
                 sql.push_str(" WHERE ");
-                sql.push_str(&expr(where_clause)?);
+                sql.push_str(&expr(where_clause.as_ref())?);
             }
         }
         _ => return None,
@@ -429,8 +444,8 @@ fn on_conflict_clause(clause: &ast::OnConflictClause) -> Option<String> {
     Some(sql)
 }
 
-fn index_elem(node: &Option<ast::Node>) -> Option<String> {
-    let Node::IndexElem(elem) = node.as_ref()? else {
+fn index_elem(node: Option<&ast::Node>) -> Option<String> {
+    let Node::IndexElem(elem) = node? else {
         return None;
     };
     if !elem.indexcolname.is_empty()
@@ -443,7 +458,7 @@ fn index_elem(node: &Option<ast::Node>) -> Option<String> {
         return None;
     }
     if let expression @ Some(_) = &elem.expr {
-        return expr(expression);
+        return expr(expression.as_ref());
     }
     (!elem.name.is_empty()).then(|| quote_identifier(&elem.name))
 }
@@ -453,7 +468,11 @@ fn returning_clause(clause: &ast::ReturningClause) -> Option<String> {
         // `RETURNING WITH (OLD AS …, NEW AS …)` isn't generated.
         return None;
     }
-    let exprs: Vec<String> = clause.exprs.iter().map(res_target).collect::<Option<_>>()?;
+    let exprs: Vec<String> = clause
+        .exprs
+        .iter()
+        .map(|n| res_target(n.as_ref()))
+        .collect::<Option<_>>()?;
     if exprs.is_empty() {
         return None;
     }
@@ -468,7 +487,7 @@ fn with_clause(with: &ast::WithClause) -> Option<String> {
     let ctes: Vec<String> = with
         .ctes
         .iter()
-        .map(common_table_expr)
+        .map(|n| common_table_expr(n.as_ref()))
         .collect::<Option<_>>()?;
     if ctes.is_empty() {
         return None;
@@ -477,8 +496,8 @@ fn with_clause(with: &ast::WithClause) -> Option<String> {
     Some(sql)
 }
 
-fn common_table_expr(node: &Option<ast::Node>) -> Option<String> {
-    let Node::CommonTableExpr(cte) = node.as_ref()? else {
+fn common_table_expr(node: Option<&ast::Node>) -> Option<String> {
+    let Node::CommonTableExpr(cte) = node? else {
         return None;
     };
     if cte.search_clause.is_some() || cte.cycle_clause.is_some() {
@@ -502,7 +521,7 @@ fn common_table_expr(node: &Option<ast::Node>) -> Option<String> {
         ast::CteMaterialize::Never => sql.push_str("NOT MATERIALIZED "),
     }
     sql.push('(');
-    sql.push_str(&statement(&cte.ctequery)?);
+    sql.push_str(&statement(cte.ctequery.as_ref())?);
     sql.push(')');
     Some(sql)
 }
@@ -544,8 +563,8 @@ fn alias_sql(alias: &ast::Alias) -> Option<String> {
     Some(sql)
 }
 
-fn from_item(node: &Option<ast::Node>) -> Option<String> {
-    match node.as_ref()? {
+fn from_item(node: Option<&ast::Node>) -> Option<String> {
+    match node? {
         Node::RangeVar(var) => range_var(var),
         Node::RangeSubselect(sub) => {
             let mut sql = String::new();
@@ -553,7 +572,7 @@ fn from_item(node: &Option<ast::Node>) -> Option<String> {
                 sql.push_str("LATERAL ");
             }
             sql.push('(');
-            sql.push_str(&statement(&sub.subquery)?);
+            sql.push_str(&statement(sub.subquery.as_ref())?);
             sql.push(')');
             if let Some(alias) = sub.alias.as_ref() {
                 sql.push_str(&alias_sql(alias)?);
@@ -580,7 +599,7 @@ fn range_function(func: &ast::RangeFunction) -> Option<String> {
             return None;
         };
         match list.items.as_slice() {
-            [call] => calls.push(expr(call)?),
+            [call] => calls.push(expr(call.as_ref())?),
             _ => return None,
         }
     }
@@ -612,8 +631,8 @@ fn join_expr(join: &ast::JoinExpr) -> Option<String> {
         _ => return None,
     };
     let natural = if join.is_natural { "NATURAL " } else { "" };
-    let larg = from_item(&join.larg)?;
-    let rarg = from_item(&join.rarg)?;
+    let larg = from_item(join.larg.as_ref())?;
+    let rarg = from_item(join.rarg.as_ref())?;
     let mut sql = if join.quals.is_none() && join.using_clause.is_empty() {
         // Inner joins without a condition: `CROSS JOIN` keeps the tree.
         if join.jointype != JoinType::JoinInner || join.is_natural {
@@ -632,7 +651,7 @@ fn join_expr(join: &ast::JoinExpr) -> Option<String> {
     } else {
         format!(
             "{larg} {natural}{qualifier}JOIN {rarg} ON {}",
-            expr(&join.quals)?
+            expr(join.quals.as_ref())?
         )
     };
     if let Some(alias) = join.alias.as_ref() {
@@ -645,18 +664,18 @@ fn join_expr(join: &ast::JoinExpr) -> Option<String> {
 // Target lists and clause nodes.
 // ──────────────────────────────────────────────────────────────────────────
 
-fn res_target(node: &Option<ast::Node>) -> Option<String> {
-    let Node::ResTarget(target) = node.as_ref()? else {
+fn res_target(node: Option<&ast::Node>) -> Option<String> {
+    let Node::ResTarget(target) = node? else {
         return None;
     };
     if !target.indirection.is_empty() {
         // `x = …` targets with subscripts aren't produced by the fuzzer.
         return None;
     }
-    if target_star(&target.val) {
+    if target_star(target.val.as_ref()) {
         return Some("*".to_string());
     }
-    let val = expr(&target.val)?;
+    let val = expr(target.val.as_ref())?;
     if target.name.is_empty() {
         Some(val)
     } else {
@@ -666,8 +685,8 @@ fn res_target(node: &Option<ast::Node>) -> Option<String> {
 
 /// An assignment target (`UPDATE … SET c = v`, `ON CONFLICT DO UPDATE`,
 /// MERGE's UPDATE action): `ResTarget` with the column name and the value.
-fn set_target(node: &Option<ast::Node>) -> Option<String> {
-    let Node::ResTarget(target) = node.as_ref()? else {
+fn set_target(node: Option<&ast::Node>) -> Option<String> {
+    let Node::ResTarget(target) = node? else {
         return None;
     };
     if target.name.is_empty() || !target.indirection.is_empty() {
@@ -676,24 +695,24 @@ fn set_target(node: &Option<ast::Node>) -> Option<String> {
     Some(format!(
         "{} = {}",
         quote_identifier(&target.name),
-        expr(&target.val)?
+        expr(target.val.as_ref())?
     ))
 }
 
 /// Whether a target is a bare `*` (`SELECT *`, `RETURNING *`).
-fn target_star(node: &Option<ast::Node>) -> bool {
+fn target_star(node: Option<&ast::Node>) -> bool {
     matches!(node, Some(Node::ColumnRef(cr))
         if cr.fields.len() == 1 && matches!(cr.fields[0], Some(Node::AStar(_))))
 }
 
-fn sort_by(node: &Option<ast::Node>) -> Option<String> {
-    let Node::SortBy(sort) = node.as_ref()? else {
+fn sort_by(node: Option<&ast::Node>) -> Option<String> {
+    let Node::SortBy(sort) = node? else {
         return None;
     };
     if !sort.use_op.is_empty() {
         return None;
     }
-    let mut sql = expr(&sort.node)?;
+    let mut sql = expr(sort.node.as_ref())?;
     match sort.sortby_dir {
         SortByDir::SortbyAsc | SortByDir::SortbyDefault => {}
         SortByDir::SortbyDesc => sql.push_str(" DESC"),
@@ -707,13 +726,17 @@ fn sort_by(node: &Option<ast::Node>) -> Option<String> {
     Some(sql)
 }
 
-fn grouping_element(node: &Option<ast::Node>) -> Option<String> {
-    let Some(Node::GroupingSet(set)) = node.as_ref() else {
+fn grouping_element(node: Option<&ast::Node>) -> Option<String> {
+    let Some(Node::GroupingSet(set)) = node else {
         return expr(node);
     };
     match set.kind {
         GroupingSetKind::GroupingSetSimple => {
-            let items = set.content.iter().map(expr).collect::<Option<Vec<_>>>()?;
+            let items = set
+                .content
+                .iter()
+                .map(|n| expr(n.as_ref()))
+                .collect::<Option<Vec<_>>>()?;
             Some(format!("({})", items.join(", ")))
         }
         GroupingSetKind::GroupingSetEmpty => Some("()".to_string()),
@@ -726,7 +749,7 @@ fn grouping_element(node: &Option<ast::Node>) -> Option<String> {
             let items = set
                 .content
                 .iter()
-                .map(grouping_element)
+                .map(|n| grouping_element(n.as_ref()))
                 .collect::<Option<Vec<_>>>()?;
             Some(format!("{keyword} ({})", items.join(", ")))
         }
@@ -737,7 +760,7 @@ fn grouping_element(node: &Option<ast::Node>) -> Option<String> {
             let items = set
                 .content
                 .iter()
-                .map(grouping_element)
+                .map(|n| grouping_element(n.as_ref()))
                 .collect::<Option<Vec<_>>>()?;
             Some(format!("GROUPING SETS ({})", items.join(", ")))
         }
@@ -762,7 +785,7 @@ fn window_spec(window: &ast::WindowDef) -> Option<String> {
         let items = window
             .partition_clause
             .iter()
-            .map(expr)
+            .map(|n| expr(n.as_ref()))
             .collect::<Option<Vec<_>>>()?;
         parts.push(format!("PARTITION BY {}", items.join(", ")));
     }
@@ -770,7 +793,7 @@ fn window_spec(window: &ast::WindowDef) -> Option<String> {
         let items = window
             .order_clause
             .iter()
-            .map(sort_by)
+            .map(|n| sort_by(n.as_ref()))
             .collect::<Option<Vec<_>>>()?;
         parts.push(format!("ORDER BY {}", items.join(", ")));
     }
@@ -835,7 +858,7 @@ fn frame_clause(window: &ast::WindowDef) -> Option<String> {
     };
     let start = frame_bound(
         options,
-        &window.start_offset,
+        window.start_offset.as_ref(),
         FRAMEOPTION_START_UNBOUNDED_PRECEDING,
         FRAMEOPTION_START_UNBOUNDED_FOLLOWING,
         FRAMEOPTION_START_CURRENT_ROW,
@@ -845,7 +868,7 @@ fn frame_clause(window: &ast::WindowDef) -> Option<String> {
     if options & FRAMEOPTION_BETWEEN != 0 {
         let end = frame_bound(
             options,
-            &window.end_offset,
+            window.end_offset.as_ref(),
             FRAMEOPTION_END_UNBOUNDED_PRECEDING,
             FRAMEOPTION_END_UNBOUNDED_FOLLOWING,
             FRAMEOPTION_END_CURRENT_ROW,
@@ -860,7 +883,7 @@ fn frame_clause(window: &ast::WindowDef) -> Option<String> {
 
 fn frame_bound(
     options: i32,
-    offset: &Option<ast::Node>,
+    offset: Option<&ast::Node>,
     unbounded_preceding: i32,
     unbounded_following: i32,
     current_row: i32,
@@ -889,8 +912,8 @@ fn frame_bound(
 // Expressions.
 // ──────────────────────────────────────────────────────────────────────────
 
-fn expr(node: &Option<ast::Node>) -> Option<String> {
-    match node.as_ref()? {
+fn expr(node: Option<&ast::Node>) -> Option<String> {
+    match node? {
         Node::ColumnRef(column) => column_ref(column),
         Node::AConst(c) => a_const(c),
         Node::ParamRef(param) => Some(format!("${}", param.number)),
@@ -901,12 +924,16 @@ fn expr(node: &Option<ast::Node>) -> Option<String> {
         Node::FuncCall(call) => func_call(call),
         Node::TypeCast(cast) => Some(format!(
             "CAST({} AS {})",
-            expr(&cast.arg)?,
+            expr(cast.arg.as_ref())?,
             type_name(cast.type_name.as_ref()?)?
         )),
         Node::CaseExpr(case) => case_expr(case),
         Node::CoalesceExpr(coalesce) => {
-            let args = coalesce.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
+            let args = coalesce
+                .args
+                .iter()
+                .map(|n| expr(n.as_ref()))
+                .collect::<Option<Vec<_>>>()?;
             if args.is_empty() {
                 return None;
             }
@@ -917,7 +944,11 @@ fn expr(node: &Option<ast::Node>) -> Option<String> {
                 MinMaxOp::IsGreatest => "GREATEST",
                 MinMaxOp::IsLeast => "LEAST",
             };
-            let args = minmax.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
+            let args = minmax
+                .args
+                .iter()
+                .map(|n| expr(n.as_ref()))
+                .collect::<Option<Vec<_>>>()?;
             if args.is_empty() {
                 return None;
             }
@@ -928,7 +959,7 @@ fn expr(node: &Option<ast::Node>) -> Option<String> {
             let elements = array
                 .elements
                 .iter()
-                .map(expr)
+                .map(|n| expr(n.as_ref()))
                 .collect::<Option<Vec<_>>>()?;
             if elements.is_empty() {
                 return None;
@@ -943,7 +974,7 @@ fn expr(node: &Option<ast::Node>) -> Option<String> {
             let names = strings(&collate.collname)?;
             Some(format!(
                 "({} COLLATE {})",
-                expr(&collate.arg)?,
+                expr(collate.arg.as_ref())?,
                 names
                     .iter()
                     .map(|n| quote_identifier(n))
@@ -1014,7 +1045,7 @@ fn quote_literal(value: &str) -> String {
 fn a_expr(expr_node: &ast::AExpr) -> Option<String> {
     let op = operator_name(&expr_node.name)?;
     let lexpr = match &expr_node.lexpr {
-        node @ Some(_) => Some(expr(node)?),
+        node @ Some(_) => Some(expr(node.as_ref())?),
         None => None,
     };
     let rexpr @ Some(_) = &expr_node.rexpr else {
@@ -1022,36 +1053,44 @@ fn a_expr(expr_node: &ast::AExpr) -> Option<String> {
     };
     match expr_node.kind {
         AExprKind::AexprOp => match lexpr {
-            Some(left) => Some(format!("({left} {op} {})", expr(rexpr)?)),
+            Some(left) => Some(format!("({left} {op} {})", expr(rexpr.as_ref())?)),
             None => {
                 // Prefix operators: quoted or not, only the symbolic ones
                 // PostgreSQL parses in that position.
                 if !matches!(op.as_str(), "+" | "-" | "~" | "@") {
                     return None;
                 }
-                Some(format!("({op} {})", expr(rexpr)?))
+                Some(format!("({op} {})", expr(rexpr.as_ref())?))
             }
         },
-        AExprKind::AexprOpAny => Some(format!("({} {op} ANY ({}))", lexpr?, expr(rexpr)?)),
-        AExprKind::AexprOpAll => Some(format!("({} {op} ALL ({}))", lexpr?, expr(rexpr)?)),
-        AExprKind::AexprDistinct => Some(format!("({} IS DISTINCT FROM {})", lexpr?, expr(rexpr)?)),
+        AExprKind::AexprOpAny => Some(format!("({} {op} ANY ({}))", lexpr?, expr(rexpr.as_ref())?)),
+        AExprKind::AexprOpAll => Some(format!("({} {op} ALL ({}))", lexpr?, expr(rexpr.as_ref())?)),
+        AExprKind::AexprDistinct => Some(format!(
+            "({} IS DISTINCT FROM {})",
+            lexpr?,
+            expr(rexpr.as_ref())?
+        )),
         AExprKind::AexprNotDistinct => Some(format!(
             "({} IS NOT DISTINCT FROM {})",
             lexpr?,
-            expr(rexpr)?
+            expr(rexpr.as_ref())?
         )),
-        AExprKind::AexprNullif => Some(format!("NULLIF({}, {})", lexpr?, expr(rexpr)?)),
+        AExprKind::AexprNullif => Some(format!("NULLIF({}, {})", lexpr?, expr(rexpr.as_ref())?)),
         AExprKind::AexprIn => {
             let Node::List(list) = rexpr.as_ref()? else {
                 return None;
             };
-            let items = list.items.iter().map(expr).collect::<Option<Vec<_>>>()?;
+            let items = list
+                .items
+                .iter()
+                .map(|n| expr(n.as_ref()))
+                .collect::<Option<Vec<_>>>()?;
             if items.is_empty() {
                 return None;
             }
             let keyword = match &expr_node.name[..] {
-                [name] if string_of(name) == Some("=") => "IN",
-                [name] if string_of(name) == Some("<>") => "NOT IN",
+                [name] if string_of(name.as_ref()) == Some("=") => "IN",
+                [name] if string_of(name.as_ref()) == Some("<>") => "NOT IN",
                 _ => return None,
             };
             Some(format!("({} {keyword} ({}))", lexpr?, items.join(", ")))
@@ -1060,25 +1099,25 @@ fn a_expr(expr_node: &ast::AExpr) -> Option<String> {
             let [name] = &expr_node.name[..] else {
                 return None;
             };
-            let keyword = match (expr_node.kind, string_of(name)) {
+            let keyword = match (expr_node.kind, string_of(name.as_ref())) {
                 (AExprKind::AexprLike, Some("~~")) => "LIKE",
                 (AExprKind::AexprLike, Some("!~~")) => "NOT LIKE",
                 (AExprKind::AexprIlike, Some("~~*")) => "ILIKE",
                 (AExprKind::AexprIlike, Some("!~~*")) => "NOT ILIKE",
                 _ => return None,
             };
-            Some(format!("({} {keyword} {})", lexpr?, expr(rexpr)?))
+            Some(format!("({} {keyword} {})", lexpr?, expr(rexpr.as_ref())?))
         }
         AExprKind::AexprSimilar => {
             let [name] = &expr_node.name[..] else {
                 return None;
             };
-            let keyword = match string_of(name) {
+            let keyword = match string_of(name.as_ref()) {
                 Some("~") => "SIMILAR TO",
                 Some("!~") => "NOT SIMILAR TO",
                 _ => return None,
             };
-            Some(format!("({} {keyword} {})", lexpr?, expr(rexpr)?))
+            Some(format!("({} {keyword} {})", lexpr?, expr(rexpr.as_ref())?))
         }
         AExprKind::AexprBetween
         | AExprKind::AexprNotBetween
@@ -1099,8 +1138,8 @@ fn a_expr(expr_node: &ast::AExpr) -> Option<String> {
             Some(format!(
                 "({} {keyword} {} AND {})",
                 lexpr?,
-                expr(low)?,
-                expr(high)?
+                expr(low.as_ref())?,
+                expr(high.as_ref())?
             ))
         }
     }
@@ -1114,7 +1153,11 @@ fn bool_expr(bool: &ast::BoolExpr) -> Option<String> {
             } else {
                 " OR "
             };
-            let args = bool.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
+            let args = bool
+                .args
+                .iter()
+                .map(|n| expr(n.as_ref()))
+                .collect::<Option<Vec<_>>>()?;
             if args.len() < 2 {
                 return None;
             }
@@ -1124,7 +1167,7 @@ fn bool_expr(bool: &ast::BoolExpr) -> Option<String> {
             let [arg] = bool.args.as_slice() else {
                 return None;
             };
-            Some(format!("(NOT {})", expr(arg)?))
+            Some(format!("(NOT {})", expr(arg.as_ref())?))
         }
     }
 }
@@ -1134,7 +1177,7 @@ fn null_test(test: &ast::NullTest) -> Option<String> {
         NullTestType::IsNull => "IS NULL",
         NullTestType::IsNotNull => "IS NOT NULL",
     };
-    Some(format!("({} {keyword})", expr(&test.arg)?))
+    Some(format!("({} {keyword})", expr(test.arg.as_ref())?))
 }
 
 fn boolean_test(test: &ast::BooleanTest) -> Option<String> {
@@ -1146,7 +1189,7 @@ fn boolean_test(test: &ast::BooleanTest) -> Option<String> {
         BoolTestType::IsUnknown => "IS UNKNOWN",
         BoolTestType::IsNotUnknown => "IS NOT UNKNOWN",
     };
-    Some(format!("({} {keyword})", expr(&test.arg)?))
+    Some(format!("({} {keyword})", expr(test.arg.as_ref())?))
 }
 
 fn func_call(call: &ast::FuncCall) -> Option<String> {
@@ -1163,7 +1206,11 @@ fn func_call(call: &ast::FuncCall) -> Option<String> {
         if call.agg_distinct {
             sql.push_str("DISTINCT ");
         }
-        let mut args = call.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
+        let mut args = call
+            .args
+            .iter()
+            .map(|n| expr(n.as_ref()))
+            .collect::<Option<Vec<_>>>()?;
         if call.func_variadic {
             let last = args.last_mut()?;
             *last = format!("VARIADIC {last}");
@@ -1173,7 +1220,7 @@ fn func_call(call: &ast::FuncCall) -> Option<String> {
             let order = call
                 .agg_order
                 .iter()
-                .map(sort_by)
+                .map(|n| sort_by(n.as_ref()))
                 .collect::<Option<Vec<_>>>()?;
             if !args.is_empty() {
                 sql.push(' ');
@@ -1186,7 +1233,7 @@ fn func_call(call: &ast::FuncCall) -> Option<String> {
         let order = call
             .agg_order
             .iter()
-            .map(sort_by)
+            .map(|n| sort_by(n.as_ref()))
             .collect::<Option<Vec<_>>>()?;
         if order.is_empty() {
             return None;
@@ -1194,7 +1241,7 @@ fn func_call(call: &ast::FuncCall) -> Option<String> {
         sql.push_str(&format!(" WITHIN GROUP (ORDER BY {})", order.join(", ")));
     }
     if let filter @ Some(_) = &call.agg_filter {
-        sql.push_str(&format!(" FILTER (WHERE {})", expr(filter)?));
+        sql.push_str(&format!(" FILTER (WHERE {})", expr(filter.as_ref())?));
     }
     if let Some(over) = call.over.as_deref() {
         sql.push_str(" OVER ");
@@ -1224,23 +1271,31 @@ fn sql_syntax_func_call(call: &ast::FuncCall) -> Option<String> {
         Some(format!(
             "extract({} FROM {})",
             quote_literal(&field),
-            expr(arg)?
+            expr(arg.as_ref())?
         ))
     } else if names.as_slice() == ["pg_catalog", "substring"] {
         // `substring(a FROM b [FOR c])`: a missing FOR is a `None` node.
-        let present = |node: &Option<ast::Node>| node.is_some();
+        let present = |node: Option<&ast::Node>| node.is_some();
         match call.args.as_slice() {
-            [a, b] if present(a) && present(b) => {
-                Some(format!("substring({} FROM {})", expr(a)?, expr(b)?))
-            }
-            [a, b, c] if present(a) && present(b) && present(c) => Some(format!(
-                "substring({} FROM {} FOR {})",
-                expr(a)?,
-                expr(b)?,
-                expr(c)?
+            [a, b] if present(a.as_ref()) && present(b.as_ref()) => Some(format!(
+                "substring({} FROM {})",
+                expr(a.as_ref())?,
+                expr(b.as_ref())?
             )),
-            [a, b, c] if present(a) && !present(b) && present(c) => {
-                Some(format!("substring({} FOR {})", expr(a)?, expr(c)?))
+            [a, b, c] if present(a.as_ref()) && present(b.as_ref()) && present(c.as_ref()) => {
+                Some(format!(
+                    "substring({} FROM {} FOR {})",
+                    expr(a.as_ref())?,
+                    expr(b.as_ref())?,
+                    expr(c.as_ref())?
+                ))
+            }
+            [a, b, c] if present(a.as_ref()) && !present(b.as_ref()) && present(c.as_ref()) => {
+                Some(format!(
+                    "substring({} FOR {})",
+                    expr(a.as_ref())?,
+                    expr(c.as_ref())?
+                ))
             }
             _ => None,
         }
@@ -1256,7 +1311,11 @@ fn sql_syntax_func_call(call: &ast::FuncCall) -> Option<String> {
             "rtrim" => Some("TRAILING"),
             _ => None,
         };
-        let args = call.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
+        let args = call
+            .args
+            .iter()
+            .map(|n| expr(n.as_ref()))
+            .collect::<Option<Vec<_>>>()?;
         match (direction, args.as_slice()) {
             (Some(direction), [source]) => Some(format!("trim({direction} FROM {source})")),
             (Some(direction), [source, chars]) => {
@@ -1302,13 +1361,13 @@ fn operator_name(name: &[Option<ast::Node>]) -> Option<String> {
 }
 
 fn sub_link(link: &ast::SubLink) -> Option<String> {
-    let inner = statement(&link.subselect)?;
+    let inner = statement(link.subselect.as_ref())?;
     match link.sub_link_type {
         SubLinkType::ExistsSublink => Some(format!("EXISTS ({inner})")),
         SubLinkType::ExprSublink => Some(format!("({inner})")),
         SubLinkType::ArraySublink => Some(format!("ARRAY({inner})")),
         SubLinkType::AnySublink | SubLinkType::AllSublink => {
-            let testexpr = expr(&link.testexpr)?;
+            let testexpr = expr(link.testexpr.as_ref())?;
             // `IN`/`NOT IN (subquery)`: the grammar leaves `oper_name` empty
             // for those; an explicit `= ANY (…)` / `<> ALL (…)` carries it.
             if link.oper_name.is_empty() {
@@ -1332,7 +1391,7 @@ fn sub_link(link: &ast::SubLink) -> Option<String> {
 }
 
 fn indirection_sql(indirection: &ast::AIndirection) -> Option<String> {
-    let mut sql = expr(&indirection.arg)?;
+    let mut sql = expr(indirection.arg.as_ref())?;
     if indirection.indirection.is_empty() {
         return None;
     }
@@ -1341,11 +1400,11 @@ fn indirection_sql(indirection: &ast::AIndirection) -> Option<String> {
             Node::AIndices(indices) => {
                 if indices.is_slice {
                     let low = match &indices.lidx {
-                        node @ Some(_) => Some(expr(node)?),
+                        node @ Some(_) => Some(expr(node.as_ref())?),
                         None => None,
                     };
                     let high = match &indices.uidx {
-                        node @ Some(_) => Some(expr(node)?),
+                        node @ Some(_) => Some(expr(node.as_ref())?),
                         None => None,
                     };
                     sql.push_str(&format!(
@@ -1361,7 +1420,7 @@ fn indirection_sql(indirection: &ast::AIndirection) -> Option<String> {
                     } else {
                         &indices.lidx
                     };
-                    sql.push_str(&format!("[{}]", expr(index)?));
+                    sql.push_str(&format!("[{}]", expr(index.as_ref())?));
                 }
             }
             Node::String(field) => {
@@ -1375,7 +1434,11 @@ fn indirection_sql(indirection: &ast::AIndirection) -> Option<String> {
 }
 
 fn row_expr(row: &ast::RowExpr) -> Option<String> {
-    let args = row.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
+    let args = row
+        .args
+        .iter()
+        .map(|n| expr(n.as_ref()))
+        .collect::<Option<Vec<_>>>()?;
     if args.is_empty() {
         return None;
     }
@@ -1455,7 +1518,7 @@ fn type_name(type_name: &ast::TypeName) -> Option<String> {
         let mods = type_name
             .typmods
             .iter()
-            .map(expr)
+            .map(|n| expr(n.as_ref()))
             .collect::<Option<Vec<_>>>()?;
         sql.push_str(&format!("({})", mods.join(", ")));
     }
@@ -1472,7 +1535,7 @@ fn case_expr(case: &ast::CaseExpr) -> Option<String> {
     let mut sql = String::from("CASE");
     if let arg @ Some(_) = &case.arg {
         sql.push(' ');
-        sql.push_str(&expr(arg)?);
+        sql.push_str(&expr(arg.as_ref())?);
     }
     for when in &case.args {
         let Node::CaseWhen(when) = when.as_ref()? else {
@@ -1480,12 +1543,12 @@ fn case_expr(case: &ast::CaseExpr) -> Option<String> {
         };
         sql.push_str(&format!(
             " WHEN {} THEN {}",
-            expr(&when.expr)?,
-            expr(&when.result)?
+            expr(when.expr.as_ref())?,
+            expr(when.result.as_ref())?
         ));
     }
     if let defresult @ Some(_) = &case.defresult {
-        sql.push_str(&format!(" ELSE {}", expr(defresult)?));
+        sql.push_str(&format!(" ELSE {}", expr(defresult.as_ref())?));
     }
     sql.push_str(" END");
     Some(sql)
@@ -1500,12 +1563,12 @@ fn case_expr(case: &ast::CaseExpr) -> Option<String> {
 fn strings(nodes: &[Option<ast::Node>]) -> Option<Vec<String>> {
     nodes
         .iter()
-        .map(|node| string_of(node).map(str::to_owned))
+        .map(|node| string_of(node.as_ref()).map(str::to_owned))
         .collect()
 }
 
-fn string_of(node: &Option<ast::Node>) -> Option<&str> {
-    match node.as_ref()? {
+fn string_of(node: Option<&ast::Node>) -> Option<&str> {
+    match node? {
         Node::String(s) => Some(&s.sval),
         _ => None,
     }

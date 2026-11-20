@@ -69,7 +69,7 @@ fn check_when_clause(
     interp: &PgCatalog,
     relid: PgClassOid,
     stmt: &CreateTrigStmt,
-    when: &Option<typedpg_pg_query::ast::Node>,
+    when: Option<&typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
@@ -128,7 +128,7 @@ fn check_when_clause(
 
     let before = stmt.timing & TRIGGER_TYPE_BEFORE != 0;
     let has_generated = attrs.iter().any(|a| a.attgenerated.is_some());
-    let Some(inner) = when.as_ref() else {
+    let Some(inner) = when else {
         return Ok(());
     };
     // `(new).col` is the column `col` of NEW (transformIndirection).
@@ -141,7 +141,11 @@ fn check_when_clause(
         let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
             continue;
         };
-        let fields: Vec<Option<&str>> = cr.fields.iter().map(super::util::node_string).collect();
+        let fields: Vec<Option<&str>> = cr
+            .fields
+            .iter()
+            .map(|n| super::util::node_string(n.as_ref()))
+            .collect();
         let selected = selections
             .iter()
             .find(|(r, _)| std::ptr::eq(*r, cr))
@@ -233,7 +237,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
     check_firing(stmt)?;
     check_transition_tables(interp, relid, &class, stmt)?;
     if stmt.when_clause.is_some() {
-        check_when_clause(interp, relid, stmt, &stmt.when_clause)?;
+        check_when_clause(interp, relid, stmt, stmt.when_clause.as_ref())?;
     }
 
     // The function takes no declared arguments (the trigger's arguments go
@@ -241,7 +245,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
     let parts: Vec<&str> = stmt
         .funcname
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .collect();
     let (schema, name) = match parts.as_slice() {
         [name] => (None, *name),
@@ -271,7 +275,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
     let columns: Vec<String> = stmt
         .columns
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .map(str::to_owned)
         .collect();
     let trigger = Trigger {
@@ -660,16 +664,16 @@ pub(crate) fn remove_with_clones(interp: &mut PgCatalog, relid: PgClassOid, name
 /// `DROP TRIGGER [IF EXISTS] name ON table`.
 pub(crate) fn drop_trigger(
     interp: &mut PgCatalog,
-    obj_node: &Option<typedpg_pg_query::ast::Node>,
+    obj_node: Option<&typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node else {
         return Ok(());
     };
     let parts: Vec<String> = list
         .items
         .iter()
-        .filter_map(super::util::node_string)
+        .filter_map(|n| super::util::node_string(n.as_ref()))
         .map(str::to_owned)
         .collect();
     let Some((trigname, rel)) = parts.split_last() else {
