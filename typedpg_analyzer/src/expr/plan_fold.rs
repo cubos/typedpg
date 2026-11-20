@@ -31,6 +31,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use typedpg_pg_query::ast;
 
@@ -1109,8 +1110,9 @@ thread_local! {
     static LEVELS: RefCell<Vec<LevelQuals>> = const { RefCell::new(Vec::new()) };
     /// Each level's quals over columns that may prove a relation empty
     /// (see [`may_be_empty`]): the planner may push them down into a
-    /// subquery it plans on its own (`set_subquery_pathlist`).
-    static PUSHABLE: RefCell<Vec<Vec<Option<ast::Node>>>> = const { RefCell::new(Vec::new()) };
+    /// subquery it plans on its own (`set_subquery_pathlist`). Shared, so
+    /// a level below borrows them without cloning the trees.
+    static PUSHABLE: RefCell<Vec<Rc<[Option<ast::Node>]>>> = const { RefCell::new(Vec::new()) };
     static NEXT_LEVEL: Cell<NextLevel> = const { Cell::new(NextLevel::Own) };
     /// The alias of the FROM item the next level analyzed is, in the
     /// level around it (see [`with_next_item`]).
@@ -1236,7 +1238,7 @@ impl PlanLevel {
         } else {
             LevelQuals::default()
         };
-        PUSHABLE.with(|p| p.borrow_mut().push(Vec::new()));
+        PUSHABLE.with(|p| p.borrow_mut().push(Rc::new([])));
         LEVELS.with(|l| l.borrow_mut().push(quals));
         PlanLevel
     }
@@ -1337,6 +1339,14 @@ impl PlanLevel {
             }
             let mut dummy_quals = conjuncts.clone();
             dummy_quals.extend(having_quals.iter().copied());
+            // The quals the level around pushes down into this one, which
+            // it plans on its own.
+            let pushed = match next {
+                NextLevel::Separate { pushed_down: true } => {
+                    PUSHABLE.with(|p| p.borrow().last().cloned())
+                }
+                _ => None,
+            };
             let mut group = Group {
                 target: match level {
                     Level::Dml { target } => target,
@@ -1365,11 +1375,9 @@ impl PlanLevel {
                 snapshot,
             }
             .held_relations();
-            group.quals.extend(
-                having_quals
-                    .into_iter()
-                    .map(|q| (q.cloned(), Owner::Level, true)),
-            );
+            group
+                .quals
+                .extend(having_quals.into_iter().map(|q| (q, Owner::Level, true)));
             // A level inside one any relation of which may be proven
             // empty may be, to be sure — a FROM subquery pulled up, only
             // when its relations may be.
@@ -1389,16 +1397,13 @@ impl PlanLevel {
                 NextLevel::PulledUpNullable | NextLevel::Own | NextLevel::Subplan => {
                     (group.rels, parent_empty)
                 }
-                NextLevel::Separate { pushed_down } => {
-                    if pushed_down {
-                        let pushed = PUSHABLE.with(|p| p.borrow().last().cloned());
-                        group.quals.extend(
-                            pushed
-                                .into_iter()
-                                .flatten()
-                                .map(|q| (q, Owner::Level, true)),
-                        );
-                    }
+                NextLevel::Separate { .. } => {
+                    group.quals.extend(
+                        pushed
+                            .iter()
+                            .flat_map(|p| p.iter())
+                            .map(|q| (q.as_ref(), Owner::Level, true)),
+                    );
                     (group.rels, false)
                 }
             };
@@ -1431,7 +1436,7 @@ impl PlanLevel {
                 ctes: cte_names,
             }
         } else {
-            PUSHABLE.with(|p| p.borrow_mut().push(Vec::new()));
+            PUSHABLE.with(|p| p.borrow_mut().push(Rc::new([])));
             LevelQuals::default()
         };
         LEVELS.with(|l| l.borrow_mut().push(quals));
@@ -1452,12 +1457,12 @@ impl Drop for PlanLevel {
 /// below: a relation the analyzer can't be sure stays one (a function the
 /// planner may inline, a CTE it may inline) counts for none.
 #[derive(Default)]
-struct Group {
+struct Group<'a> {
     /// The quals the planner distributes over the level's join tree, each
     /// with where it comes from (see [`Owner`]) and whether it is one of
     /// the top join domain's (WHERE, an inner join's ON, never below the
     /// nullable side of an outer join nor in a semi-join's condition).
-    quals: Vec<(Option<ast::Node>, Owner, bool)>,
+    quals: Vec<(Option<&'a ast::Node>, Owner, bool)>,
     /// The aliases of the level's own FROM items (tables, subqueries,
     /// functions — not joins), which a column proves empty.
     aliases: Vec<String>,
@@ -1482,7 +1487,7 @@ struct Group {
     /// The top-level AND arguments of the ON clauses of the level's own
     /// inner joins never null-extended, whose sublinks `pull_up_sublinks`
     /// may turn into semi-joins (see [`Self::walk`]).
-    on_quals: Vec<Option<ast::Node>>,
+    on_quals: Vec<Option<&'a ast::Node>>,
     /// The aliases of the level's own FROM items on the nullable side of
     /// an outer join.
     nullable: Vec<String>,
@@ -1491,25 +1496,25 @@ struct Group {
     own_level: bool,
 }
 
-impl Group {
+impl<'a> Group<'a> {
     /// The quals `where_clause` and FROM items `from` of a query level (or
     /// of a subquery pulled up into it), in the top join domain when
     /// `top`.
     fn walk(
         &mut self,
-        where_clause: Option<&ast::Node>,
-        from: &[Option<ast::Node>],
-        ctes: &[Cte<'_>],
-        snapshot: &PgCatalog,
+        where_clause: Option<&'a ast::Node>,
+        from: &'a [Option<ast::Node>],
+        ctes: &[Cte<'a>],
+        snapshot: &'a PgCatalog,
         owner: &Owner,
         top: bool,
     ) {
+        let mut quals = Vec::new();
         if let Some(w) = where_clause {
-            let mut quals = Vec::new();
             flatten_and(Some(w), &mut quals);
-            self.quals
-                .extend(quals.into_iter().map(|q| (q.cloned(), owner.clone(), top)));
         }
+        self.quals
+            .extend(quals.iter().map(|&q| (q, owner.clone(), top)));
         let on_quals = self.on_quals.len();
         for f in from {
             self.item(f.as_ref(), true, ctes, snapshot, owner, top);
@@ -1520,11 +1525,7 @@ impl Group {
         // The IN sublinks `pull_up_sublinks` turns into semi-joins: their
         // subqueries join the level (any qual in them may prove empty
         // what can't be told).
-        let mut quals = Vec::new();
-        if let Some(w) = where_clause {
-            flatten_and(Some(w), &mut quals);
-        }
-        let mut joined: Vec<Option<ast::Node>> = quals.into_iter().map(|q| q.cloned()).collect();
+        let mut joined = quals;
         // Those of a kept inner join's ON clause too, above that join —
         // whose own quals don't reach their relations: they are not
         // counted for the level.
@@ -1532,7 +1533,7 @@ impl Group {
         joined.extend(self.on_quals.drain(on_quals..));
         let owner = Owner::SemiJoin;
         for (i, q) in joined.iter().enumerate() {
-            let Some(sub) = conjunct_sublink(q.as_ref()) else {
+            let Some(sub) = conjunct_sublink(*q) else {
                 continue;
             };
             let Some(ast::Node::SelectStmt(sel)) = sub.subselect.as_ref() else {
@@ -1585,10 +1586,10 @@ impl Group {
     /// quals are `owner`'s, in the top join domain when `top`.
     fn subquery(
         &mut self,
-        sel: &ast::SelectStmt,
+        sel: &'a ast::SelectStmt,
         kept: bool,
-        ctes: &[Cte<'_>],
-        snapshot: &PgCatalog,
+        ctes: &[Cte<'a>],
+        snapshot: &'a PgCatalog,
         owner: &Owner,
         top: bool,
     ) {
@@ -1624,10 +1625,10 @@ impl Group {
     /// [`Owner::Level`]); kept, it is in the top join domain when `top`.
     fn item(
         &mut self,
-        n: Option<&ast::Node>,
+        n: Option<&'a ast::Node>,
         kept: bool,
-        ctes: &[Cte<'_>],
-        snapshot: &PgCatalog,
+        ctes: &[Cte<'a>],
+        snapshot: &'a PgCatalog,
         owner: &Owner,
         top: bool,
     ) {
@@ -1717,15 +1718,17 @@ impl Group {
                     }
                     RelKind::View if !kept => {}
                     RelKind::View if self.views.contains(&class.oid) => self.unknown_quals = true,
-                    RelKind::View => match crate::ddl::views::view_query(snapshot, class.oid) {
-                        // A view's query sees no CTE of the statement.
-                        Some(ast::Node::SelectStmt(sel)) => {
-                            self.views.push(class.oid);
-                            self.subquery(&sel, kept, &[], snapshot, owner, top);
-                            self.views.pop();
+                    RelKind::View => {
+                        match crate::ddl::views::stored_view_query(snapshot, class.oid) {
+                            // A view's query sees no CTE of the statement.
+                            Some(ast::Node::SelectStmt(sel)) => {
+                                self.views.push(class.oid);
+                                self.subquery(sel, kept, &[], snapshot, owner, top);
+                                self.views.pop();
+                            }
+                            _ => self.unknown_quals = true,
                         }
-                        _ => self.unknown_quals = true,
-                    },
+                    }
                     _ => self.unknown_quals |= kept,
                 }
             }
@@ -1759,13 +1762,10 @@ impl Group {
                     // domain's.
                     let in_top = top && kept && inner;
                     if inner && kept && level_own {
-                        self.on_quals.extend(quals.iter().map(|q| q.cloned()));
+                        self.on_quals.extend(quals.iter().copied());
                     }
-                    self.quals.extend(
-                        quals
-                            .into_iter()
-                            .map(|q| (q.cloned(), owner.clone(), in_top)),
-                    );
+                    self.quals
+                        .extend(quals.into_iter().map(|q| (q, owner.clone(), in_top)));
                 }
             }
             // A function the planner may inline as a subquery it pulls up.
@@ -1797,14 +1797,14 @@ impl Group {
         let constant = self.unknown_quals
             || (self.substitutes && self.quals.iter().any(|(_, o, top)| level_wide(o, *top)))
             || self.quals.iter().any(|(q, o, top)| {
-                let folded = fold_qual(q.as_ref(), snapshot);
+                let folded = fold_qual(*q, snapshot);
                 level_wide(o, *top) && folded.may_be_const() && folded != Folded::Bool(true)
             });
         let column_quals: Vec<(Option<&ast::Node>, &Owner, bool)> = self
             .quals
             .iter()
-            .filter(|(q, _, _)| !fold_qual(q.as_ref(), snapshot).may_be_const())
-            .map(|(q, o, top)| (q.as_ref(), o, *top))
+            .filter(|(q, _, _)| !fold_qual(*q, snapshot).may_be_const())
+            .map(|(q, o, top)| (*q, o, *top))
             .collect();
         let mut proven = Proven::default();
         let mut equalities = Vec::new();
@@ -1868,8 +1868,8 @@ impl Group {
                         Some(ast::Node::ColumnRef(_))))
         };
         !self.quals.iter().any(|(q, _, top)| {
-            *top && !tested(q.as_ref())
-                && q.as_ref().is_some_and(|q| {
+            *top && !tested(*q)
+                && q.is_some_and(|q| {
                     q.nodes().any(|(n, _)| match n {
                         typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                             let names = extract_names(&cr.fields);

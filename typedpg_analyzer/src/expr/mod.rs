@@ -1587,10 +1587,7 @@ fn infer_expr_unlocated(
             let row: &ast::RowExpr = match expand_row_args(&row.args, ctx, params)? {
                 std::borrow::Cow::Borrowed(_) => row,
                 std::borrow::Cow::Owned(args) => {
-                    expanded = ast::RowExpr {
-                        args,
-                        ..(**row).clone()
-                    };
+                    expanded = row_with_args(row, args);
                     &expanded
                 }
             };
@@ -2610,6 +2607,17 @@ fn text_constant(n: Option<&ast::Node>, ctx: Ctx<'_>) -> Option<String> {
             }
         }
         _ => None,
+    }
+}
+
+/// `row` with arguments `args` (its own, expanded by [`expand_row_args`]).
+pub(crate) fn row_with_args(row: &ast::RowExpr, args: Vec<Option<ast::Node>>) -> ast::RowExpr {
+    ast::RowExpr {
+        args,
+        row_typeid: row.row_typeid,
+        row_format: row.row_format,
+        colnames: row.colnames.clone(),
+        location: row.location,
     }
 }
 

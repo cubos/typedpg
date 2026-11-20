@@ -88,11 +88,10 @@ fn analyze_insert_here(
         // NULL or `$N` alone becomes text), DEFAULT not allowed. Only a
         // plain VALUES list is the INSERT's own rows.
         if !val_sel.values_lists.is_empty() && !is_general_select(val_sel) {
-            let expanded = expand_values_rows(val_sel, snapshot, params, &cte_scopes)?;
-            let val_sel: &ast::SelectStmt = &expanded;
-            written = analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
-            let rows: Vec<&[Option<ast::Node>]> = val_sel
-                .values_lists
+            let values_lists = expand_values_rows(val_sel, snapshot, params, &cte_scopes)?;
+            written =
+                analyze_insert_values(ins, &values_lists, &tgt, snapshot, params, &cte_scopes)?;
+            let rows: Vec<&[Option<ast::Node>]> = values_lists
                 .iter()
                 .filter_map(|l| match l.as_ref() {
                     Some(ast::Node::List(list)) => Some(list.items.as_slice()),
@@ -817,7 +816,7 @@ fn arity_mismatch(tgt: &InsertTarget, given: usize, expected: usize) -> bool {
 /// `INSERT … VALUES (…)`: infer each value with the column's type as goal,
 /// enforcing arity, NOT NULL / typmod literal checks, and the
 /// generated/identity-column restrictions.
-/// `INSERT … VALUES` with each row as transformInsertStmt transforms it
+/// The rows of `INSERT … VALUES` as transformInsertStmt transforms them
 /// (transformExpressionList, single row or several): `rel.*` and
 /// `(expr).*` expanded into one value per column — a rule action's
 /// `new.*`, a SQL function parameter's `v.*` — before rows are counted
@@ -827,7 +826,7 @@ fn expand_values_rows<'a>(
     snapshot: &PgCatalog,
     params: &ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<std::borrow::Cow<'a, ast::SelectStmt>, AnalyzeError> {
+) -> Result<std::borrow::Cow<'a, [Option<ast::Node>]>, AnalyzeError> {
     let scope = Scope {
         ctes: cte_scopes.clone(),
         ..Scope::default()
@@ -848,9 +847,9 @@ fn expand_values_rows<'a>(
         })
         .collect::<Result<_, AnalyzeError>>()?;
     if rows.iter().all(Option::is_none) {
-        return Ok(std::borrow::Cow::Borrowed(val_sel));
+        return Ok(std::borrow::Cow::Borrowed(&val_sel.values_lists));
     }
-    let values_lists = val_sel
+    Ok(val_sel
         .values_lists
         .iter()
         .zip(rows)
@@ -858,16 +857,12 @@ fn expand_values_rows<'a>(
             Some(items) => Some(ast::Node::List(NodeBox::new(ast::List { items }))),
             None => row.clone(),
         })
-        .collect();
-    Ok(std::borrow::Cow::Owned(ast::SelectStmt {
-        values_lists,
-        ..val_sel.clone()
-    }))
+        .collect())
 }
 
 fn analyze_insert_values(
     ins: &ast::InsertStmt,
-    val_sel: &ast::SelectStmt,
+    values_lists: &[Option<ast::Node>],
     tgt: &InsertTarget,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -890,7 +885,7 @@ fn analyze_insert_values(
     let mut first_len: Option<usize> = None;
     // What each row writes at each position (`None`: DEFAULT).
     let mut written: Vec<Vec<Option<ValueInfo>>> = Vec::new();
-    for val_list in &val_sel.values_lists {
+    for val_list in values_lists {
         let Some(ast::Node::List(list)) = val_list.as_ref() else {
             continue;
         };
@@ -974,7 +969,7 @@ fn analyze_insert_values(
             // A multi-row VALUES list is a VALUES RTE, where PG forbids
             // set-returning functions; a single row is the INSERT's own
             // target list.
-            if val_sel.values_lists.len() > 1 {
+            if values_lists.len() > 1 {
                 check_no_srf_in_clause(val.as_ref(), snapshot, "VALUES")?;
             }
             // EXPR_KIND_VALUES / EXPR_KIND_VALUES_SINGLE.
@@ -1008,13 +1003,12 @@ fn analyze_insert_values(
             }
         }
         if violation.is_none() {
+            let items: Vec<Option<&ast::Node>> = list.items.iter().map(Option::as_ref).collect();
             let known = |i: usize| match target_col_at(tgt, i) {
-                Some(tc) if is_null_value(list.items[i].as_ref(), tc, None, snapshot) => {
-                    Known::Null
-                }
-                _ => Known::Value(list.items[i].as_ref()),
+                Some(tc) if is_null_value(items[i], tc, None, snapshot) => Known::Null,
+                _ => Known::Value(items[i]),
             };
-            violation = row_violation(tgt, &list.items, &known, snapshot);
+            violation = row_violation(tgt, &items, &known, snapshot);
         }
         written.push(row_written);
     }
@@ -1064,6 +1058,9 @@ impl RowViolation {
     }
 }
 
+/// An INSERT row's values, by position (see [`row_violation`]).
+type RowItems<'a> = Vec<Option<&'a ast::Node>>;
+
 /// What the row checks know of the value an INSERT row gives a column.
 #[derive(Clone, Copy)]
 enum Known<'a> {
@@ -1085,7 +1082,7 @@ enum Known<'a> {
 /// DO INSTEAD rule replaces the INSERT.
 fn row_violation<'a>(
     tgt: &InsertTarget,
-    items: &'a [Option<ast::Node>],
+    items: &[Option<&'a ast::Node>],
     known: &dyn Fn(usize) -> Known<'a>,
     snapshot: &PgCatalog,
 ) -> Option<RowViolation> {
@@ -1115,7 +1112,7 @@ fn row_violation<'a>(
         if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) {
             continue;
         }
-        if is_set_to_default(val.as_ref()) {
+        if is_set_to_default(*val) {
             // An explicit DEFAULT that is NULL competes like an omitted
             // column.
             violations.extend(null_default_violation(tc, snapshot, &lands_in));
@@ -1133,7 +1130,7 @@ fn row_violation<'a>(
             // `NULL::d`, for a domain `d` rejecting NULL, fails as the row
             // is built, whatever the column.
             Known::Value(_) | Known::Unknown => {
-                if let Some(msg) = null_domain_cast(val.as_ref(), snapshot) {
+                if let Some(msg) = null_domain_cast(*val, snapshot) {
                     let attnum = snapshot
                         .attribute_by_name(lands_in.0, &tc.attname)
                         .map_or(tc.attnum, |a| a.attnum);
@@ -1166,11 +1163,11 @@ fn row_violation<'a>(
 /// whose value is no longer the one `items` gives there (a view default).
 /// None when `tgt` isn't such a view — or a column the row writes is not
 /// updatable, which the rewriter reports first.
-fn through_view(
+fn through_view<'a>(
     tgt: &InsertTarget,
-    items: &[Option<ast::Node>],
+    items: &[Option<&'a ast::Node>],
     snapshot: &PgCatalog,
-) -> Option<(InsertTarget, Vec<Option<ast::Node>>, Vec<usize>)> {
+) -> Option<(InsertTarget, RowItems<'a>, Vec<usize>)> {
     let class = snapshot.pg_class.get(&tgt.oid)?;
     if class.relkind != crate::pg_catalog::RelKind::View {
         return None;
@@ -1207,11 +1204,11 @@ fn through_view(
         given.push(tc.attname.as_str());
         col_names.push(base_col(tc)?);
         col_indirection.push(tgt.col_indirection.get(i).cloned().unwrap_or_default());
-        if is_set_to_default(item.as_ref()) && tc.atthasdef {
+        if is_set_to_default(*item) && tc.atthasdef {
             opaque.push(i);
             base_items.push(None);
         } else {
-            base_items.push(item.clone());
+            base_items.push(*item);
         }
     }
     // The view's defaults for the columns the row omits.
@@ -1296,7 +1293,7 @@ fn null_domain_cast_error(val: Option<&ast::Node>, snapshot: &PgCatalog) -> Opti
 /// a DO INSTEAD rule replaces the INSERT.
 fn row_relation<'a>(
     tgt: &InsertTarget,
-    items: &'a [Option<ast::Node>],
+    items: &[Option<&'a ast::Node>],
     known: &dyn Fn(usize) -> Known<'a>,
     snapshot: &PgCatalog,
 ) -> ((crate::oid::PgClassOid, String), Option<RowViolation>) {
@@ -1310,7 +1307,7 @@ fn row_relation<'a>(
             Some(i) if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) || tgt.discards(c) => {
                 None
             }
-            Some(i) if !is_set_to_default(items[i].as_ref()) => match known(i) {
+            Some(i) if !is_set_to_default(items[i]) => match known(i) {
                 Known::Null => Some(None),
                 Known::Value(v) => v.map(Some),
                 Known::Unknown => None,
@@ -1496,7 +1493,7 @@ fn null_coercion(
 /// columns only (a view's defaults are its base table's).
 fn omitted_domain_nulls(
     tgt: &InsertTarget,
-    items: &[Option<ast::Node>],
+    items: &[Option<&ast::Node>],
     snapshot: &PgCatalog,
 ) -> Vec<RowViolation> {
     let is_table = snapshot.pg_class.get(&tgt.oid).is_some_and(|c| {
@@ -1511,7 +1508,7 @@ fn omitted_domain_nulls(
     let given: Vec<&str> = items
         .iter()
         .enumerate()
-        .filter(|(_, v)| !is_set_to_default(v.as_ref()))
+        .filter(|&(_, &v)| !is_set_to_default(v))
         .filter_map(|(i, _)| target_col_at(tgt, i).map(|c| c.attname.as_str()))
         .collect();
     tgt.attrs
@@ -1885,11 +1882,11 @@ fn general_values_violation(
             _ => Err(()),
         }
     }
-    let rows: Vec<&[Option<ast::Node>]> = val_sel
+    let rows: Vec<Vec<Option<&ast::Node>>> = val_sel
         .values_lists
         .iter()
         .filter_map(|l| match l.as_ref() {
-            Some(ast::Node::List(list)) => Some(list.items.as_slice()),
+            Some(ast::Node::List(list)) => Some(list.items.iter().map(Option::as_ref).collect()),
             _ => None,
         })
         .collect();
@@ -1902,10 +1899,10 @@ fn general_values_violation(
         .map(|items| {
             let known = |i: usize| match (target_col_at(tgt, i), column_types.get(i)) {
                 (Some(tc), Some(&t)) if t == snapshot.unwrap_domain(tc.atttypid) => {
-                    if is_null_value(items[i].as_ref(), tc, Some(t), snapshot) {
+                    if is_null_value(items[i], tc, Some(t), snapshot) {
                         Known::Null
                     } else {
-                        Known::Value(items[i].as_ref())
+                        Known::Value(items[i])
                     }
                 }
                 _ => Known::Unknown,

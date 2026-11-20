@@ -2380,8 +2380,9 @@ fn substitute(
                 .map(|e| {
                     wrap(ast::Node::NullTest(NodeBox::new(ast::NullTest {
                         arg: e.clone(),
+                        nulltesttype: nt.nulltesttype,
                         argisrow: false,
-                        ..(**nt).clone()
+                        location: nt.location,
                     })))
                 })
                 .collect();
@@ -2396,36 +2397,55 @@ fn substitute(
         }
         ast::Node::NullTest(nt) => wrap(ast::Node::NullTest(NodeBox::new(ast::NullTest {
             arg: boxed(nt.arg.as_ref())?,
-            ..(**nt).clone()
+            nulltesttype: nt.nulltesttype,
+            argisrow: nt.argisrow,
+            location: nt.location,
         }))),
         ast::Node::AExpr(e) => wrap(ast::Node::AExpr(NodeBox::new(ast::AExpr {
+            kind: e.kind,
+            name: e.name.clone(),
             lexpr: boxed(e.lexpr.as_ref())?,
             rexpr: boxed(e.rexpr.as_ref())?,
-            ..(**e).clone()
+            rexpr_list_start: e.rexpr_list_start,
+            rexpr_list_end: e.rexpr_list_end,
+            location: e.location,
         }))),
         ast::Node::List(l) => wrap(ast::Node::List(NodeBox::new(ast::List {
             items: subs(&l.items)?,
         }))),
         ast::Node::BoolExpr(b) => wrap(ast::Node::BoolExpr(NodeBox::new(ast::BoolExpr {
+            boolop: b.boolop,
             args: subs(&b.args)?,
-            ..(**b).clone()
+            location: b.location,
         }))),
         ast::Node::TypeCast(tc) => wrap(ast::Node::TypeCast(NodeBox::new(ast::TypeCast {
             arg: boxed(tc.arg.as_ref())?,
-            ..(**tc).clone()
+            type_name: tc.type_name.clone(),
+            location: tc.location,
         }))),
         ast::Node::CoalesceExpr(c) => {
             wrap(ast::Node::CoalesceExpr(NodeBox::new(ast::CoalesceExpr {
+                coalescetype: c.coalescetype,
+                coalescecollid: c.coalescecollid,
                 args: subs(&c.args)?,
-                ..(**c).clone()
+                location: c.location,
             })))
         }
         ast::Node::FuncCall(fc)
             if fc.agg_order.is_empty() && fc.agg_filter.is_none() && fc.over.is_none() =>
         {
             wrap(ast::Node::FuncCall(NodeBox::new(ast::FuncCall {
+                funcname: fc.funcname.clone(),
                 args: subs(&fc.args)?,
-                ..(**fc).clone()
+                agg_order: Vec::new(),
+                agg_filter: None,
+                over: None,
+                agg_within_group: fc.agg_within_group,
+                agg_star: fc.agg_star,
+                agg_distinct: fc.agg_distinct,
+                func_variadic: fc.func_variadic,
+                funcformat: fc.funcformat,
+                location: fc.location,
             })))
         }
         _ => {

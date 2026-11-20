@@ -53,8 +53,8 @@ pub(super) fn sure_row_violation(
         None => Vec::new(),
     };
     let outputs = sure_row(sel, snapshot, &ctes, 0)?;
-    let items: Vec<Option<ast::Node>> = (0..column_types.len())
-        .map(|i| outputs.get(i).copied().flatten().cloned())
+    let items: Vec<Option<&ast::Node>> = (0..column_types.len())
+        .map(|i| outputs.get(i).copied().flatten())
         .collect();
     let known_at = |i: usize| outputs.get(i).copied().flatten().is_some();
     let stored = |i: usize| {
@@ -72,7 +72,7 @@ pub(super) fn sure_row_violation(
                 snapshot,
                 tc.atttypid,
                 snapshot.effective_typmod(tc.atttypid, tc.atttypmod),
-                v.as_ref(),
+                *v,
             )?;
             Some(RowViolation {
                 order: (false, tc.attnum),
@@ -85,10 +85,10 @@ pub(super) fn sure_row_violation(
     let known = |i: usize| match (known_at(i), target_col_at(tgt, i), column_types.get(i)) {
         (true, Some(tc), Some(&t)) => {
             let source = (t != oid::UNKNOWN).then_some(t);
-            if is_null_value(items[i].as_ref(), tc, source, snapshot) {
+            if is_null_value(items[i], tc, source, snapshot) {
                 Known::Null
             } else if t == snapshot.unwrap_domain(tc.atttypid) {
-                Known::Value(items[i].as_ref())
+                Known::Value(items[i])
             } else {
                 Known::Unknown
             }
