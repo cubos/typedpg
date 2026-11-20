@@ -1055,10 +1055,10 @@ fn find_select(
 /// same `FROM` clause for a `LATERAL` item, and only the levels around the
 /// clause (`level_parent`) for anything else.
 #[allow(clippy::too_many_arguments)] // one per level's walker state
-fn find_select_from(
+fn find_select_from<'n>(
     ctx: &Ctx<'_>,
-    from: &[Option<ast::Node>],
-    left: &[Option<ast::Node>],
+    from: &'n [Option<ast::Node>],
+    left: &[Option<&'n ast::Node>],
     level_parent: Option<&FromScope<'_>>,
     env: &CteEnv,
     target: &SelectStmt,
@@ -1077,7 +1077,7 @@ fn find_select_from(
             check,
             out,
         );
-        left.push(item.clone());
+        left.push(item.as_ref());
     }
 }
 
@@ -1085,10 +1085,10 @@ fn find_select_from(
 /// with its own ON scope, a subquery or function a level nested in the
 /// entries to its left.
 #[allow(clippy::too_many_arguments)] // one per level's walker state
-fn find_select_from_item(
+fn find_select_from_item<'n>(
     ctx: &Ctx<'_>,
-    item: Option<&ast::Node>,
-    left: &[Option<ast::Node>],
+    item: Option<&'n ast::Node>,
+    left: &[Option<&'n ast::Node>],
     level_parent: Option<&FromScope<'_>>,
     env: &CteEnv,
     target: &SelectStmt,
@@ -1113,7 +1113,7 @@ fn find_select_from_item(
                     check,
                     out,
                 );
-                join_left.push(l.clone());
+                join_left.push(l.as_ref());
             }
             if join.rarg.is_some() {
                 let r = &join.rarg;
@@ -1131,10 +1131,10 @@ fn find_select_from_item(
             // An ON condition sees its own join's two sides, not the other
             // FROM entries of the level.
             if let Some(quals) = join.quals.as_ref() {
-                let sides: Vec<Option<ast::Node>> = [&join.larg, &join.rarg]
+                let sides: Vec<Option<&ast::Node>> = [&join.larg, &join.rarg]
                     .into_iter()
                     .filter(|n| n.is_some())
-                    .cloned()
+                    .map(Option::as_ref)
                     .collect();
                 let scope = FromScope::of_items(ctx, &sides, level_parent);
                 find_select(ctx, quals.to_ref(), Some(&scope), env, target, check, out);

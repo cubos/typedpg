@@ -694,7 +694,7 @@ fn build_insert_cte_scopes(
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &ins.with_clause {
-        let owner = ast::Node::InsertStmt(NodeBox::new(ins.clone()));
+        let owner = typedpg_pg_query::NodeRef::InsertStmt(ins);
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
@@ -2278,7 +2278,7 @@ fn analyze_update_here(
     // reasoning as the corresponding block in `analyze_insert`.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &upd.with_clause {
-        let owner = ast::Node::UpdateStmt(NodeBox::new(upd.clone()));
+        let owner = typedpg_pg_query::NodeRef::UpdateStmt(upd);
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
@@ -2531,7 +2531,7 @@ fn analyze_delete_here(
     // with the collector and the CTE alias is visible to the USING clause.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &del.with_clause {
-        let owner = ast::Node::DeleteStmt(NodeBox::new(del.clone()));
+        let owner = typedpg_pg_query::NodeRef::DeleteStmt(del);
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;

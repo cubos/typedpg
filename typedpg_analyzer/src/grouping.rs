@@ -22,6 +22,7 @@ use typedpg_pg_query::ast::{self, GroupingSetKind, JoinType};
 
 use crate::error::AnalyzeError;
 use crate::expr;
+use crate::node_key::NodeKey;
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{ConType, PgCatalog};
 use crate::resolve::ExpandedTarget;
@@ -450,10 +451,9 @@ pub(crate) const EXPR_KEY: &str = "\u{0}expr";
 /// ([`resolve_type_names`]: `CAST(g AS bigint)` is `g::int8`).
 pub(crate) fn expr_key(node: Option<&ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> String {
     let node = own_whole_row_fields(node, scope);
-    let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
+    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
     crate::resolve::node_fingerprint(
-        crate::resolve::predtest_unqualify(resolve_type_names(node.as_ref(), snapshot).as_ref())
-            .as_ref(),
+        crate::resolve::predtest_unqualify(resolve_type_names(node, snapshot)).as_ref(),
     )
 }
 
@@ -464,8 +464,8 @@ pub(crate) fn expr_key(node: Option<&ast::Node>, scope: &Scope, snapshot: &PgCat
 /// `equal()` finds equal once transformed, up to how columns are spelled.
 pub(crate) fn typed_fingerprint(node: &ast::Node, scope: &Scope, snapshot: &PgCatalog) -> String {
     let node = own_whole_row_fields(Some(node), scope);
-    let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
-    crate::resolve::node_fingerprint(resolve_type_names(node.as_ref(), snapshot).as_ref())
+    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
+    crate::resolve::node_fingerprint(resolve_type_names(node, snapshot).as_ref())
 }
 
 /// `node` with every type name it holds resolved to its type — PG
@@ -475,14 +475,14 @@ pub(crate) fn typed_fingerprint(node: &ast::Node, scope: &Scope, snapshot: &PgCa
 /// bounds it accounts for; a typmod stays). A name that doesn't resolve
 /// stays as written.
 pub(crate) fn resolve_type_names(
-    node: Option<&ast::Node>,
+    node: Option<ast::Node>,
     snapshot: &PgCatalog,
 ) -> Option<ast::Node> {
     use typedpg_pg_query::NodeMut;
     let mut tree = ast::ParseResult {
         version: 0,
         stmts: vec![ast::RawStmt {
-            stmt: node.cloned(),
+            stmt: node,
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -511,7 +511,7 @@ fn resolve_group_column(
     snapshot: &PgCatalog,
 ) -> Option<ColKey> {
     let node = own_whole_row_fields(node, scope);
-    let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
+    let node = strip_noop_casts(node, scope, snapshot, &|_| true);
     let ast::Node::ColumnRef(cr) = node.as_ref()? else {
         return None;
     };
@@ -540,12 +540,12 @@ fn resolve_group_column(
 /// references, only those `own` accepts are looked at; subqueries are left
 /// as they are.
 fn strip_noop_casts(
-    node: Option<&ast::Node>,
+    node: Option<ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
     own: &dyn Fn(&ast::ColumnRef) -> bool,
 ) -> Option<ast::Node> {
-    let mut out = node.cloned();
+    let mut out = node;
     if let Some(out) = out.as_mut() {
         out.rewrite(&mut |n| !matches!(n, ast::Node::SelectStmt(_)), &mut |n| {
             if let ast::Node::TypeCast(tc) = n
@@ -1223,9 +1223,9 @@ pub(crate) struct LevelInfo {
 
 thread_local! {
     static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
-    /// Keyed by the SelectStmt's address; cleared when the outermost level
-    /// is left, so no address outlives its tree.
-    static LEVELS: RefCell<HashMap<usize, LevelInfo>> = RefCell::new(HashMap::new());
+    /// Keyed by the SelectStmt; cleared when the outermost level is left,
+    /// so no key outlives its tree.
+    static LEVELS: RefCell<HashMap<NodeKey<ast::SelectStmt>, LevelInfo>> = RefCell::new(HashMap::new());
     /// Whole-row references coerce_record_to_complex took apart, by the
     /// reference's location: the entry and its columns (see
     /// [`note_expanded_whole_row`]). Cleared with [`LEVELS`].
@@ -1258,8 +1258,8 @@ fn expanded_whole_row(location: i32, alias: &str) -> Option<Vec<String>> {
     })
 }
 
-fn level_key(sel: &ast::SelectStmt) -> usize {
-    sel as *const ast::SelectStmt as usize
+fn level_key(sel: &ast::SelectStmt) -> NodeKey<ast::SelectStmt> {
+    NodeKey::of(sel)
 }
 
 /// A query level starts (`QueryLevel::enter`).
@@ -1833,27 +1833,23 @@ fn canonical(
     snapshot: &PgCatalog,
 ) -> Option<ast::Node> {
     use typedpg_pg_query::{NodeMut, NodeRef};
-    let node = &column_notation_calls(whole_row_fields(node, chain).as_ref(), chain);
-    let stripped;
+    let node = column_notation_calls(whole_row_fields(node, chain), chain);
     let node = match scope {
-        Some(scope) => {
-            stripped = strip_noop_casts(node.as_ref(), scope, snapshot, &|cr| {
-                chain.resolve(cr).is_some_and(|t| t.level == level)
-            });
-            &stripped
-        }
+        Some(scope) => strip_noop_casts(node, scope, snapshot, &|cr| {
+            chain.resolve(cr).is_some_and(|t| t.level == level)
+        }),
         None => node,
     };
     let mut tree = ast::ParseResult {
         version: 0,
         stmts: vec![ast::RawStmt {
-            stmt: resolve_type_names(node.as_ref(), snapshot),
+            stmt: resolve_type_names(node, snapshot),
             stmt_location: 0,
             stmt_len: 0,
         }],
     };
-    let mut inner: HashSet<usize> = HashSet::new();
-    let mut resolved: HashMap<usize, String> = HashMap::new();
+    let mut inner: HashSet<NodeKey<ast::ColumnRef>> = HashSet::new();
+    let mut resolved: HashMap<NodeKey<ast::ColumnRef>, String> = HashMap::new();
     for (n, _) in tree.nodes() {
         let sub = match n {
             NodeRef::SubLink(sl) => sl.subselect.as_ref(),
@@ -1863,14 +1859,14 @@ fn canonical(
         if let Some(sub) = sub {
             for (m, _) in sub.nodes() {
                 if let NodeRef::ColumnRef(cr) = m {
-                    inner.insert(cr as *const ast::ColumnRef as usize);
+                    inner.insert(NodeKey::of(cr));
                 }
             }
         }
     }
     for (n, _) in tree.nodes() {
         if let NodeRef::ColumnRef(cr) = n {
-            let key = cr as *const ast::ColumnRef as usize;
+            let key = NodeKey::of(cr);
             if !inner.contains(&key)
                 && let Some(RefTarget {
                     level: l,
@@ -1888,7 +1884,7 @@ fn canonical(
     }
     tree.for_each_node_mut(|n, _| {
         if let NodeMut::ColumnRef(cr) = n
-            && let Some(name) = resolved.get(&(&raw const *cr as usize))
+            && let Some(name) = resolved.get(&NodeKey::of(&*cr))
         {
             cr.fields = vec![Some(string_node(name))];
         }
@@ -1924,8 +1920,8 @@ fn own_whole_row_fields(node: Option<&ast::Node>, scope: &Scope) -> Option<ast::
 /// `node` with each column notation `t.f` of its level (not inside its
 /// sublinks) written as the call `f(t.*)` it stands for, so both spellings
 /// compare equal.
-fn column_notation_calls(node: Option<&ast::Node>, chain: &Chain) -> Option<ast::Node> {
-    let mut out = node.cloned();
+fn column_notation_calls(node: Option<ast::Node>, chain: &Chain) -> Option<ast::Node> {
+    let mut out = node;
     if let Some(out) = out.as_mut() {
         out.rewrite(&mut |n| !matches!(n, ast::Node::SelectStmt(_)), &mut |n| {
             if let ast::Node::ColumnRef(cr) = n
@@ -2337,11 +2333,11 @@ impl UnplannedCall {
 }
 
 thread_local! {
-    /// Per analyzed VALUES level (keyed by its SelectStmt's address), the
+    /// Per analyzed VALUES level (keyed by its SelectStmt), the
     /// first call of its ORDER BY the executor can't run — read once the
     /// statement is analyzed, where a VALUES certain to be planned fails
     /// with it ([`values_sort_call`]). Cleared before each statement.
-    static VALUES_SORT_CALLS: RefCell<HashMap<usize, (UnplannedCall, i32)>> =
+    static VALUES_SORT_CALLS: RefCell<HashMap<NodeKey<ast::SelectStmt>, (UnplannedCall, i32)>> =
         RefCell::new(HashMap::new());
 }
 
@@ -2566,8 +2562,7 @@ impl GroupExprs {
             };
             // A cast that is no coercion is the column itself, and so is a
             // field selected from the whole row.
-            let expr = &whole_row_fields(expr, own);
-            let expr = &strip_noop_casts(expr.as_ref(), scope, snapshot, &|cr| {
+            let expr = &strip_noop_casts(whole_row_fields(expr, own), scope, snapshot, &|cr| {
                 matches!(own.resolve(cr), Some(RefTarget { level: 0, .. }))
             });
             if let Some(ast::Node::ColumnRef(cr)) = expr.as_ref()

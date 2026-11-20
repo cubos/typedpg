@@ -447,17 +447,17 @@ impl Walker<'_, '_> {
     /// the items to its left; both see the levels around (`parent`), never
     /// the rest of the FROM, whose names may shadow an outer one.
     fn walk_from_rest(&mut self, from: &[Option<Node>], parent: Option<&FromScope<'_>>) {
-        let mut left: Vec<Option<Node>> = Vec::new();
+        let mut left: Vec<Option<&Node>> = Vec::new();
         for item in from {
             self.walk_from_item(item.as_ref(), &mut left, parent);
         }
     }
 
     /// One FROM item, `left` holding the items before it (and getting it).
-    fn walk_from_item(
+    fn walk_from_item<'n>(
         &mut self,
-        item: Option<&Node>,
-        left: &mut Vec<Option<Node>>,
+        item: Option<&'n Node>,
+        left: &mut Vec<Option<&'n Node>>,
         parent: Option<&FromScope<'_>>,
     ) {
         match item {
@@ -476,10 +476,10 @@ impl Walker<'_, '_> {
                 for side in [&j.larg, &j.rarg].into_iter().filter(|s| s.is_some()) {
                     self.walk_from_item(side.as_ref(), left, parent);
                 }
-                let sides: Vec<Option<Node>> = [&j.larg, &j.rarg]
+                let sides: Vec<Option<&Node>> = [&j.larg, &j.rarg]
                     .into_iter()
                     .filter(|s| s.is_some())
-                    .cloned()
+                    .map(Option::as_ref)
                     .collect();
                 let scope = FromScope::of_items(self.ctx, &sides, parent);
                 self.opt(j.quals.as_ref(), &scope);
@@ -492,7 +492,7 @@ impl Walker<'_, '_> {
             }
             None => {}
         }
-        left.push(item.cloned());
+        left.push(item);
     }
 
     fn select(&mut self, s: &SelectStmt, parent: Option<&FromScope<'_>>) {

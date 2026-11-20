@@ -26,6 +26,7 @@ pub(crate) mod subst;
 use typedpg_pg_query::NodeBox;
 use typedpg_pg_query::ast;
 
+use crate::node_key::NodeKey;
 use crate::pg_catalog::PgCatalog;
 use crate::scope::Scope;
 
@@ -284,9 +285,9 @@ impl StrictLog {
 
 thread_local! {
     /// The sublink / LATERAL subquery whose WHERE facts about the
-    /// enclosing level are being captured: the `SelectStmt`'s address, and
-    /// what it deposited.
-    static CORRELATION: RefCell<Option<(usize, Option<Facts>)>> = const { RefCell::new(None) };
+    /// enclosing level are being captured: the `SelectStmt`, and what it
+    /// deposited.
+    static CORRELATION: RefCell<Option<(NodeKey<ast::SelectStmt>, Option<Facts>)>> = const { RefCell::new(None) };
 }
 
 /// Run `f` (the analysis of subquery `sel`), capturing what `sel`'s WHERE
@@ -296,7 +297,7 @@ thread_local! {
 /// inner join's. Only `sel` itself deposits (by address): not the queries
 /// nested in it, nor a set operation's arms.
 pub(crate) fn capture_correlation<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R) -> (R, Facts) {
-    let key = sel as *const ast::SelectStmt as usize;
+    let key = NodeKey::of(sel);
     let before = CORRELATION.with(|c| c.replace(Some((key, None))));
     let out = f();
     let got = CORRELATION.with(|c| c.replace(before));
@@ -308,7 +309,7 @@ pub(crate) fn capture_correlation<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> 
 /// the subquery being captured (see [`capture_correlation`]). Expression
 /// facts stay behind: they may speak of `sel`'s own columns.
 pub(crate) fn deposit_correlation(sel: &ast::SelectStmt, mut facts: Facts) {
-    let key = sel as *const ast::SelectStmt as usize;
+    let key = NodeKey::of(sel);
     facts.exprs.clear();
     CORRELATION.with(|c| {
         if let Some((k, slot)) = c.borrow_mut().as_mut()
@@ -331,15 +332,15 @@ pub(crate) struct OwnRows {
 
 thread_local! {
     /// The subquery whose own rows' facts are being captured: the
-    /// `SelectStmt`'s address, and what it deposited.
-    static OWN_ROWS: RefCell<Option<(usize, Option<OwnRows>)>> = const { RefCell::new(None) };
+    /// `SelectStmt`, and what it deposited.
+    static OWN_ROWS: RefCell<Option<(NodeKey<ast::SelectStmt>, Option<OwnRows>)>> = const { RefCell::new(None) };
 }
 
 /// Run `f` (the analysis of subquery `sel`), capturing what `sel`'s level
 /// proves of its own rows (see [`OwnRows`]), when every row it returns
 /// passed its WHERE. Only `sel` itself deposits, by address.
 pub(crate) fn capture_own<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R) -> (R, Option<OwnRows>) {
-    let key = sel as *const ast::SelectStmt as usize;
+    let key = NodeKey::of(sel);
     let before = OWN_ROWS.with(|c| c.replace(Some((key, None))));
     let out = f();
     let got = OWN_ROWS.with(|c| c.replace(before));
@@ -349,7 +350,7 @@ pub(crate) fn capture_own<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R) -> (R
 /// Deposit what `sel`'s level proves of its own rows, if `sel` is the
 /// subquery being captured (see [`capture_own`]).
 pub(crate) fn deposit_own(sel: &ast::SelectStmt, mut own: OwnRows) {
-    let key = sel as *const ast::SelectStmt as usize;
+    let key = NodeKey::of(sel);
     own.facts.exprs.clear();
     OWN_ROWS.with(|c| {
         if let Some((k, slot)) = c.borrow_mut().as_mut()
@@ -362,13 +363,13 @@ pub(crate) fn deposit_own(sel: &ast::SelectStmt, mut own: OwnRows) {
 
 /// Whether some query is capturing `sel`'s own rows' facts.
 pub(crate) fn own_wanted(sel: &ast::SelectStmt) -> bool {
-    let key = sel as *const ast::SelectStmt as usize;
+    let key = NodeKey::of(sel);
     OWN_ROWS.with(|c| c.borrow().as_ref().is_some_and(|(k, _)| *k == key))
 }
 
 /// Whether some query is capturing `sel`'s correlation facts.
 pub(crate) fn correlation_wanted(sel: &ast::SelectStmt) -> bool {
-    let key = sel as *const ast::SelectStmt as usize;
+    let key = NodeKey::of(sel);
     CORRELATION.with(|c| c.borrow().as_ref().is_some_and(|(k, _)| *k == key))
 }
 

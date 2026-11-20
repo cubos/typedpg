@@ -820,9 +820,13 @@ fn column_name(cr: &ast::ColumnRef) -> Option<&str> {
 /// their structure without locations, qualifiers or type-name spellings
 /// (erring towards matching).
 fn equivalence_key(n: Option<&ast::Node>, snapshot: &PgCatalog) -> String {
+    owned_equivalence_key(n.cloned(), snapshot)
+}
+
+/// [`equivalence_key`] of an expression already owned.
+fn owned_equivalence_key(n: Option<ast::Node>, snapshot: &PgCatalog) -> String {
     super::node_fingerprint(
-        super::predtest_unqualify(crate::grouping::resolve_type_names(n, snapshot).as_ref())
-            .as_ref(),
+        super::predtest_unqualify(crate::grouping::resolve_type_names(n, snapshot)).as_ref(),
     )
 }
 
@@ -912,7 +916,7 @@ fn promoted_equalities<'a>(c: Option<&'a ast::Node>, snapshot: &PgCatalog) -> Ve
             .collect(),
         Some(ast::Node::BoolExpr(b)) if b.boolop == B::OrExpr => {
             let key = |e: &ast::AExpr| {
-                equivalence_key(Some(&ast::Node::AExpr(NodeBox::new(e.clone()))), snapshot)
+                owned_equivalence_key(Some(ast::Node::AExpr(NodeBox::new(e.clone()))), snapshot)
             };
             let arms: Vec<Vec<&ast::AExpr>> = b
                 .args
@@ -3288,12 +3292,12 @@ fn from_item_rows(
     depth: usize,
     stored: bool,
 ) -> Option<SourceRows> {
-    let select = |n: Option<&ast::Node>| -> Option<ast::SelectStmt> {
+    fn select(n: Option<&ast::Node>) -> Option<std::borrow::Cow<'_, ast::SelectStmt>> {
         match n {
-            Some(ast::Node::SelectStmt(s)) => Some((**s).clone()),
+            Some(ast::Node::SelectStmt(s)) => Some(std::borrow::Cow::Borrowed(&**s)),
             _ => None,
         }
-    };
+    }
     // `view`: the query is this view's, stored without execution.
     let (name, alias, query, inner_ctes, mut names, view): (
         _,
@@ -3331,7 +3335,10 @@ fn from_item_rows(
                 // The view's query as it was bound (its names may have
                 // come to mean other objects since).
                 crate::ddl::views::reanalyze_view(snapshot, class.oid)?;
-                let query = select(Some(&crate::ddl::views::view_query(snapshot, class.oid)?))?;
+                let query = match crate::ddl::views::view_query(snapshot, class.oid)? {
+                    ast::Node::SelectStmt(s) => std::borrow::Cow::Owned(s.into_inner()),
+                    _ => return None,
+                };
                 let names = snapshot
                     .attributes_of(class.oid)
                     .iter()

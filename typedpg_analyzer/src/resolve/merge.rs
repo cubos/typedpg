@@ -68,7 +68,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         if with.recursive {
             return Err(crate::pgmsg::merge_with_recursive().finalize_implicit());
         }
-        let owner = ast::Node::MergeStmt(NodeBox::new(merge.clone()));
+        let owner = typedpg_pg_query::NodeRef::MergeStmt(merge);
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
