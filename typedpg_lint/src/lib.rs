@@ -1674,7 +1674,6 @@ mod tests {
         let location = view
             .tree
             .nodes()
-            .into_iter()
             .find_map(|(node, _)| match node {
                 typedpg_pg_query::NodeRef::SubLink(sub) => Some(sub.location),
                 _ => None,

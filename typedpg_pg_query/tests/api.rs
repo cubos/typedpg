@@ -24,7 +24,10 @@ fn parses_with_postgres_18_grammar() {
         typedpg_pg_query::parse("UPDATE t SET a = 1 RETURNING WITH (OLD AS o, NEW AS n) o.a, n.a")
             .unwrap();
     assert_eq!(parsed.tree.version, typedpg_pg_query::PG_VERSION_NUM);
-    assert!(matches!(parsed.tree.nodes()[0].0, NodeRef::UpdateStmt(_)));
+    assert!(matches!(
+        parsed.tree.nodes().next(),
+        Some((NodeRef::UpdateStmt(_), 0))
+    ));
 }
 
 #[test]
@@ -89,6 +92,30 @@ fn the_deepest_tree_drops_on_a_small_stack() {
 }
 
 #[test]
+fn the_deepest_tree_is_walked_on_a_small_stack() {
+    // The walkers queue nodes instead of recursing, so they reach every
+    // level of the deepest tree on a 256 kB thread stack, in a debug build
+    // too.
+    let sql = format!("SELECT 1{}", " + 1".repeat(4995));
+    let mut parsed = typedpg_pg_query::parse(&sql).unwrap();
+    let depths = std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(move || {
+            let deepest = parsed.tree.nodes().map(|(_, d)| d).max().unwrap();
+            let mut deepest_mut = 0;
+            parsed
+                .tree
+                .for_each_node_mut(|_, d| deepest_mut = deepest_mut.max(d));
+            (deepest, deepest_mut, parsed)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(depths.0 > 4995, "{}", depths.0);
+    assert_eq!(depths.0, depths.1);
+}
+
+#[test]
 fn parse_errors_carry_the_server_message() {
     let err = typedpg_pg_query::parse("SELECT FROM WHERE").unwrap_err();
     assert_eq!(
@@ -148,7 +175,7 @@ fn nodes_reaches_every_expression() {
         "SELECT a + (SELECT max(b) FROM u WHERE u.c = t.d) FROM t WHERE e IN (1, 2) ORDER BY f",
     )
     .unwrap();
-    let nodes = parsed.tree.nodes();
+    let nodes: Vec<_> = parsed.tree.nodes().collect();
     // The statement itself comes first, at depth 0.
     assert!(matches!(nodes[0], (NodeRef::SelectStmt(_), 0)));
     let mut columns: Vec<String> = nodes
@@ -165,21 +192,83 @@ fn nodes_reaches_every_expression() {
     assert_eq!(columns, ["a", "b", "c", "d", "e", "f"]);
     // A subtree walk starts at its own root.
     let stmt = parsed.tree.stmts[0].stmt.as_ref().unwrap();
-    assert_eq!(stmt.nodes().len(), nodes.len());
+    assert_eq!(stmt.nodes().count(), nodes.len());
 }
 
 #[test]
-fn nodes_mut_edits_the_tree_in_place() {
+fn nodes_is_lazy_and_visits_in_breadth_first_order() {
+    let parsed = typedpg_pg_query::parse("SELECT a, b FROM t; SELECT 1").unwrap();
+    let kinds: Vec<(String, usize)> = parsed
+        .tree
+        .nodes()
+        .map(|(n, depth)| {
+            let kind = format!("{n:?}");
+            (kind[..kind.find('(').unwrap()].to_owned(), depth)
+        })
+        .collect();
+    // Both statements first, then each level in field order.
+    assert_eq!(
+        &kinds[..2],
+        [("SelectStmt".into(), 0), ("SelectStmt".into(), 0)]
+    );
+    assert!(kinds.windows(2).all(|w| w[0].1 <= w[1].1), "{kinds:?}");
+    // The second level is the first statement's children.
+    let first = parsed.tree.nodes().next().unwrap().0;
+    let children: Vec<_> = first.children().map(|c| c.location()).collect();
+    let second_level: Vec<_> = parsed
+        .tree
+        .nodes()
+        .skip(2)
+        .take(children.len())
+        .map(|(n, _)| n.location())
+        .collect();
+    assert_eq!(children, second_level);
+    assert!(first.children().any(|c| matches!(c, NodeRef::RangeVar(_))));
+    assert!(!first.children().any(|c| matches!(c, NodeRef::ColumnRef(_))));
+    // More children than the inline buffer holds spill, in order.
+    let wide = typedpg_pg_query::parse("SELECT f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)").unwrap();
+    let call = wide
+        .tree
+        .nodes()
+        .find(|(n, _)| matches!(n, NodeRef::FuncCall(_)))
+        .unwrap()
+        .0;
+    let args = call.children();
+    assert_eq!(args.len(), 12);
+    let locations: Vec<_> = args.filter_map(|c| c.location()).collect();
+    assert!(
+        locations.is_sorted() && locations.len() == 11,
+        "{locations:?}"
+    );
+}
+
+#[test]
+fn for_each_node_mut_edits_the_tree_in_place() {
     let mut parsed = typedpg_pg_query::parse("SELECT a FROM t").unwrap();
-    for (n, _) in unsafe { parsed.tree.nodes_mut() } {
+    let order: Vec<_> = parsed
+        .tree
+        .nodes()
+        .map(|(n, d)| (n.location(), d))
+        .collect();
+    let mut seen = Vec::new();
+    parsed.tree.for_each_node_mut(|n, depth| {
         if let typedpg_pg_query::NodeMut::RangeVar(rv) = n {
-            unsafe { (*rv).relname = "renamed".into() };
+            seen.push((Some(rv.location), depth));
+            rv.relname = "renamed".into();
+        } else {
+            seen.push((None, depth));
         }
-    }
+    });
+    // The same nodes, in the same order, as `nodes()`.
+    assert_eq!(seen.len(), order.len());
+    assert!(
+        seen.iter()
+            .zip(&order)
+            .all(|(s, o)| s.1 == o.1 && (s.0.is_none() || s.0 == o.0))
+    );
     let relations: Vec<String> = parsed
         .tree
         .nodes()
-        .iter()
         .filter_map(|(n, _)| match n {
             NodeRef::RangeVar(rv) => Some(rv.relname.clone()),
             _ => None,

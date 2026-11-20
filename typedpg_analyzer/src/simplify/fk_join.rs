@@ -368,7 +368,7 @@ fn find_range<'a>(node: Option<&'a ast::Node>, name: &str) -> Found<'a> {
 /// A JOIN USING or NATURAL JOIN anywhere: its merged columns may come from
 /// the parent without naming it.
 fn has_using_or_natural(root: &Node) -> bool {
-    root.nodes().iter().any(
+    root.nodes().any(
         |(n, _)| matches!(n, NodeRef::JoinExpr(j) if j.is_natural || !j.using_clause.is_empty()),
     )
 }

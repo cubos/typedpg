@@ -441,7 +441,6 @@ fn bound_value(
         && (matches!(inner, ast::Node::ColumnRef(_))
             || inner
                 .nodes()
-                .into_iter()
                 .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::ColumnRef(_))))
     {
         return Err(DdlError::Parse(

@@ -15,8 +15,11 @@ The crate exposes:
   own values. A nullable `Node *` is an `Option<Node>`, and a `List` is a
   `Vec<Option<Node>>`, since PostgreSQL's lists can hold NULL cells
   (`SELECT DISTINCT`'s `list_make1(NIL)`, `DROP OPERATOR`'s `NONE`);
-- `NodeRef` / `NodeMut`, a view of a node by kind, and `nodes()` /
-  `nodes_mut()`, every node of a tree (breadth-first, with its depth);
+- `NodeRef` / `NodeMut`, a shared or mutable view of a node by kind;
+  `nodes()`, a lazy iterator over every node of a tree (breadth-first,
+  with its depth), `for_each_node_mut()`, the same walk with mutable views,
+  `NodeRef::children()`, a node's direct children, and `Node::rewrite()`,
+  which replaces nodes bottom-up — all in safe Rust;
 - `Equal`, PostgreSQL's `equal()` over the AST: every field compared except
   source locations and `equal_ignore` fields, both read from the PostgreSQL
   headers;

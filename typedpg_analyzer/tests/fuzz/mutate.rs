@@ -93,92 +93,134 @@ pub(crate) fn str_node(s: &str) -> Option<ast::Node> {
 pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<String> {
     let mut parsed = typedpg_pg_query::parse(seed).ok()?;
 
-    // SAFETY: `nodes_mut` hands back raw pointers into `parsed`'s owned
-    // AST. They stay valid because `parsed` outlives this block and
-    // we don't move it; we mutate through them and then print. The pointers
-    // carry no lifetime, so the `&mut parsed` borrow ends here and the printer
-    // (an immutable borrow) is free to read the mutated tree afterwards.
-    let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.tree.nodes_mut() }
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
+    let nodes = mutation_targets(&parsed.tree);
     if nodes.is_empty() {
         return None;
     }
 
     for _ in 0..n_edits {
         let idx = rng.random_range(0..nodes.len());
-        apply_mutation(nodes[idx], rng);
+        mutate_target(&mut parsed.tree, nodes[idx], rng);
     }
 
     printer::print(&parsed.tree)
 }
 
-/// One mutation on a single node, dispatched on its kind.
-pub(crate) fn apply_mutation(node: typedpg_pg_query::NodeMut, rng: &mut StdRng) {
+/// A node [`apply_mutation`] may edit, by kind and address: what tells it
+/// apart from every other node of the tree while it is in the tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Target(u8, usize);
+
+fn addr<T>(x: &T) -> usize {
+    std::ptr::from_ref(x) as usize
+}
+
+fn target_of(node: typedpg_pg_query::NodeRef<'_>) -> Option<Target> {
+    use typedpg_pg_query::NodeRef;
+    Some(match node {
+        NodeRef::AConst(x) => Target(0, addr(x)),
+        NodeRef::ColumnRef(x) => Target(1, addr(x)),
+        NodeRef::AExpr(x) => Target(2, addr(x)),
+        NodeRef::FuncCall(x) => Target(3, addr(x)),
+        NodeRef::TypeName(x) => Target(4, addr(x)),
+        _ => return None,
+    })
+}
+
+fn target_of_mut(node: &typedpg_pg_query::NodeMut<'_>) -> Option<Target> {
     use typedpg_pg_query::NodeMut;
-    unsafe {
-        match node {
-            NodeMut::AConst(p) if !p.is_null() => {
-                let c = &mut *p;
-                c.isnull = false;
-                c.val = Some(match rng.random_range(0..5) {
-                    0 => ast::AConstValue::Integer(ast::Integer {
-                        ival: rng.random_range(-5..1000),
-                    }),
-                    1 => ast::AConstValue::String(ast::String {
-                        // Drawn from the literal-probe pool so constant
-                        // mutations stress the input-syntax validators too
-                        // (radix/underscore ints, float specials, array /
-                        // range / json shapes, datetime keywords, …).
-                        sval: LITERAL_PROBES[rng.random_range(0..LITERAL_PROBES.len())].to_string(),
-                    }),
-                    2 => ast::AConstValue::Boolean(ast::Boolean {
-                        boolval: rng.random_bool(0.5),
-                    }),
-                    3 => ast::AConstValue::Float(ast::Float {
-                        fval: "3.14".to_string(),
-                    }),
-                    _ => {
-                        c.isnull = true;
-                        c.val = None;
-                        return;
-                    }
-                });
-            }
-            NodeMut::ColumnRef(p) if !p.is_null() => {
-                let cr = &mut *p;
-                if let Some(last) = cr.fields.last_mut()
-                    && matches!(last, Some(Node::String(_)))
-                {
-                    let name = ALL_COLUMN_NAMES[rng.random_range(0..ALL_COLUMN_NAMES.len())];
-                    *last = str_node(name);
-                }
-            }
-            NodeMut::AExpr(p) if !p.is_null() => {
-                let e = &mut *p;
-                // AEXPR_OP: a plain binary/unary operator.
-                if e.kind == ast::AExprKind::AexprOp && e.name.len() == 1 {
-                    let op = OPERATORS[rng.random_range(0..OPERATORS.len())];
-                    e.name[0] = str_node(op);
-                }
-            }
-            NodeMut::FuncCall(p) if !p.is_null() => {
-                let fc = &mut *p;
-                if !fc.agg_star {
-                    let f = FUNCTIONS[rng.random_range(0..FUNCTIONS.len())];
-                    fc.funcname = vec![str_node(f)];
-                }
-            }
-            NodeMut::TypeName(p) if !p.is_null() => {
-                let tn = &mut *p;
-                let t = BASE_TYPE_NAMES[rng.random_range(0..BASE_TYPE_NAMES.len())];
-                tn.names = vec![str_node(t)];
-                tn.typmods.clear();
-                tn.array_bounds.clear();
-                tn.typemod = -1;
-            }
-            _ => {}
+    Some(match node {
+        NodeMut::AConst(x) => Target(0, addr(&**x)),
+        NodeMut::ColumnRef(x) => Target(1, addr(&**x)),
+        NodeMut::AExpr(x) => Target(2, addr(&**x)),
+        NodeMut::FuncCall(x) => Target(3, addr(&**x)),
+        NodeMut::TypeName(x) => Target(4, addr(&**x)),
+        _ => return None,
+    })
+}
+
+/// Every node of `tree`, in `nodes()` order: the ones [`apply_mutation`]
+/// edits by identity, `None` for the others (it leaves them as they are).
+pub(crate) fn mutation_targets(tree: &ast::ParseResult) -> Vec<Option<Target>> {
+    tree.nodes().map(|(n, _)| target_of(n)).collect()
+}
+
+/// [`apply_mutation`] on the node `target` names, an entry of
+/// [`mutation_targets`] taken before any mutation: so successive picks
+/// index the tree as it was parsed. A node an earlier mutation removed
+/// (a type modifier `TypeName` dropped) is no longer found and left alone.
+pub(crate) fn mutate_target(tree: &mut ast::ParseResult, target: Option<Target>, rng: &mut StdRng) {
+    let Some(target) = target else {
+        return;
+    };
+    let mut rng = Some(rng);
+    tree.for_each_node_mut(|n, _| {
+        if target_of_mut(&n) == Some(target)
+            && let Some(rng) = rng.take()
+        {
+            apply_mutation(n, rng);
         }
+    });
+}
+
+/// One mutation on a single node, dispatched on its kind.
+pub(crate) fn apply_mutation(node: typedpg_pg_query::NodeMut<'_>, rng: &mut StdRng) {
+    use typedpg_pg_query::NodeMut;
+    match node {
+        NodeMut::AConst(c) => {
+            c.isnull = false;
+            c.val = Some(match rng.random_range(0..5) {
+                0 => ast::AConstValue::Integer(ast::Integer {
+                    ival: rng.random_range(-5..1000),
+                }),
+                1 => ast::AConstValue::String(ast::String {
+                    // Drawn from the literal-probe pool so constant
+                    // mutations stress the input-syntax validators too
+                    // (radix/underscore ints, float specials, array /
+                    // range / json shapes, datetime keywords, …).
+                    sval: LITERAL_PROBES[rng.random_range(0..LITERAL_PROBES.len())].to_string(),
+                }),
+                2 => ast::AConstValue::Boolean(ast::Boolean {
+                    boolval: rng.random_bool(0.5),
+                }),
+                3 => ast::AConstValue::Float(ast::Float {
+                    fval: "3.14".to_string(),
+                }),
+                _ => {
+                    c.isnull = true;
+                    c.val = None;
+                    return;
+                }
+            });
+        }
+        NodeMut::ColumnRef(cr) => {
+            if let Some(last) = cr.fields.last_mut()
+                && matches!(last, Some(Node::String(_)))
+            {
+                let name = ALL_COLUMN_NAMES[rng.random_range(0..ALL_COLUMN_NAMES.len())];
+                *last = str_node(name);
+            }
+        }
+        NodeMut::AExpr(e) => {
+            // AEXPR_OP: a plain binary/unary operator.
+            if e.kind == ast::AExprKind::AexprOp && e.name.len() == 1 {
+                let op = OPERATORS[rng.random_range(0..OPERATORS.len())];
+                e.name[0] = str_node(op);
+            }
+        }
+        NodeMut::FuncCall(fc) => {
+            if !fc.agg_star {
+                let f = FUNCTIONS[rng.random_range(0..FUNCTIONS.len())];
+                fc.funcname = vec![str_node(f)];
+            }
+        }
+        NodeMut::TypeName(tn) => {
+            let t = BASE_TYPE_NAMES[rng.random_range(0..BASE_TYPE_NAMES.len())];
+            tn.names = vec![str_node(t)];
+            tn.typmods.clear();
+            tn.array_bounds.clear();
+            tn.typemod = -1;
+        }
+        _ => {}
     }
 }

@@ -225,7 +225,6 @@ pub(crate) fn cook_generation_expr(
         .map(|inner| {
             inner
                 .nodes()
-                .into_iter()
                 .filter_map(|(n, ..)| match n {
                     typedpg_pg_query::NodeRef::ColumnRef(cr) => Some(cr),
                     _ => None,

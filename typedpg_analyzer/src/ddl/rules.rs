@@ -525,7 +525,7 @@ fn check_action_relations(
     let Some(inner) = action else {
         return Ok(());
     };
-    let nodes = inner.nodes();
+    let nodes: Vec<_> = inner.nodes().collect();
     let ctes: Vec<&str> = nodes
         .iter()
         .filter_map(|(n, ..)| match n {

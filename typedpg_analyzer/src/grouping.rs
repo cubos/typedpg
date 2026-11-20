@@ -487,22 +487,16 @@ pub(crate) fn resolve_type_names(
             stmt_len: 0,
         }],
     };
-    // SAFETY: the tree is neither moved nor dropped while the pointers are
-    // used; only `TypeName`s are dereferenced, each once (no `TypeName`
-    // holds another), and the `String` children whose list is replaced are
-    // never dereferenced afterwards.
-    unsafe {
-        for (n, _) in tree.nodes_mut() {
-            if let NodeMut::TypeName(tn) = n
-                && let Some(oid) = crate::ddl::util::resolve_type_name(&*tn, snapshot)
-            {
-                (*tn).type_oid = oid.get();
-                (*tn).names = Vec::new();
-                (*tn).array_bounds = Vec::new();
-                (*tn).pct_type = false;
-            }
+    tree.for_each_node_mut(|n, _| {
+        if let NodeMut::TypeName(tn) = n
+            && let Some(oid) = crate::ddl::util::resolve_type_name(tn, snapshot)
+        {
+            tn.type_oid = oid.get();
+            tn.names = Vec::new();
+            tn.array_bounds = Vec::new();
+            tn.pct_type = false;
         }
-    }
+    });
     tree.stmts.pop().and_then(|s| s.stmt)
 }
 
@@ -603,7 +597,7 @@ fn is_noop_cast(
             }
         }
         Some(n) => {
-            if n.nodes().iter().any(|(m, _)| match m {
+            if n.nodes().any(|(m, _)| match m {
                 NodeRef::SelectStmt(_) => true,
                 NodeRef::ColumnRef(cr) => !own(cr),
                 _ => false,
@@ -1892,19 +1886,13 @@ fn canonical(
             }
         }
     }
-    // SAFETY: the tree is neither moved nor dropped while the pointers are
-    // used; only the resolved column references are written, replacing
-    // their `fields` (whose `String` children no pointer is dereferenced
-    // through afterwards).
-    unsafe {
-        for (n, _) in tree.nodes_mut() {
-            if let NodeMut::ColumnRef(cr) = n
-                && let Some(name) = resolved.get(&(cr as usize))
-            {
-                (*cr).fields = vec![Some(string_node(name))];
-            }
+    tree.for_each_node_mut(|n, _| {
+        if let NodeMut::ColumnRef(cr) = n
+            && let Some(name) = resolved.get(&(&raw const *cr as usize))
+        {
+            cr.fields = vec![Some(string_node(name))];
         }
-    }
+    });
     tree.stmts.pop().and_then(|s| s.stmt)
 }
 

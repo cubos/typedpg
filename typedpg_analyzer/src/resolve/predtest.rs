@@ -526,21 +526,9 @@ pub(crate) fn unqualify(node: Option<&ast::Node>) -> Option<ast::Node> {
             stmt_len: 0,
         }],
     };
-    // SAFETY: the tree is neither moved nor dropped while the pointers are
-    // used, and only column references are written through them; a column
-    // reference contains no other column reference, so no pointer that is
-    // dereferenced points into a vector that has been modified.
-    unsafe {
-        let column_refs: Vec<_> = tree
-            .nodes_mut()
-            .into_iter()
-            .filter_map(|(n, _)| match n {
-                typedpg_pg_query::NodeMut::ColumnRef(cr) => Some(cr),
-                _ => None,
-            })
-            .collect();
-        for cr in column_refs {
-            let fields = &mut (*cr).fields;
+    tree.for_each_node_mut(|n, _| {
+        if let typedpg_pg_query::NodeMut::ColumnRef(cr) = n {
+            let fields = &mut cr.fields;
             if fields.len() > 1
                 && matches!(
                     fields.last().and_then(|f| f.as_ref()),
@@ -552,6 +540,6 @@ pub(crate) fn unqualify(node: Option<&ast::Node>) -> Option<ast::Node> {
                 fields.extend(last);
             }
         }
-    }
+    });
     tree.stmts.pop().and_then(|s| s.stmt)
 }

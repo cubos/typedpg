@@ -1185,7 +1185,7 @@ pub(crate) fn rebuild_indexes_for_column_type(
     for index in &indexes {
         let reads_column = |ast: &SerializedAst| {
             ast.ast.as_ref().is_some_and(|inner| {
-                inner.nodes().into_iter().any(|(n, ..)| {
+                inner.nodes().any(|(n, ..)| {
                     matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
                         if cr.fields.last().and_then(|n| super::util::node_string(n.as_ref()))
                             == Some(attr.attname.as_str()))
@@ -1253,7 +1253,7 @@ pub(crate) fn rebuild_indexes_for_column_type(
                     continue;
                 };
                 let reads = expr.ast.as_ref().is_some_and(|inner| {
-                    inner.nodes().into_iter().any(|(n, ..)| {
+                    inner.nodes().any(|(n, ..)| {
                         matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
                             if cr.fields.last().and_then(|n| super::util::node_string(n.as_ref()))
                                 == Some(attr.attname.as_str()))
@@ -1474,7 +1474,6 @@ pub(crate) fn check_index_columns(
         // A column by name, or selected from the whole row (`(t).a`).
         let names = inner
             .nodes()
-            .into_iter()
             .filter_map(|(n, ..)| match n {
                 typedpg_pg_query::NodeRef::ColumnRef(cr) => cr
                     .fields

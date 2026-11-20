@@ -167,7 +167,7 @@ fn observes_only_existence(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
 /// set-returning function. Every overload counts; an unresolved call is
 /// treated as one, conservatively.
 fn has_set_returning_function(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
-    let mut stack: Vec<NodeRef<'_>> = NodeRef::SelectStmt(select).children();
+    let mut stack: Vec<NodeRef<'_>> = NodeRef::SelectStmt(select).children().collect();
     while let Some(node) = stack.pop() {
         // A nested `SELECT` is another query level: its own target list is
         // checked when it is walked as a select of its own.

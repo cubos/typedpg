@@ -74,7 +74,7 @@ fn with_nullable_side<R>(
     // one equating the other side, one restricting its relation to a
     // constant): it may be proven unique for the join.
     let has_equality = |q: &ast::Node| {
-        q.nodes().into_iter().any(|(n, _)| {
+        q.nodes().any(|(n, _)| {
             matches!(n, typedpg_pg_query::NodeRef::AExpr(e)
                 if crate::expr::extract_string_fields(&e.name)
                     .last()

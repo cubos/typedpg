@@ -2591,7 +2591,6 @@ fn volatile(catalog: &PgCatalog, node: Option<&Node>) -> bool {
     };
     inner
         .nodes()
-        .iter()
         .any(|(node, _)| matches!(node, typedpg_pg_query::NodeRef::FuncCall(call) if catalog.call_is_volatile(call)))
 }
 

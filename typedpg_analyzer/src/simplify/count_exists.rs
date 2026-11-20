@@ -308,7 +308,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     let Some(text) = Text::new(ctx.sql) else {
         return Vec::new();
     };
-    let nodes = ctx.tree.nodes();
+    let nodes: Vec<_> = ctx.tree.nodes().collect();
     // A reference to one of these may read a CTE rather than a table.
     let cte_names: Vec<&str> = nodes
         .iter()
@@ -759,7 +759,7 @@ fn pure(ctx: &Ctx<'_>, cte_names: &[&str], node: Option<&Node>) -> bool {
     let Some(inner) = node else {
         return true;
     };
-    inner.nodes().iter().all(|(n, _)| match n {
+    inner.nodes().all(|(n, _)| match n {
         NodeRef::RangeVar(rv) => {
             if rv.schemaname.is_empty() && cte_names.contains(&rv.relname.as_str()) {
                 return false;
@@ -905,7 +905,7 @@ fn sublink_form(
         let val = rt.val.as_ref()?;
         // A `*` FigureColname would name after a column of what it expands
         // to: not a name this level alone tells.
-        if val.nodes().iter().any(|(n, _)| {
+        if val.nodes().any(|(n, _)| {
             matches!(n, NodeRef::ColumnRef(c)
                 if c.fields.iter().any(|f| matches!(f, Some(ast::Node::AStar(_)))))
         }) {
@@ -955,7 +955,6 @@ fn named_as_before(sql: &str, edits: &[Edit], names: &[(usize, String)]) -> bool
     let targets: Vec<(i32, &str)> = tree
         .tree
         .nodes()
-        .into_iter()
         .filter_map(|(n, _)| match n {
             NodeRef::ResTarget(rt) => Some((rt.location, rt.name.as_str())),
             _ => None,
@@ -1078,7 +1077,7 @@ fn uncorrelated(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
         .chain(select.from_clause.iter())
         .all(|n| {
             n.as_ref().is_none_or(|n| {
-                n.nodes().iter().all(|(n, _)| match n {
+                n.nodes().all(|(n, _)| match n {
                     NodeRef::ColumnRef(c) => scope.resolve(ctx, c).is_some(),
                     NodeRef::SubLink(_) => false,
                     _ => true,
@@ -1097,7 +1096,7 @@ fn in_top_level_where(ctx: &Ctx<'_>, location: i32) -> bool {
         if matches!(node, NodeRef::SubLink(_) | NodeRef::SelectStmt(_)) {
             return false;
         }
-        node.children().into_iter().any(|c| reaches(c, at))
+        node.children().any(|c| reaches(c, at))
     }
     let [stmt] = ctx.tree.stmts.as_slice() else {
         return false;

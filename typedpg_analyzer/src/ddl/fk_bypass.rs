@@ -261,7 +261,7 @@ fn system_table(rv: &RangeVar) -> bool {
 /// module docs).
 fn bypasses(stmt: &ast::Node) -> bool {
     let target = |rv: Option<&RangeVar>| rv.is_some_and(system_table);
-    stmt.nodes().iter().any(|(n, _)| match n {
+    stmt.nodes().any(|(n, _)| match n {
         NodeRef::FuncCall(fc) => {
             let name: Vec<&str> = fc
                 .funcname
@@ -303,7 +303,6 @@ fn bypasses(stmt: &ast::Node) -> bool {
         // A view over a catalog: writes through it reach the catalog.
         NodeRef::ViewStmt(v) => v.query.as_ref().is_some_and(|q| {
             q.nodes()
-                .iter()
                 .any(|(n, _)| matches!(n, NodeRef::RangeVar(rv) if system_table(rv)))
         }),
         NodeRef::CreateSubscriptionStmt(_) | NodeRef::AlterSubscriptionStmt(_) => true,
@@ -332,7 +331,7 @@ fn aliases_sql_running_builtin(f: &typedpg_pg_query::ast::CreateFunctionStmt) ->
     let Some(body) = defelem("as") else {
         return false;
     };
-    body.nodes().iter().any(|(n, _)| match n {
+    body.nodes().any(|(n, _)| match n {
         NodeRef::String(s) => SQL_RUNNING_SYMBOLS
             .iter()
             .any(|sym| s.sval.trim().eq_ignore_ascii_case(sym)),

@@ -50,7 +50,7 @@ pub(crate) fn reusable(n: Option<&ast::Node>, scope: &Scope, snapshot: &PgCatalo
     let Some(root) = n else {
         return false;
     };
-    let nodes = Node::nodes(root);
+    let nodes: Vec<_> = Node::nodes(root).collect();
     let in_subquery = nodes
         .iter()
         .any(|(n, _)| matches!(n, NodeRef::SelectStmt(_)));

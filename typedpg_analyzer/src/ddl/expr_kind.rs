@@ -79,7 +79,6 @@ pub(crate) fn check_expr_kind(
         && (matches!(inner, ast::Node::SubLink(_))
             || inner
                 .nodes()
-                .into_iter()
                 .any(|(n, ..)| matches!(n, NodeRef::SubLink(_))))
     {
         return Err(DdlError::UnsupportedDdl(format!(
