@@ -130,6 +130,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         ..Scope::default()
     };
     target_scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
+    note_merge_privileges(merge, table_oid, &table_attrs);
     let mut source_scope = Scope {
         ctes: cte_scopes.clone(),
         ..Scope::default()
@@ -980,5 +981,73 @@ impl MergeArms<'_> {
             &[row],
             Overriding::from_kind(when.r#override),
         )
+    }
+}
+
+/// What a MERGE requires of its target (transformMergeStmt's
+/// `targetPerms`): the privilege of each action's command, INSERT on the
+/// columns an INSERT action lists (or the leading ones its VALUES fill),
+/// UPDATE on those an UPDATE action sets, and the defaults the INSERT
+/// actions leave columns to.
+fn note_merge_privileges(
+    merge: &ast::MergeStmt,
+    table_oid: crate::oid::PgClassOid,
+    table_attrs: &[crate::pg_catalog::PgAttribute],
+) {
+    use crate::ddl::acl::bits;
+    use crate::privileges::{ColumnAccess, note_column, note_default, note_relation};
+    for when_node in &merge.merge_when_clauses {
+        let Some(ast::Node::MergeWhenClause(when)) = when_node.as_ref() else {
+            continue;
+        };
+        match when.command_type {
+            CmdType::CmdInsert => {
+                note_relation(table_oid, bits::INSERT);
+                let names: Vec<String> = if when.target_list.is_empty() {
+                    table_attrs
+                        .iter()
+                        .filter(|a| a.attnum > 0)
+                        .take(when.values.len())
+                        .map(|a| a.attname.clone())
+                        .collect()
+                } else {
+                    when.target_list
+                        .iter()
+                        .filter_map(|t| match t.as_ref() {
+                            Some(ast::Node::ResTarget(rt)) => Some(rt.name.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                for name in &names {
+                    note_column(table_oid, name, ColumnAccess::Insert);
+                }
+                for a in table_attrs.iter().filter(|a| a.attnum > 0) {
+                    let defaulted = match names.iter().position(|n| *n == a.attname) {
+                        None => true,
+                        Some(i) => when
+                            .values
+                            .get(i)
+                            .is_some_and(|n| is_set_to_default(n.as_ref())),
+                    };
+                    if defaulted {
+                        note_default(table_oid, a.attnum);
+                    }
+                }
+            }
+            CmdType::CmdUpdate => {
+                note_relation(table_oid, bits::UPDATE);
+                for t in &when.target_list {
+                    if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
+                        note_column(table_oid, &rt.name, ColumnAccess::Update);
+                    }
+                }
+            }
+            CmdType::CmdDelete => note_relation(table_oid, bits::DELETE),
+            // DO NOTHING requires SELECT, so that the target relation is
+            // never one with no privileges to check at all.
+            CmdType::CmdNothing => note_relation(table_oid, bits::SELECT),
+            _ => {}
+        }
     }
 }

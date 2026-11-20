@@ -166,7 +166,8 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     Ok(())
 }
 
-/// Record view `relid`'s `security_barrier` option as `options` set it:
+/// Record view `relid`'s `security_barrier` and `security_invoker` options
+/// as `options` set them:
 /// with `replace` (the options replaced wholesale), an absent option is
 /// off; otherwise only the options listed change (`ALTER VIEW … SET`),
 /// to off when `reset`.
@@ -177,33 +178,38 @@ pub(crate) fn set_security_barrier(
     replace: bool,
     reset: bool,
 ) {
-    let given = options.iter().find_map(|o| match o.as_ref() {
-        Some(ast::Node::DefElem(de))
-            if de.defname == "security_barrier" && de.defnamespace.is_empty() =>
-        {
-            Some(
-                !reset
-                    && match de.arg.as_ref() {
-                        None => true,
-                        Some(ast::Node::String(s)) => {
-                            super::reloptions::parse_bool(&s.sval).unwrap_or(false)
-                        }
-                        Some(ast::Node::Boolean(b)) => b.boolval,
-                        Some(ast::Node::Integer(i)) => i.ival != 0,
-                        _ => false,
-                    },
-            )
+    for (option, invoker) in [("security_barrier", false), ("security_invoker", true)] {
+        let given = options.iter().find_map(|o| match o.as_ref() {
+            Some(ast::Node::DefElem(de)) if de.defname == option && de.defnamespace.is_empty() => {
+                Some(
+                    !reset
+                        && match de.arg.as_ref() {
+                            None => true,
+                            Some(ast::Node::String(s)) => {
+                                super::reloptions::parse_bool(&s.sval).unwrap_or(false)
+                            }
+                            Some(ast::Node::Boolean(b)) => b.boolval,
+                            Some(ast::Node::Integer(i)) => i.ival != 0,
+                            _ => false,
+                        },
+                )
+            }
+            _ => None,
+        });
+        let set = if invoker {
+            &mut interp.security_invoker_views
+        } else {
+            &mut interp.security_barrier_views
+        };
+        match given.or((replace).then_some(false)) {
+            Some(true) => {
+                set.insert(relid);
+            }
+            Some(false) => {
+                set.remove(&relid);
+            }
+            None => {}
         }
-        _ => None,
-    });
-    match given.or((replace).then_some(false)) {
-        Some(true) => {
-            interp.security_barrier_views.insert(relid);
-        }
-        Some(false) => {
-            interp.security_barrier_views.remove(&relid);
-        }
-        None => {}
     }
 }
 

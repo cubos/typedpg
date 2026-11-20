@@ -2797,6 +2797,25 @@ fn check_locking_clause(
             }
             locked.push(source);
         }
+        // applyLockingClause: a locked relation requires
+        // ACL_SELECT_FOR_UPDATE (UPDATE).
+        for source in &locked {
+            match source.kind {
+                SourceKind::Relation => {
+                    if let Some(relid) = source.relid {
+                        crate::privileges::note_lock(relid);
+                    }
+                }
+                // transformLockingClause pushes the clause into a FROM
+                // subquery: its relations are locked too.
+                SourceKind::Subquery { .. } => {
+                    for item in &sel.from_clause {
+                        note_subquery_locks(item, Some(&source.alias), scope, snapshot);
+                    }
+                }
+                _ => {}
+            }
+        }
         for source in &locked {
             if let SourceKind::Subquery {
                 lock_blocker: Some(blocker),
@@ -3108,4 +3127,69 @@ fn check_distinct_on_matches_order_by(
         return Err(err());
     }
     Ok(())
+}
+
+/// The relations a locking clause pushed into FROM subquery `alias` (any
+/// subquery when `None`, and every FROM item below the first) locks:
+/// transformLockingClause applies it to each relation of the subquery's
+/// range table and recurses into its own subqueries, joins included.
+fn note_subquery_locks(
+    item: &Option<ast::Node>,
+    alias: Option<&str>,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) {
+    match item.as_ref() {
+        Some(ast::Node::RangeSubselect(rs)) => {
+            let name = rs.alias.as_ref().map(|a| a.aliasname.as_str());
+            if alias.is_some() && name != alias {
+                return;
+            }
+            if let Some(ast::Node::SelectStmt(inner)) = rs.subquery.as_ref() {
+                for item in &inner.from_clause {
+                    note_locks_below(item, inner, scope, snapshot);
+                }
+            }
+        }
+        Some(ast::Node::JoinExpr(j)) => {
+            for side in [&j.larg, &j.rarg] {
+                note_subquery_locks(side, alias, scope, snapshot);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A FROM item of a subquery a locking clause was pushed into: a relation
+/// is locked, a join or subquery passes the lock on. A WITH query's name
+/// (the subquery's own, or the statement's) is no relation.
+fn note_locks_below(
+    item: &Option<ast::Node>,
+    sel: &ast::SelectStmt,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) {
+    match item.as_ref() {
+        Some(ast::Node::RangeVar(rv)) => {
+            let own_cte = sel.with_clause.as_ref().is_some_and(|w| {
+                w.ctes.iter().any(|c| {
+                    matches!(c.as_ref(), Some(ast::Node::CommonTableExpr(cte)) if cte.ctename == rv.relname)
+                })
+            });
+            if rv.schemaname.is_empty() && (own_cte || scope.ctes.contains_key(&rv.relname)) {
+                return;
+            }
+            let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
+            if let Some(class) = snapshot.resolve_table(schema, &rv.relname) {
+                crate::privileges::note_lock(class.oid);
+            }
+        }
+        Some(ast::Node::JoinExpr(j)) => {
+            for side in [&j.larg, &j.rarg] {
+                note_locks_below(side, sel, scope, snapshot);
+            }
+        }
+        Some(ast::Node::RangeSubselect(_)) => note_subquery_locks(item, None, scope, snapshot),
+        _ => {}
+    }
 }

@@ -142,6 +142,8 @@ mod function_resolution;
 mod grouping_sets;
 #[path = "query/json_operators.rs"]
 mod json_operators;
+#[path = "query/privileges.rs"]
+mod privileges;
 #[path = "query/recursive_ctes.rs"]
 mod recursive_ctes;
 #[path = "query/returning_old_new.rs"]

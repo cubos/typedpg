@@ -64,6 +64,11 @@ pub(crate) struct Roles {
     pub(crate) bootstrap: RoleId,
     /// The role the migrations run as while no `SET ROLE` is active.
     pub(crate) migrations_user: RoleId,
+    /// `ALTER ROLE r SET search_path`: the setting each role's new sessions
+    /// start with (pg_db_role_setting), by role.
+    pub(crate) search_paths: std::collections::HashMap<RoleId, Vec<String>>,
+    /// `ALTER ROLE ALL SET search_path`: every role's.
+    pub(crate) all_search_path: Option<Vec<String>>,
 }
 
 impl Default for Roles {
@@ -81,6 +86,8 @@ impl Roles {
             next_id: 1,
             bootstrap: RoleId(0),
             migrations_user: RoleId(0),
+            search_paths: std::collections::HashMap::new(),
+            all_search_path: None,
         };
         // Built-in roles first: their ids stay small and stable.
         roles.bootstrap = roles.add("postgres", false, true);
@@ -186,6 +193,7 @@ impl Roles {
         if let Some(role) = self.roles.remove(&id) {
             self.by_name.remove(&role.name);
         }
+        self.search_paths.remove(&id);
         self.memberships
             .retain(|m| m.role != id && m.member != id && m.grantor != id);
     }
@@ -287,6 +295,63 @@ pub(crate) fn resolve_role_spec(
         return Ok(interp.roles.migrations_user);
     }
     Ok(interp.roles.id_or_intern(&name))
+}
+
+/// `ALTER ROLE { r | ALL } [IN DATABASE d] SET / RESET ...`
+/// (AlterRoleSet): a setting for the role's new sessions. As for `ALTER
+/// DATABASE ... SET`, any database is taken as the application's. Only
+/// `search_path` matters: it decides what the role's statements resolve
+/// their unqualified names to.
+pub fn alter_role_set(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::ast::AlterRoleSetStmt,
+) -> Result<(), DdlError> {
+    use typedpg_pg_query::ast::VariableSetKind;
+    let role = match &stmt.role {
+        Some(spec) => Some(resolve_role_spec(interp, spec)?),
+        None => None,
+    };
+    let Some(set) = stmt.setstmt.as_ref() else {
+        return Ok(());
+    };
+    let kind = set.kind;
+    let value = if kind == VariableSetKind::VarResetAll {
+        None
+    } else {
+        // The parameter must exist and be settable, and a new value valid,
+        // as for SET.
+        if let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned()
+            && kind == VariableSetKind::VarSetValue
+            && let [arg] = set.args.as_slice()
+            && let Some(value) = session::const_arg_string(arg.as_ref())
+        {
+            super::guc::check_value(interp, &setting, &value)?;
+        }
+        if !set.name.eq_ignore_ascii_case("search_path") {
+            return Ok(());
+        }
+        match kind {
+            VariableSetKind::VarSetValue => match session::search_path_args(set) {
+                Some(names) => Some(names),
+                None => return Ok(()),
+            },
+            // FROM CURRENT: the migrations' session's value now.
+            VariableSetKind::VarSetCurrent => Some(interp.search_path_guc.effective().to_vec()),
+            _ => None,
+        }
+    };
+    match role {
+        Some(id) => match value {
+            Some(v) => {
+                interp.roles.search_paths.insert(id, v);
+            }
+            None => {
+                interp.roles.search_paths.remove(&id);
+            }
+        },
+        None => interp.roles.all_search_path = value,
+    }
+    Ok(())
 }
 
 /// The role the session acts as: `current_user`, or the migrations' user.

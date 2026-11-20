@@ -135,7 +135,13 @@ impl PgCatalog {
     /// implicitly prepended (PG §5.9.5).
     pub(crate) fn schemas_for_lookup(&self, schema: Option<&str>) -> Vec<PgNamespaceOid> {
         if let Some(name) = schema {
-            return self.namespace_oid(name).into_iter().collect();
+            let oid = self.namespace_oid(name);
+            // LookupExplicitNamespace: a schema named explicitly needs
+            // USAGE.
+            if let Some(oid) = oid {
+                crate::privileges::note_schema(oid);
+            }
+            return oid.into_iter().collect();
         }
         let mut out = Vec::with_capacity(self.search_path.len() + 2);
         // The temporary schema is searched first (recomputeNamespacePath),
@@ -678,6 +684,10 @@ impl PgCatalog {
         ) {
             Ok((result_type_oid, _)) => {
                 crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::operator(chosen.oid));
+                // ExecInitFunc runs the operator's function: EXECUTE.
+                if let Some(code) = chosen.oprcode {
+                    crate::privileges::note_routine(code, crate::privileges::RoutineKind::Function);
+                }
                 OperatorMatch::Found(ResolvedOperator {
                     left_type_oid: chosen.oprleft.map(|_| declared[0]),
                     declared_left_type_oid: chosen.oprleft,
