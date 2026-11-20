@@ -37,3 +37,10 @@ migrations = "./no_such_migrations"
 [package.metadata.typedpg.databases.roles.database]
 migrations = "./migrations_roles"
 roles = ["fixture_app"]
+
+# Two roles whose search paths resolve `items` differently: one sees
+# `alternate.items`, whose `x` is text; the other `public.items`, whose `x`
+# is an integer.
+[package.metadata.typedpg.databases.searchpath.database]
+migrations = "./migrations_searchpath"
+roles = ["sp_alt", "sp_public"]

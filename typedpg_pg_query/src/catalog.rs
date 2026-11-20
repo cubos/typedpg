@@ -61,6 +61,12 @@ pub trait Catalog {
     fn type_by_name(&self, namespace: u32, name: &str) -> Option<u32>;
     fn namespace_by_name(&self, name: &str) -> Option<u32>;
     fn namespace_name(&self, namespace: u32) -> Option<String>;
+    /// Note a schema looked up explicitly while PL/pgSQL compiled a function
+    /// body: its `DECLARE` section's declared types and `%TYPE` /
+    /// `%ROWTYPE` names, whose USAGE the first call requires. The signature
+    /// was resolved at `CREATE FUNCTION` and doesn't come here.
+    fn note_body_schema(&self, _namespace: u32) {}
+
     /// The schemas an unqualified name is looked up in, in order — the
     /// effective search path, `pg_catalog` included where it applies.
     fn search_path(&self) -> Vec<u32>;
@@ -112,6 +118,7 @@ pub(crate) struct CatalogFns {
     type_by_name: extern "C" fn(*mut c_void, u32, *const c_char) -> u32,
     namespace_by_name: extern "C" fn(*mut c_void, *const c_char) -> u32,
     namespace_name: extern "C" fn(*mut c_void, u32) -> *const c_char,
+    note_body_schema: extern "C" fn(*mut c_void, u32),
     search_path: extern "C" fn(*mut c_void, *mut u32, usize) -> usize,
     relation_by_name: extern "C" fn(*mut c_void, u32, *const c_char) -> u32,
     relation_type: extern "C" fn(*mut c_void, u32) -> u32,
@@ -208,6 +215,10 @@ extern "C" fn namespace_by_name(ctx: *mut c_void, name: *const c_char) -> u32 {
     })
 }
 
+extern "C" fn note_body_schema(ctx: *mut c_void, namespace: u32) {
+    with_session(ctx, (), |s| s.catalog.note_body_schema(namespace));
+}
+
 extern "C" fn namespace_name(ctx: *mut c_void, namespace: u32) -> *const c_char {
     with_session(ctx, std::ptr::null(), |s| {
         s.catalog
@@ -295,6 +306,7 @@ pub(crate) fn with_catalog<R>(catalog: &dyn Catalog, f: impl FnOnce(*const Catal
         type_by_name,
         namespace_by_name,
         namespace_name,
+        note_body_schema,
         search_path,
         relation_by_name,
         relation_type,

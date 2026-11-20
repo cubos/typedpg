@@ -474,13 +474,24 @@ impl Soundness {
     }
 
     /// Create the seeding helpers in the query session (once).
-    fn install(&mut self, client: &mut Client) {
+    pub(super) fn install(&mut self, client: &mut Client) {
         if !self.installed {
             client
                 .batch_execute(SEED_SQL)
                 .unwrap_or_else(|e| panic!("pg_sanity: installing seed.sql failed: {e:?}"));
             self.installed = true;
         }
+    }
+
+    /// Seed one fully filled row per table (as the superuser running `tx`)
+    /// for the role oracle's second execution, which reaches the checks only
+    /// rows run (a row trigger, a CHECK constraint, a generated expression).
+    /// Returns whether anything was inserted.
+    pub(super) fn seed_for_role(&mut self, tx: &mut Transaction<'_>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        !self.seed(tx, 2).inserts.is_empty()
     }
 
     /// Seed one row per table for `mode`, replaying this generation's plan
@@ -785,15 +796,24 @@ fn has_inner_promise(ty: &Type) -> bool {
     }
 }
 
-/// Whether `sql` is one plannable statement the oracle may run:
-/// SELECT / VALUES / INSERT / UPDATE / DELETE / MERGE (with or without
-/// WITH).
-/// Whether the role oracle may execute `sql` (see [`is_executable`]):
-/// CALL too, whose procedure's EXECUTE is checked as it runs.
+/// Whether the role oracle may execute `sql`: [`is_executable`] statements
+/// (which are also what EXPLAIN takes), plus CALL, whose procedure's EXECUTE
+/// is checked as it runs.
 pub(super) fn is_executable_by_role(sql: &str) -> bool {
-    let head = sql.trim_start().get(..4).unwrap_or("");
-    !UNSAFE_CALLS.iter().any(|c| sql.contains(c))
-        && (is_executable(sql) || head.eq_ignore_ascii_case("call"))
+    !UNSAFE_CALLS.iter().any(|c| sql.contains(c)) && (is_executable(sql) || is_call(sql))
+}
+
+/// Whether `sql` is a `CALL`, read from the parse tree (a leading comment or
+/// whitespace doesn't change it).
+fn is_call(sql: &str) -> bool {
+    use typedpg_pg_query::ast::Node;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return false;
+    };
+    let [raw] = parsed.tree.stmts.as_slice() else {
+        return false;
+    };
+    matches!(raw.stmt.as_ref(), Some(Node::CallStmt(_)))
 }
 
 fn is_executable(sql: &str) -> bool {

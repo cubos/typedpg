@@ -312,6 +312,18 @@ pub(crate) fn record_default_dependencies(
     for seq in sequences {
         record_default_sequence(interp, relid, attnum, seq);
     }
+    // The privileges each sequence function of the default needs when the
+    // default runs (`nextval`: USAGE or UPDATE, `currval`: SELECT or USAGE,
+    // `setval`: UPDATE) — a bare `'s'::regclass` constant names no function.
+    let mut perms = Vec::new();
+    if let Some(expr) = expr {
+        sequence_function_refs(interp, Some(expr), &mut perms);
+    }
+    if perms.is_empty() {
+        interp.default_sequence_perms.remove(&(relid, attnum));
+    } else {
+        interp.default_sequence_perms.insert((relid, attnum), perms);
+    }
     // Functions, operators, types, ... the expression refers to.
     if let Some(expr) = expr {
         let target = interp
@@ -365,8 +377,253 @@ pub(crate) fn forget_default_dependencies(
             && d.objsubid == attnum
             && d.deptype == DepType::Normal)
     });
+    interp.default_sequence_perms.remove(&(relid, attnum));
 }
 
+/// The sequences the `nextval` / `currval` / `setval` calls of `expr` name,
+/// with the privileges each needs (`do_setval` requires UPDATE). The
+/// expression runs through `expression_planner` first: a call in code the
+/// planner certainly drops (a dead CASE branch, a COALESCE argument after a
+/// constant) never runs.
+pub(crate) fn sequence_function_refs(
+    interp: &PgCatalog,
+    expr: Option<&ast::Node>,
+    out: &mut Vec<crate::privileges::SequencePrivileges>,
+) {
+    if let Some(inner) = expr {
+        walk_sequence_functions(inner.to_ref(), interp, false, out);
+    }
+}
+
+fn walk_sequence_functions(
+    n: typedpg_pg_query::NodeRef<'_>,
+    interp: &PgCatalog,
+    dead: bool,
+    out: &mut Vec<crate::privileges::SequencePrivileges>,
+) {
+    use typedpg_pg_query::NodeRef;
+    if dead {
+        return;
+    }
+    match n {
+        NodeRef::FuncCall(fc) => {
+            note_sequence_call(interp, fc, out);
+            for arg in &fc.args {
+                walk_sequence_node(arg.as_ref(), interp, false, out);
+            }
+        }
+        NodeRef::BoolExpr(b) => {
+            let deciding = match b.boolop {
+                typedpg_pg_query::ast::BoolExprType::AndExpr => Some(false),
+                typedpg_pg_query::ast::BoolExprType::OrExpr => Some(true),
+                _ => None,
+            };
+            let decided = deciding.filter(|&value| {
+                b.args.iter().any(|a| {
+                    crate::expr::plan_fold::certainly(a.as_ref(), interp)
+                        == crate::expr::plan_fold::Certain::Bool(value)
+                })
+            });
+            for arg in &b.args {
+                let dead = decided.is_some_and(|value| {
+                    crate::expr::plan_fold::certainly(arg.as_ref(), interp)
+                        != crate::expr::plan_fold::Certain::Bool(value)
+                });
+                walk_sequence_node(arg.as_ref(), interp, dead, out);
+            }
+        }
+        NodeRef::CoalesceExpr(c) => {
+            let mut stopped = false;
+            for arg in &c.args {
+                walk_sequence_node(arg.as_ref(), interp, stopped, out);
+                stopped |=
+                    crate::expr::plan_fold::certainly_non_null_constant(arg.as_ref(), interp);
+            }
+        }
+        NodeRef::CaseExpr(c) => {
+            // A simple CASE compares its test with each WHEN value: the
+            // WHEN is a value, not a condition. A searched CASE tests each
+            // WHEN directly.
+            if let Some(test) = c.arg.as_ref() {
+                walk_sequence_node(Some(test), interp, false, out);
+            }
+            let mut stopped = false;
+            for when in &c.args {
+                let Some(typedpg_pg_query::ast::Node::CaseWhen(when)) = when.as_ref() else {
+                    break;
+                };
+                if stopped {
+                    for part in when.expr.iter().chain(when.result.iter()) {
+                        walk_sequence_node(Some(part), interp, true, out);
+                    }
+                    continue;
+                }
+                if let Some(cond) = when.expr.as_ref() {
+                    walk_sequence_node(Some(cond), interp, false, out);
+                }
+                if let Some(test) = c.arg.as_ref() {
+                    match when.expr.as_ref().and_then(|v| {
+                        crate::expr::plan_fold::simple_case_equal(Some(test), Some(v))
+                    }) {
+                        Some(true) => {
+                            if let Some(result) = when.result.as_ref() {
+                                walk_sequence_node(Some(result), interp, false, out);
+                            }
+                            stopped = true;
+                        }
+                        Some(false) => {
+                            if let Some(result) = when.result.as_ref() {
+                                walk_sequence_node(Some(result), interp, true, out);
+                            }
+                        }
+                        None => {
+                            if let Some(result) = when.result.as_ref() {
+                                walk_sequence_node(Some(result), interp, false, out);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                match when
+                    .expr
+                    .as_ref()
+                    .map(|e| crate::expr::plan_fold::certainly(Some(e), interp))
+                {
+                    Some(
+                        crate::expr::plan_fold::Certain::Bool(false)
+                        | crate::expr::plan_fold::Certain::Null,
+                    ) => {
+                        if let Some(result) = when.result.as_ref() {
+                            walk_sequence_node(Some(result), interp, true, out);
+                        }
+                    }
+                    Some(crate::expr::plan_fold::Certain::Bool(true)) => {
+                        if let Some(result) = when.result.as_ref() {
+                            walk_sequence_node(Some(result), interp, false, out);
+                        }
+                        stopped = true;
+                    }
+                    _ => {
+                        if let Some(result) = when.result.as_ref() {
+                            walk_sequence_node(Some(result), interp, false, out);
+                        }
+                    }
+                }
+            }
+            if let Some(default) = c.defresult.as_ref() {
+                walk_sequence_node(Some(default), interp, stopped, out);
+            }
+        }
+        _ => {
+            for child in n.children() {
+                walk_sequence_functions(child, interp, false, out);
+            }
+        }
+    }
+}
+
+fn walk_sequence_node(
+    node: Option<&ast::Node>,
+    interp: &PgCatalog,
+    dead: bool,
+    out: &mut Vec<crate::privileges::SequencePrivileges>,
+) {
+    if let Some(inner) = node {
+        walk_sequence_functions(inner.to_ref(), interp, dead, out);
+    }
+}
+
+/// Record the sequence `fc` names, if it is a `nextval` / `currval` /
+/// `setval` call over a regclass constant.
+fn note_sequence_call(
+    interp: &PgCatalog,
+    fc: &typedpg_pg_query::ast::FuncCall,
+    out: &mut Vec<crate::privileges::SequencePrivileges>,
+) {
+    let Some(needed) = sequence_function_privileges(interp, fc) else {
+        return;
+    };
+    if let Some(first) = fc.args.first()
+        && let Some(text) = regclass_literal(first.as_ref())
+        && let Some(seq) = resolve_regclass(interp, text)
+        && !out.contains(&(seq, needed))
+    {
+        out.push((seq, needed));
+    }
+}
+
+/// The privileges the function `fc` calls needs of the sequence it names,
+/// when it resolves to `pg_catalog`'s `nextval` / `currval` / `setval` —
+/// `None` for another function (a user's same-named one, which the search
+/// path may put first) and for anything else.
+fn sequence_function_privileges(
+    interp: &PgCatalog,
+    fc: &typedpg_pg_query::ast::FuncCall,
+) -> Option<u32> {
+    use crate::ddl::acl::bits;
+    let parts: Vec<&str> = fc
+        .funcname
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, *name),
+        [schema, name] => (Some(*schema), *name),
+        _ => return None,
+    };
+    let needed = match name {
+        "nextval" => bits::USAGE | bits::UPDATE,
+        "currval" => bits::SELECT | bits::USAGE,
+        "setval" => bits::UPDATE,
+        _ => return None,
+    };
+    const REGCLASS: PgTypeOid = PgTypeOid::from_raw(2205);
+    let mut arg_types = Vec::with_capacity(fc.args.len());
+    for (i, arg) in fc.args.iter().enumerate() {
+        if i == 0 {
+            // The sequence argument is a regclass constant (an untyped
+            // literal, or a cast to regclass).
+            regclass_literal(arg.as_ref())?;
+            arg_types.push(REGCLASS);
+        } else {
+            arg_types.push(literal_argument_type(interp, arg.as_ref()).unwrap_or(oid::UNKNOWN));
+        }
+    }
+    let notation = crate::functions::CallNotation::of(fc).ok()?;
+    let resolved =
+        crate::functions::func_get_detail(interp, schema, name, &arg_types, &notation, None, None)
+            .ok()?;
+    let crate::functions::FuncDetail::Routine(routine) = resolved else {
+        return None;
+    };
+    let proc = interp.pg_proc.get(&routine.oid)?;
+    (Some(proc.pronamespace) == interp.pg_catalog_oid()).then_some(needed)
+}
+
+/// The type a literal argument of a sequence call has, as the parse tree
+/// writes it: an integer, a numeric, a boolean, a string (unknown) or an
+/// explicit cast.
+fn literal_argument_type(interp: &PgCatalog, arg: Option<&ast::Node>) -> Option<PgTypeOid> {
+    match arg? {
+        ast::Node::AConst(c) => {
+            if c.isnull {
+                return None;
+            }
+            match c.val.as_ref()? {
+                ast::AConstValue::Integer(_) => Some(oid::INT4),
+                ast::AConstValue::Float(_) => Some(oid::NUMERIC),
+                ast::AConstValue::Boolean(_) => Some(oid::BOOL),
+                ast::AConstValue::String(_) => Some(oid::UNKNOWN),
+                ast::AConstValue::BitString(_) => None,
+            }
+        }
+        ast::Node::TypeCast(tc) => super::util::resolve_type_name(tc.type_name.as_ref()?, interp),
+        _ => None,
+    }
+}
+
+/// The sequences `expr` names in a regclass literal, anywhere in the tree:
+/// what `pg_depend` records (dead branches included).
 fn collect_sequence_refs(
     interp: &PgCatalog,
     expr: Option<&ast::Node>,
@@ -375,18 +632,10 @@ fn collect_sequence_refs(
     let Some(inner) = expr else {
         return;
     };
-    match inner {
-        ast::Node::FuncCall(fc) => {
-            let name: Vec<&str> = fc
-                .funcname
-                .iter()
-                .filter_map(|n| super::util::node_string(n.as_ref()))
-                .collect();
-            let is_seq_fn = matches!(
-                name.as_slice(),
-                ["nextval" | "currval" | "setval"]
-                    | ["pg_catalog", "nextval" | "currval" | "setval"]
-            );
+    let mut todo = vec![inner.to_ref()];
+    while let Some(n) = todo.pop() {
+        if let typedpg_pg_query::NodeRef::FuncCall(fc) = n {
+            let is_seq_fn = sequence_function_privileges(interp, fc).is_some();
             if is_seq_fn
                 && let Some(first) = fc.args.first()
                 && let Some(text) = regclass_literal(first.as_ref())
@@ -394,24 +643,8 @@ fn collect_sequence_refs(
             {
                 out.push(seq);
             }
-            for arg in &fc.args {
-                collect_sequence_refs(interp, arg.as_ref(), out);
-            }
         }
-        ast::Node::TypeCast(tc) => {
-            collect_sequence_refs(interp, tc.arg.as_ref(), out);
-        }
-        ast::Node::AExpr(e) => {
-            for side in [&e.lexpr, &e.rexpr] {
-                collect_sequence_refs(interp, side.as_ref(), out);
-            }
-        }
-        ast::Node::CoalesceExpr(c) => {
-            for arg in &c.args {
-                collect_sequence_refs(interp, arg.as_ref(), out);
-            }
-        }
-        _ => {}
+        todo.extend(n.children());
     }
 }
 

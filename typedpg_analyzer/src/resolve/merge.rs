@@ -69,7 +69,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             return Err(crate::pgmsg::merge_with_recursive().finalize_implicit());
         }
         let owner = typedpg_pg_query::NodeRef::MergeStmt(merge);
-        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+        cte_scopes = super::cte::with_statement_owner(with, owner, snapshot, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
     }
@@ -184,11 +184,15 @@ pub(crate) fn analyze_merge_with_outer_ctes(
 
     let on_log = crate::nonnull::StrictLog::default();
     if let join_condition @ Some(_) = &merge.join_condition {
+        // transformMergeStmt transforms the ON condition as
+        // EXPR_KIND_JOIN_ON but never coerces it to boolean (unlike a
+        // join's `transformJoinOnClause`): PostgreSQL 18 accepts any type
+        // there, and the executor reads the datum as a boolean.
         expr::infer_expr(
             join_condition.as_ref(),
             expr::Ctx::new(&both, &null_ctx, snapshot).logging_strictness(&on_log),
             params,
-            TypeGoal::assignment(oid::BOOL),
+            TypeGoal::NONE,
         )?;
         // transformMergeStmt analyzes it as EXPR_KIND_JOIN_ON.
         crate::clause::check_no_aggregates_or_windows(
@@ -989,6 +993,7 @@ fn note_merge_privileges(
 ) {
     use crate::ddl::acl::bits;
     use crate::privileges::{ColumnAccess, note_column, note_default, note_relation};
+    crate::privileges::note_merge_target(table_oid);
     for when_node in &merge.merge_when_clauses {
         let Some(ast::Node::MergeWhenClause(when)) = when_node.as_ref() else {
             continue;
@@ -996,7 +1001,11 @@ fn note_merge_privileges(
         match when.command_type {
             CmdType::CmdInsert => {
                 note_relation(table_oid, bits::INSERT);
-                crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_INSERT);
+                crate::privileges::note_write(
+                    table_oid,
+                    crate::ddl::triggers::TRIGGER_TYPE_INSERT,
+                    false,
+                );
                 let names: Vec<String> = if when.target_list.is_empty() {
                     table_attrs
                         .iter()
@@ -1031,16 +1040,31 @@ fn note_merge_privileges(
             }
             CmdType::CmdUpdate => {
                 note_relation(table_oid, bits::UPDATE);
-                crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_UPDATE);
+                crate::privileges::note_write(
+                    table_oid,
+                    crate::ddl::triggers::TRIGGER_TYPE_UPDATE,
+                    !merge.relation.as_ref().is_some_and(|r| r.inh),
+                );
                 for t in &when.target_list {
                     if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
                         note_column(table_oid, &rt.name, ColumnAccess::Update);
+                        // `SET c = DEFAULT` runs the column's default
+                        // (rewriteTargetListIU over the MERGE action).
+                        if is_set_to_default(rt.val.as_ref())
+                            && let Some(a) = table_attrs.iter().find(|a| a.attname == rt.name)
+                        {
+                            note_default(table_oid, a.attnum);
+                        }
                     }
                 }
             }
             CmdType::CmdDelete => {
                 note_relation(table_oid, bits::DELETE);
-                crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_DELETE);
+                crate::privileges::note_write(
+                    table_oid,
+                    crate::ddl::triggers::TRIGGER_TYPE_DELETE,
+                    !merge.relation.as_ref().is_some_and(|r| r.inh),
+                );
             }
             // DO NOTHING requires SELECT, so that the target relation is
             // never one with no privileges to check at all.

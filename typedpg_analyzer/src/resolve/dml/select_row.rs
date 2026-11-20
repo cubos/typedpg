@@ -95,7 +95,7 @@ pub(super) fn sure_row_violation(
         }
         _ => Known::Unknown,
     };
-    violations.extend(row_violation(tgt, &items, &known, snapshot));
+    violations.extend(row_violation(tgt, &items, &known, snapshot, tgt.oid));
     violations
         .into_iter()
         .min_by_key(|v| v.order)

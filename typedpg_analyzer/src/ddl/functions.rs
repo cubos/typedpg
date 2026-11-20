@@ -49,9 +49,9 @@ pub(crate) enum RoutineSource {
     /// A `LANGUAGE sql` body given as a string (`AS $$ ... $$`).
     SqlText(String),
     /// A SQL-standard body (`BEGIN ATOMIC ... END` / `RETURN ...`),
-    /// already parsed: PG stores it parsed, and the statements were
-    /// analyzed at CREATE FUNCTION.
-    SqlStandard(Vec<typedpg_pg_query::ast::Node>),
+    /// resolved at CREATE FUNCTION: PG stores it analyzed, and what it
+    /// requires is fixed then (by OID).
+    SqlStandard(Box<crate::privileges::Requirements>),
     /// A `LANGUAGE plpgsql` body: the `CREATE FUNCTION` statement as
     /// written, which PL/pgSQL's compiler reads (through
     /// `parse_plpgsql`) for its parameter and variable declarations.
@@ -342,6 +342,33 @@ fn check_set_item(interp: &PgCatalog, item: &ast::Node) -> Result<(), DdlError> 
     Ok(())
 }
 
+/// What a routine's parameter DEFAULT expression runs, and which parameter
+/// it fills: `add_function_defaults` / `reorder_function_arguments` insert
+/// only the defaults of the parameters a call leaves out.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RoutineDefault {
+    /// The parameter's position in `proargtypes` (0-based).
+    pub param: usize,
+    /// The functions the DEFAULT expression runs.
+    pub procs: Vec<crate::oid::PgProcOid>,
+    /// The sequences its `nextval` / `currval` / `setval` name, with the
+    /// privileges each needs.
+    pub sequences: Vec<crate::privileges::SequencePrivileges>,
+    /// The expression certainly is the NULL constant: a strict function
+    /// called with it is NULL before its body or its other arguments run
+    /// (`evaluate_function`).
+    pub null: bool,
+    /// The routines and sequences the expression certainly runs: `procs`
+    /// and `sequences` keep the functions of code the planner folds (a
+    /// dead CASE branch), which `add_function_defaults` drops.
+    pub live_procs: Vec<crate::oid::PgProcOid>,
+    pub live_sequences: Vec<crate::privileges::SequencePrivileges>,
+    /// Everything the expression's analysis required: a call that never
+    /// evaluates the default still simplifies it (an `IMMUTABLE` call over
+    /// constants in it runs, see `privileges::keep_default_simplified`).
+    pub live: crate::privileges::Requirements,
+}
+
 /// The parameter list of a routine as `interpret_function_parameter_list`
 /// reads it.
 pub(crate) struct ParameterList {
@@ -362,6 +389,9 @@ pub(crate) struct ParameterList {
     pub default_refs: Vec<super::depend::Reference>,
     /// The functions the DEFAULT expressions run.
     pub default_procs: Vec<crate::oid::PgProcOid>,
+    /// Per defaulted parameter, in declaration order: what inserting its
+    /// default runs.
+    pub defaults_data: Vec<RoutineDefault>,
     /// Whether any parameter has an OUT or VARIADIC mode (PG then stores
     /// `proallargtypes` / `proargmodes`).
     pub has_modes: bool,
@@ -385,6 +415,7 @@ pub(crate) fn interpret_function_parameter_list(
         required_result: None,
         default_refs: Vec::new(),
         default_procs: Vec::new(),
+        defaults_data: Vec::new(),
         has_modes: false,
     };
     let mut out_count = 0;
@@ -517,7 +548,36 @@ pub(crate) fn interpret_function_parameter_list(
                         expr.as_ref(),
                         toid,
                     ));
-                list.default_procs.extend(used.into_inner());
+                let procs = used.into_inner();
+                let mut sequences = Vec::new();
+                super::defaults::sequence_function_refs(interp, expr.as_ref(), &mut sequences);
+                let null = matches!(
+                    crate::expr::plan_fold::certainly(expr.as_ref(), interp),
+                    crate::expr::plan_fold::Certain::Null
+                );
+                // What the default runs for real: the planner drops the
+                // functions of its dead code, and those need no EXECUTE.
+                let (_, live) = crate::privileges::collect(|| {
+                    let scope = crate::scope::Scope::default();
+                    let null_ctx = crate::nullability::NullabilityContext::default();
+                    let mut params = crate::param_collector::ParamCollector::default();
+                    let _ = crate::expr::infer_expr(
+                        expr.as_ref(),
+                        crate::expr::Ctx::new(&scope, &null_ctx, interp),
+                        &mut params,
+                        crate::expr::TypeGoal::NONE,
+                    );
+                });
+                list.defaults_data.push(RoutineDefault {
+                    param: list.in_types.len() - 1,
+                    procs: procs.clone(),
+                    sequences,
+                    null,
+                    live_procs: live.routines.iter().map(|(oid, _)| *oid).collect(),
+                    live_sequences: live.sequences.clone(),
+                    live,
+                });
+                list.default_procs.extend(procs);
                 have_defaults = true;
             }
             None => {
@@ -676,6 +736,13 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     interp
         .proc_default_procs
         .insert(proc.oid, params.default_procs.clone());
+    if params.defaults_data.is_empty() {
+        interp.routine_defaults.remove(&proc.oid);
+    } else {
+        interp
+            .routine_defaults
+            .insert(proc.oid, params.defaults_data.clone());
+    }
     // A replaced body replaces what was inlined of the old one.
     match super::function_body::inlinable_body(stmt, &proc) {
         Some(body) => {
@@ -747,9 +814,12 @@ fn record_routine_body(
     let security_definer = attrs.common.security.and_then(def_bool).unwrap_or(false);
     let search_path = routine_search_path(interp, &attrs.common.set_items, None);
     let source = if let Some(body) = stmt.sql_body.as_ref() {
-        Some(RoutineSource::SqlStandard(
-            super::function_body::atomic_body_statements(body),
-        ))
+        // PG stores an SQL-standard body analyzed (`prosqlbody`): what it
+        // runs is what the creation `search_path` resolved now.
+        let statements = super::function_body::atomic_body_statements(body);
+        Some(RoutineSource::SqlStandard(Box::new(
+            crate::privileges::resolve_sql_standard_body(interp, &statements, proc),
+        )))
     } else {
         let text = attrs.as_clause.and_then(|de| {
             match de.arg.as_ref()? {
@@ -1531,6 +1601,9 @@ pub(crate) fn rename_routine(
         return Ok(());
     };
     check_no_function_in_namespace(interp, &stmt.newname, &proc.proargtypes, proc.pronamespace)?;
+    // A stored policy expression calls the routine by name: follow it.
+    let schema = interp.namespace_name(proc.pronamespace).map(str::to_owned);
+    crate::ddl::policies::rewrite_function_refs(interp, oid, schema.as_deref(), &stmt.newname);
     interp.rename_pg_proc(oid, stmt.newname.clone(), proc.pronamespace);
     Ok(())
 }
@@ -1557,6 +1630,9 @@ pub(crate) fn set_routine_schema(
         return Ok(());
     };
     check_no_function_in_namespace(interp, &proc.proname, &proc.proargtypes, new_nsoid)?;
+    // A stored policy expression calls the routine by name: follow it.
+    let schema = interp.namespace_name(new_nsoid).map(str::to_owned);
+    crate::ddl::policies::rewrite_function_refs(interp, oid, schema.as_deref(), &proc.proname);
     interp.rename_pg_proc(oid, proc.proname.clone(), new_nsoid);
     Ok(())
 }

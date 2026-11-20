@@ -33,6 +33,21 @@ fn conditions_name_their_clause_when_not_boolean() {
     );
 }
 
+#[test]
+fn the_on_condition_is_not_coerced_to_boolean() {
+    // transformMergeStmt transforms ON as EXPR_KIND_JOIN_ON without
+    // coerce_to_boolean: PostgreSQL 18.7 prepares and runs a MERGE whose ON
+    // is an integer or text (found by the differential fuzzer).
+    let db = setup();
+    for sql in [
+        "MERGE INTO t USING s ON t.id + s.id WHEN MATCHED THEN DELETE \
+         WHEN NOT MATCHED THEN DO NOTHING",
+        "MERGE INTO t USING s ON t.w WHEN MATCHED THEN DO NOTHING",
+    ] {
+        db.analyze(sql).unwrap();
+    }
+}
+
 // ── WHEN-clause visibility (PG's setNamespaceForMergeWhen) ───────────────────
 
 #[test]

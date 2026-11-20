@@ -77,11 +77,24 @@ pub fn create_extension(
 
     let target_version = extract_option(&stmt.options, "new_version")
         .unwrap_or_else(|| ext.default_version.to_owned());
-    // CreateExtensionInternal: the SCHEMA given, which must exist, or the
-    // creation schema.
-    let target_schema = match extract_option(&stmt.options, "schema") {
-        Some(schema) => schema,
-        None => super::util::creation_schema(interp)?,
+    // CreateExtensionInternal: a control file's fixed `schema` wins — giving
+    // another one is an error — else the SCHEMA given, which must exist, or
+    // the creation schema.
+    let target_schema = match fixed_schema(name) {
+        Some(schema) => {
+            if let Some(given) = extract_option(&stmt.options, "schema")
+                && given != schema
+            {
+                return Err(DdlError::ExtensionError(format!(
+                    "extension \"{name}\" must be installed in schema \"{schema}\""
+                )));
+            }
+            schema.to_owned()
+        }
+        None => match extract_option(&stmt.options, "schema") {
+            Some(schema) => schema,
+            None => super::util::creation_schema(interp)?,
+        },
     };
     let target_nsoid = super::util::existing_namespace(interp, &target_schema)?;
 
@@ -354,6 +367,12 @@ pub(crate) fn outside_postgres_image(name: &str) -> bool {
 /// but these.
 fn relocatable(name: &str) -> bool {
     !matches!(name, "plpgsql" | "xml2")
+}
+
+/// The control files' `schema`: extensions that must be installed in one
+/// schema (plpgsql.control: `schema = pg_catalog`).
+fn fixed_schema(name: &str) -> Option<&'static str> {
+    (name == "plpgsql").then_some("pg_catalog")
 }
 
 /// The control files' `requires`: extensions that must be installed first.

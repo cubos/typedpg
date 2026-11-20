@@ -1143,12 +1143,14 @@ pub(crate) fn set_identity(
             ast::Node::Constraint(c) => c.options.clone(),
             _ => Vec::new(),
         };
+        let owner = interp.owner_of(crate::ddl::acl::AclObject::Relation(relid));
         crate::ddl::sequences::create_owned_sequence(
             interp,
             relid,
             attnum,
             crate::pg_catalog::DepType::Internal,
             &options,
+            owner,
         )?;
     }
     for child in identity_partitions(interp, relid, rec) {
@@ -1420,12 +1422,14 @@ fn add_column_to(
     if !rec.recursing
         && let Some(deptype) = col.owned_sequence
     {
+        let owner = interp.owner_of(crate::ddl::acl::AclObject::Relation(relid));
         crate::ddl::sequences::create_owned_sequence(
             interp,
             relid,
             next_attnum,
             deptype,
             &col.identity_options,
+            owner,
         )?;
     }
     // The generation expression, now that the column exists.

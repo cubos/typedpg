@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use serde_json::{Value, json};
 use typedpg_analyzer::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedQuery, LocatedError, PgCatalog, SpreadKind, Type,
-    ValuesItem, ValuesList,
+    ValuesItem, ValuesList, first_difference,
 };
 
 use crate::scan::Kind;
@@ -67,8 +67,12 @@ impl From<LocatedError> for GenError {
 }
 
 /// Analyze `text` and generate its entries. `roles` are the database's
-/// configured roles: each is also checked against the query, and the first
-/// that may not run it is the error (`PgCatalog::analyze_as`). A COPY
+/// configured roles: the query is analyzed as the first of them (or as the
+/// schema's owner when there are none) and generated from that analysis, so
+/// the role's search path decides what its unqualified names mean. Every
+/// other role's analysis must agree on the types — a query one may run but
+/// another resolves to different types cannot be generated — and a role that
+/// may not run the query is the error (`PgCatalog::analyze_as`). A COPY
 /// target's privileges are not modeled, so its roles are not checked.
 pub fn generate(
     catalog: &PgCatalog,
@@ -80,10 +84,21 @@ pub fn generate(
     mapper.used.borrow_mut().clear();
     let mut g = match kind {
         Kind::Query => {
-            let analyzed = catalog.analyze_located(text)?;
-            for role in roles {
-                catalog.analyze_as_located(text, role)?;
-            }
+            let analyzed = if roles.is_empty() {
+                catalog.analyze_located(text)?
+            } else {
+                let mut analyses = Vec::with_capacity(roles.len());
+                for role in roles {
+                    analyses.push((role.as_str(), catalog.analyze_as_located(text, role)?));
+                }
+                let (first_role, first) = &analyses[0];
+                for (role, analysis) in &analyses[1..] {
+                    if let Some(difference) = first_difference(first, analysis) {
+                        return Err(GenError::plain(difference.message(first_role, role)));
+                    }
+                }
+                analyses.remove(0).1
+            };
             generate_query(&analyzed, mapper)
         }
         Kind::CopyIn => generate_copy_in(&catalog.analyze_copy_in_located(text)?, mapper),
@@ -527,8 +542,17 @@ mod tests {
     }
 
     fn run_as(kind: Kind, sql: &str, roles: &[String]) -> Result<Generated, GenError> {
+        run_with_ddl(DDL, kind, sql, roles)
+    }
+
+    fn run_with_ddl(
+        ddl: &str,
+        kind: Kind,
+        sql: &str,
+        roles: &[String],
+    ) -> Result<Generated, GenError> {
         let mut c = PgCatalog::new().unwrap();
-        c.apply_migration("0001.sql", DDL).unwrap();
+        c.apply_migration("0001.sql", ddl).unwrap();
         let overrides = HashMap::new();
         let mapper = TypeMapper {
             overrides: &overrides,
@@ -756,6 +780,65 @@ mod tests {
             run_as(Kind::CopyIn, "users (id, name)", &["nobody".to_owned()]).is_ok(),
             "a COPY target is not checked against roles"
         );
+    }
+
+    /// Two roles whose `search_path`s make `items` resolve to tables with
+    /// different `x` columns.
+    const SEARCH_PATHS: &str = "
+        CREATE ROLE path_alt;
+        CREATE ROLE path_public;
+        CREATE SCHEMA alternate;
+        CREATE TABLE public.items (id int4 PRIMARY KEY, x int4 NOT NULL);
+        CREATE TABLE alternate.items (id int4 PRIMARY KEY, x text NOT NULL);
+        GRANT USAGE ON SCHEMA alternate TO path_alt;
+        GRANT SELECT ON public.items TO path_alt, path_public;
+        GRANT SELECT ON alternate.items TO path_alt;
+        ALTER ROLE path_alt SET search_path = alternate, public;
+        ALTER ROLE path_public SET search_path = public;
+    ";
+
+    /// The generated types are those of the role's own resolution: the
+    /// alternate table's `x` is text, the public one's is an integer.
+    #[test]
+    fn the_role_search_path_decides_the_generated_types() {
+        let g = run_with_ddl(
+            SEARCH_PATHS,
+            Kind::Query,
+            "SELECT x FROM items",
+            &["path_alt".to_owned()],
+        )
+        .unwrap();
+        assert!(g.types.contains("x: string;"), "{}", g.types);
+
+        let g = run_with_ddl(
+            SEARCH_PATHS,
+            Kind::Query,
+            "SELECT x FROM items",
+            &["path_public".to_owned()],
+        )
+        .unwrap();
+        assert!(g.types.contains("x: number;"), "{}", g.types);
+    }
+
+    /// One module has one type per query: roles that resolve the same
+    /// statement to different types cannot both be described by it.
+    #[test]
+    fn roles_that_resolve_the_query_differently_are_an_error() {
+        let e = run_with_ddl(
+            SEARCH_PATHS,
+            Kind::Query,
+            "SELECT x FROM items",
+            &["path_alt".to_owned(), "path_public".to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            e.message,
+            "query resolves differently for roles \"path_alt\" and \"path_public\": column \"x\" \
+             is text for \"path_alt\" and integer for \"path_public\" (the roles' search_path \
+             settings differ)"
+        );
+        // A disagreement is about the query, not a position in it.
+        assert_eq!(e.offset, None);
     }
 
     #[test]

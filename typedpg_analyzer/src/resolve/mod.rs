@@ -1633,6 +1633,9 @@ pub(crate) fn planned_only<R>(f: impl FnOnce() -> R) -> R {
         Execution::NotRun => Execution::NotRun,
         _ => Execution::Planned,
     };
+    if mode == Execution::Planned {
+        crate::privileges::note_planned_statement();
+    }
     with_execution(mode, f)
 }
 
@@ -1816,7 +1819,7 @@ mod select;
 mod set_ops;
 mod target_list;
 mod type_resolution;
-mod walk;
+pub(crate) mod walk;
 mod written_row;
 
 // Re-export submodule items at the `resolve` path so intra-crate callers

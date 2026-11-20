@@ -159,6 +159,7 @@ fn body_scope(proc: &crate::pg_catalog::PgProc, bound: &[ExprType]) -> Option<cr
             elem_nullable: t.elem_nullable,
             refine: t.refine.clone(),
             origin: None,
+            output: None,
         })
         .collect();
     let mut scope = crate::scope::Scope::default();

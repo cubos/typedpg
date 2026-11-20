@@ -120,6 +120,10 @@ pub(crate) struct ResolvedFunction {
     /// notation; a named argument binds by name (`string_agg(delimiter =>
     /// ',', value => x)` binds its first argument to parameter 1).
     pub arg_positions: Vec<usize>,
+    /// The parameters the call leaves to their DEFAULT expressions
+    /// (`add_function_defaults` / `reorder_function_arguments`), as
+    /// positions in the declared parameter list.
+    pub default_params: Vec<usize>,
 }
 
 impl ResolvedFunction {
@@ -393,6 +397,7 @@ pub(crate) fn func_get_detail(
         nvargs: cand.nvargs,
         provariadic: f.provariadic,
         arg_positions: cand.arg_positions.clone(),
+        default_params: cand.default_params.clone(),
         return_type_oid,
         arg_types: declared,
         schema: snapshot

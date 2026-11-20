@@ -120,6 +120,15 @@ fn analyze_insert_here(
         } else {
             let (selected, column_types) =
                 analyze_insert_select(val_sel, &ins.cols, &tgt, snapshot, params, &cte_scopes)?;
+            // Each output's type: the assignment to its column coerces the
+            // value to the column's type unless they already agree.
+            for (i, ty) in column_types.iter().enumerate() {
+                if let Some(tc) = target_col_at(&tgt, i)
+                    && tgt.col_indirection.get(i).is_none_or(Vec::is_empty)
+                {
+                    crate::privileges::note_column_value(tgt.oid, &tc.attname, Some(*ty));
+                }
+            }
             if !val_sel.values_lists.is_empty()
                 && let Some(e) = general_values_violation(val_sel, &tgt, &column_types, snapshot)
             {
@@ -180,7 +189,7 @@ fn analyze_insert_here(
     // still go to no partition. (Executing it fails after planning folded
     // the defaults above.)
     if ins.select_stmt.is_none()
-        && let Some(v) = row_violation(&tgt, &[], &|_| Known::Unknown, snapshot)
+        && let Some(v) = row_violation(&tgt, &[], &|_| Known::Unknown, snapshot, tgt.oid)
     {
         return Err(v.error);
     }
@@ -698,7 +707,7 @@ fn build_insert_cte_scopes(
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &ins.with_clause {
         let owner = typedpg_pg_query::NodeRef::InsertStmt(ins);
-        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+        cte_scopes = super::cte::with_statement_owner(with, owner, snapshot, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
     }
@@ -723,7 +732,8 @@ fn note_written_columns(tgt: &InsertTarget, width: usize) {
 /// leaves to them, which run with the statement (rewriteTargetListIU).
 fn note_insert_privileges(ins: &ast::InsertStmt, tgt: &InsertTarget, width: usize) {
     crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::INSERT);
-    crate::privileges::note_write(tgt.oid, crate::ddl::triggers::TRIGGER_TYPE_INSERT);
+    // INSERT has no ONLY form: it never routes into inheritance children.
+    crate::privileges::note_write(tgt.oid, crate::ddl::triggers::TRIGGER_TYPE_INSERT, false);
     for i in 0..width {
         if let Some(c) = target_col_at(tgt, i) {
             crate::privileges::note_column(
@@ -987,6 +997,24 @@ fn analyze_insert_values(
                 }
                 None => expr::infer_expr(val.as_ref(), ctx, params, goal)?,
             };
+            // The assignment's value type: `coerce_type` skips its domain
+            // coercion when it already is the column's type.
+            if !is_set_to_default(val.as_ref())
+                && !indirected
+                && let Some(tc) = target_col
+            {
+                crate::privileges::note_column_value(tgt.oid, &tc.attname, Some(inferred.type_oid));
+            }
+            // A parameter of a domain type is received through the domain's
+            // input / receive function (domain_in / domain_recv), which
+            // evaluates its checks however it is sent.
+            if matches!(val.as_ref(), Some(ast::Node::ParamRef(_)))
+                && snapshot
+                    .get_type(inferred.type_oid)
+                    .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Domain)
+            {
+                crate::privileges::note_domain_coercion(inferred.type_oid);
+            }
             row_written.push(match target_col {
                 _ if is_set_to_default(val.as_ref()) => None,
                 // A value stored inside the column says nothing of it.
@@ -1008,7 +1036,7 @@ fn analyze_insert_values(
                 Some(tc) if is_null_value(items[i], tc, None, snapshot) => Known::Null,
                 _ => Known::Value(items[i]),
             };
-            violation = row_violation(tgt, &items, &known, snapshot);
+            violation = row_violation(tgt, &items, &known, snapshot, tgt.oid);
         }
         written.push(row_written);
     }
@@ -1085,6 +1113,7 @@ fn row_violation<'a>(
     items: &[Option<&'a ast::Node>],
     known: &dyn Fn(usize) -> Known<'a>,
     snapshot: &PgCatalog,
+    statement_target: crate::oid::PgClassOid,
 ) -> Option<RowViolation> {
     if returning_rewritten(snapshot, tgt.oid, &[DmlEvent::Insert]) {
         return None;
@@ -1099,9 +1128,9 @@ fn row_violation<'a>(
                 Known::Unknown
             }
         };
-        return row_violation(&base, &base_items, &known, snapshot);
+        return row_violation(&base, &base_items, &known, snapshot, statement_target);
     }
-    let (lands_in, unrouted) = row_relation(tgt, items, known, snapshot);
+    let (lands_in, unrouted) = row_relation(tgt, items, known, snapshot, statement_target);
     let mut violations: Vec<RowViolation> = unrouted.into_iter().collect();
     for (i, val) in items.iter().enumerate() {
         let Some(tc) = target_col_at(tgt, i) else {
@@ -1296,6 +1325,7 @@ fn row_relation<'a>(
     items: &[Option<&'a ast::Node>],
     known: &dyn Fn(usize) -> Known<'a>,
     snapshot: &PgCatalog,
+    statement_target: crate::oid::PgClassOid,
 ) -> ((crate::oid::PgClassOid, String), Option<RowViolation>) {
     // A column's value in the row: given, or its default when that is NULL
     // (`Some(None)` for NULL); `None` when unknown.
@@ -1317,6 +1347,17 @@ fn row_relation<'a>(
     };
     use crate::ddl::tables::partbound::Route;
     let route = crate::ddl::tables::partbound::route_row(snapshot, tgt.oid, &value_of);
+    // The planner prunes the result relations the rows certainly reach:
+    // only their generated columns, checks and triggers are initialized.
+    // The route itself is the statement's target's (the view's, when the
+    // row is stored in a base relation): `expand_views` hands it to the
+    // base, whose target RTE carries it.
+    match route {
+        Route::Leaf(leaf) => crate::privileges::note_insert_route(statement_target, leaf),
+        Route::NoPartition(_) | Route::Unknown => {
+            crate::privileges::note_insert_route_unknown(statement_target);
+        }
+    }
     let lands_in = route
         .leaf()
         .filter(|&leaf| leaf != tgt.oid)
@@ -1907,7 +1948,7 @@ fn general_values_violation(
                 }
                 _ => Known::Unknown,
             };
-            row_violation(tgt, items, &known, snapshot)
+            row_violation(tgt, items, &known, snapshot, tgt.oid)
         })
         .collect();
     let stored = rows.len().saturating_sub(offset).min(limit);
@@ -2017,9 +2058,11 @@ fn analyze_insert_on_conflict(
         crate::ddl::depend::note_column(tgt.oid, &a.attname);
     }
     // DO UPDATE requires UPDATE of the columns its SET list writes, and
-    // fires the UPDATE triggers.
+    // fires the UPDATE triggers. Its auxiliary UPDATE also applies the
+    // target's UPDATE policies (`root->onConflict->action`).
     crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::UPDATE);
-    crate::privileges::note_write(tgt.oid, crate::ddl::triggers::TRIGGER_TYPE_UPDATE);
+    crate::privileges::note_conflict_update(tgt.oid);
+    crate::privileges::note_write(tgt.oid, crate::ddl::triggers::TRIGGER_TYPE_UPDATE, false);
     for t in &on_conflict.target_list {
         if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
             crate::privileges::note_column(
@@ -2101,7 +2144,7 @@ fn transform_on_conflict_arbiter(
                 elem_attnum = Some(a.attnum);
                 // The inference element is a Var of the column, read.
                 crate::ddl::depend::note_column(tgt.oid, &a.attname);
-                crate::privileges::note_column_by_name(tgt.oid, &a.attname);
+                crate::privileges::note_target_column_by_name(tgt.oid, &a.attname, false);
             } else if let Some(&(_, _, attnum)) = crate::pg_catalog::SYSTEM_COLUMNS
                 .iter()
                 .find(|(n, ..)| *n == ie.name)
@@ -2198,7 +2241,7 @@ fn transform_on_conflict_arbiter(
             crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::SELECT);
             for attnum in &c.conkey {
                 if let Some(a) = tgt.attrs.iter().find(|a| a.attnum == *attnum) {
-                    crate::privileges::note_column_by_name(tgt.oid, &a.attname);
+                    crate::privileges::note_target_column_by_name(tgt.oid, &a.attname, false);
                 }
             }
             return Ok(arbiter);
@@ -2334,7 +2377,11 @@ fn analyze_update_here(
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
     // The columns the UPDATE writes.
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::UPDATE);
-    crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_UPDATE);
+    crate::privileges::note_write(
+        table_oid,
+        crate::ddl::triggers::TRIGGER_TYPE_UPDATE,
+        !relation.inh,
+    );
     for target in &upd.target_list {
         if let Some(ast::Node::ResTarget(rt)) = target.as_ref() {
             crate::ddl::depend::note_column(table_oid, &rt.name);
@@ -2358,7 +2405,7 @@ fn analyze_update_here(
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &upd.with_clause {
         let owner = typedpg_pg_query::NodeRef::UpdateStmt(upd);
-        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+        cte_scopes = super::cte::with_statement_owner(with, owner, snapshot, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
     }
@@ -2407,12 +2454,16 @@ fn analyze_update_here(
     let mut old_facts: Option<crate::nonnull::Facts> = None;
     if let where_clause @ Some(_) = &upd.where_clause {
         let log = crate::nonnull::StrictLog::default();
-        crate::clause::coerce_clause_expr(
-            where_clause.as_ref(),
-            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
-            params,
-            crate::clause::ClauseKind::Where,
-        )?;
+        // `estimate_expression_value` reduces a pseudoconstant side of a
+        // restriction while estimating it.
+        expr::plan_fold::with_estimated_qual(where_clause.as_ref(), &scope, snapshot, || {
+            crate::clause::coerce_clause_expr(
+                where_clause.as_ref(),
+                expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+                params,
+                crate::clause::ClauseKind::Where,
+            )
+        })?;
         check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
         // The FROM entries keep what WHERE saw. The target's new row keeps
         // it only in the columns nothing rewrites: not SET, not generated
@@ -2601,7 +2652,11 @@ fn analyze_delete_here(
     let table_oid = table.oid;
     // transformDeleteStmt: the target requires DELETE.
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
-    crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_DELETE);
+    crate::privileges::note_write(
+        table_oid,
+        crate::ddl::triggers::TRIGGER_TYPE_DELETE,
+        !relation.inh,
+    );
     let table_relname = table.relname.clone();
     let table_nsname = snapshot
         .namespace_name(table.relnamespace)
@@ -2614,7 +2669,7 @@ fn analyze_delete_here(
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &del.with_clause {
         let owner = typedpg_pg_query::NodeRef::DeleteStmt(del);
-        cte_scopes = super::cte::with_statement_owner(with, owner, || {
+        cte_scopes = super::cte::with_statement_owner(with, owner, snapshot, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
     }
@@ -2662,12 +2717,14 @@ fn analyze_delete_here(
     let mut old_facts: Option<crate::nonnull::Facts> = None;
     if let where_clause @ Some(_) = &del.where_clause {
         let log = crate::nonnull::StrictLog::default();
-        crate::clause::coerce_clause_expr(
-            where_clause.as_ref(),
-            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
-            params,
-            crate::clause::ClauseKind::Where,
-        )?;
+        expr::plan_fold::with_estimated_qual(where_clause.as_ref(), &scope, snapshot, || {
+            crate::clause::coerce_clause_expr(
+                where_clause.as_ref(),
+                expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+                params,
+                crate::clause::ClauseKind::Where,
+            )
+        })?;
         check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
         // RETURNING reads the deleted row as WHERE saw it, unless a rule
         // rewrites the statement or the target is a view.

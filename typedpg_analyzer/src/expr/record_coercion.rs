@@ -164,6 +164,16 @@ pub(crate) fn coerce_record_to_complex(
                         ..TypeGoal::assignment(field.atttypid)
                     },
                 )?;
+                // coerce_type wraps a value that isn't already of the
+                // field's type in a CoerceToDomain when the field is a
+                // domain: its checks run.
+                if t.type_oid != field.atttypid
+                    && snapshot
+                        .get_type(field.atttypid)
+                        .is_some_and(|x| x.typtype == TypType::Domain)
+                {
+                    crate::privileges::note_domain_coercion(field.atttypid);
+                }
                 // Each value is kept, coerced to its field's type: still
                 // non-NULL when no cast runs (same type), an untyped
                 // literal is read by the field type's input function, or a
@@ -230,6 +240,13 @@ pub(crate) fn coerce_record_to_complex(
                     && !crate::coerce::can_coerce(own.type_oid, field.atttypid, context, snapshot)
                 {
                     return Err(mismatch(own.type_oid, field.atttypid, i + 1));
+                }
+                if own.type_oid != field.atttypid
+                    && snapshot
+                        .get_type(field.atttypid)
+                        .is_some_and(|x| x.typtype == TypType::Domain)
+                {
+                    crate::privileges::note_domain_coercion(field.atttypid);
                 }
                 let nullable =
                     crate::expr::literals::assignment_nullable(&own, field.atttypid, snapshot);

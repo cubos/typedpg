@@ -293,8 +293,47 @@ impl Run {
             Stmt::Assign(s) => self.assign(interp, s),
             Stmt::Raise(s) => self.raise(s),
             Stmt::Return(_) => Ok(Flow::Return),
+            Stmt::If(s) => self.if_statement(interp, s),
             _ => Ok(Flow::Unknown),
         }
+    }
+
+    /// `IF condition THEN ... END IF` (exec_stmt_if). The common
+    /// `CREATE ROLE IF NOT EXISTS` idiom is statically known: a
+    /// `NOT EXISTS (SELECT ... FROM pg_roles WHERE rolname = 'name')`
+    /// condition, whose outcome the catalog knows, selects the branch — the
+    /// then-branch when the role doesn't exist, the else-branch (if any)
+    /// when it does — and that branch runs through the normal interpreter.
+    /// Any other condition, or an `ELSIF` chain that would have to be
+    /// evaluated, is unknowable.
+    fn if_statement(
+        &mut self,
+        interp: &mut PgCatalog,
+        s: &plpgsql::StmtIf,
+    ) -> Result<Flow, DdlError> {
+        let Some(condition) = expr_query(s.cond.as_ref()) else {
+            return Ok(Flow::Unknown);
+        };
+        let Some((role, view)) = role_not_exists_condition(condition) else {
+            return Ok(Flow::Unknown);
+        };
+        // `pg_roles` has every role; `pg_user` (and `pg_shadow`) only those
+        // with `rolcanlogin`.
+        let exists = match view {
+            RoleView::Roles => interp.roles.exists(&role),
+            RoleView::User => interp.roles.exists_with_login(&role),
+        };
+        if exists {
+            // The then-branch doesn't run. The else-branch does, unless an
+            // ELSIF chain would have to decide first.
+            if !s.elsif_list.is_empty() {
+                return Ok(Flow::Unknown);
+            }
+            return self.statements(interp, &s.else_body);
+        }
+        // The condition is true: the then-branch runs and no ELSIF is
+        // evaluated.
+        self.statements(interp, &s.then_body)
     }
 
     /// Run a statement list.
@@ -533,6 +572,120 @@ fn runs_in_a_function(sql: &str) -> bool {
             Some(ast::Node::IndexStmt(i)) if i.concurrent
         )
     })
+}
+
+/// The role a `NOT EXISTS (...)` condition checks for, when it is the common
+/// Which catalog view a role-existence condition reads: `pg_roles` lists
+/// every role, `pg_user` only the ones that can log in (it selects from
+/// `pg_shadow`, which filters `rolcanlogin`).
+#[derive(Clone, Copy)]
+enum RoleView {
+    Roles,
+    User,
+}
+
+/// `IF NOT EXISTS (SELECT ... FROM pg_roles WHERE rolname = 'name')` idiom
+/// (`pg_catalog.pg_roles`, `pg_user` with `usename`).
+fn role_not_exists_condition(query: &str) -> Option<(String, RoleView)> {
+    use typedpg_pg_query::ast::{AExprKind, BoolExprType, Node, SubLinkType};
+    let parsed = typedpg_pg_query::parse(&format!("SELECT {query}")).ok()?;
+    let [raw] = parsed.tree.stmts.as_slice() else {
+        return None;
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref() else {
+        return None;
+    };
+    let [target] = select.target_list.as_slice() else {
+        return None;
+    };
+    let Some(Node::ResTarget(res_target)) = target.as_ref() else {
+        return None;
+    };
+    let Some(Node::BoolExpr(bool_expr)) = res_target.val.as_ref() else {
+        return None;
+    };
+    if bool_expr.boolop != BoolExprType::NotExpr {
+        return None;
+    }
+    let [argument] = bool_expr.args.as_slice() else {
+        return None;
+    };
+    let Some(Node::SubLink(sub_link)) = argument.as_ref() else {
+        return None;
+    };
+    if sub_link.sub_link_type != SubLinkType::ExistsSublink {
+        return None;
+    }
+    let Some(Node::SelectStmt(subselect)) = sub_link.subselect.as_ref() else {
+        return None;
+    };
+    let [from] = subselect.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(Node::RangeVar(range_var)) = from.as_ref() else {
+        return None;
+    };
+    if !range_var.catalogname.is_empty()
+        || !matches!(range_var.schemaname.as_str(), "" | "pg_catalog")
+    {
+        return None;
+    }
+    let (column, view) = match range_var.relname.as_str() {
+        "pg_roles" => ("rolname", RoleView::Roles),
+        "pg_user" => ("usename", RoleView::User),
+        _ => return None,
+    };
+    if !subselect.group_clause.is_empty()
+        || subselect.having_clause.is_some()
+        || subselect.with_clause.is_some()
+        || !subselect.sort_clause.is_empty()
+        || subselect.limit_count.is_some()
+        || subselect.limit_offset.is_some()
+    {
+        return None;
+    }
+    let Some(Node::AExpr(expr)) = subselect.where_clause.as_ref() else {
+        return None;
+    };
+    if expr.kind != AExprKind::AexprOp
+        || !expr
+            .name
+            .iter()
+            .filter_map(|n| match n.as_ref()? {
+                Node::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .eq(["="])
+    {
+        return None;
+    }
+    let column_ref = |node: Option<&Node>| -> Option<String> {
+        let Node::ColumnRef(column_ref) = node? else {
+            return None;
+        };
+        let Node::String(name) = column_ref.fields.last()?.as_ref()? else {
+            return None;
+        };
+        Some(name.sval.clone())
+    };
+    let literal = |node: Option<&Node>| -> Option<String> {
+        let Node::AConst(constant) = node? else {
+            return None;
+        };
+        if constant.isnull {
+            return None;
+        }
+        match constant.val.as_ref()? {
+            ast::AConstValue::String(s) => Some(s.sval.clone()),
+            _ => None,
+        }
+    };
+    let left = expr.lexpr.as_ref();
+    let right = expr.rexpr.as_ref();
+    if column_ref(left).as_deref() != Some(column) {
+        return None;
+    }
+    Some((literal(right)?, view))
 }
 
 /// A constant coerced to `type_name`: what the type's input function

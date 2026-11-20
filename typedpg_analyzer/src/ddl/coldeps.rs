@@ -32,7 +32,13 @@ pub(crate) enum Dependent {
 pub(crate) struct ColumnDeps {
     /// Each policy's USING and WITH CHECK expressions: ALTER POLICY
     /// replaces them one at a time.
-    pub(crate) policy_quals: HashMap<(PgClassOid, String), (Option<Node>, Option<Node>)>,
+    pub(crate) policy_quals: HashMap<
+        (PgClassOid, String),
+        (
+            Option<super::policies::PolicyClause>,
+            Option<super::policies::PolicyClause>,
+        ),
+    >,
 }
 
 impl Dependent {
@@ -442,6 +448,67 @@ fn policy_refs(
     )
 }
 
+/// The operators and cast functions a policy's expressions call:
+/// `recordDependencyOnExpr` records an operator (not its function) and the
+/// `FuncExpr` of a cast (`pg_cast.castfunc`), so `pg_depend` keeps the ones
+/// the policy was written with — DROP OPERATOR / DROP FUNCTION is blocked by
+/// them, and the policy's privilege check finds the routines they name.
+fn policy_expression_refs(
+    interp: &PgCatalog,
+    table: &ast::RangeVar,
+    quals: &(Option<Node>, Option<Node>),
+) -> Vec<ObjectAddress> {
+    let Some(relid) = relation_of(interp, table) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for expr in quals.0.iter().chain(quals.1.iter()) {
+        for reference in super::depend::expression_references(interp, Some(expr), Some(relid)) {
+            if let super::depend::Reference::Object(addr) = reference
+                && addr.classid == crate::pg_catalog::PG_OPERATOR_RELID
+                && !out.contains(&addr)
+            {
+                out.push(addr);
+            }
+        }
+    }
+    // The cast functions the expressions run (an explicit `::type`, an
+    // implicit argument coercion): `recordDependencyOnExpr` sees them as the
+    // `FuncExpr`s the cast became.
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return out;
+    };
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = crate::scope::Scope::default();
+    scope.add_dml_target(
+        interp,
+        &class.relname,
+        crate::qualified_name::QualifiedName::new(nspname, class.relname.clone()),
+        &attrs,
+    );
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    for expr in quals.0.iter().chain(quals.1.iter()) {
+        let used = std::cell::RefCell::new(Vec::new());
+        let mut params = crate::param_collector::ParamCollector::default();
+        let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).recording(&used);
+        let _ = crate::expr::infer_expr(Some(expr), ctx, &mut params, crate::expr::TypeGoal::NONE);
+        for oid in used.into_inner() {
+            if !interp.pg_cast.values().any(|c| c.castfunc == Some(oid)) {
+                continue;
+            }
+            let addr = ObjectAddress::proc(oid);
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
+}
+
 /// CREATE POLICY: the columns its USING / WITH CHECK read.
 pub(crate) fn record_policy(
     interp: &mut PgCatalog,
@@ -453,17 +520,26 @@ pub(crate) fn record_policy(
     let Some(relid) = relation_of(interp, table) else {
         return Ok(());
     };
-    let quals = (
+    let raw = (
         stmt.qual.as_ref().cloned(),
         stmt.with_check.as_ref().cloned(),
     );
-    let refs = policy_refs(interp, table, &quals);
-    let functions = policy_functions(interp, table, &quals);
+    let refs = policy_refs(interp, table, &raw);
+    let functions = policy_functions(interp, table, &raw);
+    let operators = policy_expression_refs(interp, table, &raw);
     let dep = Dependent::Policy {
         relid,
         name: stmt.policy_name.clone(),
     };
-    store(interp, &dep, refs, functions, Vec::new())?;
+    store(interp, &dep, refs, functions, operators)?;
+    let quals = (
+        stmt.qual
+            .as_ref()
+            .map(|q| super::policies::stored_clause(interp, relid, Some(q))),
+        stmt.with_check
+            .as_ref()
+            .map(|c| super::policies::stored_clause(interp, relid, Some(c))),
+    );
     interp
         .column_deps
         .policy_quals
@@ -490,18 +566,23 @@ pub(crate) fn record_policy_alter(
         .cloned()
         .unwrap_or_default();
     if let Some(q) = stmt.qual.as_ref() {
-        quals.0 = Some(q.clone());
+        quals.0 = Some(super::policies::stored_clause(interp, relid, Some(q)));
     }
     if let Some(c) = stmt.with_check.as_ref() {
-        quals.1 = Some(c.clone());
+        quals.1 = Some(super::policies::stored_clause(interp, relid, Some(c)));
     }
-    let refs = policy_refs(interp, table, &quals);
-    let functions = policy_functions(interp, table, &quals);
+    let raw = (
+        quals.0.as_ref().and_then(|c| c.expr.clone()),
+        quals.1.as_ref().and_then(|c| c.expr.clone()),
+    );
+    let refs = policy_refs(interp, table, &raw);
+    let functions = policy_functions(interp, table, &raw);
+    let operators = policy_expression_refs(interp, table, &raw);
     let dep = Dependent::Policy {
         relid,
         name: stmt.policy_name.clone(),
     };
-    store(interp, &dep, refs, functions, Vec::new())?;
+    store(interp, &dep, refs, functions, operators)?;
     interp.column_deps.policy_quals.insert(key, quals);
     Ok(())
 }

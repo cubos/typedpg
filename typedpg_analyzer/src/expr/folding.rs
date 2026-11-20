@@ -86,7 +86,9 @@ fn fold(node: Option<&ast::Node>, ctx: Ctx<'_>, generation: bool) -> Folding {
                 .get(&(origin.relid, attr.attnum))
             {
                 Some(crate::ddl::tables::check_inherit::StoredExpr::Written(expr)) => {
-                    fold((**expr).as_ref(), ctx, true)
+                    // The stored expression's names were resolved when the
+                    // column was defined: folding it looks no schema up.
+                    crate::privileges::suspended(|| fold(expr.as_ref().as_ref(), ctx, true))
                 }
                 _ => Folding::Maybe,
             }

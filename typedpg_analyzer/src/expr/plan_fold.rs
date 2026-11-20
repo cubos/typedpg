@@ -65,6 +65,23 @@ impl Folded {
     }
 }
 
+/// What an expression certainly folds to (see [`certainly`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Certain {
+    /// A boolean constant.
+    Bool(bool),
+    /// The NULL constant.
+    Null,
+    /// A constant other than NULL, of a value the analyzer doesn't compute.
+    Value,
+    /// A constant whose value — NULL or not — the analyzer doesn't compute:
+    /// an immutable function or operator `evaluate_function` folds without
+    /// knowing what it returns.
+    UnknownValue,
+    /// Not certainly a constant: it may stay for execution.
+    Not,
+}
+
 /// `parse_bool_with_len`: the strings `boolin` accepts.
 fn parse_bool(s: &str) -> Option<bool> {
     let s = s.trim().to_ascii_lowercase();
@@ -1006,6 +1023,957 @@ pub(crate) fn unless_dead<R>(dead: bool, f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// The functions and operators a stored expression (`expression_planner`
+/// folds it before execution) calls, split by whether the planner certainly
+/// evaluates them. A call in code `eval_const_expressions` drops never runs:
+/// its `pg_depend` routine needs no EXECUTE when the expression executes.
+#[derive(Default)]
+pub(crate) struct Callees {
+    pub(crate) live: std::collections::HashSet<String>,
+    pub(crate) dead: std::collections::HashSet<String>,
+    /// The `(name, argument count)` of the live function calls — the only
+    /// thing a `pg_depend` row tells apart without resolving names again
+    /// (see [`Callees::runs_routine`]).
+    pub(crate) live_arities: std::collections::HashSet<(String, usize)>,
+    /// Likewise, of the calls in code the planner drops.
+    pub(crate) dead_arities: std::collections::HashSet<(String, usize)>,
+}
+
+impl Callees {
+    /// Whether a routine (or operator's function) named `name` may run: it
+    /// appears in live code, or nowhere this walk classified (a cast
+    /// function, say).
+    pub(crate) fn runs(&self, name: &str) -> bool {
+        self.live.contains(name) || !self.dead.contains(name)
+    }
+
+    /// Whether the walk saw `name` anywhere, live or dead.
+    pub(crate) fn mentions(&self, name: &str) -> bool {
+        self.live.contains(name) || self.dead.contains(name)
+    }
+
+    /// [`Self::runs`] over the exact expression the walk covered: a name the
+    /// walk never saw is not part of it. A policy's `pg_depend` rows cover
+    /// every clause of the policy, but a statement builds only the clauses
+    /// its command and tables use (a WITH CHECK on a read, a USING on an
+    /// INSERT): a dependency named by no built clause is dead for it.
+    pub(crate) fn runs_mentioned(&self, name: &str) -> bool {
+        self.live.contains(name)
+    }
+
+    /// Whether the routine `name` with `nargs` input parameters is called by
+    /// live code. The stored expression's `pg_depend` rows name the exact
+    /// OIDs the expression resolved to at creation, and resolving its names
+    /// again under a later `search_path` may pick another schema's function:
+    /// only the call sites the folding walk finds dead for *the same*
+    /// expression may prune a row. A function with defaults or `VARIADIC`
+    /// parameters is called with another argument count than its `pronargs`:
+    /// when no call site of the name has this count, every live call of the
+    /// name keeps it.
+    pub(crate) fn runs_routine(&self, name: &str, nargs: usize) -> bool {
+        let key = (name.to_owned(), nargs);
+        if self.live_arities.contains(&key) {
+            return true;
+        }
+        if self.dead_arities.contains(&key) {
+            return false;
+        }
+        self.runs(name)
+    }
+
+    /// [`Self::runs_routine`] with [`Self::runs_mentioned`]'s rule: a name
+    /// no call site of the walk mentions is dead.
+    pub(crate) fn runs_routine_mentioned(&self, name: &str, nargs: usize) -> bool {
+        let key = (name.to_owned(), nargs);
+        if self.live_arities.contains(&key) {
+            return true;
+        }
+        if self.dead_arities.contains(&key) {
+            return false;
+        }
+        self.runs_mentioned(name)
+    }
+}
+
+/// The callees of `n`, dead branches classified (see [`Callees`]).
+pub(crate) fn callees(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Callees {
+    let mut out = Callees::default();
+    walk_node(n, snapshot, false, &mut out);
+    out
+}
+
+/// [`walk_callees`] for a node the tree holds by reference.
+fn walk_node(n: Option<&ast::Node>, snapshot: &PgCatalog, dead: bool, out: &mut Callees) {
+    if let Some(inner) = n {
+        walk_callees(inner.to_ref(), snapshot, dead, out);
+    }
+}
+
+fn walk_callees(
+    n: typedpg_pg_query::NodeRef<'_>,
+    snapshot: &PgCatalog,
+    dead: bool,
+    out: &mut Callees,
+) {
+    use typedpg_pg_query::NodeRef;
+    if dead {
+        collect_callees(n, out);
+        return;
+    }
+    match n {
+        NodeRef::FuncCall(fc) => {
+            if let Some(name) = extract_names(&fc.funcname).last() {
+                out.live_arities.insert((name.clone(), fc.args.len()));
+            }
+            out.live.extend(extract_names(&fc.funcname).last().cloned());
+        }
+        NodeRef::AExpr(e) => out.live.extend(extract_names(&e.name).last().cloned()),
+        NodeRef::BoolExpr(b) => {
+            let deciding = match b.boolop {
+                ast::BoolExprType::AndExpr => Some(false),
+                ast::BoolExprType::OrExpr => Some(true),
+                _ => None,
+            };
+            if let Some(value) = deciding
+                && b.args
+                    .iter()
+                    .any(|a| certainly(a.as_ref(), snapshot) == Certain::Bool(value))
+            {
+                for a in &b.args {
+                    if certainly(a.as_ref(), snapshot) == Certain::Bool(value) {
+                        continue;
+                    }
+                    walk_node(a.as_ref(), snapshot, true, out);
+                }
+                return;
+            }
+        }
+        NodeRef::CoalesceExpr(c) => {
+            let mut stopped = false;
+            for a in &c.args {
+                if stopped {
+                    walk_node(a.as_ref(), snapshot, true, out);
+                    continue;
+                }
+                walk_node(a.as_ref(), snapshot, false, out);
+                stopped = certainly_non_null_constant(a.as_ref(), snapshot);
+            }
+            return;
+        }
+        NodeRef::CaseExpr(c) => {
+            let mut stopped = false;
+            for w in &c.args {
+                let Some(ast::Node::CaseWhen(w)) = w.as_ref() else {
+                    break;
+                };
+                if stopped {
+                    if let Some(cond) = w.expr.as_ref() {
+                        walk_node(Some(cond), snapshot, true, out);
+                    }
+                    if let Some(r) = w.result.as_ref() {
+                        walk_node(Some(r), snapshot, true, out);
+                    }
+                    continue;
+                }
+                if c.arg.is_some() {
+                    // A simple CASE: compare its test with each WHEN. The
+                    // planner folds only `CASE const WHEN const` (see
+                    // `certain_case`); the walker's generic names still catch
+                    // the live calls.
+                    if let Some(cond) = w.expr.as_ref() {
+                        walk_node(Some(cond), snapshot, false, out);
+                    }
+                    if let Some(r) = w.result.as_ref() {
+                        walk_node(Some(r), snapshot, false, out);
+                    }
+                    continue;
+                }
+                if let Some(cond) = w.expr.as_ref() {
+                    walk_node(Some(cond), snapshot, false, out);
+                }
+                match w.expr.as_ref().map(|e| certainly(Some(e), snapshot)) {
+                    Some(Certain::Bool(false) | Certain::Null) => {
+                        if let Some(r) = w.result.as_ref() {
+                            walk_node(Some(r), snapshot, true, out);
+                        }
+                    }
+                    Some(Certain::Bool(true)) => {
+                        if let Some(r) = w.result.as_ref() {
+                            walk_node(Some(r), snapshot, false, out);
+                        }
+                        stopped = true;
+                    }
+                    _ => {
+                        if let Some(r) = w.result.as_ref() {
+                            walk_node(Some(r), snapshot, false, out);
+                        }
+                    }
+                }
+            }
+            if let Some(d) = c.defresult.as_ref() {
+                walk_node(Some(d), snapshot, stopped, out);
+            }
+            return;
+        }
+        _ => {}
+    }
+    for child in n.children() {
+        walk_callees(child, snapshot, false, out);
+    }
+}
+
+/// The names and call arities of the functions and operators anywhere in
+/// `n`, live or dead.
+fn collect_callees(n: typedpg_pg_query::NodeRef<'_>, out: &mut Callees) {
+    use typedpg_pg_query::NodeRef;
+    match n {
+        NodeRef::FuncCall(fc) => {
+            if let Some(name) = extract_names(&fc.funcname).last() {
+                out.dead_arities.insert((name.clone(), fc.args.len()));
+                out.dead.insert(name.clone());
+            }
+        }
+        NodeRef::AExpr(e) => out.dead.extend(extract_names(&e.name).last().cloned()),
+        _ => {}
+    }
+    for child in n.children() {
+        collect_callees(child, out);
+    }
+}
+
+/// Run `f` for a part of the expression the rewriter / planner certainly
+/// drops, so execution never checks it (a privilege check the dropped code
+/// would need is not made). The code is still analyzed: parse analysis
+/// resolved its names and types before the planner ran.
+pub(crate) fn unless_dropped<R>(dropped: bool, f: impl FnOnce() -> R) -> R {
+    if dropped && !crate::privileges::checks_dropped_code() {
+        crate::privileges::not_executed(f)
+    } else {
+        f()
+    }
+}
+
+/// Whether `n` is a condition the planner certainly folds to a known
+/// boolean: what `eval_const_expressions` reduces an `IF` / `CASE WHEN` /
+/// `AND` / `OR` operand to. `Some(true)` / `Some(false)` when certain (a
+/// `NULL` condition is not true, so `Some(false)`); `None` when it isn't
+/// certainly a constant.
+pub(crate) fn certainly_true(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<bool> {
+    match certainly(n, snapshot) {
+        Certain::Bool(v) => Some(v),
+        Certain::Null => Some(false),
+        Certain::Value | Certain::UnknownValue | Certain::Not => None,
+    }
+}
+
+/// Whether `n` certainly folds to a non-NULL constant (COALESCE stops after
+/// it: the arguments after it are never evaluated).
+pub(crate) fn certainly_non_null_constant(n: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
+    matches!(certainly(n, snapshot), Certain::Bool(_) | Certain::Value)
+}
+
+thread_local! {
+    /// The scope `certainly` resolves column references in (see
+    /// [`certainly_in`]): the output of a subquery the planner certainly
+    /// pulls up replaces the reference before folding.
+    static CERTAIN_SCOPE: Cell<Option<*const crate::scope::Scope>> = const { Cell::new(None) };
+    /// How deep in substituted output expressions `certainly` is.
+    static CERTAIN_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Restores [`CERTAIN_SCOPE`] when dropped.
+struct CertainScopeGuard(Option<*const crate::scope::Scope>);
+
+impl Drop for CertainScopeGuard {
+    fn drop(&mut self) {
+        CERTAIN_SCOPE.with(|c| c.set(self.0));
+    }
+}
+
+/// [`certainly`] in the scope of `ctx`: a column reference the planner
+/// replaces by a certainly known expression — the output of a subquery it
+/// certainly pulls up (`pull_up_simple_subquery`), a view's, an inlined
+/// CTE's — counts as that expression. A reference to a column that stays a
+/// Var (a table's, a subquery the planner keeps, one of an outer join's
+/// nullable side) is no constant.
+pub(crate) fn certainly_in(n: Option<&ast::Node>, ctx: super::Ctx<'_>) -> Certain {
+    let outer = CERTAIN_SCOPE.with(|c| c.replace(Some(std::ptr::from_ref(ctx.scope))));
+    let _restore = CertainScopeGuard(outer);
+    certainly(n, ctx.snapshot)
+}
+
+/// [`certainly`] of column `cr`: what the expression the planner
+/// substitutes for it folds to (see [`certainly_in`]).
+fn certain_column(cr: &ast::ColumnRef, snapshot: &PgCatalog) -> Certain {
+    let Some(scope) = CERTAIN_SCOPE.with(Cell::get) else {
+        return Certain::Not;
+    };
+    // SAFETY: the scope outlives the guard that installed it on this thread
+    // (see [`certainly_in`]); `certainly` only walks the current level's
+    // expression, never a subquery's.
+    let scope = unsafe { &*scope };
+    let parts = extract_names(&cr.fields);
+    let (table, column) = match parts.as_slice() {
+        [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+        [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+        _ => return Certain::Not,
+    };
+    let Ok(col) = scope.resolve_column(table, column, None) else {
+        return Certain::Not;
+    };
+    match col.deferred.substitution {
+        crate::scope::Substitution::Certain => match col.deferred.expr.as_deref() {
+            Some(e) => {
+                // A substituted expression is usually a constant already; a
+                // chain of pulls ends in one. Bound the walk anyway.
+                let depth = CERTAIN_DEPTH.with(Cell::get);
+                if depth >= 64 {
+                    return Certain::Not;
+                }
+                CERTAIN_DEPTH.with(|c| c.set(depth + 1));
+                let out = certainly(Some(e), snapshot);
+                CERTAIN_DEPTH.with(|c| c.set(depth));
+                out
+            }
+            // A table's column passed through stays a Var.
+            None => Certain::Not,
+        },
+        _ => Certain::Not,
+    }
+}
+
+/// What `eval_const_expressions` makes of `n`, *certainly*: a boolean or
+/// NULL constant it computes, a non-NULL constant it folds whose value the
+/// analyzer doesn't compute, or [`Certain::Not`] when the expression may stay
+/// (or when the analyzer can't tell). A column reference counts only in
+/// [`certainly_in`]'s scope, as the expression the planner substitutes for
+/// it. Unlike [`fold`], which errs towards treating an expression as
+/// foldable, this errs towards `Not`: code the planner may keep is code that
+/// runs, and its privileges must be checked.
+pub(crate) fn certainly(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Certain {
+    let Some(inner) = n else {
+        return Certain::Not;
+    };
+    match inner {
+        ast::Node::AConst(c) => {
+            if c.isnull {
+                return Certain::Null;
+            }
+            match c.val.as_ref() {
+                Some(ast::AConstValue::Boolean(b)) => Certain::Bool(b.boolval),
+                // An untyped literal: in a boolean context the parser has
+                // coerced it to boolean (`parse_bool`); otherwise it is a
+                // non-NULL constant.
+                Some(ast::AConstValue::String(s)) => match parse_bool(&s.sval) {
+                    Some(v) => Certain::Bool(v),
+                    None => Certain::Value,
+                },
+                _ => Certain::Value,
+            }
+        }
+        ast::Node::TypeCast(tc) => certain_cast(tc, snapshot),
+        ast::Node::ColumnRef(cr) => certain_column(cr, snapshot),
+        ast::Node::CollateClause(c) => c
+            .arg
+            .as_ref()
+            .map_or(Certain::Not, |a| certainly(Some(a), snapshot)),
+        // A custom plan substitutes the parameter's value.
+        ast::Node::ParamRef(_) => {
+            if custom_plan() {
+                Certain::UnknownValue
+            } else {
+                Certain::Not
+            }
+        }
+        ast::Node::BoolExpr(b) => certain_bool_expr(b, snapshot),
+        ast::Node::AExpr(e) => certain_a_expr(e, snapshot),
+        ast::Node::NullTest(t) => {
+            let is_null = t.nulltesttype == ast::NullTestType::IsNull;
+            match t.arg.as_ref().map(|a| certainly(Some(a), snapshot)) {
+                Some(Certain::Null) => Certain::Bool(is_null),
+                Some(Certain::Bool(_) | Certain::Value) => Certain::Bool(!is_null),
+                // A folded constant may be NULL.
+                _ => Certain::Not,
+            }
+        }
+        ast::Node::BooleanTest(t) => certain_boolean_test(t, snapshot),
+        ast::Node::CoalesceExpr(c) => {
+            for a in &c.args {
+                match certainly(a.as_ref(), snapshot) {
+                    Certain::Null => {}
+                    v @ (Certain::Bool(_) | Certain::Value) => return v,
+                    // A folded constant may be NULL: the next argument may
+                    // still run.
+                    Certain::UnknownValue => return Certain::Not,
+                    Certain::Not => return Certain::Not,
+                }
+            }
+            Certain::Null
+        }
+        ast::Node::CaseExpr(c) => certain_case(c, snapshot),
+        ast::Node::FuncCall(fc) => certain_func_call(fc, snapshot),
+        ast::Node::MinMaxExpr(m) => {
+            let mut all_null = true;
+            for a in &m.args {
+                match certainly(a.as_ref(), snapshot) {
+                    Certain::Null => {}
+                    Certain::Bool(_) | Certain::Value => all_null = false,
+                    Certain::UnknownValue | Certain::Not => return Certain::Not,
+                }
+            }
+            if all_null {
+                Certain::Null
+            } else {
+                Certain::Value
+            }
+        }
+        ast::Node::AArrayExpr(a) => {
+            if a.elements.iter().all(|e| {
+                matches!(
+                    certainly(e.as_ref(), snapshot),
+                    Certain::Bool(_) | Certain::Null | Certain::Value
+                )
+            }) {
+                Certain::Value
+            } else {
+                Certain::Not
+            }
+        }
+        ast::Node::RowExpr(r) => {
+            if r.args.iter().all(|e| {
+                matches!(
+                    certainly(e.as_ref(), snapshot),
+                    Certain::Bool(_) | Certain::Null | Certain::Value
+                )
+            }) {
+                Certain::Value
+            } else {
+                Certain::Not
+            }
+        }
+        ast::Node::NamedArgExpr(a) => a
+            .arg
+            .as_ref()
+            .map_or(Certain::Not, |a| certainly(Some(a), snapshot)),
+        ast::Node::AIndirection(i) => {
+            let base = i.arg.as_ref().map(|a| certainly(Some(a), snapshot));
+            let indirection = i
+                .indirection
+                .iter()
+                .all(|x| certainly(x.as_ref(), snapshot) != Certain::Not);
+            match base {
+                Some(Certain::Bool(_) | Certain::Value | Certain::UnknownValue) if indirection => {
+                    Certain::UnknownValue
+                }
+                _ => Certain::Not,
+            }
+        }
+        _ => Certain::Not,
+    }
+}
+
+/// [`certainly`] for a cast: `eval_const_expressions` folds a cast of a
+/// constant when its target is no domain (a `CoerceToDomain` is never
+/// folded, whatever its argument) and no cast function it may run is mutable.
+/// A cast of an untyped string literal (`'now'::timestamptz`) runs the
+/// target's input function at parse time: it is a Const whatever that
+/// function's volatility.
+fn certain_cast(tc: &ast::TypeCast, snapshot: &PgCatalog) -> Certain {
+    let Some(target) = cast_target(tc, snapshot) else {
+        return Certain::Not;
+    };
+    let Some(ty) = snapshot.pg_type.get(&target) else {
+        return Certain::Not;
+    };
+    let arg_node = tc.arg.as_ref();
+    // `transformRowExpr`: a row constructor cast to a composite type is a
+    // `RowExpr` of that type, not a coercion — as constant as its fields
+    // (`ROW(1)::ct` is a `Const`-like argument `eval_const_expressions`
+    // folds a call over).
+    if ty.typtype == crate::pg_catalog::TypType::Composite
+        && let Some(ast::Node::RowExpr(row)) = arg_node
+    {
+        return if row.args.iter().all(|e| {
+            matches!(
+                certainly(e.as_ref(), snapshot),
+                Certain::Bool(_) | Certain::Null | Certain::Value
+            )
+        }) {
+            Certain::Value
+        } else {
+            Certain::Not
+        };
+    }
+    // coerce_type turns an untyped constant into a Const of the target's
+    // *base* type (`parse_coerce.c`), and wraps it in a `CoerceToDomain`
+    // when the target is a domain. That node is never folded: its constraint
+    // expressions run when it is evaluated — even for a NULL value
+    // (`EEOP_DOMAIN_CHECK` evaluates them), so `NULL::d` is not the NULL
+    // constant. `eval_const_expressions` replaces a constraint-less domain's
+    // coercion with a RelabelType (`DomainHasConstraints`), so only a domain
+    // with constraints keeps the node.
+    if arg_node.is_some_and(|a| {
+        matches!(
+            Some(a),
+            Some(ast::Node::AConst(c)) if c.isnull
+        )
+    }) {
+        // `DomainHasConstraints` counts the whole domain stack: its own
+        // checks and NOT NULL, and every parent domain's (the typcache's
+        // `load_domaintype_info` applies them).
+        if ty.typtype == crate::pg_catalog::TypType::Domain
+            && domain_has_constraints(snapshot, target)
+        {
+            return Certain::Not;
+        }
+        return Certain::Null;
+    }
+    // A boolean cast keeps the value: a value already boolean only takes a
+    // RelabelType, and the parser evaluates an untyped literal through
+    // `boolin` (`'false'::boolean` is the false constant).
+    if target == crate::pg_catalog::oid::BOOL
+        && let Some(arg) = arg_node.map(|a| certainly(Some(a), snapshot))
+    {
+        match arg {
+            Certain::Bool(v) => return Certain::Bool(v),
+            Certain::Null => return Certain::Null,
+            _ => {}
+        }
+    }
+    if ty.typtype == crate::pg_catalog::TypType::Domain {
+        return Certain::Not;
+    }
+    let arg = arg_node.map(|a| certainly(Some(a), snapshot));
+    // The parser turns an untyped literal into a Const when it coerces it
+    // (stringTypeDatum), before the planner runs.
+    let untyped_literal = arg_node.is_some_and(|a| {
+        matches!(
+            Some(a),
+            Some(ast::Node::AConst(c))
+                if !c.isnull && matches!(c.val.as_ref(), Some(ast::AConstValue::String(_)))
+        )
+    });
+    let source = arg_node.and_then(|a| constant_type(Some(a), snapshot));
+    let cast = source.and_then(|source| {
+        snapshot
+            .pg_cast
+            .values()
+            .find(|c| c.castsource == source && c.casttarget == target)
+    });
+    let function = |cast: Option<&crate::pg_catalog::PgCast>| {
+        cast.and_then(|c| c.castfunc)
+            .and_then(|f| snapshot.pg_proc.get(&f))
+    };
+    // No `pg_cast` row: a CoerceViaIO through the types' output and input
+    // functions, which `eval_const_expressions` folds only when both are
+    // immutable — and the catalog doesn't keep their volatility here. Stay
+    // conservative (`1::text` may fold, but `'now'::timestamptz::text`'s
+    // timestamptz output is stable).
+    let Some(cast) = cast else {
+        return if untyped_literal {
+            Certain::Value
+        } else {
+            Certain::Not
+        };
+    };
+    match arg {
+        Some(Certain::Not) | None => Certain::Not,
+        // A NULL through a strict cast function is NULL.
+        Some(Certain::Null) => {
+            if function(Some(cast)).is_none_or(|p| p.proisstrict) {
+                Certain::Null
+            } else {
+                Certain::Not
+            }
+        }
+        Some(Certain::Bool(v)) if target == crate::pg_catalog::oid::BOOL => Certain::Bool(v),
+        Some(Certain::Bool(_) | Certain::Value | Certain::UnknownValue) => {
+            match function(Some(cast)) {
+                // A relabel / binary coercion keeps the value.
+                None => Certain::Value,
+                Some(p) if p.provolatile == ProVolatile::Immutable => {
+                    // The cast function runs, and may return NULL.
+                    Certain::UnknownValue
+                }
+                Some(_) => Certain::Not,
+            }
+        }
+    }
+}
+
+/// Whether a domain (or a domain it is over) has any constraint:
+/// `DomainHasConstraints` (typcache.c), which counts NOT NULL too.
+fn domain_has_constraints(snapshot: &PgCatalog, domain: crate::oid::PgTypeOid) -> bool {
+    let mut current = Some(domain);
+    while let Some(ty) = current {
+        let Some(row) = snapshot.pg_type.get(&ty) else {
+            return true;
+        };
+        if row.typtype != crate::pg_catalog::TypType::Domain {
+            return false;
+        }
+        if row.typnotnull
+            || snapshot
+                .domain_constraints
+                .get(&ty)
+                .is_some_and(|constraints| !constraints.is_empty())
+        {
+            return true;
+        }
+        current = row.typbasetype;
+    }
+    false
+}
+
+/// The type a constant expression certainly has, for finding its cast:
+/// an integer / boolean literal, or the target of a cast.
+fn constant_type(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Option<crate::oid::PgTypeOid> {
+    match n? {
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::Integer(_) => Some(crate::pg_catalog::oid::INT4),
+            ast::AConstValue::Boolean(_) => Some(crate::pg_catalog::oid::BOOL),
+            _ => None,
+        },
+        ast::Node::TypeCast(tc) => cast_target(tc, snapshot),
+        _ => None,
+    }
+}
+
+/// The type a `TypeCast`'s `TypeName` names, array bounds included.
+fn cast_target(tc: &ast::TypeCast, snapshot: &PgCatalog) -> Option<crate::oid::PgTypeOid> {
+    let type_name = tc.type_name.as_ref()?;
+    let names = extract_names(&type_name.names);
+    let ty = match names.as_slice() {
+        [name] => snapshot.resolve_type_by_name(None, name),
+        [schema, name] => snapshot.resolve_type_by_name(Some(schema), name),
+        _ => None,
+    }?;
+    if type_name.array_bounds.is_empty() {
+        Some(ty.oid)
+    } else {
+        snapshot.array_type_of(ty.oid)
+    }
+}
+
+fn certain_bool_expr(b: &ast::BoolExpr, snapshot: &PgCatalog) -> Certain {
+    let op = b.boolop;
+    match op {
+        ast::BoolExprType::NotExpr => {
+            match b.args.first().map(|a| certainly(a.as_ref(), snapshot)) {
+                Some(Certain::Bool(v)) => Certain::Bool(!v),
+                Some(Certain::Null) => Certain::Null,
+                _ => Certain::Not,
+            }
+        }
+        op @ (ast::BoolExprType::AndExpr | ast::BoolExprType::OrExpr) => {
+            let or = op == ast::BoolExprType::OrExpr;
+            let mut null = false;
+            for a in &b.args {
+                match certainly(a.as_ref(), snapshot) {
+                    // simplify_and_arguments / simplify_or_arguments: this
+                    // argument is the result, the others are dropped.
+                    Certain::Bool(v) if v == or => return Certain::Bool(or),
+                    Certain::Bool(_) => {}
+                    Certain::Null => null = true,
+                    Certain::Value | Certain::UnknownValue | Certain::Not => {
+                        return Certain::Not;
+                    }
+                }
+            }
+            if null {
+                Certain::Null
+            } else {
+                Certain::Bool(!or)
+            }
+        }
+    }
+}
+
+fn certain_boolean_test(t: &ast::BooleanTest, snapshot: &PgCatalog) -> Certain {
+    use typedpg_pg_query::ast::BoolTestType;
+    let arg = t.arg.as_ref().map(|a| certainly(Some(a), snapshot));
+    let kind = t.booltesttype;
+    match (kind, arg) {
+        (BoolTestType::IsTrue, Some(Certain::Bool(v))) => Certain::Bool(v),
+        (BoolTestType::IsTrue, Some(Certain::Null)) => Certain::Bool(false),
+        (BoolTestType::IsNotTrue, Some(Certain::Bool(v))) => Certain::Bool(!v),
+        (BoolTestType::IsNotTrue, Some(Certain::Null)) => Certain::Bool(true),
+        (BoolTestType::IsFalse, Some(Certain::Bool(v))) => Certain::Bool(!v),
+        (BoolTestType::IsFalse, Some(Certain::Null)) => Certain::Bool(false),
+        (BoolTestType::IsNotFalse, Some(Certain::Bool(v))) => Certain::Bool(v),
+        (BoolTestType::IsNotFalse, Some(Certain::Null)) => Certain::Bool(true),
+        (BoolTestType::IsUnknown, Some(Certain::Null)) => Certain::Bool(true),
+        (BoolTestType::IsUnknown, Some(Certain::Bool(_) | Certain::Value)) => Certain::Bool(false),
+        (BoolTestType::IsNotUnknown, Some(Certain::Null)) => Certain::Bool(false),
+        (BoolTestType::IsNotUnknown, Some(Certain::Bool(_) | Certain::Value)) => {
+            Certain::Bool(true)
+        }
+        _ => Certain::Not,
+    }
+}
+
+/// The literal an expression is, for comparing a simple CASE's test with a
+/// WHEN: an integer or a (plain) string literal.
+enum Literal {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+}
+
+fn certain_literal(n: Option<&ast::Node>) -> Option<Literal> {
+    match n? {
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(Literal::Int(i64::from(i.ival))),
+            ast::AConstValue::String(s) => Some(Literal::Str(s.sval.clone())),
+            ast::AConstValue::Boolean(b) => Some(Literal::Bool(b.boolval)),
+            _ => None,
+        },
+        ast::Node::TypeCast(tc) => {
+            // A boolean cast runs the input function at parse time: a plain
+            // string literal becomes the boolean it spells.
+            if cast_target_is_bool(tc) {
+                return match tc.arg.as_ref()? {
+                    ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+                        ast::AConstValue::String(s) => parse_bool(&s.sval).map(Literal::Bool),
+                        ast::AConstValue::Boolean(b) => Some(Literal::Bool(b.boolval)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
+            // Only a cast that keeps the text of a plain string literal
+            // (`'x'::text`), never a typed conversion (`'1'::int`).
+            if !cast_target_is_text(tc) {
+                return None;
+            }
+            match tc.arg.as_ref()? {
+                ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+                    ast::AConstValue::String(s) => Some(Literal::Str(s.sval.clone())),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether the cast's target is plain `boolean` (not a domain, no array).
+fn cast_target_is_bool(tc: &ast::TypeCast) -> bool {
+    let Some(type_name) = tc.type_name.as_ref() else {
+        return false;
+    };
+    if !type_name.array_bounds.is_empty() || !type_name.typmods.is_empty() {
+        return false;
+    }
+    let names = extract_names(&type_name.names);
+    matches!(names.as_slice(), [n] | [_, n] if n == "bool" || n == "boolean")
+}
+
+fn cast_target_is_text(tc: &ast::TypeCast) -> bool {
+    let Some(names) = tc.type_name.as_ref().map(|t| extract_names(&t.names)) else {
+        return false;
+    };
+    matches!(
+        names.as_slice(),
+        [n] | [_, n] if n == "text" || n == "varchar"
+    )
+}
+
+fn certain_case(c: &ast::CaseExpr, snapshot: &PgCatalog) -> Certain {
+    // A simple CASE compares its test with each WHEN; a searched CASE tests
+    // each WHEN directly.
+    let test = c.arg.as_ref();
+    for w in &c.args {
+        let Some(ast::Node::CaseWhen(w)) = w.as_ref() else {
+            return Certain::Not;
+        };
+        let cond = match test {
+            None => match w.expr.as_ref().map(|e| certainly(Some(e), snapshot)) {
+                Some(Certain::Bool(v)) => Some(v),
+                Some(Certain::Null) => Some(false),
+                Some(Certain::Value | Certain::UnknownValue) => return Certain::Not,
+                Some(Certain::Not) | None => return Certain::Not,
+            },
+            Some(test) => match (
+                certain_literal(Some(test)),
+                certain_literal(w.expr.as_ref()),
+            ) {
+                (Some(a), Some(b)) => Some(equal_literals(&a, &b)),
+                _ => return Certain::Not,
+            },
+        };
+        match cond {
+            Some(true) => {
+                return w
+                    .result
+                    .as_ref()
+                    .map_or(Certain::Not, |r| certainly(Some(r), snapshot));
+            }
+            Some(false) => {}
+            None => return Certain::Not,
+        }
+    }
+    match c.defresult.as_ref() {
+        Some(d) => certainly(Some(d), snapshot),
+        None => Certain::Null,
+    }
+}
+
+/// Whether a simple CASE's test `test` certainly equals its WHEN value
+/// `when` (`CASE x WHEN v …`): `None` when either isn't a known literal.
+pub(crate) fn simple_case_equal(
+    test: Option<&ast::Node>,
+    when: Option<&ast::Node>,
+) -> Option<bool> {
+    match (certain_literal(test), certain_literal(when)) {
+        (Some(a), Some(b)) => Some(equal_literals(&a, &b)),
+        _ => None,
+    }
+}
+
+fn equal_literals(a: &Literal, b: &Literal) -> bool {
+    match (a, b) {
+        (Literal::Int(a), Literal::Int(b)) => a == b,
+        (Literal::Str(a), Literal::Str(b)) => a == b,
+        (Literal::Bool(a), Literal::Bool(b)) => a == b,
+        // `transformCaseExpr` builds `subject = when` and lets the operator
+        // resolution coerce: an unknown string literal takes the other side's
+        // type, so `CASE 1 WHEN '1'` compares integers. `int4in` accepts the
+        // digits `str::parse` does for the values that reach here (a literal
+        // it rejects fails the parse, before folding).
+        (Literal::Int(a), Literal::Str(b)) | (Literal::Str(b), Literal::Int(a)) => {
+            b.trim().parse::<i64>() == Ok(*a)
+        }
+        (Literal::Bool(a), Literal::Str(b)) | (Literal::Str(b), Literal::Bool(a)) => {
+            parse_bool(b) == Some(*a)
+        }
+        _ => false,
+    }
+}
+
+fn certain_a_expr(e: &ast::AExpr, snapshot: &PgCatalog) -> Certain {
+    let kind = e.kind;
+    let operands: Vec<Option<&ast::Node>> = [e.lexpr.as_ref(), e.rexpr.as_ref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|n| match n {
+            ast::Node::List(l) => l.items.iter().map(Option::as_ref).collect(),
+            _ => vec![Some(n)],
+        })
+        .collect();
+    let folded: Vec<Certain> = operands.iter().map(|o| certainly(*o, snapshot)).collect();
+    let names = extract_names(&e.name);
+    let operator = names.last().map(String::as_str);
+    // An operator all of whose implementations are strict folds a NULL
+    // operand to NULL (`NULL + x`).
+    if folded.contains(&Certain::Null)
+        && operator.is_some_and(|op| operator_certain(op, snapshot, ProVolatile::Volatile, true))
+    {
+        return Certain::Null;
+    }
+    if folded.contains(&Certain::Not) || folded.contains(&Certain::Null) {
+        return Certain::Not;
+    }
+    // A comparison of two constants the analyzer can compute.
+    if kind == ast::AExprKind::AexprOp
+        && let (Some(l), Some(r)) = (e.lexpr.as_ref(), e.rexpr.as_ref())
+    {
+        if let (Some(l), Some(r)) = (int_literal(Some(l)), int_literal(Some(r))) {
+            let v = match operator {
+                Some("=") => Some(l == r),
+                Some("<>" | "!=") => Some(l != r),
+                Some("<") => Some(l < r),
+                Some(">") => Some(l > r),
+                Some("<=") => Some(l <= r),
+                Some(">=") => Some(l >= r),
+                _ => None,
+            };
+            if let Some(v) = v {
+                return Certain::Bool(v);
+            }
+        }
+        if let (Some(a), Some(b)) = (certain_literal(Some(l)), certain_literal(Some(r))) {
+            match (operator, &a, &b) {
+                (Some("="), Literal::Str(a), Literal::Str(b)) => return Certain::Bool(a == b),
+                (Some("<>" | "!="), Literal::Str(a), Literal::Str(b)) => {
+                    return Certain::Bool(a != b);
+                }
+                _ => {}
+            }
+        }
+    }
+    // Any other operator over constants folds to a constant, if every
+    // implementation is immutable; its value (and NULL-ness) is unknown.
+    if operator.is_some_and(|op| operator_certain(op, snapshot, ProVolatile::Immutable, false)) {
+        Certain::UnknownValue
+    } else {
+        Certain::Not
+    }
+}
+
+/// Whether every operator named `op`'s implementation is at most
+/// `volatility` (and, when `strict`, strict).
+fn operator_certain(op: &str, snapshot: &PgCatalog, volatility: ProVolatile, strict: bool) -> bool {
+    let mut any = false;
+    for o in snapshot.pg_operator.values().filter(|o| o.oprname == op) {
+        any = true;
+        let Some(p) = o.oprcode.and_then(|c| snapshot.pg_proc.get(&c)) else {
+            return false;
+        };
+        if !at_most(p.provolatile, volatility) || (strict && !p.proisstrict) {
+            return false;
+        }
+    }
+    any
+}
+
+/// Whether volatility `v` is at most `limit`.
+fn at_most(v: ProVolatile, limit: ProVolatile) -> bool {
+    match limit {
+        ProVolatile::Immutable => v == ProVolatile::Immutable,
+        ProVolatile::Stable => v != ProVolatile::Volatile,
+        ProVolatile::Volatile => true,
+    }
+}
+
+fn certain_func_call(fc: &ast::FuncCall, snapshot: &PgCatalog) -> Certain {
+    if fc.over.is_some() || fc.agg_filter.is_some() || fc.agg_star || !fc.agg_order.is_empty() {
+        return Certain::Not;
+    }
+    let names = extract_names(&fc.funcname);
+    let (schema, name) = match names.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] => (Some(s.as_str()), n.as_str()),
+        _ => return Certain::Not,
+    };
+    let candidates = snapshot.find_functions(schema, name);
+    if candidates.is_empty() || candidates.iter().any(|p| p.proretset) {
+        return Certain::Not;
+    }
+    let args: Vec<Certain> = fc
+        .args
+        .iter()
+        .map(|a| certainly(a.as_ref(), snapshot))
+        .collect();
+    if args.contains(&Certain::Null) && candidates.iter().all(|p| p.proisstrict) {
+        return Certain::Null;
+    }
+    if args.contains(&Certain::Not) {
+        return Certain::Not;
+    }
+    if candidates
+        .iter()
+        .all(|p| p.provolatile == ProVolatile::Immutable)
+    {
+        // evaluate_function folds the call to a Const: an immutable
+        // function may still return NULL.
+        Certain::UnknownValue
+    } else {
+        Certain::Not
+    }
+}
+
 // ─── EXECUTE's custom plans ─────────────────────────────────────────────────
 
 thread_local! {
@@ -1723,7 +2691,12 @@ impl<'a> Group<'a> {
                             // A view's query sees no CTE of the statement.
                             Some(ast::Node::SelectStmt(sel)) => {
                                 self.views.push(class.oid);
-                                self.subquery(sel, kept, &[], snapshot, owner, top);
+                                // The stored query's names were resolved
+                                // when the view was defined: looking into it
+                                // again requires no schema's USAGE.
+                                crate::privileges::suspended(|| {
+                                    self.subquery(sel, kept, &[], snapshot, owner, top);
+                                });
                                 self.views.pop();
                             }
                             _ => self.unknown_quals = true,
@@ -3215,6 +4188,345 @@ pub(crate) fn may_be_distinct(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bo
                 }
             }
             _ => {}
+        }
+        todo.extend(n.children());
+    }
+    false
+}
+
+// ─── Estimation of restrictions (`estimate_expression_value`) ───────────────
+
+thread_local! {
+    /// The expressions the planner estimates while planning the statement
+    /// (`estimate_expression_value`): the pseudoconstant side of a
+    /// restriction or join comparison, a `LIMIT` / `OFFSET` bound. A STABLE
+    /// (or IMMUTABLE) call over constant arguments there runs while planning
+    /// (`evaluate_function`'s estimation mode).
+    ///
+    /// One frame per query level (or per expression): the innermost one is
+    /// the only one that applies, so a sublink's own level doesn't inherit
+    /// its enclosing level's marks.
+    static ESTIMABLE_SIDES: RefCell<Vec<std::collections::HashSet<NodeKey<ast::Node>>>> =
+        const { RefCell::new(Vec::new()) };
+    /// How deep in such an expression the analysis is.
+    static ESTIMATING: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The guard of [`ESTIMATING`]: the expression being analyzed is one the
+/// planner estimates.
+struct EstimatedGuard;
+
+impl EstimatedGuard {
+    fn enter() -> Self {
+        ESTIMATING.with(|c| c.set(c.get() + 1));
+        EstimatedGuard
+    }
+}
+
+impl Drop for EstimatedGuard {
+    fn drop(&mut self) {
+        ESTIMATING.with(|c| c.set(c.get() - 1));
+    }
+}
+
+/// Whether the expression being analyzed is one the planner estimates.
+pub(crate) fn estimating() -> bool {
+    ESTIMATING.with(Cell::get) > 0
+}
+
+/// The guard of [`enter_estimated`].
+pub(crate) struct EstimatedScope {
+    _guard: Option<EstimatedGuard>,
+}
+
+/// Enter the estimation frame of the expression `node`, if it is one the
+/// planner estimates (see [`with_estimated_qual`]): everything inside it may
+/// run a constant-argument STABLE call while planning.
+pub(crate) fn enter_estimated(node: Option<&ast::Node>) -> EstimatedScope {
+    let hit = ESTIMABLE_SIDES.with(|sides| {
+        sides
+            .borrow()
+            .last()
+            .is_some_and(|sides| node.is_some_and(|n| sides.contains(&NodeKey::of(n))))
+    });
+    EstimatedScope {
+        _guard: hit.then(EstimatedGuard::enter),
+    }
+}
+
+fn with_estimated<R>(sides: Vec<NodeKey<ast::Node>>, f: impl FnOnce() -> R) -> R {
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            ESTIMABLE_SIDES.with(|sides| {
+                sides.borrow_mut().pop();
+            });
+        }
+    }
+    ESTIMABLE_SIDES.with(|current| current.borrow_mut().push(sides.into_iter().collect()));
+    let _pop = Pop;
+    f()
+}
+
+/// Run `f`, the analysis of a `WHERE` / `JOIN ... ON` clause of `scope`'s
+/// level: the planner estimates the pseudoconstant side of each of its
+/// restriction comparisons (`selfuncs.c`'s `get_restriction_variable`,
+/// `scalararraysel` and the BooleanTest fallback), which runs a constant
+/// argument STABLE call there while planning.
+pub(crate) fn with_estimated_qual<R>(
+    qual: Option<&ast::Node>,
+    scope: &crate::scope::Scope,
+    snapshot: &PgCatalog,
+    f: impl FnOnce() -> R,
+) -> R {
+    let sides = estimated_sides(qual, scope, snapshot);
+    with_estimated(sides, f)
+}
+
+/// Run `f`, the analysis of a `LIMIT` / `OFFSET` expression: the planner
+/// estimates its value while planning every query with a Limit node
+/// (`preprocess_limit`), running a constant argument STABLE call there.
+pub(crate) fn with_estimated_limit<R>(expr: Option<&ast::Node>, f: impl FnOnce() -> R) -> R {
+    with_estimated(expr.map(NodeKey::of).into_iter().collect(), f)
+}
+
+/// Run `f`, the analysis of a `TABLESAMPLE` method's first parameter: a
+/// sample scan's size estimate (`set_tablesample_rel_size` →
+/// `SampleScanGetSampleSize`) `estimate_expression_value`s it, running a
+/// constant argument STABLE call there. The `REPEATABLE` seed is no part of
+/// the estimate: only `eval_const_expressions` folds it.
+pub(crate) fn with_estimated_sample<R>(arg: Option<&ast::Node>, f: impl FnOnce() -> R) -> R {
+    with_estimated(arg.map(NodeKey::of).into_iter().collect(), f)
+}
+
+/// The sub-expressions of a `WHERE` / `ON` clause that the planner reduces
+/// to constants while estimating the clause's selectivity: for each
+/// comparison with a relation column on one side and none on the other, the
+/// side without columns is `estimate_expression_value`'d. The walk follows
+/// `clause_selectivity`: AND / OR arguments, NOT, a BooleanTest other than
+/// UNKNOWN (whose fallback recurses into the argument), and gives up on a
+/// clause `eval_const_expressions` certainly replaces by a constant.
+fn estimated_sides(
+    qual: Option<&ast::Node>,
+    scope: &crate::scope::Scope,
+    snapshot: &PgCatalog,
+) -> Vec<NodeKey<ast::Node>> {
+    let mut out = Vec::new();
+    if let Some(inner) = qual {
+        estimated_sides_here(inner.to_ref(), scope, snapshot, &mut out);
+    }
+    out
+}
+
+fn estimated_sides_here(
+    n: typedpg_pg_query::NodeRef<'_>,
+    scope: &crate::scope::Scope,
+    snapshot: &PgCatalog,
+    out: &mut Vec<NodeKey<ast::Node>>,
+) {
+    use typedpg_pg_query::NodeRef;
+    match n {
+        NodeRef::BoolExpr(b) => {
+            let op = Some(b.boolop);
+            for arg in &b.args {
+                let folded = fold_qual(arg.as_ref(), snapshot);
+                match (op, folded) {
+                    // A constant FALSE decides an AND: the clause is gone.
+                    (Some(ast::BoolExprType::AndExpr), Folded::Bool(false) | Folded::Null) => {
+                        return;
+                    }
+                    // Likewise TRUE for an OR.
+                    (Some(ast::BoolExprType::OrExpr), Folded::Bool(true)) => return,
+                    (Some(ast::BoolExprType::AndExpr), Folded::Bool(true))
+                    | (Some(ast::BoolExprType::OrExpr), Folded::Bool(false) | Folded::Null) => {
+                        continue;
+                    }
+                    _ => {
+                        if let Some(inner) = arg.as_ref() {
+                            estimated_sides_here(inner.to_ref(), scope, snapshot, out);
+                        }
+                    }
+                }
+            }
+        }
+        NodeRef::BooleanTest(t) => {
+            // `booltestsel` falls back to `clause_selectivity` of the
+            // argument for IS [NOT] TRUE / FALSE; IS UNKNOWN doesn't.
+            if matches!(
+                t.booltesttype,
+                ast::BoolTestType::IsTrue
+                    | ast::BoolTestType::IsFalse
+                    | ast::BoolTestType::IsNotTrue
+                    | ast::BoolTestType::IsNotFalse
+            ) && let Some(arg) = t.arg.as_ref()
+            {
+                estimated_sides_here(arg.to_ref(), scope, snapshot, out);
+            }
+        }
+        NodeRef::AExpr(e) => {
+            let kind = Some(e.kind);
+            match kind {
+                Some(
+                    ast::AExprKind::AexprOp
+                    | ast::AExprKind::AexprDistinct
+                    | ast::AExprKind::AexprNotDistinct,
+                ) => {
+                    // `get_restriction_variable`: the side without a Var of
+                    // the relation being estimated is reduced with
+                    // `estimate_expression_value`. Which relation is the one
+                    // estimated depends on the paths the planner costs: a
+                    // parameterized path for either relation of a join
+                    // compares the other side as a pseudoconstant
+                    // (`get_baserel_parampathinfo` → `get_parameterized_
+                    // baserel_size`). So a side is estimated when the other
+                    // reads a relation it doesn't — for a join clause with
+                    // columns on both sides that is both sides. The planner
+                    // chooses those paths by cost (an index, the statistics);
+                    // treating both as run keeps a denial without depending
+                    // on the plan.
+                    let left = level_column_sources(e.lexpr.as_ref(), scope);
+                    let right = level_column_sources(e.rexpr.as_ref(), scope);
+                    let left_estimated = right.iter().any(|s| !left.contains(s));
+                    let right_estimated = left.iter().any(|s| !right.contains(s));
+                    if left_estimated {
+                        mark_side(e.lexpr.as_ref(), out);
+                    }
+                    if right_estimated {
+                        mark_side(e.rexpr.as_ref(), out);
+                    }
+                }
+                Some(
+                    ast::AExprKind::AexprIn
+                    | ast::AExprKind::AexprOpAny
+                    | ast::AExprKind::AexprOpAll,
+                ) => {
+                    // `scalararraysel` estimates both operands whatever
+                    // relations they read (the clause returned early only
+                    // when it has no Var at all).
+                    let left = level_column_sources(e.lexpr.as_ref(), scope);
+                    let right = level_column_sources(e.rexpr.as_ref(), scope);
+                    if !left.is_empty() || !right.is_empty() {
+                        mark_side(e.lexpr.as_ref(), out);
+                        mark_side(e.rexpr.as_ref(), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        NodeRef::TypeCast(tc) => {
+            // `clause_selectivity` looks through a no-op relabeling
+            // (`RelabelType`, `CoerceToDomain`), which a cast to plain
+            // boolean becomes.
+            if cast_target_is_bool(tc)
+                && let Some(arg) = tc.arg.as_ref()
+            {
+                estimated_sides_here(arg.to_ref(), scope, snapshot, out);
+            }
+        }
+        // A NullTest's selectivity never recurses into its argument
+        // (`nulltestsel`), and anything else isn't a comparison.
+        _ => {}
+    }
+}
+
+/// Mark the sub-expressions of one operand of a comparison the planner
+/// estimates: the operand itself, or the elements of an `IN` / `= ANY`
+/// array (which is what the analysis reaches).
+fn mark_side(side: Option<&ast::Node>, out: &mut Vec<NodeKey<ast::Node>>) {
+    let Some(side) = side else {
+        return;
+    };
+    if contains_sublink(Some(side)) {
+        return;
+    }
+    match side {
+        ast::Node::List(list) => {
+            for item in list.items.iter().flatten() {
+                if !contains_sublink(Some(item)) {
+                    out.push(NodeKey::of(item));
+                }
+            }
+        }
+        ast::Node::AArrayExpr(array) => {
+            for element in array.elements.iter().flatten() {
+                if !contains_sublink(Some(element)) {
+                    out.push(NodeKey::of(element));
+                }
+            }
+        }
+        _ => out.push(NodeKey::of(side)),
+    }
+}
+
+/// The aliases of `scope`'s own FROM items `node` reads columns of: the
+/// relations of the Vars it holds. A sublink's columns are its own query's.
+fn level_column_sources(node: Option<&ast::Node>, scope: &crate::scope::Scope) -> Vec<String> {
+    use typedpg_pg_query::NodeRef;
+    let mut out: Vec<String> = Vec::new();
+    let Some(node) = node else {
+        return out;
+    };
+    let Some(inner) = Some(node) else {
+        return out;
+    };
+    let mut todo = vec![inner.to_ref()];
+    while let Some(n) = todo.pop() {
+        match n {
+            NodeRef::SubLink(_) => continue,
+            NodeRef::ColumnRef(cr) => {
+                let names: Vec<&str> = cr
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.as_ref() {
+                        Some(ast::Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let stars = cr
+                    .fields
+                    .iter()
+                    .filter(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
+                    .count();
+                let sources: Vec<&str> = if stars > 0 {
+                    // `*` is every column of the level; `t.*` is t's row.
+                    match names.as_slice() {
+                        [] => scope
+                            .sources
+                            .iter()
+                            .map(|s| s.alias.as_str())
+                            .collect::<Vec<_>>(),
+                        [table] if scope.is_level_source(table) => vec![table],
+                        _ => Vec::new(),
+                    }
+                } else {
+                    match names.as_slice() {
+                        [column] => scope.level_column_sources(None, column),
+                        [table, column] => scope.level_column_sources(Some(table), column),
+                        _ => Vec::new(),
+                    }
+                };
+                for source in sources {
+                    if !out.iter().any(|s| s == source) {
+                        out.push(source.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+        todo.extend(n.children());
+    }
+    out
+}
+
+fn contains_sublink(node: Option<&ast::Node>) -> bool {
+    use typedpg_pg_query::NodeRef;
+    let Some(inner) = node else {
+        return false;
+    };
+    let mut todo = vec![inner.to_ref()];
+    while let Some(n) = todo.pop() {
+        if matches!(n, NodeRef::SubLink(_)) {
+            return true;
         }
         todo.extend(n.children());
     }

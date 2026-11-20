@@ -397,6 +397,8 @@ pub fn lookup_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Result<PgTypeOid
         }
     };
 
+    // A stored policy follows a type's rename / `SET SCHEMA`.
+    crate::ddl::policies::note_type_ref(tn.location, base_oid);
     // An array of a type without one (an array type itself: `_int4[]`)
     // doesn't exist either.
     if !tn.array_bounds.is_empty() {

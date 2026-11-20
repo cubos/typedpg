@@ -66,6 +66,7 @@ pub fn alter_owner(interp: &mut PgCatalog, stmt: &AlterOwnerStmt) -> Result<(), 
     if let Some(rv) = stmt.relation.as_ref() {
         let (_, relid) = super::util::lookup_relation(interp, rv)?;
         if let Some(owner) = new_owner {
+            super::sequences::check_sequence_owner_change(interp, relid, owner)?;
             acl::change_relation_owner(interp, relid, owner);
         }
         return Ok(());
@@ -85,6 +86,7 @@ pub fn alter_owner(interp: &mut PgCatalog, stmt: &AlterOwnerStmt) -> Result<(), 
         | ObjectType::ObjectForeignTable => {
             let parts = object_names(object);
             if let Some(relid) = relation_oid(interp, &parts) {
+                super::sequences::check_sequence_owner_change(interp, relid, owner)?;
                 acl::change_relation_owner(interp, relid, owner);
             }
         }
@@ -125,6 +127,14 @@ pub fn alter_owner(interp: &mut PgCatalog, stmt: &AlterOwnerStmt) -> Result<(), 
             interp.change_object_owner(AclObject::Type(oid), owner);
             if let Some(array) = interp.array_type_of(oid) {
                 interp.change_object_owner(AclObject::Type(array), owner);
+            }
+            // `AlterTypeOwnerInternal` follows a range's multirange type (and
+            // that type's array) too.
+            if let Some(multirange) = interp.pg_range.get(&oid).and_then(|r| r.rngmultitypid) {
+                interp.change_object_owner(AclObject::Type(multirange), owner);
+                if let Some(array) = interp.array_type_of(multirange) {
+                    interp.change_object_owner(AclObject::Type(array), owner);
+                }
             }
         }
         ObjectType::ObjectSchema => {

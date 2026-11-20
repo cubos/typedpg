@@ -363,6 +363,38 @@ pub(crate) fn infinite_rule_recursion(relation: &str) -> RawError {
     )
 }
 
+/// `check_enable_rls` (rls.c): the session's `row_security` is off and row
+/// security applies to the relation, so PG rejects the statement instead of
+/// filtering its rows — SQLSTATE 42501. The caller passes `owner` when the
+/// checking role is the table's owner (whose `FORCE ROW LEVEL SECURITY`
+/// made it apply), which adds PG's hint.
+pub(crate) fn row_security_off(relation: &str, owner: bool) -> RawError {
+    RawError::new(
+        AnalyzeError::InsufficientPrivilege(format!(
+            "query would be affected by row-level security policy for table \"{relation}\""
+        )),
+        None,
+        owner.then(|| {
+            "To disable the policy for the table's owner, use ALTER TABLE NO FORCE ROW LEVEL \
+             SECURITY."
+                .to_owned()
+        }),
+    )
+}
+
+/// `fireRIRrules` (rewriteHandler.c): a policy's subquery reaches its own
+/// relation (directly or through other relations' policies), so the
+/// rewriter would expand it forever — SQLSTATE 42P17.
+pub(crate) fn infinite_policy_recursion(relation: &str) -> RawError {
+    RawError::new(
+        AnalyzeError::InvalidObjectDefinition(format!(
+            "infinite recursion detected in policy for relation \"{relation}\""
+        )),
+        None,
+        None,
+    )
+}
+
 /// matchLocks: `cannot execute MERGE on relation "r"` — SQLSTATE 0A000.
 pub(crate) fn merge_on_relation_with_rules(relation: &str) -> RawError {
     RawError::new(

@@ -19,6 +19,8 @@
 
 /* The installed catalog, or NULL when the built-in rows answer. */
 static TypedpgCatalog const *current_catalog = NULL;
+/* > 0 while PL/pgSQL compiles a function body (not its signature). */
+static int body_depth = 0;
 
 /* The search path shim_init() sets, the one an empty database has. */
 #define TYPEDPG_DEFAULT_SEARCH_PATH "\"$user\", public"
@@ -43,6 +45,7 @@ install_search_path(const char *path)
 void
 typedpg_catalog_install(const TypedpgCatalog *catalog)
 {
+	body_depth = 0;
 	if (catalog == NULL)
 	{
 		current_catalog = NULL;
@@ -92,6 +95,25 @@ typedpg_catalog_install(const TypedpgCatalog *catalog)
 
 	current_catalog = catalog;
 	typedpg_invalidate_syscaches();
+}
+
+void
+typedpg_catalog_enter_body(void)
+{
+	body_depth++;
+}
+
+void
+typedpg_catalog_leave_body(void)
+{
+	if (body_depth > 0)
+		body_depth--;
+}
+
+bool
+typedpg_catalog_in_body(void)
+{
+	return body_depth > 0;
 }
 
 bool

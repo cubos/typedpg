@@ -1,0 +1,6 @@
+error: query resolves differently for roles "sp_alt" and "sp_public": column "x" is text for "sp_alt" and integer for "sp_public" (the roles' search_path settings differ)
+ --> src/bin/fail_role_search_path_disagreement.rs:6:40
+  |
+6 |     typedpg::sql!(db = searchpath, db, "SELECT x FROM items")
+  |                                        ^^^^^^^^^^^^^^^^^^^^^
+

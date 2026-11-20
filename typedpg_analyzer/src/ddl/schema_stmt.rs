@@ -115,6 +115,23 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
         .collect();
     elements.sort_by_key(|node| rank(node));
     let saved = interp.push_search_path_front(&name);
+    // If the requested authorization is different from the current user,
+    // temporarily set the current user so that the elements are created with
+    // the correct ownership (`CreateSchemaCommand`'s
+    // `SetUserIdAndSecContext(owner_uid)`).
+    let saved_identity = interp.session_identity.clone();
+    let owner_name = interp.roles.name(owner).to_owned();
+    let current_name = interp
+        .session_identity
+        .current_user()
+        .map(str::to_owned)
+        .unwrap_or_else(|| PgCatalog::MIGRATIONS_USER.to_owned());
+    if owner_name != current_name {
+        interp
+            .session_identity
+            .set_session_role(Some(owner_name), false);
+        interp.refresh_search_path();
+    }
     let mut result = Ok(());
     for node in elements {
         result = super::apply_statement(interp, node);
@@ -122,6 +139,8 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
             break;
         }
     }
+    interp.session_identity = saved_identity;
+    interp.refresh_search_path();
     interp.restore_search_path(saved);
     result
 }

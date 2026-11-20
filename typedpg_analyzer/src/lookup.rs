@@ -684,8 +684,13 @@ impl PgCatalog {
         ) {
             Ok((result_type_oid, _)) => {
                 crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::operator(chosen.oid));
-                // ExecInitFunc runs the operator's function: EXECUTE.
-                if let Some(code) = chosen.oprcode {
+                // ExecInitFunc runs the operator's function: EXECUTE. A call
+                // site that records the call itself (see
+                // `privileges::resolve_operator_quietly`) skips this, for a
+                // STRICT call over a NULL operand never reaches ExecInitFunc.
+                if let Some(code) = chosen.oprcode
+                    && !crate::privileges::quiet_operator()
+                {
                     crate::privileges::note_routine(code, crate::privileges::RoutineKind::Function);
                 }
                 OperatorMatch::Found(ResolvedOperator {

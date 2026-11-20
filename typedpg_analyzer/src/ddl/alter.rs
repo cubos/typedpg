@@ -245,6 +245,8 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     crate::ddl::util::check_relation_name_unused(interp, nsoid, &new_name)?;
 
     let class = interp.pg_class.get(&class_oid).cloned();
+    // A stored policy expression names its relations: follow the rename.
+    crate::ddl::policies::rewrite_relation_refs(interp, class_oid, None, &new_name);
     interp.rename_pg_class(class_oid, new_name.clone(), nsoid);
     // A renamed relation is no longer the seeded one of that name.
     interp.mark_relation_modified(class_oid);
@@ -499,6 +501,8 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     crate::ddl::schema_stmt::check_schema_name(new)?;
 
     interp.rename_pg_namespace(nsoid, new.clone());
+    // Stored policy expressions that name the schema follow it.
+    crate::ddl::policies::rewrite_schema_refs(interp, nsoid, new);
     views::rewrite_views_on_schema_rename(interp, old, new);
     Ok(())
 }
@@ -584,6 +588,7 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
                 ));
             }
             interp.move_pg_operator(oid, new_nsoid);
+            crate::ddl::policies::rewrite_operator_refs(interp, oid, &new_schema);
             Ok(())
         }
         ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match &stmt.object {
@@ -775,6 +780,8 @@ fn set_relation_schema(
     }
 
     let name = class.relname.clone();
+    // A stored policy expression names its relations: follow the move.
+    crate::ddl::policies::rewrite_relation_refs(interp, class_oid, Some(new_schema), &name);
     interp.rename_pg_class(class_oid, name.clone(), new_nsoid);
     for t in row_types {
         if let Some(typname) = interp.pg_type.get(&t).map(|t| t.typname.clone()) {

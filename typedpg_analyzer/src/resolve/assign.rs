@@ -496,9 +496,27 @@ pub(crate) fn analyze_set_clause<'a>(
                 // EXPR_KIND_UPDATE_SOURCE (also ON CONFLICT and MERGE SET);
                 // an aggregate of this level in a sublink of the value is
                 // placed here too.
-                crate::grouping::with_clause(Some("UPDATE"), || {
+                let value = crate::grouping::with_clause(Some("UPDATE"), || {
                     target.infer_value(val, goal, ctx, params)
                 })?;
+                // `coerce_type` leaves a value already of the column's type
+                // unchanged: its domain constraints don't run. (A parameter
+                // is received through the domain's input function, which
+                // checks it anyway.)
+                if !target.indirected {
+                    crate::privileges::note_column_value(
+                        tc.attrelid,
+                        &tc.attname,
+                        Some(value.type_oid),
+                    );
+                    if matches!(val.as_ref(), Some(ast::Node::ParamRef(_)))
+                        && snapshot
+                            .get_type(value.type_oid)
+                            .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Domain)
+                    {
+                        crate::privileges::note_domain_coercion(value.type_oid);
+                    }
+                }
                 crate::clause::check_no_aggregates_or_windows(val, snapshot, "UPDATE")?;
                 check_no_srf_in_clause(val, snapshot, "UPDATE")?;
                 if let Some(ast::Node::ParamRef(p)) = val
@@ -524,6 +542,13 @@ pub(crate) fn analyze_set_clause<'a>(
                         snapshot,
                         crate::error::SourceSpan::from_node_qname(rt.location),
                     ));
+                }
+                if !target.indirected {
+                    crate::privileges::note_column_value(
+                        tc.attrelid,
+                        &tc.attname,
+                        Some(col.type_oid),
+                    );
                 }
             }
         }

@@ -1725,3 +1725,1096 @@ fn drop_role_refuses_a_role_that_granted_privileges() {
         Privilege::Select
     ));
 }
+
+#[test]
+fn serial_sequences_of_a_role_created_table_belong_to_it() {
+    // `transformColumnDefinition` / `generateSerialExtraStmts` create a
+    // table's serial and identity sequences before the table's owner is
+    // recorded; they still belong to the role creating the table, with that
+    // role's sequence default privileges.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_serial_role;
+         CREATE ROLE acl_serial_app;
+         ALTER DEFAULT PRIVILEGES FOR ROLE acl_serial_role
+             GRANT SELECT ON SEQUENCES TO acl_serial_app;
+         CREATE SCHEMA acl_serial_s AUTHORIZATION acl_serial_role;
+         SET ROLE acl_serial_role;
+         CREATE TABLE acl_serial_s.t (id serial, ident int GENERATED ALWAYS AS IDENTITY);
+         RESET ROLE;",
+    )]);
+    for name in ["t_id_seq", "t_ident_seq"] {
+        let sequence = relation(&db, "acl_serial_s", name);
+        assert!(
+            db.has_sequence_privilege("acl_serial_role", sequence, Privilege::Usage),
+            "the sequence {name} belongs to the role that owns the table"
+        );
+        assert!(
+            db.has_sequence_privilege("acl_serial_app", sequence, Privilege::Select),
+            "the sequence {name} takes its owner's default privileges"
+        );
+        assert!(!db.has_sequence_privilege("acl_serial_app", sequence, Privilege::Update));
+    }
+    assert!(db.has_sequence_privilege(
+        MIGRATIONS_USER,
+        relation(&db, "acl_serial_s", "t_id_seq"),
+        Privilege::Usage
+    ));
+}
+
+#[test]
+fn schema_elements_are_created_as_the_schema_owner() {
+    // CreateSchemaCommand temporarily becomes the schema's owner
+    // (`SetUserIdAndSecContext`), so its elements are the owner's — and take
+    // the owner's default privileges.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_schema_el_owner;
+         CREATE ROLE acl_schema_el_app;
+         CREATE ROLE acl_schema_el_other;
+         ALTER DEFAULT PRIVILEGES FOR ROLE acl_schema_el_owner
+             GRANT SELECT ON TABLES TO acl_schema_el_app;
+         CREATE SCHEMA acl_schema_el AUTHORIZATION acl_schema_el_owner
+             CREATE TABLE t (id int)
+             CREATE VIEW v AS SELECT id FROM t;",
+    )]);
+    for name in ["t", "v"] {
+        assert!(table_has(
+            &db,
+            "acl_schema_el_owner",
+            "acl_schema_el",
+            name,
+            Privilege::Select
+        ));
+        assert!(
+            table_has(
+                &db,
+                "acl_schema_el_app",
+                "acl_schema_el",
+                name,
+                Privilege::Select
+            ),
+            "the schema element {name} gets the owner's default privileges"
+        );
+        assert!(!table_has(
+            &db,
+            "acl_schema_el_other",
+            "acl_schema_el",
+            name,
+            Privilege::Insert
+        ));
+    }
+}
+
+#[test]
+fn drop_owned_revokes_only_the_owners_grants() {
+    // DROP OWNED issues `REVOKE ALL FROM role` as each object's owner
+    // (RemoveRoleFromObjectACL), so a grant another grantor made to the role
+    // survives.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE ROLE acl_do_owner;
+             CREATE ROLE acl_do_grantor;
+             CREATE ROLE acl_do_r;
+             CREATE SCHEMA acl_do_s AUTHORIZATION acl_do_owner;
+             GRANT USAGE ON SCHEMA acl_do_s TO acl_do_grantor;
+             SET ROLE acl_do_owner;
+             CREATE TABLE acl_do_s.t (id int);
+             GRANT SELECT ON acl_do_s.t TO acl_do_grantor WITH GRANT OPTION;
+             GRANT INSERT ON acl_do_s.t TO acl_do_r;
+             RESET ROLE;
+             SET ROLE acl_do_grantor;
+             GRANT SELECT ON acl_do_s.t TO acl_do_r;
+             RESET ROLE;
+             CREATE ROLE acl_do_membership;
+             CREATE ROLE acl_do_member;
+             CREATE TABLE acl_do_membership_t (id int);
+             GRANT SELECT ON acl_do_membership_t TO acl_do_membership;
+             GRANT acl_do_membership TO acl_do_r WITH ADMIN OPTION;
+             SET ROLE acl_do_r;
+             GRANT acl_do_membership TO acl_do_member;
+             RESET ROLE;",
+        ),
+        ("0002.sql", "DROP OWNED BY acl_do_r;"),
+    ]);
+    let table = relation(&db, "acl_do_s", "t");
+    assert!(db.has_table_privilege("acl_do_r", table, Privilege::Select));
+    assert!(!db.has_table_privilege("acl_do_r", table, Privilege::Insert));
+    // The membership the role granted goes with it.
+    assert!(!table_has(
+        &db,
+        "acl_do_member",
+        "public",
+        "acl_do_membership_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn drop_owned_restrict_fails_on_other_roles_dependents() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_do2_owner;
+         CREATE ROLE acl_do2_viewer;
+         CREATE SCHEMA acl_do2_s AUTHORIZATION acl_do2_owner;
+         SET ROLE acl_do2_owner;
+         CREATE TABLE acl_do2_s.t (id int);
+         RESET ROLE;
+         GRANT USAGE, CREATE ON SCHEMA acl_do2_s TO acl_do2_viewer;
+         GRANT SELECT ON acl_do2_s.t TO acl_do2_viewer;
+         SET ROLE acl_do2_viewer;
+         CREATE VIEW acl_do2_s.v AS SELECT id FROM acl_do2_s.t;
+         RESET ROLE;
+         DROP OWNED BY acl_do2_owner;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop desired object(s) because other objects depend on them (view \
+         acl_do2_s.v depends on table acl_do2_s.t)"
+    );
+}
+
+#[test]
+fn drop_owned_cascade_drops_other_roles_dependents() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_do3_owner;
+         CREATE ROLE acl_do3_viewer;
+         CREATE SCHEMA acl_do3_s AUTHORIZATION acl_do3_owner;
+         SET ROLE acl_do3_owner;
+         CREATE TABLE acl_do3_s.t (id int);
+         RESET ROLE;
+         GRANT USAGE, CREATE ON SCHEMA acl_do3_s TO acl_do3_viewer;
+         GRANT SELECT ON acl_do3_s.t TO acl_do3_viewer;
+         SET ROLE acl_do3_viewer;
+         CREATE VIEW acl_do3_s.v AS SELECT id FROM acl_do3_s.t;
+         RESET ROLE;
+         DROP OWNED BY acl_do3_owner CASCADE;",
+    )]);
+    assert!(db.namespace_oid("acl_do3_s").is_none());
+    assert!(db.resolve_table(Some("acl_do3_s"), "t").is_none());
+    assert!(db.resolve_table(Some("acl_do3_s"), "v").is_none());
+}
+
+#[test]
+fn role_granted_by_records_and_revokes_the_named_grantor() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_gb_g;
+         CREATE ROLE acl_gb_grantor;
+         CREATE ROLE acl_gb_app;
+         CREATE TABLE acl_gb_t (id int);
+         GRANT SELECT ON acl_gb_t TO acl_gb_g;
+         GRANT acl_gb_g TO acl_gb_grantor WITH ADMIN OPTION;
+         GRANT acl_gb_g TO acl_gb_app GRANTED BY acl_gb_grantor;
+         REVOKE acl_gb_g FROM acl_gb_app;",
+    )]);
+    // The superuser's REVOKE looks for its own grant (the bootstrap
+    // superuser's) and finds none: nothing changes.
+    assert!(table_has(
+        &db,
+        "acl_gb_app",
+        "public",
+        "acl_gb_t",
+        Privilege::Select
+    ));
+
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE ROLE acl_gb2_g;
+             CREATE ROLE acl_gb2_grantor;
+             CREATE ROLE acl_gb2_app;
+             CREATE TABLE acl_gb2_t (id int);
+             GRANT SELECT ON acl_gb2_t TO acl_gb2_g;
+             GRANT acl_gb2_g TO acl_gb2_grantor WITH ADMIN OPTION;
+             GRANT acl_gb2_g TO acl_gb2_app GRANTED BY acl_gb2_grantor;",
+        ),
+        (
+            "0002.sql",
+            "REVOKE acl_gb2_g FROM acl_gb2_app GRANTED BY acl_gb2_grantor;",
+        ),
+    ]);
+    assert!(!table_has(
+        &db,
+        "acl_gb2_app",
+        "public",
+        "acl_gb2_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn role_grant_requires_the_grantor_to_hold_admin() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_gb3_g;
+         CREATE ROLE acl_gb3_grantor;
+         CREATE ROLE acl_gb3_app;
+         GRANT acl_gb3_g TO acl_gb3_grantor;
+         GRANT acl_gb3_g TO acl_gb3_app GRANTED BY acl_gb3_grantor;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::Parse(_),
+        "permission denied to grant privileges as role \"acl_gb3_grantor\""
+    );
+}
+
+#[test]
+fn revoking_role_membership_with_dependents_needs_cascade() {
+    let setup = "CREATE ROLE acl_admin_g;
+         CREATE ROLE acl_admin_middle;
+         CREATE ROLE acl_admin_app;
+         CREATE TABLE acl_admin_t (id int);
+         GRANT SELECT ON acl_admin_t TO acl_admin_g;
+         GRANT acl_admin_g TO acl_admin_middle WITH ADMIN OPTION;
+         SET ROLE acl_admin_middle;
+         GRANT acl_admin_g TO acl_admin_app;
+         RESET ROLE;";
+    let result = try_apply(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             REVOKE ADMIN OPTION FOR acl_admin_g FROM acl_admin_middle;"
+        ),
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "dependent privileges exist"
+    );
+
+    let db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             REVOKE ADMIN OPTION FOR acl_admin_g FROM acl_admin_middle CASCADE;"
+        ),
+    )]);
+    assert!(!table_has(
+        &db,
+        "acl_admin_app",
+        "public",
+        "acl_admin_t",
+        Privilege::Select
+    ));
+    assert!(table_has(
+        &db,
+        "acl_admin_middle",
+        "public",
+        "acl_admin_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn role_revoke_with_cascade_keeps_grants_backed_by_a_surviving_admin() {
+    // PG's plan_recursive_revoke only descends when the member would no
+    // longer have ADMIN OPTION through any surviving grant.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_rr_g;
+         CREATE ROLE acl_rr_a;
+         CREATE ROLE acl_rr_b;
+         CREATE ROLE acl_rr_app;
+         CREATE TABLE acl_rr_t (id int);
+         GRANT SELECT ON acl_rr_t TO acl_rr_g;
+         GRANT acl_rr_g TO acl_rr_a WITH ADMIN OPTION;
+         SET ROLE acl_rr_a;
+         GRANT acl_rr_g TO acl_rr_b WITH ADMIN OPTION;
+         SET ROLE acl_rr_b;
+         GRANT acl_rr_g TO acl_rr_app;
+         RESET ROLE;
+         GRANT acl_rr_g TO acl_rr_b WITH ADMIN OPTION;
+         REVOKE acl_rr_g FROM acl_rr_b CASCADE;",
+    )]);
+    assert!(table_has(
+        &db,
+        "acl_rr_app",
+        "public",
+        "acl_rr_t",
+        Privilege::Select
+    ));
+    assert!(db.role_exists("acl_rr_app"));
+}
+
+#[test]
+fn grant_through_an_inherited_grant_option_records_the_inherited_role() {
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE ROLE acl_bg_group;
+             CREATE ROLE acl_bg_member;
+             CREATE ROLE acl_bg_app;
+             CREATE TABLE acl_bg_t (id int);
+             GRANT SELECT ON acl_bg_t TO acl_bg_group WITH GRANT OPTION;
+             GRANT acl_bg_group TO acl_bg_member;
+             SET ROLE acl_bg_member;
+             GRANT SELECT ON acl_bg_t TO acl_bg_app;
+             RESET ROLE;",
+        ),
+        (
+            "0002.sql",
+            "REVOKE SELECT ON acl_bg_t FROM acl_bg_group CASCADE;",
+        ),
+    ]);
+    assert!(!table_has(
+        &db,
+        "acl_bg_app",
+        "public",
+        "acl_bg_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn grants_and_revokes_are_limited_to_the_grantors_grant_options() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_po_g;
+             CREATE ROLE acl_po_app;
+             CREATE TABLE acl_po_t (id int);
+             GRANT INSERT ON acl_po_t TO acl_po_app;
+             GRANT SELECT ON acl_po_t TO acl_po_g WITH GRANT OPTION;
+             SET ROLE acl_po_g;
+             GRANT ALL PRIVILEGES ON acl_po_t TO acl_po_app;
+             RESET ROLE;",
+    )]);
+    let table = relation(&db, "public", "acl_po_t");
+    // The grantor only holds SELECT WITH GRANT OPTION: GRANT ALL only grants
+    // SELECT (restrict_and_check_grant), and the owner's INSERT survives.
+    assert!(db.has_table_privilege("acl_po_app", table, Privilege::Select));
+    assert!(db.has_table_privilege("acl_po_app", table, Privilege::Insert));
+    for privilege in [
+        Privilege::Update,
+        Privilege::Delete,
+        Privilege::Truncate,
+        Privilege::References,
+        Privilege::Trigger,
+        Privilege::Maintain,
+    ] {
+        assert!(
+            !db.has_table_privilege("acl_po_app", table, privilege),
+            "grantor without the {privilege:?} grant option cannot grant it"
+        );
+    }
+
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE ROLE acl_po2_g;
+             CREATE ROLE acl_po2_app;
+             CREATE TABLE acl_po2_t (id int);
+             GRANT INSERT ON acl_po2_t TO acl_po2_app;
+             GRANT SELECT ON acl_po2_t TO acl_po2_g WITH GRANT OPTION;
+             SET ROLE acl_po2_g;
+             GRANT ALL PRIVILEGES ON acl_po2_t TO acl_po2_app;
+             RESET ROLE;",
+        ),
+        (
+            "0002.sql",
+            "SET ROLE acl_po2_g;
+             REVOKE ALL PRIVILEGES ON acl_po2_t FROM acl_po2_app;
+             RESET ROLE;",
+        ),
+    ]);
+    let table = relation(&db, "public", "acl_po2_t");
+    // The REVOKE could only revoke what the grantor granted: its SELECT.
+    assert!(!db.has_table_privilege("acl_po2_app", table, Privilege::Select));
+    assert!(db.has_table_privilege("acl_po2_app", table, Privilege::Insert));
+}
+
+#[test]
+fn the_owner_keeps_grant_options_through_membership() {
+    // recursive_revoke's aclmask treats a member of the owner as holding
+    // every grant option, so revoking the grant does not cascade into the
+    // grants it made.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE ROLE acl_og_owner;
+             CREATE ROLE acl_og_holder;
+             CREATE ROLE acl_og_app;
+             GRANT acl_og_owner TO acl_og_holder;
+             CREATE SCHEMA acl_og_s AUTHORIZATION acl_og_owner;
+             SET ROLE acl_og_owner;
+             CREATE TABLE acl_og_s.t (id int);
+             GRANT SELECT ON acl_og_s.t TO acl_og_holder WITH GRANT OPTION;
+             RESET ROLE;
+             SET ROLE acl_og_holder;
+             GRANT SELECT ON acl_og_s.t TO acl_og_app;
+             RESET ROLE;",
+        ),
+        (
+            "0002.sql",
+            "REVOKE SELECT ON acl_og_s.t FROM acl_og_holder CASCADE;",
+        ),
+    ]);
+    assert!(table_has(
+        &db,
+        "acl_og_app",
+        "acl_og_s",
+        "t",
+        Privilege::Select
+    ));
+    assert!(table_has(
+        &db,
+        "acl_og_holder",
+        "acl_og_s",
+        "t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn added_columns_take_their_tables_owners_default_privileges() {
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE ROLE acl_addcol_owner;
+             CREATE ROLE acl_addcol_cur;
+             CREATE ROLE acl_addcol_app;
+             CREATE SCHEMA acl_addcol_s AUTHORIZATION acl_addcol_owner;
+             GRANT USAGE, CREATE ON SCHEMA acl_addcol_s TO acl_addcol_cur;
+             SET ROLE acl_addcol_owner;
+             CREATE TABLE acl_addcol_s.t (a int);
+             RESET ROLE;
+             ALTER DEFAULT PRIVILEGES FOR ROLE acl_addcol_cur
+                 GRANT SELECT ON SEQUENCES TO acl_addcol_app;
+             GRANT acl_addcol_owner TO acl_addcol_cur;",
+        ),
+        (
+            "0002.sql",
+            "SET ROLE acl_addcol_cur;
+             ALTER TABLE acl_addcol_s.t ADD COLUMN id serial;
+             RESET ROLE;",
+        ),
+    ]);
+    let sequence = relation(&db, "acl_addcol_s", "t_id_seq");
+    // The sequence belongs to the table's owner and takes *its* (empty)
+    // default privileges, not the current role's.
+    assert!(db.has_sequence_privilege("acl_addcol_owner", sequence, Privilege::Usage));
+    assert!(!db.has_sequence_privilege("acl_addcol_app", sequence, Privilege::Select));
+}
+
+#[test]
+fn drop_role_details_name_default_privileges_and_memberships() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_dep_grantee;
+         CREATE ROLE acl_dep_owner;
+         ALTER DEFAULT PRIVILEGES FOR ROLE acl_dep_owner
+             GRANT SELECT ON TABLES TO acl_dep_grantee;
+         DROP ROLE acl_dep_grantee;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "role \"acl_dep_grantee\" cannot be dropped because some objects depend on it \
+         (privileges for default privileges on new relations belonging to role acl_dep_owner)"
+    );
+
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_dep2_g;
+         CREATE ROLE acl_dep2_member;
+         CREATE ROLE acl_dep2_grantor;
+         GRANT acl_dep2_g TO acl_dep2_member WITH ADMIN OPTION;
+         GRANT acl_dep2_g TO acl_dep2_grantor WITH ADMIN OPTION;
+         GRANT acl_dep2_g TO acl_dep2_member GRANTED BY acl_dep2_grantor;
+         DROP ROLE acl_dep2_grantor;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "role \"acl_dep2_grantor\" cannot be dropped because some objects depend on it \
+         (privileges for membership of role acl_dep2_member in role acl_dep2_g)"
+    );
+}
+
+#[test]
+fn pg_database_owner_cannot_have_members() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_pdo_member;
+         GRANT pg_database_owner TO acl_pdo_member;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::Parse(_),
+        "role \"pg_database_owner\" cannot have explicit members"
+    );
+}
+
+#[test]
+fn range_constructors_take_the_bootstrap_default_privileges() {
+    // makeRangeConstructors passes BOOTSTRAP_SUPERUSERID as proowner, so the
+    // constructors take that role's function default privileges — not the
+    // migration user's (the model keeps the two identities apart).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_range_app;
+         CREATE ROLE acl_range_other;
+         ALTER DEFAULT PRIVILEGES FOR ROLE postgres
+             REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+         ALTER DEFAULT PRIVILEGES FOR ROLE postgres
+             GRANT EXECUTE ON FUNCTIONS TO acl_range_app;
+         CREATE TYPE acl_rng_r AS RANGE (subtype = int4);",
+    )]);
+    for name in ["acl_rng_r", "acl_rng_r_multirange"] {
+        let constructors = db.find_functions(Some("public"), name);
+        assert!(!constructors.is_empty(), "the {name} constructors exist");
+        for constructor in constructors {
+            assert!(
+                db.has_function_privilege("acl_range_app", constructor.oid),
+                "the {name} constructor takes the bootstrap function defaults"
+            );
+            assert!(
+                !db.has_function_privilege("acl_range_other", constructor.oid),
+                "PUBLIC's EXECUTE was revoked in the bootstrap defaults"
+            );
+        }
+    }
+}
+
+#[test]
+fn granting_on_table_restricts_to_the_sequences_privileges() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_seqgrant_app;
+         CREATE SEQUENCE acl_seqgrant_s;
+         GRANT INSERT, SELECT ON TABLE acl_seqgrant_s TO acl_seqgrant_app;
+         GRANT INSERT, USAGE ON TABLE acl_seqgrant_s TO acl_seqgrant_app WITH GRANT OPTION;",
+    )]);
+    let sequence = relation(&db, "public", "acl_seqgrant_s");
+    assert!(db.has_sequence_privilege("acl_seqgrant_app", sequence, Privilege::Select));
+    assert!(db.has_sequence_privilege("acl_seqgrant_app", sequence, Privilege::Usage));
+    assert!(!db.has_table_privilege("acl_seqgrant_app", sequence, Privilege::Insert));
+    assert!(!db.has_table_privilege_with_grant_option(
+        "acl_seqgrant_app",
+        sequence,
+        Privilege::Insert
+    ));
+    assert!(db.has_sequence_privilege_with_grant_option(
+        "acl_seqgrant_app",
+        sequence,
+        Privilege::Usage
+    ));
+    assert!(!db.has_sequence_privilege_with_grant_option(
+        "acl_seqgrant_app",
+        sequence,
+        Privilege::Select
+    ));
+    assert!(!db.has_sequence_privilege("acl_seqgrant_app", sequence, Privilege::Update));
+}
+
+#[test]
+fn alter_sequence_owner_refuses_a_linked_sequence() {
+    for sql in [
+        "ALTER SEQUENCE acl_link_t_id_seq OWNER TO acl_link_r;",
+        "ALTER TABLE acl_link_t_id_seq OWNER TO acl_link_r;",
+    ] {
+        let result = try_apply(&[(
+            "0001.sql",
+            &format!(
+                "CREATE ROLE acl_link_r;
+                 CREATE TABLE acl_link_t (id serial);
+                 {sql}"
+            ),
+        )]);
+        assert_err_prefix!(
+            result,
+            DdlError::UnsupportedDdl(_),
+            "cannot change owner of sequence \"acl_link_t_id_seq\" (Sequence \
+             \"acl_link_t_id_seq\" is linked to table \"acl_link_t\".)"
+        );
+    }
+    for sql in [
+        "ALTER SEQUENCE acl_link2_t_id_seq OWNER TO acl_link2_r;",
+        "ALTER TABLE acl_link2_t_id_seq OWNER TO acl_link2_r;",
+    ] {
+        let result = try_apply(&[(
+            "0001.sql",
+            &format!(
+                "CREATE ROLE acl_link2_r;
+                 CREATE TABLE acl_link2_t (id int GENERATED ALWAYS AS IDENTITY);
+                 {sql}"
+            ),
+        )]);
+        assert_err_prefix!(
+            result,
+            DdlError::UnsupportedDdl(_),
+            "cannot change owner of sequence \"acl_link2_t_id_seq\""
+        );
+    }
+    // The owning table can still be given away, taking the sequence along.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_link3_r;
+         CREATE TABLE acl_link3_t (id serial);
+         ALTER TABLE acl_link3_t OWNER TO acl_link3_r;",
+    )]);
+    assert!(db.has_sequence_privilege(
+        "acl_link3_r",
+        relation(&db, "public", "acl_link3_t_id_seq"),
+        Privilege::Usage
+    ));
+}
+
+#[test]
+fn create_schema_authorization_current_user_uses_its_name() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_cs_user SUPERUSER;
+         SET ROLE acl_cs_user;
+         CREATE SCHEMA AUTHORIZATION CURRENT_USER;
+         RESET ROLE;",
+    )]);
+    assert!(db.namespace_oid("acl_cs_user").is_some());
+    assert!(db.has_schema_privilege(
+        "acl_cs_user",
+        namespace(&db, "acl_cs_user"),
+        Privilege::Create
+    ));
+
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_cs_owner;
+         CREATE SCHEMA AUTHORIZATION acl_cs_owner;",
+    )]);
+    assert!(db.namespace_oid("acl_cs_owner").is_some());
+
+    // The migrations' own user is unnamed: the schema's name is unknowable,
+    // and the statement is accepted without creating anything (as before).
+    let mut db = PgCatalog::new().unwrap();
+    db.skip_pg_sanity();
+    db.apply_sql("CREATE SCHEMA AUTHORIZATION CURRENT_USER;")
+        .unwrap();
+    assert!(db.namespace_oid(MIGRATIONS_USER).is_none());
+}
+
+#[test]
+fn do_block_create_role_if_not_exists_creates_the_role() {
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "DO $$ BEGIN
+                 IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'acl_do_app') THEN
+                     CREATE ROLE acl_do_app LOGIN;
+                 END IF;
+             END $$;
+             DO $$ BEGIN
+                 IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'acl_do_user') THEN
+                     CREATE USER acl_do_user;
+                 END IF;
+             END $$;",
+        ),
+        (
+            "0002.sql",
+            "DO $$ BEGIN
+                 IF NOT EXISTS (SELECT FROM pg_user WHERE usename = 'acl_do_user') THEN
+                     CREATE USER acl_do_user;
+                 END IF;
+             END $$;",
+        ),
+    ]);
+    // The second block found its role and did nothing: a CREATE USER would
+    // have failed with "already exists" and failed the migration.
+    assert!(db.role_exists("acl_do_app"));
+    assert!(db.role_exists("acl_do_user"));
+}
+
+#[test]
+fn object_grants_require_the_grantor_to_be_the_current_user() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_grantby_other;
+         CREATE TABLE acl_grantby_t (id int);
+         GRANT SELECT ON acl_grantby_t TO acl_grantby_other
+             GRANTED BY acl_grantby_other;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::UnsupportedDdl(_),
+        "grantor must be current user"
+    );
+    // `GRANTED BY` the current user is accepted.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_grantby_app;
+         CREATE TABLE acl_grantby_t2 (id int);
+         GRANT SELECT ON acl_grantby_t2 TO acl_grantby_app GRANTED BY postgres;",
+    )]);
+    assert!(table_has(
+        &db,
+        "acl_grantby_app",
+        "public",
+        "acl_grantby_t2",
+        Privilege::Select
+    ));
+}
+
+// ─── Role/ACL model, second round ───────────────────────────────────────────
+//
+// Reviewer reproducers: `GRANTED BY CURRENT_USER`, table revokes taking the
+// column grants along, DROP OWNED's grantor selection and RESTRICT check,
+// range-constructor default privileges, DROP ROLE details, and the DO-block
+// `CREATE ROLE IF NOT EXISTS` idiom with more than one statement.
+
+#[test]
+fn role_grant_granted_by_current_user_is_accepted() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_gb_app;
+         CREATE ROLE acl2_gb_r;
+         CREATE TABLE acl2_gb_t (id int);
+         GRANT SELECT ON acl2_gb_t TO acl2_gb_r;
+         GRANT acl2_gb_r TO acl2_gb_app GRANTED BY CURRENT_USER;",
+    )]);
+    assert!(table_has(
+        &db,
+        "acl2_gb_app",
+        "public",
+        "acl2_gb_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn role_revoke_granted_by_current_user_removes_the_grant() {
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE ROLE acl2_gb2_app;
+             CREATE ROLE acl2_gb2_r;
+             CREATE TABLE acl2_gb2_t (id int);
+             GRANT SELECT ON acl2_gb2_t TO acl2_gb2_r;
+             GRANT acl2_gb2_r TO acl2_gb2_app GRANTED BY CURRENT_USER;",
+        ),
+        (
+            "0002.sql",
+            "REVOKE acl2_gb2_r FROM acl2_gb2_app GRANTED BY CURRENT_USER;",
+        ),
+    ]);
+    assert!(!table_has(
+        &db,
+        "acl2_gb2_app",
+        "public",
+        "acl2_gb2_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn drop_owned_by_role_under_set_role_keeps_the_owners_grant() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_dro_x;
+         CREATE TABLE acl2_dro_t (id int);
+         GRANT SELECT ON acl2_dro_t TO acl2_dro_x;
+         SET ROLE acl2_dro_x;
+         DROP OWNED BY acl2_dro_x;
+         RESET ROLE;",
+    )]);
+    // DROP OWNED runs RemoveRoleFromObjectACL as the current user, who holds
+    // no grant options: the owner's grant stays.
+    assert!(table_has(
+        &db,
+        "acl2_dro_x",
+        "public",
+        "acl2_dro_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn drop_owned_restrict_fails_on_dependents_of_types_and_functions() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_do_x;
+         GRANT CREATE ON SCHEMA public TO acl2_do_x;
+         SET ROLE acl2_do_x;
+         CREATE TYPE acl2_do_e AS ENUM ('a');
+         CREATE FUNCTION acl2_do_f() RETURNS int LANGUAGE sql AS 'select 1';
+         RESET ROLE;
+         CREATE TABLE acl2_do_t (id acl2_do_e DEFAULT 'a', n int DEFAULT acl2_do_f());
+         DROP OWNED BY acl2_do_x;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop desired object(s) because other objects depend on them"
+    );
+}
+
+#[test]
+fn drop_owned_cascade_drops_dependents_of_types_and_functions() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_doc_x;
+         GRANT CREATE ON SCHEMA public TO acl2_doc_x;
+         SET ROLE acl2_doc_x;
+         CREATE TYPE acl2_doc_e AS ENUM ('a');
+         CREATE FUNCTION acl2_doc_f() RETURNS int LANGUAGE sql AS 'select 1';
+         RESET ROLE;
+         CREATE TABLE acl2_doc_t (id acl2_doc_e DEFAULT 'a', n int DEFAULT acl2_doc_f());
+         DROP OWNED BY acl2_doc_x CASCADE;",
+    )]);
+    assert!(
+        db.resolve_type_by_name(Some("public"), "acl2_doc_e")
+            .is_none()
+    );
+    assert!(db.find_functions(Some("public"), "acl2_doc_f").is_empty());
+    // The table itself belonged to another role: it survives.
+    assert!(db.resolve_table(Some("public"), "acl2_doc_t").is_some());
+}
+
+#[test]
+fn range_constructors_take_the_migrations_users_default_privileges() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_rng_app;
+         ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+         CREATE TYPE acl2_rng_fr AS RANGE (subtype = float8);",
+    )]);
+    let constructor = db
+        .find_functions(Some("public"), "acl2_rng_fr")
+        .into_iter()
+        .find(|p| p.proargtypes.len() == 2)
+        .expect("range constructor");
+    // The constructors are bootstrap-owned, and the migrations' user is the
+    // bootstrap superuser: its default privileges apply to them.
+    assert!(!db.has_function_privilege("acl2_rng_app", constructor.oid));
+    assert!(db.has_function_privilege(MIGRATIONS_USER, constructor.oid));
+}
+
+#[test]
+fn another_roles_default_privileges_do_not_touch_range_constructors() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_rng4_app;
+         CREATE ROLE acl2_rng4_x;
+         GRANT CREATE ON SCHEMA public TO acl2_rng4_x;
+         ALTER DEFAULT PRIVILEGES FOR ROLE acl2_rng4_x
+             REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+         SET ROLE acl2_rng4_x;
+         CREATE TYPE acl2_rng4_fr AS RANGE (subtype = float8);
+         RESET ROLE;",
+    )]);
+    let constructor = db
+        .find_functions(Some("public"), "acl2_rng4_fr")
+        .into_iter()
+        .find(|p| p.proargtypes.len() == 2)
+        .expect("range constructor");
+    // Constructors stay bootstrap-owned: x's default privileges don't apply.
+    assert!(db.has_function_privilege("acl2_rng4_app", constructor.oid));
+}
+
+#[test]
+fn range_constructor_privileges_can_be_revoked_and_granted() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_rng1_app;
+         CREATE TYPE acl2_rng1_fr AS RANGE (subtype = float8);
+         ALTER TYPE acl2_rng1_fr OWNER TO acl2_rng1_app;
+         REVOKE EXECUTE ON FUNCTION acl2_rng1_fr(float8, float8) FROM PUBLIC;
+         REVOKE EXECUTE ON FUNCTION acl2_rng1_fr(float8, float8, text) FROM PUBLIC;
+         REVOKE EXECUTE ON FUNCTION acl2_rng1_fr_multirange(acl2_rng1_fr) FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION acl2_rng1_fr(float8, float8) TO acl2_rng1_app;",
+    )]);
+    let two = db
+        .find_functions(Some("public"), "acl2_rng1_fr")
+        .into_iter()
+        .find(|p| p.proargtypes.len() == 2)
+        .expect("range constructor");
+    let three = db
+        .find_functions(Some("public"), "acl2_rng1_fr")
+        .into_iter()
+        .find(|p| p.proargtypes.len() == 3)
+        .expect("range constructor with collation");
+    let multirange = db
+        .find_functions(Some("public"), "acl2_rng1_fr_multirange")
+        .into_iter()
+        .find(|p| p.proargtypes.len() == 1)
+        .expect("multirange constructor");
+    assert!(db.has_function_privilege("acl2_rng1_app", two.oid));
+    assert!(!db.has_function_privilege("acl2_rng1_app", three.oid));
+    assert!(!db.has_function_privilege("acl2_rng1_app", multirange.oid));
+}
+
+#[test]
+fn drop_role_details_name_column_privileges_in_pg_order() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_det_x;
+         CREATE TABLE acl2_det_t (id int, b int);
+         GRANT SELECT (b) ON acl2_det_t TO acl2_det_x;
+         ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO acl2_det_x;
+         DROP ROLE acl2_det_x;",
+    )]);
+    // PG sorts the details by the dependent object's OID — the table was
+    // created before the default ACL — and names the column without
+    // repeating the table.
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "role \"acl2_det_x\" cannot be dropped because some objects depend on it (privileges \
+         for column b of table acl2_det_t; privileges for default privileges on new relations \
+         belonging to role postgres)"
+    );
+}
+
+#[test]
+fn do_block_role_existence_branch_runs_other_statements() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_do3_app;
+         CREATE TABLE acl2_do3_t (id int);
+         DO $$ BEGIN
+             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'acl2_do3_r') THEN
+                 CREATE ROLE acl2_do3_r;
+                 GRANT SELECT ON acl2_do3_t TO acl2_do3_r;
+             END IF;
+         END $$;
+         GRANT acl2_do3_r TO acl2_do3_app;",
+    )]);
+    assert!(table_has(
+        &db,
+        "acl2_do3_app",
+        "public",
+        "acl2_do3_t",
+        Privilege::Select
+    ));
+}
+
+#[test]
+fn do_block_role_existence_branch_can_create_a_role_in_role() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE acl2_do4_t (id int);
+         DO $$ BEGIN
+             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'acl2_do4_app') THEN
+                 CREATE ROLE acl2_do4_app;
+             END IF;
+         END $$;
+         DO $$ BEGIN
+             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'acl2_do4_r') THEN
+                 CREATE ROLE acl2_do4_r IN ROLE acl2_do4_app;
+             END IF;
+         END $$;
+         DROP ROLE acl2_do4_r;",
+    )]);
+    assert!(db.role_exists("acl2_do4_app"));
+    assert!(!db.role_exists("acl2_do4_r"));
+}
+
+#[test]
+fn do_block_skips_the_then_branch_when_the_role_exists() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_do2_app;
+         CREATE TABLE acl2_do2_t (id int);
+         DO $$ BEGIN
+             IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles
+                            WHERE rolname = 'acl2_do2_app') THEN
+                 CREATE ROLE acl2_do2_app SUPERUSER;
+             END IF;
+         END $$;",
+    )]);
+    // The role existed, so it did not become a superuser: it still cannot
+    // read the table.
+    assert!(
+        db.analyze_as("SELECT id FROM acl2_do2_t", "acl2_do2_app")
+            .is_err()
+    );
+}
+
+#[test]
+fn reassign_owned_by_current_user_refuses_the_bootstrap_superuser() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_reas_app;
+         CREATE TABLE acl2_reas_t (id int);
+         REASSIGN OWNED BY CURRENT_USER TO acl2_reas_app;",
+    )]);
+    // The migrations' user is the bootstrap superuser; PG names it.
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot reassign ownership of objects owned by role postgres because they are required \
+         by the database system"
+    );
+}
+
+#[test]
+fn drop_owned_by_current_user_refuses_the_bootstrap_superuser() {
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE acl2_dropcu_t (id int);
+         DROP OWNED BY CURRENT_USER;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "cannot drop objects owned by role postgres because they are required by the database \
+         system"
+    );
+}
+
+#[test]
+fn created_roles_keep_their_attributes() {
+    // The oracle compares every created role's pg_authid attributes with the
+    // server's; exercise the options the model records.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_attr_a CREATEROLE CREATEDB LOGIN INHERIT;
+         CREATE ROLE acl2_attr_b NOLOGIN NOINHERIT;
+         ALTER ROLE acl2_attr_a NOCREATEDB;
+         ALTER ROLE acl2_attr_b CREATEROLE;",
+    )]);
+    assert!(db.role_exists("acl2_attr_a"));
+    assert!(db.role_exists("acl2_attr_b"));
+}
+
+// ─── Role/ACL model, third round: DROP OWNED's explicit ACLs ───────────────
+
+#[test]
+fn drop_owned_keeps_an_explicit_empty_acl() {
+    // RemoveRoleFromObjectACL leaves an explicit empty ACL: the object must
+    // not fall back to its default ACL (which grants PUBLIC EXECUTE).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_t7_empty_removed;
+         CREATE ROLE acl_t7_empty_app;
+         CREATE FUNCTION acl_t7_empty_f() RETURNS int LANGUAGE plpgsql
+             AS $$ BEGIN RETURN 1; END $$;
+         REVOKE EXECUTE ON FUNCTION acl_t7_empty_f() FROM PUBLIC;
+         REVOKE EXECUTE ON FUNCTION acl_t7_empty_f() FROM CURRENT_USER;
+         GRANT EXECUTE ON FUNCTION acl_t7_empty_f() TO acl_t7_empty_removed;
+         DROP OWNED BY acl_t7_empty_removed;",
+    )]);
+    assert!(!db.has_function_privilege(
+        "acl_t7_empty_app",
+        proc_oid(&db, "public", "acl_t7_empty_f")
+    ));
+}
+
+#[test]
+fn drop_owned_reaches_column_acls_without_a_table_acl() {
+    // shdepDropOwned reaches column grants through the role's shared
+    // dependencies even when the relation itself has no explicit ACL.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_t7_coldrop_app;
+         CREATE TABLE acl_t7_coldrop_t (a int, b int);
+         GRANT SELECT (a) ON acl_t7_coldrop_t TO acl_t7_coldrop_app;
+         DROP OWNED BY acl_t7_coldrop_app;",
+    )]);
+    let table = relation(&db, "public", "acl_t7_coldrop_t");
+    let a = attnum(&db, table, "a");
+    assert!(!db.has_column_privilege("acl_t7_coldrop_app", table, a, Privilege::Select));
+    assert!(!db.has_any_column_privilege("acl_t7_coldrop_app", table, Privilege::Select));
+}

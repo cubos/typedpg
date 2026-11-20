@@ -541,30 +541,54 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
     let built = catalog_for(&config, input.db_name.as_ref())?;
 
     // 3. Analyze the SQL (lex + type inference in one pass).
-    let analyzed = built
-        .catalog
-        .analyze(&sql_str)
-        .map_err(|e| syn::Error::new(input.sql.span(), built.annotate(e.to_string())))?;
-    let resolved = &built.resolved;
-
+    //
     // The role the statement runs as, or the database's configured ones. A
-    // call-site role replaces them for this statement.
+    // call-site role replaces them for this statement. The generated code is
+    // built from the analysis as that role: its search path decides what an
+    // unqualified name means, and so the types of the columns and
+    // parameters. Only without roles is the plain analysis (the schema
+    // owner's) the one generated from.
+    let resolved = &built.resolved;
     let roles: Vec<String> = match &input.role {
         Some(role) => vec![role.value()],
         None => resolved.roles().to_vec(),
     };
-    for role in &roles {
-        if let Err(e) = built.catalog.analyze_as(&sql_str, role) {
-            // A role the call site names and the migrations don't create is
-            // reported at the role literal: it is the token that names the
-            // missing role. Everything else is about the statement.
-            let span = match &input.role {
-                Some(literal) if !built.catalog.role_exists(role) => literal.span(),
-                _ => input.sql.span(),
-            };
-            return Err(syn::Error::new(span, built.annotate(e.to_string())));
+    let analyzed = if roles.is_empty() {
+        built
+            .catalog
+            .analyze(&sql_str)
+            .map_err(|e| syn::Error::new(input.sql.span(), built.annotate(e.to_string())))?
+    } else {
+        let mut analyses = Vec::with_capacity(roles.len());
+        for role in &roles {
+            match built.catalog.analyze_as(&sql_str, role) {
+                Ok(analysis) => analyses.push((role.clone(), analysis)),
+                // A role the call site names and the migrations don't create
+                // is reported at the role literal: it is the token that names
+                // the missing role. Everything else is about the statement.
+                Err(e) => {
+                    let span = match &input.role {
+                        Some(literal) if !built.catalog.role_exists(role) => literal.span(),
+                        _ => input.sql.span(),
+                    };
+                    return Err(syn::Error::new(span, built.annotate(e.to_string())));
+                }
+            }
         }
-    }
+        // One analysis is generated from, so every role must resolve the
+        // statement to the same types. A difference means the roles'
+        // search paths resolve an unqualified name to different objects.
+        let (first_role, first) = &analyses[0];
+        for (role, analysis) in &analyses[1..] {
+            if let Some(difference) = typedpg_analyzer::first_difference(first, analysis) {
+                return Err(syn::Error::new(
+                    input.sql.span(),
+                    built.annotate(difference.message(first_role, role)),
+                ));
+            }
+        }
+        analyses.remove(0).1
+    };
 
     // A native `$1` placeholder is a valid PG parameter, but it has no name
     // an argument could bind to.

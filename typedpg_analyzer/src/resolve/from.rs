@@ -242,6 +242,22 @@ pub(crate) fn process_from_item(
                 return Ok(());
             }
 
+            // A trigger's transition table (`REFERENCING NEW TABLE AS
+            // new_rows`) is in scope in its function's statements as a
+            // relation holding the trigger relation's rows, with no
+            // privilege requirement: the rows are the statement's own.
+            if rv.schemaname.is_empty()
+                && let Some(relid) = crate::privileges::transition_table(&rv.relname)
+            {
+                scope.add_transition_table(
+                    snapshot,
+                    relid,
+                    alias,
+                    crate::error::SourceSpan::from_node_qname(rv.location),
+                )?;
+                return Ok(());
+            }
+
             let schema = if rv.schemaname.is_empty() {
                 None
             } else {
@@ -252,7 +268,11 @@ pub(crate) fn process_from_item(
                 schema,
                 &rv.relname,
                 alias,
-                crate::error::SourceSpan::from_node_qname(rv.location),
+                crate::scope::SourceSite {
+                    span: crate::error::SourceSpan::from_node_qname(rv.location),
+                    location: rv.location,
+                    aliased: rv.alias.is_some(),
+                },
             )?;
             // A view the planner pulls up raises what its query does, like
             // a FROM subquery (see `deferred`).
@@ -303,6 +323,9 @@ pub(crate) fn process_from_item(
                 src.partial_scan =
                     !rv.inh && class.relkind == crate::pg_catalog::RelKind::Partitioned;
                 src.only = !rv.inh;
+                if !rv.inh {
+                    crate::privileges::note_only(class.oid);
+                }
                 // A scan of an inheritance parent returns its children's
                 // rows too: a column is NOT NULL only if it is in each of
                 // them (a parent's `NOT NULL NO INHERIT` isn't).
@@ -378,17 +401,51 @@ pub(crate) fn process_from_item(
                         let plan = if snapshot.security_barrier_views.contains(&class.oid) {
                             super::deferred::Plan::Separate
                         } else {
+                            // The stored query's names were fixed when the
+                            // view was defined: re-reading it resolves no
+                            // schema (PG looks none up), so its USAGE is not
+                            // the statement's to require.
                             view_sel.map_or(super::deferred::Plan::Uncertain, |sel| {
-                                super::deferred::plan_of(sel, snapshot)
+                                crate::privileges::suspended(|| {
+                                    super::deferred::plan_of(sel, snapshot)
+                                })
                             })
+                        };
+                        // Pulled up, the planner substitutes the view's
+                        // output expressions for references to its columns
+                        // (`ApplyRetrieveRule`: the rule action is a
+                        // subquery) — a constant output then folds like a
+                        // subquery's.
+                        let mut view_exprs = if plan == super::deferred::Plan::PulledUp {
+                            view_sel
+                                .map(|sel| super::deferred::output_exprs(sel))
+                                .unwrap_or_default()
+                                .into_iter()
+                        } else {
+                            Vec::new().into_iter()
                         };
                         // Its query was analyzed without the plan-time
                         // checks: no level model says it can't be empty.
                         // (It sees no CTE of the statement.)
                         let removable = view_sel.is_some_and(|sel| {
-                            super::select::removable_scan(sel, &cols, &|_| false, false, snapshot)
+                            crate::privileges::suspended(|| {
+                                super::select::removable_scan(
+                                    sel,
+                                    &cols,
+                                    &|_| false,
+                                    false,
+                                    snapshot,
+                                )
+                            })
                         });
                         for (c, rc) in src.columns.iter_mut().zip(cols) {
+                            if plan == super::deferred::Plan::PulledUp {
+                                // The view is a subquery the planner pulls up
+                                // where it is never null-extended: the
+                                // reference becomes this output expression.
+                                c.deferred.substitution = crate::scope::Substitution::Certain;
+                                c.deferred.expr = view_exprs.next().flatten();
+                            }
                             match (plan, rc.planned) {
                                 (
                                     super::deferred::Plan::PulledUp,
@@ -587,6 +644,11 @@ pub(crate) fn process_from_item(
                     analyzed
                 });
                 let (mut cols, _) = analyzed?;
+                // The planner drops an output nothing reads (the subquery
+                // is pulled up, or `remove_unused_subquery_outputs` blanks
+                // it): what the level's output expressions run is kept with
+                // the columns, marked read as this level references them.
+                let output_group = crate::privileges::take_level_outputs();
                 if let Some((location, e)) = planned.rest
                     && let Some(e) = crate::expr::plan_time_error(location, e)
                 {
@@ -614,7 +676,8 @@ pub(crate) fn process_from_item(
                 .into_iter();
                 let mut scope_cols: Vec<ScopeColumn> = cols
                     .into_iter()
-                    .map(|rc| ScopeColumn {
+                    .enumerate()
+                    .map(|(index, rc)| ScopeColumn {
                         deferred: crate::scope::Deferred {
                             value: outputs.next().flatten().map(Box::new),
                             entry: None,
@@ -669,6 +732,8 @@ pub(crate) fn process_from_item(
                         elem_nullable: rc.elem_nullable,
                         refine: rc.refine.clone(),
                         origin: rc.origin,
+                        output: output_group
+                            .map(|group| crate::privileges::OutputRef { group, index }),
                     })
                     .collect();
                 // PG rejects more aliases than columns (42P10).
@@ -977,6 +1042,7 @@ fn process_range_function(
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
             origin: None,
+            output: None,
         });
     }
 
@@ -1320,12 +1386,16 @@ fn process_join_expr(
         let pulls_up = join_type == JoinType::JoinInner && kept;
         expr::plan_fold::skip_restrictions_on(removable, || {
             let mut coerce = || {
-                crate::clause::coerce_clause_expr(
-                    quals.as_ref(),
-                    expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
-                    params,
-                    crate::clause::ClauseKind::JoinOn,
-                )
+                // `estimate_expression_value` reduces a pseudoconstant side
+                // of an ON comparison while estimating it.
+                expr::plan_fold::with_estimated_qual(quals.as_ref(), &on_scope, snapshot, || {
+                    crate::clause::coerce_clause_expr(
+                        quals.as_ref(),
+                        expr::Ctx::new(&on_scope, null_ctx, snapshot).logging_strictness(&log),
+                        params,
+                        crate::clause::ClauseKind::JoinOn,
+                    )
+                })
             };
             match available {
                 _ if pulls_up => expr::plan_fold::with_where_clause(quals.as_ref(), coerce),
@@ -1918,6 +1988,9 @@ fn merge_using_columns(
         }
         let (l_idx, l) = find_col(scope, left, name, "left")?;
         let (r_idx, r) = find_col(scope, right, name, "right")?;
+        // The join qual `l = r` reads both columns.
+        scope.sources[l_idx].note_column(name);
+        scope.sources[r_idx].note_column(name);
 
         let lt = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
         let rt = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
@@ -1991,6 +2064,7 @@ fn merge_using_columns(
                 &r.refine.converted(r.type_oid, type_oid, snapshot),
             ]),
             origin: None,
+            output: None,
         });
         hide.push((l_idx, name.clone()));
         hide.push((r_idx, name.clone()));
@@ -2477,7 +2551,19 @@ fn function_rte_columns(
     )?;
     // ExecInitFunctionScan: the function's EXECUTE, and a constant
     // sequence argument's privileges, checked as for a call anywhere else.
-    crate::privileges::note_call(snapshot, resolved.oid, false, &func_call.args);
+    let certainty: Vec<crate::expr::plan_fold::Certain> = func_call
+        .args
+        .iter()
+        .map(|arg| crate::expr::plan_fold::certainly_in(arg.as_ref(), arg_ctx))
+        .collect();
+    crate::privileges::note_call(
+        snapshot,
+        resolved.oid,
+        false,
+        crate::privileges::CallSite::From,
+        &func_call.args,
+        &certainty,
+    );
     // Coerce untyped arguments to the chosen signature (pins `$N`,
     // validates literal contents), as for a call anywhere else.
     expr::backfill_call_args(func_call, &arg_types, &resolved, arg_ctx, params)?;
@@ -2561,6 +2647,7 @@ fn function_rte_columns(
                 elem_nullable: None,
                 refine: crate::refine::Refinement::NONE,
                 origin: None,
+                output: None,
             })
             .collect());
     }
@@ -2639,6 +2726,7 @@ fn function_rte_columns(
             })
             .unwrap_or_default(),
         origin: None,
+        output: None,
     }])
 }
 
@@ -2713,6 +2801,7 @@ fn expr_rte_columns(
         elem_nullable: value.elem_nullable,
         refine: value.refine,
         origin: None,
+        output: None,
     }])
 }
 
@@ -2790,6 +2879,7 @@ fn composite_rte_columns(
                 elem_nullable: None,
                 refine: crate::refine::Refinement::NONE,
                 origin: None,
+                output: None,
             })
             .collect(),
     ))
@@ -2928,6 +3018,7 @@ fn coldeflist_columns(
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
             origin: None,
+            output: None,
         });
     }
     for (i, c) in cols.iter().enumerate() {
@@ -3026,10 +3117,24 @@ fn process_tablesample(
         }
     };
     // The arguments are EXPR_KIND_FROM_FUNCTION expressions: no aggregates
-    // or window functions.
-    for (arg, &target) in ts.args.iter().zip(param_types) {
-        coerce(arg.as_ref(), target, "TABLESAMPLE", params)?;
-        crate::clause::check_no_aggregates_or_windows(arg.as_ref(), snapshot, "functions in FROM")?;
+    // or window functions. The first parameter — the sample percentage, row
+    // count or time — is what the planner estimates to size the sample
+    // (`set_tablesample_rel_size`), so a STABLE call over constants in it
+    // runs while planning; `REPEATABLE`'s seed is only const-folded.
+    for (i, (arg, &target)) in ts.args.iter().zip(param_types).enumerate() {
+        let analyze = |params: &mut ParamCollector| -> Result<(), AnalyzeError> {
+            coerce(arg.as_ref(), target, "TABLESAMPLE", params)?;
+            crate::clause::check_no_aggregates_or_windows(
+                arg.as_ref(),
+                snapshot,
+                "functions in FROM",
+            )
+        };
+        if i == 0 {
+            crate::expr::plan_fold::with_estimated_sample(arg.as_ref(), || analyze(params))?;
+        } else {
+            analyze(params)?;
+        }
     }
     if let seed @ Some(_) = &ts.repeatable {
         coerce(seed.as_ref(), oid::FLOAT8, "REPEATABLE", params)?;
@@ -3304,6 +3409,7 @@ fn json_table_columns(
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
             origin: None,
+            output: None,
         });
     }
     for col in nested {
@@ -3412,9 +3518,12 @@ pub(crate) fn view_lock_error(
         return None;
     }
     match crate::ddl::views::view_query(snapshot, class.oid)? {
-        ast::Node::SelectStmt(s) => {
-            crate::ddl::views::expanding_view(class.oid, || pushed_lock_error(&s, snapshot))?
-        }
+        // The stored query's names were resolved when the view was defined:
+        // analyzing it here is no statement's parse analysis, so it requires
+        // no schema's USAGE (PG looks none up).
+        ast::Node::SelectStmt(s) => crate::privileges::suspended(|| {
+            crate::ddl::views::expanding_view(class.oid, || pushed_lock_error(&s, snapshot))
+        })?,
         _ => None,
     }
 }

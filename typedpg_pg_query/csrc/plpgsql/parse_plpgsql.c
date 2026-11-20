@@ -163,7 +163,22 @@ compile_do_stmt(DoStmt *stmt)
 	/* Another language: nothing to compile. */
 	if (strcmp(language, "plpgsql") != 0)
 		return NULL;
-	return plpgsql_compile_inline(proc_source);
+	{
+		PLpgSQL_function *function;
+
+		/* A DO block's declarations are compiled with its body. */
+		typedpg_catalog_enter_body();
+		PG_TRY();
+		{
+			function = plpgsql_compile_inline(proc_source);
+		}
+		PG_FINALLY();
+		{
+			typedpg_catalog_leave_body();
+		}
+		PG_END_TRY();
+		return function;
+	}
 }
 
 /*
@@ -436,7 +451,20 @@ compile_create_function_stmt(CreateFunctionStmt *stmt)
 	typedpg_tuple_set_xmin(wrapper, next_proc_xmin++);
 	typedpg_proc_install(flinfo.fn_oid, wrapper);
 
-	function = plpgsql_compile(fcinfo, true);
+	/*
+	 * The body's explicit schema lookups (see note_body_schema): the
+	 * signature's types are OIDs in the fake pg_proc row by now.
+	 */
+	typedpg_catalog_enter_body();
+	PG_TRY();
+	{
+		function = plpgsql_compile(fcinfo, true);
+	}
+	PG_FINALLY();
+	{
+		typedpg_catalog_leave_body();
+	}
+	PG_END_TRY();
 	return function;
 }
 

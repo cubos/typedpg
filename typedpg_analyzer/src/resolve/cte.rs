@@ -117,10 +117,11 @@ pub(crate) fn analyze_cte(
         elem_nullable: rc.elem_nullable,
         refine: rc.refine.clone(),
         origin: rc.origin,
+        output: None,
     };
 
     let mut min_one_row = false;
-    let columns: Vec<ScopeColumn> = match cte_query {
+    let mut columns: Vec<ScopeColumn> = match cte_query {
         // A recursive CTE is `non-recursive-term UNION [ALL] recursive-term`
         // (checkWellFormedRecursion made sure). transformSetOperationStmt
         // processes the body's own WITH, then the non-recursive term, whose
@@ -311,6 +312,7 @@ pub(crate) fn analyze_cte(
                                 &r.refine.converted(r.type_oid, type_oid, snapshot),
                             ]),
                             origin: None,
+                            output: None,
                         }
                     })
                     .collect()
@@ -439,6 +441,17 @@ pub(crate) fn analyze_cte(
         }
     };
 
+    // An inlined CTE is planned where its references are (a subquery the
+    // planner may pull up): the outputs nothing reads are dropped, and the
+    // expressions of the others run.
+    if inlined == Some(true)
+        && !recursive
+        && let Some(group) = crate::privileges::take_level_outputs()
+    {
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.output = Some(crate::privileges::OutputRef { group, index: i });
+        }
+    }
     check_search_cycle_clauses(cte, recursive, &columns)?;
     Ok(AnalyzedCte {
         columns,
@@ -477,6 +490,7 @@ fn search_cycle_columns(
         elem_nullable: None,
         refine: crate::refine::Refinement::NONE,
         origin: None,
+        output: None,
     };
     let record_array = snapshot.array_type_of(oid::RECORD).unwrap_or(oid::UNKNOWN);
     let mut added: Vec<ScopeColumn> = Vec::new();
@@ -906,16 +920,26 @@ struct OwnerFacts {
     references: Option<usize>,
     /// See [`owner_kept_reference`].
     kept_reference: Option<String>,
+    /// Whether the statement references the CTE in live code outside the
+    /// WITH (see [`owner_cte_refs`]).
+    live_reference: Option<bool>,
+    /// Whether the statement references the CTE anywhere outside the CTE's
+    /// own body (see [`referenced_outside_self`]).
+    referenced_outside_self: Option<bool>,
 }
 
 /// Run `f` (the analysis of `sel`'s WITH clause) knowing `sel` owns it:
 /// how many times the statement references a CTE decides whether the
 /// planner inlines it.
-pub(crate) fn with_clause_owner<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_clause_owner<R>(
+    sel: &ast::SelectStmt,
+    snapshot: &PgCatalog,
+    f: impl FnOnce() -> R,
+) -> R {
     let Some(with) = sel.with_clause.as_ref() else {
         return f();
     };
-    with_statement_owner(with, NodeRef::SelectStmt(sel), f)
+    with_statement_owner(with, NodeRef::SelectStmt(sel), snapshot, f)
 }
 
 /// [`with_clause_owner`] for `owner`, any statement owning WITH clause
@@ -925,6 +949,7 @@ pub(crate) fn with_clause_owner<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R)
 pub(crate) fn with_statement_owner<R>(
     with: &ast::WithClause,
     owner: NodeRef<'_>,
+    snapshot: &PgCatalog,
     f: impl FnOnce() -> R,
 ) -> R {
     let target = match owner {
@@ -934,14 +959,20 @@ pub(crate) fn with_statement_owner<R>(
         NodeRef::MergeStmt(s) => s.relation.as_deref(),
         _ => None,
     };
-    let facts = with
+    let names: Vec<&str> = with
         .ctes
         .iter()
         .filter_map(|c| match c.as_ref() {
             Some(ast::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
             _ => None,
         })
-        .map(|name| {
+        .collect();
+    let live = owner_cte_refs(owner, &names, snapshot);
+    let facts = names
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, name)| {
             // `references_in` counts the target relation when it is named
             // so: it isn't a reference.
             let target_named =
@@ -951,6 +982,10 @@ pub(crate) fn with_statement_owner<R>(
                 references: references_in(owner, statement_with(owner), name)
                     .map(|n| n - usize::from(target_named)),
                 kept_reference: kept_reference(owner, name),
+                live_reference: Some(live.contains(&index)),
+                referenced_outside_self: Some(referenced_outside_self(
+                    owner, &names, snapshot, index,
+                )),
             }
         })
         .collect();
@@ -993,6 +1028,405 @@ fn owner_fact<T>(
 /// owner isn't known (see [`with_clause_owner`]).
 fn owner_references(with: &ast::WithClause, name: &str) -> Option<usize> {
     owner_fact(with, name, |f| f.references)
+}
+
+/// The CTEs of the WITH statement `root` owns that it references outside
+/// that WITH's own CTE bodies, in live code: the plan's roots. A reference an
+/// inner WITH shadows (`WITH a AS (…) SELECT * FROM (WITH a AS (…) SELECT …
+/// FROM a) s`) names the inner CTE, and code the planner certainly folds
+/// away (a dead CASE branch, `false AND …`) is never planned. An `EXISTS` /
+/// `IN` sublink that `pull_up_sublinks` turns into a join survives the
+/// folding — its subquery is planned with the query — when it is a
+/// top-level AND argument of a WHERE (or an UPDATE's / DELETE's).
+fn owner_cte_refs(
+    root: NodeRef<'_>,
+    names: &[&str],
+    snapshot: &PgCatalog,
+) -> std::collections::BTreeSet<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut scope = RefScope {
+        names,
+        snapshot,
+        shadowed: Vec::new(),
+        out: &mut out,
+        raw: false,
+    };
+    scope.walk_owner(root, None);
+    out
+}
+
+/// Whether the statement references CTE `index` anywhere outside that CTE's
+/// own body — PostgreSQL's `cterefcount` for it, without the self-reference
+/// (a recursive CTE only it references is discarded).
+fn referenced_outside_self(
+    root: NodeRef<'_>,
+    names: &[&str],
+    snapshot: &PgCatalog,
+    index: usize,
+) -> bool {
+    let mut out = std::collections::BTreeSet::new();
+    let mut scope = RefScope {
+        names,
+        snapshot,
+        shadowed: Vec::new(),
+        out: &mut out,
+        raw: true,
+    };
+    scope.walk_owner(root, Some(index));
+    out.contains(&index)
+}
+
+/// The CTEs of a WITH a CTE's body references in live code, as indexes:
+/// what a planned CTE's body reads reaches the plan through it.
+fn cte_body_refs(
+    cte: &ast::CommonTableExpr,
+    names: &[&str],
+    snapshot: &PgCatalog,
+) -> std::collections::BTreeSet<usize> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut scope = RefScope {
+        names,
+        snapshot,
+        shadowed: Vec::new(),
+        out: &mut out,
+        raw: false,
+    };
+    scope.walk_node(cte.ctequery.as_ref(), false);
+    out
+}
+
+/// The state of [`owner_cte_refs`]'s walk: the CTE names being looked for
+/// and the inner WITHs shadowing them.
+struct RefScope<'a, 'o> {
+    names: &'a [&'a str],
+    snapshot: &'a PgCatalog,
+    /// The CTE names each enclosing inner WITH defines, nearest last.
+    shadowed: Vec<std::collections::HashSet<String>>,
+    out: &'o mut std::collections::BTreeSet<usize>,
+    /// Count every reference, dead code included (PostgreSQL's
+    /// `cterefcount`), rather than the live ones the plan reaches.
+    raw: bool,
+}
+
+impl RefScope<'_, '_> {
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.shadowed.iter().any(|w| w.contains(name))
+    }
+
+    /// `where_and`: the node is a top-level AND argument of a WHERE clause,
+    /// where `pull_up_sublinks` makes a sublink a join whatever the clause
+    /// folds to.
+    fn walk(&mut self, n: NodeRef<'_>, where_and: bool) {
+        match n {
+            // The CTE body is not the statement's own reference: what a
+            // planned CTE's body reads reaches the plan through that CTE
+            // (`cte_body_refs`).
+            NodeRef::CommonTableExpr(_) => {}
+            NodeRef::RangeVar(rv) => {
+                if rv.schemaname.is_empty()
+                    && !self.is_shadowed(&rv.relname)
+                    && let Some(i) = self.names.iter().position(|name| *name == rv.relname)
+                {
+                    self.out.insert(i);
+                }
+            }
+            // A query of its own: its WITH scopes over the whole statement,
+            // and its WHERE folds as the planner sees it.
+            NodeRef::SelectStmt(stmt) => {
+                self.statement(stmt.with_clause.as_deref(), |scope| {
+                    scope.where_clause(stmt.where_clause.as_ref());
+                    scope.children_but_with(n);
+                });
+            }
+            NodeRef::InsertStmt(stmt) => {
+                self.statement(stmt.with_clause.as_deref(), |scope| {
+                    scope.children_but_with(n);
+                });
+            }
+            NodeRef::UpdateStmt(stmt) => {
+                self.statement(stmt.with_clause.as_deref(), |scope| {
+                    // The WHERE's top-level AND arguments are where
+                    // `pull_up_sublinks` applies.
+                    scope.where_clause(stmt.where_clause.as_ref());
+                    scope.children_but_with(n);
+                });
+            }
+            NodeRef::DeleteStmt(stmt) => {
+                self.statement(stmt.with_clause.as_deref(), |scope| {
+                    scope.where_clause(stmt.where_clause.as_ref());
+                    scope.children_but_with(n);
+                });
+            }
+            NodeRef::MergeStmt(stmt) => {
+                self.statement(stmt.with_clause.as_deref(), |scope| {
+                    scope.children_but_with(n);
+                });
+            }
+            // Short-circuiting expressions drop what follows their deciding
+            // constant; `pull_up_sublinks` reaches the AND arguments of a
+            // WHERE (subqueries included).
+            NodeRef::BoolExpr(b) => self.bool_expr(b, where_and),
+            NodeRef::CaseExpr(c) => self.case_expr(c),
+            NodeRef::CoalesceExpr(c) => {
+                let mut stopped = false;
+                for arg in &c.args {
+                    if stopped && !self.raw {
+                        continue;
+                    }
+                    self.walk_node(arg.as_ref(), false);
+                    stopped = crate::expr::plan_fold::certainly_non_null_constant(
+                        arg.as_ref(),
+                        self.snapshot,
+                    );
+                }
+            }
+            _ => {
+                for child in n.children() {
+                    self.walk(child, false);
+                }
+            }
+        }
+    }
+
+    /// The children of statement `n` but its WITH clause (handled by
+    /// [`Self::statement`]). Its WHERE clause is walked again, as a plain
+    /// expression: that walk reaches no more than [`Self::where_clause`]'s.
+    fn children_but_with(&mut self, n: NodeRef<'_>) {
+        for child in n.children() {
+            if !matches!(child, NodeRef::WithClause(_)) {
+                self.walk(child, false);
+            }
+        }
+    }
+
+    /// The statement owning the WITH being counted: its own WITH clause's
+    /// CTEs are the ones being counted, not inner ones shadowing them. Its
+    /// CTE bodies are not the statement's own references — except for a raw
+    /// count (`skip`: the CTE whose references are counted), where every
+    /// other CTE's body counts too.
+    fn walk_owner(&mut self, root: NodeRef<'_>, skip: Option<usize>) {
+        let (with, where_clause) = match root {
+            NodeRef::SelectStmt(s) => (s.with_clause.as_deref(), s.where_clause.as_ref()),
+            NodeRef::InsertStmt(s) => (s.with_clause.as_deref(), None),
+            NodeRef::UpdateStmt(s) => (s.with_clause.as_deref(), s.where_clause.as_ref()),
+            NodeRef::DeleteStmt(s) => (s.with_clause.as_deref(), s.where_clause.as_ref()),
+            NodeRef::MergeStmt(s) => (s.with_clause.as_deref(), None),
+            _ => {
+                self.walk(root, false);
+                return;
+            }
+        };
+        if let (Some(skip), Some(with)) = (skip, with) {
+            for (i, cte) in with
+                .ctes
+                .iter()
+                .filter_map(|n| match n.as_ref()? {
+                    ast::Node::CommonTableExpr(c) => Some(&**c),
+                    _ => None,
+                })
+                .enumerate()
+            {
+                if i != skip {
+                    self.walk_node(cte.ctequery.as_ref(), false);
+                }
+            }
+        }
+        if self.raw {
+            for child in root.children() {
+                if !matches!(child, NodeRef::WithClause(_)) {
+                    self.walk(child, false);
+                }
+            }
+            return;
+        }
+        self.where_clause(where_clause);
+        self.children_but_with(root);
+    }
+
+    fn walk_node(&mut self, n: Option<&ast::Node>, where_and: bool) {
+        if let Some(inner) = n {
+            self.walk(inner.to_ref(), where_and);
+        }
+    }
+
+    /// Run `main` (the statement's own clauses) with the CTEs of `with` in
+    /// scope, and its CTE bodies with the ones before each in scope.
+    fn statement(&mut self, with: Option<&ast::WithClause>, main: impl FnOnce(&mut Self)) {
+        let Some(with) = with else {
+            main(self);
+            return;
+        };
+        let ctes: Vec<&ast::CommonTableExpr> = with
+            .ctes
+            .iter()
+            .filter_map(|n| match n.as_ref()? {
+                ast::Node::CommonTableExpr(c) => Some(&**c),
+                _ => None,
+            })
+            .collect();
+        if with.recursive {
+            self.shadowed
+                .push(ctes.iter().map(|c| c.ctename.clone()).collect());
+            for cte in &ctes {
+                self.walk_node(cte.ctequery.as_ref(), false);
+            }
+            main(self);
+            self.shadowed.pop();
+            return;
+        }
+        let mut earlier = std::collections::HashSet::new();
+        for cte in &ctes {
+            self.shadowed.push(earlier.clone());
+            self.walk_node(cte.ctequery.as_ref(), false);
+            self.shadowed.pop();
+            earlier.insert(cte.ctename.clone());
+        }
+        self.shadowed.push(earlier);
+        main(self);
+        self.shadowed.pop();
+    }
+
+    /// The `WHERE` clause: an AND tree whose top arguments
+    /// `pull_up_sublinks` reaches before folding.
+    fn where_clause(&mut self, clause: Option<&ast::Node>) {
+        self.walk_node(clause, true);
+    }
+
+    fn bool_expr(&mut self, b: &ast::BoolExpr, where_and: bool) {
+        use crate::expr::plan_fold::{Certain, certainly};
+        use typedpg_pg_query::ast::BoolExprType;
+        if self.raw {
+            for arg in &b.args {
+                self.walk_node(arg.as_ref(), false);
+            }
+            return;
+        }
+        match b.boolop {
+            BoolExprType::NotExpr => {
+                if let Some(arg) = b.args.first() {
+                    self.walk_node(arg.as_ref(), where_and);
+                }
+            }
+            op @ (BoolExprType::AndExpr | BoolExprType::OrExpr) => {
+                let and = op == BoolExprType::AndExpr;
+                let deciding = b
+                    .args
+                    .iter()
+                    .any(|a| certainly(a.as_ref(), self.snapshot) == Certain::Bool(!and));
+                for arg in &b.args {
+                    if !deciding {
+                        self.walk_node(arg.as_ref(), and && where_and);
+                        continue;
+                    }
+                    if certainly(arg.as_ref(), self.snapshot) == Certain::Bool(!and) {
+                        continue;
+                    }
+                    // A pullable sublink under a false AND argument still
+                    // becomes a join: its subquery is planned.
+                    if and && where_and && is_pullable_sublink(arg.as_ref()) {
+                        self.walk_node(arg.as_ref(), false);
+                    }
+                }
+            }
+        }
+    }
+
+    fn case_expr(&mut self, c: &ast::CaseExpr) {
+        use crate::expr::plan_fold::{Certain, certainly};
+        let whens = c.args.iter().filter_map(|w| match w.as_ref() {
+            Some(ast::Node::CaseWhen(when)) => Some(&**when),
+            _ => None,
+        });
+        // The CASE's test expression is always evaluated.
+        self.walk_node(c.arg.as_ref(), false);
+        if self.raw {
+            for when in whens {
+                self.walk_node(when.expr.as_ref(), false);
+                self.walk_node(when.result.as_ref(), false);
+            }
+            self.walk_node(c.defresult.as_ref(), false);
+            return;
+        }
+        let mut stopped = false;
+        for when in whens {
+            if stopped {
+                continue;
+            }
+            // A simple CASE's WHENs compare its test; only a searched CASE
+            // folds on its conditions (the analyzer leaves the simple form's
+            // results live).
+            if c.arg.is_none() {
+                self.walk_node(when.expr.as_ref(), false);
+                match certainly(when.expr.as_ref(), self.snapshot) {
+                    Certain::Bool(false) | Certain::Null => continue,
+                    Certain::Bool(true) => {
+                        self.walk_node(when.result.as_ref(), false);
+                        stopped = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+                self.walk_node(when.result.as_ref(), false);
+                continue;
+            }
+            self.walk_node(when.expr.as_ref(), false);
+            self.walk_node(when.result.as_ref(), false);
+        }
+        if !stopped {
+            self.walk_node(c.defresult.as_ref(), false);
+        }
+    }
+}
+
+/// Whether `arg`, a top-level AND argument of a WHERE, is a sublink
+/// `pull_up_sublinks` may turn into a join: an `EXISTS` with a WHERE (which
+/// must reference the level) or an `IN` whose test expression reads a
+/// column. Anything else is left for the folding, and dropped.
+fn is_pullable_sublink(arg: Option<&ast::Node>) -> bool {
+    use typedpg_pg_query::ast::{BoolExprType, SetOperation, SubLinkType};
+    let inner = match arg {
+        Some(ast::Node::SubLink(s)) => s,
+        Some(ast::Node::BoolExpr(b)) if b.boolop == BoolExprType::NotExpr => {
+            match b.args.first().and_then(Option::as_ref) {
+                Some(ast::Node::SubLink(s)) => s,
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    match inner.sub_link_type {
+        SubLinkType::ExistsSublink => match inner.subselect.as_ref() {
+            Some(subselect @ ast::Node::SelectStmt(s)) => {
+                // `convert_EXISTS_sublink_to_join` needs a WHERE clause and a
+                // reference to the level around it. A subquery naming no
+                // column at all (`EXISTS (SELECT 1 FROM …)`) has no outer
+                // reference: it stays a sublink, which the folding drops
+                // when the clause around it decides.
+                s.where_clause.is_some()
+                    && reads_column(Some(subselect))
+                    && s.with_clause.is_none()
+                    && s.group_clause.is_empty()
+                    && s.having_clause.is_none()
+                    && s.limit_count.is_none()
+                    && s.limit_offset.is_none()
+                    && s.op == SetOperation::SetopNone
+                    && s.values_lists.is_empty()
+            }
+            _ => false,
+        },
+        SubLinkType::AnySublink => reads_column(inner.testexpr.as_ref()),
+        _ => false,
+    }
+}
+
+/// Whether the expression reads a column anywhere (a test expression of an
+/// `IN` sublink, which `convert_ANY_sublink_to_join` needs).
+fn reads_column(n: Option<&ast::Node>) -> bool {
+    n.is_some_and(|inner| {
+        inner
+            .nodes()
+            .any(|(n, _)| matches!(n, NodeRef::ColumnRef(_)))
+    })
 }
 
 /// The alias of a reference to CTE `name` the SELECT (UPDATE, DELETE)
@@ -1216,6 +1650,53 @@ fn analyze_with_clause_here(
 
     let top_level = QUERY_DEPTH.with(|d| d.get()) <= 1;
     let depth = QUERY_DEPTH.with(|d| d.get());
+    // Which CTEs reach the plan: those the statement references outside the
+    // WITH in live code (a reference a nested WITH shadows or the folding
+    // drops doesn't count), the data-modifying ones, which always run, and
+    // every one the planner doesn't inline that anything outside its own
+    // body references (`SS_process_ctes` plans those before any folding).
+    // A CTE a planned one's body references is planned too.
+    let names: Vec<&str> = ctes.iter().map(|c| c.ctename.as_str()).collect();
+    let mut planned_ctes: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut references_by_cte: Vec<Option<usize>> = Vec::with_capacity(ctes.len());
+    let mut inlined_by_cte: Vec<Option<bool>> = Vec::with_capacity(ctes.len());
+    for (i, cte) in ctes.iter().enumerate() {
+        // PostgreSQL's `cterefcount` counts every syntactic reference,
+        // dead code included: it decides inlining, not whether the CTE
+        // reaches the plan.
+        let references = owner_references(with, &cte.ctename);
+        let inlined = inlined(cte, recursive[i], references, snapshot);
+        let modifying = matches!(
+            cte.ctequery.as_ref(),
+            Some(
+                ast::Node::InsertStmt(_)
+                    | ast::Node::UpdateStmt(_)
+                    | ast::Node::DeleteStmt(_)
+                    | ast::Node::MergeStmt(_)
+            )
+        );
+        // An unknown owner plans every CTE (never prunes a check).
+        let live = owner_fact(with, &cte.ctename, |f| f.live_reference).unwrap_or(true);
+        let outside_self =
+            owner_fact(with, &cte.ctename, |f| f.referenced_outside_self).unwrap_or(true);
+        if modifying || live || (outside_self && inlined != Some(true)) {
+            planned_ctes.insert(i);
+        }
+        references_by_cte.push(references);
+        inlined_by_cte.push(inlined);
+    }
+    // An inlined CTE's body is planned inside the CTEs that reference it.
+    loop {
+        let mut added = false;
+        for i in planned_ctes.clone() {
+            for j in cte_body_refs(ctes[i], &names, snapshot) {
+                added |= planned_ctes.insert(j);
+            }
+        }
+        if !added {
+            break;
+        }
+    }
     let mut cte_scopes = outer_ctes.clone();
     for i in order {
         let cte = ctes[i];
@@ -1250,14 +1731,18 @@ fn analyze_with_clause_here(
         // `deferred`). A data-modifying one always runs. One the planner
         // doesn't inline is scanned as is (a CTE scan, whose Vars keep
         // their parsed collations).
-        let references = owner_references(with, &cte.ctename);
-        let inlined = inlined(cte, recursive[i], references, snapshot);
+        let references = references_by_cte[i];
+        let inlined = inlined_by_cte[i];
         // Inlined, the CTE is a FROM subquery where its one reference is:
         // one of the owner's own FROM items is analyzed as such.
         let reference = match inlined {
             Some(true) => owner_kept_reference(with, &cte.ctename),
             _ => None,
         };
+        // A SELECT CTE the plan never holds is not checked: execution checks
+        // none of what it would read. It is still analyzed (its names and
+        // types are). A data-modifying CTE always runs.
+        let unplanned = returning.is_none() && !planned_ctes.contains(&i);
         let (analyzed, planned) = super::deferred::analyze_cte(
             cte,
             recursive[i],
@@ -1265,15 +1750,25 @@ fn analyze_with_clause_here(
             reference.as_deref(),
             snapshot,
             || {
-                analyze_cte(
-                    cte,
-                    recursive[i],
-                    inlined,
-                    snapshot,
-                    params,
-                    &cte_scopes,
-                    outer_tiers,
-                )
+                let mut body = || {
+                    analyze_cte(
+                        cte,
+                        recursive[i],
+                        inlined,
+                        snapshot,
+                        params,
+                        &cte_scopes,
+                        outer_tiers,
+                    )
+                };
+                if unplanned {
+                    // Not executed: the planner drops it, so its runtime
+                    // privileges aren't checked — but parse analysis still
+                    // looked up the schemas it names.
+                    crate::privileges::not_executed(body)
+                } else {
+                    body()
+                }
             },
         );
         let mut analyzed = analyzed?;

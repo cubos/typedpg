@@ -12,6 +12,7 @@
 #include "postgres.h"
 #include "miscadmin.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_namespace.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/inval.h"
@@ -33,9 +34,22 @@ GetUserId(void)
 	return BOOTSTRAP_SUPERUSERID;
 }
 
+/*
+ * Every privilege is granted.  A schema's USAGE that PL/pgSQL's compiler
+ * checks while it compiles a body (LookupExplicitNamespace, for the DECLARE
+ * section's types and %TYPE / %ROWTYPE names) is reported to the caller's
+ * catalog: the running role needs it when the function is first called.
+ */
 AclResult
 object_aclcheck(Oid classid, Oid objectid, Oid roleid, AclMode mode)
 {
+	if (classid == NamespaceRelationId && (mode & ACL_USAGE) &&
+		typedpg_catalog_in_body() && typedpg_catalog_active())
+	{
+		const TypedpgCatalog *catalog = typedpg_catalog();
+
+		catalog->note_body_schema(catalog->ctx, objectid);
+	}
 	return ACLCHECK_OK;
 }
 

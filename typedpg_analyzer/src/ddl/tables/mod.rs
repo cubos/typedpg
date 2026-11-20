@@ -596,6 +596,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             }
         }
     }
+    let owner = super::roles::current_role(interp);
     for (i, col) in columns.iter().enumerate() {
         if let Some(deptype) = col.owned_sequence {
             super::sequences::create_owned_sequence(
@@ -604,6 +605,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 (i + 1) as i16,
                 deptype,
                 &col.identity_options,
+                owner,
             )?;
         }
     }
@@ -837,6 +839,13 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             })
             .collect();
         crate::ddl::depend::record_partition_key_expressions(interp, class_oid, &key_exprs);
+        interp.partition_key_exprs.insert(
+            class_oid,
+            key_exprs
+                .iter()
+                .map(|e| crate::ddl::indexes::serialize_node(*e))
+                .collect(),
+        );
     }
 
     // DefineRelation: the table access method.
@@ -909,7 +918,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // DefineRelation / heap_create_with_catalog: the relation's owner (the
     // current role), its default ACL, and — as dependent types — its row
     // type and that type's array.
-    let owner = super::roles::current_role(interp);
     super::acl::relation_created(
         interp,
         class_oid,
@@ -1414,6 +1422,8 @@ fn change_relation_owner(
     ) {
         return Ok(());
     }
+    // ATExecChangeOwner: an owned sequence's owner can't change by itself.
+    super::sequences::check_sequence_owner_change(interp, relid, new_owner)?;
     super::acl::change_relation_owner(interp, relid, new_owner);
     Ok(())
 }
@@ -1663,6 +1673,14 @@ fn apply_alter_subtype(
         }
         AlterTableType::AtDisableRowSecurity => {
             interp.row_security.remove(&relid);
+            Ok(())
+        }
+        AlterTableType::AtForceRowSecurity => {
+            interp.force_row_security.insert(relid);
+            Ok(())
+        }
+        AlterTableType::AtNoForceRowSecurity => {
+            interp.force_row_security.remove(&relid);
             Ok(())
         }
         // EnableDisableTrigger recurses into a partitioned table's

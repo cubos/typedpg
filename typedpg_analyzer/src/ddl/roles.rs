@@ -33,6 +33,8 @@ pub(crate) struct Role {
     /// `rolinherit`: the default `INHERIT` option of the memberships this
     /// role is granted (`InitGrantRoleOptions` + `AddRoleMems`).
     pub(crate) inherit: bool,
+    pub(crate) createrole: bool,
+    pub(crate) createdb: bool,
     pub(crate) bypassrls: bool,
     pub(crate) login: bool,
     /// Created by a migration's `CREATE ROLE` (or `CREATE USER` / `CREATE
@@ -50,6 +52,10 @@ pub(crate) struct Membership {
     pub(crate) admin: bool,
     pub(crate) inherit: bool,
     pub(crate) set: bool,
+    /// The row's OID in PG (`pg_auth_members.oid`), which orders the
+    /// dependency DETAIL lines a DROP ROLE reports. The built-in grants get
+    /// the lowest values; every new grant takes the next catalog OID.
+    pub(crate) oid: u32,
 }
 
 /// The cluster's roles and memberships.
@@ -69,6 +75,13 @@ pub(crate) struct Roles {
     pub(crate) search_paths: std::collections::HashMap<RoleId, Vec<String>>,
     /// `ALTER ROLE ALL SET search_path`: every role's.
     pub(crate) all_search_path: Option<Vec<String>>,
+    /// `ALTER ROLE r SET row_security`: the `row_security` GUC each role's
+    /// new sessions start with (pg_db_role_setting). A session of the role
+    /// with it off makes PG reject every statement row security would
+    /// affect (`check_enable_rls`) instead of filtering its rows.
+    pub(crate) row_security: std::collections::HashMap<RoleId, bool>,
+    /// `ALTER ROLE ALL SET row_security`: every role's.
+    pub(crate) all_row_security: Option<bool>,
 }
 
 impl Default for Roles {
@@ -88,6 +101,8 @@ impl Roles {
             migrations_user: RoleId(0),
             search_paths: std::collections::HashMap::new(),
             all_search_path: None,
+            row_security: std::collections::HashMap::new(),
+            all_row_security: None,
         };
         // Built-in roles first: their ids stay small and stable.
         roles.bootstrap = roles.add("postgres", false, true);
@@ -97,11 +112,14 @@ impl Roles {
         }
         // pg_monitor's fixed memberships (pg_authid.dat / system_views.sql).
         let monitor = roles.id("pg_monitor").expect("pg_monitor is predefined");
-        for granted in [
+        for (oid, granted) in [
             "pg_read_all_settings",
             "pg_read_all_stats",
             "pg_stat_scan_tables",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let role = roles.id(granted).expect("predefined role");
             roles.memberships.push(Membership {
                 role,
@@ -110,6 +128,9 @@ impl Roles {
                 admin: false,
                 inherit: true,
                 set: true,
+                // Initdb assigns these rows OIDs below the user range; the
+                // only thing that matters is that they sort first.
+                oid: oid as u32,
             });
         }
         roles
@@ -127,6 +148,8 @@ impl Roles {
                 name: name.to_owned(),
                 superuser,
                 inherit: true,
+                createrole: false,
+                createdb: false,
                 bypassrls: false,
                 login: false,
                 created,
@@ -134,6 +157,25 @@ impl Roles {
         );
         self.by_name.insert(name.to_owned(), id);
         id
+    }
+
+    /// The id the real cluster uses for a model role: the migrations' user
+    /// and the bootstrap superuser are the same real role (see
+    /// [`PgCatalog::MIGRATIONS_USER`]), so every recorded grantor, owner,
+    /// default-privilege key and identity comparison uses the bootstrap's
+    /// id. Created and other predefined roles are their own.
+    pub(crate) fn canonical(&self, id: RoleId) -> RoleId {
+        if self.same_real_role(id, self.bootstrap) {
+            self.bootstrap
+        } else {
+            id
+        }
+    }
+
+    /// The name PG prints for a model role: the migrations' user prints as
+    /// the bootstrap superuser, the role it really is.
+    pub(crate) fn display_name(&self, id: RoleId) -> &str {
+        self.name(self.canonical(id))
     }
 
     pub(crate) fn get(&self, id: RoleId) -> Option<&Role> {
@@ -167,6 +209,14 @@ impl Roles {
         self.by_name.contains_key(name)
     }
 
+    /// Whether `name` is a role with `rolcanlogin` (`pg_user` / `pg_shadow`
+    /// list only those; `pg_roles` lists every role).
+    pub(crate) fn exists_with_login(&self, name: &str) -> bool {
+        self.by_name
+            .get(name)
+            .is_some_and(|id| self.roles.get(id).is_some_and(|r| r.login))
+    }
+
     /// The roles the migrations created, in creation order: the ones the
     /// `pg_sanity` oracle compares and drops at teardown.
     #[cfg(feature = "pg_sanity")]
@@ -194,6 +244,7 @@ impl Roles {
             self.by_name.remove(&role.name);
         }
         self.search_paths.remove(&id);
+        self.row_security.remove(&id);
         self.memberships
             .retain(|m| m.role != id && m.member != id && m.grantor != id);
     }
@@ -203,24 +254,76 @@ impl Roles {
     /// member's own `INHERIT` attribute only chooses that option's default
     /// when a membership is granted, so it isn't consulted here.
     pub(crate) fn has_privs_of_role(&self, member: RoleId, role: RoleId) -> bool {
-        if member == role || self.is_superuser(member) {
+        if self.same_real_role(member, role) || self.is_superuser(member) {
             return true;
         }
-        // BFS over inheritable memberships.
-        let mut seen = vec![member];
-        let mut queue = vec![member];
-        while let Some(current) = queue.pop() {
-            for m in &self.memberships {
-                if m.member == current && m.inherit && !seen.contains(&m.role) {
-                    if m.role == role {
-                        return true;
-                    }
-                    seen.push(m.role);
-                    queue.push(m.role);
+        // `roles_is_member_of`'s inheritable-membership closure (which also
+        // gives the database owner pg_database_owner's implicit membership).
+        self.roles_with_privs_of(member)
+            .into_iter()
+            .any(|other| self.same_real_role(other, role))
+    }
+
+    /// Whether two role ids name the same cluster role: the migrations' user
+    /// and the bootstrap superuser are the same real role (the connecting
+    /// user), which the model keeps apart because its own name is unknown.
+    pub(crate) fn same_real_role(&self, left: RoleId, right: RoleId) -> bool {
+        left == right
+            || (left == self.migrations_user && right == self.bootstrap)
+            || (left == self.bootstrap && right == self.migrations_user)
+    }
+
+    /// `roles_is_member_of(role, ROLERECURSE_PRIVS)`: the role itself and
+    /// every role it has the privileges of, in breadth-first order (closer
+    /// relationships first), as `select_best_admin` / `select_best_grantor`
+    /// search them. Like PG, the database owner is implicitly a member of
+    /// `pg_database_owner`; the model's database — the oracle's scratch
+    /// database — belongs to the migrations' user (the bootstrap superuser).
+    pub(crate) fn roles_with_privs_of(&self, member: RoleId) -> Vec<RoleId> {
+        let member = self.canonical(member);
+        let mut found = vec![member];
+        let database_owner = self.canonical(self.migrations_user);
+        let database_owner_role = self.id("pg_database_owner");
+        let mut next = 0;
+        while next < found.len() {
+            let current = found[next];
+            next += 1;
+            let mut added: Vec<RoleId> = self
+                .memberships
+                .iter()
+                .filter(|m| m.member == current && m.inherit)
+                .map(|m| m.role)
+                .collect();
+            added.sort();
+            for role in added {
+                if !found.contains(&role) {
+                    found.push(role);
                 }
             }
+            // `roles_is_member_of` implements pg_database_owner's implicit
+            // membership right after the database owner's own grants.
+            if current == database_owner
+                && let Some(database_owner_role) = database_owner_role
+                && !found.contains(&database_owner_role)
+            {
+                found.push(database_owner_role);
+            }
         }
-        false
+        found
+    }
+
+    /// `select_best_admin` (acl.c): the role closest to `member` (itself
+    /// first) that directly holds ADMIN OPTION on `role`, ignoring
+    /// superuserness. `None` when no such role exists.
+    pub(crate) fn select_best_admin(&self, member: RoleId, role: RoleId) -> Option<RoleId> {
+        if self.same_real_role(member, role) {
+            return None;
+        }
+        self.roles_with_privs_of(member).into_iter().find(|&other| {
+            self.memberships
+                .iter()
+                .any(|m| m.role == role && self.same_real_role(m.member, other) && m.admin)
+        })
     }
 
     /// `is_member_of_role_nosuper`: membership regardless of the inherit
@@ -299,9 +402,10 @@ pub(crate) fn resolve_role_spec(
 
 /// `ALTER ROLE { r | ALL } [IN DATABASE d] SET / RESET ...`
 /// (AlterRoleSet): a setting for the role's new sessions. As for `ALTER
-/// DATABASE ... SET`, any database is taken as the application's. Only
-/// `search_path` matters: it decides what the role's statements resolve
-/// their unqualified names to.
+/// DATABASE ... SET`, any database is taken as the application's. Two
+/// settings matter: `search_path`, which decides what the role's statements
+/// resolve their unqualified names to, and `row_security`, whose `off` makes
+/// every statement row security affects fail (`check_enable_rls`).
 pub fn alter_role_set(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::AlterRoleSetStmt,
@@ -315,30 +419,66 @@ pub fn alter_role_set(
         return Ok(());
     };
     let kind = set.kind;
-    let value = if kind == VariableSetKind::VarResetAll {
-        None
-    } else {
-        // The parameter must exist and be settable, and a new value valid,
-        // as for SET.
-        if let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned()
-            && kind == VariableSetKind::VarSetValue
-            && let [arg] = set.args.as_slice()
-            && let Some(value) = session::const_arg_string(arg.as_ref())
-        {
-            super::guc::check_value(interp, &setting, &value)?;
+    let is_search_path = set.name.eq_ignore_ascii_case("search_path");
+    let is_row_security = set.name.eq_ignore_ascii_case("row_security");
+    if kind == VariableSetKind::VarResetAll {
+        // RESET ALL drops every setting `pg_db_role_setting` keeps.
+        match role {
+            Some(id) => {
+                interp.roles.search_paths.remove(&id);
+                interp.roles.row_security.remove(&id);
+            }
+            None => {
+                interp.roles.all_search_path = None;
+                interp.roles.all_row_security = None;
+            }
         }
-        if !set.name.eq_ignore_ascii_case("search_path") {
-            return Ok(());
-        }
-        match kind {
-            VariableSetKind::VarSetValue => match session::search_path_args(set) {
-                Some(names) => Some(names),
-                None => return Ok(()),
+        return Ok(());
+    }
+    // The parameter must exist and be settable, and a new value valid, as
+    // for SET.
+    if let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned()
+        && kind == VariableSetKind::VarSetValue
+        && let [arg] = set.args.as_slice()
+        && let Some(value) = session::const_arg_string(arg.as_ref())
+    {
+        super::guc::check_value(interp, &setting, &value)?;
+    }
+    if is_row_security {
+        let value = match kind {
+            VariableSetKind::VarSetValue => match set.args.as_slice() {
+                [arg] => session::const_arg_string(arg.as_ref())
+                    .and_then(|v| super::reloptions::parse_bool(&v)),
+                _ => None,
             },
             // FROM CURRENT: the migrations' session's value now.
-            VariableSetKind::VarSetCurrent => Some(interp.search_path_guc.effective().to_vec()),
+            VariableSetKind::VarSetCurrent => Some(interp.row_security_guc.get()),
             _ => None,
+        };
+        match role {
+            Some(id) => match value {
+                Some(v) => {
+                    interp.roles.row_security.insert(id, v);
+                }
+                None => {
+                    interp.roles.row_security.remove(&id);
+                }
+            },
+            None => interp.roles.all_row_security = value,
         }
+        return Ok(());
+    }
+    if !is_search_path {
+        return Ok(());
+    }
+    let value = match kind {
+        VariableSetKind::VarSetValue => match session::search_path_args(set) {
+            Some(names) => Some(names),
+            None => return Ok(()),
+        },
+        // FROM CURRENT: the migrations' session's value now.
+        VariableSetKind::VarSetCurrent => Some(interp.search_path_guc.effective().to_vec()),
+        _ => None,
     };
     match role {
         Some(id) => match value {
@@ -427,6 +567,7 @@ fn add_membership(
             "role \"pg_database_owner\" cannot be a member of any role".into(),
         ));
     }
+    let grantor = interp.roles.canonical(grantor);
     // Loop check, ignoring superuser status (`is_member_of_role_nosuper`).
     if interp.roles.is_member_nosuper(role, member) {
         return Err(DdlError::Parse(format!(
@@ -453,6 +594,7 @@ fn add_membership(
         return Ok(());
     }
     let member_inherit = interp.roles.get(member).is_none_or(|r| r.inherit);
+    let oid = interp.alloc_oid()?.get();
     interp.roles.memberships.push(Membership {
         role,
         member,
@@ -460,6 +602,7 @@ fn add_membership(
         admin: admin.unwrap_or(false),
         inherit: inherit.unwrap_or(member_inherit),
         set: set.unwrap_or(true),
+        oid,
     });
     Ok(())
 }
@@ -566,7 +709,19 @@ pub fn create_role(
             // Options the model stores nothing for, and that don't have a
             // boolean value (a password or `VALID UNTIL` timestamp).
             "password" | "validUntil" => {}
-            "createrole" | "createdb" | "isreplication" | "connectionlimit" | "sysid" => {
+            "createrole" => {
+                let value = option_bool(interp, de)?;
+                if let Some(role) = interp.roles.roles.get_mut(&id) {
+                    role.createrole = value;
+                }
+            }
+            "createdb" => {
+                let value = option_bool(interp, de)?;
+                if let Some(role) = interp.roles.roles.get_mut(&id) {
+                    role.createdb = value;
+                }
+            }
+            "isreplication" | "connectionlimit" | "sysid" => {
                 let _ = option_bool(interp, de);
             }
             // `ROLE g` / `IN ROLE g` / `ADMIN g`.
@@ -677,7 +832,19 @@ pub fn alter_role(
                 }
             }
             "password" | "validUntil" => {}
-            "createrole" | "createdb" | "isreplication" | "connectionlimit" | "sysid" => {
+            "createrole" => {
+                let value = option_bool(interp, de)?;
+                if let Some(role) = interp.roles.roles.get_mut(&id) {
+                    role.createrole = value;
+                }
+            }
+            "createdb" => {
+                let value = option_bool(interp, de)?;
+                if let Some(role) = interp.roles.roles.get_mut(&id) {
+                    role.createdb = value;
+                }
+            }
+            "isreplication" | "connectionlimit" | "sysid" => {
                 let _ = option_bool(interp, de);
             }
             other => {
@@ -698,6 +865,10 @@ pub fn grant_role(
 ) -> Result<(), DdlError> {
     let current = current_role(interp);
     let (admin, inherit, set) = role_grant_options(interp, stmt)?;
+    let explicit_grantor = match stmt.grantor.as_ref() {
+        Some(spec) => Some(resolve_role_spec(interp, spec)?),
+        None => None,
+    };
     let mut granted = Vec::new();
     for node in &stmt.granted_roles {
         let Some(name) = node.as_ref().and_then(granted_role_name) else {
@@ -717,15 +888,16 @@ pub fn grant_role(
         };
         members.push(resolve_role_spec(interp, spec)?);
     }
-    // A superuser's grants are recorded as the bootstrap superuser's
-    // (`check_role_grantor`): they depend on no other grant.
-    let grantor = if interp.roles.is_superuser(current) {
-        interp.roles.bootstrap
-    } else {
-        current
-    };
     let behavior = stmt.behavior;
+    let cascade = behavior == DropBehavior::DropCascade;
     for &role in &granted {
+        // `check_role_membership_authorization`.
+        if stmt.is_grant && interp.roles.name(role) == "pg_database_owner" {
+            return Err(DdlError::Parse(
+                "role \"pg_database_owner\" cannot have explicit members".into(),
+            ));
+        }
+        let grantor = check_role_grantor(interp, current, role, explicit_grantor, stmt.is_grant)?;
         for &member in &members {
             if stmt.is_grant {
                 add_membership(interp, role, member, grantor, admin, inherit, set)?;
@@ -733,63 +905,222 @@ pub fn grant_role(
             }
             // REVOKE: only the grants this grantor recorded. With an option
             // named (`REVOKE ADMIN/INHERIT/SET OPTION FOR`), only that
-            // option is cleared; otherwise the membership goes.
-            let rows: Vec<usize> = interp
-                .roles
-                .memberships
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| m.role == role && m.member == member && m.grantor == grantor)
-                .map(|(i, _)| i)
-                .collect();
-            if rows.is_empty() {
-                continue;
-            }
-            let option_only = admin == Some(false) || inherit == Some(false) || set == Some(false);
-            if option_only {
-                for i in rows {
-                    let m = &mut interp.roles.memberships[i];
-                    if admin == Some(false) {
-                        m.admin = false;
-                    }
-                    if inherit == Some(false) {
-                        m.inherit = false;
-                    }
-                    if set == Some(false) {
-                        m.set = false;
-                    }
-                }
-                continue;
-            }
-            // Dropping a membership the role granted to others needs those
-            // dependent memberships to go too: PG calls this "dependent
-            // privileges", and CASCADE is required.
-            let dependent: Vec<Membership> = interp
-                .roles
-                .memberships
-                .iter()
-                .filter(|m| m.grantor == member && m.role == role)
-                .copied()
-                .collect();
-            if !dependent.is_empty() && behavior != DropBehavior::DropCascade {
-                return Err(DdlError::DependencyError(
-                    "dependent privileges exist".into(),
-                ));
-            }
-            for m in dependent {
-                interp.roles.memberships.retain(|candidate| {
-                    !(candidate.role == m.role
-                        && candidate.member == m.member
-                        && candidate.grantor == m.grantor)
-                });
-            }
-            // Remove the rows from the end so the indices stay valid.
-            for i in rows.into_iter().rev() {
-                interp.roles.memberships.remove(i);
-            }
+            // option is cleared; otherwise the membership goes, with the
+            // grants that depended on its ADMIN OPTION
+            // (`plan_single_revoke`).
+            revoke_membership(
+                interp,
+                role,
+                member,
+                grantor,
+                &(admin, inherit, set),
+                cascade,
+            )?;
         }
     }
     Ok(())
+}
+
+/// The option a REVOKE names (`REVOKE ADMIN/INHERIT/SET OPTION FOR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevokeOption {
+    Admin,
+    Inherit,
+    Set,
+}
+
+fn named_revoke_option(options: RoleGrantOptions) -> Option<RevokeOption> {
+    match options {
+        (Some(false), _, _) => Some(RevokeOption::Admin),
+        (_, Some(false), _) => Some(RevokeOption::Inherit),
+        (_, _, Some(false)) => Some(RevokeOption::Set),
+        _ => None,
+    }
+}
+
+/// One planned action from `plan_recursive_revoke`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevokeAction {
+    Noop,
+    RemoveAdmin,
+    RemoveInherit,
+    RemoveSet,
+    Delete,
+}
+
+/// `plan_recursive_revoke` (user.c): plan the deletion of one grant and,
+/// when it removes the member's ADMIN OPTION and no other grant leaves it
+/// that option, of the grants that depended on it.
+fn plan_recursive_revoke(
+    rows: &[Membership],
+    actions: &mut [RevokeAction],
+    index: usize,
+    revoke_admin_option_only: bool,
+    cascade: bool,
+) -> Result<(), DdlError> {
+    if actions[index] == RevokeAction::Delete {
+        return Ok(());
+    }
+    if actions[index] == RevokeAction::RemoveAdmin && revoke_admin_option_only {
+        return Ok(());
+    }
+    let row = rows[index];
+    if !revoke_admin_option_only {
+        actions[index] = RevokeAction::Delete;
+        if !row.admin {
+            return Ok(());
+        }
+    } else {
+        if !row.admin {
+            return Ok(());
+        }
+        actions[index] = RevokeAction::RemoveAdmin;
+    }
+    // Determine whether the member would still have ADMIN OPTION.
+    let still_admin = rows.iter().enumerate().any(|(i, candidate)| {
+        candidate.member == row.member && candidate.admin && actions[i] == RevokeAction::Noop
+    });
+    if still_admin {
+        return Ok(());
+    }
+    for (i, candidate) in rows.iter().enumerate() {
+        if candidate.grantor == row.member && actions[i] != RevokeAction::Delete {
+            if !cascade {
+                return Err(DdlError::DependencyError(
+                    "dependent privileges exist (Use CASCADE to revoke them too.)".into(),
+                ));
+            }
+            plan_recursive_revoke(rows, actions, i, false, cascade)?;
+        }
+    }
+    Ok(())
+}
+
+/// `plan_single_revoke`: plan one REVOKE. `false` when no grant of the
+/// grantor to the member exists (PG warns and changes nothing).
+fn plan_single_revoke(
+    rows: &[Membership],
+    actions: &mut [RevokeAction],
+    member: RoleId,
+    grantor: RoleId,
+    options: RoleGrantOptions,
+    cascade: bool,
+) -> Result<bool, DdlError> {
+    let Some(index) = rows
+        .iter()
+        .position(|row| row.member == member && row.grantor == grantor)
+    else {
+        return Ok(false);
+    };
+    match named_revoke_option(options) {
+        // Revoking INHERIT / SET doesn't affect dependent grants.
+        Some(RevokeOption::Inherit) => actions[index] = RevokeAction::RemoveInherit,
+        Some(RevokeOption::Set) => actions[index] = RevokeAction::RemoveSet,
+        option => plan_recursive_revoke(
+            rows,
+            actions,
+            index,
+            option == Some(RevokeOption::Admin),
+            cascade,
+        )?,
+    }
+    Ok(true)
+}
+
+/// `DelRoleMems` for one member of `role`.
+fn revoke_membership(
+    interp: &mut PgCatalog,
+    role: RoleId,
+    member: RoleId,
+    grantor: RoleId,
+    options: &RoleGrantOptions,
+    cascade: bool,
+) -> Result<(), DdlError> {
+    let indices: Vec<usize> = interp
+        .roles
+        .memberships
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == role)
+        .map(|(i, _)| i)
+        .collect();
+    let rows: Vec<Membership> = indices
+        .iter()
+        .map(|&i| interp.roles.memberships[i])
+        .collect();
+    let mut actions = vec![RevokeAction::Noop; rows.len()];
+    if !plan_single_revoke(&rows, &mut actions, member, grantor, *options, cascade)? {
+        // PG: `role "..." has not been granted membership in role "..." by
+        // role "..."` (warning).
+        return Ok(());
+    }
+    // Apply from the end so removing an entry never invalidates a later
+    // index.
+    for (row, action) in indices.iter().zip(actions.iter()).rev() {
+        match action {
+            RevokeAction::Noop => {}
+            RevokeAction::Delete => {
+                interp.roles.memberships.remove(*row);
+            }
+            RevokeAction::RemoveAdmin => interp.roles.memberships[*row].admin = false,
+            RevokeAction::RemoveInherit => interp.roles.memberships[*row].inherit = false,
+            RevokeAction::RemoveSet => interp.roles.memberships[*row].set = false,
+        }
+    }
+    Ok(())
+}
+
+/// `check_role_grantor` (user.c): the grantor a GRANT / REVOKE of role
+/// membership is recorded as made by. Without `GRANTED BY`: a superuser's
+/// grants as the bootstrap superuser, another role's as the closest role
+/// whose ADMIN OPTION it inherits (itself first). An explicit grantor must be
+/// a role whose privileges the current role has, and — for GRANT — one that
+/// holds ADMIN OPTION on the granted role.
+fn check_role_grantor(
+    interp: &PgCatalog,
+    current: RoleId,
+    role: RoleId,
+    explicit: Option<RoleId>,
+    is_grant: bool,
+) -> Result<RoleId, DdlError> {
+    let Some(grantor) = explicit else {
+        if interp.roles.is_superuser(current) {
+            return Ok(interp.roles.bootstrap);
+        }
+        return Ok(interp
+            .roles
+            .select_best_admin(current, role)
+            .unwrap_or(current));
+    };
+    // `CURRENT_USER` is the migrations' user, which is the bootstrap
+    // superuser: PG records the bootstrap and exempts it from the ADMIN
+    // check (`check_role_grantor`'s `grantorId != BOOTSTRAP_SUPERUSERID`).
+    let grantor = interp.roles.canonical(grantor);
+    let grantor_name = interp.roles.name(grantor);
+    if is_grant {
+        if !interp.roles.has_privs_of_role(current, grantor) {
+            return Err(DdlError::Parse(format!(
+                "permission denied to grant privileges as role \"{grantor_name}\" (Only roles \
+                 with privileges of role \"{grantor_name}\" may grant privileges as this role.)"
+            )));
+        }
+        if grantor != interp.roles.bootstrap
+            && interp.roles.select_best_admin(grantor, role) != Some(grantor)
+        {
+            return Err(DdlError::Parse(format!(
+                "permission denied to grant privileges as role \"{grantor_name}\" (The grantor \
+                 must have the ADMIN option on role \"{}\".)",
+                interp.roles.name(role)
+            )));
+        }
+    } else if !interp.roles.has_privs_of_role(current, grantor) {
+        return Err(DdlError::Parse(format!(
+            "permission denied to revoke privileges granted by role \"{grantor_name}\" (Only \
+             roles with privileges of role \"{grantor_name}\" may revoke privileges granted by \
+             this role.)"
+        )));
+    }
+    Ok(grantor)
 }
 
 /// `DROP ROLE [IF EXISTS] a [, ...]` (`DropRole`): a role that still owns
@@ -807,7 +1138,7 @@ pub fn drop_role(
                 "cannot use special role specifier in DROP ROLE".into(),
             ));
         };
-        let Some(id) = interp.roles.id(&name) else {
+        let Some(id) = interp.roles.id(&name).map(|id| interp.roles.canonical(id)) else {
             if stmt.missing_ok || session::role_may_exist(&name) {
                 // A name the migrations never created is an external role:
                 // taken to exist, with nothing the model knows how to drop.
@@ -840,25 +1171,15 @@ pub fn drop_role(
             // An external role: accepted, nothing known to drop.
             continue;
         }
-        if role_has_dependents(interp, id) {
+        if let Some(details) = super::acl::role_dependency_details(interp, id) {
             return Err(DdlError::DependencyError(format!(
-                "role \"{name}\" cannot be dropped because some objects depend on it"
+                "role \"{name}\" cannot be dropped because some objects depend on it ({details})"
             )));
         }
         interp.roles.remove(id);
         interp.acls.forget_role(id);
     }
     Ok(())
-}
-
-/// Whether dropping `role` would drop or revoke something: owns an object
-/// (or its default privileges), or appears as grantee/grantor in an ACL
-/// (`pg_shdepend`'s OWNER and ACL dependencies).
-fn role_has_dependents(interp: &PgCatalog, role: RoleId) -> bool {
-    if interp.acls.owns_anything(role) {
-        return true;
-    }
-    interp.acls.mentions_role(role)
 }
 
 /// `ALTER ROLE ... RENAME TO` (a `RenameStmt` with `OBJECT_ROLE`).
@@ -890,6 +1211,22 @@ pub fn rename_role(interp: &mut PgCatalog, old: &str, new_name: &str) -> Result<
     Ok(())
 }
 
+/// `IsPinnedObject(AuthIdRelationId, roleid)`: the bootstrap superuser and
+/// the predefined roles were created by initdb, so `REASSIGN OWNED` and
+/// `DROP OWNED` refuse them (`shdepReassignOwned` / `shdepDropOwned`). The
+/// migrations' user is the bootstrap superuser, so it is pinned too.
+fn check_role_not_pinned(interp: &PgCatalog, role: RoleId, action: &str) -> Result<(), DdlError> {
+    let role = interp.roles.canonical(role);
+    let name = interp.roles.name(role);
+    if role == interp.roles.bootstrap || session::PREDEFINED_ROLES.contains(&name) {
+        return Err(DdlError::DependencyError(format!(
+            "cannot {action} objects owned by role {name} because they are required by the \
+             database system"
+        )));
+    }
+    Ok(())
+}
+
 /// `REASSIGN OWNED BY a [, ...] TO b`: the ownership of everything the roles
 /// own moves to `b`, with their ACLs' owner/grantor mentions (`aclnewowner`).
 pub fn reassign_owned(
@@ -900,6 +1237,7 @@ pub fn reassign_owned(
         return Ok(());
     };
     let new_owner = resolve_role_spec(interp, new_spec)?;
+    let new_owner = interp.roles.canonical(new_owner);
     let mut old = Vec::new();
     for node in &stmt.roles {
         let Some(ast::Node::RoleSpec(spec)) = node.as_ref() else {
@@ -908,6 +1246,8 @@ pub fn reassign_owned(
         old.push(resolve_role_spec(interp, spec)?);
     }
     for role in old {
+        check_role_not_pinned(interp, role, "reassign ownership of")?;
+        let role = interp.roles.canonical(role);
         interp.acls.reassign_owner(role, new_owner);
     }
     Ok(())
@@ -927,8 +1267,37 @@ pub fn drop_owned(
         roles.push(resolve_role_spec(interp, spec)?);
     }
     let cascade = stmt.behavior == DropBehavior::DropCascade;
+    let mut canonical: Vec<RoleId> = Vec::new();
     for role in roles {
-        super::acl::drop_owned_by(interp, role, cascade)?;
+        check_role_not_pinned(interp, role, "drop")?;
+        let role = interp.roles.canonical(role);
+        if !canonical.contains(&role) {
+            canonical.push(role);
+        }
+    }
+    // `shdepDropOwned` collects every role's objects into one set before
+    // `performMultipleDeletions`: a RESTRICT check sees dependencies among
+    // what the command deletes together, so two roles' objects depending on
+    // each other don't block it.
+    if !cascade {
+        let mut targets = Vec::new();
+        for &role in &canonical {
+            super::acl::owned_targets(interp, role, &mut targets);
+        }
+        if let Some((blocker, via)) = super::depend::multiple_deletion_blockers(interp, &targets)
+            .into_iter()
+            .next()
+        {
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop desired object(s) because other objects depend on them ({} depends \
+                 on {})",
+                super::depend::describe_dependent(interp, blocker),
+                super::depend::describe(interp, via)
+            )));
+        }
+    }
+    for role in canonical {
+        super::acl::drop_owned_by(interp, role, cascade, true)?;
     }
     Ok(())
 }
@@ -958,5 +1327,40 @@ impl PgCatalog {
     #[cfg(feature = "pg_sanity")]
     pub(crate) fn created_roles(&self) -> Vec<String> {
         self.roles.created_names()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `roles_is_member_of` gives the database owner `pg_database_owner`'s
+    /// implicit membership; the model's database belongs to the migrations'
+    /// user (the bootstrap superuser).
+    #[test]
+    fn database_owner_is_implicitly_a_member_of_pg_database_owner() {
+        let roles = Roles::new();
+        let database_owner = roles.id("pg_database_owner").expect("predefined role");
+        assert!(
+            roles
+                .roles_with_privs_of(roles.migrations_user)
+                .contains(&database_owner)
+        );
+        assert!(
+            roles
+                .roles_with_privs_of(roles.bootstrap)
+                .contains(&database_owner)
+        );
+        // An ordinary role doesn't get it.
+        let other = roles.id("pg_read_all_data").expect("predefined role");
+        assert!(!roles.roles_with_privs_of(other).contains(&database_owner));
+    }
+
+    #[test]
+    fn the_migrations_user_is_the_bootstrap_superuser() {
+        let roles = Roles::new();
+        assert!(roles.same_real_role(roles.migrations_user, roles.bootstrap));
+        assert_eq!(roles.canonical(roles.migrations_user), roles.bootstrap);
+        assert_eq!(roles.display_name(roles.migrations_user), "postgres");
     }
 }
