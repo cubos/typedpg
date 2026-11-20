@@ -8312,3 +8312,28 @@ const REINDEX_CASES: &[(&str, Option<&str>)] = &[
         Some("only shared relations can be placed in pg_global tablespace"),
     ),
 ];
+
+#[test]
+fn lock_refuses_a_foreign_table() {
+    // RangeVarCallbackForLockTable locks plain and partitioned tables and
+    // views only (verified on PostgreSQL 18.7).
+    let setup = "CREATE FOREIGN DATA WRAPPER lk_w;
+         CREATE SERVER lk_s FOREIGN DATA WRAPPER lk_w;
+         CREATE FOREIGN TABLE lk_ft (id int) SERVER lk_s;";
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        ("0002.sql", "SELECT 1; LOCK TABLE lk_ft;"),
+    ])
+    .expect_err("LOCK of a foreign table");
+    assert!(
+        err.to_string()
+            .starts_with("cannot lock relation \"lk_ft\""),
+        "got: {err}"
+    );
+    let db = build_db(&[("0001.sql", setup)]);
+    let err = db.analyze("LOCK lk_ft").unwrap_err().to_string();
+    assert!(
+        err.starts_with("cannot lock relation \"lk_ft\""),
+        "got: {err}"
+    );
+}

@@ -800,7 +800,32 @@ fn has_inner_promise(ty: &Type) -> bool {
 /// (which are also what EXPLAIN takes), plus CALL, whose procedure's EXECUTE
 /// is checked as it runs.
 pub(super) fn is_executable_by_role(sql: &str) -> bool {
-    !UNSAFE_CALLS.iter().any(|c| sql.contains(c)) && (is_executable(sql) || is_call(sql))
+    !UNSAFE_CALLS.iter().any(|c| sql.contains(c))
+        && (is_executable(sql) || is_call(sql) || is_checked_utility(sql))
+}
+
+/// Whether `sql` is a utility statement that checks the role's privileges
+/// only when it executes (`TRUNCATE`, `LOCK`, `ANALYZE`, `REFRESH
+/// MATERIALIZED VIEW`, `SET` / `RESET`): run in the rolled-back transaction,
+/// it shows what the role may do.
+fn is_checked_utility(sql: &str) -> bool {
+    use typedpg_pg_query::ast::Node;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return false;
+    };
+    let [raw] = parsed.tree.stmts.as_slice() else {
+        return false;
+    };
+    match raw.stmt.as_ref() {
+        Some(
+            Node::TruncateStmt(_)
+            | Node::LockStmt(_)
+            | Node::RefreshMatViewStmt(_)
+            | Node::VariableSetStmt(_),
+        ) => true,
+        Some(Node::VacuumStmt(v)) => !v.is_vacuumcmd,
+        _ => false,
+    }
 }
 
 /// Whether `sql` is a `CALL`, read from the parse tree (a leading comment or

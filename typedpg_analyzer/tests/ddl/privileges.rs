@@ -2818,3 +2818,39 @@ fn drop_owned_reaches_column_acls_without_a_table_acl() {
     assert!(!db.has_column_privilege("acl_t7_coldrop_app", table, a, Privilege::Select));
     assert!(!db.has_any_column_privilege("acl_t7_coldrop_app", table, Privilege::Select));
 }
+
+#[test]
+fn parameter_privileges_hold_their_grantees() {
+    // pg_parameter_acl: a role granted SET on a parameter can't be dropped
+    // until DROP OWNED revokes it (verified on PostgreSQL 18.7).
+    let setup = "CREATE ROLE dp_param_role;
+         GRANT SET ON PARAMETER log_min_duration_statement TO dp_param_role;";
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        ("0002.sql", "DROP ROLE dp_param_role;"),
+    ])
+    .expect_err("DROP ROLE with a parameter grant");
+    assert!(
+        err.to_string().starts_with(
+            "role \"dp_param_role\" cannot be dropped because some objects depend on it"
+        ),
+        "got: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("privileges for parameter log_min_duration_statement"),
+        "got: {err}"
+    );
+    // Another role: the mirror's cluster keeps the first one (its grant
+    // outlives the database that made it).
+    build_db(&[
+        (
+            "0001.sql",
+            &setup.replace("dp_param_role", "dp_param_role2"),
+        ),
+        (
+            "0002.sql",
+            "DROP OWNED BY dp_param_role2; DROP ROLE dp_param_role2;",
+        ),
+    ]);
+}

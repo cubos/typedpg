@@ -90,7 +90,7 @@ pub(crate) const TRIGGER_TYPE_UPDATE: i32 = 1 << 4;
 pub(crate) const TRIGGER_TYPE_BEFORE: i32 = 1 << 1;
 pub(crate) const TRIGGER_TYPE_INSERT: i32 = 1 << 2;
 pub(crate) const TRIGGER_TYPE_DELETE: i32 = 1 << 3;
-const TRIGGER_TYPE_TRUNCATE: i32 = 1 << 5;
+pub(crate) const TRIGGER_TYPE_TRUNCATE: i32 = 1 << 5;
 const TRIGGER_TYPE_INSTEAD: i32 = 1 << 6;
 /// `TRIGGER_TYPE_AFTER` is no bit at all.
 const TRIGGER_TYPE_AFTER: i32 = 0;

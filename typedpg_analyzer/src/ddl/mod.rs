@@ -27,7 +27,7 @@ pub(crate) mod fdw;
 mod fk_bypass;
 pub(crate) mod function_body;
 pub mod functions;
-mod guc;
+pub(crate) mod guc;
 pub mod indexes;
 pub(crate) mod languages;
 pub(crate) mod maintenance;

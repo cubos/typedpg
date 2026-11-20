@@ -1565,7 +1565,7 @@ typedpg does not support CREATE INDEX statements in queries yet
   ·   ───┬──
   ·      ╰─ unsupported construct
   ╰────
-  help: a query can be SELECT, VALUES, INSERT, UPDATE, DELETE, MERGE, CALL, EXPLAIN, NOTIFY, LISTEN or UNLISTEN; schema changes belong in migrations
+  help: a query can be SELECT, VALUES, INSERT, UPDATE, DELETE, MERGE, CALL, EXPLAIN, NOTIFY, LISTEN, UNLISTEN, TRUNCATE, LOCK, ANALYZE, REFRESH MATERIALIZED VIEW, SET or RESET; schema changes belong in migrations
 ",
     );
 }

@@ -1233,6 +1233,26 @@ fn analyze_raw_node_once(
         ast::Node::NotifyStmt(_) | ast::Node::ListenStmt(_) | ast::Node::UnlistenStmt(_) => {
             (Vec::new(), None)
         }
+        ast::Node::TruncateStmt(s) => {
+            utility::analyze_truncate(s, snapshot)?;
+            (Vec::new(), None)
+        }
+        ast::Node::LockStmt(s) => {
+            utility::analyze_lock(s, snapshot)?;
+            (Vec::new(), None)
+        }
+        ast::Node::VacuumStmt(s) if !s.is_vacuumcmd => {
+            utility::analyze_vacuum(s, snapshot)?;
+            (Vec::new(), None)
+        }
+        ast::Node::RefreshMatViewStmt(s) => {
+            utility::analyze_refresh(s, snapshot)?;
+            (Vec::new(), None)
+        }
+        ast::Node::VariableSetStmt(s) => {
+            utility::analyze_set(s, snapshot)?;
+            (Vec::new(), None)
+        }
         _ => {
             return Err(crate::error::RawError::unsupported(
                 format!(
@@ -1242,7 +1262,8 @@ fn analyze_raw_node_once(
                 crate::error::statement_span(),
                 Some(
                     "a query can be SELECT, VALUES, INSERT, UPDATE, DELETE, MERGE, CALL, \
-                     EXPLAIN, NOTIFY, LISTEN or UNLISTEN; schema changes belong in migrations"
+                     EXPLAIN, NOTIFY, LISTEN, UNLISTEN, TRUNCATE, LOCK, ANALYZE, REFRESH \
+                     MATERIALIZED VIEW, SET or RESET; schema changes belong in migrations"
                         .into(),
                 ),
             )
@@ -1819,6 +1840,7 @@ mod select;
 mod set_ops;
 mod target_list;
 mod type_resolution;
+mod utility;
 pub(crate) mod walk;
 mod written_row;
 

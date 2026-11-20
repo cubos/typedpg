@@ -648,6 +648,9 @@ pub(crate) struct Acls {
     /// The `pg_default_acl` row's OID per entry, which orders the dependency
     /// DETAIL lines a DROP ROLE reports (PG reports by dependent object OID).
     default_oids: HashMap<(RoleId, Option<PgNamespaceOid>, DefaultAclClass), u32>,
+    /// `pg_parameter_acl`: by lowercased parameter name, the row's OID and
+    /// its ACL. Absent means no row (no privilege granted).
+    parameters: HashMap<String, (u32, Vec<AclItem>)>,
 }
 
 impl Acls {
@@ -1148,6 +1151,8 @@ fn check_grant_option(stmt: &GrantStmt, grantees: &[Grantee]) -> Result<(), DdlE
 
 /// A resolved GRANT target.
 enum Target {
+    /// A configuration parameter, by lowercased name.
+    Parameter(String),
     Relation(PgClassOid),
     Function(PgProcOid),
     Schema(PgNamespaceOid),
@@ -1375,17 +1380,17 @@ fn resolve_target(
         }
         // ParameterAclCreate: a GRANT names a known parameter or a custom
         // `prefix.name` one; a REVOKE of an unknown one does nothing.
-        (O::ObjectParameterAcl, _) => {
-            if let Some(name) = node_string(obj)
-                && is_grant
-                && !super::guc::exists(interp, name)
-            {
+        (O::ObjectParameterAcl, _) => match node_string(obj) {
+            Some(name) if super::guc::exists(interp, name) => {
+                Target::Parameter(name.to_ascii_lowercase())
+            }
+            Some(name) if is_grant => {
                 return Err(DdlError::TypeNotFound(format!(
                     "unrecognized configuration parameter \"{name}\""
                 )));
             }
-            Target::Other
-        }
+            _ => Target::Other,
+        },
         _ => Target::Other,
     }))
 }
@@ -1500,6 +1505,62 @@ fn column_attnum(interp: &PgCatalog, relid: PgClassOid, column: &str) -> Option<
         })
 }
 
+/// `ExecGrant_Parameter`: a parameter has no owner; its ACL is granted as
+/// the bootstrap superuser, and an emptied ACL removes its
+/// `pg_parameter_acl` row.
+fn apply_parameter_grant(
+    interp: &mut PgCatalog,
+    name: &str,
+    privileges: &Privileges<'_>,
+    grantees: &[Grantee],
+    stmt: &GrantStmt,
+    behavior: DropBehavior,
+    current: RoleId,
+) -> Result<(), DdlError> {
+    let mask = if privileges.all {
+        bits::PARAMETER_ACL
+    } else {
+        privileges.mask
+    };
+    let owner = interp.roles.bootstrap;
+    let (oid, old_acl) = interp
+        .acls
+        .parameters
+        .get(name)
+        .cloned()
+        .unwrap_or_default();
+    let (grantor, available) = select_best_grantor(interp, current, &old_acl, owner, mask);
+    let mask = mask & available;
+    if mask == 0 {
+        return Ok(());
+    }
+    let new_acl = merge_acl_with_grant(
+        interp,
+        &old_acl,
+        stmt.is_grant,
+        stmt.grant_option,
+        behavior,
+        grantees,
+        mask,
+        grantor,
+        owner,
+    )?;
+    if new_acl.is_empty() {
+        interp.acls.parameters.remove(name);
+        return Ok(());
+    }
+    let oid = if oid == 0 {
+        interp.alloc_oid()?.get()
+    } else {
+        oid
+    };
+    interp
+        .acls
+        .parameters
+        .insert(name.to_owned(), (oid, new_acl));
+    Ok(())
+}
+
 /// Apply one GRANT / REVOKE to one target: `ExecGrant_*`.
 fn apply_target_grant(
     interp: &mut PgCatalog,
@@ -1511,6 +1572,11 @@ fn apply_target_grant(
     current: RoleId,
 ) -> Result<(), DdlError> {
     let object = match target {
+        Target::Parameter(name) => {
+            return apply_parameter_grant(
+                interp, name, privileges, grantees, stmt, behavior, current,
+            );
+        }
         Target::Relation(relid) => AclObject::Relation(*relid),
         Target::Function(oid) => AclObject::Function(*oid),
         Target::Schema(ns) => AclObject::Schema(*ns),
@@ -2054,6 +2120,23 @@ pub(crate) fn drop_owned_by(
     for object in mentioned {
         revoke_all_from_object(interp, object, role, current)?;
     }
+    // Parameter ACLs, granted as the bootstrap superuser.
+    let bootstrap = interp.roles.bootstrap;
+    let parameters: Vec<(String, u32, Vec<AclItem>)> = interp
+        .acls
+        .parameters
+        .iter()
+        .filter(|(_, (_, acl))| acl_mentions(acl, role))
+        .map(|(name, (oid, acl))| (name.clone(), *oid, acl.clone()))
+        .collect();
+    for (name, oid, acl) in parameters {
+        let new_acl = revoke_all_from(interp, &acl, role, bootstrap, bootstrap);
+        if new_acl.is_empty() {
+            interp.acls.parameters.remove(&name);
+        } else {
+            interp.acls.parameters.insert(name, (oid, new_acl));
+        }
+    }
     // `pg_default_acl`: the role's own entries are dropped (an owner
     // dependency); in another role's, the role's grants are revoked as that
     // role does (`SetDefaultACL`'s grantor is always the target role).
@@ -2282,6 +2365,7 @@ impl AclObject {
 /// two kinds of shared dependency `DROP ROLE` reports.
 const PG_AUTH_MEMBERS_RELID: u32 = 1260;
 const PG_DEFAULT_ACL_RELID: u32 = 826;
+const PG_PARAMETER_ACL_RELID: u32 = 6243;
 
 /// `checkSharedDependencies`'s DETAIL lines for `role`: every object it owns,
 /// every default ACL it owns or appears in, every ACL and column ACL it
@@ -2418,6 +2502,19 @@ pub(crate) fn role_dependency_details(interp: &PgCatalog, role: RoleId) -> Optio
         ));
     }
 
+    // Parameter ACLs it appears in.
+    for (name, (oid, acl)) in &interp.acls.parameters {
+        if acl_mentions(acl, role) {
+            details.push((
+                *oid,
+                PG_PARAMETER_ACL_RELID,
+                0,
+                'a',
+                format!("privileges for parameter {name}"),
+            ));
+        }
+    }
+
     // Role memberships it granted.
     for membership in &interp.roles.memberships {
         if membership.grantor != role {
@@ -2527,6 +2624,28 @@ impl PgCatalog {
     /// the privileges of a relation — a table, view, materialized view,
     /// foreign table, partitioned table or sequence. Like PG's function, it
     /// accepts any relation OID; a sequence's ACL is its own kind's.
+    /// `pg_parameter_aclcheck`: a superuser has every privilege on every
+    /// parameter; anyone else what the parameter's ACL grants them, PUBLIC
+    /// or a role whose privileges they have.
+    pub(crate) fn has_parameter_privilege(&self, role: &str, name: &str, bit: u32) -> bool {
+        let Some(role_id) = self.known_role(role) else {
+            return false;
+        };
+        if self.roles.is_superuser(role_id) {
+            return true;
+        }
+        let Some((_, acl)) = self.acls.parameters.get(&name.to_ascii_lowercase()) else {
+            return false;
+        };
+        acl.iter().any(|item| {
+            item.privileges & bit != 0
+                && match item.grantee {
+                    Grantee::Public => true,
+                    Grantee::Role(grantee) => self.roles.has_privs_of_role(role_id, grantee),
+                }
+        })
+    }
+
     pub fn has_table_privilege(&self, role: &str, relid: PgClassOid, privilege: Privilege) -> bool {
         let Some(class) = self.pg_class.get(&relid) else {
             return false;
