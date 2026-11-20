@@ -1,0 +1,9 @@
+error: permission denied for table audits
+         help: grant it in a migration: GRANT TRUNCATE ON public.audits TO fixture_app;
+         note: role fixture_app has no TRUNCATE on public.audits
+       
+ --> src/bin/fail_role_truncate_denied.rs:4:35
+  |
+4 |     typedpg::sql!(db = roles, db, "TRUNCATE audits")
+  |                                   ^^^^^^^^^^^^^^^^^
+

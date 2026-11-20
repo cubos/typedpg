@@ -370,6 +370,9 @@ struct RelationRequirement {
     /// the relation a dummy one): their security quals are never built, so
     /// no policy expression runs. A DML target occurrence is never empty.
     proven_empty: bool,
+    /// Named by a utility statement (`TRUNCATE`), which opens it outside
+    /// any range table: no row-level security applies.
+    no_range_table: bool,
     selected: Vec<Column>,
     inserted: Vec<Column>,
     updated: Vec<Column>,
@@ -430,6 +433,40 @@ pub(crate) struct ViewOutput {
     /// these `selectedCols` entries are checked by `ExecCheckPermissions`
     /// whatever the planner drops.
     pub parse_relations: Requirements,
+}
+
+/// A privilege a utility statement checks itself (`TRUNCATE`, `LOCK`,
+/// `SET`, `REFRESH MATERIALIZED VIEW`): these open their relations outside
+/// any range table, and check what their command needs.
+#[derive(Debug, Clone)]
+pub(crate) enum UtilityCheck {
+    /// One of the privileges `any_of` (`bits::*`) on relation `relid`, held
+    /// by `check_as` (`None`: the role running the statement) —
+    /// `pg_class_aclcheck` with a mask (`truncate_check_perms`,
+    /// `LockTableAclCheck`, `RangeVarCallbackMaintainsTable`).
+    Relation {
+        relid: PgClassOid,
+        any_of: u32,
+        check_as: Option<crate::ddl::roles::RoleId>,
+    },
+    /// Ownership of sequence `relid` (`TRUNCATE ... RESTART IDENTITY`'s
+    /// `object_ownercheck`).
+    SequenceOwner { relid: PgClassOid },
+    /// `SET` of a parameter only a superuser may set unless granted
+    /// (`PGC_SUSET`: `pg_parameter_aclcheck` for `ACL_SET`).
+    SetParameter { name: String },
+    /// `SET ROLE name`: the role must be able to become it
+    /// (`member_can_set_role`).
+    SetRole { name: String },
+    /// `SET SESSION AUTHORIZATION name`: only a superuser session may
+    /// become another role.
+    SessionAuthorization { name: String },
+    /// What a materialized view's stored query requires, checked as the
+    /// view's owner (`REFRESH MATERIALIZED VIEW` switches to it).
+    AsOwnerOf {
+        relid: PgClassOid,
+        req: Box<Requirements>,
+    },
 }
 
 /// What reading a view runs: its stored query, split by the parts the
@@ -525,6 +562,9 @@ pub(crate) struct Requirements {
     /// `pg_depend` naming is not needed to keep them — unlike a name the
     /// analysis resolved again under the running role's search path.
     stable_routines: Vec<PgProcOid>,
+    /// What a utility statement (`TRUNCATE`, `LOCK`, `SET`, `REFRESH`)
+    /// checks itself, outside any range table.
+    utility: Vec<UtilityCheck>,
     /// Whether the statement executes: EXPLAIN without ANALYZE starts its
     /// executor without running an expression, so nothing reaches a
     /// sequence's `nextval` and no trigger or routine body runs.
@@ -542,12 +582,24 @@ impl Requirements {
 
     /// Add every requirement of `other` that isn't there already: what a
     /// part of a call's arguments needs, kept only when the call runs it.
+    /// The relations the requirements name, in order.
+    pub(crate) fn relation_oids(&self) -> Vec<PgClassOid> {
+        let mut out: Vec<PgClassOid> = Vec::new();
+        for rel in &self.relations {
+            if !out.contains(&rel.relid) {
+                out.push(rel.relid);
+            }
+        }
+        out
+    }
+
     fn merge(&mut self, other: &Requirements) {
         for &ns in &other.schemas {
             if !self.schemas.contains(&ns) {
                 self.schemas.push(ns);
             }
         }
+        self.utility.extend(other.utility.iter().cloned());
         for rel in &other.relations {
             let entry = match self
                 .relations
@@ -568,6 +620,7 @@ impl Requirements {
             entry.merge_target |= rel.merge_target;
             entry.target_select |= rel.target_select;
             entry.view_owner |= rel.view_owner;
+            entry.no_range_table &= rel.no_range_table;
             // Every scan occurrence must be certainly empty: one live scan
             // (or a DML target) builds its security quals. A mark-only
             // occurrence (a column read on the relation's `selectedCols`)
@@ -668,6 +721,7 @@ impl Requirements {
                     target_select: false,
                     view_owner: false,
                     proven_empty: false,
+                    no_range_table: false,
                     selected: Vec::new(),
                     inserted: Vec::new(),
                     updated: Vec::new(),
@@ -2512,6 +2566,27 @@ pub(crate) fn note_insert_route_unknown(relid: PgClassOid) {
 /// `TRIGGER_TYPE_*` bit), which fires its triggers for that event. `only`:
 /// the write reaches no inheritance children (`UPDATE ONLY` / `DELETE FROM
 /// ONLY`).
+/// A utility statement's own privilege check (see [`UtilityCheck`]).
+pub(crate) fn note_utility(check: UtilityCheck) {
+    with(|req| req.utility.push(check.clone()));
+}
+
+/// `TRUNCATE` empties `relid`: its TRUNCATE statement triggers fire. The
+/// relation is in no range table, so no row-level security applies.
+pub(crate) fn note_truncated(relid: PgClassOid) {
+    with(|req| {
+        let rel = req.relation(relid);
+        rel.no_range_table = true;
+        let write = WriteEvent {
+            event: crate::ddl::triggers::TRIGGER_TYPE_TRUNCATE,
+            only: true,
+        };
+        if !rel.writes.contains(&write) {
+            rel.writes.push(write);
+        }
+    });
+}
+
 pub(crate) fn note_write(relid: PgClassOid, event: i32, only: bool) {
     with(|req| {
         let write = WriteEvent { event, only };
@@ -2884,6 +2959,9 @@ impl PgCatalog {
         }
         for &ns in &req.schemas {
             self.check_schema_usage(role, ns)?;
+        }
+        for check in &req.utility {
+            self.check_utility(role, check, ctx)?;
         }
 
         // EXPLAIN without ANALYZE starts the executor and never runs it:
@@ -4374,6 +4452,7 @@ impl PgCatalog {
                                     target_select: false,
                                     view_owner: inner_as.is_some(),
                                     proven_empty: rel.proven_empty,
+                                    no_range_table: false,
                                     selected: Vec::new(),
                                     inserted: Vec::new(),
                                     updated: Vec::new(),
@@ -4547,6 +4626,7 @@ impl PgCatalog {
                         target_select: rel.target_select,
                         view_owner: inner_as.is_some(),
                         proven_empty: false,
+                        no_range_table: false,
                         // rewriteTargetView leaves the view query's own
                         // selectedCols on the base relation, not the outer
                         // statement's: the owner needs SELECT on every
@@ -4589,6 +4669,7 @@ impl PgCatalog {
                     existing.merge_target |= rel.merge_target;
                     existing.target_select |= rel.target_select;
                     existing.view_owner |= rel.view_owner;
+                    existing.no_range_table &= rel.no_range_table;
                     existing.proven_empty = if rel.target.is_some() || !rel.writes.is_empty() {
                         false
                     } else if !rel.scanned {
@@ -5593,6 +5674,186 @@ impl PgCatalog {
         out
     }
 
+    /// A utility statement's own check (see [`UtilityCheck`]), with PG's
+    /// error.
+    fn check_utility(
+        &self,
+        role: &str,
+        check: &UtilityCheck,
+        ctx: &mut BodyContext,
+    ) -> Result<(), AnalyzeError> {
+        match check {
+            UtilityCheck::Relation {
+                relid,
+                any_of,
+                check_as,
+            } => {
+                let who = match check_as {
+                    Some(id) => self.roles.name(*id).to_owned(),
+                    None => role.to_owned(),
+                };
+                let candidates: Vec<crate::Privilege> = [
+                    crate::Privilege::Select,
+                    crate::Privilege::Insert,
+                    crate::Privilege::Update,
+                    crate::Privilege::Delete,
+                    crate::Privilege::Truncate,
+                    crate::Privilege::Maintain,
+                ]
+                .into_iter()
+                .filter(|p| any_of & p.bit() != 0)
+                .collect();
+                if candidates
+                    .iter()
+                    .any(|&p| self.has_table_privilege(&who, *relid, p))
+                {
+                    return Ok(());
+                }
+                let Some(class) = self.pg_class.get(relid) else {
+                    return Ok(());
+                };
+                let schema = self.namespace_name(class.relnamespace).unwrap_or_default();
+                let qualified = crate::QualifiedName::new(schema, class.relname.clone());
+                let whom = if check_as.is_some() {
+                    format!(
+                        "role {} (which the view's query is checked as, being the view's \
+                         owner)",
+                        quote_role(&who)
+                    )
+                } else {
+                    format!("role {}", quote_role(&who))
+                };
+                let names: Vec<&str> = candidates.iter().map(|p| p.name()).collect();
+                let note = match names.as_slice() {
+                    [one] => format!("{whom} has no {one} on {qualified}"),
+                    _ => format!("{whom} has none of {} on {qualified}", names.join(", ")),
+                };
+                let grant = format!(
+                    "GRANT {} ON {qualified} TO {};",
+                    names.first().copied().unwrap_or("SELECT"),
+                    quote_role(&who)
+                );
+                Err(Denial {
+                    message: format!(
+                        "permission denied for {} {}",
+                        relkind_word(class.relkind),
+                        class.relname
+                    ),
+                    note,
+                    grant,
+                }
+                .into_error())
+            }
+            UtilityCheck::SequenceOwner { relid } => {
+                let Some(id) = self.roles.id(role) else {
+                    return Ok(());
+                };
+                let owner = self.owner_of(AclObject::Relation(*relid));
+                if self
+                    .roles
+                    .has_privs_of_role(self.roles.canonical(id), owner)
+                {
+                    return Ok(());
+                }
+                let Some(class) = self.pg_class.get(relid) else {
+                    return Ok(());
+                };
+                let schema = self.namespace_name(class.relnamespace).unwrap_or_default();
+                let qualified = crate::QualifiedName::new(schema, class.relname.clone());
+                let mut raw = RawError::new(
+                    AnalyzeError::InsufficientPrivilege(format!(
+                        "must be owner of sequence {}",
+                        class.relname
+                    )),
+                    None,
+                    Some(format!(
+                        "make the role a member of the sequence's owner in a migration: GRANT \
+                         {} TO {};",
+                        quote_role(self.roles.name(owner)),
+                        quote_role(role)
+                    )),
+                );
+                raw.notes.push(format!(
+                    "RESTART IDENTITY resets {qualified}, which only its owner ({}) may do",
+                    quote_role(self.roles.name(owner))
+                ));
+                Err(raw.finalize_implicit())
+            }
+            UtilityCheck::SetParameter { name } => {
+                if self.has_parameter_privilege(role, name, crate::ddl::acl::bits::SET) {
+                    return Ok(());
+                }
+                let mut raw = RawError::new(
+                    AnalyzeError::InsufficientPrivilege(format!(
+                        "permission denied to set parameter \"{name}\""
+                    )),
+                    None,
+                    Some(format!(
+                        "grant it in a migration: GRANT SET ON PARAMETER {name} TO {};",
+                        quote_role(role)
+                    )),
+                );
+                raw.notes.push(format!(
+                    "only a superuser may set {name} unless granted SET on it; role {} is \
+                     neither",
+                    quote_role(role)
+                ));
+                Err(raw.finalize_implicit())
+            }
+            UtilityCheck::SetRole { name } => {
+                let (Some(member), Some(target)) = (self.roles.id(role), self.roles.id(name))
+                else {
+                    return Ok(());
+                };
+                if self.roles.can_set_role(member, target) {
+                    return Ok(());
+                }
+                let mut raw = RawError::new(
+                    AnalyzeError::InsufficientPrivilege(format!(
+                        "permission denied to set role \"{name}\""
+                    )),
+                    None,
+                    Some(format!(
+                        "grant it in a migration: GRANT {} TO {};",
+                        quote_role(name),
+                        quote_role(role)
+                    )),
+                );
+                raw.notes.push(format!(
+                    "role {} is not a member of {} with the SET option",
+                    quote_role(role),
+                    quote_role(name)
+                ));
+                Err(raw.finalize_implicit())
+            }
+            UtilityCheck::SessionAuthorization { name } => {
+                let Some(id) = self.roles.id(role) else {
+                    return Ok(());
+                };
+                if self.roles.is_superuser(id) || name.as_str() == role {
+                    return Ok(());
+                }
+                let mut raw = RawError::new(
+                    AnalyzeError::InsufficientPrivilege(format!(
+                        "permission denied to set session authorization \"{name}\""
+                    )),
+                    None,
+                    None,
+                );
+                raw.notes.push(format!(
+                    "only a superuser session may change its session user; role {} is not one",
+                    quote_role(role)
+                ));
+                Err(raw.finalize_implicit())
+            }
+            UtilityCheck::AsOwnerOf { relid, req } => {
+                let owner = self.owner_of(AclObject::Relation(*relid));
+                let owner = self.roles.name(owner).to_owned();
+                self.check_requirements_in(&owner, req, ctx)
+            }
+        }
+    }
+
     /// `ExecCheckOneRelPerms`: the relation-level privileges first; what
     /// they leave of SELECT / INSERT / UPDATE may come from the columns the
     /// statement accesses (all of them; any column when it names none).
@@ -5678,14 +5939,7 @@ impl PgCatalog {
         let Some((privilege, columns)) = denied.into_iter().next() else {
             return Ok(());
         };
-        // get_relkind_objtype.
-        let word = match class.relkind {
-            RelKind::View => "view",
-            RelKind::MaterializedView => "materialized view",
-            RelKind::Sequence => "sequence",
-            RelKind::ForeignTable => "foreign table",
-            _ => "table",
-        };
+        let word = relkind_word(class.relkind);
         let schema = self.namespace_name(class.relnamespace).unwrap_or_default();
         let qualified = crate::QualifiedName::new(schema, class.relname.clone());
         let name = privilege.name();
@@ -5911,6 +6165,9 @@ impl PgCatalog {
         executes: bool,
         ctx: &mut BodyContext,
     ) -> Result<(), AnalyzeError> {
+        if rel.no_range_table {
+            return Ok(());
+        }
         let Some(class) = self.pg_class.get(&rel.relid) else {
             return Ok(());
         };
@@ -6222,6 +6479,7 @@ impl PgCatalog {
                         target_select: false,
                         view_owner: rel.check_as.is_some(),
                         proven_empty: false,
+                        no_range_table: false,
                         selected: Vec::new(),
                         inserted: Vec::new(),
                         updated: Vec::new(),
@@ -7704,6 +7962,17 @@ fn call_arity_matches(nargs: usize, defaults: i16, variadic: bool, written: usiz
         return written + 1 >= nargs;
     }
     written == nargs || (written < nargs && written + defaults >= nargs)
+}
+
+/// `get_relkind_objtype`'s word for a relation, as `aclcheck_error` says it.
+fn relkind_word(relkind: RelKind) -> &'static str {
+    match relkind {
+        RelKind::View => "view",
+        RelKind::MaterializedView => "materialized view",
+        RelKind::Sequence => "sequence",
+        RelKind::ForeignTable => "foreign table",
+        _ => "table",
+    }
 }
 
 #[cfg(test)]

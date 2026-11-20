@@ -312,6 +312,31 @@ impl Roles {
         found
     }
 
+    /// `member_can_set_role`: a superuser may become anyone; anyone else
+    /// the roles reachable through memberships granted WITH SET.
+    pub(crate) fn can_set_role(&self, member: RoleId, role: RoleId) -> bool {
+        if self.is_superuser(member) || self.same_real_role(member, role) {
+            return true;
+        }
+        let mut seen = vec![self.canonical(member)];
+        let mut next = 0;
+        while next < seen.len() {
+            let current = seen[next];
+            next += 1;
+            for m in &self.memberships {
+                if self.same_real_role(m.member, current) && m.set {
+                    if self.same_real_role(m.role, role) {
+                        return true;
+                    }
+                    if !seen.contains(&m.role) {
+                        seen.push(m.role);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// `select_best_admin` (acl.c): the role closest to `member` (itself
     /// first) that directly holds ADMIN OPTION on `role`, ignoring
     /// superuserness. `None` when no such role exists.

@@ -152,3 +152,186 @@ fn unlisten_star_accepted() {
     assert!(s.columns.is_empty());
     assert!(s.params.is_empty());
 }
+
+// ── TRUNCATE, LOCK, ANALYZE, REFRESH MATERIALIZED VIEW, SET / RESET ─────────
+//
+// PostgreSQL prepares these without looking at their relations: everything
+// is checked when they execute. What fails on every execution is a
+// compile-time error, with PostgreSQL's message (verified on 18.7).
+
+fn utility_setup() -> PgCatalog {
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE ut_parent (id int PRIMARY KEY, v text);
+         CREATE TABLE ut_child (id int REFERENCES ut_parent);
+         CREATE TABLE ut_inh () INHERITS (ut_parent);
+         CREATE TABLE ut_part (id int) PARTITION BY RANGE (id);
+         CREATE TABLE ut_part1 PARTITION OF ut_part FOR VALUES FROM (0) TO (10);
+         CREATE VIEW ut_view AS SELECT * FROM ut_parent;
+         CREATE MATERIALIZED VIEW ut_mv AS SELECT id FROM ut_parent;
+         CREATE MATERIALIZED VIEW ut_mv_unique AS SELECT id FROM ut_parent;
+         CREATE UNIQUE INDEX ON ut_mv_unique (id);
+         CREATE SEQUENCE ut_seq;",
+    )])
+}
+
+#[test]
+fn utility_statements_return_no_rows_and_take_no_parameters() {
+    let db = utility_setup();
+    for sql in [
+        "TRUNCATE ut_parent, ut_child",
+        "TRUNCATE TABLE ut_parent CASCADE",
+        "TRUNCATE ONLY ut_part1 RESTART IDENTITY",
+        "TRUNCATE ut_part",
+        "LOCK ut_parent",
+        "LOCK TABLE ut_parent, ut_view IN ACCESS SHARE MODE NOWAIT",
+        "LOCK ut_part IN ROW EXCLUSIVE MODE",
+        "ANALYZE",
+        "ANALYZE VERBOSE ut_parent (id, v), ut_mv",
+        "ANALYZE (SKIP_LOCKED, BUFFER_USAGE_LIMIT '256kB') ut_parent",
+        // A view or a sequence is skipped with a WARNING.
+        "ANALYZE ut_view, ut_seq",
+        "REFRESH MATERIALIZED VIEW ut_mv",
+        "REFRESH MATERIALIZED VIEW ut_mv WITH NO DATA",
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY ut_mv_unique",
+        "SET statement_timeout = '5s'",
+        "SET LOCAL lock_timeout TO 1000",
+        "SET app.tenant = '42'",
+        "SET TIME ZONE 'UTC'",
+        "RESET work_mem",
+        "RESET ALL",
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert!(s.columns.is_empty(), "{sql}");
+        assert!(s.params.is_empty(), "{sql}");
+    }
+}
+
+#[test]
+fn truncate_reports_what_every_execution_raises() {
+    let db = utility_setup();
+    assert_err_prefix!(
+        db.analyze("TRUNCATE ut_nope"),
+        AnalyzeError::UndefinedTable(_),
+        "relation \"ut_nope\" does not exist"
+    );
+    for (sql, name) in [
+        ("TRUNCATE ut_view", "ut_view"),
+        ("TRUNCATE ut_mv", "ut_mv"),
+        ("TRUNCATE ut_seq", "ut_seq"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::WrongObjectType(_),
+            &format!("\"{name}\" is not a table")
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("TRUNCATE ONLY ut_part"),
+        AnalyzeError::WrongObjectType(_),
+        "cannot truncate only a partitioned table"
+    );
+    // RESTRICT: whatever the rows, a table another one references must be
+    // truncated with it.
+    assert_err_prefix!(
+        db.analyze("TRUNCATE ut_parent"),
+        AnalyzeError::FeatureNotSupported(_),
+        "cannot truncate a table referenced in a foreign key constraint"
+    );
+    assert_err_prefix!(
+        db.analyze("TRUNCATE pg_catalog.pg_class"),
+        AnalyzeError::InsufficientPrivilege(_),
+        "permission denied: \"pg_class\" is a system catalog"
+    );
+}
+
+#[test]
+fn lock_reports_what_every_execution_raises() {
+    let db = utility_setup();
+    for (sql, name) in [("LOCK ut_mv", "ut_mv"), ("LOCK ut_seq", "ut_seq")] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::WrongObjectType(_),
+            &format!("cannot lock relation \"{name}\"")
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("LOCK ut_nope"),
+        AnalyzeError::UndefinedTable(_),
+        "relation \"ut_nope\" does not exist"
+    );
+}
+
+#[test]
+fn analyze_reports_what_every_execution_raises() {
+    let db = utility_setup();
+    assert_err_prefix!(
+        db.analyze("ANALYZE ut_nope"),
+        AnalyzeError::UndefinedTable(_),
+        "relation \"ut_nope\" does not exist"
+    );
+    assert_err_prefix!(
+        db.analyze("ANALYZE ut_parent (nope)"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"nope\" of relation \"ut_parent\" does not exist"
+    );
+    assert_err_prefix!(
+        db.analyze("ANALYZE ut_parent (id, id)"),
+        AnalyzeError::DuplicateColumn(_),
+        "column \"id\" of relation \"ut_parent\" appears more than once"
+    );
+    assert_err_prefix!(
+        db.analyze("ANALYZE (FULL) ut_parent"),
+        AnalyzeError::SyntaxError(_),
+        "unrecognized ANALYZE option \"full\""
+    );
+    assert_err_prefix!(
+        db.analyze("ANALYZE (VERBOSE maybe) ut_parent"),
+        AnalyzeError::SyntaxError(_),
+        "verbose requires a Boolean value"
+    );
+}
+
+#[test]
+fn refresh_reports_what_every_execution_raises() {
+    let db = utility_setup();
+    assert_err_prefix!(
+        db.analyze("REFRESH MATERIALIZED VIEW ut_parent"),
+        AnalyzeError::FeatureNotSupported(_),
+        "\"ut_parent\" is not a materialized view"
+    );
+    assert_err_prefix!(
+        db.analyze("REFRESH MATERIALIZED VIEW CONCURRENTLY ut_mv"),
+        AnalyzeError::ObjectNotInPrerequisiteState(_),
+        "cannot refresh materialized view \"public.ut_mv\" concurrently"
+    );
+    assert_err_prefix!(
+        db.analyze("REFRESH MATERIALIZED VIEW CONCURRENTLY ut_mv_unique WITH NO DATA"),
+        AnalyzeError::SyntaxError(_),
+        "CONCURRENTLY and WITH NO DATA options cannot be used together"
+    );
+}
+
+#[test]
+fn set_reports_what_every_execution_raises() {
+    let db = utility_setup();
+    assert_err_prefix!(
+        db.analyze("SET ut_nope = 1"),
+        AnalyzeError::UndefinedObject(_),
+        "unrecognized configuration parameter \"ut_nope\""
+    );
+    for (sql, message) in [
+        (
+            "SET work_mem = 'abc'",
+            "invalid value for parameter \"work_mem\": \"abc\"",
+        ),
+        (
+            "SET shared_buffers = '1MB'",
+            "parameter \"shared_buffers\" cannot be changed without restarting the server",
+        ),
+    ] {
+        let e = db.analyze(sql).unwrap_err().to_string();
+        assert!(e.starts_with(message), "{sql}: {e}");
+    }
+}

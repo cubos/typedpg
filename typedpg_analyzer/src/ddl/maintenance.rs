@@ -603,7 +603,9 @@ pub fn lock(interp: &PgCatalog, stmt: &LockStmt) -> Result<(), DdlError> {
         };
         let (_, relid) = super::util::lookup_relation(interp, rv)?;
         let kinds = match relkind(interp, relid) {
-            Some(RelKind::Table | RelKind::Partitioned | RelKind::View | RelKind::ForeignTable) => {
+            // RangeVarCallbackForLockTable: plain and partitioned tables
+            // and views only.
+            Some(RelKind::Table | RelKind::Partitioned | RelKind::View) => {
                 continue;
             }
             Some(kind) => kind.plural(),

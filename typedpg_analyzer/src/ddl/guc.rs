@@ -214,3 +214,9 @@ fn format_g(v: f64) -> String {
         }
     }
 }
+
+/// A memory value in kB (`parse_int` with `GUC_UNIT_KB`): a bare number is
+/// kB, a unit converts.
+pub(crate) fn parse_memory_kb(value: &str) -> Option<f64> {
+    parse_with_unit(value, "kB")
+}
