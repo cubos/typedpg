@@ -14,7 +14,7 @@ use crate::oid::{PgClassOid, PgTypeOid};
 use crate::pg_catalog::{ConType, PgCatalog, TypType};
 
 /// Run `edit` over every node of `expr` (mutably).
-fn edit_nodes(expr: &mut Option<ast::Node>, edit: &mut dyn FnMut(typedpg_pg_query::NodeMut)) {
+fn edit_nodes(expr: &mut Option<ast::Node>, edit: &mut dyn FnMut(typedpg_pg_query::NodeMut<'_>)) {
     let mut tree = ast::ParseResult {
         version: 0,
         stmts: vec![ast::RawStmt {
@@ -23,14 +23,7 @@ fn edit_nodes(expr: &mut Option<ast::Node>, edit: &mut dyn FnMut(typedpg_pg_quer
             stmt_len: 0,
         }],
     };
-    // SAFETY: the tree is neither moved nor dropped while the pointers are
-    // used, and `edit` only overwrites `String` leaves and constants'
-    // values — no subtree another pointer refers into is replaced.
-    unsafe {
-        for (n, _) in tree.nodes_mut() {
-            edit(n);
-        }
-    }
+    tree.for_each_node_mut(|n, _| edit(n));
     *expr = tree.stmts.pop().and_then(|s| s.stmt);
 }
 
@@ -72,8 +65,7 @@ fn rename_column_refs(
         let typedpg_pg_query::NodeMut::ColumnRef(cr) = n else {
             return;
         };
-        // SAFETY: see `edit_nodes`; only a `String` leaf is written.
-        let fields = unsafe { &mut (*cr).fields };
+        let fields = &mut cr.fields;
         if fields
             .iter()
             .any(|f| !matches!(f, Some(ast::Node::String(_))))
@@ -120,34 +112,23 @@ pub(crate) fn over_own_row(
             stmt_len: 0,
         }],
     };
-    // SAFETY: the tree is neither moved nor dropped while the pointers are
-    // used, and only column references' field lists are rewritten, after
-    // every column reference was collected: a column reference holds no
-    // other one, and no pointer into a field list is dereferenced.
-    unsafe {
-        let column_refs: Vec<_> = tree
-            .nodes_mut()
-            .into_iter()
-            .filter_map(|(n, _)| match n {
-                typedpg_pg_query::NodeMut::ColumnRef(cr) => Some(cr),
-                _ => None,
-            })
-            .collect();
-        for cr in column_refs {
-            let fields = &mut (*cr).fields;
-            if fields
-                .iter()
-                .any(|f| !matches!(f, Some(ast::Node::String(_))))
-            {
-                continue;
-            }
-            let names = crate::expr::extract_string_fields(fields);
-            let idx = column_field(&names, &relname, &is_column);
-            if idx > 0 && is_column(&names[idx]) {
-                fields.drain(..idx);
-            }
+    tree.for_each_node_mut(|n, _| {
+        let typedpg_pg_query::NodeMut::ColumnRef(cr) = n else {
+            return;
+        };
+        let fields = &mut cr.fields;
+        if fields
+            .iter()
+            .any(|f| !matches!(f, Some(ast::Node::String(_))))
+        {
+            return;
         }
-    }
+        let names = crate::expr::extract_string_fields(fields);
+        let idx = column_field(&names, &relname, &is_column);
+        if idx > 0 && is_column(&names[idx]) {
+            fields.drain(..idx);
+        }
+    });
     tree.stmts.pop().and_then(|s| s.stmt)
 }
 
@@ -253,9 +234,6 @@ pub(crate) fn rename_enum_label(interp: &mut PgCatalog, enum_oid: PgTypeOid, old
             let typedpg_pg_query::NodeMut::AConst(c) = n else {
                 return;
             };
-            // SAFETY: see `edit_nodes`; only the constant's string is
-            // written.
-            let c = unsafe { &mut *c };
             let Some(ast::AConstValue::String(s)) = c.val.as_mut() else {
                 return;
             };

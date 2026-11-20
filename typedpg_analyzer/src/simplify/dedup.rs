@@ -3414,7 +3414,6 @@ fn union_keyword_edit(tokens: &[ast::ScanToken], s: &ast::SelectStmt) -> Option<
 /// spelled like one may be the CTE.
 pub(super) fn cte_names(tree: &ast::ParseResult) -> HashSet<String> {
     tree.nodes()
-        .into_iter()
         .filter_map(|(n, _)| match n {
             NodeRef::CommonTableExpr(c) => Some(c.ctename.clone()),
             _ => None,

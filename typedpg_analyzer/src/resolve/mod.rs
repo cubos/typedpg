@@ -328,7 +328,7 @@ pub(crate) fn prove_array_forms(
             });
             columns_same && params_same
         };
-    let nodes = sample.nodes();
+    let nodes: Vec<_> = sample.nodes().collect();
     let mut first = lex_output.params.len();
     for (si, spread) in lex_output.spreads.iter().enumerate() {
         let count = spread.fields.as_ref().map_or(1, Vec::len);
@@ -363,7 +363,7 @@ pub(crate) fn prove_array_forms(
             let open = in_expr
                 .lexpr
                 .as_ref()
-                .and_then(|l| l.nodes().iter().filter_map(|(n, _)| n.location()).min());
+                .and_then(|l| l.nodes().filter_map(|(n, _)| n.location()).min());
             let (Some(open), Ok(keyword)) = (open, usize::try_from(in_expr.location)) else {
                 continue;
             };
@@ -437,7 +437,7 @@ pub(crate) fn check_spread_positions(
     let Some(tree) = sample else {
         return Ok(());
     };
-    let nodes = tree.nodes();
+    let nodes: Vec<_> = tree.nodes().collect();
     // The placeholder numbers of a parenthesized list of bare `$k`s.
     let numbers = |items: &[Option<typedpg_pg_query::ast::Node>]| -> Option<Vec<i32>> {
         items
@@ -1049,7 +1049,7 @@ fn analyze_raw_node_with(
 pub(crate) fn locks_rows(stmt: &ast::Node) -> bool {
     let locks = |n: typedpg_pg_query::NodeRef<'_>| matches!(n, typedpg_pg_query::NodeRef::SelectStmt(s) if !s.locking_clause.is_empty());
     matches!(stmt, ast::Node::SelectStmt(s) if !s.locking_clause.is_empty())
-        || stmt.nodes().into_iter().any(|(n, ..)| locks(n))
+        || stmt.nodes().any(|(n, ..)| locks(n))
 }
 
 /// Whether `stmt` locks rows: it has a locking clause, or reads a view
@@ -1058,7 +1058,7 @@ pub(crate) fn locks_rows(stmt: &ast::Node) -> bool {
 /// cautious).
 fn statement_locks_rows(snapshot: &PgCatalog, stmt: &ast::Node) -> bool {
     locks_rows(stmt)
-        || stmt.nodes().into_iter().any(|(n, ..)| match n {
+        || stmt.nodes().any(|(n, ..)| match n {
             typedpg_pg_query::NodeRef::RangeVar(rv) => {
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
                 snapshot
@@ -1549,20 +1549,15 @@ fn rename_column_refs(node: &ast::Node, rename: &dyn Fn(&str) -> Option<String>)
             stmt_len: 0,
         }],
     };
-    // SAFETY: the tree is neither moved nor dropped while the pointers are
-    // used, and only the `String` leaves of column references are written —
-    // no subtree any other pointer refers into is replaced.
-    unsafe {
-        for (n, _) in tree.nodes_mut() {
-            if let typedpg_pg_query::NodeMut::ColumnRef(cr) = n
-                && let Some(last) = (*cr).fields.last_mut()
-                && let Some(ast::Node::String(s)) = last.as_mut()
-                && let Some(new) = rename(&s.sval)
-            {
-                s.sval = new;
-            }
+    tree.for_each_node_mut(|n, _| {
+        if let typedpg_pg_query::NodeMut::ColumnRef(cr) = n
+            && let Some(last) = cr.fields.last_mut()
+            && let Some(ast::Node::String(s)) = last.as_mut()
+            && let Some(new) = rename(&s.sval)
+        {
+            s.sval = new;
         }
-    }
+    });
     tree.stmts
         .pop()
         .and_then(|s| s.stmt)

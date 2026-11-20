@@ -805,7 +805,6 @@ mod tests {
         let location = view
             .tree
             .nodes()
-            .into_iter()
             .find_map(|(node, _)| match node {
                 NodeRef::NullTest(test) => Some(test.location),
                 _ => None,

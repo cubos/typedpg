@@ -568,7 +568,7 @@ fn check_view_columns(
 /// The query of a view or CREATE TABLE AS has no parameters: a `$n` is an
 /// error (transformParamRef without a parameter hook).
 fn check_no_parameters(query: &ast::Node) -> Result<(), DdlError> {
-    let number = query.nodes().into_iter().find_map(|(n, _)| match n {
+    let number = query.nodes().find_map(|(n, _)| match n {
         typedpg_pg_query::NodeRef::ParamRef(p) => Some(p.number),
         _ => None,
     });
@@ -2177,7 +2177,7 @@ fn returns_set(interp: &PgCatalog, node: &ast::Node) -> bool {
             (!candidates.is_empty() && candidates.iter().all(|p| p.proretset))
                 || fc.args.iter().flatten().any(|a| returns_set(interp, a))
         }
-        other => other.nodes().into_iter().skip(1).any(|(n, ..)| match n {
+        other => other.nodes().skip(1).any(|(n, ..)| match n {
             typedpg_pg_query::NodeRef::FuncCall(fc) => {
                 returns_set(interp, &ast::Node::FuncCall(NodeBox::new(fc.clone())))
             }

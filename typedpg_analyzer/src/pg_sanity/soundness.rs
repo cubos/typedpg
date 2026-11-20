@@ -640,7 +640,6 @@ fn written_tables(sql: &str) -> Vec<String> {
     let mut out: Vec<String> = parsed
         .tree
         .nodes()
-        .iter()
         .filter_map(|(n, _)| match n {
             NodeRef::InsertStmt(s) => s.relation.as_ref(),
             NodeRef::UpdateStmt(s) => s.relation.as_ref(),

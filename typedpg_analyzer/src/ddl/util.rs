@@ -818,7 +818,6 @@ pub(crate) fn whole_row_selections<'a>(
     };
     inner
         .nodes()
-        .into_iter()
         .filter_map(|(n, ..)| {
             let typedpg_pg_query::NodeRef::AIndirection(ind) = n else {
                 return None;

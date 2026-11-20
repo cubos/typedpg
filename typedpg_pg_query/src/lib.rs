@@ -6,8 +6,9 @@
 //! - [`ast`] holds the AST types, generated from PostgreSQL's headers: a
 //!   struct per node type and [`ast::Node`], the enum over all of them, each
 //!   kind in a [`NodeBox`];
-//! - [`NodeRef`] / [`NodeMut`] view a node by kind, and `nodes()` /
-//!   `nodes_mut()` list a tree's nodes.
+//! - [`NodeRef`] / [`NodeMut`] view a node by kind (shared or mutable);
+//!   `nodes()` iterates over a tree's nodes ([`Nodes`]), `for_each_node_mut()`
+//!   visits them mutably, and `rewrite()` replaces them bottom-up.
 //!
 //! The generated modules are produced by `typedpg_pg_query_codegen`; see the
 //! crate README for how the sources are imported and regenerated.
@@ -423,69 +424,147 @@ fn plpgsql_result(
     compiled
 }
 
-/// Every node reachable from `roots`, breadth-first, each with its depth
-/// (the roots at 0).
-fn walk(roots: Vec<NodeRef<'_>>) -> Vec<(NodeRef<'_>, usize)> {
-    let mut queue: VecDeque<(NodeRef<'_>, usize)> = roots.into_iter().map(|n| (n, 0)).collect();
-    let mut out = Vec::new();
-    while let Some((n, depth)) = queue.pop_front() {
-        out.push((n, depth));
-        node::children(n, &mut |child| queue.push_back((child, depth + 1)));
-    }
-    out
+/// Every node reachable from some roots, breadth-first, each with its depth
+/// (the roots at 0): the iterator [`ast::ParseResult::nodes`] and
+/// [`ast::Node::nodes`] return.
+///
+/// It is lazy: a node's children are queued when the node is yielded, so
+/// stopping early (`any`, `find`, …) skips the rest of the tree, and the
+/// only allocation is the queue of nodes seen but not yet yielded. It does
+/// not recurse, so it walks the deepest trees on any stack.
+#[derive(Debug, Clone)]
+pub struct Nodes<'a> {
+    queue: VecDeque<(NodeRef<'a>, usize)>,
 }
 
-/// [`walk`] over raw pointers.
-///
-/// # Safety
-/// See [`ast::ParseResult::nodes_mut`].
-unsafe fn walk_mut(roots: Vec<NodeMut>) -> Vec<(NodeMut, usize)> {
-    let mut queue: VecDeque<(NodeMut, usize)> = roots.into_iter().map(|n| (n, 0)).collect();
-    let mut out = Vec::new();
-    while let Some((n, depth)) = queue.pop_front() {
-        out.push((n, depth));
-        unsafe { node::children_mut(n, &mut |child| queue.push_back((child, depth + 1))) };
+impl<'a> Nodes<'a> {
+    fn new(roots: impl IntoIterator<Item = NodeRef<'a>>) -> Self {
+        Nodes {
+            queue: roots.into_iter().map(|n| (n, 0)).collect(),
+        }
     }
-    out
+}
+
+impl<'a> Iterator for Nodes<'a> {
+    type Item = (NodeRef<'a>, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (n, depth) = self.queue.pop_front()?;
+        node::children(n, &mut |child| self.queue.push_back((child, depth + 1)));
+        Some((n, depth))
+    }
+}
+
+impl std::iter::FusedIterator for Nodes<'_> {}
+
+/// Call `f` on every node reachable from `roots`, in the order (and with the
+/// depths) [`Nodes`] yields them. `f` sees a node before its children are
+/// queued, so the walk descends into the children `f` leaves in place.
+fn walk_mut<'a>(
+    roots: impl IntoIterator<Item = NodeMut<'a>>,
+    f: &mut dyn FnMut(NodeMut<'_>, usize),
+) {
+    let mut queue: VecDeque<(NodeMut<'a>, usize)> = roots.into_iter().map(|n| (n, 0)).collect();
+    while let Some((mut n, depth)) = queue.pop_front() {
+        f(n.reborrow(), depth);
+        // `n`'s borrow is split among its children, disjoint fields of it.
+        node::children_mut(n, &mut |child| queue.push_back((child, depth + 1)));
+    }
 }
 
 impl ast::ParseResult {
-    /// Every node of every statement, breadth-first, with its depth.
-    pub fn nodes(&self) -> Vec<(NodeRef<'_>, usize)> {
-        walk(
+    /// Every node of every statement, breadth-first, with its depth (each
+    /// statement at 0).
+    pub fn nodes(&self) -> Nodes<'_> {
+        Nodes::new(
             self.stmts
                 .iter()
                 .filter_map(|s| s.stmt.as_ref())
-                .map(ast::Node::to_ref)
-                .collect(),
+                .map(ast::Node::to_ref),
         )
     }
 
-    /// [`Self::nodes`] as raw mutable pointers.
-    ///
-    /// # Safety
-    /// The pointers are valid only while the tree is neither moved nor
-    /// dropped, and a pointer into a subtree dangles once a mutation through
-    /// another pointer replaces that subtree. The caller must not create
-    /// overlapping references through them.
-    pub unsafe fn nodes_mut(&mut self) -> Vec<(NodeMut, usize)> {
-        let roots = self
-            .stmts
-            .iter_mut()
-            .filter_map(|s| s.stmt.as_mut())
-            .map(ast::Node::to_mut)
-            .collect();
-        unsafe { walk_mut(roots) }
+    /// Call `f` on every node of every statement, mutably, in the order
+    /// and with the depths [`Self::nodes`] yields them. `f` sees a node
+    /// before the walk goes below it, so the walk visits the children the
+    /// node has once `f` returns: a subtree `f` replaces is walked as
+    /// replaced.
+    pub fn for_each_node_mut(&mut self, mut f: impl FnMut(NodeMut<'_>, usize)) {
+        walk_mut(
+            self.stmts
+                .iter_mut()
+                .filter_map(|s| s.stmt.as_mut())
+                .map(ast::Node::to_mut),
+            &mut f,
+        );
     }
 }
+
+/// How many children [`Children`] holds without allocating: most nodes have
+/// fewer (an expression's operands, a statement's few set clauses); a
+/// longer list spills to the heap.
+const INLINE_CHILDREN: usize = 8;
+
+/// A node's direct children, in field order: the iterator
+/// [`NodeRef::children`] returns.
+///
+/// The children are spread over the fields of each of the 280-odd node
+/// types, so they are gathered when the iterator is made — into an inline
+/// buffer, the first [`INLINE_CHILDREN`] of them, so a node with no more
+/// costs no allocation.
+#[derive(Debug, Clone)]
+pub struct Children<'a> {
+    inline: [Option<NodeRef<'a>>; INLINE_CHILDREN],
+    spilled: Vec<NodeRef<'a>>,
+    len: usize,
+    next: usize,
+}
+
+impl<'a> Iterator for Children<'a> {
+    type Item = NodeRef<'a>;
+
+    fn next(&mut self) -> Option<NodeRef<'a>> {
+        let i = self.next;
+        if i >= self.len {
+            return None;
+        }
+        self.next += 1;
+        if i < INLINE_CHILDREN {
+            self.inline[i]
+        } else {
+            Some(self.spilled[i - INLINE_CHILDREN])
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.len - self.next;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for Children<'_> {}
+
+impl std::iter::FusedIterator for Children<'_> {}
 
 impl<'a> NodeRef<'a> {
     /// The node's direct children, in field order — the building block for
     /// walkers that, like PostgreSQL's `raw_expression_tree_walker`
     /// callers, need to decide per node whether and how to descend.
-    pub fn children(self) -> Vec<NodeRef<'a>> {
-        let mut out = Vec::new();
-        node::children(self, &mut |c| out.push(c));
+    pub fn children(self) -> Children<'a> {
+        let mut out = Children {
+            inline: [None; INLINE_CHILDREN],
+            spilled: Vec::new(),
+            len: 0,
+            next: 0,
+        };
+        node::children(self, &mut |c| {
+            if out.len < INLINE_CHILDREN {
+                out.inline[out.len] = Some(c);
+            } else {
+                out.spilled.push(c);
+            }
+            out.len += 1;
+        });
         out
     }
 }
@@ -493,8 +572,15 @@ impl<'a> NodeRef<'a> {
 impl ast::Node {
     /// This node and every node below it, breadth-first, with its depth
     /// (this node at 0).
-    pub fn nodes(&self) -> Vec<(NodeRef<'_>, usize)> {
-        walk(vec![self.to_ref()])
+    pub fn nodes(&self) -> Nodes<'_> {
+        Nodes::new([self.to_ref()])
+    }
+
+    /// Call `f` on this node and every node below it, mutably, in the order
+    /// and with the depths [`Self::nodes`] yields them (see
+    /// [`ast::ParseResult::for_each_node_mut`]).
+    pub fn for_each_node_mut(&mut self, mut f: impl FnMut(NodeMut<'_>, usize)) {
+        walk_mut([self.to_mut()], &mut f);
     }
 
     /// Rewrite this tree bottom-up: `f` sees each node once the nodes below
@@ -506,9 +592,7 @@ impl ast::Node {
         f: &mut dyn FnMut(&mut ast::Node),
     ) {
         if descend(self) {
-            // SAFETY: `self` is borrowed mutably for the whole walk, and the
-            // slots handed out are disjoint fields below it.
-            unsafe { node::child_slots_mut(self.to_mut(), &mut |slot| slot.rewrite(descend, f)) };
+            node::child_slots_mut(self.to_mut(), &mut |slot| slot.rewrite(descend, f));
         }
         f(self);
     }

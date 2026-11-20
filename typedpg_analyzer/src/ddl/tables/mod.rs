@@ -771,7 +771,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 let reads_columns = expr.as_ref().is_some_and(|inner| {
                     inner
                         .nodes()
-                        .into_iter()
                         .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::ColumnRef(_)))
                 });
                 if !reads_columns {

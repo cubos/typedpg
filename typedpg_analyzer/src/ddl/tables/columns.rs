@@ -2193,7 +2193,7 @@ fn recheck_dependents_of_retyped_column(
     use crate::pg_catalog::oid;
     let reads_column = |expr: Option<&typedpg_pg_query::ast::Node>| {
         expr.is_some_and(|inner| {
-            inner.nodes().into_iter().any(|(n, ..)| {
+            inner.nodes().any(|(n, ..)| {
                 matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
                     if cr.fields.last().and_then(|n| super::super::util::node_string(n.as_ref()))
                         == Some(attr.attname.as_str()))

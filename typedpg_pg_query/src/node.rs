@@ -2,7 +2,7 @@
 // Do not edit; run `cargo run -p typedpg_pg_query_codegen`.
 
 //! Views over a `Node` by kind and the child walkers behind
-//! `nodes()` / `nodes_mut()`.
+//! `nodes()` / `for_each_node_mut()` / `rewrite()`.
 
 #![allow(clippy::all, dead_code, unused_variables)]
 
@@ -284,280 +284,281 @@ pub enum NodeRef<'a> {
     AConst(&'a ast::AConst),
 }
 
-/// A raw mutable pointer to one AST node, by kind (see `nodes_mut`).
-#[derive(Debug, Clone, Copy)]
-pub enum NodeMut {
-    Alias(*mut ast::Alias),
-    RangeVar(*mut ast::RangeVar),
-    TableFunc(*mut ast::TableFunc),
-    IntoClause(*mut ast::IntoClause),
-    Var(*mut ast::Var),
-    Param(*mut ast::Param),
-    Aggref(*mut ast::Aggref),
-    GroupingFunc(*mut ast::GroupingFunc),
-    WindowFunc(*mut ast::WindowFunc),
-    WindowFuncRunCondition(*mut ast::WindowFuncRunCondition),
-    MergeSupportFunc(*mut ast::MergeSupportFunc),
-    SubscriptingRef(*mut ast::SubscriptingRef),
-    FuncExpr(*mut ast::FuncExpr),
-    NamedArgExpr(*mut ast::NamedArgExpr),
-    OpExpr(*mut ast::OpExpr),
-    DistinctExpr(*mut ast::DistinctExpr),
-    NullIfExpr(*mut ast::NullIfExpr),
-    ScalarArrayOpExpr(*mut ast::ScalarArrayOpExpr),
-    BoolExpr(*mut ast::BoolExpr),
-    SubLink(*mut ast::SubLink),
-    SubPlan(*mut ast::SubPlan),
-    AlternativeSubPlan(*mut ast::AlternativeSubPlan),
-    FieldSelect(*mut ast::FieldSelect),
-    FieldStore(*mut ast::FieldStore),
-    RelabelType(*mut ast::RelabelType),
-    CoerceViaIo(*mut ast::CoerceViaIo),
-    ArrayCoerceExpr(*mut ast::ArrayCoerceExpr),
-    ConvertRowtypeExpr(*mut ast::ConvertRowtypeExpr),
-    CollateExpr(*mut ast::CollateExpr),
-    CaseExpr(*mut ast::CaseExpr),
-    CaseWhen(*mut ast::CaseWhen),
-    CaseTestExpr(*mut ast::CaseTestExpr),
-    ArrayExpr(*mut ast::ArrayExpr),
-    RowExpr(*mut ast::RowExpr),
-    RowCompareExpr(*mut ast::RowCompareExpr),
-    CoalesceExpr(*mut ast::CoalesceExpr),
-    MinMaxExpr(*mut ast::MinMaxExpr),
-    SqlValueFunction(*mut ast::SqlValueFunction),
-    XmlExpr(*mut ast::XmlExpr),
-    JsonFormat(*mut ast::JsonFormat),
-    JsonReturning(*mut ast::JsonReturning),
-    JsonValueExpr(*mut ast::JsonValueExpr),
-    JsonConstructorExpr(*mut ast::JsonConstructorExpr),
-    JsonIsPredicate(*mut ast::JsonIsPredicate),
-    JsonBehavior(*mut ast::JsonBehavior),
-    JsonExpr(*mut ast::JsonExpr),
-    JsonTablePath(*mut ast::JsonTablePath),
-    JsonTablePathScan(*mut ast::JsonTablePathScan),
-    JsonTableSiblingJoin(*mut ast::JsonTableSiblingJoin),
-    NullTest(*mut ast::NullTest),
-    BooleanTest(*mut ast::BooleanTest),
-    MergeAction(*mut ast::MergeAction),
-    CoerceToDomain(*mut ast::CoerceToDomain),
-    CoerceToDomainValue(*mut ast::CoerceToDomainValue),
-    SetToDefault(*mut ast::SetToDefault),
-    CurrentOfExpr(*mut ast::CurrentOfExpr),
-    NextValueExpr(*mut ast::NextValueExpr),
-    InferenceElem(*mut ast::InferenceElem),
-    ReturningExpr(*mut ast::ReturningExpr),
-    TargetEntry(*mut ast::TargetEntry),
-    RangeTblRef(*mut ast::RangeTblRef),
-    JoinExpr(*mut ast::JoinExpr),
-    FromExpr(*mut ast::FromExpr),
-    OnConflictExpr(*mut ast::OnConflictExpr),
-    Query(*mut ast::Query),
-    TypeName(*mut ast::TypeName),
-    ColumnRef(*mut ast::ColumnRef),
-    ParamRef(*mut ast::ParamRef),
-    AExpr(*mut ast::AExpr),
-    TypeCast(*mut ast::TypeCast),
-    CollateClause(*mut ast::CollateClause),
-    RoleSpec(*mut ast::RoleSpec),
-    FuncCall(*mut ast::FuncCall),
-    AStar(*mut ast::AStar),
-    AIndices(*mut ast::AIndices),
-    AIndirection(*mut ast::AIndirection),
-    AArrayExpr(*mut ast::AArrayExpr),
-    ResTarget(*mut ast::ResTarget),
-    MultiAssignRef(*mut ast::MultiAssignRef),
-    SortBy(*mut ast::SortBy),
-    WindowDef(*mut ast::WindowDef),
-    RangeSubselect(*mut ast::RangeSubselect),
-    RangeFunction(*mut ast::RangeFunction),
-    RangeTableFunc(*mut ast::RangeTableFunc),
-    RangeTableFuncCol(*mut ast::RangeTableFuncCol),
-    RangeTableSample(*mut ast::RangeTableSample),
-    ColumnDef(*mut ast::ColumnDef),
-    TableLikeClause(*mut ast::TableLikeClause),
-    IndexElem(*mut ast::IndexElem),
-    DefElem(*mut ast::DefElem),
-    LockingClause(*mut ast::LockingClause),
-    XmlSerialize(*mut ast::XmlSerialize),
-    PartitionElem(*mut ast::PartitionElem),
-    PartitionSpec(*mut ast::PartitionSpec),
-    PartitionBoundSpec(*mut ast::PartitionBoundSpec),
-    PartitionRangeDatum(*mut ast::PartitionRangeDatum),
-    PartitionCmd(*mut ast::PartitionCmd),
-    RangeTblEntry(*mut ast::RangeTblEntry),
-    RtePermissionInfo(*mut ast::RtePermissionInfo),
-    RangeTblFunction(*mut ast::RangeTblFunction),
-    TableSampleClause(*mut ast::TableSampleClause),
-    WithCheckOption(*mut ast::WithCheckOption),
-    SortGroupClause(*mut ast::SortGroupClause),
-    GroupingSet(*mut ast::GroupingSet),
-    WindowClause(*mut ast::WindowClause),
-    RowMarkClause(*mut ast::RowMarkClause),
-    WithClause(*mut ast::WithClause),
-    InferClause(*mut ast::InferClause),
-    OnConflictClause(*mut ast::OnConflictClause),
-    CteSearchClause(*mut ast::CteSearchClause),
-    CteCycleClause(*mut ast::CteCycleClause),
-    CommonTableExpr(*mut ast::CommonTableExpr),
-    MergeWhenClause(*mut ast::MergeWhenClause),
-    ReturningOption(*mut ast::ReturningOption),
-    ReturningClause(*mut ast::ReturningClause),
-    TriggerTransition(*mut ast::TriggerTransition),
-    JsonOutput(*mut ast::JsonOutput),
-    JsonArgument(*mut ast::JsonArgument),
-    JsonFuncExpr(*mut ast::JsonFuncExpr),
-    JsonTablePathSpec(*mut ast::JsonTablePathSpec),
-    JsonTable(*mut ast::JsonTable),
-    JsonTableColumn(*mut ast::JsonTableColumn),
-    JsonKeyValue(*mut ast::JsonKeyValue),
-    JsonParseExpr(*mut ast::JsonParseExpr),
-    JsonScalarExpr(*mut ast::JsonScalarExpr),
-    JsonSerializeExpr(*mut ast::JsonSerializeExpr),
-    JsonObjectConstructor(*mut ast::JsonObjectConstructor),
-    JsonArrayConstructor(*mut ast::JsonArrayConstructor),
-    JsonArrayQueryConstructor(*mut ast::JsonArrayQueryConstructor),
-    JsonAggConstructor(*mut ast::JsonAggConstructor),
-    JsonObjectAgg(*mut ast::JsonObjectAgg),
-    JsonArrayAgg(*mut ast::JsonArrayAgg),
-    RawStmt(*mut ast::RawStmt),
-    InsertStmt(*mut ast::InsertStmt),
-    DeleteStmt(*mut ast::DeleteStmt),
-    UpdateStmt(*mut ast::UpdateStmt),
-    MergeStmt(*mut ast::MergeStmt),
-    SelectStmt(*mut ast::SelectStmt),
-    SetOperationStmt(*mut ast::SetOperationStmt),
-    ReturnStmt(*mut ast::ReturnStmt),
-    PlAssignStmt(*mut ast::PlAssignStmt),
-    CreateSchemaStmt(*mut ast::CreateSchemaStmt),
-    AlterTableStmt(*mut ast::AlterTableStmt),
-    AlterTableCmd(*mut ast::AlterTableCmd),
-    AtAlterConstraint(*mut ast::AtAlterConstraint),
-    ReplicaIdentityStmt(*mut ast::ReplicaIdentityStmt),
-    AlterCollationStmt(*mut ast::AlterCollationStmt),
-    AlterDomainStmt(*mut ast::AlterDomainStmt),
-    GrantStmt(*mut ast::GrantStmt),
-    ObjectWithArgs(*mut ast::ObjectWithArgs),
-    AccessPriv(*mut ast::AccessPriv),
-    GrantRoleStmt(*mut ast::GrantRoleStmt),
-    AlterDefaultPrivilegesStmt(*mut ast::AlterDefaultPrivilegesStmt),
-    CopyStmt(*mut ast::CopyStmt),
-    VariableSetStmt(*mut ast::VariableSetStmt),
-    VariableShowStmt(*mut ast::VariableShowStmt),
-    CreateStmt(*mut ast::CreateStmt),
-    Constraint(*mut ast::Constraint),
-    CreateTableSpaceStmt(*mut ast::CreateTableSpaceStmt),
-    DropTableSpaceStmt(*mut ast::DropTableSpaceStmt),
-    AlterTableSpaceOptionsStmt(*mut ast::AlterTableSpaceOptionsStmt),
-    AlterTableMoveAllStmt(*mut ast::AlterTableMoveAllStmt),
-    CreateExtensionStmt(*mut ast::CreateExtensionStmt),
-    AlterExtensionStmt(*mut ast::AlterExtensionStmt),
-    AlterExtensionContentsStmt(*mut ast::AlterExtensionContentsStmt),
-    CreateFdwStmt(*mut ast::CreateFdwStmt),
-    AlterFdwStmt(*mut ast::AlterFdwStmt),
-    CreateForeignServerStmt(*mut ast::CreateForeignServerStmt),
-    AlterForeignServerStmt(*mut ast::AlterForeignServerStmt),
-    CreateForeignTableStmt(*mut ast::CreateForeignTableStmt),
-    CreateUserMappingStmt(*mut ast::CreateUserMappingStmt),
-    AlterUserMappingStmt(*mut ast::AlterUserMappingStmt),
-    DropUserMappingStmt(*mut ast::DropUserMappingStmt),
-    ImportForeignSchemaStmt(*mut ast::ImportForeignSchemaStmt),
-    CreatePolicyStmt(*mut ast::CreatePolicyStmt),
-    AlterPolicyStmt(*mut ast::AlterPolicyStmt),
-    CreateAmStmt(*mut ast::CreateAmStmt),
-    CreateTrigStmt(*mut ast::CreateTrigStmt),
-    CreateEventTrigStmt(*mut ast::CreateEventTrigStmt),
-    AlterEventTrigStmt(*mut ast::AlterEventTrigStmt),
-    CreatePLangStmt(*mut ast::CreatePLangStmt),
-    CreateRoleStmt(*mut ast::CreateRoleStmt),
-    AlterRoleStmt(*mut ast::AlterRoleStmt),
-    AlterRoleSetStmt(*mut ast::AlterRoleSetStmt),
-    DropRoleStmt(*mut ast::DropRoleStmt),
-    CreateSeqStmt(*mut ast::CreateSeqStmt),
-    AlterSeqStmt(*mut ast::AlterSeqStmt),
-    DefineStmt(*mut ast::DefineStmt),
-    CreateDomainStmt(*mut ast::CreateDomainStmt),
-    CreateOpClassStmt(*mut ast::CreateOpClassStmt),
-    CreateOpClassItem(*mut ast::CreateOpClassItem),
-    CreateOpFamilyStmt(*mut ast::CreateOpFamilyStmt),
-    AlterOpFamilyStmt(*mut ast::AlterOpFamilyStmt),
-    DropStmt(*mut ast::DropStmt),
-    TruncateStmt(*mut ast::TruncateStmt),
-    CommentStmt(*mut ast::CommentStmt),
-    SecLabelStmt(*mut ast::SecLabelStmt),
-    DeclareCursorStmt(*mut ast::DeclareCursorStmt),
-    ClosePortalStmt(*mut ast::ClosePortalStmt),
-    FetchStmt(*mut ast::FetchStmt),
-    IndexStmt(*mut ast::IndexStmt),
-    CreateStatsStmt(*mut ast::CreateStatsStmt),
-    StatsElem(*mut ast::StatsElem),
-    AlterStatsStmt(*mut ast::AlterStatsStmt),
-    CreateFunctionStmt(*mut ast::CreateFunctionStmt),
-    FunctionParameter(*mut ast::FunctionParameter),
-    AlterFunctionStmt(*mut ast::AlterFunctionStmt),
-    DoStmt(*mut ast::DoStmt),
-    InlineCodeBlock(*mut ast::InlineCodeBlock),
-    CallStmt(*mut ast::CallStmt),
-    CallContext(*mut ast::CallContext),
-    RenameStmt(*mut ast::RenameStmt),
-    AlterObjectDependsStmt(*mut ast::AlterObjectDependsStmt),
-    AlterObjectSchemaStmt(*mut ast::AlterObjectSchemaStmt),
-    AlterOwnerStmt(*mut ast::AlterOwnerStmt),
-    AlterOperatorStmt(*mut ast::AlterOperatorStmt),
-    AlterTypeStmt(*mut ast::AlterTypeStmt),
-    RuleStmt(*mut ast::RuleStmt),
-    NotifyStmt(*mut ast::NotifyStmt),
-    ListenStmt(*mut ast::ListenStmt),
-    UnlistenStmt(*mut ast::UnlistenStmt),
-    TransactionStmt(*mut ast::TransactionStmt),
-    CompositeTypeStmt(*mut ast::CompositeTypeStmt),
-    CreateEnumStmt(*mut ast::CreateEnumStmt),
-    CreateRangeStmt(*mut ast::CreateRangeStmt),
-    AlterEnumStmt(*mut ast::AlterEnumStmt),
-    ViewStmt(*mut ast::ViewStmt),
-    LoadStmt(*mut ast::LoadStmt),
-    CreatedbStmt(*mut ast::CreatedbStmt),
-    AlterDatabaseStmt(*mut ast::AlterDatabaseStmt),
-    AlterDatabaseRefreshCollStmt(*mut ast::AlterDatabaseRefreshCollStmt),
-    AlterDatabaseSetStmt(*mut ast::AlterDatabaseSetStmt),
-    DropdbStmt(*mut ast::DropdbStmt),
-    AlterSystemStmt(*mut ast::AlterSystemStmt),
-    ClusterStmt(*mut ast::ClusterStmt),
-    VacuumStmt(*mut ast::VacuumStmt),
-    VacuumRelation(*mut ast::VacuumRelation),
-    ExplainStmt(*mut ast::ExplainStmt),
-    CreateTableAsStmt(*mut ast::CreateTableAsStmt),
-    RefreshMatViewStmt(*mut ast::RefreshMatViewStmt),
-    CheckPointStmt(*mut ast::CheckPointStmt),
-    DiscardStmt(*mut ast::DiscardStmt),
-    LockStmt(*mut ast::LockStmt),
-    ConstraintsSetStmt(*mut ast::ConstraintsSetStmt),
-    ReindexStmt(*mut ast::ReindexStmt),
-    CreateConversionStmt(*mut ast::CreateConversionStmt),
-    CreateCastStmt(*mut ast::CreateCastStmt),
-    CreateTransformStmt(*mut ast::CreateTransformStmt),
-    PrepareStmt(*mut ast::PrepareStmt),
-    ExecuteStmt(*mut ast::ExecuteStmt),
-    DeallocateStmt(*mut ast::DeallocateStmt),
-    DropOwnedStmt(*mut ast::DropOwnedStmt),
-    ReassignOwnedStmt(*mut ast::ReassignOwnedStmt),
-    AlterTsDictionaryStmt(*mut ast::AlterTsDictionaryStmt),
-    AlterTsConfigurationStmt(*mut ast::AlterTsConfigurationStmt),
-    PublicationTable(*mut ast::PublicationTable),
-    PublicationObjSpec(*mut ast::PublicationObjSpec),
-    CreatePublicationStmt(*mut ast::CreatePublicationStmt),
-    AlterPublicationStmt(*mut ast::AlterPublicationStmt),
-    CreateSubscriptionStmt(*mut ast::CreateSubscriptionStmt),
-    AlterSubscriptionStmt(*mut ast::AlterSubscriptionStmt),
-    DropSubscriptionStmt(*mut ast::DropSubscriptionStmt),
-    Integer(*mut ast::Integer),
-    Float(*mut ast::Float),
-    Boolean(*mut ast::Boolean),
-    String(*mut ast::String),
-    BitString(*mut ast::BitString),
-    List(*mut ast::List),
-    IntList(*mut ast::IntList),
-    OidList(*mut ast::OidList),
-    AConst(*mut ast::AConst),
+/// A mutably borrowed view of one AST node, by kind (see
+/// `for_each_node_mut`).
+#[derive(Debug)]
+pub enum NodeMut<'a> {
+    Alias(&'a mut ast::Alias),
+    RangeVar(&'a mut ast::RangeVar),
+    TableFunc(&'a mut ast::TableFunc),
+    IntoClause(&'a mut ast::IntoClause),
+    Var(&'a mut ast::Var),
+    Param(&'a mut ast::Param),
+    Aggref(&'a mut ast::Aggref),
+    GroupingFunc(&'a mut ast::GroupingFunc),
+    WindowFunc(&'a mut ast::WindowFunc),
+    WindowFuncRunCondition(&'a mut ast::WindowFuncRunCondition),
+    MergeSupportFunc(&'a mut ast::MergeSupportFunc),
+    SubscriptingRef(&'a mut ast::SubscriptingRef),
+    FuncExpr(&'a mut ast::FuncExpr),
+    NamedArgExpr(&'a mut ast::NamedArgExpr),
+    OpExpr(&'a mut ast::OpExpr),
+    DistinctExpr(&'a mut ast::DistinctExpr),
+    NullIfExpr(&'a mut ast::NullIfExpr),
+    ScalarArrayOpExpr(&'a mut ast::ScalarArrayOpExpr),
+    BoolExpr(&'a mut ast::BoolExpr),
+    SubLink(&'a mut ast::SubLink),
+    SubPlan(&'a mut ast::SubPlan),
+    AlternativeSubPlan(&'a mut ast::AlternativeSubPlan),
+    FieldSelect(&'a mut ast::FieldSelect),
+    FieldStore(&'a mut ast::FieldStore),
+    RelabelType(&'a mut ast::RelabelType),
+    CoerceViaIo(&'a mut ast::CoerceViaIo),
+    ArrayCoerceExpr(&'a mut ast::ArrayCoerceExpr),
+    ConvertRowtypeExpr(&'a mut ast::ConvertRowtypeExpr),
+    CollateExpr(&'a mut ast::CollateExpr),
+    CaseExpr(&'a mut ast::CaseExpr),
+    CaseWhen(&'a mut ast::CaseWhen),
+    CaseTestExpr(&'a mut ast::CaseTestExpr),
+    ArrayExpr(&'a mut ast::ArrayExpr),
+    RowExpr(&'a mut ast::RowExpr),
+    RowCompareExpr(&'a mut ast::RowCompareExpr),
+    CoalesceExpr(&'a mut ast::CoalesceExpr),
+    MinMaxExpr(&'a mut ast::MinMaxExpr),
+    SqlValueFunction(&'a mut ast::SqlValueFunction),
+    XmlExpr(&'a mut ast::XmlExpr),
+    JsonFormat(&'a mut ast::JsonFormat),
+    JsonReturning(&'a mut ast::JsonReturning),
+    JsonValueExpr(&'a mut ast::JsonValueExpr),
+    JsonConstructorExpr(&'a mut ast::JsonConstructorExpr),
+    JsonIsPredicate(&'a mut ast::JsonIsPredicate),
+    JsonBehavior(&'a mut ast::JsonBehavior),
+    JsonExpr(&'a mut ast::JsonExpr),
+    JsonTablePath(&'a mut ast::JsonTablePath),
+    JsonTablePathScan(&'a mut ast::JsonTablePathScan),
+    JsonTableSiblingJoin(&'a mut ast::JsonTableSiblingJoin),
+    NullTest(&'a mut ast::NullTest),
+    BooleanTest(&'a mut ast::BooleanTest),
+    MergeAction(&'a mut ast::MergeAction),
+    CoerceToDomain(&'a mut ast::CoerceToDomain),
+    CoerceToDomainValue(&'a mut ast::CoerceToDomainValue),
+    SetToDefault(&'a mut ast::SetToDefault),
+    CurrentOfExpr(&'a mut ast::CurrentOfExpr),
+    NextValueExpr(&'a mut ast::NextValueExpr),
+    InferenceElem(&'a mut ast::InferenceElem),
+    ReturningExpr(&'a mut ast::ReturningExpr),
+    TargetEntry(&'a mut ast::TargetEntry),
+    RangeTblRef(&'a mut ast::RangeTblRef),
+    JoinExpr(&'a mut ast::JoinExpr),
+    FromExpr(&'a mut ast::FromExpr),
+    OnConflictExpr(&'a mut ast::OnConflictExpr),
+    Query(&'a mut ast::Query),
+    TypeName(&'a mut ast::TypeName),
+    ColumnRef(&'a mut ast::ColumnRef),
+    ParamRef(&'a mut ast::ParamRef),
+    AExpr(&'a mut ast::AExpr),
+    TypeCast(&'a mut ast::TypeCast),
+    CollateClause(&'a mut ast::CollateClause),
+    RoleSpec(&'a mut ast::RoleSpec),
+    FuncCall(&'a mut ast::FuncCall),
+    AStar(&'a mut ast::AStar),
+    AIndices(&'a mut ast::AIndices),
+    AIndirection(&'a mut ast::AIndirection),
+    AArrayExpr(&'a mut ast::AArrayExpr),
+    ResTarget(&'a mut ast::ResTarget),
+    MultiAssignRef(&'a mut ast::MultiAssignRef),
+    SortBy(&'a mut ast::SortBy),
+    WindowDef(&'a mut ast::WindowDef),
+    RangeSubselect(&'a mut ast::RangeSubselect),
+    RangeFunction(&'a mut ast::RangeFunction),
+    RangeTableFunc(&'a mut ast::RangeTableFunc),
+    RangeTableFuncCol(&'a mut ast::RangeTableFuncCol),
+    RangeTableSample(&'a mut ast::RangeTableSample),
+    ColumnDef(&'a mut ast::ColumnDef),
+    TableLikeClause(&'a mut ast::TableLikeClause),
+    IndexElem(&'a mut ast::IndexElem),
+    DefElem(&'a mut ast::DefElem),
+    LockingClause(&'a mut ast::LockingClause),
+    XmlSerialize(&'a mut ast::XmlSerialize),
+    PartitionElem(&'a mut ast::PartitionElem),
+    PartitionSpec(&'a mut ast::PartitionSpec),
+    PartitionBoundSpec(&'a mut ast::PartitionBoundSpec),
+    PartitionRangeDatum(&'a mut ast::PartitionRangeDatum),
+    PartitionCmd(&'a mut ast::PartitionCmd),
+    RangeTblEntry(&'a mut ast::RangeTblEntry),
+    RtePermissionInfo(&'a mut ast::RtePermissionInfo),
+    RangeTblFunction(&'a mut ast::RangeTblFunction),
+    TableSampleClause(&'a mut ast::TableSampleClause),
+    WithCheckOption(&'a mut ast::WithCheckOption),
+    SortGroupClause(&'a mut ast::SortGroupClause),
+    GroupingSet(&'a mut ast::GroupingSet),
+    WindowClause(&'a mut ast::WindowClause),
+    RowMarkClause(&'a mut ast::RowMarkClause),
+    WithClause(&'a mut ast::WithClause),
+    InferClause(&'a mut ast::InferClause),
+    OnConflictClause(&'a mut ast::OnConflictClause),
+    CteSearchClause(&'a mut ast::CteSearchClause),
+    CteCycleClause(&'a mut ast::CteCycleClause),
+    CommonTableExpr(&'a mut ast::CommonTableExpr),
+    MergeWhenClause(&'a mut ast::MergeWhenClause),
+    ReturningOption(&'a mut ast::ReturningOption),
+    ReturningClause(&'a mut ast::ReturningClause),
+    TriggerTransition(&'a mut ast::TriggerTransition),
+    JsonOutput(&'a mut ast::JsonOutput),
+    JsonArgument(&'a mut ast::JsonArgument),
+    JsonFuncExpr(&'a mut ast::JsonFuncExpr),
+    JsonTablePathSpec(&'a mut ast::JsonTablePathSpec),
+    JsonTable(&'a mut ast::JsonTable),
+    JsonTableColumn(&'a mut ast::JsonTableColumn),
+    JsonKeyValue(&'a mut ast::JsonKeyValue),
+    JsonParseExpr(&'a mut ast::JsonParseExpr),
+    JsonScalarExpr(&'a mut ast::JsonScalarExpr),
+    JsonSerializeExpr(&'a mut ast::JsonSerializeExpr),
+    JsonObjectConstructor(&'a mut ast::JsonObjectConstructor),
+    JsonArrayConstructor(&'a mut ast::JsonArrayConstructor),
+    JsonArrayQueryConstructor(&'a mut ast::JsonArrayQueryConstructor),
+    JsonAggConstructor(&'a mut ast::JsonAggConstructor),
+    JsonObjectAgg(&'a mut ast::JsonObjectAgg),
+    JsonArrayAgg(&'a mut ast::JsonArrayAgg),
+    RawStmt(&'a mut ast::RawStmt),
+    InsertStmt(&'a mut ast::InsertStmt),
+    DeleteStmt(&'a mut ast::DeleteStmt),
+    UpdateStmt(&'a mut ast::UpdateStmt),
+    MergeStmt(&'a mut ast::MergeStmt),
+    SelectStmt(&'a mut ast::SelectStmt),
+    SetOperationStmt(&'a mut ast::SetOperationStmt),
+    ReturnStmt(&'a mut ast::ReturnStmt),
+    PlAssignStmt(&'a mut ast::PlAssignStmt),
+    CreateSchemaStmt(&'a mut ast::CreateSchemaStmt),
+    AlterTableStmt(&'a mut ast::AlterTableStmt),
+    AlterTableCmd(&'a mut ast::AlterTableCmd),
+    AtAlterConstraint(&'a mut ast::AtAlterConstraint),
+    ReplicaIdentityStmt(&'a mut ast::ReplicaIdentityStmt),
+    AlterCollationStmt(&'a mut ast::AlterCollationStmt),
+    AlterDomainStmt(&'a mut ast::AlterDomainStmt),
+    GrantStmt(&'a mut ast::GrantStmt),
+    ObjectWithArgs(&'a mut ast::ObjectWithArgs),
+    AccessPriv(&'a mut ast::AccessPriv),
+    GrantRoleStmt(&'a mut ast::GrantRoleStmt),
+    AlterDefaultPrivilegesStmt(&'a mut ast::AlterDefaultPrivilegesStmt),
+    CopyStmt(&'a mut ast::CopyStmt),
+    VariableSetStmt(&'a mut ast::VariableSetStmt),
+    VariableShowStmt(&'a mut ast::VariableShowStmt),
+    CreateStmt(&'a mut ast::CreateStmt),
+    Constraint(&'a mut ast::Constraint),
+    CreateTableSpaceStmt(&'a mut ast::CreateTableSpaceStmt),
+    DropTableSpaceStmt(&'a mut ast::DropTableSpaceStmt),
+    AlterTableSpaceOptionsStmt(&'a mut ast::AlterTableSpaceOptionsStmt),
+    AlterTableMoveAllStmt(&'a mut ast::AlterTableMoveAllStmt),
+    CreateExtensionStmt(&'a mut ast::CreateExtensionStmt),
+    AlterExtensionStmt(&'a mut ast::AlterExtensionStmt),
+    AlterExtensionContentsStmt(&'a mut ast::AlterExtensionContentsStmt),
+    CreateFdwStmt(&'a mut ast::CreateFdwStmt),
+    AlterFdwStmt(&'a mut ast::AlterFdwStmt),
+    CreateForeignServerStmt(&'a mut ast::CreateForeignServerStmt),
+    AlterForeignServerStmt(&'a mut ast::AlterForeignServerStmt),
+    CreateForeignTableStmt(&'a mut ast::CreateForeignTableStmt),
+    CreateUserMappingStmt(&'a mut ast::CreateUserMappingStmt),
+    AlterUserMappingStmt(&'a mut ast::AlterUserMappingStmt),
+    DropUserMappingStmt(&'a mut ast::DropUserMappingStmt),
+    ImportForeignSchemaStmt(&'a mut ast::ImportForeignSchemaStmt),
+    CreatePolicyStmt(&'a mut ast::CreatePolicyStmt),
+    AlterPolicyStmt(&'a mut ast::AlterPolicyStmt),
+    CreateAmStmt(&'a mut ast::CreateAmStmt),
+    CreateTrigStmt(&'a mut ast::CreateTrigStmt),
+    CreateEventTrigStmt(&'a mut ast::CreateEventTrigStmt),
+    AlterEventTrigStmt(&'a mut ast::AlterEventTrigStmt),
+    CreatePLangStmt(&'a mut ast::CreatePLangStmt),
+    CreateRoleStmt(&'a mut ast::CreateRoleStmt),
+    AlterRoleStmt(&'a mut ast::AlterRoleStmt),
+    AlterRoleSetStmt(&'a mut ast::AlterRoleSetStmt),
+    DropRoleStmt(&'a mut ast::DropRoleStmt),
+    CreateSeqStmt(&'a mut ast::CreateSeqStmt),
+    AlterSeqStmt(&'a mut ast::AlterSeqStmt),
+    DefineStmt(&'a mut ast::DefineStmt),
+    CreateDomainStmt(&'a mut ast::CreateDomainStmt),
+    CreateOpClassStmt(&'a mut ast::CreateOpClassStmt),
+    CreateOpClassItem(&'a mut ast::CreateOpClassItem),
+    CreateOpFamilyStmt(&'a mut ast::CreateOpFamilyStmt),
+    AlterOpFamilyStmt(&'a mut ast::AlterOpFamilyStmt),
+    DropStmt(&'a mut ast::DropStmt),
+    TruncateStmt(&'a mut ast::TruncateStmt),
+    CommentStmt(&'a mut ast::CommentStmt),
+    SecLabelStmt(&'a mut ast::SecLabelStmt),
+    DeclareCursorStmt(&'a mut ast::DeclareCursorStmt),
+    ClosePortalStmt(&'a mut ast::ClosePortalStmt),
+    FetchStmt(&'a mut ast::FetchStmt),
+    IndexStmt(&'a mut ast::IndexStmt),
+    CreateStatsStmt(&'a mut ast::CreateStatsStmt),
+    StatsElem(&'a mut ast::StatsElem),
+    AlterStatsStmt(&'a mut ast::AlterStatsStmt),
+    CreateFunctionStmt(&'a mut ast::CreateFunctionStmt),
+    FunctionParameter(&'a mut ast::FunctionParameter),
+    AlterFunctionStmt(&'a mut ast::AlterFunctionStmt),
+    DoStmt(&'a mut ast::DoStmt),
+    InlineCodeBlock(&'a mut ast::InlineCodeBlock),
+    CallStmt(&'a mut ast::CallStmt),
+    CallContext(&'a mut ast::CallContext),
+    RenameStmt(&'a mut ast::RenameStmt),
+    AlterObjectDependsStmt(&'a mut ast::AlterObjectDependsStmt),
+    AlterObjectSchemaStmt(&'a mut ast::AlterObjectSchemaStmt),
+    AlterOwnerStmt(&'a mut ast::AlterOwnerStmt),
+    AlterOperatorStmt(&'a mut ast::AlterOperatorStmt),
+    AlterTypeStmt(&'a mut ast::AlterTypeStmt),
+    RuleStmt(&'a mut ast::RuleStmt),
+    NotifyStmt(&'a mut ast::NotifyStmt),
+    ListenStmt(&'a mut ast::ListenStmt),
+    UnlistenStmt(&'a mut ast::UnlistenStmt),
+    TransactionStmt(&'a mut ast::TransactionStmt),
+    CompositeTypeStmt(&'a mut ast::CompositeTypeStmt),
+    CreateEnumStmt(&'a mut ast::CreateEnumStmt),
+    CreateRangeStmt(&'a mut ast::CreateRangeStmt),
+    AlterEnumStmt(&'a mut ast::AlterEnumStmt),
+    ViewStmt(&'a mut ast::ViewStmt),
+    LoadStmt(&'a mut ast::LoadStmt),
+    CreatedbStmt(&'a mut ast::CreatedbStmt),
+    AlterDatabaseStmt(&'a mut ast::AlterDatabaseStmt),
+    AlterDatabaseRefreshCollStmt(&'a mut ast::AlterDatabaseRefreshCollStmt),
+    AlterDatabaseSetStmt(&'a mut ast::AlterDatabaseSetStmt),
+    DropdbStmt(&'a mut ast::DropdbStmt),
+    AlterSystemStmt(&'a mut ast::AlterSystemStmt),
+    ClusterStmt(&'a mut ast::ClusterStmt),
+    VacuumStmt(&'a mut ast::VacuumStmt),
+    VacuumRelation(&'a mut ast::VacuumRelation),
+    ExplainStmt(&'a mut ast::ExplainStmt),
+    CreateTableAsStmt(&'a mut ast::CreateTableAsStmt),
+    RefreshMatViewStmt(&'a mut ast::RefreshMatViewStmt),
+    CheckPointStmt(&'a mut ast::CheckPointStmt),
+    DiscardStmt(&'a mut ast::DiscardStmt),
+    LockStmt(&'a mut ast::LockStmt),
+    ConstraintsSetStmt(&'a mut ast::ConstraintsSetStmt),
+    ReindexStmt(&'a mut ast::ReindexStmt),
+    CreateConversionStmt(&'a mut ast::CreateConversionStmt),
+    CreateCastStmt(&'a mut ast::CreateCastStmt),
+    CreateTransformStmt(&'a mut ast::CreateTransformStmt),
+    PrepareStmt(&'a mut ast::PrepareStmt),
+    ExecuteStmt(&'a mut ast::ExecuteStmt),
+    DeallocateStmt(&'a mut ast::DeallocateStmt),
+    DropOwnedStmt(&'a mut ast::DropOwnedStmt),
+    ReassignOwnedStmt(&'a mut ast::ReassignOwnedStmt),
+    AlterTsDictionaryStmt(&'a mut ast::AlterTsDictionaryStmt),
+    AlterTsConfigurationStmt(&'a mut ast::AlterTsConfigurationStmt),
+    PublicationTable(&'a mut ast::PublicationTable),
+    PublicationObjSpec(&'a mut ast::PublicationObjSpec),
+    CreatePublicationStmt(&'a mut ast::CreatePublicationStmt),
+    AlterPublicationStmt(&'a mut ast::AlterPublicationStmt),
+    CreateSubscriptionStmt(&'a mut ast::CreateSubscriptionStmt),
+    AlterSubscriptionStmt(&'a mut ast::AlterSubscriptionStmt),
+    DropSubscriptionStmt(&'a mut ast::DropSubscriptionStmt),
+    Integer(&'a mut ast::Integer),
+    Float(&'a mut ast::Float),
+    Boolean(&'a mut ast::Boolean),
+    String(&'a mut ast::String),
+    BitString(&'a mut ast::BitString),
+    List(&'a mut ast::List),
+    IntList(&'a mut ast::IntList),
+    OidList(&'a mut ast::OidList),
+    AConst(&'a mut ast::AConst),
 }
 
 impl ast::Node {
@@ -838,8 +839,8 @@ impl ast::Node {
         }
     }
 
-    /// This node as a [`NodeMut`] pointer.
-    pub fn to_mut(&mut self) -> NodeMut {
+    /// This node as a [`NodeMut`].
+    pub fn to_mut(&mut self) -> NodeMut<'_> {
         match self {
             Self::Alias(x) => NodeMut::Alias(&mut **x),
             Self::RangeVar(x) => NodeMut::RangeVar(&mut **x),
@@ -1114,6 +1115,288 @@ impl ast::Node {
             Self::IntList(x) => NodeMut::IntList(&mut **x),
             Self::OidList(x) => NodeMut::OidList(&mut **x),
             Self::AConst(x) => NodeMut::AConst(&mut **x),
+        }
+    }
+}
+
+impl NodeMut<'_> {
+    /// A shorter-lived [`NodeMut`] to the same node; `self` is usable
+    /// again once it is dropped.
+    pub fn reborrow(&mut self) -> NodeMut<'_> {
+        match self {
+            NodeMut::Alias(x) => NodeMut::Alias(&mut **x),
+            NodeMut::RangeVar(x) => NodeMut::RangeVar(&mut **x),
+            NodeMut::TableFunc(x) => NodeMut::TableFunc(&mut **x),
+            NodeMut::IntoClause(x) => NodeMut::IntoClause(&mut **x),
+            NodeMut::Var(x) => NodeMut::Var(&mut **x),
+            NodeMut::Param(x) => NodeMut::Param(&mut **x),
+            NodeMut::Aggref(x) => NodeMut::Aggref(&mut **x),
+            NodeMut::GroupingFunc(x) => NodeMut::GroupingFunc(&mut **x),
+            NodeMut::WindowFunc(x) => NodeMut::WindowFunc(&mut **x),
+            NodeMut::WindowFuncRunCondition(x) => NodeMut::WindowFuncRunCondition(&mut **x),
+            NodeMut::MergeSupportFunc(x) => NodeMut::MergeSupportFunc(&mut **x),
+            NodeMut::SubscriptingRef(x) => NodeMut::SubscriptingRef(&mut **x),
+            NodeMut::FuncExpr(x) => NodeMut::FuncExpr(&mut **x),
+            NodeMut::NamedArgExpr(x) => NodeMut::NamedArgExpr(&mut **x),
+            NodeMut::OpExpr(x) => NodeMut::OpExpr(&mut **x),
+            NodeMut::DistinctExpr(x) => NodeMut::DistinctExpr(&mut **x),
+            NodeMut::NullIfExpr(x) => NodeMut::NullIfExpr(&mut **x),
+            NodeMut::ScalarArrayOpExpr(x) => NodeMut::ScalarArrayOpExpr(&mut **x),
+            NodeMut::BoolExpr(x) => NodeMut::BoolExpr(&mut **x),
+            NodeMut::SubLink(x) => NodeMut::SubLink(&mut **x),
+            NodeMut::SubPlan(x) => NodeMut::SubPlan(&mut **x),
+            NodeMut::AlternativeSubPlan(x) => NodeMut::AlternativeSubPlan(&mut **x),
+            NodeMut::FieldSelect(x) => NodeMut::FieldSelect(&mut **x),
+            NodeMut::FieldStore(x) => NodeMut::FieldStore(&mut **x),
+            NodeMut::RelabelType(x) => NodeMut::RelabelType(&mut **x),
+            NodeMut::CoerceViaIo(x) => NodeMut::CoerceViaIo(&mut **x),
+            NodeMut::ArrayCoerceExpr(x) => NodeMut::ArrayCoerceExpr(&mut **x),
+            NodeMut::ConvertRowtypeExpr(x) => NodeMut::ConvertRowtypeExpr(&mut **x),
+            NodeMut::CollateExpr(x) => NodeMut::CollateExpr(&mut **x),
+            NodeMut::CaseExpr(x) => NodeMut::CaseExpr(&mut **x),
+            NodeMut::CaseWhen(x) => NodeMut::CaseWhen(&mut **x),
+            NodeMut::CaseTestExpr(x) => NodeMut::CaseTestExpr(&mut **x),
+            NodeMut::ArrayExpr(x) => NodeMut::ArrayExpr(&mut **x),
+            NodeMut::RowExpr(x) => NodeMut::RowExpr(&mut **x),
+            NodeMut::RowCompareExpr(x) => NodeMut::RowCompareExpr(&mut **x),
+            NodeMut::CoalesceExpr(x) => NodeMut::CoalesceExpr(&mut **x),
+            NodeMut::MinMaxExpr(x) => NodeMut::MinMaxExpr(&mut **x),
+            NodeMut::SqlValueFunction(x) => NodeMut::SqlValueFunction(&mut **x),
+            NodeMut::XmlExpr(x) => NodeMut::XmlExpr(&mut **x),
+            NodeMut::JsonFormat(x) => NodeMut::JsonFormat(&mut **x),
+            NodeMut::JsonReturning(x) => NodeMut::JsonReturning(&mut **x),
+            NodeMut::JsonValueExpr(x) => NodeMut::JsonValueExpr(&mut **x),
+            NodeMut::JsonConstructorExpr(x) => NodeMut::JsonConstructorExpr(&mut **x),
+            NodeMut::JsonIsPredicate(x) => NodeMut::JsonIsPredicate(&mut **x),
+            NodeMut::JsonBehavior(x) => NodeMut::JsonBehavior(&mut **x),
+            NodeMut::JsonExpr(x) => NodeMut::JsonExpr(&mut **x),
+            NodeMut::JsonTablePath(x) => NodeMut::JsonTablePath(&mut **x),
+            NodeMut::JsonTablePathScan(x) => NodeMut::JsonTablePathScan(&mut **x),
+            NodeMut::JsonTableSiblingJoin(x) => NodeMut::JsonTableSiblingJoin(&mut **x),
+            NodeMut::NullTest(x) => NodeMut::NullTest(&mut **x),
+            NodeMut::BooleanTest(x) => NodeMut::BooleanTest(&mut **x),
+            NodeMut::MergeAction(x) => NodeMut::MergeAction(&mut **x),
+            NodeMut::CoerceToDomain(x) => NodeMut::CoerceToDomain(&mut **x),
+            NodeMut::CoerceToDomainValue(x) => NodeMut::CoerceToDomainValue(&mut **x),
+            NodeMut::SetToDefault(x) => NodeMut::SetToDefault(&mut **x),
+            NodeMut::CurrentOfExpr(x) => NodeMut::CurrentOfExpr(&mut **x),
+            NodeMut::NextValueExpr(x) => NodeMut::NextValueExpr(&mut **x),
+            NodeMut::InferenceElem(x) => NodeMut::InferenceElem(&mut **x),
+            NodeMut::ReturningExpr(x) => NodeMut::ReturningExpr(&mut **x),
+            NodeMut::TargetEntry(x) => NodeMut::TargetEntry(&mut **x),
+            NodeMut::RangeTblRef(x) => NodeMut::RangeTblRef(&mut **x),
+            NodeMut::JoinExpr(x) => NodeMut::JoinExpr(&mut **x),
+            NodeMut::FromExpr(x) => NodeMut::FromExpr(&mut **x),
+            NodeMut::OnConflictExpr(x) => NodeMut::OnConflictExpr(&mut **x),
+            NodeMut::Query(x) => NodeMut::Query(&mut **x),
+            NodeMut::TypeName(x) => NodeMut::TypeName(&mut **x),
+            NodeMut::ColumnRef(x) => NodeMut::ColumnRef(&mut **x),
+            NodeMut::ParamRef(x) => NodeMut::ParamRef(&mut **x),
+            NodeMut::AExpr(x) => NodeMut::AExpr(&mut **x),
+            NodeMut::TypeCast(x) => NodeMut::TypeCast(&mut **x),
+            NodeMut::CollateClause(x) => NodeMut::CollateClause(&mut **x),
+            NodeMut::RoleSpec(x) => NodeMut::RoleSpec(&mut **x),
+            NodeMut::FuncCall(x) => NodeMut::FuncCall(&mut **x),
+            NodeMut::AStar(x) => NodeMut::AStar(&mut **x),
+            NodeMut::AIndices(x) => NodeMut::AIndices(&mut **x),
+            NodeMut::AIndirection(x) => NodeMut::AIndirection(&mut **x),
+            NodeMut::AArrayExpr(x) => NodeMut::AArrayExpr(&mut **x),
+            NodeMut::ResTarget(x) => NodeMut::ResTarget(&mut **x),
+            NodeMut::MultiAssignRef(x) => NodeMut::MultiAssignRef(&mut **x),
+            NodeMut::SortBy(x) => NodeMut::SortBy(&mut **x),
+            NodeMut::WindowDef(x) => NodeMut::WindowDef(&mut **x),
+            NodeMut::RangeSubselect(x) => NodeMut::RangeSubselect(&mut **x),
+            NodeMut::RangeFunction(x) => NodeMut::RangeFunction(&mut **x),
+            NodeMut::RangeTableFunc(x) => NodeMut::RangeTableFunc(&mut **x),
+            NodeMut::RangeTableFuncCol(x) => NodeMut::RangeTableFuncCol(&mut **x),
+            NodeMut::RangeTableSample(x) => NodeMut::RangeTableSample(&mut **x),
+            NodeMut::ColumnDef(x) => NodeMut::ColumnDef(&mut **x),
+            NodeMut::TableLikeClause(x) => NodeMut::TableLikeClause(&mut **x),
+            NodeMut::IndexElem(x) => NodeMut::IndexElem(&mut **x),
+            NodeMut::DefElem(x) => NodeMut::DefElem(&mut **x),
+            NodeMut::LockingClause(x) => NodeMut::LockingClause(&mut **x),
+            NodeMut::XmlSerialize(x) => NodeMut::XmlSerialize(&mut **x),
+            NodeMut::PartitionElem(x) => NodeMut::PartitionElem(&mut **x),
+            NodeMut::PartitionSpec(x) => NodeMut::PartitionSpec(&mut **x),
+            NodeMut::PartitionBoundSpec(x) => NodeMut::PartitionBoundSpec(&mut **x),
+            NodeMut::PartitionRangeDatum(x) => NodeMut::PartitionRangeDatum(&mut **x),
+            NodeMut::PartitionCmd(x) => NodeMut::PartitionCmd(&mut **x),
+            NodeMut::RangeTblEntry(x) => NodeMut::RangeTblEntry(&mut **x),
+            NodeMut::RtePermissionInfo(x) => NodeMut::RtePermissionInfo(&mut **x),
+            NodeMut::RangeTblFunction(x) => NodeMut::RangeTblFunction(&mut **x),
+            NodeMut::TableSampleClause(x) => NodeMut::TableSampleClause(&mut **x),
+            NodeMut::WithCheckOption(x) => NodeMut::WithCheckOption(&mut **x),
+            NodeMut::SortGroupClause(x) => NodeMut::SortGroupClause(&mut **x),
+            NodeMut::GroupingSet(x) => NodeMut::GroupingSet(&mut **x),
+            NodeMut::WindowClause(x) => NodeMut::WindowClause(&mut **x),
+            NodeMut::RowMarkClause(x) => NodeMut::RowMarkClause(&mut **x),
+            NodeMut::WithClause(x) => NodeMut::WithClause(&mut **x),
+            NodeMut::InferClause(x) => NodeMut::InferClause(&mut **x),
+            NodeMut::OnConflictClause(x) => NodeMut::OnConflictClause(&mut **x),
+            NodeMut::CteSearchClause(x) => NodeMut::CteSearchClause(&mut **x),
+            NodeMut::CteCycleClause(x) => NodeMut::CteCycleClause(&mut **x),
+            NodeMut::CommonTableExpr(x) => NodeMut::CommonTableExpr(&mut **x),
+            NodeMut::MergeWhenClause(x) => NodeMut::MergeWhenClause(&mut **x),
+            NodeMut::ReturningOption(x) => NodeMut::ReturningOption(&mut **x),
+            NodeMut::ReturningClause(x) => NodeMut::ReturningClause(&mut **x),
+            NodeMut::TriggerTransition(x) => NodeMut::TriggerTransition(&mut **x),
+            NodeMut::JsonOutput(x) => NodeMut::JsonOutput(&mut **x),
+            NodeMut::JsonArgument(x) => NodeMut::JsonArgument(&mut **x),
+            NodeMut::JsonFuncExpr(x) => NodeMut::JsonFuncExpr(&mut **x),
+            NodeMut::JsonTablePathSpec(x) => NodeMut::JsonTablePathSpec(&mut **x),
+            NodeMut::JsonTable(x) => NodeMut::JsonTable(&mut **x),
+            NodeMut::JsonTableColumn(x) => NodeMut::JsonTableColumn(&mut **x),
+            NodeMut::JsonKeyValue(x) => NodeMut::JsonKeyValue(&mut **x),
+            NodeMut::JsonParseExpr(x) => NodeMut::JsonParseExpr(&mut **x),
+            NodeMut::JsonScalarExpr(x) => NodeMut::JsonScalarExpr(&mut **x),
+            NodeMut::JsonSerializeExpr(x) => NodeMut::JsonSerializeExpr(&mut **x),
+            NodeMut::JsonObjectConstructor(x) => NodeMut::JsonObjectConstructor(&mut **x),
+            NodeMut::JsonArrayConstructor(x) => NodeMut::JsonArrayConstructor(&mut **x),
+            NodeMut::JsonArrayQueryConstructor(x) => NodeMut::JsonArrayQueryConstructor(&mut **x),
+            NodeMut::JsonAggConstructor(x) => NodeMut::JsonAggConstructor(&mut **x),
+            NodeMut::JsonObjectAgg(x) => NodeMut::JsonObjectAgg(&mut **x),
+            NodeMut::JsonArrayAgg(x) => NodeMut::JsonArrayAgg(&mut **x),
+            NodeMut::RawStmt(x) => NodeMut::RawStmt(&mut **x),
+            NodeMut::InsertStmt(x) => NodeMut::InsertStmt(&mut **x),
+            NodeMut::DeleteStmt(x) => NodeMut::DeleteStmt(&mut **x),
+            NodeMut::UpdateStmt(x) => NodeMut::UpdateStmt(&mut **x),
+            NodeMut::MergeStmt(x) => NodeMut::MergeStmt(&mut **x),
+            NodeMut::SelectStmt(x) => NodeMut::SelectStmt(&mut **x),
+            NodeMut::SetOperationStmt(x) => NodeMut::SetOperationStmt(&mut **x),
+            NodeMut::ReturnStmt(x) => NodeMut::ReturnStmt(&mut **x),
+            NodeMut::PlAssignStmt(x) => NodeMut::PlAssignStmt(&mut **x),
+            NodeMut::CreateSchemaStmt(x) => NodeMut::CreateSchemaStmt(&mut **x),
+            NodeMut::AlterTableStmt(x) => NodeMut::AlterTableStmt(&mut **x),
+            NodeMut::AlterTableCmd(x) => NodeMut::AlterTableCmd(&mut **x),
+            NodeMut::AtAlterConstraint(x) => NodeMut::AtAlterConstraint(&mut **x),
+            NodeMut::ReplicaIdentityStmt(x) => NodeMut::ReplicaIdentityStmt(&mut **x),
+            NodeMut::AlterCollationStmt(x) => NodeMut::AlterCollationStmt(&mut **x),
+            NodeMut::AlterDomainStmt(x) => NodeMut::AlterDomainStmt(&mut **x),
+            NodeMut::GrantStmt(x) => NodeMut::GrantStmt(&mut **x),
+            NodeMut::ObjectWithArgs(x) => NodeMut::ObjectWithArgs(&mut **x),
+            NodeMut::AccessPriv(x) => NodeMut::AccessPriv(&mut **x),
+            NodeMut::GrantRoleStmt(x) => NodeMut::GrantRoleStmt(&mut **x),
+            NodeMut::AlterDefaultPrivilegesStmt(x) => NodeMut::AlterDefaultPrivilegesStmt(&mut **x),
+            NodeMut::CopyStmt(x) => NodeMut::CopyStmt(&mut **x),
+            NodeMut::VariableSetStmt(x) => NodeMut::VariableSetStmt(&mut **x),
+            NodeMut::VariableShowStmt(x) => NodeMut::VariableShowStmt(&mut **x),
+            NodeMut::CreateStmt(x) => NodeMut::CreateStmt(&mut **x),
+            NodeMut::Constraint(x) => NodeMut::Constraint(&mut **x),
+            NodeMut::CreateTableSpaceStmt(x) => NodeMut::CreateTableSpaceStmt(&mut **x),
+            NodeMut::DropTableSpaceStmt(x) => NodeMut::DropTableSpaceStmt(&mut **x),
+            NodeMut::AlterTableSpaceOptionsStmt(x) => NodeMut::AlterTableSpaceOptionsStmt(&mut **x),
+            NodeMut::AlterTableMoveAllStmt(x) => NodeMut::AlterTableMoveAllStmt(&mut **x),
+            NodeMut::CreateExtensionStmt(x) => NodeMut::CreateExtensionStmt(&mut **x),
+            NodeMut::AlterExtensionStmt(x) => NodeMut::AlterExtensionStmt(&mut **x),
+            NodeMut::AlterExtensionContentsStmt(x) => NodeMut::AlterExtensionContentsStmt(&mut **x),
+            NodeMut::CreateFdwStmt(x) => NodeMut::CreateFdwStmt(&mut **x),
+            NodeMut::AlterFdwStmt(x) => NodeMut::AlterFdwStmt(&mut **x),
+            NodeMut::CreateForeignServerStmt(x) => NodeMut::CreateForeignServerStmt(&mut **x),
+            NodeMut::AlterForeignServerStmt(x) => NodeMut::AlterForeignServerStmt(&mut **x),
+            NodeMut::CreateForeignTableStmt(x) => NodeMut::CreateForeignTableStmt(&mut **x),
+            NodeMut::CreateUserMappingStmt(x) => NodeMut::CreateUserMappingStmt(&mut **x),
+            NodeMut::AlterUserMappingStmt(x) => NodeMut::AlterUserMappingStmt(&mut **x),
+            NodeMut::DropUserMappingStmt(x) => NodeMut::DropUserMappingStmt(&mut **x),
+            NodeMut::ImportForeignSchemaStmt(x) => NodeMut::ImportForeignSchemaStmt(&mut **x),
+            NodeMut::CreatePolicyStmt(x) => NodeMut::CreatePolicyStmt(&mut **x),
+            NodeMut::AlterPolicyStmt(x) => NodeMut::AlterPolicyStmt(&mut **x),
+            NodeMut::CreateAmStmt(x) => NodeMut::CreateAmStmt(&mut **x),
+            NodeMut::CreateTrigStmt(x) => NodeMut::CreateTrigStmt(&mut **x),
+            NodeMut::CreateEventTrigStmt(x) => NodeMut::CreateEventTrigStmt(&mut **x),
+            NodeMut::AlterEventTrigStmt(x) => NodeMut::AlterEventTrigStmt(&mut **x),
+            NodeMut::CreatePLangStmt(x) => NodeMut::CreatePLangStmt(&mut **x),
+            NodeMut::CreateRoleStmt(x) => NodeMut::CreateRoleStmt(&mut **x),
+            NodeMut::AlterRoleStmt(x) => NodeMut::AlterRoleStmt(&mut **x),
+            NodeMut::AlterRoleSetStmt(x) => NodeMut::AlterRoleSetStmt(&mut **x),
+            NodeMut::DropRoleStmt(x) => NodeMut::DropRoleStmt(&mut **x),
+            NodeMut::CreateSeqStmt(x) => NodeMut::CreateSeqStmt(&mut **x),
+            NodeMut::AlterSeqStmt(x) => NodeMut::AlterSeqStmt(&mut **x),
+            NodeMut::DefineStmt(x) => NodeMut::DefineStmt(&mut **x),
+            NodeMut::CreateDomainStmt(x) => NodeMut::CreateDomainStmt(&mut **x),
+            NodeMut::CreateOpClassStmt(x) => NodeMut::CreateOpClassStmt(&mut **x),
+            NodeMut::CreateOpClassItem(x) => NodeMut::CreateOpClassItem(&mut **x),
+            NodeMut::CreateOpFamilyStmt(x) => NodeMut::CreateOpFamilyStmt(&mut **x),
+            NodeMut::AlterOpFamilyStmt(x) => NodeMut::AlterOpFamilyStmt(&mut **x),
+            NodeMut::DropStmt(x) => NodeMut::DropStmt(&mut **x),
+            NodeMut::TruncateStmt(x) => NodeMut::TruncateStmt(&mut **x),
+            NodeMut::CommentStmt(x) => NodeMut::CommentStmt(&mut **x),
+            NodeMut::SecLabelStmt(x) => NodeMut::SecLabelStmt(&mut **x),
+            NodeMut::DeclareCursorStmt(x) => NodeMut::DeclareCursorStmt(&mut **x),
+            NodeMut::ClosePortalStmt(x) => NodeMut::ClosePortalStmt(&mut **x),
+            NodeMut::FetchStmt(x) => NodeMut::FetchStmt(&mut **x),
+            NodeMut::IndexStmt(x) => NodeMut::IndexStmt(&mut **x),
+            NodeMut::CreateStatsStmt(x) => NodeMut::CreateStatsStmt(&mut **x),
+            NodeMut::StatsElem(x) => NodeMut::StatsElem(&mut **x),
+            NodeMut::AlterStatsStmt(x) => NodeMut::AlterStatsStmt(&mut **x),
+            NodeMut::CreateFunctionStmt(x) => NodeMut::CreateFunctionStmt(&mut **x),
+            NodeMut::FunctionParameter(x) => NodeMut::FunctionParameter(&mut **x),
+            NodeMut::AlterFunctionStmt(x) => NodeMut::AlterFunctionStmt(&mut **x),
+            NodeMut::DoStmt(x) => NodeMut::DoStmt(&mut **x),
+            NodeMut::InlineCodeBlock(x) => NodeMut::InlineCodeBlock(&mut **x),
+            NodeMut::CallStmt(x) => NodeMut::CallStmt(&mut **x),
+            NodeMut::CallContext(x) => NodeMut::CallContext(&mut **x),
+            NodeMut::RenameStmt(x) => NodeMut::RenameStmt(&mut **x),
+            NodeMut::AlterObjectDependsStmt(x) => NodeMut::AlterObjectDependsStmt(&mut **x),
+            NodeMut::AlterObjectSchemaStmt(x) => NodeMut::AlterObjectSchemaStmt(&mut **x),
+            NodeMut::AlterOwnerStmt(x) => NodeMut::AlterOwnerStmt(&mut **x),
+            NodeMut::AlterOperatorStmt(x) => NodeMut::AlterOperatorStmt(&mut **x),
+            NodeMut::AlterTypeStmt(x) => NodeMut::AlterTypeStmt(&mut **x),
+            NodeMut::RuleStmt(x) => NodeMut::RuleStmt(&mut **x),
+            NodeMut::NotifyStmt(x) => NodeMut::NotifyStmt(&mut **x),
+            NodeMut::ListenStmt(x) => NodeMut::ListenStmt(&mut **x),
+            NodeMut::UnlistenStmt(x) => NodeMut::UnlistenStmt(&mut **x),
+            NodeMut::TransactionStmt(x) => NodeMut::TransactionStmt(&mut **x),
+            NodeMut::CompositeTypeStmt(x) => NodeMut::CompositeTypeStmt(&mut **x),
+            NodeMut::CreateEnumStmt(x) => NodeMut::CreateEnumStmt(&mut **x),
+            NodeMut::CreateRangeStmt(x) => NodeMut::CreateRangeStmt(&mut **x),
+            NodeMut::AlterEnumStmt(x) => NodeMut::AlterEnumStmt(&mut **x),
+            NodeMut::ViewStmt(x) => NodeMut::ViewStmt(&mut **x),
+            NodeMut::LoadStmt(x) => NodeMut::LoadStmt(&mut **x),
+            NodeMut::CreatedbStmt(x) => NodeMut::CreatedbStmt(&mut **x),
+            NodeMut::AlterDatabaseStmt(x) => NodeMut::AlterDatabaseStmt(&mut **x),
+            NodeMut::AlterDatabaseRefreshCollStmt(x) => {
+                NodeMut::AlterDatabaseRefreshCollStmt(&mut **x)
+            }
+            NodeMut::AlterDatabaseSetStmt(x) => NodeMut::AlterDatabaseSetStmt(&mut **x),
+            NodeMut::DropdbStmt(x) => NodeMut::DropdbStmt(&mut **x),
+            NodeMut::AlterSystemStmt(x) => NodeMut::AlterSystemStmt(&mut **x),
+            NodeMut::ClusterStmt(x) => NodeMut::ClusterStmt(&mut **x),
+            NodeMut::VacuumStmt(x) => NodeMut::VacuumStmt(&mut **x),
+            NodeMut::VacuumRelation(x) => NodeMut::VacuumRelation(&mut **x),
+            NodeMut::ExplainStmt(x) => NodeMut::ExplainStmt(&mut **x),
+            NodeMut::CreateTableAsStmt(x) => NodeMut::CreateTableAsStmt(&mut **x),
+            NodeMut::RefreshMatViewStmt(x) => NodeMut::RefreshMatViewStmt(&mut **x),
+            NodeMut::CheckPointStmt(x) => NodeMut::CheckPointStmt(&mut **x),
+            NodeMut::DiscardStmt(x) => NodeMut::DiscardStmt(&mut **x),
+            NodeMut::LockStmt(x) => NodeMut::LockStmt(&mut **x),
+            NodeMut::ConstraintsSetStmt(x) => NodeMut::ConstraintsSetStmt(&mut **x),
+            NodeMut::ReindexStmt(x) => NodeMut::ReindexStmt(&mut **x),
+            NodeMut::CreateConversionStmt(x) => NodeMut::CreateConversionStmt(&mut **x),
+            NodeMut::CreateCastStmt(x) => NodeMut::CreateCastStmt(&mut **x),
+            NodeMut::CreateTransformStmt(x) => NodeMut::CreateTransformStmt(&mut **x),
+            NodeMut::PrepareStmt(x) => NodeMut::PrepareStmt(&mut **x),
+            NodeMut::ExecuteStmt(x) => NodeMut::ExecuteStmt(&mut **x),
+            NodeMut::DeallocateStmt(x) => NodeMut::DeallocateStmt(&mut **x),
+            NodeMut::DropOwnedStmt(x) => NodeMut::DropOwnedStmt(&mut **x),
+            NodeMut::ReassignOwnedStmt(x) => NodeMut::ReassignOwnedStmt(&mut **x),
+            NodeMut::AlterTsDictionaryStmt(x) => NodeMut::AlterTsDictionaryStmt(&mut **x),
+            NodeMut::AlterTsConfigurationStmt(x) => NodeMut::AlterTsConfigurationStmt(&mut **x),
+            NodeMut::PublicationTable(x) => NodeMut::PublicationTable(&mut **x),
+            NodeMut::PublicationObjSpec(x) => NodeMut::PublicationObjSpec(&mut **x),
+            NodeMut::CreatePublicationStmt(x) => NodeMut::CreatePublicationStmt(&mut **x),
+            NodeMut::AlterPublicationStmt(x) => NodeMut::AlterPublicationStmt(&mut **x),
+            NodeMut::CreateSubscriptionStmt(x) => NodeMut::CreateSubscriptionStmt(&mut **x),
+            NodeMut::AlterSubscriptionStmt(x) => NodeMut::AlterSubscriptionStmt(&mut **x),
+            NodeMut::DropSubscriptionStmt(x) => NodeMut::DropSubscriptionStmt(&mut **x),
+            NodeMut::Integer(x) => NodeMut::Integer(&mut **x),
+            NodeMut::Float(x) => NodeMut::Float(&mut **x),
+            NodeMut::Boolean(x) => NodeMut::Boolean(&mut **x),
+            NodeMut::String(x) => NodeMut::String(&mut **x),
+            NodeMut::BitString(x) => NodeMut::BitString(&mut **x),
+            NodeMut::List(x) => NodeMut::List(&mut **x),
+            NodeMut::IntList(x) => NodeMut::IntList(&mut **x),
+            NodeMut::OidList(x) => NodeMut::OidList(&mut **x),
+            NodeMut::AConst(x) => NodeMut::AConst(&mut **x),
         }
     }
 }
@@ -1494,346 +1777,325 @@ pub(crate) fn children<'a>(node: NodeRef<'a>, out: &mut dyn FnMut(NodeRef<'a>)) 
 }
 
 /// What the mutable walkers report: a `Node` field (`slot`) or a field
-/// of one node kind's own type (`node`).
-trait MutVisitor {
-    fn slot(&mut self, n: &mut ast::Node);
-    fn node(&mut self, n: NodeMut);
+/// of one node kind's own type (`node`), each borrowed for `'a` — the
+/// fields are disjoint, so their borrows split the node's own.
+trait MutVisitor<'a> {
+    fn slot(&mut self, n: &'a mut ast::Node);
+    fn node(&mut self, n: NodeMut<'a>);
 }
 
 /// Walk the fields of `node` holding nodes.
-///
-/// # Safety
-/// `node` must point to a live node no one else accesses.
-unsafe fn walk_mut(node: NodeMut, out: &mut dyn MutVisitor) {
+fn walk_mut<'a>(node: NodeMut<'a>, out: &mut dyn MutVisitor<'a>) {
     match node {
-        NodeMut::Alias(m) => unsafe { walk_mut_alias(m, out) },
-        NodeMut::RangeVar(m) => unsafe { walk_mut_range_var(m, out) },
-        NodeMut::TableFunc(m) => unsafe { walk_mut_table_func(m, out) },
-        NodeMut::IntoClause(m) => unsafe { walk_mut_into_clause(m, out) },
-        NodeMut::Var(m) => unsafe { walk_mut_var(m, out) },
-        NodeMut::Param(m) => unsafe { walk_mut_param(m, out) },
-        NodeMut::Aggref(m) => unsafe { walk_mut_aggref(m, out) },
-        NodeMut::GroupingFunc(m) => unsafe { walk_mut_grouping_func(m, out) },
-        NodeMut::WindowFunc(m) => unsafe { walk_mut_window_func(m, out) },
-        NodeMut::WindowFuncRunCondition(m) => unsafe { walk_mut_window_func_run_condition(m, out) },
-        NodeMut::MergeSupportFunc(m) => unsafe { walk_mut_merge_support_func(m, out) },
-        NodeMut::SubscriptingRef(m) => unsafe { walk_mut_subscripting_ref(m, out) },
-        NodeMut::FuncExpr(m) => unsafe { walk_mut_func_expr(m, out) },
-        NodeMut::NamedArgExpr(m) => unsafe { walk_mut_named_arg_expr(m, out) },
-        NodeMut::OpExpr(m) => unsafe { walk_mut_op_expr(m, out) },
-        NodeMut::DistinctExpr(m) => unsafe { walk_mut_distinct_expr(m, out) },
-        NodeMut::NullIfExpr(m) => unsafe { walk_mut_null_if_expr(m, out) },
-        NodeMut::ScalarArrayOpExpr(m) => unsafe { walk_mut_scalar_array_op_expr(m, out) },
-        NodeMut::BoolExpr(m) => unsafe { walk_mut_bool_expr(m, out) },
-        NodeMut::SubLink(m) => unsafe { walk_mut_sub_link(m, out) },
-        NodeMut::SubPlan(m) => unsafe { walk_mut_sub_plan(m, out) },
-        NodeMut::AlternativeSubPlan(m) => unsafe { walk_mut_alternative_sub_plan(m, out) },
-        NodeMut::FieldSelect(m) => unsafe { walk_mut_field_select(m, out) },
-        NodeMut::FieldStore(m) => unsafe { walk_mut_field_store(m, out) },
-        NodeMut::RelabelType(m) => unsafe { walk_mut_relabel_type(m, out) },
-        NodeMut::CoerceViaIo(m) => unsafe { walk_mut_coerce_via_io(m, out) },
-        NodeMut::ArrayCoerceExpr(m) => unsafe { walk_mut_array_coerce_expr(m, out) },
-        NodeMut::ConvertRowtypeExpr(m) => unsafe { walk_mut_convert_rowtype_expr(m, out) },
-        NodeMut::CollateExpr(m) => unsafe { walk_mut_collate_expr(m, out) },
-        NodeMut::CaseExpr(m) => unsafe { walk_mut_case_expr(m, out) },
-        NodeMut::CaseWhen(m) => unsafe { walk_mut_case_when(m, out) },
-        NodeMut::CaseTestExpr(m) => unsafe { walk_mut_case_test_expr(m, out) },
-        NodeMut::ArrayExpr(m) => unsafe { walk_mut_array_expr(m, out) },
-        NodeMut::RowExpr(m) => unsafe { walk_mut_row_expr(m, out) },
-        NodeMut::RowCompareExpr(m) => unsafe { walk_mut_row_compare_expr(m, out) },
-        NodeMut::CoalesceExpr(m) => unsafe { walk_mut_coalesce_expr(m, out) },
-        NodeMut::MinMaxExpr(m) => unsafe { walk_mut_min_max_expr(m, out) },
-        NodeMut::SqlValueFunction(m) => unsafe { walk_mut_sql_value_function(m, out) },
-        NodeMut::XmlExpr(m) => unsafe { walk_mut_xml_expr(m, out) },
-        NodeMut::JsonFormat(m) => unsafe { walk_mut_json_format(m, out) },
-        NodeMut::JsonReturning(m) => unsafe { walk_mut_json_returning(m, out) },
-        NodeMut::JsonValueExpr(m) => unsafe { walk_mut_json_value_expr(m, out) },
-        NodeMut::JsonConstructorExpr(m) => unsafe { walk_mut_json_constructor_expr(m, out) },
-        NodeMut::JsonIsPredicate(m) => unsafe { walk_mut_json_is_predicate(m, out) },
-        NodeMut::JsonBehavior(m) => unsafe { walk_mut_json_behavior(m, out) },
-        NodeMut::JsonExpr(m) => unsafe { walk_mut_json_expr(m, out) },
-        NodeMut::JsonTablePath(m) => unsafe { walk_mut_json_table_path(m, out) },
-        NodeMut::JsonTablePathScan(m) => unsafe { walk_mut_json_table_path_scan(m, out) },
-        NodeMut::JsonTableSiblingJoin(m) => unsafe { walk_mut_json_table_sibling_join(m, out) },
-        NodeMut::NullTest(m) => unsafe { walk_mut_null_test(m, out) },
-        NodeMut::BooleanTest(m) => unsafe { walk_mut_boolean_test(m, out) },
-        NodeMut::MergeAction(m) => unsafe { walk_mut_merge_action(m, out) },
-        NodeMut::CoerceToDomain(m) => unsafe { walk_mut_coerce_to_domain(m, out) },
-        NodeMut::CoerceToDomainValue(m) => unsafe { walk_mut_coerce_to_domain_value(m, out) },
-        NodeMut::SetToDefault(m) => unsafe { walk_mut_set_to_default(m, out) },
-        NodeMut::CurrentOfExpr(m) => unsafe { walk_mut_current_of_expr(m, out) },
-        NodeMut::NextValueExpr(m) => unsafe { walk_mut_next_value_expr(m, out) },
-        NodeMut::InferenceElem(m) => unsafe { walk_mut_inference_elem(m, out) },
-        NodeMut::ReturningExpr(m) => unsafe { walk_mut_returning_expr(m, out) },
-        NodeMut::TargetEntry(m) => unsafe { walk_mut_target_entry(m, out) },
-        NodeMut::RangeTblRef(m) => unsafe { walk_mut_range_tbl_ref(m, out) },
-        NodeMut::JoinExpr(m) => unsafe { walk_mut_join_expr(m, out) },
-        NodeMut::FromExpr(m) => unsafe { walk_mut_from_expr(m, out) },
-        NodeMut::OnConflictExpr(m) => unsafe { walk_mut_on_conflict_expr(m, out) },
-        NodeMut::Query(m) => unsafe { walk_mut_query(m, out) },
-        NodeMut::TypeName(m) => unsafe { walk_mut_type_name(m, out) },
-        NodeMut::ColumnRef(m) => unsafe { walk_mut_column_ref(m, out) },
-        NodeMut::ParamRef(m) => unsafe { walk_mut_param_ref(m, out) },
-        NodeMut::AExpr(m) => unsafe { walk_mut_a_expr(m, out) },
-        NodeMut::TypeCast(m) => unsafe { walk_mut_type_cast(m, out) },
-        NodeMut::CollateClause(m) => unsafe { walk_mut_collate_clause(m, out) },
-        NodeMut::RoleSpec(m) => unsafe { walk_mut_role_spec(m, out) },
-        NodeMut::FuncCall(m) => unsafe { walk_mut_func_call(m, out) },
-        NodeMut::AStar(m) => unsafe { walk_mut_a_star(m, out) },
-        NodeMut::AIndices(m) => unsafe { walk_mut_a_indices(m, out) },
-        NodeMut::AIndirection(m) => unsafe { walk_mut_a_indirection(m, out) },
-        NodeMut::AArrayExpr(m) => unsafe { walk_mut_a_array_expr(m, out) },
-        NodeMut::ResTarget(m) => unsafe { walk_mut_res_target(m, out) },
-        NodeMut::MultiAssignRef(m) => unsafe { walk_mut_multi_assign_ref(m, out) },
-        NodeMut::SortBy(m) => unsafe { walk_mut_sort_by(m, out) },
-        NodeMut::WindowDef(m) => unsafe { walk_mut_window_def(m, out) },
-        NodeMut::RangeSubselect(m) => unsafe { walk_mut_range_subselect(m, out) },
-        NodeMut::RangeFunction(m) => unsafe { walk_mut_range_function(m, out) },
-        NodeMut::RangeTableFunc(m) => unsafe { walk_mut_range_table_func(m, out) },
-        NodeMut::RangeTableFuncCol(m) => unsafe { walk_mut_range_table_func_col(m, out) },
-        NodeMut::RangeTableSample(m) => unsafe { walk_mut_range_table_sample(m, out) },
-        NodeMut::ColumnDef(m) => unsafe { walk_mut_column_def(m, out) },
-        NodeMut::TableLikeClause(m) => unsafe { walk_mut_table_like_clause(m, out) },
-        NodeMut::IndexElem(m) => unsafe { walk_mut_index_elem(m, out) },
-        NodeMut::DefElem(m) => unsafe { walk_mut_def_elem(m, out) },
-        NodeMut::LockingClause(m) => unsafe { walk_mut_locking_clause(m, out) },
-        NodeMut::XmlSerialize(m) => unsafe { walk_mut_xml_serialize(m, out) },
-        NodeMut::PartitionElem(m) => unsafe { walk_mut_partition_elem(m, out) },
-        NodeMut::PartitionSpec(m) => unsafe { walk_mut_partition_spec(m, out) },
-        NodeMut::PartitionBoundSpec(m) => unsafe { walk_mut_partition_bound_spec(m, out) },
-        NodeMut::PartitionRangeDatum(m) => unsafe { walk_mut_partition_range_datum(m, out) },
-        NodeMut::PartitionCmd(m) => unsafe { walk_mut_partition_cmd(m, out) },
-        NodeMut::RangeTblEntry(m) => unsafe { walk_mut_range_tbl_entry(m, out) },
-        NodeMut::RtePermissionInfo(m) => unsafe { walk_mut_rte_permission_info(m, out) },
-        NodeMut::RangeTblFunction(m) => unsafe { walk_mut_range_tbl_function(m, out) },
-        NodeMut::TableSampleClause(m) => unsafe { walk_mut_table_sample_clause(m, out) },
-        NodeMut::WithCheckOption(m) => unsafe { walk_mut_with_check_option(m, out) },
-        NodeMut::SortGroupClause(m) => unsafe { walk_mut_sort_group_clause(m, out) },
-        NodeMut::GroupingSet(m) => unsafe { walk_mut_grouping_set(m, out) },
-        NodeMut::WindowClause(m) => unsafe { walk_mut_window_clause(m, out) },
-        NodeMut::RowMarkClause(m) => unsafe { walk_mut_row_mark_clause(m, out) },
-        NodeMut::WithClause(m) => unsafe { walk_mut_with_clause(m, out) },
-        NodeMut::InferClause(m) => unsafe { walk_mut_infer_clause(m, out) },
-        NodeMut::OnConflictClause(m) => unsafe { walk_mut_on_conflict_clause(m, out) },
-        NodeMut::CteSearchClause(m) => unsafe { walk_mut_cte_search_clause(m, out) },
-        NodeMut::CteCycleClause(m) => unsafe { walk_mut_cte_cycle_clause(m, out) },
-        NodeMut::CommonTableExpr(m) => unsafe { walk_mut_common_table_expr(m, out) },
-        NodeMut::MergeWhenClause(m) => unsafe { walk_mut_merge_when_clause(m, out) },
-        NodeMut::ReturningOption(m) => unsafe { walk_mut_returning_option(m, out) },
-        NodeMut::ReturningClause(m) => unsafe { walk_mut_returning_clause(m, out) },
-        NodeMut::TriggerTransition(m) => unsafe { walk_mut_trigger_transition(m, out) },
-        NodeMut::JsonOutput(m) => unsafe { walk_mut_json_output(m, out) },
-        NodeMut::JsonArgument(m) => unsafe { walk_mut_json_argument(m, out) },
-        NodeMut::JsonFuncExpr(m) => unsafe { walk_mut_json_func_expr(m, out) },
-        NodeMut::JsonTablePathSpec(m) => unsafe { walk_mut_json_table_path_spec(m, out) },
-        NodeMut::JsonTable(m) => unsafe { walk_mut_json_table(m, out) },
-        NodeMut::JsonTableColumn(m) => unsafe { walk_mut_json_table_column(m, out) },
-        NodeMut::JsonKeyValue(m) => unsafe { walk_mut_json_key_value(m, out) },
-        NodeMut::JsonParseExpr(m) => unsafe { walk_mut_json_parse_expr(m, out) },
-        NodeMut::JsonScalarExpr(m) => unsafe { walk_mut_json_scalar_expr(m, out) },
-        NodeMut::JsonSerializeExpr(m) => unsafe { walk_mut_json_serialize_expr(m, out) },
-        NodeMut::JsonObjectConstructor(m) => unsafe { walk_mut_json_object_constructor(m, out) },
-        NodeMut::JsonArrayConstructor(m) => unsafe { walk_mut_json_array_constructor(m, out) },
-        NodeMut::JsonArrayQueryConstructor(m) => unsafe {
-            walk_mut_json_array_query_constructor(m, out)
-        },
-        NodeMut::JsonAggConstructor(m) => unsafe { walk_mut_json_agg_constructor(m, out) },
-        NodeMut::JsonObjectAgg(m) => unsafe { walk_mut_json_object_agg(m, out) },
-        NodeMut::JsonArrayAgg(m) => unsafe { walk_mut_json_array_agg(m, out) },
-        NodeMut::RawStmt(m) => unsafe { walk_mut_raw_stmt(m, out) },
-        NodeMut::InsertStmt(m) => unsafe { walk_mut_insert_stmt(m, out) },
-        NodeMut::DeleteStmt(m) => unsafe { walk_mut_delete_stmt(m, out) },
-        NodeMut::UpdateStmt(m) => unsafe { walk_mut_update_stmt(m, out) },
-        NodeMut::MergeStmt(m) => unsafe { walk_mut_merge_stmt(m, out) },
-        NodeMut::SelectStmt(m) => unsafe { walk_mut_select_stmt(m, out) },
-        NodeMut::SetOperationStmt(m) => unsafe { walk_mut_set_operation_stmt(m, out) },
-        NodeMut::ReturnStmt(m) => unsafe { walk_mut_return_stmt(m, out) },
-        NodeMut::PlAssignStmt(m) => unsafe { walk_mut_pl_assign_stmt(m, out) },
-        NodeMut::CreateSchemaStmt(m) => unsafe { walk_mut_create_schema_stmt(m, out) },
-        NodeMut::AlterTableStmt(m) => unsafe { walk_mut_alter_table_stmt(m, out) },
-        NodeMut::AlterTableCmd(m) => unsafe { walk_mut_alter_table_cmd(m, out) },
-        NodeMut::AtAlterConstraint(m) => unsafe { walk_mut_at_alter_constraint(m, out) },
-        NodeMut::ReplicaIdentityStmt(m) => unsafe { walk_mut_replica_identity_stmt(m, out) },
-        NodeMut::AlterCollationStmt(m) => unsafe { walk_mut_alter_collation_stmt(m, out) },
-        NodeMut::AlterDomainStmt(m) => unsafe { walk_mut_alter_domain_stmt(m, out) },
-        NodeMut::GrantStmt(m) => unsafe { walk_mut_grant_stmt(m, out) },
-        NodeMut::ObjectWithArgs(m) => unsafe { walk_mut_object_with_args(m, out) },
-        NodeMut::AccessPriv(m) => unsafe { walk_mut_access_priv(m, out) },
-        NodeMut::GrantRoleStmt(m) => unsafe { walk_mut_grant_role_stmt(m, out) },
-        NodeMut::AlterDefaultPrivilegesStmt(m) => unsafe {
-            walk_mut_alter_default_privileges_stmt(m, out)
-        },
-        NodeMut::CopyStmt(m) => unsafe { walk_mut_copy_stmt(m, out) },
-        NodeMut::VariableSetStmt(m) => unsafe { walk_mut_variable_set_stmt(m, out) },
-        NodeMut::VariableShowStmt(m) => unsafe { walk_mut_variable_show_stmt(m, out) },
-        NodeMut::CreateStmt(m) => unsafe { walk_mut_create_stmt(m, out) },
-        NodeMut::Constraint(m) => unsafe { walk_mut_constraint(m, out) },
-        NodeMut::CreateTableSpaceStmt(m) => unsafe { walk_mut_create_table_space_stmt(m, out) },
-        NodeMut::DropTableSpaceStmt(m) => unsafe { walk_mut_drop_table_space_stmt(m, out) },
-        NodeMut::AlterTableSpaceOptionsStmt(m) => unsafe {
-            walk_mut_alter_table_space_options_stmt(m, out)
-        },
-        NodeMut::AlterTableMoveAllStmt(m) => unsafe { walk_mut_alter_table_move_all_stmt(m, out) },
-        NodeMut::CreateExtensionStmt(m) => unsafe { walk_mut_create_extension_stmt(m, out) },
-        NodeMut::AlterExtensionStmt(m) => unsafe { walk_mut_alter_extension_stmt(m, out) },
-        NodeMut::AlterExtensionContentsStmt(m) => unsafe {
-            walk_mut_alter_extension_contents_stmt(m, out)
-        },
-        NodeMut::CreateFdwStmt(m) => unsafe { walk_mut_create_fdw_stmt(m, out) },
-        NodeMut::AlterFdwStmt(m) => unsafe { walk_mut_alter_fdw_stmt(m, out) },
-        NodeMut::CreateForeignServerStmt(m) => unsafe {
-            walk_mut_create_foreign_server_stmt(m, out)
-        },
-        NodeMut::AlterForeignServerStmt(m) => unsafe { walk_mut_alter_foreign_server_stmt(m, out) },
-        NodeMut::CreateForeignTableStmt(m) => unsafe { walk_mut_create_foreign_table_stmt(m, out) },
-        NodeMut::CreateUserMappingStmt(m) => unsafe { walk_mut_create_user_mapping_stmt(m, out) },
-        NodeMut::AlterUserMappingStmt(m) => unsafe { walk_mut_alter_user_mapping_stmt(m, out) },
-        NodeMut::DropUserMappingStmt(m) => unsafe { walk_mut_drop_user_mapping_stmt(m, out) },
-        NodeMut::ImportForeignSchemaStmt(m) => unsafe {
-            walk_mut_import_foreign_schema_stmt(m, out)
-        },
-        NodeMut::CreatePolicyStmt(m) => unsafe { walk_mut_create_policy_stmt(m, out) },
-        NodeMut::AlterPolicyStmt(m) => unsafe { walk_mut_alter_policy_stmt(m, out) },
-        NodeMut::CreateAmStmt(m) => unsafe { walk_mut_create_am_stmt(m, out) },
-        NodeMut::CreateTrigStmt(m) => unsafe { walk_mut_create_trig_stmt(m, out) },
-        NodeMut::CreateEventTrigStmt(m) => unsafe { walk_mut_create_event_trig_stmt(m, out) },
-        NodeMut::AlterEventTrigStmt(m) => unsafe { walk_mut_alter_event_trig_stmt(m, out) },
-        NodeMut::CreatePLangStmt(m) => unsafe { walk_mut_create_p_lang_stmt(m, out) },
-        NodeMut::CreateRoleStmt(m) => unsafe { walk_mut_create_role_stmt(m, out) },
-        NodeMut::AlterRoleStmt(m) => unsafe { walk_mut_alter_role_stmt(m, out) },
-        NodeMut::AlterRoleSetStmt(m) => unsafe { walk_mut_alter_role_set_stmt(m, out) },
-        NodeMut::DropRoleStmt(m) => unsafe { walk_mut_drop_role_stmt(m, out) },
-        NodeMut::CreateSeqStmt(m) => unsafe { walk_mut_create_seq_stmt(m, out) },
-        NodeMut::AlterSeqStmt(m) => unsafe { walk_mut_alter_seq_stmt(m, out) },
-        NodeMut::DefineStmt(m) => unsafe { walk_mut_define_stmt(m, out) },
-        NodeMut::CreateDomainStmt(m) => unsafe { walk_mut_create_domain_stmt(m, out) },
-        NodeMut::CreateOpClassStmt(m) => unsafe { walk_mut_create_op_class_stmt(m, out) },
-        NodeMut::CreateOpClassItem(m) => unsafe { walk_mut_create_op_class_item(m, out) },
-        NodeMut::CreateOpFamilyStmt(m) => unsafe { walk_mut_create_op_family_stmt(m, out) },
-        NodeMut::AlterOpFamilyStmt(m) => unsafe { walk_mut_alter_op_family_stmt(m, out) },
-        NodeMut::DropStmt(m) => unsafe { walk_mut_drop_stmt(m, out) },
-        NodeMut::TruncateStmt(m) => unsafe { walk_mut_truncate_stmt(m, out) },
-        NodeMut::CommentStmt(m) => unsafe { walk_mut_comment_stmt(m, out) },
-        NodeMut::SecLabelStmt(m) => unsafe { walk_mut_sec_label_stmt(m, out) },
-        NodeMut::DeclareCursorStmt(m) => unsafe { walk_mut_declare_cursor_stmt(m, out) },
-        NodeMut::ClosePortalStmt(m) => unsafe { walk_mut_close_portal_stmt(m, out) },
-        NodeMut::FetchStmt(m) => unsafe { walk_mut_fetch_stmt(m, out) },
-        NodeMut::IndexStmt(m) => unsafe { walk_mut_index_stmt(m, out) },
-        NodeMut::CreateStatsStmt(m) => unsafe { walk_mut_create_stats_stmt(m, out) },
-        NodeMut::StatsElem(m) => unsafe { walk_mut_stats_elem(m, out) },
-        NodeMut::AlterStatsStmt(m) => unsafe { walk_mut_alter_stats_stmt(m, out) },
-        NodeMut::CreateFunctionStmt(m) => unsafe { walk_mut_create_function_stmt(m, out) },
-        NodeMut::FunctionParameter(m) => unsafe { walk_mut_function_parameter(m, out) },
-        NodeMut::AlterFunctionStmt(m) => unsafe { walk_mut_alter_function_stmt(m, out) },
-        NodeMut::DoStmt(m) => unsafe { walk_mut_do_stmt(m, out) },
-        NodeMut::InlineCodeBlock(m) => unsafe { walk_mut_inline_code_block(m, out) },
-        NodeMut::CallStmt(m) => unsafe { walk_mut_call_stmt(m, out) },
-        NodeMut::CallContext(m) => unsafe { walk_mut_call_context(m, out) },
-        NodeMut::RenameStmt(m) => unsafe { walk_mut_rename_stmt(m, out) },
-        NodeMut::AlterObjectDependsStmt(m) => unsafe { walk_mut_alter_object_depends_stmt(m, out) },
-        NodeMut::AlterObjectSchemaStmt(m) => unsafe { walk_mut_alter_object_schema_stmt(m, out) },
-        NodeMut::AlterOwnerStmt(m) => unsafe { walk_mut_alter_owner_stmt(m, out) },
-        NodeMut::AlterOperatorStmt(m) => unsafe { walk_mut_alter_operator_stmt(m, out) },
-        NodeMut::AlterTypeStmt(m) => unsafe { walk_mut_alter_type_stmt(m, out) },
-        NodeMut::RuleStmt(m) => unsafe { walk_mut_rule_stmt(m, out) },
-        NodeMut::NotifyStmt(m) => unsafe { walk_mut_notify_stmt(m, out) },
-        NodeMut::ListenStmt(m) => unsafe { walk_mut_listen_stmt(m, out) },
-        NodeMut::UnlistenStmt(m) => unsafe { walk_mut_unlisten_stmt(m, out) },
-        NodeMut::TransactionStmt(m) => unsafe { walk_mut_transaction_stmt(m, out) },
-        NodeMut::CompositeTypeStmt(m) => unsafe { walk_mut_composite_type_stmt(m, out) },
-        NodeMut::CreateEnumStmt(m) => unsafe { walk_mut_create_enum_stmt(m, out) },
-        NodeMut::CreateRangeStmt(m) => unsafe { walk_mut_create_range_stmt(m, out) },
-        NodeMut::AlterEnumStmt(m) => unsafe { walk_mut_alter_enum_stmt(m, out) },
-        NodeMut::ViewStmt(m) => unsafe { walk_mut_view_stmt(m, out) },
-        NodeMut::LoadStmt(m) => unsafe { walk_mut_load_stmt(m, out) },
-        NodeMut::CreatedbStmt(m) => unsafe { walk_mut_createdb_stmt(m, out) },
-        NodeMut::AlterDatabaseStmt(m) => unsafe { walk_mut_alter_database_stmt(m, out) },
-        NodeMut::AlterDatabaseRefreshCollStmt(m) => unsafe {
+        NodeMut::Alias(m) => walk_mut_alias(m, out),
+        NodeMut::RangeVar(m) => walk_mut_range_var(m, out),
+        NodeMut::TableFunc(m) => walk_mut_table_func(m, out),
+        NodeMut::IntoClause(m) => walk_mut_into_clause(m, out),
+        NodeMut::Var(m) => walk_mut_var(m, out),
+        NodeMut::Param(m) => walk_mut_param(m, out),
+        NodeMut::Aggref(m) => walk_mut_aggref(m, out),
+        NodeMut::GroupingFunc(m) => walk_mut_grouping_func(m, out),
+        NodeMut::WindowFunc(m) => walk_mut_window_func(m, out),
+        NodeMut::WindowFuncRunCondition(m) => walk_mut_window_func_run_condition(m, out),
+        NodeMut::MergeSupportFunc(m) => walk_mut_merge_support_func(m, out),
+        NodeMut::SubscriptingRef(m) => walk_mut_subscripting_ref(m, out),
+        NodeMut::FuncExpr(m) => walk_mut_func_expr(m, out),
+        NodeMut::NamedArgExpr(m) => walk_mut_named_arg_expr(m, out),
+        NodeMut::OpExpr(m) => walk_mut_op_expr(m, out),
+        NodeMut::DistinctExpr(m) => walk_mut_distinct_expr(m, out),
+        NodeMut::NullIfExpr(m) => walk_mut_null_if_expr(m, out),
+        NodeMut::ScalarArrayOpExpr(m) => walk_mut_scalar_array_op_expr(m, out),
+        NodeMut::BoolExpr(m) => walk_mut_bool_expr(m, out),
+        NodeMut::SubLink(m) => walk_mut_sub_link(m, out),
+        NodeMut::SubPlan(m) => walk_mut_sub_plan(m, out),
+        NodeMut::AlternativeSubPlan(m) => walk_mut_alternative_sub_plan(m, out),
+        NodeMut::FieldSelect(m) => walk_mut_field_select(m, out),
+        NodeMut::FieldStore(m) => walk_mut_field_store(m, out),
+        NodeMut::RelabelType(m) => walk_mut_relabel_type(m, out),
+        NodeMut::CoerceViaIo(m) => walk_mut_coerce_via_io(m, out),
+        NodeMut::ArrayCoerceExpr(m) => walk_mut_array_coerce_expr(m, out),
+        NodeMut::ConvertRowtypeExpr(m) => walk_mut_convert_rowtype_expr(m, out),
+        NodeMut::CollateExpr(m) => walk_mut_collate_expr(m, out),
+        NodeMut::CaseExpr(m) => walk_mut_case_expr(m, out),
+        NodeMut::CaseWhen(m) => walk_mut_case_when(m, out),
+        NodeMut::CaseTestExpr(m) => walk_mut_case_test_expr(m, out),
+        NodeMut::ArrayExpr(m) => walk_mut_array_expr(m, out),
+        NodeMut::RowExpr(m) => walk_mut_row_expr(m, out),
+        NodeMut::RowCompareExpr(m) => walk_mut_row_compare_expr(m, out),
+        NodeMut::CoalesceExpr(m) => walk_mut_coalesce_expr(m, out),
+        NodeMut::MinMaxExpr(m) => walk_mut_min_max_expr(m, out),
+        NodeMut::SqlValueFunction(m) => walk_mut_sql_value_function(m, out),
+        NodeMut::XmlExpr(m) => walk_mut_xml_expr(m, out),
+        NodeMut::JsonFormat(m) => walk_mut_json_format(m, out),
+        NodeMut::JsonReturning(m) => walk_mut_json_returning(m, out),
+        NodeMut::JsonValueExpr(m) => walk_mut_json_value_expr(m, out),
+        NodeMut::JsonConstructorExpr(m) => walk_mut_json_constructor_expr(m, out),
+        NodeMut::JsonIsPredicate(m) => walk_mut_json_is_predicate(m, out),
+        NodeMut::JsonBehavior(m) => walk_mut_json_behavior(m, out),
+        NodeMut::JsonExpr(m) => walk_mut_json_expr(m, out),
+        NodeMut::JsonTablePath(m) => walk_mut_json_table_path(m, out),
+        NodeMut::JsonTablePathScan(m) => walk_mut_json_table_path_scan(m, out),
+        NodeMut::JsonTableSiblingJoin(m) => walk_mut_json_table_sibling_join(m, out),
+        NodeMut::NullTest(m) => walk_mut_null_test(m, out),
+        NodeMut::BooleanTest(m) => walk_mut_boolean_test(m, out),
+        NodeMut::MergeAction(m) => walk_mut_merge_action(m, out),
+        NodeMut::CoerceToDomain(m) => walk_mut_coerce_to_domain(m, out),
+        NodeMut::CoerceToDomainValue(m) => walk_mut_coerce_to_domain_value(m, out),
+        NodeMut::SetToDefault(m) => walk_mut_set_to_default(m, out),
+        NodeMut::CurrentOfExpr(m) => walk_mut_current_of_expr(m, out),
+        NodeMut::NextValueExpr(m) => walk_mut_next_value_expr(m, out),
+        NodeMut::InferenceElem(m) => walk_mut_inference_elem(m, out),
+        NodeMut::ReturningExpr(m) => walk_mut_returning_expr(m, out),
+        NodeMut::TargetEntry(m) => walk_mut_target_entry(m, out),
+        NodeMut::RangeTblRef(m) => walk_mut_range_tbl_ref(m, out),
+        NodeMut::JoinExpr(m) => walk_mut_join_expr(m, out),
+        NodeMut::FromExpr(m) => walk_mut_from_expr(m, out),
+        NodeMut::OnConflictExpr(m) => walk_mut_on_conflict_expr(m, out),
+        NodeMut::Query(m) => walk_mut_query(m, out),
+        NodeMut::TypeName(m) => walk_mut_type_name(m, out),
+        NodeMut::ColumnRef(m) => walk_mut_column_ref(m, out),
+        NodeMut::ParamRef(m) => walk_mut_param_ref(m, out),
+        NodeMut::AExpr(m) => walk_mut_a_expr(m, out),
+        NodeMut::TypeCast(m) => walk_mut_type_cast(m, out),
+        NodeMut::CollateClause(m) => walk_mut_collate_clause(m, out),
+        NodeMut::RoleSpec(m) => walk_mut_role_spec(m, out),
+        NodeMut::FuncCall(m) => walk_mut_func_call(m, out),
+        NodeMut::AStar(m) => walk_mut_a_star(m, out),
+        NodeMut::AIndices(m) => walk_mut_a_indices(m, out),
+        NodeMut::AIndirection(m) => walk_mut_a_indirection(m, out),
+        NodeMut::AArrayExpr(m) => walk_mut_a_array_expr(m, out),
+        NodeMut::ResTarget(m) => walk_mut_res_target(m, out),
+        NodeMut::MultiAssignRef(m) => walk_mut_multi_assign_ref(m, out),
+        NodeMut::SortBy(m) => walk_mut_sort_by(m, out),
+        NodeMut::WindowDef(m) => walk_mut_window_def(m, out),
+        NodeMut::RangeSubselect(m) => walk_mut_range_subselect(m, out),
+        NodeMut::RangeFunction(m) => walk_mut_range_function(m, out),
+        NodeMut::RangeTableFunc(m) => walk_mut_range_table_func(m, out),
+        NodeMut::RangeTableFuncCol(m) => walk_mut_range_table_func_col(m, out),
+        NodeMut::RangeTableSample(m) => walk_mut_range_table_sample(m, out),
+        NodeMut::ColumnDef(m) => walk_mut_column_def(m, out),
+        NodeMut::TableLikeClause(m) => walk_mut_table_like_clause(m, out),
+        NodeMut::IndexElem(m) => walk_mut_index_elem(m, out),
+        NodeMut::DefElem(m) => walk_mut_def_elem(m, out),
+        NodeMut::LockingClause(m) => walk_mut_locking_clause(m, out),
+        NodeMut::XmlSerialize(m) => walk_mut_xml_serialize(m, out),
+        NodeMut::PartitionElem(m) => walk_mut_partition_elem(m, out),
+        NodeMut::PartitionSpec(m) => walk_mut_partition_spec(m, out),
+        NodeMut::PartitionBoundSpec(m) => walk_mut_partition_bound_spec(m, out),
+        NodeMut::PartitionRangeDatum(m) => walk_mut_partition_range_datum(m, out),
+        NodeMut::PartitionCmd(m) => walk_mut_partition_cmd(m, out),
+        NodeMut::RangeTblEntry(m) => walk_mut_range_tbl_entry(m, out),
+        NodeMut::RtePermissionInfo(m) => walk_mut_rte_permission_info(m, out),
+        NodeMut::RangeTblFunction(m) => walk_mut_range_tbl_function(m, out),
+        NodeMut::TableSampleClause(m) => walk_mut_table_sample_clause(m, out),
+        NodeMut::WithCheckOption(m) => walk_mut_with_check_option(m, out),
+        NodeMut::SortGroupClause(m) => walk_mut_sort_group_clause(m, out),
+        NodeMut::GroupingSet(m) => walk_mut_grouping_set(m, out),
+        NodeMut::WindowClause(m) => walk_mut_window_clause(m, out),
+        NodeMut::RowMarkClause(m) => walk_mut_row_mark_clause(m, out),
+        NodeMut::WithClause(m) => walk_mut_with_clause(m, out),
+        NodeMut::InferClause(m) => walk_mut_infer_clause(m, out),
+        NodeMut::OnConflictClause(m) => walk_mut_on_conflict_clause(m, out),
+        NodeMut::CteSearchClause(m) => walk_mut_cte_search_clause(m, out),
+        NodeMut::CteCycleClause(m) => walk_mut_cte_cycle_clause(m, out),
+        NodeMut::CommonTableExpr(m) => walk_mut_common_table_expr(m, out),
+        NodeMut::MergeWhenClause(m) => walk_mut_merge_when_clause(m, out),
+        NodeMut::ReturningOption(m) => walk_mut_returning_option(m, out),
+        NodeMut::ReturningClause(m) => walk_mut_returning_clause(m, out),
+        NodeMut::TriggerTransition(m) => walk_mut_trigger_transition(m, out),
+        NodeMut::JsonOutput(m) => walk_mut_json_output(m, out),
+        NodeMut::JsonArgument(m) => walk_mut_json_argument(m, out),
+        NodeMut::JsonFuncExpr(m) => walk_mut_json_func_expr(m, out),
+        NodeMut::JsonTablePathSpec(m) => walk_mut_json_table_path_spec(m, out),
+        NodeMut::JsonTable(m) => walk_mut_json_table(m, out),
+        NodeMut::JsonTableColumn(m) => walk_mut_json_table_column(m, out),
+        NodeMut::JsonKeyValue(m) => walk_mut_json_key_value(m, out),
+        NodeMut::JsonParseExpr(m) => walk_mut_json_parse_expr(m, out),
+        NodeMut::JsonScalarExpr(m) => walk_mut_json_scalar_expr(m, out),
+        NodeMut::JsonSerializeExpr(m) => walk_mut_json_serialize_expr(m, out),
+        NodeMut::JsonObjectConstructor(m) => walk_mut_json_object_constructor(m, out),
+        NodeMut::JsonArrayConstructor(m) => walk_mut_json_array_constructor(m, out),
+        NodeMut::JsonArrayQueryConstructor(m) => walk_mut_json_array_query_constructor(m, out),
+        NodeMut::JsonAggConstructor(m) => walk_mut_json_agg_constructor(m, out),
+        NodeMut::JsonObjectAgg(m) => walk_mut_json_object_agg(m, out),
+        NodeMut::JsonArrayAgg(m) => walk_mut_json_array_agg(m, out),
+        NodeMut::RawStmt(m) => walk_mut_raw_stmt(m, out),
+        NodeMut::InsertStmt(m) => walk_mut_insert_stmt(m, out),
+        NodeMut::DeleteStmt(m) => walk_mut_delete_stmt(m, out),
+        NodeMut::UpdateStmt(m) => walk_mut_update_stmt(m, out),
+        NodeMut::MergeStmt(m) => walk_mut_merge_stmt(m, out),
+        NodeMut::SelectStmt(m) => walk_mut_select_stmt(m, out),
+        NodeMut::SetOperationStmt(m) => walk_mut_set_operation_stmt(m, out),
+        NodeMut::ReturnStmt(m) => walk_mut_return_stmt(m, out),
+        NodeMut::PlAssignStmt(m) => walk_mut_pl_assign_stmt(m, out),
+        NodeMut::CreateSchemaStmt(m) => walk_mut_create_schema_stmt(m, out),
+        NodeMut::AlterTableStmt(m) => walk_mut_alter_table_stmt(m, out),
+        NodeMut::AlterTableCmd(m) => walk_mut_alter_table_cmd(m, out),
+        NodeMut::AtAlterConstraint(m) => walk_mut_at_alter_constraint(m, out),
+        NodeMut::ReplicaIdentityStmt(m) => walk_mut_replica_identity_stmt(m, out),
+        NodeMut::AlterCollationStmt(m) => walk_mut_alter_collation_stmt(m, out),
+        NodeMut::AlterDomainStmt(m) => walk_mut_alter_domain_stmt(m, out),
+        NodeMut::GrantStmt(m) => walk_mut_grant_stmt(m, out),
+        NodeMut::ObjectWithArgs(m) => walk_mut_object_with_args(m, out),
+        NodeMut::AccessPriv(m) => walk_mut_access_priv(m, out),
+        NodeMut::GrantRoleStmt(m) => walk_mut_grant_role_stmt(m, out),
+        NodeMut::AlterDefaultPrivilegesStmt(m) => walk_mut_alter_default_privileges_stmt(m, out),
+        NodeMut::CopyStmt(m) => walk_mut_copy_stmt(m, out),
+        NodeMut::VariableSetStmt(m) => walk_mut_variable_set_stmt(m, out),
+        NodeMut::VariableShowStmt(m) => walk_mut_variable_show_stmt(m, out),
+        NodeMut::CreateStmt(m) => walk_mut_create_stmt(m, out),
+        NodeMut::Constraint(m) => walk_mut_constraint(m, out),
+        NodeMut::CreateTableSpaceStmt(m) => walk_mut_create_table_space_stmt(m, out),
+        NodeMut::DropTableSpaceStmt(m) => walk_mut_drop_table_space_stmt(m, out),
+        NodeMut::AlterTableSpaceOptionsStmt(m) => walk_mut_alter_table_space_options_stmt(m, out),
+        NodeMut::AlterTableMoveAllStmt(m) => walk_mut_alter_table_move_all_stmt(m, out),
+        NodeMut::CreateExtensionStmt(m) => walk_mut_create_extension_stmt(m, out),
+        NodeMut::AlterExtensionStmt(m) => walk_mut_alter_extension_stmt(m, out),
+        NodeMut::AlterExtensionContentsStmt(m) => walk_mut_alter_extension_contents_stmt(m, out),
+        NodeMut::CreateFdwStmt(m) => walk_mut_create_fdw_stmt(m, out),
+        NodeMut::AlterFdwStmt(m) => walk_mut_alter_fdw_stmt(m, out),
+        NodeMut::CreateForeignServerStmt(m) => walk_mut_create_foreign_server_stmt(m, out),
+        NodeMut::AlterForeignServerStmt(m) => walk_mut_alter_foreign_server_stmt(m, out),
+        NodeMut::CreateForeignTableStmt(m) => walk_mut_create_foreign_table_stmt(m, out),
+        NodeMut::CreateUserMappingStmt(m) => walk_mut_create_user_mapping_stmt(m, out),
+        NodeMut::AlterUserMappingStmt(m) => walk_mut_alter_user_mapping_stmt(m, out),
+        NodeMut::DropUserMappingStmt(m) => walk_mut_drop_user_mapping_stmt(m, out),
+        NodeMut::ImportForeignSchemaStmt(m) => walk_mut_import_foreign_schema_stmt(m, out),
+        NodeMut::CreatePolicyStmt(m) => walk_mut_create_policy_stmt(m, out),
+        NodeMut::AlterPolicyStmt(m) => walk_mut_alter_policy_stmt(m, out),
+        NodeMut::CreateAmStmt(m) => walk_mut_create_am_stmt(m, out),
+        NodeMut::CreateTrigStmt(m) => walk_mut_create_trig_stmt(m, out),
+        NodeMut::CreateEventTrigStmt(m) => walk_mut_create_event_trig_stmt(m, out),
+        NodeMut::AlterEventTrigStmt(m) => walk_mut_alter_event_trig_stmt(m, out),
+        NodeMut::CreatePLangStmt(m) => walk_mut_create_p_lang_stmt(m, out),
+        NodeMut::CreateRoleStmt(m) => walk_mut_create_role_stmt(m, out),
+        NodeMut::AlterRoleStmt(m) => walk_mut_alter_role_stmt(m, out),
+        NodeMut::AlterRoleSetStmt(m) => walk_mut_alter_role_set_stmt(m, out),
+        NodeMut::DropRoleStmt(m) => walk_mut_drop_role_stmt(m, out),
+        NodeMut::CreateSeqStmt(m) => walk_mut_create_seq_stmt(m, out),
+        NodeMut::AlterSeqStmt(m) => walk_mut_alter_seq_stmt(m, out),
+        NodeMut::DefineStmt(m) => walk_mut_define_stmt(m, out),
+        NodeMut::CreateDomainStmt(m) => walk_mut_create_domain_stmt(m, out),
+        NodeMut::CreateOpClassStmt(m) => walk_mut_create_op_class_stmt(m, out),
+        NodeMut::CreateOpClassItem(m) => walk_mut_create_op_class_item(m, out),
+        NodeMut::CreateOpFamilyStmt(m) => walk_mut_create_op_family_stmt(m, out),
+        NodeMut::AlterOpFamilyStmt(m) => walk_mut_alter_op_family_stmt(m, out),
+        NodeMut::DropStmt(m) => walk_mut_drop_stmt(m, out),
+        NodeMut::TruncateStmt(m) => walk_mut_truncate_stmt(m, out),
+        NodeMut::CommentStmt(m) => walk_mut_comment_stmt(m, out),
+        NodeMut::SecLabelStmt(m) => walk_mut_sec_label_stmt(m, out),
+        NodeMut::DeclareCursorStmt(m) => walk_mut_declare_cursor_stmt(m, out),
+        NodeMut::ClosePortalStmt(m) => walk_mut_close_portal_stmt(m, out),
+        NodeMut::FetchStmt(m) => walk_mut_fetch_stmt(m, out),
+        NodeMut::IndexStmt(m) => walk_mut_index_stmt(m, out),
+        NodeMut::CreateStatsStmt(m) => walk_mut_create_stats_stmt(m, out),
+        NodeMut::StatsElem(m) => walk_mut_stats_elem(m, out),
+        NodeMut::AlterStatsStmt(m) => walk_mut_alter_stats_stmt(m, out),
+        NodeMut::CreateFunctionStmt(m) => walk_mut_create_function_stmt(m, out),
+        NodeMut::FunctionParameter(m) => walk_mut_function_parameter(m, out),
+        NodeMut::AlterFunctionStmt(m) => walk_mut_alter_function_stmt(m, out),
+        NodeMut::DoStmt(m) => walk_mut_do_stmt(m, out),
+        NodeMut::InlineCodeBlock(m) => walk_mut_inline_code_block(m, out),
+        NodeMut::CallStmt(m) => walk_mut_call_stmt(m, out),
+        NodeMut::CallContext(m) => walk_mut_call_context(m, out),
+        NodeMut::RenameStmt(m) => walk_mut_rename_stmt(m, out),
+        NodeMut::AlterObjectDependsStmt(m) => walk_mut_alter_object_depends_stmt(m, out),
+        NodeMut::AlterObjectSchemaStmt(m) => walk_mut_alter_object_schema_stmt(m, out),
+        NodeMut::AlterOwnerStmt(m) => walk_mut_alter_owner_stmt(m, out),
+        NodeMut::AlterOperatorStmt(m) => walk_mut_alter_operator_stmt(m, out),
+        NodeMut::AlterTypeStmt(m) => walk_mut_alter_type_stmt(m, out),
+        NodeMut::RuleStmt(m) => walk_mut_rule_stmt(m, out),
+        NodeMut::NotifyStmt(m) => walk_mut_notify_stmt(m, out),
+        NodeMut::ListenStmt(m) => walk_mut_listen_stmt(m, out),
+        NodeMut::UnlistenStmt(m) => walk_mut_unlisten_stmt(m, out),
+        NodeMut::TransactionStmt(m) => walk_mut_transaction_stmt(m, out),
+        NodeMut::CompositeTypeStmt(m) => walk_mut_composite_type_stmt(m, out),
+        NodeMut::CreateEnumStmt(m) => walk_mut_create_enum_stmt(m, out),
+        NodeMut::CreateRangeStmt(m) => walk_mut_create_range_stmt(m, out),
+        NodeMut::AlterEnumStmt(m) => walk_mut_alter_enum_stmt(m, out),
+        NodeMut::ViewStmt(m) => walk_mut_view_stmt(m, out),
+        NodeMut::LoadStmt(m) => walk_mut_load_stmt(m, out),
+        NodeMut::CreatedbStmt(m) => walk_mut_createdb_stmt(m, out),
+        NodeMut::AlterDatabaseStmt(m) => walk_mut_alter_database_stmt(m, out),
+        NodeMut::AlterDatabaseRefreshCollStmt(m) => {
             walk_mut_alter_database_refresh_coll_stmt(m, out)
-        },
-        NodeMut::AlterDatabaseSetStmt(m) => unsafe { walk_mut_alter_database_set_stmt(m, out) },
-        NodeMut::DropdbStmt(m) => unsafe { walk_mut_dropdb_stmt(m, out) },
-        NodeMut::AlterSystemStmt(m) => unsafe { walk_mut_alter_system_stmt(m, out) },
-        NodeMut::ClusterStmt(m) => unsafe { walk_mut_cluster_stmt(m, out) },
-        NodeMut::VacuumStmt(m) => unsafe { walk_mut_vacuum_stmt(m, out) },
-        NodeMut::VacuumRelation(m) => unsafe { walk_mut_vacuum_relation(m, out) },
-        NodeMut::ExplainStmt(m) => unsafe { walk_mut_explain_stmt(m, out) },
-        NodeMut::CreateTableAsStmt(m) => unsafe { walk_mut_create_table_as_stmt(m, out) },
-        NodeMut::RefreshMatViewStmt(m) => unsafe { walk_mut_refresh_mat_view_stmt(m, out) },
-        NodeMut::CheckPointStmt(m) => unsafe { walk_mut_check_point_stmt(m, out) },
-        NodeMut::DiscardStmt(m) => unsafe { walk_mut_discard_stmt(m, out) },
-        NodeMut::LockStmt(m) => unsafe { walk_mut_lock_stmt(m, out) },
-        NodeMut::ConstraintsSetStmt(m) => unsafe { walk_mut_constraints_set_stmt(m, out) },
-        NodeMut::ReindexStmt(m) => unsafe { walk_mut_reindex_stmt(m, out) },
-        NodeMut::CreateConversionStmt(m) => unsafe { walk_mut_create_conversion_stmt(m, out) },
-        NodeMut::CreateCastStmt(m) => unsafe { walk_mut_create_cast_stmt(m, out) },
-        NodeMut::CreateTransformStmt(m) => unsafe { walk_mut_create_transform_stmt(m, out) },
-        NodeMut::PrepareStmt(m) => unsafe { walk_mut_prepare_stmt(m, out) },
-        NodeMut::ExecuteStmt(m) => unsafe { walk_mut_execute_stmt(m, out) },
-        NodeMut::DeallocateStmt(m) => unsafe { walk_mut_deallocate_stmt(m, out) },
-        NodeMut::DropOwnedStmt(m) => unsafe { walk_mut_drop_owned_stmt(m, out) },
-        NodeMut::ReassignOwnedStmt(m) => unsafe { walk_mut_reassign_owned_stmt(m, out) },
-        NodeMut::AlterTsDictionaryStmt(m) => unsafe { walk_mut_alter_ts_dictionary_stmt(m, out) },
-        NodeMut::AlterTsConfigurationStmt(m) => unsafe {
-            walk_mut_alter_ts_configuration_stmt(m, out)
-        },
-        NodeMut::PublicationTable(m) => unsafe { walk_mut_publication_table(m, out) },
-        NodeMut::PublicationObjSpec(m) => unsafe { walk_mut_publication_obj_spec(m, out) },
-        NodeMut::CreatePublicationStmt(m) => unsafe { walk_mut_create_publication_stmt(m, out) },
-        NodeMut::AlterPublicationStmt(m) => unsafe { walk_mut_alter_publication_stmt(m, out) },
-        NodeMut::CreateSubscriptionStmt(m) => unsafe { walk_mut_create_subscription_stmt(m, out) },
-        NodeMut::AlterSubscriptionStmt(m) => unsafe { walk_mut_alter_subscription_stmt(m, out) },
-        NodeMut::DropSubscriptionStmt(m) => unsafe { walk_mut_drop_subscription_stmt(m, out) },
-        NodeMut::Integer(m) => unsafe { walk_mut_integer(m, out) },
-        NodeMut::Float(m) => unsafe { walk_mut_float(m, out) },
-        NodeMut::Boolean(m) => unsafe { walk_mut_boolean(m, out) },
-        NodeMut::String(m) => unsafe { walk_mut_string(m, out) },
-        NodeMut::BitString(m) => unsafe { walk_mut_bit_string(m, out) },
-        NodeMut::List(m) => unsafe { walk_mut_list(m, out) },
-        NodeMut::IntList(m) => unsafe { walk_mut_int_list(m, out) },
-        NodeMut::OidList(m) => unsafe { walk_mut_oid_list(m, out) },
-        NodeMut::AConst(m) => unsafe { walk_mut_a_const(m, out) },
+        }
+        NodeMut::AlterDatabaseSetStmt(m) => walk_mut_alter_database_set_stmt(m, out),
+        NodeMut::DropdbStmt(m) => walk_mut_dropdb_stmt(m, out),
+        NodeMut::AlterSystemStmt(m) => walk_mut_alter_system_stmt(m, out),
+        NodeMut::ClusterStmt(m) => walk_mut_cluster_stmt(m, out),
+        NodeMut::VacuumStmt(m) => walk_mut_vacuum_stmt(m, out),
+        NodeMut::VacuumRelation(m) => walk_mut_vacuum_relation(m, out),
+        NodeMut::ExplainStmt(m) => walk_mut_explain_stmt(m, out),
+        NodeMut::CreateTableAsStmt(m) => walk_mut_create_table_as_stmt(m, out),
+        NodeMut::RefreshMatViewStmt(m) => walk_mut_refresh_mat_view_stmt(m, out),
+        NodeMut::CheckPointStmt(m) => walk_mut_check_point_stmt(m, out),
+        NodeMut::DiscardStmt(m) => walk_mut_discard_stmt(m, out),
+        NodeMut::LockStmt(m) => walk_mut_lock_stmt(m, out),
+        NodeMut::ConstraintsSetStmt(m) => walk_mut_constraints_set_stmt(m, out),
+        NodeMut::ReindexStmt(m) => walk_mut_reindex_stmt(m, out),
+        NodeMut::CreateConversionStmt(m) => walk_mut_create_conversion_stmt(m, out),
+        NodeMut::CreateCastStmt(m) => walk_mut_create_cast_stmt(m, out),
+        NodeMut::CreateTransformStmt(m) => walk_mut_create_transform_stmt(m, out),
+        NodeMut::PrepareStmt(m) => walk_mut_prepare_stmt(m, out),
+        NodeMut::ExecuteStmt(m) => walk_mut_execute_stmt(m, out),
+        NodeMut::DeallocateStmt(m) => walk_mut_deallocate_stmt(m, out),
+        NodeMut::DropOwnedStmt(m) => walk_mut_drop_owned_stmt(m, out),
+        NodeMut::ReassignOwnedStmt(m) => walk_mut_reassign_owned_stmt(m, out),
+        NodeMut::AlterTsDictionaryStmt(m) => walk_mut_alter_ts_dictionary_stmt(m, out),
+        NodeMut::AlterTsConfigurationStmt(m) => walk_mut_alter_ts_configuration_stmt(m, out),
+        NodeMut::PublicationTable(m) => walk_mut_publication_table(m, out),
+        NodeMut::PublicationObjSpec(m) => walk_mut_publication_obj_spec(m, out),
+        NodeMut::CreatePublicationStmt(m) => walk_mut_create_publication_stmt(m, out),
+        NodeMut::AlterPublicationStmt(m) => walk_mut_alter_publication_stmt(m, out),
+        NodeMut::CreateSubscriptionStmt(m) => walk_mut_create_subscription_stmt(m, out),
+        NodeMut::AlterSubscriptionStmt(m) => walk_mut_alter_subscription_stmt(m, out),
+        NodeMut::DropSubscriptionStmt(m) => walk_mut_drop_subscription_stmt(m, out),
+        NodeMut::Integer(m) => walk_mut_integer(m, out),
+        NodeMut::Float(m) => walk_mut_float(m, out),
+        NodeMut::Boolean(m) => walk_mut_boolean(m, out),
+        NodeMut::String(m) => walk_mut_string(m, out),
+        NodeMut::BitString(m) => walk_mut_bit_string(m, out),
+        NodeMut::List(m) => walk_mut_list(m, out),
+        NodeMut::IntList(m) => walk_mut_int_list(m, out),
+        NodeMut::OidList(m) => walk_mut_oid_list(m, out),
+        NodeMut::AConst(m) => walk_mut_a_const(m, out),
     }
 }
 
-struct Children<'f>(&'f mut dyn FnMut(NodeMut));
+struct Children<'f, 'a>(&'f mut dyn FnMut(NodeMut<'a>));
 
-impl MutVisitor for Children<'_> {
-    fn slot(&mut self, n: &mut ast::Node) {
+impl<'a> MutVisitor<'a> for Children<'_, 'a> {
+    fn slot(&mut self, n: &'a mut ast::Node) {
         (self.0)(n.to_mut());
     }
-    fn node(&mut self, n: NodeMut) {
+    fn node(&mut self, n: NodeMut<'a>) {
         (self.0)(n);
     }
 }
 
-/// Call `out` on every direct child node of `node`.
-///
-/// # Safety
-/// `node` must point to a live node no one else accesses.
-pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {
-    unsafe { walk_mut(node, &mut Children(out)) }
+/// Call `out` on every direct child node of `node`, in the order
+/// [`children`] reports them, splitting `node`'s borrow among them.
+pub(crate) fn children_mut<'a>(node: NodeMut<'a>, out: &mut dyn FnMut(NodeMut<'a>)) {
+    walk_mut(node, &mut Children(out))
 }
 
-struct Slots<'f>(&'f mut dyn FnMut(&mut ast::Node));
+struct Slots<'f, 'a>(&'f mut dyn FnMut(&'a mut ast::Node));
 
-impl MutVisitor for Slots<'_> {
-    fn slot(&mut self, n: &mut ast::Node) {
+impl<'a> MutVisitor<'a> for Slots<'_, 'a> {
+    fn slot(&mut self, n: &'a mut ast::Node) {
         (self.0)(n);
     }
-    fn node(&mut self, n: NodeMut) {
-        unsafe { walk_mut(n, self) }
+    fn node(&mut self, n: NodeMut<'a>) {
+        walk_mut(n, self)
     }
 }
 
 /// Call `out` on every `Node` field below `node` reached without
 /// passing through another one: the places a child node can be
 /// replaced by a node of another kind.
-///
-/// # Safety
-/// `node` must point to a live node no one else accesses.
-pub(crate) unsafe fn child_slots_mut(node: NodeMut, out: &mut dyn FnMut(&mut ast::Node)) {
-    unsafe { walk_mut(node, &mut Slots(out)) }
+pub(crate) fn child_slots_mut<'a>(node: NodeMut<'a>, out: &mut dyn FnMut(&'a mut ast::Node)) {
+    walk_mut(node, &mut Slots(out))
 }
 
 fn walk_parse_result<'a>(m: &'a ast::ParseResult, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -1843,10 +2105,9 @@ fn walk_parse_result<'a>(m: &'a ast::ParseResult, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_parse_result(m: *mut ast::ParseResult, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_parse_result<'a>(m: &'a mut ast::ParseResult, out: &mut dyn MutVisitor<'a>) {
     for x in &mut m.stmts {
-        let x: &mut ast::RawStmt = x;
+        let x: &'a mut ast::RawStmt = x;
         out.node(NodeMut::RawStmt(x));
     }
 }
@@ -1858,43 +2119,32 @@ fn walk_scan_result<'a>(m: &'a ast::ScanResult, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_scan_result(m: *mut ast::ScanResult, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_scan_result<'a>(m: &'a mut ast::ScanResult, out: &mut dyn MutVisitor<'a>) {
     for x in &mut m.tokens {
-        let x: &mut ast::ScanToken = x;
-        unsafe { walk_mut_scan_token(x, out) };
+        let x: &'a mut ast::ScanToken = x;
+        walk_mut_scan_token(x, out);
     }
 }
 
 fn walk_integer<'a>(m: &'a ast::Integer, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_integer(m: *mut ast::Integer, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_integer<'a>(m: &'a mut ast::Integer, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_float<'a>(m: &'a ast::Float, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_float(m: *mut ast::Float, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_float<'a>(m: &'a mut ast::Float, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_boolean<'a>(m: &'a ast::Boolean, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_boolean(m: *mut ast::Boolean, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_boolean<'a>(m: &'a mut ast::Boolean, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_string<'a>(m: &'a ast::String, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_string(m: *mut ast::String, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_string<'a>(m: &'a mut ast::String, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_bit_string<'a>(m: &'a ast::BitString, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_bit_string(m: *mut ast::BitString, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_bit_string<'a>(m: &'a mut ast::BitString, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_list<'a>(m: &'a ast::List, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.items.iter().flatten() {
@@ -1902,8 +2152,7 @@ fn walk_list<'a>(m: &'a ast::List, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_list(m: *mut ast::List, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_list<'a>(m: &'a mut ast::List, out: &mut dyn MutVisitor<'a>) {
     for x in m.items.iter_mut().flatten() {
         out.slot(x);
     }
@@ -1915,8 +2164,7 @@ fn walk_oid_list<'a>(m: &'a ast::OidList, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_oid_list(m: *mut ast::OidList, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_oid_list<'a>(m: &'a mut ast::OidList, out: &mut dyn MutVisitor<'a>) {
     for x in m.items.iter_mut().flatten() {
         out.slot(x);
     }
@@ -1928,8 +2176,7 @@ fn walk_int_list<'a>(m: &'a ast::IntList, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_int_list(m: *mut ast::IntList, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_int_list<'a>(m: &'a mut ast::IntList, out: &mut dyn MutVisitor<'a>) {
     for x in m.items.iter_mut().flatten() {
         out.slot(x);
     }
@@ -1961,27 +2208,26 @@ fn walk_a_const<'a>(m: &'a ast::AConst, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_a_const(m: *mut ast::AConst, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_a_const<'a>(m: &'a mut ast::AConst, out: &mut dyn MutVisitor<'a>) {
     match &mut m.val {
         Some(ast::AConstValue::Integer(x)) => {
-            let x: &mut ast::Integer = x;
+            let x: &'a mut ast::Integer = x;
             out.node(NodeMut::Integer(x));
         }
         Some(ast::AConstValue::Float(x)) => {
-            let x: &mut ast::Float = x;
+            let x: &'a mut ast::Float = x;
             out.node(NodeMut::Float(x));
         }
         Some(ast::AConstValue::Boolean(x)) => {
-            let x: &mut ast::Boolean = x;
+            let x: &'a mut ast::Boolean = x;
             out.node(NodeMut::Boolean(x));
         }
         Some(ast::AConstValue::String(x)) => {
-            let x: &mut ast::String = x;
+            let x: &'a mut ast::String = x;
             out.node(NodeMut::String(x));
         }
         Some(ast::AConstValue::BitString(x)) => {
-            let x: &mut ast::BitString = x;
+            let x: &'a mut ast::BitString = x;
             out.node(NodeMut::BitString(x));
         }
         None => {}
@@ -1994,8 +2240,7 @@ fn walk_alias<'a>(m: &'a ast::Alias, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_alias(m: *mut ast::Alias, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alias<'a>(m: &'a mut ast::Alias, out: &mut dyn MutVisitor<'a>) {
     for x in m.colnames.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2008,10 +2253,9 @@ fn walk_range_var<'a>(m: &'a ast::RangeVar, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_range_var(m: *mut ast::RangeVar, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_var<'a>(m: &'a mut ast::RangeVar, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
 }
@@ -2058,8 +2302,7 @@ fn walk_table_func<'a>(m: &'a ast::TableFunc, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_table_func(m: *mut ast::TableFunc, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_table_func<'a>(m: &'a mut ast::TableFunc, out: &mut dyn MutVisitor<'a>) {
     for x in m.ns_uris.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2118,10 +2361,9 @@ fn walk_into_clause<'a>(m: &'a ast::IntoClause, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_into_clause(m: *mut ast::IntoClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_into_clause<'a>(m: &'a mut ast::IntoClause, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.rel {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.col_names.iter_mut().flatten() {
@@ -2131,22 +2373,18 @@ unsafe fn walk_mut_into_clause(m: *mut ast::IntoClause, out: &mut dyn MutVisitor
         out.slot(x);
     }
     if let Some(x) = &mut m.view_query {
-        let x: &mut ast::Query = x;
+        let x: &'a mut ast::Query = x;
         out.node(NodeMut::Query(x));
     }
 }
 
 fn walk_var<'a>(m: &'a ast::Var, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_var(m: *mut ast::Var, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_var<'a>(m: &'a mut ast::Var, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_param<'a>(m: &'a ast::Param, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_param(m: *mut ast::Param, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_param<'a>(m: &'a mut ast::Param, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_aggref<'a>(m: &'a ast::Aggref, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.aggargtypes.iter().flatten() {
@@ -2169,8 +2407,7 @@ fn walk_aggref<'a>(m: &'a ast::Aggref, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_aggref(m: *mut ast::Aggref, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_aggref<'a>(m: &'a mut ast::Aggref, out: &mut dyn MutVisitor<'a>) {
     for x in m.aggargtypes.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2200,8 +2437,7 @@ fn walk_grouping_func<'a>(m: &'a ast::GroupingFunc, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_grouping_func(m: *mut ast::GroupingFunc, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_grouping_func<'a>(m: &'a mut ast::GroupingFunc, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2222,8 +2458,7 @@ fn walk_window_func<'a>(m: &'a ast::WindowFunc, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_window_func(m: *mut ast::WindowFunc, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_window_func<'a>(m: &'a mut ast::WindowFunc, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2244,11 +2479,10 @@ fn walk_window_func_run_condition<'a>(
     }
 }
 
-unsafe fn walk_mut_window_func_run_condition(
-    m: *mut ast::WindowFuncRunCondition,
-    out: &mut dyn MutVisitor,
+fn walk_mut_window_func_run_condition<'a>(
+    m: &'a mut ast::WindowFuncRunCondition,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2256,8 +2490,7 @@ unsafe fn walk_mut_window_func_run_condition(
 
 fn walk_merge_support_func<'a>(m: &'a ast::MergeSupportFunc, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_merge_support_func(m: *mut ast::MergeSupportFunc, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_merge_support_func<'a>(m: &'a mut ast::MergeSupportFunc, out: &mut dyn MutVisitor<'a>) {
 }
 
 fn walk_subscripting_ref<'a>(m: &'a ast::SubscriptingRef, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -2275,8 +2508,7 @@ fn walk_subscripting_ref<'a>(m: &'a ast::SubscriptingRef, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_subscripting_ref(m: *mut ast::SubscriptingRef, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_subscripting_ref<'a>(m: &'a mut ast::SubscriptingRef, out: &mut dyn MutVisitor<'a>) {
     for x in m.refupperindexpr.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2297,8 +2529,7 @@ fn walk_func_expr<'a>(m: &'a ast::FuncExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_func_expr(m: *mut ast::FuncExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_func_expr<'a>(m: &'a mut ast::FuncExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2310,8 +2541,7 @@ fn walk_named_arg_expr<'a>(m: &'a ast::NamedArgExpr, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_named_arg_expr(m: *mut ast::NamedArgExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_named_arg_expr<'a>(m: &'a mut ast::NamedArgExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2323,8 +2553,7 @@ fn walk_op_expr<'a>(m: &'a ast::OpExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_op_expr(m: *mut ast::OpExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_op_expr<'a>(m: &'a mut ast::OpExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2336,8 +2565,7 @@ fn walk_distinct_expr<'a>(m: &'a ast::DistinctExpr, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_distinct_expr(m: *mut ast::DistinctExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_distinct_expr<'a>(m: &'a mut ast::DistinctExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2349,8 +2577,7 @@ fn walk_null_if_expr<'a>(m: &'a ast::NullIfExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_null_if_expr(m: *mut ast::NullIfExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_null_if_expr<'a>(m: &'a mut ast::NullIfExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2362,8 +2589,10 @@ fn walk_scalar_array_op_expr<'a>(m: &'a ast::ScalarArrayOpExpr, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_scalar_array_op_expr(m: *mut ast::ScalarArrayOpExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_scalar_array_op_expr<'a>(
+    m: &'a mut ast::ScalarArrayOpExpr,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2375,8 +2604,7 @@ fn walk_bool_expr<'a>(m: &'a ast::BoolExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_bool_expr(m: *mut ast::BoolExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_bool_expr<'a>(m: &'a mut ast::BoolExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2394,8 +2622,7 @@ fn walk_sub_link<'a>(m: &'a ast::SubLink, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_sub_link(m: *mut ast::SubLink, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_sub_link<'a>(m: &'a mut ast::SubLink, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.testexpr {
         out.slot(x);
     }
@@ -2425,8 +2652,7 @@ fn walk_sub_plan<'a>(m: &'a ast::SubPlan, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_sub_plan(m: *mut ast::SubPlan, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_sub_plan<'a>(m: &'a mut ast::SubPlan, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.testexpr {
         out.slot(x);
     }
@@ -2450,8 +2676,10 @@ fn walk_alternative_sub_plan<'a>(m: &'a ast::AlternativeSubPlan, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_alternative_sub_plan(m: *mut ast::AlternativeSubPlan, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alternative_sub_plan<'a>(
+    m: &'a mut ast::AlternativeSubPlan,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.subplans.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2463,8 +2691,7 @@ fn walk_field_select<'a>(m: &'a ast::FieldSelect, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_field_select(m: *mut ast::FieldSelect, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_field_select<'a>(m: &'a mut ast::FieldSelect, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2482,8 +2709,7 @@ fn walk_field_store<'a>(m: &'a ast::FieldStore, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_field_store(m: *mut ast::FieldStore, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_field_store<'a>(m: &'a mut ast::FieldStore, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2501,8 +2727,7 @@ fn walk_relabel_type<'a>(m: &'a ast::RelabelType, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_relabel_type(m: *mut ast::RelabelType, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_relabel_type<'a>(m: &'a mut ast::RelabelType, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2514,8 +2739,7 @@ fn walk_coerce_via_io<'a>(m: &'a ast::CoerceViaIo, out: &mut dyn FnMut(NodeRef<'
     }
 }
 
-unsafe fn walk_mut_coerce_via_io(m: *mut ast::CoerceViaIo, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_coerce_via_io<'a>(m: &'a mut ast::CoerceViaIo, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2530,8 +2754,7 @@ fn walk_array_coerce_expr<'a>(m: &'a ast::ArrayCoerceExpr, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_array_coerce_expr(m: *mut ast::ArrayCoerceExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_array_coerce_expr<'a>(m: &'a mut ast::ArrayCoerceExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2546,8 +2769,10 @@ fn walk_convert_rowtype_expr<'a>(m: &'a ast::ConvertRowtypeExpr, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_convert_rowtype_expr(m: *mut ast::ConvertRowtypeExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_convert_rowtype_expr<'a>(
+    m: &'a mut ast::ConvertRowtypeExpr,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2559,8 +2784,7 @@ fn walk_collate_expr<'a>(m: &'a ast::CollateExpr, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_collate_expr(m: *mut ast::CollateExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_collate_expr<'a>(m: &'a mut ast::CollateExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2578,8 +2802,7 @@ fn walk_case_expr<'a>(m: &'a ast::CaseExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_case_expr(m: *mut ast::CaseExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_case_expr<'a>(m: &'a mut ast::CaseExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2600,8 +2823,7 @@ fn walk_case_when<'a>(m: &'a ast::CaseWhen, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_case_when(m: *mut ast::CaseWhen, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_case_when<'a>(m: &'a mut ast::CaseWhen, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
@@ -2612,9 +2834,7 @@ unsafe fn walk_mut_case_when(m: *mut ast::CaseWhen, out: &mut dyn MutVisitor) {
 
 fn walk_case_test_expr<'a>(m: &'a ast::CaseTestExpr, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_case_test_expr(m: *mut ast::CaseTestExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_case_test_expr<'a>(m: &'a mut ast::CaseTestExpr, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_array_expr<'a>(m: &'a ast::ArrayExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.elements.iter().flatten() {
@@ -2622,8 +2842,7 @@ fn walk_array_expr<'a>(m: &'a ast::ArrayExpr, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_array_expr(m: *mut ast::ArrayExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_array_expr<'a>(m: &'a mut ast::ArrayExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.elements.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2638,8 +2857,7 @@ fn walk_row_expr<'a>(m: &'a ast::RowExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_row_expr(m: *mut ast::RowExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_row_expr<'a>(m: &'a mut ast::RowExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2666,8 +2884,7 @@ fn walk_row_compare_expr<'a>(m: &'a ast::RowCompareExpr, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_row_compare_expr(m: *mut ast::RowCompareExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_row_compare_expr<'a>(m: &'a mut ast::RowCompareExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.opnos.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2691,8 +2908,7 @@ fn walk_coalesce_expr<'a>(m: &'a ast::CoalesceExpr, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_coalesce_expr(m: *mut ast::CoalesceExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_coalesce_expr<'a>(m: &'a mut ast::CoalesceExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2704,8 +2920,7 @@ fn walk_min_max_expr<'a>(m: &'a ast::MinMaxExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_min_max_expr(m: *mut ast::MinMaxExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_min_max_expr<'a>(m: &'a mut ast::MinMaxExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2713,8 +2928,7 @@ unsafe fn walk_mut_min_max_expr(m: *mut ast::MinMaxExpr, out: &mut dyn MutVisito
 
 fn walk_sql_value_function<'a>(m: &'a ast::SqlValueFunction, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_sql_value_function(m: *mut ast::SqlValueFunction, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_sql_value_function<'a>(m: &'a mut ast::SqlValueFunction, out: &mut dyn MutVisitor<'a>) {
 }
 
 fn walk_xml_expr<'a>(m: &'a ast::XmlExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -2729,8 +2943,7 @@ fn walk_xml_expr<'a>(m: &'a ast::XmlExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_xml_expr(m: *mut ast::XmlExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_xml_expr<'a>(m: &'a mut ast::XmlExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.named_args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2744,9 +2957,7 @@ unsafe fn walk_mut_xml_expr(m: *mut ast::XmlExpr, out: &mut dyn MutVisitor) {
 
 fn walk_json_format<'a>(m: &'a ast::JsonFormat, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_json_format(m: *mut ast::JsonFormat, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_json_format<'a>(m: &'a mut ast::JsonFormat, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_json_returning<'a>(m: &'a ast::JsonReturning, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.format {
@@ -2755,10 +2966,9 @@ fn walk_json_returning<'a>(m: &'a ast::JsonReturning, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_json_returning(m: *mut ast::JsonReturning, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_returning<'a>(m: &'a mut ast::JsonReturning, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.format {
-        let x: &mut ast::JsonFormat = x;
+        let x: &'a mut ast::JsonFormat = x;
         out.node(NodeMut::JsonFormat(x));
     }
 }
@@ -2776,8 +2986,7 @@ fn walk_json_value_expr<'a>(m: &'a ast::JsonValueExpr, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_json_value_expr(m: *mut ast::JsonValueExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_value_expr<'a>(m: &'a mut ast::JsonValueExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.raw_expr {
         out.slot(x);
     }
@@ -2785,7 +2994,7 @@ unsafe fn walk_mut_json_value_expr(m: *mut ast::JsonValueExpr, out: &mut dyn Mut
         out.slot(x);
     }
     if let Some(x) = &mut m.format {
-        let x: &mut ast::JsonFormat = x;
+        let x: &'a mut ast::JsonFormat = x;
         out.node(NodeMut::JsonFormat(x));
     }
 }
@@ -2809,11 +3018,10 @@ fn walk_json_constructor_expr<'a>(
     }
 }
 
-unsafe fn walk_mut_json_constructor_expr(
-    m: *mut ast::JsonConstructorExpr,
-    out: &mut dyn MutVisitor,
+fn walk_mut_json_constructor_expr<'a>(
+    m: &'a mut ast::JsonConstructorExpr,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -2824,7 +3032,7 @@ unsafe fn walk_mut_json_constructor_expr(
         out.slot(x);
     }
     if let Some(x) = &mut m.returning {
-        let x: &mut ast::JsonReturning = x;
+        let x: &'a mut ast::JsonReturning = x;
         out.node(NodeMut::JsonReturning(x));
     }
 }
@@ -2839,13 +3047,12 @@ fn walk_json_is_predicate<'a>(m: &'a ast::JsonIsPredicate, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_json_is_predicate(m: *mut ast::JsonIsPredicate, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_is_predicate<'a>(m: &'a mut ast::JsonIsPredicate, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
     if let Some(x) = &mut m.format {
-        let x: &mut ast::JsonFormat = x;
+        let x: &'a mut ast::JsonFormat = x;
         out.node(NodeMut::JsonFormat(x));
     }
 }
@@ -2856,8 +3063,7 @@ fn walk_json_behavior<'a>(m: &'a ast::JsonBehavior, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_json_behavior(m: *mut ast::JsonBehavior, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_behavior<'a>(m: &'a mut ast::JsonBehavior, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
@@ -2894,20 +3100,19 @@ fn walk_json_expr<'a>(m: &'a ast::JsonExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_json_expr(m: *mut ast::JsonExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_expr<'a>(m: &'a mut ast::JsonExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.formatted_expr {
         out.slot(x);
     }
     if let Some(x) = &mut m.format {
-        let x: &mut ast::JsonFormat = x;
+        let x: &'a mut ast::JsonFormat = x;
         out.node(NodeMut::JsonFormat(x));
     }
     if let Some(x) = &mut m.path_spec {
         out.slot(x);
     }
     if let Some(x) = &mut m.returning {
-        let x: &mut ast::JsonReturning = x;
+        let x: &'a mut ast::JsonReturning = x;
         out.node(NodeMut::JsonReturning(x));
     }
     for x in m.passing_names.iter_mut().flatten() {
@@ -2917,20 +3122,18 @@ unsafe fn walk_mut_json_expr(m: *mut ast::JsonExpr, out: &mut dyn MutVisitor) {
         out.slot(x);
     }
     if let Some(x) = &mut m.on_empty {
-        let x: &mut ast::JsonBehavior = x;
+        let x: &'a mut ast::JsonBehavior = x;
         out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.on_error {
-        let x: &mut ast::JsonBehavior = x;
+        let x: &'a mut ast::JsonBehavior = x;
         out.node(NodeMut::JsonBehavior(x));
     }
 }
 
 fn walk_json_table_path<'a>(m: &'a ast::JsonTablePath, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_json_table_path(m: *mut ast::JsonTablePath, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_json_table_path<'a>(m: &'a mut ast::JsonTablePath, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_json_table_path_scan<'a>(m: &'a ast::JsonTablePathScan, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.path {
@@ -2942,10 +3145,12 @@ fn walk_json_table_path_scan<'a>(m: &'a ast::JsonTablePathScan, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_json_table_path_scan(m: *mut ast::JsonTablePathScan, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_table_path_scan<'a>(
+    m: &'a mut ast::JsonTablePathScan,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.path {
-        let x: &mut ast::JsonTablePath = x;
+        let x: &'a mut ast::JsonTablePath = x;
         out.node(NodeMut::JsonTablePath(x));
     }
     if let Some(x) = &mut m.child {
@@ -2965,11 +3170,10 @@ fn walk_json_table_sibling_join<'a>(
     }
 }
 
-unsafe fn walk_mut_json_table_sibling_join(
-    m: *mut ast::JsonTableSiblingJoin,
-    out: &mut dyn MutVisitor,
+fn walk_mut_json_table_sibling_join<'a>(
+    m: &'a mut ast::JsonTableSiblingJoin,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.lplan {
         out.slot(x);
     }
@@ -2984,8 +3188,7 @@ fn walk_null_test<'a>(m: &'a ast::NullTest, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_null_test(m: *mut ast::NullTest, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_null_test<'a>(m: &'a mut ast::NullTest, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -2997,8 +3200,7 @@ fn walk_boolean_test<'a>(m: &'a ast::BooleanTest, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_boolean_test(m: *mut ast::BooleanTest, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_boolean_test<'a>(m: &'a mut ast::BooleanTest, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -3016,8 +3218,7 @@ fn walk_merge_action<'a>(m: &'a ast::MergeAction, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_merge_action(m: *mut ast::MergeAction, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_merge_action<'a>(m: &'a mut ast::MergeAction, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.qual {
         out.slot(x);
     }
@@ -3035,8 +3236,7 @@ fn walk_coerce_to_domain<'a>(m: &'a ast::CoerceToDomain, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_coerce_to_domain(m: *mut ast::CoerceToDomain, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_coerce_to_domain<'a>(m: &'a mut ast::CoerceToDomain, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -3048,30 +3248,23 @@ fn walk_coerce_to_domain_value<'a>(
 ) {
 }
 
-unsafe fn walk_mut_coerce_to_domain_value(
-    m: *mut ast::CoerceToDomainValue,
-    out: &mut dyn MutVisitor,
+fn walk_mut_coerce_to_domain_value<'a>(
+    m: &'a mut ast::CoerceToDomainValue,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
 }
 
 fn walk_set_to_default<'a>(m: &'a ast::SetToDefault, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_set_to_default(m: *mut ast::SetToDefault, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_set_to_default<'a>(m: &'a mut ast::SetToDefault, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_current_of_expr<'a>(m: &'a ast::CurrentOfExpr, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_current_of_expr(m: *mut ast::CurrentOfExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_current_of_expr<'a>(m: &'a mut ast::CurrentOfExpr, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_next_value_expr<'a>(m: &'a ast::NextValueExpr, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_next_value_expr(m: *mut ast::NextValueExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_next_value_expr<'a>(m: &'a mut ast::NextValueExpr, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_inference_elem<'a>(m: &'a ast::InferenceElem, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.expr {
@@ -3079,8 +3272,7 @@ fn walk_inference_elem<'a>(m: &'a ast::InferenceElem, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_inference_elem(m: *mut ast::InferenceElem, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_inference_elem<'a>(m: &'a mut ast::InferenceElem, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
@@ -3092,8 +3284,7 @@ fn walk_returning_expr<'a>(m: &'a ast::ReturningExpr, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_returning_expr(m: *mut ast::ReturningExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_returning_expr<'a>(m: &'a mut ast::ReturningExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.retexpr {
         out.slot(x);
     }
@@ -3105,8 +3296,7 @@ fn walk_target_entry<'a>(m: &'a ast::TargetEntry, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_target_entry(m: *mut ast::TargetEntry, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_target_entry<'a>(m: &'a mut ast::TargetEntry, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
@@ -3114,9 +3304,7 @@ unsafe fn walk_mut_target_entry(m: *mut ast::TargetEntry, out: &mut dyn MutVisit
 
 fn walk_range_tbl_ref<'a>(m: &'a ast::RangeTblRef, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_range_tbl_ref(m: *mut ast::RangeTblRef, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_range_tbl_ref<'a>(m: &'a mut ast::RangeTblRef, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_join_expr<'a>(m: &'a ast::JoinExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.larg {
@@ -3141,8 +3329,7 @@ fn walk_join_expr<'a>(m: &'a ast::JoinExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_join_expr(m: *mut ast::JoinExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_join_expr<'a>(m: &'a mut ast::JoinExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.larg {
         out.slot(x);
     }
@@ -3153,14 +3340,14 @@ unsafe fn walk_mut_join_expr(m: *mut ast::JoinExpr, out: &mut dyn MutVisitor) {
         out.slot(x);
     }
     if let Some(x) = &mut m.join_using_alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
     if let Some(x) = &mut m.quals {
         out.slot(x);
     }
     if let Some(x) = &mut m.alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
 }
@@ -3174,8 +3361,7 @@ fn walk_from_expr<'a>(m: &'a ast::FromExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_from_expr(m: *mut ast::FromExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_from_expr<'a>(m: &'a mut ast::FromExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.fromlist.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3202,8 +3388,7 @@ fn walk_on_conflict_expr<'a>(m: &'a ast::OnConflictExpr, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_on_conflict_expr(m: *mut ast::OnConflictExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_on_conflict_expr<'a>(m: &'a mut ast::OnConflictExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.arbiter_elems.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3292,8 +3477,7 @@ fn walk_query<'a>(m: &'a ast::Query, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_query(m: *mut ast::Query, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_query<'a>(m: &'a mut ast::Query, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.utility_stmt {
         out.slot(x);
     }
@@ -3307,7 +3491,7 @@ unsafe fn walk_mut_query(m: *mut ast::Query, out: &mut dyn MutVisitor) {
         out.slot(x);
     }
     if let Some(x) = &mut m.jointree {
-        let x: &mut ast::FromExpr = x;
+        let x: &'a mut ast::FromExpr = x;
         out.node(NodeMut::FromExpr(x));
     }
     for x in m.merge_action_list.iter_mut().flatten() {
@@ -3320,7 +3504,7 @@ unsafe fn walk_mut_query(m: *mut ast::Query, out: &mut dyn MutVisitor) {
         out.slot(x);
     }
     if let Some(x) = &mut m.on_conflict {
-        let x: &mut ast::OnConflictExpr = x;
+        let x: &'a mut ast::OnConflictExpr = x;
         out.node(NodeMut::OnConflictExpr(x));
     }
     for x in m.returning_list.iter_mut().flatten() {
@@ -3376,8 +3560,7 @@ fn walk_type_name<'a>(m: &'a ast::TypeName, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_type_name(m: *mut ast::TypeName, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_type_name<'a>(m: &'a mut ast::TypeName, out: &mut dyn MutVisitor<'a>) {
     for x in m.names.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3395,8 +3578,7 @@ fn walk_column_ref<'a>(m: &'a ast::ColumnRef, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_column_ref(m: *mut ast::ColumnRef, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_column_ref<'a>(m: &'a mut ast::ColumnRef, out: &mut dyn MutVisitor<'a>) {
     for x in m.fields.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3404,9 +3586,7 @@ unsafe fn walk_mut_column_ref(m: *mut ast::ColumnRef, out: &mut dyn MutVisitor) 
 
 fn walk_param_ref<'a>(m: &'a ast::ParamRef, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_param_ref(m: *mut ast::ParamRef, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_param_ref<'a>(m: &'a mut ast::ParamRef, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_a_expr<'a>(m: &'a ast::AExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.name.iter().flatten() {
@@ -3420,8 +3600,7 @@ fn walk_a_expr<'a>(m: &'a ast::AExpr, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_a_expr(m: *mut ast::AExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_a_expr<'a>(m: &'a mut ast::AExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3443,13 +3622,12 @@ fn walk_type_cast<'a>(m: &'a ast::TypeCast, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_type_cast(m: *mut ast::TypeCast, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_type_cast<'a>(m: &'a mut ast::TypeCast, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
 }
@@ -3463,8 +3641,7 @@ fn walk_collate_clause<'a>(m: &'a ast::CollateClause, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_collate_clause(m: *mut ast::CollateClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_collate_clause<'a>(m: &'a mut ast::CollateClause, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -3475,9 +3652,7 @@ unsafe fn walk_mut_collate_clause(m: *mut ast::CollateClause, out: &mut dyn MutV
 
 fn walk_role_spec<'a>(m: &'a ast::RoleSpec, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_role_spec(m: *mut ast::RoleSpec, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_role_spec<'a>(m: &'a mut ast::RoleSpec, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_func_call<'a>(m: &'a ast::FuncCall, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.funcname.iter().flatten() {
@@ -3498,8 +3673,7 @@ fn walk_func_call<'a>(m: &'a ast::FuncCall, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_func_call(m: *mut ast::FuncCall, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_func_call<'a>(m: &'a mut ast::FuncCall, out: &mut dyn MutVisitor<'a>) {
     for x in m.funcname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3513,16 +3687,14 @@ unsafe fn walk_mut_func_call(m: *mut ast::FuncCall, out: &mut dyn MutVisitor) {
         out.slot(x);
     }
     if let Some(x) = &mut m.over {
-        let x: &mut ast::WindowDef = x;
+        let x: &'a mut ast::WindowDef = x;
         out.node(NodeMut::WindowDef(x));
     }
 }
 
 fn walk_a_star<'a>(m: &'a ast::AStar, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_a_star(m: *mut ast::AStar, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_a_star<'a>(m: &'a mut ast::AStar, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_a_indices<'a>(m: &'a ast::AIndices, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.lidx {
@@ -3533,8 +3705,7 @@ fn walk_a_indices<'a>(m: &'a ast::AIndices, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_a_indices(m: *mut ast::AIndices, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_a_indices<'a>(m: &'a mut ast::AIndices, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.lidx {
         out.slot(x);
     }
@@ -3552,8 +3723,7 @@ fn walk_a_indirection<'a>(m: &'a ast::AIndirection, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_a_indirection(m: *mut ast::AIndirection, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_a_indirection<'a>(m: &'a mut ast::AIndirection, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -3568,8 +3738,7 @@ fn walk_a_array_expr<'a>(m: &'a ast::AArrayExpr, out: &mut dyn FnMut(NodeRef<'a>
     }
 }
 
-unsafe fn walk_mut_a_array_expr(m: *mut ast::AArrayExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_a_array_expr<'a>(m: &'a mut ast::AArrayExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.elements.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3584,8 +3753,7 @@ fn walk_res_target<'a>(m: &'a ast::ResTarget, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_res_target(m: *mut ast::ResTarget, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_res_target<'a>(m: &'a mut ast::ResTarget, out: &mut dyn MutVisitor<'a>) {
     for x in m.indirection.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3600,8 +3768,7 @@ fn walk_multi_assign_ref<'a>(m: &'a ast::MultiAssignRef, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_multi_assign_ref(m: *mut ast::MultiAssignRef, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_multi_assign_ref<'a>(m: &'a mut ast::MultiAssignRef, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.source {
         out.slot(x);
     }
@@ -3616,8 +3783,7 @@ fn walk_sort_by<'a>(m: &'a ast::SortBy, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_sort_by(m: *mut ast::SortBy, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_sort_by<'a>(m: &'a mut ast::SortBy, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.node {
         out.slot(x);
     }
@@ -3641,8 +3807,7 @@ fn walk_window_def<'a>(m: &'a ast::WindowDef, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_window_def(m: *mut ast::WindowDef, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_window_def<'a>(m: &'a mut ast::WindowDef, out: &mut dyn MutVisitor<'a>) {
     for x in m.partition_clause.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3667,13 +3832,12 @@ fn walk_range_subselect<'a>(m: &'a ast::RangeSubselect, out: &mut dyn FnMut(Node
     }
 }
 
-unsafe fn walk_mut_range_subselect(m: *mut ast::RangeSubselect, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_subselect<'a>(m: &'a mut ast::RangeSubselect, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.subquery {
         out.slot(x);
     }
     if let Some(x) = &mut m.alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
 }
@@ -3691,13 +3855,12 @@ fn walk_range_function<'a>(m: &'a ast::RangeFunction, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_range_function(m: *mut ast::RangeFunction, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_function<'a>(m: &'a mut ast::RangeFunction, out: &mut dyn MutVisitor<'a>) {
     for x in m.functions.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
     for x in m.coldeflist.iter_mut().flatten() {
@@ -3724,8 +3887,7 @@ fn walk_range_table_func<'a>(m: &'a ast::RangeTableFunc, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_range_table_func(m: *mut ast::RangeTableFunc, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_table_func<'a>(m: &'a mut ast::RangeTableFunc, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.docexpr {
         out.slot(x);
     }
@@ -3739,7 +3901,7 @@ unsafe fn walk_mut_range_table_func(m: *mut ast::RangeTableFunc, out: &mut dyn M
         out.slot(x);
     }
     if let Some(x) = &mut m.alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
 }
@@ -3757,10 +3919,12 @@ fn walk_range_table_func_col<'a>(m: &'a ast::RangeTableFuncCol, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_range_table_func_col(m: *mut ast::RangeTableFuncCol, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_table_func_col<'a>(
+    m: &'a mut ast::RangeTableFuncCol,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.colexpr {
@@ -3786,8 +3950,7 @@ fn walk_range_table_sample<'a>(m: &'a ast::RangeTableSample, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_range_table_sample(m: *mut ast::RangeTableSample, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_table_sample<'a>(m: &'a mut ast::RangeTableSample, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
         out.slot(x);
     }
@@ -3829,10 +3992,9 @@ fn walk_column_def<'a>(m: &'a ast::ColumnDef, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_column_def(m: *mut ast::ColumnDef, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_column_def<'a>(m: &'a mut ast::ColumnDef, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.raw_default {
@@ -3842,11 +4004,11 @@ unsafe fn walk_mut_column_def(m: *mut ast::ColumnDef, out: &mut dyn MutVisitor) 
         out.slot(x);
     }
     if let Some(x) = &mut m.identity_sequence {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.coll_clause {
-        let x: &mut ast::CollateClause = x;
+        let x: &'a mut ast::CollateClause = x;
         out.node(NodeMut::CollateClause(x));
     }
     for x in m.constraints.iter_mut().flatten() {
@@ -3864,10 +4026,9 @@ fn walk_table_like_clause<'a>(m: &'a ast::TableLikeClause, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_table_like_clause(m: *mut ast::TableLikeClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_table_like_clause<'a>(m: &'a mut ast::TableLikeClause, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
 }
@@ -3887,8 +4048,7 @@ fn walk_index_elem<'a>(m: &'a ast::IndexElem, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_index_elem(m: *mut ast::IndexElem, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_index_elem<'a>(m: &'a mut ast::IndexElem, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
@@ -3909,8 +4069,7 @@ fn walk_def_elem<'a>(m: &'a ast::DefElem, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_def_elem(m: *mut ast::DefElem, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_def_elem<'a>(m: &'a mut ast::DefElem, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.arg {
         out.slot(x);
     }
@@ -3922,8 +4081,7 @@ fn walk_locking_clause<'a>(m: &'a ast::LockingClause, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_locking_clause(m: *mut ast::LockingClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_locking_clause<'a>(m: &'a mut ast::LockingClause, out: &mut dyn MutVisitor<'a>) {
     for x in m.locked_rels.iter_mut().flatten() {
         out.slot(x);
     }
@@ -3939,13 +4097,12 @@ fn walk_xml_serialize<'a>(m: &'a ast::XmlSerialize, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_xml_serialize(m: *mut ast::XmlSerialize, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_xml_serialize<'a>(m: &'a mut ast::XmlSerialize, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
 }
@@ -3962,8 +4119,7 @@ fn walk_partition_elem<'a>(m: &'a ast::PartitionElem, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_partition_elem(m: *mut ast::PartitionElem, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_partition_elem<'a>(m: &'a mut ast::PartitionElem, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
@@ -3981,8 +4137,7 @@ fn walk_partition_spec<'a>(m: &'a ast::PartitionSpec, out: &mut dyn FnMut(NodeRe
     }
 }
 
-unsafe fn walk_mut_partition_spec(m: *mut ast::PartitionSpec, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_partition_spec<'a>(m: &'a mut ast::PartitionSpec, out: &mut dyn MutVisitor<'a>) {
     for x in m.part_params.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4000,8 +4155,10 @@ fn walk_partition_bound_spec<'a>(m: &'a ast::PartitionBoundSpec, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_partition_bound_spec(m: *mut ast::PartitionBoundSpec, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_partition_bound_spec<'a>(
+    m: &'a mut ast::PartitionBoundSpec,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.listdatums.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4022,11 +4179,10 @@ fn walk_partition_range_datum<'a>(
     }
 }
 
-unsafe fn walk_mut_partition_range_datum(
-    m: *mut ast::PartitionRangeDatum,
-    out: &mut dyn MutVisitor,
+fn walk_mut_partition_range_datum<'a>(
+    m: &'a mut ast::PartitionRangeDatum,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.value {
         out.slot(x);
     }
@@ -4043,14 +4199,13 @@ fn walk_partition_cmd<'a>(m: &'a ast::PartitionCmd, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_partition_cmd(m: *mut ast::PartitionCmd, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_partition_cmd<'a>(m: &'a mut ast::PartitionCmd, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.name {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.bound {
-        let x: &mut ast::PartitionBoundSpec = x;
+        let x: &'a mut ast::PartitionBoundSpec = x;
         out.node(NodeMut::PartitionBoundSpec(x));
     }
 }
@@ -4112,22 +4267,21 @@ fn walk_range_tbl_entry<'a>(m: &'a ast::RangeTblEntry, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_range_tbl_entry(m: *mut ast::RangeTblEntry, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_tbl_entry<'a>(m: &'a mut ast::RangeTblEntry, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
     if let Some(x) = &mut m.eref {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
     if let Some(x) = &mut m.tablesample {
-        let x: &mut ast::TableSampleClause = x;
+        let x: &'a mut ast::TableSampleClause = x;
         out.node(NodeMut::TableSampleClause(x));
     }
     if let Some(x) = &mut m.subquery {
-        let x: &mut ast::Query = x;
+        let x: &'a mut ast::Query = x;
         out.node(NodeMut::Query(x));
     }
     for x in m.joinaliasvars.iter_mut().flatten() {
@@ -4140,14 +4294,14 @@ unsafe fn walk_mut_range_tbl_entry(m: *mut ast::RangeTblEntry, out: &mut dyn Mut
         out.slot(x);
     }
     if let Some(x) = &mut m.join_using_alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
     for x in m.functions.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.tablefunc {
-        let x: &mut ast::TableFunc = x;
+        let x: &'a mut ast::TableFunc = x;
         out.node(NodeMut::TableFunc(x));
     }
     for x in m.values_lists.iter_mut().flatten() {
@@ -4172,8 +4326,10 @@ unsafe fn walk_mut_range_tbl_entry(m: *mut ast::RangeTblEntry, out: &mut dyn Mut
 
 fn walk_rte_permission_info<'a>(m: &'a ast::RtePermissionInfo, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_rte_permission_info(m: *mut ast::RtePermissionInfo, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_rte_permission_info<'a>(
+    m: &'a mut ast::RtePermissionInfo,
+    out: &mut dyn MutVisitor<'a>,
+) {
 }
 
 fn walk_range_tbl_function<'a>(m: &'a ast::RangeTblFunction, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -4194,8 +4350,7 @@ fn walk_range_tbl_function<'a>(m: &'a ast::RangeTblFunction, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_range_tbl_function(m: *mut ast::RangeTblFunction, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_range_tbl_function<'a>(m: &'a mut ast::RangeTblFunction, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.funcexpr {
         out.slot(x);
     }
@@ -4222,8 +4377,10 @@ fn walk_table_sample_clause<'a>(m: &'a ast::TableSampleClause, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_table_sample_clause(m: *mut ast::TableSampleClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_table_sample_clause<'a>(
+    m: &'a mut ast::TableSampleClause,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4238,8 +4395,7 @@ fn walk_with_check_option<'a>(m: &'a ast::WithCheckOption, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_with_check_option(m: *mut ast::WithCheckOption, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_with_check_option<'a>(m: &'a mut ast::WithCheckOption, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.qual {
         out.slot(x);
     }
@@ -4247,9 +4403,7 @@ unsafe fn walk_mut_with_check_option(m: *mut ast::WithCheckOption, out: &mut dyn
 
 fn walk_sort_group_clause<'a>(m: &'a ast::SortGroupClause, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_sort_group_clause(m: *mut ast::SortGroupClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_sort_group_clause<'a>(m: &'a mut ast::SortGroupClause, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_grouping_set<'a>(m: &'a ast::GroupingSet, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.content.iter().flatten() {
@@ -4257,8 +4411,7 @@ fn walk_grouping_set<'a>(m: &'a ast::GroupingSet, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_grouping_set(m: *mut ast::GroupingSet, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_grouping_set<'a>(m: &'a mut ast::GroupingSet, out: &mut dyn MutVisitor<'a>) {
     for x in m.content.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4279,8 +4432,7 @@ fn walk_window_clause<'a>(m: &'a ast::WindowClause, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_window_clause(m: *mut ast::WindowClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_window_clause<'a>(m: &'a mut ast::WindowClause, out: &mut dyn MutVisitor<'a>) {
     for x in m.partition_clause.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4297,9 +4449,7 @@ unsafe fn walk_mut_window_clause(m: *mut ast::WindowClause, out: &mut dyn MutVis
 
 fn walk_row_mark_clause<'a>(m: &'a ast::RowMarkClause, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_row_mark_clause(m: *mut ast::RowMarkClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_row_mark_clause<'a>(m: &'a mut ast::RowMarkClause, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_with_clause<'a>(m: &'a ast::WithClause, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.ctes.iter().flatten() {
@@ -4307,8 +4457,7 @@ fn walk_with_clause<'a>(m: &'a ast::WithClause, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_with_clause(m: *mut ast::WithClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_with_clause<'a>(m: &'a mut ast::WithClause, out: &mut dyn MutVisitor<'a>) {
     for x in m.ctes.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4323,8 +4472,7 @@ fn walk_infer_clause<'a>(m: &'a ast::InferClause, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_infer_clause(m: *mut ast::InferClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_infer_clause<'a>(m: &'a mut ast::InferClause, out: &mut dyn MutVisitor<'a>) {
     for x in m.index_elems.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4346,10 +4494,9 @@ fn walk_on_conflict_clause<'a>(m: &'a ast::OnConflictClause, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_on_conflict_clause(m: *mut ast::OnConflictClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_on_conflict_clause<'a>(m: &'a mut ast::OnConflictClause, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.infer {
-        let x: &mut ast::InferClause = x;
+        let x: &'a mut ast::InferClause = x;
         out.node(NodeMut::InferClause(x));
     }
     for x in m.target_list.iter_mut().flatten() {
@@ -4366,8 +4513,7 @@ fn walk_cte_search_clause<'a>(m: &'a ast::CteSearchClause, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_cte_search_clause(m: *mut ast::CteSearchClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_cte_search_clause<'a>(m: &'a mut ast::CteSearchClause, out: &mut dyn MutVisitor<'a>) {
     for x in m.search_col_list.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4385,8 +4531,7 @@ fn walk_cte_cycle_clause<'a>(m: &'a ast::CteCycleClause, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_cte_cycle_clause(m: *mut ast::CteCycleClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_cte_cycle_clause<'a>(m: &'a mut ast::CteCycleClause, out: &mut dyn MutVisitor<'a>) {
     for x in m.cycle_col_list.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4427,8 +4572,7 @@ fn walk_common_table_expr<'a>(m: &'a ast::CommonTableExpr, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_common_table_expr(m: *mut ast::CommonTableExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_common_table_expr<'a>(m: &'a mut ast::CommonTableExpr, out: &mut dyn MutVisitor<'a>) {
     for x in m.aliascolnames.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4436,11 +4580,11 @@ unsafe fn walk_mut_common_table_expr(m: *mut ast::CommonTableExpr, out: &mut dyn
         out.slot(x);
     }
     if let Some(x) = &mut m.search_clause {
-        let x: &mut ast::CteSearchClause = x;
+        let x: &'a mut ast::CteSearchClause = x;
         out.node(NodeMut::CteSearchClause(x));
     }
     if let Some(x) = &mut m.cycle_clause {
-        let x: &mut ast::CteCycleClause = x;
+        let x: &'a mut ast::CteCycleClause = x;
         out.node(NodeMut::CteCycleClause(x));
     }
     for x in m.ctecolnames.iter_mut().flatten() {
@@ -4469,8 +4613,7 @@ fn walk_merge_when_clause<'a>(m: &'a ast::MergeWhenClause, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_merge_when_clause(m: *mut ast::MergeWhenClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_merge_when_clause<'a>(m: &'a mut ast::MergeWhenClause, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.condition {
         out.slot(x);
     }
@@ -4484,9 +4627,7 @@ unsafe fn walk_mut_merge_when_clause(m: *mut ast::MergeWhenClause, out: &mut dyn
 
 fn walk_returning_option<'a>(m: &'a ast::ReturningOption, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_returning_option(m: *mut ast::ReturningOption, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_returning_option<'a>(m: &'a mut ast::ReturningOption, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_returning_clause<'a>(m: &'a ast::ReturningClause, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.options.iter().flatten() {
@@ -4497,8 +4638,7 @@ fn walk_returning_clause<'a>(m: &'a ast::ReturningClause, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_returning_clause(m: *mut ast::ReturningClause, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_returning_clause<'a>(m: &'a mut ast::ReturningClause, out: &mut dyn MutVisitor<'a>) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -4509,8 +4649,10 @@ unsafe fn walk_mut_returning_clause(m: *mut ast::ReturningClause, out: &mut dyn 
 
 fn walk_trigger_transition<'a>(m: &'a ast::TriggerTransition, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_trigger_transition(m: *mut ast::TriggerTransition, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_trigger_transition<'a>(
+    m: &'a mut ast::TriggerTransition,
+    out: &mut dyn MutVisitor<'a>,
+) {
 }
 
 fn walk_json_output<'a>(m: &'a ast::JsonOutput, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -4524,14 +4666,13 @@ fn walk_json_output<'a>(m: &'a ast::JsonOutput, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_json_output(m: *mut ast::JsonOutput, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_output<'a>(m: &'a mut ast::JsonOutput, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.returning {
-        let x: &mut ast::JsonReturning = x;
+        let x: &'a mut ast::JsonReturning = x;
         out.node(NodeMut::JsonReturning(x));
     }
 }
@@ -4543,10 +4684,9 @@ fn walk_json_argument<'a>(m: &'a ast::JsonArgument, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_json_argument(m: *mut ast::JsonArgument, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_argument<'a>(m: &'a mut ast::JsonArgument, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.val {
-        let x: &mut ast::JsonValueExpr = x;
+        let x: &'a mut ast::JsonValueExpr = x;
         out.node(NodeMut::JsonValueExpr(x));
     }
 }
@@ -4576,10 +4716,9 @@ fn walk_json_func_expr<'a>(m: &'a ast::JsonFuncExpr, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_json_func_expr(m: *mut ast::JsonFuncExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_func_expr<'a>(m: &'a mut ast::JsonFuncExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.context_item {
-        let x: &mut ast::JsonValueExpr = x;
+        let x: &'a mut ast::JsonValueExpr = x;
         out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.pathspec {
@@ -4589,15 +4728,15 @@ unsafe fn walk_mut_json_func_expr(m: *mut ast::JsonFuncExpr, out: &mut dyn MutVi
         out.slot(x);
     }
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
     if let Some(x) = &mut m.on_empty {
-        let x: &mut ast::JsonBehavior = x;
+        let x: &'a mut ast::JsonBehavior = x;
         out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.on_error {
-        let x: &mut ast::JsonBehavior = x;
+        let x: &'a mut ast::JsonBehavior = x;
         out.node(NodeMut::JsonBehavior(x));
     }
 }
@@ -4608,8 +4747,10 @@ fn walk_json_table_path_spec<'a>(m: &'a ast::JsonTablePathSpec, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_json_table_path_spec(m: *mut ast::JsonTablePathSpec, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_table_path_spec<'a>(
+    m: &'a mut ast::JsonTablePathSpec,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.string {
         out.slot(x);
     }
@@ -4640,14 +4781,13 @@ fn walk_json_table<'a>(m: &'a ast::JsonTable, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_json_table(m: *mut ast::JsonTable, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_table<'a>(m: &'a mut ast::JsonTable, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.context_item {
-        let x: &mut ast::JsonValueExpr = x;
+        let x: &'a mut ast::JsonValueExpr = x;
         out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.pathspec {
-        let x: &mut ast::JsonTablePathSpec = x;
+        let x: &'a mut ast::JsonTablePathSpec = x;
         out.node(NodeMut::JsonTablePathSpec(x));
     }
     for x in m.passing.iter_mut().flatten() {
@@ -4657,11 +4797,11 @@ unsafe fn walk_mut_json_table(m: *mut ast::JsonTable, out: &mut dyn MutVisitor) 
         out.slot(x);
     }
     if let Some(x) = &mut m.on_error {
-        let x: &mut ast::JsonBehavior = x;
+        let x: &'a mut ast::JsonBehavior = x;
         out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.alias {
-        let x: &mut ast::Alias = x;
+        let x: &'a mut ast::Alias = x;
         out.node(NodeMut::Alias(x));
     }
 }
@@ -4692,29 +4832,28 @@ fn walk_json_table_column<'a>(m: &'a ast::JsonTableColumn, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_json_table_column(m: *mut ast::JsonTableColumn, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_table_column<'a>(m: &'a mut ast::JsonTableColumn, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.pathspec {
-        let x: &mut ast::JsonTablePathSpec = x;
+        let x: &'a mut ast::JsonTablePathSpec = x;
         out.node(NodeMut::JsonTablePathSpec(x));
     }
     if let Some(x) = &mut m.format {
-        let x: &mut ast::JsonFormat = x;
+        let x: &'a mut ast::JsonFormat = x;
         out.node(NodeMut::JsonFormat(x));
     }
     for x in m.columns.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.on_empty {
-        let x: &mut ast::JsonBehavior = x;
+        let x: &'a mut ast::JsonBehavior = x;
         out.node(NodeMut::JsonBehavior(x));
     }
     if let Some(x) = &mut m.on_error {
-        let x: &mut ast::JsonBehavior = x;
+        let x: &'a mut ast::JsonBehavior = x;
         out.node(NodeMut::JsonBehavior(x));
     }
 }
@@ -4729,13 +4868,12 @@ fn walk_json_key_value<'a>(m: &'a ast::JsonKeyValue, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_json_key_value(m: *mut ast::JsonKeyValue, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_key_value<'a>(m: &'a mut ast::JsonKeyValue, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.key {
         out.slot(x);
     }
     if let Some(x) = &mut m.value {
-        let x: &mut ast::JsonValueExpr = x;
+        let x: &'a mut ast::JsonValueExpr = x;
         out.node(NodeMut::JsonValueExpr(x));
     }
 }
@@ -4751,14 +4889,13 @@ fn walk_json_parse_expr<'a>(m: &'a ast::JsonParseExpr, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_json_parse_expr(m: *mut ast::JsonParseExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_parse_expr<'a>(m: &'a mut ast::JsonParseExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
-        let x: &mut ast::JsonValueExpr = x;
+        let x: &'a mut ast::JsonValueExpr = x;
         out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
 }
@@ -4773,13 +4910,12 @@ fn walk_json_scalar_expr<'a>(m: &'a ast::JsonScalarExpr, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_json_scalar_expr(m: *mut ast::JsonScalarExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_scalar_expr<'a>(m: &'a mut ast::JsonScalarExpr, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
 }
@@ -4795,14 +4931,16 @@ fn walk_json_serialize_expr<'a>(m: &'a ast::JsonSerializeExpr, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_json_serialize_expr(m: *mut ast::JsonSerializeExpr, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_serialize_expr<'a>(
+    m: &'a mut ast::JsonSerializeExpr,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.expr {
-        let x: &mut ast::JsonValueExpr = x;
+        let x: &'a mut ast::JsonValueExpr = x;
         out.node(NodeMut::JsonValueExpr(x));
     }
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
 }
@@ -4820,16 +4958,15 @@ fn walk_json_object_constructor<'a>(
     }
 }
 
-unsafe fn walk_mut_json_object_constructor(
-    m: *mut ast::JsonObjectConstructor,
-    out: &mut dyn MutVisitor,
+fn walk_mut_json_object_constructor<'a>(
+    m: &'a mut ast::JsonObjectConstructor,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.exprs.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
 }
@@ -4847,16 +4984,15 @@ fn walk_json_array_constructor<'a>(
     }
 }
 
-unsafe fn walk_mut_json_array_constructor(
-    m: *mut ast::JsonArrayConstructor,
-    out: &mut dyn MutVisitor,
+fn walk_mut_json_array_constructor<'a>(
+    m: &'a mut ast::JsonArrayConstructor,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.exprs.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
 }
@@ -4878,20 +5014,19 @@ fn walk_json_array_query_constructor<'a>(
     }
 }
 
-unsafe fn walk_mut_json_array_query_constructor(
-    m: *mut ast::JsonArrayQueryConstructor,
-    out: &mut dyn MutVisitor,
+fn walk_mut_json_array_query_constructor<'a>(
+    m: &'a mut ast::JsonArrayQueryConstructor,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.query {
         out.slot(x);
     }
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
     if let Some(x) = &mut m.format {
-        let x: &mut ast::JsonFormat = x;
+        let x: &'a mut ast::JsonFormat = x;
         out.node(NodeMut::JsonFormat(x));
     }
 }
@@ -4913,10 +5048,12 @@ fn walk_json_agg_constructor<'a>(m: &'a ast::JsonAggConstructor, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_json_agg_constructor(m: *mut ast::JsonAggConstructor, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_agg_constructor<'a>(
+    m: &'a mut ast::JsonAggConstructor,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.output {
-        let x: &mut ast::JsonOutput = x;
+        let x: &'a mut ast::JsonOutput = x;
         out.node(NodeMut::JsonOutput(x));
     }
     if let Some(x) = &mut m.agg_filter {
@@ -4926,7 +5063,7 @@ unsafe fn walk_mut_json_agg_constructor(m: *mut ast::JsonAggConstructor, out: &m
         out.slot(x);
     }
     if let Some(x) = &mut m.over {
-        let x: &mut ast::WindowDef = x;
+        let x: &'a mut ast::WindowDef = x;
         out.node(NodeMut::WindowDef(x));
     }
 }
@@ -4942,14 +5079,13 @@ fn walk_json_object_agg<'a>(m: &'a ast::JsonObjectAgg, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_json_object_agg(m: *mut ast::JsonObjectAgg, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_object_agg<'a>(m: &'a mut ast::JsonObjectAgg, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.constructor {
-        let x: &mut ast::JsonAggConstructor = x;
+        let x: &'a mut ast::JsonAggConstructor = x;
         out.node(NodeMut::JsonAggConstructor(x));
     }
     if let Some(x) = &mut m.arg {
-        let x: &mut ast::JsonKeyValue = x;
+        let x: &'a mut ast::JsonKeyValue = x;
         out.node(NodeMut::JsonKeyValue(x));
     }
 }
@@ -4965,14 +5101,13 @@ fn walk_json_array_agg<'a>(m: &'a ast::JsonArrayAgg, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_json_array_agg(m: *mut ast::JsonArrayAgg, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_json_array_agg<'a>(m: &'a mut ast::JsonArrayAgg, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.constructor {
-        let x: &mut ast::JsonAggConstructor = x;
+        let x: &'a mut ast::JsonAggConstructor = x;
         out.node(NodeMut::JsonAggConstructor(x));
     }
     if let Some(x) = &mut m.arg {
-        let x: &mut ast::JsonValueExpr = x;
+        let x: &'a mut ast::JsonValueExpr = x;
         out.node(NodeMut::JsonValueExpr(x));
     }
 }
@@ -4983,8 +5118,7 @@ fn walk_raw_stmt<'a>(m: &'a ast::RawStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_raw_stmt(m: *mut ast::RawStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_raw_stmt<'a>(m: &'a mut ast::RawStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.stmt {
         out.slot(x);
     }
@@ -5015,10 +5149,9 @@ fn walk_insert_stmt<'a>(m: &'a ast::InsertStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_insert_stmt(m: *mut ast::InsertStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_insert_stmt<'a>(m: &'a mut ast::InsertStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.cols.iter_mut().flatten() {
@@ -5028,15 +5161,15 @@ unsafe fn walk_mut_insert_stmt(m: *mut ast::InsertStmt, out: &mut dyn MutVisitor
         out.slot(x);
     }
     if let Some(x) = &mut m.on_conflict_clause {
-        let x: &mut ast::OnConflictClause = x;
+        let x: &'a mut ast::OnConflictClause = x;
         out.node(NodeMut::OnConflictClause(x));
     }
     if let Some(x) = &mut m.returning_clause {
-        let x: &mut ast::ReturningClause = x;
+        let x: &'a mut ast::ReturningClause = x;
         out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
-        let x: &mut ast::WithClause = x;
+        let x: &'a mut ast::WithClause = x;
         out.node(NodeMut::WithClause(x));
     }
 }
@@ -5062,10 +5195,9 @@ fn walk_delete_stmt<'a>(m: &'a ast::DeleteStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_delete_stmt(m: *mut ast::DeleteStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_delete_stmt<'a>(m: &'a mut ast::DeleteStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.using_clause.iter_mut().flatten() {
@@ -5075,11 +5207,11 @@ unsafe fn walk_mut_delete_stmt(m: *mut ast::DeleteStmt, out: &mut dyn MutVisitor
         out.slot(x);
     }
     if let Some(x) = &mut m.returning_clause {
-        let x: &mut ast::ReturningClause = x;
+        let x: &'a mut ast::ReturningClause = x;
         out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
-        let x: &mut ast::WithClause = x;
+        let x: &'a mut ast::WithClause = x;
         out.node(NodeMut::WithClause(x));
     }
 }
@@ -5108,10 +5240,9 @@ fn walk_update_stmt<'a>(m: &'a ast::UpdateStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_update_stmt(m: *mut ast::UpdateStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_update_stmt<'a>(m: &'a mut ast::UpdateStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.target_list.iter_mut().flatten() {
@@ -5124,11 +5255,11 @@ unsafe fn walk_mut_update_stmt(m: *mut ast::UpdateStmt, out: &mut dyn MutVisitor
         out.slot(x);
     }
     if let Some(x) = &mut m.returning_clause {
-        let x: &mut ast::ReturningClause = x;
+        let x: &'a mut ast::ReturningClause = x;
         out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
-        let x: &mut ast::WithClause = x;
+        let x: &'a mut ast::WithClause = x;
         out.node(NodeMut::WithClause(x));
     }
 }
@@ -5157,10 +5288,9 @@ fn walk_merge_stmt<'a>(m: &'a ast::MergeStmt, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_merge_stmt(m: *mut ast::MergeStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_merge_stmt<'a>(m: &'a mut ast::MergeStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.source_relation {
@@ -5173,11 +5303,11 @@ unsafe fn walk_mut_merge_stmt(m: *mut ast::MergeStmt, out: &mut dyn MutVisitor) 
         out.slot(x);
     }
     if let Some(x) = &mut m.returning_clause {
-        let x: &mut ast::ReturningClause = x;
+        let x: &'a mut ast::ReturningClause = x;
         out.node(NodeMut::ReturningClause(x));
     }
     if let Some(x) = &mut m.with_clause {
-        let x: &mut ast::WithClause = x;
+        let x: &'a mut ast::WithClause = x;
         out.node(NodeMut::WithClause(x));
     }
 }
@@ -5237,13 +5367,12 @@ fn walk_select_stmt<'a>(m: &'a ast::SelectStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_select_stmt(m: *mut ast::SelectStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_select_stmt<'a>(m: &'a mut ast::SelectStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.distinct_clause.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.into_clause {
-        let x: &mut ast::IntoClause = x;
+        let x: &'a mut ast::IntoClause = x;
         out.node(NodeMut::IntoClause(x));
     }
     for x in m.target_list.iter_mut().flatten() {
@@ -5280,15 +5409,15 @@ unsafe fn walk_mut_select_stmt(m: *mut ast::SelectStmt, out: &mut dyn MutVisitor
         out.slot(x);
     }
     if let Some(x) = &mut m.with_clause {
-        let x: &mut ast::WithClause = x;
+        let x: &'a mut ast::WithClause = x;
         out.node(NodeMut::WithClause(x));
     }
     if let Some(x) = &mut m.larg {
-        let x: &mut ast::SelectStmt = x;
+        let x: &'a mut ast::SelectStmt = x;
         out.node(NodeMut::SelectStmt(x));
     }
     if let Some(x) = &mut m.rarg {
-        let x: &mut ast::SelectStmt = x;
+        let x: &'a mut ast::SelectStmt = x;
         out.node(NodeMut::SelectStmt(x));
     }
 }
@@ -5314,8 +5443,7 @@ fn walk_set_operation_stmt<'a>(m: &'a ast::SetOperationStmt, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_set_operation_stmt(m: *mut ast::SetOperationStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_set_operation_stmt<'a>(m: &'a mut ast::SetOperationStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.larg {
         out.slot(x);
     }
@@ -5342,8 +5470,7 @@ fn walk_return_stmt<'a>(m: &'a ast::ReturnStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_return_stmt(m: *mut ast::ReturnStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_return_stmt<'a>(m: &'a mut ast::ReturnStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.returnval {
         out.slot(x);
     }
@@ -5359,13 +5486,12 @@ fn walk_pl_assign_stmt<'a>(m: &'a ast::PlAssignStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_pl_assign_stmt(m: *mut ast::PlAssignStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_pl_assign_stmt<'a>(m: &'a mut ast::PlAssignStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.indirection.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.val {
-        let x: &mut ast::SelectStmt = x;
+        let x: &'a mut ast::SelectStmt = x;
         out.node(NodeMut::SelectStmt(x));
     }
 }
@@ -5380,10 +5506,9 @@ fn walk_create_schema_stmt<'a>(m: &'a ast::CreateSchemaStmt, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_create_schema_stmt(m: *mut ast::CreateSchemaStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_schema_stmt<'a>(m: &'a mut ast::CreateSchemaStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.authrole {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
     for x in m.schema_elts.iter_mut().flatten() {
@@ -5401,10 +5526,9 @@ fn walk_alter_table_stmt<'a>(m: &'a ast::AlterTableStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_alter_table_stmt(m: *mut ast::AlterTableStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_table_stmt<'a>(m: &'a mut ast::AlterTableStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.cmds.iter_mut().flatten() {
@@ -5422,10 +5546,9 @@ fn walk_alter_table_cmd<'a>(m: &'a ast::AlterTableCmd, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_alter_table_cmd(m: *mut ast::AlterTableCmd, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_table_cmd<'a>(m: &'a mut ast::AlterTableCmd, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.newowner {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
     if let Some(x) = &mut m.def {
@@ -5435,8 +5558,10 @@ unsafe fn walk_mut_alter_table_cmd(m: *mut ast::AlterTableCmd, out: &mut dyn Mut
 
 fn walk_at_alter_constraint<'a>(m: &'a ast::AtAlterConstraint, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_at_alter_constraint(m: *mut ast::AtAlterConstraint, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_at_alter_constraint<'a>(
+    m: &'a mut ast::AtAlterConstraint,
+    out: &mut dyn MutVisitor<'a>,
+) {
 }
 
 fn walk_replica_identity_stmt<'a>(
@@ -5445,11 +5570,10 @@ fn walk_replica_identity_stmt<'a>(
 ) {
 }
 
-unsafe fn walk_mut_replica_identity_stmt(
-    m: *mut ast::ReplicaIdentityStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_replica_identity_stmt<'a>(
+    m: &'a mut ast::ReplicaIdentityStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
 }
 
 fn walk_alter_collation_stmt<'a>(m: &'a ast::AlterCollationStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -5458,8 +5582,10 @@ fn walk_alter_collation_stmt<'a>(m: &'a ast::AlterCollationStmt, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_alter_collation_stmt(m: *mut ast::AlterCollationStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_collation_stmt<'a>(
+    m: &'a mut ast::AlterCollationStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.collname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5474,8 +5600,7 @@ fn walk_alter_domain_stmt<'a>(m: &'a ast::AlterDomainStmt, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_alter_domain_stmt(m: *mut ast::AlterDomainStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_domain_stmt<'a>(m: &'a mut ast::AlterDomainStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.type_name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5500,8 +5625,7 @@ fn walk_grant_stmt<'a>(m: &'a ast::GrantStmt, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_grant_stmt(m: *mut ast::GrantStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_grant_stmt<'a>(m: &'a mut ast::GrantStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.objects.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5512,7 +5636,7 @@ unsafe fn walk_mut_grant_stmt(m: *mut ast::GrantStmt, out: &mut dyn MutVisitor) 
         out.slot(x);
     }
     if let Some(x) = &mut m.grantor {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
 }
@@ -5529,8 +5653,7 @@ fn walk_object_with_args<'a>(m: &'a ast::ObjectWithArgs, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_object_with_args(m: *mut ast::ObjectWithArgs, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_object_with_args<'a>(m: &'a mut ast::ObjectWithArgs, out: &mut dyn MutVisitor<'a>) {
     for x in m.objname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5548,8 +5671,7 @@ fn walk_access_priv<'a>(m: &'a ast::AccessPriv, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_access_priv(m: *mut ast::AccessPriv, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_access_priv<'a>(m: &'a mut ast::AccessPriv, out: &mut dyn MutVisitor<'a>) {
     for x in m.cols.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5571,8 +5693,7 @@ fn walk_grant_role_stmt<'a>(m: &'a ast::GrantRoleStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_grant_role_stmt(m: *mut ast::GrantRoleStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_grant_role_stmt<'a>(m: &'a mut ast::GrantRoleStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.granted_roles.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5583,7 +5704,7 @@ unsafe fn walk_mut_grant_role_stmt(m: *mut ast::GrantRoleStmt, out: &mut dyn Mut
         out.slot(x);
     }
     if let Some(x) = &mut m.grantor {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
 }
@@ -5601,16 +5722,15 @@ fn walk_alter_default_privileges_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_default_privileges_stmt(
-    m: *mut ast::AlterDefaultPrivilegesStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_default_privileges_stmt<'a>(
+    m: &'a mut ast::AlterDefaultPrivilegesStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.action {
-        let x: &mut ast::GrantStmt = x;
+        let x: &'a mut ast::GrantStmt = x;
         out.node(NodeMut::GrantStmt(x));
     }
 }
@@ -5634,10 +5754,9 @@ fn walk_copy_stmt<'a>(m: &'a ast::CopyStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_copy_stmt(m: *mut ast::CopyStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_copy_stmt<'a>(m: &'a mut ast::CopyStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.query {
@@ -5660,8 +5779,7 @@ fn walk_variable_set_stmt<'a>(m: &'a ast::VariableSetStmt, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_variable_set_stmt(m: *mut ast::VariableSetStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_variable_set_stmt<'a>(m: &'a mut ast::VariableSetStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5669,8 +5787,7 @@ unsafe fn walk_mut_variable_set_stmt(m: *mut ast::VariableSetStmt, out: &mut dyn
 
 fn walk_variable_show_stmt<'a>(m: &'a ast::VariableShowStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_variable_show_stmt(m: *mut ast::VariableShowStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_variable_show_stmt<'a>(m: &'a mut ast::VariableShowStmt, out: &mut dyn MutVisitor<'a>) {
 }
 
 fn walk_create_stmt<'a>(m: &'a ast::CreateStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -5707,10 +5824,9 @@ fn walk_create_stmt<'a>(m: &'a ast::CreateStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_create_stmt(m: *mut ast::CreateStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_stmt<'a>(m: &'a mut ast::CreateStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.table_elts.iter_mut().flatten() {
@@ -5720,15 +5836,15 @@ unsafe fn walk_mut_create_stmt(m: *mut ast::CreateStmt, out: &mut dyn MutVisitor
         out.slot(x);
     }
     if let Some(x) = &mut m.partbound {
-        let x: &mut ast::PartitionBoundSpec = x;
+        let x: &'a mut ast::PartitionBoundSpec = x;
         out.node(NodeMut::PartitionBoundSpec(x));
     }
     if let Some(x) = &mut m.partspec {
-        let x: &mut ast::PartitionSpec = x;
+        let x: &'a mut ast::PartitionSpec = x;
         out.node(NodeMut::PartitionSpec(x));
     }
     if let Some(x) = &mut m.of_typename {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     for x in m.constraints.iter_mut().flatten() {
@@ -5779,8 +5895,7 @@ fn walk_constraint<'a>(m: &'a ast::Constraint, out: &mut dyn FnMut(NodeRef<'a>))
     }
 }
 
-unsafe fn walk_mut_constraint(m: *mut ast::Constraint, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_constraint<'a>(m: &'a mut ast::Constraint, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.raw_expr {
         out.slot(x);
     }
@@ -5800,7 +5915,7 @@ unsafe fn walk_mut_constraint(m: *mut ast::Constraint, out: &mut dyn MutVisitor)
         out.slot(x);
     }
     if let Some(x) = &mut m.pktable {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.fk_attrs.iter_mut().flatten() {
@@ -5830,13 +5945,12 @@ fn walk_create_table_space_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_table_space_stmt(
-    m: *mut ast::CreateTableSpaceStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_table_space_stmt<'a>(
+    m: &'a mut ast::CreateTableSpaceStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.owner {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -5850,11 +5964,10 @@ fn walk_drop_table_space_stmt<'a>(
 ) {
 }
 
-unsafe fn walk_mut_drop_table_space_stmt(
-    m: *mut ast::DropTableSpaceStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_drop_table_space_stmt<'a>(
+    m: &'a mut ast::DropTableSpaceStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
 }
 
 fn walk_alter_table_space_options_stmt<'a>(
@@ -5866,11 +5979,10 @@ fn walk_alter_table_space_options_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_table_space_options_stmt(
-    m: *mut ast::AlterTableSpaceOptionsStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_table_space_options_stmt<'a>(
+    m: &'a mut ast::AlterTableSpaceOptionsStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5885,11 +5997,10 @@ fn walk_alter_table_move_all_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_table_move_all_stmt(
-    m: *mut ast::AlterTableMoveAllStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_table_move_all_stmt<'a>(
+    m: &'a mut ast::AlterTableMoveAllStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.roles.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5904,11 +6015,10 @@ fn walk_create_extension_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_extension_stmt(
-    m: *mut ast::CreateExtensionStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_extension_stmt<'a>(
+    m: &'a mut ast::CreateExtensionStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5920,8 +6030,10 @@ fn walk_alter_extension_stmt<'a>(m: &'a ast::AlterExtensionStmt, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_alter_extension_stmt(m: *mut ast::AlterExtensionStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_extension_stmt<'a>(
+    m: &'a mut ast::AlterExtensionStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5936,11 +6048,10 @@ fn walk_alter_extension_contents_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_extension_contents_stmt(
-    m: *mut ast::AlterExtensionContentsStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_extension_contents_stmt<'a>(
+    m: &'a mut ast::AlterExtensionContentsStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.object {
         out.slot(x);
     }
@@ -5955,8 +6066,7 @@ fn walk_create_fdw_stmt<'a>(m: &'a ast::CreateFdwStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_create_fdw_stmt(m: *mut ast::CreateFdwStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_fdw_stmt<'a>(m: &'a mut ast::CreateFdwStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.func_options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5974,8 +6084,7 @@ fn walk_alter_fdw_stmt<'a>(m: &'a ast::AlterFdwStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_alter_fdw_stmt(m: *mut ast::AlterFdwStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_fdw_stmt<'a>(m: &'a mut ast::AlterFdwStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.func_options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -5993,11 +6102,10 @@ fn walk_create_foreign_server_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_foreign_server_stmt(
-    m: *mut ast::CreateForeignServerStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_foreign_server_stmt<'a>(
+    m: &'a mut ast::CreateForeignServerStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6012,11 +6120,10 @@ fn walk_alter_foreign_server_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_foreign_server_stmt(
-    m: *mut ast::AlterForeignServerStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_foreign_server_stmt<'a>(
+    m: &'a mut ast::AlterForeignServerStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6036,14 +6143,13 @@ fn walk_create_foreign_table_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_foreign_table_stmt(
-    m: *mut ast::CreateForeignTableStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_foreign_table_stmt<'a>(
+    m: &'a mut ast::CreateForeignTableStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     {
         let x = &mut m.base_stmt;
-        let x: &mut ast::CreateStmt = x;
+        let x: &'a mut ast::CreateStmt = x;
         out.node(NodeMut::CreateStmt(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -6064,13 +6170,12 @@ fn walk_create_user_mapping_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_user_mapping_stmt(
-    m: *mut ast::CreateUserMappingStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_user_mapping_stmt<'a>(
+    m: &'a mut ast::CreateUserMappingStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.user {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -6091,13 +6196,12 @@ fn walk_alter_user_mapping_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_user_mapping_stmt(
-    m: *mut ast::AlterUserMappingStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_user_mapping_stmt<'a>(
+    m: &'a mut ast::AlterUserMappingStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.user {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -6115,13 +6219,12 @@ fn walk_drop_user_mapping_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_drop_user_mapping_stmt(
-    m: *mut ast::DropUserMappingStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_drop_user_mapping_stmt<'a>(
+    m: &'a mut ast::DropUserMappingStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.user {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
 }
@@ -6138,11 +6241,10 @@ fn walk_import_foreign_schema_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_import_foreign_schema_stmt(
-    m: *mut ast::ImportForeignSchemaStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_import_foreign_schema_stmt<'a>(
+    m: &'a mut ast::ImportForeignSchemaStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.table_list.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6167,10 +6269,9 @@ fn walk_create_policy_stmt<'a>(m: &'a ast::CreatePolicyStmt, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_create_policy_stmt(m: *mut ast::CreatePolicyStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_policy_stmt<'a>(m: &'a mut ast::CreatePolicyStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.table {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.roles.iter_mut().flatten() {
@@ -6200,10 +6301,9 @@ fn walk_alter_policy_stmt<'a>(m: &'a ast::AlterPolicyStmt, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_alter_policy_stmt(m: *mut ast::AlterPolicyStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_policy_stmt<'a>(m: &'a mut ast::AlterPolicyStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.table {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.roles.iter_mut().flatten() {
@@ -6223,8 +6323,7 @@ fn walk_create_am_stmt<'a>(m: &'a ast::CreateAmStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_create_am_stmt(m: *mut ast::CreateAmStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_am_stmt<'a>(m: &'a mut ast::CreateAmStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.handler_name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6256,10 +6355,9 @@ fn walk_create_trig_stmt<'a>(m: &'a ast::CreateTrigStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_create_trig_stmt(m: *mut ast::CreateTrigStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_trig_stmt<'a>(m: &'a mut ast::CreateTrigStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.funcname.iter_mut().flatten() {
@@ -6278,7 +6376,7 @@ unsafe fn walk_mut_create_trig_stmt(m: *mut ast::CreateTrigStmt, out: &mut dyn M
         out.slot(x);
     }
     if let Some(x) = &mut m.constrrel {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
 }
@@ -6295,11 +6393,10 @@ fn walk_create_event_trig_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_event_trig_stmt(
-    m: *mut ast::CreateEventTrigStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_event_trig_stmt<'a>(
+    m: &'a mut ast::CreateEventTrigStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.whenclause.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6314,11 +6411,10 @@ fn walk_alter_event_trig_stmt<'a>(
 ) {
 }
 
-unsafe fn walk_mut_alter_event_trig_stmt(
-    m: *mut ast::AlterEventTrigStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_event_trig_stmt<'a>(
+    m: &'a mut ast::AlterEventTrigStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
 }
 
 fn walk_create_p_lang_stmt<'a>(m: &'a ast::CreatePLangStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
@@ -6333,8 +6429,7 @@ fn walk_create_p_lang_stmt<'a>(m: &'a ast::CreatePLangStmt, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_create_p_lang_stmt(m: *mut ast::CreatePLangStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_p_lang_stmt<'a>(m: &'a mut ast::CreatePLangStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.plhandler.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6352,8 +6447,7 @@ fn walk_create_role_stmt<'a>(m: &'a ast::CreateRoleStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_create_role_stmt(m: *mut ast::CreateRoleStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_role_stmt<'a>(m: &'a mut ast::CreateRoleStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6369,10 +6463,9 @@ fn walk_alter_role_stmt<'a>(m: &'a ast::AlterRoleStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_alter_role_stmt(m: *mut ast::AlterRoleStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_role_stmt<'a>(m: &'a mut ast::AlterRoleStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.role {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -6391,14 +6484,16 @@ fn walk_alter_role_set_stmt<'a>(m: &'a ast::AlterRoleSetStmt, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_alter_role_set_stmt(m: *mut ast::AlterRoleSetStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_role_set_stmt<'a>(
+    m: &'a mut ast::AlterRoleSetStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.role {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
     if let Some(x) = &mut m.setstmt {
-        let x: &mut ast::VariableSetStmt = x;
+        let x: &'a mut ast::VariableSetStmt = x;
         out.node(NodeMut::VariableSetStmt(x));
     }
 }
@@ -6409,8 +6504,7 @@ fn walk_drop_role_stmt<'a>(m: &'a ast::DropRoleStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_drop_role_stmt(m: *mut ast::DropRoleStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_drop_role_stmt<'a>(m: &'a mut ast::DropRoleStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.roles.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6426,10 +6520,9 @@ fn walk_create_seq_stmt<'a>(m: &'a ast::CreateSeqStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_create_seq_stmt(m: *mut ast::CreateSeqStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_seq_stmt<'a>(m: &'a mut ast::CreateSeqStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.sequence {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -6447,10 +6540,9 @@ fn walk_alter_seq_stmt<'a>(m: &'a ast::AlterSeqStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_alter_seq_stmt(m: *mut ast::AlterSeqStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_seq_stmt<'a>(m: &'a mut ast::AlterSeqStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.sequence {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -6470,8 +6562,7 @@ fn walk_define_stmt<'a>(m: &'a ast::DefineStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_define_stmt(m: *mut ast::DefineStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_define_stmt<'a>(m: &'a mut ast::DefineStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.defnames.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6500,17 +6591,16 @@ fn walk_create_domain_stmt<'a>(m: &'a ast::CreateDomainStmt, out: &mut dyn FnMut
     }
 }
 
-unsafe fn walk_mut_create_domain_stmt(m: *mut ast::CreateDomainStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_domain_stmt<'a>(m: &'a mut ast::CreateDomainStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.domainname.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.coll_clause {
-        let x: &mut ast::CollateClause = x;
+        let x: &'a mut ast::CollateClause = x;
         out.node(NodeMut::CollateClause(x));
     }
     for x in m.constraints.iter_mut().flatten() {
@@ -6534,8 +6624,10 @@ fn walk_create_op_class_stmt<'a>(m: &'a ast::CreateOpClassStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_create_op_class_stmt(m: *mut ast::CreateOpClassStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_op_class_stmt<'a>(
+    m: &'a mut ast::CreateOpClassStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.opclassname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6543,7 +6635,7 @@ unsafe fn walk_mut_create_op_class_stmt(m: *mut ast::CreateOpClassStmt, out: &mu
         out.slot(x);
     }
     if let Some(x) = &mut m.datatype {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     for x in m.items.iter_mut().flatten() {
@@ -6568,10 +6660,12 @@ fn walk_create_op_class_item<'a>(m: &'a ast::CreateOpClassItem, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_create_op_class_item(m: *mut ast::CreateOpClassItem, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_op_class_item<'a>(
+    m: &'a mut ast::CreateOpClassItem,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.name {
-        let x: &mut ast::ObjectWithArgs = x;
+        let x: &'a mut ast::ObjectWithArgs = x;
         out.node(NodeMut::ObjectWithArgs(x));
     }
     for x in m.order_family.iter_mut().flatten() {
@@ -6581,7 +6675,7 @@ unsafe fn walk_mut_create_op_class_item(m: *mut ast::CreateOpClassItem, out: &mu
         out.slot(x);
     }
     if let Some(x) = &mut m.storedtype {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
 }
@@ -6595,11 +6689,10 @@ fn walk_create_op_family_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_op_family_stmt(
-    m: *mut ast::CreateOpFamilyStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_op_family_stmt<'a>(
+    m: &'a mut ast::CreateOpFamilyStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.opfamilyname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6614,8 +6707,10 @@ fn walk_alter_op_family_stmt<'a>(m: &'a ast::AlterOpFamilyStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_alter_op_family_stmt(m: *mut ast::AlterOpFamilyStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_op_family_stmt<'a>(
+    m: &'a mut ast::AlterOpFamilyStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.opfamilyname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6630,8 +6725,7 @@ fn walk_drop_stmt<'a>(m: &'a ast::DropStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_drop_stmt(m: *mut ast::DropStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_drop_stmt<'a>(m: &'a mut ast::DropStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.objects.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6643,8 +6737,7 @@ fn walk_truncate_stmt<'a>(m: &'a ast::TruncateStmt, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_truncate_stmt(m: *mut ast::TruncateStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_truncate_stmt<'a>(m: &'a mut ast::TruncateStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.relations.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6656,8 +6749,7 @@ fn walk_comment_stmt<'a>(m: &'a ast::CommentStmt, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_comment_stmt(m: *mut ast::CommentStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_comment_stmt<'a>(m: &'a mut ast::CommentStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.object {
         out.slot(x);
     }
@@ -6669,8 +6761,7 @@ fn walk_sec_label_stmt<'a>(m: &'a ast::SecLabelStmt, out: &mut dyn FnMut(NodeRef
     }
 }
 
-unsafe fn walk_mut_sec_label_stmt(m: *mut ast::SecLabelStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_sec_label_stmt<'a>(m: &'a mut ast::SecLabelStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.object {
         out.slot(x);
     }
@@ -6682,8 +6773,10 @@ fn walk_declare_cursor_stmt<'a>(m: &'a ast::DeclareCursorStmt, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_declare_cursor_stmt(m: *mut ast::DeclareCursorStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_declare_cursor_stmt<'a>(
+    m: &'a mut ast::DeclareCursorStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.query {
         out.slot(x);
     }
@@ -6691,15 +6784,11 @@ unsafe fn walk_mut_declare_cursor_stmt(m: *mut ast::DeclareCursorStmt, out: &mut
 
 fn walk_close_portal_stmt<'a>(m: &'a ast::ClosePortalStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_close_portal_stmt(m: *mut ast::ClosePortalStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_close_portal_stmt<'a>(m: &'a mut ast::ClosePortalStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_fetch_stmt<'a>(m: &'a ast::FetchStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_fetch_stmt(m: *mut ast::FetchStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_fetch_stmt<'a>(m: &'a mut ast::FetchStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_index_stmt<'a>(m: &'a ast::IndexStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.relation {
@@ -6723,10 +6812,9 @@ fn walk_index_stmt<'a>(m: &'a ast::IndexStmt, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_index_stmt(m: *mut ast::IndexStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_index_stmt<'a>(m: &'a mut ast::IndexStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.index_params.iter_mut().flatten() {
@@ -6761,8 +6849,7 @@ fn walk_create_stats_stmt<'a>(m: &'a ast::CreateStatsStmt, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_create_stats_stmt(m: *mut ast::CreateStatsStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_stats_stmt<'a>(m: &'a mut ast::CreateStatsStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.defnames.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6783,8 +6870,7 @@ fn walk_stats_elem<'a>(m: &'a ast::StatsElem, out: &mut dyn FnMut(NodeRef<'a>)) 
     }
 }
 
-unsafe fn walk_mut_stats_elem(m: *mut ast::StatsElem, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_stats_elem<'a>(m: &'a mut ast::StatsElem, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.expr {
         out.slot(x);
     }
@@ -6799,8 +6885,7 @@ fn walk_alter_stats_stmt<'a>(m: &'a ast::AlterStatsStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_alter_stats_stmt(m: *mut ast::AlterStatsStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_stats_stmt<'a>(m: &'a mut ast::AlterStatsStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.defnames.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6828,8 +6913,10 @@ fn walk_create_function_stmt<'a>(m: &'a ast::CreateFunctionStmt, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_create_function_stmt(m: *mut ast::CreateFunctionStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_function_stmt<'a>(
+    m: &'a mut ast::CreateFunctionStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.funcname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6837,7 +6924,7 @@ unsafe fn walk_mut_create_function_stmt(m: *mut ast::CreateFunctionStmt, out: &m
         out.slot(x);
     }
     if let Some(x) = &mut m.return_type {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -6858,10 +6945,12 @@ fn walk_function_parameter<'a>(m: &'a ast::FunctionParameter, out: &mut dyn FnMu
     }
 }
 
-unsafe fn walk_mut_function_parameter(m: *mut ast::FunctionParameter, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_function_parameter<'a>(
+    m: &'a mut ast::FunctionParameter,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.arg_type {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.defexpr {
@@ -6879,10 +6968,12 @@ fn walk_alter_function_stmt<'a>(m: &'a ast::AlterFunctionStmt, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_alter_function_stmt(m: *mut ast::AlterFunctionStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_function_stmt<'a>(
+    m: &'a mut ast::AlterFunctionStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.func {
-        let x: &mut ast::ObjectWithArgs = x;
+        let x: &'a mut ast::ObjectWithArgs = x;
         out.node(NodeMut::ObjectWithArgs(x));
     }
     for x in m.actions.iter_mut().flatten() {
@@ -6896,8 +6987,7 @@ fn walk_do_stmt<'a>(m: &'a ast::DoStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_do_stmt(m: *mut ast::DoStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_do_stmt<'a>(m: &'a mut ast::DoStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.args.iter_mut().flatten() {
         out.slot(x);
     }
@@ -6905,9 +6995,7 @@ unsafe fn walk_mut_do_stmt(m: *mut ast::DoStmt, out: &mut dyn MutVisitor) {
 
 fn walk_inline_code_block<'a>(m: &'a ast::InlineCodeBlock, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_inline_code_block(m: *mut ast::InlineCodeBlock, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_inline_code_block<'a>(m: &'a mut ast::InlineCodeBlock, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_call_stmt<'a>(m: &'a ast::CallStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.funccall {
@@ -6923,14 +7011,13 @@ fn walk_call_stmt<'a>(m: &'a ast::CallStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_call_stmt(m: *mut ast::CallStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_call_stmt<'a>(m: &'a mut ast::CallStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.funccall {
-        let x: &mut ast::FuncCall = x;
+        let x: &'a mut ast::FuncCall = x;
         out.node(NodeMut::FuncCall(x));
     }
     if let Some(x) = &mut m.funcexpr {
-        let x: &mut ast::FuncExpr = x;
+        let x: &'a mut ast::FuncExpr = x;
         out.node(NodeMut::FuncExpr(x));
     }
     for x in m.outargs.iter_mut().flatten() {
@@ -6940,9 +7027,7 @@ unsafe fn walk_mut_call_stmt(m: *mut ast::CallStmt, out: &mut dyn MutVisitor) {
 
 fn walk_call_context<'a>(m: &'a ast::CallContext, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_call_context(m: *mut ast::CallContext, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_call_context<'a>(m: &'a mut ast::CallContext, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_rename_stmt<'a>(m: &'a ast::RenameStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     if let Some(x) = &m.relation {
@@ -6954,10 +7039,9 @@ fn walk_rename_stmt<'a>(m: &'a ast::RenameStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_rename_stmt(m: *mut ast::RenameStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_rename_stmt<'a>(m: &'a mut ast::RenameStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
@@ -6982,20 +7066,19 @@ fn walk_alter_object_depends_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_object_depends_stmt(
-    m: *mut ast::AlterObjectDependsStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_object_depends_stmt<'a>(
+    m: &'a mut ast::AlterObjectDependsStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
         out.slot(x);
     }
     if let Some(x) = &mut m.extname {
-        let x: &mut ast::String = x;
+        let x: &'a mut ast::String = x;
         out.node(NodeMut::String(x));
     }
 }
@@ -7013,13 +7096,12 @@ fn walk_alter_object_schema_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_object_schema_stmt(
-    m: *mut ast::AlterObjectSchemaStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_object_schema_stmt<'a>(
+    m: &'a mut ast::AlterObjectSchemaStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
@@ -7041,17 +7123,16 @@ fn walk_alter_owner_stmt<'a>(m: &'a ast::AlterOwnerStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_alter_owner_stmt(m: *mut ast::AlterOwnerStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_owner_stmt<'a>(m: &'a mut ast::AlterOwnerStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.object {
         out.slot(x);
     }
     if let Some(x) = &mut m.newowner {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
 }
@@ -7066,10 +7147,12 @@ fn walk_alter_operator_stmt<'a>(m: &'a ast::AlterOperatorStmt, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_alter_operator_stmt(m: *mut ast::AlterOperatorStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_operator_stmt<'a>(
+    m: &'a mut ast::AlterOperatorStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.opername {
-        let x: &mut ast::ObjectWithArgs = x;
+        let x: &'a mut ast::ObjectWithArgs = x;
         out.node(NodeMut::ObjectWithArgs(x));
     }
     for x in m.options.iter_mut().flatten() {
@@ -7086,8 +7169,7 @@ fn walk_alter_type_stmt<'a>(m: &'a ast::AlterTypeStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_alter_type_stmt(m: *mut ast::AlterTypeStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_type_stmt<'a>(m: &'a mut ast::AlterTypeStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.type_name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7109,10 +7191,9 @@ fn walk_rule_stmt<'a>(m: &'a ast::RuleStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_rule_stmt(m: *mut ast::RuleStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_rule_stmt<'a>(m: &'a mut ast::RuleStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.where_clause {
@@ -7125,21 +7206,15 @@ unsafe fn walk_mut_rule_stmt(m: *mut ast::RuleStmt, out: &mut dyn MutVisitor) {
 
 fn walk_notify_stmt<'a>(m: &'a ast::NotifyStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_notify_stmt(m: *mut ast::NotifyStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_notify_stmt<'a>(m: &'a mut ast::NotifyStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_listen_stmt<'a>(m: &'a ast::ListenStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_listen_stmt(m: *mut ast::ListenStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_listen_stmt<'a>(m: &'a mut ast::ListenStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_unlisten_stmt<'a>(m: &'a ast::UnlistenStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_unlisten_stmt(m: *mut ast::UnlistenStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_unlisten_stmt<'a>(m: &'a mut ast::UnlistenStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_transaction_stmt<'a>(m: &'a ast::TransactionStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.options.iter().flatten() {
@@ -7147,8 +7222,7 @@ fn walk_transaction_stmt<'a>(m: &'a ast::TransactionStmt, out: &mut dyn FnMut(No
     }
 }
 
-unsafe fn walk_mut_transaction_stmt(m: *mut ast::TransactionStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_transaction_stmt<'a>(m: &'a mut ast::TransactionStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7164,10 +7238,12 @@ fn walk_composite_type_stmt<'a>(m: &'a ast::CompositeTypeStmt, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_composite_type_stmt(m: *mut ast::CompositeTypeStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_composite_type_stmt<'a>(
+    m: &'a mut ast::CompositeTypeStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.typevar {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.coldeflist.iter_mut().flatten() {
@@ -7184,8 +7260,7 @@ fn walk_create_enum_stmt<'a>(m: &'a ast::CreateEnumStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_create_enum_stmt(m: *mut ast::CreateEnumStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_enum_stmt<'a>(m: &'a mut ast::CreateEnumStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.type_name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7203,8 +7278,7 @@ fn walk_create_range_stmt<'a>(m: &'a ast::CreateRangeStmt, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_create_range_stmt(m: *mut ast::CreateRangeStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_range_stmt<'a>(m: &'a mut ast::CreateRangeStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.type_name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7219,8 +7293,7 @@ fn walk_alter_enum_stmt<'a>(m: &'a ast::AlterEnumStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_alter_enum_stmt(m: *mut ast::AlterEnumStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_enum_stmt<'a>(m: &'a mut ast::AlterEnumStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.type_name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7242,10 +7315,9 @@ fn walk_view_stmt<'a>(m: &'a ast::ViewStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_view_stmt(m: *mut ast::ViewStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_view_stmt<'a>(m: &'a mut ast::ViewStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.view {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.aliases.iter_mut().flatten() {
@@ -7261,9 +7333,7 @@ unsafe fn walk_mut_view_stmt(m: *mut ast::ViewStmt, out: &mut dyn MutVisitor) {
 
 fn walk_load_stmt<'a>(m: &'a ast::LoadStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_load_stmt(m: *mut ast::LoadStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_load_stmt<'a>(m: &'a mut ast::LoadStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_createdb_stmt<'a>(m: &'a ast::CreatedbStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.options.iter().flatten() {
@@ -7271,8 +7341,7 @@ fn walk_createdb_stmt<'a>(m: &'a ast::CreatedbStmt, out: &mut dyn FnMut(NodeRef<
     }
 }
 
-unsafe fn walk_mut_createdb_stmt(m: *mut ast::CreatedbStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_createdb_stmt<'a>(m: &'a mut ast::CreatedbStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7284,8 +7353,10 @@ fn walk_alter_database_stmt<'a>(m: &'a ast::AlterDatabaseStmt, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_alter_database_stmt(m: *mut ast::AlterDatabaseStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_database_stmt<'a>(
+    m: &'a mut ast::AlterDatabaseStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7297,11 +7368,10 @@ fn walk_alter_database_refresh_coll_stmt<'a>(
 ) {
 }
 
-unsafe fn walk_mut_alter_database_refresh_coll_stmt(
-    m: *mut ast::AlterDatabaseRefreshCollStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_database_refresh_coll_stmt<'a>(
+    m: &'a mut ast::AlterDatabaseRefreshCollStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
 }
 
 fn walk_alter_database_set_stmt<'a>(
@@ -7314,13 +7384,12 @@ fn walk_alter_database_set_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_database_set_stmt(
-    m: *mut ast::AlterDatabaseSetStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_database_set_stmt<'a>(
+    m: &'a mut ast::AlterDatabaseSetStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.setstmt {
-        let x: &mut ast::VariableSetStmt = x;
+        let x: &'a mut ast::VariableSetStmt = x;
         out.node(NodeMut::VariableSetStmt(x));
     }
 }
@@ -7331,8 +7400,7 @@ fn walk_dropdb_stmt<'a>(m: &'a ast::DropdbStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_dropdb_stmt(m: *mut ast::DropdbStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_dropdb_stmt<'a>(m: &'a mut ast::DropdbStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7345,10 +7413,9 @@ fn walk_alter_system_stmt<'a>(m: &'a ast::AlterSystemStmt, out: &mut dyn FnMut(N
     }
 }
 
-unsafe fn walk_mut_alter_system_stmt(m: *mut ast::AlterSystemStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_alter_system_stmt<'a>(m: &'a mut ast::AlterSystemStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.setstmt {
-        let x: &mut ast::VariableSetStmt = x;
+        let x: &'a mut ast::VariableSetStmt = x;
         out.node(NodeMut::VariableSetStmt(x));
     }
 }
@@ -7363,10 +7430,9 @@ fn walk_cluster_stmt<'a>(m: &'a ast::ClusterStmt, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_cluster_stmt(m: *mut ast::ClusterStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_cluster_stmt<'a>(m: &'a mut ast::ClusterStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.params.iter_mut().flatten() {
@@ -7383,8 +7449,7 @@ fn walk_vacuum_stmt<'a>(m: &'a ast::VacuumStmt, out: &mut dyn FnMut(NodeRef<'a>)
     }
 }
 
-unsafe fn walk_mut_vacuum_stmt(m: *mut ast::VacuumStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_vacuum_stmt<'a>(m: &'a mut ast::VacuumStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7403,10 +7468,9 @@ fn walk_vacuum_relation<'a>(m: &'a ast::VacuumRelation, out: &mut dyn FnMut(Node
     }
 }
 
-unsafe fn walk_mut_vacuum_relation(m: *mut ast::VacuumRelation, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_vacuum_relation<'a>(m: &'a mut ast::VacuumRelation, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.va_cols.iter_mut().flatten() {
@@ -7423,8 +7487,7 @@ fn walk_explain_stmt<'a>(m: &'a ast::ExplainStmt, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_explain_stmt(m: *mut ast::ExplainStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_explain_stmt<'a>(m: &'a mut ast::ExplainStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.query {
         out.slot(x);
     }
@@ -7443,13 +7506,15 @@ fn walk_create_table_as_stmt<'a>(m: &'a ast::CreateTableAsStmt, out: &mut dyn Fn
     }
 }
 
-unsafe fn walk_mut_create_table_as_stmt(m: *mut ast::CreateTableAsStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_table_as_stmt<'a>(
+    m: &'a mut ast::CreateTableAsStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.query {
         out.slot(x);
     }
     if let Some(x) = &mut m.into {
-        let x: &mut ast::IntoClause = x;
+        let x: &'a mut ast::IntoClause = x;
         out.node(NodeMut::IntoClause(x));
     }
 }
@@ -7464,28 +7529,23 @@ fn walk_refresh_mat_view_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_refresh_mat_view_stmt(
-    m: *mut ast::RefreshMatViewStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_refresh_mat_view_stmt<'a>(
+    m: &'a mut ast::RefreshMatViewStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
 }
 
 fn walk_check_point_stmt<'a>(m: &'a ast::CheckPointStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_check_point_stmt(m: *mut ast::CheckPointStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_check_point_stmt<'a>(m: &'a mut ast::CheckPointStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_discard_stmt<'a>(m: &'a ast::DiscardStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_discard_stmt(m: *mut ast::DiscardStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_discard_stmt<'a>(m: &'a mut ast::DiscardStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_lock_stmt<'a>(m: &'a ast::LockStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.relations.iter().flatten() {
@@ -7493,8 +7553,7 @@ fn walk_lock_stmt<'a>(m: &'a ast::LockStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     }
 }
 
-unsafe fn walk_mut_lock_stmt(m: *mut ast::LockStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_lock_stmt<'a>(m: &'a mut ast::LockStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.relations.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7506,8 +7565,10 @@ fn walk_constraints_set_stmt<'a>(m: &'a ast::ConstraintsSetStmt, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_constraints_set_stmt(m: *mut ast::ConstraintsSetStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_constraints_set_stmt<'a>(
+    m: &'a mut ast::ConstraintsSetStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.constraints.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7523,10 +7584,9 @@ fn walk_reindex_stmt<'a>(m: &'a ast::ReindexStmt, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_reindex_stmt(m: *mut ast::ReindexStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_reindex_stmt<'a>(m: &'a mut ast::ReindexStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.params.iter_mut().flatten() {
@@ -7546,11 +7606,10 @@ fn walk_create_conversion_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_conversion_stmt(
-    m: *mut ast::CreateConversionStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_conversion_stmt<'a>(
+    m: &'a mut ast::CreateConversionStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.conversion_name.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7574,18 +7633,17 @@ fn walk_create_cast_stmt<'a>(m: &'a ast::CreateCastStmt, out: &mut dyn FnMut(Nod
     }
 }
 
-unsafe fn walk_mut_create_cast_stmt(m: *mut ast::CreateCastStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_create_cast_stmt<'a>(m: &'a mut ast::CreateCastStmt, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.sourcetype {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.targettype {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.func {
-        let x: &mut ast::ObjectWithArgs = x;
+        let x: &'a mut ast::ObjectWithArgs = x;
         out.node(NodeMut::ObjectWithArgs(x));
     }
 }
@@ -7608,21 +7666,20 @@ fn walk_create_transform_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_transform_stmt(
-    m: *mut ast::CreateTransformStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_transform_stmt<'a>(
+    m: &'a mut ast::CreateTransformStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     if let Some(x) = &mut m.type_name {
-        let x: &mut ast::TypeName = x;
+        let x: &'a mut ast::TypeName = x;
         out.node(NodeMut::TypeName(x));
     }
     if let Some(x) = &mut m.fromsql {
-        let x: &mut ast::ObjectWithArgs = x;
+        let x: &'a mut ast::ObjectWithArgs = x;
         out.node(NodeMut::ObjectWithArgs(x));
     }
     if let Some(x) = &mut m.tosql {
-        let x: &mut ast::ObjectWithArgs = x;
+        let x: &'a mut ast::ObjectWithArgs = x;
         out.node(NodeMut::ObjectWithArgs(x));
     }
 }
@@ -7636,8 +7693,7 @@ fn walk_prepare_stmt<'a>(m: &'a ast::PrepareStmt, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_prepare_stmt(m: *mut ast::PrepareStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_prepare_stmt<'a>(m: &'a mut ast::PrepareStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.argtypes.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7652,8 +7708,7 @@ fn walk_execute_stmt<'a>(m: &'a ast::ExecuteStmt, out: &mut dyn FnMut(NodeRef<'a
     }
 }
 
-unsafe fn walk_mut_execute_stmt(m: *mut ast::ExecuteStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_execute_stmt<'a>(m: &'a mut ast::ExecuteStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.params.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7661,9 +7716,7 @@ unsafe fn walk_mut_execute_stmt(m: *mut ast::ExecuteStmt, out: &mut dyn MutVisit
 
 fn walk_deallocate_stmt<'a>(m: &'a ast::DeallocateStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_deallocate_stmt(m: *mut ast::DeallocateStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_deallocate_stmt<'a>(m: &'a mut ast::DeallocateStmt, out: &mut dyn MutVisitor<'a>) {}
 
 fn walk_drop_owned_stmt<'a>(m: &'a ast::DropOwnedStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.roles.iter().flatten() {
@@ -7671,8 +7724,7 @@ fn walk_drop_owned_stmt<'a>(m: &'a ast::DropOwnedStmt, out: &mut dyn FnMut(NodeR
     }
 }
 
-unsafe fn walk_mut_drop_owned_stmt(m: *mut ast::DropOwnedStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_drop_owned_stmt<'a>(m: &'a mut ast::DropOwnedStmt, out: &mut dyn MutVisitor<'a>) {
     for x in m.roles.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7688,13 +7740,15 @@ fn walk_reassign_owned_stmt<'a>(m: &'a ast::ReassignOwnedStmt, out: &mut dyn FnM
     }
 }
 
-unsafe fn walk_mut_reassign_owned_stmt(m: *mut ast::ReassignOwnedStmt, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_reassign_owned_stmt<'a>(
+    m: &'a mut ast::ReassignOwnedStmt,
+    out: &mut dyn MutVisitor<'a>,
+) {
     for x in m.roles.iter_mut().flatten() {
         out.slot(x);
     }
     if let Some(x) = &mut m.newrole {
-        let x: &mut ast::RoleSpec = x;
+        let x: &'a mut ast::RoleSpec = x;
         out.node(NodeMut::RoleSpec(x));
     }
 }
@@ -7711,11 +7765,10 @@ fn walk_alter_ts_dictionary_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_ts_dictionary_stmt(
-    m: *mut ast::AlterTsDictionaryStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_ts_dictionary_stmt<'a>(
+    m: &'a mut ast::AlterTsDictionaryStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.dictname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7739,11 +7792,10 @@ fn walk_alter_ts_configuration_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_ts_configuration_stmt(
-    m: *mut ast::AlterTsConfigurationStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_ts_configuration_stmt<'a>(
+    m: &'a mut ast::AlterTsConfigurationStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.cfgname.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7768,10 +7820,9 @@ fn walk_publication_table<'a>(m: &'a ast::PublicationTable, out: &mut dyn FnMut(
     }
 }
 
-unsafe fn walk_mut_publication_table(m: *mut ast::PublicationTable, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_publication_table<'a>(m: &'a mut ast::PublicationTable, out: &mut dyn MutVisitor<'a>) {
     if let Some(x) = &mut m.relation {
-        let x: &mut ast::RangeVar = x;
+        let x: &'a mut ast::RangeVar = x;
         out.node(NodeMut::RangeVar(x));
     }
     if let Some(x) = &mut m.where_clause {
@@ -7789,10 +7840,12 @@ fn walk_publication_obj_spec<'a>(m: &'a ast::PublicationObjSpec, out: &mut dyn F
     }
 }
 
-unsafe fn walk_mut_publication_obj_spec(m: *mut ast::PublicationObjSpec, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
+fn walk_mut_publication_obj_spec<'a>(
+    m: &'a mut ast::PublicationObjSpec,
+    out: &mut dyn MutVisitor<'a>,
+) {
     if let Some(x) = &mut m.pubtable {
-        let x: &mut ast::PublicationTable = x;
+        let x: &'a mut ast::PublicationTable = x;
         out.node(NodeMut::PublicationTable(x));
     }
 }
@@ -7809,11 +7862,10 @@ fn walk_create_publication_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_publication_stmt(
-    m: *mut ast::CreatePublicationStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_publication_stmt<'a>(
+    m: &'a mut ast::CreatePublicationStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7834,11 +7886,10 @@ fn walk_alter_publication_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_publication_stmt(
-    m: *mut ast::AlterPublicationStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_publication_stmt<'a>(
+    m: &'a mut ast::AlterPublicationStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.options.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7859,11 +7910,10 @@ fn walk_create_subscription_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_create_subscription_stmt(
-    m: *mut ast::CreateSubscriptionStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_create_subscription_stmt<'a>(
+    m: &'a mut ast::CreateSubscriptionStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.publication.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7884,11 +7934,10 @@ fn walk_alter_subscription_stmt<'a>(
     }
 }
 
-unsafe fn walk_mut_alter_subscription_stmt(
-    m: *mut ast::AlterSubscriptionStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_alter_subscription_stmt<'a>(
+    m: &'a mut ast::AlterSubscriptionStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
     for x in m.publication.iter_mut().flatten() {
         out.slot(x);
     }
@@ -7903,15 +7952,12 @@ fn walk_drop_subscription_stmt<'a>(
 ) {
 }
 
-unsafe fn walk_mut_drop_subscription_stmt(
-    m: *mut ast::DropSubscriptionStmt,
-    out: &mut dyn MutVisitor,
+fn walk_mut_drop_subscription_stmt<'a>(
+    m: &'a mut ast::DropSubscriptionStmt,
+    out: &mut dyn MutVisitor<'a>,
 ) {
-    let m = unsafe { &mut *m };
 }
 
 fn walk_scan_token<'a>(m: &'a ast::ScanToken, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
-unsafe fn walk_mut_scan_token(m: *mut ast::ScanToken, out: &mut dyn MutVisitor) {
-    let m = unsafe { &mut *m };
-}
+fn walk_mut_scan_token<'a>(m: &'a mut ast::ScanToken, out: &mut dyn MutVisitor<'a>) {}

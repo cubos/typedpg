@@ -230,7 +230,7 @@ fn simple_shape(sel: &ast::SelectStmt) -> bool {
 fn calls_in_target_list(sel: &ast::SelectStmt) -> bool {
     sel.target_list.iter().any(|t| {
         t.as_ref().is_some_and(|n| {
-            n.nodes().into_iter().any(|(n, _)| {
+            n.nodes().any(|(n, _)| {
                 matches!(
                     n,
                     typedpg_pg_query::NodeRef::FuncCall(_)
@@ -257,7 +257,7 @@ fn simple_target_list(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
         let Some(inner) = t.as_ref() else {
             return true;
         };
-        inner.nodes().into_iter().all(|(n, _)| match n {
+        inner.nodes().all(|(n, _)| match n {
             typedpg_pg_query::NodeRef::SubLink(_) | typedpg_pg_query::NodeRef::GroupingFunc(_) => {
                 false
             }

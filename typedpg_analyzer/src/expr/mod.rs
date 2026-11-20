@@ -2228,7 +2228,6 @@ fn has_param_ref(expr: Option<&ast::Node>) -> bool {
         matches!(inner, ast::Node::ParamRef(_))
             || inner
                 .nodes()
-                .into_iter()
                 .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::ParamRef(_)))
     })
 }
@@ -2239,7 +2238,6 @@ fn has_sublink(expr: Option<&ast::Node>) -> bool {
         matches!(inner, ast::Node::SubLink(_))
             || inner
                 .nodes()
-                .into_iter()
                 .any(|(n, ..)| matches!(n, typedpg_pg_query::NodeRef::SubLink(_)))
     })
 }

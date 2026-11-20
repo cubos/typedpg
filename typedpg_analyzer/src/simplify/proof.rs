@@ -124,11 +124,8 @@ impl<'a> FromScope<'a> {
             from_item(ctx, &ctes, from.as_ref(), false, &mut items);
         }
         let grouping_sets = select.group_clause.iter().any(|g| {
-            g.as_ref().is_some_and(|g| {
-                g.nodes()
-                    .iter()
-                    .any(|(n, _)| matches!(n, NodeRef::GroupingSet(_)))
-            })
+            g.as_ref()
+                .is_some_and(|g| g.nodes().any(|(n, _)| matches!(n, NodeRef::GroupingSet(_))))
         });
         FromScope {
             items,
@@ -533,7 +530,6 @@ pub(super) fn is_system_column(name: &str) -> bool {
 fn cte_names(ctx: &Ctx<'_>) -> HashSet<String> {
     ctx.tree
         .nodes()
-        .iter()
         .filter_map(|(n, _)| match n {
             NodeRef::CommonTableExpr(c) => Some(c.ctename.clone()),
             _ => None,
@@ -1367,7 +1363,6 @@ fn in_list_cannot_error(
     let constant = |n: Option<&Node>| {
         n.is_some_and(|n| {
             n.nodes()
-                .iter()
                 .all(|(n, _)| !matches!(n, NodeRef::ColumnRef(_) | NodeRef::SubLink(_)))
         })
     };
@@ -1840,7 +1835,7 @@ pub(crate) fn written_names_use(ctx: &Ctx<'_>, prefix: &str) -> bool {
                     .any(|c| matches!(c, Some(N::String(s)) if hit(&s.sval)))
         })
     };
-    parsed.tree.nodes().iter().any(|(n, _)| match n {
+    parsed.tree.nodes().any(|(n, _)| match n {
         NodeRef::String(s) => hit(&s.sval),
         NodeRef::RangeVar(r) => {
             hit(&r.relname) || hit(&r.schemaname) || alias_hit(r.alias.as_deref())
@@ -2143,7 +2138,6 @@ fn site_position(ctx: &Ctx<'_>, site_location: i32) -> Option<SitePosition> {
     let locks = ctx
         .tree
         .nodes()
-        .iter()
         .any(|(n, _)| matches!(n, NodeRef::LockingClause(_)));
     match top {
         N::SelectStmt(s) => {
@@ -2204,11 +2198,7 @@ pub(crate) fn siblings_cannot_error(
     scope: &FromScope<'_>,
 ) -> bool {
     let holds_site = |n: Option<&Node>| {
-        n.is_some_and(|n| {
-            n.nodes()
-                .iter()
-                .any(|(n, _)| n.location() == Some(site_location))
-        })
+        n.is_some_and(|n| n.nodes().any(|(n, _)| n.location() == Some(site_location)))
     };
     if !holds_site(clause) {
         return false;
@@ -2258,7 +2248,7 @@ fn cheap(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
     let Some(root) = node else {
         return true;
     };
-    root.nodes().iter().all(|(n, _)| match n {
+    root.nodes().all(|(n, _)| match n {
         NodeRef::SubLink(_) => false,
         NodeRef::FuncCall(f) => name_parts(&f.funcname).is_some_and(|(schema, name)| {
             let candidates = catalog.find_functions(schema, name);
@@ -2329,7 +2319,7 @@ pub(crate) fn has_volatile(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
     let Some(root) = node else {
         return false;
     };
-    root.nodes().iter().any(|(n, _)| match n {
+    root.nodes().any(|(n, _)| match n {
         NodeRef::FuncCall(f) => match name_parts(&f.funcname) {
             Some((schema, name)) => {
                 let candidates = catalog.find_functions(schema, name);

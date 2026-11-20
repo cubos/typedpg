@@ -238,7 +238,6 @@ pub(crate) fn joined_exists_sublink(
             .filter_map(|g| g.as_ref())
             .any(|g| {
                 g.nodes()
-                    .into_iter()
                     .any(|(n, _)| matches!(n, typedpg_pg_query::NodeRef::GroupingSet(_)))
             })
         || sel.having_clause.is_some()
@@ -287,7 +286,7 @@ pub(crate) fn joined_exists_sublink(
     // certainly one of the subquery's own, qualified by one of its FROM
     // items, and it holds no sublink.
     let own_columns = |q: &ast::Node| {
-        q.nodes().into_iter().all(|(n, _)| match n {
+        q.nodes().all(|(n, _)| match n {
             typedpg_pg_query::NodeRef::SubLink(_) => false,
             typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                 let names = extract_names(&cr.fields);
@@ -460,7 +459,7 @@ pub(crate) fn subquery_reads_only(
             .is_some_and(|cols| cols.iter().any(|n| n == c))
     };
     let other_alias = |t: &str| !aliases.contains(&t) && other_alias(t);
-    query.nodes().into_iter().all(|(n, _)| match n {
+    query.nodes().all(|(n, _)| match n {
         typedpg_pg_query::NodeRef::ColumnRef(cr) => {
             let parts = extract_names(&cr.fields);
             match parts.as_slice() {
@@ -1293,7 +1292,7 @@ impl PlanLevel {
                             || !sel.locking_clause.is_empty()
                             || sel.target_list.iter().any(|t| {
                                 t.as_ref().is_some_and(|t| {
-                                    t.nodes().into_iter().any(|(n, _)| {
+                                    t.nodes().any(|(n, _)| {
                                         matches!(n, typedpg_pg_query::NodeRef::FuncCall(f)
                                             if f.over.is_some())
                                     })
@@ -1870,7 +1869,7 @@ impl Group {
         !self.quals.iter().any(|(q, _, top)| {
             *top && !tested(q.as_ref())
                 && q.as_ref().is_some_and(|q| {
-                    q.nodes().into_iter().any(|(n, _)| match n {
+                    q.nodes().any(|(n, _)| match n {
                         typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                             let names = extract_names(&cr.fields);
                             match names.as_slice() {
@@ -2191,7 +2190,7 @@ pub(crate) fn join_equates(j: &ast::JoinExpr) -> bool {
     j.is_natural
         || !j.using_clause.is_empty()
         || j.quals.as_ref().is_some_and(|q| {
-            q.nodes().into_iter().any(|(n, _)| {
+            q.nodes().any(|(n, _)| {
                 matches!(n, typedpg_pg_query::NodeRef::AExpr(e)
                         if extract_names(&e.name).last().is_some_and(|o| o == "="))
             })
@@ -2408,14 +2407,9 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
             !fc.args
                 .iter()
                 .any(|a| fold(a.as_ref(), snapshot) == Folded::Null || params_only(a.as_ref()))
-                && n.children()
-                    .into_iter()
-                    .any(|c| reads_ref(c, target, snapshot))
+                && n.children().any(|c| reads_ref(c, target, snapshot))
         }
-        _ => n
-            .children()
-            .into_iter()
-            .any(|c| reads_ref(c, target, snapshot)),
+        _ => n.children().any(|c| reads_ref(c, target, snapshot)),
     }
 }
 
@@ -2425,7 +2419,7 @@ fn params_only(n: Option<&ast::Node>) -> bool {
     let Some(inner) = n else {
         return false;
     };
-    let nodes = inner.nodes();
+    let nodes: Vec<_> = inner.nodes().collect();
     nodes
         .iter()
         .any(|(n, _)| matches!(n, typedpg_pg_query::NodeRef::ParamRef(_)))
@@ -2694,7 +2688,7 @@ impl Reads<'_> {
         // The tested expression reads the side alone.
         let test_reads_side = |sub: &ast::SubLink| {
             sub.testexpr.as_ref().is_none_or(|t| {
-                t.nodes().into_iter().all(|(n, _)| match n {
+                t.nodes().all(|(n, _)| match n {
                     typedpg_pg_query::NodeRef::SubLink(_) => false,
                     typedpg_pg_query::NodeRef::ColumnRef(cr) => side_column(cr),
                     _ => true,
@@ -2801,7 +2795,6 @@ impl Reads<'_> {
             || sel.target_list[..i].iter().any(|t| {
                 t.as_ref().is_some_and(|t| {
                     t.nodes()
-                        .into_iter()
                         .any(|(n, _)| matches!(n, typedpg_pg_query::NodeRef::AStar(_)))
                 })
             })

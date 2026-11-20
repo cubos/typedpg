@@ -86,7 +86,7 @@ const RESERVED_PREFIX: &str = "__typedpg";
 
 pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     // Most queries have no `IN (SELECT …)` at all: nothing to scan for.
-    let has_site = ctx.tree.nodes().iter().any(|(n, _)| {
+    let has_site = ctx.tree.nodes().any(|(n, _)| {
         matches!(n, NodeRef::SubLink(s)
             if s.sub_link_type == SubLinkType::AnySublink && s.oper_name.is_empty())
     });
@@ -597,17 +597,13 @@ fn render(c: &ColumnRef) -> Option<String> {
 
 /// Whether `node` holds a sublink.
 fn contains_sublink(node: Option<&Node>) -> bool {
-    node.is_some_and(|n| {
-        n.nodes()
-            .iter()
-            .any(|(n, _)| matches!(n, NodeRef::SubLink(_)))
-    })
+    node.is_some_and(|n| n.nodes().any(|(n, _)| matches!(n, NodeRef::SubLink(_))))
 }
 
 /// Whether a relation `node` reads (by name) has row security.
 fn reads_row_security(ctx: &Ctx<'_>, node: Option<&Node>) -> bool {
     node.is_some_and(|n| {
-        n.nodes().iter().any(|(n, _)| match n {
+        n.nodes().any(|(n, _)| match n {
             NodeRef::RangeVar(rv) => {
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
                 ctx.catalog

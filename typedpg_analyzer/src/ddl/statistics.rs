@@ -208,7 +208,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                 None => None,
             };
             if let Some(inner) = expr.as_ref() {
-                let nodes = inner.nodes();
+                let nodes: Vec<_> = inner.nodes().collect();
                 // A field selection on the whole row, `(t).a`, is the
                 // column `a` (transformIndirection), not the whole row.
                 let selections: Vec<_> = nodes

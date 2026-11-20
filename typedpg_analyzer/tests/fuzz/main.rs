@@ -460,16 +460,11 @@ fn printer_round_trips_trees() {
         let positional = named_to_positional(seed);
         for _ in 0..16 {
             let mut parsed = typedpg_pg_query::parse(&positional).expect("a seed parses");
-            // SAFETY: as in `mutate`: the pointers stay valid while `parsed`
-            // is not moved, and no reference is held across the mutations.
-            let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.tree.nodes_mut() }
-                .into_iter()
-                .map(|(node, _)| node)
-                .collect();
+            let nodes = mutation_targets(&parsed.tree);
             assert!(!nodes.is_empty(), "a parsed seed has nodes");
             for _ in 0..rng.random_range(1..=3u32) {
                 let idx = rng.random_range(0..nodes.len());
-                apply_mutation(nodes[idx], &mut rng);
+                mutate_target(&mut parsed.tree, nodes[idx], &mut rng);
             }
             match printer::print(&parsed.tree) {
                 Some(printed) => {

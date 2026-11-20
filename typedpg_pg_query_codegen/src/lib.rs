@@ -6,7 +6,7 @@
 //! - `src/ast.rs`: the AST types — one struct per node type, the `Node`
 //!   enum over all of them, and PostgreSQL's enums;
 //! - `src/node.rs`: the `NodeRef` / `NodeMut` views over a `Node` and the
-//!   per-type child walkers behind `nodes()` / `nodes_mut()`;
+//!   per-type child walkers behind `nodes()` / `for_each_node_mut()`;
 //! - `src/equal.rs`: PostgreSQL's `equal()` over the AST — every field
 //!   compared except the ones `equalfuncs.c` skips (parse locations and
 //!   `equal_ignore` fields) — and the matching key, a string over the same
@@ -264,15 +264,17 @@ fn visit(target: &Target, mutable: bool) -> String {
             format!("let x: &'a ast::{ty} = x; out(NodeRef::{variant}(x));")
         }
         (Target::Variant(variant, ty), true) => {
-            format!("let x: &mut ast::{ty} = x; out.node(NodeMut::{variant}(x));")
+            format!("let x: &'a mut ast::{ty} = x; out.node(NodeMut::{variant}(x));")
         }
         (Target::Plain(ty), false) => {
             format!("let x: &'a ast::{ty} = x; {}(x, out);", walk_fn(ty, false))
         }
-        (Target::Plain(ty), true) => format!(
-            "let x: &mut ast::{ty} = x; unsafe {{ {}(x, out) }};",
-            walk_fn(ty, true)
-        ),
+        (Target::Plain(ty), true) => {
+            format!(
+                "let x: &'a mut ast::{ty} = x; {}(x, out);",
+                walk_fn(ty, true)
+            )
+        }
     }
 }
 
@@ -280,7 +282,7 @@ fn walkers(model: &Model, header: &str) -> String {
     let mut s = String::from(header);
     s.push_str(
         "//! Views over a `Node` by kind and the child walkers behind\n\
-         //! `nodes()` / `nodes_mut()`.\n\n\
+         //! `nodes()` / `for_each_node_mut()` / `rewrite()`.\n\n\
          #![allow(clippy::all, dead_code, unused_variables)]\n\n\
          use crate::ast;\n\n",
     );
@@ -294,11 +296,12 @@ fn walkers(model: &Model, header: &str) -> String {
         writeln!(s, "    {variant}(&'a ast::{ty}),").unwrap();
     }
     s.push_str(
-        "}\n\n/// A raw mutable pointer to one AST node, by kind (see `nodes_mut`).\n\
-         #[derive(Debug, Clone, Copy)]\npub enum NodeMut {\n",
+        "}\n\n/// A mutably borrowed view of one AST node, by kind (see\n\
+         /// `for_each_node_mut`).\n\
+         #[derive(Debug)]\npub enum NodeMut<'a> {\n",
     );
     for (variant, ty) in &model.variants {
-        writeln!(s, "    {variant}(*mut ast::{ty}),").unwrap();
+        writeln!(s, "    {variant}(&'a mut ast::{ty}),").unwrap();
     }
     s.push_str("}\n\n");
 
@@ -315,13 +318,27 @@ fn walkers(model: &Model, header: &str) -> String {
         .unwrap();
     }
     s.push_str(
-        "        }\n    }\n\n    /// This node as a [`NodeMut`] pointer.\n    \
-         pub fn to_mut(&mut self) -> NodeMut {\n        match self {\n",
+        "        }\n    }\n\n    /// This node as a [`NodeMut`].\n    \
+         pub fn to_mut(&mut self) -> NodeMut<'_> {\n        match self {\n",
     );
     for (variant, _) in &model.variants {
         writeln!(
             s,
             "            Self::{variant}(x) => NodeMut::{variant}(&mut **x),"
+        )
+        .unwrap();
+    }
+    s.push_str("        }\n    }\n}\n\n");
+
+    s.push_str(
+        "impl NodeMut<'_> {\n    /// A shorter-lived [`NodeMut`] to the same node; `self` is usable\n    \
+         /// again once it is dropped.\n    \
+         pub fn reborrow(&mut self) -> NodeMut<'_> {\n        match self {\n",
+    );
+    for (variant, _) in &model.variants {
+        writeln!(
+            s,
+            "            NodeMut::{variant}(x) => NodeMut::{variant}(&mut **x),"
         )
         .unwrap();
     }
@@ -361,43 +378,42 @@ fn walkers(model: &Model, header: &str) -> String {
     s.push_str(
         "    }\n}\n\n\
          /// What the mutable walkers report: a `Node` field (`slot`) or a field\n\
-         /// of one node kind's own type (`node`).\n\
-         trait MutVisitor {\n    \
-         fn slot(&mut self, n: &mut ast::Node);\n    \
-         fn node(&mut self, n: NodeMut);\n}\n\n\
-         /// Walk the fields of `node` holding nodes.\n///\n\
-         /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
-         unsafe fn walk_mut(node: NodeMut, out: &mut dyn MutVisitor) {\n    \
+         /// of one node kind's own type (`node`), each borrowed for `'a` — the\n\
+         /// fields are disjoint, so their borrows split the node's own.\n\
+         trait MutVisitor<'a> {\n    \
+         fn slot(&mut self, n: &'a mut ast::Node);\n    \
+         fn node(&mut self, n: NodeMut<'a>);\n}\n\n\
+         /// Walk the fields of `node` holding nodes.\n\
+         fn walk_mut<'a>(node: NodeMut<'a>, out: &mut dyn MutVisitor<'a>) {\n    \
          match node {\n",
     );
     for (variant, ty) in &model.variants {
         writeln!(
             s,
-            "        NodeMut::{variant}(m) => unsafe {{ {}(m, out) }},",
+            "        NodeMut::{variant}(m) => {}(m, out),",
             walk_fn(ty, true)
         )
         .unwrap();
     }
     s.push_str(
         "    }\n}\n\n\
-         struct Children<'f>(&'f mut dyn FnMut(NodeMut));\n\n\
-         impl MutVisitor for Children<'_> {\n    \
-         fn slot(&mut self, n: &mut ast::Node) { (self.0)(n.to_mut()); }\n    \
-         fn node(&mut self, n: NodeMut) { (self.0)(n); }\n}\n\n\
-         /// Call `out` on every direct child node of `node`.\n///\n\
-         /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
-         pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {\n    \
-         unsafe { walk_mut(node, &mut Children(out)) }\n}\n\n\
-         struct Slots<'f>(&'f mut dyn FnMut(&mut ast::Node));\n\n\
-         impl MutVisitor for Slots<'_> {\n    \
-         fn slot(&mut self, n: &mut ast::Node) { (self.0)(n); }\n    \
-         fn node(&mut self, n: NodeMut) { unsafe { walk_mut(n, self) } }\n}\n\n\
+         struct Children<'f, 'a>(&'f mut dyn FnMut(NodeMut<'a>));\n\n\
+         impl<'a> MutVisitor<'a> for Children<'_, 'a> {\n    \
+         fn slot(&mut self, n: &'a mut ast::Node) { (self.0)(n.to_mut()); }\n    \
+         fn node(&mut self, n: NodeMut<'a>) { (self.0)(n); }\n}\n\n\
+         /// Call `out` on every direct child node of `node`, in the order\n\
+         /// [`children`] reports them, splitting `node`'s borrow among them.\n\
+         pub(crate) fn children_mut<'a>(node: NodeMut<'a>, out: &mut dyn FnMut(NodeMut<'a>)) {\n    \
+         walk_mut(node, &mut Children(out))\n}\n\n\
+         struct Slots<'f, 'a>(&'f mut dyn FnMut(&'a mut ast::Node));\n\n\
+         impl<'a> MutVisitor<'a> for Slots<'_, 'a> {\n    \
+         fn slot(&mut self, n: &'a mut ast::Node) { (self.0)(n); }\n    \
+         fn node(&mut self, n: NodeMut<'a>) { walk_mut(n, self) }\n}\n\n\
          /// Call `out` on every `Node` field below `node` reached without\n\
          /// passing through another one: the places a child node can be\n\
-         /// replaced by a node of another kind.\n///\n\
-         /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
-         pub(crate) unsafe fn child_slots_mut(node: NodeMut, out: &mut dyn FnMut(&mut ast::Node)) {\n    \
-         unsafe { walk_mut(node, &mut Slots(out)) }\n}\n\n",
+         /// replaced by a node of another kind.\n\
+         pub(crate) fn child_slots_mut<'a>(node: NodeMut<'a>, out: &mut dyn FnMut(&'a mut ast::Node)) {\n    \
+         walk_mut(node, &mut Slots(out))\n}\n\n",
     );
 
     // One walker per type.
@@ -407,8 +423,7 @@ fn walkers(model: &Model, header: &str) -> String {
             if mutable {
                 writeln!(
                     s,
-                    "unsafe fn {}(m: *mut ast::{}, out: &mut dyn MutVisitor) {{\n    \
-                     let m = unsafe {{ &mut *m }};\n{body}}}\n",
+                    "fn {}<'a>(m: &'a mut ast::{}, out: &mut dyn MutVisitor<'a>) {{\n{body}}}\n",
                     walk_fn(&m.rust, true),
                     m.rust
                 )

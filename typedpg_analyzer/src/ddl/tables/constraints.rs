@@ -2035,7 +2035,6 @@ fn check_system_column_refs(
     // A column by name, or selected from the whole row (`(t).ctid`).
     let names = inner
         .nodes()
-        .into_iter()
         .filter_map(|(n, ..)| match n {
             typedpg_pg_query::NodeRef::ColumnRef(cr) => cr
                 .fields

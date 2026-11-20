@@ -362,10 +362,7 @@ fn visible_ctes(
 fn references_cte(node: NodeRef<'_>, name: &str) -> bool {
     match node {
         NodeRef::RangeVar(range) => range.schemaname.is_empty() && range.relname == name,
-        _ => node
-            .children()
-            .into_iter()
-            .any(|child| references_cte(child, name)),
+        _ => node.children().any(|child| references_cte(child, name)),
     }
 }
 
@@ -1807,7 +1804,7 @@ fn aggregate_is_this_level(scope: Option<&Scope<'_>>, call: &ast::FuncCall) -> b
 fn contains_column_ref(node: NodeRef<'_>) -> bool {
     match node {
         NodeRef::ColumnRef(_) => true,
-        _ => node.children().into_iter().any(contains_column_ref),
+        _ => node.children().any(contains_column_ref),
     }
 }
 
@@ -2847,7 +2844,6 @@ mod tests {
         let selects: Vec<&SelectStmt> = outer
             .tree
             .nodes()
-            .into_iter()
             .filter_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select) => Some(select),
                 _ => None,
@@ -2863,7 +2859,6 @@ mod tests {
         let selects: Vec<&SelectStmt> = inner
             .tree
             .nodes()
-            .into_iter()
             .filter_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select) => Some(select),
                 _ => None,
@@ -2929,7 +2924,6 @@ mod tests {
         let aggregate = outer
             .tree
             .nodes()
-            .into_iter()
             .find_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select)
                     if select.target_list.iter().any(|target| {
@@ -2955,7 +2949,6 @@ mod tests {
         let aggregate = nested
             .tree
             .nodes()
-            .into_iter()
             .find_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select)
                     if select.target_list.iter().any(|target| {
@@ -3169,7 +3162,6 @@ mod tests {
             let select = view
                 .tree
                 .nodes()
-                .into_iter()
                 .find_map(|(node, _)| match node {
                     NodeRef::SelectStmt(select)
                         if select.target_list.iter().any(|target| {
@@ -3225,7 +3217,6 @@ mod tests {
             let select = view
                 .tree
                 .nodes()
-                .into_iter()
                 .find_map(|(node, _)| match node {
                     NodeRef::SelectStmt(select)
                         if select.target_list.iter().any(|target| {
@@ -3826,7 +3817,6 @@ mod tests {
             let selects: Vec<&SelectStmt> = view
                 .tree
                 .nodes()
-                .into_iter()
                 .filter_map(|(node, _)| match node {
                     NodeRef::SelectStmt(select) => Some(select),
                     _ => None,
@@ -4662,7 +4652,6 @@ mod tests {
     fn limited_select(view: &QueryView) -> &SelectStmt {
         view.tree
             .nodes()
-            .into_iter()
             .find_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select) if select.limit_count.is_some() => Some(select),
                 _ => None,
@@ -5091,7 +5080,6 @@ mod tests {
         let selects: Vec<&SelectStmt> = outer
             .tree
             .nodes()
-            .into_iter()
             .filter_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select) => Some(select),
                 _ => None,

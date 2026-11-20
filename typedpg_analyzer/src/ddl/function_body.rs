@@ -106,7 +106,6 @@ fn validate_sql_body(
         // sql_fn_param_ref: `$n` must name one of the arguments.
         let highest = inner
             .nodes()
-            .into_iter()
             .filter_map(|(n, _)| match n {
                 typedpg_pg_query::NodeRef::ParamRef(p) => Some(p.number),
                 _ => None,
