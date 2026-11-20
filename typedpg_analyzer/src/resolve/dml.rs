@@ -1,4 +1,5 @@
 use super::*;
+use typedpg_pg_query::NodeBox;
 
 pub(super) mod select_row;
 
@@ -7,7 +8,7 @@ pub(super) mod select_row;
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn analyze_insert(
-    ins: &protobuf::InsertStmt,
+    ins: &ast::InsertStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
@@ -19,7 +20,7 @@ pub(crate) fn analyze_insert(
 /// under a condition), so what the planner would fold of it may never be
 /// planned — its plan-time checks are off.
 fn replaced_by_instead_rule(
-    relation: Option<&protobuf::RangeVar>,
+    relation: Option<&ast::RangeVar>,
     cmd: CmdType,
     snapshot: &PgCatalog,
 ) -> bool {
@@ -42,12 +43,12 @@ fn replaced_by_instead_rule(
 /// [`analyze_cte`]). The outer CTEs are merged into the INSERT's local
 /// `cte_scopes` so `INSERT … SELECT … FROM <outer_cte>` resolves.
 pub(crate) fn analyze_insert_with_outer_ctes(
-    ins: &protobuf::InsertStmt,
+    ins: &ast::InsertStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
-    if replaced_by_instead_rule(ins.relation.as_ref(), CmdType::CmdInsert, snapshot) {
+    if replaced_by_instead_rule(ins.relation.as_deref(), CmdType::CmdInsert, snapshot) {
         crate::expr::replaced_by_rule(|| analyze_insert_here(ins, snapshot, params, outer_ctes))
     } else {
         analyze_insert_here(ins, snapshot, params, outer_ctes)
@@ -55,7 +56,7 @@ pub(crate) fn analyze_insert_with_outer_ctes(
 }
 
 fn analyze_insert_here(
-    ins: &protobuf::InsertStmt,
+    ins: &ast::InsertStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -79,9 +80,7 @@ fn analyze_insert_here(
     let mut written: Vec<Vec<Option<ValueInfo>>> = vec![Vec::new()];
     // The output types of a SELECT source (not VALUES).
     let mut select_types: Option<Vec<PgTypeOid>> = None;
-    if let Some(select_node) = &ins.select_stmt
-        && let Some(node::Node::SelectStmt(val_sel)) = select_node.node.as_ref()
-    {
+    if let Some(ast::Node::SelectStmt(val_sel)) = ins.select_stmt.as_ref() {
         // transformInsertStmt's isGeneralSelect: a VALUES carrying ORDER
         // BY, LIMIT / OFFSET, a locking clause or its own WITH is analyzed
         // as a standalone SELECT whose output columns are then assigned —
@@ -90,13 +89,13 @@ fn analyze_insert_here(
         // plain VALUES list is the INSERT's own rows.
         if !val_sel.values_lists.is_empty() && !is_general_select(val_sel) {
             let expanded = expand_values_rows(val_sel, snapshot, params, &cte_scopes)?;
-            let val_sel: &protobuf::SelectStmt = &expanded;
+            let val_sel: &ast::SelectStmt = &expanded;
             written = analyze_insert_values(ins, val_sel, &tgt, snapshot, params, &cte_scopes)?;
-            let rows: Vec<&[protobuf::Node]> = val_sel
+            let rows: Vec<&[Option<ast::Node>]> = val_sel
                 .values_lists
                 .iter()
-                .filter_map(|l| match l.node.as_ref() {
-                    Some(node::Node::List(list)) => Some(list.items.as_slice()),
+                .filter_map(|l| match l.as_ref() {
+                    Some(ast::Node::List(list)) => Some(list.items.as_slice()),
                     _ => None,
                 })
                 .collect();
@@ -149,18 +148,17 @@ fn analyze_insert_here(
     // to the column's type (rewriteTargetListIU / rewriteValuesRTE): a
     // constant one is folded like a written value.
     if crate::expr::plan_time_checks() {
-        let rows: Vec<&[protobuf::Node]> =
-            match ins.select_stmt.as_deref().and_then(|n| n.node.as_ref()) {
-                Some(node::Node::SelectStmt(sel)) => sel
-                    .values_lists
-                    .iter()
-                    .filter_map(|l| match l.node.as_ref() {
-                        Some(node::Node::List(list)) => Some(list.items.as_slice()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
+        let rows: Vec<&[Option<ast::Node>]> = match ins.select_stmt.as_ref() {
+            Some(ast::Node::SelectStmt(sel)) => sel
+                .values_lists
+                .iter()
+                .filter_map(|l| match l.as_ref() {
+                    Some(ast::Node::List(list)) => Some(list.items.as_slice()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         for c in tgt.attrs.iter().filter(|c| c.attnum > 0) {
             let position = (0..assigns.len())
                 .find(|&i| target_col_at(&tgt, i).is_some_and(|t| t.attnum == c.attnum));
@@ -209,7 +207,7 @@ fn analyze_insert_here(
     if ins
         .on_conflict_clause
         .as_ref()
-        .is_some_and(|oc| oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32)
+        .is_some_and(|oc| oc.action == ast::OnConflictAction::OnconflictUpdate)
     {
         events.push(DmlEvent::Update);
     }
@@ -228,7 +226,7 @@ fn analyze_insert_here(
     if ins
         .on_conflict_clause
         .as_ref()
-        .is_some_and(|oc| oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32)
+        .is_some_and(|oc| oc.action == ast::OnConflictAction::OnconflictUpdate)
     {
         let mut holder = Scope::default();
         holder.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
@@ -254,7 +252,7 @@ fn analyze_insert_here(
         };
         let mut not_null = wt.row_not_null(snapshot, &insert_arm);
         if let Some(oc) = &ins.on_conflict_clause
-            && oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32
+            && oc.action == ast::OnConflictAction::OnconflictUpdate
         {
             let update_arm = on_conflict_update_arm(
                 oc,
@@ -284,17 +282,18 @@ fn analyze_insert_here(
     let mut rw = Rewrite::single(DmlEvent::Insert, assigns, tgt.overriding);
     rw.row_error = row_error;
     rw.returning = has_returning(&ins.returning_clause);
-    rw.on_conflict = ins.on_conflict_clause.as_ref().and_then(|oc| {
-        match protobuf::OnConflictAction::try_from(oc.action) {
-            Ok(protobuf::OnConflictAction::OnconflictUpdate) => {
+    rw.on_conflict = ins
+        .on_conflict_clause
+        .as_ref()
+        .and_then(|oc| match oc.action {
+            ast::OnConflictAction::OnconflictUpdate => {
                 let set = set_list_assigns(&conflict_set_list);
                 rw.listed.extend(set.iter().map(|a| a.column.clone()));
                 Some(Some(set))
             }
-            Ok(protobuf::OnConflictAction::OnconflictNothing) => Some(None),
+            ast::OnConflictAction::OnconflictNothing => Some(None),
             _ => None,
-        }
-    });
+        });
     check_rewrite(snapshot, tgt.oid, &rw)?;
     // The planner infers the arbiter index after the rewriter ran.
     if let (Some(on_conflict), Some(arbiter)) = (&ins.on_conflict_clause, &arbiter) {
@@ -302,8 +301,7 @@ fn analyze_insert_here(
     }
     // Every execution evaluates the rows the SELECT yields. (Not followed
     // in a WITH, whose earlier CTEs its names could mean.)
-    if let Some(node::Node::SelectStmt(sel)) =
-        ins.select_stmt.as_deref().and_then(|s| s.node.as_ref())
+    if let Some(ast::Node::SelectStmt(sel)) = ins.select_stmt.as_ref()
         && outer_ctes.is_empty()
         && ins.with_clause.as_ref().is_none_or(|w| !w.recursive)
     {
@@ -311,11 +309,10 @@ fn analyze_insert_here(
         super::failing_rows::check_insert_select(sel, ctes, tgt.oid, snapshot)?;
     }
     // Then storing the row a SELECT yields every time fails, if it does.
-    if let (Some(types), Some(node::Node::SelectStmt(sel))) = (
-        &select_types,
-        ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()),
-    ) && let Some(e) =
-        select_row::sure_row_violation(sel, ins.with_clause.as_ref(), &tgt, types, snapshot)
+    if let (Some(types), Some(ast::Node::SelectStmt(sel))) =
+        (&select_types, ins.select_stmt.as_ref())
+        && let Some(e) =
+            select_row::sure_row_violation(sel, ins.with_clause.as_deref(), &tgt, types, snapshot)
     {
         return Err(e);
     }
@@ -408,9 +405,9 @@ pub(crate) fn inserted_rows_knowledge(
 /// `set_list` is `oc`'s SET list as [`analyze_set_clause`] expanded it.
 #[allow(clippy::too_many_arguments)]
 fn on_conflict_update_arm(
-    oc: &protobuf::OnConflictClause,
-    set_list: &[protobuf::Node],
-    relation: &protobuf::RangeVar,
+    oc: &ast::OnConflictClause,
+    set_list: &[Option<ast::Node>],
+    relation: &ast::RangeVar,
     tgt: &InsertTarget,
     wt: &WriteTarget,
     insert_not_null: &std::collections::HashSet<String>,
@@ -443,7 +440,7 @@ fn on_conflict_update_arm(
     scope.sources.extend(holder.sources);
     let mut null_ctx = NullabilityContext::default();
     let mut k = RowKnowledge::default();
-    if let Some(w) = &oc.where_clause {
+    if let w @ Some(_) = &oc.where_clause {
         let log = crate::nonnull::StrictLog::default();
         let mut scratch = params.clone();
         let typed = expr::infer_expr(
@@ -502,7 +499,7 @@ fn on_conflict_update_arm(
 /// The name ON CONFLICT and RETURNING use for the INSERT target:
 /// `INSERT INTO t AS a` makes it `a` (PG's `transformInsertStmt` adds the
 /// target RTE under its alias).
-fn insert_target_alias(relation: &protobuf::RangeVar) -> &str {
+fn insert_target_alias(relation: &ast::RangeVar) -> &str {
     relation
         .alias
         .as_ref()
@@ -522,7 +519,7 @@ struct InsertTarget {
     col_names: Vec<String>,
     /// The indirection (`arr[1]`, `p.x`) of each named column, parallel to
     /// `col_names`.
-    col_indirection: Vec<Vec<protobuf::Node>>,
+    col_indirection: Vec<Vec<Option<ast::Node>>>,
     /// `OVERRIDING SYSTEM VALUE` or `OVERRIDING USER VALUE`. Either lets a
     /// value be written to a GENERATED ALWAYS identity column; USER VALUE
     /// then discards it — and any value given for a BY DEFAULT one — in
@@ -593,8 +590,8 @@ fn view_identity_columns(snapshot: &PgCatalog, relid: crate::oid::PgClassOid) ->
 /// Resolve the INSERT target relation, validate that every column named in the
 /// target list exists, and collect the declared column list + overriding flag.
 fn resolve_insert_target(
-    ins: &protobuf::InsertStmt,
-    relation: &protobuf::RangeVar,
+    ins: &ast::InsertStmt,
+    relation: &ast::RangeVar,
     snapshot: &PgCatalog,
 ) -> Result<InsertTarget, AnalyzeError> {
     super::from::check_rangevar_catalog(relation)?;
@@ -615,7 +612,7 @@ fn resolve_insert_target(
         .cols
         .iter()
         .filter_map(|n| {
-            if let Some(node::Node::ResTarget(rt)) = n.node.as_ref() {
+            if let Some(ast::Node::ResTarget(rt)) = n.as_ref() {
                 Some(rt.name.clone())
             } else {
                 None
@@ -637,7 +634,7 @@ fn resolve_insert_target(
     // parameter as text via the UNKNOWN fallback, masking a real bug in the
     // caller's SQL.
     for n in &ins.cols {
-        let Some(node::Node::ResTarget(rt)) = n.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = n.as_ref() else {
             continue;
         };
         if !table_attrs.iter().any(|c| c.attname == rt.name) {
@@ -657,8 +654,8 @@ fn resolve_insert_target(
     let col_indirection = ins
         .cols
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => Some(rt.indirection.clone()),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => Some(rt.indirection.clone()),
             _ => None,
         })
         .collect();
@@ -686,16 +683,14 @@ fn resolve_insert_target(
 /// threaded into the inner SELECT's scope so `INSERT … SELECT … FROM cte`
 /// resolves the CTE alias.
 fn build_insert_cte_scopes(
-    ins: &protobuf::InsertStmt,
+    ins: &ast::InsertStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &ins.with_clause {
-        let owner = protobuf::Node {
-            node: Some(node::Node::InsertStmt(Box::new(ins.clone()))),
-        };
+        let owner = ast::Node::InsertStmt(NodeBox::new(ins.clone()));
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
@@ -754,7 +749,7 @@ fn insert_arity(tgt: &InsertTarget) -> usize {
 
 /// transformInsertStmt's `isGeneralSelect`, for a VALUES source: a VALUES
 /// list with a sort, limit, locking or WITH clause is a full SELECT.
-fn is_general_select(sel: &protobuf::SelectStmt) -> bool {
+fn is_general_select(sel: &ast::SelectStmt) -> bool {
     !sel.sort_clause.is_empty()
         || sel.limit_offset.is_some()
         || sel.limit_count.is_some()
@@ -778,22 +773,22 @@ fn arity_mismatch(tgt: &InsertTarget, given: usize, expected: usize) -> bool {
 /// `new.*`, a SQL function parameter's `v.*` — before rows are counted
 /// against the target columns. Borrowed when no row holds a star.
 fn expand_values_rows<'a>(
-    val_sel: &'a protobuf::SelectStmt,
+    val_sel: &'a ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<std::borrow::Cow<'a, protobuf::SelectStmt>, AnalyzeError> {
+) -> Result<std::borrow::Cow<'a, ast::SelectStmt>, AnalyzeError> {
     let scope = Scope {
         ctes: cte_scopes.clone(),
         ..Scope::default()
     };
     let null_ctx = NullabilityContext::default();
     let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
-    let rows: Vec<Option<Vec<protobuf::Node>>> = val_sel
+    let rows: Vec<Option<Vec<Option<ast::Node>>>> = val_sel
         .values_lists
         .iter()
-        .map(|row| match row.node.as_ref() {
-            Some(node::Node::List(list)) => {
+        .map(|row| match row.as_ref() {
+            Some(ast::Node::List(list)) => {
                 Ok(match expr::expand_row_args(&list.items, ctx, params)? {
                     std::borrow::Cow::Owned(items) => Some(items),
                     std::borrow::Cow::Borrowed(_) => None,
@@ -810,21 +805,19 @@ fn expand_values_rows<'a>(
         .iter()
         .zip(rows)
         .map(|(row, items)| match items {
-            Some(items) => protobuf::Node {
-                node: Some(node::Node::List(protobuf::List { items })),
-            },
+            Some(items) => Some(ast::Node::List(NodeBox::new(ast::List { items }))),
             None => row.clone(),
         })
         .collect();
-    Ok(std::borrow::Cow::Owned(protobuf::SelectStmt {
+    Ok(std::borrow::Cow::Owned(ast::SelectStmt {
         values_lists,
         ..val_sel.clone()
     }))
 }
 
 fn analyze_insert_values(
-    ins: &protobuf::InsertStmt,
-    val_sel: &protobuf::SelectStmt,
+    ins: &ast::InsertStmt,
+    val_sel: &ast::SelectStmt,
     tgt: &InsertTarget,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -848,7 +841,7 @@ fn analyze_insert_values(
     // What each row writes at each position (`None`: DEFAULT).
     let mut written: Vec<Vec<Option<ValueInfo>>> = Vec::new();
     for val_list in &val_sel.values_lists {
-        let Some(node::Node::List(list)) = val_list.node.as_ref() else {
+        let Some(ast::Node::List(list)) = val_list.as_ref() else {
             continue;
         };
         let mut row_written: Vec<Option<ValueInfo>> = Vec::with_capacity(list.items.len());
@@ -896,7 +889,7 @@ fn analyze_insert_values(
             // build a `source_span` so a type mismatch surfaces a secondary
             // label at the column reference (not just at the value).
             let target_loc = ins.cols.get(i).and_then(|n| {
-                if let Some(node::Node::ResTarget(rt)) = n.node.as_ref() {
+                if let Some(ast::Node::ResTarget(rt)) = n.as_ref() {
                     crate::error::SourceSpan::from_node_qname(rt.location)
                 } else {
                     None
@@ -952,7 +945,7 @@ fn analyze_insert_values(
                 None => Some(ValueInfo::default()),
             });
 
-            if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+            if let Some(ast::Node::ParamRef(p)) = val.as_ref()
                 && let Some(tc) = target_col
                 && (!tc.attnotnull || indirected || tgt.discards(tc))
             {
@@ -1020,7 +1013,7 @@ enum Known<'a> {
     /// A NULL, stored as is.
     Null,
     /// This expression, stored as the column's type reads it.
-    Value(&'a protobuf::Node),
+    Value(&'a Option<ast::Node>),
     /// Nothing.
     Unknown,
 }
@@ -1035,7 +1028,7 @@ enum Known<'a> {
 /// DO INSTEAD rule replaces the INSERT.
 fn row_violation<'a>(
     tgt: &InsertTarget,
-    items: &'a [protobuf::Node],
+    items: &'a [Option<ast::Node>],
     known: &dyn Fn(usize) -> Known<'a>,
     snapshot: &PgCatalog,
 ) -> Option<RowViolation> {
@@ -1118,9 +1111,9 @@ fn row_violation<'a>(
 /// updatable, which the rewriter reports first.
 fn through_view(
     tgt: &InsertTarget,
-    items: &[protobuf::Node],
+    items: &[Option<ast::Node>],
     snapshot: &PgCatalog,
-) -> Option<(InsertTarget, Vec<protobuf::Node>, Vec<usize>)> {
+) -> Option<(InsertTarget, Vec<Option<ast::Node>>, Vec<usize>)> {
     let class = snapshot.pg_class.get(&tgt.oid)?;
     if class.relkind != crate::pg_catalog::RelKind::View {
         return None;
@@ -1159,7 +1152,7 @@ fn through_view(
         col_indirection.push(tgt.col_indirection.get(i).cloned().unwrap_or_default());
         if is_set_to_default(item) && tc.atthasdef {
             opaque.push(i);
-            base_items.push(protobuf::Node { node: None });
+            base_items.push(None);
         } else {
             base_items.push(item.clone());
         }
@@ -1170,7 +1163,7 @@ fn through_view(
             opaque.push(base_items.len());
             col_names.push(base_col(c)?);
             col_indirection.push(Vec::new());
-            base_items.push(protobuf::Node { node: None });
+            base_items.push(None);
         }
     }
     let base = InsertTarget {
@@ -1194,7 +1187,7 @@ fn through_view(
 /// mapping NULL to NULL (see [`null_under_casts`]) — then coerced to
 /// `source` (a VALUES column's common type) and to the column's type.
 fn is_null_value(
-    val: &protobuf::Node,
+    val: &Option<ast::Node>,
     column: &crate::pg_catalog::PgAttribute,
     source: Option<PgTypeOid>,
     snapshot: &PgCatalog,
@@ -1223,7 +1216,7 @@ fn is_null_value(
 /// (`NULL::d`, also under further casts). None when the statement is not
 /// run (a view, rule action, SQL function body, prepared statement or
 /// plain EXPLAIN).
-fn null_domain_cast(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
+fn null_domain_cast(val: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
     if !super::executes() {
         return None;
     }
@@ -1231,7 +1224,7 @@ fn null_domain_cast(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String
 }
 
 /// [`null_domain_cast`]'s error, whether or not the statement runs.
-fn null_domain_cast_error(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
+fn null_domain_cast_error(val: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
     match null_under_casts(val, snapshot)? {
         (NullCast::Fails(msg), _) => Some(msg),
         (NullCast::Null, _) => None,
@@ -1246,13 +1239,13 @@ fn null_domain_cast_error(val: &protobuf::Node, snapshot: &PgCatalog) -> Option<
 /// a DO INSTEAD rule replaces the INSERT.
 fn row_relation<'a>(
     tgt: &InsertTarget,
-    items: &'a [protobuf::Node],
+    items: &'a [Option<ast::Node>],
     known: &dyn Fn(usize) -> Known<'a>,
     snapshot: &PgCatalog,
 ) -> ((crate::oid::PgClassOid, String), Option<RowViolation>) {
     // A column's value in the row: given, or its default when that is NULL
     // (`Some(None)` for NULL); `None` when unknown.
-    let value_of = |name: &str| -> Option<Option<&protobuf::Node>> {
+    let value_of = |name: &str| -> Option<Option<&ast::Node>> {
         let c = tgt.attrs.iter().find(|c| c.attname == name)?;
         let given =
             (0..items.len()).find(|&i| target_col_at(tgt, i).is_some_and(|t| t.attname == name));
@@ -1262,7 +1255,7 @@ fn row_relation<'a>(
             }
             Some(i) if !is_set_to_default(&items[i]) => match known(i) {
                 Known::Null => Some(None),
-                Known::Value(v) => Some(Some(v)),
+                Known::Value(v) => v.as_ref().map(Some),
                 Known::Unknown => None,
             },
             _ => null_default(c, snapshot).then_some(None),
@@ -1370,11 +1363,11 @@ fn stored_default(c: &crate::pg_catalog::PgAttribute, snapshot: &PgCatalog) -> O
 /// What `e` evaluates to when it is `NULL` under casts (`NULL::int8`,
 /// `CAST(NULL::int8 AS text)`), with the type of the result: `None` when
 /// it is something else, or when a cast may turn the NULL into a value.
-fn null_under_casts(e: &protobuf::Node, snapshot: &PgCatalog) -> Option<(NullCast, PgTypeOid)> {
-    match e.node.as_ref()? {
-        node::Node::AConst(k) if k.isnull => Some((NullCast::Null, oid::UNKNOWN)),
-        node::Node::TypeCast(tc) => {
-            let (inner, from) = null_under_casts(tc.arg.as_deref()?, snapshot)?;
+fn null_under_casts(e: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<(NullCast, PgTypeOid)> {
+    match e.as_ref()? {
+        ast::Node::AConst(k) if k.isnull => Some((NullCast::Null, oid::UNKNOWN)),
+        ast::Node::TypeCast(tc) => {
+            let (inner, from) = null_under_casts(&tc.arg, snapshot)?;
             let tn = tc.type_name.as_ref()?;
             let target = crate::ddl::util::resolve_type_name(tn, snapshot)?;
             if inner != NullCast::Null {
@@ -1446,7 +1439,7 @@ fn null_coercion(
 /// columns only (a view's defaults are its base table's).
 fn omitted_domain_nulls(
     tgt: &InsertTarget,
-    items: &[protobuf::Node],
+    items: &[Option<ast::Node>],
     snapshot: &PgCatalog,
 ) -> Vec<RowViolation> {
     let is_table = snapshot.pg_class.get(&tgt.oid).is_some_and(|c| {
@@ -1539,7 +1532,7 @@ fn omitted_not_null_columns(
 /// `targets` target columns (`cols`, the explicit column list, maybe
 /// empty). `extra_value` is the span of the first value past the targets.
 fn insert_arity_error(
-    cols: &[protobuf::Node],
+    cols: &[Option<ast::Node>],
     targets: usize,
     expressions: usize,
     extra_value: Option<crate::error::SourceSpan>,
@@ -1547,8 +1540,8 @@ fn insert_arity_error(
     if expressions > targets {
         crate::pgmsg::insert_more_expressions_than_targets(targets, expressions, extra_value)
     } else {
-        let column = cols.get(expressions).and_then(|n| match n.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => {
+        let column = cols.get(expressions).and_then(|n| match n.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => {
                 crate::error::SourceSpan::from_node_qname(rt.location)
             }
             _ => None,
@@ -1563,8 +1556,8 @@ fn insert_arity_error(
 /// register and typos propagate, then pin column types onto bare `$N`
 /// projections.
 fn analyze_insert_select(
-    val_sel: &protobuf::SelectStmt,
-    cols: &[protobuf::Node],
+    val_sel: &ast::SelectStmt,
+    cols: &[Option<ast::Node>],
     tgt: &InsertTarget,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -1590,13 +1583,13 @@ fn analyze_insert_select(
     }
     // The SELECT's target entries line up with its output columns only for
     // a plain SELECT without `*`.
-    let direct_targets: &[protobuf::Node] = if val_sel.op == SetOperation::SetopNone as i32
+    let direct_targets: &[Option<ast::Node>] = if val_sel.op == SetOperation::SetopNone
         && val_sel.values_lists.is_empty()
         && !val_sel.target_list.iter().any(|t| {
-            matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                    Some(node::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
-                        matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
+            matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+                if matches!(rt.val.as_ref(),
+                    Some(ast::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
+                        matches!(f.as_ref(), Some(ast::Node::AStar(_))))))
         }) {
         &val_sel.target_list
     } else {
@@ -1634,11 +1627,8 @@ fn analyze_insert_select(
         // `unknown` here and is coerced to the column's type through
         // `variable_coerce_param_hook` (42P08 if WHERE & co. deduced
         // another type — see `expr::note_untyped_output_params`).
-        if let Some(node::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.node.as_ref())
-            && let Some(p) = rt
-                .val
-                .as_deref()
-                .and_then(|v| expr::bare_param(v, snapshot))
+        if let Some(ast::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.as_ref())
+            && let Some(p) = expr::bare_param(&rt.val, snapshot)
             && params.is_untyped_output(p.location)
         {
             if let Err(prev) = params.coerce_untyped(p.number, target_oid) {
@@ -1651,16 +1641,15 @@ fn analyze_insert_select(
         // A Var of the SELECT's `unknown` output that is no literal: only
         // the I/O conversion to a string type assigns it.
         if sel_col.unknown_value {
-            let fallback = protobuf::Node { node: None };
-            let node = match direct_targets.get(i).and_then(|t| t.node.as_ref()) {
-                Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+            let node = match direct_targets.get(i).and_then(|t| t.as_ref()) {
+                Some(ast::Node::ResTarget(rt)) => rt.val.as_ref(),
                 _ => None,
             };
             expr::unknown_value_coercion(
                 target_oid,
                 crate::coerce::CoercionContext::Assignment,
                 snapshot,
-                node.unwrap_or(&fallback),
+                node,
             )?;
             continue;
         }
@@ -1668,11 +1657,10 @@ fn analyze_insert_select(
             continue;
         }
         let literal = direct_targets.get(i).and_then(|t| {
-            if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
-                && let Some(val) = &rt.val
-                && let Some(node::Node::AConst(ac)) = val.node.as_ref()
+            if let Some(ast::Node::ResTarget(rt)) = t.as_ref()
+                && let Some(ast::Node::AConst(ac)) = rt.val.as_ref()
                 && !ac.isnull
-                && let Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
+                && let Some(typedpg_pg_query::ast::AConstValue::String(sv)) = &ac.val
             {
                 Some(sv.sval.as_str())
             } else {
@@ -1732,8 +1720,8 @@ fn analyze_insert_select(
     // their conversion to the columns' types is folded like a VALUES row's.
     if super::deferred::pulled_up(val_sel) {
         for (i, target) in direct_targets.iter().enumerate() {
-            if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-                && let Some(val) = &rt.val
+            if let Some(ast::Node::ResTarget(rt)) = target.as_ref()
+                && let val @ Some(_) = &rt.val
                 && let Some(tc) = target_col_at(tgt, i)
                 && tgt.col_indirection.get(i).is_none_or(|ind| ind.is_empty())
                 && !tgt.discards(tc)
@@ -1752,23 +1740,23 @@ fn analyze_insert_select(
     // The expressions each output column takes its value from: the select
     // list's entries, or — a VALUES source with ORDER BY / LIMIT & co. —
     // every row's value at that position.
-    let mut outputs: Vec<(usize, &protobuf::Node)> = direct_targets
+    let mut outputs: Vec<(usize, &Option<ast::Node>)> = direct_targets
         .iter()
         .enumerate()
-        .filter_map(|(i, t)| match t.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => Some((i, rt.val.as_deref()?)),
+        .filter_map(|(i, t)| match t.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => rt.val.is_some().then_some((i, &rt.val)),
             _ => None,
         })
         .collect();
-    if val_sel.op == SetOperation::SetopNone as i32 {
+    if val_sel.op == SetOperation::SetopNone {
         for row in &val_sel.values_lists {
-            if let Some(node::Node::List(list)) = row.node.as_ref() {
+            if let Some(ast::Node::List(list)) = row.as_ref() {
                 outputs.extend(list.items.iter().enumerate());
             }
         }
     }
     for (i, val) in outputs {
-        if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+        if let Some(ast::Node::ParamRef(p)) = val.as_ref()
             && let Some(tc) = target_col_at(tgt, i)
             && let Some(Some(target_oid)) = target_types.get(i)
         {
@@ -1821,35 +1809,35 @@ fn analyze_insert_select(
 /// which are. A value is known only when the VALUES column has the target
 /// column's type: another one is converted on the way.
 fn general_values_violation(
-    val_sel: &protobuf::SelectStmt,
+    val_sel: &ast::SelectStmt,
     tgt: &InsertTarget,
     column_types: &[PgTypeOid],
     snapshot: &PgCatalog,
 ) -> Option<AnalyzeError> {
     /// A constant non-negative count (`None`: a NULL / ALL one, which
     /// doesn't count); `Err` when it isn't one.
-    fn count(n: Option<&protobuf::Node>) -> Result<Option<usize>, ()> {
-        use typedpg_pg_query::protobuf::a_const::Val;
-        match n.and_then(|n| n.node.as_ref()) {
+    fn count(n: Option<&ast::Node>) -> Result<Option<usize>, ()> {
+        use typedpg_pg_query::ast::{self, AConstValue};
+        match n {
             None => Ok(None),
-            Some(node::Node::AConst(c)) if c.isnull => Ok(None),
-            Some(node::Node::AConst(c)) => match &c.val {
-                Some(Val::Ival(i)) => usize::try_from(i.ival).map(Some).map_err(|_| ()),
+            Some(ast::Node::AConst(c)) if c.isnull => Ok(None),
+            Some(ast::Node::AConst(c)) => match &c.val {
+                Some(AConstValue::Integer(i)) => usize::try_from(i.ival).map(Some).map_err(|_| ()),
                 _ => Err(()),
             },
             _ => Err(()),
         }
     }
-    let rows: Vec<&[protobuf::Node]> = val_sel
+    let rows: Vec<&[Option<ast::Node>]> = val_sel
         .values_lists
         .iter()
-        .filter_map(|l| match l.node.as_ref() {
-            Some(node::Node::List(list)) => Some(list.items.as_slice()),
+        .filter_map(|l| match l.as_ref() {
+            Some(ast::Node::List(list)) => Some(list.items.as_slice()),
             _ => None,
         })
         .collect();
-    let offset = count(val_sel.limit_offset.as_deref()).ok()?.unwrap_or(0);
-    let limit = count(val_sel.limit_count.as_deref())
+    let offset = count(val_sel.limit_offset.as_ref()).ok()?.unwrap_or(0);
+    let limit = count(val_sel.limit_count.as_ref())
         .ok()?
         .unwrap_or(usize::MAX);
     let violations: Vec<Option<RowViolation>> = rows
@@ -1905,14 +1893,14 @@ fn general_values_violation(
 /// ([`validate_on_conflict_target`]), `None` without an inference clause,
 /// and the DO UPDATE SET list as [`analyze_set_clause`] expanded it.
 fn analyze_insert_on_conflict(
-    on_conflict: &protobuf::OnConflictClause,
-    relation: &protobuf::RangeVar,
+    on_conflict: &ast::OnConflictClause,
+    relation: &ast::RangeVar,
     tgt: &InsertTarget,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
-) -> Result<(Option<Arbiter>, Vec<protobuf::Node>), AnalyzeError> {
-    let update = on_conflict.action() == protobuf::OnConflictAction::OnconflictUpdate;
+) -> Result<(Option<Arbiter>, Vec<Option<ast::Node>>), AnalyzeError> {
+    let update = on_conflict.action == ast::OnConflictAction::OnconflictUpdate;
     let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
     let mut target_scope = Scope {
         ctes: cte_scopes.clone(),
@@ -1985,7 +1973,7 @@ fn analyze_insert_on_conflict(
         false,
     )?
     .into_owned();
-    if let Some(where_clause) = &on_conflict.where_clause {
+    if let where_clause @ Some(_) = &on_conflict.where_clause {
         expr::infer_expr(
             where_clause,
             expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
@@ -2005,7 +1993,7 @@ fn analyze_insert_on_conflict(
 /// the WHERE is transformed as an index predicate; a named constraint must
 /// exist on the table.
 fn transform_on_conflict_arbiter(
-    infer: &protobuf::InferClause,
+    infer: &ast::InferClause,
     target_alias: &str,
     tgt: &InsertTarget,
     ctx: Ctx<'_>,
@@ -2024,19 +2012,13 @@ fn transform_on_conflict_arbiter(
             .finalize_implicit()
     };
     for elem in &infer.index_elems {
-        let Some(node::Node::IndexElem(ie)) = elem.node.as_ref() else {
+        let Some(ast::Node::IndexElem(ie)) = elem.as_ref() else {
             continue;
         };
-        if !matches!(
-            ie.ordering(),
-            protobuf::SortByDir::SortbyDefault | protobuf::SortByDir::Undefined
-        ) {
+        if ie.ordering != ast::SortByDir::SortbyDefault {
             return Err(invalid("ASC/DESC is not allowed in ON CONFLICT clause"));
         }
-        if !matches!(
-            ie.nulls_ordering(),
-            protobuf::SortByNulls::SortbyNullsDefault | protobuf::SortByNulls::Undefined
-        ) {
+        if ie.nulls_ordering != ast::SortByNulls::SortbyNullsDefault {
             return Err(invalid(
                 "NULLS FIRST/LAST is not allowed in ON CONFLICT clause",
             ));
@@ -2062,7 +2044,7 @@ fn transform_on_conflict_arbiter(
             } else {
                 ctx.scope.resolve_column(None, &ie.name, None)?;
             }
-        } else if let Some(e) = ie.expr.as_deref() {
+        } else if let e @ Some(_) = &ie.expr {
             check_index_expr_kind(e, snapshot, "index expressions", "index expression")?;
             expr::infer_expr(e, ctx, params, TypeGoal::NONE)?;
             check_index_expr_kind(e, snapshot, "index expressions", "index expression")?;
@@ -2109,17 +2091,17 @@ fn transform_on_conflict_arbiter(
         if collation.is_some() || opclass.is_some() {
             arbiter.qualified.push(crate::resolve::ArbiterElem {
                 attnum: elem_attnum,
-                expr: ie.expr.as_deref().cloned(),
+                expr: ie.expr.as_ref().cloned(),
                 collation,
                 opclass,
             });
         }
     }
-    if let Some(w) = infer.where_clause.as_deref() {
+    if let w @ Some(_) = &infer.where_clause {
         check_index_expr_kind(w, snapshot, "index predicates", "index predicate")?;
         expr::infer_expr(w, ctx, params, TypeGoal::NONE)?;
         check_index_expr_kind(w, snapshot, "index predicates", "index predicate")?;
-        arbiter.where_clause = Some(w.clone());
+        arbiter.where_clause = w.clone();
     }
     if !infer.conname.is_empty() {
         let constraint = snapshot
@@ -2152,14 +2134,14 @@ fn transform_on_conflict_arbiter(
 /// (transformSubLink, 0A000), aggregates and window functions, and
 /// set-returning functions.
 fn check_index_expr_kind(
-    e: &protobuf::Node,
+    e: &Option<ast::Node>,
     snapshot: &PgCatalog,
     kind: &str,
     subquery_context: &str,
 ) -> Result<(), AnalyzeError> {
     let mut has_sublink = false;
     visit_same_level(e, &mut |n| {
-        has_sublink |= matches!(n.node.as_ref(), Some(node::Node::SubLink(_)));
+        has_sublink |= matches!(n.as_ref(), Some(ast::Node::SubLink(_)));
     });
     if has_sublink {
         return Err(crate::error::RawError::new(
@@ -2174,7 +2156,7 @@ fn check_index_expr_kind(
 }
 
 pub(crate) fn analyze_update(
-    upd: &protobuf::UpdateStmt,
+    upd: &ast::UpdateStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
@@ -2184,12 +2166,12 @@ pub(crate) fn analyze_update(
 /// [`analyze_update`] for an UPDATE that sees the CTEs of an enclosing
 /// `WITH` (a data-modifying CTE body).
 pub(crate) fn analyze_update_with_outer_ctes(
-    upd: &protobuf::UpdateStmt,
+    upd: &ast::UpdateStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
-    if replaced_by_instead_rule(upd.relation.as_ref(), CmdType::CmdUpdate, snapshot) {
+    if replaced_by_instead_rule(upd.relation.as_deref(), CmdType::CmdUpdate, snapshot) {
         crate::expr::replaced_by_rule(|| analyze_update_here(upd, snapshot, params, outer_ctes))
     } else {
         analyze_update_here(upd, snapshot, params, outer_ctes)
@@ -2199,32 +2181,30 @@ pub(crate) fn analyze_update_with_outer_ctes(
 /// An UPDATE's or DELETE's FROM items: its target `relation`, then those
 /// of its FROM / USING clause `from`.
 fn with_target(
-    relation: Option<&protobuf::RangeVar>,
-    from: &[protobuf::Node],
-) -> Vec<protobuf::Node> {
+    relation: Option<&ast::RangeVar>,
+    from: &[Option<ast::Node>],
+) -> Vec<Option<ast::Node>> {
     relation
-        .map(|rv| protobuf::Node {
-            node: Some(node::Node::RangeVar(rv.clone())),
-        })
+        .map(|rv| Some(ast::Node::RangeVar(NodeBox::new(rv.clone()))))
         .into_iter()
         .chain(from.iter().cloned())
         .collect()
 }
 
 fn analyze_update_here(
-    upd: &protobuf::UpdateStmt,
+    upd: &ast::UpdateStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
     // The target is one of the level's relations.
-    let from = with_target(upd.relation.as_ref(), &upd.from_clause);
+    let from = with_target(upd.relation.as_deref(), &upd.from_clause);
     let _plan = expr::plan_fold::PlanLevel::enter_dml(
-        upd.where_clause.as_deref(),
+        upd.where_clause.as_ref(),
         &from,
-        upd.relation.as_ref(),
-        upd.with_clause.as_ref(),
+        upd.relation.as_deref(),
+        upd.with_clause.as_deref(),
         typedpg_pg_query::NodeRef::UpdateStmt(upd),
         outer_ctes.keys(),
         snapshot,
@@ -2267,7 +2247,7 @@ fn analyze_update_here(
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
     // The columns the UPDATE writes.
     for target in &upd.target_list {
-        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref() {
+        if let Some(ast::Node::ResTarget(rt)) = target.as_ref() {
             crate::ddl::depend::note_column(table_oid, &rt.name);
         }
     }
@@ -2277,14 +2257,12 @@ fn analyze_update_here(
     // reasoning as the corresponding block in `analyze_insert`.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &upd.with_clause {
-        let owner = protobuf::Node {
-            node: Some(node::Node::UpdateStmt(Box::new(upd.clone()))),
-        };
+        let owner = ast::Node::UpdateStmt(NodeBox::new(upd.clone()));
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
     }
-    check_current_of_on_view(upd.where_clause.as_deref(), snapshot, table_oid)?;
+    check_current_of_on_view(upd.where_clause.as_ref(), snapshot, table_oid)?;
 
     // Build scope with target table + FROM clause tables.
     let mut scope = Scope {
@@ -2327,7 +2305,7 @@ fn analyze_update_here(
     // WHERE — BOOL goal with assignment coercion.
     let mut rows = ReturningRows::default();
     let mut old_facts: Option<crate::nonnull::Facts> = None;
-    if let Some(where_clause) = &upd.where_clause {
+    if let where_clause @ Some(_) = &upd.where_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             where_clause,
@@ -2451,7 +2429,7 @@ fn analyze_update_here(
 }
 
 pub(crate) fn analyze_delete(
-    del: &protobuf::DeleteStmt,
+    del: &ast::DeleteStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
@@ -2461,12 +2439,12 @@ pub(crate) fn analyze_delete(
 /// [`analyze_delete`] for a DELETE that sees the CTEs of an enclosing
 /// `WITH` (a data-modifying CTE body).
 pub(crate) fn analyze_delete_with_outer_ctes(
-    del: &protobuf::DeleteStmt,
+    del: &ast::DeleteStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
-    if replaced_by_instead_rule(del.relation.as_ref(), CmdType::CmdDelete, snapshot) {
+    if replaced_by_instead_rule(del.relation.as_deref(), CmdType::CmdDelete, snapshot) {
         crate::expr::replaced_by_rule(|| analyze_delete_here(del, snapshot, params, outer_ctes))
     } else {
         analyze_delete_here(del, snapshot, params, outer_ctes)
@@ -2474,19 +2452,19 @@ pub(crate) fn analyze_delete_with_outer_ctes(
 }
 
 fn analyze_delete_here(
-    del: &protobuf::DeleteStmt,
+    del: &ast::DeleteStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
     // The target is one of the level's relations.
-    let from = with_target(del.relation.as_ref(), &del.using_clause);
+    let from = with_target(del.relation.as_deref(), &del.using_clause);
     let _plan = expr::plan_fold::PlanLevel::enter_dml(
-        del.where_clause.as_deref(),
+        del.where_clause.as_ref(),
         &from,
-        del.relation.as_ref(),
-        del.with_clause.as_ref(),
+        del.relation.as_deref(),
+        del.with_clause.as_deref(),
         typedpg_pg_query::NodeRef::DeleteStmt(del),
         outer_ctes.keys(),
         snapshot,
@@ -2532,14 +2510,12 @@ fn analyze_delete_here(
     // with the collector and the CTE alias is visible to the USING clause.
     let mut cte_scopes: HashMap<String, Vec<ScopeColumn>> = outer_ctes.clone();
     if let Some(with) = &del.with_clause {
-        let owner = protobuf::Node {
-            node: Some(node::Node::DeleteStmt(Box::new(del.clone()))),
-        };
+        let owner = ast::Node::DeleteStmt(NodeBox::new(del.clone()));
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
     }
-    check_current_of_on_view(del.where_clause.as_deref(), snapshot, table_oid)?;
+    check_current_of_on_view(del.where_clause.as_ref(), snapshot, table_oid)?;
 
     let mut scope = Scope {
         ctes: cte_scopes.clone(),
@@ -2581,7 +2557,7 @@ fn analyze_delete_here(
     };
     // WHERE — BOOL goal with assignment coercion.
     let mut old_facts: Option<crate::nonnull::Facts> = None;
-    if let Some(where_clause) = &del.where_clause {
+    if let where_clause @ Some(_) = &del.where_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             where_clause,
@@ -2803,7 +2779,7 @@ pub(crate) fn take_written_relation(relid: crate::oid::PgClassOid) -> Option<Vec
 /// hold of the old row.
 fn where_facts(
     ctx: expr::Ctx<'_>,
-    where_clause: &protobuf::Node,
+    where_clause: &Option<ast::Node>,
     log: &crate::nonnull::StrictLog,
     target_alias: &str,
     rows: &mut ReturningRows,
@@ -2896,7 +2872,7 @@ pub(crate) fn rows_returned_as_is(snapshot: &PgCatalog, relid: crate::oid::PgCla
 /// transformDeleteStmt): a LATERAL subquery or a FROM function referencing
 /// it is `invalid reference to FROM-clause entry` (42P10).
 fn process_from_clause_beside_target(
-    from_clause: &[protobuf::Node],
+    from_clause: &[Option<ast::Node>],
     target_alias: &str,
     scope: &mut Scope,
     null_ctx: &mut NullabilityContext,
@@ -2917,17 +2893,15 @@ fn process_from_clause_beside_target(
 /// transformUpdateStmt / transformDeleteStmt: `WHERE CURRENT OF` can't
 /// target a view (0A000).
 fn check_current_of_on_view(
-    where_clause: Option<&protobuf::Node>,
+    where_clause: Option<&ast::Node>,
     snapshot: &PgCatalog,
     table_oid: crate::oid::PgClassOid,
 ) -> Result<(), AnalyzeError> {
-    if matches!(
-        where_clause.and_then(|w| w.node.as_ref()),
-        Some(node::Node::CurrentOfExpr(_))
-    ) && snapshot
-        .pg_class
-        .get(&table_oid)
-        .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View)
+    if matches!(where_clause, Some(ast::Node::CurrentOfExpr(_)))
+        && snapshot
+            .pg_class
+            .get(&table_oid)
+            .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View)
     {
         return Err(crate::error::RawError::new(
             AnalyzeError::FeatureNotSupported(

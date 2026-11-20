@@ -1,11 +1,13 @@
 use super::*;
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // SELECT
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn analyze_select(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
@@ -19,7 +21,7 @@ pub(crate) fn analyze_select(
 /// `IN (SELECT ...)`, where PG's lexical rule says inner aliases shadow
 /// outer ones.
 pub(crate) fn analyze_correlated_select(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_scope: &crate::scope::Scope,
@@ -82,13 +84,13 @@ pub(crate) fn analyze_correlated_select(
 /// Set-operation arms and INSERT … SELECT keep their unknowns (PG resolves
 /// those against the other arm / the target column) and don't come here.
 pub(crate) fn resolve_unknown_outputs(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     cols: &mut [RawColumn],
     params: &mut ParamCollector,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     expr::resolve_untyped_output_params(sel, snapshot, params)?;
-    let direct = sel.op == SetOperation::SetopNone as i32
+    let direct = sel.op == SetOperation::SetopNone
         && sel.values_lists.is_empty()
         && sel.target_list.len() == cols.len();
     for (i, col) in cols.iter_mut().enumerate() {
@@ -101,8 +103,8 @@ pub(crate) fn resolve_unknown_outputs(
         // labels its column text, no coercion runs.)
         col.unknown_value = false;
         if direct
-            && let Some(node::Node::ResTarget(rt)) = sel.target_list[i].node.as_ref()
-            && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            && let Some(ast::Node::ResTarget(rt)) = sel.target_list[i].as_ref()
+            && let Some(ast::Node::ParamRef(p)) = rt.val.as_ref()
             && params.get(p.number) == oid::UNKNOWN
         {
             params.record(p.number, oid::TEXT);
@@ -112,7 +114,7 @@ pub(crate) fn resolve_unknown_outputs(
 }
 
 pub(crate) fn analyze_select_with_ctes(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -133,7 +135,7 @@ pub(crate) fn analyze_select_with_ctes(
 /// missing-column to PG's `invalid reference to FROM-clause entry for
 /// table "x"` when the SQL tries to reach across the boundary.
 pub(crate) fn analyze_select_with_ctes_and_outer(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -174,7 +176,7 @@ pub(crate) fn keeping_unknown_outputs<T>(f: impl FnOnce() -> T) -> T {
 /// literal nor parameter ([`RawColumn::unknown_value`]): its coercion to
 /// `text` fails (`SELECT 'a'::text::unknown`).
 pub(crate) fn resolve_unknown_values(
-    target_list: &[protobuf::Node],
+    target_list: &[Option<ast::Node>],
     columns: &[RawColumn],
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
@@ -182,14 +184,12 @@ pub(crate) fn resolve_unknown_values(
         return Ok(());
     };
     // The entry, when the select list has no `*` before it.
-    let fallback = protobuf::Node { node: None };
     let node = (target_list.len() == columns.len())
-        .then(|| match target_list[i].node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+        .then(|| match target_list[i].as_ref() {
+            Some(ast::Node::ResTarget(rt)) => rt.val.as_ref(),
             _ => None,
         })
-        .flatten()
-        .unwrap_or(&fallback);
+        .flatten();
     expr::unknown_value_coercion(
         oid::TEXT,
         crate::coerce::CoercionContext::Implicit,
@@ -199,7 +199,7 @@ pub(crate) fn resolve_unknown_values(
 }
 
 fn analyze_select_here(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -213,9 +213,9 @@ fn analyze_select_here(
     // transformSetOperationStmt: an INTO on the leftmost member is the
     // statement's only where the statement is the top level, which
     // `analyze_raw_node` strips; here it is out of place.
-    if sel.op != SetOperation::SetopNone as i32 {
+    if sel.op != SetOperation::SetopNone {
         let mut leftmost = sel;
-        while leftmost.op != SetOperation::SetopNone as i32
+        while leftmost.op != SetOperation::SetopNone
             && let Some(l) = leftmost.larg.as_deref()
         {
             leftmost = l;
@@ -241,7 +241,7 @@ fn analyze_select_here(
     // its own, without a FROM clause; its arms are the levels below.
     // Outer references reach the arms and the VALUES rows below like any
     // subquery's.
-    if sel.op != SetOperation::SetopNone as i32 {
+    if sel.op != SetOperation::SetopNone {
         grouping::register_level(sel, &[], &[]);
         let result = analyze_set_operation(
             sel,
@@ -265,8 +265,8 @@ fn analyze_select_here(
     // expression of this level (`LATERAL (VALUES (v.a))`).
     if !sel.values_lists.is_empty() {
         // transformValuesClause: a bare VALUES has no relation to lock.
-        if let Some(node::Node::LockingClause(lc)) =
-            sel.locking_clause.first().and_then(|n| n.node.as_ref())
+        if let Some(ast::Node::LockingClause(lc)) =
+            sel.locking_clause.first().and_then(|n| n.as_ref())
         {
             return Err(crate::pgmsg::locking_values(lock_strength_name(lc)).finalize_implicit());
         }
@@ -316,8 +316,8 @@ fn analyze_select_here(
     null_ctx.window_frames = sel
         .window_clause
         .iter()
-        .filter_map(|w| match w.node.as_ref()? {
-            node::Node::WindowDef(wd) => Some((wd.name.clone(), expr::effective_frame_options(wd))),
+        .filter_map(|w| match w.as_ref()? {
+            ast::Node::WindowDef(wd) => Some((wd.name.clone(), expr::effective_frame_options(wd))),
             _ => None,
         })
         .collect();
@@ -381,7 +381,7 @@ fn analyze_select_here(
     let mut correlated: Option<crate::nonnull::Facts> = None;
     let mut own_facts: Option<crate::nonnull::Facts> = None;
     let log = crate::nonnull::StrictLog::default();
-    if let Some(where_clause) = &sel.where_clause {
+    if let where_clause @ Some(_) = &sel.where_clause {
         // PG rejects aggregate / window function calls inside WHERE (they
         // reference the post-aggregation row, not the pre-aggregation one) —
         // but only after the expression itself resolves; the ordering lives
@@ -446,7 +446,7 @@ fn analyze_select_here(
 
     // Process HAVING clause — same boolean goal as WHERE, but aggregates
     // are of course allowed there.
-    if let Some(having) = &sel.having_clause {
+    if let having @ Some(_) = &sel.having_clause {
         let log = crate::nonnull::StrictLog::default();
         crate::clause::coerce_clause_expr(
             having,
@@ -479,15 +479,16 @@ fn analyze_select_here(
     // `SELECT DISTINCT` (the plain form parses as one empty node) restricts
     // ORDER BY to expressions that appear in the select list.
     let plain_distinct =
-        !sel.distinct_clause.is_empty() && sel.distinct_clause.iter().all(|n| n.node.is_none());
+        !sel.distinct_clause.is_empty() && sel.distinct_clause.iter().all(|n| n.is_none());
     for sort_node in &sel.sort_clause {
-        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+        let Some(ast::Node::SortBy(sb)) = sort_node.as_ref() else {
             continue;
         };
-        let Some(inner) = sb.node.as_deref() else {
+        let inner = &sb.node;
+        if inner.is_none() {
             continue;
-        };
-        if let Some(ord) = sql92_position(inner, "ORDER BY")? {
+        }
+        if let Some(ord) = sql92_position_of(inner, "ORDER BY")? {
             if ord < 1 || ord as usize > n_targets {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "ORDER BY",
@@ -558,9 +559,9 @@ fn analyze_select_here(
     // still `unknown` as text (addTargetToGroupList): `unknown_keys` are
     // the select-list entries keys name, and the bare `$N` keys transformed
     // untyped.
-    let mut unknown_keys: Vec<Result<&protobuf::ResTarget, &protobuf::ParamRef>> = Vec::new();
+    let mut unknown_keys: Vec<Result<&ast::ResTarget, &ast::ParamRef>> = Vec::new();
     for distinct_node in &sel.distinct_clause {
-        if let Some(ord) = sql92_position(distinct_node, "DISTINCT ON")? {
+        if let Some(ord) = sql92_position_of(distinct_node, "DISTINCT ON")? {
             if ord < 1 || ord as usize > n_targets {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "DISTINCT ON",
@@ -583,7 +584,7 @@ fn analyze_select_here(
         {
             unknown_keys.push(Err(p));
         }
-        if distinct_node.node.is_some()
+        if distinct_node.is_some()
             && let Err(e) = expr::infer_expr(
                 distinct_node,
                 expr::Ctx::new(&scope, &null_ctx, snapshot),
@@ -609,23 +610,23 @@ fn analyze_select_here(
     let defined_windows: std::collections::HashSet<&str> = sel
         .window_clause
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::WindowDef(w) if !w.name.is_empty() => Some(w.name.as_str()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::WindowDef(w) if !w.name.is_empty() => Some(w.name.as_str()),
             _ => None,
         })
         .collect();
     for t in &sel.target_list {
-        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
-            && let Some(val) = &rt.val
+        if let Some(ast::Node::ResTarget(rt)) = t.as_ref()
+            && rt.val.is_some()
         {
-            check_window_refs(val, &defined_windows)?;
+            check_window_refs(&rt.val, &defined_windows)?;
         }
     }
     for sort_node in &sel.sort_clause {
-        if let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref()
-            && let Some(inner) = sb.node.as_deref()
+        if let Some(ast::Node::SortBy(sb)) = sort_node.as_ref()
+            && sb.node.is_some()
         {
-            check_window_refs(inner, &defined_windows)?;
+            check_window_refs(&sb.node, &defined_windows)?;
         }
     }
     for distinct_node in &sel.distinct_clause {
@@ -678,8 +679,8 @@ fn analyze_select_here(
     for n in sel
         .target_list
         .iter()
-        .chain(sel.where_clause.as_deref())
-        .chain(sel.having_clause.as_deref())
+        .chain(std::iter::once(&sel.where_clause))
+        .chain(std::iter::once(&sel.having_clause))
         .chain(sel.sort_clause.iter())
         .chain(sel.group_clause.iter())
     {
@@ -735,10 +736,10 @@ fn analyze_select_here(
             && sel.having_clause.is_none()
             && !grouping::level_info(sel).is_some_and(|l| l.has_aggs);
         let target = match sel.target_list.as_slice() {
-            [t] => match t.node.as_ref() {
-                Some(node::Node::ResTarget(rt)) => rt
+            [t] => match t.as_ref() {
+                Some(ast::Node::ResTarget(rt)) => rt
                     .val
-                    .as_deref()
+                    .as_ref()
                     .and_then(|v| crate::nonnull::plain_column(v, &scope))
                     .map(|(col, _)| col),
                 _ => None,
@@ -799,13 +800,13 @@ fn analyze_select_here(
 /// output (an ordinal, or for ORDER BY and DISTINCT ON an output's name,
 /// is one), a window's key.
 pub(crate) fn removable_scan(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     columns: &[RawColumn],
     cte: &dyn Fn(&str) -> bool,
     not_dummy: bool,
     snapshot: &PgCatalog,
 ) -> bool {
-    if sel.op != SetOperation::SetopNone as i32
+    if sel.op != SetOperation::SetopNone
         || !sel.values_lists.is_empty()
         || !sel.locking_clause.is_empty()
         || !sel.window_clause.is_empty()
@@ -816,13 +817,13 @@ pub(crate) fn removable_scan(
         cte(name)
             || sel.with_clause.as_ref().is_some_and(|w| {
                 w.ctes.iter().any(|c| {
-                    matches!(c.node.as_ref(), Some(node::Node::CommonTableExpr(c))
+                    matches!(c.as_ref(), Some(ast::Node::CommonTableExpr(c))
                         if c.ctename == name)
                 })
             })
     };
-    let plain_table = |n: &protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::RangeVar(rv)) => {
+    let plain_table = |n: &Option<ast::Node>| match n.as_ref() {
+        Some(ast::Node::RangeVar(rv)) => {
             let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
             (schema.is_some() || !own_cte(&rv.relname))
                 && snapshot
@@ -841,35 +842,31 @@ pub(crate) fn removable_scan(
     {
         return false;
     }
-    let ordinal = |n: &protobuf::Node| {
+    let ordinal = |n: &Option<ast::Node>| {
         matches!(
-            n.node.as_ref(),
-            Some(node::Node::AConst(protobuf::AConst {
-                val: Some(protobuf::a_const::Val::Ival(_)),
-                ..
-            }))
+            n.as_ref(),
+            Some(ast::Node::AConst(c)) if matches!(c.val, Some(ast::AConstValue::Integer(_)))
         )
     };
-    let output_name = |n: &protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::ColumnRef(cr)) => match cr.fields.as_slice() {
-            [f] => matches!(f.node.as_ref(), Some(node::Node::String(s))
+    let output_name = |n: &Option<ast::Node>| match n.as_ref() {
+        Some(ast::Node::ColumnRef(cr)) => match cr.fields.as_slice() {
+            [f] => matches!(f.as_ref(), Some(ast::Node::String(s))
                 if columns.iter().filter(|c| c.name == s.sval).count() == 1),
             _ => false,
         },
         _ => false,
     };
-    let sort_keys_are_outputs = sel.sort_clause.iter().all(|s| match s.node.as_ref() {
-        Some(node::Node::SortBy(sb)) => sb
-            .node
-            .as_deref()
-            .is_some_and(|k| ordinal(k) || output_name(k)),
+    let sort_keys_are_outputs = sel.sort_clause.iter().all(|s| match s.as_ref() {
+        Some(ast::Node::SortBy(sb)) => {
+            sb.node.is_some() && (ordinal(&sb.node) || output_name(&sb.node))
+        }
         _ => false,
     });
     // A plain DISTINCT is one empty node.
     let distinct_keys_are_outputs = sel
         .distinct_clause
         .iter()
-        .all(|d| d.node.is_none() || ordinal(d) || output_name(d));
+        .all(|d| d.is_none() || ordinal(d) || output_name(d));
     if !sort_keys_are_outputs || !distinct_keys_are_outputs || !sel.group_clause.iter().all(ordinal)
     {
         return false;
@@ -881,14 +878,14 @@ pub(crate) fn removable_scan(
         .target_list
         .iter()
         .chain(&sel.from_clause)
-        .filter_map(|n| n.node.as_ref())
+        .filter_map(|n| n.as_ref())
         .map(|n| n.to_ref())
         .collect();
     if let Some(with) = &sel.with_clause {
         todo.extend(
             with.ctes
                 .iter()
-                .filter_map(|n| n.node.as_ref())
+                .filter_map(|n| n.as_ref())
                 .map(|n| n.to_ref()),
         );
     }
@@ -976,7 +973,7 @@ enum TopOutput<'a> {
 /// sits above it, a Var of it keeps its parsed collation; where the
 /// analyzer can't tell, the collation is unknown.
 fn set_planned_top(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     columns: &mut [RawColumn],
     snapshot: &PgCatalog,
@@ -1022,21 +1019,22 @@ fn set_planned_top(
     let mut outputs: Vec<TopOutput<'_>> = Vec::new();
     let mut opaque = false;
     for t in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = t.as_ref() else {
             continue;
         };
-        let Some(val) = rt.val.as_deref() else {
+        let val = &rt.val;
+        if val.is_none() {
             continue;
-        };
-        match val.node.as_ref() {
-            Some(node::Node::ColumnRef(cr))
+        }
+        match val.as_ref() {
+            Some(ast::Node::ColumnRef(cr))
                 if cr
                     .fields
                     .iter()
-                    .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_)))) =>
+                    .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_)))) =>
             {
-                let table = cr.fields.iter().rev().find_map(|f| match f.node.as_ref()? {
-                    node::Node::String(s) => Some(s.sval.as_str()),
+                let table = cr.fields.iter().rev().find_map(|f| match f.as_ref()? {
+                    ast::Node::String(s) => Some(s.sval.as_str()),
                     _ => None,
                 });
                 let cols: Vec<&ScopeColumn> = match table {
@@ -1061,7 +1059,7 @@ fn set_planned_top(
                     }
                 }));
             }
-            Some(node::Node::ColumnRef(cr)) => match column_ref_target(cr, scope) {
+            Some(ast::Node::ColumnRef(cr)) => match column_ref_target(cr, scope) {
                 Some(c) if local(c) => outputs.push(TopOutput::Var(c)),
                 Some(_) => outputs.push(TopOutput::Other),
                 None => opaque = true,
@@ -1080,7 +1078,7 @@ fn set_planned_top(
                     continue;
                 }
                 let mut cols = Vec::new();
-                let mut todo: Vec<_> = val.node.as_ref().map(|n| n.to_ref()).into_iter().collect();
+                let mut todo: Vec<_> = val.as_ref().map(|n| n.to_ref()).into_iter().collect();
                 while let Some(n) = todo.pop() {
                     match n {
                         // A sublink's columns are its own query's.
@@ -1098,12 +1096,12 @@ fn set_planned_top(
                     todo.extend(n.children());
                 }
                 let mut cast = val;
-                while let Some(node::Node::TypeCast(tc)) = cast.node.as_ref()
-                    && let Some(arg) = tc.arg.as_deref()
+                while let Some(ast::Node::TypeCast(tc)) = cast.as_ref()
+                    && tc.arg.is_some()
                 {
-                    cast = arg;
+                    cast = &tc.arg;
                 }
-                let may_be_var = matches!(cast.node.as_ref(), Some(node::Node::ColumnRef(_)))
+                let may_be_var = matches!(cast.as_ref(), Some(ast::Node::ColumnRef(_)))
                     || columns
                         .get(i)
                         .is_some_and(|c| c.planned != Planned::AsParsed);
@@ -1125,25 +1123,23 @@ fn set_planned_top(
         return;
     }
     let single = match (sel.from_clause.as_slice(), scope.sources.as_slice()) {
-        ([item], [src]) if !matches!(item.node.as_ref(), Some(node::Node::JoinExpr(_))) => {
-            Some(src)
-        }
+        ([item], [src]) if !matches!(item.as_ref(), Some(ast::Node::JoinExpr(_))) => Some(src),
         _ => None,
     };
     // limit_needed: a NULL count, a NULL or zero offset, makes no Limit
     // node; another constant does.
-    let constant = |n: Option<&protobuf::Node>| match n.and_then(|n| n.node.as_ref()) {
+    let constant = |n: Option<&ast::Node>| match n {
         None => Some(None),
-        Some(node::Node::AConst(c)) if c.isnull => Some(None),
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(protobuf::a_const::Val::Ival(i)),
-            ..
-        })) => Some(Some(i.ival)),
+        Some(ast::Node::AConst(c)) if c.isnull => Some(None),
+        Some(ast::Node::AConst(c)) => match &c.val {
+            Some(ast::AConstValue::Integer(i)) => Some(Some(i.ival)),
+            _ => None,
+        },
         _ => None,
     };
     let (count, offset) = (
-        constant(sel.limit_count.as_deref()),
-        constant(sel.limit_offset.as_deref()),
+        constant(sel.limit_count.as_ref()),
+        constant(sel.limit_offset.as_ref()),
     );
     let no_limit = count == Some(None) && matches!(offset, Some(None | Some(0)));
     let limit_node = matches!(count, Some(Some(_))) || matches!(offset, Some(Some(o)) if o != 0);
@@ -1152,7 +1148,8 @@ fn set_planned_top(
     // Result over the level's Vars; a qual that is no constant (one no
     // custom plan's parameter values or sublink may turn into one) stays
     // above the scan, unless pushed down into the subquery.
-    let where_fold = sel.where_clause.as_deref().map(|w| {
+    let where_fold = sel.where_clause.is_some().then(|| {
+        let w = &sel.where_clause;
         let fixed = !contains_node(w, &|n| {
             matches!(
                 n,
@@ -1209,14 +1206,15 @@ fn set_planned_top(
         let (len, facts) = (first.len, first.facts);
         // The WHERE reads nothing but the scan's Vars: no pulled-up
         // expression a substitution may fold.
-        let where_reads_scan = sel.where_clause.as_deref().is_some_and(|w| {
+        let where_reads_scan = sel.where_clause.is_some() && {
+            let w = &sel.where_clause;
             !contains_node(w, &|n| match n {
                 typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                     column_ref_target(cr, scope).is_none_or(|c| !local(c) || scan_of(c).is_none())
                 }
                 _ => false,
             })
-        });
+        };
         let trivial = outputs.len() == len
             && outputs
                 .iter()
@@ -1238,21 +1236,21 @@ fn set_planned_top(
         // Incremental Sort, is above the scan. `key_var` tells whether a
         // key is a Var of the scan, and whether it has no collation.
         let no_collation = |o: &TopOutput<'_>| matches!(o, TopOutput::Var(v) if v.no_collation);
-        let key_var = |k: &protobuf::Node| -> Option<bool> {
-            match k.node.as_ref() {
-                Some(node::Node::AConst(protobuf::AConst {
-                    val: Some(protobuf::a_const::Val::Ival(i)),
-                    ..
-                })) => usize::try_from(i.ival)
-                    .ok()
-                    .and_then(|i| i.checked_sub(1))
-                    .and_then(|i| outputs.get(i))
-                    .filter(|o| scan(o).is_some())
-                    .map(no_collation),
-                Some(node::Node::ColumnRef(cr)) => {
+        let key_var = |k: &Option<ast::Node>| -> Option<bool> {
+            match k.as_ref() {
+                Some(ast::Node::AConst(c)) => match &c.val {
+                    Some(ast::AConstValue::Integer(i)) => usize::try_from(i.ival)
+                        .ok()
+                        .and_then(|i| i.checked_sub(1))
+                        .and_then(|i| outputs.get(i))
+                        .filter(|o| scan(o).is_some())
+                        .map(no_collation),
+                    _ => None,
+                },
+                Some(ast::Node::ColumnRef(cr)) => {
                     let by_name = match cr.fields.as_slice() {
-                        [f] => match f.node.as_ref() {
-                            Some(node::Node::String(s)) => {
+                        [f] => match f.as_ref() {
+                            Some(ast::Node::String(s)) => {
                                 let named: Vec<_> = columns
                                     .iter()
                                     .zip(&outputs)
@@ -1282,8 +1280,8 @@ fn set_planned_top(
         let keys: Option<Vec<bool>> = sel
             .sort_clause
             .iter()
-            .map(|s| match s.node.as_ref() {
-                Some(node::Node::SortBy(sb)) => sb.node.as_deref().and_then(key_var),
+            .map(|s| match s.as_ref() {
+                Some(ast::Node::SortBy(sb)) => key_var(&sb.node),
                 _ => None,
             })
             .collect();
@@ -1361,28 +1359,22 @@ fn set_planned_top(
 /// alone) not on the nullable side of an outer join — or on one
 /// `join_is_removable` can't drop (see [`nullable_side_kept`]).
 fn never_removed(
-    item: &protobuf::Node,
-    sel: &protobuf::SelectStmt,
+    item: &Option<ast::Node>,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
-    match item.node.as_ref() {
-        Some(node::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot).is_some(),
-        Some(node::Node::JoinExpr(j)) => {
-            let side = |n: &Option<Box<protobuf::Node>>| {
-                n.as_deref()
-                    .is_some_and(|n| never_removed(n, sel, scope, snapshot))
-            };
-            let nullable = |n: &Option<Box<protobuf::Node>>| {
-                n.as_deref()
-                    .is_some_and(|n| nullable_side_kept(n, j, sel, scope, snapshot))
-            };
-            match protobuf::JoinType::try_from(j.jointype) {
-                Ok(protobuf::JoinType::JoinInner | protobuf::JoinType::JoinFull) => {
+    match item.as_ref() {
+        Some(ast::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot).is_some(),
+        Some(ast::Node::JoinExpr(j)) => {
+            let side = |n: &Option<ast::Node>| never_removed(n, sel, scope, snapshot);
+            let nullable = |n: &Option<ast::Node>| nullable_side_kept(n, j, sel, scope, snapshot);
+            match j.jointype {
+                ast::JoinType::JoinInner | ast::JoinType::JoinFull => {
                     side(&j.larg) || side(&j.rarg)
                 }
-                Ok(protobuf::JoinType::JoinLeft) => side(&j.larg) || nullable(&j.rarg),
-                Ok(protobuf::JoinType::JoinRight) => side(&j.rarg) || nullable(&j.larg),
+                ast::JoinType::JoinLeft => side(&j.larg) || nullable(&j.rarg),
+                ast::JoinType::JoinRight => side(&j.rarg) || nullable(&j.larg),
                 _ => false,
             }
         }
@@ -1393,7 +1385,7 @@ fn never_removed(
 /// The FROM entry of `scope` RangeVar `rv` is, when it is a table,
 /// partitioned table or materialized view.
 fn relation_source<'a>(
-    rv: &protobuf::RangeVar,
+    rv: &ast::RangeVar,
     scope: &'a Scope,
     snapshot: &PgCatalog,
 ) -> Option<&'a crate::scope::TableSource> {
@@ -1426,9 +1418,9 @@ fn relation_source<'a>(
 /// (`relation_has_unique_index_for`), none of its columns used above the
 /// join (in the target list or a WHERE qual, which is pushed down).
 fn nullable_side_kept(
-    item: &protobuf::Node,
-    j: &protobuf::JoinExpr,
-    sel: &protobuf::SelectStmt,
+    item: &Option<ast::Node>,
+    j: &ast::JoinExpr,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
@@ -1438,20 +1430,16 @@ fn nullable_side_kept(
             .values()
             .any(|i| i.indrelid == relid && i.indisunique)
     };
-    let rv = match item.node.as_ref() {
-        Some(node::Node::RangeVar(rv)) => rv,
-        Some(node::Node::JoinExpr(inner)) => {
-            let plain = |n: &Option<Box<protobuf::Node>>| match n
-                .as_deref()
-                .and_then(|n| n.node.as_ref())
-            {
-                Some(node::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot)
+    let rv = match item.as_ref() {
+        Some(ast::Node::RangeVar(rv)) => rv,
+        Some(ast::Node::JoinExpr(inner)) => {
+            let plain = |n: &Option<ast::Node>| match n.as_ref() {
+                Some(ast::Node::RangeVar(rv)) => relation_source(rv, scope, snapshot)
                     .and_then(|s| s.relid)
                     .filter(|&r| !unique_index(r)),
                 _ => None,
             };
-            return protobuf::JoinType::try_from(inner.jointype)
-                == Ok(protobuf::JoinType::JoinInner)
+            return inner.jointype == ast::JoinType::JoinInner
                 && plain(&inner.larg).is_some()
                 && plain(&inner.rarg).is_some();
         }
@@ -1470,21 +1458,16 @@ fn nullable_side_kept(
     let mut mentioned: Vec<&str> = j
         .using_clause
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect();
-    if let Some(quals) = j.quals.as_deref() {
-        let mut todo: Vec<_> = quals
-            .node
-            .as_ref()
-            .map(|n| n.to_ref())
-            .into_iter()
-            .collect();
+    if let Some(quals) = j.quals.as_ref() {
+        let mut todo: Vec<_> = vec![quals.to_ref()];
         while let Some(n) = todo.pop() {
             if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
-                && let Some(node::Node::String(s)) = cr.fields.last().and_then(|f| f.node.as_ref())
+                && let Some(ast::Node::String(s)) = cr.fields.last().and_then(|f| f.as_ref())
             {
                 mentioned.push(s.sval.as_str());
             }
@@ -1511,18 +1494,18 @@ fn nullable_side_kept(
     }
     // A column of the relation read above the join (outside sublinks,
     // whose names may be their own entries').
-    let reads = |n: &protobuf::Node| {
+    let reads = |n: &Option<ast::Node>| {
         contains_node_outside_sublinks(n, &|n| match n {
             typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                 let star = cr
                     .fields
                     .last()
-                    .is_some_and(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
+                    .is_some_and(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))));
                 if star {
                     match cr.fields.as_slice() {
                         [_] => !source.columns.is_empty(),
-                        [t, _] => matches!(t.node.as_ref(),
-                            Some(node::Node::String(s)) if s.sval == source.alias),
+                        [t, _] => matches!(t.as_ref(),
+                            Some(ast::Node::String(s)) if s.sval == source.alias),
                         _ => false,
                     }
                 } else {
@@ -1533,15 +1516,15 @@ fn nullable_side_kept(
             _ => false,
         })
     };
-    sel.target_list.iter().any(reads) || sel.where_clause.as_deref().is_some_and(reads)
+    sel.target_list.iter().any(reads) || reads(&sel.where_clause)
 }
 
 /// Whether `n` holds a node `pred` accepts, not looking into sublinks.
 fn contains_node_outside_sublinks(
-    n: &protobuf::Node,
+    n: &Option<ast::Node>,
     pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>) -> bool,
 ) -> bool {
-    let Some(n) = n.node.as_ref() else {
+    let Some(n) = n.as_ref() else {
         return false;
     };
     let mut todo = vec![n.to_ref()];
@@ -1563,7 +1546,7 @@ fn contains_node_outside_sublinks(
 /// whose branch constants decide (`eval_const_expressions`) — `true`
 /// then — reaching one.
 fn folds_to_column<'a>(
-    n: &protobuf::Node,
+    n: &Option<ast::Node>,
     scope: &'a Scope,
     snapshot: &PgCatalog,
 ) -> Option<(bool, &'a ScopeColumn)> {
@@ -1572,35 +1555,35 @@ fn folds_to_column<'a>(
     let mut casts = Vec::new();
     let mut n = n;
     loop {
-        match n.node.as_ref()? {
-            node::Node::TypeCast(tc) => {
+        match n.as_ref()? {
+            ast::Node::TypeCast(tc) => {
                 let tn = tc.type_name.as_ref()?;
                 if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() || tn.setof || tn.pct_type
                 {
                     return None;
                 }
                 casts.push(crate::ddl::util::resolve_type_name(tn, snapshot)?);
-                n = tc.arg.as_deref()?;
+                n = &tc.arg;
             }
-            node::Node::CaseExpr(c) if c.arg.is_none() => {
+            ast::Node::CaseExpr(c) if c.arg.is_none() => {
                 let mut next = None;
                 for w in &c.args {
-                    let Some(node::Node::CaseWhen(w)) = w.node.as_ref() else {
+                    let Some(ast::Node::CaseWhen(w)) = w.as_ref() else {
                         return None;
                     };
-                    match case_when(None, w.expr.as_deref(), snapshot) {
+                    match case_when(None, w.expr.as_ref(), snapshot) {
                         Folded::Bool(true) => {
-                            next = w.result.as_deref();
+                            next = Some(&w.result).filter(|r| r.is_some());
                             break;
                         }
                         Folded::Bool(false) | Folded::Null => {}
                         _ => return None,
                     }
                 }
-                n = next.or(c.defresult.as_deref())?;
+                n = next.or(Some(&c.defresult).filter(|d| d.is_some()))?;
                 folded = true;
             }
-            node::Node::ColumnRef(cr) => {
+            ast::Node::ColumnRef(cr) => {
                 let c = column_ref_target(cr, scope)?;
                 return (c.typmod.is_none() && casts.iter().all(|t| *t == c.type_oid))
                     .then_some((folded, c));
@@ -1614,18 +1597,18 @@ fn folds_to_column<'a>(
 /// outputs are `columns`, certainly makes of a SubqueryScan over it,
 /// planned on its own (see [`crate::scope::ScanFacts`]).
 fn scan_facts(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     columns: &[RawColumn],
     snapshot: &PgCatalog,
 ) -> crate::scope::ScanFacts {
     use crate::expr::plan_fold::Folded;
     use crate::pg_catalog::RelKind;
-    if sel.op != SetOperation::SetopNone as i32 || !sel.values_lists.is_empty() {
+    if sel.op != SetOperation::SetopNone || !sel.values_lists.is_empty() {
         return Default::default();
     }
-    let source_of = |n: &protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::RangeVar(rv)) => {
+    let source_of = |n: &Option<ast::Node>| match n.as_ref() {
+        Some(ast::Node::RangeVar(rv)) => {
             let name = rv
                 .alias
                 .as_ref()
@@ -1652,7 +1635,7 @@ fn scan_facts(
     // dummy one, and so is the join (`expand_partitioned_rtentry`).
     let tables = !sel.from_clause.is_empty()
         && sel.from_clause.iter().all(|f| {
-            matches!(f.node.as_ref(), Some(node::Node::RangeVar(rv)) if rv.inh)
+            matches!(f.as_ref(), Some(ast::Node::RangeVar(rv)) if rv.inh)
                 && source_of(f).is_some_and(|s| {
                     matches!(relkind(s), Some(RelKind::Table | RelKind::Partitioned))
                 })
@@ -1681,34 +1664,33 @@ fn scan_facts(
     // one (`restriction_is_constant_false`), and so the subquery's; the
     // relation reading it is a dummy one too. (A Limit node, a sort,
     // grouping or row marks above it may keep a plan.)
-    let no_limit_node =
-        |n: Option<&protobuf::Node>, zero_ok: bool| match n.and_then(|n| n.node.as_ref()) {
-            None => true,
-            Some(node::Node::AConst(c)) if c.isnull => true,
-            Some(node::Node::AConst(protobuf::AConst {
-                val: Some(protobuf::a_const::Val::Ival(i)),
-                ..
-            })) => zero_ok && i.ival == 0,
+    let no_limit_node = |n: Option<&ast::Node>, zero_ok: bool| match n {
+        None => true,
+        Some(ast::Node::AConst(c)) if c.isnull => true,
+        Some(ast::Node::AConst(c)) => match &c.val {
+            Some(ast::AConstValue::Integer(i)) => zero_ok && i.ival == 0,
             _ => false,
-        };
+        },
+        _ => false,
+    };
     let dummy = tables
         && plain_level
         && sel.sort_clause.is_empty()
         && sel.locking_clause.is_empty()
-        && no_limit_node(sel.limit_count.as_deref(), false)
-        && no_limit_node(sel.limit_offset.as_deref(), true)
+        && no_limit_node(sel.limit_count.as_ref(), false)
+        && no_limit_node(sel.limit_offset.as_ref(), true)
         && (no_partition
-            || sel.where_clause.as_deref().is_some_and(|w| {
-                crate::expr::plan_fold::fold_qual(w, snapshot) == Folded::Bool(false)
-            }));
+            || (sel.where_clause.is_some()
+                && crate::expr::plan_fold::fold_qual(&sel.where_clause, snapshot)
+                    == Folded::Bool(false)));
     // Row marks: each locked table adds a resjunk `ctid` entry.
-    let row_marks = sel.locking_clause.iter().any(|l| match l.node.as_ref() {
-        Some(node::Node::LockingClause(lc)) => sel.from_clause.iter().any(|f| {
+    let row_marks = sel.locking_clause.iter().any(|l| match l.as_ref() {
+        Some(ast::Node::LockingClause(lc)) => sel.from_clause.iter().any(|f| {
             source_of(f).is_some_and(|s| {
                 matches!(relkind(s), Some(RelKind::Table | RelKind::Partitioned))
                     && (lc.locked_rels.is_empty()
                         || lc.locked_rels.iter().any(|r| {
-                            matches!(r.node.as_ref(), Some(node::Node::RangeVar(rv))
+                            matches!(r.as_ref(), Some(ast::Node::RangeVar(rv))
                                 if rv.schemaname.is_empty() && rv.relname == s.alias)
                         }))
             })
@@ -1719,15 +1701,14 @@ fn scan_facts(
     // resjunk entry (`findTargetlistEntrySQL99` adds one). An unqualified
     // name naming an output is that output (SQL92 rule).
     let resjunk_sort = sel.sort_clause.iter().any(|s| {
-        let Some(node::Node::SortBy(sb)) = s.node.as_ref() else {
+        let Some(ast::Node::SortBy(sb)) = s.as_ref() else {
             return false;
         };
-        let Some(node::Node::ColumnRef(cr)) = sb.node.as_deref().and_then(|k| k.node.as_ref())
-        else {
+        let Some(ast::Node::ColumnRef(cr)) = sb.node.as_ref() else {
             return false;
         };
         if let [f] = cr.fields.as_slice()
-            && let Some(node::Node::String(s)) = f.node.as_ref()
+            && let Some(ast::Node::String(s)) = f.as_ref()
             && columns.iter().any(|c| c.name == s.sval)
         {
             return false;
@@ -1736,18 +1717,18 @@ fn scan_facts(
             return false;
         };
         !sel.target_list.iter().any(|t| {
-            let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+            let Some(ast::Node::ResTarget(rt)) = t.as_ref() else {
                 return true;
             };
-            let mut v = rt.val.as_deref();
-            while let Some(node::Node::TypeCast(tc)) = v.and_then(|v| v.node.as_ref()) {
-                v = tc.arg.as_deref();
+            let mut v = rt.val.as_ref();
+            while let Some(ast::Node::TypeCast(tc)) = v {
+                v = tc.arg.as_ref();
             }
-            match v.and_then(|v| v.node.as_ref()) {
-                Some(node::Node::ColumnRef(t)) => {
+            match v {
+                Some(ast::Node::ColumnRef(t)) => {
                     t.fields
                         .iter()
-                        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+                        .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
                         || column_ref_target(t, scope).is_none_or(|c| std::ptr::eq(c, key))
                 }
                 _ => false,
@@ -1813,8 +1794,11 @@ fn has_leaf_partition(snapshot: &PgCatalog, rel: crate::oid::PgClassOid) -> bool
 }
 
 /// Whether `n` holds a node `pred` accepts.
-fn contains_node(n: &protobuf::Node, pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>) -> bool) -> bool {
-    let mut todo: Vec<_> = n.node.as_ref().map(|n| n.to_ref()).into_iter().collect();
+fn contains_node(
+    n: &Option<ast::Node>,
+    pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>) -> bool,
+) -> bool {
+    let mut todo: Vec<_> = n.as_ref().map(|n| n.to_ref()).into_iter().collect();
     while let Some(n) = todo.pop() {
         if pred(n) {
             return true;
@@ -1826,12 +1810,12 @@ fn contains_node(n: &protobuf::Node, pred: &dyn Fn(typedpg_pg_query::NodeRef<'_>
 
 /// The column a non-star column reference resolves to, if it names one
 /// (not a whole row).
-fn column_ref_target<'a>(cr: &protobuf::ColumnRef, scope: &'a Scope) -> Option<&'a ScopeColumn> {
+fn column_ref_target<'a>(cr: &ast::ColumnRef, scope: &'a Scope) -> Option<&'a ScopeColumn> {
     let names: Vec<&str> = cr
         .fields
         .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+        .map(|f| match f.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect::<Option<_>>()?;
@@ -1843,15 +1827,15 @@ fn column_ref_target<'a>(cr: &protobuf::ColumnRef, scope: &'a Scope) -> Option<&
 }
 
 /// Whether a target list holds a `(expr).*`.
-fn star_over_expression(target_list: &[protobuf::Node]) -> bool {
+fn star_over_expression(target_list: &[Option<ast::Node>]) -> bool {
     target_list.iter().any(|t| {
         matches!(
-            t.node.as_ref(),
-            Some(node::Node::ResTarget(rt))
+            t.as_ref(),
+            Some(ast::Node::ResTarget(rt))
                 if matches!(
-                    rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                    Some(node::Node::AIndirection(i))
-                        if i.indirection.iter().any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+                    rt.val.as_ref(),
+                    Some(ast::Node::AIndirection(i))
+                        if i.indirection.iter().any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
                 )
         )
     })
@@ -1861,9 +1845,9 @@ fn star_over_expression(target_list: &[protobuf::Node]) -> bool {
 /// an aggregate of this level in its select list or ORDER BY — directly,
 /// or in a sublink over a column this level may provide (PG gives an
 /// aggregate the level of its arguments' columns).
-fn may_aggregate(sel: &protobuf::SelectStmt, scope: &Scope, snapshot: &PgCatalog) -> bool {
+fn may_aggregate(sel: &ast::SelectStmt, scope: &Scope, snapshot: &PgCatalog) -> bool {
     use typedpg_pg_query::NodeRef;
-    let is_aggregate = |f: &protobuf::FuncCall| {
+    let is_aggregate = |f: &ast::FuncCall| {
         let parts = expr::extract_string_fields(&f.funcname);
         let (schema, name) = match parts.as_slice() {
             [n] => (None, n.as_str()),
@@ -1897,7 +1881,7 @@ fn may_aggregate(sel: &protobuf::SelectStmt, scope: &Scope, snapshot: &PgCatalog
     fn walk(
         n: NodeRef<'_>,
         in_sublink: bool,
-        is_aggregate: &dyn Fn(&protobuf::FuncCall) -> bool,
+        is_aggregate: &dyn Fn(&ast::FuncCall) -> bool,
         mentions_own: &dyn Fn(NodeRef<'_>) -> bool,
     ) -> bool {
         let own = match n {
@@ -1915,8 +1899,7 @@ fn may_aggregate(sel: &protobuf::SelectStmt, scope: &Scope, snapshot: &PgCatalog
     }
     sel.having_clause.is_some()
         || sel.target_list.iter().chain(&sel.sort_clause).any(|n| {
-            n.node
-                .as_ref()
+            n.as_ref()
                 .is_some_and(|n| walk(n.to_ref(), false, &is_aggregate, &mentions_own))
         })
 }
@@ -1926,28 +1909,28 @@ enum KeyRef<'a> {
     /// A select-list entry (expanded-target index).
     Target(usize),
     /// An expression of its own.
-    Expr(&'a protobuf::Node),
+    Expr(&'a Option<ast::Node>),
 }
 
 /// The expression of expanded select-list entry `i`, a column reference for
 /// a `*` column.
-fn target_expr(targets: &[ExpandedTarget<'_>], i: usize) -> Option<protobuf::Node> {
+fn target_expr(targets: &[ExpandedTarget<'_>], i: usize) -> Option<Option<ast::Node>> {
     match targets.get(i)? {
-        ExpandedTarget::Expr(rt) => rt.val.as_deref().cloned(),
+        ExpandedTarget::Expr(rt) => rt.val.is_some().then(|| rt.val.clone()),
         ExpandedTarget::StarColumn {
             column: Some((alias, col)),
             ..
-        } => Some(protobuf::Node {
-            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                fields: [*alias, *col]
-                    .into_iter()
-                    .map(|s| protobuf::Node {
-                        node: Some(node::Node::String(protobuf::String { sval: s.into() })),
-                    })
-                    .collect(),
-                location: -1,
-            })),
-        }),
+        } => Some(Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+            fields: [*alias, *col]
+                .into_iter()
+                .map(|s| {
+                    Some(ast::Node::String(NodeBox::new(ast::String {
+                        sval: s.into(),
+                    })))
+                })
+                .collect(),
+            location: -1,
+        })))),
         ExpandedTarget::StarColumn { column: None, .. } => None,
     }
 }
@@ -1958,7 +1941,7 @@ fn target_expr(targets: &[ExpandedTarget<'_>], i: usize) -> Option<protobuf::Nod
 /// it) — `{clause} "a" is ambiguous` (42702) when several output columns
 /// of that name have differing expressions; anything else is an expression.
 fn sql92_key<'a>(
-    node: &'a protobuf::Node,
+    node: &'a Option<ast::Node>,
     clause: &str,
     targets: &[ExpandedTarget<'_>],
     columns: &[RawColumn],
@@ -1971,7 +1954,7 @@ fn sql92_key<'a>(
             _ => KeyRef::Expr(node),
         });
     }
-    let Some(node::Node::ColumnRef(cr)) = node.node.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = node.as_ref() else {
         return Ok(KeyRef::Expr(node));
     };
     let parts = expr::extract_string_fields(&cr.fields);
@@ -2017,7 +2000,7 @@ fn sql92_key<'a>(
 /// such operator), then assign_collations' rule that a sort / group key's
 /// collation must be determinate (42P21).
 fn check_sort_group_keys(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     targets: &[ExpandedTarget<'_>],
     columns: &[RawColumn],
     ctx: Ctx<'_>,
@@ -2027,15 +2010,14 @@ fn check_sort_group_keys(
     let scope = ctx.scope;
     // `(key, operators needed — None for ORDER BY … USING, location)`.
     let mut keys: Vec<(KeyRef<'_>, Option<KeyUse>, i32)> = Vec::new();
-    let loc = |n: &protobuf::Node| crate::error::node_location(n).unwrap_or(-1);
-    fn sort_items(order: &[protobuf::Node]) -> Vec<(&protobuf::Node, bool)> {
+    let loc = |n: &Option<ast::Node>| crate::error::node_location(n).unwrap_or(-1);
+    fn sort_items(order: &[Option<ast::Node>]) -> Vec<(&Option<ast::Node>, bool)> {
         order
             .iter()
-            .filter_map(|o| match o.node.as_ref()? {
-                node::Node::SortBy(sb) => Some((
-                    sb.node.as_deref()?,
-                    sb.sortby_dir() == protobuf::SortByDir::SortbyUsing,
-                )),
+            .filter_map(|o| match o.as_ref()? {
+                ast::Node::SortBy(sb) if sb.node.is_some() => {
+                    Some((&sb.node, sb.sortby_dir == ast::SortByDir::SortbyUsing))
+                }
                 _ => None,
             })
             .collect()
@@ -2044,9 +2026,9 @@ fn check_sort_group_keys(
         let key = sql92_key(inner, "ORDER BY", targets, columns, scope, ctx.snapshot)?;
         keys.push((key, (!using).then_some(KeyUse::Sort), loc(inner)));
     }
-    let mut stack: Vec<&protobuf::Node> = sel.group_clause.iter().rev().collect();
+    let mut stack: Vec<&Option<ast::Node>> = sel.group_clause.iter().rev().collect();
     while let Some(g) = stack.pop() {
-        if let Some(node::Node::GroupingSet(gs)) = g.node.as_ref() {
+        if let Some(ast::Node::GroupingSet(gs)) = g.as_ref() {
             stack.extend(gs.content.iter().rev());
         } else if let Some(items) = grouping::implicit_row_items(g) {
             stack.extend(items.iter().rev());
@@ -2056,7 +2038,7 @@ fn check_sort_group_keys(
         }
     }
     let plain_distinct =
-        !sel.distinct_clause.is_empty() && sel.distinct_clause.iter().all(|n| n.node.is_none());
+        !sel.distinct_clause.is_empty() && sel.distinct_clause.iter().all(|n| n.is_none());
     if plain_distinct {
         for (i, t) in targets.iter().enumerate() {
             let location = match t {
@@ -2066,37 +2048,37 @@ fn check_sort_group_keys(
             keys.push((KeyRef::Target(i), Some(KeyUse::Group), location));
         }
     } else {
-        for d in sel.distinct_clause.iter().filter(|n| n.node.is_some()) {
+        for d in sel.distinct_clause.iter().filter(|n| n.is_some()) {
             let key = sql92_key(d, "DISTINCT ON", targets, columns, scope, ctx.snapshot)?;
             keys.push((key, Some(KeyUse::Group), loc(d)));
         }
     }
     // Windows and aggregates of this level.
-    let mut windows: Vec<&protobuf::WindowDef> = sel
+    let mut windows: Vec<&ast::WindowDef> = sel
         .window_clause
         .iter()
-        .filter_map(|w| match w.node.as_ref()? {
-            node::Node::WindowDef(wd) => Some(&**wd),
+        .filter_map(|w| match w.as_ref()? {
+            ast::Node::WindowDef(wd) => Some(&**wd),
             _ => None,
         })
         .collect();
-    let mut level_exprs: Vec<&protobuf::Node> = sel
+    let mut level_exprs: Vec<&Option<ast::Node>> = sel
         .target_list
         .iter()
-        .filter_map(|t| match t.node.as_ref()? {
-            node::Node::ResTarget(rt) => rt.val.as_deref(),
+        .filter_map(|t| match t.as_ref()? {
+            ast::Node::ResTarget(rt) if rt.val.is_some() => Some(&rt.val),
             _ => None,
         })
         .collect();
-    level_exprs.extend(sel.having_clause.as_deref());
+    level_exprs.extend(Some(&sel.having_clause).filter(|h| h.is_some()));
     level_exprs.extend(sort_items(&sel.sort_clause).into_iter().map(|(n, _)| n));
-    let mut agg_keys: Vec<(&protobuf::Node, KeyUse)> = Vec::new();
+    let mut agg_keys: Vec<(&Option<ast::Node>, KeyUse)> = Vec::new();
     for e in level_exprs {
         visit_same_level(e, &mut |n| {
             // SQL/JSON aggregates: their ORDER BY and window.
-            let json_agg = match n.node.as_ref() {
-                Some(node::Node::JsonObjectAgg(a)) => a.constructor.as_deref(),
-                Some(node::Node::JsonArrayAgg(a)) => a.constructor.as_deref(),
+            let json_agg = match n.as_ref() {
+                Some(ast::Node::JsonObjectAgg(a)) => a.constructor.as_deref(),
+                Some(ast::Node::JsonArrayAgg(a)) => a.constructor.as_deref(),
                 _ => None,
             };
             if let Some(ctor) = json_agg {
@@ -2107,7 +2089,7 @@ fn check_sort_group_keys(
                         .map(|(n, _)| (n, KeyUse::Sort)),
                 );
             }
-            let Some(node::Node::FuncCall(fc)) = n.node.as_ref() else {
+            let Some(ast::Node::FuncCall(fc)) = n.as_ref() else {
                 return;
             };
             if let Some(over) = fc.over.as_deref() {
@@ -2161,7 +2143,7 @@ fn check_sort_group_keys(
                 oid::TEXT,
                 crate::coerce::CoercionContext::Implicit,
                 ctx.snapshot,
-                &node,
+                node.as_ref(),
             )?;
         }
     }
@@ -2204,7 +2186,7 @@ fn check_sort_group_keys(
 /// transformValuesClause): they see its columns (`column1`, …) the way a
 /// query sees a FROM item, and select-list positions count its columns.
 fn values_sort_and_limit(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     columns: &[RawColumn],
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -2241,13 +2223,14 @@ fn values_sort_and_limit(
     // them: an aggregate there over `column1` is the VALUES level's.
     grouping::with_own_namespace(&scope.sources, || {
         for sort_node in &sel.sort_clause {
-            let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+            let Some(ast::Node::SortBy(sb)) = sort_node.as_ref() else {
                 continue;
             };
-            let Some(inner) = sb.node.as_deref() else {
+            let inner = &sb.node;
+            if inner.is_none() {
                 continue;
-            };
-            if let Some(ord) = sql92_position(inner, "ORDER BY")? {
+            }
+            if let Some(ord) = sql92_position_of(inner, "ORDER BY")? {
                 if ord < 1 || ord as usize > columns.len() {
                     return Err(crate::pgmsg::position_not_in_select_list(
                         "ORDER BY",
@@ -2278,17 +2261,17 @@ fn values_sort_and_limit(
 /// WINDOW clause. SubLinks are skipped — their windows belong to the inner
 /// query.
 fn check_window_refs(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     defined: &std::collections::HashSet<&str>,
 ) -> Result<(), AnalyzeError> {
     let mut missing: Option<(&str, i32)> = None;
     visit_same_level(node, &mut |n| {
-        let over = match n.node.as_ref() {
-            Some(node::Node::FuncCall(fc)) => fc.over.as_deref(),
-            Some(node::Node::JsonObjectAgg(a)) => {
+        let over = match n.as_ref() {
+            Some(ast::Node::FuncCall(fc)) => fc.over.as_deref(),
+            Some(ast::Node::JsonObjectAgg(a)) => {
                 a.constructor.as_deref().and_then(|c| c.over.as_deref())
             }
-            Some(node::Node::JsonArrayAgg(a)) => {
+            Some(ast::Node::JsonArrayAgg(a)) => {
                 a.constructor.as_deref().and_then(|c| c.over.as_deref())
             }
             _ => None,
@@ -2318,15 +2301,12 @@ fn check_window_refs(
 /// (`Some`), any other constant — string, float, boolean, NULL — is
 /// `non-integer constant in {clause}` (42601), and anything else is an
 /// expression (`None`).
-pub(crate) fn sql92_position(
-    node: &protobuf::Node,
-    clause: &str,
-) -> Result<Option<i64>, AnalyzeError> {
-    let Some(node::Node::AConst(ac)) = node.node.as_ref() else {
+pub(crate) fn sql92_position(node: &ast::Node, clause: &str) -> Result<Option<i64>, AnalyzeError> {
+    let ast::Node::AConst(ac) = node else {
         return Ok(None);
     };
     match &ac.val {
-        Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) if !ac.isnull => {
+        Some(typedpg_pg_query::ast::AConstValue::Integer(i)) if !ac.isnull => {
             Ok(Some(i.ival as i64))
         }
         _ => Err(crate::pgmsg::non_integer_constant(
@@ -2337,12 +2317,18 @@ pub(crate) fn sql92_position(
     }
 }
 
+/// [`sql92_position`] of a list cell: a NULL one is no constant.
+fn sql92_position_of(node: &Option<ast::Node>, clause: &str) -> Result<Option<i64>, AnalyzeError> {
+    node.as_ref()
+        .map_or(Ok(None), |n| sql92_position(n, clause))
+}
+
 /// If `node` is a bare integer literal, return its value — GROUP BY / ORDER
 /// BY treat those as 1-based projection ordinals.
-fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
-    if let Some(node::Node::AConst(ac)) = node.node.as_ref()
+fn ordinal_of(node: &Option<ast::Node>) -> Option<i64> {
+    if let Some(ast::Node::AConst(ac)) = node.as_ref()
         && !ac.isnull
-        && let Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)) = &ac.val
+        && let Some(typedpg_pg_query::ast::AConstValue::Integer(i)) = &ac.val
     {
         return Some(i.ival as i64);
     }
@@ -2355,7 +2341,7 @@ fn ordinal_of(node: &protobuf::Node) -> Option<i64> {
 /// `ARRAY[…]` and `IN (…)` lists among them. Used to compare an ORDER BY
 /// expression against the projection entries (PG's "appears in select
 /// list" test), where byte positions necessarily differ.
-pub(crate) fn node_fingerprint(node: &protobuf::Node) -> String {
+pub(crate) fn node_fingerprint(node: &Option<ast::Node>) -> String {
     use typedpg_pg_query::Equal;
     let mut out = String::new();
     node.equal_key(&mut out);
@@ -2366,13 +2352,13 @@ pub(crate) fn node_fingerprint(node: &protobuf::Node) -> String {
 /// select list — as a structurally equal expression or as a select-list
 /// alias (ordinals are handled by the caller).
 fn sort_expr_in_select_list(
-    inner: &protobuf::Node,
-    target_list: &[protobuf::Node],
+    inner: &Option<ast::Node>,
+    target_list: &[Option<ast::Node>],
     select_aliases: &std::collections::HashSet<String>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
-    if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref() {
+    if let Some(ast::Node::ColumnRef(cr)) = inner.as_ref() {
         let parts = expr::extract_string_fields(&cr.fields);
         if let [single] = parts.as_slice()
             && select_aliases.contains(single)
@@ -2380,9 +2366,13 @@ fn sort_expr_in_select_list(
             return true;
         }
     }
+    // Callers pass a present key.
+    let Some(inner) = inner.as_ref() else {
+        return false;
+    };
     let want = grouping::typed_fingerprint(inner, scope, snapshot);
     target_list.iter().any(|t| {
-        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref()
+        if let Some(ast::Node::ResTarget(rt)) = t.as_ref()
             && let Some(val) = &rt.val
         {
             grouping::typed_fingerprint(val, scope, snapshot) == want
@@ -2397,7 +2387,7 @@ fn sort_expr_in_select_list(
 /// expressions. The walk type-checks parameters and rejects aggregates /
 /// window calls inside the grouping expressions (PG forbids those too).
 fn walk_group_clause_node(
-    group_node: &protobuf::Node,
+    group_node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     select_aliases: &std::collections::HashSet<String>,
@@ -2413,8 +2403,8 @@ fn walk_group_clause_node(
     // A grouping set's members — and the members of an implicit row
     // `(a, b)`, which flatten_grouping_sets turns into a list of grouping
     // expressions — are grouping expressions of their own.
-    let members = match group_node.node.as_ref() {
-        Some(node::Node::GroupingSet(gs)) => Some(&gs.content),
+    let members = match group_node.as_ref() {
+        Some(ast::Node::GroupingSet(gs)) => Some(&gs.content),
         _ => grouping::implicit_row_items(group_node),
     };
     if let Some(members) = members {
@@ -2428,8 +2418,8 @@ fn walk_group_clause_node(
             )?;
         }
         // transformGroupingSet: a CUBE over more than 12 elements.
-        if let Some(node::Node::GroupingSet(gs)) = group_node.node.as_ref()
-            && gs.kind == protobuf::GroupingSetKind::GroupingSetCube as i32
+        if let Some(ast::Node::GroupingSet(gs)) = group_node.as_ref()
+            && gs.kind == ast::GroupingSetKind::GroupingSetCube
             && gs.content.len() > 12
         {
             return Err(crate::pgmsg::cube_too_many_elements(
@@ -2441,7 +2431,7 @@ fn walk_group_clause_node(
     }
     // Integer literals are 1-based projection ordinals (42P10 when out of
     // range); a valid one needs no further walking.
-    if let Some(ord) = sql92_position(group_node, "GROUP BY")? {
+    if let Some(ord) = sql92_position_of(group_node, "GROUP BY")? {
         if ord < 1 || ord as usize > n_targets {
             return Err(crate::pgmsg::position_not_in_select_list(
                 "GROUP BY",
@@ -2465,7 +2455,7 @@ fn walk_group_clause_node(
     // (colNameToVar — a FROM entry's name doesn't count) but an output
     // column's name stands for that select-list entry. `GROUP BY s` with
     // `SELECT s::c FROM (…) s` groups by `s::c`, not the whole row `s`.
-    if let Some(node::Node::ColumnRef(cr)) = group_node.node.as_ref()
+    if let Some(ast::Node::ColumnRef(cr)) = group_node.as_ref()
         && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
         && cr.fields.len() == 1
         && matches!(
@@ -2490,8 +2480,8 @@ fn walk_group_clause_node(
         if !is_select_alias_reference(group_node, select_aliases, &e) {
             return Err(e);
         }
-        let alias = expr::extract_string_fields(match group_node.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => &cr.fields,
+        let alias = expr::extract_string_fields(match group_node.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) => &cr.fields,
             _ => &[],
         });
         let target = targets.iter().find_map(|t| match t {
@@ -2519,16 +2509,16 @@ fn walk_group_clause_node(
 /// output name — a bare name, which findTargetlistEntrySQL92 matches
 /// against the output names before the input columns.
 fn aliased_target<'a>(
-    key: &protobuf::Node,
+    key: &Option<ast::Node>,
     targets: &[ExpandedTarget<'a>],
-) -> Option<&'a protobuf::ResTarget> {
-    let Some(node::Node::ColumnRef(cr)) = key.node.as_ref() else {
+) -> Option<&'a ast::ResTarget> {
+    let Some(ast::Node::ColumnRef(cr)) = key.as_ref() else {
         return None;
     };
     let [field] = cr.fields.as_slice() else {
         return None;
     };
-    let Some(node::Node::String(name)) = field.node.as_ref() else {
+    let Some(ast::Node::String(name)) = field.as_ref() else {
         return None;
     };
     targets.iter().find_map(|t| match t {
@@ -2543,15 +2533,11 @@ fn aliased_target<'a>(
 /// resolved as text right there — `inconsistent types deduced` if a
 /// clause transformed meanwhile (WHERE, HAVING) typed `$N` otherwise.
 fn resolve_unknown_target(
-    rt: &protobuf::ResTarget,
+    rt: &ast::ResTarget,
     snapshot: &crate::pg_catalog::PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    match rt
-        .val
-        .as_deref()
-        .and_then(|v| expr::bare_param(v, snapshot))
-    {
+    match expr::bare_param(&rt.val, snapshot) {
         Some(p) if params.is_untyped_output(p.location) => {
             expr::coerce_untyped_param(p, oid::TEXT, snapshot, params)
         }
@@ -2564,13 +2550,13 @@ fn resolve_unknown_target(
 /// counts (contain_aggs_of_level) — else `aggregate functions are not
 /// allowed in GROUP BY` (42803).
 fn check_group_target_has_no_aggregates(
-    target: Option<&protobuf::ResTarget>,
+    target: Option<&ast::ResTarget>,
     snapshot: &crate::pg_catalog::PgCatalog,
 ) -> Result<(), AnalyzeError> {
     if let Some(rt) = target
-        && let Some(val) = &rt.val
+        && rt.val.is_some()
     {
-        let kinds = expr::detect_func_kinds(val, snapshot);
+        let kinds = expr::detect_func_kinds(&rt.val, snapshot);
         if kinds.has_aggregate || kinds.has_grouping {
             return Err(crate::error::RawError::new(
                 AnalyzeError::GroupingError(
@@ -2592,20 +2578,20 @@ fn check_group_target_has_no_aggregates(
 /// that isn't visible in the FROM scope. Any other error (type mismatch,
 /// undefined function, etc.) is left to propagate.
 fn is_select_alias_reference(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     aliases: &std::collections::HashSet<String>,
     err: &AnalyzeError,
 ) -> bool {
     if !matches!(err, AnalyzeError::UndefinedColumn(_)) {
         return false;
     }
-    let Some(node::Node::ColumnRef(cr)) = node.node.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = node.as_ref() else {
         return false;
     };
     if cr.fields.len() != 1 {
         return false;
     }
-    let Some(node::Node::String(s)) = cr.fields[0].node.as_ref() else {
+    let Some(ast::Node::String(s)) = cr.fields[0].as_ref() else {
         return false;
     };
     aliases.contains(&s.sval)
@@ -2613,25 +2599,25 @@ fn is_select_alias_reference(
 
 /// PG's `LCS_asString`: the clause's spelling in messages.
 /// Where PG positions an error about an INTO clause: its relation.
-pub(crate) fn into_span(into: &protobuf::IntoClause) -> Option<crate::error::SourceSpan> {
+pub(crate) fn into_span(into: &ast::IntoClause) -> Option<crate::error::SourceSpan> {
     into.rel
         .as_ref()
         .and_then(|rv| crate::error::SourceSpan::from_node_qname(rv.location))
 }
 
-pub(crate) fn lock_strength_name(lc: &protobuf::LockingClause) -> &'static str {
-    match lc.strength() {
-        typedpg_pg_query::protobuf::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
-        typedpg_pg_query::protobuf::LockClauseStrength::LcsForshare => "FOR SHARE",
-        typedpg_pg_query::protobuf::LockClauseStrength::LcsFornokeyupdate => "FOR NO KEY UPDATE",
+pub(crate) fn lock_strength_name(lc: &ast::LockingClause) -> &'static str {
+    match lc.strength {
+        typedpg_pg_query::ast::LockClauseStrength::LcsForkeyshare => "FOR KEY SHARE",
+        typedpg_pg_query::ast::LockClauseStrength::LcsForshare => "FOR SHARE",
+        typedpg_pg_query::ast::LockClauseStrength::LcsFornokeyupdate => "FOR NO KEY UPDATE",
         _ => "FOR UPDATE",
     }
 }
 
 /// The first `CheckSelectLocking` (analyze.c) violation of `sel`: the
 /// construct a locking clause is not allowed with.
-fn select_lock_blocker(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<&'static str> {
-    if sel.op != SetOperation::SetopNone as i32 {
+fn select_lock_blocker(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> Option<&'static str> {
+    if sel.op != SetOperation::SetopNone {
         return Some("UNION/INTERSECT/EXCEPT");
     }
     if !sel.distinct_clause.is_empty() {
@@ -2643,21 +2629,17 @@ fn select_lock_blocker(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Opti
     if sel.having_clause.is_some() {
         return Some("HAVING clause");
     }
-    let level_exprs: Vec<&protobuf::Node> = sel
+    let level_exprs: Vec<&Option<ast::Node>> = sel
         .target_list
         .iter()
-        .filter_map(|t| match t.node.as_ref()? {
-            node::Node::ResTarget(rt) => rt.val.as_deref(),
+        .filter_map(|t| match t.as_ref()? {
+            ast::Node::ResTarget(rt) if rt.val.is_some() => Some(&rt.val),
             _ => None,
         })
-        .chain(
-            sel.sort_clause
-                .iter()
-                .filter_map(|n| match n.node.as_ref()? {
-                    node::Node::SortBy(sb) => sb.node.as_deref(),
-                    _ => None,
-                }),
-        )
+        .chain(sel.sort_clause.iter().filter_map(|n| match n.as_ref()? {
+            ast::Node::SortBy(sb) if sb.node.is_some() => Some(&sb.node),
+            _ => None,
+        }))
         .collect();
     let kinds: Vec<_> = level_exprs
         .iter()
@@ -2680,24 +2662,17 @@ fn select_lock_blocker(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Opti
 /// clause to the subquery, which re-runs `CheckSelectLocking` there and
 /// pushes further into *its* FROM subqueries.
 pub(crate) fn subquery_lock_blocker(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Option<&'static str> {
-    fn from_item_blocker(n: &protobuf::Node, snapshot: &PgCatalog) -> Option<&'static str> {
-        match n.node.as_ref()? {
-            node::Node::RangeSubselect(rs) => match rs.subquery.as_deref()?.node.as_ref()? {
-                node::Node::SelectStmt(s) => subquery_lock_blocker(s, snapshot),
+    fn from_item_blocker(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<&'static str> {
+        match n.as_ref()? {
+            ast::Node::RangeSubselect(rs) => match rs.subquery.as_ref()? {
+                ast::Node::SelectStmt(s) => subquery_lock_blocker(s, snapshot),
                 _ => None,
             },
-            node::Node::JoinExpr(j) => j
-                .larg
-                .as_deref()
-                .and_then(|l| from_item_blocker(l, snapshot))
-                .or_else(|| {
-                    j.rarg
-                        .as_deref()
-                        .and_then(|r| from_item_blocker(r, snapshot))
-                }),
+            ast::Node::JoinExpr(j) => from_item_blocker(&j.larg, snapshot)
+                .or_else(|| from_item_blocker(&j.rarg, snapshot)),
             _ => None,
         }
     }
@@ -2718,7 +2693,7 @@ pub(crate) fn subquery_lock_blocker(
 /// planner's `make_outerjoininfo` error. All but the missing entry are
 /// 0A000.
 fn check_locking_clause(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
@@ -2729,7 +2704,7 @@ fn check_locking_clause(
             .finalize_implicit()
     };
     for node in &sel.locking_clause {
-        let Some(node::Node::LockingClause(lc)) = node.node.as_ref() else {
+        let Some(ast::Node::LockingClause(lc)) = node.as_ref() else {
             continue;
         };
         let clause = lock_strength_name(lc);
@@ -2747,7 +2722,7 @@ fn check_locking_clause(
             );
         }
         for rel in &lc.locked_rels {
-            let Some(node::Node::RangeVar(rv)) = rel.node.as_ref() else {
+            let Some(ast::Node::RangeVar(rv)) = rel.as_ref() else {
                 continue;
             };
             if !rv.schemaname.is_empty() || !rv.catalogname.is_empty() {
@@ -2830,7 +2805,7 @@ fn check_locking_clause(
 /// `argument of LIMIT must not contain variables` (outer references are
 /// fine).
 pub(crate) fn analyze_limit_offset(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -2843,9 +2818,9 @@ pub(crate) fn analyze_limit_offset(
         ),
         (&sel.limit_count, crate::clause::ClauseKind::Limit, "LIMIT"),
     ] {
-        let Some(limit_node) = limit_node else {
+        if limit_node.is_none() {
             continue;
-        };
+        }
         crate::clause::coerce_clause_expr(limit_node, ctx, params, kind)?;
         // The conversion to `bigint` is folded by the planner.
         if expr::plan_time_checks()
@@ -2864,7 +2839,7 @@ pub(crate) fn analyze_limit_offset(
         let mut var: Option<i32> = None;
         visit_same_level(limit_node, &mut |e| {
             if var.is_none()
-                && let Some(node::Node::ColumnRef(cr)) = e.node.as_ref()
+                && let Some(ast::Node::ColumnRef(cr)) = e.as_ref()
                 && references_local_column(cr, ctx.scope)
             {
                 var = Some(cr.location);
@@ -2883,9 +2858,8 @@ pub(crate) fn analyze_limit_offset(
     }
     // transformLimitClause: WITH TIES needs a row count, so a NULL constant
     // there is rejected (a NULL at run time only fails when evaluated).
-    if sel.limit_option == protobuf::LimitOption::WithTies as i32
-        && let Some(node::Node::AConst(ac)) =
-            sel.limit_count.as_deref().and_then(|n| n.node.as_ref())
+    if sel.limit_option == ast::LimitOption::WithTies
+        && let Some(ast::Node::AConst(ac)) = sel.limit_count.as_ref()
         && ac.isnull
     {
         return Err(crate::pgmsg::with_ties_null_row_count(
@@ -2898,7 +2872,7 @@ pub(crate) fn analyze_limit_offset(
 
 /// Whether `cr` resolves against this query level's own FROM items (as
 /// opposed to an enclosing query's).
-pub(crate) fn references_local_column(cr: &protobuf::ColumnRef, scope: &Scope) -> bool {
+pub(crate) fn references_local_column(cr: &ast::ColumnRef, scope: &Scope) -> bool {
     let parts = expr::extract_string_fields(&cr.fields);
     match parts.as_slice() {
         [col] => scope
@@ -2916,23 +2890,24 @@ pub(crate) fn references_local_column(cr: &protobuf::ColumnRef, scope: &Scope) -
 /// analyzer has no `pg_amop`, so it accepts the ordering operator names PG's
 /// btree families use.
 fn check_order_by_using(
-    sort_clause: &[protobuf::Node],
-    target_list: &[protobuf::Node],
+    sort_clause: &[Option<ast::Node>],
+    target_list: &[Option<ast::Node>],
     columns: &[RawColumn],
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Result<(), AnalyzeError> {
     let snapshot = ctx.snapshot;
     for sort_node in sort_clause {
-        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+        let Some(ast::Node::SortBy(sb)) = sort_node.as_ref() else {
             continue;
         };
-        if sb.sortby_dir() != protobuf::SortByDir::SortbyUsing {
+        if sb.sortby_dir != ast::SortByDir::SortbyUsing {
             continue;
         }
-        let Some(inner) = sb.node.as_deref() else {
+        let inner = &sb.node;
+        if inner.is_none() {
             continue;
-        };
+        }
         let Some(ty) = sort_expr_type(inner, target_list, columns, ctx, params) else {
             continue;
         };
@@ -2967,8 +2942,8 @@ fn check_order_by_using(
 /// the target list (`findTargetlistEntrySQL92`), anything else is inferred
 /// on a scratch parameter collector.
 fn sort_expr_type(
-    inner: &protobuf::Node,
-    target_list: &[protobuf::Node],
+    inner: &Option<ast::Node>,
+    target_list: &[Option<ast::Node>],
     columns: &[RawColumn],
     ctx: Ctx<'_>,
     params: &ParamCollector,
@@ -2998,8 +2973,8 @@ enum SortKey {
 /// bare name matching an output column is that column, and otherwise the
 /// expression matches a select-list entry it is equal to.
 fn sort_target_key(
-    inner: &protobuf::Node,
-    target_list: &[protobuf::Node],
+    inner: &Option<ast::Node>,
+    target_list: &[Option<ast::Node>],
     columns: &[RawColumn],
     scope: &Scope,
     snapshot: &PgCatalog,
@@ -3009,24 +2984,28 @@ fn sort_target_key(
     {
         return SortKey::Target(ord as usize - 1);
     }
-    if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref()
+    if let Some(ast::Node::ColumnRef(cr)) = inner.as_ref()
         && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
         && let Some(i) = columns.iter().position(|c| &c.name == name)
     {
         return SortKey::Target(i);
     }
+    // Callers pass a present key.
+    let Some(inner) = inner.as_ref() else {
+        return SortKey::Expr(node_fingerprint(inner));
+    };
     let fp = grouping::typed_fingerprint(inner, scope, snapshot);
     // Only a plain target list (no `*`) lines up with the output columns.
     let has_star = target_list.iter().any(|t| {
-        matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                Some(node::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
-                    matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
+        matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+            if matches!(rt.val.as_ref(),
+                Some(ast::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
+                    matches!(f.as_ref(), Some(ast::Node::AStar(_))))))
     });
     if !has_star
         && let Some(i) = target_list.iter().position(|t| {
-            matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-                if rt.val.as_deref().is_some_and(|v| grouping::typed_fingerprint(v, scope, snapshot) == fp))
+            matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+                if rt.val.as_ref().is_some_and(|v| grouping::typed_fingerprint(v, scope, snapshot) == fp))
         })
     {
         return SortKey::Target(i);
@@ -3039,7 +3018,7 @@ fn sort_target_key(
 /// been skipped, a later DISTINCT ON item (in ORDER BY or not) is 42P10
 /// `SELECT DISTINCT ON expressions must match initial ORDER BY expressions`.
 fn check_distinct_on_matches_order_by(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     columns: &[RawColumn],
     scope: &Scope,
     snapshot: &PgCatalog,
@@ -3047,7 +3026,7 @@ fn check_distinct_on_matches_order_by(
     let distinct: Vec<SortKey> = sel
         .distinct_clause
         .iter()
-        .filter(|n| n.node.is_some())
+        .filter(|n| n.is_some())
         .map(|n| sort_target_key(n, &sel.target_list, columns, scope, snapshot))
         .collect();
     if distinct.is_empty() || sel.sort_clause.is_empty() {
@@ -3066,12 +3045,13 @@ fn check_distinct_on_matches_order_by(
     let mut skipped = false;
     let mut covered: Vec<&SortKey> = Vec::new();
     for sort_node in &sel.sort_clause {
-        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+        let Some(ast::Node::SortBy(sb)) = sort_node.as_ref() else {
             continue;
         };
-        let Some(inner) = sb.node.as_deref() else {
+        let inner = &sb.node;
+        if inner.is_none() {
             continue;
-        };
+        }
         let key = sort_target_key(inner, &sel.target_list, columns, scope, snapshot);
         if let Some(d) = distinct.iter().find(|d| **d == key) {
             if skipped {

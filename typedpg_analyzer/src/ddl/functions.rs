@@ -7,9 +7,9 @@
 //! body (`interpret_AS_clause`), then `ProcedureCreate` (pg_proc.c) — the
 //! signature rules, CREATE OR REPLACE's rules — and the language's validator.
 
-use typedpg_pg_query::protobuf::{
-    CreateFunctionStmt, DefElem, FunctionParameterMode, ObjectType, ObjectWithArgs, TypeName,
-    VariableSetKind, node,
+use typedpg_pg_query::ast::{
+    self, CreateFunctionStmt, DefElem, FunctionParameterMode, ObjectType, ObjectWithArgs, TypeName,
+    VariableSetKind,
 };
 
 use crate::oid::{PgNamespaceOid, PgProcOid, PgTypeOid};
@@ -47,7 +47,7 @@ struct CommonAttributes<'a> {
     strict: Option<&'a DefElem>,
     security: Option<&'a DefElem>,
     leakproof: Option<&'a DefElem>,
-    set_items: Vec<&'a node::Node>,
+    set_items: Vec<&'a ast::Node>,
     cost: Option<&'a DefElem>,
     rows: Option<&'a DefElem>,
     support: Option<&'a DefElem>,
@@ -69,7 +69,7 @@ impl<'a> CommonAttributes<'a> {
             }
             "leakproof" => &mut self.leakproof,
             "set" => {
-                if let Some(arg) = de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                if let Some(arg) = de.arg.as_ref() {
                     self.set_items.push(arg);
                 }
                 return Ok(true);
@@ -146,13 +146,13 @@ struct FunctionAttributes<'a> {
 fn compute_function_attributes<'a>(
     interp: &PgCatalog,
     is_procedure: bool,
-    options: &'a [typedpg_pg_query::protobuf::Node],
+    options: &'a [Option<typedpg_pg_query::ast::Node>],
 ) -> Result<FunctionAttributes<'a>, DdlError> {
     let mut attrs = FunctionAttributes::default();
     let mut language_item: Option<&DefElem> = None;
     let mut window_item: Option<&DefElem> = None;
     for option in options {
-        let Some(node::Node::DefElem(de)) = option.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = option.as_ref() else {
             continue;
         };
         match de.defname.as_str() {
@@ -198,13 +198,13 @@ fn compute_function_attributes<'a>(
 
 /// `defGetString` of an option's value, for the forms these options take.
 fn def_string(de: &DefElem) -> Option<String> {
-    match de.arg.as_deref()?.node.as_ref()? {
-        node::Node::String(s) => Some(s.sval.clone()),
-        node::Node::Integer(i) => Some(i.ival.to_string()),
-        node::Node::Float(f) => Some(f.fval.clone()),
-        node::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
-        node::Node::TypeName(tn) => Some(type_name_to_string(tn)),
-        node::Node::List(l) => Some(
+    match de.arg.as_ref()? {
+        ast::Node::String(s) => Some(s.sval.clone()),
+        ast::Node::Integer(i) => Some(i.ival.to_string()),
+        ast::Node::Float(f) => Some(f.fval.clone()),
+        ast::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
+        ast::Node::TypeName(tn) => Some(type_name_to_string(tn)),
+        ast::Node::List(l) => Some(
             l.items
                 .iter()
                 .filter_map(node_string)
@@ -217,20 +217,20 @@ fn def_string(de: &DefElem) -> Option<String> {
 
 /// `defGetBoolean`: no value means true.
 fn def_bool(de: &DefElem) -> Option<bool> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+    match de.arg.as_ref() {
         None => Some(true),
-        Some(node::Node::Boolean(b)) => Some(b.boolval),
-        Some(node::Node::Integer(i)) => Some(i.ival != 0),
-        Some(node::Node::String(s)) => super::reloptions::parse_bool(&s.sval),
+        Some(ast::Node::Boolean(b)) => Some(b.boolval),
+        Some(ast::Node::Integer(i)) => Some(i.ival != 0),
+        Some(ast::Node::String(s)) => super::reloptions::parse_bool(&s.sval),
         _ => None,
     }
 }
 
 /// `defGetNumeric`.
 fn def_numeric(de: &DefElem) -> Option<f64> {
-    match de.arg.as_deref()?.node.as_ref()? {
-        node::Node::Integer(i) => Some(f64::from(i.ival)),
-        node::Node::Float(f) => f.fval.parse().ok(),
+    match de.arg.as_ref()? {
+        ast::Node::Integer(i) => Some(f64::from(i.ival)),
+        ast::Node::Float(f) => f.fval.parse().ok(),
         _ => None,
     }
 }
@@ -248,20 +248,20 @@ fn interpret_func_parallel(de: &DefElem) -> Result<(), DdlError> {
 /// `interpret_func_support`: `SUPPORT name` names a `name(internal)`
 /// returning `internal`.
 fn interpret_func_support(interp: &PgCatalog, de: &DefElem) -> Result<PgProcOid, DdlError> {
-    let names: Vec<String> = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::List(l)) => l
+    let names: Vec<String> = match de.arg.as_ref() {
+        Some(ast::Node::List(l)) => l
             .items
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::TypeName(tn)) => tn
+        Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::String(s)) => vec![s.sval.clone()],
+        Some(ast::Node::String(s)) => vec![s.sval.clone()],
         _ => Vec::new(),
     };
     let written = names.join(".");
@@ -283,11 +283,11 @@ fn interpret_func_support(interp: &PgCatalog, de: &DefElem) -> Result<PgProcOid,
 /// (`update_proconfig_value` → `validate_option_array_item`): the
 /// parameter must exist (or be a custom `prefix.name` one), be settable,
 /// and a new value valid.
-fn check_set_item(interp: &PgCatalog, item: &node::Node) -> Result<(), DdlError> {
-    let node::Node::VariableSetStmt(set) = item else {
+fn check_set_item(interp: &PgCatalog, item: &ast::Node) -> Result<(), DdlError> {
+    let ast::Node::VariableSetStmt(set) = item else {
         return Ok(());
     };
-    let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+    let kind = set.kind;
     if matches!(kind, VariableSetKind::VarResetAll) {
         return Ok(());
     }
@@ -296,14 +296,14 @@ fn check_set_item(interp: &PgCatalog, item: &node::Node) -> Result<(), DdlError>
     };
     if kind == VariableSetKind::VarSetValue
         && let [arg] = set.args.as_slice()
-        && let Some(node::Node::AConst(c)) = arg.node.as_ref()
+        && let Some(ast::Node::AConst(c)) = arg.as_ref()
     {
-        use typedpg_pg_query::protobuf::a_const::Val;
+        use typedpg_pg_query::ast::AConstValue;
         let value = match c.val.as_ref() {
-            Some(Val::Ival(i)) => Some(i.ival.to_string()),
-            Some(Val::Fval(f)) => Some(f.fval.clone()),
-            Some(Val::Sval(s)) => Some(s.sval.clone()),
-            Some(Val::Boolval(b)) => Some(b.boolval.to_string()),
+            Some(AConstValue::Integer(i)) => Some(i.ival.to_string()),
+            Some(AConstValue::Float(f)) => Some(f.fval.clone()),
+            Some(AConstValue::String(s)) => Some(s.sval.clone()),
+            Some(AConstValue::Boolean(b)) => Some(b.boolval.to_string()),
             _ => None,
         };
         if let Some(value) = value {
@@ -342,7 +342,7 @@ pub(crate) struct ParameterList {
 /// routine's language (`None` for an aggregate).
 pub(crate) fn interpret_function_parameter_list(
     interp: &PgCatalog,
-    parameters: &[typedpg_pg_query::protobuf::Node],
+    parameters: &[Option<typedpg_pg_query::ast::Node>],
     language: Option<&str>,
     objtype: ObjectType,
 ) -> Result<ParameterList, DdlError> {
@@ -361,19 +361,19 @@ pub(crate) fn interpret_function_parameter_list(
     let mut out_count = 0;
     let mut var_count = 0;
     let mut have_defaults = false;
-    let params: Vec<&typedpg_pg_query::protobuf::FunctionParameter> = parameters
+    let params: Vec<&typedpg_pg_query::ast::FunctionParameter> = parameters
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::FunctionParameter(fp)) => Some(fp.as_ref()),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::FunctionParameter(fp)) => Some(fp.as_ref()),
             _ => None,
         })
         .collect();
     for (i, fp) in params.iter().enumerate() {
-        let mode = match FunctionParameterMode::try_from(fp.mode) {
-            Ok(FunctionParameterMode::FuncParamOut) => ArgMode::Out,
-            Ok(FunctionParameterMode::FuncParamInout) => ArgMode::InOut,
-            Ok(FunctionParameterMode::FuncParamVariadic) => ArgMode::Variadic,
-            Ok(FunctionParameterMode::FuncParamTable) => ArgMode::Table,
+        let mode = match fp.mode {
+            FunctionParameterMode::FuncParamOut => ArgMode::Out,
+            FunctionParameterMode::FuncParamInout => ArgMode::InOut,
+            FunctionParameterMode::FuncParamVariadic => ArgMode::Variadic,
+            FunctionParameterMode::FuncParamTable => ArgMode::Table,
             _ => ArgMode::In,
         };
         let Some(tn) = fp.arg_type.as_ref() else {
@@ -460,13 +460,13 @@ pub(crate) fn interpret_function_parameter_list(
                 }
             }
         }
-        match fp.defexpr.as_deref() {
+        match &fp.defexpr {
             Some(_) if !is_input => {
                 return Err(DdlError::Parse(
                     "only input parameters can have default values".into(),
                 ));
             }
-            Some(expr) => {
+            expr @ Some(_) => {
                 let polymorphic = crate::polymorphic::is_polymorphic(toid);
                 let used = std::cell::RefCell::new(Vec::new());
                 let (default_type, refs) = super::depend::collect(|| {
@@ -525,11 +525,10 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     // TRANSFORM FOR TYPE t: a transform for t (or its element type) and
     // the language must exist.
     if let Some(transform) = attrs.transform
-        && let Some(node::Node::List(types)) =
-            transform.arg.as_deref().and_then(|a| a.node.as_ref())
+        && let Some(ast::Node::List(types)) = transform.arg.as_ref()
     {
         for item in &types.items {
-            let Some(node::Node::TypeName(tn)) = item.node.as_ref() else {
+            let Some(ast::Node::TypeName(tn)) = item.as_ref() else {
                 continue;
             };
             let typeid = typename_type_id(interp, tn)?;
@@ -645,7 +644,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
             interp
                 .inline_body_trust
                 .insert(proc.oid, std::sync::OnceLock::new());
-            interp.inline_sql_bodies.insert(proc.oid, body)
+            interp.inline_sql_bodies.insert(proc.oid, Some(body))
         }
         None => {
             interp.inline_body_trust.remove(&proc.oid);
@@ -785,9 +784,9 @@ const BUILTIN_PROSRC: &str = include_str!("builtin_prosrc.txt");
 /// `fmgr_internal_validator` (pg_proc.c): a `LANGUAGE internal` function's
 /// body names a built-in C function.
 fn fmgr_internal_validator(as_clause: Option<&DefElem>, proc: &PgProc) -> Result<(), DdlError> {
-    let prosrc = match as_clause.and_then(|de| de.arg.as_deref()?.node.as_ref()) {
-        Some(node::Node::List(l)) => l.items.first().and_then(node_string).map(str::to_owned),
-        Some(node::Node::String(s)) => Some(s.sval.clone()),
+    let prosrc = match as_clause.and_then(|de| de.arg.as_ref()) {
+        Some(ast::Node::List(l)) => l.items.first().and_then(node_string).map(str::to_owned),
+        Some(ast::Node::String(s)) => Some(s.sval.clone()),
         _ => None,
     }
     .unwrap_or_else(|| proc.proname.clone());
@@ -1137,7 +1136,7 @@ pub(crate) fn lookup_func_with_args(
     let names = object_name(owa);
     let mut argoids: Vec<PgTypeOid> = Vec::new();
     for arg in &owa.objargs {
-        let Some(node::Node::TypeName(tn)) = arg.node.as_ref() else {
+        let Some(ast::Node::TypeName(tn)) = arg.as_ref() else {
             continue;
         };
         match lookup_type_name(tn, interp) {
@@ -1163,9 +1162,8 @@ pub(crate) fn lookup_func_with_args(
         && !matches!(result, Err(LookupError::Ambiguous))
     {
         let have_param_mode = owa.objfuncargs.iter().any(|a| {
-            matches!(a.node.as_ref(), Some(node::Node::FunctionParameter(fp))
-                if FunctionParameterMode::try_from(fp.mode)
-                    != Ok(FunctionParameterMode::FuncParamDefault))
+            matches!(a.as_ref(), Some(ast::Node::FunctionParameter(fp))
+                if fp.mode != FunctionParameterMode::FuncParamDefault)
         });
         if !have_param_mode {
             let with_out = lookup_func_name_internal(
@@ -1278,12 +1276,12 @@ pub(crate) fn check_no_function_in_namespace(
 /// analysis).
 pub fn alter_function(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterFunctionStmt,
+    stmt: &typedpg_pg_query::ast::AlterFunctionStmt,
 ) -> Result<(), DdlError> {
     let Some(func) = stmt.func.as_ref() else {
         return Ok(());
     };
-    let objtype = ObjectType::try_from(stmt.objtype).unwrap_or(ObjectType::ObjectFunction);
+    let objtype = stmt.objtype;
     let Some(oid) = lookup_func_with_args(interp, objtype, func, false)? else {
         return Ok(());
     };
@@ -1299,7 +1297,7 @@ pub fn alter_function(
     let is_procedure = proc.prokind == ProKind::Procedure;
     let mut common = CommonAttributes::default();
     for action in &stmt.actions {
-        let Some(node::Node::DefElem(de)) = action.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = action.as_ref() else {
             continue;
         };
         if !common.take(is_procedure, de)? {
@@ -1357,12 +1355,10 @@ pub fn alter_function(
 /// routine's input types in its schema.
 pub(crate) fn rename_routine(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
     objtype: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ObjectWithArgs(owa)) =
-        stmt.object.as_deref().and_then(|o| o.node.as_ref())
-    else {
+    let Some(ast::Node::ObjectWithArgs(owa)) = stmt.object.as_ref() else {
         return Ok(());
     };
     let Some(oid) = lookup_func_with_args(interp, objtype, owa, stmt.missing_ok)? else {
@@ -1380,13 +1376,11 @@ pub(crate) fn rename_routine(
 /// routine's name must be free for its input types in the new schema.
 pub(crate) fn set_routine_schema(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+    stmt: &typedpg_pg_query::ast::AlterObjectSchemaStmt,
     new_schema: &str,
     objtype: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ObjectWithArgs(owa)) =
-        stmt.object.as_deref().and_then(|o| o.node.as_ref())
-    else {
+    let Some(ast::Node::ObjectWithArgs(owa)) = stmt.object.as_ref() else {
         return Ok(());
     };
     let Some(oid) = lookup_func_with_args(interp, objtype, owa, stmt.missing_ok)? else {

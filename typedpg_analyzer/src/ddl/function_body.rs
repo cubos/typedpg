@@ -14,7 +14,8 @@
 //! ([`crate::expr::with_sql_function_params`]), after columns and relations,
 //! as PG's `sql_fn_post_column_ref` does.
 
-use typedpg_pg_query::protobuf::{self, CreateFunctionStmt, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast::{self, CreateFunctionStmt};
 
 use super::DdlError;
 use crate::coerce::{CoercionContext, can_coerce};
@@ -345,10 +346,10 @@ fn language_is_sql(stmt: &CreateFunctionStmt) -> bool {
     // A `BEGIN ATOMIC` / `RETURN` body is always SQL.
     stmt.sql_body.is_some()
         || stmt.options.iter().any(|n| {
-            matches!(n.node.as_ref(), Some(node::Node::DefElem(de))
+            matches!(n.as_ref(), Some(ast::Node::DefElem(de))
                 if de.defname == "language"
-                    && matches!(de.arg.as_deref().and_then(|a| a.node.as_ref()),
-                        Some(node::Node::String(s)) if s.sval.eq_ignore_ascii_case("sql")))
+                    && matches!(de.arg.as_ref(),
+                        Some(ast::Node::String(s)) if s.sval.eq_ignore_ascii_case("sql")))
         })
 }
 
@@ -356,16 +357,16 @@ fn language_is_sql(stmt: &CreateFunctionStmt) -> bool {
 /// (`BEGIN ATOMIC` / `RETURN` bodies come parsed with the CREATE FUNCTION
 /// itself; string bodies are parsed — and analyzed only under
 /// `check_function_bodies`).
-fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<node::Node>, bool)>, DdlError> {
-    if let Some(body) = stmt.sql_body.as_deref() {
+fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<ast::Node>, bool)>, DdlError> {
+    if let Some(body) = stmt.sql_body.as_ref() {
         let mut out = Vec::new();
         collect_atomic(body, &mut out);
         return Ok(Some((out, true)));
     }
-    let source = stmt.options.iter().find_map(|n| match n.node.as_ref()? {
-        node::Node::DefElem(de) if de.defname == "as" => match de.arg.as_deref()?.node.as_ref()? {
-            node::Node::List(l) => l.items.first().and_then(super::util::node_string),
-            node::Node::String(s) => Some(s.sval.as_str()),
+    let source = stmt.options.iter().find_map(|n| match n.as_ref()? {
+        ast::Node::DefElem(de) if de.defname == "as" => match de.arg.as_ref()? {
+            ast::Node::List(l) => l.items.first().and_then(super::util::node_string),
+            ast::Node::String(s) => Some(s.sval.as_str()),
             _ => None,
         },
         _ => None,
@@ -378,39 +379,36 @@ fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<node::Node>,
         other => DdlError::Parse(other.to_string()),
     })?;
     let statements = parsed
-        .protobuf
+        .tree
         .stmts
         .into_iter()
-        .filter_map(|raw| raw.stmt.and_then(|n| n.node))
+        .filter_map(|raw| raw.stmt)
         .collect();
     Ok(Some((statements, false)))
 }
 
-fn collect_atomic(node: &protobuf::Node, out: &mut Vec<node::Node>) {
-    match node.node.as_ref() {
-        Some(node::Node::List(l)) => {
-            for item in &l.items {
+fn collect_atomic(node: &ast::Node, out: &mut Vec<ast::Node>) {
+    match node {
+        ast::Node::List(l) => {
+            for item in l.items.iter().flatten() {
                 collect_atomic(item, out);
             }
         }
         // `RETURN expr` is `SELECT expr`.
-        Some(node::Node::ReturnStmt(r)) => {
-            if let Some(val) = r.returnval.as_deref() {
-                out.push(node::Node::SelectStmt(Box::new(protobuf::SelectStmt {
-                    target_list: vec![protobuf::Node {
-                        node: Some(node::Node::ResTarget(Box::new(protobuf::ResTarget {
-                            val: Some(Box::new(val.clone())),
-                            ..Default::default()
-                        }))),
-                    }],
-                    limit_option: protobuf::LimitOption::Count as i32,
-                    op: protobuf::SetOperation::SetopNone as i32,
+        ast::Node::ReturnStmt(r) => {
+            if let Some(val) = r.returnval.as_ref() {
+                out.push(ast::Node::SelectStmt(NodeBox::new(ast::SelectStmt {
+                    target_list: vec![Some(ast::Node::ResTarget(NodeBox::new(ast::ResTarget {
+                        val: Some(val.clone()),
+                        ..Default::default()
+                    })))],
+                    limit_option: ast::LimitOption::Count,
+                    op: ast::SetOperation::SetopNone,
                     ..Default::default()
                 })));
             }
         }
-        Some(other) => out.push(other.clone()),
-        None => {}
+        other => out.push(other.clone()),
     }
 }
 
@@ -458,10 +456,10 @@ fn is_polymorphic(interp: &PgCatalog, t: PgTypeOid) -> bool {
 
 /// `CreateCommandTag` (utility.c) for the utility statements a body may
 /// hold.
-fn command_tag(stmt: &node::Node) -> String {
-    use typedpg_pg_query::protobuf::ObjectType as O;
-    let object = |t: i32| -> &'static str {
-        match O::try_from(t).unwrap_or(O::Undefined) {
+fn command_tag(stmt: &ast::Node) -> String {
+    use typedpg_pg_query::ast::ObjectType as O;
+    let object = |t: O| -> &'static str {
+        match t {
             O::ObjectTable => "TABLE",
             O::ObjectSequence => "SEQUENCE",
             O::ObjectView => "VIEW",
@@ -484,76 +482,74 @@ fn command_tag(stmt: &node::Node) -> String {
         }
     };
     match stmt {
-        node::Node::CreateStmt(_) => "CREATE TABLE".into(),
-        node::Node::DropStmt(d) => format!("DROP {}", object(d.remove_type)),
-        node::Node::AlterTableStmt(a) => format!("ALTER {}", object(a.objtype)),
-        node::Node::IndexStmt(_) => "CREATE INDEX".into(),
-        node::Node::ViewStmt(_) => "CREATE VIEW".into(),
-        node::Node::CreateFunctionStmt(f) if f.is_procedure => "CREATE PROCEDURE".into(),
-        node::Node::CreateFunctionStmt(_) => "CREATE FUNCTION".into(),
-        node::Node::CreateSeqStmt(_) => "CREATE SEQUENCE".into(),
-        node::Node::AlterSeqStmt(_) => "ALTER SEQUENCE".into(),
-        node::Node::CreateSchemaStmt(_) => "CREATE SCHEMA".into(),
-        node::Node::CreateDomainStmt(_) => "CREATE DOMAIN".into(),
-        node::Node::CompositeTypeStmt(_)
-        | node::Node::CreateEnumStmt(_)
-        | node::Node::CreateRangeStmt(_) => "CREATE TYPE".into(),
-        node::Node::CreateTableAsStmt(c) if c.is_select_into => "SELECT INTO".into(),
-        node::Node::CreateTableAsStmt(c) if c.objtype == O::ObjectMatview as i32 => {
+        ast::Node::CreateStmt(_) => "CREATE TABLE".into(),
+        ast::Node::DropStmt(d) => format!("DROP {}", object(d.remove_type)),
+        ast::Node::AlterTableStmt(a) => format!("ALTER {}", object(a.objtype)),
+        ast::Node::IndexStmt(_) => "CREATE INDEX".into(),
+        ast::Node::ViewStmt(_) => "CREATE VIEW".into(),
+        ast::Node::CreateFunctionStmt(f) if f.is_procedure => "CREATE PROCEDURE".into(),
+        ast::Node::CreateFunctionStmt(_) => "CREATE FUNCTION".into(),
+        ast::Node::CreateSeqStmt(_) => "CREATE SEQUENCE".into(),
+        ast::Node::AlterSeqStmt(_) => "ALTER SEQUENCE".into(),
+        ast::Node::CreateSchemaStmt(_) => "CREATE SCHEMA".into(),
+        ast::Node::CreateDomainStmt(_) => "CREATE DOMAIN".into(),
+        ast::Node::CompositeTypeStmt(_)
+        | ast::Node::CreateEnumStmt(_)
+        | ast::Node::CreateRangeStmt(_) => "CREATE TYPE".into(),
+        ast::Node::CreateTableAsStmt(c) if c.is_select_into => "SELECT INTO".into(),
+        ast::Node::CreateTableAsStmt(c) if c.objtype == O::ObjectMatview => {
             "CREATE MATERIALIZED VIEW".into()
         }
-        node::Node::CreateTableAsStmt(_) => "CREATE TABLE AS".into(),
-        node::Node::TruncateStmt(_) => "TRUNCATE TABLE".into(),
-        node::Node::CommentStmt(_) => "COMMENT".into(),
-        node::Node::NotifyStmt(_) => "NOTIFY".into(),
-        node::Node::CallStmt(_) => "CALL".into(),
-        node::Node::DoStmt(_) => "DO".into(),
-        node::Node::ExplainStmt(_) => "EXPLAIN".into(),
-        node::Node::LockStmt(_) => "LOCK TABLE".into(),
-        node::Node::VacuumStmt(v) if v.is_vacuumcmd => "VACUUM".into(),
-        node::Node::VacuumStmt(_) => "ANALYZE".into(),
-        node::Node::VariableSetStmt(v)
+        ast::Node::CreateTableAsStmt(_) => "CREATE TABLE AS".into(),
+        ast::Node::TruncateStmt(_) => "TRUNCATE TABLE".into(),
+        ast::Node::CommentStmt(_) => "COMMENT".into(),
+        ast::Node::NotifyStmt(_) => "NOTIFY".into(),
+        ast::Node::CallStmt(_) => "CALL".into(),
+        ast::Node::DoStmt(_) => "DO".into(),
+        ast::Node::ExplainStmt(_) => "EXPLAIN".into(),
+        ast::Node::LockStmt(_) => "LOCK TABLE".into(),
+        ast::Node::VacuumStmt(v) if v.is_vacuumcmd => "VACUUM".into(),
+        ast::Node::VacuumStmt(_) => "ANALYZE".into(),
+        ast::Node::VariableSetStmt(v)
             if matches!(
-                typedpg_pg_query::protobuf::VariableSetKind::try_from(v.kind),
-                Ok(typedpg_pg_query::protobuf::VariableSetKind::VarReset
-                    | typedpg_pg_query::protobuf::VariableSetKind::VarResetAll)
+                v.kind,
+                typedpg_pg_query::ast::VariableSetKind::VarReset
+                    | typedpg_pg_query::ast::VariableSetKind::VarResetAll
             ) =>
         {
             "RESET".into()
         }
-        node::Node::VariableSetStmt(_) => "SET".into(),
-        node::Node::GrantStmt(g) if g.is_grant => "GRANT".into(),
-        node::Node::GrantStmt(_) => "REVOKE".into(),
+        ast::Node::VariableSetStmt(_) => "SET".into(),
+        ast::Node::GrantStmt(g) if g.is_grant => "GRANT".into(),
+        ast::Node::GrantStmt(_) => "REVOKE".into(),
         _ => "utility statement".into(),
     }
 }
 
-fn is_analyzable(stmt: &node::Node) -> bool {
+fn is_analyzable(stmt: &ast::Node) -> bool {
     matches!(
         stmt,
-        node::Node::SelectStmt(_)
-            | node::Node::InsertStmt(_)
-            | node::Node::UpdateStmt(_)
-            | node::Node::DeleteStmt(_)
-            | node::Node::MergeStmt(_)
+        ast::Node::SelectStmt(_)
+            | ast::Node::InsertStmt(_)
+            | ast::Node::UpdateStmt(_)
+            | ast::Node::DeleteStmt(_)
+            | ast::Node::MergeStmt(_)
     )
 }
 
-fn returns_rows(stmt: &node::Node) -> bool {
+fn returns_rows(stmt: &ast::Node) -> bool {
     match stmt {
-        node::Node::SelectStmt(_) => true,
-        node::Node::InsertStmt(s) => {
+        ast::Node::SelectStmt(_) => true,
+        ast::Node::InsertStmt(s) => {
             !crate::resolve::returning_exprs(&s.returning_clause).is_empty()
         }
-        node::Node::UpdateStmt(s) => {
+        ast::Node::UpdateStmt(s) => {
             !crate::resolve::returning_exprs(&s.returning_clause).is_empty()
         }
-        node::Node::DeleteStmt(s) => {
+        ast::Node::DeleteStmt(s) => {
             !crate::resolve::returning_exprs(&s.returning_clause).is_empty()
         }
-        node::Node::MergeStmt(s) => {
-            !crate::resolve::returning_exprs(&s.returning_clause).is_empty()
-        }
+        ast::Node::MergeStmt(s) => !crate::resolve::returning_exprs(&s.returning_clause).is_empty(),
         _ => false,
     }
 }
@@ -562,22 +558,22 @@ fn returns_rows(stmt: &node::Node) -> bool {
 /// (`inline_function`, optimizer/util/clauses.c): a non-set-returning
 /// function whose body is a single `SELECT expr` — no FROM, WHERE,
 /// grouping, ordering, limit, set operation or CTE — or `RETURN expr`.
-pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option<protobuf::Node> {
+pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option<ast::Node> {
     if !language_is_sql(stmt) || proc.proretset {
         return None;
     }
-    if let Some(body) = stmt.sql_body.as_deref() {
-        return match body.node.as_ref()? {
-            node::Node::ReturnStmt(r) => r.returnval.as_deref().cloned(),
-            node::Node::List(l) if l.items.len() == 1 => match l.items[0].node.as_ref()? {
-                node::Node::ReturnStmt(r) => r.returnval.as_deref().cloned(),
+    if let Some(body) = stmt.sql_body.as_ref() {
+        return match body {
+            ast::Node::ReturnStmt(r) => r.returnval.as_ref().cloned(),
+            ast::Node::List(l) if l.items.len() == 1 => match l.items[0].as_ref()? {
+                ast::Node::ReturnStmt(r) => r.returnval.as_ref().cloned(),
                 _ => None,
             },
             _ => None,
         };
     }
     let (statements, _) = body_statements(stmt).ok()??;
-    let [node::Node::SelectStmt(sel)] = statements.as_slice() else {
+    let [ast::Node::SelectStmt(sel)] = statements.as_slice() else {
         return None;
     };
     let simple = sel.from_clause.is_empty()
@@ -596,8 +592,8 @@ pub(crate) fn inlinable_body(stmt: &CreateFunctionStmt, proc: &PgProc) -> Option
     if !simple {
         return None;
     }
-    match sel.target_list[0].node.as_ref()? {
-        node::Node::ResTarget(rt) => rt.val.as_deref().cloned(),
+    match sel.target_list[0].as_ref()? {
+        ast::Node::ResTarget(rt) => rt.val.as_ref().cloned(),
         _ => None,
     }
 }
@@ -612,10 +608,10 @@ pub(crate) fn validate_plpgsql_function(
     check_bodies: bool,
 ) -> Result<(), DdlError> {
     let is_plpgsql = stmt.options.iter().any(|n| {
-        matches!(n.node.as_ref(), Some(node::Node::DefElem(de))
+        matches!(n.as_ref(), Some(ast::Node::DefElem(de))
             if de.defname == "language"
-                && matches!(de.arg.as_deref().and_then(|a| a.node.as_ref()),
-                    Some(node::Node::String(s)) if s.sval.eq_ignore_ascii_case("plpgsql")))
+                && matches!(de.arg.as_ref(),
+                    Some(ast::Node::String(s)) if s.sval.eq_ignore_ascii_case("plpgsql")))
     });
     if !is_plpgsql || !check_bodies {
         return Ok(());
@@ -633,15 +629,15 @@ pub(crate) fn validate_plpgsql_function(
 /// types) before it runs. What the block does when it runs isn't modeled.
 pub(crate) fn do_block(
     interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::DoStmt,
+    stmt: &typedpg_pg_query::ast::DoStmt,
 ) -> Result<(), DdlError> {
     let mut code = None;
     let mut language = "plpgsql".to_owned();
     for arg in &stmt.args {
-        let Some(node::Node::DefElem(de)) = arg.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = arg.as_ref() else {
             continue;
         };
-        let Some(node::Node::String(s)) = de.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        let Some(ast::Node::String(s)) = de.arg.as_ref() else {
             continue;
         };
         match de.defname.as_str() {

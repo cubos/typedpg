@@ -1,7 +1,7 @@
 //! Event triggers (event_trigger.c): the event must be known, the
 //! function must exist and return `event_trigger`, and names are unique.
 
-use typedpg_pg_query::protobuf::{AlterEventTrigStmt, CreateEventTrigStmt};
+use typedpg_pg_query::ast::{AlterEventTrigStmt, CreateEventTrigStmt};
 
 use super::DdlError;
 use super::util::node_string;
@@ -73,10 +73,10 @@ pub fn create_event_trigger(
 /// for (validate_ddl_tags / validate_table_rewrite_tags), and login
 /// triggers take none.
 fn check_filters(stmt: &CreateEventTrigStmt) -> Result<(), DdlError> {
-    use typedpg_pg_query::protobuf::node;
+    use typedpg_pg_query::ast;
     let mut tags: Option<Vec<&str>> = None;
     for filter in &stmt.whenclause {
-        let Some(node::Node::DefElem(def)) = filter.node.as_ref() else {
+        let Some(ast::Node::DefElem(def)) = filter.as_ref() else {
             continue;
         };
         if def.defname != "tag" {
@@ -91,8 +91,8 @@ fn check_filters(stmt: &CreateEventTrigStmt) -> Result<(), DdlError> {
                 def.defname
             )));
         }
-        tags = Some(match def.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            Some(node::Node::List(list)) => list.items.iter().filter_map(node_string).collect(),
+        tags = Some(match def.arg.as_ref() {
+            Some(ast::Node::List(list)) => list.items.iter().filter_map(node_string).collect(),
             _ => Vec::new(),
         });
     }
@@ -148,7 +148,7 @@ pub fn alter_event_trigger(interp: &PgCatalog, stmt: &AlterEventTrigStmt) -> Res
 /// DROP EVENT TRIGGER [IF EXISTS] name.
 pub(crate) fn drop_event_trigger(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = node_string(obj_node).map(str::to_owned) else {
@@ -165,14 +165,9 @@ pub(crate) fn drop_event_trigger(
 /// ALTER EVENT TRIGGER name RENAME TO new.
 pub(crate) fn rename_event_trigger(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = stmt
-        .object
-        .as_deref()
-        .and_then(node_string)
-        .map(str::to_owned)
-    else {
+    let Some(old) = node_string(&stmt.object).map(str::to_owned) else {
         return Ok(());
     };
     if interp

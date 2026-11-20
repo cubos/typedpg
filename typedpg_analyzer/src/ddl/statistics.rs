@@ -3,7 +3,7 @@
 //! and keeps their names unique per schema, and a statistics object goes
 //! away with its table or any column it reads.
 
-use typedpg_pg_query::protobuf::{AlterStatsStmt, CreateStatsStmt, node};
+use typedpg_pg_query::ast::{self, AlterStatsStmt, CreateStatsStmt};
 
 use super::DdlError;
 use super::util::node_string;
@@ -24,7 +24,7 @@ pub(crate) struct StatisticsObject {
 /// STATS_MAX_DIMENSIONS.
 const MAX_DIMENSIONS: usize = 8;
 
-fn split(names: &[typedpg_pg_query::protobuf::Node]) -> (Option<String>, String) {
+fn split(names: &[Option<typedpg_pg_query::ast::Node>]) -> (Option<String>, String) {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     match parts.as_slice() {
         [schema, name] => (Some((*schema).to_owned()), (*name).to_owned()),
@@ -35,7 +35,7 @@ fn split(names: &[typedpg_pg_query::protobuf::Node]) -> (Option<String>, String)
 
 /// get_statistics_object_oid: an unqualified name is looked up along the
 /// search path.
-fn find(interp: &PgCatalog, names: &[typedpg_pg_query::protobuf::Node]) -> Option<usize> {
+fn find(interp: &PgCatalog, names: &[Option<typedpg_pg_query::ast::Node>]) -> Option<usize> {
     let (schema, name) = split(names);
     interp
         .schemas_for_lookup(schema.as_deref())
@@ -51,7 +51,7 @@ fn find(interp: &PgCatalog, names: &[typedpg_pg_query::protobuf::Node]) -> Optio
 /// get_statistics_object_oid's error: a schema that doesn't exist first.
 pub(crate) fn not_found(
     interp: &PgCatalog,
-    names: &[typedpg_pg_query::protobuf::Node],
+    names: &[Option<typedpg_pg_query::ast::Node>],
 ) -> DdlError {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     if let [schema, _] = parts.as_slice()
@@ -72,7 +72,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             "only a single relation is allowed in CREATE STATISTICS".into(),
         ));
     }
-    let Some(node::Node::RangeVar(rv)) = stmt.relations[0].node.as_ref() else {
+    let Some(ast::Node::RangeVar(rv)) = stmt.relations[0].as_ref() else {
         return Err(DdlError::UnsupportedDdl(
             "CREATE STATISTICS only supports relation names in the FROM clause".into(),
         ));
@@ -151,10 +151,10 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
     };
     // The expressions and the types they produce (find_composite_type_
     // dependencies' view of them).
-    let mut raw_exprs: Vec<&typedpg_pg_query::protobuf::Node> = Vec::new();
+    let mut raw_exprs: Vec<&Option<typedpg_pg_query::ast::Node>> = Vec::new();
     let mut expr_results: Vec<crate::oid::PgTypeOid> = Vec::new();
     for elem in &stmt.exprs {
-        let Some(node::Node::StatsElem(se)) = elem.node.as_ref() else {
+        let Some(ast::Node::StatsElem(se)) = elem.as_ref() else {
             continue;
         };
         // A column, by name or in parentheses (a Var): CreateStatistics
@@ -162,9 +162,7 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
         let column = if !se.name.is_empty() {
             Some(se.name.as_str())
         } else {
-            se.expr
-                .as_deref()
-                .and_then(|e| parenthesized_column(interp, relid, e))
+            parenthesized_column(interp, relid, &se.expr)
         };
         if let Some(column) = column {
             if SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == column) {
@@ -195,13 +193,14 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             } else {
                 se.name.clone()
             });
-        } else if let Some(expr) = se.expr.as_deref() {
+        } else if se.expr.is_some() {
+            let expr = &se.expr;
             let typ = match super::volatile::infer_over_relation(interp, relid, expr, None) {
                 Some(Err(e)) => return Err(DdlError::UnsupportedDdl(e.to_string())),
                 Some(Ok(t)) => Some(t),
                 None => None,
             };
-            if let Some(inner) = expr.node.as_ref() {
+            if let Some(inner) = expr.as_ref() {
                 let nodes = inner.nodes();
                 // A field selection on the whole row, `(t).a`, is the
                 // column `a` (transformIndirection), not the whole row.
@@ -398,12 +397,12 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
 fn parenthesized_column<'a>(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &'a typedpg_pg_query::protobuf::Node,
+    expr: &'a Option<typedpg_pg_query::ast::Node>,
 ) -> Option<&'a str> {
-    let cr = match expr.node.as_ref()? {
-        node::Node::ColumnRef(cr) => cr,
+    let cr = match expr.as_ref()? {
+        ast::Node::ColumnRef(cr) => cr,
         // `((t).a)`: the field selection is the Var of `a`.
-        node::Node::AIndirection(ind) if ind.indirection.len() == 1 => {
+        ast::Node::AIndirection(ind) if ind.indirection.len() == 1 => {
             return whole_row_field(interp, relid, ind)
                 .map(|(_, f)| f)
                 .filter(|f| {
@@ -433,10 +432,10 @@ fn parenthesized_column<'a>(
 fn whole_row_field<'a>(
     interp: &PgCatalog,
     relid: PgClassOid,
-    ind: &'a typedpg_pg_query::protobuf::AIndirection,
-) -> Option<(&'a typedpg_pg_query::protobuf::ColumnRef, &'a str)> {
+    ind: &'a typedpg_pg_query::ast::AIndirection,
+) -> Option<(&'a typedpg_pg_query::ast::ColumnRef, &'a str)> {
     let field = node_string(ind.indirection.first()?)?;
-    let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = ind.arg.as_ref() else {
         return None;
     };
     let [name] = cr.fields.as_slice() else {
@@ -494,10 +493,10 @@ pub fn alter_statistics(interp: &PgCatalog, stmt: &AlterStatsStmt) -> Result<(),
 /// `DROP STATISTICS [IF EXISTS] name`.
 pub(crate) fn drop_statistics(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::List(l)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::List(l)) = obj_node.as_ref() else {
         return Ok(());
     };
     match find(interp, &l.items) {
@@ -513,9 +512,9 @@ pub(crate) fn drop_statistics(
 /// `ALTER STATISTICS name RENAME TO new` (AlterObjectRename_internal).
 pub(crate) fn rename_statistics(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::List(l)) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+    let Some(ast::Node::List(l)) = stmt.object.as_ref() else {
         return Ok(());
     };
     let Some(i) = find(interp, &l.items) else {
@@ -543,7 +542,7 @@ pub(crate) fn rename_statistics(
 /// Whether a statistics object `names` exists (get_object_address).
 pub(crate) fn statistics_exist(
     interp: &PgCatalog,
-    names: &[typedpg_pg_query::protobuf::Node],
+    names: &[Option<typedpg_pg_query::ast::Node>],
 ) -> bool {
     find(interp, names).is_some()
 }
@@ -559,9 +558,9 @@ pub(crate) fn drop_column_statistics(interp: &mut PgCatalog, relid: PgClassOid, 
 /// its name must be free in the new schema.
 pub(crate) fn set_statistics_schema(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+    stmt: &typedpg_pg_query::ast::AlterObjectSchemaStmt,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::List(l)) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+    let Some(ast::Node::List(l)) = stmt.object.as_ref() else {
         return Ok(());
     };
     let Some(i) = find(interp, &l.items) else {

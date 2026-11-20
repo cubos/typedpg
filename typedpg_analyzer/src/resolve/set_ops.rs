@@ -1,5 +1,6 @@
 use super::*;
 use crate::expr::NoCollation;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // UNION / INTERSECT / EXCEPT
@@ -9,15 +10,15 @@ use crate::expr::NoCollation;
 /// PG locates it: the expression of a plain SELECT's target (or VALUES
 /// cell), or of the leftmost query of a nested set operation.
 pub(crate) fn branch_column_span(
-    node: &protobuf::SelectStmt,
+    node: &ast::SelectStmt,
     i: usize,
 ) -> Option<crate::error::SourceSpan> {
-    if node.op != protobuf::SetOperation::SetopNone as i32 {
+    if node.op != ast::SetOperation::SetopNone {
         return node.larg.as_deref().and_then(|l| branch_column_span(l, i));
     }
     if let Some(row) = node.values_lists.first() {
-        return match row.node.as_ref()? {
-            node::Node::List(l) => l.items.get(i).and_then(crate::error::expr_span),
+        return match row.as_ref()? {
+            ast::Node::List(l) => l.items.get(i).and_then(crate::error::expr_span),
             _ => None,
         };
     }
@@ -25,7 +26,7 @@ pub(crate) fn branch_column_span(
 }
 
 pub(crate) fn analyze_set_operation(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
@@ -70,15 +71,14 @@ pub(crate) fn analyze_set_operation(
     })?;
 
     // PG names the operation in both error messages below.
-    let op_label = match protobuf::SetOperation::try_from(sel.op) {
-        Ok(protobuf::SetOperation::SetopIntersect) => "INTERSECT",
-        Ok(protobuf::SetOperation::SetopExcept) => "EXCEPT",
+    let op_label = match sel.op {
+        ast::SetOperation::SetopIntersect => "INTERSECT",
+        ast::SetOperation::SetopExcept => "EXCEPT",
         _ => "UNION",
     };
 
     // PG's CheckSelectLocking: a set operation can't be locked (0A000).
-    if let Some(node::Node::LockingClause(lc)) =
-        sel.locking_clause.first().and_then(|n| n.node.as_ref())
+    if let Some(ast::Node::LockingClause(lc)) = sel.locking_clause.first().and_then(|n| n.as_ref())
     {
         return Err(crate::error::RawError::new(
             AnalyzeError::FeatureNotSupported(format!(
@@ -115,9 +115,8 @@ pub(crate) fn analyze_set_operation(
             // `unknown` even if a later clause of the arm deduced a type,
             // and its coercion then fails with 42P08
             // (`expr::note_untyped_output_params`).
-            if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-                && let Some(val) = &rt.val
-                && let Some(p) = expr::bare_param(val, snapshot)
+            if let Some(ast::Node::ResTarget(rt)) = target.as_ref()
+                && let Some(p) = expr::bare_param(&rt.val, snapshot)
                 && (own_cols.get(i).is_some_and(|c| c.type_oid == oid::UNKNOWN)
                     || params.is_untyped_output(p.location))
                 && let Some(peer) = peer_cols.get(i)
@@ -300,7 +299,7 @@ pub(crate) fn analyze_set_operation(
 /// else is 0A000 `invalid UNION/INTERSECT/EXCEPT ORDER BY clause`; LIMIT and
 /// OFFSET see no columns at all.
 fn set_operation_sort_and_limit(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     columns: &[RawColumn],
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -332,19 +331,19 @@ fn set_operation_sort_and_limit(
     scope.add_derived(&alias, result_cols, crate::scope::SourceKind::Other)?;
     let null_ctx = NullabilityContext::default();
     for sort_node in &sel.sort_clause {
-        let Some(node::Node::SortBy(sb)) = sort_node.node.as_ref() else {
+        let Some(ast::Node::SortBy(sb)) = sort_node.as_ref() else {
             continue;
         };
-        let Some(inner) = sb.node.as_deref() else {
+        let Some(inner) = sb.node.as_ref() else {
             continue;
         };
-        let sorts = sb.sortby_dir() != protobuf::SortByDir::SortbyUsing;
+        let sorts = sb.sortby_dir != ast::SortByDir::SortbyUsing;
         if let Some(ord) = sql92_position(inner, "ORDER BY")? {
             if ord < 1 || ord as usize > columns.len() {
                 return Err(crate::pgmsg::position_not_in_select_list(
                     "ORDER BY",
                     ord,
-                    crate::error::node_location(inner)
+                    crate::error::node_location(&sb.node)
                         .and_then(crate::error::SourceSpan::from_node_token),
                 )
                 .finalize_implicit());
@@ -354,14 +353,14 @@ fn set_operation_sort_and_limit(
                     snapshot,
                     columns[ord as usize - 1].type_oid,
                     crate::clause::KeyUse::Sort,
-                    crate::error::node_location(inner),
+                    crate::error::node_location(&sb.node),
                 )?;
             }
             continue;
         }
         // findTargetlistEntrySQL92: a name matches the result columns;
         // several of that name (distinct columns) are ambiguous.
-        if let Some(node::Node::ColumnRef(cr)) = inner.node.as_ref()
+        if let ast::Node::ColumnRef(cr) = inner
             && let [name] = expr::extract_string_fields(&cr.fields).as_slice()
             && cr.fields.len() == 1
         {
@@ -386,19 +385,19 @@ fn set_operation_sort_and_limit(
             }
         }
         expr::infer_expr(
-            inner,
+            &sb.node,
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             TypeGoal::NONE,
         )?;
-        let is_result_column = matches!(inner.node.as_ref(),
-            Some(node::Node::ColumnRef(cr)) if cr.fields.len() == 1);
+        let is_result_column = matches!(inner,
+            ast::Node::ColumnRef(cr) if cr.fields.len() == 1);
         if !is_result_column {
             return Err(crate::error::RawError::new(
                 AnalyzeError::FeatureNotSupported(
                     "invalid UNION/INTERSECT/EXCEPT ORDER BY clause".into(),
                 ),
-                crate::error::node_location(inner)
+                crate::error::node_location(&sb.node)
                     .and_then(crate::error::SourceSpan::from_node_token),
                 Some(
                     "Add the expression/function to every SELECT, or move the UNION into a \
@@ -418,25 +417,25 @@ fn set_operation_sort_and_limit(
 
 /// The untyped string literal an arm projects at position `i`, when the arm
 /// is a plain SELECT whose target entries line up with its output.
-fn arm_unknown_literal(arm: &protobuf::SelectStmt, i: usize) -> Option<&str> {
-    if arm.op != SetOperation::SetopNone as i32 || !arm.values_lists.is_empty() {
+fn arm_unknown_literal(arm: &ast::SelectStmt, i: usize) -> Option<&str> {
+    if arm.op != SetOperation::SetopNone || !arm.values_lists.is_empty() {
         return None;
     }
     let has_star = arm.target_list.iter().any(|t| {
-        matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                Some(node::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
-                    matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
+        matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+            if matches!(rt.val.as_ref(),
+                Some(ast::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
+                    matches!(f.as_ref(), Some(ast::Node::AStar(_))))))
     });
     if has_star {
         return None;
     }
-    let Some(node::Node::ResTarget(rt)) = arm.target_list.get(i)?.node.as_ref() else {
+    let Some(ast::Node::ResTarget(rt)) = arm.target_list.get(i)?.as_ref() else {
         return None;
     };
-    match rt.val.as_deref()?.node.as_ref()? {
-        node::Node::AConst(ac) if !ac.isnull => match &ac.val {
-            Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) => Some(sv.sval.as_str()),
+    match rt.val.as_ref()? {
+        ast::Node::AConst(ac) if !ac.isnull => match &ac.val {
+            Some(typedpg_pg_query::ast::AConstValue::String(sv)) => Some(sv.sval.as_str()),
             _ => None,
         },
         _ => None,
@@ -449,7 +448,7 @@ fn arm_unknown_literal(arm: &protobuf::SelectStmt, i: usize) -> Option<&str> {
 /// an INTO (the leftmost one's is reported before, see
 /// `analyze_select_here`). A member with its own ORDER BY, LIMIT, locking
 /// or WITH is a subquery of the tree, analyzed on its own.
-fn check_set_op_tree_into(sel: &protobuf::SelectStmt) -> Result<(), AnalyzeError> {
+fn check_set_op_tree_into(sel: &ast::SelectStmt) -> Result<(), AnalyzeError> {
     for arm in [sel.larg.as_deref(), sel.rarg.as_deref()]
         .into_iter()
         .flatten()
@@ -459,7 +458,7 @@ fn check_set_op_tree_into(sel: &protobuf::SelectStmt) -> Result<(), AnalyzeError
                 crate::pgmsg::into_not_on_first_set_op_member(into_span(into)).finalize_implicit(),
             );
         }
-        let leaf = arm.op == SetOperation::SetopNone as i32
+        let leaf = arm.op == SetOperation::SetopNone
             || !arm.sort_clause.is_empty()
             || arm.limit_offset.is_some()
             || arm.limit_count.is_some()
@@ -472,9 +471,9 @@ fn check_set_op_tree_into(sel: &protobuf::SelectStmt) -> Result<(), AnalyzeError
     Ok(())
 }
 
-pub(crate) fn check_set_op_member_locking(arm: &protobuf::SelectStmt) -> Result<(), AnalyzeError> {
-    match arm.locking_clause.first().and_then(|n| n.node.as_ref()) {
-        Some(node::Node::LockingClause(lc)) => Err(crate::error::RawError::new(
+pub(crate) fn check_set_op_member_locking(arm: &ast::SelectStmt) -> Result<(), AnalyzeError> {
+    match arm.locking_clause.first().and_then(|n| n.as_ref()) {
+        Some(ast::Node::LockingClause(lc)) => Err(crate::error::RawError::new(
             AnalyzeError::FeatureNotSupported(format!(
                 "{} is not allowed with UNION/INTERSECT/EXCEPT",
                 lock_strength_name(lc)
@@ -492,15 +491,15 @@ pub(crate) fn check_set_op_member_locking(arm: &protobuf::SelectStmt) -> Result<
 /// LIMIT / OFFSET, nor a set-returning call (an ORDER BY one included, see
 /// [`level_srf_calls`]) — exactly one row — or a VALUES list with a
 /// `(NULL)` row.
-fn always_yields_null(arm: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
-    fn is_null_constant(n: &protobuf::Node) -> bool {
-        match n.node.as_ref() {
-            Some(node::Node::AConst(c)) => c.isnull,
-            Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(is_null_constant),
+fn always_yields_null(arm: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
+    fn is_null_constant(n: &Option<ast::Node>) -> bool {
+        match n.as_ref() {
+            Some(ast::Node::AConst(c)) => c.isnull,
+            Some(ast::Node::TypeCast(c)) => is_null_constant(&c.arg),
             _ => false,
         }
     }
-    if arm.op != SetOperation::SetopNone as i32
+    if arm.op != SetOperation::SetopNone
         || arm.limit_count.is_some()
         || arm.limit_offset.is_some()
         || arm.where_clause.is_some()
@@ -512,8 +511,8 @@ fn always_yields_null(arm: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool 
         return false;
     }
     if !arm.values_lists.is_empty() {
-        return arm.values_lists.iter().any(|row| match row.node.as_ref() {
-            Some(node::Node::List(l)) => matches!(l.items.as_slice(), [v] if is_null_constant(v)),
+        return arm.values_lists.iter().any(|row| match row.as_ref() {
+            Some(ast::Node::List(l)) => matches!(l.items.as_slice(), [v] if is_null_constant(v)),
             _ => false,
         });
     }
@@ -521,8 +520,8 @@ fn always_yields_null(arm: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool 
         && matches!(
             arm.target_list.as_slice(),
             [t] if matches!(
-                t.node.as_ref(),
-                Some(node::Node::ResTarget(rt)) if rt.val.as_deref().is_some_and(is_null_constant)
+                t.as_ref(),
+                Some(ast::Node::ResTarget(rt)) if is_null_constant(&rt.val)
             )
         )
 }
@@ -536,15 +535,15 @@ fn always_yields_null(arm: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool 
 /// conflict stays one; a nested set operation's column without a
 /// collation brings none.
 pub(super) fn set_op_column_collation(
-    left: (&protobuf::SelectStmt, &RawColumn),
-    right: (&protobuf::SelectStmt, &RawColumn),
+    left: (&ast::SelectStmt, &RawColumn),
+    right: (&ast::SelectStmt, &RawColumn),
     i: usize,
     type_oid: PgTypeOid,
     union_all: bool,
     snapshot: &PgCatalog,
 ) -> Result<crate::clause::CollationState, AnalyzeError> {
-    let arm_state = |(arm, c): (&protobuf::SelectStmt, &RawColumn)| {
-        let leaf = arm.op == SetOperation::SetopNone as i32;
+    let arm_state = |(arm, c): (&ast::SelectStmt, &RawColumn)| {
+        let leaf = arm.op == SetOperation::SetopNone;
         let explicit = leaf
             && crate::grouping::level_info(arm)
                 .is_some_and(|l| l.explicit_collations.get(i).copied().unwrap_or(false));

@@ -638,7 +638,7 @@ fn written_tables(sql: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut out: Vec<String> = parsed
-        .protobuf
+        .tree
         .nodes()
         .iter()
         .filter_map(|(n, _)| match n {
@@ -727,17 +727,9 @@ fn run_in(sp: &mut Transaction<'_>, stmt: &Statement, params: &[&(dyn ToSql + Sy
 /// ORDER BY or with a key that isn't an output column (its ties could come
 /// back in any order).
 fn order_keys(sql: &str, ours: &AnalyzedQuery) -> Option<Vec<usize>> {
-    use typedpg_pg_query::protobuf::{a_const::Val, node::Node as N};
+    use typedpg_pg_query::ast::{AConstValue, Node as N};
     let parsed = typedpg_pg_query::parse(sql).ok()?;
-    let Some(N::SelectStmt(select)) = parsed
-        .protobuf
-        .stmts
-        .first()?
-        .stmt
-        .as_deref()?
-        .node
-        .as_ref()
-    else {
+    let Some(N::SelectStmt(select)) = parsed.tree.stmts.first()?.stmt.as_ref() else {
         return None;
     };
     if select.sort_clause.is_empty() {
@@ -747,17 +739,17 @@ fn order_keys(sql: &str, ours: &AnalyzedQuery) -> Option<Vec<usize>> {
         .sort_clause
         .iter()
         .map(|s| {
-            let Some(N::SortBy(by)) = s.node.as_ref() else {
+            let Some(N::SortBy(by)) = s.as_ref() else {
                 return None;
             };
-            match by.node.as_deref()?.node.as_ref()? {
+            match by.node.as_ref()? {
                 N::AConst(c) => match &c.val {
-                    Some(Val::Ival(i)) => usize::try_from(i.ival).ok()?.checked_sub(1),
+                    Some(AConstValue::Integer(i)) => usize::try_from(i.ival).ok()?.checked_sub(1),
                     _ => None,
                 },
                 N::ColumnRef(c) => match c.fields.as_slice() {
                     [f] => {
-                        let Some(N::String(name)) = f.node.as_ref() else {
+                        let Some(N::String(name)) = f.as_ref() else {
                             return None;
                         };
                         let mut at = ours
@@ -798,15 +790,15 @@ fn has_inner_promise(ty: &Type) -> bool {
 /// SELECT / VALUES / INSERT / UPDATE / DELETE / MERGE (with or without
 /// WITH).
 fn is_executable(sql: &str) -> bool {
-    use typedpg_pg_query::protobuf::node::Node;
+    use typedpg_pg_query::ast::Node;
     let Ok(parsed) = typedpg_pg_query::parse(sql) else {
         return false;
     };
-    let [raw] = parsed.protobuf.stmts.as_slice() else {
+    let [raw] = parsed.tree.stmts.as_slice() else {
         return false;
     };
     matches!(
-        raw.stmt.as_ref().and_then(|n| n.node.as_ref()),
+        raw.stmt.as_ref(),
         Some(
             Node::SelectStmt(_)
                 | Node::InsertStmt(_)

@@ -12,7 +12,7 @@
 //! members migrations create, and records each hard member as its owner's
 //! normal dependency on the object.
 
-use typedpg_pg_query::protobuf::{CreateOpClassItem, ObjectType, node};
+use typedpg_pg_query::ast::{self, CreateOpClassItem, ObjectType};
 
 use super::DdlError;
 use super::depend::ObjectAddress;
@@ -335,12 +335,12 @@ pub(crate) fn forget_family(interp: &mut PgCatalog, family: &FamilyKey) {
 pub(crate) fn function_members(
     interp: &PgCatalog,
     family: &FamilyKey,
-    items: &[typedpg_pg_query::protobuf::Node],
+    items: &[Option<typedpg_pg_query::ast::Node>],
     intype: Option<PgTypeOid>,
 ) -> Result<Vec<FamilyMember>, DdlError> {
     let mut members: Vec<FamilyMember> = Vec::new();
     for item in items {
-        let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
+        let Some(ast::Node::CreateOpClassItem(item)) = item.as_ref() else {
             continue;
         };
         // OPCLASS_ITEM_FUNCTION.
@@ -440,8 +440,8 @@ fn function_member(
     let given: Vec<Option<PgTypeOid>> = item
         .class_args
         .iter()
-        .map(|n| match n.node.as_ref() {
-            Some(node::Node::TypeName(tn)) => super::util::resolve_type_name(tn, interp),
+        .map(|n| match n.as_ref() {
+            Some(ast::Node::TypeName(tn)) => super::util::resolve_type_name(tn, interp),
             _ => None,
         })
         .collect();

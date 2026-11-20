@@ -4,7 +4,7 @@
 //! A row trigger on a partitioned table is cloned to every partition, the
 //! ones it has and the ones it gets later (`CloneRowTriggersToPartition`).
 
-use typedpg_pg_query::protobuf::{CreateTrigStmt, node};
+use typedpg_pg_query::ast::{self, CreateTrigStmt};
 
 use super::DdlError;
 use crate::oid::{PgClassOid, PgProcOid};
@@ -69,7 +69,7 @@ fn check_when_clause(
     interp: &PgCatalog,
     relid: PgClassOid,
     stmt: &CreateTrigStmt,
-    when: &typedpg_pg_query::protobuf::Node,
+    when: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
@@ -128,7 +128,7 @@ fn check_when_clause(
 
     let before = stmt.timing & TRIGGER_TYPE_BEFORE != 0;
     let has_generated = attrs.iter().any(|a| a.attgenerated.is_some());
-    let Some(inner) = when.node.as_ref() else {
+    let Some(inner) = when.as_ref() else {
         return Ok(());
     };
     // `(new).col` is the column `col` of NEW (transformIndirection).
@@ -232,8 +232,8 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
     };
     check_firing(stmt)?;
     check_transition_tables(interp, relid, &class, stmt)?;
-    if let Some(when) = stmt.when_clause.as_deref() {
-        check_when_clause(interp, relid, stmt, when)?;
+    if stmt.when_clause.is_some() {
+        check_when_clause(interp, relid, stmt, &stmt.when_clause)?;
     }
 
     // The function takes no declared arguments (the trigger's arguments go
@@ -387,7 +387,7 @@ fn check_transition_tables(
     let mut old_name: Option<&str> = None;
     let mut new_name: Option<&str> = None;
     for rel in &stmt.transition_rels {
-        let Some(node::Node::TriggerTransition(tt)) = rel.node.as_ref() else {
+        let Some(ast::Node::TriggerTransition(tt)) = rel.as_ref() else {
             continue;
         };
         let unsupported = |msg: String| Err(DdlError::UnsupportedDdl(msg));
@@ -660,10 +660,10 @@ pub(crate) fn remove_with_clones(interp: &mut PgCatalog, relid: PgClassOid, name
 /// `DROP TRIGGER [IF EXISTS] name ON table`.
 pub(crate) fn drop_trigger(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
         return Ok(());
     };
     let parts: Vec<String> = list
@@ -675,7 +675,7 @@ pub(crate) fn drop_trigger(
     let Some((trigname, rel)) = parts.split_last() else {
         return Ok(());
     };
-    let rv = typedpg_pg_query::protobuf::RangeVar {
+    let rv = typedpg_pg_query::ast::RangeVar {
         schemaname: if rel.len() == 2 {
             rel[0].clone()
         } else {
@@ -743,7 +743,7 @@ pub(crate) fn triggers_using_function(
 /// `ALTER TRIGGER name ON table RENAME TO new` (renametrig).
 pub(crate) fn rename_trigger(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());

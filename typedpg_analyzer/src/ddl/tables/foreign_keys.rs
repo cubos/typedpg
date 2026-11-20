@@ -52,7 +52,7 @@ fn column_attnums(
         .collect()
 }
 
-fn node_names(nodes: &[typedpg_pg_query::protobuf::Node]) -> Vec<String> {
+fn node_names(nodes: &[Option<typedpg_pg_query::ast::Node>]) -> Vec<String> {
     nodes
         .iter()
         .filter_map(crate::ddl::util::node_string)
@@ -193,7 +193,7 @@ pub(super) fn fk_types_compatible(
 pub(super) fn add_foreign_key(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
     fk_names: &[String],
     default_name: ConName,
     created: bool,
@@ -712,7 +712,7 @@ impl FkDetails {
         self.match_type == "f"
     }
 
-    fn of(c: &typedpg_pg_query::protobuf::Constraint) -> Self {
+    fn of(c: &typedpg_pg_query::ast::Constraint) -> Self {
         let or = |s: &str, default: &str| {
             if s.is_empty() {
                 default.to_owned()

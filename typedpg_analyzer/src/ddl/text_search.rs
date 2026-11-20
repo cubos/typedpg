@@ -3,7 +3,7 @@
 //! others it's built from. Also the lookups behind `regconfig` /
 //! `regdictionary` input.
 
-use typedpg_pg_query::protobuf::{AlterTsConfigurationStmt, DefineStmt, ObjectType, node};
+use typedpg_pg_query::ast::{self, AlterTsConfigurationStmt, DefineStmt, ObjectType};
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -59,27 +59,27 @@ pub(crate) fn find(interp: &PgCatalog, kind: &str, names: &[&str]) -> Result<(),
     )))
 }
 
-fn names_of(nodes: &[typedpg_pg_query::protobuf::Node]) -> Vec<&str> {
+fn names_of(nodes: &[Option<typedpg_pg_query::ast::Node>]) -> Vec<&str> {
     nodes.iter().filter_map(node_string).collect()
 }
 
 /// A definition option naming another text search object
 /// (`PARSER = p`, `COPY = c`, `TEMPLATE = t`).
-fn option_names(de: &typedpg_pg_query::protobuf::DefElem) -> Vec<String> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::TypeName(tn)) => tn
+fn option_names(de: &typedpg_pg_query::ast::DefElem) -> Vec<String> {
+    match de.arg.as_ref() {
+        Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::List(l)) => l
+        Some(ast::Node::List(l)) => l
             .items
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::String(s)) => vec![s.sval.clone()],
+        Some(ast::Node::String(s)) => vec![s.sval.clone()],
         _ => Vec::new(),
     }
 }
@@ -272,20 +272,20 @@ const SNOWBALL_LANGUAGES: &[&str] = &[
 ];
 
 /// defGetString of a definition option's value; `None` without one.
-fn option_value(de: &typedpg_pg_query::protobuf::DefElem) -> Option<String> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
-        node::Node::String(s) => Some(s.sval.clone()),
-        node::Node::Integer(i) => Some(i.ival.to_string()),
-        node::Node::Float(f) => Some(f.fval.clone()),
-        node::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.to_owned()),
-        node::Node::TypeName(tn) => Some(
+fn option_value(de: &typedpg_pg_query::ast::DefElem) -> Option<String> {
+    match de.arg.as_ref()? {
+        ast::Node::String(s) => Some(s.sval.clone()),
+        ast::Node::Integer(i) => Some(i.ival.to_string()),
+        ast::Node::Float(f) => Some(f.fval.clone()),
+        ast::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.to_owned()),
+        ast::Node::TypeName(tn) => Some(
             tn.names
                 .iter()
                 .filter_map(node_string)
                 .collect::<Vec<_>>()
                 .join("."),
         ),
-        node::Node::List(l) => Some(
+        ast::Node::List(l) => Some(
             l.items
                 .iter()
                 .filter_map(node_string)
@@ -480,11 +480,11 @@ fn verify_dict_options(
 
 /// CREATE TEXT SEARCH CONFIGURATION / DICTIONARY / PARSER / TEMPLATE.
 pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
-    let kind = match ObjectType::try_from(stmt.kind) {
-        Ok(ObjectType::ObjectTsconfiguration) => "c",
-        Ok(ObjectType::ObjectTsdictionary) => "d",
-        Ok(ObjectType::ObjectTsparser) => "p",
-        Ok(ObjectType::ObjectTstemplate) => "t",
+    let kind = match stmt.kind {
+        ObjectType::ObjectTsconfiguration => "c",
+        ObjectType::ObjectTsdictionary => "d",
+        ObjectType::ObjectTsparser => "p",
+        ObjectType::ObjectTstemplate => "t",
         _ => return Ok(()),
     };
     let (nsoid, name) = super::util::ensure_qualified_name(interp, &stmt.defnames)?;
@@ -497,7 +497,7 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
     let mut template = None;
     let mut dict_options = Vec::new();
     for opt in &stmt.definition {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         let referenced = match (kind, de.defname.as_str()) {
@@ -538,9 +538,9 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
     if kind == "c" {
         // DefineTSConfiguration.
         let given = |name: &str| {
-            stmt.definition.iter().any(
-                |o| matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defname == name),
-            )
+            stmt.definition
+                .iter()
+                .any(|o| matches!(o.as_ref(), Some(ast::Node::DefElem(de)) if de.defname == name))
         };
         if given("parser") && given("copy") {
             return Err(DdlError::Parse(
@@ -678,7 +678,7 @@ pub fn alter_configuration(
     }
     let mut dicts: Vec<PgGenericOid> = Vec::new();
     for dict in &stmt.dicts {
-        if let Some(node::Node::List(l)) = dict.node.as_ref() {
+        if let Some(ast::Node::List(l)) = dict.as_ref() {
             let d = position(interp, "d", &names_of(&l.items))?;
             dicts.push(interp.pg_ts_objects[d].oid);
         }
@@ -692,8 +692,8 @@ pub fn alter_configuration(
             tokens.push(token);
         }
     }
-    use typedpg_pg_query::protobuf::AlterTsConfigType as K;
-    match K::try_from(stmt.kind).unwrap_or(K::AlterTsconfigTypeUndefined) {
+    use typedpg_pg_query::ast::AlterTsConfigType as K;
+    match stmt.kind {
         // MakeConfigurationMapping without override: a token type mapped
         // already trips pg_ts_config_map's unique index.
         K::AlterTsconfigAddMapping => {
@@ -715,7 +715,7 @@ pub fn alter_configuration(
         // REPLACE old WITH new, for every token type or those named.
         K::AlterTsconfigReplaceDict | K::AlterTsconfigReplaceDictForToken => {
             if let [old, new] = dicts.as_slice() {
-                let all = stmt.kind == K::AlterTsconfigReplaceDict as i32;
+                let all = stmt.kind == K::AlterTsconfigReplaceDict;
                 for (token, mapped) in &mut mapping {
                     if all || tokens.contains(&token.as_str()) {
                         for d in mapped.iter_mut().filter(|d| **d == *old) {
@@ -735,7 +735,6 @@ pub fn alter_configuration(
                 }
             }
         }
-        K::AlterTsconfigTypeUndefined => {}
     }
     set_config_mapping(interp, config, mapping);
     Ok(())
@@ -746,7 +745,7 @@ pub fn alter_configuration(
 /// result goes through the template's checks again.
 pub fn alter_dictionary(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterTsDictionaryStmt,
+    stmt: &typedpg_pg_query::ast::AlterTsDictionaryStmt,
 ) -> Result<(), DdlError> {
     let at = position(interp, "d", &names_of(&stmt.dictname))?;
     let object = &interp.pg_ts_objects[at];
@@ -755,7 +754,7 @@ pub fn alter_dictionary(
         return Ok(());
     };
     for opt in &stmt.options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         let value = option_value(de);
@@ -781,7 +780,7 @@ pub fn alter_dictionary(
 pub(crate) fn drop(
     interp: &mut PgCatalog,
     objtype: ObjectType,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -791,7 +790,7 @@ pub(crate) fn drop(
         ObjectType::ObjectTsparser => "p",
         _ => "t",
     };
-    let Some(node::Node::List(l)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::List(l)) = obj_node.as_ref() else {
         return Ok(());
     };
     let names = names_of(&l.items);
@@ -850,7 +849,7 @@ fn kind_of(objtype: ObjectType) -> Option<&'static str> {
 pub(crate) fn drop_target_oid(
     interp: &PgCatalog,
     kind: &str,
-    nodes: &[typedpg_pg_query::protobuf::Node],
+    nodes: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Option<crate::oid::PgGenericOid> {
     let at = position(interp, kind, &names_of(nodes)).ok()?;
     Some(interp.pg_ts_objects[at].oid)
@@ -899,12 +898,9 @@ fn check_free(
 pub(crate) fn rename(
     interp: &mut PgCatalog,
     objtype: ObjectType,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let (Some(kind), Some(node::Node::List(l))) = (
-        kind_of(objtype),
-        stmt.object.as_deref().and_then(|o| o.node.as_ref()),
-    ) else {
+    let (Some(kind), Some(ast::Node::List(l))) = (kind_of(objtype), stmt.object.as_ref()) else {
         return Ok(());
     };
     let at = position(interp, kind, &names_of(&l.items))?;
@@ -921,13 +917,10 @@ pub(crate) fn rename(
 pub(crate) fn set_schema(
     interp: &mut PgCatalog,
     objtype: ObjectType,
-    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+    stmt: &typedpg_pg_query::ast::AlterObjectSchemaStmt,
     new_schema: &str,
 ) -> Result<(), DdlError> {
-    let (Some(kind), Some(node::Node::List(l))) = (
-        kind_of(objtype),
-        stmt.object.as_deref().and_then(|o| o.node.as_ref()),
-    ) else {
+    let (Some(kind), Some(ast::Node::List(l))) = (kind_of(objtype), stmt.object.as_ref()) else {
         return Ok(());
     };
     let names = names_of(&l.items);

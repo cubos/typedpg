@@ -3,7 +3,7 @@
 //! (`get_object_address`), so a migration naming something that doesn't
 //! exist fails.
 
-use typedpg_pg_query::protobuf::{CommentStmt, ObjectType, node};
+use typedpg_pg_query::ast::{self, CommentStmt, ObjectType};
 
 use super::DdlError;
 use super::util::node_string;
@@ -12,13 +12,13 @@ use crate::pg_catalog::{PgCatalog, RelKind};
 /// COMMENT ON (CommentObject): the object must exist, and a column's
 /// relation must be one whose columns can carry comments.
 pub fn comment_on(interp: &PgCatalog, stmt: &CommentStmt) -> Result<(), DdlError> {
-    let Some(object) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+    let Some(object) = stmt.object.as_ref() else {
         return Ok(());
     };
-    let objtype = ObjectType::try_from(stmt.objtype).unwrap_or(ObjectType::Undefined);
+    let objtype = stmt.objtype;
     resolve_object(interp, objtype, object)?;
     if objtype == ObjectType::ObjectColumn
-        && let node::Node::List(l) = object
+        && let ast::Node::List(l) = object
     {
         let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
         let (schema, name) = match parts.as_slice() {
@@ -52,25 +52,25 @@ pub fn comment_on(interp: &PgCatalog, stmt: &CommentStmt) -> Result<(), DdlError
 /// build.
 pub fn alter_owner(
     interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterOwnerStmt,
+    stmt: &typedpg_pg_query::ast::AlterOwnerStmt,
 ) -> Result<(), DdlError> {
-    let objtype = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
+    let objtype = stmt.object_type;
     if let Some(rv) = stmt.relation.as_ref() {
         super::util::lookup_relation(interp, rv)?;
         return Ok(());
     }
-    let Some(object) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+    let Some(object) = stmt.object.as_ref() else {
         return Ok(());
     };
     // ALTER TYPE / DOMAIN name the type as a plain name list.
-    if let (ObjectType::ObjectType | ObjectType::ObjectDomain, node::Node::List(l)) =
+    if let (ObjectType::ObjectType | ObjectType::ObjectDomain, ast::Node::List(l)) =
         (objtype, object)
     {
-        let tn = typedpg_pg_query::protobuf::TypeName {
+        let tn = typedpg_pg_query::ast::TypeName {
             names: l.items.clone(),
             ..Default::default()
         };
-        return resolve_object(interp, objtype, &node::Node::TypeName(tn));
+        return resolve_object(interp, objtype, &ast::Node::TypeName(tn.into()));
     }
     resolve_object(interp, objtype, object)
 }
@@ -79,17 +79,17 @@ pub fn alter_owner(
 pub(crate) fn resolve_object(
     interp: &PgCatalog,
     objtype: ObjectType,
-    object: &node::Node,
+    object: &ast::Node,
 ) -> Result<(), DdlError> {
-    let names = |n: &node::Node| -> Vec<String> {
+    let names = |n: &ast::Node| -> Vec<String> {
         match n {
-            node::Node::List(l) => l
+            ast::Node::List(l) => l
                 .items
                 .iter()
                 .filter_map(node_string)
                 .map(str::to_owned)
                 .collect(),
-            node::Node::String(s) => vec![s.sval.clone()],
+            ast::Node::String(s) => vec![s.sval.clone()],
             _ => Vec::new(),
         }
     };
@@ -197,7 +197,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
-            if let node::Node::TypeName(tn) = object {
+            if let ast::Node::TypeName(tn) = object {
                 super::util::lookup_type_name(tn, interp)?;
                 if objtype == ObjectType::ObjectDomain {
                     super::types::check_is_domain(interp, &tn.names)?;
@@ -205,7 +205,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectSchema => {
-            if let node::Node::String(s) = object
+            if let ast::Node::String(s) = object
                 && interp.namespace_oid(&s.sval).is_none()
             {
                 return Err(DdlError::TableNotFound(format!(
@@ -219,7 +219,7 @@ pub(crate) fn resolve_object(
         | ObjectType::ObjectRoutine
         | ObjectType::ObjectAggregate => {
             // get_object_address: LookupFuncWithArgs.
-            if let node::Node::ObjectWithArgs(owa) = object {
+            if let ast::Node::ObjectWithArgs(owa) = object {
                 super::functions::lookup_func_with_args(interp, objtype, owa, false)?;
             }
         }
@@ -238,21 +238,19 @@ pub(crate) fn resolve_object(
             super::text_search::find(interp, kind, &parts)?;
         }
         ObjectType::ObjectForeignServer => {
-            if let node::Node::String(s) = object {
+            if let ast::Node::String(s) = object {
                 super::fdw::check_server(interp, &s.sval)?;
             }
         }
         ObjectType::ObjectStatisticExt => {
-            if let node::Node::List(l) = object
+            if let ast::Node::List(l) = object
                 && !super::statistics::statistics_exist(interp, &l.items)
             {
                 return Err(super::statistics::not_found(interp, &l.items));
             }
         }
         ObjectType::ObjectCollation => {
-            let list = typedpg_pg_query::protobuf::Node {
-                node: Some(object.clone()),
-            };
+            let list = Some(object.clone());
             super::collations::lookup_collation(interp, &list, false)?;
         }
         ObjectType::ObjectTrigger | ObjectType::ObjectPolicy | ObjectType::ObjectRule => {
@@ -291,22 +289,20 @@ pub(crate) fn resolve_object(
         }
         ObjectType::ObjectOperator => {
             // LookupOperWithArgs.
-            let wrapped = typedpg_pg_query::protobuf::Node {
-                node: Some(object.clone()),
-            };
+            let wrapped = Some(object.clone());
             super::drop::lookup_operator(interp, &wrapped)?;
         }
         ObjectType::ObjectCast => {
-            let node::Node::List(l) = object else {
+            let ast::Node::List(l) = object else {
                 return Ok(());
             };
-            let [Some(node::Node::TypeName(source)), Some(target)] = [
-                l.items.first().and_then(|n| n.node.as_ref()),
-                l.items.get(1).and_then(|n| n.node.as_ref()),
+            let [Some(ast::Node::TypeName(source)), Some(target)] = [
+                l.items.first().and_then(|n| n.as_ref()),
+                l.items.get(1).and_then(|n| n.as_ref()),
             ] else {
                 return Ok(());
             };
-            let node::Node::TypeName(target) = target else {
+            let ast::Node::TypeName(target) = target else {
                 return Ok(());
             };
             let source = super::util::lookup_type_name(source, interp)?;
@@ -354,7 +350,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectAccessMethod => {
-            if let node::Node::String(s) = object
+            if let ast::Node::String(s) = object
                 && !super::opclass::am_exists(interp, &s.sval)
             {
                 return Err(DdlError::TypeNotFound(format!(
@@ -364,7 +360,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectTablespace => {
-            if let node::Node::String(s) = object
+            if let ast::Node::String(s) = object
                 && !super::cluster::tablespace_exists(interp, &s.sval)
             {
                 return Err(DdlError::TypeNotFound(format!(
@@ -374,14 +370,14 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectFdw => {
-            if let node::Node::String(s) = object {
+            if let ast::Node::String(s) = object {
                 super::fdw::check_fdw(interp, &s.sval)?;
             }
         }
         ObjectType::ObjectLargeobject => {
             let oid = match object {
-                node::Node::Integer(i) => u32::try_from(i.ival).ok(),
-                node::Node::Float(f) => f.fval.parse().ok(),
+                ast::Node::Integer(i) => u32::try_from(i.ival).ok(),
+                ast::Node::Float(f) => f.fval.parse().ok(),
                 _ => None,
             };
             if let Some(oid) = oid
@@ -393,9 +389,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectTransform => {
-            let wrapped = typedpg_pg_query::protobuf::Node {
-                node: Some(object.clone()),
-            };
+            let wrapped = Some(object.clone());
             super::languages::find_transform(interp, &wrapped)?;
         }
         ObjectType::ObjectConversion => {
@@ -406,7 +400,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectEventTrigger => {
-            if let node::Node::String(s) = object
+            if let ast::Node::String(s) = object
                 && !interp.event_triggers.iter().any(|(t, _)| *t == s.sval)
             {
                 return Err(DdlError::TypeNotFound(format!(
@@ -416,12 +410,12 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectSubscription => {
-            if let node::Node::String(s) = object {
+            if let ast::Node::String(s) = object {
                 super::cluster::alter_subscription(interp, &s.sval)?;
             }
         }
         ObjectType::ObjectPublication => {
-            if let node::Node::String(s) = object
+            if let ast::Node::String(s) = object
                 && !super::publications::publication_exists(interp, &s.sval)
             {
                 return Err(DdlError::TypeNotFound(format!(
@@ -431,7 +425,7 @@ pub(crate) fn resolve_object(
             }
         }
         ObjectType::ObjectLanguage => {
-            if let node::Node::String(s) = object {
+            if let ast::Node::String(s) = object {
                 super::languages::check(interp, &s.sval)?;
             }
         }

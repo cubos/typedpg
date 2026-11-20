@@ -5,7 +5,7 @@
 //! of an object — every other attribute (STRICT, VOLATILE, owner, tablespace,
 //! …) is irrelevant for static type analysis and remains a no-op.
 
-use typedpg_pg_query::protobuf::{AlterObjectSchemaStmt, ObjectType, RenameStmt, node};
+use typedpg_pg_query::ast::{self, AlterObjectSchemaStmt, ObjectType, RenameStmt};
 
 use super::DdlError;
 use super::util::{node_string, resolve_type_name};
@@ -16,7 +16,7 @@ use crate::pg_catalog::{PgCatalog, PgProc};
 // ─── ALTER ... RENAME TO ────────────────────────────────────────────────────
 
 pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
-    let rename_type = ObjectType::try_from(stmt.rename_type).unwrap_or(ObjectType::Undefined);
+    let rename_type = stmt.rename_type;
 
     match rename_type {
         ObjectType::ObjectTable
@@ -77,8 +77,8 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
         | ObjectType::ObjectTstemplate => {
             crate::ddl::text_search::rename(interp, rename_type, stmt)
         }
-        ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match stmt.object.as_deref() {
-            Some(object) => crate::ddl::opclass::rename_or_move_am_object(
+        ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match &stmt.object {
+            object @ Some(_) => crate::ddl::opclass::rename_or_move_am_object(
                 interp,
                 rename_type == ObjectType::ObjectOpclass,
                 object,
@@ -196,10 +196,10 @@ pub(crate) fn check_constraint_name_free(
 /// `ALTER DOMAIN d RENAME CONSTRAINT old TO new` (get_domain_constraint_oid,
 /// RenameConstraintById).
 fn rename_domain_constraint(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError> {
-    let Some(node::Node::List(l)) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+    let Some(ast::Node::List(l)) = stmt.object.as_ref() else {
         return Ok(());
     };
-    let tn = typedpg_pg_query::protobuf::TypeName {
+    let tn = typedpg_pg_query::ast::TypeName {
         names: l.items.clone(),
         ..Default::default()
     };
@@ -233,12 +233,7 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
         Err(_) if stmt.missing_ok => return Ok(()),
         Err(e) => return Err(e),
     };
-    check_alter_relation_kind(
-        interp,
-        class_oid,
-        ObjectType::try_from(stmt.rename_type).unwrap_or(ObjectType::Undefined),
-        false,
-    )?;
+    check_alter_relation_kind(interp, class_oid, stmt.rename_type, false)?;
 
     let old_name = rv.relname.clone();
     let new_name = stmt.newname.clone();
@@ -315,7 +310,7 @@ fn rename_column(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     if interp.pg_index.contains_key(&relid) {
         return rename_index_column(interp, relid, &stmt.subname, &stmt.newname, rv.inh, true);
     }
-    let cascade = stmt.behavior == typedpg_pg_query::protobuf::DropBehavior::DropCascade as i32;
+    let cascade = stmt.behavior == typedpg_pg_query::ast::DropBehavior::DropCascade;
     let typed = crate::ddl::tables::typed::typed_table_dependents(interp, relid, cascade)?;
     rename_column_in(interp, relid, &stmt.subname, &stmt.newname, rv.inh, 0)?;
     for table in typed {
@@ -508,7 +503,7 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
 // ─── ALTER ... SET SCHEMA ───────────────────────────────────────────────────
 
 pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Result<(), DdlError> {
-    let object_type = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
+    let object_type = stmt.object_type;
     let new_schema = stmt.newschema.clone();
     // AlterTableNamespace looks the relation up before the new schema.
     if matches!(
@@ -537,7 +532,7 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
         ObjectType::ObjectType | ObjectType::ObjectDomain => {
             crate::ddl::types::set_type_schema(interp, stmt, &new_schema)
         }
-        ObjectType::ObjectExtension => match stmt.object.as_deref().and_then(node_string) {
+        ObjectType::ObjectExtension => match node_string(&stmt.object) {
             Some(name) => {
                 let name = name.to_owned();
                 crate::ddl::extensions::set_extension_schema(interp, &name, &new_schema)
@@ -559,10 +554,10 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
         // AlterObjectNamespace_oid: the operator keeps its name and operand
         // types, which must be free in the new schema.
         ObjectType::ObjectOperator => {
-            let Some(object) = stmt.object.as_deref() else {
+            if stmt.object.is_none() {
                 return Ok(());
-            };
-            let Some(oid) = crate::ddl::drop::lookup_operator(interp, object)? else {
+            }
+            let Some(oid) = crate::ddl::drop::lookup_operator(interp, &stmt.object)? else {
                 return Ok(());
             };
             let Some(op) = interp.pg_operator.get(&oid).cloned() else {
@@ -588,8 +583,8 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
             interp.move_pg_operator(oid, new_nsoid);
             Ok(())
         }
-        ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match stmt.object.as_deref() {
-            Some(object) => crate::ddl::opclass::rename_or_move_am_object(
+        ObjectType::ObjectOpclass | ObjectType::ObjectOpfamily => match &stmt.object {
+            object @ Some(_) => crate::ddl::opclass::rename_or_move_am_object(
                 interp,
                 object_type == ObjectType::ObjectOpclass,
                 object,
@@ -797,12 +792,11 @@ fn set_relation_schema(
 
 /// Extract `(schema_opt, name, arg_oids)` from an `ObjectWithArgs` target.
 pub(crate) fn extract_func_target(
-    object: &Option<Box<typedpg_pg_query::protobuf::Node>>,
+    object: &Option<typedpg_pg_query::ast::Node>,
     interp: &PgCatalog,
 ) -> Option<(Option<String>, String, Vec<PgTypeOid>)> {
-    let node = object.as_deref()?;
-    let owa = match node.node.as_ref()? {
-        node::Node::ObjectWithArgs(owa) => owa,
+    let owa = match object.as_ref()? {
+        ast::Node::ObjectWithArgs(owa) => owa,
         _ => return None,
     };
 
@@ -817,7 +811,7 @@ pub(crate) fn extract_func_target(
         .objargs
         .iter()
         .filter_map(|n| {
-            if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
+            if let Some(ast::Node::TypeName(tn)) = n.as_ref() {
                 resolve_type_name(tn, interp)
             } else {
                 None

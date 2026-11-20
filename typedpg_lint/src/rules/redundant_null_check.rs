@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{CoalesceExpr, Node, NullTest, NullTestType, node::Node as N};
+use typedpg_pg_query::ast::{CoalesceExpr, Node, Node as N, NullTest, NullTestType};
 
 use super::{expression_end, location, operand_start};
 use crate::{Ctx, RawFinding, SqlEdit};
@@ -21,8 +21,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     for (node, _) in ctx.tree.nodes() {
         if let NodeRef::ResTarget(target) = node
             && target.name.is_empty()
-            && let Some(N::CoalesceExpr(expr)) =
-                target.val.as_deref().and_then(|val| val.node.as_ref())
+            && let Some(N::CoalesceExpr(expr)) = target.val.as_ref()
         {
             unaliased.insert(expr.location);
         }
@@ -40,9 +39,10 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
 // ── IS [NOT] NULL ──────────────────────────────────────────────────────────
 
 fn null_test(ctx: &Ctx<'_>, test: &NullTest, out: &mut Vec<RawFinding>) {
-    let Some(arg) = test.arg.as_deref() else {
+    let arg = &test.arg;
+    if arg.is_none() {
         return;
-    };
+    }
     // The analyzer's fact: without one, it didn't prove the argument's
     // nullability (a row / composite value, or a site it never inferred),
     // and the rule never guesses.
@@ -55,7 +55,7 @@ fn null_test(ctx: &Ctx<'_>, test: &NullTest, out: &mut Vec<RawFinding>) {
     let Some(end) = null_keyword_end(ctx, test.location).filter(|end| *end > start) else {
         return;
     };
-    let is_null = NullTestType::try_from(test.nulltesttype) == Ok(NullTestType::IsNull);
+    let is_null = test.nulltesttype == NullTestType::IsNull;
     let message = match (argument_text(ctx, arg), is_null) {
         (Some(text), true) => format!("`{text}` IS NULL is never true: it is never NULL"),
         (Some(text), false) => format!("`{text}` IS NOT NULL is always true: it is never NULL"),
@@ -240,12 +240,12 @@ fn call_parens(ctx: &Ctx<'_>, start: usize) -> Option<(usize, usize)> {
 /// Whether replacing `COALESCE(...)` by its first argument can leave the
 /// argument bare: a column, parameter, constant, function call or an
 /// expression whose own parentheses wrap it binds like the call did.
-fn is_simple_argument(ctx: &Ctx<'_>, node: &Node, start: usize, end: usize) -> bool {
+fn is_simple_argument(ctx: &Ctx<'_>, node: &Option<Node>, start: usize, end: usize) -> bool {
     if is_parenthesized(ctx, start, end) {
         return true;
     }
     matches!(
-        node.node.as_ref(),
+        node.as_ref(),
         Some(N::ColumnRef(_) | N::ParamRef(_) | N::AConst(_) | N::FuncCall(_))
     )
 }
@@ -282,9 +282,8 @@ fn is_parenthesized(ctx: &Ctx<'_>, start: usize, end: usize) -> bool {
 /// Whether a dropped argument holds a function call outside any sublink:
 /// aggregates, window functions and set-returning functions shape the rows
 /// the query returns even when `COALESCE` never evaluates them.
-fn has_call_outside_sublink(node: &Node) -> bool {
-    node.node
-        .as_ref()
+fn has_call_outside_sublink(node: &Option<Node>) -> bool {
+    node.as_ref()
         .is_some_and(|node| call_outside_sublink(node.to_ref()))
 }
 
@@ -301,9 +300,8 @@ fn call_outside_sublink(node: NodeRef<'_>) -> bool {
 /// Whether a dropped argument holds a `COLLATE` clause or a column reference:
 /// either can decide the `COALESCE`'s collation, even though the argument is
 /// never evaluated.
-fn has_collation_or_column(node: &Node) -> bool {
-    node.node
-        .as_ref()
+fn has_collation_or_column(node: &Option<Node>) -> bool {
+    node.as_ref()
         .is_some_and(|node| collation_or_column(node.to_ref()))
 }
 
@@ -337,25 +335,18 @@ fn joins(character: char) -> bool {
 /// The start of the token sequence of `node`, descending through casts and a
 /// binary expression's left side so `a + b` starts at `a` (an `AExpr`'s own
 /// location is its operator).
-fn argument_start(node: &Node) -> Option<usize> {
-    match node.node.as_ref()? {
-        N::TypeCast(cast) => cast
-            .arg
-            .as_deref()
-            .and_then(argument_start)
-            .or_else(|| operand_start(node)),
-        N::AExpr(expr) => expr
-            .lexpr
-            .as_deref()
-            .and_then(argument_start)
-            .or_else(|| operand_start(node)),
+fn argument_start(node: &Option<Node>) -> Option<usize> {
+    let node = node.as_ref()?;
+    match node {
+        N::TypeCast(cast) => argument_start(&cast.arg).or_else(|| operand_start(node)),
+        N::AExpr(expr) => argument_start(&expr.lexpr).or_else(|| operand_start(node)),
         _ => operand_start(node),
     }
 }
 
 /// The expression as the message shows it, on one line; `None` when it is
 /// too long to quote.
-fn argument_text(ctx: &Ctx<'_>, node: &Node) -> Option<String> {
+fn argument_text(ctx: &Ctx<'_>, node: &Option<Node>) -> Option<String> {
     let start = argument_start(node)?;
     short_text(ctx, start, expression_end(ctx, start))
 }

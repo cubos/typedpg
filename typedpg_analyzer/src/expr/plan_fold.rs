@@ -32,7 +32,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use typedpg_pg_query::protobuf::{self, a_const, node};
+use typedpg_pg_query::ast;
 
 use crate::pg_catalog::{PgCatalog, ProVolatile, RelKind};
 
@@ -79,11 +79,11 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
-fn extract_names(nodes: &[protobuf::Node]) -> Vec<String> {
+fn extract_names(nodes: &[Option<ast::Node>]) -> Vec<String> {
     nodes
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.clone()),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.clone()),
             _ => None,
         })
         .collect()
@@ -91,7 +91,7 @@ fn extract_names(nodes: &[protobuf::Node]) -> Vec<String> {
 
 /// Whether every function `fc` may resolve to is one the planner doesn't
 /// fold (stable or volatile).
-pub(crate) fn never_folded(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+pub(crate) fn never_folded(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
     let names = extract_names(&fc.funcname);
     let (schema, name) = match names.as_slice() {
         [n] => (None, n.as_str()),
@@ -108,8 +108,8 @@ pub(crate) fn never_folded(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> boo
 /// Whether `n` may call a volatile function (`contain_volatile_functions`):
 /// a function or operator some candidate of which is volatile, or one the
 /// analyzer can't find.
-pub(crate) fn may_be_volatile(n: &protobuf::Node, snapshot: &PgCatalog) -> bool {
-    let Some(inner) = n.node.as_ref() else {
+pub(crate) fn may_be_volatile(n: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
+    let Some(inner) = n.as_ref() else {
         return false;
     };
     let volatile = |p: &crate::pg_catalog::PgProc| p.provolatile == ProVolatile::Volatile;
@@ -153,7 +153,7 @@ pub(crate) fn may_be_volatile(n: &protobuf::Node, snapshot: &PgCatalog) -> bool 
 
 /// Whether an operator named `name` may be a volatile one (or one whose
 /// function the analyzer can't find).
-fn operator_may_be_volatile(name: &[protobuf::Node], snapshot: &PgCatalog) -> bool {
+fn operator_may_be_volatile(name: &[Option<ast::Node>], snapshot: &PgCatalog) -> bool {
     let names = extract_names(name);
     names.last().is_some_and(|name| {
         snapshot.pg_operator.values().any(|o| {
@@ -172,14 +172,14 @@ fn operator_may_be_volatile(name: &[protobuf::Node], snapshot: &PgCatalog) -> bo
 /// and calls nothing volatile. Its subquery then joins the level, a FROM
 /// subquery never null-extended.
 pub(crate) fn joined_any_sublink(
-    sub: &protobuf::SubLink,
+    sub: &ast::SubLink,
     snapshot: &PgCatalog,
-    is_level_column: &dyn Fn(&protobuf::ColumnRef) -> bool,
+    is_level_column: &dyn Fn(&ast::ColumnRef) -> bool,
 ) -> bool {
-    if sub.sub_link_type != protobuf::SubLinkType::AnySublink as i32 {
+    if sub.sub_link_type != ast::SubLinkType::AnySublink {
         return false;
     }
-    let Some(test) = sub.testexpr.as_deref() else {
+    let test @ Some(_) = &sub.testexpr else {
         return false;
     };
     if may_be_volatile(test, snapshot)
@@ -187,7 +187,7 @@ pub(crate) fn joined_any_sublink(
     {
         return false;
     }
-    let Some(inner) = test.node.as_ref() else {
+    let Some(inner) = test.as_ref() else {
         return false;
     };
     let mut todo = vec![inner.to_ref()];
@@ -217,18 +217,17 @@ pub(crate) fn joined_any_sublink(
 /// subquery) and calls nothing volatile. Its FROM items then join the
 /// level, its WHERE becomes the join's qual.
 pub(crate) fn joined_exists_sublink(
-    sub: &protobuf::SubLink,
+    sub: &ast::SubLink,
     snapshot: &PgCatalog,
-    is_level_column: &dyn Fn(&protobuf::ColumnRef) -> bool,
+    is_level_column: &dyn Fn(&ast::ColumnRef) -> bool,
 ) -> bool {
-    if sub.sub_link_type != protobuf::SubLinkType::ExistsSublink as i32 {
+    if sub.sub_link_type != ast::SubLinkType::ExistsSublink {
         return false;
     }
-    let Some(node::Node::SelectStmt(sel)) = sub.subselect.as_deref().and_then(|s| s.node.as_ref())
-    else {
+    let Some(ast::Node::SelectStmt(sel)) = sub.subselect.as_ref() else {
         return false;
     };
-    if sel.op != protobuf::SetOperation::SetopNone as i32
+    if sel.op != ast::SetOperation::SetopNone
         || !sel.values_lists.is_empty()
         || sel.with_clause.is_some()
         // GROUP BY (WINDOW, DISTINCT, ORDER BY) is thrown away; grouping
@@ -236,7 +235,7 @@ pub(crate) fn joined_exists_sublink(
         || sel
             .group_clause
             .iter()
-            .filter_map(|g| g.node.as_ref())
+            .filter_map(|g| g.as_ref())
             .any(|g| {
                 g.nodes()
                     .into_iter()
@@ -245,22 +244,21 @@ pub(crate) fn joined_exists_sublink(
         || sel.having_clause.is_some()
         || sel.limit_offset.is_some()
         // A positive or NULL (ALL) constant LIMIT is dropped.
-        || sel.limit_count.as_deref().is_some_and(|l| {
-            !matches!(l.node.as_ref(), Some(node::Node::AConst(c)) if c.isnull)
-                && int_literal(l).is_none_or(|n| n <= 0)
-        })
+        || (sel.limit_count.is_some()
+            && !matches!(sel.limit_count.as_ref(), Some(ast::Node::AConst(c)) if c.isnull)
+            && int_literal(&sel.limit_count).is_none_or(|n| n <= 0))
         || !sel.locking_clause.is_empty()
     {
         return false;
     }
     // Plain relations, maybe joined (without an alias for the join).
     fn plain<'a>(
-        n: &'a protobuf::Node,
+        n: Option<&'a ast::Node>,
         inner: &mut Vec<&'a str>,
-        on: &mut Vec<&'a protobuf::Node>,
+        on: &mut Vec<&'a ast::Node>,
     ) -> bool {
-        match n.node.as_ref() {
-            Some(node::Node::RangeVar(rv)) => {
+        match n {
+            Some(ast::Node::RangeVar(rv)) => {
                 inner.push(
                     rv.alias
                         .as_ref()
@@ -268,11 +266,11 @@ pub(crate) fn joined_exists_sublink(
                 );
                 true
             }
-            Some(node::Node::JoinExpr(j)) if j.alias.is_none() && j.join_using_alias.is_none() => {
-                on.extend(j.quals.as_deref());
+            Some(ast::Node::JoinExpr(j)) if j.alias.is_none() && j.join_using_alias.is_none() => {
+                on.extend(j.quals.as_ref());
                 [&j.larg, &j.rarg]
                     .into_iter()
-                    .all(|s| s.as_deref().is_some_and(|s| plain(s, inner, on)))
+                    .all(|s| s.as_ref().is_some_and(|s| plain(Some(s), inner, on)))
             }
             _ => false,
         }
@@ -280,7 +278,7 @@ pub(crate) fn joined_exists_sublink(
     let mut inner = Vec::new();
     let mut on = Vec::new();
     for f in &sel.from_clause {
-        if !plain(f, &mut inner, &mut on) {
+        if !plain(f.as_ref(), &mut inner, &mut on) {
             return false;
         }
     }
@@ -288,17 +286,15 @@ pub(crate) fn joined_exists_sublink(
     // (`contain_vars_of_level`): every column of a join's ON clause is
     // certainly one of the subquery's own, qualified by one of its FROM
     // items, and it holds no sublink.
-    let own_columns = |q: &protobuf::Node| {
-        q.node.as_ref().is_some_and(|q| {
-            q.nodes().into_iter().all(|(n, _)| match n {
-                typedpg_pg_query::NodeRef::SubLink(_) => false,
-                typedpg_pg_query::NodeRef::ColumnRef(cr) => {
-                    let names = extract_names(&cr.fields);
-                    matches!(names.as_slice(), [t, _]
-                        if names.len() == cr.fields.len() && inner.contains(&t.as_str()))
-                }
-                _ => true,
-            })
+    let own_columns = |q: &ast::Node| {
+        q.nodes().into_iter().all(|(n, _)| match n {
+            typedpg_pg_query::NodeRef::SubLink(_) => false,
+            typedpg_pg_query::NodeRef::ColumnRef(cr) => {
+                let names = extract_names(&cr.fields);
+                matches!(names.as_slice(), [t, _]
+                    if names.len() == cr.fields.len() && inner.contains(&t.as_str()))
+            }
+            _ => true,
         })
     };
     if !on.into_iter().all(own_columns) {
@@ -310,7 +306,7 @@ pub(crate) fn joined_exists_sublink(
         .target_list
         .iter()
         .chain(&sel.sort_clause)
-        .filter_map(|n| n.node.as_ref().map(node::Node::to_ref))
+        .filter_map(|n| n.as_ref().map(ast::Node::to_ref))
         .collect();
     while let Some(n) = todo.pop() {
         match n {
@@ -342,13 +338,13 @@ pub(crate) fn joined_exists_sublink(
         }
         todo.extend(n.children());
     }
-    let Some(qual) = sel.where_clause.as_deref() else {
+    let qual @ Some(_) = &sel.where_clause else {
         return false;
     };
     if may_be_volatile(qual, snapshot) {
         return false;
     }
-    let Some(qual) = qual.node.as_ref() else {
+    let Some(qual) = qual.as_ref() else {
         return false;
     };
     let mut todo = vec![qual.to_ref()];
@@ -381,16 +377,16 @@ pub(crate) fn joined_exists_sublink(
 /// accepts, or unqualified and `other_column`, may be one of those items'.
 /// `outer_cte` tells the CTE names the query sees from around it.
 pub(crate) fn subquery_reads_only(
-    sub: &protobuf::SubLink,
+    sub: &ast::SubLink,
     snapshot: &PgCatalog,
     outer_cte: &dyn Fn(&str) -> bool,
     other_alias: &dyn Fn(&str) -> bool,
     other_column: &dyn Fn(&str) -> bool,
 ) -> bool {
-    let Some(query) = sub.subselect.as_deref().and_then(|s| s.node.as_ref()) else {
+    let Some(query) = sub.subselect.as_ref() else {
         return false;
     };
-    let node::Node::SelectStmt(sel) = query else {
+    let ast::Node::SelectStmt(sel) = query else {
         return false;
     };
     // The query's own FROM items, and the columns of its tables (`None`
@@ -401,15 +397,15 @@ pub(crate) fn subquery_reads_only(
         .with_clause
         .iter()
         .flat_map(|w| &w.ctes)
-        .filter_map(|c| match c.node.as_ref() {
-            Some(node::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
+        .filter_map(|c| match c.as_ref() {
+            Some(ast::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
             _ => None,
         })
         .collect();
-    let mut todo: Vec<&protobuf::Node> = sel.from_clause.iter().collect();
+    let mut todo: Vec<Option<&ast::Node>> = sel.from_clause.iter().map(Option::as_ref).collect();
     while let Some(f) = todo.pop() {
-        match f.node.as_ref() {
-            Some(node::Node::RangeVar(rv)) => {
+        match f {
+            Some(ast::Node::RangeVar(rv)) => {
                 aliases.push(
                     rv.alias
                         .as_ref()
@@ -435,15 +431,15 @@ pub(crate) fn subquery_reads_only(
                     _ => columns = None,
                 }
             }
-            Some(node::Node::RangeSubselect(r)) => {
+            Some(ast::Node::RangeSubselect(r)) => {
                 aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
                 columns = None;
             }
-            Some(node::Node::RangeFunction(r)) => {
+            Some(ast::Node::RangeFunction(r)) => {
                 aliases.extend(r.alias.as_ref().map(|a| a.aliasname.as_str()));
                 columns = None;
             }
-            Some(node::Node::JoinExpr(j)) => {
+            Some(ast::Node::JoinExpr(j)) => {
                 if j.alias.is_some()
                     || j.join_using_alias.is_some()
                     || !j.using_clause.is_empty()
@@ -452,8 +448,8 @@ pub(crate) fn subquery_reads_only(
                     columns = None;
                 }
                 aliases.extend(j.alias.as_ref().map(|a| a.aliasname.as_str()));
-                todo.extend(j.larg.as_deref());
-                todo.extend(j.rarg.as_deref());
+                todo.extend(j.larg.as_ref().map(Some));
+                todo.extend(j.rarg.as_ref().map(Some));
             }
             _ => columns = None,
         }
@@ -483,14 +479,19 @@ pub(crate) fn subquery_reads_only(
 /// The sublink `pull_up_sublinks` may turn into a join a top-level AND
 /// argument `n` of a WHERE clause holds: `n` itself, or the EXISTS a NOT
 /// negates.
-pub(crate) fn conjunct_sublink(n: &protobuf::Node) -> Option<&protobuf::SubLink> {
-    match n.node.as_ref()? {
-        node::Node::SubLink(sub) => Some(sub),
-        node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::NotExpr as i32 => {
+pub(crate) fn conjunct_sublink(n: &Option<ast::Node>) -> Option<&ast::SubLink> {
+    conjunct_sublink_node(n.as_ref())
+}
+
+/// [`conjunct_sublink`] of a node held by reference.
+fn conjunct_sublink_node(n: Option<&ast::Node>) -> Option<&ast::SubLink> {
+    match n? {
+        ast::Node::SubLink(sub) => Some(sub),
+        ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::NotExpr => {
             match b.args.as_slice() {
-                [a] => match a.node.as_ref()? {
-                    node::Node::SubLink(sub)
-                        if sub.sub_link_type == protobuf::SubLinkType::ExistsSublink as i32 =>
+                [a] => match a.as_ref()? {
+                    ast::Node::SubLink(sub)
+                        if sub.sub_link_type == ast::SubLinkType::ExistsSublink =>
                     {
                         Some(sub)
                     }
@@ -509,7 +510,7 @@ thread_local! {
     /// never null-extended, whose sublinks `pull_up_sublinks` pulls up
     /// alike (reading only the join's sides, which is all the ON clause
     /// sees).
-    static WHERE_ROOT: Cell<*const protobuf::Node> = const { Cell::new(std::ptr::null()) };
+    static WHERE_ROOT: Cell<*const Option<ast::Node>> = const { Cell::new(std::ptr::null()) };
     /// The FROM items (by alias) a sublink of [`WHERE_ROOT`] may read to
     /// be pulled up, when that is the ON clause of a join a semi-join
     /// below it joins only part of (see [`with_nullable_on_clause`]);
@@ -518,7 +519,7 @@ thread_local! {
 }
 
 /// Run `f`, the analysis of WHERE clause `n` (or of such an ON clause).
-pub(crate) fn with_where_clause<R>(n: &protobuf::Node, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_where_clause<R>(n: &Option<ast::Node>, f: impl FnOnce() -> R) -> R {
     with_root(n, None, f)
 }
 
@@ -529,14 +530,14 @@ pub(crate) fn with_where_clause<R>(n: &protobuf::Node, f: impl FnOnce() -> R) ->
 /// `available` of that side — or an inner join's below the nullable side
 /// of one, into the join (`available`, its two sides).
 pub(crate) fn with_nullable_on_clause<R>(
-    n: &protobuf::Node,
+    n: &Option<ast::Node>,
     available: Vec<String>,
     f: impl FnOnce() -> R,
 ) -> R {
     with_root(n, Some(available), f)
 }
 
-fn with_root<R>(n: &protobuf::Node, available: Option<Vec<String>>, f: impl FnOnce() -> R) -> R {
+fn with_root<R>(n: &Option<ast::Node>, available: Option<Vec<String>>, f: impl FnOnce() -> R) -> R {
     let prev = WHERE_ROOT.with(|w| w.replace(std::ptr::from_ref(n)));
     let prev_available = AVAILABLE.with(|a| a.replace(available));
     let out = f();
@@ -553,15 +554,15 @@ pub(crate) fn where_available() -> Option<Vec<String>> {
 }
 
 /// Whether `n` is the WHERE clause being analyzed.
-pub(crate) fn is_where_clause(n: *const protobuf::Node) -> bool {
+pub(crate) fn is_where_clause(n: *const Option<ast::Node>) -> bool {
     !n.is_null() && WHERE_ROOT.with(|w| w.get() == n)
 }
 
 /// The value of a whole-number literal.
-fn int_literal(n: &protobuf::Node) -> Option<i64> {
-    match n.node.as_ref()? {
-        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            a_const::Val::Ival(i) => Some(i64::from(i.ival)),
+fn int_literal(n: &Option<ast::Node>) -> Option<i64> {
+    match n.as_ref()? {
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(i64::from(i.ival)),
             _ => None,
         },
         _ => None,
@@ -569,13 +570,23 @@ fn int_literal(n: &protobuf::Node) -> Option<i64> {
 }
 
 /// What `n` folds to.
-pub(crate) fn fold(n: &protobuf::Node, snapshot: &PgCatalog) -> Folded {
+pub(crate) fn fold(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Folded {
+    fold_node(n.as_ref(), snapshot)
+}
+
+/// [`fold`] of a node held by reference.
+fn fold_node(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
     fold_with(n, snapshot, &|_| Folded::Var)
 }
 
 /// What qual `n` — a WHERE or JOIN ON clause, a HAVING one — folds to
 /// once the planner preprocessed it.
-pub(crate) fn fold_qual(n: &protobuf::Node, snapshot: &PgCatalog) -> Folded {
+pub(crate) fn fold_qual(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Folded {
+    fold_qual_node(n.as_ref(), snapshot)
+}
+
+/// [`fold_qual`] of a node held by reference.
+fn fold_qual_node(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
     qual_with(n, snapshot, &|_| Folded::Var, false)
 }
 
@@ -583,8 +594,8 @@ pub(crate) fn fold_qual(n: &protobuf::Node, snapshot: &PgCatalog) -> Folded {
 /// number of NOTs when `negated`, in the scope of `ctx`: a column the
 /// planner replaces by a pulled-up subquery's output is what that folds to
 /// (see [`crate::scope::Substitution`]).
-pub(crate) fn fold_qual_in(n: &protobuf::Node, ctx: super::Ctx<'_>, negated: bool) -> Folded {
-    qual_with(n, ctx.snapshot, &|cr| column_in(cr, ctx), negated)
+pub(crate) fn fold_qual_in(n: &Option<ast::Node>, ctx: super::Ctx<'_>, negated: bool) -> Folded {
+    qual_with(n.as_ref(), ctx.snapshot, &|cr| column_in(cr, ctx), negated)
 }
 
 /// `eval_const_expressions` pushes a NOT down an AND / OR (`negate_clause`,
@@ -594,23 +605,23 @@ pub(crate) fn fold_qual_in(n: &protobuf::Node, ctx: super::Ctx<'_>, negated: boo
 /// qual, the NULL constant is FALSE (`rt.s ~ '(' AND NULL` is FALSE, its
 /// regex never estimated). Never [`Folded::Null`].
 fn qual_with(
-    n: &protobuf::Node,
+    n: Option<&ast::Node>,
     snapshot: &PgCatalog,
-    col: &dyn Fn(&protobuf::ColumnRef) -> Folded,
+    col: &dyn Fn(&ast::ColumnRef) -> Folded,
     negated: bool,
 ) -> Folded {
-    if let Some(node::Node::BoolExpr(b)) = n.node.as_ref() {
-        match protobuf::BoolExprType::try_from(b.boolop) {
-            Ok(protobuf::BoolExprType::NotExpr) => {
+    if let Some(ast::Node::BoolExpr(b)) = n {
+        match b.boolop {
+            ast::BoolExprType::NotExpr => {
                 if let Some(a) = b.args.first() {
-                    return qual_with(a, snapshot, col, !negated);
+                    return qual_with(a.as_ref(), snapshot, col, !negated);
                 }
             }
-            Ok(op) => {
-                let or = (op == protobuf::BoolExprType::OrExpr) != negated;
+            op => {
+                let or = (op == ast::BoolExprType::OrExpr) != negated;
                 let (mut var, mut unknown) = (false, false);
                 for a in &b.args {
-                    match qual_with(a, snapshot, col, negated) {
+                    match qual_with(a.as_ref(), snapshot, col, negated) {
                         Folded::Bool(v) if v == or => return Folded::Bool(or),
                         Folded::Bool(_) => {}
                         Folded::Const => unknown = true,
@@ -625,7 +636,6 @@ fn qual_with(
                     Folded::Bool(!or)
                 };
             }
-            Err(_) => {}
         }
     }
     match fold_with(n, snapshot, col) {
@@ -639,9 +649,9 @@ fn qual_with(
 /// `ctx`, before folding: the output of a subquery it certainly pulls up
 /// where it is never null-extended (see [`crate::scope::Substitution`]).
 pub(crate) fn substituted_column(
-    cr: &protobuf::ColumnRef,
+    cr: &ast::ColumnRef,
     ctx: super::Ctx<'_>,
-) -> Option<std::sync::Arc<protobuf::Node>> {
+) -> Option<std::sync::Arc<ast::Node>> {
     let parts = extract_names(&cr.fields);
     let (table, column) = match parts.as_slice() {
         [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
@@ -656,7 +666,7 @@ pub(crate) fn substituted_column(
 }
 
 /// What column `cr` folds to in the scope of `ctx` (see [`fold_qual_in`]).
-fn column_in(cr: &protobuf::ColumnRef, ctx: super::Ctx<'_>) -> Folded {
+fn column_in(cr: &ast::ColumnRef, ctx: super::Ctx<'_>) -> Folded {
     let parts = extract_names(&cr.fields);
     let (table, column) = match parts.as_slice() {
         [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
@@ -669,7 +679,7 @@ fn column_in(cr: &protobuf::ColumnRef, ctx: super::Ctx<'_>) -> Folded {
     match col.deferred.substitution {
         crate::scope::Substitution::Never if !col.planned_unknown => Folded::Var,
         crate::scope::Substitution::Certain => match col.deferred.expr.as_deref() {
-            Some(e) => fold(e, ctx.snapshot),
+            Some(e) => fold_with(Some(e), ctx.snapshot, &|_| Folded::Var),
             // A table's column passed through stays a Var (unless
             // virtual generated: its expression replaces it).
             None if col.origin.as_ref().is_some_and(|o| {
@@ -688,17 +698,17 @@ fn column_in(cr: &protobuf::ColumnRef, ctx: super::Ctx<'_>) -> Folded {
 }
 
 fn fold_with(
-    n: &protobuf::Node,
+    n: Option<&ast::Node>,
     snapshot: &PgCatalog,
-    col: &dyn Fn(&protobuf::ColumnRef) -> Folded,
+    col: &dyn Fn(&ast::ColumnRef) -> Folded,
 ) -> Folded {
-    let Some(inner) = n.node.as_ref() else {
+    let Some(inner) = n else {
         return Folded::Const;
     };
-    let all = |args: &[protobuf::Node]| -> Folded {
+    let all = |args: &[Option<ast::Node>]| -> Folded {
         if args
             .iter()
-            .any(|a| fold_with(a, snapshot, col) == Folded::Var)
+            .any(|a| fold_with(a.as_ref(), snapshot, col) == Folded::Var)
         {
             Folded::Var
         } else {
@@ -706,19 +716,19 @@ fn fold_with(
         }
     };
     match inner {
-        node::Node::AConst(c) => {
+        ast::Node::AConst(c) => {
             if c.isnull {
                 return Folded::Null;
             }
             match c.val.as_ref() {
-                Some(a_const::Val::Boolval(b)) => Folded::Bool(b.boolval),
-                Some(a_const::Val::Sval(s)) => {
+                Some(ast::AConstValue::Boolean(b)) => Folded::Bool(b.boolval),
+                Some(ast::AConstValue::String(s)) => {
                     parse_bool(&s.sval).map_or(Folded::Const, Folded::Bool)
                 }
                 _ => Folded::Const,
             }
         }
-        node::Node::TypeCast(c) => match c.arg.as_deref().map(|a| fold_with(a, snapshot, col)) {
+        ast::Node::TypeCast(c) => match c.arg.as_ref().map(|a| fold_with(Some(a), snapshot, col)) {
             Some(Folded::Var) => Folded::Var,
             Some(Folded::Null) => Folded::Null,
             Some(Folded::Bool(b))
@@ -734,37 +744,37 @@ fn fold_with(
             }
             _ => Folded::Const,
         },
-        node::Node::CollateClause(c) => c
+        ast::Node::CollateClause(c) => c
             .arg
-            .as_deref()
-            .map_or(Folded::Const, |a| fold_with(a, snapshot, col)),
-        node::Node::ColumnRef(cr) => col(cr),
+            .as_ref()
+            .map_or(Folded::Const, |a| fold_with(Some(a), snapshot, col)),
+        ast::Node::ColumnRef(cr) => col(cr),
         // A custom plan of an EXECUTE has its arguments as constants.
-        node::Node::ParamRef(_) => {
+        ast::Node::ParamRef(_) => {
             if custom_plan() {
                 Folded::Const
             } else {
                 Folded::Var
             }
         }
-        node::Node::SubLink(_)
-        | node::Node::SqlvalueFunction(_)
-        | node::Node::GroupingFunc(_)
-        | node::Node::CurrentOfExpr(_)
-        | node::Node::SetToDefault(_) => Folded::Var,
-        node::Node::BoolExpr(b) => match protobuf::BoolExprType::try_from(b.boolop) {
-            Ok(protobuf::BoolExprType::NotExpr) => {
-                match b.args.first().map(|a| fold_with(a, snapshot, col)) {
+        ast::Node::SubLink(_)
+        | ast::Node::SqlValueFunction(_)
+        | ast::Node::GroupingFunc(_)
+        | ast::Node::CurrentOfExpr(_)
+        | ast::Node::SetToDefault(_) => Folded::Var,
+        ast::Node::BoolExpr(b) => match b.boolop {
+            ast::BoolExprType::NotExpr => {
+                match b.args.first().map(|a| fold_with(a.as_ref(), snapshot, col)) {
                     Some(Folded::Bool(v)) => Folded::Bool(!v),
                     Some(other) => other,
                     None => Folded::Const,
                 }
             }
-            Ok(op) => {
-                let or = op == protobuf::BoolExprType::OrExpr;
+            op => {
+                let or = op == ast::BoolExprType::OrExpr;
                 let (mut var, mut unknown, mut null) = (false, false, false);
                 for a in &b.args {
-                    match fold_with(a, snapshot, col) {
+                    match fold_with(a.as_ref(), snapshot, col) {
                         Folded::Bool(v) if v == or => return Folded::Bool(or),
                         Folded::Bool(_) => {}
                         Folded::Null => null = true,
@@ -782,24 +792,23 @@ fn fold_with(
                     Folded::Bool(!or)
                 }
             }
-            Err(_) => Folded::Const,
         },
-        node::Node::AExpr(e) => {
-            let mut operands: Vec<&protobuf::Node> = Vec::new();
+        ast::Node::AExpr(e) => {
+            let mut operands: Vec<Option<&ast::Node>> = Vec::new();
             for side in [&e.lexpr, &e.rexpr].into_iter().flatten() {
-                match side.node.as_ref() {
-                    Some(node::Node::List(l)) => operands.extend(l.items.iter()),
-                    _ => operands.push(side),
+                match side {
+                    ast::Node::List(l) => operands.extend(l.items.iter().map(Option::as_ref)),
+                    _ => operands.push(Some(side)),
                 }
             }
             let folded: Vec<Folded> = operands
                 .iter()
-                .map(|o| fold_with(o, snapshot, col))
+                .map(|o| fold_with(*o, snapshot, col))
                 .collect();
-            let kind = protobuf::AExprKind::try_from(e.kind);
+            let kind = e.kind;
             if matches!(
                 kind,
-                Ok(protobuf::AExprKind::AexprDistinct | protobuf::AExprKind::AexprNotDistinct)
+                ast::AExprKind::AexprDistinct | ast::AExprKind::AexprNotDistinct
             ) {
                 return if folded.contains(&Folded::Var) {
                     Folded::Var
@@ -809,7 +818,7 @@ fn fold_with(
             }
             // A (strict) operator over a NULL constant folds to NULL.
             if folded.contains(&Folded::Null) {
-                return if kind == Ok(protobuf::AExprKind::AexprOp) {
+                return if kind == ast::AExprKind::AexprOp {
                     Folded::Null
                 } else {
                     Folded::Const
@@ -818,8 +827,8 @@ fn fold_with(
             if folded.contains(&Folded::Var) {
                 return Folded::Var;
             }
-            if kind == Ok(protobuf::AExprKind::AexprOp)
-                && let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref())
+            if kind == ast::AExprKind::AexprOp
+                && let (l @ Some(_), r @ Some(_)) = (&e.lexpr, &e.rexpr)
                 && let (Some(l), Some(r)) = (int_literal(l), int_literal(r))
             {
                 let v = match extract_names(&e.name).as_slice() {
@@ -837,24 +846,25 @@ fn fold_with(
             }
             Folded::Const
         }
-        node::Node::NullTest(t) => {
-            let is_null = protobuf::NullTestType::try_from(t.nulltesttype)
-                == Ok(protobuf::NullTestType::IsNull);
-            match t.arg.as_deref().map(|a| fold_with(a, snapshot, col)) {
+        ast::Node::NullTest(t) => {
+            let is_null = t.nulltesttype == ast::NullTestType::IsNull;
+            match t.arg.as_ref().map(|a| fold_with(Some(a), snapshot, col)) {
                 Some(Folded::Var) => Folded::Var,
                 Some(Folded::Null) => Folded::Bool(is_null),
                 Some(Folded::Bool(_)) => Folded::Bool(!is_null),
                 _ => Folded::Const,
             }
         }
-        node::Node::BooleanTest(t) => match t.arg.as_deref().map(|a| fold_with(a, snapshot, col)) {
-            Some(Folded::Var) => Folded::Var,
-            _ => Folded::Const,
-        },
-        node::Node::CoalesceExpr(c) => {
+        ast::Node::BooleanTest(t) => {
+            match t.arg.as_ref().map(|a| fold_with(Some(a), snapshot, col)) {
+                Some(Folded::Var) => Folded::Var,
+                _ => Folded::Const,
+            }
+        }
+        ast::Node::CoalesceExpr(c) => {
             let mut var = false;
             for a in &c.args {
-                match fold_with(a, snapshot, col) {
+                match fold_with(a.as_ref(), snapshot, col) {
                     Folded::Null => {}
                     Folded::Var => var = true,
                     v => return if var { Folded::Var } else { v },
@@ -862,22 +872,22 @@ fn fold_with(
             }
             if var { Folded::Var } else { Folded::Null }
         }
-        node::Node::CaseExpr(c) => {
-            let test = c.arg.as_deref().map(|a| fold_with(a, snapshot, col));
+        ast::Node::CaseExpr(c) => {
+            let test = c.arg.as_ref().map(|a| fold_with(Some(a), snapshot, col));
             let mut var = false;
             for w in &c.args {
-                let Some(node::Node::CaseWhen(w)) = w.node.as_ref() else {
+                let Some(ast::Node::CaseWhen(w)) = w.as_ref() else {
                     return Folded::Const;
                 };
-                match case_when_with(test, w.expr.as_deref(), snapshot, col) {
+                match case_when_with(test, w.expr.as_ref(), snapshot, col) {
                     Folded::Bool(false) | Folded::Null => {}
                     Folded::Bool(true) => {
                         return if var {
                             Folded::Var
                         } else {
                             w.result
-                                .as_deref()
-                                .map_or(Folded::Const, |r| fold_with(r, snapshot, col))
+                                .as_ref()
+                                .map_or(Folded::Const, |r| fold_with(Some(r), snapshot, col))
                         };
                     }
                     Folded::Const => return Folded::Const,
@@ -888,11 +898,11 @@ fn fold_with(
                 Folded::Var
             } else {
                 c.defresult
-                    .as_deref()
-                    .map_or(Folded::Null, |d| fold_with(d, snapshot, col))
+                    .as_ref()
+                    .map_or(Folded::Null, |d| fold_with(Some(d), snapshot, col))
             }
         }
-        node::Node::FuncCall(fc) => {
+        ast::Node::FuncCall(fc) => {
             if fc.over.is_some()
                 || fc.agg_filter.is_some()
                 || fc.agg_star
@@ -906,15 +916,15 @@ fn fold_with(
                 Folded::Const
             }
         }
-        node::Node::NamedArgExpr(a) => a
+        ast::Node::NamedArgExpr(a) => a
             .arg
-            .as_deref()
-            .map_or(Folded::Const, |a| fold_with(a, snapshot, col)),
-        node::Node::MinMaxExpr(m) => all(&m.args),
-        node::Node::RowExpr(r) => all(&r.args),
-        node::Node::AArrayExpr(a) => all(&a.elements),
-        node::Node::AIndirection(i) => i.arg.as_deref().map_or(Folded::Const, |a| {
-            if fold_with(a, snapshot, col) == Folded::Var {
+            .as_ref()
+            .map_or(Folded::Const, |a| fold_with(Some(a), snapshot, col)),
+        ast::Node::MinMaxExpr(m) => all(&m.args),
+        ast::Node::RowExpr(r) => all(&r.args),
+        ast::Node::AArrayExpr(a) => all(&a.elements),
+        ast::Node::AIndirection(i) => i.arg.as_ref().map_or(Folded::Const, |a| {
+            if fold_with(Some(a), snapshot, col) == Folded::Var {
                 Folded::Var
             } else {
                 Folded::Const
@@ -928,7 +938,7 @@ fn fold_with(
 /// CASE with a test expression folding to `test`.
 pub(crate) fn case_when(
     test: Option<Folded>,
-    cond: Option<&protobuf::Node>,
+    cond: Option<&ast::Node>,
     snapshot: &PgCatalog,
 ) -> Folded {
     case_when_with(test, cond, snapshot, &|_| Folded::Var)
@@ -936,11 +946,11 @@ pub(crate) fn case_when(
 
 fn case_when_with(
     test: Option<Folded>,
-    cond: Option<&protobuf::Node>,
+    cond: Option<&ast::Node>,
     snapshot: &PgCatalog,
-    col: &dyn Fn(&protobuf::ColumnRef) -> Folded,
+    col: &dyn Fn(&ast::ColumnRef) -> Folded,
 ) -> Folded {
-    let cond = cond.map_or(Folded::Const, |e| fold_with(e, snapshot, col));
+    let cond = cond.map_or(Folded::Const, |e| fold_with(Some(e), snapshot, col));
     match test {
         Some(t) => {
             if t == Folded::Null || cond == Folded::Null {
@@ -1054,10 +1064,10 @@ struct LevelQuals {
     pulled_up: bool,
     /// The level's SELECT, when it is one (see [`read_above`]): the address
     /// of a node the analysis borrows while the level is entered.
-    select: Option<*const protobuf::SelectStmt>,
+    select: Option<*const ast::SelectStmt>,
     /// Its FROM clause (an UPDATE's or DELETE's, with its target),
     /// borrowed alike.
-    from: Option<*const [protobuf::Node]>,
+    from: Option<*const [Option<ast::Node>]>,
     /// Every relation of the level has a row mark (`preprocess_rowmarks`):
     /// an UPDATE, a DELETE, a SELECT with a locking clause, or a level
     /// pulled up into one. Its row identity is needed above every join.
@@ -1098,7 +1108,7 @@ thread_local! {
     /// Each level's quals over columns that may prove a relation empty
     /// (see [`may_be_empty`]): the planner may push them down into a
     /// subquery it plans on its own (`set_subquery_pathlist`).
-    static PUSHABLE: RefCell<Vec<Vec<protobuf::Node>>> = const { RefCell::new(Vec::new()) };
+    static PUSHABLE: RefCell<Vec<Vec<Option<ast::Node>>>> = const { RefCell::new(Vec::new()) };
     static NEXT_LEVEL: Cell<NextLevel> = const { Cell::new(NextLevel::Own) };
     /// The alias of the FROM item the next level analyzed is, in the
     /// level around it (see [`with_next_item`]).
@@ -1139,7 +1149,7 @@ pub(crate) fn next_level_is_subplan() -> bool {
 /// The statement a query level is (see [`PlanLevel`]).
 #[derive(Clone, Copy)]
 enum Level<'a> {
-    Select(&'a protobuf::SelectStmt),
+    Select(&'a ast::SelectStmt),
     /// An UPDATE or DELETE, whose target is at this location.
     Dml {
         target: Option<i32>,
@@ -1161,22 +1171,22 @@ impl PlanLevel {
     /// constant folding precedes relation exclusion.) A constant HAVING
     /// qual is moved into WHERE, so it too may make the plan a dummy one.
     pub(crate) fn enter_select<'a>(
-        sel: &'a protobuf::SelectStmt,
+        sel: &'a ast::SelectStmt,
         ctes: impl IntoIterator<Item = &'a String>,
         snapshot: &PgCatalog,
     ) -> Self {
         let names = cte_list(
             ctes,
-            sel.with_clause.as_ref(),
+            sel.with_clause.as_deref(),
             typedpg_pg_query::NodeRef::SelectStmt(sel),
             None,
             snapshot,
         );
         Self::enter_level(
-            sel.where_clause.as_deref(),
+            sel.where_clause.as_ref(),
             &sel.from_clause,
             &sel.from_clause,
-            sel.having_clause.as_deref(),
+            sel.having_clause.as_ref(),
             &names,
             Level::Select(sel),
             snapshot,
@@ -1188,10 +1198,10 @@ impl PlanLevel {
     /// USING items may read the CTEs `ctes` and those of its own WITH,
     /// `with`.
     pub(crate) fn enter_dml<'a>(
-        where_clause: Option<&protobuf::Node>,
-        from: &[protobuf::Node],
-        target: Option<&protobuf::RangeVar>,
-        with: Option<&'a protobuf::WithClause>,
+        where_clause: Option<&ast::Node>,
+        from: &[Option<ast::Node>],
+        target: Option<&ast::RangeVar>,
+        with: Option<&'a ast::WithClause>,
         stmt: typedpg_pg_query::NodeRef<'_>,
         ctes: impl IntoIterator<Item = &'a String>,
         snapshot: &PgCatalog,
@@ -1214,7 +1224,7 @@ impl PlanLevel {
     /// level, only its row marks are modeled (every relation of the
     /// source has one, `preprocess_rowmarks`), which keep its joins'
     /// nullable sides (see [`read_above`]).
-    pub(crate) fn enter_merge_source(source: &protobuf::Node) -> Self {
+    pub(crate) fn enter_merge_source(source: &Option<ast::Node>) -> Self {
         let quals = if super::plan_time_checks() {
             LevelQuals {
                 from: Some(std::ptr::from_ref(std::slice::from_ref(source))),
@@ -1230,10 +1240,10 @@ impl PlanLevel {
     }
 
     fn enter_level(
-        where_clause: Option<&protobuf::Node>,
-        from: &[protobuf::Node],
-        own_from: &[protobuf::Node],
-        having: Option<&protobuf::Node>,
+        where_clause: Option<&ast::Node>,
+        from: &[Option<ast::Node>],
+        own_from: &[Option<ast::Node>],
+        having: Option<&ast::Node>,
         ctes: &[Cte<'_>],
         level: Level<'_>,
         snapshot: &PgCatalog,
@@ -1256,7 +1266,7 @@ impl PlanLevel {
             // A set operation's arms are used as it is.
             let arm = match level {
                 Level::Select(sel) => parent_select.is_some_and(|p| {
-                    p.op != protobuf::SetOperation::SetopNone as i32
+                    p.op != ast::SetOperation::SetopNone
                         && [&p.larg, &p.rarg]
                             .into_iter()
                             .flatten()
@@ -1275,12 +1285,12 @@ impl PlanLevel {
             let outputs = match level {
                 Level::Select(sel)
                     if outputs == Outputs::Exists
-                        && (sel.op != protobuf::SetOperation::SetopNone as i32
+                        && (sel.op != ast::SetOperation::SetopNone
                             || sel.having_clause.is_some()
                             || sel.limit_offset.is_some()
                             || !sel.locking_clause.is_empty()
                             || sel.target_list.iter().any(|t| {
-                                t.node.as_ref().is_some_and(|t| {
+                                t.as_ref().is_some_and(|t| {
                                     t.nodes().into_iter().any(|(n, _)| {
                                         matches!(n, typedpg_pg_query::NodeRef::FuncCall(f)
                                             if f.over.is_some())
@@ -1298,9 +1308,8 @@ impl PlanLevel {
                 Level::Select(sel)
                     if outputs == Outputs::Trimmed
                         && (parent.row_marks
-                            || sel.distinct_clause.iter().any(|d| d.node.is_none())
-                            || (sel.op != protobuf::SetOperation::SetopNone as i32
-                                && !sel.all)) =>
+                            || sel.distinct_clause.iter().any(|d| d.is_none())
+                            || (sel.op != ast::SetOperation::SetopNone && !sel.all)) =>
                 {
                     Outputs::Needed
                 }
@@ -1312,17 +1321,17 @@ impl PlanLevel {
                 pending.is_none() && !arm && matches!(next, NextLevel::Own | NextLevel::Subplan);
             let mut conjuncts = Vec::new();
             if let Some(w) = where_clause {
-                flatten_and(w, &mut conjuncts);
+                flatten_and(Some(w), &mut conjuncts);
             }
             for f in from {
-                join_quals(f, &mut conjuncts);
+                join_quals(f.as_ref(), &mut conjuncts);
             }
             // subquery_planner moves a HAVING qual without columns (nor
             // aggregates) into WHERE.
             let mut having_quals = Vec::new();
             if let Some(h) = having {
-                flatten_and(h, &mut having_quals);
-                having_quals.retain(|q| fold_qual(q, snapshot).may_be_const());
+                flatten_and(Some(h), &mut having_quals);
+                having_quals.retain(|q| fold_qual_node(*q, snapshot).may_be_const());
             }
             let mut dummy_quals = conjuncts.clone();
             dummy_quals.extend(having_quals.iter().copied());
@@ -1357,7 +1366,7 @@ impl PlanLevel {
             group.quals.extend(
                 having_quals
                     .into_iter()
-                    .map(|q| (q.clone(), Owner::Level, true)),
+                    .map(|q| (q.cloned(), Owner::Level, true)),
             );
             // A level inside one any relation of which may be proven
             // empty may be, to be sure — a FROM subquery pulled up, only
@@ -1393,8 +1402,10 @@ impl PlanLevel {
             };
             let pushable = conjuncts
                 .iter()
-                .filter(|c| fold_qual(c, snapshot) == Folded::Var && may_prove_empty(c, snapshot))
-                .map(|c| (*c).clone())
+                .filter(|c| {
+                    fold_qual_node(**c, snapshot) == Folded::Var && may_prove_empty(**c, snapshot)
+                })
+                .map(|c| c.cloned())
                 .collect();
             PUSHABLE.with(|p| p.borrow_mut().push(pushable));
             let proven = group.may_be_empty(rels, snapshot);
@@ -1444,7 +1455,7 @@ struct Group {
     /// with where it comes from (see [`Owner`]) and whether it is one of
     /// the top join domain's (WHERE, an inner join's ON, never below the
     /// nullable side of an outer join nor in a semi-join's condition).
-    quals: Vec<(protobuf::Node, Owner, bool)>,
+    quals: Vec<(Option<ast::Node>, Owner, bool)>,
     /// The aliases of the level's own FROM items (tables, subqueries,
     /// functions — not joins), which a column proves empty.
     aliases: Vec<String>,
@@ -1469,7 +1480,7 @@ struct Group {
     /// The top-level AND arguments of the ON clauses of the level's own
     /// inner joins never null-extended, whose sublinks `pull_up_sublinks`
     /// may turn into semi-joins (see [`Self::walk`]).
-    on_quals: Vec<protobuf::Node>,
+    on_quals: Vec<Option<ast::Node>>,
     /// The aliases of the level's own FROM items on the nullable side of
     /// an outer join.
     nullable: Vec<String>,
@@ -1484,8 +1495,8 @@ impl Group {
     /// `top`.
     fn walk(
         &mut self,
-        where_clause: Option<&protobuf::Node>,
-        from: &[protobuf::Node],
+        where_clause: Option<&ast::Node>,
+        from: &[Option<ast::Node>],
         ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
         owner: &Owner,
@@ -1493,13 +1504,13 @@ impl Group {
     ) {
         if let Some(w) = where_clause {
             let mut quals = Vec::new();
-            flatten_and(w, &mut quals);
+            flatten_and(Some(w), &mut quals);
             self.quals
-                .extend(quals.into_iter().map(|q| (q.clone(), owner.clone(), top)));
+                .extend(quals.into_iter().map(|q| (q.cloned(), owner.clone(), top)));
         }
         let on_quals = self.on_quals.len();
         for f in from {
-            self.item(f, true, ctes, snapshot, owner, top);
+            self.item(f.as_ref(), true, ctes, snapshot, owner, top);
         }
         if !matches!(owner, Owner::Level) {
             return;
@@ -1509,9 +1520,9 @@ impl Group {
         // what can't be told).
         let mut quals = Vec::new();
         if let Some(w) = where_clause {
-            flatten_and(w, &mut quals);
+            flatten_and(Some(w), &mut quals);
         }
-        let mut joined: Vec<protobuf::Node> = quals.into_iter().cloned().collect();
+        let mut joined: Vec<Option<ast::Node>> = quals.into_iter().map(|q| q.cloned()).collect();
         // Those of a kept inner join's ON clause too, above that join —
         // whose own quals don't reach their relations: they are not
         // counted for the level.
@@ -1522,20 +1533,18 @@ impl Group {
             let Some(sub) = conjunct_sublink(q) else {
                 continue;
             };
-            let Some(node::Node::SelectStmt(sel)) =
-                sub.subselect.as_deref().and_then(|s| s.node.as_ref())
-            else {
+            let Some(ast::Node::SelectStmt(sel)) = sub.subselect.as_ref() else {
                 continue;
             };
             let rels = self.rels;
-            let level = |cr: &protobuf::ColumnRef| self.reads_level(cr, snapshot);
+            let level = |cr: &ast::ColumnRef| self.reads_level(cr, snapshot);
             if joined_any_sublink(sub, snapshot, &level) {
                 self.subquery(sel, true, ctes, snapshot, &owner, false);
             } else if joined_exists_sublink(sub, snapshot, &level) {
                 // Its FROM items join the level, its WHERE is their
                 // join's qual.
                 self.walk(
-                    sel.where_clause.as_deref(),
+                    sel.where_clause.as_ref(),
                     &sel.from_clause,
                     ctes,
                     snapshot,
@@ -1552,7 +1561,7 @@ impl Group {
     /// Whether column `cr` certainly is one of the level's: qualified by
     /// one of its FROM items, or (unqualified) a column of one of its
     /// tables.
-    fn reads_level(&self, cr: &protobuf::ColumnRef, snapshot: &PgCatalog) -> bool {
+    fn reads_level(&self, cr: &ast::ColumnRef, snapshot: &PgCatalog) -> bool {
         let names = extract_names(&cr.fields);
         if names.len() != cr.fields.len() {
             return false;
@@ -1574,7 +1583,7 @@ impl Group {
     /// quals are `owner`'s, in the top join domain when `top`.
     fn subquery(
         &mut self,
-        sel: &protobuf::SelectStmt,
+        sel: &ast::SelectStmt,
         kept: bool,
         ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
@@ -1589,12 +1598,12 @@ impl Group {
                 // Only an output that is no column of its own may fold.
                 self.substitutes |= !sel.values_lists.is_empty()
                     || sel.target_list.iter().any(|t| {
-                        !matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-                            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                                Some(node::Node::ColumnRef(_))))
+                        !matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+                            if matches!(rt.val.as_ref(),
+                                Some(ast::Node::ColumnRef(_))))
                     });
                 self.walk(
-                    sel.where_clause.as_deref(),
+                    sel.where_clause.as_ref(),
                     &sel.from_clause,
                     ctes,
                     snapshot,
@@ -1613,7 +1622,7 @@ impl Group {
     /// [`Owner::Level`]); kept, it is in the top join domain when `top`.
     fn item(
         &mut self,
-        n: &protobuf::Node,
+        n: Option<&ast::Node>,
         kept: bool,
         ctes: &[Cte<'_>],
         snapshot: &PgCatalog,
@@ -1637,8 +1646,8 @@ impl Group {
                 }
             }
         };
-        match n.node.as_ref() {
-            Some(node::Node::RangeVar(rv)) => {
+        match n {
+            Some(ast::Node::RangeVar(rv)) => {
                 let alias = rv
                     .alias
                     .as_ref()
@@ -1649,8 +1658,8 @@ impl Group {
                     && self.target != Some(rv.location)
                     && let Some(cte) = ctes.iter().rev().find(|c| c.name == rv.relname)
                 {
-                    let body = match cte.def.and_then(|c| c.ctequery.as_deref()?.node.as_ref()) {
-                        Some(node::Node::SelectStmt(sel)) => Some(sel),
+                    let body = match cte.def.and_then(|c| c.ctequery.as_ref()) {
+                        Some(ast::Node::SelectStmt(sel)) => Some(sel),
                         _ => None,
                     };
                     if cte.inlined
@@ -1706,11 +1715,9 @@ impl Group {
                     }
                     RelKind::View if !kept => {}
                     RelKind::View if self.views.contains(&class.oid) => self.unknown_quals = true,
-                    RelKind::View => match crate::ddl::views::view_query(snapshot, class.oid)
-                        .and_then(|q| q.node)
-                    {
+                    RelKind::View => match crate::ddl::views::view_query(snapshot, class.oid) {
                         // A view's query sees no CTE of the statement.
-                        Some(node::Node::SelectStmt(sel)) => {
+                        Some(ast::Node::SelectStmt(sel)) => {
                             self.views.push(class.oid);
                             self.subquery(&sel, kept, &[], snapshot, owner, top);
                             self.views.pop();
@@ -1720,49 +1727,47 @@ impl Group {
                     _ => self.unknown_quals |= kept,
                 }
             }
-            Some(node::Node::RangeSubselect(sub)) => {
+            Some(ast::Node::RangeSubselect(sub)) => {
                 // (An unaliased subquery is named by nothing.)
                 let alias = sub.alias.as_ref().map_or("", |a| a.aliasname.as_str());
                 record(alias);
                 let owner = &own(alias, sub.lateral);
-                if let Some(node::Node::SelectStmt(sel)) =
-                    sub.subquery.as_deref().and_then(|q| q.node.as_ref())
-                {
+                if let Some(ast::Node::SelectStmt(sel)) = sub.subquery.as_ref() {
                     self.subquery(sel, kept, ctes, snapshot, owner, top);
                 }
             }
-            Some(node::Node::JoinExpr(j)) => {
-                let inner = j.jointype == protobuf::JoinType::JoinInner as i32;
-                let (left, right) = match protobuf::JoinType::try_from(j.jointype) {
-                    Ok(protobuf::JoinType::JoinInner) => (kept, kept),
-                    Ok(protobuf::JoinType::JoinLeft) => (kept, false),
-                    Ok(protobuf::JoinType::JoinRight) => (false, kept),
+            Some(ast::Node::JoinExpr(j)) => {
+                let inner = j.jointype == ast::JoinType::JoinInner;
+                let (left, right) = match j.jointype {
+                    ast::JoinType::JoinInner => (kept, kept),
+                    ast::JoinType::JoinLeft => (kept, false),
+                    ast::JoinType::JoinRight => (false, kept),
                     _ => (false, false),
                 };
-                if let Some(l) = j.larg.as_deref() {
-                    self.item(l, left, ctes, snapshot, owner, top);
+                if let Some(l) = j.larg.as_ref() {
+                    self.item(Some(l), left, ctes, snapshot, owner, top);
                 }
-                if let Some(r) = j.rarg.as_deref() {
-                    self.item(r, right, ctes, snapshot, owner, top);
+                if let Some(r) = j.rarg.as_ref() {
+                    self.item(Some(r), right, ctes, snapshot, owner, top);
                 }
-                if let Some(q) = j.quals.as_deref() {
+                if let Some(q) = j.quals.as_ref() {
                     let mut quals = Vec::new();
-                    flatten_and(q, &mut quals);
+                    flatten_and(Some(q), &mut quals);
                     // An outer join's quals are its nullable side's join
                     // domain's.
                     let in_top = top && kept && inner;
                     if inner && kept && level_own {
-                        self.on_quals.extend(quals.iter().map(|q| (*q).clone()));
+                        self.on_quals.extend(quals.iter().map(|q| q.cloned()));
                     }
                     self.quals.extend(
                         quals
                             .into_iter()
-                            .map(|q| (q.clone(), owner.clone(), in_top)),
+                            .map(|q| (q.cloned(), owner.clone(), in_top)),
                     );
                 }
             }
             // A function the planner may inline as a subquery it pulls up.
-            Some(node::Node::RangeFunction(rf)) => {
+            Some(ast::Node::RangeFunction(rf)) => {
                 if let Some(a) = rf.alias.as_ref() {
                     record(&a.aliasname);
                 }
@@ -1793,7 +1798,7 @@ impl Group {
                 let folded = fold_qual(q, snapshot);
                 level_wide(o, *top) && folded.may_be_const() && folded != Folded::Bool(true)
             });
-        let column_quals: Vec<(&protobuf::Node, &Owner, bool)> = self
+        let column_quals: Vec<(&Option<ast::Node>, &Owner, bool)> = self
             .quals
             .iter()
             .filter(|(q, _, _)| !fold_qual(q, snapshot).may_be_const())
@@ -1802,13 +1807,10 @@ impl Group {
         let mut proven = Proven::default();
         let mut equalities = Vec::new();
         for (q, owner, top) in &column_quals {
-            match q.node.as_ref() {
-                Some(node::Node::NullTest(t))
-                    if t.nulltesttype == protobuf::NullTestType::IsNull as i32
-                        && matches!(
-                            t.arg.as_deref().and_then(|a| a.node.as_ref()),
-                            Some(node::Node::ColumnRef(_))
-                        ) =>
+            match q.as_ref() {
+                Some(ast::Node::NullTest(t))
+                    if t.nulltesttype == ast::NullTestType::IsNull
+                        && matches!(t.arg.as_ref(), Some(ast::Node::ColumnRef(_))) =>
                 {
                     if !(*top && matches!(owner, Owner::Level) && self.null_extended(t)) {
                         self.prove_about(q, owner, &mut proven);
@@ -1820,7 +1822,7 @@ impl Group {
                 // `process_implied_equality`): of several relations, a
                 // gating qual above their join, which proves none of them
                 // empty.
-                Some(node::Node::AExpr(e))
+                Some(ast::Node::AExpr(e))
                     if extract_names(&e.name) == ["="] && !(*top && rels >= 2) =>
                 {
                     equalities.push((*q, *owner));
@@ -1829,7 +1831,7 @@ impl Group {
             }
         }
         // An equivalence class's members may be any equality's columns.
-        let quals: Vec<&protobuf::Node> = equalities.iter().map(|(q, _)| *q).collect();
+        let quals: Vec<Option<&ast::Node>> = equalities.iter().map(|(q, _)| q.as_ref()).collect();
         if equates_constants(&quals, snapshot) {
             for (q, owner) in equalities {
                 self.prove_about(q, owner, &mut proven);
@@ -1846,8 +1848,8 @@ impl Group {
     /// proves nothing empty. Not when another qual of the domain reads
     /// such an item (or an unqualified column): strict, it may reduce the
     /// outer join to an inner one (`reduce_outer_joins`).
-    fn null_extended(&self, t: &protobuf::NullTest) -> bool {
-        let Some(node::Node::ColumnRef(cr)) = t.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+    fn null_extended(&self, t: &ast::NullTest) -> bool {
+        let Some(ast::Node::ColumnRef(cr)) = t.arg.as_ref() else {
             return false;
         };
         let names = extract_names(&cr.fields);
@@ -1857,15 +1859,15 @@ impl Group {
         if !self.own_level || names.len() != cr.fields.len() || !self.nullable.contains(alias) {
             return false;
         }
-        let tested = |q: &protobuf::Node| {
-            matches!(q.node.as_ref(), Some(node::Node::NullTest(t))
-                if t.nulltesttype == protobuf::NullTestType::IsNull as i32
-                    && matches!(t.arg.as_deref().and_then(|a| a.node.as_ref()),
-                        Some(node::Node::ColumnRef(_))))
+        let tested = |q: &Option<ast::Node>| {
+            matches!(q.as_ref(), Some(ast::Node::NullTest(t))
+                if t.nulltesttype == ast::NullTestType::IsNull
+                    && matches!(t.arg.as_ref(),
+                        Some(ast::Node::ColumnRef(_))))
         };
         !self.quals.iter().any(|(q, _, top)| {
             *top && !tested(q)
-                && q.node.as_ref().is_some_and(|q| {
+                && q.as_ref().is_some_and(|q| {
                     q.nodes().into_iter().any(|(n, _)| match n {
                         typedpg_pg_query::NodeRef::ColumnRef(cr) => {
                             let names = extract_names(&cr.fields);
@@ -1887,7 +1889,7 @@ impl Group {
     /// FROM items, that item (and, under LATERAL, the level's items it
     /// names); in the level's own quals, the item a column names — any,
     /// when one can't be told (an unqualified column, a join's alias).
-    fn prove_about(&self, n: &protobuf::Node, owner: &Owner, proven: &mut Proven) {
+    fn prove_about(&self, n: &Option<ast::Node>, owner: &Owner, proven: &mut Proven) {
         let (outer, lateral) = match owner {
             Owner::Level => (true, false),
             Owner::Item { alias, lateral } => {
@@ -1905,7 +1907,7 @@ impl Group {
         if !outer && !lateral {
             return;
         }
-        let Some(inner) = n.node.as_ref() else {
+        let Some(inner) = n.as_ref() else {
             return;
         };
         let mut todo = vec![inner.to_ref()];
@@ -1933,9 +1935,9 @@ impl Group {
 /// (whose target, when a data-modifying one, is `target`).
 fn cte_list<'a>(
     outer: impl IntoIterator<Item = &'a String>,
-    with: Option<&'a protobuf::WithClause>,
+    with: Option<&'a ast::WithClause>,
     root: typedpg_pg_query::NodeRef<'_>,
-    target: Option<&protobuf::RangeVar>,
+    target: Option<&ast::RangeVar>,
     snapshot: &PgCatalog,
 ) -> Vec<Cte<'a>> {
     let mut names: Vec<Cte<'a>> = outer
@@ -1951,7 +1953,7 @@ fn cte_list<'a>(
         return names;
     };
     for c in &with.ctes {
-        let Some(node::Node::CommonTableExpr(c)) = c.node.as_ref() else {
+        let Some(ast::Node::CommonTableExpr(c)) = c.as_ref() else {
             continue;
         };
         // Referenced once (`cterefcount`, counted over the statement
@@ -1977,7 +1979,7 @@ fn cte_list<'a>(
 struct Cte<'a> {
     name: &'a str,
     /// Its definition, when known.
-    def: Option<&'a protobuf::CommonTableExpr>,
+    def: Option<&'a ast::CommonTableExpr>,
     /// The planner certainly inlines it (see [`crate::resolve::inlined`]).
     inlined: bool,
     /// The planner certainly doesn't: a reference to it is a CTE scan.
@@ -1987,10 +1989,10 @@ struct Cte<'a> {
 /// Whether a reference to CTE `cte` is a relation of its own, never pulled
 /// up: a CTE scan (MATERIALIZED, data-modifying), or a subquery the planner
 /// plans on its own once inlined.
-fn scanned_alone(cte: &protobuf::CommonTableExpr, snapshot: &PgCatalog) -> bool {
-    match cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
-        Some(node::Node::SelectStmt(sel)) => {
-            cte.ctematerialized == protobuf::CteMaterialize::Always as i32
+fn scanned_alone(cte: &ast::CommonTableExpr, snapshot: &PgCatalog) -> bool {
+    match cte.ctequery.as_ref() {
+        Some(ast::Node::SelectStmt(sel)) => {
+            cte.ctematerialized == ast::CteMaterialize::Always
                 || crate::resolve::plan_of(sel, snapshot) == crate::resolve::Plan::Separate
         }
         Some(_) => true,
@@ -2022,38 +2024,38 @@ struct Proven {
     aliases: Vec<String>,
 }
 
-fn flatten_and<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
-    if let Some(node::Node::BoolExpr(b)) = n.node.as_ref()
-        && b.boolop == protobuf::BoolExprType::AndExpr as i32
+fn flatten_and<'a>(n: Option<&'a ast::Node>, out: &mut Vec<Option<&'a ast::Node>>) {
+    if let Some(ast::Node::BoolExpr(b)) = n
+        && b.boolop == ast::BoolExprType::AndExpr
     {
         for a in &b.args {
-            flatten_and(a, out);
+            flatten_and(a.as_ref(), out);
         }
         return;
     }
     out.push(n);
 }
 
-fn join_quals<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
-    if let Some(node::Node::JoinExpr(j)) = n.node.as_ref() {
+fn join_quals<'a>(n: Option<&'a ast::Node>, out: &mut Vec<Option<&'a ast::Node>>) {
+    if let Some(ast::Node::JoinExpr(j)) = n {
         for side in [&j.larg, &j.rarg].into_iter().flatten() {
-            join_quals(side, out);
+            join_quals(Some(side), out);
         }
-        if let Some(q) = j.quals.as_deref() {
-            flatten_and(q, out);
+        if let Some(q) = j.quals.as_ref() {
+            flatten_and(Some(q), out);
         }
     }
 }
 
 /// A key identifying a literal's value, for telling two constants apart.
-fn literal_key(n: &protobuf::Node) -> Option<String> {
-    match n.node.as_ref()? {
-        node::Node::AConst(c) if !c.isnull => Some(match c.val.as_ref()? {
-            a_const::Val::Ival(i) => format!("i{}", i.ival),
-            a_const::Val::Fval(f) => format!("f{}", f.fval),
-            a_const::Val::Sval(s) => format!("s{}", s.sval),
-            a_const::Val::Boolval(b) => format!("b{}", b.boolval),
-            a_const::Val::Bsval(b) => format!("x{}", b.bsval),
+fn literal_key(n: Option<&ast::Node>) -> Option<String> {
+    match n? {
+        ast::Node::AConst(c) if !c.isnull => Some(match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => format!("i{}", i.ival),
+            ast::AConstValue::Float(f) => format!("f{}", f.fval),
+            ast::AConstValue::String(s) => format!("s{}", s.sval),
+            ast::AConstValue::Boolean(b) => format!("b{}", b.boolval),
+            ast::AConstValue::BitString(b) => format!("x{}", b.bsval),
         }),
         _ => None,
     }
@@ -2061,28 +2063,23 @@ fn literal_key(n: &protobuf::Node) -> Option<String> {
 
 /// Whether `c`, a qual over columns, is one [`may_be_empty`] may prove a
 /// relation empty with: `col IS NULL`, or `expr = constant`.
-fn may_prove_empty(c: &protobuf::Node, snapshot: &PgCatalog) -> bool {
-    match c.node.as_ref() {
-        Some(node::Node::NullTest(t)) => {
-            t.nulltesttype == protobuf::NullTestType::IsNull as i32
-                && matches!(
-                    t.arg.as_deref().and_then(|a| a.node.as_ref()),
-                    Some(node::Node::ColumnRef(_))
-                )
+fn may_prove_empty(c: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
+    match c {
+        Some(ast::Node::NullTest(t)) => {
+            t.nulltesttype == ast::NullTestType::IsNull
+                && matches!(t.arg.as_ref(), Some(ast::Node::ColumnRef(_)))
         }
-        Some(node::Node::AExpr(e)) if extract_names(&e.name) == ["="] => {
-            match protobuf::AExprKind::try_from(e.kind) {
-                Ok(protobuf::AExprKind::AexprOp) => [&e.lexpr, &e.rexpr]
-                    .into_iter()
-                    .flatten()
-                    .any(|s| fold(s, snapshot).may_be_const()),
-                Ok(protobuf::AExprKind::AexprIn) => matches!(
-                    e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
-                    Some(node::Node::List(l)) if l.items.len() == 1
-                ),
-                _ => false,
-            }
-        }
+        Some(ast::Node::AExpr(e)) if extract_names(&e.name) == ["="] => match e.kind {
+            ast::AExprKind::AexprOp => [&e.lexpr, &e.rexpr]
+                .into_iter()
+                .flatten()
+                .any(|s| fold_node(Some(s), snapshot).may_be_const()),
+            ast::AExprKind::AexprIn => matches!(
+                e.rexpr.as_ref(),
+                Some(ast::Node::List(l)) if l.items.len() == 1
+            ),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -2091,18 +2088,15 @@ fn may_prove_empty(c: &protobuf::Node, snapshot: &PgCatalog) -> bool {
 /// quals: one folds to a constant other than TRUE, one is `col IS NULL`
 /// (FALSE over a NOT NULL column), or two `expr = constant` may put two
 /// different constants in one equivalence class.
-fn may_be_empty(conjuncts: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
+fn may_be_empty(conjuncts: &[Option<&ast::Node>], snapshot: &PgCatalog) -> bool {
     for c in conjuncts {
-        let folded = fold_qual(c, snapshot);
+        let folded = fold_qual_node(*c, snapshot);
         if folded.may_be_const() && folded != Folded::Bool(true) {
             return true;
         }
-        if let Some(node::Node::NullTest(t)) = c.node.as_ref()
-            && t.nulltesttype == protobuf::NullTestType::IsNull as i32
-            && matches!(
-                t.arg.as_deref().and_then(|a| a.node.as_ref()),
-                Some(node::Node::ColumnRef(_))
-            )
+        if let Some(ast::Node::NullTest(t)) = c
+            && t.nulltesttype == ast::NullTestType::IsNull
+            && matches!(t.arg.as_ref(), Some(ast::Node::ColumnRef(_)))
         {
             return true;
         }
@@ -2112,23 +2106,23 @@ fn may_be_empty(conjuncts: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
 
 /// Whether two `expr = constant` of `conjuncts` may put two different
 /// constants in one equivalence class.
-fn equates_constants(conjuncts: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
+fn equates_constants(conjuncts: &[Option<&ast::Node>], snapshot: &PgCatalog) -> bool {
     let mut equated: Vec<Option<String>> = Vec::new();
     for c in conjuncts {
-        match c.node.as_ref() {
-            Some(node::Node::AExpr(e)) if extract_names(&e.name) == ["="] => {
-                let constant = match protobuf::AExprKind::try_from(e.kind) {
-                    Ok(protobuf::AExprKind::AexprOp) => [&e.lexpr, &e.rexpr]
+        match c {
+            Some(ast::Node::AExpr(e)) if extract_names(&e.name) == ["="] => {
+                let constant = match e.kind {
+                    ast::AExprKind::AexprOp => [&e.lexpr, &e.rexpr]
                         .into_iter()
                         .flatten()
-                        .find(|s| fold(s, snapshot).may_be_const())
-                        .map(|s| &**s),
-                    Ok(protobuf::AExprKind::AexprIn) => {
-                        match e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
-                            Some(node::Node::List(l)) if l.items.len() == 1 => l.items.first(),
-                            _ => None,
+                        .find(|s| fold_node(Some(s), snapshot).may_be_const())
+                        .map(Some),
+                    ast::AExprKind::AexprIn => match e.rexpr.as_ref() {
+                        Some(ast::Node::List(l)) if l.items.len() == 1 => {
+                            l.items.first().map(Option::as_ref)
                         }
-                    }
+                        _ => None,
+                    },
                     _ => None,
                 };
                 if let Some(constant) = constant {
@@ -2171,7 +2165,7 @@ impl LevelQuals {
 /// `join_is_removable` then keeps the join (the column is needed above
 /// it, `attr_needed`), whose nullable side is planned and its
 /// restrictions estimated. See [`Reads::above`].
-pub(crate) fn read_above(alias: &str, join: &protobuf::JoinExpr, snapshot: &PgCatalog) -> bool {
+pub(crate) fn read_above(alias: &str, join: &ast::JoinExpr, snapshot: &PgCatalog) -> bool {
     LEVELS.with(|l| {
         let l = l.borrow();
         let Some((last, rest)) = l.split_last() else {
@@ -2191,18 +2185,15 @@ pub(crate) fn read_above(alias: &str, join: &protobuf::JoinExpr, snapshot: &PgCa
 /// nullable side unique for it (`rel_is_distinct_for` needs a
 /// mergejoinable equality, of the join or of the relation's own
 /// restrictions — both in the ON clause here).
-pub(crate) fn join_equates(j: &protobuf::JoinExpr) -> bool {
+pub(crate) fn join_equates(j: &ast::JoinExpr) -> bool {
     j.is_natural
         || !j.using_clause.is_empty()
-        || j.quals
-            .as_deref()
-            .and_then(|q| q.node.as_ref())
-            .is_some_and(|q| {
-                q.nodes().into_iter().any(|(n, _)| {
-                    matches!(n, typedpg_pg_query::NodeRef::AExpr(e)
+        || j.quals.as_ref().is_some_and(|q| {
+            q.nodes().into_iter().any(|(n, _)| {
+                matches!(n, typedpg_pg_query::NodeRef::AExpr(e)
                         if extract_names(&e.name).last().is_some_and(|o| o == "="))
-                })
             })
+        })
 }
 
 /// Whether join `j` may prove table `relid`, its nullable side `alias`,
@@ -2210,14 +2201,14 @@ pub(crate) fn join_equates(j: &protobuf::JoinExpr) -> bool {
 /// of which the join equates (`alias.col = …`, an unqualified `col = …`,
 /// USING or NATURAL), or one over an expression.
 pub(crate) fn join_may_prove_unique(
-    j: &protobuf::JoinExpr,
+    j: &ast::JoinExpr,
     alias: &str,
     relid: crate::oid::PgClassOid,
     snapshot: &PgCatalog,
 ) -> bool {
     let using = extract_names(&j.using_clause);
     let mut equated: Vec<String> = Vec::new();
-    if let Some(q) = j.quals.as_deref().and_then(|q| q.node.as_ref()) {
+    if let Some(q) = j.quals.as_ref() {
         for (n, _) in q.nodes() {
             let typedpg_pg_query::NodeRef::AExpr(e) = n else {
                 continue;
@@ -2226,7 +2217,7 @@ pub(crate) fn join_may_prove_unique(
                 continue;
             }
             for side in [&e.lexpr, &e.rexpr].into_iter().flatten() {
-                if let Some(node::Node::ColumnRef(cr)) = side.node.as_ref() {
+                if let ast::Node::ColumnRef(cr) = side {
                     let names = extract_names(&cr.fields);
                     if names.len() != cr.fields.len() {
                         continue;
@@ -2316,14 +2307,14 @@ struct Target<'a> {
 }
 
 impl Target<'_> {
-    fn matches(&self, cr: &protobuf::ColumnRef) -> bool {
+    fn matches(&self, cr: &ast::ColumnRef) -> bool {
         let [a, c] = cr.fields.as_slice() else {
             return false;
         };
-        matches!(a.node.as_ref(), Some(node::Node::String(a)) if a.sval == self.alias)
-            && match c.node.as_ref() {
-                Some(node::Node::String(c)) => self.column.is_none_or(|col| c.sval == col),
-                Some(node::Node::AStar(_)) => true,
+        matches!(a.as_ref(), Some(ast::Node::String(a)) if a.sval == self.alias)
+            && match c.as_ref() {
+                Some(ast::Node::String(c)) => self.column.is_none_or(|col| c.sval == col),
+                Some(ast::Node::AStar(_)) => true,
                 _ => false,
             }
     }
@@ -2340,11 +2331,11 @@ impl Target<'_> {
 /// level outside it counts where the sublink keeps it (see
 /// [`sublink_reads`]); none in a FROM subquery, whose outputs may be
 /// trimmed.
-fn certainly_reads(n: &protobuf::Node, target: &Target<'_>, snapshot: &PgCatalog) -> bool {
-    let Some(inner) = n.node.as_ref() else {
+fn certainly_reads(n: Option<&ast::Node>, target: &Target<'_>, snapshot: &PgCatalog) -> bool {
+    let Some(inner) = n else {
         return false;
     };
-    !fold(n, snapshot).known() && reads_ref(inner.to_ref(), target, snapshot)
+    !fold_node(n, snapshot).known() && reads_ref(inner.to_ref(), target, snapshot)
 }
 
 fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &PgCatalog) -> bool {
@@ -2352,13 +2343,11 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
     match n {
         R::ColumnRef(cr) => target.matches(cr),
         R::SubLink(sub) => {
-            sub.testexpr
-                .as_deref()
-                .is_some_and(|t| certainly_reads(t, target, snapshot))
-                || matches!(sub.subselect.as_deref().and_then(|s| s.node.as_ref()),
-                Some(node::Node::SelectStmt(sel)) if sublink_reads(
+            certainly_reads(sub.testexpr.as_ref(), target, snapshot)
+                || matches!(sub.subselect.as_ref(),
+                Some(ast::Node::SelectStmt(sel)) if sublink_reads(
                     sel,
-                    sub.sub_link_type == protobuf::SubLinkType::ExistsSublink as i32,
+                    sub.sub_link_type == ast::SubLinkType::ExistsSublink,
                     target,
                     snapshot,
                 ))
@@ -2371,7 +2360,7 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
                 match fold(a, snapshot) {
                     Folded::Null => {}
                     Folded::Var => {
-                        if certainly_reads(a, target, snapshot) {
+                        if certainly_reads(a.as_ref(), target, snapshot) {
                             return true;
                         }
                     }
@@ -2381,41 +2370,42 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
             false
         }
         R::BoolExpr(b) => {
-            let identity = match protobuf::BoolExprType::try_from(b.boolop) {
-                Ok(protobuf::BoolExprType::AndExpr) => Some(Folded::Bool(true)),
-                Ok(protobuf::BoolExprType::OrExpr) => Some(Folded::Bool(false)),
-                Ok(protobuf::BoolExprType::NotExpr) => None,
-                _ => return false,
+            let identity = match b.boolop {
+                ast::BoolExprType::AndExpr => Some(Folded::Bool(true)),
+                ast::BoolExprType::OrExpr => Some(Folded::Bool(false)),
+                ast::BoolExprType::NotExpr => None,
             };
             if identity.is_some()
                 && b.args.iter().any(|a| {
                     let f = fold(a, snapshot);
-                    (f != Folded::Var && Some(f) != identity) || params_only(a)
+                    (f != Folded::Var && Some(f) != identity) || params_only(a.as_ref())
                 })
             {
                 return false;
             }
-            b.args.iter().any(|a| certainly_reads(a, target, snapshot))
+            b.args
+                .iter()
+                .any(|a| certainly_reads(a.as_ref(), target, snapshot))
         }
         R::AExpr(e) => {
-            let mut operands: Vec<&protobuf::Node> = Vec::new();
+            let mut operands: Vec<Option<&ast::Node>> = Vec::new();
             for side in [&e.lexpr, &e.rexpr].into_iter().flatten() {
-                match side.node.as_ref() {
-                    Some(node::Node::List(l)) => operands.extend(l.items.iter()),
-                    _ => operands.push(side),
+                match side {
+                    ast::Node::List(l) => operands.extend(l.items.iter().map(Option::as_ref)),
+                    _ => operands.push(Some(side)),
                 }
             }
             !operands
                 .iter()
-                .any(|o| fold(o, snapshot) == Folded::Null || params_only(o))
+                .any(|o| fold_node(*o, snapshot) == Folded::Null || params_only(*o))
                 && operands
                     .iter()
-                    .any(|o| certainly_reads(o, target, snapshot))
+                    .any(|o| certainly_reads(*o, target, snapshot))
         }
         R::FuncCall(fc) => {
             !fc.args
                 .iter()
-                .any(|a| fold(a, snapshot) == Folded::Null || params_only(a))
+                .any(|a| fold(a, snapshot) == Folded::Null || params_only(a.as_ref()))
                 && n.children()
                     .into_iter()
                     .any(|c| reads_ref(c, target, snapshot))
@@ -2429,8 +2419,8 @@ fn reads_ref(n: typedpg_pg_query::NodeRef<'_>, target: &Target<'_>, snapshot: &P
 
 /// Whether `n` reads parameters but no column nor sublink: a custom plan
 /// has them as constants (NULL ones, maybe), which it folds.
-fn params_only(n: &protobuf::Node) -> bool {
-    let Some(inner) = n.node.as_ref() else {
+fn params_only(n: Option<&ast::Node>) -> bool {
+    let Some(inner) = n else {
         return false;
     };
     let nodes = inner.nodes();
@@ -2451,85 +2441,86 @@ fn params_only(n: &protobuf::Node) -> bool {
 /// `simplify_EXISTS_query` throws away — its select list. Not when one of
 /// its FROM items may be named `target.alias` (hiding the outer one).
 fn sublink_reads(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     exists: bool,
     target: &Target<'_>,
     snapshot: &PgCatalog,
 ) -> bool {
-    if sel.op != protobuf::SetOperation::SetopNone as i32 || !sel.values_lists.is_empty() {
+    if sel.op != ast::SetOperation::SetopNone || !sel.values_lists.is_empty() {
         return false;
     }
-    fn hides(n: &protobuf::Node, alias: &str) -> bool {
-        match n.node.as_ref() {
-            Some(node::Node::RangeVar(rv)) => {
+    fn hides(n: Option<&ast::Node>, alias: &str) -> bool {
+        match n {
+            Some(ast::Node::RangeVar(rv)) => {
                 rv.alias
                     .as_ref()
                     .map_or(rv.relname.as_str(), |a| &a.aliasname)
                     == alias
             }
-            Some(node::Node::RangeSubselect(s)) => {
+            Some(ast::Node::RangeSubselect(s)) => {
                 s.alias.as_ref().is_some_and(|a| a.aliasname == alias)
             }
-            Some(node::Node::RangeFunction(f)) => {
+            Some(ast::Node::RangeFunction(f)) => {
                 f.alias.as_ref().is_none_or(|a| a.aliasname == alias)
             }
-            Some(node::Node::JoinExpr(j)) => {
+            Some(ast::Node::JoinExpr(j)) => {
                 j.alias.as_ref().is_some_and(|a| a.aliasname == alias)
                     || [&j.larg, &j.rarg]
                         .into_iter()
                         .flatten()
-                        .any(|s| hides(s, alias))
+                        .any(|s| hides(Some(s), alias))
             }
             // Anything else may be named so.
             _ => true,
         }
     }
-    if sel.from_clause.iter().any(|f| hides(f, target.alias)) {
+    if sel
+        .from_clause
+        .iter()
+        .any(|f| hides(f.as_ref(), target.alias))
+    {
         return false;
     }
     // The ON clauses of its joins no join removal drops.
-    fn on_reads(n: &protobuf::Node, target: &Target<'_>, snapshot: &PgCatalog) -> bool {
-        let Some(node::Node::JoinExpr(j)) = n.node.as_ref() else {
+    fn on_reads(n: Option<&ast::Node>, target: &Target<'_>, snapshot: &PgCatalog) -> bool {
+        let Some(ast::Node::JoinExpr(j)) = n else {
             return false;
         };
-        let (quals, left, right) = match protobuf::JoinType::try_from(j.jointype) {
-            Ok(protobuf::JoinType::JoinInner | protobuf::JoinType::JoinFull) => (true, true, true),
-            Ok(protobuf::JoinType::JoinLeft) => (false, true, false),
-            Ok(protobuf::JoinType::JoinRight) => (false, false, true),
+        let (quals, left, right) = match j.jointype {
+            ast::JoinType::JoinInner | ast::JoinType::JoinFull => (true, true, true),
+            ast::JoinType::JoinLeft => (false, true, false),
+            ast::JoinType::JoinRight => (false, false, true),
             _ => return false,
         };
-        (quals
-            && j.quals
-                .as_deref()
-                .is_some_and(|q| certainly_reads(q, target, snapshot)))
-            || (left
-                && j.larg
-                    .as_deref()
-                    .is_some_and(|s| on_reads(s, target, snapshot)))
-            || (right
-                && j.rarg
-                    .as_deref()
-                    .is_some_and(|s| on_reads(s, target, snapshot)))
+        (quals && certainly_reads(j.quals.as_ref(), target, snapshot))
+            || (left && on_reads(j.larg.as_ref(), target, snapshot))
+            || (right && on_reads(j.rarg.as_ref(), target, snapshot))
     }
     sel.where_clause
-        .as_deref()
+        .as_ref()
         .into_iter()
-        .chain(sel.having_clause.as_deref())
-        .chain(sel.target_list.iter().filter(|_| !exists))
+        .chain(sel.having_clause.as_ref())
+        .map(Some)
+        .chain(
+            sel.target_list
+                .iter()
+                .filter(|_| !exists)
+                .map(Option::as_ref),
+        )
         .any(|c| certainly_reads(c, target, snapshot))
         || sel
             .from_clause
             .iter()
-            .any(|f| on_reads(f, target, snapshot))
+            .any(|f| on_reads(f.as_ref(), target, snapshot))
 }
 
 /// What a query level's read checks look at (see [`LevelQuals::reads`]).
 #[derive(Clone, Copy)]
 struct Reads<'a> {
     /// The level's SELECT, when it is one.
-    select: Option<&'a protobuf::SelectStmt>,
+    select: Option<&'a ast::SelectStmt>,
     /// Its FROM clause (an UPDATE's or DELETE's with its target).
-    from: &'a [protobuf::Node],
+    from: &'a [Option<ast::Node>],
     row_marks: bool,
     outputs: Outputs,
     pulled_up: bool,
@@ -2582,20 +2573,20 @@ impl Reads<'_> {
     /// Only a reference qualified by the alias counts (`alias.col`,
     /// `alias.*`), or a `*` of the select list. `depth` bounds the
     /// recursion through other joins' nullable sides.
-    fn above(&self, alias: &str, join: *const protobuf::JoinExpr, depth: usize) -> bool {
-        fn holds(n: &protobuf::Node, join: *const protobuf::JoinExpr) -> bool {
-            let Some(node::Node::JoinExpr(j)) = n.node.as_ref() else {
+    fn above(&self, alias: &str, join: *const ast::JoinExpr, depth: usize) -> bool {
+        fn holds(n: Option<&ast::Node>, join: *const ast::JoinExpr) -> bool {
+            let Some(ast::Node::JoinExpr(j)) = n else {
                 return false;
             };
             std::ptr::eq(&**j, join)
                 || [&j.larg, &j.rarg]
                     .into_iter()
                     .flatten()
-                    .any(|s| holds(s, join))
+                    .any(|s| holds(Some(s), join))
         }
         // A join the level's FROM clause doesn't hold (a view's, a CTE's):
         // nothing is known.
-        if !self.from.iter().any(|f| holds(f, join)) {
+        if !self.from.iter().any(|f| holds(f.as_ref(), join)) {
             return false;
         }
         if self.row_marks {
@@ -2607,7 +2598,7 @@ impl Reads<'_> {
         };
         self.from
             .iter()
-            .any(|f| self.join_reads(f, join, &target, depth))
+            .any(|f| self.join_reads(f.as_ref(), join, &target, depth))
             || self
                 .select
                 .is_some_and(|sel| self.clauses_read(sel, &target))
@@ -2618,33 +2609,29 @@ impl Reads<'_> {
     /// removed.
     fn join_reads(
         &self,
-        n: &protobuf::Node,
-        join: *const protobuf::JoinExpr,
+        n: Option<&ast::Node>,
+        join: *const ast::JoinExpr,
         target: &Target<'_>,
         depth: usize,
     ) -> bool {
-        let Some(node::Node::JoinExpr(j)) = n.node.as_ref() else {
+        let Some(ast::Node::JoinExpr(j)) = n else {
             return false;
         };
         if std::ptr::eq(&**j, join) {
             return false;
         }
-        let reads = || {
-            j.quals
-                .as_deref()
-                .is_some_and(|q| certainly_reads(q, target, self.snapshot))
-        };
-        let kept = || match protobuf::JoinType::try_from(j.jointype) {
-            Ok(protobuf::JoinType::JoinInner | protobuf::JoinType::JoinFull) => true,
-            Ok(protobuf::JoinType::JoinLeft) => self.side_kept(j, j.rarg.as_deref(), depth),
-            Ok(protobuf::JoinType::JoinRight) => self.side_kept(j, j.larg.as_deref(), depth),
+        let reads = || certainly_reads(j.quals.as_ref(), target, self.snapshot);
+        let kept = || match j.jointype {
+            ast::JoinType::JoinInner | ast::JoinType::JoinFull => true,
+            ast::JoinType::JoinLeft => self.side_kept(j, j.rarg.as_ref(), depth),
+            ast::JoinType::JoinRight => self.side_kept(j, j.larg.as_ref(), depth),
             _ => false,
         };
         (reads() && kept())
             || [&j.larg, &j.rarg]
                 .into_iter()
                 .flatten()
-                .any(|s| self.join_reads(s, join, target, depth))
+                .any(|s| self.join_reads(Some(s), join, target, depth))
     }
 
     /// Whether `remove_useless_joins` certainly keeps outer join `j` of
@@ -2653,14 +2640,9 @@ impl Reads<'_> {
     /// on its own whose rows may not be distinct, a FROM item read above
     /// the join, or one a sublink of its ON clause is pulled up into (see
     /// [`Self::pulls_sublink_into`]).
-    fn side_kept(
-        &self,
-        j: &protobuf::JoinExpr,
-        side: Option<&protobuf::Node>,
-        depth: usize,
-    ) -> bool {
-        let alias = match side.and_then(|s| s.node.as_ref()) {
-            Some(node::Node::RangeVar(rv)) => {
+    fn side_kept(&self, j: &ast::JoinExpr, side: Option<&ast::Node>, depth: usize) -> bool {
+        let alias = match side {
+            Some(ast::Node::RangeVar(rv)) => {
                 let alias = rv
                     .alias
                     .as_ref()
@@ -2673,11 +2655,10 @@ impl Reads<'_> {
                 }
                 alias
             }
-            Some(node::Node::RangeSubselect(s)) => {
+            Some(ast::Node::RangeSubselect(s)) => {
                 // Planned on its own, a subquery is proven unique only by
                 // what makes its rows distinct (`query_is_distinct_for`).
-                if let Some(node::Node::SelectStmt(sel)) =
-                    s.subquery.as_deref().and_then(|q| q.node.as_ref())
+                if let Some(ast::Node::SelectStmt(sel)) = s.subquery.as_ref()
                     && crate::resolve::plan_of(sel, self.snapshot) == crate::resolve::Plan::Separate
                     && !may_be_distinct(sel, self.snapshot)
                 {
@@ -2700,31 +2681,28 @@ impl Reads<'_> {
     /// semi-join reading the side above the join). Only references
     /// qualified by `alias` count as the side's, and the sublink's query
     /// must certainly read nothing else of the level.
-    fn pulls_sublink_into(&self, j: &protobuf::JoinExpr, alias: &str) -> bool {
-        let Some(quals) = j.quals.as_deref() else {
+    fn pulls_sublink_into(&self, j: &ast::JoinExpr, alias: &str) -> bool {
+        let Some(quals) = j.quals.as_ref() else {
             return false;
         };
-        let side_column = |cr: &protobuf::ColumnRef| {
+        let side_column = |cr: &ast::ColumnRef| {
             let names = extract_names(&cr.fields);
             names.len() == cr.fields.len() && matches!(names.as_slice(), [t, _] if t == alias)
         };
         // The tested expression reads the side alone.
-        let test_reads_side = |sub: &protobuf::SubLink| {
-            sub.testexpr
-                .as_deref()
-                .and_then(|t| t.node.as_ref())
-                .is_none_or(|t| {
-                    t.nodes().into_iter().all(|(n, _)| match n {
-                        typedpg_pg_query::NodeRef::SubLink(_) => false,
-                        typedpg_pg_query::NodeRef::ColumnRef(cr) => side_column(cr),
-                        _ => true,
-                    })
+        let test_reads_side = |sub: &ast::SubLink| {
+            sub.testexpr.as_ref().is_none_or(|t| {
+                t.nodes().into_iter().all(|(n, _)| match n {
+                    typedpg_pg_query::NodeRef::SubLink(_) => false,
+                    typedpg_pg_query::NodeRef::ColumnRef(cr) => side_column(cr),
+                    _ => true,
                 })
+            })
         };
         let mut conjuncts = Vec::new();
-        flatten_and(quals, &mut conjuncts);
+        flatten_and(Some(quals), &mut conjuncts);
         conjuncts.into_iter().any(|q| {
-            conjunct_sublink(q).is_some_and(|sub| {
+            conjunct_sublink_node(q).is_some_and(|sub| {
                 (joined_any_sublink(sub, self.snapshot, &side_column)
                     || joined_exists_sublink(sub, self.snapshot, &side_column))
                     && test_reads_side(sub)
@@ -2741,7 +2719,7 @@ impl Reads<'_> {
 
     /// The relation `rv` names when it certainly is a table (no CTE of
     /// its name).
-    fn plain_table(&self, rv: &protobuf::RangeVar) -> Option<crate::oid::PgClassOid> {
+    fn plain_table(&self, rv: &ast::RangeVar) -> Option<crate::oid::PgClassOid> {
         plain_table(rv, self.snapshot, &|name| {
             self.ctes.iter().any(|c| c == name)
         })
@@ -2752,9 +2730,9 @@ impl Reads<'_> {
     /// one's entry only where the level around it reads that output. A
     /// WINDOW clause no window call uses is dropped with a subquery
     /// pulled up.
-    fn clauses_read(&self, sel: &protobuf::SelectStmt, target: &Target<'_>) -> bool {
-        let reads = |n: &protobuf::Node| certainly_reads(n, target, self.snapshot);
-        let kept_clauses: &[&[protobuf::Node]] = match self.outputs {
+    fn clauses_read(&self, sel: &ast::SelectStmt, target: &Target<'_>) -> bool {
+        let reads = |n: Option<&ast::Node>| certainly_reads(n, target, self.snapshot);
+        let kept_clauses: &[&[Option<ast::Node>]] = match self.outputs {
             Outputs::Exists => &[],
             Outputs::Trimmed if self.pulled_up => {
                 &[&sel.group_clause, &sel.sort_clause, &sel.distinct_clause]
@@ -2768,10 +2746,16 @@ impl Reads<'_> {
         };
         if sel
             .where_clause
-            .as_deref()
+            .as_ref()
             .into_iter()
-            .chain(sel.having_clause.as_deref())
-            .chain(kept_clauses.iter().flat_map(|c| c.iter()))
+            .chain(sel.having_clause.as_ref())
+            .map(Some)
+            .chain(
+                kept_clauses
+                    .iter()
+                    .flat_map(|c| c.iter())
+                    .map(Option::as_ref),
+            )
             .any(reads)
         {
             return true;
@@ -2779,17 +2763,17 @@ impl Reads<'_> {
         match self.outputs {
             Outputs::Needed => {
                 sel.target_list.iter().any(|t| {
-                    matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-                        if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                            Some(node::Node::ColumnRef(cr)) if matches!(cr.fields.as_slice(),
-                                [f] if matches!(f.node, Some(node::Node::AStar(_))))))
-                }) || sel.target_list.iter().any(reads)
+                    matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+                        if matches!(rt.val.as_ref(),
+                            Some(ast::Node::ColumnRef(cr)) if matches!(cr.fields.as_slice(),
+                                [f] if matches!(f, Some(ast::Node::AStar(_))))))
+                }) || sel.target_list.iter().any(|t| reads(t.as_ref()))
             }
             Outputs::Trimmed => sel
                 .target_list
                 .iter()
                 .enumerate()
-                .any(|(i, t)| reads(t) && self.output_read(sel, i)),
+                .any(|(i, t)| reads(t.as_ref()) && self.output_read(sel, i)),
             Outputs::Exists => false,
         }
     }
@@ -2798,7 +2782,7 @@ impl Reads<'_> {
     /// `sel`, the FROM item [`Self::item`] it is there (named as that
     /// item's column aliases, or the CTE's, say), in a clause that keeps
     /// it.
-    fn output_read(&self, sel: &protobuf::SelectStmt, i: usize) -> bool {
+    fn output_read(&self, sel: &ast::SelectStmt, i: usize) -> bool {
         let (Some(item), Some(parent)) = (self.item, self.parent) else {
             return false;
         };
@@ -2813,7 +2797,7 @@ impl Reads<'_> {
         // Entry `i` is output `i` when no `*` comes before it.
         if item.is_empty()
             || sel.target_list[..i].iter().any(|t| {
-                t.node.as_ref().is_some_and(|t| {
+                t.as_ref().is_some_and(|t| {
                     t.nodes()
                         .into_iter()
                         .any(|(n, _)| matches!(n, typedpg_pg_query::NodeRef::AStar(_)))
@@ -2822,45 +2806,40 @@ impl Reads<'_> {
         {
             return false;
         }
-        let Some(node::Node::ResTarget(rt)) = sel.target_list[i].node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = sel.target_list[i].as_ref() else {
             return false;
         };
-        fn find<'n>(n: &'n protobuf::Node, item: &str) -> Option<&'n protobuf::Node> {
-            match n.node.as_ref()? {
-                node::Node::RangeVar(rv)
+        fn find<'n>(n: Option<&'n ast::Node>, item: &str) -> Option<&'n ast::Node> {
+            match n? {
+                ast::Node::RangeVar(rv)
                     if rv
                         .alias
                         .as_ref()
                         .map_or(rv.relname.as_str(), |a| &a.aliasname)
                         == item =>
                 {
-                    Some(n)
+                    n
                 }
-                node::Node::RangeSubselect(s)
+                ast::Node::RangeSubselect(s)
                     if s.alias.as_ref().is_some_and(|a| a.aliasname == item) =>
                 {
-                    Some(n)
+                    n
                 }
-                node::Node::JoinExpr(j) => [&j.larg, &j.rarg]
+                ast::Node::JoinExpr(j) => [&j.larg, &j.rarg]
                     .into_iter()
                     .flatten()
-                    .find_map(|s| find(s, item)),
+                    .find_map(|s| find(Some(s), item)),
                 _ => None,
             }
         }
-        let strings = |names: &[protobuf::Node]| -> Vec<String> { extract_names(names) };
-        let renames = match psel
-            .from_clause
-            .iter()
-            .find_map(|f| find(f, item))
-            .and_then(|n| n.node.as_ref())
-        {
-            Some(node::Node::RangeSubselect(s)) => s
+        let strings = |names: &[Option<ast::Node>]| -> Vec<String> { extract_names(names) };
+        let renames = match psel.from_clause.iter().find_map(|f| find(f.as_ref(), item)) {
+            Some(ast::Node::RangeSubselect(s)) => s
                 .alias
                 .as_ref()
                 .map(|a| strings(&a.colnames))
                 .unwrap_or_default(),
-            Some(node::Node::RangeVar(rv)) => {
+            Some(ast::Node::RangeVar(rv)) => {
                 let mut names = rv
                     .alias
                     .as_ref()
@@ -2869,8 +2848,8 @@ impl Reads<'_> {
                 if names.len() <= i {
                     // A CTE of the level's own WITH (any other's is unknown).
                     let cte = psel.with_clause.as_ref().and_then(|w| {
-                        w.ctes.iter().find_map(|c| match c.node.as_ref() {
-                            Some(node::Node::CommonTableExpr(c)) if c.ctename == rv.relname => {
+                        w.ctes.iter().find_map(|c| match c.as_ref() {
+                            Some(ast::Node::CommonTableExpr(c)) if c.ctename == rv.relname => {
                                 Some(c)
                             }
                             _ => None,
@@ -2890,9 +2869,8 @@ impl Reads<'_> {
             n.clone()
         } else if !rt.name.is_empty() {
             rt.name.clone()
-        } else if let Some(node::Node::ColumnRef(cr)) =
-            rt.val.as_deref().and_then(|v| v.node.as_ref())
-            && let Some(node::Node::String(s)) = cr.fields.last().and_then(|f| f.node.as_ref())
+        } else if let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref()
+            && let Some(ast::Node::String(s)) = cr.fields.last().and_then(|f| f.as_ref())
         {
             s.sval.clone()
         } else {
@@ -2906,7 +2884,7 @@ impl Reads<'_> {
             || psel
                 .from_clause
                 .iter()
-                .any(|f| outer.join_reads(f, std::ptr::null(), &target, 0))
+                .any(|f| outer.join_reads(f.as_ref(), std::ptr::null(), &target, 0))
     }
 
     /// How many base relations on the nullable side of the level's outer
@@ -2918,47 +2896,42 @@ impl Reads<'_> {
     /// and an inner join's are all in its `min_righthand`; self-join
     /// elimination merges only scans of one table).
     fn held_relations(&self) -> usize {
-        fn count(r: &Reads<'_>, n: &protobuf::Node) -> usize {
-            let Some(node::Node::JoinExpr(j)) = n.node.as_ref() else {
+        fn count(r: &Reads<'_>, n: Option<&ast::Node>) -> usize {
+            let Some(ast::Node::JoinExpr(j)) = n else {
                 return 0;
             };
-            let one = |side: Option<&protobuf::Node>| -> usize {
-                match side.and_then(|s| s.node.as_ref()) {
-                    Some(node::Node::RangeVar(rv)) => usize::from(r.plain_table(rv).is_some()),
-                    Some(node::Node::RangeSubselect(s)) => usize::from(matches!(
-                        s.subquery.as_deref().and_then(|q| q.node.as_ref()),
-                        Some(node::Node::SelectStmt(sel)) if !sel.from_clause.is_empty()
+            let one = |side: Option<&ast::Node>| -> usize {
+                match side {
+                    Some(ast::Node::RangeVar(rv)) => usize::from(r.plain_table(rv).is_some()),
+                    Some(ast::Node::RangeSubselect(s)) => usize::from(matches!(
+                        s.subquery.as_ref(),
+                        Some(ast::Node::SelectStmt(sel)) if !sel.from_clause.is_empty()
                             && matches!(crate::resolve::plan_of(sel, r.snapshot),
                                 crate::resolve::Plan::PulledUp | crate::resolve::Plan::Separate)
                     )),
                     _ => 0,
                 }
             };
-            let inner_tables = |side: Option<&protobuf::Node>| {
+            let inner_tables = |side: Option<&ast::Node>| {
                 side.map_or(0, |side| {
-                    inner_join_tables(side, r.snapshot, &|name| r.ctes.iter().any(|c| c == name))
+                    inner_join_tables_node(Some(side), r.snapshot, &|name| {
+                        r.ctes.iter().any(|c| c == name)
+                    })
                 })
             };
-            let joined = |side: Option<&protobuf::Node>| {
-                matches!(
-                    side.and_then(|s| s.node.as_ref()),
-                    Some(node::Node::JoinExpr(_))
-                )
-            };
-            let (l, rr) = (j.larg.as_deref(), j.rarg.as_deref());
-            let held = match protobuf::JoinType::try_from(j.jointype) {
-                Ok(protobuf::JoinType::JoinLeft) if joined(rr) => inner_tables(rr),
-                Ok(protobuf::JoinType::JoinRight) if joined(l) => inner_tables(l),
-                Ok(protobuf::JoinType::JoinLeft) if r.side_kept(j, rr, 0) => one(rr),
-                Ok(protobuf::JoinType::JoinRight) if r.side_kept(j, l, 0) => one(l),
-                Ok(protobuf::JoinType::JoinFull) => {
-                    one(l) + one(rr) + inner_tables(l) + inner_tables(rr)
-                }
+            let joined = |side: Option<&ast::Node>| matches!(side, Some(ast::Node::JoinExpr(_)));
+            let (l, rr) = (j.larg.as_ref(), j.rarg.as_ref());
+            let held = match j.jointype {
+                ast::JoinType::JoinLeft if joined(rr) => inner_tables(rr),
+                ast::JoinType::JoinRight if joined(l) => inner_tables(l),
+                ast::JoinType::JoinLeft if r.side_kept(j, rr, 0) => one(rr),
+                ast::JoinType::JoinRight if r.side_kept(j, l, 0) => one(l),
+                ast::JoinType::JoinFull => one(l) + one(rr) + inner_tables(l) + inner_tables(rr),
                 _ => 0,
             };
-            held + l.map_or(0, |s| count(r, s)) + rr.map_or(0, |s| count(r, s))
+            held + l.map_or(0, |s| count(r, Some(s))) + rr.map_or(0, |s| count(r, Some(s)))
         }
-        self.from.iter().map(|f| count(self, f)).sum()
+        self.from.iter().map(|f| count(self, f.as_ref())).sum()
     }
 }
 
@@ -3145,7 +3118,7 @@ pub(crate) fn may_be_removed(source: &crate::scope::TableSource, snapshot: &PgCa
 /// The relation `rv` names when it certainly is a table (no CTE of its
 /// name, as `is_cte` tells).
 fn plain_table(
-    rv: &protobuf::RangeVar,
+    rv: &ast::RangeVar,
     snapshot: &PgCatalog,
     is_cte: &dyn Fn(&str) -> bool,
 ) -> Option<crate::oid::PgClassOid> {
@@ -3168,22 +3141,31 @@ fn plain_table(
 /// join's `min_righthand` (self-join elimination merges only scans of one
 /// table). `is_cte` tells the CTE names the level sees.
 pub(crate) fn inner_join_tables(
-    side: &protobuf::Node,
+    side: &Option<ast::Node>,
     snapshot: &PgCatalog,
     is_cte: &dyn Fn(&str) -> bool,
 ) -> usize {
-    if !matches!(side.node.as_ref(), Some(node::Node::JoinExpr(_))) {
+    inner_join_tables_node(side.as_ref(), snapshot, is_cte)
+}
+
+/// [`inner_join_tables`] of a node held by reference.
+fn inner_join_tables_node(
+    side: Option<&ast::Node>,
+    snapshot: &PgCatalog,
+    is_cte: &dyn Fn(&str) -> bool,
+) -> usize {
+    if !matches!(side, Some(ast::Node::JoinExpr(_))) {
         return 0;
     }
     let mut relids = Vec::new();
     let mut todo = vec![side];
     while let Some(n) = todo.pop() {
-        match n.node.as_ref() {
-            Some(node::Node::JoinExpr(j)) if j.jointype == protobuf::JoinType::JoinInner as i32 => {
-                todo.extend(j.larg.as_deref());
-                todo.extend(j.rarg.as_deref());
+        match n {
+            Some(ast::Node::JoinExpr(j)) if j.jointype == ast::JoinType::JoinInner => {
+                todo.extend(j.larg.as_ref().map(Some));
+                todo.extend(j.rarg.as_ref().map(Some));
             }
-            Some(node::Node::RangeVar(rv)) => {
+            Some(ast::Node::RangeVar(rv)) => {
                 if let Some(relid) = plain_table(rv, snapshot, is_cte)
                     && !relids.contains(&relid)
                 {
@@ -3200,8 +3182,8 @@ pub(crate) fn inner_join_tables(
 /// the planner plans on its own: it has DISTINCT, GROUP BY, HAVING, a set
 /// operation — or may call an aggregate (a function some candidate of
 /// which is one, or one the analyzer can't find, outside sublinks).
-pub(crate) fn may_be_distinct(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
-    if sel.op != protobuf::SetOperation::SetopNone as i32
+pub(crate) fn may_be_distinct(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
+    if sel.op != ast::SetOperation::SetopNone
         || !sel.distinct_clause.is_empty()
         || !sel.group_clause.is_empty()
         || sel.having_clause.is_some()
@@ -3212,7 +3194,7 @@ pub(crate) fn may_be_distinct(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) 
         .target_list
         .iter()
         .chain(&sel.sort_clause)
-        .filter_map(|n| n.node.as_ref().map(node::Node::to_ref))
+        .filter_map(|n| n.as_ref().map(ast::Node::to_ref))
         .collect();
     while let Some(n) = todo.pop() {
         match n {

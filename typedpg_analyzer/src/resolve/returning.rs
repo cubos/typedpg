@@ -1,4 +1,6 @@
 use super::*;
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // RETURNING (PG 18: OLD / NEW rows)
@@ -32,7 +34,7 @@ pub(crate) struct ReturningRows {
 /// table-only), so unqualified names and the bare `*` still mean the
 /// target. They exist only for the RETURNING list.
 pub(crate) fn resolve_returning(
-    clause: &Option<protobuf::ReturningClause>,
+    clause: &Option<NodeBox<ast::ReturningClause>>,
     target_alias: &str,
     rows: ReturningRows,
     ctx: Ctx<'_>,
@@ -45,18 +47,19 @@ pub(crate) fn resolve_returning(
 
     // EXPR_KIND_RETURNING / EXPR_KIND_MERGE_RETURNING.
     for target in &clause.exprs {
-        if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-            && let Some(val) = &rt.val
+        if let Some(ast::Node::ResTarget(rt)) = target.as_ref()
+            && rt.val.is_some()
         {
+            let val = &rt.val;
             crate::clause::check_no_aggregates_or_windows(val, ctx.snapshot, "RETURNING")?;
             check_no_srf_in_clause(val, ctx.snapshot, "RETURNING")?;
         }
     }
     // (Only a bare `$N` changes anything here: any other parameter is typed
     // alike by the walk below.)
-    let is_bare_param = |t: &protobuf::Node| {
-        matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-            if rt.val.as_deref().and_then(|v| expr::bare_param(v, ctx.snapshot)).is_some())
+    let is_bare_param = |t: &Option<ast::Node>| {
+        matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+            if expr::bare_param(&rt.val, ctx.snapshot).is_some())
     };
     if clause.exprs.iter().any(is_bare_param) {
         resolve_unknown_returning_params(
@@ -91,7 +94,7 @@ pub(crate) fn resolve_returning(
 /// the analyzer resolves it: ahead of an UPDATE's SET list
 /// (transformUpdateStmt). Errors are left to [`resolve_returning`].
 pub(crate) fn type_returning_params(
-    clause: &Option<protobuf::ReturningClause>,
+    clause: &Option<NodeBox<ast::ReturningClause>>,
     target_alias: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -115,15 +118,15 @@ pub(crate) fn type_returning_params(
 /// (resolveTargetListUnknowns): a bare `$N` untyped when transformed is
 /// deduced `text` — or, typed meanwhile by a later entry, inconsistent.
 fn resolve_unknown_returning_params(
-    clause: &protobuf::ReturningClause,
+    clause: &ast::ReturningClause,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let items: Vec<&protobuf::Node> = clause
+    let items: Vec<&Option<ast::Node>> = clause
         .exprs
         .iter()
-        .filter_map(|t| match t.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+        .filter_map(|t| match t.as_ref() {
+            Some(ast::Node::ResTarget(rt)) if rt.val.is_some() => Some(&rt.val),
             _ => None,
         })
         .collect();
@@ -138,7 +141,7 @@ fn resolve_unknown_returning_params(
 
 /// The namespace RETURNING resolves in: `scope` plus the OLD / NEW rows.
 fn returning_scope(
-    clause: &protobuf::ReturningClause,
+    clause: &ast::ReturningClause,
     target_alias: &str,
     rows: &ReturningRows,
     scope: &Scope,
@@ -158,23 +161,16 @@ fn returning_scope(
     let mut old_named = false;
     let mut new_named = false;
     for option in &clause.options {
-        let Some(node::Node::ReturningOption(opt)) = option.node.as_ref() else {
+        let Some(ast::Node::ReturningOption(opt)) = option.as_ref() else {
             continue;
         };
         let span = crate::error::SourceSpan::from_node_qname(opt.location);
-        let (named, kind, null_row, old) = match protobuf::ReturningOptionKind::try_from(opt.option)
-        {
-            Ok(protobuf::ReturningOptionKind::ReturningOptionOld) => {
+        let (named, kind, null_row, old) = match opt.option {
+            ast::ReturningOptionKind::ReturningOptionOld => {
                 (&mut old_named, "OLD", rows.old_may_be_null, true)
             }
-            Ok(protobuf::ReturningOptionKind::ReturningOptionNew) => {
+            ast::ReturningOptionKind::ReturningOptionNew => {
                 (&mut new_named, "NEW", rows.new_may_be_null, false)
-            }
-            _ => {
-                return Err(AnalyzeError::Unsupported(format!(
-                    "unrecognized returning option: {}",
-                    opt.option
-                )));
             }
         };
         if *named {

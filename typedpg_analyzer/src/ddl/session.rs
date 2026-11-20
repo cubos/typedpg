@@ -16,9 +16,9 @@
 //! session, `SET LOCAL` until the end of the transaction (`COMMIT` /
 //! `ROLLBACK` or the end of the `apply_sql` call).
 
-use typedpg_pg_query::protobuf::{
-    FuncCall, SelectStmt, TransactionStmt, TransactionStmtKind, VariableSetKind, VariableSetStmt,
-    a_const, node,
+use typedpg_pg_query::ast::{
+    self, FuncCall, SelectStmt, TransactionStmt, TransactionStmtKind, VariableSetKind,
+    VariableSetStmt,
 };
 
 use super::DdlError;
@@ -209,15 +209,15 @@ impl RoutineSettings {
     /// = off` included); with it off, `proconfig` isn't applied and nothing
     /// is checked. Each item replaces an earlier one for the same setting,
     /// and `SET name TO DEFAULT` removes it (`update_proconfig_value`).
-    pub(crate) fn of(interp: &PgCatalog, set_items: &[&node::Node]) -> Self {
+    pub(crate) fn of(interp: &PgCatalog, set_items: &[&ast::Node]) -> Self {
         let session = interp.check_function_bodies.get();
         let mut check_bodies = None;
         let mut search_path = None;
         for item in set_items {
-            let node::Node::VariableSetStmt(set) = item else {
+            let ast::Node::VariableSetStmt(set) = item else {
                 continue;
             };
-            let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+            let kind = set.kind;
             if set.name.eq_ignore_ascii_case("check_function_bodies") {
                 check_bodies = match kind {
                     // FROM CURRENT: the session's value, which is on here.
@@ -423,7 +423,7 @@ fn set_identity(
 /// the session identity (`SET ROLE`, `SET SESSION AUTHORIZATION`). Other
 /// settings don't influence static analysis and are ignored.
 pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Result<(), DdlError> {
-    let kind = VariableSetKind::try_from(stmt.kind).unwrap_or(VariableSetKind::Undefined);
+    let kind = stmt.kind;
     if stmt.name.eq_ignore_ascii_case("role")
         || stmt.name.eq_ignore_ascii_case("session_authorization")
     {
@@ -524,12 +524,12 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
 /// own — the one the application uses. Only `search_path` matters.
 pub(crate) fn alter_database_set(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterDatabaseSetStmt,
+    stmt: &typedpg_pg_query::ast::AlterDatabaseSetStmt,
 ) -> Result<(), DdlError> {
     let Some(set) = stmt.setstmt.as_ref() else {
         return Ok(());
     };
-    let kind = VariableSetKind::try_from(set.kind).unwrap_or(VariableSetKind::Undefined);
+    let kind = set.kind;
     if kind == VariableSetKind::VarResetAll {
         interp.search_path_guc.database = None;
         interp.refresh_search_path();
@@ -568,9 +568,9 @@ fn search_path_args(stmt: &VariableSetStmt) -> Option<Vec<String>> {
     // search_path = 'a, b'` names a single schema `a, b`.
     stmt.args
         .iter()
-        .map(|arg| match arg.node.as_ref() {
-            Some(node::Node::AConst(c)) => match c.val.as_ref() {
-                Some(a_const::Val::Sval(s)) => Some(s.sval.clone()),
+        .map(|arg| match arg.as_ref() {
+            Some(ast::Node::AConst(c)) => match c.val.as_ref() {
+                Some(ast::AConstValue::String(s)) => Some(s.sval.clone()),
                 _ => None,
             },
             _ => None,
@@ -582,7 +582,7 @@ fn search_path_args(stmt: &VariableSetStmt) -> Option<Vec<String>> {
 /// the transaction scope of `SET LOCAL`, and close the transaction's
 /// cursors.
 pub(crate) fn transaction(interp: &mut PgCatalog, stmt: &TransactionStmt) -> Result<(), DdlError> {
-    let kind = TransactionStmtKind::try_from(stmt.kind).unwrap_or(TransactionStmtKind::Undefined);
+    let kind = stmt.kind;
     if matches!(
         kind,
         TransactionStmtKind::TransStmtCommit
@@ -612,10 +612,10 @@ pub(crate) fn select_side_effects(
         return Ok(());
     }
     for target in &stmt.target_list {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             continue;
         };
-        let Some(node::Node::FuncCall(fc)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+        let Some(ast::Node::FuncCall(fc)) = rt.val.as_ref() else {
             continue;
         };
         super::cluster::large_object_calls(interp, fc);
@@ -650,9 +650,9 @@ pub(crate) fn select_side_effects(
 
 /// A `SET TIME ZONE` / `SET timezone` value: a number of hours, an
 /// interval (`INTERVAL '...'`), or a zone name or POSIX specification.
-fn timezone_arg_is_utc(arg: &typedpg_pg_query::protobuf::Node) -> bool {
-    match arg.node.as_ref() {
-        Some(node::Node::TypeCast(tc)) => match tc.arg.as_deref().and_then(const_arg_string) {
+fn timezone_arg_is_utc(arg: &Option<typedpg_pg_query::ast::Node>) -> bool {
+    match arg.as_ref() {
+        Some(ast::Node::TypeCast(tc)) => match const_arg_string(&tc.arg) {
             // An interval: zero when every number in it is.
             Some(value) => value.chars().filter(char::is_ascii_digit).all(|c| c == '0'),
             None => false,
@@ -719,14 +719,14 @@ pub(crate) fn timezone_is_utc(value: &str) -> bool {
 }
 
 /// A constant `SET` argument as the string GUC code parses.
-fn const_arg_string(arg: &typedpg_pg_query::protobuf::Node) -> Option<String> {
-    match arg.node.as_ref() {
-        Some(node::Node::AConst(c)) => match c.val.as_ref()? {
-            a_const::Val::Ival(i) => Some(i.ival.to_string()),
-            a_const::Val::Fval(f) => Some(f.fval.clone()),
-            a_const::Val::Sval(s) => Some(s.sval.clone()),
-            a_const::Val::Boolval(b) => Some(b.boolval.to_string()),
-            a_const::Val::Bsval(_) => None,
+fn const_arg_string(arg: &Option<typedpg_pg_query::ast::Node>) -> Option<String> {
+    match arg.as_ref() {
+        Some(ast::Node::AConst(c)) => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(i.ival.to_string()),
+            ast::AConstValue::Float(f) => Some(f.fval.clone()),
+            ast::AConstValue::String(s) => Some(s.sval.clone()),
+            ast::AConstValue::Boolean(b) => Some(b.boolval.to_string()),
+            ast::AConstValue::BitString(_) => None,
         },
         _ => None,
     }
@@ -748,9 +748,9 @@ fn constant_set_config(fc: &FuncCall) -> Option<(String, String)> {
     let [setting, value, _] = fc.args.as_slice() else {
         return None;
     };
-    let as_str = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::AConst(c)) => match c.val.as_ref() {
-            Some(a_const::Val::Sval(s)) => Some(s.sval.clone()),
+    let as_str = |n: &Option<typedpg_pg_query::ast::Node>| match n.as_ref() {
+        Some(ast::Node::AConst(c)) => match c.val.as_ref() {
+            Some(ast::AConstValue::String(s)) => Some(s.sval.clone()),
             _ => None,
         },
         _ => None,
@@ -775,11 +775,11 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     let [setting, value, is_local] = fc.args.as_slice() else {
         return None;
     };
-    let as_const = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::AConst(c)) => c.val.clone(),
+    let as_const = |n: &Option<typedpg_pg_query::ast::Node>| match n.as_ref() {
+        Some(ast::Node::AConst(c)) => c.val.clone(),
         _ => None,
     };
-    let Some(a_const::Val::Sval(setting)) = as_const(setting) else {
+    let Some(ast::AConstValue::String(setting)) = as_const(setting) else {
         return None;
     };
     if !setting.sval.eq_ignore_ascii_case("role")
@@ -787,11 +787,11 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     {
         return None;
     }
-    let Some(a_const::Val::Sval(value)) = as_const(value) else {
+    let Some(ast::AConstValue::String(value)) = as_const(value) else {
         return None;
     };
     let is_local = match as_const(is_local)? {
-        a_const::Val::Boolval(b) => b.boolval,
+        ast::AConstValue::Boolean(b) => b.boolval,
         _ => return None,
     };
     Some((setting.sval, value.sval, is_local))
@@ -814,21 +814,21 @@ fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(Strin
     let [setting, value, is_local] = fc.args.as_slice() else {
         return None;
     };
-    let as_const = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::AConst(c)) => c.val.clone(),
+    let as_const = |n: &Option<typedpg_pg_query::ast::Node>| match n.as_ref() {
+        Some(ast::Node::AConst(c)) => c.val.clone(),
         _ => None,
     };
-    let Some(a_const::Val::Sval(setting)) = as_const(setting) else {
+    let Some(ast::AConstValue::String(setting)) = as_const(setting) else {
         return None;
     };
     if !setting.sval.eq_ignore_ascii_case(setting_name) {
         return None;
     }
-    let Some(a_const::Val::Sval(value)) = as_const(value) else {
+    let Some(ast::AConstValue::String(value)) = as_const(value) else {
         return None;
     };
     let is_local = match as_const(is_local)? {
-        a_const::Val::Boolval(b) => b.boolval,
+        ast::AConstValue::Boolean(b) => b.boolval,
         _ => return None,
     };
     Some((value.sval, is_local))
@@ -881,28 +881,28 @@ fn split_identifier_string(value: &str) -> Vec<String> {
 /// anyway.
 pub(crate) fn explain(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::ExplainStmt,
+    stmt: &typedpg_pg_query::ast::ExplainStmt,
 ) -> Result<(), DdlError> {
     let analyze = explain_options(&stmt.options)
         .map_err(|e| DdlError::Parse(e.to_string()))?
         .analyze;
-    let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) else {
+    let Some(query) = stmt.query.as_ref() else {
         return Ok(());
     };
     match query {
         // ExplainOneUtility explains the cursor's query; no cursor opens.
-        node::Node::DeclareCursorStmt(d) if analyze => super::cursors::check_declare(interp, d),
-        node::Node::CreateTableAsStmt(ctas) if analyze => {
+        ast::Node::DeclareCursorStmt(d) if analyze => super::cursors::check_declare(interp, d),
+        ast::Node::CreateTableAsStmt(ctas) if analyze => {
             super::views::create_table_as_planned(interp, ctas, true)
         }
         _ if analyze => super::apply_statement(interp, query),
         _ => crate::resolve::planned_only(|| match query {
-            node::Node::DeclareCursorStmt(d) => super::cursors::check_declare(interp, d),
-            node::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
-            node::Node::CreateTableAsStmt(ctas) => {
-                match ctas.query.as_deref().and_then(|q| q.node.as_ref()) {
+            ast::Node::DeclareCursorStmt(d) => super::cursors::check_declare(interp, d),
+            ast::Node::ExecuteStmt(e) => super::prepared::execute(interp, e),
+            ast::Node::CreateTableAsStmt(ctas) => {
+                match ctas.query.as_ref() {
                     // ExplainExecuteQuery revalidates the cached plan.
-                    Some(node::Node::ExecuteStmt(e)) => super::prepared::execute(interp, e),
+                    Some(ast::Node::ExecuteStmt(e)) => super::prepared::execute(interp, e),
                     Some(q) => super::dml::check_executed(interp, q),
                     None => Ok(()),
                 }
@@ -917,16 +917,16 @@ pub(crate) fn explain(
 /// target — the relation it names first, or without `OF` the first
 /// relation or subquery of the FROM clause — at the strongest strength a
 /// clause asks of it (applyLockingClause keeps one mark per relation).
-pub(super) fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str> {
-    use typedpg_pg_query::protobuf::LockingClause;
-    let node::Node::SelectStmt(sel) = stmt else {
+pub(super) fn first_row_mark_strength(stmt: &ast::Node) -> Option<&'static str> {
+    use typedpg_pg_query::ast::LockingClause;
+    let ast::Node::SelectStmt(sel) = stmt else {
         return None;
     };
     let clauses: Vec<&LockingClause> = sel
         .locking_clause
         .iter()
-        .filter_map(|c| match c.node.as_ref() {
-            Some(node::Node::LockingClause(lc)) => Some(lc),
+        .filter_map(|c| match c.as_ref() {
+            Some(ast::Node::LockingClause(lc)) => Some(&**lc),
             _ => None,
         })
         .collect();
@@ -934,8 +934,8 @@ pub(super) fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str>
     let names = |lc: &LockingClause| -> Vec<String> {
         lc.locked_rels
             .iter()
-            .filter_map(|n| match n.node.as_ref() {
-                Some(node::Node::RangeVar(rv)) => Some(rv.relname.clone()),
+            .filter_map(|n| match n.as_ref() {
+                Some(ast::Node::RangeVar(rv)) => Some(rv.relname.clone()),
                 _ => None,
             })
             .collect()
@@ -944,8 +944,8 @@ pub(super) fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str>
         .with_clause
         .iter()
         .flat_map(|w| &w.ctes)
-        .filter_map(|c| match c.node.as_ref() {
-            Some(node::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
+        .filter_map(|c| match c.as_ref() {
+            Some(ast::Node::CommonTableExpr(c)) => Some(c.ctename.as_str()),
             _ => None,
         })
         .collect();
@@ -964,7 +964,7 @@ pub(super) fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str>
             let named = names(lc);
             named.is_empty() || named.contains(&target)
         })
-        .max_by_key(|lc| lc.strength)?;
+        .max_by_key(|lc| lc.strength as i32)?;
     Some(crate::resolve::lock_strength_name(strongest))
 }
 
@@ -972,9 +972,9 @@ pub(super) fn first_row_mark_strength(stmt: &node::Node) -> Option<&'static str>
 /// range-table order (a join's left side first): what a locking clause
 /// without `OF` marks first. Functions, VALUES and CTE references take no
 /// mark.
-fn first_lockable(item: &typedpg_pg_query::protobuf::Node, ctes: &[&str]) -> Option<String> {
-    match item.node.as_ref()? {
-        node::Node::RangeVar(rv) => {
+fn first_lockable(item: &Option<typedpg_pg_query::ast::Node>, ctes: &[&str]) -> Option<String> {
+    match item.as_ref()? {
+        ast::Node::RangeVar(rv) => {
             if rv.schemaname.is_empty() && ctes.contains(&rv.relname.as_str()) {
                 return None;
             }
@@ -985,17 +985,15 @@ fn first_lockable(item: &typedpg_pg_query::protobuf::Node, ctes: &[&str]) -> Opt
             )
         }
         // An unnamed subquery is marked too, though no `OF` can name it.
-        node::Node::RangeSubselect(rs) => Some(
+        ast::Node::RangeSubselect(rs) => Some(
             rs.alias
                 .as_ref()
                 .map(|a| a.aliasname.clone())
                 .unwrap_or_default(),
         ),
-        node::Node::JoinExpr(j) => j
-            .larg
-            .as_deref()
-            .and_then(|l| first_lockable(l, ctes))
-            .or_else(|| j.rarg.as_deref().and_then(|r| first_lockable(r, ctes))),
+        ast::Node::JoinExpr(j) => {
+            first_lockable(&j.larg, ctes).or_else(|| first_lockable(&j.rarg, ctes))
+        }
         _ => None,
     }
 }
@@ -1013,15 +1011,15 @@ pub(crate) struct ExplainOptions {
 /// `off`, case insensitively, or the integers 1 and 0 — nothing else
 /// (`maybe`, `yes`, `t`, `2`: `<option> requires a Boolean value`,
 /// SQLSTATE 42601).
-pub(crate) fn def_get_boolean(de: &typedpg_pg_query::protobuf::DefElem) -> Result<bool, DdlError> {
-    let value = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+pub(crate) fn def_get_boolean(de: &typedpg_pg_query::ast::DefElem) -> Result<bool, DdlError> {
+    let value = match de.arg.as_ref() {
         None => return Ok(true),
-        Some(node::Node::Integer(i)) => match i.ival {
+        Some(ast::Node::Integer(i)) => match i.ival {
             0 => Some(false),
             1 => Some(true),
             _ => None,
         },
-        Some(node::Node::Boolean(b)) => Some(b.boolval),
+        Some(ast::Node::Boolean(b)) => Some(b.boolval),
         Some(other) => match string_arg(other).map(|s| s.to_ascii_lowercase()) {
             Some(s) if s == "true" || s == "on" => Some(true),
             Some(s) if s == "false" || s == "off" => Some(false),
@@ -1036,24 +1034,19 @@ pub(crate) fn def_get_boolean(de: &typedpg_pg_query::protobuf::DefElem) -> Resul
 /// unknown one, defGetBoolean), a value or combination it doesn't take an
 /// `invalid_parameter_value`.
 pub(crate) fn explain_options(
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<ExplainOptions, AnalyzeError> {
-    let boolean = |de: &typedpg_pg_query::protobuf::DefElem| -> Result<bool, AnalyzeError> {
+    let boolean = |de: &typedpg_pg_query::ast::DefElem| -> Result<bool, AnalyzeError> {
         def_get_boolean(de).map_err(|e| AnalyzeError::SyntaxError(e.to_string()))
     };
     let (mut analyze, mut wal, mut generic) = (false, false, false);
     let (mut timing, mut serialize) = (None, false);
     let mut result_type = crate::pg_catalog::oid::TEXT;
     for opt in options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
-        let text = || {
-            de.arg
-                .as_deref()
-                .and_then(|a| a.node.as_ref())
-                .and_then(string_arg)
-        };
+        let text = || de.arg.as_ref().and_then(string_arg);
         match de.defname.as_str() {
             "analyze" => analyze = boolean(de)?,
             "verbose" | "costs" | "buffers" | "settings" | "summary" | "memory" => {
@@ -1120,12 +1113,12 @@ pub(crate) fn explain_options(
 }
 
 /// defGetString of an option value.
-fn string_arg(n: &node::Node) -> Option<String> {
+fn string_arg(n: &ast::Node) -> Option<String> {
     match n {
-        node::Node::String(s) => Some(s.sval.clone()),
-        node::Node::Integer(i) => Some(i.ival.to_string()),
-        node::Node::Float(f) => Some(f.fval.clone()),
-        node::Node::TypeName(tn) => Some(
+        ast::Node::String(s) => Some(s.sval.clone()),
+        ast::Node::Integer(i) => Some(i.ival.to_string()),
+        ast::Node::Float(f) => Some(f.fval.clone()),
+        ast::Node::TypeName(tn) => Some(
             tn.names
                 .iter()
                 .filter_map(super::util::node_string)
@@ -1142,10 +1135,10 @@ fn string_arg(n: &node::Node) -> Option<String> {
 /// — and SET ... DEFERRED needs every match to be deferrable.
 pub(crate) fn set_constraints(
     interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::ConstraintsSetStmt,
+    stmt: &typedpg_pg_query::ast::ConstraintsSetStmt,
 ) -> Result<(), DdlError> {
     for constraint in &stmt.constraints {
-        let Some(node::Node::RangeVar(rv)) = constraint.node.as_ref() else {
+        let Some(ast::Node::RangeVar(rv)) = constraint.as_ref() else {
             continue;
         };
         let namespaces = if rv.schemaname.is_empty() {

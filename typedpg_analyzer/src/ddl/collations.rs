@@ -12,7 +12,7 @@
 //! subsequent `COLLATE "name"` references resolve. `ALTER COLLATION`
 //! renames and moves it, `DROP COLLATION` drops it.
 
-use typedpg_pg_query::protobuf::{DefineStmt, node};
+use typedpg_pg_query::ast::{self, DefineStmt};
 
 use super::DdlError;
 use super::util::ensure_qualified_name;
@@ -35,7 +35,7 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     let mut collencoding: i32 = DATABASE_ENCODING;
     let mut deterministic = true;
     for opt in &stmt.definition {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         if de.defname.eq_ignore_ascii_case("deterministic") {
@@ -43,11 +43,9 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         }
         if de.defname.eq_ignore_ascii_case("provider") {
             // defGetString: a bare word arrives as a type name.
-            let provider = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                Some(node::Node::String(s)) => Some(s.sval.as_str()),
-                Some(node::Node::TypeName(tn)) => {
-                    tn.names.last().and_then(super::util::node_string)
-                }
+            let provider = match de.arg.as_ref() {
+                Some(ast::Node::String(s)) => Some(s.sval.as_str()),
+                Some(ast::Node::TypeName(tn)) => tn.names.last().and_then(super::util::node_string),
                 _ => None,
             };
             if provider.is_some_and(|p| !p.eq_ignore_ascii_case("libc")) {
@@ -55,18 +53,18 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
             }
         }
         if de.defname.eq_ignore_ascii_case("from")
-            && let Some(arg) = de.arg.as_deref()
+            && let Some(arg) = de.arg.as_ref()
         {
-            let parts: Vec<&str> = match arg.node.as_ref() {
-                Some(node::Node::List(list)) => list
+            let parts: Vec<&str> = match arg {
+                ast::Node::List(list) => list
                     .items
                     .iter()
-                    .filter_map(|n| match n.node.as_ref()? {
-                        node::Node::String(s) => Some(s.sval.as_str()),
+                    .filter_map(|n| match n.as_ref()? {
+                        ast::Node::String(s) => Some(s.sval.as_str()),
                         _ => None,
                     })
                     .collect(),
-                Some(node::Node::String(s)) => vec![s.sval.as_str()],
+                ast::Node::String(s) => vec![s.sval.as_str()],
                 _ => Vec::new(),
             };
             let (schema, src_name) = match parts.as_slice() {
@@ -121,10 +119,10 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
 /// collation. `Ok(None)` when it's missing and `missing_ok`.
 pub(crate) fn lookup_collation(
     interp: &PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<Option<PgCollationOid>, DdlError> {
-    let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
         return Ok(None);
     };
     let names: Vec<&str> = list
@@ -188,12 +186,9 @@ fn check_collation_name_free(
 /// `ALTER COLLATION name RENAME TO new` (AlterObjectRename_internal).
 pub(crate) fn rename_collation(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(obj) = stmt.object.as_deref() else {
-        return Ok(());
-    };
-    let Some(oid) = lookup_collation(interp, obj, stmt.missing_ok)? else {
+    let Some(oid) = lookup_collation(interp, &stmt.object, stmt.missing_ok)? else {
         return Ok(());
     };
     let Some(mut row) = interp.pg_collation.get(&oid).cloned() else {
@@ -211,12 +206,9 @@ pub(crate) fn rename_collation(
 /// already is does nothing.
 pub(crate) fn set_collation_schema(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+    stmt: &typedpg_pg_query::ast::AlterObjectSchemaStmt,
 ) -> Result<(), DdlError> {
-    let Some(obj) = stmt.object.as_deref() else {
-        return Ok(());
-    };
-    let Some(oid) = lookup_collation(interp, obj, stmt.missing_ok)? else {
+    let Some(oid) = lookup_collation(interp, &stmt.object, stmt.missing_ok)? else {
         return Ok(());
     };
     let Some(mut row) = interp.pg_collation.get(&oid).cloned() else {
@@ -238,13 +230,14 @@ pub(crate) fn set_collation_schema(
 /// isn't modelled; the collation must exist.
 pub(crate) fn refresh_version(
     interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterCollationStmt,
+    stmt: &typedpg_pg_query::ast::AlterCollationStmt,
 ) -> Result<(), DdlError> {
-    let list = typedpg_pg_query::protobuf::Node {
-        node: Some(node::Node::List(typedpg_pg_query::protobuf::List {
+    let list = Some(typedpg_pg_query::ast::Node::List(
+        typedpg_pg_query::ast::List {
             items: stmt.collname.clone(),
-        })),
-    };
+        }
+        .into(),
+    ));
     lookup_collation(interp, &list, false).map(|_| ())
 }
 
@@ -252,7 +245,7 @@ pub(crate) fn refresh_version(
 /// `performDeletion`).
 pub(crate) fn drop_collation(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -313,10 +306,10 @@ pub(crate) fn drop_collation_oid(
         else {
             continue;
         };
-        let cmd = typedpg_pg_query::protobuf::AlterTableCmd {
-            subtype: typedpg_pg_query::protobuf::AlterTableType::AtDropColumn as i32,
+        let cmd = typedpg_pg_query::ast::AlterTableCmd {
+            subtype: typedpg_pg_query::ast::AlterTableType::AtDropColumn,
             name: attname,
-            behavior: typedpg_pg_query::protobuf::DropBehavior::DropCascade as i32,
+            behavior: typedpg_pg_query::ast::DropBehavior::DropCascade,
             missing_ok: true,
             ..Default::default()
         };

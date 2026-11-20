@@ -7,7 +7,8 @@
 
 #![allow(clippy::all, unused_variables)]
 
-use crate::protobuf;
+use crate::NodeBox;
+use crate::ast;
 
 /// Structural equality of AST values, as PostgreSQL's `equal()`.
 pub trait Equal {
@@ -16,7 +17,7 @@ pub trait Equal {
     /// Append the value's key: a string over the fields `equal()` compares,
     /// the same for two values exactly when they are `equal()` — what to
     /// hash or store in place of the value. Every key is self-delimiting
-    /// (a scalar ends in `;`, a message is braced, a list bracketed), so a
+    /// (a scalar ends in `;`, a struct is braced, a list bracketed), so a
     /// sequence of keys reads back one way.
     fn equal_key(&self, out: &mut String);
 }
@@ -41,7 +42,7 @@ impl<T: Equal> Equal for Option<T> {
     }
 }
 
-impl<T: Equal> Equal for Box<T> {
+impl<T: Equal> Equal for NodeBox<T> {
     fn equal(&self, other: &Self) -> bool {
         (**self).equal(other)
     }
@@ -82,47 +83,100 @@ macro_rules! scalar {
 
 scalar!(bool, i32, i64, u32, u64, u8, f32, f64, String);
 
-impl Equal for protobuf::ParseResult {
-    fn equal(&self, other: &Self) -> bool {
-        self.version.equal(&other.version) && self.stmts.equal(&other.stmts)
-    }
+/// A C enum compares by value; its key is its C value.
+macro_rules! enums {
+    ($($t:ident),*) => {$(
+        impl Equal for ast::$t {
+            fn equal(&self, other: &Self) -> bool {
+                self == other
+            }
 
-    fn equal_key(&self, out: &mut String) {
-        out.push('{');
-        self.version.equal_key(out);
-        self.stmts.equal_key(out);
-        out.push('}');
-    }
+            fn equal_key(&self, out: &mut String) {
+                use std::fmt::Write;
+                let _ = write!(out, "{};", *self as i32);
+            }
+        }
+    )*};
 }
 
-impl Equal for protobuf::ScanResult {
+enums!(
+    QuerySource,
+    SortByDir,
+    SortByNulls,
+    SetQuantifier,
+    AExprKind,
+    RoleSpecType,
+    TableLikeOption,
+    DefElemAction,
+    PartitionStrategy,
+    PartitionRangeDatumKind,
+    RteKind,
+    WcoKind,
+    GroupingSetKind,
+    CteMaterialize,
+    ReturningOptionKind,
+    JsonQuotes,
+    JsonTableColumnType,
+    SetOperation,
+    ObjectType,
+    DropBehavior,
+    AlterTableType,
+    GrantTargetType,
+    VariableSetKind,
+    ConstrType,
+    ImportForeignSchemaType,
+    RoleStmtType,
+    FetchDirection,
+    FunctionParameterMode,
+    TransactionStmtKind,
+    ViewCheckOption,
+    DiscardMode,
+    ReindexObjectType,
+    AlterTsConfigType,
+    PublicationObjSpecType,
+    AlterPublicationAction,
+    AlterSubscriptionType,
+    OverridingKind,
+    OnCommitAction,
+    TableFuncType,
+    VarReturningType,
+    ParamKind,
+    CoercionContext,
+    CoercionForm,
+    BoolExprType,
+    SubLinkType,
+    MinMaxOp,
+    SqlValueFunctionOp,
+    XmlExprOp,
+    XmlOptionType,
+    JsonEncoding,
+    JsonFormatType,
+    JsonConstructorType,
+    JsonValueType,
+    JsonWrapper,
+    JsonBehaviorType,
+    JsonExprOp,
+    NullTestType,
+    BoolTestType,
+    MergeMatchKind,
+    CmdType,
+    JoinType,
+    AggStrategy,
+    AggSplit,
+    SetOpCmd,
+    SetOpStrategy,
+    OnConflictAction,
+    LimitOption,
+    LockClauseStrength,
+    LockWaitPolicy,
+    LockTupleMode,
+    CompareType,
+    KeywordKind,
+    Token
+);
+
+impl Equal for ast::Node {
     fn equal(&self, other: &Self) -> bool {
-        self.version.equal(&other.version) && self.tokens.equal(&other.tokens)
-    }
-
-    fn equal_key(&self, out: &mut String) {
-        out.push('{');
-        self.version.equal_key(out);
-        self.tokens.equal_key(out);
-        out.push('}');
-    }
-}
-
-impl Equal for protobuf::Node {
-    fn equal(&self, other: &Self) -> bool {
-        self.node.equal(&other.node)
-    }
-
-    fn equal_key(&self, out: &mut String) {
-        out.push('{');
-        self.node.equal_key(out);
-        out.push('}');
-    }
-}
-
-impl Equal for protobuf::node::Node {
-    fn equal(&self, other: &Self) -> bool {
-        #[allow(unreachable_patterns)]
         match (self, other) {
             (Self::Alias(a), Self::Alias(b)) => a.equal(b),
             (Self::RangeVar(a), Self::RangeVar(b)) => a.equal(b),
@@ -161,7 +215,7 @@ impl Equal for protobuf::node::Node {
             (Self::RowCompareExpr(a), Self::RowCompareExpr(b)) => a.equal(b),
             (Self::CoalesceExpr(a), Self::CoalesceExpr(b)) => a.equal(b),
             (Self::MinMaxExpr(a), Self::MinMaxExpr(b)) => a.equal(b),
-            (Self::SqlvalueFunction(a), Self::SqlvalueFunction(b)) => a.equal(b),
+            (Self::SqlValueFunction(a), Self::SqlValueFunction(b)) => a.equal(b),
             (Self::XmlExpr(a), Self::XmlExpr(b)) => a.equal(b),
             (Self::JsonFormat(a), Self::JsonFormat(b)) => a.equal(b),
             (Self::JsonReturning(a), Self::JsonReturning(b)) => a.equal(b),
@@ -222,7 +276,7 @@ impl Equal for protobuf::node::Node {
             (Self::PartitionRangeDatum(a), Self::PartitionRangeDatum(b)) => a.equal(b),
             (Self::PartitionCmd(a), Self::PartitionCmd(b)) => a.equal(b),
             (Self::RangeTblEntry(a), Self::RangeTblEntry(b)) => a.equal(b),
-            (Self::RtepermissionInfo(a), Self::RtepermissionInfo(b)) => a.equal(b),
+            (Self::RtePermissionInfo(a), Self::RtePermissionInfo(b)) => a.equal(b),
             (Self::RangeTblFunction(a), Self::RangeTblFunction(b)) => a.equal(b),
             (Self::TableSampleClause(a), Self::TableSampleClause(b)) => a.equal(b),
             (Self::WithCheckOption(a), Self::WithCheckOption(b)) => a.equal(b),
@@ -233,8 +287,8 @@ impl Equal for protobuf::node::Node {
             (Self::WithClause(a), Self::WithClause(b)) => a.equal(b),
             (Self::InferClause(a), Self::InferClause(b)) => a.equal(b),
             (Self::OnConflictClause(a), Self::OnConflictClause(b)) => a.equal(b),
-            (Self::CtesearchClause(a), Self::CtesearchClause(b)) => a.equal(b),
-            (Self::CtecycleClause(a), Self::CtecycleClause(b)) => a.equal(b),
+            (Self::CteSearchClause(a), Self::CteSearchClause(b)) => a.equal(b),
+            (Self::CteCycleClause(a), Self::CteCycleClause(b)) => a.equal(b),
             (Self::CommonTableExpr(a), Self::CommonTableExpr(b)) => a.equal(b),
             (Self::MergeWhenClause(a), Self::MergeWhenClause(b)) => a.equal(b),
             (Self::ReturningOption(a), Self::ReturningOption(b)) => a.equal(b),
@@ -264,11 +318,11 @@ impl Equal for protobuf::node::Node {
             (Self::SelectStmt(a), Self::SelectStmt(b)) => a.equal(b),
             (Self::SetOperationStmt(a), Self::SetOperationStmt(b)) => a.equal(b),
             (Self::ReturnStmt(a), Self::ReturnStmt(b)) => a.equal(b),
-            (Self::PlassignStmt(a), Self::PlassignStmt(b)) => a.equal(b),
+            (Self::PlAssignStmt(a), Self::PlAssignStmt(b)) => a.equal(b),
             (Self::CreateSchemaStmt(a), Self::CreateSchemaStmt(b)) => a.equal(b),
             (Self::AlterTableStmt(a), Self::AlterTableStmt(b)) => a.equal(b),
             (Self::AlterTableCmd(a), Self::AlterTableCmd(b)) => a.equal(b),
-            (Self::AtalterConstraint(a), Self::AtalterConstraint(b)) => a.equal(b),
+            (Self::AtAlterConstraint(a), Self::AtAlterConstraint(b)) => a.equal(b),
             (Self::ReplicaIdentityStmt(a), Self::ReplicaIdentityStmt(b)) => a.equal(b),
             (Self::AlterCollationStmt(a), Self::AlterCollationStmt(b)) => a.equal(b),
             (Self::AlterDomainStmt(a), Self::AlterDomainStmt(b)) => a.equal(b),
@@ -310,7 +364,7 @@ impl Equal for protobuf::node::Node {
             (Self::CreateTrigStmt(a), Self::CreateTrigStmt(b)) => a.equal(b),
             (Self::CreateEventTrigStmt(a), Self::CreateEventTrigStmt(b)) => a.equal(b),
             (Self::AlterEventTrigStmt(a), Self::AlterEventTrigStmt(b)) => a.equal(b),
-            (Self::CreatePlangStmt(a), Self::CreatePlangStmt(b)) => a.equal(b),
+            (Self::CreatePLangStmt(a), Self::CreatePLangStmt(b)) => a.equal(b),
             (Self::CreateRoleStmt(a), Self::CreateRoleStmt(b)) => a.equal(b),
             (Self::AlterRoleStmt(a), Self::AlterRoleStmt(b)) => a.equal(b),
             (Self::AlterRoleSetStmt(a), Self::AlterRoleSetStmt(b)) => a.equal(b),
@@ -385,8 +439,8 @@ impl Equal for protobuf::node::Node {
             (Self::DeallocateStmt(a), Self::DeallocateStmt(b)) => a.equal(b),
             (Self::DropOwnedStmt(a), Self::DropOwnedStmt(b)) => a.equal(b),
             (Self::ReassignOwnedStmt(a), Self::ReassignOwnedStmt(b)) => a.equal(b),
-            (Self::AlterTsdictionaryStmt(a), Self::AlterTsdictionaryStmt(b)) => a.equal(b),
-            (Self::AlterTsconfigurationStmt(a), Self::AlterTsconfigurationStmt(b)) => a.equal(b),
+            (Self::AlterTsDictionaryStmt(a), Self::AlterTsDictionaryStmt(b)) => a.equal(b),
+            (Self::AlterTsConfigurationStmt(a), Self::AlterTsConfigurationStmt(b)) => a.equal(b),
             (Self::PublicationTable(a), Self::PublicationTable(b)) => a.equal(b),
             (Self::PublicationObjSpec(a), Self::PublicationObjSpec(b)) => a.equal(b),
             (Self::CreatePublicationStmt(a), Self::CreatePublicationStmt(b)) => a.equal(b),
@@ -594,8 +648,8 @@ impl Equal for protobuf::node::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::SqlvalueFunction(a) => {
-                out.push_str("SqlvalueFunction(");
+            Self::SqlValueFunction(a) => {
+                out.push_str("SqlValueFunction(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -899,8 +953,8 @@ impl Equal for protobuf::node::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::RtepermissionInfo(a) => {
-                out.push_str("RtepermissionInfo(");
+            Self::RtePermissionInfo(a) => {
+                out.push_str("RtePermissionInfo(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -954,13 +1008,13 @@ impl Equal for protobuf::node::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::CtesearchClause(a) => {
-                out.push_str("CtesearchClause(");
+            Self::CteSearchClause(a) => {
+                out.push_str("CteSearchClause(");
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::CtecycleClause(a) => {
-                out.push_str("CtecycleClause(");
+            Self::CteCycleClause(a) => {
+                out.push_str("CteCycleClause(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -1109,8 +1163,8 @@ impl Equal for protobuf::node::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::PlassignStmt(a) => {
-                out.push_str("PlassignStmt(");
+            Self::PlAssignStmt(a) => {
+                out.push_str("PlAssignStmt(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -1129,8 +1183,8 @@ impl Equal for protobuf::node::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::AtalterConstraint(a) => {
-                out.push_str("AtalterConstraint(");
+            Self::AtAlterConstraint(a) => {
+                out.push_str("AtAlterConstraint(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -1309,8 +1363,8 @@ impl Equal for protobuf::node::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::CreatePlangStmt(a) => {
-                out.push_str("CreatePlangStmt(");
+            Self::CreatePLangStmt(a) => {
+                out.push_str("CreatePLangStmt(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -1674,13 +1728,13 @@ impl Equal for protobuf::node::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::AlterTsdictionaryStmt(a) => {
-                out.push_str("AlterTsdictionaryStmt(");
+            Self::AlterTsDictionaryStmt(a) => {
+                out.push_str("AlterTsDictionaryStmt(");
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::AlterTsconfigurationStmt(a) => {
-                out.push_str("AlterTsconfigurationStmt(");
+            Self::AlterTsConfigurationStmt(a) => {
+                out.push_str("AlterTsConfigurationStmt(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -1768,7 +1822,33 @@ impl Equal for protobuf::node::Node {
     }
 }
 
-impl Equal for protobuf::Integer {
+impl Equal for ast::ParseResult {
+    fn equal(&self, other: &Self) -> bool {
+        self.version.equal(&other.version) && self.stmts.equal(&other.stmts)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.version.equal_key(out);
+        self.stmts.equal_key(out);
+        out.push('}');
+    }
+}
+
+impl Equal for ast::ScanResult {
+    fn equal(&self, other: &Self) -> bool {
+        self.version.equal(&other.version) && self.tokens.equal(&other.tokens)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.version.equal_key(out);
+        self.tokens.equal_key(out);
+        out.push('}');
+    }
+}
+
+impl Equal for ast::Integer {
     fn equal(&self, other: &Self) -> bool {
         self.ival.equal(&other.ival)
     }
@@ -1780,7 +1860,7 @@ impl Equal for protobuf::Integer {
     }
 }
 
-impl Equal for protobuf::Float {
+impl Equal for ast::Float {
     fn equal(&self, other: &Self) -> bool {
         self.fval.equal(&other.fval)
     }
@@ -1792,7 +1872,7 @@ impl Equal for protobuf::Float {
     }
 }
 
-impl Equal for protobuf::Boolean {
+impl Equal for ast::Boolean {
     fn equal(&self, other: &Self) -> bool {
         self.boolval.equal(&other.boolval)
     }
@@ -1804,7 +1884,7 @@ impl Equal for protobuf::Boolean {
     }
 }
 
-impl Equal for protobuf::String {
+impl Equal for ast::String {
     fn equal(&self, other: &Self) -> bool {
         self.sval.equal(&other.sval)
     }
@@ -1816,7 +1896,7 @@ impl Equal for protobuf::String {
     }
 }
 
-impl Equal for protobuf::BitString {
+impl Equal for ast::BitString {
     fn equal(&self, other: &Self) -> bool {
         self.bsval.equal(&other.bsval)
     }
@@ -1828,7 +1908,7 @@ impl Equal for protobuf::BitString {
     }
 }
 
-impl Equal for protobuf::List {
+impl Equal for ast::List {
     fn equal(&self, other: &Self) -> bool {
         self.items.equal(&other.items)
     }
@@ -1840,7 +1920,7 @@ impl Equal for protobuf::List {
     }
 }
 
-impl Equal for protobuf::OidList {
+impl Equal for ast::OidList {
     fn equal(&self, other: &Self) -> bool {
         self.items.equal(&other.items)
     }
@@ -1852,7 +1932,7 @@ impl Equal for protobuf::OidList {
     }
 }
 
-impl Equal for protobuf::IntList {
+impl Equal for ast::IntList {
     fn equal(&self, other: &Self) -> bool {
         self.items.equal(&other.items)
     }
@@ -1864,7 +1944,7 @@ impl Equal for protobuf::IntList {
     }
 }
 
-impl Equal for protobuf::AConst {
+impl Equal for ast::AConst {
     fn equal(&self, other: &Self) -> bool {
         self.val.equal(&other.val) && self.isnull.equal(&other.isnull)
     }
@@ -1877,43 +1957,42 @@ impl Equal for protobuf::AConst {
     }
 }
 
-impl Equal for protobuf::a_const::Val {
+impl Equal for ast::AConstValue {
     fn equal(&self, other: &Self) -> bool {
-        #[allow(unreachable_patterns)]
         match (self, other) {
-            (Self::Ival(a), Self::Ival(b)) => a.equal(b),
-            (Self::Fval(a), Self::Fval(b)) => a.equal(b),
-            (Self::Boolval(a), Self::Boolval(b)) => a.equal(b),
-            (Self::Sval(a), Self::Sval(b)) => a.equal(b),
-            (Self::Bsval(a), Self::Bsval(b)) => a.equal(b),
+            (Self::Integer(a), Self::Integer(b)) => a.equal(b),
+            (Self::Float(a), Self::Float(b)) => a.equal(b),
+            (Self::Boolean(a), Self::Boolean(b)) => a.equal(b),
+            (Self::String(a), Self::String(b)) => a.equal(b),
+            (Self::BitString(a), Self::BitString(b)) => a.equal(b),
             _ => false,
         }
     }
 
     fn equal_key(&self, out: &mut String) {
         match self {
-            Self::Ival(a) => {
-                out.push_str("Ival(");
+            Self::Integer(a) => {
+                out.push_str("Integer(");
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::Fval(a) => {
-                out.push_str("Fval(");
+            Self::Float(a) => {
+                out.push_str("Float(");
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::Boolval(a) => {
-                out.push_str("Boolval(");
+            Self::Boolean(a) => {
+                out.push_str("Boolean(");
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::Sval(a) => {
-                out.push_str("Sval(");
+            Self::String(a) => {
+                out.push_str("String(");
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::Bsval(a) => {
-                out.push_str("Bsval(");
+            Self::BitString(a) => {
+                out.push_str("BitString(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -1921,7 +2000,7 @@ impl Equal for protobuf::a_const::Val {
     }
 }
 
-impl Equal for protobuf::Alias {
+impl Equal for ast::Alias {
     fn equal(&self, other: &Self) -> bool {
         self.aliasname.equal(&other.aliasname) && self.colnames.equal(&other.colnames)
     }
@@ -1934,7 +2013,7 @@ impl Equal for protobuf::Alias {
     }
 }
 
-impl Equal for protobuf::RangeVar {
+impl Equal for ast::RangeVar {
     fn equal(&self, other: &Self) -> bool {
         self.catalogname.equal(&other.catalogname)
             && self.schemaname.equal(&other.schemaname)
@@ -1956,7 +2035,7 @@ impl Equal for protobuf::RangeVar {
     }
 }
 
-impl Equal for protobuf::TableFunc {
+impl Equal for ast::TableFunc {
     fn equal(&self, other: &Self) -> bool {
         self.functype.equal(&other.functype)
             && self.ns_uris.equal(&other.ns_uris)
@@ -1998,7 +2077,7 @@ impl Equal for protobuf::TableFunc {
     }
 }
 
-impl Equal for protobuf::IntoClause {
+impl Equal for ast::IntoClause {
     fn equal(&self, other: &Self) -> bool {
         self.rel.equal(&other.rel)
             && self.col_names.equal(&other.col_names)
@@ -2024,10 +2103,9 @@ impl Equal for protobuf::IntoClause {
     }
 }
 
-impl Equal for protobuf::Var {
+impl Equal for ast::Var {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.varno.equal(&other.varno)
+        self.varno.equal(&other.varno)
             && self.varattno.equal(&other.varattno)
             && self.vartype.equal(&other.vartype)
             && self.vartypmod.equal(&other.vartypmod)
@@ -2039,7 +2117,6 @@ impl Equal for protobuf::Var {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.varno.equal_key(out);
         self.varattno.equal_key(out);
         self.vartype.equal_key(out);
@@ -2052,10 +2129,9 @@ impl Equal for protobuf::Var {
     }
 }
 
-impl Equal for protobuf::Param {
+impl Equal for ast::Param {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.paramkind.equal(&other.paramkind)
+        self.paramkind.equal(&other.paramkind)
             && self.paramid.equal(&other.paramid)
             && self.paramtype.equal(&other.paramtype)
             && self.paramtypmod.equal(&other.paramtypmod)
@@ -2064,7 +2140,6 @@ impl Equal for protobuf::Param {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.paramkind.equal_key(out);
         self.paramid.equal_key(out);
         self.paramtype.equal_key(out);
@@ -2074,10 +2149,9 @@ impl Equal for protobuf::Param {
     }
 }
 
-impl Equal for protobuf::Aggref {
+impl Equal for ast::Aggref {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.aggfnoid.equal(&other.aggfnoid)
+        self.aggfnoid.equal(&other.aggfnoid)
             && self.aggtype.equal(&other.aggtype)
             && self.aggcollid.equal(&other.aggcollid)
             && self.inputcollid.equal(&other.inputcollid)
@@ -2098,7 +2172,6 @@ impl Equal for protobuf::Aggref {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.aggfnoid.equal_key(out);
         self.aggtype.equal_key(out);
         self.aggcollid.equal_key(out);
@@ -2120,26 +2193,22 @@ impl Equal for protobuf::Aggref {
     }
 }
 
-impl Equal for protobuf::GroupingFunc {
+impl Equal for ast::GroupingFunc {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.args.equal(&other.args)
-            && self.agglevelsup.equal(&other.agglevelsup)
+        self.args.equal(&other.args) && self.agglevelsup.equal(&other.agglevelsup)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.args.equal_key(out);
         self.agglevelsup.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::WindowFunc {
+impl Equal for ast::WindowFunc {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.winfnoid.equal(&other.winfnoid)
+        self.winfnoid.equal(&other.winfnoid)
             && self.wintype.equal(&other.wintype)
             && self.wincollid.equal(&other.wincollid)
             && self.inputcollid.equal(&other.inputcollid)
@@ -2153,7 +2222,6 @@ impl Equal for protobuf::WindowFunc {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.winfnoid.equal_key(out);
         self.wintype.equal_key(out);
         self.wincollid.equal_key(out);
@@ -2168,10 +2236,9 @@ impl Equal for protobuf::WindowFunc {
     }
 }
 
-impl Equal for protobuf::WindowFuncRunCondition {
+impl Equal for ast::WindowFuncRunCondition {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.opno.equal(&other.opno)
+        self.opno.equal(&other.opno)
             && self.inputcollid.equal(&other.inputcollid)
             && self.wfunc_left.equal(&other.wfunc_left)
             && self.arg.equal(&other.arg)
@@ -2179,7 +2246,6 @@ impl Equal for protobuf::WindowFuncRunCondition {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.opno.equal_key(out);
         self.inputcollid.equal_key(out);
         self.wfunc_left.equal_key(out);
@@ -2188,26 +2254,22 @@ impl Equal for protobuf::WindowFuncRunCondition {
     }
 }
 
-impl Equal for protobuf::MergeSupportFunc {
+impl Equal for ast::MergeSupportFunc {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.msftype.equal(&other.msftype)
-            && self.msfcollid.equal(&other.msfcollid)
+        self.msftype.equal(&other.msftype) && self.msfcollid.equal(&other.msfcollid)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.msftype.equal_key(out);
         self.msfcollid.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::SubscriptingRef {
+impl Equal for ast::SubscriptingRef {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.refcontainertype.equal(&other.refcontainertype)
+        self.refcontainertype.equal(&other.refcontainertype)
             && self.refelemtype.equal(&other.refelemtype)
             && self.refrestype.equal(&other.refrestype)
             && self.reftypmod.equal(&other.reftypmod)
@@ -2220,7 +2282,6 @@ impl Equal for protobuf::SubscriptingRef {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.refcontainertype.equal_key(out);
         self.refelemtype.equal_key(out);
         self.refrestype.equal_key(out);
@@ -2234,10 +2295,9 @@ impl Equal for protobuf::SubscriptingRef {
     }
 }
 
-impl Equal for protobuf::FuncExpr {
+impl Equal for ast::FuncExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.funcid.equal(&other.funcid)
+        self.funcid.equal(&other.funcid)
             && self.funcresulttype.equal(&other.funcresulttype)
             && self.funcretset.equal(&other.funcretset)
             && self.funcvariadic.equal(&other.funcvariadic)
@@ -2249,7 +2309,6 @@ impl Equal for protobuf::FuncExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.funcid.equal_key(out);
         self.funcresulttype.equal_key(out);
         self.funcretset.equal_key(out);
@@ -2262,17 +2321,15 @@ impl Equal for protobuf::FuncExpr {
     }
 }
 
-impl Equal for protobuf::NamedArgExpr {
+impl Equal for ast::NamedArgExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.name.equal(&other.name)
             && self.argnumber.equal(&other.argnumber)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.name.equal_key(out);
         self.argnumber.equal_key(out);
@@ -2280,10 +2337,9 @@ impl Equal for protobuf::NamedArgExpr {
     }
 }
 
-impl Equal for protobuf::OpExpr {
+impl Equal for ast::OpExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.opno.equal(&other.opno)
+        self.opno.equal(&other.opno)
             && self.opresulttype.equal(&other.opresulttype)
             && self.opretset.equal(&other.opretset)
             && self.opcollid.equal(&other.opcollid)
@@ -2293,7 +2349,6 @@ impl Equal for protobuf::OpExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.opno.equal_key(out);
         self.opresulttype.equal_key(out);
         self.opretset.equal_key(out);
@@ -2304,10 +2359,9 @@ impl Equal for protobuf::OpExpr {
     }
 }
 
-impl Equal for protobuf::DistinctExpr {
+impl Equal for ast::DistinctExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.opno.equal(&other.opno)
+        self.opno.equal(&other.opno)
             && self.opresulttype.equal(&other.opresulttype)
             && self.opretset.equal(&other.opretset)
             && self.opcollid.equal(&other.opcollid)
@@ -2318,7 +2372,6 @@ impl Equal for protobuf::DistinctExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.opno.equal_key(out);
         self.opresulttype.equal_key(out);
         self.opretset.equal_key(out);
@@ -2330,10 +2383,9 @@ impl Equal for protobuf::DistinctExpr {
     }
 }
 
-impl Equal for protobuf::NullIfExpr {
+impl Equal for ast::NullIfExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.opno.equal(&other.opno)
+        self.opno.equal(&other.opno)
             && self.opresulttype.equal(&other.opresulttype)
             && self.opretset.equal(&other.opretset)
             && self.opcollid.equal(&other.opcollid)
@@ -2344,7 +2396,6 @@ impl Equal for protobuf::NullIfExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.opno.equal_key(out);
         self.opresulttype.equal_key(out);
         self.opretset.equal_key(out);
@@ -2356,10 +2407,9 @@ impl Equal for protobuf::NullIfExpr {
     }
 }
 
-impl Equal for protobuf::ScalarArrayOpExpr {
+impl Equal for ast::ScalarArrayOpExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.opno.equal(&other.opno)
+        self.opno.equal(&other.opno)
             && self.use_or.equal(&other.use_or)
             && self.inputcollid.equal(&other.inputcollid)
             && self.args.equal(&other.args)
@@ -2367,7 +2417,6 @@ impl Equal for protobuf::ScalarArrayOpExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.opno.equal_key(out);
         self.use_or.equal_key(out);
         self.inputcollid.equal_key(out);
@@ -2376,26 +2425,22 @@ impl Equal for protobuf::ScalarArrayOpExpr {
     }
 }
 
-impl Equal for protobuf::BoolExpr {
+impl Equal for ast::BoolExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.boolop.equal(&other.boolop)
-            && self.args.equal(&other.args)
+        self.boolop.equal(&other.boolop) && self.args.equal(&other.args)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.boolop.equal_key(out);
         self.args.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::SubLink {
+impl Equal for ast::SubLink {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.sub_link_type.equal(&other.sub_link_type)
+        self.sub_link_type.equal(&other.sub_link_type)
             && self.sub_link_id.equal(&other.sub_link_id)
             && self.testexpr.equal(&other.testexpr)
             && self.oper_name.equal(&other.oper_name)
@@ -2404,7 +2449,6 @@ impl Equal for protobuf::SubLink {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.sub_link_type.equal_key(out);
         self.sub_link_id.equal_key(out);
         self.testexpr.equal_key(out);
@@ -2414,10 +2458,9 @@ impl Equal for protobuf::SubLink {
     }
 }
 
-impl Equal for protobuf::SubPlan {
+impl Equal for ast::SubPlan {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.sub_link_type.equal(&other.sub_link_type)
+        self.sub_link_type.equal(&other.sub_link_type)
             && self.testexpr.equal(&other.testexpr)
             && self.param_ids.equal(&other.param_ids)
             && self.plan_id.equal(&other.plan_id)
@@ -2437,7 +2480,6 @@ impl Equal for protobuf::SubPlan {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.sub_link_type.equal_key(out);
         self.testexpr.equal_key(out);
         self.param_ids.equal_key(out);
@@ -2458,23 +2500,21 @@ impl Equal for protobuf::SubPlan {
     }
 }
 
-impl Equal for protobuf::AlternativeSubPlan {
+impl Equal for ast::AlternativeSubPlan {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr) && self.subplans.equal(&other.subplans)
+        self.subplans.equal(&other.subplans)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.subplans.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::FieldSelect {
+impl Equal for ast::FieldSelect {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.fieldnum.equal(&other.fieldnum)
             && self.resulttype.equal(&other.resulttype)
             && self.resulttypmod.equal(&other.resulttypmod)
@@ -2483,7 +2523,6 @@ impl Equal for protobuf::FieldSelect {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.fieldnum.equal_key(out);
         self.resulttype.equal_key(out);
@@ -2493,10 +2532,9 @@ impl Equal for protobuf::FieldSelect {
     }
 }
 
-impl Equal for protobuf::FieldStore {
+impl Equal for ast::FieldStore {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.newvals.equal(&other.newvals)
             && self.fieldnums.equal(&other.fieldnums)
             && self.resulttype.equal(&other.resulttype)
@@ -2504,7 +2542,6 @@ impl Equal for protobuf::FieldStore {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.newvals.equal_key(out);
         self.fieldnums.equal_key(out);
@@ -2513,10 +2550,9 @@ impl Equal for protobuf::FieldStore {
     }
 }
 
-impl Equal for protobuf::RelabelType {
+impl Equal for ast::RelabelType {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.resulttype.equal(&other.resulttype)
             && self.resulttypmod.equal(&other.resulttypmod)
             && self.resultcollid.equal(&other.resultcollid)
@@ -2525,7 +2561,6 @@ impl Equal for protobuf::RelabelType {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.resulttype.equal_key(out);
         self.resulttypmod.equal_key(out);
@@ -2535,10 +2570,9 @@ impl Equal for protobuf::RelabelType {
     }
 }
 
-impl Equal for protobuf::CoerceViaIo {
+impl Equal for ast::CoerceViaIo {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.resulttype.equal(&other.resulttype)
             && self.resultcollid.equal(&other.resultcollid)
             && self.coerceformat.equal(&other.coerceformat)
@@ -2546,7 +2580,6 @@ impl Equal for protobuf::CoerceViaIo {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.resulttype.equal_key(out);
         self.resultcollid.equal_key(out);
@@ -2555,10 +2588,9 @@ impl Equal for protobuf::CoerceViaIo {
     }
 }
 
-impl Equal for protobuf::ArrayCoerceExpr {
+impl Equal for ast::ArrayCoerceExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.elemexpr.equal(&other.elemexpr)
             && self.resulttype.equal(&other.resulttype)
             && self.resulttypmod.equal(&other.resulttypmod)
@@ -2568,7 +2600,6 @@ impl Equal for protobuf::ArrayCoerceExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.elemexpr.equal_key(out);
         self.resulttype.equal_key(out);
@@ -2579,17 +2610,15 @@ impl Equal for protobuf::ArrayCoerceExpr {
     }
 }
 
-impl Equal for protobuf::ConvertRowtypeExpr {
+impl Equal for ast::ConvertRowtypeExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.resulttype.equal(&other.resulttype)
             && self.convertformat.equal(&other.convertformat)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.resulttype.equal_key(out);
         self.convertformat.equal_key(out);
@@ -2597,26 +2626,22 @@ impl Equal for protobuf::ConvertRowtypeExpr {
     }
 }
 
-impl Equal for protobuf::CollateExpr {
+impl Equal for ast::CollateExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
-            && self.coll_oid.equal(&other.coll_oid)
+        self.arg.equal(&other.arg) && self.coll_oid.equal(&other.coll_oid)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.coll_oid.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::CaseExpr {
+impl Equal for ast::CaseExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.casetype.equal(&other.casetype)
+        self.casetype.equal(&other.casetype)
             && self.casecollid.equal(&other.casecollid)
             && self.arg.equal(&other.arg)
             && self.args.equal(&other.args)
@@ -2625,7 +2650,6 @@ impl Equal for protobuf::CaseExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.casetype.equal_key(out);
         self.casecollid.equal_key(out);
         self.arg.equal_key(out);
@@ -2635,33 +2659,28 @@ impl Equal for protobuf::CaseExpr {
     }
 }
 
-impl Equal for protobuf::CaseWhen {
+impl Equal for ast::CaseWhen {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.expr.equal(&other.expr)
-            && self.result.equal(&other.result)
+        self.expr.equal(&other.expr) && self.result.equal(&other.result)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.expr.equal_key(out);
         self.result.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::CaseTestExpr {
+impl Equal for ast::CaseTestExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.type_id.equal(&other.type_id)
+        self.type_id.equal(&other.type_id)
             && self.type_mod.equal(&other.type_mod)
             && self.collation.equal(&other.collation)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.type_id.equal_key(out);
         self.type_mod.equal_key(out);
         self.collation.equal_key(out);
@@ -2669,10 +2688,9 @@ impl Equal for protobuf::CaseTestExpr {
     }
 }
 
-impl Equal for protobuf::ArrayExpr {
+impl Equal for ast::ArrayExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.array_typeid.equal(&other.array_typeid)
+        self.array_typeid.equal(&other.array_typeid)
             && self.array_collid.equal(&other.array_collid)
             && self.element_typeid.equal(&other.element_typeid)
             && self.elements.equal(&other.elements)
@@ -2681,7 +2699,6 @@ impl Equal for protobuf::ArrayExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.array_typeid.equal_key(out);
         self.array_collid.equal_key(out);
         self.element_typeid.equal_key(out);
@@ -2691,10 +2708,9 @@ impl Equal for protobuf::ArrayExpr {
     }
 }
 
-impl Equal for protobuf::RowExpr {
+impl Equal for ast::RowExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.args.equal(&other.args)
+        self.args.equal(&other.args)
             && self.row_typeid.equal(&other.row_typeid)
             && self.row_format.equal(&other.row_format)
             && self.colnames.equal(&other.colnames)
@@ -2702,7 +2718,6 @@ impl Equal for protobuf::RowExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.args.equal_key(out);
         self.row_typeid.equal_key(out);
         self.row_format.equal_key(out);
@@ -2711,10 +2726,9 @@ impl Equal for protobuf::RowExpr {
     }
 }
 
-impl Equal for protobuf::RowCompareExpr {
+impl Equal for ast::RowCompareExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.cmptype.equal(&other.cmptype)
+        self.cmptype.equal(&other.cmptype)
             && self.opnos.equal(&other.opnos)
             && self.opfamilies.equal(&other.opfamilies)
             && self.inputcollids.equal(&other.inputcollids)
@@ -2724,7 +2738,6 @@ impl Equal for protobuf::RowCompareExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.cmptype.equal_key(out);
         self.opnos.equal_key(out);
         self.opfamilies.equal_key(out);
@@ -2735,17 +2748,15 @@ impl Equal for protobuf::RowCompareExpr {
     }
 }
 
-impl Equal for protobuf::CoalesceExpr {
+impl Equal for ast::CoalesceExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.coalescetype.equal(&other.coalescetype)
+        self.coalescetype.equal(&other.coalescetype)
             && self.coalescecollid.equal(&other.coalescecollid)
             && self.args.equal(&other.args)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.coalescetype.equal_key(out);
         self.coalescecollid.equal_key(out);
         self.args.equal_key(out);
@@ -2753,10 +2764,9 @@ impl Equal for protobuf::CoalesceExpr {
     }
 }
 
-impl Equal for protobuf::MinMaxExpr {
+impl Equal for ast::MinMaxExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.minmaxtype.equal(&other.minmaxtype)
+        self.minmaxtype.equal(&other.minmaxtype)
             && self.minmaxcollid.equal(&other.minmaxcollid)
             && self.inputcollid.equal(&other.inputcollid)
             && self.op.equal(&other.op)
@@ -2765,7 +2775,6 @@ impl Equal for protobuf::MinMaxExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.minmaxtype.equal_key(out);
         self.minmaxcollid.equal_key(out);
         self.inputcollid.equal_key(out);
@@ -2775,17 +2784,15 @@ impl Equal for protobuf::MinMaxExpr {
     }
 }
 
-impl Equal for protobuf::SqlValueFunction {
+impl Equal for ast::SqlValueFunction {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.op.equal(&other.op)
+        self.op.equal(&other.op)
             && self.r#type.equal(&other.r#type)
             && self.typmod.equal(&other.typmod)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.op.equal_key(out);
         self.r#type.equal_key(out);
         self.typmod.equal_key(out);
@@ -2793,10 +2800,9 @@ impl Equal for protobuf::SqlValueFunction {
     }
 }
 
-impl Equal for protobuf::XmlExpr {
+impl Equal for ast::XmlExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.op.equal(&other.op)
+        self.op.equal(&other.op)
             && self.name.equal(&other.name)
             && self.named_args.equal(&other.named_args)
             && self.arg_names.equal(&other.arg_names)
@@ -2809,7 +2815,6 @@ impl Equal for protobuf::XmlExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.op.equal_key(out);
         self.name.equal_key(out);
         self.named_args.equal_key(out);
@@ -2823,7 +2828,7 @@ impl Equal for protobuf::XmlExpr {
     }
 }
 
-impl Equal for protobuf::JsonFormat {
+impl Equal for ast::JsonFormat {
     fn equal(&self, other: &Self) -> bool {
         self.format_type.equal(&other.format_type) && self.encoding.equal(&other.encoding)
     }
@@ -2836,7 +2841,7 @@ impl Equal for protobuf::JsonFormat {
     }
 }
 
-impl Equal for protobuf::JsonReturning {
+impl Equal for ast::JsonReturning {
     fn equal(&self, other: &Self) -> bool {
         self.format.equal(&other.format)
             && self.typid.equal(&other.typid)
@@ -2852,7 +2857,7 @@ impl Equal for protobuf::JsonReturning {
     }
 }
 
-impl Equal for protobuf::JsonValueExpr {
+impl Equal for ast::JsonValueExpr {
     fn equal(&self, other: &Self) -> bool {
         self.raw_expr.equal(&other.raw_expr)
             && self.formatted_expr.equal(&other.formatted_expr)
@@ -2868,10 +2873,9 @@ impl Equal for protobuf::JsonValueExpr {
     }
 }
 
-impl Equal for protobuf::JsonConstructorExpr {
+impl Equal for ast::JsonConstructorExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.r#type.equal(&other.r#type)
+        self.r#type.equal(&other.r#type)
             && self.args.equal(&other.args)
             && self.func.equal(&other.func)
             && self.coercion.equal(&other.coercion)
@@ -2882,7 +2886,6 @@ impl Equal for protobuf::JsonConstructorExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.r#type.equal_key(out);
         self.args.equal_key(out);
         self.func.equal_key(out);
@@ -2894,7 +2897,7 @@ impl Equal for protobuf::JsonConstructorExpr {
     }
 }
 
-impl Equal for protobuf::JsonIsPredicate {
+impl Equal for ast::JsonIsPredicate {
     fn equal(&self, other: &Self) -> bool {
         self.expr.equal(&other.expr)
             && self.format.equal(&other.format)
@@ -2912,7 +2915,7 @@ impl Equal for protobuf::JsonIsPredicate {
     }
 }
 
-impl Equal for protobuf::JsonBehavior {
+impl Equal for ast::JsonBehavior {
     fn equal(&self, other: &Self) -> bool {
         self.btype.equal(&other.btype)
             && self.expr.equal(&other.expr)
@@ -2928,10 +2931,9 @@ impl Equal for protobuf::JsonBehavior {
     }
 }
 
-impl Equal for protobuf::JsonExpr {
+impl Equal for ast::JsonExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.op.equal(&other.op)
+        self.op.equal(&other.op)
             && self.column_name.equal(&other.column_name)
             && self.formatted_expr.equal(&other.formatted_expr)
             && self.format.equal(&other.format)
@@ -2950,7 +2952,6 @@ impl Equal for protobuf::JsonExpr {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.op.equal_key(out);
         self.column_name.equal_key(out);
         self.formatted_expr.equal_key(out);
@@ -2970,7 +2971,7 @@ impl Equal for protobuf::JsonExpr {
     }
 }
 
-impl Equal for protobuf::JsonTablePath {
+impl Equal for ast::JsonTablePath {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
     }
@@ -2982,10 +2983,9 @@ impl Equal for protobuf::JsonTablePath {
     }
 }
 
-impl Equal for protobuf::JsonTablePathScan {
+impl Equal for ast::JsonTablePathScan {
     fn equal(&self, other: &Self) -> bool {
-        self.plan.equal(&other.plan)
-            && self.path.equal(&other.path)
+        self.path.equal(&other.path)
             && self.error_on_error.equal(&other.error_on_error)
             && self.child.equal(&other.child)
             && self.col_min.equal(&other.col_min)
@@ -2994,7 +2994,6 @@ impl Equal for protobuf::JsonTablePathScan {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.plan.equal_key(out);
         self.path.equal_key(out);
         self.error_on_error.equal_key(out);
         self.child.equal_key(out);
@@ -3004,33 +3003,28 @@ impl Equal for protobuf::JsonTablePathScan {
     }
 }
 
-impl Equal for protobuf::JsonTableSiblingJoin {
+impl Equal for ast::JsonTableSiblingJoin {
     fn equal(&self, other: &Self) -> bool {
-        self.plan.equal(&other.plan)
-            && self.lplan.equal(&other.lplan)
-            && self.rplan.equal(&other.rplan)
+        self.lplan.equal(&other.lplan) && self.rplan.equal(&other.rplan)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.plan.equal_key(out);
         self.lplan.equal_key(out);
         self.rplan.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::NullTest {
+impl Equal for ast::NullTest {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.nulltesttype.equal(&other.nulltesttype)
             && self.argisrow.equal(&other.argisrow)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.nulltesttype.equal_key(out);
         self.argisrow.equal_key(out);
@@ -3038,23 +3032,20 @@ impl Equal for protobuf::NullTest {
     }
 }
 
-impl Equal for protobuf::BooleanTest {
+impl Equal for ast::BooleanTest {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
-            && self.booltesttype.equal(&other.booltesttype)
+        self.arg.equal(&other.arg) && self.booltesttype.equal(&other.booltesttype)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.booltesttype.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::MergeAction {
+impl Equal for ast::MergeAction {
     fn equal(&self, other: &Self) -> bool {
         self.match_kind.equal(&other.match_kind)
             && self.command_type.equal(&other.command_type)
@@ -3076,10 +3067,9 @@ impl Equal for protobuf::MergeAction {
     }
 }
 
-impl Equal for protobuf::CoerceToDomain {
+impl Equal for ast::CoerceToDomain {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.arg.equal(&other.arg)
+        self.arg.equal(&other.arg)
             && self.resulttype.equal(&other.resulttype)
             && self.resulttypmod.equal(&other.resulttypmod)
             && self.resultcollid.equal(&other.resultcollid)
@@ -3088,7 +3078,6 @@ impl Equal for protobuf::CoerceToDomain {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.arg.equal_key(out);
         self.resulttype.equal_key(out);
         self.resulttypmod.equal_key(out);
@@ -3098,17 +3087,15 @@ impl Equal for protobuf::CoerceToDomain {
     }
 }
 
-impl Equal for protobuf::CoerceToDomainValue {
+impl Equal for ast::CoerceToDomainValue {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.type_id.equal(&other.type_id)
+        self.type_id.equal(&other.type_id)
             && self.type_mod.equal(&other.type_mod)
             && self.collation.equal(&other.collation)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.type_id.equal_key(out);
         self.type_mod.equal_key(out);
         self.collation.equal_key(out);
@@ -3116,17 +3103,15 @@ impl Equal for protobuf::CoerceToDomainValue {
     }
 }
 
-impl Equal for protobuf::SetToDefault {
+impl Equal for ast::SetToDefault {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.type_id.equal(&other.type_id)
+        self.type_id.equal(&other.type_id)
             && self.type_mod.equal(&other.type_mod)
             && self.collation.equal(&other.collation)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.type_id.equal_key(out);
         self.type_mod.equal_key(out);
         self.collation.equal_key(out);
@@ -3134,17 +3119,15 @@ impl Equal for protobuf::SetToDefault {
     }
 }
 
-impl Equal for protobuf::CurrentOfExpr {
+impl Equal for ast::CurrentOfExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.cvarno.equal(&other.cvarno)
+        self.cvarno.equal(&other.cvarno)
             && self.cursor_name.equal(&other.cursor_name)
             && self.cursor_param.equal(&other.cursor_param)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.cvarno.equal_key(out);
         self.cursor_name.equal_key(out);
         self.cursor_param.equal_key(out);
@@ -3152,33 +3135,28 @@ impl Equal for protobuf::CurrentOfExpr {
     }
 }
 
-impl Equal for protobuf::NextValueExpr {
+impl Equal for ast::NextValueExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.seqid.equal(&other.seqid)
-            && self.type_id.equal(&other.type_id)
+        self.seqid.equal(&other.seqid) && self.type_id.equal(&other.type_id)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.seqid.equal_key(out);
         self.type_id.equal_key(out);
         out.push('}');
     }
 }
 
-impl Equal for protobuf::InferenceElem {
+impl Equal for ast::InferenceElem {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.expr.equal(&other.expr)
+        self.expr.equal(&other.expr)
             && self.infercollid.equal(&other.infercollid)
             && self.inferopclass.equal(&other.inferopclass)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.expr.equal_key(out);
         self.infercollid.equal_key(out);
         self.inferopclass.equal_key(out);
@@ -3186,17 +3164,15 @@ impl Equal for protobuf::InferenceElem {
     }
 }
 
-impl Equal for protobuf::ReturningExpr {
+impl Equal for ast::ReturningExpr {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.retlevelsup.equal(&other.retlevelsup)
+        self.retlevelsup.equal(&other.retlevelsup)
             && self.retold.equal(&other.retold)
             && self.retexpr.equal(&other.retexpr)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.retlevelsup.equal_key(out);
         self.retold.equal_key(out);
         self.retexpr.equal_key(out);
@@ -3204,10 +3180,9 @@ impl Equal for protobuf::ReturningExpr {
     }
 }
 
-impl Equal for protobuf::TargetEntry {
+impl Equal for ast::TargetEntry {
     fn equal(&self, other: &Self) -> bool {
-        self.xpr.equal(&other.xpr)
-            && self.expr.equal(&other.expr)
+        self.expr.equal(&other.expr)
             && self.resno.equal(&other.resno)
             && self.resname.equal(&other.resname)
             && self.ressortgroupref.equal(&other.ressortgroupref)
@@ -3218,7 +3193,6 @@ impl Equal for protobuf::TargetEntry {
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
-        self.xpr.equal_key(out);
         self.expr.equal_key(out);
         self.resno.equal_key(out);
         self.resname.equal_key(out);
@@ -3230,7 +3204,7 @@ impl Equal for protobuf::TargetEntry {
     }
 }
 
-impl Equal for protobuf::RangeTblRef {
+impl Equal for ast::RangeTblRef {
     fn equal(&self, other: &Self) -> bool {
         self.rtindex.equal(&other.rtindex)
     }
@@ -3242,7 +3216,7 @@ impl Equal for protobuf::RangeTblRef {
     }
 }
 
-impl Equal for protobuf::JoinExpr {
+impl Equal for ast::JoinExpr {
     fn equal(&self, other: &Self) -> bool {
         self.jointype.equal(&other.jointype)
             && self.is_natural.equal(&other.is_natural)
@@ -3270,7 +3244,7 @@ impl Equal for protobuf::JoinExpr {
     }
 }
 
-impl Equal for protobuf::FromExpr {
+impl Equal for ast::FromExpr {
     fn equal(&self, other: &Self) -> bool {
         self.fromlist.equal(&other.fromlist) && self.quals.equal(&other.quals)
     }
@@ -3283,7 +3257,7 @@ impl Equal for protobuf::FromExpr {
     }
 }
 
-impl Equal for protobuf::OnConflictExpr {
+impl Equal for ast::OnConflictExpr {
     fn equal(&self, other: &Self) -> bool {
         self.action.equal(&other.action)
             && self.arbiter_elems.equal(&other.arbiter_elems)
@@ -3309,7 +3283,7 @@ impl Equal for protobuf::OnConflictExpr {
     }
 }
 
-impl Equal for protobuf::Query {
+impl Equal for ast::Query {
     fn equal(&self, other: &Self) -> bool {
         self.command_type.equal(&other.command_type)
             && self.query_source.equal(&other.query_source)
@@ -3407,7 +3381,7 @@ impl Equal for protobuf::Query {
     }
 }
 
-impl Equal for protobuf::TypeName {
+impl Equal for ast::TypeName {
     fn equal(&self, other: &Self) -> bool {
         self.names.equal(&other.names)
             && self.type_oid.equal(&other.type_oid)
@@ -3431,7 +3405,7 @@ impl Equal for protobuf::TypeName {
     }
 }
 
-impl Equal for protobuf::ColumnRef {
+impl Equal for ast::ColumnRef {
     fn equal(&self, other: &Self) -> bool {
         self.fields.equal(&other.fields)
     }
@@ -3443,7 +3417,7 @@ impl Equal for protobuf::ColumnRef {
     }
 }
 
-impl Equal for protobuf::ParamRef {
+impl Equal for ast::ParamRef {
     fn equal(&self, other: &Self) -> bool {
         self.number.equal(&other.number)
     }
@@ -3455,7 +3429,7 @@ impl Equal for protobuf::ParamRef {
     }
 }
 
-impl Equal for protobuf::AExpr {
+impl Equal for ast::AExpr {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.name.equal(&other.name)
@@ -3473,7 +3447,7 @@ impl Equal for protobuf::AExpr {
     }
 }
 
-impl Equal for protobuf::TypeCast {
+impl Equal for ast::TypeCast {
     fn equal(&self, other: &Self) -> bool {
         self.arg.equal(&other.arg) && self.type_name.equal(&other.type_name)
     }
@@ -3486,7 +3460,7 @@ impl Equal for protobuf::TypeCast {
     }
 }
 
-impl Equal for protobuf::CollateClause {
+impl Equal for ast::CollateClause {
     fn equal(&self, other: &Self) -> bool {
         self.arg.equal(&other.arg) && self.collname.equal(&other.collname)
     }
@@ -3499,7 +3473,7 @@ impl Equal for protobuf::CollateClause {
     }
 }
 
-impl Equal for protobuf::RoleSpec {
+impl Equal for ast::RoleSpec {
     fn equal(&self, other: &Self) -> bool {
         self.roletype.equal(&other.roletype) && self.rolename.equal(&other.rolename)
     }
@@ -3512,7 +3486,7 @@ impl Equal for protobuf::RoleSpec {
     }
 }
 
-impl Equal for protobuf::FuncCall {
+impl Equal for ast::FuncCall {
     fn equal(&self, other: &Self) -> bool {
         self.funcname.equal(&other.funcname)
             && self.args.equal(&other.args)
@@ -3542,7 +3516,7 @@ impl Equal for protobuf::FuncCall {
     }
 }
 
-impl Equal for protobuf::AStar {
+impl Equal for ast::AStar {
     fn equal(&self, other: &Self) -> bool {
         true
     }
@@ -3553,7 +3527,7 @@ impl Equal for protobuf::AStar {
     }
 }
 
-impl Equal for protobuf::AIndices {
+impl Equal for ast::AIndices {
     fn equal(&self, other: &Self) -> bool {
         self.is_slice.equal(&other.is_slice)
             && self.lidx.equal(&other.lidx)
@@ -3569,7 +3543,7 @@ impl Equal for protobuf::AIndices {
     }
 }
 
-impl Equal for protobuf::AIndirection {
+impl Equal for ast::AIndirection {
     fn equal(&self, other: &Self) -> bool {
         self.arg.equal(&other.arg) && self.indirection.equal(&other.indirection)
     }
@@ -3582,7 +3556,7 @@ impl Equal for protobuf::AIndirection {
     }
 }
 
-impl Equal for protobuf::AArrayExpr {
+impl Equal for ast::AArrayExpr {
     fn equal(&self, other: &Self) -> bool {
         self.elements.equal(&other.elements)
     }
@@ -3594,7 +3568,7 @@ impl Equal for protobuf::AArrayExpr {
     }
 }
 
-impl Equal for protobuf::ResTarget {
+impl Equal for ast::ResTarget {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.indirection.equal(&other.indirection)
@@ -3610,7 +3584,7 @@ impl Equal for protobuf::ResTarget {
     }
 }
 
-impl Equal for protobuf::MultiAssignRef {
+impl Equal for ast::MultiAssignRef {
     fn equal(&self, other: &Self) -> bool {
         self.source.equal(&other.source)
             && self.colno.equal(&other.colno)
@@ -3626,7 +3600,7 @@ impl Equal for protobuf::MultiAssignRef {
     }
 }
 
-impl Equal for protobuf::SortBy {
+impl Equal for ast::SortBy {
     fn equal(&self, other: &Self) -> bool {
         self.node.equal(&other.node)
             && self.sortby_dir.equal(&other.sortby_dir)
@@ -3644,7 +3618,7 @@ impl Equal for protobuf::SortBy {
     }
 }
 
-impl Equal for protobuf::WindowDef {
+impl Equal for ast::WindowDef {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.refname.equal(&other.refname)
@@ -3668,7 +3642,7 @@ impl Equal for protobuf::WindowDef {
     }
 }
 
-impl Equal for protobuf::RangeSubselect {
+impl Equal for ast::RangeSubselect {
     fn equal(&self, other: &Self) -> bool {
         self.lateral.equal(&other.lateral)
             && self.subquery.equal(&other.subquery)
@@ -3684,7 +3658,7 @@ impl Equal for protobuf::RangeSubselect {
     }
 }
 
-impl Equal for protobuf::RangeFunction {
+impl Equal for ast::RangeFunction {
     fn equal(&self, other: &Self) -> bool {
         self.lateral.equal(&other.lateral)
             && self.ordinality.equal(&other.ordinality)
@@ -3706,7 +3680,7 @@ impl Equal for protobuf::RangeFunction {
     }
 }
 
-impl Equal for protobuf::RangeTableFunc {
+impl Equal for ast::RangeTableFunc {
     fn equal(&self, other: &Self) -> bool {
         self.lateral.equal(&other.lateral)
             && self.docexpr.equal(&other.docexpr)
@@ -3728,7 +3702,7 @@ impl Equal for protobuf::RangeTableFunc {
     }
 }
 
-impl Equal for protobuf::RangeTableFuncCol {
+impl Equal for ast::RangeTableFuncCol {
     fn equal(&self, other: &Self) -> bool {
         self.colname.equal(&other.colname)
             && self.type_name.equal(&other.type_name)
@@ -3750,7 +3724,7 @@ impl Equal for protobuf::RangeTableFuncCol {
     }
 }
 
-impl Equal for protobuf::RangeTableSample {
+impl Equal for ast::RangeTableSample {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.method.equal(&other.method)
@@ -3768,7 +3742,7 @@ impl Equal for protobuf::RangeTableSample {
     }
 }
 
-impl Equal for protobuf::ColumnDef {
+impl Equal for ast::ColumnDef {
     fn equal(&self, other: &Self) -> bool {
         self.colname.equal(&other.colname)
             && self.type_name.equal(&other.type_name)
@@ -3814,7 +3788,7 @@ impl Equal for protobuf::ColumnDef {
     }
 }
 
-impl Equal for protobuf::TableLikeClause {
+impl Equal for ast::TableLikeClause {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.options.equal(&other.options)
@@ -3830,7 +3804,7 @@ impl Equal for protobuf::TableLikeClause {
     }
 }
 
-impl Equal for protobuf::IndexElem {
+impl Equal for ast::IndexElem {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.expr.equal(&other.expr)
@@ -3856,7 +3830,7 @@ impl Equal for protobuf::IndexElem {
     }
 }
 
-impl Equal for protobuf::DefElem {
+impl Equal for ast::DefElem {
     fn equal(&self, other: &Self) -> bool {
         self.defnamespace.equal(&other.defnamespace)
             && self.defname.equal(&other.defname)
@@ -3874,7 +3848,7 @@ impl Equal for protobuf::DefElem {
     }
 }
 
-impl Equal for protobuf::LockingClause {
+impl Equal for ast::LockingClause {
     fn equal(&self, other: &Self) -> bool {
         self.locked_rels.equal(&other.locked_rels)
             && self.strength.equal(&other.strength)
@@ -3890,7 +3864,7 @@ impl Equal for protobuf::LockingClause {
     }
 }
 
-impl Equal for protobuf::XmlSerialize {
+impl Equal for ast::XmlSerialize {
     fn equal(&self, other: &Self) -> bool {
         self.xmloption.equal(&other.xmloption)
             && self.expr.equal(&other.expr)
@@ -3908,7 +3882,7 @@ impl Equal for protobuf::XmlSerialize {
     }
 }
 
-impl Equal for protobuf::PartitionElem {
+impl Equal for ast::PartitionElem {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.expr.equal(&other.expr)
@@ -3926,7 +3900,7 @@ impl Equal for protobuf::PartitionElem {
     }
 }
 
-impl Equal for protobuf::PartitionSpec {
+impl Equal for ast::PartitionSpec {
     fn equal(&self, other: &Self) -> bool {
         self.strategy.equal(&other.strategy) && self.part_params.equal(&other.part_params)
     }
@@ -3939,7 +3913,7 @@ impl Equal for protobuf::PartitionSpec {
     }
 }
 
-impl Equal for protobuf::PartitionBoundSpec {
+impl Equal for ast::PartitionBoundSpec {
     fn equal(&self, other: &Self) -> bool {
         self.strategy.equal(&other.strategy)
             && self.is_default.equal(&other.is_default)
@@ -3965,7 +3939,7 @@ impl Equal for protobuf::PartitionBoundSpec {
     }
 }
 
-impl Equal for protobuf::PartitionRangeDatum {
+impl Equal for ast::PartitionRangeDatum {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind) && self.value.equal(&other.value)
     }
@@ -3978,7 +3952,7 @@ impl Equal for protobuf::PartitionRangeDatum {
     }
 }
 
-impl Equal for protobuf::PartitionCmd {
+impl Equal for ast::PartitionCmd {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.bound.equal(&other.bound)
@@ -3994,7 +3968,7 @@ impl Equal for protobuf::PartitionCmd {
     }
 }
 
-impl Equal for protobuf::RangeTblEntry {
+impl Equal for ast::RangeTblEntry {
     fn equal(&self, other: &Self) -> bool {
         self.alias.equal(&other.alias)
             && self.eref.equal(&other.eref)
@@ -4070,7 +4044,7 @@ impl Equal for protobuf::RangeTblEntry {
     }
 }
 
-impl Equal for protobuf::RtePermissionInfo {
+impl Equal for ast::RtePermissionInfo {
     fn equal(&self, other: &Self) -> bool {
         self.relid.equal(&other.relid)
             && self.inh.equal(&other.inh)
@@ -4094,7 +4068,7 @@ impl Equal for protobuf::RtePermissionInfo {
     }
 }
 
-impl Equal for protobuf::RangeTblFunction {
+impl Equal for ast::RangeTblFunction {
     fn equal(&self, other: &Self) -> bool {
         self.funcexpr.equal(&other.funcexpr)
             && self.funccolcount.equal(&other.funccolcount)
@@ -4118,7 +4092,7 @@ impl Equal for protobuf::RangeTblFunction {
     }
 }
 
-impl Equal for protobuf::TableSampleClause {
+impl Equal for ast::TableSampleClause {
     fn equal(&self, other: &Self) -> bool {
         self.tsmhandler.equal(&other.tsmhandler)
             && self.args.equal(&other.args)
@@ -4134,7 +4108,7 @@ impl Equal for protobuf::TableSampleClause {
     }
 }
 
-impl Equal for protobuf::WithCheckOption {
+impl Equal for ast::WithCheckOption {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.relname.equal(&other.relname)
@@ -4154,7 +4128,7 @@ impl Equal for protobuf::WithCheckOption {
     }
 }
 
-impl Equal for protobuf::SortGroupClause {
+impl Equal for ast::SortGroupClause {
     fn equal(&self, other: &Self) -> bool {
         self.tle_sort_group_ref.equal(&other.tle_sort_group_ref)
             && self.eqop.equal(&other.eqop)
@@ -4176,7 +4150,7 @@ impl Equal for protobuf::SortGroupClause {
     }
 }
 
-impl Equal for protobuf::GroupingSet {
+impl Equal for ast::GroupingSet {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind) && self.content.equal(&other.content)
     }
@@ -4189,7 +4163,7 @@ impl Equal for protobuf::GroupingSet {
     }
 }
 
-impl Equal for protobuf::WindowClause {
+impl Equal for ast::WindowClause {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.refname.equal(&other.refname)
@@ -4227,7 +4201,7 @@ impl Equal for protobuf::WindowClause {
     }
 }
 
-impl Equal for protobuf::RowMarkClause {
+impl Equal for ast::RowMarkClause {
     fn equal(&self, other: &Self) -> bool {
         self.rti.equal(&other.rti)
             && self.strength.equal(&other.strength)
@@ -4245,7 +4219,7 @@ impl Equal for protobuf::RowMarkClause {
     }
 }
 
-impl Equal for protobuf::WithClause {
+impl Equal for ast::WithClause {
     fn equal(&self, other: &Self) -> bool {
         self.ctes.equal(&other.ctes) && self.recursive.equal(&other.recursive)
     }
@@ -4258,7 +4232,7 @@ impl Equal for protobuf::WithClause {
     }
 }
 
-impl Equal for protobuf::InferClause {
+impl Equal for ast::InferClause {
     fn equal(&self, other: &Self) -> bool {
         self.index_elems.equal(&other.index_elems)
             && self.where_clause.equal(&other.where_clause)
@@ -4274,7 +4248,7 @@ impl Equal for protobuf::InferClause {
     }
 }
 
-impl Equal for protobuf::OnConflictClause {
+impl Equal for ast::OnConflictClause {
     fn equal(&self, other: &Self) -> bool {
         self.action.equal(&other.action)
             && self.infer.equal(&other.infer)
@@ -4292,7 +4266,7 @@ impl Equal for protobuf::OnConflictClause {
     }
 }
 
-impl Equal for protobuf::CteSearchClause {
+impl Equal for ast::CteSearchClause {
     fn equal(&self, other: &Self) -> bool {
         self.search_col_list.equal(&other.search_col_list)
             && self.search_breadth_first.equal(&other.search_breadth_first)
@@ -4308,7 +4282,7 @@ impl Equal for protobuf::CteSearchClause {
     }
 }
 
-impl Equal for protobuf::CteCycleClause {
+impl Equal for ast::CteCycleClause {
     fn equal(&self, other: &Self) -> bool {
         self.cycle_col_list.equal(&other.cycle_col_list)
             && self.cycle_mark_column.equal(&other.cycle_mark_column)
@@ -4336,7 +4310,7 @@ impl Equal for protobuf::CteCycleClause {
     }
 }
 
-impl Equal for protobuf::CommonTableExpr {
+impl Equal for ast::CommonTableExpr {
     fn equal(&self, other: &Self) -> bool {
         self.ctename.equal(&other.ctename)
             && self.aliascolnames.equal(&other.aliascolnames)
@@ -4370,7 +4344,7 @@ impl Equal for protobuf::CommonTableExpr {
     }
 }
 
-impl Equal for protobuf::MergeWhenClause {
+impl Equal for ast::MergeWhenClause {
     fn equal(&self, other: &Self) -> bool {
         self.match_kind.equal(&other.match_kind)
             && self.command_type.equal(&other.command_type)
@@ -4392,7 +4366,7 @@ impl Equal for protobuf::MergeWhenClause {
     }
 }
 
-impl Equal for protobuf::ReturningOption {
+impl Equal for ast::ReturningOption {
     fn equal(&self, other: &Self) -> bool {
         self.option.equal(&other.option) && self.value.equal(&other.value)
     }
@@ -4405,7 +4379,7 @@ impl Equal for protobuf::ReturningOption {
     }
 }
 
-impl Equal for protobuf::ReturningClause {
+impl Equal for ast::ReturningClause {
     fn equal(&self, other: &Self) -> bool {
         self.options.equal(&other.options) && self.exprs.equal(&other.exprs)
     }
@@ -4418,7 +4392,7 @@ impl Equal for protobuf::ReturningClause {
     }
 }
 
-impl Equal for protobuf::TriggerTransition {
+impl Equal for ast::TriggerTransition {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.is_new.equal(&other.is_new)
@@ -4434,7 +4408,7 @@ impl Equal for protobuf::TriggerTransition {
     }
 }
 
-impl Equal for protobuf::JsonOutput {
+impl Equal for ast::JsonOutput {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.returning.equal(&other.returning)
     }
@@ -4447,7 +4421,7 @@ impl Equal for protobuf::JsonOutput {
     }
 }
 
-impl Equal for protobuf::JsonArgument {
+impl Equal for ast::JsonArgument {
     fn equal(&self, other: &Self) -> bool {
         self.val.equal(&other.val) && self.name.equal(&other.name)
     }
@@ -4460,7 +4434,7 @@ impl Equal for protobuf::JsonArgument {
     }
 }
 
-impl Equal for protobuf::JsonFuncExpr {
+impl Equal for ast::JsonFuncExpr {
     fn equal(&self, other: &Self) -> bool {
         self.op.equal(&other.op)
             && self.column_name.equal(&other.column_name)
@@ -4490,7 +4464,7 @@ impl Equal for protobuf::JsonFuncExpr {
     }
 }
 
-impl Equal for protobuf::JsonTablePathSpec {
+impl Equal for ast::JsonTablePathSpec {
     fn equal(&self, other: &Self) -> bool {
         self.string.equal(&other.string) && self.name.equal(&other.name)
     }
@@ -4503,7 +4477,7 @@ impl Equal for protobuf::JsonTablePathSpec {
     }
 }
 
-impl Equal for protobuf::JsonTable {
+impl Equal for ast::JsonTable {
     fn equal(&self, other: &Self) -> bool {
         self.context_item.equal(&other.context_item)
             && self.pathspec.equal(&other.pathspec)
@@ -4527,7 +4501,7 @@ impl Equal for protobuf::JsonTable {
     }
 }
 
-impl Equal for protobuf::JsonTableColumn {
+impl Equal for ast::JsonTableColumn {
     fn equal(&self, other: &Self) -> bool {
         self.coltype.equal(&other.coltype)
             && self.name.equal(&other.name)
@@ -4557,7 +4531,7 @@ impl Equal for protobuf::JsonTableColumn {
     }
 }
 
-impl Equal for protobuf::JsonKeyValue {
+impl Equal for ast::JsonKeyValue {
     fn equal(&self, other: &Self) -> bool {
         self.key.equal(&other.key) && self.value.equal(&other.value)
     }
@@ -4570,7 +4544,7 @@ impl Equal for protobuf::JsonKeyValue {
     }
 }
 
-impl Equal for protobuf::JsonParseExpr {
+impl Equal for ast::JsonParseExpr {
     fn equal(&self, other: &Self) -> bool {
         self.expr.equal(&other.expr)
             && self.output.equal(&other.output)
@@ -4586,7 +4560,7 @@ impl Equal for protobuf::JsonParseExpr {
     }
 }
 
-impl Equal for protobuf::JsonScalarExpr {
+impl Equal for ast::JsonScalarExpr {
     fn equal(&self, other: &Self) -> bool {
         self.expr.equal(&other.expr) && self.output.equal(&other.output)
     }
@@ -4599,7 +4573,7 @@ impl Equal for protobuf::JsonScalarExpr {
     }
 }
 
-impl Equal for protobuf::JsonSerializeExpr {
+impl Equal for ast::JsonSerializeExpr {
     fn equal(&self, other: &Self) -> bool {
         self.expr.equal(&other.expr) && self.output.equal(&other.output)
     }
@@ -4612,7 +4586,7 @@ impl Equal for protobuf::JsonSerializeExpr {
     }
 }
 
-impl Equal for protobuf::JsonObjectConstructor {
+impl Equal for ast::JsonObjectConstructor {
     fn equal(&self, other: &Self) -> bool {
         self.exprs.equal(&other.exprs)
             && self.output.equal(&other.output)
@@ -4630,7 +4604,7 @@ impl Equal for protobuf::JsonObjectConstructor {
     }
 }
 
-impl Equal for protobuf::JsonArrayConstructor {
+impl Equal for ast::JsonArrayConstructor {
     fn equal(&self, other: &Self) -> bool {
         self.exprs.equal(&other.exprs)
             && self.output.equal(&other.output)
@@ -4646,7 +4620,7 @@ impl Equal for protobuf::JsonArrayConstructor {
     }
 }
 
-impl Equal for protobuf::JsonArrayQueryConstructor {
+impl Equal for ast::JsonArrayQueryConstructor {
     fn equal(&self, other: &Self) -> bool {
         self.query.equal(&other.query)
             && self.output.equal(&other.output)
@@ -4664,7 +4638,7 @@ impl Equal for protobuf::JsonArrayQueryConstructor {
     }
 }
 
-impl Equal for protobuf::JsonAggConstructor {
+impl Equal for ast::JsonAggConstructor {
     fn equal(&self, other: &Self) -> bool {
         self.output.equal(&other.output)
             && self.agg_filter.equal(&other.agg_filter)
@@ -4682,7 +4656,7 @@ impl Equal for protobuf::JsonAggConstructor {
     }
 }
 
-impl Equal for protobuf::JsonObjectAgg {
+impl Equal for ast::JsonObjectAgg {
     fn equal(&self, other: &Self) -> bool {
         self.constructor.equal(&other.constructor)
             && self.arg.equal(&other.arg)
@@ -4700,7 +4674,7 @@ impl Equal for protobuf::JsonObjectAgg {
     }
 }
 
-impl Equal for protobuf::JsonArrayAgg {
+impl Equal for ast::JsonArrayAgg {
     fn equal(&self, other: &Self) -> bool {
         self.constructor.equal(&other.constructor)
             && self.arg.equal(&other.arg)
@@ -4716,7 +4690,7 @@ impl Equal for protobuf::JsonArrayAgg {
     }
 }
 
-impl Equal for protobuf::RawStmt {
+impl Equal for ast::RawStmt {
     fn equal(&self, other: &Self) -> bool {
         self.stmt.equal(&other.stmt)
     }
@@ -4728,7 +4702,7 @@ impl Equal for protobuf::RawStmt {
     }
 }
 
-impl Equal for protobuf::InsertStmt {
+impl Equal for ast::InsertStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.cols.equal(&other.cols)
@@ -4752,7 +4726,7 @@ impl Equal for protobuf::InsertStmt {
     }
 }
 
-impl Equal for protobuf::DeleteStmt {
+impl Equal for ast::DeleteStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.using_clause.equal(&other.using_clause)
@@ -4772,7 +4746,7 @@ impl Equal for protobuf::DeleteStmt {
     }
 }
 
-impl Equal for protobuf::UpdateStmt {
+impl Equal for ast::UpdateStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.target_list.equal(&other.target_list)
@@ -4794,7 +4768,7 @@ impl Equal for protobuf::UpdateStmt {
     }
 }
 
-impl Equal for protobuf::MergeStmt {
+impl Equal for ast::MergeStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.source_relation.equal(&other.source_relation)
@@ -4816,7 +4790,7 @@ impl Equal for protobuf::MergeStmt {
     }
 }
 
-impl Equal for protobuf::SelectStmt {
+impl Equal for ast::SelectStmt {
     fn equal(&self, other: &Self) -> bool {
         self.distinct_clause.equal(&other.distinct_clause)
             && self.into_clause.equal(&other.into_clause)
@@ -4866,7 +4840,7 @@ impl Equal for protobuf::SelectStmt {
     }
 }
 
-impl Equal for protobuf::SetOperationStmt {
+impl Equal for ast::SetOperationStmt {
     fn equal(&self, other: &Self) -> bool {
         self.op.equal(&other.op)
             && self.all.equal(&other.all)
@@ -4892,7 +4866,7 @@ impl Equal for protobuf::SetOperationStmt {
     }
 }
 
-impl Equal for protobuf::ReturnStmt {
+impl Equal for ast::ReturnStmt {
     fn equal(&self, other: &Self) -> bool {
         self.returnval.equal(&other.returnval)
     }
@@ -4904,7 +4878,7 @@ impl Equal for protobuf::ReturnStmt {
     }
 }
 
-impl Equal for protobuf::PlAssignStmt {
+impl Equal for ast::PlAssignStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.indirection.equal(&other.indirection)
@@ -4922,7 +4896,7 @@ impl Equal for protobuf::PlAssignStmt {
     }
 }
 
-impl Equal for protobuf::CreateSchemaStmt {
+impl Equal for ast::CreateSchemaStmt {
     fn equal(&self, other: &Self) -> bool {
         self.schemaname.equal(&other.schemaname)
             && self.authrole.equal(&other.authrole)
@@ -4940,7 +4914,7 @@ impl Equal for protobuf::CreateSchemaStmt {
     }
 }
 
-impl Equal for protobuf::AlterTableStmt {
+impl Equal for ast::AlterTableStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.cmds.equal(&other.cmds)
@@ -4958,7 +4932,7 @@ impl Equal for protobuf::AlterTableStmt {
     }
 }
 
-impl Equal for protobuf::AlterTableCmd {
+impl Equal for ast::AlterTableCmd {
     fn equal(&self, other: &Self) -> bool {
         self.subtype.equal(&other.subtype)
             && self.name.equal(&other.name)
@@ -4984,7 +4958,7 @@ impl Equal for protobuf::AlterTableCmd {
     }
 }
 
-impl Equal for protobuf::AtAlterConstraint {
+impl Equal for ast::AtAlterConstraint {
     fn equal(&self, other: &Self) -> bool {
         self.conname.equal(&other.conname)
             && self.alter_enforceability.equal(&other.alter_enforceability)
@@ -5010,7 +4984,7 @@ impl Equal for protobuf::AtAlterConstraint {
     }
 }
 
-impl Equal for protobuf::ReplicaIdentityStmt {
+impl Equal for ast::ReplicaIdentityStmt {
     fn equal(&self, other: &Self) -> bool {
         self.identity_type.equal(&other.identity_type) && self.name.equal(&other.name)
     }
@@ -5023,7 +4997,7 @@ impl Equal for protobuf::ReplicaIdentityStmt {
     }
 }
 
-impl Equal for protobuf::AlterCollationStmt {
+impl Equal for ast::AlterCollationStmt {
     fn equal(&self, other: &Self) -> bool {
         self.collname.equal(&other.collname)
     }
@@ -5035,7 +5009,7 @@ impl Equal for protobuf::AlterCollationStmt {
     }
 }
 
-impl Equal for protobuf::AlterDomainStmt {
+impl Equal for ast::AlterDomainStmt {
     fn equal(&self, other: &Self) -> bool {
         self.subtype.equal(&other.subtype)
             && self.type_name.equal(&other.type_name)
@@ -5057,7 +5031,7 @@ impl Equal for protobuf::AlterDomainStmt {
     }
 }
 
-impl Equal for protobuf::GrantStmt {
+impl Equal for ast::GrantStmt {
     fn equal(&self, other: &Self) -> bool {
         self.is_grant.equal(&other.is_grant)
             && self.targtype.equal(&other.targtype)
@@ -5085,7 +5059,7 @@ impl Equal for protobuf::GrantStmt {
     }
 }
 
-impl Equal for protobuf::ObjectWithArgs {
+impl Equal for ast::ObjectWithArgs {
     fn equal(&self, other: &Self) -> bool {
         self.objname.equal(&other.objname)
             && self.objargs.equal(&other.objargs)
@@ -5103,7 +5077,7 @@ impl Equal for protobuf::ObjectWithArgs {
     }
 }
 
-impl Equal for protobuf::AccessPriv {
+impl Equal for ast::AccessPriv {
     fn equal(&self, other: &Self) -> bool {
         self.priv_name.equal(&other.priv_name) && self.cols.equal(&other.cols)
     }
@@ -5116,7 +5090,7 @@ impl Equal for protobuf::AccessPriv {
     }
 }
 
-impl Equal for protobuf::GrantRoleStmt {
+impl Equal for ast::GrantRoleStmt {
     fn equal(&self, other: &Self) -> bool {
         self.granted_roles.equal(&other.granted_roles)
             && self.grantee_roles.equal(&other.grantee_roles)
@@ -5138,7 +5112,7 @@ impl Equal for protobuf::GrantRoleStmt {
     }
 }
 
-impl Equal for protobuf::AlterDefaultPrivilegesStmt {
+impl Equal for ast::AlterDefaultPrivilegesStmt {
     fn equal(&self, other: &Self) -> bool {
         self.options.equal(&other.options) && self.action.equal(&other.action)
     }
@@ -5151,7 +5125,7 @@ impl Equal for protobuf::AlterDefaultPrivilegesStmt {
     }
 }
 
-impl Equal for protobuf::CopyStmt {
+impl Equal for ast::CopyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.query.equal(&other.query)
@@ -5177,7 +5151,7 @@ impl Equal for protobuf::CopyStmt {
     }
 }
 
-impl Equal for protobuf::VariableSetStmt {
+impl Equal for ast::VariableSetStmt {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.name.equal(&other.name)
@@ -5197,7 +5171,7 @@ impl Equal for protobuf::VariableSetStmt {
     }
 }
 
-impl Equal for protobuf::VariableShowStmt {
+impl Equal for ast::VariableShowStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
     }
@@ -5209,7 +5183,7 @@ impl Equal for protobuf::VariableShowStmt {
     }
 }
 
-impl Equal for protobuf::CreateStmt {
+impl Equal for ast::CreateStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.table_elts.equal(&other.table_elts)
@@ -5245,7 +5219,7 @@ impl Equal for protobuf::CreateStmt {
     }
 }
 
-impl Equal for protobuf::Constraint {
+impl Equal for ast::Constraint {
     fn equal(&self, other: &Self) -> bool {
         self.contype.equal(&other.contype)
             && self.conname.equal(&other.conname)
@@ -5323,7 +5297,7 @@ impl Equal for protobuf::Constraint {
     }
 }
 
-impl Equal for protobuf::CreateTableSpaceStmt {
+impl Equal for ast::CreateTableSpaceStmt {
     fn equal(&self, other: &Self) -> bool {
         self.tablespacename.equal(&other.tablespacename)
             && self.owner.equal(&other.owner)
@@ -5341,7 +5315,7 @@ impl Equal for protobuf::CreateTableSpaceStmt {
     }
 }
 
-impl Equal for protobuf::DropTableSpaceStmt {
+impl Equal for ast::DropTableSpaceStmt {
     fn equal(&self, other: &Self) -> bool {
         self.tablespacename.equal(&other.tablespacename) && self.missing_ok.equal(&other.missing_ok)
     }
@@ -5354,7 +5328,7 @@ impl Equal for protobuf::DropTableSpaceStmt {
     }
 }
 
-impl Equal for protobuf::AlterTableSpaceOptionsStmt {
+impl Equal for ast::AlterTableSpaceOptionsStmt {
     fn equal(&self, other: &Self) -> bool {
         self.tablespacename.equal(&other.tablespacename)
             && self.options.equal(&other.options)
@@ -5370,7 +5344,7 @@ impl Equal for protobuf::AlterTableSpaceOptionsStmt {
     }
 }
 
-impl Equal for protobuf::AlterTableMoveAllStmt {
+impl Equal for ast::AlterTableMoveAllStmt {
     fn equal(&self, other: &Self) -> bool {
         self.orig_tablespacename.equal(&other.orig_tablespacename)
             && self.objtype.equal(&other.objtype)
@@ -5390,7 +5364,7 @@ impl Equal for protobuf::AlterTableMoveAllStmt {
     }
 }
 
-impl Equal for protobuf::CreateExtensionStmt {
+impl Equal for ast::CreateExtensionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.extname.equal(&other.extname)
             && self.if_not_exists.equal(&other.if_not_exists)
@@ -5406,7 +5380,7 @@ impl Equal for protobuf::CreateExtensionStmt {
     }
 }
 
-impl Equal for protobuf::AlterExtensionStmt {
+impl Equal for ast::AlterExtensionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.extname.equal(&other.extname) && self.options.equal(&other.options)
     }
@@ -5419,7 +5393,7 @@ impl Equal for protobuf::AlterExtensionStmt {
     }
 }
 
-impl Equal for protobuf::AlterExtensionContentsStmt {
+impl Equal for ast::AlterExtensionContentsStmt {
     fn equal(&self, other: &Self) -> bool {
         self.extname.equal(&other.extname)
             && self.action.equal(&other.action)
@@ -5437,7 +5411,7 @@ impl Equal for protobuf::AlterExtensionContentsStmt {
     }
 }
 
-impl Equal for protobuf::CreateFdwStmt {
+impl Equal for ast::CreateFdwStmt {
     fn equal(&self, other: &Self) -> bool {
         self.fdwname.equal(&other.fdwname)
             && self.func_options.equal(&other.func_options)
@@ -5453,7 +5427,7 @@ impl Equal for protobuf::CreateFdwStmt {
     }
 }
 
-impl Equal for protobuf::AlterFdwStmt {
+impl Equal for ast::AlterFdwStmt {
     fn equal(&self, other: &Self) -> bool {
         self.fdwname.equal(&other.fdwname)
             && self.func_options.equal(&other.func_options)
@@ -5469,7 +5443,7 @@ impl Equal for protobuf::AlterFdwStmt {
     }
 }
 
-impl Equal for protobuf::CreateForeignServerStmt {
+impl Equal for ast::CreateForeignServerStmt {
     fn equal(&self, other: &Self) -> bool {
         self.servername.equal(&other.servername)
             && self.servertype.equal(&other.servertype)
@@ -5491,7 +5465,7 @@ impl Equal for protobuf::CreateForeignServerStmt {
     }
 }
 
-impl Equal for protobuf::AlterForeignServerStmt {
+impl Equal for ast::AlterForeignServerStmt {
     fn equal(&self, other: &Self) -> bool {
         self.servername.equal(&other.servername)
             && self.version.equal(&other.version)
@@ -5509,7 +5483,7 @@ impl Equal for protobuf::AlterForeignServerStmt {
     }
 }
 
-impl Equal for protobuf::CreateForeignTableStmt {
+impl Equal for ast::CreateForeignTableStmt {
     fn equal(&self, other: &Self) -> bool {
         self.base_stmt.equal(&other.base_stmt)
             && self.servername.equal(&other.servername)
@@ -5525,7 +5499,7 @@ impl Equal for protobuf::CreateForeignTableStmt {
     }
 }
 
-impl Equal for protobuf::CreateUserMappingStmt {
+impl Equal for ast::CreateUserMappingStmt {
     fn equal(&self, other: &Self) -> bool {
         self.user.equal(&other.user)
             && self.servername.equal(&other.servername)
@@ -5543,7 +5517,7 @@ impl Equal for protobuf::CreateUserMappingStmt {
     }
 }
 
-impl Equal for protobuf::AlterUserMappingStmt {
+impl Equal for ast::AlterUserMappingStmt {
     fn equal(&self, other: &Self) -> bool {
         self.user.equal(&other.user)
             && self.servername.equal(&other.servername)
@@ -5559,7 +5533,7 @@ impl Equal for protobuf::AlterUserMappingStmt {
     }
 }
 
-impl Equal for protobuf::DropUserMappingStmt {
+impl Equal for ast::DropUserMappingStmt {
     fn equal(&self, other: &Self) -> bool {
         self.user.equal(&other.user)
             && self.servername.equal(&other.servername)
@@ -5575,7 +5549,7 @@ impl Equal for protobuf::DropUserMappingStmt {
     }
 }
 
-impl Equal for protobuf::ImportForeignSchemaStmt {
+impl Equal for ast::ImportForeignSchemaStmt {
     fn equal(&self, other: &Self) -> bool {
         self.server_name.equal(&other.server_name)
             && self.remote_schema.equal(&other.remote_schema)
@@ -5597,7 +5571,7 @@ impl Equal for protobuf::ImportForeignSchemaStmt {
     }
 }
 
-impl Equal for protobuf::CreatePolicyStmt {
+impl Equal for ast::CreatePolicyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.policy_name.equal(&other.policy_name)
             && self.table.equal(&other.table)
@@ -5621,7 +5595,7 @@ impl Equal for protobuf::CreatePolicyStmt {
     }
 }
 
-impl Equal for protobuf::AlterPolicyStmt {
+impl Equal for ast::AlterPolicyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.policy_name.equal(&other.policy_name)
             && self.table.equal(&other.table)
@@ -5641,7 +5615,7 @@ impl Equal for protobuf::AlterPolicyStmt {
     }
 }
 
-impl Equal for protobuf::CreateAmStmt {
+impl Equal for ast::CreateAmStmt {
     fn equal(&self, other: &Self) -> bool {
         self.amname.equal(&other.amname)
             && self.handler_name.equal(&other.handler_name)
@@ -5657,7 +5631,7 @@ impl Equal for protobuf::CreateAmStmt {
     }
 }
 
-impl Equal for protobuf::CreateTrigStmt {
+impl Equal for ast::CreateTrigStmt {
     fn equal(&self, other: &Self) -> bool {
         self.replace.equal(&other.replace)
             && self.isconstraint.equal(&other.isconstraint)
@@ -5697,7 +5671,7 @@ impl Equal for protobuf::CreateTrigStmt {
     }
 }
 
-impl Equal for protobuf::CreateEventTrigStmt {
+impl Equal for ast::CreateEventTrigStmt {
     fn equal(&self, other: &Self) -> bool {
         self.trigname.equal(&other.trigname)
             && self.eventname.equal(&other.eventname)
@@ -5715,7 +5689,7 @@ impl Equal for protobuf::CreateEventTrigStmt {
     }
 }
 
-impl Equal for protobuf::AlterEventTrigStmt {
+impl Equal for ast::AlterEventTrigStmt {
     fn equal(&self, other: &Self) -> bool {
         self.trigname.equal(&other.trigname) && self.tgenabled.equal(&other.tgenabled)
     }
@@ -5728,7 +5702,7 @@ impl Equal for protobuf::AlterEventTrigStmt {
     }
 }
 
-impl Equal for protobuf::CreatePLangStmt {
+impl Equal for ast::CreatePLangStmt {
     fn equal(&self, other: &Self) -> bool {
         self.replace.equal(&other.replace)
             && self.plname.equal(&other.plname)
@@ -5750,7 +5724,7 @@ impl Equal for protobuf::CreatePLangStmt {
     }
 }
 
-impl Equal for protobuf::CreateRoleStmt {
+impl Equal for ast::CreateRoleStmt {
     fn equal(&self, other: &Self) -> bool {
         self.stmt_type.equal(&other.stmt_type)
             && self.role.equal(&other.role)
@@ -5766,7 +5740,7 @@ impl Equal for protobuf::CreateRoleStmt {
     }
 }
 
-impl Equal for protobuf::AlterRoleStmt {
+impl Equal for ast::AlterRoleStmt {
     fn equal(&self, other: &Self) -> bool {
         self.role.equal(&other.role)
             && self.options.equal(&other.options)
@@ -5782,7 +5756,7 @@ impl Equal for protobuf::AlterRoleStmt {
     }
 }
 
-impl Equal for protobuf::AlterRoleSetStmt {
+impl Equal for ast::AlterRoleSetStmt {
     fn equal(&self, other: &Self) -> bool {
         self.role.equal(&other.role)
             && self.database.equal(&other.database)
@@ -5798,7 +5772,7 @@ impl Equal for protobuf::AlterRoleSetStmt {
     }
 }
 
-impl Equal for protobuf::DropRoleStmt {
+impl Equal for ast::DropRoleStmt {
     fn equal(&self, other: &Self) -> bool {
         self.roles.equal(&other.roles) && self.missing_ok.equal(&other.missing_ok)
     }
@@ -5811,7 +5785,7 @@ impl Equal for protobuf::DropRoleStmt {
     }
 }
 
-impl Equal for protobuf::CreateSeqStmt {
+impl Equal for ast::CreateSeqStmt {
     fn equal(&self, other: &Self) -> bool {
         self.sequence.equal(&other.sequence)
             && self.options.equal(&other.options)
@@ -5831,7 +5805,7 @@ impl Equal for protobuf::CreateSeqStmt {
     }
 }
 
-impl Equal for protobuf::AlterSeqStmt {
+impl Equal for ast::AlterSeqStmt {
     fn equal(&self, other: &Self) -> bool {
         self.sequence.equal(&other.sequence)
             && self.options.equal(&other.options)
@@ -5849,7 +5823,7 @@ impl Equal for protobuf::AlterSeqStmt {
     }
 }
 
-impl Equal for protobuf::DefineStmt {
+impl Equal for ast::DefineStmt {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.oldstyle.equal(&other.oldstyle)
@@ -5873,7 +5847,7 @@ impl Equal for protobuf::DefineStmt {
     }
 }
 
-impl Equal for protobuf::CreateDomainStmt {
+impl Equal for ast::CreateDomainStmt {
     fn equal(&self, other: &Self) -> bool {
         self.domainname.equal(&other.domainname)
             && self.type_name.equal(&other.type_name)
@@ -5891,7 +5865,7 @@ impl Equal for protobuf::CreateDomainStmt {
     }
 }
 
-impl Equal for protobuf::CreateOpClassStmt {
+impl Equal for ast::CreateOpClassStmt {
     fn equal(&self, other: &Self) -> bool {
         self.opclassname.equal(&other.opclassname)
             && self.opfamilyname.equal(&other.opfamilyname)
@@ -5913,7 +5887,7 @@ impl Equal for protobuf::CreateOpClassStmt {
     }
 }
 
-impl Equal for protobuf::CreateOpClassItem {
+impl Equal for ast::CreateOpClassItem {
     fn equal(&self, other: &Self) -> bool {
         self.itemtype.equal(&other.itemtype)
             && self.name.equal(&other.name)
@@ -5935,7 +5909,7 @@ impl Equal for protobuf::CreateOpClassItem {
     }
 }
 
-impl Equal for protobuf::CreateOpFamilyStmt {
+impl Equal for ast::CreateOpFamilyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.opfamilyname.equal(&other.opfamilyname) && self.amname.equal(&other.amname)
     }
@@ -5948,7 +5922,7 @@ impl Equal for protobuf::CreateOpFamilyStmt {
     }
 }
 
-impl Equal for protobuf::AlterOpFamilyStmt {
+impl Equal for ast::AlterOpFamilyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.opfamilyname.equal(&other.opfamilyname)
             && self.amname.equal(&other.amname)
@@ -5966,7 +5940,7 @@ impl Equal for protobuf::AlterOpFamilyStmt {
     }
 }
 
-impl Equal for protobuf::DropStmt {
+impl Equal for ast::DropStmt {
     fn equal(&self, other: &Self) -> bool {
         self.objects.equal(&other.objects)
             && self.remove_type.equal(&other.remove_type)
@@ -5986,7 +5960,7 @@ impl Equal for protobuf::DropStmt {
     }
 }
 
-impl Equal for protobuf::TruncateStmt {
+impl Equal for ast::TruncateStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relations.equal(&other.relations)
             && self.restart_seqs.equal(&other.restart_seqs)
@@ -6002,7 +5976,7 @@ impl Equal for protobuf::TruncateStmt {
     }
 }
 
-impl Equal for protobuf::CommentStmt {
+impl Equal for ast::CommentStmt {
     fn equal(&self, other: &Self) -> bool {
         self.objtype.equal(&other.objtype)
             && self.object.equal(&other.object)
@@ -6018,7 +5992,7 @@ impl Equal for protobuf::CommentStmt {
     }
 }
 
-impl Equal for protobuf::SecLabelStmt {
+impl Equal for ast::SecLabelStmt {
     fn equal(&self, other: &Self) -> bool {
         self.objtype.equal(&other.objtype)
             && self.object.equal(&other.object)
@@ -6036,7 +6010,7 @@ impl Equal for protobuf::SecLabelStmt {
     }
 }
 
-impl Equal for protobuf::DeclareCursorStmt {
+impl Equal for ast::DeclareCursorStmt {
     fn equal(&self, other: &Self) -> bool {
         self.portalname.equal(&other.portalname)
             && self.options.equal(&other.options)
@@ -6052,7 +6026,7 @@ impl Equal for protobuf::DeclareCursorStmt {
     }
 }
 
-impl Equal for protobuf::ClosePortalStmt {
+impl Equal for ast::ClosePortalStmt {
     fn equal(&self, other: &Self) -> bool {
         self.portalname.equal(&other.portalname)
     }
@@ -6064,7 +6038,7 @@ impl Equal for protobuf::ClosePortalStmt {
     }
 }
 
-impl Equal for protobuf::FetchStmt {
+impl Equal for ast::FetchStmt {
     fn equal(&self, other: &Self) -> bool {
         self.direction.equal(&other.direction)
             && self.how_many.equal(&other.how_many)
@@ -6082,7 +6056,7 @@ impl Equal for protobuf::FetchStmt {
     }
 }
 
-impl Equal for protobuf::IndexStmt {
+impl Equal for ast::IndexStmt {
     fn equal(&self, other: &Self) -> bool {
         self.idxname.equal(&other.idxname)
             && self.relation.equal(&other.relation)
@@ -6146,7 +6120,7 @@ impl Equal for protobuf::IndexStmt {
     }
 }
 
-impl Equal for protobuf::CreateStatsStmt {
+impl Equal for ast::CreateStatsStmt {
     fn equal(&self, other: &Self) -> bool {
         self.defnames.equal(&other.defnames)
             && self.stat_types.equal(&other.stat_types)
@@ -6172,7 +6146,7 @@ impl Equal for protobuf::CreateStatsStmt {
     }
 }
 
-impl Equal for protobuf::StatsElem {
+impl Equal for ast::StatsElem {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name) && self.expr.equal(&other.expr)
     }
@@ -6185,7 +6159,7 @@ impl Equal for protobuf::StatsElem {
     }
 }
 
-impl Equal for protobuf::AlterStatsStmt {
+impl Equal for ast::AlterStatsStmt {
     fn equal(&self, other: &Self) -> bool {
         self.defnames.equal(&other.defnames)
             && self.stxstattarget.equal(&other.stxstattarget)
@@ -6201,7 +6175,7 @@ impl Equal for protobuf::AlterStatsStmt {
     }
 }
 
-impl Equal for protobuf::CreateFunctionStmt {
+impl Equal for ast::CreateFunctionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.is_procedure.equal(&other.is_procedure)
             && self.replace.equal(&other.replace)
@@ -6225,7 +6199,7 @@ impl Equal for protobuf::CreateFunctionStmt {
     }
 }
 
-impl Equal for protobuf::FunctionParameter {
+impl Equal for ast::FunctionParameter {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.arg_type.equal(&other.arg_type)
@@ -6243,7 +6217,7 @@ impl Equal for protobuf::FunctionParameter {
     }
 }
 
-impl Equal for protobuf::AlterFunctionStmt {
+impl Equal for ast::AlterFunctionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.objtype.equal(&other.objtype)
             && self.func.equal(&other.func)
@@ -6259,7 +6233,7 @@ impl Equal for protobuf::AlterFunctionStmt {
     }
 }
 
-impl Equal for protobuf::DoStmt {
+impl Equal for ast::DoStmt {
     fn equal(&self, other: &Self) -> bool {
         self.args.equal(&other.args)
     }
@@ -6271,7 +6245,7 @@ impl Equal for protobuf::DoStmt {
     }
 }
 
-impl Equal for protobuf::InlineCodeBlock {
+impl Equal for ast::InlineCodeBlock {
     fn equal(&self, other: &Self) -> bool {
         self.source_text.equal(&other.source_text)
             && self.lang_oid.equal(&other.lang_oid)
@@ -6289,7 +6263,7 @@ impl Equal for protobuf::InlineCodeBlock {
     }
 }
 
-impl Equal for protobuf::CallStmt {
+impl Equal for ast::CallStmt {
     fn equal(&self, other: &Self) -> bool {
         self.funccall.equal(&other.funccall)
             && self.funcexpr.equal(&other.funcexpr)
@@ -6305,7 +6279,7 @@ impl Equal for protobuf::CallStmt {
     }
 }
 
-impl Equal for protobuf::CallContext {
+impl Equal for ast::CallContext {
     fn equal(&self, other: &Self) -> bool {
         self.atomic.equal(&other.atomic)
     }
@@ -6317,7 +6291,7 @@ impl Equal for protobuf::CallContext {
     }
 }
 
-impl Equal for protobuf::RenameStmt {
+impl Equal for ast::RenameStmt {
     fn equal(&self, other: &Self) -> bool {
         self.rename_type.equal(&other.rename_type)
             && self.relation_type.equal(&other.relation_type)
@@ -6343,7 +6317,7 @@ impl Equal for protobuf::RenameStmt {
     }
 }
 
-impl Equal for protobuf::AlterObjectDependsStmt {
+impl Equal for ast::AlterObjectDependsStmt {
     fn equal(&self, other: &Self) -> bool {
         self.object_type.equal(&other.object_type)
             && self.relation.equal(&other.relation)
@@ -6363,7 +6337,7 @@ impl Equal for protobuf::AlterObjectDependsStmt {
     }
 }
 
-impl Equal for protobuf::AlterObjectSchemaStmt {
+impl Equal for ast::AlterObjectSchemaStmt {
     fn equal(&self, other: &Self) -> bool {
         self.object_type.equal(&other.object_type)
             && self.relation.equal(&other.relation)
@@ -6383,7 +6357,7 @@ impl Equal for protobuf::AlterObjectSchemaStmt {
     }
 }
 
-impl Equal for protobuf::AlterOwnerStmt {
+impl Equal for ast::AlterOwnerStmt {
     fn equal(&self, other: &Self) -> bool {
         self.object_type.equal(&other.object_type)
             && self.relation.equal(&other.relation)
@@ -6401,7 +6375,7 @@ impl Equal for protobuf::AlterOwnerStmt {
     }
 }
 
-impl Equal for protobuf::AlterOperatorStmt {
+impl Equal for ast::AlterOperatorStmt {
     fn equal(&self, other: &Self) -> bool {
         self.opername.equal(&other.opername) && self.options.equal(&other.options)
     }
@@ -6414,7 +6388,7 @@ impl Equal for protobuf::AlterOperatorStmt {
     }
 }
 
-impl Equal for protobuf::AlterTypeStmt {
+impl Equal for ast::AlterTypeStmt {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.options.equal(&other.options)
     }
@@ -6427,7 +6401,7 @@ impl Equal for protobuf::AlterTypeStmt {
     }
 }
 
-impl Equal for protobuf::RuleStmt {
+impl Equal for ast::RuleStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.rulename.equal(&other.rulename)
@@ -6451,7 +6425,7 @@ impl Equal for protobuf::RuleStmt {
     }
 }
 
-impl Equal for protobuf::NotifyStmt {
+impl Equal for ast::NotifyStmt {
     fn equal(&self, other: &Self) -> bool {
         self.conditionname.equal(&other.conditionname) && self.payload.equal(&other.payload)
     }
@@ -6464,7 +6438,7 @@ impl Equal for protobuf::NotifyStmt {
     }
 }
 
-impl Equal for protobuf::ListenStmt {
+impl Equal for ast::ListenStmt {
     fn equal(&self, other: &Self) -> bool {
         self.conditionname.equal(&other.conditionname)
     }
@@ -6476,7 +6450,7 @@ impl Equal for protobuf::ListenStmt {
     }
 }
 
-impl Equal for protobuf::UnlistenStmt {
+impl Equal for ast::UnlistenStmt {
     fn equal(&self, other: &Self) -> bool {
         self.conditionname.equal(&other.conditionname)
     }
@@ -6488,7 +6462,7 @@ impl Equal for protobuf::UnlistenStmt {
     }
 }
 
-impl Equal for protobuf::TransactionStmt {
+impl Equal for ast::TransactionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.options.equal(&other.options)
@@ -6508,7 +6482,7 @@ impl Equal for protobuf::TransactionStmt {
     }
 }
 
-impl Equal for protobuf::CompositeTypeStmt {
+impl Equal for ast::CompositeTypeStmt {
     fn equal(&self, other: &Self) -> bool {
         self.typevar.equal(&other.typevar) && self.coldeflist.equal(&other.coldeflist)
     }
@@ -6521,7 +6495,7 @@ impl Equal for protobuf::CompositeTypeStmt {
     }
 }
 
-impl Equal for protobuf::CreateEnumStmt {
+impl Equal for ast::CreateEnumStmt {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.vals.equal(&other.vals)
     }
@@ -6534,7 +6508,7 @@ impl Equal for protobuf::CreateEnumStmt {
     }
 }
 
-impl Equal for protobuf::CreateRangeStmt {
+impl Equal for ast::CreateRangeStmt {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name) && self.params.equal(&other.params)
     }
@@ -6547,7 +6521,7 @@ impl Equal for protobuf::CreateRangeStmt {
     }
 }
 
-impl Equal for protobuf::AlterEnumStmt {
+impl Equal for ast::AlterEnumStmt {
     fn equal(&self, other: &Self) -> bool {
         self.type_name.equal(&other.type_name)
             && self.old_val.equal(&other.old_val)
@@ -6571,7 +6545,7 @@ impl Equal for protobuf::AlterEnumStmt {
     }
 }
 
-impl Equal for protobuf::ViewStmt {
+impl Equal for ast::ViewStmt {
     fn equal(&self, other: &Self) -> bool {
         self.view.equal(&other.view)
             && self.aliases.equal(&other.aliases)
@@ -6593,7 +6567,7 @@ impl Equal for protobuf::ViewStmt {
     }
 }
 
-impl Equal for protobuf::LoadStmt {
+impl Equal for ast::LoadStmt {
     fn equal(&self, other: &Self) -> bool {
         self.filename.equal(&other.filename)
     }
@@ -6605,7 +6579,7 @@ impl Equal for protobuf::LoadStmt {
     }
 }
 
-impl Equal for protobuf::CreatedbStmt {
+impl Equal for ast::CreatedbStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname) && self.options.equal(&other.options)
     }
@@ -6618,7 +6592,7 @@ impl Equal for protobuf::CreatedbStmt {
     }
 }
 
-impl Equal for protobuf::AlterDatabaseStmt {
+impl Equal for ast::AlterDatabaseStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname) && self.options.equal(&other.options)
     }
@@ -6631,7 +6605,7 @@ impl Equal for protobuf::AlterDatabaseStmt {
     }
 }
 
-impl Equal for protobuf::AlterDatabaseRefreshCollStmt {
+impl Equal for ast::AlterDatabaseRefreshCollStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname)
     }
@@ -6643,7 +6617,7 @@ impl Equal for protobuf::AlterDatabaseRefreshCollStmt {
     }
 }
 
-impl Equal for protobuf::AlterDatabaseSetStmt {
+impl Equal for ast::AlterDatabaseSetStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname) && self.setstmt.equal(&other.setstmt)
     }
@@ -6656,7 +6630,7 @@ impl Equal for protobuf::AlterDatabaseSetStmt {
     }
 }
 
-impl Equal for protobuf::DropdbStmt {
+impl Equal for ast::DropdbStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dbname.equal(&other.dbname)
             && self.missing_ok.equal(&other.missing_ok)
@@ -6672,7 +6646,7 @@ impl Equal for protobuf::DropdbStmt {
     }
 }
 
-impl Equal for protobuf::AlterSystemStmt {
+impl Equal for ast::AlterSystemStmt {
     fn equal(&self, other: &Self) -> bool {
         self.setstmt.equal(&other.setstmt)
     }
@@ -6684,7 +6658,7 @@ impl Equal for protobuf::AlterSystemStmt {
     }
 }
 
-impl Equal for protobuf::ClusterStmt {
+impl Equal for ast::ClusterStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.indexname.equal(&other.indexname)
@@ -6700,7 +6674,7 @@ impl Equal for protobuf::ClusterStmt {
     }
 }
 
-impl Equal for protobuf::VacuumStmt {
+impl Equal for ast::VacuumStmt {
     fn equal(&self, other: &Self) -> bool {
         self.options.equal(&other.options)
             && self.rels.equal(&other.rels)
@@ -6716,7 +6690,7 @@ impl Equal for protobuf::VacuumStmt {
     }
 }
 
-impl Equal for protobuf::VacuumRelation {
+impl Equal for ast::VacuumRelation {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.oid.equal(&other.oid)
@@ -6732,7 +6706,7 @@ impl Equal for protobuf::VacuumRelation {
     }
 }
 
-impl Equal for protobuf::ExplainStmt {
+impl Equal for ast::ExplainStmt {
     fn equal(&self, other: &Self) -> bool {
         self.query.equal(&other.query) && self.options.equal(&other.options)
     }
@@ -6745,7 +6719,7 @@ impl Equal for protobuf::ExplainStmt {
     }
 }
 
-impl Equal for protobuf::CreateTableAsStmt {
+impl Equal for ast::CreateTableAsStmt {
     fn equal(&self, other: &Self) -> bool {
         self.query.equal(&other.query)
             && self.into.equal(&other.into)
@@ -6765,7 +6739,7 @@ impl Equal for protobuf::CreateTableAsStmt {
     }
 }
 
-impl Equal for protobuf::RefreshMatViewStmt {
+impl Equal for ast::RefreshMatViewStmt {
     fn equal(&self, other: &Self) -> bool {
         self.concurrent.equal(&other.concurrent)
             && self.skip_data.equal(&other.skip_data)
@@ -6781,7 +6755,7 @@ impl Equal for protobuf::RefreshMatViewStmt {
     }
 }
 
-impl Equal for protobuf::CheckPointStmt {
+impl Equal for ast::CheckPointStmt {
     fn equal(&self, other: &Self) -> bool {
         true
     }
@@ -6792,7 +6766,7 @@ impl Equal for protobuf::CheckPointStmt {
     }
 }
 
-impl Equal for protobuf::DiscardStmt {
+impl Equal for ast::DiscardStmt {
     fn equal(&self, other: &Self) -> bool {
         self.target.equal(&other.target)
     }
@@ -6804,7 +6778,7 @@ impl Equal for protobuf::DiscardStmt {
     }
 }
 
-impl Equal for protobuf::LockStmt {
+impl Equal for ast::LockStmt {
     fn equal(&self, other: &Self) -> bool {
         self.relations.equal(&other.relations)
             && self.mode.equal(&other.mode)
@@ -6820,7 +6794,7 @@ impl Equal for protobuf::LockStmt {
     }
 }
 
-impl Equal for protobuf::ConstraintsSetStmt {
+impl Equal for ast::ConstraintsSetStmt {
     fn equal(&self, other: &Self) -> bool {
         self.constraints.equal(&other.constraints) && self.deferred.equal(&other.deferred)
     }
@@ -6833,7 +6807,7 @@ impl Equal for protobuf::ConstraintsSetStmt {
     }
 }
 
-impl Equal for protobuf::ReindexStmt {
+impl Equal for ast::ReindexStmt {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.relation.equal(&other.relation)
@@ -6851,7 +6825,7 @@ impl Equal for protobuf::ReindexStmt {
     }
 }
 
-impl Equal for protobuf::CreateConversionStmt {
+impl Equal for ast::CreateConversionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.conversion_name.equal(&other.conversion_name)
             && self.for_encoding_name.equal(&other.for_encoding_name)
@@ -6871,7 +6845,7 @@ impl Equal for protobuf::CreateConversionStmt {
     }
 }
 
-impl Equal for protobuf::CreateCastStmt {
+impl Equal for ast::CreateCastStmt {
     fn equal(&self, other: &Self) -> bool {
         self.sourcetype.equal(&other.sourcetype)
             && self.targettype.equal(&other.targettype)
@@ -6891,7 +6865,7 @@ impl Equal for protobuf::CreateCastStmt {
     }
 }
 
-impl Equal for protobuf::CreateTransformStmt {
+impl Equal for ast::CreateTransformStmt {
     fn equal(&self, other: &Self) -> bool {
         self.replace.equal(&other.replace)
             && self.type_name.equal(&other.type_name)
@@ -6911,7 +6885,7 @@ impl Equal for protobuf::CreateTransformStmt {
     }
 }
 
-impl Equal for protobuf::PrepareStmt {
+impl Equal for ast::PrepareStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name)
             && self.argtypes.equal(&other.argtypes)
@@ -6927,7 +6901,7 @@ impl Equal for protobuf::PrepareStmt {
     }
 }
 
-impl Equal for protobuf::ExecuteStmt {
+impl Equal for ast::ExecuteStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name) && self.params.equal(&other.params)
     }
@@ -6940,7 +6914,7 @@ impl Equal for protobuf::ExecuteStmt {
     }
 }
 
-impl Equal for protobuf::DeallocateStmt {
+impl Equal for ast::DeallocateStmt {
     fn equal(&self, other: &Self) -> bool {
         self.name.equal(&other.name) && self.isall.equal(&other.isall)
     }
@@ -6953,7 +6927,7 @@ impl Equal for protobuf::DeallocateStmt {
     }
 }
 
-impl Equal for protobuf::DropOwnedStmt {
+impl Equal for ast::DropOwnedStmt {
     fn equal(&self, other: &Self) -> bool {
         self.roles.equal(&other.roles) && self.behavior.equal(&other.behavior)
     }
@@ -6966,7 +6940,7 @@ impl Equal for protobuf::DropOwnedStmt {
     }
 }
 
-impl Equal for protobuf::ReassignOwnedStmt {
+impl Equal for ast::ReassignOwnedStmt {
     fn equal(&self, other: &Self) -> bool {
         self.roles.equal(&other.roles) && self.newrole.equal(&other.newrole)
     }
@@ -6979,7 +6953,7 @@ impl Equal for protobuf::ReassignOwnedStmt {
     }
 }
 
-impl Equal for protobuf::AlterTsDictionaryStmt {
+impl Equal for ast::AlterTsDictionaryStmt {
     fn equal(&self, other: &Self) -> bool {
         self.dictname.equal(&other.dictname) && self.options.equal(&other.options)
     }
@@ -6992,7 +6966,7 @@ impl Equal for protobuf::AlterTsDictionaryStmt {
     }
 }
 
-impl Equal for protobuf::AlterTsConfigurationStmt {
+impl Equal for ast::AlterTsConfigurationStmt {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.cfgname.equal(&other.cfgname)
@@ -7016,7 +6990,7 @@ impl Equal for protobuf::AlterTsConfigurationStmt {
     }
 }
 
-impl Equal for protobuf::PublicationTable {
+impl Equal for ast::PublicationTable {
     fn equal(&self, other: &Self) -> bool {
         self.relation.equal(&other.relation)
             && self.where_clause.equal(&other.where_clause)
@@ -7032,7 +7006,7 @@ impl Equal for protobuf::PublicationTable {
     }
 }
 
-impl Equal for protobuf::PublicationObjSpec {
+impl Equal for ast::PublicationObjSpec {
     fn equal(&self, other: &Self) -> bool {
         self.pubobjtype.equal(&other.pubobjtype)
             && self.name.equal(&other.name)
@@ -7048,7 +7022,7 @@ impl Equal for protobuf::PublicationObjSpec {
     }
 }
 
-impl Equal for protobuf::CreatePublicationStmt {
+impl Equal for ast::CreatePublicationStmt {
     fn equal(&self, other: &Self) -> bool {
         self.pubname.equal(&other.pubname)
             && self.options.equal(&other.options)
@@ -7066,7 +7040,7 @@ impl Equal for protobuf::CreatePublicationStmt {
     }
 }
 
-impl Equal for protobuf::AlterPublicationStmt {
+impl Equal for ast::AlterPublicationStmt {
     fn equal(&self, other: &Self) -> bool {
         self.pubname.equal(&other.pubname)
             && self.options.equal(&other.options)
@@ -7086,7 +7060,7 @@ impl Equal for protobuf::AlterPublicationStmt {
     }
 }
 
-impl Equal for protobuf::CreateSubscriptionStmt {
+impl Equal for ast::CreateSubscriptionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.subname.equal(&other.subname)
             && self.conninfo.equal(&other.conninfo)
@@ -7104,7 +7078,7 @@ impl Equal for protobuf::CreateSubscriptionStmt {
     }
 }
 
-impl Equal for protobuf::AlterSubscriptionStmt {
+impl Equal for ast::AlterSubscriptionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.subname.equal(&other.subname)
@@ -7124,7 +7098,7 @@ impl Equal for protobuf::AlterSubscriptionStmt {
     }
 }
 
-impl Equal for protobuf::DropSubscriptionStmt {
+impl Equal for ast::DropSubscriptionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.subname.equal(&other.subname)
             && self.missing_ok.equal(&other.missing_ok)
@@ -7140,7 +7114,7 @@ impl Equal for protobuf::DropSubscriptionStmt {
     }
 }
 
-impl Equal for protobuf::ScanToken {
+impl Equal for ast::ScanToken {
     fn equal(&self, other: &Self) -> bool {
         self.start.equal(&other.start)
             && self.end.equal(&other.end)

@@ -8,7 +8,7 @@
 //! OLD column reference standing in as a typed NULL. The rewriter's checks
 //! on an action run when a statement fires the rule, as in PG.
 
-use typedpg_pg_query::protobuf::{CmdType, RuleStmt, node};
+use typedpg_pg_query::ast::{self, CmdType, RuleStmt};
 
 use super::DdlError;
 use crate::oid::PgClassOid;
@@ -81,7 +81,7 @@ fn define_rule(
     };
     let (_, relid) = super::util::lookup_table(interp, rv)?;
     let relkind = interp.pg_class.get(&relid).map(|c| c.relkind);
-    let event = CmdType::try_from(stmt.event).unwrap_or(CmdType::Undefined);
+    let event = stmt.event;
     match relkind {
         Some(RelKind::MaterializedView) => {
             return Err(DdlError::UnsupportedDdl(
@@ -122,8 +122,8 @@ fn define_rule(
     // In the WHERE condition the missing one is an invisible range entry
     // (errorMissingRTE); in an action, transformRuleStmt names the event.
     let pseudo_refs =
-        |n: &typedpg_pg_query::protobuf::Node, in_qual: bool| -> Result<(), DdlError> {
-            let Some(inner) = n.node.as_ref() else {
+        |n: &Option<typedpg_pg_query::ast::Node>, in_qual: bool| -> Result<(), DdlError> {
+            let Some(inner) = n.as_ref() else {
                 return Ok(());
             };
             for (node, ..) in inner.nodes() {
@@ -151,7 +151,8 @@ fn define_rule(
             }
             Ok(())
         };
-    if let Some(qual) = stmt.where_clause.as_deref() {
+    if stmt.where_clause.is_some() {
+        let qual = &stmt.where_clause;
         pseudo_refs(qual, true)?;
         let (checked, refs) =
             super::depend::collect(|| check_rule_qual(interp, relid, qual, has_old, has_new));
@@ -177,8 +178,7 @@ fn define_rule(
         actions.extend(rewrites);
         // transformRuleStmt: a conditional rule's action must be a query
         // (the condition is added to it); NOTIFY is a utility statement.
-        if stmt.where_clause.is_some()
-            && matches!(action.node.as_ref(), Some(node::Node::NotifyStmt(_)))
+        if stmt.where_clause.is_some() && matches!(action.as_ref(), Some(ast::Node::NotifyStmt(_)))
         {
             return Err(DdlError::UnsupportedDdl(
                 "rules with WHERE conditions can only have SELECT, INSERT, UPDATE, or DELETE \
@@ -192,7 +192,7 @@ fn define_rule(
     if event == CmdType::CmdSelect {
         // CREATE OR REPLACE RULE "_RETURN": the view's new query, producing
         // the same columns.
-        let view = typedpg_pg_query::protobuf::RangeVar {
+        let view = typedpg_pg_query::ast::RangeVar {
             schemaname: interp
                 .pg_class
                 .get(&relid)
@@ -206,9 +206,9 @@ fn define_rule(
         };
         return super::views::create_view(
             interp,
-            &typedpg_pg_query::protobuf::ViewStmt {
-                view: Some(view),
-                query: stmt.actions.first().cloned().map(Box::new),
+            &typedpg_pg_query::ast::ViewStmt {
+                view: Some(view.into()),
+                query: stmt.actions.first().cloned().flatten(),
                 replace: true,
                 ..Default::default()
             },
@@ -216,16 +216,16 @@ fn define_rule(
     }
 
     let relname = rv.relname.clone();
-    let returning = stmt.actions.iter().any(|a| match a.node.as_ref() {
-        Some(node::Node::InsertStmt(s)) => s
+    let returning = stmt.actions.iter().any(|a| match a.as_ref() {
+        Some(ast::Node::InsertStmt(s)) => s
             .returning_clause
             .as_ref()
             .is_some_and(|r| !r.exprs.is_empty()),
-        Some(node::Node::UpdateStmt(s)) => s
+        Some(ast::Node::UpdateStmt(s)) => s
             .returning_clause
             .as_ref()
             .is_some_and(|r| !r.exprs.is_empty()),
-        Some(node::Node::DeleteStmt(s)) => s
+        Some(ast::Node::DeleteStmt(s)) => s
             .returning_clause
             .as_ref()
             .is_some_and(|r| !r.exprs.is_empty()),
@@ -244,11 +244,11 @@ fn define_rule(
         action_cmds: stmt
             .actions
             .iter()
-            .map(|a| match a.node.as_ref() {
-                Some(node::Node::SelectStmt(_)) => CmdType::CmdSelect,
-                Some(node::Node::InsertStmt(_)) => CmdType::CmdInsert,
-                Some(node::Node::UpdateStmt(_)) => CmdType::CmdUpdate,
-                Some(node::Node::DeleteStmt(_)) => CmdType::CmdDelete,
+            .map(|a| match a.as_ref() {
+                Some(ast::Node::SelectStmt(_)) => CmdType::CmdSelect,
+                Some(ast::Node::InsertStmt(_)) => CmdType::CmdInsert,
+                Some(ast::Node::UpdateStmt(_)) => CmdType::CmdUpdate,
+                Some(ast::Node::DeleteStmt(_)) => CmdType::CmdDelete,
                 _ => CmdType::CmdUtility,
             })
             .collect(),
@@ -311,7 +311,7 @@ fn define_query_rewrite(
         let [action] = stmt.actions.as_slice() else {
             return unsupported("multiple actions for rules on SELECT are not implemented");
         };
-        let Some(node::Node::SelectStmt(select)) = action.node.as_ref() else {
+        let Some(ast::Node::SelectStmt(select)) = action.as_ref() else {
             return unsupported("rules on SELECT must have action INSTEAD SELECT");
         };
         if !stmt.instead {
@@ -319,10 +319,10 @@ fn define_query_rewrite(
         }
         let modifying_cte = select.with_clause.as_ref().is_some_and(|w| {
             w.ctes.iter().any(|cte| {
-                matches!(cte.node.as_ref(), Some(node::Node::CommonTableExpr(c))
-                    if matches!(c.ctequery.as_deref().and_then(|q| q.node.as_ref()),
-                        Some(node::Node::InsertStmt(_) | node::Node::UpdateStmt(_)
-                            | node::Node::DeleteStmt(_) | node::Node::MergeStmt(_))))
+                matches!(cte.as_ref(), Some(ast::Node::CommonTableExpr(c))
+                    if matches!(c.ctequery.as_ref(),
+                        Some(ast::Node::InsertStmt(_) | ast::Node::UpdateStmt(_)
+                            | ast::Node::DeleteStmt(_) | ast::Node::MergeStmt(_))))
             })
         });
         if modifying_cte {
@@ -375,12 +375,12 @@ fn define_query_rewrite(
 }
 
 /// The action has a RETURNING list.
-fn has_returning(action: &typedpg_pg_query::protobuf::Node) -> bool {
-    let returning = match action.node.as_ref() {
-        Some(node::Node::InsertStmt(s)) => s.returning_clause.as_ref(),
-        Some(node::Node::UpdateStmt(s)) => s.returning_clause.as_ref(),
-        Some(node::Node::DeleteStmt(s)) => s.returning_clause.as_ref(),
-        Some(node::Node::MergeStmt(s)) => s.returning_clause.as_ref(),
+fn has_returning(action: &Option<typedpg_pg_query::ast::Node>) -> bool {
+    let returning = match action.as_ref() {
+        Some(ast::Node::InsertStmt(s)) => s.returning_clause.as_ref(),
+        Some(ast::Node::UpdateStmt(s)) => s.returning_clause.as_ref(),
+        Some(ast::Node::DeleteStmt(s)) => s.returning_clause.as_ref(),
+        Some(ast::Node::MergeStmt(s)) => s.returning_clause.as_ref(),
         _ => None,
     };
     returning.is_some_and(|r| !r.exprs.is_empty())
@@ -453,7 +453,7 @@ fn check_rule_result_list(
 fn check_rule_qual(
     interp: &PgCatalog,
     relid: PgClassOid,
-    qual: &typedpg_pg_query::protobuf::Node,
+    qual: &Option<typedpg_pg_query::ast::Node>,
     has_old: bool,
     has_new: bool,
 ) -> Result<(), DdlError> {
@@ -509,9 +509,9 @@ fn check_rule_qual(
 /// defined by the action don't count.
 fn check_action_relations(
     interp: &PgCatalog,
-    action: &typedpg_pg_query::protobuf::Node,
+    action: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
-    let Some(inner) = action.node.as_ref() else {
+    let Some(inner) = action.as_ref() else {
         return Ok(());
     };
     let nodes = inner.nodes();
@@ -542,19 +542,19 @@ fn check_action_relations(
 fn check_action_query(
     interp: &PgCatalog,
     relid: PgClassOid,
-    action: &typedpg_pg_query::protobuf::Node,
+    action: &Option<typedpg_pg_query::ast::Node>,
     has_old: bool,
     has_new: bool,
 ) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
-    let Some(inner) = action.node.as_ref() else {
+    let Some(inner) = action.as_ref() else {
         return Ok(None);
     };
     if !matches!(
         inner,
-        node::Node::SelectStmt(_)
-            | node::Node::InsertStmt(_)
-            | node::Node::UpdateStmt(_)
-            | node::Node::DeleteStmt(_)
+        ast::Node::SelectStmt(_)
+            | ast::Node::InsertStmt(_)
+            | ast::Node::UpdateStmt(_)
+            | ast::Node::DeleteStmt(_)
     ) {
         return Ok(None);
     }
@@ -585,15 +585,15 @@ fn check_action_query(
 fn action_plan_error(
     interp: &PgCatalog,
     relid: PgClassOid,
-    action: &typedpg_pg_query::protobuf::Node,
+    action: &Option<typedpg_pg_query::ast::Node>,
     has_old: bool,
     has_new: bool,
 ) -> Option<ActionPlanError> {
-    let target = match action.node.as_ref()? {
-        node::Node::SelectStmt(_) => None,
-        node::Node::InsertStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdInsert)),
-        node::Node::UpdateStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdUpdate)),
-        node::Node::DeleteStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdDelete)),
+    let target = match action.as_ref()? {
+        ast::Node::SelectStmt(_) => None,
+        ast::Node::InsertStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdInsert)),
+        ast::Node::UpdateStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdUpdate)),
+        ast::Node::DeleteStmt(s) => Some((s.relation.as_ref()?, CmdType::CmdDelete)),
         _ => return None,
     };
     let target = match target {
@@ -614,10 +614,10 @@ fn action_plan_error(
 /// `DROP RULE [IF EXISTS] name ON table`.
 pub(crate) fn drop_rule(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
         return Ok(());
     };
     let parts: Vec<String> = list
@@ -629,7 +629,7 @@ pub(crate) fn drop_rule(
     let Some((name, rel)) = parts.split_last() else {
         return Ok(());
     };
-    let rv = typedpg_pg_query::protobuf::RangeVar {
+    let rv = typedpg_pg_query::ast::RangeVar {
         schemaname: if rel.len() == 2 {
             rel[0].clone()
         } else {
@@ -678,7 +678,7 @@ pub(crate) fn drop_rule(
 /// `ALTER RULE name ON table RENAME TO new` (RenameRewriteRule).
 pub(crate) fn rename_rule(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());

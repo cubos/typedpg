@@ -25,7 +25,7 @@
 //!      (INSERT/UPDATE/DELETE with RETURNING) — mistypes deliberately allowed,
 //!      and `$pN` parameters threaded through typed contexts;
 //!   2. an **AST mutator** that parses a seed with `typedpg_pg_query`, tweaks leaf
-//!      nodes in the protobuf tree (constants, column refs, operators,
+//!      nodes in the AST (constants, column refs, operators,
 //!      function names, cast targets), and prints the tree back to SQL with a
 //!      small printer (`printer.rs`) — which keeps
 //!      the output syntactically plausible while perturbing types; and
@@ -78,8 +78,7 @@ use typedpg_analyzer::{
     AnalyzedQuery, Divergence, DivergenceKind, PgCatalog, PgTypeOid, ProKind, QualifiedName,
     TypType, Type,
 };
-use typedpg_pg_query::NodeEnum;
-use typedpg_pg_query::protobuf::{self, a_const};
+use typedpg_pg_query::ast::Node;
 
 mod generators;
 mod minimize;
@@ -383,14 +382,14 @@ fn round_trip(sql: &str) -> RoundTrip {
     let Ok(parsed) = typedpg_pg_query::parse(sql) else {
         return RoundTrip::Unparseable;
     };
-    let Some(printed) = printer::print(&parsed.protobuf) else {
+    let Some(printed) = printer::print(&parsed.tree) else {
         return RoundTrip::Unprinted;
     };
     let reparsed = typedpg_pg_query::parse(&printed).unwrap_or_else(|e| {
         panic!("printer output does not parse: {printed}\n  from: {sql}\n  {e}")
     });
     assert!(
-        parsed.protobuf.equal(&reparsed.protobuf),
+        parsed.tree.equal(&reparsed.tree),
         "printer output reparses to a different tree:\n  from: {sql}\n  printed: {printed}"
     );
     RoundTrip::Equal
@@ -463,7 +462,7 @@ fn printer_round_trips_trees() {
             let mut parsed = typedpg_pg_query::parse(&positional).expect("a seed parses");
             // SAFETY: as in `mutate`: the pointers stay valid while `parsed`
             // is not moved, and no reference is held across the mutations.
-            let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.protobuf.nodes_mut() }
+            let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.tree.nodes_mut() }
                 .into_iter()
                 .map(|(node, _)| node)
                 .collect();
@@ -472,13 +471,13 @@ fn printer_round_trips_trees() {
                 let idx = rng.random_range(0..nodes.len());
                 apply_mutation(nodes[idx], &mut rng);
             }
-            match printer::print(&parsed.protobuf) {
+            match printer::print(&parsed.tree) {
                 Some(printed) => {
                     let reparsed = typedpg_pg_query::parse(&printed).unwrap_or_else(|e| {
                         panic!("mutated tree prints to SQL that does not parse: {printed}\n  {e}")
                     });
                     assert!(
-                        parsed.protobuf.equal(&reparsed.protobuf),
+                        parsed.tree.equal(&reparsed.tree),
                         "a mutated tree reprinted to a different tree: {printed}"
                     );
                     mutated += 1;

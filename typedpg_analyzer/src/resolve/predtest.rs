@@ -18,7 +18,8 @@
 //!
 //! Anything else is not proven, so the index doesn't qualify.
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 use super::node_fingerprint;
 use crate::coerce::{CoercionContext, CoercionPath, coercion_pathway};
@@ -41,7 +42,7 @@ impl Types<'_> {
             .map(|a| a.atttypid)
     }
 
-    fn type_name(&self, tn: &protobuf::TypeName) -> Option<PgTypeOid> {
+    fn type_name(&self, tn: &ast::TypeName) -> Option<PgTypeOid> {
         crate::ddl::util::resolve_type_name(tn, self.snapshot)
     }
 
@@ -65,8 +66,8 @@ impl Types<'_> {
 /// `predicate` true whenever `clause` is? No predicate is always implied;
 /// a missing clause implies nothing else.
 pub(crate) fn predicate_implied_by(
-    predicate: Option<&protobuf::Node>,
-    clause: Option<&protobuf::Node>,
+    predicate: Option<&ast::Node>,
+    clause: Option<&ast::Node>,
     types: &Types,
 ) -> bool {
     let Some(predicate) = predicate else {
@@ -76,8 +77,8 @@ pub(crate) fn predicate_implied_by(
         return false;
     };
     implied_by_recurse(
-        &normalize(&unqualify(clause), types),
-        &normalize(&unqualify(predicate), types),
+        &normalize(&unqualify(Some(clause)), types),
+        &normalize(&unqualify(Some(predicate)), types),
     )
 }
 
@@ -88,33 +89,31 @@ const MAX_SAOP_ARRAY_SIZE: usize = 100;
 /// (ARRAY[...])` expanded into the OR / AND of `x op element` (as
 /// `predicate_classify` reads a ScalarArrayOpExpr), and each comparison
 /// typed ([`typed_comparison`]).
-fn normalize(n: &protobuf::Node, types: &Types) -> protobuf::Node {
-    use protobuf::AExprKind as K;
-    let Some(inner) = n.node.as_ref() else {
+fn normalize(n: &Option<ast::Node>, types: &Types) -> Option<ast::Node> {
+    use ast::AExprKind as K;
+    let Some(inner) = n.as_ref() else {
         return n.clone();
     };
     match inner {
-        node::Node::BoolExpr(b) => {
+        ast::Node::BoolExpr(b) => {
             let mut b = (**b).clone();
             b.args = b.args.iter().map(|a| normalize(a, types)).collect();
-            protobuf::Node {
-                node: Some(node::Node::BoolExpr(Box::new(b))),
-            }
+            Some(ast::Node::BoolExpr(NodeBox::new(b)))
         }
-        node::Node::AExpr(e) if matches!(e.kind(), K::AexprIn | K::AexprOpAny | K::AexprOpAll) => {
-            let elements = match (e.kind(), e.rexpr.as_deref().and_then(|r| r.node.as_ref())) {
-                (K::AexprIn, Some(node::Node::List(l))) => &l.items,
-                (K::AexprOpAny | K::AexprOpAll, Some(node::Node::AArrayExpr(a))) => &a.elements,
+        ast::Node::AExpr(e) if matches!(e.kind, K::AexprIn | K::AexprOpAny | K::AexprOpAll) => {
+            let elements = match (e.kind, e.rexpr.as_ref()) {
+                (K::AexprIn, Some(ast::Node::List(l))) => &l.items,
+                (K::AexprOpAny | K::AexprOpAll, Some(ast::Node::AArrayExpr(a))) => &a.elements,
                 _ => return n.clone(),
             };
-            let Some(x) = e.lexpr.as_deref() else {
+            let Some(x) = e.lexpr.as_ref() else {
                 return n.clone();
             };
             if elements.is_empty() || elements.len() > MAX_SAOP_ARRAY_SIZE {
                 return n.clone();
             }
             // `IN` is `= ANY`, `NOT IN` is `<> ALL`.
-            let any = match e.kind() {
+            let any = match e.kind {
                 K::AexprIn => matches!(
                     super::expr::extract_string_fields(&e.name).as_slice(),
                     [op] if op == "="
@@ -126,25 +125,23 @@ fn normalize(n: &protobuf::Node, types: &Types) -> protobuf::Node {
                 .iter()
                 .map(|el| {
                     let mut cmp = (**e).clone();
-                    cmp.set_kind(K::AexprOp);
-                    cmp.lexpr = Some(Box::new(x.clone()));
-                    cmp.rexpr = Some(Box::new(el.clone()));
+                    cmp.kind = K::AexprOp;
+                    cmp.lexpr = Some(x.clone());
+                    cmp.rexpr = el.clone();
                     typed_comparison(cmp, types)
                 })
                 .collect();
-            protobuf::Node {
-                node: Some(node::Node::BoolExpr(Box::new(protobuf::BoolExpr {
-                    boolop: if any {
-                        protobuf::BoolExprType::OrExpr
-                    } else {
-                        protobuf::BoolExprType::AndExpr
-                    } as i32,
-                    args,
-                    ..Default::default()
-                }))),
-            }
+            Some(ast::Node::BoolExpr(NodeBox::new(ast::BoolExpr {
+                boolop: if any {
+                    ast::BoolExprType::OrExpr
+                } else {
+                    ast::BoolExprType::AndExpr
+                },
+                args,
+                ..Default::default()
+            })))
         }
-        node::Node::AExpr(e) if e.kind() == K::AexprOp => typed_comparison((**e).clone(), types),
+        ast::Node::AExpr(e) if e.kind == K::AexprOp => typed_comparison((**e).clone(), types),
         _ => n.clone(),
     }
 }
@@ -155,15 +152,13 @@ fn normalize(n: &protobuf::Node, types: &Types) -> protobuf::Node {
 /// one), and a constant of that type a bare literal (`'x'::text` against a
 /// text operand — how pg_dump writes an index predicate — is `'x'`). Any
 /// operand whose type the raw AST doesn't tell leaves `e` as written.
-fn typed_comparison(mut e: protobuf::AExpr, types: &Types) -> protobuf::Node {
-    let unchanged = |e: protobuf::AExpr| protobuf::Node {
-        node: Some(node::Node::AExpr(Box::new(e))),
-    };
+fn typed_comparison(mut e: ast::AExpr, types: &Types) -> Option<ast::Node> {
+    let unchanged = |e: ast::AExpr| Some(ast::Node::AExpr(NodeBox::new(e)));
     let op = match super::expr::extract_string_fields(&e.name).as_slice() {
         [op] => op.clone(),
         _ => return unchanged(e),
     };
-    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+    let (Some(l), Some(r)) = (e.lexpr.as_ref(), e.rexpr.as_ref()) else {
         return unchanged(e);
     };
     let (Some(lt), Some(rt)) = (operand_type(l, types), operand_type(r, types)) else {
@@ -178,25 +173,25 @@ fn typed_comparison(mut e: protobuf::AExpr, types: &Types) -> protobuf::Node {
     ) else {
         return unchanged(e);
     };
-    e.lexpr = Some(Box::new(l));
-    e.rexpr = Some(Box::new(r));
+    e.lexpr = Some(l);
+    e.rexpr = Some(r);
     unchanged(e)
 }
 
 /// The operand `x`, of type `t`, as an operator taking `declared` reads it;
 /// `None` when that can't be written in the canonical form.
 fn typed_operand(
-    x: &protobuf::Node,
+    x: &ast::Node,
     t: PgTypeOid,
     declared: PgTypeOid,
     types: &Types,
-) -> Option<protobuf::Node> {
-    let constant = match x.node.as_ref()? {
-        node::Node::AConst(_) => Some(x),
-        node::Node::TypeCast(tc) => tc
+) -> Option<ast::Node> {
+    let constant = match x {
+        ast::Node::AConst(_) => Some(x),
+        ast::Node::TypeCast(tc) => tc
             .arg
-            .as_deref()
-            .filter(|a| matches!(a.node.as_ref(), Some(node::Node::AConst(_)))),
+            .as_ref()
+            .filter(|a| matches!(a, ast::Node::AConst(_))),
         _ => None,
     };
     if let Some(c) = constant {
@@ -208,11 +203,11 @@ fn typed_operand(
 
 /// `x` with its casts written canonically ([`coerce`]); `None` for a type
 /// name with a modifier or array bounds, which is another expression.
-fn canonical(x: &protobuf::Node, types: &Types) -> Option<protobuf::Node> {
-    let Some(node::Node::TypeCast(tc)) = x.node.as_ref() else {
+fn canonical(x: &ast::Node, types: &Types) -> Option<ast::Node> {
+    let ast::Node::TypeCast(tc) = x else {
         return Some(x.clone());
     };
-    let (arg, written) = (tc.arg.as_deref()?, tc.type_name.as_ref()?);
+    let (arg, written) = (tc.arg.as_ref()?, tc.type_name.as_ref()?);
     if !written.typmods.is_empty() || !written.array_bounds.is_empty() || written.pct_type {
         return None;
     }
@@ -227,7 +222,7 @@ fn canonical(x: &protobuf::Node, types: &Types) -> Option<protobuf::Node> {
 /// explicit one. No coercion to its own type; a binary-compatible one is a
 /// RelabelType, which `applyRelabelType` stacks on no other and drops when
 /// the relabelings net out to nothing (`t::varchar::text` is `t`).
-fn coerce(x: protobuf::Node, from: PgTypeOid, to: PgTypeOid, types: &Types) -> protobuf::Node {
+fn coerce(x: ast::Node, from: PgTypeOid, to: PgTypeOid, types: &Types) -> ast::Node {
     if from == to {
         return x;
     }
@@ -250,63 +245,57 @@ fn coerce(x: protobuf::Node, from: PgTypeOid, to: PgTypeOid, types: &Types) -> p
 }
 
 /// A RelabelType [`coerce`] wrote: its operand and that operand's type.
-fn relabeled(x: &protobuf::Node) -> Option<(protobuf::Node, PgTypeOid)> {
-    let Some(node::Node::TypeCast(tc)) = x.node.as_ref() else {
+fn relabeled(x: &ast::Node) -> Option<(ast::Node, PgTypeOid)> {
+    let ast::Node::TypeCast(tc) = x else {
         return None;
     };
     match super::expr::extract_string_fields(&tc.type_name.as_ref()?.names).as_slice() {
         [kind, from, _] if kind == "relabel" => Some((
-            (**tc.arg.as_ref()?).clone(),
+            tc.arg.as_ref()?.clone(),
             PgTypeOid::new(from.parse().ok()?)?,
         )),
         _ => None,
     }
 }
 
-fn cast_node<const N: usize>(x: protobuf::Node, names: [String; N]) -> protobuf::Node {
-    protobuf::Node {
-        node: Some(node::Node::TypeCast(Box::new(protobuf::TypeCast {
-            arg: Some(Box::new(x)),
-            type_name: Some(protobuf::TypeName {
-                names: names
-                    .into_iter()
-                    .map(|sval| protobuf::Node {
-                        node: Some(node::Node::String(protobuf::String { sval })),
-                    })
-                    .collect(),
-                typemod: -1,
-                ..Default::default()
-            }),
-            location: 0,
-        }))),
-    }
+fn cast_node<const N: usize>(x: ast::Node, names: [String; N]) -> ast::Node {
+    ast::Node::TypeCast(NodeBox::new(ast::TypeCast {
+        arg: Some(x),
+        type_name: Some(NodeBox::new(ast::TypeName {
+            names: names
+                .into_iter()
+                .map(|sval| Some(ast::Node::String(NodeBox::new(ast::String { sval }))))
+                .collect(),
+            typemod: -1,
+            ..Default::default()
+        })),
+        location: 0,
+    }))
 }
 
 /// The type of an operand whose type the raw AST tells: a column's, a
 /// cast's (`c::text`), a literal's.
-fn operand_type(x: &protobuf::Node, types: &Types) -> Option<PgTypeOid> {
-    use protobuf::a_const::Val;
-    match x.node.as_ref()? {
-        node::Node::ColumnRef(cr) => match cr.fields.as_slice() {
-            [
-                protobuf::Node {
-                    node: Some(node::Node::String(s)),
-                },
-            ] => types.column(&s.sval),
+fn operand_type(x: &ast::Node, types: &Types) -> Option<PgTypeOid> {
+    use ast::AConstValue;
+    match x {
+        ast::Node::ColumnRef(cr) => match cr.fields.as_slice() {
+            [Some(ast::Node::String(s))] => types.column(&s.sval),
             _ => None,
         },
-        node::Node::TypeCast(tc) => types.type_name(tc.type_name.as_ref()?),
+        ast::Node::TypeCast(tc) => types.type_name(tc.type_name.as_ref()?),
         // `make_const`: an integer literal is an int4, one too wide an
         // int8, a decimal a numeric.
-        node::Node::AConst(c) if !c.isnull => Some(match c.val.as_ref()? {
-            Val::Ival(_) => oid::INT4,
-            Val::Fval(f) if !f.fval.contains(['.', 'e', 'E']) && f.fval.parse::<i64>().is_ok() => {
+        ast::Node::AConst(c) if !c.isnull => Some(match c.val.as_ref()? {
+            AConstValue::Integer(_) => oid::INT4,
+            AConstValue::Float(f)
+                if !f.fval.contains(['.', 'e', 'E']) && f.fval.parse::<i64>().is_ok() =>
+            {
                 oid::INT8
             }
-            Val::Fval(_) => oid::NUMERIC,
-            Val::Sval(_) => oid::UNKNOWN,
-            Val::Boolval(_) => oid::BOOL,
-            Val::Bsval(_) => return None,
+            AConstValue::Float(_) => oid::NUMERIC,
+            AConstValue::String(_) => oid::UNKNOWN,
+            AConstValue::Boolean(_) => oid::BOOL,
+            AConstValue::BitString(_) => return None,
         }),
         _ => None,
     }
@@ -314,24 +303,22 @@ fn operand_type(x: &protobuf::Node, types: &Types) -> Option<PgTypeOid> {
 
 /// How `predicate_implied_by_recurse` classifies a node.
 enum Shape<'a> {
-    And(&'a [protobuf::Node]),
-    Or(&'a [protobuf::Node]),
+    And(&'a [Option<ast::Node>]),
+    Or(&'a [Option<ast::Node>]),
     Atom,
 }
 
-fn shape(n: &protobuf::Node) -> Shape<'_> {
-    match n.node.as_ref() {
-        Some(node::Node::BoolExpr(b)) if b.boolop() == protobuf::BoolExprType::AndExpr => {
+fn shape(n: &Option<ast::Node>) -> Shape<'_> {
+    match n.as_ref() {
+        Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
             Shape::And(&b.args)
         }
-        Some(node::Node::BoolExpr(b)) if b.boolop() == protobuf::BoolExprType::OrExpr => {
-            Shape::Or(&b.args)
-        }
+        Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::OrExpr => Shape::Or(&b.args),
         _ => Shape::Atom,
     }
 }
 
-fn implied_by_recurse(clause: &protobuf::Node, pred: &protobuf::Node) -> bool {
+fn implied_by_recurse(clause: &Option<ast::Node>, pred: &Option<ast::Node>) -> bool {
     match (shape(clause), shape(pred)) {
         (_, Shape::And(ps)) => ps.iter().all(|p| implied_by_recurse(clause, p)),
         (Shape::And(cs), Shape::Or(ps)) => {
@@ -349,17 +336,17 @@ fn implied_by_recurse(clause: &protobuf::Node, pred: &protobuf::Node) -> bool {
 }
 
 /// `predicate_implied_by_simple_clause`.
-fn simple_clause_implied(clause: &protobuf::Node, pred: &protobuf::Node) -> bool {
+fn simple_clause_implied(clause: &Option<ast::Node>, pred: &Option<ast::Node>) -> bool {
     if node_fingerprint(clause) == node_fingerprint(pred) {
         return true;
     }
     // `x IS NOT NULL` follows from any strict comparison on x.
-    if let Some(node::Node::NullTest(nt)) = pred.node.as_ref()
-        && nt.nulltesttype() == protobuf::NullTestType::IsNotNull
+    if let Some(ast::Node::NullTest(nt)) = pred.as_ref()
+        && nt.nulltesttype == ast::NullTestType::IsNotNull
         && !nt.argisrow
-        && let Some(arg) = nt.arg.as_deref()
+        && nt.arg.is_some()
         && let Some((x, _, _)) = comparison(clause)
-        && node_fingerprint(&x) == node_fingerprint(arg)
+        && node_fingerprint(&x) == node_fingerprint(&nt.arg)
     {
         return true;
     }
@@ -434,22 +421,22 @@ enum Constant {
 }
 
 impl Constant {
-    fn of(n: &protobuf::Node) -> Option<Constant> {
-        use protobuf::a_const::Val;
-        let Some(node::Node::AConst(c)) = n.node.as_ref() else {
+    fn of(n: &Option<ast::Node>) -> Option<Constant> {
+        use ast::AConstValue;
+        let Some(ast::Node::AConst(c)) = n.as_ref() else {
             return None;
         };
         if c.isnull {
             return None;
         }
         Some(match c.val.as_ref()? {
-            Val::Ival(i) => Constant::Int(i64::from(i.ival)),
-            Val::Fval(f) => match f.fval.parse::<i64>() {
+            AConstValue::Integer(i) => Constant::Int(i64::from(i.ival)),
+            AConstValue::Float(f) => match f.fval.parse::<i64>() {
                 // An integer too wide for int4 is still an integer literal.
                 Ok(i) if !f.fval.contains(['.', 'e', 'E']) => Constant::Int(i),
                 _ => Constant::Decimal(crate::decimal::Decimal::parse(&f.fval)?),
             },
-            Val::Sval(s) => Constant::Text(s.sval.clone()),
+            AConstValue::String(s) => Constant::Text(s.sval.clone()),
             _ => return None,
         })
     }
@@ -464,11 +451,11 @@ impl Constant {
 }
 
 /// `x op c` / `c op x` as `(x, op, c)` with the constant on the right.
-fn comparison(n: &protobuf::Node) -> Option<(protobuf::Node, Cmp, Constant)> {
-    let Some(node::Node::AExpr(e)) = n.node.as_ref() else {
+fn comparison(n: &Option<ast::Node>) -> Option<(Option<ast::Node>, Cmp, Constant)> {
+    let Some(ast::Node::AExpr(e)) = n.as_ref() else {
         return None;
     };
-    if e.kind() != protobuf::AExprKind::AexprOp {
+    if e.kind != ast::AExprKind::AexprOp {
         return None;
     }
     let op = match super::expr::extract_string_fields(&e.name).as_slice() {
@@ -476,7 +463,10 @@ fn comparison(n: &protobuf::Node) -> Option<(protobuf::Node, Cmp, Constant)> {
         [schema, op] if schema == "pg_catalog" => Cmp::parse(op)?,
         _ => return None,
     };
-    let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+    if e.lexpr.is_none() || e.rexpr.is_none() {
+        return None;
+    }
+    let (l, r) = (&e.lexpr, &e.rexpr);
     match (Constant::of(l), Constant::of(r)) {
         (None, Some(c)) => Some((l.clone(), op, c)),
         (Some(c), None) => Some((r.clone(), op.commute(), c)),
@@ -487,7 +477,7 @@ fn comparison(n: &protobuf::Node) -> Option<(protobuf::Node, Cmp, Constant)> {
 /// `operator_predicate_proof`: does `x op1 c1` imply `x op2 c2`? Decided
 /// as containment of the value sets on an ordered domain, which is what
 /// `BT_implic_table`'s test operators encode.
-fn operator_predicate_proof(clause: &protobuf::Node, pred: &protobuf::Node) -> bool {
+fn operator_predicate_proof(clause: &Option<ast::Node>, pred: &Option<ast::Node>) -> bool {
     let (Some((cx, op1, c1)), Some((px, op2, c2))) = (comparison(clause), comparison(pred)) else {
         return false;
     };
@@ -522,11 +512,11 @@ fn operator_predicate_proof(clause: &protobuf::Node, pred: &protobuf::Node) -> b
 
 /// `node` with every qualified column reference (`t.v`) reduced to its
 /// column name — both sides refer to the one target relation.
-pub(crate) fn unqualify(node: &protobuf::Node) -> protobuf::Node {
-    let mut tree = protobuf::ParseResult {
+pub(crate) fn unqualify(node: Option<&ast::Node>) -> Option<ast::Node> {
+    let mut tree = ast::ParseResult {
         version: 0,
-        stmts: vec![protobuf::RawStmt {
-            stmt: Some(Box::new(node.clone())),
+        stmts: vec![ast::RawStmt {
+            stmt: node.cloned(),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -548,8 +538,8 @@ pub(crate) fn unqualify(node: &protobuf::Node) -> protobuf::Node {
             let fields = &mut (*cr).fields;
             if fields.len() > 1
                 && matches!(
-                    fields.last().and_then(|f| f.node.as_ref()),
-                    Some(node::Node::String(_))
+                    fields.last().and_then(|f| f.as_ref()),
+                    Some(ast::Node::String(_))
                 )
             {
                 let last = fields.pop();
@@ -558,9 +548,5 @@ pub(crate) fn unqualify(node: &protobuf::Node) -> protobuf::Node {
             }
         }
     }
-    tree.stmts
-        .pop()
-        .and_then(|s| s.stmt)
-        .map(|b| *b)
-        .unwrap_or_default()
+    tree.stmts.pop().and_then(|s| s.stmt)
 }

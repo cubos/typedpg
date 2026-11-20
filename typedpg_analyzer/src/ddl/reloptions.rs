@@ -3,7 +3,7 @@
 //! the relation kind's option table (reloptions.c) and rejects unknown
 //! names, malformed values and out-of-range numbers.
 
-use typedpg_pg_query::protobuf::node;
+use typedpg_pg_query::ast;
 
 use super::DdlError;
 
@@ -119,14 +119,14 @@ fn option_type(kind: RelOptKind, namespace: Option<&str>, name: &str) -> Option<
 }
 
 /// defGetString of an option's value; a bare name means "true".
-fn value_string(de: &typedpg_pg_query::protobuf::DefElem) -> Option<String> {
-    Some(match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+fn value_string(de: &typedpg_pg_query::ast::DefElem) -> Option<String> {
+    Some(match de.arg.as_ref() {
         None => "true".to_owned(),
-        Some(node::Node::Integer(i)) => i.ival.to_string(),
-        Some(node::Node::Float(f)) => f.fval.clone(),
-        Some(node::Node::String(s)) => s.sval.clone(),
-        Some(node::Node::Boolean(b)) => b.boolval.to_string(),
-        Some(node::Node::TypeName(tn)) => super::util::type_name_to_string(tn),
+        Some(ast::Node::Integer(i)) => i.ival.to_string(),
+        Some(ast::Node::Float(f)) => f.fval.clone(),
+        Some(ast::Node::String(s)) => s.sval.clone(),
+        Some(ast::Node::Boolean(b)) => b.boolval.to_string(),
+        Some(ast::Node::TypeName(tn)) => super::util::type_name_to_string(tn),
         _ => return None,
     })
 }
@@ -227,26 +227,26 @@ fn check_value(name: &str, typ: OptType, value: &str) -> Result<(), DdlError> {
 /// index, a partitioned table, through ALTER) takes unchecked in it
 /// (transformRelOptions keeps them aside, and nothing validates them).
 pub(crate) fn without_toast_options(
-    options: &[typedpg_pg_query::protobuf::Node],
-) -> Vec<typedpg_pg_query::protobuf::Node> {
+    options: &[Option<typedpg_pg_query::ast::Node>],
+) -> Vec<Option<typedpg_pg_query::ast::Node>> {
     options
         .iter()
-        .filter(|o| {
-            !matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defnamespace == "toast")
-        })
+        .filter(
+            |o| !matches!(o.as_ref(), Some(ast::Node::DefElem(de)) if de.defnamespace == "toast"),
+        )
         .cloned()
         .collect()
 }
 
 /// The options of a list in the `toast` namespace.
 pub(crate) fn toast_options(
-    options: &[typedpg_pg_query::protobuf::Node],
-) -> Vec<typedpg_pg_query::protobuf::Node> {
+    options: &[Option<typedpg_pg_query::ast::Node>],
+) -> Vec<Option<typedpg_pg_query::ast::Node>> {
     options
         .iter()
-        .filter(|o| {
-            matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defnamespace == "toast")
-        })
+        .filter(
+            |o| matches!(o.as_ref(), Some(ast::Node::DefElem(de)) if de.defnamespace == "toast"),
+        )
         .cloned()
         .collect()
 }
@@ -254,7 +254,7 @@ pub(crate) fn toast_options(
 /// transformRelOptions + the kind's `*_reloptions`: validate a `WITH` /
 /// `SET` list, or the names of a `RESET` list.
 pub(crate) fn check_reloptions(
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
     kind: RelOptKind,
     reset: bool,
     accept_oids_off: bool,
@@ -262,7 +262,7 @@ pub(crate) fn check_reloptions(
     let mut seen: Vec<(String, String)> = Vec::new();
     let mut any = false;
     for opt in options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         if reset {

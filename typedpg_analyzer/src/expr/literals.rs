@@ -1,24 +1,25 @@
 use super::*;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Literals
 // ──────────────────────────────────────────────────────────────────────────────
 
-pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, AnalyzeError> {
+pub(crate) fn infer_a_const(a_const: &ast::AConst) -> Result<ExprType, AnalyzeError> {
     if a_const.isnull {
         return Ok(ExprType::scalar(oid::UNKNOWN, true));
     }
 
     let type_oid = match &a_const.val {
-        Some(a_const::Val::Ival(_)) => oid::INT4,
-        Some(a_const::Val::Fval(f)) => fval_const_type(&f.fval),
-        Some(a_const::Val::Boolval(_)) => oid::BOOL,
-        Some(a_const::Val::Sval(_)) => oid::UNKNOWN, // untyped string literal
+        Some(ast::AConstValue::Integer(_)) => oid::INT4,
+        Some(ast::AConstValue::Float(f)) => fval_const_type(&f.fval),
+        Some(ast::AConstValue::Boolean(_)) => oid::BOOL,
+        Some(ast::AConstValue::String(_)) => oid::UNKNOWN, // untyped string literal
         // `B'…'` / `X'…'`: PG's make_const types a T_BitString as `bit` and
         // runs `bit_in` on it right away, so a bad digit is a parse-time
         // 22P02. The lexer keeps the radix marker (`b101` / `x1F`), which is
         // exactly the form bit_in accepts.
-        Some(a_const::Val::Bsval(b)) => {
+        Some(ast::AConstValue::BitString(b)) => {
             if let Err(msg) = crate::literal_input::validate_bit(&b.bsval) {
                 let span = crate::error::SourceSpan::from_node_token(a_const.location);
                 return Err(crate::error::RawError::invalid_literal(msg, span).finalize_implicit());
@@ -30,13 +31,13 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
     // A number, a boolean or a bit string is never an infinity; a string
     // is when it spells one.
     let refine = match &a_const.val {
-        Some(a_const::Val::Sval(s)) => crate::refine::Refinement::of_string_literal(&s.sval),
-        Some(a_const::Val::Ival(i)) => crate::refine::Refinement {
+        Some(ast::AConstValue::String(s)) => crate::refine::Refinement::of_string_literal(&s.sval),
+        Some(ast::AConstValue::Integer(i)) => crate::refine::Refinement {
             values: Some([i.ival.to_string()].into()),
             range: Some(crate::refine::IntRange::exactly(i.ival.into())),
             ..crate::refine::Refinement::FINITE
         },
-        Some(a_const::Val::Fval(f)) if type_oid != oid::NUMERIC => {
+        Some(ast::AConstValue::Float(f)) if type_oid != oid::NUMERIC => {
             let int = crate::literal_input::parse_pg_integer(&f.fval);
             crate::refine::Refinement {
                 values: int.map(|i| [i.to_string()].into()),
@@ -44,7 +45,7 @@ pub(crate) fn infer_a_const(a_const: &protobuf::AConst) -> Result<ExprType, Anal
                 ..crate::refine::Refinement::FINITE
             }
         }
-        Some(a_const::Val::Boolval(b)) => crate::refine::Refinement {
+        Some(ast::AConstValue::Boolean(b)) => crate::refine::Refinement {
             values: Some([b.boolval.to_string()].into()),
             ..crate::refine::Refinement::FINITE
         },
@@ -88,32 +89,33 @@ fn fval_const_type(fval: &str) -> PgTypeOid {
 /// other node. (A typed operand goes through [`infer_type_cast`], which
 /// returns it as it is too.)
 pub(crate) fn passthrough_cast_operand<'a>(
-    node: &'a protobuf::Node,
+    node: &'a Option<ast::Node>,
     snapshot: &PgCatalog,
     params: &ParamCollector,
-) -> Option<&'a protobuf::Node> {
+) -> Option<&'a Option<ast::Node>> {
     let mut operand = node;
     let mut peeled = false;
     let mut to_unknown = false;
-    while let Some(node::Node::TypeCast(cast)) = operand.node.as_ref() {
+    while let Some(ast::Node::TypeCast(cast)) = operand.as_ref() {
         let tn = cast.type_name.as_ref()?;
         if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
             return None;
         }
-        let target = resolve_type_name(Some(tn), snapshot).ok()?;
+        let target = resolve_type_name(Some(&**tn), snapshot).ok()?;
         if !keeps_unknown_operand(target) {
             return None;
         }
         to_unknown |= target == oid::UNKNOWN;
-        operand = cast.arg.as_deref()?;
+        cast.arg.as_ref()?;
+        operand = &cast.arg;
         peeled = true;
     }
-    let untyped = match operand.node.as_ref()? {
-        node::Node::AConst(ac) => ac.isnull || matches!(ac.val, Some(a_const::Val::Sval(_))),
+    let untyped = match operand.as_ref()? {
+        ast::Node::AConst(ac) => ac.isnull || matches!(ac.val, Some(ast::AConstValue::String(_))),
         // A cast to `unknown` of a typed value fails (`cannot cast type
         // integer to unknown`): unless this occurrence was transformed
         // untyped, and a later clause typed it.
-        node::Node::ParamRef(p) => {
+        ast::Node::ParamRef(p) => {
             params.get(p.number) == oid::UNKNOWN
                 || (to_unknown && params.is_untyped_cast_operand(p.location))
         }
@@ -135,22 +137,23 @@ fn keeps_unknown_operand(target: PgTypeOid) -> bool {
 /// `$1::unknown` alike are a bare parameter PG's `resolveTargetListUnknowns`
 /// may coerce.
 pub(crate) fn bare_param<'a>(
-    node: &'a protobuf::Node,
+    node: &'a Option<ast::Node>,
     snapshot: &PgCatalog,
-) -> Option<&'a protobuf::ParamRef> {
+) -> Option<&'a ast::ParamRef> {
     let mut operand = node;
     loop {
-        match operand.node.as_ref()? {
-            node::Node::ParamRef(p) => return Some(p),
-            node::Node::TypeCast(cast) => {
+        match operand.as_ref()? {
+            ast::Node::ParamRef(p) => return Some(p),
+            ast::Node::TypeCast(cast) => {
                 let tn = cast.type_name.as_ref()?;
                 if !tn.typmods.is_empty()
                     || !tn.array_bounds.is_empty()
-                    || !resolve_type_name(Some(tn), snapshot).is_ok_and(keeps_unknown_operand)
+                    || !resolve_type_name(Some(&**tn), snapshot).is_ok_and(keeps_unknown_operand)
                 {
                     return None;
                 }
-                operand = cast.arg.as_deref()?;
+                cast.arg.as_ref()?;
+                operand = &cast.arg;
             }
             _ => return None,
         }
@@ -158,19 +161,19 @@ pub(crate) fn bare_param<'a>(
 }
 
 pub(crate) fn infer_type_cast(
-    cast: &protobuf::TypeCast,
+    cast: &ast::TypeCast,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
-    let inner = cast
-        .arg
-        .as_ref()
-        .ok_or_else(|| AnalyzeError::Unsupported("TypeCast without arg".into()))?;
+    let inner = &cast.arg;
+    if inner.is_none() {
+        return Err(AnalyzeError::Unsupported("TypeCast without arg".into()));
+    }
     // `('a'::anyelement)::int` casts the literal itself.
     let inner = passthrough_cast_operand(inner, snapshot, params).unwrap_or(inner);
 
-    let target_oid = resolve_type_name(cast.type_name.as_ref(), snapshot)?;
+    let target_oid = resolve_type_name(cast.type_name.as_deref(), snapshot)?;
     // typenameTypeIdAndMod: the target's typmod is resolved (and validated)
     // before the operand is transformed.
     let written_typmod = match cast.type_name.as_ref() {
@@ -192,18 +195,18 @@ pub(crate) fn infer_type_cast(
     ];
     let pass_through = PASS_THROUGH.contains(&target_oid);
 
-    if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
+    if let Some(ast::Node::AConst(ac)) = inner.as_ref()
         && !pass_through
         && !ac.isnull
-        && matches!(ac.val, Some(a_const::Val::Sval(_)))
+        && matches!(ac.val, Some(ast::AConstValue::String(_)))
     {
         ctx.note_literal_type(ac.location, target_oid);
     }
     // stringTypeDatum runs the target's input function on an untyped
     // literal, which a pseudo-type with a dummy one refuses — on NULL too
     // when it is not strict (`NULL::trigger`; `NULL::anyarray` is a NULL).
-    if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
-        && (ac.isnull || matches!(ac.val, Some(a_const::Val::Sval(_))))
+    if let Some(ast::Node::AConst(ac)) = inner.as_ref()
+        && (ac.isnull || matches!(ac.val, Some(ast::AConstValue::String(_))))
         && let Some(strict) = dummy_input_pseudo_type(target_oid, snapshot)
         && (!ac.isnull || !strict)
     {
@@ -216,9 +219,9 @@ pub(crate) fn infer_type_cast(
     // target's input function at parse time (`'x'::int` fails prepare with
     // `invalid input syntax for type integer: "x"`). Mirror it for the types
     // we model — see `literal_input`.
-    if let Some(node::Node::AConst(ac)) = inner.node.as_ref()
+    if let Some(ast::Node::AConst(ac)) = inner.as_ref()
         && !ac.isnull
-        && let Some(a_const::Val::Sval(sv)) = &ac.val
+        && let Some(ast::AConstValue::String(sv)) = &ac.val
         && let Err(msg) = crate::literal_input::validate_with_typmod(
             &sv.sval,
             target_oid,
@@ -246,14 +249,14 @@ pub(crate) fn infer_type_cast(
     // pinned against the matching field type — without that propagation,
     // params inside the ROW would remain indeterminate. Mirror it.
     let inner_goal = match (
-        inner.node.as_ref(),
+        inner.as_ref(),
         snapshot
             .get_type(snapshot.unwrap_domain(target_oid))
             .map(|t| t.typtype),
     ) {
         // (An explicit cast: coerce_record_to_complex converts each field
         // in the explicit context.)
-        (Some(node::Node::RowExpr(_)), Some(TypType::Composite)) => TypeGoal {
+        (Some(ast::Node::RowExpr(_)), Some(TypType::Composite)) => TypeGoal {
             coercion: CoercionContext::Explicit,
             ..TypeGoal::assignment(target_oid)
         },
@@ -264,9 +267,9 @@ pub(crate) fn infer_type_cast(
     // type, so its untyped elements and params take that type
     // (`ARRAY[$1]::int[]` makes `$1` an integer).
     let target_base = snapshot.unwrap_domain(target_oid);
-    let array_target = match inner.node.as_ref() {
+    let array_target = match inner.as_ref() {
         // (`get_element_type`: also `record[]`, a pseudo-type array.)
-        Some(node::Node::AArrayExpr(arr)) => {
+        Some(ast::Node::AArrayExpr(arr)) => {
             array_element_type(snapshot, target_base).map(|element_type| {
                 (
                     arr,
@@ -300,7 +303,7 @@ pub(crate) fn infer_type_cast(
         inner_type
     };
 
-    if let Some(node::Node::ParamRef(p)) = inner.node.as_ref()
+    if let Some(ast::Node::ParamRef(p)) = inner.as_ref()
         && !pass_through
         && params.get(p.number) == oid::UNKNOWN
     {
@@ -311,7 +314,12 @@ pub(crate) fn infer_type_cast(
     // type only, and passes through `unknown` itself and the pseudo-types
     // coerce_type hands it to untouched.
     if inner_type.unknown_value {
-        super::unknown_value_coercion(target_oid, CoercionContext::Explicit, snapshot, inner)?;
+        super::unknown_value_coercion(
+            target_oid,
+            CoercionContext::Explicit,
+            snapshot,
+            inner.as_ref(),
+        )?;
         if target_oid == oid::UNKNOWN || crate::polymorphic::passes_operand_through(target_oid) {
             return Ok(inner_type);
         }
@@ -425,9 +433,9 @@ pub(crate) fn infer_type_cast(
         None
     } else if snapshot.domain_null_free_elements(target_oid) {
         Some(false)
-    } else if let Some(node::Node::AConst(ac)) = inner.node.as_ref() {
+    } else if let Some(ast::Node::AConst(ac)) = inner.as_ref() {
         match &ac.val {
-            Some(a_const::Val::Sval(sv)) if !ac.isnull => Some(
+            Some(ast::AConstValue::String(sv)) if !ac.isnull => Some(
                 crate::literal_input::array_literal_may_contain_null(&sv.sval),
             ),
             _ => None,
@@ -483,7 +491,7 @@ pub(crate) fn infer_type_cast(
                 }
                 // A parameter cast to a type the generator binds finite
                 // (`$at::timestamptz`) is of that type.
-                if matches!(inner.node.as_ref(), Some(node::Node::ParamRef(_)))
+                if matches!(inner.as_ref(), Some(ast::Node::ParamRef(_)))
                     && snapshot.finite_param(target_oid)
                 {
                     refine.finite = true;

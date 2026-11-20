@@ -15,7 +15,7 @@
 //! expressions over such columns no constant can short-circuit. Anything
 //! else may fold.
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::ast;
 
 use super::Ctx;
 use crate::pg_catalog::{AttGenerated, PgCatalog, SQL_LANGUAGE};
@@ -53,7 +53,11 @@ impl Foldable {
 }
 
 /// What `node` may fold to, in the scope of `ctx`.
-pub(crate) fn foldable(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
+pub(crate) fn foldable(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Foldable {
+    foldable_node(node.as_ref(), ctx)
+}
+
+fn foldable_node(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
     if casts_may_inline(ctx.snapshot) {
         return Foldable::ANY;
     }
@@ -63,32 +67,36 @@ pub(crate) fn foldable(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
 /// Whether the test of a CASE's WHEN may fold: the condition, or for
 /// `CASE arg WHEN v` the comparison `arg = v`.
 pub(crate) fn case_test_may_fold(
-    arg: Option<&protobuf::Node>,
-    cond: Option<&protobuf::Node>,
+    arg: Option<&ast::Node>,
+    cond: Option<&ast::Node>,
     ctx: Ctx<'_>,
 ) -> bool {
     let Some(cond) = cond else {
         return true;
     };
     match arg {
-        None => foldable(cond, ctx).may_fold(),
-        Some(arg) => strict([foldable(arg, ctx), foldable(cond, ctx)]).may_fold(),
+        None => foldable_node(Some(cond), ctx).may_fold(),
+        Some(arg) => strict([
+            foldable_node(Some(arg), ctx),
+            foldable_node(Some(cond), ctx),
+        ])
+        .may_fold(),
     }
 }
 
-fn shape(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
+fn shape(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
     crate::stack::step(|| shape_here(node, ctx))
 }
 
-fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
-    let Some(inner) = node.node.as_ref() else {
+fn shape_here(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
+    let Some(inner) = node else {
         return Foldable::ANY;
     };
-    let all = |nodes: &mut dyn Iterator<Item = &protobuf::Node>| {
-        nodes.map(|n| shape(n, ctx)).collect::<Vec<_>>()
+    let all = |nodes: &mut dyn Iterator<Item = &Option<ast::Node>>| {
+        nodes.map(|n| shape(n.as_ref(), ctx)).collect::<Vec<_>>()
     };
     match inner {
-        node::Node::AConst(c) => {
+        ast::Node::AConst(c) => {
             if c.isnull {
                 Foldable {
                     null: true,
@@ -99,24 +107,21 @@ fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
             }
         }
         // A custom plan substitutes the parameter's value.
-        node::Node::ParamRef(_) => Foldable::ANY,
-        node::Node::ColumnRef(cr) => column(cr, ctx),
-        node::Node::TypeCast(tc) => match tc.arg.as_deref() {
-            Some(arg) => strict([shape(arg, ctx)]),
+        ast::Node::ParamRef(_) => Foldable::ANY,
+        ast::Node::ColumnRef(cr) => column(cr, ctx),
+        ast::Node::TypeCast(tc) => match tc.arg.as_ref() {
+            Some(arg) => strict([shape(Some(arg), ctx)]),
             None => Foldable::ANY,
         },
-        node::Node::CollateClause(c) => match c.arg.as_deref() {
-            Some(arg) => shape(arg, ctx),
+        ast::Node::CollateClause(c) => match c.arg.as_ref() {
+            Some(arg) => shape(Some(arg), ctx),
             None => Foldable::ANY,
         },
-        node::Node::AExpr(e) => {
+        ast::Node::AExpr(e) => {
             let names = super::extract_string_fields(&e.name);
-            let kind = protobuf::AExprKind::try_from(e.kind);
             if matches!(
-                kind,
-                Ok(protobuf::AExprKind::AexprOp
-                    | protobuf::AExprKind::AexprOpAny
-                    | protobuf::AExprKind::AexprOpAll)
+                e.kind,
+                ast::AExprKind::AexprOp | ast::AExprKind::AexprOpAny | ast::AExprKind::AexprOpAll
             ) && names
                 .last()
                 .is_some_and(|op| operator_may_inline(op, ctx.snapshot))
@@ -127,22 +132,20 @@ fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
             // row comparison compares field by field, an AND / OR of
             // strict comparisons — a row with a field that may fold may
             // too (see `row`).
-            let operands: Vec<&protobuf::Node> = [e.lexpr.as_deref(), e.rexpr.as_deref()]
+            let operands: Vec<Option<&ast::Node>> = [e.lexpr.as_ref(), e.rexpr.as_ref()]
                 .into_iter()
                 .flatten()
-                .flat_map(|n| match n.node.as_ref() {
-                    Some(node::Node::List(l)) => l.items.iter().collect(),
-                    _ => vec![n],
+                .flat_map(|n| match n {
+                    ast::Node::List(l) => l.items.iter().map(Option::as_ref).collect(),
+                    _ => vec![Some(n)],
                 })
                 .collect();
             strict(operands.into_iter().map(|n| shape(n, ctx)))
         }
-        node::Node::BoolExpr(b) => {
+        ast::Node::BoolExpr(b) => {
             let args = all(&mut b.args.iter());
-            match protobuf::BoolExprType::try_from(b.boolop) {
-                Ok(protobuf::BoolExprType::NotExpr) => {
-                    args.first().copied().unwrap_or(Foldable::ANY)
-                }
+            match b.boolop {
+                ast::BoolExprType::NotExpr => args.first().copied().unwrap_or(Foldable::ANY),
                 // `simplify_and_arguments` / `simplify_or_arguments`: a FALSE
                 // (TRUE) argument is the result; constants only otherwise.
                 _ => {
@@ -154,21 +157,21 @@ fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
                 }
             }
         }
-        node::Node::NullTest(t) => match t.arg.as_deref() {
-            Some(arg) if shape(arg, ctx).may_fold() => Foldable::VALUE,
+        ast::Node::NullTest(t) => match t.arg.as_ref() {
+            Some(arg) if shape(Some(arg), ctx).may_fold() => Foldable::VALUE,
             Some(_) => Foldable::NEVER,
             None => Foldable::VALUE,
         },
-        node::Node::BooleanTest(t) => match t.arg.as_deref() {
-            Some(arg) if shape(arg, ctx).may_fold() => Foldable::VALUE,
+        ast::Node::BooleanTest(t) => match t.arg.as_ref() {
+            Some(arg) if shape(Some(arg), ctx).may_fold() => Foldable::VALUE,
             Some(_) => Foldable::NEVER,
             None => Foldable::VALUE,
         },
         // A CASE folds only through a test that does.
-        node::Node::CaseExpr(c) => {
-            let arg = c.arg.as_deref();
-            let any_test = c.args.iter().any(|w| match w.node.as_ref() {
-                Some(node::Node::CaseWhen(w)) => case_test_may_fold(arg, w.expr.as_deref(), ctx),
+        ast::Node::CaseExpr(c) => {
+            let arg = c.arg.as_ref();
+            let any_test = c.args.iter().any(|w| match w.as_ref() {
+                Some(ast::Node::CaseWhen(w)) => case_test_may_fold(arg, w.expr.as_ref(), ctx),
                 _ => true,
             });
             if any_test {
@@ -179,13 +182,13 @@ fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
         }
         // NULL arguments are dropped, and the arguments after the first
         // other constant.
-        node::Node::CoalesceExpr(c) => {
+        ast::Node::CoalesceExpr(c) => {
             let mut out = Foldable {
                 null: true,
                 value: false,
             };
             for a in &c.args {
-                let a = shape(a, ctx);
+                let a = shape(a.as_ref(), ctx);
                 out.value |= a.value;
                 if !a.null {
                     out.null = false;
@@ -195,9 +198,9 @@ fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
             out
         }
         // A sublink becomes a SubPlan: it is never folded.
-        node::Node::SubLink(_) => Foldable::NEVER,
-        node::Node::RowExpr(r) => row(&r.args, ctx),
-        node::Node::FuncCall(f) => {
+        ast::Node::SubLink(_) => Foldable::NEVER,
+        ast::Node::RowExpr(r) => row(&r.args, ctx),
+        ast::Node::FuncCall(f) => {
             // A window function, or an aggregate over `*`: never folded.
             if f.over.is_some() || f.agg_star {
                 return Foldable::NEVER;
@@ -214,29 +217,30 @@ fn shape_here(node: &protobuf::Node, ctx: Ctx<'_>) -> Foldable {
             if super::plan_fold::never_folded(f, ctx.snapshot) {
                 return Foldable::NEVER;
             }
-            strict(f.args.iter().map(|a| shape(a, ctx)))
+            strict(f.args.iter().map(|a| shape(a.as_ref(), ctx)))
         }
-        node::Node::NamedArgExpr(a) => match a.arg.as_deref() {
-            Some(arg) => shape(arg, ctx),
+        ast::Node::NamedArgExpr(a) => match a.arg.as_ref() {
+            Some(arg) => shape(Some(arg), ctx),
             None => Foldable::ANY,
         },
-        node::Node::AIndirection(i) => strict(
+        ast::Node::AIndirection(i) => strict(
             i.arg
-                .as_deref()
+                .as_ref()
                 .into_iter()
-                .chain(i.indirection.iter())
+                .map(Some)
+                .chain(i.indirection.iter().map(Option::as_ref))
                 .map(|n| shape(n, ctx)),
         ),
-        node::Node::AIndices(i) => strict(
-            [i.lidx.as_deref(), i.uidx.as_deref()]
+        ast::Node::AIndices(i) => strict(
+            [i.lidx.as_ref(), i.uidx.as_ref()]
                 .into_iter()
                 .flatten()
-                .map(|n| shape(n, ctx)),
+                .map(|n| shape(Some(n), ctx)),
         ),
         // A field name of an indirection.
-        node::Node::String(_) | node::Node::AStar(_) => Foldable::NEVER,
-        node::Node::AArrayExpr(a) => strict(a.elements.iter().map(|n| shape(n, ctx))),
-        node::Node::MinMaxExpr(m) => strict(m.args.iter().map(|n| shape(n, ctx))),
+        ast::Node::String(_) | ast::Node::AStar(_) => Foldable::NEVER,
+        ast::Node::AArrayExpr(a) => strict(a.elements.iter().map(|n| shape(n.as_ref(), ctx))),
+        ast::Node::MinMaxExpr(m) => strict(m.args.iter().map(|n| shape(n.as_ref(), ctx))),
         // Anything else (a SQL/JSON or XML construct, …) may.
         _ => Foldable::ANY,
     }
@@ -260,8 +264,8 @@ fn strict(args: impl IntoIterator<Item = Foldable>) -> Foldable {
 
 /// A row (`ROW(…)`, `(a, b)`): compared or tested field by field, so a
 /// field that may fold makes the comparison or test one that may.
-fn row(fields: &[protobuf::Node], ctx: Ctx<'_>) -> Foldable {
-    if fields.iter().any(|f| shape(f, ctx).may_fold()) {
+fn row(fields: &[Option<ast::Node>], ctx: Ctx<'_>) -> Foldable {
+    if fields.iter().any(|f| shape(f.as_ref(), ctx).may_fold()) {
         Foldable::ANY
     } else {
         Foldable::NEVER
@@ -273,12 +277,12 @@ fn row(fields: &[protobuf::Node], ctx: Ctx<'_>) -> Foldable {
 /// it holds; a rule's NEW / OLD the statement's value; a SQL function's
 /// parameter the call's argument; a virtual generated column its
 /// expression — all may be constants.
-fn column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>) -> Foldable {
+fn column(cr: &ast::ColumnRef, ctx: Ctx<'_>) -> Foldable {
     let parts: Vec<&str> = cr
         .fields
         .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+        .map(|f| match f.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect::<Option<_>>()

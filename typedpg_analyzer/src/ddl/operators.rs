@@ -1,7 +1,7 @@
 //! CREATE OPERATOR / ALTER OPERATOR (`DefineOperator`, `AlterOperator`,
 //! operatorcmds.c; `OperatorCreate`, pg_operator.c).
 
-use typedpg_pg_query::protobuf::{AlterOperatorStmt, DefElem, DefineStmt, node};
+use typedpg_pg_query::ast::{self, AlterOperatorStmt, DefElem, DefineStmt};
 
 use crate::oid::{PgNamespaceOid, PgOperatorOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{DepType, PgOperator, oid as builtin};
@@ -16,31 +16,31 @@ const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
 
 /// `defGetQualifiedName`.
 fn def_qualified_name(de: &DefElem) -> Vec<String> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::TypeName(tn)) => tn
+    match de.arg.as_ref() {
+        Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::List(l)) => l
+        Some(ast::Node::List(l)) => l
             .items
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::String(s)) => vec![s.sval.clone()],
+        Some(ast::Node::String(s)) => vec![s.sval.clone()],
         _ => Vec::new(),
     }
 }
 
 /// `defGetBoolean`: no value means true.
 fn def_bool(de: &DefElem) -> bool {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+    match de.arg.as_ref() {
         None => true,
-        Some(node::Node::Boolean(b)) => b.boolval,
-        Some(node::Node::Integer(i)) => i.ival != 0,
-        Some(node::Node::String(s)) => super::reloptions::parse_bool(&s.sval).unwrap_or(false),
+        Some(ast::Node::Boolean(b)) => b.boolval,
+        Some(ast::Node::Integer(i)) => i.ival != 0,
+        Some(ast::Node::String(s)) => super::reloptions::parse_bool(&s.sval).unwrap_or(false),
         _ => false,
     }
 }
@@ -333,10 +333,10 @@ fn get_other_operator(
         interp,
         &other
             .iter()
-            .map(|s| typedpg_pg_query::protobuf::Node {
-                node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
-                    sval: s.clone(),
-                })),
+            .map(|s| {
+                Some(typedpg_pg_query::ast::Node::String(
+                    typedpg_pg_query::ast::String { sval: s.clone() }.into(),
+                ))
             })
             .collect::<Vec<_>>(),
     )?;
@@ -359,11 +359,11 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
     let mut can_hash = false;
     let mut can_merge = false;
     for opt in &stmt.definition {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
-        let type_name = || match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            Some(node::Node::TypeName(tn)) => Some(tn.clone()),
+        let type_name = || match de.arg.as_ref() {
+            Some(ast::Node::TypeName(tn)) => Some(tn.clone()),
             _ => None,
         };
         match de.defname.as_str() {
@@ -583,9 +583,9 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         .filter_map(node_string)
         .map(str::to_owned)
         .collect();
-    let arg = |n: &typedpg_pg_query::protobuf::Node| -> Result<Option<PgTypeOid>, DdlError> {
-        match n.node.as_ref() {
-            Some(node::Node::TypeName(tn)) if !tn.names.is_empty() => {
+    let arg = |n: &Option<typedpg_pg_query::ast::Node>| -> Result<Option<PgTypeOid>, DdlError> {
+        match n.as_ref() {
+            Some(ast::Node::TypeName(tn)) if !tn.names.is_empty() => {
                 typename_type_id(interp, tn).map(Some)
             }
             _ => Ok(None),
@@ -614,7 +614,7 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
     let (mut restrict, mut join, mut commutator, mut negator) = (None, None, None, None);
     let (mut can_merge, mut can_hash) = (false, false);
     for opt in &stmt.options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         // An option without a value (NONE) resets it.

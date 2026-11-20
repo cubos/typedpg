@@ -299,7 +299,7 @@ pub struct PgCatalog {
     /// (`SELECT expr` / `RETURN expr`, as `inline_function` requires),
     /// which PG substitutes for the call before checking an index or
     /// generation expression's mutability.
-    pub(crate) inline_sql_bodies: Shared<HashMap<PgProcOid, typedpg_pg_query::protobuf::Node>>,
+    pub(crate) inline_sql_bodies: Shared<HashMap<PgProcOid, Option<typedpg_pg_query::ast::Node>>>,
     /// Routines with SET items (`SET search_path = …`): their body's names
     /// resolve under settings of their own, so a call isn't read as its
     /// body ([`crate::expr::inline`]).
@@ -1035,15 +1035,15 @@ impl PgCatalog {
     /// it, the expression it stands for.
     fn add_sql_function_def(&mut self, oid: PgProcOid, definition: String) {
         let stmt = typedpg_pg_query::parse(&definition).ok().and_then(|p| {
-            match p.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()? {
-                typedpg_pg_query::protobuf::node::Node::CreateFunctionStmt(s) => Some(s.clone()),
+            match p.tree.stmts.first()?.stmt.as_ref()? {
+                typedpg_pg_query::ast::Node::CreateFunctionStmt(s) => Some(s.clone()),
                 _ => None,
             }
         });
         if let (Some(stmt), Some(proc)) = (stmt, self.pg_proc.get(&oid))
             && let Some(body) = crate::ddl::function_body::inlinable_body(&stmt, proc)
         {
-            self.inline_sql_bodies.insert(oid, body);
+            self.inline_sql_bodies.insert(oid, Some(body));
         }
         self.sql_function_defs.insert(oid, definition);
     }
@@ -1314,24 +1314,24 @@ impl PgCatalog {
     pub fn check_expression(
         &self,
         constraint: PgConstraintOid,
-    ) -> Option<&typedpg_pg_query::protobuf::Node> {
+    ) -> Option<&typedpg_pg_query::ast::Node> {
         match &self.check_defs.get(&constraint)?.expr {
-            crate::ddl::tables::check_inherit::StoredExpr::Written(expr) => Some(expr),
+            crate::ddl::tables::check_inherit::StoredExpr::Written(expr) => (**expr).as_ref(),
             crate::ddl::tables::check_inherit::StoredExpr::Serial(..) => None,
         }
     }
 
     /// The predicate of a partial index, or `None` for an index without one.
     #[cfg(any(test, feature = "internal"))]
-    pub fn index_predicate(&self, index: PgClassOid) -> Option<typedpg_pg_query::protobuf::Node> {
+    pub fn index_predicate(&self, index: PgClassOid) -> Option<typedpg_pg_query::ast::Node> {
         let predicate = self.pg_index.get(&index)?.indpred.as_ref()?;
-        Some(predicate.ast.clone())
+        predicate.ast.clone()
     }
 
     /// Whether the function call is surely VOLATILE (every overload that can
     /// take its arguments is).
     #[cfg(any(test, feature = "internal"))]
-    pub fn call_is_volatile(&self, call: &typedpg_pg_query::protobuf::FuncCall) -> bool {
+    pub fn call_is_volatile(&self, call: &typedpg_pg_query::ast::FuncCall) -> bool {
         crate::ddl::volatile::surely_volatile(call, self)
     }
 
@@ -1342,8 +1342,8 @@ impl PgCatalog {
         &self,
         relid: PgClassOid,
         column: &str,
-        type_name: &typedpg_pg_query::protobuf::TypeName,
-        using: Option<&typedpg_pg_query::protobuf::Node>,
+        type_name: &typedpg_pg_query::ast::TypeName,
+        using: Option<&typedpg_pg_query::ast::Node>,
     ) -> Option<bool> {
         let attr = self.attribute_by_name(relid, column)?;
         let new_type = crate::ddl::functions::typename_type_id(self, type_name).ok()?;
@@ -1497,7 +1497,7 @@ impl PgCatalog {
                 })
             });
         let analyzed = result.map_err(LocatedError::new)?;
-        let tree = analysis.tree.map(|tree| tree.protobuf).ok_or_else(|| {
+        let tree = analysis.tree.map(|tree| tree.tree).ok_or_else(|| {
             LocatedError::new(AnalyzeError::Internal(format!(
                 "the analyzed query has no parse tree: {}",
                 analysis.sql
@@ -1636,7 +1636,7 @@ impl PgCatalog {
                 let _guard = crate::error::DiagContextGuard::install(sql, &sample_lex);
                 let tree = typedpg_pg_query::parse(&sample_lex.sql).ok();
                 let error = check_spread_positions(
-                    tree.as_ref().map(|t| &t.protobuf),
+                    tree.as_ref().map(|t| &t.tree),
                     &lex_output,
                     &sample_lex,
                 )
@@ -1756,7 +1756,7 @@ impl PgCatalog {
                     &crate::resolve::Sample {
                         lex_output: &lex_output,
                         sample_lex: &analysis_lex,
-                        tree: &tree.protobuf,
+                        tree: &tree.tree,
                         nullability: &param_nullability,
                     },
                     &columns,
@@ -1886,18 +1886,18 @@ impl PgCatalog {
 /// a column or identifier named `extension` doesn't cause a false skip.
 #[cfg(feature = "pg_sanity")]
 fn sql_touches_extension(sql: &str) -> bool {
-    use typedpg_pg_query::protobuf::node;
+    use typedpg_pg_query::ast;
     let Ok(parsed) = typedpg_pg_query::parse(sql) else {
         return false;
     };
-    parsed.protobuf.stmts.iter().any(|raw| {
-        let Some(stmt) = raw.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+    parsed.tree.stmts.iter().any(|raw| {
+        let Some(stmt) = raw.stmt.as_ref() else {
             return false;
         };
         match stmt {
-            node::Node::CreateExtensionStmt(_) | node::Node::AlterExtensionStmt(_) => true,
-            node::Node::DropStmt(d) => {
-                d.remove_type == typedpg_pg_query::protobuf::ObjectType::ObjectExtension as i32
+            ast::Node::CreateExtensionStmt(_) | ast::Node::AlterExtensionStmt(_) => true,
+            ast::Node::DropStmt(d) => {
+                d.remove_type == typedpg_pg_query::ast::ObjectType::ObjectExtension
             }
             _ => false,
         }
@@ -2507,7 +2507,7 @@ struct QueryAnalysis {
 /// One statement of a migration, as [`MigrationObserver`] sees it.
 pub struct MigrationStatement<'a> {
     /// The parsed statement.
-    pub node: &'a typedpg_pg_query::protobuf::node::Node,
+    pub node: &'a typedpg_pg_query::ast::Node,
     /// The statement's byte range in the migration file's text: the
     /// `RawStmt`'s `stmt_location .. stmt_location + stmt_len`, or to the
     /// end of the file when `stmt_len` is 0. libpg_query starts it at the
@@ -2695,7 +2695,7 @@ pub struct QueryView {
     /// `$n`, and spreads materialized as the sample row analysis uses.
     pub sql: String,
     /// The parse of [`Self::sql`].
-    pub tree: typedpg_pg_query::protobuf::ParseResult,
+    pub tree: typedpg_pg_query::ast::ParseResult,
     /// The analysis result, before any query simplification.
     pub analyzed: AnalyzedQuery,
     /// The offset map from [`Self::sql`] back to the original text.
@@ -2778,8 +2778,8 @@ mod tests {
     impl MigrationObserver for Recorder {
         fn before(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
             let kind = match statement.node {
-                typedpg_pg_query::protobuf::node::Node::CreateStmt(_) => "create",
-                typedpg_pg_query::protobuf::node::Node::AlterTableStmt(_) => "alter",
+                typedpg_pg_query::ast::Node::CreateStmt(_) => "create",
+                typedpg_pg_query::ast::Node::AlterTableStmt(_) => "alter",
                 _ => "other",
             };
             self.events.push(Event {

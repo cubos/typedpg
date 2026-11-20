@@ -12,6 +12,7 @@
 //! base columns.
 
 use std::collections::{HashMap, HashSet};
+use typedpg_pg_query::ast;
 
 use super::*;
 use crate::nonnull::{Facts, Literal};
@@ -97,7 +98,7 @@ impl ValueInfo {
     /// ([`crate::typmod::keeps_literal`]: `varchar(2)` drops `'ab '`'s
     /// trailing space, `numeric(2,-1)` rounds 15 to 20).
     pub(crate) fn assigned(
-        val: &protobuf::Node,
+        val: &Option<ast::Node>,
         t: &expr::ExprType,
         attr: &crate::pg_catalog::PgAttribute,
         snapshot: &PgCatalog,
@@ -402,6 +403,7 @@ pub(crate) fn default_value(
         },
         Some(StoredExpr::Written(expr)) => {
             let scope = Scope::default();
+
             let null_ctx = NullabilityContext::default();
             let mut params = ParamCollector::default();
             // (What the default writes; whether it folds is checked by
@@ -528,7 +530,7 @@ pub(crate) fn base_row_not_null(
 /// of the parameters. Columns assigned through indirection, or from a
 /// sub-SELECT, are left out (nothing is known of them).
 pub(crate) fn set_values(
-    target_list: &[protobuf::Node],
+    target_list: &[Option<ast::Node>],
     target: &WriteTarget,
     table_attrs: &[crate::pg_catalog::PgAttribute],
     ctx: Ctx<'_>,
@@ -537,28 +539,27 @@ pub(crate) fn set_values(
     let mut out = HashMap::new();
     let mut scratch = params.clone();
     for item in target_list {
-        let Some(node::Node::ResTarget(rt)) = item.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = item.as_ref() else {
             continue;
         };
         if !rt.indirection.is_empty() {
             continue;
         }
-        let Some(val) = rt.val.as_deref() else {
+        if rt.val.is_none() {
             continue;
-        };
-        let val = match val.node.as_ref() {
-            Some(node::Node::MultiAssignRef(mar)) => {
-                match mar.source.as_deref().and_then(|s| s.node.as_ref()) {
-                    Some(node::Node::RowExpr(row)) => {
-                        let colno = usize::try_from(mar.colno).unwrap_or(1).max(1);
-                        match row.args.get(colno - 1) {
-                            Some(v) => v,
-                            None => continue,
-                        }
+        }
+        let val = &rt.val;
+        let val = match val.as_ref() {
+            Some(ast::Node::MultiAssignRef(mar)) => match mar.source.as_ref() {
+                Some(ast::Node::RowExpr(row)) => {
+                    let colno = usize::try_from(mar.colno).unwrap_or(1).max(1);
+                    match row.args.get(colno - 1) {
+                        Some(v) => v,
+                        None => continue,
                     }
-                    _ => continue,
                 }
-            }
+                _ => continue,
+            },
             _ => val,
         };
         let Some(attr) = table_attrs.iter().find(|a| a.attname == rt.name) else {

@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 
-use typedpg_pg_query::protobuf::{self, Node, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast::{self, Node};
 
 use super::DdlError;
 use super::depend::{NamedObject, ObjectAddress};
@@ -172,65 +173,65 @@ pub(crate) fn rename(interp: &mut PgCatalog, old: &Dependent, new_name: &str) {
 
 // ─── What an expression or statement reads ──────────────────────────────
 
-fn range_var_node(rv: &protobuf::RangeVar, alias: Option<&str>) -> Node {
+fn range_var_node(rv: &ast::RangeVar, alias: Option<&str>) -> Node {
     let mut rv = rv.clone();
     if let Some(alias) = alias {
-        rv.alias = Some(protobuf::Alias {
+        rv.alias = Some(NodeBox::new(ast::Alias {
             aliasname: alias.to_owned(),
             ..Default::default()
-        });
+        }));
     }
-    Node {
-        node: Some(node::Node::RangeVar(rv)),
-    }
+    ast::Node::RangeVar(NodeBox::new(rv))
 }
 
 fn target(expr: &Node) -> Node {
-    Node {
-        node: Some(node::Node::ResTarget(Box::new(protobuf::ResTarget {
-            val: Some(Box::new(expr.clone())),
-            ..Default::default()
-        }))),
-    }
+    ast::Node::ResTarget(NodeBox::new(ast::ResTarget {
+        val: Some(expr.clone()),
+        ..Default::default()
+    }))
 }
 
 /// `SELECT exprs FROM from`: what the expressions read, resolved by the
 /// view machinery's binding walker.
-fn select_of(exprs: &[&Node], from: Vec<Node>) -> Node {
-    Node {
-        node: Some(node::Node::SelectStmt(Box::new(protobuf::SelectStmt {
-            target_list: exprs.iter().map(|e| target(e)).collect(),
-            from_clause: from,
-            limit_option: protobuf::LimitOption::Count as i32,
-            op: protobuf::SetOperation::SetopNone as i32,
-            ..Default::default()
-        }))),
-    }
+fn select_of(exprs: &[&Node], from: Vec<Option<Node>>) -> Node {
+    ast::Node::SelectStmt(NodeBox::new(ast::SelectStmt {
+        target_list: exprs.iter().map(|e| Some(target(e))).collect(),
+        from_clause: from,
+        limit_option: ast::LimitOption::Count,
+        op: ast::SetOperation::SetopNone,
+        ..Default::default()
+    }))
 }
 
 /// The expressions of a RETURNING list.
-fn returning_vals(clause: &Option<protobuf::ReturningClause>) -> Vec<&Node> {
-    crate::resolve::returning_exprs(clause)
+fn returning_vals(clause: &Option<NodeBox<ast::ReturningClause>>) -> Vec<&Node> {
+    clause
+        .as_deref()
+        .map_or(&[][..], |c| c.exprs.as_slice())
         .iter()
-        .filter_map(|t| match t.node.as_ref()? {
-            node::Node::ResTarget(rt) => rt.val.as_deref(),
+        .filter_map(|t| match t.as_ref()? {
+            ast::Node::ResTarget(rt) => rt.val.as_ref(),
             _ => None,
         })
         .collect()
 }
 
-fn relation_of(interp: &PgCatalog, rv: &protobuf::RangeVar) -> Option<PgClassOid> {
+fn relation_of(interp: &PgCatalog, rv: &ast::RangeVar) -> Option<PgClassOid> {
     super::util::lookup_relation(interp, rv)
         .ok()
         .map(|(_, oid)| oid)
 }
 
-fn names_of(interp: &PgCatalog, relid: PgClassOid, names: &[Node]) -> Vec<(PgClassOid, i16)> {
+fn names_of(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    names: &[Option<Node>],
+) -> Vec<(PgClassOid, i16)> {
     names
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.as_str()),
-            node::Node::ResTarget(rt) => Some(rt.name.as_str()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.as_str()),
+            ast::Node::ResTarget(rt) => Some(rt.name.as_str()),
             _ => None,
         })
         .filter_map(|name| interp.attribute_by_name(relid, name))
@@ -241,39 +242,37 @@ fn names_of(interp: &PgCatalog, relid: PgClassOid, names: &[Node]) -> Vec<(PgCla
 /// The relations (attnum 0) and columns a statement reads or writes —
 /// SELECT, INSERT, UPDATE, DELETE — with `extra_from` in scope (a rule's
 /// NEW and OLD).
-fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(PgClassOid, i16)> {
+fn statement_refs(
+    interp: &PgCatalog,
+    stmt: &Node,
+    extra_from: &[Option<Node>],
+) -> Vec<(PgClassOid, i16)> {
     let mut refs: Vec<(PgClassOid, i16)> = Vec::new();
     let walk = |select: &Node, refs: &mut Vec<(PgClassOid, i16)>| {
         let (relations, columns) = super::views::statement_references(interp, select);
         refs.extend(relations.into_iter().map(|r| (r, 0)));
         refs.extend(columns);
     };
-    match stmt.node.as_ref() {
-        Some(node::Node::SelectStmt(sel))
-            if !extra_from.is_empty() && sel.values_lists.is_empty() =>
-        {
+    match stmt {
+        ast::Node::SelectStmt(sel) if !extra_from.is_empty() && sel.values_lists.is_empty() => {
             let mut sel = sel.clone();
             sel.from_clause.extend(extra_from.iter().cloned());
-            walk(
-                &Node {
-                    node: Some(node::Node::SelectStmt(sel)),
-                },
-                &mut refs,
-            );
+            walk(&ast::Node::SelectStmt(sel), &mut refs);
         }
-        Some(node::Node::SelectStmt(sel)) if !sel.values_lists.is_empty() => {
+        ast::Node::SelectStmt(sel) if !sel.values_lists.is_empty() => {
             let exprs: Vec<&Node> = sel
                 .values_lists
                 .iter()
-                .flat_map(|row| match row.node.as_ref() {
-                    Some(node::Node::List(l)) => l.items.iter().collect::<Vec<_>>(),
+                .flat_map(|row| match row.as_ref() {
+                    // A NULL cell adds a target without a value: it reads nothing.
+                    Some(ast::Node::List(l)) => l.items.iter().flatten().collect::<Vec<_>>(),
                     _ => Vec::new(),
                 })
                 .collect();
             walk(&select_of(&exprs, extra_from.to_vec()), &mut refs);
         }
-        Some(node::Node::SelectStmt(_)) => walk(stmt, &mut refs),
-        Some(node::Node::InsertStmt(ins)) => {
+        ast::Node::SelectStmt(_) => walk(stmt, &mut refs),
+        ast::Node::InsertStmt(ins) => {
             if let Some(rv) = ins.relation.as_ref()
                 && let Some(relid) = relation_of(interp, rv)
             {
@@ -284,19 +283,19 @@ fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(
                 // analysis of the statement tells those (record_rule).
                 refs.extend(names_of(interp, relid, &ins.cols));
             }
-            if let Some(source) = ins.select_stmt.as_deref() {
+            if let Some(source) = ins.select_stmt.as_ref() {
                 refs.extend(statement_refs(interp, source, extra_from));
             }
             let returning: Vec<&Node> = returning_vals(&ins.returning_clause);
             if let Some(rv) = ins.relation.as_ref()
                 && !returning.is_empty()
             {
-                let mut from = vec![range_var_node(rv, None)];
+                let mut from = vec![Some(range_var_node(rv, None))];
                 from.extend(extra_from.iter().cloned());
                 walk(&select_of(&returning, from), &mut refs);
             }
         }
-        Some(node::Node::UpdateStmt(upd)) => {
+        ast::Node::UpdateStmt(upd) => {
             if let Some(rv) = upd.relation.as_ref()
                 && let Some(relid) = relation_of(interp, rv)
             {
@@ -305,27 +304,27 @@ fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(
                 let mut exprs: Vec<&Node> = upd
                     .target_list
                     .iter()
-                    .filter_map(|t| match t.node.as_ref()? {
-                        node::Node::ResTarget(rt) => rt.val.as_deref(),
+                    .filter_map(|t| match t.as_ref()? {
+                        ast::Node::ResTarget(rt) => rt.val.as_ref(),
                         _ => None,
                     })
                     .collect();
-                exprs.extend(upd.where_clause.as_deref());
+                exprs.extend(upd.where_clause.as_ref());
                 exprs.extend(returning_vals(&upd.returning_clause));
-                let mut from = vec![range_var_node(rv, None)];
+                let mut from = vec![Some(range_var_node(rv, None))];
                 from.extend(upd.from_clause.iter().cloned());
                 from.extend(extra_from.iter().cloned());
                 walk(&select_of(&exprs, from), &mut refs);
             }
         }
-        Some(node::Node::DeleteStmt(del)) => {
+        ast::Node::DeleteStmt(del) => {
             if let Some(rv) = del.relation.as_ref()
                 && let Some(relid) = relation_of(interp, rv)
             {
                 refs.push((relid, 0));
-                let mut exprs: Vec<&Node> = del.where_clause.as_deref().into_iter().collect();
+                let mut exprs: Vec<&Node> = del.where_clause.as_ref().into_iter().collect();
                 exprs.extend(returning_vals(&del.returning_clause));
-                let mut from = vec![range_var_node(rv, None)];
+                let mut from = vec![Some(range_var_node(rv, None))];
                 from.extend(del.using_clause.iter().cloned());
                 from.extend(extra_from.iter().cloned());
                 walk(&select_of(&exprs, from), &mut refs);
@@ -338,37 +337,40 @@ fn statement_refs(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<(
 
 /// The functions a statement calls — SELECT, INSERT, UPDATE, DELETE —
 /// with `extra_from` in scope, as [`statement_refs`] walks it.
-fn statement_functions(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> Vec<PgProcOid> {
+fn statement_functions(
+    interp: &PgCatalog,
+    stmt: &Node,
+    extra_from: &[Option<Node>],
+) -> Vec<PgProcOid> {
     let walk = |select: &Node| super::views::statement_functions(interp, select);
-    let with_target = |rv: &protobuf::RangeVar, more: &[Node]| {
-        let mut from = vec![range_var_node(rv, None)];
+    let with_target = |rv: &ast::RangeVar, more: &[Option<Node>]| {
+        let mut from = vec![Some(range_var_node(rv, None))];
         from.extend(more.iter().cloned());
         from.extend(extra_from.iter().cloned());
         from
     };
-    match stmt.node.as_ref() {
-        Some(node::Node::SelectStmt(sel)) if !sel.values_lists.is_empty() => {
+    match stmt {
+        ast::Node::SelectStmt(sel) if !sel.values_lists.is_empty() => {
             let exprs: Vec<&Node> = sel
                 .values_lists
                 .iter()
-                .flat_map(|row| match row.node.as_ref() {
-                    Some(node::Node::List(l)) => l.items.iter().collect::<Vec<_>>(),
+                .flat_map(|row| match row.as_ref() {
+                    // A NULL cell adds a target without a value: it reads nothing.
+                    Some(ast::Node::List(l)) => l.items.iter().flatten().collect::<Vec<_>>(),
                     _ => Vec::new(),
                 })
                 .collect();
             walk(&select_of(&exprs, extra_from.to_vec()))
         }
-        Some(node::Node::SelectStmt(sel)) => {
+        ast::Node::SelectStmt(sel) => {
             let mut sel = sel.clone();
             sel.from_clause.extend(extra_from.iter().cloned());
-            walk(&Node {
-                node: Some(node::Node::SelectStmt(sel)),
-            })
+            walk(&ast::Node::SelectStmt(sel))
         }
-        Some(node::Node::InsertStmt(ins)) => {
+        ast::Node::InsertStmt(ins) => {
             let mut out = ins
                 .select_stmt
-                .as_deref()
+                .as_ref()
                 .map(|s| statement_functions(interp, s, extra_from))
                 .unwrap_or_default();
             let returning = returning_vals(&ins.returning_clause);
@@ -379,27 +381,27 @@ fn statement_functions(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> 
             }
             out
         }
-        Some(node::Node::UpdateStmt(upd)) => {
+        ast::Node::UpdateStmt(upd) => {
             let Some(rv) = upd.relation.as_ref() else {
                 return Vec::new();
             };
             let mut exprs: Vec<&Node> = upd
                 .target_list
                 .iter()
-                .filter_map(|t| match t.node.as_ref()? {
-                    node::Node::ResTarget(rt) => rt.val.as_deref(),
+                .filter_map(|t| match t.as_ref()? {
+                    ast::Node::ResTarget(rt) => rt.val.as_ref(),
                     _ => None,
                 })
                 .collect();
-            exprs.extend(upd.where_clause.as_deref());
+            exprs.extend(upd.where_clause.as_ref());
             exprs.extend(returning_vals(&upd.returning_clause));
             walk(&select_of(&exprs, with_target(rv, &upd.from_clause)))
         }
-        Some(node::Node::DeleteStmt(del)) => {
+        ast::Node::DeleteStmt(del) => {
             let Some(rv) = del.relation.as_ref() else {
                 return Vec::new();
             };
-            let mut exprs: Vec<&Node> = del.where_clause.as_deref().into_iter().collect();
+            let mut exprs: Vec<&Node> = del.where_clause.as_ref().into_iter().collect();
             exprs.extend(returning_vals(&del.returning_clause));
             walk(&select_of(&exprs, with_target(rv, &del.using_clause)))
         }
@@ -412,7 +414,7 @@ fn statement_functions(interp: &PgCatalog, stmt: &Node, extra_from: &[Node]) -> 
 /// The functions a policy's USING / WITH CHECK call.
 fn policy_functions(
     interp: &PgCatalog,
-    table: &protobuf::RangeVar,
+    table: &ast::RangeVar,
     quals: &(Option<Node>, Option<Node>),
 ) -> Vec<PgProcOid> {
     let exprs: Vec<&Node> = quals.0.iter().chain(quals.1.iter()).collect();
@@ -421,13 +423,13 @@ fn policy_functions(
     }
     super::views::statement_functions(
         interp,
-        &select_of(&exprs, vec![range_var_node(table, None)]),
+        &select_of(&exprs, vec![Some(range_var_node(table, None))]),
     )
 }
 
 fn policy_refs(
     interp: &PgCatalog,
-    table: &protobuf::RangeVar,
+    table: &ast::RangeVar,
     quals: &(Option<Node>, Option<Node>),
 ) -> Vec<(PgClassOid, i16)> {
     let exprs: Vec<&Node> = quals.0.iter().chain(quals.1.iter()).collect();
@@ -436,7 +438,7 @@ fn policy_refs(
     }
     statement_refs(
         interp,
-        &select_of(&exprs, vec![range_var_node(table, None)]),
+        &select_of(&exprs, vec![Some(range_var_node(table, None))]),
         &[],
     )
 }
@@ -444,7 +446,7 @@ fn policy_refs(
 /// CREATE POLICY: the columns its USING / WITH CHECK read.
 pub(crate) fn record_policy(
     interp: &mut PgCatalog,
-    stmt: &protobuf::CreatePolicyStmt,
+    stmt: &ast::CreatePolicyStmt,
 ) -> Result<(), DdlError> {
     let Some(table) = stmt.table.as_ref() else {
         return Ok(());
@@ -453,8 +455,8 @@ pub(crate) fn record_policy(
         return Ok(());
     };
     let quals = (
-        stmt.qual.as_deref().cloned(),
-        stmt.with_check.as_deref().cloned(),
+        stmt.qual.as_ref().cloned(),
+        stmt.with_check.as_ref().cloned(),
     );
     let refs = policy_refs(interp, table, &quals);
     let functions = policy_functions(interp, table, &quals);
@@ -473,7 +475,7 @@ pub(crate) fn record_policy(
 /// ALTER POLICY: a new USING or WITH CHECK replaces the old one.
 pub(crate) fn record_policy_alter(
     interp: &mut PgCatalog,
-    stmt: &protobuf::AlterPolicyStmt,
+    stmt: &ast::AlterPolicyStmt,
 ) -> Result<(), DdlError> {
     let Some(table) = stmt.table.as_ref() else {
         return Ok(());
@@ -488,10 +490,10 @@ pub(crate) fn record_policy_alter(
         .get(&key)
         .cloned()
         .unwrap_or_default();
-    if let Some(q) = stmt.qual.as_deref() {
+    if let Some(q) = stmt.qual.as_ref() {
         quals.0 = Some(q.clone());
     }
-    if let Some(c) = stmt.with_check.as_deref() {
+    if let Some(c) = stmt.with_check.as_ref() {
         quals.1 = Some(c.clone());
     }
     let refs = policy_refs(interp, table, &quals);
@@ -509,7 +511,7 @@ pub(crate) fn record_policy_alter(
 /// and its UPDATE OF columns.
 pub(crate) fn record_trigger(
     interp: &mut PgCatalog,
-    stmt: &protobuf::CreateTrigStmt,
+    stmt: &ast::CreateTrigStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -518,10 +520,10 @@ pub(crate) fn record_trigger(
         return Ok(());
     };
     let mut refs = names_of(interp, relid, &stmt.columns);
-    if let Some(when) = stmt.when_clause.as_deref() {
+    if let Some(when) = stmt.when_clause.as_ref() {
         let from = vec![
-            range_var_node(rv, Some("new")),
-            range_var_node(rv, Some("old")),
+            Some(range_var_node(rv, Some("new"))),
+            Some(range_var_node(rv, Some("old"))),
         ];
         refs.extend(
             statement_refs(interp, &select_of(&[when], from), &[])
@@ -545,7 +547,7 @@ pub(crate) fn record_trigger(
 /// standing for the rule's relation.
 pub(crate) fn record_rule(
     interp: &mut PgCatalog,
-    stmt: &protobuf::RuleStmt,
+    stmt: &ast::RuleStmt,
     analyzed: &[super::depend::Reference],
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
@@ -564,18 +566,18 @@ pub(crate) fn record_rule(
         return Ok(());
     }
     let new_old = vec![
-        range_var_node(rv, Some("new")),
-        range_var_node(rv, Some("old")),
+        Some(range_var_node(rv, Some("new"))),
+        Some(range_var_node(rv, Some("old"))),
     ];
     let mut refs: Vec<(PgClassOid, i16)> = Vec::new();
-    if let Some(qual) = stmt.where_clause.as_deref() {
+    if let Some(qual) = stmt.where_clause.as_ref() {
         refs.extend(statement_refs(
             interp,
             &select_of(&[qual], new_old.clone()),
             &[],
         ));
     }
-    for action in &stmt.actions {
+    for action in stmt.actions.iter().flatten() {
         refs.extend(statement_refs(interp, action, &new_old));
     }
     // The rule's own relation, through NEW / OLD, is its owner, not a
@@ -583,13 +585,13 @@ pub(crate) fn record_rule(
     refs.retain(|&(r, attnum)| r != relid || attnum != 0);
     // The functions its qualification and actions call.
     let mut functions: Vec<PgProcOid> = Vec::new();
-    if let Some(qual) = stmt.where_clause.as_deref() {
+    if let Some(qual) = stmt.where_clause.as_ref() {
         functions.extend(super::views::statement_functions(
             interp,
             &select_of(&[qual], new_old.clone()),
         ));
     }
-    for action in &stmt.actions {
+    for action in stmt.actions.iter().flatten() {
         functions.extend(statement_functions(interp, action, &new_old));
     }
     let dep = Dependent::Rule {

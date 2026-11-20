@@ -32,9 +32,9 @@ include = [
 ]
 
 [dependencies]
-# A tree's depth is bounded by the converter (10,000 message levels, as
-# libpg_query's protobuf encoder was): the stack for deeper ones is
-# src/stack.rs's.
+# A tree's depth is bounded by the converter (10,000 levels, as libpg_query's
+# was): the stack for deeper ones is src/stack.rs's, and NodeBox grows it to
+# drop them.
 serde = { version = "1", features = ["derive"] }
 stacker = "0.1"
 serde_json = "1"

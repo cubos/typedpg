@@ -10,7 +10,7 @@
 //! (`public`, a reserved `pg_` name): roles live in the cluster, outside
 //! what the migrations build.
 
-use typedpg_pg_query::protobuf::{GrantStmt, GrantTargetType, ObjectType, RoleSpecType, node};
+use typedpg_pg_query::ast::{self, GrantStmt, GrantTargetType, ObjectType, RoleSpecType};
 
 use super::DdlError;
 use super::util::node_string;
@@ -137,7 +137,7 @@ struct Privileges<'a> {
 /// ExecuteGrantStmt's privilege checks against the object type.
 fn check_privileges<'a>(
     objtype: ObjectType,
-    privileges: &'a [typedpg_pg_query::protobuf::Node],
+    privileges: &'a [Option<typedpg_pg_query::ast::Node>],
     default_privileges: bool,
 ) -> Result<Privileges<'a>, DdlError> {
     let mut out = Privileges {
@@ -149,7 +149,7 @@ fn check_privileges<'a>(
         return Ok(out);
     };
     for p in privileges {
-        let Some(node::Node::AccessPriv(ap)) = p.node.as_ref() else {
+        let Some(ast::Node::AccessPriv(ap)) = p.as_ref() else {
             continue;
         };
         if !ap.cols.is_empty() {
@@ -188,15 +188,15 @@ fn check_privileges<'a>(
 }
 
 /// get_rolespec_oid for the grantees; `true` when PUBLIC is among them.
-fn check_grantees(grantees: &[typedpg_pg_query::protobuf::Node]) -> Result<bool, DdlError> {
+fn check_grantees(grantees: &[Option<typedpg_pg_query::ast::Node>]) -> Result<bool, DdlError> {
     let mut public = false;
     for g in grantees {
-        let Some(node::Node::RoleSpec(rs)) = g.node.as_ref() else {
+        let Some(ast::Node::RoleSpec(rs)) = g.as_ref() else {
             continue;
         };
-        match RoleSpecType::try_from(rs.roletype) {
-            Ok(RoleSpecType::RolespecPublic) => public = true,
-            Ok(RoleSpecType::RolespecCstring) if !super::session::role_may_exist(&rs.rolename) => {
+        match rs.roletype {
+            RoleSpecType::RolespecPublic => public = true,
+            RoleSpecType::RolespecCstring if !super::session::role_may_exist(&rs.rolename) => {
                 return Err(DdlError::TypeNotFound(format!(
                     "role \"{}\" does not exist",
                     rs.rolename
@@ -219,8 +219,8 @@ fn check_grant_option(stmt: &GrantStmt, to_public: bool) -> Result<(), DdlError>
 }
 
 pub fn grant(interp: &PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
-    let targtype = GrantTargetType::try_from(stmt.targtype).unwrap_or(GrantTargetType::Undefined);
-    let objtype = ObjectType::try_from(stmt.objtype).unwrap_or(ObjectType::Undefined);
+    let targtype = stmt.targtype;
+    let objtype = stmt.objtype;
     // The target objects (objectNamesToOids / objectsInSchemaToOids).
     let mut targets = Vec::new();
     match targtype {
@@ -299,7 +299,7 @@ fn relations_in_schema(
 fn resolve_target(
     interp: &PgCatalog,
     objtype: ObjectType,
-    obj: &typedpg_pg_query::protobuf::Node,
+    obj: &Option<typedpg_pg_query::ast::Node>,
     is_grant: bool,
 ) -> Result<Option<Target>, DdlError> {
     use ObjectType as O;
@@ -308,13 +308,13 @@ fn resolve_target(
             "{what} \"{name}\" does not exist"
         )))
     };
-    Ok(Some(match (objtype, obj.node.as_ref()) {
-        (O::ObjectTable | O::ObjectSequence, Some(node::Node::RangeVar(rv))) => {
+    Ok(Some(match (objtype, obj.as_ref()) {
+        (O::ObjectTable | O::ObjectSequence, Some(ast::Node::RangeVar(rv))) => {
             Target::Relation(super::util::lookup_relation(interp, rv)?.1)
         }
         (
             O::ObjectFunction | O::ObjectProcedure | O::ObjectRoutine,
-            Some(inner @ node::Node::ObjectWithArgs(_)),
+            Some(inner @ ast::Node::ObjectWithArgs(_)),
         ) => {
             super::comment::resolve_object(interp, objtype, inner)?;
             Target::Other
@@ -329,8 +329,8 @@ fn resolve_target(
             }
             Target::Other
         }
-        (O::ObjectType | O::ObjectDomain, Some(node::Node::List(l))) => {
-            let tn = typedpg_pg_query::protobuf::TypeName {
+        (O::ObjectType | O::ObjectDomain, Some(ast::Node::List(l))) => {
+            let tn = typedpg_pg_query::ast::TypeName {
                 names: l.items.clone(),
                 ..Default::default()
             };
@@ -378,8 +378,8 @@ fn resolve_target(
         }
         (O::ObjectLargeobject, Some(n)) => {
             let oid = match n {
-                node::Node::Integer(i) => u32::try_from(i.ival).ok(),
-                node::Node::Float(f) => f.fval.parse().ok(),
+                ast::Node::Integer(i) => u32::try_from(i.ival).ok(),
+                ast::Node::Float(f) => f.fval.parse().ok(),
                 _ => None,
             };
             if let Some(oid) = oid
@@ -508,17 +508,17 @@ fn check_target(
 /// (ExecAlterDefaultPrivilegesStmt, SetDefaultACLsInSchemas, SetDefaultACL).
 pub fn alter_default_privileges(
     interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterDefaultPrivilegesStmt,
+    stmt: &typedpg_pg_query::ast::AlterDefaultPrivilegesStmt,
 ) -> Result<(), DdlError> {
     let mut schemas: Vec<&str> = Vec::new();
     for opt in &stmt.options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         if de.defname != "schemas" {
             continue;
         }
-        let Some(node::Node::List(list)) = de.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        let Some(ast::Node::List(list)) = de.arg.as_ref() else {
             continue;
         };
         schemas.extend(list.items.iter().filter_map(node_string));
@@ -526,7 +526,7 @@ pub fn alter_default_privileges(
     let Some(action) = stmt.action.as_ref() else {
         return Ok(());
     };
-    let objtype = ObjectType::try_from(action.objtype).unwrap_or(ObjectType::Undefined);
+    let objtype = action.objtype;
     let to_public = check_grantees(&action.grantees)?;
     check_privileges(objtype, &action.privileges, true)?;
     for schema in &schemas {

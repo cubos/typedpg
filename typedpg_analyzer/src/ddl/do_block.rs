@@ -21,7 +21,7 @@
 //! against).
 
 use serde_json::Value;
-use typedpg_pg_query::protobuf::{KeywordKind, Token, a_const, node};
+use typedpg_pg_query::ast::{self, KeywordKind, Token};
 
 use super::DdlError;
 use crate::pg_catalog::PgCatalog;
@@ -57,17 +57,17 @@ struct Run {
 /// Run the PL/pgSQL `DO` block `code` against the catalog.
 pub(crate) fn execute(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::DoStmt,
+    stmt: &typedpg_pg_query::ast::DoStmt,
 ) -> Result<(), DdlError> {
     // The block's statements are parsed from its code, not the migration.
     let _barrier = crate::error::DiagContextGuard::barrier();
     let mut code = None;
     let mut language = "plpgsql".to_owned();
     for arg in &stmt.args {
-        let Some(node::Node::DefElem(de)) = arg.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = arg.as_ref() else {
             continue;
         };
-        let Some(node::Node::String(s)) = de.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        let Some(ast::Node::String(s)) = de.arg.as_ref() else {
             continue;
         };
         match de.defname.as_str() {
@@ -167,30 +167,30 @@ fn expr_query(expr: &Value) -> Option<&str> {
 /// `expr` isn't a constant.
 fn constant(expr: &str) -> Option<Option<String>> {
     let parsed = typedpg_pg_query::parse(&format!("SELECT {expr}")).ok()?;
-    let [raw] = parsed.protobuf.stmts.as_slice() else {
+    let [raw] = parsed.tree.stmts.as_slice() else {
         return None;
     };
-    let Some(node::Node::SelectStmt(select)) = raw.stmt.as_ref()?.node.as_ref() else {
+    let Some(ast::Node::SelectStmt(select)) = raw.stmt.as_ref() else {
         return None;
     };
     let [target] = select.target_list.as_slice() else {
         return None;
     };
-    let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+    let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
         return None;
     };
-    let Some(node::Node::AConst(c)) = rt.val.as_deref()?.node.as_ref() else {
+    let Some(ast::Node::AConst(c)) = rt.val.as_ref() else {
         return None;
     };
     if c.isnull {
         return Some(None);
     }
     Some(Some(match c.val.as_ref()? {
-        a_const::Val::Ival(i) => i.ival.to_string(),
-        a_const::Val::Fval(f) => f.fval.clone(),
-        a_const::Val::Sval(s) => s.sval.clone(),
-        a_const::Val::Boolval(b) => if b.boolval { "t" } else { "f" }.to_owned(),
-        a_const::Val::Bsval(b) => b.bsval.clone(),
+        ast::AConstValue::Integer(i) => i.ival.to_string(),
+        ast::AConstValue::Float(f) => f.fval.clone(),
+        ast::AConstValue::String(s) => s.sval.clone(),
+        ast::AConstValue::Boolean(b) => if b.boolval { "t" } else { "f" }.to_owned(),
+        ast::AConstValue::BitString(b) => b.bsval.clone(),
     }))
 }
 
@@ -203,12 +203,12 @@ impl Run {
             return true;
         };
         scan.tokens.iter().any(|t| {
-            let identifier = t.token == Token::Ident as i32
+            let identifier = t.token == Token::Ident
                 || matches!(
-                    KeywordKind::try_from(t.keyword_kind),
-                    Ok(KeywordKind::UnreservedKeyword
+                    t.keyword_kind,
+                    KeywordKind::UnreservedKeyword
                         | KeywordKind::ColNameKeyword
-                        | KeywordKind::TypeFuncNameKeyword)
+                        | KeywordKind::TypeFuncNameKeyword
                 );
             if !identifier {
                 return false;
@@ -535,27 +535,27 @@ fn runs_in_a_function(sql: &str) -> bool {
     let Ok(parsed) = typedpg_pg_query::parse(sql) else {
         return true;
     };
-    !parsed.protobuf.stmts.iter().any(|raw| {
+    !parsed.tree.stmts.iter().any(|raw| {
         matches!(
-            raw.stmt.as_ref().and_then(|n| n.node.as_ref()),
+            raw.stmt.as_ref(),
             Some(
-                node::Node::TransactionStmt(_)
-                    | node::Node::VacuumStmt(_)
-                    | node::Node::ReindexStmt(_)
-                    | node::Node::ClusterStmt(_)
-                    | node::Node::CreatedbStmt(_)
-                    | node::Node::DropdbStmt(_)
-                    | node::Node::CreateTableSpaceStmt(_)
-                    | node::Node::DropTableSpaceStmt(_)
-                    | node::Node::AlterSystemStmt(_)
-                    | node::Node::DiscardStmt(_)
-                    | node::Node::LockStmt(_)
-                    | node::Node::DeclareCursorStmt(_)
-                    | node::Node::DoStmt(_)
+                ast::Node::TransactionStmt(_)
+                    | ast::Node::VacuumStmt(_)
+                    | ast::Node::ReindexStmt(_)
+                    | ast::Node::ClusterStmt(_)
+                    | ast::Node::CreatedbStmt(_)
+                    | ast::Node::DropdbStmt(_)
+                    | ast::Node::CreateTableSpaceStmt(_)
+                    | ast::Node::DropTableSpaceStmt(_)
+                    | ast::Node::AlterSystemStmt(_)
+                    | ast::Node::DiscardStmt(_)
+                    | ast::Node::LockStmt(_)
+                    | ast::Node::DeclareCursorStmt(_)
+                    | ast::Node::DoStmt(_)
             )
         ) || matches!(
-            raw.stmt.as_ref().and_then(|n| n.node.as_ref()),
-            Some(node::Node::IndexStmt(i)) if i.concurrent
+            raw.stmt.as_ref(),
+            Some(ast::Node::IndexStmt(i)) if i.concurrent
         )
     })
 }
@@ -567,13 +567,7 @@ fn check_constant(interp: &PgCatalog, constant: &str, type_name: &str) -> Result
     let Ok(parsed) = typedpg_pg_query::parse(&sql) else {
         return Ok(());
     };
-    let Some(stmt) = parsed
-        .protobuf
-        .stmts
-        .first()
-        .and_then(|s| s.stmt.as_ref())
-        .and_then(|n| n.node.as_ref())
-    else {
+    let Some(stmt) = parsed.tree.stmts.first().and_then(|s| s.stmt.as_ref()) else {
         return Ok(());
     };
     super::dml::check_statement(interp, stmt)

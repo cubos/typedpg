@@ -1,6 +1,6 @@
 //! CREATE SCHEMA handler.
 
-use typedpg_pg_query::protobuf::{CreateSchemaStmt, node};
+use typedpg_pg_query::ast::{self, CreateSchemaStmt};
 
 use super::DdlError;
 use super::util::ensure_namespace;
@@ -24,23 +24,19 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     // get_rolespec_oid: the owner role must exist — `public` never does.
     // CURRENT_USER / CURRENT_ROLE / SESSION_USER are known once the
     // migrations name them (SET ROLE / SET SESSION AUTHORIZATION).
-    use typedpg_pg_query::protobuf::RoleSpecType;
-    let role =
-        stmt.authrole
-            .as_ref()
-            .and_then(|r| match RoleSpecType::try_from(r.roletype).ok()? {
-                RoleSpecType::RolespecCstring => Some(Ok(r.rolename.clone())),
-                RoleSpecType::RolespecPublic => Some(Err("public".to_owned())),
-                RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser => interp
-                    .session_identity
-                    .current_user()
-                    .map(|u| Ok(u.to_owned())),
-                RoleSpecType::RolespecSessionUser => interp
-                    .session_identity
-                    .session_user()
-                    .map(|u| Ok(u.to_owned())),
-                RoleSpecType::Undefined => None,
-            });
+    use typedpg_pg_query::ast::RoleSpecType;
+    let role = stmt.authrole.as_ref().and_then(|r| match r.roletype {
+        RoleSpecType::RolespecCstring => Some(Ok(r.rolename.clone())),
+        RoleSpecType::RolespecPublic => Some(Err("public".to_owned())),
+        RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser => interp
+            .session_identity
+            .current_user()
+            .map(|u| Ok(u.to_owned())),
+        RoleSpecType::RolespecSessionUser => interp
+            .session_identity
+            .session_user()
+            .map(|u| Ok(u.to_owned())),
+    });
     let role = match role {
         Some(Ok(name)) if super::session::role_may_exist(&name) => Some(name),
         Some(Ok(name)) | Some(Err(name)) => {
@@ -75,12 +71,12 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     // the new schema pushed in front of the search path, so their unqualified
     // references see it first (PushOverrideSearchPath).
     for elt in &stmt.schema_elts {
-        let target_schema = match elt.node.as_ref() {
-            Some(node::Node::CreateStmt(s)) => s.relation.as_ref().map(|r| &r.schemaname),
-            Some(node::Node::ViewStmt(s)) => s.view.as_ref().map(|r| &r.schemaname),
-            Some(node::Node::CreateSeqStmt(s)) => s.sequence.as_ref().map(|r| &r.schemaname),
-            Some(node::Node::IndexStmt(s)) => s.relation.as_ref().map(|r| &r.schemaname),
-            Some(node::Node::CreateTrigStmt(s)) => s.relation.as_ref().map(|r| &r.schemaname),
+        let target_schema = match elt.as_ref() {
+            Some(ast::Node::CreateStmt(s)) => s.relation.as_ref().map(|r| &r.schemaname),
+            Some(ast::Node::ViewStmt(s)) => s.view.as_ref().map(|r| &r.schemaname),
+            Some(ast::Node::CreateSeqStmt(s)) => s.sequence.as_ref().map(|r| &r.schemaname),
+            Some(ast::Node::IndexStmt(s)) => s.relation.as_ref().map(|r| &r.schemaname),
+            Some(ast::Node::CreateTrigStmt(s)) => s.relation.as_ref().map(|r| &r.schemaname),
             _ => None,
         };
         if let Some(schema) = target_schema
@@ -95,18 +91,18 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     // transformCreateSchemaStmtElements runs them grouped by kind so that
     // no element refers to one created later: sequences, tables, views,
     // indexes, triggers, then grants — each group in the order given.
-    let rank = |node: &node::Node| match node {
-        node::Node::CreateSeqStmt(_) => 0,
-        node::Node::CreateStmt(_) => 1,
-        node::Node::ViewStmt(_) => 2,
-        node::Node::IndexStmt(_) => 3,
-        node::Node::CreateTrigStmt(_) => 4,
+    let rank = |node: &ast::Node| match node {
+        ast::Node::CreateSeqStmt(_) => 0,
+        ast::Node::CreateStmt(_) => 1,
+        ast::Node::ViewStmt(_) => 2,
+        ast::Node::IndexStmt(_) => 3,
+        ast::Node::CreateTrigStmt(_) => 4,
         _ => 5,
     };
-    let mut elements: Vec<&node::Node> = stmt
+    let mut elements: Vec<&ast::Node> = stmt
         .schema_elts
         .iter()
-        .filter_map(|elt| elt.node.as_ref())
+        .filter_map(|elt| elt.as_ref())
         .collect();
     elements.sort_by_key(|node| rank(node));
     let saved = interp.push_search_path_front(&name);

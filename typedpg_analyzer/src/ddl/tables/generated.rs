@@ -4,6 +4,7 @@
 //! `CHKATYPE_IS_VIRTUAL`).
 
 use super::*;
+use typedpg_pg_query::ast;
 
 /// `FirstUnpinnedObjectId` (transam.h): objects below it are created by
 /// initdb and count as built-in.
@@ -208,7 +209,7 @@ pub(crate) fn cook_generation_expr(
     attname: &str,
     atttypid: PgTypeOid,
     kind: AttGenerated,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<CookedGeneration, DdlError> {
     use crate::ddl::expr_kind::{ExprKind, check_expr_kind};
     use crate::ddl::volatile::{ExprLocation, check_mutability, infer_over_relation};
@@ -219,8 +220,7 @@ pub(crate) fn cook_generation_expr(
         .map_err(unsupported)?;
 
     let relname = relname_of(interp, relid);
-    let column_refs: Vec<&typedpg_pg_query::protobuf::ColumnRef> = expr
-        .node
+    let column_refs: Vec<&typedpg_pg_query::ast::ColumnRef> = expr
         .as_ref()
         .map(|inner| {
             inner
@@ -274,7 +274,7 @@ pub(crate) fn cook_generation_expr(
 
     // check_nested_generated.
     let mut refs: Vec<i16> = Vec::new();
-    let selected = |cr: &typedpg_pg_query::protobuf::ColumnRef| {
+    let selected = |cr: &typedpg_pg_query::ast::ColumnRef| {
         selections
             .iter()
             .find(|(r, _)| std::ptr::eq(*r, cr))
@@ -283,7 +283,7 @@ pub(crate) fn cook_generation_expr(
     for cr in &column_refs {
         let whole_row = selected(cr).is_none()
             && match cr.fields.as_slice() {
-                [.., last] if matches!(last.node.as_ref(), Some(node::Node::AStar(_))) => true,
+                [.., last] if matches!(last.as_ref(), Some(ast::Node::AStar(_))) => true,
                 [only] => crate::ddl::util::node_string(only)
                     .is_some_and(|n| n == relname && interp.attribute_by_name(relid, n).is_none()),
                 _ => false,
@@ -375,7 +375,7 @@ pub(crate) fn cook_generation_expr(
 fn infer_with_goal(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
     goal: crate::expr::TypeGoal,
 ) -> Result<crate::expr::ExprType, crate::error::AnalyzeError> {
     use crate::nullability::NullabilityContext;
@@ -415,7 +415,7 @@ fn infer_with_goal(
 fn check_virtual_generated_security(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
     used: &[crate::oid::PgProcOid],
     result: &crate::expr::ExprType,
 ) -> Result<(), DdlError> {
@@ -431,7 +431,7 @@ fn check_virtual_generated_security(
         used.iter()
             .filter_map(|f| interp.pg_proc.get(f).map(|p| p.prorettype)),
     );
-    if let Some(inner) = expr.node.as_ref() {
+    if let Some(inner) = expr.as_ref() {
         for (n, ..) in inner.nodes() {
             match n {
                 typedpg_pg_query::NodeRef::ColumnRef(cr) => {

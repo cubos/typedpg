@@ -5,6 +5,7 @@
 //! parent's; they are then counted as inherited.
 
 use super::*;
+use typedpg_pg_query::ast;
 
 /// `relispartition`: the relation is a partition of a partitioned table.
 pub(super) fn is_partition(interp: &PgCatalog, relid: PgClassOid) -> bool {
@@ -17,9 +18,9 @@ pub(super) fn is_partition(interp: &PgCatalog, relid: PgClassOid) -> bool {
     })
 }
 
-fn parent_rangevar(cmd: &AlterTableCmd) -> Option<&typedpg_pg_query::protobuf::RangeVar> {
-    match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
-        Some(node::Node::RangeVar(rv)) => Some(rv),
+fn parent_rangevar(cmd: &AlterTableCmd) -> Option<&typedpg_pg_query::ast::RangeVar> {
+    match cmd.def.as_ref() {
+        Some(ast::Node::RangeVar(rv)) => Some(rv),
         _ => None,
     }
 }
@@ -346,8 +347,7 @@ pub(super) fn attach_partition(
     parent: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::PartitionCmd(pc)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
-    else {
+    let Some(ast::Node::PartitionCmd(pc)) = cmd.def.as_ref() else {
         return Ok(());
     };
     let Some(rv) = pc.name.as_ref() else {
@@ -475,8 +475,7 @@ pub(super) fn detach_partition(
     parent: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::PartitionCmd(pc)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
-    else {
+    let Some(ast::Node::PartitionCmd(pc)) = cmd.def.as_ref() else {
         return Ok(());
     };
     let Some(rv) = pc.name.as_ref() else {
@@ -551,10 +550,10 @@ pub(super) fn detach_partition(
 fn add_detached_partition_check(
     interp: &mut PgCatalog,
     part: PgClassOid,
-    expr: typedpg_pg_query::protobuf::Node,
+    expr: typedpg_pg_query::ast::Node,
     vars: &[String],
 ) -> Result<(), DdlError> {
-    let stored = super::check_inherit::StoredExpr::written(&expr);
+    let stored = super::check_inherit::StoredExpr::Written(Box::new(Some(expr.clone())));
     if interp.pg_constraint.values().any(|c| {
         c.conrelid == part
             && c.contype == ConType::Check
@@ -608,8 +607,7 @@ pub(super) fn detach_partition_finalize(
     parent: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::PartitionCmd(pc)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
-    else {
+    let Some(ast::Node::PartitionCmd(pc)) = cmd.def.as_ref() else {
         return Ok(());
     };
     let Some(rv) = pc.name.as_ref() else {

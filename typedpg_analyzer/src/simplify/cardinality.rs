@@ -9,10 +9,10 @@
 //! answer is always sound, so every case this can't prove gives up.
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{
-    self, CommonTableExpr, DeleteStmt, GroupingSetKind, InsertStmt, JoinType, LimitOption,
-    MergeMatchKind, MergeStmt, ReturningClause, SelectStmt, SetOperation, UpdateStmt, WithClause,
-    a_const::Val, node::Node,
+use typedpg_pg_query::ast::{
+    self, AConstValue, CommonTableExpr, DeleteStmt, GroupingSetKind, InsertStmt, JoinType,
+    LimitOption, MergeMatchKind, MergeStmt, Node, ReturningClause, SelectStmt, SetOperation,
+    UpdateStmt, WithClause,
 };
 
 use super::Ctx;
@@ -196,7 +196,7 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
     let mut found = None;
     let env = CteEnv::default();
     for raw in &view.tree.stmts {
-        if let Some(root) = raw.stmt.as_deref().and_then(|node| node.node.as_ref()) {
+        if let Some(root) = raw.stmt.as_ref() {
             find_select(
                 &ctx,
                 root.to_ref(),
@@ -231,7 +231,7 @@ pub(super) fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> boo
     let mut found = None;
     let env = CteEnv::default();
     for raw in &ctx.tree.stmts {
-        if let Some(root) = raw.stmt.as_deref().and_then(|node| node.node.as_ref()) {
+        if let Some(root) = raw.stmt.as_ref() {
             find_select(
                 ctx,
                 root.to_ref(),
@@ -283,13 +283,7 @@ pub fn statement_at_most_one_row(catalog: &PgCatalog, view: &QueryView) -> bool 
         catalog,
         analyzed: &view.analyzed,
     };
-    let Some(statement) = view
-        .tree
-        .stmts
-        .first()
-        .and_then(|raw| raw.stmt.as_deref())
-        .and_then(|node| node.node.as_ref())
-    else {
+    let Some(statement) = view.tree.stmts.first().and_then(|raw| raw.stmt.as_ref()) else {
         return false;
     };
     statement_at_most_one_row_in(&ctx, statement.to_ref(), &CteEnv::default(), None)
@@ -330,13 +324,13 @@ fn visible_ctes(
     // forward reference never falls through to a table of the same name.
     if with.recursive {
         for node in &with.ctes {
-            if let Some(Node::CommonTableExpr(cte)) = &node.node {
+            if let Some(Node::CommonTableExpr(cte)) = node {
                 after.insert(cte.ctename.clone(), None);
             }
         }
     }
     for node in &with.ctes {
-        let Some(Node::CommonTableExpr(cte)) = &node.node else {
+        let Some(Node::CommonTableExpr(cte)) = node else {
             continue;
         };
         // `WITH RECURSIVE` only allows recursion; a CTE whose body never
@@ -346,11 +340,10 @@ fn visible_ctes(
         let recursive = with.recursive
             && (cte.search_clause.is_some()
                 || cte.cycle_clause.is_some()
-                || cte.ctequery.as_deref().is_some_and(|body| {
-                    body.node
-                        .as_ref()
-                        .is_some_and(|body| references_cte(body.to_ref(), &cte.ctename))
-                }));
+                || cte
+                    .ctequery
+                    .as_ref()
+                    .is_some_and(|body| references_cte(body.to_ref(), &cte.ctename)));
         if recursive {
             after.insert(cte.ctename.clone(), None);
             bodies.push(after.clone());
@@ -388,7 +381,7 @@ pub(super) fn subquery_cte_env(
     select: &SelectStmt,
     parent: &FromScope<'_>,
 ) -> CteEnv {
-    visible_ctes(ctx, env, select.with_clause.as_ref(), Some(parent)).after
+    visible_ctes(ctx, env, select.with_clause.as_deref(), Some(parent)).after
 }
 
 /// Whether `cte`'s output columns are known, and whether its body — with
@@ -408,11 +401,7 @@ fn single_row_cte(
     if cte.search_clause.is_some() || cte.cycle_clause.is_some() {
         return None;
     }
-    let body = cte
-        .ctequery
-        .as_deref()
-        .and_then(|node| node.node.as_ref())?
-        .to_ref();
+    let body = cte.ctequery.as_ref()?.to_ref();
     let returns_rows = match body {
         NodeRef::SelectStmt(_) => true,
         NodeRef::InsertStmt(insert) => insert.returning_clause.is_some(),
@@ -429,7 +418,7 @@ fn single_row_cte(
         &visible_ctes(ctx, env, with_clause(body), parent).after,
     );
     for (column, alias) in columns.iter_mut().zip(&cte.aliascolnames) {
-        let Some(Node::String(name)) = &alias.node else {
+        let Some(Node::String(name)) = alias else {
             return None;
         };
         column.name = Some(name.sval.clone());
@@ -452,11 +441,11 @@ fn single_row_cte(
 /// The WITH clause a statement node carries.
 fn with_clause(node: NodeRef<'_>) -> Option<&WithClause> {
     match node {
-        NodeRef::SelectStmt(statement) => statement.with_clause.as_ref(),
-        NodeRef::InsertStmt(statement) => statement.with_clause.as_ref(),
-        NodeRef::UpdateStmt(statement) => statement.with_clause.as_ref(),
-        NodeRef::DeleteStmt(statement) => statement.with_clause.as_ref(),
-        NodeRef::MergeStmt(statement) => statement.with_clause.as_ref(),
+        NodeRef::SelectStmt(statement) => statement.with_clause.as_deref(),
+        NodeRef::InsertStmt(statement) => statement.with_clause.as_deref(),
+        NodeRef::UpdateStmt(statement) => statement.with_clause.as_deref(),
+        NodeRef::DeleteStmt(statement) => statement.with_clause.as_deref(),
+        NodeRef::MergeStmt(statement) => statement.with_clause.as_deref(),
         _ => None,
     }
 }
@@ -467,23 +456,23 @@ fn cte_output_columns(ctx: &Ctx<'_>, body: NodeRef<'_>, env: &CteEnv) -> Vec<Cte
         NodeRef::SelectStmt(select) => select_output_columns(ctx, select, env),
         NodeRef::InsertStmt(insert) => returning_columns(
             ctx,
-            insert.relation.as_ref(),
+            insert.relation.as_deref(),
             &[],
-            insert.returning_clause.as_ref(),
+            insert.returning_clause.as_deref(),
             env,
         ),
         NodeRef::UpdateStmt(update) => returning_columns(
             ctx,
-            update.relation.as_ref(),
+            update.relation.as_deref(),
             &update.from_clause,
-            update.returning_clause.as_ref(),
+            update.returning_clause.as_deref(),
             env,
         ),
         NodeRef::DeleteStmt(delete) => returning_columns(
             ctx,
-            delete.relation.as_ref(),
+            delete.relation.as_deref(),
             &delete.using_clause,
-            delete.returning_clause.as_ref(),
+            delete.returning_clause.as_deref(),
             env,
         ),
         _ => Vec::new(),
@@ -499,7 +488,7 @@ pub(super) fn select_output_columns(
     select: &SelectStmt,
     env: &CteEnv,
 ) -> Vec<CteColumn> {
-    if select.op() != SetOperation::SetopNone {
+    if select.op != SetOperation::SetopNone {
         let (Some(left), Some(right)) = (select.larg.as_deref(), select.rarg.as_deref()) else {
             return Vec::new();
         };
@@ -522,7 +511,7 @@ pub(super) fn select_output_columns(
         // deterministic collation. PG coerces the rows to a common type this
         // doesn't model, so any other shape stays unknown.
         let mut rows = select.values_lists.iter();
-        let Some(Node::List(first)) = rows.next().and_then(|node| node.node.as_ref()) else {
+        let Some(Node::List(first)) = rows.next().and_then(|node| node.as_ref()) else {
             return Vec::new();
         };
         let mut out: Vec<CteColumn> = first
@@ -539,7 +528,7 @@ pub(super) fn select_output_columns(
             })
             .collect();
         for row in rows {
-            let Some(Node::List(list)) = row.node.as_ref() else {
+            let Some(Node::List(list)) = row.as_ref() else {
                 return Vec::new();
             };
             if list.items.len() != out.len() {
@@ -562,13 +551,14 @@ pub(super) fn select_output_columns(
     let scope = Scope::build_env(ctx, env, &select.from_clause, &root);
     let mut out = Vec::new();
     for target in &select.target_list {
-        let Some(Node::ResTarget(target)) = &target.node else {
+        let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        let Some(value) = target.val.as_deref() else {
+        if target.val.is_none() {
             return Vec::new();
-        };
-        if let Some(Node::ColumnRef(column)) = &value.node
+        }
+        let value = &target.val;
+        if let Some(Node::ColumnRef(column)) = value
             && let Fields::Star(qualifier) = dedup::column_ref_fields(column)
         {
             let Some(scope) = scope.as_ref() else {
@@ -628,8 +618,8 @@ pub(super) fn select_output_columns(
 /// CTE, but its columns' types are unknown: a key equality can't read them.
 fn returning_columns(
     ctx: &Ctx<'_>,
-    relation: Option<&protobuf::RangeVar>,
-    from: &[protobuf::Node],
+    relation: Option<&ast::RangeVar>,
+    from: &[Option<ast::Node>],
     returning: Option<&ReturningClause>,
     env: &CteEnv,
 ) -> Vec<CteColumn> {
@@ -645,13 +635,14 @@ fn returning_columns(
     let scope = Scope::dml(ctx, env, relation, from);
     let mut out = Vec::new();
     for target in &returning.exprs {
-        let Some(Node::ResTarget(target)) = &target.node else {
+        let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        let Some(value) = target.val.as_deref() else {
+        if target.val.is_none() {
             return Vec::new();
-        };
-        if let Some(Node::ColumnRef(column)) = &value.node
+        }
+        let value = &target.val;
+        if let Some(Node::ColumnRef(column)) = value
             && let Some(qualifier) = star_ref(column)
         {
             let target_star = match qualifier {
@@ -718,17 +709,14 @@ fn returning_columns(
 
 /// The qualifier of a star reference: `Some(None)` for `*`, `Some(Some(q))`
 /// for `q.*` (or the table part of `schema.q.*`), `None` for anything else.
-fn star_ref(column: &protobuf::ColumnRef) -> Option<Option<&str>> {
+fn star_ref(column: &ast::ColumnRef) -> Option<Option<&str>> {
     let (last, names) = column.fields.split_last()?;
-    if !matches!(last.node, Some(Node::AStar(_))) {
+    if !matches!(last, Some(Node::AStar(_))) {
         return None;
     }
     match names {
         [] => Some(None),
-        [qualifier] => match &qualifier.node {
-            Some(Node::String(string)) => Some(Some(string.sval.as_str())),
-            _ => Some(Some("")),
-        },
+        [Some(Node::String(string))] => Some(Some(string.sval.as_str())),
         // A schema-qualified star: not the plain target name/alias, so let
         // it expand no known relation (its columns stay unknown).
         _ => Some(Some("")),
@@ -748,9 +736,9 @@ fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
 fn value_type(
     ctx: &Ctx<'_>,
     scope: Option<&Scope<'_>>,
-    value: &protobuf::Node,
+    value: &Option<ast::Node>,
 ) -> (Option<crate::oid::PgTypeOid>, bool) {
-    match value.node.as_ref() {
+    match value.as_ref() {
         Some(Node::ColumnRef(column)) => {
             let (Some(scope), Fields::Names(names)) = (scope, dedup::column_ref_fields(column))
             else {
@@ -784,9 +772,9 @@ fn value_type(
             }
         }
         Some(Node::AConst(constant)) if !constant.isnull => match constant.val.as_ref() {
-            Some(Val::Ival(_)) => (Some(oid::INT4), true),
-            Some(Val::Sval(_)) => (Some(oid::TEXT), true),
-            Some(Val::Boolval(_)) => (Some(oid::BOOL), true),
+            Some(AConstValue::Integer(_)) => (Some(oid::INT4), true),
+            Some(AConstValue::String(_)) => (Some(oid::TEXT), true),
+            Some(AConstValue::Boolean(_)) => (Some(oid::BOOL), true),
             _ => (None, false),
         },
         Some(Node::TypeCast(cast)) => {
@@ -826,8 +814,8 @@ fn value_type(
 /// other names from the expression (a cast from its argument, a function call
 /// from the function, `CASE` as `case`), which this doesn't reproduce, so
 /// anything else is unknown.
-fn output_name(value: &protobuf::Node) -> Option<String> {
-    let Node::ColumnRef(column) = value.node.as_ref()? else {
+fn output_name(value: &Option<ast::Node>) -> Option<String> {
+    let Node::ColumnRef(column) = value.as_ref()? else {
         return None;
     };
     let Fields::Names(names) = dedup::column_ref_fields(column) else {
@@ -837,10 +825,10 @@ fn output_name(value: &protobuf::Node) -> Option<String> {
 }
 
 #[cfg(test)]
-fn string_list(nodes: &[protobuf::Node]) -> Vec<&str> {
+fn string_list(nodes: &[Option<ast::Node>]) -> Vec<&str> {
     nodes
         .iter()
-        .filter_map(|node| match &node.node {
+        .filter_map(|node| match node {
             Some(Node::String(string)) => Some(string.sval.as_str()),
             _ => None,
         })
@@ -879,7 +867,7 @@ fn find_select(
     }
     match node {
         NodeRef::SelectStmt(select) => {
-            let visible = visible_ctes(ctx, env, select.with_clause.as_ref(), parent);
+            let visible = visible_ctes(ctx, env, select.with_clause.as_deref(), parent);
             if std::ptr::eq(select, target) {
                 let scope = FromScope::of_select(ctx, select, parent);
                 *out = Some(match check {
@@ -894,14 +882,14 @@ fn find_select(
             }
             find_cte_bodies(
                 ctx,
-                select.with_clause.as_ref(),
+                select.with_clause.as_deref(),
                 &visible.bodies,
                 parent,
                 target,
                 check,
                 out,
             );
-            if select.op() != SetOperation::SetopNone {
+            if select.op != SetOperation::SetopNone {
                 for arm in [select.larg.as_deref(), select.rarg.as_deref()]
                     .into_iter()
                     .flatten()
@@ -937,26 +925,26 @@ fn find_select(
             );
         }
         NodeRef::InsertStmt(insert) => {
-            let visible = visible_ctes(ctx, env, insert.with_clause.as_ref(), parent);
+            let visible = visible_ctes(ctx, env, insert.with_clause.as_deref(), parent);
             find_cte_bodies(
                 ctx,
-                insert.with_clause.as_ref(),
+                insert.with_clause.as_deref(),
                 &visible.bodies,
                 parent,
                 target,
                 check,
                 out,
             );
-            let scope = FromScope::of_dml(ctx, insert.relation.as_ref(), &[], parent);
+            let scope = FromScope::of_dml(ctx, insert.relation.as_deref(), &[], parent);
             for child in insert_children(insert) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
         }
         NodeRef::UpdateStmt(update) => {
-            let visible = visible_ctes(ctx, env, update.with_clause.as_ref(), parent);
+            let visible = visible_ctes(ctx, env, update.with_clause.as_deref(), parent);
             find_cte_bodies(
                 ctx,
-                update.with_clause.as_ref(),
+                update.with_clause.as_deref(),
                 &visible.bodies,
                 parent,
                 target,
@@ -964,7 +952,7 @@ fn find_select(
                 out,
             );
             let scope =
-                FromScope::of_dml(ctx, update.relation.as_ref(), &update.from_clause, parent);
+                FromScope::of_dml(ctx, update.relation.as_deref(), &update.from_clause, parent);
             for child in update_children(update) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
@@ -980,18 +968,22 @@ fn find_select(
             );
         }
         NodeRef::DeleteStmt(delete) => {
-            let visible = visible_ctes(ctx, env, delete.with_clause.as_ref(), parent);
+            let visible = visible_ctes(ctx, env, delete.with_clause.as_deref(), parent);
             find_cte_bodies(
                 ctx,
-                delete.with_clause.as_ref(),
+                delete.with_clause.as_deref(),
                 &visible.bodies,
                 parent,
                 target,
                 check,
                 out,
             );
-            let scope =
-                FromScope::of_dml(ctx, delete.relation.as_ref(), &delete.using_clause, parent);
+            let scope = FromScope::of_dml(
+                ctx,
+                delete.relation.as_deref(),
+                &delete.using_clause,
+                parent,
+            );
             for child in delete_children(delete) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
@@ -1007,22 +999,22 @@ fn find_select(
             );
         }
         NodeRef::MergeStmt(merge) => {
-            let visible = visible_ctes(ctx, env, merge.with_clause.as_ref(), parent);
+            let visible = visible_ctes(ctx, env, merge.with_clause.as_deref(), parent);
             find_cte_bodies(
                 ctx,
-                merge.with_clause.as_ref(),
+                merge.with_clause.as_deref(),
                 &visible.bodies,
                 parent,
                 target,
                 check,
                 out,
             );
-            let source: &[protobuf::Node] = merge
-                .source_relation
-                .as_deref()
-                .map(std::slice::from_ref)
-                .unwrap_or_default();
-            let scope = FromScope::of_dml(ctx, merge.relation.as_ref(), source, parent);
+            let source: &[Option<ast::Node>] = if merge.source_relation.is_some() {
+                std::slice::from_ref(&merge.source_relation)
+            } else {
+                &[]
+            };
+            let scope = FromScope::of_dml(ctx, merge.relation.as_deref(), source, parent);
             for child in merge_children(merge) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
@@ -1033,9 +1025,7 @@ fn find_select(
         // which is what a non-`LATERAL` one sees; a `LATERAL` one may see
         // fewer items than PostgreSQL allows, giving up safely.
         NodeRef::RangeSubselect(sub) => {
-            if let Some(Node::SelectStmt(select)) =
-                sub.subquery.as_deref().and_then(|n| n.node.as_ref())
-            {
+            if let Some(Node::SelectStmt(select)) = sub.subquery.as_ref() {
                 find_select(
                     ctx,
                     NodeRef::SelectStmt(select),
@@ -1070,8 +1060,8 @@ fn find_select(
 #[allow(clippy::too_many_arguments)] // one per level's walker state
 fn find_select_from(
     ctx: &Ctx<'_>,
-    from: &[protobuf::Node],
-    left: &[protobuf::Node],
+    from: &[Option<ast::Node>],
+    left: &[Option<ast::Node>],
     level_parent: Option<&FromScope<'_>>,
     env: &CteEnv,
     target: &SelectStmt,
@@ -1091,8 +1081,8 @@ fn find_select_from(
 #[allow(clippy::too_many_arguments)] // one per level's walker state
 fn find_select_from_item(
     ctx: &Ctx<'_>,
-    item: &protobuf::Node,
-    left: &[protobuf::Node],
+    item: &Option<ast::Node>,
+    left: &[Option<ast::Node>],
     level_parent: Option<&FromScope<'_>>,
     env: &CteEnv,
     target: &SelectStmt,
@@ -1102,34 +1092,32 @@ fn find_select_from_item(
     if out.is_some() {
         return;
     }
-    match item.node.as_ref() {
+    match item.as_ref() {
         Some(Node::JoinExpr(join)) => {
             let mut join_left = left.to_vec();
-            if let Some(l) = join.larg.as_deref() {
+            if join.larg.is_some() {
+                let l = &join.larg;
                 find_select_from_item(ctx, l, &join_left, level_parent, env, target, check, out);
                 join_left.push(l.clone());
             }
-            if let Some(r) = join.rarg.as_deref() {
+            if join.rarg.is_some() {
+                let r = &join.rarg;
                 find_select_from_item(ctx, r, &join_left, level_parent, env, target, check, out);
             }
             // An ON condition sees its own join's two sides, not the other
             // FROM entries of the level.
-            if let Some(quals) = join.quals.as_deref()
-                && let Some(quals) = quals.node.as_ref()
-            {
-                let sides: Vec<protobuf::Node> = [&join.larg, &join.rarg]
+            if let Some(quals) = join.quals.as_ref() {
+                let sides: Vec<Option<ast::Node>> = [&join.larg, &join.rarg]
                     .into_iter()
-                    .flatten()
-                    .map(|n| (**n).clone())
+                    .filter(|n| n.is_some())
+                    .cloned()
                     .collect();
                 let scope = FromScope::of_items(ctx, &sides, level_parent);
                 find_select(ctx, quals.to_ref(), Some(&scope), env, target, check, out);
             }
         }
         Some(Node::RangeSubselect(sub)) => {
-            if let Some(Node::SelectStmt(select)) =
-                sub.subquery.as_deref().and_then(|n| n.node.as_ref())
-            {
+            if let Some(Node::SelectStmt(select)) = sub.subquery.as_ref() {
                 if sub.lateral {
                     let scope = FromScope::of_items_nested(ctx, left, level_parent);
                     find_select(
@@ -1160,14 +1148,14 @@ fn find_select_from_item(
             // `LATERAL` is a noise word before a function call: its
             // arguments already read the items to its left.
             let scope = FromScope::of_items_nested(ctx, left, level_parent);
-            if let Some(root) = item.node.as_ref() {
+            if let Some(root) = item.as_ref() {
                 for child in root.to_ref().children() {
                     find_select(ctx, child, Some(&scope), env, target, check, out);
                 }
             }
         }
         _ => {
-            if let Some(root) = item.node.as_ref() {
+            if let Some(root) = item.as_ref() {
                 for child in root.to_ref().children() {
                     find_select(ctx, child, level_parent, env, target, check, out);
                 }
@@ -1190,8 +1178,8 @@ fn find_cte_bodies(
         return;
     };
     for (node, env) in with.ctes.iter().zip(bodies) {
-        if let Some(Node::CommonTableExpr(cte)) = &node.node
-            && let Some(body) = cte.ctequery.as_deref().and_then(|n| n.node.as_ref())
+        if let Some(Node::CommonTableExpr(cte)) = node
+            && let Some(body) = cte.ctequery.as_ref()
         {
             find_select(ctx, body.to_ref(), parent, env, target, check, out);
         }
@@ -1219,7 +1207,7 @@ fn select_children(select: &SelectStmt) -> Vec<NodeRef<'_>> {
         &select.limit_count,
         &select.limit_offset,
     ] {
-        if let Some(node) = node.as_deref().and_then(|node| node.node.as_ref()) {
+        if let Some(node) = node.as_ref() {
             out.push(node.to_ref());
         }
     }
@@ -1228,11 +1216,7 @@ fn select_children(select: &SelectStmt) -> Vec<NodeRef<'_>> {
 
 fn insert_children(insert: &InsertStmt) -> Vec<NodeRef<'_>> {
     let mut out: Vec<NodeRef<'_>> = refs(&insert.cols).collect();
-    if let Some(node) = insert
-        .select_stmt
-        .as_deref()
-        .and_then(|node| node.node.as_ref())
-    {
+    if let Some(node) = insert.select_stmt.as_ref() {
         out.push(node.to_ref());
     }
     if let Some(conflict) = &insert.on_conflict_clause {
@@ -1246,11 +1230,7 @@ fn insert_children(insert: &InsertStmt) -> Vec<NodeRef<'_>> {
 
 fn update_children(update: &UpdateStmt) -> Vec<NodeRef<'_>> {
     let mut out: Vec<NodeRef<'_>> = refs(&update.target_list).collect();
-    if let Some(node) = update
-        .where_clause
-        .as_deref()
-        .and_then(|node| node.node.as_ref())
-    {
+    if let Some(node) = update.where_clause.as_ref() {
         out.push(node.to_ref());
     }
     if let Some(returning) = &update.returning_clause {
@@ -1261,11 +1241,7 @@ fn update_children(update: &UpdateStmt) -> Vec<NodeRef<'_>> {
 
 fn delete_children(delete: &DeleteStmt) -> Vec<NodeRef<'_>> {
     let mut out: Vec<NodeRef<'_>> = Vec::new();
-    if let Some(node) = delete
-        .where_clause
-        .as_deref()
-        .and_then(|node| node.node.as_ref())
-    {
+    if let Some(node) = delete.where_clause.as_ref() {
         out.push(node.to_ref());
     }
     if let Some(returning) = &delete.returning_clause {
@@ -1276,11 +1252,7 @@ fn delete_children(delete: &DeleteStmt) -> Vec<NodeRef<'_>> {
 
 fn merge_children(merge: &MergeStmt) -> Vec<NodeRef<'_>> {
     let mut out: Vec<NodeRef<'_>> = refs(&merge.merge_when_clauses).collect();
-    if let Some(node) = merge
-        .join_condition
-        .as_deref()
-        .and_then(|node| node.node.as_ref())
-    {
+    if let Some(node) = merge.join_condition.as_ref() {
         out.push(node.to_ref());
     }
     if let Some(returning) = &merge.returning_clause {
@@ -1311,16 +1283,16 @@ fn statement_at_most_one_row_in(
         NodeRef::UpdateStmt(update) => dml_at_most_one_row(
             ctx,
             &env,
-            update.relation.as_ref(),
+            update.relation.as_deref(),
             &update.from_clause,
-            update.where_clause.as_deref(),
+            &update.where_clause,
         ),
         NodeRef::DeleteStmt(delete) => dml_at_most_one_row(
             ctx,
             &env,
-            delete.relation.as_ref(),
+            delete.relation.as_deref(),
             &delete.using_clause,
-            delete.where_clause.as_deref(),
+            &delete.where_clause,
         ),
         NodeRef::MergeStmt(merge) => merge_at_most_one_row(ctx, merge, &env),
         _ => false,
@@ -1333,7 +1305,7 @@ pub(super) fn select_at_most_one_row_in(
     outer: &FromScope<'_>,
     env: &CteEnv,
 ) -> bool {
-    if select.op() != SetOperation::SetopNone || select.into_clause.is_some() {
+    if select.op != SetOperation::SetopNone || select.into_clause.is_some() {
         return false;
     }
     // `GROUP BY ()` is a single empty grouping set: one group, like an
@@ -1344,7 +1316,7 @@ pub(super) fn select_at_most_one_row_in(
     let plain_group = select
         .group_clause
         .iter()
-        .all(|group| !matches!(&group.node, Some(Node::GroupingSet(_))));
+        .all(|group| !matches!(group, Some(Node::GroupingSet(_))));
     if select.group_distinct
         || (!select.group_clause.is_empty() && !empty_grouping_set && !plain_group)
     {
@@ -1400,7 +1372,7 @@ pub(super) fn select_at_most_one_row_in(
     let distinct_on = !dedup::is_plain_distinct(select) && !select.distinct_clause.is_empty();
     if grouped || distinct_on {
         let Some(determination) =
-            determined_relations(ctx, select.where_clause.as_deref(), &scope, outer, env)
+            determined_relations(ctx, &select.where_clause, &scope, outer, env)
         else {
             return false;
         };
@@ -1436,7 +1408,7 @@ fn grouping_key_single_valued(
     ctx: &Ctx<'_>,
     scope: &Scope<'_>,
     determination: &Determination,
-    item: &protobuf::Node,
+    item: &Option<ast::Node>,
     positional: bool,
 ) -> bool {
     // `GROUP BY (a, b)` is the two items `a` and `b` (PG's
@@ -1448,9 +1420,9 @@ fn grouping_key_single_valued(
     }
     if positional
         && matches!(
-            item.node.as_ref(),
+            item.as_ref(),
             Some(Node::AConst(constant))
-                if !constant.isnull && matches!(constant.val, Some(Val::Ival(_)))
+                if !constant.isnull && matches!(constant.val, Some(AConstValue::Integer(_)))
         )
     {
         return false;
@@ -1481,8 +1453,8 @@ fn grouping_key_single_valued(
 /// input column has the same name. A target whose output name this can't
 /// tell (`FigureColname` derives it from the expression) may be the one a
 /// bare name means, so such a key is refused too.
-fn distinct_on_key_reads_input(select: &SelectStmt, key: &protobuf::Node) -> bool {
-    let Some(Node::ColumnRef(column)) = key.node.as_ref() else {
+fn distinct_on_key_reads_input(select: &SelectStmt, key: &Option<ast::Node>) -> bool {
+    let Some(Node::ColumnRef(column)) = key.as_ref() else {
         return true;
     };
     let Fields::Names(names) = dedup::column_ref_fields(column) else {
@@ -1492,27 +1464,25 @@ fn distinct_on_key_reads_input(select: &SelectStmt, key: &protobuf::Node) -> boo
         return true;
     };
     select.target_list.iter().all(|target| {
-        let Some(Node::ResTarget(target)) = &target.node else {
+        let Some(Node::ResTarget(target)) = target else {
             return false;
         };
         let output = if target.name.is_empty() {
-            target.val.as_deref().and_then(output_name)
+            output_name(&target.val)
         } else {
             Some(target.name.clone())
         };
         match output {
             // The key names this output column: fine only when the target
             // is that same bare input column.
-            Some(output) if output == *name => target.val.as_deref().is_some_and(|value| {
-                matches!(
-                    value.node.as_ref(),
-                    Some(Node::ColumnRef(target_column))
-                        if matches!(
-                            dedup::column_ref_fields(target_column),
-                            Fields::Names(target_names) if target_names.as_slice() == [*name]
-                        )
-                )
-            }),
+            Some(output) if output == *name => matches!(
+                target.val.as_ref(),
+                Some(Node::ColumnRef(target_column))
+                    if matches!(
+                        dedup::column_ref_fields(target_column),
+                        Fields::Names(target_names) if target_names.as_slice() == [*name]
+                    )
+            ),
             Some(_) => true,
             None => false,
         }
@@ -1521,8 +1491,8 @@ fn distinct_on_key_reads_input(select: &SelectStmt, key: &protobuf::Node) -> boo
 
 /// The relation and attnum a grouping / `DISTINCT ON` item is a plain
 /// column of, resolved in this level's scope.
-fn plain_column(scope: &Scope<'_>, item: &protobuf::Node) -> Option<(usize, i16)> {
-    let Some(Node::ColumnRef(column)) = item.node.as_ref() else {
+fn plain_column(scope: &Scope<'_>, item: &Option<ast::Node>) -> Option<(usize, i16)> {
+    let Some(Node::ColumnRef(column)) = item.as_ref() else {
         return None;
     };
     let Fields::Names(names) = dedup::column_ref_fields(column) else {
@@ -1541,9 +1511,9 @@ fn single_empty_grouping_set(select: &SelectStmt) -> bool {
         return false;
     };
     matches!(
-        &group.node,
+        group,
         Some(Node::GroupingSet(set))
-            if set.kind() == GroupingSetKind::GroupingSetEmpty && set.content.is_empty()
+            if set.kind == GroupingSetKind::GroupingSetEmpty && set.content.is_empty()
     )
 }
 
@@ -1554,24 +1524,21 @@ fn single_empty_grouping_set(select: &SelectStmt) -> bool {
 /// at most one.
 fn fixed_distinct_targets(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     select.target_list.iter().all(|target| {
-        let Some(Node::ResTarget(target)) = &target.node else {
+        let Some(Node::ResTarget(target)) = target else {
             return false;
         };
-        target
-            .val
-            .as_deref()
-            .is_some_and(|value| fixed_per_evaluation(ctx, value))
+        target.val.is_some() && fixed_per_evaluation(ctx, &target.val)
     })
 }
 
 /// Whether `value` evaluates to the same result on every row of a query
 /// level: it reads no column and no nested query, and every call it makes is
 /// non-volatile, non-aggregate and non-window.
-fn fixed_per_evaluation(ctx: &Ctx<'_>, value: &protobuf::Node) -> bool {
+fn fixed_per_evaluation(ctx: &Ctx<'_>, value: &Option<ast::Node>) -> bool {
     if proof::has_volatile(ctx, value) {
         return false;
     }
-    let Some(root) = value.node.as_ref() else {
+    let Some(root) = value.as_ref() else {
         return false;
     };
     let mut stack = vec![root.to_ref()];
@@ -1616,11 +1583,11 @@ fn fixed_per_evaluation(ctx: &Ctx<'_>, value: &protobuf::Node) -> bool {
     true
 }
 
-/// The [`NodeRef`]s of a list of protobuf nodes, skipping empty slots.
-fn refs(nodes: &[protobuf::Node]) -> impl Iterator<Item = NodeRef<'_>> {
+/// The [`NodeRef`]s of a list of AST nodes, skipping NULL cells.
+fn refs(nodes: &[Option<ast::Node>]) -> impl Iterator<Item = NodeRef<'_>> {
     nodes
         .iter()
-        .filter_map(|node| node.node.as_ref().map(|inner| inner.to_ref()))
+        .filter_map(|node| node.as_ref().map(|inner| inner.to_ref()))
 }
 
 /// Whether a call in `select`'s own level can multiply rows: a
@@ -1642,7 +1609,7 @@ fn has_set_returning(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
         &select.limit_count,
         &select.limit_offset,
     ] {
-        if let Some(node) = node.as_deref().and_then(|node| node.node.as_ref()) {
+        if let Some(node) = node.as_ref() {
             stack.push(node.to_ref());
         }
     }
@@ -1661,7 +1628,7 @@ fn has_set_returning(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
                 }
             }
             NodeRef::AExpr(expr) => {
-                if let Some(name) = expr.name.iter().rev().find_map(|node| match &node.node {
+                if let Some(name) = expr.name.iter().rev().find_map(|node| match node {
                     Some(Node::String(string)) => Some(string.sval.as_str()),
                     _ => None,
                 }) && ctx.catalog.pg_operator.values().any(|operator| {
@@ -1725,7 +1692,7 @@ fn has_own_aggregate(
         &select.limit_count,
         &select.limit_offset,
     ] {
-        if let Some(node) = node.as_deref().and_then(|node| node.node.as_ref()) {
+        if let Some(node) = node.as_ref() {
             stack.push(node.to_ref());
         }
     }
@@ -1766,26 +1733,21 @@ fn has_own_aggregate(
 /// also reads. With no variable at all (`count(*)`) it belongs to the level
 /// it is written in. A call whose references are all outer is the outer
 /// level's aggregate and does not collapse this level's rows.
-fn aggregate_is_this_level(scope: Option<&Scope<'_>>, call: &protobuf::FuncCall) -> bool {
+fn aggregate_is_this_level(scope: Option<&Scope<'_>>, call: &ast::FuncCall) -> bool {
     let sort_exprs = call
         .agg_order
         .iter()
-        .filter_map(|node| match node.node.as_ref() {
-            Some(Node::SortBy(by)) => by.node.as_deref(),
-            _ => Some(node),
+        .filter_map(|node| match node.as_ref() {
+            Some(Node::SortBy(by)) => by.node.as_ref(),
+            other => other,
         });
     let mut stack: Vec<NodeRef<'_>> = call
         .args
         .iter()
-        .filter_map(|n| n.node.as_ref().map(|inner| inner.to_ref()))
+        .filter_map(|n| n.as_ref().map(|inner| inner.to_ref()))
         .collect();
-    stack.extend(sort_exprs.filter_map(|n| n.node.as_ref().map(|inner| inner.to_ref())));
-    stack.extend(
-        call.agg_filter
-            .as_deref()
-            .and_then(|n| n.node.as_ref())
-            .map(|inner| inner.to_ref()),
-    );
+    stack.extend(sort_exprs.map(|inner| inner.to_ref()));
+    stack.extend(call.agg_filter.as_ref().map(|inner| inner.to_ref()));
     let mut has_column = false;
     let mut resolved_locally = false;
     while let Some(node) = stack.pop() {
@@ -1824,18 +1786,15 @@ fn contains_column_ref(node: NodeRef<'_>) -> bool {
 }
 
 /// Whether the FROM clause contains a FULL JOIN at any depth.
-fn has_full_join(from: &[protobuf::Node]) -> bool {
+fn has_full_join(from: &[Option<ast::Node>]) -> bool {
     from.iter().any(node_has_full_join)
 }
 
-fn node_has_full_join(item: &protobuf::Node) -> bool {
-    match item.node.as_ref() {
+fn node_has_full_join(item: &Option<ast::Node>) -> bool {
+    match item.as_ref() {
         Some(Node::JoinExpr(join)) => {
-            join.jointype() == JoinType::JoinFull
-                || [&join.larg, &join.rarg]
-                    .into_iter()
-                    .flatten()
-                    .any(|side| node_has_full_join(side))
+            join.jointype == JoinType::JoinFull
+                || [&join.larg, &join.rarg].into_iter().any(node_has_full_join)
         }
         _ => false,
     }
@@ -1866,6 +1825,14 @@ struct Determination {
     level_facts: Vec<dedup::EqFact>,
 }
 
+/// A join, the equality facts its `ON` (or `USING`) yields, and its `ON`
+/// conjuncts.
+type JoinFacts<'j, 'a, 'q> = (
+    &'j dedup::Join<'a>,
+    Vec<dedup::EqFact>,
+    Vec<&'q Option<ast::Node>>,
+);
+
 /// The relations of `scope` determined: a relation is determined when one of
 /// its unique keys is equated to constants, parameters, outer-query columns
 /// or already-determined relations. `WHERE` facts hold on every output row,
@@ -1879,7 +1846,7 @@ struct Determination {
 /// the joins contribute.
 fn determined_relations(
     ctx: &Ctx<'_>,
-    where_clause: Option<&protobuf::Node>,
+    where_clause: &Option<ast::Node>,
     scope: &Scope<'_>,
     outer: &FromScope<'_>,
     env: &CteEnv,
@@ -1903,7 +1870,7 @@ fn determined_relations(
         .iter()
         .flat_map(|conjunct| scope.cardinality_facts(ctx, conjunct, Some(outer), env))
         .collect();
-    let join_facts: Vec<(&dedup::Join<'_>, Vec<dedup::EqFact>, Vec<&protobuf::Node>)> = scope
+    let join_facts: Vec<JoinFacts<'_, '_, '_>> = scope
         .joins
         .iter()
         .map(|join| {
@@ -1970,7 +1937,7 @@ fn determined_relations(
         }
         for (join, facts, conjuncts) in &join_facts {
             let (targets, allowed): (u64, u64) = match join.kind {
-                typedpg_pg_query::protobuf::JoinType::JoinInner => {
+                typedpg_pg_query::ast::JoinType::JoinInner => {
                     (join.rels() & !known, known & join.rels())
                 }
                 // An outer join's nullable side is one fixed row only once
@@ -1978,14 +1945,14 @@ fn determined_relations(
                 // match it and others null-extend it, and an expression of
                 // its columns that maps NULL to a value (`quote_nullable`)
                 // then differs from row to row.
-                typedpg_pg_query::protobuf::JoinType::JoinLeft if join.left & !known == 0 => {
+                typedpg_pg_query::ast::JoinType::JoinLeft if join.left & !known == 0 => {
                     (join.right_rel.map_or(0, |b| 1 << b), join.left)
                 }
-                typedpg_pg_query::protobuf::JoinType::JoinRight if join.right & !known == 0 => {
+                typedpg_pg_query::ast::JoinType::JoinRight if join.right & !known == 0 => {
                     (join.left_rel.map_or(0, |b| 1 << b), join.right)
                 }
-                typedpg_pg_query::protobuf::JoinType::JoinLeft
-                | typedpg_pg_query::protobuf::JoinType::JoinRight => (0, 0),
+                typedpg_pg_query::ast::JoinType::JoinLeft
+                | typedpg_pg_query::ast::JoinType::JoinRight => (0, 0),
                 // Nothing an ON says bounds a FULL join's unmatched rows.
                 _ => (0, 0),
             };
@@ -2033,7 +2000,7 @@ fn all_relations_determined(
     outer: &FromScope<'_>,
     env: &CteEnv,
 ) -> bool {
-    determined_relations(ctx, select.where_clause.as_deref(), scope, outer, env)
+    determined_relations(ctx, &select.where_clause, scope, outer, env)
         .is_some_and(|determination| determination.known & determination.all == determination.all)
 }
 
@@ -2049,7 +2016,7 @@ fn all_relations_determined(
 /// (and its `RETURNING` list) with whatever its actions return, so no rule
 /// at all is allowed. `DO ALSO` rules and triggers can add effects, but a
 /// plain table without rewrite rules writes one row per source row.
-fn dml_target_without_rules(ctx: &Ctx<'_>, relation: &protobuf::RangeVar) -> bool {
+fn dml_target_without_rules(ctx: &Ctx<'_>, relation: &ast::RangeVar) -> bool {
     if !relation.catalogname.is_empty() {
         return false;
     }
@@ -2066,17 +2033,13 @@ fn dml_target_without_rules(ctx: &Ctx<'_>, relation: &protobuf::RangeVar) -> boo
 /// case also needs a target relation no rewrite rule can replace (see
 /// [`dml_target_without_rules`]).
 fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> bool {
-    let Some(relation) = insert.relation.as_ref() else {
+    let Some(relation) = insert.relation.as_deref() else {
         return false;
     };
     if !dml_target_without_rules(ctx, relation) {
         return false;
     }
-    let Some(node) = insert
-        .select_stmt
-        .as_deref()
-        .and_then(|node| node.node.as_ref())
-    else {
+    let Some(node) = insert.select_stmt.as_ref() else {
         // `INSERT ... DEFAULT VALUES` writes exactly one row.
         return true;
     };
@@ -2085,7 +2048,7 @@ fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> b
     };
     // The source query's own `WITH` shadows the statement's CTE names, just
     // as it does in a FROM subquery.
-    let env = visible_ctes(ctx, env, select.with_clause.as_ref(), None).after;
+    let env = visible_ctes(ctx, env, select.with_clause.as_deref(), None).after;
     let scope = FromScope::of_select(ctx, select, None);
     select_at_most_one_row_in(ctx, select, &scope, &env) || limit_bounds_one(select)
 }
@@ -2101,9 +2064,9 @@ fn insert_at_most_one_row(ctx: &Ctx<'_>, insert: &InsertStmt, env: &CteEnv) -> b
 fn dml_at_most_one_row(
     ctx: &Ctx<'_>,
     env: &CteEnv,
-    relation: Option<&protobuf::RangeVar>,
-    from: &[protobuf::Node],
-    where_clause: Option<&protobuf::Node>,
+    relation: Option<&ast::RangeVar>,
+    from: &[Option<ast::Node>],
+    where_clause: &Option<ast::Node>,
 ) -> bool {
     let Some(relation) = relation else {
         return false;
@@ -2138,7 +2101,7 @@ fn dml_at_most_one_row(
 /// `1`; a CTE reference must be one of the statement's single-row CTEs. A
 /// base table is never one row here (nothing filters it before the action).
 fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool {
-    let Some(relation) = merge.relation.as_ref() else {
+    let Some(relation) = merge.relation.as_deref() else {
         return false;
     };
     if !dml_target_without_rules(ctx, relation) {
@@ -2148,27 +2111,26 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
     // matched, so the source's row count no longer bounds the action count.
     if merge.merge_when_clauses.iter().any(|node| {
         matches!(
-            &node.node,
+            node,
             Some(Node::MergeWhenClause(clause))
-                if clause.match_kind() == MergeMatchKind::MergeWhenNotMatchedBySource
+                if clause.match_kind == MergeMatchKind::MergeWhenNotMatchedBySource
         )
     }) {
         return false;
     }
-    let Some(source) = merge.source_relation.as_deref() else {
+    if merge.source_relation.is_none() {
         return false;
-    };
+    }
+    let source = &merge.source_relation;
     let Some(mut scope) = Scope::dml(ctx, env, relation, std::slice::from_ref(source)) else {
         return false;
     };
     if scope.rels.len() != 2 {
         return false;
     }
-    match source.node.as_ref() {
+    match source.as_ref() {
         Some(Node::RangeSubselect(sub)) => {
-            let Some(Node::SelectStmt(select)) =
-                sub.subquery.as_deref().and_then(|node| node.node.as_ref())
-            else {
+            let Some(Node::SelectStmt(select)) = sub.subquery.as_ref() else {
                 return false;
             };
             if !statement_at_most_one_row_in(ctx, NodeRef::SelectStmt(select), env, None) {
@@ -2178,7 +2140,7 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
             // The subquery's output types, so an `ON` key equality can read
             // its columns. (The FROM-subquery typing may fill these in on
             // its own; doing it here keeps the MERGE proof independent.)
-            let source_env = visible_ctes(ctx, env, select.with_clause.as_ref(), None).after;
+            let source_env = visible_ctes(ctx, env, select.with_clause.as_deref(), None).after;
             let columns = select_output_columns(ctx, select, &source_env);
             if columns.len() == scope.rels[1].columns.len() {
                 scope.rels[1].cte_columns = columns
@@ -2196,7 +2158,7 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
         return false;
     }
     let root = FromScope::opaque(None);
-    let known = determined_relations(ctx, merge.join_condition.as_deref(), &scope, &root, env)
+    let known = determined_relations(ctx, &merge.join_condition, &scope, &root, env)
         .map_or(0, |determination| determination.known);
     // Relation 0 is the target (`Scope::dml` adds it first).
     known & 1 == 1
@@ -2205,22 +2167,22 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
 /// Whether `select`'s `LIMIT` / `FETCH FIRST` is the constant `0` or `1`
 /// (without `WITH TIES`). Its `OFFSET` doesn't affect the bound.
 pub(super) fn limit_bounds_one(select: &SelectStmt) -> bool {
-    if select.limit_option() == LimitOption::WithTies {
+    if select.limit_option == LimitOption::WithTies {
         return false;
     }
     matches!(
-        select.limit_count.as_deref().and_then(|node| node.node.as_ref()),
+        select.limit_count.as_ref(),
         Some(Node::AConst(value))
             if !value.isnull
-                && matches!(value.val, Some(Val::Ival(count)) if count.ival == 0 || count.ival == 1)
+                && matches!(value.val, Some(AConstValue::Integer(count)) if count.ival == 0 || count.ival == 1)
     )
 }
 
 /// The last name of a function call, with its schema when written.
-fn function_name(nodes: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
+fn function_name(nodes: &[Option<ast::Node>]) -> Option<(Option<&str>, &str)> {
     let names: Vec<&str> = nodes
         .iter()
-        .filter_map(|node| match &node.node {
+        .filter_map(|node| match node {
             Some(Node::String(string)) => Some(string.sval.as_str()),
             _ => None,
         })
@@ -2389,13 +2351,7 @@ mod tests {
     }
 
     fn top(view: &QueryView) -> &SelectStmt {
-        match view
-            .tree
-            .stmts
-            .first()
-            .and_then(|raw| raw.stmt.as_deref())
-            .and_then(|node| node.node.as_ref())
-        {
+        match view.tree.stmts.first().and_then(|raw| raw.stmt.as_ref()) {
             Some(Node::SelectStmt(select)) => select,
             other => panic!("not a SELECT: {other:?}"),
         }
@@ -2403,13 +2359,13 @@ mod tests {
 
     /// The SELECT inside the first target's `ARRAY(...)` sublink.
     fn array_select(select: &SelectStmt) -> &SelectStmt {
-        let Some(Node::ResTarget(target)) = select.target_list[0].node.as_ref() else {
+        let Some(Node::ResTarget(target)) = select.target_list[0].as_ref() else {
             panic!("not a target");
         };
-        let Some(Node::SubLink(sub)) = target.val.as_deref().and_then(|n| n.node.as_ref()) else {
+        let Some(Node::SubLink(sub)) = target.val.as_ref() else {
             panic!("not an ARRAY sublink");
         };
-        match sub.subselect.as_deref().and_then(|n| n.node.as_ref()) {
+        match sub.subselect.as_ref() {
             Some(Node::SelectStmt(inner)) => inner,
             other => panic!("not a SELECT: {other:?}"),
         }
@@ -2949,8 +2905,8 @@ mod tests {
             .find_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select)
                     if select.target_list.iter().any(|target| {
-                        matches!(&target.node, Some(Node::ResTarget(target))
-                            if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                        matches!(target, Some(Node::ResTarget(target))
+                            if matches!(target.val.as_ref(),
                                 Some(Node::FuncCall(call))
                                     if string_list(&call.funcname) == ["min"]))
                     }) =>
@@ -2975,8 +2931,8 @@ mod tests {
             .find_map(|(node, _)| match node {
                 NodeRef::SelectStmt(select)
                     if select.target_list.iter().any(|target| {
-                        matches!(&target.node, Some(Node::ResTarget(target))
-                            if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                        matches!(target, Some(Node::ResTarget(target))
+                            if matches!(target.val.as_ref(),
                                 Some(Node::FuncCall(call))
                                     if string_list(&call.funcname) == ["min"]))
                     }) =>
@@ -3189,8 +3145,8 @@ mod tests {
                 .find_map(|(node, _)| match node {
                     NodeRef::SelectStmt(select)
                         if select.target_list.iter().any(|target| {
-                            matches!(&target.node, Some(Node::ResTarget(target))
-                                if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                            matches!(target, Some(Node::ResTarget(target))
+                                if matches!(target.val.as_ref(),
                                     Some(Node::FuncCall(call))
                                         if string_list(&call.funcname) == ["count"]))
                         }) =>
@@ -3245,8 +3201,8 @@ mod tests {
                 .find_map(|(node, _)| match node {
                     NodeRef::SelectStmt(select)
                         if select.target_list.iter().any(|target| {
-                            matches!(&target.node, Some(Node::ResTarget(target))
-                                if matches!(target.val.as_deref().and_then(|v| v.node.as_ref()),
+                            matches!(target, Some(Node::ResTarget(target))
+                                if matches!(target.val.as_ref(),
                                     Some(Node::FuncCall(call))
                                         if string_list(&call.funcname) == ["count"]))
                         }) =>
@@ -3688,14 +3644,12 @@ mod tests {
             .with_clause
             .as_ref()
             .and_then(|with| with.ctes.first())
-            .and_then(|node| match &node.node {
+            .and_then(|node| match node {
                 Some(Node::CommonTableExpr(cte)) => Some(cte),
                 _ => None,
             })
             .unwrap();
-        let Some(Node::SelectStmt(body)) =
-            cte.ctequery.as_deref().and_then(|node| node.node.as_ref())
-        else {
+        let Some(Node::SelectStmt(body)) = cte.ctequery.as_ref() else {
             panic!("not a set operation");
         };
         let term = body.rarg.as_deref().expect("recursive term");

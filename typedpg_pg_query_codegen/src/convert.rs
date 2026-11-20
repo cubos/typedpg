@@ -1,39 +1,31 @@
 //! Generation of the C parse tree → AST converter.
 //!
-//! The next phase switches `typedpg_pg_query` from libpg_query to PostgreSQL's
-//! own parser; [`crate::generate_from_headers`] emits this module alongside the
-//! AST so that the raw C tree `raw_parser()` returns can be turned into the
-//! `protobuf` records (the name is historical — they are plain Rust structs).
+//! [`crate::generate_from_headers`] emits this module alongside the AST so
+//! that the raw C tree `raw_parser()` returns can be turned into the AST
+//! types.
 //!
-//! The conversion is a Rust port of libpg_query's
-//! `src/pg_query_outfuncs_protobuf.c` plus the generated
-//! `src/include/pg_query_outfuncs_defs.c` and `pg_query_outfuncs_conds.c`: the
-//! same fields are copied, in the same shapes, because the next phase compares
-//! the trees against libpg_query's over tens of thousands of statements.
-//!
-//! What the C backend's `WRITE_*` macros do, and what this generates:
+//! The conversion started as a Rust port of libpg_query's output functions
+//! (`src/pg_query_outfuncs_*.c`, with the generated `pg_query_outfuncs_defs.c`
+//! and `pg_query_outfuncs_conds.c`), and copies the same fields:
 //!
 //! - a NULL `char *` becomes the empty string; a `char` becomes a one-character
 //!   string, or empty for `'\0'`;
-//! - an enum becomes its `_enumToInt` value: its position in the declaration
-//!   (one-based; the `.proto` has a dummy zero value before the first
-//!   enumerator), which differs from the C value for enums with negative or
-//!   non-sequential values;
-//! - `List *` becomes a repeated `Node`, each cell through [`node`]; a
-//!   `Bitmapset *` becomes a repeated `uint64` of its members, ascending;
-//! - a typed node pointer (`RangeVar *`, `Alias *`, …) becomes its own message
-//!   (not wrapped in `Node`), and only an abstract `Node *` / `Expr *` /
-//!   `Value *` becomes a `Node`;
+//! - an enum becomes the Rust enum's variant of the same value;
+//! - `List *` becomes a `Vec<Option<Node>>`, each cell through [`node`] (a
+//!   NULL cell is `None`); a `Bitmapset *` becomes the `Vec<u64>` of its
+//!   members, ascending;
+//! - a typed node pointer (`RangeVar *`, `Alias *`, …) becomes its own type
+//!   in a `NodeBox` (not wrapped in `Node`), and only an abstract `Node *` /
+//!   `Expr *` / `Value *` becomes a `Node`;
 //! - an embedded node struct (only `CreateForeignTableStmt.base`) becomes its
-//!   message;
-//! - `A_Const` is special: `isnull`, `location`, then the `val` oneof chosen by
+//!   type, by value;
+//! - `A_Const` is special: `isnull`, `location`, then the value chosen by
 //!   the tag of the union member.
 //!
 //! Two differences from the C backend are deliberate:
 //!
 //! - an unknown `NodeTag` makes [`node`] return `None` where the C backend
-//!   logs a warning and leaves the field unset (the next phase turns the `None`
-//!   into an error);
+//!   logs a warning and leaves the field unset;
 //! - the C backend's `WRITE_LIST_FIELD` reads every list cell as a pointer,
 //!   which cannot work for an `IntList`/`OidList`; here those cells become
 //!   `Integer` nodes (the only integer node the AST has), and no raw parse
@@ -44,7 +36,7 @@ use std::fmt::Write;
 
 use heck::ToSnakeCase;
 
-use crate::ast::{Program, node_struct};
+use crate::ast::{Enum, Program, node_struct};
 use crate::schema::Schema;
 use crate::{Field, FieldType, HEADER_FROM_HEADERS, Message};
 
@@ -54,29 +46,14 @@ pub fn generate(schema: &Schema, program: &Program) -> String {
     s.push_str(PRELUDE);
 
     let c_names = c_struct_names(schema);
-    let enum_values = enum_values(schema);
     let mut used_enums = BTreeSet::new();
-    let node_message = program
-        .model
-        .messages
-        .iter()
-        .find(|m| m.name == "Node")
-        .expect("the Node message");
-    let boxed = |ty: &str| -> bool {
-        node_message
-            .fields
-            .iter()
-            .find(|f| matches!(&f.ty, FieldType::Message(t) if t == ty))
-            .map(|f| f.boxed)
-            .unwrap_or(false)
-    };
 
-    emit_node(&mut s, program, schema, &boxed);
+    emit_node(&mut s, program, schema);
     emit_raw_stmts(&mut s);
 
     for message in &program.model.messages {
         match message.name.as_str() {
-            "Node" | "ParseResult" | "ScanResult" | "ScanToken" | "SummaryResult" => continue,
+            "ParseResult" | "ScanResult" | "ScanToken" => continue,
             "Integer" | "Float" | "Boolean" | "String" | "BitString" | "List" | "IntList"
             | "OidList" | "A_Const" => emit_value(&mut s, message),
             _ => {
@@ -88,7 +65,7 @@ pub fn generate(schema: &Schema, program: &Program) -> String {
                     message,
                     &struct_def,
                     &c_names,
-                    &enum_values,
+                    program,
                     &mut used_enums,
                 );
             }
@@ -96,7 +73,13 @@ pub fn generate(schema: &Schema, program: &Program) -> String {
     }
 
     for enum_name in used_enums {
-        emit_enum(&mut s, &enum_name, &enum_values[&enum_name]);
+        let enum_def = program
+            .enum_by_c_name(&enum_name)
+            .unwrap_or_else(|| panic!("enum {enum_name}"));
+        emit_enum(&mut s, enum_def);
+    }
+    for name in ["Token", "KeywordKind"] {
+        emit_scan_enum(&mut s, program.enum_by_c_name(name).expect("scan enum"));
     }
 
     s
@@ -106,31 +89,31 @@ pub fn generate(schema: &Schema, program: &Program) -> String {
 /// per call so the per-struct bodies stay close to the C macros.
 const PRELUDE: &str = r#"//! Conversion of PostgreSQL's C raw parse tree into the AST types.
 //!
-//! Generated together with `protobuf.rs`; it assumes `mod bindings` and
-//! `mod protobuf` are siblings, as the crate arranges them.
+//! Generated together with `ast.rs`; it assumes `mod bindings` and
+//! `mod ast` are siblings, as the crate arranges them.
 
 #![allow(clippy::all, dead_code, unused_variables)]
 
+use crate::NodeBox;
+use crate::ast;
 use crate::bindings;
-use crate::protobuf;
 
-/// The deepest message nesting the AST can carry, libpg_query's
-/// `PG_QUERY_PROTOBUF_MAX_DEPTH`: deeper trees could not be encoded to
-/// protobuf (nor decoded back) by the engine this replaces, so they are
-/// refused here too.
+/// The deepest nesting the AST carries, libpg_query's limit (its
+/// `PG_QUERY_PROTOBUF_MAX_DEPTH`): deeper trees are refused, as they were
+/// by the engine this replaces.
 const MAX_DEPTH: usize = 10_000;
 
 thread_local! {
-    /// The message nesting of the conversion in progress. Every `Node`
-    /// wrapper and every message counts one level, as a protobuf encoder
-    /// counts them.
+    /// The nesting of the conversion in progress. Every abstract `Node`
+    /// and every node struct counts one level, as libpg_query counted
+    /// them.
     static DEPTH: ::core::cell::Cell<usize> = const { ::core::cell::Cell::new(0) };
     /// Whether [`MAX_DEPTH`] was passed; the conversion then finishes with
     /// default values and the caller turns this into an error.
     static TOO_DEEP: ::core::cell::Cell<bool> = const { ::core::cell::Cell::new(false) };
 }
 
-/// Counts one message level for its lifetime.
+/// Counts one level for its lifetime.
 struct DepthGuard(());
 
 impl DepthGuard {
@@ -163,7 +146,7 @@ pub(crate) fn too_deep() -> bool {
     TOO_DEEP.with(|flag| flag.get())
 }
 
-/// Run one message's conversion on enough stack: the recursion is as deep as
+/// Run one node's conversion on enough stack: the recursion is as deep as
 /// the tree (up to [`MAX_DEPTH`] levels), so the stack grows in segments as it
 /// goes instead of being reserved up front.
 #[inline(always)]
@@ -221,14 +204,15 @@ unsafe fn bitmapset_members(p: *mut bindings::Bitmapset) -> ::std::vec::Vec<u64>
 }
 
 /// The cells of a `List *` as `Node`s, as `WRITE_LIST_FIELD` /
-/// `_outList` do. NULL and the empty list are empty.
+/// `_outList` do: a NULL cell (or one of an unknown tag) is `None`. NULL
+/// and the empty list are empty.
 ///
 /// A `T_IntList`/`T_OidList` cell holds an integer, not a pointer; it becomes
 /// an `Integer` node, which is how the AST can represent it.
 ///
 /// # Safety
 /// `list` must be NULL or point to a valid `List`.
-unsafe fn list_items(list: *mut bindings::List) -> ::std::vec::Vec<protobuf::Node> {
+unsafe fn list_items(list: *mut bindings::List) -> ::std::vec::Vec<Option<ast::Node>> {
     let mut out = ::std::vec::Vec::new();
     if list.is_null() {
         return out;
@@ -239,17 +223,15 @@ unsafe fn list_items(list: *mut bindings::List) -> ::std::vec::Vec<protobuf::Nod
     for index in 0..length {
         let cell = unsafe { &*list.elements.add(index) };
         let node = match list.type_ {
-            bindings::NodeTag_T_IntList => Some(protobuf::node::Node::Integer(protobuf::Integer {
+            bindings::NodeTag_T_IntList => Some(ast::Node::Integer(NodeBox::new(ast::Integer {
                 ival: unsafe { cell.int_value },
-            })),
-            bindings::NodeTag_T_OidList => Some(protobuf::node::Node::Integer(protobuf::Integer {
+            }))),
+            bindings::NodeTag_T_OidList => Some(ast::Node::Integer(NodeBox::new(ast::Integer {
                 ival: unsafe { cell.oid_value } as i32,
-            })),
+            }))),
             _ => unsafe { node(cell.ptr_value as *const bindings::Node) },
         };
-        // `_outNode` still appends the (empty) `Node` message for a NULL or
-        // unrecognized cell; only the oneof stays unset.
-        out.push(protobuf::Node { node });
+        out.push(node);
     }
     out
 }
@@ -265,35 +247,60 @@ fn c_struct_names(schema: &Schema) -> HashMap<String, String> {
     out
 }
 
-/// The C enums and their enumerators, by C type name.
-fn enum_values(schema: &Schema) -> HashMap<String, Vec<(String, i64)>> {
-    let mut out = HashMap::new();
-    for group in &schema.groups {
-        for enum_def in &group.enums {
-            if let Some(name) = &enum_def.name {
-                out.insert(name.clone(), enum_def.resolved_values());
-            }
-        }
-    }
-    out
-}
-
-/// `_enumToInt` as libpg_query generates it: the enumerators number from one
-/// in declaration order, which is not the C value when the enum is not
-/// sequential from zero (`PARTITION_RANGE_DATUM_MINVALUE` is -1) or has gaps.
-fn emit_enum(s: &mut String, c_name: &str, values: &[(String, i64)]) {
-    let name = format!("convert_{}", c_name.to_snake_case());
+/// The conversion of a C enum to the Rust one: the same value, by name.
+/// The bindings and the AST come from the same headers, so every value has
+/// a variant.
+fn emit_enum(s: &mut String, enum_def: &Enum) {
+    let c_name = &enum_def.c_name;
+    let rust = &enum_def.rust;
     let _ = writeln!(
         s,
-        "fn {name}(value: bindings::{c_name}) -> i32 {{\n    match value {{"
+        "fn convert_{}(value: bindings::{c_name}) -> ast::{rust} {{\n    match value {{",
+        c_name.to_snake_case()
     );
-    for (index, (variant, _)) in values.iter().enumerate() {
-        let _ = writeln!(s, "        bindings::{c_name}_{variant} => {},", index + 1);
+    for value in &enum_def.values {
+        let _ = writeln!(
+            s,
+            "        bindings::{c_name}_{} => ast::{rust}::{},",
+            value.c, value.rust
+        );
     }
-    s.push_str("        _ => -1,\n    }\n}\n\n");
+    let _ = writeln!(
+        s,
+        "        other => unreachable!(\"{{other}} is not a {c_name}\"),\n    }}\n}}\n"
+    );
+    // The Rust enum's values are PostgreSQL's.
+    s.push_str("const _: () = {\n");
+    for value in &enum_def.values {
+        let _ = writeln!(
+            s,
+            "    assert!(bindings::{c_name}_{} as i64 == ast::{rust}::{} as i64);",
+            value.c, value.rust
+        );
+    }
+    s.push_str("};\n\n");
 }
 
-/// The lookups below go from the Rust message name to the C type name; both
+/// The conversion of a token number (or keyword category) the scanner
+/// reports to the enum; `None` for a number that isn't one.
+fn emit_scan_enum(s: &mut String, enum_def: &Enum) {
+    let rust = &enum_def.rust;
+    let _ = writeln!(
+        s,
+        "pub(crate) fn {}(value: i32) -> Option<ast::{rust}> {{\n    Some(match value {{",
+        rust.to_snake_case()
+    );
+    for value in &enum_def.values {
+        let _ = writeln!(
+            s,
+            "        {} => ast::{rust}::{},",
+            value.number, value.rust
+        );
+    }
+    s.push_str("        _ => return None,\n    })\n}\n\n");
+}
+
+/// The lookups below go from the Rust type name to the C type name; both
 /// normalise the same way (`A_Const`/`AConst` → `aconst`,
 /// `SQLValueFunction`/`SqlValueFunction` → `sqlvaluefunction`).
 fn normalised(name: &str) -> String {
@@ -310,17 +317,16 @@ fn c_type_name(c_names: &HashMap<String, String>, rust: &str) -> String {
         .unwrap_or_else(|| rust.to_string())
 }
 
-fn emit_node(s: &mut String, program: &Program, schema: &Schema, boxed: &impl Fn(&str) -> bool) {
+fn emit_node(s: &mut String, program: &Program, schema: &Schema) {
     s.push_str(
         "/// Convert one C node, by its `NodeTag`; NULL is `None`.\n\
          ///\n\
          /// An unrecognized tag also returns `None` (libpg_query's C backend\n\
-         /// logs a warning and leaves the field unset; the caller turns this\n\
-         /// into an error).\n\
+         /// logs a warning and leaves the field unset).\n\
          ///\n\
          /// # Safety\n\
          /// `p` must be NULL or point to a live node.\n\
-         pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<protobuf::node::Node> {\n\
+         pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<ast::Node> {\n\
          \x20   if too_deep() {\n\
          \x20       return None;\n\
          \x20   }\n\
@@ -334,18 +340,10 @@ fn emit_node(s: &mut String, program: &Program, schema: &Schema, boxed: &impl Fn
     for (variant, ty) in &program.model.variants {
         let tag = variant_c_name(schema, ty);
         let binding = binding_type(&tag);
-        let call = format!(
-            "unsafe {{ {}(p as *const bindings::{binding}) }}",
-            ty.to_snake_case()
-        );
-        let call = if boxed(ty) {
-            format!("::std::boxed::Box::new({call})")
-        } else {
-            call
-        };
         writeln!(
             s,
-            "        bindings::NodeTag_T_{tag} => protobuf::node::Node::{variant}({call}),"
+            "        bindings::NodeTag_T_{tag} => ast::Node::{variant}(NodeBox::new(unsafe {{ {}(p as *const bindings::{binding}) }})),",
+            ty.to_snake_case()
         )
         .unwrap();
     }
@@ -362,7 +360,7 @@ fn binding_type(tag: &str) -> &str {
     }
 }
 
-/// The C name behind a Rust message name (`AConst` → `A_Const`, `CteCycleClause`
+/// The C name behind a Rust type name (`AConst` → `A_Const`, `CteCycleClause`
 /// → `CTECycleClause`).
 fn variant_c_name(schema: &Schema, rust: &str) -> String {
     for nodetype in &schema.nodetypes {
@@ -380,7 +378,7 @@ fn emit_raw_stmts(s: &mut String) {
          ///\n\
          /// # Safety\n\
          /// `list` must be NULL or point to a valid `List` of `RawStmt`.\n\
-         pub(crate) unsafe fn raw_stmts(list: *const bindings::List) -> ::std::vec::Vec<protobuf::RawStmt> {\n\
+         pub(crate) unsafe fn raw_stmts(list: *const bindings::List) -> ::std::vec::Vec<ast::RawStmt> {\n\
          \x20   begin();\n\
          \x20   let mut out = ::std::vec::Vec::new();\n\
          \x20   if list.is_null() {\n\
@@ -399,19 +397,19 @@ fn emit_raw_stmts(s: &mut String) {
 
 /// The value and list nodes, which `nodes/value.h` and `nodes/pg_list.h`
 /// declare but whose AST shapes are the generator's own (see
-/// [`crate::ast::value_messages`]).
+/// `value_messages` in [`crate::ast`]).
 fn emit_value(s: &mut String, message: &Message) {
     let name = message.rust.to_snake_case();
     match message.name.as_str() {
         "Integer" => {
             let _ = writeln!(
                 s,
-                "pub(crate) unsafe fn {name}(p: *const bindings::Integer) -> protobuf::{ty} {{\n\
+                "pub(crate) unsafe fn {name}(p: *const bindings::Integer) -> ast::{ty} {{\n\
                  \x20   if too_deep() {{\n\
-         \x20       return protobuf::{ty}::default();\n\
+         \x20       return ast::{ty}::default();\n\
          \x20   }}\n\
          \x20   let _depth = DepthGuard::new();\n\
-                 \x20   let mut out = protobuf::{ty}::default();\n\
+                 \x20   let mut out = ast::{ty}::default();\n\
                  \x20   out.ival = unsafe {{ (*p).ival as i32 }};\n\
                  \x20   out\n}}\n",
                 ty = message.rust,
@@ -421,12 +419,12 @@ fn emit_value(s: &mut String, message: &Message) {
         "Boolean" => {
             let _ = writeln!(
                 s,
-                "pub(crate) unsafe fn {name}(p: *const bindings::Boolean) -> protobuf::{ty} {{\n\
+                "pub(crate) unsafe fn {name}(p: *const bindings::Boolean) -> ast::{ty} {{\n\
                  \x20   if too_deep() {{\n\
-         \x20       return protobuf::{ty}::default();\n\
+         \x20       return ast::{ty}::default();\n\
          \x20   }}\n\
          \x20   let _depth = DepthGuard::new();\n\
-                 \x20   let mut out = protobuf::{ty}::default();\n\
+                 \x20   let mut out = ast::{ty}::default();\n\
                  \x20   out.boolval = unsafe {{ (*p).boolval }};\n\
                  \x20   out\n}}\n",
                 ty = message.rust,
@@ -437,12 +435,12 @@ fn emit_value(s: &mut String, message: &Message) {
         "List" | "IntList" | "OidList" => {
             let _ = writeln!(
                 s,
-                "pub(crate) unsafe fn {name}(p: *const bindings::List) -> protobuf::{ty} {{\n\
+                "pub(crate) unsafe fn {name}(p: *const bindings::List) -> ast::{ty} {{\n\
                  \x20   if too_deep() {{\n\
-         \x20       return protobuf::{ty}::default();\n\
+         \x20       return ast::{ty}::default();\n\
          \x20   }}\n\
          \x20   let _depth = DepthGuard::new();\n\
-                 \x20   let mut out = protobuf::{ty}::default();\n\
+                 \x20   let mut out = ast::{ty}::default();\n\
                  \x20   out.items = unsafe {{ list_items(p as *mut bindings::List) }};\n\
                  \x20   out\n}}\n",
                 ty = message.rust,
@@ -457,12 +455,12 @@ fn value_string(s: &mut String, message: &Message, c: &str, field: &str) {
     let name = message.rust.to_snake_case();
     let _ = writeln!(
         s,
-        "pub(crate) unsafe fn {name}(p: *const bindings::{c}) -> protobuf::{ty} {{\n\
+        "pub(crate) unsafe fn {name}(p: *const bindings::{c}) -> ast::{ty} {{\n\
          \x20   if too_deep() {{\n\
-         \x20       return protobuf::{ty}::default();\n\
+         \x20       return ast::{ty}::default();\n\
          \x20   }}\n\
          \x20   let _depth = DepthGuard::new();\n\
-         \x20   let mut out = protobuf::{ty}::default();\n\
+         \x20   let mut out = ast::{ty}::default();\n\
          \x20   out.{field} = unsafe {{ c_string((*p).{field}) }};\n\
          \x20   out\n}}\n",
         ty = message.rust,
@@ -473,41 +471,41 @@ fn emit_a_const(s: &mut String, message: &Message) {
     let name = message.rust.to_snake_case();
     let ty = &message.rust;
     let members = [
-        ("Integer", "Ival", "ival", "ival"),
-        ("Float", "Fval", "fval", "fval"),
-        ("Boolean", "Boolval", "boolval", "boolval"),
-        ("String", "Sval", "sval", "sval"),
-        ("BitString", "Bsval", "bsval", "bsval"),
+        ("Integer", "ival", "ival"),
+        ("Float", "fval", "fval"),
+        ("Boolean", "boolval", "boolval"),
+        ("String", "sval", "sval"),
+        ("BitString", "bsval", "bsval"),
     ];
     let _ = writeln!(
         s,
-        "pub(crate) unsafe fn {name}(p: *const bindings::A_Const) -> protobuf::{ty} {{\n\
+        "pub(crate) unsafe fn {name}(p: *const bindings::A_Const) -> ast::{ty} {{\n\
          \x20   if too_deep() {{\n\
-         \x20       return protobuf::{ty}::default();\n\
+         \x20       return ast::{ty}::default();\n\
          \x20   }}\n\
          \x20   let _depth = DepthGuard::new();\n\
-         \x20   let mut out = protobuf::{ty}::default();\n\
+         \x20   let mut out = ast::{ty}::default();\n\
          \x20   out.isnull = unsafe {{ (*p).isnull }};\n\
          \x20   out.location = unsafe {{ (*p).location as i32 }};\n\
          \x20   if !out.isnull {{\n\
          \x20       out.val = unsafe {{\n\
          \x20           match (*p).val.node.type_ {{\n"
     );
-    for (c_type, variant, union_field, ast_field) in members {
+    for (c_type, union_field, ast_field) in members {
         let value = match c_type {
             "Integer" => {
-                format!("protobuf::Integer {{ ival: (*p).val.{union_field}.{ast_field} as i32 }}")
+                format!("ast::Integer {{ ival: (*p).val.{union_field}.{ast_field} as i32 }}")
             }
             "Boolean" => {
-                format!("protobuf::Boolean {{ boolval: (*p).val.{union_field}.{ast_field} }}")
+                format!("ast::Boolean {{ boolval: (*p).val.{union_field}.{ast_field} }}")
             }
             _ => format!(
-                "protobuf::{c_type} {{ {ast_field}: c_string((*p).val.{union_field}.{ast_field}) }}"
+                "ast::{c_type} {{ {ast_field}: c_string((*p).val.{union_field}.{ast_field}) }}"
             ),
         };
         let _ = writeln!(
             s,
-            "                bindings::NodeTag_T_{c_type} => Some(protobuf::a_const::Val::{variant}({value})),"
+            "                bindings::NodeTag_T_{c_type} => Some(ast::AConstValue::{c_type}({value})),"
         );
     }
     s.push_str(
@@ -525,14 +523,14 @@ fn emit_struct(
     message: &Message,
     struct_def: &crate::schema::StructDef,
     c_names: &HashMap<String, String>,
-    enum_values: &HashMap<String, Vec<(String, i64)>>,
+    program: &Program,
     used_enums: &mut BTreeSet<String>,
 ) {
     let name = message.rust.to_snake_case();
     let ty = &message.rust;
     let _ = writeln!(
         s,
-        "pub(crate) unsafe fn {name}(p: *const bindings::{c_ty}) -> protobuf::{ty} {{",
+        "pub(crate) unsafe fn {name}(p: *const bindings::{c_ty}) -> ast::{ty} {{",
         c_ty = message.name,
     );
 
@@ -544,31 +542,25 @@ fn emit_struct(
         let Some(cdef) = struct_def
             .fields
             .iter()
-            .find(|f| f.name.as_deref() == Some(field.json.as_str()))
+            .find(|f| f.name.as_deref() == Some(field.c_name.as_str()))
         else {
             panic!(
                 "{}.{} is in the AST but not in the C struct",
-                message.name, field.json
+                message.name, field.c_name
             );
         };
         let c_type = cdef
             .c_type
             .as_deref()
-            .unwrap_or_else(|| panic!("{}.{} has no C type", message.name, field.json));
-        // The abstract `Expr xpr` every expression node embeds is not part of
-        // the generated `_out*` functions (only its `NodeTag` exists); the AST
-        // field stays unset.
-        if !c_type.ends_with('*') && matches!(&field.ty, FieldType::Message(ty) if ty == "Node") {
-            continue;
-        }
-        let expr = conversion_expr(field, c_type, c_names, enum_values, used_enums);
+            .unwrap_or_else(|| panic!("{}.{} has no C type", message.name, field.c_name));
+        let expr = conversion_expr(field, c_type, c_names, program, used_enums);
         let _ = writeln!(body, "    out.{} = unsafe {{ {expr} }};", field.rust);
     }
 
     let binding = if body.is_empty() { "let" } else { "let mut" };
     let _ = writeln!(
         s,
-        "    if too_deep() {{\n        return protobuf::{ty}::default();\n    }}\n    let _depth = DepthGuard::new();\n    grow(|| {{\n    {binding} out = protobuf::{ty}::default();\n{body}    out\n    }})\n}}\n"
+        "    if too_deep() {{\n        return ast::{ty}::default();\n    }}\n    let _depth = DepthGuard::new();\n    grow(|| {{\n    {binding} out = ast::{ty}::default();\n{body}    out\n    }})\n}}\n"
     );
 }
 
@@ -578,18 +570,18 @@ fn conversion_expr(
     field: &Field,
     c_type: &str,
     c_names: &HashMap<String, String>,
-    enum_values: &HashMap<String, Vec<(String, i64)>>,
+    program: &Program,
     used_enums: &mut BTreeSet<String>,
 ) -> String {
-    // `WRITE_LIST_FIELD`: a `List *` field is a repeated `Node`.
-    if field.repeated && matches!(&field.ty, FieldType::Message(ty) if ty == "Node") {
-        return format!("list_items((*p).{})", c_field_ident(&field.json));
+    let value = format!("(*p).{}", c_field_ident(&field.c_name));
+    // `WRITE_LIST_FIELD`: a `List *` field is a list of nodes.
+    if field.repeated && field.ty == FieldType::Node {
+        return format!("list_items({value})");
     }
     if matches!(c_type, "Bitmapset*" | "Relids") {
-        return format!("bitmapset_members((*p).{})", c_field_ident(&field.json));
+        return format!("bitmapset_members({value})");
     }
 
-    let value = format!("(*p).{}", c_field_ident(&field.json));
     match &field.ty {
         FieldType::Bool => value,
         FieldType::I32 => format!("{value} as i32"),
@@ -604,63 +596,29 @@ fn conversion_expr(
                 format!("c_string({value})")
             }
         }
-        // `WRITE_ENUM_FIELD`: `_enumToInt` numbers the enumerators from one.
         FieldType::Enum(_) => {
-            if enum_values.contains_key(c_type) {
-                used_enums.insert(c_type.to_string());
-                format!("convert_{}({value})", c_type.to_snake_case())
-            } else {
-                format!("({value} as i32) + 1")
-            }
-        }
-        FieldType::Message(ty) if ty == "Node" => {
-            if !c_type.ends_with('*') {
-                panic!(
-                    "{}.{} embeds an abstract node; only `Expr xpr` does, and it is skipped",
-                    field.json, field.json
-                );
-            }
-            let call = format!(
-                "if {value}.is_null() {{ None }} else {{ Some(protobuf::Node {{ node: node({value} as *const bindings::Node) }}) }}"
+            assert!(
+                program.enum_by_c_name(c_type).is_some(),
+                "{} has enum type {c_type}, which the AST doesn't define",
+                field.c_name
             );
-            if field.boxed {
-                format!(
-                    "if {value}.is_null() {{ None }} else {{ Some(::std::boxed::Box::new(protobuf::Node {{ node: node({value} as *const bindings::Node) }})) }}"
-                )
-            } else {
-                call
-            }
+            used_enums.insert(c_type.to_string());
+            format!("convert_{}({value})", c_type.to_snake_case())
         }
+        FieldType::Node => format!(
+            "if {value}.is_null() {{ None }} else {{ node({value} as *const bindings::Node) }}"
+        ),
         FieldType::Message(ty) => {
             let c_ty = c_type_name(c_names, ty);
-            let call = if c_type.ends_with('*') {
-                format!(
-                    "if {value}.is_null() {{ None }} else {{ Some({}({value} as *const bindings::{c_ty})) }}",
-                    ty.to_snake_case()
-                )
+            let convert = ty.to_snake_case();
+            if field.embedded {
+                format!("{convert}(&{value} as *const bindings::{c_ty})")
             } else {
                 format!(
-                    "Some({}(&{value} as *const bindings::{c_ty}))",
-                    ty.to_snake_case()
+                    "if {value}.is_null() {{ None }} else {{ Some(NodeBox::new({convert}({value} as *const bindings::{c_ty}))) }}"
                 )
-            };
-            if field.boxed {
-                if c_type.ends_with('*') {
-                    format!(
-                        "if {value}.is_null() {{ None }} else {{ Some(::std::boxed::Box::new({}({value} as *const bindings::{c_ty}))) }}",
-                        ty.to_snake_case()
-                    )
-                } else {
-                    format!(
-                        "Some(::std::boxed::Box::new({}(&{value} as *const bindings::{c_ty})))",
-                        ty.to_snake_case()
-                    )
-                }
-            } else {
-                call
             }
         }
-        FieldType::Map => panic!("map field {} in the C tree", field.json),
     }
 }
 

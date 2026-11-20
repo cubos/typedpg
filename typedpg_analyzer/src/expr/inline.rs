@@ -175,7 +175,7 @@ fn body_scope(proc: &crate::pg_catalog::PgProc, bound: &[ExprType]) -> Option<cr
 pub(crate) fn body_trust(
     snapshot: &crate::pg_catalog::PgCatalog,
     proc: &crate::pg_catalog::PgProc,
-    body: &typedpg_pg_query::protobuf::Node,
+    body: &Option<typedpg_pg_query::ast::Node>,
 ) -> Option<crate::nonnull::TrustedNodes> {
     let bound: Option<Vec<ExprType>> = proc
         .proargtypes

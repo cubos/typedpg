@@ -1,7 +1,7 @@
 //! CREATE TABLE and ALTER TABLE DDL handlers.
 
-use typedpg_pg_query::protobuf::{
-    AlterTableCmd, AlterTableStmt, AlterTableType, ConstrType, CreateStmt, DropBehavior, node,
+use typedpg_pg_query::ast::{
+    self, AlterTableCmd, AlterTableStmt, AlterTableType, ConstrType, CreateStmt, DropBehavior,
 };
 
 use crate::oid::{PgClassOid, PgConstraintOid, PgTypeOid};
@@ -93,10 +93,10 @@ impl ConName {
 fn check_conkey(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: Option<&typedpg_pg_query::protobuf::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Vec<i16> {
     let mut attnums: Vec<i16> = Vec::new();
-    if let Some(inner) = expr.and_then(|e| e.node.as_ref()) {
+    if let Some(inner) = expr {
         for (n, ..) in inner.nodes() {
             if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
                 && let Some(name) = cr.fields.last().and_then(super::util::node_string)
@@ -117,10 +117,10 @@ fn check_conkey(
 fn check_name_addition(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: Option<&typedpg_pg_query::protobuf::Node>,
+    expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> String {
     let mut columns: Vec<String> = Vec::new();
-    if let Some(inner) = expr.and_then(|e| e.node.as_ref()) {
+    if let Some(inner) = expr {
         for (n, ..) in inner.nodes() {
             if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
                 && let Some(name) = cr.fields.last().and_then(super::util::node_string)
@@ -189,11 +189,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // The indexes of its PRIMARY KEY / UNIQUE / EXCLUDE constraints
     // (USING INDEX TABLESPACE), created by DefineIndex.
     for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
-        match elt.node.as_ref() {
-            Some(node::Node::Constraint(c)) => check_tablespace_placement(&c.indexspace)?,
-            Some(node::Node::ColumnDef(cd)) => {
+        match elt.as_ref() {
+            Some(ast::Node::Constraint(c)) => check_tablespace_placement(&c.indexspace)?,
+            Some(ast::Node::ColumnDef(cd)) => {
                 for c in &cd.constraints {
-                    if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+                    if let Some(ast::Node::Constraint(c)) = c.as_ref() {
                         check_tablespace_placement(&c.indexspace)?;
                     }
                 }
@@ -213,11 +213,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         // (further down). Skip the volatility walk for CHECK to stay
         // aligned with PG, otherwise the analyzer would reject DDL that
         // PG happily accepts.
-        if let Some(node::Node::Constraint(c)) = elt.node.as_ref()
-            && c.contype == ConstrType::ConstrPrimary as i32
+        if let Some(ast::Node::Constraint(c)) = elt.as_ref()
+            && c.contype == ConstrType::ConstrPrimary
         {
             for key_node in &c.keys {
-                if let Some(node::Node::String(s)) = key_node.node.as_ref() {
+                if let Some(ast::Node::String(s)) = key_node.as_ref() {
                     pk_columns.push(s.sval.clone());
                 }
             }
@@ -235,14 +235,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     let column_pks = stmt
         .table_elts
         .iter()
-        .filter_map(|e| match e.node.as_ref()? {
-            node::Node::ColumnDef(cd) => Some(cd),
+        .filter_map(|e| match e.as_ref()? {
+            ast::Node::ColumnDef(cd) => Some(cd),
             _ => None,
         })
         .flat_map(|cd| cd.constraints.iter())
         .filter(|n| {
-            matches!(n.node.as_ref(), Some(node::Node::Constraint(c))
-                if c.contype == ConstrType::ConstrPrimary as i32)
+            matches!(n.as_ref(), Some(ast::Node::Constraint(c))
+                if c.contype == ConstrType::ConstrPrimary)
         })
         .count();
     let table_pks = stmt
@@ -250,8 +250,8 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .iter()
         .chain(stmt.table_elts.iter())
         .filter(|n| {
-            matches!(n.node.as_ref(), Some(node::Node::Constraint(c))
-                if c.contype == ConstrType::ConstrPrimary as i32)
+            matches!(n.as_ref(), Some(ast::Node::Constraint(c))
+                if c.contype == ConstrType::ConstrPrimary)
         })
         .count();
     if column_pks + table_pks > 1 {
@@ -264,18 +264,18 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // exist (inherited and LIKE columns count); PRIMARY KEY marks them NOT
     // NULL (`transformIndexConstraint`).
     for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
-        let Some(node::Node::Constraint(c)) = elt.node.as_ref() else {
+        let Some(ast::Node::Constraint(c)) = elt.as_ref() else {
             continue;
         };
-        let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
-        let is_not_null = c.contype == ConstrType::ConstrNotnull as i32;
+        let is_primary = c.contype == ConstrType::ConstrPrimary;
+        let is_not_null = c.contype == ConstrType::ConstrNotnull;
         // transformTableConstraint.
         if is_not_null && c.is_no_inherit && stmt.partspec.is_some() {
             return Err(DdlError::UnsupportedDdl(
                 "not-null constraints on partitioned tables cannot be NO INHERIT".into(),
             ));
         }
-        if !is_primary && !is_not_null && c.contype != ConstrType::ConstrUnique as i32 {
+        if !is_primary && !is_not_null && c.contype != ConstrType::ConstrUnique {
             continue;
         }
         for key in c.keys.iter().filter_map(super::util::node_string) {
@@ -348,7 +348,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
 
     // transformIndexConstraint: so must their INCLUDE columns.
     for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
-        let Some(node::Node::Constraint(c)) = elt.node.as_ref() else {
+        let Some(ast::Node::Constraint(c)) = elt.as_ref() else {
             continue;
         };
         for key in c.including.iter().filter_map(super::util::node_string) {
@@ -387,10 +387,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         interp.relpersistence.insert(class_oid, 'u');
     }
     // ON COMMIT applies to temporary tables only (transformCreateStmt).
-    use typedpg_pg_query::protobuf::OnCommitAction;
-    match OnCommitAction::try_from(stmt.oncommit) {
-        Ok(OnCommitAction::OncommitNoop | OnCommitAction::Undefined) | Err(_) => {}
-        Ok(action) => {
+    use typedpg_pg_query::ast::OnCommitAction;
+    match stmt.oncommit {
+        OnCommitAction::OncommitNoop => {}
+        action => {
             if Some(nsoid) != interp.temp_namespace {
                 return Err(DdlError::UnsupportedDdl(
                     "ON COMMIT can only be used on temporary tables".into(),
@@ -407,7 +407,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // (an inherited column's is its parent's).
     let mut storage_clauses: Vec<(String, TypStorage)> = Vec::new();
     for elt in &stmt.table_elts {
-        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref()
+        if let Some(ast::Node::ColumnDef(cd)) = elt.as_ref()
             && let Some(col) = columns.iter().find(|c| c.name == cd.colname)
         {
             if col.storage.is_none() && !cd.storage_name.is_empty() {
@@ -607,8 +607,8 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // transformPartitionSpec / ComputePartitionAttrs: the key columns and
     // expressions, and their operator classes.
     if let Some(spec) = stmt.partspec.as_ref() {
-        use typedpg_pg_query::protobuf::PartitionStrategy;
-        let strategy = PartitionStrategy::try_from(spec.strategy).ok();
+        use typedpg_pg_query::ast::PartitionStrategy;
+        let strategy = Some(spec.strategy);
         // DefineRelation: PARTITION_MAX_KEYS (= INDEX_MAX_KEYS).
         if spec.part_params.len() > crate::ddl::indexes::INDEX_MAX_KEYS {
             return Err(DdlError::UnsupportedDdl(format!(
@@ -630,14 +630,15 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         // Every column the key reads (has_partition_attrs).
         let mut key_attrs: Vec<i16> = Vec::new();
         for (keycol, elem) in spec.part_params.iter().enumerate() {
-            let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
+            let Some(ast::Node::PartitionElem(pe)) = elem.as_ref() else {
                 continue;
             };
             let key_type = if pe.name.is_empty() {
                 key.push(0);
-                let Some(expr) = pe.expr.as_deref() else {
+                if pe.expr.is_none() {
                     continue;
-                };
+                }
+                let expr = &pe.expr;
                 crate::ddl::expr_kind::check_expr_kind(
                     interp,
                     expr,
@@ -673,7 +674,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 // system nor generated columns.
                 let mut read: Vec<i16> = Vec::new();
                 let mut whole_row_read = false;
-                if let Some(inner) = expr.node.as_ref() {
+                if let Some(inner) = expr.as_ref() {
                     // `(p).a` reads the column `a` (transformIndirection).
                     let selections = super::util::relation_row_selections(interp, class_oid, expr);
                     for (n, ..) in inner.nodes() {
@@ -687,7 +688,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                         let whole_row = selected.is_none()
                             && match cr.fields.as_slice() {
                                 [.., last]
-                                    if matches!(last.node.as_ref(), Some(node::Node::AStar(_))) =>
+                                    if matches!(last.as_ref(), Some(ast::Node::AStar(_))) =>
                                 {
                                     true
                                 }
@@ -744,7 +745,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                         generated.attname
                     )));
                 }
-                let reads_columns = expr.node.as_ref().is_some_and(|inner| {
+                let reads_columns = expr.as_ref().is_some_and(|inner| {
                     inner
                         .nodes()
                         .into_iter()
@@ -803,11 +804,13 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         key_attrs.dedup();
         interp.partition_key_attrs.insert(class_oid, key_attrs);
         partbound::record_partition_spec(interp, class_oid, spec);
-        let key_exprs: Vec<&typedpg_pg_query::protobuf::Node> = spec
+        let key_exprs: Vec<&Option<typedpg_pg_query::ast::Node>> = spec
             .part_params
             .iter()
-            .filter_map(|elem| match elem.node.as_ref() {
-                Some(node::Node::PartitionElem(pe)) if pe.name.is_empty() => pe.expr.as_deref(),
+            .filter_map(|elem| match elem.as_ref() {
+                Some(ast::Node::PartitionElem(pe)) if pe.name.is_empty() => {
+                    pe.expr.is_some().then_some(&pe.expr)
+                }
                 _ => None,
             })
             .collect();
@@ -902,7 +905,7 @@ pub(crate) fn check_tablespace_placement(tablespace: &str) -> Result<(), DdlErro
 /// the analyzer models changes.
 pub fn alter_table_move_all(
     _interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterTableMoveAllStmt,
+    stmt: &typedpg_pg_query::ast::AlterTableMoveAllStmt,
 ) -> Result<(), DdlError> {
     if stmt.orig_tablespacename == "pg_global" || stmt.new_tablespacename == "pg_global" {
         return Err(DdlError::Parse(
@@ -911,9 +914,8 @@ pub fn alter_table_move_all(
     }
     // roleSpecsToIds.
     for role in &stmt.roles {
-        if let Some(node::Node::RoleSpec(r)) = role.node.as_ref()
-            && typedpg_pg_query::protobuf::RoleSpecType::try_from(r.roletype)
-                == Ok(typedpg_pg_query::protobuf::RoleSpecType::RolespecCstring)
+        if let Some(ast::Node::RoleSpec(r)) = role.as_ref()
+            && r.roletype == typedpg_pg_query::ast::RoleSpecType::RolespecCstring
             && !super::session::role_may_exist(&r.rolename)
         {
             return Err(DdlError::Parse(format!(
@@ -989,9 +991,9 @@ pub(crate) fn check_system_column_name(name: &str) -> Result<(), DdlError> {
 }
 
 /// The `OPTIONS (...)` list of an ALTER TABLE subcommand.
-fn generic_options_of(cmd: &AlterTableCmd) -> &[typedpg_pg_query::protobuf::Node] {
-    match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
-        Some(node::Node::List(l)) => &l.items,
+fn generic_options_of(cmd: &AlterTableCmd) -> &[Option<typedpg_pg_query::ast::Node>] {
+    match cmd.def.as_ref() {
+        Some(ast::Node::List(l)) => &l.items,
         _ => &[],
     }
 }
@@ -1002,7 +1004,7 @@ fn alter_column_generic_options(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     colname: &str,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
     if options.is_empty() {
         return Ok(());
@@ -1028,7 +1030,7 @@ pub(crate) fn column_generic_options_stmt(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     colname: &str,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
     if options.is_empty() {
         return Ok(());
@@ -1066,7 +1068,7 @@ pub fn create_plain_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(
         return Ok(());
     };
     for elt in &stmt.table_elts {
-        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
+        if let Some(ast::Node::ColumnDef(cd)) = elt.as_ref() {
             column_generic_options_stmt(interp, relid, &cd.colname, &cd.fdwoptions)?;
         }
     }
@@ -1078,11 +1080,9 @@ pub fn create_plain_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(
 /// elsewhere; the server and options don't affect typing.
 pub fn create_foreign_table(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::CreateForeignTableStmt,
+    stmt: &typedpg_pg_query::ast::CreateForeignTableStmt,
 ) -> Result<(), DdlError> {
-    let Some(base) = stmt.base_stmt.as_ref() else {
-        return Ok(());
-    };
+    let base = &stmt.base_stmt;
     let existed = base.relation.as_ref().and_then(|rv| {
         let (schema, name) = range_var_names(rv, interp);
         interp
@@ -1093,11 +1093,11 @@ pub fn create_foreign_table(
     // skip the statement.
     let skipped = existed.is_some() && base.if_not_exists;
     for elt in base.table_elts.iter().filter(|_| !skipped) {
-        match elt.node.as_ref() {
-            Some(node::Node::Constraint(c)) => check_foreign_table_constraint(c)?,
-            Some(node::Node::ColumnDef(cd)) => {
+        match elt.as_ref() {
+            Some(ast::Node::Constraint(c)) => check_foreign_table_constraint(c)?,
+            Some(ast::Node::ColumnDef(cd)) => {
                 for c in &cd.constraints {
-                    if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+                    if let Some(ast::Node::Constraint(c)) = c.as_ref() {
                         check_foreign_table_constraint(c)?;
                     }
                 }
@@ -1172,7 +1172,7 @@ pub fn create_foreign_table(
         &stmt.options,
     )?;
     for elt in &base.table_elts {
-        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
+        if let Some(ast::Node::ColumnDef(cd)) = elt.as_ref() {
             alter_column_generic_options(interp, oid, &cd.colname, &cd.fdwoptions)?;
         }
     }
@@ -1208,7 +1208,7 @@ struct ParsedColumn {
     /// `Internal` for identity columns.
     owned_sequence: Option<crate::pg_catalog::DepType>,
     /// The identity's sequence options (`GENERATED ... AS IDENTITY (...)`).
-    identity_options: Vec<typedpg_pg_query::protobuf::Node>,
+    identity_options: Vec<Option<typedpg_pg_query::ast::Node>>,
     /// The column has a local NOT NULL (explicit, PRIMARY KEY, serial,
     /// identity) — PG 18 records it as a local not-null constraint.
     nn_local: bool,
@@ -1252,8 +1252,7 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     crate::ddl::util::check_not_system_class(interp, class_oid)?;
     let relkind = interp.pg_class.get(&class_oid).map(|c| c.relkind);
     super::indexes::check_alter_relation_kind(stmt.objtype, relkind, &rv.relname)?;
-    let via_alter_type = typedpg_pg_query::protobuf::ObjectType::try_from(stmt.objtype)
-        == Ok(typedpg_pg_query::protobuf::ObjectType::ObjectType);
+    let via_alter_type = stmt.objtype == typedpg_pg_query::ast::ObjectType::ObjectType;
     if !via_alter_type && relkind == Some(RelKind::CompositeType) {
         return Err(DdlError::Parse(format!(
             "\"{}\" is a composite type",
@@ -1272,8 +1271,8 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         .cmds
         .iter()
         .filter(|n| {
-            matches!(n.node.as_ref(), Some(node::Node::AlterTableCmd(c))
-                if c.subtype == AlterTableType::AtSetTableSpace as i32)
+            matches!(n.as_ref(), Some(ast::Node::AlterTableCmd(c))
+                if c.subtype == AlterTableType::AtSetTableSpace)
         })
         .count();
     if set_tablespaces > 1 {
@@ -1286,12 +1285,12 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     let mut persistence = current_persistence(interp, class_oid);
     let mut persistence_changed = false;
     for cmd_node in &stmt.cmds {
-        let Some(node::Node::AlterTableCmd(cmd)) = cmd_node.node.as_ref() else {
+        let Some(ast::Node::AlterTableCmd(cmd)) = cmd_node.as_ref() else {
             continue;
         };
-        let target = match AlterTableType::try_from(cmd.subtype) {
-            Ok(AlterTableType::AtSetLogged) => 'p',
-            Ok(AlterTableType::AtSetUnLogged) => 'u',
+        let target = match cmd.subtype {
+            AlterTableType::AtSetLogged => 'p',
+            AlterTableType::AtSetUnLogged => 'u',
             _ => continue,
         };
         if persistence_changed {
@@ -1313,8 +1312,8 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     let mut cmds: Vec<&AlterTableCmd> = stmt
         .cmds
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::AlterTableCmd(cmd)) => Some(&**cmd),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::AlterTableCmd(cmd)) => Some(&**cmd),
             _ => None,
         })
         .collect();
@@ -1322,7 +1321,7 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     // the prep phase, in statement order, against the table as it is
     // before any pass executes.
     for cmd in &cmds {
-        if cmd.subtype == AlterTableType::AtAlterColumnType as i32 {
+        if cmd.subtype == AlterTableType::AtAlterColumnType {
             columns::prep_alter_column_using(interp, class_oid, cmd)?;
         }
     }
@@ -1334,7 +1333,7 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
             recurse,
             recursing: false,
         };
-        let retype = cmd.subtype == AlterTableType::AtAlterColumnType as i32;
+        let retype = cmd.subtype == AlterTableType::AtAlterColumnType;
         let before = interp
             .attribute_by_name(class_oid, &cmd.name)
             .map(|a| (a.atttypid, a.atttypmod));
@@ -1373,7 +1372,7 @@ fn alter_table_pass(cmd: &AlterTableCmd) -> u8 {
     const ADD_INDEX: u8 = 9;
     const ADD_OTHERCONSTR: u8 = 10;
     const MISC: u8 = 11;
-    match AlterTableType::try_from(cmd.subtype).unwrap_or(At::Undefined) {
+    match cmd.subtype {
         At::AtDropColumn
         | At::AtDropNotNull
         | At::AtDropExpression
@@ -1383,22 +1382,22 @@ fn alter_table_pass(cmd: &AlterTableCmd) -> u8 {
         At::AtAlterColumnType => ALTER_TYPE,
         At::AtAddColumn | At::AtAddColumnToView => ADD_COL,
         At::AtSetExpression => SET_EXPRESSION,
-        At::AtAddConstraint => match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
-            Some(node::Node::Constraint(c))
+        At::AtAddConstraint => match cmd.def.as_ref() {
+            Some(ast::Node::Constraint(c))
                 if !c.indexname.is_empty()
                     && matches!(
-                        ConstrType::try_from(c.contype),
-                        Ok(ConstrType::ConstrPrimary | ConstrType::ConstrUnique)
+                        c.contype,
+                        ConstrType::ConstrPrimary | ConstrType::ConstrUnique
                     ) =>
             {
                 ADD_INDEXCONSTR
             }
-            Some(node::Node::Constraint(c))
+            Some(ast::Node::Constraint(c))
                 if matches!(
-                    ConstrType::try_from(c.contype),
-                    Ok(ConstrType::ConstrPrimary
+                    c.contype,
+                    ConstrType::ConstrPrimary
                         | ConstrType::ConstrUnique
-                        | ConstrType::ConstrExclusion)
+                        | ConstrType::ConstrExclusion
                 ) =>
             {
                 ADD_INDEX
@@ -1417,7 +1416,7 @@ fn apply_alter_cmd(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let subtype = AlterTableType::try_from(cmd.subtype).unwrap_or(AlterTableType::Undefined);
+    let subtype = cmd.subtype;
     check_alter_target(interp, relid, subtype)?;
     let mut typed_dependents = Vec::new();
     if !rec.recursing {
@@ -1430,7 +1429,7 @@ fn apply_alter_cmd(
                 | AlterTableType::AtDropColumn
                 | AlterTableType::AtAlterColumnType
         ) {
-            let cascade = cmd.behavior == DropBehavior::DropCascade as i32;
+            let cascade = cmd.behavior == DropBehavior::DropCascade;
             typed_dependents = typed::typed_table_dependents(interp, relid, cascade)?;
         }
     }
@@ -1475,15 +1474,13 @@ fn apply_alter_subtype(
         AlterTableType::AtAlterColumnType => alter_column_type(interp, relid, cmd, rec),
         AlterTableType::AtAddConstraint => {
             // DefineIndex, for a constraint's USING INDEX TABLESPACE.
-            if let Some(node::Node::Constraint(c)) =
-                cmd.def.as_deref().and_then(|d| d.node.as_ref())
-            {
+            if let Some(ast::Node::Constraint(c)) = cmd.def.as_ref() {
                 check_tablespace_placement(&c.indexspace)?;
                 // transformIndexConstraint takes a system column as found:
                 // a PRIMARY KEY's not-null constraint on it is refused
                 // first, else DefineIndex refuses the index.
-                let is_pk = c.contype == ConstrType::ConstrPrimary as i32;
-                if (is_pk || c.contype == ConstrType::ConstrUnique as i32)
+                let is_pk = c.contype == ConstrType::ConstrPrimary;
+                if (is_pk || c.contype == ConstrType::ConstrUnique)
                     && let Some(key) = c
                         .keys
                         .iter()
@@ -1540,8 +1537,7 @@ fn apply_alter_subtype(
         | AlterTableType::AtReplaceRelOptions => {
             set_reloptions(interp, relid, cmd, subtype)?;
             if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::View)
-                && let Some(node::Node::List(list)) =
-                    cmd.def.as_deref().and_then(|d| d.node.as_ref())
+                && let Some(ast::Node::List(list)) = cmd.def.as_ref()
             {
                 crate::ddl::views::set_security_barrier(
                     interp,
@@ -1573,8 +1569,7 @@ fn apply_alter_subtype(
         AlterTableType::AtAttachPartition if partidx::is_partitioned_index(interp, relid) => {
             // transformPartitionCmd: a partition bound (ALTER TABLE's
             // ATTACH PARTITION ... FOR VALUES) is a partitioned table's.
-            if let Some(node::Node::PartitionCmd(pc)) =
-                cmd.def.as_deref().and_then(|d| d.node.as_ref())
+            if let Some(ast::Node::PartitionCmd(pc)) = cmd.def.as_ref()
                 && pc.bound.is_some()
             {
                 return Err(DdlError::Parse(format!(
@@ -1725,7 +1720,7 @@ fn set_reloptions(
     subtype: AlterTableType,
 ) -> Result<(), DdlError> {
     use crate::ddl::reloptions::{IndexAm, RelOptKind};
-    let Some(node::Node::List(list)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+    let Some(ast::Node::List(list)) = cmd.def.as_ref() else {
         return Ok(());
     };
     let kind = match interp.pg_class.get(&relid).map(|c| c.relkind) {
@@ -1748,7 +1743,7 @@ fn set_reloptions(
     // relation that has a TOAST table.
     // (A view, an index or a partitioned table has none: it takes them
     // unchecked.)
-    let items: Vec<typedpg_pg_query::protobuf::Node> =
+    let items: Vec<Option<typedpg_pg_query::ast::Node>> =
         if kind == RelOptKind::Heap && interp.toast_tables.contains(&relid) {
             list.items.clone()
         } else {
@@ -2035,7 +2030,7 @@ pub(crate) fn alter_type_rewrites_for_lint(
     attr: &PgAttribute,
     new_type: PgTypeOid,
     new_typmod: Option<i32>,
-    using: Option<&typedpg_pg_query::protobuf::Node>,
+    using: Option<&typedpg_pg_query::ast::Node>,
 ) -> bool {
     columns::alter_type_rewrites(interp, attr, new_type, new_typmod, using)
 }

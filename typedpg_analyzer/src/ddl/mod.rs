@@ -57,7 +57,7 @@ pub(crate) mod volatile;
 #[cfg(any(test, feature = "internal"))]
 pub(crate) use views::serialize_subnode;
 
-use typedpg_pg_query::protobuf::node;
+use typedpg_pg_query::ast;
 
 use crate::pg_catalog::PgCatalog;
 
@@ -197,12 +197,12 @@ fn apply_migration_here(
             // A grammar error carries PG's message verbatim.
             DdlError::Parse(message)
         })?;
-        let mut tx = txblock::Transaction::start(db, sql, &parsed.protobuf.stmts);
+        let mut tx = txblock::Transaction::start(db, sql, &parsed.tree.stmts);
         // The statement that opened the explicit block the next one runs
         // in, when the file opened it.
         let mut opened_by = None;
-        for raw_stmt in &parsed.protobuf.stmts {
-            let Some(stmt) = raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+        for raw_stmt in &parsed.tree.stmts {
+            let Some(stmt) = raw_stmt.stmt.as_ref() else {
                 continue;
             };
             crate::error::take_captured();
@@ -221,7 +221,7 @@ fn apply_migration_here(
             let result = {
                 db.in_transaction_block = tx.in_block();
                 with_statement_sql(db, sql, raw_stmt, |db| match stmt {
-                    node::Node::TransactionStmt(t) => tx.control(db, t),
+                    ast::Node::TransactionStmt(t) => tx.control(db, t),
                     _ => apply_statement(db, stmt),
                 })
             };
@@ -234,8 +234,7 @@ fn apply_migration_here(
             observer.after(db, &statement);
             if !tx.in_explicit_block() {
                 opened_by = None;
-            } else if !explicit_before || matches!(stmt, node::Node::TransactionStmt(t) if t.chain)
-            {
+            } else if !explicit_before || matches!(stmt, ast::Node::TransactionStmt(t) if t.chain) {
                 opened_by = Some(raw_stmt);
             }
         }
@@ -263,7 +262,7 @@ pub(crate) struct MigrationFailure {
 /// wrong: the `BEGIN` (`raw_stmt`) that opened it, with how to fix it.
 fn left_open_location(
     sql: &str,
-    raw_stmt: &typedpg_pg_query::protobuf::RawStmt,
+    raw_stmt: &typedpg_pg_query::ast::RawStmt,
     error: &DdlError,
 ) -> crate::error::CapturedDiagnostic {
     let (start, _) = statement_range(sql, raw_stmt);
@@ -288,7 +287,7 @@ fn left_open_location(
 /// hint — else the statement's first token.
 fn locate_in_statement(
     sql: &str,
-    raw_stmt: &typedpg_pg_query::protobuf::RawStmt,
+    raw_stmt: &typedpg_pg_query::ast::RawStmt,
     error: &DdlError,
 ) -> crate::error::CapturedDiagnostic {
     let (start, end) = statement_range(sql, raw_stmt);
@@ -367,7 +366,7 @@ fn named_token(
 }
 
 /// The byte range of `raw_stmt` in `sql` (`stmt_len` 0 means "to the end").
-fn statement_range(sql: &str, raw_stmt: &typedpg_pg_query::protobuf::RawStmt) -> (usize, usize) {
+fn statement_range(sql: &str, raw_stmt: &typedpg_pg_query::ast::RawStmt) -> (usize, usize) {
     let start = usize::try_from(raw_stmt.stmt_location)
         .unwrap_or(0)
         .min(sql.len());
@@ -423,8 +422,8 @@ pub(crate) fn apply_sql_to(db: &mut PgCatalog, sql: &str) -> Result<(), DdlError
     let _barrier = crate::error::DiagContextGuard::barrier();
     in_migration(db, |db| {
         let parsed = parse(sql)?;
-        for raw_stmt in &parsed.protobuf.stmts {
-            let Some(stmt) = raw_stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+        for raw_stmt in &parsed.tree.stmts {
+            let Some(stmt) = raw_stmt.stmt.as_ref() else {
                 continue;
             };
             with_statement_sql(db, sql, raw_stmt, |db| apply_statement(db, stmt))?;
@@ -461,7 +460,7 @@ fn parse(sql: &str) -> Result<typedpg_pg_query::ParseResult, DdlError> {
 fn with_statement_sql(
     db: &mut PgCatalog,
     sql: &str,
-    raw_stmt: &typedpg_pg_query::protobuf::RawStmt,
+    raw_stmt: &typedpg_pg_query::ast::RawStmt,
     f: impl FnOnce(&mut PgCatalog) -> Result<(), DdlError>,
 ) -> Result<(), DdlError> {
     let (start, end) = statement_range(sql, raw_stmt);
@@ -490,58 +489,58 @@ fn note_user_code(db: &mut PgCatalog) {
 
 /// Apply a single parsed statement, noting what it does to foreign-key
 /// checks (`fk_bypass`).
-fn apply_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
     fk_bypass::note(db, stmt);
     dispatch_statement(db, stmt)
 }
 
 /// Apply a single parsed statement, by kind.
-fn dispatch_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
     match stmt {
         // ── Tables ──────────────────────────────────────────────────
-        node::Node::CreateStmt(s) => tables::create_plain_table(db, s),
-        node::Node::AlterTableStmt(s) => tables::alter_table(db, s),
-        node::Node::CreateForeignTableStmt(s) => tables::create_foreign_table(db, s),
-        node::Node::RefreshMatViewStmt(s) => views::refresh_materialized_view(db, s),
+        ast::Node::CreateStmt(s) => tables::create_plain_table(db, s),
+        ast::Node::AlterTableStmt(s) => tables::alter_table(db, s),
+        ast::Node::CreateForeignTableStmt(s) => tables::create_foreign_table(db, s),
+        ast::Node::RefreshMatViewStmt(s) => views::refresh_materialized_view(db, s),
 
         // ── Types ───────────────────────────────────────────────────
-        node::Node::CreateDomainStmt(s) => types::create_domain(db, s),
-        node::Node::CreateEnumStmt(s) => types::create_enum(db, s),
-        node::Node::CompositeTypeStmt(s) => types::create_composite(db, s),
-        node::Node::CreateRangeStmt(s) => types::create_range(db, s),
-        node::Node::AlterEnumStmt(s) => types::alter_enum(db, s),
-        node::Node::AlterDomainStmt(s) => types::alter_domain(db, s),
+        ast::Node::CreateDomainStmt(s) => types::create_domain(db, s),
+        ast::Node::CreateEnumStmt(s) => types::create_enum(db, s),
+        ast::Node::CompositeTypeStmt(s) => types::create_composite(db, s),
+        ast::Node::CreateRangeStmt(s) => types::create_range(db, s),
+        ast::Node::AlterEnumStmt(s) => types::alter_enum(db, s),
+        ast::Node::AlterDomainStmt(s) => types::alter_domain(db, s),
 
         // ── Drop ────────────────────────────────────────────────────
-        node::Node::DropStmt(s) => drop::drop_objects(db, s),
+        ast::Node::DropStmt(s) => drop::drop_objects(db, s),
 
         // ── Schema ──────────────────────────────────────────────────
-        node::Node::CreateSchemaStmt(s) => schema_stmt::create_schema(db, s),
+        ast::Node::CreateSchemaStmt(s) => schema_stmt::create_schema(db, s),
 
         // ── Sequences ───────────────────────────────────────────────
-        node::Node::CreateSeqStmt(s) => sequences::create_sequence(db, s),
-        node::Node::AlterSeqStmt(s) => sequences::alter_sequence(db, s),
+        ast::Node::CreateSeqStmt(s) => sequences::create_sequence(db, s),
+        ast::Node::AlterSeqStmt(s) => sequences::alter_sequence(db, s),
 
         // ── Functions ───────────────────────────────────────────────
-        node::Node::CreateFunctionStmt(s) => {
+        ast::Node::CreateFunctionStmt(s) => {
             functions::create_function(db, s)?;
             note_user_code(db);
             Ok(())
         }
-        node::Node::AlterFunctionStmt(s) => functions::alter_function(db, s),
+        ast::Node::AlterFunctionStmt(s) => functions::alter_function(db, s),
 
         // ── Views ───────────────────────────────────────────────────
-        node::Node::ViewStmt(s) => views::create_view(db, s),
-        node::Node::CreateTableAsStmt(s) => views::create_table_as(db, s),
+        ast::Node::ViewStmt(s) => views::create_view(db, s),
+        ast::Node::CreateTableAsStmt(s) => views::create_table_as(db, s),
 
         // ── Extensions ──────────────────────────────────────────────
-        node::Node::CreateExtensionStmt(s) => extensions::create_extension(db, s),
-        node::Node::AlterExtensionStmt(s) => extensions::alter_extension(db, s),
+        ast::Node::CreateExtensionStmt(s) => extensions::create_extension(db, s),
+        ast::Node::AlterExtensionStmt(s) => extensions::alter_extension(db, s),
 
         // ── Type definitions (CREATE TYPE name (...)) and casts ─────
-        node::Node::DefineStmt(s) => {
-            use typedpg_pg_query::protobuf::ObjectType;
-            match ObjectType::try_from(s.kind).unwrap_or(ObjectType::Undefined) {
+        ast::Node::DefineStmt(s) => {
+            use typedpg_pg_query::ast::ObjectType;
+            match s.kind {
                 ObjectType::ObjectType => types::define_type(db, s),
                 ObjectType::ObjectOperator => operators::define_operator(db, s),
                 ObjectType::ObjectAggregate => aggregates::define_aggregate(db, s),
@@ -555,104 +554,104 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlEr
                 _ => Ok(()),
             }
         }
-        node::Node::CreateCastStmt(s) => types::create_cast(db, s),
+        ast::Node::CreateCastStmt(s) => types::create_cast(db, s),
 
         // ── ALTER ... RENAME / SET SCHEMA ───────────────────────────
-        node::Node::RenameStmt(s) => alter::rename(db, s),
-        node::Node::AlterObjectSchemaStmt(s) => alter::set_schema(db, s),
+        ast::Node::RenameStmt(s) => alter::rename(db, s),
+        ast::Node::AlterObjectSchemaStmt(s) => alter::set_schema(db, s),
 
         // ── Session state (search_path) ─────────────────────────────
-        node::Node::VariableSetStmt(s) => session::variable_set(db, s),
-        node::Node::AlterDatabaseSetStmt(s) => session::alter_database_set(db, s),
+        ast::Node::VariableSetStmt(s) => session::variable_set(db, s),
+        ast::Node::AlterDatabaseSetStmt(s) => session::alter_database_set(db, s),
         // Top-level transaction control goes through the migration's
         // `txblock::Transaction`; this is what one nested in another
         // statement's SQL does.
-        node::Node::TransactionStmt(s) => session::transaction(db, s),
-        node::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
+        ast::Node::TransactionStmt(s) => session::transaction(db, s),
+        ast::Node::SelectStmt(s) if s.into_clause.is_some() => views::select_into(db, s),
         // A migration's query runs: what the planner folds is checked.
-        node::Node::SelectStmt(s) => {
+        ast::Node::SelectStmt(s) => {
             dml::check_executed(db, stmt)?;
             session::select_side_effects(db, s)
         }
-        node::Node::InsertStmt(_)
-        | node::Node::UpdateStmt(_)
-        | node::Node::DeleteStmt(_)
-        | node::Node::MergeStmt(_)
-        | node::Node::CallStmt(_) => dml::check_executed(db, stmt),
+        ast::Node::InsertStmt(_)
+        | ast::Node::UpdateStmt(_)
+        | ast::Node::DeleteStmt(_)
+        | ast::Node::MergeStmt(_)
+        | ast::Node::CallStmt(_) => dml::check_executed(db, stmt),
 
         // ── Indexes ─────────────────────────────────────────────────
         // Indexes don't change query result types, but expression indexes
         // forbid VOLATILE functions (CREATE INDEX walks the expression
         // tree to detect them).
-        node::Node::IndexStmt(s) => indexes::create_index(db, s),
+        ast::Node::IndexStmt(s) => indexes::create_index(db, s),
 
         // ── No-ops (irrelevant for type analysis) ───────────────────
-        node::Node::CommentStmt(s) => comment::comment_on(db, s),
-        node::Node::AlterOwnerStmt(s) => comment::alter_owner(db, s),
-        node::Node::CreateTrigStmt(s) => {
+        ast::Node::CommentStmt(s) => comment::comment_on(db, s),
+        ast::Node::AlterOwnerStmt(s) => comment::alter_owner(db, s),
+        ast::Node::CreateTrigStmt(s) => {
             triggers::create_trigger(db, s).and_then(|()| coldeps::record_trigger(db, s))
         }
-        node::Node::GrantStmt(s) => acl::grant(db, s),
-        node::Node::CreatePolicyStmt(s) => {
+        ast::Node::GrantStmt(s) => acl::grant(db, s),
+        ast::Node::CreatePolicyStmt(s) => {
             policies::create_policy(db, s).and_then(|()| coldeps::record_policy(db, s))
         }
-        node::Node::AlterPolicyStmt(s) => {
+        ast::Node::AlterPolicyStmt(s) => {
             policies::alter_policy(db, s).and_then(|()| coldeps::record_policy_alter(db, s))
         }
-        node::Node::RuleStmt(s) => rules::create_rule(db, s).and_then(|refs| coldeps::record_rule(db, s, &refs)),
-        node::Node::CreateAmStmt(s) => opclass::create_am(db, s),
-        node::Node::CreateConversionStmt(s) => conversions::create_conversion(db, s),
-        node::Node::CreatePlangStmt(s) => languages::create_language(db, s),
-        node::Node::CreateTransformStmt(s) => languages::create_transform(db, s),
-        node::Node::AlterTsconfigurationStmt(s) => text_search::alter_configuration(db, s),
-        node::Node::AlterTsdictionaryStmt(s) => text_search::alter_dictionary(db, s),
-        node::Node::CreateEventTrigStmt(s) => event_triggers::create_event_trigger(db, s),
-        node::Node::AlterEventTrigStmt(s) => event_triggers::alter_event_trigger(db, s),
-        node::Node::CreatePublicationStmt(s) => publications::create_publication(db, s),
-        node::Node::AlterPublicationStmt(s) => publications::alter_publication(db, s),
+        ast::Node::RuleStmt(s) => rules::create_rule(db, s).and_then(|refs| coldeps::record_rule(db, s, &refs)),
+        ast::Node::CreateAmStmt(s) => opclass::create_am(db, s),
+        ast::Node::CreateConversionStmt(s) => conversions::create_conversion(db, s),
+        ast::Node::CreatePLangStmt(s) => languages::create_language(db, s),
+        ast::Node::CreateTransformStmt(s) => languages::create_transform(db, s),
+        ast::Node::AlterTsConfigurationStmt(s) => text_search::alter_configuration(db, s),
+        ast::Node::AlterTsDictionaryStmt(s) => text_search::alter_dictionary(db, s),
+        ast::Node::CreateEventTrigStmt(s) => event_triggers::create_event_trigger(db, s),
+        ast::Node::AlterEventTrigStmt(s) => event_triggers::alter_event_trigger(db, s),
+        ast::Node::CreatePublicationStmt(s) => publications::create_publication(db, s),
+        ast::Node::AlterPublicationStmt(s) => publications::alter_publication(db, s),
         // Compiled first (plpgsql_compile_inline), then run.
-        node::Node::DoStmt(s) => {
+        ast::Node::DoStmt(s) => {
             function_body::do_block(db, s)?;
             note_user_code(db);
             do_block::execute(db, s)
         }
-        node::Node::AlterExtensionContentsStmt(s) => extensions::alter_extension_contents(db, s),
-        node::Node::CreateFdwStmt(s) => fdw::create_fdw(db, s),
-        node::Node::AlterFdwStmt(s) => fdw::alter_fdw(db, s),
-        node::Node::CreateForeignServerStmt(s) => fdw::create_server(db, s),
-        node::Node::AlterForeignServerStmt(s) => fdw::alter_server(db, s),
-        node::Node::CreateUserMappingStmt(s) => fdw::create_user_mapping(db, s),
-        node::Node::AlterUserMappingStmt(s) => fdw::alter_user_mapping(db, s),
-        node::Node::DropUserMappingStmt(s) => fdw::drop_user_mapping(db, s),
-        node::Node::ImportForeignSchemaStmt(s) => fdw::import_foreign_schema(db, s),
-        node::Node::CreateStatsStmt(s) => statistics::create_statistics(db, s),
-        node::Node::AlterStatsStmt(s) => statistics::alter_statistics(db, s),
-        node::Node::CreateOpClassStmt(s) => opclass::create_opclass(db, s),
-        node::Node::CreateOpFamilyStmt(s) => opclass::create_opfamily(db, s),
-        node::Node::AlterOpFamilyStmt(s) => opclass::alter_opfamily(db, s),
-        node::Node::TruncateStmt(s) => maintenance::truncate(db, s),
-        node::Node::CopyStmt(s) => maintenance::copy(db, s),
-        node::Node::ClusterStmt(s) => maintenance::cluster(db, s),
-        node::Node::ReindexStmt(s) => maintenance::reindex(db, s),
-        node::Node::VacuumStmt(s) => maintenance::vacuum(db, s),
-        node::Node::LockStmt(s) => maintenance::lock(db, s),
-        node::Node::SecLabelStmt(s) => maintenance::security_label(s),
-        node::Node::AlterDefaultPrivilegesStmt(s) => acl::alter_default_privileges(db, s),
-        node::Node::ConstraintsSetStmt(s) => session::set_constraints(db, s),
-        node::Node::ExplainStmt(s) => session::explain(db, s),
-        node::Node::CreateTableSpaceStmt(s) => cluster::create_tablespace(db, s),
-        node::Node::DropTableSpaceStmt(s) => cluster::drop_tablespace(db, s),
-        node::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
-        node::Node::AlterSubscriptionStmt(s) => cluster::alter_subscription(db, &s.subname),
-        node::Node::DropSubscriptionStmt(s) => cluster::drop_subscription(db, s),
-        node::Node::AlterOperatorStmt(s) => operators::alter_operator(db, s),
-        node::Node::GrantRoleStmt(_)
-        | node::Node::CreateRoleStmt(_)
-        | node::Node::AlterRoleStmt(_)
-        | node::Node::VariableShowStmt(_)
-        | node::Node::NotifyStmt(_)
-        | node::Node::ListenStmt(_)
-        | node::Node::UnlistenStmt(_)
+        ast::Node::AlterExtensionContentsStmt(s) => extensions::alter_extension_contents(db, s),
+        ast::Node::CreateFdwStmt(s) => fdw::create_fdw(db, s),
+        ast::Node::AlterFdwStmt(s) => fdw::alter_fdw(db, s),
+        ast::Node::CreateForeignServerStmt(s) => fdw::create_server(db, s),
+        ast::Node::AlterForeignServerStmt(s) => fdw::alter_server(db, s),
+        ast::Node::CreateUserMappingStmt(s) => fdw::create_user_mapping(db, s),
+        ast::Node::AlterUserMappingStmt(s) => fdw::alter_user_mapping(db, s),
+        ast::Node::DropUserMappingStmt(s) => fdw::drop_user_mapping(db, s),
+        ast::Node::ImportForeignSchemaStmt(s) => fdw::import_foreign_schema(db, s),
+        ast::Node::CreateStatsStmt(s) => statistics::create_statistics(db, s),
+        ast::Node::AlterStatsStmt(s) => statistics::alter_statistics(db, s),
+        ast::Node::CreateOpClassStmt(s) => opclass::create_opclass(db, s),
+        ast::Node::CreateOpFamilyStmt(s) => opclass::create_opfamily(db, s),
+        ast::Node::AlterOpFamilyStmt(s) => opclass::alter_opfamily(db, s),
+        ast::Node::TruncateStmt(s) => maintenance::truncate(db, s),
+        ast::Node::CopyStmt(s) => maintenance::copy(db, s),
+        ast::Node::ClusterStmt(s) => maintenance::cluster(db, s),
+        ast::Node::ReindexStmt(s) => maintenance::reindex(db, s),
+        ast::Node::VacuumStmt(s) => maintenance::vacuum(db, s),
+        ast::Node::LockStmt(s) => maintenance::lock(db, s),
+        ast::Node::SecLabelStmt(s) => maintenance::security_label(s),
+        ast::Node::AlterDefaultPrivilegesStmt(s) => acl::alter_default_privileges(db, s),
+        ast::Node::ConstraintsSetStmt(s) => session::set_constraints(db, s),
+        ast::Node::ExplainStmt(s) => session::explain(db, s),
+        ast::Node::CreateTableSpaceStmt(s) => cluster::create_tablespace(db, s),
+        ast::Node::DropTableSpaceStmt(s) => cluster::drop_tablespace(db, s),
+        ast::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
+        ast::Node::AlterSubscriptionStmt(s) => cluster::alter_subscription(db, &s.subname),
+        ast::Node::DropSubscriptionStmt(s) => cluster::drop_subscription(db, s),
+        ast::Node::AlterOperatorStmt(s) => operators::alter_operator(db, s),
+        ast::Node::GrantRoleStmt(_)
+        | ast::Node::CreateRoleStmt(_)
+        | ast::Node::AlterRoleStmt(_)
+        | ast::Node::VariableShowStmt(_)
+        | ast::Node::NotifyStmt(_)
+        | ast::Node::ListenStmt(_)
+        | ast::Node::UnlistenStmt(_)
         // Statements PG accepts in a migration that don't change anything the
         // static analysis reads: DML and procedure calls (like the SELECT /
         // INSERT above), statistics, database / role / system settings,
@@ -661,28 +660,28 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &node::Node) -> Result<(), DdlEr
         // wrappers / servers / user mappings,
         // tablespaces, conversions, languages, transforms, security labels,
         // and type property changes (`ALTER TYPE t SET (...)`).
-        | node::Node::CheckPointStmt(_)
-        | node::Node::LoadStmt(_)
-        | node::Node::AlterDatabaseStmt(_)
-        | node::Node::AlterDatabaseRefreshCollStmt(_)
-        | node::Node::AlterRoleSetStmt(_)
-        | node::Node::AlterSystemStmt(_)
-        | node::Node::DropRoleStmt(_)
-        | node::Node::ReassignOwnedStmt(_)
-        | node::Node::DropOwnedStmt(_)
-        | node::Node::AlterTableSpaceOptionsStmt(_) => Ok(()),
-        node::Node::AlterObjectDependsStmt(s) => extensions::alter_object_depends(db, s),
+        | ast::Node::CheckPointStmt(_)
+        | ast::Node::LoadStmt(_)
+        | ast::Node::AlterDatabaseStmt(_)
+        | ast::Node::AlterDatabaseRefreshCollStmt(_)
+        | ast::Node::AlterRoleSetStmt(_)
+        | ast::Node::AlterSystemStmt(_)
+        | ast::Node::DropRoleStmt(_)
+        | ast::Node::ReassignOwnedStmt(_)
+        | ast::Node::DropOwnedStmt(_)
+        | ast::Node::AlterTableSpaceOptionsStmt(_) => Ok(()),
+        ast::Node::AlterObjectDependsStmt(s) => extensions::alter_object_depends(db, s),
         // `ALTER COLLATION name REFRESH VERSION`: only the name matters.
-        node::Node::AlterCollationStmt(s) => collations::refresh_version(db, s),
-        node::Node::AlterTypeStmt(s) => types::alter_type(db, s),
-        node::Node::AlterTableMoveAllStmt(s) => tables::alter_table_move_all(db, s),
-        node::Node::PrepareStmt(s) => prepared::prepare(db, s),
-        node::Node::ExecuteStmt(s) => prepared::execute(db, s),
-        node::Node::DeallocateStmt(s) => prepared::deallocate(db, s),
-        node::Node::DiscardStmt(s) => prepared::discard(db, s),
-        node::Node::DeclareCursorStmt(s) => cursors::declare(db, s),
-        node::Node::FetchStmt(s) => cursors::fetch(db, s),
-        node::Node::ClosePortalStmt(s) => cursors::close(db, s),
+        ast::Node::AlterCollationStmt(s) => collations::refresh_version(db, s),
+        ast::Node::AlterTypeStmt(s) => types::alter_type(db, s),
+        ast::Node::AlterTableMoveAllStmt(s) => tables::alter_table_move_all(db, s),
+        ast::Node::PrepareStmt(s) => prepared::prepare(db, s),
+        ast::Node::ExecuteStmt(s) => prepared::execute(db, s),
+        ast::Node::DeallocateStmt(s) => prepared::deallocate(db, s),
+        ast::Node::DiscardStmt(s) => prepared::discard(db, s),
+        ast::Node::DeclareCursorStmt(s) => cursors::declare(db, s),
+        ast::Node::FetchStmt(s) => cursors::fetch(db, s),
+        ast::Node::ClosePortalStmt(s) => cursors::close(db, s),
 
         // ── Unknown DDL — surface as an error ───────────────────────
         // Name the statement, never dump its tree.

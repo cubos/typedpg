@@ -2,7 +2,7 @@
 //! are checked against each other and the sequence's data type like
 //! `init_params` (sequence.c) does.
 
-use typedpg_pg_query::protobuf::node;
+use typedpg_pg_query::ast;
 
 use super::DdlError;
 use crate::oid::PgTypeOid;
@@ -47,22 +47,26 @@ impl SeqParams {
 impl SeqParams {
     /// sequence_options (sequence.c): these parameters as the option list
     /// that recreates them.
-    pub(crate) fn as_options(&self) -> Vec<typedpg_pg_query::protobuf::Node> {
-        use typedpg_pg_query::protobuf::{DefElem, Float, Integer, Node};
+    pub(crate) fn as_options(&self) -> Vec<Option<typedpg_pg_query::ast::Node>> {
+        use typedpg_pg_query::ast::{DefElem, Float, Integer};
         let def = |name: &str, value: i128| {
             let arg = match i32::try_from(value) {
-                Ok(ival) => node::Node::Integer(Integer { ival }),
-                Err(_) => node::Node::Float(Float {
-                    fval: value.to_string(),
-                }),
+                Ok(ival) => ast::Node::Integer(Integer { ival }.into()),
+                Err(_) => ast::Node::Float(
+                    Float {
+                        fval: value.to_string(),
+                    }
+                    .into(),
+                ),
             };
-            Node {
-                node: Some(node::Node::DefElem(Box::new(DefElem {
+            Some(ast::Node::DefElem(
+                DefElem {
                     defname: name.to_owned(),
-                    arg: Some(Box::new(Node { node: Some(arg) })),
+                    arg: Some(arg),
                     ..Default::default()
-                }))),
-            }
+                }
+                .into(),
+            ))
         };
         vec![
             def("cache", self.cache),
@@ -75,11 +79,11 @@ impl SeqParams {
 }
 
 /// `defGetInt64`: an integer, or a numeric literal `int8in` accepts.
-fn numeric_arg(de: &typedpg_pg_query::protobuf::DefElem) -> Result<Option<i128>, DdlError> {
-    let text = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::Integer(i)) => return Ok(Some(i128::from(i.ival))),
-        Some(node::Node::Float(f)) => f.fval.as_str(),
-        Some(node::Node::String(s)) => s.sval.as_str(),
+fn numeric_arg(de: &typedpg_pg_query::ast::DefElem) -> Result<Option<i128>, DdlError> {
+    let text = match de.arg.as_ref() {
+        Some(ast::Node::Integer(i)) => return Ok(Some(i128::from(i.ival))),
+        Some(ast::Node::Float(f)) => f.fval.as_str(),
+        Some(ast::Node::String(s)) => s.sval.as_str(),
         _ => return Ok(None),
     };
     match crate::literal_input::parse_pg_integer(text) {
@@ -96,7 +100,7 @@ fn numeric_arg(de: &typedpg_pg_query::protobuf::DefElem) -> Result<Option<i128>,
 /// init_params: apply `options` to `current` (a new sequence when `None`).
 pub(crate) fn init_params(
     interp: &PgCatalog,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
     current: Option<SeqParams>,
 ) -> Result<SeqParams, DdlError> {
     match current {
@@ -110,7 +114,7 @@ pub(crate) fn init_params(
 /// sequence parameters.
 pub(crate) fn init_column_params(
     interp: &PgCatalog,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
     typ: PgTypeOid,
 ) -> Result<SeqParams, DdlError> {
     apply(interp, options, SeqParams::defaults(typ), true)
@@ -118,7 +122,7 @@ pub(crate) fn init_column_params(
 
 fn apply(
     interp: &PgCatalog,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
     old: SeqParams,
     is_init: bool,
 ) -> Result<SeqParams, DdlError> {
@@ -131,7 +135,7 @@ fn apply(
     let mut restart: Option<Option<i128>> = None;
     let mut cache = None;
     for opt in options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         let name = de.defname.as_str();
@@ -158,9 +162,7 @@ fn apply(
         }
         match name {
             "as" => {
-                if let Some(node::Node::TypeName(tn)) =
-                    de.arg.as_deref().and_then(|a| a.node.as_ref())
-                {
+                if let Some(ast::Node::TypeName(tn)) = de.arg.as_ref() {
                     as_type = Some(super::functions::typename_type_id(interp, tn)?);
                 }
             }

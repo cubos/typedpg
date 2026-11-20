@@ -1,4 +1,5 @@
 use super::*;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Indirection (`(expr).field`, `(expr)[i]`)
@@ -10,16 +11,15 @@ use super::*;
 /// (`arr[1:3]`, which keeps the array type). `jsonb` / `json` subscripting
 /// (`data['key']`, `data[0]`, chained) yields `jsonb` at every step.
 pub(crate) fn infer_indirection(
-    ind: &protobuf::AIndirection,
+    ind: &ast::AIndirection,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx {
         scope, snapshot, ..
     } = ctx;
-    let arg = ind
-        .arg
-        .as_deref()
+    let arg = &ind.arg;
+    arg.as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("indirection without arg".into()))?;
 
     // A `record` arg's fields come with its inferred type: a function's OUT
@@ -27,8 +27,8 @@ pub(crate) fn infer_indirection(
     // subquery or CTE that produced it).
     let mut current = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
     let arg_is_column = matches!(
-        arg.node.as_ref(),
-        Some(node::Node::ColumnRef(cr)) if column_ref_is_column(cr, scope)
+        arg.as_ref(),
+        Some(ast::Node::ColumnRef(cr)) if column_ref_is_column(cr, scope)
     );
 
     // The `(alias).field` shape: arg is a FROM entry's whole row (see
@@ -39,8 +39,8 @@ pub(crate) fn infer_indirection(
     let steps = &ind.indirection[..];
     let mut i = 0;
     while i < steps.len() {
-        match steps[i].node.as_ref() {
-            Some(node::Node::String(s)) => {
+        match steps[i].as_ref() {
+            Some(ast::Node::String(s)) => {
                 if i == 0 && arg_is_column {
                     record_var_shape_visible(&current, snapshot)?;
                 }
@@ -48,7 +48,7 @@ pub(crate) fn infer_indirection(
                 // that is no column of the entry is the call `f(t)` (below).
                 let selected = match entry.filter(|_| i == 0) {
                     Some((alias, src)) => match entry_column(alias, src, &steps[i], arg) {
-                        Some(column) => Ok(infer_expr(&column, ctx, params, TypeGoal::NONE)?),
+                        Some(column) => Ok(infer_expr(&Some(column), ctx, params, TypeGoal::NONE)?),
                         // unknown_attribute: errmsg("column %s.%s does not
                         // exist", rte->eref->aliasname, attname) — the names
                         // as they are, neither quoted nor escaped.
@@ -67,14 +67,10 @@ pub(crate) fn infer_indirection(
                         let value = if i == 0 {
                             arg.clone()
                         } else {
-                            protobuf::Node {
-                                node: Some(node::Node::AIndirection(Box::new(
-                                    protobuf::AIndirection {
-                                        arg: ind.arg.clone(),
-                                        indirection: steps[..i].to_vec(),
-                                    },
-                                ))),
-                            }
+                            Some(ast::Node::AIndirection(NodeBox::new(ast::AIndirection {
+                                arg: ind.arg.clone(),
+                                indirection: steps[..i].to_vec(),
+                            })))
                         };
                         let location = crate::error::node_location(arg).unwrap_or(-1);
                         match super::func_call::infer_column_notation_call(
@@ -87,7 +83,7 @@ pub(crate) fn infer_indirection(
                 };
                 i += 1;
             }
-            Some(node::Node::AIndices(_)) => {
+            Some(ast::Node::AIndices(_)) => {
                 // PG's transformIndirection gathers every consecutive
                 // subscript into one list and hands the whole run to
                 // transformContainerSubscripts, so e.g. a slice anywhere in
@@ -99,11 +95,14 @@ pub(crate) fn infer_indirection(
                     && matches!(run.as_slice(), [ai] if !ai.is_slice
                     && ai.lidx.is_none()
                     && matches!(
-                        ai.uidx.as_deref().and_then(|u| u.node.as_ref()),
-                        Some(node::Node::AConst(protobuf::AConst {
-                            val: Some(a_const::Val::Ival(one)),
-                            ..
-                        })) if one.ival == 1
+                        ai.uidx.as_ref(),
+                        Some(ast::Node::AConst(c)) if matches!(
+                            &**c,
+                            ast::AConst {
+                                val: Some(ast::AConstValue::Integer(one)),
+                                ..
+                            } if one.ival == 1
+                        )
                     ))
                     && super::func_call::is_nonempty_1d_array_agg(arg, &current, ctx, params);
                 i += run.len();
@@ -114,7 +113,7 @@ pub(crate) fn infer_indirection(
             }
             // `(expr).*` only expands in a SELECT list (see
             // `expand_indirection_star`); anywhere else PG refuses it.
-            Some(node::Node::AStar(_)) => {
+            Some(ast::Node::AStar(_)) => {
                 return Err(AnalyzeError::Invalid(
                     "row expansion via \"*\" is not supported here".into(),
                 ));
@@ -124,7 +123,6 @@ pub(crate) fn infer_indirection(
                     "typedpg does not support {} in an indirection (`expr.field`, \
                      `expr[i]`) yet",
                     steps[i]
-                        .node
                         .as_ref()
                         .map_or_else(|| "an empty step".to_owned(), crate::error::node_kind)
                 )));
@@ -142,24 +140,18 @@ pub(crate) fn infer_indirection(
 /// does not exist` (whereas `(c.col).field` gives `column "field" not
 /// found in data type T`).
 pub(crate) fn whole_row_entry<'a>(
-    ind: &'a protobuf::AIndirection,
+    ind: &'a ast::AIndirection,
     scope: &'a Scope,
 ) -> Option<(&'a str, &'a crate::scope::TableSource)> {
-    let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = ind.arg.as_ref() else {
         return None;
     };
     if column_ref_is_column(cr, scope) {
         return None;
     }
     let alias = match cr.fields.as_slice() {
-        [name]
-        | [
-            name,
-            protobuf::Node {
-                node: Some(node::Node::AStar(_)),
-            },
-        ] => match name.node.as_ref()? {
-            node::Node::String(s) => s.sval.as_str(),
+        [name] | [name, Some(ast::Node::AStar(_))] => match name.as_ref()? {
+            ast::Node::String(s) => s.sval.as_str(),
             _ => return None,
         },
         _ => return None,
@@ -177,10 +169,10 @@ pub(crate) fn whole_row_entry<'a>(
 pub(crate) fn entry_column(
     alias: &str,
     src: &crate::scope::TableSource,
-    field: &protobuf::Node,
-    arg: &protobuf::Node,
-) -> Option<protobuf::Node> {
-    let Some(node::Node::String(f)) = field.node.as_ref() else {
+    field: &Option<ast::Node>,
+    arg: &Option<ast::Node>,
+) -> Option<ast::Node> {
+    let Some(ast::Node::String(f)) = field.as_ref() else {
         return None;
     };
     if !src
@@ -191,42 +183,36 @@ pub(crate) fn entry_column(
     {
         return None;
     }
-    let location = match arg.node.as_ref() {
-        Some(node::Node::ColumnRef(cr)) => cr.location,
+    let location = match arg.as_ref() {
+        Some(ast::Node::ColumnRef(cr)) => cr.location,
         _ => -1,
     };
-    Some(protobuf::Node {
-        node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-            fields: vec![
-                protobuf::Node {
-                    node: Some(node::Node::String(protobuf::String {
-                        sval: alias.to_owned(),
-                    })),
-                },
-                field.clone(),
-            ],
-            location,
-        })),
-    })
+    Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+        fields: vec![
+            Some(ast::Node::String(NodeBox::new(ast::String {
+                sval: alias.to_owned(),
+            }))),
+            field.clone(),
+        ],
+        location,
+    })))
 }
 
 /// The column `t.f` that `ind`, a single field selection `(t).f` on a FROM
 /// entry's whole row, is ([`entry_column`]) — `None` for any other
 /// indirection.
-pub(crate) fn whole_row_field_column(
-    ind: &protobuf::AIndirection,
-    scope: &Scope,
-) -> Option<protobuf::Node> {
+pub(crate) fn whole_row_field_column(ind: &ast::AIndirection, scope: &Scope) -> Option<ast::Node> {
     let [field] = ind.indirection.as_slice() else {
         return None;
     };
     let (alias, src) = whole_row_entry(ind, scope)?;
-    entry_column(alias, src, field, ind.arg.as_deref()?)
+    ind.arg.as_ref()?;
+    entry_column(alias, src, field, &ind.arg)
 }
 
 /// Whether `cr` names a column (a Var in PG) rather than a FROM entry's
 /// whole row.
-pub(crate) fn column_ref_is_column(cr: &protobuf::ColumnRef, scope: &Scope) -> bool {
+pub(crate) fn column_ref_is_column(cr: &ast::ColumnRef, scope: &Scope) -> bool {
     let parts = extract_string_fields(&cr.fields);
     if parts.len() != cr.fields.len() {
         return false; // `t.*`
@@ -384,7 +370,7 @@ pub(crate) fn composite_field_nullable(value: &ExprType, name: &str) -> bool {
 
 /// `ARRAY[expr1, expr2, …]` with no target type (see [`transform_array_expr`]).
 pub(crate) fn infer_array_expr(
-    arr: &protobuf::AArrayExpr,
+    arr: &ast::AArrayExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -418,7 +404,7 @@ pub(crate) struct ArrayTarget {
 /// The result's typmod is the one every element agrees on (PG's
 /// `exprTypmod` of an ArrayExpr), or the target's.
 pub(crate) fn transform_array_expr(
-    arr: &protobuf::AArrayExpr,
+    arr: &ast::AArrayExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     target: Option<ArrayTarget>,
@@ -427,7 +413,7 @@ pub(crate) fn transform_array_expr(
     let mut elems = Vec::with_capacity(arr.elements.len());
     let mut multidims = false;
     for elem in &arr.elements {
-        let t = if let Some(node::Node::AArrayExpr(sub)) = elem.node.as_ref() {
+        let t = if let Some(ast::Node::AArrayExpr(sub)) = elem.as_ref() {
             multidims = true;
             transform_array_expr(sub, ctx, params, target)?
         } else {
@@ -435,8 +421,8 @@ pub(crate) fn transform_array_expr(
             // an array of composites is converted field by field, so its
             // arity and fields are checked against the target's
             // (`ARRAY[ROW(1, 2, 3)]::t[]` is `cannot cast type record to t`).
-            let goal = match (elem.node.as_ref(), target) {
-                (Some(node::Node::RowExpr(_)), Some(tg))
+            let goal = match (elem.as_ref(), target) {
+                (Some(ast::Node::RowExpr(_)), Some(tg))
                     if coerce::is_complex(tg.element_type, snapshot) =>
                 {
                     TypeGoal {
@@ -477,7 +463,7 @@ pub(crate) fn transform_array_expr(
             let common = match coerce::select_common_type(&types, snapshot) {
                 Ok(t) => t,
                 Err(coerce::CommonTypeError::Mismatch(a, b)) => {
-                    let nodes: Vec<&protobuf::Node> = arr.elements.iter().collect();
+                    let nodes: Vec<&Option<ast::Node>> = arr.elements.iter().collect();
                     let span = super::conditional::failing_input_span(&types, &nodes, b, snapshot);
                     let (a, b) = (name(a), name(b));
                     return Err(crate::pgmsg::types_cannot_be_matched(
@@ -493,7 +479,7 @@ pub(crate) fn transform_array_expr(
                     .finalize_implicit());
                 }
                 Err(coerce::CommonTypeError::CannotConvert { from, to }) => {
-                    let nodes: Vec<&protobuf::Node> = arr.elements.iter().collect();
+                    let nodes: Vec<&Option<ast::Node>> = arr.elements.iter().collect();
                     let span =
                         super::conditional::failing_input_span(&types, &nodes, from, snapshot);
                     return Err(crate::pgmsg::could_not_convert_type(
@@ -683,13 +669,13 @@ enum SubArrayShape {
 /// to a type that is no domain (`'{1}'::int[]`, `NULL::int[]` — the
 /// literal is read as that type; a domain's check stays a node), or an
 /// `ARRAY[...]` of such, which `eval_const_expressions` evaluates.
-fn certainly_constant(node: &protobuf::Node, snapshot: &PgCatalog) -> bool {
-    match node.node.as_ref() {
-        Some(node::Node::AConst(_)) => true,
-        Some(node::Node::TypeCast(c)) => {
-            let untyped = match c.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                Some(node::Node::AConst(a)) => {
-                    a.isnull || matches!(a.val, Some(a_const::Val::Sval(_)))
+fn certainly_constant(node: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
+    match node.as_ref() {
+        Some(ast::Node::AConst(_)) => true,
+        Some(ast::Node::TypeCast(c)) => {
+            let untyped = match c.arg.as_ref() {
+                Some(ast::Node::AConst(a)) => {
+                    a.isnull || matches!(a.val, Some(ast::AConstValue::String(_)))
                 }
                 _ => false,
             };
@@ -699,7 +685,7 @@ fn certainly_constant(node: &protobuf::Node, snapshot: &PgCatalog) -> bool {
                     .and_then(|tn| crate::ddl::util::lookup_type_name(tn, snapshot).ok())
                     .is_some_and(|t| snapshot.unwrap_domain(t) == t)
         }
-        Some(node::Node::AArrayExpr(a)) => {
+        Some(ast::Node::AArrayExpr(a)) => {
             a.elements.iter().all(|e| certainly_constant(e, snapshot))
         }
         _ => false,
@@ -711,48 +697,46 @@ fn certainly_constant(node: &protobuf::Node, snapshot: &PgCatalog) -> bool {
 /// over values — or over sub-arrays all of one fixed shape — a NULL, or an
 /// array literal (untyped, read as `array_type`, or cast to an array type).
 fn sub_array_shape(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     array_type: PgTypeOid,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> SubArrayShape {
-    match node.node.as_ref() {
-        Some(node::Node::AConst(c)) if c.isnull => SubArrayShape::Absent,
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(a_const::Val::Sval(sv)),
-            ..
-        })) => array_literal_shape(&sv.sval, array_type, ctx.snapshot),
-        Some(node::Node::TypeCast(c)) => match c.arg.as_deref() {
+    match node.as_ref() {
+        Some(ast::Node::AConst(c)) if c.isnull => SubArrayShape::Absent,
+        Some(ast::Node::AConst(c)) => match &c.val {
+            Some(ast::AConstValue::String(sv)) => {
+                array_literal_shape(&sv.sval, array_type, ctx.snapshot)
+            }
+            _ => SubArrayShape::Unknown,
+        },
+        Some(ast::Node::TypeCast(c)) => match &c.arg {
             // A literal is read by the input function of the type it is
             // cast to — `array_in` for an array type.
-            Some(
-                arg @ protobuf::Node {
-                    node:
-                        Some(node::Node::AConst(protobuf::AConst {
-                            val: Some(a_const::Val::Sval(_)),
-                            ..
-                        })),
-                },
-            ) => match c
-                .type_name
-                .as_ref()
-                .and_then(|tn| crate::ddl::util::lookup_type_name(tn, ctx.snapshot).ok())
+            arg @ Some(ast::Node::AConst(ac))
+                if matches!(ac.val, Some(ast::AConstValue::String(_))) =>
             {
-                Some(t) => sub_array_shape(arg, t, ctx, params),
-                None => SubArrayShape::Unknown,
-            },
-            Some(arg) => sub_array_shape(arg, array_type, ctx, params),
+                match c
+                    .type_name
+                    .as_ref()
+                    .and_then(|tn| crate::ddl::util::lookup_type_name(tn, ctx.snapshot).ok())
+                {
+                    Some(t) => sub_array_shape(arg, t, ctx, params),
+                    None => SubArrayShape::Unknown,
+                }
+            }
+            arg @ Some(_) => sub_array_shape(arg, array_type, ctx, params),
             None => SubArrayShape::Unknown,
         },
-        Some(node::Node::AArrayExpr(a)) => {
+        Some(ast::Node::AArrayExpr(a)) => {
             if a.elements.is_empty() {
                 return SubArrayShape::Absent;
             }
             let n = a.elements.len() as i64;
             // transformArrayExpr: a sub-ARRAY, or any element of an array
             // type, makes it multidimensional.
-            let sub_array = |e: &protobuf::Node| {
-                matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))) || {
+            let sub_array = |e: &Option<ast::Node>| {
+                matches!(e.as_ref(), Some(ast::Node::AArrayExpr(_))) || {
                     let mut scratch = params.clone();
                     infer_expr(e, ctx, &mut scratch, TypeGoal::NONE)
                         .is_ok_and(|t| is_sub_array_type(t.type_oid, ctx.snapshot))
@@ -780,12 +764,12 @@ fn sub_array_shape(
             }
             // Values (not arrays, which would make it multidimensional with
             // their own shapes) make a one-dimensional array of `n`.
-            let scalar = |e: &protobuf::Node| {
+            let scalar = |e: &Option<ast::Node>| {
                 let mut scratch = params.clone();
                 infer_expr(e, ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| {
                     t.type_oid != oid::UNKNOWN
                         && array_element_type(ctx.snapshot, t.type_oid).is_none()
-                }) || matches!(e.node.as_ref(), Some(node::Node::AConst(_)))
+                }) || matches!(e.as_ref(), Some(ast::Node::AConst(_)))
             };
             if a.elements.iter().all(scalar) {
                 SubArrayShape::Dims(vec![(1, n)])
@@ -827,7 +811,7 @@ fn array_literal_shape(
 /// end in `.*`. The value must have a known row shape: a composite type
 /// (domains unwrapped) or an anonymous record whose fields are known.
 pub(crate) fn expand_indirection_star(
-    ind: &protobuf::AIndirection,
+    ind: &ast::AIndirection,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<Vec<(String, ExprType)>>, AnalyzeError> {
@@ -835,17 +819,16 @@ pub(crate) fn expand_indirection_star(
     let Some((last, prefix)) = ind.indirection.split_last() else {
         return Ok(None);
     };
-    if !matches!(last.node.as_ref(), Some(node::Node::AStar(_))) {
+    if !matches!(last.as_ref(), Some(ast::Node::AStar(_))) {
         return Ok(None);
     }
-    let arg = ind
-        .arg
-        .as_deref()
+    let arg = &ind.arg;
+    arg.as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("indirection without arg".into()))?;
     let container = if prefix.is_empty() {
         infer_expr(arg, ctx, params, TypeGoal::NONE)?
     } else {
-        let inner = protobuf::AIndirection {
+        let inner = ast::AIndirection {
             arg: ind.arg.clone(),
             indirection: prefix.to_vec(),
         };
@@ -910,14 +893,14 @@ pub(crate) fn expand_indirection_star(
 /// The argument and name of a call PG may read as a column projection:
 /// one argument, an unqualified name, no aggregate / window / VARIADIC
 /// decoration and no argument name.
-fn projection_candidate(func: &protobuf::FuncCall) -> Option<(&protobuf::Node, &protobuf::String)> {
+fn projection_candidate(func: &ast::FuncCall) -> Option<(&Option<ast::Node>, &ast::String)> {
     let [arg] = func.args.as_slice() else {
         return None;
     };
     let [name] = func.funcname.as_slice() else {
         return None;
     };
-    let Some(node::Node::String(name)) = name.node.as_ref() else {
+    let Some(ast::Node::String(name)) = name.as_ref() else {
         return None;
     };
     if !func.agg_order.is_empty()
@@ -927,7 +910,7 @@ fn projection_candidate(func: &protobuf::FuncCall) -> Option<(&protobuf::Node, &
         || func.agg_within_group
         || func.over.is_some()
         || func.func_variadic
-        || matches!(arg.node.as_ref(), Some(node::Node::NamedArgExpr(_)))
+        || matches!(arg.as_ref(), Some(ast::Node::NamedArgExpr(_)))
     {
         return None;
     }
@@ -939,12 +922,12 @@ fn projection_candidate(func: &protobuf::FuncCall) -> Option<(&protobuf::Node, &
 /// fails in `expandRecordVariable` (see [`record_var_shape_visible`])
 /// rather than as a missing function. `None` when that doesn't apply.
 pub(crate) fn unmatched_projection_error(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Option<AnalyzeError> {
     let (arg, _) = projection_candidate(func)?;
-    let Some(node::Node::ColumnRef(cr)) = arg.node.as_ref() else {
+    let Some(ast::Node::ColumnRef(cr)) = arg.as_ref() else {
         return None;
     };
     if !column_ref_is_column(cr, ctx.scope) {
@@ -961,7 +944,7 @@ pub(crate) fn unmatched_projection_error(
 /// function lookup. When the call doesn't qualify or no such field exists,
 /// the caller goes on to function resolution.
 pub(crate) fn try_column_projection(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ColumnProjection, AnalyzeError> {
@@ -1010,11 +993,11 @@ pub(crate) enum ColumnProjection {
 }
 
 /// The leading run of consecutive `[…]` steps of an indirection list.
-pub(crate) fn subscript_run(steps: &[protobuf::Node]) -> Vec<&protobuf::AIndices> {
+pub(crate) fn subscript_run(steps: &[Option<ast::Node>]) -> Vec<&ast::AIndices> {
     steps
         .iter()
-        .map_while(|s| match s.node.as_ref() {
-            Some(node::Node::AIndices(ai)) => Some(&**ai),
+        .map_while(|s| match s.as_ref() {
+            Some(ast::Node::AIndices(ai)) => Some(&**ai),
             _ => None,
         })
         .collect()
@@ -1044,7 +1027,7 @@ const MAXDIM: usize = 6;
 ///   int4 or text, trying int4 first; an unknown one becomes text.
 pub(crate) fn transform_container_subscripts(
     container: &ExprType,
-    subscripts: &[&protobuf::AIndices],
+    subscripts: &[&ast::AIndices],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -1072,7 +1055,7 @@ pub(crate) fn transform_container_subscripts(
                 "hstore allows only one subscript".into(),
             ));
         }
-        if let Some(bound) = subscripts[0].uidx.as_deref() {
+        if let bound @ Some(_) = &subscripts[0].uidx {
             match infer_expr(bound, ctx, params, TypeGoal::assignment(oid::TEXT)) {
                 Ok(_) => {}
                 Err(AnalyzeError::TypeMismatch { .. }) => {
@@ -1085,7 +1068,7 @@ pub(crate) fn transform_container_subscripts(
         }
         return Ok(ExprType::scalar(oid::TEXT, true));
     }
-    let bound_span = |bound: &protobuf::Node| {
+    let bound_span = |bound: &Option<ast::Node>| {
         crate::error::node_location(bound).and_then(crate::error::SourceSpan::from_node_qname)
     };
 
@@ -1094,18 +1077,19 @@ pub(crate) fn transform_container_subscripts(
     }) {
         for ai in subscripts {
             if is_slice {
-                let span = ai
-                    .uidx
-                    .as_deref()
-                    .or(ai.lidx.as_deref())
-                    .and_then(bound_span);
+                let span = bound_span(if ai.uidx.is_some() {
+                    &ai.uidx
+                } else {
+                    &ai.lidx
+                });
                 return Err(
                     crate::pgmsg::jsonb_subscript_does_not_support_slices(span).finalize_implicit()
                 );
             }
-            let Some(bound) = ai.uidx.as_deref() else {
+            let bound = &ai.uidx;
+            if bound.is_none() {
                 continue;
-            };
+            }
             let t = infer_expr(bound, ctx, params, TypeGoal::NONE)?;
             if t.type_oid == oid::UNKNOWN {
                 coerce_unknown_to(bound, ctx, params, oid::TEXT)?;
@@ -1131,8 +1115,12 @@ pub(crate) fn transform_container_subscripts(
     for ai in subscripts {
         // A non-slice subscript inside a slice run means `[1:i]`: its
         // implicit lower bound is the constant 1, so only `uidx` is walked.
-        let lower = if is_slice { ai.lidx.as_deref() } else { None };
-        for bound in [lower, ai.uidx.as_deref()].into_iter().flatten() {
+        let lower = if is_slice { Some(&ai.lidx) } else { None };
+        for bound in [lower, Some(&ai.uidx)]
+            .into_iter()
+            .flatten()
+            .filter(|b| b.is_some())
+        {
             let t = match infer_expr(bound, ctx, params, TypeGoal::assignment(oid::INT4)) {
                 Ok(t) => t,
                 Err(AnalyzeError::TypeMismatch { .. }) => {

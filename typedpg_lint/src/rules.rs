@@ -5,9 +5,8 @@
 use typedpg_analyzer::{CastMethod, PgTypeOid, TypType};
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{
-    AExpr, AExprKind, BoolExpr, BoolExprType, CaseWhen, Node, RangeVar, SubLinkType,
-    node::Node as N,
+use typedpg_pg_query::ast::{
+    AExpr, AExprKind, BoolExpr, BoolExprType, CaseWhen, Node, Node as N, RangeVar, SubLinkType,
 };
 
 use crate::{Ctx, RawFinding, Rule};
@@ -73,9 +72,8 @@ fn null_comparison(ctx: &Ctx<'_>) -> Vec<RawFinding> {
 }
 
 fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
-    let kind = AExprKind::try_from(expr.kind).ok();
-    match kind {
-        Some(AExprKind::AexprOp) => {
+    match expr.kind {
+        AExprKind::AexprOp => {
             let Some(operator) = operator_name(expr) else {
                 return;
             };
@@ -84,24 +82,24 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
             }
             let left_null = expr
                 .lexpr
-                .as_deref()
+                .as_ref()
                 .is_some_and(|node| is_null_literal(ctx, node));
             let right_null = expr
                 .rexpr
-                .as_deref()
+                .as_ref()
                 .is_some_and(|node| is_null_literal(ctx, node));
             if !left_null && !right_null {
                 return;
             }
             let start = expr
                 .lexpr
-                .as_deref()
+                .as_ref()
                 .and_then(operand_start)
                 .or_else(|| location(expr.location))
                 .unwrap_or(0);
             let end = expr
                 .rexpr
-                .as_deref()
+                .as_ref()
                 .map(|right| {
                     let right_start = operand_start(right).unwrap_or(start);
                     expression_end(ctx, right_start)
@@ -115,24 +113,28 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
                 fix: Vec::new(),
             });
         }
-        Some(AExprKind::AexprIn) if operator_name(expr) == Some("<>") => {
+        AExprKind::AexprIn if operator_name(expr) == Some("<>") => {
             // `NOT IN` compares with `=` internally; a user-defined
             // non-strict `=` may accept NULL.
             if ctx.non_strict_operators.contains("=") {
                 return;
             }
-            let Some(right) = expr.rexpr.as_deref() else {
+            let Some(right) = expr.rexpr.as_ref() else {
                 return;
             };
-            let Some(N::List(list)) = &right.node else {
+            let N::List(list) = right else {
                 return;
             };
-            if !list.items.iter().any(|node| is_null_literal(ctx, node)) {
+            if !list
+                .items
+                .iter()
+                .any(|node| node.as_ref().is_some_and(|node| is_null_literal(ctx, node)))
+            {
                 return;
             }
             let start = expr
                 .lexpr
-                .as_deref()
+                .as_ref()
                 .and_then(operand_start)
                 .or_else(|| location(expr.location))
                 .unwrap_or(0);
@@ -153,7 +155,7 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
 }
 
 fn case_when(ctx: &Ctx<'_>, when: &CaseWhen, out: &mut Vec<RawFinding>) {
-    let Some(expr) = when.expr.as_deref() else {
+    let Some(expr) = when.expr.as_ref() else {
         return;
     };
     if !is_null_literal(ctx, expr) || ctx.non_strict_operators.contains("=") {
@@ -179,7 +181,7 @@ fn case_when(ctx: &Ctx<'_>, when: &CaseWhen, out: &mut Vec<RawFinding>) {
 /// The operator's name without its schema: `OPERATOR(pg_catalog.=)` is
 /// `=`.
 pub(super) fn operator_name(expr: &AExpr) -> Option<&str> {
-    expr.name.iter().rev().find_map(|node| match &node.node {
+    expr.name.iter().rev().find_map(|node| match node {
         Some(N::String(s)) => Some(s.sval.as_str()),
         _ => None,
     })
@@ -194,10 +196,10 @@ pub(super) fn operator_name(expr: &AExpr) -> Option<&str> {
 /// known to leave NULL NULL; anything whose path cannot be resolved is not
 /// treated as a NULL literal.
 pub(super) fn is_null_literal(ctx: &Ctx<'_>, node: &Node) -> bool {
-    match &node.node {
-        Some(N::AConst(value)) => value.isnull,
-        Some(N::TypeCast(cast)) => {
-            let Some(arg) = cast.arg.as_deref() else {
+    match node {
+        N::AConst(value) => value.isnull,
+        N::TypeCast(cast) => {
+            let Some(arg) = cast.arg.as_ref() else {
                 return false;
             };
             if !is_null_literal(ctx, arg) {
@@ -210,11 +212,11 @@ pub(super) fn is_null_literal(ctx: &Ctx<'_>, node: &Node) -> bool {
             else {
                 return false;
             };
-            let source = match arg.node.as_ref() {
+            let source = match arg {
                 // A bare NULL literal is `unknown`: the parser makes a NULL
                 // constant of the target type directly, with no function.
-                Some(N::AConst(_)) => None,
-                Some(N::TypeCast(inner)) => inner
+                N::AConst(_) => None,
+                N::TypeCast(inner) => inner
                     .type_name
                     .as_ref()
                     .and_then(|name| ctx.catalog.lint_resolve_type_name(name)),
@@ -278,11 +280,11 @@ fn is_builtin_type(ctx: &Ctx<'_>, oid: PgTypeOid) -> bool {
 /// The start of the token sequence of `node`, descending through casts so
 /// `NULL::int` starts at `NULL` (a `TypeCast`'s own location is its `::`).
 pub(super) fn operand_start(node: &Node) -> Option<usize> {
-    match &node.node {
-        Some(N::AConst(value)) if value.isnull => location(value.location),
-        Some(N::TypeCast(cast)) => cast
+    match node {
+        N::AConst(value) if value.isnull => location(value.location),
+        N::TypeCast(cast) => cast
             .arg
-            .as_deref()
+            .as_ref()
             .and_then(operand_start)
             .or_else(|| node_start(node)),
         _ => node_start(node),
@@ -290,7 +292,6 @@ pub(super) fn operand_start(node: &Node) -> Option<usize> {
 }
 
 pub(super) fn node_start(node: &Node) -> Option<usize> {
-    let node = node.node.as_ref()?;
     typedpg_pg_query::NodeRef::location(node.to_ref())
         .and_then(|location| usize::try_from(location).ok())
 }
@@ -405,16 +406,13 @@ fn not_in_nullable(ctx: &Ctx<'_>) -> Vec<RawFinding> {
 }
 
 fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
-    if BoolExprType::try_from(expr.boolop) != Ok(BoolExprType::NotExpr) || expr.args.len() != 1 {
+    if expr.boolop != BoolExprType::NotExpr || expr.args.len() != 1 {
         return;
     }
-    let Some(Node {
-        node: Some(N::SubLink(sub)),
-    }) = expr.args.first()
-    else {
+    let Some(Some(N::SubLink(sub))) = expr.args.first() else {
         return;
     };
-    if SubLinkType::try_from(sub.sub_link_type) != Ok(SubLinkType::AnySublink) {
+    if sub.sub_link_type != SubLinkType::AnySublink {
         return;
     }
     // A row-valued `(a, b) NOT IN (SELECT …)` compares field by field, and
@@ -423,8 +421,7 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
     // because its first fields differ. The scalar null rule does not apply.
     if sub
         .testexpr
-        .as_deref()
-        .and_then(|node| node.node.as_ref())
+        .as_ref()
         .is_some_and(|node| matches!(node, N::RowExpr(_)))
     {
         return;
@@ -432,7 +429,7 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
     let operator = sub
         .oper_name
         .iter()
-        .filter_map(|node| match &node.node {
+        .filter_map(|node| match node {
             Some(N::String(s)) => Some(s.sval.as_str()),
             _ => None,
         })
@@ -462,7 +459,7 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
     };
     let start = sub
         .testexpr
-        .as_deref()
+        .as_ref()
         .and_then(operand_start)
         .or_else(|| location(sub.location))
         .or_else(|| location(expr.location))
@@ -494,10 +491,10 @@ fn unbounded_write(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     for (node, _) in ctx.tree.nodes() {
         match node {
             NodeRef::UpdateStmt(stmt) if stmt.where_clause.is_none() => {
-                write_finding(ctx, "UPDATE", "changes", &stmt.relation, &mut out);
+                write_finding(ctx, "UPDATE", "changes", stmt.relation.as_deref(), &mut out);
             }
             NodeRef::DeleteStmt(stmt) if stmt.where_clause.is_none() => {
-                write_finding(ctx, "DELETE", "removes", &stmt.relation, &mut out);
+                write_finding(ctx, "DELETE", "removes", stmt.relation.as_deref(), &mut out);
             }
             _ => {}
         }
@@ -509,7 +506,7 @@ fn write_finding(
     ctx: &Ctx<'_>,
     keyword: &str,
     verb: &str,
-    relation: &Option<RangeVar>,
+    relation: Option<&RangeVar>,
     out: &mut Vec<RawFinding>,
 ) {
     let Some(relation) = relation else {

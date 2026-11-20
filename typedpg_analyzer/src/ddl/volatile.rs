@@ -11,18 +11,18 @@
 //! overloads that can take the call's argument count and rejects the call
 //! when none of them is IMMUTABLE.
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::ast;
 
 use super::DdlError;
 use crate::pg_catalog::{PgCatalog, ProVolatile};
 
 /// Returns the qualified name (`[schema, name]` or `[name]`) of a
 /// `FuncCall.funcname`. Identifiers are positional `String` nodes.
-fn funcname_parts(funcname: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
+fn funcname_parts(funcname: &[Option<ast::Node>]) -> Option<(Option<&str>, &str)> {
     let parts: Vec<&str> = funcname
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.as_str()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect();
@@ -38,9 +38,9 @@ fn funcname_parts(funcname: &[protobuf::Node]) -> Option<(Option<&str>, &str)> {
 /// the call's place when exactly one overload fits and is inlinable.
 /// `None` if no function of that name fits.
 fn funcall_volatility<'a>(
-    fc: &protobuf::FuncCall,
+    fc: &ast::FuncCall,
     snapshot: &'a PgCatalog,
-) -> Option<(ProVolatile, Option<&'a protobuf::Node>)> {
+) -> Option<(ProVolatile, Option<&'a ast::Node>)> {
     let (schema, name) = funcname_parts(&fc.funcname)?;
     let nargs = fc.args.len();
     let fits: Vec<&crate::pg_catalog::PgProc> = snapshot
@@ -65,7 +65,10 @@ fn funcall_volatility<'a>(
         ProVolatile::Volatile
     };
     let inline = match fits.as_slice() {
-        [only] => snapshot.inline_sql_bodies.get(&only.oid),
+        [only] => snapshot
+            .inline_sql_bodies
+            .get(&only.oid)
+            .and_then(Option::as_ref),
         _ => None,
     };
     Some((least, inline))
@@ -73,7 +76,7 @@ fn funcall_volatility<'a>(
 
 /// Every overload of the function `fc` calls that can take its arguments
 /// is VOLATILE.
-pub(crate) fn surely_volatile(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+pub(crate) fn surely_volatile(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
     funcall_volatility(fc, snapshot).is_some_and(|(v, _)| v == ProVolatile::Volatile)
 }
 
@@ -83,11 +86,11 @@ const MAX_INLINE_DEPTH: usize = 16;
 /// Walk `node` and return `Err` if any `FuncCall` resolves to a function
 /// marked `VOLATILE`. `location` selects PG's wording for that context.
 pub(crate) fn check_no_volatile(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     location: ExprLocation,
     snapshot: &PgCatalog,
 ) -> Result<(), DdlError> {
-    walk(node, location, snapshot, 0)
+    walk(node.as_ref(), location, snapshot, 0)
 }
 
 /// Analyze `expr` with the row of `relid` in scope — the way PG
@@ -96,7 +99,7 @@ pub(crate) fn check_no_volatile(
 pub(crate) fn infer_over_relation(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     used: Option<&std::cell::RefCell<Vec<crate::oid::PgProcOid>>>,
 ) -> Option<Result<crate::expr::ExprType, crate::error::AnalyzeError>> {
     use crate::expr::{TypeGoal, infer_expr};
@@ -133,7 +136,7 @@ pub(crate) fn infer_over_relation(
 pub(crate) fn strict_columns_over_relation(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
 ) -> Vec<String> {
     use crate::expr::{TypeGoal, infer_expr};
     let Some(class) = interp.pg_class.get(&relid) else {
@@ -177,7 +180,7 @@ pub(crate) fn strict_columns_over_relation(
 pub(crate) fn trusted_over_relation(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
 ) -> Option<crate::nonnull::TrustedNodes> {
     use crate::expr::{TypeGoal, infer_expr};
     let class = interp.pg_class.get(&relid)?;
@@ -214,7 +217,7 @@ pub(crate) fn trusted_over_relation(
 pub(crate) fn check_mutability(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     loc: ExprLocation,
 ) -> Result<(), DdlError> {
     let used = std::cell::RefCell::new(Vec::new());
@@ -238,7 +241,7 @@ pub(crate) fn check_mutability(
             continue;
         }
         match interp.inline_sql_bodies.get(&oid) {
-            Some(body) => walk(body, loc, interp, 1)?,
+            Some(body) => walk(body.as_ref(), loc, interp, 1)?,
             None => return Err(loc.error(&proc.proname)),
         }
     }
@@ -279,18 +282,19 @@ impl ExprLocation {
 }
 
 fn walk(
-    node: &protobuf::Node,
+    node: Option<&ast::Node>,
     loc: ExprLocation,
     snapshot: &PgCatalog,
     depth: usize,
 ) -> Result<(), DdlError> {
-    let walk =
-        |n: &protobuf::Node, loc: ExprLocation, snapshot: &PgCatalog| walk(n, loc, snapshot, depth);
-    let Some(inner) = node.node.as_ref() else {
+    let walk = |n: Option<&ast::Node>, loc: ExprLocation, snapshot: &PgCatalog| {
+        walk(n, loc, snapshot, depth)
+    };
+    let Some(inner) = node else {
         return Ok(());
     };
     match inner {
-        node::Node::FuncCall(fc) => {
+        ast::Node::FuncCall(fc) => {
             if let Some((ProVolatile::Volatile | ProVolatile::Stable, inline)) =
                 funcall_volatility(fc, snapshot)
             {
@@ -299,7 +303,7 @@ fn walk(
                 // counts is the body's volatility, not the declaration's.
                 match inline {
                     Some(body) if depth < MAX_INLINE_DEPTH => {
-                        self::walk(body, loc, snapshot, depth + 1)?;
+                        self::walk(Some(body), loc, snapshot, depth + 1)?;
                     }
                     _ => {
                         let name = funcname_parts(&fc.funcname)
@@ -310,95 +314,95 @@ fn walk(
                 }
             }
             for arg in &fc.args {
-                walk(arg, loc, snapshot)?;
+                walk(arg.as_ref(), loc, snapshot)?;
             }
-            if let Some(filter) = fc.agg_filter.as_deref() {
-                walk(filter, loc, snapshot)?;
-            }
-        }
-        node::Node::AExpr(e) => {
-            if let Some(l) = e.lexpr.as_deref() {
-                walk(l, loc, snapshot)?;
-            }
-            if let Some(r) = e.rexpr.as_deref() {
-                walk(r, loc, snapshot)?;
+            if let Some(filter) = fc.agg_filter.as_ref() {
+                walk(Some(filter), loc, snapshot)?;
             }
         }
-        node::Node::BoolExpr(b) => {
+        ast::Node::AExpr(e) => {
+            if let Some(l) = e.lexpr.as_ref() {
+                walk(Some(l), loc, snapshot)?;
+            }
+            if let Some(r) = e.rexpr.as_ref() {
+                walk(Some(r), loc, snapshot)?;
+            }
+        }
+        ast::Node::BoolExpr(b) => {
             for arg in &b.args {
-                walk(arg, loc, snapshot)?;
+                walk(arg.as_ref(), loc, snapshot)?;
             }
         }
-        node::Node::TypeCast(tc) => {
-            if let Some(arg) = tc.arg.as_deref() {
-                walk(arg, loc, snapshot)?;
+        ast::Node::TypeCast(tc) => {
+            if let Some(arg) = tc.arg.as_ref() {
+                walk(Some(arg), loc, snapshot)?;
             }
         }
-        node::Node::NamedArgExpr(na) => {
-            if let Some(arg) = na.arg.as_deref() {
-                walk(arg, loc, snapshot)?;
+        ast::Node::NamedArgExpr(na) => {
+            if let Some(arg) = na.arg.as_ref() {
+                walk(Some(arg), loc, snapshot)?;
             }
         }
-        node::Node::CollateClause(cc) => {
-            if let Some(arg) = cc.arg.as_deref() {
-                walk(arg, loc, snapshot)?;
+        ast::Node::CollateClause(cc) => {
+            if let Some(arg) = cc.arg.as_ref() {
+                walk(Some(arg), loc, snapshot)?;
             }
         }
-        node::Node::CoalesceExpr(c) => {
+        ast::Node::CoalesceExpr(c) => {
             for a in &c.args {
-                walk(a, loc, snapshot)?;
+                walk(a.as_ref(), loc, snapshot)?;
             }
         }
-        node::Node::MinMaxExpr(m) => {
+        ast::Node::MinMaxExpr(m) => {
             for a in &m.args {
-                walk(a, loc, snapshot)?;
+                walk(a.as_ref(), loc, snapshot)?;
             }
         }
-        node::Node::NullIfExpr(n) => {
+        ast::Node::NullIfExpr(n) => {
             for a in &n.args {
-                walk(a, loc, snapshot)?;
+                walk(a.as_ref(), loc, snapshot)?;
             }
         }
-        node::Node::CaseExpr(c) => {
-            if let Some(arg) = c.arg.as_deref() {
-                walk(arg, loc, snapshot)?;
+        ast::Node::CaseExpr(c) => {
+            if let Some(arg) = c.arg.as_ref() {
+                walk(Some(arg), loc, snapshot)?;
             }
             for w in &c.args {
-                walk(w, loc, snapshot)?;
+                walk(w.as_ref(), loc, snapshot)?;
             }
-            if let Some(d) = c.defresult.as_deref() {
-                walk(d, loc, snapshot)?;
-            }
-        }
-        node::Node::CaseWhen(cw) => {
-            if let Some(e) = cw.expr.as_deref() {
-                walk(e, loc, snapshot)?;
-            }
-            if let Some(r) = cw.result.as_deref() {
-                walk(r, loc, snapshot)?;
+            if let Some(d) = c.defresult.as_ref() {
+                walk(Some(d), loc, snapshot)?;
             }
         }
-        node::Node::List(l) => {
+        ast::Node::CaseWhen(cw) => {
+            if let Some(e) = cw.expr.as_ref() {
+                walk(Some(e), loc, snapshot)?;
+            }
+            if let Some(r) = cw.result.as_ref() {
+                walk(Some(r), loc, snapshot)?;
+            }
+        }
+        ast::Node::List(l) => {
             for item in &l.items {
-                walk(item, loc, snapshot)?;
+                walk(item.as_ref(), loc, snapshot)?;
             }
         }
-        node::Node::SubLink(sl) => {
-            if let Some(testexpr) = sl.testexpr.as_deref() {
-                walk(testexpr, loc, snapshot)?;
+        ast::Node::SubLink(sl) => {
+            if let Some(testexpr) = sl.testexpr.as_ref() {
+                walk(Some(testexpr), loc, snapshot)?;
             }
             // We don't descend into subselects — PG's IMMUTABLE check
             // disallows them entirely in CHECK / GENERATED / index, but
             // we leave that as a separate gap.
         }
-        node::Node::AArrayExpr(arr) => {
+        ast::Node::AArrayExpr(arr) => {
             for e in &arr.elements {
-                walk(e, loc, snapshot)?;
+                walk(e.as_ref(), loc, snapshot)?;
             }
         }
-        node::Node::RowExpr(r) => {
+        ast::Node::RowExpr(r) => {
             for a in &r.args {
-                walk(a, loc, snapshot)?;
+                walk(a.as_ref(), loc, snapshot)?;
             }
         }
         // Leaf-like nodes carry no sub-expression — nothing to walk.

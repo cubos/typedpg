@@ -3,9 +3,9 @@
 //! SECURITY LABEL, ALTER DEFAULT PRIVILEGES — but that PG runs against
 //! named objects which must exist and suit the command.
 
-use typedpg_pg_query::protobuf::{
-    ClusterStmt, DropBehavior, LockStmt, ReindexObjectType, ReindexStmt, SecLabelStmt,
-    TruncateStmt, VacuumStmt, node,
+use typedpg_pg_query::ast::{
+    self, ClusterStmt, DropBehavior, LockStmt, ReindexObjectType, ReindexStmt, SecLabelStmt,
+    TruncateStmt, VacuumStmt,
 };
 
 use super::DdlError;
@@ -30,7 +30,7 @@ fn relname(interp: &PgCatalog, relid: PgClassOid) -> String {
 pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlError> {
     let mut targets: Vec<PgClassOid> = Vec::new();
     for rel in &stmt.relations {
-        let Some(node::Node::RangeVar(rv)) = rel.node.as_ref() else {
+        let Some(ast::Node::RangeVar(rv)) = rel.as_ref() else {
             continue;
         };
         let (_, relid) = super::util::lookup_relation(interp, rv)?;
@@ -68,7 +68,7 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
             }
         }
     }
-    if stmt.behavior == DropBehavior::DropCascade as i32 {
+    if stmt.behavior == DropBehavior::DropCascade {
         // ExecuteTruncate: CASCADE truncates the referencing tables too.
         let mut i = 0;
         while i < targets.len() {
@@ -147,7 +147,7 @@ fn new_relfilenodes(interp: &mut PgCatalog, tables: &[PgClassOid]) {
 /// views (the message names only the first and last).
 fn maintained_table(
     interp: &PgCatalog,
-    rv: &typedpg_pg_query::protobuf::RangeVar,
+    rv: &typedpg_pg_query::ast::RangeVar,
 ) -> Result<PgClassOid, DdlError> {
     let (_, relid) = super::util::lookup_relation(interp, rv)?;
     if !matches!(
@@ -237,8 +237,8 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
     // The tablespace the indexes move to (any name is taken to exist, see
     // check_tablespace_placement).
     let tablespace = super::txblock::reindex_tablespace(&stmt.params);
-    match ReindexObjectType::try_from(stmt.kind) {
-        Ok(ReindexObjectType::ReindexObjectIndex) => {
+    match stmt.kind {
+        ReindexObjectType::ReindexObjectIndex => {
             let Some(rv) = stmt.relation.as_ref() else {
                 return Ok(());
             };
@@ -263,7 +263,7 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
             }
             super::indexes::new_relfilenode(interp, relid);
         }
-        Ok(ReindexObjectType::ReindexObjectTable) => {
+        ReindexObjectType::ReindexObjectTable => {
             if let Some(rv) = stmt.relation.as_ref() {
                 let relid = maintained_table(interp, rv)?;
                 if relkind(interp, relid) == Some(RelKind::Partitioned) {
@@ -283,7 +283,7 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
             }
         }
         // get_namespace_oid: the name as written — `pg_temp` is no schema's.
-        Ok(ReindexObjectType::ReindexObjectSchema)
+        ReindexObjectType::ReindexObjectSchema
             if stmt.name == "pg_temp" || interp.namespace_oid(&stmt.name).is_none() =>
         {
             return Err(DdlError::TableNotFound(format!(
@@ -291,7 +291,7 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
                 stmt.name
             )));
         }
-        Ok(ReindexObjectType::ReindexObjectSystem) if concurrently => {
+        ReindexObjectType::ReindexObjectSystem if concurrently => {
             return Err(DdlError::UnsupportedDdl(
                 "cannot reindex system catalogs concurrently".into(),
             ));
@@ -301,10 +301,10 @@ pub fn reindex(interp: &mut PgCatalog, stmt: &ReindexStmt) -> Result<(), DdlErro
         // REINDEX SYSTEM moves nothing. (REINDEX DATABASE / SYSTEM name the
         // database the session is connected to, which the analyzer can't
         // know: any name is taken as it.)
-        Ok(
-            kind @ (ReindexObjectType::ReindexObjectSchema
-            | ReindexObjectType::ReindexObjectDatabase),
-        ) if tablespace.is_some() => {
+        kind @ (ReindexObjectType::ReindexObjectSchema
+        | ReindexObjectType::ReindexObjectDatabase)
+            if tablespace.is_some() =>
+        {
             let schema = (kind == ReindexObjectType::ReindexObjectSchema)
                 .then(|| interp.namespace_oid(&stmt.name))
                 .flatten();
@@ -394,7 +394,7 @@ pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError>
             .collect();
     }
     for rel in &stmt.rels {
-        let Some(node::Node::VacuumRelation(vr)) = rel.node.as_ref() else {
+        let Some(ast::Node::VacuumRelation(vr)) = rel.as_ref() else {
             continue;
         };
         let Some(rv) = vr.relation.as_ref() else {
@@ -439,17 +439,17 @@ fn vacuum_options(stmt: &VacuumStmt) -> Result<bool, DdlError> {
     let mut nworkers: i64 = -1;
     let mut buffer_usage_limit = false;
     // A value as defGetString renders it.
-    let string = |de: &typedpg_pg_query::protobuf::DefElem| -> Option<String> {
-        match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            node::Node::Integer(i) => Some(i.ival.to_string()),
-            node::Node::Float(f) => Some(f.fval.clone()),
-            node::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
+    let string = |de: &typedpg_pg_query::ast::DefElem| -> Option<String> {
+        match de.arg.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.clone()),
+            ast::Node::Integer(i) => Some(i.ival.to_string()),
+            ast::Node::Float(f) => Some(f.fval.clone()),
+            ast::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
             _ => None,
         }
     };
     for opt in &stmt.options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         match de.defname.as_str() {
@@ -526,9 +526,9 @@ fn vacuum_options(stmt: &VacuumStmt) -> Result<bool, DdlError> {
         ));
     }
     if !analyze
-        && stmt.rels.iter().any(|r| {
-            matches!(r.node.as_ref(), Some(node::Node::VacuumRelation(vr)) if !vr.va_cols.is_empty())
-        })
+        && stmt.rels.iter().any(
+            |r| matches!(r.as_ref(), Some(ast::Node::VacuumRelation(vr)) if !vr.va_cols.is_empty()),
+        )
     {
         return Err(DdlError::Parse(
             "ANALYZE option must be specified when a column list is provided".into(),
@@ -570,7 +570,7 @@ fn vacuum_options(stmt: &VacuumStmt) -> Result<bool, DdlError> {
 }
 
 /// get_vacoptval_from_boolean: defGetBoolean's values.
-fn vacopt_from_boolean(de: &typedpg_pg_query::protobuf::DefElem) -> Result<bool, DdlError> {
+fn vacopt_from_boolean(de: &typedpg_pg_query::ast::DefElem) -> Result<bool, DdlError> {
     super::session::def_get_boolean(de)
 }
 
@@ -594,7 +594,7 @@ fn buffer_usage_limit_kb(value: &str) -> Option<i64> {
 /// views and foreign tables.
 pub fn lock(interp: &PgCatalog, stmt: &LockStmt) -> Result<(), DdlError> {
     for rel in &stmt.relations {
-        let Some(node::Node::RangeVar(rv)) = rel.node.as_ref() else {
+        let Some(ast::Node::RangeVar(rv)) = rel.as_ref() else {
             continue;
         };
         let (_, relid) = super::util::lookup_relation(interp, rv)?;
@@ -631,10 +631,7 @@ pub fn security_label(stmt: &SecLabelStmt) -> Result<(), DdlError> {
 /// options must be known, the relation must suit the direction and the
 /// column list name its columns once; COPY (query) TO analyzes the query.
 /// The data itself (files, STDIN) isn't modeled.
-pub fn copy(
-    interp: &PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::CopyStmt,
-) -> Result<(), DdlError> {
+pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Result<(), DdlError> {
     const OPTIONS: &[&str] = &[
         "format",
         "freeze",
@@ -654,7 +651,7 @@ pub fn copy(
         "log_verbosity",
     ];
     for opt in &stmt.options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         if !OPTIONS.contains(&de.defname.as_str()) {
@@ -664,7 +661,7 @@ pub fn copy(
             )));
         }
         if de.defname == "format"
-            && let Some(node::Node::String(s)) = de.arg.as_deref().and_then(|a| a.node.as_ref())
+            && let Some(ast::Node::String(s)) = de.arg.as_ref()
             && !matches!(
                 s.sval.to_ascii_lowercase().as_str(),
                 "text" | "csv" | "binary"
@@ -677,7 +674,7 @@ pub fn copy(
         }
     }
     // `COPY (query) TO` runs the query.
-    if let Some(query) = stmt.query.as_deref().and_then(|q| q.node.as_ref()) {
+    if let Some(query) = stmt.query.as_ref() {
         return super::dml::check_executed(interp, query);
     }
     let Some(rv) = stmt.relation.as_ref() else {

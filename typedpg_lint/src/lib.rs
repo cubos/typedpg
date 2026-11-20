@@ -37,7 +37,7 @@ use std::path::Path;
 
 use typedpg_analyzer::{LocatedError, PgCatalog};
 use typedpg_core::config::LintConfig;
-use typedpg_pg_query::protobuf::Token;
+use typedpg_pg_query::ast::Token;
 
 /// How severe a finding is, ordered from least to most severe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -467,7 +467,7 @@ pub(crate) struct Tok {
 pub(crate) struct Ctx<'a> {
     /// The analyzed text (the [`typedpg_analyzer::QueryView`]'s SQL).
     pub sql: &'a str,
-    pub tree: &'a typedpg_pg_query::protobuf::ParseResult,
+    pub tree: &'a typedpg_pg_query::ast::ParseResult,
     /// The non-comment tokens of `sql`, in order.
     pub tokens: &'a [Tok],
     /// The names of operators with a non-strict implementation: comparing
@@ -521,7 +521,7 @@ pub fn lint_query_called(
             scanned
                 .tokens
                 .iter()
-                .filter(|token| !matches!(token.token(), Token::SqlComment | Token::CComment))
+                .filter(|token| !matches!(token.token, Token::SqlComment | Token::CComment))
                 .filter_map(|token| {
                     Some(Tok {
                         start: usize::try_from(token.start).ok()?,
@@ -772,7 +772,7 @@ fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
         return (suppressed, errors);
     };
     for token in &scanned.tokens {
-        if !matches!(token.token(), Token::SqlComment | Token::CComment) {
+        if !matches!(token.token, Token::SqlComment | Token::CComment) {
             continue;
         }
         let (Ok(start), Ok(end)) = (usize::try_from(token.start), usize::try_from(token.end))

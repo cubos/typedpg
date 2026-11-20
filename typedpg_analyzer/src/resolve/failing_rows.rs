@@ -39,10 +39,12 @@
 
 use super::*;
 use crate::range_input::{RangeShape, range_shape};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 /// Fail when every execution of `sel` evaluates a NULL its domain rejects.
 pub(super) fn check_null_domain_casts(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     check_rows(sel, snapshot, &[])
@@ -54,8 +56,8 @@ pub(super) fn check_null_domain_casts(
 /// drop the query, or the columns it reads — a view's rewrite could reach
 /// some); `ctes` are the INSERT's WITH list.
 pub(super) fn check_insert_select(
-    sel: &protobuf::SelectStmt,
-    ctes: &[protobuf::Node],
+    sel: &ast::SelectStmt,
+    ctes: &[Option<ast::Node>],
     target: crate::oid::PgClassOid,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
@@ -72,9 +74,9 @@ pub(super) fn check_insert_select(
 }
 
 fn check_rows(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
-    ctes: &[&protobuf::CommonTableExpr],
+    ctes: &[&ast::CommonTableExpr],
 ) -> Result<(), AnalyzeError> {
     if !executes() {
         return Ok(());
@@ -294,7 +296,7 @@ impl Rows {
 #[derive(Clone)]
 struct Leaf {
     /// Its select list's expressions.
-    exprs: Vec<protobuf::Node>,
+    exprs: Vec<Option<ast::Node>>,
     /// What evaluating each of them raises.
     errors: Vec<Option<Failure>>,
 }
@@ -331,12 +333,12 @@ enum LeafOutcome {
     Unknown,
 }
 
-fn cte_list(nodes: &[protobuf::Node]) -> Vec<&protobuf::CommonTableExpr> {
+fn cte_list(nodes: &[Option<ast::Node>]) -> Vec<&ast::CommonTableExpr> {
     nodes
         .iter()
         .rev()
-        .filter_map(|c| match c.node.as_ref() {
-            Some(node::Node::CommonTableExpr(cte)) => Some(cte.as_ref()),
+        .filter_map(|c| match c.as_ref() {
+            Some(ast::Node::CommonTableExpr(cte)) => Some(cte.as_ref()),
             _ => None,
         })
         .collect()
@@ -346,16 +348,16 @@ fn cte_list(nodes: &[protobuf::Node]) -> Vec<&protobuf::CommonTableExpr> {
 /// `ctes` are the CTEs visible to `sel`'s FROM items, innermost first;
 /// `stored` is set inside a view's query.
 fn query_rows(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
-    ctes: &[&protobuf::CommonTableExpr],
+    ctes: &[&ast::CommonTableExpr],
     depth: usize,
     stored: bool,
 ) -> Option<Rows> {
     if depth > MAX_DEPTH {
         return None;
     }
-    let rows = if sel.op != protobuf::SetOperation::SetopNone as i32 {
+    let rows = if sel.op != ast::SetOperation::SetopNone {
         set_op_rows(sel, snapshot, ctes, depth, stored)?
     } else {
         select_rows(sel, snapshot, ctes, depth, stored)?
@@ -365,23 +367,23 @@ fn query_rows(
 
 /// A LIMIT / OFFSET bound: `None` for an absent, NULL or ALL one, the
 /// integer of a literal one; `Err` for anything else.
-fn bound(n: Option<&protobuf::Node>) -> Result<Option<i64>, ()> {
+fn bound(n: Option<&ast::Node>) -> Result<Option<i64>, ()> {
     let Some(n) = n else { return Ok(None) };
-    match n.node.as_ref() {
-        Some(node::Node::AConst(c)) if c.isnull => Ok(None),
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(protobuf::a_const::Val::Ival(i)),
-            ..
-        })) if i.ival >= 0 => Ok(Some(i64::from(i.ival))),
+    match n {
+        ast::Node::AConst(c) if c.isnull => Ok(None),
+        ast::Node::AConst(c) => match &c.val {
+            Some(ast::AConstValue::Integer(i)) if i.ival >= 0 => Ok(Some(i64::from(i.ival))),
+            _ => Err(()),
+        },
         _ => Err(()),
     }
 }
 
 /// `rows` through `sel`'s LIMIT and OFFSET (ExecLimit fetches — evaluates
 /// — the rows it skips, and stops after the ones it returns).
-fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
-    let count = bound(sel.limit_count.as_deref()).ok()?;
-    let offset = bound(sel.limit_offset.as_deref()).ok()?.unwrap_or(0);
+fn limit_rows(sel: &ast::SelectStmt, rows: Rows) -> Option<Rows> {
+    let count = bound(sel.limit_count.as_ref()).ok()?;
+    let offset = bound(sel.limit_offset.as_ref()).ok()?.unwrap_or(0);
     if count == Some(0) {
         return None;
     }
@@ -412,7 +414,7 @@ fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
         sorted: rows.first.any(),
         unpushable: vec![true; rows.all.columns.len()],
         whole_row_unpushable: true,
-        keeps_columns: rows.keeps_columns || sel.op != protobuf::SetOperation::SetopNone as i32,
+        keeps_columns: rows.keeps_columns || sel.op != ast::SetOperation::SetopNone,
         ..rows
     };
     // Sorting, the planner may postpone an expensive column past the
@@ -473,13 +475,13 @@ fn limit_rows(sel: &protobuf::SelectStmt, rows: Rows) -> Option<Rows> {
 
 /// The rows of a SELECT that isn't a set operation, before its LIMIT.
 fn select_rows(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
-    ctes: &[&protobuf::CommonTableExpr],
+    ctes: &[&ast::CommonTableExpr],
     depth: usize,
     stored: bool,
 ) -> Option<Rows> {
-    let mut visible: Vec<&protobuf::CommonTableExpr> = Vec::new();
+    let mut visible: Vec<&ast::CommonTableExpr> = Vec::new();
     if let Some(with) = sel.with_clause.as_ref() {
         if with.recursive {
             return None;
@@ -501,11 +503,11 @@ fn select_rows(
         qual: false,
     };
     if !sel.values_lists.is_empty() {
-        let rows: Vec<&[protobuf::Node]> = sel
+        let rows: Vec<&[Option<ast::Node>]> = sel
             .values_lists
             .iter()
-            .filter_map(|row| match row.node.as_ref() {
-                Some(node::Node::List(l)) => Some(l.items.as_slice()),
+            .filter_map(|row| match row.as_ref() {
+                Some(ast::Node::List(l)) => Some(l.items.as_slice()),
                 _ => None,
             })
             .collect();
@@ -552,20 +554,21 @@ fn select_rows(
     let mut grouping_sets = 1usize;
     let grouped_row = sel.group_clause.is_empty()
         || sel.from_clause.is_empty()
-            && sel.group_clause.iter().all(|g| match g.node.as_ref() {
-                Some(node::Node::ColumnRef(_))
-                | Some(node::Node::AConst(protobuf::AConst {
-                    val: Some(protobuf::a_const::Val::Ival(_)),
-                    ..
-                })) => true,
-                Some(node::Node::GroupingSet(gs)) => match gs.kind() {
-                    protobuf::GroupingSetKind::GroupingSetEmpty => true,
-                    protobuf::GroupingSetKind::GroupingSetSets
+            && sel.group_clause.iter().all(|g| match g.as_ref() {
+                Some(ast::Node::ColumnRef(_)) => true,
+                Some(ast::Node::AConst(c))
+                    if matches!(c.val, Some(ast::AConstValue::Integer(_))) =>
+                {
+                    true
+                }
+                Some(ast::Node::GroupingSet(gs)) => match gs.kind {
+                    ast::GroupingSetKind::GroupingSetEmpty => true,
+                    ast::GroupingSetKind::GroupingSetSets
                         if gs.content.iter().all(|s| {
                             matches!(
-                                s.node.as_ref(),
-                                Some(node::Node::GroupingSet(e))
-                                    if e.kind() == protobuf::GroupingSetKind::GroupingSetEmpty
+                                s.as_ref(),
+                                Some(ast::Node::GroupingSet(e))
+                                    if e.kind == ast::GroupingSetKind::GroupingSetEmpty
                             )
                         }) && !gs.content.is_empty() =>
                     {
@@ -603,10 +606,8 @@ fn select_rows(
     // evaluates it. One that is pushed down into no arm runs over the
     // projected rows, all of them (the set operation runs whole below
     // it), whatever it lets through.
-    let where_fails = sel
-        .where_clause
-        .as_deref()
-        .filter(|w| level.truth(w) != Some(true));
+    let where_fails =
+        Some(&sel.where_clause).filter(|w| w.is_some() && level.truth(w) != Some(true));
     let unpushed = where_fails
         .filter(|w| level.unpushed(w))
         .map(|_| projection.clone());
@@ -657,11 +658,12 @@ fn select_rows(
         .filter(|_| where_fails.is_none_or(|w| level.unpushed(w)))
         .or(pushed.fail_after)
         .filter(|_| super::walk::level_srf_calls(sel, snapshot).is_empty());
-    let equated = equated_exprs(sel.where_clause.as_deref(), snapshot);
+    let equated = equated_exprs(&sel.where_clause, snapshot);
     let mut sorted_by = false;
-    let ordered = sel.sort_clause.iter().find_map(|k| match k.node.as_ref() {
-        Some(node::Node::SortBy(sb)) => {
-            let key = sb.node.as_deref()?;
+    let ordered = sel.sort_clause.iter().find_map(|k| match k.as_ref() {
+        Some(ast::Node::SortBy(sb)) => {
+            sb.node.as_ref()?;
+            let key = &sb.node;
             if order_key_redundant(sel, level, key, &equated) {
                 return None;
             }
@@ -705,14 +707,15 @@ fn select_rows(
 
 /// The names of the columns `sel`'s select list yields over `level`'s
 /// source (`*` expanded), as FigureColname gives them.
-fn level_names(sel: &protobuf::SelectStmt, level: Level<'_>) -> Option<Vec<String>> {
+fn level_names(sel: &ast::SelectStmt, level: Level<'_>) -> Option<Vec<String>> {
     let mut names = Vec::new();
     for target in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             return None;
         };
-        let val = rt.val.as_deref()?;
-        if let (Some(source), Some(node::Node::ColumnRef(cr))) = (level.source, val.node.as_ref())
+        rt.val.as_ref()?;
+        let val = &rt.val;
+        if let (Some(source), Some(ast::Node::ColumnRef(cr))) = (level.source, val.as_ref())
             && let Read::All = source.read(cr)
         {
             names.extend(source.names.iter().cloned());
@@ -731,31 +734,31 @@ fn level_names(sel: &protobuf::SelectStmt, level: Level<'_>) -> Option<Vec<Strin
 /// source surely raises: an output column's error (by position or by
 /// alias), else the expression's.
 fn order_key_error(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     level: Level<'_>,
     all: &Errors,
-    key: &protobuf::Node,
+    key: &Option<ast::Node>,
 ) -> Option<Failure> {
-    match key.node.as_ref()? {
-        node::Node::AConst(protobuf::AConst {
-            val: Some(protobuf::a_const::Val::Ival(i)),
-            ..
-        }) => return all.column(usize::try_from(i.ival).ok()?.checked_sub(1)?),
-        node::Node::ColumnRef(cr) => {
+    match key.as_ref()? {
+        ast::Node::AConst(c) => {
+            if let Some(ast::AConstValue::Integer(i)) = &c.val {
+                return all.column(usize::try_from(i.ival).ok()?.checked_sub(1)?);
+            }
+        }
+        ast::Node::ColumnRef(cr) => {
             if let [f] = cr.fields.as_slice()
-                && let Some(node::Node::String(name)) = f.node.as_ref()
+                && let Some(ast::Node::String(name)) = f.as_ref()
             {
                 // An output column's alias wins over the FROM item's
                 // columns (findTargetlistEntrySQL92).
                 let mut column = 0;
                 for target in &sel.target_list {
-                    let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+                    let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
                         return None;
                     };
-                    if let (Some(source), Some(node::Node::ColumnRef(cr))) = (
-                        level.source,
-                        rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                    ) && let Read::All = source.read(cr)
+                    if let (Some(source), Some(ast::Node::ColumnRef(cr))) =
+                        (level.source, rt.val.as_ref())
+                        && let Read::All = source.read(cr)
                     {
                         column += source.names.len();
                         continue;
@@ -773,9 +776,9 @@ fn order_key_error(
 }
 
 /// The conjuncts of the qualification `n`: its ANDed terms, flattened.
-fn conjuncts(n: &protobuf::Node) -> Vec<&protobuf::Node> {
-    match n.node.as_ref() {
-        Some(node::Node::BoolExpr(b)) if b.boolop == protobuf::BoolExprType::AndExpr as i32 => {
+fn conjuncts(n: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
+    match n.as_ref() {
+        Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
             b.args.iter().flat_map(conjuncts).collect()
         }
         _ => vec![n],
@@ -786,23 +789,20 @@ fn conjuncts(n: &protobuf::Node) -> Vec<&protobuf::Node> {
 /// equivalence class: an operator not named as an ordering one is (a
 /// user's could be a btree equality), and so is a single-item IN, which
 /// the parser makes one `=` (a NOT of `<>` is negated into one, too).
-fn may_equate(e: &protobuf::AExpr) -> bool {
+fn may_equate(e: &ast::AExpr) -> bool {
     let ordering = matches!(
         expr::extract_string_fields(&e.name)
             .last()
             .map(String::as_str),
         Some("<" | ">" | "<=" | ">=")
     );
-    matches!(
-        e.kind(),
-        protobuf::AExprKind::AexprOp | protobuf::AExprKind::AexprIn
-    ) && !ordering
+    matches!(e.kind, ast::AExprKind::AexprOp | ast::AExprKind::AexprIn) && !ordering
 }
 
 /// The column a column reference names (its last field).
-fn column_name(cr: &protobuf::ColumnRef) -> Option<&str> {
-    match cr.fields.last()?.node.as_ref()? {
-        node::Node::String(s) => Some(s.sval.as_str()),
+fn column_name(cr: &ast::ColumnRef) -> Option<&str> {
+    match cr.fields.last()?.as_ref()? {
+        ast::Node::String(s) => Some(s.sval.as_str()),
         _ => None,
     }
 }
@@ -810,9 +810,9 @@ fn column_name(cr: &protobuf::ColumnRef) -> Option<&str> {
 /// The key two expressions an equivalence class could hold have alike:
 /// their structure without locations, qualifiers or type-name spellings
 /// (erring towards matching).
-fn equivalence_key(n: &protobuf::Node, snapshot: &PgCatalog) -> String {
+fn equivalence_key(n: &Option<ast::Node>, snapshot: &PgCatalog) -> String {
     super::node_fingerprint(&super::predtest_unqualify(
-        &crate::grouping::resolve_type_names(n, snapshot),
+        crate::grouping::resolve_type_names(n, snapshot).as_ref(),
     ))
 }
 
@@ -823,38 +823,45 @@ fn equivalence_key(n: &protobuf::Node, snapshot: &PgCatalog) -> String {
 /// dropped, and with it the key's evaluation over every row. Only the
 /// compared expressions are members (`a + 0 = 1` doesn't make `a` one).
 fn equated_exprs(
-    qual: Option<&protobuf::Node>,
+    qual: &Option<ast::Node>,
     snapshot: &PgCatalog,
 ) -> std::collections::HashSet<String> {
     let mut equated = std::collections::HashSet::new();
-    for c in qual.map(conjuncts).unwrap_or_default() {
+    for c in if qual.is_some() {
+        conjuncts(qual)
+    } else {
+        Vec::new()
+    } {
         let mut c = c;
         // A NOT of `<>` is negated into `=`.
-        while let Some(node::Node::BoolExpr(b)) = c.node.as_ref()
-            && b.boolop == protobuf::BoolExprType::NotExpr as i32
+        while let Some(ast::Node::BoolExpr(b)) = c.as_ref()
+            && b.boolop == ast::BoolExprType::NotExpr
             && let [arg] = b.args.as_slice()
         {
             c = arg;
         }
         // The expressions an equality compares.
-        fn compared(e: &protobuf::AExpr) -> Vec<&protobuf::Node> {
-            let mut members: Vec<&protobuf::Node> = e.lexpr.iter().map(|l| &**l).collect();
-            match e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
-                Some(node::Node::List(l)) => members.extend(l.items.iter()),
-                Some(_) => members.extend(e.rexpr.as_deref()),
+        fn compared(e: &ast::AExpr) -> Vec<&Option<ast::Node>> {
+            let mut members: Vec<&Option<ast::Node>> = Vec::new();
+            if e.lexpr.is_some() {
+                members.push(&e.lexpr);
+            }
+            match e.rexpr.as_ref() {
+                Some(ast::Node::List(l)) => members.extend(l.items.iter()),
+                Some(_) => members.push(&e.rexpr),
                 None => {}
             }
             members
         }
-        let mut members = match c.node.as_ref() {
-            Some(node::Node::AExpr(e)) if may_equate(e) => compared(e),
-            Some(node::Node::AExpr(_)) => continue,
+        let mut members = match c.as_ref() {
+            Some(ast::Node::AExpr(e)) if may_equate(e) => compared(e),
+            Some(ast::Node::AExpr(_)) => continue,
             // Simplified, another conjunct may become one (`a = 1 OR a =
             // 1` loses its duplicate arm): any equality in it counts.
             _ => {
                 let mut members = Vec::new();
                 super::walk::visit_same_level(c, &mut |x| {
-                    if let Some(node::Node::AExpr(e)) = x.node.as_ref()
+                    if let Some(ast::Node::AExpr(e)) = x.as_ref()
                         && may_equate(e)
                     {
                         members.extend(compared(e));
@@ -865,10 +872,10 @@ fn equated_exprs(
         };
         // A row comparison `(a, b) = (1, 2)` is one equality per column
         // (make_row_comparison_op).
-        let fields: Vec<&protobuf::Node> = members
+        let fields: Vec<&Option<ast::Node>> = members
             .iter()
-            .filter_map(|m| match m.node.as_ref() {
-                Some(node::Node::RowExpr(r)) => Some(r.args.iter()),
+            .filter_map(|m| match m.as_ref() {
+                Some(ast::Node::RowExpr(r)) => Some(r.args.iter()),
                 _ => None,
             })
             .flatten()
@@ -884,28 +891,20 @@ fn equated_exprs(
 /// an AND's, and those every arm of an OR has (find_duplicate_ors drops a
 /// duplicate arm, and pulls out what all of them AND); under a NOT or a
 /// cast, any (a NOT of `<>` is negated into `=`).
-fn promoted_equalities<'a>(
-    c: &'a protobuf::Node,
-    snapshot: &PgCatalog,
-) -> Vec<&'a protobuf::AExpr> {
-    use protobuf::BoolExprType as B;
-    match c.node.as_ref() {
-        Some(node::Node::AExpr(e)) if may_equate(e) => vec![e],
-        Some(node::Node::BoolExpr(b)) if b.boolop == B::AndExpr as i32 => b
+fn promoted_equalities<'a>(c: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Vec<&'a ast::AExpr> {
+    use ast::BoolExprType as B;
+    match c.as_ref() {
+        Some(ast::Node::AExpr(e)) if may_equate(e) => vec![&**e],
+        Some(ast::Node::BoolExpr(b)) if b.boolop == B::AndExpr => b
             .args
             .iter()
             .flat_map(|a| promoted_equalities(a, snapshot))
             .collect(),
-        Some(node::Node::BoolExpr(b)) if b.boolop == B::OrExpr as i32 => {
-            let key = |e: &protobuf::AExpr| {
-                equivalence_key(
-                    &protobuf::Node {
-                        node: Some(node::Node::AExpr(Box::new(e.clone()))),
-                    },
-                    snapshot,
-                )
+        Some(ast::Node::BoolExpr(b)) if b.boolop == B::OrExpr => {
+            let key = |e: &ast::AExpr| {
+                equivalence_key(&Some(ast::Node::AExpr(NodeBox::new(e.clone()))), snapshot)
             };
-            let arms: Vec<Vec<&protobuf::AExpr>> = b
+            let arms: Vec<Vec<&ast::AExpr>> = b
                 .args
                 .iter()
                 .map(|a| promoted_equalities(a, snapshot))
@@ -926,11 +925,11 @@ fn promoted_equalities<'a>(
                 })
                 .collect()
         }
-        Some(node::Node::AExpr(_)) => Vec::new(),
+        Some(ast::Node::AExpr(_)) => Vec::new(),
         Some(_) => {
             let mut all = Vec::new();
             super::walk::visit_same_level(c, &mut |x| {
-                if let Some(node::Node::AExpr(e)) = x.node.as_ref()
+                if let Some(ast::Node::AExpr(e)) = x.as_ref()
                     && may_equate(e)
                 {
                     all.push(e.as_ref());
@@ -947,35 +946,37 @@ fn promoted_equalities<'a>(
 /// the key names, by position or alias) in `equated` (see
 /// [`equated_exprs`]).
 fn order_key_redundant(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     level: Level<'_>,
-    key: &protobuf::Node,
+    key: &Option<ast::Node>,
     equated: &std::collections::HashSet<String>,
 ) -> bool {
-    let redundant = |n: &protobuf::Node| {
+    let redundant = |n: &Option<ast::Node>| {
         let mut reads = false;
         super::walk::visit_same_level(n, &mut |x| {
-            reads |= matches!(x.node, Some(node::Node::ColumnRef(_)));
+            reads |= matches!(x, Some(ast::Node::ColumnRef(_)));
         });
         !reads || equated.contains(&equivalence_key(n, level.snapshot))
     };
-    let column = |name: &str| protobuf::Node {
-        node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-            fields: vec![protobuf::Node {
-                node: Some(node::Node::String(protobuf::String { sval: name.into() })),
-            }],
+    let column = |name: &str| {
+        Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+            fields: vec![Some(ast::Node::String(NodeBox::new(ast::String {
+                sval: name.into(),
+            })))],
             location: -1,
-        })),
+        })))
     };
-    let position = match key.node.as_ref() {
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(protobuf::a_const::Val::Ival(i)),
-            ..
-        })) => usize::try_from(i.ival).ok().and_then(|i| i.checked_sub(1)),
+    let position = match key.as_ref() {
+        Some(ast::Node::AConst(c)) => match &c.val {
+            Some(ast::AConstValue::Integer(i)) => {
+                usize::try_from(i.ival).ok().and_then(|i| i.checked_sub(1))
+            }
+            _ => None,
+        },
         _ => None,
     };
-    let alias = match key.node.as_ref() {
-        Some(node::Node::ColumnRef(cr)) if cr.fields.len() == 1 => column_name(cr),
+    let alias = match key.as_ref() {
+        Some(ast::Node::ColumnRef(cr)) if cr.fields.len() == 1 => column_name(cr),
         _ => None,
     };
     if position.is_none() && alias.is_none() {
@@ -984,12 +985,12 @@ fn order_key_redundant(
     // As [`order_key_error`] resolves it.
     let mut at = 0;
     for target in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             return true;
         };
-        let val = rt.val.as_deref();
-        if let (Some(source), Some(node::Node::ColumnRef(cr))) =
-            (level.source, val.and_then(|v| v.node.as_ref()))
+        let val = Some(&rt.val).filter(|v| v.is_some());
+        if let (Some(source), Some(ast::Node::ColumnRef(cr))) =
+            (level.source, val.and_then(|v| v.as_ref()))
             && let Read::All = source.read(cr)
         {
             let width = source.names.len();
@@ -1000,7 +1001,7 @@ fn order_key_redundant(
             continue;
         }
         if position == Some(at) || alias.is_some_and(|a| a == rt.name) {
-            return val.is_none_or(redundant);
+            return val.is_none_or(&redundant);
         }
         at += 1;
     }
@@ -1010,15 +1011,15 @@ fn order_key_redundant(
 /// Which columns `sel`'s select list yields over `level`'s projected
 /// source a qualification above can't push down: those reading such a
 /// column of it.
-fn level_unpushable(sel: &protobuf::SelectStmt, level: Level<'_>) -> Vec<bool> {
+fn level_unpushable(sel: &ast::SelectStmt, level: Level<'_>) -> Vec<bool> {
     let mut unpushable = Vec::new();
     for target in &sel.target_list {
-        let val = match target.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+        let val = match target.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => Some(&rt.val).filter(|v| v.is_some()),
             _ => None,
         };
-        let (Some(source), Some(node::Node::ColumnRef(cr))) =
-            (level.source, val.and_then(|v| v.node.as_ref()))
+        let (Some(source), Some(ast::Node::ColumnRef(cr))) =
+            (level.source, val.and_then(|v| v.as_ref()))
         else {
             unpushable.push(false);
             continue;
@@ -1038,9 +1039,9 @@ fn level_unpushable(sel: &protobuf::SelectStmt, level: Level<'_>) -> Vec<bool> {
 /// `where_fails` is a WHERE that must fail, which every row reaching the
 /// select list would have passed.
 fn level_errors(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     level: Level<'_>,
-    where_fails: Option<&protobuf::Node>,
+    where_fails: Option<&Option<ast::Node>>,
     unpushed: Option<Failure>,
     pushed: Option<Failure>,
 ) -> Option<(Errors, Vec<Option<Value>>)> {
@@ -1058,11 +1059,12 @@ fn level_errors(
     let mut columns = Vec::new();
     let mut values = Vec::new();
     for target in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             return None;
         };
-        let val = rt.val.as_deref()?;
-        if let (Some(source), Some(node::Node::ColumnRef(cr))) = (source, val.node.as_ref())
+        rt.val.as_ref()?;
+        let val = &rt.val;
+        if let (Some(source), Some(ast::Node::ColumnRef(cr))) = (source, val.as_ref())
             && let Read::All = source.read(cr)
         {
             let errors = source.rows.errors(level.first);
@@ -1082,15 +1084,15 @@ fn level_errors(
 
 /// The type of each column `sel`'s select list yields over `level`'s
 /// source, where known.
-fn level_types(sel: &protobuf::SelectStmt, level: Level<'_>) -> Vec<Option<PgTypeOid>> {
+fn level_types(sel: &ast::SelectStmt, level: Level<'_>) -> Vec<Option<PgTypeOid>> {
     let mut types = Vec::new();
     for target in &sel.target_list {
-        let val = match target.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+        let val = match target.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => Some(&rt.val).filter(|v| v.is_some()),
             _ => None,
         };
-        if let (Some(source), Some(node::Node::ColumnRef(cr))) =
-            (level.source, val.and_then(|v| v.node.as_ref()))
+        if let (Some(source), Some(ast::Node::ColumnRef(cr))) =
+            (level.source, val.and_then(|v| v.as_ref()))
             && let Read::All = source.read(cr)
         {
             types.extend((0..source.names.len()).map(|i| source.rows.type_of(i)));
@@ -1101,8 +1103,8 @@ fn level_types(sel: &protobuf::SelectStmt, level: Level<'_>) -> Vec<Option<PgTyp
     types
 }
 
-fn is_column_ref(n: &protobuf::Node) -> bool {
-    matches!(n.node, Some(node::Node::ColumnRef(_)))
+fn is_column_ref(n: &Option<ast::Node>) -> bool {
+    matches!(n, Some(ast::Node::ColumnRef(_)))
 }
 
 /// The rows of a set operation, before its LIMIT. An arm is evaluated
@@ -1119,13 +1121,13 @@ fn is_column_ref(n: &protobuf::Node) -> bool {
 /// setop_retrieve_sorted). The outer one of an EXCEPT is its left arm,
 /// read whole; an INTERSECT's may be either.
 fn set_op_rows(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
-    ctes: &[&protobuf::CommonTableExpr],
+    ctes: &[&ast::CommonTableExpr],
     depth: usize,
     stored: bool,
 ) -> Option<Rows> {
-    use protobuf::SetOperation as Op;
+    use ast::SetOperation as Op;
     if sel.with_clause.is_some() {
         return None;
     }
@@ -1133,7 +1135,7 @@ fn set_op_rows(
         .map(|arm| query_rows(arm.as_deref()?, snapshot, ctes, depth + 1, stored));
     let width = leftmost(sel).target_list.len();
     let [left, right] = &arms;
-    let (all, first, sorted, count) = match Op::try_from(sel.op).ok()? {
+    let (all, first, sorted, count) = match sel.op {
         Op::SetopUnion => {
             let arms: Vec<&Rows> = [left, right].into_iter().flatten().collect();
             let all = arms.iter().find_map(|a| a.all.any());
@@ -1175,8 +1177,8 @@ fn set_op_rows(
             };
             // A grouped leaf is estimated its rows (build_setop_child_paths),
             // at least one but where proven empty (a dummy relation).
-            let leaf = |s: &protobuf::SelectStmt, rows: Option<&Rows>| {
-                s.op == Op::SetopNone as i32
+            let leaf = |s: &ast::SelectStmt, rows: Option<&Rows>| {
+                s.op == Op::SetopNone
                     && s.having_clause.is_none()
                     && (s.group_clause.is_empty() && s.distinct_clause.is_empty()
                         || rows.is_some_and(|r| r.count.at_least_one))
@@ -1189,10 +1191,7 @@ fn set_op_rows(
             // rows estimate may be less for a set operation, or a grouped
             // leaf that may be empty).
             let left_outer = left.as_ref().is_some_and(|l| l.count.at_most_one)
-                && sel
-                    .larg
-                    .as_deref()
-                    .is_some_and(|l| l.op == Op::SetopNone as i32)
+                && sel.larg.as_deref().is_some_and(|l| l.op == Op::SetopNone)
                 && sel.rarg.as_deref().is_some_and(|r| leaf(r, right.as_ref()));
             let first = if left_outer {
                 outer(left.as_ref()?, right.as_ref())
@@ -1209,7 +1208,7 @@ fn set_op_rows(
             };
             (first.clone(), first.clone(), first, count)
         }
-        Op::SetopNone | Op::Undefined => return None,
+        Op::SetopNone => return None,
     };
     let known = arms.iter().flatten().next()?;
     let width = width.max(known.all.columns.len());
@@ -1222,7 +1221,7 @@ fn set_op_rows(
             (Some(a), Some(r)) if in_set_operation_tree(a) => {
                 leaf_types.extend(r.leaf_types.iter().cloned())
             }
-            (Some(a), Some(r)) if a.op == Op::SetopNone as i32 => leaf_types.push(r.types.clone()),
+            (Some(a), Some(r)) if a.op == Op::SetopNone => leaf_types.push(r.types.clone()),
             _ => {}
         }
     }
@@ -1292,7 +1291,7 @@ fn set_op_rows(
             if types_differ(snapshot, &leaf_types, i) {
                 return None;
             }
-            let from: Vec<&Option<Rows>> = if sel.op == Op::SetopUnion as i32 {
+            let from: Vec<&Option<Rows>> = if sel.op == Op::SetopUnion {
                 arms.iter().collect()
             } else {
                 vec![left]
@@ -1309,7 +1308,7 @@ fn set_op_rows(
     // first row is fetched (see the UNION above for why only a domain's
     // failure counts).
     let fail_after =
-        if sel.op == Op::SetopUnion as i32 && sel.all && sel.sort_clause.is_empty() && !flattened {
+        if sel.op == Op::SetopUnion && sel.all && sel.sort_clause.is_empty() && !flattened {
             left.as_ref().and_then(|l| {
                 l.fail_after.clone().or_else(|| {
                     let f = right.as_ref()?.first.any().filter(|f| f.domain)?;
@@ -1348,7 +1347,7 @@ fn set_op_rows(
                 flattened,
                 in_order: union_all_tree(sel) && sel.sort_clause.is_empty(),
                 all_at_once: !intersect
-                    && (sel.op == Op::SetopUnion as i32 && !sel.all || !sel.sort_clause.is_empty()),
+                    && (sel.op == Op::SetopUnion && !sel.all || !sel.sort_clause.is_empty()),
                 intersect,
             }
         });
@@ -1389,8 +1388,8 @@ fn set_op_rows(
 
 /// A set operation arm that is part of its parent's tree, not a leaf
 /// subquery of its own (transformSetOperationTree's `isLeaf`).
-fn in_set_operation_tree(s: &protobuf::SelectStmt) -> bool {
-    s.op != protobuf::SetOperation::SetopNone as i32
+fn in_set_operation_tree(s: &ast::SelectStmt) -> bool {
+    s.op != ast::SetOperation::SetopNone
         && s.sort_clause.is_empty()
         && s.limit_count.is_none()
         && s.limit_offset.is_none()
@@ -1401,20 +1400,20 @@ fn in_set_operation_tree(s: &protobuf::SelectStmt) -> bool {
 /// No qualification is pushed down into the set operation `sel`
 /// (recurse_pushdown_safe): its tree has an EXCEPT, or a component that is
 /// a set operation of its own.
-fn pushdown_unsafe_tree(sel: &protobuf::SelectStmt) -> bool {
-    sel.op == protobuf::SetOperation::SetopExcept as i32
+fn pushdown_unsafe_tree(sel: &ast::SelectStmt) -> bool {
+    sel.op == ast::SetOperation::SetopExcept
         || [&sel.larg, &sel.rarg].into_iter().flatten().any(|arm| {
             if in_set_operation_tree(arm) {
                 pushdown_unsafe_tree(arm)
             } else {
-                arm.op != protobuf::SetOperation::SetopNone as i32
+                arm.op != ast::SetOperation::SetopNone
             }
         })
 }
 
 /// `sel`'s tree has an INTERSECT.
-fn intersect_tree(sel: &protobuf::SelectStmt) -> bool {
-    sel.op == protobuf::SetOperation::SetopIntersect as i32
+fn intersect_tree(sel: &ast::SelectStmt) -> bool {
+    sel.op == ast::SetOperation::SetopIntersect
         || [&sel.larg, &sel.rarg]
             .into_iter()
             .flatten()
@@ -1423,8 +1422,8 @@ fn intersect_tree(sel: &protobuf::SelectStmt) -> bool {
 
 /// The select list of `s`, a set operation's leaf that reads no FROM item
 /// and does nothing but project its one row.
-fn plain_leaf(s: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<Vec<protobuf::Node>> {
-    let plain = s.op == protobuf::SetOperation::SetopNone as i32
+fn plain_leaf(s: &ast::SelectStmt, snapshot: &PgCatalog) -> Option<Vec<Option<ast::Node>>> {
+    let plain = s.op == ast::SetOperation::SetopNone
         && s.from_clause.is_empty()
         && s.where_clause.is_none()
         && s.group_clause.is_empty()
@@ -1444,10 +1443,10 @@ fn plain_leaf(s: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<Vec<prot
     }
     s.target_list
         .iter()
-        .map(|t| match t.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => {
-                rt.val.as_deref().filter(|v| !is_column_ref(v)).cloned()
-            }
+        .map(|t| match t.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => Some(&rt.val)
+                .filter(|v| v.is_some() && !is_column_ref(v))
+                .cloned(),
             _ => None,
         })
         .collect()
@@ -1455,8 +1454,8 @@ fn plain_leaf(s: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<Vec<prot
 
 /// `sel`'s tree is all UNION ALL, whatever its leaves
 /// (is_simple_union_all_recurse).
-fn union_all_tree(sel: &protobuf::SelectStmt) -> bool {
-    sel.op == protobuf::SetOperation::SetopUnion as i32
+fn union_all_tree(sel: &ast::SelectStmt) -> bool {
+    sel.op == ast::SetOperation::SetopUnion
         && sel.all
         && [&sel.larg, &sel.rarg]
             .into_iter()
@@ -1484,9 +1483,9 @@ fn types_differ(snapshot: &PgCatalog, leaves: &[Vec<Option<PgTypeOid>>], i: usiz
 }
 
 /// The leftmost arm of a set operation, which names its columns.
-fn leftmost(sel: &protobuf::SelectStmt) -> &protobuf::SelectStmt {
+fn leftmost(sel: &ast::SelectStmt) -> &ast::SelectStmt {
     match sel.larg.as_deref() {
-        Some(l) if sel.op != protobuf::SetOperation::SetopNone as i32 => leftmost(l),
+        Some(l) if sel.op != ast::SetOperation::SetopNone => leftmost(l),
         _ => sel,
     }
 }
@@ -1495,7 +1494,7 @@ fn leftmost(sel: &protobuf::SelectStmt) -> &protobuf::SelectStmt {
 #[derive(Clone, Copy)]
 struct Level<'a> {
     snapshot: &'a PgCatalog,
-    ctes: &'a [&'a protobuf::CommonTableExpr],
+    ctes: &'a [&'a ast::CommonTableExpr],
     depth: usize,
     stored: bool,
     standalone: bool,
@@ -1508,15 +1507,15 @@ struct Level<'a> {
 
 impl Level<'_> {
     /// The error evaluating `n` surely raises.
-    fn error(&self, n: &protobuf::Node) -> Option<Failure> {
-        match n.node.as_ref()? {
-            node::Node::TypeCast(tc) => {
+    fn error(&self, n: &Option<ast::Node>) -> Option<Failure> {
+        match n.as_ref()? {
+            ast::Node::TypeCast(tc) => {
                 if let Some(e) = self.null_cast(tc) {
                     return Some(e);
                 }
                 // A cast evaluates its argument where no cast into the
                 // target could drop it (see [`casts_evaluate_argument`]).
-                if let Some(e) = tc.arg.as_deref().and_then(|a| self.error(a))
+                if let Some(e) = self.error(&tc.arg)
                     && tc
                         .type_name
                         .as_ref()
@@ -1526,7 +1525,7 @@ impl Level<'_> {
                     return Some(e);
                 }
             }
-            node::Node::ColumnRef(cr) => {
+            ast::Node::ColumnRef(cr) => {
                 let source = self.source?;
                 if self.qual && source.rows.projected && !source.rows.unpushable(&source.read(cr)) {
                     // Pushed down into the arms, the qualification runs
@@ -1548,11 +1547,11 @@ impl Level<'_> {
             }
             // Its argument is evaluated (a domain's coercion is not
             // folded).
-            node::Node::NullTest(nt) => return self.error(nt.arg.as_deref()?),
-            node::Node::SubLink(sl) => return self.sublink_error(sl),
+            ast::Node::NullTest(nt) => return self.error(&nt.arg),
+            ast::Node::SubLink(sl) => return self.sublink_error(sl),
             // COALESCE drops its NULL constant arguments, and evaluates the
             // first one left first.
-            node::Node::CoalesceExpr(c) => {
+            ast::Node::CoalesceExpr(c) => {
                 if let Some(f) = c
                     .args
                     .iter()
@@ -1562,7 +1561,7 @@ impl Level<'_> {
                     return Some(f);
                 }
             }
-            node::Node::AExpr(e) => {
+            ast::Node::AExpr(e) => {
                 if let Some(f) = self.a_expr_error(e) {
                     return Some(f);
                 }
@@ -1592,10 +1591,10 @@ impl Level<'_> {
     }
 
     /// The error evaluating the operator expression `e` surely raises.
-    fn a_expr_error(&self, e: &protobuf::AExpr) -> Option<Failure> {
-        use protobuf::AExprKind as K;
-        let operands = || e.lexpr.iter().chain(&e.rexpr).find_map(|a| self.error(a));
-        match e.kind() {
+    fn a_expr_error(&self, e: &ast::AExpr) -> Option<Failure> {
+        use ast::AExprKind as K;
+        let operands = || [&e.lexpr, &e.rexpr].into_iter().find_map(|a| self.error(a));
+        match e.kind {
             K::AexprOp => self.operator_error(e),
             // A DistinctExpr is folded only when every argument is a
             // constant, and never inlined (eval_const_expressions); a
@@ -1609,17 +1608,18 @@ impl Level<'_> {
             // same comparison first: transformAExprBetween): the first
             // one is evaluated first.
             K::AexprBetween | K::AexprNotBetween | K::AexprBetweenSym | K::AexprNotBetweenSym => {
-                let Some(node::Node::List(bounds)) = e.rexpr.as_deref()?.node.as_ref() else {
+                let Some(ast::Node::List(bounds)) = e.rexpr.as_ref() else {
                     return None;
                 };
-                let (first, second) = match e.kind() {
+                let (first, second) = match e.kind {
                     K::AexprBetween | K::AexprBetweenSym => (">=", "<="),
                     _ => ("<", ">"),
                 };
                 let [low, high] = bounds.items.as_slice() else {
                     return None;
                 };
-                let lexpr = e.lexpr.as_deref()?;
+                e.lexpr.as_ref()?;
+                let lexpr = &e.lexpr;
                 let low_cmp = comparison(first, lexpr, low);
                 if let Some(f) = self.operator_error(&low_cmp) {
                     return Some(f);
@@ -1642,24 +1642,25 @@ impl Level<'_> {
             // common type, or `a = b` for one (transformAExprIn): `a = b`
             // evaluating `a`, all of those do, first.
             K::AexprIn => {
-                let Some(node::Node::List(list)) = e.rexpr.as_deref()?.node.as_ref() else {
+                let Some(ast::Node::List(list)) = e.rexpr.as_ref() else {
                     return None;
                 };
                 let literals = list
                     .items
                     .iter()
-                    .all(|i| matches!(i.node.as_ref(), Some(node::Node::AConst(c)) if !c.isnull));
+                    .all(|i| matches!(i.as_ref(), Some(ast::Node::AConst(c)) if !c.isnull));
                 if !literals {
                     return None;
                 }
                 let name = match e.name.as_slice() {
-                    [n] => match n.node.as_ref()? {
-                        node::Node::String(s) => s.sval.as_str(),
+                    [n] => match n.as_ref()? {
+                        ast::Node::String(s) => s.sval.as_str(),
                         _ => return None,
                     },
                     _ => return None,
                 };
-                self.operator_error(&comparison(name, e.lexpr.as_deref()?, list.items.first()?))
+                e.lexpr.as_ref()?;
+                self.operator_error(&comparison(name, &e.lexpr, list.items.first()?))
             }
             _ => None,
         }
@@ -1668,24 +1669,24 @@ impl Level<'_> {
     /// The type `n` surely has, where it is simple enough to tell: a
     /// constant, a cast, a column of the source, an operator over such or
     /// a scalar subquery.
-    fn type_of(&self, n: &protobuf::Node) -> Option<PgTypeOid> {
-        match n.node.as_ref()? {
-            node::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
-            node::Node::TypeCast(tc) => {
+    fn type_of(&self, n: &Option<ast::Node>) -> Option<PgTypeOid> {
+        match n.as_ref()? {
+            ast::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
+            ast::Node::TypeCast(tc) => {
                 crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)
             }
-            node::Node::ColumnRef(cr) => {
+            ast::Node::ColumnRef(cr) => {
                 let source = self.source?;
                 match source.read(cr) {
                     Read::Column(i) => source.rows.type_of(i),
                     _ => None,
                 }
             }
-            node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
+            ast::Node::AExpr(e) if e.kind == ast::AExprKind::AexprOp => {
                 Some(self.operator(e)?.result_type_oid)
             }
-            node::Node::FuncCall(_) => range_const(self.snapshot, n).map(|(t, _)| t),
-            node::Node::SqlvalueFunction(_) => {
+            ast::Node::FuncCall(_) => range_const(self.snapshot, n).map(|(t, _)| t),
+            ast::Node::SqlValueFunction(_) => {
                 let scope = Scope::default();
                 let null_ctx = NullabilityContext::default();
                 let ctx = Ctx::new(&scope, &null_ctx, self.snapshot);
@@ -1693,11 +1694,8 @@ impl Level<'_> {
                     .ok()
                     .map(|t| t.type_oid)
             }
-            node::Node::SubLink(sl)
-                if sl.sub_link_type == protobuf::SubLinkType::ExprSublink as i32 =>
-            {
-                let Some(node::Node::SelectStmt(sub)) = sl.subselect.as_deref()?.node.as_ref()
-                else {
+            ast::Node::SubLink(sl) if sl.sub_link_type == ast::SubLinkType::ExprSublink => {
+                let Some(ast::Node::SelectStmt(sub)) = sl.subselect.as_ref() else {
                     return None;
                 };
                 query_rows(sub, self.snapshot, self.ctes, self.depth + 1, self.stored)?.type_of(0)
@@ -1707,13 +1705,14 @@ impl Level<'_> {
     }
 
     /// The operator `e` resolves to, when its operands' types are known.
-    fn operator(&self, e: &protobuf::AExpr) -> Option<crate::lookup::ResolvedOperator> {
+    fn operator(&self, e: &ast::AExpr) -> Option<crate::lookup::ResolvedOperator> {
         let name = expr::extract_string_fields(&e.name).join(".");
-        let left = match e.lexpr.as_deref() {
-            Some(l) => Some(self.type_of(l)?),
+        let left = match e.lexpr.as_ref() {
+            Some(_) => Some(self.type_of(&e.lexpr)?),
             None => None,
         };
-        let right = self.type_of(e.rexpr.as_deref()?)?;
+        e.rexpr.as_ref()?;
+        let right = self.type_of(&e.rexpr)?;
         match self.snapshot.find_operator_detailed(&name, left, right) {
             crate::lookup::OperatorMatch::Found(op) => Some(op),
             _ => None,
@@ -1726,8 +1725,11 @@ impl Level<'_> {
     /// unless the function is a SQL one, whose inlined body may evaluate
     /// them in another order: then the failing ones must raise the same
     /// error.
-    fn operator_error(&self, e: &protobuf::AExpr) -> Option<Failure> {
-        let operands: Vec<&protobuf::Node> = e.lexpr.iter().chain(&e.rexpr).map(|a| &**a).collect();
+    fn operator_error(&self, e: &ast::AExpr) -> Option<Failure> {
+        let operands: Vec<&Option<ast::Node>> = [&e.lexpr, &e.rexpr]
+            .into_iter()
+            .filter(|a| a.is_some())
+            .collect();
         let errors: Vec<Option<Failure>> = operands.iter().map(|a| self.error(a)).collect();
         let leftmost = errors.iter().position(Option::is_some)?;
         // Failing operands all raising the same error, the order they are
@@ -1766,11 +1768,12 @@ impl Level<'_> {
     /// function, which can't return NULL for one), a built-in cast of one,
     /// a stable SQL value function (`CURRENT_DATE`, not folded), a column
     /// holding a constant, or an expression whose evaluation surely fails.
-    fn not_null_const(&self, n: &protobuf::Node) -> bool {
-        match n.node.as_ref() {
-            Some(node::Node::AConst(c)) => !c.isnull,
-            Some(node::Node::TypeCast(tc))
-                if tc.arg.as_deref().is_some_and(|a| self.not_null_const(a))
+    fn not_null_const(&self, n: &Option<ast::Node>) -> bool {
+        match n.as_ref() {
+            Some(ast::Node::AConst(c)) => !c.isnull,
+            Some(ast::Node::TypeCast(tc))
+                if tc.arg.is_some()
+                    && self.not_null_const(&tc.arg)
                     && tc
                         .type_name
                         .as_ref()
@@ -1779,8 +1782,8 @@ impl Level<'_> {
             {
                 true
             }
-            Some(node::Node::SqlvalueFunction(_)) => true,
-            Some(node::Node::ColumnRef(cr))
+            Some(ast::Node::SqlValueFunction(_)) => true,
+            Some(ast::Node::ColumnRef(cr))
                 if self.source.is_some_and(|s| match s.read(cr) {
                     Read::Column(i) => s.rows.values.get(i).is_some_and(Option::is_some),
                     _ => false,
@@ -1793,10 +1796,10 @@ impl Level<'_> {
     }
 
     /// `NULL::d` of a domain `d` rejecting it.
-    fn null_cast(&self, tc: &protobuf::TypeCast) -> Option<Failure> {
+    fn null_cast(&self, tc: &ast::TypeCast) -> Option<Failure> {
         if !matches!(
-            tc.arg.as_deref().and_then(|a| a.node.as_ref()),
-            Some(node::Node::AConst(c)) if c.isnull
+            tc.arg.as_ref(),
+            Some(ast::Node::AConst(c)) if c.isnull
         ) {
             return None;
         }
@@ -1810,12 +1813,12 @@ impl Level<'_> {
 
     /// A scalar or ARRAY subquery evaluates its rows' one column (an
     /// uncorrelated one as an initplan, where its value is needed).
-    fn sublink_error(&self, sl: &protobuf::SubLink) -> Option<Failure> {
-        let scalar = sl.sub_link_type == protobuf::SubLinkType::ExprSublink as i32;
-        if !scalar && sl.sub_link_type != protobuf::SubLinkType::ArraySublink as i32 {
+    fn sublink_error(&self, sl: &ast::SubLink) -> Option<Failure> {
+        let scalar = sl.sub_link_type == ast::SubLinkType::ExprSublink;
+        if !scalar && sl.sub_link_type != ast::SubLinkType::ArraySublink {
             return None;
         }
-        let Some(node::Node::SelectStmt(sub)) = sl.subselect.as_deref()?.node.as_ref() else {
+        let Some(ast::Node::SelectStmt(sub)) = sl.subselect.as_ref() else {
             return None;
         };
         let rows = query_rows(sub, self.snapshot, self.ctes, self.depth + 1, self.stored)?;
@@ -1831,9 +1834,9 @@ impl Level<'_> {
     }
 
     /// The constant `n` surely is.
-    fn value(&self, n: &protobuf::Node) -> Option<Value> {
-        match n.node.as_ref()? {
-            node::Node::ColumnRef(cr) => {
+    fn value(&self, n: &Option<ast::Node>) -> Option<Value> {
+        match n.as_ref()? {
+            ast::Node::ColumnRef(cr) => {
                 let source = self.source?;
                 match source.read(cr) {
                     Read::Column(i) => source.rows.values.get(i).cloned().flatten(),
@@ -1843,8 +1846,8 @@ impl Level<'_> {
             // An integer literal cast to an integer type it fits, or to a
             // domain over one without CHECK constraints (its NOT NULL
             // holds): the value is the literal's.
-            node::Node::TypeCast(tc) => {
-                let Some(Value::Int(i)) = literal_value(tc.arg.as_deref()?) else {
+            ast::Node::TypeCast(tc) => {
+                let Some(Value::Int(i)) = literal_value(tc.arg.as_ref()) else {
                     return None;
                 };
                 let type_name = tc.type_name.as_ref()?;
@@ -1868,26 +1871,26 @@ impl Level<'_> {
                 });
                 (fits && !checked).then_some(Value::Int(i))
             }
-            _ => literal_value(n),
+            _ => literal_value(n.as_ref()),
         }
     }
 
     /// What `n`, a qualification, surely evaluates to (see
     /// [`truth_with`]).
-    fn truth(&self, n: &protobuf::Node) -> Option<bool> {
+    fn truth(&self, n: &Option<ast::Node>) -> Option<bool> {
         truth_with(n, &|v| self.value(v))
     }
 
     /// The error a qualification surely raises: one testing a failing
     /// value, ANDed with ones that hold (the planner orders the others by
     /// cost, so one that may be false could run first and skip it).
-    fn surely_fails(&self, n: &protobuf::Node) -> Option<Failure> {
+    fn surely_fails(&self, n: &Option<ast::Node>) -> Option<Failure> {
         let level = Level {
             qual: true,
             ..*self
         };
-        match n.node.as_ref()? {
-            node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::AndExpr as i32 => {
+        match n.as_ref()? {
+            ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::AndExpr => {
                 let mut failing = None;
                 let mut left = Vec::new();
                 for a in &b.args {
@@ -1903,7 +1906,7 @@ impl Level<'_> {
                 let member = self
                     .source
                     .is_some_and(|s| s.rows.projected && !s.rows.qual_reads.is_empty());
-                let args: Vec<&protobuf::Node> = b.args.iter().collect();
+                let args: Vec<&Option<ast::Node>> = b.args.iter().collect();
                 if !self.equalities_consistent(&args) || member && refutable(&left, self.snapshot) {
                     return None;
                 }
@@ -1912,7 +1915,7 @@ impl Level<'_> {
             // An OR whose arguments left (the ones not folded to false
             // nor NULL) all surely fail evaluates one of them first; one
             // folded to true folds it away. A NOT evaluates its argument.
-            node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::OrExpr as i32 => {
+            ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::OrExpr => {
                 let mut failing = None;
                 for a in &b.args {
                     match self.truth(a) {
@@ -1926,13 +1929,13 @@ impl Level<'_> {
                 }
                 failing
             }
-            node::Node::BoolExpr(b) if b.boolop == protobuf::BoolExprType::NotExpr as i32 => {
+            ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::NotExpr => {
                 match b.args.as_slice() {
                     [a] => self.surely_fails(a),
                     _ => None,
                 }
             }
-            node::Node::BoolExpr(_) => None,
+            ast::Node::BoolExpr(_) => None,
             _ => level.error(n),
         }
     }
@@ -1951,8 +1954,8 @@ impl Level<'_> {
     /// equality operators of different input types, which no class
     /// shares). Over no FROM item, a qualification reads no Var: each
     /// conjunct is a gating qual, in no class.
-    fn equalities_consistent(&self, conjuncts: &[&protobuf::Node]) -> bool {
-        let equalities: Vec<&protobuf::AExpr> = conjuncts
+    fn equalities_consistent(&self, conjuncts: &[&Option<ast::Node>]) -> bool {
+        let equalities: Vec<&ast::AExpr> = conjuncts
             .iter()
             .flat_map(|c| promoted_equalities(c, self.snapshot))
             .collect();
@@ -1969,25 +1972,27 @@ impl Level<'_> {
         // column of an integer or numeric type `'3'`). Each equality's
         // column is keyed by the type its operator takes it as, where the
         // operator resolves (else it may share a class with any other).
-        let column_const = |e: &protobuf::AExpr| -> Option<(Member, EqConst)> {
+        let column_const = |e: &ast::AExpr| -> Option<(Member, EqConst)> {
             if expr::extract_string_fields(&e.name) != ["="] {
                 return None;
             }
             // A single-item IN is one `=` (transformAExprIn).
-            let r = match (e.kind(), e.rexpr.as_deref().and_then(|r| r.node.as_ref())) {
-                (protobuf::AExprKind::AexprOp, _) => e.rexpr.as_deref()?,
-                (protobuf::AExprKind::AexprIn, Some(node::Node::List(l))) => {
-                    match l.items.as_slice() {
-                        [item] => item,
-                        _ => return None,
-                    }
+            let r = match (e.kind, e.rexpr.as_ref()) {
+                (ast::AExprKind::AexprOp, _) => {
+                    e.rexpr.as_ref()?;
+                    &e.rexpr
                 }
+                (ast::AExprKind::AexprIn, Some(ast::Node::List(l))) => match l.items.as_slice() {
+                    [item] => item,
+                    _ => return None,
+                },
                 _ => return None,
             };
-            let l = e.lexpr.as_deref()?;
-            let (col, lit, col_left) = match (l.node.as_ref()?, r.node.as_ref()?) {
-                (node::Node::ColumnRef(cr), _) => (cr, r, true),
-                (_, node::Node::ColumnRef(cr)) => (cr, l, false),
+            e.lexpr.as_ref()?;
+            let l = &e.lexpr;
+            let (col, lit, col_left) = match (l.as_ref()?, r.as_ref()?) {
+                (ast::Node::ColumnRef(cr), _) => (cr, r, true),
+                (_, ast::Node::ColumnRef(cr)) => (cr, l, false),
                 _ => return None,
             };
             let Read::Column(i) = source.read(col) else {
@@ -2027,7 +2032,7 @@ impl Level<'_> {
     /// What the WHERE `w` of `sel` raises where it is pushed down into the
     /// leaves of the set operation `sel` reads (see [`Leaf`]): reading
     /// every row, fetching the first one, and past how many rows.
-    fn pushed_down(&self, sel: &protobuf::SelectStmt, w: &protobuf::Node) -> Option<Pushed> {
+    fn pushed_down(&self, sel: &ast::SelectStmt, w: &Option<ast::Node>) -> Option<Pushed> {
         let source = self.source?;
         let leaves = source.rows.leaves.as_ref()?;
         // Not flattened, the qualification goes down only where
@@ -2035,15 +2040,15 @@ impl Level<'_> {
         // that can't be, no whole row, no subquery); a volatile function
         // could be left above, or run first in the leaf's filter.
         let mut safe = true;
-        super::walk::visit_same_level(w, &mut |x| match x.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => {
+        super::walk::visit_same_level(w, &mut |x| match x.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) => {
                 let read = source.read(cr);
                 safe &= matches!(read, Read::Column(_) | Read::WholeRow)
                     && (leaves.flattened
                         || matches!(read, Read::Column(_)) && !source.rows.unpushable(&read));
             }
-            Some(node::Node::SubLink(_)) => safe = false,
-            Some(node::Node::FuncCall(_)) => safe &= leaves.flattened,
+            Some(ast::Node::SubLink(_)) => safe = false,
+            Some(ast::Node::FuncCall(_)) => safe &= leaves.flattened,
             _ => {}
         });
         if !safe || !self.equalities_consistent(&conjuncts(w)) {
@@ -2053,9 +2058,8 @@ impl Level<'_> {
         // UNION ALL's leaf, which computes no other).
         let mut read = vec![false; source.names.len()];
         for target in &sel.target_list {
-            if let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-                && let Some(node::Node::ColumnRef(cr)) =
-                    rt.val.as_deref().and_then(|v| v.node.as_ref())
+            if let Some(ast::Node::ResTarget(rt)) = target.as_ref()
+                && let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref()
             {
                 match source.read(cr) {
                     Read::Column(i) => read[i] = true,
@@ -2139,16 +2143,16 @@ impl Level<'_> {
     /// The conjuncts the qualification `q` is split into once folded over
     /// a leaf's constants: an AND's, and those of an OR left with one
     /// argument (the others folded to false or NULL).
-    fn leaf_conjuncts<'n>(&self, q: &'n protobuf::Node, out: &mut Vec<&'n protobuf::Node>) {
-        use protobuf::BoolExprType as B;
-        match q.node.as_ref() {
-            Some(node::Node::BoolExpr(b)) if b.boolop == B::AndExpr as i32 => {
+    fn leaf_conjuncts<'n>(&self, q: &'n Option<ast::Node>, out: &mut Vec<&'n Option<ast::Node>>) {
+        use ast::BoolExprType as B;
+        match q.as_ref() {
+            Some(ast::Node::BoolExpr(b)) if b.boolop == B::AndExpr => {
                 for a in &b.args {
                     self.leaf_conjuncts(a, out);
                 }
             }
-            Some(node::Node::BoolExpr(b)) if b.boolop == B::OrExpr as i32 => {
-                let left: Vec<&protobuf::Node> = b
+            Some(ast::Node::BoolExpr(b)) if b.boolop == B::OrExpr => {
+                let left: Vec<&Option<ast::Node>> = b
                     .args
                     .iter()
                     .filter(|a| self.truth(a) != Some(false) && !is_null_const(self.snapshot, a))
@@ -2168,7 +2172,7 @@ impl Level<'_> {
     /// its One-Time Filter, run in an order of their costs — every one
     /// must surely fail. Flattened, a volatile conjunct is in a filter of
     /// its own, run after.
-    fn leaf_outcome(&self, q: &protobuf::Node, flattened: bool) -> LeafOutcome {
+    fn leaf_outcome(&self, q: &Option<ast::Node>, flattened: bool) -> LeafOutcome {
         let mut failure = None;
         let mut unknown = false;
         let mut volatile = false;
@@ -2213,54 +2217,51 @@ impl Level<'_> {
     /// surely true reads a column that can't be pushed down
     /// (`qual_is_pushdown_safe`), through nothing but operators, casts
     /// and NULL tests of columns and non-NULL literals.
-    fn unpushed(&self, n: &protobuf::Node) -> bool {
+    fn unpushed(&self, n: &Option<ast::Node>) -> bool {
         let Some(source) = self
             .source
             .filter(|s| s.rows.keeps_columns || s.rows.projection.is_some())
         else {
             return false;
         };
-        let conjuncts: Vec<&protobuf::Node> = conjuncts(n)
+        let conjuncts: Vec<&Option<ast::Node>> = conjuncts(n)
             .into_iter()
             .filter(|c| self.truth(c) != Some(true))
             .collect();
         if !self.equalities_consistent(&conjuncts) {
             return false;
         }
-        let reads_column = |n: &protobuf::Node| {
+        let reads_column = |n: &Option<ast::Node>| {
             let mut reads = false;
             super::walk::visit_same_level(n, &mut |x| {
-                reads |= matches!(x.node, Some(node::Node::ColumnRef(_)));
+                reads |= matches!(x, Some(ast::Node::ColumnRef(_)));
             });
             reads
         };
         conjuncts.into_iter().all(|c| {
             let mut simple = true;
             let mut reads = false;
-            super::walk::visit_same_level(c, &mut |x| match x.node.as_ref() {
-                Some(node::Node::ColumnRef(cr)) => {
+            super::walk::visit_same_level(c, &mut |x| match x.as_ref() {
+                Some(ast::Node::ColumnRef(cr)) => {
                     reads |= source.rows.unpushable(&source.read(cr));
                 }
-                Some(node::Node::AConst(a)) => simple &= !a.isnull,
+                Some(ast::Node::AConst(a)) => simple &= !a.isnull,
                 // An IN list of literals is one `=`, or `= ANY` of an
                 // array constant (transformAExprIn).
-                Some(node::Node::AExpr(e)) => {
-                    simple &= matches!(
-                        e.kind(),
-                        protobuf::AExprKind::AexprOp | protobuf::AExprKind::AexprIn
-                    );
+                Some(ast::Node::AExpr(e)) => {
+                    simple &= matches!(e.kind, ast::AExprKind::AexprOp | ast::AExprKind::AexprIn);
                 }
-                Some(node::Node::List(l)) => {
+                Some(ast::Node::List(l)) => {
                     simple &= l
                         .items
                         .iter()
-                        .all(|i| matches!(i.node, Some(node::Node::AConst(_))));
+                        .all(|i| matches!(i, Some(ast::Node::AConst(_))));
                 }
                 // Each argument reading a column, none is folded to a
                 // constant.
-                Some(node::Node::BoolExpr(b)) => simple &= b.args.iter().all(reads_column),
-                Some(node::Node::TypeCast(_) | node::Node::NullTest(_)) => {}
-                Some(node::Node::TypeName(_) | node::Node::String(_)) => {}
+                Some(ast::Node::BoolExpr(b)) => simple &= b.args.iter().all(reads_column),
+                Some(ast::Node::TypeCast(_) | ast::Node::NullTest(_)) => {}
+                Some(ast::Node::TypeName(_) | ast::Node::String(_)) => {}
                 _ => simple = false,
             });
             simple && reads
@@ -2273,7 +2274,7 @@ impl Level<'_> {
 /// into several (an AND inside, or a NOT of an AND or OR, which
 /// eval_const_expressions negates into one). One alone, or repeated,
 /// refutes nothing.
-fn refutable(failing: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
+fn refutable(failing: &[&Option<ast::Node>], snapshot: &PgCatalog) -> bool {
     let distinct: std::collections::HashSet<String> = failing
         .iter()
         .map(|c| equivalence_key(c, snapshot))
@@ -2282,12 +2283,12 @@ fn refutable(failing: &[&protobuf::Node], snapshot: &PgCatalog) -> bool {
         || failing.iter().any(|c| {
             let mut compound = false;
             super::walk::visit_same_level(c, &mut |x| {
-                if let Some(node::Node::BoolExpr(b)) = x.node.as_ref() {
-                    compound |= b.boolop == protobuf::BoolExprType::AndExpr as i32
-                        || b.boolop == protobuf::BoolExprType::NotExpr as i32
+                if let Some(ast::Node::BoolExpr(b)) = x.as_ref() {
+                    compound |= b.boolop == ast::BoolExprType::AndExpr
+                        || b.boolop == ast::BoolExprType::NotExpr
                             && matches!(
-                                b.args.first().and_then(|a| a.node.as_ref()),
-                                Some(node::Node::BoolExpr(_))
+                                b.args.first().and_then(|a| a.as_ref()),
+                                Some(ast::Node::BoolExpr(_))
                             );
                 }
             });
@@ -2305,10 +2306,10 @@ struct Pushed {
 }
 
 /// `n` calls a function every overload of which is volatile.
-fn surely_volatile(n: &protobuf::Node, snapshot: &PgCatalog) -> bool {
+fn surely_volatile(n: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
     let mut volatile = false;
     super::walk::visit_same_level(n, &mut |x| {
-        if let Some(node::Node::FuncCall(fc)) = x.node.as_ref() {
+        if let Some(ast::Node::FuncCall(fc)) = x.as_ref() {
             volatile |= crate::ddl::volatile::surely_volatile(fc, snapshot);
         }
     });
@@ -2319,77 +2320,80 @@ fn surely_volatile(n: &protobuf::Node, snapshot: &PgCatalog) -> bool {
 /// column replaced by the leaf's expression, a whole-row NULL test by
 /// one of each column (eval_const_expressions expands a ROW's); `None`
 /// where it reads something else, or through an expression not followed.
-fn substitute(n: &protobuf::Node, source: &SourceRows, leaf: &Leaf) -> Option<protobuf::Node> {
-    let sub = |n: &protobuf::Node| substitute(n, source, leaf);
-    let subs = |ns: &[protobuf::Node]| ns.iter().map(sub).collect::<Option<Vec<_>>>();
-    let boxed = |n: &Option<Box<protobuf::Node>>| match n {
-        Some(n) => sub(n).map(|n| Some(Box::new(n))),
+fn substitute(
+    n: &Option<ast::Node>,
+    source: &SourceRows,
+    leaf: &Leaf,
+) -> Option<Option<ast::Node>> {
+    let sub = |n: &Option<ast::Node>| substitute(n, source, leaf);
+    let subs = |ns: &[Option<ast::Node>]| ns.iter().map(sub).collect::<Option<Vec<_>>>();
+    let boxed = |n: &Option<ast::Node>| match n {
+        Some(_) => sub(n),
         None => Some(None),
     };
-    let wrap = |n: node::Node| protobuf::Node { node: Some(n) };
-    let inner = n.node.as_ref()?;
+    let wrap = |n: ast::Node| Some(n);
+    let inner = n.as_ref()?;
     Some(match inner {
-        node::Node::ColumnRef(cr) => match source.read(cr) {
+        ast::Node::ColumnRef(cr) => match source.read(cr) {
             Read::Column(i) => leaf.exprs.get(i)?.clone(),
             _ => return None,
         },
-        node::Node::NullTest(nt)
+        ast::Node::NullTest(nt)
             if matches!(
-                nt.arg.as_deref().and_then(|a| a.node.as_ref()),
-                Some(node::Node::ColumnRef(cr)) if matches!(source.read(cr), Read::WholeRow)
+                nt.arg.as_ref(),
+                Some(ast::Node::ColumnRef(cr)) if matches!(source.read(cr), Read::WholeRow)
             ) =>
         {
-            let tests: Vec<protobuf::Node> = leaf
+            let tests: Vec<Option<ast::Node>> = leaf
                 .exprs
                 .iter()
                 .map(|e| {
-                    wrap(node::Node::NullTest(Box::new(protobuf::NullTest {
-                        arg: Some(Box::new(e.clone())),
+                    wrap(ast::Node::NullTest(NodeBox::new(ast::NullTest {
+                        arg: e.clone(),
                         argisrow: false,
                         ..(**nt).clone()
                     })))
                 })
                 .collect();
-            match <[protobuf::Node; 1]>::try_from(tests) {
+            match <[Option<ast::Node>; 1]>::try_from(tests) {
                 Ok([t]) => t,
-                Err(args) => wrap(node::Node::BoolExpr(Box::new(protobuf::BoolExpr {
-                    boolop: protobuf::BoolExprType::AndExpr as i32,
+                Err(args) => wrap(ast::Node::BoolExpr(NodeBox::new(ast::BoolExpr {
+                    boolop: ast::BoolExprType::AndExpr,
                     args,
                     location: -1,
-                    ..Default::default()
                 }))),
             }
         }
-        node::Node::NullTest(nt) => wrap(node::Node::NullTest(Box::new(protobuf::NullTest {
+        ast::Node::NullTest(nt) => wrap(ast::Node::NullTest(NodeBox::new(ast::NullTest {
             arg: boxed(&nt.arg)?,
             ..(**nt).clone()
         }))),
-        node::Node::AExpr(e) => wrap(node::Node::AExpr(Box::new(protobuf::AExpr {
+        ast::Node::AExpr(e) => wrap(ast::Node::AExpr(NodeBox::new(ast::AExpr {
             lexpr: boxed(&e.lexpr)?,
             rexpr: boxed(&e.rexpr)?,
             ..(**e).clone()
         }))),
-        node::Node::List(l) => wrap(node::Node::List(protobuf::List {
+        ast::Node::List(l) => wrap(ast::Node::List(NodeBox::new(ast::List {
             items: subs(&l.items)?,
-        })),
-        node::Node::BoolExpr(b) => wrap(node::Node::BoolExpr(Box::new(protobuf::BoolExpr {
+        }))),
+        ast::Node::BoolExpr(b) => wrap(ast::Node::BoolExpr(NodeBox::new(ast::BoolExpr {
             args: subs(&b.args)?,
             ..(**b).clone()
         }))),
-        node::Node::TypeCast(tc) => wrap(node::Node::TypeCast(Box::new(protobuf::TypeCast {
+        ast::Node::TypeCast(tc) => wrap(ast::Node::TypeCast(NodeBox::new(ast::TypeCast {
             arg: boxed(&tc.arg)?,
             ..(**tc).clone()
         }))),
-        node::Node::CoalesceExpr(c) => {
-            wrap(node::Node::CoalesceExpr(Box::new(protobuf::CoalesceExpr {
+        ast::Node::CoalesceExpr(c) => {
+            wrap(ast::Node::CoalesceExpr(NodeBox::new(ast::CoalesceExpr {
                 args: subs(&c.args)?,
                 ..(**c).clone()
             })))
         }
-        node::Node::FuncCall(fc)
+        ast::Node::FuncCall(fc)
             if fc.agg_order.is_empty() && fc.agg_filter.is_none() && fc.over.is_none() =>
         {
-            wrap(node::Node::FuncCall(Box::new(protobuf::FuncCall {
+            wrap(ast::Node::FuncCall(NodeBox::new(ast::FuncCall {
                 args: subs(&fc.args)?,
                 ..(**fc).clone()
             })))
@@ -2397,7 +2401,7 @@ fn substitute(n: &protobuf::Node, source: &SourceRows, leaf: &Leaf) -> Option<pr
         _ => {
             let mut reads = false;
             super::walk::visit_same_level(n, &mut |x| {
-                reads |= matches!(x.node, Some(node::Node::ColumnRef(_)));
+                reads |= matches!(x, Some(ast::Node::ColumnRef(_)));
             });
             if reads {
                 return None;
@@ -2530,19 +2534,19 @@ fn range_support_keeps(
 /// built-in range constructor (`int4range(1, 5)`, `numrange(1, NULL,
 /// '[]')`) over literals — immutable, folded by the planner
 /// (`evaluate_function`) into the range its bounds' text makes.
-fn range_const(snapshot: &PgCatalog, n: &protobuf::Node) -> Option<(PgTypeOid, RangeShape)> {
-    match n.node.as_ref()? {
-        node::Node::TypeCast(tc) => {
-            let Some(node::Node::AConst(c)) = tc.arg.as_deref()?.node.as_ref() else {
+fn range_const(snapshot: &PgCatalog, n: &Option<ast::Node>) -> Option<(PgTypeOid, RangeShape)> {
+    match n.as_ref()? {
+        ast::Node::TypeCast(tc) => {
+            let Some(ast::Node::AConst(c)) = tc.arg.as_ref() else {
                 return None;
             };
-            let Some(protobuf::a_const::Val::Sval(content)) = c.val.as_ref() else {
+            let Some(ast::AConstValue::String(content)) = c.val.as_ref() else {
                 return None;
             };
             let t = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
             Some((t, range_shape(&content.sval, t, snapshot)?))
         }
-        node::Node::FuncCall(fc)
+        ast::Node::FuncCall(fc)
             if fc.agg_order.is_empty()
                 && fc.agg_filter.is_none()
                 && fc.over.is_none()
@@ -2553,19 +2557,19 @@ fn range_const(snapshot: &PgCatalog, n: &protobuf::Node) -> Option<(PgTypeOid, R
             let (bounds, flags) = match fc.args.as_slice() {
                 [lower, upper] => ([lower, upper], "[)"),
                 [lower, upper, flags] => {
-                    let Some(Value::Str(flags)) = literal_value(flags) else {
+                    let Some(Value::Str(flags)) = literal_value(flags.as_ref()) else {
                         return None;
                     };
                     ([lower, upper], flags_str(&flags)?)
                 }
                 _ => return None,
             };
-            let bounds = bounds.map(|b| match b.node.as_ref() {
-                Some(node::Node::AConst(c)) if c.isnull => Some(None),
-                Some(node::Node::AConst(c)) => Some(Some(match c.val.as_ref()? {
-                    protobuf::a_const::Val::Ival(i) => i.ival.to_string(),
-                    protobuf::a_const::Val::Fval(f) => f.fval.clone(),
-                    protobuf::a_const::Val::Sval(s) => s.sval.clone(),
+            let bounds = bounds.map(|b| match b.as_ref() {
+                Some(ast::Node::AConst(c)) if c.isnull => Some(None),
+                Some(ast::Node::AConst(c)) => Some(Some(match c.val.as_ref()? {
+                    ast::AConstValue::Integer(i) => i.ival.to_string(),
+                    ast::AConstValue::Float(f) => f.fval.clone(),
+                    ast::AConstValue::String(s) => s.sval.clone(),
                     _ => return None,
                 })),
                 _ => None,
@@ -2629,13 +2633,12 @@ fn flags_str(flags: &str) -> Option<&'static str> {
 
 /// `n` surely is a NULL constant once simplified: a NULL literal, or one
 /// cast to a type that is no domain (a domain's coercion is not folded).
-fn is_null_const(snapshot: &PgCatalog, n: &protobuf::Node) -> bool {
-    match n.node.as_ref() {
-        Some(node::Node::AConst(c)) => c.isnull,
-        Some(node::Node::TypeCast(tc)) => {
-            tc.arg
-                .as_deref()
-                .is_some_and(|a| is_null_const(snapshot, a))
+fn is_null_const(snapshot: &PgCatalog, n: &Option<ast::Node>) -> bool {
+    match n.as_ref() {
+        Some(ast::Node::AConst(c)) => c.isnull,
+        Some(ast::Node::TypeCast(tc)) => {
+            tc.arg.is_some()
+                && is_null_const(snapshot, &tc.arg)
                 && tc
                     .type_name
                     .as_ref()
@@ -2657,7 +2660,7 @@ fn is_null_const(snapshot: &PgCatalog, n: &protobuf::Node) -> bool {
 /// operands are evaluated (an inlined body may reorder them).
 fn operator_evaluates(
     snapshot: &PgCatalog,
-    e: &protobuf::AExpr,
+    e: &ast::AExpr,
     code: Option<Option<crate::oid::PgProcOid>>,
     operand: usize,
     ordered: bool,
@@ -2684,7 +2687,7 @@ fn operator_evaluates(
     if let Some(code) = code {
         return evaluates(code);
     }
-    let Some(node::Node::String(name)) = e.name.last().and_then(|n| n.node.as_ref()) else {
+    let Some(ast::Node::String(name)) = e.name.last().and_then(|n| n.as_ref()) else {
         return false;
     };
     let prefix = e.lexpr.is_none();
@@ -2741,12 +2744,12 @@ struct Body<'a> {
 
 impl Body<'_> {
     /// The parameter `n` refers to: `$n`, or its name.
-    fn param(&self, n: &protobuf::Node) -> Option<usize> {
-        match n.node.as_ref()? {
-            node::Node::ParamRef(p) => usize::try_from(p.number).ok()?.checked_sub(1),
-            node::Node::ColumnRef(cr) => match cr.fields.as_slice() {
-                [f] => match f.node.as_ref()? {
-                    node::Node::String(s) => self
+    fn param(&self, n: &Option<ast::Node>) -> Option<usize> {
+        match n.as_ref()? {
+            ast::Node::ParamRef(p) => usize::try_from(p.number).ok()?.checked_sub(1),
+            ast::Node::ColumnRef(cr) => match cr.fields.as_slice() {
+                [f] => match f.as_ref()? {
+                    ast::Node::String(s) => self
                         .proc
                         .proargnames
                         .iter()
@@ -2763,7 +2766,7 @@ impl Body<'_> {
     /// The type `n` surely has, where it is simple enough to tell: a
     /// parameter's (a polymorphic one's is its argument's), a literal's,
     /// a cast's, an operator's result.
-    fn type_of(&self, n: &protobuf::Node) -> Option<PgTypeOid> {
+    fn type_of(&self, n: &Option<ast::Node>) -> Option<PgTypeOid> {
         if let Some(i) = self.param(n) {
             let declared = self.proc.proargtypes[i];
             return if crate::polymorphic::is_polymorphic(declared) {
@@ -2772,35 +2775,36 @@ impl Body<'_> {
                 Some(declared)
             };
         }
-        match n.node.as_ref()? {
-            node::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
-            node::Node::TypeCast(tc) => {
+        match n.as_ref()? {
+            ast::Node::AConst(c) => Some(expr::literals::infer_a_const(c).ok()?.type_oid),
+            ast::Node::TypeCast(tc) => {
                 crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)
             }
-            node::Node::AExpr(e) if e.kind() == protobuf::AExprKind::AexprOp => {
+            ast::Node::AExpr(e) if e.kind == ast::AExprKind::AexprOp => {
                 Some(self.operator(e)?.result_type_oid)
             }
-            node::Node::FuncCall(_) => range_const(self.snapshot, n).map(|(t, _)| t),
+            ast::Node::FuncCall(_) => range_const(self.snapshot, n).map(|(t, _)| t),
             _ => None,
         }
     }
 
     /// The range constant `n` surely is, by its shape: a parameter given
     /// one, or one written out (see [`range_const`]).
-    fn range(&self, n: &protobuf::Node) -> Option<RangeShape> {
+    fn range(&self, n: &Option<ast::Node>) -> Option<RangeShape> {
         match self.param(n) {
             Some(i) => self.args[i].range,
             None => range_const(self.snapshot, n).map(|(_, shape)| shape),
         }
     }
 
-    fn operator(&self, e: &protobuf::AExpr) -> Option<crate::lookup::ResolvedOperator> {
+    fn operator(&self, e: &ast::AExpr) -> Option<crate::lookup::ResolvedOperator> {
         let name = expr::extract_string_fields(&e.name).join(".");
-        let left = match e.lexpr.as_deref() {
-            Some(l) => Some(self.type_of(l)?),
+        let left = match e.lexpr.as_ref() {
+            Some(_) => Some(self.type_of(&e.lexpr)?),
             None => None,
         };
-        let right = self.type_of(e.rexpr.as_deref()?)?;
+        e.rexpr.as_ref()?;
+        let right = self.type_of(&e.rexpr)?;
         match self.snapshot.find_operator_detailed(&name, left, right) {
             crate::lookup::OperatorMatch::Found(op) => Some(op),
             _ => None,
@@ -2808,36 +2812,39 @@ impl Body<'_> {
     }
 
     /// The constant `n` surely is: a literal, or a parameter given one.
-    fn value(&self, n: &protobuf::Node) -> Option<Value> {
+    fn value(&self, n: &Option<ast::Node>) -> Option<Value> {
         match self.param(n) {
             Some(i) => self.args[i].value.clone(),
-            None => literal_value(n),
+            None => literal_value(n.as_ref()),
         }
     }
 
     /// What `n`, a condition, is folded to (see [`truth_with`]).
-    fn truth(&self, n: &protobuf::Node) -> Option<bool> {
+    fn truth(&self, n: &Option<ast::Node>) -> Option<bool> {
         truth_with(n, &|v| self.value(v))
     }
 
     /// `n` surely evaluates parameter `k` (the failing argument, no
     /// constant), and isn't folded away.
-    fn evaluates(&self, n: &protobuf::Node, k: usize) -> bool {
+    fn evaluates(&self, n: &Option<ast::Node>, k: usize) -> bool {
         if self.param(n) == Some(k) {
             return true;
         }
-        match n.node.as_ref() {
-            Some(node::Node::TypeCast(tc)) => {
-                tc.arg.as_deref().is_some_and(|a| self.evaluates(a, k))
+        match n.as_ref() {
+            Some(ast::Node::TypeCast(tc)) => {
+                tc.arg.is_some()
+                    && self.evaluates(&tc.arg, k)
                     && tc
                         .type_name
                         .as_ref()
                         .and_then(|t| crate::ddl::util::resolve_type_name(t, self.snapshot))
                         .is_some_and(|t| casts_evaluate_argument(self.snapshot, t))
             }
-            Some(node::Node::AExpr(e)) if e.kind() == protobuf::AExprKind::AexprOp => {
-                let operands: Vec<&protobuf::Node> =
-                    e.lexpr.iter().chain(&e.rexpr).map(|a| &**a).collect();
+            Some(ast::Node::AExpr(e)) if e.kind == ast::AExprKind::AexprOp => {
+                let operands: Vec<&Option<ast::Node>> = [&e.lexpr, &e.rexpr]
+                    .into_iter()
+                    .filter(|a| a.is_some())
+                    .collect();
                 let reading: Vec<bool> = operands.iter().map(|a| self.evaluates(a, k)).collect();
                 let Some(operand) = reading.iter().position(|&r| r) else {
                     return false;
@@ -2867,21 +2874,22 @@ impl Body<'_> {
             // A NullTest of no constant isn't folded; a DistinctExpr is
             // folded only when every argument is a constant (see
             // [`Level::a_expr_error`]).
-            Some(node::Node::NullTest(nt)) => {
-                nt.arg.as_deref().is_some_and(|a| self.evaluates(a, k))
-            }
-            Some(node::Node::AExpr(e))
+            Some(ast::Node::NullTest(nt)) => nt.arg.is_some() && self.evaluates(&nt.arg, k),
+            Some(ast::Node::AExpr(e))
                 if matches!(
-                    e.kind(),
-                    protobuf::AExprKind::AexprDistinct | protobuf::AExprKind::AexprNotDistinct
+                    e.kind,
+                    ast::AExprKind::AexprDistinct | ast::AExprKind::AexprNotDistinct
                 ) =>
             {
-                e.lexpr.iter().chain(&e.rexpr).any(|a| self.evaluates(a, k))
+                [&e.lexpr, &e.rexpr]
+                    .into_iter()
+                    .filter(|a| a.is_some())
+                    .any(|a| self.evaluates(a, k))
             }
             // COALESCE drops its NULL constant arguments, and keeps the
             // first other one, no constant, first (a non-NULL constant
             // first is its value).
-            Some(node::Node::CoalesceExpr(c)) => c
+            Some(ast::Node::CoalesceExpr(c)) => c
                 .args
                 .iter()
                 .find(|a| !self.null_const(a))
@@ -2892,10 +2900,10 @@ impl Body<'_> {
             // to the deciding one, and stops at the first one deciding
             // it: each one left must evaluate the parameter (no constant
             // then). A NOT evaluates its argument.
-            Some(node::Node::BoolExpr(b)) => {
-                let deciding = match protobuf::BoolExprType::try_from(b.boolop) {
-                    Ok(protobuf::BoolExprType::AndExpr) => false,
-                    Ok(protobuf::BoolExprType::OrExpr) => true,
+            Some(ast::Node::BoolExpr(b)) => {
+                let deciding = match b.boolop {
+                    ast::BoolExprType::AndExpr => false,
+                    ast::BoolExprType::OrExpr => true,
                     _ => return b.args.len() == 1 && self.evaluates(&b.args[0], k),
                 };
                 let mut left = Vec::new();
@@ -2913,23 +2921,24 @@ impl Body<'_> {
             // and stops at one folded to true, its result then the
             // CASE's; it evaluates the first WHEN left first
             // (eval_const_expressions' CaseExpr).
-            Some(node::Node::CaseExpr(c)) if c.arg.is_none() => {
+            Some(ast::Node::CaseExpr(c)) if c.arg.is_none() => {
                 for w in &c.args {
-                    let Some(node::Node::CaseWhen(w)) = w.node.as_ref() else {
+                    let Some(ast::Node::CaseWhen(w)) = w.as_ref() else {
                         return false;
                     };
-                    let Some(cond) = w.expr.as_deref() else {
+                    if w.expr.is_none() {
                         return false;
-                    };
+                    }
+                    let cond = &w.expr;
                     match self.truth(cond) {
                         Some(true) => {
-                            return w.result.as_deref().is_some_and(|r| self.evaluates(r, k));
+                            return w.result.is_some() && self.evaluates(&w.result, k);
                         }
                         Some(false) => continue,
                         None => return self.evaluates(cond, k),
                     }
                 }
-                c.defresult.as_deref().is_some_and(|d| self.evaluates(d, k))
+                c.defresult.is_some() && self.evaluates(&c.defresult, k)
             }
             _ => false,
         }
@@ -2937,7 +2946,7 @@ impl Body<'_> {
 
     /// `n` surely is a NULL constant once simplified: a parameter given
     /// one, or a NULL literal (maybe cast).
-    fn null_const(&self, n: &protobuf::Node) -> bool {
+    fn null_const(&self, n: &Option<ast::Node>) -> bool {
         match self.param(n) {
             Some(i) => self.args[i].null,
             None => is_null_const(self.snapshot, n),
@@ -2946,14 +2955,15 @@ impl Body<'_> {
 
     /// `n` surely is no NULL constant once simplified: a parameter given
     /// none, a non-NULL literal, a built-in cast of such.
-    fn not_null_const(&self, n: &protobuf::Node) -> bool {
+    fn not_null_const(&self, n: &Option<ast::Node>) -> bool {
         if let Some(i) = self.param(n) {
             return self.args[i].not_null;
         }
-        match n.node.as_ref() {
-            Some(node::Node::AConst(c)) => !c.isnull,
-            Some(node::Node::TypeCast(tc)) => {
-                tc.arg.as_deref().is_some_and(|a| self.not_null_const(a))
+        match n.as_ref() {
+            Some(ast::Node::AConst(c)) => !c.isnull,
+            Some(ast::Node::TypeCast(tc)) => {
+                tc.arg.is_some()
+                    && self.not_null_const(&tc.arg)
                     && tc
                         .type_name
                         .as_ref()
@@ -2969,12 +2979,12 @@ impl Body<'_> {
 /// tells the constants of (a literal each, where known): comparisons of
 /// constants (see [`truth_with`]).
 pub(super) fn qual_truth<'a>(
-    qual: &protobuf::Node,
-    column: &dyn Fn(&protobuf::ColumnRef) -> Option<&'a protobuf::Node>,
+    qual: &Option<ast::Node>,
+    column: &dyn Fn(&ast::ColumnRef) -> Option<&'a ast::Node>,
 ) -> Option<bool> {
-    truth_with(qual, &|n| match n.node.as_ref()? {
-        node::Node::ColumnRef(cr) => literal_value(column(cr)?),
-        _ => literal_value(n),
+    truth_with(qual, &|n| match n.as_ref()? {
+        ast::Node::ColumnRef(cr) => literal_value(Some(column(cr)?)),
+        _ => literal_value(n.as_ref()),
     })
 }
 
@@ -2989,41 +2999,38 @@ enum EqConst {
 /// The constant `n` is, compared with a column — of an integer or numeric
 /// type where `numeric`: a literal, or a number (a literal one, or one
 /// cast to such a type, maybe a string).
-fn eq_const(n: &protobuf::Node, numeric: bool, snapshot: &PgCatalog) -> Option<EqConst> {
+fn eq_const(n: &Option<ast::Node>, numeric: bool, snapshot: &PgCatalog) -> Option<EqConst> {
     // Equal numbers are one value of whatever type they are read as, a
     // string only of a numeric one.
     let string = matches!(
-        n.node.as_ref(),
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(protobuf::a_const::Val::Sval(_)),
-            ..
-        }))
+        n.as_ref(),
+        Some(ast::Node::AConst(c)) if matches!(c.val, Some(ast::AConstValue::String(_)))
     );
     if (numeric || !string)
         && let Some(number) = number_const(n, snapshot)
     {
         return Some(EqConst::Number(number));
     }
-    literal_value(n).map(EqConst::Literal)
+    literal_value(n.as_ref()).map(EqConst::Literal)
 }
 
 /// The canonical decimal form of the number `n` surely is.
-fn number_const(n: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
-    match n.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            protobuf::a_const::Val::Ival(i) => Some(i.ival.to_string()),
-            protobuf::a_const::Val::Fval(f) => canonical_decimal(&f.fval),
-            protobuf::a_const::Val::Sval(s) => canonical_decimal(&s.sval),
+fn number_const(n: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
+    match n.as_ref()? {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(i.ival.to_string()),
+            ast::AConstValue::Float(f) => canonical_decimal(&f.fval),
+            ast::AConstValue::String(s) => canonical_decimal(&s.sval),
             _ => None,
         },
-        node::Node::TypeCast(tc) => {
+        ast::Node::TypeCast(tc) => {
             let t = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
             if ![oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t)
                 || tc.type_name.as_ref().is_some_and(|t| !t.typmods.is_empty())
             {
                 return None;
             }
-            number_const(tc.arg.as_deref()?, snapshot)
+            number_const(&tc.arg, snapshot)
         }
         _ => None,
     }
@@ -3060,12 +3067,12 @@ fn canonical_decimal(s: &str) -> Option<String> {
 }
 
 /// The constant the literal `n` is.
-fn literal_value(n: &protobuf::Node) -> Option<Value> {
-    match n.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            protobuf::a_const::Val::Ival(i) => Some(Value::Int(i64::from(i.ival))),
-            protobuf::a_const::Val::Sval(s) => Some(Value::Str(s.sval.clone())),
-            protobuf::a_const::Val::Boolval(b) => Some(Value::Bool(b.boolval)),
+fn literal_value(n: Option<&ast::Node>) -> Option<Value> {
+    match n? {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(Value::Int(i64::from(i.ival))),
+            ast::AConstValue::String(s) => Some(Value::Str(s.sval.clone())),
+            ast::AConstValue::Boolean(b) => Some(Value::Bool(b.boolval)),
             _ => None,
         },
         _ => None,
@@ -3076,18 +3083,18 @@ fn literal_value(n: &protobuf::Node) -> Option<Value> {
 /// told by `value`: comparisons of constants, which the planner folds
 /// (and which evaluate so at run time).
 fn truth_with(
-    n: &protobuf::Node,
-    value: &dyn Fn(&protobuf::Node) -> Option<Value>,
+    n: &Option<ast::Node>,
+    value: &dyn Fn(&Option<ast::Node>) -> Option<Value>,
 ) -> Option<bool> {
-    use protobuf::BoolExprType as B;
-    match n.node.as_ref()? {
-        node::Node::AConst(_) => match value(n)? {
+    use ast::BoolExprType as B;
+    match n.as_ref()? {
+        ast::Node::AConst(_) => match value(n)? {
             Value::Bool(b) => Some(b),
             _ => None,
         },
-        node::Node::BoolExpr(b) => {
+        ast::Node::BoolExpr(b) => {
             let args: Vec<Option<bool>> = b.args.iter().map(|a| truth_with(a, value)).collect();
-            match B::try_from(b.boolop).ok()? {
+            match b.boolop {
                 B::AndExpr if args.contains(&Some(false)) => Some(false),
                 B::AndExpr => args.iter().all(|a| *a == Some(true)).then_some(true),
                 B::OrExpr if args.contains(&Some(true)) => Some(true),
@@ -3096,26 +3103,30 @@ fn truth_with(
                     [Some(a)] => Some(!a),
                     _ => None,
                 },
-                B::Undefined => None,
             }
         }
-        node::Node::NullTest(nt) => {
-            value(nt.arg.as_deref()?)?;
-            Some(nt.nulltesttype == protobuf::NullTestType::IsNotNull as i32)
+        ast::Node::NullTest(nt) => {
+            nt.arg.as_ref()?;
+            value(&nt.arg)?;
+            Some(nt.nulltesttype == ast::NullTestType::IsNotNull)
         }
-        node::Node::AExpr(e) => {
+        ast::Node::AExpr(e) => {
             let name = match e.name.as_slice() {
-                [n] => match n.node.as_ref()? {
-                    node::Node::String(s) => s.sval.as_str(),
+                [n] => match n.as_ref()? {
+                    ast::Node::String(s) => s.sval.as_str(),
                     _ => return None,
                 },
                 _ => return None,
             };
-            let l = value(e.lexpr.as_deref()?)?;
-            match e.kind() {
-                protobuf::AExprKind::AexprOp => compare(name, &l, &value(e.rexpr.as_deref()?)?),
-                protobuf::AExprKind::AexprIn => {
-                    let Some(node::Node::List(list)) = e.rexpr.as_deref()?.node.as_ref() else {
+            e.lexpr.as_ref()?;
+            let l = value(&e.lexpr)?;
+            match e.kind {
+                ast::AExprKind::AexprOp => {
+                    e.rexpr.as_ref()?;
+                    compare(name, &l, &value(&e.rexpr)?)
+                }
+                ast::AExprKind::AexprIn => {
+                    let Some(ast::Node::List(list)) = e.rexpr.as_ref() else {
                         return None;
                     };
                     let eq: Vec<Option<bool>> = list
@@ -3144,14 +3155,15 @@ fn truth_with(
 
 /// The operator expression `l <op> r`, as the parser builds out of a
 /// BETWEEN or an IN.
-fn comparison(op: &str, l: &protobuf::Node, r: &protobuf::Node) -> protobuf::AExpr {
-    protobuf::AExpr {
-        kind: protobuf::AExprKind::AexprOp as i32,
-        name: vec![protobuf::Node {
-            node: Some(node::Node::String(protobuf::String { sval: op.into() })),
-        }],
-        lexpr: Some(Box::new(l.clone())),
-        rexpr: Some(Box::new(r.clone())),
+fn comparison(op: &str, l: &Option<ast::Node>, r: &Option<ast::Node>) -> ast::AExpr {
+    ast::AExpr {
+        kind: ast::AExprKind::AexprOp,
+        name: vec![Some(ast::Node::String(NodeBox::new(ast::String {
+            sval: op.into(),
+        })))],
+        lexpr: l.clone(),
+        rexpr: r.clone(),
+
         ..Default::default()
     }
 }
@@ -3205,11 +3217,11 @@ enum Read {
 }
 
 impl SourceRows {
-    fn read(&self, cr: &protobuf::ColumnRef) -> Read {
-        let star = |n: &protobuf::Node| matches!(n.node, Some(node::Node::AStar(_)));
-        fn name(n: &protobuf::Node) -> Option<&str> {
-            match n.node.as_ref() {
-                Some(node::Node::String(s)) => Some(s.sval.as_str()),
+    fn read(&self, cr: &ast::ColumnRef) -> Read {
+        let star = |n: &Option<ast::Node>| matches!(n, Some(ast::Node::AStar(_)));
+        fn name(n: &Option<ast::Node>) -> Option<&str> {
+            match n.as_ref() {
+                Some(ast::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             }
         }
@@ -3233,15 +3245,15 @@ impl SourceRows {
 /// The FROM item `item` as [`SourceRows`]: a view, a CTE or a subquery
 /// whose query's rows are surely evaluated.
 fn from_item_rows(
-    item: &protobuf::Node,
+    item: &Option<ast::Node>,
     snapshot: &PgCatalog,
-    ctes: &[&protobuf::CommonTableExpr],
+    ctes: &[&ast::CommonTableExpr],
     depth: usize,
     stored: bool,
 ) -> Option<SourceRows> {
-    let select = |n: &protobuf::Node| -> Option<protobuf::SelectStmt> {
-        match n.node.as_ref() {
-            Some(node::Node::SelectStmt(s)) => Some((**s).clone()),
+    let select = |n: Option<&ast::Node>| -> Option<ast::SelectStmt> {
+        match n {
+            Some(ast::Node::SelectStmt(s)) => Some((**s).clone()),
             _ => None,
         }
     };
@@ -3250,11 +3262,11 @@ fn from_item_rows(
         _,
         _,
         _,
-        &[&protobuf::CommonTableExpr],
+        &[&ast::CommonTableExpr],
         _,
         _,
-    ) = match item.node.as_ref()? {
-        node::Node::RangeVar(rv) => {
+    ) = match item.as_ref()? {
+        ast::Node::RangeVar(rv) => {
             let cte = rv
                 .schemaname
                 .is_empty()
@@ -3262,7 +3274,7 @@ fn from_item_rows(
                 .flatten();
             if let Some(i) = cte {
                 let cte = ctes[i];
-                let query = select(cte.ctequery.as_deref()?)?;
+                let query = select(cte.ctequery.as_ref())?;
                 let names = string_names(&cte.aliascolnames);
                 // A CTE sees the ones listed before it.
                 (
@@ -3282,7 +3294,7 @@ fn from_item_rows(
                 // The view's query as it was bound (its names may have
                 // come to mean other objects since).
                 crate::ddl::views::reanalyze_view(snapshot, class.oid)?;
-                let query = select(&crate::ddl::views::view_query(snapshot, class.oid)?)?;
+                let query = select(Some(&crate::ddl::views::view_query(snapshot, class.oid)?))?;
                 let names = snapshot
                     .attributes_of(class.oid)
                     .iter()
@@ -3299,8 +3311,8 @@ fn from_item_rows(
                 )
             }
         }
-        node::Node::RangeSubselect(rs) => {
-            let query = select(rs.subquery.as_deref()?)?;
+        ast::Node::RangeSubselect(rs) => {
+            let query = select(rs.subquery.as_ref())?;
             // Without an alias, it can't be referred to by name.
             (
                 String::new(),
@@ -3315,8 +3327,8 @@ fn from_item_rows(
     };
     // A subquery doesn't see the CTEs of the query it is in only when it
     // is a view's; the others do.
-    let inner_ctes: Vec<&protobuf::CommonTableExpr> =
-        if matches!(item.node, Some(node::Node::RangeSubselect(_))) {
+    let inner_ctes: Vec<&ast::CommonTableExpr> =
+        if matches!(item, Some(ast::Node::RangeSubselect(_))) {
             ctes.to_vec()
         } else {
             inner_ctes.to_vec()
@@ -3331,11 +3343,11 @@ fn from_item_rows(
     // Only a subquery in FROM is surely planned as one a qualification is
     // pushed down into (a view may be a security barrier, a CTE
     // materialized).
-    if !matches!(item.node, Some(node::Node::RangeSubselect(_))) {
+    if !matches!(item, Some(ast::Node::RangeSubselect(_))) {
         rows.leaves = None;
     }
     // A CTE read more than once is materialized: its columns are Vars.
-    if !matches!(item.node, Some(node::Node::RangeSubselect(_))) && view.is_none() {
+    if !matches!(item, Some(ast::Node::RangeSubselect(_))) && view.is_none() {
         rows.var_free = false;
     }
     // A view's columns have the types it was created with.
@@ -3357,13 +3369,14 @@ fn from_item_rows(
         names = named
             .target_list
             .iter()
-            .map(|t| match t.node.as_ref() {
-                Some(node::Node::ResTarget(rt)) if !rt.name.is_empty() => rt.name.clone(),
-                Some(node::Node::ResTarget(rt)) => rt
+            .map(|t| match t.as_ref() {
+                Some(ast::Node::ResTarget(rt)) if !rt.name.is_empty() => rt.name.clone(),
+                Some(ast::Node::ResTarget(rt)) => rt
                     .val
-                    .as_deref()
-                    .and_then(super::target_list::infer_column_name)
+                    .as_ref()
+                    .and_then(|_| super::target_list::infer_column_name(&rt.val))
                     .unwrap_or_else(|| "?column?".to_owned()),
+
                 _ => String::new(),
             })
             .collect();
@@ -3388,11 +3401,11 @@ fn from_item_rows(
     Some(SourceRows { name, names, rows })
 }
 
-fn string_names(nodes: &[protobuf::Node]) -> Vec<String> {
+fn string_names(nodes: &[Option<ast::Node>]) -> Vec<String> {
     nodes
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.clone()),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.clone()),
             _ => None,
         })
         .collect()

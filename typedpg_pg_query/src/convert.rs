@@ -3,31 +3,31 @@
 
 //! Conversion of PostgreSQL's C raw parse tree into the AST types.
 //!
-//! Generated together with `protobuf.rs`; it assumes `mod bindings` and
-//! `mod protobuf` are siblings, as the crate arranges them.
+//! Generated together with `ast.rs`; it assumes `mod bindings` and
+//! `mod ast` are siblings, as the crate arranges them.
 
 #![allow(clippy::all, dead_code, unused_variables)]
 
+use crate::NodeBox;
+use crate::ast;
 use crate::bindings;
-use crate::protobuf;
 
-/// The deepest message nesting the AST can carry, libpg_query's
-/// `PG_QUERY_PROTOBUF_MAX_DEPTH`: deeper trees could not be encoded to
-/// protobuf (nor decoded back) by the engine this replaces, so they are
-/// refused here too.
+/// The deepest nesting the AST carries, libpg_query's limit (its
+/// `PG_QUERY_PROTOBUF_MAX_DEPTH`): deeper trees are refused, as they were
+/// by the engine this replaces.
 const MAX_DEPTH: usize = 10_000;
 
 thread_local! {
-    /// The message nesting of the conversion in progress. Every `Node`
-    /// wrapper and every message counts one level, as a protobuf encoder
-    /// counts them.
+    /// The nesting of the conversion in progress. Every abstract `Node`
+    /// and every node struct counts one level, as libpg_query counted
+    /// them.
     static DEPTH: ::core::cell::Cell<usize> = const { ::core::cell::Cell::new(0) };
     /// Whether [`MAX_DEPTH`] was passed; the conversion then finishes with
     /// default values and the caller turns this into an error.
     static TOO_DEEP: ::core::cell::Cell<bool> = const { ::core::cell::Cell::new(false) };
 }
 
-/// Counts one message level for its lifetime.
+/// Counts one level for its lifetime.
 struct DepthGuard(());
 
 impl DepthGuard {
@@ -60,7 +60,7 @@ pub(crate) fn too_deep() -> bool {
     TOO_DEEP.with(|flag| flag.get())
 }
 
-/// Run one message's conversion on enough stack: the recursion is as deep as
+/// Run one node's conversion on enough stack: the recursion is as deep as
 /// the tree (up to [`MAX_DEPTH`] levels), so the stack grows in segments as it
 /// goes instead of being reserved up front.
 #[inline(always)]
@@ -118,14 +118,15 @@ unsafe fn bitmapset_members(p: *mut bindings::Bitmapset) -> ::std::vec::Vec<u64>
 }
 
 /// The cells of a `List *` as `Node`s, as `WRITE_LIST_FIELD` /
-/// `_outList` do. NULL and the empty list are empty.
+/// `_outList` do: a NULL cell (or one of an unknown tag) is `None`. NULL
+/// and the empty list are empty.
 ///
 /// A `T_IntList`/`T_OidList` cell holds an integer, not a pointer; it becomes
 /// an `Integer` node, which is how the AST can represent it.
 ///
 /// # Safety
 /// `list` must be NULL or point to a valid `List`.
-unsafe fn list_items(list: *mut bindings::List) -> ::std::vec::Vec<protobuf::Node> {
+unsafe fn list_items(list: *mut bindings::List) -> ::std::vec::Vec<Option<ast::Node>> {
     let mut out = ::std::vec::Vec::new();
     if list.is_null() {
         return out;
@@ -136,17 +137,15 @@ unsafe fn list_items(list: *mut bindings::List) -> ::std::vec::Vec<protobuf::Nod
     for index in 0..length {
         let cell = unsafe { &*list.elements.add(index) };
         let node = match list.type_ {
-            bindings::NodeTag_T_IntList => Some(protobuf::node::Node::Integer(protobuf::Integer {
+            bindings::NodeTag_T_IntList => Some(ast::Node::Integer(NodeBox::new(ast::Integer {
                 ival: unsafe { cell.int_value },
-            })),
-            bindings::NodeTag_T_OidList => Some(protobuf::node::Node::Integer(protobuf::Integer {
+            }))),
+            bindings::NodeTag_T_OidList => Some(ast::Node::Integer(NodeBox::new(ast::Integer {
                 ival: unsafe { cell.oid_value } as i32,
-            })),
+            }))),
             _ => unsafe { node(cell.ptr_value as *const bindings::Node) },
         };
-        // `_outNode` still appends the (empty) `Node` message for a NULL or
-        // unrecognized cell; only the oneof stays unset.
-        out.push(protobuf::Node { node });
+        out.push(node);
     }
     out
 }
@@ -154,12 +153,11 @@ unsafe fn list_items(list: *mut bindings::List) -> ::std::vec::Vec<protobuf::Nod
 /// Convert one C node, by its `NodeTag`; NULL is `None`.
 ///
 /// An unrecognized tag also returns `None` (libpg_query's C backend
-/// logs a warning and leaves the field unset; the caller turns this
-/// into an error).
+/// logs a warning and leaves the field unset).
 ///
 /// # Safety
 /// `p` must be NULL or point to a live node.
-pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<protobuf::node::Node> {
+pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<ast::Node> {
     if too_deep() {
         return None;
     }
@@ -170,1160 +168,956 @@ pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<protobuf::node::No
     let tag = unsafe { (*p).type_ };
     Some(match tag {
         bindings::NodeTag_T_Alias => {
-            protobuf::node::Node::Alias(unsafe { alias(p as *const bindings::Alias) })
+            ast::Node::Alias(NodeBox::new(unsafe { alias(p as *const bindings::Alias) }))
         }
-        bindings::NodeTag_T_RangeVar => {
-            protobuf::node::Node::RangeVar(unsafe { range_var(p as *const bindings::RangeVar) })
-        }
-        bindings::NodeTag_T_TableFunc => {
-            protobuf::node::Node::TableFunc(::std::boxed::Box::new(unsafe {
-                table_func(p as *const bindings::TableFunc)
-            }))
-        }
-        bindings::NodeTag_T_IntoClause => {
-            protobuf::node::Node::IntoClause(::std::boxed::Box::new(unsafe {
-                into_clause(p as *const bindings::IntoClause)
-            }))
-        }
-        bindings::NodeTag_T_Var => protobuf::node::Node::Var(::std::boxed::Box::new(unsafe {
-            var(p as *const bindings::Var)
+        bindings::NodeTag_T_RangeVar => ast::Node::RangeVar(NodeBox::new(unsafe {
+            range_var(p as *const bindings::RangeVar)
         })),
-        bindings::NodeTag_T_Param => protobuf::node::Node::Param(::std::boxed::Box::new(unsafe {
-            param(p as *const bindings::Param)
+        bindings::NodeTag_T_TableFunc => ast::Node::TableFunc(NodeBox::new(unsafe {
+            table_func(p as *const bindings::TableFunc)
         })),
-        bindings::NodeTag_T_Aggref => {
-            protobuf::node::Node::Aggref(::std::boxed::Box::new(unsafe {
-                aggref(p as *const bindings::Aggref)
-            }))
+        bindings::NodeTag_T_IntoClause => ast::Node::IntoClause(NodeBox::new(unsafe {
+            into_clause(p as *const bindings::IntoClause)
+        })),
+        bindings::NodeTag_T_Var => {
+            ast::Node::Var(NodeBox::new(unsafe { var(p as *const bindings::Var) }))
         }
-        bindings::NodeTag_T_GroupingFunc => {
-            protobuf::node::Node::GroupingFunc(::std::boxed::Box::new(unsafe {
-                grouping_func(p as *const bindings::GroupingFunc)
-            }))
+        bindings::NodeTag_T_Param => {
+            ast::Node::Param(NodeBox::new(unsafe { param(p as *const bindings::Param) }))
         }
-        bindings::NodeTag_T_WindowFunc => {
-            protobuf::node::Node::WindowFunc(::std::boxed::Box::new(unsafe {
-                window_func(p as *const bindings::WindowFunc)
-            }))
-        }
+        bindings::NodeTag_T_Aggref => ast::Node::Aggref(NodeBox::new(unsafe {
+            aggref(p as *const bindings::Aggref)
+        })),
+        bindings::NodeTag_T_GroupingFunc => ast::Node::GroupingFunc(NodeBox::new(unsafe {
+            grouping_func(p as *const bindings::GroupingFunc)
+        })),
+        bindings::NodeTag_T_WindowFunc => ast::Node::WindowFunc(NodeBox::new(unsafe {
+            window_func(p as *const bindings::WindowFunc)
+        })),
         bindings::NodeTag_T_WindowFuncRunCondition => {
-            protobuf::node::Node::WindowFuncRunCondition(::std::boxed::Box::new(unsafe {
+            ast::Node::WindowFuncRunCondition(NodeBox::new(unsafe {
                 window_func_run_condition(p as *const bindings::WindowFuncRunCondition)
             }))
         }
-        bindings::NodeTag_T_MergeSupportFunc => {
-            protobuf::node::Node::MergeSupportFunc(::std::boxed::Box::new(unsafe {
-                merge_support_func(p as *const bindings::MergeSupportFunc)
-            }))
-        }
-        bindings::NodeTag_T_SubscriptingRef => {
-            protobuf::node::Node::SubscriptingRef(::std::boxed::Box::new(unsafe {
-                subscripting_ref(p as *const bindings::SubscriptingRef)
-            }))
-        }
-        bindings::NodeTag_T_FuncExpr => {
-            protobuf::node::Node::FuncExpr(::std::boxed::Box::new(unsafe {
-                func_expr(p as *const bindings::FuncExpr)
-            }))
-        }
-        bindings::NodeTag_T_NamedArgExpr => {
-            protobuf::node::Node::NamedArgExpr(::std::boxed::Box::new(unsafe {
-                named_arg_expr(p as *const bindings::NamedArgExpr)
-            }))
-        }
-        bindings::NodeTag_T_OpExpr => {
-            protobuf::node::Node::OpExpr(::std::boxed::Box::new(unsafe {
-                op_expr(p as *const bindings::OpExpr)
-            }))
-        }
-        bindings::NodeTag_T_DistinctExpr => {
-            protobuf::node::Node::DistinctExpr(::std::boxed::Box::new(unsafe {
-                distinct_expr(p as *const bindings::DistinctExpr)
-            }))
-        }
-        bindings::NodeTag_T_NullIfExpr => {
-            protobuf::node::Node::NullIfExpr(::std::boxed::Box::new(unsafe {
-                null_if_expr(p as *const bindings::NullIfExpr)
-            }))
-        }
+        bindings::NodeTag_T_MergeSupportFunc => ast::Node::MergeSupportFunc(NodeBox::new(unsafe {
+            merge_support_func(p as *const bindings::MergeSupportFunc)
+        })),
+        bindings::NodeTag_T_SubscriptingRef => ast::Node::SubscriptingRef(NodeBox::new(unsafe {
+            subscripting_ref(p as *const bindings::SubscriptingRef)
+        })),
+        bindings::NodeTag_T_FuncExpr => ast::Node::FuncExpr(NodeBox::new(unsafe {
+            func_expr(p as *const bindings::FuncExpr)
+        })),
+        bindings::NodeTag_T_NamedArgExpr => ast::Node::NamedArgExpr(NodeBox::new(unsafe {
+            named_arg_expr(p as *const bindings::NamedArgExpr)
+        })),
+        bindings::NodeTag_T_OpExpr => ast::Node::OpExpr(NodeBox::new(unsafe {
+            op_expr(p as *const bindings::OpExpr)
+        })),
+        bindings::NodeTag_T_DistinctExpr => ast::Node::DistinctExpr(NodeBox::new(unsafe {
+            distinct_expr(p as *const bindings::DistinctExpr)
+        })),
+        bindings::NodeTag_T_NullIfExpr => ast::Node::NullIfExpr(NodeBox::new(unsafe {
+            null_if_expr(p as *const bindings::NullIfExpr)
+        })),
         bindings::NodeTag_T_ScalarArrayOpExpr => {
-            protobuf::node::Node::ScalarArrayOpExpr(::std::boxed::Box::new(unsafe {
+            ast::Node::ScalarArrayOpExpr(NodeBox::new(unsafe {
                 scalar_array_op_expr(p as *const bindings::ScalarArrayOpExpr)
             }))
         }
-        bindings::NodeTag_T_BoolExpr => {
-            protobuf::node::Node::BoolExpr(::std::boxed::Box::new(unsafe {
-                bool_expr(p as *const bindings::BoolExpr)
-            }))
-        }
-        bindings::NodeTag_T_SubLink => {
-            protobuf::node::Node::SubLink(::std::boxed::Box::new(unsafe {
-                sub_link(p as *const bindings::SubLink)
-            }))
-        }
-        bindings::NodeTag_T_SubPlan => {
-            protobuf::node::Node::SubPlan(::std::boxed::Box::new(unsafe {
-                sub_plan(p as *const bindings::SubPlan)
-            }))
-        }
+        bindings::NodeTag_T_BoolExpr => ast::Node::BoolExpr(NodeBox::new(unsafe {
+            bool_expr(p as *const bindings::BoolExpr)
+        })),
+        bindings::NodeTag_T_SubLink => ast::Node::SubLink(NodeBox::new(unsafe {
+            sub_link(p as *const bindings::SubLink)
+        })),
+        bindings::NodeTag_T_SubPlan => ast::Node::SubPlan(NodeBox::new(unsafe {
+            sub_plan(p as *const bindings::SubPlan)
+        })),
         bindings::NodeTag_T_AlternativeSubPlan => {
-            protobuf::node::Node::AlternativeSubPlan(::std::boxed::Box::new(unsafe {
+            ast::Node::AlternativeSubPlan(NodeBox::new(unsafe {
                 alternative_sub_plan(p as *const bindings::AlternativeSubPlan)
             }))
         }
-        bindings::NodeTag_T_FieldSelect => {
-            protobuf::node::Node::FieldSelect(::std::boxed::Box::new(unsafe {
-                field_select(p as *const bindings::FieldSelect)
-            }))
-        }
-        bindings::NodeTag_T_FieldStore => {
-            protobuf::node::Node::FieldStore(::std::boxed::Box::new(unsafe {
-                field_store(p as *const bindings::FieldStore)
-            }))
-        }
-        bindings::NodeTag_T_RelabelType => {
-            protobuf::node::Node::RelabelType(::std::boxed::Box::new(unsafe {
-                relabel_type(p as *const bindings::RelabelType)
-            }))
-        }
-        bindings::NodeTag_T_CoerceViaIO => {
-            protobuf::node::Node::CoerceViaIo(::std::boxed::Box::new(unsafe {
-                coerce_via_io(p as *const bindings::CoerceViaIO)
-            }))
-        }
-        bindings::NodeTag_T_ArrayCoerceExpr => {
-            protobuf::node::Node::ArrayCoerceExpr(::std::boxed::Box::new(unsafe {
-                array_coerce_expr(p as *const bindings::ArrayCoerceExpr)
-            }))
-        }
+        bindings::NodeTag_T_FieldSelect => ast::Node::FieldSelect(NodeBox::new(unsafe {
+            field_select(p as *const bindings::FieldSelect)
+        })),
+        bindings::NodeTag_T_FieldStore => ast::Node::FieldStore(NodeBox::new(unsafe {
+            field_store(p as *const bindings::FieldStore)
+        })),
+        bindings::NodeTag_T_RelabelType => ast::Node::RelabelType(NodeBox::new(unsafe {
+            relabel_type(p as *const bindings::RelabelType)
+        })),
+        bindings::NodeTag_T_CoerceViaIO => ast::Node::CoerceViaIo(NodeBox::new(unsafe {
+            coerce_via_io(p as *const bindings::CoerceViaIO)
+        })),
+        bindings::NodeTag_T_ArrayCoerceExpr => ast::Node::ArrayCoerceExpr(NodeBox::new(unsafe {
+            array_coerce_expr(p as *const bindings::ArrayCoerceExpr)
+        })),
         bindings::NodeTag_T_ConvertRowtypeExpr => {
-            protobuf::node::Node::ConvertRowtypeExpr(::std::boxed::Box::new(unsafe {
+            ast::Node::ConvertRowtypeExpr(NodeBox::new(unsafe {
                 convert_rowtype_expr(p as *const bindings::ConvertRowtypeExpr)
             }))
         }
-        bindings::NodeTag_T_CollateExpr => {
-            protobuf::node::Node::CollateExpr(::std::boxed::Box::new(unsafe {
-                collate_expr(p as *const bindings::CollateExpr)
-            }))
-        }
-        bindings::NodeTag_T_CaseExpr => {
-            protobuf::node::Node::CaseExpr(::std::boxed::Box::new(unsafe {
-                case_expr(p as *const bindings::CaseExpr)
-            }))
-        }
-        bindings::NodeTag_T_CaseWhen => {
-            protobuf::node::Node::CaseWhen(::std::boxed::Box::new(unsafe {
-                case_when(p as *const bindings::CaseWhen)
-            }))
-        }
-        bindings::NodeTag_T_CaseTestExpr => {
-            protobuf::node::Node::CaseTestExpr(::std::boxed::Box::new(unsafe {
-                case_test_expr(p as *const bindings::CaseTestExpr)
-            }))
-        }
-        bindings::NodeTag_T_ArrayExpr => {
-            protobuf::node::Node::ArrayExpr(::std::boxed::Box::new(unsafe {
-                array_expr(p as *const bindings::ArrayExpr)
-            }))
-        }
-        bindings::NodeTag_T_RowExpr => {
-            protobuf::node::Node::RowExpr(::std::boxed::Box::new(unsafe {
-                row_expr(p as *const bindings::RowExpr)
-            }))
-        }
-        bindings::NodeTag_T_RowCompareExpr => {
-            protobuf::node::Node::RowCompareExpr(::std::boxed::Box::new(unsafe {
-                row_compare_expr(p as *const bindings::RowCompareExpr)
-            }))
-        }
-        bindings::NodeTag_T_CoalesceExpr => {
-            protobuf::node::Node::CoalesceExpr(::std::boxed::Box::new(unsafe {
-                coalesce_expr(p as *const bindings::CoalesceExpr)
-            }))
-        }
-        bindings::NodeTag_T_MinMaxExpr => {
-            protobuf::node::Node::MinMaxExpr(::std::boxed::Box::new(unsafe {
-                min_max_expr(p as *const bindings::MinMaxExpr)
-            }))
-        }
-        bindings::NodeTag_T_SQLValueFunction => {
-            protobuf::node::Node::SqlvalueFunction(::std::boxed::Box::new(unsafe {
-                sql_value_function(p as *const bindings::SQLValueFunction)
-            }))
-        }
-        bindings::NodeTag_T_XmlExpr => {
-            protobuf::node::Node::XmlExpr(::std::boxed::Box::new(unsafe {
-                xml_expr(p as *const bindings::XmlExpr)
-            }))
-        }
-        bindings::NodeTag_T_JsonFormat => protobuf::node::Node::JsonFormat(unsafe {
+        bindings::NodeTag_T_CollateExpr => ast::Node::CollateExpr(NodeBox::new(unsafe {
+            collate_expr(p as *const bindings::CollateExpr)
+        })),
+        bindings::NodeTag_T_CaseExpr => ast::Node::CaseExpr(NodeBox::new(unsafe {
+            case_expr(p as *const bindings::CaseExpr)
+        })),
+        bindings::NodeTag_T_CaseWhen => ast::Node::CaseWhen(NodeBox::new(unsafe {
+            case_when(p as *const bindings::CaseWhen)
+        })),
+        bindings::NodeTag_T_CaseTestExpr => ast::Node::CaseTestExpr(NodeBox::new(unsafe {
+            case_test_expr(p as *const bindings::CaseTestExpr)
+        })),
+        bindings::NodeTag_T_ArrayExpr => ast::Node::ArrayExpr(NodeBox::new(unsafe {
+            array_expr(p as *const bindings::ArrayExpr)
+        })),
+        bindings::NodeTag_T_RowExpr => ast::Node::RowExpr(NodeBox::new(unsafe {
+            row_expr(p as *const bindings::RowExpr)
+        })),
+        bindings::NodeTag_T_RowCompareExpr => ast::Node::RowCompareExpr(NodeBox::new(unsafe {
+            row_compare_expr(p as *const bindings::RowCompareExpr)
+        })),
+        bindings::NodeTag_T_CoalesceExpr => ast::Node::CoalesceExpr(NodeBox::new(unsafe {
+            coalesce_expr(p as *const bindings::CoalesceExpr)
+        })),
+        bindings::NodeTag_T_MinMaxExpr => ast::Node::MinMaxExpr(NodeBox::new(unsafe {
+            min_max_expr(p as *const bindings::MinMaxExpr)
+        })),
+        bindings::NodeTag_T_SQLValueFunction => ast::Node::SqlValueFunction(NodeBox::new(unsafe {
+            sql_value_function(p as *const bindings::SQLValueFunction)
+        })),
+        bindings::NodeTag_T_XmlExpr => ast::Node::XmlExpr(NodeBox::new(unsafe {
+            xml_expr(p as *const bindings::XmlExpr)
+        })),
+        bindings::NodeTag_T_JsonFormat => ast::Node::JsonFormat(NodeBox::new(unsafe {
             json_format(p as *const bindings::JsonFormat)
-        }),
-        bindings::NodeTag_T_JsonReturning => protobuf::node::Node::JsonReturning(unsafe {
+        })),
+        bindings::NodeTag_T_JsonReturning => ast::Node::JsonReturning(NodeBox::new(unsafe {
             json_returning(p as *const bindings::JsonReturning)
-        }),
-        bindings::NodeTag_T_JsonValueExpr => {
-            protobuf::node::Node::JsonValueExpr(::std::boxed::Box::new(unsafe {
-                json_value_expr(p as *const bindings::JsonValueExpr)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_JsonValueExpr => ast::Node::JsonValueExpr(NodeBox::new(unsafe {
+            json_value_expr(p as *const bindings::JsonValueExpr)
+        })),
         bindings::NodeTag_T_JsonConstructorExpr => {
-            protobuf::node::Node::JsonConstructorExpr(::std::boxed::Box::new(unsafe {
+            ast::Node::JsonConstructorExpr(NodeBox::new(unsafe {
                 json_constructor_expr(p as *const bindings::JsonConstructorExpr)
             }))
         }
-        bindings::NodeTag_T_JsonIsPredicate => {
-            protobuf::node::Node::JsonIsPredicate(::std::boxed::Box::new(unsafe {
-                json_is_predicate(p as *const bindings::JsonIsPredicate)
-            }))
-        }
-        bindings::NodeTag_T_JsonBehavior => {
-            protobuf::node::Node::JsonBehavior(::std::boxed::Box::new(unsafe {
-                json_behavior(p as *const bindings::JsonBehavior)
-            }))
-        }
-        bindings::NodeTag_T_JsonExpr => {
-            protobuf::node::Node::JsonExpr(::std::boxed::Box::new(unsafe {
-                json_expr(p as *const bindings::JsonExpr)
-            }))
-        }
-        bindings::NodeTag_T_JsonTablePath => protobuf::node::Node::JsonTablePath(unsafe {
+        bindings::NodeTag_T_JsonIsPredicate => ast::Node::JsonIsPredicate(NodeBox::new(unsafe {
+            json_is_predicate(p as *const bindings::JsonIsPredicate)
+        })),
+        bindings::NodeTag_T_JsonBehavior => ast::Node::JsonBehavior(NodeBox::new(unsafe {
+            json_behavior(p as *const bindings::JsonBehavior)
+        })),
+        bindings::NodeTag_T_JsonExpr => ast::Node::JsonExpr(NodeBox::new(unsafe {
+            json_expr(p as *const bindings::JsonExpr)
+        })),
+        bindings::NodeTag_T_JsonTablePath => ast::Node::JsonTablePath(NodeBox::new(unsafe {
             json_table_path(p as *const bindings::JsonTablePath)
-        }),
+        })),
         bindings::NodeTag_T_JsonTablePathScan => {
-            protobuf::node::Node::JsonTablePathScan(::std::boxed::Box::new(unsafe {
+            ast::Node::JsonTablePathScan(NodeBox::new(unsafe {
                 json_table_path_scan(p as *const bindings::JsonTablePathScan)
             }))
         }
         bindings::NodeTag_T_JsonTableSiblingJoin => {
-            protobuf::node::Node::JsonTableSiblingJoin(::std::boxed::Box::new(unsafe {
+            ast::Node::JsonTableSiblingJoin(NodeBox::new(unsafe {
                 json_table_sibling_join(p as *const bindings::JsonTableSiblingJoin)
             }))
         }
-        bindings::NodeTag_T_NullTest => {
-            protobuf::node::Node::NullTest(::std::boxed::Box::new(unsafe {
-                null_test(p as *const bindings::NullTest)
-            }))
-        }
-        bindings::NodeTag_T_BooleanTest => {
-            protobuf::node::Node::BooleanTest(::std::boxed::Box::new(unsafe {
-                boolean_test(p as *const bindings::BooleanTest)
-            }))
-        }
-        bindings::NodeTag_T_MergeAction => {
-            protobuf::node::Node::MergeAction(::std::boxed::Box::new(unsafe {
-                merge_action(p as *const bindings::MergeAction)
-            }))
-        }
-        bindings::NodeTag_T_CoerceToDomain => {
-            protobuf::node::Node::CoerceToDomain(::std::boxed::Box::new(unsafe {
-                coerce_to_domain(p as *const bindings::CoerceToDomain)
-            }))
-        }
+        bindings::NodeTag_T_NullTest => ast::Node::NullTest(NodeBox::new(unsafe {
+            null_test(p as *const bindings::NullTest)
+        })),
+        bindings::NodeTag_T_BooleanTest => ast::Node::BooleanTest(NodeBox::new(unsafe {
+            boolean_test(p as *const bindings::BooleanTest)
+        })),
+        bindings::NodeTag_T_MergeAction => ast::Node::MergeAction(NodeBox::new(unsafe {
+            merge_action(p as *const bindings::MergeAction)
+        })),
+        bindings::NodeTag_T_CoerceToDomain => ast::Node::CoerceToDomain(NodeBox::new(unsafe {
+            coerce_to_domain(p as *const bindings::CoerceToDomain)
+        })),
         bindings::NodeTag_T_CoerceToDomainValue => {
-            protobuf::node::Node::CoerceToDomainValue(::std::boxed::Box::new(unsafe {
+            ast::Node::CoerceToDomainValue(NodeBox::new(unsafe {
                 coerce_to_domain_value(p as *const bindings::CoerceToDomainValue)
             }))
         }
-        bindings::NodeTag_T_SetToDefault => {
-            protobuf::node::Node::SetToDefault(::std::boxed::Box::new(unsafe {
-                set_to_default(p as *const bindings::SetToDefault)
-            }))
-        }
-        bindings::NodeTag_T_CurrentOfExpr => {
-            protobuf::node::Node::CurrentOfExpr(::std::boxed::Box::new(unsafe {
-                current_of_expr(p as *const bindings::CurrentOfExpr)
-            }))
-        }
-        bindings::NodeTag_T_NextValueExpr => {
-            protobuf::node::Node::NextValueExpr(::std::boxed::Box::new(unsafe {
-                next_value_expr(p as *const bindings::NextValueExpr)
-            }))
-        }
-        bindings::NodeTag_T_InferenceElem => {
-            protobuf::node::Node::InferenceElem(::std::boxed::Box::new(unsafe {
-                inference_elem(p as *const bindings::InferenceElem)
-            }))
-        }
-        bindings::NodeTag_T_ReturningExpr => {
-            protobuf::node::Node::ReturningExpr(::std::boxed::Box::new(unsafe {
-                returning_expr(p as *const bindings::ReturningExpr)
-            }))
-        }
-        bindings::NodeTag_T_TargetEntry => {
-            protobuf::node::Node::TargetEntry(::std::boxed::Box::new(unsafe {
-                target_entry(p as *const bindings::TargetEntry)
-            }))
-        }
-        bindings::NodeTag_T_RangeTblRef => protobuf::node::Node::RangeTblRef(unsafe {
-            range_tbl_ref(p as *const bindings::RangeTblRef)
-        }),
-        bindings::NodeTag_T_JoinExpr => {
-            protobuf::node::Node::JoinExpr(::std::boxed::Box::new(unsafe {
-                join_expr(p as *const bindings::JoinExpr)
-            }))
-        }
-        bindings::NodeTag_T_FromExpr => {
-            protobuf::node::Node::FromExpr(::std::boxed::Box::new(unsafe {
-                from_expr(p as *const bindings::FromExpr)
-            }))
-        }
-        bindings::NodeTag_T_OnConflictExpr => {
-            protobuf::node::Node::OnConflictExpr(::std::boxed::Box::new(unsafe {
-                on_conflict_expr(p as *const bindings::OnConflictExpr)
-            }))
-        }
-        bindings::NodeTag_T_Query => protobuf::node::Node::Query(::std::boxed::Box::new(unsafe {
-            query(p as *const bindings::Query)
+        bindings::NodeTag_T_SetToDefault => ast::Node::SetToDefault(NodeBox::new(unsafe {
+            set_to_default(p as *const bindings::SetToDefault)
         })),
-        bindings::NodeTag_T_TypeName => {
-            protobuf::node::Node::TypeName(unsafe { type_name(p as *const bindings::TypeName) })
+        bindings::NodeTag_T_CurrentOfExpr => ast::Node::CurrentOfExpr(NodeBox::new(unsafe {
+            current_of_expr(p as *const bindings::CurrentOfExpr)
+        })),
+        bindings::NodeTag_T_NextValueExpr => ast::Node::NextValueExpr(NodeBox::new(unsafe {
+            next_value_expr(p as *const bindings::NextValueExpr)
+        })),
+        bindings::NodeTag_T_InferenceElem => ast::Node::InferenceElem(NodeBox::new(unsafe {
+            inference_elem(p as *const bindings::InferenceElem)
+        })),
+        bindings::NodeTag_T_ReturningExpr => ast::Node::ReturningExpr(NodeBox::new(unsafe {
+            returning_expr(p as *const bindings::ReturningExpr)
+        })),
+        bindings::NodeTag_T_TargetEntry => ast::Node::TargetEntry(NodeBox::new(unsafe {
+            target_entry(p as *const bindings::TargetEntry)
+        })),
+        bindings::NodeTag_T_RangeTblRef => ast::Node::RangeTblRef(NodeBox::new(unsafe {
+            range_tbl_ref(p as *const bindings::RangeTblRef)
+        })),
+        bindings::NodeTag_T_JoinExpr => ast::Node::JoinExpr(NodeBox::new(unsafe {
+            join_expr(p as *const bindings::JoinExpr)
+        })),
+        bindings::NodeTag_T_FromExpr => ast::Node::FromExpr(NodeBox::new(unsafe {
+            from_expr(p as *const bindings::FromExpr)
+        })),
+        bindings::NodeTag_T_OnConflictExpr => ast::Node::OnConflictExpr(NodeBox::new(unsafe {
+            on_conflict_expr(p as *const bindings::OnConflictExpr)
+        })),
+        bindings::NodeTag_T_Query => {
+            ast::Node::Query(NodeBox::new(unsafe { query(p as *const bindings::Query) }))
         }
-        bindings::NodeTag_T_ColumnRef => {
-            protobuf::node::Node::ColumnRef(unsafe { column_ref(p as *const bindings::ColumnRef) })
-        }
-        bindings::NodeTag_T_ParamRef => {
-            protobuf::node::Node::ParamRef(unsafe { param_ref(p as *const bindings::ParamRef) })
-        }
-        bindings::NodeTag_T_A_Expr => protobuf::node::Node::AExpr(::std::boxed::Box::new(unsafe {
+        bindings::NodeTag_T_TypeName => ast::Node::TypeName(NodeBox::new(unsafe {
+            type_name(p as *const bindings::TypeName)
+        })),
+        bindings::NodeTag_T_ColumnRef => ast::Node::ColumnRef(NodeBox::new(unsafe {
+            column_ref(p as *const bindings::ColumnRef)
+        })),
+        bindings::NodeTag_T_ParamRef => ast::Node::ParamRef(NodeBox::new(unsafe {
+            param_ref(p as *const bindings::ParamRef)
+        })),
+        bindings::NodeTag_T_A_Expr => ast::Node::AExpr(NodeBox::new(unsafe {
             a_expr(p as *const bindings::A_Expr)
         })),
-        bindings::NodeTag_T_TypeCast => {
-            protobuf::node::Node::TypeCast(::std::boxed::Box::new(unsafe {
-                type_cast(p as *const bindings::TypeCast)
-            }))
-        }
-        bindings::NodeTag_T_CollateClause => {
-            protobuf::node::Node::CollateClause(::std::boxed::Box::new(unsafe {
-                collate_clause(p as *const bindings::CollateClause)
-            }))
-        }
-        bindings::NodeTag_T_RoleSpec => {
-            protobuf::node::Node::RoleSpec(unsafe { role_spec(p as *const bindings::RoleSpec) })
-        }
-        bindings::NodeTag_T_FuncCall => {
-            protobuf::node::Node::FuncCall(::std::boxed::Box::new(unsafe {
-                func_call(p as *const bindings::FuncCall)
-            }))
-        }
-        bindings::NodeTag_T_A_Star => {
-            protobuf::node::Node::AStar(unsafe { a_star(p as *const bindings::A_Star) })
-        }
-        bindings::NodeTag_T_A_Indices => {
-            protobuf::node::Node::AIndices(::std::boxed::Box::new(unsafe {
-                a_indices(p as *const bindings::A_Indices)
-            }))
-        }
-        bindings::NodeTag_T_A_Indirection => {
-            protobuf::node::Node::AIndirection(::std::boxed::Box::new(unsafe {
-                a_indirection(p as *const bindings::A_Indirection)
-            }))
-        }
-        bindings::NodeTag_T_A_ArrayExpr => protobuf::node::Node::AArrayExpr(unsafe {
+        bindings::NodeTag_T_TypeCast => ast::Node::TypeCast(NodeBox::new(unsafe {
+            type_cast(p as *const bindings::TypeCast)
+        })),
+        bindings::NodeTag_T_CollateClause => ast::Node::CollateClause(NodeBox::new(unsafe {
+            collate_clause(p as *const bindings::CollateClause)
+        })),
+        bindings::NodeTag_T_RoleSpec => ast::Node::RoleSpec(NodeBox::new(unsafe {
+            role_spec(p as *const bindings::RoleSpec)
+        })),
+        bindings::NodeTag_T_FuncCall => ast::Node::FuncCall(NodeBox::new(unsafe {
+            func_call(p as *const bindings::FuncCall)
+        })),
+        bindings::NodeTag_T_A_Star => ast::Node::AStar(NodeBox::new(unsafe {
+            a_star(p as *const bindings::A_Star)
+        })),
+        bindings::NodeTag_T_A_Indices => ast::Node::AIndices(NodeBox::new(unsafe {
+            a_indices(p as *const bindings::A_Indices)
+        })),
+        bindings::NodeTag_T_A_Indirection => ast::Node::AIndirection(NodeBox::new(unsafe {
+            a_indirection(p as *const bindings::A_Indirection)
+        })),
+        bindings::NodeTag_T_A_ArrayExpr => ast::Node::AArrayExpr(NodeBox::new(unsafe {
             a_array_expr(p as *const bindings::A_ArrayExpr)
-        }),
-        bindings::NodeTag_T_ResTarget => {
-            protobuf::node::Node::ResTarget(::std::boxed::Box::new(unsafe {
-                res_target(p as *const bindings::ResTarget)
-            }))
-        }
-        bindings::NodeTag_T_MultiAssignRef => {
-            protobuf::node::Node::MultiAssignRef(::std::boxed::Box::new(unsafe {
-                multi_assign_ref(p as *const bindings::MultiAssignRef)
-            }))
-        }
-        bindings::NodeTag_T_SortBy => {
-            protobuf::node::Node::SortBy(::std::boxed::Box::new(unsafe {
-                sort_by(p as *const bindings::SortBy)
-            }))
-        }
-        bindings::NodeTag_T_WindowDef => {
-            protobuf::node::Node::WindowDef(::std::boxed::Box::new(unsafe {
-                window_def(p as *const bindings::WindowDef)
-            }))
-        }
-        bindings::NodeTag_T_RangeSubselect => {
-            protobuf::node::Node::RangeSubselect(::std::boxed::Box::new(unsafe {
-                range_subselect(p as *const bindings::RangeSubselect)
-            }))
-        }
-        bindings::NodeTag_T_RangeFunction => protobuf::node::Node::RangeFunction(unsafe {
+        })),
+        bindings::NodeTag_T_ResTarget => ast::Node::ResTarget(NodeBox::new(unsafe {
+            res_target(p as *const bindings::ResTarget)
+        })),
+        bindings::NodeTag_T_MultiAssignRef => ast::Node::MultiAssignRef(NodeBox::new(unsafe {
+            multi_assign_ref(p as *const bindings::MultiAssignRef)
+        })),
+        bindings::NodeTag_T_SortBy => ast::Node::SortBy(NodeBox::new(unsafe {
+            sort_by(p as *const bindings::SortBy)
+        })),
+        bindings::NodeTag_T_WindowDef => ast::Node::WindowDef(NodeBox::new(unsafe {
+            window_def(p as *const bindings::WindowDef)
+        })),
+        bindings::NodeTag_T_RangeSubselect => ast::Node::RangeSubselect(NodeBox::new(unsafe {
+            range_subselect(p as *const bindings::RangeSubselect)
+        })),
+        bindings::NodeTag_T_RangeFunction => ast::Node::RangeFunction(NodeBox::new(unsafe {
             range_function(p as *const bindings::RangeFunction)
-        }),
-        bindings::NodeTag_T_RangeTableFunc => {
-            protobuf::node::Node::RangeTableFunc(::std::boxed::Box::new(unsafe {
-                range_table_func(p as *const bindings::RangeTableFunc)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_RangeTableFunc => ast::Node::RangeTableFunc(NodeBox::new(unsafe {
+            range_table_func(p as *const bindings::RangeTableFunc)
+        })),
         bindings::NodeTag_T_RangeTableFuncCol => {
-            protobuf::node::Node::RangeTableFuncCol(::std::boxed::Box::new(unsafe {
+            ast::Node::RangeTableFuncCol(NodeBox::new(unsafe {
                 range_table_func_col(p as *const bindings::RangeTableFuncCol)
             }))
         }
-        bindings::NodeTag_T_RangeTableSample => {
-            protobuf::node::Node::RangeTableSample(::std::boxed::Box::new(unsafe {
-                range_table_sample(p as *const bindings::RangeTableSample)
-            }))
-        }
-        bindings::NodeTag_T_ColumnDef => {
-            protobuf::node::Node::ColumnDef(::std::boxed::Box::new(unsafe {
-                column_def(p as *const bindings::ColumnDef)
-            }))
-        }
-        bindings::NodeTag_T_TableLikeClause => protobuf::node::Node::TableLikeClause(unsafe {
+        bindings::NodeTag_T_RangeTableSample => ast::Node::RangeTableSample(NodeBox::new(unsafe {
+            range_table_sample(p as *const bindings::RangeTableSample)
+        })),
+        bindings::NodeTag_T_ColumnDef => ast::Node::ColumnDef(NodeBox::new(unsafe {
+            column_def(p as *const bindings::ColumnDef)
+        })),
+        bindings::NodeTag_T_TableLikeClause => ast::Node::TableLikeClause(NodeBox::new(unsafe {
             table_like_clause(p as *const bindings::TableLikeClause)
-        }),
-        bindings::NodeTag_T_IndexElem => {
-            protobuf::node::Node::IndexElem(::std::boxed::Box::new(unsafe {
-                index_elem(p as *const bindings::IndexElem)
-            }))
-        }
-        bindings::NodeTag_T_DefElem => {
-            protobuf::node::Node::DefElem(::std::boxed::Box::new(unsafe {
-                def_elem(p as *const bindings::DefElem)
-            }))
-        }
-        bindings::NodeTag_T_LockingClause => protobuf::node::Node::LockingClause(unsafe {
+        })),
+        bindings::NodeTag_T_IndexElem => ast::Node::IndexElem(NodeBox::new(unsafe {
+            index_elem(p as *const bindings::IndexElem)
+        })),
+        bindings::NodeTag_T_DefElem => ast::Node::DefElem(NodeBox::new(unsafe {
+            def_elem(p as *const bindings::DefElem)
+        })),
+        bindings::NodeTag_T_LockingClause => ast::Node::LockingClause(NodeBox::new(unsafe {
             locking_clause(p as *const bindings::LockingClause)
-        }),
-        bindings::NodeTag_T_XmlSerialize => {
-            protobuf::node::Node::XmlSerialize(::std::boxed::Box::new(unsafe {
-                xml_serialize(p as *const bindings::XmlSerialize)
-            }))
-        }
-        bindings::NodeTag_T_PartitionElem => {
-            protobuf::node::Node::PartitionElem(::std::boxed::Box::new(unsafe {
-                partition_elem(p as *const bindings::PartitionElem)
-            }))
-        }
-        bindings::NodeTag_T_PartitionSpec => protobuf::node::Node::PartitionSpec(unsafe {
+        })),
+        bindings::NodeTag_T_XmlSerialize => ast::Node::XmlSerialize(NodeBox::new(unsafe {
+            xml_serialize(p as *const bindings::XmlSerialize)
+        })),
+        bindings::NodeTag_T_PartitionElem => ast::Node::PartitionElem(NodeBox::new(unsafe {
+            partition_elem(p as *const bindings::PartitionElem)
+        })),
+        bindings::NodeTag_T_PartitionSpec => ast::Node::PartitionSpec(NodeBox::new(unsafe {
             partition_spec(p as *const bindings::PartitionSpec)
-        }),
+        })),
         bindings::NodeTag_T_PartitionBoundSpec => {
-            protobuf::node::Node::PartitionBoundSpec(unsafe {
+            ast::Node::PartitionBoundSpec(NodeBox::new(unsafe {
                 partition_bound_spec(p as *const bindings::PartitionBoundSpec)
-            })
+            }))
         }
         bindings::NodeTag_T_PartitionRangeDatum => {
-            protobuf::node::Node::PartitionRangeDatum(::std::boxed::Box::new(unsafe {
+            ast::Node::PartitionRangeDatum(NodeBox::new(unsafe {
                 partition_range_datum(p as *const bindings::PartitionRangeDatum)
             }))
         }
-        bindings::NodeTag_T_PartitionCmd => protobuf::node::Node::PartitionCmd(unsafe {
+        bindings::NodeTag_T_PartitionCmd => ast::Node::PartitionCmd(NodeBox::new(unsafe {
             partition_cmd(p as *const bindings::PartitionCmd)
-        }),
-        bindings::NodeTag_T_RangeTblEntry => {
-            protobuf::node::Node::RangeTblEntry(::std::boxed::Box::new(unsafe {
-                range_tbl_entry(p as *const bindings::RangeTblEntry)
+        })),
+        bindings::NodeTag_T_RangeTblEntry => ast::Node::RangeTblEntry(NodeBox::new(unsafe {
+            range_tbl_entry(p as *const bindings::RangeTblEntry)
+        })),
+        bindings::NodeTag_T_RTEPermissionInfo => {
+            ast::Node::RtePermissionInfo(NodeBox::new(unsafe {
+                rte_permission_info(p as *const bindings::RTEPermissionInfo)
             }))
         }
-        bindings::NodeTag_T_RTEPermissionInfo => protobuf::node::Node::RtepermissionInfo(unsafe {
-            rte_permission_info(p as *const bindings::RTEPermissionInfo)
-        }),
-        bindings::NodeTag_T_RangeTblFunction => {
-            protobuf::node::Node::RangeTblFunction(::std::boxed::Box::new(unsafe {
-                range_tbl_function(p as *const bindings::RangeTblFunction)
-            }))
-        }
+        bindings::NodeTag_T_RangeTblFunction => ast::Node::RangeTblFunction(NodeBox::new(unsafe {
+            range_tbl_function(p as *const bindings::RangeTblFunction)
+        })),
         bindings::NodeTag_T_TableSampleClause => {
-            protobuf::node::Node::TableSampleClause(::std::boxed::Box::new(unsafe {
+            ast::Node::TableSampleClause(NodeBox::new(unsafe {
                 table_sample_clause(p as *const bindings::TableSampleClause)
             }))
         }
-        bindings::NodeTag_T_WithCheckOption => {
-            protobuf::node::Node::WithCheckOption(::std::boxed::Box::new(unsafe {
-                with_check_option(p as *const bindings::WithCheckOption)
-            }))
-        }
-        bindings::NodeTag_T_SortGroupClause => protobuf::node::Node::SortGroupClause(unsafe {
+        bindings::NodeTag_T_WithCheckOption => ast::Node::WithCheckOption(NodeBox::new(unsafe {
+            with_check_option(p as *const bindings::WithCheckOption)
+        })),
+        bindings::NodeTag_T_SortGroupClause => ast::Node::SortGroupClause(NodeBox::new(unsafe {
             sort_group_clause(p as *const bindings::SortGroupClause)
-        }),
-        bindings::NodeTag_T_GroupingSet => protobuf::node::Node::GroupingSet(unsafe {
+        })),
+        bindings::NodeTag_T_GroupingSet => ast::Node::GroupingSet(NodeBox::new(unsafe {
             grouping_set(p as *const bindings::GroupingSet)
-        }),
-        bindings::NodeTag_T_WindowClause => {
-            protobuf::node::Node::WindowClause(::std::boxed::Box::new(unsafe {
-                window_clause(p as *const bindings::WindowClause)
-            }))
-        }
-        bindings::NodeTag_T_RowMarkClause => protobuf::node::Node::RowMarkClause(unsafe {
+        })),
+        bindings::NodeTag_T_WindowClause => ast::Node::WindowClause(NodeBox::new(unsafe {
+            window_clause(p as *const bindings::WindowClause)
+        })),
+        bindings::NodeTag_T_RowMarkClause => ast::Node::RowMarkClause(NodeBox::new(unsafe {
             row_mark_clause(p as *const bindings::RowMarkClause)
-        }),
-        bindings::NodeTag_T_WithClause => protobuf::node::Node::WithClause(unsafe {
+        })),
+        bindings::NodeTag_T_WithClause => ast::Node::WithClause(NodeBox::new(unsafe {
             with_clause(p as *const bindings::WithClause)
-        }),
-        bindings::NodeTag_T_InferClause => {
-            protobuf::node::Node::InferClause(::std::boxed::Box::new(unsafe {
-                infer_clause(p as *const bindings::InferClause)
-            }))
-        }
-        bindings::NodeTag_T_OnConflictClause => {
-            protobuf::node::Node::OnConflictClause(::std::boxed::Box::new(unsafe {
-                on_conflict_clause(p as *const bindings::OnConflictClause)
-            }))
-        }
-        bindings::NodeTag_T_CTESearchClause => protobuf::node::Node::CtesearchClause(unsafe {
+        })),
+        bindings::NodeTag_T_InferClause => ast::Node::InferClause(NodeBox::new(unsafe {
+            infer_clause(p as *const bindings::InferClause)
+        })),
+        bindings::NodeTag_T_OnConflictClause => ast::Node::OnConflictClause(NodeBox::new(unsafe {
+            on_conflict_clause(p as *const bindings::OnConflictClause)
+        })),
+        bindings::NodeTag_T_CTESearchClause => ast::Node::CteSearchClause(NodeBox::new(unsafe {
             cte_search_clause(p as *const bindings::CTESearchClause)
-        }),
-        bindings::NodeTag_T_CTECycleClause => {
-            protobuf::node::Node::CtecycleClause(::std::boxed::Box::new(unsafe {
-                cte_cycle_clause(p as *const bindings::CTECycleClause)
-            }))
-        }
-        bindings::NodeTag_T_CommonTableExpr => {
-            protobuf::node::Node::CommonTableExpr(::std::boxed::Box::new(unsafe {
-                common_table_expr(p as *const bindings::CommonTableExpr)
-            }))
-        }
-        bindings::NodeTag_T_MergeWhenClause => {
-            protobuf::node::Node::MergeWhenClause(::std::boxed::Box::new(unsafe {
-                merge_when_clause(p as *const bindings::MergeWhenClause)
-            }))
-        }
-        bindings::NodeTag_T_ReturningOption => protobuf::node::Node::ReturningOption(unsafe {
+        })),
+        bindings::NodeTag_T_CTECycleClause => ast::Node::CteCycleClause(NodeBox::new(unsafe {
+            cte_cycle_clause(p as *const bindings::CTECycleClause)
+        })),
+        bindings::NodeTag_T_CommonTableExpr => ast::Node::CommonTableExpr(NodeBox::new(unsafe {
+            common_table_expr(p as *const bindings::CommonTableExpr)
+        })),
+        bindings::NodeTag_T_MergeWhenClause => ast::Node::MergeWhenClause(NodeBox::new(unsafe {
+            merge_when_clause(p as *const bindings::MergeWhenClause)
+        })),
+        bindings::NodeTag_T_ReturningOption => ast::Node::ReturningOption(NodeBox::new(unsafe {
             returning_option(p as *const bindings::ReturningOption)
-        }),
-        bindings::NodeTag_T_ReturningClause => protobuf::node::Node::ReturningClause(unsafe {
+        })),
+        bindings::NodeTag_T_ReturningClause => ast::Node::ReturningClause(NodeBox::new(unsafe {
             returning_clause(p as *const bindings::ReturningClause)
-        }),
-        bindings::NodeTag_T_TriggerTransition => protobuf::node::Node::TriggerTransition(unsafe {
-            trigger_transition(p as *const bindings::TriggerTransition)
-        }),
-        bindings::NodeTag_T_JsonOutput => protobuf::node::Node::JsonOutput(unsafe {
+        })),
+        bindings::NodeTag_T_TriggerTransition => {
+            ast::Node::TriggerTransition(NodeBox::new(unsafe {
+                trigger_transition(p as *const bindings::TriggerTransition)
+            }))
+        }
+        bindings::NodeTag_T_JsonOutput => ast::Node::JsonOutput(NodeBox::new(unsafe {
             json_output(p as *const bindings::JsonOutput)
-        }),
-        bindings::NodeTag_T_JsonArgument => {
-            protobuf::node::Node::JsonArgument(::std::boxed::Box::new(unsafe {
-                json_argument(p as *const bindings::JsonArgument)
-            }))
-        }
-        bindings::NodeTag_T_JsonFuncExpr => {
-            protobuf::node::Node::JsonFuncExpr(::std::boxed::Box::new(unsafe {
-                json_func_expr(p as *const bindings::JsonFuncExpr)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_JsonArgument => ast::Node::JsonArgument(NodeBox::new(unsafe {
+            json_argument(p as *const bindings::JsonArgument)
+        })),
+        bindings::NodeTag_T_JsonFuncExpr => ast::Node::JsonFuncExpr(NodeBox::new(unsafe {
+            json_func_expr(p as *const bindings::JsonFuncExpr)
+        })),
         bindings::NodeTag_T_JsonTablePathSpec => {
-            protobuf::node::Node::JsonTablePathSpec(::std::boxed::Box::new(unsafe {
+            ast::Node::JsonTablePathSpec(NodeBox::new(unsafe {
                 json_table_path_spec(p as *const bindings::JsonTablePathSpec)
             }))
         }
-        bindings::NodeTag_T_JsonTable => {
-            protobuf::node::Node::JsonTable(::std::boxed::Box::new(unsafe {
-                json_table(p as *const bindings::JsonTable)
-            }))
-        }
-        bindings::NodeTag_T_JsonTableColumn => {
-            protobuf::node::Node::JsonTableColumn(::std::boxed::Box::new(unsafe {
-                json_table_column(p as *const bindings::JsonTableColumn)
-            }))
-        }
-        bindings::NodeTag_T_JsonKeyValue => {
-            protobuf::node::Node::JsonKeyValue(::std::boxed::Box::new(unsafe {
-                json_key_value(p as *const bindings::JsonKeyValue)
-            }))
-        }
-        bindings::NodeTag_T_JsonParseExpr => {
-            protobuf::node::Node::JsonParseExpr(::std::boxed::Box::new(unsafe {
-                json_parse_expr(p as *const bindings::JsonParseExpr)
-            }))
-        }
-        bindings::NodeTag_T_JsonScalarExpr => {
-            protobuf::node::Node::JsonScalarExpr(::std::boxed::Box::new(unsafe {
-                json_scalar_expr(p as *const bindings::JsonScalarExpr)
-            }))
-        }
+        bindings::NodeTag_T_JsonTable => ast::Node::JsonTable(NodeBox::new(unsafe {
+            json_table(p as *const bindings::JsonTable)
+        })),
+        bindings::NodeTag_T_JsonTableColumn => ast::Node::JsonTableColumn(NodeBox::new(unsafe {
+            json_table_column(p as *const bindings::JsonTableColumn)
+        })),
+        bindings::NodeTag_T_JsonKeyValue => ast::Node::JsonKeyValue(NodeBox::new(unsafe {
+            json_key_value(p as *const bindings::JsonKeyValue)
+        })),
+        bindings::NodeTag_T_JsonParseExpr => ast::Node::JsonParseExpr(NodeBox::new(unsafe {
+            json_parse_expr(p as *const bindings::JsonParseExpr)
+        })),
+        bindings::NodeTag_T_JsonScalarExpr => ast::Node::JsonScalarExpr(NodeBox::new(unsafe {
+            json_scalar_expr(p as *const bindings::JsonScalarExpr)
+        })),
         bindings::NodeTag_T_JsonSerializeExpr => {
-            protobuf::node::Node::JsonSerializeExpr(::std::boxed::Box::new(unsafe {
+            ast::Node::JsonSerializeExpr(NodeBox::new(unsafe {
                 json_serialize_expr(p as *const bindings::JsonSerializeExpr)
             }))
         }
         bindings::NodeTag_T_JsonObjectConstructor => {
-            protobuf::node::Node::JsonObjectConstructor(unsafe {
+            ast::Node::JsonObjectConstructor(NodeBox::new(unsafe {
                 json_object_constructor(p as *const bindings::JsonObjectConstructor)
-            })
+            }))
         }
         bindings::NodeTag_T_JsonArrayConstructor => {
-            protobuf::node::Node::JsonArrayConstructor(unsafe {
+            ast::Node::JsonArrayConstructor(NodeBox::new(unsafe {
                 json_array_constructor(p as *const bindings::JsonArrayConstructor)
-            })
+            }))
         }
         bindings::NodeTag_T_JsonArrayQueryConstructor => {
-            protobuf::node::Node::JsonArrayQueryConstructor(::std::boxed::Box::new(unsafe {
+            ast::Node::JsonArrayQueryConstructor(NodeBox::new(unsafe {
                 json_array_query_constructor(p as *const bindings::JsonArrayQueryConstructor)
             }))
         }
         bindings::NodeTag_T_JsonAggConstructor => {
-            protobuf::node::Node::JsonAggConstructor(::std::boxed::Box::new(unsafe {
+            ast::Node::JsonAggConstructor(NodeBox::new(unsafe {
                 json_agg_constructor(p as *const bindings::JsonAggConstructor)
             }))
         }
-        bindings::NodeTag_T_JsonObjectAgg => {
-            protobuf::node::Node::JsonObjectAgg(::std::boxed::Box::new(unsafe {
-                json_object_agg(p as *const bindings::JsonObjectAgg)
-            }))
-        }
-        bindings::NodeTag_T_JsonArrayAgg => {
-            protobuf::node::Node::JsonArrayAgg(::std::boxed::Box::new(unsafe {
-                json_array_agg(p as *const bindings::JsonArrayAgg)
-            }))
-        }
-        bindings::NodeTag_T_RawStmt => {
-            protobuf::node::Node::RawStmt(::std::boxed::Box::new(unsafe {
-                raw_stmt(p as *const bindings::RawStmt)
-            }))
-        }
-        bindings::NodeTag_T_InsertStmt => {
-            protobuf::node::Node::InsertStmt(::std::boxed::Box::new(unsafe {
-                insert_stmt(p as *const bindings::InsertStmt)
-            }))
-        }
-        bindings::NodeTag_T_DeleteStmt => {
-            protobuf::node::Node::DeleteStmt(::std::boxed::Box::new(unsafe {
-                delete_stmt(p as *const bindings::DeleteStmt)
-            }))
-        }
-        bindings::NodeTag_T_UpdateStmt => {
-            protobuf::node::Node::UpdateStmt(::std::boxed::Box::new(unsafe {
-                update_stmt(p as *const bindings::UpdateStmt)
-            }))
-        }
-        bindings::NodeTag_T_MergeStmt => {
-            protobuf::node::Node::MergeStmt(::std::boxed::Box::new(unsafe {
-                merge_stmt(p as *const bindings::MergeStmt)
-            }))
-        }
-        bindings::NodeTag_T_SelectStmt => {
-            protobuf::node::Node::SelectStmt(::std::boxed::Box::new(unsafe {
-                select_stmt(p as *const bindings::SelectStmt)
-            }))
-        }
-        bindings::NodeTag_T_SetOperationStmt => {
-            protobuf::node::Node::SetOperationStmt(::std::boxed::Box::new(unsafe {
-                set_operation_stmt(p as *const bindings::SetOperationStmt)
-            }))
-        }
-        bindings::NodeTag_T_ReturnStmt => {
-            protobuf::node::Node::ReturnStmt(::std::boxed::Box::new(unsafe {
-                return_stmt(p as *const bindings::ReturnStmt)
-            }))
-        }
-        bindings::NodeTag_T_PLAssignStmt => {
-            protobuf::node::Node::PlassignStmt(::std::boxed::Box::new(unsafe {
-                pl_assign_stmt(p as *const bindings::PLAssignStmt)
-            }))
-        }
-        bindings::NodeTag_T_CreateSchemaStmt => protobuf::node::Node::CreateSchemaStmt(unsafe {
+        bindings::NodeTag_T_JsonObjectAgg => ast::Node::JsonObjectAgg(NodeBox::new(unsafe {
+            json_object_agg(p as *const bindings::JsonObjectAgg)
+        })),
+        bindings::NodeTag_T_JsonArrayAgg => ast::Node::JsonArrayAgg(NodeBox::new(unsafe {
+            json_array_agg(p as *const bindings::JsonArrayAgg)
+        })),
+        bindings::NodeTag_T_RawStmt => ast::Node::RawStmt(NodeBox::new(unsafe {
+            raw_stmt(p as *const bindings::RawStmt)
+        })),
+        bindings::NodeTag_T_InsertStmt => ast::Node::InsertStmt(NodeBox::new(unsafe {
+            insert_stmt(p as *const bindings::InsertStmt)
+        })),
+        bindings::NodeTag_T_DeleteStmt => ast::Node::DeleteStmt(NodeBox::new(unsafe {
+            delete_stmt(p as *const bindings::DeleteStmt)
+        })),
+        bindings::NodeTag_T_UpdateStmt => ast::Node::UpdateStmt(NodeBox::new(unsafe {
+            update_stmt(p as *const bindings::UpdateStmt)
+        })),
+        bindings::NodeTag_T_MergeStmt => ast::Node::MergeStmt(NodeBox::new(unsafe {
+            merge_stmt(p as *const bindings::MergeStmt)
+        })),
+        bindings::NodeTag_T_SelectStmt => ast::Node::SelectStmt(NodeBox::new(unsafe {
+            select_stmt(p as *const bindings::SelectStmt)
+        })),
+        bindings::NodeTag_T_SetOperationStmt => ast::Node::SetOperationStmt(NodeBox::new(unsafe {
+            set_operation_stmt(p as *const bindings::SetOperationStmt)
+        })),
+        bindings::NodeTag_T_ReturnStmt => ast::Node::ReturnStmt(NodeBox::new(unsafe {
+            return_stmt(p as *const bindings::ReturnStmt)
+        })),
+        bindings::NodeTag_T_PLAssignStmt => ast::Node::PlAssignStmt(NodeBox::new(unsafe {
+            pl_assign_stmt(p as *const bindings::PLAssignStmt)
+        })),
+        bindings::NodeTag_T_CreateSchemaStmt => ast::Node::CreateSchemaStmt(NodeBox::new(unsafe {
             create_schema_stmt(p as *const bindings::CreateSchemaStmt)
-        }),
-        bindings::NodeTag_T_AlterTableStmt => protobuf::node::Node::AlterTableStmt(unsafe {
+        })),
+        bindings::NodeTag_T_AlterTableStmt => ast::Node::AlterTableStmt(NodeBox::new(unsafe {
             alter_table_stmt(p as *const bindings::AlterTableStmt)
-        }),
-        bindings::NodeTag_T_AlterTableCmd => {
-            protobuf::node::Node::AlterTableCmd(::std::boxed::Box::new(unsafe {
-                alter_table_cmd(p as *const bindings::AlterTableCmd)
+        })),
+        bindings::NodeTag_T_AlterTableCmd => ast::Node::AlterTableCmd(NodeBox::new(unsafe {
+            alter_table_cmd(p as *const bindings::AlterTableCmd)
+        })),
+        bindings::NodeTag_T_ATAlterConstraint => {
+            ast::Node::AtAlterConstraint(NodeBox::new(unsafe {
+                at_alter_constraint(p as *const bindings::ATAlterConstraint)
             }))
         }
-        bindings::NodeTag_T_ATAlterConstraint => protobuf::node::Node::AtalterConstraint(unsafe {
-            at_alter_constraint(p as *const bindings::ATAlterConstraint)
-        }),
         bindings::NodeTag_T_ReplicaIdentityStmt => {
-            protobuf::node::Node::ReplicaIdentityStmt(unsafe {
+            ast::Node::ReplicaIdentityStmt(NodeBox::new(unsafe {
                 replica_identity_stmt(p as *const bindings::ReplicaIdentityStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterCollationStmt => {
-            protobuf::node::Node::AlterCollationStmt(unsafe {
+            ast::Node::AlterCollationStmt(NodeBox::new(unsafe {
                 alter_collation_stmt(p as *const bindings::AlterCollationStmt)
-            })
-        }
-        bindings::NodeTag_T_AlterDomainStmt => {
-            protobuf::node::Node::AlterDomainStmt(::std::boxed::Box::new(unsafe {
-                alter_domain_stmt(p as *const bindings::AlterDomainStmt)
             }))
         }
-        bindings::NodeTag_T_GrantStmt => {
-            protobuf::node::Node::GrantStmt(unsafe { grant_stmt(p as *const bindings::GrantStmt) })
-        }
-        bindings::NodeTag_T_ObjectWithArgs => protobuf::node::Node::ObjectWithArgs(unsafe {
+        bindings::NodeTag_T_AlterDomainStmt => ast::Node::AlterDomainStmt(NodeBox::new(unsafe {
+            alter_domain_stmt(p as *const bindings::AlterDomainStmt)
+        })),
+        bindings::NodeTag_T_GrantStmt => ast::Node::GrantStmt(NodeBox::new(unsafe {
+            grant_stmt(p as *const bindings::GrantStmt)
+        })),
+        bindings::NodeTag_T_ObjectWithArgs => ast::Node::ObjectWithArgs(NodeBox::new(unsafe {
             object_with_args(p as *const bindings::ObjectWithArgs)
-        }),
-        bindings::NodeTag_T_AccessPriv => protobuf::node::Node::AccessPriv(unsafe {
+        })),
+        bindings::NodeTag_T_AccessPriv => ast::Node::AccessPriv(NodeBox::new(unsafe {
             access_priv(p as *const bindings::AccessPriv)
-        }),
-        bindings::NodeTag_T_GrantRoleStmt => protobuf::node::Node::GrantRoleStmt(unsafe {
+        })),
+        bindings::NodeTag_T_GrantRoleStmt => ast::Node::GrantRoleStmt(NodeBox::new(unsafe {
             grant_role_stmt(p as *const bindings::GrantRoleStmt)
-        }),
+        })),
         bindings::NodeTag_T_AlterDefaultPrivilegesStmt => {
-            protobuf::node::Node::AlterDefaultPrivilegesStmt(unsafe {
+            ast::Node::AlterDefaultPrivilegesStmt(NodeBox::new(unsafe {
                 alter_default_privileges_stmt(p as *const bindings::AlterDefaultPrivilegesStmt)
-            })
-        }
-        bindings::NodeTag_T_CopyStmt => {
-            protobuf::node::Node::CopyStmt(::std::boxed::Box::new(unsafe {
-                copy_stmt(p as *const bindings::CopyStmt)
             }))
         }
-        bindings::NodeTag_T_VariableSetStmt => protobuf::node::Node::VariableSetStmt(unsafe {
+        bindings::NodeTag_T_CopyStmt => ast::Node::CopyStmt(NodeBox::new(unsafe {
+            copy_stmt(p as *const bindings::CopyStmt)
+        })),
+        bindings::NodeTag_T_VariableSetStmt => ast::Node::VariableSetStmt(NodeBox::new(unsafe {
             variable_set_stmt(p as *const bindings::VariableSetStmt)
-        }),
-        bindings::NodeTag_T_VariableShowStmt => protobuf::node::Node::VariableShowStmt(unsafe {
+        })),
+        bindings::NodeTag_T_VariableShowStmt => ast::Node::VariableShowStmt(NodeBox::new(unsafe {
             variable_show_stmt(p as *const bindings::VariableShowStmt)
-        }),
-        bindings::NodeTag_T_CreateStmt => protobuf::node::Node::CreateStmt(unsafe {
+        })),
+        bindings::NodeTag_T_CreateStmt => ast::Node::CreateStmt(NodeBox::new(unsafe {
             create_stmt(p as *const bindings::CreateStmt)
-        }),
-        bindings::NodeTag_T_Constraint => {
-            protobuf::node::Node::Constraint(::std::boxed::Box::new(unsafe {
-                constraint(p as *const bindings::Constraint)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_Constraint => ast::Node::Constraint(NodeBox::new(unsafe {
+            constraint(p as *const bindings::Constraint)
+        })),
         bindings::NodeTag_T_CreateTableSpaceStmt => {
-            protobuf::node::Node::CreateTableSpaceStmt(unsafe {
+            ast::Node::CreateTableSpaceStmt(NodeBox::new(unsafe {
                 create_table_space_stmt(p as *const bindings::CreateTableSpaceStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_DropTableSpaceStmt => {
-            protobuf::node::Node::DropTableSpaceStmt(unsafe {
+            ast::Node::DropTableSpaceStmt(NodeBox::new(unsafe {
                 drop_table_space_stmt(p as *const bindings::DropTableSpaceStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterTableSpaceOptionsStmt => {
-            protobuf::node::Node::AlterTableSpaceOptionsStmt(unsafe {
+            ast::Node::AlterTableSpaceOptionsStmt(NodeBox::new(unsafe {
                 alter_table_space_options_stmt(p as *const bindings::AlterTableSpaceOptionsStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterTableMoveAllStmt => {
-            protobuf::node::Node::AlterTableMoveAllStmt(unsafe {
+            ast::Node::AlterTableMoveAllStmt(NodeBox::new(unsafe {
                 alter_table_move_all_stmt(p as *const bindings::AlterTableMoveAllStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_CreateExtensionStmt => {
-            protobuf::node::Node::CreateExtensionStmt(unsafe {
+            ast::Node::CreateExtensionStmt(NodeBox::new(unsafe {
                 create_extension_stmt(p as *const bindings::CreateExtensionStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterExtensionStmt => {
-            protobuf::node::Node::AlterExtensionStmt(unsafe {
+            ast::Node::AlterExtensionStmt(NodeBox::new(unsafe {
                 alter_extension_stmt(p as *const bindings::AlterExtensionStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterExtensionContentsStmt => {
-            protobuf::node::Node::AlterExtensionContentsStmt(::std::boxed::Box::new(unsafe {
+            ast::Node::AlterExtensionContentsStmt(NodeBox::new(unsafe {
                 alter_extension_contents_stmt(p as *const bindings::AlterExtensionContentsStmt)
             }))
         }
-        bindings::NodeTag_T_CreateFdwStmt => protobuf::node::Node::CreateFdwStmt(unsafe {
+        bindings::NodeTag_T_CreateFdwStmt => ast::Node::CreateFdwStmt(NodeBox::new(unsafe {
             create_fdw_stmt(p as *const bindings::CreateFdwStmt)
-        }),
-        bindings::NodeTag_T_AlterFdwStmt => protobuf::node::Node::AlterFdwStmt(unsafe {
+        })),
+        bindings::NodeTag_T_AlterFdwStmt => ast::Node::AlterFdwStmt(NodeBox::new(unsafe {
             alter_fdw_stmt(p as *const bindings::AlterFdwStmt)
-        }),
+        })),
         bindings::NodeTag_T_CreateForeignServerStmt => {
-            protobuf::node::Node::CreateForeignServerStmt(unsafe {
+            ast::Node::CreateForeignServerStmt(NodeBox::new(unsafe {
                 create_foreign_server_stmt(p as *const bindings::CreateForeignServerStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterForeignServerStmt => {
-            protobuf::node::Node::AlterForeignServerStmt(unsafe {
+            ast::Node::AlterForeignServerStmt(NodeBox::new(unsafe {
                 alter_foreign_server_stmt(p as *const bindings::AlterForeignServerStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_CreateForeignTableStmt => {
-            protobuf::node::Node::CreateForeignTableStmt(unsafe {
+            ast::Node::CreateForeignTableStmt(NodeBox::new(unsafe {
                 create_foreign_table_stmt(p as *const bindings::CreateForeignTableStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_CreateUserMappingStmt => {
-            protobuf::node::Node::CreateUserMappingStmt(unsafe {
+            ast::Node::CreateUserMappingStmt(NodeBox::new(unsafe {
                 create_user_mapping_stmt(p as *const bindings::CreateUserMappingStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterUserMappingStmt => {
-            protobuf::node::Node::AlterUserMappingStmt(unsafe {
+            ast::Node::AlterUserMappingStmt(NodeBox::new(unsafe {
                 alter_user_mapping_stmt(p as *const bindings::AlterUserMappingStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_DropUserMappingStmt => {
-            protobuf::node::Node::DropUserMappingStmt(unsafe {
+            ast::Node::DropUserMappingStmt(NodeBox::new(unsafe {
                 drop_user_mapping_stmt(p as *const bindings::DropUserMappingStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_ImportForeignSchemaStmt => {
-            protobuf::node::Node::ImportForeignSchemaStmt(unsafe {
+            ast::Node::ImportForeignSchemaStmt(NodeBox::new(unsafe {
                 import_foreign_schema_stmt(p as *const bindings::ImportForeignSchemaStmt)
-            })
-        }
-        bindings::NodeTag_T_CreatePolicyStmt => {
-            protobuf::node::Node::CreatePolicyStmt(::std::boxed::Box::new(unsafe {
-                create_policy_stmt(p as *const bindings::CreatePolicyStmt)
             }))
         }
-        bindings::NodeTag_T_AlterPolicyStmt => {
-            protobuf::node::Node::AlterPolicyStmt(::std::boxed::Box::new(unsafe {
-                alter_policy_stmt(p as *const bindings::AlterPolicyStmt)
-            }))
-        }
-        bindings::NodeTag_T_CreateAmStmt => protobuf::node::Node::CreateAmStmt(unsafe {
+        bindings::NodeTag_T_CreatePolicyStmt => ast::Node::CreatePolicyStmt(NodeBox::new(unsafe {
+            create_policy_stmt(p as *const bindings::CreatePolicyStmt)
+        })),
+        bindings::NodeTag_T_AlterPolicyStmt => ast::Node::AlterPolicyStmt(NodeBox::new(unsafe {
+            alter_policy_stmt(p as *const bindings::AlterPolicyStmt)
+        })),
+        bindings::NodeTag_T_CreateAmStmt => ast::Node::CreateAmStmt(NodeBox::new(unsafe {
             create_am_stmt(p as *const bindings::CreateAmStmt)
-        }),
-        bindings::NodeTag_T_CreateTrigStmt => {
-            protobuf::node::Node::CreateTrigStmt(::std::boxed::Box::new(unsafe {
-                create_trig_stmt(p as *const bindings::CreateTrigStmt)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_CreateTrigStmt => ast::Node::CreateTrigStmt(NodeBox::new(unsafe {
+            create_trig_stmt(p as *const bindings::CreateTrigStmt)
+        })),
         bindings::NodeTag_T_CreateEventTrigStmt => {
-            protobuf::node::Node::CreateEventTrigStmt(unsafe {
+            ast::Node::CreateEventTrigStmt(NodeBox::new(unsafe {
                 create_event_trig_stmt(p as *const bindings::CreateEventTrigStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterEventTrigStmt => {
-            protobuf::node::Node::AlterEventTrigStmt(unsafe {
+            ast::Node::AlterEventTrigStmt(NodeBox::new(unsafe {
                 alter_event_trig_stmt(p as *const bindings::AlterEventTrigStmt)
-            })
+            }))
         }
-        bindings::NodeTag_T_CreatePLangStmt => protobuf::node::Node::CreatePlangStmt(unsafe {
+        bindings::NodeTag_T_CreatePLangStmt => ast::Node::CreatePLangStmt(NodeBox::new(unsafe {
             create_p_lang_stmt(p as *const bindings::CreatePLangStmt)
-        }),
-        bindings::NodeTag_T_CreateRoleStmt => protobuf::node::Node::CreateRoleStmt(unsafe {
+        })),
+        bindings::NodeTag_T_CreateRoleStmt => ast::Node::CreateRoleStmt(NodeBox::new(unsafe {
             create_role_stmt(p as *const bindings::CreateRoleStmt)
-        }),
-        bindings::NodeTag_T_AlterRoleStmt => protobuf::node::Node::AlterRoleStmt(unsafe {
+        })),
+        bindings::NodeTag_T_AlterRoleStmt => ast::Node::AlterRoleStmt(NodeBox::new(unsafe {
             alter_role_stmt(p as *const bindings::AlterRoleStmt)
-        }),
-        bindings::NodeTag_T_AlterRoleSetStmt => protobuf::node::Node::AlterRoleSetStmt(unsafe {
+        })),
+        bindings::NodeTag_T_AlterRoleSetStmt => ast::Node::AlterRoleSetStmt(NodeBox::new(unsafe {
             alter_role_set_stmt(p as *const bindings::AlterRoleSetStmt)
-        }),
-        bindings::NodeTag_T_DropRoleStmt => protobuf::node::Node::DropRoleStmt(unsafe {
+        })),
+        bindings::NodeTag_T_DropRoleStmt => ast::Node::DropRoleStmt(NodeBox::new(unsafe {
             drop_role_stmt(p as *const bindings::DropRoleStmt)
-        }),
-        bindings::NodeTag_T_CreateSeqStmt => protobuf::node::Node::CreateSeqStmt(unsafe {
+        })),
+        bindings::NodeTag_T_CreateSeqStmt => ast::Node::CreateSeqStmt(NodeBox::new(unsafe {
             create_seq_stmt(p as *const bindings::CreateSeqStmt)
-        }),
-        bindings::NodeTag_T_AlterSeqStmt => protobuf::node::Node::AlterSeqStmt(unsafe {
+        })),
+        bindings::NodeTag_T_AlterSeqStmt => ast::Node::AlterSeqStmt(NodeBox::new(unsafe {
             alter_seq_stmt(p as *const bindings::AlterSeqStmt)
-        }),
-        bindings::NodeTag_T_DefineStmt => protobuf::node::Node::DefineStmt(unsafe {
+        })),
+        bindings::NodeTag_T_DefineStmt => ast::Node::DefineStmt(NodeBox::new(unsafe {
             define_stmt(p as *const bindings::DefineStmt)
-        }),
-        bindings::NodeTag_T_CreateDomainStmt => {
-            protobuf::node::Node::CreateDomainStmt(::std::boxed::Box::new(unsafe {
-                create_domain_stmt(p as *const bindings::CreateDomainStmt)
+        })),
+        bindings::NodeTag_T_CreateDomainStmt => ast::Node::CreateDomainStmt(NodeBox::new(unsafe {
+            create_domain_stmt(p as *const bindings::CreateDomainStmt)
+        })),
+        bindings::NodeTag_T_CreateOpClassStmt => {
+            ast::Node::CreateOpClassStmt(NodeBox::new(unsafe {
+                create_op_class_stmt(p as *const bindings::CreateOpClassStmt)
             }))
         }
-        bindings::NodeTag_T_CreateOpClassStmt => protobuf::node::Node::CreateOpClassStmt(unsafe {
-            create_op_class_stmt(p as *const bindings::CreateOpClassStmt)
-        }),
-        bindings::NodeTag_T_CreateOpClassItem => protobuf::node::Node::CreateOpClassItem(unsafe {
-            create_op_class_item(p as *const bindings::CreateOpClassItem)
-        }),
+        bindings::NodeTag_T_CreateOpClassItem => {
+            ast::Node::CreateOpClassItem(NodeBox::new(unsafe {
+                create_op_class_item(p as *const bindings::CreateOpClassItem)
+            }))
+        }
         bindings::NodeTag_T_CreateOpFamilyStmt => {
-            protobuf::node::Node::CreateOpFamilyStmt(unsafe {
+            ast::Node::CreateOpFamilyStmt(NodeBox::new(unsafe {
                 create_op_family_stmt(p as *const bindings::CreateOpFamilyStmt)
-            })
+            }))
         }
-        bindings::NodeTag_T_AlterOpFamilyStmt => protobuf::node::Node::AlterOpFamilyStmt(unsafe {
-            alter_op_family_stmt(p as *const bindings::AlterOpFamilyStmt)
-        }),
-        bindings::NodeTag_T_DropStmt => {
-            protobuf::node::Node::DropStmt(unsafe { drop_stmt(p as *const bindings::DropStmt) })
+        bindings::NodeTag_T_AlterOpFamilyStmt => {
+            ast::Node::AlterOpFamilyStmt(NodeBox::new(unsafe {
+                alter_op_family_stmt(p as *const bindings::AlterOpFamilyStmt)
+            }))
         }
-        bindings::NodeTag_T_TruncateStmt => protobuf::node::Node::TruncateStmt(unsafe {
+        bindings::NodeTag_T_DropStmt => ast::Node::DropStmt(NodeBox::new(unsafe {
+            drop_stmt(p as *const bindings::DropStmt)
+        })),
+        bindings::NodeTag_T_TruncateStmt => ast::Node::TruncateStmt(NodeBox::new(unsafe {
             truncate_stmt(p as *const bindings::TruncateStmt)
-        }),
-        bindings::NodeTag_T_CommentStmt => {
-            protobuf::node::Node::CommentStmt(::std::boxed::Box::new(unsafe {
-                comment_stmt(p as *const bindings::CommentStmt)
-            }))
-        }
-        bindings::NodeTag_T_SecLabelStmt => {
-            protobuf::node::Node::SecLabelStmt(::std::boxed::Box::new(unsafe {
-                sec_label_stmt(p as *const bindings::SecLabelStmt)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_CommentStmt => ast::Node::CommentStmt(NodeBox::new(unsafe {
+            comment_stmt(p as *const bindings::CommentStmt)
+        })),
+        bindings::NodeTag_T_SecLabelStmt => ast::Node::SecLabelStmt(NodeBox::new(unsafe {
+            sec_label_stmt(p as *const bindings::SecLabelStmt)
+        })),
         bindings::NodeTag_T_DeclareCursorStmt => {
-            protobuf::node::Node::DeclareCursorStmt(::std::boxed::Box::new(unsafe {
+            ast::Node::DeclareCursorStmt(NodeBox::new(unsafe {
                 declare_cursor_stmt(p as *const bindings::DeclareCursorStmt)
             }))
         }
-        bindings::NodeTag_T_ClosePortalStmt => protobuf::node::Node::ClosePortalStmt(unsafe {
+        bindings::NodeTag_T_ClosePortalStmt => ast::Node::ClosePortalStmt(NodeBox::new(unsafe {
             close_portal_stmt(p as *const bindings::ClosePortalStmt)
-        }),
-        bindings::NodeTag_T_FetchStmt => {
-            protobuf::node::Node::FetchStmt(unsafe { fetch_stmt(p as *const bindings::FetchStmt) })
-        }
-        bindings::NodeTag_T_IndexStmt => {
-            protobuf::node::Node::IndexStmt(::std::boxed::Box::new(unsafe {
-                index_stmt(p as *const bindings::IndexStmt)
-            }))
-        }
-        bindings::NodeTag_T_CreateStatsStmt => protobuf::node::Node::CreateStatsStmt(unsafe {
+        })),
+        bindings::NodeTag_T_FetchStmt => ast::Node::FetchStmt(NodeBox::new(unsafe {
+            fetch_stmt(p as *const bindings::FetchStmt)
+        })),
+        bindings::NodeTag_T_IndexStmt => ast::Node::IndexStmt(NodeBox::new(unsafe {
+            index_stmt(p as *const bindings::IndexStmt)
+        })),
+        bindings::NodeTag_T_CreateStatsStmt => ast::Node::CreateStatsStmt(NodeBox::new(unsafe {
             create_stats_stmt(p as *const bindings::CreateStatsStmt)
-        }),
-        bindings::NodeTag_T_StatsElem => {
-            protobuf::node::Node::StatsElem(::std::boxed::Box::new(unsafe {
-                stats_elem(p as *const bindings::StatsElem)
-            }))
-        }
-        bindings::NodeTag_T_AlterStatsStmt => {
-            protobuf::node::Node::AlterStatsStmt(::std::boxed::Box::new(unsafe {
-                alter_stats_stmt(p as *const bindings::AlterStatsStmt)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_StatsElem => ast::Node::StatsElem(NodeBox::new(unsafe {
+            stats_elem(p as *const bindings::StatsElem)
+        })),
+        bindings::NodeTag_T_AlterStatsStmt => ast::Node::AlterStatsStmt(NodeBox::new(unsafe {
+            alter_stats_stmt(p as *const bindings::AlterStatsStmt)
+        })),
         bindings::NodeTag_T_CreateFunctionStmt => {
-            protobuf::node::Node::CreateFunctionStmt(::std::boxed::Box::new(unsafe {
+            ast::Node::CreateFunctionStmt(NodeBox::new(unsafe {
                 create_function_stmt(p as *const bindings::CreateFunctionStmt)
             }))
         }
         bindings::NodeTag_T_FunctionParameter => {
-            protobuf::node::Node::FunctionParameter(::std::boxed::Box::new(unsafe {
+            ast::Node::FunctionParameter(NodeBox::new(unsafe {
                 function_parameter(p as *const bindings::FunctionParameter)
             }))
         }
-        bindings::NodeTag_T_AlterFunctionStmt => protobuf::node::Node::AlterFunctionStmt(unsafe {
-            alter_function_stmt(p as *const bindings::AlterFunctionStmt)
-        }),
-        bindings::NodeTag_T_DoStmt => {
-            protobuf::node::Node::DoStmt(unsafe { do_stmt(p as *const bindings::DoStmt) })
+        bindings::NodeTag_T_AlterFunctionStmt => {
+            ast::Node::AlterFunctionStmt(NodeBox::new(unsafe {
+                alter_function_stmt(p as *const bindings::AlterFunctionStmt)
+            }))
         }
-        bindings::NodeTag_T_InlineCodeBlock => protobuf::node::Node::InlineCodeBlock(unsafe {
+        bindings::NodeTag_T_DoStmt => ast::Node::DoStmt(NodeBox::new(unsafe {
+            do_stmt(p as *const bindings::DoStmt)
+        })),
+        bindings::NodeTag_T_InlineCodeBlock => ast::Node::InlineCodeBlock(NodeBox::new(unsafe {
             inline_code_block(p as *const bindings::InlineCodeBlock)
-        }),
-        bindings::NodeTag_T_CallStmt => {
-            protobuf::node::Node::CallStmt(::std::boxed::Box::new(unsafe {
-                call_stmt(p as *const bindings::CallStmt)
-            }))
-        }
-        bindings::NodeTag_T_CallContext => protobuf::node::Node::CallContext(unsafe {
+        })),
+        bindings::NodeTag_T_CallStmt => ast::Node::CallStmt(NodeBox::new(unsafe {
+            call_stmt(p as *const bindings::CallStmt)
+        })),
+        bindings::NodeTag_T_CallContext => ast::Node::CallContext(NodeBox::new(unsafe {
             call_context(p as *const bindings::CallContext)
-        }),
-        bindings::NodeTag_T_RenameStmt => {
-            protobuf::node::Node::RenameStmt(::std::boxed::Box::new(unsafe {
-                rename_stmt(p as *const bindings::RenameStmt)
-            }))
-        }
+        })),
+        bindings::NodeTag_T_RenameStmt => ast::Node::RenameStmt(NodeBox::new(unsafe {
+            rename_stmt(p as *const bindings::RenameStmt)
+        })),
         bindings::NodeTag_T_AlterObjectDependsStmt => {
-            protobuf::node::Node::AlterObjectDependsStmt(::std::boxed::Box::new(unsafe {
+            ast::Node::AlterObjectDependsStmt(NodeBox::new(unsafe {
                 alter_object_depends_stmt(p as *const bindings::AlterObjectDependsStmt)
             }))
         }
         bindings::NodeTag_T_AlterObjectSchemaStmt => {
-            protobuf::node::Node::AlterObjectSchemaStmt(::std::boxed::Box::new(unsafe {
+            ast::Node::AlterObjectSchemaStmt(NodeBox::new(unsafe {
                 alter_object_schema_stmt(p as *const bindings::AlterObjectSchemaStmt)
             }))
         }
-        bindings::NodeTag_T_AlterOwnerStmt => {
-            protobuf::node::Node::AlterOwnerStmt(::std::boxed::Box::new(unsafe {
-                alter_owner_stmt(p as *const bindings::AlterOwnerStmt)
+        bindings::NodeTag_T_AlterOwnerStmt => ast::Node::AlterOwnerStmt(NodeBox::new(unsafe {
+            alter_owner_stmt(p as *const bindings::AlterOwnerStmt)
+        })),
+        bindings::NodeTag_T_AlterOperatorStmt => {
+            ast::Node::AlterOperatorStmt(NodeBox::new(unsafe {
+                alter_operator_stmt(p as *const bindings::AlterOperatorStmt)
             }))
         }
-        bindings::NodeTag_T_AlterOperatorStmt => protobuf::node::Node::AlterOperatorStmt(unsafe {
-            alter_operator_stmt(p as *const bindings::AlterOperatorStmt)
-        }),
-        bindings::NodeTag_T_AlterTypeStmt => protobuf::node::Node::AlterTypeStmt(unsafe {
+        bindings::NodeTag_T_AlterTypeStmt => ast::Node::AlterTypeStmt(NodeBox::new(unsafe {
             alter_type_stmt(p as *const bindings::AlterTypeStmt)
-        }),
-        bindings::NodeTag_T_RuleStmt => {
-            protobuf::node::Node::RuleStmt(::std::boxed::Box::new(unsafe {
-                rule_stmt(p as *const bindings::RuleStmt)
-            }))
-        }
-        bindings::NodeTag_T_NotifyStmt => protobuf::node::Node::NotifyStmt(unsafe {
+        })),
+        bindings::NodeTag_T_RuleStmt => ast::Node::RuleStmt(NodeBox::new(unsafe {
+            rule_stmt(p as *const bindings::RuleStmt)
+        })),
+        bindings::NodeTag_T_NotifyStmt => ast::Node::NotifyStmt(NodeBox::new(unsafe {
             notify_stmt(p as *const bindings::NotifyStmt)
-        }),
-        bindings::NodeTag_T_ListenStmt => protobuf::node::Node::ListenStmt(unsafe {
+        })),
+        bindings::NodeTag_T_ListenStmt => ast::Node::ListenStmt(NodeBox::new(unsafe {
             listen_stmt(p as *const bindings::ListenStmt)
-        }),
-        bindings::NodeTag_T_UnlistenStmt => protobuf::node::Node::UnlistenStmt(unsafe {
+        })),
+        bindings::NodeTag_T_UnlistenStmt => ast::Node::UnlistenStmt(NodeBox::new(unsafe {
             unlisten_stmt(p as *const bindings::UnlistenStmt)
-        }),
-        bindings::NodeTag_T_TransactionStmt => protobuf::node::Node::TransactionStmt(unsafe {
+        })),
+        bindings::NodeTag_T_TransactionStmt => ast::Node::TransactionStmt(NodeBox::new(unsafe {
             transaction_stmt(p as *const bindings::TransactionStmt)
-        }),
-        bindings::NodeTag_T_CompositeTypeStmt => protobuf::node::Node::CompositeTypeStmt(unsafe {
-            composite_type_stmt(p as *const bindings::CompositeTypeStmt)
-        }),
-        bindings::NodeTag_T_CreateEnumStmt => protobuf::node::Node::CreateEnumStmt(unsafe {
-            create_enum_stmt(p as *const bindings::CreateEnumStmt)
-        }),
-        bindings::NodeTag_T_CreateRangeStmt => protobuf::node::Node::CreateRangeStmt(unsafe {
-            create_range_stmt(p as *const bindings::CreateRangeStmt)
-        }),
-        bindings::NodeTag_T_AlterEnumStmt => protobuf::node::Node::AlterEnumStmt(unsafe {
-            alter_enum_stmt(p as *const bindings::AlterEnumStmt)
-        }),
-        bindings::NodeTag_T_ViewStmt => {
-            protobuf::node::Node::ViewStmt(::std::boxed::Box::new(unsafe {
-                view_stmt(p as *const bindings::ViewStmt)
+        })),
+        bindings::NodeTag_T_CompositeTypeStmt => {
+            ast::Node::CompositeTypeStmt(NodeBox::new(unsafe {
+                composite_type_stmt(p as *const bindings::CompositeTypeStmt)
             }))
         }
-        bindings::NodeTag_T_LoadStmt => {
-            protobuf::node::Node::LoadStmt(unsafe { load_stmt(p as *const bindings::LoadStmt) })
-        }
-        bindings::NodeTag_T_CreatedbStmt => protobuf::node::Node::CreatedbStmt(unsafe {
+        bindings::NodeTag_T_CreateEnumStmt => ast::Node::CreateEnumStmt(NodeBox::new(unsafe {
+            create_enum_stmt(p as *const bindings::CreateEnumStmt)
+        })),
+        bindings::NodeTag_T_CreateRangeStmt => ast::Node::CreateRangeStmt(NodeBox::new(unsafe {
+            create_range_stmt(p as *const bindings::CreateRangeStmt)
+        })),
+        bindings::NodeTag_T_AlterEnumStmt => ast::Node::AlterEnumStmt(NodeBox::new(unsafe {
+            alter_enum_stmt(p as *const bindings::AlterEnumStmt)
+        })),
+        bindings::NodeTag_T_ViewStmt => ast::Node::ViewStmt(NodeBox::new(unsafe {
+            view_stmt(p as *const bindings::ViewStmt)
+        })),
+        bindings::NodeTag_T_LoadStmt => ast::Node::LoadStmt(NodeBox::new(unsafe {
+            load_stmt(p as *const bindings::LoadStmt)
+        })),
+        bindings::NodeTag_T_CreatedbStmt => ast::Node::CreatedbStmt(NodeBox::new(unsafe {
             createdb_stmt(p as *const bindings::CreatedbStmt)
-        }),
-        bindings::NodeTag_T_AlterDatabaseStmt => protobuf::node::Node::AlterDatabaseStmt(unsafe {
-            alter_database_stmt(p as *const bindings::AlterDatabaseStmt)
-        }),
+        })),
+        bindings::NodeTag_T_AlterDatabaseStmt => {
+            ast::Node::AlterDatabaseStmt(NodeBox::new(unsafe {
+                alter_database_stmt(p as *const bindings::AlterDatabaseStmt)
+            }))
+        }
         bindings::NodeTag_T_AlterDatabaseRefreshCollStmt => {
-            protobuf::node::Node::AlterDatabaseRefreshCollStmt(unsafe {
+            ast::Node::AlterDatabaseRefreshCollStmt(NodeBox::new(unsafe {
                 alter_database_refresh_coll_stmt(p as *const bindings::AlterDatabaseRefreshCollStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterDatabaseSetStmt => {
-            protobuf::node::Node::AlterDatabaseSetStmt(unsafe {
+            ast::Node::AlterDatabaseSetStmt(NodeBox::new(unsafe {
                 alter_database_set_stmt(p as *const bindings::AlterDatabaseSetStmt)
-            })
-        }
-        bindings::NodeTag_T_DropdbStmt => protobuf::node::Node::DropdbStmt(unsafe {
-            dropdb_stmt(p as *const bindings::DropdbStmt)
-        }),
-        bindings::NodeTag_T_AlterSystemStmt => protobuf::node::Node::AlterSystemStmt(unsafe {
-            alter_system_stmt(p as *const bindings::AlterSystemStmt)
-        }),
-        bindings::NodeTag_T_ClusterStmt => protobuf::node::Node::ClusterStmt(unsafe {
-            cluster_stmt(p as *const bindings::ClusterStmt)
-        }),
-        bindings::NodeTag_T_VacuumStmt => protobuf::node::Node::VacuumStmt(unsafe {
-            vacuum_stmt(p as *const bindings::VacuumStmt)
-        }),
-        bindings::NodeTag_T_VacuumRelation => protobuf::node::Node::VacuumRelation(unsafe {
-            vacuum_relation(p as *const bindings::VacuumRelation)
-        }),
-        bindings::NodeTag_T_ExplainStmt => {
-            protobuf::node::Node::ExplainStmt(::std::boxed::Box::new(unsafe {
-                explain_stmt(p as *const bindings::ExplainStmt)
             }))
         }
+        bindings::NodeTag_T_DropdbStmt => ast::Node::DropdbStmt(NodeBox::new(unsafe {
+            dropdb_stmt(p as *const bindings::DropdbStmt)
+        })),
+        bindings::NodeTag_T_AlterSystemStmt => ast::Node::AlterSystemStmt(NodeBox::new(unsafe {
+            alter_system_stmt(p as *const bindings::AlterSystemStmt)
+        })),
+        bindings::NodeTag_T_ClusterStmt => ast::Node::ClusterStmt(NodeBox::new(unsafe {
+            cluster_stmt(p as *const bindings::ClusterStmt)
+        })),
+        bindings::NodeTag_T_VacuumStmt => ast::Node::VacuumStmt(NodeBox::new(unsafe {
+            vacuum_stmt(p as *const bindings::VacuumStmt)
+        })),
+        bindings::NodeTag_T_VacuumRelation => ast::Node::VacuumRelation(NodeBox::new(unsafe {
+            vacuum_relation(p as *const bindings::VacuumRelation)
+        })),
+        bindings::NodeTag_T_ExplainStmt => ast::Node::ExplainStmt(NodeBox::new(unsafe {
+            explain_stmt(p as *const bindings::ExplainStmt)
+        })),
         bindings::NodeTag_T_CreateTableAsStmt => {
-            protobuf::node::Node::CreateTableAsStmt(::std::boxed::Box::new(unsafe {
+            ast::Node::CreateTableAsStmt(NodeBox::new(unsafe {
                 create_table_as_stmt(p as *const bindings::CreateTableAsStmt)
             }))
         }
         bindings::NodeTag_T_RefreshMatViewStmt => {
-            protobuf::node::Node::RefreshMatViewStmt(unsafe {
+            ast::Node::RefreshMatViewStmt(NodeBox::new(unsafe {
                 refresh_mat_view_stmt(p as *const bindings::RefreshMatViewStmt)
-            })
-        }
-        bindings::NodeTag_T_CheckPointStmt => protobuf::node::Node::CheckPointStmt(unsafe {
-            check_point_stmt(p as *const bindings::CheckPointStmt)
-        }),
-        bindings::NodeTag_T_DiscardStmt => protobuf::node::Node::DiscardStmt(unsafe {
-            discard_stmt(p as *const bindings::DiscardStmt)
-        }),
-        bindings::NodeTag_T_LockStmt => {
-            protobuf::node::Node::LockStmt(unsafe { lock_stmt(p as *const bindings::LockStmt) })
-        }
-        bindings::NodeTag_T_ConstraintsSetStmt => {
-            protobuf::node::Node::ConstraintsSetStmt(unsafe {
-                constraints_set_stmt(p as *const bindings::ConstraintsSetStmt)
-            })
-        }
-        bindings::NodeTag_T_ReindexStmt => protobuf::node::Node::ReindexStmt(unsafe {
-            reindex_stmt(p as *const bindings::ReindexStmt)
-        }),
-        bindings::NodeTag_T_CreateConversionStmt => {
-            protobuf::node::Node::CreateConversionStmt(unsafe {
-                create_conversion_stmt(p as *const bindings::CreateConversionStmt)
-            })
-        }
-        bindings::NodeTag_T_CreateCastStmt => protobuf::node::Node::CreateCastStmt(unsafe {
-            create_cast_stmt(p as *const bindings::CreateCastStmt)
-        }),
-        bindings::NodeTag_T_CreateTransformStmt => {
-            protobuf::node::Node::CreateTransformStmt(unsafe {
-                create_transform_stmt(p as *const bindings::CreateTransformStmt)
-            })
-        }
-        bindings::NodeTag_T_PrepareStmt => {
-            protobuf::node::Node::PrepareStmt(::std::boxed::Box::new(unsafe {
-                prepare_stmt(p as *const bindings::PrepareStmt)
             }))
         }
-        bindings::NodeTag_T_ExecuteStmt => protobuf::node::Node::ExecuteStmt(unsafe {
+        bindings::NodeTag_T_CheckPointStmt => ast::Node::CheckPointStmt(NodeBox::new(unsafe {
+            check_point_stmt(p as *const bindings::CheckPointStmt)
+        })),
+        bindings::NodeTag_T_DiscardStmt => ast::Node::DiscardStmt(NodeBox::new(unsafe {
+            discard_stmt(p as *const bindings::DiscardStmt)
+        })),
+        bindings::NodeTag_T_LockStmt => ast::Node::LockStmt(NodeBox::new(unsafe {
+            lock_stmt(p as *const bindings::LockStmt)
+        })),
+        bindings::NodeTag_T_ConstraintsSetStmt => {
+            ast::Node::ConstraintsSetStmt(NodeBox::new(unsafe {
+                constraints_set_stmt(p as *const bindings::ConstraintsSetStmt)
+            }))
+        }
+        bindings::NodeTag_T_ReindexStmt => ast::Node::ReindexStmt(NodeBox::new(unsafe {
+            reindex_stmt(p as *const bindings::ReindexStmt)
+        })),
+        bindings::NodeTag_T_CreateConversionStmt => {
+            ast::Node::CreateConversionStmt(NodeBox::new(unsafe {
+                create_conversion_stmt(p as *const bindings::CreateConversionStmt)
+            }))
+        }
+        bindings::NodeTag_T_CreateCastStmt => ast::Node::CreateCastStmt(NodeBox::new(unsafe {
+            create_cast_stmt(p as *const bindings::CreateCastStmt)
+        })),
+        bindings::NodeTag_T_CreateTransformStmt => {
+            ast::Node::CreateTransformStmt(NodeBox::new(unsafe {
+                create_transform_stmt(p as *const bindings::CreateTransformStmt)
+            }))
+        }
+        bindings::NodeTag_T_PrepareStmt => ast::Node::PrepareStmt(NodeBox::new(unsafe {
+            prepare_stmt(p as *const bindings::PrepareStmt)
+        })),
+        bindings::NodeTag_T_ExecuteStmt => ast::Node::ExecuteStmt(NodeBox::new(unsafe {
             execute_stmt(p as *const bindings::ExecuteStmt)
-        }),
-        bindings::NodeTag_T_DeallocateStmt => protobuf::node::Node::DeallocateStmt(unsafe {
+        })),
+        bindings::NodeTag_T_DeallocateStmt => ast::Node::DeallocateStmt(NodeBox::new(unsafe {
             deallocate_stmt(p as *const bindings::DeallocateStmt)
-        }),
-        bindings::NodeTag_T_DropOwnedStmt => protobuf::node::Node::DropOwnedStmt(unsafe {
+        })),
+        bindings::NodeTag_T_DropOwnedStmt => ast::Node::DropOwnedStmt(NodeBox::new(unsafe {
             drop_owned_stmt(p as *const bindings::DropOwnedStmt)
-        }),
-        bindings::NodeTag_T_ReassignOwnedStmt => protobuf::node::Node::ReassignOwnedStmt(unsafe {
-            reassign_owned_stmt(p as *const bindings::ReassignOwnedStmt)
-        }),
+        })),
+        bindings::NodeTag_T_ReassignOwnedStmt => {
+            ast::Node::ReassignOwnedStmt(NodeBox::new(unsafe {
+                reassign_owned_stmt(p as *const bindings::ReassignOwnedStmt)
+            }))
+        }
         bindings::NodeTag_T_AlterTSDictionaryStmt => {
-            protobuf::node::Node::AlterTsdictionaryStmt(unsafe {
+            ast::Node::AlterTsDictionaryStmt(NodeBox::new(unsafe {
                 alter_ts_dictionary_stmt(p as *const bindings::AlterTSDictionaryStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterTSConfigurationStmt => {
-            protobuf::node::Node::AlterTsconfigurationStmt(unsafe {
+            ast::Node::AlterTsConfigurationStmt(NodeBox::new(unsafe {
                 alter_ts_configuration_stmt(p as *const bindings::AlterTSConfigurationStmt)
-            })
-        }
-        bindings::NodeTag_T_PublicationTable => {
-            protobuf::node::Node::PublicationTable(::std::boxed::Box::new(unsafe {
-                publication_table(p as *const bindings::PublicationTable)
             }))
         }
+        bindings::NodeTag_T_PublicationTable => ast::Node::PublicationTable(NodeBox::new(unsafe {
+            publication_table(p as *const bindings::PublicationTable)
+        })),
         bindings::NodeTag_T_PublicationObjSpec => {
-            protobuf::node::Node::PublicationObjSpec(::std::boxed::Box::new(unsafe {
+            ast::Node::PublicationObjSpec(NodeBox::new(unsafe {
                 publication_obj_spec(p as *const bindings::PublicationObjSpec)
             }))
         }
         bindings::NodeTag_T_CreatePublicationStmt => {
-            protobuf::node::Node::CreatePublicationStmt(unsafe {
+            ast::Node::CreatePublicationStmt(NodeBox::new(unsafe {
                 create_publication_stmt(p as *const bindings::CreatePublicationStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterPublicationStmt => {
-            protobuf::node::Node::AlterPublicationStmt(unsafe {
+            ast::Node::AlterPublicationStmt(NodeBox::new(unsafe {
                 alter_publication_stmt(p as *const bindings::AlterPublicationStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_CreateSubscriptionStmt => {
-            protobuf::node::Node::CreateSubscriptionStmt(unsafe {
+            ast::Node::CreateSubscriptionStmt(NodeBox::new(unsafe {
                 create_subscription_stmt(p as *const bindings::CreateSubscriptionStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_AlterSubscriptionStmt => {
-            protobuf::node::Node::AlterSubscriptionStmt(unsafe {
+            ast::Node::AlterSubscriptionStmt(NodeBox::new(unsafe {
                 alter_subscription_stmt(p as *const bindings::AlterSubscriptionStmt)
-            })
+            }))
         }
         bindings::NodeTag_T_DropSubscriptionStmt => {
-            protobuf::node::Node::DropSubscriptionStmt(unsafe {
+            ast::Node::DropSubscriptionStmt(NodeBox::new(unsafe {
                 drop_subscription_stmt(p as *const bindings::DropSubscriptionStmt)
-            })
+            }))
         }
-        bindings::NodeTag_T_Integer => {
-            protobuf::node::Node::Integer(unsafe { integer(p as *const bindings::Integer) })
-        }
+        bindings::NodeTag_T_Integer => ast::Node::Integer(NodeBox::new(unsafe {
+            integer(p as *const bindings::Integer)
+        })),
         bindings::NodeTag_T_Float => {
-            protobuf::node::Node::Float(unsafe { float(p as *const bindings::Float) })
+            ast::Node::Float(NodeBox::new(unsafe { float(p as *const bindings::Float) }))
         }
-        bindings::NodeTag_T_Boolean => {
-            protobuf::node::Node::Boolean(unsafe { boolean(p as *const bindings::Boolean) })
-        }
-        bindings::NodeTag_T_String => {
-            protobuf::node::Node::String(unsafe { string(p as *const bindings::String) })
-        }
-        bindings::NodeTag_T_BitString => {
-            protobuf::node::Node::BitString(unsafe { bit_string(p as *const bindings::BitString) })
-        }
+        bindings::NodeTag_T_Boolean => ast::Node::Boolean(NodeBox::new(unsafe {
+            boolean(p as *const bindings::Boolean)
+        })),
+        bindings::NodeTag_T_String => ast::Node::String(NodeBox::new(unsafe {
+            string(p as *const bindings::String)
+        })),
+        bindings::NodeTag_T_BitString => ast::Node::BitString(NodeBox::new(unsafe {
+            bit_string(p as *const bindings::BitString)
+        })),
         bindings::NodeTag_T_List => {
-            protobuf::node::Node::List(unsafe { list(p as *const bindings::List) })
+            ast::Node::List(NodeBox::new(unsafe { list(p as *const bindings::List) }))
         }
-        bindings::NodeTag_T_IntList => {
-            protobuf::node::Node::IntList(unsafe { int_list(p as *const bindings::List) })
-        }
-        bindings::NodeTag_T_OidList => {
-            protobuf::node::Node::OidList(unsafe { oid_list(p as *const bindings::List) })
-        }
-        bindings::NodeTag_T_A_Const => {
-            protobuf::node::Node::AConst(unsafe { a_const(p as *const bindings::A_Const) })
-        }
+        bindings::NodeTag_T_IntList => ast::Node::IntList(NodeBox::new(unsafe {
+            int_list(p as *const bindings::List)
+        })),
+        bindings::NodeTag_T_OidList => ast::Node::OidList(NodeBox::new(unsafe {
+            oid_list(p as *const bindings::List)
+        })),
+        bindings::NodeTag_T_A_Const => ast::Node::AConst(NodeBox::new(unsafe {
+            a_const(p as *const bindings::A_Const)
+        })),
         _ => return None,
     })
 }
@@ -1333,7 +1127,7 @@ pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<protobuf::node::No
 ///
 /// # Safety
 /// `list` must be NULL or point to a valid `List` of `RawStmt`.
-pub(crate) unsafe fn raw_stmts(list: *const bindings::List) -> ::std::vec::Vec<protobuf::RawStmt> {
+pub(crate) unsafe fn raw_stmts(list: *const bindings::List) -> ::std::vec::Vec<ast::RawStmt> {
     begin();
     let mut out = ::std::vec::Vec::new();
     if list.is_null() {
@@ -1349,117 +1143,111 @@ pub(crate) unsafe fn raw_stmts(list: *const bindings::List) -> ::std::vec::Vec<p
     out
 }
 
-pub(crate) unsafe fn integer(p: *const bindings::Integer) -> protobuf::Integer {
+pub(crate) unsafe fn integer(p: *const bindings::Integer) -> ast::Integer {
     if too_deep() {
-        return protobuf::Integer::default();
+        return ast::Integer::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::Integer::default();
+    let mut out = ast::Integer::default();
     out.ival = unsafe { (*p).ival as i32 };
     out
 }
 
-pub(crate) unsafe fn float(p: *const bindings::Float) -> protobuf::Float {
+pub(crate) unsafe fn float(p: *const bindings::Float) -> ast::Float {
     if too_deep() {
-        return protobuf::Float::default();
+        return ast::Float::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::Float::default();
+    let mut out = ast::Float::default();
     out.fval = unsafe { c_string((*p).fval) };
     out
 }
 
-pub(crate) unsafe fn boolean(p: *const bindings::Boolean) -> protobuf::Boolean {
+pub(crate) unsafe fn boolean(p: *const bindings::Boolean) -> ast::Boolean {
     if too_deep() {
-        return protobuf::Boolean::default();
+        return ast::Boolean::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::Boolean::default();
+    let mut out = ast::Boolean::default();
     out.boolval = unsafe { (*p).boolval };
     out
 }
 
-pub(crate) unsafe fn string(p: *const bindings::String) -> protobuf::String {
+pub(crate) unsafe fn string(p: *const bindings::String) -> ast::String {
     if too_deep() {
-        return protobuf::String::default();
+        return ast::String::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::String::default();
+    let mut out = ast::String::default();
     out.sval = unsafe { c_string((*p).sval) };
     out
 }
 
-pub(crate) unsafe fn bit_string(p: *const bindings::BitString) -> protobuf::BitString {
+pub(crate) unsafe fn bit_string(p: *const bindings::BitString) -> ast::BitString {
     if too_deep() {
-        return protobuf::BitString::default();
+        return ast::BitString::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::BitString::default();
+    let mut out = ast::BitString::default();
     out.bsval = unsafe { c_string((*p).bsval) };
     out
 }
 
-pub(crate) unsafe fn list(p: *const bindings::List) -> protobuf::List {
+pub(crate) unsafe fn list(p: *const bindings::List) -> ast::List {
     if too_deep() {
-        return protobuf::List::default();
+        return ast::List::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::List::default();
+    let mut out = ast::List::default();
     out.items = unsafe { list_items(p as *mut bindings::List) };
     out
 }
 
-pub(crate) unsafe fn oid_list(p: *const bindings::List) -> protobuf::OidList {
+pub(crate) unsafe fn oid_list(p: *const bindings::List) -> ast::OidList {
     if too_deep() {
-        return protobuf::OidList::default();
+        return ast::OidList::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::OidList::default();
+    let mut out = ast::OidList::default();
     out.items = unsafe { list_items(p as *mut bindings::List) };
     out
 }
 
-pub(crate) unsafe fn int_list(p: *const bindings::List) -> protobuf::IntList {
+pub(crate) unsafe fn int_list(p: *const bindings::List) -> ast::IntList {
     if too_deep() {
-        return protobuf::IntList::default();
+        return ast::IntList::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::IntList::default();
+    let mut out = ast::IntList::default();
     out.items = unsafe { list_items(p as *mut bindings::List) };
     out
 }
 
-pub(crate) unsafe fn a_const(p: *const bindings::A_Const) -> protobuf::AConst {
+pub(crate) unsafe fn a_const(p: *const bindings::A_Const) -> ast::AConst {
     if too_deep() {
-        return protobuf::AConst::default();
+        return ast::AConst::default();
     }
     let _depth = DepthGuard::new();
-    let mut out = protobuf::AConst::default();
+    let mut out = ast::AConst::default();
     out.isnull = unsafe { (*p).isnull };
     out.location = unsafe { (*p).location as i32 };
     if !out.isnull {
         out.val = unsafe {
             match (*p).val.node.type_ {
-                bindings::NodeTag_T_Integer => {
-                    Some(protobuf::a_const::Val::Ival(protobuf::Integer {
-                        ival: (*p).val.ival.ival as i32,
-                    }))
-                }
-                bindings::NodeTag_T_Float => Some(protobuf::a_const::Val::Fval(protobuf::Float {
+                bindings::NodeTag_T_Integer => Some(ast::AConstValue::Integer(ast::Integer {
+                    ival: (*p).val.ival.ival as i32,
+                })),
+                bindings::NodeTag_T_Float => Some(ast::AConstValue::Float(ast::Float {
                     fval: c_string((*p).val.fval.fval),
                 })),
-                bindings::NodeTag_T_Boolean => {
-                    Some(protobuf::a_const::Val::Boolval(protobuf::Boolean {
-                        boolval: (*p).val.boolval.boolval,
-                    }))
-                }
-                bindings::NodeTag_T_String => {
-                    Some(protobuf::a_const::Val::Sval(protobuf::String {
-                        sval: c_string((*p).val.sval.sval),
-                    }))
-                }
+                bindings::NodeTag_T_Boolean => Some(ast::AConstValue::Boolean(ast::Boolean {
+                    boolval: (*p).val.boolval.boolval,
+                })),
+                bindings::NodeTag_T_String => Some(ast::AConstValue::String(ast::String {
+                    sval: c_string((*p).val.sval.sval),
+                })),
                 bindings::NodeTag_T_BitString => {
-                    Some(protobuf::a_const::Val::Bsval(protobuf::BitString {
+                    Some(ast::AConstValue::BitString(ast::BitString {
                         bsval: c_string((*p).val.bsval.bsval),
                     }))
                 }
@@ -1470,26 +1258,26 @@ pub(crate) unsafe fn a_const(p: *const bindings::A_Const) -> protobuf::AConst {
     out
 }
 
-pub(crate) unsafe fn alias(p: *const bindings::Alias) -> protobuf::Alias {
+pub(crate) unsafe fn alias(p: *const bindings::Alias) -> ast::Alias {
     if too_deep() {
-        return protobuf::Alias::default();
+        return ast::Alias::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::Alias::default();
+        let mut out = ast::Alias::default();
         out.aliasname = unsafe { c_string((*p).aliasname) };
         out.colnames = unsafe { list_items((*p).colnames) };
         out
     })
 }
 
-pub(crate) unsafe fn range_var(p: *const bindings::RangeVar) -> protobuf::RangeVar {
+pub(crate) unsafe fn range_var(p: *const bindings::RangeVar) -> ast::RangeVar {
     if too_deep() {
-        return protobuf::RangeVar::default();
+        return ast::RangeVar::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeVar::default();
+        let mut out = ast::RangeVar::default();
         out.catalogname = unsafe { c_string((*p).catalogname) };
         out.schemaname = unsafe { c_string((*p).schemaname) };
         out.relname = unsafe { c_string((*p).relname) };
@@ -1499,7 +1287,7 @@ pub(crate) unsafe fn range_var(p: *const bindings::RangeVar) -> protobuf::RangeV
             if (*p).alias.is_null() {
                 None
             } else {
-                Some(alias((*p).alias as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).alias as *const bindings::Alias)))
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -1507,13 +1295,13 @@ pub(crate) unsafe fn range_var(p: *const bindings::RangeVar) -> protobuf::RangeV
     })
 }
 
-pub(crate) unsafe fn table_func(p: *const bindings::TableFunc) -> protobuf::TableFunc {
+pub(crate) unsafe fn table_func(p: *const bindings::TableFunc) -> ast::TableFunc {
     if too_deep() {
-        return protobuf::TableFunc::default();
+        return ast::TableFunc::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TableFunc::default();
+        let mut out = ast::TableFunc::default();
         out.functype = unsafe { convert_table_func_type((*p).functype) };
         out.ns_uris = unsafe { list_items((*p).ns_uris) };
         out.ns_names = unsafe { list_items((*p).ns_names) };
@@ -1521,18 +1309,14 @@ pub(crate) unsafe fn table_func(p: *const bindings::TableFunc) -> protobuf::Tabl
             if (*p).docexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).docexpr as *const bindings::Node),
-                }))
+                node((*p).docexpr as *const bindings::Node)
             }
         };
         out.rowexpr = unsafe {
             if (*p).rowexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).rowexpr as *const bindings::Node),
-                }))
+                node((*p).rowexpr as *const bindings::Node)
             }
         };
         out.colnames = unsafe { list_items((*p).colnames) };
@@ -1548,9 +1332,7 @@ pub(crate) unsafe fn table_func(p: *const bindings::TableFunc) -> protobuf::Tabl
             if (*p).plan.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).plan as *const bindings::Node),
-                }))
+                node((*p).plan as *const bindings::Node)
             }
         };
         out.ordinalitycol = unsafe { (*p).ordinalitycol as i32 };
@@ -1559,18 +1341,20 @@ pub(crate) unsafe fn table_func(p: *const bindings::TableFunc) -> protobuf::Tabl
     })
 }
 
-pub(crate) unsafe fn into_clause(p: *const bindings::IntoClause) -> protobuf::IntoClause {
+pub(crate) unsafe fn into_clause(p: *const bindings::IntoClause) -> ast::IntoClause {
     if too_deep() {
-        return protobuf::IntoClause::default();
+        return ast::IntoClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::IntoClause::default();
+        let mut out = ast::IntoClause::default();
         out.rel = unsafe {
             if (*p).rel.is_null() {
                 None
             } else {
-                Some(range_var((*p).rel as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).rel as *const bindings::RangeVar,
+                )))
             }
         };
         out.col_names = unsafe { list_items((*p).colNames) };
@@ -1582,7 +1366,7 @@ pub(crate) unsafe fn into_clause(p: *const bindings::IntoClause) -> protobuf::In
             if (*p).viewQuery.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(query(
+                Some(NodeBox::new(query(
                     (*p).viewQuery as *const bindings::Query,
                 )))
             }
@@ -1592,13 +1376,13 @@ pub(crate) unsafe fn into_clause(p: *const bindings::IntoClause) -> protobuf::In
     })
 }
 
-pub(crate) unsafe fn var(p: *const bindings::Var) -> protobuf::Var {
+pub(crate) unsafe fn var(p: *const bindings::Var) -> ast::Var {
     if too_deep() {
-        return protobuf::Var::default();
+        return ast::Var::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::Var::default();
+        let mut out = ast::Var::default();
         out.varno = unsafe { (*p).varno as i32 };
         out.varattno = unsafe { (*p).varattno as i32 };
         out.vartype = unsafe { (*p).vartype as u32 };
@@ -1612,13 +1396,13 @@ pub(crate) unsafe fn var(p: *const bindings::Var) -> protobuf::Var {
     })
 }
 
-pub(crate) unsafe fn param(p: *const bindings::Param) -> protobuf::Param {
+pub(crate) unsafe fn param(p: *const bindings::Param) -> ast::Param {
     if too_deep() {
-        return protobuf::Param::default();
+        return ast::Param::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::Param::default();
+        let mut out = ast::Param::default();
         out.paramkind = unsafe { convert_param_kind((*p).paramkind) };
         out.paramid = unsafe { (*p).paramid as i32 };
         out.paramtype = unsafe { (*p).paramtype as u32 };
@@ -1629,13 +1413,13 @@ pub(crate) unsafe fn param(p: *const bindings::Param) -> protobuf::Param {
     })
 }
 
-pub(crate) unsafe fn aggref(p: *const bindings::Aggref) -> protobuf::Aggref {
+pub(crate) unsafe fn aggref(p: *const bindings::Aggref) -> ast::Aggref {
     if too_deep() {
-        return protobuf::Aggref::default();
+        return ast::Aggref::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::Aggref::default();
+        let mut out = ast::Aggref::default();
         out.aggfnoid = unsafe { (*p).aggfnoid as u32 };
         out.aggtype = unsafe { (*p).aggtype as u32 };
         out.aggcollid = unsafe { (*p).aggcollid as u32 };
@@ -1649,9 +1433,7 @@ pub(crate) unsafe fn aggref(p: *const bindings::Aggref) -> protobuf::Aggref {
             if (*p).aggfilter.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).aggfilter as *const bindings::Node),
-                }))
+                node((*p).aggfilter as *const bindings::Node)
             }
         };
         out.aggstar = unsafe { (*p).aggstar };
@@ -1666,13 +1448,13 @@ pub(crate) unsafe fn aggref(p: *const bindings::Aggref) -> protobuf::Aggref {
     })
 }
 
-pub(crate) unsafe fn grouping_func(p: *const bindings::GroupingFunc) -> protobuf::GroupingFunc {
+pub(crate) unsafe fn grouping_func(p: *const bindings::GroupingFunc) -> ast::GroupingFunc {
     if too_deep() {
-        return protobuf::GroupingFunc::default();
+        return ast::GroupingFunc::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::GroupingFunc::default();
+        let mut out = ast::GroupingFunc::default();
         out.args = unsafe { list_items((*p).args) };
         out.refs = unsafe { list_items((*p).refs) };
         out.agglevelsup = unsafe { (*p).agglevelsup as u32 };
@@ -1681,13 +1463,13 @@ pub(crate) unsafe fn grouping_func(p: *const bindings::GroupingFunc) -> protobuf
     })
 }
 
-pub(crate) unsafe fn window_func(p: *const bindings::WindowFunc) -> protobuf::WindowFunc {
+pub(crate) unsafe fn window_func(p: *const bindings::WindowFunc) -> ast::WindowFunc {
     if too_deep() {
-        return protobuf::WindowFunc::default();
+        return ast::WindowFunc::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::WindowFunc::default();
+        let mut out = ast::WindowFunc::default();
         out.winfnoid = unsafe { (*p).winfnoid as u32 };
         out.wintype = unsafe { (*p).wintype as u32 };
         out.wincollid = unsafe { (*p).wincollid as u32 };
@@ -1697,9 +1479,7 @@ pub(crate) unsafe fn window_func(p: *const bindings::WindowFunc) -> protobuf::Wi
             if (*p).aggfilter.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).aggfilter as *const bindings::Node),
-                }))
+                node((*p).aggfilter as *const bindings::Node)
             }
         };
         out.run_condition = unsafe { list_items((*p).runCondition) };
@@ -1713,13 +1493,13 @@ pub(crate) unsafe fn window_func(p: *const bindings::WindowFunc) -> protobuf::Wi
 
 pub(crate) unsafe fn window_func_run_condition(
     p: *const bindings::WindowFuncRunCondition,
-) -> protobuf::WindowFuncRunCondition {
+) -> ast::WindowFuncRunCondition {
     if too_deep() {
-        return protobuf::WindowFuncRunCondition::default();
+        return ast::WindowFuncRunCondition::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::WindowFuncRunCondition::default();
+        let mut out = ast::WindowFuncRunCondition::default();
         out.opno = unsafe { (*p).opno as u32 };
         out.inputcollid = unsafe { (*p).inputcollid as u32 };
         out.wfunc_left = unsafe { (*p).wfunc_left };
@@ -1727,9 +1507,7 @@ pub(crate) unsafe fn window_func_run_condition(
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out
@@ -1738,13 +1516,13 @@ pub(crate) unsafe fn window_func_run_condition(
 
 pub(crate) unsafe fn merge_support_func(
     p: *const bindings::MergeSupportFunc,
-) -> protobuf::MergeSupportFunc {
+) -> ast::MergeSupportFunc {
     if too_deep() {
-        return protobuf::MergeSupportFunc::default();
+        return ast::MergeSupportFunc::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::MergeSupportFunc::default();
+        let mut out = ast::MergeSupportFunc::default();
         out.msftype = unsafe { (*p).msftype as u32 };
         out.msfcollid = unsafe { (*p).msfcollid as u32 };
         out.location = unsafe { (*p).location as i32 };
@@ -1752,15 +1530,13 @@ pub(crate) unsafe fn merge_support_func(
     })
 }
 
-pub(crate) unsafe fn subscripting_ref(
-    p: *const bindings::SubscriptingRef,
-) -> protobuf::SubscriptingRef {
+pub(crate) unsafe fn subscripting_ref(p: *const bindings::SubscriptingRef) -> ast::SubscriptingRef {
     if too_deep() {
-        return protobuf::SubscriptingRef::default();
+        return ast::SubscriptingRef::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SubscriptingRef::default();
+        let mut out = ast::SubscriptingRef::default();
         out.refcontainertype = unsafe { (*p).refcontainertype as u32 };
         out.refelemtype = unsafe { (*p).refelemtype as u32 };
         out.refrestype = unsafe { (*p).refrestype as u32 };
@@ -1772,31 +1548,27 @@ pub(crate) unsafe fn subscripting_ref(
             if (*p).refexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).refexpr as *const bindings::Node),
-                }))
+                node((*p).refexpr as *const bindings::Node)
             }
         };
         out.refassgnexpr = unsafe {
             if (*p).refassgnexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).refassgnexpr as *const bindings::Node),
-                }))
+                node((*p).refassgnexpr as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn func_expr(p: *const bindings::FuncExpr) -> protobuf::FuncExpr {
+pub(crate) unsafe fn func_expr(p: *const bindings::FuncExpr) -> ast::FuncExpr {
     if too_deep() {
-        return protobuf::FuncExpr::default();
+        return ast::FuncExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::FuncExpr::default();
+        let mut out = ast::FuncExpr::default();
         out.funcid = unsafe { (*p).funcid as u32 };
         out.funcresulttype = unsafe { (*p).funcresulttype as u32 };
         out.funcretset = unsafe { (*p).funcretset };
@@ -1810,20 +1582,18 @@ pub(crate) unsafe fn func_expr(p: *const bindings::FuncExpr) -> protobuf::FuncEx
     })
 }
 
-pub(crate) unsafe fn named_arg_expr(p: *const bindings::NamedArgExpr) -> protobuf::NamedArgExpr {
+pub(crate) unsafe fn named_arg_expr(p: *const bindings::NamedArgExpr) -> ast::NamedArgExpr {
     if too_deep() {
-        return protobuf::NamedArgExpr::default();
+        return ast::NamedArgExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::NamedArgExpr::default();
+        let mut out = ast::NamedArgExpr::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.name = unsafe { c_string((*p).name) };
@@ -1833,13 +1603,13 @@ pub(crate) unsafe fn named_arg_expr(p: *const bindings::NamedArgExpr) -> protobu
     })
 }
 
-pub(crate) unsafe fn op_expr(p: *const bindings::OpExpr) -> protobuf::OpExpr {
+pub(crate) unsafe fn op_expr(p: *const bindings::OpExpr) -> ast::OpExpr {
     if too_deep() {
-        return protobuf::OpExpr::default();
+        return ast::OpExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::OpExpr::default();
+        let mut out = ast::OpExpr::default();
         out.opno = unsafe { (*p).opno as u32 };
         out.opresulttype = unsafe { (*p).opresulttype as u32 };
         out.opretset = unsafe { (*p).opretset };
@@ -1851,13 +1621,13 @@ pub(crate) unsafe fn op_expr(p: *const bindings::OpExpr) -> protobuf::OpExpr {
     })
 }
 
-pub(crate) unsafe fn distinct_expr(p: *const bindings::DistinctExpr) -> protobuf::DistinctExpr {
+pub(crate) unsafe fn distinct_expr(p: *const bindings::DistinctExpr) -> ast::DistinctExpr {
     if too_deep() {
-        return protobuf::DistinctExpr::default();
+        return ast::DistinctExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DistinctExpr::default();
+        let mut out = ast::DistinctExpr::default();
         out.opno = unsafe { (*p).opno as u32 };
         out.opresulttype = unsafe { (*p).opresulttype as u32 };
         out.opretset = unsafe { (*p).opretset };
@@ -1869,13 +1639,13 @@ pub(crate) unsafe fn distinct_expr(p: *const bindings::DistinctExpr) -> protobuf
     })
 }
 
-pub(crate) unsafe fn null_if_expr(p: *const bindings::NullIfExpr) -> protobuf::NullIfExpr {
+pub(crate) unsafe fn null_if_expr(p: *const bindings::NullIfExpr) -> ast::NullIfExpr {
     if too_deep() {
-        return protobuf::NullIfExpr::default();
+        return ast::NullIfExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::NullIfExpr::default();
+        let mut out = ast::NullIfExpr::default();
         out.opno = unsafe { (*p).opno as u32 };
         out.opresulttype = unsafe { (*p).opresulttype as u32 };
         out.opretset = unsafe { (*p).opretset };
@@ -1889,13 +1659,13 @@ pub(crate) unsafe fn null_if_expr(p: *const bindings::NullIfExpr) -> protobuf::N
 
 pub(crate) unsafe fn scalar_array_op_expr(
     p: *const bindings::ScalarArrayOpExpr,
-) -> protobuf::ScalarArrayOpExpr {
+) -> ast::ScalarArrayOpExpr {
     if too_deep() {
-        return protobuf::ScalarArrayOpExpr::default();
+        return ast::ScalarArrayOpExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ScalarArrayOpExpr::default();
+        let mut out = ast::ScalarArrayOpExpr::default();
         out.opno = unsafe { (*p).opno as u32 };
         out.use_or = unsafe { (*p).useOr };
         out.inputcollid = unsafe { (*p).inputcollid as u32 };
@@ -1905,13 +1675,13 @@ pub(crate) unsafe fn scalar_array_op_expr(
     })
 }
 
-pub(crate) unsafe fn bool_expr(p: *const bindings::BoolExpr) -> protobuf::BoolExpr {
+pub(crate) unsafe fn bool_expr(p: *const bindings::BoolExpr) -> ast::BoolExpr {
     if too_deep() {
-        return protobuf::BoolExpr::default();
+        return ast::BoolExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::BoolExpr::default();
+        let mut out = ast::BoolExpr::default();
         out.boolop = unsafe { convert_bool_expr_type((*p).boolop) };
         out.args = unsafe { list_items((*p).args) };
         out.location = unsafe { (*p).location as i32 };
@@ -1919,22 +1689,20 @@ pub(crate) unsafe fn bool_expr(p: *const bindings::BoolExpr) -> protobuf::BoolEx
     })
 }
 
-pub(crate) unsafe fn sub_link(p: *const bindings::SubLink) -> protobuf::SubLink {
+pub(crate) unsafe fn sub_link(p: *const bindings::SubLink) -> ast::SubLink {
     if too_deep() {
-        return protobuf::SubLink::default();
+        return ast::SubLink::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SubLink::default();
+        let mut out = ast::SubLink::default();
         out.sub_link_type = unsafe { convert_sub_link_type((*p).subLinkType) };
         out.sub_link_id = unsafe { (*p).subLinkId as i32 };
         out.testexpr = unsafe {
             if (*p).testexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).testexpr as *const bindings::Node),
-                }))
+                node((*p).testexpr as *const bindings::Node)
             }
         };
         out.oper_name = unsafe { list_items((*p).operName) };
@@ -1942,9 +1710,7 @@ pub(crate) unsafe fn sub_link(p: *const bindings::SubLink) -> protobuf::SubLink 
             if (*p).subselect.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).subselect as *const bindings::Node),
-                }))
+                node((*p).subselect as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -1952,21 +1718,19 @@ pub(crate) unsafe fn sub_link(p: *const bindings::SubLink) -> protobuf::SubLink 
     })
 }
 
-pub(crate) unsafe fn sub_plan(p: *const bindings::SubPlan) -> protobuf::SubPlan {
+pub(crate) unsafe fn sub_plan(p: *const bindings::SubPlan) -> ast::SubPlan {
     if too_deep() {
-        return protobuf::SubPlan::default();
+        return ast::SubPlan::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SubPlan::default();
+        let mut out = ast::SubPlan::default();
         out.sub_link_type = unsafe { convert_sub_link_type((*p).subLinkType) };
         out.testexpr = unsafe {
             if (*p).testexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).testexpr as *const bindings::Node),
-                }))
+                node((*p).testexpr as *const bindings::Node)
             }
         };
         out.param_ids = unsafe { list_items((*p).paramIds) };
@@ -1989,32 +1753,30 @@ pub(crate) unsafe fn sub_plan(p: *const bindings::SubPlan) -> protobuf::SubPlan 
 
 pub(crate) unsafe fn alternative_sub_plan(
     p: *const bindings::AlternativeSubPlan,
-) -> protobuf::AlternativeSubPlan {
+) -> ast::AlternativeSubPlan {
     if too_deep() {
-        return protobuf::AlternativeSubPlan::default();
+        return ast::AlternativeSubPlan::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlternativeSubPlan::default();
+        let mut out = ast::AlternativeSubPlan::default();
         out.subplans = unsafe { list_items((*p).subplans) };
         out
     })
 }
 
-pub(crate) unsafe fn field_select(p: *const bindings::FieldSelect) -> protobuf::FieldSelect {
+pub(crate) unsafe fn field_select(p: *const bindings::FieldSelect) -> ast::FieldSelect {
     if too_deep() {
-        return protobuf::FieldSelect::default();
+        return ast::FieldSelect::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::FieldSelect::default();
+        let mut out = ast::FieldSelect::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.fieldnum = unsafe { (*p).fieldnum as i32 };
@@ -2025,20 +1787,18 @@ pub(crate) unsafe fn field_select(p: *const bindings::FieldSelect) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn field_store(p: *const bindings::FieldStore) -> protobuf::FieldStore {
+pub(crate) unsafe fn field_store(p: *const bindings::FieldStore) -> ast::FieldStore {
     if too_deep() {
-        return protobuf::FieldStore::default();
+        return ast::FieldStore::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::FieldStore::default();
+        let mut out = ast::FieldStore::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.newvals = unsafe { list_items((*p).newvals) };
@@ -2048,20 +1808,18 @@ pub(crate) unsafe fn field_store(p: *const bindings::FieldStore) -> protobuf::Fi
     })
 }
 
-pub(crate) unsafe fn relabel_type(p: *const bindings::RelabelType) -> protobuf::RelabelType {
+pub(crate) unsafe fn relabel_type(p: *const bindings::RelabelType) -> ast::RelabelType {
     if too_deep() {
-        return protobuf::RelabelType::default();
+        return ast::RelabelType::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RelabelType::default();
+        let mut out = ast::RelabelType::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.resulttype = unsafe { (*p).resulttype as u32 };
@@ -2073,20 +1831,18 @@ pub(crate) unsafe fn relabel_type(p: *const bindings::RelabelType) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn coerce_via_io(p: *const bindings::CoerceViaIO) -> protobuf::CoerceViaIo {
+pub(crate) unsafe fn coerce_via_io(p: *const bindings::CoerceViaIO) -> ast::CoerceViaIo {
     if too_deep() {
-        return protobuf::CoerceViaIo::default();
+        return ast::CoerceViaIo::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CoerceViaIo::default();
+        let mut out = ast::CoerceViaIo::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.resulttype = unsafe { (*p).resulttype as u32 };
@@ -2099,29 +1855,25 @@ pub(crate) unsafe fn coerce_via_io(p: *const bindings::CoerceViaIO) -> protobuf:
 
 pub(crate) unsafe fn array_coerce_expr(
     p: *const bindings::ArrayCoerceExpr,
-) -> protobuf::ArrayCoerceExpr {
+) -> ast::ArrayCoerceExpr {
     if too_deep() {
-        return protobuf::ArrayCoerceExpr::default();
+        return ast::ArrayCoerceExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ArrayCoerceExpr::default();
+        let mut out = ast::ArrayCoerceExpr::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.elemexpr = unsafe {
             if (*p).elemexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).elemexpr as *const bindings::Node),
-                }))
+                node((*p).elemexpr as *const bindings::Node)
             }
         };
         out.resulttype = unsafe { (*p).resulttype as u32 };
@@ -2135,20 +1887,18 @@ pub(crate) unsafe fn array_coerce_expr(
 
 pub(crate) unsafe fn convert_rowtype_expr(
     p: *const bindings::ConvertRowtypeExpr,
-) -> protobuf::ConvertRowtypeExpr {
+) -> ast::ConvertRowtypeExpr {
     if too_deep() {
-        return protobuf::ConvertRowtypeExpr::default();
+        return ast::ConvertRowtypeExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ConvertRowtypeExpr::default();
+        let mut out = ast::ConvertRowtypeExpr::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.resulttype = unsafe { (*p).resulttype as u32 };
@@ -2158,20 +1908,18 @@ pub(crate) unsafe fn convert_rowtype_expr(
     })
 }
 
-pub(crate) unsafe fn collate_expr(p: *const bindings::CollateExpr) -> protobuf::CollateExpr {
+pub(crate) unsafe fn collate_expr(p: *const bindings::CollateExpr) -> ast::CollateExpr {
     if too_deep() {
-        return protobuf::CollateExpr::default();
+        return ast::CollateExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CollateExpr::default();
+        let mut out = ast::CollateExpr::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.coll_oid = unsafe { (*p).collOid as u32 };
@@ -2180,22 +1928,20 @@ pub(crate) unsafe fn collate_expr(p: *const bindings::CollateExpr) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn case_expr(p: *const bindings::CaseExpr) -> protobuf::CaseExpr {
+pub(crate) unsafe fn case_expr(p: *const bindings::CaseExpr) -> ast::CaseExpr {
     if too_deep() {
-        return protobuf::CaseExpr::default();
+        return ast::CaseExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CaseExpr::default();
+        let mut out = ast::CaseExpr::default();
         out.casetype = unsafe { (*p).casetype as u32 };
         out.casecollid = unsafe { (*p).casecollid as u32 };
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.args = unsafe { list_items((*p).args) };
@@ -2203,9 +1949,7 @@ pub(crate) unsafe fn case_expr(p: *const bindings::CaseExpr) -> protobuf::CaseEx
             if (*p).defresult.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).defresult as *const bindings::Node),
-                }))
+                node((*p).defresult as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -2213,29 +1957,25 @@ pub(crate) unsafe fn case_expr(p: *const bindings::CaseExpr) -> protobuf::CaseEx
     })
 }
 
-pub(crate) unsafe fn case_when(p: *const bindings::CaseWhen) -> protobuf::CaseWhen {
+pub(crate) unsafe fn case_when(p: *const bindings::CaseWhen) -> ast::CaseWhen {
     if too_deep() {
-        return protobuf::CaseWhen::default();
+        return ast::CaseWhen::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CaseWhen::default();
+        let mut out = ast::CaseWhen::default();
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.result = unsafe {
             if (*p).result.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).result as *const bindings::Node),
-                }))
+                node((*p).result as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -2243,13 +1983,13 @@ pub(crate) unsafe fn case_when(p: *const bindings::CaseWhen) -> protobuf::CaseWh
     })
 }
 
-pub(crate) unsafe fn case_test_expr(p: *const bindings::CaseTestExpr) -> protobuf::CaseTestExpr {
+pub(crate) unsafe fn case_test_expr(p: *const bindings::CaseTestExpr) -> ast::CaseTestExpr {
     if too_deep() {
-        return protobuf::CaseTestExpr::default();
+        return ast::CaseTestExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CaseTestExpr::default();
+        let mut out = ast::CaseTestExpr::default();
         out.type_id = unsafe { (*p).typeId as u32 };
         out.type_mod = unsafe { (*p).typeMod as i32 };
         out.collation = unsafe { (*p).collation as u32 };
@@ -2257,13 +1997,13 @@ pub(crate) unsafe fn case_test_expr(p: *const bindings::CaseTestExpr) -> protobu
     })
 }
 
-pub(crate) unsafe fn array_expr(p: *const bindings::ArrayExpr) -> protobuf::ArrayExpr {
+pub(crate) unsafe fn array_expr(p: *const bindings::ArrayExpr) -> ast::ArrayExpr {
     if too_deep() {
-        return protobuf::ArrayExpr::default();
+        return ast::ArrayExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ArrayExpr::default();
+        let mut out = ast::ArrayExpr::default();
         out.array_typeid = unsafe { (*p).array_typeid as u32 };
         out.array_collid = unsafe { (*p).array_collid as u32 };
         out.element_typeid = unsafe { (*p).element_typeid as u32 };
@@ -2276,13 +2016,13 @@ pub(crate) unsafe fn array_expr(p: *const bindings::ArrayExpr) -> protobuf::Arra
     })
 }
 
-pub(crate) unsafe fn row_expr(p: *const bindings::RowExpr) -> protobuf::RowExpr {
+pub(crate) unsafe fn row_expr(p: *const bindings::RowExpr) -> ast::RowExpr {
     if too_deep() {
-        return protobuf::RowExpr::default();
+        return ast::RowExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RowExpr::default();
+        let mut out = ast::RowExpr::default();
         out.args = unsafe { list_items((*p).args) };
         out.row_typeid = unsafe { (*p).row_typeid as u32 };
         out.row_format = unsafe { convert_coercion_form((*p).row_format) };
@@ -2292,15 +2032,13 @@ pub(crate) unsafe fn row_expr(p: *const bindings::RowExpr) -> protobuf::RowExpr 
     })
 }
 
-pub(crate) unsafe fn row_compare_expr(
-    p: *const bindings::RowCompareExpr,
-) -> protobuf::RowCompareExpr {
+pub(crate) unsafe fn row_compare_expr(p: *const bindings::RowCompareExpr) -> ast::RowCompareExpr {
     if too_deep() {
-        return protobuf::RowCompareExpr::default();
+        return ast::RowCompareExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RowCompareExpr::default();
+        let mut out = ast::RowCompareExpr::default();
         out.cmptype = unsafe { convert_compare_type((*p).cmptype) };
         out.opnos = unsafe { list_items((*p).opnos) };
         out.opfamilies = unsafe { list_items((*p).opfamilies) };
@@ -2311,13 +2049,13 @@ pub(crate) unsafe fn row_compare_expr(
     })
 }
 
-pub(crate) unsafe fn coalesce_expr(p: *const bindings::CoalesceExpr) -> protobuf::CoalesceExpr {
+pub(crate) unsafe fn coalesce_expr(p: *const bindings::CoalesceExpr) -> ast::CoalesceExpr {
     if too_deep() {
-        return protobuf::CoalesceExpr::default();
+        return ast::CoalesceExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CoalesceExpr::default();
+        let mut out = ast::CoalesceExpr::default();
         out.coalescetype = unsafe { (*p).coalescetype as u32 };
         out.coalescecollid = unsafe { (*p).coalescecollid as u32 };
         out.args = unsafe { list_items((*p).args) };
@@ -2326,13 +2064,13 @@ pub(crate) unsafe fn coalesce_expr(p: *const bindings::CoalesceExpr) -> protobuf
     })
 }
 
-pub(crate) unsafe fn min_max_expr(p: *const bindings::MinMaxExpr) -> protobuf::MinMaxExpr {
+pub(crate) unsafe fn min_max_expr(p: *const bindings::MinMaxExpr) -> ast::MinMaxExpr {
     if too_deep() {
-        return protobuf::MinMaxExpr::default();
+        return ast::MinMaxExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::MinMaxExpr::default();
+        let mut out = ast::MinMaxExpr::default();
         out.minmaxtype = unsafe { (*p).minmaxtype as u32 };
         out.minmaxcollid = unsafe { (*p).minmaxcollid as u32 };
         out.inputcollid = unsafe { (*p).inputcollid as u32 };
@@ -2345,13 +2083,13 @@ pub(crate) unsafe fn min_max_expr(p: *const bindings::MinMaxExpr) -> protobuf::M
 
 pub(crate) unsafe fn sql_value_function(
     p: *const bindings::SQLValueFunction,
-) -> protobuf::SqlValueFunction {
+) -> ast::SqlValueFunction {
     if too_deep() {
-        return protobuf::SqlValueFunction::default();
+        return ast::SqlValueFunction::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SqlValueFunction::default();
+        let mut out = ast::SqlValueFunction::default();
         out.op = unsafe { convert_sql_value_function_op((*p).op) };
         out.r#type = unsafe { (*p).type_ as u32 };
         out.typmod = unsafe { (*p).typmod as i32 };
@@ -2360,13 +2098,13 @@ pub(crate) unsafe fn sql_value_function(
     })
 }
 
-pub(crate) unsafe fn xml_expr(p: *const bindings::XmlExpr) -> protobuf::XmlExpr {
+pub(crate) unsafe fn xml_expr(p: *const bindings::XmlExpr) -> ast::XmlExpr {
     if too_deep() {
-        return protobuf::XmlExpr::default();
+        return ast::XmlExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::XmlExpr::default();
+        let mut out = ast::XmlExpr::default();
         out.op = unsafe { convert_xml_expr_op((*p).op) };
         out.name = unsafe { c_string((*p).name) };
         out.named_args = unsafe { list_items((*p).named_args) };
@@ -2381,13 +2119,13 @@ pub(crate) unsafe fn xml_expr(p: *const bindings::XmlExpr) -> protobuf::XmlExpr 
     })
 }
 
-pub(crate) unsafe fn json_format(p: *const bindings::JsonFormat) -> protobuf::JsonFormat {
+pub(crate) unsafe fn json_format(p: *const bindings::JsonFormat) -> ast::JsonFormat {
     if too_deep() {
-        return protobuf::JsonFormat::default();
+        return ast::JsonFormat::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonFormat::default();
+        let mut out = ast::JsonFormat::default();
         out.format_type = unsafe { convert_json_format_type((*p).format_type) };
         out.encoding = unsafe { convert_json_encoding((*p).encoding) };
         out.location = unsafe { (*p).location as i32 };
@@ -2395,18 +2133,20 @@ pub(crate) unsafe fn json_format(p: *const bindings::JsonFormat) -> protobuf::Js
     })
 }
 
-pub(crate) unsafe fn json_returning(p: *const bindings::JsonReturning) -> protobuf::JsonReturning {
+pub(crate) unsafe fn json_returning(p: *const bindings::JsonReturning) -> ast::JsonReturning {
     if too_deep() {
-        return protobuf::JsonReturning::default();
+        return ast::JsonReturning::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonReturning::default();
+        let mut out = ast::JsonReturning::default();
         out.format = unsafe {
             if (*p).format.is_null() {
                 None
             } else {
-                Some(json_format((*p).format as *const bindings::JsonFormat))
+                Some(NodeBox::new(json_format(
+                    (*p).format as *const bindings::JsonFormat,
+                )))
             }
         };
         out.typid = unsafe { (*p).typid as u32 };
@@ -2415,36 +2155,34 @@ pub(crate) unsafe fn json_returning(p: *const bindings::JsonReturning) -> protob
     })
 }
 
-pub(crate) unsafe fn json_value_expr(p: *const bindings::JsonValueExpr) -> protobuf::JsonValueExpr {
+pub(crate) unsafe fn json_value_expr(p: *const bindings::JsonValueExpr) -> ast::JsonValueExpr {
     if too_deep() {
-        return protobuf::JsonValueExpr::default();
+        return ast::JsonValueExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonValueExpr::default();
+        let mut out = ast::JsonValueExpr::default();
         out.raw_expr = unsafe {
             if (*p).raw_expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).raw_expr as *const bindings::Node),
-                }))
+                node((*p).raw_expr as *const bindings::Node)
             }
         };
         out.formatted_expr = unsafe {
             if (*p).formatted_expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).formatted_expr as *const bindings::Node),
-                }))
+                node((*p).formatted_expr as *const bindings::Node)
             }
         };
         out.format = unsafe {
             if (*p).format.is_null() {
                 None
             } else {
-                Some(json_format((*p).format as *const bindings::JsonFormat))
+                Some(NodeBox::new(json_format(
+                    (*p).format as *const bindings::JsonFormat,
+                )))
             }
         };
         out
@@ -2453,40 +2191,36 @@ pub(crate) unsafe fn json_value_expr(p: *const bindings::JsonValueExpr) -> proto
 
 pub(crate) unsafe fn json_constructor_expr(
     p: *const bindings::JsonConstructorExpr,
-) -> protobuf::JsonConstructorExpr {
+) -> ast::JsonConstructorExpr {
     if too_deep() {
-        return protobuf::JsonConstructorExpr::default();
+        return ast::JsonConstructorExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonConstructorExpr::default();
+        let mut out = ast::JsonConstructorExpr::default();
         out.r#type = unsafe { convert_json_constructor_type((*p).type_) };
         out.args = unsafe { list_items((*p).args) };
         out.func = unsafe {
             if (*p).func.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).func as *const bindings::Node),
-                }))
+                node((*p).func as *const bindings::Node)
             }
         };
         out.coercion = unsafe {
             if (*p).coercion.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).coercion as *const bindings::Node),
-                }))
+                node((*p).coercion as *const bindings::Node)
             }
         };
         out.returning = unsafe {
             if (*p).returning.is_null() {
                 None
             } else {
-                Some(json_returning(
+                Some(NodeBox::new(json_returning(
                     (*p).returning as *const bindings::JsonReturning,
-                ))
+                )))
             }
         };
         out.absent_on_null = unsafe { (*p).absent_on_null };
@@ -2498,27 +2232,27 @@ pub(crate) unsafe fn json_constructor_expr(
 
 pub(crate) unsafe fn json_is_predicate(
     p: *const bindings::JsonIsPredicate,
-) -> protobuf::JsonIsPredicate {
+) -> ast::JsonIsPredicate {
     if too_deep() {
-        return protobuf::JsonIsPredicate::default();
+        return ast::JsonIsPredicate::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonIsPredicate::default();
+        let mut out = ast::JsonIsPredicate::default();
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.format = unsafe {
             if (*p).format.is_null() {
                 None
             } else {
-                Some(json_format((*p).format as *const bindings::JsonFormat))
+                Some(NodeBox::new(json_format(
+                    (*p).format as *const bindings::JsonFormat,
+                )))
             }
         };
         out.item_type = unsafe { convert_json_value_type((*p).item_type) };
@@ -2528,21 +2262,19 @@ pub(crate) unsafe fn json_is_predicate(
     })
 }
 
-pub(crate) unsafe fn json_behavior(p: *const bindings::JsonBehavior) -> protobuf::JsonBehavior {
+pub(crate) unsafe fn json_behavior(p: *const bindings::JsonBehavior) -> ast::JsonBehavior {
     if too_deep() {
-        return protobuf::JsonBehavior::default();
+        return ast::JsonBehavior::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonBehavior::default();
+        let mut out = ast::JsonBehavior::default();
         out.btype = unsafe { convert_json_behavior_type((*p).btype) };
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.coerce = unsafe { (*p).coerce };
@@ -2551,47 +2283,45 @@ pub(crate) unsafe fn json_behavior(p: *const bindings::JsonBehavior) -> protobuf
     })
 }
 
-pub(crate) unsafe fn json_expr(p: *const bindings::JsonExpr) -> protobuf::JsonExpr {
+pub(crate) unsafe fn json_expr(p: *const bindings::JsonExpr) -> ast::JsonExpr {
     if too_deep() {
-        return protobuf::JsonExpr::default();
+        return ast::JsonExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonExpr::default();
+        let mut out = ast::JsonExpr::default();
         out.op = unsafe { convert_json_expr_op((*p).op) };
         out.column_name = unsafe { c_string((*p).column_name) };
         out.formatted_expr = unsafe {
             if (*p).formatted_expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).formatted_expr as *const bindings::Node),
-                }))
+                node((*p).formatted_expr as *const bindings::Node)
             }
         };
         out.format = unsafe {
             if (*p).format.is_null() {
                 None
             } else {
-                Some(json_format((*p).format as *const bindings::JsonFormat))
+                Some(NodeBox::new(json_format(
+                    (*p).format as *const bindings::JsonFormat,
+                )))
             }
         };
         out.path_spec = unsafe {
             if (*p).path_spec.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).path_spec as *const bindings::Node),
-                }))
+                node((*p).path_spec as *const bindings::Node)
             }
         };
         out.returning = unsafe {
             if (*p).returning.is_null() {
                 None
             } else {
-                Some(json_returning(
+                Some(NodeBox::new(json_returning(
                     (*p).returning as *const bindings::JsonReturning,
-                ))
+                )))
             }
         };
         out.passing_names = unsafe { list_items((*p).passing_names) };
@@ -2600,7 +2330,7 @@ pub(crate) unsafe fn json_expr(p: *const bindings::JsonExpr) -> protobuf::JsonEx
             if (*p).on_empty.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_behavior(
+                Some(NodeBox::new(json_behavior(
                     (*p).on_empty as *const bindings::JsonBehavior,
                 )))
             }
@@ -2609,7 +2339,7 @@ pub(crate) unsafe fn json_expr(p: *const bindings::JsonExpr) -> protobuf::JsonEx
             if (*p).on_error.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_behavior(
+                Some(NodeBox::new(json_behavior(
                     (*p).on_error as *const bindings::JsonBehavior,
                 )))
             }
@@ -2624,13 +2354,13 @@ pub(crate) unsafe fn json_expr(p: *const bindings::JsonExpr) -> protobuf::JsonEx
     })
 }
 
-pub(crate) unsafe fn json_table_path(p: *const bindings::JsonTablePath) -> protobuf::JsonTablePath {
+pub(crate) unsafe fn json_table_path(p: *const bindings::JsonTablePath) -> ast::JsonTablePath {
     if too_deep() {
-        return protobuf::JsonTablePath::default();
+        return ast::JsonTablePath::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonTablePath::default();
+        let mut out = ast::JsonTablePath::default();
         out.name = unsafe { c_string((*p).name) };
         out
     })
@@ -2638,18 +2368,20 @@ pub(crate) unsafe fn json_table_path(p: *const bindings::JsonTablePath) -> proto
 
 pub(crate) unsafe fn json_table_path_scan(
     p: *const bindings::JsonTablePathScan,
-) -> protobuf::JsonTablePathScan {
+) -> ast::JsonTablePathScan {
     if too_deep() {
-        return protobuf::JsonTablePathScan::default();
+        return ast::JsonTablePathScan::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonTablePathScan::default();
+        let mut out = ast::JsonTablePathScan::default();
         out.path = unsafe {
             if (*p).path.is_null() {
                 None
             } else {
-                Some(json_table_path((*p).path as *const bindings::JsonTablePath))
+                Some(NodeBox::new(json_table_path(
+                    (*p).path as *const bindings::JsonTablePath,
+                )))
             }
         };
         out.error_on_error = unsafe { (*p).errorOnError };
@@ -2657,9 +2389,7 @@ pub(crate) unsafe fn json_table_path_scan(
             if (*p).child.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).child as *const bindings::Node),
-                }))
+                node((*p).child as *const bindings::Node)
             }
         };
         out.col_min = unsafe { (*p).colMin as i32 };
@@ -2670,49 +2400,43 @@ pub(crate) unsafe fn json_table_path_scan(
 
 pub(crate) unsafe fn json_table_sibling_join(
     p: *const bindings::JsonTableSiblingJoin,
-) -> protobuf::JsonTableSiblingJoin {
+) -> ast::JsonTableSiblingJoin {
     if too_deep() {
-        return protobuf::JsonTableSiblingJoin::default();
+        return ast::JsonTableSiblingJoin::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonTableSiblingJoin::default();
+        let mut out = ast::JsonTableSiblingJoin::default();
         out.lplan = unsafe {
             if (*p).lplan.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).lplan as *const bindings::Node),
-                }))
+                node((*p).lplan as *const bindings::Node)
             }
         };
         out.rplan = unsafe {
             if (*p).rplan.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).rplan as *const bindings::Node),
-                }))
+                node((*p).rplan as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn null_test(p: *const bindings::NullTest) -> protobuf::NullTest {
+pub(crate) unsafe fn null_test(p: *const bindings::NullTest) -> ast::NullTest {
     if too_deep() {
-        return protobuf::NullTest::default();
+        return ast::NullTest::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::NullTest::default();
+        let mut out = ast::NullTest::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.nulltesttype = unsafe { convert_null_test_type((*p).nulltesttype) };
@@ -2722,20 +2446,18 @@ pub(crate) unsafe fn null_test(p: *const bindings::NullTest) -> protobuf::NullTe
     })
 }
 
-pub(crate) unsafe fn boolean_test(p: *const bindings::BooleanTest) -> protobuf::BooleanTest {
+pub(crate) unsafe fn boolean_test(p: *const bindings::BooleanTest) -> ast::BooleanTest {
     if too_deep() {
-        return protobuf::BooleanTest::default();
+        return ast::BooleanTest::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::BooleanTest::default();
+        let mut out = ast::BooleanTest::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.booltesttype = unsafe { convert_bool_test_type((*p).booltesttype) };
@@ -2744,13 +2466,13 @@ pub(crate) unsafe fn boolean_test(p: *const bindings::BooleanTest) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn merge_action(p: *const bindings::MergeAction) -> protobuf::MergeAction {
+pub(crate) unsafe fn merge_action(p: *const bindings::MergeAction) -> ast::MergeAction {
     if too_deep() {
-        return protobuf::MergeAction::default();
+        return ast::MergeAction::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::MergeAction::default();
+        let mut out = ast::MergeAction::default();
         out.match_kind = unsafe { convert_merge_match_kind((*p).matchKind) };
         out.command_type = unsafe { convert_cmd_type((*p).commandType) };
         out.r#override = unsafe { convert_overriding_kind((*p).override_) };
@@ -2758,9 +2480,7 @@ pub(crate) unsafe fn merge_action(p: *const bindings::MergeAction) -> protobuf::
             if (*p).qual.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).qual as *const bindings::Node),
-                }))
+                node((*p).qual as *const bindings::Node)
             }
         };
         out.target_list = unsafe { list_items((*p).targetList) };
@@ -2769,22 +2489,18 @@ pub(crate) unsafe fn merge_action(p: *const bindings::MergeAction) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn coerce_to_domain(
-    p: *const bindings::CoerceToDomain,
-) -> protobuf::CoerceToDomain {
+pub(crate) unsafe fn coerce_to_domain(p: *const bindings::CoerceToDomain) -> ast::CoerceToDomain {
     if too_deep() {
-        return protobuf::CoerceToDomain::default();
+        return ast::CoerceToDomain::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CoerceToDomain::default();
+        let mut out = ast::CoerceToDomain::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.resulttype = unsafe { (*p).resulttype as u32 };
@@ -2798,13 +2514,13 @@ pub(crate) unsafe fn coerce_to_domain(
 
 pub(crate) unsafe fn coerce_to_domain_value(
     p: *const bindings::CoerceToDomainValue,
-) -> protobuf::CoerceToDomainValue {
+) -> ast::CoerceToDomainValue {
     if too_deep() {
-        return protobuf::CoerceToDomainValue::default();
+        return ast::CoerceToDomainValue::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CoerceToDomainValue::default();
+        let mut out = ast::CoerceToDomainValue::default();
         out.type_id = unsafe { (*p).typeId as u32 };
         out.type_mod = unsafe { (*p).typeMod as i32 };
         out.collation = unsafe { (*p).collation as u32 };
@@ -2813,13 +2529,13 @@ pub(crate) unsafe fn coerce_to_domain_value(
     })
 }
 
-pub(crate) unsafe fn set_to_default(p: *const bindings::SetToDefault) -> protobuf::SetToDefault {
+pub(crate) unsafe fn set_to_default(p: *const bindings::SetToDefault) -> ast::SetToDefault {
     if too_deep() {
-        return protobuf::SetToDefault::default();
+        return ast::SetToDefault::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SetToDefault::default();
+        let mut out = ast::SetToDefault::default();
         out.type_id = unsafe { (*p).typeId as u32 };
         out.type_mod = unsafe { (*p).typeMod as i32 };
         out.collation = unsafe { (*p).collation as u32 };
@@ -2828,13 +2544,13 @@ pub(crate) unsafe fn set_to_default(p: *const bindings::SetToDefault) -> protobu
     })
 }
 
-pub(crate) unsafe fn current_of_expr(p: *const bindings::CurrentOfExpr) -> protobuf::CurrentOfExpr {
+pub(crate) unsafe fn current_of_expr(p: *const bindings::CurrentOfExpr) -> ast::CurrentOfExpr {
     if too_deep() {
-        return protobuf::CurrentOfExpr::default();
+        return ast::CurrentOfExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CurrentOfExpr::default();
+        let mut out = ast::CurrentOfExpr::default();
         out.cvarno = unsafe { (*p).cvarno as u32 };
         out.cursor_name = unsafe { c_string((*p).cursor_name) };
         out.cursor_param = unsafe { (*p).cursor_param as i32 };
@@ -2842,33 +2558,31 @@ pub(crate) unsafe fn current_of_expr(p: *const bindings::CurrentOfExpr) -> proto
     })
 }
 
-pub(crate) unsafe fn next_value_expr(p: *const bindings::NextValueExpr) -> protobuf::NextValueExpr {
+pub(crate) unsafe fn next_value_expr(p: *const bindings::NextValueExpr) -> ast::NextValueExpr {
     if too_deep() {
-        return protobuf::NextValueExpr::default();
+        return ast::NextValueExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::NextValueExpr::default();
+        let mut out = ast::NextValueExpr::default();
         out.seqid = unsafe { (*p).seqid as u32 };
         out.type_id = unsafe { (*p).typeId as u32 };
         out
     })
 }
 
-pub(crate) unsafe fn inference_elem(p: *const bindings::InferenceElem) -> protobuf::InferenceElem {
+pub(crate) unsafe fn inference_elem(p: *const bindings::InferenceElem) -> ast::InferenceElem {
     if too_deep() {
-        return protobuf::InferenceElem::default();
+        return ast::InferenceElem::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::InferenceElem::default();
+        let mut out = ast::InferenceElem::default();
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.infercollid = unsafe { (*p).infercollid as u32 };
@@ -2877,42 +2591,38 @@ pub(crate) unsafe fn inference_elem(p: *const bindings::InferenceElem) -> protob
     })
 }
 
-pub(crate) unsafe fn returning_expr(p: *const bindings::ReturningExpr) -> protobuf::ReturningExpr {
+pub(crate) unsafe fn returning_expr(p: *const bindings::ReturningExpr) -> ast::ReturningExpr {
     if too_deep() {
-        return protobuf::ReturningExpr::default();
+        return ast::ReturningExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ReturningExpr::default();
+        let mut out = ast::ReturningExpr::default();
         out.retlevelsup = unsafe { (*p).retlevelsup as i32 };
         out.retold = unsafe { (*p).retold };
         out.retexpr = unsafe {
             if (*p).retexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).retexpr as *const bindings::Node),
-                }))
+                node((*p).retexpr as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn target_entry(p: *const bindings::TargetEntry) -> protobuf::TargetEntry {
+pub(crate) unsafe fn target_entry(p: *const bindings::TargetEntry) -> ast::TargetEntry {
     if too_deep() {
-        return protobuf::TargetEntry::default();
+        return ast::TargetEntry::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TargetEntry::default();
+        let mut out = ast::TargetEntry::default();
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.resno = unsafe { (*p).resno as i32 };
@@ -2925,43 +2635,39 @@ pub(crate) unsafe fn target_entry(p: *const bindings::TargetEntry) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn range_tbl_ref(p: *const bindings::RangeTblRef) -> protobuf::RangeTblRef {
+pub(crate) unsafe fn range_tbl_ref(p: *const bindings::RangeTblRef) -> ast::RangeTblRef {
     if too_deep() {
-        return protobuf::RangeTblRef::default();
+        return ast::RangeTblRef::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeTblRef::default();
+        let mut out = ast::RangeTblRef::default();
         out.rtindex = unsafe { (*p).rtindex as i32 };
         out
     })
 }
 
-pub(crate) unsafe fn join_expr(p: *const bindings::JoinExpr) -> protobuf::JoinExpr {
+pub(crate) unsafe fn join_expr(p: *const bindings::JoinExpr) -> ast::JoinExpr {
     if too_deep() {
-        return protobuf::JoinExpr::default();
+        return ast::JoinExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JoinExpr::default();
+        let mut out = ast::JoinExpr::default();
         out.jointype = unsafe { convert_join_type((*p).jointype) };
         out.is_natural = unsafe { (*p).isNatural };
         out.larg = unsafe {
             if (*p).larg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).larg as *const bindings::Node),
-                }))
+                node((*p).larg as *const bindings::Node)
             }
         };
         out.rarg = unsafe {
             if (*p).rarg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).rarg as *const bindings::Node),
-                }))
+                node((*p).rarg as *const bindings::Node)
             }
         };
         out.using_clause = unsafe { list_items((*p).usingClause) };
@@ -2969,23 +2675,23 @@ pub(crate) unsafe fn join_expr(p: *const bindings::JoinExpr) -> protobuf::JoinEx
             if (*p).join_using_alias.is_null() {
                 None
             } else {
-                Some(alias((*p).join_using_alias as *const bindings::Alias))
+                Some(NodeBox::new(alias(
+                    (*p).join_using_alias as *const bindings::Alias,
+                )))
             }
         };
         out.quals = unsafe {
             if (*p).quals.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).quals as *const bindings::Node),
-                }))
+                node((*p).quals as *const bindings::Node)
             }
         };
         out.alias = unsafe {
             if (*p).alias.is_null() {
                 None
             } else {
-                Some(alias((*p).alias as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).alias as *const bindings::Alias)))
             }
         };
         out.rtindex = unsafe { (*p).rtindex as i32 };
@@ -2993,45 +2699,39 @@ pub(crate) unsafe fn join_expr(p: *const bindings::JoinExpr) -> protobuf::JoinEx
     })
 }
 
-pub(crate) unsafe fn from_expr(p: *const bindings::FromExpr) -> protobuf::FromExpr {
+pub(crate) unsafe fn from_expr(p: *const bindings::FromExpr) -> ast::FromExpr {
     if too_deep() {
-        return protobuf::FromExpr::default();
+        return ast::FromExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::FromExpr::default();
+        let mut out = ast::FromExpr::default();
         out.fromlist = unsafe { list_items((*p).fromlist) };
         out.quals = unsafe {
             if (*p).quals.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).quals as *const bindings::Node),
-                }))
+                node((*p).quals as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn on_conflict_expr(
-    p: *const bindings::OnConflictExpr,
-) -> protobuf::OnConflictExpr {
+pub(crate) unsafe fn on_conflict_expr(p: *const bindings::OnConflictExpr) -> ast::OnConflictExpr {
     if too_deep() {
-        return protobuf::OnConflictExpr::default();
+        return ast::OnConflictExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::OnConflictExpr::default();
+        let mut out = ast::OnConflictExpr::default();
         out.action = unsafe { convert_on_conflict_action((*p).action) };
         out.arbiter_elems = unsafe { list_items((*p).arbiterElems) };
         out.arbiter_where = unsafe {
             if (*p).arbiterWhere.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arbiterWhere as *const bindings::Node),
-                }))
+                node((*p).arbiterWhere as *const bindings::Node)
             }
         };
         out.constraint = unsafe { (*p).constraint as u32 };
@@ -3040,9 +2740,7 @@ pub(crate) unsafe fn on_conflict_expr(
             if (*p).onConflictWhere.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).onConflictWhere as *const bindings::Node),
-                }))
+                node((*p).onConflictWhere as *const bindings::Node)
             }
         };
         out.excl_rel_index = unsafe { (*p).exclRelIndex as i32 };
@@ -3051,13 +2749,13 @@ pub(crate) unsafe fn on_conflict_expr(
     })
 }
 
-pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
+pub(crate) unsafe fn query(p: *const bindings::Query) -> ast::Query {
     if too_deep() {
-        return protobuf::Query::default();
+        return ast::Query::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::Query::default();
+        let mut out = ast::Query::default();
         out.command_type = unsafe { convert_cmd_type((*p).commandType) };
         out.query_source = unsafe { convert_query_source((*p).querySource) };
         out.can_set_tag = unsafe { (*p).canSetTag };
@@ -3065,9 +2763,7 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
             if (*p).utilityStmt.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).utilityStmt as *const bindings::Node),
-                }))
+                node((*p).utilityStmt as *const bindings::Node)
             }
         };
         out.result_relation = unsafe { (*p).resultRelation as i32 };
@@ -3089,7 +2785,7 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
             if (*p).jointree.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(from_expr(
+                Some(NodeBox::new(from_expr(
                     (*p).jointree as *const bindings::FromExpr,
                 )))
             }
@@ -3100,9 +2796,7 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
             if (*p).mergeJoinCondition.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).mergeJoinCondition as *const bindings::Node),
-                }))
+                node((*p).mergeJoinCondition as *const bindings::Node)
             }
         };
         out.target_list = unsafe { list_items((*p).targetList) };
@@ -3111,7 +2805,7 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
             if (*p).onConflict.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(on_conflict_expr(
+                Some(NodeBox::new(on_conflict_expr(
                     (*p).onConflict as *const bindings::OnConflictExpr,
                 )))
             }
@@ -3126,9 +2820,7 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
             if (*p).havingQual.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).havingQual as *const bindings::Node),
-                }))
+                node((*p).havingQual as *const bindings::Node)
             }
         };
         out.window_clause = unsafe { list_items((*p).windowClause) };
@@ -3138,18 +2830,14 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
             if (*p).limitOffset.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).limitOffset as *const bindings::Node),
-                }))
+                node((*p).limitOffset as *const bindings::Node)
             }
         };
         out.limit_count = unsafe {
             if (*p).limitCount.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).limitCount as *const bindings::Node),
-                }))
+                node((*p).limitCount as *const bindings::Node)
             }
         };
         out.limit_option = unsafe { convert_limit_option((*p).limitOption) };
@@ -3158,9 +2846,7 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
             if (*p).setOperations.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).setOperations as *const bindings::Node),
-                }))
+                node((*p).setOperations as *const bindings::Node)
             }
         };
         out.constraint_deps = unsafe { list_items((*p).constraintDeps) };
@@ -3171,13 +2857,13 @@ pub(crate) unsafe fn query(p: *const bindings::Query) -> protobuf::Query {
     })
 }
 
-pub(crate) unsafe fn type_name(p: *const bindings::TypeName) -> protobuf::TypeName {
+pub(crate) unsafe fn type_name(p: *const bindings::TypeName) -> ast::TypeName {
     if too_deep() {
-        return protobuf::TypeName::default();
+        return ast::TypeName::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TypeName::default();
+        let mut out = ast::TypeName::default();
         out.names = unsafe { list_items((*p).names) };
         out.type_oid = unsafe { (*p).typeOid as u32 };
         out.setof = unsafe { (*p).setof };
@@ -3190,57 +2876,53 @@ pub(crate) unsafe fn type_name(p: *const bindings::TypeName) -> protobuf::TypeNa
     })
 }
 
-pub(crate) unsafe fn column_ref(p: *const bindings::ColumnRef) -> protobuf::ColumnRef {
+pub(crate) unsafe fn column_ref(p: *const bindings::ColumnRef) -> ast::ColumnRef {
     if too_deep() {
-        return protobuf::ColumnRef::default();
+        return ast::ColumnRef::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ColumnRef::default();
+        let mut out = ast::ColumnRef::default();
         out.fields = unsafe { list_items((*p).fields) };
         out.location = unsafe { (*p).location as i32 };
         out
     })
 }
 
-pub(crate) unsafe fn param_ref(p: *const bindings::ParamRef) -> protobuf::ParamRef {
+pub(crate) unsafe fn param_ref(p: *const bindings::ParamRef) -> ast::ParamRef {
     if too_deep() {
-        return protobuf::ParamRef::default();
+        return ast::ParamRef::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ParamRef::default();
+        let mut out = ast::ParamRef::default();
         out.number = unsafe { (*p).number as i32 };
         out.location = unsafe { (*p).location as i32 };
         out
     })
 }
 
-pub(crate) unsafe fn a_expr(p: *const bindings::A_Expr) -> protobuf::AExpr {
+pub(crate) unsafe fn a_expr(p: *const bindings::A_Expr) -> ast::AExpr {
     if too_deep() {
-        return protobuf::AExpr::default();
+        return ast::AExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AExpr::default();
+        let mut out = ast::AExpr::default();
         out.kind = unsafe { convert_a_expr_kind((*p).kind) };
         out.name = unsafe { list_items((*p).name) };
         out.lexpr = unsafe {
             if (*p).lexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).lexpr as *const bindings::Node),
-                }))
+                node((*p).lexpr as *const bindings::Node)
             }
         };
         out.rexpr = unsafe {
             if (*p).rexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).rexpr as *const bindings::Node),
-                }))
+                node((*p).rexpr as *const bindings::Node)
             }
         };
         out.rexpr_list_start = unsafe { (*p).rexpr_list_start as i32 };
@@ -3250,27 +2932,27 @@ pub(crate) unsafe fn a_expr(p: *const bindings::A_Expr) -> protobuf::AExpr {
     })
 }
 
-pub(crate) unsafe fn type_cast(p: *const bindings::TypeCast) -> protobuf::TypeCast {
+pub(crate) unsafe fn type_cast(p: *const bindings::TypeCast) -> ast::TypeCast {
     if too_deep() {
-        return protobuf::TypeCast::default();
+        return ast::TypeCast::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TypeCast::default();
+        let mut out = ast::TypeCast::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.type_name = unsafe {
             if (*p).typeName.is_null() {
                 None
             } else {
-                Some(type_name((*p).typeName as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).typeName as *const bindings::TypeName,
+                )))
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -3278,20 +2960,18 @@ pub(crate) unsafe fn type_cast(p: *const bindings::TypeCast) -> protobuf::TypeCa
     })
 }
 
-pub(crate) unsafe fn collate_clause(p: *const bindings::CollateClause) -> protobuf::CollateClause {
+pub(crate) unsafe fn collate_clause(p: *const bindings::CollateClause) -> ast::CollateClause {
     if too_deep() {
-        return protobuf::CollateClause::default();
+        return ast::CollateClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CollateClause::default();
+        let mut out = ast::CollateClause::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.collname = unsafe { list_items((*p).collname) };
@@ -3300,13 +2980,13 @@ pub(crate) unsafe fn collate_clause(p: *const bindings::CollateClause) -> protob
     })
 }
 
-pub(crate) unsafe fn role_spec(p: *const bindings::RoleSpec) -> protobuf::RoleSpec {
+pub(crate) unsafe fn role_spec(p: *const bindings::RoleSpec) -> ast::RoleSpec {
     if too_deep() {
-        return protobuf::RoleSpec::default();
+        return ast::RoleSpec::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RoleSpec::default();
+        let mut out = ast::RoleSpec::default();
         out.roletype = unsafe { convert_role_spec_type((*p).roletype) };
         out.rolename = unsafe { c_string((*p).rolename) };
         out.location = unsafe { (*p).location as i32 };
@@ -3314,13 +2994,13 @@ pub(crate) unsafe fn role_spec(p: *const bindings::RoleSpec) -> protobuf::RoleSp
     })
 }
 
-pub(crate) unsafe fn func_call(p: *const bindings::FuncCall) -> protobuf::FuncCall {
+pub(crate) unsafe fn func_call(p: *const bindings::FuncCall) -> ast::FuncCall {
     if too_deep() {
-        return protobuf::FuncCall::default();
+        return ast::FuncCall::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::FuncCall::default();
+        let mut out = ast::FuncCall::default();
         out.funcname = unsafe { list_items((*p).funcname) };
         out.args = unsafe { list_items((*p).args) };
         out.agg_order = unsafe { list_items((*p).agg_order) };
@@ -3328,16 +3008,14 @@ pub(crate) unsafe fn func_call(p: *const bindings::FuncCall) -> protobuf::FuncCa
             if (*p).agg_filter.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).agg_filter as *const bindings::Node),
-                }))
+                node((*p).agg_filter as *const bindings::Node)
             }
         };
         out.over = unsafe {
             if (*p).over.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(window_def(
+                Some(NodeBox::new(window_def(
                     (*p).over as *const bindings::WindowDef,
                 )))
             }
@@ -3352,61 +3030,55 @@ pub(crate) unsafe fn func_call(p: *const bindings::FuncCall) -> protobuf::FuncCa
     })
 }
 
-pub(crate) unsafe fn a_star(p: *const bindings::A_Star) -> protobuf::AStar {
+pub(crate) unsafe fn a_star(p: *const bindings::A_Star) -> ast::AStar {
     if too_deep() {
-        return protobuf::AStar::default();
+        return ast::AStar::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let out = protobuf::AStar::default();
+        let out = ast::AStar::default();
         out
     })
 }
 
-pub(crate) unsafe fn a_indices(p: *const bindings::A_Indices) -> protobuf::AIndices {
+pub(crate) unsafe fn a_indices(p: *const bindings::A_Indices) -> ast::AIndices {
     if too_deep() {
-        return protobuf::AIndices::default();
+        return ast::AIndices::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AIndices::default();
+        let mut out = ast::AIndices::default();
         out.is_slice = unsafe { (*p).is_slice };
         out.lidx = unsafe {
             if (*p).lidx.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).lidx as *const bindings::Node),
-                }))
+                node((*p).lidx as *const bindings::Node)
             }
         };
         out.uidx = unsafe {
             if (*p).uidx.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).uidx as *const bindings::Node),
-                }))
+                node((*p).uidx as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn a_indirection(p: *const bindings::A_Indirection) -> protobuf::AIndirection {
+pub(crate) unsafe fn a_indirection(p: *const bindings::A_Indirection) -> ast::AIndirection {
     if too_deep() {
-        return protobuf::AIndirection::default();
+        return ast::AIndirection::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AIndirection::default();
+        let mut out = ast::AIndirection::default();
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.indirection = unsafe { list_items((*p).indirection) };
@@ -3414,13 +3086,13 @@ pub(crate) unsafe fn a_indirection(p: *const bindings::A_Indirection) -> protobu
     })
 }
 
-pub(crate) unsafe fn a_array_expr(p: *const bindings::A_ArrayExpr) -> protobuf::AArrayExpr {
+pub(crate) unsafe fn a_array_expr(p: *const bindings::A_ArrayExpr) -> ast::AArrayExpr {
     if too_deep() {
-        return protobuf::AArrayExpr::default();
+        return ast::AArrayExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AArrayExpr::default();
+        let mut out = ast::AArrayExpr::default();
         out.elements = unsafe { list_items((*p).elements) };
         out.list_start = unsafe { (*p).list_start as i32 };
         out.list_end = unsafe { (*p).list_end as i32 };
@@ -3429,22 +3101,20 @@ pub(crate) unsafe fn a_array_expr(p: *const bindings::A_ArrayExpr) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn res_target(p: *const bindings::ResTarget) -> protobuf::ResTarget {
+pub(crate) unsafe fn res_target(p: *const bindings::ResTarget) -> ast::ResTarget {
     if too_deep() {
-        return protobuf::ResTarget::default();
+        return ast::ResTarget::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ResTarget::default();
+        let mut out = ast::ResTarget::default();
         out.name = unsafe { c_string((*p).name) };
         out.indirection = unsafe { list_items((*p).indirection) };
         out.val = unsafe {
             if (*p).val.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).val as *const bindings::Node),
-                }))
+                node((*p).val as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -3452,22 +3122,18 @@ pub(crate) unsafe fn res_target(p: *const bindings::ResTarget) -> protobuf::ResT
     })
 }
 
-pub(crate) unsafe fn multi_assign_ref(
-    p: *const bindings::MultiAssignRef,
-) -> protobuf::MultiAssignRef {
+pub(crate) unsafe fn multi_assign_ref(p: *const bindings::MultiAssignRef) -> ast::MultiAssignRef {
     if too_deep() {
-        return protobuf::MultiAssignRef::default();
+        return ast::MultiAssignRef::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::MultiAssignRef::default();
+        let mut out = ast::MultiAssignRef::default();
         out.source = unsafe {
             if (*p).source.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).source as *const bindings::Node),
-                }))
+                node((*p).source as *const bindings::Node)
             }
         };
         out.colno = unsafe { (*p).colno as i32 };
@@ -3476,20 +3142,18 @@ pub(crate) unsafe fn multi_assign_ref(
     })
 }
 
-pub(crate) unsafe fn sort_by(p: *const bindings::SortBy) -> protobuf::SortBy {
+pub(crate) unsafe fn sort_by(p: *const bindings::SortBy) -> ast::SortBy {
     if too_deep() {
-        return protobuf::SortBy::default();
+        return ast::SortBy::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SortBy::default();
+        let mut out = ast::SortBy::default();
         out.node = unsafe {
             if (*p).node.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).node as *const bindings::Node),
-                }))
+                node((*p).node as *const bindings::Node)
             }
         };
         out.sortby_dir = unsafe { convert_sort_by_dir((*p).sortby_dir) };
@@ -3500,13 +3164,13 @@ pub(crate) unsafe fn sort_by(p: *const bindings::SortBy) -> protobuf::SortBy {
     })
 }
 
-pub(crate) unsafe fn window_def(p: *const bindings::WindowDef) -> protobuf::WindowDef {
+pub(crate) unsafe fn window_def(p: *const bindings::WindowDef) -> ast::WindowDef {
     if too_deep() {
-        return protobuf::WindowDef::default();
+        return ast::WindowDef::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::WindowDef::default();
+        let mut out = ast::WindowDef::default();
         out.name = unsafe { c_string((*p).name) };
         out.refname = unsafe { c_string((*p).refname) };
         out.partition_clause = unsafe { list_items((*p).partitionClause) };
@@ -3516,18 +3180,14 @@ pub(crate) unsafe fn window_def(p: *const bindings::WindowDef) -> protobuf::Wind
             if (*p).startOffset.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).startOffset as *const bindings::Node),
-                }))
+                node((*p).startOffset as *const bindings::Node)
             }
         };
         out.end_offset = unsafe {
             if (*p).endOffset.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).endOffset as *const bindings::Node),
-                }))
+                node((*p).endOffset as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -3535,43 +3195,39 @@ pub(crate) unsafe fn window_def(p: *const bindings::WindowDef) -> protobuf::Wind
     })
 }
 
-pub(crate) unsafe fn range_subselect(
-    p: *const bindings::RangeSubselect,
-) -> protobuf::RangeSubselect {
+pub(crate) unsafe fn range_subselect(p: *const bindings::RangeSubselect) -> ast::RangeSubselect {
     if too_deep() {
-        return protobuf::RangeSubselect::default();
+        return ast::RangeSubselect::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeSubselect::default();
+        let mut out = ast::RangeSubselect::default();
         out.lateral = unsafe { (*p).lateral };
         out.subquery = unsafe {
             if (*p).subquery.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).subquery as *const bindings::Node),
-                }))
+                node((*p).subquery as *const bindings::Node)
             }
         };
         out.alias = unsafe {
             if (*p).alias.is_null() {
                 None
             } else {
-                Some(alias((*p).alias as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).alias as *const bindings::Alias)))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn range_function(p: *const bindings::RangeFunction) -> protobuf::RangeFunction {
+pub(crate) unsafe fn range_function(p: *const bindings::RangeFunction) -> ast::RangeFunction {
     if too_deep() {
-        return protobuf::RangeFunction::default();
+        return ast::RangeFunction::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeFunction::default();
+        let mut out = ast::RangeFunction::default();
         out.lateral = unsafe { (*p).lateral };
         out.ordinality = unsafe { (*p).ordinality };
         out.is_rowsfrom = unsafe { (*p).is_rowsfrom };
@@ -3580,7 +3236,7 @@ pub(crate) unsafe fn range_function(p: *const bindings::RangeFunction) -> protob
             if (*p).alias.is_null() {
                 None
             } else {
-                Some(alias((*p).alias as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).alias as *const bindings::Alias)))
             }
         };
         out.coldeflist = unsafe { list_items((*p).coldeflist) };
@@ -3588,32 +3244,26 @@ pub(crate) unsafe fn range_function(p: *const bindings::RangeFunction) -> protob
     })
 }
 
-pub(crate) unsafe fn range_table_func(
-    p: *const bindings::RangeTableFunc,
-) -> protobuf::RangeTableFunc {
+pub(crate) unsafe fn range_table_func(p: *const bindings::RangeTableFunc) -> ast::RangeTableFunc {
     if too_deep() {
-        return protobuf::RangeTableFunc::default();
+        return ast::RangeTableFunc::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeTableFunc::default();
+        let mut out = ast::RangeTableFunc::default();
         out.lateral = unsafe { (*p).lateral };
         out.docexpr = unsafe {
             if (*p).docexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).docexpr as *const bindings::Node),
-                }))
+                node((*p).docexpr as *const bindings::Node)
             }
         };
         out.rowexpr = unsafe {
             if (*p).rowexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).rowexpr as *const bindings::Node),
-                }))
+                node((*p).rowexpr as *const bindings::Node)
             }
         };
         out.namespaces = unsafe { list_items((*p).namespaces) };
@@ -3622,7 +3272,7 @@ pub(crate) unsafe fn range_table_func(
             if (*p).alias.is_null() {
                 None
             } else {
-                Some(alias((*p).alias as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).alias as *const bindings::Alias)))
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -3632,19 +3282,21 @@ pub(crate) unsafe fn range_table_func(
 
 pub(crate) unsafe fn range_table_func_col(
     p: *const bindings::RangeTableFuncCol,
-) -> protobuf::RangeTableFuncCol {
+) -> ast::RangeTableFuncCol {
     if too_deep() {
-        return protobuf::RangeTableFuncCol::default();
+        return ast::RangeTableFuncCol::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeTableFuncCol::default();
+        let mut out = ast::RangeTableFuncCol::default();
         out.colname = unsafe { c_string((*p).colname) };
         out.type_name = unsafe {
             if (*p).typeName.is_null() {
                 None
             } else {
-                Some(type_name((*p).typeName as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).typeName as *const bindings::TypeName,
+                )))
             }
         };
         out.for_ordinality = unsafe { (*p).for_ordinality };
@@ -3653,18 +3305,14 @@ pub(crate) unsafe fn range_table_func_col(
             if (*p).colexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).colexpr as *const bindings::Node),
-                }))
+                node((*p).colexpr as *const bindings::Node)
             }
         };
         out.coldefexpr = unsafe {
             if (*p).coldefexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).coldefexpr as *const bindings::Node),
-                }))
+                node((*p).coldefexpr as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -3674,20 +3322,18 @@ pub(crate) unsafe fn range_table_func_col(
 
 pub(crate) unsafe fn range_table_sample(
     p: *const bindings::RangeTableSample,
-) -> protobuf::RangeTableSample {
+) -> ast::RangeTableSample {
     if too_deep() {
-        return protobuf::RangeTableSample::default();
+        return ast::RangeTableSample::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeTableSample::default();
+        let mut out = ast::RangeTableSample::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).relation as *const bindings::Node),
-                }))
+                node((*p).relation as *const bindings::Node)
             }
         };
         out.method = unsafe { list_items((*p).method) };
@@ -3696,9 +3342,7 @@ pub(crate) unsafe fn range_table_sample(
             if (*p).repeatable.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).repeatable as *const bindings::Node),
-                }))
+                node((*p).repeatable as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -3706,19 +3350,21 @@ pub(crate) unsafe fn range_table_sample(
     })
 }
 
-pub(crate) unsafe fn column_def(p: *const bindings::ColumnDef) -> protobuf::ColumnDef {
+pub(crate) unsafe fn column_def(p: *const bindings::ColumnDef) -> ast::ColumnDef {
     if too_deep() {
-        return protobuf::ColumnDef::default();
+        return ast::ColumnDef::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ColumnDef::default();
+        let mut out = ast::ColumnDef::default();
         out.colname = unsafe { c_string((*p).colname) };
         out.type_name = unsafe {
             if (*p).typeName.is_null() {
                 None
             } else {
-                Some(type_name((*p).typeName as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).typeName as *const bindings::TypeName,
+                )))
             }
         };
         out.compression = unsafe { c_string((*p).compression) };
@@ -3732,18 +3378,14 @@ pub(crate) unsafe fn column_def(p: *const bindings::ColumnDef) -> protobuf::Colu
             if (*p).raw_default.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).raw_default as *const bindings::Node),
-                }))
+                node((*p).raw_default as *const bindings::Node)
             }
         };
         out.cooked_default = unsafe {
             if (*p).cooked_default.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).cooked_default as *const bindings::Node),
-                }))
+                node((*p).cooked_default as *const bindings::Node)
             }
         };
         out.identity = unsafe { c_char_string((*p).identity) };
@@ -3751,9 +3393,9 @@ pub(crate) unsafe fn column_def(p: *const bindings::ColumnDef) -> protobuf::Colu
             if (*p).identitySequence.is_null() {
                 None
             } else {
-                Some(range_var(
+                Some(NodeBox::new(range_var(
                     (*p).identitySequence as *const bindings::RangeVar,
-                ))
+                )))
             }
         };
         out.generated = unsafe { c_char_string((*p).generated) };
@@ -3761,7 +3403,7 @@ pub(crate) unsafe fn column_def(p: *const bindings::ColumnDef) -> protobuf::Colu
             if (*p).collClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(collate_clause(
+                Some(NodeBox::new(collate_clause(
                     (*p).collClause as *const bindings::CollateClause,
                 )))
             }
@@ -3776,18 +3418,20 @@ pub(crate) unsafe fn column_def(p: *const bindings::ColumnDef) -> protobuf::Colu
 
 pub(crate) unsafe fn table_like_clause(
     p: *const bindings::TableLikeClause,
-) -> protobuf::TableLikeClause {
+) -> ast::TableLikeClause {
     if too_deep() {
-        return protobuf::TableLikeClause::default();
+        return ast::TableLikeClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TableLikeClause::default();
+        let mut out = ast::TableLikeClause::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.options = unsafe { (*p).options as u32 };
@@ -3796,21 +3440,19 @@ pub(crate) unsafe fn table_like_clause(
     })
 }
 
-pub(crate) unsafe fn index_elem(p: *const bindings::IndexElem) -> protobuf::IndexElem {
+pub(crate) unsafe fn index_elem(p: *const bindings::IndexElem) -> ast::IndexElem {
     if too_deep() {
-        return protobuf::IndexElem::default();
+        return ast::IndexElem::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::IndexElem::default();
+        let mut out = ast::IndexElem::default();
         out.name = unsafe { c_string((*p).name) };
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.indexcolname = unsafe { c_string((*p).indexcolname) };
@@ -3823,22 +3465,20 @@ pub(crate) unsafe fn index_elem(p: *const bindings::IndexElem) -> protobuf::Inde
     })
 }
 
-pub(crate) unsafe fn def_elem(p: *const bindings::DefElem) -> protobuf::DefElem {
+pub(crate) unsafe fn def_elem(p: *const bindings::DefElem) -> ast::DefElem {
     if too_deep() {
-        return protobuf::DefElem::default();
+        return ast::DefElem::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DefElem::default();
+        let mut out = ast::DefElem::default();
         out.defnamespace = unsafe { c_string((*p).defnamespace) };
         out.defname = unsafe { c_string((*p).defname) };
         out.arg = unsafe {
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).arg as *const bindings::Node),
-                }))
+                node((*p).arg as *const bindings::Node)
             }
         };
         out.defaction = unsafe { convert_def_elem_action((*p).defaction) };
@@ -3847,13 +3487,13 @@ pub(crate) unsafe fn def_elem(p: *const bindings::DefElem) -> protobuf::DefElem 
     })
 }
 
-pub(crate) unsafe fn locking_clause(p: *const bindings::LockingClause) -> protobuf::LockingClause {
+pub(crate) unsafe fn locking_clause(p: *const bindings::LockingClause) -> ast::LockingClause {
     if too_deep() {
-        return protobuf::LockingClause::default();
+        return ast::LockingClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::LockingClause::default();
+        let mut out = ast::LockingClause::default();
         out.locked_rels = unsafe { list_items((*p).lockedRels) };
         out.strength = unsafe { convert_lock_clause_strength((*p).strength) };
         out.wait_policy = unsafe { convert_lock_wait_policy((*p).waitPolicy) };
@@ -3861,28 +3501,28 @@ pub(crate) unsafe fn locking_clause(p: *const bindings::LockingClause) -> protob
     })
 }
 
-pub(crate) unsafe fn xml_serialize(p: *const bindings::XmlSerialize) -> protobuf::XmlSerialize {
+pub(crate) unsafe fn xml_serialize(p: *const bindings::XmlSerialize) -> ast::XmlSerialize {
     if too_deep() {
-        return protobuf::XmlSerialize::default();
+        return ast::XmlSerialize::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::XmlSerialize::default();
+        let mut out = ast::XmlSerialize::default();
         out.xmloption = unsafe { convert_xml_option_type((*p).xmloption) };
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.type_name = unsafe {
             if (*p).typeName.is_null() {
                 None
             } else {
-                Some(type_name((*p).typeName as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).typeName as *const bindings::TypeName,
+                )))
             }
         };
         out.indent = unsafe { (*p).indent };
@@ -3891,21 +3531,19 @@ pub(crate) unsafe fn xml_serialize(p: *const bindings::XmlSerialize) -> protobuf
     })
 }
 
-pub(crate) unsafe fn partition_elem(p: *const bindings::PartitionElem) -> protobuf::PartitionElem {
+pub(crate) unsafe fn partition_elem(p: *const bindings::PartitionElem) -> ast::PartitionElem {
     if too_deep() {
-        return protobuf::PartitionElem::default();
+        return ast::PartitionElem::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PartitionElem::default();
+        let mut out = ast::PartitionElem::default();
         out.name = unsafe { c_string((*p).name) };
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.collation = unsafe { list_items((*p).collation) };
@@ -3915,13 +3553,13 @@ pub(crate) unsafe fn partition_elem(p: *const bindings::PartitionElem) -> protob
     })
 }
 
-pub(crate) unsafe fn partition_spec(p: *const bindings::PartitionSpec) -> protobuf::PartitionSpec {
+pub(crate) unsafe fn partition_spec(p: *const bindings::PartitionSpec) -> ast::PartitionSpec {
     if too_deep() {
-        return protobuf::PartitionSpec::default();
+        return ast::PartitionSpec::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PartitionSpec::default();
+        let mut out = ast::PartitionSpec::default();
         out.strategy = unsafe { convert_partition_strategy((*p).strategy) };
         out.part_params = unsafe { list_items((*p).partParams) };
         out.location = unsafe { (*p).location as i32 };
@@ -3931,13 +3569,13 @@ pub(crate) unsafe fn partition_spec(p: *const bindings::PartitionSpec) -> protob
 
 pub(crate) unsafe fn partition_bound_spec(
     p: *const bindings::PartitionBoundSpec,
-) -> protobuf::PartitionBoundSpec {
+) -> ast::PartitionBoundSpec {
     if too_deep() {
-        return protobuf::PartitionBoundSpec::default();
+        return ast::PartitionBoundSpec::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PartitionBoundSpec::default();
+        let mut out = ast::PartitionBoundSpec::default();
         out.strategy = unsafe { c_char_string((*p).strategy) };
         out.is_default = unsafe { (*p).is_default };
         out.modulus = unsafe { (*p).modulus as i32 };
@@ -3952,21 +3590,19 @@ pub(crate) unsafe fn partition_bound_spec(
 
 pub(crate) unsafe fn partition_range_datum(
     p: *const bindings::PartitionRangeDatum,
-) -> protobuf::PartitionRangeDatum {
+) -> ast::PartitionRangeDatum {
     if too_deep() {
-        return protobuf::PartitionRangeDatum::default();
+        return ast::PartitionRangeDatum::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PartitionRangeDatum::default();
+        let mut out = ast::PartitionRangeDatum::default();
         out.kind = unsafe { convert_partition_range_datum_kind((*p).kind) };
         out.value = unsafe {
             if (*p).value.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).value as *const bindings::Node),
-                }))
+                node((*p).value as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -3974,27 +3610,29 @@ pub(crate) unsafe fn partition_range_datum(
     })
 }
 
-pub(crate) unsafe fn partition_cmd(p: *const bindings::PartitionCmd) -> protobuf::PartitionCmd {
+pub(crate) unsafe fn partition_cmd(p: *const bindings::PartitionCmd) -> ast::PartitionCmd {
     if too_deep() {
-        return protobuf::PartitionCmd::default();
+        return ast::PartitionCmd::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PartitionCmd::default();
+        let mut out = ast::PartitionCmd::default();
         out.name = unsafe {
             if (*p).name.is_null() {
                 None
             } else {
-                Some(range_var((*p).name as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).name as *const bindings::RangeVar,
+                )))
             }
         };
         out.bound = unsafe {
             if (*p).bound.is_null() {
                 None
             } else {
-                Some(partition_bound_spec(
+                Some(NodeBox::new(partition_bound_spec(
                     (*p).bound as *const bindings::PartitionBoundSpec,
-                ))
+                )))
             }
         };
         out.concurrent = unsafe { (*p).concurrent };
@@ -4002,25 +3640,25 @@ pub(crate) unsafe fn partition_cmd(p: *const bindings::PartitionCmd) -> protobuf
     })
 }
 
-pub(crate) unsafe fn range_tbl_entry(p: *const bindings::RangeTblEntry) -> protobuf::RangeTblEntry {
+pub(crate) unsafe fn range_tbl_entry(p: *const bindings::RangeTblEntry) -> ast::RangeTblEntry {
     if too_deep() {
-        return protobuf::RangeTblEntry::default();
+        return ast::RangeTblEntry::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeTblEntry::default();
+        let mut out = ast::RangeTblEntry::default();
         out.alias = unsafe {
             if (*p).alias.is_null() {
                 None
             } else {
-                Some(alias((*p).alias as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).alias as *const bindings::Alias)))
             }
         };
         out.eref = unsafe {
             if (*p).eref.is_null() {
                 None
             } else {
-                Some(alias((*p).eref as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).eref as *const bindings::Alias)))
             }
         };
         out.rtekind = unsafe { convert_rte_kind((*p).rtekind) };
@@ -4033,7 +3671,7 @@ pub(crate) unsafe fn range_tbl_entry(p: *const bindings::RangeTblEntry) -> proto
             if (*p).tablesample.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(table_sample_clause(
+                Some(NodeBox::new(table_sample_clause(
                     (*p).tablesample as *const bindings::TableSampleClause,
                 )))
             }
@@ -4042,9 +3680,7 @@ pub(crate) unsafe fn range_tbl_entry(p: *const bindings::RangeTblEntry) -> proto
             if (*p).subquery.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(query(
-                    (*p).subquery as *const bindings::Query,
-                )))
+                Some(NodeBox::new(query((*p).subquery as *const bindings::Query)))
             }
         };
         out.security_barrier = unsafe { (*p).security_barrier };
@@ -4057,7 +3693,9 @@ pub(crate) unsafe fn range_tbl_entry(p: *const bindings::RangeTblEntry) -> proto
             if (*p).join_using_alias.is_null() {
                 None
             } else {
-                Some(alias((*p).join_using_alias as *const bindings::Alias))
+                Some(NodeBox::new(alias(
+                    (*p).join_using_alias as *const bindings::Alias,
+                )))
             }
         };
         out.functions = unsafe { list_items((*p).functions) };
@@ -4066,7 +3704,7 @@ pub(crate) unsafe fn range_tbl_entry(p: *const bindings::RangeTblEntry) -> proto
             if (*p).tablefunc.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(table_func(
+                Some(NodeBox::new(table_func(
                     (*p).tablefunc as *const bindings::TableFunc,
                 )))
             }
@@ -4090,13 +3728,13 @@ pub(crate) unsafe fn range_tbl_entry(p: *const bindings::RangeTblEntry) -> proto
 
 pub(crate) unsafe fn rte_permission_info(
     p: *const bindings::RTEPermissionInfo,
-) -> protobuf::RtePermissionInfo {
+) -> ast::RtePermissionInfo {
     if too_deep() {
-        return protobuf::RtePermissionInfo::default();
+        return ast::RtePermissionInfo::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RtePermissionInfo::default();
+        let mut out = ast::RtePermissionInfo::default();
         out.relid = unsafe { (*p).relid as u32 };
         out.inh = unsafe { (*p).inh };
         out.required_perms = unsafe { (*p).requiredPerms as u64 };
@@ -4110,20 +3748,18 @@ pub(crate) unsafe fn rte_permission_info(
 
 pub(crate) unsafe fn range_tbl_function(
     p: *const bindings::RangeTblFunction,
-) -> protobuf::RangeTblFunction {
+) -> ast::RangeTblFunction {
     if too_deep() {
-        return protobuf::RangeTblFunction::default();
+        return ast::RangeTblFunction::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RangeTblFunction::default();
+        let mut out = ast::RangeTblFunction::default();
         out.funcexpr = unsafe {
             if (*p).funcexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).funcexpr as *const bindings::Node),
-                }))
+                node((*p).funcexpr as *const bindings::Node)
             }
         };
         out.funccolcount = unsafe { (*p).funccolcount as i32 };
@@ -4138,22 +3774,20 @@ pub(crate) unsafe fn range_tbl_function(
 
 pub(crate) unsafe fn table_sample_clause(
     p: *const bindings::TableSampleClause,
-) -> protobuf::TableSampleClause {
+) -> ast::TableSampleClause {
     if too_deep() {
-        return protobuf::TableSampleClause::default();
+        return ast::TableSampleClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TableSampleClause::default();
+        let mut out = ast::TableSampleClause::default();
         out.tsmhandler = unsafe { (*p).tsmhandler as u32 };
         out.args = unsafe { list_items((*p).args) };
         out.repeatable = unsafe {
             if (*p).repeatable.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).repeatable as *const bindings::Node),
-                }))
+                node((*p).repeatable as *const bindings::Node)
             }
         };
         out
@@ -4162,13 +3796,13 @@ pub(crate) unsafe fn table_sample_clause(
 
 pub(crate) unsafe fn with_check_option(
     p: *const bindings::WithCheckOption,
-) -> protobuf::WithCheckOption {
+) -> ast::WithCheckOption {
     if too_deep() {
-        return protobuf::WithCheckOption::default();
+        return ast::WithCheckOption::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::WithCheckOption::default();
+        let mut out = ast::WithCheckOption::default();
         out.kind = unsafe { convert_wco_kind((*p).kind) };
         out.relname = unsafe { c_string((*p).relname) };
         out.polname = unsafe { c_string((*p).polname) };
@@ -4176,9 +3810,7 @@ pub(crate) unsafe fn with_check_option(
             if (*p).qual.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).qual as *const bindings::Node),
-                }))
+                node((*p).qual as *const bindings::Node)
             }
         };
         out.cascaded = unsafe { (*p).cascaded };
@@ -4188,13 +3820,13 @@ pub(crate) unsafe fn with_check_option(
 
 pub(crate) unsafe fn sort_group_clause(
     p: *const bindings::SortGroupClause,
-) -> protobuf::SortGroupClause {
+) -> ast::SortGroupClause {
     if too_deep() {
-        return protobuf::SortGroupClause::default();
+        return ast::SortGroupClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SortGroupClause::default();
+        let mut out = ast::SortGroupClause::default();
         out.tle_sort_group_ref = unsafe { (*p).tleSortGroupRef as u32 };
         out.eqop = unsafe { (*p).eqop as u32 };
         out.sortop = unsafe { (*p).sortop as u32 };
@@ -4205,13 +3837,13 @@ pub(crate) unsafe fn sort_group_clause(
     })
 }
 
-pub(crate) unsafe fn grouping_set(p: *const bindings::GroupingSet) -> protobuf::GroupingSet {
+pub(crate) unsafe fn grouping_set(p: *const bindings::GroupingSet) -> ast::GroupingSet {
     if too_deep() {
-        return protobuf::GroupingSet::default();
+        return ast::GroupingSet::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::GroupingSet::default();
+        let mut out = ast::GroupingSet::default();
         out.kind = unsafe { convert_grouping_set_kind((*p).kind) };
         out.content = unsafe { list_items((*p).content) };
         out.location = unsafe { (*p).location as i32 };
@@ -4219,13 +3851,13 @@ pub(crate) unsafe fn grouping_set(p: *const bindings::GroupingSet) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn window_clause(p: *const bindings::WindowClause) -> protobuf::WindowClause {
+pub(crate) unsafe fn window_clause(p: *const bindings::WindowClause) -> ast::WindowClause {
     if too_deep() {
-        return protobuf::WindowClause::default();
+        return ast::WindowClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::WindowClause::default();
+        let mut out = ast::WindowClause::default();
         out.name = unsafe { c_string((*p).name) };
         out.refname = unsafe { c_string((*p).refname) };
         out.partition_clause = unsafe { list_items((*p).partitionClause) };
@@ -4235,18 +3867,14 @@ pub(crate) unsafe fn window_clause(p: *const bindings::WindowClause) -> protobuf
             if (*p).startOffset.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).startOffset as *const bindings::Node),
-                }))
+                node((*p).startOffset as *const bindings::Node)
             }
         };
         out.end_offset = unsafe {
             if (*p).endOffset.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).endOffset as *const bindings::Node),
-                }))
+                node((*p).endOffset as *const bindings::Node)
             }
         };
         out.start_in_range_func = unsafe { (*p).startInRangeFunc as u32 };
@@ -4260,13 +3888,13 @@ pub(crate) unsafe fn window_clause(p: *const bindings::WindowClause) -> protobuf
     })
 }
 
-pub(crate) unsafe fn row_mark_clause(p: *const bindings::RowMarkClause) -> protobuf::RowMarkClause {
+pub(crate) unsafe fn row_mark_clause(p: *const bindings::RowMarkClause) -> ast::RowMarkClause {
     if too_deep() {
-        return protobuf::RowMarkClause::default();
+        return ast::RowMarkClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RowMarkClause::default();
+        let mut out = ast::RowMarkClause::default();
         out.rti = unsafe { (*p).rti as u32 };
         out.strength = unsafe { convert_lock_clause_strength((*p).strength) };
         out.wait_policy = unsafe { convert_lock_wait_policy((*p).waitPolicy) };
@@ -4275,13 +3903,13 @@ pub(crate) unsafe fn row_mark_clause(p: *const bindings::RowMarkClause) -> proto
     })
 }
 
-pub(crate) unsafe fn with_clause(p: *const bindings::WithClause) -> protobuf::WithClause {
+pub(crate) unsafe fn with_clause(p: *const bindings::WithClause) -> ast::WithClause {
     if too_deep() {
-        return protobuf::WithClause::default();
+        return ast::WithClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::WithClause::default();
+        let mut out = ast::WithClause::default();
         out.ctes = unsafe { list_items((*p).ctes) };
         out.recursive = unsafe { (*p).recursive };
         out.location = unsafe { (*p).location as i32 };
@@ -4289,21 +3917,19 @@ pub(crate) unsafe fn with_clause(p: *const bindings::WithClause) -> protobuf::Wi
     })
 }
 
-pub(crate) unsafe fn infer_clause(p: *const bindings::InferClause) -> protobuf::InferClause {
+pub(crate) unsafe fn infer_clause(p: *const bindings::InferClause) -> ast::InferClause {
     if too_deep() {
-        return protobuf::InferClause::default();
+        return ast::InferClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::InferClause::default();
+        let mut out = ast::InferClause::default();
         out.index_elems = unsafe { list_items((*p).indexElems) };
         out.where_clause = unsafe {
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.conname = unsafe { c_string((*p).conname) };
@@ -4314,19 +3940,19 @@ pub(crate) unsafe fn infer_clause(p: *const bindings::InferClause) -> protobuf::
 
 pub(crate) unsafe fn on_conflict_clause(
     p: *const bindings::OnConflictClause,
-) -> protobuf::OnConflictClause {
+) -> ast::OnConflictClause {
     if too_deep() {
-        return protobuf::OnConflictClause::default();
+        return ast::OnConflictClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::OnConflictClause::default();
+        let mut out = ast::OnConflictClause::default();
         out.action = unsafe { convert_on_conflict_action((*p).action) };
         out.infer = unsafe {
             if (*p).infer.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(infer_clause(
+                Some(NodeBox::new(infer_clause(
                     (*p).infer as *const bindings::InferClause,
                 )))
             }
@@ -4336,9 +3962,7 @@ pub(crate) unsafe fn on_conflict_clause(
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -4348,13 +3972,13 @@ pub(crate) unsafe fn on_conflict_clause(
 
 pub(crate) unsafe fn cte_search_clause(
     p: *const bindings::CTESearchClause,
-) -> protobuf::CteSearchClause {
+) -> ast::CteSearchClause {
     if too_deep() {
-        return protobuf::CteSearchClause::default();
+        return ast::CteSearchClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CteSearchClause::default();
+        let mut out = ast::CteSearchClause::default();
         out.search_col_list = unsafe { list_items((*p).search_col_list) };
         out.search_breadth_first = unsafe { (*p).search_breadth_first };
         out.search_seq_column = unsafe { c_string((*p).search_seq_column) };
@@ -4363,33 +3987,27 @@ pub(crate) unsafe fn cte_search_clause(
     })
 }
 
-pub(crate) unsafe fn cte_cycle_clause(
-    p: *const bindings::CTECycleClause,
-) -> protobuf::CteCycleClause {
+pub(crate) unsafe fn cte_cycle_clause(p: *const bindings::CTECycleClause) -> ast::CteCycleClause {
     if too_deep() {
-        return protobuf::CteCycleClause::default();
+        return ast::CteCycleClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CteCycleClause::default();
+        let mut out = ast::CteCycleClause::default();
         out.cycle_col_list = unsafe { list_items((*p).cycle_col_list) };
         out.cycle_mark_column = unsafe { c_string((*p).cycle_mark_column) };
         out.cycle_mark_value = unsafe {
             if (*p).cycle_mark_value.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).cycle_mark_value as *const bindings::Node),
-                }))
+                node((*p).cycle_mark_value as *const bindings::Node)
             }
         };
         out.cycle_mark_default = unsafe {
             if (*p).cycle_mark_default.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).cycle_mark_default as *const bindings::Node),
-                }))
+                node((*p).cycle_mark_default as *const bindings::Node)
             }
         };
         out.cycle_path_column = unsafe { c_string((*p).cycle_path_column) };
@@ -4404,13 +4022,13 @@ pub(crate) unsafe fn cte_cycle_clause(
 
 pub(crate) unsafe fn common_table_expr(
     p: *const bindings::CommonTableExpr,
-) -> protobuf::CommonTableExpr {
+) -> ast::CommonTableExpr {
     if too_deep() {
-        return protobuf::CommonTableExpr::default();
+        return ast::CommonTableExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CommonTableExpr::default();
+        let mut out = ast::CommonTableExpr::default();
         out.ctename = unsafe { c_string((*p).ctename) };
         out.aliascolnames = unsafe { list_items((*p).aliascolnames) };
         out.ctematerialized = unsafe { convert_cte_materialize((*p).ctematerialized) };
@@ -4418,25 +4036,23 @@ pub(crate) unsafe fn common_table_expr(
             if (*p).ctequery.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).ctequery as *const bindings::Node),
-                }))
+                node((*p).ctequery as *const bindings::Node)
             }
         };
         out.search_clause = unsafe {
             if (*p).search_clause.is_null() {
                 None
             } else {
-                Some(cte_search_clause(
+                Some(NodeBox::new(cte_search_clause(
                     (*p).search_clause as *const bindings::CTESearchClause,
-                ))
+                )))
             }
         };
         out.cycle_clause = unsafe {
             if (*p).cycle_clause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(cte_cycle_clause(
+                Some(NodeBox::new(cte_cycle_clause(
                     (*p).cycle_clause as *const bindings::CTECycleClause,
                 )))
             }
@@ -4454,13 +4070,13 @@ pub(crate) unsafe fn common_table_expr(
 
 pub(crate) unsafe fn merge_when_clause(
     p: *const bindings::MergeWhenClause,
-) -> protobuf::MergeWhenClause {
+) -> ast::MergeWhenClause {
     if too_deep() {
-        return protobuf::MergeWhenClause::default();
+        return ast::MergeWhenClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::MergeWhenClause::default();
+        let mut out = ast::MergeWhenClause::default();
         out.match_kind = unsafe { convert_merge_match_kind((*p).matchKind) };
         out.command_type = unsafe { convert_cmd_type((*p).commandType) };
         out.r#override = unsafe { convert_overriding_kind((*p).override_) };
@@ -4468,9 +4084,7 @@ pub(crate) unsafe fn merge_when_clause(
             if (*p).condition.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).condition as *const bindings::Node),
-                }))
+                node((*p).condition as *const bindings::Node)
             }
         };
         out.target_list = unsafe { list_items((*p).targetList) };
@@ -4479,15 +4093,13 @@ pub(crate) unsafe fn merge_when_clause(
     })
 }
 
-pub(crate) unsafe fn returning_option(
-    p: *const bindings::ReturningOption,
-) -> protobuf::ReturningOption {
+pub(crate) unsafe fn returning_option(p: *const bindings::ReturningOption) -> ast::ReturningOption {
     if too_deep() {
-        return protobuf::ReturningOption::default();
+        return ast::ReturningOption::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ReturningOption::default();
+        let mut out = ast::ReturningOption::default();
         out.option = unsafe { convert_returning_option_kind((*p).option) };
         out.value = unsafe { c_string((*p).value) };
         out.location = unsafe { (*p).location as i32 };
@@ -4495,15 +4107,13 @@ pub(crate) unsafe fn returning_option(
     })
 }
 
-pub(crate) unsafe fn returning_clause(
-    p: *const bindings::ReturningClause,
-) -> protobuf::ReturningClause {
+pub(crate) unsafe fn returning_clause(p: *const bindings::ReturningClause) -> ast::ReturningClause {
     if too_deep() {
-        return protobuf::ReturningClause::default();
+        return ast::ReturningClause::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ReturningClause::default();
+        let mut out = ast::ReturningClause::default();
         out.options = unsafe { list_items((*p).options) };
         out.exprs = unsafe { list_items((*p).exprs) };
         out
@@ -4512,13 +4122,13 @@ pub(crate) unsafe fn returning_clause(
 
 pub(crate) unsafe fn trigger_transition(
     p: *const bindings::TriggerTransition,
-) -> protobuf::TriggerTransition {
+) -> ast::TriggerTransition {
     if too_deep() {
-        return protobuf::TriggerTransition::default();
+        return ast::TriggerTransition::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TriggerTransition::default();
+        let mut out = ast::TriggerTransition::default();
         out.name = unsafe { c_string((*p).name) };
         out.is_new = unsafe { (*p).isNew };
         out.is_table = unsafe { (*p).isTable };
@@ -4526,45 +4136,47 @@ pub(crate) unsafe fn trigger_transition(
     })
 }
 
-pub(crate) unsafe fn json_output(p: *const bindings::JsonOutput) -> protobuf::JsonOutput {
+pub(crate) unsafe fn json_output(p: *const bindings::JsonOutput) -> ast::JsonOutput {
     if too_deep() {
-        return protobuf::JsonOutput::default();
+        return ast::JsonOutput::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonOutput::default();
+        let mut out = ast::JsonOutput::default();
         out.type_name = unsafe {
             if (*p).typeName.is_null() {
                 None
             } else {
-                Some(type_name((*p).typeName as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).typeName as *const bindings::TypeName,
+                )))
             }
         };
         out.returning = unsafe {
             if (*p).returning.is_null() {
                 None
             } else {
-                Some(json_returning(
+                Some(NodeBox::new(json_returning(
                     (*p).returning as *const bindings::JsonReturning,
-                ))
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn json_argument(p: *const bindings::JsonArgument) -> protobuf::JsonArgument {
+pub(crate) unsafe fn json_argument(p: *const bindings::JsonArgument) -> ast::JsonArgument {
     if too_deep() {
-        return protobuf::JsonArgument::default();
+        return ast::JsonArgument::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonArgument::default();
+        let mut out = ast::JsonArgument::default();
         out.val = unsafe {
             if (*p).val.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_value_expr(
+                Some(NodeBox::new(json_value_expr(
                     (*p).val as *const bindings::JsonValueExpr,
                 )))
             }
@@ -4574,20 +4186,20 @@ pub(crate) unsafe fn json_argument(p: *const bindings::JsonArgument) -> protobuf
     })
 }
 
-pub(crate) unsafe fn json_func_expr(p: *const bindings::JsonFuncExpr) -> protobuf::JsonFuncExpr {
+pub(crate) unsafe fn json_func_expr(p: *const bindings::JsonFuncExpr) -> ast::JsonFuncExpr {
     if too_deep() {
-        return protobuf::JsonFuncExpr::default();
+        return ast::JsonFuncExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonFuncExpr::default();
+        let mut out = ast::JsonFuncExpr::default();
         out.op = unsafe { convert_json_expr_op((*p).op) };
         out.column_name = unsafe { c_string((*p).column_name) };
         out.context_item = unsafe {
             if (*p).context_item.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_value_expr(
+                Some(NodeBox::new(json_value_expr(
                     (*p).context_item as *const bindings::JsonValueExpr,
                 )))
             }
@@ -4596,9 +4208,7 @@ pub(crate) unsafe fn json_func_expr(p: *const bindings::JsonFuncExpr) -> protobu
             if (*p).pathspec.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).pathspec as *const bindings::Node),
-                }))
+                node((*p).pathspec as *const bindings::Node)
             }
         };
         out.passing = unsafe { list_items((*p).passing) };
@@ -4606,14 +4216,16 @@ pub(crate) unsafe fn json_func_expr(p: *const bindings::JsonFuncExpr) -> protobu
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.on_empty = unsafe {
             if (*p).on_empty.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_behavior(
+                Some(NodeBox::new(json_behavior(
                     (*p).on_empty as *const bindings::JsonBehavior,
                 )))
             }
@@ -4622,7 +4234,7 @@ pub(crate) unsafe fn json_func_expr(p: *const bindings::JsonFuncExpr) -> protobu
             if (*p).on_error.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_behavior(
+                Some(NodeBox::new(json_behavior(
                     (*p).on_error as *const bindings::JsonBehavior,
                 )))
             }
@@ -4636,20 +4248,18 @@ pub(crate) unsafe fn json_func_expr(p: *const bindings::JsonFuncExpr) -> protobu
 
 pub(crate) unsafe fn json_table_path_spec(
     p: *const bindings::JsonTablePathSpec,
-) -> protobuf::JsonTablePathSpec {
+) -> ast::JsonTablePathSpec {
     if too_deep() {
-        return protobuf::JsonTablePathSpec::default();
+        return ast::JsonTablePathSpec::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonTablePathSpec::default();
+        let mut out = ast::JsonTablePathSpec::default();
         out.string = unsafe {
             if (*p).string.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).string as *const bindings::Node),
-                }))
+                node((*p).string as *const bindings::Node)
             }
         };
         out.name = unsafe { c_string((*p).name) };
@@ -4659,18 +4269,18 @@ pub(crate) unsafe fn json_table_path_spec(
     })
 }
 
-pub(crate) unsafe fn json_table(p: *const bindings::JsonTable) -> protobuf::JsonTable {
+pub(crate) unsafe fn json_table(p: *const bindings::JsonTable) -> ast::JsonTable {
     if too_deep() {
-        return protobuf::JsonTable::default();
+        return ast::JsonTable::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonTable::default();
+        let mut out = ast::JsonTable::default();
         out.context_item = unsafe {
             if (*p).context_item.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_value_expr(
+                Some(NodeBox::new(json_value_expr(
                     (*p).context_item as *const bindings::JsonValueExpr,
                 )))
             }
@@ -4679,7 +4289,7 @@ pub(crate) unsafe fn json_table(p: *const bindings::JsonTable) -> protobuf::Json
             if (*p).pathspec.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_table_path_spec(
+                Some(NodeBox::new(json_table_path_spec(
                     (*p).pathspec as *const bindings::JsonTablePathSpec,
                 )))
             }
@@ -4690,7 +4300,7 @@ pub(crate) unsafe fn json_table(p: *const bindings::JsonTable) -> protobuf::Json
             if (*p).on_error.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_behavior(
+                Some(NodeBox::new(json_behavior(
                     (*p).on_error as *const bindings::JsonBehavior,
                 )))
             }
@@ -4699,7 +4309,7 @@ pub(crate) unsafe fn json_table(p: *const bindings::JsonTable) -> protobuf::Json
             if (*p).alias.is_null() {
                 None
             } else {
-                Some(alias((*p).alias as *const bindings::Alias))
+                Some(NodeBox::new(alias((*p).alias as *const bindings::Alias)))
             }
         };
         out.lateral = unsafe { (*p).lateral };
@@ -4710,27 +4320,29 @@ pub(crate) unsafe fn json_table(p: *const bindings::JsonTable) -> protobuf::Json
 
 pub(crate) unsafe fn json_table_column(
     p: *const bindings::JsonTableColumn,
-) -> protobuf::JsonTableColumn {
+) -> ast::JsonTableColumn {
     if too_deep() {
-        return protobuf::JsonTableColumn::default();
+        return ast::JsonTableColumn::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonTableColumn::default();
+        let mut out = ast::JsonTableColumn::default();
         out.coltype = unsafe { convert_json_table_column_type((*p).coltype) };
         out.name = unsafe { c_string((*p).name) };
         out.type_name = unsafe {
             if (*p).typeName.is_null() {
                 None
             } else {
-                Some(type_name((*p).typeName as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).typeName as *const bindings::TypeName,
+                )))
             }
         };
         out.pathspec = unsafe {
             if (*p).pathspec.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_table_path_spec(
+                Some(NodeBox::new(json_table_path_spec(
                     (*p).pathspec as *const bindings::JsonTablePathSpec,
                 )))
             }
@@ -4739,7 +4351,9 @@ pub(crate) unsafe fn json_table_column(
             if (*p).format.is_null() {
                 None
             } else {
-                Some(json_format((*p).format as *const bindings::JsonFormat))
+                Some(NodeBox::new(json_format(
+                    (*p).format as *const bindings::JsonFormat,
+                )))
             }
         };
         out.wrapper = unsafe { convert_json_wrapper((*p).wrapper) };
@@ -4749,7 +4363,7 @@ pub(crate) unsafe fn json_table_column(
             if (*p).on_empty.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_behavior(
+                Some(NodeBox::new(json_behavior(
                     (*p).on_empty as *const bindings::JsonBehavior,
                 )))
             }
@@ -4758,7 +4372,7 @@ pub(crate) unsafe fn json_table_column(
             if (*p).on_error.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_behavior(
+                Some(NodeBox::new(json_behavior(
                     (*p).on_error as *const bindings::JsonBehavior,
                 )))
             }
@@ -4768,27 +4382,25 @@ pub(crate) unsafe fn json_table_column(
     })
 }
 
-pub(crate) unsafe fn json_key_value(p: *const bindings::JsonKeyValue) -> protobuf::JsonKeyValue {
+pub(crate) unsafe fn json_key_value(p: *const bindings::JsonKeyValue) -> ast::JsonKeyValue {
     if too_deep() {
-        return protobuf::JsonKeyValue::default();
+        return ast::JsonKeyValue::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonKeyValue::default();
+        let mut out = ast::JsonKeyValue::default();
         out.key = unsafe {
             if (*p).key.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).key as *const bindings::Node),
-                }))
+                node((*p).key as *const bindings::Node)
             }
         };
         out.value = unsafe {
             if (*p).value.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_value_expr(
+                Some(NodeBox::new(json_value_expr(
                     (*p).value as *const bindings::JsonValueExpr,
                 )))
             }
@@ -4797,18 +4409,18 @@ pub(crate) unsafe fn json_key_value(p: *const bindings::JsonKeyValue) -> protobu
     })
 }
 
-pub(crate) unsafe fn json_parse_expr(p: *const bindings::JsonParseExpr) -> protobuf::JsonParseExpr {
+pub(crate) unsafe fn json_parse_expr(p: *const bindings::JsonParseExpr) -> ast::JsonParseExpr {
     if too_deep() {
-        return protobuf::JsonParseExpr::default();
+        return ast::JsonParseExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonParseExpr::default();
+        let mut out = ast::JsonParseExpr::default();
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_value_expr(
+                Some(NodeBox::new(json_value_expr(
                     (*p).expr as *const bindings::JsonValueExpr,
                 )))
             }
@@ -4817,7 +4429,9 @@ pub(crate) unsafe fn json_parse_expr(p: *const bindings::JsonParseExpr) -> proto
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.unique_keys = unsafe { (*p).unique_keys };
@@ -4826,29 +4440,27 @@ pub(crate) unsafe fn json_parse_expr(p: *const bindings::JsonParseExpr) -> proto
     })
 }
 
-pub(crate) unsafe fn json_scalar_expr(
-    p: *const bindings::JsonScalarExpr,
-) -> protobuf::JsonScalarExpr {
+pub(crate) unsafe fn json_scalar_expr(p: *const bindings::JsonScalarExpr) -> ast::JsonScalarExpr {
     if too_deep() {
-        return protobuf::JsonScalarExpr::default();
+        return ast::JsonScalarExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonScalarExpr::default();
+        let mut out = ast::JsonScalarExpr::default();
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out.output = unsafe {
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -4858,18 +4470,18 @@ pub(crate) unsafe fn json_scalar_expr(
 
 pub(crate) unsafe fn json_serialize_expr(
     p: *const bindings::JsonSerializeExpr,
-) -> protobuf::JsonSerializeExpr {
+) -> ast::JsonSerializeExpr {
     if too_deep() {
-        return protobuf::JsonSerializeExpr::default();
+        return ast::JsonSerializeExpr::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonSerializeExpr::default();
+        let mut out = ast::JsonSerializeExpr::default();
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_value_expr(
+                Some(NodeBox::new(json_value_expr(
                     (*p).expr as *const bindings::JsonValueExpr,
                 )))
             }
@@ -4878,7 +4490,9 @@ pub(crate) unsafe fn json_serialize_expr(
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -4888,19 +4502,21 @@ pub(crate) unsafe fn json_serialize_expr(
 
 pub(crate) unsafe fn json_object_constructor(
     p: *const bindings::JsonObjectConstructor,
-) -> protobuf::JsonObjectConstructor {
+) -> ast::JsonObjectConstructor {
     if too_deep() {
-        return protobuf::JsonObjectConstructor::default();
+        return ast::JsonObjectConstructor::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonObjectConstructor::default();
+        let mut out = ast::JsonObjectConstructor::default();
         out.exprs = unsafe { list_items((*p).exprs) };
         out.output = unsafe {
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.absent_on_null = unsafe { (*p).absent_on_null };
@@ -4912,19 +4528,21 @@ pub(crate) unsafe fn json_object_constructor(
 
 pub(crate) unsafe fn json_array_constructor(
     p: *const bindings::JsonArrayConstructor,
-) -> protobuf::JsonArrayConstructor {
+) -> ast::JsonArrayConstructor {
     if too_deep() {
-        return protobuf::JsonArrayConstructor::default();
+        return ast::JsonArrayConstructor::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonArrayConstructor::default();
+        let mut out = ast::JsonArrayConstructor::default();
         out.exprs = unsafe { list_items((*p).exprs) };
         out.output = unsafe {
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.absent_on_null = unsafe { (*p).absent_on_null };
@@ -4935,34 +4553,36 @@ pub(crate) unsafe fn json_array_constructor(
 
 pub(crate) unsafe fn json_array_query_constructor(
     p: *const bindings::JsonArrayQueryConstructor,
-) -> protobuf::JsonArrayQueryConstructor {
+) -> ast::JsonArrayQueryConstructor {
     if too_deep() {
-        return protobuf::JsonArrayQueryConstructor::default();
+        return ast::JsonArrayQueryConstructor::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonArrayQueryConstructor::default();
+        let mut out = ast::JsonArrayQueryConstructor::default();
         out.query = unsafe {
             if (*p).query.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).query as *const bindings::Node),
-                }))
+                node((*p).query as *const bindings::Node)
             }
         };
         out.output = unsafe {
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.format = unsafe {
             if (*p).format.is_null() {
                 None
             } else {
-                Some(json_format((*p).format as *const bindings::JsonFormat))
+                Some(NodeBox::new(json_format(
+                    (*p).format as *const bindings::JsonFormat,
+                )))
             }
         };
         out.absent_on_null = unsafe { (*p).absent_on_null };
@@ -4973,27 +4593,27 @@ pub(crate) unsafe fn json_array_query_constructor(
 
 pub(crate) unsafe fn json_agg_constructor(
     p: *const bindings::JsonAggConstructor,
-) -> protobuf::JsonAggConstructor {
+) -> ast::JsonAggConstructor {
     if too_deep() {
-        return protobuf::JsonAggConstructor::default();
+        return ast::JsonAggConstructor::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonAggConstructor::default();
+        let mut out = ast::JsonAggConstructor::default();
         out.output = unsafe {
             if (*p).output.is_null() {
                 None
             } else {
-                Some(json_output((*p).output as *const bindings::JsonOutput))
+                Some(NodeBox::new(json_output(
+                    (*p).output as *const bindings::JsonOutput,
+                )))
             }
         };
         out.agg_filter = unsafe {
             if (*p).agg_filter.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).agg_filter as *const bindings::Node),
-                }))
+                node((*p).agg_filter as *const bindings::Node)
             }
         };
         out.agg_order = unsafe { list_items((*p).agg_order) };
@@ -5001,7 +4621,7 @@ pub(crate) unsafe fn json_agg_constructor(
             if (*p).over.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(window_def(
+                Some(NodeBox::new(window_def(
                     (*p).over as *const bindings::WindowDef,
                 )))
             }
@@ -5011,18 +4631,18 @@ pub(crate) unsafe fn json_agg_constructor(
     })
 }
 
-pub(crate) unsafe fn json_object_agg(p: *const bindings::JsonObjectAgg) -> protobuf::JsonObjectAgg {
+pub(crate) unsafe fn json_object_agg(p: *const bindings::JsonObjectAgg) -> ast::JsonObjectAgg {
     if too_deep() {
-        return protobuf::JsonObjectAgg::default();
+        return ast::JsonObjectAgg::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonObjectAgg::default();
+        let mut out = ast::JsonObjectAgg::default();
         out.constructor = unsafe {
             if (*p).constructor.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_agg_constructor(
+                Some(NodeBox::new(json_agg_constructor(
                     (*p).constructor as *const bindings::JsonAggConstructor,
                 )))
             }
@@ -5031,7 +4651,7 @@ pub(crate) unsafe fn json_object_agg(p: *const bindings::JsonObjectAgg) -> proto
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_key_value(
+                Some(NodeBox::new(json_key_value(
                     (*p).arg as *const bindings::JsonKeyValue,
                 )))
             }
@@ -5042,18 +4662,18 @@ pub(crate) unsafe fn json_object_agg(p: *const bindings::JsonObjectAgg) -> proto
     })
 }
 
-pub(crate) unsafe fn json_array_agg(p: *const bindings::JsonArrayAgg) -> protobuf::JsonArrayAgg {
+pub(crate) unsafe fn json_array_agg(p: *const bindings::JsonArrayAgg) -> ast::JsonArrayAgg {
     if too_deep() {
-        return protobuf::JsonArrayAgg::default();
+        return ast::JsonArrayAgg::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::JsonArrayAgg::default();
+        let mut out = ast::JsonArrayAgg::default();
         out.constructor = unsafe {
             if (*p).constructor.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_agg_constructor(
+                Some(NodeBox::new(json_agg_constructor(
                     (*p).constructor as *const bindings::JsonAggConstructor,
                 )))
             }
@@ -5062,7 +4682,7 @@ pub(crate) unsafe fn json_array_agg(p: *const bindings::JsonArrayAgg) -> protobu
             if (*p).arg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(json_value_expr(
+                Some(NodeBox::new(json_value_expr(
                     (*p).arg as *const bindings::JsonValueExpr,
                 )))
             }
@@ -5072,20 +4692,18 @@ pub(crate) unsafe fn json_array_agg(p: *const bindings::JsonArrayAgg) -> protobu
     })
 }
 
-pub(crate) unsafe fn raw_stmt(p: *const bindings::RawStmt) -> protobuf::RawStmt {
+pub(crate) unsafe fn raw_stmt(p: *const bindings::RawStmt) -> ast::RawStmt {
     if too_deep() {
-        return protobuf::RawStmt::default();
+        return ast::RawStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RawStmt::default();
+        let mut out = ast::RawStmt::default();
         out.stmt = unsafe {
             if (*p).stmt.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).stmt as *const bindings::Node),
-                }))
+                node((*p).stmt as *const bindings::Node)
             }
         };
         out.stmt_location = unsafe { (*p).stmt_location as i32 };
@@ -5094,18 +4712,20 @@ pub(crate) unsafe fn raw_stmt(p: *const bindings::RawStmt) -> protobuf::RawStmt 
     })
 }
 
-pub(crate) unsafe fn insert_stmt(p: *const bindings::InsertStmt) -> protobuf::InsertStmt {
+pub(crate) unsafe fn insert_stmt(p: *const bindings::InsertStmt) -> ast::InsertStmt {
     if too_deep() {
-        return protobuf::InsertStmt::default();
+        return ast::InsertStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::InsertStmt::default();
+        let mut out = ast::InsertStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.cols = unsafe { list_items((*p).cols) };
@@ -5113,16 +4733,14 @@ pub(crate) unsafe fn insert_stmt(p: *const bindings::InsertStmt) -> protobuf::In
             if (*p).selectStmt.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).selectStmt as *const bindings::Node),
-                }))
+                node((*p).selectStmt as *const bindings::Node)
             }
         };
         out.on_conflict_clause = unsafe {
             if (*p).onConflictClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(on_conflict_clause(
+                Some(NodeBox::new(on_conflict_clause(
                     (*p).onConflictClause as *const bindings::OnConflictClause,
                 )))
             }
@@ -5131,16 +4749,18 @@ pub(crate) unsafe fn insert_stmt(p: *const bindings::InsertStmt) -> protobuf::In
             if (*p).returningClause.is_null() {
                 None
             } else {
-                Some(returning_clause(
+                Some(NodeBox::new(returning_clause(
                     (*p).returningClause as *const bindings::ReturningClause,
-                ))
+                )))
             }
         };
         out.with_clause = unsafe {
             if (*p).withClause.is_null() {
                 None
             } else {
-                Some(with_clause((*p).withClause as *const bindings::WithClause))
+                Some(NodeBox::new(with_clause(
+                    (*p).withClause as *const bindings::WithClause,
+                )))
             }
         };
         out.r#override = unsafe { convert_overriding_kind((*p).override_) };
@@ -5148,18 +4768,20 @@ pub(crate) unsafe fn insert_stmt(p: *const bindings::InsertStmt) -> protobuf::In
     })
 }
 
-pub(crate) unsafe fn delete_stmt(p: *const bindings::DeleteStmt) -> protobuf::DeleteStmt {
+pub(crate) unsafe fn delete_stmt(p: *const bindings::DeleteStmt) -> ast::DeleteStmt {
     if too_deep() {
-        return protobuf::DeleteStmt::default();
+        return ast::DeleteStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DeleteStmt::default();
+        let mut out = ast::DeleteStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.using_clause = unsafe { list_items((*p).usingClause) };
@@ -5167,43 +4789,45 @@ pub(crate) unsafe fn delete_stmt(p: *const bindings::DeleteStmt) -> protobuf::De
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.returning_clause = unsafe {
             if (*p).returningClause.is_null() {
                 None
             } else {
-                Some(returning_clause(
+                Some(NodeBox::new(returning_clause(
                     (*p).returningClause as *const bindings::ReturningClause,
-                ))
+                )))
             }
         };
         out.with_clause = unsafe {
             if (*p).withClause.is_null() {
                 None
             } else {
-                Some(with_clause((*p).withClause as *const bindings::WithClause))
+                Some(NodeBox::new(with_clause(
+                    (*p).withClause as *const bindings::WithClause,
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn update_stmt(p: *const bindings::UpdateStmt) -> protobuf::UpdateStmt {
+pub(crate) unsafe fn update_stmt(p: *const bindings::UpdateStmt) -> ast::UpdateStmt {
     if too_deep() {
-        return protobuf::UpdateStmt::default();
+        return ast::UpdateStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::UpdateStmt::default();
+        let mut out = ast::UpdateStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.target_list = unsafe { list_items((*p).targetList) };
@@ -5211,9 +4835,7 @@ pub(crate) unsafe fn update_stmt(p: *const bindings::UpdateStmt) -> protobuf::Up
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.from_clause = unsafe { list_items((*p).fromClause) };
@@ -5221,52 +4843,52 @@ pub(crate) unsafe fn update_stmt(p: *const bindings::UpdateStmt) -> protobuf::Up
             if (*p).returningClause.is_null() {
                 None
             } else {
-                Some(returning_clause(
+                Some(NodeBox::new(returning_clause(
                     (*p).returningClause as *const bindings::ReturningClause,
-                ))
+                )))
             }
         };
         out.with_clause = unsafe {
             if (*p).withClause.is_null() {
                 None
             } else {
-                Some(with_clause((*p).withClause as *const bindings::WithClause))
+                Some(NodeBox::new(with_clause(
+                    (*p).withClause as *const bindings::WithClause,
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn merge_stmt(p: *const bindings::MergeStmt) -> protobuf::MergeStmt {
+pub(crate) unsafe fn merge_stmt(p: *const bindings::MergeStmt) -> ast::MergeStmt {
     if too_deep() {
-        return protobuf::MergeStmt::default();
+        return ast::MergeStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::MergeStmt::default();
+        let mut out = ast::MergeStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.source_relation = unsafe {
             if (*p).sourceRelation.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).sourceRelation as *const bindings::Node),
-                }))
+                node((*p).sourceRelation as *const bindings::Node)
             }
         };
         out.join_condition = unsafe {
             if (*p).joinCondition.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).joinCondition as *const bindings::Node),
-                }))
+                node((*p).joinCondition as *const bindings::Node)
             }
         };
         out.merge_when_clauses = unsafe { list_items((*p).mergeWhenClauses) };
@@ -5274,35 +4896,37 @@ pub(crate) unsafe fn merge_stmt(p: *const bindings::MergeStmt) -> protobuf::Merg
             if (*p).returningClause.is_null() {
                 None
             } else {
-                Some(returning_clause(
+                Some(NodeBox::new(returning_clause(
                     (*p).returningClause as *const bindings::ReturningClause,
-                ))
+                )))
             }
         };
         out.with_clause = unsafe {
             if (*p).withClause.is_null() {
                 None
             } else {
-                Some(with_clause((*p).withClause as *const bindings::WithClause))
+                Some(NodeBox::new(with_clause(
+                    (*p).withClause as *const bindings::WithClause,
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::SelectStmt {
+pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> ast::SelectStmt {
     if too_deep() {
-        return protobuf::SelectStmt::default();
+        return ast::SelectStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SelectStmt::default();
+        let mut out = ast::SelectStmt::default();
         out.distinct_clause = unsafe { list_items((*p).distinctClause) };
         out.into_clause = unsafe {
             if (*p).intoClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(into_clause(
+                Some(NodeBox::new(into_clause(
                     (*p).intoClause as *const bindings::IntoClause,
                 )))
             }
@@ -5313,9 +4937,7 @@ pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::Se
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.group_clause = unsafe { list_items((*p).groupClause) };
@@ -5324,9 +4946,7 @@ pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::Se
             if (*p).havingClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).havingClause as *const bindings::Node),
-                }))
+                node((*p).havingClause as *const bindings::Node)
             }
         };
         out.window_clause = unsafe { list_items((*p).windowClause) };
@@ -5336,18 +4956,14 @@ pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::Se
             if (*p).limitOffset.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).limitOffset as *const bindings::Node),
-                }))
+                node((*p).limitOffset as *const bindings::Node)
             }
         };
         out.limit_count = unsafe {
             if (*p).limitCount.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).limitCount as *const bindings::Node),
-                }))
+                node((*p).limitCount as *const bindings::Node)
             }
         };
         out.limit_option = unsafe { convert_limit_option((*p).limitOption) };
@@ -5356,7 +4972,9 @@ pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::Se
             if (*p).withClause.is_null() {
                 None
             } else {
-                Some(with_clause((*p).withClause as *const bindings::WithClause))
+                Some(NodeBox::new(with_clause(
+                    (*p).withClause as *const bindings::WithClause,
+                )))
             }
         };
         out.op = unsafe { convert_set_operation((*p).op) };
@@ -5365,7 +4983,7 @@ pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::Se
             if (*p).larg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(select_stmt(
+                Some(NodeBox::new(select_stmt(
                     (*p).larg as *const bindings::SelectStmt,
                 )))
             }
@@ -5374,7 +4992,7 @@ pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::Se
             if (*p).rarg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(select_stmt(
+                Some(NodeBox::new(select_stmt(
                     (*p).rarg as *const bindings::SelectStmt,
                 )))
             }
@@ -5385,31 +5003,27 @@ pub(crate) unsafe fn select_stmt(p: *const bindings::SelectStmt) -> protobuf::Se
 
 pub(crate) unsafe fn set_operation_stmt(
     p: *const bindings::SetOperationStmt,
-) -> protobuf::SetOperationStmt {
+) -> ast::SetOperationStmt {
     if too_deep() {
-        return protobuf::SetOperationStmt::default();
+        return ast::SetOperationStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SetOperationStmt::default();
+        let mut out = ast::SetOperationStmt::default();
         out.op = unsafe { convert_set_operation((*p).op) };
         out.all = unsafe { (*p).all };
         out.larg = unsafe {
             if (*p).larg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).larg as *const bindings::Node),
-                }))
+                node((*p).larg as *const bindings::Node)
             }
         };
         out.rarg = unsafe {
             if (*p).rarg.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).rarg as *const bindings::Node),
-                }))
+                node((*p).rarg as *const bindings::Node)
             }
         };
         out.col_types = unsafe { list_items((*p).colTypes) };
@@ -5420,33 +5034,31 @@ pub(crate) unsafe fn set_operation_stmt(
     })
 }
 
-pub(crate) unsafe fn return_stmt(p: *const bindings::ReturnStmt) -> protobuf::ReturnStmt {
+pub(crate) unsafe fn return_stmt(p: *const bindings::ReturnStmt) -> ast::ReturnStmt {
     if too_deep() {
-        return protobuf::ReturnStmt::default();
+        return ast::ReturnStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ReturnStmt::default();
+        let mut out = ast::ReturnStmt::default();
         out.returnval = unsafe {
             if (*p).returnval.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).returnval as *const bindings::Node),
-                }))
+                node((*p).returnval as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn pl_assign_stmt(p: *const bindings::PLAssignStmt) -> protobuf::PlAssignStmt {
+pub(crate) unsafe fn pl_assign_stmt(p: *const bindings::PLAssignStmt) -> ast::PlAssignStmt {
     if too_deep() {
-        return protobuf::PlAssignStmt::default();
+        return ast::PlAssignStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PlAssignStmt::default();
+        let mut out = ast::PlAssignStmt::default();
         out.name = unsafe { c_string((*p).name) };
         out.indirection = unsafe { list_items((*p).indirection) };
         out.nnames = unsafe { (*p).nnames as i32 };
@@ -5454,7 +5066,7 @@ pub(crate) unsafe fn pl_assign_stmt(p: *const bindings::PLAssignStmt) -> protobu
             if (*p).val.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(select_stmt(
+                Some(NodeBox::new(select_stmt(
                     (*p).val as *const bindings::SelectStmt,
                 )))
             }
@@ -5466,19 +5078,21 @@ pub(crate) unsafe fn pl_assign_stmt(p: *const bindings::PLAssignStmt) -> protobu
 
 pub(crate) unsafe fn create_schema_stmt(
     p: *const bindings::CreateSchemaStmt,
-) -> protobuf::CreateSchemaStmt {
+) -> ast::CreateSchemaStmt {
     if too_deep() {
-        return protobuf::CreateSchemaStmt::default();
+        return ast::CreateSchemaStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateSchemaStmt::default();
+        let mut out = ast::CreateSchemaStmt::default();
         out.schemaname = unsafe { c_string((*p).schemaname) };
         out.authrole = unsafe {
             if (*p).authrole.is_null() {
                 None
             } else {
-                Some(role_spec((*p).authrole as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).authrole as *const bindings::RoleSpec,
+                )))
             }
         };
         out.schema_elts = unsafe { list_items((*p).schemaElts) };
@@ -5487,20 +5101,20 @@ pub(crate) unsafe fn create_schema_stmt(
     })
 }
 
-pub(crate) unsafe fn alter_table_stmt(
-    p: *const bindings::AlterTableStmt,
-) -> protobuf::AlterTableStmt {
+pub(crate) unsafe fn alter_table_stmt(p: *const bindings::AlterTableStmt) -> ast::AlterTableStmt {
     if too_deep() {
-        return protobuf::AlterTableStmt::default();
+        return ast::AlterTableStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterTableStmt::default();
+        let mut out = ast::AlterTableStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.cmds = unsafe { list_items((*p).cmds) };
@@ -5510,13 +5124,13 @@ pub(crate) unsafe fn alter_table_stmt(
     })
 }
 
-pub(crate) unsafe fn alter_table_cmd(p: *const bindings::AlterTableCmd) -> protobuf::AlterTableCmd {
+pub(crate) unsafe fn alter_table_cmd(p: *const bindings::AlterTableCmd) -> ast::AlterTableCmd {
     if too_deep() {
-        return protobuf::AlterTableCmd::default();
+        return ast::AlterTableCmd::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterTableCmd::default();
+        let mut out = ast::AlterTableCmd::default();
         out.subtype = unsafe { convert_alter_table_type((*p).subtype) };
         out.name = unsafe { c_string((*p).name) };
         out.num = unsafe { (*p).num as i32 };
@@ -5524,16 +5138,16 @@ pub(crate) unsafe fn alter_table_cmd(p: *const bindings::AlterTableCmd) -> proto
             if (*p).newowner.is_null() {
                 None
             } else {
-                Some(role_spec((*p).newowner as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).newowner as *const bindings::RoleSpec,
+                )))
             }
         };
         out.def = unsafe {
             if (*p).def.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).def as *const bindings::Node),
-                }))
+                node((*p).def as *const bindings::Node)
             }
         };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
@@ -5545,13 +5159,13 @@ pub(crate) unsafe fn alter_table_cmd(p: *const bindings::AlterTableCmd) -> proto
 
 pub(crate) unsafe fn at_alter_constraint(
     p: *const bindings::ATAlterConstraint,
-) -> protobuf::AtAlterConstraint {
+) -> ast::AtAlterConstraint {
     if too_deep() {
-        return protobuf::AtAlterConstraint::default();
+        return ast::AtAlterConstraint::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AtAlterConstraint::default();
+        let mut out = ast::AtAlterConstraint::default();
         out.conname = unsafe { c_string((*p).conname) };
         out.alter_enforceability = unsafe { (*p).alterEnforceability };
         out.is_enforced = unsafe { (*p).is_enforced };
@@ -5566,13 +5180,13 @@ pub(crate) unsafe fn at_alter_constraint(
 
 pub(crate) unsafe fn replica_identity_stmt(
     p: *const bindings::ReplicaIdentityStmt,
-) -> protobuf::ReplicaIdentityStmt {
+) -> ast::ReplicaIdentityStmt {
     if too_deep() {
-        return protobuf::ReplicaIdentityStmt::default();
+        return ast::ReplicaIdentityStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ReplicaIdentityStmt::default();
+        let mut out = ast::ReplicaIdentityStmt::default();
         out.identity_type = unsafe { c_char_string((*p).identity_type) };
         out.name = unsafe { c_string((*p).name) };
         out
@@ -5581,13 +5195,13 @@ pub(crate) unsafe fn replica_identity_stmt(
 
 pub(crate) unsafe fn alter_collation_stmt(
     p: *const bindings::AlterCollationStmt,
-) -> protobuf::AlterCollationStmt {
+) -> ast::AlterCollationStmt {
     if too_deep() {
-        return protobuf::AlterCollationStmt::default();
+        return ast::AlterCollationStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterCollationStmt::default();
+        let mut out = ast::AlterCollationStmt::default();
         out.collname = unsafe { list_items((*p).collname) };
         out
     })
@@ -5595,13 +5209,13 @@ pub(crate) unsafe fn alter_collation_stmt(
 
 pub(crate) unsafe fn alter_domain_stmt(
     p: *const bindings::AlterDomainStmt,
-) -> protobuf::AlterDomainStmt {
+) -> ast::AlterDomainStmt {
     if too_deep() {
-        return protobuf::AlterDomainStmt::default();
+        return ast::AlterDomainStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterDomainStmt::default();
+        let mut out = ast::AlterDomainStmt::default();
         out.subtype = unsafe { c_char_string((*p).subtype) };
         out.type_name = unsafe { list_items((*p).typeName) };
         out.name = unsafe { c_string((*p).name) };
@@ -5609,9 +5223,7 @@ pub(crate) unsafe fn alter_domain_stmt(
             if (*p).def.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).def as *const bindings::Node),
-                }))
+                node((*p).def as *const bindings::Node)
             }
         };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
@@ -5620,13 +5232,13 @@ pub(crate) unsafe fn alter_domain_stmt(
     })
 }
 
-pub(crate) unsafe fn grant_stmt(p: *const bindings::GrantStmt) -> protobuf::GrantStmt {
+pub(crate) unsafe fn grant_stmt(p: *const bindings::GrantStmt) -> ast::GrantStmt {
     if too_deep() {
-        return protobuf::GrantStmt::default();
+        return ast::GrantStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::GrantStmt::default();
+        let mut out = ast::GrantStmt::default();
         out.is_grant = unsafe { (*p).is_grant };
         out.targtype = unsafe { convert_grant_target_type((*p).targtype) };
         out.objtype = unsafe { convert_object_type((*p).objtype) };
@@ -5638,7 +5250,9 @@ pub(crate) unsafe fn grant_stmt(p: *const bindings::GrantStmt) -> protobuf::Gran
             if (*p).grantor.is_null() {
                 None
             } else {
-                Some(role_spec((*p).grantor as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).grantor as *const bindings::RoleSpec,
+                )))
             }
         };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
@@ -5646,15 +5260,13 @@ pub(crate) unsafe fn grant_stmt(p: *const bindings::GrantStmt) -> protobuf::Gran
     })
 }
 
-pub(crate) unsafe fn object_with_args(
-    p: *const bindings::ObjectWithArgs,
-) -> protobuf::ObjectWithArgs {
+pub(crate) unsafe fn object_with_args(p: *const bindings::ObjectWithArgs) -> ast::ObjectWithArgs {
     if too_deep() {
-        return protobuf::ObjectWithArgs::default();
+        return ast::ObjectWithArgs::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ObjectWithArgs::default();
+        let mut out = ast::ObjectWithArgs::default();
         out.objname = unsafe { list_items((*p).objname) };
         out.objargs = unsafe { list_items((*p).objargs) };
         out.objfuncargs = unsafe { list_items((*p).objfuncargs) };
@@ -5663,26 +5275,26 @@ pub(crate) unsafe fn object_with_args(
     })
 }
 
-pub(crate) unsafe fn access_priv(p: *const bindings::AccessPriv) -> protobuf::AccessPriv {
+pub(crate) unsafe fn access_priv(p: *const bindings::AccessPriv) -> ast::AccessPriv {
     if too_deep() {
-        return protobuf::AccessPriv::default();
+        return ast::AccessPriv::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AccessPriv::default();
+        let mut out = ast::AccessPriv::default();
         out.priv_name = unsafe { c_string((*p).priv_name) };
         out.cols = unsafe { list_items((*p).cols) };
         out
     })
 }
 
-pub(crate) unsafe fn grant_role_stmt(p: *const bindings::GrantRoleStmt) -> protobuf::GrantRoleStmt {
+pub(crate) unsafe fn grant_role_stmt(p: *const bindings::GrantRoleStmt) -> ast::GrantRoleStmt {
     if too_deep() {
-        return protobuf::GrantRoleStmt::default();
+        return ast::GrantRoleStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::GrantRoleStmt::default();
+        let mut out = ast::GrantRoleStmt::default();
         out.granted_roles = unsafe { list_items((*p).granted_roles) };
         out.grantee_roles = unsafe { list_items((*p).grantee_roles) };
         out.is_grant = unsafe { (*p).is_grant };
@@ -5691,7 +5303,9 @@ pub(crate) unsafe fn grant_role_stmt(p: *const bindings::GrantRoleStmt) -> proto
             if (*p).grantor.is_null() {
                 None
             } else {
-                Some(role_spec((*p).grantor as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).grantor as *const bindings::RoleSpec,
+                )))
             }
         };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
@@ -5701,46 +5315,48 @@ pub(crate) unsafe fn grant_role_stmt(p: *const bindings::GrantRoleStmt) -> proto
 
 pub(crate) unsafe fn alter_default_privileges_stmt(
     p: *const bindings::AlterDefaultPrivilegesStmt,
-) -> protobuf::AlterDefaultPrivilegesStmt {
+) -> ast::AlterDefaultPrivilegesStmt {
     if too_deep() {
-        return protobuf::AlterDefaultPrivilegesStmt::default();
+        return ast::AlterDefaultPrivilegesStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterDefaultPrivilegesStmt::default();
+        let mut out = ast::AlterDefaultPrivilegesStmt::default();
         out.options = unsafe { list_items((*p).options) };
         out.action = unsafe {
             if (*p).action.is_null() {
                 None
             } else {
-                Some(grant_stmt((*p).action as *const bindings::GrantStmt))
+                Some(NodeBox::new(grant_stmt(
+                    (*p).action as *const bindings::GrantStmt,
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn copy_stmt(p: *const bindings::CopyStmt) -> protobuf::CopyStmt {
+pub(crate) unsafe fn copy_stmt(p: *const bindings::CopyStmt) -> ast::CopyStmt {
     if too_deep() {
-        return protobuf::CopyStmt::default();
+        return ast::CopyStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CopyStmt::default();
+        let mut out = ast::CopyStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.query = unsafe {
             if (*p).query.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).query as *const bindings::Node),
-                }))
+                node((*p).query as *const bindings::Node)
             }
         };
         out.attlist = unsafe { list_items((*p).attlist) };
@@ -5752,9 +5368,7 @@ pub(crate) unsafe fn copy_stmt(p: *const bindings::CopyStmt) -> protobuf::CopySt
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out
@@ -5763,13 +5377,13 @@ pub(crate) unsafe fn copy_stmt(p: *const bindings::CopyStmt) -> protobuf::CopySt
 
 pub(crate) unsafe fn variable_set_stmt(
     p: *const bindings::VariableSetStmt,
-) -> protobuf::VariableSetStmt {
+) -> ast::VariableSetStmt {
     if too_deep() {
-        return protobuf::VariableSetStmt::default();
+        return ast::VariableSetStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::VariableSetStmt::default();
+        let mut out = ast::VariableSetStmt::default();
         out.kind = unsafe { convert_variable_set_kind((*p).kind) };
         out.name = unsafe { c_string((*p).name) };
         out.args = unsafe { list_items((*p).args) };
@@ -5782,30 +5396,32 @@ pub(crate) unsafe fn variable_set_stmt(
 
 pub(crate) unsafe fn variable_show_stmt(
     p: *const bindings::VariableShowStmt,
-) -> protobuf::VariableShowStmt {
+) -> ast::VariableShowStmt {
     if too_deep() {
-        return protobuf::VariableShowStmt::default();
+        return ast::VariableShowStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::VariableShowStmt::default();
+        let mut out = ast::VariableShowStmt::default();
         out.name = unsafe { c_string((*p).name) };
         out
     })
 }
 
-pub(crate) unsafe fn create_stmt(p: *const bindings::CreateStmt) -> protobuf::CreateStmt {
+pub(crate) unsafe fn create_stmt(p: *const bindings::CreateStmt) -> ast::CreateStmt {
     if too_deep() {
-        return protobuf::CreateStmt::default();
+        return ast::CreateStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateStmt::default();
+        let mut out = ast::CreateStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.table_elts = unsafe { list_items((*p).tableElts) };
@@ -5814,25 +5430,27 @@ pub(crate) unsafe fn create_stmt(p: *const bindings::CreateStmt) -> protobuf::Cr
             if (*p).partbound.is_null() {
                 None
             } else {
-                Some(partition_bound_spec(
+                Some(NodeBox::new(partition_bound_spec(
                     (*p).partbound as *const bindings::PartitionBoundSpec,
-                ))
+                )))
             }
         };
         out.partspec = unsafe {
             if (*p).partspec.is_null() {
                 None
             } else {
-                Some(partition_spec(
+                Some(NodeBox::new(partition_spec(
                     (*p).partspec as *const bindings::PartitionSpec,
-                ))
+                )))
             }
         };
         out.of_typename = unsafe {
             if (*p).ofTypename.is_null() {
                 None
             } else {
-                Some(type_name((*p).ofTypename as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).ofTypename as *const bindings::TypeName,
+                )))
             }
         };
         out.constraints = unsafe { list_items((*p).constraints) };
@@ -5846,13 +5464,13 @@ pub(crate) unsafe fn create_stmt(p: *const bindings::CreateStmt) -> protobuf::Cr
     })
 }
 
-pub(crate) unsafe fn constraint(p: *const bindings::Constraint) -> protobuf::Constraint {
+pub(crate) unsafe fn constraint(p: *const bindings::Constraint) -> ast::Constraint {
     if too_deep() {
-        return protobuf::Constraint::default();
+        return ast::Constraint::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::Constraint::default();
+        let mut out = ast::Constraint::default();
         out.contype = unsafe { convert_constr_type((*p).contype) };
         out.conname = unsafe { c_string((*p).conname) };
         out.deferrable = unsafe { (*p).deferrable };
@@ -5865,9 +5483,7 @@ pub(crate) unsafe fn constraint(p: *const bindings::Constraint) -> protobuf::Con
             if (*p).raw_expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).raw_expr as *const bindings::Node),
-                }))
+                node((*p).raw_expr as *const bindings::Node)
             }
         };
         out.cooked_expr = unsafe { c_string((*p).cooked_expr) };
@@ -5887,16 +5503,16 @@ pub(crate) unsafe fn constraint(p: *const bindings::Constraint) -> protobuf::Con
             if (*p).where_clause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).where_clause as *const bindings::Node),
-                }))
+                node((*p).where_clause as *const bindings::Node)
             }
         };
         out.pktable = unsafe {
             if (*p).pktable.is_null() {
                 None
             } else {
-                Some(range_var((*p).pktable as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).pktable as *const bindings::RangeVar,
+                )))
             }
         };
         out.fk_attrs = unsafe { list_items((*p).fk_attrs) };
@@ -5916,19 +5532,21 @@ pub(crate) unsafe fn constraint(p: *const bindings::Constraint) -> protobuf::Con
 
 pub(crate) unsafe fn create_table_space_stmt(
     p: *const bindings::CreateTableSpaceStmt,
-) -> protobuf::CreateTableSpaceStmt {
+) -> ast::CreateTableSpaceStmt {
     if too_deep() {
-        return protobuf::CreateTableSpaceStmt::default();
+        return ast::CreateTableSpaceStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateTableSpaceStmt::default();
+        let mut out = ast::CreateTableSpaceStmt::default();
         out.tablespacename = unsafe { c_string((*p).tablespacename) };
         out.owner = unsafe {
             if (*p).owner.is_null() {
                 None
             } else {
-                Some(role_spec((*p).owner as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).owner as *const bindings::RoleSpec,
+                )))
             }
         };
         out.location = unsafe { c_string((*p).location) };
@@ -5939,13 +5557,13 @@ pub(crate) unsafe fn create_table_space_stmt(
 
 pub(crate) unsafe fn drop_table_space_stmt(
     p: *const bindings::DropTableSpaceStmt,
-) -> protobuf::DropTableSpaceStmt {
+) -> ast::DropTableSpaceStmt {
     if too_deep() {
-        return protobuf::DropTableSpaceStmt::default();
+        return ast::DropTableSpaceStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DropTableSpaceStmt::default();
+        let mut out = ast::DropTableSpaceStmt::default();
         out.tablespacename = unsafe { c_string((*p).tablespacename) };
         out.missing_ok = unsafe { (*p).missing_ok };
         out
@@ -5954,13 +5572,13 @@ pub(crate) unsafe fn drop_table_space_stmt(
 
 pub(crate) unsafe fn alter_table_space_options_stmt(
     p: *const bindings::AlterTableSpaceOptionsStmt,
-) -> protobuf::AlterTableSpaceOptionsStmt {
+) -> ast::AlterTableSpaceOptionsStmt {
     if too_deep() {
-        return protobuf::AlterTableSpaceOptionsStmt::default();
+        return ast::AlterTableSpaceOptionsStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterTableSpaceOptionsStmt::default();
+        let mut out = ast::AlterTableSpaceOptionsStmt::default();
         out.tablespacename = unsafe { c_string((*p).tablespacename) };
         out.options = unsafe { list_items((*p).options) };
         out.is_reset = unsafe { (*p).isReset };
@@ -5970,13 +5588,13 @@ pub(crate) unsafe fn alter_table_space_options_stmt(
 
 pub(crate) unsafe fn alter_table_move_all_stmt(
     p: *const bindings::AlterTableMoveAllStmt,
-) -> protobuf::AlterTableMoveAllStmt {
+) -> ast::AlterTableMoveAllStmt {
     if too_deep() {
-        return protobuf::AlterTableMoveAllStmt::default();
+        return ast::AlterTableMoveAllStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterTableMoveAllStmt::default();
+        let mut out = ast::AlterTableMoveAllStmt::default();
         out.orig_tablespacename = unsafe { c_string((*p).orig_tablespacename) };
         out.objtype = unsafe { convert_object_type((*p).objtype) };
         out.roles = unsafe { list_items((*p).roles) };
@@ -5988,13 +5606,13 @@ pub(crate) unsafe fn alter_table_move_all_stmt(
 
 pub(crate) unsafe fn create_extension_stmt(
     p: *const bindings::CreateExtensionStmt,
-) -> protobuf::CreateExtensionStmt {
+) -> ast::CreateExtensionStmt {
     if too_deep() {
-        return protobuf::CreateExtensionStmt::default();
+        return ast::CreateExtensionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateExtensionStmt::default();
+        let mut out = ast::CreateExtensionStmt::default();
         out.extname = unsafe { c_string((*p).extname) };
         out.if_not_exists = unsafe { (*p).if_not_exists };
         out.options = unsafe { list_items((*p).options) };
@@ -6004,13 +5622,13 @@ pub(crate) unsafe fn create_extension_stmt(
 
 pub(crate) unsafe fn alter_extension_stmt(
     p: *const bindings::AlterExtensionStmt,
-) -> protobuf::AlterExtensionStmt {
+) -> ast::AlterExtensionStmt {
     if too_deep() {
-        return protobuf::AlterExtensionStmt::default();
+        return ast::AlterExtensionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterExtensionStmt::default();
+        let mut out = ast::AlterExtensionStmt::default();
         out.extname = unsafe { c_string((*p).extname) };
         out.options = unsafe { list_items((*p).options) };
         out
@@ -6019,13 +5637,13 @@ pub(crate) unsafe fn alter_extension_stmt(
 
 pub(crate) unsafe fn alter_extension_contents_stmt(
     p: *const bindings::AlterExtensionContentsStmt,
-) -> protobuf::AlterExtensionContentsStmt {
+) -> ast::AlterExtensionContentsStmt {
     if too_deep() {
-        return protobuf::AlterExtensionContentsStmt::default();
+        return ast::AlterExtensionContentsStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterExtensionContentsStmt::default();
+        let mut out = ast::AlterExtensionContentsStmt::default();
         out.extname = unsafe { c_string((*p).extname) };
         out.action = unsafe { (*p).action as i32 };
         out.objtype = unsafe { convert_object_type((*p).objtype) };
@@ -6033,22 +5651,20 @@ pub(crate) unsafe fn alter_extension_contents_stmt(
             if (*p).object.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).object as *const bindings::Node),
-                }))
+                node((*p).object as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn create_fdw_stmt(p: *const bindings::CreateFdwStmt) -> protobuf::CreateFdwStmt {
+pub(crate) unsafe fn create_fdw_stmt(p: *const bindings::CreateFdwStmt) -> ast::CreateFdwStmt {
     if too_deep() {
-        return protobuf::CreateFdwStmt::default();
+        return ast::CreateFdwStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateFdwStmt::default();
+        let mut out = ast::CreateFdwStmt::default();
         out.fdwname = unsafe { c_string((*p).fdwname) };
         out.func_options = unsafe { list_items((*p).func_options) };
         out.options = unsafe { list_items((*p).options) };
@@ -6056,13 +5672,13 @@ pub(crate) unsafe fn create_fdw_stmt(p: *const bindings::CreateFdwStmt) -> proto
     })
 }
 
-pub(crate) unsafe fn alter_fdw_stmt(p: *const bindings::AlterFdwStmt) -> protobuf::AlterFdwStmt {
+pub(crate) unsafe fn alter_fdw_stmt(p: *const bindings::AlterFdwStmt) -> ast::AlterFdwStmt {
     if too_deep() {
-        return protobuf::AlterFdwStmt::default();
+        return ast::AlterFdwStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterFdwStmt::default();
+        let mut out = ast::AlterFdwStmt::default();
         out.fdwname = unsafe { c_string((*p).fdwname) };
         out.func_options = unsafe { list_items((*p).func_options) };
         out.options = unsafe { list_items((*p).options) };
@@ -6072,13 +5688,13 @@ pub(crate) unsafe fn alter_fdw_stmt(p: *const bindings::AlterFdwStmt) -> protobu
 
 pub(crate) unsafe fn create_foreign_server_stmt(
     p: *const bindings::CreateForeignServerStmt,
-) -> protobuf::CreateForeignServerStmt {
+) -> ast::CreateForeignServerStmt {
     if too_deep() {
-        return protobuf::CreateForeignServerStmt::default();
+        return ast::CreateForeignServerStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateForeignServerStmt::default();
+        let mut out = ast::CreateForeignServerStmt::default();
         out.servername = unsafe { c_string((*p).servername) };
         out.servertype = unsafe { c_string((*p).servertype) };
         out.version = unsafe { c_string((*p).version) };
@@ -6091,13 +5707,13 @@ pub(crate) unsafe fn create_foreign_server_stmt(
 
 pub(crate) unsafe fn alter_foreign_server_stmt(
     p: *const bindings::AlterForeignServerStmt,
-) -> protobuf::AlterForeignServerStmt {
+) -> ast::AlterForeignServerStmt {
     if too_deep() {
-        return protobuf::AlterForeignServerStmt::default();
+        return ast::AlterForeignServerStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterForeignServerStmt::default();
+        let mut out = ast::AlterForeignServerStmt::default();
         out.servername = unsafe { c_string((*p).servername) };
         out.version = unsafe { c_string((*p).version) };
         out.options = unsafe { list_items((*p).options) };
@@ -6108,14 +5724,14 @@ pub(crate) unsafe fn alter_foreign_server_stmt(
 
 pub(crate) unsafe fn create_foreign_table_stmt(
     p: *const bindings::CreateForeignTableStmt,
-) -> protobuf::CreateForeignTableStmt {
+) -> ast::CreateForeignTableStmt {
     if too_deep() {
-        return protobuf::CreateForeignTableStmt::default();
+        return ast::CreateForeignTableStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateForeignTableStmt::default();
-        out.base_stmt = unsafe { Some(create_stmt(&(*p).base as *const bindings::CreateStmt)) };
+        let mut out = ast::CreateForeignTableStmt::default();
+        out.base_stmt = unsafe { create_stmt(&(*p).base as *const bindings::CreateStmt) };
         out.servername = unsafe { c_string((*p).servername) };
         out.options = unsafe { list_items((*p).options) };
         out
@@ -6124,18 +5740,20 @@ pub(crate) unsafe fn create_foreign_table_stmt(
 
 pub(crate) unsafe fn create_user_mapping_stmt(
     p: *const bindings::CreateUserMappingStmt,
-) -> protobuf::CreateUserMappingStmt {
+) -> ast::CreateUserMappingStmt {
     if too_deep() {
-        return protobuf::CreateUserMappingStmt::default();
+        return ast::CreateUserMappingStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateUserMappingStmt::default();
+        let mut out = ast::CreateUserMappingStmt::default();
         out.user = unsafe {
             if (*p).user.is_null() {
                 None
             } else {
-                Some(role_spec((*p).user as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).user as *const bindings::RoleSpec,
+                )))
             }
         };
         out.servername = unsafe { c_string((*p).servername) };
@@ -6147,18 +5765,20 @@ pub(crate) unsafe fn create_user_mapping_stmt(
 
 pub(crate) unsafe fn alter_user_mapping_stmt(
     p: *const bindings::AlterUserMappingStmt,
-) -> protobuf::AlterUserMappingStmt {
+) -> ast::AlterUserMappingStmt {
     if too_deep() {
-        return protobuf::AlterUserMappingStmt::default();
+        return ast::AlterUserMappingStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterUserMappingStmt::default();
+        let mut out = ast::AlterUserMappingStmt::default();
         out.user = unsafe {
             if (*p).user.is_null() {
                 None
             } else {
-                Some(role_spec((*p).user as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).user as *const bindings::RoleSpec,
+                )))
             }
         };
         out.servername = unsafe { c_string((*p).servername) };
@@ -6169,18 +5789,20 @@ pub(crate) unsafe fn alter_user_mapping_stmt(
 
 pub(crate) unsafe fn drop_user_mapping_stmt(
     p: *const bindings::DropUserMappingStmt,
-) -> protobuf::DropUserMappingStmt {
+) -> ast::DropUserMappingStmt {
     if too_deep() {
-        return protobuf::DropUserMappingStmt::default();
+        return ast::DropUserMappingStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DropUserMappingStmt::default();
+        let mut out = ast::DropUserMappingStmt::default();
         out.user = unsafe {
             if (*p).user.is_null() {
                 None
             } else {
-                Some(role_spec((*p).user as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).user as *const bindings::RoleSpec,
+                )))
             }
         };
         out.servername = unsafe { c_string((*p).servername) };
@@ -6191,13 +5813,13 @@ pub(crate) unsafe fn drop_user_mapping_stmt(
 
 pub(crate) unsafe fn import_foreign_schema_stmt(
     p: *const bindings::ImportForeignSchemaStmt,
-) -> protobuf::ImportForeignSchemaStmt {
+) -> ast::ImportForeignSchemaStmt {
     if too_deep() {
-        return protobuf::ImportForeignSchemaStmt::default();
+        return ast::ImportForeignSchemaStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ImportForeignSchemaStmt::default();
+        let mut out = ast::ImportForeignSchemaStmt::default();
         out.server_name = unsafe { c_string((*p).server_name) };
         out.remote_schema = unsafe { c_string((*p).remote_schema) };
         out.local_schema = unsafe { c_string((*p).local_schema) };
@@ -6210,19 +5832,21 @@ pub(crate) unsafe fn import_foreign_schema_stmt(
 
 pub(crate) unsafe fn create_policy_stmt(
     p: *const bindings::CreatePolicyStmt,
-) -> protobuf::CreatePolicyStmt {
+) -> ast::CreatePolicyStmt {
     if too_deep() {
-        return protobuf::CreatePolicyStmt::default();
+        return ast::CreatePolicyStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreatePolicyStmt::default();
+        let mut out = ast::CreatePolicyStmt::default();
         out.policy_name = unsafe { c_string((*p).policy_name) };
         out.table = unsafe {
             if (*p).table.is_null() {
                 None
             } else {
-                Some(range_var((*p).table as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).table as *const bindings::RangeVar,
+                )))
             }
         };
         out.cmd_name = unsafe { c_string((*p).cmd_name) };
@@ -6232,18 +5856,14 @@ pub(crate) unsafe fn create_policy_stmt(
             if (*p).qual.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).qual as *const bindings::Node),
-                }))
+                node((*p).qual as *const bindings::Node)
             }
         };
         out.with_check = unsafe {
             if (*p).with_check.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).with_check as *const bindings::Node),
-                }))
+                node((*p).with_check as *const bindings::Node)
             }
         };
         out
@@ -6252,19 +5872,21 @@ pub(crate) unsafe fn create_policy_stmt(
 
 pub(crate) unsafe fn alter_policy_stmt(
     p: *const bindings::AlterPolicyStmt,
-) -> protobuf::AlterPolicyStmt {
+) -> ast::AlterPolicyStmt {
     if too_deep() {
-        return protobuf::AlterPolicyStmt::default();
+        return ast::AlterPolicyStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterPolicyStmt::default();
+        let mut out = ast::AlterPolicyStmt::default();
         out.policy_name = unsafe { c_string((*p).policy_name) };
         out.table = unsafe {
             if (*p).table.is_null() {
                 None
             } else {
-                Some(range_var((*p).table as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).table as *const bindings::RangeVar,
+                )))
             }
         };
         out.roles = unsafe { list_items((*p).roles) };
@@ -6272,31 +5894,27 @@ pub(crate) unsafe fn alter_policy_stmt(
             if (*p).qual.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).qual as *const bindings::Node),
-                }))
+                node((*p).qual as *const bindings::Node)
             }
         };
         out.with_check = unsafe {
             if (*p).with_check.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).with_check as *const bindings::Node),
-                }))
+                node((*p).with_check as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn create_am_stmt(p: *const bindings::CreateAmStmt) -> protobuf::CreateAmStmt {
+pub(crate) unsafe fn create_am_stmt(p: *const bindings::CreateAmStmt) -> ast::CreateAmStmt {
     if too_deep() {
-        return protobuf::CreateAmStmt::default();
+        return ast::CreateAmStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateAmStmt::default();
+        let mut out = ast::CreateAmStmt::default();
         out.amname = unsafe { c_string((*p).amname) };
         out.handler_name = unsafe { list_items((*p).handler_name) };
         out.amtype = unsafe { c_char_string((*p).amtype) };
@@ -6304,15 +5922,13 @@ pub(crate) unsafe fn create_am_stmt(p: *const bindings::CreateAmStmt) -> protobu
     })
 }
 
-pub(crate) unsafe fn create_trig_stmt(
-    p: *const bindings::CreateTrigStmt,
-) -> protobuf::CreateTrigStmt {
+pub(crate) unsafe fn create_trig_stmt(p: *const bindings::CreateTrigStmt) -> ast::CreateTrigStmt {
     if too_deep() {
-        return protobuf::CreateTrigStmt::default();
+        return ast::CreateTrigStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateTrigStmt::default();
+        let mut out = ast::CreateTrigStmt::default();
         out.replace = unsafe { (*p).replace };
         out.isconstraint = unsafe { (*p).isconstraint };
         out.trigname = unsafe { c_string((*p).trigname) };
@@ -6320,7 +5936,9 @@ pub(crate) unsafe fn create_trig_stmt(
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.funcname = unsafe { list_items((*p).funcname) };
@@ -6333,9 +5951,7 @@ pub(crate) unsafe fn create_trig_stmt(
             if (*p).whenClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whenClause as *const bindings::Node),
-                }))
+                node((*p).whenClause as *const bindings::Node)
             }
         };
         out.transition_rels = unsafe { list_items((*p).transitionRels) };
@@ -6345,7 +5961,9 @@ pub(crate) unsafe fn create_trig_stmt(
             if (*p).constrrel.is_null() {
                 None
             } else {
-                Some(range_var((*p).constrrel as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).constrrel as *const bindings::RangeVar,
+                )))
             }
         };
         out
@@ -6354,13 +5972,13 @@ pub(crate) unsafe fn create_trig_stmt(
 
 pub(crate) unsafe fn create_event_trig_stmt(
     p: *const bindings::CreateEventTrigStmt,
-) -> protobuf::CreateEventTrigStmt {
+) -> ast::CreateEventTrigStmt {
     if too_deep() {
-        return protobuf::CreateEventTrigStmt::default();
+        return ast::CreateEventTrigStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateEventTrigStmt::default();
+        let mut out = ast::CreateEventTrigStmt::default();
         out.trigname = unsafe { c_string((*p).trigname) };
         out.eventname = unsafe { c_string((*p).eventname) };
         out.whenclause = unsafe { list_items((*p).whenclause) };
@@ -6371,13 +5989,13 @@ pub(crate) unsafe fn create_event_trig_stmt(
 
 pub(crate) unsafe fn alter_event_trig_stmt(
     p: *const bindings::AlterEventTrigStmt,
-) -> protobuf::AlterEventTrigStmt {
+) -> ast::AlterEventTrigStmt {
     if too_deep() {
-        return protobuf::AlterEventTrigStmt::default();
+        return ast::AlterEventTrigStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterEventTrigStmt::default();
+        let mut out = ast::AlterEventTrigStmt::default();
         out.trigname = unsafe { c_string((*p).trigname) };
         out.tgenabled = unsafe { c_char_string((*p).tgenabled) };
         out
@@ -6386,13 +6004,13 @@ pub(crate) unsafe fn alter_event_trig_stmt(
 
 pub(crate) unsafe fn create_p_lang_stmt(
     p: *const bindings::CreatePLangStmt,
-) -> protobuf::CreatePLangStmt {
+) -> ast::CreatePLangStmt {
     if too_deep() {
-        return protobuf::CreatePLangStmt::default();
+        return ast::CreatePLangStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreatePLangStmt::default();
+        let mut out = ast::CreatePLangStmt::default();
         out.replace = unsafe { (*p).replace };
         out.plname = unsafe { c_string((*p).plname) };
         out.plhandler = unsafe { list_items((*p).plhandler) };
@@ -6403,15 +6021,13 @@ pub(crate) unsafe fn create_p_lang_stmt(
     })
 }
 
-pub(crate) unsafe fn create_role_stmt(
-    p: *const bindings::CreateRoleStmt,
-) -> protobuf::CreateRoleStmt {
+pub(crate) unsafe fn create_role_stmt(p: *const bindings::CreateRoleStmt) -> ast::CreateRoleStmt {
     if too_deep() {
-        return protobuf::CreateRoleStmt::default();
+        return ast::CreateRoleStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateRoleStmt::default();
+        let mut out = ast::CreateRoleStmt::default();
         out.stmt_type = unsafe { convert_role_stmt_type((*p).stmt_type) };
         out.role = unsafe { c_string((*p).role) };
         out.options = unsafe { list_items((*p).options) };
@@ -6419,18 +6035,20 @@ pub(crate) unsafe fn create_role_stmt(
     })
 }
 
-pub(crate) unsafe fn alter_role_stmt(p: *const bindings::AlterRoleStmt) -> protobuf::AlterRoleStmt {
+pub(crate) unsafe fn alter_role_stmt(p: *const bindings::AlterRoleStmt) -> ast::AlterRoleStmt {
     if too_deep() {
-        return protobuf::AlterRoleStmt::default();
+        return ast::AlterRoleStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterRoleStmt::default();
+        let mut out = ast::AlterRoleStmt::default();
         out.role = unsafe {
             if (*p).role.is_null() {
                 None
             } else {
-                Some(role_spec((*p).role as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).role as *const bindings::RoleSpec,
+                )))
             }
         };
         out.options = unsafe { list_items((*p).options) };
@@ -6441,18 +6059,20 @@ pub(crate) unsafe fn alter_role_stmt(p: *const bindings::AlterRoleStmt) -> proto
 
 pub(crate) unsafe fn alter_role_set_stmt(
     p: *const bindings::AlterRoleSetStmt,
-) -> protobuf::AlterRoleSetStmt {
+) -> ast::AlterRoleSetStmt {
     if too_deep() {
-        return protobuf::AlterRoleSetStmt::default();
+        return ast::AlterRoleSetStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterRoleSetStmt::default();
+        let mut out = ast::AlterRoleSetStmt::default();
         out.role = unsafe {
             if (*p).role.is_null() {
                 None
             } else {
-                Some(role_spec((*p).role as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).role as *const bindings::RoleSpec,
+                )))
             }
         };
         out.database = unsafe { c_string((*p).database) };
@@ -6460,40 +6080,42 @@ pub(crate) unsafe fn alter_role_set_stmt(
             if (*p).setstmt.is_null() {
                 None
             } else {
-                Some(variable_set_stmt(
+                Some(NodeBox::new(variable_set_stmt(
                     (*p).setstmt as *const bindings::VariableSetStmt,
-                ))
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn drop_role_stmt(p: *const bindings::DropRoleStmt) -> protobuf::DropRoleStmt {
+pub(crate) unsafe fn drop_role_stmt(p: *const bindings::DropRoleStmt) -> ast::DropRoleStmt {
     if too_deep() {
-        return protobuf::DropRoleStmt::default();
+        return ast::DropRoleStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DropRoleStmt::default();
+        let mut out = ast::DropRoleStmt::default();
         out.roles = unsafe { list_items((*p).roles) };
         out.missing_ok = unsafe { (*p).missing_ok };
         out
     })
 }
 
-pub(crate) unsafe fn create_seq_stmt(p: *const bindings::CreateSeqStmt) -> protobuf::CreateSeqStmt {
+pub(crate) unsafe fn create_seq_stmt(p: *const bindings::CreateSeqStmt) -> ast::CreateSeqStmt {
     if too_deep() {
-        return protobuf::CreateSeqStmt::default();
+        return ast::CreateSeqStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateSeqStmt::default();
+        let mut out = ast::CreateSeqStmt::default();
         out.sequence = unsafe {
             if (*p).sequence.is_null() {
                 None
             } else {
-                Some(range_var((*p).sequence as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).sequence as *const bindings::RangeVar,
+                )))
             }
         };
         out.options = unsafe { list_items((*p).options) };
@@ -6504,18 +6126,20 @@ pub(crate) unsafe fn create_seq_stmt(p: *const bindings::CreateSeqStmt) -> proto
     })
 }
 
-pub(crate) unsafe fn alter_seq_stmt(p: *const bindings::AlterSeqStmt) -> protobuf::AlterSeqStmt {
+pub(crate) unsafe fn alter_seq_stmt(p: *const bindings::AlterSeqStmt) -> ast::AlterSeqStmt {
     if too_deep() {
-        return protobuf::AlterSeqStmt::default();
+        return ast::AlterSeqStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterSeqStmt::default();
+        let mut out = ast::AlterSeqStmt::default();
         out.sequence = unsafe {
             if (*p).sequence.is_null() {
                 None
             } else {
-                Some(range_var((*p).sequence as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).sequence as *const bindings::RangeVar,
+                )))
             }
         };
         out.options = unsafe { list_items((*p).options) };
@@ -6525,13 +6149,13 @@ pub(crate) unsafe fn alter_seq_stmt(p: *const bindings::AlterSeqStmt) -> protobu
     })
 }
 
-pub(crate) unsafe fn define_stmt(p: *const bindings::DefineStmt) -> protobuf::DefineStmt {
+pub(crate) unsafe fn define_stmt(p: *const bindings::DefineStmt) -> ast::DefineStmt {
     if too_deep() {
-        return protobuf::DefineStmt::default();
+        return ast::DefineStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DefineStmt::default();
+        let mut out = ast::DefineStmt::default();
         out.kind = unsafe { convert_object_type((*p).kind) };
         out.oldstyle = unsafe { (*p).oldstyle };
         out.defnames = unsafe { list_items((*p).defnames) };
@@ -6545,26 +6169,28 @@ pub(crate) unsafe fn define_stmt(p: *const bindings::DefineStmt) -> protobuf::De
 
 pub(crate) unsafe fn create_domain_stmt(
     p: *const bindings::CreateDomainStmt,
-) -> protobuf::CreateDomainStmt {
+) -> ast::CreateDomainStmt {
     if too_deep() {
-        return protobuf::CreateDomainStmt::default();
+        return ast::CreateDomainStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateDomainStmt::default();
+        let mut out = ast::CreateDomainStmt::default();
         out.domainname = unsafe { list_items((*p).domainname) };
         out.type_name = unsafe {
             if (*p).typeName.is_null() {
                 None
             } else {
-                Some(type_name((*p).typeName as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).typeName as *const bindings::TypeName,
+                )))
             }
         };
         out.coll_clause = unsafe {
             if (*p).collClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(collate_clause(
+                Some(NodeBox::new(collate_clause(
                     (*p).collClause as *const bindings::CollateClause,
                 )))
             }
@@ -6576,13 +6202,13 @@ pub(crate) unsafe fn create_domain_stmt(
 
 pub(crate) unsafe fn create_op_class_stmt(
     p: *const bindings::CreateOpClassStmt,
-) -> protobuf::CreateOpClassStmt {
+) -> ast::CreateOpClassStmt {
     if too_deep() {
-        return protobuf::CreateOpClassStmt::default();
+        return ast::CreateOpClassStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateOpClassStmt::default();
+        let mut out = ast::CreateOpClassStmt::default();
         out.opclassname = unsafe { list_items((*p).opclassname) };
         out.opfamilyname = unsafe { list_items((*p).opfamilyname) };
         out.amname = unsafe { c_string((*p).amname) };
@@ -6590,7 +6216,9 @@ pub(crate) unsafe fn create_op_class_stmt(
             if (*p).datatype.is_null() {
                 None
             } else {
-                Some(type_name((*p).datatype as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).datatype as *const bindings::TypeName,
+                )))
             }
         };
         out.items = unsafe { list_items((*p).items) };
@@ -6601,21 +6229,21 @@ pub(crate) unsafe fn create_op_class_stmt(
 
 pub(crate) unsafe fn create_op_class_item(
     p: *const bindings::CreateOpClassItem,
-) -> protobuf::CreateOpClassItem {
+) -> ast::CreateOpClassItem {
     if too_deep() {
-        return protobuf::CreateOpClassItem::default();
+        return ast::CreateOpClassItem::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateOpClassItem::default();
+        let mut out = ast::CreateOpClassItem::default();
         out.itemtype = unsafe { (*p).itemtype as i32 };
         out.name = unsafe {
             if (*p).name.is_null() {
                 None
             } else {
-                Some(object_with_args(
+                Some(NodeBox::new(object_with_args(
                     (*p).name as *const bindings::ObjectWithArgs,
-                ))
+                )))
             }
         };
         out.number = unsafe { (*p).number as i32 };
@@ -6625,7 +6253,9 @@ pub(crate) unsafe fn create_op_class_item(
             if (*p).storedtype.is_null() {
                 None
             } else {
-                Some(type_name((*p).storedtype as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).storedtype as *const bindings::TypeName,
+                )))
             }
         };
         out
@@ -6634,13 +6264,13 @@ pub(crate) unsafe fn create_op_class_item(
 
 pub(crate) unsafe fn create_op_family_stmt(
     p: *const bindings::CreateOpFamilyStmt,
-) -> protobuf::CreateOpFamilyStmt {
+) -> ast::CreateOpFamilyStmt {
     if too_deep() {
-        return protobuf::CreateOpFamilyStmt::default();
+        return ast::CreateOpFamilyStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateOpFamilyStmt::default();
+        let mut out = ast::CreateOpFamilyStmt::default();
         out.opfamilyname = unsafe { list_items((*p).opfamilyname) };
         out.amname = unsafe { c_string((*p).amname) };
         out
@@ -6649,13 +6279,13 @@ pub(crate) unsafe fn create_op_family_stmt(
 
 pub(crate) unsafe fn alter_op_family_stmt(
     p: *const bindings::AlterOpFamilyStmt,
-) -> protobuf::AlterOpFamilyStmt {
+) -> ast::AlterOpFamilyStmt {
     if too_deep() {
-        return protobuf::AlterOpFamilyStmt::default();
+        return ast::AlterOpFamilyStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterOpFamilyStmt::default();
+        let mut out = ast::AlterOpFamilyStmt::default();
         out.opfamilyname = unsafe { list_items((*p).opfamilyname) };
         out.amname = unsafe { c_string((*p).amname) };
         out.is_drop = unsafe { (*p).isDrop };
@@ -6664,13 +6294,13 @@ pub(crate) unsafe fn alter_op_family_stmt(
     })
 }
 
-pub(crate) unsafe fn drop_stmt(p: *const bindings::DropStmt) -> protobuf::DropStmt {
+pub(crate) unsafe fn drop_stmt(p: *const bindings::DropStmt) -> ast::DropStmt {
     if too_deep() {
-        return protobuf::DropStmt::default();
+        return ast::DropStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DropStmt::default();
+        let mut out = ast::DropStmt::default();
         out.objects = unsafe { list_items((*p).objects) };
         out.remove_type = unsafe { convert_object_type((*p).removeType) };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
@@ -6680,13 +6310,13 @@ pub(crate) unsafe fn drop_stmt(p: *const bindings::DropStmt) -> protobuf::DropSt
     })
 }
 
-pub(crate) unsafe fn truncate_stmt(p: *const bindings::TruncateStmt) -> protobuf::TruncateStmt {
+pub(crate) unsafe fn truncate_stmt(p: *const bindings::TruncateStmt) -> ast::TruncateStmt {
     if too_deep() {
-        return protobuf::TruncateStmt::default();
+        return ast::TruncateStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TruncateStmt::default();
+        let mut out = ast::TruncateStmt::default();
         out.relations = unsafe { list_items((*p).relations) };
         out.restart_seqs = unsafe { (*p).restart_seqs };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
@@ -6694,21 +6324,19 @@ pub(crate) unsafe fn truncate_stmt(p: *const bindings::TruncateStmt) -> protobuf
     })
 }
 
-pub(crate) unsafe fn comment_stmt(p: *const bindings::CommentStmt) -> protobuf::CommentStmt {
+pub(crate) unsafe fn comment_stmt(p: *const bindings::CommentStmt) -> ast::CommentStmt {
     if too_deep() {
-        return protobuf::CommentStmt::default();
+        return ast::CommentStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CommentStmt::default();
+        let mut out = ast::CommentStmt::default();
         out.objtype = unsafe { convert_object_type((*p).objtype) };
         out.object = unsafe {
             if (*p).object.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).object as *const bindings::Node),
-                }))
+                node((*p).object as *const bindings::Node)
             }
         };
         out.comment = unsafe { c_string((*p).comment) };
@@ -6716,21 +6344,19 @@ pub(crate) unsafe fn comment_stmt(p: *const bindings::CommentStmt) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn sec_label_stmt(p: *const bindings::SecLabelStmt) -> protobuf::SecLabelStmt {
+pub(crate) unsafe fn sec_label_stmt(p: *const bindings::SecLabelStmt) -> ast::SecLabelStmt {
     if too_deep() {
-        return protobuf::SecLabelStmt::default();
+        return ast::SecLabelStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::SecLabelStmt::default();
+        let mut out = ast::SecLabelStmt::default();
         out.objtype = unsafe { convert_object_type((*p).objtype) };
         out.object = unsafe {
             if (*p).object.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).object as *const bindings::Node),
-                }))
+                node((*p).object as *const bindings::Node)
             }
         };
         out.provider = unsafe { c_string((*p).provider) };
@@ -6741,22 +6367,20 @@ pub(crate) unsafe fn sec_label_stmt(p: *const bindings::SecLabelStmt) -> protobu
 
 pub(crate) unsafe fn declare_cursor_stmt(
     p: *const bindings::DeclareCursorStmt,
-) -> protobuf::DeclareCursorStmt {
+) -> ast::DeclareCursorStmt {
     if too_deep() {
-        return protobuf::DeclareCursorStmt::default();
+        return ast::DeclareCursorStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DeclareCursorStmt::default();
+        let mut out = ast::DeclareCursorStmt::default();
         out.portalname = unsafe { c_string((*p).portalname) };
         out.options = unsafe { (*p).options as i32 };
         out.query = unsafe {
             if (*p).query.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).query as *const bindings::Node),
-                }))
+                node((*p).query as *const bindings::Node)
             }
         };
         out
@@ -6765,25 +6389,25 @@ pub(crate) unsafe fn declare_cursor_stmt(
 
 pub(crate) unsafe fn close_portal_stmt(
     p: *const bindings::ClosePortalStmt,
-) -> protobuf::ClosePortalStmt {
+) -> ast::ClosePortalStmt {
     if too_deep() {
-        return protobuf::ClosePortalStmt::default();
+        return ast::ClosePortalStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ClosePortalStmt::default();
+        let mut out = ast::ClosePortalStmt::default();
         out.portalname = unsafe { c_string((*p).portalname) };
         out
     })
 }
 
-pub(crate) unsafe fn fetch_stmt(p: *const bindings::FetchStmt) -> protobuf::FetchStmt {
+pub(crate) unsafe fn fetch_stmt(p: *const bindings::FetchStmt) -> ast::FetchStmt {
     if too_deep() {
-        return protobuf::FetchStmt::default();
+        return ast::FetchStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::FetchStmt::default();
+        let mut out = ast::FetchStmt::default();
         out.direction = unsafe { convert_fetch_direction((*p).direction) };
         out.how_many = unsafe { (*p).howMany as i64 };
         out.portalname = unsafe { c_string((*p).portalname) };
@@ -6792,19 +6416,21 @@ pub(crate) unsafe fn fetch_stmt(p: *const bindings::FetchStmt) -> protobuf::Fetc
     })
 }
 
-pub(crate) unsafe fn index_stmt(p: *const bindings::IndexStmt) -> protobuf::IndexStmt {
+pub(crate) unsafe fn index_stmt(p: *const bindings::IndexStmt) -> ast::IndexStmt {
     if too_deep() {
-        return protobuf::IndexStmt::default();
+        return ast::IndexStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::IndexStmt::default();
+        let mut out = ast::IndexStmt::default();
         out.idxname = unsafe { c_string((*p).idxname) };
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.access_method = unsafe { c_string((*p).accessMethod) };
@@ -6816,9 +6442,7 @@ pub(crate) unsafe fn index_stmt(p: *const bindings::IndexStmt) -> protobuf::Inde
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.exclude_op_names = unsafe { list_items((*p).excludeOpNames) };
@@ -6844,13 +6468,13 @@ pub(crate) unsafe fn index_stmt(p: *const bindings::IndexStmt) -> protobuf::Inde
 
 pub(crate) unsafe fn create_stats_stmt(
     p: *const bindings::CreateStatsStmt,
-) -> protobuf::CreateStatsStmt {
+) -> ast::CreateStatsStmt {
     if too_deep() {
-        return protobuf::CreateStatsStmt::default();
+        return ast::CreateStatsStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateStatsStmt::default();
+        let mut out = ast::CreateStatsStmt::default();
         out.defnames = unsafe { list_items((*p).defnames) };
         out.stat_types = unsafe { list_items((*p).stat_types) };
         out.exprs = unsafe { list_items((*p).exprs) };
@@ -6863,44 +6487,38 @@ pub(crate) unsafe fn create_stats_stmt(
     })
 }
 
-pub(crate) unsafe fn stats_elem(p: *const bindings::StatsElem) -> protobuf::StatsElem {
+pub(crate) unsafe fn stats_elem(p: *const bindings::StatsElem) -> ast::StatsElem {
     if too_deep() {
-        return protobuf::StatsElem::default();
+        return ast::StatsElem::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::StatsElem::default();
+        let mut out = ast::StatsElem::default();
         out.name = unsafe { c_string((*p).name) };
         out.expr = unsafe {
             if (*p).expr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).expr as *const bindings::Node),
-                }))
+                node((*p).expr as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn alter_stats_stmt(
-    p: *const bindings::AlterStatsStmt,
-) -> protobuf::AlterStatsStmt {
+pub(crate) unsafe fn alter_stats_stmt(p: *const bindings::AlterStatsStmt) -> ast::AlterStatsStmt {
     if too_deep() {
-        return protobuf::AlterStatsStmt::default();
+        return ast::AlterStatsStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterStatsStmt::default();
+        let mut out = ast::AlterStatsStmt::default();
         out.defnames = unsafe { list_items((*p).defnames) };
         out.stxstattarget = unsafe {
             if (*p).stxstattarget.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).stxstattarget as *const bindings::Node),
-                }))
+                node((*p).stxstattarget as *const bindings::Node)
             }
         };
         out.missing_ok = unsafe { (*p).missing_ok };
@@ -6910,13 +6528,13 @@ pub(crate) unsafe fn alter_stats_stmt(
 
 pub(crate) unsafe fn create_function_stmt(
     p: *const bindings::CreateFunctionStmt,
-) -> protobuf::CreateFunctionStmt {
+) -> ast::CreateFunctionStmt {
     if too_deep() {
-        return protobuf::CreateFunctionStmt::default();
+        return ast::CreateFunctionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateFunctionStmt::default();
+        let mut out = ast::CreateFunctionStmt::default();
         out.is_procedure = unsafe { (*p).is_procedure };
         out.replace = unsafe { (*p).replace };
         out.funcname = unsafe { list_items((*p).funcname) };
@@ -6925,7 +6543,9 @@ pub(crate) unsafe fn create_function_stmt(
             if (*p).returnType.is_null() {
                 None
             } else {
-                Some(type_name((*p).returnType as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).returnType as *const bindings::TypeName,
+                )))
             }
         };
         out.options = unsafe { list_items((*p).options) };
@@ -6933,9 +6553,7 @@ pub(crate) unsafe fn create_function_stmt(
             if (*p).sql_body.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).sql_body as *const bindings::Node),
-                }))
+                node((*p).sql_body as *const bindings::Node)
             }
         };
         out
@@ -6944,19 +6562,21 @@ pub(crate) unsafe fn create_function_stmt(
 
 pub(crate) unsafe fn function_parameter(
     p: *const bindings::FunctionParameter,
-) -> protobuf::FunctionParameter {
+) -> ast::FunctionParameter {
     if too_deep() {
-        return protobuf::FunctionParameter::default();
+        return ast::FunctionParameter::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::FunctionParameter::default();
+        let mut out = ast::FunctionParameter::default();
         out.name = unsafe { c_string((*p).name) };
         out.arg_type = unsafe {
             if (*p).argType.is_null() {
                 None
             } else {
-                Some(type_name((*p).argType as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).argType as *const bindings::TypeName,
+                )))
             }
         };
         out.mode = unsafe { convert_function_parameter_mode((*p).mode) };
@@ -6964,9 +6584,7 @@ pub(crate) unsafe fn function_parameter(
             if (*p).defexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).defexpr as *const bindings::Node),
-                }))
+                node((*p).defexpr as *const bindings::Node)
             }
         };
         out.location = unsafe { (*p).location as i32 };
@@ -6976,21 +6594,21 @@ pub(crate) unsafe fn function_parameter(
 
 pub(crate) unsafe fn alter_function_stmt(
     p: *const bindings::AlterFunctionStmt,
-) -> protobuf::AlterFunctionStmt {
+) -> ast::AlterFunctionStmt {
     if too_deep() {
-        return protobuf::AlterFunctionStmt::default();
+        return ast::AlterFunctionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterFunctionStmt::default();
+        let mut out = ast::AlterFunctionStmt::default();
         out.objtype = unsafe { convert_object_type((*p).objtype) };
         out.func = unsafe {
             if (*p).func.is_null() {
                 None
             } else {
-                Some(object_with_args(
+                Some(NodeBox::new(object_with_args(
                     (*p).func as *const bindings::ObjectWithArgs,
-                ))
+                )))
             }
         };
         out.actions = unsafe { list_items((*p).actions) };
@@ -6998,13 +6616,13 @@ pub(crate) unsafe fn alter_function_stmt(
     })
 }
 
-pub(crate) unsafe fn do_stmt(p: *const bindings::DoStmt) -> protobuf::DoStmt {
+pub(crate) unsafe fn do_stmt(p: *const bindings::DoStmt) -> ast::DoStmt {
     if too_deep() {
-        return protobuf::DoStmt::default();
+        return ast::DoStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DoStmt::default();
+        let mut out = ast::DoStmt::default();
         out.args = unsafe { list_items((*p).args) };
         out
     })
@@ -7012,13 +6630,13 @@ pub(crate) unsafe fn do_stmt(p: *const bindings::DoStmt) -> protobuf::DoStmt {
 
 pub(crate) unsafe fn inline_code_block(
     p: *const bindings::InlineCodeBlock,
-) -> protobuf::InlineCodeBlock {
+) -> ast::InlineCodeBlock {
     if too_deep() {
-        return protobuf::InlineCodeBlock::default();
+        return ast::InlineCodeBlock::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::InlineCodeBlock::default();
+        let mut out = ast::InlineCodeBlock::default();
         out.source_text = unsafe { c_string((*p).source_text) };
         out.lang_oid = unsafe { (*p).langOid as u32 };
         out.lang_is_trusted = unsafe { (*p).langIsTrusted };
@@ -7027,18 +6645,18 @@ pub(crate) unsafe fn inline_code_block(
     })
 }
 
-pub(crate) unsafe fn call_stmt(p: *const bindings::CallStmt) -> protobuf::CallStmt {
+pub(crate) unsafe fn call_stmt(p: *const bindings::CallStmt) -> ast::CallStmt {
     if too_deep() {
-        return protobuf::CallStmt::default();
+        return ast::CallStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CallStmt::default();
+        let mut out = ast::CallStmt::default();
         out.funccall = unsafe {
             if (*p).funccall.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(func_call(
+                Some(NodeBox::new(func_call(
                     (*p).funccall as *const bindings::FuncCall,
                 )))
             }
@@ -7047,7 +6665,7 @@ pub(crate) unsafe fn call_stmt(p: *const bindings::CallStmt) -> protobuf::CallSt
             if (*p).funcexpr.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(func_expr(
+                Some(NodeBox::new(func_expr(
                     (*p).funcexpr as *const bindings::FuncExpr,
                 )))
             }
@@ -7057,41 +6675,41 @@ pub(crate) unsafe fn call_stmt(p: *const bindings::CallStmt) -> protobuf::CallSt
     })
 }
 
-pub(crate) unsafe fn call_context(p: *const bindings::CallContext) -> protobuf::CallContext {
+pub(crate) unsafe fn call_context(p: *const bindings::CallContext) -> ast::CallContext {
     if too_deep() {
-        return protobuf::CallContext::default();
+        return ast::CallContext::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CallContext::default();
+        let mut out = ast::CallContext::default();
         out.atomic = unsafe { (*p).atomic };
         out
     })
 }
 
-pub(crate) unsafe fn rename_stmt(p: *const bindings::RenameStmt) -> protobuf::RenameStmt {
+pub(crate) unsafe fn rename_stmt(p: *const bindings::RenameStmt) -> ast::RenameStmt {
     if too_deep() {
-        return protobuf::RenameStmt::default();
+        return ast::RenameStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RenameStmt::default();
+        let mut out = ast::RenameStmt::default();
         out.rename_type = unsafe { convert_object_type((*p).renameType) };
         out.relation_type = unsafe { convert_object_type((*p).relationType) };
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.object = unsafe {
             if (*p).object.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).object as *const bindings::Node),
-                }))
+                node((*p).object as *const bindings::Node)
             }
         };
         out.subname = unsafe { c_string((*p).subname) };
@@ -7104,35 +6722,37 @@ pub(crate) unsafe fn rename_stmt(p: *const bindings::RenameStmt) -> protobuf::Re
 
 pub(crate) unsafe fn alter_object_depends_stmt(
     p: *const bindings::AlterObjectDependsStmt,
-) -> protobuf::AlterObjectDependsStmt {
+) -> ast::AlterObjectDependsStmt {
     if too_deep() {
-        return protobuf::AlterObjectDependsStmt::default();
+        return ast::AlterObjectDependsStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterObjectDependsStmt::default();
+        let mut out = ast::AlterObjectDependsStmt::default();
         out.object_type = unsafe { convert_object_type((*p).objectType) };
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.object = unsafe {
             if (*p).object.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).object as *const bindings::Node),
-                }))
+                node((*p).object as *const bindings::Node)
             }
         };
         out.extname = unsafe {
             if (*p).extname.is_null() {
                 None
             } else {
-                Some(string((*p).extname as *const bindings::String))
+                Some(NodeBox::new(string(
+                    (*p).extname as *const bindings::String,
+                )))
             }
         };
         out.remove = unsafe { (*p).remove };
@@ -7142,28 +6762,28 @@ pub(crate) unsafe fn alter_object_depends_stmt(
 
 pub(crate) unsafe fn alter_object_schema_stmt(
     p: *const bindings::AlterObjectSchemaStmt,
-) -> protobuf::AlterObjectSchemaStmt {
+) -> ast::AlterObjectSchemaStmt {
     if too_deep() {
-        return protobuf::AlterObjectSchemaStmt::default();
+        return ast::AlterObjectSchemaStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterObjectSchemaStmt::default();
+        let mut out = ast::AlterObjectSchemaStmt::default();
         out.object_type = unsafe { convert_object_type((*p).objectType) };
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.object = unsafe {
             if (*p).object.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).object as *const bindings::Node),
-                }))
+                node((*p).object as *const bindings::Node)
             }
         };
         out.newschema = unsafe { c_string((*p).newschema) };
@@ -7172,37 +6792,37 @@ pub(crate) unsafe fn alter_object_schema_stmt(
     })
 }
 
-pub(crate) unsafe fn alter_owner_stmt(
-    p: *const bindings::AlterOwnerStmt,
-) -> protobuf::AlterOwnerStmt {
+pub(crate) unsafe fn alter_owner_stmt(p: *const bindings::AlterOwnerStmt) -> ast::AlterOwnerStmt {
     if too_deep() {
-        return protobuf::AlterOwnerStmt::default();
+        return ast::AlterOwnerStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterOwnerStmt::default();
+        let mut out = ast::AlterOwnerStmt::default();
         out.object_type = unsafe { convert_object_type((*p).objectType) };
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.object = unsafe {
             if (*p).object.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).object as *const bindings::Node),
-                }))
+                node((*p).object as *const bindings::Node)
             }
         };
         out.newowner = unsafe {
             if (*p).newowner.is_null() {
                 None
             } else {
-                Some(role_spec((*p).newowner as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).newowner as *const bindings::RoleSpec,
+                )))
             }
         };
         out
@@ -7211,20 +6831,20 @@ pub(crate) unsafe fn alter_owner_stmt(
 
 pub(crate) unsafe fn alter_operator_stmt(
     p: *const bindings::AlterOperatorStmt,
-) -> protobuf::AlterOperatorStmt {
+) -> ast::AlterOperatorStmt {
     if too_deep() {
-        return protobuf::AlterOperatorStmt::default();
+        return ast::AlterOperatorStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterOperatorStmt::default();
+        let mut out = ast::AlterOperatorStmt::default();
         out.opername = unsafe {
             if (*p).opername.is_null() {
                 None
             } else {
-                Some(object_with_args(
+                Some(NodeBox::new(object_with_args(
                     (*p).opername as *const bindings::ObjectWithArgs,
-                ))
+                )))
             }
         };
         out.options = unsafe { list_items((*p).options) };
@@ -7232,31 +6852,33 @@ pub(crate) unsafe fn alter_operator_stmt(
     })
 }
 
-pub(crate) unsafe fn alter_type_stmt(p: *const bindings::AlterTypeStmt) -> protobuf::AlterTypeStmt {
+pub(crate) unsafe fn alter_type_stmt(p: *const bindings::AlterTypeStmt) -> ast::AlterTypeStmt {
     if too_deep() {
-        return protobuf::AlterTypeStmt::default();
+        return ast::AlterTypeStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterTypeStmt::default();
+        let mut out = ast::AlterTypeStmt::default();
         out.type_name = unsafe { list_items((*p).typeName) };
         out.options = unsafe { list_items((*p).options) };
         out
     })
 }
 
-pub(crate) unsafe fn rule_stmt(p: *const bindings::RuleStmt) -> protobuf::RuleStmt {
+pub(crate) unsafe fn rule_stmt(p: *const bindings::RuleStmt) -> ast::RuleStmt {
     if too_deep() {
-        return protobuf::RuleStmt::default();
+        return ast::RuleStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RuleStmt::default();
+        let mut out = ast::RuleStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.rulename = unsafe { c_string((*p).rulename) };
@@ -7264,9 +6886,7 @@ pub(crate) unsafe fn rule_stmt(p: *const bindings::RuleStmt) -> protobuf::RuleSt
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.event = unsafe { convert_cmd_type((*p).event) };
@@ -7277,52 +6897,50 @@ pub(crate) unsafe fn rule_stmt(p: *const bindings::RuleStmt) -> protobuf::RuleSt
     })
 }
 
-pub(crate) unsafe fn notify_stmt(p: *const bindings::NotifyStmt) -> protobuf::NotifyStmt {
+pub(crate) unsafe fn notify_stmt(p: *const bindings::NotifyStmt) -> ast::NotifyStmt {
     if too_deep() {
-        return protobuf::NotifyStmt::default();
+        return ast::NotifyStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::NotifyStmt::default();
+        let mut out = ast::NotifyStmt::default();
         out.conditionname = unsafe { c_string((*p).conditionname) };
         out.payload = unsafe { c_string((*p).payload) };
         out
     })
 }
 
-pub(crate) unsafe fn listen_stmt(p: *const bindings::ListenStmt) -> protobuf::ListenStmt {
+pub(crate) unsafe fn listen_stmt(p: *const bindings::ListenStmt) -> ast::ListenStmt {
     if too_deep() {
-        return protobuf::ListenStmt::default();
+        return ast::ListenStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ListenStmt::default();
+        let mut out = ast::ListenStmt::default();
         out.conditionname = unsafe { c_string((*p).conditionname) };
         out
     })
 }
 
-pub(crate) unsafe fn unlisten_stmt(p: *const bindings::UnlistenStmt) -> protobuf::UnlistenStmt {
+pub(crate) unsafe fn unlisten_stmt(p: *const bindings::UnlistenStmt) -> ast::UnlistenStmt {
     if too_deep() {
-        return protobuf::UnlistenStmt::default();
+        return ast::UnlistenStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::UnlistenStmt::default();
+        let mut out = ast::UnlistenStmt::default();
         out.conditionname = unsafe { c_string((*p).conditionname) };
         out
     })
 }
 
-pub(crate) unsafe fn transaction_stmt(
-    p: *const bindings::TransactionStmt,
-) -> protobuf::TransactionStmt {
+pub(crate) unsafe fn transaction_stmt(p: *const bindings::TransactionStmt) -> ast::TransactionStmt {
     if too_deep() {
-        return protobuf::TransactionStmt::default();
+        return ast::TransactionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::TransactionStmt::default();
+        let mut out = ast::TransactionStmt::default();
         out.kind = unsafe { convert_transaction_stmt_kind((*p).kind) };
         out.options = unsafe { list_items((*p).options) };
         out.savepoint_name = unsafe { c_string((*p).savepoint_name) };
@@ -7335,18 +6953,20 @@ pub(crate) unsafe fn transaction_stmt(
 
 pub(crate) unsafe fn composite_type_stmt(
     p: *const bindings::CompositeTypeStmt,
-) -> protobuf::CompositeTypeStmt {
+) -> ast::CompositeTypeStmt {
     if too_deep() {
-        return protobuf::CompositeTypeStmt::default();
+        return ast::CompositeTypeStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CompositeTypeStmt::default();
+        let mut out = ast::CompositeTypeStmt::default();
         out.typevar = unsafe {
             if (*p).typevar.is_null() {
                 None
             } else {
-                Some(range_var((*p).typevar as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).typevar as *const bindings::RangeVar,
+                )))
             }
         };
         out.coldeflist = unsafe { list_items((*p).coldeflist) };
@@ -7354,15 +6974,13 @@ pub(crate) unsafe fn composite_type_stmt(
     })
 }
 
-pub(crate) unsafe fn create_enum_stmt(
-    p: *const bindings::CreateEnumStmt,
-) -> protobuf::CreateEnumStmt {
+pub(crate) unsafe fn create_enum_stmt(p: *const bindings::CreateEnumStmt) -> ast::CreateEnumStmt {
     if too_deep() {
-        return protobuf::CreateEnumStmt::default();
+        return ast::CreateEnumStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateEnumStmt::default();
+        let mut out = ast::CreateEnumStmt::default();
         out.type_name = unsafe { list_items((*p).typeName) };
         out.vals = unsafe { list_items((*p).vals) };
         out
@@ -7371,26 +6989,26 @@ pub(crate) unsafe fn create_enum_stmt(
 
 pub(crate) unsafe fn create_range_stmt(
     p: *const bindings::CreateRangeStmt,
-) -> protobuf::CreateRangeStmt {
+) -> ast::CreateRangeStmt {
     if too_deep() {
-        return protobuf::CreateRangeStmt::default();
+        return ast::CreateRangeStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateRangeStmt::default();
+        let mut out = ast::CreateRangeStmt::default();
         out.type_name = unsafe { list_items((*p).typeName) };
         out.params = unsafe { list_items((*p).params) };
         out
     })
 }
 
-pub(crate) unsafe fn alter_enum_stmt(p: *const bindings::AlterEnumStmt) -> protobuf::AlterEnumStmt {
+pub(crate) unsafe fn alter_enum_stmt(p: *const bindings::AlterEnumStmt) -> ast::AlterEnumStmt {
     if too_deep() {
-        return protobuf::AlterEnumStmt::default();
+        return ast::AlterEnumStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterEnumStmt::default();
+        let mut out = ast::AlterEnumStmt::default();
         out.type_name = unsafe { list_items((*p).typeName) };
         out.old_val = unsafe { c_string((*p).oldVal) };
         out.new_val = unsafe { c_string((*p).newVal) };
@@ -7401,18 +7019,20 @@ pub(crate) unsafe fn alter_enum_stmt(p: *const bindings::AlterEnumStmt) -> proto
     })
 }
 
-pub(crate) unsafe fn view_stmt(p: *const bindings::ViewStmt) -> protobuf::ViewStmt {
+pub(crate) unsafe fn view_stmt(p: *const bindings::ViewStmt) -> ast::ViewStmt {
     if too_deep() {
-        return protobuf::ViewStmt::default();
+        return ast::ViewStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ViewStmt::default();
+        let mut out = ast::ViewStmt::default();
         out.view = unsafe {
             if (*p).view.is_null() {
                 None
             } else {
-                Some(range_var((*p).view as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).view as *const bindings::RangeVar,
+                )))
             }
         };
         out.aliases = unsafe { list_items((*p).aliases) };
@@ -7420,9 +7040,7 @@ pub(crate) unsafe fn view_stmt(p: *const bindings::ViewStmt) -> protobuf::ViewSt
             if (*p).query.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).query as *const bindings::Node),
-                }))
+                node((*p).query as *const bindings::Node)
             }
         };
         out.replace = unsafe { (*p).replace };
@@ -7432,25 +7050,25 @@ pub(crate) unsafe fn view_stmt(p: *const bindings::ViewStmt) -> protobuf::ViewSt
     })
 }
 
-pub(crate) unsafe fn load_stmt(p: *const bindings::LoadStmt) -> protobuf::LoadStmt {
+pub(crate) unsafe fn load_stmt(p: *const bindings::LoadStmt) -> ast::LoadStmt {
     if too_deep() {
-        return protobuf::LoadStmt::default();
+        return ast::LoadStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::LoadStmt::default();
+        let mut out = ast::LoadStmt::default();
         out.filename = unsafe { c_string((*p).filename) };
         out
     })
 }
 
-pub(crate) unsafe fn createdb_stmt(p: *const bindings::CreatedbStmt) -> protobuf::CreatedbStmt {
+pub(crate) unsafe fn createdb_stmt(p: *const bindings::CreatedbStmt) -> ast::CreatedbStmt {
     if too_deep() {
-        return protobuf::CreatedbStmt::default();
+        return ast::CreatedbStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreatedbStmt::default();
+        let mut out = ast::CreatedbStmt::default();
         out.dbname = unsafe { c_string((*p).dbname) };
         out.options = unsafe { list_items((*p).options) };
         out
@@ -7459,13 +7077,13 @@ pub(crate) unsafe fn createdb_stmt(p: *const bindings::CreatedbStmt) -> protobuf
 
 pub(crate) unsafe fn alter_database_stmt(
     p: *const bindings::AlterDatabaseStmt,
-) -> protobuf::AlterDatabaseStmt {
+) -> ast::AlterDatabaseStmt {
     if too_deep() {
-        return protobuf::AlterDatabaseStmt::default();
+        return ast::AlterDatabaseStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterDatabaseStmt::default();
+        let mut out = ast::AlterDatabaseStmt::default();
         out.dbname = unsafe { c_string((*p).dbname) };
         out.options = unsafe { list_items((*p).options) };
         out
@@ -7474,13 +7092,13 @@ pub(crate) unsafe fn alter_database_stmt(
 
 pub(crate) unsafe fn alter_database_refresh_coll_stmt(
     p: *const bindings::AlterDatabaseRefreshCollStmt,
-) -> protobuf::AlterDatabaseRefreshCollStmt {
+) -> ast::AlterDatabaseRefreshCollStmt {
     if too_deep() {
-        return protobuf::AlterDatabaseRefreshCollStmt::default();
+        return ast::AlterDatabaseRefreshCollStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterDatabaseRefreshCollStmt::default();
+        let mut out = ast::AlterDatabaseRefreshCollStmt::default();
         out.dbname = unsafe { c_string((*p).dbname) };
         out
     })
@@ -7488,34 +7106,34 @@ pub(crate) unsafe fn alter_database_refresh_coll_stmt(
 
 pub(crate) unsafe fn alter_database_set_stmt(
     p: *const bindings::AlterDatabaseSetStmt,
-) -> protobuf::AlterDatabaseSetStmt {
+) -> ast::AlterDatabaseSetStmt {
     if too_deep() {
-        return protobuf::AlterDatabaseSetStmt::default();
+        return ast::AlterDatabaseSetStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterDatabaseSetStmt::default();
+        let mut out = ast::AlterDatabaseSetStmt::default();
         out.dbname = unsafe { c_string((*p).dbname) };
         out.setstmt = unsafe {
             if (*p).setstmt.is_null() {
                 None
             } else {
-                Some(variable_set_stmt(
+                Some(NodeBox::new(variable_set_stmt(
                     (*p).setstmt as *const bindings::VariableSetStmt,
-                ))
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn dropdb_stmt(p: *const bindings::DropdbStmt) -> protobuf::DropdbStmt {
+pub(crate) unsafe fn dropdb_stmt(p: *const bindings::DropdbStmt) -> ast::DropdbStmt {
     if too_deep() {
-        return protobuf::DropdbStmt::default();
+        return ast::DropdbStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DropdbStmt::default();
+        let mut out = ast::DropdbStmt::default();
         out.dbname = unsafe { c_string((*p).dbname) };
         out.missing_ok = unsafe { (*p).missing_ok };
         out.options = unsafe { list_items((*p).options) };
@@ -7525,38 +7143,40 @@ pub(crate) unsafe fn dropdb_stmt(p: *const bindings::DropdbStmt) -> protobuf::Dr
 
 pub(crate) unsafe fn alter_system_stmt(
     p: *const bindings::AlterSystemStmt,
-) -> protobuf::AlterSystemStmt {
+) -> ast::AlterSystemStmt {
     if too_deep() {
-        return protobuf::AlterSystemStmt::default();
+        return ast::AlterSystemStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterSystemStmt::default();
+        let mut out = ast::AlterSystemStmt::default();
         out.setstmt = unsafe {
             if (*p).setstmt.is_null() {
                 None
             } else {
-                Some(variable_set_stmt(
+                Some(NodeBox::new(variable_set_stmt(
                     (*p).setstmt as *const bindings::VariableSetStmt,
-                ))
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn cluster_stmt(p: *const bindings::ClusterStmt) -> protobuf::ClusterStmt {
+pub(crate) unsafe fn cluster_stmt(p: *const bindings::ClusterStmt) -> ast::ClusterStmt {
     if too_deep() {
-        return protobuf::ClusterStmt::default();
+        return ast::ClusterStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ClusterStmt::default();
+        let mut out = ast::ClusterStmt::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.indexname = unsafe { c_string((*p).indexname) };
@@ -7565,13 +7185,13 @@ pub(crate) unsafe fn cluster_stmt(p: *const bindings::ClusterStmt) -> protobuf::
     })
 }
 
-pub(crate) unsafe fn vacuum_stmt(p: *const bindings::VacuumStmt) -> protobuf::VacuumStmt {
+pub(crate) unsafe fn vacuum_stmt(p: *const bindings::VacuumStmt) -> ast::VacuumStmt {
     if too_deep() {
-        return protobuf::VacuumStmt::default();
+        return ast::VacuumStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::VacuumStmt::default();
+        let mut out = ast::VacuumStmt::default();
         out.options = unsafe { list_items((*p).options) };
         out.rels = unsafe { list_items((*p).rels) };
         out.is_vacuumcmd = unsafe { (*p).is_vacuumcmd };
@@ -7579,20 +7199,20 @@ pub(crate) unsafe fn vacuum_stmt(p: *const bindings::VacuumStmt) -> protobuf::Va
     })
 }
 
-pub(crate) unsafe fn vacuum_relation(
-    p: *const bindings::VacuumRelation,
-) -> protobuf::VacuumRelation {
+pub(crate) unsafe fn vacuum_relation(p: *const bindings::VacuumRelation) -> ast::VacuumRelation {
     if too_deep() {
-        return protobuf::VacuumRelation::default();
+        return ast::VacuumRelation::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::VacuumRelation::default();
+        let mut out = ast::VacuumRelation::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.oid = unsafe { (*p).oid as u32 };
@@ -7601,20 +7221,18 @@ pub(crate) unsafe fn vacuum_relation(
     })
 }
 
-pub(crate) unsafe fn explain_stmt(p: *const bindings::ExplainStmt) -> protobuf::ExplainStmt {
+pub(crate) unsafe fn explain_stmt(p: *const bindings::ExplainStmt) -> ast::ExplainStmt {
     if too_deep() {
-        return protobuf::ExplainStmt::default();
+        return ast::ExplainStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ExplainStmt::default();
+        let mut out = ast::ExplainStmt::default();
         out.query = unsafe {
             if (*p).query.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).query as *const bindings::Node),
-                }))
+                node((*p).query as *const bindings::Node)
             }
         };
         out.options = unsafe { list_items((*p).options) };
@@ -7624,27 +7242,25 @@ pub(crate) unsafe fn explain_stmt(p: *const bindings::ExplainStmt) -> protobuf::
 
 pub(crate) unsafe fn create_table_as_stmt(
     p: *const bindings::CreateTableAsStmt,
-) -> protobuf::CreateTableAsStmt {
+) -> ast::CreateTableAsStmt {
     if too_deep() {
-        return protobuf::CreateTableAsStmt::default();
+        return ast::CreateTableAsStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateTableAsStmt::default();
+        let mut out = ast::CreateTableAsStmt::default();
         out.query = unsafe {
             if (*p).query.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).query as *const bindings::Node),
-                }))
+                node((*p).query as *const bindings::Node)
             }
         };
         out.into = unsafe {
             if (*p).into.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(into_clause(
+                Some(NodeBox::new(into_clause(
                     (*p).into as *const bindings::IntoClause,
                 )))
             }
@@ -7658,58 +7274,58 @@ pub(crate) unsafe fn create_table_as_stmt(
 
 pub(crate) unsafe fn refresh_mat_view_stmt(
     p: *const bindings::RefreshMatViewStmt,
-) -> protobuf::RefreshMatViewStmt {
+) -> ast::RefreshMatViewStmt {
     if too_deep() {
-        return protobuf::RefreshMatViewStmt::default();
+        return ast::RefreshMatViewStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::RefreshMatViewStmt::default();
+        let mut out = ast::RefreshMatViewStmt::default();
         out.concurrent = unsafe { (*p).concurrent };
         out.skip_data = unsafe { (*p).skipData };
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn check_point_stmt(
-    p: *const bindings::CheckPointStmt,
-) -> protobuf::CheckPointStmt {
+pub(crate) unsafe fn check_point_stmt(p: *const bindings::CheckPointStmt) -> ast::CheckPointStmt {
     if too_deep() {
-        return protobuf::CheckPointStmt::default();
+        return ast::CheckPointStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let out = protobuf::CheckPointStmt::default();
+        let out = ast::CheckPointStmt::default();
         out
     })
 }
 
-pub(crate) unsafe fn discard_stmt(p: *const bindings::DiscardStmt) -> protobuf::DiscardStmt {
+pub(crate) unsafe fn discard_stmt(p: *const bindings::DiscardStmt) -> ast::DiscardStmt {
     if too_deep() {
-        return protobuf::DiscardStmt::default();
+        return ast::DiscardStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DiscardStmt::default();
+        let mut out = ast::DiscardStmt::default();
         out.target = unsafe { convert_discard_mode((*p).target) };
         out
     })
 }
 
-pub(crate) unsafe fn lock_stmt(p: *const bindings::LockStmt) -> protobuf::LockStmt {
+pub(crate) unsafe fn lock_stmt(p: *const bindings::LockStmt) -> ast::LockStmt {
     if too_deep() {
-        return protobuf::LockStmt::default();
+        return ast::LockStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::LockStmt::default();
+        let mut out = ast::LockStmt::default();
         out.relations = unsafe { list_items((*p).relations) };
         out.mode = unsafe { (*p).mode as i32 };
         out.nowait = unsafe { (*p).nowait };
@@ -7719,32 +7335,34 @@ pub(crate) unsafe fn lock_stmt(p: *const bindings::LockStmt) -> protobuf::LockSt
 
 pub(crate) unsafe fn constraints_set_stmt(
     p: *const bindings::ConstraintsSetStmt,
-) -> protobuf::ConstraintsSetStmt {
+) -> ast::ConstraintsSetStmt {
     if too_deep() {
-        return protobuf::ConstraintsSetStmt::default();
+        return ast::ConstraintsSetStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ConstraintsSetStmt::default();
+        let mut out = ast::ConstraintsSetStmt::default();
         out.constraints = unsafe { list_items((*p).constraints) };
         out.deferred = unsafe { (*p).deferred };
         out
     })
 }
 
-pub(crate) unsafe fn reindex_stmt(p: *const bindings::ReindexStmt) -> protobuf::ReindexStmt {
+pub(crate) unsafe fn reindex_stmt(p: *const bindings::ReindexStmt) -> ast::ReindexStmt {
     if too_deep() {
-        return protobuf::ReindexStmt::default();
+        return ast::ReindexStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ReindexStmt::default();
+        let mut out = ast::ReindexStmt::default();
         out.kind = unsafe { convert_reindex_object_type((*p).kind) };
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.name = unsafe { c_string((*p).name) };
@@ -7755,13 +7373,13 @@ pub(crate) unsafe fn reindex_stmt(p: *const bindings::ReindexStmt) -> protobuf::
 
 pub(crate) unsafe fn create_conversion_stmt(
     p: *const bindings::CreateConversionStmt,
-) -> protobuf::CreateConversionStmt {
+) -> ast::CreateConversionStmt {
     if too_deep() {
-        return protobuf::CreateConversionStmt::default();
+        return ast::CreateConversionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateConversionStmt::default();
+        let mut out = ast::CreateConversionStmt::default();
         out.conversion_name = unsafe { list_items((*p).conversion_name) };
         out.for_encoding_name = unsafe { c_string((*p).for_encoding_name) };
         out.to_encoding_name = unsafe { c_string((*p).to_encoding_name) };
@@ -7771,36 +7389,38 @@ pub(crate) unsafe fn create_conversion_stmt(
     })
 }
 
-pub(crate) unsafe fn create_cast_stmt(
-    p: *const bindings::CreateCastStmt,
-) -> protobuf::CreateCastStmt {
+pub(crate) unsafe fn create_cast_stmt(p: *const bindings::CreateCastStmt) -> ast::CreateCastStmt {
     if too_deep() {
-        return protobuf::CreateCastStmt::default();
+        return ast::CreateCastStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateCastStmt::default();
+        let mut out = ast::CreateCastStmt::default();
         out.sourcetype = unsafe {
             if (*p).sourcetype.is_null() {
                 None
             } else {
-                Some(type_name((*p).sourcetype as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).sourcetype as *const bindings::TypeName,
+                )))
             }
         };
         out.targettype = unsafe {
             if (*p).targettype.is_null() {
                 None
             } else {
-                Some(type_name((*p).targettype as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).targettype as *const bindings::TypeName,
+                )))
             }
         };
         out.func = unsafe {
             if (*p).func.is_null() {
                 None
             } else {
-                Some(object_with_args(
+                Some(NodeBox::new(object_with_args(
                     (*p).func as *const bindings::ObjectWithArgs,
-                ))
+                )))
             }
         };
         out.context = unsafe { convert_coercion_context((*p).context) };
@@ -7811,19 +7431,21 @@ pub(crate) unsafe fn create_cast_stmt(
 
 pub(crate) unsafe fn create_transform_stmt(
     p: *const bindings::CreateTransformStmt,
-) -> protobuf::CreateTransformStmt {
+) -> ast::CreateTransformStmt {
     if too_deep() {
-        return protobuf::CreateTransformStmt::default();
+        return ast::CreateTransformStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateTransformStmt::default();
+        let mut out = ast::CreateTransformStmt::default();
         out.replace = unsafe { (*p).replace };
         out.type_name = unsafe {
             if (*p).type_name.is_null() {
                 None
             } else {
-                Some(type_name((*p).type_name as *const bindings::TypeName))
+                Some(NodeBox::new(type_name(
+                    (*p).type_name as *const bindings::TypeName,
+                )))
             }
         };
         out.lang = unsafe { c_string((*p).lang) };
@@ -7831,68 +7453,64 @@ pub(crate) unsafe fn create_transform_stmt(
             if (*p).fromsql.is_null() {
                 None
             } else {
-                Some(object_with_args(
+                Some(NodeBox::new(object_with_args(
                     (*p).fromsql as *const bindings::ObjectWithArgs,
-                ))
+                )))
             }
         };
         out.tosql = unsafe {
             if (*p).tosql.is_null() {
                 None
             } else {
-                Some(object_with_args(
+                Some(NodeBox::new(object_with_args(
                     (*p).tosql as *const bindings::ObjectWithArgs,
-                ))
+                )))
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn prepare_stmt(p: *const bindings::PrepareStmt) -> protobuf::PrepareStmt {
+pub(crate) unsafe fn prepare_stmt(p: *const bindings::PrepareStmt) -> ast::PrepareStmt {
     if too_deep() {
-        return protobuf::PrepareStmt::default();
+        return ast::PrepareStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PrepareStmt::default();
+        let mut out = ast::PrepareStmt::default();
         out.name = unsafe { c_string((*p).name) };
         out.argtypes = unsafe { list_items((*p).argtypes) };
         out.query = unsafe {
             if (*p).query.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).query as *const bindings::Node),
-                }))
+                node((*p).query as *const bindings::Node)
             }
         };
         out
     })
 }
 
-pub(crate) unsafe fn execute_stmt(p: *const bindings::ExecuteStmt) -> protobuf::ExecuteStmt {
+pub(crate) unsafe fn execute_stmt(p: *const bindings::ExecuteStmt) -> ast::ExecuteStmt {
     if too_deep() {
-        return protobuf::ExecuteStmt::default();
+        return ast::ExecuteStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ExecuteStmt::default();
+        let mut out = ast::ExecuteStmt::default();
         out.name = unsafe { c_string((*p).name) };
         out.params = unsafe { list_items((*p).params) };
         out
     })
 }
 
-pub(crate) unsafe fn deallocate_stmt(
-    p: *const bindings::DeallocateStmt,
-) -> protobuf::DeallocateStmt {
+pub(crate) unsafe fn deallocate_stmt(p: *const bindings::DeallocateStmt) -> ast::DeallocateStmt {
     if too_deep() {
-        return protobuf::DeallocateStmt::default();
+        return ast::DeallocateStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DeallocateStmt::default();
+        let mut out = ast::DeallocateStmt::default();
         out.name = unsafe { c_string((*p).name) };
         out.isall = unsafe { (*p).isall };
         out.location = unsafe { (*p).location as i32 };
@@ -7900,13 +7518,13 @@ pub(crate) unsafe fn deallocate_stmt(
     })
 }
 
-pub(crate) unsafe fn drop_owned_stmt(p: *const bindings::DropOwnedStmt) -> protobuf::DropOwnedStmt {
+pub(crate) unsafe fn drop_owned_stmt(p: *const bindings::DropOwnedStmt) -> ast::DropOwnedStmt {
     if too_deep() {
-        return protobuf::DropOwnedStmt::default();
+        return ast::DropOwnedStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DropOwnedStmt::default();
+        let mut out = ast::DropOwnedStmt::default();
         out.roles = unsafe { list_items((*p).roles) };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
         out
@@ -7915,19 +7533,21 @@ pub(crate) unsafe fn drop_owned_stmt(p: *const bindings::DropOwnedStmt) -> proto
 
 pub(crate) unsafe fn reassign_owned_stmt(
     p: *const bindings::ReassignOwnedStmt,
-) -> protobuf::ReassignOwnedStmt {
+) -> ast::ReassignOwnedStmt {
     if too_deep() {
-        return protobuf::ReassignOwnedStmt::default();
+        return ast::ReassignOwnedStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::ReassignOwnedStmt::default();
+        let mut out = ast::ReassignOwnedStmt::default();
         out.roles = unsafe { list_items((*p).roles) };
         out.newrole = unsafe {
             if (*p).newrole.is_null() {
                 None
             } else {
-                Some(role_spec((*p).newrole as *const bindings::RoleSpec))
+                Some(NodeBox::new(role_spec(
+                    (*p).newrole as *const bindings::RoleSpec,
+                )))
             }
         };
         out
@@ -7936,13 +7556,13 @@ pub(crate) unsafe fn reassign_owned_stmt(
 
 pub(crate) unsafe fn alter_ts_dictionary_stmt(
     p: *const bindings::AlterTSDictionaryStmt,
-) -> protobuf::AlterTsDictionaryStmt {
+) -> ast::AlterTsDictionaryStmt {
     if too_deep() {
-        return protobuf::AlterTsDictionaryStmt::default();
+        return ast::AlterTsDictionaryStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterTsDictionaryStmt::default();
+        let mut out = ast::AlterTsDictionaryStmt::default();
         out.dictname = unsafe { list_items((*p).dictname) };
         out.options = unsafe { list_items((*p).options) };
         out
@@ -7951,13 +7571,13 @@ pub(crate) unsafe fn alter_ts_dictionary_stmt(
 
 pub(crate) unsafe fn alter_ts_configuration_stmt(
     p: *const bindings::AlterTSConfigurationStmt,
-) -> protobuf::AlterTsConfigurationStmt {
+) -> ast::AlterTsConfigurationStmt {
     if too_deep() {
-        return protobuf::AlterTsConfigurationStmt::default();
+        return ast::AlterTsConfigurationStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterTsConfigurationStmt::default();
+        let mut out = ast::AlterTsConfigurationStmt::default();
         out.kind = unsafe { convert_alter_ts_config_type((*p).kind) };
         out.cfgname = unsafe { list_items((*p).cfgname) };
         out.tokentype = unsafe { list_items((*p).tokentype) };
@@ -7971,27 +7591,27 @@ pub(crate) unsafe fn alter_ts_configuration_stmt(
 
 pub(crate) unsafe fn publication_table(
     p: *const bindings::PublicationTable,
-) -> protobuf::PublicationTable {
+) -> ast::PublicationTable {
     if too_deep() {
-        return protobuf::PublicationTable::default();
+        return ast::PublicationTable::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PublicationTable::default();
+        let mut out = ast::PublicationTable::default();
         out.relation = unsafe {
             if (*p).relation.is_null() {
                 None
             } else {
-                Some(range_var((*p).relation as *const bindings::RangeVar))
+                Some(NodeBox::new(range_var(
+                    (*p).relation as *const bindings::RangeVar,
+                )))
             }
         };
         out.where_clause = unsafe {
             if (*p).whereClause.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(protobuf::Node {
-                    node: node((*p).whereClause as *const bindings::Node),
-                }))
+                node((*p).whereClause as *const bindings::Node)
             }
         };
         out.columns = unsafe { list_items((*p).columns) };
@@ -8001,20 +7621,20 @@ pub(crate) unsafe fn publication_table(
 
 pub(crate) unsafe fn publication_obj_spec(
     p: *const bindings::PublicationObjSpec,
-) -> protobuf::PublicationObjSpec {
+) -> ast::PublicationObjSpec {
     if too_deep() {
-        return protobuf::PublicationObjSpec::default();
+        return ast::PublicationObjSpec::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::PublicationObjSpec::default();
+        let mut out = ast::PublicationObjSpec::default();
         out.pubobjtype = unsafe { convert_publication_obj_spec_type((*p).pubobjtype) };
         out.name = unsafe { c_string((*p).name) };
         out.pubtable = unsafe {
             if (*p).pubtable.is_null() {
                 None
             } else {
-                Some(::std::boxed::Box::new(publication_table(
+                Some(NodeBox::new(publication_table(
                     (*p).pubtable as *const bindings::PublicationTable,
                 )))
             }
@@ -8026,13 +7646,13 @@ pub(crate) unsafe fn publication_obj_spec(
 
 pub(crate) unsafe fn create_publication_stmt(
     p: *const bindings::CreatePublicationStmt,
-) -> protobuf::CreatePublicationStmt {
+) -> ast::CreatePublicationStmt {
     if too_deep() {
-        return protobuf::CreatePublicationStmt::default();
+        return ast::CreatePublicationStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreatePublicationStmt::default();
+        let mut out = ast::CreatePublicationStmt::default();
         out.pubname = unsafe { c_string((*p).pubname) };
         out.options = unsafe { list_items((*p).options) };
         out.pubobjects = unsafe { list_items((*p).pubobjects) };
@@ -8043,13 +7663,13 @@ pub(crate) unsafe fn create_publication_stmt(
 
 pub(crate) unsafe fn alter_publication_stmt(
     p: *const bindings::AlterPublicationStmt,
-) -> protobuf::AlterPublicationStmt {
+) -> ast::AlterPublicationStmt {
     if too_deep() {
-        return protobuf::AlterPublicationStmt::default();
+        return ast::AlterPublicationStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterPublicationStmt::default();
+        let mut out = ast::AlterPublicationStmt::default();
         out.pubname = unsafe { c_string((*p).pubname) };
         out.options = unsafe { list_items((*p).options) };
         out.pubobjects = unsafe { list_items((*p).pubobjects) };
@@ -8061,13 +7681,13 @@ pub(crate) unsafe fn alter_publication_stmt(
 
 pub(crate) unsafe fn create_subscription_stmt(
     p: *const bindings::CreateSubscriptionStmt,
-) -> protobuf::CreateSubscriptionStmt {
+) -> ast::CreateSubscriptionStmt {
     if too_deep() {
-        return protobuf::CreateSubscriptionStmt::default();
+        return ast::CreateSubscriptionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::CreateSubscriptionStmt::default();
+        let mut out = ast::CreateSubscriptionStmt::default();
         out.subname = unsafe { c_string((*p).subname) };
         out.conninfo = unsafe { c_string((*p).conninfo) };
         out.publication = unsafe { list_items((*p).publication) };
@@ -8078,13 +7698,13 @@ pub(crate) unsafe fn create_subscription_stmt(
 
 pub(crate) unsafe fn alter_subscription_stmt(
     p: *const bindings::AlterSubscriptionStmt,
-) -> protobuf::AlterSubscriptionStmt {
+) -> ast::AlterSubscriptionStmt {
     if too_deep() {
-        return protobuf::AlterSubscriptionStmt::default();
+        return ast::AlterSubscriptionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::AlterSubscriptionStmt::default();
+        let mut out = ast::AlterSubscriptionStmt::default();
         out.kind = unsafe { convert_alter_subscription_type((*p).kind) };
         out.subname = unsafe { c_string((*p).subname) };
         out.conninfo = unsafe { c_string((*p).conninfo) };
@@ -8096,13 +7716,13 @@ pub(crate) unsafe fn alter_subscription_stmt(
 
 pub(crate) unsafe fn drop_subscription_stmt(
     p: *const bindings::DropSubscriptionStmt,
-) -> protobuf::DropSubscriptionStmt {
+) -> ast::DropSubscriptionStmt {
     if too_deep() {
-        return protobuf::DropSubscriptionStmt::default();
+        return ast::DropSubscriptionStmt::default();
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let mut out = protobuf::DropSubscriptionStmt::default();
+        let mut out = ast::DropSubscriptionStmt::default();
         out.subname = unsafe { c_string((*p).subname) };
         out.missing_ok = unsafe { (*p).missing_ok };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
@@ -8110,826 +7730,2963 @@ pub(crate) unsafe fn drop_subscription_stmt(
     })
 }
 
-fn convert_a_expr_kind(value: bindings::A_Expr_Kind) -> i32 {
-    match value {
-        bindings::A_Expr_Kind_AEXPR_OP => 1,
-        bindings::A_Expr_Kind_AEXPR_OP_ANY => 2,
-        bindings::A_Expr_Kind_AEXPR_OP_ALL => 3,
-        bindings::A_Expr_Kind_AEXPR_DISTINCT => 4,
-        bindings::A_Expr_Kind_AEXPR_NOT_DISTINCT => 5,
-        bindings::A_Expr_Kind_AEXPR_NULLIF => 6,
-        bindings::A_Expr_Kind_AEXPR_IN => 7,
-        bindings::A_Expr_Kind_AEXPR_LIKE => 8,
-        bindings::A_Expr_Kind_AEXPR_ILIKE => 9,
-        bindings::A_Expr_Kind_AEXPR_SIMILAR => 10,
-        bindings::A_Expr_Kind_AEXPR_BETWEEN => 11,
-        bindings::A_Expr_Kind_AEXPR_NOT_BETWEEN => 12,
-        bindings::A_Expr_Kind_AEXPR_BETWEEN_SYM => 13,
-        bindings::A_Expr_Kind_AEXPR_NOT_BETWEEN_SYM => 14,
-        _ => -1,
-    }
-}
-
-fn convert_agg_split(value: bindings::AggSplit) -> i32 {
-    match value {
-        bindings::AggSplit_AGGSPLIT_SIMPLE => 1,
-        bindings::AggSplit_AGGSPLIT_INITIAL_SERIAL => 2,
-        bindings::AggSplit_AGGSPLIT_FINAL_DESERIAL => 3,
-        _ => -1,
-    }
-}
-
-fn convert_alter_publication_action(value: bindings::AlterPublicationAction) -> i32 {
-    match value {
-        bindings::AlterPublicationAction_AP_AddObjects => 1,
-        bindings::AlterPublicationAction_AP_DropObjects => 2,
-        bindings::AlterPublicationAction_AP_SetObjects => 3,
-        _ => -1,
-    }
-}
-
-fn convert_alter_subscription_type(value: bindings::AlterSubscriptionType) -> i32 {
-    match value {
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_OPTIONS => 1,
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_CONNECTION => 2,
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SET_PUBLICATION => 3,
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ADD_PUBLICATION => 4,
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_DROP_PUBLICATION => 5,
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH => 6,
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ENABLED => 7,
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SKIP => 8,
-        _ => -1,
-    }
-}
-
-fn convert_alter_ts_config_type(value: bindings::AlterTSConfigType) -> i32 {
-    match value {
-        bindings::AlterTSConfigType_ALTER_TSCONFIG_ADD_MAPPING => 1,
-        bindings::AlterTSConfigType_ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN => 2,
-        bindings::AlterTSConfigType_ALTER_TSCONFIG_REPLACE_DICT => 3,
-        bindings::AlterTSConfigType_ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN => 4,
-        bindings::AlterTSConfigType_ALTER_TSCONFIG_DROP_MAPPING => 5,
-        _ => -1,
-    }
-}
-
-fn convert_alter_table_type(value: bindings::AlterTableType) -> i32 {
-    match value {
-        bindings::AlterTableType_AT_AddColumn => 1,
-        bindings::AlterTableType_AT_AddColumnToView => 2,
-        bindings::AlterTableType_AT_ColumnDefault => 3,
-        bindings::AlterTableType_AT_CookedColumnDefault => 4,
-        bindings::AlterTableType_AT_DropNotNull => 5,
-        bindings::AlterTableType_AT_SetNotNull => 6,
-        bindings::AlterTableType_AT_SetExpression => 7,
-        bindings::AlterTableType_AT_DropExpression => 8,
-        bindings::AlterTableType_AT_SetStatistics => 9,
-        bindings::AlterTableType_AT_SetOptions => 10,
-        bindings::AlterTableType_AT_ResetOptions => 11,
-        bindings::AlterTableType_AT_SetStorage => 12,
-        bindings::AlterTableType_AT_SetCompression => 13,
-        bindings::AlterTableType_AT_DropColumn => 14,
-        bindings::AlterTableType_AT_AddIndex => 15,
-        bindings::AlterTableType_AT_ReAddIndex => 16,
-        bindings::AlterTableType_AT_AddConstraint => 17,
-        bindings::AlterTableType_AT_ReAddConstraint => 18,
-        bindings::AlterTableType_AT_ReAddDomainConstraint => 19,
-        bindings::AlterTableType_AT_AlterConstraint => 20,
-        bindings::AlterTableType_AT_ValidateConstraint => 21,
-        bindings::AlterTableType_AT_AddIndexConstraint => 22,
-        bindings::AlterTableType_AT_DropConstraint => 23,
-        bindings::AlterTableType_AT_ReAddComment => 24,
-        bindings::AlterTableType_AT_AlterColumnType => 25,
-        bindings::AlterTableType_AT_AlterColumnGenericOptions => 26,
-        bindings::AlterTableType_AT_ChangeOwner => 27,
-        bindings::AlterTableType_AT_ClusterOn => 28,
-        bindings::AlterTableType_AT_DropCluster => 29,
-        bindings::AlterTableType_AT_SetLogged => 30,
-        bindings::AlterTableType_AT_SetUnLogged => 31,
-        bindings::AlterTableType_AT_DropOids => 32,
-        bindings::AlterTableType_AT_SetAccessMethod => 33,
-        bindings::AlterTableType_AT_SetTableSpace => 34,
-        bindings::AlterTableType_AT_SetRelOptions => 35,
-        bindings::AlterTableType_AT_ResetRelOptions => 36,
-        bindings::AlterTableType_AT_ReplaceRelOptions => 37,
-        bindings::AlterTableType_AT_EnableTrig => 38,
-        bindings::AlterTableType_AT_EnableAlwaysTrig => 39,
-        bindings::AlterTableType_AT_EnableReplicaTrig => 40,
-        bindings::AlterTableType_AT_DisableTrig => 41,
-        bindings::AlterTableType_AT_EnableTrigAll => 42,
-        bindings::AlterTableType_AT_DisableTrigAll => 43,
-        bindings::AlterTableType_AT_EnableTrigUser => 44,
-        bindings::AlterTableType_AT_DisableTrigUser => 45,
-        bindings::AlterTableType_AT_EnableRule => 46,
-        bindings::AlterTableType_AT_EnableAlwaysRule => 47,
-        bindings::AlterTableType_AT_EnableReplicaRule => 48,
-        bindings::AlterTableType_AT_DisableRule => 49,
-        bindings::AlterTableType_AT_AddInherit => 50,
-        bindings::AlterTableType_AT_DropInherit => 51,
-        bindings::AlterTableType_AT_AddOf => 52,
-        bindings::AlterTableType_AT_DropOf => 53,
-        bindings::AlterTableType_AT_ReplicaIdentity => 54,
-        bindings::AlterTableType_AT_EnableRowSecurity => 55,
-        bindings::AlterTableType_AT_DisableRowSecurity => 56,
-        bindings::AlterTableType_AT_ForceRowSecurity => 57,
-        bindings::AlterTableType_AT_NoForceRowSecurity => 58,
-        bindings::AlterTableType_AT_GenericOptions => 59,
-        bindings::AlterTableType_AT_AttachPartition => 60,
-        bindings::AlterTableType_AT_DetachPartition => 61,
-        bindings::AlterTableType_AT_DetachPartitionFinalize => 62,
-        bindings::AlterTableType_AT_AddIdentity => 63,
-        bindings::AlterTableType_AT_SetIdentity => 64,
-        bindings::AlterTableType_AT_DropIdentity => 65,
-        bindings::AlterTableType_AT_ReAddStatistics => 66,
-        _ => -1,
-    }
-}
-
-fn convert_bool_expr_type(value: bindings::BoolExprType) -> i32 {
-    match value {
-        bindings::BoolExprType_AND_EXPR => 1,
-        bindings::BoolExprType_OR_EXPR => 2,
-        bindings::BoolExprType_NOT_EXPR => 3,
-        _ => -1,
-    }
-}
-
-fn convert_bool_test_type(value: bindings::BoolTestType) -> i32 {
-    match value {
-        bindings::BoolTestType_IS_TRUE => 1,
-        bindings::BoolTestType_IS_NOT_TRUE => 2,
-        bindings::BoolTestType_IS_FALSE => 3,
-        bindings::BoolTestType_IS_NOT_FALSE => 4,
-        bindings::BoolTestType_IS_UNKNOWN => 5,
-        bindings::BoolTestType_IS_NOT_UNKNOWN => 6,
-        _ => -1,
-    }
-}
-
-fn convert_cte_materialize(value: bindings::CTEMaterialize) -> i32 {
-    match value {
-        bindings::CTEMaterialize_CTEMaterializeDefault => 1,
-        bindings::CTEMaterialize_CTEMaterializeAlways => 2,
-        bindings::CTEMaterialize_CTEMaterializeNever => 3,
-        _ => -1,
-    }
-}
-
-fn convert_cmd_type(value: bindings::CmdType) -> i32 {
-    match value {
-        bindings::CmdType_CMD_UNKNOWN => 1,
-        bindings::CmdType_CMD_SELECT => 2,
-        bindings::CmdType_CMD_UPDATE => 3,
-        bindings::CmdType_CMD_INSERT => 4,
-        bindings::CmdType_CMD_DELETE => 5,
-        bindings::CmdType_CMD_MERGE => 6,
-        bindings::CmdType_CMD_UTILITY => 7,
-        bindings::CmdType_CMD_NOTHING => 8,
-        _ => -1,
-    }
-}
-
-fn convert_coercion_context(value: bindings::CoercionContext) -> i32 {
-    match value {
-        bindings::CoercionContext_COERCION_IMPLICIT => 1,
-        bindings::CoercionContext_COERCION_ASSIGNMENT => 2,
-        bindings::CoercionContext_COERCION_PLPGSQL => 3,
-        bindings::CoercionContext_COERCION_EXPLICIT => 4,
-        _ => -1,
-    }
-}
-
-fn convert_coercion_form(value: bindings::CoercionForm) -> i32 {
-    match value {
-        bindings::CoercionForm_COERCE_EXPLICIT_CALL => 1,
-        bindings::CoercionForm_COERCE_EXPLICIT_CAST => 2,
-        bindings::CoercionForm_COERCE_IMPLICIT_CAST => 3,
-        bindings::CoercionForm_COERCE_SQL_SYNTAX => 4,
-        _ => -1,
-    }
-}
-
-fn convert_compare_type(value: bindings::CompareType) -> i32 {
-    match value {
-        bindings::CompareType_COMPARE_INVALID => 1,
-        bindings::CompareType_COMPARE_LT => 2,
-        bindings::CompareType_COMPARE_LE => 3,
-        bindings::CompareType_COMPARE_EQ => 4,
-        bindings::CompareType_COMPARE_GE => 5,
-        bindings::CompareType_COMPARE_GT => 6,
-        bindings::CompareType_COMPARE_NE => 7,
-        bindings::CompareType_COMPARE_OVERLAP => 8,
-        bindings::CompareType_COMPARE_CONTAINED_BY => 9,
-        _ => -1,
-    }
-}
-
-fn convert_constr_type(value: bindings::ConstrType) -> i32 {
-    match value {
-        bindings::ConstrType_CONSTR_NULL => 1,
-        bindings::ConstrType_CONSTR_NOTNULL => 2,
-        bindings::ConstrType_CONSTR_DEFAULT => 3,
-        bindings::ConstrType_CONSTR_IDENTITY => 4,
-        bindings::ConstrType_CONSTR_GENERATED => 5,
-        bindings::ConstrType_CONSTR_CHECK => 6,
-        bindings::ConstrType_CONSTR_PRIMARY => 7,
-        bindings::ConstrType_CONSTR_UNIQUE => 8,
-        bindings::ConstrType_CONSTR_EXCLUSION => 9,
-        bindings::ConstrType_CONSTR_FOREIGN => 10,
-        bindings::ConstrType_CONSTR_ATTR_DEFERRABLE => 11,
-        bindings::ConstrType_CONSTR_ATTR_NOT_DEFERRABLE => 12,
-        bindings::ConstrType_CONSTR_ATTR_DEFERRED => 13,
-        bindings::ConstrType_CONSTR_ATTR_IMMEDIATE => 14,
-        bindings::ConstrType_CONSTR_ATTR_ENFORCED => 15,
-        bindings::ConstrType_CONSTR_ATTR_NOT_ENFORCED => 16,
-        _ => -1,
-    }
-}
-
-fn convert_def_elem_action(value: bindings::DefElemAction) -> i32 {
-    match value {
-        bindings::DefElemAction_DEFELEM_UNSPEC => 1,
-        bindings::DefElemAction_DEFELEM_SET => 2,
-        bindings::DefElemAction_DEFELEM_ADD => 3,
-        bindings::DefElemAction_DEFELEM_DROP => 4,
-        _ => -1,
-    }
-}
-
-fn convert_discard_mode(value: bindings::DiscardMode) -> i32 {
-    match value {
-        bindings::DiscardMode_DISCARD_ALL => 1,
-        bindings::DiscardMode_DISCARD_PLANS => 2,
-        bindings::DiscardMode_DISCARD_SEQUENCES => 3,
-        bindings::DiscardMode_DISCARD_TEMP => 4,
-        _ => -1,
-    }
-}
-
-fn convert_drop_behavior(value: bindings::DropBehavior) -> i32 {
-    match value {
-        bindings::DropBehavior_DROP_RESTRICT => 1,
-        bindings::DropBehavior_DROP_CASCADE => 2,
-        _ => -1,
-    }
-}
-
-fn convert_fetch_direction(value: bindings::FetchDirection) -> i32 {
-    match value {
-        bindings::FetchDirection_FETCH_FORWARD => 1,
-        bindings::FetchDirection_FETCH_BACKWARD => 2,
-        bindings::FetchDirection_FETCH_ABSOLUTE => 3,
-        bindings::FetchDirection_FETCH_RELATIVE => 4,
-        _ => -1,
-    }
-}
-
-fn convert_function_parameter_mode(value: bindings::FunctionParameterMode) -> i32 {
-    match value {
-        bindings::FunctionParameterMode_FUNC_PARAM_IN => 1,
-        bindings::FunctionParameterMode_FUNC_PARAM_OUT => 2,
-        bindings::FunctionParameterMode_FUNC_PARAM_INOUT => 3,
-        bindings::FunctionParameterMode_FUNC_PARAM_VARIADIC => 4,
-        bindings::FunctionParameterMode_FUNC_PARAM_TABLE => 5,
-        bindings::FunctionParameterMode_FUNC_PARAM_DEFAULT => 6,
-        _ => -1,
-    }
-}
-
-fn convert_grant_target_type(value: bindings::GrantTargetType) -> i32 {
-    match value {
-        bindings::GrantTargetType_ACL_TARGET_OBJECT => 1,
-        bindings::GrantTargetType_ACL_TARGET_ALL_IN_SCHEMA => 2,
-        bindings::GrantTargetType_ACL_TARGET_DEFAULTS => 3,
-        _ => -1,
-    }
-}
-
-fn convert_grouping_set_kind(value: bindings::GroupingSetKind) -> i32 {
-    match value {
-        bindings::GroupingSetKind_GROUPING_SET_EMPTY => 1,
-        bindings::GroupingSetKind_GROUPING_SET_SIMPLE => 2,
-        bindings::GroupingSetKind_GROUPING_SET_ROLLUP => 3,
-        bindings::GroupingSetKind_GROUPING_SET_CUBE => 4,
-        bindings::GroupingSetKind_GROUPING_SET_SETS => 5,
-        _ => -1,
-    }
-}
-
-fn convert_import_foreign_schema_type(value: bindings::ImportForeignSchemaType) -> i32 {
-    match value {
-        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_ALL => 1,
-        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_LIMIT_TO => 2,
-        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_EXCEPT => 3,
-        _ => -1,
-    }
-}
-
-fn convert_join_type(value: bindings::JoinType) -> i32 {
-    match value {
-        bindings::JoinType_JOIN_INNER => 1,
-        bindings::JoinType_JOIN_LEFT => 2,
-        bindings::JoinType_JOIN_FULL => 3,
-        bindings::JoinType_JOIN_RIGHT => 4,
-        bindings::JoinType_JOIN_SEMI => 5,
-        bindings::JoinType_JOIN_ANTI => 6,
-        bindings::JoinType_JOIN_RIGHT_SEMI => 7,
-        bindings::JoinType_JOIN_RIGHT_ANTI => 8,
-        bindings::JoinType_JOIN_UNIQUE_OUTER => 9,
-        bindings::JoinType_JOIN_UNIQUE_INNER => 10,
-        _ => -1,
-    }
-}
-
-fn convert_json_behavior_type(value: bindings::JsonBehaviorType) -> i32 {
-    match value {
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_NULL => 1,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_ERROR => 2,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY => 3,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_TRUE => 4,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_FALSE => 5,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_UNKNOWN => 6,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY_ARRAY => 7,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY_OBJECT => 8,
-        bindings::JsonBehaviorType_JSON_BEHAVIOR_DEFAULT => 9,
-        _ => -1,
-    }
-}
-
-fn convert_json_constructor_type(value: bindings::JsonConstructorType) -> i32 {
-    match value {
-        bindings::JsonConstructorType_JSCTOR_JSON_OBJECT => 1,
-        bindings::JsonConstructorType_JSCTOR_JSON_ARRAY => 2,
-        bindings::JsonConstructorType_JSCTOR_JSON_OBJECTAGG => 3,
-        bindings::JsonConstructorType_JSCTOR_JSON_ARRAYAGG => 4,
-        bindings::JsonConstructorType_JSCTOR_JSON_PARSE => 5,
-        bindings::JsonConstructorType_JSCTOR_JSON_SCALAR => 6,
-        bindings::JsonConstructorType_JSCTOR_JSON_SERIALIZE => 7,
-        _ => -1,
-    }
-}
-
-fn convert_json_encoding(value: bindings::JsonEncoding) -> i32 {
-    match value {
-        bindings::JsonEncoding_JS_ENC_DEFAULT => 1,
-        bindings::JsonEncoding_JS_ENC_UTF8 => 2,
-        bindings::JsonEncoding_JS_ENC_UTF16 => 3,
-        bindings::JsonEncoding_JS_ENC_UTF32 => 4,
-        _ => -1,
-    }
-}
-
-fn convert_json_expr_op(value: bindings::JsonExprOp) -> i32 {
-    match value {
-        bindings::JsonExprOp_JSON_EXISTS_OP => 1,
-        bindings::JsonExprOp_JSON_QUERY_OP => 2,
-        bindings::JsonExprOp_JSON_VALUE_OP => 3,
-        bindings::JsonExprOp_JSON_TABLE_OP => 4,
-        _ => -1,
-    }
-}
-
-fn convert_json_format_type(value: bindings::JsonFormatType) -> i32 {
-    match value {
-        bindings::JsonFormatType_JS_FORMAT_DEFAULT => 1,
-        bindings::JsonFormatType_JS_FORMAT_JSON => 2,
-        bindings::JsonFormatType_JS_FORMAT_JSONB => 3,
-        _ => -1,
-    }
-}
-
-fn convert_json_quotes(value: bindings::JsonQuotes) -> i32 {
-    match value {
-        bindings::JsonQuotes_JS_QUOTES_UNSPEC => 1,
-        bindings::JsonQuotes_JS_QUOTES_KEEP => 2,
-        bindings::JsonQuotes_JS_QUOTES_OMIT => 3,
-        _ => -1,
-    }
-}
-
-fn convert_json_table_column_type(value: bindings::JsonTableColumnType) -> i32 {
-    match value {
-        bindings::JsonTableColumnType_JTC_FOR_ORDINALITY => 1,
-        bindings::JsonTableColumnType_JTC_REGULAR => 2,
-        bindings::JsonTableColumnType_JTC_EXISTS => 3,
-        bindings::JsonTableColumnType_JTC_FORMATTED => 4,
-        bindings::JsonTableColumnType_JTC_NESTED => 5,
-        _ => -1,
-    }
-}
-
-fn convert_json_value_type(value: bindings::JsonValueType) -> i32 {
-    match value {
-        bindings::JsonValueType_JS_TYPE_ANY => 1,
-        bindings::JsonValueType_JS_TYPE_OBJECT => 2,
-        bindings::JsonValueType_JS_TYPE_ARRAY => 3,
-        bindings::JsonValueType_JS_TYPE_SCALAR => 4,
-        _ => -1,
-    }
-}
-
-fn convert_json_wrapper(value: bindings::JsonWrapper) -> i32 {
-    match value {
-        bindings::JsonWrapper_JSW_UNSPEC => 1,
-        bindings::JsonWrapper_JSW_NONE => 2,
-        bindings::JsonWrapper_JSW_CONDITIONAL => 3,
-        bindings::JsonWrapper_JSW_UNCONDITIONAL => 4,
-        _ => -1,
-    }
-}
-
-fn convert_limit_option(value: bindings::LimitOption) -> i32 {
-    match value {
-        bindings::LimitOption_LIMIT_OPTION_COUNT => 1,
-        bindings::LimitOption_LIMIT_OPTION_WITH_TIES => 2,
-        _ => -1,
-    }
-}
-
-fn convert_lock_clause_strength(value: bindings::LockClauseStrength) -> i32 {
-    match value {
-        bindings::LockClauseStrength_LCS_NONE => 1,
-        bindings::LockClauseStrength_LCS_FORKEYSHARE => 2,
-        bindings::LockClauseStrength_LCS_FORSHARE => 3,
-        bindings::LockClauseStrength_LCS_FORNOKEYUPDATE => 4,
-        bindings::LockClauseStrength_LCS_FORUPDATE => 5,
-        _ => -1,
-    }
-}
-
-fn convert_lock_wait_policy(value: bindings::LockWaitPolicy) -> i32 {
-    match value {
-        bindings::LockWaitPolicy_LockWaitBlock => 1,
-        bindings::LockWaitPolicy_LockWaitSkip => 2,
-        bindings::LockWaitPolicy_LockWaitError => 3,
-        _ => -1,
-    }
-}
-
-fn convert_merge_match_kind(value: bindings::MergeMatchKind) -> i32 {
-    match value {
-        bindings::MergeMatchKind_MERGE_WHEN_MATCHED => 1,
-        bindings::MergeMatchKind_MERGE_WHEN_NOT_MATCHED_BY_SOURCE => 2,
-        bindings::MergeMatchKind_MERGE_WHEN_NOT_MATCHED_BY_TARGET => 3,
-        _ => -1,
-    }
-}
-
-fn convert_min_max_op(value: bindings::MinMaxOp) -> i32 {
-    match value {
-        bindings::MinMaxOp_IS_GREATEST => 1,
-        bindings::MinMaxOp_IS_LEAST => 2,
-        _ => -1,
-    }
-}
-
-fn convert_null_test_type(value: bindings::NullTestType) -> i32 {
-    match value {
-        bindings::NullTestType_IS_NULL => 1,
-        bindings::NullTestType_IS_NOT_NULL => 2,
-        _ => -1,
-    }
-}
-
-fn convert_object_type(value: bindings::ObjectType) -> i32 {
-    match value {
-        bindings::ObjectType_OBJECT_ACCESS_METHOD => 1,
-        bindings::ObjectType_OBJECT_AGGREGATE => 2,
-        bindings::ObjectType_OBJECT_AMOP => 3,
-        bindings::ObjectType_OBJECT_AMPROC => 4,
-        bindings::ObjectType_OBJECT_ATTRIBUTE => 5,
-        bindings::ObjectType_OBJECT_CAST => 6,
-        bindings::ObjectType_OBJECT_COLUMN => 7,
-        bindings::ObjectType_OBJECT_COLLATION => 8,
-        bindings::ObjectType_OBJECT_CONVERSION => 9,
-        bindings::ObjectType_OBJECT_DATABASE => 10,
-        bindings::ObjectType_OBJECT_DEFAULT => 11,
-        bindings::ObjectType_OBJECT_DEFACL => 12,
-        bindings::ObjectType_OBJECT_DOMAIN => 13,
-        bindings::ObjectType_OBJECT_DOMCONSTRAINT => 14,
-        bindings::ObjectType_OBJECT_EVENT_TRIGGER => 15,
-        bindings::ObjectType_OBJECT_EXTENSION => 16,
-        bindings::ObjectType_OBJECT_FDW => 17,
-        bindings::ObjectType_OBJECT_FOREIGN_SERVER => 18,
-        bindings::ObjectType_OBJECT_FOREIGN_TABLE => 19,
-        bindings::ObjectType_OBJECT_FUNCTION => 20,
-        bindings::ObjectType_OBJECT_INDEX => 21,
-        bindings::ObjectType_OBJECT_LANGUAGE => 22,
-        bindings::ObjectType_OBJECT_LARGEOBJECT => 23,
-        bindings::ObjectType_OBJECT_MATVIEW => 24,
-        bindings::ObjectType_OBJECT_OPCLASS => 25,
-        bindings::ObjectType_OBJECT_OPERATOR => 26,
-        bindings::ObjectType_OBJECT_OPFAMILY => 27,
-        bindings::ObjectType_OBJECT_PARAMETER_ACL => 28,
-        bindings::ObjectType_OBJECT_POLICY => 29,
-        bindings::ObjectType_OBJECT_PROCEDURE => 30,
-        bindings::ObjectType_OBJECT_PUBLICATION => 31,
-        bindings::ObjectType_OBJECT_PUBLICATION_NAMESPACE => 32,
-        bindings::ObjectType_OBJECT_PUBLICATION_REL => 33,
-        bindings::ObjectType_OBJECT_ROLE => 34,
-        bindings::ObjectType_OBJECT_ROUTINE => 35,
-        bindings::ObjectType_OBJECT_RULE => 36,
-        bindings::ObjectType_OBJECT_SCHEMA => 37,
-        bindings::ObjectType_OBJECT_SEQUENCE => 38,
-        bindings::ObjectType_OBJECT_SUBSCRIPTION => 39,
-        bindings::ObjectType_OBJECT_STATISTIC_EXT => 40,
-        bindings::ObjectType_OBJECT_TABCONSTRAINT => 41,
-        bindings::ObjectType_OBJECT_TABLE => 42,
-        bindings::ObjectType_OBJECT_TABLESPACE => 43,
-        bindings::ObjectType_OBJECT_TRANSFORM => 44,
-        bindings::ObjectType_OBJECT_TRIGGER => 45,
-        bindings::ObjectType_OBJECT_TSCONFIGURATION => 46,
-        bindings::ObjectType_OBJECT_TSDICTIONARY => 47,
-        bindings::ObjectType_OBJECT_TSPARSER => 48,
-        bindings::ObjectType_OBJECT_TSTEMPLATE => 49,
-        bindings::ObjectType_OBJECT_TYPE => 50,
-        bindings::ObjectType_OBJECT_USER_MAPPING => 51,
-        bindings::ObjectType_OBJECT_VIEW => 52,
-        _ => -1,
-    }
-}
-
-fn convert_on_commit_action(value: bindings::OnCommitAction) -> i32 {
-    match value {
-        bindings::OnCommitAction_ONCOMMIT_NOOP => 1,
-        bindings::OnCommitAction_ONCOMMIT_PRESERVE_ROWS => 2,
-        bindings::OnCommitAction_ONCOMMIT_DELETE_ROWS => 3,
-        bindings::OnCommitAction_ONCOMMIT_DROP => 4,
-        _ => -1,
-    }
-}
-
-fn convert_on_conflict_action(value: bindings::OnConflictAction) -> i32 {
-    match value {
-        bindings::OnConflictAction_ONCONFLICT_NONE => 1,
-        bindings::OnConflictAction_ONCONFLICT_NOTHING => 2,
-        bindings::OnConflictAction_ONCONFLICT_UPDATE => 3,
-        _ => -1,
-    }
-}
-
-fn convert_overriding_kind(value: bindings::OverridingKind) -> i32 {
-    match value {
-        bindings::OverridingKind_OVERRIDING_NOT_SET => 1,
-        bindings::OverridingKind_OVERRIDING_USER_VALUE => 2,
-        bindings::OverridingKind_OVERRIDING_SYSTEM_VALUE => 3,
-        _ => -1,
-    }
-}
-
-fn convert_param_kind(value: bindings::ParamKind) -> i32 {
-    match value {
-        bindings::ParamKind_PARAM_EXTERN => 1,
-        bindings::ParamKind_PARAM_EXEC => 2,
-        bindings::ParamKind_PARAM_SUBLINK => 3,
-        bindings::ParamKind_PARAM_MULTIEXPR => 4,
-        _ => -1,
-    }
-}
-
-fn convert_partition_range_datum_kind(value: bindings::PartitionRangeDatumKind) -> i32 {
-    match value {
-        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_MINVALUE => 1,
-        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_VALUE => 2,
-        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_MAXVALUE => 3,
-        _ => -1,
-    }
-}
-
-fn convert_partition_strategy(value: bindings::PartitionStrategy) -> i32 {
-    match value {
-        bindings::PartitionStrategy_PARTITION_STRATEGY_LIST => 1,
-        bindings::PartitionStrategy_PARTITION_STRATEGY_RANGE => 2,
-        bindings::PartitionStrategy_PARTITION_STRATEGY_HASH => 3,
-        _ => -1,
-    }
-}
-
-fn convert_publication_obj_spec_type(value: bindings::PublicationObjSpecType) -> i32 {
-    match value {
-        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLE => 1,
-        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_SCHEMA => 2,
-        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA => 3,
-        bindings::PublicationObjSpecType_PUBLICATIONOBJ_CONTINUATION => 4,
-        _ => -1,
-    }
-}
-
-fn convert_query_source(value: bindings::QuerySource) -> i32 {
-    match value {
-        bindings::QuerySource_QSRC_ORIGINAL => 1,
-        bindings::QuerySource_QSRC_PARSER => 2,
-        bindings::QuerySource_QSRC_INSTEAD_RULE => 3,
-        bindings::QuerySource_QSRC_QUAL_INSTEAD_RULE => 4,
-        bindings::QuerySource_QSRC_NON_INSTEAD_RULE => 5,
-        _ => -1,
-    }
-}
-
-fn convert_rte_kind(value: bindings::RTEKind) -> i32 {
-    match value {
-        bindings::RTEKind_RTE_RELATION => 1,
-        bindings::RTEKind_RTE_SUBQUERY => 2,
-        bindings::RTEKind_RTE_JOIN => 3,
-        bindings::RTEKind_RTE_FUNCTION => 4,
-        bindings::RTEKind_RTE_TABLEFUNC => 5,
-        bindings::RTEKind_RTE_VALUES => 6,
-        bindings::RTEKind_RTE_CTE => 7,
-        bindings::RTEKind_RTE_NAMEDTUPLESTORE => 8,
-        bindings::RTEKind_RTE_RESULT => 9,
-        bindings::RTEKind_RTE_GROUP => 10,
-        _ => -1,
-    }
-}
-
-fn convert_reindex_object_type(value: bindings::ReindexObjectType) -> i32 {
-    match value {
-        bindings::ReindexObjectType_REINDEX_OBJECT_INDEX => 1,
-        bindings::ReindexObjectType_REINDEX_OBJECT_TABLE => 2,
-        bindings::ReindexObjectType_REINDEX_OBJECT_SCHEMA => 3,
-        bindings::ReindexObjectType_REINDEX_OBJECT_SYSTEM => 4,
-        bindings::ReindexObjectType_REINDEX_OBJECT_DATABASE => 5,
-        _ => -1,
-    }
-}
-
-fn convert_returning_option_kind(value: bindings::ReturningOptionKind) -> i32 {
-    match value {
-        bindings::ReturningOptionKind_RETURNING_OPTION_OLD => 1,
-        bindings::ReturningOptionKind_RETURNING_OPTION_NEW => 2,
-        _ => -1,
-    }
-}
-
-fn convert_role_spec_type(value: bindings::RoleSpecType) -> i32 {
-    match value {
-        bindings::RoleSpecType_ROLESPEC_CSTRING => 1,
-        bindings::RoleSpecType_ROLESPEC_CURRENT_ROLE => 2,
-        bindings::RoleSpecType_ROLESPEC_CURRENT_USER => 3,
-        bindings::RoleSpecType_ROLESPEC_SESSION_USER => 4,
-        bindings::RoleSpecType_ROLESPEC_PUBLIC => 5,
-        _ => -1,
-    }
-}
-
-fn convert_role_stmt_type(value: bindings::RoleStmtType) -> i32 {
-    match value {
-        bindings::RoleStmtType_ROLESTMT_ROLE => 1,
-        bindings::RoleStmtType_ROLESTMT_USER => 2,
-        bindings::RoleStmtType_ROLESTMT_GROUP => 3,
-        _ => -1,
-    }
-}
-
-fn convert_sql_value_function_op(value: bindings::SQLValueFunctionOp) -> i32 {
-    match value {
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_DATE => 1,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIME => 2,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIME_N => 3,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP => 4,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N => 5,
-        bindings::SQLValueFunctionOp_SVFOP_LOCALTIME => 6,
-        bindings::SQLValueFunctionOp_SVFOP_LOCALTIME_N => 7,
-        bindings::SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP => 8,
-        bindings::SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N => 9,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_ROLE => 10,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_USER => 11,
-        bindings::SQLValueFunctionOp_SVFOP_USER => 12,
-        bindings::SQLValueFunctionOp_SVFOP_SESSION_USER => 13,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_CATALOG => 14,
-        bindings::SQLValueFunctionOp_SVFOP_CURRENT_SCHEMA => 15,
-        _ => -1,
-    }
-}
-
-fn convert_set_operation(value: bindings::SetOperation) -> i32 {
-    match value {
-        bindings::SetOperation_SETOP_NONE => 1,
-        bindings::SetOperation_SETOP_UNION => 2,
-        bindings::SetOperation_SETOP_INTERSECT => 3,
-        bindings::SetOperation_SETOP_EXCEPT => 4,
-        _ => -1,
-    }
-}
-
-fn convert_sort_by_dir(value: bindings::SortByDir) -> i32 {
-    match value {
-        bindings::SortByDir_SORTBY_DEFAULT => 1,
-        bindings::SortByDir_SORTBY_ASC => 2,
-        bindings::SortByDir_SORTBY_DESC => 3,
-        bindings::SortByDir_SORTBY_USING => 4,
-        _ => -1,
-    }
-}
-
-fn convert_sort_by_nulls(value: bindings::SortByNulls) -> i32 {
-    match value {
-        bindings::SortByNulls_SORTBY_NULLS_DEFAULT => 1,
-        bindings::SortByNulls_SORTBY_NULLS_FIRST => 2,
-        bindings::SortByNulls_SORTBY_NULLS_LAST => 3,
-        _ => -1,
-    }
-}
-
-fn convert_sub_link_type(value: bindings::SubLinkType) -> i32 {
-    match value {
-        bindings::SubLinkType_EXISTS_SUBLINK => 1,
-        bindings::SubLinkType_ALL_SUBLINK => 2,
-        bindings::SubLinkType_ANY_SUBLINK => 3,
-        bindings::SubLinkType_ROWCOMPARE_SUBLINK => 4,
-        bindings::SubLinkType_EXPR_SUBLINK => 5,
-        bindings::SubLinkType_MULTIEXPR_SUBLINK => 6,
-        bindings::SubLinkType_ARRAY_SUBLINK => 7,
-        bindings::SubLinkType_CTE_SUBLINK => 8,
-        _ => -1,
-    }
-}
-
-fn convert_table_func_type(value: bindings::TableFuncType) -> i32 {
-    match value {
-        bindings::TableFuncType_TFT_XMLTABLE => 1,
-        bindings::TableFuncType_TFT_JSON_TABLE => 2,
-        _ => -1,
-    }
-}
-
-fn convert_transaction_stmt_kind(value: bindings::TransactionStmtKind) -> i32 {
-    match value {
-        bindings::TransactionStmtKind_TRANS_STMT_BEGIN => 1,
-        bindings::TransactionStmtKind_TRANS_STMT_START => 2,
-        bindings::TransactionStmtKind_TRANS_STMT_COMMIT => 3,
-        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK => 4,
-        bindings::TransactionStmtKind_TRANS_STMT_SAVEPOINT => 5,
-        bindings::TransactionStmtKind_TRANS_STMT_RELEASE => 6,
-        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => 7,
-        bindings::TransactionStmtKind_TRANS_STMT_PREPARE => 8,
-        bindings::TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED => 9,
-        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED => 10,
-        _ => -1,
-    }
-}
-
-fn convert_var_returning_type(value: bindings::VarReturningType) -> i32 {
-    match value {
-        bindings::VarReturningType_VAR_RETURNING_DEFAULT => 1,
-        bindings::VarReturningType_VAR_RETURNING_OLD => 2,
-        bindings::VarReturningType_VAR_RETURNING_NEW => 3,
-        _ => -1,
-    }
-}
-
-fn convert_variable_set_kind(value: bindings::VariableSetKind) -> i32 {
-    match value {
-        bindings::VariableSetKind_VAR_SET_VALUE => 1,
-        bindings::VariableSetKind_VAR_SET_DEFAULT => 2,
-        bindings::VariableSetKind_VAR_SET_CURRENT => 3,
-        bindings::VariableSetKind_VAR_SET_MULTI => 4,
-        bindings::VariableSetKind_VAR_RESET => 5,
-        bindings::VariableSetKind_VAR_RESET_ALL => 6,
-        _ => -1,
-    }
-}
-
-fn convert_view_check_option(value: bindings::ViewCheckOption) -> i32 {
-    match value {
-        bindings::ViewCheckOption_NO_CHECK_OPTION => 1,
-        bindings::ViewCheckOption_LOCAL_CHECK_OPTION => 2,
-        bindings::ViewCheckOption_CASCADED_CHECK_OPTION => 3,
-        _ => -1,
-    }
-}
-
-fn convert_wco_kind(value: bindings::WCOKind) -> i32 {
-    match value {
-        bindings::WCOKind_WCO_VIEW_CHECK => 1,
-        bindings::WCOKind_WCO_RLS_INSERT_CHECK => 2,
-        bindings::WCOKind_WCO_RLS_UPDATE_CHECK => 3,
-        bindings::WCOKind_WCO_RLS_CONFLICT_CHECK => 4,
-        bindings::WCOKind_WCO_RLS_MERGE_UPDATE_CHECK => 5,
-        bindings::WCOKind_WCO_RLS_MERGE_DELETE_CHECK => 6,
-        bindings::WCOKind_WCO_VIEW_CONFLICT_CHECK => 7,
-        _ => -1,
-    }
-}
-
-fn convert_xml_expr_op(value: bindings::XmlExprOp) -> i32 {
-    match value {
-        bindings::XmlExprOp_IS_XMLCONCAT => 1,
-        bindings::XmlExprOp_IS_XMLELEMENT => 2,
-        bindings::XmlExprOp_IS_XMLFOREST => 3,
-        bindings::XmlExprOp_IS_XMLPARSE => 4,
-        bindings::XmlExprOp_IS_XMLPI => 5,
-        bindings::XmlExprOp_IS_XMLROOT => 6,
-        bindings::XmlExprOp_IS_XMLSERIALIZE => 7,
-        bindings::XmlExprOp_IS_DOCUMENT => 8,
-        _ => -1,
-    }
-}
-
-fn convert_xml_option_type(value: bindings::XmlOptionType) -> i32 {
-    match value {
-        bindings::XmlOptionType_XMLOPTION_DOCUMENT => 1,
-        bindings::XmlOptionType_XMLOPTION_CONTENT => 2,
-        _ => -1,
-    }
+fn convert_a_expr_kind(value: bindings::A_Expr_Kind) -> ast::AExprKind {
+    match value {
+        bindings::A_Expr_Kind_AEXPR_OP => ast::AExprKind::AexprOp,
+        bindings::A_Expr_Kind_AEXPR_OP_ANY => ast::AExprKind::AexprOpAny,
+        bindings::A_Expr_Kind_AEXPR_OP_ALL => ast::AExprKind::AexprOpAll,
+        bindings::A_Expr_Kind_AEXPR_DISTINCT => ast::AExprKind::AexprDistinct,
+        bindings::A_Expr_Kind_AEXPR_NOT_DISTINCT => ast::AExprKind::AexprNotDistinct,
+        bindings::A_Expr_Kind_AEXPR_NULLIF => ast::AExprKind::AexprNullif,
+        bindings::A_Expr_Kind_AEXPR_IN => ast::AExprKind::AexprIn,
+        bindings::A_Expr_Kind_AEXPR_LIKE => ast::AExprKind::AexprLike,
+        bindings::A_Expr_Kind_AEXPR_ILIKE => ast::AExprKind::AexprIlike,
+        bindings::A_Expr_Kind_AEXPR_SIMILAR => ast::AExprKind::AexprSimilar,
+        bindings::A_Expr_Kind_AEXPR_BETWEEN => ast::AExprKind::AexprBetween,
+        bindings::A_Expr_Kind_AEXPR_NOT_BETWEEN => ast::AExprKind::AexprNotBetween,
+        bindings::A_Expr_Kind_AEXPR_BETWEEN_SYM => ast::AExprKind::AexprBetweenSym,
+        bindings::A_Expr_Kind_AEXPR_NOT_BETWEEN_SYM => ast::AExprKind::AexprNotBetweenSym,
+        other => unreachable!("{other} is not a A_Expr_Kind"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::A_Expr_Kind_AEXPR_OP as i64 == ast::AExprKind::AexprOp as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_OP_ANY as i64 == ast::AExprKind::AexprOpAny as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_OP_ALL as i64 == ast::AExprKind::AexprOpAll as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_DISTINCT as i64 == ast::AExprKind::AexprDistinct as i64);
+    assert!(
+        bindings::A_Expr_Kind_AEXPR_NOT_DISTINCT as i64 == ast::AExprKind::AexprNotDistinct as i64
+    );
+    assert!(bindings::A_Expr_Kind_AEXPR_NULLIF as i64 == ast::AExprKind::AexprNullif as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_IN as i64 == ast::AExprKind::AexprIn as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_LIKE as i64 == ast::AExprKind::AexprLike as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_ILIKE as i64 == ast::AExprKind::AexprIlike as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_SIMILAR as i64 == ast::AExprKind::AexprSimilar as i64);
+    assert!(bindings::A_Expr_Kind_AEXPR_BETWEEN as i64 == ast::AExprKind::AexprBetween as i64);
+    assert!(
+        bindings::A_Expr_Kind_AEXPR_NOT_BETWEEN as i64 == ast::AExprKind::AexprNotBetween as i64
+    );
+    assert!(
+        bindings::A_Expr_Kind_AEXPR_BETWEEN_SYM as i64 == ast::AExprKind::AexprBetweenSym as i64
+    );
+    assert!(
+        bindings::A_Expr_Kind_AEXPR_NOT_BETWEEN_SYM as i64
+            == ast::AExprKind::AexprNotBetweenSym as i64
+    );
+};
+
+fn convert_agg_split(value: bindings::AggSplit) -> ast::AggSplit {
+    match value {
+        bindings::AggSplit_AGGSPLIT_SIMPLE => ast::AggSplit::AggsplitSimple,
+        bindings::AggSplit_AGGSPLIT_INITIAL_SERIAL => ast::AggSplit::AggsplitInitialSerial,
+        bindings::AggSplit_AGGSPLIT_FINAL_DESERIAL => ast::AggSplit::AggsplitFinalDeserial,
+        other => unreachable!("{other} is not a AggSplit"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::AggSplit_AGGSPLIT_SIMPLE as i64 == ast::AggSplit::AggsplitSimple as i64);
+    assert!(
+        bindings::AggSplit_AGGSPLIT_INITIAL_SERIAL as i64
+            == ast::AggSplit::AggsplitInitialSerial as i64
+    );
+    assert!(
+        bindings::AggSplit_AGGSPLIT_FINAL_DESERIAL as i64
+            == ast::AggSplit::AggsplitFinalDeserial as i64
+    );
+};
+
+fn convert_alter_publication_action(
+    value: bindings::AlterPublicationAction,
+) -> ast::AlterPublicationAction {
+    match value {
+        bindings::AlterPublicationAction_AP_AddObjects => ast::AlterPublicationAction::ApAddObjects,
+        bindings::AlterPublicationAction_AP_DropObjects => {
+            ast::AlterPublicationAction::ApDropObjects
+        }
+        bindings::AlterPublicationAction_AP_SetObjects => ast::AlterPublicationAction::ApSetObjects,
+        other => unreachable!("{other} is not a AlterPublicationAction"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::AlterPublicationAction_AP_AddObjects as i64
+            == ast::AlterPublicationAction::ApAddObjects as i64
+    );
+    assert!(
+        bindings::AlterPublicationAction_AP_DropObjects as i64
+            == ast::AlterPublicationAction::ApDropObjects as i64
+    );
+    assert!(
+        bindings::AlterPublicationAction_AP_SetObjects as i64
+            == ast::AlterPublicationAction::ApSetObjects as i64
+    );
+};
+
+fn convert_alter_subscription_type(
+    value: bindings::AlterSubscriptionType,
+) -> ast::AlterSubscriptionType {
+    match value {
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_OPTIONS => {
+            ast::AlterSubscriptionType::AlterSubscriptionOptions
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_CONNECTION => {
+            ast::AlterSubscriptionType::AlterSubscriptionConnection
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SET_PUBLICATION => {
+            ast::AlterSubscriptionType::AlterSubscriptionSetPublication
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ADD_PUBLICATION => {
+            ast::AlterSubscriptionType::AlterSubscriptionAddPublication
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_DROP_PUBLICATION => {
+            ast::AlterSubscriptionType::AlterSubscriptionDropPublication
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH => {
+            ast::AlterSubscriptionType::AlterSubscriptionRefresh
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ENABLED => {
+            ast::AlterSubscriptionType::AlterSubscriptionEnabled
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SKIP => {
+            ast::AlterSubscriptionType::AlterSubscriptionSkip
+        }
+        other => unreachable!("{other} is not a AlterSubscriptionType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_OPTIONS as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionOptions as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_CONNECTION as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionConnection as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SET_PUBLICATION as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionSetPublication as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ADD_PUBLICATION as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionAddPublication as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_DROP_PUBLICATION as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionDropPublication as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionRefresh as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ENABLED as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionEnabled as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SKIP as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionSkip as i64
+    );
+};
+
+fn convert_alter_ts_config_type(value: bindings::AlterTSConfigType) -> ast::AlterTsConfigType {
+    match value {
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_ADD_MAPPING => {
+            ast::AlterTsConfigType::AlterTsconfigAddMapping
+        }
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN => {
+            ast::AlterTsConfigType::AlterTsconfigAlterMappingForToken
+        }
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_REPLACE_DICT => {
+            ast::AlterTsConfigType::AlterTsconfigReplaceDict
+        }
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN => {
+            ast::AlterTsConfigType::AlterTsconfigReplaceDictForToken
+        }
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_DROP_MAPPING => {
+            ast::AlterTsConfigType::AlterTsconfigDropMapping
+        }
+        other => unreachable!("{other} is not a AlterTSConfigType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_ADD_MAPPING as i64
+            == ast::AlterTsConfigType::AlterTsconfigAddMapping as i64
+    );
+    assert!(
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN as i64
+            == ast::AlterTsConfigType::AlterTsconfigAlterMappingForToken as i64
+    );
+    assert!(
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_REPLACE_DICT as i64
+            == ast::AlterTsConfigType::AlterTsconfigReplaceDict as i64
+    );
+    assert!(
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN as i64
+            == ast::AlterTsConfigType::AlterTsconfigReplaceDictForToken as i64
+    );
+    assert!(
+        bindings::AlterTSConfigType_ALTER_TSCONFIG_DROP_MAPPING as i64
+            == ast::AlterTsConfigType::AlterTsconfigDropMapping as i64
+    );
+};
+
+fn convert_alter_table_type(value: bindings::AlterTableType) -> ast::AlterTableType {
+    match value {
+        bindings::AlterTableType_AT_AddColumn => ast::AlterTableType::AtAddColumn,
+        bindings::AlterTableType_AT_AddColumnToView => ast::AlterTableType::AtAddColumnToView,
+        bindings::AlterTableType_AT_ColumnDefault => ast::AlterTableType::AtColumnDefault,
+        bindings::AlterTableType_AT_CookedColumnDefault => {
+            ast::AlterTableType::AtCookedColumnDefault
+        }
+        bindings::AlterTableType_AT_DropNotNull => ast::AlterTableType::AtDropNotNull,
+        bindings::AlterTableType_AT_SetNotNull => ast::AlterTableType::AtSetNotNull,
+        bindings::AlterTableType_AT_SetExpression => ast::AlterTableType::AtSetExpression,
+        bindings::AlterTableType_AT_DropExpression => ast::AlterTableType::AtDropExpression,
+        bindings::AlterTableType_AT_SetStatistics => ast::AlterTableType::AtSetStatistics,
+        bindings::AlterTableType_AT_SetOptions => ast::AlterTableType::AtSetOptions,
+        bindings::AlterTableType_AT_ResetOptions => ast::AlterTableType::AtResetOptions,
+        bindings::AlterTableType_AT_SetStorage => ast::AlterTableType::AtSetStorage,
+        bindings::AlterTableType_AT_SetCompression => ast::AlterTableType::AtSetCompression,
+        bindings::AlterTableType_AT_DropColumn => ast::AlterTableType::AtDropColumn,
+        bindings::AlterTableType_AT_AddIndex => ast::AlterTableType::AtAddIndex,
+        bindings::AlterTableType_AT_ReAddIndex => ast::AlterTableType::AtReAddIndex,
+        bindings::AlterTableType_AT_AddConstraint => ast::AlterTableType::AtAddConstraint,
+        bindings::AlterTableType_AT_ReAddConstraint => ast::AlterTableType::AtReAddConstraint,
+        bindings::AlterTableType_AT_ReAddDomainConstraint => {
+            ast::AlterTableType::AtReAddDomainConstraint
+        }
+        bindings::AlterTableType_AT_AlterConstraint => ast::AlterTableType::AtAlterConstraint,
+        bindings::AlterTableType_AT_ValidateConstraint => ast::AlterTableType::AtValidateConstraint,
+        bindings::AlterTableType_AT_AddIndexConstraint => ast::AlterTableType::AtAddIndexConstraint,
+        bindings::AlterTableType_AT_DropConstraint => ast::AlterTableType::AtDropConstraint,
+        bindings::AlterTableType_AT_ReAddComment => ast::AlterTableType::AtReAddComment,
+        bindings::AlterTableType_AT_AlterColumnType => ast::AlterTableType::AtAlterColumnType,
+        bindings::AlterTableType_AT_AlterColumnGenericOptions => {
+            ast::AlterTableType::AtAlterColumnGenericOptions
+        }
+        bindings::AlterTableType_AT_ChangeOwner => ast::AlterTableType::AtChangeOwner,
+        bindings::AlterTableType_AT_ClusterOn => ast::AlterTableType::AtClusterOn,
+        bindings::AlterTableType_AT_DropCluster => ast::AlterTableType::AtDropCluster,
+        bindings::AlterTableType_AT_SetLogged => ast::AlterTableType::AtSetLogged,
+        bindings::AlterTableType_AT_SetUnLogged => ast::AlterTableType::AtSetUnLogged,
+        bindings::AlterTableType_AT_DropOids => ast::AlterTableType::AtDropOids,
+        bindings::AlterTableType_AT_SetAccessMethod => ast::AlterTableType::AtSetAccessMethod,
+        bindings::AlterTableType_AT_SetTableSpace => ast::AlterTableType::AtSetTableSpace,
+        bindings::AlterTableType_AT_SetRelOptions => ast::AlterTableType::AtSetRelOptions,
+        bindings::AlterTableType_AT_ResetRelOptions => ast::AlterTableType::AtResetRelOptions,
+        bindings::AlterTableType_AT_ReplaceRelOptions => ast::AlterTableType::AtReplaceRelOptions,
+        bindings::AlterTableType_AT_EnableTrig => ast::AlterTableType::AtEnableTrig,
+        bindings::AlterTableType_AT_EnableAlwaysTrig => ast::AlterTableType::AtEnableAlwaysTrig,
+        bindings::AlterTableType_AT_EnableReplicaTrig => ast::AlterTableType::AtEnableReplicaTrig,
+        bindings::AlterTableType_AT_DisableTrig => ast::AlterTableType::AtDisableTrig,
+        bindings::AlterTableType_AT_EnableTrigAll => ast::AlterTableType::AtEnableTrigAll,
+        bindings::AlterTableType_AT_DisableTrigAll => ast::AlterTableType::AtDisableTrigAll,
+        bindings::AlterTableType_AT_EnableTrigUser => ast::AlterTableType::AtEnableTrigUser,
+        bindings::AlterTableType_AT_DisableTrigUser => ast::AlterTableType::AtDisableTrigUser,
+        bindings::AlterTableType_AT_EnableRule => ast::AlterTableType::AtEnableRule,
+        bindings::AlterTableType_AT_EnableAlwaysRule => ast::AlterTableType::AtEnableAlwaysRule,
+        bindings::AlterTableType_AT_EnableReplicaRule => ast::AlterTableType::AtEnableReplicaRule,
+        bindings::AlterTableType_AT_DisableRule => ast::AlterTableType::AtDisableRule,
+        bindings::AlterTableType_AT_AddInherit => ast::AlterTableType::AtAddInherit,
+        bindings::AlterTableType_AT_DropInherit => ast::AlterTableType::AtDropInherit,
+        bindings::AlterTableType_AT_AddOf => ast::AlterTableType::AtAddOf,
+        bindings::AlterTableType_AT_DropOf => ast::AlterTableType::AtDropOf,
+        bindings::AlterTableType_AT_ReplicaIdentity => ast::AlterTableType::AtReplicaIdentity,
+        bindings::AlterTableType_AT_EnableRowSecurity => ast::AlterTableType::AtEnableRowSecurity,
+        bindings::AlterTableType_AT_DisableRowSecurity => ast::AlterTableType::AtDisableRowSecurity,
+        bindings::AlterTableType_AT_ForceRowSecurity => ast::AlterTableType::AtForceRowSecurity,
+        bindings::AlterTableType_AT_NoForceRowSecurity => ast::AlterTableType::AtNoForceRowSecurity,
+        bindings::AlterTableType_AT_GenericOptions => ast::AlterTableType::AtGenericOptions,
+        bindings::AlterTableType_AT_AttachPartition => ast::AlterTableType::AtAttachPartition,
+        bindings::AlterTableType_AT_DetachPartition => ast::AlterTableType::AtDetachPartition,
+        bindings::AlterTableType_AT_DetachPartitionFinalize => {
+            ast::AlterTableType::AtDetachPartitionFinalize
+        }
+        bindings::AlterTableType_AT_AddIdentity => ast::AlterTableType::AtAddIdentity,
+        bindings::AlterTableType_AT_SetIdentity => ast::AlterTableType::AtSetIdentity,
+        bindings::AlterTableType_AT_DropIdentity => ast::AlterTableType::AtDropIdentity,
+        bindings::AlterTableType_AT_ReAddStatistics => ast::AlterTableType::AtReAddStatistics,
+        other => unreachable!("{other} is not a AlterTableType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::AlterTableType_AT_AddColumn as i64 == ast::AlterTableType::AtAddColumn as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AddColumnToView as i64
+            == ast::AlterTableType::AtAddColumnToView as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ColumnDefault as i64
+            == ast::AlterTableType::AtColumnDefault as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_CookedColumnDefault as i64
+            == ast::AlterTableType::AtCookedColumnDefault as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DropNotNull as i64 == ast::AlterTableType::AtDropNotNull as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetNotNull as i64 == ast::AlterTableType::AtSetNotNull as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetExpression as i64
+            == ast::AlterTableType::AtSetExpression as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DropExpression as i64
+            == ast::AlterTableType::AtDropExpression as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetStatistics as i64
+            == ast::AlterTableType::AtSetStatistics as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetOptions as i64 == ast::AlterTableType::AtSetOptions as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ResetOptions as i64
+            == ast::AlterTableType::AtResetOptions as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetStorage as i64 == ast::AlterTableType::AtSetStorage as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetCompression as i64
+            == ast::AlterTableType::AtSetCompression as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DropColumn as i64 == ast::AlterTableType::AtDropColumn as i64
+    );
+    assert!(bindings::AlterTableType_AT_AddIndex as i64 == ast::AlterTableType::AtAddIndex as i64);
+    assert!(
+        bindings::AlterTableType_AT_ReAddIndex as i64 == ast::AlterTableType::AtReAddIndex as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AddConstraint as i64
+            == ast::AlterTableType::AtAddConstraint as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ReAddConstraint as i64
+            == ast::AlterTableType::AtReAddConstraint as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ReAddDomainConstraint as i64
+            == ast::AlterTableType::AtReAddDomainConstraint as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AlterConstraint as i64
+            == ast::AlterTableType::AtAlterConstraint as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ValidateConstraint as i64
+            == ast::AlterTableType::AtValidateConstraint as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AddIndexConstraint as i64
+            == ast::AlterTableType::AtAddIndexConstraint as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DropConstraint as i64
+            == ast::AlterTableType::AtDropConstraint as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ReAddComment as i64
+            == ast::AlterTableType::AtReAddComment as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AlterColumnType as i64
+            == ast::AlterTableType::AtAlterColumnType as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AlterColumnGenericOptions as i64
+            == ast::AlterTableType::AtAlterColumnGenericOptions as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ChangeOwner as i64 == ast::AlterTableType::AtChangeOwner as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ClusterOn as i64 == ast::AlterTableType::AtClusterOn as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DropCluster as i64 == ast::AlterTableType::AtDropCluster as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetLogged as i64 == ast::AlterTableType::AtSetLogged as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetUnLogged as i64 == ast::AlterTableType::AtSetUnLogged as i64
+    );
+    assert!(bindings::AlterTableType_AT_DropOids as i64 == ast::AlterTableType::AtDropOids as i64);
+    assert!(
+        bindings::AlterTableType_AT_SetAccessMethod as i64
+            == ast::AlterTableType::AtSetAccessMethod as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetTableSpace as i64
+            == ast::AlterTableType::AtSetTableSpace as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetRelOptions as i64
+            == ast::AlterTableType::AtSetRelOptions as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ResetRelOptions as i64
+            == ast::AlterTableType::AtResetRelOptions as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ReplaceRelOptions as i64
+            == ast::AlterTableType::AtReplaceRelOptions as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableTrig as i64 == ast::AlterTableType::AtEnableTrig as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableAlwaysTrig as i64
+            == ast::AlterTableType::AtEnableAlwaysTrig as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableReplicaTrig as i64
+            == ast::AlterTableType::AtEnableReplicaTrig as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DisableTrig as i64 == ast::AlterTableType::AtDisableTrig as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableTrigAll as i64
+            == ast::AlterTableType::AtEnableTrigAll as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DisableTrigAll as i64
+            == ast::AlterTableType::AtDisableTrigAll as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableTrigUser as i64
+            == ast::AlterTableType::AtEnableTrigUser as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DisableTrigUser as i64
+            == ast::AlterTableType::AtDisableTrigUser as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableRule as i64 == ast::AlterTableType::AtEnableRule as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableAlwaysRule as i64
+            == ast::AlterTableType::AtEnableAlwaysRule as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableReplicaRule as i64
+            == ast::AlterTableType::AtEnableReplicaRule as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DisableRule as i64 == ast::AlterTableType::AtDisableRule as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AddInherit as i64 == ast::AlterTableType::AtAddInherit as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DropInherit as i64 == ast::AlterTableType::AtDropInherit as i64
+    );
+    assert!(bindings::AlterTableType_AT_AddOf as i64 == ast::AlterTableType::AtAddOf as i64);
+    assert!(bindings::AlterTableType_AT_DropOf as i64 == ast::AlterTableType::AtDropOf as i64);
+    assert!(
+        bindings::AlterTableType_AT_ReplicaIdentity as i64
+            == ast::AlterTableType::AtReplicaIdentity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_EnableRowSecurity as i64
+            == ast::AlterTableType::AtEnableRowSecurity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DisableRowSecurity as i64
+            == ast::AlterTableType::AtDisableRowSecurity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ForceRowSecurity as i64
+            == ast::AlterTableType::AtForceRowSecurity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_NoForceRowSecurity as i64
+            == ast::AlterTableType::AtNoForceRowSecurity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_GenericOptions as i64
+            == ast::AlterTableType::AtGenericOptions as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AttachPartition as i64
+            == ast::AlterTableType::AtAttachPartition as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DetachPartition as i64
+            == ast::AlterTableType::AtDetachPartition as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DetachPartitionFinalize as i64
+            == ast::AlterTableType::AtDetachPartitionFinalize as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_AddIdentity as i64 == ast::AlterTableType::AtAddIdentity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_SetIdentity as i64 == ast::AlterTableType::AtSetIdentity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_DropIdentity as i64
+            == ast::AlterTableType::AtDropIdentity as i64
+    );
+    assert!(
+        bindings::AlterTableType_AT_ReAddStatistics as i64
+            == ast::AlterTableType::AtReAddStatistics as i64
+    );
+};
+
+fn convert_bool_expr_type(value: bindings::BoolExprType) -> ast::BoolExprType {
+    match value {
+        bindings::BoolExprType_AND_EXPR => ast::BoolExprType::AndExpr,
+        bindings::BoolExprType_OR_EXPR => ast::BoolExprType::OrExpr,
+        bindings::BoolExprType_NOT_EXPR => ast::BoolExprType::NotExpr,
+        other => unreachable!("{other} is not a BoolExprType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::BoolExprType_AND_EXPR as i64 == ast::BoolExprType::AndExpr as i64);
+    assert!(bindings::BoolExprType_OR_EXPR as i64 == ast::BoolExprType::OrExpr as i64);
+    assert!(bindings::BoolExprType_NOT_EXPR as i64 == ast::BoolExprType::NotExpr as i64);
+};
+
+fn convert_bool_test_type(value: bindings::BoolTestType) -> ast::BoolTestType {
+    match value {
+        bindings::BoolTestType_IS_TRUE => ast::BoolTestType::IsTrue,
+        bindings::BoolTestType_IS_NOT_TRUE => ast::BoolTestType::IsNotTrue,
+        bindings::BoolTestType_IS_FALSE => ast::BoolTestType::IsFalse,
+        bindings::BoolTestType_IS_NOT_FALSE => ast::BoolTestType::IsNotFalse,
+        bindings::BoolTestType_IS_UNKNOWN => ast::BoolTestType::IsUnknown,
+        bindings::BoolTestType_IS_NOT_UNKNOWN => ast::BoolTestType::IsNotUnknown,
+        other => unreachable!("{other} is not a BoolTestType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::BoolTestType_IS_TRUE as i64 == ast::BoolTestType::IsTrue as i64);
+    assert!(bindings::BoolTestType_IS_NOT_TRUE as i64 == ast::BoolTestType::IsNotTrue as i64);
+    assert!(bindings::BoolTestType_IS_FALSE as i64 == ast::BoolTestType::IsFalse as i64);
+    assert!(bindings::BoolTestType_IS_NOT_FALSE as i64 == ast::BoolTestType::IsNotFalse as i64);
+    assert!(bindings::BoolTestType_IS_UNKNOWN as i64 == ast::BoolTestType::IsUnknown as i64);
+    assert!(bindings::BoolTestType_IS_NOT_UNKNOWN as i64 == ast::BoolTestType::IsNotUnknown as i64);
+};
+
+fn convert_cte_materialize(value: bindings::CTEMaterialize) -> ast::CteMaterialize {
+    match value {
+        bindings::CTEMaterialize_CTEMaterializeDefault => ast::CteMaterialize::Default,
+        bindings::CTEMaterialize_CTEMaterializeAlways => ast::CteMaterialize::Always,
+        bindings::CTEMaterialize_CTEMaterializeNever => ast::CteMaterialize::Never,
+        other => unreachable!("{other} is not a CTEMaterialize"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::CTEMaterialize_CTEMaterializeDefault as i64
+            == ast::CteMaterialize::Default as i64
+    );
+    assert!(
+        bindings::CTEMaterialize_CTEMaterializeAlways as i64 == ast::CteMaterialize::Always as i64
+    );
+    assert!(
+        bindings::CTEMaterialize_CTEMaterializeNever as i64 == ast::CteMaterialize::Never as i64
+    );
+};
+
+fn convert_cmd_type(value: bindings::CmdType) -> ast::CmdType {
+    match value {
+        bindings::CmdType_CMD_UNKNOWN => ast::CmdType::CmdUnknown,
+        bindings::CmdType_CMD_SELECT => ast::CmdType::CmdSelect,
+        bindings::CmdType_CMD_UPDATE => ast::CmdType::CmdUpdate,
+        bindings::CmdType_CMD_INSERT => ast::CmdType::CmdInsert,
+        bindings::CmdType_CMD_DELETE => ast::CmdType::CmdDelete,
+        bindings::CmdType_CMD_MERGE => ast::CmdType::CmdMerge,
+        bindings::CmdType_CMD_UTILITY => ast::CmdType::CmdUtility,
+        bindings::CmdType_CMD_NOTHING => ast::CmdType::CmdNothing,
+        other => unreachable!("{other} is not a CmdType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::CmdType_CMD_UNKNOWN as i64 == ast::CmdType::CmdUnknown as i64);
+    assert!(bindings::CmdType_CMD_SELECT as i64 == ast::CmdType::CmdSelect as i64);
+    assert!(bindings::CmdType_CMD_UPDATE as i64 == ast::CmdType::CmdUpdate as i64);
+    assert!(bindings::CmdType_CMD_INSERT as i64 == ast::CmdType::CmdInsert as i64);
+    assert!(bindings::CmdType_CMD_DELETE as i64 == ast::CmdType::CmdDelete as i64);
+    assert!(bindings::CmdType_CMD_MERGE as i64 == ast::CmdType::CmdMerge as i64);
+    assert!(bindings::CmdType_CMD_UTILITY as i64 == ast::CmdType::CmdUtility as i64);
+    assert!(bindings::CmdType_CMD_NOTHING as i64 == ast::CmdType::CmdNothing as i64);
+};
+
+fn convert_coercion_context(value: bindings::CoercionContext) -> ast::CoercionContext {
+    match value {
+        bindings::CoercionContext_COERCION_IMPLICIT => ast::CoercionContext::CoercionImplicit,
+        bindings::CoercionContext_COERCION_ASSIGNMENT => ast::CoercionContext::CoercionAssignment,
+        bindings::CoercionContext_COERCION_PLPGSQL => ast::CoercionContext::CoercionPlpgsql,
+        bindings::CoercionContext_COERCION_EXPLICIT => ast::CoercionContext::CoercionExplicit,
+        other => unreachable!("{other} is not a CoercionContext"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::CoercionContext_COERCION_IMPLICIT as i64
+            == ast::CoercionContext::CoercionImplicit as i64
+    );
+    assert!(
+        bindings::CoercionContext_COERCION_ASSIGNMENT as i64
+            == ast::CoercionContext::CoercionAssignment as i64
+    );
+    assert!(
+        bindings::CoercionContext_COERCION_PLPGSQL as i64
+            == ast::CoercionContext::CoercionPlpgsql as i64
+    );
+    assert!(
+        bindings::CoercionContext_COERCION_EXPLICIT as i64
+            == ast::CoercionContext::CoercionExplicit as i64
+    );
+};
+
+fn convert_coercion_form(value: bindings::CoercionForm) -> ast::CoercionForm {
+    match value {
+        bindings::CoercionForm_COERCE_EXPLICIT_CALL => ast::CoercionForm::CoerceExplicitCall,
+        bindings::CoercionForm_COERCE_EXPLICIT_CAST => ast::CoercionForm::CoerceExplicitCast,
+        bindings::CoercionForm_COERCE_IMPLICIT_CAST => ast::CoercionForm::CoerceImplicitCast,
+        bindings::CoercionForm_COERCE_SQL_SYNTAX => ast::CoercionForm::CoerceSqlSyntax,
+        other => unreachable!("{other} is not a CoercionForm"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::CoercionForm_COERCE_EXPLICIT_CALL as i64
+            == ast::CoercionForm::CoerceExplicitCall as i64
+    );
+    assert!(
+        bindings::CoercionForm_COERCE_EXPLICIT_CAST as i64
+            == ast::CoercionForm::CoerceExplicitCast as i64
+    );
+    assert!(
+        bindings::CoercionForm_COERCE_IMPLICIT_CAST as i64
+            == ast::CoercionForm::CoerceImplicitCast as i64
+    );
+    assert!(
+        bindings::CoercionForm_COERCE_SQL_SYNTAX as i64
+            == ast::CoercionForm::CoerceSqlSyntax as i64
+    );
+};
+
+fn convert_compare_type(value: bindings::CompareType) -> ast::CompareType {
+    match value {
+        bindings::CompareType_COMPARE_INVALID => ast::CompareType::CompareInvalid,
+        bindings::CompareType_COMPARE_LT => ast::CompareType::CompareLt,
+        bindings::CompareType_COMPARE_LE => ast::CompareType::CompareLe,
+        bindings::CompareType_COMPARE_EQ => ast::CompareType::CompareEq,
+        bindings::CompareType_COMPARE_GE => ast::CompareType::CompareGe,
+        bindings::CompareType_COMPARE_GT => ast::CompareType::CompareGt,
+        bindings::CompareType_COMPARE_NE => ast::CompareType::CompareNe,
+        bindings::CompareType_COMPARE_OVERLAP => ast::CompareType::CompareOverlap,
+        bindings::CompareType_COMPARE_CONTAINED_BY => ast::CompareType::CompareContainedBy,
+        other => unreachable!("{other} is not a CompareType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::CompareType_COMPARE_INVALID as i64 == ast::CompareType::CompareInvalid as i64
+    );
+    assert!(bindings::CompareType_COMPARE_LT as i64 == ast::CompareType::CompareLt as i64);
+    assert!(bindings::CompareType_COMPARE_LE as i64 == ast::CompareType::CompareLe as i64);
+    assert!(bindings::CompareType_COMPARE_EQ as i64 == ast::CompareType::CompareEq as i64);
+    assert!(bindings::CompareType_COMPARE_GE as i64 == ast::CompareType::CompareGe as i64);
+    assert!(bindings::CompareType_COMPARE_GT as i64 == ast::CompareType::CompareGt as i64);
+    assert!(bindings::CompareType_COMPARE_NE as i64 == ast::CompareType::CompareNe as i64);
+    assert!(
+        bindings::CompareType_COMPARE_OVERLAP as i64 == ast::CompareType::CompareOverlap as i64
+    );
+    assert!(
+        bindings::CompareType_COMPARE_CONTAINED_BY as i64
+            == ast::CompareType::CompareContainedBy as i64
+    );
+};
+
+fn convert_constr_type(value: bindings::ConstrType) -> ast::ConstrType {
+    match value {
+        bindings::ConstrType_CONSTR_NULL => ast::ConstrType::ConstrNull,
+        bindings::ConstrType_CONSTR_NOTNULL => ast::ConstrType::ConstrNotnull,
+        bindings::ConstrType_CONSTR_DEFAULT => ast::ConstrType::ConstrDefault,
+        bindings::ConstrType_CONSTR_IDENTITY => ast::ConstrType::ConstrIdentity,
+        bindings::ConstrType_CONSTR_GENERATED => ast::ConstrType::ConstrGenerated,
+        bindings::ConstrType_CONSTR_CHECK => ast::ConstrType::ConstrCheck,
+        bindings::ConstrType_CONSTR_PRIMARY => ast::ConstrType::ConstrPrimary,
+        bindings::ConstrType_CONSTR_UNIQUE => ast::ConstrType::ConstrUnique,
+        bindings::ConstrType_CONSTR_EXCLUSION => ast::ConstrType::ConstrExclusion,
+        bindings::ConstrType_CONSTR_FOREIGN => ast::ConstrType::ConstrForeign,
+        bindings::ConstrType_CONSTR_ATTR_DEFERRABLE => ast::ConstrType::ConstrAttrDeferrable,
+        bindings::ConstrType_CONSTR_ATTR_NOT_DEFERRABLE => ast::ConstrType::ConstrAttrNotDeferrable,
+        bindings::ConstrType_CONSTR_ATTR_DEFERRED => ast::ConstrType::ConstrAttrDeferred,
+        bindings::ConstrType_CONSTR_ATTR_IMMEDIATE => ast::ConstrType::ConstrAttrImmediate,
+        bindings::ConstrType_CONSTR_ATTR_ENFORCED => ast::ConstrType::ConstrAttrEnforced,
+        bindings::ConstrType_CONSTR_ATTR_NOT_ENFORCED => ast::ConstrType::ConstrAttrNotEnforced,
+        other => unreachable!("{other} is not a ConstrType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::ConstrType_CONSTR_NULL as i64 == ast::ConstrType::ConstrNull as i64);
+    assert!(bindings::ConstrType_CONSTR_NOTNULL as i64 == ast::ConstrType::ConstrNotnull as i64);
+    assert!(bindings::ConstrType_CONSTR_DEFAULT as i64 == ast::ConstrType::ConstrDefault as i64);
+    assert!(bindings::ConstrType_CONSTR_IDENTITY as i64 == ast::ConstrType::ConstrIdentity as i64);
+    assert!(
+        bindings::ConstrType_CONSTR_GENERATED as i64 == ast::ConstrType::ConstrGenerated as i64
+    );
+    assert!(bindings::ConstrType_CONSTR_CHECK as i64 == ast::ConstrType::ConstrCheck as i64);
+    assert!(bindings::ConstrType_CONSTR_PRIMARY as i64 == ast::ConstrType::ConstrPrimary as i64);
+    assert!(bindings::ConstrType_CONSTR_UNIQUE as i64 == ast::ConstrType::ConstrUnique as i64);
+    assert!(
+        bindings::ConstrType_CONSTR_EXCLUSION as i64 == ast::ConstrType::ConstrExclusion as i64
+    );
+    assert!(bindings::ConstrType_CONSTR_FOREIGN as i64 == ast::ConstrType::ConstrForeign as i64);
+    assert!(
+        bindings::ConstrType_CONSTR_ATTR_DEFERRABLE as i64
+            == ast::ConstrType::ConstrAttrDeferrable as i64
+    );
+    assert!(
+        bindings::ConstrType_CONSTR_ATTR_NOT_DEFERRABLE as i64
+            == ast::ConstrType::ConstrAttrNotDeferrable as i64
+    );
+    assert!(
+        bindings::ConstrType_CONSTR_ATTR_DEFERRED as i64
+            == ast::ConstrType::ConstrAttrDeferred as i64
+    );
+    assert!(
+        bindings::ConstrType_CONSTR_ATTR_IMMEDIATE as i64
+            == ast::ConstrType::ConstrAttrImmediate as i64
+    );
+    assert!(
+        bindings::ConstrType_CONSTR_ATTR_ENFORCED as i64
+            == ast::ConstrType::ConstrAttrEnforced as i64
+    );
+    assert!(
+        bindings::ConstrType_CONSTR_ATTR_NOT_ENFORCED as i64
+            == ast::ConstrType::ConstrAttrNotEnforced as i64
+    );
+};
+
+fn convert_def_elem_action(value: bindings::DefElemAction) -> ast::DefElemAction {
+    match value {
+        bindings::DefElemAction_DEFELEM_UNSPEC => ast::DefElemAction::DefelemUnspec,
+        bindings::DefElemAction_DEFELEM_SET => ast::DefElemAction::DefelemSet,
+        bindings::DefElemAction_DEFELEM_ADD => ast::DefElemAction::DefelemAdd,
+        bindings::DefElemAction_DEFELEM_DROP => ast::DefElemAction::DefelemDrop,
+        other => unreachable!("{other} is not a DefElemAction"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::DefElemAction_DEFELEM_UNSPEC as i64 == ast::DefElemAction::DefelemUnspec as i64
+    );
+    assert!(bindings::DefElemAction_DEFELEM_SET as i64 == ast::DefElemAction::DefelemSet as i64);
+    assert!(bindings::DefElemAction_DEFELEM_ADD as i64 == ast::DefElemAction::DefelemAdd as i64);
+    assert!(bindings::DefElemAction_DEFELEM_DROP as i64 == ast::DefElemAction::DefelemDrop as i64);
+};
+
+fn convert_discard_mode(value: bindings::DiscardMode) -> ast::DiscardMode {
+    match value {
+        bindings::DiscardMode_DISCARD_ALL => ast::DiscardMode::DiscardAll,
+        bindings::DiscardMode_DISCARD_PLANS => ast::DiscardMode::DiscardPlans,
+        bindings::DiscardMode_DISCARD_SEQUENCES => ast::DiscardMode::DiscardSequences,
+        bindings::DiscardMode_DISCARD_TEMP => ast::DiscardMode::DiscardTemp,
+        other => unreachable!("{other} is not a DiscardMode"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::DiscardMode_DISCARD_ALL as i64 == ast::DiscardMode::DiscardAll as i64);
+    assert!(bindings::DiscardMode_DISCARD_PLANS as i64 == ast::DiscardMode::DiscardPlans as i64);
+    assert!(
+        bindings::DiscardMode_DISCARD_SEQUENCES as i64 == ast::DiscardMode::DiscardSequences as i64
+    );
+    assert!(bindings::DiscardMode_DISCARD_TEMP as i64 == ast::DiscardMode::DiscardTemp as i64);
+};
+
+fn convert_drop_behavior(value: bindings::DropBehavior) -> ast::DropBehavior {
+    match value {
+        bindings::DropBehavior_DROP_RESTRICT => ast::DropBehavior::DropRestrict,
+        bindings::DropBehavior_DROP_CASCADE => ast::DropBehavior::DropCascade,
+        other => unreachable!("{other} is not a DropBehavior"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::DropBehavior_DROP_RESTRICT as i64 == ast::DropBehavior::DropRestrict as i64);
+    assert!(bindings::DropBehavior_DROP_CASCADE as i64 == ast::DropBehavior::DropCascade as i64);
+};
+
+fn convert_fetch_direction(value: bindings::FetchDirection) -> ast::FetchDirection {
+    match value {
+        bindings::FetchDirection_FETCH_FORWARD => ast::FetchDirection::FetchForward,
+        bindings::FetchDirection_FETCH_BACKWARD => ast::FetchDirection::FetchBackward,
+        bindings::FetchDirection_FETCH_ABSOLUTE => ast::FetchDirection::FetchAbsolute,
+        bindings::FetchDirection_FETCH_RELATIVE => ast::FetchDirection::FetchRelative,
+        other => unreachable!("{other} is not a FetchDirection"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::FetchDirection_FETCH_FORWARD as i64 == ast::FetchDirection::FetchForward as i64
+    );
+    assert!(
+        bindings::FetchDirection_FETCH_BACKWARD as i64 == ast::FetchDirection::FetchBackward as i64
+    );
+    assert!(
+        bindings::FetchDirection_FETCH_ABSOLUTE as i64 == ast::FetchDirection::FetchAbsolute as i64
+    );
+    assert!(
+        bindings::FetchDirection_FETCH_RELATIVE as i64 == ast::FetchDirection::FetchRelative as i64
+    );
+};
+
+fn convert_function_parameter_mode(
+    value: bindings::FunctionParameterMode,
+) -> ast::FunctionParameterMode {
+    match value {
+        bindings::FunctionParameterMode_FUNC_PARAM_IN => ast::FunctionParameterMode::FuncParamIn,
+        bindings::FunctionParameterMode_FUNC_PARAM_OUT => ast::FunctionParameterMode::FuncParamOut,
+        bindings::FunctionParameterMode_FUNC_PARAM_INOUT => {
+            ast::FunctionParameterMode::FuncParamInout
+        }
+        bindings::FunctionParameterMode_FUNC_PARAM_VARIADIC => {
+            ast::FunctionParameterMode::FuncParamVariadic
+        }
+        bindings::FunctionParameterMode_FUNC_PARAM_TABLE => {
+            ast::FunctionParameterMode::FuncParamTable
+        }
+        bindings::FunctionParameterMode_FUNC_PARAM_DEFAULT => {
+            ast::FunctionParameterMode::FuncParamDefault
+        }
+        other => unreachable!("{other} is not a FunctionParameterMode"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::FunctionParameterMode_FUNC_PARAM_IN as i64
+            == ast::FunctionParameterMode::FuncParamIn as i64
+    );
+    assert!(
+        bindings::FunctionParameterMode_FUNC_PARAM_OUT as i64
+            == ast::FunctionParameterMode::FuncParamOut as i64
+    );
+    assert!(
+        bindings::FunctionParameterMode_FUNC_PARAM_INOUT as i64
+            == ast::FunctionParameterMode::FuncParamInout as i64
+    );
+    assert!(
+        bindings::FunctionParameterMode_FUNC_PARAM_VARIADIC as i64
+            == ast::FunctionParameterMode::FuncParamVariadic as i64
+    );
+    assert!(
+        bindings::FunctionParameterMode_FUNC_PARAM_TABLE as i64
+            == ast::FunctionParameterMode::FuncParamTable as i64
+    );
+    assert!(
+        bindings::FunctionParameterMode_FUNC_PARAM_DEFAULT as i64
+            == ast::FunctionParameterMode::FuncParamDefault as i64
+    );
+};
+
+fn convert_grant_target_type(value: bindings::GrantTargetType) -> ast::GrantTargetType {
+    match value {
+        bindings::GrantTargetType_ACL_TARGET_OBJECT => ast::GrantTargetType::AclTargetObject,
+        bindings::GrantTargetType_ACL_TARGET_ALL_IN_SCHEMA => {
+            ast::GrantTargetType::AclTargetAllInSchema
+        }
+        bindings::GrantTargetType_ACL_TARGET_DEFAULTS => ast::GrantTargetType::AclTargetDefaults,
+        other => unreachable!("{other} is not a GrantTargetType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::GrantTargetType_ACL_TARGET_OBJECT as i64
+            == ast::GrantTargetType::AclTargetObject as i64
+    );
+    assert!(
+        bindings::GrantTargetType_ACL_TARGET_ALL_IN_SCHEMA as i64
+            == ast::GrantTargetType::AclTargetAllInSchema as i64
+    );
+    assert!(
+        bindings::GrantTargetType_ACL_TARGET_DEFAULTS as i64
+            == ast::GrantTargetType::AclTargetDefaults as i64
+    );
+};
+
+fn convert_grouping_set_kind(value: bindings::GroupingSetKind) -> ast::GroupingSetKind {
+    match value {
+        bindings::GroupingSetKind_GROUPING_SET_EMPTY => ast::GroupingSetKind::GroupingSetEmpty,
+        bindings::GroupingSetKind_GROUPING_SET_SIMPLE => ast::GroupingSetKind::GroupingSetSimple,
+        bindings::GroupingSetKind_GROUPING_SET_ROLLUP => ast::GroupingSetKind::GroupingSetRollup,
+        bindings::GroupingSetKind_GROUPING_SET_CUBE => ast::GroupingSetKind::GroupingSetCube,
+        bindings::GroupingSetKind_GROUPING_SET_SETS => ast::GroupingSetKind::GroupingSetSets,
+        other => unreachable!("{other} is not a GroupingSetKind"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::GroupingSetKind_GROUPING_SET_EMPTY as i64
+            == ast::GroupingSetKind::GroupingSetEmpty as i64
+    );
+    assert!(
+        bindings::GroupingSetKind_GROUPING_SET_SIMPLE as i64
+            == ast::GroupingSetKind::GroupingSetSimple as i64
+    );
+    assert!(
+        bindings::GroupingSetKind_GROUPING_SET_ROLLUP as i64
+            == ast::GroupingSetKind::GroupingSetRollup as i64
+    );
+    assert!(
+        bindings::GroupingSetKind_GROUPING_SET_CUBE as i64
+            == ast::GroupingSetKind::GroupingSetCube as i64
+    );
+    assert!(
+        bindings::GroupingSetKind_GROUPING_SET_SETS as i64
+            == ast::GroupingSetKind::GroupingSetSets as i64
+    );
+};
+
+fn convert_import_foreign_schema_type(
+    value: bindings::ImportForeignSchemaType,
+) -> ast::ImportForeignSchemaType {
+    match value {
+        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_ALL => {
+            ast::ImportForeignSchemaType::FdwImportSchemaAll
+        }
+        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_LIMIT_TO => {
+            ast::ImportForeignSchemaType::FdwImportSchemaLimitTo
+        }
+        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_EXCEPT => {
+            ast::ImportForeignSchemaType::FdwImportSchemaExcept
+        }
+        other => unreachable!("{other} is not a ImportForeignSchemaType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_ALL as i64
+            == ast::ImportForeignSchemaType::FdwImportSchemaAll as i64
+    );
+    assert!(
+        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_LIMIT_TO as i64
+            == ast::ImportForeignSchemaType::FdwImportSchemaLimitTo as i64
+    );
+    assert!(
+        bindings::ImportForeignSchemaType_FDW_IMPORT_SCHEMA_EXCEPT as i64
+            == ast::ImportForeignSchemaType::FdwImportSchemaExcept as i64
+    );
+};
+
+fn convert_join_type(value: bindings::JoinType) -> ast::JoinType {
+    match value {
+        bindings::JoinType_JOIN_INNER => ast::JoinType::JoinInner,
+        bindings::JoinType_JOIN_LEFT => ast::JoinType::JoinLeft,
+        bindings::JoinType_JOIN_FULL => ast::JoinType::JoinFull,
+        bindings::JoinType_JOIN_RIGHT => ast::JoinType::JoinRight,
+        bindings::JoinType_JOIN_SEMI => ast::JoinType::JoinSemi,
+        bindings::JoinType_JOIN_ANTI => ast::JoinType::JoinAnti,
+        bindings::JoinType_JOIN_RIGHT_SEMI => ast::JoinType::JoinRightSemi,
+        bindings::JoinType_JOIN_RIGHT_ANTI => ast::JoinType::JoinRightAnti,
+        bindings::JoinType_JOIN_UNIQUE_OUTER => ast::JoinType::JoinUniqueOuter,
+        bindings::JoinType_JOIN_UNIQUE_INNER => ast::JoinType::JoinUniqueInner,
+        other => unreachable!("{other} is not a JoinType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::JoinType_JOIN_INNER as i64 == ast::JoinType::JoinInner as i64);
+    assert!(bindings::JoinType_JOIN_LEFT as i64 == ast::JoinType::JoinLeft as i64);
+    assert!(bindings::JoinType_JOIN_FULL as i64 == ast::JoinType::JoinFull as i64);
+    assert!(bindings::JoinType_JOIN_RIGHT as i64 == ast::JoinType::JoinRight as i64);
+    assert!(bindings::JoinType_JOIN_SEMI as i64 == ast::JoinType::JoinSemi as i64);
+    assert!(bindings::JoinType_JOIN_ANTI as i64 == ast::JoinType::JoinAnti as i64);
+    assert!(bindings::JoinType_JOIN_RIGHT_SEMI as i64 == ast::JoinType::JoinRightSemi as i64);
+    assert!(bindings::JoinType_JOIN_RIGHT_ANTI as i64 == ast::JoinType::JoinRightAnti as i64);
+    assert!(bindings::JoinType_JOIN_UNIQUE_OUTER as i64 == ast::JoinType::JoinUniqueOuter as i64);
+    assert!(bindings::JoinType_JOIN_UNIQUE_INNER as i64 == ast::JoinType::JoinUniqueInner as i64);
+};
+
+fn convert_json_behavior_type(value: bindings::JsonBehaviorType) -> ast::JsonBehaviorType {
+    match value {
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_NULL => ast::JsonBehaviorType::JsonBehaviorNull,
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_ERROR => ast::JsonBehaviorType::JsonBehaviorError,
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY => ast::JsonBehaviorType::JsonBehaviorEmpty,
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_TRUE => ast::JsonBehaviorType::JsonBehaviorTrue,
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_FALSE => ast::JsonBehaviorType::JsonBehaviorFalse,
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_UNKNOWN => {
+            ast::JsonBehaviorType::JsonBehaviorUnknown
+        }
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY_ARRAY => {
+            ast::JsonBehaviorType::JsonBehaviorEmptyArray
+        }
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY_OBJECT => {
+            ast::JsonBehaviorType::JsonBehaviorEmptyObject
+        }
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_DEFAULT => {
+            ast::JsonBehaviorType::JsonBehaviorDefault
+        }
+        other => unreachable!("{other} is not a JsonBehaviorType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_NULL as i64
+            == ast::JsonBehaviorType::JsonBehaviorNull as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_ERROR as i64
+            == ast::JsonBehaviorType::JsonBehaviorError as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY as i64
+            == ast::JsonBehaviorType::JsonBehaviorEmpty as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_TRUE as i64
+            == ast::JsonBehaviorType::JsonBehaviorTrue as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_FALSE as i64
+            == ast::JsonBehaviorType::JsonBehaviorFalse as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_UNKNOWN as i64
+            == ast::JsonBehaviorType::JsonBehaviorUnknown as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY_ARRAY as i64
+            == ast::JsonBehaviorType::JsonBehaviorEmptyArray as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_EMPTY_OBJECT as i64
+            == ast::JsonBehaviorType::JsonBehaviorEmptyObject as i64
+    );
+    assert!(
+        bindings::JsonBehaviorType_JSON_BEHAVIOR_DEFAULT as i64
+            == ast::JsonBehaviorType::JsonBehaviorDefault as i64
+    );
+};
+
+fn convert_json_constructor_type(value: bindings::JsonConstructorType) -> ast::JsonConstructorType {
+    match value {
+        bindings::JsonConstructorType_JSCTOR_JSON_OBJECT => {
+            ast::JsonConstructorType::JsctorJsonObject
+        }
+        bindings::JsonConstructorType_JSCTOR_JSON_ARRAY => {
+            ast::JsonConstructorType::JsctorJsonArray
+        }
+        bindings::JsonConstructorType_JSCTOR_JSON_OBJECTAGG => {
+            ast::JsonConstructorType::JsctorJsonObjectagg
+        }
+        bindings::JsonConstructorType_JSCTOR_JSON_ARRAYAGG => {
+            ast::JsonConstructorType::JsctorJsonArrayagg
+        }
+        bindings::JsonConstructorType_JSCTOR_JSON_PARSE => {
+            ast::JsonConstructorType::JsctorJsonParse
+        }
+        bindings::JsonConstructorType_JSCTOR_JSON_SCALAR => {
+            ast::JsonConstructorType::JsctorJsonScalar
+        }
+        bindings::JsonConstructorType_JSCTOR_JSON_SERIALIZE => {
+            ast::JsonConstructorType::JsctorJsonSerialize
+        }
+        other => unreachable!("{other} is not a JsonConstructorType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_OBJECT as i64
+            == ast::JsonConstructorType::JsctorJsonObject as i64
+    );
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_ARRAY as i64
+            == ast::JsonConstructorType::JsctorJsonArray as i64
+    );
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_OBJECTAGG as i64
+            == ast::JsonConstructorType::JsctorJsonObjectagg as i64
+    );
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_ARRAYAGG as i64
+            == ast::JsonConstructorType::JsctorJsonArrayagg as i64
+    );
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_PARSE as i64
+            == ast::JsonConstructorType::JsctorJsonParse as i64
+    );
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_SCALAR as i64
+            == ast::JsonConstructorType::JsctorJsonScalar as i64
+    );
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_SERIALIZE as i64
+            == ast::JsonConstructorType::JsctorJsonSerialize as i64
+    );
+};
+
+fn convert_json_encoding(value: bindings::JsonEncoding) -> ast::JsonEncoding {
+    match value {
+        bindings::JsonEncoding_JS_ENC_DEFAULT => ast::JsonEncoding::JsEncDefault,
+        bindings::JsonEncoding_JS_ENC_UTF8 => ast::JsonEncoding::JsEncUtf8,
+        bindings::JsonEncoding_JS_ENC_UTF16 => ast::JsonEncoding::JsEncUtf16,
+        bindings::JsonEncoding_JS_ENC_UTF32 => ast::JsonEncoding::JsEncUtf32,
+        other => unreachable!("{other} is not a JsonEncoding"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::JsonEncoding_JS_ENC_DEFAULT as i64 == ast::JsonEncoding::JsEncDefault as i64);
+    assert!(bindings::JsonEncoding_JS_ENC_UTF8 as i64 == ast::JsonEncoding::JsEncUtf8 as i64);
+    assert!(bindings::JsonEncoding_JS_ENC_UTF16 as i64 == ast::JsonEncoding::JsEncUtf16 as i64);
+    assert!(bindings::JsonEncoding_JS_ENC_UTF32 as i64 == ast::JsonEncoding::JsEncUtf32 as i64);
+};
+
+fn convert_json_expr_op(value: bindings::JsonExprOp) -> ast::JsonExprOp {
+    match value {
+        bindings::JsonExprOp_JSON_EXISTS_OP => ast::JsonExprOp::JsonExistsOp,
+        bindings::JsonExprOp_JSON_QUERY_OP => ast::JsonExprOp::JsonQueryOp,
+        bindings::JsonExprOp_JSON_VALUE_OP => ast::JsonExprOp::JsonValueOp,
+        bindings::JsonExprOp_JSON_TABLE_OP => ast::JsonExprOp::JsonTableOp,
+        other => unreachable!("{other} is not a JsonExprOp"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::JsonExprOp_JSON_EXISTS_OP as i64 == ast::JsonExprOp::JsonExistsOp as i64);
+    assert!(bindings::JsonExprOp_JSON_QUERY_OP as i64 == ast::JsonExprOp::JsonQueryOp as i64);
+    assert!(bindings::JsonExprOp_JSON_VALUE_OP as i64 == ast::JsonExprOp::JsonValueOp as i64);
+    assert!(bindings::JsonExprOp_JSON_TABLE_OP as i64 == ast::JsonExprOp::JsonTableOp as i64);
+};
+
+fn convert_json_format_type(value: bindings::JsonFormatType) -> ast::JsonFormatType {
+    match value {
+        bindings::JsonFormatType_JS_FORMAT_DEFAULT => ast::JsonFormatType::JsFormatDefault,
+        bindings::JsonFormatType_JS_FORMAT_JSON => ast::JsonFormatType::JsFormatJson,
+        bindings::JsonFormatType_JS_FORMAT_JSONB => ast::JsonFormatType::JsFormatJsonb,
+        other => unreachable!("{other} is not a JsonFormatType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::JsonFormatType_JS_FORMAT_DEFAULT as i64
+            == ast::JsonFormatType::JsFormatDefault as i64
+    );
+    assert!(
+        bindings::JsonFormatType_JS_FORMAT_JSON as i64 == ast::JsonFormatType::JsFormatJson as i64
+    );
+    assert!(
+        bindings::JsonFormatType_JS_FORMAT_JSONB as i64
+            == ast::JsonFormatType::JsFormatJsonb as i64
+    );
+};
+
+fn convert_json_quotes(value: bindings::JsonQuotes) -> ast::JsonQuotes {
+    match value {
+        bindings::JsonQuotes_JS_QUOTES_UNSPEC => ast::JsonQuotes::JsQuotesUnspec,
+        bindings::JsonQuotes_JS_QUOTES_KEEP => ast::JsonQuotes::JsQuotesKeep,
+        bindings::JsonQuotes_JS_QUOTES_OMIT => ast::JsonQuotes::JsQuotesOmit,
+        other => unreachable!("{other} is not a JsonQuotes"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::JsonQuotes_JS_QUOTES_UNSPEC as i64 == ast::JsonQuotes::JsQuotesUnspec as i64);
+    assert!(bindings::JsonQuotes_JS_QUOTES_KEEP as i64 == ast::JsonQuotes::JsQuotesKeep as i64);
+    assert!(bindings::JsonQuotes_JS_QUOTES_OMIT as i64 == ast::JsonQuotes::JsQuotesOmit as i64);
+};
+
+fn convert_json_table_column_type(
+    value: bindings::JsonTableColumnType,
+) -> ast::JsonTableColumnType {
+    match value {
+        bindings::JsonTableColumnType_JTC_FOR_ORDINALITY => {
+            ast::JsonTableColumnType::JtcForOrdinality
+        }
+        bindings::JsonTableColumnType_JTC_REGULAR => ast::JsonTableColumnType::JtcRegular,
+        bindings::JsonTableColumnType_JTC_EXISTS => ast::JsonTableColumnType::JtcExists,
+        bindings::JsonTableColumnType_JTC_FORMATTED => ast::JsonTableColumnType::JtcFormatted,
+        bindings::JsonTableColumnType_JTC_NESTED => ast::JsonTableColumnType::JtcNested,
+        other => unreachable!("{other} is not a JsonTableColumnType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::JsonTableColumnType_JTC_FOR_ORDINALITY as i64
+            == ast::JsonTableColumnType::JtcForOrdinality as i64
+    );
+    assert!(
+        bindings::JsonTableColumnType_JTC_REGULAR as i64
+            == ast::JsonTableColumnType::JtcRegular as i64
+    );
+    assert!(
+        bindings::JsonTableColumnType_JTC_EXISTS as i64
+            == ast::JsonTableColumnType::JtcExists as i64
+    );
+    assert!(
+        bindings::JsonTableColumnType_JTC_FORMATTED as i64
+            == ast::JsonTableColumnType::JtcFormatted as i64
+    );
+    assert!(
+        bindings::JsonTableColumnType_JTC_NESTED as i64
+            == ast::JsonTableColumnType::JtcNested as i64
+    );
+};
+
+fn convert_json_value_type(value: bindings::JsonValueType) -> ast::JsonValueType {
+    match value {
+        bindings::JsonValueType_JS_TYPE_ANY => ast::JsonValueType::JsTypeAny,
+        bindings::JsonValueType_JS_TYPE_OBJECT => ast::JsonValueType::JsTypeObject,
+        bindings::JsonValueType_JS_TYPE_ARRAY => ast::JsonValueType::JsTypeArray,
+        bindings::JsonValueType_JS_TYPE_SCALAR => ast::JsonValueType::JsTypeScalar,
+        other => unreachable!("{other} is not a JsonValueType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::JsonValueType_JS_TYPE_ANY as i64 == ast::JsonValueType::JsTypeAny as i64);
+    assert!(
+        bindings::JsonValueType_JS_TYPE_OBJECT as i64 == ast::JsonValueType::JsTypeObject as i64
+    );
+    assert!(bindings::JsonValueType_JS_TYPE_ARRAY as i64 == ast::JsonValueType::JsTypeArray as i64);
+    assert!(
+        bindings::JsonValueType_JS_TYPE_SCALAR as i64 == ast::JsonValueType::JsTypeScalar as i64
+    );
+};
+
+fn convert_json_wrapper(value: bindings::JsonWrapper) -> ast::JsonWrapper {
+    match value {
+        bindings::JsonWrapper_JSW_UNSPEC => ast::JsonWrapper::JswUnspec,
+        bindings::JsonWrapper_JSW_NONE => ast::JsonWrapper::JswNone,
+        bindings::JsonWrapper_JSW_CONDITIONAL => ast::JsonWrapper::JswConditional,
+        bindings::JsonWrapper_JSW_UNCONDITIONAL => ast::JsonWrapper::JswUnconditional,
+        other => unreachable!("{other} is not a JsonWrapper"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::JsonWrapper_JSW_UNSPEC as i64 == ast::JsonWrapper::JswUnspec as i64);
+    assert!(bindings::JsonWrapper_JSW_NONE as i64 == ast::JsonWrapper::JswNone as i64);
+    assert!(
+        bindings::JsonWrapper_JSW_CONDITIONAL as i64 == ast::JsonWrapper::JswConditional as i64
+    );
+    assert!(
+        bindings::JsonWrapper_JSW_UNCONDITIONAL as i64 == ast::JsonWrapper::JswUnconditional as i64
+    );
+};
+
+fn convert_limit_option(value: bindings::LimitOption) -> ast::LimitOption {
+    match value {
+        bindings::LimitOption_LIMIT_OPTION_COUNT => ast::LimitOption::Count,
+        bindings::LimitOption_LIMIT_OPTION_WITH_TIES => ast::LimitOption::WithTies,
+        other => unreachable!("{other} is not a LimitOption"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::LimitOption_LIMIT_OPTION_COUNT as i64 == ast::LimitOption::Count as i64);
+    assert!(
+        bindings::LimitOption_LIMIT_OPTION_WITH_TIES as i64 == ast::LimitOption::WithTies as i64
+    );
+};
+
+fn convert_lock_clause_strength(value: bindings::LockClauseStrength) -> ast::LockClauseStrength {
+    match value {
+        bindings::LockClauseStrength_LCS_NONE => ast::LockClauseStrength::LcsNone,
+        bindings::LockClauseStrength_LCS_FORKEYSHARE => ast::LockClauseStrength::LcsForkeyshare,
+        bindings::LockClauseStrength_LCS_FORSHARE => ast::LockClauseStrength::LcsForshare,
+        bindings::LockClauseStrength_LCS_FORNOKEYUPDATE => {
+            ast::LockClauseStrength::LcsFornokeyupdate
+        }
+        bindings::LockClauseStrength_LCS_FORUPDATE => ast::LockClauseStrength::LcsForupdate,
+        other => unreachable!("{other} is not a LockClauseStrength"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::LockClauseStrength_LCS_NONE as i64 == ast::LockClauseStrength::LcsNone as i64
+    );
+    assert!(
+        bindings::LockClauseStrength_LCS_FORKEYSHARE as i64
+            == ast::LockClauseStrength::LcsForkeyshare as i64
+    );
+    assert!(
+        bindings::LockClauseStrength_LCS_FORSHARE as i64
+            == ast::LockClauseStrength::LcsForshare as i64
+    );
+    assert!(
+        bindings::LockClauseStrength_LCS_FORNOKEYUPDATE as i64
+            == ast::LockClauseStrength::LcsFornokeyupdate as i64
+    );
+    assert!(
+        bindings::LockClauseStrength_LCS_FORUPDATE as i64
+            == ast::LockClauseStrength::LcsForupdate as i64
+    );
+};
+
+fn convert_lock_wait_policy(value: bindings::LockWaitPolicy) -> ast::LockWaitPolicy {
+    match value {
+        bindings::LockWaitPolicy_LockWaitBlock => ast::LockWaitPolicy::LockWaitBlock,
+        bindings::LockWaitPolicy_LockWaitSkip => ast::LockWaitPolicy::LockWaitSkip,
+        bindings::LockWaitPolicy_LockWaitError => ast::LockWaitPolicy::LockWaitError,
+        other => unreachable!("{other} is not a LockWaitPolicy"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::LockWaitPolicy_LockWaitBlock as i64 == ast::LockWaitPolicy::LockWaitBlock as i64
+    );
+    assert!(
+        bindings::LockWaitPolicy_LockWaitSkip as i64 == ast::LockWaitPolicy::LockWaitSkip as i64
+    );
+    assert!(
+        bindings::LockWaitPolicy_LockWaitError as i64 == ast::LockWaitPolicy::LockWaitError as i64
+    );
+};
+
+fn convert_merge_match_kind(value: bindings::MergeMatchKind) -> ast::MergeMatchKind {
+    match value {
+        bindings::MergeMatchKind_MERGE_WHEN_MATCHED => ast::MergeMatchKind::MergeWhenMatched,
+        bindings::MergeMatchKind_MERGE_WHEN_NOT_MATCHED_BY_SOURCE => {
+            ast::MergeMatchKind::MergeWhenNotMatchedBySource
+        }
+        bindings::MergeMatchKind_MERGE_WHEN_NOT_MATCHED_BY_TARGET => {
+            ast::MergeMatchKind::MergeWhenNotMatchedByTarget
+        }
+        other => unreachable!("{other} is not a MergeMatchKind"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::MergeMatchKind_MERGE_WHEN_MATCHED as i64
+            == ast::MergeMatchKind::MergeWhenMatched as i64
+    );
+    assert!(
+        bindings::MergeMatchKind_MERGE_WHEN_NOT_MATCHED_BY_SOURCE as i64
+            == ast::MergeMatchKind::MergeWhenNotMatchedBySource as i64
+    );
+    assert!(
+        bindings::MergeMatchKind_MERGE_WHEN_NOT_MATCHED_BY_TARGET as i64
+            == ast::MergeMatchKind::MergeWhenNotMatchedByTarget as i64
+    );
+};
+
+fn convert_min_max_op(value: bindings::MinMaxOp) -> ast::MinMaxOp {
+    match value {
+        bindings::MinMaxOp_IS_GREATEST => ast::MinMaxOp::IsGreatest,
+        bindings::MinMaxOp_IS_LEAST => ast::MinMaxOp::IsLeast,
+        other => unreachable!("{other} is not a MinMaxOp"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::MinMaxOp_IS_GREATEST as i64 == ast::MinMaxOp::IsGreatest as i64);
+    assert!(bindings::MinMaxOp_IS_LEAST as i64 == ast::MinMaxOp::IsLeast as i64);
+};
+
+fn convert_null_test_type(value: bindings::NullTestType) -> ast::NullTestType {
+    match value {
+        bindings::NullTestType_IS_NULL => ast::NullTestType::IsNull,
+        bindings::NullTestType_IS_NOT_NULL => ast::NullTestType::IsNotNull,
+        other => unreachable!("{other} is not a NullTestType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::NullTestType_IS_NULL as i64 == ast::NullTestType::IsNull as i64);
+    assert!(bindings::NullTestType_IS_NOT_NULL as i64 == ast::NullTestType::IsNotNull as i64);
+};
+
+fn convert_object_type(value: bindings::ObjectType) -> ast::ObjectType {
+    match value {
+        bindings::ObjectType_OBJECT_ACCESS_METHOD => ast::ObjectType::ObjectAccessMethod,
+        bindings::ObjectType_OBJECT_AGGREGATE => ast::ObjectType::ObjectAggregate,
+        bindings::ObjectType_OBJECT_AMOP => ast::ObjectType::ObjectAmop,
+        bindings::ObjectType_OBJECT_AMPROC => ast::ObjectType::ObjectAmproc,
+        bindings::ObjectType_OBJECT_ATTRIBUTE => ast::ObjectType::ObjectAttribute,
+        bindings::ObjectType_OBJECT_CAST => ast::ObjectType::ObjectCast,
+        bindings::ObjectType_OBJECT_COLUMN => ast::ObjectType::ObjectColumn,
+        bindings::ObjectType_OBJECT_COLLATION => ast::ObjectType::ObjectCollation,
+        bindings::ObjectType_OBJECT_CONVERSION => ast::ObjectType::ObjectConversion,
+        bindings::ObjectType_OBJECT_DATABASE => ast::ObjectType::ObjectDatabase,
+        bindings::ObjectType_OBJECT_DEFAULT => ast::ObjectType::ObjectDefault,
+        bindings::ObjectType_OBJECT_DEFACL => ast::ObjectType::ObjectDefacl,
+        bindings::ObjectType_OBJECT_DOMAIN => ast::ObjectType::ObjectDomain,
+        bindings::ObjectType_OBJECT_DOMCONSTRAINT => ast::ObjectType::ObjectDomconstraint,
+        bindings::ObjectType_OBJECT_EVENT_TRIGGER => ast::ObjectType::ObjectEventTrigger,
+        bindings::ObjectType_OBJECT_EXTENSION => ast::ObjectType::ObjectExtension,
+        bindings::ObjectType_OBJECT_FDW => ast::ObjectType::ObjectFdw,
+        bindings::ObjectType_OBJECT_FOREIGN_SERVER => ast::ObjectType::ObjectForeignServer,
+        bindings::ObjectType_OBJECT_FOREIGN_TABLE => ast::ObjectType::ObjectForeignTable,
+        bindings::ObjectType_OBJECT_FUNCTION => ast::ObjectType::ObjectFunction,
+        bindings::ObjectType_OBJECT_INDEX => ast::ObjectType::ObjectIndex,
+        bindings::ObjectType_OBJECT_LANGUAGE => ast::ObjectType::ObjectLanguage,
+        bindings::ObjectType_OBJECT_LARGEOBJECT => ast::ObjectType::ObjectLargeobject,
+        bindings::ObjectType_OBJECT_MATVIEW => ast::ObjectType::ObjectMatview,
+        bindings::ObjectType_OBJECT_OPCLASS => ast::ObjectType::ObjectOpclass,
+        bindings::ObjectType_OBJECT_OPERATOR => ast::ObjectType::ObjectOperator,
+        bindings::ObjectType_OBJECT_OPFAMILY => ast::ObjectType::ObjectOpfamily,
+        bindings::ObjectType_OBJECT_PARAMETER_ACL => ast::ObjectType::ObjectParameterAcl,
+        bindings::ObjectType_OBJECT_POLICY => ast::ObjectType::ObjectPolicy,
+        bindings::ObjectType_OBJECT_PROCEDURE => ast::ObjectType::ObjectProcedure,
+        bindings::ObjectType_OBJECT_PUBLICATION => ast::ObjectType::ObjectPublication,
+        bindings::ObjectType_OBJECT_PUBLICATION_NAMESPACE => {
+            ast::ObjectType::ObjectPublicationNamespace
+        }
+        bindings::ObjectType_OBJECT_PUBLICATION_REL => ast::ObjectType::ObjectPublicationRel,
+        bindings::ObjectType_OBJECT_ROLE => ast::ObjectType::ObjectRole,
+        bindings::ObjectType_OBJECT_ROUTINE => ast::ObjectType::ObjectRoutine,
+        bindings::ObjectType_OBJECT_RULE => ast::ObjectType::ObjectRule,
+        bindings::ObjectType_OBJECT_SCHEMA => ast::ObjectType::ObjectSchema,
+        bindings::ObjectType_OBJECT_SEQUENCE => ast::ObjectType::ObjectSequence,
+        bindings::ObjectType_OBJECT_SUBSCRIPTION => ast::ObjectType::ObjectSubscription,
+        bindings::ObjectType_OBJECT_STATISTIC_EXT => ast::ObjectType::ObjectStatisticExt,
+        bindings::ObjectType_OBJECT_TABCONSTRAINT => ast::ObjectType::ObjectTabconstraint,
+        bindings::ObjectType_OBJECT_TABLE => ast::ObjectType::ObjectTable,
+        bindings::ObjectType_OBJECT_TABLESPACE => ast::ObjectType::ObjectTablespace,
+        bindings::ObjectType_OBJECT_TRANSFORM => ast::ObjectType::ObjectTransform,
+        bindings::ObjectType_OBJECT_TRIGGER => ast::ObjectType::ObjectTrigger,
+        bindings::ObjectType_OBJECT_TSCONFIGURATION => ast::ObjectType::ObjectTsconfiguration,
+        bindings::ObjectType_OBJECT_TSDICTIONARY => ast::ObjectType::ObjectTsdictionary,
+        bindings::ObjectType_OBJECT_TSPARSER => ast::ObjectType::ObjectTsparser,
+        bindings::ObjectType_OBJECT_TSTEMPLATE => ast::ObjectType::ObjectTstemplate,
+        bindings::ObjectType_OBJECT_TYPE => ast::ObjectType::ObjectType,
+        bindings::ObjectType_OBJECT_USER_MAPPING => ast::ObjectType::ObjectUserMapping,
+        bindings::ObjectType_OBJECT_VIEW => ast::ObjectType::ObjectView,
+        other => unreachable!("{other} is not a ObjectType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::ObjectType_OBJECT_ACCESS_METHOD as i64
+            == ast::ObjectType::ObjectAccessMethod as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_AGGREGATE as i64 == ast::ObjectType::ObjectAggregate as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_AMOP as i64 == ast::ObjectType::ObjectAmop as i64);
+    assert!(bindings::ObjectType_OBJECT_AMPROC as i64 == ast::ObjectType::ObjectAmproc as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_ATTRIBUTE as i64 == ast::ObjectType::ObjectAttribute as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_CAST as i64 == ast::ObjectType::ObjectCast as i64);
+    assert!(bindings::ObjectType_OBJECT_COLUMN as i64 == ast::ObjectType::ObjectColumn as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_COLLATION as i64 == ast::ObjectType::ObjectCollation as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_CONVERSION as i64 == ast::ObjectType::ObjectConversion as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_DATABASE as i64 == ast::ObjectType::ObjectDatabase as i64);
+    assert!(bindings::ObjectType_OBJECT_DEFAULT as i64 == ast::ObjectType::ObjectDefault as i64);
+    assert!(bindings::ObjectType_OBJECT_DEFACL as i64 == ast::ObjectType::ObjectDefacl as i64);
+    assert!(bindings::ObjectType_OBJECT_DOMAIN as i64 == ast::ObjectType::ObjectDomain as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_DOMCONSTRAINT as i64
+            == ast::ObjectType::ObjectDomconstraint as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_EVENT_TRIGGER as i64
+            == ast::ObjectType::ObjectEventTrigger as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_EXTENSION as i64 == ast::ObjectType::ObjectExtension as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_FDW as i64 == ast::ObjectType::ObjectFdw as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_FOREIGN_SERVER as i64
+            == ast::ObjectType::ObjectForeignServer as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_FOREIGN_TABLE as i64
+            == ast::ObjectType::ObjectForeignTable as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_FUNCTION as i64 == ast::ObjectType::ObjectFunction as i64);
+    assert!(bindings::ObjectType_OBJECT_INDEX as i64 == ast::ObjectType::ObjectIndex as i64);
+    assert!(bindings::ObjectType_OBJECT_LANGUAGE as i64 == ast::ObjectType::ObjectLanguage as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_LARGEOBJECT as i64 == ast::ObjectType::ObjectLargeobject as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_MATVIEW as i64 == ast::ObjectType::ObjectMatview as i64);
+    assert!(bindings::ObjectType_OBJECT_OPCLASS as i64 == ast::ObjectType::ObjectOpclass as i64);
+    assert!(bindings::ObjectType_OBJECT_OPERATOR as i64 == ast::ObjectType::ObjectOperator as i64);
+    assert!(bindings::ObjectType_OBJECT_OPFAMILY as i64 == ast::ObjectType::ObjectOpfamily as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_PARAMETER_ACL as i64
+            == ast::ObjectType::ObjectParameterAcl as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_POLICY as i64 == ast::ObjectType::ObjectPolicy as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_PROCEDURE as i64 == ast::ObjectType::ObjectProcedure as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_PUBLICATION as i64 == ast::ObjectType::ObjectPublication as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_PUBLICATION_NAMESPACE as i64
+            == ast::ObjectType::ObjectPublicationNamespace as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_PUBLICATION_REL as i64
+            == ast::ObjectType::ObjectPublicationRel as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_ROLE as i64 == ast::ObjectType::ObjectRole as i64);
+    assert!(bindings::ObjectType_OBJECT_ROUTINE as i64 == ast::ObjectType::ObjectRoutine as i64);
+    assert!(bindings::ObjectType_OBJECT_RULE as i64 == ast::ObjectType::ObjectRule as i64);
+    assert!(bindings::ObjectType_OBJECT_SCHEMA as i64 == ast::ObjectType::ObjectSchema as i64);
+    assert!(bindings::ObjectType_OBJECT_SEQUENCE as i64 == ast::ObjectType::ObjectSequence as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_SUBSCRIPTION as i64
+            == ast::ObjectType::ObjectSubscription as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_STATISTIC_EXT as i64
+            == ast::ObjectType::ObjectStatisticExt as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_TABCONSTRAINT as i64
+            == ast::ObjectType::ObjectTabconstraint as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_TABLE as i64 == ast::ObjectType::ObjectTable as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_TABLESPACE as i64 == ast::ObjectType::ObjectTablespace as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_TRANSFORM as i64 == ast::ObjectType::ObjectTransform as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_TRIGGER as i64 == ast::ObjectType::ObjectTrigger as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_TSCONFIGURATION as i64
+            == ast::ObjectType::ObjectTsconfiguration as i64
+    );
+    assert!(
+        bindings::ObjectType_OBJECT_TSDICTIONARY as i64
+            == ast::ObjectType::ObjectTsdictionary as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_TSPARSER as i64 == ast::ObjectType::ObjectTsparser as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_TSTEMPLATE as i64 == ast::ObjectType::ObjectTstemplate as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_TYPE as i64 == ast::ObjectType::ObjectType as i64);
+    assert!(
+        bindings::ObjectType_OBJECT_USER_MAPPING as i64
+            == ast::ObjectType::ObjectUserMapping as i64
+    );
+    assert!(bindings::ObjectType_OBJECT_VIEW as i64 == ast::ObjectType::ObjectView as i64);
+};
+
+fn convert_on_commit_action(value: bindings::OnCommitAction) -> ast::OnCommitAction {
+    match value {
+        bindings::OnCommitAction_ONCOMMIT_NOOP => ast::OnCommitAction::OncommitNoop,
+        bindings::OnCommitAction_ONCOMMIT_PRESERVE_ROWS => {
+            ast::OnCommitAction::OncommitPreserveRows
+        }
+        bindings::OnCommitAction_ONCOMMIT_DELETE_ROWS => ast::OnCommitAction::OncommitDeleteRows,
+        bindings::OnCommitAction_ONCOMMIT_DROP => ast::OnCommitAction::OncommitDrop,
+        other => unreachable!("{other} is not a OnCommitAction"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::OnCommitAction_ONCOMMIT_NOOP as i64 == ast::OnCommitAction::OncommitNoop as i64
+    );
+    assert!(
+        bindings::OnCommitAction_ONCOMMIT_PRESERVE_ROWS as i64
+            == ast::OnCommitAction::OncommitPreserveRows as i64
+    );
+    assert!(
+        bindings::OnCommitAction_ONCOMMIT_DELETE_ROWS as i64
+            == ast::OnCommitAction::OncommitDeleteRows as i64
+    );
+    assert!(
+        bindings::OnCommitAction_ONCOMMIT_DROP as i64 == ast::OnCommitAction::OncommitDrop as i64
+    );
+};
+
+fn convert_on_conflict_action(value: bindings::OnConflictAction) -> ast::OnConflictAction {
+    match value {
+        bindings::OnConflictAction_ONCONFLICT_NONE => ast::OnConflictAction::OnconflictNone,
+        bindings::OnConflictAction_ONCONFLICT_NOTHING => ast::OnConflictAction::OnconflictNothing,
+        bindings::OnConflictAction_ONCONFLICT_UPDATE => ast::OnConflictAction::OnconflictUpdate,
+        other => unreachable!("{other} is not a OnConflictAction"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::OnConflictAction_ONCONFLICT_NONE as i64
+            == ast::OnConflictAction::OnconflictNone as i64
+    );
+    assert!(
+        bindings::OnConflictAction_ONCONFLICT_NOTHING as i64
+            == ast::OnConflictAction::OnconflictNothing as i64
+    );
+    assert!(
+        bindings::OnConflictAction_ONCONFLICT_UPDATE as i64
+            == ast::OnConflictAction::OnconflictUpdate as i64
+    );
+};
+
+fn convert_overriding_kind(value: bindings::OverridingKind) -> ast::OverridingKind {
+    match value {
+        bindings::OverridingKind_OVERRIDING_NOT_SET => ast::OverridingKind::OverridingNotSet,
+        bindings::OverridingKind_OVERRIDING_USER_VALUE => ast::OverridingKind::OverridingUserValue,
+        bindings::OverridingKind_OVERRIDING_SYSTEM_VALUE => {
+            ast::OverridingKind::OverridingSystemValue
+        }
+        other => unreachable!("{other} is not a OverridingKind"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::OverridingKind_OVERRIDING_NOT_SET as i64
+            == ast::OverridingKind::OverridingNotSet as i64
+    );
+    assert!(
+        bindings::OverridingKind_OVERRIDING_USER_VALUE as i64
+            == ast::OverridingKind::OverridingUserValue as i64
+    );
+    assert!(
+        bindings::OverridingKind_OVERRIDING_SYSTEM_VALUE as i64
+            == ast::OverridingKind::OverridingSystemValue as i64
+    );
+};
+
+fn convert_param_kind(value: bindings::ParamKind) -> ast::ParamKind {
+    match value {
+        bindings::ParamKind_PARAM_EXTERN => ast::ParamKind::ParamExtern,
+        bindings::ParamKind_PARAM_EXEC => ast::ParamKind::ParamExec,
+        bindings::ParamKind_PARAM_SUBLINK => ast::ParamKind::ParamSublink,
+        bindings::ParamKind_PARAM_MULTIEXPR => ast::ParamKind::ParamMultiexpr,
+        other => unreachable!("{other} is not a ParamKind"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::ParamKind_PARAM_EXTERN as i64 == ast::ParamKind::ParamExtern as i64);
+    assert!(bindings::ParamKind_PARAM_EXEC as i64 == ast::ParamKind::ParamExec as i64);
+    assert!(bindings::ParamKind_PARAM_SUBLINK as i64 == ast::ParamKind::ParamSublink as i64);
+    assert!(bindings::ParamKind_PARAM_MULTIEXPR as i64 == ast::ParamKind::ParamMultiexpr as i64);
+};
+
+fn convert_partition_range_datum_kind(
+    value: bindings::PartitionRangeDatumKind,
+) -> ast::PartitionRangeDatumKind {
+    match value {
+        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_MINVALUE => {
+            ast::PartitionRangeDatumKind::PartitionRangeDatumMinvalue
+        }
+        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_VALUE => {
+            ast::PartitionRangeDatumKind::PartitionRangeDatumValue
+        }
+        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_MAXVALUE => {
+            ast::PartitionRangeDatumKind::PartitionRangeDatumMaxvalue
+        }
+        other => unreachable!("{other} is not a PartitionRangeDatumKind"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_MINVALUE as i64
+            == ast::PartitionRangeDatumKind::PartitionRangeDatumMinvalue as i64
+    );
+    assert!(
+        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_VALUE as i64
+            == ast::PartitionRangeDatumKind::PartitionRangeDatumValue as i64
+    );
+    assert!(
+        bindings::PartitionRangeDatumKind_PARTITION_RANGE_DATUM_MAXVALUE as i64
+            == ast::PartitionRangeDatumKind::PartitionRangeDatumMaxvalue as i64
+    );
+};
+
+fn convert_partition_strategy(value: bindings::PartitionStrategy) -> ast::PartitionStrategy {
+    match value {
+        bindings::PartitionStrategy_PARTITION_STRATEGY_LIST => ast::PartitionStrategy::List,
+        bindings::PartitionStrategy_PARTITION_STRATEGY_RANGE => ast::PartitionStrategy::Range,
+        bindings::PartitionStrategy_PARTITION_STRATEGY_HASH => ast::PartitionStrategy::Hash,
+        other => unreachable!("{other} is not a PartitionStrategy"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::PartitionStrategy_PARTITION_STRATEGY_LIST as i64
+            == ast::PartitionStrategy::List as i64
+    );
+    assert!(
+        bindings::PartitionStrategy_PARTITION_STRATEGY_RANGE as i64
+            == ast::PartitionStrategy::Range as i64
+    );
+    assert!(
+        bindings::PartitionStrategy_PARTITION_STRATEGY_HASH as i64
+            == ast::PartitionStrategy::Hash as i64
+    );
+};
+
+fn convert_publication_obj_spec_type(
+    value: bindings::PublicationObjSpecType,
+) -> ast::PublicationObjSpecType {
+    match value {
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLE => {
+            ast::PublicationObjSpecType::PublicationobjTable
+        }
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_SCHEMA => {
+            ast::PublicationObjSpecType::PublicationobjTablesInSchema
+        }
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA => {
+            ast::PublicationObjSpecType::PublicationobjTablesInCurSchema
+        }
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_CONTINUATION => {
+            ast::PublicationObjSpecType::PublicationobjContinuation
+        }
+        other => unreachable!("{other} is not a PublicationObjSpecType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLE as i64
+            == ast::PublicationObjSpecType::PublicationobjTable as i64
+    );
+    assert!(
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_SCHEMA as i64
+            == ast::PublicationObjSpecType::PublicationobjTablesInSchema as i64
+    );
+    assert!(
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA as i64
+            == ast::PublicationObjSpecType::PublicationobjTablesInCurSchema as i64
+    );
+    assert!(
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_CONTINUATION as i64
+            == ast::PublicationObjSpecType::PublicationobjContinuation as i64
+    );
+};
+
+fn convert_query_source(value: bindings::QuerySource) -> ast::QuerySource {
+    match value {
+        bindings::QuerySource_QSRC_ORIGINAL => ast::QuerySource::QsrcOriginal,
+        bindings::QuerySource_QSRC_PARSER => ast::QuerySource::QsrcParser,
+        bindings::QuerySource_QSRC_INSTEAD_RULE => ast::QuerySource::QsrcInsteadRule,
+        bindings::QuerySource_QSRC_QUAL_INSTEAD_RULE => ast::QuerySource::QsrcQualInsteadRule,
+        bindings::QuerySource_QSRC_NON_INSTEAD_RULE => ast::QuerySource::QsrcNonInsteadRule,
+        other => unreachable!("{other} is not a QuerySource"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::QuerySource_QSRC_ORIGINAL as i64 == ast::QuerySource::QsrcOriginal as i64);
+    assert!(bindings::QuerySource_QSRC_PARSER as i64 == ast::QuerySource::QsrcParser as i64);
+    assert!(
+        bindings::QuerySource_QSRC_INSTEAD_RULE as i64 == ast::QuerySource::QsrcInsteadRule as i64
+    );
+    assert!(
+        bindings::QuerySource_QSRC_QUAL_INSTEAD_RULE as i64
+            == ast::QuerySource::QsrcQualInsteadRule as i64
+    );
+    assert!(
+        bindings::QuerySource_QSRC_NON_INSTEAD_RULE as i64
+            == ast::QuerySource::QsrcNonInsteadRule as i64
+    );
+};
+
+fn convert_rte_kind(value: bindings::RTEKind) -> ast::RteKind {
+    match value {
+        bindings::RTEKind_RTE_RELATION => ast::RteKind::RteRelation,
+        bindings::RTEKind_RTE_SUBQUERY => ast::RteKind::RteSubquery,
+        bindings::RTEKind_RTE_JOIN => ast::RteKind::RteJoin,
+        bindings::RTEKind_RTE_FUNCTION => ast::RteKind::RteFunction,
+        bindings::RTEKind_RTE_TABLEFUNC => ast::RteKind::RteTablefunc,
+        bindings::RTEKind_RTE_VALUES => ast::RteKind::RteValues,
+        bindings::RTEKind_RTE_CTE => ast::RteKind::RteCte,
+        bindings::RTEKind_RTE_NAMEDTUPLESTORE => ast::RteKind::RteNamedtuplestore,
+        bindings::RTEKind_RTE_RESULT => ast::RteKind::RteResult,
+        bindings::RTEKind_RTE_GROUP => ast::RteKind::RteGroup,
+        other => unreachable!("{other} is not a RTEKind"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::RTEKind_RTE_RELATION as i64 == ast::RteKind::RteRelation as i64);
+    assert!(bindings::RTEKind_RTE_SUBQUERY as i64 == ast::RteKind::RteSubquery as i64);
+    assert!(bindings::RTEKind_RTE_JOIN as i64 == ast::RteKind::RteJoin as i64);
+    assert!(bindings::RTEKind_RTE_FUNCTION as i64 == ast::RteKind::RteFunction as i64);
+    assert!(bindings::RTEKind_RTE_TABLEFUNC as i64 == ast::RteKind::RteTablefunc as i64);
+    assert!(bindings::RTEKind_RTE_VALUES as i64 == ast::RteKind::RteValues as i64);
+    assert!(bindings::RTEKind_RTE_CTE as i64 == ast::RteKind::RteCte as i64);
+    assert!(
+        bindings::RTEKind_RTE_NAMEDTUPLESTORE as i64 == ast::RteKind::RteNamedtuplestore as i64
+    );
+    assert!(bindings::RTEKind_RTE_RESULT as i64 == ast::RteKind::RteResult as i64);
+    assert!(bindings::RTEKind_RTE_GROUP as i64 == ast::RteKind::RteGroup as i64);
+};
+
+fn convert_reindex_object_type(value: bindings::ReindexObjectType) -> ast::ReindexObjectType {
+    match value {
+        bindings::ReindexObjectType_REINDEX_OBJECT_INDEX => {
+            ast::ReindexObjectType::ReindexObjectIndex
+        }
+        bindings::ReindexObjectType_REINDEX_OBJECT_TABLE => {
+            ast::ReindexObjectType::ReindexObjectTable
+        }
+        bindings::ReindexObjectType_REINDEX_OBJECT_SCHEMA => {
+            ast::ReindexObjectType::ReindexObjectSchema
+        }
+        bindings::ReindexObjectType_REINDEX_OBJECT_SYSTEM => {
+            ast::ReindexObjectType::ReindexObjectSystem
+        }
+        bindings::ReindexObjectType_REINDEX_OBJECT_DATABASE => {
+            ast::ReindexObjectType::ReindexObjectDatabase
+        }
+        other => unreachable!("{other} is not a ReindexObjectType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::ReindexObjectType_REINDEX_OBJECT_INDEX as i64
+            == ast::ReindexObjectType::ReindexObjectIndex as i64
+    );
+    assert!(
+        bindings::ReindexObjectType_REINDEX_OBJECT_TABLE as i64
+            == ast::ReindexObjectType::ReindexObjectTable as i64
+    );
+    assert!(
+        bindings::ReindexObjectType_REINDEX_OBJECT_SCHEMA as i64
+            == ast::ReindexObjectType::ReindexObjectSchema as i64
+    );
+    assert!(
+        bindings::ReindexObjectType_REINDEX_OBJECT_SYSTEM as i64
+            == ast::ReindexObjectType::ReindexObjectSystem as i64
+    );
+    assert!(
+        bindings::ReindexObjectType_REINDEX_OBJECT_DATABASE as i64
+            == ast::ReindexObjectType::ReindexObjectDatabase as i64
+    );
+};
+
+fn convert_returning_option_kind(value: bindings::ReturningOptionKind) -> ast::ReturningOptionKind {
+    match value {
+        bindings::ReturningOptionKind_RETURNING_OPTION_OLD => {
+            ast::ReturningOptionKind::ReturningOptionOld
+        }
+        bindings::ReturningOptionKind_RETURNING_OPTION_NEW => {
+            ast::ReturningOptionKind::ReturningOptionNew
+        }
+        other => unreachable!("{other} is not a ReturningOptionKind"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::ReturningOptionKind_RETURNING_OPTION_OLD as i64
+            == ast::ReturningOptionKind::ReturningOptionOld as i64
+    );
+    assert!(
+        bindings::ReturningOptionKind_RETURNING_OPTION_NEW as i64
+            == ast::ReturningOptionKind::ReturningOptionNew as i64
+    );
+};
+
+fn convert_role_spec_type(value: bindings::RoleSpecType) -> ast::RoleSpecType {
+    match value {
+        bindings::RoleSpecType_ROLESPEC_CSTRING => ast::RoleSpecType::RolespecCstring,
+        bindings::RoleSpecType_ROLESPEC_CURRENT_ROLE => ast::RoleSpecType::RolespecCurrentRole,
+        bindings::RoleSpecType_ROLESPEC_CURRENT_USER => ast::RoleSpecType::RolespecCurrentUser,
+        bindings::RoleSpecType_ROLESPEC_SESSION_USER => ast::RoleSpecType::RolespecSessionUser,
+        bindings::RoleSpecType_ROLESPEC_PUBLIC => ast::RoleSpecType::RolespecPublic,
+        other => unreachable!("{other} is not a RoleSpecType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::RoleSpecType_ROLESPEC_CSTRING as i64 == ast::RoleSpecType::RolespecCstring as i64
+    );
+    assert!(
+        bindings::RoleSpecType_ROLESPEC_CURRENT_ROLE as i64
+            == ast::RoleSpecType::RolespecCurrentRole as i64
+    );
+    assert!(
+        bindings::RoleSpecType_ROLESPEC_CURRENT_USER as i64
+            == ast::RoleSpecType::RolespecCurrentUser as i64
+    );
+    assert!(
+        bindings::RoleSpecType_ROLESPEC_SESSION_USER as i64
+            == ast::RoleSpecType::RolespecSessionUser as i64
+    );
+    assert!(
+        bindings::RoleSpecType_ROLESPEC_PUBLIC as i64 == ast::RoleSpecType::RolespecPublic as i64
+    );
+};
+
+fn convert_role_stmt_type(value: bindings::RoleStmtType) -> ast::RoleStmtType {
+    match value {
+        bindings::RoleStmtType_ROLESTMT_ROLE => ast::RoleStmtType::RolestmtRole,
+        bindings::RoleStmtType_ROLESTMT_USER => ast::RoleStmtType::RolestmtUser,
+        bindings::RoleStmtType_ROLESTMT_GROUP => ast::RoleStmtType::RolestmtGroup,
+        other => unreachable!("{other} is not a RoleStmtType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::RoleStmtType_ROLESTMT_ROLE as i64 == ast::RoleStmtType::RolestmtRole as i64);
+    assert!(bindings::RoleStmtType_ROLESTMT_USER as i64 == ast::RoleStmtType::RolestmtUser as i64);
+    assert!(
+        bindings::RoleStmtType_ROLESTMT_GROUP as i64 == ast::RoleStmtType::RolestmtGroup as i64
+    );
+};
+
+fn convert_sql_value_function_op(value: bindings::SQLValueFunctionOp) -> ast::SqlValueFunctionOp {
+    match value {
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_DATE => {
+            ast::SqlValueFunctionOp::SvfopCurrentDate
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIME => {
+            ast::SqlValueFunctionOp::SvfopCurrentTime
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIME_N => {
+            ast::SqlValueFunctionOp::SvfopCurrentTimeN
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP => {
+            ast::SqlValueFunctionOp::SvfopCurrentTimestamp
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N => {
+            ast::SqlValueFunctionOp::SvfopCurrentTimestampN
+        }
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIME => ast::SqlValueFunctionOp::SvfopLocaltime,
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIME_N => ast::SqlValueFunctionOp::SvfopLocaltimeN,
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP => {
+            ast::SqlValueFunctionOp::SvfopLocaltimestamp
+        }
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N => {
+            ast::SqlValueFunctionOp::SvfopLocaltimestampN
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_ROLE => {
+            ast::SqlValueFunctionOp::SvfopCurrentRole
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_USER => {
+            ast::SqlValueFunctionOp::SvfopCurrentUser
+        }
+        bindings::SQLValueFunctionOp_SVFOP_USER => ast::SqlValueFunctionOp::SvfopUser,
+        bindings::SQLValueFunctionOp_SVFOP_SESSION_USER => {
+            ast::SqlValueFunctionOp::SvfopSessionUser
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_CATALOG => {
+            ast::SqlValueFunctionOp::SvfopCurrentCatalog
+        }
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_SCHEMA => {
+            ast::SqlValueFunctionOp::SvfopCurrentSchema
+        }
+        other => unreachable!("{other} is not a SQLValueFunctionOp"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_DATE as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentDate as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIME as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentTime as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIME_N as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentTimeN as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentTimestamp as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentTimestampN as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIME as i64
+            == ast::SqlValueFunctionOp::SvfopLocaltime as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIME_N as i64
+            == ast::SqlValueFunctionOp::SvfopLocaltimeN as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP as i64
+            == ast::SqlValueFunctionOp::SvfopLocaltimestamp as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N as i64
+            == ast::SqlValueFunctionOp::SvfopLocaltimestampN as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_ROLE as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentRole as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_USER as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentUser as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_USER as i64 == ast::SqlValueFunctionOp::SvfopUser as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_SESSION_USER as i64
+            == ast::SqlValueFunctionOp::SvfopSessionUser as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_CATALOG as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentCatalog as i64
+    );
+    assert!(
+        bindings::SQLValueFunctionOp_SVFOP_CURRENT_SCHEMA as i64
+            == ast::SqlValueFunctionOp::SvfopCurrentSchema as i64
+    );
+};
+
+fn convert_set_operation(value: bindings::SetOperation) -> ast::SetOperation {
+    match value {
+        bindings::SetOperation_SETOP_NONE => ast::SetOperation::SetopNone,
+        bindings::SetOperation_SETOP_UNION => ast::SetOperation::SetopUnion,
+        bindings::SetOperation_SETOP_INTERSECT => ast::SetOperation::SetopIntersect,
+        bindings::SetOperation_SETOP_EXCEPT => ast::SetOperation::SetopExcept,
+        other => unreachable!("{other} is not a SetOperation"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::SetOperation_SETOP_NONE as i64 == ast::SetOperation::SetopNone as i64);
+    assert!(bindings::SetOperation_SETOP_UNION as i64 == ast::SetOperation::SetopUnion as i64);
+    assert!(
+        bindings::SetOperation_SETOP_INTERSECT as i64 == ast::SetOperation::SetopIntersect as i64
+    );
+    assert!(bindings::SetOperation_SETOP_EXCEPT as i64 == ast::SetOperation::SetopExcept as i64);
+};
+
+fn convert_sort_by_dir(value: bindings::SortByDir) -> ast::SortByDir {
+    match value {
+        bindings::SortByDir_SORTBY_DEFAULT => ast::SortByDir::SortbyDefault,
+        bindings::SortByDir_SORTBY_ASC => ast::SortByDir::SortbyAsc,
+        bindings::SortByDir_SORTBY_DESC => ast::SortByDir::SortbyDesc,
+        bindings::SortByDir_SORTBY_USING => ast::SortByDir::SortbyUsing,
+        other => unreachable!("{other} is not a SortByDir"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::SortByDir_SORTBY_DEFAULT as i64 == ast::SortByDir::SortbyDefault as i64);
+    assert!(bindings::SortByDir_SORTBY_ASC as i64 == ast::SortByDir::SortbyAsc as i64);
+    assert!(bindings::SortByDir_SORTBY_DESC as i64 == ast::SortByDir::SortbyDesc as i64);
+    assert!(bindings::SortByDir_SORTBY_USING as i64 == ast::SortByDir::SortbyUsing as i64);
+};
+
+fn convert_sort_by_nulls(value: bindings::SortByNulls) -> ast::SortByNulls {
+    match value {
+        bindings::SortByNulls_SORTBY_NULLS_DEFAULT => ast::SortByNulls::SortbyNullsDefault,
+        bindings::SortByNulls_SORTBY_NULLS_FIRST => ast::SortByNulls::SortbyNullsFirst,
+        bindings::SortByNulls_SORTBY_NULLS_LAST => ast::SortByNulls::SortbyNullsLast,
+        other => unreachable!("{other} is not a SortByNulls"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::SortByNulls_SORTBY_NULLS_DEFAULT as i64
+            == ast::SortByNulls::SortbyNullsDefault as i64
+    );
+    assert!(
+        bindings::SortByNulls_SORTBY_NULLS_FIRST as i64
+            == ast::SortByNulls::SortbyNullsFirst as i64
+    );
+    assert!(
+        bindings::SortByNulls_SORTBY_NULLS_LAST as i64 == ast::SortByNulls::SortbyNullsLast as i64
+    );
+};
+
+fn convert_sub_link_type(value: bindings::SubLinkType) -> ast::SubLinkType {
+    match value {
+        bindings::SubLinkType_EXISTS_SUBLINK => ast::SubLinkType::ExistsSublink,
+        bindings::SubLinkType_ALL_SUBLINK => ast::SubLinkType::AllSublink,
+        bindings::SubLinkType_ANY_SUBLINK => ast::SubLinkType::AnySublink,
+        bindings::SubLinkType_ROWCOMPARE_SUBLINK => ast::SubLinkType::RowcompareSublink,
+        bindings::SubLinkType_EXPR_SUBLINK => ast::SubLinkType::ExprSublink,
+        bindings::SubLinkType_MULTIEXPR_SUBLINK => ast::SubLinkType::MultiexprSublink,
+        bindings::SubLinkType_ARRAY_SUBLINK => ast::SubLinkType::ArraySublink,
+        bindings::SubLinkType_CTE_SUBLINK => ast::SubLinkType::CteSublink,
+        other => unreachable!("{other} is not a SubLinkType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::SubLinkType_EXISTS_SUBLINK as i64 == ast::SubLinkType::ExistsSublink as i64);
+    assert!(bindings::SubLinkType_ALL_SUBLINK as i64 == ast::SubLinkType::AllSublink as i64);
+    assert!(bindings::SubLinkType_ANY_SUBLINK as i64 == ast::SubLinkType::AnySublink as i64);
+    assert!(
+        bindings::SubLinkType_ROWCOMPARE_SUBLINK as i64
+            == ast::SubLinkType::RowcompareSublink as i64
+    );
+    assert!(bindings::SubLinkType_EXPR_SUBLINK as i64 == ast::SubLinkType::ExprSublink as i64);
+    assert!(
+        bindings::SubLinkType_MULTIEXPR_SUBLINK as i64 == ast::SubLinkType::MultiexprSublink as i64
+    );
+    assert!(bindings::SubLinkType_ARRAY_SUBLINK as i64 == ast::SubLinkType::ArraySublink as i64);
+    assert!(bindings::SubLinkType_CTE_SUBLINK as i64 == ast::SubLinkType::CteSublink as i64);
+};
+
+fn convert_table_func_type(value: bindings::TableFuncType) -> ast::TableFuncType {
+    match value {
+        bindings::TableFuncType_TFT_XMLTABLE => ast::TableFuncType::TftXmltable,
+        bindings::TableFuncType_TFT_JSON_TABLE => ast::TableFuncType::TftJsonTable,
+        other => unreachable!("{other} is not a TableFuncType"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::TableFuncType_TFT_XMLTABLE as i64 == ast::TableFuncType::TftXmltable as i64);
+    assert!(
+        bindings::TableFuncType_TFT_JSON_TABLE as i64 == ast::TableFuncType::TftJsonTable as i64
+    );
+};
+
+fn convert_transaction_stmt_kind(value: bindings::TransactionStmtKind) -> ast::TransactionStmtKind {
+    match value {
+        bindings::TransactionStmtKind_TRANS_STMT_BEGIN => ast::TransactionStmtKind::TransStmtBegin,
+        bindings::TransactionStmtKind_TRANS_STMT_START => ast::TransactionStmtKind::TransStmtStart,
+        bindings::TransactionStmtKind_TRANS_STMT_COMMIT => {
+            ast::TransactionStmtKind::TransStmtCommit
+        }
+        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK => {
+            ast::TransactionStmtKind::TransStmtRollback
+        }
+        bindings::TransactionStmtKind_TRANS_STMT_SAVEPOINT => {
+            ast::TransactionStmtKind::TransStmtSavepoint
+        }
+        bindings::TransactionStmtKind_TRANS_STMT_RELEASE => {
+            ast::TransactionStmtKind::TransStmtRelease
+        }
+        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => {
+            ast::TransactionStmtKind::TransStmtRollbackTo
+        }
+        bindings::TransactionStmtKind_TRANS_STMT_PREPARE => {
+            ast::TransactionStmtKind::TransStmtPrepare
+        }
+        bindings::TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED => {
+            ast::TransactionStmtKind::TransStmtCommitPrepared
+        }
+        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED => {
+            ast::TransactionStmtKind::TransStmtRollbackPrepared
+        }
+        other => unreachable!("{other} is not a TransactionStmtKind"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_BEGIN as i64
+            == ast::TransactionStmtKind::TransStmtBegin as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_START as i64
+            == ast::TransactionStmtKind::TransStmtStart as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_COMMIT as i64
+            == ast::TransactionStmtKind::TransStmtCommit as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK as i64
+            == ast::TransactionStmtKind::TransStmtRollback as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_SAVEPOINT as i64
+            == ast::TransactionStmtKind::TransStmtSavepoint as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_RELEASE as i64
+            == ast::TransactionStmtKind::TransStmtRelease as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO as i64
+            == ast::TransactionStmtKind::TransStmtRollbackTo as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_PREPARE as i64
+            == ast::TransactionStmtKind::TransStmtPrepare as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED as i64
+            == ast::TransactionStmtKind::TransStmtCommitPrepared as i64
+    );
+    assert!(
+        bindings::TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED as i64
+            == ast::TransactionStmtKind::TransStmtRollbackPrepared as i64
+    );
+};
+
+fn convert_var_returning_type(value: bindings::VarReturningType) -> ast::VarReturningType {
+    match value {
+        bindings::VarReturningType_VAR_RETURNING_DEFAULT => {
+            ast::VarReturningType::VarReturningDefault
+        }
+        bindings::VarReturningType_VAR_RETURNING_OLD => ast::VarReturningType::VarReturningOld,
+        bindings::VarReturningType_VAR_RETURNING_NEW => ast::VarReturningType::VarReturningNew,
+        other => unreachable!("{other} is not a VarReturningType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::VarReturningType_VAR_RETURNING_DEFAULT as i64
+            == ast::VarReturningType::VarReturningDefault as i64
+    );
+    assert!(
+        bindings::VarReturningType_VAR_RETURNING_OLD as i64
+            == ast::VarReturningType::VarReturningOld as i64
+    );
+    assert!(
+        bindings::VarReturningType_VAR_RETURNING_NEW as i64
+            == ast::VarReturningType::VarReturningNew as i64
+    );
+};
+
+fn convert_variable_set_kind(value: bindings::VariableSetKind) -> ast::VariableSetKind {
+    match value {
+        bindings::VariableSetKind_VAR_SET_VALUE => ast::VariableSetKind::VarSetValue,
+        bindings::VariableSetKind_VAR_SET_DEFAULT => ast::VariableSetKind::VarSetDefault,
+        bindings::VariableSetKind_VAR_SET_CURRENT => ast::VariableSetKind::VarSetCurrent,
+        bindings::VariableSetKind_VAR_SET_MULTI => ast::VariableSetKind::VarSetMulti,
+        bindings::VariableSetKind_VAR_RESET => ast::VariableSetKind::VarReset,
+        bindings::VariableSetKind_VAR_RESET_ALL => ast::VariableSetKind::VarResetAll,
+        other => unreachable!("{other} is not a VariableSetKind"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::VariableSetKind_VAR_SET_VALUE as i64 == ast::VariableSetKind::VarSetValue as i64
+    );
+    assert!(
+        bindings::VariableSetKind_VAR_SET_DEFAULT as i64
+            == ast::VariableSetKind::VarSetDefault as i64
+    );
+    assert!(
+        bindings::VariableSetKind_VAR_SET_CURRENT as i64
+            == ast::VariableSetKind::VarSetCurrent as i64
+    );
+    assert!(
+        bindings::VariableSetKind_VAR_SET_MULTI as i64 == ast::VariableSetKind::VarSetMulti as i64
+    );
+    assert!(bindings::VariableSetKind_VAR_RESET as i64 == ast::VariableSetKind::VarReset as i64);
+    assert!(
+        bindings::VariableSetKind_VAR_RESET_ALL as i64 == ast::VariableSetKind::VarResetAll as i64
+    );
+};
+
+fn convert_view_check_option(value: bindings::ViewCheckOption) -> ast::ViewCheckOption {
+    match value {
+        bindings::ViewCheckOption_NO_CHECK_OPTION => ast::ViewCheckOption::NoCheckOption,
+        bindings::ViewCheckOption_LOCAL_CHECK_OPTION => ast::ViewCheckOption::LocalCheckOption,
+        bindings::ViewCheckOption_CASCADED_CHECK_OPTION => {
+            ast::ViewCheckOption::CascadedCheckOption
+        }
+        other => unreachable!("{other} is not a ViewCheckOption"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::ViewCheckOption_NO_CHECK_OPTION as i64
+            == ast::ViewCheckOption::NoCheckOption as i64
+    );
+    assert!(
+        bindings::ViewCheckOption_LOCAL_CHECK_OPTION as i64
+            == ast::ViewCheckOption::LocalCheckOption as i64
+    );
+    assert!(
+        bindings::ViewCheckOption_CASCADED_CHECK_OPTION as i64
+            == ast::ViewCheckOption::CascadedCheckOption as i64
+    );
+};
+
+fn convert_wco_kind(value: bindings::WCOKind) -> ast::WcoKind {
+    match value {
+        bindings::WCOKind_WCO_VIEW_CHECK => ast::WcoKind::WcoViewCheck,
+        bindings::WCOKind_WCO_RLS_INSERT_CHECK => ast::WcoKind::WcoRlsInsertCheck,
+        bindings::WCOKind_WCO_RLS_UPDATE_CHECK => ast::WcoKind::WcoRlsUpdateCheck,
+        bindings::WCOKind_WCO_RLS_CONFLICT_CHECK => ast::WcoKind::WcoRlsConflictCheck,
+        bindings::WCOKind_WCO_RLS_MERGE_UPDATE_CHECK => ast::WcoKind::WcoRlsMergeUpdateCheck,
+        bindings::WCOKind_WCO_RLS_MERGE_DELETE_CHECK => ast::WcoKind::WcoRlsMergeDeleteCheck,
+        bindings::WCOKind_WCO_VIEW_CONFLICT_CHECK => ast::WcoKind::WcoViewConflictCheck,
+        other => unreachable!("{other} is not a WCOKind"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::WCOKind_WCO_VIEW_CHECK as i64 == ast::WcoKind::WcoViewCheck as i64);
+    assert!(
+        bindings::WCOKind_WCO_RLS_INSERT_CHECK as i64 == ast::WcoKind::WcoRlsInsertCheck as i64
+    );
+    assert!(
+        bindings::WCOKind_WCO_RLS_UPDATE_CHECK as i64 == ast::WcoKind::WcoRlsUpdateCheck as i64
+    );
+    assert!(
+        bindings::WCOKind_WCO_RLS_CONFLICT_CHECK as i64 == ast::WcoKind::WcoRlsConflictCheck as i64
+    );
+    assert!(
+        bindings::WCOKind_WCO_RLS_MERGE_UPDATE_CHECK as i64
+            == ast::WcoKind::WcoRlsMergeUpdateCheck as i64
+    );
+    assert!(
+        bindings::WCOKind_WCO_RLS_MERGE_DELETE_CHECK as i64
+            == ast::WcoKind::WcoRlsMergeDeleteCheck as i64
+    );
+    assert!(
+        bindings::WCOKind_WCO_VIEW_CONFLICT_CHECK as i64
+            == ast::WcoKind::WcoViewConflictCheck as i64
+    );
+};
+
+fn convert_xml_expr_op(value: bindings::XmlExprOp) -> ast::XmlExprOp {
+    match value {
+        bindings::XmlExprOp_IS_XMLCONCAT => ast::XmlExprOp::IsXmlconcat,
+        bindings::XmlExprOp_IS_XMLELEMENT => ast::XmlExprOp::IsXmlelement,
+        bindings::XmlExprOp_IS_XMLFOREST => ast::XmlExprOp::IsXmlforest,
+        bindings::XmlExprOp_IS_XMLPARSE => ast::XmlExprOp::IsXmlparse,
+        bindings::XmlExprOp_IS_XMLPI => ast::XmlExprOp::IsXmlpi,
+        bindings::XmlExprOp_IS_XMLROOT => ast::XmlExprOp::IsXmlroot,
+        bindings::XmlExprOp_IS_XMLSERIALIZE => ast::XmlExprOp::IsXmlserialize,
+        bindings::XmlExprOp_IS_DOCUMENT => ast::XmlExprOp::IsDocument,
+        other => unreachable!("{other} is not a XmlExprOp"),
+    }
+}
+
+const _: () = {
+    assert!(bindings::XmlExprOp_IS_XMLCONCAT as i64 == ast::XmlExprOp::IsXmlconcat as i64);
+    assert!(bindings::XmlExprOp_IS_XMLELEMENT as i64 == ast::XmlExprOp::IsXmlelement as i64);
+    assert!(bindings::XmlExprOp_IS_XMLFOREST as i64 == ast::XmlExprOp::IsXmlforest as i64);
+    assert!(bindings::XmlExprOp_IS_XMLPARSE as i64 == ast::XmlExprOp::IsXmlparse as i64);
+    assert!(bindings::XmlExprOp_IS_XMLPI as i64 == ast::XmlExprOp::IsXmlpi as i64);
+    assert!(bindings::XmlExprOp_IS_XMLROOT as i64 == ast::XmlExprOp::IsXmlroot as i64);
+    assert!(bindings::XmlExprOp_IS_XMLSERIALIZE as i64 == ast::XmlExprOp::IsXmlserialize as i64);
+    assert!(bindings::XmlExprOp_IS_DOCUMENT as i64 == ast::XmlExprOp::IsDocument as i64);
+};
+
+fn convert_xml_option_type(value: bindings::XmlOptionType) -> ast::XmlOptionType {
+    match value {
+        bindings::XmlOptionType_XMLOPTION_DOCUMENT => ast::XmlOptionType::XmloptionDocument,
+        bindings::XmlOptionType_XMLOPTION_CONTENT => ast::XmlOptionType::XmloptionContent,
+        other => unreachable!("{other} is not a XmlOptionType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::XmlOptionType_XMLOPTION_DOCUMENT as i64
+            == ast::XmlOptionType::XmloptionDocument as i64
+    );
+    assert!(
+        bindings::XmlOptionType_XMLOPTION_CONTENT as i64
+            == ast::XmlOptionType::XmloptionContent as i64
+    );
+};
+
+pub(crate) fn token(value: i32) -> Option<ast::Token> {
+    Some(match value {
+        0 => ast::Token::Nul,
+        36 => ast::Token::Ascii36,
+        37 => ast::Token::Ascii37,
+        40 => ast::Token::Ascii40,
+        41 => ast::Token::Ascii41,
+        42 => ast::Token::Ascii42,
+        43 => ast::Token::Ascii43,
+        44 => ast::Token::Ascii44,
+        45 => ast::Token::Ascii45,
+        46 => ast::Token::Ascii46,
+        47 => ast::Token::Ascii47,
+        58 => ast::Token::Ascii58,
+        59 => ast::Token::Ascii59,
+        60 => ast::Token::Ascii60,
+        61 => ast::Token::Ascii61,
+        62 => ast::Token::Ascii62,
+        63 => ast::Token::Ascii63,
+        91 => ast::Token::Ascii91,
+        92 => ast::Token::Ascii92,
+        93 => ast::Token::Ascii93,
+        94 => ast::Token::Ascii94,
+        258 => ast::Token::Ident,
+        259 => ast::Token::Uident,
+        260 => ast::Token::Fconst,
+        261 => ast::Token::Sconst,
+        262 => ast::Token::Usconst,
+        263 => ast::Token::Bconst,
+        264 => ast::Token::Xconst,
+        265 => ast::Token::Op,
+        266 => ast::Token::Iconst,
+        267 => ast::Token::Param,
+        268 => ast::Token::Typecast,
+        269 => ast::Token::DotDot,
+        270 => ast::Token::ColonEquals,
+        271 => ast::Token::EqualsGreater,
+        272 => ast::Token::LessEquals,
+        273 => ast::Token::GreaterEquals,
+        274 => ast::Token::NotEquals,
+        780 => ast::Token::SqlComment,
+        781 => ast::Token::CComment,
+        275 => ast::Token::AbortP,
+        276 => ast::Token::Absent,
+        277 => ast::Token::AbsoluteP,
+        278 => ast::Token::Access,
+        279 => ast::Token::Action,
+        280 => ast::Token::AddP,
+        281 => ast::Token::Admin,
+        282 => ast::Token::After,
+        283 => ast::Token::Aggregate,
+        284 => ast::Token::All,
+        285 => ast::Token::Also,
+        286 => ast::Token::Alter,
+        287 => ast::Token::Always,
+        288 => ast::Token::Analyse,
+        289 => ast::Token::Analyze,
+        290 => ast::Token::And,
+        291 => ast::Token::Any,
+        292 => ast::Token::Array,
+        293 => ast::Token::As,
+        294 => ast::Token::Asc,
+        295 => ast::Token::Asensitive,
+        296 => ast::Token::Assertion,
+        297 => ast::Token::Assignment,
+        298 => ast::Token::Asymmetric,
+        299 => ast::Token::Atomic,
+        300 => ast::Token::At,
+        301 => ast::Token::Attach,
+        302 => ast::Token::Attribute,
+        303 => ast::Token::Authorization,
+        304 => ast::Token::Backward,
+        305 => ast::Token::Before,
+        306 => ast::Token::BeginP,
+        307 => ast::Token::Between,
+        308 => ast::Token::Bigint,
+        309 => ast::Token::Binary,
+        310 => ast::Token::Bit,
+        311 => ast::Token::BooleanP,
+        312 => ast::Token::Both,
+        313 => ast::Token::Breadth,
+        314 => ast::Token::By,
+        315 => ast::Token::Cache,
+        316 => ast::Token::Call,
+        317 => ast::Token::Called,
+        318 => ast::Token::Cascade,
+        319 => ast::Token::Cascaded,
+        320 => ast::Token::Case,
+        321 => ast::Token::Cast,
+        322 => ast::Token::CatalogP,
+        323 => ast::Token::Chain,
+        324 => ast::Token::CharP,
+        325 => ast::Token::Character,
+        326 => ast::Token::Characteristics,
+        327 => ast::Token::Check,
+        328 => ast::Token::Checkpoint,
+        329 => ast::Token::Class,
+        330 => ast::Token::Close,
+        331 => ast::Token::Cluster,
+        332 => ast::Token::Coalesce,
+        333 => ast::Token::Collate,
+        334 => ast::Token::Collation,
+        335 => ast::Token::Column,
+        336 => ast::Token::Columns,
+        337 => ast::Token::Comment,
+        338 => ast::Token::Comments,
+        339 => ast::Token::Commit,
+        340 => ast::Token::Committed,
+        341 => ast::Token::Compression,
+        342 => ast::Token::Concurrently,
+        343 => ast::Token::Conditional,
+        344 => ast::Token::Configuration,
+        345 => ast::Token::Conflict,
+        346 => ast::Token::Connection,
+        347 => ast::Token::Constraint,
+        348 => ast::Token::Constraints,
+        349 => ast::Token::ContentP,
+        350 => ast::Token::ContinueP,
+        351 => ast::Token::ConversionP,
+        352 => ast::Token::Copy,
+        353 => ast::Token::Cost,
+        354 => ast::Token::Create,
+        355 => ast::Token::Cross,
+        356 => ast::Token::Csv,
+        357 => ast::Token::Cube,
+        358 => ast::Token::CurrentP,
+        359 => ast::Token::CurrentCatalog,
+        360 => ast::Token::CurrentDate,
+        361 => ast::Token::CurrentRole,
+        362 => ast::Token::CurrentSchema,
+        363 => ast::Token::CurrentTime,
+        364 => ast::Token::CurrentTimestamp,
+        365 => ast::Token::CurrentUser,
+        366 => ast::Token::Cursor,
+        367 => ast::Token::Cycle,
+        368 => ast::Token::DataP,
+        369 => ast::Token::Database,
+        370 => ast::Token::DayP,
+        371 => ast::Token::Deallocate,
+        372 => ast::Token::Dec,
+        373 => ast::Token::DecimalP,
+        374 => ast::Token::Declare,
+        375 => ast::Token::Default,
+        376 => ast::Token::Defaults,
+        377 => ast::Token::Deferrable,
+        378 => ast::Token::Deferred,
+        379 => ast::Token::Definer,
+        380 => ast::Token::DeleteP,
+        381 => ast::Token::Delimiter,
+        382 => ast::Token::Delimiters,
+        383 => ast::Token::Depends,
+        384 => ast::Token::Depth,
+        385 => ast::Token::Desc,
+        386 => ast::Token::Detach,
+        387 => ast::Token::Dictionary,
+        388 => ast::Token::DisableP,
+        389 => ast::Token::Discard,
+        390 => ast::Token::Distinct,
+        391 => ast::Token::Do,
+        392 => ast::Token::DocumentP,
+        393 => ast::Token::DomainP,
+        394 => ast::Token::DoubleP,
+        395 => ast::Token::Drop,
+        396 => ast::Token::Each,
+        397 => ast::Token::Else,
+        398 => ast::Token::EmptyP,
+        399 => ast::Token::EnableP,
+        400 => ast::Token::Encoding,
+        401 => ast::Token::Encrypted,
+        402 => ast::Token::EndP,
+        403 => ast::Token::Enforced,
+        404 => ast::Token::EnumP,
+        405 => ast::Token::ErrorP,
+        406 => ast::Token::Escape,
+        407 => ast::Token::Event,
+        408 => ast::Token::Except,
+        409 => ast::Token::Exclude,
+        410 => ast::Token::Excluding,
+        411 => ast::Token::Exclusive,
+        412 => ast::Token::Execute,
+        413 => ast::Token::Exists,
+        414 => ast::Token::Explain,
+        415 => ast::Token::Expression,
+        416 => ast::Token::Extension,
+        417 => ast::Token::External,
+        418 => ast::Token::Extract,
+        419 => ast::Token::FalseP,
+        420 => ast::Token::Family,
+        421 => ast::Token::Fetch,
+        422 => ast::Token::Filter,
+        423 => ast::Token::Finalize,
+        424 => ast::Token::FirstP,
+        425 => ast::Token::FloatP,
+        426 => ast::Token::Following,
+        427 => ast::Token::For,
+        428 => ast::Token::Force,
+        429 => ast::Token::Foreign,
+        430 => ast::Token::Format,
+        431 => ast::Token::Forward,
+        432 => ast::Token::Freeze,
+        433 => ast::Token::From,
+        434 => ast::Token::Full,
+        435 => ast::Token::Function,
+        436 => ast::Token::Functions,
+        437 => ast::Token::Generated,
+        438 => ast::Token::Global,
+        439 => ast::Token::Grant,
+        440 => ast::Token::Granted,
+        441 => ast::Token::Greatest,
+        442 => ast::Token::GroupP,
+        443 => ast::Token::Grouping,
+        444 => ast::Token::Groups,
+        445 => ast::Token::Handler,
+        446 => ast::Token::Having,
+        447 => ast::Token::HeaderP,
+        448 => ast::Token::Hold,
+        449 => ast::Token::HourP,
+        450 => ast::Token::IdentityP,
+        451 => ast::Token::IfP,
+        452 => ast::Token::Ilike,
+        453 => ast::Token::Immediate,
+        454 => ast::Token::Immutable,
+        455 => ast::Token::ImplicitP,
+        456 => ast::Token::ImportP,
+        457 => ast::Token::InP,
+        458 => ast::Token::Include,
+        459 => ast::Token::Including,
+        460 => ast::Token::Increment,
+        461 => ast::Token::Indent,
+        462 => ast::Token::Index,
+        463 => ast::Token::Indexes,
+        464 => ast::Token::Inherit,
+        465 => ast::Token::Inherits,
+        466 => ast::Token::Initially,
+        467 => ast::Token::InlineP,
+        468 => ast::Token::InnerP,
+        469 => ast::Token::Inout,
+        470 => ast::Token::InputP,
+        471 => ast::Token::Insensitive,
+        472 => ast::Token::Insert,
+        473 => ast::Token::Instead,
+        474 => ast::Token::IntP,
+        475 => ast::Token::Integer,
+        476 => ast::Token::Intersect,
+        477 => ast::Token::Interval,
+        478 => ast::Token::Into,
+        479 => ast::Token::Invoker,
+        480 => ast::Token::Is,
+        481 => ast::Token::Isnull,
+        482 => ast::Token::Isolation,
+        483 => ast::Token::Join,
+        484 => ast::Token::Json,
+        485 => ast::Token::JsonArray,
+        486 => ast::Token::JsonArrayagg,
+        487 => ast::Token::JsonExists,
+        488 => ast::Token::JsonObject,
+        489 => ast::Token::JsonObjectagg,
+        490 => ast::Token::JsonQuery,
+        491 => ast::Token::JsonScalar,
+        492 => ast::Token::JsonSerialize,
+        493 => ast::Token::JsonTable,
+        494 => ast::Token::JsonValue,
+        495 => ast::Token::Keep,
+        496 => ast::Token::Key,
+        497 => ast::Token::Keys,
+        498 => ast::Token::Label,
+        499 => ast::Token::Language,
+        500 => ast::Token::LargeP,
+        501 => ast::Token::LastP,
+        502 => ast::Token::LateralP,
+        503 => ast::Token::Leading,
+        504 => ast::Token::Leakproof,
+        505 => ast::Token::Least,
+        506 => ast::Token::Left,
+        507 => ast::Token::Level,
+        508 => ast::Token::Like,
+        509 => ast::Token::Limit,
+        510 => ast::Token::Listen,
+        511 => ast::Token::Load,
+        512 => ast::Token::Local,
+        513 => ast::Token::Localtime,
+        514 => ast::Token::Localtimestamp,
+        515 => ast::Token::Location,
+        516 => ast::Token::LockP,
+        517 => ast::Token::Locked,
+        518 => ast::Token::Logged,
+        519 => ast::Token::Mapping,
+        520 => ast::Token::Match,
+        521 => ast::Token::Matched,
+        522 => ast::Token::Materialized,
+        523 => ast::Token::Maxvalue,
+        524 => ast::Token::Merge,
+        525 => ast::Token::MergeAction,
+        526 => ast::Token::Method,
+        527 => ast::Token::MinuteP,
+        528 => ast::Token::Minvalue,
+        529 => ast::Token::Mode,
+        530 => ast::Token::MonthP,
+        531 => ast::Token::Move,
+        532 => ast::Token::NameP,
+        533 => ast::Token::Names,
+        534 => ast::Token::National,
+        535 => ast::Token::Natural,
+        536 => ast::Token::Nchar,
+        537 => ast::Token::Nested,
+        538 => ast::Token::New,
+        539 => ast::Token::Next,
+        540 => ast::Token::Nfc,
+        541 => ast::Token::Nfd,
+        542 => ast::Token::Nfkc,
+        543 => ast::Token::Nfkd,
+        544 => ast::Token::No,
+        545 => ast::Token::None,
+        546 => ast::Token::Normalize,
+        547 => ast::Token::Normalized,
+        548 => ast::Token::Not,
+        549 => ast::Token::Nothing,
+        550 => ast::Token::Notify,
+        551 => ast::Token::Notnull,
+        552 => ast::Token::Nowait,
+        553 => ast::Token::NullP,
+        554 => ast::Token::Nullif,
+        555 => ast::Token::NullsP,
+        556 => ast::Token::Numeric,
+        557 => ast::Token::ObjectP,
+        558 => ast::Token::ObjectsP,
+        559 => ast::Token::Of,
+        560 => ast::Token::Off,
+        561 => ast::Token::Offset,
+        562 => ast::Token::Oids,
+        563 => ast::Token::Old,
+        564 => ast::Token::Omit,
+        565 => ast::Token::On,
+        566 => ast::Token::Only,
+        567 => ast::Token::Operator,
+        568 => ast::Token::Option,
+        569 => ast::Token::Options,
+        570 => ast::Token::Or,
+        571 => ast::Token::Order,
+        572 => ast::Token::Ordinality,
+        573 => ast::Token::Others,
+        574 => ast::Token::OutP,
+        575 => ast::Token::OuterP,
+        576 => ast::Token::Over,
+        577 => ast::Token::Overlaps,
+        578 => ast::Token::Overlay,
+        579 => ast::Token::Overriding,
+        580 => ast::Token::Owned,
+        581 => ast::Token::Owner,
+        582 => ast::Token::Parallel,
+        583 => ast::Token::Parameter,
+        584 => ast::Token::Parser,
+        585 => ast::Token::Partial,
+        586 => ast::Token::Partition,
+        587 => ast::Token::Passing,
+        588 => ast::Token::Password,
+        589 => ast::Token::Path,
+        590 => ast::Token::Period,
+        591 => ast::Token::Placing,
+        592 => ast::Token::Plan,
+        593 => ast::Token::Plans,
+        594 => ast::Token::Policy,
+        595 => ast::Token::Position,
+        596 => ast::Token::Preceding,
+        597 => ast::Token::Precision,
+        598 => ast::Token::Preserve,
+        599 => ast::Token::Prepare,
+        600 => ast::Token::Prepared,
+        601 => ast::Token::Primary,
+        602 => ast::Token::Prior,
+        603 => ast::Token::Privileges,
+        604 => ast::Token::Procedural,
+        605 => ast::Token::Procedure,
+        606 => ast::Token::Procedures,
+        607 => ast::Token::Program,
+        608 => ast::Token::Publication,
+        609 => ast::Token::Quote,
+        610 => ast::Token::Quotes,
+        611 => ast::Token::Range,
+        612 => ast::Token::Read,
+        613 => ast::Token::Real,
+        614 => ast::Token::Reassign,
+        615 => ast::Token::Recursive,
+        616 => ast::Token::RefP,
+        617 => ast::Token::References,
+        618 => ast::Token::Referencing,
+        619 => ast::Token::Refresh,
+        620 => ast::Token::Reindex,
+        621 => ast::Token::RelativeP,
+        622 => ast::Token::Release,
+        623 => ast::Token::Rename,
+        624 => ast::Token::Repeatable,
+        625 => ast::Token::Replace,
+        626 => ast::Token::Replica,
+        627 => ast::Token::Reset,
+        628 => ast::Token::Restart,
+        629 => ast::Token::Restrict,
+        630 => ast::Token::Return,
+        631 => ast::Token::Returning,
+        632 => ast::Token::Returns,
+        633 => ast::Token::Revoke,
+        634 => ast::Token::Right,
+        635 => ast::Token::Role,
+        636 => ast::Token::Rollback,
+        637 => ast::Token::Rollup,
+        638 => ast::Token::Routine,
+        639 => ast::Token::Routines,
+        640 => ast::Token::Row,
+        641 => ast::Token::Rows,
+        642 => ast::Token::Rule,
+        643 => ast::Token::Savepoint,
+        644 => ast::Token::Scalar,
+        645 => ast::Token::Schema,
+        646 => ast::Token::Schemas,
+        647 => ast::Token::Scroll,
+        648 => ast::Token::Search,
+        649 => ast::Token::SecondP,
+        650 => ast::Token::Security,
+        651 => ast::Token::Select,
+        652 => ast::Token::Sequence,
+        653 => ast::Token::Sequences,
+        654 => ast::Token::Serializable,
+        655 => ast::Token::Server,
+        656 => ast::Token::Session,
+        657 => ast::Token::SessionUser,
+        658 => ast::Token::Set,
+        659 => ast::Token::Sets,
+        660 => ast::Token::Setof,
+        661 => ast::Token::Share,
+        662 => ast::Token::Show,
+        663 => ast::Token::Similar,
+        664 => ast::Token::Simple,
+        665 => ast::Token::Skip,
+        666 => ast::Token::Smallint,
+        667 => ast::Token::Snapshot,
+        668 => ast::Token::Some,
+        669 => ast::Token::Source,
+        670 => ast::Token::SqlP,
+        671 => ast::Token::Stable,
+        672 => ast::Token::StandaloneP,
+        673 => ast::Token::Start,
+        674 => ast::Token::Statement,
+        675 => ast::Token::Statistics,
+        676 => ast::Token::Stdin,
+        677 => ast::Token::Stdout,
+        678 => ast::Token::Storage,
+        679 => ast::Token::Stored,
+        680 => ast::Token::StrictP,
+        681 => ast::Token::StringP,
+        682 => ast::Token::StripP,
+        683 => ast::Token::Subscription,
+        684 => ast::Token::Substring,
+        685 => ast::Token::Support,
+        686 => ast::Token::Symmetric,
+        687 => ast::Token::Sysid,
+        688 => ast::Token::SystemP,
+        689 => ast::Token::SystemUser,
+        690 => ast::Token::Table,
+        691 => ast::Token::Tables,
+        692 => ast::Token::Tablesample,
+        693 => ast::Token::Tablespace,
+        694 => ast::Token::Target,
+        695 => ast::Token::Temp,
+        696 => ast::Token::Template,
+        697 => ast::Token::Temporary,
+        698 => ast::Token::TextP,
+        699 => ast::Token::Then,
+        700 => ast::Token::Ties,
+        701 => ast::Token::Time,
+        702 => ast::Token::Timestamp,
+        703 => ast::Token::To,
+        704 => ast::Token::Trailing,
+        705 => ast::Token::Transaction,
+        706 => ast::Token::Transform,
+        707 => ast::Token::Treat,
+        708 => ast::Token::Trigger,
+        709 => ast::Token::Trim,
+        710 => ast::Token::TrueP,
+        711 => ast::Token::Truncate,
+        712 => ast::Token::Trusted,
+        713 => ast::Token::TypeP,
+        714 => ast::Token::TypesP,
+        715 => ast::Token::Uescape,
+        716 => ast::Token::Unbounded,
+        717 => ast::Token::Unconditional,
+        718 => ast::Token::Uncommitted,
+        719 => ast::Token::Unencrypted,
+        720 => ast::Token::Union,
+        721 => ast::Token::Unique,
+        722 => ast::Token::Unknown,
+        723 => ast::Token::Unlisten,
+        724 => ast::Token::Unlogged,
+        725 => ast::Token::Until,
+        726 => ast::Token::Update,
+        727 => ast::Token::User,
+        728 => ast::Token::Using,
+        729 => ast::Token::Vacuum,
+        730 => ast::Token::Valid,
+        731 => ast::Token::Validate,
+        732 => ast::Token::Validator,
+        733 => ast::Token::ValueP,
+        734 => ast::Token::Values,
+        735 => ast::Token::Varchar,
+        736 => ast::Token::Variadic,
+        737 => ast::Token::Varying,
+        738 => ast::Token::Verbose,
+        739 => ast::Token::VersionP,
+        740 => ast::Token::View,
+        741 => ast::Token::Views,
+        742 => ast::Token::Virtual,
+        743 => ast::Token::Volatile,
+        744 => ast::Token::When,
+        745 => ast::Token::Where,
+        746 => ast::Token::WhitespaceP,
+        747 => ast::Token::Window,
+        748 => ast::Token::With,
+        749 => ast::Token::Within,
+        750 => ast::Token::Without,
+        751 => ast::Token::Work,
+        752 => ast::Token::Wrapper,
+        753 => ast::Token::Write,
+        754 => ast::Token::XmlP,
+        755 => ast::Token::Xmlattributes,
+        756 => ast::Token::Xmlconcat,
+        757 => ast::Token::Xmlelement,
+        758 => ast::Token::Xmlexists,
+        759 => ast::Token::Xmlforest,
+        760 => ast::Token::Xmlnamespaces,
+        761 => ast::Token::Xmlparse,
+        762 => ast::Token::Xmlpi,
+        763 => ast::Token::Xmlroot,
+        764 => ast::Token::Xmlserialize,
+        765 => ast::Token::Xmltable,
+        766 => ast::Token::YearP,
+        767 => ast::Token::YesP,
+        768 => ast::Token::Zone,
+        769 => ast::Token::FormatLa,
+        770 => ast::Token::NotLa,
+        771 => ast::Token::NullsLa,
+        772 => ast::Token::WithLa,
+        773 => ast::Token::WithoutLa,
+        774 => ast::Token::ModeTypeName,
+        775 => ast::Token::ModePlpgsqlExpr,
+        776 => ast::Token::ModePlpgsqlAssign1,
+        777 => ast::Token::ModePlpgsqlAssign2,
+        778 => ast::Token::ModePlpgsqlAssign3,
+        779 => ast::Token::Uminus,
+        _ => return None,
+    })
+}
+
+pub(crate) fn keyword_kind(value: i32) -> Option<ast::KeywordKind> {
+    Some(match value {
+        0 => ast::KeywordKind::NoKeyword,
+        1 => ast::KeywordKind::UnreservedKeyword,
+        2 => ast::KeywordKind::ColNameKeyword,
+        3 => ast::KeywordKind::TypeFuncNameKeyword,
+        4 => ast::KeywordKind::ReservedKeyword,
+        _ => return None,
+    })
 }

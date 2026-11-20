@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 
-use typedpg_pg_query::protobuf::{self, a_const::Val as ConstVal, node};
+use typedpg_pg_query::ast::{self, AConstValue};
 
 use super::{Col, StrictLog, StrictNode, plain_column};
 use crate::pg_catalog::PgCatalog;
@@ -91,90 +91,96 @@ const MAX_COLUMNS: usize = 16;
 
 /// The plain columns of this level `n` references (not those inside a
 /// sublink), if it is small enough to evaluate once per column.
-pub(crate) fn candidate_columns(n: &protobuf::Node, scope: &Scope) -> Vec<Col> {
+pub(crate) fn candidate_columns(n: &Option<ast::Node>, scope: &Scope) -> Vec<Col> {
     let mut out = BTreeSet::new();
     let mut count = 0usize;
-    if !collect(n, scope, &mut out, &mut count) || out.len() > MAX_COLUMNS {
+    if !collect(n.as_ref(), scope, &mut out, &mut count) || out.len() > MAX_COLUMNS {
         return Vec::new();
     }
     out.into_iter().collect()
 }
 
-fn collect(n: &protobuf::Node, scope: &Scope, out: &mut BTreeSet<Col>, count: &mut usize) -> bool {
+fn collect(
+    n: Option<&ast::Node>,
+    scope: &Scope,
+    out: &mut BTreeSet<Col>,
+    count: &mut usize,
+) -> bool {
     *count += 1;
     if *count > MAX_NODES {
         return false;
     }
-    let mut each = |ns: &[protobuf::Node]| ns.iter().all(|c| collect(c, scope, out, count));
-    match n.node.as_ref() {
-        Some(node::Node::ColumnRef(_)) => {
+    let mut each =
+        |ns: &[Option<ast::Node>]| ns.iter().all(|c| collect(c.as_ref(), scope, out, count));
+    match n {
+        Some(n @ ast::Node::ColumnRef(_)) => {
             if let Some((c, _)) = plain_column(n, scope) {
                 out.insert(c);
             }
             true
         }
-        Some(node::Node::AExpr(e)) => {
-            let kids: Vec<protobuf::Node> = [&e.lexpr, &e.rexpr]
+        Some(ast::Node::AExpr(e)) => {
+            let kids: Vec<Option<ast::Node>> = [&e.lexpr, &e.rexpr]
                 .into_iter()
-                .flatten()
-                .map(|b| (**b).clone())
+                .filter(|b| b.is_some())
+                .cloned()
                 .collect();
             each(&kids)
         }
-        Some(node::Node::BoolExpr(b)) => each(&b.args),
-        Some(node::Node::FuncCall(f)) => each(&f.args),
-        Some(node::Node::List(l)) => each(&l.items),
-        Some(node::Node::CoalesceExpr(c)) => each(&c.args),
-        Some(node::Node::MinMaxExpr(m)) => each(&m.args),
-        Some(node::Node::RowExpr(r)) => each(&r.args),
-        Some(node::Node::TypeCast(c)) => c
+        Some(ast::Node::BoolExpr(b)) => each(&b.args),
+        Some(ast::Node::FuncCall(f)) => each(&f.args),
+        Some(ast::Node::List(l)) => each(&l.items),
+        Some(ast::Node::CoalesceExpr(c)) => each(&c.args),
+        Some(ast::Node::MinMaxExpr(m)) => each(&m.args),
+        Some(ast::Node::RowExpr(r)) => each(&r.args),
+        Some(ast::Node::TypeCast(c)) => c
             .arg
-            .as_deref()
-            .is_none_or(|a| collect(a, scope, out, count)),
-        Some(node::Node::CollateClause(c)) => c
+            .as_ref()
+            .is_none_or(|a| collect(Some(a), scope, out, count)),
+        Some(ast::Node::CollateClause(c)) => c
             .arg
-            .as_deref()
-            .is_none_or(|a| collect(a, scope, out, count)),
-        Some(node::Node::NamedArgExpr(a)) => a
+            .as_ref()
+            .is_none_or(|a| collect(Some(a), scope, out, count)),
+        Some(ast::Node::NamedArgExpr(a)) => a
             .arg
-            .as_deref()
-            .is_none_or(|a| collect(a, scope, out, count)),
-        Some(node::Node::NullTest(t)) => t
+            .as_ref()
+            .is_none_or(|a| collect(Some(a), scope, out, count)),
+        Some(ast::Node::NullTest(t)) => t
             .arg
-            .as_deref()
-            .is_none_or(|a| collect(a, scope, out, count)),
-        Some(node::Node::BooleanTest(t)) => t
+            .as_ref()
+            .is_none_or(|a| collect(Some(a), scope, out, count)),
+        Some(ast::Node::BooleanTest(t)) => t
             .arg
-            .as_deref()
-            .is_none_or(|a| collect(a, scope, out, count)),
+            .as_ref()
+            .is_none_or(|a| collect(Some(a), scope, out, count)),
         _ => true,
     }
 }
 
 impl Subst<'_> {
-    pub(crate) fn eval(&self, n: &protobuf::Node) -> Val {
-        let Some(inner) = n.node.as_ref() else {
+    pub(crate) fn eval(&self, n: &Option<ast::Node>) -> Val {
+        let Some(inner) = n.as_ref() else {
             return Val::Unknown;
         };
         match inner {
-            node::Node::ColumnRef(_) => match plain_column(n, self.scope) {
+            ast::Node::ColumnRef(_) => match plain_column(inner, self.scope) {
                 Some((c, _)) if &c == self.null => Val::Null,
                 _ => Val::Unknown,
             },
-            node::Node::AConst(c) => {
+            ast::Node::AConst(c) => {
                 if c.isnull {
                     return Val::Null;
                 }
                 match c.val.as_ref() {
-                    Some(ConstVal::Ival(i)) => Val::Int(i.ival as i64),
-                    Some(ConstVal::Sval(s)) => Val::Text(s.sval.clone()),
-                    Some(ConstVal::Boolval(b)) => Val::Bool(b.boolval),
+                    Some(AConstValue::Integer(i)) => Val::Int(i.ival as i64),
+                    Some(AConstValue::String(s)) => Val::Text(s.sval.clone()),
+                    Some(AConstValue::Boolean(b)) => Val::Bool(b.boolval),
                     Some(_) => Val::NonNull,
                     None => Val::Unknown,
                 }
             }
-            node::Node::TypeCast(tc) => {
-                let v = tc.arg.as_deref().map_or(Val::Unknown, |a| self.eval(a));
+            ast::Node::TypeCast(tc) => {
+                let v = self.eval(&tc.arg);
                 if v == Val::Null {
                     // A strict cast (or one with no function) of NULL.
                     return if self.log.is_strict(tc.location, StrictNode::Cast) {
@@ -205,51 +211,48 @@ impl Subst<'_> {
                     _ => Val::Unknown,
                 }
             }
-            node::Node::NullTest(t) => {
-                let v = t.arg.as_deref().map_or(Val::Unknown, |a| self.eval(a));
+            ast::Node::NullTest(t) => {
+                let v = self.eval(&t.arg);
                 let is_null = match v {
                     Val::Null => true,
                     v if v.known_non_null() => false,
                     _ => return Val::Unknown,
                 };
-                match protobuf::NullTestType::try_from(t.nulltesttype) {
-                    Ok(protobuf::NullTestType::IsNull) => Val::Bool(is_null),
-                    Ok(protobuf::NullTestType::IsNotNull) => Val::Bool(!is_null),
-                    _ => Val::Unknown,
+                match t.nulltesttype {
+                    ast::NullTestType::IsNull => Val::Bool(is_null),
+                    ast::NullTestType::IsNotNull => Val::Bool(!is_null),
                 }
             }
-            node::Node::BooleanTest(t) => {
-                use protobuf::BoolTestType as B;
-                let v = t.arg.as_deref().map_or(Val::Unknown, |a| self.eval(a));
+            ast::Node::BooleanTest(t) => {
+                use ast::BoolTestType as B;
+                let v = self.eval(&t.arg);
                 let v = match v {
                     Val::Null => None,
                     Val::Bool(b) => Some(b),
                     _ => return Val::Unknown,
                 };
-                Val::Bool(match B::try_from(t.booltesttype) {
-                    Ok(B::IsTrue) => v == Some(true),
-                    Ok(B::IsNotTrue) => v != Some(true),
-                    Ok(B::IsFalse) => v == Some(false),
-                    Ok(B::IsNotFalse) => v != Some(false),
-                    Ok(B::IsUnknown) => v.is_none(),
-                    Ok(B::IsNotUnknown) => v.is_some(),
-                    _ => return Val::Unknown,
+                Val::Bool(match t.booltesttype {
+                    B::IsTrue => v == Some(true),
+                    B::IsNotTrue => v != Some(true),
+                    B::IsFalse => v == Some(false),
+                    B::IsNotFalse => v != Some(false),
+                    B::IsUnknown => v.is_none(),
+                    B::IsNotUnknown => v.is_some(),
                 })
             }
-            node::Node::BoolExpr(b) => {
+            ast::Node::BoolExpr(b) => {
                 let vals: Vec<Val> = b.args.iter().map(|a| self.eval(a)).collect();
-                match protobuf::BoolExprType::try_from(b.boolop) {
-                    Ok(protobuf::BoolExprType::NotExpr) => match vals.as_slice() {
+                match b.boolop {
+                    ast::BoolExprType::NotExpr => match vals.as_slice() {
                         [Val::Null] => Val::Null,
                         [Val::Bool(v)] => Val::Bool(!v),
                         _ => Val::Unknown,
                     },
-                    Ok(protobuf::BoolExprType::AndExpr) => three_valued(&vals, false),
-                    Ok(protobuf::BoolExprType::OrExpr) => three_valued(&vals, true),
-                    _ => Val::Unknown,
+                    ast::BoolExprType::AndExpr => three_valued(&vals, false),
+                    ast::BoolExprType::OrExpr => three_valued(&vals, true),
                 }
             }
-            node::Node::CoalesceExpr(c) => {
+            ast::Node::CoalesceExpr(c) => {
                 for a in &c.args {
                     match self.eval(a) {
                         Val::Null => continue,
@@ -258,9 +261,8 @@ impl Subst<'_> {
                 }
                 Val::Null
             }
-            node::Node::MinMaxExpr(m) => {
-                let greatest =
-                    protobuf::MinMaxOp::try_from(m.op) == Ok(protobuf::MinMaxOp::IsGreatest);
+            ast::Node::MinMaxExpr(m) => {
+                let greatest = m.op == ast::MinMaxOp::IsGreatest;
                 let mut ints = Vec::new();
                 let mut non_null = false;
                 let mut unknown = false;
@@ -289,8 +291,8 @@ impl Subst<'_> {
                     self.converted(m.location, Val::Int(*ints.iter().min().expect("non-empty")))
                 }
             }
-            node::Node::AExpr(e) => self.eval_a_expr(e),
-            node::Node::FuncCall(f) => self.eval_func(f),
+            ast::Node::AExpr(e) => self.eval_a_expr(e),
+            ast::Node::FuncCall(f) => self.eval_func(f),
             _ => Val::Unknown,
         }
     }
@@ -324,13 +326,13 @@ impl Subst<'_> {
                 && b.abs() <= FLOAT_EXACT)
     }
 
-    fn eval_a_expr(&self, e: &protobuf::AExpr) -> Val {
-        use protobuf::AExprKind as K;
-        let l = e.lexpr.as_deref().map(|n| self.eval(n));
-        let r = e.rexpr.as_deref().map(|n| self.eval(n));
+    fn eval_a_expr(&self, e: &ast::AExpr) -> Val {
+        use ast::AExprKind as K;
+        let l = e.lexpr.is_some().then(|| self.eval(&e.lexpr));
+        let r = e.rexpr.is_some().then(|| self.eval(&e.rexpr));
         let strict = self.log.is_strict(e.location, StrictNode::Op);
-        match K::try_from(e.kind) {
-            Ok(K::AexprOp) => {
+        match e.kind {
+            K::AexprOp => {
                 if !strict {
                     return Val::Unknown;
                 }
@@ -346,14 +348,16 @@ impl Subst<'_> {
             // `x IN (…)`, `x BETWEEN …`, `x op ANY (array)` with a NULL `x`
             // and strict comparisons: NULL (an IN list, a BETWEEN's bounds
             // are never empty; an empty array makes ANY FALSE, ALL TRUE).
-            Ok(
-                K::AexprIn
-                | K::AexprBetween
-                | K::AexprNotBetween
-                | K::AexprBetweenSym
-                | K::AexprNotBetweenSym,
-            ) if strict && l == Some(Val::Null) => Val::Null,
-            Ok(K::AexprNullif) => match (l, r) {
+            K::AexprIn
+            | K::AexprBetween
+            | K::AexprNotBetween
+            | K::AexprBetweenSym
+            | K::AexprNotBetweenSym
+                if strict && l == Some(Val::Null) =>
+            {
+                Val::Null
+            }
+            K::AexprNullif => match (l, r) {
                 (Some(Val::Null), _) => Val::Null,
                 (Some(Val::Int(a)), Some(Val::Int(b))) if self.ints_compare(e.location, a, b) => {
                     if a == b {
@@ -365,8 +369,8 @@ impl Subst<'_> {
                 (Some(Val::Int(a)), Some(Val::Null)) => Val::Int(a),
                 _ => Val::Unknown,
             },
-            Ok(K::AexprDistinct | K::AexprNotDistinct) => {
-                let distinct = K::try_from(e.kind) == Ok(K::AexprDistinct);
+            K::AexprDistinct | K::AexprNotDistinct => {
+                let distinct = e.kind == K::AexprDistinct;
                 let same = match (l, r) {
                     (Some(Val::Null), Some(Val::Null)) => true,
                     (Some(Val::Null), Some(v)) | (Some(v), Some(Val::Null))
@@ -424,7 +428,7 @@ impl Subst<'_> {
         Val::Unknown
     }
 
-    fn eval_func(&self, f: &protobuf::FuncCall) -> Val {
+    fn eval_func(&self, f: &ast::FuncCall) -> Val {
         let vals: Vec<Val> = f.args.iter().map(|a| self.eval(a)).collect();
         if self.log.is_strict(f.location, StrictNode::Func) {
             return if vals.contains(&Val::Null) {

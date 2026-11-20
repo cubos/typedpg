@@ -1,6 +1,7 @@
 //! The binding's API against PostgreSQL's own parser.
 
-use typedpg_pg_query::{NodeEnum, NodeRef, protobuf};
+use typedpg_pg_query::NodeRef;
+use typedpg_pg_query::ast::{self, Node};
 
 #[test]
 fn parses_with_postgres_18_grammar() {
@@ -9,11 +10,8 @@ fn parses_with_postgres_18_grammar() {
     let parsed =
         typedpg_pg_query::parse("UPDATE t SET a = 1 RETURNING WITH (OLD AS o, NEW AS n) o.a, n.a")
             .unwrap();
-    assert_eq!(parsed.protobuf.version, typedpg_pg_query::PG_VERSION_NUM);
-    assert!(matches!(
-        parsed.protobuf.nodes()[0].0,
-        NodeRef::UpdateStmt(_)
-    ));
+    assert_eq!(parsed.tree.version, typedpg_pg_query::PG_VERSION_NUM);
+    assert!(matches!(parsed.tree.nodes()[0].0, NodeRef::UpdateStmt(_)));
 }
 
 #[test]
@@ -50,11 +48,31 @@ fn the_deepest_query_parses_on_a_small_stack() {
     let sql = format!("SELECT 1{}", " + 1".repeat(4995));
     let parsed = std::thread::Builder::new()
         .stack_size(256 << 10)
-        .spawn(move || typedpg_pg_query::parse(&sql).map(|p| p.protobuf.stmts.len()))
+        .spawn(move || typedpg_pg_query::parse(&sql).map(|p| p.tree.stmts.len()))
         .unwrap()
         .join()
         .unwrap();
     assert_eq!(parsed.unwrap(), 1);
+}
+
+#[test]
+fn the_deepest_tree_drops_on_a_small_stack() {
+    // Dropping a tree recurses once per level; `NodeBox` grows the stack as
+    // it goes, so the deepest tree drops on a 256 kB thread stack, in a
+    // debug build too.
+    let sql = format!("SELECT 1{}", " + 1".repeat(4995));
+    let parsed = typedpg_pg_query::parse(&sql).unwrap();
+    let dropped = std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(move || {
+            let copy = parsed.tree.clone();
+            drop(parsed);
+            copy.stmts.len()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(dropped, 1);
 }
 
 #[test]
@@ -117,42 +135,36 @@ fn nodes_reaches_every_expression() {
         "SELECT a + (SELECT max(b) FROM u WHERE u.c = t.d) FROM t WHERE e IN (1, 2) ORDER BY f",
     )
     .unwrap();
-    let nodes = parsed.protobuf.nodes();
+    let nodes = parsed.tree.nodes();
     // The statement itself comes first, at depth 0.
     assert!(matches!(nodes[0], (NodeRef::SelectStmt(_), 0)));
     let mut columns: Vec<String> = nodes
         .iter()
         .filter_map(|(n, _)| match n {
-            NodeRef::ColumnRef(cr) => cr.fields.last().and_then(|f| match &f.node {
-                Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+            NodeRef::ColumnRef(cr) => match cr.fields.last() {
+                Some(Some(Node::String(s))) => Some(s.sval.clone()),
                 _ => None,
-            }),
+            },
             _ => None,
         })
         .collect();
     columns.sort();
     assert_eq!(columns, ["a", "b", "c", "d", "e", "f"]);
     // A subtree walk starts at its own root.
-    let stmt = parsed.protobuf.stmts[0]
-        .stmt
-        .as_ref()
-        .unwrap()
-        .node
-        .as_ref()
-        .unwrap();
+    let stmt = parsed.tree.stmts[0].stmt.as_ref().unwrap();
     assert_eq!(stmt.nodes().len(), nodes.len());
 }
 
 #[test]
 fn nodes_mut_edits_the_tree_in_place() {
     let mut parsed = typedpg_pg_query::parse("SELECT a FROM t").unwrap();
-    for (n, _) in unsafe { parsed.protobuf.nodes_mut() } {
+    for (n, _) in unsafe { parsed.tree.nodes_mut() } {
         if let typedpg_pg_query::NodeMut::RangeVar(rv) = n {
             unsafe { (*rv).relname = "renamed".into() };
         }
     }
     let relations: Vec<String> = parsed
-        .protobuf
+        .tree
         .nodes()
         .iter()
         .filter_map(|(n, _)| match n {
@@ -166,14 +178,14 @@ fn nodes_mut_edits_the_tree_in_place() {
 #[test]
 fn scans_tokens() {
     let scan = typedpg_pg_query::scan("SELECT $1 FROM t").unwrap();
-    let kinds: Vec<protobuf::Token> = scan.tokens.iter().map(|t| t.token()).collect();
+    let kinds: Vec<ast::Token> = scan.tokens.iter().map(|t| t.token).collect();
     assert_eq!(
         kinds,
         [
-            protobuf::Token::Select,
-            protobuf::Token::Param,
-            protobuf::Token::From,
-            protobuf::Token::Ident
+            ast::Token::Select,
+            ast::Token::Param,
+            ast::Token::From,
+            ast::Token::Ident
         ]
     );
 }
@@ -239,14 +251,7 @@ fn equal_compares_trees_like_postgres_equal() {
     use typedpg_pg_query::Equal;
     let expr = |sql: &str| {
         let parsed = typedpg_pg_query::parse(&format!("SELECT {sql}")).unwrap();
-        let NodeEnum::SelectStmt(sel) = parsed.protobuf.stmts[0]
-            .stmt
-            .as_ref()
-            .unwrap()
-            .node
-            .clone()
-            .unwrap()
-        else {
+        let Some(Node::SelectStmt(sel)) = parsed.tree.stmts[0].stmt.clone() else {
             unreachable!()
         };
         sel.target_list[0].clone()
@@ -269,36 +274,26 @@ fn rewrite_replaces_nodes_bottom_up() {
     // excepted: the nested cast goes first, so both layers go.
     let parsed =
         typedpg_pg_query::parse("SELECT a::int::int + 1, (SELECT b::int), c::text").unwrap();
-    let mut stmt = *parsed.protobuf.stmts[0].stmt.clone().unwrap();
-    stmt.rewrite(
-        &mut |n| !matches!(n.node, Some(NodeEnum::SubLink(_))),
-        &mut |n| {
-            if let Some(NodeEnum::TypeCast(tc)) = n.node.as_mut()
-                && tc.type_name.as_ref().is_some_and(|tn| {
-                    tn.names
-                        .iter()
-                        .any(|s| matches!(&s.node, Some(NodeEnum::String(s)) if s.sval == "int4"))
-                })
-                && let Some(arg) = tc.arg.as_deref_mut()
-            {
-                *n = std::mem::take(arg);
-            }
-        },
-    );
+    let mut stmt = parsed.tree.stmts[0].stmt.clone().unwrap();
+    stmt.rewrite(&mut |n| !matches!(n, Node::SubLink(_)), &mut |n| {
+        if let Node::TypeCast(tc) = n
+            && tc.type_name.as_ref().is_some_and(|tn| {
+                tn.names
+                    .iter()
+                    .any(|s| matches!(s, Some(Node::String(s)) if s.sval == "int4"))
+            })
+            && let Some(arg) = tc.arg.take()
+        {
+            *n = arg;
+        }
+    });
     // The tree now equals the one of the rewritten SQL: `a + 1` (both casts
     // gone), the subquery untouched, and `c::text` intact.
-    let NodeEnum::SelectStmt(rewritten) = stmt.node.unwrap() else {
+    let Node::SelectStmt(rewritten) = stmt else {
         unreachable!()
     };
     let expected = typedpg_pg_query::parse("SELECT a + 1, (SELECT b::int), c::text").unwrap();
-    let NodeEnum::SelectStmt(expected) = expected.protobuf.stmts[0]
-        .stmt
-        .as_ref()
-        .unwrap()
-        .node
-        .clone()
-        .unwrap()
-    else {
+    let Some(Node::SelectStmt(expected)) = expected.tree.stmts[0].stmt.clone() else {
         unreachable!()
     };
     assert!(rewritten.target_list.equal(&expected.target_list));

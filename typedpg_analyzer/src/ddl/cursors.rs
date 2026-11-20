@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use typedpg_pg_query::protobuf::{ClosePortalStmt, DeclareCursorStmt, FetchStmt};
+use typedpg_pg_query::ast::{ClosePortalStmt, DeclareCursorStmt, FetchStmt};
 
 use super::DdlError;
 use crate::pg_catalog::PgCatalog;
@@ -115,14 +115,11 @@ pub(crate) fn check_declare(interp: &PgCatalog, stmt: &DeclareCursorStmt) -> Res
             )));
         }
     }
-    let Some(query) = stmt.query.as_deref() else {
-        return Ok(());
-    };
-    let Some(inner) = query.node.as_ref() else {
+    let Some(inner) = stmt.query.as_ref() else {
         return Ok(());
     };
     super::dml::check_executed(interp, inner)?;
-    if super::views::has_modifying_cte(query) {
+    if super::views::has_modifying_cte(&stmt.query) {
         return Err(DdlError::UnsupportedDdl(
             "DECLARE CURSOR must not contain data-modifying statements in WITH".into(),
         ));

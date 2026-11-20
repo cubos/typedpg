@@ -50,7 +50,7 @@
 //!   built-ins that run SQL given as text, by its C symbol.
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{AlterTableType, RangeVar, a_const, node};
+use typedpg_pg_query::ast::{self, AlterTableType, RangeVar};
 
 use crate::pg_catalog::PgCatalog;
 
@@ -115,14 +115,14 @@ const ROLE: &str = "session_replication_role";
 
 /// Note what statement `stmt` (the one being applied, whose text is
 /// [`PgCatalog::statement_sql`]) does to foreign-key checks.
-pub(crate) fn note(db: &mut PgCatalog, stmt: &node::Node) {
+pub(crate) fn note(db: &mut PgCatalog, stmt: &ast::Node) {
     if db.fk_checks_bypassed {
         return;
     }
     let forms = text_forms(db, stmt);
     let defines_code = matches!(
         stmt,
-        node::Node::CreateFunctionStmt(_) | node::Node::DoStmt(_)
+        ast::Node::CreateFunctionStmt(_) | ast::Node::DoStmt(_)
     );
     let markers = if defines_code { BODY_MARKERS } else { &[ROLE] };
     if forms.iter().any(|t| markers.iter().any(|m| t.contains(m))) || bypasses(stmt) {
@@ -136,13 +136,13 @@ pub(crate) fn note(db: &mut PgCatalog, stmt: &node::Node) {
 /// escapes decoded, and each of those with comments dropped — each with
 /// whitespace collapsed. (Comments are dropped without regard to string
 /// literals, so the forms without them stand in for what that might hide.)
-fn text_forms(db: &PgCatalog, stmt: &node::Node) -> Vec<String> {
+fn text_forms(db: &PgCatalog, stmt: &ast::Node) -> Vec<String> {
     let mut text = db.statement_sql.clone().unwrap_or_default();
     for (n, _) in stmt.nodes() {
         let s = match n {
             NodeRef::String(s) => s.sval.as_str(),
             NodeRef::AConst(c) => match &c.val {
-                Some(a_const::Val::Sval(s)) => s.sval.as_str(),
+                Some(ast::AConstValue::String(s)) => s.sval.as_str(),
                 _ => continue,
             },
             NodeRef::VariableSetStmt(v) => v.name.as_str(),
@@ -259,7 +259,7 @@ fn system_table(rv: &RangeVar) -> bool {
 
 /// What in the statement's parse tree may bypass the checks (see the
 /// module docs).
-fn bypasses(stmt: &node::Node) -> bool {
+fn bypasses(stmt: &ast::Node) -> bool {
     let target = |rv: Option<&RangeVar>| rv.is_some_and(system_table);
     stmt.nodes().iter().any(|(n, _)| match n {
         NodeRef::FuncCall(fc) => {
@@ -272,25 +272,22 @@ fn bypasses(stmt: &node::Node) -> bool {
                 name.as_slice(),
                 ["set_config"] | ["pg_catalog", "set_config"]
             ) && !matches!(
-                fc.args.first().and_then(|a| a.node.as_ref()),
-                Some(node::Node::AConst(typedpg_pg_query::protobuf::AConst {
-                    val: Some(a_const::Val::Sval(_)),
-                    ..
-                }))
+                fc.args.first().and_then(|a| a.as_ref()),
+                Some(ast::Node::AConst(c)) if matches!(c.val, Some(ast::AConstValue::String(_)))
             );
             let runs_sql = name
                 .last()
                 .is_some_and(|n| SQL_RUNNING_BUILTINS.contains(&n.to_ascii_lowercase().as_str()));
             set_config || runs_sql
         }
-        NodeRef::InsertStmt(s) => target(s.relation.as_ref()),
-        NodeRef::UpdateStmt(s) => target(s.relation.as_ref()),
-        NodeRef::DeleteStmt(s) => target(s.relation.as_ref()),
-        NodeRef::MergeStmt(s) => target(s.relation.as_ref()),
-        NodeRef::CopyStmt(s) => s.is_program || (s.is_from && target(s.relation.as_ref())),
+        NodeRef::InsertStmt(s) => target(s.relation.as_deref()),
+        NodeRef::UpdateStmt(s) => target(s.relation.as_deref()),
+        NodeRef::DeleteStmt(s) => target(s.relation.as_deref()),
+        NodeRef::MergeStmt(s) => target(s.relation.as_deref()),
+        NodeRef::CopyStmt(s) => s.is_program || (s.is_from && target(s.relation.as_deref())),
         NodeRef::AlterTableCmd(c) => matches!(
-            AlterTableType::try_from(c.subtype),
-            Ok(AlterTableType::AtEnableReplicaTrig | AlterTableType::AtEnableAlwaysTrig)
+            c.subtype,
+            AlterTableType::AtEnableReplicaTrig | AlterTableType::AtEnableAlwaysTrig
         ),
         // A foreign table's, server's or wrapper's `program` option runs
         // a shell command (file_fdw), as COPY ... PROGRAM does.
@@ -299,20 +296,16 @@ fn bypasses(stmt: &node::Node) -> bool {
         NodeRef::CreateExtensionStmt(e) => {
             REMOTE_SQL_EXTENSIONS.contains(&e.extname.to_ascii_lowercase().as_str())
         }
-        NodeRef::TruncateStmt(s) => s.relations.iter().any(|r| match r.node.as_ref() {
-            Some(node::Node::RangeVar(rv)) => system_table(rv),
+        NodeRef::TruncateStmt(s) => s.relations.iter().any(|r| match r.as_ref() {
+            Some(ast::Node::RangeVar(rv)) => system_table(rv),
             _ => true,
         }),
         // A view over a catalog: writes through it reach the catalog.
-        NodeRef::ViewStmt(v) => v
-            .query
-            .as_deref()
-            .and_then(|q| q.node.as_ref())
-            .is_some_and(|q| {
-                q.nodes()
-                    .iter()
-                    .any(|(n, _)| matches!(n, NodeRef::RangeVar(rv) if system_table(rv)))
-            }),
+        NodeRef::ViewStmt(v) => v.query.as_ref().is_some_and(|q| {
+            q.nodes()
+                .iter()
+                .any(|(n, _)| matches!(n, NodeRef::RangeVar(rv) if system_table(rv)))
+        }),
         NodeRef::CreateSubscriptionStmt(_) | NodeRef::AlterSubscriptionStmt(_) => true,
         _ => false,
     })
@@ -320,20 +313,23 @@ fn bypasses(stmt: &node::Node) -> bool {
 
 /// A `LANGUAGE internal` or `c` routine whose symbol is one of
 /// [`SQL_RUNNING_SYMBOLS`].
-fn aliases_sql_running_builtin(f: &typedpg_pg_query::protobuf::CreateFunctionStmt) -> bool {
+fn aliases_sql_running_builtin(f: &typedpg_pg_query::ast::CreateFunctionStmt) -> bool {
     let defelem = |name: &str| {
-        f.options.iter().find_map(|o| match o.node.as_ref() {
-            Some(node::Node::DefElem(d)) if d.defname == name => d.arg.as_deref(),
+        f.options.iter().find_map(|o| match o.as_ref() {
+            Some(ast::Node::DefElem(d)) if d.defname == name => d.arg.as_ref(),
             _ => None,
         })
     };
     let native = defelem("language")
-        .and_then(super::util::node_string)
+        .and_then(|l| match l {
+            ast::Node::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
         .is_some_and(|l| l.eq_ignore_ascii_case("internal") || l.eq_ignore_ascii_case("c"));
     if !native {
         return false;
     }
-    let Some(body) = defelem("as").and_then(|b| b.node.as_ref()) else {
+    let Some(body) = defelem("as") else {
         return false;
     };
     body.nodes().iter().any(|(n, _)| match n {

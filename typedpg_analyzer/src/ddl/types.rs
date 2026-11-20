@@ -1,8 +1,8 @@
 //! CREATE TYPE / CREATE DOMAIN / ALTER TYPE DDL handlers.
 
-use typedpg_pg_query::protobuf::{
-    AlterEnumStmt, CoercionContext, CompositeTypeStmt, ConstrType, CreateCastStmt,
-    CreateDomainStmt, CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, TypeName, node,
+use typedpg_pg_query::ast::{
+    self, AlterEnumStmt, CoercionContext, CompositeTypeStmt, ConstrType, CreateCastStmt,
+    CreateDomainStmt, CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, TypeName,
 };
 
 use crate::oid::{PgCastOid, PgClassOid, PgEnumOid, PgNamespaceOid, PgProcOid, PgTypeOid};
@@ -81,19 +81,19 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     let mut null_defined = false;
     let mut typ_not_null = false;
     for n in &stmt.constraints {
-        let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
+        let Some(ast::Node::Constraint(c)) = n.as_ref() else {
             continue;
         };
         // DefineDomain: which clauses a domain takes, and how often.
         let fail = |msg: &str| Err(DdlError::Parse(msg.to_owned()));
-        match ConstrType::try_from(c.contype) {
-            Ok(ConstrType::ConstrDefault) => {
+        match c.contype {
+            ConstrType::ConstrDefault => {
                 if saw_default {
                     return fail("multiple default expressions");
                 }
                 saw_default = true;
             }
-            Ok(ConstrType::ConstrNotnull) => {
+            ConstrType::ConstrNotnull => {
                 if null_defined {
                     return fail(if typ_not_null {
                         "redundant NOT NULL constraint definition"
@@ -107,48 +107,46 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
                 typ_not_null = true;
                 null_defined = true;
             }
-            Ok(ConstrType::ConstrNull) => {
+            ConstrType::ConstrNull => {
                 if null_defined && typ_not_null {
                     return fail("conflicting NULL/NOT NULL constraints");
                 }
                 typ_not_null = false;
                 null_defined = true;
             }
-            Ok(ConstrType::ConstrCheck) if c.is_no_inherit => {
+            ConstrType::ConstrCheck if c.is_no_inherit => {
                 return fail("check constraints for domains cannot be marked NO INHERIT");
             }
-            Ok(ConstrType::ConstrUnique) => {
+            ConstrType::ConstrUnique => {
                 return fail("unique constraints not possible for domains");
             }
-            Ok(ConstrType::ConstrPrimary) => {
+            ConstrType::ConstrPrimary => {
                 return fail("primary key constraints not possible for domains");
             }
-            Ok(ConstrType::ConstrExclusion) => {
+            ConstrType::ConstrExclusion => {
                 return fail("exclusion constraints not possible for domains");
             }
-            Ok(ConstrType::ConstrForeign) => {
+            ConstrType::ConstrForeign => {
                 return fail("foreign key constraints not possible for domains");
             }
-            Ok(
-                ConstrType::ConstrAttrDeferrable
-                | ConstrType::ConstrAttrNotDeferrable
-                | ConstrType::ConstrAttrDeferred
-                | ConstrType::ConstrAttrImmediate,
-            ) => {
+            ConstrType::ConstrAttrDeferrable
+            | ConstrType::ConstrAttrNotDeferrable
+            | ConstrType::ConstrAttrDeferred
+            | ConstrType::ConstrAttrImmediate => {
                 return fail("specifying constraint deferrability not supported for domains");
             }
-            Ok(ConstrType::ConstrGenerated | ConstrType::ConstrIdentity) => {
+            ConstrType::ConstrGenerated | ConstrType::ConstrIdentity => {
                 return fail("specifying GENERATED not supported for domains");
             }
-            Ok(ConstrType::ConstrAttrEnforced | ConstrType::ConstrAttrNotEnforced) => {
+            ConstrType::ConstrAttrEnforced | ConstrType::ConstrAttrNotEnforced => {
                 return fail("specifying constraint enforceability not supported for domains");
             }
             _ => {}
         }
         // domainAddDefault: cooked like a column default named after the
         // domain, against the base type.
-        if c.contype == ConstrType::ConstrDefault as i32
-            && let Some(expr) = c.raw_expr.as_deref()
+        if c.contype == ConstrType::ConstrDefault
+            && let Some(expr) = Some(&c.raw_expr).filter(|e| e.is_some())
         {
             let (checked, refs) = super::depend::collect(|| {
                 super::defaults::check_default(interp, expr, &name, base_type_oid)
@@ -230,10 +228,10 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
 }
 
 /// A bare `NULL`, cast or not: a default that is no default.
-fn is_null_constant(expr: &typedpg_pg_query::protobuf::Node) -> bool {
-    match expr.node.as_ref() {
-        Some(node::Node::AConst(c)) => c.isnull,
-        Some(node::Node::TypeCast(tc)) => tc.arg.as_deref().is_some_and(is_null_constant),
+fn is_null_constant(expr: &Option<typedpg_pg_query::ast::Node>) -> bool {
+    match expr.as_ref() {
+        Some(ast::Node::AConst(c)) => c.isnull,
+        Some(ast::Node::TypeCast(tc)) => is_null_constant(&tc.arg),
         _ => false,
     }
 }
@@ -277,7 +275,7 @@ fn add_domain_constraint(
     interp: &mut PgCatalog,
     domain: &str,
     base_type: PgTypeOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
     existing: &mut Vec<DomainConstraint>,
 ) -> Result<(), DdlError> {
     let mut refs = Vec::new();
@@ -285,14 +283,14 @@ fn add_domain_constraint(
     let mut null_free_elements = false;
     let mut finite = false;
     let mut allowed = None;
-    let kind = match ConstrType::try_from(c.contype) {
-        Ok(ConstrType::ConstrNotnull) => {
+    let kind = match c.contype {
+        ConstrType::ConstrNotnull => {
             rejects_null = true;
             DomainConstraintKind::NotNull
         }
-        Ok(ConstrType::ConstrCheck) => {
-            if let Some(expr) = c.raw_expr.as_deref() {
-                let checked = check_domain_check_expression(interp, base_type, expr)?;
+        ConstrType::ConstrCheck => {
+            if c.raw_expr.is_some() {
+                let checked = check_domain_check_expression(interp, base_type, &c.raw_expr)?;
                 (refs, rejects_null, null_free_elements, finite, allowed) = (
                     checked.refs,
                     checked.rejects_null,
@@ -399,7 +397,7 @@ struct DomainCheck {
 fn check_domain_check_expression(
     interp: &PgCatalog,
     base_type: PgTypeOid,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<DomainCheck, DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
@@ -433,7 +431,6 @@ fn check_domain_check_expression(
     super::expr_kind::check_expr_kind(interp, expr, super::expr_kind::ExprKind::CheckConstraint)?;
     // A domain CHECK has no parameters (transformParamRef finds no hook).
     if let Some(number) = expr
-        .node
         .iter()
         .flat_map(|n| n.nodes())
         .find_map(|(n, _)| match n {
@@ -515,7 +512,7 @@ fn check_domain_check_expression(
 /// `pg_type.typnotnull`, which every column of the domain reads.
 pub fn alter_domain(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterDomainStmt,
+    stmt: &typedpg_pg_query::ast::AlterDomainStmt,
 ) -> Result<(), DdlError> {
     let parts: Vec<&str> = stmt.type_name.iter().filter_map(node_string).collect();
     let (schema, name) = match parts.as_slice() {
@@ -549,8 +546,8 @@ pub fn alter_domain(
     match stmt.subtype.as_str() {
         // SET NOT NULL / DROP NOT NULL
         "O" => {
-            let nn = typedpg_pg_query::protobuf::Constraint {
-                contype: ConstrType::ConstrNotnull as i32,
+            let nn = typedpg_pg_query::ast::Constraint {
+                contype: ConstrType::ConstrNotnull,
                 ..Default::default()
             };
             add_domain_constraint(interp, name, base_type, &nn, &mut constraints)?;
@@ -558,9 +555,7 @@ pub fn alter_domain(
         "N" => constraints.retain(|c| c.kind != DomainConstraintKind::NotNull),
         // ADD constraint
         "C" => {
-            if let Some(node::Node::Constraint(c)) =
-                stmt.def.as_deref().and_then(|d| d.node.as_ref())
-            {
+            if let Some(ast::Node::Constraint(c)) = stmt.def.as_ref() {
                 add_domain_constraint(interp, name, base_type, c, &mut constraints)?;
             }
         }
@@ -586,7 +581,8 @@ pub fn alter_domain(
         // (AlterDomainDefault). DROP DEFAULT has no effect on typing.
         "T" => {
             let mut default_refs = Vec::new();
-            if let Some(expr) = stmt.def.as_deref() {
+            if stmt.def.is_some() {
+                let expr = &stmt.def;
                 let (checked, refs) = super::depend::collect(|| {
                     super::defaults::check_default(interp, expr, name, base_type)
                 });
@@ -621,8 +617,8 @@ pub fn alter_domain(
                     results: Vec::new(),
                 },
             );
-            match stmt.def.as_deref() {
-                Some(expr) if !is_null_constant(expr) => {
+            match &stmt.def {
+                expr @ Some(_) if !is_null_constant(expr) => {
                     interp.domain_defaults.insert(type_oid);
                 }
                 _ => {
@@ -761,7 +757,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
     );
     let mut field_defs: Vec<FieldDef> = Vec::new();
     for col_node in &stmt.coldeflist {
-        if let Some(node::Node::ColumnDef(cd)) = col_node.node.as_ref()
+        if let Some(ast::Node::ColumnDef(cd)) = col_node.as_ref()
             && let Some(tn) = cd.type_name.as_ref()
         {
             // MergeAttributes.
@@ -849,21 +845,21 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
 
     // DefineRange (typecmds.c): each attribute once; `subtype` is required.
     let conflicting = || DdlError::Parse("conflicting or redundant options".into());
-    let qualified = |de: &typedpg_pg_query::protobuf::DefElem| -> Vec<String> {
-        match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            Some(node::Node::TypeName(tn)) => tn
+    let qualified = |de: &typedpg_pg_query::ast::DefElem| -> Vec<String> {
+        match de.arg.as_ref() {
+            Some(ast::Node::TypeName(tn)) => tn
                 .names
                 .iter()
                 .filter_map(node_string)
                 .map(str::to_owned)
                 .collect(),
-            Some(node::Node::List(l)) => l
+            Some(ast::Node::List(l)) => l
                 .items
                 .iter()
                 .filter_map(node_string)
                 .map(str::to_owned)
                 .collect(),
-            Some(node::Node::String(s)) => vec![s.sval.clone()],
+            Some(ast::Node::String(s)) => vec![s.sval.clone()],
             _ => Vec::new(),
         }
     };
@@ -874,7 +870,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
     let mut diff_name: Option<Vec<String>> = None;
     let mut multirange_names: Option<Vec<String>> = None;
     for param_node in &stmt.params {
-        let Some(node::Node::DefElem(de)) = param_node.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = param_node.as_ref() else {
             continue;
         };
         let slot = match de.defname.as_str() {
@@ -882,9 +878,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
                 if subtype_oid.is_some() {
                     return Err(conflicting());
                 }
-                let Some(node::Node::TypeName(tn)) =
-                    de.arg.as_deref().and_then(|a| a.node.as_ref())
-                else {
+                let Some(ast::Node::TypeName(tn)) = de.arg.as_ref() else {
                     continue;
                 };
                 subtype_oid = Some(super::functions::typename_type_id(interp, tn)?);
@@ -1357,7 +1351,7 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
 /// full type definitions (`CREATE TYPE citext (INPUT = ..., OUTPUT = ...)`)
 /// (DefineType): a full definition fills in a shell made beforehand.
 pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
-    let obj_type = ObjectType::try_from(stmt.kind).unwrap_or(ObjectType::Undefined);
+    let obj_type = stmt.kind;
     if obj_type != ObjectType::ObjectType {
         return Ok(());
     }
@@ -1391,35 +1385,35 @@ pub fn define_type(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlE
 
 /// The value of a `CREATE TYPE` option, as DefineType's `defGetString` reads
 /// it (a name's last component, a string or a number), lowercased.
-fn option_word(de: &typedpg_pg_query::protobuf::DefElem) -> Option<String> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
-        node::Node::TypeName(tn) => tn
+fn option_word(de: &typedpg_pg_query::ast::DefElem) -> Option<String> {
+    match de.arg.as_ref()? {
+        ast::Node::TypeName(tn) => tn
             .names
             .last()
             .and_then(super::util::node_string)
             .map(str::to_ascii_lowercase),
-        node::Node::String(s) => Some(s.sval.to_ascii_lowercase()),
-        node::Node::Integer(i) => Some(i.ival.to_string()),
+        ast::Node::String(s) => Some(s.sval.to_ascii_lowercase()),
+        ast::Node::Integer(i) => Some(i.ival.to_string()),
         _ => None,
     }
 }
 
 /// `defGetQualifiedName` of a support-function option.
-fn option_names(de: &typedpg_pg_query::protobuf::DefElem) -> Vec<String> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::TypeName(tn)) => tn
+fn option_names(de: &typedpg_pg_query::ast::DefElem) -> Vec<String> {
+    match de.arg.as_ref() {
+        Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::List(l)) => l
+        Some(ast::Node::List(l)) => l
             .items
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::String(s)) => vec![s.sval.clone()],
+        Some(ast::Node::String(s)) => vec![s.sval.clone()],
         _ => Vec::new(),
     }
 }
@@ -1473,12 +1467,12 @@ fn define_base_type(
     nsoid: PgNamespaceOid,
     name: &str,
     oid: PgTypeOid,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
-    let defs: Vec<&typedpg_pg_query::protobuf::DefElem> = options
+    let defs: Vec<&typedpg_pg_query::ast::DefElem> = options
         .iter()
-        .filter_map(|o| match o.node.as_ref() {
-            Some(node::Node::DefElem(de)) => Some(de.as_ref()),
+        .filter_map(|o| match o.as_ref() {
+            Some(ast::Node::DefElem(de)) => Some(de.as_ref()),
             _ => None,
         })
         .collect();
@@ -1522,7 +1516,7 @@ fn define_base_type(
     let mut phys = TypePhysical::VARIABLE_BASE;
     let mut storage = TypStorage::Plain;
     if let Some(like) = get("like")
-        && let Some(node::Node::TypeName(tn)) = like.arg.as_deref().and_then(|a| a.node.as_ref())
+        && let Some(ast::Node::TypeName(tn)) = like.arg.as_ref()
     {
         let like_oid = super::functions::typename_type_id(interp, tn)?;
         if let Some(t) = interp.pg_type.get(&like_oid) {
@@ -1542,7 +1536,7 @@ fn define_base_type(
         };
     }
     if let Some(de) = get("element")
-        && let Some(node::Node::TypeName(tn)) = de.arg.as_deref().and_then(|a| a.node.as_ref())
+        && let Some(ast::Node::TypeName(tn)) = de.arg.as_ref()
     {
         let elem = super::functions::typename_type_id(interp, tn)?;
         if interp.pg_type.get(&elem).map(|t| t.typtype) == Some(TypType::Pseudo) {
@@ -1735,7 +1729,7 @@ fn define_base_type(
 }
 
 /// DefineType's `STORAGE = plain | external | extended | main`.
-fn parse_storage(de: &typedpg_pg_query::protobuf::DefElem) -> Option<TypStorage> {
+fn parse_storage(de: &typedpg_pg_query::ast::DefElem) -> Option<TypStorage> {
     Some(match option_word(de)?.as_str() {
         "external" => TypStorage::External,
         "extended" => TypStorage::Extended,
@@ -1750,15 +1744,15 @@ fn parse_storage(de: &typedpg_pg_query::protobuf::DefElem) -> Option<TypStorage>
 /// reserved for true arrays.
 fn subscript_handler(
     interp: &PgCatalog,
-    de: &typedpg_pg_query::protobuf::DefElem,
+    de: &typedpg_pg_query::ast::DefElem,
 ) -> Result<Option<PgProcOid>, DdlError> {
-    let names: Vec<&str> = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::TypeName(tn)) => tn
+    let names: Vec<&str> = match de.arg.as_ref() {
+        Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
             .filter_map(super::util::node_string)
             .collect(),
-        Some(node::Node::String(s)) => vec![s.sval.as_str()],
+        Some(ast::Node::String(s)) => vec![s.sval.as_str()],
         _ => return Ok(None),
     };
     let (schema, name) = match names.as_slice() {
@@ -1799,7 +1793,7 @@ fn subscript_handler(
 /// CREATE TYPE attributes can't be changed.
 pub fn alter_type(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterTypeStmt,
+    stmt: &typedpg_pg_query::ast::AlterTypeStmt,
 ) -> Result<(), DdlError> {
     let tn = TypeName {
         names: stmt.type_name.clone(),
@@ -1813,7 +1807,7 @@ pub fn alter_type(
     let mut storage = None;
     let mut subscript = None;
     for opt in &stmt.options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         // An option without a value means NONE.
@@ -2082,9 +2076,9 @@ pub fn create_cast(interp: &mut PgCatalog, stmt: &CreateCastStmt) -> Result<(), 
         return invalid("source data type and target data type are the same");
     }
 
-    let castcontext = match CoercionContext::try_from(stmt.context) {
-        Ok(CoercionContext::CoercionImplicit) => CastContext::Implicit,
-        Ok(CoercionContext::CoercionAssignment) => CastContext::Assignment,
+    let castcontext = match stmt.context {
+        CoercionContext::CoercionImplicit => CastContext::Implicit,
+        CoercionContext::CoercionAssignment => CastContext::Assignment,
         _ => CastContext::Explicit,
     };
     // CastCreate.
@@ -2328,7 +2322,7 @@ fn new_type_oid(interp: &mut PgCatalog, shell: Option<PgTypeOid>) -> Result<PgTy
 /// resolve to a domain. Other lookup failures are left to the caller.
 pub(crate) fn check_is_domain(
     interp: &PgCatalog,
-    names: &[typedpg_pg_query::protobuf::Node],
+    names: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     let (schema, name) = match parts.as_slice() {
@@ -2364,13 +2358,13 @@ fn check_enum_label(label: &str) -> Result<(), DdlError> {
 /// a missing type with `missing_ok`.
 fn alterable_type(
     interp: &PgCatalog,
-    object: Option<&typedpg_pg_query::protobuf::Node>,
+    object: Option<&typedpg_pg_query::ast::Node>,
     objtype: ObjectType,
     missing_ok: bool,
 ) -> Result<Option<PgTypeOid>, DdlError> {
-    let tn = match object.and_then(|o| o.node.as_ref()) {
-        Some(node::Node::TypeName(tn)) => tn.clone(),
-        Some(node::Node::List(list)) => TypeName {
+    let tn = match object {
+        Some(ast::Node::TypeName(tn)) => (**tn).clone(),
+        Some(ast::Node::List(list)) => TypeName {
             names: list.items.clone(),
             typemod: -1,
             ..Default::default()
@@ -2450,11 +2444,10 @@ fn rename_type_internal(
 /// composite type's relation is renamed with it.
 pub(crate) fn rename_type(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let objtype = ObjectType::try_from(stmt.rename_type).unwrap_or(ObjectType::ObjectType);
-    let Some(oid) = alterable_type(interp, stmt.object.as_deref(), objtype, stmt.missing_ok)?
-    else {
+    let objtype = stmt.rename_type;
+    let Some(oid) = alterable_type(interp, stmt.object.as_ref(), objtype, stmt.missing_ok)? else {
         return Ok(());
     };
     let Some(t) = interp.pg_type.get(&oid).cloned() else {
@@ -2472,12 +2465,11 @@ pub(crate) fn rename_type(
 /// relation) move along.
 pub(crate) fn set_type_schema(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterObjectSchemaStmt,
+    stmt: &typedpg_pg_query::ast::AlterObjectSchemaStmt,
     new_schema: &str,
 ) -> Result<(), DdlError> {
-    let objtype = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::ObjectType);
-    let Some(oid) = alterable_type(interp, stmt.object.as_deref(), objtype, stmt.missing_ok)?
-    else {
+    let objtype = stmt.object_type;
+    let Some(oid) = alterable_type(interp, stmt.object.as_ref(), objtype, stmt.missing_ok)? else {
         return Ok(());
     };
     let Some(t) = interp.pg_type.get(&oid).cloned() else {

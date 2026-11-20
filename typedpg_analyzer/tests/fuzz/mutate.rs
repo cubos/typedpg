@@ -2,6 +2,7 @@
 //! nodes, print the tree back to SQL (`printer`).
 
 use super::*;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Strategy 2 — AST mutation via typedpg_pg_query parse → tweak → print.
@@ -71,15 +72,16 @@ pub(crate) const SEEDS: &[&str] = &[
     "SELECT u.name FROM users u WHERE EXISTS (SELECT 1 FROM posts p WHERE p.user_id = u.id)",
 ];
 
-pub(crate) fn str_node(s: &str) -> protobuf::Node {
-    protobuf::Node {
-        node: Some(NodeEnum::String(protobuf::String {
+pub(crate) fn str_node(s: &str) -> Option<ast::Node> {
+    Some(Node::String(
+        ast::String {
             sval: s.to_string(),
-        })),
-    }
+        }
+        .into(),
+    ))
 }
 
-/// Parse `seed`, mutate exactly `n_edits` leaf nodes in the protobuf tree, and
+/// Parse `seed`, mutate exactly `n_edits` leaf nodes in the AST, and
 /// print it back to SQL. Returns `None` if parsing or printing fails (the
 /// printer refuses trees it can't render faithfully — we just skip those).
 ///
@@ -92,11 +94,11 @@ pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<Strin
     let mut parsed = typedpg_pg_query::parse(seed).ok()?;
 
     // SAFETY: `nodes_mut` hands back raw pointers into `parsed`'s owned
-    // protobuf tree. They stay valid because `parsed` outlives this block and
+    // AST. They stay valid because `parsed` outlives this block and
     // we don't move it; we mutate through them and then print. The pointers
     // carry no lifetime, so the `&mut parsed` borrow ends here and the printer
     // (an immutable borrow) is free to read the mutated tree afterwards.
-    let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.protobuf.nodes_mut() }
+    let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.tree.nodes_mut() }
         .into_iter()
         .map(|(n, _)| n)
         .collect();
@@ -109,7 +111,7 @@ pub(crate) fn mutate(seed: &str, rng: &mut StdRng, n_edits: u32) -> Option<Strin
         apply_mutation(nodes[idx], rng);
     }
 
-    printer::print(&parsed.protobuf)
+    printer::print(&parsed.tree)
 }
 
 /// One mutation on a single node, dispatched on its kind.
@@ -121,20 +123,20 @@ pub(crate) fn apply_mutation(node: typedpg_pg_query::NodeMut, rng: &mut StdRng) 
                 let c = &mut *p;
                 c.isnull = false;
                 c.val = Some(match rng.random_range(0..5) {
-                    0 => a_const::Val::Ival(protobuf::Integer {
+                    0 => ast::AConstValue::Integer(ast::Integer {
                         ival: rng.random_range(-5..1000),
                     }),
-                    1 => a_const::Val::Sval(protobuf::String {
+                    1 => ast::AConstValue::String(ast::String {
                         // Drawn from the literal-probe pool so constant
                         // mutations stress the input-syntax validators too
                         // (radix/underscore ints, float specials, array /
                         // range / json shapes, datetime keywords, …).
                         sval: LITERAL_PROBES[rng.random_range(0..LITERAL_PROBES.len())].to_string(),
                     }),
-                    2 => a_const::Val::Boolval(protobuf::Boolean {
+                    2 => ast::AConstValue::Boolean(ast::Boolean {
                         boolval: rng.random_bool(0.5),
                     }),
-                    3 => a_const::Val::Fval(protobuf::Float {
+                    3 => ast::AConstValue::Float(ast::Float {
                         fval: "3.14".to_string(),
                     }),
                     _ => {
@@ -147,7 +149,7 @@ pub(crate) fn apply_mutation(node: typedpg_pg_query::NodeMut, rng: &mut StdRng) 
             NodeMut::ColumnRef(p) if !p.is_null() => {
                 let cr = &mut *p;
                 if let Some(last) = cr.fields.last_mut()
-                    && matches!(last.node, Some(NodeEnum::String(_)))
+                    && matches!(last, Some(Node::String(_)))
                 {
                     let name = ALL_COLUMN_NAMES[rng.random_range(0..ALL_COLUMN_NAMES.len())];
                     *last = str_node(name);
@@ -155,8 +157,8 @@ pub(crate) fn apply_mutation(node: typedpg_pg_query::NodeMut, rng: &mut StdRng) 
             }
             NodeMut::AExpr(p) if !p.is_null() => {
                 let e = &mut *p;
-                // kind 0 == AEXPR_OP (a plain binary/unary operator).
-                if e.kind == 0 && e.name.len() == 1 {
+                // AEXPR_OP: a plain binary/unary operator.
+                if e.kind == ast::AExprKind::AexprOp && e.name.len() == 1 {
                     let op = OPERATORS[rng.random_range(0..OPERATORS.len())];
                     e.name[0] = str_node(op);
                 }

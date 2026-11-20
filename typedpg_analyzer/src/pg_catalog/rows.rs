@@ -768,7 +768,7 @@ pub struct PgRewrite {
     pub(crate) ev_action: SerializedAst,
 }
 
-/// Bundle of a `typedpg_pg_query::Node` plus the per-name-slot binding
+/// Bundle of a `typedpg_pg_query::ast::Node` plus the per-name-slot binding
 /// side-table that resolves every `RangeVar` / `ColumnRef` / `FuncCall` /
 /// `TypeName` in the AST to a catalog OID.
 ///
@@ -779,13 +779,13 @@ pub struct PgRewrite {
 /// The emitter and the rewrite pass walk the AST in identical pre-order:
 /// each name-bearing node consumes exactly one [`AstBinding`] entry. RENAME
 /// / SET SCHEMA become no-ops on the AST itself — the OIDs in the bindings
-/// remain valid and the deparser looks up *current* names.
+/// remain valid, and a name is looked up by OID when it is needed.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct SerializedAst {
     /// The stored expression or statement. Compact in JSON: postcard bytes,
     /// in base64, so the seed's stored ASTs stay small.
     #[serde(with = "serde_compact_ast")]
-    pub ast: typedpg_pg_query::protobuf::Node,
+    pub ast: Option<typedpg_pg_query::ast::Node>,
     /// One entry per name slot, walked in lockstep with the AST.
     pub(crate) bindings: Vec<AstBinding>,
 }
@@ -1045,14 +1045,14 @@ pub struct PgDepend {
 mod serde_compact_ast {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer, ser::Error as _};
-    use typedpg_pg_query::protobuf::Node;
+    use typedpg_pg_query::ast::Node;
 
-    pub fn serialize<S: Serializer>(node: &Node, ser: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(node: &Option<Node>, ser: S) -> Result<S::Ok, S::Error> {
         let bytes = postcard::to_allocvec(node).map_err(S::Error::custom)?;
         ser.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Node, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Node>, D::Error> {
         let s = String::deserialize(de)?;
         let bytes = STANDARD.decode(&s).map_err(serde::de::Error::custom)?;
         postcard::from_bytes(&bytes).map_err(serde::de::Error::custom)

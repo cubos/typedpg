@@ -10,7 +10,7 @@
 //! own the proof that a rewrite returns the same rows; the driver only
 //! guards against a rewrite that changes the query's shape.
 
-use typedpg_pg_query::protobuf::ParseResult;
+use typedpg_pg_query::ast::ParseResult;
 
 use crate::pg_catalog::PgCatalog;
 use crate::resolve::AnalyzedQuery;
@@ -217,7 +217,7 @@ fn run_rules(
         };
         let ctx = Ctx {
             sql: &sql,
-            tree: &tree.protobuf,
+            tree: &tree.tree,
             catalog,
             analyzed,
         };
@@ -362,11 +362,11 @@ fn same_shape(
 /// past each of its `$n` placeholders, read from PG's own tokens. `None`
 /// when a placeholder is out of range or the SQL doesn't scan.
 fn placeholder_offsets(sql: &str, count: usize) -> Option<Vec<Vec<usize>>> {
-    use typedpg_pg_query::protobuf::Token;
+    use typedpg_pg_query::ast::Token;
     let scanned = typedpg_pg_query::scan(sql).ok()?;
     let mut offsets = vec![Vec::new(); count];
     for token in &scanned.tokens {
-        if token.token() != Token::Param {
+        if token.token != Token::Param {
             continue;
         }
         let (start, end) = (

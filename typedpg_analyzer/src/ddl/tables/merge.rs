@@ -14,6 +14,7 @@
 //!   `MergeChildAttribute`).
 
 use super::*;
+use typedpg_pg_query::ast;
 
 /// `TableLikeOption` bits (`parsenodes.h`).
 pub(crate) const LIKE_COMPRESSION: u32 = 1 << 1;
@@ -69,13 +70,13 @@ pub(crate) fn assemble_columns(
     }
 
     for elt in &stmt.table_elts {
-        match elt.node.as_ref() {
-            Some(node::Node::ColumnDef(cd)) => entries.push(Entry {
+        match elt.as_ref() {
+            Some(ast::Node::ColumnDef(cd)) => entries.push(Entry {
                 col: parse_column_def(interp, relname, cd, pk_columns, cx)?,
                 has_type: cd.type_name.is_some(),
                 is_from_type: false,
             }),
-            Some(node::Node::TableLikeClause(lc)) => {
+            Some(ast::Node::TableLikeClause(lc)) => {
                 expand_like(interp, lc, &mut entries, &mut likes)?;
             }
             _ => {}
@@ -173,7 +174,7 @@ pub(crate) fn assemble_columns(
 /// options can merge into them.
 fn of_type_columns(
     interp: &PgCatalog,
-    tn: &typedpg_pg_query::protobuf::TypeName,
+    tn: &typedpg_pg_query::ast::TypeName,
     entries: &mut Vec<Entry>,
 ) -> Result<(), DdlError> {
     let type_oid = lookup_type_name(tn, interp)?;
@@ -219,7 +220,7 @@ fn of_type_columns(
 /// catalog, so nothing is copied from those.
 fn expand_like(
     interp: &PgCatalog,
-    lc: &typedpg_pg_query::protobuf::TableLikeClause,
+    lc: &typedpg_pg_query::ast::TableLikeClause,
     entries: &mut Vec<Entry>,
     likes: &mut Vec<LikeCopy>,
 ) -> Result<(), DdlError> {
@@ -305,7 +306,7 @@ fn expand_like(
 /// `relation "x" does not exist` when it doesn't.
 fn lookup_relation(
     interp: &PgCatalog,
-    rv: &typedpg_pg_query::protobuf::RangeVar,
+    rv: &typedpg_pg_query::ast::RangeVar,
 ) -> Result<PgClassOid, DdlError> {
     let (schema, name) = range_var_names(rv, interp);
     interp
@@ -343,7 +344,7 @@ fn inherited_columns(
     // before MergeAttributes opens them (table_open).
     let mut named: Vec<PgClassOid> = Vec::new();
     for parent_node in &stmt.inh_relations {
-        let Some(node::Node::RangeVar(rv)) = parent_node.node.as_ref() else {
+        let Some(ast::Node::RangeVar(rv)) = parent_node.as_ref() else {
             continue;
         };
         let parent = lookup_relation(interp, rv)?;
@@ -356,7 +357,7 @@ fn inherited_columns(
         named.push(parent);
     }
     for parent_node in &stmt.inh_relations {
-        let Some(node::Node::RangeVar(rv)) = parent_node.node.as_ref() else {
+        let Some(ast::Node::RangeVar(rv)) = parent_node.as_ref() else {
             continue;
         };
         let parent = lookup_relation(interp, rv)?;

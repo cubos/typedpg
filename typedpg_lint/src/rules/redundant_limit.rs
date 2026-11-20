@@ -10,7 +10,7 @@
 
 use typedpg_analyzer::select_at_most_one_row;
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{self, LimitOption, Token, a_const::Val, node};
+use typedpg_pg_query::ast::{self, AConstValue, LimitOption, Token};
 
 use crate::{Ctx, RawFinding, SqlEdit};
 
@@ -20,10 +20,10 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let NodeRef::SelectStmt(select) = node else {
             continue;
         };
-        if select.limit_offset.is_some() || select.limit_option() == LimitOption::WithTies {
+        if select.limit_offset.is_some() || select.limit_option == LimitOption::WithTies {
             continue;
         }
-        let Some(count) = select.limit_count.as_deref() else {
+        let Some(count) = select.limit_count.as_ref() else {
             continue;
         };
         if !is_positive_integer(count) {
@@ -66,12 +66,12 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
 
 /// Whether `node` is an integer constant at least 1 (not `ALL`, `NULL`, a
 /// parameter or an expression).
-fn is_positive_integer(node: &protobuf::Node) -> bool {
+fn is_positive_integer(node: &ast::Node) -> bool {
     matches!(
-        node.node,
-        Some(node::Node::AConst(ref value))
+        node,
+        ast::Node::AConst(value)
             if !value.isnull
-                && matches!(value.val, Some(Val::Ival(ref count)) if count.ival >= 1)
+                && matches!(value.val, Some(AConstValue::Integer(ref count)) if count.ival >= 1)
     )
 }
 
@@ -88,9 +88,9 @@ struct LimitClause {
 }
 
 /// The clause `count` belongs to, read from the tokens around it.
-fn limit_clause(ctx: &Ctx<'_>, count: &protobuf::Node) -> Option<LimitClause> {
-    let at = first_location(NodeRef::AConst(match count.node.as_ref()? {
-        node::Node::AConst(value) => value,
+fn limit_clause(ctx: &Ctx<'_>, count: &ast::Node) -> Option<LimitClause> {
+    let at = first_location(NodeRef::AConst(match count {
+        ast::Node::AConst(value) => value,
         _ => return None,
     }))?;
     let index = ctx.tokens.iter().position(|token| token.start == at)?;
@@ -187,7 +187,7 @@ fn delete_start(ctx: &Ctx<'_>, keyword: usize) -> usize {
 fn ends_in_line_comment(sql: &str) -> bool {
     match typedpg_pg_query::scan(sql) {
         Ok(scanned) => scanned.tokens.last().is_some_and(|token| {
-            token.token() == Token::SqlComment
+            token.token == Token::SqlComment
                 && usize::try_from(token.end).is_ok_and(|end| end == sql.len())
         }),
         Err(_) => true,

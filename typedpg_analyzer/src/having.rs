@@ -2,7 +2,7 @@
 //! aggregates behave over rows lacking values — what decides whether an
 //! aggregate's result can be NULL.
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::ast;
 
 use crate::decimal::Decimal;
 use crate::expr;
@@ -68,7 +68,7 @@ pub(crate) fn aggregate_class(name: &str) -> AggregateClass {
 /// routine of that name it can reach is a `pg_catalog` aggregate — so the
 /// call is to the builtin whatever its argument types.
 pub(crate) fn builtin_aggregate_name<'a>(
-    fc: &'a protobuf::FuncCall,
+    fc: &'a ast::FuncCall,
     snapshot: &PgCatalog,
 ) -> Option<&'a str> {
     if fc.over.is_some() {
@@ -97,11 +97,11 @@ pub(crate) fn builtin_aggregate_name<'a>(
 /// outer columns only (`count(outer.x)`) is the outer query's — its value
 /// says nothing of this level's groups. A call holding a subquery is not
 /// looked into.
-fn is_current_level(fc_node: &protobuf::Node, scope: &Scope) -> bool {
+fn is_current_level(fc_node: &Option<ast::Node>, scope: &Scope) -> bool {
     let own = crate::nonnull::own_aliases(scope);
     let (mut refs, mut current, mut opaque) = (0, false, false);
-    crate::resolve::visit_same_level(fc_node, &mut |e| match e.node.as_ref() {
-        Some(node::Node::ColumnRef(_)) => {
+    crate::resolve::visit_same_level(fc_node, &mut |e| match e.as_ref() {
+        Some(ast::Node::ColumnRef(_)) => {
             refs += 1;
             match column_of(e, scope) {
                 Some((alias, _)) if own.contains(&alias) => current = true,
@@ -109,31 +109,28 @@ fn is_current_level(fc_node: &protobuf::Node, scope: &Scope) -> bool {
                 None => opaque = true,
             }
         }
-        Some(node::Node::SubLink(_)) => opaque = true,
+        Some(ast::Node::SubLink(_)) => opaque = true,
         _ => {}
     });
     !opaque && (refs == 0 || current)
 }
 
-fn string_of(n: &protobuf::Node) -> Option<&str> {
-    match n.node.as_ref()? {
-        node::Node::String(s) => Some(s.sval.as_str()),
+fn string_of(n: &Option<ast::Node>) -> Option<&str> {
+    match n.as_ref()? {
+        ast::Node::String(s) => Some(s.sval.as_str()),
         _ => None,
     }
 }
 
 /// The values an aggregate reads (`string_agg`'s delimiter and an
 /// ordered-set aggregate's direct arguments aside).
-pub(crate) fn aggregated_args<'a>(
-    fc: &'a protobuf::FuncCall,
-    name: &str,
-) -> Vec<&'a protobuf::Node> {
+pub(crate) fn aggregated_args<'a>(fc: &'a ast::FuncCall, name: &str) -> Vec<&'a Option<ast::Node>> {
     if fc.agg_within_group {
         return fc
             .agg_order
             .iter()
-            .filter_map(|o| match o.node.as_ref() {
-                Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+            .filter_map(|o| match o.as_ref() {
+                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
                 _ => None,
             })
             .collect();
@@ -145,8 +142,8 @@ pub(crate) fn aggregated_args<'a>(
 }
 
 /// The column a plain column reference resolves to.
-pub(crate) fn column_of(n: &protobuf::Node, scope: &Scope) -> Option<Col> {
-    let node::Node::ColumnRef(cr) = n.node.as_ref()? else {
+pub(crate) fn column_of(n: &Option<ast::Node>, scope: &Scope) -> Option<Col> {
+    let ast::Node::ColumnRef(cr) = n.as_ref()? else {
         return None;
     };
     let parts = expr::extract_string_fields(&cr.fields);
@@ -169,13 +166,13 @@ pub(crate) fn column_of(n: &protobuf::Node, scope: &Scope) -> Option<Col> {
 /// A hypothesis under which HAVING can only be FALSE or NULL is refuted
 /// for every group it keeps.
 pub(crate) fn having_facts(
-    having: &protobuf::Node,
+    having: &Option<ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> HavingFacts {
     let mut candidates: Vec<Col> = Vec::new();
     crate::resolve::visit_same_level(having, &mut |e| {
-        if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+        if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
             && let Some(name) = builtin_aggregate_name(fc, snapshot)
             && is_current_level(e, scope)
         {
@@ -263,21 +260,21 @@ fn builtin_strict_operator(name: &str, snapshot: &PgCatalog) -> bool {
     any
 }
 
-fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgCatalog) -> Val {
-    use typedpg_pg_query::protobuf::a_const::Val as C;
-    let sub = |n: &protobuf::Node| eval(n, h, scope, snapshot);
-    let Some(inner) = node.node.as_ref() else {
+fn eval(node: &Option<ast::Node>, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgCatalog) -> Val {
+    use typedpg_pg_query::ast::AConstValue as C;
+    let sub = |n: &Option<ast::Node>| eval(n, h, scope, snapshot);
+    let Some(inner) = node.as_ref() else {
         return Val::Any;
     };
     match inner {
-        node::Node::AConst(c) if c.isnull => Val::Null,
-        node::Node::AConst(c) => match &c.val {
-            Some(C::Ival(i)) => Val::Num(Decimal::int(i64::from(i.ival))),
-            Some(C::Fval(f)) => Decimal::parse(&f.fval).map_or(Val::Any, Val::Num),
-            Some(C::Boolval(b)) => Val::Bool(if b.boolval { T } else { F }),
+        ast::Node::AConst(c) if c.isnull => Val::Null,
+        ast::Node::AConst(c) => match &c.val {
+            Some(C::Integer(i)) => Val::Num(Decimal::int(i64::from(i.ival))),
+            Some(C::Float(f)) => Decimal::parse(&f.fval).map_or(Val::Any, Val::Num),
+            Some(C::Boolean(b)) => Val::Bool(if b.boolval { T } else { F }),
             _ => Val::Any,
         },
-        node::Node::TypeCast(c) => {
+        ast::Node::TypeCast(c) => {
             // An exact target: an integer one rounds, `numeric` (without a
             // typmod, which would round too) keeps the value. A float one
             // is inexact — what its arithmetic gives isn't tracked.
@@ -291,7 +288,7 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
                     _ => None,
                 }
             });
-            match (c.arg.as_deref().map(sub), target) {
+            match (c.arg.is_some().then(|| sub(&c.arg)), target) {
                 // A cast of NULL is NULL (or fails, to a domain): not TRUE.
                 (Some(Val::Null), _) => Val::Null,
                 (Some(v @ Val::Num(_)), Some(true)) => v,
@@ -299,7 +296,7 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
                 _ => Val::Any,
             }
         }
-        node::Node::FuncCall(fc) => {
+        ast::Node::FuncCall(fc) => {
             let Some(name) =
                 builtin_aggregate_name(fc, snapshot).filter(|_| is_current_level(node, scope))
             else {
@@ -327,9 +324,7 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
                 }
             }
         }
-        node::Node::AExpr(e)
-            if protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp) =>
-        {
+        ast::Node::AExpr(e) if e.kind == ast::AExprKind::AexprOp => {
             let op = match e.name.as_slice() {
                 [n] => string_of(n),
                 [s, n] if string_of(s) == Some("pg_catalog") => string_of(n),
@@ -338,9 +333,9 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
             let Some(op) = op.filter(|op| builtin_strict_operator(op, snapshot)) else {
                 return Val::Any;
             };
-            let r = e.rexpr.as_deref().map_or(Val::Any, sub);
-            let l = match e.lexpr.as_deref() {
-                Some(l) => sub(l),
+            let r = sub(&e.rexpr);
+            let l = match e.lexpr.as_ref() {
+                Some(_) => sub(&e.lexpr),
                 // A prefix operator.
                 None => {
                     return match (op, r) {
@@ -375,10 +370,10 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
                 _ => Val::Any,
             }
         }
-        node::Node::BoolExpr(b) => {
+        ast::Node::BoolExpr(b) => {
             let masks: Vec<u8> = b.args.iter().map(|a| sub(a).mask()).collect();
-            match protobuf::BoolExprType::try_from(b.boolop) {
-                Ok(protobuf::BoolExprType::NotExpr) => {
+            match b.boolop {
+                ast::BoolExprType::NotExpr => {
                     let m = masks.first().copied().unwrap_or(T | F | N);
                     let mut out = 0;
                     if m & T != 0 {
@@ -392,22 +387,20 @@ fn eval(node: &protobuf::Node, h: &Hypothesis<'_>, scope: &Scope, snapshot: &PgC
                     }
                     Val::Bool(out)
                 }
-                Ok(protobuf::BoolExprType::AndExpr) => Val::Bool(fold_3vl(&masks, true)),
-                Ok(protobuf::BoolExprType::OrExpr) => Val::Bool(fold_3vl(&masks, false)),
-                _ => Val::Any,
+                ast::BoolExprType::AndExpr => Val::Bool(fold_3vl(&masks, true)),
+                ast::BoolExprType::OrExpr => Val::Bool(fold_3vl(&masks, false)),
             }
         }
-        node::Node::NullTest(t) => {
-            let Some(arg) = t.arg.as_deref() else {
+        ast::Node::NullTest(t) => {
+            let Some(arg) = t.arg.as_ref() else {
                 return Val::Any;
             };
             // A row-valued test (`ROW(…) IS NULL`) reads fields: unknown.
-            if matches!(arg.node.as_ref(), Some(node::Node::RowExpr(_))) {
+            if matches!(arg, ast::Node::RowExpr(_)) {
                 return Val::Any;
             }
-            let m = sub(arg).mask();
-            let is_null_test = protobuf::NullTestType::try_from(t.nulltesttype)
-                == Ok(protobuf::NullTestType::IsNull);
+            let m = sub(&t.arg).mask();
+            let is_null_test = t.nulltesttype == ast::NullTestType::IsNull;
             let mut out = 0;
             if m & N != 0 {
                 out |= if is_null_test { T } else { F };

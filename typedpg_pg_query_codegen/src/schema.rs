@@ -3,18 +3,16 @@
 //!
 //! libpg_query turns PostgreSQL's headers into AST definitions with a
 //! line-oriented Ruby script: [`extract_headers.rb`] produces
-//! `srcdata/*.json`, and `generate_protobuf_and_funcs.rb` turns that into
-//! `pg_query.proto`. This module is the first half of dropping the `.proto`
-//! step: it is a port of `extract_headers.rb`, returning the same data as a
-//! typed [`Schema`].
+//! `srcdata/*.json`, from which libpg_query's node generator derives its
+//! AST. This module is a port of `extract_headers.rb`, returning the same
+//! data as a typed [`Schema`] that [`crate::ast`] builds the AST from.
 //!
 //! Every parser function names the Ruby rule it mirrors. The Ruby script is
 //! deliberately forgiving — it matches field declarations with one regular
 //! expression per line rather than parsing C — and the port keeps that
-//! behaviour, because the generated AST has to stay identical to what
-//! libpg_query's `.proto` describes (including the fields the script
-//! accidentally drops, such as those carrying more than one
-//! `pg_node_attr(...)` argument).
+//! behaviour, so the AST has the fields libpg_query's had (including leaving
+//! out the ones the script accidentally drops, such as those carrying more
+//! than one `pg_node_attr(...)` argument).
 //!
 //! [`extract_headers.rb`]: https://github.com/pganalyze/libpg_query/blob/master/scripts/extract_headers.rb
 
@@ -69,6 +67,11 @@ pub struct Schema {
     pub groups: Vec<Group>,
     /// `typedef old new;` declarations, in header order.
     pub typedefs: Vec<Typedef>,
+    /// The enumerator values bindgen evaluated, by bindgen constant name
+    /// (`AggSplit_AGGSPLIT_INITIAL_SERIAL`), from the crate's
+    /// `postgres/typedpg/bindings.rs`: the C compiler's view of every enum
+    /// the bound structs use, initializer expressions included.
+    pub bindgen_values: std::collections::HashMap<String, i64>,
 }
 
 /// One header group (`nodes/parsenodes.h`, …).
@@ -116,6 +119,11 @@ pub struct EnumDef {
 pub struct EnumValue {
     pub name: Option<String>,
     pub value: Option<i64>,
+    /// The enumerator has an initializer the line parser can't evaluate
+    /// (`AGGSPLITOP_SKIPFINAL | AGGSPLITOP_SERIALIZE`); `value` is then a
+    /// guess, and the evaluated value has to come from elsewhere (see
+    /// [`Schema::bindgen_values`]).
+    pub opaque: bool,
 }
 
 /// A `typedef` alias.
@@ -143,6 +151,13 @@ impl EnumDef {
         }
         out
     }
+
+    /// Whether an enumerator's initializer couldn't be evaluated (see
+    /// [`EnumValue::opaque`]); its value, and those following it, are then
+    /// guesses.
+    pub fn has_opaque_values(&self) -> bool {
+        self.values.iter().any(|v| v.opaque)
+    }
 }
 
 impl Schema {
@@ -153,6 +168,12 @@ impl Schema {
     pub fn parse(include_dir: &Path, gram_h: &Path) -> Schema {
         let mut schema = Schema {
             nodetypes: parse_nodetags(&include_dir.join("nodes/nodetags.h")),
+            bindgen_values: parse_bindgen_values(
+                &include_dir
+                    .parent()
+                    .unwrap_or(include_dir)
+                    .join("typedpg/bindings.rs"),
+            ),
             ..Schema::default()
         };
 
@@ -203,6 +224,7 @@ impl Schema {
             node_tag.values.push(EnumValue {
                 name: Some(format!("T_{name}")),
                 value: Some(i as i64 + 1),
+                opaque: false,
             });
         }
 
@@ -301,6 +323,23 @@ impl Schema {
     pub fn is_nodetype(&self, name: &str) -> bool {
         self.nodetypes.iter().any(|n| n == name)
     }
+}
+
+/// The `pub const Enum_VALUE: Enum = value;` lines of bindgen's output.
+fn parse_bindgen_values(path: &Path) -> std::collections::HashMap<String, i64> {
+    static CONST: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^pub const ([A-Za-z0-9_]+): ([A-Za-z0-9_]+) = (-?\d+);$").unwrap()
+    });
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    text.lines()
+        .filter_map(|line| {
+            let captures = CONST.captures(line)?;
+            let (name, ty) = (&captures[1], &captures[2]);
+            name.starts_with(&format!("{ty}_"))
+                .then(|| (name.to_string(), captures[3].parse().expect("an integer")))
+        })
+        .collect()
 }
 
 /// `Extractor#generate_nodetypes!`: lines of `nodes/nodetags.h` that are not
@@ -440,7 +479,9 @@ fn handle_struct(
     }
 }
 
-/// `Extractor#handle_enum`: one line while inside a `typedef enum`.
+/// `Extractor#handle_enum`: one line while inside a `typedef enum`. Unlike
+/// the Ruby script, a negative value (`PARTITION_RANGE_DATUM_MINVALUE = -1`)
+/// is read as such: the AST's enums carry PostgreSQL's values.
 fn handle_enum(
     line: &str,
     current: &mut Option<EnumDef>,
@@ -449,7 +490,7 @@ fn handle_enum(
 ) {
     static VALUE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"^\s+([A-z0-9_]+)(?: = (?:(\d+)(?: << (\d+))?|(PG_INT32_MAX)|(?:'(\w)')))?,?\s*((?:[A-z0-9_]+,?\s*)+)?(/\*.+)?",
+            r"^\s+([A-z0-9_]+)(?: = (?:(-?\d+)(?: << (\d+))?|(PG_INT32_MAX)|(?:'(\w)')))?,?\s*((?:[A-z0-9_]+,?\s*)+)?(/\*.+)?",
         )
         .unwrap()
     });
@@ -459,6 +500,15 @@ fn handle_enum(
     if let Some(captures) = VALUE.captures(line) {
         let name = captures.get(1).expect("enumerator").as_str().to_string();
         let last = enum_def.values.iter().filter_map(|v| v.value).next_back();
+        let initializer = line[captures.get(1).expect("enumerator").end()..]
+            .split("/*")
+            .next()
+            .unwrap_or("")
+            .contains('=');
+        let opaque = initializer
+            && captures.get(2).is_none()
+            && captures.get(4).is_none()
+            && captures.get(5).is_none();
         let value = if let Some(decimal) = captures.get(2) {
             let decimal: i64 = decimal.as_str().parse().expect("decimal enumerator");
             match captures.get(3) {
@@ -477,6 +527,7 @@ fn handle_enum(
         enum_def.values.push(EnumValue {
             name: Some(name),
             value: Some(value),
+            opaque,
         });
         if let Some(trailing) = captures.get(6) {
             for name in trailing.as_str().split(',') {
@@ -487,6 +538,7 @@ fn handle_enum(
                 enum_def.values.push(EnumValue {
                     name: Some(name.to_string()),
                     value: None,
+                    opaque: false,
                 });
             }
         }
@@ -502,12 +554,14 @@ fn handle_enum(
         enum_def.values.push(EnumValue {
             name: None,
             value: None,
+            opaque: false,
         });
         *open_comment = !line.contains("*/");
     } else {
         enum_def.values.push(EnumValue {
             name: None,
             value: None,
+            opaque: false,
         });
     }
 }
@@ -524,18 +578,22 @@ mod tests {
                 EnumValue {
                     name: Some("A".into()),
                     value: None,
+                    opaque: false,
                 },
                 EnumValue {
                     name: Some("B".into()),
                     value: Some(4),
+                    opaque: false,
                 },
                 EnumValue {
                     name: Some("C".into()),
                     value: None,
+                    opaque: false,
                 },
                 EnumValue {
                     name: Some("D".into()),
                     value: Some(1 << 5),
+                    opaque: false,
                 },
             ],
         };

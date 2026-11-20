@@ -3,7 +3,7 @@
 //! it (`parse_analyze`), so a data migration naming a missing table or
 //! column, or mistyping a value, fails.
 
-use typedpg_pg_query::protobuf::node;
+use typedpg_pg_query::ast;
 
 use super::DdlError;
 use crate::error::AnalyzeError;
@@ -12,7 +12,7 @@ use crate::pg_catalog::PgCatalog;
 /// Analyze `stmt` like the `sql!` macro would, failing the migration on
 /// what PG's parse analysis rejects. Analyzer limitations
 /// (`Unsupported`, internal errors) leave the statement unchecked.
-pub(crate) fn check_statement(interp: &PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+pub(crate) fn check_statement(interp: &PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
     analyze_statement(interp, stmt).map(drop)
 }
 
@@ -20,7 +20,7 @@ pub(crate) fn check_statement(interp: &PgCatalog, stmt: &node::Node) -> Result<(
 /// executed, not only analyzed: what the planner and the executor's start
 /// raise on every execution fails it too, as it fails an application
 /// query ([`crate::resolve::analyze_executed`]).
-pub(crate) fn check_executed(interp: &PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+pub(crate) fn check_executed(interp: &PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
     verdict(crate::resolve::analyze_executed(interp, stmt, || {
         crate::resolve::analyze_raw_node(interp, stmt, &[])
     }))
@@ -31,7 +31,7 @@ pub(crate) fn check_executed(interp: &PgCatalog, stmt: &node::Node) -> Result<()
 /// analysis could tell them. The statement runs: it is rewritten too.
 pub(crate) fn analyze_statement(
     interp: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
 ) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
     crate::expr::with_rewriting(true, || analyze_parsed(interp, stmt))
 }
@@ -40,14 +40,14 @@ pub(crate) fn analyze_statement(
 /// parse analysis alone, the rewriter runs once something fires it.
 pub(crate) fn analyze_stored_statement(
     interp: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
 ) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
     crate::expr::with_rewriting(false, || analyze_parsed(interp, stmt))
 }
 
 fn analyze_parsed(
     interp: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
 ) -> Result<Option<Vec<crate::resolve::RawColumn>>, DdlError> {
     verdict(crate::resolve::analyze_raw_node(interp, stmt, &[]))
 }

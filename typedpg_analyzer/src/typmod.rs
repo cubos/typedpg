@@ -28,7 +28,7 @@
 //! `Ok(None)` so custom types with their own typmodin function don't break
 //! the migration — we just don't track typmod for those.
 
-use typedpg_pg_query::protobuf::{Node, TypeName, node};
+use typedpg_pg_query::ast::{self, Node, TypeName};
 
 use crate::ddl::DdlError;
 use crate::error::AnalyzeError;
@@ -338,20 +338,20 @@ fn encode_vector(raw: &[i32]) -> Result<i32, DdlError> {
 
 /// `typenameTypeMod`'s modifiers as the strings handed to `typmodin`: an
 /// integer, a numeric or string literal as written, or a bare identifier.
-fn typmod_strings(typmods: &[Node]) -> Result<Vec<String>, DdlError> {
-    use typedpg_pg_query::protobuf::a_const::Val;
+fn typmod_strings(typmods: &[Option<Node>]) -> Result<Vec<String>, DdlError> {
+    use typedpg_pg_query::ast::AConstValue;
     typmods
         .iter()
-        .map(|tm| match tm.node.as_ref() {
-            Some(node::Node::AConst(c)) => match c.val.as_ref() {
-                Some(Val::Ival(i)) => Some(i.ival.to_string()),
-                Some(Val::Fval(f)) => Some(f.fval.clone()),
-                Some(Val::Sval(s)) => Some(s.sval.clone()),
+        .map(|tm| match tm.as_ref() {
+            Some(ast::Node::AConst(c)) => match c.val.as_ref() {
+                Some(AConstValue::Integer(i)) => Some(i.ival.to_string()),
+                Some(AConstValue::Float(f)) => Some(f.fval.clone()),
+                Some(AConstValue::String(s)) => Some(s.sval.clone()),
                 _ => None,
             },
-            Some(node::Node::ColumnRef(cr)) => match cr.fields.as_slice() {
-                [f] => match f.node.as_ref() {
-                    Some(node::Node::String(s)) => Some(s.sval.clone()),
+            Some(ast::Node::ColumnRef(cr)) => match cr.fields.as_slice() {
+                [f] => match f.as_ref() {
+                    Some(ast::Node::String(s)) => Some(s.sval.clone()),
                     _ => None,
                 },
                 _ => None,
@@ -406,7 +406,7 @@ pub fn check_literal_assignment(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,
     typmod: Option<i32>,
-    value: &Node,
+    value: &Option<Node>,
 ) -> Option<AnalyzeError> {
     assignment_error(
         snapshot,
@@ -426,7 +426,7 @@ pub(crate) fn assignment_error(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,
     typmod: Option<i32>,
-    value: &Node,
+    value: &Option<Node>,
     location: Option<i32>,
     span: impl FnOnce() -> Option<crate::error::SourceSpan>,
 ) -> Option<AnalyzeError> {
@@ -435,8 +435,8 @@ pub(crate) fn assignment_error(
     }
     // A column of a subquery the planner pulled up is the subquery's
     // output expression by the time the conversion is folded.
-    let substituted = crate::resolve::substituted(value);
-    let value = substituted.as_deref().unwrap_or(value);
+    let substituted = crate::resolve::substituted(value).map(|e| Some((*e).clone()));
+    let value = substituted.as_ref().unwrap_or(value);
     let e = assignment_error_here(snapshot, type_oid, typmod, value, span)?;
     crate::expr::plan_time_error(location, e)
 }
@@ -449,7 +449,7 @@ pub(crate) fn evaluated_assignment_error(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,
     typmod: Option<i32>,
-    value: &Node,
+    value: &Option<Node>,
 ) -> Option<AnalyzeError> {
     assignment_error_here(snapshot, type_oid, typmod, value, || {
         crate::error::expr_span(value)
@@ -460,7 +460,7 @@ fn assignment_error_here(
     snapshot: &PgCatalog,
     type_oid: PgTypeOid,
     typmod: Option<i32>,
-    value: &Node,
+    value: &Option<Node>,
     span: impl FnOnce() -> Option<crate::error::SourceSpan>,
 ) -> Option<AnalyzeError> {
     if let Some(e) = crate::fold::conversion_error(value, type_oid, typmod, snapshot) {
@@ -491,13 +491,13 @@ fn assignment_error_here(
 /// to a string type that keeps it whole (`'abc'::text`) — not to one
 /// that may truncate it (`'abcd'::varchar(2)` is `'ab'`, `::char` is
 /// `char(1)`).
-fn assigned_string<'a>(node: &'a Node, snapshot: &PgCatalog) -> Option<&'a str> {
-    match node.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
+fn assigned_string<'a>(node: &'a Option<Node>, snapshot: &PgCatalog) -> Option<&'a str> {
+    match node.as_ref()? {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            typedpg_pg_query::ast::AConstValue::String(s) => Some(s.sval.as_str()),
             _ => None,
         },
-        node::Node::TypeCast(tc) => {
+        ast::Node::TypeCast(tc) => {
             let tn = tc.type_name.as_ref()?;
             let keeps = tn.typmods.is_empty()
                 && tn.array_bounds.is_empty()
@@ -508,7 +508,7 @@ fn assigned_string<'a>(node: &'a Node, snapshot: &PgCatalog) -> Option<&'a str> 
                     )
                 });
             if keeps {
-                assigned_string(tc.arg.as_deref()?, snapshot)
+                assigned_string(&tc.arg, snapshot)
             } else {
                 None
             }
@@ -570,15 +570,15 @@ pub(crate) fn char_length_violation(
     excess_not_blank.then(|| format!("value too long for type {typ_label}({n})"))
 }
 
-fn string_literal(node: &Node) -> Option<&str> {
-    match node.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
+fn string_literal(node: &Option<Node>) -> Option<&str> {
+    match node.as_ref()? {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            typedpg_pg_query::ast::AConstValue::String(s) => Some(s.sval.as_str()),
             _ => None,
         },
         // Allow `'abc'::varchar(N)` — drill through the cast so the literal
         // length still gets checked against the assignment target.
-        node::Node::TypeCast(tc) => tc.arg.as_deref().and_then(string_literal),
+        ast::Node::TypeCast(tc) => string_literal(&tc.arg),
         _ => None,
     }
 }
@@ -677,24 +677,22 @@ pub(crate) fn numeric_overflow(raw: &str, precision: i32, scale: i32) -> Option<
     overflow(format!("must round to an absolute value less than {bound}"))
 }
 
-fn vector_literal_dim_count(node: &Node) -> Option<usize> {
-    match node.node.as_ref()? {
+fn vector_literal_dim_count(node: &Option<Node>) -> Option<usize> {
+    match node.as_ref()? {
         // ARRAY[1, 2, 3]::vector
-        node::Node::AArrayExpr(arr) => Some(arr.elements.len()),
+        ast::Node::AArrayExpr(arr) => Some(arr.elements.len()),
         // '[1,2,3]'::vector
-        node::Node::TypeCast(tc) => {
+        ast::Node::TypeCast(tc) => {
             // First try drilling into the cast argument as an array.
-            if let Some(arg) = tc.arg.as_deref()
-                && let count = vector_literal_dim_count(arg)
-                && count.is_some()
-            {
+            let count = vector_literal_dim_count(&tc.arg);
+            if count.is_some() {
                 return count;
             }
             // Or a string literal in pgvector's `[1,2,3]` syntax.
-            let s = string_literal(tc.arg.as_deref()?)?;
+            let s = string_literal(&tc.arg)?;
             parse_vector_string(s)
         }
-        node::Node::AConst(_) => {
+        ast::Node::AConst(_) => {
             let s = string_literal(node)?;
             parse_vector_string(s)
         }

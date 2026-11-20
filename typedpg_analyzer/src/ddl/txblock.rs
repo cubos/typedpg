@@ -19,9 +19,8 @@
 //! or its last `COMMIT` / `ROLLBACK`. The session's cursors follow the
 //! transaction's end too ([`super::cursors`]).
 
-use typedpg_pg_query::protobuf::{
-    DiscardMode, ReindexObjectType, TransactionStmt, TransactionStmtKind, VariableSetKind, a_const,
-    node,
+use typedpg_pg_query::ast::{
+    self, DiscardMode, ReindexObjectType, TransactionStmt, TransactionStmtKind, VariableSetKind,
 };
 
 use super::DdlError;
@@ -66,7 +65,7 @@ impl Transaction {
     pub(crate) fn start(
         db: &PgCatalog,
         sql: &str,
-        statements: &[typedpg_pg_query::protobuf::RawStmt],
+        statements: &[typedpg_pg_query::ast::RawStmt],
     ) -> Transaction {
         // The runner's rule, shared (`typedpg_core::migration_marker`).
         let no_transaction = typedpg_core::migration_marker::has_no_transaction_marker(sql);
@@ -95,7 +94,7 @@ impl Transaction {
     }
 
     /// The rules the transaction state imposes on `stmt`, before it runs.
-    pub(crate) fn check(&self, db: &PgCatalog, stmt: &node::Node) -> Result<(), DdlError> {
+    pub(crate) fn check(&self, db: &PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
         if self.block != Block::Started
             && let Some(what) = forbidden_in_block(stmt)
         {
@@ -130,29 +129,29 @@ impl Transaction {
 
     /// Bookkeeping after `stmt` ran: sent on its own, outside a block, it
     /// was a transaction of its own, which commits.
-    pub(crate) fn after(&mut self, db: &mut PgCatalog, stmt: &node::Node) {
+    pub(crate) fn after(&mut self, db: &mut PgCatalog, stmt: &ast::Node) {
         self.track(stmt);
         if self.per_statement && self.block == Block::Started {
             self.end(db, false, true);
         }
     }
 
-    fn track(&mut self, stmt: &node::Node) {
+    fn track(&mut self, stmt: &ast::Node) {
         match stmt {
-            node::Node::VariableSetStmt(v) => {
+            ast::Node::VariableSetStmt(v) => {
                 if let Some(read_only) = read_only_setting(v) {
                     self.read_only = read_only;
                 }
             }
-            node::Node::TransactionStmt(_) | node::Node::VariableShowStmt(_) => {}
+            ast::Node::TransactionStmt(_) | ast::Node::VariableShowStmt(_) => {}
             _ => self.queried = true,
         }
     }
 
     /// `SET TRANSACTION READ WRITE` / `SET transaction_read_only = off`
     /// after the transaction took its snapshot (check_transaction_read_only).
-    pub(crate) fn check_setting(&self, stmt: &node::Node) -> Result<(), DdlError> {
-        if let node::Node::VariableSetStmt(v) = stmt
+    pub(crate) fn check_setting(&self, stmt: &ast::Node) -> Result<(), DdlError> {
+        if let ast::Node::VariableSetStmt(v) = stmt
             && read_only_setting(v) == Some(false)
             && self.read_only
             && self.queried
@@ -172,14 +171,14 @@ impl Transaction {
         stmt: &TransactionStmt,
     ) -> Result<(), DdlError> {
         use TransactionStmtKind as K;
-        let kind = K::try_from(stmt.kind).unwrap_or(K::Undefined);
+        let kind = stmt.kind;
         match kind {
             K::TransStmtBegin | K::TransStmtStart => {
                 // BeginTransactionBlock: inside a block, only a warning; an
                 // implicit block becomes an explicit one.
                 self.block = Block::Explicit;
                 for option in &stmt.options {
-                    if let Some(node::Node::DefElem(de)) = option.node.as_ref()
+                    if let Some(ast::Node::DefElem(de)) = option.as_ref()
                         && de.defname == "transaction_read_only"
                     {
                         self.read_only = def_elem_true(de);
@@ -253,7 +252,6 @@ impl Transaction {
                     stmt.gid
                 )));
             }
-            K::Undefined => {}
         }
         Ok(())
     }
@@ -317,25 +315,25 @@ impl Transaction {
 
 /// The value `BEGIN` / `SET TRANSACTION` options carry as an integer
 /// constant (`transaction_read_only` = 1).
-fn def_elem_true(de: &typedpg_pg_query::protobuf::DefElem) -> bool {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::AConst(c)) => match c.val.as_ref() {
-            Some(a_const::Val::Ival(i)) => i.ival != 0,
-            Some(a_const::Val::Boolval(b)) => b.boolval,
+fn def_elem_true(de: &typedpg_pg_query::ast::DefElem) -> bool {
+    match de.arg.as_ref() {
+        Some(ast::Node::AConst(c)) => match c.val.as_ref() {
+            Some(ast::AConstValue::Integer(i)) => i.ival != 0,
+            Some(ast::AConstValue::Boolean(b)) => b.boolval,
             _ => true,
         },
-        Some(node::Node::Integer(i)) => i.ival != 0,
+        Some(ast::Node::Integer(i)) => i.ival != 0,
         _ => true,
     }
 }
 
 /// What a `SET` does to `transaction_read_only`: `SET TRANSACTION [READ
 /// ONLY | READ WRITE]` or `SET transaction_read_only = ...`.
-fn read_only_setting(v: &typedpg_pg_query::protobuf::VariableSetStmt) -> Option<bool> {
-    let kind = VariableSetKind::try_from(v.kind).unwrap_or(VariableSetKind::Undefined);
+fn read_only_setting(v: &typedpg_pg_query::ast::VariableSetStmt) -> Option<bool> {
+    let kind = v.kind;
     if kind == VariableSetKind::VarSetMulti && v.name.eq_ignore_ascii_case("TRANSACTION") {
-        return v.args.iter().rev().find_map(|arg| match arg.node.as_ref() {
-            Some(node::Node::DefElem(de)) if de.defname == "transaction_read_only" => {
+        return v.args.iter().rev().find_map(|arg| match arg.as_ref() {
+            Some(ast::Node::DefElem(de)) if de.defname == "transaction_read_only" => {
                 Some(def_elem_true(de))
             }
             _ => None,
@@ -346,11 +344,11 @@ fn read_only_setting(v: &typedpg_pg_query::protobuf::VariableSetStmt) -> Option<
         let [arg] = v.args.as_slice() else {
             return None;
         };
-        return match arg.node.as_ref() {
-            Some(node::Node::AConst(c)) => match c.val.as_ref()? {
-                a_const::Val::Ival(i) => Some(i.ival != 0),
-                a_const::Val::Boolval(b) => Some(b.boolval),
-                a_const::Val::Sval(s) => match s.sval.to_ascii_lowercase().as_str() {
+        return match arg.as_ref() {
+            Some(ast::Node::AConst(c)) => match c.val.as_ref()? {
+                ast::AConstValue::Integer(i) => Some(i.ival != 0),
+                ast::AConstValue::Boolean(b) => Some(b.boolval),
+                ast::AConstValue::String(s) => match s.sval.to_ascii_lowercase().as_str() {
                     "on" | "true" | "yes" | "1" | "t" | "y" => Some(true),
                     "off" | "false" | "no" | "0" | "f" | "n" => Some(false),
                     _ => None,
@@ -366,8 +364,8 @@ fn read_only_setting(v: &typedpg_pg_query::protobuf::VariableSetStmt) -> Option<
 /// The command a read-only transaction refuses `stmt` as, if it writes:
 /// DDL and TRUNCATE (ClassifyUtilityCommandAsReadOnly), and DML on a
 /// permanent relation (ExecCheckXactReadOnly).
-fn writes(db: &PgCatalog, stmt: &node::Node) -> Option<&'static str> {
-    use node::Node as N;
+fn writes(db: &PgCatalog, stmt: &ast::Node) -> Option<&'static str> {
+    use ast::Node as N;
     if super::cmdtag::utility_is_not_read_only(stmt) {
         return Some(super::cmdtag::command_tag(stmt));
     }
@@ -391,11 +389,11 @@ fn writes(db: &PgCatalog, stmt: &node::Node) -> Option<&'static str> {
 /// CONCURRENTLY and VERBOSE booleans (defGetBoolean), TABLESPACE, and no
 /// other. Whether CONCURRENTLY is on (the last one given wins).
 pub(crate) fn reindex_options(
-    params: &[typedpg_pg_query::protobuf::Node],
+    params: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<bool, DdlError> {
     let mut concurrently = false;
     for p in params {
-        let Some(node::Node::DefElem(de)) = p.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = p.as_ref() else {
             continue;
         };
         match de.defname.as_str() {
@@ -422,65 +420,59 @@ pub(crate) fn reindex_options(
 }
 
 /// REINDEX's TABLESPACE: the last one given, as defGetString renders it.
-pub(crate) fn reindex_tablespace(params: &[typedpg_pg_query::protobuf::Node]) -> Option<String> {
-    params.iter().rev().find_map(|p| match p.node.as_ref() {
-        Some(node::Node::DefElem(de)) if de.defname == "tablespace" => {
-            match de.arg.as_deref().and_then(|a| a.node.as_ref())? {
-                node::Node::String(s) => Some(s.sval.clone()),
-                node::Node::Integer(i) => Some(i.ival.to_string()),
-                node::Node::Float(f) => Some(f.fval.clone()),
-                node::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
-                _ => None,
-            }
-        }
+pub(crate) fn reindex_tablespace(params: &[Option<typedpg_pg_query::ast::Node>]) -> Option<String> {
+    params.iter().rev().find_map(|p| match p.as_ref() {
+        Some(ast::Node::DefElem(de)) if de.defname == "tablespace" => match de.arg.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.clone()),
+            ast::Node::Integer(i) => Some(i.ival.to_string()),
+            ast::Node::Float(f) => Some(f.fval.clone()),
+            ast::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
+            _ => None,
+        },
         _ => None,
     })
 }
 
 /// PreventInTransactionBlock callers. (A REINDEX whose options are invalid
 /// fails on them first, in [`super::maintenance::reindex`].)
-fn forbidden_in_block(stmt: &node::Node) -> Option<&'static str> {
+fn forbidden_in_block(stmt: &ast::Node) -> Option<&'static str> {
     match stmt {
-        node::Node::VacuumStmt(v) if v.is_vacuumcmd => Some("VACUUM"),
-        node::Node::IndexStmt(i) if i.concurrent => Some("CREATE INDEX CONCURRENTLY"),
-        node::Node::DropStmt(d) if d.concurrent => Some("DROP INDEX CONCURRENTLY"),
-        node::Node::ReindexStmt(r) => {
+        ast::Node::VacuumStmt(v) if v.is_vacuumcmd => Some("VACUUM"),
+        ast::Node::IndexStmt(i) if i.concurrent => Some("CREATE INDEX CONCURRENTLY"),
+        ast::Node::DropStmt(d) if d.concurrent => Some("DROP INDEX CONCURRENTLY"),
+        ast::Node::ReindexStmt(r) => {
             let Ok(concurrently) = reindex_options(&r.params) else {
                 return None;
             };
             if concurrently {
                 return Some("REINDEX CONCURRENTLY");
             }
-            match ReindexObjectType::try_from(r.kind) {
-                Ok(ReindexObjectType::ReindexObjectSchema) => Some("REINDEX SCHEMA"),
-                Ok(ReindexObjectType::ReindexObjectSystem) => Some("REINDEX SYSTEM"),
-                Ok(ReindexObjectType::ReindexObjectDatabase) => Some("REINDEX DATABASE"),
+            match r.kind {
+                ReindexObjectType::ReindexObjectSchema => Some("REINDEX SCHEMA"),
+                ReindexObjectType::ReindexObjectSystem => Some("REINDEX SYSTEM"),
+                ReindexObjectType::ReindexObjectDatabase => Some("REINDEX DATABASE"),
                 _ => None,
             }
         }
-        node::Node::ClusterStmt(c) if c.relation.is_none() => Some("CLUSTER"),
-        node::Node::AlterTableStmt(a) => a.cmds.iter().find_map(|c| match c.node.as_ref() {
-            Some(node::Node::AlterTableCmd(cmd)) => {
-                match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
-                    Some(node::Node::PartitionCmd(pc)) if pc.concurrent => {
-                        Some("ALTER TABLE ... DETACH CONCURRENTLY")
-                    }
-                    _ => None,
+        ast::Node::ClusterStmt(c) if c.relation.is_none() => Some("CLUSTER"),
+        ast::Node::AlterTableStmt(a) => a.cmds.iter().find_map(|c| match c.as_ref() {
+            Some(ast::Node::AlterTableCmd(cmd)) => match cmd.def.as_ref() {
+                Some(ast::Node::PartitionCmd(pc)) if pc.concurrent => {
+                    Some("ALTER TABLE ... DETACH CONCURRENTLY")
                 }
-            }
+                _ => None,
+            },
             _ => None,
         }),
-        node::Node::DiscardStmt(d) if d.target == DiscardMode::DiscardAll as i32 => {
-            Some("DISCARD ALL")
-        }
-        node::Node::CreatedbStmt(_) => Some("CREATE DATABASE"),
-        node::Node::DropdbStmt(_) => Some("DROP DATABASE"),
-        node::Node::CreateTableSpaceStmt(_) => Some("CREATE TABLESPACE"),
-        node::Node::DropTableSpaceStmt(_) => Some("DROP TABLESPACE"),
-        node::Node::AlterSystemStmt(_) => Some("ALTER SYSTEM"),
-        node::Node::TransactionStmt(t) => match TransactionStmtKind::try_from(t.kind) {
-            Ok(TransactionStmtKind::TransStmtCommitPrepared) => Some("COMMIT PREPARED"),
-            Ok(TransactionStmtKind::TransStmtRollbackPrepared) => Some("ROLLBACK PREPARED"),
+        ast::Node::DiscardStmt(d) if d.target == DiscardMode::DiscardAll => Some("DISCARD ALL"),
+        ast::Node::CreatedbStmt(_) => Some("CREATE DATABASE"),
+        ast::Node::DropdbStmt(_) => Some("DROP DATABASE"),
+        ast::Node::CreateTableSpaceStmt(_) => Some("CREATE TABLESPACE"),
+        ast::Node::DropTableSpaceStmt(_) => Some("DROP TABLESPACE"),
+        ast::Node::AlterSystemStmt(_) => Some("ALTER SYSTEM"),
+        ast::Node::TransactionStmt(t) => match t.kind {
+            TransactionStmtKind::TransStmtCommitPrepared => Some("COMMIT PREPARED"),
+            TransactionStmtKind::TransStmtRollbackPrepared => Some("ROLLBACK PREPARED"),
             _ => None,
         },
         _ => None,
@@ -489,18 +481,18 @@ fn forbidden_in_block(stmt: &node::Node) -> Option<&'static str> {
 
 /// RequireTransactionBlock callers: `(name, the implicit block of a
 /// multi-statement query suffices)`.
-fn needs_block(stmt: &node::Node) -> Option<(&'static str, bool)> {
+fn needs_block(stmt: &ast::Node) -> Option<(&'static str, bool)> {
     /// CURSOR_OPT_HOLD (parsenodes.h).
     const CURSOR_OPT_HOLD: i32 = 0x0020;
     match stmt {
-        node::Node::LockStmt(_) => Some(("LOCK TABLE", true)),
-        node::Node::DeclareCursorStmt(d) if d.options & CURSOR_OPT_HOLD == 0 => {
+        ast::Node::LockStmt(_) => Some(("LOCK TABLE", true)),
+        ast::Node::DeclareCursorStmt(d) if d.options & CURSOR_OPT_HOLD == 0 => {
             Some(("DECLARE CURSOR", true))
         }
-        node::Node::TransactionStmt(t) => match TransactionStmtKind::try_from(t.kind) {
-            Ok(TransactionStmtKind::TransStmtSavepoint) => Some(("SAVEPOINT", false)),
-            Ok(TransactionStmtKind::TransStmtRelease) => Some(("RELEASE SAVEPOINT", false)),
-            Ok(TransactionStmtKind::TransStmtRollbackTo) => Some(("ROLLBACK TO SAVEPOINT", false)),
+        ast::Node::TransactionStmt(t) => match t.kind {
+            TransactionStmtKind::TransStmtSavepoint => Some(("SAVEPOINT", false)),
+            TransactionStmtKind::TransStmtRelease => Some(("RELEASE SAVEPOINT", false)),
+            TransactionStmtKind::TransStmtRollbackTo => Some(("ROLLBACK TO SAVEPOINT", false)),
             _ => None,
         },
         _ => None,

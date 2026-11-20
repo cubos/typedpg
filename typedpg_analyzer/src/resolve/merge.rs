@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use typedpg_pg_query::{NodeBox, ast};
 
 use super::*;
 
@@ -17,7 +18,7 @@ thread_local! {
 /// `merge_action()` (PG 17): `text NOT NULL` inside a MERGE RETURNING list
 /// (directly or in a sublink there), 42601 everywhere else.
 pub(crate) fn infer_merge_support_func(
-    f: &protobuf::MergeSupportFunc,
+    f: &ast::MergeSupportFunc,
 ) -> Result<expr::ExprType, AnalyzeError> {
     if MERGE_RETURNING_DEPTH.with(Cell::get) == 0 {
         return Err(crate::error::RawError::new(
@@ -33,7 +34,7 @@ pub(crate) fn infer_merge_support_func(
 }
 
 pub(crate) fn analyze_merge(
-    merge: &protobuf::MergeStmt,
+    merge: &ast::MergeStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
@@ -47,7 +48,7 @@ pub(crate) fn analyze_merge(
 /// SOURCE: the target), and RETURNING (PG 17) sees both — source first, as
 /// in `*` expansion.
 pub(crate) fn analyze_merge_with_outer_ctes(
-    merge: &protobuf::MergeStmt,
+    merge: &ast::MergeStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -67,9 +68,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         if with.recursive {
             return Err(crate::pgmsg::merge_with_recursive().finalize_implicit());
         }
-        let owner = protobuf::Node {
-            node: Some(node::Node::MergeStmt(Box::new(merge.clone()))),
-        };
+        let owner = ast::Node::MergeStmt(NodeBox::new(merge.clone()));
         cte_scopes = super::cte::with_statement_owner(with, owner, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, &[])
         })?;
@@ -141,12 +140,12 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     // inside the source is `invalid reference to FROM-clause entry`.
     source_scope.shadowed_sources = target_scope.sources.clone();
     let target_entries = source_scope.shadowed_sources.len();
-    if let Some(source_relation) = &merge.source_relation {
+    if let source_relation @ Some(_) = &merge.source_relation {
         // transform_MERGE_to_join: the source is null-extended only for a
         // NOT MATCHED BY SOURCE action (a LEFT or FULL join).
         let kept = !merge.merge_when_clauses.iter().any(|w| {
-            matches!(w.node.as_ref(), Some(node::Node::MergeWhenClause(w))
-                if w.match_kind == protobuf::MergeMatchKind::MergeWhenNotMatchedBySource as i32)
+            matches!(w.as_ref(), Some(ast::Node::MergeWhenClause(w))
+                if w.match_kind == ast::MergeMatchKind::MergeWhenNotMatchedBySource)
         });
         let _plan = crate::expr::plan_fold::PlanLevel::enter_merge_source(source_relation);
         super::from::with_rows_kept(kept, || {
@@ -183,7 +182,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         .extend(target_scope.sources.iter().cloned());
 
     let on_log = crate::nonnull::StrictLog::default();
-    if let Some(join_condition) = &merge.join_condition {
+    if let join_condition @ Some(_) = &merge.join_condition {
         expr::infer_expr(
             join_condition,
             expr::Ctx::new(&both, &null_ctx, snapshot).logging_strictness(&on_log),
@@ -199,11 +198,11 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     let events: Vec<DmlEvent> = merge
         .merge_when_clauses
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::MergeWhenClause(w)) => match CmdType::try_from(w.command_type) {
-                Ok(CmdType::CmdInsert) => Some(DmlEvent::Insert),
-                Ok(CmdType::CmdUpdate) => Some(DmlEvent::Update),
-                Ok(CmdType::CmdDelete) => Some(DmlEvent::Delete),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::MergeWhenClause(w)) => match w.command_type {
+                CmdType::CmdInsert => Some(DmlEvent::Insert),
+                CmdType::CmdUpdate => Some(DmlEvent::Update),
+                CmdType::CmdDelete => Some(DmlEvent::Delete),
                 _ => None,
             },
             _ => None,
@@ -234,25 +233,24 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     // What each WHEN clause's condition proves, where its action runs.
     let mut when_facts: Vec<crate::nonnull::Facts> = Vec::new();
     // The WHEN clauses with their UPDATE SET lists expanded, when one was.
-    let mut expanded_whens: Option<Vec<protobuf::Node>> = None;
+    let mut expanded_whens: Option<Vec<Option<ast::Node>>> = None;
     for (i, when_node) in merge.merge_when_clauses.iter().enumerate() {
-        if let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() {
+        if let Some(ast::Node::MergeWhenClause(when)) = when_node.as_ref() {
             // An INSERT action returns a row with no old version, a DELETE
             // action one with no new version.
-            match CmdType::try_from(when.command_type) {
-                Ok(CmdType::CmdInsert) => rows.old_may_be_null = true,
-                Ok(CmdType::CmdDelete) => rows.new_may_be_null = true,
+            match when.command_type {
+                CmdType::CmdInsert => rows.old_may_be_null = true,
+                CmdType::CmdDelete => rows.new_may_be_null = true,
                 _ => {}
             }
-            let when_scope = match protobuf::MergeMatchKind::try_from(when.match_kind) {
-                Ok(protobuf::MergeMatchKind::MergeWhenNotMatchedBySource) => {
+            let when_scope = match when.match_kind {
+                ast::MergeMatchKind::MergeWhenNotMatchedBySource => {
                     // Rows of the target without a source match: the source
                     // side is NULL wherever such an action returns a row.
-                    source_may_be_null |= CmdType::try_from(when.command_type)
-                        .is_ok_and(|c| c != CmdType::CmdNothing);
+                    source_may_be_null |= when.command_type != CmdType::CmdNothing;
                     &target_only
                 }
-                Ok(protobuf::MergeMatchKind::MergeWhenNotMatchedByTarget) => &source_only,
+                ast::MergeMatchKind::MergeWhenNotMatchedByTarget => &source_only,
                 _ => &both,
             };
             let log = crate::nonnull::StrictLog::default();
@@ -266,17 +264,15 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             )?;
             if let Some(target_list) = set_list {
                 let whens = expanded_whens.get_or_insert_with(|| merge.merge_when_clauses.clone());
-                whens[i] = protobuf::Node {
-                    node: Some(node::Node::MergeWhenClause(Box::new(
-                        protobuf::MergeWhenClause {
-                            target_list,
-                            ..(**when).clone()
-                        },
-                    ))),
-                };
+                whens[i] = Some(ast::Node::MergeWhenClause(NodeBox::new(
+                    ast::MergeWhenClause {
+                        target_list,
+                        ..(**when).clone()
+                    },
+                )));
             }
             when_facts.push(match &when.condition {
-                Some(c) => crate::nonnull::nonnullable(c, true, when_scope, &log, snapshot)
+                c @ Some(_) => crate::nonnull::nonnullable(c, true, when_scope, &log, snapshot)
                     .restricted_to(&crate::nonnull::own_aliases(when_scope)),
                 None => crate::nonnull::Facts::default(),
             });
@@ -286,7 +282,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     let expanded_merge;
     let merge = match expanded_whens {
         Some(merge_when_clauses) => {
-            expanded_merge = protobuf::MergeStmt {
+            expanded_merge = ast::MergeStmt {
                 merge_when_clauses,
                 ..merge.clone()
             };
@@ -306,14 +302,12 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     if has_returning(&merge.returning_clause)
         && let Some(wt) = WriteTarget::resolve(snapshot, table_oid)
     {
-        let on_facts = merge
-            .join_condition
-            .as_deref()
-            .map(|c| {
-                crate::nonnull::nonnullable(c, true, &both, &on_log, snapshot)
-                    .restricted_to(&crate::nonnull::own_aliases(&both))
-            })
-            .unwrap_or_default();
+        let on_facts = if merge.join_condition.is_some() {
+            crate::nonnull::nonnullable(&merge.join_condition, true, &both, &on_log, snapshot)
+                .restricted_to(&crate::nonnull::own_aliases(&both))
+        } else {
+            Default::default()
+        };
         let arms = MergeArms {
             merge,
             wt: &wt,
@@ -357,11 +351,11 @@ pub(crate) fn analyze_merge_with_outer_ctes(
 
     let mut actions = Vec::new();
     for when_node in &merge.merge_when_clauses {
-        let Some(node::Node::MergeWhenClause(when)) = when_node.node.as_ref() else {
+        let Some(ast::Node::MergeWhenClause(when)) = when_node.as_ref() else {
             continue;
         };
-        actions.push(match CmdType::try_from(when.command_type) {
-            Ok(CmdType::CmdInsert) => {
+        actions.push(match when.command_type {
+            CmdType::CmdInsert => {
                 // `INSERT (cols) VALUES (…)`, or the leading columns.
                 let names: Vec<String> = if when.target_list.is_empty() {
                     table_attrs
@@ -372,8 +366,8 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                 } else {
                     when.target_list
                         .iter()
-                        .filter_map(|t| match t.node.as_ref() {
-                            Some(node::Node::ResTarget(rt)) => Some(rt.name.clone()),
+                        .filter_map(|t| match t.as_ref() {
+                            Some(ast::Node::ResTarget(rt)) => Some(rt.name.clone()),
                             _ => None,
                         })
                         .collect()
@@ -392,12 +386,12 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                     overriding: Overriding::from_kind(when.r#override),
                 }
             }
-            Ok(CmdType::CmdUpdate) => Action {
+            CmdType::CmdUpdate => Action {
                 event: Some(DmlEvent::Update),
                 assigns: set_list_assigns(&when.target_list),
                 overriding: Overriding::NotSet,
             },
-            Ok(CmdType::CmdDelete) => Action {
+            CmdType::CmdDelete => Action {
                 event: Some(DmlEvent::Delete),
                 assigns: Vec::new(),
                 overriding: Overriding::NotSet,
@@ -427,14 +421,14 @@ pub(crate) fn analyze_merge_with_outer_ctes(
 /// Returns an UPDATE action's SET list when [`analyze_set_clause`] expanded
 /// it.
 fn walk_merge_when_clause(
-    when: &protobuf::MergeWhenClause,
+    when: &ast::MergeWhenClause,
     ctx: Ctx<'_>,
     log: &crate::nonnull::StrictLog,
     params: &mut ParamCollector,
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
-) -> Result<Option<Vec<protobuf::Node>>, AnalyzeError> {
-    if let Some(condition) = &when.condition {
+) -> Result<Option<Vec<Option<ast::Node>>>, AnalyzeError> {
+    if let condition @ Some(_) = &when.condition {
         check_no_system_columns(condition, ctx.scope)?;
         // transformMergeStmt: transformWhereClause(…, EXPR_KIND_MERGE_WHEN,
         // "WHEN").
@@ -447,7 +441,7 @@ fn walk_merge_when_clause(
         check_no_srf_in_clause(condition, ctx.snapshot, "MERGE WHEN conditions")?;
     }
 
-    let cmd = CmdType::try_from(when.command_type).unwrap_or(CmdType::Undefined);
+    let cmd = when.command_type;
     match cmd {
         CmdType::CmdUpdate => merge_when_update(when, ctx, params, table_attrs, table_relname),
         CmdType::CmdInsert => {
@@ -460,7 +454,7 @@ fn walk_merge_when_clause(
         }
         _ => Err(AnalyzeError::Unsupported(format!(
             "typedpg does not support the MERGE action {} yet",
-            cmd.as_str_name()
+            cmd.c_name()
         ))),
     }
 }
@@ -468,10 +462,13 @@ fn walk_merge_when_clause(
 /// scanNSItemForColumn under EXPR_KIND_MERGE_WHEN: a WHEN condition may
 /// not read a relation's system column but `tableoid` (42P10). A sub-select
 /// is a query level of its own, where they are allowed.
-fn check_no_system_columns(condition: &protobuf::Node, scope: &Scope) -> Result<(), AnalyzeError> {
+fn check_no_system_columns(
+    condition: &Option<ast::Node>,
+    scope: &Scope,
+) -> Result<(), AnalyzeError> {
     let mut found: Option<(&str, i32)> = None;
     visit_same_level(condition, &mut |n| {
-        let Some(node::Node::ColumnRef(cr)) = n.node.as_ref() else {
+        let Some(ast::Node::ColumnRef(cr)) = n.as_ref() else {
             return;
         };
         if found.is_some() {
@@ -480,8 +477,8 @@ fn check_no_system_columns(condition: &protobuf::Node, scope: &Scope) -> Result<
         let names: Vec<&str> = cr
             .fields
             .iter()
-            .map_while(|f| match f.node.as_ref() {
-                Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            .map_while(|f| match f.as_ref() {
+                Some(ast::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             })
             .collect();
@@ -514,12 +511,12 @@ fn check_no_system_columns(condition: &protobuf::Node, scope: &Scope) -> Result<
 /// SET analysis against the target table. Returns the SET list when it
 /// expanded it.
 fn merge_when_update(
-    when: &protobuf::MergeWhenClause,
+    when: &ast::MergeWhenClause,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
-) -> Result<Option<Vec<protobuf::Node>>, AnalyzeError> {
+) -> Result<Option<Vec<Option<ast::Node>>>, AnalyzeError> {
     let set_list = analyze_set_clause(
         &when.target_list,
         table_attrs,
@@ -539,18 +536,18 @@ fn merge_when_update(
 /// parallel value expressions. An empty `target_list` implies the full
 /// attribute list.
 fn merge_when_insert(
-    when: &protobuf::MergeWhenClause,
+    when: &ast::MergeWhenClause,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
 ) -> Result<(), AnalyzeError> {
     let snapshot = ctx.snapshot;
-    let res_targets: Vec<&protobuf::ResTarget> = when
+    let res_targets: Vec<&ast::ResTarget> = when
         .target_list
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::ResTarget(rt) if !rt.name.is_empty() => Some(rt.as_ref()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::ResTarget(rt) if !rt.name.is_empty() => Some(rt.as_ref()),
             _ => None,
         })
         .collect();
@@ -584,7 +581,7 @@ fn merge_when_insert(
     // ExecMergeNotMatched inserts through ExecInsert: a row for a
     // partitioned target is routed first, and checked in (and named after)
     // its partition.
-    let value_of = |name: &str| -> Option<Option<&protobuf::Node>> {
+    let value_of = |name: &str| -> Option<Option<&ast::Node>> {
         let c = table_attrs.iter().find(|c| c.attname == name)?;
         match target_attrs.iter().position(|t| t.attname == name) {
             Some(i)
@@ -600,7 +597,7 @@ fn merge_when_insert(
                 if is_set_to_default(v) {
                     null_default(c, snapshot).then_some(None)
                 } else {
-                    Some((!is_sql_null_literal(v)).then_some(v))
+                    Some((!is_sql_null_literal(v)).then_some(v.as_ref()?))
                 }
             }
             None => null_default(c, snapshot).then_some(None),
@@ -689,7 +686,7 @@ fn merge_when_insert(
             // EXPR_KIND_VALUES_SINGLE.
             crate::clause::check_no_aggregates_or_windows(val, snapshot, "VALUES")?;
         }
-        if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+        if let Some(ast::Node::ParamRef(p)) = val.as_ref()
             && let Some(tc) = target_col
             && (!tc.attnotnull || indirected || discards(tc))
         {
@@ -727,10 +724,10 @@ fn merge_when_insert(
 /// transformMergeStmt's first pass over the WHEN clauses: once a match kind
 /// has an unconditional clause, a later clause of the same kind can never
 /// run (42601).
-fn check_unreachable_when_clauses(clauses: &[protobuf::Node]) -> Result<(), AnalyzeError> {
-    let mut terminal: Vec<i32> = Vec::new();
+fn check_unreachable_when_clauses(clauses: &[Option<ast::Node>]) -> Result<(), AnalyzeError> {
+    let mut terminal: Vec<ast::MergeMatchKind> = Vec::new();
     for n in clauses {
-        let Some(node::Node::MergeWhenClause(when)) = n.node.as_ref() else {
+        let Some(ast::Node::MergeWhenClause(when)) = n.as_ref() else {
             continue;
         };
         if terminal.contains(&when.match_kind) {
@@ -747,25 +744,25 @@ fn check_unreachable_when_clauses(clauses: &[protobuf::Node]) -> Result<(), Anal
 /// alias): the alias when given, else the relation / CTE name, the first
 /// function's name, `json_table`, or PG's `unnamed_subquery` /
 /// `unnamed_join` placeholders.
-fn from_item_refname(item: &protobuf::Node) -> Option<String> {
-    let alias = |a: &Option<protobuf::Alias>| a.as_ref().map(|a| a.aliasname.clone());
-    match item.node.as_ref()? {
-        node::Node::RangeVar(rv) => alias(&rv.alias).or_else(|| Some(rv.relname.clone())),
-        node::Node::RangeSubselect(rs) => {
+fn from_item_refname(item: &Option<ast::Node>) -> Option<String> {
+    let alias = |a: &Option<NodeBox<ast::Alias>>| a.as_deref().map(|a| a.aliasname.clone());
+    match item.as_ref()? {
+        ast::Node::RangeVar(rv) => alias(&rv.alias).or_else(|| Some(rv.relname.clone())),
+        ast::Node::RangeSubselect(rs) => {
             alias(&rs.alias).or_else(|| Some("unnamed_subquery".into()))
         }
-        node::Node::JoinExpr(j) => alias(&j.alias).or_else(|| Some("unnamed_join".into())),
-        node::Node::RangeFunction(rf) => alias(&rf.alias).or_else(|| {
-            let Some(node::Node::List(pair)) = rf.functions.first()?.node.as_ref() else {
+        ast::Node::JoinExpr(j) => alias(&j.alias).or_else(|| Some("unnamed_join".into())),
+        ast::Node::RangeFunction(rf) => alias(&rf.alias).or_else(|| {
+            let Some(ast::Node::List(pair)) = rf.functions.first()?.as_ref() else {
                 return None;
             };
-            match pair.items.first()?.node.as_ref()? {
-                node::Node::FuncCall(fc) => expr::extract_string_fields(&fc.funcname).pop(),
+            match pair.items.first()?.as_ref()? {
+                ast::Node::FuncCall(fc) => expr::extract_string_fields(&fc.funcname).pop(),
                 _ => None,
             }
         }),
-        node::Node::JsonTable(jt) => alias(&jt.alias).or_else(|| Some("json_table".into())),
-        node::Node::RangeTableSample(ts) => from_item_refname(ts.relation.as_deref()?),
+        ast::Node::JsonTable(jt) => alias(&jt.alias).or_else(|| Some("json_table".into())),
+        ast::Node::RangeTableSample(ts) => from_item_refname(&ts.relation),
         _ => None,
     }
 }
@@ -776,7 +773,7 @@ fn from_item_refname(item: &protobuf::Node) -> Option<String> {
 /// MATCHED one, the ON condition — held. What is known of every returned
 /// row is what every action that returns one knows.
 struct MergeArms<'a> {
-    merge: &'a protobuf::MergeStmt,
+    merge: &'a ast::MergeStmt,
     wt: &'a WriteTarget,
     target_alias: &'a str,
     table_attrs: &'a [crate::pg_catalog::PgAttribute],
@@ -815,28 +812,27 @@ impl MergeArms<'_> {
             .merge
             .merge_when_clauses
             .iter()
-            .filter_map(|n| match n.node.as_ref() {
-                Some(node::Node::MergeWhenClause(w)) => Some(w.as_ref()),
+            .filter_map(|n| match n.as_ref() {
+                Some(ast::Node::MergeWhenClause(w)) => Some(w.as_ref()),
                 _ => None,
             });
         for (when, when_facts) in whens.zip(self.when_facts) {
-            let cmd = CmdType::try_from(when.command_type).unwrap_or(CmdType::Undefined);
+            let cmd = when.command_type;
             if !matches!(
                 cmd,
                 CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete
             ) {
                 continue;
             }
-            let kind = protobuf::MergeMatchKind::try_from(when.match_kind)
-                .unwrap_or(protobuf::MergeMatchKind::MergeWhenMatched);
+            let kind = when.match_kind;
             let facts = match kind {
-                protobuf::MergeMatchKind::MergeWhenMatched => {
+                ast::MergeMatchKind::MergeWhenMatched => {
                     self.on_facts.clone().union(when_facts.clone())
                 }
                 _ => when_facts.clone(),
             };
             let source_cols: std::collections::HashSet<(String, String)> = match kind {
-                protobuf::MergeMatchKind::MergeWhenNotMatchedBySource => Default::default(),
+                ast::MergeMatchKind::MergeWhenNotMatchedBySource => Default::default(),
                 _ => facts
                     .columns
                     .iter()
@@ -907,7 +903,7 @@ impl MergeArms<'_> {
     /// row where `facts` hold, and the defaults.
     fn inserted(
         &self,
-        when: &protobuf::MergeWhenClause,
+        when: &ast::MergeWhenClause,
         facts: &crate::nonnull::Facts,
         params: &mut ParamCollector,
     ) -> RowKnowledge {
@@ -919,8 +915,8 @@ impl MergeArms<'_> {
         } else {
             when.target_list
                 .iter()
-                .filter_map(|t| match t.node.as_ref() {
-                    Some(node::Node::ResTarget(rt)) => {
+                .filter_map(|t| match t.as_ref() {
+                    Some(ast::Node::ResTarget(rt)) => {
                         Some((rt.name.clone(), !rt.indirection.is_empty()))
                     }
                     _ => None,

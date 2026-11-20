@@ -1,6 +1,6 @@
 //! Shared utilities for DDL interpretation.
 
-use typedpg_pg_query::protobuf::{Node, RangeVar, TypeName, node};
+use typedpg_pg_query::ast::{self, Node, RangeVar, TypeName};
 
 use crate::ddl::DdlError;
 use crate::oid::{PgCastOid, PgNamespaceOid, PgTypeOid};
@@ -111,7 +111,7 @@ pub(crate) fn lookup_table(
 /// name nodes (e.g. `DROP TABLE` / `DROP TYPE` objects). Handles both
 /// `["name"]` and `["schema", "name"]`; an unqualified name is looked up
 /// along the search path, relations first, then types.
-pub fn extract_names(names: &[Node], snapshot: &PgCatalog) -> (String, String) {
+pub fn extract_names(names: &[Option<Node>], snapshot: &PgCatalog) -> (String, String) {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
 
     match parts.as_slice() {
@@ -135,7 +135,7 @@ pub fn extract_names(names: &[Node], snapshot: &PgCatalog) -> (String, String) {
 }
 
 /// Extract a schema-qualified key from name nodes.
-pub fn names_key(names: &[Node], snapshot: &PgCatalog) -> QualifiedName {
+pub fn names_key(names: &[Option<Node>], snapshot: &PgCatalog) -> QualifiedName {
     let (schema, name) = extract_names(names, snapshot);
     QualifiedName::new(schema, name)
 }
@@ -275,7 +275,7 @@ pub fn existing_namespace(interp: &PgCatalog, name: &str) -> Result<PgNamespaceO
 /// or the creation schema.
 pub fn ensure_qualified_name(
     interp: &mut PgCatalog,
-    names: &[Node],
+    names: &[Option<Node>],
 ) -> Result<(PgNamespaceOid, String), DdlError> {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     let (schema, name) = match parts.as_slice() {
@@ -348,8 +348,8 @@ pub fn lookup_type_name(tn: &TypeName, snapshot: &PgCatalog) -> Result<PgTypeOid
     let parts: Vec<&str> = tn
         .names
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.as_str()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect();
@@ -786,9 +786,9 @@ pub fn format_type_with_typmod(
 }
 
 /// Extract a string value from a Node.
-pub fn node_string(n: &Node) -> Option<&str> {
-    match n.node.as_ref()? {
-        node::Node::String(s) => Some(s.sval.as_str()),
+pub fn node_string(n: &Option<Node>) -> Option<&str> {
+    match n.as_ref()? {
+        ast::Node::String(s) => Some(s.sval.as_str()),
         _ => None,
     }
 }
@@ -803,11 +803,11 @@ pub fn node_string(n: &Node) -> Option<&str> {
 /// user or system one — of the field's name (else `(t).f` is the call
 /// `f(t)`, which reads the whole row).
 pub(crate) fn whole_row_selections<'a>(
-    expr: &'a Node,
+    expr: &'a Option<Node>,
     is_row: &dyn Fn(&str) -> bool,
     is_column: &dyn Fn(&str) -> bool,
-) -> Vec<(&'a typedpg_pg_query::protobuf::ColumnRef, &'a str)> {
-    let Some(inner) = expr.node.as_ref() else {
+) -> Vec<(&'a typedpg_pg_query::ast::ColumnRef, &'a str)> {
+    let Some(inner) = expr.as_ref() else {
         return Vec::new();
     };
     inner
@@ -818,13 +818,13 @@ pub(crate) fn whole_row_selections<'a>(
                 return None;
             };
             let field = node_string(ind.indirection.first()?)?;
-            let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+            let Some(ast::Node::ColumnRef(cr)) = ind.arg.as_ref() else {
                 return None;
             };
             let [name] = cr.fields.as_slice() else {
                 return None;
             };
-            (is_row(node_string(name)?) && is_column(field)).then_some((cr, field))
+            (is_row(node_string(name)?) && is_column(field)).then_some((&**cr, field))
         })
         .collect()
 }
@@ -834,8 +834,8 @@ pub(crate) fn whole_row_selections<'a>(
 pub(crate) fn relation_row_selections<'a>(
     interp: &PgCatalog,
     relid: crate::oid::PgClassOid,
-    expr: &'a Node,
-) -> Vec<(&'a typedpg_pg_query::protobuf::ColumnRef, &'a str)> {
+    expr: &'a Option<Node>,
+) -> Vec<(&'a typedpg_pg_query::ast::ColumnRef, &'a str)> {
     let relname = interp.pg_class.get(&relid).map(|c| c.relname.as_str());
     whole_row_selections(
         expr,

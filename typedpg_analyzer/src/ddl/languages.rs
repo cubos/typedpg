@@ -4,7 +4,7 @@
 //! language, and DROP LANGUAGE goes through the dependency engine — the
 //! built-in languages are pinned, plpgsql belongs to its extension.
 
-use typedpg_pg_query::protobuf::{CreatePLangStmt, CreateTransformStmt};
+use typedpg_pg_query::ast::{CreatePLangStmt, CreateTransformStmt};
 
 use super::DdlError;
 use crate::oid::{PgLanguageOid, PgProcOid, PgTypeOid};
@@ -42,7 +42,7 @@ pub(crate) fn check(interp: &PgCatalog, name: &str) -> Result<PgLanguageOid, Ddl
 /// The `name(args)` function of a CREATE LANGUAGE clause, if written.
 fn clause_function(
     interp: &PgCatalog,
-    names: &[typedpg_pg_query::protobuf::Node],
+    names: &[Option<typedpg_pg_query::ast::Node>],
     args: &[PgTypeOid],
 ) -> Result<Option<PgProcOid>, DdlError> {
     let parts: Vec<String> = names
@@ -111,7 +111,7 @@ pub fn create_language(interp: &mut PgCatalog, stmt: &CreatePLangStmt) -> Result
 /// routines written in it need CASCADE.
 pub(crate) fn drop_language(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -148,14 +148,9 @@ pub(crate) fn delete_language(interp: &mut PgCatalog, oid: PgLanguageOid) {
 /// ALTER LANGUAGE name RENAME TO new.
 pub(crate) fn rename_language(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = stmt
-        .object
-        .as_deref()
-        .and_then(super::util::node_string)
-        .map(str::to_owned)
-    else {
+    let Some(old) = super::util::node_string(&stmt.object).map(str::to_owned) else {
         return Ok(());
     };
     let oid = check(interp, &old)?;
@@ -209,17 +204,17 @@ pub(crate) fn transform_exists(interp: &PgCatalog, typeid: PgTypeOid, language: 
 /// LANGUAGE lang` (a `[TypeName, lang]` list). Returns where it is.
 pub(crate) fn find_transform(
     interp: &PgCatalog,
-    object: &typedpg_pg_query::protobuf::Node,
+    object: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<Option<usize>, DdlError> {
-    use typedpg_pg_query::protobuf::node;
-    let Some(node::Node::List(l)) = object.node.as_ref() else {
+    use typedpg_pg_query::ast;
+    let Some(ast::Node::List(l)) = object.as_ref() else {
         return Ok(None);
     };
     let [typ, lang] = l.items.as_slice() else {
         return Ok(None);
     };
-    let (Some(node::Node::TypeName(tn)), Some(lang)) =
-        (typ.node.as_ref(), super::util::node_string(lang))
+    let (Some(ast::Node::TypeName(tn)), Some(lang)) =
+        (typ.as_ref(), super::util::node_string(lang))
     else {
         return Ok(None);
     };
@@ -241,7 +236,7 @@ pub(crate) fn find_transform(
 /// DROP TRANSFORM [IF EXISTS] FOR type LANGUAGE lang.
 pub(crate) fn drop_transform(
     interp: &mut PgCatalog,
-    object: &typedpg_pg_query::protobuf::Node,
+    object: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     match find_transform(interp, object) {
