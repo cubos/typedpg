@@ -37,7 +37,6 @@ include = [
 # drop them.
 serde = { version = "1", features = ["derive"] }
 stacker = "0.1"
-serde_json = "1"
 thiserror = "2"
 
 [build-dependencies]

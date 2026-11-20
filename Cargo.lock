@@ -3705,7 +3705,6 @@ version = "0.7.3"
 dependencies = [
  "cc",
  "serde",
- "serde_json",
  "stacker",
  "thiserror",
  "typedpg_core",

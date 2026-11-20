@@ -22,31 +22,33 @@ The crate exposes:
   headers;
 - `parse_plpgsql` / `parse_plpgsql_with_catalog`, which compile `DO` blocks
   and `CREATE FUNCTION … LANGUAGE plpgsql` statements with PostgreSQL's own
-  PL/pgSQL compiler and return the compiled functions as JSON (see below).
+  PL/pgSQL compiler and return the compiled functions as `plpgsql::Function`
+  trees (see below).
 
 ## PL/pgSQL
 
 The compiler is PostgreSQL's (`postgres/src/pl/plpgsql/src/pl_comp.c`,
 `pl_gram.c`, `pl_funcs.c`, `pl_scanner.c`, `pl_handler.c`). The driver lives in
-[`csrc/plpgsql/`](csrc/plpgsql): libpg_query's `pg_query_parse_plpgsql.c` and
-`pg_query_json_plpgsql.c` — BSD-3-Clause, its [`LICENSE`](csrc/plpgsql/LICENSE)
-sits next to them — adapted to this crate. The JSON patches typedpg used to
-apply at build time are applied to the source directly:
+[`csrc/plpgsql/`](csrc/plpgsql): libpg_query's `pg_query_parse_plpgsql.c` —
+BSD-3-Clause, its [`LICENSE`](csrc/plpgsql/LICENSE) sits next to it — adapted
+to this crate.
 
-- a block's `initvarnos` (the variables it initializes on entry) are dumped;
-- a trigger function's `TG_*` promise datums are dumped as the variables they
-  are (older libpg_query emitted them as empty objects, invalid JSON);
-- `retvarno` is dumped for `RETURN` / `RETURN NEXT` of a row or set variable;
-- `PLpgSQL_type` carries the type name as written (`origtypname`), all that is
-  left of a named composite type for re-lookup;
-- a record variable's declared type is dumped.
+The compiled functions are converted straight from the compiler's C structs
+into the hand-written types of [`src/plpgsql.rs`](src/plpgsql.rs) (a
+`Function`, its `Datum`s, a `Stmt` per `PLpgSQL_stmt_type`), which mirror
+`plpgsql.h`'s parse-time fields; the converter
+([`src/plpgsql/convert.rs`](src/plpgsql/convert.rs)) reads them through the
+bindgen bindings of `plpgsql.h`, so a field a PostgreSQL upgrade renames or
+retypes is a compile error there. Embedded SQL stays text (`Expr::query`). The
+driver hands each function to the converter as soon as it is compiled, then
+frees it: `funccache.c` reuses a compiled function's cache entry for the next
+function of the same signature, so they cannot all be kept to the end.
 
 Compiling a `CREATE FUNCTION` builds the `pg_proc` row PostgreSQL's validator
 would read — parameter types (the `proargtypes` oidvector and the OUT/VARIADIC
 arrays), the result type, the source text — as a real heap tuple, registers it
 in the syscache under a fake OID and calls `plpgsql_compile`, so the compiler
-runs on its normal path. A `DO` block calls `plpgsql_compile_inline`. The
-result is rendered by `plpgsqlToJSON`.
+runs on its normal path. A `DO` block calls `plpgsql_compile_inline`.
 
 Without a catalog, every lookup the compiler and the parser helpers make is
 answered from the release's built-in `pg_catalog` rows
@@ -81,7 +83,8 @@ What compilation does not do:
 sources the parser needs whole into [`postgres/`](postgres), trims
 `postgres/include/` to the headers they use, generates the built-in catalog
 tables, the stubs for the symbols the crate does not carry and the `bindgen`
-bindings of the node structs. See [`import/README.md`](import/README.md).
+bindings of the node structs and of PL/pgSQL's `plpgsql.h`. See
+[`import/README.md`](import/README.md).
 
 `build.rs` compiles `import/FILES`, `postgres/typedpg/*.c`, `csrc/*.c` (the
 catalog bridge), `csrc/pg/*.c` (the hand-written server services and the

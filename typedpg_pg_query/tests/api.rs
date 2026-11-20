@@ -2,6 +2,19 @@
 
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{self, Node};
+use typedpg_pg_query::plpgsql::{self, Datum, Stmt};
+
+/// The only function `sql` compiles to.
+fn compile_one(sql: &str) -> plpgsql::Function {
+    let mut functions = typedpg_pg_query::parse_plpgsql(sql).unwrap();
+    assert_eq!(functions.len(), 1, "{sql}: {functions:?}");
+    functions.remove(0)
+}
+
+/// The statements of a function's body.
+fn body(function: &plpgsql::Function) -> &[Stmt] {
+    &function.action.as_ref().expect("a body").body
+}
 
 #[test]
 fn parses_with_postgres_18_grammar() {
@@ -192,11 +205,13 @@ fn scans_tokens() {
 
 #[test]
 fn parses_plpgsql_bodies() {
-    let json = typedpg_pg_query::parse_plpgsql(
+    let function = compile_one(
         "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
-    )
-    .unwrap();
-    assert!(json.to_string().contains("PLpgSQL_stmt_return"), "{json}");
+    );
+    let [Stmt::Return(ret)] = body(&function) else {
+        panic!("{function:?}")
+    };
+    assert_eq!(ret.expr.as_ref().map(|e| e.query.as_str()), Some("1"));
 }
 
 #[test]
@@ -224,26 +239,36 @@ fn plpgsql_functions_without_a_string_body_are_errors_not_aborts() {
         }
     }
     // Without LANGUAGE an inline body is SQL: nothing to compile.
-    assert!(typedpg_pg_query::parse_plpgsql("CREATE FUNCTION f() RETURNS int RETURN 1").is_ok());
+    assert_eq!(
+        typedpg_pg_query::parse_plpgsql("CREATE FUNCTION f() RETURNS int RETURN 1"),
+        Ok(Vec::new())
+    );
 }
 
 #[test]
-fn plpgsql_trigger_functions_dump_valid_json() {
-    // TG_* variables are promise datums; `RETURN NEW` is a retvarno.
-    let json = typedpg_pg_query::parse_plpgsql(
+fn plpgsql_trigger_functions_convert() {
+    // TG_* variables are promise datums.
+    let function = compile_one(
         "CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
-    )
-    .unwrap();
-    let text = json.to_string();
-    assert!(text.contains("\"refname\":\"tg_name\""), "{text}");
+    );
+    assert!(
+        function.datums.iter().any(|d| matches!(
+            d,
+            Datum::Promise(v) if v.refname == "tg_name" && v.promise == plpgsql::PromiseType::TgName
+        )),
+        "{function:?}"
+    );
     // `RETURN r` of a record variable: retvarno is r's datum number
-    // (datums: found = 0, x = 1, r = 2). Zero values are omitted.
-    let json = typedpg_pg_query::parse_plpgsql(
+    // (datums: found = 0, x = 1, r = 2).
+    let function = compile_one(
         "CREATE FUNCTION f() RETURNS record LANGUAGE plpgsql AS \
          $$ DECLARE x int; r record; BEGIN RETURN r; END $$",
-    )
-    .unwrap();
-    assert!(json.to_string().contains("\"retvarno\":2"), "{json}");
+    );
+    let [Stmt::Return(ret)] = body(&function) else {
+        panic!("{function:?}")
+    };
+    assert_eq!((ret.expr.as_ref(), ret.retvarno), (None, 2), "{function:?}");
+    assert_eq!(function.datums[2].refname(), Some("r"));
 }
 
 #[test]
@@ -304,19 +329,64 @@ fn plpgsql_validates_anycompatiblemultirange_as_postgres_18_7() {
     // Validation resolves polymorphic types to int4 ones: since PostgreSQL
     // 18.7 (patches.rs), anycompatiblemultirange to int4multirange, as
     // anymultirange, for the arguments and the result ($0) alike.
-    let json = typedpg_pg_query::parse_plpgsql(
+    let function = compile_one(
         "CREATE FUNCTION f(a anycompatiblemultirange) RETURNS anycompatiblemultirange \
          LANGUAGE plpgsql AS $$ BEGIN RETURN a; END $$",
-    )
-    .unwrap();
-    let datums = json[0]["PLpgSQL_function"]["datums"].as_array().unwrap();
+    );
     let type_of = |name: &str| {
-        datums
-            .iter()
-            .map(|d| &d["PLpgSQL_var"])
-            .find(|v| v["refname"] == name)
-            .map(|v| v["datatype"]["PLpgSQL_type"]["typname"].clone())
+        function.datums.iter().find_map(|d| match d {
+            Datum::Var(v) if v.refname == name => v.datatype.as_ref().map(|t| t.typname.as_str()),
+            _ => None,
+        })
     };
-    assert_eq!(type_of("a"), Some("int4multirange".into()), "{json}");
-    assert_eq!(type_of("$0"), Some("int4multirange".into()), "{json}");
+    assert_eq!(type_of("a"), Some("int4multirange"), "{function:?}");
+    assert_eq!(type_of("$0"), Some("int4multirange"), "{function:?}");
+}
+
+#[test]
+fn the_deepest_plpgsql_converts_and_drops_on_a_small_stack() {
+    // PL/pgSQL's grammar nests 3,330 blocks (3,329 IFs) in a DO
+    // block's own, and no more: its parser stack (bison's YYMAXDEPTH, 10,000
+    // entries) runs out. The deepest tree converts, clones and drops on a
+    // 256 kB thread stack, in a debug build too.
+    let deepest = |open: &str, close: &str, n: usize| {
+        format!("DO $$ BEGIN {}{} END $$", open.repeat(n), close.repeat(n))
+    };
+    for (open, close, max) in [
+        ("BEGIN ", "END; ", 3330),
+        ("IF true THEN ", "END IF; ", 3329),
+    ] {
+        let too_deep = typedpg_pg_query::parse_plpgsql(&deepest(open, close, max + 1));
+        assert!(
+            matches!(&too_deep, Err(typedpg_pg_query::Error::Parse { message, .. })
+                if message.starts_with("memory exhausted")),
+            "{too_deep:?}"
+        );
+        let sql = deepest(open, close, max);
+        let depth = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || {
+                let functions = typedpg_pg_query::parse_plpgsql(&sql).unwrap();
+                let copy = functions.clone();
+                drop(functions);
+                // Down the first statement of each body to the innermost
+                // (the outermost body also holds the dummy RETURN the
+                // compiler appends).
+                let mut depth = 0;
+                let mut level = copy[0].action.as_ref().map(|b| b.body.as_slice());
+                while let Some([stmt, ..]) = level {
+                    depth += 1;
+                    level = match stmt {
+                        Stmt::Block(b) => Some(b.body.as_slice()),
+                        Stmt::If(i) => Some(i.then_body.as_slice()),
+                        _ => None,
+                    };
+                }
+                depth
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(depth, max, "{open}");
+    }
 }

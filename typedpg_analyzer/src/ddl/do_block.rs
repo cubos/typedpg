@@ -20,8 +20,8 @@
 //! analyzer's errors don't carry the SQLSTATE the condition is matched
 //! against).
 
-use serde_json::Value;
 use typedpg_pg_query::ast::{self, KeywordKind, Token};
+use typedpg_pg_query::plpgsql::{self, Datum, Stmt};
 
 use super::DdlError;
 use crate::pg_catalog::PgCatalog;
@@ -37,6 +37,9 @@ struct Variable {
     /// The current value, as its type's output text — `Some(None)` for
     /// NULL — when it is a known constant.
     value: Option<Option<String>>,
+    /// For a row (an `INTO` target list), the varnos of its fields'
+    /// variables.
+    fields: Option<Vec<i32>>,
 }
 
 /// How running a statement list ended.
@@ -91,54 +94,57 @@ pub(crate) fn execute(
     let Ok(parsed) = typedpg_pg_query::parse_plpgsql_with_catalog(&sql, &*interp) else {
         return Ok(());
     };
-    let Some(function) = parsed.get(0).and_then(|f| f.get("PLpgSQL_function")) else {
+    let Some(function) = parsed.first() else {
         return Ok(());
     };
     let mut run = Run {
         variables: variables(function),
     };
-    let Some(action) = function.get("action") else {
+    let Some(action) = &function.action else {
         return Ok(());
     };
     let start = interp.snapshot();
-    if let Flow::Unknown = run.statement(interp, action)? {
+    if let Flow::Unknown = run.block(interp, action)? {
         interp.roll_back_to(&start);
     }
     Ok(())
 }
 
 /// The function's datums, by varno.
-fn variables(function: &Value) -> Vec<Variable> {
-    let Some(datums) = function.get("datums").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    datums
+fn variables(function: &plpgsql::Function) -> Vec<Variable> {
+    function
+        .datums
         .iter()
         .map(|datum| {
-            let (kind, body) = datum
-                .as_object()
-                .and_then(|o| o.iter().next())
-                .map(|(k, v)| (k.as_str(), v))
-                .unwrap_or(("", &Value::Null));
-            let name = body
-                .get("refname")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let type_name = (kind == "PLpgSQL_var")
-                .then(|| body.pointer("/datatype/PLpgSQL_type"))
-                .flatten()
-                .and_then(type_name);
+            let (type_name, default, fields) = match datum {
+                Datum::Var(v) | Datum::Promise(v) => (
+                    v.datatype.as_ref().map(type_name),
+                    v.default_val.as_ref(),
+                    None,
+                ),
+                Datum::Row(r) => (
+                    None,
+                    r.default_val.as_ref(),
+                    // A dropped column's field has no variable.
+                    Some(
+                        r.fields
+                            .iter()
+                            .filter(|f| f.name.is_some())
+                            .map(|f| f.varno)
+                            .collect(),
+                    ),
+                ),
+                Datum::Rec(r) => (None, r.default_val.as_ref(), None),
+                Datum::Recfield(_) => (None, None, None),
+            };
             Variable {
-                name,
+                name: datum.refname().unwrap_or_default().to_owned(),
                 type_name,
-                default: body
-                    .get("default_val")
-                    .and_then(expr_query)
-                    .map(str::to_owned),
+                default: default.map(|e| e.query.clone()),
                 // A variable starts out NULL; its DEFAULT is evaluated at
                 // block entry.
                 value: Some(None),
+                fields,
             }
         })
         .collect()
@@ -146,20 +152,27 @@ fn variables(function: &Value) -> Vec<Variable> {
 
 /// A declared type as a type name: its name as written (`origtypname`),
 /// each part quoted, or the resolved name.
-fn type_name(datatype: &Value) -> Option<String> {
+fn type_name(datatype: &plpgsql::Type) -> String {
     let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    if let Some(parts) = datatype.get("origtypname").and_then(Value::as_array) {
-        let parts: Vec<String> = parts.iter().filter_map(Value::as_str).map(quote).collect();
-        if !parts.is_empty() {
-            return Some(parts.join("."));
-        }
+    let written: Vec<String> = datatype
+        .origtypname
+        .iter()
+        .flat_map(|t| &t.names)
+        .filter_map(|n| match n {
+            Some(ast::Node::String(s)) => Some(quote(&s.sval)),
+            _ => None,
+        })
+        .collect();
+    if written.is_empty() {
+        quote(&datatype.typname)
+    } else {
+        written.join(".")
     }
-    datatype.get("typname").and_then(Value::as_str).map(quote)
 }
 
 /// The SQL text of a `PLpgSQL_expr`.
-fn expr_query(expr: &Value) -> Option<&str> {
-    expr.pointer("/PLpgSQL_expr/query").and_then(Value::as_str)
+fn expr_query(expr: Option<&plpgsql::Expr>) -> Option<&str> {
+    expr.map(|e| e.query.as_str())
 }
 
 /// The value of a constant expression: `Some(Some(text))` for a literal
@@ -228,14 +241,11 @@ impl Run {
     }
 
     /// Run one statement.
-    fn statement(&mut self, interp: &mut PgCatalog, stmt: &Value) -> Result<Flow, DdlError> {
-        let Some((kind, body)) = stmt.as_object().and_then(|o| o.iter().next()) else {
-            return Ok(Flow::Unknown);
-        };
-        match kind.as_str() {
-            "PLpgSQL_stmt_block" => self.block(interp, body),
-            "PLpgSQL_stmt_execsql" => {
-                let Some(query) = body.get("sqlstmt").and_then(expr_query) else {
+    fn statement(&mut self, interp: &mut PgCatalog, stmt: &Stmt) -> Result<Flow, DdlError> {
+        match stmt {
+            Stmt::Block(block) => self.block(interp, block),
+            Stmt::Execsql(s) => {
+                let Some(query) = expr_query(s.sqlstmt.as_ref()) else {
                     return Ok(Flow::Unknown);
                 };
                 if self.reads_variables(query) {
@@ -245,25 +255,21 @@ impl Run {
                     return Ok(Flow::Unknown);
                 }
                 super::apply_sql_to(interp, query)?;
-                if body.get("into").and_then(Value::as_bool) == Some(true) {
+                if s.into {
                     // The targets get the row's values; STRICT fails
                     // unless exactly one row comes back.
-                    self.forget_targets(body.get("target"));
-                    if body.get("strict").and_then(Value::as_bool) == Some(true) {
+                    self.forget_targets(s.target);
+                    if s.strict {
                         return Ok(Flow::Unknown);
                     }
                 }
                 Ok(Flow::Done)
             }
-            "PLpgSQL_stmt_dynexecute" => {
-                if body.get("into").and_then(Value::as_bool) == Some(true)
-                    || body.get("params").is_some()
-                {
+            Stmt::Dynexecute(s) => {
+                if s.into || !s.params.is_empty() {
                     return Ok(Flow::Unknown);
                 }
-                let Some(Some(sql)) = body
-                    .get("query")
-                    .and_then(expr_query)
+                let Some(Some(sql)) = expr_query(s.query.as_ref())
                     .and_then(|q| (!self.reads_variables(q)).then(|| constant(q)).flatten())
                 else {
                     return Ok(Flow::Unknown);
@@ -274,8 +280,8 @@ impl Run {
                 super::apply_sql_to(interp, &sql)?;
                 Ok(Flow::Done)
             }
-            "PLpgSQL_stmt_perform" => {
-                let Some(query) = body.get("expr").and_then(expr_query) else {
+            Stmt::Perform(s) => {
+                let Some(query) = expr_query(s.expr.as_ref()) else {
                     return Ok(Flow::Unknown);
                 };
                 if self.reads_variables(query) {
@@ -284,16 +290,16 @@ impl Run {
                 super::apply_sql_to(interp, query)?;
                 Ok(Flow::Done)
             }
-            "PLpgSQL_stmt_assign" => self.assign(interp, body),
-            "PLpgSQL_stmt_raise" => self.raise(body),
-            "PLpgSQL_stmt_return" => Ok(Flow::Return),
+            Stmt::Assign(s) => self.assign(interp, s),
+            Stmt::Raise(s) => self.raise(s),
+            Stmt::Return(_) => Ok(Flow::Return),
             _ => Ok(Flow::Unknown),
         }
     }
 
     /// Run a statement list.
-    fn statements(&mut self, interp: &mut PgCatalog, list: &Value) -> Result<Flow, DdlError> {
-        for stmt in list.as_array().into_iter().flatten() {
+    fn statements(&mut self, interp: &mut PgCatalog, list: &[Stmt]) -> Result<Flow, DdlError> {
+        for stmt in list {
             match self.statement(interp, stmt)? {
                 Flow::Done => {}
                 other => return Ok(other),
@@ -305,41 +311,38 @@ impl Run {
     /// `[DECLARE ...] BEGIN ... [EXCEPTION ...] END` (exec_stmt_block): the
     /// declared variables get their defaults, then the body runs — inside a
     /// subtransaction when there are exception handlers.
-    fn block(&mut self, interp: &mut PgCatalog, block: &Value) -> Result<Flow, DdlError> {
-        let handlers = block.pointer("/exceptions/PLpgSQL_exception_block/exc_list");
+    fn block(
+        &mut self,
+        interp: &mut PgCatalog,
+        block: &plpgsql::StmtBlock,
+    ) -> Result<Flow, DdlError> {
+        let handlers = block
+            .exceptions
+            .as_ref()
+            .map(|e| &e.exc_list)
+            .filter(|handlers| !handlers.is_empty());
         let Some(handlers) = handlers else {
             self.initialize(interp, block)?;
-            return self.statements(interp, block.get("body").unwrap_or(&Value::Null));
+            return self.statements(interp, &block.body);
         };
         let start = interp.snapshot();
         let result = self
             .initialize(interp, block)
-            .and_then(|()| self.statements(interp, block.get("body").unwrap_or(&Value::Null)));
+            .and_then(|()| self.statements(interp, &block.body));
         let Err(_) = result else {
             return result;
         };
         // exec_stmt_block rolls the subtransaction back, then looks for a
         // handler of the error's condition.
         interp.roll_back_to(&start);
-        let others = handlers.as_array().into_iter().flatten().find(|handler| {
+        let others = handlers.iter().find(|handler| {
             handler
-                .pointer("/PLpgSQL_exception/conditions")
-                .and_then(Value::as_array)
-                .is_some_and(|conditions| {
-                    conditions.iter().any(|c| {
-                        c.pointer("/PLpgSQL_condition/condname")
-                            .and_then(Value::as_str)
-                            == Some("others")
-                    })
-                })
+                .conditions
+                .iter()
+                .any(|c| c.sqlerrstate == plpgsql::Condition::OTHERS)
         });
         match others {
-            Some(handler) => self.statements(
-                interp,
-                handler
-                    .pointer("/PLpgSQL_exception/action")
-                    .unwrap_or(&Value::Null),
-            ),
+            Some(handler) => self.statements(interp, &handler.action),
             None => Ok(Flow::Unknown),
         }
     }
@@ -347,11 +350,12 @@ impl Run {
     /// Block entry (exec_stmt_block): each variable the block declares
     /// gets its DEFAULT — a constant coerced to the variable's type, which
     /// fails on a value the type rejects — or NULL.
-    fn initialize(&mut self, interp: &PgCatalog, block: &Value) -> Result<(), DdlError> {
-        let Some(varnos) = block.get("initvarnos").and_then(Value::as_array) else {
-            return Ok(());
-        };
-        for varno in varnos.iter().filter_map(Value::as_u64) {
+    fn initialize(
+        &mut self,
+        interp: &PgCatalog,
+        block: &plpgsql::StmtBlock,
+    ) -> Result<(), DdlError> {
+        for &varno in &block.initvarnos {
             let Some(variable) = usize::try_from(varno)
                 .ok()
                 .and_then(|i| self.variables.get_mut(i))
@@ -374,15 +378,11 @@ impl Run {
 
     /// `var := expr` (exec_stmt_assign): a constant is coerced to the
     /// variable's type — a value the type's input function rejects fails.
-    fn assign(&mut self, interp: &PgCatalog, body: &Value) -> Result<Flow, DdlError> {
-        let Some(varno) = body
-            .get("varno")
-            .and_then(Value::as_u64)
-            .and_then(|v| usize::try_from(v).ok())
-        else {
+    fn assign(&mut self, interp: &PgCatalog, s: &plpgsql::StmtAssign) -> Result<Flow, DdlError> {
+        let Ok(varno) = usize::try_from(s.varno) else {
             return Ok(Flow::Unknown);
         };
-        let Some(query) = body.get("expr").and_then(expr_query) else {
+        let Some(query) = expr_query(s.expr.as_ref()) else {
             return Ok(Flow::Unknown);
         };
         let Some(variable) = self.variables.get(varno) else {
@@ -410,32 +410,25 @@ impl Run {
         Ok(Flow::Done)
     }
 
-    /// The targets of `INTO` get values the analyzer doesn't know.
-    fn forget_targets(&mut self, target: Option<&Value>) {
-        let Some(target) = target else {
+    /// The targets of `INTO` get values the analyzer doesn't know: a row's
+    /// fields, or the record or variable itself.
+    fn forget_targets(&mut self, target: Option<i32>) {
+        let Some(target) = target.and_then(|t| usize::try_from(t).ok()) else {
             return;
         };
-        let fields = target
-            .pointer("/PLpgSQL_row/fields")
-            .and_then(Value::as_array);
-        let varnos: Vec<u64> = match fields {
-            Some(fields) => fields
+        let varnos: Vec<usize> = match self.variables.get(target) {
+            Some(Variable {
+                fields: Some(fields),
+                ..
+            }) => fields
                 .iter()
-                .filter_map(|f| f.get("varno").and_then(Value::as_u64))
+                .filter_map(|&f| usize::try_from(f).ok())
                 .collect(),
-            None => target
-                .as_object()
-                .and_then(|o| o.values().next())
-                .and_then(|b| b.get("dno"))
-                .and_then(Value::as_u64)
-                .into_iter()
-                .collect(),
+            Some(_) => vec![target],
+            None => return,
         };
         for varno in varnos {
-            if let Some(v) = usize::try_from(varno)
-                .ok()
-                .and_then(|i| self.variables.get_mut(i))
-            {
+            if let Some(v) = self.variables.get_mut(varno) {
                 v.value = None;
             }
         }
@@ -445,27 +438,19 @@ impl Run {
     /// EXCEPTION the block fails with the message — the format with each
     /// `%` replaced by the next parameter's text, `USING MESSAGE`, the
     /// condition's name or the SQLSTATE.
-    fn raise(&self, body: &Value) -> Result<Flow, DdlError> {
+    fn raise(&self, s: &plpgsql::StmtRaise) -> Result<Flow, DdlError> {
         /// `ERROR` (elog.h): RAISE EXCEPTION's level.
-        const ERROR: u64 = 21;
-        /// PLPGSQL_RAISEOPTION_ERRCODE / _MESSAGE.
-        const OPTION_ERRCODE: u64 = 0;
-        const OPTION_MESSAGE: u64 = 1;
-        if body
-            .get("elog_level")
-            .and_then(Value::as_u64)
-            .unwrap_or(ERROR)
-            < ERROR
-        {
+        const ERROR: i32 = 21;
+        if s.elog_level < ERROR {
             return Ok(Flow::Done);
         }
         // A re-raise (bare RAISE) happens only in a handler.
-        let format = body.get("message").and_then(Value::as_str);
-        let condname = body.get("condname").and_then(Value::as_str);
-        if format.is_none() && condname.is_none() && body.get("options").is_none() {
+        let format = s.message.as_deref();
+        let condname = s.condname.as_deref();
+        if format.is_none() && condname.is_none() && s.options.is_empty() {
             return Ok(Flow::Unknown);
         }
-        let text = |expr: &Value| -> Option<String> {
+        let text = |expr: Option<&plpgsql::Expr>| -> Option<String> {
             let query = expr_query(expr)?;
             let value = match self.variables.iter().find(|v| v.name == query.trim()) {
                 Some(v) => v.value.clone()?,
@@ -475,11 +460,7 @@ impl Run {
         };
         let mut message = match format {
             Some(format) => {
-                let mut params = body
-                    .get("params")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten();
+                let mut params = s.params.iter();
                 let mut out = String::new();
                 let mut chars = format.chars().peekable();
                 while let Some(c) = chars.next() {
@@ -488,7 +469,7 @@ impl Run {
                     } else if chars.next_if_eq(&'%').is_some() {
                         out.push('%');
                     } else {
-                        match params.next().and_then(text) {
+                        match text(params.next()) {
                             Some(value) => out.push_str(&value),
                             // A value only running the block would give.
                             None => return Ok(Flow::Unknown),
@@ -500,20 +481,14 @@ impl Run {
             None => None,
         };
         let mut errcode = None;
-        for option in body
-            .get("options")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let option = option.get("PLpgSQL_raise_option").unwrap_or(&Value::Null);
-            let value = option.get("expr").and_then(text);
-            match option.get("opt_type").and_then(Value::as_u64).unwrap_or(0) {
-                OPTION_ERRCODE => match value {
+        for option in &s.options {
+            let value = text(option.expr.as_ref());
+            match option.opt_type {
+                plpgsql::RaiseOptionType::Errcode => match value {
                     Some(code) => errcode = Some(code),
                     None => return Ok(Flow::Unknown),
                 },
-                OPTION_MESSAGE => match value {
+                plpgsql::RaiseOptionType::Message => match value {
                     Some(text) => message = Some(text),
                     None => return Ok(Flow::Unknown),
                 },
@@ -571,4 +546,27 @@ fn check_constant(interp: &PgCatalog, constant: &str, type_name: &str) -> Result
         return Ok(());
     };
     super::dml::check_statement(interp, stmt)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pg_catalog::PgCatalog;
+
+    #[test]
+    fn deeply_nested_blocks_run() {
+        // 500 nested blocks: the innermost statement runs. (PL/pgSQL's
+        // grammar takes up to 3,330; a server running them hits
+        // max_stack_depth well before that, at a depth its configuration
+        // decides.)
+        let n = 500;
+        let sql = format!(
+            "DO $$ BEGIN {}CREATE TABLE t (a int);{} END $$",
+            "BEGIN ".repeat(n),
+            " END;".repeat(n)
+        );
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(&sql).unwrap();
+        let err = db.apply_sql("CREATE TABLE t (a int)").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
 }

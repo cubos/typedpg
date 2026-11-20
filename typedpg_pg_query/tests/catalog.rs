@@ -1,5 +1,6 @@
 //! PL/pgSQL compiled against a caller-supplied catalog.
 
+use typedpg_pg_query::plpgsql::{Datum, Function, Var};
 use typedpg_pg_query::{Catalog, CatalogAttribute, CatalogType, parse_plpgsql_with_catalog};
 
 const PG_CATALOG: u32 = 11;
@@ -134,14 +135,24 @@ impl Catalog for Mini {
     }
 }
 
-fn datums(json: &serde_json::Value) -> Vec<serde_json::Value> {
-    json[0]["PLpgSQL_function"]["datums"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+fn datums(functions: &[Function]) -> &[Datum] {
+    &functions[0].datums
 }
 
-fn compile(body: &str) -> Result<serde_json::Value, String> {
+/// A datum that must be a scalar variable.
+fn var(datum: &Datum) -> &Var {
+    match datum {
+        Datum::Var(v) => v,
+        other => panic!("not a variable: {other:?}"),
+    }
+}
+
+/// A variable's resolved type name.
+fn typname(datum: &Datum) -> &str {
+    &var(datum).datatype.as_ref().expect("a type").typname
+}
+
+fn compile(body: &str) -> Result<Vec<Function>, String> {
     parse_plpgsql_with_catalog(
         &format!("CREATE FUNCTION f() RETURNS int4 LANGUAGE plpgsql AS $${body}$$"),
         &Mini,
@@ -152,28 +163,20 @@ fn compile(body: &str) -> Result<serde_json::Value, String> {
 #[test]
 fn user_types_resolve_with_their_real_kind() {
     // An enum in another schema is a scalar; its array is a true array.
-    let json = compile("DECLARE m app.mood; ms app.mood[]; BEGIN RETURN 1; END").unwrap();
-    let d = datums(&json);
-    assert!(d[1]["PLpgSQL_var"]["refname"] == "m", "{json}");
-    assert_eq!(
-        d[1]["PLpgSQL_var"]["datatype"]["PLpgSQL_type"]["typname"],
-        "mood"
-    );
-    assert_eq!(
-        d[2]["PLpgSQL_var"]["datatype"]["PLpgSQL_type"]["typname"],
-        "_mood"
-    );
+    let functions = compile("DECLARE m app.mood; ms app.mood[]; BEGIN RETURN 1; END").unwrap();
+    let d = datums(&functions);
+    assert_eq!(var(&d[1]).refname, "m", "{functions:?}");
+    assert_eq!(typname(&d[1]), "mood");
+    assert_eq!(typname(&d[2]), "_mood");
 }
 
 #[test]
 fn rowtype_and_column_type_references_resolve() {
-    let json = compile("DECLARE r users%ROWTYPE; n users.name%TYPE; BEGIN RETURN 1; END").unwrap();
-    let d = datums(&json);
-    assert!(d[1].get("PLpgSQL_rec").is_some(), "{json}");
-    assert_eq!(
-        d[2]["PLpgSQL_var"]["datatype"]["PLpgSQL_type"]["typname"],
-        "text"
-    );
+    let functions =
+        compile("DECLARE r users%ROWTYPE; n users.name%TYPE; BEGIN RETURN 1; END").unwrap();
+    let d = datums(&functions);
+    assert!(matches!(d[1], Datum::Rec(_)), "{functions:?}");
+    assert_eq!(typname(&d[2]), "text");
 }
 
 #[test]
@@ -207,16 +210,13 @@ fn missing_objects_get_postgres_errors() {
 
 #[test]
 fn signature_types_come_from_the_catalog() {
-    let json = parse_plpgsql_with_catalog(
+    let functions = parse_plpgsql_with_catalog(
         "CREATE FUNCTION f(m app.mood, VARIADIC xs int4[]) RETURNS app.mood LANGUAGE plpgsql \
          AS $$ BEGIN RETURN m; END $$",
         &Mini,
     )
     .unwrap();
-    assert_eq!(
-        datums(&json)[0]["PLpgSQL_var"]["datatype"]["PLpgSQL_type"]["typname"],
-        "mood"
-    );
+    assert_eq!(typname(&datums(&functions)[0]), "mood");
     let err = parse_plpgsql_with_catalog(
         "CREATE FUNCTION f() RETURNS nosuch LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
         &Mini,

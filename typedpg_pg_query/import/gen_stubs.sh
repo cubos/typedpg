@@ -47,9 +47,9 @@ done <"$work/sources"
 # --- symbols referenced but defined nowhere --------------------------------
 
 nm -g --defined-only "$work"/*.o | awk 'NF == 3 { print $3 }' | sort -u >"$work/defined"
-# Symbols the crate's Rust side defines (src/stack.rs), which the C compiler
-# cannot see.
-printf '%s\n' typedpg_remaining_stack >>"$work/defined"
+# Symbols the crate's Rust side defines (src/stack.rs, src/lib.rs), which
+# the C compiler cannot see.
+printf '%s\n' typedpg_remaining_stack typedpg_plpgsql_convert >>"$work/defined"
 sort -u -o "$work/defined" "$work/defined"
 nm -u "$work"/*.o | awk '{ print $NF }' | grep -v ':' | sort -u |
 	comm -23 - "$work/defined" >"$work/undef"

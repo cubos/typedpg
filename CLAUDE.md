@@ -149,8 +149,10 @@ targets (glibc and musl Linux on x86_64/aarch64, macOS on x86_64/aarch64,
 Windows x64) build the same imported tree.
 
 PL/pgSQL is compiled by PostgreSQL's own compiler (`pl_comp.c`, `pl_gram.c`),
-driven by `csrc/plpgsql/` — libpg_query's two PL/pgSQL files, BSD-3-Clause,
-with its JSON patches applied — and rendered as JSON by `plpgsqlToJSON`. A
+driven by `csrc/plpgsql/` (libpg_query's PL/pgSQL driver, BSD-3-Clause), and
+each compiled function is converted straight from its C structs into the
+hand-written `typedpg_pg_query::plpgsql` types (`src/plpgsql/convert.rs`, over
+the bindgen bindings of `plpgsql.h`). A
 `CREATE FUNCTION … LANGUAGE plpgsql` builds a fake `pg_proc` row, registers it
 in the syscache and calls `plpgsql_compile` exactly as the validator does; a
 `DO` block calls `plpgsql_compile_inline`. Catalog lookups go through the

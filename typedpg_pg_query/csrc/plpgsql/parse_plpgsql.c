@@ -1,7 +1,7 @@
 /*
  * parse_plpgsql.c — compile DO blocks and CREATE FUNCTION / PROCEDURE ...
- * LANGUAGE plpgsql statements with PostgreSQL's PL/pgSQL compiler, returning
- * the compiled functions as JSON.
+ * LANGUAGE plpgsql statements with PostgreSQL's PL/pgSQL compiler, handing
+ * each compiled function to the Rust converter (src/plpgsql/convert.rs).
  *
  * Derived from libpg_query's src/pg_query_parse_plpgsql.c (BSD-3-Clause; see
  * LICENSE in this directory), adapted to typedpg:
@@ -12,7 +12,12 @@
  *  - memory and errors follow csrc/pg/shim.c: one context per call, errors
  *    caught with PG_TRY and copied out as malloc'd strings;
  *  - the catalog is whatever typedpg_catalog_install() installed (the
- *    caller's Catalog, or the built-in pg_type/pg_namespace rows).
+ *    caller's Catalog, or the built-in pg_type/pg_namespace rows);
+ *  - each compiled function is handed to typedpg_plpgsql_convert (Rust)
+ *    while it is alive, then freed.  The functions cannot all be kept until
+ *    the call returns: funccache.c keys a compiled function on its pg_proc
+ *    signature, and compiling a second function of the same signature
+ *    reuses, and frees, the first one's cache entry.
  */
 #include "postgres.h"
 
@@ -24,7 +29,6 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
-#include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
@@ -38,17 +42,23 @@
 #include "shim_internal.h"
 #include "typedpg_catalog.h"
 
-#include "plpgsql_json.h"
+#include "plpgsql.h"
 
 /* One compilation at a time: the fake pg_proc row keeps this identity. */
 static TransactionId next_proc_xmin = FirstNormalTransactionId;
 
 typedef struct ShimPlpgsqlResult
 {
-	char	   *json;			/* malloc'd, NULL on error */
 	char	   *notices;		/* malloc'd, WARNING/NOTICE text */
 	ShimError  *error;			/* malloc'd, NULL on success */
 } ShimPlpgsqlResult;
+
+/*
+ * src/plpgsql/convert.rs: convert `func` into the Rust tree `state`
+ * collects.  It reads the structs only: it neither calls into PostgreSQL nor
+ * raises an ERROR (a panic is caught and resumed after the call).
+ */
+extern void typedpg_plpgsql_convert(void *state, const PLpgSQL_function *func);
 
 /*
  * Examine the RETURNS clause of the CREATE FUNCTION statement and return
@@ -150,8 +160,9 @@ compile_do_stmt(DoStmt *stmt)
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("no inline code specified")));
 
+	/* Another language: nothing to compile. */
 	if (strcmp(language, "plpgsql") != 0)
-		return (PLpgSQL_function *) palloc0(sizeof(PLpgSQL_function));
+		return NULL;
 	return plpgsql_compile_inline(proc_source);
 }
 
@@ -371,11 +382,12 @@ compile_create_function_stmt(CreateFunctionStmt *stmt)
 		}
 		/* CreateFunction: without LANGUAGE, an inline body is SQL. */
 		if (!language_given && stmt->sql_body != NULL)
-			return (PLpgSQL_function *) palloc0(sizeof(PLpgSQL_function));
+			return NULL;
 	}
 
+	/* Another language: nothing to compile. */
 	if (strcmp(language, "plpgsql") != 0)
-		return (PLpgSQL_function *) palloc0(sizeof(PLpgSQL_function));
+		return NULL;
 
 	/* Mirrors the checks in upstream interpret_AS_clause */
 	if (stmt->sql_body == NULL && proc_source == NULL)
@@ -428,23 +440,20 @@ compile_create_function_stmt(CreateFunctionStmt *stmt)
 	return function;
 }
 
-/* Compile every DO block and CREATE FUNCTION / PROCEDURE of `sql`. */
-static char *
-compile_statements(List *tree)
+/*
+ * Compile every DO block and CREATE FUNCTION / PROCEDURE of `tree` and hand
+ * each compiled function to the converter, with `state`.
+ */
+static void
+compile_statements(List *tree, void *state)
 {
-	StringInfoData json;
-	int			nfuncs = 0;
 	ListCell   *lc;
-
-	initStringInfo(&json);
-	appendStringInfoString(&json, "[\n");
 
 	foreach(lc, tree)
 	{
 		RawStmt    *raw = lfirst_node(RawStmt, lc);
 		Node	   *stmt = raw->stmt;
 		PLpgSQL_function *func = NULL;
-		char	   *func_json;
 
 		if (IsA(stmt, CreateFunctionStmt))
 			func = compile_create_function_stmt((CreateFunctionStmt *) stmt);
@@ -456,40 +465,23 @@ compile_statements(List *tree)
 		if (func == NULL)
 			continue;
 
-		PG_TRY();
-		{
-			func_json = plpgsqlToJSON(func);
-		}
-		PG_CATCH();
-		{
-			/* A compiled function lives in CacheMemoryContext: free it. */
-			plpgsql_free_function_memory(func);
-			typedpg_proc_uninstall();
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
+		/* The converter raises no ERROR: no PG_TRY is needed around it. */
+		typedpg_plpgsql_convert(state, func);
+
+		/* A compiled function lives in CacheMemoryContext: free it. */
 		plpgsql_free_function_memory(func);
 		typedpg_proc_uninstall();
-
-		appendStringInfo(&json, "%s,\n", func_json);
-		nfuncs++;
 	}
-
-	if (nfuncs == 0)
-		return strdup("[]");
-
-	json.data[json.len - 2] = '\n';
-	json.data[json.len - 1] = ']';
-	return strdup(json.data);
 }
 
 /*
- * The crate's entry point: parse `sql` and compile its PL/pgSQL.  With a
+ * The crate's entry point: parse `sql`, compile its PL/pgSQL and hand each
+ * compiled function to typedpg_plpgsql_convert with `state`.  With a
  * `catalog` installed, the compiler resolves types, schemas, relations and
  * columns against it; NULL means the built-in rows of an empty database.
  */
 ShimPlpgsqlResult
-shim_plpgsql(const char *sql, const TypedpgCatalog *catalog)
+shim_plpgsql(const char *sql, const TypedpgCatalog *catalog, void *state)
 {
 	ShimPlpgsqlResult result = {0};
 	MemoryContext ctx;
@@ -507,7 +499,7 @@ shim_plpgsql(const char *sql, const TypedpgCatalog *catalog)
 			typedpg_catalog_install(catalog);
 
 		tree = raw_parser(sql, RAW_PARSE_DEFAULT);
-		result.json = compile_statements(tree);
+		compile_statements(tree, state);
 	}
 	PG_CATCH();
 	{
@@ -531,7 +523,6 @@ shim_plpgsql(const char *sql, const TypedpgCatalog *catalog)
 void
 shim_plpgsql_free(ShimPlpgsqlResult result)
 {
-	free(result.json);
 	free(result.notices);
 	if (result.error)
 	{
