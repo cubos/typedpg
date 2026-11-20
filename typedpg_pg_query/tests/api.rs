@@ -151,18 +151,16 @@ fn nodes_mut_edits_the_tree_in_place() {
             unsafe { (*rv).relname = "renamed".into() };
         }
     }
-    assert_eq!(parsed.deparse().unwrap(), "SELECT a FROM renamed");
-}
-
-#[test]
-fn deparses_trees_and_single_nodes() {
-    let parsed = typedpg_pg_query::parse("select a from t where b = 1").unwrap();
-    assert_eq!(
-        typedpg_pg_query::deparse(&parsed.protobuf).unwrap(),
-        "SELECT a FROM t WHERE b = 1"
-    );
-    let stmt = parsed.protobuf.stmts[0].stmt.as_ref().unwrap();
-    assert_eq!(stmt.deparse().unwrap(), "SELECT a FROM t WHERE b = 1");
+    let relations: Vec<String> = parsed
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(n, _)| match n {
+            NodeRef::RangeVar(rv) => Some(rv.relname.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(relations, ["renamed"]);
 }
 
 #[test]
@@ -266,6 +264,7 @@ fn equal_compares_trees_like_postgres_equal() {
 
 #[test]
 fn rewrite_replaces_nodes_bottom_up() {
+    use typedpg_pg_query::Equal;
     // Replace every `x::int` with `x`, below a node `descend` refuses
     // excepted: the nested cast goes first, so both layers go.
     let parsed =
@@ -286,10 +285,23 @@ fn rewrite_replaces_nodes_bottom_up() {
             }
         },
     );
-    assert_eq!(
-        stmt.deparse().unwrap(),
-        "SELECT a + 1, (SELECT b::int), c::text"
-    );
+    // The tree now equals the one of the rewritten SQL: `a + 1` (both casts
+    // gone), the subquery untouched, and `c::text` intact.
+    let NodeEnum::SelectStmt(rewritten) = stmt.node.unwrap() else {
+        unreachable!()
+    };
+    let expected = typedpg_pg_query::parse("SELECT a + 1, (SELECT b::int), c::text").unwrap();
+    let NodeEnum::SelectStmt(expected) = expected.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .unwrap()
+        .node
+        .clone()
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert!(rewritten.target_list.equal(&expected.target_list));
 }
 
 #[test]

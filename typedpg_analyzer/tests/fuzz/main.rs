@@ -26,7 +26,8 @@
 //!      and `$pN` parameters threaded through typed contexts;
 //!   2. an **AST mutator** that parses a seed with `typedpg_pg_query`, tweaks leaf
 //!      nodes in the protobuf tree (constants, column refs, operators,
-//!      function names, cast targets), and deparses back to SQL — which keeps
+//!      function names, cast targets), and prints the tree back to SQL with a
+//!      small printer (`printer.rs`) — which keeps
 //!      the output syntactically plausible while perturbing types; and
 //!   3. a **catalog-mined, type-directed generator** (`gen_typed_select`) that
 //!      indexes every real function/operator by result type and builds
@@ -84,6 +85,7 @@ mod generators;
 mod minimize;
 mod mutate;
 mod narrowing;
+mod printer;
 mod report;
 mod schema;
 mod typed;
@@ -359,6 +361,134 @@ fn fuzz_analyze_against_pg() {
         ),
         _ => {}
     }
+}
+
+/// The outcome of printing a statement and parsing the result back.
+#[derive(Debug)]
+enum RoundTrip {
+    /// Parse → print → reparse gives a tree equal to the original.
+    Equal,
+    /// The printer refused the tree (unsupported node or field).
+    Unprinted,
+    /// The generated SQL doesn't parse (the generators deliberately emit some
+    /// invalid statements, and the fuzzer then only judges the error).
+    Unparseable,
+}
+
+/// `sql` through parse → [`printer::print`] → parse, requiring the reparsed
+/// tree to equal the original under [`typedpg_pg_query::Equal`] (which ignores
+/// source locations).
+fn round_trip(sql: &str) -> RoundTrip {
+    use typedpg_pg_query::Equal;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return RoundTrip::Unparseable;
+    };
+    let Some(printed) = printer::print(&parsed.protobuf) else {
+        return RoundTrip::Unprinted;
+    };
+    let reparsed = typedpg_pg_query::parse(&printed).unwrap_or_else(|e| {
+        panic!("printer output does not parse: {printed}\n  from: {sql}\n  {e}")
+    });
+    assert!(
+        parsed.protobuf.equal(&reparsed.protobuf),
+        "printer output reparses to a different tree:\n  from: {sql}\n  printed: {printed}"
+    );
+    RoundTrip::Equal
+}
+
+/// The printer's round-trip property, with no database: every seed, the
+/// generators' output and mutated seeds print to SQL that parses back to the
+/// same tree. Run it with:
+///
+/// ```bash
+/// cargo nextest run -p typedpg_analyzer --features pg_sanity --test fuzz round_trip
+/// ```
+///
+/// The type-directed generator (`gen_typed_select`) is not covered: it needs a
+/// live catalog to know which functions and operators exist.
+#[test]
+fn printer_round_trips_trees() {
+    use typedpg_pg_query::Equal;
+
+    // (a) Every seed, in the positional (`$N`) form the mutator parses.
+    for seed in SEEDS {
+        let positional = named_to_positional(seed);
+        match round_trip(&positional) {
+            RoundTrip::Equal => {}
+            other => panic!("seed {seed:?} did not round-trip: {other:?}"),
+        }
+    }
+
+    // (b) Statement generation, with fixed seeds. Some generator output is
+    // deliberately invalid SQL; among what parses, the printer must render
+    // (almost) everything.
+    let mut rng = StdRng::seed_from_u64(0x5EED);
+    let (mut parseable, mut printed) = (0usize, 0usize);
+    for i in 0..2000 {
+        let generated = if i % 10 == 9 {
+            gen_literal_probe(&mut rng)
+        } else {
+            gen_statement(&mut rng)
+        };
+        match round_trip(&named_to_positional(&generated)) {
+            RoundTrip::Equal => {
+                parseable += 1;
+                printed += 1;
+            }
+            RoundTrip::Unprinted => parseable += 1,
+            RoundTrip::Unparseable => {}
+        }
+    }
+    let fraction = if parseable == 0 {
+        0.0
+    } else {
+        printed as f64 / parseable as f64
+    };
+    eprintln!(
+        "fuzz printer: {printed}/{parseable} generated statements printed and round-tripped \
+         ({:.1}%)",
+        100.0 * fraction
+    );
+    assert!(
+        fraction >= 0.95,
+        "the printer rendered only {printed}/{parseable} generated statements"
+    );
+
+    // (c) Mutated seeds: the tree the AST mutator builds must print.
+    let mut rng = StdRng::seed_from_u64(0xED17);
+    let (mut mutated, mut skipped) = (0usize, 0usize);
+    for seed in SEEDS {
+        let positional = named_to_positional(seed);
+        for _ in 0..16 {
+            let mut parsed = typedpg_pg_query::parse(&positional).expect("a seed parses");
+            // SAFETY: as in `mutate`: the pointers stay valid while `parsed`
+            // is not moved, and no reference is held across the mutations.
+            let nodes: Vec<typedpg_pg_query::NodeMut> = unsafe { parsed.protobuf.nodes_mut() }
+                .into_iter()
+                .map(|(node, _)| node)
+                .collect();
+            assert!(!nodes.is_empty(), "a parsed seed has nodes");
+            for _ in 0..rng.random_range(1..=3u32) {
+                let idx = rng.random_range(0..nodes.len());
+                apply_mutation(nodes[idx], &mut rng);
+            }
+            match printer::print(&parsed.protobuf) {
+                Some(printed) => {
+                    let reparsed = typedpg_pg_query::parse(&printed).unwrap_or_else(|e| {
+                        panic!("mutated tree prints to SQL that does not parse: {printed}\n  {e}")
+                    });
+                    assert!(
+                        parsed.protobuf.equal(&reparsed.protobuf),
+                        "a mutated tree reprinted to a different tree: {printed}"
+                    );
+                    mutated += 1;
+                }
+                None => skipped += 1,
+            }
+        }
+    }
+    eprintln!("fuzz printer: {mutated} mutated trees round-tripped, {skipped} not printable");
+    assert!(mutated > 0, "no mutated tree could be printed");
 }
 
 /// A divergence that is the analyzer's documented choice, not a bug:

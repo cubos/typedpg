@@ -147,8 +147,17 @@ fn main() {
     let source = |p: std::path::PathBuf| replacements.get(&p).cloned().unwrap_or(p);
 
     let mut build = cc::Build::new();
+    // typedpg uses neither libpg_query's deparser nor its statement summary
+    // (which calls the deparser): leave their sources out.
+    let sources = glob(&lib.join("src"))
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            !(name.ends_with("_deparse.c") || name.starts_with("pg_query_summary"))
+        })
+        .map(source);
     build
-        .files(glob(&lib.join("src")).into_iter().map(source))
+        .files(sources)
         .files(glob(&lib.join("src/postgres")).into_iter().map(source))
         .file(lib.join("vendor/xxhash/xxhash.c"))
         // Protobuf, through upb (libpg_query's Makefile: UPB_SRC_FILES).

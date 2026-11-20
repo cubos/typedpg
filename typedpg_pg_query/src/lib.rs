@@ -3,8 +3,7 @@
 //! grammar, extracted into a library, with the parse tree handed over as
 //! protobuf.
 //!
-//! - [`parse`] / [`scan`] / [`deparse`] / [`parse_plpgsql`] call into the
-//!   C library;
+//! - [`parse`] / [`scan`] / [`parse_plpgsql`] call into the C library;
 //! - [`protobuf`] holds the AST types, generated from libpg_query's
 //!   `pg_query.proto`;
 //! - [`NodeRef`] / [`NodeMut`] view a node by kind, and `nodes()` /
@@ -24,7 +23,6 @@ mod stack;
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
 
 use prost::Message;
 
@@ -45,8 +43,7 @@ pub enum Error {
     /// The protobuf the library returned didn't decode.
     #[error("Error decoding result: {0}")]
     Decode(#[from] prost::DecodeError),
-    /// PostgreSQL's parser (or deparser) rejected the input; the message is
-    /// the server's.
+    /// PostgreSQL's parser rejected the input; the message is the server's.
     #[error("Invalid statement: {message}")]
     Parse {
         /// The server's error message (`syntax error at or near "x"`).
@@ -79,13 +76,6 @@ pub struct ParseResult {
     pub protobuf: protobuf::ParseResult,
     /// Whatever the parser wrote to stderr (warnings).
     pub stderr: String,
-}
-
-impl ParseResult {
-    /// The SQL this tree deparses to.
-    pub fn deparse(&self) -> Result<String> {
-        deparse(&self.protobuf)
-    }
 }
 
 impl Error {
@@ -206,30 +196,6 @@ fn scan_here(sql: &str) -> Result<protobuf::ScanResult> {
     scanned
 }
 
-/// Turn a parse tree back into SQL.
-pub fn deparse(tree: &protobuf::ParseResult) -> Result<String> {
-    stack::with_stack(|| deparse_here(tree))
-}
-
-fn deparse_here(tree: &protobuf::ParseResult) -> Result<String> {
-    let buffer = tree.encode_to_vec();
-    let input = ffi::PgQueryProtobuf {
-        len: buffer.len(),
-        // The deparser only reads the buffer.
-        data: buffer.as_ptr() as *mut c_char,
-    };
-    let result = unsafe { ffi::pg_query_deparse_protobuf(input) };
-    let sql = if result.error.is_null() {
-        Ok(unsafe { CStr::from_ptr(result.query) }
-            .to_string_lossy()
-            .into_owned())
-    } else {
-        Err(Error::parse_message(unsafe { error_message(result.error) }))
-    };
-    unsafe { ffi::pg_query_free_deparse_result(result) };
-    sql
-}
-
 /// Parse a `CREATE FUNCTION … LANGUAGE plpgsql` statement (or a `DO`
 /// block) with PL/pgSQL's compiler, returning libpg_query's JSON rendering
 /// of it. Without a catalog, the compiler only knows the built-in types:
@@ -318,11 +284,6 @@ impl protobuf::ParseResult {
             .collect();
         unsafe { walk_mut(roots) }
     }
-
-    /// The SQL this tree deparses to.
-    pub fn deparse(&self) -> Result<String> {
-        deparse(self)
-    }
 }
 
 impl<'a> NodeRef<'a> {
@@ -342,31 +303,9 @@ impl NodeEnum {
     pub fn nodes(&self) -> Vec<(NodeRef<'_>, usize)> {
         walk(vec![self.to_ref()])
     }
-
-    /// The SQL this node deparses to, as a statement of its own.
-    pub fn deparse(&self) -> Result<String> {
-        deparse(&protobuf::ParseResult {
-            version: PG_VERSION_NUM,
-            stmts: vec![protobuf::RawStmt {
-                stmt: Some(Box::new(protobuf::Node {
-                    node: Some(self.clone()),
-                })),
-                stmt_location: 0,
-                stmt_len: 0,
-            }],
-        })
-    }
 }
 
 impl protobuf::Node {
-    /// The SQL this node deparses to, as a statement of its own.
-    pub fn deparse(&self) -> Result<String> {
-        match &self.node {
-            Some(n) => n.deparse(),
-            None => Err(Error::parse_message("empty node")),
-        }
-    }
-
     /// Rewrite this tree bottom-up: `f` sees each node once the nodes below
     /// it are rewritten, and may replace it with a node of any kind. The
     /// subtree below a node `descend` refuses is left as it is.

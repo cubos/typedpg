@@ -33,12 +33,6 @@ pub(crate) struct PgQueryProtobufParseResult {
 }
 
 #[repr(C)]
-pub(crate) struct PgQueryDeparseResult {
-    pub query: *mut c_char,
-    pub error: *mut PgQueryError,
-}
-
-#[repr(C)]
 pub(crate) struct PgQueryPlpgsqlParseResult {
     pub plpgsql_funcs: *mut c_char,
     pub error: *mut PgQueryError,
@@ -52,8 +46,6 @@ unsafe extern "C" {
     pub(crate) fn pg_query_free_protobuf_parse_result(result: PgQueryProtobufParseResult);
     pub(crate) fn pg_query_scan(input: *const c_char) -> PgQueryScanResult;
     pub(crate) fn pg_query_free_scan_result(result: PgQueryScanResult);
-    pub(crate) fn pg_query_deparse_protobuf(parse_tree: PgQueryProtobuf) -> PgQueryDeparseResult;
-    pub(crate) fn pg_query_free_deparse_result(result: PgQueryDeparseResult);
     pub(crate) fn pg_query_parse_plpgsql(input: *const c_char) -> PgQueryPlpgsqlParseResult;
     pub(crate) fn pg_query_free_plpgsql_parse_result(result: PgQueryPlpgsqlParseResult);
 }
