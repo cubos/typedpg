@@ -14,9 +14,10 @@
 //!
 //! [`parse_plpgsql`] compiles `DO` blocks and `CREATE FUNCTION … LANGUAGE
 //! plpgsql` statements with PostgreSQL's own PL/pgSQL compiler and returns
-//! the compiled functions as JSON; [`parse_plpgsql_with_catalog`] resolves
-//! their types, schemas and relations against a [`Catalog`] instead of only
-//! the built-in `pg_catalog` rows.
+//! the compiled functions as [`plpgsql::Function`]s, converted straight from
+//! the compiler's structs; [`parse_plpgsql_with_catalog`] resolves their
+//! types, schemas and relations against a [`Catalog`] instead of only the
+//! built-in `pg_catalog` rows.
 
 #[allow(clippy::all, missing_docs)]
 pub mod ast;
@@ -26,6 +27,7 @@ mod convert;
 mod equal;
 mod node;
 mod node_box;
+pub mod plpgsql;
 mod stack;
 
 use std::collections::VecDeque;
@@ -61,9 +63,6 @@ pub enum Error {
         /// from. `None` when unknown.
         funcname: Option<String>,
     },
-    /// The PL/pgSQL parse tree wasn't valid JSON.
-    #[error("Error parsing JSON: {0}")]
-    InvalidJson(String),
     /// The scanner rejected the input.
     #[error("Error scanning: {0}")]
     Scan(String),
@@ -126,8 +125,6 @@ struct ShimScanResult {
 /// `ShimPlpgsqlResult` in csrc/plpgsql/parse_plpgsql.c.
 #[repr(C)]
 struct ShimPlpgsqlResult {
-    /// The JSON array of compiled functions, malloc'd; NULL on error.
-    json: *mut c_char,
     /// WARNING/NOTICE text, malloc'd.
     notices: *mut c_char,
     error: *mut ShimError,
@@ -138,7 +135,11 @@ unsafe extern "C" {
     fn shim_finish(result: ShimParseResult);
     fn shim_scan(sql: *const c_char) -> ShimScanResult;
     fn shim_scan_free(result: ShimScanResult);
-    fn shim_plpgsql(sql: *const c_char, catalog: *const CatalogFns) -> ShimPlpgsqlResult;
+    fn shim_plpgsql(
+        sql: *const c_char,
+        catalog: *const CatalogFns,
+        state: *mut c_void,
+    ) -> ShimPlpgsqlResult;
     fn shim_plpgsql_free(result: ShimPlpgsqlResult);
 }
 
@@ -345,11 +346,12 @@ fn with_comments(sql: &str, tokens: Vec<ast::ScanToken>) -> Vec<ast::ScanToken> 
     out
 }
 
-/// Parse a `CREATE FUNCTION … LANGUAGE plpgsql` statement (or a `DO` block)
-/// with PL/pgSQL's compiler, returning its JSON rendering. Without a
-/// catalog, the compiler only knows the built-in `pg_catalog` types and
-/// schemas — an empty database, where anything else is an error.
-pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
+/// Compile the `CREATE FUNCTION … LANGUAGE plpgsql` statements and `DO`
+/// blocks of `sql` with PL/pgSQL's compiler, returning the compiled
+/// functions in statement order (statements of other languages yield none).
+/// Without a catalog, the compiler only knows the built-in `pg_catalog`
+/// types and schemas — an empty database, where anything else is an error.
+pub fn parse_plpgsql(sql: &str) -> Result<Vec<plpgsql::Function>> {
     let input = CString::new(sql)?;
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stack::with_stack(|| plpgsql_result(&input, std::ptr::null(), sql))
@@ -359,26 +361,65 @@ pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value> {
 /// and columns (`%TYPE`, `%ROWTYPE`) against `catalog` — so it reports what
 /// PostgreSQL would for that catalog (`type "x" does not exist`, `relation
 /// "t" does not exist`, …).
-pub fn parse_plpgsql_with_catalog(sql: &str, catalog: &dyn Catalog) -> Result<serde_json::Value> {
+pub fn parse_plpgsql_with_catalog(
+    sql: &str,
+    catalog: &dyn Catalog,
+) -> Result<Vec<plpgsql::Function>> {
     let input = CString::new(sql)?;
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stack::with_stack(|| catalog::with_catalog(catalog, |hooks| plpgsql_result(&input, hooks, sql)))
 }
 
-/// One `shim_plpgsql` call: compile, then parse the JSON or take the error.
+/// What one `shim_plpgsql` call collects: the converted functions, or the
+/// panic a conversion raised (resumed once the call is back in Rust).
+#[derive(Default)]
+struct PlpgsqlState {
+    functions: Vec<plpgsql::Function>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// Called by csrc/plpgsql/parse_plpgsql.c with each compiled function,
+/// before it is freed.
+#[unsafe(no_mangle)]
+extern "C" fn typedpg_plpgsql_convert(state: *mut c_void, func: *const bindings::PLpgSQL_function) {
+    // SAFETY: `state` is the `PlpgsqlState` plpgsql_result passed to
+    // shim_plpgsql, which is still running.
+    let state = unsafe { &mut *(state as *mut PlpgsqlState) };
+    if state.panic.is_some() {
+        return;
+    }
+    // A panic must not unwind into C: keep it for plpgsql_result.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        plpgsql::convert::function(func)
+    })) {
+        Ok(function) => state.functions.push(function),
+        Err(payload) => state.panic = Some(payload),
+    }
+}
+
+/// One `shim_plpgsql` call: compile and convert, or take the error.
 fn plpgsql_result(
     input: &CString,
     catalog: *const CatalogFns,
     sql: &str,
-) -> Result<serde_json::Value> {
-    let result = unsafe { shim_plpgsql(input.as_ptr(), catalog) };
+) -> Result<Vec<plpgsql::Function>> {
+    let mut state = PlpgsqlState::default();
+    let result = unsafe {
+        shim_plpgsql(
+            input.as_ptr(),
+            catalog,
+            &mut state as *mut PlpgsqlState as *mut c_void,
+        )
+    };
     let compiled = if result.error.is_null() {
-        let json = unsafe { take_string(result.json) };
-        serde_json::from_str(&json).map_err(|e| Error::InvalidJson(e.to_string()))
+        Ok(std::mem::take(&mut state.functions))
     } else {
         Err(unsafe { parse_error(result.error, sql) })
     };
     unsafe { shim_plpgsql_free(result) };
+    if let Some(payload) = state.panic {
+        std::panic::resume_unwind(payload);
+    }
     compiled
 }
 

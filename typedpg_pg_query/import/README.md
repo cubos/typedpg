@@ -68,7 +68,13 @@ The script:
    use and the value nodes. Only those types are allowlisted; bindgen pulls in
    what they reference. The output uses `::core::ffi` types, `consts`-style
    enums, wrapped unsafe operations and no layout tests or doc comments, and its
-   version banner is stripped so the file is reproducible;
+   version banner is stripped so the file is reproducible. A second bindgen run
+   appends PL/pgSQL's compiled-function structs (`plpgsql.h`'s `PLpgSQL_*`
+   types, which `src/plpgsql/convert.rs` reads): it allowlists those and the
+   few types their fields name beyond the node bindings, without recursion,
+   and keeps the runtime-only ones opaque (`plpgsql.h` declares the executor's
+   node structs, which the first run's node tag list would otherwise pull in
+   by the hundred);
 9. fails if any build-machine path (`/tmp/...`, `/home/...`, `/nix/store/...`)
    leaked into the tree.
 
@@ -163,8 +169,8 @@ services the copied sources call (`vars.c` for globals, `server.c` for the
 superuser ACL checks, the syscache callbacks and no-op locks, `syscache.c` for
 the syscache itself, `type_cache.c` for `lookup_type_cache`, `parse_defaults.c`
 for the parameter-default transformers the crate skips, and `shim.c` for the
-C entry points); `csrc/plpgsql/` holds libpg_query's PL/pgSQL driver and its
-JSON renderer (BSD-3-Clause, see the LICENSE there), adapted. `gen_stubs.sh`
+C entry points); `csrc/plpgsql/` holds libpg_query's PL/pgSQL driver
+(BSD-3-Clause, see the LICENSE there), adapted. `gen_stubs.sh`
 compiles all of them too, so anything they define is subtracted from the stub
 list; adding a file there needs no other change.
 

@@ -3790,3 +3790,682 @@ pub struct DropSubscriptionStmt {
     pub missing_ok: bool,
     pub behavior: DropBehavior,
 }
+pub type Size = usize;
+pub type LocalTransactionId = uint32;
+pub type MemoryContext = *mut MemoryContextData;
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct TupleDescData {
+    pub _bindgen_opaque_blob: [u64; 3usize],
+}
+pub type TupleDesc = *mut TupleDescData;
+#[repr(C)]
+#[repr(align(8))]
+pub struct TypeCacheEntry {
+    pub _bindgen_opaque_blob: [u64; 62usize],
+}
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct ExprState {
+    pub _bindgen_opaque_blob: [u64; 15usize],
+}
+pub const RawParseMode_RAW_PARSE_DEFAULT: RawParseMode = 0;
+pub const RawParseMode_RAW_PARSE_TYPE_NAME: RawParseMode = 1;
+pub const RawParseMode_RAW_PARSE_PLPGSQL_EXPR: RawParseMode = 2;
+pub const RawParseMode_RAW_PARSE_PLPGSQL_ASSIGN1: RawParseMode = 3;
+pub const RawParseMode_RAW_PARSE_PLPGSQL_ASSIGN2: RawParseMode = 4;
+pub const RawParseMode_RAW_PARSE_PLPGSQL_ASSIGN3: RawParseMode = 5;
+pub type RawParseMode = ::core::ffi::c_uint;
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct CachedPlanSource {
+    pub _bindgen_opaque_blob: [u64; 28usize],
+}
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct CachedPlan {
+    pub _bindgen_opaque_blob: [u64; 6usize],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct _SPI_plan {
+    _unused: [u8; 0],
+}
+pub type SPIPlanPtr = *mut _SPI_plan;
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct ExpandedRecordHeader {
+    pub _bindgen_opaque_blob: [u64; 26usize],
+}
+#[repr(C)]
+#[repr(align(4))]
+#[derive(Debug, Copy, Clone)]
+pub struct ExpandedRecordFieldInfo {
+    pub _bindgen_opaque_blob: [u32; 4usize],
+}
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct CachedFunction {
+    pub _bindgen_opaque_blob: [u64; 5usize],
+}
+pub const PLpgSQL_nsitem_type_PLPGSQL_NSTYPE_LABEL: PLpgSQL_nsitem_type = 0;
+pub const PLpgSQL_nsitem_type_PLPGSQL_NSTYPE_VAR: PLpgSQL_nsitem_type = 1;
+pub const PLpgSQL_nsitem_type_PLPGSQL_NSTYPE_REC: PLpgSQL_nsitem_type = 2;
+pub type PLpgSQL_nsitem_type = ::core::ffi::c_uint;
+pub const PLpgSQL_label_type_PLPGSQL_LABEL_BLOCK: PLpgSQL_label_type = 0;
+pub const PLpgSQL_label_type_PLPGSQL_LABEL_LOOP: PLpgSQL_label_type = 1;
+pub const PLpgSQL_label_type_PLPGSQL_LABEL_OTHER: PLpgSQL_label_type = 2;
+pub type PLpgSQL_label_type = ::core::ffi::c_uint;
+pub const PLpgSQL_datum_type_PLPGSQL_DTYPE_VAR: PLpgSQL_datum_type = 0;
+pub const PLpgSQL_datum_type_PLPGSQL_DTYPE_ROW: PLpgSQL_datum_type = 1;
+pub const PLpgSQL_datum_type_PLPGSQL_DTYPE_REC: PLpgSQL_datum_type = 2;
+pub const PLpgSQL_datum_type_PLPGSQL_DTYPE_RECFIELD: PLpgSQL_datum_type = 3;
+pub const PLpgSQL_datum_type_PLPGSQL_DTYPE_PROMISE: PLpgSQL_datum_type = 4;
+pub type PLpgSQL_datum_type = ::core::ffi::c_uint;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_NONE: PLpgSQL_promise_type = 0;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_NAME: PLpgSQL_promise_type = 1;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_WHEN: PLpgSQL_promise_type = 2;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_LEVEL: PLpgSQL_promise_type = 3;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_OP: PLpgSQL_promise_type = 4;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_RELID: PLpgSQL_promise_type = 5;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_TABLE_NAME: PLpgSQL_promise_type = 6;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_TABLE_SCHEMA: PLpgSQL_promise_type = 7;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_NARGS: PLpgSQL_promise_type = 8;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_ARGV: PLpgSQL_promise_type = 9;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_EVENT: PLpgSQL_promise_type = 10;
+pub const PLpgSQL_promise_type_PLPGSQL_PROMISE_TG_TAG: PLpgSQL_promise_type = 11;
+pub type PLpgSQL_promise_type = ::core::ffi::c_uint;
+pub const PLpgSQL_type_type_PLPGSQL_TTYPE_SCALAR: PLpgSQL_type_type = 0;
+pub const PLpgSQL_type_type_PLPGSQL_TTYPE_REC: PLpgSQL_type_type = 1;
+pub const PLpgSQL_type_type_PLPGSQL_TTYPE_PSEUDO: PLpgSQL_type_type = 2;
+pub type PLpgSQL_type_type = ::core::ffi::c_uint;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_BLOCK: PLpgSQL_stmt_type = 0;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_ASSIGN: PLpgSQL_stmt_type = 1;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_IF: PLpgSQL_stmt_type = 2;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_CASE: PLpgSQL_stmt_type = 3;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_LOOP: PLpgSQL_stmt_type = 4;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_WHILE: PLpgSQL_stmt_type = 5;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_FORI: PLpgSQL_stmt_type = 6;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_FORS: PLpgSQL_stmt_type = 7;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_FORC: PLpgSQL_stmt_type = 8;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_FOREACH_A: PLpgSQL_stmt_type = 9;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_EXIT: PLpgSQL_stmt_type = 10;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_RETURN: PLpgSQL_stmt_type = 11;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_RETURN_NEXT: PLpgSQL_stmt_type = 12;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_RETURN_QUERY: PLpgSQL_stmt_type = 13;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_RAISE: PLpgSQL_stmt_type = 14;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_ASSERT: PLpgSQL_stmt_type = 15;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_EXECSQL: PLpgSQL_stmt_type = 16;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_DYNEXECUTE: PLpgSQL_stmt_type = 17;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_DYNFORS: PLpgSQL_stmt_type = 18;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_GETDIAG: PLpgSQL_stmt_type = 19;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_OPEN: PLpgSQL_stmt_type = 20;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_FETCH: PLpgSQL_stmt_type = 21;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_CLOSE: PLpgSQL_stmt_type = 22;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_PERFORM: PLpgSQL_stmt_type = 23;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_CALL: PLpgSQL_stmt_type = 24;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_COMMIT: PLpgSQL_stmt_type = 25;
+pub const PLpgSQL_stmt_type_PLPGSQL_STMT_ROLLBACK: PLpgSQL_stmt_type = 26;
+pub type PLpgSQL_stmt_type = ::core::ffi::c_uint;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_ROW_COUNT: PLpgSQL_getdiag_kind = 0;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_ROUTINE_OID: PLpgSQL_getdiag_kind = 1;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_CONTEXT: PLpgSQL_getdiag_kind = 2;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_ERROR_CONTEXT: PLpgSQL_getdiag_kind = 3;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_ERROR_DETAIL: PLpgSQL_getdiag_kind = 4;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_ERROR_HINT: PLpgSQL_getdiag_kind = 5;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_RETURNED_SQLSTATE: PLpgSQL_getdiag_kind = 6;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_COLUMN_NAME: PLpgSQL_getdiag_kind = 7;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_CONSTRAINT_NAME: PLpgSQL_getdiag_kind = 8;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_DATATYPE_NAME: PLpgSQL_getdiag_kind = 9;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_MESSAGE_TEXT: PLpgSQL_getdiag_kind = 10;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_TABLE_NAME: PLpgSQL_getdiag_kind = 11;
+pub const PLpgSQL_getdiag_kind_PLPGSQL_GETDIAG_SCHEMA_NAME: PLpgSQL_getdiag_kind = 12;
+pub type PLpgSQL_getdiag_kind = ::core::ffi::c_uint;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_ERRCODE: PLpgSQL_raise_option_type = 0;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_MESSAGE: PLpgSQL_raise_option_type = 1;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_DETAIL: PLpgSQL_raise_option_type = 2;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_HINT: PLpgSQL_raise_option_type = 3;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_COLUMN: PLpgSQL_raise_option_type = 4;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_CONSTRAINT: PLpgSQL_raise_option_type = 5;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_DATATYPE: PLpgSQL_raise_option_type = 6;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_TABLE: PLpgSQL_raise_option_type = 7;
+pub const PLpgSQL_raise_option_type_PLPGSQL_RAISEOPTION_SCHEMA: PLpgSQL_raise_option_type = 8;
+pub type PLpgSQL_raise_option_type = ::core::ffi::c_uint;
+pub const PLpgSQL_resolve_option_PLPGSQL_RESOLVE_ERROR: PLpgSQL_resolve_option = 0;
+pub const PLpgSQL_resolve_option_PLPGSQL_RESOLVE_VARIABLE: PLpgSQL_resolve_option = 1;
+pub const PLpgSQL_resolve_option_PLPGSQL_RESOLVE_COLUMN: PLpgSQL_resolve_option = 2;
+pub type PLpgSQL_resolve_option = ::core::ffi::c_uint;
+pub const PLpgSQL_rwopt_PLPGSQL_RWOPT_UNKNOWN: PLpgSQL_rwopt = 0;
+pub const PLpgSQL_rwopt_PLPGSQL_RWOPT_NOPE: PLpgSQL_rwopt = 1;
+pub const PLpgSQL_rwopt_PLPGSQL_RWOPT_TRANSFER: PLpgSQL_rwopt = 2;
+pub const PLpgSQL_rwopt_PLPGSQL_RWOPT_INPLACE: PLpgSQL_rwopt = 3;
+pub type PLpgSQL_rwopt = ::core::ffi::c_uint;
+#[repr(C)]
+pub struct PLpgSQL_type {
+    pub typname: *mut ::core::ffi::c_char,
+    pub typoid: Oid,
+    pub ttype: PLpgSQL_type_type,
+    pub typlen: int16,
+    pub typbyval: bool,
+    pub typtype: ::core::ffi::c_char,
+    pub collation: Oid,
+    pub typisarray: bool,
+    pub atttypmod: int32,
+    pub origtypname: *mut TypeName,
+    pub tcache: *mut TypeCacheEntry,
+    pub tupdesc_id: uint64,
+}
+#[repr(C)]
+pub struct PLpgSQL_expr {
+    pub query: *mut ::core::ffi::c_char,
+    pub parseMode: RawParseMode,
+    pub func: *mut PLpgSQL_function,
+    pub ns: *mut PLpgSQL_nsitem,
+    pub target_param: ::core::ffi::c_int,
+    pub target_is_local: bool,
+    pub plan: SPIPlanPtr,
+    pub paramnos: *mut Bitmapset,
+    pub expr_simple_expr: *mut Expr,
+    pub expr_simple_type: Oid,
+    pub expr_simple_typmod: int32,
+    pub expr_simple_mutable: bool,
+    pub expr_rwopt: PLpgSQL_rwopt,
+    pub expr_rw_param: *mut Param,
+    pub expr_simple_plansource: *mut CachedPlanSource,
+    pub expr_simple_plan: *mut CachedPlan,
+    pub expr_simple_plan_lxid: LocalTransactionId,
+    pub expr_simple_state: *mut ExprState,
+    pub expr_simple_in_use: bool,
+    pub expr_simple_lxid: LocalTransactionId,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_datum {
+    pub dtype: PLpgSQL_datum_type,
+    pub dno: ::core::ffi::c_int,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_variable {
+    pub dtype: PLpgSQL_datum_type,
+    pub dno: ::core::ffi::c_int,
+    pub refname: *mut ::core::ffi::c_char,
+    pub lineno: ::core::ffi::c_int,
+    pub isconst: bool,
+    pub notnull: bool,
+    pub default_val: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+pub struct PLpgSQL_var {
+    pub dtype: PLpgSQL_datum_type,
+    pub dno: ::core::ffi::c_int,
+    pub refname: *mut ::core::ffi::c_char,
+    pub lineno: ::core::ffi::c_int,
+    pub isconst: bool,
+    pub notnull: bool,
+    pub default_val: *mut PLpgSQL_expr,
+    pub datatype: *mut PLpgSQL_type,
+    pub cursor_explicit_expr: *mut PLpgSQL_expr,
+    pub cursor_explicit_argrow: ::core::ffi::c_int,
+    pub cursor_options: ::core::ffi::c_int,
+    pub value: Datum,
+    pub isnull: bool,
+    pub freeval: bool,
+    pub promise: PLpgSQL_promise_type,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_row {
+    pub dtype: PLpgSQL_datum_type,
+    pub dno: ::core::ffi::c_int,
+    pub refname: *mut ::core::ffi::c_char,
+    pub lineno: ::core::ffi::c_int,
+    pub isconst: bool,
+    pub notnull: bool,
+    pub default_val: *mut PLpgSQL_expr,
+    pub rowtupdesc: TupleDesc,
+    pub nfields: ::core::ffi::c_int,
+    pub fieldnames: *mut *mut ::core::ffi::c_char,
+    pub varnos: *mut ::core::ffi::c_int,
+}
+#[repr(C)]
+pub struct PLpgSQL_rec {
+    pub dtype: PLpgSQL_datum_type,
+    pub dno: ::core::ffi::c_int,
+    pub refname: *mut ::core::ffi::c_char,
+    pub lineno: ::core::ffi::c_int,
+    pub isconst: bool,
+    pub notnull: bool,
+    pub default_val: *mut PLpgSQL_expr,
+    pub datatype: *mut PLpgSQL_type,
+    pub rectypeid: Oid,
+    pub firstfield: ::core::ffi::c_int,
+    pub erh: *mut ExpandedRecordHeader,
+}
+#[repr(C)]
+pub struct PLpgSQL_recfield {
+    pub dtype: PLpgSQL_datum_type,
+    pub dno: ::core::ffi::c_int,
+    pub fieldname: *mut ::core::ffi::c_char,
+    pub recparentno: ::core::ffi::c_int,
+    pub nextfield: ::core::ffi::c_int,
+    pub rectupledescid: uint64,
+    pub finfo: ExpandedRecordFieldInfo,
+}
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_nsitem {
+    pub _bindgen_opaque_blob: [u64; 2usize],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_condition {
+    pub sqlerrstate: ::core::ffi::c_int,
+    pub condname: *mut ::core::ffi::c_char,
+    pub next: *mut PLpgSQL_condition,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_exception_block {
+    pub sqlstate_varno: ::core::ffi::c_int,
+    pub sqlerrm_varno: ::core::ffi::c_int,
+    pub exc_list: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_exception {
+    pub lineno: ::core::ffi::c_int,
+    pub conditions: *mut PLpgSQL_condition,
+    pub action: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_block {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub body: *mut List,
+    pub n_initvars: ::core::ffi::c_int,
+    pub initvarnos: *mut ::core::ffi::c_int,
+    pub exceptions: *mut PLpgSQL_exception_block,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_assign {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub varno: ::core::ffi::c_int,
+    pub expr: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_perform {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub expr: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_call {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub expr: *mut PLpgSQL_expr,
+    pub is_call: bool,
+    pub target: *mut PLpgSQL_variable,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_commit {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub chain: bool,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_rollback {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub chain: bool,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_diag_item {
+    pub kind: PLpgSQL_getdiag_kind,
+    pub target: ::core::ffi::c_int,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_getdiag {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub is_stacked: bool,
+    pub diag_items: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_if {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub cond: *mut PLpgSQL_expr,
+    pub then_body: *mut List,
+    pub elsif_list: *mut List,
+    pub else_body: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_if_elsif {
+    pub lineno: ::core::ffi::c_int,
+    pub cond: *mut PLpgSQL_expr,
+    pub stmts: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_case {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub t_expr: *mut PLpgSQL_expr,
+    pub t_varno: ::core::ffi::c_int,
+    pub case_when_list: *mut List,
+    pub have_else: bool,
+    pub else_stmts: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_case_when {
+    pub lineno: ::core::ffi::c_int,
+    pub expr: *mut PLpgSQL_expr,
+    pub stmts: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_loop {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub body: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_while {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub cond: *mut PLpgSQL_expr,
+    pub body: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_fori {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub var: *mut PLpgSQL_var,
+    pub lower: *mut PLpgSQL_expr,
+    pub upper: *mut PLpgSQL_expr,
+    pub step: *mut PLpgSQL_expr,
+    pub reverse: ::core::ffi::c_int,
+    pub body: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_forq {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub var: *mut PLpgSQL_variable,
+    pub body: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_fors {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub var: *mut PLpgSQL_variable,
+    pub body: *mut List,
+    pub query: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_forc {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub var: *mut PLpgSQL_variable,
+    pub body: *mut List,
+    pub curvar: ::core::ffi::c_int,
+    pub argquery: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_dynfors {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub var: *mut PLpgSQL_variable,
+    pub body: *mut List,
+    pub query: *mut PLpgSQL_expr,
+    pub params: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_foreach_a {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub label: *mut ::core::ffi::c_char,
+    pub varno: ::core::ffi::c_int,
+    pub slice: ::core::ffi::c_int,
+    pub expr: *mut PLpgSQL_expr,
+    pub body: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_open {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub curvar: ::core::ffi::c_int,
+    pub cursor_options: ::core::ffi::c_int,
+    pub argquery: *mut PLpgSQL_expr,
+    pub query: *mut PLpgSQL_expr,
+    pub dynquery: *mut PLpgSQL_expr,
+    pub params: *mut List,
+}
+#[repr(C)]
+pub struct PLpgSQL_stmt_fetch {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub target: *mut PLpgSQL_variable,
+    pub curvar: ::core::ffi::c_int,
+    pub direction: FetchDirection,
+    pub how_many: ::core::ffi::c_long,
+    pub expr: *mut PLpgSQL_expr,
+    pub is_move: bool,
+    pub returns_multiple_rows: bool,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_close {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub curvar: ::core::ffi::c_int,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_exit {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub is_exit: bool,
+    pub label: *mut ::core::ffi::c_char,
+    pub cond: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_return {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub expr: *mut PLpgSQL_expr,
+    pub retvarno: ::core::ffi::c_int,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_return_next {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub expr: *mut PLpgSQL_expr,
+    pub retvarno: ::core::ffi::c_int,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_return_query {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub query: *mut PLpgSQL_expr,
+    pub dynquery: *mut PLpgSQL_expr,
+    pub params: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_raise {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub elog_level: ::core::ffi::c_int,
+    pub condname: *mut ::core::ffi::c_char,
+    pub message: *mut ::core::ffi::c_char,
+    pub params: *mut List,
+    pub options: *mut List,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_raise_option {
+    pub opt_type: PLpgSQL_raise_option_type,
+    pub expr: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_assert {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub cond: *mut PLpgSQL_expr,
+    pub message: *mut PLpgSQL_expr,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_execsql {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub sqlstmt: *mut PLpgSQL_expr,
+    pub mod_stmt: bool,
+    pub mod_stmt_set: bool,
+    pub into: bool,
+    pub strict: bool,
+    pub target: *mut PLpgSQL_variable,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_stmt_dynexecute {
+    pub cmd_type: PLpgSQL_stmt_type,
+    pub lineno: ::core::ffi::c_int,
+    pub stmtid: ::core::ffi::c_uint,
+    pub query: *mut PLpgSQL_expr,
+    pub into: bool,
+    pub strict: bool,
+    pub target: *mut PLpgSQL_variable,
+    pub params: *mut List,
+}
+pub const PLpgSQL_trigtype_PLPGSQL_DML_TRIGGER: PLpgSQL_trigtype = 0;
+pub const PLpgSQL_trigtype_PLPGSQL_EVENT_TRIGGER: PLpgSQL_trigtype = 1;
+pub const PLpgSQL_trigtype_PLPGSQL_NOT_TRIGGER: PLpgSQL_trigtype = 2;
+pub type PLpgSQL_trigtype = ::core::ffi::c_uint;
+#[repr(C)]
+pub struct PLpgSQL_function {
+    pub cfunc: CachedFunction,
+    pub fn_signature: *mut ::core::ffi::c_char,
+    pub fn_oid: Oid,
+    pub fn_is_trigger: PLpgSQL_trigtype,
+    pub fn_input_collation: Oid,
+    pub fn_cxt: MemoryContext,
+    pub fn_rettype: Oid,
+    pub fn_rettyplen: ::core::ffi::c_int,
+    pub fn_retbyval: bool,
+    pub fn_retistuple: bool,
+    pub fn_retisdomain: bool,
+    pub fn_retset: bool,
+    pub fn_readonly: bool,
+    pub fn_prokind: ::core::ffi::c_char,
+    pub fn_nargs: ::core::ffi::c_int,
+    pub fn_argvarnos: [::core::ffi::c_int; 100usize],
+    pub out_param_varno: ::core::ffi::c_int,
+    pub found_varno: ::core::ffi::c_int,
+    pub new_varno: ::core::ffi::c_int,
+    pub old_varno: ::core::ffi::c_int,
+    pub resolve_option: PLpgSQL_resolve_option,
+    pub print_strict_params: bool,
+    pub extra_warnings: ::core::ffi::c_int,
+    pub extra_errors: ::core::ffi::c_int,
+    pub ndatums: ::core::ffi::c_int,
+    pub datums: *mut *mut PLpgSQL_datum,
+    pub copiable_size: Size,
+    pub action: *mut PLpgSQL_stmt_block,
+    pub nstatements: ::core::ffi::c_uint,
+    pub requires_procedure_resowner: bool,
+    pub has_exception_block: bool,
+    pub cur_estate: *mut PLpgSQL_execstate,
+}
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_execstate {
+    pub _bindgen_opaque_blob: [u64; 30usize],
+}
+#[repr(C)]
+#[repr(align(8))]
+#[derive(Debug, Copy, Clone)]
+pub struct PLpgSQL_plugin {
+    pub _bindgen_opaque_blob: [u64; 10usize],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct MemoryContextData {
+    pub _address: u8,
+}
