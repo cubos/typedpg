@@ -28,17 +28,45 @@ PG_USER="postgres"
 PG_PASS="postgres"
 PG_DB="postgres"
 
+# The cluster lives in memory (tmpfs): every test creates and drops its own
+# database, and on disk each DROP DATABASE waits for a checkpoint's fsyncs.
+# On Linux the tests also connect over a Unix socket shared through a bind
+# mount: thousands of short TCP connections exhaust the ephemeral ports.
+# Docker Desktop (macOS) can't share a socket that way, so it keeps TCP.
+# The container's entrypoint takes ownership of the shared directory, so it
+# is a child of one this script owns: that one can always be removed.
+SOCKET_PARENT=""
+SOCKET_DIR=""
+if [[ "$(uname -s)" == "Linux" ]]; then
+    SOCKET_PARENT="$(mktemp -d -t typedpg-pg-sanity.XXXXXX)"
+    SOCKET_DIR="$SOCKET_PARENT/socket"
+    mkdir "$SOCKET_DIR"
+    chmod 777 "$SOCKET_DIR"
+fi
+
 cleanup() {
-    # Stop wins over rm so we exit fast on Ctrl-C; --rm on the container
-    # handles the actual deletion. Errors during cleanup are swallowed —
-    # the container may already be gone if the test process exited.
+    # `docker stop` shuts PostgreSQL down cleanly, which removes its socket
+    # and lock files from the shared directory (they belong to the
+    # container's user, so they can't be removed from here); --rm then
+    # deletes the container. Errors are swallowed: the container may already
+    # be gone.
+    docker stop -t 10 "$CONTAINER_NAME" >/dev/null 2>&1 || true
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    if [[ -n "$SOCKET_PARENT" ]]; then
+        rm -rf "$SOCKET_PARENT" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
 echo "pg_sanity: starting $PG_IMAGE as $CONTAINER_NAME..."
+socket_args=()
+if [[ -n "$SOCKET_DIR" ]]; then
+    socket_args=(-v "$SOCKET_DIR:/var/run/postgresql")
+fi
 docker run -d --rm \
     --name "$CONTAINER_NAME" \
+    --tmpfs /var/lib/postgresql:rw \
+    ${socket_args[@]+"${socket_args[@]}"} \
     -e POSTGRES_USER="$PG_USER" \
     -e POSTGRES_PASSWORD="$PG_PASS" \
     -e POSTGRES_DB="$PG_DB" \
@@ -77,7 +105,11 @@ if [[ "$ready" -ne 1 ]]; then
     exit 1
 fi
 
-export POSTGRES_URL="host=127.0.0.1 port=$PG_PORT user=$PG_USER password=$PG_PASS dbname=$PG_DB"
+if [[ -n "$SOCKET_DIR" ]]; then
+    export POSTGRES_URL="host=$SOCKET_DIR user=$PG_USER password=$PG_PASS dbname=$PG_DB"
+else
+    export POSTGRES_URL="host=127.0.0.1 port=$PG_PORT user=$PG_USER password=$PG_PASS dbname=$PG_DB"
+fi
 echo "pg_sanity: POSTGRES_URL=$POSTGRES_URL"
 echo "pg_sanity: running tests..."
 
