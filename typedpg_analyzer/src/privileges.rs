@@ -11,7 +11,20 @@
 //! - the routines its plan runs (`ExecInitFunc` / `ExecInitAgg` /
 //!   `ExecuteCallStmt`: EXECUTE);
 //! - the sequences its `nextval` / `currval` / `setval` calls and the
-//!   column defaults it fills reach (checked when they run).
+//!   column defaults it fills reach (checked when they run);
+//! - the bodies of the routines it calls or depends on, and of the trigger
+//!   functions the writes it makes fire: a body runs with the privileges of
+//!   the role the statement runs as, or of the routine's owner under
+//!   `SECURITY DEFINER` (`GetUserId`), so what a trigger or a called
+//!   function reads and writes is checked too, recursively.
+//!
+//! Body statements are analyzed with the privilege collector active, under
+//! the effective role and the search path the body sees (its `SET
+//! search_path`, or the role's session search path). Each body is checked
+//! once per (routine, effective role), so cycles end. A body statement that
+//! doesn't analyze — dynamic SQL (`EXECUTE`, `RETURN QUERY EXECUTE`), a
+//! construct the analyzer doesn't model, a name it cannot resolve — is
+//! skipped, never reported: only its privileges would be missing.
 //!
 //! [`PgCatalog::check_requirements`] then evaluates them for a role. The
 //! collector records nothing outside [`collect`], and nothing while an
@@ -19,16 +32,21 @@
 //! stored query, a function body read for nullability, ...): those
 //! references aren't the statement's own range table.
 //!
-//! Not modeled yet: the bodies of trigger functions and of the routines a
-//! statement calls, which run with the caller's privileges; row-level
-//! security policies; COPY.
+//! Not modeled yet: row-level security policies; `COPY`; the timing of a
+//! body's statements (every statement of a routine that runs is checked,
+//! even in a branch that may not); foreign-key cascade actions (they run as
+//! the table's owner).
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use crate::AnalyzeError;
 use crate::ddl::acl::{AclObject, bits};
 use crate::ddl::depend::Reference;
+use crate::ddl::functions::RoutineSource;
+use crate::ddl::triggers::{TRIGGER_TYPE_DELETE, TRIGGER_TYPE_INSERT, TRIGGER_TYPE_UPDATE};
 use crate::error::RawError;
+use crate::expr::ExprType;
 use crate::oid::{PgClassOid, PgNamespaceOid, PgProcOid};
 use crate::pg_catalog::{PG_CLASS_RELID, PgCatalog, ProKind, RelKind};
 
@@ -87,6 +105,16 @@ struct RelationRequirement {
     /// The relation is read in FROM (a scan), rather than only being a
     /// DML target.
     scanned: bool,
+    /// The writes the statement makes to it, whose triggers fire (moved
+    /// onto the base relation when the write goes through a view).
+    writes: Vec<WriteEvent>,
+}
+
+/// A write a statement makes to a relation: the trigger event it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriteEvent {
+    /// `TRIGGER_TYPE_INSERT` / `_UPDATE` / `_DELETE`.
+    event: i32,
 }
 
 /// What a statement requires, in the order PG checks it.
@@ -120,6 +148,7 @@ impl Requirements {
                     updated: Vec::new(),
                     locked: false,
                     scanned: false,
+                    writes: Vec::new(),
                 });
                 self.relations.len() - 1
             }
@@ -372,6 +401,18 @@ pub(crate) fn note_default(relid: PgClassOid, attnum: i16) {
     });
 }
 
+/// The statement writes relation `relid` (INSERT / UPDATE / DELETE, the
+/// `TRIGGER_TYPE_*` bit), which fires its triggers for that event.
+pub(crate) fn note_write(relid: PgClassOid, event: i32) {
+    with(|req| {
+        let write = WriteEvent { event };
+        let rel = req.relation(relid);
+        if !rel.writes.contains(&write) {
+            rel.writes.push(write);
+        }
+    });
+}
+
 /// Why a role may not run a statement: PG's error, with what is missing and
 /// the grant that would allow it.
 struct Denial {
@@ -383,6 +424,101 @@ struct Denial {
     grant: String,
 }
 
+/// Where a body the check is inside runs: the routine, and how a statement
+/// came to run it.
+#[derive(Clone, Debug)]
+enum FrameKind {
+    Function {
+        signature: String,
+        kind: RoutineKind,
+    },
+    Trigger {
+        signature: String,
+        /// `TRIGGER_TYPE_*`.
+        event: i32,
+        /// The relation written, as `schema.name`.
+        relation: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct RunFrame {
+    kind: FrameKind,
+    /// The effective role the body runs as (`GetUserId()`).
+    role: String,
+    /// The effective role is the routine's owner because it is `SECURITY
+    /// DEFINER`.
+    definer: bool,
+}
+
+thread_local! {
+    /// The bodies the current check is inside, outermost first.
+    static RUN_FRAMES: RefCell<Vec<RunFrame>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Pops the frame [`push_frame`] pushed, however the check ends.
+struct FrameGuard;
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        RUN_FRAMES.with(|f| {
+            f.borrow_mut().pop();
+        });
+    }
+}
+
+fn push_frame(frame: RunFrame) -> FrameGuard {
+    RUN_FRAMES.with(|f| f.borrow_mut().push(frame));
+    FrameGuard
+}
+
+/// The note locating a body failure: which routine ran, why, and as whom.
+fn frames_note() -> Option<String> {
+    RUN_FRAMES.with(|frames| {
+        let frames = frames.borrow();
+        if frames.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (i, frame) in frames.iter().rev().enumerate() {
+            let lead = if i == 0 { "in" } else { "called by" };
+            match &frame.kind {
+                FrameKind::Function { signature, kind } => {
+                    parts.push(format!("{lead} {} {signature}", kind.word()));
+                }
+                FrameKind::Trigger {
+                    signature,
+                    event,
+                    relation,
+                } => {
+                    parts.push(format!("{lead} trigger function {signature}"));
+                    parts.push(format!(
+                        "fired by {} on {relation}",
+                        crate::ddl::triggers::event_word(*event)
+                    ));
+                }
+            }
+        }
+        // A routine the statement itself calls (no outer frame): say so.
+        if matches!(
+            frames.first().map(|f| &f.kind),
+            Some(FrameKind::Function { .. })
+        ) {
+            parts.push("called by the statement".to_owned());
+        }
+        let inner = frames.last()?;
+        parts.push(if inner.definer {
+            format!(
+                "run as its owner {} (SECURITY DEFINER)",
+                quote_role(&inner.role)
+            )
+        } else {
+            format!("run as role {}", quote_role(&inner.role))
+        });
+        Some(parts.join(", "))
+    })
+}
+
 impl Denial {
     fn into_error(self) -> AnalyzeError {
         let mut raw = RawError::new(
@@ -390,6 +526,9 @@ impl Denial {
             None,
             Some(format!("grant it in a migration: {}", self.grant)),
         );
+        if let Some(location) = frames_note() {
+            raw.notes.push(location);
+        }
         raw.notes.push(self.note);
         raw.finalize_implicit()
     }
@@ -433,11 +572,22 @@ impl PgCatalog {
     /// the order it makes them — explicitly named schemas (parse
     /// analysis), the range table (`ExecCheckPermissions`), the routines
     /// the plan runs (executor start), then the sequences the statement's
-    /// sequence functions and column defaults reach (as they run).
+    /// sequence functions and column defaults reach (as they run). What
+    /// those routines' bodies then do, and the triggers the statement's
+    /// writes fire, is checked recursively.
     pub(crate) fn check_requirements(
         &self,
         role: &str,
         req: &Requirements,
+    ) -> Result<(), AnalyzeError> {
+        self.check_requirements_in(role, req, &mut BodyContext::default())
+    }
+
+    fn check_requirements_in(
+        &self,
+        role: &str,
+        req: &Requirements,
+        ctx: &mut BodyContext,
     ) -> Result<(), AnalyzeError> {
         for &ns in &req.schemas {
             if !self.has_schema_privilege(role, ns, crate::Privilege::Usage) {
@@ -563,6 +713,17 @@ impl PgCatalog {
                 .into_error());
             }
         }
+
+        // The bodies of the routines the statement calls (or whose
+        // defaults run), then the triggers each write it makes fires.
+        for &(oid, _) in &routines {
+            self.check_routine_body(oid, None, role, ctx)?;
+        }
+        for rel in &relations {
+            if !rel.writes.is_empty() {
+                self.check_write_triggers(rel, role, ctx)?;
+            }
+        }
         Ok(())
     }
 
@@ -581,7 +742,7 @@ impl PgCatalog {
         let mut todo: std::collections::VecDeque<RelationRequirement> =
             req.relations.iter().cloned().collect();
         let mut expanded: Vec<(PgClassOid, Option<crate::ddl::roles::RoleId>)> = Vec::new();
-        while let Some(rel) = todo.pop_front() {
+        while let Some(mut rel) = todo.pop_front() {
             let is_view = self
                 .pg_class
                 .get(&rel.relid)
@@ -626,6 +787,7 @@ impl PgCatalog {
                                 updated: Vec::new(),
                                 locked: rel.locked,
                                 scanned: true,
+                                writes: Vec::new(),
                             });
                             inner.len() - 1
                         }
@@ -716,6 +878,20 @@ impl PgCatalog {
                 {
                     let view_attrs = self.attributes_of(rel.relid);
                     let base_attrs = self.attributes_of(base);
+                    // The writes rewriteTargetView hands to the base
+                    // relation: its triggers fire there, not on the view.
+                    let mapped_writes: Vec<WriteEvent> = rel
+                        .writes
+                        .iter()
+                        .copied()
+                        .filter(|w| match w.event {
+                            TRIGGER_TYPE_INSERT => writes & bits::INSERT != 0,
+                            TRIGGER_TYPE_UPDATE => writes & bits::UPDATE != 0,
+                            TRIGGER_TYPE_DELETE => writes & bits::DELETE != 0,
+                            _ => false,
+                        })
+                        .collect();
+                    rel.writes.retain(|w| !mapped_writes.contains(w));
                     // A view column's base column, by name.
                     let map = |cols: &[Column]| -> Vec<Column> {
                         cols.iter()
@@ -749,6 +925,7 @@ impl PgCatalog {
                         updated: map(&rel.updated),
                         locked: false,
                         scanned: false,
+                        writes: mapped_writes,
                     });
                 }
             }
@@ -769,8 +946,463 @@ impl PgCatalog {
                             }
                         }
                     }
+                    for write in &rel.writes {
+                        if !existing.writes.contains(write) {
+                            existing.writes.push(*write);
+                        }
+                    }
                 }
                 None => out.push(rel),
+            }
+        }
+        out
+    }
+
+    /// The search path a body that sets `search_path` to `names` sees:
+    /// `$user` is `role`, schemas that don't exist or that `role` has no
+    /// USAGE on are skipped (recomputeNamespacePath), and duplicates keep
+    /// their first place.
+    fn search_path_named(&self, role: &str, names: &[String]) -> Vec<PgNamespaceOid> {
+        let mut out = Vec::new();
+        for name in names {
+            let name = match name.as_str() {
+                // The application's sessions have no temporary schema.
+                "pg_temp" => continue,
+                "$user" => role,
+                other => other,
+            };
+            if let Some(oid) = self.namespace_by_name.get(name).copied()
+                && Some(oid) != self.temp_namespace
+                && !out.contains(&oid)
+                && self.has_schema_privilege(role, oid, crate::Privilege::Usage)
+            {
+                out.push(oid);
+            }
+        }
+        out
+    }
+
+    /// The display form of routine `proc`: `schema.name(arg, ...)`.
+    fn routine_signature(&self, proc: &crate::pg_catalog::PgProc) -> String {
+        let schema = self.namespace_name(proc.pronamespace).unwrap_or_default();
+        let args = proc
+            .proargtypes
+            .iter()
+            .map(|&t| crate::ddl::util::format_type_for_message(self, t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{}({args})",
+            crate::QualifiedName::new(schema, proc.proname.clone())
+        )
+    }
+
+    /// The display form of relation `relid`.
+    fn relation_display_name(&self, relid: PgClassOid) -> String {
+        let Some(class) = self.pg_class.get(&relid) else {
+            return "<unknown relation>".to_owned();
+        };
+        let schema = self.namespace_name(class.relnamespace).unwrap_or_default();
+        crate::QualifiedName::new(schema, class.relname.clone()).to_string()
+    }
+
+    /// Check the body of routine `oid` as the role the caller runs it as
+    /// (`trigger`: the trigger that fired it, with the relation written and
+    /// the event). A routine with no recorded body — a built-in one, or a
+    /// language the analyzer doesn't read — passes.
+    fn check_routine_body(
+        &self,
+        oid: PgProcOid,
+        trigger: Option<(PgClassOid, i32)>,
+        caller_role: &str,
+        ctx: &mut BodyContext,
+    ) -> Result<(), AnalyzeError> {
+        let Some(body) = self.routine_bodies.get(&oid) else {
+            return Ok(());
+        };
+        let Some(proc) = self.pg_proc.get(&oid) else {
+            return Ok(());
+        };
+        let effective = if body.security_definer {
+            self.roles
+                .name(self.owner_of(AclObject::Function(oid)))
+                .to_owned()
+        } else {
+            caller_role.to_owned()
+        };
+        // A body runs once per statement: a cycle of trigger functions, or
+        // a function that calls itself, ends here.
+        if !ctx.visited.insert((oid, effective.clone())) {
+            return Ok(());
+        }
+        let signature = self.routine_signature(proc);
+        let kind = match trigger {
+            Some((relid, event)) => FrameKind::Trigger {
+                signature,
+                event,
+                relation: self.relation_display_name(relid),
+            },
+            None => FrameKind::Function {
+                signature,
+                kind: match proc.prokind {
+                    ProKind::Procedure => RoutineKind::Procedure,
+                    ProKind::Aggregate => RoutineKind::Aggregate,
+                    _ => RoutineKind::Function,
+                },
+            },
+        };
+        let _frame = push_frame(RunFrame {
+            kind,
+            role: effective.clone(),
+            definer: body.security_definer,
+        });
+        let path = match &body.search_path {
+            Some(names) => self.search_path_named(&effective, names),
+            None => self.role_search_path(&effective),
+        };
+        let mut owned;
+        let catalog: &PgCatalog = if path == self.search_path {
+            self
+        } else {
+            owned = self.clone();
+            owned.search_path = path;
+            &owned
+        };
+        let params = crate::ddl::function_body::input_params(proc);
+        match (body.language.as_str(), &body.source) {
+            ("sql", RoutineSource::SqlText(text)) => {
+                self.check_sql_text_body(catalog, text, proc, &params, &effective, ctx)
+            }
+            ("sql", RoutineSource::SqlStandard(statements)) => {
+                for statement in statements {
+                    self.check_body_statement(
+                        catalog,
+                        statement,
+                        proc,
+                        &params,
+                        &[],
+                        &effective,
+                        ctx,
+                    )?;
+                }
+                Ok(())
+            }
+            ("plpgsql", RoutineSource::Plpgsql { create_sql }) => self.check_plpgsql_body(
+                catalog,
+                oid,
+                create_sql,
+                proc,
+                trigger.map(|(relid, _)| relid),
+                &params,
+                &effective,
+                ctx,
+            ),
+            // A language the analyzer doesn't read: its body isn't SQL.
+            _ => Ok(()),
+        }
+    }
+
+    /// Check every statement of a `LANGUAGE sql` body given as a string.
+    fn check_sql_text_body(
+        &self,
+        catalog: &PgCatalog,
+        text: &str,
+        proc: &crate::pg_catalog::PgProc,
+        params: &[(String, crate::oid::PgTypeOid)],
+        role: &str,
+        ctx: &mut BodyContext,
+    ) -> Result<(), AnalyzeError> {
+        let Ok(parsed) = typedpg_pg_query::parse(text) else {
+            return Ok(());
+        };
+        for raw in &parsed.tree.stmts {
+            let Some(statement) = raw.stmt.as_ref() else {
+                continue;
+            };
+            self.check_body_statement(catalog, statement, proc, params, &[], role, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Check one body statement: analyze it for what it requires, and check
+    /// that. A statement that doesn't analyze is skipped — only its
+    /// privileges would have been checked.
+    #[allow(clippy::too_many_arguments)]
+    fn check_body_statement(
+        &self,
+        catalog: &PgCatalog,
+        statement: &typedpg_pg_query::ast::Node,
+        proc: &crate::pg_catalog::PgProc,
+        params: &[(String, crate::oid::PgTypeOid)],
+        locals: &[(String, ExprType)],
+        role: &str,
+        ctx: &mut BodyContext,
+    ) -> Result<(), AnalyzeError> {
+        if !is_analyzable(statement) {
+            return Ok(());
+        }
+        let param_types: Vec<crate::oid::PgTypeOid> = params.iter().map(|(_, t)| *t).collect();
+        let namespace = crate::expr::SqlFunctionParams {
+            name: proc.proname.clone(),
+            params: params.to_vec(),
+            locals: locals.to_vec(),
+        };
+        let (result, requirements) = collect(|| {
+            crate::expr::with_sql_function_params(namespace, || {
+                crate::resolve::without_execution(|| {
+                    crate::resolve::analyze_raw_node_with_param_types(
+                        catalog,
+                        statement,
+                        &param_types,
+                    )
+                })
+            })
+        });
+        if result.is_err() {
+            return Ok(());
+        }
+        self.check_requirements_in(role, &requirements, ctx)
+    }
+
+    /// Check a `LANGUAGE plpgsql` body: every SQL query its statements
+    /// carry, with the body's variables in scope. Dynamic SQL is skipped.
+    #[allow(clippy::too_many_arguments)]
+    fn check_plpgsql_body(
+        &self,
+        catalog: &PgCatalog,
+        oid: PgProcOid,
+        create_sql: &str,
+        proc: &crate::pg_catalog::PgProc,
+        trigger_rel: Option<PgClassOid>,
+        params: &[(String, crate::oid::PgTypeOid)],
+        role: &str,
+        ctx: &mut BodyContext,
+    ) -> Result<(), AnalyzeError> {
+        let parsed = match ctx.plpgsql.get(&oid) {
+            Some(parsed) => parsed.clone(),
+            None => {
+                let parsed = typedpg_pg_query::parse_plpgsql_with_catalog(create_sql, catalog)
+                    .ok()
+                    .map(std::sync::Arc::new);
+                ctx.plpgsql.insert(oid, parsed.clone());
+                parsed
+            }
+        };
+        let Some(parsed) = parsed else {
+            return Ok(());
+        };
+        let Some(function) = parsed.first() else {
+            return Ok(());
+        };
+        let mut locals = self.plpgsql_locals(catalog, function, trigger_rel);
+        self.add_for_record_shapes(catalog, function, proc, params, &mut locals);
+        let mut queries = Vec::new();
+        collect_plpgsql_queries(function, &mut queries);
+        for query in queries {
+            let Some(statement) = statement_or_expression(&query) else {
+                continue;
+            };
+            self.check_body_statement(catalog, &statement, proc, params, &locals, role, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// The variables a PL/pgSQL body's statements see: its parameters and
+    /// `DECLARE`d variables, `NEW` / `OLD` (the trigger relation's row
+    /// type), `FOUND` and `TG_*`.
+    fn plpgsql_locals(
+        &self,
+        catalog: &PgCatalog,
+        function: &typedpg_pg_query::plpgsql::Function,
+        trigger_rel: Option<PgClassOid>,
+    ) -> Vec<(String, ExprType)> {
+        use typedpg_pg_query::plpgsql::Datum;
+        let mut locals: Vec<(String, ExprType)> = Vec::new();
+        if let Some(relid) = trigger_rel
+            && let Some(row_type) = self.table_row_type(relid)
+        {
+            let row = ExprType::scalar(row_type, true);
+            locals.push(("new".to_owned(), row.clone()));
+            locals.push(("old".to_owned(), row));
+        }
+        for datum in &function.datums {
+            let Some(name) = datum.refname() else {
+                continue;
+            };
+            if trigger_rel.is_some() && (name == "new" || name == "old") {
+                // Already typed as the trigger relation's row.
+                continue;
+            }
+            let value = match datum {
+                Datum::Var(var) | Datum::Promise(var) => {
+                    let Some(datatype) = var.datatype.as_ref() else {
+                        continue;
+                    };
+                    let Some(type_oid) = resolve_type_name(catalog, datatype) else {
+                        continue;
+                    };
+                    ExprType::scalar(type_oid, true)
+                }
+                // A record: its shape is unknown unless a query gave it
+                // ([`Self::add_for_record_shapes`]).
+                Datum::Rec(_) | Datum::Row(_) => {
+                    ExprType::scalar(crate::pg_catalog::oid::RECORD, true)
+                }
+                Datum::Recfield(_) => continue,
+            };
+            locals.push((name.to_owned(), value));
+        }
+        locals
+    }
+
+    /// The composite type of relation `relid`'s row (`pg_type.typrelid`).
+    fn table_row_type(&self, relid: PgClassOid) -> Option<crate::oid::PgTypeOid> {
+        self.pg_type
+            .values()
+            .find(|t| {
+                t.typrelid == Some(relid) && t.typtype == crate::pg_catalog::TypType::Composite
+            })
+            .map(|t| t.oid)
+    }
+
+    /// Type `FOR r IN SELECT ...` loop variables from the query's columns,
+    /// when the query analyzes.
+    fn add_for_record_shapes(
+        &self,
+        catalog: &PgCatalog,
+        function: &typedpg_pg_query::plpgsql::Function,
+        proc: &crate::pg_catalog::PgProc,
+        params: &[(String, crate::oid::PgTypeOid)],
+        locals: &mut Vec<(String, ExprType)>,
+    ) {
+        let mut fors = Vec::new();
+        collect_for_records(function, &mut fors);
+        for (name, query) in fors {
+            let Some(statement) = full_statement(&query) else {
+                continue;
+            };
+            if !is_analyzable(&statement) {
+                continue;
+            }
+            let param_types: Vec<crate::oid::PgTypeOid> = params.iter().map(|(_, t)| *t).collect();
+            let namespace = crate::expr::SqlFunctionParams {
+                name: proc.proname.clone(),
+                params: params.to_vec(),
+                locals: locals.clone(),
+            };
+            let analyzed = crate::expr::with_sql_function_params(namespace, || {
+                crate::resolve::without_execution(|| {
+                    crate::resolve::analyze_raw_node_with_param_types(
+                        catalog,
+                        &statement,
+                        &param_types,
+                    )
+                })
+            });
+            let Ok((columns, _)) = analyzed else {
+                continue;
+            };
+            if columns.is_empty() {
+                continue;
+            }
+            let fields: Vec<crate::expr::RecordField> = columns
+                .iter()
+                .map(|c| crate::expr::RecordField {
+                    name: c.name.clone(),
+                    ty: ExprType::scalar_with_typmod(c.type_oid, c.nullable, c.typmod),
+                })
+                .collect();
+            let mut value = ExprType::scalar(crate::pg_catalog::oid::RECORD, true);
+            value.record_fields = Some(crate::expr::RecordShape {
+                fields,
+                hidden: false,
+            });
+            match locals.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, ty)) => *ty = value,
+                None => locals.push((name, value)),
+            }
+        }
+    }
+
+    /// Check the bodies of the triggers the writes `rel` records fire,
+    /// once per function.
+    fn check_write_triggers(
+        &self,
+        rel: &RelationRequirement,
+        role: &str,
+        ctx: &mut BodyContext,
+    ) -> Result<(), AnalyzeError> {
+        let mut checked: HashSet<PgProcOid> = HashSet::new();
+        for write in &rel.writes {
+            for trigger in self.triggers_fired_by(rel, *write) {
+                if !checked.insert(trigger.function) {
+                    continue;
+                }
+                self.check_routine_body(
+                    trigger.function,
+                    Some((rel.relid, write.event)),
+                    role,
+                    ctx,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The triggers a write `write` to `rel` fires: the relation's own,
+    /// plus the row triggers of the relations its rows may be stored in —
+    /// a partitioned table's partitions (a row is routed to one of them),
+    /// and for UPDATE / DELETE an inheritance parent's children (whose
+    /// rows it reaches). A statement that fails for the rows some partition
+    /// takes is checked like one that fails for every row. Disabled
+    /// triggers and `UPDATE OF` triggers whose columns the SET list doesn't
+    /// name never fire.
+    fn triggers_fired_by(
+        &self,
+        rel: &RelationRequirement,
+        write: WriteEvent,
+    ) -> Vec<&crate::ddl::triggers::Trigger> {
+        let mut out = Vec::new();
+        let mut todo = vec![rel.relid];
+        let mut seen = HashSet::new();
+        while let Some(relid) = todo.pop() {
+            if !seen.insert(relid) {
+                continue;
+            }
+            let Some(class) = self.pg_class.get(&relid) else {
+                continue;
+            };
+            let is_written = relid == rel.relid;
+            let partitioned = class.relkind == RelKind::Partitioned;
+            for trigger in self.triggers.get(&relid).into_iter().flatten() {
+                // Statement triggers fire on the relation written only.
+                if !is_written && !trigger.row {
+                    continue;
+                }
+                if !trigger.state.fires() {
+                    continue;
+                }
+                if trigger.events & write.event == 0 {
+                    continue;
+                }
+                if write.event == TRIGGER_TYPE_UPDATE
+                    && !trigger.columns.is_empty()
+                    && !trigger
+                        .columns
+                        .iter()
+                        .any(|c| rel.updated.contains(&Column::Named(c.clone())))
+                {
+                    continue;
+                }
+                out.push(trigger);
+            }
+            if partitioned || write.event != crate::ddl::triggers::TRIGGER_TYPE_INSERT {
+                todo.extend(
+                    self.pg_inherits
+                        .iter()
+                        .filter(|i| i.inhparent == relid)
+                        .map(|i| i.inhrelid),
+                );
             }
         }
         out
@@ -920,4 +1552,249 @@ impl PgCatalog {
         }
         .into_error())
     }
+}
+
+/// The caches of one `analyze_as` call's body walk: what was already
+/// checked (per routine and effective role) and the PL/pgSQL bodies already
+/// parsed.
+#[derive(Default)]
+struct BodyContext {
+    visited: HashSet<(PgProcOid, String)>,
+    plpgsql: HashMap<PgProcOid, Option<std::sync::Arc<Vec<typedpg_pg_query::plpgsql::Function>>>>,
+}
+
+/// Whether a body statement is one the query analyzer reads: the others
+/// (utility statements, transaction control) have no privileges of their
+/// own.
+fn is_analyzable(statement: &typedpg_pg_query::ast::Node) -> bool {
+    use typedpg_pg_query::ast::Node;
+    matches!(
+        statement,
+        Node::SelectStmt(_)
+            | Node::InsertStmt(_)
+            | Node::UpdateStmt(_)
+            | Node::DeleteStmt(_)
+            | Node::MergeStmt(_)
+    )
+}
+
+/// The type a PL/pgSQL datum's declared type names, as the catalog resolves
+/// it: `origtypname` when the compiler recorded one (`pg_catalog.int4`, a
+/// user type), else `typname` from `pg_catalog` or along the search path.
+fn resolve_type_name(
+    catalog: &PgCatalog,
+    datatype: &typedpg_pg_query::plpgsql::Type,
+) -> Option<crate::oid::PgTypeOid> {
+    let parts: Vec<String> = datatype
+        .origtypname
+        .as_ref()
+        .map(|tn| {
+            tn.names
+                .iter()
+                .filter_map(|n| crate::ddl::util::node_string(n.as_ref()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let typname = datatype.typname.as_str();
+    let resolve = |schema: Option<&str>, name: &str| {
+        catalog.resolve_type_by_name(schema, name).map(|t| t.oid)
+    };
+    let found = match parts.as_slice() {
+        [] => resolve(Some("pg_catalog"), typname).or_else(|| resolve(None, typname)),
+        [name] => resolve(None, name).or_else(|| resolve(Some("pg_catalog"), name)),
+        [schema, name] => resolve(Some(schema), name),
+        // `database.schema.name`: the current database's schemas only.
+        [_, schema, name] => resolve(Some(schema), name),
+        _ => None,
+    };
+    found.or_else(|| resolve(Some("pg_catalog"), typname).or_else(|| resolve(None, typname)))
+}
+
+/// Visit every statement of `stmts`, nested bodies included, before its
+/// children.
+fn walk_plpgsql_stmts<'a>(
+    stmts: &'a [typedpg_pg_query::plpgsql::Stmt],
+    f: &mut impl FnMut(&'a typedpg_pg_query::plpgsql::Stmt),
+) {
+    use typedpg_pg_query::plpgsql::Stmt;
+    for stmt in stmts {
+        f(stmt);
+        match stmt {
+            Stmt::Block(b) => {
+                walk_plpgsql_stmts(&b.body, f);
+                for exc in b.exceptions.iter().flat_map(|e| &e.exc_list) {
+                    walk_plpgsql_stmts(&exc.action, f);
+                }
+            }
+            Stmt::If(s) => {
+                walk_plpgsql_stmts(&s.then_body, f);
+                for elsif in &s.elsif_list {
+                    walk_plpgsql_stmts(&elsif.stmts, f);
+                }
+                walk_plpgsql_stmts(&s.else_body, f);
+            }
+            Stmt::Case(s) => {
+                for when in &s.case_when_list {
+                    walk_plpgsql_stmts(&when.stmts, f);
+                }
+                walk_plpgsql_stmts(&s.else_stmts, f);
+            }
+            Stmt::Loop(s) => walk_plpgsql_stmts(&s.body, f),
+            Stmt::While(s) => walk_plpgsql_stmts(&s.body, f),
+            Stmt::Fori(s) => walk_plpgsql_stmts(&s.body, f),
+            Stmt::Fors(s) => walk_plpgsql_stmts(&s.body, f),
+            Stmt::Forc(s) => walk_plpgsql_stmts(&s.body, f),
+            Stmt::ForeachA(s) => walk_plpgsql_stmts(&s.body, f),
+            Stmt::Dynfors(s) => walk_plpgsql_stmts(&s.body, f),
+            _ => {}
+        }
+    }
+}
+
+/// The SQL expressions statement `stmt` itself carries (not its nested
+/// statements'). Dynamic SQL (`EXECUTE`) carries none: what it runs isn't
+/// known statically.
+fn plpgsql_stmt_exprs(
+    stmt: &typedpg_pg_query::plpgsql::Stmt,
+) -> Vec<&typedpg_pg_query::plpgsql::Expr> {
+    use typedpg_pg_query::plpgsql::Stmt;
+    let mut out: Vec<&typedpg_pg_query::plpgsql::Expr> = Vec::new();
+    match stmt {
+        Stmt::Assign(s) => out.extend(s.expr.as_ref()),
+        Stmt::If(s) => {
+            out.extend(s.cond.as_ref());
+            out.extend(s.elsif_list.iter().filter_map(|e| e.cond.as_ref()));
+        }
+        Stmt::Case(s) => {
+            out.extend(s.t_expr.as_ref());
+            out.extend(s.case_when_list.iter().filter_map(|w| w.expr.as_ref()));
+        }
+        Stmt::While(s) => out.extend(s.cond.as_ref()),
+        Stmt::Fori(s) => {
+            out.extend(s.lower.as_ref());
+            out.extend(s.upper.as_ref());
+            out.extend(s.step.as_ref());
+        }
+        Stmt::Fors(s) => out.extend(s.query.as_ref()),
+        Stmt::Forc(s) => out.extend(s.argquery.as_ref()),
+        Stmt::ForeachA(s) => out.extend(s.expr.as_ref()),
+        Stmt::Exit(s) => out.extend(s.cond.as_ref()),
+        Stmt::Return(s) => out.extend(s.expr.as_ref()),
+        Stmt::ReturnNext(s) => out.extend(s.expr.as_ref()),
+        Stmt::ReturnQuery(s) => {
+            out.extend(s.query.as_ref());
+            out.extend(s.dynquery.as_ref());
+            out.extend(&s.params);
+        }
+        Stmt::Raise(s) => {
+            out.extend(&s.params);
+            out.extend(s.options.iter().filter_map(|o| o.expr.as_ref()));
+        }
+        Stmt::Assert(s) => {
+            out.extend(s.cond.as_ref());
+            out.extend(s.message.as_ref());
+        }
+        Stmt::Execsql(s) => out.extend(s.sqlstmt.as_ref()),
+        Stmt::Dynfors(s) => {
+            out.extend(s.query.as_ref());
+            out.extend(&s.params);
+        }
+        Stmt::Open(s) => {
+            out.extend(s.argquery.as_ref());
+            out.extend(s.query.as_ref());
+            out.extend(s.dynquery.as_ref());
+            out.extend(&s.params);
+        }
+        Stmt::Fetch(s) => out.extend(s.expr.as_ref()),
+        Stmt::Perform(s) => out.extend(s.expr.as_ref()),
+        Stmt::Call(s) => out.extend(s.expr.as_ref()),
+        Stmt::Dynexecute(_)
+        | Stmt::Block(_)
+        | Stmt::Loop(_)
+        | Stmt::Getdiag(_)
+        | Stmt::Close(_)
+        | Stmt::Commit(_)
+        | Stmt::Rollback(_) => {}
+    }
+    out
+}
+
+/// Every SQL query a compiled PL/pgSQL function carries: its variables'
+/// `DEFAULT`s and cursor queries, then its statements'. Dynamic SQL
+/// (`EXECUTE`) is skipped: what it runs isn't known statically.
+fn collect_plpgsql_queries(function: &typedpg_pg_query::plpgsql::Function, out: &mut Vec<String>) {
+    use typedpg_pg_query::plpgsql::Datum;
+    for datum in &function.datums {
+        let exprs = match datum {
+            Datum::Var(v) | Datum::Promise(v) => {
+                [v.default_val.as_ref(), v.cursor_explicit_expr.as_ref()]
+            }
+            Datum::Row(r) => [r.default_val.as_ref(), None],
+            Datum::Rec(r) => [r.default_val.as_ref(), None],
+            Datum::Recfield(_) => [None, None],
+        };
+        out.extend(exprs.into_iter().flatten().map(|e| e.query.clone()));
+    }
+    if let Some(block) = function.action.as_ref() {
+        walk_plpgsql_stmts(&block.body, &mut |stmt| {
+            out.extend(
+                plpgsql_stmt_exprs(stmt)
+                    .into_iter()
+                    .map(|e| e.query.clone()),
+            );
+        });
+    }
+}
+
+/// The `(variable, query)` of every `FOR variable IN query` loop, whose
+/// variable's shape comes from the query's columns.
+fn collect_for_records(
+    function: &typedpg_pg_query::plpgsql::Function,
+    out: &mut Vec<(String, String)>,
+) {
+    let Some(block) = function.action.as_ref() else {
+        return;
+    };
+    walk_plpgsql_stmts(&block.body, &mut |stmt| {
+        if let typedpg_pg_query::plpgsql::Stmt::Fors(fors) = stmt
+            && let Some(var) = fors.var
+            && let Some(name) = usize::try_from(var)
+                .ok()
+                .and_then(|i| function.datums.get(i))
+                .and_then(|d| d.refname())
+            && let Some(query) = fors.query.as_ref()
+        {
+            out.push((name.to_owned(), query.query.clone()));
+        }
+    });
+}
+
+/// The statement `query` is, when it is one the analyzer reads.
+fn full_statement(query: &str) -> Option<typedpg_pg_query::ast::Node> {
+    let parsed = typedpg_pg_query::parse(query).ok()?;
+    let [raw] = parsed.tree.stmts.as_slice() else {
+        return None;
+    };
+    let statement = raw.stmt.as_ref()?;
+    is_analyzable(statement).then(|| statement.clone())
+}
+
+/// A PL/pgSQL statement's SQL text as a statement to analyze: a query as
+/// written, or an expression (a condition, a `PERFORM` argument, an
+/// assignment's right-hand side) wrapped as `SELECT expression`.
+fn statement_or_expression(query: &str) -> Option<typedpg_pg_query::ast::Node> {
+    if let Ok(parsed) = typedpg_pg_query::parse(query) {
+        // A complete statement the analyzer reads, or a utility statement
+        // it doesn't: never an expression.
+        let statement = parsed.tree.stmts.first().and_then(|r| r.stmt.as_ref())?;
+        return is_analyzable(statement).then(|| statement.clone());
+    }
+    // PL/pgSQL's assignment expressions are written `target := value`.
+    let expression = query
+        .split_once(":=")
+        .map_or(query, |(_, rhs)| rhs)
+        .trim_start();
+    let sql = format!("SELECT {expression}");
+    full_statement(&sql)
 }

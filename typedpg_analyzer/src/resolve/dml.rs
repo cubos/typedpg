@@ -724,6 +724,7 @@ fn note_written_columns(tgt: &InsertTarget, width: usize) {
 /// leaves to them, which run with the statement (rewriteTargetListIU).
 fn note_insert_privileges(ins: &ast::InsertStmt, tgt: &InsertTarget, width: usize) {
     crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::INSERT);
+    crate::privileges::note_write(tgt.oid, crate::ddl::triggers::TRIGGER_TYPE_INSERT);
     for i in 0..width {
         if let Some(c) = target_col_at(tgt, i) {
             crate::privileges::note_column(
@@ -2018,8 +2019,10 @@ fn analyze_insert_on_conflict(
     for a in tgt.attrs.iter().filter(|a| a.attnum > 0) {
         crate::ddl::depend::note_column(tgt.oid, &a.attname);
     }
-    // DO UPDATE requires UPDATE of the columns its SET list writes.
+    // DO UPDATE requires UPDATE of the columns its SET list writes, and
+    // fires the UPDATE triggers.
     crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::UPDATE);
+    crate::privileges::note_write(tgt.oid, crate::ddl::triggers::TRIGGER_TYPE_UPDATE);
     for t in &on_conflict.target_list {
         if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
             crate::privileges::note_column(
@@ -2334,6 +2337,7 @@ fn analyze_update_here(
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
     // The columns the UPDATE writes.
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::UPDATE);
+    crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_UPDATE);
     for target in &upd.target_list {
         if let Some(ast::Node::ResTarget(rt)) = target.as_ref() {
             crate::ddl::depend::note_column(table_oid, &rt.name);
@@ -2600,6 +2604,7 @@ fn analyze_delete_here(
     let table_oid = table.oid;
     // transformDeleteStmt: the target requires DELETE.
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
+    crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_DELETE);
     let table_relname = table.relname.clone();
     let table_nsname = snapshot
         .namespace_name(table.relnamespace)

@@ -29,6 +29,35 @@ const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
 /// assigns a new one, or keeps the replaced routine's).
 pub(crate) const PENDING_OID: PgProcOid = PgProcOid::from_raw(u32::MAX);
 
+/// What the analyzer keeps of a routine the migrations create, beyond its
+/// `pg_proc` row: what deciding whether a role may run its body needs.
+#[derive(Clone, Debug)]
+pub(crate) struct RoutineBody {
+    /// `prolang`'s name, lowercased (`sql`, `plpgsql`, `c`, ...).
+    pub(crate) language: String,
+    /// `prosecdef`: the body runs as the routine's owner, not its caller.
+    pub(crate) security_definer: bool,
+    /// The schema names a `SET search_path` clause gives the body, when it
+    /// has one. `None`: the caller's session search path.
+    pub(crate) search_path: Option<Vec<String>>,
+    pub(crate) source: RoutineSource,
+}
+
+/// Where a routine's body text lives.
+#[derive(Clone, Debug)]
+pub(crate) enum RoutineSource {
+    /// A `LANGUAGE sql` body given as a string (`AS $$ ... $$`).
+    SqlText(String),
+    /// A SQL-standard body (`BEGIN ATOMIC ... END` / `RETURN ...`),
+    /// already parsed: PG stores it parsed, and the statements were
+    /// analyzed at CREATE FUNCTION.
+    SqlStandard(Vec<typedpg_pg_query::ast::Node>),
+    /// A `LANGUAGE plpgsql` body: the `CREATE FUNCTION` statement as
+    /// written, which PL/pgSQL's compiler reads (through
+    /// `parse_plpgsql`) for its parameter and variable declarations.
+    Plpgsql { create_sql: String },
+}
+
 /// `errorConflictingDefElem` (define.c).
 fn conflicting_options() -> DdlError {
     DdlError::Parse("conflicting or redundant options".into())
@@ -633,6 +662,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
         prosupport: attrs.support,
     };
     let proc = procedure_create(interp, proc, stmt.replace)?;
+    record_routine_body(interp, stmt, &attrs, &proc, &language);
     // ProcedureCreate: the routine depends on its language (the pinned
     // built-in ones record nothing).
     super::depend::record(
@@ -702,6 +732,90 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     );
 
     Ok(())
+}
+
+/// Record what a routine the migrations create runs, for the privilege
+/// check of its body (`privileges`). Built-in routines and aggregates keep
+/// none: their bodies belong to the bootstrap superuser, or aren't SQL.
+fn record_routine_body(
+    interp: &mut PgCatalog,
+    stmt: &CreateFunctionStmt,
+    attrs: &FunctionAttributes,
+    proc: &PgProc,
+    language: &str,
+) {
+    let security_definer = attrs.common.security.and_then(def_bool).unwrap_or(false);
+    let search_path = routine_search_path(interp, &attrs.common.set_items, None);
+    let source = if let Some(body) = stmt.sql_body.as_ref() {
+        Some(RoutineSource::SqlStandard(
+            super::function_body::atomic_body_statements(body),
+        ))
+    } else {
+        let text = attrs.as_clause.and_then(|de| {
+            match de.arg.as_ref()? {
+                ast::Node::List(l) => l.items.first().and_then(|n| node_string(n.as_ref())),
+                ast::Node::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            }
+            .map(str::to_owned)
+        });
+        match text {
+            Some(_) if language == "plpgsql" => interp
+                .statement_sql
+                .clone()
+                .map(|create_sql| RoutineSource::Plpgsql { create_sql }),
+            Some(text) => Some(RoutineSource::SqlText(text)),
+            None => None,
+        }
+    };
+    match source {
+        Some(source) => {
+            interp.routine_bodies.insert(
+                proc.oid,
+                RoutineBody {
+                    language: language.to_owned(),
+                    security_definer,
+                    search_path,
+                    source,
+                },
+            );
+        }
+        None => {
+            interp.routine_bodies.remove(&proc.oid);
+        }
+    }
+}
+
+/// The `search_path` a routine's `SET` clauses leave: the last `SET
+/// search_path` wins; `SET search_path TO DEFAULT` / `RESET search_path`
+/// remove it. `current` is what the routine had before (ALTER FUNCTION).
+fn routine_search_path(
+    interp: &PgCatalog,
+    set_items: &[&ast::Node],
+    current: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut path = current;
+    for item in set_items {
+        let ast::Node::VariableSetStmt(set) = item else {
+            continue;
+        };
+        let kind = set.kind;
+        // `RESET ALL` clears every setting, `search_path` included.
+        if kind == VariableSetKind::VarResetAll {
+            path = None;
+            continue;
+        }
+        if !set.name.eq_ignore_ascii_case("search_path") {
+            continue;
+        }
+        path = match kind {
+            VariableSetKind::VarSetValue => super::session::search_path_args(set),
+            VariableSetKind::VarSetCurrent => Some(interp.search_path_guc.effective().to_vec()),
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => None,
+            _ => path,
+        };
+    }
+    path
 }
 
 /// `typenameTypeId`: like LookupTypeName, but a shell type is an error.
@@ -1371,6 +1485,20 @@ pub fn alter_function(
     }
     let volatility = common.volatility();
     let strict = common.strict();
+    // What the routine's body sees, for the privilege check: its
+    // `SECURITY DEFINER` flag and its `SET search_path` are part of
+    // `proconfig` too.
+    let security = common.security.and_then(def_bool);
+    if let Some(mut body) = interp.routine_bodies.get(&oid).cloned() {
+        if let Some(security) = security {
+            body.security_definer = security;
+        }
+        if !deferred_sets.set_items.is_empty() {
+            body.search_path =
+                routine_search_path(interp, &deferred_sets.set_items, body.search_path);
+        }
+        interp.routine_bodies.insert(oid, body);
+    }
     if let Some(p) = interp.pg_proc.get_mut(&oid) {
         if let Some(v) = volatility {
             p.provolatile = v;

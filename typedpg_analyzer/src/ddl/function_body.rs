@@ -81,6 +81,7 @@ fn validate_sql_body(
     let namespace = || crate::expr::SqlFunctionParams {
         name: proc.proname.clone(),
         params: params.clone(),
+        locals: Vec::new(),
     };
     let param_types: Vec<PgTypeOid> = params.iter().map(|(_, t)| *t).collect();
     let mut last: Option<LastStatement> = None;
@@ -389,6 +390,15 @@ fn body_statements(stmt: &CreateFunctionStmt) -> Result<Option<(Vec<ast::Node>, 
     Ok(Some((statements, false)))
 }
 
+/// The statements of a SQL-standard (`BEGIN ATOMIC` / `RETURN`) body,
+/// parsed by `interpret_AS_clause`, with `RETURN expr` turned into
+/// `SELECT expr`.
+pub(crate) fn atomic_body_statements(body: &ast::Node) -> Vec<ast::Node> {
+    let mut out = Vec::new();
+    collect_atomic(body, &mut out);
+    out
+}
+
 fn collect_atomic(node: &ast::Node, out: &mut Vec<ast::Node>) {
     match node {
         ast::Node::List(l) => {
@@ -415,7 +425,7 @@ fn collect_atomic(node: &ast::Node, out: &mut Vec<ast::Node>) {
 }
 
 /// Input parameters `(name, type)` in call order (IN, INOUT, VARIADIC).
-fn input_params(proc: &PgProc) -> Vec<(String, PgTypeOid)> {
+pub(crate) fn input_params(proc: &PgProc) -> Vec<(String, PgTypeOid)> {
     if proc.proargmodes.is_empty() {
         return proc
             .proargtypes

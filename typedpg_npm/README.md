@@ -992,7 +992,7 @@ src/orders.ts:14:5: error: permission denied for table orders
   note: role app_role has no SELECT on public.orders
 ```
 
-The checks are PostgreSQL's own: USAGE on the schemas a query names, SELECT/INSERT/UPDATE/DELETE on its relations (per column where that is what the role is granted), EXECUTE on the routines it calls, and the sequence privileges of serial columns and `nextval`. Unqualified names resolve along the role's search path; views are read as their owner unless `security_invoker`. Only roles the migrations create can be checked — naming another is `role "x" does not exist (typedpg can check only the roles the migrations create)`. Trigger and function bodies, row-level security and `COPY` are not checked. In the multi-database form, `roles` goes in each `databases` entry.
+The checks are PostgreSQL's own: USAGE on the schemas a query names, SELECT/INSERT/UPDATE/DELETE on its relations (per column where that is what the role is granted), EXECUTE on the routines it calls, and the sequence privileges of serial columns and `nextval`. Unqualified names resolve along the role's search path; views are read as their owner unless `security_invoker`. The bodies of the triggers a statement fires and of the routines it calls are checked recursively: a body runs with the statement's role, or with its owner's under `SECURITY DEFINER`, and what it reads and writes must be allowed too — except dynamic SQL (`EXECUTE`) and statements typedpg can't analyze. Only roles the migrations create can be checked — naming another is `role "x" does not exist (typedpg can check only the roles the migrations create)`. Row-level security and `COPY` are not checked. In the multi-database form, `roles` goes in each `databases` entry.
 
 ## Limits
 

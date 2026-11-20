@@ -1003,6 +1003,7 @@ fn note_merge_privileges(
         match when.command_type {
             CmdType::CmdInsert => {
                 note_relation(table_oid, bits::INSERT);
+                crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_INSERT);
                 let names: Vec<String> = if when.target_list.is_empty() {
                     table_attrs
                         .iter()
@@ -1037,13 +1038,17 @@ fn note_merge_privileges(
             }
             CmdType::CmdUpdate => {
                 note_relation(table_oid, bits::UPDATE);
+                crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_UPDATE);
                 for t in &when.target_list {
                     if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
                         note_column(table_oid, &rt.name, ColumnAccess::Update);
                     }
                 }
             }
-            CmdType::CmdDelete => note_relation(table_oid, bits::DELETE),
+            CmdType::CmdDelete => {
+                note_relation(table_oid, bits::DELETE);
+                crate::privileges::note_write(table_oid, crate::ddl::triggers::TRIGGER_TYPE_DELETE);
+            }
             // DO NOTHING requires SELECT, so that the target relation is
             // never one with no privileges to check at all.
             CmdType::CmdNothing => note_relation(table_oid, bits::SELECT),

@@ -308,6 +308,12 @@ pub struct PgCatalog {
     /// resolve under settings of their own, so a call isn't read as its
     /// body ([`crate::expr::inline`]).
     pub(crate) procs_with_config: Shared<std::collections::HashSet<PgProcOid>>,
+    /// What the bodies of the routines the migrations create run with
+    /// (language, `SECURITY DEFINER`, `SET search_path`, source), for the
+    /// privilege check of a statement that calls them or fires them as
+    /// triggers. Seeded routines aren't listed: their bodies are the
+    /// bootstrap superuser's.
+    pub(crate) routine_bodies: Shared<HashMap<PgProcOid, crate::ddl::functions::RoutineBody>>,
     /// What each inlinable body resolves to (see
     /// [`crate::expr::inline::body_trust`]), worked out when first needed —
     /// with every routine it calls there, whatever order they were created
@@ -872,6 +878,7 @@ impl PgCatalog {
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),
+            routine_bodies: Shared::default(),
             inline_body_trust: Shared::default(),
             relation_checks: Default::default(),
             finite_param_types: Default::default(),
@@ -2385,6 +2392,7 @@ impl PgCatalog {
             .retain(|m| !(m.is_func && m.object == object && m.hard_owner.is_none()));
         self.inline_sql_bodies.remove(&oid);
         self.procs_with_config.remove(&oid);
+        self.routine_bodies.remove(&oid);
         self.inline_body_trust.remove(&oid);
         self.proc_default_procs.remove(&oid);
         self.sql_function_defs.remove(&oid);

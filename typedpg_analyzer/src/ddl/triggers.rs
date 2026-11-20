@@ -17,6 +17,8 @@ pub(crate) struct Trigger {
     pub(crate) oid: crate::oid::PgGenericOid,
     pub(crate) name: String,
     pub(crate) function: PgProcOid,
+    /// `pg_trigger.tgenabled`: when the trigger fires.
+    pub(crate) state: TriggerState,
     /// The `TRIGGER_TYPE_INSERT | _DELETE | _UPDATE | _TRUNCATE` bits of
     /// an `INSTEAD OF ... FOR EACH ROW` trigger, else 0 — what the
     /// relcache's `trig_*_instead_row` flags are made of.
@@ -39,6 +41,25 @@ pub(crate) struct Trigger {
     pub(crate) parent: Option<PgClassOid>,
 }
 
+/// `pg_trigger.tgenabled`: `O` origin (the default), `A` always, `R`
+/// replica, `D` disabled. An application's sessions run with
+/// `session_replication_role = origin`, so only the first two fire there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TriggerState {
+    Origin,
+    Always,
+    Replica,
+    Disabled,
+}
+
+impl TriggerState {
+    /// Whether the trigger fires in a session with the default
+    /// `session_replication_role = origin`.
+    pub(crate) fn fires(self) -> bool {
+        matches!(self, TriggerState::Origin | TriggerState::Always)
+    }
+}
+
 impl Trigger {
     /// The relation has an INSTEAD OF row trigger for this event
     /// (`TRIGGER_TYPE_INSERT` / `_UPDATE` / `_DELETE` bits).
@@ -58,6 +79,74 @@ const TRIGGER_TYPE_TRUNCATE: i32 = 1 << 5;
 const TRIGGER_TYPE_INSTEAD: i32 = 1 << 6;
 /// `TRIGGER_TYPE_AFTER` is no bit at all.
 const TRIGGER_TYPE_AFTER: i32 = 0;
+
+/// The word `pg_get_triggerdef` / the trigger note uses for an event bit.
+pub(crate) fn event_word(event_bit: i32) -> &'static str {
+    match event_bit {
+        TRIGGER_TYPE_INSERT => "INSERT",
+        TRIGGER_TYPE_UPDATE => "UPDATE",
+        TRIGGER_TYPE_DELETE => "DELETE",
+        _ => "TRUNCATE",
+    }
+}
+
+/// `EnableDisableTrigger` for `ALTER TABLE ... ENABLE / DISABLE TRIGGER
+/// name`: the trigger `name` of `relid` fires as `state` from now on — its
+/// clones on a partitioned table's partitions too, unless the command said
+/// `ONLY`.
+pub(crate) fn set_trigger_state(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &typedpg_pg_query::ast::AlterTableCmd,
+    state: TriggerState,
+) -> Result<(), DdlError> {
+    if !interp
+        .triggers
+        .get(&relid)
+        .is_some_and(|ts| ts.iter().any(|t| t.name == cmd.name))
+    {
+        return Err(DdlError::TypeNotFound(format!(
+            "trigger \"{}\" for table \"{}\" does not exist",
+            cmd.name,
+            interp
+                .pg_class
+                .get(&relid)
+                .map_or("", |c| c.relname.as_str())
+        )));
+    }
+    let partitioned = interp
+        .pg_class
+        .get(&relid)
+        .is_some_and(|c| c.relkind == RelKind::Partitioned);
+    let targets = if cmd.recurse && partitioned {
+        super::tables::inherit::all_inheritors(interp, relid)
+    } else {
+        vec![relid]
+    };
+    for rel in targets {
+        if let Some(triggers) = interp.triggers.get_mut(&rel) {
+            for trigger in triggers.iter_mut().filter(|t| t.name == cmd.name) {
+                trigger.state = state;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `EnableDisableTrigger` for `ENABLE / DISABLE TRIGGER ALL | USER`: every
+/// trigger of `relid` fires as `state`. The analyzer models no internal
+/// triggers, so ALL and USER are the same here.
+pub(crate) fn set_all_triggers_state(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    state: TriggerState,
+) {
+    if let Some(triggers) = interp.triggers.get_mut(&relid) {
+        for trigger in triggers.iter_mut() {
+            trigger.state = state;
+        }
+    }
+}
 
 /// CreateTriggerFiringOn: the WHEN condition is transformed as a boolean
 /// WHERE clause (EXPR_KIND_TRIGGER_WHEN) over the relation as `old` and
@@ -282,6 +371,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
         oid: crate::ddl::depend::PENDING_OID,
         name: stmt.trigname.clone(),
         function,
+        state: TriggerState::Origin,
         instead_row_events: if stmt.timing & TRIGGER_TYPE_INSTEAD != 0 && stmt.row {
             stmt.events
         } else {

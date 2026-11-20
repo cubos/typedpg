@@ -1430,3 +1430,804 @@ fn writes_through_a_view_run_its_query_only_when_pg_does() {
     assert!(e.starts_with("permission denied for table t"), "{e}");
     denied(&db, "qp_vwrite_app", "UPDATE v SET a = 1 WHERE id = 1");
 }
+
+// ─── Routine bodies (#269, step 4) ─────────────────────────────────────────
+
+#[test]
+fn trigger_body_writes_audit_table() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_trg_audit_app;
+         CREATE TABLE qp_trg_audit_t (id int, a int);
+         CREATE TABLE qp_trg_audit (id int, a int);
+         INSERT INTO qp_trg_audit_t VALUES (1, 1);
+         CREATE FUNCTION qp_trg_audit_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_trg_audit (id, a) VALUES (NEW.id, NEW.a);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_trg_audit_trg AFTER INSERT ON qp_trg_audit_t
+           FOR EACH ROW EXECUTE FUNCTION qp_trg_audit_fn();
+         GRANT SELECT, INSERT ON qp_trg_audit_t TO qp_trg_audit_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_trg_audit_app",
+        "INSERT INTO qp_trg_audit_t (id, a) VALUES (2, 2)",
+        "permission denied for table qp_trg_audit",
+    );
+    assert!(
+        e.contains("in trigger function public.qp_trg_audit_fn(), fired by INSERT on public.qp_trg_audit_t, run as role qp_trg_audit_app"),
+        "{e}"
+    );
+
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_trg_audit_ok_app;
+         CREATE TABLE qp_trg_audit_ok_t (id int, a int);
+         CREATE TABLE qp_trg_audit_ok (id int, a int);
+         CREATE FUNCTION qp_trg_audit_ok_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_trg_audit_ok (id, a) VALUES (NEW.id, NEW.a);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_trg_audit_ok_trg BEFORE INSERT ON qp_trg_audit_ok_t
+           FOR EACH ROW EXECUTE FUNCTION qp_trg_audit_ok_fn();
+         GRANT SELECT, INSERT ON qp_trg_audit_ok_t TO qp_trg_audit_ok_app;
+         GRANT INSERT ON qp_trg_audit_ok TO qp_trg_audit_ok_app;",
+    )]);
+    allowed(
+        &db,
+        "qp_trg_audit_ok_app",
+        "INSERT INTO qp_trg_audit_ok_t (id, a) VALUES (2, 2)",
+    );
+}
+
+#[test]
+fn security_definer_trigger_runs_as_its_owner() {
+    // Owned by the migrations' user (a superuser-equivalent): the body may
+    // write the audit table whatever the role.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_def_ok_app;
+         CREATE TABLE qp_def_ok_t (id int, a int);
+         CREATE TABLE qp_def_ok_audit (id int);
+         CREATE FUNCTION qp_def_ok_fn() RETURNS trigger LANGUAGE plpgsql
+             SECURITY DEFINER AS $$
+         BEGIN
+           INSERT INTO qp_def_ok_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_def_ok_trg AFTER INSERT ON qp_def_ok_t
+             FOR EACH ROW EXECUTE FUNCTION qp_def_ok_fn();
+         GRANT SELECT, INSERT ON qp_def_ok_t TO qp_def_ok_app;",
+    )]);
+    allowed(
+        &db,
+        "qp_def_ok_app",
+        "INSERT INTO qp_def_ok_t (id, a) VALUES (1, 1)",
+    );
+
+    // Owned by a role without INSERT on the audit table: the body is denied
+    // as that owner, and the note says so.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_def_bad_app;
+         CREATE ROLE qp_def_bad_owner;
+         CREATE TABLE qp_def_bad_t (id int, a int);
+         CREATE TABLE qp_def_bad_audit (id int);
+         CREATE FUNCTION qp_def_bad_fn() RETURNS trigger LANGUAGE plpgsql
+             SECURITY DEFINER AS $$
+         BEGIN
+           INSERT INTO qp_def_bad_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         ALTER FUNCTION qp_def_bad_fn() OWNER TO qp_def_bad_owner;
+         CREATE TRIGGER qp_def_bad_trg AFTER INSERT ON qp_def_bad_t
+             FOR EACH ROW EXECUTE FUNCTION qp_def_bad_fn();
+         GRANT SELECT, INSERT ON qp_def_bad_t TO qp_def_bad_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_def_bad_app",
+        "INSERT INTO qp_def_bad_t (id, a) VALUES (1, 1)",
+        "permission denied for table qp_def_bad_audit",
+    );
+    assert!(
+        e.contains(
+            "in trigger function public.qp_def_bad_fn(), fired by INSERT on public.qp_def_bad_t, \
+             run as its owner qp_def_bad_owner (SECURITY DEFINER)"
+        ),
+        "{e}"
+    );
+    // The statement itself is still the role's: dropping the trigger makes
+    // it allowed.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_def_bad2_app;
+         CREATE TABLE qp_def_bad2_t (id int, a int);
+         GRANT SELECT, INSERT ON qp_def_bad2_t TO qp_def_bad2_app;",
+    )]);
+    allowed(
+        &db,
+        "qp_def_bad2_app",
+        "INSERT INTO qp_def_bad2_t (id, a) VALUES (1, 1)",
+    );
+}
+
+#[test]
+fn statement_level_update_trigger_runs_even_for_no_rows() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_stmt_app;
+         CREATE TABLE qp_stmt_t (id int, a int);
+         CREATE TABLE qp_stmt_audit (n int);
+         CREATE FUNCTION qp_stmt_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_stmt_audit (n) VALUES (1);
+           RETURN NULL;
+         END $$;
+         CREATE TRIGGER qp_stmt_trg AFTER UPDATE ON qp_stmt_t
+             FOR EACH STATEMENT EXECUTE FUNCTION qp_stmt_fn();
+         GRANT SELECT, UPDATE ON qp_stmt_t TO qp_stmt_app;",
+    )]);
+    // The table is empty and the WHERE matches nothing; a statement trigger
+    // fires anyway.
+    denied_with(
+        &db,
+        "qp_stmt_app",
+        "UPDATE qp_stmt_t SET a = 1 WHERE false",
+        "permission denied for table qp_stmt_audit",
+    );
+}
+
+#[test]
+fn update_of_trigger_fires_only_for_named_columns() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_updof_app;
+         CREATE TABLE qp_updof_t (id int, a int, b int);
+         INSERT INTO qp_updof_t VALUES (1, 1, 1);
+         CREATE TABLE qp_updof_audit (id int);
+         CREATE FUNCTION qp_updof_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_updof_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_updof_trg BEFORE UPDATE OF b ON qp_updof_t
+             FOR EACH ROW EXECUTE FUNCTION qp_updof_fn();
+         GRANT SELECT, UPDATE (a, b) ON qp_updof_t TO qp_updof_app;",
+    )]);
+    allowed(&db, "qp_updof_app", "UPDATE qp_updof_t SET a = 2");
+    denied_with(
+        &db,
+        "qp_updof_app",
+        "UPDATE qp_updof_t SET b = 2",
+        "permission denied for table qp_updof_audit",
+    );
+}
+
+#[test]
+fn delete_trigger_runs() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_deltrg_app;
+         CREATE TABLE qp_del_t (id int, a int);
+         INSERT INTO qp_del_t VALUES (1, 1);
+         CREATE TABLE qp_del_audit (id int);
+         CREATE FUNCTION qp_del_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_del_audit (id) VALUES (OLD.id);
+           RETURN OLD;
+         END $$;
+         CREATE TRIGGER qp_del_trg AFTER DELETE ON qp_del_t
+             FOR EACH ROW EXECUTE FUNCTION qp_del_fn();
+         GRANT SELECT, DELETE ON qp_del_t TO qp_deltrg_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_deltrg_app",
+        "DELETE FROM qp_del_t",
+        "permission denied for table qp_del_audit",
+    );
+}
+
+#[test]
+fn on_conflict_do_update_fires_update_row_triggers() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_oc_app;
+         CREATE TABLE qp_oc_t (id int PRIMARY KEY, a int);
+         INSERT INTO qp_oc_t VALUES (1, 1);
+         CREATE TABLE qp_oc_audit (id int);
+         CREATE FUNCTION qp_oc_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_oc_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_oc_trg AFTER UPDATE ON qp_oc_t
+             FOR EACH ROW EXECUTE FUNCTION qp_oc_fn();
+         CREATE TRIGGER qp_oc_stmt AFTER UPDATE ON qp_oc_t
+             FOR EACH STATEMENT EXECUTE FUNCTION qp_oc_fn();
+         GRANT SELECT, INSERT, UPDATE ON qp_oc_t TO qp_oc_app;",
+    )]);
+    // DO NOTHING doesn't update a row.
+    allowed(
+        &db,
+        "qp_oc_app",
+        "INSERT INTO qp_oc_t (id, a) VALUES (1, 2) ON CONFLICT (id) DO NOTHING",
+    );
+    // DO UPDATE fires the row-level UPDATE trigger (not the statement-level
+    // one, whose body would be checked the same way but doesn't run).
+    denied_with(
+        &db,
+        "qp_oc_app",
+        "INSERT INTO qp_oc_t (id, a) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a",
+        "permission denied for table qp_oc_audit",
+    );
+}
+
+#[test]
+fn on_conflict_do_update_fires_statement_update_triggers() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_ocs_app;
+         CREATE TABLE qp_ocs_t (id int PRIMARY KEY, a int);
+         INSERT INTO qp_ocs_t VALUES (1, 1);
+         CREATE TABLE qp_ocs_audit (id int);
+         CREATE FUNCTION qp_ocs_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_ocs_audit (id) VALUES (1);
+           RETURN NULL;
+         END $$;
+         CREATE TRIGGER qp_ocs_trg AFTER UPDATE ON qp_ocs_t
+             FOR EACH STATEMENT EXECUTE FUNCTION qp_ocs_fn();
+         GRANT SELECT, INSERT, UPDATE ON qp_ocs_t TO qp_ocs_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_ocs_app",
+        "INSERT INTO qp_ocs_t (id, a) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a",
+        "permission denied for table qp_ocs_audit",
+    );
+}
+
+#[test]
+fn merge_actions_fire_their_triggers() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_mrgact_app;
+         CREATE TABLE qp_merge_t (id int PRIMARY KEY, a int);
+         CREATE TABLE qp_merge_src (id int, a int);
+         INSERT INTO qp_merge_t VALUES (1, 1);
+         INSERT INTO qp_merge_src VALUES (1, 2), (2, 2);
+         CREATE TABLE qp_merge_audit (id int);
+         CREATE FUNCTION qp_merge_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_merge_audit (id) VALUES (1);
+           RETURN NULL;
+         END $$;
+         CREATE TRIGGER qp_merge_upd AFTER UPDATE ON qp_merge_t
+             FOR EACH ROW EXECUTE FUNCTION qp_merge_fn();
+         CREATE TRIGGER qp_merge_ins AFTER INSERT ON qp_merge_t
+             FOR EACH ROW EXECUTE FUNCTION qp_merge_fn();
+         GRANT SELECT, INSERT, UPDATE, DELETE ON qp_merge_t TO qp_mrgact_app;
+         GRANT SELECT ON qp_merge_src TO qp_mrgact_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_mrgact_app",
+        "MERGE INTO qp_merge_t t USING qp_merge_src s ON t.id = s.id
+         WHEN MATCHED THEN UPDATE SET a = s.a
+         WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a)",
+        "permission denied for table qp_merge_audit",
+    );
+}
+
+#[test]
+fn instead_of_trigger_body_close_reads_write_tables() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_itb_app;
+         CREATE TABLE qp_itb_base (id int, a int);
+         CREATE TABLE qp_itb_audit (id int);
+         CREATE VIEW qp_itb_v AS SELECT id, a FROM qp_itb_base;
+         CREATE FUNCTION qp_itb_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_itb_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_itb_trg INSTEAD OF INSERT ON qp_itb_v
+             FOR EACH ROW EXECUTE FUNCTION qp_itb_fn();
+         GRANT SELECT, INSERT ON qp_itb_v TO qp_itb_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_itb_app",
+        "INSERT INTO qp_itb_v (id, a) VALUES (1, 1)",
+        "permission denied for table qp_itb_audit",
+    );
+    assert!(
+        e.contains("in trigger function public.qp_itb_fn(), fired by INSERT on public.qp_itb_v"),
+        "{e}"
+    );
+}
+
+#[test]
+fn auto_updatable_view_base_table_trigger_runs_as_the_caller() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_av_app;
+         CREATE TABLE qp_av_base (id int, a int);
+         CREATE TABLE qp_av_audit (id int);
+         CREATE VIEW qp_av_v AS SELECT id, a FROM qp_av_base;
+         CREATE FUNCTION qp_av_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_av_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_av_trg AFTER INSERT ON qp_av_base
+             FOR EACH ROW EXECUTE FUNCTION qp_av_fn();
+         GRANT SELECT, INSERT ON qp_av_v TO qp_av_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_av_app",
+        "INSERT INTO qp_av_v (id, a) VALUES (1, 1)",
+        "permission denied for table qp_av_audit",
+    );
+    assert!(
+        e.contains(
+            "in trigger function public.qp_av_fn(), fired by INSERT on public.qp_av_base, \
+             run as role qp_av_app"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
+fn trigger_body_resolves_new_old_and_local_variables() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_vars_app;
+         CREATE TABLE qp_vars_t (id int, a int);
+         INSERT INTO qp_vars_t VALUES (1, 1);
+         CREATE TABLE qp_vars_audit (id int, v int, old_id int);
+         CREATE FUNCTION qp_vars_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE
+           v int := 1;
+         BEGIN
+           v := NEW.id + v;
+           INSERT INTO qp_vars_audit (id, v, old_id)
+             VALUES (NEW.id, v, OLD.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_vars_trg BEFORE UPDATE ON qp_vars_t
+             FOR EACH ROW EXECUTE FUNCTION qp_vars_fn();
+         GRANT SELECT, UPDATE ON qp_vars_t TO qp_vars_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_vars_app",
+        "UPDATE qp_vars_t SET a = 2",
+        "permission denied for table qp_vars_audit",
+    );
+}
+
+#[test]
+fn trigger_calls_function_reading_protected_table() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_rec_app;
+         CREATE TABLE qp_rec_t (id int, a int);
+         CREATE TABLE qp_rec_secret (id int);
+         INSERT INTO qp_rec_secret VALUES (1);
+         CREATE FUNCTION qp_rec_read() RETURNS int LANGUAGE sql AS
+             'SELECT max(id) FROM qp_rec_secret';
+         CREATE FUNCTION qp_rec_trg_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           PERFORM qp_rec_read();
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_rec_trg AFTER INSERT ON qp_rec_t
+             FOR EACH ROW EXECUTE FUNCTION qp_rec_trg_fn();
+         GRANT SELECT, INSERT ON qp_rec_t TO qp_rec_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_rec_app",
+        "INSERT INTO qp_rec_t (id, a) VALUES (1, 1)",
+        "permission denied for table qp_rec_secret",
+    );
+    assert!(
+        e.contains(
+            "in function public.qp_rec_read(), called by trigger function public.qp_rec_trg_fn(), \
+             fired by INSERT on public.qp_rec_t, run as role qp_rec_app"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
+fn trigger_body_writes_table_with_its_own_trigger() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_nest_app;
+         CREATE TABLE qp_nest_t (id int, a int);
+         CREATE TABLE qp_nest_mid (id int);
+         CREATE TABLE qp_nest_audit (id int);
+         CREATE FUNCTION qp_nest_fn_a() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_nest_mid (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE FUNCTION qp_nest_fn_b() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_nest_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_nest_trg_a AFTER INSERT ON qp_nest_t
+             FOR EACH ROW EXECUTE FUNCTION qp_nest_fn_a();
+         CREATE TRIGGER qp_nest_trg_b AFTER INSERT ON qp_nest_mid
+             FOR EACH ROW EXECUTE FUNCTION qp_nest_fn_b();
+         GRANT SELECT, INSERT ON qp_nest_t, qp_nest_mid TO qp_nest_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_nest_app",
+        "INSERT INTO qp_nest_t (id, a) VALUES (1, 1)",
+        "permission denied for table qp_nest_audit",
+    );
+    assert!(
+        e.contains(
+            "in trigger function public.qp_nest_fn_b(), fired by INSERT on public.qp_nest_mid, \
+             called by trigger function public.qp_nest_fn_a()"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
+fn trigger_cycle_terminates() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_cycle_app;
+         CREATE TABLE qp_cycle_a (id int);
+         CREATE TABLE qp_cycle_b (id int);
+         CREATE FUNCTION qp_cycle_fn_a() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF pg_trigger_depth() > 3 THEN RETURN NEW; END IF;
+           INSERT INTO qp_cycle_b (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE FUNCTION qp_cycle_fn_b() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF pg_trigger_depth() > 3 THEN RETURN NEW; END IF;
+           INSERT INTO qp_cycle_a (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_cycle_trg_a AFTER INSERT ON qp_cycle_a
+             FOR EACH ROW EXECUTE FUNCTION qp_cycle_fn_a();
+         CREATE TRIGGER qp_cycle_trg_b AFTER INSERT ON qp_cycle_b
+             FOR EACH ROW EXECUTE FUNCTION qp_cycle_fn_b();
+         GRANT SELECT, INSERT ON qp_cycle_a, qp_cycle_b TO qp_cycle_app;",
+    )]);
+    allowed(
+        &db,
+        "qp_cycle_app",
+        "INSERT INTO qp_cycle_a (id) VALUES (1)",
+    );
+}
+
+#[test]
+fn disabled_triggers_do_not_run() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_dis_app;
+         CREATE TABLE qp_dis_t (id int, a int);
+         CREATE TABLE qp_dis_audit (id int);
+         CREATE FUNCTION qp_dis_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_dis_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_dis_trg AFTER INSERT ON qp_dis_t
+             FOR EACH ROW EXECUTE FUNCTION qp_dis_fn();
+         ALTER TABLE qp_dis_t DISABLE TRIGGER qp_dis_trg;
+         GRANT SELECT, INSERT ON qp_dis_t TO qp_dis_app;",
+    )]);
+    allowed(
+        &db,
+        "qp_dis_app",
+        "INSERT INTO qp_dis_t (id, a) VALUES (1, 1)",
+    );
+
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_dis_all_app;
+         CREATE TABLE qp_dis_all_t (id int, a int);
+         CREATE TABLE qp_dis_all_audit (id int);
+         CREATE FUNCTION qp_dis_all_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_dis_all_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_dis_all_trg AFTER INSERT ON qp_dis_all_t
+             FOR EACH ROW EXECUTE FUNCTION qp_dis_all_fn();
+         ALTER TABLE qp_dis_all_t DISABLE TRIGGER ALL;
+         GRANT SELECT, INSERT ON qp_dis_all_t TO qp_dis_all_app;",
+    )]);
+    allowed(
+        &db,
+        "qp_dis_all_app",
+        "INSERT INTO qp_dis_all_t (id, a) VALUES (1, 1)",
+    );
+
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_ena_app;
+         CREATE TABLE qp_ena_t (id int, a int);
+         CREATE TABLE qp_ena_audit (id int);
+         CREATE FUNCTION qp_ena_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_ena_audit (id) VALUES (NEW.id);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_ena_trg AFTER INSERT ON qp_ena_t
+             FOR EACH ROW EXECUTE FUNCTION qp_ena_fn();
+         ALTER TABLE qp_ena_t DISABLE TRIGGER qp_ena_trg;
+         ALTER TABLE qp_ena_t ENABLE TRIGGER qp_ena_trg;
+         GRANT SELECT, INSERT ON qp_ena_t TO qp_ena_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_ena_app",
+        "INSERT INTO qp_ena_t (id, a) VALUES (1, 1)",
+        "permission denied for table qp_ena_audit",
+    );
+}
+
+#[test]
+fn plpgsql_function_body_reads_protected_table() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_plpgsql_app;
+         CREATE TABLE qp_plpgsql_secret (id int);
+         INSERT INTO qp_plpgsql_secret VALUES (1);
+         CREATE FUNCTION qp_plpgsql_f(x int) RETURNS int LANGUAGE plpgsql AS $$
+         BEGIN
+           RETURN (SELECT count(*) FROM qp_plpgsql_secret WHERE id = x);
+         END $$;
+         GRANT EXECUTE ON FUNCTION qp_plpgsql_f(int) TO qp_plpgsql_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_plpgsql_app",
+        "SELECT qp_plpgsql_f(1)",
+        "permission denied for table qp_plpgsql_secret",
+    );
+    assert!(
+        e.contains("in function public.qp_plpgsql_f(integer), called by the statement, run as role qp_plpgsql_app"),
+        "{e}"
+    );
+}
+
+#[test]
+fn sql_function_body_reads_protected_table() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_sqlf_app;
+         CREATE TABLE qp_sqlf_secret (id int);
+         INSERT INTO qp_sqlf_secret VALUES (1);
+         CREATE FUNCTION qp_sqlf_f() RETURNS SETOF int LANGUAGE sql
+             SECURITY INVOKER AS 'SELECT id FROM qp_sqlf_secret';
+         GRANT EXECUTE ON FUNCTION qp_sqlf_f() TO qp_sqlf_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_sqlf_app",
+        "SELECT qp_sqlf_f()",
+        "permission denied for table qp_sqlf_secret",
+    );
+}
+
+#[test]
+fn inlined_sql_function_body_is_checked() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_inline_app;
+         CREATE TABLE qp_inline_secret (id int);
+         INSERT INTO qp_inline_secret VALUES (1);
+         CREATE FUNCTION qp_inline_f() RETURNS int LANGUAGE sql IMMUTABLE AS
+             'SELECT (SELECT max(id) FROM qp_inline_secret)';
+         GRANT EXECUTE ON FUNCTION qp_inline_f() TO qp_inline_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_inline_app",
+        "SELECT qp_inline_f()",
+        "permission denied for table qp_inline_secret",
+    );
+}
+
+#[test]
+fn function_set_search_path_decides_its_body_names() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_sp_app;
+         CREATE SCHEMA qp_sp_s;
+         CREATE TABLE qp_sp_s.qp_sp_secret (id int);
+         INSERT INTO qp_sp_s.qp_sp_secret VALUES (1);
+         CREATE FUNCTION qp_sp_f() RETURNS int LANGUAGE sql
+             SET search_path = qp_sp_s AS 'SELECT max(id) FROM qp_sp_secret';
+         GRANT USAGE ON SCHEMA qp_sp_s TO qp_sp_app;
+         GRANT EXECUTE ON FUNCTION qp_sp_f() TO qp_sp_app;",
+    )]);
+    denied_with(
+        &db,
+        "qp_sp_app",
+        "SELECT qp_sp_f()",
+        "permission denied for table qp_sp_secret",
+    );
+
+    // Granted, the name resolves and the body may read it.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_sp_ok_app;
+         CREATE SCHEMA qp_sp_ok_s;
+         CREATE TABLE qp_sp_ok_s.qp_sp_ok_secret (id int);
+         INSERT INTO qp_sp_ok_s.qp_sp_ok_secret VALUES (1);
+         CREATE FUNCTION qp_sp_ok_f() RETURNS int LANGUAGE sql
+             SET search_path = qp_sp_ok_s AS 'SELECT max(id) FROM qp_sp_ok_secret';
+         GRANT USAGE ON SCHEMA qp_sp_ok_s TO qp_sp_ok_app;
+         GRANT SELECT ON qp_sp_ok_s.qp_sp_ok_secret TO qp_sp_ok_app;
+         GRANT EXECUTE ON FUNCTION qp_sp_ok_f() TO qp_sp_ok_app;",
+    )]);
+    allowed(&db, "qp_sp_ok_app", "SELECT qp_sp_ok_f()");
+}
+
+#[test]
+fn dynamic_sql_in_a_body_is_skipped() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_dyn_app;
+         CREATE TABLE qp_dyn_secret (id int);
+         INSERT INTO qp_dyn_secret VALUES (1);
+         CREATE FUNCTION qp_dyn_f() RETURNS void LANGUAGE plpgsql AS $$
+         BEGIN
+           IF false THEN
+             EXECUTE 'SELECT * FROM qp_dyn_secret';
+           END IF;
+         END $$;
+         GRANT EXECUTE ON FUNCTION qp_dyn_f() TO qp_dyn_app;",
+    )]);
+    // The dynamic statement would read a protected table; it is skipped,
+    // and never runs.
+    allowed(&db, "qp_dyn_app", "SELECT qp_dyn_f()");
+}
+
+#[test]
+fn procedure_body_writes_protected_table() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_proc_app;
+         CREATE TABLE qp_proc_audit (id int);
+         CREATE PROCEDURE qp_proc_p() LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_proc_audit (id) VALUES (1);
+         END $$;
+         GRANT EXECUTE ON PROCEDURE qp_proc_p() TO qp_proc_app;",
+    )]);
+    let e = denied_with(
+        &db,
+        "qp_proc_app",
+        "CALL qp_proc_p()",
+        "permission denied for table qp_proc_audit",
+    );
+    assert!(
+        e.contains(
+            "in procedure public.qp_proc_p(), called by the statement, run as role qp_proc_app"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
+fn rendered_error_of_a_trigger_body_names_the_trigger() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_render_app;
+         CREATE TABLE qp_render_t (id int, a int);
+         CREATE TABLE qp_render_audit (id int, a int);
+         CREATE FUNCTION qp_render_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           INSERT INTO qp_render_audit (id, a) VALUES (NEW.id, NEW.a);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER qp_render_trg AFTER INSERT ON qp_render_t
+             FOR EACH ROW EXECUTE FUNCTION qp_render_fn();
+         GRANT SELECT, INSERT ON qp_render_t TO qp_render_app;",
+    )]);
+    let e = denied(
+        &db,
+        "qp_render_app",
+        "INSERT INTO qp_render_t (id, a) VALUES (1, 1)",
+    );
+    assert_eq!(
+        e,
+        "permission denied for table qp_render_audit\n  \
+         help: grant it in a migration: GRANT INSERT (id, a) ON public.qp_render_audit TO qp_render_app;\n  \
+         note: in trigger function public.qp_render_fn(), fired by INSERT on public.qp_render_t, run as role qp_render_app\n  \
+         note: role qp_render_app has no INSERT on column(s) id, a of public.qp_render_audit\n"
+    );
+}
+
+#[test]
+fn row_triggers_of_partitions_and_inheritance_children_fire() {
+    // A trigger made directly on a partition fires for the rows routed to
+    // it, even when the statement writes the partitioned parent.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_parttrg_app;
+         CREATE TABLE audit (note text);
+         CREATE TABLE p (k int, v text) PARTITION BY LIST (k);
+         CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1);
+         CREATE FUNCTION p1_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             INSERT INTO audit (note) VALUES (NEW.v);
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER p1_audit BEFORE INSERT ON p1 FOR EACH ROW EXECUTE FUNCTION p1_audit();
+         GRANT INSERT ON p TO qp_parttrg_app;",
+    )]);
+    let e = denied(
+        &db,
+        "qp_parttrg_app",
+        "INSERT INTO p (k, v) VALUES (1, 'x')",
+    );
+    assert!(e.starts_with("permission denied for table audit"), "{e}");
+
+    // An UPDATE of an inheritance parent reaches its children's rows, and
+    // their row triggers.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_inhtrg_app;
+         CREATE TABLE audit (note text);
+         CREATE TABLE parent (id int, v text);
+         CREATE TABLE child () INHERITS (parent);
+         INSERT INTO child VALUES (1, 'a');
+         CREATE FUNCTION child_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             INSERT INTO audit (note) VALUES (OLD.v);
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER child_audit BEFORE UPDATE ON child FOR EACH ROW EXECUTE FUNCTION child_audit();
+         GRANT SELECT, UPDATE ON parent TO qp_inhtrg_app;",
+    )]);
+    let e = denied(
+        &db,
+        "qp_inhtrg_app",
+        "UPDATE parent SET v = 'b' WHERE id = 1",
+    );
+    assert!(e.starts_with("permission denied for table audit"), "{e}");
+    // An INSERT into the parent stays in the parent.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_inhtrg_ins_app;
+         CREATE TABLE audit (note text);
+         CREATE TABLE parent (id int, v text);
+         CREATE TABLE child () INHERITS (parent);
+         CREATE FUNCTION child_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             INSERT INTO audit (note) VALUES (NEW.v);
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER child_audit BEFORE INSERT ON child FOR EACH ROW EXECUTE FUNCTION child_audit();
+         GRANT INSERT ON parent TO qp_inhtrg_ins_app;",
+    )]);
+    allowed(
+        &db,
+        "qp_inhtrg_ins_app",
+        "INSERT INTO parent (id, v) VALUES (1, 'x')",
+    );
+}
