@@ -271,6 +271,9 @@ impl AclObjectKind {
     }
 }
 
+/// `pg_default_acl`'s key: `(defaclrole, defaclnamespace, defaclobjtype)`.
+type DefaultAclKey = (RoleId, Option<PgNamespaceOid>, DefaultAclClass);
+
 /// The object kinds `ALTER DEFAULT PRIVILEGES` has (`defaclobjtype`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum DefaultAclClass {
@@ -304,6 +307,18 @@ impl DefaultAclClass {
             DefaultAclClass::Schema => AclObjectKind::Schema,
         }
     }
+
+    /// The `pg_default_acl.defaclobjtype` letter of the class.
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn objtype(self) -> char {
+        match self {
+            DefaultAclClass::Table => 'r',
+            DefaultAclClass::Sequence => 'S',
+            DefaultAclClass::Function => 'f',
+            DefaultAclClass::Type => 'T',
+            DefaultAclClass::Schema => 'n',
+        }
+    }
 }
 
 /// An ACL's grantee: `PUBLIC` (`ACL_ID_PUBLIC`, grantee 0) or one role.
@@ -325,6 +340,20 @@ pub(crate) struct AclItem {
 impl AclItem {
     fn same_entry(&self, other: &AclItem) -> bool {
         self.grantee == other.grantee && self.grantor == other.grantor
+    }
+
+    /// The privileges the entry carries, each with whether it also carries
+    /// that privilege's grant option, in PG's `aclexplode` shape.
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn exploded(&self) -> Vec<(&'static str, bool)> {
+        let mut out = Vec::new();
+        for bit in 0..16 {
+            let mask = 1 << bit;
+            if self.privileges & mask != 0 {
+                out.push((privilege_name(mask), self.grant_options & mask != 0));
+            }
+        }
+        out
     }
 }
 
@@ -483,8 +512,8 @@ fn recursive_revoke(
 }
 
 /// The grant options `role` holds over `bits` in `acl` (PG's `aclmask` of
-/// `ACL_GRANT_OPTION_FOR(bits)`): the owner and a superuser implicitly hold
-/// every option.
+/// `ACL_GRANT_OPTION_FOR(bits)`): the owner — or a role with its privileges
+/// (`has_privs_of_role`) — and a superuser implicitly hold every option.
 fn grant_options_held(
     db: &PgCatalog,
     role: RoleId,
@@ -492,7 +521,10 @@ fn grant_options_held(
     acl: &[AclItem],
     bits: u32,
 ) -> u32 {
-    if role == owner || db.roles.is_superuser(role) {
+    if bits == 0 {
+        return 0;
+    }
+    if db.roles.has_privs_of_role(role, owner) || db.roles.is_superuser(role) {
         return bits;
     }
     let mut result = 0;
@@ -506,6 +538,60 @@ fn grant_options_held(
         }
     }
     result
+}
+
+/// `aclmask_direct` over grant options: only the entries granted directly to
+/// `role` count; the owner implicitly holds every option.
+fn grant_options_direct(role: RoleId, owner: RoleId, acl: &[AclItem], bits: u32) -> u32 {
+    if bits == 0 {
+        return 0;
+    }
+    if role == owner {
+        return bits;
+    }
+    let mut result = 0;
+    for item in acl {
+        if item.grantee == Grantee::Role(role) {
+            result |= item.grant_options & bits;
+        }
+    }
+    result
+}
+
+/// `select_best_grantor` (acl.c): the role the GRANT / REVOKE is recorded
+/// as made by, and the grant options it holds over it. The owner and a
+/// superuser act as the owner; otherwise the first role in the current
+/// role's inheritable membership chain (the role itself first, closest
+/// ancestors first) that directly holds every requested grant option — or,
+/// failing that, the one holding the most of them.
+fn select_best_grantor(
+    db: &PgCatalog,
+    role: RoleId,
+    acl: &[AclItem],
+    owner: RoleId,
+    privileges: u32,
+) -> (RoleId, u32) {
+    if role == owner || db.roles.is_superuser(role) {
+        return (owner, privileges);
+    }
+    let mut grantor = role;
+    let mut grant_options = 0;
+    let mut nrights = 0;
+    for other in db.roles.roles_with_privs_of(role) {
+        let other_privs = grant_options_direct(other, owner, acl, privileges);
+        if other_privs == privileges {
+            return (other, other_privs);
+        }
+        if other_privs != 0 {
+            let n = other_privs.count_ones();
+            if n > nrights {
+                grantor = other;
+                grant_options = other_privs;
+                nrights = n;
+            }
+        }
+    }
+    (grantor, grant_options)
 }
 
 /// `aclmask` of plain privileges (`pg_class_aclmask` & co.'s core): the ACL
@@ -559,6 +645,9 @@ pub(crate) struct Acls {
     columns: HashMap<(PgClassOid, i16), Vec<AclItem>>,
     /// `pg_default_acl`: `(defaclrole, defaclnamespace, defaclobjtype)`.
     defaults: HashMap<(RoleId, Option<PgNamespaceOid>, DefaultAclClass), Vec<AclItem>>,
+    /// The `pg_default_acl` row's OID per entry, which orders the dependency
+    /// DETAIL lines a DROP ROLE reports (PG reports by dependent object OID).
+    default_oids: HashMap<(RoleId, Option<PgNamespaceOid>, DefaultAclClass), u32>,
 }
 
 impl Acls {
@@ -575,6 +664,8 @@ impl Acls {
     /// entries with it (`pg_default_acl` depends on the namespace).
     pub(crate) fn forget_schema_defaults(&mut self, schema: PgNamespaceOid) {
         self.defaults.retain(|(_, ns, _), _| *ns != Some(schema));
+        self.default_oids
+            .retain(|(_, ns, _), _| *ns != Some(schema));
     }
 
     pub(crate) fn forget_column(&mut self, relid: PgClassOid, attnum: i16) {
@@ -583,40 +674,7 @@ impl Acls {
 
     pub(crate) fn forget_role(&mut self, role: RoleId) {
         self.defaults.retain(|(owner, ..), _| *owner != role);
-    }
-
-    /// Whether `role` owns anything (an object, or default privileges).
-    pub(crate) fn owns_anything(&self, role: RoleId) -> bool {
-        self.owners.values().any(|&o| o == role) || self.defaults.keys().any(|k| k.0 == role)
-    }
-
-    /// Whether a stored ACL mentions `role` as grantee or grantor, or as the
-    /// owner of default privileges (`pg_shdepend`'s ACL dependencies).
-    pub(crate) fn mentions_role(&self, role: RoleId) -> bool {
-        let owner_of = |object: AclObject| self.owners.get(&object).copied();
-        for (object, acl) in &self.items {
-            let owner = owner_of(*object);
-            if acl.iter().any(|item| {
-                (item.grantee == Grantee::Role(role) || item.grantor == role) && owner != Some(role)
-            }) {
-                return true;
-            }
-        }
-        for ((relid, _), acl) in &self.columns {
-            let owner = owner_of(AclObject::Relation(*relid));
-            if acl.iter().any(|item| {
-                (item.grantee == Grantee::Role(role) || item.grantor == role) && owner != Some(role)
-            }) {
-                return true;
-            }
-        }
-        self.defaults.iter().any(|(key, acl)| {
-            key.0 == role
-                || acl.iter().any(|item| {
-                    (item.grantee == Grantee::Role(role) || item.grantor == role)
-                        && item.grantor != key.0
-                })
-        })
+        self.default_oids.retain(|(owner, ..), _| *owner != role);
     }
 
     /// `REASSIGN OWNED` of `old` to `new`: every object `old` owns changes
@@ -680,10 +738,21 @@ impl Acls {
         if global.is_none() && per_schema.is_none() {
             return None;
         }
+        // `get_user_default_acl`: a global entry replaces the hard-wired
+        // default; `aclmerge` returns NULL when both sides are empty, so an
+        // empty global entry with no per-schema one changes nothing, and one
+        // with a per-schema entry merges only that entry.
         let mut acl = global
             .cloned()
             .unwrap_or_else(|| acldefault(class.kind(), owner));
-        if let Some(per_schema) = per_schema {
+        let merged: Option<Vec<AclItem>> = if acl.is_empty() {
+            Some(per_schema.cloned()?)
+        } else {
+            None
+        };
+        if let Some(merged) = merged {
+            acl = merged;
+        } else if let Some(per_schema) = per_schema {
             for item in per_schema {
                 let modification = AclItem {
                     grantee: item.grantee,
@@ -725,6 +794,22 @@ impl Acls {
             self.defaults.insert((owner, schema, class), acl);
         }
     }
+
+    /// The stored `pg_default_acl` entries, for the `pg_sanity` oracle.
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn default_entries(
+        &self,
+    ) -> Vec<(
+        RoleId,
+        Option<PgNamespaceOid>,
+        DefaultAclClass,
+        Vec<AclItem>,
+    )> {
+        self.defaults
+            .iter()
+            .map(|(&(role, namespace, class), acl)| (role, namespace, class, acl.clone()))
+            .collect()
+    }
 }
 
 /// `aclmerge`'s inner `aclupdate` with `ACL_MODECHG_ADD`: it never loses
@@ -754,15 +839,16 @@ fn acl_update_unchecked(acl: &[AclItem], modification: &AclItem) -> Vec<AclItem>
 impl PgCatalog {
     /// The owner of an ACL-carrying object: recorded when the migrations
     /// created (or re-owned) it; else the bootstrap superuser for the seed's
-    /// built-ins, and the migrations' user for anything else.
+    /// built-ins, and the migrations' user (the same real role, recorded as
+    /// the bootstrap) for anything else.
     pub(crate) fn owner_of(&self, object: AclObject) -> RoleId {
         if let Some(&owner) = self.acls.owners.get(&object) {
-            return owner;
+            return self.roles.canonical(owner);
         }
         if object.oid().get() < self.seed_oid_end {
             self.roles.bootstrap
         } else {
-            self.roles.migrations_user
+            self.roles.canonical(self.roles.migrations_user)
         }
     }
 
@@ -785,6 +871,7 @@ impl PgCatalog {
     /// Record a new object's owner (and, when the role has default
     /// privileges for its class, its initial ACL).
     pub(crate) fn set_object_owner(&mut self, object: AclObject, owner: RoleId) {
+        let owner = self.roles.canonical(owner);
         self.acls.owners.insert(object, owner);
     }
 
@@ -799,6 +886,7 @@ impl PgCatalog {
         schema: Option<PgNamespaceOid>,
         class: DefaultAclClass,
     ) {
+        let owner = self.roles.canonical(owner);
         self.acls.owners.insert(object, owner);
         if let Some(acl) = self.acls.default_acl(owner, schema, class) {
             self.acls.items.insert(object, acl);
@@ -809,12 +897,14 @@ impl PgCatalog {
     /// owned by its parent's owner, without default privileges of its own
     /// (`TypeCreate`'s `isDependentType`, `index_create`'s owner).
     pub(crate) fn dependent_object_created(&mut self, object: AclObject, owner: RoleId) {
+        let owner = self.roles.canonical(owner);
         self.acls.owners.insert(object, owner);
     }
 
     /// `ALTER ... OWNER TO` of one object: `ATExecChangeOwner` /
     /// `AlterObjectOwnerInternal`, with `aclnewowner`.
     pub(crate) fn change_object_owner(&mut self, object: AclObject, new_owner: RoleId) {
+        let new_owner = self.roles.canonical(new_owner);
         let old_owner = self.owner_of(object);
         if old_owner == new_owner {
             return;
@@ -928,6 +1018,7 @@ pub(crate) fn schema_created(
     owner: RoleId,
     is_temp: bool,
 ) {
+    let owner = db.roles.canonical(owner);
     db.acls.items.remove(&AclObject::Schema(nsoid));
     db.acls.owners.insert(AclObject::Schema(nsoid), owner);
     if is_temp {
@@ -942,6 +1033,7 @@ pub(crate) fn schema_created(
 /// have no `ALTER DEFAULT PRIVILEGES` class; their ACL stays NULL
 /// (`acldefault`'s PUBLIC USAGE).
 pub(crate) fn language_created(db: &mut PgCatalog, lang: PgLanguageOid, owner: RoleId) {
+    let owner = db.roles.canonical(owner);
     db.acls.owners.insert(AclObject::Language(lang), owner);
 }
 
@@ -1015,7 +1107,8 @@ fn check_privileges<'a>(
 }
 
 /// Resolve the GRANT's grantees (`get_rolespec_oid`): PUBLIC or a role,
-/// interned as external if the catalog didn't know it.
+/// interned as external if the catalog didn't know it. `CURRENT_USER` is the
+/// migrations' user, recorded as the bootstrap superuser (the same role).
 fn resolve_grantees(
     interp: &mut PgCatalog,
     grantees: &[Option<typedpg_pg_query::ast::Node>],
@@ -1033,7 +1126,11 @@ fn resolve_grantees(
                     rs.rolename
                 )));
             }
-            _ => out.push(Grantee::Role(resolve_role_spec(interp, rs)?)),
+            _ => {
+                let role = resolve_role_spec(interp, rs)?;
+                let role = interp.roles.canonical(role);
+                out.push(Grantee::Role(role));
+            }
         }
     }
     Ok(out)
@@ -1060,6 +1157,17 @@ enum Target {
 }
 
 pub fn grant(interp: &mut PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
+    // ExecuteGrantStmt: `GRANTED BY` is only for SQL compatibility — the
+    // grantor must be the current user.
+    if let Some(spec) = stmt.grantor.as_ref() {
+        let grantor = resolve_role_spec(interp, spec)?;
+        let current = current_role(interp);
+        if !interp.roles.same_real_role(grantor, current) {
+            return Err(DdlError::UnsupportedDdl(
+                "grantor must be current user".into(),
+            ));
+        }
+    }
     let targtype = stmt.targtype;
     let objtype = stmt.objtype;
     // The target objects (objectNamesToOids / objectsInSchemaToOids).
@@ -1412,24 +1520,28 @@ fn apply_target_grant(
     };
     let kind = object.kind(interp);
     // `GRANT ALL ON TABLE seq` means the sequence's rights.
-    let mask = if privileges.all {
+    let mut mask = if privileges.all {
         kind.all_rights()
     } else {
         privileges.mask
     };
-    let owner = interp.owner_of(object);
-    // select_best_grantor: the owner (a superuser, or a role with the owner's
-    // privileges) grants as the owner; another grantor grants as itself.
-    let grantor = if current == owner
-        || interp.roles.is_superuser(current)
-        || interp.roles.has_privs_of_role(current, owner)
+    // `GRANT ... ON TABLE` may name a sequence: PG keeps only the
+    // sequence's privileges and warns (`ExecGrant_Relation`).
+    if let Target::Relation(relid) = target
+        && interp.pg_class.get(relid).map(|c| c.relkind) == Some(RelKind::Sequence)
     {
-        owner
-    } else {
-        current
-    };
-    if mask != 0 {
-        let old_acl = interp.acl_of(object);
+        mask &= bits::SEQUENCE;
+    }
+    let owner = interp.owner_of(object);
+    let old_acl = interp.acl_of(object);
+    // select_best_grantor: the owner, a superuser or a role with the owner's
+    // privileges grants as the owner; otherwise a role that holds the
+    // requested grant options (directly, or for an inherited role) — and the
+    // privileges the grantor holds no options for are not granted / revoked
+    // (`restrict_and_check_grant`).
+    let (grantor, available) = select_best_grantor(interp, current, &old_acl, owner, mask);
+    let relation_mask = mask & available;
+    if relation_mask != 0 {
         let new_acl = merge_acl_with_grant(
             interp,
             &old_acl,
@@ -1437,55 +1549,69 @@ fn apply_target_grant(
             stmt.grant_option,
             behavior,
             grantees,
-            mask,
+            relation_mask,
             grantor,
             owner,
         )?;
         interp.acls.items.insert(object, new_acl);
     }
-    // Column privileges: explicit lists, and a table-level REVOKE's implicit
-    // revoke (`ExecGrant_Relation`, the SQL standard's rule).
+    // Column privileges: the explicit lists, and a table-level REVOKE's
+    // implicit revoke (`ExecGrant_Relation`, the SQL standard's rule). PG
+    // expands the requested column bits before `restrict_and_check_grant`
+    // touches the relation-level mask, and each column's grantor comes from
+    // the combined table + column ACLs (`ExecGrant_Attribute`), so the
+    // relation-level restriction must not gate them.
     if let Target::Relation(relid) = target {
+        let mut column_privileges: Vec<(i16, u32)> = Vec::new();
         for (mask, columns) in &privileges.columns {
             let mask = mask.unwrap_or(bits::COLUMN);
             for column in columns {
                 let Some(attnum) = column_attnum(interp, *relid, column) else {
                     continue;
                 };
-                apply_column_grant(
-                    interp, *relid, attnum, mask, grantees, stmt, behavior, grantor, owner,
-                )?;
+                match column_privileges.iter_mut().find(|(n, _)| *n == attnum) {
+                    Some((_, granted)) => *granted |= mask,
+                    None => column_privileges.push((attnum, mask)),
+                }
             }
         }
         if !stmt.is_grant {
+            // `expand_all_col_privileges`: every column of the relation
+            // (system columns included — but a view has none).
             let column_mask = mask & bits::COLUMN;
             if column_mask != 0 {
-                let mut attnums: Vec<i16> = interp
-                    .attributes_of(*relid)
-                    .iter()
-                    .map(|a| a.attnum)
-                    .collect();
-                attnums.extend(crate::pg_catalog::SYSTEM_COLUMNS.iter().map(|(_, _, n)| *n));
-                for attnum in attnums {
-                    apply_column_grant(
-                        interp,
-                        *relid,
-                        attnum,
-                        column_mask,
-                        grantees,
-                        stmt,
-                        behavior,
-                        grantor,
-                        owner,
-                    )?;
+                for attnum in relation_attnums(interp, *relid) {
+                    match column_privileges.iter_mut().find(|(n, _)| *n == attnum) {
+                        Some((_, granted)) => *granted |= column_mask,
+                        None => column_privileges.push((attnum, column_mask)),
+                    }
                 }
             }
+        }
+        column_privileges.sort_by_key(|(attnum, _)| *attnum);
+        for (attnum, column_mask) in column_privileges {
+            apply_column_grant(
+                interp,
+                *relid,
+                attnum,
+                column_mask,
+                grantees,
+                stmt.is_grant,
+                stmt.grant_option,
+                behavior,
+                owner,
+                &old_acl,
+            )?;
         }
     }
     Ok(())
 }
 
-/// `ExecGrant_Attribute` for one column.
+/// `ExecGrant_Attribute` for one column. The grantor is selected from the
+/// relation's and the column's combined ACLs (`select_best_grantor`), as PG
+/// does for both explicit column grants and a table-level REVOKE's implicit
+/// column revoke. `table_acl` is the relation's ACL before this statement
+/// changed it, which PG's `ExecGrant_Attribute` also searches.
 #[allow(clippy::too_many_arguments)]
 fn apply_column_grant(
     interp: &mut PgCatalog,
@@ -1493,17 +1619,26 @@ fn apply_column_grant(
     attnum: i16,
     privileges: u32,
     grantees: &[Grantee],
-    stmt: &GrantStmt,
+    is_grant: bool,
+    grant_option: bool,
     behavior: DropBehavior,
-    grantor: RoleId,
     owner: RoleId,
+    table_acl: &[AclItem],
 ) -> Result<(), DdlError> {
     let old_acl = interp.column_acl_of(relid, attnum);
+    let current = current_role(interp);
+    let mut merged = table_acl.to_vec();
+    merged.extend(old_acl.iter().copied());
+    let (grantor, available) = select_best_grantor(interp, current, &merged, owner, privileges);
+    let privileges = privileges & available;
+    if privileges == 0 {
+        return Ok(());
+    }
     let new_acl = merge_acl_with_grant(
         interp,
         &old_acl,
-        stmt.is_grant,
-        stmt.grant_option,
+        is_grant,
+        grant_option,
         behavior,
         grantees,
         privileges,
@@ -1637,21 +1772,28 @@ pub fn alter_default_privileges(
         schemas.iter().map(|&ns| Some(ns)).collect()
     };
     for role in roles {
+        // The migrations' user is the bootstrap superuser: its default
+        // privileges are the bootstrap's (`FOR ROLE postgres` and no FOR
+        // ROLE name the same row), and bootstrap-owned objects such as range
+        // constructors take them.
+        let role = interp.roles.canonical(role);
         for schema in &schema_targets {
+            let key = (role, *schema, class);
             // A global entry starts from the hard-wired default, a
             // per-schema one from an empty ACL (SetDefaultACL).
-            let old_acl = interp
-                .acls
-                .defaults
-                .get(&(role, *schema, class))
-                .cloned()
-                .unwrap_or_else(|| {
-                    if schema.is_none() {
-                        acldefault(class.kind(), role)
-                    } else {
-                        Vec::new()
-                    }
-                });
+            let old_acl = interp.acls.defaults.get(&key).cloned().unwrap_or_else(|| {
+                if schema.is_none() {
+                    acldefault(class.kind(), role)
+                } else {
+                    Vec::new()
+                }
+            });
+            // A new `pg_default_acl` row gets a catalog OID when the entry
+            // is first stored (SetDefaultACL inserts it).
+            if !interp.acls.defaults.contains_key(&key) {
+                let oid = interp.alloc_oid()?.get();
+                interp.acls.default_oids.insert(key, oid);
+            }
             let new_acl = merge_acl_with_grant(
                 interp,
                 &old_acl,
@@ -1664,6 +1806,11 @@ pub fn alter_default_privileges(
                 role,
             )?;
             interp.acls.set_default_acl(role, *schema, class, new_acl);
+            // SetDefaultACL deletes an entry that ends up equal to the
+            // hard-wired default.
+            if !interp.acls.defaults.contains_key(&key) {
+                interp.acls.default_oids.remove(&key);
+            }
         }
     }
     Ok(())
@@ -1671,31 +1818,274 @@ pub fn alter_default_privileges(
 
 // ─── DROP OWNED BY ──────────────────────────────────────────────────────────
 
+/// `SetDefaultACL`'s REVOKE ALL: remove the entry `role` holds from
+/// `grantor` (always the default ACL's owning role), with what it granted
+/// through those options (`aclupdate` with `DROP_CASCADE`).
+fn revoke_all_from(
+    db: &PgCatalog,
+    acl: &[AclItem],
+    role: RoleId,
+    grantor: RoleId,
+    owner: RoleId,
+) -> Vec<AclItem> {
+    if role == owner {
+        return acl.to_vec();
+    }
+    let mut new_acl = acl.to_vec();
+    let Some(at) = new_acl
+        .iter()
+        .position(|i| i.grantee == Grantee::Role(role) && i.grantor == grantor)
+    else {
+        return new_acl;
+    };
+    let item = new_acl[at];
+    let lost = item.grant_options;
+    new_acl[at].privileges = 0;
+    new_acl[at].grant_options = 0;
+    new_acl.remove(at);
+    if lost != 0 {
+        new_acl = recursive_revoke(
+            db,
+            new_acl,
+            Grantee::Role(role),
+            lost,
+            owner,
+            DropBehavior::DropCascade,
+        )
+        .unwrap_or_else(|_| Vec::new());
+    }
+    new_acl
+}
+
+/// `RemoveRoleFromObjectACL`'s REVOKE ALL for one object, run as the
+/// current user: `select_best_grantor` picks the grantor and the grant
+/// options actually held, so only the owner (or a superuser, who acts as the
+/// owner) revokes the owner's entries; a non-superuser's `DROP OWNED` leaves
+/// them in place (`ExecGrant_*`). A table's implicit column revoke follows
+/// the relation-level one (`ExecGrant_Relation` → `ExecGrant_Attribute`),
+/// with each column selecting its own grantor from the combined ACLs.
+fn revoke_all_from_object(
+    interp: &mut PgCatalog,
+    object: AclObject,
+    role: RoleId,
+    current: RoleId,
+) -> Result<(), DdlError> {
+    // The owner's own entry is an owner dependency, not an ACL one: PG
+    // records no ACL dependency for it, so `RemoveRoleFromObjectACL` isn't
+    // called for it.
+    let owner = interp.owner_of(object);
+    if owner == role {
+        return Ok(());
+    }
+    let kind = object.kind(interp);
+    let old_acl = interp.acl_of(object);
+    let (grantor, available) =
+        select_best_grantor(interp, current, &old_acl, owner, kind.all_rights());
+    let privileges = kind.all_rights() & available;
+    if privileges != 0 {
+        let new_acl = merge_acl_with_grant(
+            interp,
+            &old_acl,
+            false,
+            false,
+            DropBehavior::DropCascade,
+            &[Grantee::Role(role)],
+            privileges,
+            grantor,
+            owner,
+        )?;
+        // An explicit ACL that ends up empty stays explicit: it must not
+        // fall back to the object's default ACL (which may grant PUBLIC
+        // more than the object's ACL does). An object with no ACL falls
+        // back only while the result still is its default.
+        let stored = interp.acls.explicit(object).is_some();
+        let default_acl = acldefault(kind, owner);
+        if stored || new_acl.is_empty() || new_acl != default_acl {
+            interp.acls.items.insert(object, new_acl);
+        } else {
+            interp.acls.items.remove(&object);
+        }
+    }
+    if let AclObject::Relation(relid) = object {
+        // `expand_all_col_privileges`: every column of the relation takes
+        // the requested column bits, before any restriction.
+        let column_mask = kind.all_rights() & bits::COLUMN;
+        if column_mask != 0 {
+            for attnum in relation_attnums(interp, relid) {
+                apply_column_grant(
+                    interp,
+                    relid,
+                    attnum,
+                    column_mask,
+                    &[Grantee::Role(role)],
+                    false,
+                    false,
+                    DropBehavior::DropCascade,
+                    owner,
+                    &old_acl,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The columns `expand_all_col_privileges` walks: every attribute, system
+/// columns included — except that a view has no system columns at all.
+fn relation_attnums(interp: &PgCatalog, relid: PgClassOid) -> Vec<i16> {
+    let is_view = interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::View);
+    let mut attnums: Vec<i16> = interp
+        .attributes_of(relid)
+        .iter()
+        .map(|a| a.attnum)
+        .filter(|n| !is_view || *n > 0)
+        .collect();
+    if !is_view {
+        attnums.extend(crate::pg_catalog::SYSTEM_COLUMNS.iter().map(|(_, _, n)| *n));
+    }
+    attnums
+}
+
+/// Whether `acl` mentions `role` as grantee or grantor.
+fn acl_mentions(acl: &[AclItem], role: RoleId) -> bool {
+    acl.iter()
+        .any(|item| item.grantee == Grantee::Role(role) || item.grantor == role)
+}
+
+/// The objects `DROP OWNED BY role` deletes and the RESTRICT check
+/// considers: the role's relations, functions, types and schemas
+/// (`shdepDropOwned`'s `performMultipleDeletions` set). Several roles'
+/// sets are checked together.
+pub(crate) fn owned_targets(
+    interp: &PgCatalog,
+    role: RoleId,
+    targets: &mut Vec<super::depend::ObjectAddress>,
+) {
+    let role = interp.roles.canonical(role);
+    let mut relations: Vec<PgClassOid> = interp
+        .pg_class
+        .values()
+        .filter(|c| interp.owner_of(AclObject::Relation(c.oid)) == role)
+        .filter(|c| {
+            matches!(
+                c.relkind,
+                RelKind::Table
+                    | RelKind::Partitioned
+                    | RelKind::View
+                    | RelKind::MaterializedView
+                    | RelKind::ForeignTable
+                    | RelKind::Sequence
+            )
+        })
+        .map(|c| c.oid)
+        .collect();
+    relations.sort();
+    targets.extend(
+        relations
+            .iter()
+            .map(|&relid| super::depend::ObjectAddress::relation(relid)),
+    );
+    let mut functions: Vec<PgProcOid> = interp
+        .pg_proc
+        .values()
+        .filter(|p| interp.owner_of(AclObject::Function(p.oid)) == role)
+        .map(|p| p.oid)
+        .collect();
+    functions.sort();
+    targets.extend(
+        functions
+            .iter()
+            .map(|&oid| super::depend::ObjectAddress::proc(oid)),
+    );
+    let mut types: Vec<PgTypeOid> = interp
+        .pg_type
+        .values()
+        .filter(|t| interp.owner_of(AclObject::Type(t.oid)) == role)
+        .filter(|t| !is_dependent_type(interp, t.oid))
+        .map(|t| t.oid)
+        .collect();
+    types.sort();
+    targets.extend(
+        types
+            .iter()
+            .map(|&oid| super::depend::ObjectAddress::type_(oid)),
+    );
+    let mut schemas: Vec<PgNamespaceOid> = interp
+        .pg_namespace
+        .values()
+        .filter(|n| interp.owner_of(AclObject::Schema(n.oid)) == role)
+        .map(|n| n.oid)
+        .collect();
+    schemas.sort();
+    targets.extend(
+        schemas
+            .iter()
+            .map(|&oid| super::depend::ObjectAddress::namespace(oid)),
+    );
+}
+
 /// `DROP OWNED BY role`: revoke the grants the role made or holds, remove its
 /// default privileges, then drop the objects it owns (`shdepDropOwned`).
 pub(crate) fn drop_owned_by(
     interp: &mut PgCatalog,
     role: RoleId,
-    _cascade: bool,
+    cascade: bool,
+    restrict_checked: bool,
 ) -> Result<(), DdlError> {
-    // ACLs first: every entry the role granted or received goes.
-    interp.acls.defaults.retain(|key, acl| {
-        let keep = key.0 != role;
-        if !keep {
-            return false;
+    let role = interp.roles.canonical(role);
+    let current = current_role(interp);
+    // ACLs first: every grant the role received from the owner — and what
+    // it granted through those grant options — goes; grants another grantor
+    // made to it survive (`RemoveRoleFromObjectACL`). A mention in a column
+    // ACL issues the table's REVOKE ALL, which takes the columns with it.
+    let mut mentioned: Vec<AclObject> = Vec::new();
+    for (object, acl) in interp.acls.items.iter() {
+        if acl_mentions(acl, role) {
+            mentioned.push(*object);
         }
-        acl.retain(|item| item.grantee != Grantee::Role(role) && item.grantor != role);
-        true
-    });
-    interp.acls.defaults.retain(|_, acl| !acl.is_empty());
-    for acl in interp.acls.items.values_mut() {
-        acl.retain(|item| item.grantee != Grantee::Role(role) && item.grantor != role);
     }
-    interp.acls.items.retain(|_, acl| !acl.is_empty());
-    for acl in interp.acls.columns.values_mut() {
-        acl.retain(|item| item.grantee != Grantee::Role(role) && item.grantor != role);
+    for ((relid, _), acl) in interp.acls.columns.iter() {
+        if acl_mentions(acl, role) {
+            mentioned.push(AclObject::Relation(*relid));
+        }
     }
-    interp.acls.columns.retain(|_, acl| !acl.is_empty());
+    mentioned.sort();
+    mentioned.dedup();
+    for object in mentioned {
+        revoke_all_from_object(interp, object, role, current)?;
+    }
+    // `pg_default_acl`: the role's own entries are dropped (an owner
+    // dependency); in another role's, the role's grants are revoked as that
+    // role does (`SetDefaultACL`'s grantor is always the target role).
+    let defaults: Vec<(DefaultAclKey, Vec<AclItem>)> = interp
+        .acls
+        .defaults
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+    for ((owner, schema, class), acl) in defaults {
+        let key = (owner, schema, class);
+        if owner == role {
+            interp.acls.defaults.remove(&key);
+            interp.acls.default_oids.remove(&key);
+            continue;
+        }
+        let new_acl = revoke_all_from(interp, &acl, role, owner, owner);
+        // An empty ACL is no entry at all: `aclmerge` returns NULL for it,
+        // so `get_user_default_acl` falls back to the hard-wired default
+        // (`SetDefaultACL` may keep the row; the ACL it stands for is empty).
+        if new_acl.is_empty() {
+            interp.acls.defaults.remove(&key);
+            interp.acls.default_oids.remove(&key);
+        } else {
+            interp.acls.defaults.insert(key, new_acl);
+        }
+    }
+
+    // Role memberships the role granted go too (`shdepDropOwned` deletes the
+    // `pg_auth_members` rows it is the grantor of); the grants it received
+    // stay, as DROP ROLE removes those itself.
+    interp.roles.memberships.retain(|m| m.grantor != role);
 
     // The relations: plain ones first, so their indexes and owned sequences
     // go with them.
@@ -1717,6 +2107,65 @@ pub(crate) fn drop_owned_by(
         .map(|c| c.oid)
         .collect();
     relations.sort();
+    // The objects this statement deletes, for `performMultipleDeletions`'
+    // RESTRICT check: the role's owned relations, functions, types and
+    // schemas (relationships among them don't block, they're deleted too).
+    let mut targets: Vec<super::depend::ObjectAddress> = relations
+        .iter()
+        .map(|&relid| super::depend::ObjectAddress::relation(relid))
+        .collect();
+    let mut owned_functions: Vec<PgProcOid> = interp
+        .pg_proc
+        .values()
+        .filter(|p| interp.owner_of(AclObject::Function(p.oid)) == role)
+        .map(|p| p.oid)
+        .collect();
+    owned_functions.sort();
+    targets.extend(
+        owned_functions
+            .iter()
+            .map(|&oid| super::depend::ObjectAddress::proc(oid)),
+    );
+    let mut owned_types: Vec<PgTypeOid> = interp
+        .pg_type
+        .values()
+        .filter(|t| interp.owner_of(AclObject::Type(t.oid)) == role)
+        .filter(|t| !is_dependent_type(interp, t.oid))
+        .map(|t| t.oid)
+        .collect();
+    owned_types.sort();
+    targets.extend(
+        owned_types
+            .iter()
+            .map(|&oid| super::depend::ObjectAddress::type_(oid)),
+    );
+    let mut owned_schemas: Vec<PgNamespaceOid> = interp
+        .pg_namespace
+        .values()
+        .filter(|n| interp.owner_of(AclObject::Schema(n.oid)) == role)
+        .map(|n| n.oid)
+        .collect();
+    owned_schemas.sort();
+    targets.extend(
+        owned_schemas
+            .iter()
+            .map(|&oid| super::depend::ObjectAddress::namespace(oid)),
+    );
+    if !cascade && !restrict_checked {
+        // The RESTRICT check: another role's object depending on one of the
+        // role's stops the DROP OWNED (`performMultipleDeletions`).
+        if let Some((blocker, via)) = super::depend::multiple_deletion_blockers(interp, &targets)
+            .into_iter()
+            .next()
+        {
+            return Err(DdlError::DependencyError(format!(
+                "cannot drop desired object(s) because other objects depend on them ({} depends \
+                 on {})",
+                super::depend::describe_dependent(interp, blocker),
+                super::depend::describe(interp, via)
+            )));
+        }
+    }
     for relid in relations {
         super::drop::drop_relation_by_oid(interp, relid);
     }
@@ -1732,34 +2181,17 @@ pub(crate) fn drop_owned_by(
         interp.remove_pg_class(relid);
     }
 
-    let mut functions: Vec<PgProcOid> = interp
-        .pg_proc
-        .values()
-        .filter(|p| interp.owner_of(AclObject::Function(p.oid)) == role)
-        .map(|p| p.oid)
-        .collect();
+    let mut functions: Vec<PgProcOid> = owned_functions;
     functions.sort();
     super::drop::drop_functions_cascade(interp, &functions);
 
-    let mut types: Vec<PgTypeOid> = interp
-        .pg_type
-        .values()
-        .filter(|t| interp.owner_of(AclObject::Type(t.oid)) == role)
-        // Arrays and multiranges go with their element / range type.
-        .filter(|t| !is_dependent_type(interp, t.oid))
-        .map(|t| t.oid)
-        .collect();
+    let mut types: Vec<PgTypeOid> = owned_types;
     types.sort();
     for typ in types {
         super::drop::drop_type_cascade(interp, typ);
     }
 
-    let mut schemas: Vec<PgNamespaceOid> = interp
-        .pg_namespace
-        .values()
-        .filter(|n| interp.owner_of(AclObject::Schema(n.oid)) == role)
-        .map(|n| n.oid)
-        .collect();
+    let mut schemas: Vec<PgNamespaceOid> = owned_schemas;
     schemas.sort();
     for ns in schemas {
         let name = interp.namespace_name(ns).unwrap_or("?").to_owned();
@@ -1785,7 +2217,7 @@ pub(crate) fn drop_owned_by(
             .map(|t| t.oid)
             .collect();
         if !still.is_empty() || !procs.is_empty() || !types.is_empty() {
-            if !_cascade {
+            if !cascade && !restrict_checked {
                 return Err(DdlError::DependencyError(format!(
                     "cannot drop schema {name} because other objects depend on it"
                 )));
@@ -1817,6 +2249,220 @@ fn is_dependent_type(interp: &PgCatalog, oid: PgTypeOid) -> bool {
     t.typcategory == crate::pg_catalog::TypCategory::Array
         && t.typelem.is_some()
         && t.typelem.and_then(|e| interp.array_type_of(e)) == Some(oid)
+}
+
+/// The `defaclobjtype` noun of a default ACL class, as `pg_shdepend`'s
+/// description renders it.
+fn default_acl_noun(class: DefaultAclClass) -> &'static str {
+    match class {
+        DefaultAclClass::Table => "relations",
+        DefaultAclClass::Sequence => "sequences",
+        DefaultAclClass::Function => "functions",
+        DefaultAclClass::Type => "types",
+        DefaultAclClass::Schema => "schemas",
+    }
+}
+
+/// The catalog `pg_class` OID that owns each ACL object's row
+/// (`pg_class`, `pg_proc`, `pg_namespace`, `pg_type`, `pg_language`), the
+/// class id `pg_shdepend` and PG's dependency-detail order use.
+impl AclObject {
+    fn classid(self) -> PgClassOid {
+        match self {
+            AclObject::Relation(_) => crate::pg_catalog::PG_CLASS_RELID,
+            AclObject::Function(_) => crate::pg_catalog::PG_PROC_RELID,
+            AclObject::Schema(_) => crate::pg_catalog::PG_NAMESPACE_RELID,
+            AclObject::Type(_) => crate::pg_catalog::PG_TYPE_RELID,
+            AclObject::Language(_) => crate::pg_catalog::PG_LANGUAGE_RELID,
+        }
+    }
+}
+
+/// `pg_auth_members` and `pg_default_acl`: the catalogs behind the other
+/// two kinds of shared dependency `DROP ROLE` reports.
+const PG_AUTH_MEMBERS_RELID: u32 = 1260;
+const PG_DEFAULT_ACL_RELID: u32 = 826;
+
+/// `checkSharedDependencies`'s DETAIL lines for `role`: every object it owns,
+/// every default ACL it owns or appears in, every ACL and column ACL it
+/// appears in, and every role membership it granted. `None` when there is
+/// none — PG's `role "x" cannot be dropped because some objects depend on
+/// it`. The lines come out in PG's order: `pg_shdepend` rows sorted by the
+/// dependent object's OID (then catalog, sub-object and dependency type).
+pub(crate) fn role_dependency_details(interp: &PgCatalog, role: RoleId) -> Option<String> {
+    let role = interp.roles.canonical(role);
+    let name = interp.roles.display_name(role).to_owned();
+    // (object OID, catalog OID, object sub-id, dependency type, text).
+    let mut details: Vec<(u32, u32, i16, char, String)> = Vec::new();
+
+    let describe_object = |object: AclObject| match object {
+        AclObject::Relation(relid) => {
+            super::depend::describe(interp, super::depend::ObjectAddress::relation(relid))
+        }
+        AclObject::Function(oid) => {
+            super::depend::describe(interp, super::depend::ObjectAddress::proc(oid))
+        }
+        AclObject::Schema(ns) => {
+            super::depend::describe(interp, super::depend::ObjectAddress::namespace(ns))
+        }
+        AclObject::Type(oid) => {
+            super::depend::describe(interp, super::depend::ObjectAddress::type_(oid))
+        }
+        AclObject::Language(oid) => {
+            super::depend::describe(interp, super::depend::ObjectAddress::language(oid))
+        }
+    };
+
+    // Objects it owns. Indexes, table row types, composite-type relations and
+    // dependent types (arrays, multiranges) aren't separate shared
+    // dependencies.
+    for (&object, &owner) in &interp.acls.owners {
+        if interp.roles.canonical(owner) != role {
+            continue;
+        }
+        match object {
+            AclObject::Relation(relid) => {
+                let Some(class) = interp.pg_class.get(&relid) else {
+                    continue;
+                };
+                if matches!(
+                    class.relkind,
+                    RelKind::Index | RelKind::PartitionedIndex | RelKind::CompositeType
+                ) {
+                    continue;
+                }
+            }
+            AclObject::Type(oid)
+                if is_dependent_type(interp, oid) || is_relation_row_type(interp, oid) =>
+            {
+                continue;
+            }
+            _ => {}
+        }
+        details.push((
+            object.oid().get(),
+            object.classid().get(),
+            0,
+            'o',
+            format!("owner of {}", describe_object(object)),
+        ));
+    }
+
+    // Default ACLs it owns, or appears in.
+    for (&(owner, namespace, class), acl) in &interp.acls.defaults {
+        let noun = default_acl_noun(class);
+        let oid = interp
+            .acls
+            .default_oids
+            .get(&(owner, namespace, class))
+            .copied()
+            .unwrap_or(0);
+        if interp.roles.canonical(owner) == role {
+            details.push((
+                oid,
+                PG_DEFAULT_ACL_RELID,
+                0,
+                'o',
+                format!("owner of default privileges on new {noun} belonging to role {name}"),
+            ));
+            continue;
+        }
+        if acl.iter().any(|item| {
+            (item.grantee == Grantee::Role(role) || item.grantor == role)
+                && item.grantee != Grantee::Role(owner)
+        }) {
+            details.push((
+                oid,
+                PG_DEFAULT_ACL_RELID,
+                0,
+                'a',
+                format!(
+                    "privileges for default privileges on new {noun} belonging to role {}",
+                    interp.roles.display_name(owner)
+                ),
+            ));
+        }
+    }
+
+    // Object and column ACLs it appears in (the owner's own entry doesn't
+    // count: the owner dependency above covers it).
+    for (&object, acl) in &interp.acls.items {
+        if interp.owner_of(object) == role {
+            continue;
+        }
+        if acl_mentions(acl, role) {
+            details.push((
+                object.oid().get(),
+                object.classid().get(),
+                0,
+                'a',
+                format!("privileges for {}", describe_object(object)),
+            ));
+        }
+    }
+    for (&(relid, attnum), acl) in &interp.acls.columns {
+        if interp.owner_of(AclObject::Relation(relid)) == role {
+            continue;
+        }
+        if !acl_mentions(acl, role) {
+            continue;
+        }
+        let column =
+            super::depend::describe(interp, super::depend::ObjectAddress::column(relid, attnum));
+        details.push((
+            relid.into_nonzero().get(),
+            crate::pg_catalog::PG_CLASS_RELID.get(),
+            attnum,
+            'a',
+            format!("privileges for {column}"),
+        ));
+    }
+
+    // Role memberships it granted.
+    for membership in &interp.roles.memberships {
+        if membership.grantor != role {
+            continue;
+        }
+        details.push((
+            membership.oid,
+            PG_AUTH_MEMBERS_RELID,
+            0,
+            'a',
+            format!(
+                "privileges for membership of role {} in role {}",
+                interp.roles.display_name(membership.member),
+                interp.roles.display_name(membership.role)
+            ),
+        ));
+    }
+
+    if details.is_empty() {
+        return None;
+    }
+    details.sort();
+    Some(
+        details
+            .into_iter()
+            .map(|(.., text)| text)
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// Whether type `oid` is some relation's row type: PG records no owner
+/// dependency for those (the relation owns them), unlike a standalone
+/// composite type — whose `pg_class` row is a composite type, not a table.
+fn is_relation_row_type(interp: &PgCatalog, oid: PgTypeOid) -> bool {
+    let Some(ty) = interp.get_type(oid) else {
+        return false;
+    };
+    let Some(relid) = ty.typrelid else {
+        return false;
+    };
+    interp
+        .pg_class
+        .get(&relid)
+        .is_some_and(|c| c.relkind != RelKind::CompositeType)
 }
 
 // ─── has_*_privilege ────────────────────────────────────────────────────────
@@ -1851,6 +2497,30 @@ impl PgCatalog {
         let owner = self.owner_of(object);
         let acl = self.acl_of(object);
         aclmask_privileges(self, role_id, owner, &acl, mask) & mask == mask
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::acl_kind_privilege`]
+    /// (`aclmask` of `ACL_GRANT_OPTION_FOR(mask)`).
+    fn acl_kind_grant_option(
+        &self,
+        role: &str,
+        object: AclObject,
+        allowed: u32,
+        privilege: Privilege,
+    ) -> bool {
+        let Some(role_id) = self.known_role(role) else {
+            return false;
+        };
+        let mask = privilege.bit();
+        if mask & !allowed != 0 {
+            return false;
+        }
+        if self.roles.is_superuser(role_id) {
+            return true;
+        }
+        let owner = self.owner_of(object);
+        let acl = self.acl_of(object);
+        grant_options_held(self, role_id, owner, &acl, mask) & mask == mask
     }
 
     /// `has_table_privilege(role, relid, privilege)` (`pg_class_aclmask`):
@@ -2058,6 +2728,149 @@ impl PgCatalog {
             return false;
         };
         self.acl_kind_privilege(role, AclObject::Type(oid), bits::TYPE, Privilege::Usage)
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_type_privilege`].
+    pub fn has_type_privilege_with_grant_option(&self, role: &str, type_oid: PgTypeOid) -> bool {
+        let Some(oid) = self.acl_type_of(type_oid) else {
+            return false;
+        };
+        self.acl_kind_grant_option(role, AclObject::Type(oid), bits::TYPE, Privilege::Usage)
+    }
+
+    /// `has_language_privilege`: USAGE on a trusted procedural language.
+    pub fn has_language_privilege(&self, role: &str, lang_oid: PgLanguageOid) -> bool {
+        self.acl_kind_privilege(
+            role,
+            AclObject::Language(lang_oid),
+            bits::LANGUAGE,
+            Privilege::Usage,
+        )
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_language_privilege`].
+    pub fn has_language_privilege_with_grant_option(
+        &self,
+        role: &str,
+        lang_oid: PgLanguageOid,
+    ) -> bool {
+        self.acl_kind_grant_option(
+            role,
+            AclObject::Language(lang_oid),
+            bits::LANGUAGE,
+            Privilege::Usage,
+        )
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_function_privilege`].
+    pub fn has_function_privilege_with_grant_option(
+        &self,
+        role: &str,
+        proc_oid: PgProcOid,
+    ) -> bool {
+        if !self.pg_proc.contains_key(&proc_oid) {
+            return false;
+        }
+        self.acl_kind_grant_option(
+            role,
+            AclObject::Function(proc_oid),
+            bits::FUNCTION,
+            Privilege::Execute,
+        )
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_schema_privilege`].
+    pub fn has_schema_privilege_with_grant_option(
+        &self,
+        role: &str,
+        nsoid: PgNamespaceOid,
+        privilege: Privilege,
+    ) -> bool {
+        self.acl_kind_grant_option(role, AclObject::Schema(nsoid), bits::SCHEMA, privilege)
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_table_privilege`].
+    pub fn has_table_privilege_with_grant_option(
+        &self,
+        role: &str,
+        relid: PgClassOid,
+        privilege: Privilege,
+    ) -> bool {
+        if !self.pg_class.contains_key(&relid) {
+            return false;
+        }
+        self.acl_kind_grant_option(role, AclObject::Relation(relid), bits::RELATION, privilege)
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_sequence_privilege`].
+    pub fn has_sequence_privilege_with_grant_option(
+        &self,
+        role: &str,
+        relid: PgClassOid,
+        privilege: Privilege,
+    ) -> bool {
+        if self.pg_class.get(&relid).map(|c| c.relkind) != Some(RelKind::Sequence) {
+            return false;
+        }
+        self.acl_kind_grant_option(role, AclObject::Relation(relid), bits::SEQUENCE, privilege)
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_column_privilege`]:
+    /// the grant option on the column, or — like PG's
+    /// `column_privilege_check` — on the table.
+    pub fn has_column_privilege_with_grant_option(
+        &self,
+        role: &str,
+        relid: PgClassOid,
+        attnum: i16,
+        privilege: Privilege,
+    ) -> bool {
+        let Some(role_id) = self.known_role(role) else {
+            return false;
+        };
+        let mask = privilege.bit();
+        if mask & !bits::COLUMN != 0 {
+            return false;
+        }
+        if self.roles.is_superuser(role_id) {
+            return true;
+        }
+        let owner = self.owner_of(AclObject::Relation(relid));
+        let acl = self.column_acl_of(relid, attnum);
+        if grant_options_held(self, role_id, owner, &acl, mask) & mask == mask {
+            return true;
+        }
+        self.has_table_privilege_with_grant_option(role, relid, privilege)
+    }
+
+    /// The `WITH GRANT OPTION` form of [`Self::has_any_column_privilege`].
+    pub fn has_any_column_privilege_with_grant_option(
+        &self,
+        role: &str,
+        relid: PgClassOid,
+        privilege: Privilege,
+    ) -> bool {
+        let mask = privilege.bit();
+        if mask & !bits::COLUMN != 0 {
+            return false;
+        }
+        if self.has_table_privilege_with_grant_option(role, relid, privilege) {
+            return true;
+        }
+        let Some(role_id) = self.known_role(role) else {
+            return false;
+        };
+        if self.roles.is_superuser(role_id) {
+            return true;
+        }
+        let owner = self.owner_of(AclObject::Relation(relid));
+        self.attributes_of(relid)
+            .iter()
+            .filter(|a| a.attnum > 0)
+            .any(|a| {
+                let acl = self.column_acl_of(relid, a.attnum);
+                grant_options_held(self, role_id, owner, &acl, mask) & mask == mask
+            })
     }
 
     /// The type whose ACL `type_oid` uses (`pg_type_aclmask_ext`).

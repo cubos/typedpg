@@ -21,6 +21,7 @@
 //! | [`AnalyzedSpread`] | A `$..name { ... }` spread with its insertion offset and typed fields. |
 //! | [`AnalyzedSpreadField`] | A single field inside a spread. |
 //! | [`AnalyzedColumn`] | A single output column: name, Rust type, nullability. |
+//! | [`AnalysisDifference`] | The first difference between two analyses of the same statement, as a diagnostic. |
 //! | [`AnalyzeError`] | Errors returned by [`PgCatalog::analyze`]. |
 //! | [`DdlError`] | Errors returned by [`PgCatalog::apply_sql`]. |
 //!
@@ -34,6 +35,7 @@
 //! // result.params[0].rust_type  == "i64"
 //! ```
 
+mod analysis_diff;
 mod array_input;
 mod builtin_nullability;
 mod clause;
@@ -107,6 +109,7 @@ pub use pg_catalog::{
     RelKind, SeedAcl, SerializedAst, TypAlign, TypCategory, TypStorage, TypType,
 };
 
+pub use analysis_diff::{AnalysisDifference, first_difference};
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{

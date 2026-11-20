@@ -92,6 +92,8 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
     // (checked before the options are parsed).
     let check_option = stmt.with_check_option != ast::ViewCheckOption::NoCheckOption
         || sets_check_option(&stmt.options);
+    let check_option_cascaded = cascaded_check_option(&stmt.options)
+        || stmt.with_check_option == ast::ViewCheckOption::CascadedCheckOption;
     if check_option && let Some(query) = stmt.query.as_ref() {
         check_option_allowed(interp, query)?;
     }
@@ -132,6 +134,14 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         }
         // OR REPLACE replaces the options too (AT_ReplaceRelOptions).
         set_security_barrier(interp, existing_oid, &stmt.options, true, false);
+        if check_option {
+            interp.check_option_views.insert(existing_oid);
+            if check_option_cascaded {
+                interp.cascaded_check_option_views.insert(existing_oid);
+            } else {
+                interp.cascaded_check_option_views.remove(&existing_oid);
+            }
+        }
         return Ok(());
     }
 
@@ -162,6 +172,12 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
             interp.view_updatability.insert(oid, updatability);
         }
         set_security_barrier(interp, oid, &stmt.options, true, false);
+        if check_option {
+            interp.check_option_views.insert(oid);
+            if check_option_cascaded {
+                interp.cascaded_check_option_views.insert(oid);
+            }
+        }
     }
     Ok(())
 }
@@ -178,6 +194,34 @@ pub(crate) fn set_security_barrier(
     replace: bool,
     reset: bool,
 ) {
+    // check_option: `local` and `cascaded` both make an INSERT evaluate the
+    // view query's WHERE (as the WITH CHECK OPTION qual).
+    let check_option = options.iter().find_map(|o| match o.as_ref() {
+        Some(ast::Node::DefElem(de)) if de.defname == "check_option" => {
+            Some(match de.arg.as_ref() {
+                Some(ast::Node::String(s)) => s.sval != "none",
+                Some(ast::Node::Boolean(b)) => b.boolval,
+                _ => true,
+            })
+        }
+        _ => None,
+    });
+    let cascaded = cascaded_check_option(options);
+    match check_option.or((replace).then_some(false)) {
+        Some(true) if !reset => {
+            interp.check_option_views.insert(relid);
+            if cascaded {
+                interp.cascaded_check_option_views.insert(relid);
+            } else {
+                interp.cascaded_check_option_views.remove(&relid);
+            }
+        }
+        Some(_) => {
+            interp.check_option_views.remove(&relid);
+            interp.cascaded_check_option_views.remove(&relid);
+        }
+        None => {}
+    }
     for (option, invoker) in [("security_barrier", false), ("security_invoker", true)] {
         let given = options.iter().find_map(|o| match o.as_ref() {
             Some(ast::Node::DefElem(de)) if de.defname == option && de.defnamespace.is_empty() => {
@@ -618,6 +662,7 @@ fn replace_view(
         bindings,
         ast,
         deps,
+        access,
     } = resolved;
     // DefineVirtualRelation adds the new columns with ATExecAddColumn.
     let system = interp
@@ -649,6 +694,7 @@ fn replace_view(
     interp.remove_pg_rewrites_of(view_oid);
     let bound = bound_references(interp, &deps.references);
     interp.view_references.insert(view_oid, bound);
+    interp.view_access.insert(view_oid, access);
     let rewrite_oid = PgRewriteOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_rewrite(PgRewrite {
         oid: rewrite_oid,
@@ -788,6 +834,9 @@ struct ResolvedView {
     bindings: Vec<AstBinding>,
     ast: Option<ast::Node>,
     deps: ViewDeps,
+    /// What the query reads, runs and changes: kept for the statements
+    /// that read the view.
+    access: crate::privileges::ViewAccess,
 }
 
 /// CheckAttributeNamesTypes (heap_create_with_catalog): a table or
@@ -832,6 +881,7 @@ fn install_relation(
         bindings,
         ast,
         deps,
+        access,
     } = resolved;
     let system = interp.namespace_name(nsoid) == Some("pg_catalog");
     check_relation_columns(interp, relkind, &columns, system)?;
@@ -851,6 +901,7 @@ fn install_relation(
     if matches!(relkind, RelKind::View | RelKind::MaterializedView) {
         let bound = bound_references(interp, &deps.references);
         interp.view_references.insert(class_oid, bound);
+        interp.view_access.insert(class_oid, access);
         let rewrite_oid = PgRewriteOid::from_nonzero(interp.alloc_oid()?);
         interp.insert_pg_rewrite(PgRewrite {
             oid: rewrite_oid,
@@ -1064,12 +1115,17 @@ fn resolve_view_with_params(
     let inner = query_node;
     let analyze =
         || crate::resolve::analyze_raw_node_with_param_types(snapshot, inner, param_types);
-    let (analyzed, references) = super::depend::collect(|| {
-        if planned {
-            crate::resolve::analyze_executed(snapshot, inner, analyze)
-        } else {
-            analyze()
-        }
+    // The query's dependencies (what a DROP must respect) and what reading
+    // the view later requires of the relations, routines and sequences it
+    // names.
+    let ((analyzed, references), access) = crate::privileges::collect_view(|| {
+        super::depend::collect_defined(|| {
+            if planned {
+                crate::resolve::analyze_executed(snapshot, inner, analyze)
+            } else {
+                analyze()
+            }
+        })
     });
     let (raw_columns, _) = analyzed.map_err(|source| DdlError::ViewAnalysis {
         view: String::new(),
@@ -1126,6 +1182,7 @@ fn resolve_view_with_params(
         bindings,
         ast: Some(query_node.clone()),
         deps,
+        access,
     })
 }
 
@@ -1303,6 +1360,25 @@ impl BindingWalker {
                 }
                 if let Some(rexpr) = expr.rexpr.as_ref() {
                     self.walk_node(rexpr, snapshot, stack);
+                }
+            }
+            // `(expr).field` / `(expr)[i]`: the argument and every subscript
+            // are expressions of their own (a function under an indirection
+            // is recorded like any other).
+            ast::Node::AIndirection(ind) => {
+                if let Some(arg) = ind.arg.as_ref() {
+                    self.walk_node(arg, snapshot, stack);
+                }
+                for step in ind.indirection.iter().flatten() {
+                    self.walk_node(step, snapshot, stack);
+                }
+            }
+            ast::Node::AIndices(ind) => {
+                if let Some(lidx) = ind.lidx.as_ref() {
+                    self.walk_node(lidx, snapshot, stack);
+                }
+                if let Some(uidx) = ind.uidx.as_ref() {
+                    self.walk_node(uidx, snapshot, stack);
                 }
             }
             ast::Node::BoolExpr(b) => {
@@ -2217,6 +2293,20 @@ pub(crate) fn check_option_allowed(interp: &PgCatalog, query: &ast::Node) -> Res
     }
 }
 
+/// Whether a `WITH (...)` option list asks for `CASCADED` (the default of
+/// `WITH CHECK OPTION`) rather than `LOCAL`.
+fn cascaded_check_option(options: &[Option<ast::Node>]) -> bool {
+    options.iter().any(|o| {
+        matches!(o.as_ref(), Some(ast::Node::DefElem(de)) if de.defname == "check_option"
+        && match de.arg.as_ref() {
+            Some(ast::Node::String(s)) => !s.sval.eq_ignore_ascii_case("local")
+                && s.sval != "none",
+            Some(ast::Node::Boolean(b)) => b.boolval,
+            _ => true,
+        })
+    })
+}
+
 /// Whether a `WITH (...)` / `SET (...)` option list sets `check_option`.
 pub(crate) fn sets_check_option(options: &[Option<ast::Node>]) -> bool {
     options
@@ -2408,8 +2498,13 @@ pub(crate) fn planned_view_errors(
     // The query is another text: its errors keep their plain messages.
     let _barrier = crate::error::DiagContextGuard::barrier();
     let ((analyzed, references), split) = expanding_view(relid, || {
-        crate::resolve::planned_errors(sel, snapshot, barrier, kept, removable_side, || {
-            super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
+        // The stored query's names were fixed when the view was defined:
+        // planning it again resolves no schema (PG looks none up), so no
+        // schema's USAGE is the statement's to require.
+        crate::privileges::suspended(|| {
+            crate::resolve::planned_errors(sel, snapshot, barrier, kept, removable_side, || {
+                super::depend::collect(|| crate::resolve::analyze_raw_node(snapshot, inner, &[]))
+            })
         })
     })??;
     analyzed.ok()?;

@@ -23,6 +23,10 @@ struct FuncArgs {
     /// resolved parameter type can map a non-NULL value to NULL (see
     /// [`coerce_call_args`]).
     coercion_nullable: Vec<bool>,
+    /// What each argument's analysis required, kept aside until the call
+    /// resolves: an inlined SQL body may drop arguments it doesn't use, and
+    /// the planner then never evaluates them.
+    collected: Vec<Option<crate::privileges::Requirements>>,
 }
 
 /// `ParseFuncOrColumn` in column notation: `t.f` / `(x).f` naming no
@@ -81,11 +85,47 @@ fn column_notation_call(
                  write {name}(…) instead"
             ))))
         }
-        Ok(_) => {
-            let node = Some(ast::Node::FuncCall(NodeBox::new(call)));
-            Some(infer_expr(node.as_ref(), ctx, params, TypeGoal::NONE))
+        Ok(detail) => {
+            if let functions::FuncDetail::Routine(r) = &detail {
+                crate::ddl::policies::note_indirection_ref(location, name, r.oid);
+            }
+            let node = ast::Node::FuncCall(typedpg_pg_query::NodeBox::new(call));
+            Some(infer_expr(Some(&node), ctx, params, TypeGoal::NONE))
         }
     }
+}
+
+/// A column-notation call `(row).name` bound by the stored policy being
+/// re-analyzed ([`crate::ddl::policies::bound_indirection_function`]): the
+/// call is the routine `oid` whatever its current name and schema, as PG's
+/// stored `FuncExpr` is. `None` when the routine is gone.
+pub(crate) fn infer_bound_column_notation_call(
+    oid: crate::oid::PgProcOid,
+    arg: Option<ast::Node>,
+    location: i32,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Option<Result<ExprType, AnalyzeError>> {
+    let proc = ctx.snapshot.pg_proc.get(&oid)?;
+    let schema = ctx.snapshot.namespace_name(proc.pronamespace)?.to_owned();
+    let call = ast::FuncCall {
+        funcname: vec![
+            Some(ast::Node::String(typedpg_pg_query::NodeBox::new(
+                ast::String { sval: schema },
+            ))),
+            Some(ast::Node::String(typedpg_pg_query::NodeBox::new(
+                ast::String {
+                    sval: proc.proname.clone(),
+                },
+            ))),
+        ],
+        args: vec![arg],
+        funcformat: ast::CoercionForm::CoerceExplicitCall,
+        location,
+        ..Default::default()
+    };
+    let node = ast::Node::FuncCall(typedpg_pg_query::NodeBox::new(call));
+    Some(infer_expr(Some(&node), ctx, params, TypeGoal::NONE))
 }
 
 pub(crate) fn infer_func_call(
@@ -157,6 +197,9 @@ pub(crate) fn infer_func_call(
     let resolved = match detail {
         functions::FuncDetail::Routine(r) => r,
         functions::FuncDetail::Coercion(target) => {
+            for req in &args.collected {
+                crate::privileges::keep_argument(req.as_ref(), true);
+            }
             check_call_shape(func, None, &args, &notation, ctx)?;
             // Same literal-content validation an explicit cast performs.
             if let Some(ast::Node::AConst(ac)) = func.args[0].as_ref()
@@ -174,42 +217,108 @@ pub(crate) fn infer_func_call(
         }
     };
 
+    // A function the planner certainly inlines (a single-expression SQL
+    // body that may be inlined, see `inline_parameter_usage`) doesn't
+    // evaluate the arguments its body doesn't use: drop what their
+    // analysis required.
+    let inlined = snapshot
+        .pg_proc
+        .get(&resolved.oid)
+        .and_then(|proc| inline_parameter_usage(snapshot, proc, func));
+    let used_defaults: Vec<&crate::ddl::functions::RoutineDefault> = snapshot
+        .routine_defaults
+        .get(&resolved.oid)
+        .map(|defaults| {
+            defaults
+                .iter()
+                .filter(|d| resolved.default_params.contains(&d.param))
+                .collect()
+        })
+        .unwrap_or_default();
+    // A strict call with a NULL argument is replaced by NULL before the
+    // executor initializes anything (`evaluate_function`): neither its
+    // arguments nor the routine nor a parameter DEFAULT run — but
+    // `simplify_function` simplifies the arguments first, and an IMMUTABLE
+    // call over constants among them runs there. `evaluate_function` refuses
+    // a set-returning or RECORD result, so such a call is never folded: the
+    // executor evaluates every argument before its strictness skips the
+    // call (`ExecEvalFuncArgs`, `execSRF.c`).
+    //
+    // What each argument certainly is counts in the scope: a pulled-up
+    // subquery's constant output replaces the reference before the call is
+    // folded (`certainly_in`).
+    let certainty: Vec<crate::expr::plan_fold::Certain> = func
+        .args
+        .iter()
+        .map(|arg| crate::expr::plan_fold::certainly_in(arg.as_ref(), ctx))
+        .collect();
+    let null_call = snapshot.pg_proc.get(&resolved.oid).is_some_and(|proc| {
+        crate::privileges::folds_to_null(proc, &certainty)
+            && !resolved.is_aggregate
+            && !resolved.is_window
+            && func.over.is_none()
+            && (certainty.contains(&crate::expr::plan_fold::Certain::Null)
+                || used_defaults.iter().any(|d| d.null))
+    });
+    for (i, req) in args.collected.iter().enumerate() {
+        let runs = !null_call
+            && match &inlined {
+                Some(usage) => usage.get(i).copied().unwrap_or(true),
+                None => true,
+            };
+        if null_call {
+            // The argument is not evaluated, but the planner still folds its
+            // constant subexpressions (`simplify_function` processes the
+            // arguments before `evaluate_function` applies the strict
+            // shortcut): an IMMUTABLE call over constants there runs.
+            crate::privileges::keep_argument_simplified(req.as_ref());
+        } else {
+            crate::privileges::keep_argument(req.as_ref(), runs);
+        }
+    }
+    let default_runs = |param: usize| {
+        !null_call
+            && inlined
+                .as_ref()
+                .is_none_or(|usage| usage.get(param).copied().unwrap_or(true))
+    };
     check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
     check_not_internal(&resolved, snapshot, func.location)?;
     ctx.note_proc(Some(resolved.oid));
     // ExecInitFunc / ExecInitAgg / ExecInitWindowAgg: EXECUTE, and the
-    // parameter DEFAULT expressions the call is expanded with run too.
-    crate::privileges::note_call(snapshot, resolved.oid, func.over.is_some(), &func.args);
-    if snapshot
-        .pg_proc
-        .get(&resolved.oid)
-        .is_some_and(|p| func.args.len() < p.proargtypes.len())
-    {
-        for &p in snapshot
-            .proc_default_procs
-            .get(&resolved.oid)
-            .into_iter()
-            .flatten()
-        {
-            crate::privileges::note_routine(p, crate::privileges::RoutineKind::Function);
+    // parameter DEFAULT expressions the call is expanded with run too — the
+    // defaults of the parameters the call leaves out, and only those
+    // (add_function_defaults / reorder_function_arguments).
+    if !null_call {
+        crate::privileges::note_call(
+            snapshot,
+            resolved.oid,
+            func.over.is_some(),
+            crate::privileges::CallSite::Expression,
+            &func.args,
+            &certainty,
+        );
+    }
+    for default in &used_defaults {
+        if !default_runs(default.param) {
+            crate::privileges::keep_default_simplified(&default.live);
+            continue;
+        }
+        for &p in &default.live_procs {
+            crate::privileges::note_default_routine(p, crate::privileges::RoutineKind::Function);
+        }
+        for &(seq, any_of) in &default.live_sequences {
+            crate::privileges::note_sequence(seq, any_of);
         }
     }
     // A call leaving parameters out runs their DEFAULT expressions — unless
     // the function is inlined (a simple SQL body, which CheckMutability
     // judges by itself).
-    if snapshot
-        .pg_proc
-        .get(&resolved.oid)
-        .is_some_and(|p| func.args.len() < p.proargtypes.len())
-        && !snapshot.inline_sql_bodies.contains_key(&resolved.oid)
-    {
-        for &p in snapshot
-            .proc_default_procs
-            .get(&resolved.oid)
-            .into_iter()
-            .flatten()
-        {
-            ctx.note_proc(Some(p));
+    if inlined.is_none() {
+        for default in &used_defaults {
+            for &p in &default.procs {
+                ctx.note_proc(Some(p));
+            }
         }
     }
     // A plain call of a strict function is NULL for a NULL argument — not
@@ -256,6 +365,9 @@ pub(crate) fn infer_func_call(
     {
         ctx.note_call(func.location, resolved.oid);
     }
+    // What a stored policy expression's call names, whatever its kind: an
+    // `ALTER FUNCTION` / `SET SCHEMA` rewrites it.
+    crate::ddl::policies::note_function_ref(func.location, resolved.oid);
     let jsonb_builtin = snapshot
         .pg_proc
         .get(&resolved.oid)
@@ -541,6 +653,7 @@ fn in_declared_order<'a>(
         exprs: resolved.in_declared_order(&args.exprs, ExprType::scalar(oid::UNKNOWN, false)),
         direct_count: positional.args.len(),
         coercion_nullable: resolved.in_declared_order(&args.coercion_nullable, false),
+        collected: resolved.in_declared_order(&args.collected, None),
     };
     (std::borrow::Cow::Owned(positional), args)
 }
@@ -949,6 +1062,164 @@ fn validate_within_group(func: &ast::FuncCall) -> Result<(), AnalyzeError> {
 /// overload resolution sees the full signature — PG records both direct args
 /// and ordered args in `pg_proc.proargtypes`.
 /// `first`: the first argument's type, when already inferred.
+/// Whether PG certainly inlines the call `func` of `proc`, and which of its
+/// declared parameters the body uses (one `bool` per parameter). `None`
+/// when the analyzer can't be sure the planner inlines it: then every
+/// argument is evaluated.
+///
+/// PG's `inline_function`: SQL language, a plain function, no SET items, no
+/// SECURITY DEFINER, not set-returning, not returning `record`, a
+/// single-expression body with no sublink, aggregate, window or
+/// set-returning call, no more volatile than the function's own category,
+/// not STRICT (that would change the semantics), and no parameter used more
+/// than once unless its argument is a constant, column or parameter (PG
+/// refuses expensive or volatile repeated arguments).
+fn inline_parameter_usage(
+    snapshot: &PgCatalog,
+    proc: &crate::pg_catalog::PgProc,
+    func: &ast::FuncCall,
+) -> Option<Vec<bool>> {
+    use crate::pg_catalog::{ProKind, ProVolatile};
+    use typedpg_pg_query::NodeRef;
+    let body = snapshot.inline_sql_bodies.get(&proc.oid)?;
+    if proc.prokind != ProKind::Function
+        || proc.proretset
+        || proc.prorettype == crate::pg_catalog::oid::RECORD
+        || proc.proisstrict
+        || proc.provariadic.is_some()
+        || snapshot.procs_with_config.contains(&proc.oid)
+        || snapshot
+            .routine_bodies
+            .get(&proc.oid)
+            .is_some_and(|b| b.security_definer)
+        || func
+            .args
+            .iter()
+            .any(|a| matches!(a.as_ref(), Some(ast::Node::NamedArgExpr(_))))
+    {
+        return None;
+    }
+    // Parameter names are only positional when every parameter is an input.
+    let named_params =
+        (proc.proargtypes.len() == proc.proargnames.len()).then_some(&proc.proargnames);
+    let mut counts = vec![0usize; proc.proargtypes.len()];
+    let mut mutable = false;
+    let mut volatile = false;
+    for (n, _) in body.as_ref()?.nodes() {
+        match n {
+            NodeRef::SubLink(_) => return None,
+            NodeRef::ParamRef(p) => {
+                let i = usize::try_from(p.number - 1).ok()?;
+                *counts.get_mut(i)? += 1;
+            }
+            // `SELECT a` names the parameter `a` (a table column of the same
+            // name in a FROM would shadow it: counting it anyway only keeps
+            // more arguments, never fewer).
+            NodeRef::ColumnRef(cr) => {
+                if let Some(names) = named_params
+                    && let [field] = cr.fields.as_slice()
+                    && let Some(ast::Node::String(name)) = field.as_ref()
+                    && let Some(i) = names.iter().position(|n| *n == name.sval)
+                    && let Some(count) = counts.get_mut(i)
+                {
+                    *count += 1;
+                }
+            }
+            NodeRef::FuncCall(fc) => {
+                let names: Vec<String> = fc
+                    .funcname
+                    .iter()
+                    .filter_map(|n| match n.as_ref() {
+                        Some(ast::Node::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let (schema, name) = match names.as_slice() {
+                    [n] => (None, n.as_str()),
+                    [s, n] => (Some(s.as_str()), n.as_str()),
+                    _ => return None,
+                };
+                let candidates = snapshot.find_functions(schema, name);
+                if candidates.is_empty()
+                    || candidates.iter().any(|p| {
+                        p.proretset
+                            || matches!(p.prokind, ProKind::Aggregate | ProKind::Window)
+                            || p.provolatile != ProVolatile::Immutable
+                    })
+                {
+                    mutable = true;
+                    if candidates.is_empty()
+                        || candidates
+                            .iter()
+                            .any(|p| p.provolatile == ProVolatile::Volatile)
+                    {
+                        volatile = true;
+                    }
+                }
+            }
+            NodeRef::AExpr(e) => {
+                let names: Vec<String> = e
+                    .name
+                    .iter()
+                    .filter_map(|n| match n.as_ref() {
+                        Some(ast::Node::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(op) = names.last() else {
+                    continue;
+                };
+                let ops: Vec<_> = snapshot
+                    .pg_operator
+                    .values()
+                    .filter(|o| &o.oprname == op)
+                    .collect();
+                if ops.is_empty()
+                    || ops.iter().any(|o| {
+                        o.oprcode
+                            .and_then(|c| snapshot.pg_proc.get(&c))
+                            .is_none_or(|p| p.provolatile != ProVolatile::Immutable)
+                    })
+                {
+                    mutable = true;
+                    if ops.is_empty()
+                        || ops.iter().any(|o| {
+                            o.oprcode
+                                .and_then(|c| snapshot.pg_proc.get(&c))
+                                .is_some_and(|p| p.provolatile == ProVolatile::Volatile)
+                        })
+                    {
+                        volatile = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    match proc.provolatile {
+        ProVolatile::Immutable if mutable => return None,
+        ProVolatile::Stable if volatile => return None,
+        _ => {}
+    }
+    // An argument used more than once: PG refuses some expensive or
+    // volatile ones. A constant, column or parameter costs nothing, so the
+    // call is certainly inlined; anything else stays conservative.
+    for (i, &count) in counts.iter().enumerate() {
+        if count > 1 {
+            let arg = func.args.get(i)?;
+            if !matches!(
+                arg.as_ref(),
+                Some(ast::Node::AConst(_))
+                    | Some(ast::Node::ParamRef(_))
+                    | Some(ast::Node::ColumnRef(_))
+            ) {
+                return None;
+            }
+        }
+    }
+    Some(counts.into_iter().map(|c| c > 0).collect())
+}
+
 fn collect_arg_types(
     func: &ast::FuncCall,
     ctx: Ctx<'_>,
@@ -959,10 +1230,20 @@ fn collect_arg_types(
     let mut nullable = Vec::with_capacity(func.args.len());
     let mut any_nullable = false;
     let mut exprs = Vec::with_capacity(func.args.len());
+    let mut collected = Vec::with_capacity(func.args.len());
     for arg in &func.args {
         let t = match first.take() {
-            Some(t) => t,
-            None => infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)?,
+            Some(t) => {
+                collected.push(None);
+                t
+            }
+            None => {
+                let (t, req) = crate::privileges::collect_argument(|| {
+                    infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)
+                });
+                collected.push(req);
+                t?
+            }
         };
         any_nullable = any_nullable || t.nullable;
         nullable.push(t.nullable);
@@ -987,6 +1268,7 @@ fn collect_arg_types(
         }
     }
 
+    collected.resize(nullable.len(), None);
     let coercion_nullable = vec![false; nullable.len()];
     Ok(FuncArgs {
         types,
@@ -995,6 +1277,7 @@ fn collect_arg_types(
         exprs,
         direct_count,
         coercion_nullable,
+        collected,
     })
 }
 
@@ -1146,6 +1429,7 @@ pub(crate) fn backfill_call_args(
         exprs: Vec::new(),
         direct_count: arg_types.len(),
         coercion_nullable: vec![false; arg_types.len()],
+        collected: Vec::new(),
     };
     backfill_func_args(func, &args, resolved, ctx, params)
 }

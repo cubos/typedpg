@@ -81,6 +81,13 @@ impl SessionIdentity {
         self.local.as_ref().unwrap_or(&self.session)
     }
 
+    /// Make `role` the effective current role (not the session user):
+    /// `CreateSchemaCommand`'s `SetUserIdAndSecContext(owner_uid)` around the
+    /// schema's elements.
+    pub(crate) fn set_session_role(&mut self, role: Option<String>, is_local: bool) {
+        self.update(is_local, |id| id.role = role);
+    }
+
     /// `current_user`, when the migrations named it.
     pub(crate) fn current_user(&self) -> Option<&str> {
         let id = self.effective();
@@ -330,6 +337,8 @@ impl PgCatalog {
             Some(&mut self.check_function_bodies)
         } else if name.eq_ignore_ascii_case("allow_system_table_mods") {
             Some(&mut self.allow_system_table_mods)
+        } else if name.eq_ignore_ascii_case("row_security") {
+            Some(&mut self.row_security_guc)
         } else {
             None
         }
@@ -339,6 +348,7 @@ impl PgCatalog {
     pub(crate) fn end_transaction_scope(&mut self) {
         self.check_function_bodies.local = None;
         self.allow_system_table_mods.local = None;
+        self.row_security_guc.local = None;
         self.timezone_utc.local = None;
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
@@ -535,7 +545,8 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
 /// `ALTER DATABASE name SET / RESET ...`: a setting for the database's new
 /// sessions (pg_db_role_setting). The analyzer can't tell which database
 /// the application connects to, so any name is taken as the migrations'
-/// own — the one the application uses. Only `search_path` matters.
+/// own — the one the application uses. `search_path` and `row_security`
+/// matter.
 pub(crate) fn alter_database_set(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::AlterDatabaseSetStmt,
@@ -544,8 +555,11 @@ pub(crate) fn alter_database_set(
         return Ok(());
     };
     let kind = set.kind;
+    let is_search_path = set.name.eq_ignore_ascii_case("search_path");
+    let is_row_security = set.name.eq_ignore_ascii_case("row_security");
     if kind == VariableSetKind::VarResetAll {
         interp.search_path_guc.database = None;
+        interp.database_row_security = None;
         interp.refresh_search_path();
         return Ok(());
     }
@@ -558,7 +572,21 @@ pub(crate) fn alter_database_set(
     {
         super::guc::check_value(interp, &setting, &value)?;
     }
-    if !set.name.eq_ignore_ascii_case("search_path") {
+    if is_row_security {
+        interp.database_row_security = match kind {
+            VariableSetKind::VarSetValue => match set.args.as_slice() {
+                [arg] => {
+                    const_arg_string(arg.as_ref()).and_then(|v| super::reloptions::parse_bool(&v))
+                }
+                _ => None,
+            },
+            // FROM CURRENT: the migrations' session's value now.
+            VariableSetKind::VarSetCurrent => Some(interp.row_security_guc.get()),
+            _ => None,
+        };
+        return Ok(());
+    }
+    if !is_search_path {
         return Ok(());
     }
     interp.search_path_guc.database = match kind {

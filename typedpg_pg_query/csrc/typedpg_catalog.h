@@ -62,6 +62,12 @@ typedef struct TypedpgCatalog
 	Oid			(*type_by_name) (void *ctx, Oid namespace, const char *name);
 	Oid			(*namespace_by_name) (void *ctx, const char *name);
 	const char *(*namespace_name) (void *ctx, Oid namespace);
+	/* Called for each schema whose USAGE an explicit lookup checks
+	 * (LookupExplicitNamespace) while PL/pgSQL compiles a function body or a
+	 * DO block: its DECLARE section's types and %TYPE / %ROWTYPE names.  The
+	 * function's signature was resolved at CREATE FUNCTION, and the first
+	 * call checks no USAGE for it. */
+	void		(*note_body_schema) (void *ctx, Oid namespace);
 	/* Writes up to `capacity` schema OIDs, returns how many there are. */
 	size_t		(*search_path) (void *ctx, Oid *out, size_t capacity);
 	Oid			(*relation_by_name) (void *ctx, Oid namespace, const char *name);
@@ -79,6 +85,12 @@ typedef struct TypedpgCatalog
 void		typedpg_catalog_install(const TypedpgCatalog *catalog);
 
 bool		typedpg_catalog_active(void);
+
+/* Bracket a PL/pgSQL body compilation (see note_body_schema).  Installing a
+ * catalog resets the depth. */
+void		typedpg_catalog_enter_body(void);
+void		typedpg_catalog_leave_body(void);
+bool		typedpg_catalog_in_body(void);
 const TypedpgCatalog *typedpg_catalog(void);
 
 /*

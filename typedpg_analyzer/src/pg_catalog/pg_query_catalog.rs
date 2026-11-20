@@ -24,6 +24,34 @@ fn attribute(a: &PgAttribute) -> CatalogAttribute {
     }
 }
 
+thread_local! {
+    /// While a PL/pgSQL body is compiled: the schemas its declarations name
+    /// explicitly (`LookupExplicitNamespace`), whose USAGE the first call
+    /// requires of the identity running the function — even a declaration
+    /// of a block that never runs is compiled.
+    static COMPILED_SCHEMAS: std::cell::RefCell<Option<Vec<PgNamespaceOid>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, a PL/pgSQL body's compilation, recording the schemas it looks
+/// up explicitly: `%TYPE` / `%ROWTYPE` and declared type names resolve at
+/// compile time, before any statement runs.
+pub(crate) fn record_compiled_schemas<R>(f: impl FnOnce() -> R) -> (R, Vec<PgNamespaceOid>) {
+    struct Restore(Option<Vec<PgNamespaceOid>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMPILED_SCHEMAS.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let outer = COMPILED_SCHEMAS.with(|c| c.replace(Some(Vec::new())));
+    let _restore = Restore(outer);
+    let result = f();
+    let schemas = COMPILED_SCHEMAS
+        .with(|c| c.borrow().clone())
+        .unwrap_or_default();
+    (result, schemas)
+}
+
 impl Catalog for PgCatalog {
     fn type_by_oid(&self, oid: u32) -> Option<CatalogType> {
         let t = self.pg_type.get(&PgTypeOid::new(oid)?)?;
@@ -57,6 +85,19 @@ impl Catalog for PgCatalog {
 
     fn namespace_by_name(&self, name: &str) -> Option<u32> {
         self.namespace_oid(name).map(|o| o.get())
+    }
+
+    fn note_body_schema(&self, namespace: u32) {
+        let Some(oid) = PgNamespaceOid::new(namespace) else {
+            return;
+        };
+        COMPILED_SCHEMAS.with(|c| {
+            if let Some(schemas) = c.borrow_mut().as_mut()
+                && !schemas.contains(&oid)
+            {
+                schemas.push(oid);
+            }
+        });
     }
 
     fn namespace_name(&self, namespace: u32) -> Option<String> {

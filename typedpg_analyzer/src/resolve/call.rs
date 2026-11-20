@@ -53,8 +53,38 @@ pub(crate) fn analyze_call(
         functions::FuncDetail::Coercion(_) => unreachable!("coercion interpretation not requested"),
     };
     ctx.note_proc(Some(resolved.oid));
-    // ExecuteCallStmt: EXECUTE on the procedure.
-    crate::privileges::note_call(snapshot, resolved.oid, false, &fc.args);
+    // ExecuteCallStmt: EXECUTE on the procedure, and the parameter DEFAULT
+    // expressions the call is expanded with — those of the parameters it
+    // leaves out.
+    let certainty: Vec<crate::expr::plan_fold::Certain> = fc
+        .args
+        .iter()
+        .map(|arg| crate::expr::plan_fold::certainly_in(arg.as_ref(), ctx))
+        .collect();
+    crate::privileges::note_call(
+        snapshot,
+        resolved.oid,
+        false,
+        crate::privileges::CallSite::Expression,
+        &fc.args,
+        &certainty,
+    );
+    for default in snapshot
+        .routine_defaults
+        .get(&resolved.oid)
+        .into_iter()
+        .flatten()
+    {
+        if !resolved.default_params.contains(&default.param) {
+            continue;
+        }
+        for &p in &default.procs {
+            crate::privileges::note_routine(p, crate::privileges::RoutineKind::Function);
+        }
+        for &(seq, any_of) in &default.sequences {
+            crate::privileges::note_sequence(seq, any_of);
+        }
+    }
 
     // Coerce each argument to its parameter: pins bare parameters and
     // validates untyped literals (`CALL p('x')` → 22P02 for an integer).

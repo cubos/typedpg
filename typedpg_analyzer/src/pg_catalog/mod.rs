@@ -59,6 +59,7 @@ pub(crate) mod oid {
     pub const NUMERIC: PgTypeOid = PgTypeOid::from_raw(1700);
     pub const JSONB: PgTypeOid = PgTypeOid::from_raw(3802);
     pub const RECORD: PgTypeOid = PgTypeOid::from_raw(2249);
+    pub const VOID: PgTypeOid = PgTypeOid::from_raw(2278);
 }
 
 /// PG's hidden system columns, present on every table/view. Negative attnums
@@ -98,7 +99,7 @@ pub const SQL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(14);
 mod lint_access;
 mod shared;
 pub use shared::Shared;
-mod pg_query_catalog;
+pub(crate) mod pg_query_catalog;
 mod rows;
 pub use rows::*;
 
@@ -264,6 +265,15 @@ pub struct PgCatalog {
     /// Domains with a DEFAULT (other than a bare NULL): a column of one
     /// (or of a domain over one) without a DEFAULT of its own takes it.
     pub(crate) domain_defaults: Shared<std::collections::HashSet<PgTypeOid>>,
+    /// Each domain's DEFAULT expression as written (what its dependencies
+    /// were recorded for): used to fold the code the planner drops before
+    /// charging its functions.
+    pub(crate) domain_default_exprs:
+        Shared<HashMap<PgTypeOid, crate::ddl::tables::check_inherit::StoredExpr>>,
+    /// The sequence functions each domain DEFAULT runs, resolved when the
+    /// domain was created: the privileges they need.
+    pub(crate) domain_default_sequence_perms:
+        Shared<HashMap<PgTypeOid, Vec<crate::privileges::SequencePrivileges>>>,
     pub(crate) domain_constraints:
         Shared<HashMap<PgTypeOid, Vec<crate::ddl::types::DomainConstraint>>>,
     /// Type of each column DEFAULT expression as `strip_implicit_coercions`
@@ -286,6 +296,13 @@ pub struct PgCatalog {
     /// The `allow_system_table_mods` GUC: a superuser may then run DDL on
     /// a system catalog.
     pub(crate) allow_system_table_mods: crate::ddl::session::BoolGuc,
+    /// The `row_security` GUC of the migrations' session (pg_dump output
+    /// sets it off). The application's sessions don't inherit it — their
+    /// value comes from `ALTER ROLE` / `ALTER DATABASE` (`Roles::row_security`);
+    /// it only feeds `ALTER ROLE ... SET row_security FROM CURRENT`.
+    pub(crate) row_security_guc: crate::ddl::session::BoolGuc,
+    /// `ALTER DATABASE ... SET row_security`: the database's new sessions.
+    pub(crate) database_row_security: Option<bool>,
     /// Whether the session's `TimeZone` is UTC — a zone with the one fixed
     /// offset 0 (pg_get_timezone_offset), which makes timestamp <->
     /// timestamptz a relabeling for ALTER COLUMN TYPE
@@ -337,6 +354,10 @@ pub struct PgCatalog {
     /// created by the migrations run (PG expands them into a call that
     /// leaves the parameters out). Built-in routines aren't listed.
     pub(crate) proc_default_procs: Shared<HashMap<PgProcOid, Vec<PgProcOid>>>,
+    /// Each routine's defaulted parameters and what inserting their default
+    /// runs (see [`crate::ddl::functions::RoutineDefault`]).
+    pub(crate) routine_defaults:
+        Shared<HashMap<PgProcOid, Vec<crate::ddl::functions::RoutineDefault>>>,
     /// Base types the migrations created with a `TYPMOD_IN` function (the
     /// built-in ones' are modeled in [`crate::typmod`]).
     pub(crate) types_with_typmodin: Shared<std::collections::HashSet<PgTypeOid>>,
@@ -350,6 +371,10 @@ pub struct PgCatalog {
     /// `pg_partitioned_table.partattrs` of each partitioned table: the
     /// partition key's attnums, `0` for an expression.
     pub(crate) partition_keys: Shared<HashMap<PgClassOid, Vec<i16>>>,
+    /// `pg_partitioned_table.partexprs`: the key expressions' parse trees,
+    /// which `ExecFindPartition` evaluates for every row a write routes.
+    pub(crate) partition_key_exprs:
+        Shared<HashMap<PgClassOid, Vec<crate::pg_catalog::SerializedAst>>>,
     /// `pg_trigger`: each relation's triggers (name and function).
     pub(crate) triggers: Shared<HashMap<PgClassOid, Vec<crate::ddl::triggers::Trigger>>>,
     /// `pg_policy`: each relation's row-security policy names.
@@ -365,12 +390,33 @@ pub struct PgCatalog {
     /// attnums, the analyzer its text, which it re-analyzes only while it
     /// still resolves alike (see [`crate::ddl::views::reanalyze_view`]).
     pub(crate) view_references: Shared<HashMap<PgClassOid, Vec<crate::ddl::depend::Reference>>>,
+    /// What each view's stored query reads, runs and changes, collected
+    /// while the view was defined: the relations and columns whose
+    /// privileges a statement reading the view checks as the view's owner
+    /// (or the caller, for `security_invoker`), the routines it calls and
+    /// the sequences its `nextval` / `currval` / `setval` name.
+    pub(crate) view_access: Shared<HashMap<PgClassOid, crate::privileges::ViewAccess>>,
+    /// The views with a CHECK OPTION: an INSERT into one evaluates the
+    /// view query's WHERE (as the caller) to check the stored rows.
+    pub(crate) check_option_views: Shared<std::collections::HashSet<PgClassOid>>,
+    /// The views whose CHECK OPTION is `CASCADED`: a write through them
+    /// evaluates the WHERE of every view below too (`rewriteTargetView`).
+    pub(crate) cascaded_check_option_views: Shared<std::collections::HashSet<PgClassOid>>,
+    /// The sequences each column default's (or generation expression's)
+    /// `nextval` / `currval` / `setval` calls name, with the privileges
+    /// each needs: what filling the column runs. A bare `'s'::regclass`
+    /// constant records a `pg_depend` edge but calls no sequence function.
+    pub(crate) default_sequence_perms:
+        Shared<HashMap<(PgClassOid, i16), Vec<crate::privileges::SequencePrivileges>>>,
     /// `pg_class.reloftype` of typed tables (`CREATE TABLE ... OF type`).
     pub(crate) typed_tables: Shared<HashMap<PgClassOid, PgTypeOid>>,
     /// Tables with row-level security enabled (`relrowsecurity`): their
     /// policies may hide rows, so a foreign key into one doesn't promise
     /// the referenced row is visible.
     pub(crate) row_security: Shared<std::collections::HashSet<PgClassOid>>,
+    /// Tables with `FORCE ROW LEVEL SECURITY` (`relforcerowsecurity`): row
+    /// security applies to the table's owner too (`check_enable_rls`).
+    pub(crate) force_row_security: Shared<std::collections::HashSet<PgClassOid>>,
     /// Tables whose triggers were all disabled (`DISABLE TRIGGER ALL`),
     /// the internal ones enforcing foreign keys included: a foreign key
     /// from or to one no longer promises anything.
@@ -636,6 +682,14 @@ impl PgCatalog {
     /// created without a named role. Its name carries the reserved `pg_`
     /// prefix, so a migration can never create a role that collides with it.
     ///
+    /// The migrations' user IS the bootstrap superuser (`Roles::bootstrap`):
+    /// the oracle connects as that role, and a deployment's connecting user
+    /// is assumed to be it. The model keeps two ids because the connecting
+    /// user's name is otherwise unknown, but every recorded grantor, owner,
+    /// default-privilege key and identity comparison unifies them
+    /// (`Roles::canonical`), and messages print the bootstrap's name, which
+    /// is the name PG prints for the same role.
+    ///
     /// The `has_*_privilege` queries accept it where they accept a role name.
     pub const MIGRATIONS_USER: &'static str = "pg_typedpg_migrations_user";
 
@@ -869,11 +923,15 @@ impl PgCatalog {
             session_identity: Default::default(),
             domain_constraints: Shared::default(),
             domain_defaults: Shared::default(),
+            domain_default_exprs: Shared::default(),
+            domain_default_sequence_perms: Shared::default(),
             attr_default_types: Shared::default(),
             attr_default_exprs: HashMap::new(),
             generated_refs: Shared::default(),
             check_function_bodies: crate::ddl::session::BoolGuc::new(true),
             allow_system_table_mods: crate::ddl::session::BoolGuc::new(false),
+            row_security_guc: crate::ddl::session::BoolGuc::new(true),
+            database_row_security: None,
             timezone_utc: crate::ddl::session::BoolGuc::new(true),
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
@@ -884,17 +942,24 @@ impl PgCatalog {
             finite_param_types: Default::default(),
             simplify_options: Default::default(),
             proc_default_procs: Shared::default(),
+            routine_defaults: Shared::default(),
             types_with_typmodin: Shared::default(),
             expr_type_uses: Shared::default(),
             sql_function_defs: HashMap::new(),
             partition_keys: Shared::default(),
+            partition_key_exprs: Shared::default(),
             triggers: Shared::default(),
             view_updatability: Shared::default(),
             view_references: Shared::default(),
+            view_access: Shared::default(),
+            check_option_views: Shared::default(),
+            cascaded_check_option_views: Shared::default(),
+            default_sequence_perms: Shared::default(),
             policies: Shared::default(),
             rules: Shared::default(),
             typed_tables: Shared::default(),
             row_security: Shared::default(),
+            force_row_security: Shared::default(),
             ri_triggers_disabled: Shared::default(),
             ri_triggers_ever_disabled: Shared::default(),
             fk_checks_bypassed: false,
@@ -2062,7 +2127,11 @@ impl PgCatalog {
         let roles = self.created_roles();
         match self.with_pg_sanity(|server| {
             server.remember_roles(&roles);
-            server.compare_extension_apply_matches(sql, result)
+            let divergence = server.compare_extension_apply_matches(sql, result);
+            if result.is_ok() && matches!(divergence, Some(None)) {
+                server.assert_privileges_match(self);
+            }
+            divergence
         }) {
             Some(Some(Some(divergence))) => panic!("{}", divergence.message),
             Some(None) => self.pg_sanity_tainted = true,
@@ -2111,6 +2180,23 @@ impl PgCatalog {
         let finite = self.finite_param_oids();
         self.with_pg_sanity(|server| server.check_rewrite(&analysis_sql, &ours, &finite))
             .flatten()
+    }
+
+    /// Run the role oracle on `analysis` as if the analyzer had produced it
+    /// for `sql` run as `role`: the mirror's divergence, if any. For testing
+    /// the oracle itself with analyses no analyzer would produce.
+    #[cfg(feature = "pg_sanity")]
+    pub fn pg_sanity_check_role_analysis(
+        &self,
+        sql: &str,
+        role: &str,
+        analysis: &AnalyzedQuery,
+    ) -> Option<crate::pg_sanity::Divergence> {
+        let (analysis_sql, _) = self.analyze_as_with_sql(sql, role);
+        self.with_pg_sanity(|server| {
+            server.compare_role_matches(&analysis_sql, role, &Ok(analysis.clone()))
+        })
+        .flatten()
     }
 
     /// Analyze `sql` and cross-check the result against the embedded PG
@@ -2238,6 +2324,8 @@ impl PgCatalog {
         self.pg_range.remove(&oid);
         self.domain_constraints.remove(&oid);
         self.domain_defaults.remove(&oid);
+        self.domain_default_exprs.remove(&oid);
+        self.domain_default_sequence_perms.remove(&oid);
         Some(row)
     }
 
@@ -2281,6 +2369,7 @@ impl PgCatalog {
         self.view_references.remove(&oid);
         self.typed_tables.remove(&oid);
         self.row_security.remove(&oid);
+        self.force_row_security.remove(&oid);
         self.ri_triggers_disabled.remove(&oid);
         self.ri_triggers_ever_disabled.remove(&oid);
         self.clustered_indexes.remove(&oid);
@@ -2301,6 +2390,11 @@ impl PgCatalog {
         self.toast_rewrites.remove(&oid);
         self.security_barrier_views.remove(&oid);
         self.security_invoker_views.remove(&oid);
+        self.view_access.remove(&oid);
+        self.check_option_views.remove(&oid);
+        self.cascaded_check_option_views.remove(&oid);
+        self.default_sequence_perms
+            .retain(|(relid, _), _| *relid != oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);
         self.attr_compression.retain(|(relid, _), _| *relid != oid);
         self.uncertain_collations.retain(|(relid, _)| *relid != oid);
@@ -2311,6 +2405,7 @@ impl PgCatalog {
         self.partition_specs.remove(&oid);
         self.partition_key_attrs.remove(&oid);
         self.partition_key_whole_row.remove(&oid);
+        self.partition_key_exprs.remove(&oid);
         self.partition_bounds.remove(&oid);
         let row = self.pg_class.remove(&oid)?;
         self.class_by_qname
@@ -2395,6 +2490,7 @@ impl PgCatalog {
         self.routine_bodies.remove(&oid);
         self.inline_body_trust.remove(&oid);
         self.proc_default_procs.remove(&oid);
+        self.routine_defaults.remove(&oid);
         self.sql_function_defs.remove(&oid);
         let row = self.pg_proc.remove(&oid)?;
         if let Some(v) = self

@@ -103,6 +103,7 @@ pub(crate) fn infer_column_ref(
     ) {
         Ok(col) => {
             super::read_deferred([col], col_ref.location)?;
+            record_column_bindings(scope, snapshot, col_ref.location, &parts, col);
             let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
             Ok(ExprType {
                 type_oid: col.type_oid,
@@ -143,6 +144,9 @@ pub(crate) fn infer_column_ref(
             {
                 scope.check_refname_unique(column, None)?;
                 super::read_deferred(&src.columns, col_ref.location)?;
+                if let Some(relid) = src.relid {
+                    crate::ddl::policies::note_relation_ref(col_ref.location, relid);
+                }
                 return whole_row_ref(src, null_ctx, snapshot);
             }
             // `t.f` naming no column of a FROM entry `t` is the function
@@ -198,10 +202,16 @@ thread_local! {
 /// what PG installs for a SQL function body (`sql_fn_parser_setup`), and
 /// what a PL/pgSQL body's variables add to.
 pub(crate) fn with_sql_function_params<R>(params: SqlFunctionParams, f: impl FnOnce() -> R) -> R {
+    /// Restores the enclosing parameter namespace however `f` ends.
+    struct Restore(Option<SqlFunctionParams>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SQL_FUNCTION_PARAMS.with(|p| *p.borrow_mut() = self.0.take());
+        }
+    }
     let prev = SQL_FUNCTION_PARAMS.with(|p| p.replace(Some(params)));
-    let out = f();
-    SQL_FUNCTION_PARAMS.with(|p| *p.borrow_mut() = prev);
-    out
+    let _restore = Restore(prev);
+    f()
 }
 
 /// PG's `sql_fn_post_column_ref`: consulted only once a column reference
@@ -308,7 +318,57 @@ fn infer_star_ref(
         AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
     })?;
     super::read_deferred(&source.columns, col_ref.location)?;
+    if let Some(relid) = source.relid
+        && let Some(qn) = source.source_qn.as_ref()
+        && qn.name == alias
+        && !source.aliased
+    {
+        crate::ddl::policies::note_qualifier_ref(
+            col_ref.location,
+            relid,
+            true,
+            col_ref.fields.len() >= 3,
+        );
+    }
     whole_row_ref(source, null_ctx, snapshot)
+}
+
+/// Record what the `ColumnRef` at `location` resolved to while a policy
+/// expression is being analyzed: the column (relation and attnum), and the
+/// relation its qualifier named when that was the relation's own name
+/// (which a rename rewrites; an alias never changes).
+fn record_column_bindings(
+    scope: &Scope,
+    snapshot: &PgCatalog,
+    location: i32,
+    parts: &[String],
+    col: &crate::scope::ScopeColumn,
+) {
+    if !crate::ddl::policies::recording() {
+        return;
+    }
+    let Some(source) = scope.column_source(col) else {
+        return;
+    };
+    let Some(relid) = source.relid else {
+        return;
+    };
+    if let Some(a) = snapshot.attribute_by_name(relid, &col.name) {
+        crate::ddl::policies::note_column_ref(location, relid, a.attnum);
+    }
+    if let Some(qn) = source.source_qn.as_ref()
+        && !source.aliased
+    {
+        match parts {
+            [t, _] if t == &qn.name => {
+                crate::ddl::policies::note_qualifier_ref(location, relid, true, false);
+            }
+            [_s, t, _] if t == &qn.name => {
+                crate::ddl::policies::note_qualifier_ref(location, relid, true, true);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// PG's `transformWholeRowRef` / `makeWholeRowVar`: a whole-row reference
@@ -326,7 +386,14 @@ fn whole_row_ref(
     // `(t.*).field` indirection still resolve, and the `record` OID lines
     // up with what PG's wire-protocol Describe reports for these queries.
     if let Some(relid) = source.relid {
-        crate::privileges::note_whole_row(relid);
+        if source.dml_target {
+            crate::privileges::note_target_whole_row(relid, source.sublink);
+        } else {
+            crate::privileges::note_whole_row(relid, source.sublink);
+        }
+    } else {
+        // A derived relation's whole row reads every output.
+        source.note_whole_row();
     }
     if let Some(qn) = source.source_qn.as_ref() {
         let composite_oid = snapshot
@@ -429,4 +496,25 @@ fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod unwind_guards {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn the_parameter_namespace_is_restored_after_a_panic() {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            with_sql_function_params(
+                SqlFunctionParams {
+                    name: "f".to_owned(),
+                    params: Vec::new(),
+                    locals: Vec::new(),
+                },
+                || panic!("boom"),
+            )
+        }));
+        assert!(SQL_FUNCTION_PARAMS.with(|p| p.borrow().is_none()));
+    }
 }

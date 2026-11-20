@@ -41,6 +41,14 @@ pub(crate) fn infer_bool_expr(
     // never reaches the ones after it. Past an argument that may fold to
     // one — a column of a pulled-up subquery, an inlined function, ... (see
     // `foldable`) — nothing is certainly folded either.
+    // A literal FALSE argument of an AND (TRUE of an OR) reduces the whole
+    // expression to it, dropping every other argument — so their relations
+    // and functions are never checked.
+    let literal_decided = and_or
+        && expr.args.iter().any(|a| {
+            super::plan_fold::certainly(a.as_ref(), ctx.snapshot)
+                == super::plan_fold::Certain::Bool(or)
+        });
     let mut dead = false;
     for arg in &expr.args {
         let narrowed = if and_or {
@@ -54,8 +62,13 @@ pub(crate) fn infer_bool_expr(
             None => ctx,
         };
         let arg_dead = dead && !(!or && and_or && super::joined_before_folding(arg.as_ref(), ctx));
-        let t = super::plan_fold::unless_dead(arg_dead, || {
-            crate::clause::coerce_clause_expr(arg.as_ref(), arg_ctx, params, kind)
+        let dropped = literal_decided
+            && super::plan_fold::certainly(arg.as_ref(), ctx.snapshot)
+                != super::plan_fold::Certain::Bool(or);
+        let t = super::plan_fold::unless_dropped(dropped, || {
+            super::plan_fold::unless_dead(arg_dead, || {
+                crate::clause::coerce_clause_expr(arg.as_ref(), arg_ctx, params, kind)
+            })
         })?;
         if and_or {
             let folded = super::plan_fold::fold(arg.as_ref(), ctx.snapshot);
@@ -206,10 +219,19 @@ pub(crate) fn infer_coalesce(
     let mut args = Vec::with_capacity(expr.args.len());
     // Folding stops at the first non-NULL constant argument; past one that
     // may fold to one (see `foldable`), nothing is certainly folded either.
+    // Past a literal one, the other arguments are certainly dropped, and
+    // never checked.
+    let literal_stop = expr
+        .args
+        .iter()
+        .position(|a| super::plan_fold::certainly_non_null_constant(a.as_ref(), snapshot));
     let mut dead = false;
-    for arg in &expr.args {
-        args.push(super::plan_fold::unless_dead(dead, || {
-            infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)
+    for (i, arg) in expr.args.iter().enumerate() {
+        let dropped = literal_stop.is_some_and(|stop| i > stop);
+        args.push(super::plan_fold::unless_dropped(dropped, || {
+            super::plan_fold::unless_dead(dead, || {
+                infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)
+            })
         })?);
         let folded = super::plan_fold::fold(arg.as_ref(), snapshot);
         dead = dead
@@ -484,10 +506,39 @@ pub(crate) fn infer_case(
     // (the ELSE too): past a condition that may fold, nothing is certainly
     // folded.
     let mut may_be_skipped = false;
+    // The same from literal constants alone: code these certainly drop is
+    // never checked. (A simple CASE compares the test expression, so its
+    // WHENs are no literals.)
+    let mut literal_stopped = false;
+    let mut literal_when: Vec<(bool, bool)> = Vec::new();
+    if expr.arg.is_none() {
+        for arg in &expr.args {
+            let Some(ast::Node::CaseWhen(when)) = arg.as_ref() else {
+                continue;
+            };
+            let cond = when
+                .expr
+                .as_ref()
+                .and_then(|c| super::plan_fold::certainly_true(Some(c), snapshot));
+            let cond_dropped = literal_stopped;
+            let result_dropped = literal_stopped || matches!(cond, Some(false));
+            if cond == Some(true) {
+                literal_stopped = true;
+            }
+            literal_when.push((cond_dropped, result_dropped));
+        }
+    }
+    let literal_else_dropped = literal_stopped;
+    let mut literal_index = 0;
     for arg in &expr.args {
         let Some(ast::Node::CaseWhen(when)) = arg.as_ref() else {
             continue;
         };
+        let (literal_cond_dropped, literal_result_dropped) = literal_when
+            .get(literal_index)
+            .copied()
+            .unwrap_or((false, false));
+        literal_index += 1;
         let when_fold = super::plan_fold::case_when(test_fold, when.expr.as_ref(), snapshot);
         let cond_dead = stopped;
         let result_dead = stopped || !super::plan_fold::case_result_reached(when_fold);
@@ -549,13 +600,15 @@ pub(crate) fn infer_case(
                 // `argument of CASE/WHEN must be type boolean, not type X` —
                 // wording and ordering live in the shared clause walker.
                 _ => {
-                    super::plan_fold::unless_dead(cond_dead, || {
-                        crate::clause::coerce_clause_expr(
-                            cond.as_ref(),
-                            cond_ctx,
-                            params,
-                            crate::clause::ClauseKind::CaseWhen,
-                        )
+                    super::plan_fold::unless_dropped(literal_cond_dropped, || {
+                        super::plan_fold::unless_dead(cond_dead, || {
+                            crate::clause::coerce_clause_expr(
+                                cond.as_ref(),
+                                cond_ctx,
+                                params,
+                                crate::clause::ClauseKind::CaseWhen,
+                            )
+                        })
                     })?;
                     taken =
                         crate::nonnull::nonnullable(cond.as_ref(), true, ctx.scope, &log, snapshot);
@@ -589,8 +642,10 @@ pub(crate) fn infer_case(
             };
             results.push((
                 result.as_ref(),
-                super::plan_fold::unless_dead(result_dead, || {
-                    infer_expr(result.as_ref(), result_ctx, params, TypeGoal::NONE)
+                super::plan_fold::unless_dropped(literal_result_dropped, || {
+                    super::plan_fold::unless_dead(result_dead, || {
+                        infer_expr(result.as_ref(), result_ctx, params, TypeGoal::NONE)
+                    })
                 })?,
             ));
         }
@@ -642,8 +697,10 @@ pub(crate) fn infer_case(
             };
             Some((
                 d.as_ref(),
-                super::plan_fold::unless_dead(stopped, || {
-                    infer_expr(d.as_ref(), default_ctx, params, TypeGoal::NONE)
+                super::plan_fold::unless_dropped(literal_else_dropped, || {
+                    super::plan_fold::unless_dead(stopped, || {
+                        infer_expr(d.as_ref(), default_ctx, params, TypeGoal::NONE)
+                    })
                 })?,
             ))
         }

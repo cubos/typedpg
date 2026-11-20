@@ -963,7 +963,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `sql` | The `.sql` files of queries: `{ "include", "emit", "out", "typeNames" }`, see [Queries in .sql files](#queries-in-sql-files). A database has `out`, `sql` or both. |
 | `migrations` | The migrations directory (default `migrations`), or `{ "dir", "table", "lockId", "useTransaction", "failOnDrift", "embed" }` — the runner's settings, as in Rust. `"embed": true` adds the migrations to the generated module. |
 | `extraMigrations` | More directories the schema is built from but the runner doesn't apply (tables another project owns). |
-| `roles` | The database roles every query is checked against, in addition to the schema's owner. Only roles the migrations create can be checked. In the multi-database form, each entry has its own. See [Role checks](#role-checks). |
+| `roles` | The database roles every query is checked against. The generated types come from the first role's analysis — its search path decides the query's unqualified names — and every listed role must resolve the query the same way. Only roles the migrations create can be checked. In the multi-database form, each entry has its own. See [Role checks](#role-checks). |
 | `types` | PG type → TypeScript type, as `"./src/types.ts#Prefs"` (relative to the config) or `"package#Type"`. A JSONB domain, an enum, a composite or any other type; an unqualified name is in `public`, a built-in type is `pg_catalog.<name>`. See [Mapping types](#mapping-types). |
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
@@ -974,14 +974,16 @@ Unknown keys are errors.
 
 ### Role checks
 
-`roles` lists the roles the application connects as. Every query is analyzed as the schema's owner, then as each of them, and one that may not run it is an error at the query — PostgreSQL's message, with the grant that would allow it:
+`roles` lists the roles the application connects as. Every query is analyzed as each of them, and one that may not run it is an error at the query — PostgreSQL's message, with the grant that would allow it. The generated types come from the first role's analysis: its search path decides what the query's unqualified names mean. Roles that resolve the same query to different types are an error naming both, since one module has one type per query:
 
 ```json
 { "out": "src/db.ts", "migrations": "migrations", "roles": ["app_role"] }
 ```
 
 ```sql
--- migrations/0001_app_role.sql
+-- migrations/0002_app_role.sql
+-- Numbered after the migration that creates `users`: the runner applies
+-- migrations by numeric prefix.
 CREATE ROLE app_role;
 GRANT SELECT ON users TO app_role;
 ```
@@ -992,7 +994,7 @@ src/orders.ts:14:5: error: permission denied for table orders
   note: role app_role has no SELECT on public.orders
 ```
 
-The checks are PostgreSQL's own: USAGE on the schemas a query names, SELECT/INSERT/UPDATE/DELETE on its relations (per column where that is what the role is granted), EXECUTE on the routines it calls, and the sequence privileges of serial columns and `nextval`. Unqualified names resolve along the role's search path; views are read as their owner unless `security_invoker`. The bodies of the triggers a statement fires and of the routines it calls are checked recursively: a body runs with the statement's role, or with its owner's under `SECURITY DEFINER`, and what it reads and writes must be allowed too — except dynamic SQL (`EXECUTE`) and statements typedpg can't analyze. Only roles the migrations create can be checked — naming another is `role "x" does not exist (typedpg can check only the roles the migrations create)`. Row-level security and `COPY` are not checked. In the multi-database form, `roles` goes in each `databases` entry.
+The checks are PostgreSQL's own: USAGE on the schemas a query names, SELECT/INSERT/UPDATE/DELETE on its relations (per column where that is what the role is granted), EXECUTE on the routines it calls, and the sequence privileges of serial columns and `nextval` (an identity column's sequence needs no grant). Unqualified names resolve along the role's search path; views are read as their owner unless `security_invoker`. The bodies of the triggers a statement fires and of the routines it calls are checked recursively: a body runs with the statement's role, or with its owner's under `SECURITY DEFINER`, and what it reads and writes must be allowed too — except dynamic SQL (`EXECUTE`) and statements typedpg can't analyze. Only roles the migrations create can be checked — naming another is `role "x" does not exist (typedpg can check only the roles the migrations create)`. Row-level security and `COPY` are not checked. In the multi-database form, `roles` goes in each `databases` entry.
 
 ## Limits
 

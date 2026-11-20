@@ -147,6 +147,11 @@ pub(crate) fn rename_column(interp: &mut PgCatalog, relid: PgClassOid, old: &str
         .iter()
         .map(|a| a.attname.clone())
         .collect();
+    // Stored policy expressions that read the column follow it (PG keeps
+    // them by attnum).
+    if let Some(attnum) = interp.attribute_by_name(relid, old).map(|a| a.attnum) {
+        crate::ddl::policies::rewrite_column_refs(interp, relid, attnum, new);
+    }
     let checks: Vec<_> = interp
         .pg_constraint
         .values()

@@ -69,8 +69,21 @@ fn handle_nullif(
     let left = infer_expr(lexpr.as_ref(), ctx, params, TypeGoal::NONE)?;
     let right = infer_expr(rexpr.as_ref(), ctx, params, TypeGoal::NONE)?;
     let name = |t: PgTypeOid| crate::ddl::util::format_type_for_message(snapshot, t);
-    let op = match snapshot.find_operator_detailed("=", Some(left.type_oid), right.type_oid) {
-        crate::lookup::OperatorMatch::Found(op) => op,
+    // `eval_const_expressions` folds a NULLIF with a certainly NULL operand
+    // to that operand without initializing the `=` function: the operator is
+    // resolved quietly, and its EXECUTE noted only when the call survives.
+    let certainty = [
+        crate::expr::plan_fold::certainly_in(lexpr.as_ref(), ctx),
+        crate::expr::plan_fold::certainly_in(rexpr.as_ref(), ctx),
+    ];
+    let folds_to_null = certainty.contains(&crate::expr::plan_fold::Certain::Null);
+    let op = match crate::privileges::resolve_operator_quietly(|| {
+        snapshot.find_operator_detailed("=", Some(left.type_oid), right.type_oid)
+    }) {
+        crate::lookup::OperatorMatch::Found(op) => {
+            crate::ddl::policies::note_operator_ref(expr.location, op.oid);
+            op
+        }
         crate::lookup::OperatorMatch::Ambiguous => {
             return Err(crate::pgmsg::operator_is_not_unique(
                 &name(left.type_oid),
@@ -95,6 +108,15 @@ fn handle_nullif(
     }
     if right.type_oid == oid::UNKNOWN {
         coerce_unknown_to(rexpr.as_ref(), ctx, params, op.right_type_oid)?;
+    }
+    // A `NullIfExpr` is no plain `OpExpr`: `eval_const_expressions` folds it
+    // only when both arguments are constants and neither is NULL, running
+    // the `=` function then (it never inlines it). The executor initializes
+    // its `=` function like any operator call's, so its EXECUTE is checked
+    // here (the resolution above was quiet).
+    if !folds_to_null && let Some(proc) = op.code.and_then(|code| snapshot.pg_proc.get(&code)) {
+        crate::privileges::note_routine(proc.oid, crate::privileges::RoutineKind::Function);
+        crate::privileges::note_operator_folded(snapshot, proc, &certainty);
     }
     if op.result_type_oid != oid::BOOL {
         return Err(AnalyzeError::DatatypeMismatch(
@@ -401,6 +423,19 @@ fn handle_in_list(
             };
             if let Some(o) = snapshot.find_operator(op, Some(left_oid), common) {
                 nullable |= operator_call_nullable(snapshot, op, &o, Some(left_oid), common);
+                // The folded `a op ANY(ARRAY[…])` is a `ScalarArrayOpExpr`
+                // whose comparison function runs while planning when `a` is
+                // a constant too (the array it is compared with is one).
+                if let Some(proc) = o.code.and_then(|code| snapshot.pg_proc.get(&code)) {
+                    crate::privileges::note_operator_folded(
+                        snapshot,
+                        proc,
+                        &[
+                            crate::expr::plan_fold::certainly_in(a.as_ref(), ctx),
+                            crate::expr::plan_fold::Certain::Value,
+                        ],
+                    );
+                }
             }
         }
     }
@@ -419,8 +454,28 @@ fn handle_in_list(
         }
         _ => None,
     };
+    // `transformAExprIn` resolves each remaining comparison over the
+    // *transformed* operands: a `ROW(...)` cast to a composite type is still
+    // a row constructor there (`coerce_to_composite_type` rebuilds it with
+    // its fields coerced), so a single-item `ROW(a, b)::ct IN (ROW(1, 2))`
+    // is compared field by field and never calls the composite type's `=`.
+    let left_row = if untyped_param.is_none() {
+        transformed_row_args(a.as_ref(), ctx, params)?
+    } else {
+        None
+    };
     for (i, (item, _, _)) in items.iter().enumerate() {
         if folded[i] {
+            continue;
+        }
+        if let Some((left_args, left_location)) = &left_row
+            && let Some((item_args, item_location)) =
+                transformed_row_args(item.as_ref(), ctx, params)?
+        {
+            let l = row_expr_node(left_args.clone(), *left_location);
+            let r = row_expr_node(item_args, item_location);
+            nullable |= infer_synthetic_op(op, l.as_ref(), r.as_ref(), expr.location, ctx, params)?
+                .nullable;
             continue;
         }
         // Each remaining comparison is an operator call: NULL-able when it
@@ -448,6 +503,123 @@ fn handle_in_list(
         }
     }
     Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
+}
+
+/// The row constructor a `Node` becomes under PG's transform, as the fields
+/// a row comparison compares, and its location: a `ROW(...)` (with stars
+/// expanded), a `ROW(...)` cast to a composite type (`coerce_to_composite_
+/// type` rebuilds the row, each field coerced to the composite's own
+/// attribute type), a cast to `record` (which leaves the row as it is) —
+/// but not a cast to a domain, which wraps the row in a `CoerceToDomain`
+/// and compares through the domain's own operators. `None` for anything
+/// else.
+/// A row's fields as a row comparison compares them, and its location.
+type RowFields = (Vec<Option<ast::Node>>, i32);
+
+fn transformed_row_args(
+    node: Option<&ast::Node>,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Result<Option<RowFields>, AnalyzeError> {
+    let snapshot = ctx.snapshot;
+    match node {
+        Some(ast::Node::RowExpr(row)) => Ok(Some((
+            expand_row_args(&row.args, ctx, params)?.into_owned(),
+            row.location,
+        ))),
+        Some(ast::Node::TypeCast(cast)) => {
+            let Some(tn) = cast.type_name.as_ref() else {
+                return Ok(None);
+            };
+            if !tn.array_bounds.is_empty() {
+                return Ok(None);
+            }
+            let Some(target) = crate::ddl::util::resolve_type_name(tn, snapshot) else {
+                return Ok(None);
+            };
+            if target == oid::RECORD {
+                let Some(arg) = cast.arg.as_ref() else {
+                    return Ok(None);
+                };
+                return transformed_row_args(Some(arg), ctx, params);
+            }
+            let Some(ty) = snapshot.get_type(target) else {
+                return Ok(None);
+            };
+            if ty.typtype == TypType::Domain {
+                return Ok(None);
+            }
+            let Some(relid) = ty.typrelid else {
+                return Ok(None);
+            };
+            let Some(arg) = cast.arg.as_ref() else {
+                return Ok(None);
+            };
+            let Some((args, location)) = transformed_row_args(Some(arg), ctx, params)? else {
+                return Ok(None);
+            };
+            let fields: Vec<_> = snapshot
+                .attributes_of(relid)
+                .iter()
+                .filter(|a| a.attnum > 0)
+                .cloned()
+                .collect();
+            if fields.len() != args.len() {
+                // The cast itself would have failed; leave the comparison to
+                // the scalar operator.
+                return Ok(None);
+            }
+            Ok(Some((
+                args.into_iter()
+                    .zip(&fields)
+                    .map(|(arg, field)| coerce_row_field(arg, field.atttypid, ctx, params))
+                    .collect(),
+                location,
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `coerce_to_composite_type` coerces each row field to the composite's own
+/// attribute type; the analyzer's nodes are raw, so the coercion is spelled
+/// as a cast. Only the pair's operator resolution reads it — the operand's
+/// own analysis already reported the same cast.
+fn coerce_row_field(
+    arg: Option<ast::Node>,
+    ty: PgTypeOid,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Option<ast::Node> {
+    let mut scratch = params.clone();
+    let same =
+        infer_expr(arg.as_ref(), ctx, &mut scratch, TypeGoal::NONE).is_ok_and(|t| t.type_oid == ty);
+    if same {
+        return arg;
+    }
+    Some(ast::Node::TypeCast(typedpg_pg_query::NodeBox::new(
+        ast::TypeCast {
+            arg,
+            type_name: Some(typedpg_pg_query::NodeBox::new(ast::TypeName {
+                type_oid: ty.get(),
+                location: -1,
+                ..Default::default()
+            })),
+            location: -1,
+        },
+    )))
+}
+
+/// A `RowExpr` node over `args`.
+fn row_expr_node(args: Vec<Option<ast::Node>>, location: i32) -> Option<ast::Node> {
+    Some(ast::Node::RowExpr(typedpg_pg_query::NodeBox::new(
+        ast::RowExpr {
+            args,
+            row_format: ast::CoercionForm::CoerceImplicitCast,
+            location,
+            ..Default::default()
+        },
+    )))
 }
 
 /// Resolve `l op r` exactly as a written binary operator would be — the
@@ -619,7 +791,10 @@ fn handle_any_all(
     let mut op_nullable = false;
     if !op_name.is_empty() {
         let op = match snapshot.find_operator_detailed(&op_name, Some(left_oid), rtype) {
-            crate::lookup::OperatorMatch::Found(op) => op,
+            crate::lookup::OperatorMatch::Found(op) => {
+                crate::ddl::policies::note_operator_ref(expr.location, op.oid);
+                op
+            }
             crate::lookup::OperatorMatch::NotFound => {
                 let err = crate::pgmsg::operator_does_not_exist(
                     &shown(left_oid),
@@ -679,6 +854,24 @@ fn handle_any_all(
         // coercion of the left operand or of an element to the operator's
         // declared types.
         note_builtin_compare(expr.location, &op_name, &op, ctx);
+        // A `ScalarArrayOpExpr` folds when both arguments are constants
+        // (`eval_const_expressions`), running the comparison function; it is
+        // never inlined.
+        let certainty = [
+            expr.lexpr
+                .as_ref()
+                .map_or(crate::expr::plan_fold::Certain::Not, |l| {
+                    crate::expr::plan_fold::certainly_in(Some(l), ctx)
+                }),
+            expr.rexpr
+                .as_ref()
+                .map_or(crate::expr::plan_fold::Certain::Not, |r| {
+                    crate::expr::plan_fold::certainly_in(Some(r), ctx)
+                }),
+        ];
+        if let Some(proc) = op.code.and_then(|code| snapshot.pg_proc.get(&code)) {
+            crate::privileges::note_operator_folded(snapshot, proc, &certainty);
+        }
         ctx.note_strict(
             expr.location,
             crate::nonnull::StrictNode::Op,
@@ -1009,17 +1202,28 @@ fn infer_generic_binary_op(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
-    // Pass 1: infer both sides bottom-up.
-    let left = expr
-        .lexpr
-        .is_some()
-        .then(|| infer_expr(expr.lexpr.as_ref(), ctx, params, TypeGoal::NONE))
-        .transpose()?;
-    let right = expr
-        .rexpr
-        .is_some()
-        .then(|| infer_expr(expr.rexpr.as_ref(), ctx, params, TypeGoal::NONE))
-        .transpose()?;
+    // Pass 1: infer both sides bottom-up, each keeping its own requirements:
+    // a STRICT operator with a certainly NULL operand becomes NULL before
+    // the executor initializes it (`evaluate_function`), and only what the
+    // planner folded of the operands still runs then.
+    let (left, left_req) = match expr.lexpr.as_ref() {
+        Some(n) => {
+            let (t, req) = crate::privileges::collect_argument(|| {
+                infer_expr(Some(n), ctx, params, TypeGoal::NONE)
+            });
+            (Some(t?), req)
+        }
+        None => (None, None),
+    };
+    let (right, right_req) = match expr.rexpr.as_ref() {
+        Some(n) => {
+            let (t, req) = crate::privileges::collect_argument(|| {
+                infer_expr(Some(n), ctx, params, TypeGoal::NONE)
+            });
+            (Some(t?), req)
+        }
+        None => (None, None),
+    };
 
     let left_oid = left.as_ref().map(|l| l.type_oid);
     let right_oid = right.as_ref().map(|r| r.type_oid).unwrap_or(oid::UNKNOWN);
@@ -1047,10 +1251,42 @@ fn infer_generic_binary_op(
     // Operator lookup with the bottom-up types — UNKNOWN sides are resolved
     // by `find_operator`'s own rules (homogeneous probe, category and text
     // fallbacks), exactly like PG; the unknown side is *not* pre-pinned to
-    // the concrete peer's type.
-    match snapshot.find_operator_detailed(op_name, left_oid_resolved, right_oid_resolved) {
+    // the concrete peer's type. The call site records the function's
+    // privileges itself, once it knows whether the call survives
+    // (`resolve_operator_quietly`).
+    let matched = crate::privileges::resolve_operator_quietly(|| {
+        snapshot.find_operator_detailed(op_name, left_oid_resolved, right_oid_resolved)
+    });
+    match matched {
         crate::lookup::OperatorMatch::Found(op) => {
+            crate::ddl::policies::note_operator_ref(expr.location, op.oid);
             ctx.note_proc(op.code);
+            // The operator is a call of its function, which the executor
+            // initializes like a `FuncExpr`'s — and a STRICT one with a
+            // certainly NULL operand is replaced by NULL before that.
+            let certainty: Vec<crate::expr::plan_fold::Certain> =
+                [expr.lexpr.as_ref(), expr.rexpr.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|operand| crate::expr::plan_fold::certainly_in(Some(operand), ctx))
+                    .collect();
+            let folds = op
+                .code
+                .and_then(|code| snapshot.pg_proc.get(&code))
+                .is_some_and(|proc| crate::privileges::folds_to_null(proc, &certainty));
+            if folds {
+                // The operands were simplified first (`simplify_function`
+                // processes them before `evaluate_function`'s NULL
+                // shortcut): an IMMUTABLE call over constants there runs.
+                crate::privileges::keep_argument_simplified(left_req.as_ref());
+                crate::privileges::keep_argument_simplified(right_req.as_ref());
+            } else {
+                crate::privileges::keep_argument(left_req.as_ref(), true);
+                crate::privileges::keep_argument(right_req.as_ref(), true);
+                if let Some(proc) = op.code.and_then(|code| snapshot.pg_proc.get(&code)) {
+                    crate::privileges::note_operator(snapshot, proc, &certainty);
+                }
+            }
             ctx.note_strict(
                 expr.location,
                 crate::nonnull::StrictNode::Op,

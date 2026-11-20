@@ -895,6 +895,8 @@ error: permission denied for table orders
 
 The analysis makes the same checks PostgreSQL makes when the role prepares and executes the statement: USAGE on the schemas it names, SELECT/INSERT/UPDATE/DELETE on its relations — per column where that is what the role is granted — EXECUTE on the routines the plan runs, and the sequence privileges of `nextval` and of serial columns' defaults. It resolves unqualified names along the role's own search path (`ALTER ROLE … SET search_path`); a view is read as its owner unless it is `security_invoker`, and a write through an auto-updatable view is checked on the base table, as PostgreSQL does.
 
+The routines and triggers a statement runs are checked too, recursively: a `SECURITY DEFINER` body runs as its owner, anything else as the role running the statement, and a body resolves its names along its own `SET search_path` or — without one — the path in effect at the call site (a `SECURITY DEFINER` body does not read the owner's `ALTER ROLE … SET search_path`). A statement is checked against everything it *may* run for some data: every trigger that may fire and every body statement that may be reached. Code that provably never runs is pruned: `IF` / `ELSIF` / `CASE` / `WHILE` conditions the planner certainly folds to a constant (immutable operators and functions over constants; never a domain coercion or a non-immutable cast), with the same certainty dropping `CASE` results, `COALESCE` arguments after a constant, the dead side of `AND` / `OR`, and the functions of stored `CHECK`s, column defaults, generated columns, index expressions and predicates, conditions on `TG_OP`, `TG_WHEN`, `TG_LEVEL`, `TG_TABLE_NAME`, `TG_TABLE_SCHEMA`, `TG_RELNAME` or `TG_NAME` evaluated for the known firing (an unknown `TG_*` is never NULL), statements after an unconditional `RETURN` / `RAISE EXCEPTION`, after a nested block whose list ends so, or after an `IF` whose every branch including `ELSE` ends, `DECLARE` defaults of blocks never entered, the body of a `BEGIN … EXCEPTION` block whose handler catches `insufficient_privilege`, SQLSTATE `'42501'` or `OTHERS` and doesn't re-raise — the handler's own statements are still checked, and a deferrable constraint trigger's denial at commit is not caught. A cursor's query is checked when the cursor is opened. A trigger whose `WHEN` condition certainly folds to false never fires; otherwise the condition's functions and operators are checked as the caller (they run per row) and its body is checked. A write through an auto-updatable view checks only the view's `WHERE` (under a `CHECK OPTION`, `CASCADED` reaching the views below), not its select list, and an inlined SQL function skips the arguments its body doesn't use. An `UPDATE` may be non-HOT for the data, so every index's expressions and predicate are checked. A row trigger on a partitioned table fires through its clones on the partitions, with each clone's own enabled state, and an `UPDATE` that may move a row between partitions — the SET list or a BEFORE row trigger may change a key column — fires the source partition's `DELETE` row triggers and the destination's `INSERT` ones. An SQL-standard body (`BEGIN ATOMIC … END` / `RETURN …`) is resolved when its function is created, as PostgreSQL stores it analyzed: it reads the objects the creation search path found, and running it checks no schema USAGE.
+
 `roles` is per database (in `[package.metadata.typedpg.databases.<name>.database]` for a named one). A `role = "..."` prefix at the call site replaces the configured roles for that one statement; the two prefixes go in either order:
 
 ```rust
@@ -907,13 +909,17 @@ Only roles the migrations create can be checked: typedpg's catalog knows what th
 
 ### Keeping crates out of each other's tables
 
-The same check keeps a workspace split by domain honest, even when every crate connects as one database role in production: give each crate a role of its own that exists only for the analysis. Put the roles and their grants in a directory the crates list in `extra_migrations` — files there build the compile-time schema but are never applied by the migration runner — and configure each crate's `roles`:
+The same check keeps a workspace split by domain honest, even when every crate connects as one database role in production: give each crate a role of its own that exists only for the analysis. Put the roles and their grants in a directory the crates list in `extra_migrations` — files there build the compile-time schema but are never applied by the migration runner — and configure each crate's `roles`. Files from `migrations` and every `extra_migrations` directory are merged and applied in one order — by numeric prefix, then file name (what `typedpg_core::migrations::compare_migration_names` defines, and how the runner orders its own migrations) — so the role file is numbered after the migrations that create the tables it grants on:
 
 ```sql
--- analysis/0001_crate_roles.sql
+-- analysis/9000_crate_roles.sql
 CREATE ROLE placement;
 GRANT pg_read_all_data TO placement;           -- reads anything
 GRANT INSERT, UPDATE, DELETE ON machines TO placement;
+-- `pg_read_all_data` covers SELECT only. A serial column's `nextval`
+-- still needs USAGE on its sequence; an identity column's sequence comes
+-- with the table's INSERT and needs no grant.
+GRANT USAGE ON SEQUENCE machines_id_seq TO placement;
 
 CREATE ROLE people;
 GRANT pg_read_all_data TO people;

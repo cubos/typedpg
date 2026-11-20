@@ -397,6 +397,16 @@ pub(crate) fn infer_type_cast(
         return Ok(result);
     }
 
+    // A cast to a domain builds a CoerceToDomain unless the value already
+    // is of the domain's type (coerce_type): the domain's checks run here.
+    if target_oid != inner_type.type_oid
+        && snapshot
+            .get_type(target_oid)
+            .is_some_and(|t| t.typtype == TypType::Domain)
+    {
+        crate::privileges::note_domain_coercion(target_oid);
+    }
+
     // PG: the cast result has exactly the written typmod — `x::T(n)` is
     // T(n), and `x::T` is T with typmod -1 even when x already was a T(n)
     // (coerce_type_typmod relabels to the target typmod).

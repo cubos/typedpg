@@ -77,11 +77,25 @@ pub(crate) fn infer_indirection(
                             })))
                         };
                         let location = crate::error::node_location(arg.as_ref()).unwrap_or(-1);
-                        match super::func_call::infer_column_notation_call(
-                            &s.sval, value, location, ctx, params,
-                        ) {
-                            Some(call) => call?,
-                            None => return Err(e),
+                        let bound =
+                            crate::ddl::policies::bound_indirection_function(location, &s.sval);
+                        if let Some(oid) = bound
+                            && let Some(call) = super::func_call::infer_bound_column_notation_call(
+                                oid,
+                                value.clone(),
+                                location,
+                                ctx,
+                                params,
+                            )
+                        {
+                            call?
+                        } else {
+                            match super::func_call::infer_column_notation_call(
+                                &s.sval, value, location, ctx, params,
+                            ) {
+                                Some(call) => call?,
+                                None => return Err(e),
+                            }
                         }
                     }
                 };

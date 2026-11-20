@@ -23,6 +23,7 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
             origin: None,
+            output: None,
         })
         .collect()
 }
@@ -68,6 +69,10 @@ pub(crate) struct ScopeColumn {
     pub origin: Option<Origin>,
     /// Errors the planner raises planning the value (see [`Deferred`]).
     pub deferred: Deferred,
+    /// For a derived relation's column (a FROM subquery's, an inlined
+    /// CTE's): the output bucket it is, whose expression the planner drops
+    /// when nothing reads it (see [`crate::privileges::collect_output`]).
+    pub output: Option<crate::privileges::OutputRef>,
 }
 
 /// The errors the planner raises planning a FROM entry's column it
@@ -230,10 +235,25 @@ pub(crate) fn fresh_scan_id() -> u32 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where a FROM item is written: the span its errors point at (and that
+/// the relation's `pg_depend` rows were recorded from), the parse `location`
+/// a stored policy expression's reference is keyed by, and whether the item
+/// gave the relation an alias (which a rename never rewrites).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SourceSite {
+    pub span: Option<SourceSpan>,
+    pub location: i32,
+    pub aliased: bool,
+}
+
 /// A table-like source in the FROM clause.
 #[derive(Debug, Clone)]
 pub(crate) struct TableSource {
     pub alias: String,
+    /// The query gave this entry an alias: its name then isn't the
+    /// relation's, and a relation rename never rewrites a reference
+    /// qualified by it.
+    pub aliased: bool,
     pub columns: Vec<ScopeColumn>,
     /// PG's hidden columns (`tableoid`, `xmin`, ...) for real relations.
     /// Kept separate so `SELECT *` expansion and ambiguity checks ignore them,
@@ -257,6 +277,12 @@ pub(crate) struct TableSource {
     /// The relation behind a FROM item that names one (dependencies on its
     /// columns are noted as they are resolved).
     pub relid: Option<crate::oid::PgClassOid>,
+    /// Whether the entry was added by a sublink's query level inside an
+    /// output expression (see
+    /// [`crate::privileges::current_level_is_sublink`]): a privilege mark
+    /// resolved here was made by that sublink's parse, so it goes with the
+    /// containing output. `false` for sources of the statement's own levels.
+    pub sublink: bool,
     /// For a FROM function returning a named composite type: each column's
     /// attribute of the type's relation, by position (dependencies on them
     /// are noted as the columns are resolved — process_function_rte_ref).
@@ -415,10 +441,12 @@ impl TableSource {
     pub(crate) fn derived(alias: &str, columns: Vec<ScopeColumn>) -> Self {
         TableSource {
             alias: alias.to_owned(),
+            aliased: false,
             columns,
             system_columns: Vec::new(),
             source_qn: None,
             relid: None,
+            sublink: false,
             rowtype_columns: Vec::new(),
             join_hidden: Default::default(),
             lateral_blocked: false,
@@ -464,7 +492,13 @@ impl TableSource {
     pub(crate) fn note_column(&self, name: &str) {
         if let Some(relid) = self.relid {
             crate::ddl::depend::note_column(relid, name);
-            crate::privileges::note_column_by_name(relid, name);
+            // A read of the statement's own DML target is a SELECT
+            // requirement of that target (markVarForSelectPriv).
+            if self.dml_target {
+                crate::privileges::note_target_column_by_name(relid, name, self.sublink);
+            } else {
+                crate::privileges::note_column_by_name(relid, name, self.sublink);
+            }
         } else if let Some(Some((relid, attname))) = self
             .columns
             .iter()
@@ -472,6 +506,31 @@ impl TableSource {
             .and_then(|i| self.rowtype_columns.get(i))
         {
             crate::ddl::depend::note_column(*relid, attname);
+        }
+        // A derived relation's output column: only its expression runs.
+        if let Some(output) = self
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.output)
+        {
+            crate::privileges::note_output_used(output.group, output.index);
+        }
+    }
+
+    /// Every column of this FROM item is read (a whole-row reference).
+    pub(crate) fn note_whole_row(&self) {
+        if let Some(relid) = self.relid {
+            if self.dml_target {
+                crate::privileges::note_target_whole_row(relid, self.sublink);
+            } else {
+                crate::privileges::note_whole_row(relid, self.sublink);
+            }
+        }
+        for column in &self.columns {
+            if let Some(output) = column.output {
+                crate::privileges::note_output_used(output.group, output.index);
+            }
         }
     }
 
@@ -755,6 +814,38 @@ fn perhaps_column_hint(matches: &[(&str, &str)]) -> Option<String> {
 }
 
 impl Scope {
+    /// Whether `table` names one of this level's own FROM items (a whole-row
+    /// reference's Var).
+    pub(crate) fn is_level_source(&self, table: &str) -> bool {
+        self.sources.iter().any(|s| s.answers_to(table))
+    }
+
+    /// The aliases of this level's own FROM items a column reference
+    /// `table.column` (or `column`) resolves to — the relations of the Vars
+    /// `pull_varnos` would find. Empty when the reference isn't one of this
+    /// level's (a correlated outer reference, or nothing at all). Read-only,
+    /// so the planner model can call it.
+    pub(crate) fn level_column_sources(&self, table: Option<&str>, column: &str) -> Vec<&str> {
+        let matches = |s: &TableSource| match table {
+            Some(table) => {
+                s.answers_to(table)
+                    && s.columns
+                        .iter()
+                        .chain(s.system_columns.iter())
+                        .any(|c| c.name == column)
+            }
+            None => s
+                .visible_columns()
+                .chain(s.visible_system_columns())
+                .any(|c| c.name == column),
+        };
+        self.sources
+            .iter()
+            .filter(|s| matches(s))
+            .map(|s| s.alias.as_str())
+            .collect()
+    }
+
     /// PG (SQLSTATE 42712): every FROM item of one query level needs a
     /// distinct alias — `FROM users u, posts u` is rejected. The synthetic
     /// empty-alias sources produced by JOIN USING merging are exempt.
@@ -784,18 +875,67 @@ impl Scope {
         schema: Option<&str>,
         name: &str,
         alias: &str,
-        span: Option<SourceSpan>,
+        site: SourceSite,
     ) -> Result<(), AnalyzeError> {
-        self.check_duplicate_alias(alias, span)?;
         let table = snapshot
             .resolve_table(schema, name)
-            .ok_or_else(|| undefined_table_error(snapshot, schema, name, span))?;
+            .ok_or_else(|| undefined_table_error(snapshot, schema, name, site.span))?;
+        self.add_relation_source(snapshot, table, alias, site, true)
+    }
+
+    /// Add a trigger's transition table (`REFERENCING NEW TABLE AS
+    /// new_rows`): the trigger relation's columns, with no privilege
+    /// requirement — the rows are the statement's own, so PG checks no
+    /// permission to read them.
+    pub(crate) fn add_transition_table(
+        &mut self,
+        snapshot: &PgCatalog,
+        relid: crate::oid::PgClassOid,
+        alias: &str,
+        span: Option<SourceSpan>,
+    ) -> Result<(), AnalyzeError> {
+        let Some(table) = snapshot.pg_class.get(&relid) else {
+            return Err(AnalyzeError::Internal(format!(
+                "transition table of unknown relation {relid:?}"
+            )));
+        };
+        self.add_relation_source(
+            snapshot,
+            table,
+            alias,
+            SourceSite {
+                span,
+                location: -1,
+                ..SourceSite::default()
+            },
+            false,
+        )
+    }
+
+    /// Add a relation's columns as a FROM entry; `required` is whether the
+    /// statement reads the relation itself (which requires SELECT on it and
+    /// makes it a dependency).
+    fn add_relation_source(
+        &mut self,
+        snapshot: &PgCatalog,
+        table: &crate::pg_catalog::PgClass,
+        alias: &str,
+        site: SourceSite,
+        required: bool,
+    ) -> Result<(), AnalyzeError> {
+        self.check_duplicate_alias(alias, site.span)?;
         check_relation_opens(table)?;
         let table_oid = table.oid;
-        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(table_oid));
-        // addRangeTableEntry: a relation read in FROM requires SELECT.
-        crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::SELECT);
-        crate::privileges::note_scan(table_oid);
+        if required {
+            crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(table_oid));
+            // addRangeTableEntry: a relation read in FROM requires SELECT.
+            crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::SELECT);
+            crate::privileges::note_scan(table_oid);
+            if crate::privileges::from_item_is_empty(alias) {
+                crate::privileges::note_proven_empty(table_oid);
+            }
+            crate::ddl::policies::note_relation_ref(site.location, table_oid);
+        }
         let nspname = snapshot
             .namespace_name(table.relnamespace)
             .map(str::to_owned)
@@ -839,18 +979,25 @@ impl Scope {
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
+                output: None,
             })
             .collect();
 
         self.sources.push(TableSource {
-            system_columns: if is_view {
+            aliased: site.aliased,
+            system_columns: if is_view || !required {
                 Vec::new()
             } else {
                 system_columns_for(alias)
             },
             source_qn: Some(QualifiedName::new(nspname, relname)),
-            relid: Some(table_oid),
-            kind: SourceKind::Relation,
+            relid: required.then_some(table_oid),
+            sublink: crate::privileges::current_level_is_sublink(),
+            kind: if required {
+                SourceKind::Relation
+            } else {
+                SourceKind::Other
+            },
             ..TableSource::derived(alias, columns)
         });
         Ok(())
@@ -938,6 +1085,7 @@ impl Scope {
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
+                output: None,
             })
             .collect();
         let relid = columns.first().map(|c| c.attrelid);
@@ -948,6 +1096,7 @@ impl Scope {
             system_columns: system_columns_for(alias),
             source_qn: Some(qn),
             relid,
+            sublink: crate::privileges::current_level_is_sublink(),
             kind: SourceKind::Relation,
             dml_target: true,
             ..TableSource::derived(alias, cols)
@@ -1101,6 +1250,12 @@ impl Scope {
 
     pub fn find_source(&self, alias: &str) -> Option<&TableSource> {
         self.all_tiers().find(|s| s.answers_to(alias))
+    }
+
+    /// The FROM entry `col` came from (the column is one of its own).
+    pub(crate) fn column_source(&self, col: &ScopeColumn) -> Option<&TableSource> {
+        self.all_tiers()
+            .find(|s| s.columns.iter().any(|c| std::ptr::eq(c, col)))
     }
 
     pub fn resolve_column(

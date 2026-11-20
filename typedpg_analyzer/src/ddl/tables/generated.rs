@@ -516,6 +516,7 @@ pub(crate) fn generation_not_null(
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
             origin: None,
+            output: None,
         })
         .collect();
     let mut scope = Scope::default();

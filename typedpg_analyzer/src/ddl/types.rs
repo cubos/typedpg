@@ -81,6 +81,8 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     let mut constraints: Vec<DomainConstraint> = Vec::new();
     let mut saw_default = false;
     let mut has_default = false;
+    let mut default_expr: Option<crate::ddl::tables::check_inherit::StoredExpr> = None;
+    let mut default_sequences = Vec::new();
     let mut default_refs: Vec<super::depend::Reference> = Vec::new();
     let mut null_defined = false;
     let mut typ_not_null = false;
@@ -163,6 +165,10 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
                 base_type_oid,
             ));
             has_default = !is_null_constant(expr);
+            if has_default {
+                default_expr = Some(crate::ddl::tables::check_inherit::StoredExpr::written(expr));
+                crate::ddl::defaults::sequence_function_refs(interp, expr, &mut default_sequences);
+            }
         }
         add_domain_constraint(interp, &name, base_type_oid, c, &mut constraints)?;
     }
@@ -227,6 +233,14 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     register_array_type(interp, nsoid, &name, oid)?;
     if has_default {
         interp.domain_defaults.insert(oid);
+        if let Some(expr) = default_expr {
+            interp.domain_default_exprs.insert(oid, expr);
+        }
+        if !default_sequences.is_empty() {
+            interp
+                .domain_default_sequence_perms
+                .insert(oid, default_sequences);
+        }
     }
     interp.domain_constraints.insert(oid, constraints);
     record_domain_constraint_dependencies(interp, oid)?;
@@ -264,6 +278,9 @@ pub(crate) struct DomainConstraint {
     /// ('a', 'b'))`, `CHECK (VALUE > 0)`), compared under the base type's
     /// collation (see [`crate::nonnull::checks::allowed_values`]).
     pub(crate) allowed: Option<crate::refine::Refinement>,
+    /// A CHECK's expression as written, which `expression_planner` folds
+    /// before it runs (a dead CASE branch needs no EXECUTE).
+    pub(crate) expr: Option<crate::ddl::tables::check_inherit::StoredExpr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,15 +306,15 @@ fn add_domain_constraint(
     let mut null_free_elements = false;
     let mut finite = false;
     let mut allowed = None;
+    let mut expr = None;
     let kind = match c.contype {
         ConstrType::ConstrNotnull => {
             rejects_null = true;
             DomainConstraintKind::NotNull
         }
         ConstrType::ConstrCheck => {
-            if c.raw_expr.is_some() {
-                let checked =
-                    check_domain_check_expression(interp, base_type, c.raw_expr.as_ref())?;
+            if let Some(raw) = c.raw_expr.as_ref() {
+                let checked = check_domain_check_expression(interp, base_type, Some(raw))?;
                 (refs, rejects_null, null_free_elements, finite, allowed) = (
                     checked.refs,
                     checked.rejects_null,
@@ -305,6 +322,9 @@ fn add_domain_constraint(
                     checked.finite,
                     checked.allowed,
                 );
+                expr = Some(crate::ddl::tables::check_inherit::StoredExpr::written(
+                    Some(raw),
+                ));
             }
             DomainConstraintKind::Check
         }
@@ -355,6 +375,7 @@ fn add_domain_constraint(
         null_free_elements,
         finite,
         allowed,
+        expr,
     });
     Ok(())
 }
@@ -633,9 +654,28 @@ pub fn alter_domain(
             match &stmt.def {
                 expr @ Some(_) if !is_null_constant(expr.as_ref()) => {
                     interp.domain_defaults.insert(type_oid);
+                    interp.domain_default_exprs.insert(
+                        type_oid,
+                        crate::ddl::tables::check_inherit::StoredExpr::written(expr.as_ref()),
+                    );
+                    let mut sequences = Vec::new();
+                    crate::ddl::defaults::sequence_function_refs(
+                        interp,
+                        expr.as_ref(),
+                        &mut sequences,
+                    );
+                    if sequences.is_empty() {
+                        interp.domain_default_sequence_perms.remove(&type_oid);
+                    } else {
+                        interp
+                            .domain_default_sequence_perms
+                            .insert(type_oid, sequences);
+                    }
                 }
                 _ => {
                     interp.domain_defaults.remove(&type_oid);
+                    interp.domain_default_exprs.remove(&type_oid);
+                    interp.domain_default_sequence_perms.remove(&type_oid);
                 }
             }
         }
@@ -1173,6 +1213,11 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
             prolang: crate::pg_catalog::INTERNAL_LANGUAGE,
             prosupport: None,
         });
+        // `ProcedureCreate` gives the constructors the bootstrap superuser as
+        // owner (`makeRangeConstructors` passes `BOOTSTRAP_SUPERUSERID`), with
+        // that role's function default privileges.
+        let owner = interp.roles.bootstrap;
+        super::acl::function_created(interp, proc_oid, pronamespace, owner);
     }
     // makeMultirangeConstructors: the explicit cast from the range to its
     // multirange, through `mr(range)`, is part of that function
@@ -2499,7 +2544,9 @@ pub(crate) fn rename_type(
     if let Some(relid) = t.typrelid {
         super::util::check_relation_name_free(interp, t.typnamespace, &stmt.newname)?;
         interp.rename_pg_class(relid, stmt.newname.clone(), t.typnamespace);
+        super::policies::rewrite_relation_refs(interp, relid, None, &stmt.newname);
     }
+    super::policies::rewrite_type_refs(interp, oid, None, &stmt.newname);
     rename_type_internal(interp, oid, &stmt.newname, t.typnamespace)
 }
 
@@ -2547,8 +2594,10 @@ pub(crate) fn set_type_schema(
     }
     if let Some(relid) = t.typrelid {
         interp.rename_pg_class(relid, t.typname.clone(), new_nsoid);
+        super::policies::rewrite_relation_refs(interp, relid, Some(new_schema), &t.typname);
     }
     interp.rename_pg_type(oid, t.typname.clone(), new_nsoid);
+    super::policies::rewrite_type_refs(interp, oid, Some(new_schema), &t.typname);
     if let Some((array_oid, array_name)) = array {
         interp.rename_pg_type(array_oid, array_name, new_nsoid);
     }

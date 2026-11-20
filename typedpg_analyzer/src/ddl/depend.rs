@@ -250,7 +250,7 @@ impl ObjectAddress {
 /// `FirstUnpinnedObjectId`: objects below it are pinned (the core of the
 /// system, created by genbki); PG never records dependencies on them.
 /// initdb's later objects (plpgsql, information_schema) are not pinned.
-const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
+pub(crate) const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 
 /// `recordDependencyOn` for each of `referenced` (deduplicated, like
 /// `record_object_address_dependencies`), skipping pinned objects and the
@@ -361,6 +361,17 @@ pub(crate) fn collect<R>(f: impl FnOnce() -> R) -> (R, Vec<Reference>) {
     let outer = COLLECTOR.with(|c| c.replace(Some(Vec::new())));
     // What an internal analysis reads isn't the statement's range table.
     let result = crate::privileges::suspended(f);
+    let refs = COLLECTOR.with(|c| c.replace(outer)).unwrap_or_default();
+    (result, refs)
+}
+
+/// [`collect`] for the query being *defined* (a view's): its references
+/// are recorded, and so is what reading it later requires (the analysis
+/// isn't a statement's, so the statement collector stays off; its own
+/// sub-analyses still are and stay out).
+pub(crate) fn collect_defined<R>(f: impl FnOnce() -> R) -> (R, Vec<Reference>) {
+    let outer = COLLECTOR.with(|c| c.replace(Some(Vec::new())));
+    let result = f();
     let refs = COLLECTOR.with(|c| c.replace(outer)).unwrap_or_default();
     (result, refs)
 }
@@ -1005,6 +1016,12 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                 .iter()
                 .find(|a| a.attnum == addr.objsubid)
                 .map(|a| a.attname.clone())
+                .or_else(|| {
+                    crate::pg_catalog::SYSTEM_COLUMNS
+                        .iter()
+                        .find(|(_, _, n)| *n == addr.objsubid)
+                        .map(|(name, _, _)| (*name).to_owned())
+                })
                 .unwrap_or_default();
             format!("column {column} of {kind} {name}")
         }
@@ -1118,7 +1135,7 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
 /// A column default (`classid = pg_class`, `objsubid = attnum`) is described
 /// as PG's pg_attrdef row is — unless the column is generated, in which case
 /// the column itself is the dependent.
-fn describe_dependent(interp: &PgCatalog, addr: ObjectAddress) -> String {
+pub(crate) fn describe_dependent(interp: &PgCatalog, addr: ObjectAddress) -> String {
     // findDependentObjects: an extension's member stands for its extension,
     // which the DROP would take instead.
     if let Some(ext) = owning_extension(interp, addr) {
@@ -1271,6 +1288,31 @@ pub(crate) fn drop_dependents(
     cascade: bool,
 ) -> Result<(), super::DdlError> {
     drop_dependents_reporting(interp, target, target_desc, target_desc, cascade)
+}
+
+/// `performMultipleDeletions`' RESTRICT check over `targets`: every
+/// dependent of the deleted objects that isn't one of them (or going with
+/// one automatically or internally), as `(dependent, object it depends on)`.
+/// Targets are checked in the given order; one blocker per target, as
+/// `findDependentObjects` stops at the first.
+pub(crate) fn multiple_deletion_blockers(
+    interp: &mut PgCatalog,
+    targets: &[ObjectAddress],
+) -> Vec<(ObjectAddress, ObjectAddress)> {
+    with_drop_targets(targets.to_vec(), || {
+        let mut blockers = Vec::new();
+        for &target in targets {
+            if !object_exists(interp, target) {
+                continue;
+            }
+            if let Some(blocker) = find_blocker(interp, target)
+                && !blockers.contains(&blocker)
+            {
+                blockers.push(blocker);
+            }
+        }
+        blockers
+    })
 }
 
 /// [`drop_dependents`] of `target`, a member of the object a DROP names

@@ -142,6 +142,10 @@ pub(crate) fn analyze_select_with_ctes_and_outer(
     outer_tiers: &[Vec<crate::scope::TableSource>],
     shadowed_sources: &[crate::scope::TableSource],
 ) -> AnalyzeResult {
+    // What each output column of this level runs is kept apart while its
+    // expressions are resolved: the planner drops an output nothing reads
+    // (see `privileges::collect_output`).
+    let _outputs = crate::privileges::LevelOutputsGuard::enter(sel, snapshot);
     crate::stack::step(|| {
         analyze_select_here(
             sel,
@@ -232,7 +236,7 @@ fn analyze_select_here(
     if let Some(with) = &sel.with_clause {
         // A CTE body is analyzed before this level's FROM: it sees the
         // enclosing levels, never this level's own items.
-        cte_scopes = super::cte::with_clause_owner(sel, || {
+        cte_scopes = super::cte::with_clause_owner(sel, snapshot, || {
             analyze_with_clause(with, snapshot, params, &cte_scopes, outer_tiers)
         })?;
     }
@@ -325,15 +329,25 @@ fn analyze_select_here(
     // Process FROM clause. An aggregate of this level inside it (in a
     // LATERAL subquery) is PG's EXPR_KIND_FROM_SUBSELECT error; JOIN
     // conditions and function arguments name their own clause.
+    //
+    // A level whose WHERE is a constant FALSE (or NULL) is a dummy plan, and
+    // so is an inner join whose ON is: the planner replaces those scans with
+    // dummy relations, whose security quals are never built. Record the FROM
+    // items certainly proven empty so their policy functions aren't checked
+    // (`check_row_security`).
+    let empty_from =
+        certainly_empty_from_aliases(&sel.from_clause, sel.where_clause.as_ref(), snapshot);
     grouping::with_clause(Some("FROM clause of their own query level"), || {
-        process_from_clause(
-            &sel.from_clause,
-            &mut scope,
-            &mut null_ctx,
-            snapshot,
-            &cte_scopes,
-            params,
-        )
+        crate::privileges::with_empty_from_aliases(&empty_from, || {
+            process_from_clause(
+                &sel.from_clause,
+                &mut scope,
+                &mut null_ctx,
+                snapshot,
+                &cte_scopes,
+                params,
+            )
+        })
     })?;
     grouping::register_level(sel, &scope.sources, &scope.shadowed_sources);
     {
@@ -381,41 +395,54 @@ fn analyze_select_here(
     let mut correlated: Option<crate::nonnull::Facts> = None;
     let mut own_facts: Option<crate::nonnull::Facts> = None;
     let log = crate::nonnull::StrictLog::default();
-    if let where_clause @ Some(_) = &sel.where_clause {
-        // PG rejects aggregate / window function calls inside WHERE (they
-        // reference the post-aggregation row, not the pre-aggregation one) —
-        // but only after the expression itself resolves; the ordering lives
-        // in `coerce_bool_clause`.
-        crate::clause::coerce_clause_expr(
-            where_clause.as_ref(),
-            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
-            params,
-            crate::clause::ClauseKind::Where,
-        )?;
-        check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
-        // What the rows past WHERE have non-NULL — read by everything
-        // evaluated after it, and reducing outer joins PG would reduce.
-        let facts =
-            crate::nonnull::nonnullable(where_clause.as_ref(), true, &scope, &log, snapshot);
-        let own = crate::nonnull::own_aliases(&scope);
-        // An EXISTS / LATERAL subquery hands what it proves of the levels
-        // around it up (see `nonnull::capture_correlation`).
-        if crate::nonnull::correlation_wanted(sel) {
-            let outer: std::collections::HashSet<String> = scope
-                .outer_tiers
-                .iter()
-                .flatten()
-                .map(|s| s.alias.clone())
-                .filter(|a| !own.contains(a))
-                .collect();
-            correlated = Some(facts.clone().restricted_to(&outer));
-        }
-        // An `IN` subquery hands what it proves of its own rows up (see
-        // `nonnull::capture_own`).
-        if crate::nonnull::own_wanted(sel) {
-            own_facts = Some(facts.clone().restricted_to(&own));
-        }
-        null_ctx.add_where_facts(facts.restricted_to(&own));
+    if let Some(where_clause) = &sel.where_clause {
+        // The view being defined keeps what its WHERE runs for a write
+        // through it (see `privileges::collect_view_qual`).
+        crate::privileges::collect_view_qual(|| -> Result<(), crate::AnalyzeError> {
+            // PG rejects aggregate / window function calls inside WHERE (they
+            // reference the post-aggregation row, not the pre-aggregation one) —
+            // but only after the expression itself resolves; the ordering lives
+            // in `coerce_bool_clause`.
+            expr::plan_fold::with_estimated_qual(
+                Some(where_clause),
+                &scope,
+                snapshot,
+                || -> Result<(), crate::AnalyzeError> {
+                    crate::clause::coerce_clause_expr(
+                        Some(where_clause),
+                        expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+                        params,
+                        crate::clause::ClauseKind::Where,
+                    )?;
+                    check_no_srf_in_clause(Some(where_clause), snapshot, "WHERE")?;
+                    Ok(())
+                },
+            )?;
+            // What the rows past WHERE have non-NULL — read by everything
+            // evaluated after it, and reducing outer joins PG would reduce.
+            let facts =
+                crate::nonnull::nonnullable(Some(where_clause), true, &scope, &log, snapshot);
+            let own = crate::nonnull::own_aliases(&scope);
+            // An EXISTS / LATERAL subquery hands what it proves of the levels
+            // around it up (see `nonnull::capture_correlation`).
+            if crate::nonnull::correlation_wanted(sel) {
+                let outer: std::collections::HashSet<String> = scope
+                    .outer_tiers
+                    .iter()
+                    .flatten()
+                    .map(|s| s.alias.clone())
+                    .filter(|a| !own.contains(a))
+                    .collect();
+                correlated = Some(facts.clone().restricted_to(&outer));
+            }
+            // An `IN` subquery hands what it proves of its own rows up (see
+            // `nonnull::capture_own`).
+            if crate::nonnull::own_wanted(sel) {
+                own_facts = Some(facts.clone().restricted_to(&own));
+            }
+            null_ctx.add_where_facts(facts.restricted_to(&own));
+            Ok(())
+        })?;
     }
     // An empty grouping set yields its row from no input, aggregates or
     // not (`GROUP BY ()`, `GROUPING SETS ((), ())`); so does an aggregate
@@ -2244,6 +2271,7 @@ fn values_sort_and_limit(
             elem_nullable: c.elem_nullable,
             refine: c.refine.clone(),
             origin: None,
+            output: None,
         })
         .collect();
     let mut scope = Scope {
@@ -2879,8 +2907,12 @@ pub(crate) fn analyze_limit_offset(
     ] {
         if limit_node.is_none() {
             continue;
-        }
-        crate::clause::coerce_clause_expr(limit_node.as_ref(), ctx, params, kind)?;
+        };
+        // `preprocess_limit` estimates the bound while planning: a STABLE
+        // call over constants runs then.
+        expr::plan_fold::with_estimated_limit(limit_node.as_ref(), || {
+            crate::clause::coerce_clause_expr(limit_node.as_ref(), ctx, params, kind).map(|_| ())
+        })?;
         // The conversion to `bigint` is folded by the planner.
         if expr::plan_time_checks()
             && let Some(e) = crate::fold::conversion_error(
@@ -3191,5 +3223,129 @@ fn note_locks_below(
         }
         Some(ast::Node::RangeSubselect(_)) => note_subquery_locks(item, None, scope, snapshot),
         _ => {}
+    }
+}
+
+/// The FROM item aliases `from` holds that the planner certainly proves
+/// empty, so their scans become dummy relations whose security quals are
+/// never built (`set_dummy_rel_pathlist`): every item when `where_clause`
+/// is a constant FALSE (or NULL, FALSE in a qual), and the sides a
+/// constant-FALSE inner `ON` empties.
+fn certainly_empty_from_aliases(
+    from: &[Option<ast::Node>],
+    where_clause: Option<&ast::Node>,
+    snapshot: &PgCatalog,
+) -> Vec<String> {
+    use crate::expr::plan_fold::{Folded, fold_qual};
+    let where_empty =
+        where_clause.is_some_and(|w| fold_qual(Some(w), snapshot) == Folded::Bool(false));
+    let mut out = Vec::new();
+    for item in from {
+        if where_empty {
+            collect_from_aliases(item.as_ref(), &mut out);
+        } else {
+            mark_empty_from_item(item.as_ref(), snapshot, &mut out);
+        }
+    }
+    out
+}
+
+/// The `RangeVar` aliases of `item`, nested joins included; a subquery's own
+/// relations are another level's.
+fn collect_from_aliases(item: Option<&ast::Node>, out: &mut Vec<String>) {
+    match item {
+        Some(ast::Node::RangeVar(rv)) => {
+            let alias = rv
+                .alias
+                .as_ref()
+                .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+            if !out.contains(&alias) {
+                out.push(alias);
+            }
+        }
+        Some(ast::Node::JoinExpr(j)) => {
+            for side in [j.larg.as_ref(), j.rarg.as_ref()].into_iter().flatten() {
+                collect_from_aliases(Some(side), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Add to `out` the FROM items of `item` the planner certainly proves empty,
+/// and return whether `item` itself is. A constant-FALSE `ON` makes an inner
+/// join empty, and for an outer join its nullable side (no row there can
+/// match, so the side is a dummy relation); a `FULL` join keeps both sides
+/// (unmatched rows of either side still come out). An empty side of an inner
+/// join empties the whole join; an empty preserved side of an outer join
+/// empties it too.
+fn mark_empty_from_item(
+    item: Option<&ast::Node>,
+    snapshot: &PgCatalog,
+    out: &mut Vec<String>,
+) -> bool {
+    use crate::expr::plan_fold::{Folded, fold_qual};
+    use typedpg_pg_query::ast::JoinType;
+    let Some(ast::Node::JoinExpr(j)) = item else {
+        return false;
+    };
+    let on_false = j
+        .quals
+        .as_ref()
+        .is_some_and(|q| fold_qual(Some(q), snapshot) == Folded::Bool(false));
+    let jointype = j.jointype;
+    let mark = |side: Option<&ast::Node>, out: &mut Vec<String>| {
+        side.is_some_and(|s| mark_empty_from_item(Some(s), snapshot, out))
+    };
+    match jointype {
+        JoinType::JoinInner | JoinType::JoinSemi | JoinType::JoinAnti => {
+            let left = mark(j.larg.as_ref(), out);
+            let right = mark(j.rarg.as_ref(), out);
+            if on_false || left || right {
+                collect_from_aliases(item, out);
+                true
+            } else {
+                false
+            }
+        }
+        JoinType::JoinLeft => {
+            let left = mark(j.larg.as_ref(), out);
+            if on_false {
+                if let Some(right) = j.rarg.as_ref() {
+                    collect_from_aliases(Some(right), out);
+                }
+            } else {
+                mark(j.rarg.as_ref(), out);
+            }
+            if left {
+                collect_from_aliases(item, out);
+                true
+            } else {
+                false
+            }
+        }
+        JoinType::JoinRight => {
+            let right = mark(j.rarg.as_ref(), out);
+            if on_false {
+                if let Some(left) = j.larg.as_ref() {
+                    collect_from_aliases(Some(left), out);
+                }
+            } else {
+                mark(j.larg.as_ref(), out);
+            }
+            if right {
+                collect_from_aliases(item, out);
+                true
+            } else {
+                false
+            }
+        }
+        // A FULL join keeps both sides, so only its own side restrictions
+        // can empty it — and only when both sides are.
+        _ => {
+            let left = mark(j.larg.as_ref(), out);
+            let right = mark(j.rarg.as_ref(), out);
+            left && right
+        }
     }
 }

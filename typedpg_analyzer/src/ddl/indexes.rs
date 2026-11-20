@@ -1515,7 +1515,7 @@ pub(crate) fn figure_index_colname(expr: Option<&typedpg_pg_query::ast::Node>) -
 /// Store a `typedpg_pg_query::ast::Node` as a `SerializedAst` (an empty bindings
 /// stream — index expressions don't yet flow through the view-binding walker;
 /// that's a separate piece of work).
-fn serialize_node(node: Option<&typedpg_pg_query::ast::Node>) -> SerializedAst {
+pub(crate) fn serialize_node(node: Option<&typedpg_pg_query::ast::Node>) -> SerializedAst {
     SerializedAst {
         ast: node.cloned(),
         bindings: Vec::<AstBinding>::new(),

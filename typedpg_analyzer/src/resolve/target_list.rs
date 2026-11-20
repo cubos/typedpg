@@ -247,13 +247,17 @@ pub(crate) fn resolve_target_list_explicit(
             continue;
         }
 
-        // No type expectation for SELECT expressions.
-        let expr_type = expr::infer_expr(
-            val.as_ref(),
-            expr::Ctx::new(scope, null_ctx, snapshot),
-            params,
-            TypeGoal::NONE,
-        )?;
+        // No type expectation for SELECT expressions. What the expression
+        // runs is kept with its output column: the planner drops an output
+        // nothing reads.
+        let expr_type = crate::privileges::collect_output(columns.len(), || {
+            expr::infer_expr(
+                val.as_ref(),
+                expr::Ctx::new(scope, null_ctx, snapshot),
+                params,
+                TypeGoal::NONE,
+            )
+        })?;
         // A column a pulled-up subquery substitutes its output for.
         super::deferred::record_read(val.as_ref(), scope);
 
@@ -543,6 +547,17 @@ pub(crate) fn analyze_values_lists(
 /// Used by the target-list walker so a `SELECT _pg_expandarray(…) AS x`
 /// records the field list on the produced column.
 fn resolve_funccall_record_fields(
+    fc: &ast::FuncCall,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Option<Vec<crate::expr::RecordField>> {
+    // The call was analyzed for its own type already: this re-read only
+    // resolves the function for its OUT args, and the arguments' privileges
+    // were collected (or dropped, for an inlined body) there.
+    crate::privileges::suspended(|| resolve_funccall_record_fields_here(fc, snapshot, params))
+}
+
+fn resolve_funccall_record_fields_here(
     fc: &ast::FuncCall,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,

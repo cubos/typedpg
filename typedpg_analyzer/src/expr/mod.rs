@@ -1036,6 +1036,9 @@ pub(crate) fn infer_expr(
     goal: TypeGoal,
 ) -> Result<ExprType, AnalyzeError> {
     let _enclosing = Enclosing::push(node);
+    // A side of a restriction the planner estimates: a STABLE call over
+    // constants in it runs while planning (`estimate_expression_value`).
+    let _estimated = plan_fold::enter_estimated(node);
     crate::stack::step(|| infer_expr_here(node, ctx, params, goal))
 }
 
@@ -1684,6 +1687,7 @@ fn infer_expr_unlocated(
                 // A CollateExpr depends on its collation
                 // (find_expr_references_walker).
                 crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::collation(r.oid));
+                crate::ddl::policies::note_collation_ref(c.location, r.oid);
                 Some(r.oid)
             };
             let result = infer_expr(arg.as_ref(), ctx, params, goal)?;
@@ -2074,7 +2078,11 @@ fn replay_targets(
         {
             continue;
         }
-        infer_expr(val.as_ref(), ctx, scratch, TypeGoal::NONE)?;
+        // The replay is the same expression's analysis again: what it runs
+        // belongs to the same output column.
+        crate::privileges::collect_output(i, || {
+            infer_expr(val.as_ref(), ctx, scratch, TypeGoal::NONE)
+        })?;
     }
     Ok(())
 }
@@ -2231,8 +2239,9 @@ fn has_param_ref(expr: Option<&ast::Node>) -> bool {
     })
 }
 
-/// Whether `expr` is or holds a subquery.
-fn has_sublink(expr: Option<&ast::Node>) -> bool {
+/// Whether `expr` is or holds a subquery (`checkExprHasSubLink`, which a
+/// policy's `hassublinks` caches).
+pub(crate) fn has_sublink(expr: Option<&ast::Node>) -> bool {
     expr.is_some_and(|inner| {
         matches!(inner, ast::Node::SubLink(_))
             || inner
@@ -2965,6 +2974,7 @@ fn resolve_type_name(
     })?;
 
     crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(type_entry.oid));
+    crate::ddl::policies::note_type_ref(tn.location, type_entry.oid);
     // typenameType: a shell type can't be used.
     if !type_entry.typisdefined {
         return Err(AnalyzeError::UndefinedType(format!(

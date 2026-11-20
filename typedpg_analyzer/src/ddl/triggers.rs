@@ -26,6 +26,10 @@ pub(crate) struct Trigger {
     /// A constraint trigger's `pg_constraint.condeferrable`; `None` for a
     /// plain trigger.
     pub(crate) constraint_deferrable: Option<bool>,
+    /// Its `pg_constraint.condeferred`: `DEFERRABLE INITIALLY DEFERRED`. A
+    /// `DEFERRABLE INITIALLY IMMEDIATE` trigger runs at the end of its
+    /// statement unless `SET CONSTRAINTS` defers it.
+    pub(crate) constraint_deferred: Option<bool>,
     /// FOR EACH ROW.
     pub(crate) row: bool,
     /// `TRIGGER_TYPE_BEFORE` / `_AFTER` / `_INSTEAD`.
@@ -39,6 +43,17 @@ pub(crate) struct Trigger {
     /// The partitioned table whose same-named trigger this one clones
     /// (`tgparentid`).
     pub(crate) parent: Option<PgClassOid>,
+    /// `tgqual`: the `WHEN` condition as written, or `None`. It runs for
+    /// each row the trigger may see, before the trigger function is called.
+    pub(crate) when: Option<typedpg_pg_query::ast::Node>,
+    /// The routines the `WHEN` condition runs, resolved at CREATE TRIGGER
+    /// (the condition's function calls), which a firing role needs EXECUTE
+    /// on — they run as that role.
+    pub(crate) when_functions: Vec<PgProcOid>,
+    /// The transition tables the trigger names (`REFERENCING`), as
+    /// `(name, is_new)`: the rows the statement changed, in scope in the
+    /// trigger function's body.
+    pub(crate) transition_tables: Vec<(String, bool)>,
 }
 
 /// `pg_trigger.tgenabled`: `O` origin (the default), `A` always, `R`
@@ -87,6 +102,17 @@ pub(crate) fn event_word(event_bit: i32) -> &'static str {
         TRIGGER_TYPE_UPDATE => "UPDATE",
         TRIGGER_TYPE_DELETE => "DELETE",
         _ => "TRUNCATE",
+    }
+}
+
+/// The word `TG_WHEN` holds: `BEFORE`, `AFTER` or `INSTEAD OF`.
+pub(crate) fn timing_word(timing: i32) -> &'static str {
+    if timing & TRIGGER_TYPE_BEFORE != 0 {
+        "BEFORE"
+    } else if timing & TRIGGER_TYPE_INSTEAD != 0 {
+        "INSTEAD OF"
+    } else {
+        "AFTER"
     }
 }
 
@@ -154,12 +180,15 @@ pub(crate) fn set_all_triggers_state(
 /// for a statement trigger, no OLD for INSERT, no NEW for DELETE, and for a
 /// BEFORE trigger no NEW system column nor generated column (their values
 /// don't exist yet).
+///
+/// Returns the routines the condition runs: it is evaluated per row, as
+/// the role running the statement, so that role needs EXECUTE on them.
 fn check_when_clause(
     interp: &PgCatalog,
     relid: PgClassOid,
     stmt: &CreateTrigStmt,
     when: Option<&typedpg_pg_query::ast::Node>,
-) -> Result<(), DdlError> {
+) -> Result<Vec<PgProcOid>, DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;
@@ -171,7 +200,7 @@ fn check_when_clause(
     crate::resolve::check_no_srf_in_clause(when, interp, "trigger WHEN conditions")
         .map_err(unsupported)?;
     let Some(class) = interp.pg_class.get(&relid) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let nspname = interp
         .namespace_name(class.relnamespace)
@@ -189,22 +218,31 @@ fn check_when_clause(
     }
     let null_ctx = NullabilityContext::default();
     let mut params = ParamCollector::default();
-    let result = infer_expr(
-        when,
-        crate::expr::Ctx::new(&scope, &null_ctx, interp),
-        &mut params,
-        TypeGoal::NONE,
-    )
-    .and_then(|r| {
-        r.check_unknown_value_coercion(
-            crate::pg_catalog::oid::BOOL,
-            crate::coerce::CoercionContext::Assignment,
-            interp,
-            when,
-        )?;
-        Ok(r)
-    })
-    .map_err(unsupported)?;
+    // The condition's functions and operators run per row as the role
+    // running the statement.
+    // PG prepares the WHEN expression whole (an `ExecInitFunc` for every
+    // function in it, even one a short-circuit later skips): no branch of
+    // it is dropped for the check.
+    let (result, routines) = crate::privileges::collect(|| {
+        crate::privileges::all_code_checked(|| {
+            infer_expr(
+                when,
+                crate::expr::Ctx::new(&scope, &null_ctx, interp),
+                &mut params,
+                TypeGoal::NONE,
+            )
+            .and_then(|r| {
+                r.check_unknown_value_coercion(
+                    crate::pg_catalog::oid::BOOL,
+                    crate::coerce::CoercionContext::Assignment,
+                    interp,
+                    when,
+                )?;
+                Ok(r)
+            })
+        })
+    });
+    let result = result.map_err(unsupported)?;
     // transformWhereClause: coerce_to_boolean.
     if result.type_oid != crate::pg_catalog::oid::BOOL
         && result.type_oid != crate::pg_catalog::oid::UNKNOWN
@@ -218,7 +256,7 @@ fn check_when_clause(
     let before = stmt.timing & TRIGGER_TYPE_BEFORE != 0;
     let has_generated = attrs.iter().any(|a| a.attgenerated.is_some());
     let Some(inner) = when else {
-        return Ok(());
+        return Ok(routines.routine_oids());
     };
     // `(new).col` is the column `col` of NEW (transformIndirection).
     let selections = super::util::whole_row_selections(
@@ -305,7 +343,7 @@ fn check_when_clause(
             },
         }
     }
-    Ok(())
+    Ok(routines.routine_oids())
 }
 
 /// `CREATE [OR REPLACE] [CONSTRAINT] TRIGGER` (CreateTriggerFiringOn).
@@ -325,9 +363,11 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
     };
     check_firing(stmt)?;
     check_transition_tables(interp, relid, &class, stmt)?;
-    if stmt.when_clause.is_some() {
-        check_when_clause(interp, relid, stmt, stmt.when_clause.as_ref())?;
-    }
+    let when_functions = match stmt.when_clause.as_ref() {
+        Some(when) => check_when_clause(interp, relid, stmt, Some(when))?,
+        None => Vec::new(),
+    };
+    let transition_tables = transition_table_names(stmt);
 
     // The function takes no declared arguments (the trigger's arguments go
     // through TG_ARGV) and must return `trigger`.
@@ -378,14 +418,30 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
             0
         },
         constraint_deferrable: stmt.isconstraint.then_some(stmt.deferrable),
+        constraint_deferred: stmt.isconstraint.then_some(stmt.initdeferred),
         row: stmt.row,
         timing: stmt.timing,
         events: stmt.events,
         columns,
         constrrel,
         parent: None,
+        when: stmt.when_clause.as_ref().cloned(),
+        when_functions,
+        transition_tables,
     };
     install(interp, relid, trigger, stmt.replace, false)
+}
+
+/// The transition tables a trigger names (`REFERENCING NEW TABLE AS ...`),
+/// as `(name, is_new)`.
+fn transition_table_names(stmt: &CreateTrigStmt) -> Vec<(String, bool)> {
+    stmt.transition_rels
+        .iter()
+        .filter_map(|rel| match rel.as_ref()? {
+            ast::Node::TriggerTransition(tt) => Some((tt.name.clone(), tt.is_new)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// CreateTriggerFiringOn's relation checks, which it also makes on each

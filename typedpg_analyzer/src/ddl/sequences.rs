@@ -31,7 +31,8 @@ pub fn create_sequence(interp: &mut PgCatalog, stmt: &CreateSeqStmt) -> Result<(
     super::util::check_relation_name_free(interp, nsoid, &name)?;
     let params = super::seqparams::init_params(interp, &stmt.options, None)?;
 
-    let seq_oid = insert_sequence_relation(interp, nsoid, name)?;
+    let owner = super::roles::current_role(interp);
+    let seq_oid = insert_sequence_relation(interp, nsoid, name, owner)?;
     interp.sequence_params.insert(seq_oid, params);
     for opt in &stmt.options {
         apply_owned_by(interp, seq_oid, opt.as_ref())?;
@@ -47,6 +48,7 @@ pub(crate) fn insert_sequence_relation(
     interp: &mut PgCatalog,
     nsoid: PgNamespaceOid,
     name: String,
+    owner: super::roles::RoleId,
 ) -> Result<PgClassOid, DdlError> {
     let class_oid = PgClassOid::from_nonzero(interp.alloc_oid()?);
     interp.insert_pg_class(PgClass {
@@ -56,7 +58,6 @@ pub(crate) fn insert_sequence_relation(
         relkind: RelKind::Sequence,
         reltype: None,
     });
-    let owner = super::roles::current_role(interp);
     super::acl::relation_created(
         interp,
         class_oid,
@@ -98,6 +99,7 @@ pub(crate) fn create_owned_sequence(
     attnum: i16,
     deptype: DepType,
     options: &[Option<typedpg_pg_query::ast::Node>],
+    owner: super::roles::RoleId,
 ) -> Result<(), DdlError> {
     let Some(class) = interp.pg_class.get(&relid).cloned() else {
         return Err(DdlError::Internal(format!("relation oid {relid} missing")));
@@ -157,22 +159,24 @@ pub(crate) fn create_owned_sequence(
             choose_relation_name(interp, class.relnamespace, &class.relname, &colname, "seq"),
         ),
     };
-    let seq_oid = insert_sequence_relation(interp, nsoid, name)?;
+    let seq_oid = insert_sequence_relation(interp, nsoid, name, owner)?;
     // An owned sequence belongs to its table's owner, not the current role
     // (`ATExecAddColumn` / `transformColumnDefinition` make it the table
-    // owner's), and takes that role's sequence default privileges.
-    let table_owner = interp.owner_of(super::acl::AclObject::Relation(relid));
-    interp.object_created(
-        super::acl::AclObject::Relation(seq_oid),
-        table_owner,
-        Some(nsoid),
-        super::acl::DefaultAclClass::Sequence,
-    );
+    // owner's), and takes that role's sequence default privileges — both of
+    // which `insert_sequence_relation` recorded.
     interp.sequence_params.insert(seq_oid, params);
     record_ownership(interp, seq_oid, relid, attnum, deptype);
     if deptype == DepType::Auto {
-        // serial's `DEFAULT nextval('<seq>')` depends on the sequence.
+        // serial's `DEFAULT nextval('<seq>')` depends on the sequence, and
+        // filling the column runs its nextval.
         crate::ddl::defaults::record_default_sequence(interp, relid, attnum, seq_oid);
+        interp.default_sequence_perms.insert(
+            (relid, attnum),
+            vec![(
+                seq_oid,
+                crate::ddl::acl::bits::USAGE | crate::ddl::acl::bits::UPDATE,
+            )],
+        );
     }
     Ok(())
 }
@@ -375,6 +379,34 @@ fn check_not_identity_sequence(interp: &PgCatalog, seq_oid: PgClassOid) -> Resul
         )));
     }
     Ok(())
+}
+
+/// `ATExecChangeOwner`'s `RELKIND_SEQUENCE` check: a sequence a table owns
+/// (a `serial` column's or an identity's) can't be given another owner by
+/// itself — `ALTER TABLE t OWNER TO` moves it with the table instead.
+pub(crate) fn check_sequence_owner_change(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    new_owner: super::roles::RoleId,
+) -> Result<(), DdlError> {
+    if interp.pg_class.get(&relid).map(|c| c.relkind) != Some(RelKind::Sequence) {
+        return Ok(());
+    }
+    if interp.owner_of(super::acl::AclObject::Relation(relid)) == new_owner {
+        return Ok(());
+    }
+    let Some((table, _)) = sequence_owner(interp, relid) else {
+        return Ok(());
+    };
+    let name = interp
+        .pg_class
+        .get(&relid)
+        .map(|c| c.relname.clone())
+        .unwrap_or_default();
+    Err(DdlError::UnsupportedDdl(format!(
+        "cannot change owner of sequence \"{name}\" ({})",
+        linked_detail(interp, relid, table)
+    )))
 }
 
 /// `ALTER SEQUENCE [IF EXISTS] name [options]`.

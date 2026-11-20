@@ -150,12 +150,19 @@ pub(crate) fn analyze_set_operation(
 
     let n_columns = left_cols.len();
     let mut columns = Vec::with_capacity(n_columns);
+    // `is_simple_union_all_recurse`: an arm's column must already have the
+    // tree's type (no coercion between the arms) for the tree to be pulled
+    // up by `pull_up_simple_union_all`.
+    let mut types_match = true;
     for (i, (mut l, mut r)) in left_cols.into_iter().zip(right_cols).enumerate() {
         if left_lits[i].is_some() {
             l.type_oid = oid::UNKNOWN;
         }
         if right_lits[i].is_some() {
             r.type_oid = oid::UNKNOWN;
+        }
+        if l.type_oid != r.type_oid {
+            types_match = false;
         }
         let target = if l.type_oid == oid::UNKNOWN {
             r.type_oid
@@ -294,6 +301,7 @@ pub(crate) fn analyze_set_operation(
         });
     }
 
+    crate::privileges::note_setop_simple(types_match);
     set_operation_sort_and_limit(sel, &columns, snapshot, params, cte_scopes)?;
 
     Ok((columns, None))
@@ -327,6 +335,7 @@ fn set_operation_sort_and_limit(
             elem_nullable: c.elem_nullable,
             refine: c.refine.clone(),
             origin: None,
+            output: None,
         })
         .collect();
     let mut scope = Scope {
