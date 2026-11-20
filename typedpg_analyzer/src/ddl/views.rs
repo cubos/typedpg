@@ -14,7 +14,8 @@
 //! view_oid`, `refobjid = table_oid`, and `refobjsubid = attnum` (or 0 when
 //! the view depends on the whole relation).
 
-use typedpg_pg_query::protobuf::{self, CreateTableAsStmt, ObjectType, ViewStmt, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast::{self, CreateTableAsStmt, ObjectType, ViewStmt};
 
 use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgRewriteOid, PgTypeOid};
 use crate::pg_catalog::{
@@ -48,12 +49,12 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
 
     let aliases = string_list(&stmt.aliases);
 
-    if let Some(query) = stmt.query.as_deref() {
+    if let Some(query) = stmt.query.as_ref() {
         check_no_parameters(query)?;
     }
     // DefineView only analyzes the query: no error its execution would
     // raise is reported (a query reading the view runs it).
-    let resolved = match stmt.query.as_deref() {
+    let resolved = match stmt.query.as_ref() {
         Some(query_node) => crate::resolve::without_execution(|| {
             resolve_view_now(interp, query_node, &aliases, false)
         })
@@ -67,14 +68,13 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         None => ResolvedView::default(),
     };
     // DefineView: parse analysis allows these; a view can't have them.
-    if let Some(query) = stmt.query.as_deref() {
-        if matches!(query.node.as_ref(), Some(node::Node::SelectStmt(sel)) if sel.into_clause.is_some())
-        {
+    if let Some(query) = stmt.query.as_ref() {
+        if matches!(query, ast::Node::SelectStmt(sel) if sel.into_clause.is_some()) {
             return Err(DdlError::UnsupportedDdl(
                 "views must not contain SELECT INTO".into(),
             ));
         }
-        if has_modifying_cte(query) {
+        if modifying_cte(query) {
             return Err(DdlError::UnsupportedDdl(
                 "views must not contain data-modifying statements in WITH".into(),
             ));
@@ -87,12 +87,12 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         ));
     }
     check_duplicate_columns(&resolved.columns)?;
-    let updatability = stmt.query.as_deref().map(|q| view_updatability(interp, q));
+    let updatability = stmt.query.as_ref().map(|q| view_updatability(interp, q));
     // DefineView: WITH CHECK OPTION needs an automatically updatable view
     // (checked before the options are parsed).
-    let check_option = stmt.with_check_option > protobuf::ViewCheckOption::NoCheckOption as i32
+    let check_option = stmt.with_check_option != ast::ViewCheckOption::NoCheckOption
         || sets_check_option(&stmt.options);
-    if check_option && let Some(query) = stmt.query.as_deref() {
+    if check_option && let Some(query) = stmt.query.as_ref() {
         check_option_allowed(interp, query)?;
     }
     // DefineView takes `toast.` options, which nothing checks.
@@ -173,23 +173,23 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
 pub(crate) fn set_security_barrier(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    options: &[protobuf::Node],
+    options: &[Option<ast::Node>],
     replace: bool,
     reset: bool,
 ) {
-    let given = options.iter().find_map(|o| match o.node.as_ref() {
-        Some(node::Node::DefElem(de))
+    let given = options.iter().find_map(|o| match o.as_ref() {
+        Some(ast::Node::DefElem(de))
             if de.defname == "security_barrier" && de.defnamespace.is_empty() =>
         {
             Some(
                 !reset
-                    && match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    && match de.arg.as_ref() {
                         None => true,
-                        Some(node::Node::String(s)) => {
+                        Some(ast::Node::String(s)) => {
                             super::reloptions::parse_bool(&s.sval).unwrap_or(false)
                         }
-                        Some(node::Node::Boolean(b)) => b.boolval,
-                        Some(node::Node::Integer(i)) => i.ival != 0,
+                        Some(ast::Node::Boolean(b)) => b.boolval,
+                        Some(ast::Node::Integer(i)) => i.ival != 0,
                         _ => false,
                     },
             )
@@ -222,21 +222,18 @@ pub(crate) fn create_table_as_planned(
         .into
         .as_deref()
         .ok_or_else(|| DdlError::Parse("CREATE TABLE AS without target".into()))?;
-    let kind = match ObjectType::try_from(stmt.objtype) {
-        Ok(ObjectType::ObjectMatview) => RelKind::MaterializedView,
+    let kind = match stmt.objtype {
+        ObjectType::ObjectMatview => RelKind::MaterializedView,
         _ => RelKind::Table,
     };
     // ExecCreateTableAs: WITH NO DATA creates the relation without
     // planning the query (create_ctas_nodata) — but `AS EXECUTE` plans the
     // prepared statement either way (ExecuteQuery).
-    let is_execute = matches!(
-        stmt.query.as_deref().and_then(|q| q.node.as_ref()),
-        Some(node::Node::ExecuteStmt(_))
-    );
+    let is_execute = matches!(stmt.query.as_ref(), Some(ast::Node::ExecuteStmt(_)));
     create_relation_as(
         interp,
         into,
-        stmt.query.as_deref(),
+        stmt.query.as_ref(),
         kind,
         stmt.if_not_exists,
         explained || is_execute || !into.skip_data,
@@ -245,15 +242,13 @@ pub(crate) fn create_table_as_planned(
 
 /// `SELECT ... INTO [TABLE] name FROM ...`: the same as `CREATE TABLE name
 /// AS SELECT ...` (`transformSelectStmt` turns it into a CreateTableAsStmt).
-pub fn select_into(interp: &mut PgCatalog, stmt: &protobuf::SelectStmt) -> Result<(), DdlError> {
+pub fn select_into(interp: &mut PgCatalog, stmt: &ast::SelectStmt) -> Result<(), DdlError> {
     let Some(into) = stmt.into_clause.as_deref() else {
         return Ok(());
     };
     let mut query = stmt.clone();
     query.into_clause = None;
-    let query_node = protobuf::Node {
-        node: Some(node::Node::SelectStmt(Box::new(query))),
-    };
+    let query_node = ast::Node::SelectStmt(NodeBox::new(query));
     create_relation_as(interp, into, Some(&query_node), RelKind::Table, false, true)
 }
 
@@ -262,8 +257,8 @@ pub fn select_into(interp: &mut PgCatalog, stmt: &protobuf::SelectStmt) -> Resul
 /// query is planned and run, not only analyzed.
 fn create_relation_as(
     interp: &mut PgCatalog,
-    into: &protobuf::IntoClause,
-    query: Option<&protobuf::Node>,
+    into: &ast::IntoClause,
+    query: Option<&ast::Node>,
     kind: RelKind,
     if_not_exists: bool,
     planned: bool,
@@ -314,9 +309,7 @@ fn create_relation_as(
         // CREATE TABLE ... AS EXECUTE (ExecuteQuery): the prepared SELECT's
         // columns, its arguments checked. The cached plan is revalidated
         // (rewritten again) even WITH NO DATA.
-        Some(protobuf::Node {
-            node: Some(node::Node::ExecuteStmt(estmt)),
-        }) => {
+        Some(ast::Node::ExecuteStmt(estmt)) => {
             let prepared = super::prepared::lookup_execute(interp, estmt)?;
             if !prepared.is_select() {
                 return Err(DdlError::Parse("prepared statement is not a SELECT".into()));
@@ -366,7 +359,7 @@ fn create_relation_as(
     // transformCreateTableAsStmt: a materialized view outlives the session
     // and is refreshed from its query.
     if kind == RelKind::MaterializedView {
-        if query.is_some_and(has_modifying_cte) {
+        if query.is_some_and(modifying_cte) {
             return Err(DdlError::UnsupportedDdl(
                 "materialized views must not use data-modifying statements in WITH".into(),
             ));
@@ -392,10 +385,7 @@ fn create_relation_as(
     // always plans) takes its columns from the planned query — whose
     // collations planning may have changed (see `Planned`); a materialized
     // view, or WITH NO DATA, from the parsed one.
-    let is_execute = matches!(
-        query.and_then(|q| q.node.as_ref()),
-        Some(node::Node::ExecuteStmt(_))
-    );
+    let is_execute = matches!(query, Some(ast::Node::ExecuteStmt(_)));
     if kind == RelKind::Table && (!into.skip_data || is_execute) {
         for col in &mut resolved.columns {
             match col.planned {
@@ -437,13 +427,9 @@ fn create_relation_as(
     // DefineRelation: ON COMMIT applies to temporary tables only — tested
     // on the statement's TEMP, before the namespace lookup that would make
     // a `pg_temp.name` temporary.
-    use protobuf::OnCommitAction;
-    let on_commit = OnCommitAction::try_from(into.on_commit).unwrap_or(OnCommitAction::Undefined);
-    if !matches!(
-        on_commit,
-        OnCommitAction::OncommitNoop | OnCommitAction::Undefined
-    ) && rv.relpersistence != "t"
-    {
+    use ast::OnCommitAction;
+    let on_commit = into.on_commit;
+    if !matches!(on_commit, OnCommitAction::OncommitNoop) && rv.relpersistence != "t" {
         return Err(DdlError::UnsupportedDdl(
             "ON COMMIT can only be used on temporary tables".into(),
         ));
@@ -493,11 +479,11 @@ fn create_relation_as(
 }
 
 /// The `String` values of a name list (view aliases, CTAS column names).
-fn string_list(nodes: &[protobuf::Node]) -> Vec<String> {
+fn string_list(nodes: &[Option<ast::Node>]) -> Vec<String> {
     nodes
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.clone()),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.clone()),
             _ => None,
         })
         .collect()
@@ -581,15 +567,11 @@ fn check_view_columns(
 
 /// The query of a view or CREATE TABLE AS has no parameters: a `$n` is an
 /// error (transformParamRef without a parameter hook).
-fn check_no_parameters(query: &protobuf::Node) -> Result<(), DdlError> {
-    let number = query
-        .node
-        .iter()
-        .flat_map(|n| n.nodes())
-        .find_map(|(n, _)| match n {
-            typedpg_pg_query::NodeRef::ParamRef(p) => Some(p.number),
-            _ => None,
-        });
+fn check_no_parameters(query: &ast::Node) -> Result<(), DdlError> {
+    let number = query.nodes().into_iter().find_map(|(n, _)| match n {
+        typedpg_pg_query::NodeRef::ParamRef(p) => Some(p.number),
+        _ => None,
+    });
     match number {
         Some(n) => Err(DdlError::Parse(format!("there is no parameter ${n}"))),
         None => Ok(()),
@@ -598,16 +580,21 @@ fn check_no_parameters(query: &protobuf::Node) -> Result<(), DdlError> {
 
 /// Whether a CTE of the query's WITH is an INSERT / UPDATE / DELETE /
 /// MERGE (`hasModifyingCTE`).
-pub(crate) fn has_modifying_cte(query: &protobuf::Node) -> bool {
-    let Some(node::Node::SelectStmt(sel)) = query.node.as_ref() else {
+pub(crate) fn has_modifying_cte(query: &Option<ast::Node>) -> bool {
+    query.as_ref().is_some_and(modifying_cte)
+}
+
+/// [`has_modifying_cte`] of a present query.
+fn modifying_cte(query: &ast::Node) -> bool {
+    let ast::Node::SelectStmt(sel) = query else {
         return false;
     };
     sel.with_clause.as_ref().is_some_and(|w| {
         w.ctes.iter().any(|cte| {
-            matches!(cte.node.as_ref(), Some(node::Node::CommonTableExpr(c))
-                if matches!(c.ctequery.as_deref().and_then(|q| q.node.as_ref()),
-                    Some(node::Node::InsertStmt(_) | node::Node::UpdateStmt(_)
-                        | node::Node::DeleteStmt(_) | node::Node::MergeStmt(_))))
+            matches!(cte.as_ref(), Some(ast::Node::CommonTableExpr(c))
+                if matches!(c.ctequery.as_ref(),
+                    Some(ast::Node::InsertStmt(_) | ast::Node::UpdateStmt(_)
+                        | ast::Node::DeleteStmt(_) | ast::Node::MergeStmt(_))))
         })
     })
 }
@@ -683,7 +670,7 @@ fn replace_view(
 /// (`ExecRefreshMatView`).
 pub fn refresh_materialized_view(
     interp: &mut PgCatalog,
-    stmt: &protobuf::RefreshMatViewStmt,
+    stmt: &ast::RefreshMatViewStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -778,7 +765,7 @@ fn check_refill(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
     if reanalyze_view(interp, relid).is_none() {
         return Ok(());
     }
-    match view_query(interp, relid).and_then(|q| q.node) {
+    match view_query(interp, relid) {
         Some(inner) => {
             crate::resolve::with_restricted_execution(|| super::dml::check_executed(interp, &inner))
         }
@@ -793,7 +780,7 @@ fn check_refill(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
 struct ResolvedView {
     columns: Vec<ResolvedColumn>,
     bindings: Vec<AstBinding>,
-    ast: protobuf::Node,
+    ast: Option<ast::Node>,
     deps: ViewDeps,
 }
 
@@ -1037,7 +1024,7 @@ struct ViewDeps {
 /// `pg_depend` deps from those bindings.
 fn resolve_view_now(
     snapshot: &PgCatalog,
-    query_node: &protobuf::Node,
+    query_node: &ast::Node,
     aliases: &[String],
     planned: bool,
 ) -> Result<ResolvedView, DdlError> {
@@ -1050,15 +1037,12 @@ fn resolve_view_now(
 /// ([`crate::resolve::analyze_executed`]).
 fn resolve_view_with_params(
     snapshot: &PgCatalog,
-    query_node: &protobuf::Node,
+    query_node: &ast::Node,
     aliases: &[String],
     param_types: &[PgTypeOid],
     planned: bool,
 ) -> Result<ResolvedView, DdlError> {
-    let inner = query_node
-        .node
-        .as_ref()
-        .ok_or_else(|| DdlError::Parse("CREATE VIEW with empty query node".into()))?;
+    let inner = query_node;
     let analyze =
         || crate::resolve::analyze_raw_node_with_param_types(snapshot, inner, param_types);
     let (analyzed, references) = super::depend::collect(|| {
@@ -1121,7 +1105,7 @@ fn resolve_view_with_params(
     Ok(ResolvedView {
         columns,
         bindings,
-        ast: query_node.clone(),
+        ast: Some(query_node.clone()),
         deps,
     })
 }
@@ -1136,7 +1120,7 @@ fn resolve_view_with_params(
 pub(crate) fn serialize_subnode(
     snapshot: &PgCatalog,
     sql: &str,
-    pick: impl Fn(&protobuf::Node) -> Option<&protobuf::Node>,
+    pick: impl Fn(&Option<ast::Node>) -> Option<&ast::Node>,
 ) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
     crate::stack::with_stack(|| serialize_subnode_here(snapshot, sql, pick))
 }
@@ -1145,22 +1129,22 @@ pub(crate) fn serialize_subnode(
 fn serialize_subnode_here(
     snapshot: &PgCatalog,
     sql: &str,
-    pick: impl Fn(&protobuf::Node) -> Option<&protobuf::Node>,
+    pick: impl Fn(&Option<ast::Node>) -> Option<&ast::Node>,
 ) -> Result<crate::pg_catalog::SerializedAst, super::DdlError> {
     let parsed = typedpg_pg_query::parse(sql)
         .map_err(|e| super::DdlError::Parse(format!("failed to parse `{sql}`: {e}")))?;
-    let proto = parsed.protobuf;
+    let proto = parsed.tree;
     let stmt = proto
         .stmts
         .first()
-        .and_then(|s| s.stmt.as_ref())
+        .map(|s| &s.stmt)
         .ok_or_else(|| super::DdlError::Parse(format!("`{sql}` produced no statement")))?;
     let target = pick(stmt)
         .ok_or_else(|| super::DdlError::Parse(format!("`{sql}` has no expression to extract")))?;
     let mut walker = BindingWalker::default();
     walker.walk(target, snapshot);
     Ok(crate::pg_catalog::SerializedAst {
-        ast: target.clone(),
+        ast: Some(target.clone()),
         bindings: walker.bindings,
     })
 }
@@ -1169,25 +1153,25 @@ fn serialize_subnode_here(
 /// in `SELECT <expr>`. Returns `None` if the input wasn't a `SelectStmt`
 /// or has no targets.
 #[cfg(any(test, feature = "internal"))]
-pub(crate) fn extract_first_target(stmt: &protobuf::Node) -> Option<&protobuf::Node> {
-    let node::Node::SelectStmt(sel) = stmt.node.as_ref()? else {
+pub(crate) fn extract_first_target(stmt: &Option<ast::Node>) -> Option<&ast::Node> {
+    let ast::Node::SelectStmt(sel) = stmt.as_ref()? else {
         return None;
     };
     let target = sel.target_list.first()?;
-    let node::Node::ResTarget(rt) = target.node.as_ref()? else {
+    let ast::Node::ResTarget(rt) = target.as_ref()? else {
         return None;
     };
-    rt.val.as_deref()
+    rt.val.as_ref()
 }
 
 /// `pick` for `serialize_predicate`: extracts the WHERE clause of
 /// `SELECT 1 WHERE <pred>`. Returns `None` if there is no WHERE.
 #[cfg(any(test, feature = "internal"))]
-pub(crate) fn extract_where(stmt: &protobuf::Node) -> Option<&protobuf::Node> {
-    let node::Node::SelectStmt(sel) = stmt.node.as_ref()? else {
+pub(crate) fn extract_where(stmt: &Option<ast::Node>) -> Option<&ast::Node> {
+    let ast::Node::SelectStmt(sel) = stmt.as_ref()? else {
         return None;
     };
-    sel.where_clause.as_deref()
+    sel.where_clause.as_ref()
 }
 
 // ─── Structured walker: emits bindings + collects deps ──────────────────────
@@ -1217,7 +1201,7 @@ pub(crate) struct BindingWalker {
 
 impl BindingWalker {
     #[cfg(any(test, feature = "internal"))]
-    fn walk(&mut self, node: &protobuf::Node, snapshot: &PgCatalog) {
+    fn walk(&mut self, node: &ast::Node, snapshot: &PgCatalog) {
         let scope_stack: Vec<Vec<FromSource>> = Vec::new();
         self.walk_node(node, snapshot, &scope_stack);
     }
@@ -1227,23 +1211,20 @@ impl BindingWalker {
 /// binding walker resolves them (what a view would record in pg_depend).
 pub(crate) fn statement_references(
     snapshot: &PgCatalog,
-    query_node: &protobuf::Node,
+    query_node: &ast::Node,
 ) -> (Vec<PgClassOid>, Vec<(PgClassOid, i16)>) {
     let (_, deps) = collect_view_bindings_and_deps(query_node, snapshot);
     (deps.relation_refs, deps.column_refs)
 }
 
 /// The functions a statement calls (the view machinery's binding walker).
-pub(crate) fn statement_functions(
-    snapshot: &PgCatalog,
-    query_node: &protobuf::Node,
-) -> Vec<PgProcOid> {
+pub(crate) fn statement_functions(snapshot: &PgCatalog, query_node: &ast::Node) -> Vec<PgProcOid> {
     let (_, deps) = collect_view_bindings_and_deps(query_node, snapshot);
     deps.function_refs
 }
 
 fn collect_view_bindings_and_deps(
-    query_node: &protobuf::Node,
+    query_node: &ast::Node,
     snapshot: &PgCatalog,
 ) -> (Vec<AstBinding>, ViewDeps) {
     let mut walker = BindingWalker::default();
@@ -1293,140 +1274,132 @@ fn derive_deps_from_bindings(bindings: &[AstBinding]) -> ViewDeps {
 }
 
 impl BindingWalker {
-    fn walk_node(
-        &mut self,
-        node: &protobuf::Node,
-        snapshot: &PgCatalog,
-        stack: &[Vec<FromSource>],
-    ) {
-        let Some(inner) = node.node.as_ref() else {
-            return;
-        };
-        match inner {
-            node::Node::SelectStmt(sel) => self.walk_select(sel, snapshot, stack),
-            node::Node::ColumnRef(cr) => self.record_column_ref(cr, snapshot, stack),
-            node::Node::AExpr(expr) => {
-                if let Some(lexpr) = expr.lexpr.as_deref() {
+    fn walk_node(&mut self, node: &ast::Node, snapshot: &PgCatalog, stack: &[Vec<FromSource>]) {
+        match node {
+            ast::Node::SelectStmt(sel) => self.walk_select(sel, snapshot, stack),
+            ast::Node::ColumnRef(cr) => self.record_column_ref(cr, snapshot, stack),
+            ast::Node::AExpr(expr) => {
+                if let Some(lexpr) = expr.lexpr.as_ref() {
                     self.walk_node(lexpr, snapshot, stack);
                 }
-                if let Some(rexpr) = expr.rexpr.as_deref() {
+                if let Some(rexpr) = expr.rexpr.as_ref() {
                     self.walk_node(rexpr, snapshot, stack);
                 }
             }
-            node::Node::BoolExpr(b) => {
-                for arg in &b.args {
+            ast::Node::BoolExpr(b) => {
+                for arg in b.args.iter().flatten() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::FuncCall(fc) => {
+            ast::Node::FuncCall(fc) => {
                 self.bind_func_name(&fc.funcname, snapshot);
-                for arg in &fc.args {
+                for arg in fc.args.iter().flatten() {
                     self.walk_node(arg, snapshot, stack);
                 }
                 if let Some(over) = fc.over.as_deref() {
-                    for arg in &over.partition_clause {
+                    for arg in over.partition_clause.iter().flatten() {
                         self.walk_node(arg, snapshot, stack);
                     }
-                    for arg in &over.order_clause {
+                    for arg in over.order_clause.iter().flatten() {
                         self.walk_node(arg, snapshot, stack);
                     }
                 }
-                if let Some(filter) = fc.agg_filter.as_deref() {
+                if let Some(filter) = fc.agg_filter.as_ref() {
                     self.walk_node(filter, snapshot, stack);
                 }
             }
-            node::Node::TypeCast(tc) => {
-                if let Some(arg) = tc.arg.as_deref() {
+            ast::Node::TypeCast(tc) => {
+                if let Some(arg) = tc.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
                 if let Some(tn) = tc.type_name.as_ref() {
                     self.bind_type_name(tn, snapshot);
                 }
             }
-            node::Node::CollateClause(cc) => {
-                if let Some(arg) = cc.arg.as_deref() {
+            ast::Node::CollateClause(cc) => {
+                if let Some(arg) = cc.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::NamedArgExpr(na) => {
-                if let Some(arg) = na.arg.as_deref() {
+            ast::Node::NamedArgExpr(na) => {
+                if let Some(arg) = na.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::CoalesceExpr(c) => {
-                for arg in &c.args {
+            ast::Node::CoalesceExpr(c) => {
+                for arg in c.args.iter().flatten() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::MinMaxExpr(m) => {
-                for arg in &m.args {
+            ast::Node::MinMaxExpr(m) => {
+                for arg in m.args.iter().flatten() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::NullIfExpr(n) => {
-                for arg in &n.args {
+            ast::Node::NullIfExpr(n) => {
+                for arg in n.args.iter().flatten() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::CaseExpr(c) => {
-                if let Some(arg) = c.arg.as_deref() {
+            ast::Node::CaseExpr(c) => {
+                if let Some(arg) = c.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
-                for branch in &c.args {
+                for branch in c.args.iter().flatten() {
                     self.walk_node(branch, snapshot, stack);
                 }
-                if let Some(def) = c.defresult.as_deref() {
+                if let Some(def) = c.defresult.as_ref() {
                     self.walk_node(def, snapshot, stack);
                 }
             }
-            node::Node::CaseWhen(w) => {
-                if let Some(expr) = w.expr.as_deref() {
+            ast::Node::CaseWhen(w) => {
+                if let Some(expr) = w.expr.as_ref() {
                     self.walk_node(expr, snapshot, stack);
                 }
-                if let Some(result) = w.result.as_deref() {
+                if let Some(result) = w.result.as_ref() {
                     self.walk_node(result, snapshot, stack);
                 }
             }
-            node::Node::SubLink(sl) => {
-                if let Some(testexpr) = sl.testexpr.as_deref() {
+            ast::Node::SubLink(sl) => {
+                if let Some(testexpr) = sl.testexpr.as_ref() {
                     self.walk_node(testexpr, snapshot, stack);
                 }
-                if let Some(subselect) = sl.subselect.as_deref() {
+                if let Some(subselect) = sl.subselect.as_ref() {
                     self.walk_node(subselect, snapshot, stack);
                 }
             }
-            node::Node::NullTest(t) => {
-                if let Some(arg) = t.arg.as_deref() {
+            ast::Node::NullTest(t) => {
+                if let Some(arg) = t.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::BooleanTest(t) => {
-                if let Some(arg) = t.arg.as_deref() {
+            ast::Node::BooleanTest(t) => {
+                if let Some(arg) = t.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::List(l) => {
-                for item in &l.items {
+            ast::Node::List(l) => {
+                for item in l.items.iter().flatten() {
                     self.walk_node(item, snapshot, stack);
                 }
             }
-            node::Node::ArrayExpr(a) => {
-                for elem in &a.elements {
+            ast::Node::ArrayExpr(a) => {
+                for elem in a.elements.iter().flatten() {
                     self.walk_node(elem, snapshot, stack);
                 }
             }
-            node::Node::RowExpr(r) => {
-                for arg in &r.args {
+            ast::Node::RowExpr(r) => {
+                for arg in r.args.iter().flatten() {
                     self.walk_node(arg, snapshot, stack);
                 }
             }
-            node::Node::ResTarget(rt) => {
-                if let Some(val) = rt.val.as_deref() {
+            ast::Node::ResTarget(rt) => {
+                if let Some(val) = rt.val.as_ref() {
                     self.walk_node(val, snapshot, stack);
                 }
             }
-            node::Node::SortBy(sb) => {
-                if let Some(n) = sb.node.as_deref() {
+            ast::Node::SortBy(sb) => {
+                if let Some(n) = sb.node.as_ref() {
                     self.walk_node(n, snapshot, stack);
                 }
             }
@@ -1436,7 +1409,7 @@ impl BindingWalker {
 
     fn walk_select(
         &mut self,
-        sel: &protobuf::SelectStmt,
+        sel: &ast::SelectStmt,
         snapshot: &PgCatalog,
         parent_stack: &[Vec<FromSource>],
     ) {
@@ -1451,8 +1424,8 @@ impl BindingWalker {
 
         if let Some(with) = sel.with_clause.as_ref() {
             for cte_node in &with.ctes {
-                if let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() {
-                    if let Some(query) = cte.ctequery.as_deref() {
+                if let Some(ast::Node::CommonTableExpr(cte)) = cte_node.as_ref() {
+                    if let Some(query) = cte.ctequery.as_ref() {
                         let mut stack_with_partial = parent_stack.to_vec();
                         stack_with_partial.push(frame.clone());
                         self.walk_node(query, snapshot, &stack_with_partial);
@@ -1463,8 +1436,8 @@ impl BindingWalker {
                         columns: cte
                             .aliascolnames
                             .iter()
-                            .filter_map(|n| match n.node.as_ref()? {
-                                node::Node::String(s) => Some(s.sval.clone()),
+                            .filter_map(|n| match n.as_ref()? {
+                                ast::Node::String(s) => Some(s.sval.clone()),
                                 _ => None,
                             })
                             .collect(),
@@ -1473,45 +1446,42 @@ impl BindingWalker {
             }
         }
 
-        for from_item in &sel.from_clause {
+        for from_item in sel.from_clause.iter().flatten() {
             self.process_from_item(from_item, snapshot, parent_stack, &mut frame);
         }
 
         let mut stack = parent_stack.to_vec();
         stack.push(frame);
 
-        for t in &sel.target_list {
+        for t in sel.target_list.iter().flatten() {
             self.walk_node(t, snapshot, &stack);
         }
-        if let Some(w) = sel.where_clause.as_deref() {
+        if let Some(w) = sel.where_clause.as_ref() {
             self.walk_node(w, snapshot, &stack);
         }
-        for g in &sel.group_clause {
+        for g in sel.group_clause.iter().flatten() {
             self.walk_node(g, snapshot, &stack);
         }
-        if let Some(h) = sel.having_clause.as_deref() {
+        if let Some(h) = sel.having_clause.as_ref() {
             self.walk_node(h, snapshot, &stack);
         }
-        for s in &sel.sort_clause {
+        for s in sel.sort_clause.iter().flatten() {
             self.walk_node(s, snapshot, &stack);
         }
-        for d in &sel.distinct_clause {
+        for d in sel.distinct_clause.iter().flatten() {
             self.walk_node(d, snapshot, &stack);
         }
     }
 
     fn process_from_item(
         &mut self,
-        node: &protobuf::Node,
+        node: &ast::Node,
         snapshot: &PgCatalog,
         parent_stack: &[Vec<FromSource>],
         frame: &mut Vec<FromSource>,
     ) {
-        let Some(inner) = node.node.as_ref() else {
-            return;
-        };
-        match inner {
-            node::Node::RangeVar(rv) => {
+        match node {
+            ast::Node::RangeVar(rv) => {
                 let alias = rv
                     .alias
                     .as_ref()
@@ -1562,26 +1532,26 @@ impl BindingWalker {
                     });
                 }
             }
-            node::Node::JoinExpr(join) => {
-                if let Some(larg) = join.larg.as_deref() {
+            ast::Node::JoinExpr(join) => {
+                if let Some(larg) = join.larg.as_ref() {
                     self.process_from_item(larg, snapshot, parent_stack, frame);
                 }
-                if let Some(rarg) = join.rarg.as_deref() {
+                if let Some(rarg) = join.rarg.as_ref() {
                     self.process_from_item(rarg, snapshot, parent_stack, frame);
                 }
                 let mut stack = parent_stack.to_vec();
                 stack.push(frame.clone());
-                if let Some(q) = join.quals.as_deref() {
+                if let Some(q) = join.quals.as_ref() {
                     self.walk_node(q, snapshot, &stack);
                 }
             }
-            node::Node::RangeSubselect(sub) => {
+            ast::Node::RangeSubselect(sub) => {
                 let alias = sub
                     .alias
                     .as_ref()
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_else(|| "_subquery".into());
-                if let Some(query) = sub.subquery.as_deref() {
+                if let Some(query) = sub.subquery.as_ref() {
                     self.walk_node(query, snapshot, parent_stack);
                 }
                 frame.push(FromSource {
@@ -1590,8 +1560,8 @@ impl BindingWalker {
                     columns: Vec::new(),
                 });
             }
-            node::Node::RangeFunction(rf) => {
-                for arg in &rf.functions {
+            ast::Node::RangeFunction(rf) => {
+                for arg in rf.functions.iter().flatten() {
                     self.walk_node(arg, snapshot, parent_stack);
                 }
                 let alias = rf
@@ -1611,22 +1581,22 @@ impl BindingWalker {
 
     fn record_column_ref(
         &mut self,
-        cr: &protobuf::ColumnRef,
+        cr: &ast::ColumnRef,
         snapshot: &PgCatalog,
         stack: &[Vec<FromSource>],
     ) {
         let parts: Vec<String> = cr
             .fields
             .iter()
-            .filter_map(|f| match f.node.as_ref()? {
-                node::Node::String(s) => Some(s.sval.clone()),
+            .filter_map(|f| match f.as_ref()? {
+                ast::Node::String(s) => Some(s.sval.clone()),
                 _ => None,
             })
             .collect();
 
         let is_star = matches!(
-            cr.fields.last().and_then(|f| f.node.as_ref()),
-            Some(node::Node::AStar(_))
+            cr.fields.last().and_then(|f| f.as_ref()),
+            Some(ast::Node::AStar(_))
         );
         if is_star {
             // `*` expands to every column of the query level's FROM items,
@@ -1670,11 +1640,11 @@ impl BindingWalker {
     /// function (any overload) and emit a Function binding with its OID;
     /// the applier uses the proc's namespace + proname to rewrite the
     /// AST literals on deparse.
-    fn bind_func_name(&mut self, funcname: &[protobuf::Node], snapshot: &PgCatalog) {
+    fn bind_func_name(&mut self, funcname: &[Option<ast::Node>], snapshot: &PgCatalog) {
         let parts: Vec<&str> = funcname
             .iter()
-            .filter_map(|n| match n.node.as_ref()? {
-                node::Node::String(s) => Some(s.sval.as_str()),
+            .filter_map(|n| match n.as_ref()? {
+                ast::Node::String(s) => Some(s.sval.as_str()),
                 _ => None,
             })
             .collect();
@@ -1699,12 +1669,12 @@ impl BindingWalker {
 
     /// TypeName.names is `[name]` or `[schema, name]`. Emit a Type binding
     /// when the type resolves; applier rewrites the schema portion.
-    fn bind_type_name(&mut self, tn: &protobuf::TypeName, snapshot: &PgCatalog) {
+    fn bind_type_name(&mut self, tn: &ast::TypeName, snapshot: &PgCatalog) {
         let parts: Vec<&str> = tn
             .names
             .iter()
-            .filter_map(|n| match n.node.as_ref()? {
-                node::Node::String(s) => Some(s.sval.as_str()),
+            .filter_map(|n| match n.as_ref()? {
+                ast::Node::String(s) => Some(s.sval.as_str()),
                 _ => None,
             })
             .collect();
@@ -2043,18 +2013,18 @@ impl ViewUpdatability {
 
 /// view_query_is_auto_updatable / view_col_is_auto_updatable
 /// (rewriteHandler.c) over a view's defining SELECT.
-pub(crate) fn view_updatability(interp: &PgCatalog, query: &protobuf::Node) -> ViewUpdatability {
+pub(crate) fn view_updatability(interp: &PgCatalog, query: &ast::Node) -> ViewUpdatability {
     let not = |reason: &'static str| ViewUpdatability {
         not_updatable: Some(reason),
         base: None,
         columns: Vec::new(),
     };
-    let Some(node::Node::SelectStmt(sel)) = query.node.as_ref() else {
+    let ast::Node::SelectStmt(sel) = query else {
         return not(
             "Views that do not select from a single table or view are not automatically updatable.",
         );
     };
-    if sel.op != protobuf::SetOperation::SetopNone as i32 {
+    if sel.op != ast::SetOperation::SetopNone {
         return not(
             "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.",
         );
@@ -2079,13 +2049,13 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &protobuf::Node) -> V
     let mut kinds = crate::expr::FuncKindPresence::default();
     let mut srf = false;
     for target in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             continue;
         };
-        let Some(val) = rt.val.as_deref() else {
+        let Some(val) = rt.val.as_ref() else {
             continue;
         };
-        let found = crate::expr::detect_func_kinds(val, interp);
+        let found = crate::expr::detect_func_kinds(&rt.val, interp);
         kinds.has_aggregate |= found.has_aggregate;
         kinds.has_window |= found.has_window;
         srf |= returns_set(interp, val);
@@ -2109,14 +2079,12 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &protobuf::Node) -> V
     let [from] = sel.from_clause.as_slice() else {
         return not(single_table);
     };
-    let (rv, tablesample) = match from.node.as_ref() {
-        Some(node::Node::RangeVar(rv)) => (rv, false),
-        Some(node::Node::RangeTableSample(ts)) => {
-            match ts.relation.as_deref().and_then(|r| r.node.as_ref()) {
-                Some(node::Node::RangeVar(rv)) => (rv, true),
-                _ => return not(single_table),
-            }
-        }
+    let (rv, tablesample) = match from.as_ref() {
+        Some(ast::Node::RangeVar(rv)) => (rv, false),
+        Some(ast::Node::RangeTableSample(ts)) => match ts.relation.as_ref() {
+            Some(ast::Node::RangeVar(rv)) => (rv, true),
+            _ => return not(single_table),
+        },
         _ => return not(single_table),
     };
     let Ok((_, base)) = super::util::lookup_relation(interp, rv) else {
@@ -2157,11 +2125,10 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &protobuf::Node) -> V
     };
     let mut columns = Vec::new();
     for target in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             continue;
         };
-        let Some(node::Node::ColumnRef(cr)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
-        else {
+        let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref() else {
             columns.push(Err(not_a_column));
             continue;
         };
@@ -2171,8 +2138,8 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &protobuf::Node) -> V
             .filter_map(super::util::node_string)
             .collect();
         let star = matches!(
-            cr.fields.last().and_then(|f| f.node.as_ref()),
-            Some(node::Node::AStar(_))
+            cr.fields.last().and_then(|f| f.as_ref()),
+            Some(ast::Node::AStar(_))
         );
         if star {
             // `*` / `alias.*`: every column of the base relation.
@@ -2193,13 +2160,10 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &protobuf::Node) -> V
 }
 
 /// Whether `node` calls a set-returning function outside a sub-select.
-fn returns_set(interp: &PgCatalog, node: &protobuf::Node) -> bool {
-    let Some(inner) = node.node.as_ref() else {
-        return false;
-    };
-    match inner {
-        node::Node::SubLink(_) => false,
-        node::Node::FuncCall(fc) => {
+fn returns_set(interp: &PgCatalog, node: &ast::Node) -> bool {
+    match node {
+        ast::Node::SubLink(_) => false,
+        ast::Node::FuncCall(fc) => {
             let parts: Vec<&str> = fc
                 .funcname
                 .iter()
@@ -2212,15 +2176,12 @@ fn returns_set(interp: &PgCatalog, node: &protobuf::Node) -> bool {
             };
             let candidates = interp.find_functions(schema, name);
             (!candidates.is_empty() && candidates.iter().all(|p| p.proretset))
-                || fc.args.iter().any(|a| returns_set(interp, a))
+                || fc.args.iter().flatten().any(|a| returns_set(interp, a))
         }
         other => other.nodes().into_iter().skip(1).any(|(n, ..)| match n {
-            typedpg_pg_query::NodeRef::FuncCall(fc) => returns_set(
-                interp,
-                &protobuf::Node {
-                    node: Some(node::Node::FuncCall(Box::new(fc.clone()))),
-                },
-            ),
+            typedpg_pg_query::NodeRef::FuncCall(fc) => {
+                returns_set(interp, &ast::Node::FuncCall(NodeBox::new(fc.clone())))
+            }
             _ => false,
         }),
     }
@@ -2228,10 +2189,7 @@ fn returns_set(interp: &PgCatalog, node: &protobuf::Node) -> bool {
 
 /// DefineView / ATExecSetRelOptions: a view with a check option must be
 /// automatically updatable.
-pub(crate) fn check_option_allowed(
-    interp: &PgCatalog,
-    query: &protobuf::Node,
-) -> Result<(), DdlError> {
+pub(crate) fn check_option_allowed(interp: &PgCatalog, query: &ast::Node) -> Result<(), DdlError> {
     match view_updatability(interp, query).reason(true) {
         Some(reason) => Err(DdlError::UnsupportedDdl(format!(
             "WITH CHECK OPTION is supported only on automatically updatable views ({reason})"
@@ -2241,10 +2199,10 @@ pub(crate) fn check_option_allowed(
 }
 
 /// Whether a `WITH (...)` / `SET (...)` option list sets `check_option`.
-pub(crate) fn sets_check_option(options: &[protobuf::Node]) -> bool {
-    options.iter().any(|o| {
-        matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defname == "check_option")
-    })
+pub(crate) fn sets_check_option(options: &[Option<ast::Node>]) -> bool {
+    options
+        .iter()
+        .any(|o| matches!(o.as_ref(), Some(ast::Node::DefElem(de)) if de.defname == "check_option"))
 }
 
 /// What an analysis resolved its names to ([`super::depend::collect`]),
@@ -2288,7 +2246,7 @@ pub(crate) fn reanalyze_view(
 ) -> Option<Vec<crate::resolve::RawColumn>> {
     let stored = snapshot.view_references.get(&relid)?;
     let query = view_query(snapshot, relid)?;
-    let inner = query.node.as_ref()?;
+    let inner = &query;
     // The query's shape only: whether it would run, and what the planner
     // folds of it, is the reading statement's to report.
     let (analyzed, references) = expanding_view(relid, || {
@@ -2424,8 +2382,8 @@ pub(crate) fn planned_view_errors(
     let barrier = snapshot.security_barrier_views.contains(&relid);
     let stored = snapshot.view_references.get(&relid)?;
     let query = view_query(snapshot, relid)?;
-    let inner = query.node.as_ref()?;
-    let node::Node::SelectStmt(sel) = inner else {
+    let inner = &query;
+    let ast::Node::SelectStmt(sel) = inner else {
         return None;
     };
     // The query is another text: its errors keep their plain messages.
@@ -2451,10 +2409,7 @@ pub(crate) fn view_locks_rows(snapshot: &PgCatalog, relid: PgClassOid) -> bool {
         if !seen.insert(view) {
             continue;
         }
-        if view_query(snapshot, view)
-            .and_then(|q| q.node)
-            .is_some_and(|q| crate::resolve::locks_rows(&q))
-        {
+        if view_query(snapshot, view).is_some_and(|q| crate::resolve::locks_rows(&q)) {
             return true;
         }
         for r in snapshot.view_references.get(&view).into_iter().flatten() {
@@ -2476,10 +2431,7 @@ pub(crate) fn view_locks_rows(snapshot: &PgCatalog, relid: PgClassOid) -> bool {
 }
 
 /// The stored SELECT of view `relid`.
-pub(crate) fn view_query(
-    interp: &PgCatalog,
-    relid: crate::oid::PgClassOid,
-) -> Option<protobuf::Node> {
+pub(crate) fn view_query(interp: &PgCatalog, relid: crate::oid::PgClassOid) -> Option<ast::Node> {
     let body = interp.view_body(relid)?;
-    Some(body.ast.clone())
+    body.ast.clone()
 }

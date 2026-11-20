@@ -2,9 +2,7 @@
 //! (`CreateCommandTag`, utility.c): what event trigger `WHEN tag IN (...)`
 //! filters name, and what a read-only transaction's refusal reports.
 
-use typedpg_pg_query::protobuf::{
-    DiscardMode, ObjectType, TransactionStmtKind, VariableSetKind, node,
-};
+use typedpg_pg_query::ast::{self, DiscardMode, ObjectType, TransactionStmtKind, VariableSetKind};
 
 /// `(name, event_trigger_ok, table_rewrite_ok)` of every command tag but
 /// CMDTAG_UNKNOWN, as cmdtaglist.h lists them.
@@ -214,9 +212,9 @@ pub(crate) fn lookup(name: &str) -> Option<(bool, bool)> {
 }
 
 /// `AlterObjectTypeCommandTag` (utility.c).
-fn alter_object_type_tag(objtype: i32) -> &'static str {
+fn alter_object_type_tag(objtype: ObjectType) -> &'static str {
     use ObjectType as O;
-    match O::try_from(objtype).unwrap_or(O::Undefined) {
+    match objtype {
         O::ObjectAggregate => "ALTER AGGREGATE",
         O::ObjectAttribute => "ALTER TYPE",
         O::ObjectCast => "ALTER CAST",
@@ -261,9 +259,9 @@ fn alter_object_type_tag(objtype: i32) -> &'static str {
     }
 }
 
-fn drop_tag(remove_type: i32) -> &'static str {
+fn drop_tag(remove_type: ObjectType) -> &'static str {
     use ObjectType as O;
-    match O::try_from(remove_type).unwrap_or(O::Undefined) {
+    match remove_type {
         O::ObjectTable => "DROP TABLE",
         O::ObjectSequence => "DROP SEQUENCE",
         O::ObjectView => "DROP VIEW",
@@ -303,9 +301,9 @@ fn drop_tag(remove_type: i32) -> &'static str {
     }
 }
 
-fn define_tag(kind: i32) -> &'static str {
+fn define_tag(kind: ObjectType) -> &'static str {
     use ObjectType as O;
-    match O::try_from(kind).unwrap_or(O::Undefined) {
+    match kind {
         O::ObjectAggregate => "CREATE AGGREGATE",
         O::ObjectOperator => "CREATE OPERATOR",
         O::ObjectType => "CREATE TYPE",
@@ -320,17 +318,17 @@ fn define_tag(kind: i32) -> &'static str {
 }
 
 /// `CreateCommandTag` (utility.c) of a raw statement.
-pub(crate) fn command_tag(stmt: &node::Node) -> &'static str {
-    use node::Node as N;
+pub(crate) fn command_tag(stmt: &ast::Node) -> &'static str {
+    use ast::Node as N;
     match stmt {
         N::InsertStmt(_) => "INSERT",
         N::DeleteStmt(_) => "DELETE",
         N::UpdateStmt(_) => "UPDATE",
         N::MergeStmt(_) => "MERGE",
-        N::SelectStmt(_) | N::PlassignStmt(_) => "SELECT",
+        N::SelectStmt(_) | N::PlAssignStmt(_) => "SELECT",
         N::TransactionStmt(t) => {
             use TransactionStmtKind as K;
-            match K::try_from(t.kind).unwrap_or(K::Undefined) {
+            match t.kind {
                 K::TransStmtBegin => "BEGIN",
                 K::TransStmtStart => "START TRANSACTION",
                 K::TransStmtCommit => "COMMIT",
@@ -340,7 +338,6 @@ pub(crate) fn command_tag(stmt: &node::Node) -> &'static str {
                 K::TransStmtPrepare => "PREPARE TRANSACTION",
                 K::TransStmtCommitPrepared => "COMMIT PREPARED",
                 K::TransStmtRollbackPrepared => "ROLLBACK PREPARED",
-                K::Undefined => "???",
             }
         }
         N::DeclareCursorStmt(_) => "DECLARE CURSOR",
@@ -371,23 +368,21 @@ pub(crate) fn command_tag(stmt: &node::Node) -> &'static str {
         N::SecLabelStmt(_) => "SECURITY LABEL",
         N::CopyStmt(_) => "COPY",
         // A renamed column takes the tag of its relation's kind.
-        N::RenameStmt(r) => {
-            alter_object_type_tag(if r.rename_type == ObjectType::ObjectColumn as i32 {
-                r.relation_type
-            } else {
-                r.rename_type
-            })
-        }
+        N::RenameStmt(r) => alter_object_type_tag(if r.rename_type == ObjectType::ObjectColumn {
+            r.relation_type
+        } else {
+            r.rename_type
+        }),
         N::AlterObjectDependsStmt(s) => alter_object_type_tag(s.object_type),
         N::AlterObjectSchemaStmt(s) => alter_object_type_tag(s.object_type),
         N::AlterOwnerStmt(s) => alter_object_type_tag(s.object_type),
         N::AlterTableMoveAllStmt(s) => alter_object_type_tag(s.objtype),
         N::AlterTableStmt(s) => alter_object_type_tag(s.objtype),
         N::AlterDomainStmt(_) => "ALTER DOMAIN",
-        N::AlterFunctionStmt(f) => match ObjectType::try_from(f.objtype) {
-            Ok(ObjectType::ObjectFunction) => "ALTER FUNCTION",
-            Ok(ObjectType::ObjectProcedure) => "ALTER PROCEDURE",
-            Ok(ObjectType::ObjectRoutine) => "ALTER ROUTINE",
+        N::AlterFunctionStmt(f) => match f.objtype {
+            ObjectType::ObjectFunction => "ALTER FUNCTION",
+            ObjectType::ObjectProcedure => "ALTER PROCEDURE",
+            ObjectType::ObjectRoutine => "ALTER ROUTINE",
             _ => "???",
         },
         N::GrantStmt(g) if g.is_grant => "GRANT",
@@ -420,32 +415,30 @@ pub(crate) fn command_tag(stmt: &node::Node) -> &'static str {
         N::VacuumStmt(v) if v.is_vacuumcmd => "VACUUM",
         N::VacuumStmt(_) => "ANALYZE",
         N::ExplainStmt(_) => "EXPLAIN",
-        N::CreateTableAsStmt(c) => match ObjectType::try_from(c.objtype) {
-            Ok(ObjectType::ObjectTable) if c.is_select_into => "SELECT INTO",
-            Ok(ObjectType::ObjectTable) => "CREATE TABLE AS",
-            Ok(ObjectType::ObjectMatview) => "CREATE MATERIALIZED VIEW",
+        N::CreateTableAsStmt(c) => match c.objtype {
+            ObjectType::ObjectTable if c.is_select_into => "SELECT INTO",
+            ObjectType::ObjectTable => "CREATE TABLE AS",
+            ObjectType::ObjectMatview => "CREATE MATERIALIZED VIEW",
             _ => "???",
         },
         N::RefreshMatViewStmt(_) => "REFRESH MATERIALIZED VIEW",
         N::AlterSystemStmt(_) => "ALTER SYSTEM",
-        N::VariableSetStmt(v) => match VariableSetKind::try_from(v.kind) {
-            Ok(VariableSetKind::VarReset | VariableSetKind::VarResetAll) => "RESET",
-            Ok(VariableSetKind::Undefined) | Err(_) => "???",
-            Ok(_) => "SET",
+        N::VariableSetStmt(v) => match v.kind {
+            VariableSetKind::VarReset | VariableSetKind::VarResetAll => "RESET",
+            _ => "SET",
         },
         N::VariableShowStmt(_) => "SHOW",
-        N::DiscardStmt(d) => match DiscardMode::try_from(d.target) {
-            Ok(DiscardMode::DiscardAll) => "DISCARD ALL",
-            Ok(DiscardMode::DiscardPlans) => "DISCARD PLANS",
-            Ok(DiscardMode::DiscardTemp) => "DISCARD TEMP",
-            Ok(DiscardMode::DiscardSequences) => "DISCARD SEQUENCES",
-            _ => "???",
+        N::DiscardStmt(d) => match d.target {
+            DiscardMode::DiscardAll => "DISCARD ALL",
+            DiscardMode::DiscardPlans => "DISCARD PLANS",
+            DiscardMode::DiscardTemp => "DISCARD TEMP",
+            DiscardMode::DiscardSequences => "DISCARD SEQUENCES",
         },
         N::CreateTransformStmt(_) => "CREATE TRANSFORM",
         N::CreateTrigStmt(_) => "CREATE TRIGGER",
         N::CreateEventTrigStmt(_) => "CREATE EVENT TRIGGER",
         N::AlterEventTrigStmt(_) => "ALTER EVENT TRIGGER",
-        N::CreatePlangStmt(_) => "CREATE LANGUAGE",
+        N::CreatePLangStmt(_) => "CREATE LANGUAGE",
         N::CreateRoleStmt(_) => "CREATE ROLE",
         N::AlterRoleStmt(_) | N::AlterRoleSetStmt(_) => "ALTER ROLE",
         N::DropRoleStmt(_) => "DROP ROLE",
@@ -462,8 +455,8 @@ pub(crate) fn command_tag(stmt: &node::Node) -> &'static str {
         N::AlterOpFamilyStmt(_) => "ALTER OPERATOR FAMILY",
         N::AlterOperatorStmt(_) => "ALTER OPERATOR",
         N::AlterTypeStmt(_) => "ALTER TYPE",
-        N::AlterTsdictionaryStmt(_) => "ALTER TEXT SEARCH DICTIONARY",
-        N::AlterTsconfigurationStmt(_) => "ALTER TEXT SEARCH CONFIGURATION",
+        N::AlterTsDictionaryStmt(_) => "ALTER TEXT SEARCH DICTIONARY",
+        N::AlterTsConfigurationStmt(_) => "ALTER TEXT SEARCH CONFIGURATION",
         N::CreatePolicyStmt(_) => "CREATE POLICY",
         N::AlterPolicyStmt(_) => "ALTER POLICY",
         N::CreateAmStmt(_) => "CREATE ACCESS METHOD",
@@ -487,8 +480,8 @@ pub(crate) fn command_tag(stmt: &node::Node) -> &'static str {
 /// that aren't allowed in a read-only transaction — DDL and TRUNCATE. DML
 /// is refused by the executor (`ExecCheckXactReadOnly`) when it writes a
 /// permanent relation.
-pub(crate) fn utility_is_not_read_only(stmt: &node::Node) -> bool {
-    use node::Node as N;
+pub(crate) fn utility_is_not_read_only(stmt: &ast::Node) -> bool {
+    use ast::Node as N;
     matches!(
         stmt,
         N::AlterCollationStmt(_)
@@ -516,8 +509,8 @@ pub(crate) fn utility_is_not_read_only(stmt: &node::Node) -> bool {
             | N::AlterSeqStmt(_)
             | N::AlterStatsStmt(_)
             | N::AlterSubscriptionStmt(_)
-            | N::AlterTsconfigurationStmt(_)
-            | N::AlterTsdictionaryStmt(_)
+            | N::AlterTsConfigurationStmt(_)
+            | N::AlterTsDictionaryStmt(_)
             | N::AlterTableMoveAllStmt(_)
             | N::AlterTableSpaceOptionsStmt(_)
             | N::AlterTableStmt(_)
@@ -538,7 +531,7 @@ pub(crate) fn utility_is_not_read_only(stmt: &node::Node) -> bool {
             | N::CreateFunctionStmt(_)
             | N::CreateOpClassStmt(_)
             | N::CreateOpFamilyStmt(_)
-            | N::CreatePlangStmt(_)
+            | N::CreatePLangStmt(_)
             | N::CreatePolicyStmt(_)
             | N::CreatePublicationStmt(_)
             | N::CreateRangeStmt(_)

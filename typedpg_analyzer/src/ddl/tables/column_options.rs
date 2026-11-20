@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::pg_catalog::{SYSTEM_COLUMNS, TypStorage};
+use typedpg_pg_query::ast;
 
 /// `MAX_STATISTICS_TARGET`: larger targets are lowered with a WARNING.
 const MIN_STATISTICS_TARGET: i32 = -1;
@@ -28,8 +29,8 @@ pub(super) fn alter_column_setting(
                 "cannot refer to non-index column by number".into(),
             ));
         }
-        let target = match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
-            Some(node::Node::Integer(i)) => i.ival,
+        let target = match cmd.def.as_ref() {
+            Some(ast::Node::Integer(i)) => i.ival,
             _ => -1,
         };
         if target < MIN_STATISTICS_TARGET {
@@ -63,8 +64,8 @@ pub(super) fn alter_column_setting(
             cmd.name
         )));
     }
-    let def_name = || match cmd.def.as_deref().and_then(|d| d.node.as_ref()) {
-        Some(node::Node::String(s)) => Some(s.sval.clone()),
+    let def_name = || match cmd.def.as_ref() {
+        Some(ast::Node::String(s)) => Some(s.sval.clone()),
         _ => None,
     };
 
@@ -94,7 +95,7 @@ pub(super) fn alter_column_setting(
                 record_attr_compression(interp, relid, attr.attnum, method);
             }
         }
-        AlterTableType::AtSetOptions => check_attribute_options(cmd.def.as_deref())?,
+        AlterTableType::AtSetOptions => check_attribute_options(cmd.def.as_ref())?,
         _ => {}
     }
     Ok(())
@@ -180,7 +181,7 @@ pub(crate) fn record_attr_compression(
 /// COMPRESSION clause's method.
 pub(crate) fn check_column_def_options(
     interp: &PgCatalog,
-    cd: &typedpg_pg_query::protobuf::ColumnDef,
+    cd: &typedpg_pg_query::ast::ColumnDef,
     typid: PgTypeOid,
 ) -> Result<(Option<TypStorage>, Option<&'static str>), DdlError> {
     let storage = if cd.storage_name.is_empty() {
@@ -264,13 +265,13 @@ fn check_index_statistics_column(
 
 /// `attribute_reloptions`: the only per-column options are the float
 /// `n_distinct` and `n_distinct_inherited`, each at least -1.
-fn check_attribute_options(def: Option<&typedpg_pg_query::protobuf::Node>) -> Result<(), DdlError> {
-    let Some(node::Node::List(list)) = def.and_then(|d| d.node.as_ref()) else {
+fn check_attribute_options(def: Option<&typedpg_pg_query::ast::Node>) -> Result<(), DdlError> {
+    let Some(ast::Node::List(list)) = def else {
         return Ok(());
     };
     let mut seen: Vec<&str> = Vec::new();
     for item in &list.items {
-        let Some(node::Node::DefElem(de)) = item.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = item.as_ref() else {
             continue;
         };
         // PostgreSQL 18.7 keeps the column's version in the reserved option
@@ -299,12 +300,12 @@ fn check_attribute_options(def: Option<&typedpg_pg_query::protobuf::Node>) -> Re
         }
         seen.push(name);
         // defGetString; a bare option name means "true".
-        let raw = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+        let raw = match de.arg.as_ref() {
             None => "true".to_owned(),
-            Some(node::Node::Integer(i)) => i.ival.to_string(),
-            Some(node::Node::Float(f)) => f.fval.clone(),
-            Some(node::Node::String(s)) => s.sval.clone(),
-            Some(node::Node::Boolean(b)) => b.boolval.to_string(),
+            Some(ast::Node::Integer(i)) => i.ival.to_string(),
+            Some(ast::Node::Float(f)) => f.fval.clone(),
+            Some(ast::Node::String(s)) => s.sval.clone(),
+            Some(ast::Node::Boolean(b)) => b.boolval.to_string(),
             _ => continue,
         };
         // parse_real: strtod, rejecting out-of-range values.

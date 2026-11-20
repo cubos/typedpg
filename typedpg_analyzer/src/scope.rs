@@ -95,7 +95,7 @@ pub(crate) struct Deferred {
     /// expression of a subquery's output.
     pub substitution: Substitution,
     /// That output's expression, when [`Substitution::Certain`] and known.
-    pub expr: Option<std::sync::Arc<typedpg_pg_query::protobuf::Node>>,
+    pub expr: Option<std::sync::Arc<typedpg_pg_query::ast::Node>>,
     /// Set for a CTE the planner may inline as a subquery it plans on its
     /// own: [`Self::value`] and [`Self::entry`] are raised only where a
     /// reference to it is certainly planned.
@@ -1004,17 +1004,14 @@ impl Scope {
 
     /// The column a plain column reference (`c`, `t.c`, `s.t.c`; not `*`)
     /// resolves to, if it resolves.
-    pub(crate) fn plain_column_ref(
-        &self,
-        n: &typedpg_pg_query::protobuf::Node,
-    ) -> Option<&ScopeColumn> {
-        use typedpg_pg_query::protobuf::node;
-        let Some(node::Node::ColumnRef(c)) = n.node.as_ref() else {
+    pub(crate) fn plain_column_ref(&self, n: &typedpg_pg_query::ast::Node) -> Option<&ScopeColumn> {
+        use typedpg_pg_query::ast;
+        let ast::Node::ColumnRef(c) = n else {
             return None;
         };
         if c.fields
             .iter()
-            .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+            .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
         {
             return None;
         }

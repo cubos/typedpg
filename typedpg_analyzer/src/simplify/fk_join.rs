@@ -46,9 +46,7 @@
 use std::collections::BTreeSet;
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{
-    self, AExprKind, BoolExprType, JoinType, SetOperation, Token, node::Node,
-};
+use typedpg_pg_query::ast::{self, AExprKind, BoolExprType, JoinType, Node, SetOperation, Token};
 
 use super::proof::{column_not_null, has_volatile};
 use super::{Candidate, Ctx, Edit, Rule};
@@ -61,13 +59,13 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     let [raw] = ctx.tree.stmts.as_slice() else {
         return Vec::new();
     };
-    let Some(root) = raw.stmt.as_deref().and_then(|n| n.node.as_ref()) else {
+    let Some(root) = raw.stmt.as_ref() else {
         return Vec::new();
     };
     let Node::SelectStmt(sel) = root else {
         return Vec::new();
     };
-    if SetOperation::try_from(sel.op) != Ok(SetOperation::SetopNone)
+    if sel.op != SetOperation::SetopNone
         || sel.with_clause.is_some()
         || sel.into_clause.is_some()
         || !sel.locking_clause.is_empty()
@@ -76,9 +74,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     {
         return Vec::new();
     }
-    let Some(stmt) = raw.stmt.as_deref() else {
-        return Vec::new();
-    };
+    let stmt = &raw.stmt;
     // Views and row locking count as volatile there too.
     if has_volatile(ctx, stmt) || has_using_or_natural(root) {
         return Vec::new();
@@ -95,9 +91,10 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     for item in &sel.from_clause {
         site.join_sites(item, &mut out);
     }
-    if let Some(quals) = sel.where_clause.as_deref() {
+    if sel.where_clause.is_some() {
+        let quals = &sel.where_clause;
         for (i, item) in sel.from_clause.iter().enumerate() {
-            if let Some(Node::RangeVar(rv)) = item.node.as_ref()
+            if let Some(Node::RangeVar(rv)) = item.as_ref()
                 && let Some(edits) = site.comma_site(sel, i, rv, quals)
                 && site.tokens.clear_of_comments(&edits)
             {
@@ -126,7 +123,7 @@ struct Tokens<'a> {
 impl<'a> Tokens<'a> {
     fn scan(sql: &'a str) -> Option<Self> {
         let scanned = typedpg_pg_query::scan(sql).ok()?;
-        let span = |t: &protobuf::ScanToken| {
+        let span = |t: &ast::ScanToken| {
             Some((usize::try_from(t.start).ok()?, usize::try_from(t.end).ok()?))
         };
         let spans = scanned
@@ -137,7 +134,7 @@ impl<'a> Tokens<'a> {
         let comments = scanned
             .tokens
             .iter()
-            .filter(|t| matches!(t.token(), Token::SqlComment | Token::CComment))
+            .filter(|t| matches!(t.token, Token::SqlComment | Token::CComment))
             .map(span)
             .collect::<Option<Vec<_>>>()?;
         Some(Tokens {
@@ -190,7 +187,7 @@ impl<'a> Tokens<'a> {
     }
 
     /// The first and last token of a two-name `ColumnRef` (`q.col`).
-    fn column_ref(&self, cr: &protobuf::ColumnRef) -> Option<(usize, usize)> {
+    fn column_ref(&self, cr: &ast::ColumnRef) -> Option<(usize, usize)> {
         let first = self.at(cr.location)?;
         self.is(first + 1, ".").then_some((first, first + 2))
     }
@@ -214,12 +211,12 @@ impl<'a> Tokens<'a> {
 // ─── Shapes ───────────────────────────────────────────────────────────────
 
 /// A `q.col` column reference's qualifier and column.
-fn qualified(n: &protobuf::Node) -> Option<(&protobuf::ColumnRef, &str, &str)> {
-    let Some(Node::ColumnRef(cr)) = n.node.as_ref() else {
+fn qualified(n: &Option<ast::Node>) -> Option<(&ast::ColumnRef, &str, &str)> {
+    let Some(Node::ColumnRef(cr)) = n.as_ref() else {
         return None;
     };
     match cr.fields.as_slice() {
-        [q, c] => match (q.node.as_ref()?, c.node.as_ref()?) {
+        [q, c] => match (q.as_ref()?, c.as_ref()?) {
             (Node::String(q), Node::String(c)) => Some((cr, q.sval.as_str(), c.sval.as_str())),
             _ => None,
         },
@@ -232,8 +229,8 @@ fn qualified(n: &protobuf::Node) -> Option<(&protobuf::ColumnRef, &str, &str)> {
 struct KeyEquality<'a> {
     /// The `=`'s location: the node the reference check skips.
     location: i32,
-    left: &'a protobuf::ColumnRef,
-    right: &'a protobuf::ColumnRef,
+    left: &'a ast::ColumnRef,
+    right: &'a ast::ColumnRef,
     parent_col: &'a str,
     child: &'a str,
     child_col: &'a str,
@@ -242,19 +239,19 @@ struct KeyEquality<'a> {
 
 /// `node` as an equality between a column of `parent` (by its range
 /// name) and a column of another range name.
-fn key_equality<'a>(node: &'a protobuf::Node, parent: &str) -> Option<KeyEquality<'a>> {
-    let Some(Node::AExpr(e)) = node.node.as_ref() else {
+fn key_equality<'a>(node: &'a Option<ast::Node>, parent: &str) -> Option<KeyEquality<'a>> {
+    let Some(Node::AExpr(e)) = node.as_ref() else {
         return None;
     };
-    if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
+    if e.kind != AExprKind::AexprOp {
         return None;
     }
     match e.name.as_slice() {
-        [op] if matches!(op.node.as_ref(), Some(Node::String(s)) if s.sval == "=") => {}
+        [op] if matches!(op.as_ref(), Some(Node::String(s)) if s.sval == "=") => {}
         _ => return None,
     }
-    let (left, lq, lc) = qualified(e.lexpr.as_deref()?)?;
-    let (right, rq, rc) = qualified(e.rexpr.as_deref()?)?;
+    let (left, lq, lc) = qualified(&e.lexpr)?;
+    let (right, rq, rc) = qualified(&e.rexpr)?;
     let (parent_left, parent_col, child, child_col) = if lq == parent && rq != parent {
         (true, lc, rq, rc)
     } else if rq == parent && lq != parent {
@@ -275,25 +272,21 @@ fn key_equality<'a>(node: &'a protobuf::Node, parent: &str) -> Option<KeyEqualit
 
 /// The conjuncts of `quals`: the arguments of a top-level AND, or `quals`
 /// itself.
-fn conjuncts(quals: &protobuf::Node) -> Vec<&protobuf::Node> {
-    match quals.node.as_ref() {
-        Some(Node::BoolExpr(b))
-            if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::AndExpr) =>
-        {
-            b.args.iter().collect()
-        }
+fn conjuncts(quals: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
+    match quals.as_ref() {
+        Some(Node::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr => b.args.iter().collect(),
         _ => vec![quals],
     }
 }
 
 /// A table the query reads by name, as the rule can reason about it.
 struct Rel<'a> {
-    rv: &'a protobuf::RangeVar,
+    rv: &'a ast::RangeVar,
     oid: PgClassOid,
     relkind: RelKind,
 }
 
-fn refname(rv: &protobuf::RangeVar) -> &str {
+fn refname(rv: &ast::RangeVar) -> &str {
     rv.alias
         .as_ref()
         .map_or(rv.relname.as_str(), |a| a.aliasname.as_str())
@@ -301,7 +294,7 @@ fn refname(rv: &protobuf::RangeVar) -> &str {
 
 /// The plain or partitioned table `rv` names. A column alias list renames
 /// the columns the names below are matched against, so it isn't followed.
-fn relation<'a>(ctx: &Ctx<'_>, rv: &'a protobuf::RangeVar) -> Option<Rel<'a>> {
+fn relation<'a>(ctx: &Ctx<'_>, rv: &'a ast::RangeVar) -> Option<Rel<'a>> {
     if !rv.catalogname.is_empty() || rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
         return None;
     }
@@ -315,7 +308,7 @@ fn relation<'a>(ctx: &Ctx<'_>, rv: &'a protobuf::RangeVar) -> Option<Rel<'a>> {
 }
 
 enum Found<'a> {
-    Here(&'a protobuf::RangeVar),
+    Here(&'a ast::RangeVar),
     Absent,
     /// Present where its rows may be NULL-extended, or behind something
     /// the rule doesn't follow.
@@ -325,8 +318,8 @@ enum Found<'a> {
 /// The range named `name` in the join tree `node`, when every row of the
 /// tree has one of its rows (it's never on the nullable side of an outer
 /// join).
-fn find_range<'a>(node: &'a protobuf::Node, name: &str) -> Found<'a> {
-    match node.node.as_ref() {
+fn find_range<'a>(node: &'a Option<ast::Node>, name: &str) -> Found<'a> {
+    match node.as_ref() {
         Some(Node::RangeVar(rv)) if refname(rv) == name => Found::Here(rv),
         Some(Node::RangeVar(_)) => Found::Absent,
         Some(Node::JoinExpr(j)) => {
@@ -334,19 +327,23 @@ fn find_range<'a>(node: &'a protobuf::Node, name: &str) -> Found<'a> {
                 // The alias hides the names inside.
                 return Found::Unusable;
             }
-            let kind = JoinType::try_from(j.jointype);
+            let kind = j.jointype;
             let sides = [
                 (
-                    j.larg.as_deref(),
-                    matches!(kind, Ok(JoinType::JoinInner | JoinType::JoinLeft)),
+                    &j.larg,
+                    matches!(kind, JoinType::JoinInner | JoinType::JoinLeft),
                 ),
                 (
-                    j.rarg.as_deref(),
-                    matches!(kind, Ok(JoinType::JoinInner | JoinType::JoinRight)),
+                    &j.rarg,
+                    matches!(kind, JoinType::JoinInner | JoinType::JoinRight),
                 ),
             ];
             for (side, preserved) in sides {
-                match side.map_or(Found::Absent, |s| find_range(s, name)) {
+                let found = match side {
+                    None => Found::Absent,
+                    Some(_) => find_range(side, name),
+                };
+                match found {
                     Found::Here(rv) if preserved => return Found::Here(rv),
                     Found::Absent => {}
                     _ => return Found::Unusable,
@@ -397,7 +394,7 @@ fn parent_used(ctx: &Ctx<'_>, root: NodeRef<'_>, parent: &Rel<'_>, skip: &[i32])
             NodeRef::ColumnRef(cr) => {
                 let unqualified = cr.fields.len() == 1;
                 for f in &cr.fields {
-                    match f.node.as_ref() {
+                    match f.as_ref() {
                         Some(Node::AStar(_)) if unqualified => return true,
                         Some(Node::String(s))
                             if s.sval == name || (unqualified && columns.contains(&*s.sval)) =>
@@ -598,7 +595,7 @@ impl Site<'_, '_> {
     /// all against the same child range name.
     fn all_key_equalities<'n>(
         &self,
-        quals: &[&'n protobuf::Node],
+        quals: &[&'n Option<ast::Node>],
         parent: &str,
     ) -> Option<Vec<KeyEquality<'n>>> {
         let eqs: Vec<KeyEquality<'n>> = quals
@@ -611,11 +608,11 @@ impl Site<'_, '_> {
 
     /// The JOIN form at every INNER JoinExpr of the tree `node` whose
     /// right-hand side is the parent.
-    fn join_sites(&self, node: &protobuf::Node, out: &mut Vec<Candidate>) {
-        let Some(Node::JoinExpr(j)) = node.node.as_ref() else {
+    fn join_sites(&self, node: &Option<ast::Node>, out: &mut Vec<Candidate>) {
+        let Some(Node::JoinExpr(j)) = node.as_ref() else {
             return;
         };
-        for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+        for side in [&j.larg, &j.rarg] {
             self.join_sites(side, out);
         }
         if let Some(edits) = self.join_site(j)
@@ -628,8 +625,8 @@ impl Site<'_, '_> {
         }
     }
 
-    fn join_site(&self, j: &protobuf::JoinExpr) -> Option<Vec<Edit>> {
-        if JoinType::try_from(j.jointype) != Ok(JoinType::JoinInner)
+    fn join_site(&self, j: &ast::JoinExpr) -> Option<Vec<Edit>> {
+        if j.jointype != JoinType::JoinInner
             || j.is_natural
             || !j.using_clause.is_empty()
             || j.alias.is_some()
@@ -637,13 +634,14 @@ impl Site<'_, '_> {
         {
             return None;
         }
-        let Some(Node::RangeVar(prv)) = j.rarg.as_deref()?.node.as_ref() else {
+        let Some(Node::RangeVar(prv)) = j.rarg.as_ref() else {
             return None;
         };
         let parent = relation(self.ctx, prv)?;
-        let quals = conjuncts(j.quals.as_deref()?);
+        j.quals.as_ref()?;
+        let quals = conjuncts(&j.quals);
         let equalities = self.all_key_equalities(&quals, refname(prv))?;
-        let Found::Here(crv) = find_range(j.larg.as_deref()?, equalities[0].child) else {
+        let Found::Here(crv) = find_range(&j.larg, equalities[0].child) else {
             return None;
         };
         let child = relation(self.ctx, crv)?;
@@ -678,10 +676,10 @@ impl Site<'_, '_> {
     /// the WHERE's top-level conjuncts.
     fn comma_site(
         &self,
-        sel: &protobuf::SelectStmt,
+        sel: &ast::SelectStmt,
         i: usize,
-        prv: &protobuf::RangeVar,
-        where_clause: &protobuf::Node,
+        prv: &ast::RangeVar,
+        where_clause: &Option<ast::Node>,
     ) -> Option<Vec<Edit>> {
         let parent = relation(self.ctx, prv)?;
         let pname = refname(prv);
@@ -724,7 +722,7 @@ impl Site<'_, '_> {
 
     /// The first token of the relation `rv`: its name, or the `ONLY` and
     /// parenthesis before it.
-    fn relation_first_token(&self, rv: &protobuf::RangeVar) -> Option<usize> {
+    fn relation_first_token(&self, rv: &ast::RangeVar) -> Option<usize> {
         let t = &self.tokens;
         let mut first = t.at(rv.location)?;
         if !rv.inh {
@@ -741,12 +739,7 @@ impl Site<'_, '_> {
 
     /// The edit removing FROM item `i` (a relation) and the comma next to
     /// it.
-    fn cut_from_item(
-        &self,
-        sel: &protobuf::SelectStmt,
-        i: usize,
-        rv: &protobuf::RangeVar,
-    ) -> Option<Edit> {
+    fn cut_from_item(&self, sel: &ast::SelectStmt, i: usize, rv: &ast::RangeVar) -> Option<Edit> {
         let t = &self.tokens;
         let first = self.relation_first_token(rv)?;
         // The relation's last token: the one before the `,` or the WHERE

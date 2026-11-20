@@ -80,9 +80,7 @@ pub(super) fn replica_identity(
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ReplicaIdentityStmt(ri)) =
-        cmd.def.as_deref().and_then(|d| d.node.as_ref())
-    else {
+    let Some(ast::Node::ReplicaIdentityStmt(ri)) = cmd.def.as_ref() else {
         return Ok(());
     };
     // REPLICA_IDENTITY_INDEX.
@@ -175,9 +173,7 @@ pub(super) fn alter_constraint(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::AtalterConstraint(alter)) =
-        cmd.def.as_deref().and_then(|d| d.node.as_ref())
-    else {
+    let Some(ast::Node::AtAlterConstraint(alter)) = cmd.def.as_ref() else {
         return Ok(());
     };
     let relname = relname_of(interp, relid);

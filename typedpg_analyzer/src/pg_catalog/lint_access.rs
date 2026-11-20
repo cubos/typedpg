@@ -72,7 +72,7 @@ impl PgCatalog {
     /// resolves casts and column definitions.
     pub fn lint_resolve_type_name(
         &self,
-        type_name: &typedpg_pg_query::protobuf::TypeName,
+        type_name: &typedpg_pg_query::ast::TypeName,
     ) -> Option<PgTypeOid> {
         crate::ddl::util::resolve_type_name(type_name, self)
     }

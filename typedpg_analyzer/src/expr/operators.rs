@@ -1,4 +1,5 @@
 use super::*;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Operators (A_Expr) — two-pass (PG chapter 10.2)
@@ -13,7 +14,7 @@ use super::*;
 /// `None` to fall through. The generic binary-operator resolution (two-pass
 /// type inference + `find_operator`) lives at the bottom of this function.
 pub(crate) fn infer_a_expr(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -54,18 +55,15 @@ pub(crate) fn infer_a_expr(
 /// has no `=` of its own; `text = text` is chosen) and keeps the left
 /// input's typmod only when it needed no coercion. Always nullable.
 fn handle_nullif(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
-    if !matches!(
-        protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprNullif)
-    ) {
+    if !matches!(expr.kind, ast::AExprKind::AexprNullif) {
         return Ok(None);
     }
-    let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+    let (lexpr @ Some(_), rexpr @ Some(_)) = (&expr.lexpr, &expr.rexpr) else {
         return Err(AnalyzeError::Internal("NULLIF without operands".into()));
     };
     let left = infer_expr(lexpr, ctx, params, TypeGoal::NONE)?;
@@ -192,23 +190,23 @@ fn handle_nullif(
 /// leaves `$1` untypable); otherwise the `=` operator is resolved like any
 /// other. The result is always bool NOT NULL.
 fn handle_distinct_from(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
     if !matches!(
-        protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprDistinct) | Ok(protobuf::AExprKind::AexprNotDistinct)
+        expr.kind,
+        ast::AExprKind::AexprDistinct | ast::AExprKind::AexprNotDistinct
     ) {
         return Ok(None);
     }
-    let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+    let (lexpr @ Some(_), rexpr @ Some(_)) = (&expr.lexpr, &expr.rexpr) else {
         return Err(AnalyzeError::Internal(
             "IS DISTINCT FROM without operands".into(),
         ));
     };
     let is_null_const =
-        |n: &protobuf::Node| matches!(n.node.as_ref(), Some(node::Node::AConst(c)) if c.isnull);
+        |n: &Option<ast::Node>| matches!(n.as_ref(), Some(ast::Node::AConst(c)) if c.isnull);
     let null_test_of = if is_null_const(rexpr) {
         Some(lexpr)
     } else if is_null_const(lexpr) {
@@ -220,17 +218,15 @@ fn handle_distinct_from(
     // values compare with `=`, and a NULL from it is the result.
     let mut nullable = false;
     if let Some(arg) = null_test_of {
-        let t = protobuf::NullTest {
-            arg: Some(Box::new(arg.clone())),
-            nulltesttype: protobuf::NullTestType::IsNotNull as i32,
+        let t = ast::NullTest {
+            arg: arg.clone(),
+            nulltesttype: ast::NullTestType::IsNotNull,
             ..Default::default()
         };
-        let n = protobuf::Node {
-            node: Some(node::Node::NullTest(Box::new(t))),
-        };
+        let n = Some(ast::Node::NullTest(NodeBox::new(t)));
         infer_expr(&n, ctx, params, TypeGoal::NONE)?;
-    } else if let (Some(node::Node::RowExpr(l)), Some(node::Node::RowExpr(r))) =
-        (lexpr.node.as_ref(), rexpr.node.as_ref())
+    } else if let (Some(ast::Node::RowExpr(l)), Some(ast::Node::RowExpr(r))) =
+        (lexpr.as_ref(), rexpr.as_ref())
     {
         // make_row_distinct_op: a pairwise `=` per column, ORed.
         let ops = row_pairwise_op("=", &l.args, &r.args, expr.location, ctx, params, |_| {
@@ -278,25 +274,25 @@ fn handle_distinct_from(
 /// order, so an untyped side is typed by its peer (`$p BETWEEN 1 AND 5`
 /// pins `$p` to int4 in the first comparison).
 fn handle_between(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
-    use protobuf::AExprKind as Kind;
-    let kind = protobuf::AExprKind::try_from(expr.kind);
+    use ast::AExprKind as Kind;
+    let kind = expr.kind;
     if !matches!(
         kind,
-        Ok(Kind::AexprBetween
+        Kind::AexprBetween
             | Kind::AexprNotBetween
             | Kind::AexprBetweenSym
-            | Kind::AexprNotBetweenSym)
+            | Kind::AexprNotBetweenSym
     ) {
         return Ok(None);
     }
-    let (Some(a), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+    let (a @ Some(_), rexpr @ Some(_)) = (&expr.lexpr, &expr.rexpr) else {
         return Err(AnalyzeError::Internal("BETWEEN without operands".into()));
     };
-    let Some(node::Node::List(list)) = rexpr.node.as_ref() else {
+    let Some(ast::Node::List(list)) = rexpr.as_ref() else {
         return Err(AnalyzeError::Internal(
             "BETWEEN bounds are not a list".into(),
         ));
@@ -304,10 +300,10 @@ fn handle_between(
     let [b, c] = list.items.as_slice() else {
         return Err(AnalyzeError::Internal("BETWEEN needs two bounds".into()));
     };
-    let comparisons: &[(&str, &protobuf::Node)] = match kind {
-        Ok(Kind::AexprBetween) => &[(">=", b), ("<=", c)],
-        Ok(Kind::AexprNotBetween) => &[("<", b), (">", c)],
-        Ok(Kind::AexprBetweenSym) => &[(">=", b), ("<=", c), (">=", c), ("<=", b)],
+    let comparisons: &[(&str, &Option<ast::Node>)] = match kind {
+        Kind::AexprBetween => &[(">=", b), ("<=", c)],
+        Kind::AexprNotBetween => &[("<", b), (">", c)],
+        Kind::AexprBetweenSym => &[(">=", b), ("<=", c), (">=", c), ("<=", b)],
         _ => &[("<", b), (">", c), ("<", c), (">", b)],
     };
     let mut nullable = false;
@@ -327,21 +323,18 @@ fn handle_between(
 /// fails) becomes its own `a op item` comparison, resolved like any binary
 /// operator — which is what types `$p` in `$p IN (n, 2)` as int4.
 fn handle_in_list(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
-    if !matches!(
-        protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprIn)
-    ) {
+    if !matches!(expr.kind, ast::AExprKind::AexprIn) {
         return Ok(None);
     }
     let Ctx { snapshot, .. } = ctx;
-    let (Some(a), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
+    let (a @ Some(_), rexpr @ Some(_)) = (&expr.lexpr, &expr.rexpr) else {
         return Err(AnalyzeError::Internal("IN without operands".into()));
     };
-    let Some(node::Node::List(list)) = rexpr.node.as_ref() else {
+    let Some(ast::Node::List(list)) = rexpr.as_ref() else {
         return Err(AnalyzeError::Internal("IN list is not a list".into()));
     };
     let op_name = extract_string_fields(&expr.name).join(".");
@@ -394,8 +387,8 @@ fn handle_in_list(
     // afresh through `variable_coerce_param_hook` — and two comparisons
     // deducing different types is `inconsistent types deduced for
     // parameter $N` (`$1 IN (int_col, text_col)`), not an operator error.
-    let untyped_param = match a.node.as_ref() {
-        Some(node::Node::ParamRef(p))
+    let untyped_param = match a.as_ref() {
+        Some(ast::Node::ParamRef(p))
             if left.type_oid == oid::UNKNOWN && !folded.iter().any(|&f| f) =>
         {
             Some(p)
@@ -435,19 +428,19 @@ fn handle_in_list(
 /// rewrite target of BETWEEN / IN (PG's `makeSimpleA_Expr` + transform).
 pub(crate) fn infer_synthetic_op(
     op: &str,
-    l: &protobuf::Node,
-    r: &protobuf::Node,
+    l: &Option<ast::Node>,
+    r: &Option<ast::Node>,
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    let e = protobuf::AExpr {
-        kind: protobuf::AExprKind::AexprOp as i32,
-        name: vec![protobuf::Node {
-            node: Some(node::Node::String(protobuf::String { sval: op.into() })),
-        }],
-        lexpr: Some(Box::new(l.clone())),
-        rexpr: Some(Box::new(r.clone())),
+    let e = ast::AExpr {
+        kind: ast::AExprKind::AexprOp,
+        name: vec![Some(ast::Node::String(NodeBox::new(ast::String {
+            sval: op.into(),
+        })))],
+        lexpr: l.clone(),
+        rexpr: r.clone(),
         // No IN list: `makeSimpleA_Expr` leaves the list bounds unset.
         rexpr_list_start: -1,
         rexpr_list_end: -1,
@@ -462,19 +455,19 @@ pub(crate) fn infer_synthetic_op(
 /// `record = record` and their contents are not typed pairwise.
 fn infer_plain_op(
     op: &str,
-    l: &protobuf::Node,
-    r: &protobuf::Node,
+    l: &Option<ast::Node>,
+    r: &Option<ast::Node>,
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    let e = protobuf::AExpr {
-        kind: protobuf::AExprKind::AexprOp as i32,
-        name: vec![protobuf::Node {
-            node: Some(node::Node::String(protobuf::String { sval: op.into() })),
-        }],
-        lexpr: Some(Box::new(l.clone())),
-        rexpr: Some(Box::new(r.clone())),
+    let e = ast::AExpr {
+        kind: ast::AExprKind::AexprOp,
+        name: vec![Some(ast::Node::String(NodeBox::new(ast::String {
+            sval: op.into(),
+        })))],
+        lexpr: l.clone(),
+        rexpr: r.clone(),
         // No IN list: `makeSimpleA_Expr` leaves the list bounds unset.
         rexpr_list_start: -1,
         rexpr_list_end: -1,
@@ -485,52 +478,47 @@ fn infer_plain_op(
 
 /// A `NULL::T` node standing for "some value of type T" (the folded array
 /// element of an IN list).
-pub(crate) fn typed_null(t: PgTypeOid) -> protobuf::Node {
-    let null = protobuf::Node {
-        node: Some(node::Node::AConst(protobuf::AConst {
-            isnull: true,
+pub(crate) fn typed_null(t: PgTypeOid) -> Option<ast::Node> {
+    let null = ast::Node::AConst(NodeBox::new(ast::AConst {
+        isnull: true,
+        ..Default::default()
+    }));
+    Some(ast::Node::TypeCast(NodeBox::new(ast::TypeCast {
+        arg: Some(null),
+        type_name: Some(NodeBox::new(ast::TypeName {
+            type_oid: t.get(),
+            location: -1,
             ..Default::default()
         })),
-    };
-    protobuf::Node {
-        node: Some(node::Node::TypeCast(Box::new(protobuf::TypeCast {
-            arg: Some(Box::new(null)),
-            type_name: Some(protobuf::TypeName {
-                type_oid: t.get(),
-                location: -1,
-                ..Default::default()
-            }),
-            location: -1,
-        }))),
-    }
+        location: -1,
+    })))
 }
 
 /// Approximates PG's `contain_vars_of_level(expr, 0)`: a column reference
 /// outside any sub-select. (A correlated reference *inside* a sub-select
 /// would also count in PG; treating those items as Var-free only changes
 /// which IN items get folded together.)
-pub(crate) fn contains_level0_column_ref(n: &protobuf::Node) -> bool {
-    let any = |ns: &[protobuf::Node]| ns.iter().any(contains_level0_column_ref);
-    let opt =
-        |n: &Option<Box<protobuf::Node>>| n.as_deref().is_some_and(contains_level0_column_ref);
-    match n.node.as_ref() {
-        Some(node::Node::ColumnRef(_)) => true,
-        Some(node::Node::AExpr(e)) => opt(&e.lexpr) || opt(&e.rexpr),
-        Some(node::Node::BoolExpr(b)) => any(&b.args),
-        Some(node::Node::FuncCall(f)) => any(&f.args) || opt(&f.agg_filter),
-        Some(node::Node::NamedArgExpr(na)) => opt(&na.arg),
-        Some(node::Node::TypeCast(c)) => opt(&c.arg),
-        Some(node::Node::CollateClause(c)) => opt(&c.arg),
-        Some(node::Node::NullTest(t)) => opt(&t.arg),
-        Some(node::Node::BooleanTest(t)) => opt(&t.arg),
-        Some(node::Node::CoalesceExpr(c)) => any(&c.args),
-        Some(node::Node::MinMaxExpr(m)) => any(&m.args),
-        Some(node::Node::RowExpr(r)) => any(&r.args),
-        Some(node::Node::AArrayExpr(a)) => any(&a.elements),
-        Some(node::Node::AIndirection(i)) => opt(&i.arg),
-        Some(node::Node::List(l)) => any(&l.items),
-        Some(node::Node::CaseExpr(c)) => opt(&c.arg) || any(&c.args) || opt(&c.defresult),
-        Some(node::Node::CaseWhen(w)) => opt(&w.expr) || opt(&w.result),
+pub(crate) fn contains_level0_column_ref(n: &Option<ast::Node>) -> bool {
+    let any = |ns: &[Option<ast::Node>]| ns.iter().any(contains_level0_column_ref);
+    let opt = contains_level0_column_ref;
+    match n.as_ref() {
+        Some(ast::Node::ColumnRef(_)) => true,
+        Some(ast::Node::AExpr(e)) => opt(&e.lexpr) || opt(&e.rexpr),
+        Some(ast::Node::BoolExpr(b)) => any(&b.args),
+        Some(ast::Node::FuncCall(f)) => any(&f.args) || opt(&f.agg_filter),
+        Some(ast::Node::NamedArgExpr(na)) => opt(&na.arg),
+        Some(ast::Node::TypeCast(c)) => opt(&c.arg),
+        Some(ast::Node::CollateClause(c)) => opt(&c.arg),
+        Some(ast::Node::NullTest(t)) => opt(&t.arg),
+        Some(ast::Node::BooleanTest(t)) => opt(&t.arg),
+        Some(ast::Node::CoalesceExpr(c)) => any(&c.args),
+        Some(ast::Node::MinMaxExpr(m)) => any(&m.args),
+        Some(ast::Node::RowExpr(r)) => any(&r.args),
+        Some(ast::Node::AArrayExpr(a)) => any(&a.elements),
+        Some(ast::Node::AIndirection(i)) => opt(&i.arg),
+        Some(ast::Node::List(l)) => any(&l.items),
+        Some(ast::Node::CaseExpr(c)) => opt(&c.arg) || any(&c.args) || opt(&c.defresult),
+        Some(ast::Node::CaseWhen(w)) => opt(&w.expr) || opt(&w.result),
         _ => false,
     }
 }
@@ -539,26 +527,26 @@ pub(crate) fn contains_level0_column_ref(n: &protobuf::Node) -> bool {
 /// The generic back-fill would assign the wrong type (element ↔ array
 /// confusion), so we handle it first and return early.
 fn handle_any_all(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
     if !matches!(
-        protobuf::AExprKind::try_from(expr.kind),
-        Ok(protobuf::AExprKind::AexprOpAny) | Ok(protobuf::AExprKind::AexprOpAll)
+        expr.kind,
+        ast::AExprKind::AexprOpAny | ast::AExprKind::AexprOpAll
     ) {
         return Ok(None);
     }
     let left = expr
         .lexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
+        .is_some()
+        .then(|| infer_expr(&expr.lexpr, ctx, params, TypeGoal::NONE))
         .transpose()?;
     let right = expr
         .rexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
+        .is_some()
+        .then(|| infer_expr(&expr.rexpr, ctx, params, TypeGoal::NONE))
         .transpose()?;
 
     let left_oid = left.as_ref().map(|l| l.type_oid).unwrap_or(oid::UNKNOWN);
@@ -644,14 +632,14 @@ fn handle_any_all(
         // make_fn_arguments: the left operand first.
         let left_type = match op.left_type_oid {
             Some(declared) if left_oid == oid::UNKNOWN => {
-                if let Some(lexpr) = &expr.lexpr {
+                if let lexpr @ Some(_) = &expr.lexpr {
                     coerce_unknown_operand(lexpr, ctx, params, declared)?;
                 }
                 declared
             }
             _ => left_oid,
         };
-        if let (Some(array), Some(rexpr)) = (array, &expr.rexpr) {
+        if let (Some(array), rexpr @ Some(_)) = (array, &expr.rexpr) {
             coerce_unknown_operand(rexpr, ctx, params, array)?;
         }
         let elem = if right_oid == oid::UNKNOWN {
@@ -684,10 +672,7 @@ fn handle_any_all(
         // Elements known non-NULL from the value's own type (`ARRAY(SELECT
         // nn_col …)`), or from its constructor / literal.
         || (right.as_ref().and_then(|r| r.elem_nullable) != Some(false)
-            && expr
-                .rexpr
-                .as_deref()
-                .is_none_or(|r| array_elements_may_be_null(r, ctx, params)));
+            && array_elements_may_be_null(&expr.rexpr, ctx, params));
     Ok(Some(ExprType::scalar(oid::BOOL, any_nullable)))
 }
 
@@ -718,13 +703,13 @@ pub(crate) fn operator_call_nullable(
 /// no NOT NULL constraint on elements. The elements are re-inferred against
 /// a throwaway collector, so the peek has no side effects.
 pub(crate) fn array_elements_may_be_null(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> bool {
-    match node.node.as_ref() {
-        Some(node::Node::AArrayExpr(arr)) => arr.elements.iter().any(|e| {
-            if matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_))) {
+    match node.as_ref() {
+        Some(ast::Node::AArrayExpr(arr)) => arr.elements.iter().any(|e| {
+            if matches!(e.as_ref(), Some(ast::Node::AArrayExpr(_))) {
                 return array_elements_may_be_null(e, ctx, params);
             }
             let mut scratch = params.clone();
@@ -734,13 +719,10 @@ pub(crate) fn array_elements_may_be_null(
                 !t.nullable && array_element_type(ctx.snapshot, t.type_oid).is_none()
             })
         }),
-        Some(node::Node::TypeCast(c)) => c
-            .arg
-            .as_deref()
-            .is_none_or(|a| array_elements_may_be_null(a, ctx, params)),
+        Some(ast::Node::TypeCast(c)) => array_elements_may_be_null(&c.arg, ctx, params),
         // An untyped literal (`'{1,2}'`, cast or coerced to the array type).
-        Some(node::Node::AConst(ac)) => match &ac.val {
-            Some(a_const::Val::Sval(sv)) if !ac.isnull => {
+        Some(ast::Node::AConst(ac)) => match &ac.val {
+            Some(ast::AConstValue::String(sv)) if !ac.isnull => {
                 crate::literal_input::array_literal_may_contain_null(&sv.sval)
             }
             _ => true,
@@ -757,16 +739,13 @@ pub(crate) fn array_elements_may_be_null(
 /// by their peer; every pairwise operator must yield boolean. (The btree
 /// opfamily check PG applies to multi-column rows is not modeled.)
 fn handle_row_row(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     op_name: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<Option<ExprType>, AnalyzeError> {
-    let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
-        return Ok(None);
-    };
-    let (Some(node::Node::RowExpr(lrow)), Some(node::Node::RowExpr(rrow))) =
-        (lexpr.node.as_ref(), rexpr.node.as_ref())
+    let (Some(ast::Node::RowExpr(lrow)), Some(ast::Node::RowExpr(rrow))) =
+        (expr.lexpr.as_ref(), expr.rexpr.as_ref())
     else {
         return Ok(None);
     };
@@ -790,8 +769,8 @@ fn handle_row_row(
 /// construct's error from the offending type's name). The result is bool, nullable if any column is.
 pub(crate) fn row_pairwise_op(
     op_name: &str,
-    largs: &[protobuf::Node],
-    rargs: &[protobuf::Node],
+    largs: &[Option<ast::Node>],
+    rargs: &[Option<ast::Node>],
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -821,7 +800,7 @@ pub(crate) fn row_pairwise_op(
     for (i, (l, r)) in largs.iter().zip(rargs).enumerate() {
         let untyped_param =
             |n, untyped: bool| super::bare_param(n, ctx.snapshot).filter(|_| untyped);
-        let pair_params: Vec<&protobuf::ParamRef> =
+        let pair_params: Vec<&ast::ParamRef> =
             [untyped_param(l, luntyped[i]), untyped_param(r, runtyped[i])]
                 .into_iter()
                 .flatten()
@@ -855,8 +834,8 @@ pub(crate) fn row_pairwise_op(
 /// types re-read on a scratch collector): `None` when it can't be told.
 fn pair_operator(
     op_name: &str,
-    l: &protobuf::Node,
-    r: &protobuf::Node,
+    l: &Option<ast::Node>,
+    r: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> Option<crate::lookup::ResolvedOperator> {
@@ -927,7 +906,7 @@ pub(crate) fn check_row_comparison_interpretation(
 /// must equal the subquery's column count. Mirror PG's `subquery has too
 /// few/many columns` for the mismatch case.
 fn handle_row_subselect(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     op_name: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -938,24 +917,15 @@ fn handle_row_subselect(
     if !matches!(op_name, "=" | "<>" | "<" | ">" | "<=" | ">=") {
         return Ok(None);
     }
-    let (Some(lexpr), Some(rexpr)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref()) else {
-        return Ok(None);
-    };
-    let (Some(node::Node::RowExpr(lrow)), Some(node::Node::SubLink(sub))) =
-        (lexpr.node.as_ref(), rexpr.node.as_ref())
+    let (Some(ast::Node::RowExpr(lrow)), Some(ast::Node::SubLink(sub))) =
+        (expr.lexpr.as_ref(), expr.rexpr.as_ref())
     else {
         return Ok(None);
     };
-    if !matches!(
-        protobuf::SubLinkType::try_from(sub.sub_link_type),
-        Ok(protobuf::SubLinkType::ExprSublink)
-    ) {
+    if !matches!(sub.sub_link_type, ast::SubLinkType::ExprSublink) {
         return Ok(None);
     }
-    let Some(subselect) = sub.subselect.as_ref() else {
-        return Ok(None);
-    };
-    let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref() else {
+    let Some(ast::Node::SelectStmt(sel)) = sub.subselect.as_ref() else {
         return Ok(None);
     };
 
@@ -996,7 +966,7 @@ fn handle_row_subselect(
 /// bottom-up, back-fill UNKNOWN sides from the concrete peer, then look up the
 /// operator and emit PG-exact errors when it doesn't exist.
 fn infer_generic_binary_op(
-    expr: &protobuf::AExpr,
+    expr: &ast::AExpr,
     op_name: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -1005,13 +975,13 @@ fn infer_generic_binary_op(
     // Pass 1: infer both sides bottom-up.
     let left = expr
         .lexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
+        .is_some()
+        .then(|| infer_expr(&expr.lexpr, ctx, params, TypeGoal::NONE))
         .transpose()?;
     let right = expr
         .rexpr
-        .as_ref()
-        .map(|n| infer_expr(n, ctx, params, TypeGoal::NONE))
+        .is_some()
+        .then(|| infer_expr(&expr.rexpr, ctx, params, TypeGoal::NONE))
         .transpose()?;
 
     let left_oid = left.as_ref().map(|l| l.type_oid);
@@ -1081,12 +1051,12 @@ fn infer_generic_binary_op(
             // what pins `$1` in `prefs -> $1` to text, and validates literal
             // content).
             if left_oid_resolved == Some(oid::UNKNOWN)
-                && let (Some(expected), Some(lexpr)) = (op.left_type_oid, &expr.lexpr)
+                && let (Some(expected), lexpr @ Some(_)) = (op.left_type_oid, &expr.lexpr)
             {
                 coerce_unknown_to(lexpr, ctx, params, expected)?;
             }
             if right_oid_resolved == oid::UNKNOWN
-                && let Some(rexpr) = &expr.rexpr
+                && let rexpr @ Some(_) = &expr.rexpr
             {
                 coerce_unknown_to(rexpr, ctx, params, op.right_type_oid)?;
             }
@@ -1100,7 +1070,7 @@ fn infer_generic_binary_op(
             // execution.
             if plan_time_checks()
                 && let Some(icase) = regex_operator_icase(snapshot, op.code)
-                && let (Some(l), Some(r)) = (expr.lexpr.as_deref(), expr.rexpr.as_deref())
+                && let (l @ Some(_), r @ Some(_)) = (&expr.lexpr, &expr.rexpr)
                 && const_string(l, snapshot).is_some()
                 && let Some(pattern) = const_regex_pattern(r, snapshot)
             {
@@ -1283,14 +1253,14 @@ fn regex_operator_icase(snapshot: &PgCatalog, code: Option<crate::oid::PgProcOid
 /// matter: ASCII without `i`, which a Turkish locale maps apart), or a
 /// parameter of an EXECUTE's custom plan bound to one. `None` for
 /// anything else.
-pub(crate) fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Option<String> {
-    match node.node.as_ref()? {
-        node::Node::AConst(ac) if !ac.isnull => match &ac.val {
-            Some(a_const::Val::Sval(sv)) => Some(sv.sval.clone()),
+pub(crate) fn const_string(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<String> {
+    match node.as_ref()? {
+        ast::Node::AConst(ac) if !ac.isnull => match &ac.val {
+            Some(ast::AConstValue::String(sv)) => Some(sv.sval.clone()),
             _ => None,
         },
-        node::Node::ParamRef(p) => super::plan_fold::bound_param(p.number),
-        node::Node::CoalesceExpr(c) => {
+        ast::Node::ParamRef(p) => super::plan_fold::bound_param(p.number),
+        ast::Node::CoalesceExpr(c) => {
             for a in &c.args {
                 if super::plan_fold::fold(a, snapshot) == super::plan_fold::Folded::Null {
                     continue;
@@ -1299,7 +1269,7 @@ pub(crate) fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Optio
             }
             None
         }
-        node::Node::FuncCall(fc)
+        ast::Node::FuncCall(fc)
             if fc.args.len() == 1
                 && fc.agg_order.is_empty()
                 && fc.agg_filter.is_none()
@@ -1332,7 +1302,7 @@ pub(crate) fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Optio
                 v.to_ascii_uppercase()
             })
         }
-        node::Node::TypeCast(c) => {
+        ast::Node::TypeCast(c) => {
             let tn = c.type_name.as_ref()?;
             if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
                 return None;
@@ -1342,14 +1312,13 @@ pub(crate) fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Optio
             let t = snapshot
                 .resolve_type_by_name((names.len() == 2).then(|| names[0].as_str()), name)?;
             (t.typcategory == TypCategory::String).then_some(())?;
-            const_string(c.arg.as_deref()?, snapshot)
+            const_string(&c.arg, snapshot)
         }
-        node::Node::AExpr(e)
-            if protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp)
-                && extract_string_fields(&e.name) == ["||"] =>
+        ast::Node::AExpr(e)
+            if e.kind == ast::AExprKind::AexprOp && extract_string_fields(&e.name) == ["||"] =>
         {
-            let l = const_string(e.lexpr.as_deref()?, snapshot)?;
-            let r = const_string(e.rexpr.as_deref()?, snapshot)?;
+            let l = const_string(&e.lexpr, snapshot)?;
+            let r = const_string(&e.rexpr, snapshot)?;
             Some(l + &r)
         }
         _ => None,
@@ -1360,10 +1329,10 @@ pub(crate) fn const_string(node: &protobuf::Node, snapshot: &PgCatalog) -> Optio
 /// SIMILAR TO's `similar_to_escape(pattern [, escape])` over constants
 /// (its own errors are plan-time errors too, hence the inner `Result`).
 fn const_regex_pattern(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     snapshot: &PgCatalog,
 ) -> Option<Result<String, AnalyzeError>> {
-    if let Some(node::Node::FuncCall(fc)) = node.node.as_ref()
+    if let Some(ast::Node::FuncCall(fc)) = node.as_ref()
         && is_builtin_similar_to_escape(fc, snapshot)
     {
         let pattern = const_string(fc.args.first()?, snapshot)?;
@@ -1378,7 +1347,7 @@ fn const_regex_pattern(
 
 /// The grammar's `pg_catalog.similar_to_escape`, or a call that can reach
 /// only it — not a user function of that name.
-fn is_builtin_similar_to_escape(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+fn is_builtin_similar_to_escape(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
     let parts = extract_string_fields(&fc.funcname);
     let schema = match parts.as_slice() {
         [n] if n == "similar_to_escape" => None,
@@ -1502,7 +1471,7 @@ fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String, Analyze
 /// constant folding leaves it; only relations the planner certainly
 /// estimates count (see [`super::plan_fold`]).
 pub(crate) fn check_regex_restrictions(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
 ) -> Result<(), AnalyzeError> {
     if !plan_time_checks() {
@@ -1514,7 +1483,7 @@ pub(crate) fn check_regex_restrictions(
 /// [`check_regex_restrictions`] for a part of the qual, under an odd
 /// number of NOTs when `negated`.
 fn regex_restrictions(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     negated: bool,
 ) -> Result<(), AnalyzeError> {
@@ -1523,24 +1492,23 @@ fn regex_restrictions(
     if super::plan_fold::fold_qual_in(node, ctx, negated) != super::plan_fold::Folded::Var {
         return Ok(());
     }
-    match node.node.as_ref() {
-        Some(node::Node::BoolExpr(b)) => {
-            let negated = negated != (b.boolop == protobuf::BoolExprType::NotExpr as i32);
+    match node.as_ref() {
+        Some(ast::Node::BoolExpr(b)) => {
+            let negated = negated != (b.boolop == ast::BoolExprType::NotExpr);
             for a in &b.args {
                 regex_restrictions(a, ctx, negated)?;
             }
             Ok(())
         }
-        Some(node::Node::AExpr(e)) => {
-            let kind = protobuf::AExprKind::try_from(e.kind);
+        Some(ast::Node::AExpr(e)) => {
             let op = extract_string_fields(&e.name);
-            let icase = match (kind, op.as_slice()) {
-                (Ok(protobuf::AExprKind::AexprOp), [o]) if o == "~" || o == "!~" => false,
-                (Ok(protobuf::AExprKind::AexprOp), [o]) if o == "~*" || o == "!~*" => true,
-                (Ok(protobuf::AExprKind::AexprSimilar), _) => false,
+            let icase = match (e.kind, op.as_slice()) {
+                (ast::AExprKind::AexprOp, [o]) if o == "~" || o == "!~" => false,
+                (ast::AExprKind::AexprOp, [o]) if o == "~*" || o == "!~*" => true,
+                (ast::AExprKind::AexprSimilar, _) => false,
                 _ => return Ok(()),
             };
-            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+            let (l @ Some(_), r @ Some(_)) = (&e.lexpr, &e.rexpr) else {
                 return Ok(());
             };
             let Some(pattern) = const_regex_pattern(r, ctx.snapshot) else {
@@ -1602,12 +1570,12 @@ fn regex_restrictions(
 /// planner pulled up the subquery they are columns of (never
 /// null-extended there): each is one of its outputs passed through from
 /// that one scan of the table.
-fn pulled_up_relation(node: &protobuf::Node, ctx: Ctx<'_>) -> Option<crate::oid::PgClassOid> {
+fn pulled_up_relation(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Option<crate::oid::PgClassOid> {
     let mut scan: Option<(u32, crate::oid::PgClassOid)> = None;
-    let mut todo = vec![node];
+    let mut todo = vec![node.as_ref()];
     while let Some(n) = todo.pop() {
-        match n.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => {
+        match n {
+            Some(ast::Node::ColumnRef(cr)) => {
                 let parts = extract_string_fields(&cr.fields);
                 let (table, column) = match parts.as_slice() {
                     [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
@@ -1624,13 +1592,13 @@ fn pulled_up_relation(node: &protobuf::Node, ctx: Ctx<'_>) -> Option<crate::oid:
                     _ => scan = Some((origin.scan, origin.relid)),
                 }
             }
-            Some(node::Node::AConst(_)) => {}
-            Some(node::Node::TypeCast(c)) => todo.extend(c.arg.as_deref()),
-            Some(node::Node::CollateClause(c)) => todo.extend(c.arg.as_deref()),
-            Some(node::Node::FuncCall(f)) => todo.extend(f.args.iter()),
-            Some(node::Node::AExpr(e)) => {
-                todo.extend(e.lexpr.as_deref());
-                todo.extend(e.rexpr.as_deref());
+            Some(ast::Node::AConst(_)) => {}
+            Some(ast::Node::TypeCast(c)) => todo.extend(c.arg.as_ref().map(Some)),
+            Some(ast::Node::CollateClause(c)) => todo.extend(c.arg.as_ref().map(Some)),
+            Some(ast::Node::FuncCall(f)) => todo.extend(f.args.iter().map(Option::as_ref)),
+            Some(ast::Node::AExpr(e)) => {
+                todo.extend(e.lexpr.as_ref().map(Some));
+                todo.extend(e.rexpr.as_ref().map(Some));
             }
             _ => return None,
         }
@@ -1641,10 +1609,10 @@ fn pulled_up_relation(node: &protobuf::Node, ctx: Ctx<'_>) -> Option<crate::oid:
 /// `get_restriction_variable`'s test: the expression references columns
 /// of exactly one relation of this query level (and nothing we can't
 /// classify) — that relation's alias.
-fn restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> Option<String> {
-    fn walk(n: &protobuf::Node, ctx: Ctx<'_>, rel: &mut Option<String>) -> bool {
-        match n.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => {
+fn restriction_variable(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Option<String> {
+    fn walk(n: Option<&ast::Node>, ctx: Ctx<'_>, rel: &mut Option<String>) -> bool {
+        match n {
+            Some(ast::Node::ColumnRef(cr)) => {
                 let parts = extract_string_fields(&cr.fields);
                 let (table, column) = match parts.as_slice() {
                     [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
@@ -1665,27 +1633,29 @@ fn restriction_variable(node: &protobuf::Node, ctx: Ctx<'_>) -> Option<String> {
                     }
                 }
             }
-            Some(node::Node::AConst(_)) => true,
-            Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(|a| walk(a, ctx, rel)),
-            Some(node::Node::CollateClause(c)) => {
-                c.arg.as_deref().is_some_and(|a| walk(a, ctx, rel))
-            }
-            Some(node::Node::FuncCall(f)) => {
+            Some(ast::Node::AConst(_)) => true,
+            Some(ast::Node::TypeCast(c)) => walk(c.arg.as_ref(), ctx, rel),
+            Some(ast::Node::CollateClause(c)) => walk(c.arg.as_ref(), ctx, rel),
+            Some(ast::Node::FuncCall(f)) => {
                 f.agg_order.is_empty()
                     && f.agg_filter.is_none()
                     && f.over.is_none()
-                    && f.args.iter().all(|a| walk(a, ctx, rel))
+                    && f.args.iter().all(|a| walk(a.as_ref(), ctx, rel))
             }
-            Some(node::Node::AExpr(e)) => {
-                protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp)
-                    && e.lexpr.as_deref().is_none_or(|a| walk(a, ctx, rel))
-                    && e.rexpr.as_deref().is_none_or(|a| walk(a, ctx, rel))
+            Some(ast::Node::AExpr(e)) => {
+                e.kind == ast::AExprKind::AexprOp
+                    && e.lexpr.as_ref().is_none_or(|a| walk(Some(a), ctx, rel))
+                    && e.rexpr.as_ref().is_none_or(|a| walk(Some(a), ctx, rel))
             }
             _ => false,
         }
     }
     let mut rel = None;
-    if walk(node, ctx, &mut rel) { rel } else { None }
+    if walk(node.as_ref(), ctx, &mut rel) {
+        rel
+    } else {
+        None
+    }
 }
 
 /// A `pg_catalog` operator run by a `pg_catalog` function.

@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use typedpg_pg_query::ast;
 
 use super::*;
 use crate::nonnull::{StrictLog, StrictNode};
@@ -47,40 +48,37 @@ pub(crate) fn take_level_summary() -> LevelSummary {
 }
 
 /// A literal `TRUE` (`WHERE true`, `ON true`).
-pub(crate) fn is_true_const(n: &protobuf::Node) -> bool {
+pub(crate) fn is_true_const(n: &Option<ast::Node>) -> bool {
     matches!(
-        n.node.as_ref(),
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(protobuf::a_const::Val::Boolval(b)),
-            isnull: false,
-            ..
-        })) if b.boolval
+        n.as_ref(),
+        Some(ast::Node::AConst(c)) if !c.isnull
+            && matches!(&c.val, Some(ast::AConstValue::Boolean(b)) if b.boolval)
     )
 }
 
 /// A LIMIT / OFFSET operand that is a constant: `Some(None)` when absent,
 /// `ALL` or NULL, `Some(Some(n))` for an integer.
-fn const_count(n: &Option<Box<protobuf::Node>>) -> Option<Option<i64>> {
-    match n.as_deref().map(|n| n.node.as_ref()) {
+fn const_count(n: &Option<ast::Node>) -> Option<Option<i64>> {
+    match n.as_ref() {
         None => Some(None),
-        Some(Some(node::Node::AConst(ac))) if ac.isnull => Some(None),
-        Some(Some(node::Node::AConst(protobuf::AConst {
-            val: Some(protobuf::a_const::Val::Ival(i)),
-            ..
-        }))) => Some(Some(i64::from(i.ival))),
+        Some(ast::Node::AConst(ac)) if ac.isnull => Some(None),
+        Some(ast::Node::AConst(ac)) => match &ac.val {
+            Some(ast::AConstValue::Integer(i)) => Some(Some(i64::from(i.ival))),
+            _ => None,
+        },
         _ => None,
     }
 }
 
 /// LIMIT ALL / NULL / n ≥ 1 and OFFSET NULL / 0: a non-empty result
 /// stays non-empty.
-pub(crate) fn limit_keeps_a_row(sel: &protobuf::SelectStmt) -> bool {
+pub(crate) fn limit_keeps_a_row(sel: &ast::SelectStmt) -> bool {
     matches!(const_count(&sel.limit_count), Some(None) | Some(Some(1..)))
         && matches!(const_count(&sel.limit_offset), Some(None) | Some(Some(0)))
 }
 
 /// No LIMIT (or ALL / NULL) and OFFSET NULL / 0: every row stays.
-fn limit_keeps_every_row(sel: &protobuf::SelectStmt) -> bool {
+fn limit_keeps_every_row(sel: &ast::SelectStmt) -> bool {
     matches!(const_count(&sel.limit_count), Some(None))
         && matches!(const_count(&sel.limit_offset), Some(None) | Some(Some(0)))
 }
@@ -332,12 +330,9 @@ pub(crate) fn scan_contains(outer: &Origin, inner: &Origin) -> bool {
 }
 
 /// The conjuncts of an AND (the node itself otherwise).
-pub(crate) fn conjuncts<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
-    match n.node.as_ref() {
-        Some(node::Node::BoolExpr(b))
-            if protobuf::BoolExprType::try_from(b.boolop)
-                == Ok(protobuf::BoolExprType::AndExpr) =>
-        {
+pub(crate) fn conjuncts<'a>(n: &'a Option<ast::Node>, out: &mut Vec<&'a Option<ast::Node>>) {
+    match n.as_ref() {
+        Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
             for a in &b.args {
                 conjuncts(a, out);
             }
@@ -364,17 +359,17 @@ pub(crate) fn conjuncts<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::N
 /// of), and nothing applies while the statement locks rows (EvalPlanQual
 /// re-checks a re-fetched row without re-checking a foreign key).
 pub(crate) fn input_nonempty(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     where_log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> bool {
-    let where_true = sel.where_clause.as_deref().is_none_or(is_true_const);
+    let where_true = sel.where_clause.is_none() || is_true_const(&sel.where_clause);
     if where_true
         && sel
             .from_clause
             .iter()
-            .all(|n| !matches!(n.node.as_ref(), Some(node::Node::JoinExpr(_))))
+            .all(|n| !matches!(n.as_ref(), Some(ast::Node::JoinExpr(_))))
         && scope.sources.iter().all(|s| s.min_one_row)
     {
         return true;
@@ -385,7 +380,7 @@ pub(crate) fn input_nonempty(
     let ([item], [p]) = (sel.from_clause.as_slice(), scope.sources.as_slice()) else {
         return false;
     };
-    if !matches!(item.node.as_ref(), Some(node::Node::RangeVar(_)))
+    if !matches!(item.as_ref(), Some(ast::Node::RangeVar(_)))
         || !matches!(p.kind, crate::scope::SourceKind::Relation)
     {
         return false;
@@ -401,28 +396,26 @@ pub(crate) fn input_nonempty(
         return false;
     }
     let mut conj = Vec::new();
-    if let Some(w) = sel.where_clause.as_deref()
-        && !where_true
-    {
-        conjuncts(w, &mut conj);
+    if sel.where_clause.is_some() && !where_true {
+        conjuncts(&sel.where_clause, &mut conj);
     }
     // (p's column, the enclosing entry's column) per equality, and
     // whether p's column is the left operand.
     let mut pairs: Vec<(&ScopeColumn, &ScopeColumn)> = Vec::new();
     let mut p_left: Vec<bool> = Vec::new();
     for c in conj {
-        let Some(node::Node::AExpr(e)) = c.node.as_ref() else {
+        let Some(ast::Node::AExpr(e)) = c.as_ref() else {
             return false;
         };
-        if protobuf::AExprKind::try_from(e.kind) != Ok(protobuf::AExprKind::AexprOp)
+        if e.kind != ast::AExprKind::AexprOp
             || expr::extract_string_fields(&e.name).join(".") != "="
             || !where_log.is_strict(e.location, StrictNode::Op)
         {
             return false;
         }
         let (Some(l), Some(r)) = (
-            e.lexpr.as_deref().and_then(|n| scope.plain_column_ref(n)),
-            e.rexpr.as_deref().and_then(|n| scope.plain_column_ref(n)),
+            e.lexpr.as_ref().and_then(|n| scope.plain_column_ref(n)),
+            e.rexpr.as_ref().and_then(|n| scope.plain_column_ref(n)),
         ) else {
             return false;
         };
@@ -505,7 +498,7 @@ pub(crate) fn input_nonempty(
 /// single FROM item) and summarize what the level guarantees.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_level(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     has_aggs: bool,
     input_nonempty: bool,
@@ -515,15 +508,12 @@ pub(crate) fn finish_level(
     let grouping_sets = sel
         .group_clause
         .iter()
-        .any(|g| matches!(g.node.as_ref(), Some(node::Node::GroupingSet(_))));
+        .any(|g| matches!(g.as_ref(), Some(ast::Node::GroupingSet(_))));
     let no_srf = level_srf_calls(sel, snapshot).is_empty();
     let keeps_every_row = sel.from_clause.len() == 1
         && scope.sources.len() == 1
-        && !matches!(
-            sel.from_clause[0].node.as_ref(),
-            Some(node::Node::JoinExpr(_))
-        )
-        && sel.where_clause.as_deref().is_none_or(is_true_const)
+        && !matches!(sel.from_clause[0].as_ref(), Some(ast::Node::JoinExpr(_)))
+        && (sel.where_clause.is_none() || is_true_const(&sel.where_clause))
         && sel.group_clause.is_empty()
         && !has_aggs
         && sel.having_clause.is_none()

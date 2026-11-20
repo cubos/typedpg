@@ -1,6 +1,6 @@
 //! A small SQL printer for the differential fuzzer's mutated parse trees.
 //!
-//! The fuzzer mutates a parsed seed's protobuf tree and needs SQL back to
+//! The fuzzer mutates a parsed seed's AST and needs SQL back to
 //! hand to the oracle. libpg_query's deparser would do it, but typedpg
 //! doesn't link it; this printer covers exactly the raw parse trees the
 //! seeds, the generators and the mutations produce.
@@ -12,34 +12,33 @@
 //! tree — so binary and unary expressions are always parenthesized.
 
 use typedpg_core::quote_identifier;
-use typedpg_pg_query::NodeEnum;
-use typedpg_pg_query::protobuf::{
-    self, AExprKind, BoolExprType, BoolTestType, CmdType, CoercionForm, CteMaterialize,
-    GroupingSetKind, JoinType, LimitOption, MergeMatchKind, MinMaxOp, NullTestType,
-    OnConflictAction, SetOperation, SortByDir, SortByNulls, SqlValueFunctionOp, SubLinkType,
-    a_const,
+use typedpg_pg_query::ast::Node;
+use typedpg_pg_query::ast::{
+    self, AExprKind, BoolExprType, BoolTestType, CoercionForm, GroupingSetKind, JoinType,
+    LimitOption, MergeMatchKind, MinMaxOp, NullTestType, SetOperation, SortByDir, SortByNulls,
+    SqlValueFunctionOp, SubLinkType,
 };
 
 /// Render `tree` as SQL: its statements, joined by `"; "`.
 ///
 /// Returns `None` if any part of the tree isn't supported: the caller then
 /// skips the tree rather than feeding the oracle a wrong query.
-pub(crate) fn print(tree: &protobuf::ParseResult) -> Option<String> {
+pub(crate) fn print(tree: &ast::ParseResult) -> Option<String> {
     let mut stmts = Vec::with_capacity(tree.stmts.len());
     for raw in &tree.stmts {
-        stmts.push(statement(raw.stmt.as_deref()?)?);
+        stmts.push(statement(&raw.stmt)?);
     }
     Some(stmts.join("; "))
 }
 
 /// One statement (a CTE body included): the node kinds the fuzzer produces.
-fn statement(node: &protobuf::Node) -> Option<String> {
-    match node.node.as_ref()? {
-        NodeEnum::SelectStmt(sel) => select_stmt(sel),
-        NodeEnum::InsertStmt(ins) => insert_stmt(ins),
-        NodeEnum::UpdateStmt(upd) => update_stmt(upd),
-        NodeEnum::DeleteStmt(del) => delete_stmt(del),
-        NodeEnum::MergeStmt(mrg) => merge_stmt(mrg),
+fn statement(node: &Option<ast::Node>) -> Option<String> {
+    match node.as_ref()? {
+        Node::SelectStmt(sel) => select_stmt(sel),
+        Node::InsertStmt(ins) => insert_stmt(ins),
+        Node::UpdateStmt(upd) => update_stmt(upd),
+        Node::DeleteStmt(del) => delete_stmt(del),
+        Node::MergeStmt(mrg) => merge_stmt(mrg),
         _ => None,
     }
 }
@@ -48,11 +47,11 @@ fn statement(node: &protobuf::Node) -> Option<String> {
 // Statements.
 // ──────────────────────────────────────────────────────────────────────────
 
-fn select_stmt(sel: &protobuf::SelectStmt) -> Option<String> {
+fn select_stmt(sel: &ast::SelectStmt) -> Option<String> {
     // A set operation: both arms are selects of their own, parenthesized so
     // their grouping survives.
-    if enumeration::<SetOperation>(sel.op)? != SetOperation::SetopNone {
-        let op = match enumeration::<SetOperation>(sel.op)? {
+    if sel.op != SetOperation::SetopNone {
+        let op = match sel.op {
             SetOperation::SetopUnion => "UNION",
             SetOperation::SetopIntersect => "INTERSECT",
             SetOperation::SetopExcept => "EXCEPT",
@@ -80,7 +79,7 @@ fn select_stmt(sel: &protobuf::SelectStmt) -> Option<String> {
             .values_lists
             .iter()
             .map(|row| {
-                let NodeEnum::List(list) = row.node.as_ref()? else {
+                let Node::List(list) = row.as_ref()? else {
                     return None;
                 };
                 let exprs: Vec<String> = list.items.iter().map(expr).collect::<Option<_>>()?;
@@ -114,7 +113,7 @@ fn select_stmt(sel: &protobuf::SelectStmt) -> Option<String> {
     sql.push_str("SELECT ");
 
     if !sel.distinct_clause.is_empty() {
-        if sel.distinct_clause.len() == 1 && sel.distinct_clause[0].node.is_none() {
+        if sel.distinct_clause.len() == 1 && sel.distinct_clause[0].is_none() {
             sql.push_str("DISTINCT ");
         } else {
             let items: Vec<String> = sel
@@ -145,7 +144,7 @@ fn select_stmt(sel: &protobuf::SelectStmt) -> Option<String> {
         sql.push_str(" FROM ");
         sql.push_str(&from.join(", "));
     }
-    if let Some(where_clause) = sel.where_clause.as_deref() {
+    if let where_clause @ Some(_) = &sel.where_clause {
         sql.push_str(" WHERE ");
         sql.push_str(&expr(where_clause)?);
     }
@@ -161,7 +160,7 @@ fn select_stmt(sel: &protobuf::SelectStmt) -> Option<String> {
         }
         sql.push_str(&groups.join(", "));
     }
-    if let Some(having) = sel.having_clause.as_deref() {
+    if let having @ Some(_) = &sel.having_clause {
         sql.push_str(" HAVING ");
         sql.push_str(&expr(having)?);
     }
@@ -170,7 +169,7 @@ fn select_stmt(sel: &protobuf::SelectStmt) -> Option<String> {
             .window_clause
             .iter()
             .map(|w| {
-                let NodeEnum::WindowDef(w) = w.node.as_ref()? else {
+                let Node::WindowDef(w) = w.as_ref()? else {
                     return None;
                 };
                 if w.name.is_empty() {
@@ -191,15 +190,15 @@ fn select_stmt(sel: &protobuf::SelectStmt) -> Option<String> {
 }
 
 /// `ORDER BY …` and the `LIMIT`/`OFFSET` (or `FETCH FIRST`) tail.
-fn sort_and_limit(sel: &protobuf::SelectStmt) -> Option<String> {
+fn sort_and_limit(sel: &ast::SelectStmt) -> Option<String> {
     let mut sql = String::new();
     if !sel.sort_clause.is_empty() {
         let sorts: Vec<String> = sel.sort_clause.iter().map(sort_by).collect::<Option<_>>()?;
         sql.push_str(" ORDER BY ");
         sql.push_str(&sorts.join(", "));
     }
-    if let Some(count) = sel.limit_count.as_deref() {
-        if enumeration::<LimitOption>(sel.limit_option)? == LimitOption::WithTies {
+    if let count @ Some(_) = &sel.limit_count {
+        if sel.limit_option == LimitOption::WithTies {
             sql.push_str(&format!(" FETCH FIRST {} ROWS WITH TIES", expr(count)?));
         } else {
             sql.push_str(&format!(" LIMIT {}", expr(count)?));
@@ -208,13 +207,13 @@ fn sort_and_limit(sel: &protobuf::SelectStmt) -> Option<String> {
     // `LIMIT ALL` needs no case of its own: the grammar stores it as a NULL
     // constant count (`LIMIT NULL` parses the same), and a select without a
     // LIMIT has no count and `LimitOption::Count`, PostgreSQL's default.
-    if let Some(offset) = sel.limit_offset.as_deref() {
+    if let offset @ Some(_) = &sel.limit_offset {
         sql.push_str(&format!(" OFFSET {}", expr(offset)?));
     }
     Some(sql)
 }
 
-fn insert_stmt(ins: &protobuf::InsertStmt) -> Option<String> {
+fn insert_stmt(ins: &ast::InsertStmt) -> Option<String> {
     let mut sql = String::new();
     if let Some(with) = ins.with_clause.as_ref() {
         sql.push_str(&with_clause(with)?);
@@ -227,7 +226,7 @@ fn insert_stmt(ins: &protobuf::InsertStmt) -> Option<String> {
             .cols
             .iter()
             .map(|c| {
-                let NodeEnum::ResTarget(target) = c.node.as_ref()? else {
+                let Node::ResTarget(target) = c.as_ref()? else {
                     return None;
                 };
                 if target.name.is_empty() {
@@ -239,7 +238,7 @@ fn insert_stmt(ins: &protobuf::InsertStmt) -> Option<String> {
         sql.push_str(&format!(" ({})", cols.join(", ")));
     }
     sql.push(' ');
-    sql.push_str(&statement(ins.select_stmt.as_deref()?)?);
+    sql.push_str(&statement(&ins.select_stmt)?);
     if let Some(on_conflict) = ins.on_conflict_clause.as_ref() {
         sql.push(' ');
         sql.push_str(&on_conflict_clause(on_conflict)?);
@@ -251,7 +250,7 @@ fn insert_stmt(ins: &protobuf::InsertStmt) -> Option<String> {
     Some(sql)
 }
 
-fn update_stmt(upd: &protobuf::UpdateStmt) -> Option<String> {
+fn update_stmt(upd: &ast::UpdateStmt) -> Option<String> {
     let mut sql = String::new();
     if let Some(with) = upd.with_clause.as_ref() {
         sql.push_str(&with_clause(with)?);
@@ -278,7 +277,7 @@ fn update_stmt(upd: &protobuf::UpdateStmt) -> Option<String> {
         sql.push_str(" FROM ");
         sql.push_str(&from.join(", "));
     }
-    if let Some(where_clause) = upd.where_clause.as_deref() {
+    if let where_clause @ Some(_) = &upd.where_clause {
         sql.push_str(" WHERE ");
         sql.push_str(&expr(where_clause)?);
     }
@@ -289,7 +288,7 @@ fn update_stmt(upd: &protobuf::UpdateStmt) -> Option<String> {
     Some(sql)
 }
 
-fn delete_stmt(del: &protobuf::DeleteStmt) -> Option<String> {
+fn delete_stmt(del: &ast::DeleteStmt) -> Option<String> {
     let mut sql = String::new();
     if let Some(with) = del.with_clause.as_ref() {
         sql.push_str(&with_clause(with)?);
@@ -306,7 +305,7 @@ fn delete_stmt(del: &protobuf::DeleteStmt) -> Option<String> {
         sql.push_str(" USING ");
         sql.push_str(&using.join(", "));
     }
-    if let Some(where_clause) = del.where_clause.as_deref() {
+    if let where_clause @ Some(_) = &del.where_clause {
         sql.push_str(" WHERE ");
         sql.push_str(&expr(where_clause)?);
     }
@@ -317,7 +316,7 @@ fn delete_stmt(del: &protobuf::DeleteStmt) -> Option<String> {
     Some(sql)
 }
 
-fn merge_stmt(mrg: &protobuf::MergeStmt) -> Option<String> {
+fn merge_stmt(mrg: &ast::MergeStmt) -> Option<String> {
     let mut sql = String::new();
     if let Some(with) = mrg.with_clause.as_ref() {
         sql.push_str(&with_clause(with)?);
@@ -326,9 +325,9 @@ fn merge_stmt(mrg: &protobuf::MergeStmt) -> Option<String> {
     sql.push_str("MERGE INTO ");
     sql.push_str(&range_var(mrg.relation.as_ref()?)?);
     sql.push_str(" USING ");
-    sql.push_str(&from_item(mrg.source_relation.as_deref()?)?);
+    sql.push_str(&from_item(&mrg.source_relation)?);
     sql.push_str(" ON ");
-    sql.push_str(&expr(mrg.join_condition.as_deref()?)?);
+    sql.push_str(&expr(&mrg.join_condition)?);
     for when in &mrg.merge_when_clauses {
         sql.push(' ');
         sql.push_str(&merge_when_clause(when)?);
@@ -340,24 +339,23 @@ fn merge_stmt(mrg: &protobuf::MergeStmt) -> Option<String> {
     Some(sql)
 }
 
-fn merge_when_clause(node: &protobuf::Node) -> Option<String> {
-    let NodeEnum::MergeWhenClause(when) = node.node.as_ref()? else {
+fn merge_when_clause(node: &Option<ast::Node>) -> Option<String> {
+    let Node::MergeWhenClause(when) = node.as_ref()? else {
         return None;
     };
     let mut sql = String::from("WHEN ");
-    sql.push_str(match enumeration::<MergeMatchKind>(when.match_kind)? {
+    sql.push_str(match when.match_kind {
         MergeMatchKind::MergeWhenMatched => "MATCHED",
         MergeMatchKind::MergeWhenNotMatchedBySource => "NOT MATCHED BY SOURCE",
         MergeMatchKind::MergeWhenNotMatchedByTarget => "NOT MATCHED",
-        _ => return None,
     });
-    if let Some(condition) = when.condition.as_deref() {
+    if let condition @ Some(_) = &when.condition {
         sql.push_str(" AND ");
         sql.push_str(&expr(condition)?);
     }
     sql.push_str(" THEN ");
-    match enumeration::<CmdType>(when.command_type)? {
-        protobuf::CmdType::CmdUpdate => {
+    match when.command_type {
+        ast::CmdType::CmdUpdate => {
             let sets: Vec<String> = when
                 .target_list
                 .iter()
@@ -369,16 +367,16 @@ fn merge_when_clause(node: &protobuf::Node) -> Option<String> {
             sql.push_str("UPDATE SET ");
             sql.push_str(&sets.join(", "));
         }
-        protobuf::CmdType::CmdDelete => sql.push_str("DELETE"),
-        protobuf::CmdType::CmdNothing => sql.push_str("DO NOTHING"),
-        protobuf::CmdType::CmdInsert => {
+        ast::CmdType::CmdDelete => sql.push_str("DELETE"),
+        ast::CmdType::CmdNothing => sql.push_str("DO NOTHING"),
+        ast::CmdType::CmdInsert => {
             sql.push_str("INSERT");
             if !when.target_list.is_empty() {
                 let cols: Vec<String> = when
                     .target_list
                     .iter()
                     .map(|c| {
-                        let NodeEnum::ResTarget(target) = c.node.as_ref()? else {
+                        let Node::ResTarget(target) = c.as_ref()? else {
                             return None;
                         };
                         (!target.name.is_empty()).then(|| quote_identifier(&target.name))
@@ -394,7 +392,7 @@ fn merge_when_clause(node: &protobuf::Node) -> Option<String> {
     Some(sql)
 }
 
-fn on_conflict_clause(clause: &protobuf::OnConflictClause) -> Option<String> {
+fn on_conflict_clause(clause: &ast::OnConflictClause) -> Option<String> {
     let mut sql = String::from("ON CONFLICT");
     if let Some(infer) = clause.infer.as_deref() {
         let elems: Vec<String> = infer
@@ -403,14 +401,14 @@ fn on_conflict_clause(clause: &protobuf::OnConflictClause) -> Option<String> {
             .map(index_elem)
             .collect::<Option<_>>()?;
         sql.push_str(&format!(" ({})", elems.join(", ")));
-        if let Some(where_clause) = infer.where_clause.as_deref() {
+        if let where_clause @ Some(_) = &infer.where_clause {
             sql.push_str(" WHERE ");
             sql.push_str(&expr(where_clause)?);
         }
     }
-    match enumeration::<OnConflictAction>(clause.action)? {
-        protobuf::OnConflictAction::OnconflictNothing => sql.push_str(" DO NOTHING"),
-        protobuf::OnConflictAction::OnconflictUpdate => {
+    match clause.action {
+        ast::OnConflictAction::OnconflictNothing => sql.push_str(" DO NOTHING"),
+        ast::OnConflictAction::OnconflictUpdate => {
             let sets: Vec<String> = clause
                 .target_list
                 .iter()
@@ -421,7 +419,7 @@ fn on_conflict_clause(clause: &protobuf::OnConflictClause) -> Option<String> {
             }
             sql.push_str(" DO UPDATE SET ");
             sql.push_str(&sets.join(", "));
-            if let Some(where_clause) = clause.where_clause.as_deref() {
+            if let where_clause @ Some(_) = &clause.where_clause {
                 sql.push_str(" WHERE ");
                 sql.push_str(&expr(where_clause)?);
             }
@@ -431,32 +429,26 @@ fn on_conflict_clause(clause: &protobuf::OnConflictClause) -> Option<String> {
     Some(sql)
 }
 
-fn index_elem(node: &protobuf::Node) -> Option<String> {
-    let NodeEnum::IndexElem(elem) = node.node.as_ref()? else {
+fn index_elem(node: &Option<ast::Node>) -> Option<String> {
+    let Node::IndexElem(elem) = node.as_ref()? else {
         return None;
     };
     if !elem.indexcolname.is_empty()
         || !elem.collation.is_empty()
         || !elem.opclass.is_empty()
         || !elem.opclassopts.is_empty()
-        || !matches!(
-            enumeration::<SortByDir>(elem.ordering)?,
-            SortByDir::Undefined | SortByDir::SortbyDefault
-        )
-        || !matches!(
-            enumeration::<SortByNulls>(elem.nulls_ordering)?,
-            SortByNulls::Undefined | SortByNulls::SortbyNullsDefault
-        )
+        || !matches!(elem.ordering, SortByDir::SortbyDefault)
+        || !matches!(elem.nulls_ordering, SortByNulls::SortbyNullsDefault)
     {
         return None;
     }
-    if let Some(expression) = elem.expr.as_deref() {
+    if let expression @ Some(_) = &elem.expr {
         return expr(expression);
     }
     (!elem.name.is_empty()).then(|| quote_identifier(&elem.name))
 }
 
-fn returning_clause(clause: &protobuf::ReturningClause) -> Option<String> {
+fn returning_clause(clause: &ast::ReturningClause) -> Option<String> {
     if !clause.options.is_empty() {
         // `RETURNING WITH (OLD AS …, NEW AS …)` isn't generated.
         return None;
@@ -468,7 +460,7 @@ fn returning_clause(clause: &protobuf::ReturningClause) -> Option<String> {
     Some(format!("RETURNING {}", exprs.join(", ")))
 }
 
-fn with_clause(with: &protobuf::WithClause) -> Option<String> {
+fn with_clause(with: &ast::WithClause) -> Option<String> {
     let mut sql = String::from("WITH ");
     if with.recursive {
         sql.push_str("RECURSIVE ");
@@ -485,8 +477,8 @@ fn with_clause(with: &protobuf::WithClause) -> Option<String> {
     Some(sql)
 }
 
-fn common_table_expr(node: &protobuf::Node) -> Option<String> {
-    let NodeEnum::CommonTableExpr(cte) = node.node.as_ref()? else {
+fn common_table_expr(node: &Option<ast::Node>) -> Option<String> {
+    let Node::CommonTableExpr(cte) = node.as_ref()? else {
         return None;
     };
     if cte.search_clause.is_some() || cte.cycle_clause.is_some() {
@@ -504,19 +496,18 @@ fn common_table_expr(node: &protobuf::Node) -> Option<String> {
         ));
     }
     sql.push_str(" AS ");
-    match enumeration::<CteMaterialize>(cte.ctematerialized)? {
-        protobuf::CteMaterialize::Default => {}
-        protobuf::CteMaterialize::Always => sql.push_str("MATERIALIZED "),
-        protobuf::CteMaterialize::Never => sql.push_str("NOT MATERIALIZED "),
-        _ => return None,
+    match cte.ctematerialized {
+        ast::CteMaterialize::Default => {}
+        ast::CteMaterialize::Always => sql.push_str("MATERIALIZED "),
+        ast::CteMaterialize::Never => sql.push_str("NOT MATERIALIZED "),
     }
     sql.push('(');
-    sql.push_str(&statement(cte.ctequery.as_deref()?)?);
+    sql.push_str(&statement(&cte.ctequery)?);
     sql.push(')');
     Some(sql)
 }
 
-fn range_var(var: &protobuf::RangeVar) -> Option<String> {
+fn range_var(var: &ast::RangeVar) -> Option<String> {
     if !var.catalogname.is_empty() {
         return None;
     }
@@ -535,7 +526,7 @@ fn range_var(var: &protobuf::RangeVar) -> Option<String> {
     Some(sql)
 }
 
-fn alias_sql(alias: &protobuf::Alias) -> Option<String> {
+fn alias_sql(alias: &ast::Alias) -> Option<String> {
     if alias.aliasname.is_empty() {
         return None;
     }
@@ -553,29 +544,29 @@ fn alias_sql(alias: &protobuf::Alias) -> Option<String> {
     Some(sql)
 }
 
-fn from_item(node: &protobuf::Node) -> Option<String> {
-    match node.node.as_ref()? {
-        NodeEnum::RangeVar(var) => range_var(var),
-        NodeEnum::RangeSubselect(sub) => {
+fn from_item(node: &Option<ast::Node>) -> Option<String> {
+    match node.as_ref()? {
+        Node::RangeVar(var) => range_var(var),
+        Node::RangeSubselect(sub) => {
             let mut sql = String::new();
             if sub.lateral {
                 sql.push_str("LATERAL ");
             }
             sql.push('(');
-            sql.push_str(&statement(sub.subquery.as_deref()?)?);
+            sql.push_str(&statement(&sub.subquery)?);
             sql.push(')');
             if let Some(alias) = sub.alias.as_ref() {
                 sql.push_str(&alias_sql(alias)?);
             }
             Some(sql)
         }
-        NodeEnum::RangeFunction(func) => range_function(func),
-        NodeEnum::JoinExpr(join) => join_expr(join),
+        Node::RangeFunction(func) => range_function(func),
+        Node::JoinExpr(join) => join_expr(join),
         _ => None,
     }
 }
 
-fn range_function(func: &protobuf::RangeFunction) -> Option<String> {
+fn range_function(func: &ast::RangeFunction) -> Option<String> {
     if func.is_rowsfrom {
         return None;
     }
@@ -585,7 +576,7 @@ fn range_function(func: &protobuf::RangeFunction) -> Option<String> {
     }
     let mut calls = Vec::new();
     for function in &func.functions {
-        let NodeEnum::List(list) = function.node.as_ref()? else {
+        let Node::List(list) = function.as_ref()? else {
             return None;
         };
         match list.items.as_slice() {
@@ -609,11 +600,11 @@ fn range_function(func: &protobuf::RangeFunction) -> Option<String> {
     Some(sql)
 }
 
-fn join_expr(join: &protobuf::JoinExpr) -> Option<String> {
+fn join_expr(join: &ast::JoinExpr) -> Option<String> {
     if join.join_using_alias.is_some() {
         return None;
     }
-    let qualifier = match enumeration::<JoinType>(join.jointype)? {
+    let qualifier = match join.jointype {
         JoinType::JoinInner => "",
         JoinType::JoinLeft => "LEFT ",
         JoinType::JoinRight => "RIGHT ",
@@ -621,11 +612,11 @@ fn join_expr(join: &protobuf::JoinExpr) -> Option<String> {
         _ => return None,
     };
     let natural = if join.is_natural { "NATURAL " } else { "" };
-    let larg = from_item(join.larg.as_deref()?)?;
-    let rarg = from_item(join.rarg.as_deref()?)?;
+    let larg = from_item(&join.larg)?;
+    let rarg = from_item(&join.rarg)?;
     let mut sql = if join.quals.is_none() && join.using_clause.is_empty() {
         // Inner joins without a condition: `CROSS JOIN` keeps the tree.
-        if enumeration::<JoinType>(join.jointype)? != JoinType::JoinInner || join.is_natural {
+        if join.jointype != JoinType::JoinInner || join.is_natural {
             return None;
         }
         format!("{larg} CROSS JOIN {rarg}")
@@ -641,7 +632,7 @@ fn join_expr(join: &protobuf::JoinExpr) -> Option<String> {
     } else {
         format!(
             "{larg} {natural}{qualifier}JOIN {rarg} ON {}",
-            expr(join.quals.as_deref()?)?
+            expr(&join.quals)?
         )
     };
     if let Some(alias) = join.alias.as_ref() {
@@ -654,18 +645,18 @@ fn join_expr(join: &protobuf::JoinExpr) -> Option<String> {
 // Target lists and clause nodes.
 // ──────────────────────────────────────────────────────────────────────────
 
-fn res_target(node: &protobuf::Node) -> Option<String> {
-    let NodeEnum::ResTarget(target) = node.node.as_ref()? else {
+fn res_target(node: &Option<ast::Node>) -> Option<String> {
+    let Node::ResTarget(target) = node.as_ref()? else {
         return None;
     };
     if !target.indirection.is_empty() {
         // `x = …` targets with subscripts aren't produced by the fuzzer.
         return None;
     }
-    if target_star(target.val.as_deref()?) {
+    if target_star(&target.val) {
         return Some("*".to_string());
     }
-    let val = expr(target.val.as_deref()?)?;
+    let val = expr(&target.val)?;
     if target.name.is_empty() {
         Some(val)
     } else {
@@ -675,8 +666,8 @@ fn res_target(node: &protobuf::Node) -> Option<String> {
 
 /// An assignment target (`UPDATE … SET c = v`, `ON CONFLICT DO UPDATE`,
 /// MERGE's UPDATE action): `ResTarget` with the column name and the value.
-fn set_target(node: &protobuf::Node) -> Option<String> {
-    let NodeEnum::ResTarget(target) = node.node.as_ref()? else {
+fn set_target(node: &Option<ast::Node>) -> Option<String> {
+    let Node::ResTarget(target) = node.as_ref()? else {
         return None;
     };
     if target.name.is_empty() || !target.indirection.is_empty() {
@@ -685,51 +676,49 @@ fn set_target(node: &protobuf::Node) -> Option<String> {
     Some(format!(
         "{} = {}",
         quote_identifier(&target.name),
-        expr(target.val.as_deref()?)?
+        expr(&target.val)?
     ))
 }
 
 /// Whether a target is a bare `*` (`SELECT *`, `RETURNING *`).
-fn target_star(node: &protobuf::Node) -> bool {
-    matches!(&node.node, Some(NodeEnum::ColumnRef(cr))
-        if cr.fields.len() == 1 && matches!(cr.fields[0].node, Some(NodeEnum::AStar(_))))
+fn target_star(node: &Option<ast::Node>) -> bool {
+    matches!(node, Some(Node::ColumnRef(cr))
+        if cr.fields.len() == 1 && matches!(cr.fields[0], Some(Node::AStar(_))))
 }
 
-fn sort_by(node: &protobuf::Node) -> Option<String> {
-    let NodeEnum::SortBy(sort) = node.node.as_ref()? else {
+fn sort_by(node: &Option<ast::Node>) -> Option<String> {
+    let Node::SortBy(sort) = node.as_ref()? else {
         return None;
     };
     if !sort.use_op.is_empty() {
         return None;
     }
-    let mut sql = expr(sort.node.as_deref()?)?;
-    match enumeration::<SortByDir>(sort.sortby_dir)? {
-        SortByDir::SortbyAsc | SortByDir::SortbyDefault | SortByDir::Undefined => {}
+    let mut sql = expr(&sort.node)?;
+    match sort.sortby_dir {
+        SortByDir::SortbyAsc | SortByDir::SortbyDefault => {}
         SortByDir::SortbyDesc => sql.push_str(" DESC"),
         SortByDir::SortbyUsing => return None,
     }
-    match enumeration::<SortByNulls>(sort.sortby_nulls)? {
-        SortByNulls::SortbyNullsDefault | SortByNulls::Undefined => {}
+    match sort.sortby_nulls {
+        SortByNulls::SortbyNullsDefault => {}
         SortByNulls::SortbyNullsFirst => sql.push_str(" NULLS FIRST"),
         SortByNulls::SortbyNullsLast => sql.push_str(" NULLS LAST"),
     }
     Some(sql)
 }
 
-fn grouping_element(node: &protobuf::Node) -> Option<String> {
-    let Some(NodeEnum::GroupingSet(set)) = node.node.as_ref() else {
+fn grouping_element(node: &Option<ast::Node>) -> Option<String> {
+    let Some(Node::GroupingSet(set)) = node.as_ref() else {
         return expr(node);
     };
-    match enumeration::<GroupingSetKind>(set.kind)? {
+    match set.kind {
         GroupingSetKind::GroupingSetSimple => {
             let items = set.content.iter().map(expr).collect::<Option<Vec<_>>>()?;
             Some(format!("({})", items.join(", ")))
         }
         GroupingSetKind::GroupingSetEmpty => Some("()".to_string()),
         GroupingSetKind::GroupingSetRollup | GroupingSetKind::GroupingSetCube => {
-            let keyword = if enumeration::<GroupingSetKind>(set.kind)?
-                == GroupingSetKind::GroupingSetRollup
-            {
+            let keyword = if set.kind == GroupingSetKind::GroupingSetRollup {
                 "ROLLUP"
             } else {
                 "CUBE"
@@ -752,11 +741,10 @@ fn grouping_element(node: &protobuf::Node) -> Option<String> {
                 .collect::<Option<Vec<_>>>()?;
             Some(format!("GROUPING SETS ({})", items.join(", ")))
         }
-        _ => None,
     }
 }
 
-fn window_spec(window: &protobuf::WindowDef) -> Option<String> {
+fn window_spec(window: &ast::WindowDef) -> Option<String> {
     if !window.name.is_empty() {
         return None;
     }
@@ -816,7 +804,7 @@ const FRAMEOPTION_END_OFFSET_FOLLOWING: i32 = 0x4000;
 const FRAMEOPTION_DEFAULTS: i32 =
     FRAMEOPTION_RANGE | FRAMEOPTION_START_UNBOUNDED_PRECEDING | FRAMEOPTION_END_CURRENT_ROW;
 
-fn frame_clause(window: &protobuf::WindowDef) -> Option<String> {
+fn frame_clause(window: &ast::WindowDef) -> Option<String> {
     let options = window.frame_options;
     let known = FRAMEOPTION_NONDEFAULT
         | FRAMEOPTION_RANGE
@@ -847,7 +835,7 @@ fn frame_clause(window: &protobuf::WindowDef) -> Option<String> {
     };
     let start = frame_bound(
         options,
-        window.start_offset.as_deref(),
+        &window.start_offset,
         FRAMEOPTION_START_UNBOUNDED_PRECEDING,
         FRAMEOPTION_START_UNBOUNDED_FOLLOWING,
         FRAMEOPTION_START_CURRENT_ROW,
@@ -857,7 +845,7 @@ fn frame_clause(window: &protobuf::WindowDef) -> Option<String> {
     if options & FRAMEOPTION_BETWEEN != 0 {
         let end = frame_bound(
             options,
-            window.end_offset.as_deref(),
+            &window.end_offset,
             FRAMEOPTION_END_UNBOUNDED_PRECEDING,
             FRAMEOPTION_END_UNBOUNDED_FOLLOWING,
             FRAMEOPTION_END_CURRENT_ROW,
@@ -872,7 +860,7 @@ fn frame_clause(window: &protobuf::WindowDef) -> Option<String> {
 
 fn frame_bound(
     options: i32,
-    offset: Option<&protobuf::Node>,
+    offset: &Option<ast::Node>,
     unbounded_preceding: i32,
     unbounded_following: i32,
     current_row: i32,
@@ -889,10 +877,10 @@ fn frame_bound(
         return Some("CURRENT ROW".to_string());
     }
     if options & offset_preceding != 0 {
-        return Some(format!("{} PRECEDING", expr(offset?)?));
+        return Some(format!("{} PRECEDING", expr(offset)?));
     }
     if options & offset_following != 0 {
-        return Some(format!("{} FOLLOWING", expr(offset?)?));
+        return Some(format!("{} FOLLOWING", expr(offset)?));
     }
     None
 }
@@ -901,34 +889,33 @@ fn frame_bound(
 // Expressions.
 // ──────────────────────────────────────────────────────────────────────────
 
-fn expr(node: &protobuf::Node) -> Option<String> {
-    match node.node.as_ref()? {
-        NodeEnum::ColumnRef(column) => column_ref(column),
-        NodeEnum::AConst(c) => a_const(c),
-        NodeEnum::ParamRef(param) => Some(format!("${}", param.number)),
-        NodeEnum::AExpr(a) => a_expr(a),
-        NodeEnum::BoolExpr(b) => bool_expr(b),
-        NodeEnum::NullTest(test) => null_test(test),
-        NodeEnum::BooleanTest(test) => boolean_test(test),
-        NodeEnum::FuncCall(call) => func_call(call),
-        NodeEnum::TypeCast(cast) => Some(format!(
+fn expr(node: &Option<ast::Node>) -> Option<String> {
+    match node.as_ref()? {
+        Node::ColumnRef(column) => column_ref(column),
+        Node::AConst(c) => a_const(c),
+        Node::ParamRef(param) => Some(format!("${}", param.number)),
+        Node::AExpr(a) => a_expr(a),
+        Node::BoolExpr(b) => bool_expr(b),
+        Node::NullTest(test) => null_test(test),
+        Node::BooleanTest(test) => boolean_test(test),
+        Node::FuncCall(call) => func_call(call),
+        Node::TypeCast(cast) => Some(format!(
             "CAST({} AS {})",
-            expr(cast.arg.as_deref()?)?,
+            expr(&cast.arg)?,
             type_name(cast.type_name.as_ref()?)?
         )),
-        NodeEnum::CaseExpr(case) => case_expr(case),
-        NodeEnum::CoalesceExpr(coalesce) => {
+        Node::CaseExpr(case) => case_expr(case),
+        Node::CoalesceExpr(coalesce) => {
             let args = coalesce.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
             if args.is_empty() {
                 return None;
             }
             Some(format!("COALESCE({})", args.join(", ")))
         }
-        NodeEnum::MinMaxExpr(minmax) => {
-            let keyword = match enumeration::<MinMaxOp>(minmax.op)? {
+        Node::MinMaxExpr(minmax) => {
+            let keyword = match minmax.op {
                 MinMaxOp::IsGreatest => "GREATEST",
                 MinMaxOp::IsLeast => "LEAST",
-                _ => return None,
             };
             let args = minmax.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
             if args.is_empty() {
@@ -936,8 +923,8 @@ fn expr(node: &protobuf::Node) -> Option<String> {
             }
             Some(format!("{keyword}({})", args.join(", ")))
         }
-        NodeEnum::SubLink(link) => sub_link(link),
-        NodeEnum::AArrayExpr(array) => {
+        Node::SubLink(link) => sub_link(link),
+        Node::AArrayExpr(array) => {
             let elements = array
                 .elements
                 .iter()
@@ -948,15 +935,15 @@ fn expr(node: &protobuf::Node) -> Option<String> {
             }
             Some(format!("ARRAY[{}]", elements.join(", ")))
         }
-        NodeEnum::AIndirection(indirection) => indirection_sql(indirection),
-        NodeEnum::CollateClause(collate) => {
+        Node::AIndirection(indirection) => indirection_sql(indirection),
+        Node::CollateClause(collate) => {
             if collate.collname.is_empty() {
                 return None;
             }
             let names = strings(&collate.collname)?;
             Some(format!(
                 "({} COLLATE {})",
-                expr(collate.arg.as_deref()?)?,
+                expr(&collate.arg)?,
                 names
                     .iter()
                     .map(|n| quote_identifier(n))
@@ -964,41 +951,41 @@ fn expr(node: &protobuf::Node) -> Option<String> {
                     .join(".")
             ))
         }
-        NodeEnum::RowExpr(row) => row_expr(row),
-        NodeEnum::SqlvalueFunction(func) => sql_value_function(func),
-        NodeEnum::SetToDefault(_) => Some("DEFAULT".to_string()),
+        Node::RowExpr(row) => row_expr(row),
+        Node::SqlValueFunction(func) => sql_value_function(func),
+        Node::SetToDefault(_) => Some("DEFAULT".to_string()),
         _ => None,
     }
 }
 
-fn column_ref(column: &protobuf::ColumnRef) -> Option<String> {
+fn column_ref(column: &ast::ColumnRef) -> Option<String> {
     if column.fields.is_empty() {
         return None;
     }
     let fields: Vec<String> = column
         .fields
         .iter()
-        .map(|field| match field.node.as_ref()? {
-            NodeEnum::String(s) => Some(quote_identifier(&s.sval)),
-            NodeEnum::AStar(_) => Some("*".to_string()),
+        .map(|field| match field.as_ref()? {
+            Node::String(s) => Some(quote_identifier(&s.sval)),
+            Node::AStar(_) => Some("*".to_string()),
             _ => None,
         })
         .collect::<Option<_>>()?;
     Some(fields.join("."))
 }
 
-fn a_const(c: &protobuf::AConst) -> Option<String> {
+fn a_const(c: &ast::AConst) -> Option<String> {
     if c.isnull {
         return Some("NULL".to_string());
     }
     match c.val.as_ref()? {
-        a_const::Val::Ival(integer) => {
+        ast::AConstValue::Integer(integer) => {
             if integer.ival == i32::MIN {
                 return None;
             }
             Some(integer.ival.to_string())
         }
-        a_const::Val::Fval(float) => {
+        ast::AConstValue::Float(float) => {
             let valid = !float.fval.is_empty()
                 && float
                     .fval
@@ -1006,13 +993,13 @@ fn a_const(c: &protobuf::AConst) -> Option<String> {
                     .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'));
             valid.then(|| float.fval.clone())
         }
-        a_const::Val::Boolval(boolean) => Some(if boolean.boolval {
+        ast::AConstValue::Boolean(boolean) => Some(if boolean.boolval {
             "true".to_string()
         } else {
             "false".to_string()
         }),
-        a_const::Val::Sval(string) => Some(quote_literal(&string.sval)),
-        a_const::Val::Bsval(bits) => {
+        ast::AConstValue::String(string) => Some(quote_literal(&string.sval)),
+        ast::AConstValue::BitString(bits) => {
             let valid = bits.bsval.chars().all(|c| matches!(c, '0' | '1'));
             valid.then(|| format!("B'{}'", bits.bsval))
         }
@@ -1024,14 +1011,16 @@ fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn a_expr(expr_node: &protobuf::AExpr) -> Option<String> {
+fn a_expr(expr_node: &ast::AExpr) -> Option<String> {
     let op = operator_name(&expr_node.name)?;
-    let lexpr = match expr_node.lexpr.as_deref() {
-        Some(node) => Some(expr(node)?),
+    let lexpr = match &expr_node.lexpr {
+        node @ Some(_) => Some(expr(node)?),
         None => None,
     };
-    let rexpr = expr_node.rexpr.as_deref()?;
-    match enumeration::<AExprKind>(expr_node.kind)? {
+    let rexpr @ Some(_) = &expr_node.rexpr else {
+        return None;
+    };
+    match expr_node.kind {
         AExprKind::AexprOp => match lexpr {
             Some(left) => Some(format!("({left} {op} {})", expr(rexpr)?)),
             None => {
@@ -1053,7 +1042,7 @@ fn a_expr(expr_node: &protobuf::AExpr) -> Option<String> {
         )),
         AExprKind::AexprNullif => Some(format!("NULLIF({}, {})", lexpr?, expr(rexpr)?)),
         AExprKind::AexprIn => {
-            let NodeEnum::List(list) = rexpr.node.as_ref()? else {
+            let Node::List(list) = rexpr.as_ref()? else {
                 return None;
             };
             let items = list.items.iter().map(expr).collect::<Option<Vec<_>>>()?;
@@ -1071,7 +1060,7 @@ fn a_expr(expr_node: &protobuf::AExpr) -> Option<String> {
             let [name] = &expr_node.name[..] else {
                 return None;
             };
-            let keyword = match (enumeration::<AExprKind>(expr_node.kind)?, string_of(name)) {
+            let keyword = match (expr_node.kind, string_of(name)) {
                 (AExprKind::AexprLike, Some("~~")) => "LIKE",
                 (AExprKind::AexprLike, Some("!~~")) => "NOT LIKE",
                 (AExprKind::AexprIlike, Some("~~*")) => "ILIKE",
@@ -1095,13 +1084,13 @@ fn a_expr(expr_node: &protobuf::AExpr) -> Option<String> {
         | AExprKind::AexprNotBetween
         | AExprKind::AexprBetweenSym
         | AExprKind::AexprNotBetweenSym => {
-            let NodeEnum::List(list) = rexpr.node.as_ref()? else {
+            let Node::List(list) = rexpr.as_ref()? else {
                 return None;
             };
             let [low, high] = list.items.as_slice() else {
                 return None;
             };
-            let keyword = match enumeration::<AExprKind>(expr_node.kind)? {
+            let keyword = match expr_node.kind {
                 AExprKind::AexprBetween => "BETWEEN",
                 AExprKind::AexprNotBetween => "NOT BETWEEN",
                 AExprKind::AexprBetweenSym => "BETWEEN SYMMETRIC",
@@ -1114,14 +1103,13 @@ fn a_expr(expr_node: &protobuf::AExpr) -> Option<String> {
                 expr(high)?
             ))
         }
-        _ => None,
     }
 }
 
-fn bool_expr(bool: &protobuf::BoolExpr) -> Option<String> {
-    match enumeration::<BoolExprType>(bool.boolop)? {
+fn bool_expr(bool: &ast::BoolExpr) -> Option<String> {
+    match bool.boolop {
         BoolExprType::AndExpr | BoolExprType::OrExpr => {
-            let keyword = if enumeration::<BoolExprType>(bool.boolop)? == BoolExprType::AndExpr {
+            let keyword = if bool.boolop == BoolExprType::AndExpr {
                 " AND "
             } else {
                 " OR "
@@ -1138,34 +1126,31 @@ fn bool_expr(bool: &protobuf::BoolExpr) -> Option<String> {
             };
             Some(format!("(NOT {})", expr(arg)?))
         }
-        _ => None,
     }
 }
 
-fn null_test(test: &protobuf::NullTest) -> Option<String> {
-    let keyword = match enumeration::<NullTestType>(test.nulltesttype)? {
+fn null_test(test: &ast::NullTest) -> Option<String> {
+    let keyword = match test.nulltesttype {
         NullTestType::IsNull => "IS NULL",
         NullTestType::IsNotNull => "IS NOT NULL",
-        _ => return None,
     };
-    Some(format!("({} {keyword})", expr(test.arg.as_deref()?)?))
+    Some(format!("({} {keyword})", expr(&test.arg)?))
 }
 
-fn boolean_test(test: &protobuf::BooleanTest) -> Option<String> {
-    let keyword = match enumeration::<BoolTestType>(test.booltesttype)? {
+fn boolean_test(test: &ast::BooleanTest) -> Option<String> {
+    let keyword = match test.booltesttype {
         BoolTestType::IsTrue => "IS TRUE",
         BoolTestType::IsNotTrue => "IS NOT TRUE",
         BoolTestType::IsFalse => "IS FALSE",
         BoolTestType::IsNotFalse => "IS NOT FALSE",
         BoolTestType::IsUnknown => "IS UNKNOWN",
         BoolTestType::IsNotUnknown => "IS NOT UNKNOWN",
-        _ => return None,
     };
-    Some(format!("({} {keyword})", expr(test.arg.as_deref()?)?))
+    Some(format!("({} {keyword})", expr(&test.arg)?))
 }
 
-fn func_call(call: &protobuf::FuncCall) -> Option<String> {
-    if enumeration::<CoercionForm>(call.funcformat)? == CoercionForm::CoerceSqlSyntax {
+fn func_call(call: &ast::FuncCall) -> Option<String> {
+    if call.funcformat == CoercionForm::CoerceSqlSyntax {
         return sql_syntax_func_call(call);
     }
     let name = func_name(&call.funcname)?;
@@ -1208,7 +1193,7 @@ fn func_call(call: &protobuf::FuncCall) -> Option<String> {
         }
         sql.push_str(&format!(" WITHIN GROUP (ORDER BY {})", order.join(", ")));
     }
-    if let Some(filter) = call.agg_filter.as_deref() {
+    if let filter @ Some(_) = &call.agg_filter {
         sql.push_str(&format!(" FILTER (WHERE {})", expr(filter)?));
     }
     if let Some(over) = call.over.as_deref() {
@@ -1219,7 +1204,7 @@ fn func_call(call: &protobuf::FuncCall) -> Option<String> {
 }
 
 /// SQL-syntax function calls: `extract(year FROM …)`, `substring(…)`, `trim(…)`.
-fn sql_syntax_func_call(call: &protobuf::FuncCall) -> Option<String> {
+fn sql_syntax_func_call(call: &ast::FuncCall) -> Option<String> {
     let names = strings(&call.funcname)?;
     // Only the exact name the grammar itself builds: a mutation can leave a
     // different name with this `funcformat`, which no SQL syntax can express.
@@ -1227,9 +1212,9 @@ fn sql_syntax_func_call(call: &protobuf::FuncCall) -> Option<String> {
         let [field, arg] = call.args.as_slice() else {
             return None;
         };
-        let field = match field.node.as_ref()? {
-            NodeEnum::AConst(c) if !c.isnull => match c.val.as_ref()? {
-                a_const::Val::Sval(s) => s.sval.clone(),
+        let field = match field.as_ref()? {
+            Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+                ast::AConstValue::String(s) => s.sval.clone(),
                 _ => return None,
             },
             _ => return None,
@@ -1243,7 +1228,7 @@ fn sql_syntax_func_call(call: &protobuf::FuncCall) -> Option<String> {
         ))
     } else if names.as_slice() == ["pg_catalog", "substring"] {
         // `substring(a FROM b [FOR c])`: a missing FOR is a `None` node.
-        let present = |node: &protobuf::Node| node.node.is_some();
+        let present = |node: &Option<ast::Node>| node.is_some();
         match call.args.as_slice() {
             [a, b] if present(a) && present(b) => {
                 Some(format!("substring({} FROM {})", expr(a)?, expr(b)?))
@@ -1286,7 +1271,7 @@ fn sql_syntax_func_call(call: &protobuf::FuncCall) -> Option<String> {
     }
 }
 
-fn func_name(name: &[protobuf::Node]) -> Option<String> {
+fn func_name(name: &[Option<ast::Node>]) -> Option<String> {
     let parts = strings(name)?;
     if parts.is_empty() {
         return None;
@@ -1300,7 +1285,7 @@ fn func_name(name: &[protobuf::Node]) -> Option<String> {
     )
 }
 
-fn operator_name(name: &[protobuf::Node]) -> Option<String> {
+fn operator_name(name: &[Option<ast::Node>]) -> Option<String> {
     let parts = strings(name)?;
     match parts.as_slice() {
         [op] => Some(op.clone()),
@@ -1316,32 +1301,29 @@ fn operator_name(name: &[protobuf::Node]) -> Option<String> {
     }
 }
 
-fn sub_link(link: &protobuf::SubLink) -> Option<String> {
-    let subselect = link.subselect.as_deref()?;
-    let inner = statement(subselect)?;
-    match enumeration::<SubLinkType>(link.sub_link_type)? {
+fn sub_link(link: &ast::SubLink) -> Option<String> {
+    let inner = statement(&link.subselect)?;
+    match link.sub_link_type {
         SubLinkType::ExistsSublink => Some(format!("EXISTS ({inner})")),
         SubLinkType::ExprSublink => Some(format!("({inner})")),
         SubLinkType::ArraySublink => Some(format!("ARRAY({inner})")),
         SubLinkType::AnySublink | SubLinkType::AllSublink => {
-            let testexpr = expr(link.testexpr.as_deref()?)?;
+            let testexpr = expr(&link.testexpr)?;
             // `IN`/`NOT IN (subquery)`: the grammar leaves `oper_name` empty
             // for those; an explicit `= ANY (…)` / `<> ALL (…)` carries it.
             if link.oper_name.is_empty() {
-                let keyword =
-                    if enumeration::<SubLinkType>(link.sub_link_type)? == SubLinkType::AnySublink {
-                        "IN"
-                    } else {
-                        "NOT IN"
-                    };
+                let keyword = if link.sub_link_type == SubLinkType::AnySublink {
+                    "IN"
+                } else {
+                    "NOT IN"
+                };
                 return Some(format!("({testexpr} {keyword} ({inner}))"));
             }
-            let keyword =
-                if enumeration::<SubLinkType>(link.sub_link_type)? == SubLinkType::AnySublink {
-                    "ANY"
-                } else {
-                    "ALL"
-                };
+            let keyword = if link.sub_link_type == SubLinkType::AnySublink {
+                "ANY"
+            } else {
+                "ALL"
+            };
             let op = operator_name(&link.oper_name)?;
             Some(format!("({testexpr} {op} {keyword} ({inner}))"))
         }
@@ -1349,21 +1331,21 @@ fn sub_link(link: &protobuf::SubLink) -> Option<String> {
     }
 }
 
-fn indirection_sql(indirection: &protobuf::AIndirection) -> Option<String> {
-    let mut sql = expr(indirection.arg.as_deref()?)?;
+fn indirection_sql(indirection: &ast::AIndirection) -> Option<String> {
+    let mut sql = expr(&indirection.arg)?;
     if indirection.indirection.is_empty() {
         return None;
     }
     for item in &indirection.indirection {
-        match item.node.as_ref()? {
-            NodeEnum::AIndices(indices) => {
+        match item.as_ref()? {
+            Node::AIndices(indices) => {
                 if indices.is_slice {
-                    let low = match indices.lidx.as_deref() {
-                        Some(node) => Some(expr(node)?),
+                    let low = match &indices.lidx {
+                        node @ Some(_) => Some(expr(node)?),
                         None => None,
                     };
-                    let high = match indices.uidx.as_deref() {
-                        Some(node) => Some(expr(node)?),
+                    let high = match &indices.uidx {
+                        node @ Some(_) => Some(expr(node)?),
                         None => None,
                     };
                     sql.push_str(&format!(
@@ -1374,11 +1356,15 @@ fn indirection_sql(indirection: &protobuf::AIndirection) -> Option<String> {
                 } else {
                     // A single subscript is stored in `uidx` (the raw parser
                     // only fills `lidx` for a slice's lower bound).
-                    let index = indices.uidx.as_deref().or(indices.lidx.as_deref())?;
+                    let index = if indices.uidx.is_some() {
+                        &indices.uidx
+                    } else {
+                        &indices.lidx
+                    };
                     sql.push_str(&format!("[{}]", expr(index)?));
                 }
             }
-            NodeEnum::String(field) => {
+            Node::String(field) => {
                 sql.push('.');
                 sql.push_str(&quote_identifier(&field.sval));
             }
@@ -1388,14 +1374,14 @@ fn indirection_sql(indirection: &protobuf::AIndirection) -> Option<String> {
     Some(format!("({sql})"))
 }
 
-fn row_expr(row: &protobuf::RowExpr) -> Option<String> {
+fn row_expr(row: &ast::RowExpr) -> Option<String> {
     let args = row.args.iter().map(expr).collect::<Option<Vec<_>>>()?;
     if args.is_empty() {
         return None;
     }
-    match enumeration::<CoercionForm>(row.row_format)? {
+    match row.row_format {
         CoercionForm::CoerceExplicitCall => Some(format!("ROW({})", args.join(", "))),
-        CoercionForm::CoerceImplicitCast | CoercionForm::Undefined => {
+        CoercionForm::CoerceImplicitCast => {
             if args.len() < 2 {
                 return None;
             }
@@ -1405,7 +1391,7 @@ fn row_expr(row: &protobuf::RowExpr) -> Option<String> {
     }
 }
 
-fn sql_value_function(func: &protobuf::SqlValueFunction) -> Option<String> {
+fn sql_value_function(func: &ast::SqlValueFunction) -> Option<String> {
     let typmod = |default: &str| -> String {
         if func.typmod < 0 {
             default.to_string()
@@ -1413,7 +1399,7 @@ fn sql_value_function(func: &protobuf::SqlValueFunction) -> Option<String> {
             format!("{default}({})", func.typmod)
         }
     };
-    Some(match enumeration::<SqlValueFunctionOp>(func.op)? {
+    Some(match func.op {
         SqlValueFunctionOp::SvfopCurrentDate => "CURRENT_DATE".to_string(),
         SqlValueFunctionOp::SvfopCurrentTime => typmod("CURRENT_TIME"),
         SqlValueFunctionOp::SvfopCurrentTimeN => {
@@ -1449,11 +1435,10 @@ fn sql_value_function(func: &protobuf::SqlValueFunction) -> Option<String> {
         SqlValueFunctionOp::SvfopSessionUser => "SESSION_USER".to_string(),
         SqlValueFunctionOp::SvfopCurrentCatalog => "CURRENT_CATALOG".to_string(),
         SqlValueFunctionOp::SvfopCurrentSchema => "CURRENT_SCHEMA".to_string(),
-        _ => return None,
     })
 }
 
-fn type_name(type_name: &protobuf::TypeName) -> Option<String> {
+fn type_name(type_name: &ast::TypeName) -> Option<String> {
     if type_name.setof || type_name.pct_type {
         return None;
     }
@@ -1475,31 +1460,31 @@ fn type_name(type_name: &protobuf::TypeName) -> Option<String> {
         sql.push_str(&format!("({})", mods.join(", ")));
     }
     for bound in &type_name.array_bounds {
-        match bound.node.as_ref()? {
-            NodeEnum::Integer(integer) if integer.ival == -1 => sql.push_str("[]"),
+        match bound.as_ref()? {
+            Node::Integer(integer) if integer.ival == -1 => sql.push_str("[]"),
             _ => return None,
         }
     }
     Some(sql)
 }
 
-fn case_expr(case: &protobuf::CaseExpr) -> Option<String> {
+fn case_expr(case: &ast::CaseExpr) -> Option<String> {
     let mut sql = String::from("CASE");
-    if let Some(arg) = case.arg.as_deref() {
+    if let arg @ Some(_) = &case.arg {
         sql.push(' ');
         sql.push_str(&expr(arg)?);
     }
     for when in &case.args {
-        let NodeEnum::CaseWhen(when) = when.node.as_ref()? else {
+        let Node::CaseWhen(when) = when.as_ref()? else {
             return None;
         };
         sql.push_str(&format!(
             " WHEN {} THEN {}",
-            expr(when.expr.as_deref()?)?,
-            expr(when.result.as_deref()?)?
+            expr(&when.expr)?,
+            expr(&when.result)?
         ));
     }
-    if let Some(defresult) = case.defresult.as_deref() {
+    if let defresult @ Some(_) = &case.defresult {
         sql.push_str(&format!(" ELSE {}", expr(defresult)?));
     }
     sql.push_str(" END");
@@ -1510,24 +1495,18 @@ fn case_expr(case: &protobuf::CaseExpr) -> Option<String> {
 // Helpers.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// A protobuf enum field (stored as `i32`) as its enum: `None` for a value
-/// the schema doesn't know.
-fn enumeration<T: TryFrom<i32>>(value: i32) -> Option<T> {
-    T::try_from(value).ok()
-}
-
 /// The parts of a funcname / type name / collation name / column-name list,
 /// each of which must be a plain `String` node.
-fn strings(nodes: &[protobuf::Node]) -> Option<Vec<String>> {
+fn strings(nodes: &[Option<ast::Node>]) -> Option<Vec<String>> {
     nodes
         .iter()
         .map(|node| string_of(node).map(str::to_owned))
         .collect()
 }
 
-fn string_of(node: &protobuf::Node) -> Option<&str> {
-    match node.node.as_ref()? {
-        NodeEnum::String(s) => Some(&s.sval),
+fn string_of(node: &Option<ast::Node>) -> Option<&str> {
+    match node.as_ref()? {
+        Node::String(s) => Some(&s.sval),
         _ => None,
     }
 }

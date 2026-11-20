@@ -10,8 +10,9 @@
 
 use std::collections::HashSet;
 
-use typedpg_pg_query::protobuf::{self, node};
-use typedpg_pg_query::{NodeEnum, NodeRef};
+use typedpg_pg_query::NodeRef;
+use typedpg_pg_query::ast;
+use typedpg_pg_query::ast::Node;
 
 use crate::pg_catalog::{PgCatalog, ProVolatile, RelKind};
 use crate::scope::Scope;
@@ -20,14 +21,14 @@ use crate::scope::Scope;
 /// source locations dropped. Column references are kept as written, so
 /// `t.j ->> 'k'` and `u.j ->> 'k'` never meet (an unqualified `j` and a
 /// qualified `t.j` simply don't match).
-pub(crate) fn key(n: &protobuf::Node) -> String {
+pub(crate) fn key(n: &Option<ast::Node>) -> String {
     crate::resolve::node_fingerprint(n)
 }
 
 /// Whether `n` may carry an expression fact: an expression other than a
 /// bare column, constant or parameter, evaluating the same way each time
 /// for one row of one statement.
-pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> bool {
+pub(crate) fn reusable(n: &Option<ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> bool {
     // An implicit cast may run anywhere an argument meets a parameter of
     // another type (`fc(x)` over an `int` `x` for `fc(c)`): with a volatile
     // one in the catalog, no expression is assumed to give the same value
@@ -35,21 +36,21 @@ pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) 
     if has_volatile_cast(snapshot, true) {
         return false;
     }
-    match n.node.as_ref() {
+    match n.as_ref() {
         None
         | Some(
-            node::Node::ColumnRef(_)
-            | node::Node::AConst(_)
-            | node::Node::ParamRef(_)
-            | node::Node::NamedArgExpr(_)
-            | node::Node::CollateClause(_),
+            ast::Node::ColumnRef(_)
+            | ast::Node::AConst(_)
+            | ast::Node::ParamRef(_)
+            | ast::Node::NamedArgExpr(_)
+            | ast::Node::CollateClause(_),
         ) => return false,
         Some(_) => {}
     }
-    let Some(root) = n.node.as_ref() else {
+    let Some(root) = n.as_ref() else {
         return false;
     };
-    let nodes = NodeEnum::nodes(root);
+    let nodes = Node::nodes(root);
     let in_subquery = nodes
         .iter()
         .any(|(n, _)| matches!(n, NodeRef::SelectStmt(_)));
@@ -90,7 +91,7 @@ pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) 
         | NodeRef::AIndices(_)
         | NodeRef::NamedArgExpr(_)
         | NodeRef::CollateClause(_)
-        | NodeRef::SqlvalueFunction(_)
+        | NodeRef::SqlValueFunction(_)
         | NodeRef::GroupingFunc(_)
         | NodeRef::TypeName(_)
         | NodeRef::SortBy(_) => true,
@@ -100,10 +101,7 @@ pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) 
         NodeRef::FuncCall(f) => function_not_volatile(f, in_subquery, snapshot),
         // A scalar sublink over a subquery that reads the same rows each
         // time (one snapshot per statement).
-        NodeRef::SubLink(s) => {
-            protobuf::SubLinkType::try_from(s.sub_link_type)
-                == Ok(protobuf::SubLinkType::ExprSublink)
-        }
+        NodeRef::SubLink(s) => s.sub_link_type == ast::SubLinkType::ExprSublink,
         NodeRef::SelectStmt(s) => {
             // LIMIT / OFFSET over an unordered (or tied) input, DISTINCT ON
             // and row locking pick rows that may differ between two runs
@@ -111,7 +109,7 @@ pub(crate) fn reusable(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) 
             s.limit_count.is_none()
                 && s.limit_offset.is_none()
                 && s.locking_clause.is_empty()
-                && s.distinct_clause.iter().all(|d| d.node.is_none())
+                && s.distinct_clause.iter().all(|d| d.is_none())
         }
         NodeRef::ResTarget(_)
         | NodeRef::JoinExpr(_)
@@ -140,12 +138,12 @@ fn has_volatile_cast(snapshot: &PgCatalog, implicit_only: bool) -> bool {
 /// function: none of the name it is written with — or, for BETWEEN, of
 /// the comparisons PG rewrites it into (`transformAExprBetween`: `a >= b
 /// AND a <= c`, `a < b OR a > c`).
-fn operator_not_volatile(e: &protobuf::AExpr, snapshot: &PgCatalog) -> bool {
-    use protobuf::AExprKind as K;
+fn operator_not_volatile(e: &ast::AExpr, snapshot: &PgCatalog) -> bool {
+    use ast::AExprKind as K;
     let name = crate::expr::extract_string_fields(&e.name);
-    let names: Vec<&str> = match K::try_from(e.kind) {
-        Ok(K::AexprBetween | K::AexprBetweenSym) => vec![">=", "<="],
-        Ok(K::AexprNotBetween | K::AexprNotBetweenSym) => vec!["<", ">"],
+    let names: Vec<&str> = match e.kind {
+        K::AexprBetween | K::AexprBetweenSym => vec![">=", "<="],
+        K::AexprNotBetween | K::AexprNotBetweenSym => vec!["<", ">"],
         _ => match name.last() {
             Some(op) => vec![op.as_str()],
             None => return true,
@@ -162,7 +160,7 @@ fn operator_not_volatile(e: &protobuf::AExpr, snapshot: &PgCatalog) -> bool {
 /// No function of this name is volatile. Inside a subquery, also no
 /// window call (ties make its value depend on the scan order) and no
 /// user-defined aggregate (its transition may depend on the input order).
-fn function_not_volatile(f: &protobuf::FuncCall, in_subquery: bool, snapshot: &PgCatalog) -> bool {
+fn function_not_volatile(f: &ast::FuncCall, in_subquery: bool, snapshot: &PgCatalog) -> bool {
     if in_subquery && f.over.is_some() {
         return false;
     }
@@ -205,7 +203,7 @@ fn function_not_volatile(f: &protobuf::FuncCall, in_subquery: bool, snapshot: &P
 /// one. A CTE of the subquery's own is fine (its body is checked with the
 /// rest); one of the enclosing query is not looked at, so is refused.
 fn relation_is_stable(
-    rv: &protobuf::RangeVar,
+    rv: &ast::RangeVar,
     own_ctes: &HashSet<&str>,
     scope: &Scope,
     snapshot: &PgCatalog,

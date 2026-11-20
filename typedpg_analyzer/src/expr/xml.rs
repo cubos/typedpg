@@ -5,6 +5,7 @@
 //! `xmlagg`, `xmlcomment`, …) resolve through the ordinary function path.
 
 use super::*;
+use typedpg_pg_query::ast;
 
 const XML: PgTypeOid = PgTypeOid::from_raw(142);
 
@@ -12,7 +13,7 @@ const XML: PgTypeOid = PgTypeOid::from_raw(142);
 /// type; a typed one needs an assignment cast, else `argument of X must be
 /// type T, not type U` (42804).
 fn coerce_to_specific_type(
-    e: &protobuf::Node,
+    e: &Option<ast::Node>,
     target: PgTypeOid,
     construct: &str,
     ctx: Ctx<'_>,
@@ -42,22 +43,23 @@ fn coerce_to_specific_type(
 /// (xml, text, boolean, int4). `IS DOCUMENT` is boolean, everything else
 /// xml.
 pub(crate) fn infer_xml_expr(
-    x: &protobuf::XmlExpr,
+    x: &ast::XmlExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    use protobuf::XmlExprOp as Op;
-    let op = protobuf::XmlExprOp::try_from(x.op).unwrap_or(Op::Undefined);
+    use ast::XmlExprOp as Op;
+    let op = x.op;
 
     let mut named_nullable = Vec::new();
     let mut names: Vec<String> = Vec::new();
     for na in &x.named_args {
-        let Some(node::Node::ResTarget(rt)) = na.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = na.as_ref() else {
             continue;
         };
-        let Some(val) = rt.val.as_deref() else {
+        let val = &rt.val;
+        if val.is_none() {
             continue;
-        };
+        }
         let t = infer_expr(val, ctx, params, TypeGoal::NONE)?;
         if let Some(p) = super::bare_param(val, ctx.snapshot) {
             params.mark_indeterminate_locked(p.number);
@@ -65,7 +67,7 @@ pub(crate) fn infer_xml_expr(
         named_nullable.push(t.nullable);
         let name = if !rt.name.is_empty() {
             rt.name.clone()
-        } else if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref()
+        } else if let Some(ast::Node::ColumnRef(cr)) = val.as_ref()
             && let Some(col) = extract_string_fields(&cr.fields).pop()
         {
             col
@@ -138,17 +140,16 @@ pub(crate) fn infer_xml_expr(
 /// target type, which must be implicitly castable from text (`cannot cast
 /// XMLSERIALIZE result to integer`, 42846).
 pub(crate) fn infer_xml_serialize(
-    xs: &protobuf::XmlSerialize,
+    xs: &ast::XmlSerialize,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let snapshot = ctx.snapshot;
-    let e = xs
-        .expr
-        .as_deref()
+    let e = &xs.expr;
+    e.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("XMLSERIALIZE without argument".into()))?;
     let arg = coerce_to_specific_type(e, XML, "XMLSERIALIZE", ctx, params)?;
-    let target = resolve_type_name(xs.type_name.as_ref(), snapshot)?;
+    let target = resolve_type_name(xs.type_name.as_deref(), snapshot)?;
     let typmod = match xs.type_name.as_ref() {
         Some(tn) => crate::typmod::encode(snapshot, target, tn)
             .map_err(|e| AnalyzeError::Invalid(e.to_string()))?,

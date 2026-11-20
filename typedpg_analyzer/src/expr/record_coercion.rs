@@ -14,6 +14,7 @@
 //! constructor of the target type — never NULL itself.
 
 use super::*;
+use typedpg_pg_query::ast;
 
 /// `cannot cast type record to T`, with PG's DETAIL as the hint.
 fn cannot_cast(
@@ -31,10 +32,10 @@ fn cannot_cast(
 }
 
 /// Where PG's `exprLocation` puts an error about the record `node`.
-fn record_span(node: &protobuf::Node) -> Option<crate::error::SourceSpan> {
-    match node.node.as_ref() {
-        Some(node::Node::RowExpr(row)) => crate::error::SourceSpan::from_node_token(row.location),
-        Some(node::Node::ColumnRef(cr)) => crate::error::SourceSpan::from_node_qname(cr.location),
+fn record_span(node: &Option<ast::Node>) -> Option<crate::error::SourceSpan> {
+    match node.as_ref() {
+        Some(ast::Node::RowExpr(row)) => crate::error::SourceSpan::from_node_token(row.location),
+        Some(ast::Node::ColumnRef(cr)) => crate::error::SourceSpan::from_node_qname(cr.location),
         _ => crate::error::expr_span(node),
     }
 }
@@ -43,15 +44,15 @@ fn record_span(node: &protobuf::Node) -> Option<crate::error::SourceSpan> {
 /// `record` (`s.*`, or a bare `s` no column claims — `transformColumnRef`'s
 /// fallback to `transformWholeRowRef`): one with no row type of its own.
 fn whole_row_source<'s>(
-    cr: &protobuf::ColumnRef,
+    cr: &ast::ColumnRef,
     scope: &'s Scope,
 ) -> Option<&'s crate::scope::TableSource> {
-    let name = |n: &protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::String(s)) => Some(s.sval.clone()),
+    let name = |n: &Option<ast::Node>| match n.as_ref() {
+        Some(ast::Node::String(s)) => Some(s.sval.clone()),
         _ => None,
     };
     let alias = match cr.fields.as_slice() {
-        [.., qualifier, last] if matches!(last.node.as_ref(), Some(node::Node::AStar(_))) => {
+        [.., qualifier, last] if matches!(last.as_ref(), Some(ast::Node::AStar(_))) => {
             name(qualifier)?
         }
         [only] => {
@@ -76,7 +77,7 @@ fn whole_row_source<'s>(
 /// does. Returns the rebuilt row, typed as the composite (domains
 /// smashed), its fields carrying the coerced values' nullability.
 pub(crate) fn coerce_record_to_complex(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     target: PgTypeOid,
     context: CoercionContext,
     ctx: Ctx<'_>,
@@ -86,13 +87,13 @@ pub(crate) fn coerce_record_to_complex(
     // coerce_type hands a `record` cast to `record` back as it is, so
     // `ROW(1, 'a')::record::t` and `s::record::t` still name their fields.
     let mut node = node;
-    while let Some(node::Node::TypeCast(cast)) = node.node.as_ref()
+    while let Some(ast::Node::TypeCast(cast)) = node.as_ref()
         && let Some(tn) = cast.type_name.as_ref()
         && tn.array_bounds.is_empty()
         && crate::ddl::util::resolve_type_name(tn, snapshot) == Some(oid::RECORD)
-        && let Some(arg) = cast.arg.as_deref()
+        && cast.arg.is_some()
     {
-        node = arg;
+        node = &cast.arg;
     }
     let composite = snapshot.unwrap_domain(target);
     let fields = snapshot
@@ -130,12 +131,12 @@ pub(crate) fn coerce_record_to_complex(
         )
     };
     let mut shape = Vec::with_capacity(fields.len());
-    let whole_row = match node.node.as_ref() {
-        Some(node::Node::ColumnRef(cr)) => whole_row_source(cr, ctx.scope).map(|s| (cr, s)),
+    let whole_row = match node.as_ref() {
+        Some(ast::Node::ColumnRef(cr)) => whole_row_source(cr, ctx.scope).map(|s| (cr, s)),
         _ => None,
     };
-    match (node.node.as_ref(), whole_row) {
-        (Some(node::Node::RowExpr(row)), _) => {
+    match (node.as_ref(), whole_row) {
+        (Some(ast::Node::RowExpr(row)), _) => {
             // transformRowExpr has expanded the stars already.
             let args = expand_row_args(&row.args, ctx, params)?;
             for (i, field) in fields.iter().enumerate() {
@@ -169,8 +170,8 @@ pub(crate) fn coerce_record_to_complex(
                 // nested row is rebuilt. Any other cast may map a value to
                 // NULL (`int4(jsonb)` on a JSON null).
                 let literal = matches!(
-                    arg.node.as_ref(),
-                    Some(node::Node::AConst(c)) if !c.isnull
+                    arg.as_ref(),
+                    Some(ast::Node::AConst(c)) if !c.isnull
                 );
                 let kept = own.type_oid == field.atttypid
                     || (own.type_oid == oid::UNKNOWN && literal)

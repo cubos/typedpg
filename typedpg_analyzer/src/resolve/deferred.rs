@@ -13,7 +13,7 @@
 //! outputs NULLed first (`remove_unused_subquery_outputs`), or not at all
 //! when the outer query proves it empty: nothing in it is certain.
 
-use typedpg_pg_query::protobuf::{self, SetOperation, node};
+use typedpg_pg_query::ast::{self, SetOperation};
 
 use crate::error::AnalyzeError;
 use crate::expr::PlanTimeError;
@@ -41,8 +41,8 @@ pub(crate) enum Plan {
 }
 
 /// How the planner plans `sel`, a FROM subquery or a CTE's query.
-pub(crate) fn plan_of(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Plan {
-    if sel.op != SetOperation::SetopNone as i32 {
+pub(crate) fn plan_of(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> Plan {
+    if sel.op != SetOperation::SetopNone {
         return Plan::Uncertain;
     }
     if !sel.values_lists.is_empty() {
@@ -81,10 +81,10 @@ pub(crate) fn plan_of(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Plan 
 /// it up: it calls an aggregate (`count(*)`, or a name only aggregates
 /// have), a window function, or a name only set-returning or volatile
 /// functions have.
-fn never_simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+fn never_simple_target_list(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
     use crate::pg_catalog::{ProKind, ProVolatile};
     sel.target_list.iter().any(|t| {
-        t.node.as_ref().is_some_and(|inner| {
+        t.as_ref().is_some_and(|inner| {
             // Not below a sublink, whose calls are its own.
             let mut todo = vec![inner.to_ref()];
             while let Some(n) = todo.pop() {
@@ -125,7 +125,7 @@ fn never_simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) ->
 /// it is certain to be planned.
 fn next_level(
     plan: Plan,
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     kept: bool,
     alias: Option<&str>,
     snapshot: &PgCatalog,
@@ -159,13 +159,13 @@ fn next_level(
 /// ORDER BY, LIMIT, locking or WITH, whose select list calls no
 /// aggregate, window, set-returning or volatile function (and holds no
 /// sublink, to be sure).
-pub(crate) fn pulled_up_in(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+pub(crate) fn pulled_up_in(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
     simple_shape(sel) && simple_target_list(sel, snapshot)
 }
 
 /// [`pulled_up_in`] for `sel`, a SELECT already analyzed (whose select
 /// list's calls the analysis recorded, see [`record_target_list`]).
-pub(crate) fn pulled_up(sel: &protobuf::SelectStmt) -> bool {
+pub(crate) fn pulled_up(sel: &ast::SelectStmt) -> bool {
     simple_shape(sel)
         && (!calls_in_target_list(sel)
             || SIMPLE_TARGETS.with(|m| m.borrow().get(&target_list_key(sel)).copied())
@@ -182,12 +182,12 @@ thread_local! {
 /// A key telling an analyzed SELECT apart: its address, and its select
 /// list's length and first location (so a SELECT later allocated where a
 /// dropped one was isn't taken for it).
-fn target_list_key(sel: &protobuf::SelectStmt) -> (usize, usize, i32) {
+fn target_list_key(sel: &ast::SelectStmt) -> (usize, usize, i32) {
     let first = sel
         .target_list
         .first()
-        .and_then(|t| match t.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => Some(rt.location),
+        .and_then(|t| match t.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => Some(rt.location),
             _ => None,
         })
         .unwrap_or(-1);
@@ -200,7 +200,7 @@ fn target_list_key(sel: &protobuf::SelectStmt) -> (usize, usize, i32) {
 
 /// Record, analyzing `sel`, whether its select list is one the planner
 /// pulls up (see [`pulled_up`]).
-pub(crate) fn record_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) {
+pub(crate) fn record_target_list(sel: &ast::SelectStmt, snapshot: &PgCatalog) {
     if calls_in_target_list(sel) {
         let simple = simple_target_list(sel, snapshot);
         SIMPLE_TARGETS.with(|m| m.borrow_mut().insert(target_list_key(sel), simple));
@@ -211,8 +211,8 @@ pub(crate) fn record_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalo
 /// list's calls. A WINDOW clause is no part of it: only a window function
 /// (`hasWindowFuncs`, see [`simple_target_list`]) keeps it from being
 /// pulled up.
-fn simple_shape(sel: &protobuf::SelectStmt) -> bool {
-    sel.op == SetOperation::SetopNone as i32
+fn simple_shape(sel: &ast::SelectStmt) -> bool {
+    sel.op == SetOperation::SetopNone
         && sel.values_lists.is_empty()
         && sel.with_clause.is_none()
         && sel.group_clause.is_empty()
@@ -227,9 +227,9 @@ fn simple_shape(sel: &protobuf::SelectStmt) -> bool {
 
 /// Whether `sel`'s select list calls any function or operator, or holds a
 /// sublink or GROUPING.
-fn calls_in_target_list(sel: &protobuf::SelectStmt) -> bool {
+fn calls_in_target_list(sel: &ast::SelectStmt) -> bool {
     sel.target_list.iter().any(|t| {
-        t.node.as_ref().is_some_and(|n| {
+        t.as_ref().is_some_and(|n| {
             n.nodes().into_iter().any(|(n, _)| {
                 matches!(
                     n,
@@ -248,13 +248,13 @@ fn calls_in_target_list(sel: &protobuf::SelectStmt) -> bool {
 /// (`contain_volatile_functions`), and — to be sure — no sublink nor
 /// GROUPING. A function is known by its name: every function of that
 /// name must be a plain, non-volatile, non-set-returning one.
-fn simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
+fn simple_target_list(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
     use crate::pg_catalog::{ProKind, ProVolatile};
     let plain = |p: &crate::pg_catalog::PgProc| {
         p.prokind == ProKind::Function && !p.proretset && p.provolatile != ProVolatile::Volatile
     };
     sel.target_list.iter().all(|t| {
-        let Some(inner) = t.node.as_ref() else {
+        let Some(inner) = t.as_ref() else {
             return true;
         };
         inner.nodes().into_iter().all(|(n, _)| match n {
@@ -308,10 +308,11 @@ fn simple_target_list(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool 
 
 thread_local! {
     /// The expression the planner substitutes for a select-list entry
-    /// that reads a pulled-up subquery's column (keyed by the entry's
-    /// address, with the column reference itself to tell it apart).
+    /// that reads a pulled-up subquery's column (keyed by the address of
+    /// the entry's boxed column reference, with the reference itself to
+    /// tell it apart).
     static SUBSTITUTED: std::cell::RefCell<
-        std::collections::HashMap<usize, (protobuf::ColumnRef, std::sync::Arc<protobuf::Node>)>,
+        std::collections::HashMap<usize, (ast::ColumnRef, std::sync::Arc<ast::Node>)>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -323,11 +324,13 @@ pub(crate) fn clear_recorded() {
 
 /// Record that the planner substitutes `expr` for `entry`, a column
 /// reference of a select list reading a pulled-up subquery's column.
-pub(crate) fn record_substitution(entry: &protobuf::Node, expr: std::sync::Arc<protobuf::Node>) {
-    if let Some(node::Node::ColumnRef(cr)) = entry.node.as_ref() {
+pub(crate) fn record_substitution(entry: &Option<ast::Node>, expr: std::sync::Arc<ast::Node>) {
+    if let Some(ast::Node::ColumnRef(cr)) = entry.as_ref() {
         SUBSTITUTED.with(|m| {
-            m.borrow_mut()
-                .insert(std::ptr::from_ref(entry) as usize, (cr.clone(), expr));
+            m.borrow_mut().insert(
+                std::ptr::from_ref::<ast::ColumnRef>(cr) as usize,
+                ((**cr).clone(), expr),
+            );
         });
     }
 }
@@ -337,8 +340,8 @@ pub(crate) fn record_substitution(entry: &protobuf::Node, expr: std::sync::Arc<p
 /// planner pulls up where it is never null-extended (a FROM subquery, an
 /// inlined CTE), the output expression the planner substitutes for it:
 /// its conversion to the type it is assigned to is folded.
-pub(crate) fn record_read(val: &protobuf::Node, scope: &crate::scope::Scope) {
-    let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() else {
+pub(crate) fn record_read(val: &Option<ast::Node>, scope: &crate::scope::Scope) {
+    let Some(ast::Node::ColumnRef(cr)) = val.as_ref() else {
         return;
     };
     let parts = crate::expr::extract_string_fields(&cr.fields);
@@ -355,14 +358,14 @@ pub(crate) fn record_read(val: &protobuf::Node, scope: &crate::scope::Scope) {
 }
 
 /// What the planner substitutes for `entry` (see [`record_substitution`]).
-pub(crate) fn substituted(entry: &protobuf::Node) -> Option<std::sync::Arc<protobuf::Node>> {
-    let Some(node::Node::ColumnRef(cr)) = entry.node.as_ref() else {
+pub(crate) fn substituted(entry: &Option<ast::Node>) -> Option<std::sync::Arc<ast::Node>> {
+    let Some(ast::Node::ColumnRef(cr)) = entry.as_ref() else {
         return None;
     };
     SUBSTITUTED.with(|m| {
         m.borrow()
-            .get(&(std::ptr::from_ref(entry) as usize))
-            .filter(|(r, _)| cr == r)
+            .get(&(std::ptr::from_ref::<ast::ColumnRef>(cr) as usize))
+            .filter(|(r, _)| **cr == *r)
             .map(|(_, e)| e.clone())
     })
 }
@@ -371,23 +374,21 @@ pub(crate) fn substituted(entry: &protobuf::Node) -> Option<std::sync::Arc<proto
 /// for references once it pulls `sel` up: each select-list entry (or the
 /// single VALUES row's item) — itself what it substitutes, when it reads
 /// a column pulled up from below. `None` past a `*`.
-pub(crate) fn output_exprs(
-    sel: &protobuf::SelectStmt,
-) -> Vec<Option<std::sync::Arc<protobuf::Node>>> {
-    let entry =
-        |n: &protobuf::Node| Some(substituted(n).unwrap_or_else(|| std::sync::Arc::new(n.clone())));
+pub(crate) fn output_exprs(sel: &ast::SelectStmt) -> Vec<Option<std::sync::Arc<ast::Node>>> {
+    let entry = |n: &Option<ast::Node>| {
+        n.as_ref()
+            .map(|inner| substituted(n).unwrap_or_else(|| std::sync::Arc::new(inner.clone())))
+    };
     match sel.values_lists.as_slice() {
-        [row] => match row.node.as_ref() {
-            Some(node::Node::List(l)) => l.items.iter().map(entry).collect(),
+        [row] => match row.as_ref() {
+            Some(ast::Node::List(l)) => l.items.iter().map(entry).collect(),
             _ => Vec::new(),
         },
         [] => sel
             .target_list
             .iter()
-            .map_while(|t| match t.node.as_ref() {
-                Some(node::Node::ResTarget(rt)) if !is_star(t) => {
-                    Some(rt.val.as_deref().and_then(entry))
-                }
+            .map_while(|t| match t.as_ref() {
+                Some(ast::Node::ResTarget(rt)) if !is_star(t) => Some(entry(&rt.val)),
                 _ => None,
             })
             .collect(),
@@ -410,12 +411,12 @@ pub(crate) struct Split {
 /// and the rest, by the location of the node each is about. One in an
 /// output whose column isn't known (after a `*`), or without a location,
 /// is dropped: it may never be planned.
-pub(crate) fn split(sel: &protobuf::SelectStmt, errors: Vec<PlanTimeError>) -> Split {
+pub(crate) fn split(sel: &ast::SelectStmt, errors: Vec<PlanTimeError>) -> Split {
     // Each output expression's span, and the column it is (`None` past a
     // `*`, which expands to columns of its own).
     let entries: Vec<(Option<Span>, Option<usize>)> = match sel.values_lists.as_slice() {
-        [row] => match row.node.as_ref() {
-            Some(node::Node::List(l)) => l
+        [row] => match row.as_ref() {
+            Some(ast::Node::List(l)) => l
                 .items
                 .iter()
                 .enumerate()
@@ -470,8 +471,8 @@ pub(crate) fn split(sel: &protobuf::SelectStmt, errors: Vec<PlanTimeError>) -> S
 type Span = (i32, i32);
 
 /// The first and last location of the nodes in `n`.
-fn span(n: &protobuf::Node) -> Option<Span> {
-    let inner = n.node.as_ref()?;
+fn span(n: &Option<ast::Node>) -> Option<Span> {
+    let inner = n.as_ref()?;
     let mut range: Option<(i32, i32)> = None;
     for (n, _) in inner.nodes() {
         if let Some(l) = n.location().filter(|l| *l >= 0) {
@@ -485,11 +486,11 @@ fn span(n: &protobuf::Node) -> Option<Span> {
 }
 
 /// A `*` or `t.*` target entry.
-fn is_star(t: &protobuf::Node) -> bool {
-    matches!(t.node.as_ref(), Some(node::Node::ResTarget(rt))
-        if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-            Some(node::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
-                matches!(f.node.as_ref(), Some(node::Node::AStar(_))))))
+fn is_star(t: &Option<ast::Node>) -> bool {
+    matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
+        if matches!(rt.val.as_ref(),
+            Some(ast::Node::ColumnRef(cr)) if cr.fields.iter().any(|f|
+                matches!(f.as_ref(), Some(ast::Node::AStar(_))))))
 }
 
 /// Analyze `sel` (with `run`) as a subquery, FROM item `alias`, the query
@@ -500,7 +501,7 @@ fn is_star(t: &protobuf::Node) -> bool {
 /// captured and split; the others are analyzed without the checks.
 pub(crate) fn analyze<T>(
     plan: Plan,
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     kept: bool,
     removable_side: bool,
     alias: &str,
@@ -533,7 +534,7 @@ pub(crate) fn analyze<T>(
 fn unless_removed<T>(
     next: NextLevel,
     removable_side: bool,
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
 ) -> T {
@@ -549,11 +550,11 @@ fn unless_removed<T>(
 /// The alias of `sel`'s only FROM item when it is one relation
 /// `join_is_removable` may drop (one with a unique index, or a name that
 /// isn't a table's: a CTE's), as [`crate::expr::plan_fold::may_be_removed`].
-fn removable_relation(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<String> {
+fn removable_relation(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> Option<String> {
     let [item] = sel.from_clause.as_slice() else {
         return None;
     };
-    let Some(node::Node::RangeVar(rv)) = item.node.as_ref() else {
+    let Some(ast::Node::RangeVar(rv)) = item.as_ref() else {
         return None;
     };
     let unique = crate::ddl::util::lookup_relation(snapshot, rv).map_or(true, |(_, relid)| {
@@ -597,20 +598,18 @@ pub(crate) struct PlannedCte {
 /// WITH, its query is that FROM item's: what that level's quals prove of
 /// it holds for it.
 pub(crate) fn analyze_cte<T>(
-    cte: &protobuf::CommonTableExpr,
+    cte: &ast::CommonTableExpr,
     recursive: bool,
     inlined: Option<bool>,
     reference: Option<&str>,
     snapshot: &PgCatalog,
     run: impl FnOnce() -> T,
 ) -> (T, PlannedCte) {
-    let Some(node::Node::SelectStmt(sel)) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
-    else {
+    let Some(ast::Node::SelectStmt(sel)) = cte.ctequery.as_ref() else {
         // A data-modifying CTE always runs.
         return (run(), PlannedCte::default());
     };
-    let scanned =
-        cte.ctematerialized == protobuf::CteMaterialize::Always as i32 || inlined == Some(false);
+    let scanned = cte.ctematerialized == ast::CteMaterialize::Always || inlined == Some(false);
     let plan = match plan_of(sel, snapshot) {
         _ if recursive => Plan::Uncertain,
         Plan::Uncertain | Plan::Separate | Plan::PulledUp if scanned => Plan::Whole,
@@ -700,7 +699,7 @@ pub(crate) fn analyze_cte<T>(
 /// `None` when nothing of it is certain to be planned. A
 /// `security_barrier` view's (`barrier`) is never pulled up.
 pub(crate) fn planned_errors<T>(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     barrier: bool,
     kept: bool,
@@ -709,7 +708,7 @@ pub(crate) fn planned_errors<T>(
 ) -> Option<(T, Split)> {
     let run = || crate::expr::plan_fold::with_next_outputs(Outputs::Trimmed, run);
     let plan = match plan_of(sel, snapshot) {
-        _ if barrier && sel.op == SetOperation::SetopNone as i32 && sel.values_lists.is_empty() => {
+        _ if barrier && sel.op == SetOperation::SetopNone && sel.values_lists.is_empty() => {
             Plan::Separate
         }
         _ if barrier => Plan::Uncertain,
@@ -808,7 +807,7 @@ pub(crate) fn reference_cte(
 /// WHERE raises is raised, once the subquery is (see
 /// [`crate::expr::sublink_planned`]).
 pub(crate) fn analyze_exists<T>(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     run: impl FnOnce() -> Result<T, AnalyzeError>,
 ) -> Result<T, AnalyzeError> {
     let run = || crate::expr::plan_fold::with_next_outputs(Outputs::Exists, run);
@@ -820,7 +819,7 @@ pub(crate) fn analyze_exists<T>(
     let planned: Vec<Span> = sel
         .from_clause
         .iter()
-        .chain(sel.where_clause.as_deref())
+        .chain(std::iter::once(&sel.where_clause))
         .filter_map(span)
         .collect();
     for (location, e) in errors {

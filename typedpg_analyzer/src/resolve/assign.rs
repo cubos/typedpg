@@ -4,6 +4,7 @@
 //! `SET p.x = …`) and PG's duplicate-target rules.
 
 use super::*;
+use typedpg_pg_query::{NodeBox, ast};
 
 /// What an assignment target (`col`, `col[i]`, `col.f[i]`, …) expects.
 pub(crate) struct AssignTarget {
@@ -31,7 +32,7 @@ pub(crate) struct AssignTarget {
 /// ones text or integer) so their parameters are typed.
 pub(crate) fn assignment_target(
     tc: &crate::pg_catalog::PgAttribute,
-    indirection: &[protobuf::Node],
+    indirection: &[Option<ast::Node>],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<AssignTarget, AnalyzeError> {
@@ -44,11 +45,11 @@ pub(crate) fn assignment_target(
     let mut last_step = None;
     let mut i = 0;
     while i < indirection.len() {
-        match indirection[i].node.as_ref() {
-            Some(node::Node::AIndices(_)) => {
-                let mut run: Vec<&protobuf::AIndices> = Vec::new();
-                while let Some(node::Node::AIndices(ai)) =
-                    indirection.get(i).and_then(|n| n.node.as_ref())
+        match indirection[i].as_ref() {
+            Some(ast::Node::AIndices(_)) => {
+                let mut run: Vec<&ast::AIndices> = Vec::new();
+                while let Some(ast::Node::AIndices(ai)) =
+                    indirection.get(i).and_then(|n| n.as_ref())
                 {
                     run.push(ai);
                     i += 1;
@@ -62,7 +63,7 @@ pub(crate) fn assignment_target(
                 ty = elem;
                 last_step = Some((true, target_name.clone()));
             }
-            Some(node::Node::String(s)) => {
+            Some(ast::Node::String(s)) => {
                 let field = &s.sval;
                 let base = snapshot.unwrap_domain(ty);
                 let relid = snapshot
@@ -113,7 +114,7 @@ pub(crate) fn assignment_target(
         last_step,
         first_step_is_subscript: indirection
             .first()
-            .map(|n| matches!(n.node.as_ref(), Some(node::Node::AIndices(_)))),
+            .map(|n| matches!(n.as_ref(), Some(ast::Node::AIndices(_)))),
     })
 }
 
@@ -123,7 +124,7 @@ impl AssignTarget {
     /// reports PG's subscript / subfield wording on a coercion failure.
     pub(crate) fn infer_value(
         &self,
-        val: &protobuf::Node,
+        val: &Option<ast::Node>,
         goal: TypeGoal,
         ctx: Ctx<'_>,
         params: &mut ParamCollector,
@@ -227,7 +228,7 @@ enum SetValue<'a> {
     /// `col = expr`, or one element of `(a, b) = ROW(x, y)`; and whether
     /// it is a bare `$N` transformed while `$N` was untyped
     /// ([`crate::expr::replay_transform`]).
-    Expr(&'a protobuf::Node, bool),
+    Expr(&'a Option<ast::Node>, bool),
     /// Column `n` of `(a, b) = (SELECT …)`.
     SubqueryColumn(Box<RawColumn>),
 }
@@ -238,20 +239,18 @@ enum SetValue<'a> {
 /// becomes `ROW(v.x, v.y)` before its elements are counted and assigned in
 /// order. Borrowed when no source holds a star.
 pub(crate) fn expand_multi_assign_rows<'a>(
-    target_list: &'a [protobuf::Node],
+    target_list: &'a [Option<ast::Node>],
     ctx: Ctx<'_>,
     params: &ParamCollector,
-) -> Result<std::borrow::Cow<'a, [protobuf::Node]>, AnalyzeError> {
-    let expanded_row = |item: &protobuf::Node| {
-        let Some(node::Node::ResTarget(rt)) = item.node.as_ref() else {
+) -> Result<std::borrow::Cow<'a, [Option<ast::Node>]>, AnalyzeError> {
+    let expanded_row = |item: &Option<ast::Node>| {
+        let Some(ast::Node::ResTarget(rt)) = item.as_ref() else {
             return Ok(None);
         };
-        let Some(node::Node::MultiAssignRef(mar)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
-        else {
+        let Some(ast::Node::MultiAssignRef(mar)) = rt.val.as_ref() else {
             return Ok(None);
         };
-        let Some(node::Node::RowExpr(row)) = mar.source.as_deref().and_then(|s| s.node.as_ref())
-        else {
+        let Some(ast::Node::RowExpr(row)) = mar.source.as_ref() else {
             return Ok(None);
         };
         let std::borrow::Cow::Owned(args) = expr::expand_row_args(&row.args, ctx, params)? else {
@@ -259,20 +258,14 @@ pub(crate) fn expand_multi_assign_rows<'a>(
         };
         let mut rt = rt.clone();
         let mut mar = mar.clone();
-        mar.source = Some(Box::new(protobuf::Node {
-            node: Some(node::Node::RowExpr(Box::new(protobuf::RowExpr {
-                args,
-                ..(**row).clone()
-            }))),
-        }));
-        rt.val = Some(Box::new(protobuf::Node {
-            node: Some(node::Node::MultiAssignRef(mar)),
-        }));
-        Ok(Some(protobuf::Node {
-            node: Some(node::Node::ResTarget(rt)),
-        }))
+        mar.source = Some(ast::Node::RowExpr(NodeBox::new(ast::RowExpr {
+            args,
+            ..(**row).clone()
+        })));
+        rt.val = Some(ast::Node::MultiAssignRef(mar));
+        Ok(Some(ast::Node::ResTarget(rt)))
     };
-    let expanded: Vec<Option<protobuf::Node>> = target_list
+    let expanded: Vec<Option<ast::Node>> = target_list
         .iter()
         .map(expanded_row)
         .collect::<Result<_, AnalyzeError>>()?;
@@ -283,7 +276,7 @@ pub(crate) fn expand_multi_assign_rows<'a>(
         target_list
             .iter()
             .zip(expanded)
-            .map(|(item, e)| e.unwrap_or_else(|| item.clone()))
+            .map(|(item, e)| e.map_or_else(|| item.clone(), Some))
             .collect(),
     ))
 }
@@ -298,10 +291,10 @@ pub(crate) fn expand_multi_assign_rows<'a>(
 /// replayed in that order ([`crate::expr::TransformReplay`]), so a bare
 /// `$N` before a sub-SELECT that types it is still an untyped node.
 fn expand_set_items<'a>(
-    target_list: &'a [protobuf::Node],
+    target_list: &'a [Option<ast::Node>],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
-) -> Result<Vec<(&'a protobuf::ResTarget, SetValue<'a>)>, AnalyzeError> {
+) -> Result<Vec<(&'a ast::ResTarget, SetValue<'a>)>, AnalyzeError> {
     let mut replay = crate::expr::TransformReplay::new(params);
     let out = expand_set_items_replayed(target_list, ctx, params, &mut replay);
     replay.finish(params);
@@ -309,26 +302,27 @@ fn expand_set_items<'a>(
 }
 
 fn expand_set_items_replayed<'a>(
-    target_list: &'a [protobuf::Node],
+    target_list: &'a [Option<ast::Node>],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     replay: &mut crate::expr::TransformReplay,
-) -> Result<Vec<(&'a protobuf::ResTarget, SetValue<'a>)>, AnalyzeError> {
+) -> Result<Vec<(&'a ast::ResTarget, SetValue<'a>)>, AnalyzeError> {
     let mut out = Vec::with_capacity(target_list.len());
     let mut subquery_cols: Vec<RawColumn> = Vec::new();
     for item in target_list {
-        let Some(node::Node::ResTarget(rt)) = item.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = item.as_ref() else {
             continue;
         };
-        let Some(val) = rt.val.as_deref() else {
+        let Some(val_node) = rt.val.as_ref() else {
             continue;
         };
-        let Some(node::Node::MultiAssignRef(mar)) = val.node.as_ref() else {
+        let val = &rt.val;
+        let ast::Node::MultiAssignRef(mar) = val_node else {
             let untyped = replay.item(val, ctx, params);
             out.push((rt.as_ref(), SetValue::Expr(val, untyped)));
             continue;
         };
-        let source = mar.source.as_deref();
+        let source = mar.source.as_ref();
         let ncolumns = usize::try_from(mar.ncolumns).unwrap_or(0);
         let colno = usize::try_from(mar.colno).unwrap_or(1).max(1);
         let count_mismatch = || {
@@ -341,8 +335,8 @@ fn expand_set_items_replayed<'a>(
             )
             .finalize_implicit()
         };
-        match source.and_then(|s| s.node.as_ref()) {
-            Some(node::Node::RowExpr(row)) => {
+        match source {
+            Some(ast::Node::RowExpr(row)) => {
                 if row.args.len() != ncolumns {
                     return Err(count_mismatch());
                 }
@@ -350,16 +344,11 @@ fn expand_set_items_replayed<'a>(
                 let untyped = replay.item(elem, ctx, params);
                 out.push((rt.as_ref(), SetValue::Expr(elem, untyped)));
             }
-            Some(node::Node::SubLink(sl))
-                if matches!(
-                    sl.subselect.as_deref().and_then(|n| n.node.as_ref()),
-                    Some(node::Node::SelectStmt(_))
-                ) =>
+            Some(ast::Node::SubLink(sl))
+                if matches!(sl.subselect.as_ref(), Some(ast::Node::SelectStmt(_))) =>
             {
                 if colno == 1 {
-                    let Some(node::Node::SelectStmt(sel)) =
-                        sl.subselect.as_deref().and_then(|n| n.node.as_ref())
-                    else {
+                    let Some(ast::Node::SelectStmt(sel)) = sl.subselect.as_ref() else {
                         unreachable!("guarded above");
                     };
                     let (cols, _) = replay.analyze_in_place(params, |params| {
@@ -414,13 +403,13 @@ fn expand_set_items_replayed<'a>(
 /// assignments' row elements expanded ([`expand_multi_assign_rows`]), what
 /// the later passes over it read.
 pub(crate) fn analyze_set_clause<'a>(
-    target_list: &'a [protobuf::Node],
+    target_list: &'a [Option<ast::Node>],
     table_attrs: &[crate::pg_catalog::PgAttribute],
     table_relname: &str,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     null_check: bool,
-) -> Result<std::borrow::Cow<'a, [protobuf::Node]>, AnalyzeError> {
+) -> Result<std::borrow::Cow<'a, [Option<ast::Node>]>, AnalyzeError> {
     let snapshot = ctx.snapshot;
     let target_list = expand_multi_assign_rows(target_list, ctx, params)?;
     let items = expand_set_items(&target_list, ctx, params)?;
@@ -507,7 +496,7 @@ pub(crate) fn analyze_set_clause<'a>(
                 })?;
                 crate::clause::check_no_aggregates_or_windows(val, snapshot, "UPDATE")?;
                 check_no_srf_in_clause(val, snapshot, "UPDATE")?;
-                if let Some(node::Node::ParamRef(p)) = val.node.as_ref()
+                if let Some(ast::Node::ParamRef(p)) = val.as_ref()
                     && (!tc.attnotnull || target.indirected)
                 {
                     params.infer_nullable(p.number, true);
@@ -557,11 +546,13 @@ pub(crate) fn analyze_set_clause<'a>(
 /// PG's `checkInsertTargets`: a column may be named more than once only
 /// when every occurrence assigns *into* it (`arr[1], arr[2]`) — 42701
 /// `column "x" specified more than once` otherwise.
-pub(crate) fn check_insert_target_duplicates(cols: &[protobuf::Node]) -> Result<(), AnalyzeError> {
+pub(crate) fn check_insert_target_duplicates(
+    cols: &[Option<ast::Node>],
+) -> Result<(), AnalyzeError> {
     let mut whole: Vec<&str> = Vec::new();
     let mut partial: Vec<&str> = Vec::new();
     for n in cols {
-        let Some(node::Node::ResTarget(rt)) = n.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = n.as_ref() else {
             continue;
         };
         let name = rt.name.as_str();

@@ -1,6 +1,7 @@
 //! `CALL procedure(args)`.
 
 use super::*;
+use typedpg_pg_query::ast;
 
 /// `CALL proc(args)` — PG's `transformCallStmt`: the arguments are
 /// transformed, then resolved by `ParseFuncOrColumn` with `proc_call`,
@@ -12,7 +13,7 @@ use super::*;
 /// row is the procedure's INOUT / OUT parameters, with polymorphic ones
 /// resolved from the arguments.
 pub(crate) fn analyze_call(
-    call: &protobuf::CallStmt,
+    call: &ast::CallStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
@@ -83,10 +84,10 @@ pub(crate) fn analyze_call(
 
 /// EXPR_KIND_CALL_ARGUMENT: no sub-select (transformSubLink, 0A000), no
 /// aggregate, window or set-returning function.
-fn check_call_argument(arg: &protobuf::Node, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
+fn check_call_argument(arg: &Option<ast::Node>, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
     let mut sublink = None;
     visit_same_level(arg, &mut |n| {
-        if let Some(node::Node::SubLink(sl)) = n.node.as_ref() {
+        if let Some(ast::Node::SubLink(sl)) = n.as_ref() {
             sublink.get_or_insert(sl.location);
         }
     });

@@ -1,4 +1,6 @@
 use super::*;
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 /// Emit `pg_constraint` rows for every PRIMARY KEY / UNIQUE / CHECK /
 /// FOREIGN KEY constraint declared on a freshly-built table. FK targets
@@ -27,13 +29,13 @@ pub(crate) fn emit_constraints(
     let mut to_emit: Vec<PendingConstraint> = Vec::new();
     // The parse node of each `to_emit` entry, for DefineIndex's checks of
     // the index-backed ones.
-    let mut specs: Vec<&typedpg_pg_query::protobuf::Constraint> = Vec::new();
+    let mut specs: Vec<&typedpg_pg_query::ast::Constraint> = Vec::new();
     let mut pending_fks: Vec<PendingFk> = Vec::new();
 
     // Column-level constraints.
-    let mut column_constraints: Vec<(&typedpg_pg_query::protobuf::ColumnDef, Vec<_>)> = Vec::new();
+    let mut column_constraints: Vec<(&typedpg_pg_query::ast::ColumnDef, Vec<_>)> = Vec::new();
     for elt in &stmt.table_elts {
-        if let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() {
+        if let Some(ast::Node::ColumnDef(cd)) = elt.as_ref() {
             column_constraints.push((&**cd, fold_constraint_attrs(&cd.constraints)?));
         }
     }
@@ -42,8 +44,8 @@ pub(crate) fn emit_constraints(
             continue;
         };
         for c in constraints {
-            match ConstrType::try_from(c.contype) {
-                Ok(ConstrType::ConstrPrimary) => {
+            match c.contype {
+                ConstrType::ConstrPrimary => {
                     to_emit.push((
                         ConName::from_explicit(
                             &c.conname,
@@ -63,7 +65,7 @@ pub(crate) fn emit_constraints(
                     ));
                     specs.push(c);
                 }
-                Ok(ConstrType::ConstrUnique) => {
+                ConstrType::ConstrUnique => {
                     to_emit.push((
                         ConName::from_explicit(
                             &c.conname,
@@ -83,24 +85,22 @@ pub(crate) fn emit_constraints(
                     ));
                     specs.push(c);
                 }
-                Ok(ConstrType::ConstrCheck) => {
+                ConstrType::ConstrCheck => {
                     to_emit.push((
                         ConName::from_explicit(
                             &c.conname,
                             ConName::Constraint {
-                                addition: check_name_addition(interp, relid, c.raw_expr.as_deref()),
+                                addition: check_name_addition(interp, relid, c.raw_expr.as_ref()),
                                 label: "check",
                             },
                         ),
                         ConType::Check,
-                        check_conkey(interp, relid, c.raw_expr.as_deref()),
+                        check_conkey(interp, relid, c.raw_expr.as_ref()),
                         None,
                         Vec::new(),
                         Some((
                             check_inherit::CheckDef::new(
-                                check_inherit::StoredExpr::written(
-                                    &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
-                                ),
+                                check_inherit::StoredExpr::written(&c.raw_expr),
                                 c.is_no_inherit,
                             ),
                             c.is_enforced,
@@ -111,7 +111,7 @@ pub(crate) fn emit_constraints(
                     ));
                     specs.push(c);
                 }
-                Ok(ConstrType::ConstrForeign) => {
+                ConstrType::ConstrForeign => {
                     pending_fks.push((
                         (*c).clone(),
                         vec![cd.colname.clone()],
@@ -128,20 +128,20 @@ pub(crate) fn emit_constraints(
 
     // Table-level constraints.
     for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
-        let Some(node::Node::Constraint(c)) = elt.node.as_ref() else {
+        let Some(ast::Node::Constraint(c)) = elt.as_ref() else {
             continue;
         };
         let column_names: Vec<String> = c
             .keys
             .iter()
-            .filter_map(|k| match k.node.as_ref()? {
-                node::Node::String(s) => Some(s.sval.clone()),
+            .filter_map(|k| match k.as_ref()? {
+                ast::Node::String(s) => Some(s.sval.clone()),
                 _ => None,
             })
             .collect();
         let columns: Vec<i16> = column_names.iter().filter_map(|n| attnum_of(n)).collect();
-        match ConstrType::try_from(c.contype) {
-            Ok(ConstrType::ConstrPrimary) if !columns.is_empty() => {
+        match c.contype {
+            ConstrType::ConstrPrimary if !columns.is_empty() => {
                 check_key_column_list(interp, relid, c, &column_names)?;
                 to_emit.push((
                     ConName::from_explicit(
@@ -162,7 +162,7 @@ pub(crate) fn emit_constraints(
                 ));
                 specs.push(c);
             }
-            Ok(ConstrType::ConstrUnique) if !columns.is_empty() => {
+            ConstrType::ConstrUnique if !columns.is_empty() => {
                 check_key_column_list(interp, relid, c, &column_names)?;
                 to_emit.push((
                     ConName::from_explicit(
@@ -189,24 +189,22 @@ pub(crate) fn emit_constraints(
                 ));
                 specs.push(c);
             }
-            Ok(ConstrType::ConstrCheck) => {
+            ConstrType::ConstrCheck => {
                 to_emit.push((
                     ConName::from_explicit(
                         &c.conname,
                         ConName::Constraint {
-                            addition: check_name_addition(interp, relid, c.raw_expr.as_deref()),
+                            addition: check_name_addition(interp, relid, c.raw_expr.as_ref()),
                             label: "check",
                         },
                     ),
                     ConType::Check,
-                    check_conkey(interp, relid, c.raw_expr.as_deref()),
+                    check_conkey(interp, relid, c.raw_expr.as_ref()),
                     None,
                     Vec::new(),
                     Some((
                         check_inherit::CheckDef::new(
-                            check_inherit::StoredExpr::written(
-                                &c.raw_expr.clone().map(|b| *b).unwrap_or_default(),
-                            ),
+                            check_inherit::StoredExpr::written(&c.raw_expr),
                             c.is_no_inherit,
                         ),
                         c.is_enforced,
@@ -217,7 +215,7 @@ pub(crate) fn emit_constraints(
                 ));
                 specs.push(c);
             }
-            Ok(ConstrType::ConstrExclusion) => {
+            ConstrType::ConstrExclusion => {
                 let (keys, names) = exclusion_keys(interp, relid, c)?;
                 to_emit.push((
                     ConName::from_explicit(
@@ -240,14 +238,14 @@ pub(crate) fn emit_constraints(
                 ));
                 specs.push(c);
             }
-            Ok(ConstrType::ConstrForeign) => {
+            ConstrType::ConstrForeign => {
                 // Table-level FK uses `fk_attrs` for the local columns;
                 // `keys` only carries column lists on PK / UNIQUE.
                 let fk_names: Vec<String> = c
                     .fk_attrs
                     .iter()
-                    .filter_map(|k| match k.node.as_ref()? {
-                        node::Node::String(s) => Some(s.sval.clone()),
+                    .filter_map(|k| match k.as_ref()? {
+                        ast::Node::String(s) => Some(s.sval.clone()),
                         _ => None,
                     })
                     .collect();
@@ -264,7 +262,7 @@ pub(crate) fn emit_constraints(
     // transformIndexConstraints drops a PRIMARY KEY / UNIQUE spec that
     // repeats an earlier one's key (an unnamed duplicate; a PRIMARY KEY wins
     // over a UNIQUE).
-    let mut kept: Vec<(PendingConstraint, &typedpg_pg_query::protobuf::Constraint)> = Vec::new();
+    let mut kept: Vec<(PendingConstraint, &typedpg_pg_query::ast::Constraint)> = Vec::new();
     for (pending, spec) in to_emit.into_iter().zip(specs) {
         let index_backed = |t: ConType| matches!(t, ConType::PrimaryKey | ConType::Unique);
         let dup = kept.iter().position(|(k, _)| {
@@ -347,7 +345,7 @@ pub(crate) fn emit_constraints(
 
 /// A FOREIGN KEY of a CREATE TABLE: `(constraint, local columns, default
 /// name)`.
-pub(crate) type PendingFk = (typedpg_pg_query::protobuf::Constraint, Vec<String>, ConName);
+pub(crate) type PendingFk = (typedpg_pg_query::ast::Constraint, Vec<String>, ConName);
 
 /// Add a CREATE TABLE's FOREIGN KEYs. They come last, after this table's
 /// own PRIMARY KEY / UNIQUE constraints and its LIKE clauses' indexes, so
@@ -380,10 +378,10 @@ pub(crate) fn add_pending_foreign_keys(
 fn check_key_column_list(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
     names: &[String],
 ) -> Result<(), DdlError> {
-    let what = if c.contype == ConstrType::ConstrPrimary as i32 {
+    let what = if c.contype == ConstrType::ConstrPrimary {
         "primary key constraint"
     } else {
         "unique constraint"
@@ -454,7 +452,7 @@ fn check_without_overlaps_index(
 fn include_attnums(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
 ) -> Result<(Vec<i16>, Vec<String>), DdlError> {
     let mut attnums = Vec::new();
     let mut names = Vec::new();
@@ -478,19 +476,19 @@ fn include_attnums(
 /// ENFORCED constraint is also NOT VALID. Deferrability only suits a key or
 /// foreign-key constraint, enforceability a CHECK or foreign key.
 pub(super) fn fold_constraint_attrs(
-    constraints: &[typedpg_pg_query::protobuf::Node],
-) -> Result<Vec<typedpg_pg_query::protobuf::Constraint>, DdlError> {
+    constraints: &[Option<typedpg_pg_query::ast::Node>],
+) -> Result<Vec<typedpg_pg_query::ast::Constraint>, DdlError> {
     use ConstrType as C;
-    let mut out: Vec<typedpg_pg_query::protobuf::Constraint> = Vec::new();
+    let mut out: Vec<typedpg_pg_query::ast::Constraint> = Vec::new();
     let mut saw_deferrability = false;
     let mut saw_initially = false;
     let mut saw_enforced = false;
     let syntax = |msg: &str| DdlError::Parse(msg.to_owned());
     for n in constraints {
-        let Some(node::Node::Constraint(c)) = n.node.as_ref() else {
+        let Some(ast::Node::Constraint(c)) = n.as_ref() else {
             continue;
         };
-        let attr = ConstrType::try_from(c.contype).unwrap_or(C::Undefined);
+        let attr = c.contype;
         let is_attr = matches!(
             attr,
             C::ConstrAttrDeferrable
@@ -508,9 +506,7 @@ pub(super) fn fold_constraint_attrs(
             continue;
         }
         let last = out.last_mut();
-        let last_type = last
-            .as_ref()
-            .and_then(|l| ConstrType::try_from(l.contype).ok());
+        let last_type = last.as_ref().map(|l| l.contype);
         // SUPPORTS_ATTRS.
         let supports_deferrability = matches!(
             last_type,
@@ -618,7 +614,7 @@ pub(super) fn emit_constraint_with_backing_index(
     include: Vec<i16>,
     period: bool,
     index_only: bool,
-    spec: Option<&typedpg_pg_query::protobuf::Constraint>,
+    spec: Option<&typedpg_pg_query::ast::Constraint>,
 ) -> Result<PgConstraintOid, DdlError> {
     let index_backed = matches!(
         contype,
@@ -889,23 +885,22 @@ pub(crate) fn check_unique_covers_partition_key(
 fn exclusion_keys(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
 ) -> Result<(Vec<i16>, Vec<String>), DdlError> {
     let mut attnums = Vec::new();
     let mut names = Vec::new();
     for pair in &c.exclusions {
-        let Some(node::Node::List(l)) = pair.node.as_ref() else {
+        let Some(ast::Node::List(l)) = pair.as_ref() else {
             continue;
         };
-        let Some(node::Node::IndexElem(elem)) = l.items.first().and_then(|n| n.node.as_ref())
-        else {
+        let Some(ast::Node::IndexElem(elem)) = l.items.first().and_then(|n| n.as_ref()) else {
             continue;
         };
         if elem.name.is_empty() {
             attnums.push(0);
             // ChooseIndexColumnNames → FigureIndexColname.
             names.push(crate::ddl::indexes::figure_index_colname(
-                elem.expr.as_deref(),
+                elem.expr.as_ref(),
             ));
         } else {
             let attnum = interp
@@ -923,17 +918,17 @@ fn exclusion_keys(
     }
     // DefineIndex: nor may its expressions or predicate read a virtual
     // generated column.
-    let exprs: Vec<&typedpg_pg_query::protobuf::Node> = c
+    let exprs: Vec<&Option<typedpg_pg_query::ast::Node>> = c
         .exclusions
         .iter()
-        .filter_map(|pair| match pair.node.as_ref()? {
-            node::Node::List(l) => match l.items.first()?.node.as_ref()? {
-                node::Node::IndexElem(elem) => elem.expr.as_deref(),
+        .filter_map(|pair| match pair.as_ref()? {
+            ast::Node::List(l) => match l.items.first()?.as_ref()? {
+                ast::Node::IndexElem(elem) => elem.expr.is_some().then_some(&elem.expr),
                 _ => None,
             },
             _ => None,
         })
-        .chain(c.where_clause.as_deref())
+        .chain(c.where_clause.is_some().then_some(&c.where_clause))
         .collect();
     crate::ddl::indexes::check_index_columns(
         interp,
@@ -956,7 +951,7 @@ pub(crate) fn persistence(interp: &PgCatalog, relid: PgClassOid) -> char {
 pub(super) fn check_fk_persistence(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
 ) -> Result<(), DdlError> {
     // The referenced table (its errors are resolve_fk_target's to report).
     let Some(target) = c
@@ -988,7 +983,7 @@ pub(super) fn check_fk_persistence(
 pub(super) fn check_fk_generated_columns(
     interp: &PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
     fk_attnums: &[i16],
 ) -> Result<(), DdlError> {
     for &attnum in fk_attnums {
@@ -1070,7 +1065,7 @@ pub(crate) fn validate_constraint_expressions(
     // Column-level constraints — CHECK and GENERATED expressions live on
     // the ColumnDef's `constraints` list.
     for elt in &stmt.table_elts {
-        let Some(node::Node::ColumnDef(cd)) = elt.node.as_ref() else {
+        let Some(ast::Node::ColumnDef(cd)) = elt.as_ref() else {
             continue;
         };
         if let Some(expr) = super::columns::column_default_expr(cd)
@@ -1111,16 +1106,17 @@ pub(crate) fn validate_constraint_expressions(
                 interp,
                 class_oid,
                 attr.attnum,
-                stored,
+                stored.and_then(|e| e.as_ref()),
             );
         }
         for c_node in &cd.constraints {
-            let Some(node::Node::Constraint(c)) = c_node.node.as_ref() else {
+            let Some(ast::Node::Constraint(c)) = c_node.as_ref() else {
                 continue;
             };
-            match ConstrType::try_from(c.contype) {
-                Ok(ConstrType::ConstrCheck) => {
-                    if let Some(expr) = c.raw_expr.as_deref() {
+            match c.contype {
+                ConstrType::ConstrCheck => {
+                    if c.raw_expr.is_some() {
+                        let expr = &c.raw_expr;
                         crate::ddl::expr_kind::check_expr_kind(
                             interp,
                             expr,
@@ -1166,8 +1162,8 @@ pub(crate) fn validate_constraint_expressions(
                         }
                     }
                 }
-                Ok(ConstrType::ConstrGenerated) => {
-                    if let Some(expr) = c.raw_expr.as_deref()
+                ConstrType::ConstrGenerated => {
+                    if c.raw_expr.is_some()
                         && let Some(attr) = table_attrs.iter().find(|a| a.attname == cd.colname)
                     {
                         let cooked = super::generated::cook_generation_expr(
@@ -1177,7 +1173,7 @@ pub(crate) fn validate_constraint_expressions(
                             attr.atttypid,
                             attr.attgenerated
                                 .unwrap_or(crate::pg_catalog::AttGenerated::Stored),
-                            expr,
+                            &c.raw_expr,
                         )?;
                         cooked.record(interp, class_oid, attr.attnum);
                     }
@@ -1190,10 +1186,11 @@ pub(crate) fn validate_constraint_expressions(
     // Table-level CHECK constraints — both `stmt.constraints` and
     // ColumnDef-shaped `Constraint` nodes inside `stmt.table_elts`.
     for elt in stmt.constraints.iter().chain(stmt.table_elts.iter()) {
-        if let Some(node::Node::Constraint(c)) = elt.node.as_ref()
-            && c.contype == ConstrType::ConstrCheck as i32
-            && let Some(expr) = c.raw_expr.as_deref()
+        if let Some(ast::Node::Constraint(c)) = elt.as_ref()
+            && c.contype == ConstrType::ConstrCheck
+            && c.raw_expr.is_some()
         {
+            let expr = &c.raw_expr;
             crate::ddl::expr_kind::check_expr_kind(
                 interp,
                 expr,
@@ -1310,10 +1307,7 @@ pub(crate) fn drop_constraint(
         .pg_constraint
         .get(&oid)
         .is_some_and(|c| matches!(c.contype, ConType::PrimaryKey | ConType::Unique));
-    let cascade = matches!(
-        DropBehavior::try_from(cmd.behavior),
-        Ok(DropBehavior::DropCascade)
-    );
+    let cascade = matches!(cmd.behavior, DropBehavior::DropCascade);
     if is_pkey_or_unique && !cascade {
         let target_set: std::collections::BTreeSet<i16> = interp
             .pg_constraint
@@ -1461,10 +1455,10 @@ pub(crate) fn add_constraint(
     cmd: &AlterTableCmd,
     rec: super::inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let Some(def) = cmd.def.as_deref() else {
+    let Some(def) = cmd.def.as_ref() else {
         return Ok(());
     };
-    let Some(node::Node::Constraint(c)) = def.node.as_ref() else {
+    let ast::Node::Constraint(c) = def else {
         return Ok(());
     };
     if interp.pg_class.get(&relid).map(|cls| cls.relkind) == Some(RelKind::ForeignTable) {
@@ -1479,13 +1473,13 @@ pub(crate) fn add_constraint(
 /// has no index, so no primary key, unique or exclusion constraint, and no
 /// foreign key either.
 pub(crate) fn check_foreign_table_constraint(
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
 ) -> Result<(), DdlError> {
-    let what = match ConstrType::try_from(c.contype) {
-        Ok(ConstrType::ConstrPrimary) => "primary key",
-        Ok(ConstrType::ConstrUnique) => "unique",
-        Ok(ConstrType::ConstrExclusion) => "exclusion",
-        Ok(ConstrType::ConstrForeign) => "foreign key",
+    let what = match c.contype {
+        ConstrType::ConstrPrimary => "primary key",
+        ConstrType::ConstrUnique => "unique",
+        ConstrType::ConstrExclusion => "exclusion",
+        ConstrType::ConstrForeign => "foreign key",
         _ => return Ok(()),
     };
     Err(DdlError::UnsupportedDdl(format!(
@@ -1502,24 +1496,24 @@ pub(crate) fn check_foreign_table_constraint(
 pub(crate) fn add_column_constraints(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    cd: &typedpg_pg_query::protobuf::ColumnDef,
+    cd: &typedpg_pg_query::ast::ColumnDef,
     recurse: bool,
 ) -> Result<(), DdlError> {
-    let colname_node = typedpg_pg_query::protobuf::Node {
-        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
+    let colname_node = Some(typedpg_pg_query::ast::Node::String(NodeBox::new(
+        typedpg_pg_query::ast::String {
             sval: cd.colname.clone(),
-        })),
-    };
+        },
+    )));
     let only_here = super::inherit::Recursion {
         recurse: false,
         recursing: false,
     };
     for mut c in fold_constraint_attrs(&cd.constraints)? {
-        match ConstrType::try_from(c.contype) {
-            Ok(ConstrType::ConstrPrimary | ConstrType::ConstrUnique) => {
+        match c.contype {
+            ConstrType::ConstrPrimary | ConstrType::ConstrUnique => {
                 c.keys = vec![colname_node.clone()];
             }
-            Ok(ConstrType::ConstrForeign) => {
+            ConstrType::ConstrForeign => {
                 c.fk_attrs = vec![colname_node.clone()];
                 let rec = super::inherit::Recursion {
                     recurse,
@@ -1528,7 +1522,7 @@ pub(crate) fn add_column_constraints(
                 add_constraint_node(interp, relid, &c, &cd.colname, rec, false)?;
                 continue;
             }
-            Ok(ConstrType::ConstrCheck) => {
+            ConstrType::ConstrCheck => {
                 // The column reaches the children, and so does its CHECK.
                 let rec = super::inherit::Recursion {
                     recurse: true,
@@ -1548,7 +1542,7 @@ pub(crate) fn add_column_constraints(
 fn add_constraint_node(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
     cmd_name: &str,
     rec: super::inherit::Recursion,
     index_only: bool,
@@ -1560,7 +1554,7 @@ fn add_constraint_node(
     }
     let (include, include_names) = include_attnums(interp, relid, c)?;
 
-    if c.contype == ConstrType::ConstrExclusion as i32 {
+    if c.contype == ConstrType::ConstrExclusion {
         let (keys, names) = exclusion_keys(interp, relid, c)?;
         let conname = ConName::from_explicit(
             &c.conname,
@@ -1588,12 +1582,12 @@ fn add_constraint_node(
         )?;
     }
 
-    if c.contype == ConstrType::ConstrPrimary as i32 {
+    if c.contype == ConstrType::ConstrPrimary {
         let pk_cols: Vec<String> = c
             .keys
             .iter()
             .filter_map(|k| {
-                if let Some(node::Node::String(s)) = k.node.as_ref() {
+                if let Some(ast::Node::String(s)) = k.as_ref() {
                     Some(s.sval.clone())
                 } else {
                     None
@@ -1642,12 +1636,12 @@ fn add_constraint_node(
         }
     }
 
-    if c.contype == ConstrType::ConstrUnique as i32 {
+    if c.contype == ConstrType::ConstrUnique {
         let cols: Vec<String> = c
             .keys
             .iter()
-            .filter_map(|k| match k.node.as_ref()? {
-                node::Node::String(s) => Some(s.sval.clone()),
+            .filter_map(|k| match k.as_ref()? {
+                ast::Node::String(s) => Some(s.sval.clone()),
                 _ => None,
             })
             .collect();
@@ -1698,12 +1692,12 @@ fn add_constraint_node(
         }
     }
 
-    if c.contype == ConstrType::ConstrNotnull as i32 {
+    if c.contype == ConstrType::ConstrNotnull {
         let col_name = c
             .keys
             .first()
             .and_then(|k| {
-                if let Some(node::Node::String(s)) = k.node.as_ref() {
+                if let Some(ast::Node::String(s)) = k.as_ref() {
                     Some(s.sval.clone())
                 } else {
                     None
@@ -1726,9 +1720,8 @@ fn add_constraint_node(
         super::inherit::add_not_null(interp, relid, &col_name, spec, rec)?;
     }
 
-    if c.contype == ConstrType::ConstrCheck as i32
-        && let Some(expr) = c.raw_expr.as_deref()
-    {
+    if c.contype == ConstrType::ConstrCheck && c.raw_expr.is_some() {
+        let expr = &c.raw_expr;
         // No volatility walk for CHECK — PG accepts volatile expressions at
         // DDL time, only the type-must-be-bool check below has teeth.
         validate_check_expression_for_table(interp, relid, expr)?;
@@ -1748,7 +1741,7 @@ fn add_constraint_node(
         let conname = ConName::from_explicit(
             &c.conname,
             ConName::Constraint {
-                addition: check_name_addition(interp, relid, Some(expr)),
+                addition: check_name_addition(interp, relid, expr.as_ref()),
                 label: "check",
             },
         )
@@ -1760,7 +1753,7 @@ fn add_constraint_node(
             expr,
             c.is_no_inherit,
             rec,
-            check_conkey(interp, relid, Some(expr)),
+            check_conkey(interp, relid, expr.as_ref()),
             super::check_inherit::CheckFlags {
                 enforced: c.is_enforced,
                 valid: c.initially_valid,
@@ -1768,14 +1761,14 @@ fn add_constraint_node(
         )?;
     }
 
-    if c.contype == ConstrType::ConstrForeign as i32 {
+    if c.contype == ConstrType::ConstrForeign {
         // FK column list lives in `fk_attrs`, not `keys` (which is empty
         // for FK constraints — `keys` is only used by PK/UNIQUE).
         let column_names: Vec<String> = c
             .fk_attrs
             .iter()
-            .filter_map(|k| match k.node.as_ref()? {
-                node::Node::String(s) => Some(s.sval.clone()),
+            .filter_map(|k| match k.as_ref()? {
+                ast::Node::String(s) => Some(s.sval.clone()),
                 _ => None,
             })
             .collect();
@@ -1805,7 +1798,7 @@ fn add_constraint_node(
 fn add_index_constraint(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    c: &typedpg_pg_query::protobuf::Constraint,
+    c: &typedpg_pg_query::ast::Constraint,
 ) -> Result<(), DdlError> {
     let nsoid = interp
         .pg_class
@@ -1927,7 +1920,7 @@ fn add_index_constraint(
                 .into(),
         ));
     }
-    let is_primary = c.contype == ConstrType::ConstrPrimary as i32;
+    let is_primary = c.contype == ConstrType::ConstrPrimary;
     if is_primary {
         // index_check_primary_key.
         check_no_primary_key(interp, relid)?;
@@ -2030,9 +2023,9 @@ fn add_index_constraint(
 fn check_system_column_refs(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
-    let Some(inner) = expr.node.as_ref() else {
+    let Some(inner) = expr.as_ref() else {
         return Ok(());
     };
     // A column by name, or selected from the whole row (`(t).ctid`).
@@ -2072,7 +2065,7 @@ fn check_system_column_refs(
 fn validate_check_expression_for_table(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;

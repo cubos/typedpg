@@ -596,7 +596,7 @@ fn create_or_replace_view_replaces_pg_rewrite_body() {
     // The rebuilt body must end up referencing both attnums (1 = id,
     // 2 = slug). Cheapest cross-check: attribute count.
     assert_eq!(snap.attributes_of(view.oid).len(), 2);
-    assert!(body.ast.node.is_some());
+    assert!(body.ast.is_some());
 }
 
 #[test]

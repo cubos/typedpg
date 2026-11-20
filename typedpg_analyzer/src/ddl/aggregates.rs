@@ -8,7 +8,7 @@
 //! function calls and must take their arguments without run-time
 //! coercion.
 
-use typedpg_pg_query::protobuf::{DefElem, DefineStmt, ObjectType, TypeName, node};
+use typedpg_pg_query::ast::{self, DefElem, DefineStmt, ObjectType, TypeName};
 
 use crate::oid::{PgProcOid, PgTypeOid};
 use crate::pg_catalog::{AggKind, DepType, PgAggregate, PgProc, ProKind, ProVolatile, TypType};
@@ -50,32 +50,30 @@ struct AggregateOptions<'a> {
 
 /// `defGetQualifiedName`.
 fn def_qualified_name(de: &DefElem) -> Vec<String> {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::TypeName(tn)) => tn
+    match de.arg.as_ref() {
+        Some(ast::Node::TypeName(tn)) => tn
             .names
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::List(l)) => l
+        Some(ast::Node::List(l)) => l
             .items
             .iter()
             .filter_map(node_string)
             .map(str::to_owned)
             .collect(),
-        Some(node::Node::String(s)) => vec![s.sval.clone()],
+        Some(ast::Node::String(s)) => vec![s.sval.clone()],
         _ => Vec::new(),
     }
 }
 
 /// `defGetTypeName`.
 fn def_type_name(de: &DefElem) -> Option<TypeName> {
-    match de.arg.as_deref()?.node.as_ref()? {
-        node::Node::TypeName(tn) => Some(tn.clone()),
-        node::Node::String(s) => Some(TypeName {
-            names: vec![typedpg_pg_query::protobuf::Node {
-                node: Some(node::Node::String(s.clone())),
-            }],
+    match de.arg.as_ref()? {
+        ast::Node::TypeName(tn) => Some((**tn).clone()),
+        ast::Node::String(s) => Some(TypeName {
+            names: vec![Some(typedpg_pg_query::ast::Node::String(s.clone()))],
             typemod: -1,
             ..Default::default()
         }),
@@ -85,13 +83,13 @@ fn def_type_name(de: &DefElem) -> Option<TypeName> {
 
 /// `defGetString`.
 fn def_string(de: &DefElem) -> Option<String> {
-    match de.arg.as_deref()?.node.as_ref()? {
-        node::Node::String(s) => Some(s.sval.clone()),
-        node::Node::Integer(i) => Some(i.ival.to_string()),
-        node::Node::Float(f) => Some(f.fval.clone()),
-        node::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
-        node::Node::TypeName(tn) => Some(type_name_to_string(tn)),
-        node::Node::List(l) => Some(
+    match de.arg.as_ref()? {
+        ast::Node::String(s) => Some(s.sval.clone()),
+        ast::Node::Integer(i) => Some(i.ival.to_string()),
+        ast::Node::Float(f) => Some(f.fval.clone()),
+        ast::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
+        ast::Node::TypeName(tn) => Some(type_name_to_string(tn)),
+        ast::Node::List(l) => Some(
             l.items
                 .iter()
                 .filter_map(node_string)
@@ -104,11 +102,11 @@ fn def_string(de: &DefElem) -> Option<String> {
 
 /// `defGetBoolean`: no value means true.
 fn def_bool(de: &DefElem) -> bool {
-    match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
+    match de.arg.as_ref() {
         None => true,
-        Some(node::Node::Boolean(b)) => b.boolval,
-        Some(node::Node::Integer(i)) => i.ival != 0,
-        Some(node::Node::String(s)) => super::reloptions::parse_bool(&s.sval).unwrap_or(false),
+        Some(ast::Node::Boolean(b)) => b.boolval,
+        Some(ast::Node::Integer(i)) => i.ival != 0,
+        Some(ast::Node::String(s)) => super::reloptions::parse_bool(&s.sval).unwrap_or(false),
         _ => false,
     }
 }
@@ -132,12 +130,12 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     // one (`agg(direct ORDER BY aggregated)`).
     let mut kind = AggKind::Normal;
     let mut num_direct_args: usize = 0;
-    let mut args: &[typedpg_pg_query::protobuf::Node] = &[];
+    let mut args: &[Option<typedpg_pg_query::ast::Node>] = &[];
     if !stmt.oldstyle {
-        if let Some(node::Node::List(list)) = stmt.args.first().and_then(|n| n.node.as_ref()) {
+        if let Some(ast::Node::List(list)) = stmt.args.first().and_then(|n| n.as_ref()) {
             args = &list.items;
         }
-        if let Some(node::Node::Integer(i)) = stmt.args.get(1).and_then(|n| n.node.as_ref())
+        if let Some(ast::Node::Integer(i)) = stmt.args.get(1).and_then(|n| n.as_ref())
             && i.ival >= 0
         {
             kind = AggKind::OrderedSet;
@@ -147,7 +145,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
 
     let mut opts = AggregateOptions::default();
     for opt in &stmt.definition {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         match de.defname.as_str() {

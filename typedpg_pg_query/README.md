@@ -8,9 +8,13 @@ by [`import/`](import).
 The crate exposes:
 
 - `parse`, `parse_type_name` and `scan`;
-- `protobuf`, the AST types (the name is historical: they are plain Rust
-  records), generated from PostgreSQL's headers by
-  `typedpg_pg_query_codegen`;
+- `ast`, the AST types, generated from PostgreSQL's headers by
+  `typedpg_pg_query_codegen`: a struct per node type, `ast::Node`, the enum
+  over all of them (each kind in a `NodeBox`, whose drop grows the stack so
+  the deepest trees drop on any thread), and PostgreSQL's enums with their
+  own values. A nullable `Node *` is an `Option<Node>`, and a `List` is a
+  `Vec<Option<Node>>`, since PostgreSQL's lists can hold NULL cells
+  (`SELECT DISTINCT`'s `list_make1(NIL)`, `DROP OPERATOR`'s `NONE`);
 - `NodeRef` / `NodeMut`, a view of a node by kind, and `nodes()` /
   `nodes_mut()`, every node of a tree (breadth-first, with its depth);
 - `Equal`, PostgreSQL's `equal()` over the AST: every field compared except

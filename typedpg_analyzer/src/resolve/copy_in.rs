@@ -2,7 +2,7 @@
 //! the catalog as PG's `CopyGetAttnums` / `CopyFrom` do, with the type and
 //! nullability each column's values must have.
 
-use typedpg_pg_query::protobuf::node;
+use typedpg_pg_query::ast;
 
 use super::AnalyzedColumn;
 use crate::error::AnalyzeError;
@@ -84,13 +84,12 @@ impl PgCatalog {
             .map_err(|e| copy_target_syntax_error(e, target, PREFIX.len()))?;
         // Exactly the one statement, with nothing but a relation and a
         // column list: the target can't smuggle in options or more SQL.
-        let [raw] = parsed.protobuf.stmts.as_slice() else {
+        let [raw] = parsed.tree.stmts.as_slice() else {
             return Err(invalid(format!(
                 "copy_in! target must be a table and an optional column list, got `{target}`"
             )));
         };
-        let Some(node::Node::CopyStmt(stmt)) = raw.stmt.as_ref().and_then(|n| n.node.as_ref())
-        else {
+        let Some(ast::Node::CopyStmt(stmt)) = raw.stmt.as_ref() else {
             return Err(invalid(format!("`COPY {target}` is not a COPY statement")));
         };
         if stmt.relation.is_none()

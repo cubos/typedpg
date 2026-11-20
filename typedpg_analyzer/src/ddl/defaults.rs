@@ -5,7 +5,7 @@
 //! subqueries, aggregates and window functions, and must then be coercible
 //! to the column's type under assignment rules.
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::ast;
 
 use super::DdlError;
 use crate::coerce::{CoercionContext, can_coerce};
@@ -22,7 +22,7 @@ use crate::scope::Scope;
 /// column type for an untyped literal).
 pub(crate) fn check_default(
     interp: &PgCatalog,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     name: &str,
     type_oid: PgTypeOid,
 ) -> Result<PgTypeOid, DdlError> {
@@ -70,7 +70,7 @@ pub(crate) fn check_default(
 /// default's type.
 pub(crate) fn check_function_default(
     interp: &PgCatalog,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     param_type: PgTypeOid,
     polymorphic: bool,
     used: &std::cell::RefCell<Vec<crate::oid::PgProcOid>>,
@@ -122,7 +122,7 @@ pub(crate) fn record_to_complex(interp: &PgCatalog, source: PgTypeOid, target: P
 /// the column gets no default, so ADD COLUMN rewrites nothing.
 pub(crate) fn is_null_default(
     interp: &PgCatalog,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     type_oid: PgTypeOid,
     typmod: Option<i32>,
 ) -> bool {
@@ -131,19 +131,15 @@ pub(crate) fn is_null_default(
 
 /// The `(type, typmod)` of the null `Const` that `expr` transforms to:
 /// `NULL`, or `NULL` under casts that each stay a constant.
-fn null_const(interp: &PgCatalog, expr: &protobuf::Node) -> Option<(PgTypeOid, i32)> {
-    match expr.node.as_ref()? {
-        node::Node::AConst(c) if c.isnull => Some((oid::UNKNOWN, -1)),
-        node::Node::TypeCast(tc) => {
+fn null_const(interp: &PgCatalog, expr: &Option<ast::Node>) -> Option<(PgTypeOid, i32)> {
+    match expr.as_ref()? {
+        ast::Node::AConst(c) if c.isnull => Some((oid::UNKNOWN, -1)),
+        ast::Node::TypeCast(tc) => {
             let tn = tc.type_name.as_ref()?;
             let target = super::util::resolve_type_name(tn, interp)?;
             let typmod = crate::typmod::encode(interp, target, tn).ok()?;
-            null_const_coerced(
-                interp,
-                null_const(interp, tc.arg.as_deref()?),
-                target,
-                typmod,
-            )
+            tc.arg.as_ref()?;
+            null_const_coerced(interp, null_const(interp, &tc.arg), target, typmod)
         }
         _ => None,
     }
@@ -191,7 +187,7 @@ fn null_const_coerced(
 /// `check_srf_call_placement`).
 fn check_default_kind(
     interp: &PgCatalog,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     column_default: bool,
 ) -> Result<(), DdlError> {
     check_default_kind_node(interp, expr, column_default)?;
@@ -201,28 +197,28 @@ fn check_default_kind(
 
 fn check_default_kind_node(
     interp: &PgCatalog,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     column_default: bool,
 ) -> Result<(), DdlError> {
     let check_default_kind =
-        |e: &protobuf::Node| check_default_kind_node(interp, e, column_default);
-    let Some(inner) = expr.node.as_ref() else {
+        |e: &Option<ast::Node>| check_default_kind_node(interp, e, column_default);
+    let Some(inner) = expr.as_ref() else {
         return Ok(());
     };
     match inner {
         // A parameter default has no columns in scope at all: the
         // reference is simply `column "x" does not exist`.
-        node::Node::ColumnRef(_) if column_default => {
+        ast::Node::ColumnRef(_) if column_default => {
             return Err(DdlError::UnsupportedDdl(
                 "cannot use column reference in DEFAULT expression".into(),
             ));
         }
-        node::Node::SubLink(_) => {
+        ast::Node::SubLink(_) => {
             return Err(DdlError::UnsupportedDdl(
                 "cannot use subquery in DEFAULT expression".into(),
             ));
         }
-        node::Node::FuncCall(fc) => {
+        ast::Node::FuncCall(fc) => {
             if fc.over.is_some() {
                 return Err(DdlError::UnsupportedDdl(
                     "window functions are not allowed in DEFAULT expressions".into(),
@@ -253,47 +249,42 @@ fn check_default_kind_node(
                 check_default_kind(arg)?;
             }
         }
-        node::Node::AExpr(e) => {
-            for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
-                .into_iter()
-                .flatten()
-            {
+        ast::Node::AExpr(e) => {
+            for side in [&e.lexpr, &e.rexpr] {
                 check_default_kind(side)?;
             }
         }
-        node::Node::BoolExpr(b) => {
+        ast::Node::BoolExpr(b) => {
             for arg in &b.args {
                 check_default_kind(arg)?;
             }
         }
-        node::Node::TypeCast(tc) => {
-            if let Some(arg) = tc.arg.as_deref() {
-                check_default_kind(arg)?;
-            }
+        ast::Node::TypeCast(tc) => {
+            check_default_kind(&tc.arg)?;
         }
-        node::Node::CoalesceExpr(c) => {
+        ast::Node::CoalesceExpr(c) => {
             for arg in &c.args {
                 check_default_kind(arg)?;
             }
         }
-        node::Node::CaseExpr(c) => {
-            for part in c.arg.iter().chain(c.defresult.iter()) {
+        ast::Node::CaseExpr(c) => {
+            for part in [&c.arg, &c.defresult] {
                 check_default_kind(part)?;
             }
             for when in &c.args {
-                if let Some(node::Node::CaseWhen(w)) = when.node.as_ref() {
-                    for part in w.expr.iter().chain(w.result.iter()) {
+                if let Some(ast::Node::CaseWhen(w)) = when.as_ref() {
+                    for part in [&w.expr, &w.result] {
                         check_default_kind(part)?;
                     }
                 }
             }
         }
-        node::Node::ArrayExpr(a) => {
+        ast::Node::ArrayExpr(a) => {
             for elem in &a.elements {
                 check_default_kind(elem)?;
             }
         }
-        node::Node::RowExpr(r) => {
+        ast::Node::RowExpr(r) => {
             for arg in &r.args {
                 check_default_kind(arg)?;
             }
@@ -311,9 +302,12 @@ pub(crate) fn record_default_dependencies(
     interp: &mut PgCatalog,
     relid: crate::oid::PgClassOid,
     attnum: i16,
-    expr: Option<&protobuf::Node>,
+    expr: Option<&ast::Node>,
 ) {
     forget_default_dependencies(interp, relid, attnum);
+    // The walks below take a nullable node.
+    let expr = expr.map(|e| Some(e.clone()));
+    let expr = expr.as_ref();
     let mut sequences = Vec::new();
     if let Some(expr) = expr {
         collect_sequence_refs(interp, expr, &mut sequences);
@@ -377,14 +371,14 @@ pub(crate) fn forget_default_dependencies(
 
 fn collect_sequence_refs(
     interp: &PgCatalog,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     out: &mut Vec<crate::oid::PgClassOid>,
 ) {
-    let Some(inner) = expr.node.as_ref() else {
+    let Some(inner) = expr.as_ref() else {
         return;
     };
     match inner {
-        node::Node::FuncCall(fc) => {
+        ast::Node::FuncCall(fc) => {
             let name: Vec<&str> = fc
                 .funcname
                 .iter()
@@ -406,20 +400,15 @@ fn collect_sequence_refs(
                 collect_sequence_refs(interp, arg, out);
             }
         }
-        node::Node::TypeCast(tc) => {
-            if let Some(arg) = tc.arg.as_deref() {
-                collect_sequence_refs(interp, arg, out);
-            }
+        ast::Node::TypeCast(tc) => {
+            collect_sequence_refs(interp, &tc.arg, out);
         }
-        node::Node::AExpr(e) => {
-            for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
-                .into_iter()
-                .flatten()
-            {
+        ast::Node::AExpr(e) => {
+            for side in [&e.lexpr, &e.rexpr] {
                 collect_sequence_refs(interp, side, out);
             }
         }
-        node::Node::CoalesceExpr(c) => {
+        ast::Node::CoalesceExpr(c) => {
             for arg in &c.args {
                 collect_sequence_refs(interp, arg, out);
             }
@@ -432,13 +421,13 @@ fn collect_sequence_refs(
 /// only argument find_expr_references_walker records a relation for. A
 /// literal cast to another type first (`'name'::text`) reaches the
 /// function through a run-time cast, which names no relation.
-fn regclass_literal(node: &protobuf::Node) -> Option<&str> {
-    match node.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            typedpg_pg_query::protobuf::a_const::Val::Sval(s) => Some(s.sval.as_str()),
+fn regclass_literal(node: &Option<ast::Node>) -> Option<&str> {
+    match node.as_ref()? {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            typedpg_pg_query::ast::AConstValue::String(s) => Some(s.sval.as_str()),
             _ => None,
         },
-        node::Node::TypeCast(tc) => {
+        ast::Node::TypeCast(tc) => {
             let type_name = tc.type_name.as_ref()?;
             if !type_name.array_bounds.is_empty() {
                 return None;
@@ -449,7 +438,7 @@ fn regclass_literal(node: &protobuf::Node) -> Option<&str> {
                 .filter_map(super::util::node_string)
                 .collect();
             match names.as_slice() {
-                ["regclass"] | ["pg_catalog", "regclass"] => regclass_literal(tc.arg.as_deref()?),
+                ["regclass"] | ["pg_catalog", "regclass"] => regclass_literal(&tc.arg),
                 _ => None,
             }
         }

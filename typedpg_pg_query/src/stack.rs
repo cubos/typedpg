@@ -2,7 +2,7 @@
 //!
 //! Converting a C parse tree recurses once per level of it, and PostgreSQL's
 //! trees go up to 10,000 levels (the converter's limit, as libpg_query's
-//! protobuf encoder was): `SELECT 1 + 1 + …` with 4,995 terms. A thread's
+//! was): `SELECT 1 + 1 + …` with 4,995 terms. A thread's
 //! stack (2 MB for a spawned one, 8 MB for the main thread) holds far fewer.
 //! So every call into the parser runs with at least [`RED_ZONE`] of stack, on
 //! a segment `stacker` grows when there is less, and PostgreSQL measures its

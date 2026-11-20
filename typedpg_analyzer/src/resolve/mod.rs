@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use typedpg_pg_query::protobuf::{self, CmdType, JoinType, SetOperation, node};
+use typedpg_pg_query::ast::{self, CmdType, JoinType, SetOperation};
 
 use crate::error::AnalyzeError;
 use crate::expr::{self, Ctx, TypeGoal};
@@ -267,7 +267,7 @@ fn sample_sql_with(
 pub(crate) struct Sample<'a> {
     pub lex_output: &'a LexOutput,
     pub sample_lex: &'a LexOutput,
-    pub tree: &'a typedpg_pg_query::protobuf::ParseResult,
+    pub tree: &'a typedpg_pg_query::ast::ParseResult,
     pub nullability: &'a [Option<bool>],
 }
 
@@ -291,7 +291,7 @@ pub(crate) fn prove_array_forms(
         tree: sample,
         nullability,
     } = *sample;
-    use typedpg_pg_query::protobuf::{AExprKind, node::Node};
+    use typedpg_pg_query::ast::{AExprKind, Node};
     // Each spread's placeholder row in the sample, as (start, length).
     let rows: Vec<(usize, usize)> = sample_lex
         .rewrites
@@ -344,28 +344,25 @@ pub(crate) fn prove_array_forms(
             // The IN this list is the right side of.
             let k = i32::try_from(placeholders.start + 1).unwrap_or(i32::MAX);
             let Some(in_expr) = nodes.iter().find_map(|(n, _)| match n {
-                NodeRef::AExpr(e) if e.kind() == AExprKind::AexprIn => {
-                    match e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
-                        Some(Node::List(l))
-                            if matches!(
-                                l.items.as_slice(),
-                                [typedpg_pg_query::protobuf::Node { node: Some(Node::ParamRef(p)) }]
-                                    if p.number == k
-                            ) =>
-                        {
-                            Some(*e)
-                        }
-                        _ => None,
+                NodeRef::AExpr(e) if e.kind == AExprKind::AexprIn => match e.rexpr.as_ref() {
+                    Some(Node::List(l))
+                        if matches!(
+                            l.items.as_slice(),
+                            [Some(typedpg_pg_query::ast::Node::ParamRef(p))]
+                                if p.number == k
+                        ) =>
+                    {
+                        Some(*e)
                     }
-                }
+                    _ => None,
+                },
                 _ => None,
             }) else {
                 continue;
             };
             let open = in_expr
                 .lexpr
-                .as_deref()
-                .and_then(|l| l.node.as_ref())
+                .as_ref()
                 .and_then(|l| l.nodes().iter().filter_map(|(n, _)| n.location()).min());
             let (Some(open), Ok(keyword)) = (open, usize::try_from(in_expr.location)) else {
                 continue;
@@ -431,21 +428,21 @@ pub(crate) fn prove_array_forms(
 /// `IN $..ids` in the sample, but expands to a row, `IN (($1, $2))` — so
 /// the token before each must also be `IN`, or `VALUES` / `,` for rows.
 pub(crate) fn check_spread_positions(
-    sample: Option<&typedpg_pg_query::protobuf::ParseResult>,
+    sample: Option<&typedpg_pg_query::ast::ParseResult>,
     lex_output: &LexOutput,
     sample_lex: &LexOutput,
 ) -> Result<(), AnalyzeError> {
     use typedpg_pg_query::NodeRef;
-    use typedpg_pg_query::protobuf::{AExprKind, node::Node};
+    use typedpg_pg_query::ast::{AExprKind, Node};
     let Some(tree) = sample else {
         return Ok(());
     };
     let nodes = tree.nodes();
     // The placeholder numbers of a parenthesized list of bare `$k`s.
-    let numbers = |items: &[typedpg_pg_query::protobuf::Node]| -> Option<Vec<i32>> {
+    let numbers = |items: &[Option<typedpg_pg_query::ast::Node>]| -> Option<Vec<i32>> {
         items
             .iter()
-            .map(|i| match i.node.as_ref()? {
+            .map(|i| match i.as_ref()? {
                 Node::ParamRef(p) => Some(p.number),
                 _ => None,
             })
@@ -474,7 +471,7 @@ pub(crate) fn check_spread_positions(
                 (before.eq_ignore_ascii_case("values") || before == ",")
                     && nodes.iter().any(|(n, _)| match n {
                         NodeRef::SelectStmt(s) => {
-                            s.values_lists.iter().any(|row| match row.node.as_ref() {
+                            s.values_lists.iter().any(|row| match row.as_ref() {
                                 Some(Node::List(l)) => {
                                     numbers(&l.items).as_ref() == Some(&expected)
                                 }
@@ -487,8 +484,8 @@ pub(crate) fn check_spread_positions(
             None => {
                 before.eq_ignore_ascii_case("in")
                     && nodes.iter().any(|(n, _)| match n {
-                        NodeRef::AExpr(e) if e.kind() == AExprKind::AexprIn => {
-                            match e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
+                        NodeRef::AExpr(e) if e.kind == AExprKind::AexprIn => {
+                            match e.rexpr.as_ref() {
                                 Some(Node::List(l)) => {
                                     numbers(&l.items).as_ref() == Some(&expected)
                                 }
@@ -625,7 +622,7 @@ pub(crate) fn fuse(
 /// one). A spread is where its offset falls between two tokens; each must
 /// be in a list, which [`check_spread_positions`] made sure of.
 fn values_lists(sql: &str, spreads: &[AnalyzedSpread]) -> Result<Vec<ValuesList>, AnalyzeError> {
-    use typedpg_pg_query::protobuf::Token;
+    use typedpg_pg_query::ast::Token;
     if spreads.iter().all(|s| s.kind != SpreadKind::Rows) {
         return Ok(Vec::new());
     }
@@ -636,7 +633,7 @@ fn values_lists(sql: &str, spreads: &[AnalyzedSpread]) -> Result<Vec<ValuesList>
         .iter()
         .map(|t| {
             let at = |n: i32| usize::try_from(n).unwrap_or(0);
-            (at(t.start), at(t.end), t.token())
+            (at(t.start), at(t.end), t.token)
         })
         .collect();
     // The rows spread at `offset`, between the token ending at `from` and
@@ -758,11 +755,10 @@ pub(crate) fn analyze_static(
         typedpg_pg_query::parse(sql).map_err(|e| parse_failure(e, sql).finalize_implicit())?;
 
     let stmt = parsed
-        .protobuf
+        .tree
         .stmts
         .first()
         .and_then(|s| s.stmt.as_ref())
-        .and_then(|n| n.node.as_ref())
         .ok_or_else(|| AnalyzeError::Parse("empty statement".into()))?;
 
     let can_run_as_subquery = can_run_as_subquery(stmt);
@@ -804,7 +800,7 @@ pub(crate) fn analyze_static(
 /// apply only here.
 pub(crate) fn analyze_executed<R>(
     snapshot: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
     analyze: impl FnOnce() -> Result<R, AnalyzeError>,
 ) -> Result<R, AnalyzeError> {
     crate::grouping::clear_values_sort_calls();
@@ -834,29 +830,29 @@ pub(crate) fn analyze_executed<R>(
 /// CTE, `EXISTS`, `CASE WHEN false`), and the statement then runs fine;
 /// one read where its plan is started — a FROM subquery, a sublink, a CTE —
 /// is checked as it is analyzed ([`check_values_sort`]).
-fn values_sort_exec_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<AnalyzeError> {
-    fn select(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> Option<AnalyzeError> {
-        if sel.op != SetOperation::SetopNone as i32 {
+fn values_sort_exec_error(stmt: &ast::Node, snapshot: &PgCatalog) -> Option<AnalyzeError> {
+    fn select(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> Option<AnalyzeError> {
+        if sel.op != SetOperation::SetopNone {
             return [&sel.larg, &sel.rarg]
                 .into_iter()
                 .find_map(|arm| select(arm.as_deref()?, snapshot));
         }
         if sel.values_lists.is_empty() {
             return sel.target_list.iter().find_map(|t| {
-                let node::Node::ResTarget(rt) = t.node.as_ref()? else {
+                let ast::Node::ResTarget(rt) = t.as_ref()? else {
                     return None;
                 };
-                let node::Node::SubLink(sl) = rt.val.as_deref()?.node.as_ref()? else {
+                let ast::Node::SubLink(sl) = rt.val.as_ref()? else {
                     return None;
                 };
                 if !matches!(
-                    protobuf::SubLinkType::try_from(sl.sub_link_type),
-                    Ok(protobuf::SubLinkType::ExprSublink | protobuf::SubLinkType::ArraySublink)
+                    sl.sub_link_type,
+                    ast::SubLinkType::ExprSublink | ast::SubLinkType::ArraySublink
                 ) {
                     return None;
                 }
-                match sl.subselect.as_deref()?.node.as_ref()? {
-                    node::Node::SelectStmt(sub) => select(sub, snapshot),
+                match sl.subselect.as_ref()? {
+                    ast::Node::SelectStmt(sub) => select(sub, snapshot),
                     _ => None,
                 }
             });
@@ -864,14 +860,12 @@ fn values_sort_exec_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<Ana
         values_sort_error(sel, snapshot).map(|(e, _)| e)
     }
     match stmt {
-        node::Node::SelectStmt(sel) => select(sel, snapshot),
-        node::Node::InsertStmt(ins) => match ins.select_stmt.as_deref()?.node.as_ref()? {
-            node::Node::SelectStmt(sel) => select(sel, snapshot),
+        ast::Node::SelectStmt(sel) => select(sel, snapshot),
+        ast::Node::InsertStmt(ins) => match ins.select_stmt.as_ref()? {
+            ast::Node::SelectStmt(sel) => select(sel, snapshot),
             _ => None,
         },
-        node::Node::ExplainStmt(es) => {
-            values_sort_exec_error(es.query.as_deref()?.node.as_ref()?, snapshot)
-        }
+        ast::Node::ExplainStmt(es) => values_sort_exec_error(es.query.as_ref()?, snapshot),
         _ => None,
     }
 }
@@ -881,16 +875,16 @@ fn values_sort_exec_error(stmt: &node::Node, snapshot: &PgCatalog) -> Option<Ana
 /// own level the plan has no node for (see [`values_sort_exec_error`]),
 /// and the location of that call.
 pub(crate) fn values_sort_error(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Option<(AnalyzeError, Option<i32>)> {
-    if sel.op != SetOperation::SetopNone as i32 || sel.values_lists.is_empty() {
+    if sel.op != SetOperation::SetopNone || sel.values_lists.is_empty() {
         return None;
     }
     let mut location = None;
     for n in &sel.sort_clause {
         visit_same_level(n, &mut |e| {
-            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
                 && location.is_none()
                 && is_srf_call(fc, snapshot)
             {
@@ -929,7 +923,7 @@ pub(crate) fn values_sort_error(
 /// whose nodes the executor never starts (a SubPlan's, `subplan`, it
 /// starts all the same).
 pub(crate) fn check_values_sort(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     subplan: bool,
 ) -> Result<(), AnalyzeError> {
@@ -951,8 +945,8 @@ pub(crate) fn check_values_sort(
 /// CTEs nested deeper than the top-level `WITH` don't need to be inspected:
 /// PG already rejects `WITH (DML)` outside the top level, so any query that
 /// reaches the analyzer has its DML-CTEs (if any) attached to the root node.
-fn can_run_as_subquery(stmt: &node::Node) -> bool {
-    let node::Node::SelectStmt(sel) = stmt else {
+fn can_run_as_subquery(stmt: &ast::Node) -> bool {
+    let ast::Node::SelectStmt(sel) = stmt else {
         return false;
     };
     if has_top_level_into(sel) {
@@ -962,16 +956,16 @@ fn can_run_as_subquery(stmt: &node::Node) -> bool {
         return true;
     };
     !with.ctes.iter().any(|cte_node| {
-        let Some(node::Node::CommonTableExpr(cte)) = cte_node.node.as_ref() else {
+        let Some(ast::Node::CommonTableExpr(cte)) = cte_node.as_ref() else {
             return false;
         };
         matches!(
-            cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+            cte.ctequery.as_ref(),
             Some(
-                node::Node::InsertStmt(_)
-                    | node::Node::UpdateStmt(_)
-                    | node::Node::DeleteStmt(_)
-                    | node::Node::MergeStmt(_)
+                ast::Node::InsertStmt(_)
+                    | ast::Node::UpdateStmt(_)
+                    | ast::Node::DeleteStmt(_)
+                    | ast::Node::MergeStmt(_)
             )
         )
     })
@@ -983,7 +977,9 @@ fn can_run_as_subquery(stmt: &node::Node) -> bool {
 pub(crate) type RawParam = (i32, PgTypeOid, bool);
 
 /// The expressions of a `RETURNING` clause (none when there is no clause).
-pub(crate) fn returning_exprs(clause: &Option<protobuf::ReturningClause>) -> &[protobuf::Node] {
+pub(crate) fn returning_exprs(
+    clause: &Option<typedpg_pg_query::NodeBox<ast::ReturningClause>>,
+) -> &[Option<ast::Node>] {
     clause.as_ref().map_or(&[], |c| c.exprs.as_slice())
 }
 
@@ -994,7 +990,7 @@ pub(crate) fn returning_exprs(clause: &Option<protobuf::ReturningClause>) -> &[p
 /// stored AST to skip the deparse → reparse round-trip.
 pub(crate) fn analyze_raw_node(
     snapshot: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
     param_nullability: &[Option<bool>],
 ) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
     let mut params = ParamCollector::default();
@@ -1012,7 +1008,7 @@ pub(crate) fn analyze_raw_node(
 /// a SQL function body, whose parameters are the function's arguments.
 pub(crate) fn analyze_raw_node_with_param_types(
     snapshot: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
     param_types: &[crate::oid::PgTypeOid],
 ) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
     let mut params = ParamCollector::default();
@@ -1031,7 +1027,7 @@ pub(crate) fn analyze_raw_node_with_param_types(
 /// on, so this ends after at most one pass per param.
 fn analyze_raw_node_with(
     snapshot: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
     params: ParamCollector,
 ) -> Result<(Vec<RawColumn>, Vec<RawParam>), AnalyzeError> {
     // A statement analyzed within one that locks rows (a view it reads)
@@ -1052,9 +1048,9 @@ fn analyze_raw_node_with(
 }
 
 /// Whether `stmt` has a `FOR UPDATE` / `FOR SHARE` clause anywhere.
-pub(crate) fn locks_rows(stmt: &node::Node) -> bool {
+pub(crate) fn locks_rows(stmt: &ast::Node) -> bool {
     let locks = |n: typedpg_pg_query::NodeRef<'_>| matches!(n, typedpg_pg_query::NodeRef::SelectStmt(s) if !s.locking_clause.is_empty());
-    matches!(stmt, node::Node::SelectStmt(s) if !s.locking_clause.is_empty())
+    matches!(stmt, ast::Node::SelectStmt(s) if !s.locking_clause.is_empty())
         || stmt.nodes().into_iter().any(|(n, ..)| locks(n))
 }
 
@@ -1062,7 +1058,7 @@ pub(crate) fn locks_rows(stmt: &node::Node) -> bool {
 /// whose query does ([`crate::ddl::views::view_locks_rows`]). A name a
 /// CTE takes counts as the view it would name otherwise (only ever too
 /// cautious).
-fn statement_locks_rows(snapshot: &PgCatalog, stmt: &node::Node) -> bool {
+fn statement_locks_rows(snapshot: &PgCatalog, stmt: &ast::Node) -> bool {
     locks_rows(stmt)
         || stmt.nodes().into_iter().any(|(n, ..)| match n {
             typedpg_pg_query::NodeRef::RangeVar(rv) => {
@@ -1082,13 +1078,13 @@ fn statement_locks_rows(snapshot: &PgCatalog, stmt: &node::Node) -> bool {
 /// the leftmost member of a set operation) is CREATE TABLE AS over the
 /// query without it — `None` when there is no INTO. An INTO anywhere else
 /// is an error (see `analyze_select_here`).
-fn without_top_level_into(sel: &protobuf::SelectStmt) -> Option<protobuf::SelectStmt> {
+fn without_top_level_into(sel: &ast::SelectStmt) -> Option<ast::SelectStmt> {
     if !has_top_level_into(sel) {
         return None;
     }
     let mut stripped = sel.clone();
     let mut leftmost = &mut stripped;
-    while leftmost.op != SetOperation::SetopNone as i32 {
+    while leftmost.op != SetOperation::SetopNone {
         leftmost = leftmost.larg.as_deref_mut()?;
     }
     leftmost.into_clause = None;
@@ -1096,9 +1092,9 @@ fn without_top_level_into(sel: &protobuf::SelectStmt) -> Option<protobuf::Select
 }
 
 /// Whether the leftmost member of `sel` carries an INTO.
-fn has_top_level_into(sel: &protobuf::SelectStmt) -> bool {
+fn has_top_level_into(sel: &ast::SelectStmt) -> bool {
     let mut leftmost = sel;
-    while leftmost.op != SetOperation::SetopNone as i32 {
+    while leftmost.op != SetOperation::SetopNone {
         match leftmost.larg.as_deref() {
             Some(l) => leftmost = l,
             None => return false,
@@ -1114,17 +1110,17 @@ type RawAnalysis = (Vec<RawColumn>, Vec<RawParam>);
 /// as non-NULL that ended up nullable.
 fn analyze_raw_node_once(
     snapshot: &PgCatalog,
-    stmt: &node::Node,
+    stmt: &ast::Node,
     mut params: ParamCollector,
 ) -> Result<(RawAnalysis, Vec<i32>), AnalyzeError> {
     let select_into = match stmt {
-        node::Node::SelectStmt(sel) => without_top_level_into(sel),
+        ast::Node::SelectStmt(sel) => without_top_level_into(sel),
         _ => None,
     };
     let (raw_columns, raw_params) = match stmt {
         // `SELECT … INTO t` is CREATE TABLE AS (transformOptionalSelectInto
         // turns it into a CreateTableAsStmt): it returns no rows.
-        node::Node::SelectStmt(_) if select_into.is_some() => {
+        ast::Node::SelectStmt(_) if select_into.is_some() => {
             let sel = select_into.as_ref().expect("guarded by the match arm");
             let (_, p) = analyze_select(sel, snapshot, &mut params)?;
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
@@ -1134,7 +1130,7 @@ fn analyze_raw_node_once(
             }
             (Vec::new(), p)
         }
-        node::Node::SelectStmt(sel) => {
+        ast::Node::SelectStmt(sel) => {
             let r = analyze_select(sel, snapshot, &mut params)?;
             // The statement-level `resolveTargetListUnknowns`.
             expr::resolve_untyped_output_params(sel, snapshot, &mut params)?;
@@ -1144,21 +1140,20 @@ fn analyze_raw_node_once(
             }
             r
         }
-        node::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
-        node::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
-        node::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
-        node::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
-        node::Node::CallStmt(call) => analyze_call(call, snapshot, &mut params)?,
+        ast::Node::InsertStmt(ins) => analyze_insert(ins, snapshot, &mut params)?,
+        ast::Node::UpdateStmt(upd) => analyze_update(upd, snapshot, &mut params)?,
+        ast::Node::DeleteStmt(del) => analyze_delete(del, snapshot, &mut params)?,
+        ast::Node::MergeStmt(merge) => analyze_merge(merge, snapshot, &mut params)?,
+        ast::Node::CallStmt(call) => analyze_call(call, snapshot, &mut params)?,
         // `EXPLAIN <query>` — recurse into the wrapped statement so its
         // parameters are harvested into the outer `ParamCollector`, then
         // replace the column list with PG's `QUERY PLAN` row description
         // (ExplainResultDesc: a single column, of the type FORMAT picks,
         // never NULL — even an empty plan emits at least one row).
-        node::Node::ExplainStmt(es) => {
+        ast::Node::ExplainStmt(es) => {
             let inner = es
                 .query
-                .as_deref()
-                .and_then(|q| q.node.as_ref())
+                .as_ref()
                 .ok_or_else(|| AnalyzeError::Unsupported("EXPLAIN with no inner query".into()))?;
             // ExplainQuery: the options first. Without ANALYZE the
             // statement is planned and its executor started, never run, so
@@ -1171,7 +1166,7 @@ fn analyze_raw_node_once(
             let mut analyze_inner = || -> Result<(), AnalyzeError> {
                 match inner {
                     // transformExplainStmt runs transformOptionalSelectInto too.
-                    node::Node::SelectStmt(sel) => {
+                    ast::Node::SelectStmt(sel) => {
                         let stripped = without_top_level_into(sel);
                         let sel = stripped.as_ref().unwrap_or(sel);
                         analyze_select(sel, snapshot, &mut params)?;
@@ -1180,16 +1175,16 @@ fn analyze_raw_node_once(
                             return Err(e);
                         }
                     }
-                    node::Node::InsertStmt(ins) => {
+                    ast::Node::InsertStmt(ins) => {
                         analyze_insert(ins, snapshot, &mut params)?;
                     }
-                    node::Node::UpdateStmt(upd) => {
+                    ast::Node::UpdateStmt(upd) => {
                         analyze_update(upd, snapshot, &mut params)?;
                     }
-                    node::Node::DeleteStmt(del) => {
+                    ast::Node::DeleteStmt(del) => {
                         analyze_delete(del, snapshot, &mut params)?;
                     }
-                    node::Node::MergeStmt(merge) => {
+                    ast::Node::MergeStmt(merge) => {
                         analyze_merge(merge, snapshot, &mut params)?;
                     }
                     _ => {
@@ -1237,7 +1232,7 @@ fn analyze_raw_node_once(
         // standard form (no expressions / parameters); for parameterized
         // notifications callers use `SELECT pg_notify($1, $2)` which goes
         // through the regular function-call path.
-        node::Node::NotifyStmt(_) | node::Node::ListenStmt(_) | node::Node::UnlistenStmt(_) => {
+        ast::Node::NotifyStmt(_) | ast::Node::ListenStmt(_) | ast::Node::UnlistenStmt(_) => {
             (Vec::new(), None)
         }
         _ => {
@@ -1280,17 +1275,17 @@ fn analyze_raw_node_once(
 /// `TypeCast { arg: AConst NULL, typename: int }` — we don't treat those as
 /// unconditionally NULL because PG allows `SET col = NULL::t` to perform an
 /// assignment the caller has explicitly typed.
-fn is_sql_null_literal(node: &protobuf::Node) -> bool {
+fn is_sql_null_literal(node: &Option<ast::Node>) -> bool {
     matches!(
-        node.node.as_ref(),
-        Some(node::Node::AConst(c)) if c.isnull
+        node.as_ref(),
+        Some(ast::Node::AConst(c)) if c.isnull
     )
 }
 
 /// `true` for the literal `DEFAULT` keyword used in INSERT VALUES /
 /// UPDATE SET. Mirrors PG's `SetToDefault` AST node.
-fn is_set_to_default(node: &protobuf::Node) -> bool {
-    matches!(node.node.as_ref(), Some(node::Node::SetToDefault(_)))
+fn is_set_to_default(node: &Option<ast::Node>) -> bool {
+    matches!(node.as_ref(), Some(ast::Node::SetToDefault(_)))
 }
 
 /// The ON CONFLICT arbiter specification after parse analysis
@@ -1300,11 +1295,11 @@ pub(crate) struct Arbiter {
     /// included, as PG's Vars carry them).
     pub cols: std::collections::BTreeSet<i16>,
     /// The expression inference elements.
-    pub exprs: Vec<protobuf::Node>,
+    pub exprs: Vec<Option<ast::Node>>,
     /// An element named the target row itself (`ON CONFLICT (t)`).
     pub whole_row: bool,
     /// The inference WHERE clause.
-    pub where_clause: Option<protobuf::Node>,
+    pub where_clause: Option<ast::Node>,
     /// The elements that name a collation or operator class
     /// (`InferenceElem.infercollid` / `inferopclass`).
     pub qualified: Vec<ArbiterElem>,
@@ -1316,7 +1311,7 @@ pub(crate) struct ArbiterElem {
     /// The column it names, or `None` for an expression.
     pub attnum: Option<i16>,
     /// The expression it names.
-    pub expr: Option<protobuf::Node>,
+    pub expr: Option<ast::Node>,
     pub collation: Option<crate::oid::PgCollationOid>,
     pub opclass: Option<crate::oid::PgOpclassOid>,
 }
@@ -1330,7 +1325,7 @@ fn infer_collation_opclass_match(
     snapshot: &PgCatalog,
     elem: &ArbiterElem,
     idx: &crate::pg_catalog::PgIndex,
-    idx_exprs: &[protobuf::Node],
+    idx_exprs: &[Option<ast::Node>],
 ) -> bool {
     let class_of = |c: crate::oid::PgOpclassOid| crate::ddl::opclass::opclass_by_oid(snapshot, c);
     let infer = elem.opclass.and_then(class_of);
@@ -1359,11 +1354,11 @@ fn infer_collation_opclass_match(
         }
         match (elem.attnum, &elem.expr) {
             (Some(a), _) if a == attno => return true,
-            (None, Some(e))
+            (None, Some(_))
                 if attno == 0
                     && idx_exprs
                         .get(natt - nplain)
-                        .is_some_and(|x| node_fingerprint(x) == node_fingerprint(e)) =>
+                        .is_some_and(|x| node_fingerprint(x) == node_fingerprint(&elem.expr)) =>
             {
                 return true;
             }
@@ -1382,7 +1377,7 @@ fn infer_collation_opclass_match(
 /// ON CONFLICT WHERE implies (`predicate_implied_by`, see [`predtest`]).
 /// 42P10 otherwise.
 fn validate_on_conflict_target(
-    on_conflict: &protobuf::OnConflictClause,
+    on_conflict: &ast::OnConflictClause,
     arbiter: &Arbiter,
     snapshot: &PgCatalog,
     table_oid: crate::oid::PgClassOid,
@@ -1420,7 +1415,7 @@ fn validate_on_conflict_target(
         }
         // An exclusion constraint's index — an EXCLUDE one, or PG 18's
         // WITHOUT OVERLAPS key — can't arbitrate an update.
-        if on_conflict.action() == protobuf::OnConflictAction::OnconflictUpdate
+        if on_conflict.action == ast::OnConflictAction::OnconflictUpdate
             && (found.contype == ConType::Exclusion || found.conperiod)
         {
             return Err(AnalyzeError::WrongObjectType(
@@ -1464,7 +1459,7 @@ fn validate_on_conflict_target(
             .map(|&a| base_attnum(a).unwrap_or(i16::MIN))
             .collect();
         for e in &mut target_expr_nodes {
-            *e = rename_column_refs(e, &base_name);
+            *e = e.as_ref().map(|n| rename_column_refs(n, &base_name));
         }
         if let Some(w) = &mut where_clause {
             *w = rename_column_refs(w, &base_name);
@@ -1481,9 +1476,7 @@ fn validate_on_conflict_target(
     target_exprs.sort();
     target_exprs.dedup();
 
-    let decode = |ast: &crate::pg_catalog::SerializedAst| -> Option<protobuf::Node> {
-        Some(ast.ast.clone())
-    };
+    let decode = |ast: &crate::pg_catalog::SerializedAst| -> Option<ast::Node> { ast.ast.clone() };
 
     let types = predtest::Types {
         snapshot,
@@ -1504,7 +1497,7 @@ fn validate_on_conflict_target(
             .min(idx.indkey.len())];
         let cols: std::collections::BTreeSet<i16> =
             key.iter().copied().filter(|&a| a != 0).collect();
-        let idx_exprs: Vec<protobuf::Node> = idx.indexprs.iter().filter_map(decode).collect();
+        let idx_exprs: Vec<Option<ast::Node>> = idx.indexprs.iter().map(decode).collect();
         let mut exprs: Vec<String> = idx_exprs.iter().map(node_fingerprint).collect();
         exprs.sort();
         exprs.dedup();
@@ -1543,14 +1536,11 @@ fn validate_on_conflict_target(
 /// `node` with every column reference's column name mapped through
 /// `rename` (names it doesn't map keep theirs) — rewriteTargetView's
 /// re-pointing of view columns at the base relation's.
-fn rename_column_refs(
-    node: &protobuf::Node,
-    rename: &dyn Fn(&str) -> Option<String>,
-) -> protobuf::Node {
-    let mut tree = protobuf::ParseResult {
+fn rename_column_refs(node: &ast::Node, rename: &dyn Fn(&str) -> Option<String>) -> ast::Node {
+    let mut tree = ast::ParseResult {
         version: 0,
-        stmts: vec![protobuf::RawStmt {
-            stmt: Some(Box::new(node.clone())),
+        stmts: vec![ast::RawStmt {
+            stmt: Some(node.clone()),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -1562,7 +1552,7 @@ fn rename_column_refs(
         for (n, _) in tree.nodes_mut() {
             if let typedpg_pg_query::NodeMut::ColumnRef(cr) = n
                 && let Some(last) = (*cr).fields.last_mut()
-                && let Some(node::Node::String(s)) = last.node.as_mut()
+                && let Some(ast::Node::String(s)) = last.as_mut()
                 && let Some(new) = rename(&s.sval)
             {
                 s.sval = new;
@@ -1572,8 +1562,7 @@ fn rename_column_refs(
     tree.stmts
         .pop()
         .and_then(|s| s.stmt)
-        .map(|b| *b)
-        .unwrap_or_default()
+        .expect("the tree keeps its one statement")
 }
 
 /// How the statement being analyzed is run, for the errors only its

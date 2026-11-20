@@ -3,7 +3,7 @@
 //! simplifications that can change a node's collation need it (see
 //! [`super::Planned`]).
 
-use typedpg_pg_query::protobuf::{self, a_const, node};
+use typedpg_pg_query::ast;
 
 use super::{Ctx, ExprType, Planned};
 use crate::oid::PgTypeOid;
@@ -29,28 +29,28 @@ pub(crate) enum Folding {
 }
 
 /// What `node` folds into.
-pub(crate) fn folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Folding {
+pub(crate) fn folding(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Folding {
     fold(node, ctx, false)
 }
 
 /// What `node` folds into; `generation` when it is a virtual generated
 /// column's expression, whose column references are the table's stored
 /// columns (a generation expression can't read another generated column).
-fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
-    let Some(inner) = node.node.as_ref() else {
+fn fold(node: Option<&ast::Node>, ctx: Ctx<'_>, generation: bool) -> Folding {
+    let Some(inner) = node else {
         return Folding::Maybe;
     };
     let snapshot = ctx.snapshot;
     match inner {
-        node::Node::AConst(c) => match &c.val {
+        ast::Node::AConst(c) => match &c.val {
             _ if c.isnull => Folding::Null,
-            Some(a_const::Val::Boolval(b)) => Folding::Bool(b.boolval),
+            Some(ast::AConstValue::Boolean(b)) => Folding::Bool(b.boolval),
             _ => Folding::Value,
         },
         // A Var of a table (read directly or passed through as is) stays
         // a Var.
-        node::Node::ColumnRef(_) if generation => Folding::Never,
-        node::Node::ColumnRef(cr) => {
+        ast::Node::ColumnRef(_) if generation => Folding::Never,
+        ast::Node::ColumnRef(cr) => {
             let parts = super::extract_string_fields(&cr.fields);
             if parts.len() != cr.fields.len() {
                 return Folding::Maybe;
@@ -86,19 +86,19 @@ fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
                 .get(&(origin.relid, attr.attnum))
             {
                 Some(crate::ddl::tables::check_inherit::StoredExpr::Written(expr)) => {
-                    fold(expr, ctx, true)
+                    fold((**expr).as_ref(), ctx, true)
                 }
                 _ => Folding::Maybe,
             }
         }
         // A cast of a non-constant is no constant, unless its function is
         // inlined.
-        node::Node::TypeCast(c) => {
-            let Some(arg) = c.arg.as_deref() else {
+        ast::Node::TypeCast(c) => {
+            let Some(arg) = c.arg.as_ref() else {
                 return Folding::Maybe;
             };
             // coerce_type makes a NULL literal a NULL constant of the type.
-            if let Some(node::Node::AConst(a)) = arg.node.as_ref()
+            if let ast::Node::AConst(a) = arg
                 && a.isnull
             {
                 return Folding::Null;
@@ -114,17 +114,14 @@ fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
                 (cast.casttarget == target || cast.casttarget == snapshot.unwrap_domain(target))
                     && cast.castfunc.is_some_and(|f| is_sql(snapshot, f))
             });
-            match fold(arg, ctx, generation) {
+            match fold(Some(arg), ctx, generation) {
                 Folding::Never if !sql_cast => Folding::Never,
                 _ => Folding::Maybe,
             }
         }
-        node::Node::AExpr(e) => {
-            use protobuf::AExprKind as K;
-            if !matches!(
-                K::try_from(e.kind),
-                Ok(K::AexprOp | K::AexprLike | K::AexprIlike)
-            ) {
+        ast::Node::AExpr(e) => {
+            use ast::AExprKind as K;
+            if !matches!(e.kind, K::AexprOp | K::AexprLike | K::AexprIlike) {
                 return Folding::Maybe;
             }
             let names = super::extract_string_fields(&e.name);
@@ -135,11 +132,11 @@ fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
                 .lexpr
                 .iter()
                 .chain(e.rexpr.iter())
-                .map(|a| fold(a, ctx, generation))
+                .map(|a| fold(Some(a), ctx, generation))
                 .collect();
             // evaluate_function: a strict function over a NULL constant is
             // the NULL constant, before any inlining.
-            if K::try_from(e.kind) == Ok(K::AexprOp)
+            if e.kind == K::AexprOp
                 && args.contains(&Folding::Null)
                 && all_strict(
                     snapshot
@@ -155,38 +152,37 @@ fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
             if operator_may_inline(snapshot, name) {
                 return Folding::Maybe;
             }
-            if K::try_from(e.kind) == Ok(K::AexprOp)
-                && let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref())
+            if e.kind == K::AexprOp
+                && let (Some(l), Some(r)) = (e.lexpr.as_ref(), e.rexpr.as_ref())
                 && let Some(v) = integer_comparison(name, l, r)
             {
                 return Folding::Bool(v);
             }
             strict_call(args.into_iter())
         }
-        node::Node::BoolExpr(b) => {
-            let args = b.args.iter().map(|a| fold(a, ctx, generation));
-            match protobuf::BoolExprType::try_from(b.boolop) {
-                Ok(protobuf::BoolExprType::AndExpr) => bool_args(args, false),
-                Ok(protobuf::BoolExprType::OrExpr) => bool_args(args, true),
-                Ok(protobuf::BoolExprType::NotExpr) => {
-                    match b.args.first().map(|a| fold(a, ctx, generation)) {
+        ast::Node::BoolExpr(b) => {
+            let args = b.args.iter().map(|a| fold(a.as_ref(), ctx, generation));
+            match b.boolop {
+                ast::BoolExprType::AndExpr => bool_args(args, false),
+                ast::BoolExprType::OrExpr => bool_args(args, true),
+                ast::BoolExprType::NotExpr => {
+                    match b.args.first().map(|a| fold(a.as_ref(), ctx, generation)) {
                         Some(Folding::Bool(v)) => Folding::Bool(!v),
                         Some(f @ (Folding::Null | Folding::Never)) => f,
                         _ => Folding::Maybe,
                     }
                 }
-                _ => Folding::Maybe,
             }
         }
-        node::Node::NullTest(t) => match t.arg.as_deref().map(|a| fold(a, ctx, generation)) {
+        ast::Node::NullTest(t) => match t.arg.as_ref().map(|a| fold(Some(a), ctx, generation)) {
             Some(Folding::Never) => Folding::Never,
             _ => Folding::Maybe,
         },
-        node::Node::BooleanTest(t) => match t.arg.as_deref().map(|a| fold(a, ctx, generation)) {
+        ast::Node::BooleanTest(t) => match t.arg.as_ref().map(|a| fold(Some(a), ctx, generation)) {
             Some(Folding::Never) => Folding::Never,
             _ => Folding::Maybe,
         },
-        node::Node::FuncCall(f) => {
+        ast::Node::FuncCall(f) => {
             let names = super::extract_string_fields(&f.funcname);
             let Some(name) = names.last() else {
                 return Folding::Maybe;
@@ -211,12 +207,12 @@ fn fold(node: &protobuf::Node, ctx: Ctx<'_>, generation: bool) -> Folding {
             let args: Vec<Folding> = f
                 .args
                 .iter()
-                .map(|a| match a.node.as_ref() {
-                    Some(node::Node::NamedArgExpr(na)) => na
+                .map(|a| match a.as_ref() {
+                    Some(ast::Node::NamedArgExpr(na)) => na
                         .arg
-                        .as_deref()
-                        .map_or(Folding::Maybe, |a| fold(a, ctx, generation)),
-                    _ => fold(a, ctx, generation),
+                        .as_ref()
+                        .map_or(Folding::Maybe, |a| fold(Some(a), ctx, generation)),
+                    _ => fold(a.as_ref(), ctx, generation),
                 })
                 .collect();
             // A strict function over a NULL constant (see the operators').
@@ -258,10 +254,10 @@ fn all_strict(
 
 /// The value of `l name r`, a comparison of two integer literals (`1 = 1`),
 /// as the built-in `int4` operators the planner folds it with compute it.
-fn integer_comparison(name: &str, l: &protobuf::Node, r: &protobuf::Node) -> Option<bool> {
-    let int = |n: &protobuf::Node| match n.node.as_ref()? {
-        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            a_const::Val::Ival(i) => Some(i64::from(i.ival)),
+fn integer_comparison(name: &str, l: &ast::Node, r: &ast::Node) -> Option<bool> {
+    let int = |n: &ast::Node| match n {
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(i64::from(i.ival)),
             _ => None,
         },
         _ => None,
@@ -377,35 +373,35 @@ fn replaced_by(branch: &ExprType, common: PgTypeOid, snapshot: &PgCatalog) -> Pl
 /// first remaining one if its condition is constant TRUE, or the ELSE if
 /// none remains. Otherwise the CASE stays, with its parsed collation.
 pub(crate) fn case_planned(
-    expr: &protobuf::CaseExpr,
+    expr: &ast::CaseExpr,
     results: &[ExprType],
     default: Option<&ExprType>,
     common: PgTypeOid,
     ctx: Ctx<'_>,
 ) -> Planned {
-    let mut whens = expr.args.iter().filter_map(|a| match a.node.as_ref() {
-        Some(node::Node::CaseWhen(w)) => Some(w),
+    let mut whens = expr.args.iter().filter_map(|a| match a.as_ref() {
+        Some(ast::Node::CaseWhen(w)) => Some(w),
         _ => None,
     });
     // Once a WHEN with a condition that isn't constant is kept, the CASE
     // stays.
-    if let Some(test) = expr.arg.as_deref() {
+    if let Some(test) = expr.arg.as_ref() {
         // A simple CASE's conditions are `test = value`: with a test that
         // never folds, one with a value that isn't NULL is left alone.
-        if folding(test, ctx) != Folding::Never || operator_may_inline(ctx.snapshot, "=") {
+        if folding(Some(test), ctx) != Folding::Never || operator_may_inline(ctx.snapshot, "=") {
             return Planned::Unknown;
         }
         return match whens
             .next()
-            .and_then(|w| w.expr.as_deref())
-            .map(|v| folding(v, ctx))
+            .and_then(|w| w.expr.as_ref())
+            .map(|v| folding(Some(v), ctx))
         {
             Some(Folding::Never | Folding::Value | Folding::Bool(_)) => Planned::AsParsed,
             _ => Planned::Unknown,
         };
     }
     for (when, result) in whens.zip(results) {
-        match when.expr.as_deref().map(|c| folding(c, ctx)) {
+        match when.expr.as_ref().map(|c| folding(Some(c), ctx)) {
             Some(Folding::Bool(false) | Folding::Null) => {}
             Some(Folding::Never) => return Planned::AsParsed,
             Some(Folding::Bool(true)) => return replaced_by(result, common, ctx.snapshot),
@@ -427,13 +423,13 @@ pub(crate) fn case_planned(
 /// argument if that is a constant. Otherwise it stays, with its parsed
 /// collation (a NULL constant of it, when every argument is NULL).
 pub(crate) fn coalesce_planned(
-    expr: &protobuf::CoalesceExpr,
+    expr: &ast::CoalesceExpr,
     args: &[ExprType],
     common: PgTypeOid,
     ctx: Ctx<'_>,
 ) -> Planned {
     for (arg, t) in expr.args.iter().zip(args) {
-        match folding(arg, ctx) {
+        match folding(arg.as_ref(), ctx) {
             Folding::Null => {}
             Folding::Bool(_) | Folding::Value => return replaced_by(t, common, ctx.snapshot),
             // Kept, the COALESCE stays.

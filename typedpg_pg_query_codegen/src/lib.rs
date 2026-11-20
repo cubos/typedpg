@@ -1,13 +1,13 @@
 //! Code generation for `typedpg_pg_query`.
 //!
 //! [`generate_from_headers`] derives the crate's generated sources straight
-//! from PostgreSQL's headers — no `.proto` and no `prost` in the result:
+//! from PostgreSQL's headers:
 //!
-//! - `src/protobuf.rs`: the AST types (the name is historical: the types are
-//!   plain Rust records now);
-//! - `src/node.rs`: the `NodeRef` / `NodeMut` views over the `Node` oneof and
-//!   the per-message child walkers behind `nodes()` / `nodes_mut()`;
-//! - `src/equal.rs`: PostgreSQL's `equal()` over the messages — every field
+//! - `src/ast.rs`: the AST types — one struct per node type, the `Node`
+//!   enum over all of them, and PostgreSQL's enums;
+//! - `src/node.rs`: the `NodeRef` / `NodeMut` views over a `Node` and the
+//!   per-type child walkers behind `nodes()` / `nodes_mut()`;
+//! - `src/equal.rs`: PostgreSQL's `equal()` over the AST — every field
 //!   compared except the ones `equalfuncs.c` skips (parse locations and
 //!   `equal_ignore` fields) — and the matching key, a string over the same
 //!   fields;
@@ -15,14 +15,14 @@
 //!   returns into those types.
 //!
 //! The AST and the converter are built from one intermediate [`Model`]
-//! (messages, fields, the `Node` variants), which the walker and equality
+//! (node types, fields, the `Node` variants), which the walker and equality
 //! generators also work on.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use heck::{ToSnakeCase, ToUpperCamelCase};
+use heck::ToSnakeCase;
 
 pub mod ast;
 pub mod convert;
@@ -39,20 +39,25 @@ pub fn crate_dir() -> PathBuf {
 /// grammar (`postgres/src/backend/parser/gram.h`).
 ///
 /// The returned paths are relative to the `typedpg_pg_query` crate:
-/// `src/protobuf.rs`, `src/node.rs`, `src/equal.rs` and `src/convert.rs`.
+/// `src/ast.rs`, `src/node.rs`, `src/equal.rs` and `src/convert.rs`.
 pub fn generate_from_headers(include_dir: &Path, gram_h: &Path) -> Vec<(PathBuf, String)> {
     let parsed = schema::Schema::parse(include_dir, gram_h);
     let program = ast::Program::from_schema(&parsed);
     let ignored = equal_ignored(&include_dir.join("nodes"));
     vec![
-        (PathBuf::from("src/protobuf.rs"), rustfmt(&program.emit())),
+        (PathBuf::from("src/ast.rs"), rustfmt(&program.emit())),
         (
             PathBuf::from("src/node.rs"),
             rustfmt(&walkers(&program.model, HEADER_FROM_HEADERS)),
         ),
         (
             PathBuf::from("src/equal.rs"),
-            rustfmt(&equality(&program.model, &ignored, HEADER_FROM_HEADERS)),
+            rustfmt(&equality(
+                &program.model,
+                &program.enum_names(),
+                &ignored,
+                HEADER_FROM_HEADERS,
+            )),
         ),
         (
             PathBuf::from("src/convert.rs"),
@@ -88,16 +93,13 @@ fn rustfmt(code: &str) -> String {
     String::from_utf8(output.stdout).expect("rustfmt output is UTF-8")
 }
 
-/// The Rust name `prost-build` gave a message (`A_Const` → `AConst`).
+/// The Rust name of a node type (`A_Const` → `AConst`).
 #[cfg(test)]
-fn type_ident(proto_type_name: &str) -> String {
-    proto_type_name
-        .trim_start_matches(".pg_query.")
-        .to_upper_camel_case()
+fn type_ident(c_name: &str) -> String {
+    heck::ToUpperCamelCase::to_upper_camel_case(c_name)
 }
 
-/// The Rust name `prost-build` gives a field (keywords become raw
-/// identifiers, as in `prost_build::ident::to_snake`).
+/// The Rust name of a field (keywords become raw identifiers).
 fn field_ident(name: &str) -> String {
     let snake = name.to_snake_case();
     match snake.as_str() {
@@ -112,18 +114,18 @@ fn field_ident(name: &str) -> String {
     }
 }
 
-/// One way a message is reached from a field.
+/// One way a node is reached from a field.
 #[derive(Debug, Clone)]
 pub(crate) enum Target {
-    /// A `Node`: yield what it wraps.
+    /// An abstract `Node`: yield it as whatever kind it is.
     Node,
-    /// A message that is a `Node` variant: yield it as that variant.
+    /// A node type that is a `Node` variant: yield it as that variant.
     Variant(String, String),
-    /// Any other message: walk it without yielding.
+    /// Any other type: walk it without yielding.
     Plain(String),
 }
 
-/// The scalar shape of a field, as far as the generated Rust is concerned.
+/// The shape of a field, as far as the generated Rust is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FieldType {
     Bool,
@@ -133,68 +135,77 @@ pub(crate) enum FieldType {
     U64,
     F64,
     String,
-    /// A `#[repr(i32)]` enum, stored as `i32`.
+    /// A C enum, by Rust type name.
     Enum(String),
-    /// Another message, by Rust type name.
+    /// An abstract node (`Node *`, `Expr *`): `Option<Node>`, or
+    /// `Vec<Option<Node>>` for a `List *` (whose cells can be NULL).
+    Node,
+    /// A node type, by Rust type name: `Option<NodeBox<T>>` for a typed
+    /// pointer, `T` when embedded, `Vec<T>` when repeated.
     Message(String),
-    /// A protobuf map (the summary API's `aliases`).
-    Map,
 }
 
 /// One field of a [`Message`].
 #[derive(Debug, Clone)]
 pub(crate) struct Field {
-    /// The field's proto name (`base_stmt`), from which Rust uses
-    /// [`Field::rust`] and the oneof variant its upper-camel-case form.
-    pub proto: String,
-    /// PostgreSQL's field name (`base`), which `equal()`'s ignore list and
-    /// the `location` lookup use.
-    pub json: String,
+    /// PostgreSQL's field name (`base`), which `equal()`'s ignore list, the
+    /// `location` lookup and the converter use.
+    pub c_name: String,
+    /// The Rust field name (`base_stmt`).
     pub rust: String,
     pub ty: FieldType,
     pub repeated: bool,
-    pub boxed: bool,
-    /// Index into [`Message::oneofs`] when the field belongs to a oneof.
+    /// A struct embedded by value (`CreateForeignTableStmt.base`), not a
+    /// pointer.
+    pub embedded: bool,
+    /// Index into [`Message::oneofs`] when the field is one variant of a
+    /// value enum (`A_Const.val`).
     pub oneof: Option<usize>,
     /// Set by [`Model::resolve_targets`].
     pub target: Option<Target>,
 }
 
-/// A oneof declaration (`Node.node`, `A_Const.val`).
+/// A value held as one of several node types (`A_Const.val`), emitted as an
+/// enum whose variants are named after the types.
 #[derive(Debug, Clone)]
 pub(crate) struct Oneof {
-    /// The oneof's proto name (`node`).
-    pub proto: String,
-    /// The Rust struct field holding it (`node`).
+    /// The Rust struct field holding it (`val`).
     pub rust: String,
-    /// The Rust enum's name (`Node`).
+    /// The Rust enum's name (`AConstValue`).
     pub enum_rust: String,
     /// Indices into [`Message::fields`].
     pub fields: Vec<usize>,
 }
 
-/// A message, as the walkers and equality see it.
+/// A node type (or one of the parse/scan results), as the walkers and
+/// equality see it.
 #[derive(Debug, Clone)]
 pub(crate) struct Message {
-    /// The proto name (`A_Const`), which equality's ignore list keys on.
+    /// The C name (`A_Const`), which equality's ignore list keys on.
     pub name: String,
     pub rust: String,
     pub fields: Vec<Field>,
     pub oneofs: Vec<Oneof>,
-    /// Nested messages (the summary API's), emitted but not walked.
-    pub nested: Vec<Message>,
-    /// Whether the proto message declares nested messages; equality skips
-    /// those (no AST ever reaches them).
-    pub has_nested: bool,
+}
+
+impl Message {
+    /// The Rust name of the enum variant of a oneof member: its type's.
+    pub(crate) fn oneof_variant(field: &Field) -> &str {
+        match &field.ty {
+            FieldType::Message(ty) => ty,
+            _ => panic!("oneof member {} is not a node type", field.rust),
+        }
+    }
 }
 
 /// The intermediate model the generators work on.
 #[derive(Debug)]
 pub struct Model {
     pub(crate) messages: Vec<Message>,
-    /// `(variant, Rust message type)` in `Node` oneof declaration order.
+    /// `(variant, Rust type)` of every `Node` variant, in `nodes/nodetags.h`
+    /// order then the value and list nodes.
     pub(crate) variants: Vec<(String, String)>,
-    /// Rust message type → its `Node` variant.
+    /// Rust type → its `Node` variant.
     pub(crate) variant_of: HashMap<String, String>,
 }
 
@@ -204,7 +215,7 @@ impl Model {
         for (variant, ty) in &self.variants {
             assert!(
                 variant_of.insert(ty.clone(), variant.clone()).is_none(),
-                "message {ty} appears twice in the Node oneof"
+                "type {ty} is two Node variants"
             );
         }
         self.variant_of = variant_of.clone();
@@ -212,22 +223,26 @@ impl Model {
         for message in &mut self.messages {
             for field in &mut message.fields {
                 field.target = match &field.ty {
-                    FieldType::Message(ty) if ty == "Node" => Some(Target::Node),
+                    FieldType::Node => Some(Target::Node),
                     FieldType::Message(ty) => {
                         if let Some(variant) = variant_of.get(ty) {
                             Some(Target::Variant(variant.clone(), ty.clone()))
-                        } else if top_level.contains(ty) {
-                            Some(Target::Plain(ty.clone()))
                         } else {
-                            // A nested (summary) record: no AST node can sit
-                            // below it.
-                            None
+                            assert!(top_level.contains(ty), "unknown type {ty}");
+                            Some(Target::Plain(ty.clone()))
                         }
                     }
                     _ => None,
                 };
             }
         }
+    }
+
+    pub(crate) fn message(&self, rust: &str) -> &Message {
+        self.messages
+            .iter()
+            .find(|m| m.rust == rust)
+            .unwrap_or_else(|| panic!("type {rust}"))
     }
 }
 
@@ -239,25 +254,23 @@ fn walk_fn(ty: &str, mutable: bool) -> String {
     )
 }
 
-/// Statements visiting one value `x` of the field's message type.
+/// Statements visiting one value `x` of the field's type (a `&Node`, a
+/// `&T` or a `&NodeBox<T>`; mutable ones alike).
 fn visit(target: &Target, mutable: bool) -> String {
     match (target, mutable) {
-        (Target::Node, false) => "visit_node(x, out);".into(),
+        (Target::Node, false) => "out(x.to_ref());".into(),
         (Target::Node, true) => "out.slot(x);".into(),
         (Target::Variant(variant, ty), false) => {
-            format!("let x: &'a protobuf::{ty} = x; out(NodeRef::{variant}(x));")
+            format!("let x: &'a ast::{ty} = x; out(NodeRef::{variant}(x));")
         }
         (Target::Variant(variant, ty), true) => {
-            format!("let x: &mut protobuf::{ty} = x; out.node(NodeMut::{variant}(x));")
+            format!("let x: &mut ast::{ty} = x; out.node(NodeMut::{variant}(x));")
         }
         (Target::Plain(ty), false) => {
-            format!(
-                "let x: &'a protobuf::{ty} = x; {}(x, out);",
-                walk_fn(ty, false)
-            )
+            format!("let x: &'a ast::{ty} = x; {}(x, out);", walk_fn(ty, false))
         }
         (Target::Plain(ty), true) => format!(
-            "let x: &mut protobuf::{ty} = x; unsafe {{ {}(x, out) }};",
+            "let x: &mut ast::{ty} = x; unsafe {{ {}(x, out) }};",
             walk_fn(ty, true)
         ),
     }
@@ -266,10 +279,10 @@ fn visit(target: &Target, mutable: bool) -> String {
 fn walkers(model: &Model, header: &str) -> String {
     let mut s = String::from(header);
     s.push_str(
-        "//! Views over the `Node` oneof and the child walkers behind\n\
+        "//! Views over a `Node` by kind and the child walkers behind\n\
          //! `nodes()` / `nodes_mut()`.\n\n\
          #![allow(clippy::all, dead_code, unused_variables)]\n\n\
-         use crate::protobuf;\n\n",
+         use crate::ast;\n\n",
     );
 
     // NodeRef / NodeMut.
@@ -278,26 +291,26 @@ fn walkers(model: &Model, header: &str) -> String {
          #[derive(Debug, Clone, Copy)]\npub enum NodeRef<'a> {\n",
     );
     for (variant, ty) in &model.variants {
-        writeln!(s, "    {variant}(&'a protobuf::{ty}),").unwrap();
+        writeln!(s, "    {variant}(&'a ast::{ty}),").unwrap();
     }
     s.push_str(
         "}\n\n/// A raw mutable pointer to one AST node, by kind (see `nodes_mut`).\n\
          #[derive(Debug, Clone, Copy)]\npub enum NodeMut {\n",
     );
     for (variant, ty) in &model.variants {
-        writeln!(s, "    {variant}(*mut protobuf::{ty}),").unwrap();
+        writeln!(s, "    {variant}(*mut ast::{ty}),").unwrap();
     }
     s.push_str("}\n\n");
 
-    // Conversions from the oneof.
+    // Conversions from the node.
     s.push_str(
-        "impl protobuf::node::Node {\n    /// This node as a [`NodeRef`].\n    \
+        "impl ast::Node {\n    /// This node as a [`NodeRef`].\n    \
          pub fn to_ref(&self) -> NodeRef<'_> {\n        match self {\n",
     );
-    for (variant, ty) in &model.variants {
+    for (variant, _) in &model.variants {
         writeln!(
             s,
-            "            Self::{variant}(x) => {{ let x: &protobuf::{ty} = x; NodeRef::{variant}(x) }}"
+            "            Self::{variant}(x) => NodeRef::{variant}(x),"
         )
         .unwrap();
     }
@@ -305,10 +318,10 @@ fn walkers(model: &Model, header: &str) -> String {
         "        }\n    }\n\n    /// This node as a [`NodeMut`] pointer.\n    \
          pub fn to_mut(&mut self) -> NodeMut {\n        match self {\n",
     );
-    for (variant, ty) in &model.variants {
+    for (variant, _) in &model.variants {
         writeln!(
             s,
-            "            Self::{variant}(x) => {{ let x: &mut protobuf::{ty} = x; NodeMut::{variant}(x) }}"
+            "            Self::{variant}(x) => NodeMut::{variant}(&mut **x),"
         )
         .unwrap();
     }
@@ -321,12 +334,7 @@ fn walkers(model: &Model, header: &str) -> String {
          pub fn location(self) -> Option<i32> {\n        match self {\n",
     );
     for (variant, ty) in &model.variants {
-        let has_location = model
-            .messages
-            .iter()
-            .find(|m| &m.rust == ty)
-            .is_some_and(Message::has_i32_location);
-        if has_location {
+        if model.message(ty).has_i32_location() {
             writeln!(
                 s,
                 "            NodeRef::{variant}(m) => (m.location >= 0).then_some(m.location),"
@@ -355,7 +363,7 @@ fn walkers(model: &Model, header: &str) -> String {
          /// What the mutable walkers report: a `Node` field (`slot`) or a field\n\
          /// of one node kind's own type (`node`).\n\
          trait MutVisitor {\n    \
-         fn slot(&mut self, n: &mut protobuf::Node);\n    \
+         fn slot(&mut self, n: &mut ast::Node);\n    \
          fn node(&mut self, n: NodeMut);\n}\n\n\
          /// Walk the fields of `node` holding nodes.\n///\n\
          /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
@@ -374,38 +382,32 @@ fn walkers(model: &Model, header: &str) -> String {
         "    }\n}\n\n\
          struct Children<'f>(&'f mut dyn FnMut(NodeMut));\n\n\
          impl MutVisitor for Children<'_> {\n    \
-         fn slot(&mut self, n: &mut protobuf::Node) {\n        \
-         if let Some(e) = &mut n.node { (self.0)(e.to_mut()); }\n    }\n    \
+         fn slot(&mut self, n: &mut ast::Node) { (self.0)(n.to_mut()); }\n    \
          fn node(&mut self, n: NodeMut) { (self.0)(n); }\n}\n\n\
          /// Call `out` on every direct child node of `node`.\n///\n\
          /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
          pub(crate) unsafe fn children_mut(node: NodeMut, out: &mut dyn FnMut(NodeMut)) {\n    \
          unsafe { walk_mut(node, &mut Children(out)) }\n}\n\n\
-         struct Slots<'f>(&'f mut dyn FnMut(&mut protobuf::Node));\n\n\
+         struct Slots<'f>(&'f mut dyn FnMut(&mut ast::Node));\n\n\
          impl MutVisitor for Slots<'_> {\n    \
-         fn slot(&mut self, n: &mut protobuf::Node) { (self.0)(n); }\n    \
+         fn slot(&mut self, n: &mut ast::Node) { (self.0)(n); }\n    \
          fn node(&mut self, n: NodeMut) { unsafe { walk_mut(n, self) } }\n}\n\n\
          /// Call `out` on every `Node` field below `node` reached without\n\
          /// passing through another one: the places a child node can be\n\
          /// replaced by a node of another kind.\n///\n\
          /// # Safety\n/// `node` must point to a live node no one else accesses.\n\
-         pub(crate) unsafe fn child_slots_mut(node: NodeMut, out: &mut dyn FnMut(&mut protobuf::Node)) {\n    \
-         unsafe { walk_mut(node, &mut Slots(out)) }\n}\n\n\
-         fn visit_node<'a>(n: &'a protobuf::Node, out: &mut dyn FnMut(NodeRef<'a>)) {\n    \
-         if let Some(e) = &n.node { out(e.to_ref()); }\n}\n\n",
+         pub(crate) unsafe fn child_slots_mut(node: NodeMut, out: &mut dyn FnMut(&mut ast::Node)) {\n    \
+         unsafe { walk_mut(node, &mut Slots(out)) }\n}\n\n",
     );
 
-    // One walker per message.
+    // One walker per type.
     for m in &model.messages {
-        if m.name == "Node" {
-            continue;
-        }
         for mutable in [false, true] {
             let body = message_body(m, mutable);
             if mutable {
                 writeln!(
                     s,
-                    "unsafe fn {}(m: *mut protobuf::{}, out: &mut dyn MutVisitor) {{\n    \
+                    "unsafe fn {}(m: *mut ast::{}, out: &mut dyn MutVisitor) {{\n    \
                      let m = unsafe {{ &mut *m }};\n{body}}}\n",
                     walk_fn(&m.rust, true),
                     m.rust
@@ -414,7 +416,7 @@ fn walkers(model: &Model, header: &str) -> String {
             } else {
                 writeln!(
                     s,
-                    "fn {}<'a>(m: &'a protobuf::{}, out: &mut dyn FnMut(NodeRef<'a>)) {{\n{body}}}\n",
+                    "fn {}<'a>(m: &'a ast::{}, out: &mut dyn FnMut(NodeRef<'a>)) {{\n{body}}}\n",
                     walk_fn(&m.rust, false),
                     m.rust
                 )
@@ -429,16 +431,16 @@ impl Message {
     fn has_i32_location(&self) -> bool {
         self.fields
             .iter()
-            .any(|f| f.json == "location" && f.ty == FieldType::I32)
+            .any(|f| f.c_name == "location" && f.ty == FieldType::I32)
     }
 }
 
-/// The statements of one message's walker.
+/// The statements of one type's walker.
 fn message_body(m: &Message, mutable: bool) -> String {
-    let (amp, iter) = if mutable {
-        ("&mut ", "&mut ")
+    let (amp, iter, flatten) = if mutable {
+        ("&mut ", "iter_mut", "&mut ")
     } else {
-        ("&", "&")
+        ("&", "iter", "&")
     };
     let mut body = String::new();
     for field in &m.fields {
@@ -450,36 +452,45 @@ fn message_body(m: &Message, mutable: bool) -> String {
         };
         let name = &field.rust;
         let visit = visit(target, mutable);
-        if field.repeated {
-            writeln!(body, "    for x in {iter}m.{name} {{ {visit} }}").unwrap();
-        } else {
-            writeln!(body, "    if let Some(x) = {amp}m.{name} {{ {visit} }}").unwrap();
+        match (target, field.repeated) {
+            // A list's cells can be NULL.
+            (Target::Node, true) => writeln!(
+                body,
+                "    for x in m.{name}.{iter}().flatten() {{ {visit} }}"
+            )
+            .unwrap(),
+            (_, true) => writeln!(body, "    for x in {flatten}m.{name} {{ {visit} }}").unwrap(),
+            (_, false) if field.embedded => {
+                writeln!(body, "    {{ let x = {amp}m.{name}; {visit} }}").unwrap()
+            }
+            (_, false) => {
+                writeln!(body, "    if let Some(x) = {amp}m.{name} {{ {visit} }}").unwrap()
+            }
         }
     }
     for oneof in &m.oneofs {
         writeln!(body, "    match {amp}m.{} {{", oneof.rust).unwrap();
         for &index in &oneof.fields {
             let field = &m.fields[index];
-            let target = field.target.as_ref().expect("a message oneof member");
+            let target = field.target.as_ref().expect("a node type oneof member");
             writeln!(
                 body,
-                "        Some(protobuf::{}::{}::{}(x)) => {{ {} }}",
-                m.rust.to_snake_case(),
+                "        Some(ast::{}::{}(x)) => {{ {} }}",
                 oneof.enum_rust,
-                field.proto.to_upper_camel_case(),
+                Message::oneof_variant(field),
                 visit(target, mutable)
             )
             .unwrap();
         }
-        body.push_str("        _ => {}\n    }\n");
+        body.push_str("        None => {}\n    }\n");
     }
     body
 }
 
 /// The `(struct, field)` pairs PostgreSQL's `equal()` doesn't compare: fields
 /// of type `ParseLoc` (source positions) and fields marked `equal_ignore`, as
-/// declared in `parsenodes.h` / `primnodes.h`. Field names are PostgreSQL's,
-/// which the `.proto` keeps as each field's `json_name`.
+/// declared in `parsenodes.h` / `primnodes.h`. Field names are PostgreSQL's
+/// ([`Field::c_name`]).
 fn equal_ignored(headers: &Path) -> HashSet<(String, String)> {
     let mut out = HashSet::new();
     for file in ["parsenodes.h", "primnodes.h"] {
@@ -552,7 +563,8 @@ const EQUAL_PRELUDE: &str = r#"//! PostgreSQL's `equal()` (equalfuncs.c) over th
 
 #![allow(clippy::all, unused_variables)]
 
-use crate::protobuf;
+use crate::NodeBox;
+use crate::ast;
 
 /// Structural equality of AST values, as PostgreSQL's `equal()`.
 pub trait Equal {
@@ -561,7 +573,7 @@ pub trait Equal {
     /// Append the value's key: a string over the fields `equal()` compares,
     /// the same for two values exactly when they are `equal()` — what to
     /// hash or store in place of the value. Every key is self-delimiting
-    /// (a scalar ends in `;`, a message is braced, a list bracketed), so a
+    /// (a scalar ends in `;`, a struct is braced, a list bracketed), so a
     /// sequence of keys reads back one way.
     fn equal_key(&self, out: &mut String);
 }
@@ -586,7 +598,7 @@ impl<T: Equal> Equal for Option<T> {
     }
 }
 
-impl<T: Equal> Equal for Box<T> {
+impl<T: Equal> Equal for NodeBox<T> {
     fn equal(&self, other: &Self) -> bool {
         (**self).equal(other)
     }
@@ -627,16 +639,56 @@ macro_rules! scalar {
 
 scalar!(bool, i32, i64, u32, u64, u8, f32, f64, String);
 
+/// A C enum compares by value; its key is its C value.
+macro_rules! enums {
+    ($($t:ident),*) => {$(
+        impl Equal for ast::$t {
+            fn equal(&self, other: &Self) -> bool {
+                self == other
+            }
+
+            fn equal_key(&self, out: &mut String) {
+                use std::fmt::Write;
+                let _ = write!(out, "{};", *self as i32);
+            }
+        }
+    )*};
+}
+
 "#;
 
-fn equality(model: &Model, ignored: &HashSet<(String, String)>, header: &str) -> String {
+fn equality(
+    model: &Model,
+    enums: &[String],
+    ignored: &HashSet<(String, String)>,
+    header: &str,
+) -> String {
     let mut s = String::from(header);
     s.push_str(EQUAL_PRELUDE);
+    writeln!(s, "enums!({});\n", enums.join(", ")).unwrap();
+
+    // The node: equal when of the same kind and equal as that kind.
+    let mut arms = String::new();
+    let mut key_arms = String::new();
+    for (variant, _) in &model.variants {
+        writeln!(
+            arms,
+            "            (Self::{variant}(a), Self::{variant}(b)) => a.equal(b),"
+        )
+        .unwrap();
+        writeln!(
+            key_arms,
+            "            Self::{variant}(a) => {{\n                out.push_str(\"{variant}(\");\n                a.equal_key(out);\n                out.push(')');\n            }}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        s,
+        "impl Equal for ast::Node {{\n    fn equal(&self, other: &Self) -> bool {{\n        match (self, other) {{\n{arms}            _ => false,\n        }}\n    }}\n\n    fn equal_key(&self, out: &mut String) {{\n        match self {{\n{key_arms}        }}\n    }}\n}}\n"
+    )
+    .unwrap();
+
     for m in &model.messages {
-        // The summary API's records aren't AST.
-        if m.has_nested {
-            continue;
-        }
         let ty = &m.rust;
         let mut fields: Vec<String> = Vec::new();
         let mut oneofs_done = HashSet::new();
@@ -647,7 +699,7 @@ fn equality(model: &Model, ignored: &HashSet<(String, String)>, header: &str) ->
                 }
                 continue;
             }
-            if ignored.contains(&(m.name.clone(), field.json.clone())) {
+            if ignored.contains(&(m.name.clone(), field.c_name.clone())) {
                 continue;
             }
             fields.push(field.rust.clone());
@@ -667,16 +719,15 @@ fn equality(model: &Model, ignored: &HashSet<(String, String)>, header: &str) ->
             .collect();
         writeln!(
             s,
-            "impl Equal for protobuf::{ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        {body}\n    }}\n\n    fn equal_key(&self, out: &mut String) {{\n        out.push('{{');\n{key}        out.push('}}');\n    }}\n}}\n"
+            "impl Equal for ast::{ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        {body}\n    }}\n\n    fn equal_key(&self, out: &mut String) {{\n        out.push('{{');\n{key}        out.push('}}');\n    }}\n}}\n"
         )
         .unwrap();
         for oneof in &m.oneofs {
-            let module = m.rust.to_snake_case();
             let enum_ty = &oneof.enum_rust;
             let mut arms = String::new();
             let mut key_arms = String::new();
             for &index in &oneof.fields {
-                let v = m.fields[index].proto.to_upper_camel_case();
+                let v = Message::oneof_variant(&m.fields[index]);
                 writeln!(
                     arms,
                     "            (Self::{v}(a), Self::{v}(b)) => a.equal(b),"
@@ -690,7 +741,7 @@ fn equality(model: &Model, ignored: &HashSet<(String, String)>, header: &str) ->
             }
             writeln!(
                 s,
-                "impl Equal for protobuf::{module}::{enum_ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        #[allow(unreachable_patterns)]\n        match (self, other) {{\n{arms}            _ => false,\n        }}\n    }}\n\n    fn equal_key(&self, out: &mut String) {{\n        match self {{\n{key_arms}        }}\n    }}\n}}\n"
+                "impl Equal for ast::{enum_ty} {{\n    fn equal(&self, other: &Self) -> bool {{\n        match (self, other) {{\n{arms}            _ => false,\n        }}\n    }}\n\n    fn equal_key(&self, out: &mut String) {{\n        match self {{\n{key_arms}        }}\n    }}\n}}\n"
             )
             .unwrap();
         }

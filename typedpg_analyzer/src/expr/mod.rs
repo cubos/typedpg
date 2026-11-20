@@ -11,7 +11,8 @@
 //! compatibility check verifies that the result type can be coerced to the
 //! goal under the allowed coercion context.
 
-use typedpg_pg_query::protobuf::{self, a_const, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 use crate::coerce::{self, CoercionContext, can_coerce};
 use crate::error::AnalyzeError;
@@ -500,10 +501,10 @@ impl ExprType {
         target: PgTypeOid,
         context: CoercionContext,
         snapshot: &PgCatalog,
-        node: &protobuf::Node,
+        node: &Option<ast::Node>,
     ) -> Result<(), AnalyzeError> {
         if self.unknown_value {
-            unknown_value_coercion(target, context, snapshot, node)
+            unknown_value_coercion(target, context, snapshot, node.as_ref())
         } else {
             Ok(())
         }
@@ -804,18 +805,20 @@ impl FuncKindPresence {
     }
 }
 
-pub(crate) fn detect_func_kinds(node: &protobuf::Node, snapshot: &PgCatalog) -> FuncKindPresence {
+pub(crate) fn detect_func_kinds(
+    node: &Option<ast::Node>,
+    snapshot: &PgCatalog,
+) -> FuncKindPresence {
     let mut out = FuncKindPresence::default();
-    walk(node, snapshot, &mut out);
+    if let Some(node) = node {
+        walk(node, snapshot, &mut out);
+    }
     out
 }
 
-fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence) {
-    let Some(inner) = node.node.as_ref() else {
-        return;
-    };
+fn walk(inner: &ast::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence) {
     match inner {
-        node::Node::FuncCall(fc) => {
+        ast::Node::FuncCall(fc) => {
             if fc.over.is_some() {
                 out.has_window = true;
                 out.window_location.get_or_insert(fc.location);
@@ -854,53 +857,52 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                     }
                 }
             }
-            for arg in &fc.args {
+            for arg in fc.args.iter().flatten() {
                 walk(arg, snapshot, out);
             }
             if let Some(f) = &fc.agg_filter {
                 walk(f, snapshot, out);
             }
-            for o in &fc.agg_order {
+            for o in fc.agg_order.iter().flatten() {
                 walk(o, snapshot, out);
             }
         }
-        node::Node::NamedArgExpr(na) => {
+        ast::Node::NamedArgExpr(na) => {
             if let Some(a) = &na.arg {
                 walk(a, snapshot, out);
             }
         }
-        node::Node::GroupingFunc(g) => {
+        ast::Node::GroupingFunc(g) => {
             out.has_grouping = true;
             out.grouping_location.get_or_insert(g.location);
         }
         // JSON_OBJECTAGG / JSON_ARRAYAGG are aggregates (window functions
         // with OVER).
-        node::Node::JsonObjectAgg(_) | node::Node::JsonArrayAgg(_) => {
-            let (ctor, args): (Option<&protobuf::JsonAggConstructor>, Vec<&protobuf::Node>) =
-                match inner {
-                    node::Node::JsonObjectAgg(a) => (
-                        a.constructor.as_deref(),
-                        a.arg
-                            .as_deref()
-                            .map(|kv| {
-                                kv.key
-                                    .as_deref()
-                                    .into_iter()
-                                    .chain(kv.value.as_deref().and_then(|v| v.raw_expr.as_deref()))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    ),
-                    node::Node::JsonArrayAgg(a) => (
-                        a.constructor.as_deref(),
-                        a.arg
-                            .as_deref()
-                            .and_then(|v| v.raw_expr.as_deref())
-                            .into_iter()
-                            .collect(),
-                    ),
-                    _ => (None, Vec::new()),
-                };
+        ast::Node::JsonObjectAgg(_) | ast::Node::JsonArrayAgg(_) => {
+            let (ctor, args): (Option<&ast::JsonAggConstructor>, Vec<&ast::Node>) = match inner {
+                ast::Node::JsonObjectAgg(a) => (
+                    a.constructor.as_deref(),
+                    a.arg
+                        .as_deref()
+                        .map(|kv| {
+                            kv.key
+                                .as_ref()
+                                .into_iter()
+                                .chain(kv.value.as_deref().and_then(|v| v.raw_expr.as_ref()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
+                ast::Node::JsonArrayAgg(a) => (
+                    a.constructor.as_deref(),
+                    a.arg
+                        .as_deref()
+                        .and_then(|v| v.raw_expr.as_ref())
+                        .into_iter()
+                        .collect(),
+                ),
+                _ => (None, Vec::new()),
+            };
             let location = ctor.map_or(-1, |c| c.location);
             if ctor.is_some_and(|c| c.over.is_some()) {
                 out.has_window = true;
@@ -913,52 +915,48 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                 walk(a, snapshot, out);
             }
         }
-        node::Node::JsonObjectConstructor(c) => {
-            for e in &c.exprs {
+        ast::Node::JsonObjectConstructor(c) => {
+            for e in c.exprs.iter().flatten() {
                 walk(e, snapshot, out);
             }
         }
-        node::Node::JsonArrayConstructor(c) => {
-            for e in &c.exprs {
+        ast::Node::JsonArrayConstructor(c) => {
+            for e in c.exprs.iter().flatten() {
                 walk(e, snapshot, out);
             }
         }
-        node::Node::JsonKeyValue(kv) => {
+        ast::Node::JsonKeyValue(kv) => {
             if let Some(k) = &kv.key {
                 walk(k, snapshot, out);
             }
-            if let Some(v) = kv.value.as_deref().and_then(|v| v.raw_expr.as_deref()) {
+            if let Some(v) = kv.value.as_deref().and_then(|v| v.raw_expr.as_ref()) {
                 walk(v, snapshot, out);
             }
         }
-        node::Node::JsonValueExpr(v) => {
+        ast::Node::JsonValueExpr(v) => {
             if let Some(e) = &v.raw_expr {
                 walk(e, snapshot, out);
             }
         }
-        node::Node::JsonIsPredicate(p) => {
+        ast::Node::JsonIsPredicate(p) => {
             if let Some(e) = &p.expr {
                 walk(e, snapshot, out);
             }
         }
-        node::Node::JsonScalarExpr(s) => {
+        ast::Node::JsonScalarExpr(s) => {
             if let Some(e) = &s.expr {
                 walk(e, snapshot, out);
             }
         }
-        node::Node::JsonFuncExpr(f) => {
-            if let Some(e) = f
-                .context_item
-                .as_deref()
-                .and_then(|v| v.raw_expr.as_deref())
-            {
+        ast::Node::JsonFuncExpr(f) => {
+            if let Some(e) = f.context_item.as_deref().and_then(|v| v.raw_expr.as_ref()) {
                 walk(e, snapshot, out);
             }
             if let Some(p) = &f.pathspec {
                 walk(p, snapshot, out);
             }
         }
-        node::Node::AExpr(e) => {
+        ast::Node::AExpr(e) => {
             if let Some(l) = &e.lexpr {
                 walk(l, snapshot, out);
             }
@@ -966,35 +964,35 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                 walk(r, snapshot, out);
             }
         }
-        node::Node::BoolExpr(b) => {
-            for a in &b.args {
+        ast::Node::BoolExpr(b) => {
+            for a in b.args.iter().flatten() {
                 walk(a, snapshot, out);
             }
         }
-        node::Node::NullTest(t) => {
+        ast::Node::NullTest(t) => {
             if let Some(a) = &t.arg {
                 walk(a, snapshot, out);
             }
         }
-        node::Node::BooleanTest(t) => {
+        ast::Node::BooleanTest(t) => {
             if let Some(a) = &t.arg {
                 walk(a, snapshot, out);
             }
         }
-        node::Node::CoalesceExpr(c) => {
-            for a in &c.args {
+        ast::Node::CoalesceExpr(c) => {
+            for a in c.args.iter().flatten() {
                 walk(a, snapshot, out);
             }
         }
-        node::Node::CaseExpr(c) => {
-            for w in &c.args {
+        ast::Node::CaseExpr(c) => {
+            for w in c.args.iter().flatten() {
                 walk(w, snapshot, out);
             }
             if let Some(d) = &c.defresult {
                 walk(d, snapshot, out);
             }
         }
-        node::Node::CaseWhen(w) => {
+        ast::Node::CaseWhen(w) => {
             if let Some(e) = &w.expr {
                 walk(e, snapshot, out);
             }
@@ -1002,17 +1000,17 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
                 walk(r, snapshot, out);
             }
         }
-        node::Node::TypeCast(c) => {
+        ast::Node::TypeCast(c) => {
             if let Some(a) = &c.arg {
                 walk(a, snapshot, out);
             }
         }
-        node::Node::List(l) => {
-            for i in &l.items {
+        ast::Node::List(l) => {
+            for i in l.items.iter().flatten() {
                 walk(i, snapshot, out);
             }
         }
-        node::Node::SubLink(_) => {
+        ast::Node::SubLink(_) => {
             // Do NOT descend into subqueries — a SubLink is its own scope
             // and aggregates/windows inside it belong to that scope, not
             // the one we're validating.
@@ -1032,7 +1030,7 @@ fn walk(node: &protobuf::Node, snapshot: &PgCatalog, out: &mut FuncKindPresence)
 /// recorded as a constraint.  After inference, the result is checked for
 /// compatibility with the goal (raising `TypeMismatch` on failure).
 pub(crate) fn infer_expr(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     goal: TypeGoal,
@@ -1044,7 +1042,7 @@ pub(crate) fn infer_expr(
 thread_local! {
     /// The expressions being inferred, innermost last, each query level's
     /// behind a null boundary (see [`sublink_planned`]).
-    static ENCLOSING: std::cell::RefCell<Vec<*const protobuf::Node>> =
+    static ENCLOSING: std::cell::RefCell<Vec<*const Option<ast::Node>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1052,7 +1050,7 @@ thread_local! {
 pub(crate) struct Enclosing;
 
 impl Enclosing {
-    fn push(node: &protobuf::Node) -> Enclosing {
+    fn push(node: &Option<ast::Node>) -> Enclosing {
         ENCLOSING.with(|e| e.borrow_mut().push(node));
         Enclosing
     }
@@ -1081,7 +1079,7 @@ pub(crate) fn sublink_planned(ctx: Ctx<'_>) -> bool {
     if !plan_time_checks() {
         return false;
     }
-    let enclosing: Vec<*const protobuf::Node> = ENCLOSING.with(|e| {
+    let enclosing: Vec<*const Option<ast::Node>> = ENCLOSING.with(|e| {
         e.borrow()
             .iter()
             .rev()
@@ -1100,7 +1098,7 @@ pub(crate) fn sublink_planned(ctx: Ctx<'_>) -> bool {
 
 /// The expressions of the current query level being inferred, innermost
 /// last (see [`ENCLOSING`]).
-fn level_enclosing() -> Vec<*const protobuf::Node> {
+fn level_enclosing() -> Vec<*const Option<ast::Node>> {
     ENCLOSING.with(|e| {
         let e = e.borrow();
         let start = e.iter().rposition(|p| p.is_null()).map_or(0, |i| i + 1);
@@ -1111,8 +1109,8 @@ fn level_enclosing() -> Vec<*const protobuf::Node> {
 /// Whether `chain` (expressions, outermost first) is the level's WHERE
 /// clause and AND arguments down from it: what reaches its innermost one
 /// is a top-level AND argument of the WHERE.
-fn where_conjunction(chain: &[*const protobuf::Node]) -> bool {
-    let and = protobuf::BoolExprType::AndExpr as i32;
+fn where_conjunction(chain: &[*const Option<ast::Node>]) -> bool {
+    let and = ast::BoolExprType::AndExpr;
     chain
         .first()
         .is_some_and(|&p| plan_fold::is_where_clause(p))
@@ -1120,14 +1118,14 @@ fn where_conjunction(chain: &[*const protobuf::Node]) -> bool {
             // SAFETY: as in `sublink_planned`, each pointer is a node an
             // `infer_expr` call still on the stack borrows.
             let n = unsafe { &*p };
-            matches!(n.node.as_ref(), Some(node::Node::BoolExpr(b)) if b.boolop == and)
+            matches!(n.as_ref(), Some(ast::Node::BoolExpr(b)) if b.boolop == and)
         })
 }
 
 /// Whether sublink `sub`, a top-level AND argument of the level's WHERE,
 /// becomes a semi-join (see [`plan_fold::joined_any_sublink`]), in the
 /// scope of `ctx`.
-fn joined_sublink(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
+fn joined_sublink(sub: &ast::SubLink, ctx: Ctx<'_>) -> bool {
     let available = plan_fold::where_available();
     plan_fold::joined_any_sublink(sub, ctx.snapshot, &|cr| {
         level_column(cr, ctx, available.as_deref())
@@ -1138,7 +1136,7 @@ fn joined_sublink(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
 
 /// [`joined_sublink`] for an EXISTS (see
 /// [`plan_fold::joined_exists_sublink`]).
-fn joined_exists(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
+fn joined_exists(sub: &ast::SubLink, ctx: Ctx<'_>) -> bool {
     let available = plan_fold::where_available();
     plan_fold::joined_exists_sublink(sub, ctx.snapshot, &|cr| {
         level_column(cr, ctx, available.as_deref())
@@ -1149,7 +1147,7 @@ fn joined_exists(sub: &protobuf::SubLink, ctx: Ctx<'_>) -> bool {
 
 /// Whether column `cr` is one of the level's FROM items (in the scope
 /// of `ctx`) — one of `available` when given.
-fn level_column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>, available: Option<&[String]>) -> bool {
+fn level_column(cr: &ast::ColumnRef, ctx: Ctx<'_>, available: Option<&[String]>) -> bool {
     let parts = extract_string_fields(&cr.fields);
     let (table, column) = match parts.as_slice() {
         [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
@@ -1172,14 +1170,14 @@ fn level_column(cr: &protobuf::ColumnRef, ctx: Ctx<'_>, available: Option<&[Stri
 /// a column may be told the query's own when it is qualified by a FROM
 /// item of the query's, or (unqualified) a column of one of its tables;
 /// any other naming one of the level's other items may be one of theirs.
-fn reads_only_available(sub: &protobuf::SubLink, ctx: Ctx<'_>, available: &[String]) -> bool {
+fn reads_only_available(sub: &ast::SubLink, ctx: Ctx<'_>, available: &[String]) -> bool {
     let others: Vec<&crate::scope::TableSource> = ctx
         .scope
         .sources
         .iter()
         .filter(|s| !available.contains(&s.alias))
         .collect();
-    if let Some(test) = sub.testexpr.as_deref().and_then(|t| t.node.as_ref()) {
+    if let Some(test) = sub.testexpr.as_ref() {
         for (n, _) in test.nodes() {
             match n {
                 // Its columns may be the level's too.
@@ -1219,7 +1217,7 @@ fn reads_only_available(sub: &protobuf::SubLink, ctx: Ctx<'_>, available: &[Stri
 /// Whether `arg`, an argument of the AND being inferred, is a sublink
 /// `pull_up_sublinks` turns into a semi-join before the AND is folded:
 /// one folding to FALSE before it doesn't drop it.
-pub(crate) fn joined_before_folding(arg: &protobuf::Node, ctx: Ctx<'_>) -> bool {
+pub(crate) fn joined_before_folding(arg: &Option<ast::Node>, ctx: Ctx<'_>) -> bool {
     plan_fold::conjunct_sublink(arg).is_some_and(|sub| {
         where_conjunction(&level_enclosing())
             && (joined_sublink(sub, ctx) || joined_exists(sub, ctx))
@@ -1230,12 +1228,12 @@ pub(crate) fn joined_before_folding(arg: &protobuf::Node, ctx: Ctx<'_>) -> bool 
 /// argument of `quals`, the clause [`plan_fold::is_where_clause`] tells
 /// of (an ON clause, see [`plan_fold::with_nullable_on_clause`]), into a
 /// semi-join, in the scope of `ctx`.
-pub(crate) fn pulls_up_sublink(quals: &protobuf::Node, ctx: Ctx<'_>) -> bool {
-    let and = protobuf::BoolExprType::AndExpr as i32;
+pub(crate) fn pulls_up_sublink(quals: &Option<ast::Node>, ctx: Ctx<'_>) -> bool {
+    let and = ast::BoolExprType::AndExpr;
     let mut todo = vec![quals];
     while let Some(q) = todo.pop() {
-        match q.node.as_ref() {
-            Some(node::Node::BoolExpr(b)) if b.boolop == and => todo.extend(&b.args),
+        match q.as_ref() {
+            Some(ast::Node::BoolExpr(b)) if b.boolop == and => todo.extend(&b.args),
             _ => {
                 if plan_fold::conjunct_sublink(q)
                     .is_some_and(|sub| joined_sublink(sub, ctx) || joined_exists(sub, ctx))
@@ -1254,10 +1252,7 @@ pub(crate) fn pulls_up_sublink(quals: &protobuf::Node, ctx: Ctx<'_>) -> bool {
 /// argument of the level's WHERE (see [`plan_fold::joined_any_sublink`]):
 /// as a FROM subquery of the level, whatever the WHERE folds to. `None`
 /// when that isn't certain.
-pub(crate) fn semijoin_level(
-    sel: &protobuf::SelectStmt,
-    ctx: Ctx<'_>,
-) -> Option<plan_fold::NextLevel> {
+pub(crate) fn semijoin_level(sel: &ast::SelectStmt, ctx: Ctx<'_>) -> Option<plan_fold::NextLevel> {
     if !plan_time_checks() {
         return None;
     }
@@ -1265,8 +1260,8 @@ pub(crate) fn semijoin_level(
     let (&last, mut above) = enclosing.split_last()?;
     // SAFETY: as in `sublink_planned`, each pointer is a node an
     // `infer_expr` call still on the stack borrows.
-    let node = |p: *const protobuf::Node| unsafe { &*p };
-    let Some(node::Node::SubLink(sub)) = node(last).node.as_ref() else {
+    let node = |p: *const Option<ast::Node>| unsafe { &*p };
+    let Some(ast::Node::SubLink(sub)) = node(last).as_ref() else {
         return None;
     };
     // A NOT EXISTS is an anti-join.
@@ -1281,9 +1276,8 @@ pub(crate) fn semijoin_level(
     }
     if !sub
         .subselect
-        .as_deref()
-        .and_then(|s| s.node.as_ref())
-        .is_some_and(|s| matches!(s, node::Node::SelectStmt(s) if std::ptr::eq(&**s, sel)))
+        .as_ref()
+        .is_some_and(|s| matches!(s, ast::Node::SelectStmt(s) if std::ptr::eq(&**s, sel)))
     {
         return None;
     }
@@ -1315,7 +1309,7 @@ pub(crate) fn semijoin_level(
 }
 
 fn infer_expr_here(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     goal: TypeGoal,
@@ -1329,8 +1323,8 @@ fn infer_expr_here(
     if t.nullable
         && ctx.null_ctx.has_expr_facts()
         && !matches!(
-            node.node.as_ref(),
-            Some(node::Node::ColumnRef(_) | node::Node::AConst(_) | node::Node::ParamRef(_))
+            node.as_ref(),
+            Some(ast::Node::ColumnRef(_) | ast::Node::AConst(_) | ast::Node::ParamRef(_))
         )
         && ctx
             .null_ctx
@@ -1355,23 +1349,22 @@ fn infer_expr_here(
 }
 
 fn infer_expr_unlocated(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     goal: TypeGoal,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
     let inner = node
-        .node
         .as_ref()
         .ok_or_else(|| AnalyzeError::Unsupported("empty node".into()))?;
 
     let mut result = match inner {
-        node::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx, params),
-        node::Node::AConst(a_const) => infer_a_const(a_const),
-        node::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
+        ast::Node::ColumnRef(col_ref) => infer_column_ref(col_ref, ctx, params),
+        ast::Node::AConst(a_const) => infer_a_const(a_const),
+        ast::Node::TypeCast(cast) => match passthrough_cast_operand(node, snapshot, params) {
             Some(operand) => {
-                if let Some(node::Node::ParamRef(p)) = operand.node.as_ref()
+                if let Some(ast::Node::ParamRef(p)) = operand.as_ref()
                     && params.get(p.number) == oid::UNKNOWN
                 {
                     params.mark_untyped_cast_operand(p.location);
@@ -1382,16 +1375,16 @@ fn infer_expr_unlocated(
                 .and_then(|t| check_folding(node, ctx).map(|()| t))
                 .and_then(|t| check_io_coercion(cast, ctx).map(|()| t)),
         },
-        node::Node::FuncCall(func) => infer_func_call(func, ctx, params),
+        ast::Node::FuncCall(func) => infer_func_call(func, ctx, params),
         // `name => value` only occurs as a function-call argument; its type is
         // the value's. The enclosing call resolves the name.
-        node::Node::NamedArgExpr(na) => match na.arg.as_deref() {
-            Some(arg) => infer_expr(arg, ctx, params, goal.clone()),
+        ast::Node::NamedArgExpr(na) => match &na.arg {
+            arg @ Some(_) => infer_expr(arg, ctx, params, goal.clone()),
             None => Err(AnalyzeError::Unsupported(
                 "named argument without a value".into(),
             )),
         },
-        node::Node::GroupingFunc(g) => {
+        ast::Node::GroupingFunc(g) => {
             // `GROUPING(expr, …)` — returns int4 indicating which of the
             // listed expressions are *missing* from the current grouping
             // set. Always defined → NOT NULL. Walk the args so params get
@@ -1401,12 +1394,12 @@ fn infer_expr_unlocated(
             }
             Ok(ExprType::scalar(oid::INT4, false))
         }
-        node::Node::AExpr(expr) => {
+        ast::Node::AExpr(expr) => {
             infer_a_expr(expr, ctx, params).and_then(|t| check_folding(node, ctx).map(|()| t))
         }
-        node::Node::BoolExpr(expr) => infer_bool_expr(expr, ctx, params),
-        node::Node::NullTest(t) => {
-            if let Some(arg) = &t.arg {
+        ast::Node::BoolExpr(expr) => infer_bool_expr(expr, ctx, params),
+        ast::Node::NullTest(t) => {
+            if let arg @ Some(_) = &t.arg {
                 let arg_type = infer_expr(arg, ctx, params, TypeGoal::NONE)?;
                 // Record the argument's own inferred nullability — the test
                 // itself proves nothing about it — for the lint's
@@ -1436,18 +1429,18 @@ fn infer_expr_unlocated(
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }
-        node::Node::BooleanTest(t) => {
+        ast::Node::BooleanTest(t) => {
             // `x IS [NOT] TRUE/FALSE/UNKNOWN` coerces its operand to boolean
             // (PG's coerce_to_boolean) — so a bare `$1 IS TRUE` pins the
             // param as bool, and a non-boolean operand gets PG's wording
             // from the shared clause walker.
-            if let Some(arg) = &t.arg {
-                let label = match protobuf::BoolTestType::try_from(t.booltesttype) {
-                    Ok(protobuf::BoolTestType::IsTrue) => "IS TRUE",
-                    Ok(protobuf::BoolTestType::IsNotTrue) => "IS NOT TRUE",
-                    Ok(protobuf::BoolTestType::IsFalse) => "IS FALSE",
-                    Ok(protobuf::BoolTestType::IsNotFalse) => "IS NOT FALSE",
-                    Ok(protobuf::BoolTestType::IsUnknown) => "IS UNKNOWN",
+            if let arg @ Some(_) = &t.arg {
+                let label = match t.booltesttype {
+                    ast::BoolTestType::IsTrue => "IS TRUE",
+                    ast::BoolTestType::IsNotTrue => "IS NOT TRUE",
+                    ast::BoolTestType::IsFalse => "IS FALSE",
+                    ast::BoolTestType::IsNotFalse => "IS NOT FALSE",
+                    ast::BoolTestType::IsUnknown => "IS UNKNOWN",
                     _ => "IS NOT UNKNOWN",
                 };
                 crate::clause::coerce_clause_expr(
@@ -1459,10 +1452,10 @@ fn infer_expr_unlocated(
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }
-        node::Node::CoalesceExpr(expr) => infer_coalesce(expr, ctx, params),
-        node::Node::CaseExpr(expr) => infer_case(expr, ctx, params),
-        node::Node::SubLink(sub) => infer_sublink(sub, ctx, params),
-        node::Node::ParamRef(p) => {
+        ast::Node::CoalesceExpr(expr) => infer_coalesce(expr, ctx, params),
+        ast::Node::CaseExpr(expr) => infer_case(expr, ctx, params),
+        ast::Node::SubLink(sub) => infer_sublink(sub, ctx, params),
+        ast::Node::ParamRef(p) => {
             if let Some(arg) = params.bound_arg(p.number) {
                 return Ok(arg.clone());
             }
@@ -1481,14 +1474,14 @@ fn infer_expr_unlocated(
             };
             Ok(ExprType::scalar(type_oid, params.read_nullable(p.number)).with_refine(refine))
         }
-        node::Node::MinMaxExpr(mm) => {
+        ast::Node::MinMaxExpr(mm) => {
             // `GREATEST`/`LEAST` are non-strict: they skip NULL args and
             // return NULL only when every arg is NULL. typedpg_pg_query's AST
             // doesn't fill in `minmaxtype` without full parse analysis —
             // we resolve the common type from the args and track per-arg
             // nullability.
-            let label = match protobuf::MinMaxOp::try_from(mm.op) {
-                Ok(protobuf::MinMaxOp::IsLeast) => "LEAST",
+            let label = match mm.op {
+                ast::MinMaxOp::IsLeast => "LEAST",
                 _ => "GREATEST",
             };
             let mut args = Vec::with_capacity(mm.args.len());
@@ -1499,7 +1492,7 @@ fn infer_expr_unlocated(
             let resolved_type = match PgTypeOid::new(mm.minmaxtype) {
                 Some(t) if t != oid::UNKNOWN => t,
                 _ => {
-                    let nodes: Vec<&protobuf::Node> = mm.args.iter().collect();
+                    let nodes: Vec<&Option<ast::Node>> = mm.args.iter().collect();
                     select_common_type(label, &types, &nodes, snapshot)?
                 }
             };
@@ -1540,7 +1533,8 @@ fn infer_expr_unlocated(
                 crate::nonnull::StrictNode::FloatFold,
                 crate::nonnull::subst::folds_as_float(resolved_type, snapshot),
             );
-            let branches: Vec<(&protobuf::Node, &ExprType)> = mm.args.iter().zip(&args).collect();
+            let branches: Vec<(&Option<ast::Node>, &ExprType)> =
+                mm.args.iter().zip(&args).collect();
             let mut refine = conditional::branches_refine(&branches, resolved_type, snapshot);
             // GREATEST is at least each non-NULL argument (LEAST at most):
             // a NOT NULL one bounds it whatever the others are.
@@ -1566,9 +1560,9 @@ fn infer_expr_unlocated(
                     .with_refine(refine),
             )
         }
-        node::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
-        node::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
-        node::Node::RowExpr(row) => {
+        ast::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
+        ast::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
+        ast::Node::RowExpr(row) => {
             // When the enclosing context expects a registered composite
             // type (a cast, `UPDATE SET composite_col = ROW(...)`, a
             // composite function argument), PG's coerce_record_to_complex
@@ -1578,10 +1572,10 @@ fn infer_expr_unlocated(
                 return coerce_record_to_complex(node, goal.type_oid, goal.coercion, ctx, params);
             }
             let expanded;
-            let row: &protobuf::RowExpr = match expand_row_args(&row.args, ctx, params)? {
+            let row: &ast::RowExpr = match expand_row_args(&row.args, ctx, params)? {
                 std::borrow::Cow::Borrowed(_) => row,
                 std::borrow::Cow::Owned(args) => {
-                    expanded = protobuf::RowExpr {
+                    expanded = ast::RowExpr {
                         args,
                         ..(**row).clone()
                     };
@@ -1628,7 +1622,7 @@ fn infer_expr_unlocated(
                 unknown_value: false,
             })
         }
-        node::Node::SetToDefault(d) => {
+        ast::Node::SetToDefault(d) => {
             // `DEFAULT` is only meaningful as the whole value of an INSERT /
             // UPDATE target, which the DML analyzers handle before reaching
             // here; anywhere else PG's transformExprRecurse rejects it.
@@ -1639,14 +1633,13 @@ fn infer_expr_unlocated(
             )
             .finalize_implicit())
         }
-        node::Node::CollateClause(c) => {
+        ast::Node::CollateClause(c) => {
             // `expr COLLATE "x"` is metadata-only — it changes how the
             // surrounding operator compares strings, not the result type or
             // nullability. Forward the goal so a `$param COLLATE "x"`
             // placeholder still picks up its expected type.
-            let arg = c
-                .arg
-                .as_ref()
+            let arg = &c.arg;
+            arg.as_ref()
                 .ok_or_else(|| AnalyzeError::Internal("CollateClause without arg".into()))?;
             // PG rejects unknown collation names up front; mirror that.
             // `collname` is a list of identifier nodes (`["pg_catalog", "C"]`
@@ -1654,8 +1647,8 @@ fn infer_expr_unlocated(
             let parts: Vec<&str> = c
                 .collname
                 .iter()
-                .filter_map(|n| match n.node.as_ref()? {
-                    node::Node::String(s) => Some(s.sval.as_str()),
+                .filter_map(|n| match n.as_ref()? {
+                    ast::Node::String(s) => Some(s.sval.as_str()),
                     _ => None,
                 })
                 .collect();
@@ -1741,14 +1734,13 @@ fn infer_expr_unlocated(
                 )
             });
         }
-        node::Node::SqlvalueFunction(svf) => {
+        ast::Node::SqlValueFunction(svf) => {
             // SQL value functions: `CURRENT_DATE`, `CURRENT_TIMESTAMP`,
             // `CURRENT_USER`, `CURRENT_SCHEMA`, `LOCALTIME`, … typedpg_pg_query leaves
             // the result OID at 0 in the raw tree, so map the op ourselves
             // (PG's gram.y assigns these). All but CURRENT_SCHEMA are never NULL.
-            use protobuf::SqlValueFunctionOp as Op;
-            let op = protobuf::SqlValueFunctionOp::try_from(svf.op)
-                .unwrap_or(Op::SqlvalueFunctionOpUndefined);
+            use ast::SqlValueFunctionOp as Op;
+            let op = svf.op;
             let type_oid = match op {
                 Op::SvfopCurrentDate => oid::DATE,
                 Op::SvfopCurrentTime | Op::SvfopCurrentTimeN => oid::TIMETZ,
@@ -1761,11 +1753,6 @@ fn infer_expr_unlocated(
                 | Op::SvfopSessionUser
                 | Op::SvfopCurrentCatalog
                 | Op::SvfopCurrentSchema => oid::NAME,
-                Op::SqlvalueFunctionOpUndefined => {
-                    return Err(AnalyzeError::Unsupported(
-                        "unknown SQL value function".into(),
-                    ));
-                }
             };
             // The `(n)` precision variants carry a typmod; the base type is
             // unchanged. Forward it so e.g. `current_time(3)` keeps its typmod.
@@ -1781,22 +1768,22 @@ fn infer_expr_unlocated(
             Ok(ExprType::scalar_with_typmod(type_oid, nullable, typmod)
                 .with_refine(crate::refine::Refinement::FINITE))
         }
-        node::Node::MergeSupportFunc(f) => crate::resolve::infer_merge_support_func(f),
+        ast::Node::MergeSupportFunc(f) => crate::resolve::infer_merge_support_func(f),
         // `WHERE CURRENT OF cursor` (UPDATE / DELETE only, by grammar): a
         // boolean test against the cursor's current row.
-        node::Node::CurrentOfExpr(_) => Ok(ExprType::scalar(oid::BOOL, false)),
-        node::Node::JsonFuncExpr(f) => infer_json_func_expr(f, ctx, params),
-        node::Node::JsonParseExpr(p) => infer_json_parse(p, ctx, params),
-        node::Node::JsonScalarExpr(s) => infer_json_scalar(s, ctx, params),
-        node::Node::JsonSerializeExpr(s) => infer_json_serialize(s, ctx, params),
-        node::Node::JsonObjectConstructor(c) => infer_json_object(c, ctx, params),
-        node::Node::JsonArrayConstructor(c) => infer_json_array(c, ctx, params),
-        node::Node::JsonArrayQueryConstructor(c) => infer_json_array_query(c, ctx, params),
-        node::Node::JsonObjectAgg(a) => infer_json_objectagg(a, ctx, params),
-        node::Node::JsonArrayAgg(a) => infer_json_arrayagg(a, ctx, params),
-        node::Node::JsonIsPredicate(p) => infer_json_is_predicate(p, ctx, params),
-        node::Node::XmlExpr(x) => infer_xml_expr(x, ctx, params),
-        node::Node::XmlSerialize(xs) => infer_xml_serialize(xs, ctx, params),
+        ast::Node::CurrentOfExpr(_) => Ok(ExprType::scalar(oid::BOOL, false)),
+        ast::Node::JsonFuncExpr(f) => infer_json_func_expr(f, ctx, params),
+        ast::Node::JsonParseExpr(p) => infer_json_parse(p, ctx, params),
+        ast::Node::JsonScalarExpr(s) => infer_json_scalar(s, ctx, params),
+        ast::Node::JsonSerializeExpr(s) => infer_json_serialize(s, ctx, params),
+        ast::Node::JsonObjectConstructor(c) => infer_json_object(c, ctx, params),
+        ast::Node::JsonArrayConstructor(c) => infer_json_array(c, ctx, params),
+        ast::Node::JsonArrayQueryConstructor(c) => infer_json_array_query(c, ctx, params),
+        ast::Node::JsonObjectAgg(a) => infer_json_objectagg(a, ctx, params),
+        ast::Node::JsonArrayAgg(a) => infer_json_arrayagg(a, ctx, params),
+        ast::Node::JsonIsPredicate(p) => infer_json_is_predicate(p, ctx, params),
+        ast::Node::XmlExpr(x) => infer_xml_expr(x, ctx, params),
+        ast::Node::XmlSerialize(xs) => infer_xml_serialize(xs, ctx, params),
         _ => Err(crate::error::RawError::unsupported(
             format!(
                 "typedpg does not support {} expressions yet",
@@ -1817,17 +1804,17 @@ fn infer_expr_unlocated(
     // gets its *content* validated here.
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN
-        && let Some(node::Node::AConst(ac)) = node.node.as_ref()
+        && let Some(ast::Node::AConst(ac)) = node.as_ref()
         && !ac.isnull
-        && matches!(ac.val, Some(a_const::Val::Sval(_)))
+        && matches!(ac.val, Some(ast::AConstValue::String(_)))
     {
         ctx.note_literal_type(ac.location, goal.type_oid);
     }
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN
-        && let Some(node::Node::AConst(ac)) = node.node.as_ref()
+        && let Some(ast::Node::AConst(ac)) = node.as_ref()
         && !ac.isnull
-        && let Some(a_const::Val::Sval(sv)) = &ac.val
+        && let Some(ast::AConstValue::String(sv)) = &ac.val
         && let Err(msg) = crate::literal_input::validate_with_typmod(
             &sv.sval,
             goal.type_oid,
@@ -1851,7 +1838,7 @@ fn infer_expr_unlocated(
     }
 
     if goal.has_expectation() && result.unknown_value {
-        unknown_value_coercion(goal.type_oid, goal.coercion, snapshot, node)?;
+        unknown_value_coercion(goal.type_oid, goal.coercion, snapshot, node.as_ref())?;
     }
 
     // Verify result is compatible with the goal type. Pass the location
@@ -1874,7 +1861,7 @@ pub(crate) fn unknown_value_coercion(
     target: PgTypeOid,
     context: CoercionContext,
     snapshot: &PgCatalog,
-    node: &protobuf::Node,
+    node: Option<&ast::Node>,
 ) -> Result<(), AnalyzeError> {
     if target == oid::UNKNOWN
         || crate::polymorphic::passes_operand_through(target)
@@ -1882,7 +1869,7 @@ pub(crate) fn unknown_value_coercion(
     {
         return Ok(());
     }
-    let span = crate::error::node_location(node).and_then(|loc| {
+    let span = crate::error::node_location(&node.cloned()).and_then(|loc| {
         crate::error::SourceSpan::from_node_qname(loc)
             .or_else(|| crate::error::SourceSpan::from_node_token(loc))
     });
@@ -1901,24 +1888,23 @@ pub(crate) fn unknown_value_coercion(
 /// by `infer_type_cast`) — may change; every other node keeps the
 /// collation it was parsed with, whatever its inputs become, so what an
 /// inference copied from an input is dropped.
-fn planned_after(inner: &node::Node, inferred: Planned, scope: &Scope) -> Planned {
+fn planned_after(inner: &ast::Node, inferred: Planned, scope: &Scope) -> Planned {
     match inner {
         // A field of a FROM entry's row is its column, a Var.
-        node::Node::AIndirection(ind) if whole_row_field_column(ind, scope).is_some() => inferred,
-        node::Node::ColumnRef(_)
-        | node::Node::CaseExpr(_)
-        | node::Node::CoalesceExpr(_)
-        | node::Node::SubLink(_)
-        | node::Node::TypeCast(_)
-        | node::Node::NamedArgExpr(_) => inferred,
+        ast::Node::AIndirection(ind) if whole_row_field_column(ind, scope).is_some() => inferred,
+        ast::Node::ColumnRef(_)
+        | ast::Node::CaseExpr(_)
+        | ast::Node::CoalesceExpr(_)
+        | ast::Node::SubLink(_)
+        | ast::Node::TypeCast(_)
+        | ast::Node::NamedArgExpr(_) => inferred,
         // A function or operator keeps its node unless it is inlined (a
         // column in functional notation, `b(s)`, is a Var).
-        node::Node::FuncCall(_) | node::Node::AExpr(_) | node::Node::AIndirection(_) => {
-            match inferred {
-                Planned::Unknown => Planned::Unknown,
-                _ => Planned::AsParsed,
-            }
-        }
+        ast::Node::FuncCall(_) | ast::Node::AExpr(_) | ast::Node::AIndirection(_) => match inferred
+        {
+            Planned::Unknown => Planned::Unknown,
+            _ => Planned::AsParsed,
+        },
         _ => Planned::AsParsed,
     }
 }
@@ -1955,7 +1941,7 @@ fn swallow_unless_literal<T>(r: Result<T, AnalyzeError>) -> Result<(), AnalyzeEr
 /// open-coded goal walks are how parameters historically ended up typed
 /// differently from PG's Describe.
 pub(crate) fn coerce_unknown_to(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     target: PgTypeOid,
@@ -1991,15 +1977,15 @@ pub(crate) fn coerce_unknown_to(
 /// already fixed: the caller runs that pass under
 /// [`with_targets_replayed`], where every subquery entry is skipped here.
 pub(crate) fn note_untyped_output_params(
-    target_list: &[protobuf::Node],
+    target_list: &[Option<ast::Node>],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let is_bare_param = |target: &protobuf::Node| {
+    let is_bare_param = |target: &Option<ast::Node>| {
         matches!(
-            target.node.as_ref(),
-            Some(node::Node::ResTarget(rt))
-                if rt.val.as_deref().and_then(|v| bare_param(v, ctx.snapshot)).is_some()
+            target.as_ref(),
+            Some(ast::Node::ResTarget(rt))
+                if bare_param(&rt.val, ctx.snapshot).is_some()
         )
     };
     let last_bare_param = target_list.iter().rposition(is_bare_param);
@@ -2038,7 +2024,7 @@ pub(crate) fn with_targets_replayed<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn replay_targets(
-    target_list: &[protobuf::Node],
+    target_list: &[Option<ast::Node>],
     last_bare_param: Option<usize>,
     replayed: bool,
     ctx: Ctx<'_>,
@@ -2046,12 +2032,13 @@ fn replay_targets(
     scratch: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
     for (i, target) in target_list.iter().enumerate() {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             continue;
         };
-        let Some(val) = rt.val.as_deref() else {
+        let val = &rt.val;
+        if val.is_none() {
             continue;
-        };
+        }
         if let Some(p) = bare_param(val, ctx.snapshot) {
             if scratch.get(p.number) == oid::UNKNOWN {
                 params.mark_untyped_output(p.location);
@@ -2062,14 +2049,14 @@ fn replay_targets(
         }
         // `*` / `t.*` / `(expr).*` expand rather than resolve as one
         // expression; the final pass handles them.
-        let star = |fields: &[protobuf::Node]| {
+        let star = |fields: &[Option<ast::Node>]| {
             fields
                 .iter()
-                .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+                .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
         };
-        match val.node.as_ref() {
-            Some(node::Node::ColumnRef(c)) if star(&c.fields) => continue,
-            Some(node::Node::AIndirection(i)) if star(&i.indirection) => continue,
+        match val.as_ref() {
+            Some(ast::Node::ColumnRef(c)) if star(&c.fields) => continue,
+            Some(ast::Node::AIndirection(i)) if star(&i.indirection) => continue,
             _ => {}
         }
         if has_sublink(val)
@@ -2096,7 +2083,7 @@ fn replay_targets(
 /// coerce with [`coerce_untyped_param`]. An item failing here is left to
 /// the caller's own pass, which reports it in its context.
 pub(crate) fn replay_transform(
-    items: &[&protobuf::Node],
+    items: &[&Option<ast::Node>],
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Vec<bool> {
@@ -2129,7 +2116,7 @@ impl TransformReplay {
     /// transformed while `$N` was untyped.
     pub(crate) fn item(
         &mut self,
-        item: &protobuf::Node,
+        item: &Option<ast::Node>,
         ctx: Ctx<'_>,
         params: &ParamCollector,
     ) -> bool {
@@ -2175,7 +2162,7 @@ impl TransformReplay {
 /// `variable_coerce_param_hook` on a bare `$N` that was transformed while
 /// untyped (see [`replay_transform`]), coerced to `target`.
 pub(crate) fn coerce_untyped_param(
-    p: &protobuf::ParamRef,
+    p: &ast::ParamRef,
     target: PgTypeOid,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
@@ -2191,7 +2178,7 @@ pub(crate) fn coerce_untyped_param(
 /// any later key or clause is looked at (`ORDER BY $1, x = $1` with an
 /// integer `x` is `integer = text`).
 pub(crate) fn resolve_unknown_key(
-    key: &protobuf::Node,
+    key: &Option<ast::Node>,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -2209,7 +2196,7 @@ pub(crate) fn resolve_unknown_key(
 /// bare `$N` among them is an untyped parameter node, coerced through
 /// [`coerce_untyped_param`] (`$1 = ANY($1)` deduces text, then text[]).
 pub(crate) fn coerce_unknown_operand(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     target: PgTypeOid,
@@ -2225,9 +2212,9 @@ pub(crate) fn coerce_unknown_operand(
 }
 
 /// Whether `expr` is or holds a `$N`.
-fn has_param_ref(expr: &protobuf::Node) -> bool {
-    expr.node.as_ref().is_some_and(|inner| {
-        matches!(inner, node::Node::ParamRef(_))
+fn has_param_ref(expr: &Option<ast::Node>) -> bool {
+    expr.as_ref().is_some_and(|inner| {
+        matches!(inner, ast::Node::ParamRef(_))
             || inner
                 .nodes()
                 .into_iter()
@@ -2236,9 +2223,9 @@ fn has_param_ref(expr: &protobuf::Node) -> bool {
 }
 
 /// Whether `expr` is or holds a subquery.
-fn has_sublink(expr: &protobuf::Node) -> bool {
-    expr.node.as_ref().is_some_and(|inner| {
-        matches!(inner, node::Node::SubLink(_))
+fn has_sublink(expr: &Option<ast::Node>) -> bool {
+    expr.as_ref().is_some_and(|inner| {
+        matches!(inner, ast::Node::SubLink(_))
             || inner
                 .nodes()
                 .into_iter()
@@ -2255,18 +2242,18 @@ fn has_sublink(expr: &protobuf::Node) -> bool {
 /// a sublink or a CTE body; set-operation arms and `INSERT … SELECT` coerce
 /// their unknowns to another type instead.
 pub(crate) fn resolve_untyped_output_params(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    if sel.op != protobuf::SetOperation::SetopNone as i32 || !sel.values_lists.is_empty() {
+    if sel.op != ast::SetOperation::SetopNone || !sel.values_lists.is_empty() {
         return Ok(());
     }
     for target in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = target.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             continue;
         };
-        let Some(p) = rt.val.as_deref().and_then(|v| bare_param(v, snapshot)) else {
+        let Some(p) = bare_param(&rt.val, snapshot) else {
             continue;
         };
         if !params.is_untyped_output(p.location) {
@@ -2507,7 +2494,7 @@ pub(crate) fn capture_plan_time_errors<R>(f: impl FnOnce() -> R) -> (R, Vec<Plan
 /// or an operator, its operands already checked), under
 /// [`with_plan_time_checks`]: `40000::int2`, `2147483647 + 1`, `1 / 0`
 /// fail every execution (see [`crate::fold`]).
-fn check_folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
+fn check_folding(node: &Option<ast::Node>, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
     if plan_time_checks()
         && let Some(e) = crate::fold::error_in(node, ctx.snapshot, &|cr| {
             plan_fold::substituted_column(cr, ctx)
@@ -2527,7 +2514,7 @@ fn check_folding(node: &protobuf::Node, ctx: Ctx<'_>) -> Result<(), AnalyzeError
 /// `int2in`'s error, as `'40000'::int2` fails parse analysis. Only for the
 /// built-in types whose input functions are immutable and modelled (see
 /// [`crate::literal_input`]).
-fn check_io_coercion(cast: &protobuf::TypeCast, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
+fn check_io_coercion(cast: &ast::TypeCast, ctx: Ctx<'_>) -> Result<(), AnalyzeError> {
     if !plan_time_checks() {
         return Ok(());
     }
@@ -2548,7 +2535,7 @@ fn check_io_coercion(cast: &protobuf::TypeCast, ctx: Ctx<'_>) -> Result<(), Anal
     ) {
         return Ok(());
     }
-    let Some(text) = cast.arg.as_deref().and_then(|a| text_constant(a, ctx)) else {
+    let Some(text) = text_constant(cast.arg.as_ref(), ctx) else {
         return Ok(());
     };
     // A cast function from text (a user's) isn't an I/O conversion.
@@ -2563,7 +2550,7 @@ fn check_io_coercion(cast: &protobuf::TypeCast, ctx: Ctx<'_>) -> Result<(), Anal
     match crate::literal_input::validate_with_typmod(&text, target, None, snapshot) {
         Ok(()) => Ok(()),
         Err(msg) => {
-            let location = cast.arg.as_deref().and_then(crate::error::node_location);
+            let location = crate::error::node_location(&cast.arg);
             let span = location.and_then(crate::error::SourceSpan::from_node_token);
             let e = crate::error::RawError::invalid_literal(msg, span).finalize_implicit();
             plan_time_error(location, e).map_or(Ok(()), Err)
@@ -2575,25 +2562,25 @@ fn check_io_coercion(cast: &protobuf::TypeCast, ctx: Ctx<'_>) -> Result<(), Anal
 /// literal cast to `text` (or `varchar` without a length), or a column the
 /// planner replaces by one (a pulled-up subquery's untyped literal output,
 /// resolved to `text`).
-fn text_constant(n: &protobuf::Node, ctx: Ctx<'_>) -> Option<String> {
-    let string = |n: &protobuf::Node| match n.node.as_ref()? {
-        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            a_const::Val::Sval(s) => Some(s.sval.clone()),
+fn text_constant(n: Option<&ast::Node>, ctx: Ctx<'_>) -> Option<String> {
+    let string = |n: Option<&ast::Node>| match n? {
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::String(s) => Some(s.sval.clone()),
             _ => None,
         },
         _ => None,
     };
-    match n.node.as_ref()? {
-        node::Node::TypeCast(tc) => {
+    match n? {
+        ast::Node::TypeCast(tc) => {
             let tn = tc.type_name.as_ref()?;
             let to = crate::ddl::util::resolve_type_name(tn, ctx.snapshot)?;
             (tn.array_bounds.is_empty()
                 && tn.typmods.is_empty()
                 && matches!(to, oid::TEXT | oid::VARCHAR))
-            .then(|| string(tc.arg.as_deref()?))
+            .then(|| string(tc.arg.as_ref()))
             .flatten()
         }
-        node::Node::ColumnRef(cr) => {
+        ast::Node::ColumnRef(cr) => {
             let e = plan_fold::substituted_column(cr, ctx)?;
             let parts = extract_string_fields(&cr.fields);
             let (table, column) = match parts.as_slice() {
@@ -2605,9 +2592,9 @@ fn text_constant(n: &protobuf::Node, ctx: Ctx<'_>) -> Option<String> {
             if col.type_oid != oid::TEXT {
                 return None;
             }
-            match e.node.as_ref()? {
-                node::Node::AConst(_) => string(&e),
-                node::Node::TypeCast(_) => text_constant(&e, ctx),
+            match &*e {
+                ast::Node::AConst(_) => string(Some(&e)),
+                ast::Node::TypeCast(_) => text_constant(Some(&e), ctx),
                 _ => None,
             }
         }
@@ -2623,47 +2610,47 @@ fn text_constant(n: &protobuf::Node, ctx: Ctx<'_>) -> Option<String> {
 /// Borrowed when no argument is a star. A `(expr).*` over a value with no
 /// fields fails as `ExpandIndirectionStar` does.
 pub(crate) fn expand_row_args<'a>(
-    args: &'a [protobuf::Node],
+    args: &'a [Option<ast::Node>],
     ctx: Ctx<'_>,
     params: &ParamCollector,
-) -> Result<std::borrow::Cow<'a, [protobuf::Node]>, AnalyzeError> {
-    let ends_in_star = |fields: &[protobuf::Node]| {
+) -> Result<std::borrow::Cow<'a, [Option<ast::Node>]>, AnalyzeError> {
+    let ends_in_star = |fields: &[Option<ast::Node>]| {
         matches!(
-            fields.last().and_then(|f| f.node.as_ref()),
-            Some(node::Node::AStar(_))
+            fields.last().and_then(|f| f.as_ref()),
+            Some(ast::Node::AStar(_))
         )
     };
-    let is_star = |a: &protobuf::Node| match a.node.as_ref() {
-        Some(node::Node::ColumnRef(cr)) => ends_in_star(&cr.fields),
-        Some(node::Node::AIndirection(ind)) => ends_in_star(&ind.indirection),
+    let is_star = |a: &Option<ast::Node>| match a.as_ref() {
+        Some(ast::Node::ColumnRef(cr)) => ends_in_star(&cr.fields),
+        Some(ast::Node::AIndirection(ind)) => ends_in_star(&ind.indirection),
         _ => false,
     };
     if !args.iter().any(is_star) {
         return Ok(std::borrow::Cow::Borrowed(args));
     }
-    let string = |s: &str| protobuf::Node {
-        node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
+    let string = |s: &str| {
+        Some(ast::Node::String(NodeBox::new(ast::String {
+            sval: s.to_owned(),
+        })))
     };
     // `(expr).*`: one field selection per field of `expr`'s composite type.
-    let expand_indirection = |ind: &protobuf::AIndirection,
-                              arg: &protobuf::Node,
-                              out: &mut Vec<protobuf::Node>|
+    let expand_indirection = |ind: &ast::AIndirection,
+                              arg: &Option<ast::Node>,
+                              out: &mut Vec<Option<ast::Node>>|
      -> Result<(), AnalyzeError> {
         let mut scratch = params.clone();
         match expand_indirection_star(ind, ctx, &mut scratch)? {
             Some(fields) => {
                 let prefix = &ind.indirection[..ind.indirection.len() - 1];
                 out.extend(fields.iter().map(|(name, _)| {
-                    protobuf::Node {
-                        node: Some(node::Node::AIndirection(Box::new(protobuf::AIndirection {
-                            arg: ind.arg.clone(),
-                            indirection: prefix
-                                .iter()
-                                .cloned()
-                                .chain(std::iter::once(string(name)))
-                                .collect(),
-                        }))),
-                    }
+                    Some(ast::Node::AIndirection(NodeBox::new(ast::AIndirection {
+                        arg: ind.arg.clone(),
+                        indirection: prefix
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(string(name)))
+                            .collect(),
+                    })))
                 }));
             }
             None => out.push(arg.clone()),
@@ -2672,21 +2659,21 @@ pub(crate) fn expand_row_args<'a>(
     };
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
-        match arg.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) if ends_in_star(&cr.fields) => {
+        match arg.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) if ends_in_star(&cr.fields) => {
                 // The relation is named by the last qualifier (`s.t.*` → t);
                 // an unknown one stays as written so the column-reference
                 // walk reports PG's error for it.
-                let rel = cr.fields.iter().rev().find_map(|f| match f.node.as_ref()? {
-                    node::Node::String(s) => Some(s.sval.as_str()),
+                let rel = cr.fields.iter().rev().find_map(|f| match f.as_ref()? {
+                    ast::Node::String(s) => Some(s.sval.as_str()),
                     _ => None,
                 });
                 match rel.and_then(|r| ctx.scope.find_source(r)) {
-                    Some(src) => out.extend(src.columns.iter().map(|c| protobuf::Node {
-                        node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
+                    Some(src) => out.extend(src.columns.iter().map(|c| {
+                        Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
                             fields: vec![string(&src.alias), string(&c.name)],
                             location: cr.location,
-                        })),
+                        })))
                     })),
                     // A SQL function parameter's `v.*` is `(v).*`.
                     None => match sql_function_param_star(cr, ctx.scope, ctx.snapshot) {
@@ -2695,7 +2682,7 @@ pub(crate) fn expand_row_args<'a>(
                     },
                 }
             }
-            Some(node::Node::AIndirection(ind)) if ends_in_star(&ind.indirection) => {
+            Some(ast::Node::AIndirection(ind)) if ends_in_star(&ind.indirection) => {
                 expand_indirection(ind, arg, &mut out)?;
             }
             _ => out.push(arg.clone()),
@@ -2810,7 +2797,7 @@ pub(crate) fn array_element_type(snapshot: &PgCatalog, t: PgTypeOid) -> Option<P
 /// bare string constant as text for type-compatibility checks — NULLIF,
 /// CASE / COALESCE / ARRAY[...] branch merging, UNION column reconciliation.
 pub(crate) fn unknown_literal_as_text(
-    node: Option<&protobuf::Node>,
+    node: Option<&ast::Node>,
     inferred_oid: PgTypeOid,
 ) -> PgTypeOid {
     if inferred_oid != oid::UNKNOWN {
@@ -2818,9 +2805,9 @@ pub(crate) fn unknown_literal_as_text(
     }
     let is_string_literal = node.is_some_and(|n| {
         matches!(
-            n.node.as_ref(),
-            Some(node::Node::AConst(ac))
-                if !ac.isnull && matches!(ac.val, Some(a_const::Val::Sval(_)))
+            n,
+            ast::Node::AConst(ac)
+                if !ac.isnull && matches!(ac.val, Some(ast::AConstValue::String(_)))
         )
     });
     if is_string_literal {
@@ -2877,11 +2864,11 @@ use xml::*;
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Extract string values from a list of nodes.
-pub(crate) fn extract_string_fields(nodes: &[protobuf::Node]) -> Vec<String> {
+pub(crate) fn extract_string_fields(nodes: &[Option<ast::Node>]) -> Vec<String> {
     nodes
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.clone()),
             _ => None,
         })
         .collect()
@@ -2908,7 +2895,7 @@ pub(crate) fn deconstruct_qualified_name(
 
 /// Resolve a TypeName to a type OID.
 fn resolve_type_name(
-    type_name: Option<&protobuf::TypeName>,
+    type_name: Option<&ast::TypeName>,
     snapshot: &PgCatalog,
 ) -> Result<PgTypeOid, AnalyzeError> {
     let tn = type_name.ok_or_else(|| AnalyzeError::Unsupported("missing TypeName".into()))?;

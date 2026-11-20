@@ -1,4 +1,6 @@
 use super::*;
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CTE
@@ -44,7 +46,7 @@ fn nullability_signature(
 }
 
 pub(crate) fn analyze_cte(
-    cte: &protobuf::CommonTableExpr,
+    cte: &ast::CommonTableExpr,
     recursive: bool,
     inlined: Option<bool>,
     snapshot: &PgCatalog,
@@ -52,7 +54,7 @@ pub(crate) fn analyze_cte(
     existing_ctes: &HashMap<String, Vec<ScopeColumn>>,
     outer_tiers: &[Vec<crate::scope::TableSource>],
 ) -> Result<AnalyzedCte, AnalyzeError> {
-    let analyze_body = |sel: &protobuf::SelectStmt,
+    let analyze_body = |sel: &ast::SelectStmt,
                         params: &mut ParamCollector,
                         ctes: &HashMap<String, Vec<ScopeColumn>>| {
         analyze_select_with_ctes_and_outer(sel, snapshot, params, ctes, outer_tiers, &[])
@@ -60,7 +62,6 @@ pub(crate) fn analyze_cte(
     let cte_query = cte
         .ctequery
         .as_ref()
-        .and_then(|n| n.node.as_ref())
         .ok_or_else(|| AnalyzeError::Unsupported("CTE without query".into()))?;
 
     let owner_depth = QUERY_DEPTH.with(|d| d.get());
@@ -72,7 +73,7 @@ pub(crate) fn analyze_cte(
     // the references to them, as planned (see `Planned`); otherwise a
     // reference stays a Var, collated as parsed.
     let pulled_up = inlined == Some(true)
-        && matches!(cte_query, node::Node::SelectStmt(sel)
+        && matches!(cte_query, ast::Node::SelectStmt(sel)
             if super::deferred::plan_of(sel, snapshot) == super::deferred::Plan::PulledUp);
     let planned_in = |p: crate::expr::Planned| match p {
         crate::expr::Planned::Folded { .. } if pulled_up => Some(p),
@@ -84,7 +85,7 @@ pub(crate) fn analyze_cte(
     // An inlined CTE is a subquery: a trivial scan over it may be removed
     // (`removable`: its level summary says it is, when planned on its own).
     let plan = match (inlined, cte_query) {
-        (Some(true), node::Node::SelectStmt(sel)) => Some(super::deferred::plan_of(sel, snapshot)),
+        (Some(true), ast::Node::SelectStmt(sel)) => Some(super::deferred::plan_of(sel, snapshot)),
         (Some(false), _) => None,
         _ => Some(super::deferred::Plan::Uncertain),
     };
@@ -124,7 +125,7 @@ pub(crate) fn analyze_cte(
         // output fixes the CTE's column names and types
         // (analyzeCTETargetList), and only then the recursive term, which
         // sees the CTE with those columns.
-        node::Node::SelectStmt(sel) if recursive && sel.larg.is_some() && sel.rarg.is_some() => {
+        ast::Node::SelectStmt(sel) if recursive && sel.larg.is_some() && sel.rarg.is_some() => {
             let (Some(larg), Some(rarg)) = (sel.larg.as_ref(), sel.rarg.as_ref()) else {
                 unreachable!("guarded above");
             };
@@ -359,7 +360,7 @@ pub(crate) fn analyze_cte(
             }
             columns
         }
-        node::Node::SelectStmt(sel) => {
+        ast::Node::SelectStmt(sel) => {
             let (mut cols, _) = analyze_body(sel, params, existing_ctes)?;
             let summary = take_level_summary();
             min_one_row = summary.min_one_row;
@@ -381,21 +382,21 @@ pub(crate) fn analyze_cte(
             }
             columns
         }
-        node::Node::InsertStmt(_)
-        | node::Node::UpdateStmt(_)
-        | node::Node::DeleteStmt(_)
-        | node::Node::MergeStmt(_) => {
+        ast::Node::InsertStmt(_)
+        | ast::Node::UpdateStmt(_)
+        | ast::Node::DeleteStmt(_)
+        | ast::Node::MergeStmt(_) => {
             let (cols, _) = match cte_query {
-                node::Node::InsertStmt(s) => {
+                ast::Node::InsertStmt(s) => {
                     analyze_insert_with_outer_ctes(s, snapshot, params, existing_ctes)?
                 }
-                node::Node::UpdateStmt(s) => {
+                ast::Node::UpdateStmt(s) => {
                     analyze_update_with_outer_ctes(s, snapshot, params, existing_ctes)?
                 }
-                node::Node::DeleteStmt(s) => {
+                ast::Node::DeleteStmt(s) => {
                     analyze_delete_with_outer_ctes(s, snapshot, params, existing_ctes)?
                 }
-                node::Node::MergeStmt(s) => {
+                ast::Node::MergeStmt(s) => {
                     analyze_merge_with_outer_ctes(s, snapshot, params, existing_ctes)?
                 }
                 _ => unreachable!("matched above"),
@@ -403,9 +404,9 @@ pub(crate) fn analyze_cte(
             // RewriteQuery first rewrites a data-modifying WITH query, which
             // must come out as a single query.
             let target = match cte_query {
-                node::Node::InsertStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdInsert)),
-                node::Node::UpdateStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdUpdate)),
-                node::Node::DeleteStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdDelete)),
+                ast::Node::InsertStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdInsert)),
+                ast::Node::UpdateStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdUpdate)),
+                ast::Node::DeleteStmt(s) => s.relation.as_ref().map(|r| (r, CmdType::CmdDelete)),
                 _ => None,
             };
             if let Some((rv, cmd)) = target
@@ -456,7 +457,7 @@ pub(crate) fn analyze_cte(
 ///
 /// All added columns are NOT NULL.
 fn search_cycle_columns(
-    cte: &protobuf::CommonTableExpr,
+    cte: &ast::CommonTableExpr,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
 ) -> Result<Vec<ScopeColumn>, AnalyzeError> {
@@ -491,13 +492,10 @@ fn search_cycle_columns(
         let scope = Scope::default();
         let null_ctx = NullabilityContext::default();
         let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
-        let values: Vec<&protobuf::Node> = [
-            cycle.cycle_mark_value.as_deref(),
-            cycle.cycle_mark_default.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let values: Vec<&Option<ast::Node>> = [&cycle.cycle_mark_value, &cycle.cycle_mark_default]
+            .into_iter()
+            .filter(|v| v.is_some())
+            .collect();
         let mut types = Vec::with_capacity(values.len());
         for v in &values {
             types.push(expr::infer_expr(v, ctx, params, TypeGoal::NONE)?.type_oid);
@@ -546,7 +544,7 @@ fn search_cycle_columns(
 /// its UNION, the listed columns must be distinct CTE columns, and the
 /// added column names must be new and distinct.
 fn check_search_cycle_clauses(
-    cte: &protobuf::CommonTableExpr,
+    cte: &ast::CommonTableExpr,
     recursive: bool,
     columns: &[ScopeColumn],
 ) -> Result<(), AnalyzeError> {
@@ -565,11 +563,9 @@ fn check_search_cycle_clauses(
     if !recursive {
         return Err(syntax("WITH query is not recursive".into()));
     }
-    if let Some(node::Node::SelectStmt(sel)) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
-    {
-        let is_leaf = |s: &Option<Box<protobuf::SelectStmt>>| {
-            s.as_ref()
-                .is_none_or(|s| s.op == SetOperation::SetopNone as i32)
+    if let Some(ast::Node::SelectStmt(sel)) = cte.ctequery.as_ref() {
+        let is_leaf = |s: &Option<NodeBox<ast::SelectStmt>>| {
+            s.as_ref().is_none_or(|s| s.op == SetOperation::SetopNone)
         };
         if !is_leaf(&sel.larg) {
             return Err(crate::error::RawError::new(
@@ -667,7 +663,7 @@ fn check_search_cycle_clauses(
 fn apply_cte_column_aliases(
     cte_name: &str,
     cols: Vec<RawColumn>,
-    aliases: &[protobuf::Node],
+    aliases: &[Option<ast::Node>],
 ) -> Result<Vec<RawColumn>, AnalyzeError> {
     let names = expr::extract_string_fields(aliases);
     if names.len() > cols.len() {
@@ -772,18 +768,18 @@ pub(crate) fn cte_returns_one_row(ctes: &HashMap<String, Vec<ScopeColumn>>, name
 /// function, or DEFAULT VALUES) into a table without rules, and no BEFORE ROW trigger can skip it (return
 /// NULL) — nor ON CONFLICT DO NOTHING, nor a DO UPDATE WHERE. ON CONFLICT
 /// DO UPDATE without WHERE returns the inserted row or the updated one.
-fn insert_returns_one_row(ins: &protobuf::InsertStmt, snapshot: &PgCatalog) -> bool {
-    let one_row = match ins.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+fn insert_returns_one_row(ins: &ast::InsertStmt, snapshot: &PgCatalog) -> bool {
+    let one_row = match ins.select_stmt.as_ref() {
         None => true,
-        Some(node::Node::SelectStmt(sel)) => {
+        Some(ast::Node::SelectStmt(sel)) => {
             sel.values_lists.len() == 1
                 && sel.with_clause.is_none()
                 && sel.limit_count.is_none()
                 && sel.limit_offset.is_none()
                 // A set-returning function in the row (the INSERT's own
                 // target list) makes it any number of rows, none included.
-                && sel.values_lists.iter().all(|row| match row.node.as_ref() {
-                    Some(node::Node::List(l)) => count_srf_calls(&l.items, snapshot) == 0,
+                && sel.values_lists.iter().all(|row| match row.as_ref() {
+                    Some(ast::Node::List(l)) => count_srf_calls(&l.items, snapshot) == 0,
                     _ => false,
                 })
         }
@@ -793,8 +789,7 @@ fn insert_returns_one_row(ins: &protobuf::InsertStmt, snapshot: &PgCatalog) -> b
         None => (false, true),
         Some(oc) => (
             true,
-            oc.action == protobuf::OnConflictAction::OnconflictUpdate as i32
-                && oc.where_clause.is_none(),
+            oc.action == ast::OnConflictAction::OnconflictUpdate && oc.where_clause.is_none(),
         ),
     };
     let Some(relation) = &ins.relation else {
@@ -894,20 +889,18 @@ pub(crate) fn cte_reference_columns(
 thread_local! {
     /// The statement owning each WITH clause being analyzed (see
     /// [`with_clause_owner`]).
-    static WITH_OWNERS: std::cell::RefCell<Vec<(usize, protobuf::Node)>> =
+    static WITH_OWNERS: std::cell::RefCell<Vec<(usize, ast::Node)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Run `f` (the analysis of `sel`'s WITH clause) knowing `sel` owns it:
 /// how many times the statement references a CTE decides whether the
 /// planner inlines it.
-pub(crate) fn with_clause_owner<R>(sel: &protobuf::SelectStmt, f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_clause_owner<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R) -> R {
     let Some(with) = sel.with_clause.as_ref() else {
         return f();
     };
-    let owner = protobuf::Node {
-        node: Some(node::Node::SelectStmt(Box::new(sel.clone()))),
-    };
+    let owner = ast::Node::SelectStmt(NodeBox::new(sel.clone()));
     with_statement_owner(with, owner, f)
 }
 
@@ -917,15 +910,15 @@ pub(crate) fn with_clause_owner<R>(sel: &protobuf::SelectStmt, f: impl FnOnce() 
 /// reference to a CTE (`setTargetTable` opens a table), so it isn't
 /// counted.
 pub(crate) fn with_statement_owner<R>(
-    with: &protobuf::WithClause,
-    mut owner: protobuf::Node,
+    with: &ast::WithClause,
+    mut owner: ast::Node,
     f: impl FnOnce() -> R,
 ) -> R {
-    match owner.node.as_mut() {
-        Some(node::Node::InsertStmt(s)) => s.relation = None,
-        Some(node::Node::UpdateStmt(s)) => s.relation = None,
-        Some(node::Node::DeleteStmt(s)) => s.relation = None,
-        Some(node::Node::MergeStmt(s)) => s.relation = None,
+    match &mut owner {
+        ast::Node::InsertStmt(s) => s.relation = None,
+        ast::Node::UpdateStmt(s) => s.relation = None,
+        ast::Node::DeleteStmt(s) => s.relation = None,
+        ast::Node::MergeStmt(s) => s.relation = None,
         _ => {}
     }
     let key = std::ptr::from_ref(with) as usize;
@@ -936,13 +929,13 @@ pub(crate) fn with_statement_owner<R>(
 }
 
 /// The WITH clause statement `n` owns.
-fn statement_with(n: &node::Node) -> Option<&protobuf::WithClause> {
+fn statement_with(n: &ast::Node) -> Option<&ast::WithClause> {
     match n {
-        node::Node::SelectStmt(s) => s.with_clause.as_ref(),
-        node::Node::InsertStmt(s) => s.with_clause.as_ref(),
-        node::Node::UpdateStmt(s) => s.with_clause.as_ref(),
-        node::Node::DeleteStmt(s) => s.with_clause.as_ref(),
-        node::Node::MergeStmt(s) => s.with_clause.as_ref(),
+        ast::Node::SelectStmt(s) => s.with_clause.as_deref(),
+        ast::Node::InsertStmt(s) => s.with_clause.as_deref(),
+        ast::Node::UpdateStmt(s) => s.with_clause.as_deref(),
+        ast::Node::DeleteStmt(s) => s.with_clause.as_deref(),
+        ast::Node::MergeStmt(s) => s.with_clause.as_deref(),
         _ => None,
     }
 }
@@ -950,12 +943,12 @@ fn statement_with(n: &node::Node) -> Option<&protobuf::WithClause> {
 /// How many references to CTE `name` the statement owning `with` has
 /// (PG's `cterefcount`), as [`references_in`] counts them; `None` when the
 /// owner isn't known (see [`with_clause_owner`]).
-fn owner_references(with: &protobuf::WithClause, name: &str) -> Option<usize> {
+fn owner_references(with: &ast::WithClause, name: &str) -> Option<usize> {
     let key = std::ptr::from_ref(with) as usize;
     WITH_OWNERS.with(|o| {
         let owners = o.borrow();
         let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
-        let root = owner.node.as_ref()?;
+        let root = owner;
         references_in(root.to_ref(), statement_with(root), name)
     })
 }
@@ -963,23 +956,23 @@ fn owner_references(with: &protobuf::WithClause, name: &str) -> Option<usize> {
 /// The alias of a reference to CTE `name` the SELECT (UPDATE, DELETE)
 /// owning `with` has among its own FROM (USING) items never null-extended (FROM-list items, sides of
 /// inner joins, a LEFT join's left side, a RIGHT join's right one).
-fn owner_kept_reference(with: &protobuf::WithClause, name: &str) -> Option<String> {
-    fn find(n: &protobuf::Node, name: &str) -> Option<String> {
-        match n.node.as_ref()? {
-            node::Node::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => Some(
+fn owner_kept_reference(with: &ast::WithClause, name: &str) -> Option<String> {
+    fn find(n: &Option<ast::Node>, name: &str) -> Option<String> {
+        match n.as_ref()? {
+            ast::Node::RangeVar(rv) if rv.schemaname.is_empty() && rv.relname == name => Some(
                 rv.alias
                     .as_ref()
                     .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone()),
             ),
-            node::Node::JoinExpr(j) => {
-                let (left, right) = match protobuf::JoinType::try_from(j.jointype) {
-                    Ok(protobuf::JoinType::JoinInner) => (true, true),
-                    Ok(protobuf::JoinType::JoinLeft) => (true, false),
-                    Ok(protobuf::JoinType::JoinRight) => (false, true),
+            ast::Node::JoinExpr(j) => {
+                let (left, right) = match j.jointype {
+                    ast::JoinType::JoinInner => (true, true),
+                    ast::JoinType::JoinLeft => (true, false),
+                    ast::JoinType::JoinRight => (false, true),
                     _ => (false, false),
                 };
-                let side = |s: &Option<Box<protobuf::Node>>, kept: bool| {
-                    s.as_deref().filter(|_| kept).and_then(|s| find(s, name))
+                let side = |s: &Option<ast::Node>, kept: bool| {
+                    if kept { find(s, name) } else { None }
                 };
                 side(&j.larg, left).or_else(|| side(&j.rarg, right))
             }
@@ -990,10 +983,10 @@ fn owner_kept_reference(with: &protobuf::WithClause, name: &str) -> Option<Strin
     WITH_OWNERS.with(|o| {
         let owners = o.borrow();
         let (_, owner) = owners.iter().rev().find(|(k, _)| *k == key)?;
-        let from = match owner.node.as_ref()? {
-            node::Node::SelectStmt(sel) => &sel.from_clause,
-            node::Node::UpdateStmt(upd) => &upd.from_clause,
-            node::Node::DeleteStmt(del) => &del.using_clause,
+        let from = match owner {
+            ast::Node::SelectStmt(sel) => &sel.from_clause,
+            ast::Node::UpdateStmt(upd) => &upd.from_clause,
+            ast::Node::DeleteStmt(del) => &del.using_clause,
             _ => return None,
         };
         from.iter().find_map(|f| find(f, name))
@@ -1009,7 +1002,7 @@ fn owner_kept_reference(with: &protobuf::WithClause, name: &str) -> Option<Strin
 /// resolves elsewhere.
 pub(crate) fn references_in(
     root: typedpg_pg_query::NodeRef<'_>,
-    with: Option<&protobuf::WithClause>,
+    with: Option<&ast::WithClause>,
     name: &str,
 ) -> Option<usize> {
     use typedpg_pg_query::NodeRef;
@@ -1029,14 +1022,10 @@ pub(crate) fn references_in(
     };
     if !with.recursive {
         for c in &with.ctes {
-            let Some(node::Node::CommonTableExpr(c)) = c.node.as_ref() else {
+            let Some(ast::Node::CommonTableExpr(c)) = c.as_ref() else {
                 continue;
             };
-            if c.ctequery
-                .as_deref()
-                .and_then(|q| q.node.as_ref())
-                .is_some_and(|q| names_it(q.to_ref()))
-            {
+            if c.ctequery.as_ref().is_some_and(|q| names_it(q.to_ref())) {
                 return None;
             }
             if c.ctename == name {
@@ -1056,8 +1045,8 @@ pub(crate) fn references_in(
             NodeRef::WithClause(w)
                 if own_with != std::ptr::from_ref(w)
                     && w.ctes.iter().any(|c| {
-                        matches!(c.node.as_ref(),
-                            Some(node::Node::CommonTableExpr(c)) if c.ctename == name)
+                        matches!(c.as_ref(),
+                            Some(ast::Node::CommonTableExpr(c)) if c.ctename == name)
                     }) =>
             {
                 return None;
@@ -1075,31 +1064,23 @@ pub(crate) fn references_in(
 /// MATERIALIZED) and without volatile functions becomes a FROM subquery;
 /// any other is scanned as is. `None` when the analyzer can't tell.
 pub(crate) fn inlined(
-    cte: &protobuf::CommonTableExpr,
+    cte: &ast::CommonTableExpr,
     recursive: bool,
     references: Option<usize>,
     snapshot: &PgCatalog,
 ) -> Option<bool> {
-    let select = matches!(
-        cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
-        Some(node::Node::SelectStmt(_))
-    );
-    if recursive || !select || cte.ctematerialized == protobuf::CteMaterialize::Always as i32 {
+    let select = matches!(cte.ctequery.as_ref(), Some(ast::Node::SelectStmt(_)));
+    if recursive || !select || cte.ctematerialized == ast::CteMaterialize::Always {
         return Some(false);
     }
-    let once = if cte.ctematerialized == protobuf::CteMaterialize::Never as i32 {
+    let once = if cte.ctematerialized == ast::CteMaterialize::Never {
         Some(true)
     } else {
         references.map(|n| n <= 1)
     };
     match once {
         Some(false) => Some(false),
-        Some(true)
-            if !cte
-                .ctequery
-                .as_deref()
-                .is_some_and(|q| crate::expr::plan_fold::may_be_volatile(q, snapshot)) =>
-        {
+        Some(true) if !crate::expr::plan_fold::may_be_volatile(&cte.ctequery, snapshot) => {
             Some(true)
         }
         _ => None,
@@ -1118,7 +1099,7 @@ pub(crate) fn inlined(
 /// `outer_tiers` are the enclosing levels the CTE bodies may reference,
 /// nearest first (see [`analyze_cte`]).
 pub(crate) fn analyze_with_clause(
-    with: &protobuf::WithClause,
+    with: &ast::WithClause,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
@@ -1131,17 +1112,17 @@ pub(crate) fn analyze_with_clause(
 }
 
 fn analyze_with_clause_here(
-    with: &protobuf::WithClause,
+    with: &ast::WithClause,
     snapshot: &PgCatalog,
     params: &mut ParamCollector,
     outer_ctes: &HashMap<String, Vec<ScopeColumn>>,
     outer_tiers: &[Vec<crate::scope::TableSource>],
 ) -> Result<HashMap<String, Vec<ScopeColumn>>, AnalyzeError> {
-    let ctes: Vec<&protobuf::CommonTableExpr> = with
+    let ctes: Vec<&ast::CommonTableExpr> = with
         .ctes
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::CommonTableExpr(cte) => Some(cte.as_ref()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::CommonTableExpr(cte) => Some(cte.as_ref()),
             _ => None,
         })
         .collect();
@@ -1170,7 +1151,7 @@ fn analyze_with_clause_here(
             vec![Default::default(); ctes.len()];
         for (i, cte) in ctes.iter().enumerate() {
             let mut walker = CteRefWalker::new(&names);
-            if let Some(q) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+            if let Some(q) = cte.ctequery.as_ref() {
                 walker.walk(q.to_ref())?;
             }
             for j in walker.found {
@@ -1194,17 +1175,17 @@ fn analyze_with_clause_here(
     let mut cte_scopes = outer_ctes.clone();
     for i in order {
         let cte = ctes[i];
-        let returning = match cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
-            Some(node::Node::InsertStmt(s)) => {
+        let returning = match cte.ctequery.as_ref() {
+            Some(ast::Node::InsertStmt(s)) => {
                 Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
             }
-            Some(node::Node::UpdateStmt(s)) => {
+            Some(ast::Node::UpdateStmt(s)) => {
                 Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
             }
-            Some(node::Node::DeleteStmt(s)) => {
+            Some(ast::Node::DeleteStmt(s)) => {
                 Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
             }
-            Some(node::Node::MergeStmt(s)) => {
+            Some(ast::Node::MergeStmt(s)) => {
                 Some(!crate::resolve::returning_exprs(&s.returning_clause).is_empty())
             }
             _ => None,
@@ -1256,8 +1237,7 @@ fn analyze_with_clause_here(
         // A VALUES the executor can't start: a CTE scanned on its own is
         // planned and started wherever it is referenced; an inlined one
         // where its reference is (see `check_values_sort`).
-        if let Some(node::Node::SelectStmt(sel)) =
-            cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
+        if let Some(ast::Node::SelectStmt(sel)) = cte.ctequery.as_ref()
             && let Some((e, _)) = super::values_sort_error(sel, snapshot)
         {
             let e = Box::new(e);
@@ -1300,8 +1280,7 @@ fn analyze_with_clause_here(
             depth,
         );
         if returning == Some(true)
-            && let Some(node::Node::InsertStmt(ins)) =
-                cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
+            && let Some(ast::Node::InsertStmt(ins)) = cte.ctequery.as_ref()
             && insert_returns_one_row(ins, snapshot)
         {
             cte_scopes.insert(one_row_marker(&cte.ctename), Vec::new());
@@ -1391,7 +1370,7 @@ impl<'a> CteRefWalker<'a> {
                     Vec::new()
                 });
                 for (cte, name) in inner_ctes(w).zip(cte_names) {
-                    if let Some(q) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+                    if let Some(q) = cte.ctequery.as_ref() {
                         self.walk(q.to_ref())?;
                     }
                     if !w.recursive
@@ -1416,14 +1395,14 @@ impl<'a> CteRefWalker<'a> {
 }
 
 /// The CTEs of a WITH clause.
-fn inner_ctes(w: &protobuf::WithClause) -> impl Iterator<Item = &protobuf::CommonTableExpr> {
-    w.ctes.iter().filter_map(|n| match n.node.as_ref()? {
-        node::Node::CommonTableExpr(c) => Some(c.as_ref()),
+fn inner_ctes(w: &ast::WithClause) -> impl Iterator<Item = &ast::CommonTableExpr> {
+    w.ctes.iter().filter_map(|n| match n.as_ref()? {
+        ast::Node::CommonTableExpr(c) => Some(c.as_ref()),
         _ => None,
     })
 }
 
-fn inner_cte_names(w: &protobuf::WithClause) -> Vec<String> {
+fn inner_cte_names(w: &ast::WithClause) -> Vec<String> {
     inner_ctes(w).map(|c| c.ctename.clone()).collect()
 }
 
@@ -1506,7 +1485,7 @@ impl RecursionWalker<'_> {
                         Vec::new()
                     });
                     for (cte, name) in inner_ctes(w).zip(cte_names) {
-                        if let Some(q) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+                        if let Some(q) = cte.ctequery.as_ref() {
                             self.walk(q.to_ref())?;
                         }
                         if !w.recursive
@@ -1529,19 +1508,19 @@ impl RecursionWalker<'_> {
                         ctx
                     }
                 };
-                let side = |w: &mut Self, n: &Option<Box<protobuf::Node>>, ctx| {
+                let side = |w: &mut Self, n: &Option<ast::Node>, ctx| {
                     w.context = ctx;
-                    let r = match n.as_deref().and_then(|n| n.node.as_ref()) {
+                    let r = match n.as_ref() {
                         Some(n) => w.walk(n.to_ref()),
                         None => Ok(()),
                     };
                     w.context = save;
                     r
                 };
-                let (l, r) = match JoinType::try_from(j.jointype) {
-                    Ok(JoinType::JoinLeft) => (save, outer(save)),
-                    Ok(JoinType::JoinFull) => (outer(save), outer(save)),
-                    Ok(JoinType::JoinRight) => (outer(save), save),
+                let (l, r) = match j.jointype {
+                    JoinType::JoinLeft => (save, outer(save)),
+                    JoinType::JoinFull => (outer(save), outer(save)),
+                    JoinType::JoinRight => (outer(save), save),
                     _ => (save, save),
                 };
                 side(self, &j.larg, l)?;
@@ -1551,11 +1530,11 @@ impl RecursionWalker<'_> {
             NodeRef::SubLink(sl) => {
                 // The subquery is independent of the outer context.
                 self.context = RecursionContext::Sublink;
-                if let Some(s) = sl.subselect.as_deref().and_then(|n| n.node.as_ref()) {
+                if let Some(s) = sl.subselect.as_ref() {
                     self.walk(s.to_ref())?;
                 }
                 self.context = save;
-                if let Some(t) = sl.testexpr.as_deref().and_then(|n| n.node.as_ref()) {
+                if let Some(t) = sl.testexpr.as_ref() {
                     self.walk(t.to_ref())?;
                 }
             }
@@ -1571,9 +1550,9 @@ impl RecursionWalker<'_> {
     /// `checkWellFormedSelectStmt`: a SELECT without looking at its WITH.
     /// Only ALL makes INTERSECT unsafe, and EXCEPT is unsafe on its right
     /// side always, on its left side with ALL.
-    fn select_stmt(&mut self, stmt: &protobuf::SelectStmt) -> Result<(), AnalyzeError> {
+    fn select_stmt(&mut self, stmt: &ast::SelectStmt) -> Result<(), AnalyzeError> {
         let save = self.context;
-        let op = SetOperation::try_from(stmt.op).unwrap_or(SetOperation::SetopNone);
+        let op = stmt.op;
         if save != RecursionContext::Ok
             || !matches!(op, SetOperation::SetopIntersect | SetOperation::SetopExcept)
         {
@@ -1582,7 +1561,7 @@ impl RecursionWalker<'_> {
             }
             return Ok(());
         }
-        let arg = |w: &mut Self, s: &Option<Box<protobuf::SelectStmt>>| match s {
+        let arg = |w: &mut Self, s: &Option<NodeBox<ast::SelectStmt>>| match s {
             Some(s) => w.walk(typedpg_pg_query::NodeRef::SelectStmt(s)),
             None => Ok(()),
         };
@@ -1602,11 +1581,11 @@ impl RecursionWalker<'_> {
         for n in stmt
             .sort_clause
             .iter()
-            .chain(stmt.limit_offset.as_deref())
-            .chain(stmt.limit_count.as_deref())
+            .chain(std::iter::once(&stmt.limit_offset))
+            .chain(std::iter::once(&stmt.limit_count))
             .chain(stmt.locking_clause.iter())
         {
-            if let Some(n) = n.node.as_ref() {
+            if let Some(n) = n.as_ref() {
                 self.walk(n.to_ref())?;
             }
         }
@@ -1620,19 +1599,18 @@ impl RecursionWalker<'_> {
 /// the non-recursive term may not reference it; and the recursive term
 /// references it exactly once, outside sublinks, outer-join nullable sides,
 /// INTERSECT ALL and EXCEPT.
-fn check_well_formed_recursion(cte: &protobuf::CommonTableExpr) -> Result<(), AnalyzeError> {
+fn check_well_formed_recursion(cte: &ast::CommonTableExpr) -> Result<(), AnalyzeError> {
     let invalid = |msg: String| {
         crate::error::RawError::new(AnalyzeError::InvalidRecursion(msg), None, None)
             .finalize_implicit()
     };
-    let Some(node::Node::SelectStmt(sel)) = cte.ctequery.as_deref().and_then(|q| q.node.as_ref())
-    else {
+    let Some(ast::Node::SelectStmt(sel)) = cte.ctequery.as_ref() else {
         return Err(invalid(format!(
             "recursive query \"{}\" must not contain data-modifying statements",
             cte.ctename
         )));
     };
-    if sel.op != SetOperation::SetopUnion as i32 {
+    if sel.op != SetOperation::SetopUnion {
         return Err(invalid(format!(
             "recursive query \"{}\" does not have the form non-recursive-term UNION [ALL] \
              recursive-term",
@@ -1647,7 +1625,7 @@ fn check_well_formed_recursion(cte: &protobuf::CommonTableExpr) -> Result<(), An
     };
     if let Some(with) = &sel.with_clause {
         for c in &with.ctes {
-            if let Some(c) = c.node.as_ref() {
+            if let Some(c) = c.as_ref() {
                 w.walk(c.to_ref())?;
             }
         }
@@ -1690,17 +1668,17 @@ fn check_well_formed_recursion(cte: &protobuf::CommonTableExpr) -> Result<(), An
 
 /// PG (parse_agg.c, 42P19): no aggregates in the recursive term.
 fn check_no_aggregates_in_recursive_term(
-    rarg: &protobuf::SelectStmt,
+    rarg: &ast::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     let has_agg = rarg
         .target_list
         .iter()
-        .filter_map(|t| match t.node.as_ref()? {
-            node::Node::ResTarget(rt) => rt.val.as_deref(),
+        .filter_map(|t| match t.as_ref()? {
+            ast::Node::ResTarget(rt) => Some(&rt.val),
             _ => None,
         })
-        .chain(rarg.having_clause.as_deref())
+        .chain(std::iter::once(&rarg.having_clause))
         .any(|n| expr::detect_func_kinds(n, snapshot).has_aggregate);
     if has_agg {
         return Err(crate::error::RawError::new(

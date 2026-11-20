@@ -16,7 +16,7 @@
 //! parameter, a function call, an operator a user may have redefined) is
 //! `None`, and the expression is left alone.
 
-use typedpg_pg_query::protobuf::{self, a_const, node};
+use typedpg_pg_query::ast;
 
 use crate::error::{AnalyzeError, RawError, SourceSpan};
 use crate::oid::PgTypeOid;
@@ -109,7 +109,7 @@ impl FoldError {
     }
 
     /// The error, pointing at `node`.
-    pub(crate) fn at(&self, node: &protobuf::Node) -> AnalyzeError {
+    pub(crate) fn at(&self, node: &Option<ast::Node>) -> AnalyzeError {
         self.raw(crate::error::expr_span(node)).finalize_implicit()
     }
 }
@@ -119,40 +119,39 @@ impl FoldError {
 pub(crate) type Folded = Option<Result<Value, FoldError>>;
 
 /// The error the planner raises folding `node`, if it certainly does.
-pub(crate) fn error(node: &protobuf::Node, snapshot: &PgCatalog) -> Option<FoldError> {
+pub(crate) fn error(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Option<FoldError> {
     fold(node, snapshot)?.err()
 }
 
 /// What the planner substitutes for a column reference before folding
 /// (the output expression of a subquery it pulls up), if anything.
-pub(crate) type Columns<'a> =
-    dyn Fn(&protobuf::ColumnRef) -> Option<std::sync::Arc<protobuf::Node>> + 'a;
+pub(crate) type Columns<'a> = dyn Fn(&ast::ColumnRef) -> Option<std::sync::Arc<ast::Node>> + 'a;
 
 /// [`error`] for `node` in a scope whose columns `columns` substitutes:
 /// `x::int2` over `(SELECT 40000 AS x) s` is `40000::int2` once `s` is
 /// pulled up (`pullup_replace_vars` precedes `eval_const_expressions`).
 pub(crate) fn error_in(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     snapshot: &PgCatalog,
     columns: &Columns<'_>,
 ) -> Option<FoldError> {
-    fold_with(node, snapshot, columns)?.err()
+    fold_with(node.as_ref(), snapshot, columns)?.err()
 }
 
 /// The error the planner raises folding `node` once converted to `target`
 /// (of typmod `typmod`) — an assignment to a column of that type, or a
 /// LIMIT's conversion to `bigint` — if it certainly does.
 pub(crate) fn conversion_error(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     target: PgTypeOid,
     typmod: Option<i32>,
     snapshot: &PgCatalog,
 ) -> Option<FoldError> {
-    let value = match node.node.as_ref()? {
+    let value = match node.as_ref()? {
         // An untyped literal is read as the target type at parse time
         // (that reading's errors are the literal's), then converted.
-        node::Node::AConst(c) if matches!(c.val, Some(a_const::Val::Sval(_))) => {
-            let Some(a_const::Val::Sval(s)) = &c.val else {
+        ast::Node::AConst(c) if matches!(c.val, Some(ast::AConstValue::String(_))) => {
+            let Some(ast::AConstValue::String(s)) = &c.val else {
                 return None;
             };
             literal_as(&s.sval, snapshot.unwrap_domain(target))?
@@ -163,25 +162,25 @@ pub(crate) fn conversion_error(
 }
 
 /// Fold `node`.
-pub(crate) fn fold(node: &protobuf::Node, snapshot: &PgCatalog) -> Folded {
-    fold_with(node, snapshot, &|_| None)
+pub(crate) fn fold(node: &Option<ast::Node>, snapshot: &PgCatalog) -> Folded {
+    fold_with(node.as_ref(), snapshot, &|_| None)
 }
 
-fn fold_with(node: &protobuf::Node, snapshot: &PgCatalog, columns: &Columns<'_>) -> Folded {
+fn fold_with(node: Option<&ast::Node>, snapshot: &PgCatalog, columns: &Columns<'_>) -> Folded {
     crate::stack::step(|| fold_here(node, snapshot, columns))
 }
 
-fn fold_here(node: &protobuf::Node, snapshot: &PgCatalog, columns: &Columns<'_>) -> Folded {
-    match node.node.as_ref()? {
+fn fold_here(node: Option<&ast::Node>, snapshot: &PgCatalog, columns: &Columns<'_>) -> Folded {
+    match node? {
         // The substituted expression is the subquery's: its own columns
         // are of the subquery's scope (and already substituted there).
-        node::Node::ColumnRef(cr) => fold(&*columns(cr)?, snapshot),
-        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            a_const::Val::Ival(i) => Some(Ok(Value::Int(i.ival.into(), IntType::Int4))),
+        ast::Node::ColumnRef(cr) => fold_with(Some(&*columns(cr)?), snapshot, &|_| None),
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(Ok(Value::Int(i.ival.into(), IntType::Int4))),
             // `make_const`: an integer too large for `int4` is `int8`, then
             // `numeric`; anything else written with a point or an exponent
             // is `numeric`.
-            a_const::Val::Fval(f) => match crate::literal_input::parse_pg_integer(&f.fval) {
+            ast::AConstValue::Float(f) => match crate::literal_input::parse_pg_integer(&f.fval) {
                 Some(v) if IntType::Int4.contains(v) => Some(Ok(Value::Int(v, IntType::Int4))),
                 Some(v) if IntType::Int8.contains(v) => Some(Ok(Value::Int(v, IntType::Int8))),
                 _ => crate::literal_input::validate_numeric(&f.fval)
@@ -190,7 +189,7 @@ fn fold_here(node: &protobuf::Node, snapshot: &PgCatalog, columns: &Columns<'_>)
             },
             _ => None,
         },
-        node::Node::TypeCast(tc) => {
+        ast::Node::TypeCast(tc) => {
             let tn = tc.type_name.as_ref()?;
             if !tn.array_bounds.is_empty() {
                 return None;
@@ -201,22 +200,22 @@ fn fold_here(node: &protobuf::Node, snapshot: &PgCatalog, columns: &Columns<'_>)
             } else {
                 crate::typmod::encode(snapshot, target, tn).ok()?
             };
-            let arg = tc.arg.as_deref()?;
-            let value = match arg.node.as_ref()? {
-                node::Node::AConst(c) if matches!(c.val, Some(a_const::Val::Sval(_))) => {
-                    let Some(a_const::Val::Sval(s)) = &c.val else {
+            let arg = tc.arg.as_ref()?;
+            let value = match arg {
+                ast::Node::AConst(c) if matches!(c.val, Some(ast::AConstValue::String(_))) => {
+                    let Some(ast::AConstValue::String(s)) = &c.val else {
                         return None;
                     };
                     literal_as(&s.sval, snapshot.unwrap_domain(target))?
                 }
-                _ => match fold_with(arg, snapshot, columns)? {
+                _ => match fold_with(Some(arg), snapshot, columns)? {
                     Ok(v) => v,
                     Err(e) => return Some(Err(e)),
                 },
             };
             convert(&value, target, typmod, snapshot)
         }
-        node::Node::AExpr(e) => fold_operator(e, snapshot, columns),
+        ast::Node::AExpr(e) => fold_operator(e, snapshot, columns),
         _ => None,
     }
 }
@@ -330,13 +329,13 @@ enum Operand {
 }
 
 fn operand(
-    node: &protobuf::Node,
+    node: Option<&ast::Node>,
     snapshot: &PgCatalog,
     columns: &Columns<'_>,
 ) -> Option<Result<Operand, FoldError>> {
-    if let Some(node::Node::AConst(c)) = node.node.as_ref()
+    if let Some(ast::Node::AConst(c)) = node
         && !c.isnull
-        && let Some(a_const::Val::Sval(s)) = &c.val
+        && let Some(ast::AConstValue::String(s)) = &c.val
     {
         return Some(Ok(Operand::Untyped(s.sval.clone())));
     }
@@ -345,8 +344,8 @@ fn operand(
 
 /// The built-in arithmetic operators, over integer and `numeric`
 /// constants: `int4pl`, `int48mi`, `int2um`, `numeric_div`, …
-fn fold_operator(e: &protobuf::AExpr, snapshot: &PgCatalog, columns: &Columns<'_>) -> Folded {
-    if protobuf::AExprKind::try_from(e.kind) != Ok(protobuf::AExprKind::AexprOp) {
+fn fold_operator(e: &ast::AExpr, snapshot: &PgCatalog, columns: &Columns<'_>) -> Folded {
+    if e.kind != ast::AExprKind::AexprOp {
         return None;
     }
     let names = crate::expr::extract_string_fields(&e.name);
@@ -358,10 +357,10 @@ fn fold_operator(e: &protobuf::AExpr, snapshot: &PgCatalog, columns: &Columns<'_
     if !matches!(op, "+" | "-" | "*" | "/" | "%") {
         return None;
     }
-    let right = e.rexpr.as_deref()?;
-    let Some(left) = e.lexpr.as_deref() else {
+    let right = e.rexpr.as_ref()?;
+    let Some(left) = e.lexpr.as_ref() else {
         // Prefix `-` / `+` (`int4um` / `int4up`).
-        return match fold_with(right, snapshot, columns)? {
+        return match fold_with(Some(right), snapshot, columns)? {
             Err(err) => Some(Err(err)),
             Ok(_) if shadowed(op, snapshot) => None,
             Ok(Value::Int(v, t)) => match op {
@@ -373,11 +372,11 @@ fn fold_operator(e: &protobuf::AExpr, snapshot: &PgCatalog, columns: &Columns<'_
         };
     };
     // The arguments are folded first, left to right.
-    let l = match operand(left, snapshot, columns) {
+    let l = match operand(Some(left), snapshot, columns) {
         Some(Err(err)) => return Some(Err(err)),
         l => l,
     };
-    let r = match operand(right, snapshot, columns) {
+    let r = match operand(Some(right), snapshot, columns) {
         Some(Err(err)) => return Some(Err(err)),
         r => r,
     };

@@ -105,7 +105,7 @@ pub(super) fn add_of(
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::TypeName(tn)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+    let Some(ast::Node::TypeName(tn)) = cmd.def.as_ref() else {
         return Ok(());
     };
     let type_oid = lookup_type_name(tn, interp)?;

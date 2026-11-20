@@ -7,7 +7,7 @@
 //! (`transformSubLink`).
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf;
+use typedpg_pg_query::ast;
 
 use super::DdlError;
 use crate::pg_catalog::PgCatalog;
@@ -71,12 +71,12 @@ impl ExprKind {
 /// Reject the constructs `kind` forbids anywhere in `expr`.
 pub(crate) fn check_expr_kind(
     interp: &PgCatalog,
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     kind: ExprKind,
 ) -> Result<(), DdlError> {
     if let Some(context) = kind.subquery_context()
-        && let Some(inner) = expr.node.as_ref()
-        && (matches!(inner, protobuf::node::Node::SubLink(_))
+        && let Some(inner) = expr.as_ref()
+        && (matches!(inner, ast::Node::SubLink(_))
             || inner
                 .nodes()
                 .into_iter()

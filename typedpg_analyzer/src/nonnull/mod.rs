@@ -23,7 +23,8 @@ pub(crate) mod checks;
 pub(crate) mod exprs;
 pub(crate) mod subst;
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 use crate::pg_catalog::PgCatalog;
 use crate::scope::Scope;
@@ -294,11 +295,8 @@ thread_local! {
 /// pulls an `EXISTS` up into a semi-join whose quals then count like an
 /// inner join's. Only `sel` itself deposits (by address): not the queries
 /// nested in it, nor a set operation's arms.
-pub(crate) fn capture_correlation<R>(
-    sel: &protobuf::SelectStmt,
-    f: impl FnOnce() -> R,
-) -> (R, Facts) {
-    let key = sel as *const protobuf::SelectStmt as usize;
+pub(crate) fn capture_correlation<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R) -> (R, Facts) {
+    let key = sel as *const ast::SelectStmt as usize;
     let before = CORRELATION.with(|c| c.replace(Some((key, None))));
     let out = f();
     let got = CORRELATION.with(|c| c.replace(before));
@@ -309,8 +307,8 @@ pub(crate) fn capture_correlation<R>(
 /// Deposit what `sel`'s WHERE proves of the enclosing levels, if `sel` is
 /// the subquery being captured (see [`capture_correlation`]). Expression
 /// facts stay behind: they may speak of `sel`'s own columns.
-pub(crate) fn deposit_correlation(sel: &protobuf::SelectStmt, mut facts: Facts) {
-    let key = sel as *const protobuf::SelectStmt as usize;
+pub(crate) fn deposit_correlation(sel: &ast::SelectStmt, mut facts: Facts) {
+    let key = sel as *const ast::SelectStmt as usize;
     facts.exprs.clear();
     CORRELATION.with(|c| {
         if let Some((k, slot)) = c.borrow_mut().as_mut()
@@ -340,11 +338,8 @@ thread_local! {
 /// Run `f` (the analysis of subquery `sel`), capturing what `sel`'s level
 /// proves of its own rows (see [`OwnRows`]), when every row it returns
 /// passed its WHERE. Only `sel` itself deposits, by address.
-pub(crate) fn capture_own<R>(
-    sel: &protobuf::SelectStmt,
-    f: impl FnOnce() -> R,
-) -> (R, Option<OwnRows>) {
-    let key = sel as *const protobuf::SelectStmt as usize;
+pub(crate) fn capture_own<R>(sel: &ast::SelectStmt, f: impl FnOnce() -> R) -> (R, Option<OwnRows>) {
+    let key = sel as *const ast::SelectStmt as usize;
     let before = OWN_ROWS.with(|c| c.replace(Some((key, None))));
     let out = f();
     let got = OWN_ROWS.with(|c| c.replace(before));
@@ -353,8 +348,8 @@ pub(crate) fn capture_own<R>(
 
 /// Deposit what `sel`'s level proves of its own rows, if `sel` is the
 /// subquery being captured (see [`capture_own`]).
-pub(crate) fn deposit_own(sel: &protobuf::SelectStmt, mut own: OwnRows) {
-    let key = sel as *const protobuf::SelectStmt as usize;
+pub(crate) fn deposit_own(sel: &ast::SelectStmt, mut own: OwnRows) {
+    let key = sel as *const ast::SelectStmt as usize;
     own.facts.exprs.clear();
     OWN_ROWS.with(|c| {
         if let Some((k, slot)) = c.borrow_mut().as_mut()
@@ -366,14 +361,14 @@ pub(crate) fn deposit_own(sel: &protobuf::SelectStmt, mut own: OwnRows) {
 }
 
 /// Whether some query is capturing `sel`'s own rows' facts.
-pub(crate) fn own_wanted(sel: &protobuf::SelectStmt) -> bool {
-    let key = sel as *const protobuf::SelectStmt as usize;
+pub(crate) fn own_wanted(sel: &ast::SelectStmt) -> bool {
+    let key = sel as *const ast::SelectStmt as usize;
     OWN_ROWS.with(|c| c.borrow().as_ref().is_some_and(|(k, _)| *k == key))
 }
 
 /// Whether some query is capturing `sel`'s correlation facts.
-pub(crate) fn correlation_wanted(sel: &protobuf::SelectStmt) -> bool {
-    let key = sel as *const protobuf::SelectStmt as usize;
+pub(crate) fn correlation_wanted(sel: &ast::SelectStmt) -> bool {
+    let key = sel as *const ast::SelectStmt as usize;
     CORRELATION.with(|c| c.borrow().as_ref().is_some_and(|(k, _)| *k == key))
 }
 
@@ -745,8 +740,8 @@ pub(crate) fn own_aliases(scope: &Scope) -> HashSet<String> {
 
 /// Intersection of the facts of every node (`None` when there is none).
 fn intersection<'a>(
-    nodes: impl IntoIterator<Item = &'a protobuf::Node>,
-    mut f: impl FnMut(&'a protobuf::Node) -> Facts,
+    nodes: impl IntoIterator<Item = &'a Option<ast::Node>>,
+    mut f: impl FnMut(&'a Option<ast::Node>) -> Facts,
 ) -> Facts {
     let mut acc: Option<Facts> = None;
     for n in nodes {
@@ -764,7 +759,7 @@ fn intersection<'a>(
 /// non-NULL (below the top level) — proves non-NULL. Column references
 /// resolve against `scope`, as the qual's own resolution did.
 pub(crate) fn nonnullable(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     top_level: bool,
     scope: &Scope,
     log: &StrictLog,
@@ -789,15 +784,15 @@ pub(crate) fn nonnullable(
     facts
 }
 
-fn is_and_or(n: &protobuf::Node) -> bool {
-    matches!(n.node.as_ref(), Some(node::Node::BoolExpr(b))
-        if b.boolop != protobuf::BoolExprType::NotExpr as i32)
+fn is_and_or(n: &Option<ast::Node>) -> bool {
+    matches!(n.as_ref(), Some(ast::Node::BoolExpr(b))
+        if b.boolop != ast::BoolExprType::NotExpr)
 }
 
 /// The columns of `node` that, replaced by NULL, make it evaluate to a
 /// value `excluded` says it doesn't have (see [`subst`]).
 fn substituted(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
@@ -824,18 +819,19 @@ fn substituted(
 /// composite `x`); not distinct from NULL, `x` is NULL. Not distinct from
 /// a non-NULL value, `x` is non-NULL.
 fn distinct_facts(
-    e: &protobuf::AExpr,
+    e: &ast::AExpr,
     distinct: bool,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> Facts {
-    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+    if e.lexpr.is_none() || e.rexpr.is_none() {
         return Facts::default();
-    };
+    }
+    let (l, r) = (&e.lexpr, &e.rexpr);
     let is_null =
-        |n: &protobuf::Node| matches!(n.node.as_ref(), Some(node::Node::AConst(c)) if c.isnull);
-    let walk = |n: &protobuf::Node| nonnullable(n, false, scope, log, snapshot);
+        |n: &Option<ast::Node>| matches!(n.as_ref(), Some(ast::Node::AConst(c)) if c.isnull);
+    let walk = |n: &Option<ast::Node>| nonnullable(n, false, scope, log, snapshot);
     let other = if is_null(r) {
         Some(l)
     } else if is_null(l) {
@@ -845,7 +841,7 @@ fn distinct_facts(
     };
     match other {
         Some(x) if distinct => walk(x),
-        Some(x) => match scalar_column(x, scope, snapshot) {
+        Some(x) => match scalar_column(x.as_ref(), scope, snapshot) {
             Some(col) => Facts::null(col),
             None => Facts::default(),
         },
@@ -865,93 +861,87 @@ fn distinct_facts(
 
 /// A row constructor's fields, unless one expands into several (`t.*`,
 /// `(x).*`): then they don't pair up with the other side's.
-fn plain_row_fields(n: &protobuf::Node) -> Option<&[protobuf::Node]> {
-    let Some(node::Node::RowExpr(r)) = n.node.as_ref() else {
+fn plain_row_fields(n: &Option<ast::Node>) -> Option<&[Option<ast::Node>]> {
+    let Some(ast::Node::RowExpr(r)) = n.as_ref() else {
         return None;
     };
-    let star = |f: &protobuf::Node| match f.node.as_ref() {
-        Some(node::Node::ColumnRef(c)) => c
+    let star = |f: &Option<ast::Node>| match f.as_ref() {
+        Some(ast::Node::ColumnRef(c)) => c
             .fields
             .iter()
-            .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_)))),
-        Some(node::Node::AIndirection(i)) => i
+            .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_)))),
+        Some(ast::Node::AIndirection(i)) => i
             .indirection
             .iter()
-            .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_)))),
+            .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_)))),
         _ => false,
     };
     (!r.args.iter().any(star)).then_some(r.args.as_slice())
 }
 
-fn is_row(n: &Option<Box<protobuf::Node>>) -> bool {
-    matches!(
-        n.as_deref().and_then(|n| n.node.as_ref()),
-        Some(node::Node::RowExpr(_))
-    )
+fn is_row(n: &Option<ast::Node>) -> bool {
+    matches!(n.as_ref(), Some(ast::Node::RowExpr(_)))
 }
 
 fn nonnullable_node(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     top_level: bool,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> Facts {
-    let walk = |n: &protobuf::Node, top: bool| nonnullable(n, top, scope, log, snapshot);
-    let walk_opt = |n: &Option<Box<protobuf::Node>>, top: bool| {
-        n.as_deref().map(|n| walk(n, top)).unwrap_or_default()
-    };
-    let Some(inner) = node.node.as_ref() else {
+    let walk = |n: &Option<ast::Node>, top: bool| nonnullable(n, top, scope, log, snapshot);
+    let walk_opt =
+        |n: &Option<ast::Node>, top: bool| n.as_ref().map(|_| walk(n, top)).unwrap_or_default();
+    let Some(inner) = node.as_ref() else {
         return Facts::default();
     };
     match inner {
-        node::Node::ColumnRef(c) => {
+        ast::Node::ColumnRef(c) => {
             let mut f = column_ref_facts(c, scope);
             // A boolean column TRUE at the top level: `done` is `done = true`.
-            if top_level && let Some((col, _)) = plain_column(node, scope) {
+            if top_level && let Some((col, _)) = plain_column(inner, scope) {
                 f.equals.insert(col, Literal::boolean(true));
             }
             f
         }
-        node::Node::BoolExpr(b) => match protobuf::BoolExprType::try_from(b.boolop) {
+        ast::Node::BoolExpr(b) => match b.boolop {
             // At the top level every conjunct must be TRUE. Below it an
             // AND of a NULL and a FALSE is FALSE, so only what every arm
             // proves holds — as for OR at any level.
-            Ok(protobuf::BoolExprType::AndExpr) if top_level => b
+            ast::BoolExprType::AndExpr if top_level => b
                 .args
                 .iter()
                 .fold(Facts::default(), |acc, a| acc.union(walk(a, true))),
-            Ok(protobuf::BoolExprType::AndExpr | protobuf::BoolExprType::OrExpr) => {
+            ast::BoolExprType::AndExpr | ast::BoolExprType::OrExpr => {
                 intersection(&b.args, |a| walk(a, top_level))
             }
             // NOT is strict. At the top level `NOT e` TRUE also means `e`
             // FALSE, so not TRUE: `NOT (x IS NULL)` proves `x`.
-            Ok(protobuf::BoolExprType::NotExpr) => {
-                b.args.iter().fold(Facts::default(), |acc, a| {
-                    let mut below = walk(a, false);
-                    if top_level && let Some((col, _)) = plain_column(a, scope) {
-                        below.equals.insert(col, Literal::boolean(false));
-                    }
-                    if top_level {
-                        acc.union(below)
-                            .union(nonnullable_unless_true(a, scope, log, snapshot))
-                    } else {
-                        acc.union(below)
-                    }
-                })
-            }
-            _ => Facts::default(),
+            ast::BoolExprType::NotExpr => b.args.iter().fold(Facts::default(), |acc, a| {
+                let mut below = walk(a, false);
+                if top_level && let Some((col, _)) = a.as_ref().and_then(|a| plain_column(a, scope))
+                {
+                    below.equals.insert(col, Literal::boolean(false));
+                }
+                if top_level {
+                    acc.union(below)
+                        .union(nonnullable_unless_true(a, scope, log, snapshot))
+                } else {
+                    acc.union(below)
+                }
+            }),
         },
-        node::Node::AExpr(e) => {
-            use protobuf::AExprKind as K;
+        ast::Node::AExpr(e) => {
+            use ast::AExprKind as K;
             if top_level && let Some(f) = null_count_facts(e, scope, log) {
                 return f;
             }
-            match K::try_from(e.kind) {
-                Ok(K::AexprDistinct) if top_level => {
+            match e.kind {
+                K::AexprDistinct if top_level => {
                     return distinct_facts(e, true, scope, log, snapshot);
                 }
-                Ok(K::AexprNotDistinct) if top_level => {
+                K::AexprNotDistinct if top_level => {
                     return distinct_facts(e, false, scope, log, snapshot);
                 }
                 _ => {}
@@ -960,23 +950,22 @@ fn nonnullable_node(
                 return Facts::default();
             }
             let op = crate::expr::extract_string_fields(&e.name).join(".");
-            match K::try_from(e.kind) {
+            match e.kind {
                 // `(a, b) = (1, 2)` is `a = 1 AND b = 2` and `(a, b) <> (1,
                 // 2)` `a <> 1 OR b <> 2` (make_row_comparison_op): at the
                 // top level. Below it a FALSE pair hides a NULL one. An
                 // ordering comparison is NULL when its first pair is (the
                 // row comparison stops at the first NULL pair).
-                Ok(K::AexprOp) if is_row(&e.lexpr) && is_row(&e.rexpr) => {
-                    let (Some(l), Some(r)) = (
-                        e.lexpr.as_deref().and_then(plain_row_fields),
-                        e.rexpr.as_deref().and_then(plain_row_fields),
-                    ) else {
+                K::AexprOp if is_row(&e.lexpr) && is_row(&e.rexpr) => {
+                    let (Some(l), Some(r)) =
+                        (plain_row_fields(&e.lexpr), plain_row_fields(&e.rexpr))
+                    else {
                         return Facts::default();
                     };
                     if !top_level || l.len() != r.len() {
                         return Facts::default();
                     }
-                    let pair = |(a, b): (&protobuf::Node, &protobuf::Node)| {
+                    let pair = |(a, b): (&Option<ast::Node>, &Option<ast::Node>)| {
                         walk(a, false).union(walk(b, false))
                     };
                     match op.as_str() {
@@ -1003,21 +992,21 @@ fn nonnullable_node(
                 }
                 // `(a, b) IN ((1, 2), (5, -5))`: an OR of row equalities,
                 // each needing every field of the left row non-NULL.
-                Ok(K::AexprIn) if is_row(&e.lexpr) => {
+                K::AexprIn if is_row(&e.lexpr) => {
                     let items_are_rows = matches!(
-                        e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
-                        Some(node::Node::List(l))
+                        e.rexpr.as_ref(),
+                        Some(ast::Node::List(l))
                             if !l.items.is_empty()
                                 && l.items.iter().all(|i| plain_row_fields(i).is_some())
                     );
-                    match e.lexpr.as_deref().and_then(plain_row_fields) {
+                    match plain_row_fields(&e.lexpr) {
                         Some(fields) if top_level && op == "=" && items_are_rows => fields
                             .iter()
                             .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
                         _ => Facts::default(),
                     }
                 }
-                Ok(K::AexprOp) => {
+                K::AexprOp => {
                     let strict = walk_opt(&e.lexpr, false).union(walk_opt(&e.rexpr, false));
                     if top_level {
                         strict.union(comparison_facts(e, scope, log, snapshot))
@@ -1025,37 +1014,35 @@ fn nonnullable_node(
                         strict
                     }
                 }
-                Ok(K::AexprLike | K::AexprIlike | K::AexprSimilar) => {
+                K::AexprLike | K::AexprIlike | K::AexprSimilar => {
                     walk_opt(&e.lexpr, false).union(walk_opt(&e.rexpr, false))
                 }
                 // `x IN (…)` is `x = ANY(ARRAY[…])` or an OR of `x = item`
                 // (NOT IN: `<> ALL` over a non-empty array, or an AND of
                 // `x <> item`), BETWEEN an AND / OR of comparisons on `x`:
                 // all strict in `x` at any level.
-                Ok(K::AexprIn) if top_level => {
+                K::AexprIn if top_level => {
                     walk_opt(&e.lexpr, false).union(comparison_facts(e, scope, log, snapshot))
                 }
-                Ok(K::AexprBetween) if top_level => {
+                K::AexprBetween if top_level => {
                     walk_opt(&e.lexpr, false).union(between_facts(e, scope, log, snapshot))
                 }
-                Ok(
-                    K::AexprIn
-                    | K::AexprBetween
-                    | K::AexprNotBetween
-                    | K::AexprBetweenSym
-                    | K::AexprNotBetweenSym,
-                ) => walk_opt(&e.lexpr, false),
+                K::AexprIn
+                | K::AexprBetween
+                | K::AexprNotBetween
+                | K::AexprBetweenSym
+                | K::AexprNotBetweenSym => walk_opt(&e.lexpr, false),
                 // `is_strict_saop(expr, falseOK)`: `x op ANY(array)` is NULL
                 // or FALSE when an input is NULL, enough at the top level.
                 // `ALL` over an empty array is TRUE whatever `x` is.
-                Ok(K::AexprOpAny) if top_level => walk_opt(&e.lexpr, false)
+                K::AexprOpAny if top_level => walk_opt(&e.lexpr, false)
                     .union(walk_opt(&e.rexpr, false))
                     .union(comparison_facts(e, scope, log, snapshot)),
-                Ok(K::AexprOpAll) if top_level => comparison_facts(e, scope, log, snapshot),
+                K::AexprOpAll if top_level => comparison_facts(e, scope, log, snapshot),
                 _ => Facts::default(),
             }
         }
-        node::Node::FuncCall(f) => {
+        ast::Node::FuncCall(f) => {
             if !log.is_strict(f.location, StrictNode::Func) {
                 return Facts::default();
             }
@@ -1063,31 +1050,27 @@ fn nonnullable_node(
                 .iter()
                 .fold(Facts::default(), |acc, a| acc.union(walk(a, false)))
         }
-        node::Node::NamedArgExpr(na) => walk_opt(&na.arg, top_level),
-        node::Node::TypeCast(tc) => {
+        ast::Node::NamedArgExpr(na) => walk_opt(&na.arg, top_level),
+        ast::Node::TypeCast(tc) => {
             if !log.is_strict(tc.location, StrictNode::Cast) {
                 return Facts::default();
             }
             walk_opt(&tc.arg, false)
         }
-        node::Node::CollateClause(c) => walk_opt(&c.arg, top_level),
-        node::Node::AIndirection(i) => match crate::expr::whole_row_field_column(i, scope) {
+        ast::Node::CollateClause(c) => walk_opt(&c.arg, top_level),
+        ast::Node::AIndirection(i) => match crate::expr::whole_row_field_column(i, scope) {
             // A field of a FROM entry's whole row is its column.
-            Some(column) => walk(&column, top_level),
+            Some(column) => walk(&Some(column), top_level),
             // A field or an element of a NULL value is NULL.
             None => walk_opt(&i.arg, false),
         },
-        node::Node::NullTest(t)
-            if top_level
-                && protobuf::NullTestType::try_from(t.nulltesttype)
-                    == Ok(protobuf::NullTestType::IsNotNull) =>
-        {
-            let Some(arg) = t.arg.as_deref() else {
+        ast::Node::NullTest(t) if top_level && t.nulltesttype == ast::NullTestType::IsNotNull => {
+            let Some(arg) = t.arg.as_ref() else {
                 return Facts::default();
             };
-            match arg.node.as_ref() {
+            match arg {
                 // `ROW(a, b) IS NOT NULL`: every field is non-NULL.
-                Some(node::Node::RowExpr(r)) => r
+                ast::Node::RowExpr(r) => r
                     .args
                     .iter()
                     .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
@@ -1100,7 +1083,7 @@ fn nonnullable_node(
                             acc.union(Facts::column(&src.alias, &c.name))
                         }),
                     None => {
-                        let mut f = walk(arg, false);
+                        let mut f = walk(&t.arg, false);
                         f.exprs.extend(composite_field_keys(arg, scope, snapshot));
                         f
                     }
@@ -1108,26 +1091,16 @@ fn nonnullable_node(
             }
         }
         // `x IS NULL` TRUE: `x` is NULL (a composite can be a row of NULLs).
-        node::Node::NullTest(t)
-            if top_level
-                && protobuf::NullTestType::try_from(t.nulltesttype)
-                    == Ok(protobuf::NullTestType::IsNull) =>
-        {
-            match t
-                .arg
-                .as_deref()
-                .and_then(|a| scalar_column(a, scope, snapshot))
-            {
+        ast::Node::NullTest(t) if top_level && t.nulltesttype == ast::NullTestType::IsNull => {
+            match scalar_column(t.arg.as_ref(), scope, snapshot) {
                 Some(col) => Facts::null(col),
                 None => Facts::default(),
             }
         }
         // `EXISTS (SELECT …)`: what the subquery's WHERE proves of this
         // level's columns, for the rows it returns (a semi-join's quals).
-        node::Node::SubLink(sub)
-            if top_level
-                && protobuf::SubLinkType::try_from(sub.sub_link_type)
-                    == Ok(protobuf::SubLinkType::ExistsSublink) =>
+        ast::Node::SubLink(sub)
+            if top_level && sub.sub_link_type == ast::SubLinkType::ExistsSublink =>
         {
             log.correlated(sub.location)
         }
@@ -1135,15 +1108,15 @@ fn nonnullable_node(
         // and, for `k IN (SELECT k FROM t … FOR UPDATE)` over a key of the
         // same table, what the subquery's WHERE proves of the row (noted
         // by `expr::sublink`).
-        node::Node::SubLink(sub) if top_level => {
+        ast::Node::SubLink(sub) if top_level => {
             let tested = if log.is_strict(sub.location, StrictNode::Sublink) {
-                match sub.testexpr.as_deref() {
-                    Some(t) => match t.node.as_ref() {
-                        Some(node::Node::RowExpr(r)) => r
+                match sub.testexpr.as_ref() {
+                    Some(t) => match t {
+                        ast::Node::RowExpr(r) => r
                             .args
                             .iter()
                             .fold(Facts::default(), |acc, a| acc.union(walk(a, false))),
-                        _ => walk(t, false),
+                        _ => walk(&sub.testexpr, false),
                     },
                     None => Facts::default(),
                 }
@@ -1153,13 +1126,13 @@ fn nonnullable_node(
             tested.union(log.correlated(sub.location))
         }
         // Boolean tests that are not TRUE for a NULL input.
-        node::Node::BooleanTest(t)
+        ast::Node::BooleanTest(t)
             if top_level
                 && matches!(
-                    protobuf::BoolTestType::try_from(t.booltesttype),
-                    Ok(protobuf::BoolTestType::IsTrue
-                        | protobuf::BoolTestType::IsFalse
-                        | protobuf::BoolTestType::IsNotUnknown)
+                    t.booltesttype,
+                    ast::BoolTestType::IsTrue
+                        | ast::BoolTestType::IsFalse
+                        | ast::BoolTestType::IsNotUnknown
                 ) =>
         {
             walk_opt(&t.arg, false)
@@ -1173,7 +1146,7 @@ fn nonnullable_node(
 /// anything: `x IS NULL` not TRUE is `x` non-NULL, while `x > 0` not TRUE
 /// may well be `x` NULL.
 pub(crate) fn nonnullable_unless_true(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
@@ -1194,7 +1167,7 @@ pub(crate) fn nonnullable_unless_true(
 /// What `node` *not* being FALSE (TRUE or NULL) proves non-NULL — an AND
 /// operand after it: a test that is never NULL is then TRUE.
 pub(crate) fn nonnullable_unless_false(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
@@ -1202,35 +1175,32 @@ pub(crate) fn nonnullable_unless_false(
     if disabled() {
         return Facts::default();
     }
-    let mut facts = match node.node.as_ref() {
-        Some(node::Node::NullTest(_) | node::Node::BooleanTest(_)) => {
+    let mut facts = match node.as_ref() {
+        Some(ast::Node::NullTest(_) | ast::Node::BooleanTest(_)) => {
             nonnullable(node, true, scope, log, snapshot)
         }
-        Some(node::Node::AExpr(e))
+        Some(ast::Node::AExpr(e))
             if matches!(
-                protobuf::AExprKind::try_from(e.kind),
-                Ok(protobuf::AExprKind::AexprDistinct | protobuf::AExprKind::AexprNotDistinct)
+                e.kind,
+                ast::AExprKind::AexprDistinct | ast::AExprKind::AexprNotDistinct
             ) =>
         {
             nonnullable(node, true, scope, log, snapshot)
         }
-        Some(node::Node::BoolExpr(b)) => match protobuf::BoolExprType::try_from(b.boolop) {
+        Some(ast::Node::BoolExpr(b)) => match b.boolop {
             // Not FALSE: no arm is FALSE.
-            Ok(protobuf::BoolExprType::AndExpr) => {
-                b.args.iter().fold(Facts::default(), |acc, a| {
-                    acc.union(nonnullable_unless_false(a, scope, log, snapshot))
-                })
-            }
+            ast::BoolExprType::AndExpr => b.args.iter().fold(Facts::default(), |acc, a| {
+                acc.union(nonnullable_unless_false(a, scope, log, snapshot))
+            }),
             // Not FALSE: some arm isn't.
-            Ok(protobuf::BoolExprType::OrExpr) => intersection(&b.args, |a| {
+            ast::BoolExprType::OrExpr => intersection(&b.args, |a| {
                 nonnullable_unless_false(a, scope, log, snapshot)
             }),
             // `NOT e` not FALSE: `e` not TRUE.
-            Ok(protobuf::BoolExprType::NotExpr) => match b.args.as_slice() {
+            ast::BoolExprType::NotExpr => match b.args.as_slice() {
                 [e] => nonnullable_unless_true(e, scope, log, snapshot),
                 _ => Facts::default(),
             },
-            _ => Facts::default(),
         },
         _ => Facts::default(),
     };
@@ -1243,86 +1213,68 @@ pub(crate) fn nonnullable_unless_false(
 }
 
 fn unless_true_node(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> Facts {
-    let Some(inner) = node.node.as_ref() else {
+    let Some(inner) = node.as_ref() else {
         return Facts::default();
     };
     match inner {
         // Never NULL: not TRUE is FALSE.
-        node::Node::AExpr(e)
-            if protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprDistinct) =>
-        {
+        ast::Node::AExpr(e) if e.kind == ast::AExprKind::AexprDistinct => {
             distinct_facts(e, false, scope, log, snapshot)
         }
-        node::Node::AExpr(e)
-            if protobuf::AExprKind::try_from(e.kind)
-                == Ok(protobuf::AExprKind::AexprNotDistinct) =>
-        {
+        ast::Node::AExpr(e) if e.kind == ast::AExprKind::AexprNotDistinct => {
             distinct_facts(e, true, scope, log, snapshot)
         }
         // `x IS NOT NULL` not TRUE: `x` is NULL.
-        node::Node::NullTest(t)
-            if protobuf::NullTestType::try_from(t.nulltesttype)
-                == Ok(protobuf::NullTestType::IsNotNull) =>
-        {
-            match t
-                .arg
-                .as_deref()
-                .and_then(|a| scalar_column(a, scope, snapshot))
-            {
+        ast::Node::NullTest(t) if t.nulltesttype == ast::NullTestType::IsNotNull => {
+            match scalar_column(t.arg.as_ref(), scope, snapshot) {
                 Some(col) => Facts::null(col),
                 None => Facts::default(),
             }
         }
-        node::Node::NullTest(t)
-            if protobuf::NullTestType::try_from(t.nulltesttype)
-                == Ok(protobuf::NullTestType::IsNull) =>
-        {
-            match t.arg.as_deref() {
+        ast::Node::NullTest(t) if t.nulltesttype == ast::NullTestType::IsNull => {
+            match t.arg.as_ref() {
                 // Some field of the row is non-NULL — which one is unknown.
-                Some(a) if matches!(a.node.as_ref(), Some(node::Node::RowExpr(_))) => {
-                    Facts::default()
-                }
+                Some(ast::Node::RowExpr(_)) => Facts::default(),
                 // A whole row that isn't NULL may still hold NULL columns:
                 // only the entry itself is present.
                 Some(a) => match whole_row_source(a, scope) {
                     Some(src) => Facts::rel(&src.alias),
-                    None => nonnullable(a, false, scope, log, snapshot),
+                    None => nonnullable(&t.arg, false, scope, log, snapshot),
                 },
                 None => Facts::default(),
             }
         }
-        node::Node::BooleanTest(t) => {
-            let Some(arg) = t.arg.as_deref() else {
+        ast::Node::BooleanTest(t) => {
+            if t.arg.is_none() {
                 return Facts::default();
-            };
-            match protobuf::BoolTestType::try_from(t.booltesttype) {
+            }
+            let arg = &t.arg;
+            match t.booltesttype {
                 // Not (NOT TRUE): TRUE.
-                Ok(protobuf::BoolTestType::IsNotTrue) => {
-                    nonnullable(arg, true, scope, log, snapshot)
-                }
+                ast::BoolTestType::IsNotTrue => nonnullable(arg, true, scope, log, snapshot),
                 // Not UNKNOWN / not (NOT FALSE), i.e. FALSE: non-NULL.
-                Ok(protobuf::BoolTestType::IsUnknown | protobuf::BoolTestType::IsNotFalse) => {
+                ast::BoolTestType::IsUnknown | ast::BoolTestType::IsNotFalse => {
                     nonnullable(arg, false, scope, log, snapshot)
                 }
                 _ => Facts::default(),
             }
         }
-        node::Node::BoolExpr(b) => match protobuf::BoolExprType::try_from(b.boolop) {
+        ast::Node::BoolExpr(b) => match b.boolop {
             // Not TRUE: no arm is TRUE.
-            Ok(protobuf::BoolExprType::OrExpr) => b.args.iter().fold(Facts::default(), |acc, a| {
+            ast::BoolExprType::OrExpr => b.args.iter().fold(Facts::default(), |acc, a| {
                 acc.union(nonnullable_unless_true(a, scope, log, snapshot))
             }),
             // Not TRUE: some arm isn't.
-            Ok(protobuf::BoolExprType::AndExpr) => intersection(&b.args, |a| {
+            ast::BoolExprType::AndExpr => intersection(&b.args, |a| {
                 nonnullable_unless_true(a, scope, log, snapshot)
             }),
             // `NOT e` not TRUE: `e` not FALSE.
-            Ok(protobuf::BoolExprType::NotExpr) => match b.args.as_slice() {
+            ast::BoolExprType::NotExpr => match b.args.as_slice() {
                 [e] => {
                     let f = nonnullable_unless_false(e, scope, log, snapshot);
                     // `NOT e` not TRUE: `e` not FALSE, so what `e` says
@@ -1334,11 +1286,10 @@ fn unless_true_node(
                 }
                 _ => Facts::default(),
             },
-            _ => Facts::default(),
         },
         // A comparison with constants not TRUE: a non-NULL column fails it
         // (`kind = 'a'` not TRUE, `kind` is NULL or isn't `'a'`).
-        node::Node::ColumnRef(_) | node::Node::AExpr(_) => {
+        ast::Node::ColumnRef(_) | ast::Node::AExpr(_) => {
             match value_pred(node, scope, log, snapshot) {
                 Some((col, p)) => Facts::pred(col, p.negated()),
                 None => Facts::default(),
@@ -1353,20 +1304,20 @@ fn unless_true_node(
 /// column's value when it is TRUE — and, for a non-NULL column, its
 /// negation when it isn't.
 fn value_pred(
-    n: &protobuf::Node,
+    n: &Option<ast::Node>,
     scope: &Scope,
     log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> Option<(Col, ValPred)> {
-    match n.node.as_ref()? {
-        node::Node::ColumnRef(_) => {
+    match n.as_ref()? {
+        n @ ast::Node::ColumnRef(_) => {
             let (col, t) = plain_column(n, scope)?;
             (snapshot.unwrap_domain(t) == crate::pg_catalog::oid::BOOL)
                 .then(|| (col, ValPred::In(vec![Literal::boolean(true)])))
         }
         // The operator resolved (and, being strict, is one of the
         // comparison operators `column_pred` reads).
-        node::Node::AExpr(e) if log.is_strict(e.location, StrictNode::Op) => {
+        ast::Node::AExpr(e) if log.is_strict(e.location, StrictNode::Op) => {
             column_pred(e, scope, log, snapshot)
         }
         _ => None,
@@ -1376,7 +1327,7 @@ fn value_pred(
 /// `(x).f` for every field `f` of composite column `x`: what `x IS NOT
 /// NULL` proves (a row-wise test, TRUE only when every field is non-NULL:
 /// `ExecEvalRowNullInt`).
-fn composite_field_keys(arg: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> Vec<String> {
+fn composite_field_keys(arg: &ast::Node, scope: &Scope, snapshot: &PgCatalog) -> Vec<String> {
     let Some((_, ty)) = plain_column(arg, scope) else {
         return Vec::new();
     };
@@ -1391,33 +1342,28 @@ fn composite_field_keys(arg: &protobuf::Node, scope: &Scope, snapshot: &PgCatalo
         .attributes_of(relid)
         .iter()
         .map(|a| {
-            exprs::key(&protobuf::Node {
-                node: Some(node::Node::AIndirection(Box::new(protobuf::AIndirection {
-                    arg: Some(Box::new(arg.clone())),
-                    indirection: vec![protobuf::Node {
-                        node: Some(node::Node::String(protobuf::String {
-                            sval: a.attname.clone(),
-                        })),
-                    }],
-                }))),
-            })
+            exprs::key(&Some(ast::Node::AIndirection(NodeBox::new(
+                ast::AIndirection {
+                    arg: Some(arg.clone()),
+                    indirection: vec![Some(ast::Node::String(NodeBox::new(ast::String {
+                        sval: a.attname.clone(),
+                    })))],
+                },
+            ))))
         })
         .collect()
 }
 
 /// The FROM entry a bare `t` / `t.*` reference names as a whole row.
-fn whole_row_source<'s>(
-    n: &protobuf::Node,
-    scope: &'s Scope,
-) -> Option<&'s crate::scope::TableSource> {
-    let Some(node::Node::ColumnRef(c)) = n.node.as_ref() else {
+fn whole_row_source<'s>(n: &ast::Node, scope: &'s Scope) -> Option<&'s crate::scope::TableSource> {
+    let ast::Node::ColumnRef(c) = n else {
         return None;
     };
     let parts = crate::expr::extract_string_fields(&c.fields);
     let star = c
         .fields
         .iter()
-        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
+        .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))));
     match (parts.as_slice(), star) {
         ([.., t], true) => scope.find_source(t),
         ([name], false)
@@ -1434,11 +1380,11 @@ fn whole_row_source<'s>(
 
 /// A column reference proves its own column non-NULL (a whole-row one,
 /// its entry).
-fn column_ref_facts(c: &protobuf::ColumnRef, scope: &Scope) -> Facts {
+fn column_ref_facts(c: &ast::ColumnRef, scope: &Scope) -> Facts {
     let star = c
         .fields
         .iter()
-        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
+        .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))));
     let parts = crate::expr::extract_string_fields(&c.fields);
     if star {
         return match parts.last() {
@@ -1467,27 +1413,24 @@ fn column_ref_facts(c: &protobuf::ColumnRef, scope: &Scope) -> Facts {
 
 /// The column a plain, non-composite column reference names (for a
 /// composite `x`, `x IS NULL` also holds for a row of NULLs).
-fn scalar_column(n: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> Option<Col> {
-    let col = plain_column(n, scope)?;
+fn scalar_column(n: Option<&ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> Option<Col> {
+    let col = plain_column(n?, scope)?;
     (!crate::coerce::is_complex(col.1, snapshot) && col.1 != crate::pg_catalog::oid::RECORD)
         .then_some(col.0)
 }
 
 /// The column a plain column reference names, with its type.
-pub(crate) fn plain_column(
-    n: &protobuf::Node,
-    scope: &Scope,
-) -> Option<(Col, crate::oid::PgTypeOid)> {
+pub(crate) fn plain_column(n: &ast::Node, scope: &Scope) -> Option<(Col, crate::oid::PgTypeOid)> {
     // A field of a FROM entry's whole row is its column.
-    if let Some(node::Node::AIndirection(i)) = n.node.as_ref() {
+    if let ast::Node::AIndirection(i) = n {
         return plain_column(&crate::expr::whole_row_field_column(i, scope)?, scope);
     }
-    let Some(node::Node::ColumnRef(c)) = n.node.as_ref() else {
+    let ast::Node::ColumnRef(c) = n else {
         return None;
     };
     if c.fields
         .iter()
-        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+        .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
     {
         return None;
     }
@@ -1503,19 +1446,19 @@ pub(crate) fn plain_column(
 }
 
 /// A bare constant operand.
-pub(crate) fn literal(n: &protobuf::Node) -> Option<Literal> {
-    use typedpg_pg_query::protobuf::a_const::Val;
-    match n.node.as_ref()? {
-        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            Val::Ival(i) => Some(Literal {
+pub(crate) fn literal(n: &Option<ast::Node>) -> Option<Literal> {
+    use typedpg_pg_query::ast::AConstValue;
+    match n.as_ref()? {
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            AConstValue::Integer(i) => Some(Literal {
                 text: i.ival.to_string(),
                 kind: LitKind::Integer,
             }),
-            Val::Sval(s) => Some(Literal {
+            AConstValue::String(s) => Some(Literal {
                 text: s.sval.clone(),
                 kind: LitKind::String,
             }),
-            Val::Boolval(b) => Some(Literal::boolean(b.boolval)),
+            AConstValue::Boolean(b) => Some(Literal::boolean(b.boolval)),
             _ => None,
         },
         _ => None,
@@ -1530,16 +1473,14 @@ pub(crate) fn literal(n: &protobuf::Node) -> Option<Literal> {
 /// CHECK on the column can use. Nor one cast with a type modifier
 /// ([`cast_target`]): `'abc'::varchar(2)` is `'ab'`.
 pub(crate) fn literal_for(
-    n: &protobuf::Node,
+    n: &Option<ast::Node>,
     column_type: crate::oid::PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Option<Literal> {
-    match n.node.as_ref()? {
-        node::Node::TypeCast(tc) => {
+    match n.as_ref()? {
+        ast::Node::TypeCast(tc) => {
             let target = cast_target(tc, snapshot)?;
-            (target == column_type)
-                .then(|| literal(tc.arg.as_deref()?))
-                .flatten()
+            (target == column_type).then(|| literal(&tc.arg)).flatten()
         }
         _ => literal(n),
     }
@@ -1551,7 +1492,7 @@ pub(crate) fn literal_for(
 /// a domain's (`CREATE DOMAIN d AS varchar(2)`) — which may truncate,
 /// round or pad the value.
 pub(crate) fn cast_target(
-    tc: &protobuf::TypeCast,
+    tc: &ast::TypeCast,
     snapshot: &PgCatalog,
 ) -> Option<crate::oid::PgTypeOid> {
     let type_name = tc.type_name.as_ref()?;
@@ -1573,12 +1514,7 @@ pub(crate) fn cast_target(
 /// `col op constant` (either way round), `col IN (…)`, `col = ANY (…)`
 /// and `col <> ALL (…)` over constants, TRUE: what it says of the column
 /// (equal to a constant, one or none of several, ordered against one).
-fn comparison_facts(
-    e: &protobuf::AExpr,
-    scope: &Scope,
-    log: &StrictLog,
-    snapshot: &PgCatalog,
-) -> Facts {
+fn comparison_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCatalog) -> Facts {
     let Some((c, p)) = column_pred(e, scope, log, snapshot) else {
         return Facts::default();
     };
@@ -1594,20 +1530,14 @@ fn comparison_facts(
 
 /// `col BETWEEN a AND b` over constants, TRUE: `col >= a AND col <= b`
 /// (when both comparisons are the built-in ones).
-fn between_facts(
-    e: &protobuf::AExpr,
-    scope: &Scope,
-    log: &StrictLog,
-    snapshot: &PgCatalog,
-) -> Facts {
-    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+fn between_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCatalog) -> Facts {
+    let (Some(l), Some(r)) = (e.lexpr.as_ref(), e.rexpr.as_ref()) else {
         return Facts::default();
     };
     if !log.trusts(e.location, StrictNode::BuiltinCompare) {
         return Facts::default();
     }
-    let (Some((c, t)), Some(node::Node::List(list))) = (plain_column(l, scope), r.node.as_ref())
-    else {
+    let (Some((c, t)), ast::Node::List(list)) = (plain_column(l, scope), r) else {
         return Facts::default();
     };
     let bound = |i: usize| list.items.get(i).and_then(|n| literal_for(n, t, snapshot));
@@ -1628,22 +1558,22 @@ fn between_facts(
 /// comparisons (`trust` says which the expression resolved to): a
 /// user-defined `=` may hold for values that differ.
 pub(crate) fn column_pred(
-    e: &protobuf::AExpr,
+    e: &ast::AExpr,
     scope: &Scope,
     trust: &dyn Trust,
     snapshot: &PgCatalog,
 ) -> Option<(Col, ValPred)> {
-    use protobuf::AExprKind as K;
+    use ast::AExprKind as K;
     if !trust.trusts(e.location, StrictNode::BuiltinCompare) {
         return None;
     }
     let op = crate::expr::extract_string_fields(&e.name).join(".");
-    let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
-    match K::try_from(e.kind).ok()? {
+    let (l, r) = (e.lexpr.as_ref()?, e.rexpr.as_ref()?);
+    match e.kind {
         K::AexprOp => {
             let (c, v, flipped) = match (plain_column(l, scope), plain_column(r, scope)) {
-                (Some((c, t)), None) => (c, literal_for(r, t, snapshot)?, false),
-                (None, Some((c, t))) => (c, literal_for(l, t, snapshot)?, true),
+                (Some((c, t)), None) => (c, literal_for(&e.rexpr, t, snapshot)?, false),
+                (None, Some((c, t))) => (c, literal_for(&e.lexpr, t, snapshot)?, true),
                 _ => return None,
             };
             let p = match op.as_str() {
@@ -1658,7 +1588,7 @@ pub(crate) fn column_pred(
         }
         K::AexprIn => {
             let (c, t) = plain_column(l, scope)?;
-            let Some(node::Node::List(list)) = r.node.as_ref() else {
+            let ast::Node::List(list) = r else {
                 return None;
             };
             let positive = match op.as_str() {
@@ -1683,7 +1613,7 @@ pub(crate) fn column_pred(
                 (K::AexprOpAll, "<>") => false,
                 _ => return None,
             };
-            let vs = array_constants(r, t, positive, snapshot)?;
+            let vs = array_constants(&e.rexpr, t, positive, snapshot)?;
             Some((
                 c,
                 if positive {
@@ -1700,14 +1630,14 @@ pub(crate) fn column_pred(
 /// The constants of an IN list or an array, for a column of type `t`
 /// (NULLs dropped when `drop_nulls`, else refused).
 pub(crate) fn constants<'n>(
-    items: impl Iterator<Item = &'n protobuf::Node>,
+    items: impl Iterator<Item = &'n Option<ast::Node>>,
     t: crate::oid::PgTypeOid,
     drop_nulls: bool,
     snapshot: &PgCatalog,
 ) -> Option<Vec<Literal>> {
     let mut out = Vec::new();
     for i in items {
-        if let Some(node::Node::AConst(c)) = i.node.as_ref()
+        if let Some(ast::Node::AConst(c)) = i.as_ref()
             && c.isnull
         {
             if drop_nulls {
@@ -1731,28 +1661,26 @@ pub(crate) fn constants<'n>(
 /// varchar, enums, integers: `array_in` with `,` as the delimiter,
 /// trimming the blanks around an element).
 pub(crate) fn array_constants(
-    n: &protobuf::Node,
+    n: &Option<ast::Node>,
     t: crate::oid::PgTypeOid,
     drop_nulls: bool,
     snapshot: &PgCatalog,
 ) -> Option<Vec<Literal>> {
-    use typedpg_pg_query::protobuf::a_const::Val;
-    match n.node.as_ref()? {
-        node::Node::AArrayExpr(a) => constants(a.elements.iter(), t, drop_nulls, snapshot),
-        node::Node::TypeCast(tc) => {
+    use typedpg_pg_query::ast::AConstValue;
+    match n.as_ref()? {
+        ast::Node::AArrayExpr(a) => constants(a.elements.iter(), t, drop_nulls, snapshot),
+        ast::Node::TypeCast(tc) => {
             let target = cast_target(tc, snapshot)?;
             if snapshot.pg_type.get(&t).and_then(|ty| ty.typarray) != Some(target) {
                 return None;
             }
-            match tc.arg.as_deref()?.node.as_ref()? {
-                node::Node::AConst(_) => {
-                    array_constants(tc.arg.as_deref()?, t, drop_nulls, snapshot)
-                }
+            match tc.arg.as_ref()? {
+                ast::Node::AConst(_) => array_constants(&tc.arg, t, drop_nulls, snapshot),
                 _ => None,
             }
         }
-        node::Node::AConst(c) if !c.isnull => {
-            let Some(Val::Sval(s)) = c.val.as_ref() else {
+        ast::Node::AConst(c) if !c.isnull => {
+            let Some(AConstValue::String(s)) = c.val.as_ref() else {
                 return None;
             };
             let base = snapshot.unwrap_domain(t);
@@ -1813,21 +1741,21 @@ pub(crate) fn array_constants(
 /// call is `pg_catalog`'s (`trust` says what it resolved to) and so is
 /// the comparison.
 pub(crate) fn null_count_bounds<'e>(
-    e: &'e protobuf::AExpr,
+    e: &'e ast::AExpr,
     trust: &dyn Trust,
-) -> Option<(&'e [protobuf::Node], i64, i64)> {
+) -> Option<(&'e [Option<ast::Node>], i64, i64)> {
     if !trust.trusts(e.location, StrictNode::BuiltinCompare) {
         return None;
     }
     let op = crate::expr::extract_string_fields(&e.name).join(".");
-    let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+    let (l, r) = (e.lexpr.as_ref()?, e.rexpr.as_ref()?);
     // `f(args) op n` or `n op f(args)` (flipped).
-    let (call, n, op) = match (l.node.as_ref()?, literal(r)) {
-        (node::Node::FuncCall(fc), Some(v)) if v.is_integer() => {
+    let (call, n, op) = match (l, literal(&e.rexpr)) {
+        (ast::Node::FuncCall(fc), Some(v)) if v.is_integer() => {
             (fc, v.text.parse::<i64>().ok()?, op)
         }
-        _ => match (r.node.as_ref()?, literal(l)) {
-            (node::Node::FuncCall(fc), Some(v)) if v.is_integer() => {
+        _ => match (r, literal(&e.lexpr)) {
+            (ast::Node::FuncCall(fc), Some(v)) if v.is_integer() => {
                 let flipped = match op.as_str() {
                     "<" => ">",
                     ">" => "<",
@@ -1878,11 +1806,15 @@ pub(crate) fn null_count_bounds<'e>(
 
 /// `num_nonnulls(a, b) > 0` and kin over plain columns: at least one of
 /// them non-NULL — or every one, when all must be.
-fn null_count_facts(e: &protobuf::AExpr, scope: &Scope, log: &StrictLog) -> Option<Facts> {
+fn null_count_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog) -> Option<Facts> {
     let (args, at_least, _) = null_count_bounds(e, log)?;
     let cols: Option<BTreeSet<Col>> = args
         .iter()
-        .map(|a| plain_column(a, scope).map(|(c, _)| c))
+        .map(|a| {
+            a.as_ref()
+                .and_then(|a| plain_column(a, scope))
+                .map(|(c, _)| c)
+        })
         .collect();
     let cols = cols?;
     if at_least <= 0 {

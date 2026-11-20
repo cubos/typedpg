@@ -3,8 +3,8 @@
 //! alone or as `CREATE TABLE ... AS EXECUTE` — runs it with arguments
 //! coerced to those types, `DEALLOCATE` (and `DISCARD ALL`) forget it.
 
-use typedpg_pg_query::protobuf::{
-    DeallocateStmt, DiscardMode, DiscardStmt, ExecuteStmt, Node, PrepareStmt, node,
+use typedpg_pg_query::ast::{
+    self, DeallocateStmt, DiscardMode, DiscardStmt, ExecuteStmt, Node, PrepareStmt,
 };
 
 use super::DdlError;
@@ -25,7 +25,7 @@ impl PreparedStatement {
     /// The query returns rows the way CREATE TABLE AS EXECUTE needs: a
     /// SELECT (ExecuteQuery's "prepared statement is not a SELECT").
     pub(crate) fn is_select(&self) -> bool {
-        matches!(self.query.node.as_ref(), Some(node::Node::SelectStmt(_)))
+        matches!(self.query, ast::Node::SelectStmt(_))
     }
 }
 
@@ -48,12 +48,12 @@ fn analysis_error(e: AnalyzeError) -> Option<DdlError> {
 /// ones it uses beyond them are inferred. It isn't run: the errors only
 /// its execution raises are EXECUTE's.
 pub(crate) fn prepare(interp: &mut PgCatalog, stmt: &PrepareStmt) -> Result<(), DdlError> {
-    let Some(query) = stmt.query.as_deref() else {
+    let Some(inner) = stmt.query.as_ref() else {
         return Ok(());
     };
     let mut declared: Vec<PgTypeOid> = Vec::new();
     for t in &stmt.argtypes {
-        if let Some(node::Node::TypeName(tn)) = t.node.as_ref() {
+        if let Some(ast::Node::TypeName(tn)) = t.as_ref() {
             declared.push(super::util::lookup_type_name(tn, interp)?);
         }
     }
@@ -64,36 +64,34 @@ pub(crate) fn prepare(interp: &mut PgCatalog, stmt: &PrepareStmt) -> Result<(), 
         )));
     }
     let mut param_types = declared.clone();
-    if let Some(inner) = query.node.as_ref() {
-        // PrepareQuery analyzes and rewrites the query (and caches the
-        // plan); it runs at EXECUTE.
-        match crate::resolve::without_execution(|| {
-            crate::expr::with_rewriting(true, || {
-                crate::resolve::analyze_raw_node_with_param_types(interp, inner, &declared)
-            })
-        }) {
-            Ok((_, params)) => {
-                for (number, typ, _) in params {
-                    let i = usize::try_from(number - 1).unwrap_or(0);
-                    if i >= param_types.len() {
-                        param_types.resize(i + 1, crate::pg_catalog::oid::UNKNOWN);
-                    }
-                    if i >= declared.len() {
-                        param_types[i] = typ;
-                    }
+    // PrepareQuery analyzes and rewrites the query (and caches the
+    // plan); it runs at EXECUTE.
+    match crate::resolve::without_execution(|| {
+        crate::expr::with_rewriting(true, || {
+            crate::resolve::analyze_raw_node_with_param_types(interp, inner, &declared)
+        })
+    }) {
+        Ok((_, params)) => {
+            for (number, typ, _) in params {
+                let i = usize::try_from(number - 1).unwrap_or(0);
+                if i >= param_types.len() {
+                    param_types.resize(i + 1, crate::pg_catalog::oid::UNKNOWN);
+                }
+                if i >= declared.len() {
+                    param_types[i] = typ;
                 }
             }
-            Err(e) => {
-                if let Some(e) = analysis_error(e) {
-                    return Err(e);
-                }
+        }
+        Err(e) => {
+            if let Some(e) = analysis_error(e) {
+                return Err(e);
             }
         }
     }
     interp.prepared_statements.insert(
         stmt.name.clone(),
         PreparedStatement {
-            query: query.clone(),
+            query: inner.clone(),
             param_types,
             custom_plans: 0,
         },
@@ -214,9 +212,7 @@ pub(crate) fn planned_for_arguments<R>(
 /// ([`planned_for_arguments`]).
 pub(crate) fn execute(interp: &mut PgCatalog, stmt: &ExecuteStmt) -> Result<(), DdlError> {
     let prepared = lookup_execute(interp, stmt)?;
-    let Some(inner) = prepared.query.node.as_ref() else {
-        return Ok(());
-    };
+    let inner = &prepared.query;
     let analyzed = planned_for_arguments(interp, stmt, &prepared, |interp| {
         crate::resolve::analyze_executed(interp, inner, || {
             crate::resolve::analyze_raw_node_with_param_types(interp, inner, &prepared.param_types)
@@ -248,7 +244,7 @@ pub(crate) fn deallocate(interp: &mut PgCatalog, stmt: &DeallocateStmt) -> Resul
 /// `DISCARD ALL` deallocates every prepared statement and closes every
 /// cursor (among the rest of the session state the analyzer doesn't keep).
 pub(crate) fn discard(interp: &mut PgCatalog, stmt: &DiscardStmt) -> Result<(), DdlError> {
-    if DiscardMode::try_from(stmt.target) == Ok(DiscardMode::DiscardAll) {
+    if stmt.target == DiscardMode::DiscardAll {
         interp.prepared_statements.clear();
         interp.cursors.close_all();
     }

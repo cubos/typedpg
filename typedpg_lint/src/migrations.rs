@@ -14,9 +14,9 @@ use typedpg_analyzer::{
     PgClassOid, PgConstraintOid, PgIndex, PgTypeOid, RelKind, TypCategory,
 };
 use typedpg_core::{QualifiedName, quote_identifier};
-use typedpg_pg_query::protobuf::{
-    AlterTableType, BoolExprType, ConstrType, Node, NullTestType, ObjectType, SortByDir,
-    SortByNulls, TransactionStmtKind, VariableSetKind, a_const::Val, node::Node as N,
+use typedpg_pg_query::ast::{
+    AConstValue, AlterTableType, BoolExprType, ConstrType, Node, Node as N, NullTestType,
+    ObjectType, SortByDir, SortByNulls, TransactionStmtKind, VariableSetKind,
 };
 
 use crate::{AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment};
@@ -352,9 +352,9 @@ impl MigrationLinter<'_> {
             .iter()
             .filter_map(|token| {
                 if matches!(
-                    token.token(),
-                    typedpg_pg_query::protobuf::Token::SqlComment
-                        | typedpg_pg_query::protobuf::Token::CComment
+                    token.token,
+                    typedpg_pg_query::ast::Token::SqlComment
+                        | typedpg_pg_query::ast::Token::CComment
                 ) {
                     return None;
                 }
@@ -393,7 +393,7 @@ impl MigrationLinter<'_> {
     fn table(
         &self,
         catalog: &PgCatalog,
-        relation: &typedpg_pg_query::protobuf::RangeVar,
+        relation: &typedpg_pg_query::ast::RangeVar,
     ) -> Option<(PgClassOid, String)> {
         let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
         let class = catalog.resolve_table(schema, &relation.relname)?;
@@ -450,7 +450,7 @@ impl MigrationLinter<'_> {
     fn create_index_blocking(
         &self,
         catalog: &PgCatalog,
-        index: &typedpg_pg_query::protobuf::IndexStmt,
+        index: &typedpg_pg_query::ast::IndexStmt,
     ) -> Vec<RawFinding> {
         if index.concurrent {
             return Vec::new();
@@ -481,7 +481,7 @@ impl MigrationLinter<'_> {
     fn constraint_index_blocking(
         &self,
         catalog: &PgCatalog,
-        alter: &typedpg_pg_query::protobuf::AlterTableStmt,
+        alter: &typedpg_pg_query::ast::AlterTableStmt,
     ) -> Vec<RawFinding> {
         let Some(relation) = alter.relation.as_ref() else {
             return Vec::new();
@@ -489,12 +489,10 @@ impl MigrationLinter<'_> {
         let Some((_, table)) = self.table(catalog, relation) else {
             return Vec::new();
         };
-        let builds_index = |constraint: &typedpg_pg_query::protobuf::Constraint| {
+        let builds_index = |constraint: &typedpg_pg_query::ast::Constraint| {
             matches!(
-                ConstrType::try_from(constraint.contype),
-                Ok(ConstrType::ConstrPrimary
-                    | ConstrType::ConstrUnique
-                    | ConstrType::ConstrExclusion)
+                constraint.contype,
+                ConstrType::ConstrPrimary | ConstrType::ConstrUnique | ConstrType::ConstrExclusion
             ) && constraint.indexname.is_empty()
         };
         let mut found = false;
@@ -502,17 +500,14 @@ impl MigrationLinter<'_> {
             let Some(command) = alter_command(command) else {
                 continue;
             };
-            match (
-                AlterTableType::try_from(command.subtype),
-                command.def.as_deref().and_then(|def| def.node.as_ref()),
-            ) {
-                (Ok(AlterTableType::AtAddConstraint), Some(N::Constraint(constraint))) => {
+            match (command.subtype, command.def.as_ref()) {
+                (AlterTableType::AtAddConstraint, Some(N::Constraint(constraint))) => {
                     found |= builds_index(constraint);
                 }
-                (Ok(AlterTableType::AtAddColumn), Some(N::ColumnDef(column))) => {
-                    found |= column.constraints.iter().any(|node| {
-                        matches!(node.node.as_ref(), Some(N::Constraint(c)) if builds_index(c))
-                    });
+                (AlterTableType::AtAddColumn, Some(N::ColumnDef(column))) => {
+                    found |= column.constraints.iter().any(
+                        |node| matches!(node.as_ref(), Some(N::Constraint(c)) if builds_index(c)),
+                    );
                 }
                 _ => {}
             }
@@ -538,7 +533,7 @@ impl MigrationLinter<'_> {
     fn constraint_validating(
         &self,
         catalog: &PgCatalog,
-        alter: &typedpg_pg_query::protobuf::AlterTableStmt,
+        alter: &typedpg_pg_query::ast::AlterTableStmt,
     ) -> Vec<RawFinding> {
         let Some(relation) = alter.relation.as_ref() else {
             return Vec::new();
@@ -561,14 +556,11 @@ impl MigrationLinter<'_> {
             let Some(command) = alter_command(command) else {
                 continue;
             };
-            match (
-                AlterTableType::try_from(command.subtype),
-                command.def.as_deref().and_then(|def| def.node.as_ref()),
-            ) {
-                (Ok(AlterTableType::AtAddColumn), Some(N::ColumnDef(column))) => {
+            match (command.subtype, command.def.as_ref()) {
+                (AlterTableType::AtAddColumn, Some(N::ColumnDef(column))) => {
                     skip_validation &= !column_has_raw_default(column);
                 }
-                (Ok(AlterTableType::AtAddConstraint), Some(N::Constraint(constraint))) => {
+                (AlterTableType::AtAddConstraint, Some(N::Constraint(constraint))) => {
                     skip_validation &= !constraint_is_foreign_key(constraint);
                 }
                 _ => {}
@@ -579,14 +571,9 @@ impl MigrationLinter<'_> {
             let Some(command) = alter_command(command) else {
                 continue;
             };
-            let Ok(subtype) = AlterTableType::try_from(command.subtype) else {
-                continue;
-            };
-            match subtype {
+            match command.subtype {
                 AlterTableType::AtAddConstraint => {
-                    let Some(N::Constraint(constraint)) =
-                        command.def.as_deref().and_then(|def| def.node.as_ref())
-                    else {
+                    let Some(N::Constraint(constraint)) = command.def.as_ref() else {
                         continue;
                     };
                     if validates(constraint) {
@@ -594,9 +581,7 @@ impl MigrationLinter<'_> {
                     }
                 }
                 AlterTableType::AtAddColumn => {
-                    let Some(N::ColumnDef(column)) =
-                        command.def.as_deref().and_then(|def| def.node.as_ref())
-                    else {
+                    let Some(N::ColumnDef(column)) = command.def.as_ref() else {
                         continue;
                     };
                     // `ADD COLUMN IF NOT EXISTS` on an existing column adds
@@ -613,7 +598,7 @@ impl MigrationLinter<'_> {
                     // validation: every added column has no default and the
                     // statement adds no other FK.
                     for node in &column.constraints {
-                        if let Some(N::Constraint(constraint)) = node.node.as_ref()
+                        if let Some(N::Constraint(constraint)) = node.as_ref()
                             && validates(constraint)
                             && !(skip_validation && constraint_is_foreign_key(constraint))
                         {
@@ -641,7 +626,7 @@ impl MigrationLinter<'_> {
     fn set_not_null_scan(
         &self,
         catalog: &PgCatalog,
-        alter: &typedpg_pg_query::protobuf::AlterTableStmt,
+        alter: &typedpg_pg_query::ast::AlterTableStmt,
     ) -> Vec<RawFinding> {
         let Some(relation) = alter.relation.as_ref() else {
             return Vec::new();
@@ -654,7 +639,7 @@ impl MigrationLinter<'_> {
             let Some(command) = alter_command(command) else {
                 continue;
             };
-            if AlterTableType::try_from(command.subtype) != Ok(AlterTableType::AtSetNotNull) {
+            if command.subtype != AlterTableType::AtSetNotNull {
                 continue;
             }
             let already = catalog
@@ -683,7 +668,7 @@ impl MigrationLinter<'_> {
     fn table_rewrite(
         &self,
         catalog: &PgCatalog,
-        alter: &typedpg_pg_query::protobuf::AlterTableStmt,
+        alter: &typedpg_pg_query::ast::AlterTableStmt,
     ) -> Vec<RawFinding> {
         let Some(relation) = alter.relation.as_ref() else {
             return Vec::new();
@@ -696,14 +681,9 @@ impl MigrationLinter<'_> {
             let Some(command) = alter_command(command) else {
                 continue;
             };
-            let Ok(subtype) = AlterTableType::try_from(command.subtype) else {
-                continue;
-            };
-            match subtype {
+            match command.subtype {
                 AlterTableType::AtAlterColumnType => {
-                    let Some(N::ColumnDef(column)) =
-                        command.def.as_deref().and_then(|def| def.node.as_ref())
-                    else {
+                    let Some(N::ColumnDef(column)) = command.def.as_ref() else {
                         continue;
                     };
                     let Some(type_name) = column.type_name.as_ref() else {
@@ -720,7 +700,7 @@ impl MigrationLinter<'_> {
                             relid,
                             &command.name,
                             type_name,
-                            column.raw_default.as_deref(),
+                            column.raw_default.as_ref(),
                         )
                         .unwrap_or(true)
                     {
@@ -728,9 +708,7 @@ impl MigrationLinter<'_> {
                     }
                 }
                 AlterTableType::AtAddColumn => {
-                    let Some(N::ColumnDef(column)) =
-                        command.def.as_deref().and_then(|def| def.node.as_ref())
-                    else {
+                    let Some(N::ColumnDef(column)) = command.def.as_ref() else {
                         continue;
                     };
                     // `ADD COLUMN IF NOT EXISTS` on a column that already
@@ -747,17 +725,14 @@ impl MigrationLinter<'_> {
                     let mut volatile_default = false;
                     let mut generated_stored = column.generated == "s";
                     for constraint in &column.constraints {
-                        let Some(N::Constraint(constraint)) = constraint.node.as_ref() else {
+                        let Some(N::Constraint(constraint)) = constraint.as_ref() else {
                             continue;
                         };
-                        match ConstrType::try_from(constraint.contype) {
-                            Ok(ConstrType::ConstrDefault) => {
-                                volatile_default |= constraint
-                                    .raw_expr
-                                    .as_deref()
-                                    .is_some_and(|default| volatile(catalog, default));
+                        match constraint.contype {
+                            ConstrType::ConstrDefault => {
+                                volatile_default |= volatile(catalog, &constraint.raw_expr);
                             }
-                            Ok(ConstrType::ConstrGenerated) => {
+                            ConstrType::ConstrGenerated => {
                                 // `generated_kind` is `s` for a stored
                                 // column (`v` is virtual, with no storage to
                                 // rewrite).
@@ -848,15 +823,8 @@ impl MigrationLinter<'_> {
     /// `ROLLBACK` restores the `BEGIN` snapshot, `ROLLBACK TO` restores the
     /// savepoint's, and `RELEASE` drops it. A `COMMIT` keeps the session
     /// value and drops the local one.
-    fn track_transaction(&mut self, transaction: &typedpg_pg_query::protobuf::TransactionStmt) {
-        let Ok(kind) = TransactionStmtKind::try_from(transaction.kind) else {
-            // An unrecognized transaction control statement can end or
-            // start a transaction in ways this tracker does not model:
-            // forget every proof, so the next blocking statement reports.
-            self.reset_lock_timeout_proof();
-            return;
-        };
-        match kind {
+    fn track_transaction(&mut self, transaction: &typedpg_pg_query::ast::TransactionStmt) {
+        match transaction.kind {
             TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart => {
                 // `BEGIN` inside an open transaction is a warning and does
                 // nothing; only an outer one starts a new snapshot.
@@ -909,8 +877,7 @@ impl MigrationLinter<'_> {
             // file's reach: do not claim any timeout survives it.
             TransactionStmtKind::TransStmtPrepare
             | TransactionStmtKind::TransStmtCommitPrepared
-            | TransactionStmtKind::TransStmtRollbackPrepared
-            | TransactionStmtKind::Undefined => self.reset_lock_timeout_proof(),
+            | TransactionStmtKind::TransStmtRollbackPrepared => self.reset_lock_timeout_proof(),
         }
     }
 
@@ -1013,9 +980,7 @@ impl MigrationLinter<'_> {
             }
             // `CREATE TABLE … AS` / `SELECT … INTO` define every column of
             // the new relation.
-            N::CreateTableAsStmt(stmt)
-                if ObjectType::try_from(stmt.objtype) == Ok(ObjectType::ObjectTable) =>
-            {
+            N::CreateTableAsStmt(stmt) if stmt.objtype == ObjectType::ObjectTable => {
                 if let Some(class) = stmt
                     .into
                     .as_ref()
@@ -1041,13 +1006,10 @@ impl MigrationLinter<'_> {
                     let Some(command) = alter_command(command) else {
                         continue;
                     };
-                    let (Ok(subtype), Some(def)) = (
-                        AlterTableType::try_from(command.subtype),
-                        command.def.as_deref().and_then(|def| def.node.as_ref()),
-                    ) else {
+                    let Some(def) = command.def.as_ref() else {
                         continue;
                     };
-                    match subtype {
+                    match command.subtype {
                         AlterTableType::AtAddColumn => {
                             let N::ColumnDef(column) = def else {
                                 continue;
@@ -1638,23 +1600,22 @@ impl MigrationObserver for MigrationLinter<'_> {
     }
 }
 
-fn validates(constraint: &typedpg_pg_query::protobuf::Constraint) -> bool {
+fn validates(constraint: &typedpg_pg_query::ast::Constraint) -> bool {
     matches!(
-        ConstrType::try_from(constraint.contype),
-        Ok(ConstrType::ConstrForeign | ConstrType::ConstrCheck)
+        constraint.contype,
+        ConstrType::ConstrForeign | ConstrType::ConstrCheck
     ) && !constraint.skip_validation
 }
 
 /// Whether a `ColumnDef` gives the column a DEFAULT: an explicit one, or the
 /// `nextval()` the `serial` pseudo-types expand to.
-fn column_has_default(column: &typedpg_pg_query::protobuf::ColumnDef) -> bool {
+fn column_has_default(column: &typedpg_pg_query::ast::ColumnDef) -> bool {
     column.raw_default.is_some()
         || column.constraints.iter().any(|node| {
             matches!(
-                node.node.as_ref(),
+                node.as_ref(),
                 Some(N::Constraint(constraint))
-                    if ConstrType::try_from(constraint.contype)
-                        == Ok(ConstrType::ConstrDefault)
+                    if constraint.contype == ConstrType::ConstrDefault
             )
         })
         || column_type_name(column).is_some_and(|name| {
@@ -1666,9 +1627,9 @@ fn column_has_default(column: &typedpg_pg_query::protobuf::ColumnDef) -> bool {
 }
 
 /// The last name of the column's declared type.
-fn column_type_name(column: &typedpg_pg_query::protobuf::ColumnDef) -> Option<&str> {
+fn column_type_name(column: &typedpg_pg_query::ast::ColumnDef) -> Option<&str> {
     let type_name = column.type_name.as_ref()?;
-    match type_name.names.last()?.node.as_ref()? {
+    match type_name.names.last()?.as_ref()? {
         N::String(name) => Some(&name.sval),
         _ => None,
     }
@@ -1679,20 +1640,20 @@ fn column_type_name(column: &typedpg_pg_query::protobuf::ColumnDef) -> Option<&s
 /// (stored or virtual, whose expression the parser stores as
 /// `raw_default`). Identity columns do not get one. This is exactly the
 /// condition `transformAlterTableStmt` checks to clear `skipValidation`.
-fn column_has_raw_default(column: &typedpg_pg_query::protobuf::ColumnDef) -> bool {
+fn column_has_raw_default(column: &typedpg_pg_query::ast::ColumnDef) -> bool {
     column_has_default(column)
         || !column.generated.is_empty()
         || column.constraints.iter().any(|node| {
             matches!(
-                node.node.as_ref(),
+                node.as_ref(),
                 Some(N::Constraint(constraint))
-                    if ConstrType::try_from(constraint.contype) == Ok(ConstrType::ConstrGenerated)
+                    if constraint.contype == ConstrType::ConstrGenerated
             )
         })
 }
 
-fn alter_command(node: &Node) -> Option<&typedpg_pg_query::protobuf::AlterTableCmd> {
-    match node.node.as_ref()? {
+fn alter_command(node: &Option<Node>) -> Option<&typedpg_pg_query::ast::AlterTableCmd> {
+    match node.as_ref()? {
         N::AlterTableCmd(command) => Some(command),
         _ => None,
     }
@@ -1701,7 +1662,7 @@ fn alter_command(node: &Node) -> Option<&typedpg_pg_query::protobuf::AlterTableC
 /// Resolve a `RangeVar` to the class the catalog holds now.
 fn resolve_relation<'a>(
     catalog: &'a PgCatalog,
-    relation: &typedpg_pg_query::protobuf::RangeVar,
+    relation: &typedpg_pg_query::ast::RangeVar,
 ) -> Option<&'a PgClass> {
     let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
     catalog.resolve_table(schema, &relation.relname)
@@ -1786,11 +1747,11 @@ fn type_label(catalog: &PgCatalog, oid: PgTypeOid) -> &str {
 /// trusted only while the catalog holds no other `set_config`.
 fn set_config_lock_timeout(
     catalog: &PgCatalog,
-    select: &typedpg_pg_query::protobuf::SelectStmt,
+    select: &typedpg_pg_query::ast::SelectStmt,
 ) -> Option<(Option<bool>, bool)> {
-    use typedpg_pg_query::protobuf::SetOperation;
+    use typedpg_pg_query::ast::SetOperation;
 
-    if select.op() != SetOperation::SetopNone
+    if select.op != SetOperation::SetopNone
         || !select.from_clause.is_empty()
         || select.where_clause.is_some()
         || !select.group_clause.is_empty()
@@ -1806,17 +1767,16 @@ fn set_config_lock_timeout(
     let [target] = select.target_list.as_slice() else {
         return None;
     };
-    let Some(N::ResTarget(target)) = target.node.as_ref() else {
+    let Some(N::ResTarget(target)) = target.as_ref() else {
         return None;
     };
-    let Some(N::FuncCall(call)) = target.val.as_deref().and_then(|value| value.node.as_ref())
-    else {
+    let Some(N::FuncCall(call)) = target.val.as_ref() else {
         return None;
     };
     let names: Vec<&str> = call
         .funcname
         .iter()
-        .filter_map(|node| match &node.node {
+        .filter_map(|node| match node {
             Some(N::String(string)) => Some(string.sval.as_str()),
             _ => None,
         })
@@ -1856,19 +1816,19 @@ fn set_config_is_builtin(catalog: &PgCatalog, names: &[&str]) -> bool {
 }
 
 /// The text of a string literal, uncast or cast once to `text`.
-fn plain_text_literal(node: &Node) -> Option<&str> {
-    let node = match node.node.as_ref()? {
+fn plain_text_literal(node: &Option<Node>) -> Option<&str> {
+    let node = match node.as_ref()? {
         N::TypeCast(cast) => {
             if !is_text_type(cast.type_name.as_ref()?) {
                 return None;
             }
-            cast.arg.as_deref()?
+            cast.arg.as_ref()?
         }
-        _ => node,
+        node => node,
     };
-    match node.node.as_ref()? {
+    match node {
         N::AConst(constant) => match constant.val.as_ref()? {
-            Val::Sval(string) => Some(&string.sval),
+            AConstValue::String(string) => Some(&string.sval),
             _ => None,
         },
         N::String(string) => Some(&string.sval),
@@ -1877,11 +1837,11 @@ fn plain_text_literal(node: &Node) -> Option<&str> {
 }
 
 /// Whether a cast's target type is `text`.
-fn is_text_type(type_name: &typedpg_pg_query::protobuf::TypeName) -> bool {
+fn is_text_type(type_name: &typedpg_pg_query::ast::TypeName) -> bool {
     let names: Vec<&str> = type_name
         .names
         .iter()
-        .filter_map(|node| match &node.node {
+        .filter_map(|node| match node {
             Some(N::String(string)) => Some(string.sval.as_str()),
             _ => None,
         })
@@ -1893,20 +1853,20 @@ fn is_text_type(type_name: &typedpg_pg_query::protobuf::TypeName) -> bool {
 /// string literal (optionally cast once to `text`), `None` when another
 /// expression computes it. A NULL literal resets the setting to its default
 /// (`0`, disabled).
-fn set_config_value(node: &Node) -> Option<bool> {
-    let node = match node.node.as_ref()? {
+fn set_config_value(node: &Option<Node>) -> Option<bool> {
+    let node = match node.as_ref()? {
         N::TypeCast(cast) => {
             if !is_text_type(cast.type_name.as_ref()?) {
                 return None;
             }
-            cast.arg.as_deref()?
+            cast.arg.as_ref()?
         }
-        _ => node,
+        node => node,
     };
-    match node.node.as_ref()? {
+    match node {
         N::AConst(constant) if constant.isnull => Some(false),
         N::AConst(constant) => match constant.val.as_ref()? {
-            Val::Sval(string) => Some(duration_nonzero(&string.sval)),
+            AConstValue::String(string) => Some(duration_nonzero(&string.sval)),
             _ => None,
         },
         N::String(string) => Some(duration_nonzero(&string.sval)),
@@ -1916,16 +1876,16 @@ fn set_config_value(node: &Node) -> Option<bool> {
 
 /// The constant `node` is, through casts.
 fn constant_node(node: &Node) -> Option<&Node> {
-    match node.node.as_ref()? {
-        N::TypeCast(cast) => constant_node(cast.arg.as_deref()?),
+    match node {
+        N::TypeCast(cast) => constant_node(cast.arg.as_ref()?),
         _ => Some(node),
     }
 }
 
-fn constant_bool(node: &Node) -> Option<bool> {
-    match constant_node(node)?.node.as_ref()? {
+fn constant_bool(node: &Option<Node>) -> Option<bool> {
+    match constant_node(node.as_ref()?)? {
         N::AConst(constant) => match constant.val.as_ref()? {
-            Val::Boolval(boolean) => Some(boolean.boolval),
+            AConstValue::Boolean(boolean) => Some(boolean.boolval),
             _ => None,
         },
         N::Boolean(boolean) => Some(boolean.boolval),
@@ -1942,11 +1902,11 @@ fn constant_bool(node: &Node) -> Option<bool> {
 /// `SET LOCAL` outside a transaction block is a no-op (PostgreSQL warns and
 /// keeps the session value), so it is `None` when `in_transaction` is false.
 fn lock_timeout_setting(
-    set: &typedpg_pg_query::protobuf::VariableSetStmt,
+    set: &typedpg_pg_query::ast::VariableSetStmt,
     in_transaction: bool,
     effective: bool,
 ) -> Option<Option<bool>> {
-    let kind = VariableSetKind::try_from(set.kind).ok()?;
+    let kind = set.kind;
     // `RESET ALL` carries no setting name: it clears every setting,
     // `lock_timeout` included.
     if kind == VariableSetKind::VarResetAll {
@@ -1969,13 +1929,13 @@ fn lock_timeout_setting(
 
 /// The value of `SET … TO <value>`: `Some` when its text is known, `None`
 /// when an expression computes it.
-fn setting_value(node: &Node) -> Option<bool> {
-    match node.node.as_ref()? {
+fn setting_value(node: &Option<Node>) -> Option<bool> {
+    match node.as_ref()? {
         N::AConst(constant) if constant.isnull => None,
         N::AConst(constant) => match constant.val.as_ref()? {
-            Val::Ival(value) => Some(value.ival != 0),
-            Val::Fval(value) => Some(duration_nonzero(&value.fval)),
-            Val::Sval(value) => Some(duration_nonzero(&value.sval)),
+            AConstValue::Integer(value) => Some(value.ival != 0),
+            AConstValue::Float(value) => Some(duration_nonzero(&value.fval)),
+            AConstValue::String(value) => Some(duration_nonzero(&value.sval)),
             _ => None,
         },
         N::Integer(value) => Some(value.ival != 0),
@@ -2118,8 +2078,8 @@ fn lock_target(
         ),
         N::RenameStmt(rename) => {
             if !matches!(
-                ObjectType::try_from(rename.rename_type),
-                Ok(ObjectType::ObjectTable | ObjectType::ObjectColumn)
+                rename.rename_type,
+                ObjectType::ObjectTable | ObjectType::ObjectColumn
             ) {
                 return None;
             }
@@ -2156,7 +2116,7 @@ fn lock_target(
                 return None;
             }
             vacuum.rels.iter().find_map(|relation| {
-                let N::VacuumRelation(relation) = relation.node.as_ref()? else {
+                let N::VacuumRelation(relation) = relation.as_ref()? else {
                     return None;
                 };
                 existing_relation(
@@ -2180,7 +2140,7 @@ fn lock_target(
 fn existing_relation(
     catalog: &PgCatalog,
     pre_existing: &HashSet<PgClassOid>,
-    relation: &typedpg_pg_query::protobuf::RangeVar,
+    relation: &typedpg_pg_query::ast::RangeVar,
     kind: &'static str,
 ) -> Option<(&'static str, PgClassOid)> {
     let class = resolve_relation(catalog, relation)?;
@@ -2192,12 +2152,12 @@ fn existing_relation(
 fn first_relation(
     catalog: &PgCatalog,
     pre_existing: &HashSet<PgClassOid>,
-    nodes: &[Node],
+    nodes: &[Option<Node>],
     kind: &'static str,
 ) -> Option<(&'static str, PgClassOid)> {
     nodes
         .iter()
-        .filter_map(|node| match node.node.as_ref()? {
+        .filter_map(|node| match node.as_ref()? {
             N::RangeVar(relation) => Some(relation),
             _ => None,
         })
@@ -2207,7 +2167,7 @@ fn first_relation(
 fn alter_table_lock_target(
     catalog: &PgCatalog,
     pre_existing: &HashSet<PgClassOid>,
-    alter: &typedpg_pg_query::protobuf::AlterTableStmt,
+    alter: &typedpg_pg_query::ast::AlterTableStmt,
 ) -> Option<(&'static str, PgClassOid)> {
     let mut strong = false;
     let mut referenced = Vec::new();
@@ -2227,9 +2187,8 @@ fn alter_table_lock_target(
         // does not model), while the parent only gets SHARE UPDATE
         // EXCLUSIVE. The attached table can hold rows, so it is the lock
         // worth reporting.
-        if AlterTableType::try_from(command.subtype) == Ok(AlterTableType::AtAttachPartition)
-            && let Some(N::PartitionCmd(partition)) =
-                command.def.as_deref().and_then(|def| def.node.as_ref())
+        if command.subtype == AlterTableType::AtAttachPartition
+            && let Some(N::PartitionCmd(partition)) = command.def.as_ref()
             && let Some(name) = partition.name.as_ref()
         {
             attached.push(name);
@@ -2264,23 +2223,21 @@ fn lock_mode_blocks_writes(mode: i32) -> bool {
 
 /// Whether an `ALTER TABLE` subcommand only takes `SHARE UPDATE EXCLUSIVE`
 /// on the table (PostgreSQL's `AlterTableGetLockLevel`).
-fn only_share_update_exclusive(command: &typedpg_pg_query::protobuf::AlterTableCmd) -> bool {
-    match AlterTableType::try_from(command.subtype) {
-        Ok(
-            AlterTableType::AtValidateConstraint
-            | AlterTableType::AtSetStatistics
-            | AlterTableType::AtSetOptions
-            | AlterTableType::AtResetOptions
-            | AlterTableType::AtClusterOn
-            | AlterTableType::AtDropCluster
-            | AlterTableType::AtAttachPartition
-            | AlterTableType::AtDetachPartitionFinalize,
-        ) => true,
-        Ok(AlterTableType::AtSetRelOptions | AlterTableType::AtResetRelOptions) => {
+fn only_share_update_exclusive(command: &typedpg_pg_query::ast::AlterTableCmd) -> bool {
+    match command.subtype {
+        AlterTableType::AtValidateConstraint
+        | AlterTableType::AtSetStatistics
+        | AlterTableType::AtSetOptions
+        | AlterTableType::AtResetOptions
+        | AlterTableType::AtClusterOn
+        | AlterTableType::AtDropCluster
+        | AlterTableType::AtAttachPartition
+        | AlterTableType::AtDetachPartitionFinalize => true,
+        AlterTableType::AtSetRelOptions | AlterTableType::AtResetRelOptions => {
             rel_options_are_share_update_exclusive(command)
         }
-        Ok(AlterTableType::AtDetachPartition) => matches!(
-            command.def.as_deref().and_then(|def| def.node.as_ref()),
+        AlterTableType::AtDetachPartition => matches!(
+            command.def.as_ref(),
             Some(N::PartitionCmd(partition)) if partition.concurrent
         ),
         _ => false,
@@ -2292,36 +2249,31 @@ fn only_share_update_exclusive(command: &typedpg_pg_query::protobuf::AlterTableC
 /// (`AlterTableGetRelOptionsLockLevel`): every table option the analyzer
 /// models is weak except `user_catalog_table`, which needs `ACCESS
 /// EXCLUSIVE`.
-fn rel_options_are_share_update_exclusive(
-    command: &typedpg_pg_query::protobuf::AlterTableCmd,
-) -> bool {
-    let Some(N::List(list)) = command.def.as_deref().and_then(|def| def.node.as_ref()) else {
+fn rel_options_are_share_update_exclusive(command: &typedpg_pg_query::ast::AlterTableCmd) -> bool {
+    let Some(N::List(list)) = command.def.as_ref() else {
         return false;
     };
     list.items.iter().all(|node| {
         !matches!(
-            node.node.as_ref(),
+            node.as_ref(),
             Some(N::DefElem(def)) if def.defname.eq_ignore_ascii_case("user_catalog_table")
         )
     })
 }
 
 fn added_foreign_key(
-    command: &typedpg_pg_query::protobuf::AlterTableCmd,
-) -> Option<&typedpg_pg_query::protobuf::Constraint> {
-    match (
-        AlterTableType::try_from(command.subtype),
-        command.def.as_deref().and_then(|def| def.node.as_ref()),
-    ) {
-        (Ok(AlterTableType::AtAddConstraint), Some(N::Constraint(constraint)))
+    command: &typedpg_pg_query::ast::AlterTableCmd,
+) -> Option<&typedpg_pg_query::ast::Constraint> {
+    match (command.subtype, command.def.as_ref()) {
+        (AlterTableType::AtAddConstraint, Some(N::Constraint(constraint)))
             if constraint_is_foreign_key(constraint) =>
         {
             Some(&**constraint)
         }
-        (Ok(AlterTableType::AtAddColumn), Some(N::ColumnDef(column))) => column
+        (AlterTableType::AtAddColumn, Some(N::ColumnDef(column))) => column
             .constraints
             .iter()
-            .filter_map(|constraint| match constraint.node.as_ref()? {
+            .filter_map(|constraint| match constraint.as_ref()? {
                 N::Constraint(constraint) if constraint_is_foreign_key(constraint) => {
                     Some(&**constraint)
                 }
@@ -2333,20 +2285,20 @@ fn added_foreign_key(
 }
 
 fn create_table_foreign_keys(
-    create: &typedpg_pg_query::protobuf::CreateStmt,
-) -> Vec<&typedpg_pg_query::protobuf::RangeVar> {
+    create: &typedpg_pg_query::ast::CreateStmt,
+) -> Vec<&typedpg_pg_query::ast::RangeVar> {
     let mut out = Vec::new();
     for node in create.table_elts.iter().chain(&create.constraints) {
-        match node.node.as_ref() {
+        match node.as_ref() {
             Some(N::Constraint(constraint)) if constraint_is_foreign_key(constraint) => {
-                out.extend(constraint.pktable.as_ref());
+                out.extend(constraint.pktable.as_deref());
             }
             Some(N::ColumnDef(column)) => {
                 for constraint in &column.constraints {
-                    if let Some(N::Constraint(constraint)) = constraint.node.as_ref()
+                    if let Some(N::Constraint(constraint)) = constraint.as_ref()
                         && constraint_is_foreign_key(constraint)
                     {
-                        out.extend(constraint.pktable.as_ref());
+                        out.extend(constraint.pktable.as_deref());
                     }
                 }
             }
@@ -2356,22 +2308,22 @@ fn create_table_foreign_keys(
     out
 }
 
-fn constraint_is_foreign_key(constraint: &typedpg_pg_query::protobuf::Constraint) -> bool {
-    ConstrType::try_from(constraint.contype) == Ok(ConstrType::ConstrForeign)
+fn constraint_is_foreign_key(constraint: &typedpg_pg_query::ast::Constraint) -> bool {
+    constraint.contype == ConstrType::ConstrForeign
 }
 
 fn drop_lock_target(
     catalog: &PgCatalog,
     pre_existing: &HashSet<PgClassOid>,
-    drop: &typedpg_pg_query::protobuf::DropStmt,
+    drop: &typedpg_pg_query::ast::DropStmt,
 ) -> Option<(&'static str, PgClassOid)> {
-    let kind = match ObjectType::try_from(drop.remove_type) {
-        Ok(ObjectType::ObjectTable | ObjectType::ObjectForeignTable) => "DROP TABLE",
-        Ok(ObjectType::ObjectIndex) if !drop.concurrent => "DROP INDEX",
+    let kind = match drop.remove_type {
+        ObjectType::ObjectTable | ObjectType::ObjectForeignTable => "DROP TABLE",
+        ObjectType::ObjectIndex if !drop.concurrent => "DROP INDEX",
         _ => return None,
     };
     for object in &drop.objects {
-        let Some(N::List(list)) = object.node.as_ref() else {
+        let Some(N::List(list)) = object.as_ref() else {
             continue;
         };
         let names: Vec<&str> = list.items.iter().filter_map(string_node).collect();
@@ -2390,16 +2342,16 @@ fn drop_lock_target(
     None
 }
 
-fn string_node(node: &Node) -> Option<&str> {
-    match node.node.as_ref()? {
+fn string_node(node: &Option<Node>) -> Option<&str> {
+    match node.as_ref()? {
         N::String(string) => Some(string.sval.as_str()),
         _ => None,
     }
 }
 
 /// Whether `options` has `name` set to a true value (a bare option counts).
-fn option_enabled(options: &[Node], name: &str) -> bool {
-    options.iter().any(|option| match option.node.as_ref() {
+fn option_enabled(options: &[Option<Node>], name: &str) -> bool {
+    options.iter().any(|option| match option.as_ref() {
         Some(N::DefElem(option)) if option.defname.eq_ignore_ascii_case(name) => {
             def_boolean(option).unwrap_or(true)
         }
@@ -2407,8 +2359,8 @@ fn option_enabled(options: &[Node], name: &str) -> bool {
     })
 }
 
-fn def_boolean(option: &typedpg_pg_query::protobuf::DefElem) -> Option<bool> {
-    match option.arg.as_deref().and_then(|arg| arg.node.as_ref()) {
+fn def_boolean(option: &typedpg_pg_query::ast::DefElem) -> Option<bool> {
+    match option.arg.as_ref() {
         None => Some(true),
         Some(N::Integer(integer)) => Some(integer.ival != 0),
         Some(N::Boolean(boolean)) => Some(boolean.boolval),
@@ -2437,22 +2389,20 @@ fn proven_not_null(catalog: &PgCatalog, relid: PgClassOid, column: &str) -> bool
 /// Whether `node` is `column IS NOT NULL`, or an AND with such a top-level
 /// conjunct (other conjuncts may test anything).
 fn check_proves_not_null(node: &Node, column: &str) -> bool {
-    match node.node.as_ref() {
-        Some(N::BoolExpr(expr))
-            if BoolExprType::try_from(expr.boolop) == Ok(BoolExprType::AndExpr) =>
-        {
+    match node {
+        N::BoolExpr(expr) if expr.boolop == BoolExprType::AndExpr => {
             !expr.args.is_empty()
-                && expr
-                    .args
-                    .iter()
-                    .any(|arg| check_proves_not_null(arg, column))
+                && expr.args.iter().any(|arg| {
+                    arg.as_ref()
+                        .is_some_and(|arg| check_proves_not_null(arg, column))
+                })
         }
-        Some(N::NullTest(test)) => {
-            NullTestType::try_from(test.nulltesttype) == Ok(NullTestType::IsNotNull)
+        N::NullTest(test) => {
+            test.nulltesttype == NullTestType::IsNotNull
                 && !test.argisrow
                 && test
                     .arg
-                    .as_deref()
+                    .as_ref()
                     .and_then(column_name)
                     .is_some_and(|name| name == column)
         }
@@ -2480,18 +2430,20 @@ fn index_serves_foreign_key(catalog: &PgCatalog, index: &PgIndex, columns: &[&st
 /// Whether `node` is `col IS NOT NULL`, or an AND of such tests (including
 /// nested ANDs and parentheses), for columns among `columns` only.
 fn not_null_and(node: &Node, columns: &[&str]) -> bool {
-    match node.node.as_ref() {
-        Some(N::BoolExpr(expr))
-            if BoolExprType::try_from(expr.boolop) == Ok(BoolExprType::AndExpr) =>
-        {
-            !expr.args.is_empty() && expr.args.iter().all(|arg| not_null_and(arg, columns))
+    match node {
+        N::BoolExpr(expr) if expr.boolop == BoolExprType::AndExpr => {
+            !expr.args.is_empty()
+                && expr
+                    .args
+                    .iter()
+                    .all(|arg| arg.as_ref().is_some_and(|arg| not_null_and(arg, columns)))
         }
-        Some(N::NullTest(test)) => {
-            NullTestType::try_from(test.nulltesttype) == Ok(NullTestType::IsNotNull)
+        N::NullTest(test) => {
+            test.nulltesttype == NullTestType::IsNotNull
                 && !test.argisrow
                 && test
                     .arg
-                    .as_deref()
+                    .as_ref()
                     .and_then(column_name)
                     .is_some_and(|name| columns.contains(&name))
         }
@@ -2502,17 +2454,17 @@ fn not_null_and(node: &Node, columns: &[&str]) -> bool {
 /// The name a `ColumnRef` names, when it is one (a qualified reference's last
 /// field, as an index predicate may spell `t.col`).
 fn column_name(node: &Node) -> Option<&str> {
-    let N::ColumnRef(reference) = node.node.as_ref()? else {
+    let N::ColumnRef(reference) = node else {
         return None;
     };
     let (last, qualifiers) = reference.fields.split_last()?;
     if !qualifiers
         .iter()
-        .all(|field| matches!(field.node.as_ref(), Some(N::String(_))))
+        .all(|field| matches!(field.as_ref(), Some(N::String(_))))
     {
         return None;
     }
-    match last.node.as_ref() {
+    match last.as_ref() {
         Some(N::String(name)) => Some(&name.sval),
         _ => None,
     }
@@ -2609,15 +2561,15 @@ fn redundant_with<'a>(
 
 /// `stmt`'s key columns' order: `(descending, nulls first)` each, nulls
 /// first by default exactly when descending, as PostgreSQL's.
-fn key_order(stmt: &typedpg_pg_query::protobuf::IndexStmt) -> Vec<(bool, bool)> {
+fn key_order(stmt: &typedpg_pg_query::ast::IndexStmt) -> Vec<(bool, bool)> {
     stmt.index_params
         .iter()
-        .map(|param| match param.node.as_ref() {
+        .map(|param| match param.as_ref() {
             Some(N::IndexElem(elem)) => {
-                let descending = SortByDir::try_from(elem.ordering) == Ok(SortByDir::SortbyDesc);
-                let nulls_first = match SortByNulls::try_from(elem.nulls_ordering) {
-                    Ok(SortByNulls::SortbyNullsFirst) => true,
-                    Ok(SortByNulls::SortbyNullsLast) => false,
+                let descending = elem.ordering == SortByDir::SortbyDesc;
+                let nulls_first = match elem.nulls_ordering {
+                    SortByNulls::SortbyNullsFirst => true,
+                    SortByNulls::SortbyNullsLast => false,
                     _ => descending,
                 };
                 (descending, nulls_first)
@@ -2627,8 +2579,8 @@ fn key_order(stmt: &typedpg_pg_query::protobuf::IndexStmt) -> Vec<(bool, bool)> 
         .collect()
 }
 
-fn volatile(catalog: &PgCatalog, node: &Node) -> bool {
-    let Some(inner) = node.node.as_ref() else {
+fn volatile(catalog: &PgCatalog, node: &Option<Node>) -> bool {
+    let Some(inner) = node.as_ref() else {
         return false;
     };
     inner
@@ -2644,9 +2596,8 @@ fn comments(sql: &str) -> Vec<Comment> {
     let mut out = Vec::new();
     for token in &scanned.tokens {
         if !matches!(
-            token.token(),
-            typedpg_pg_query::protobuf::Token::SqlComment
-                | typedpg_pg_query::protobuf::Token::CComment
+            token.token,
+            typedpg_pg_query::ast::Token::SqlComment | typedpg_pg_query::ast::Token::CComment
         ) {
             continue;
         }
@@ -3332,11 +3283,7 @@ mod tests {
             "ALTER TABLE measurements DETACH PARTITION measurements_1 FINALIZE",
         )
         .unwrap();
-        let node = parsed.protobuf.stmts[0]
-            .stmt
-            .as_ref()
-            .and_then(|stmt| stmt.node.as_ref())
-            .unwrap();
+        let node = parsed.tree.stmts[0].stmt.as_ref().unwrap();
         let N::AlterTableStmt(alter) = node else {
             panic!("expected ALTER TABLE");
         };

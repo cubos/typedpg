@@ -20,7 +20,7 @@ const MAX_DEPTH: usize = 16;
 
 /// What each output column of the row a SELECT surely yields holds: the
 /// constant it is, when known (positions past the end: unknown).
-type Outputs<'a> = Vec<Option<&'a protobuf::Node>>;
+type Outputs<'a> = Vec<Option<&'a ast::Node>>;
 
 /// A FROM subquery's row, its columns' names and its alias.
 type Subquery<'a> = (Outputs<'a>, Vec<Option<&'a str>>, Option<&'a str>);
@@ -31,8 +31,8 @@ type Subquery<'a> = (Outputs<'a>, Vec<Option<&'a str>>, Option<&'a str>);
 /// to its column failing first, as the row is built. None when the
 /// statement isn't run, or a DO INSTEAD rule replaces the INSERT.
 pub(super) fn sure_row_violation(
-    sel: &protobuf::SelectStmt,
-    with: Option<&protobuf::WithClause>,
+    sel: &ast::SelectStmt,
+    with: Option<&ast::WithClause>,
     tgt: &InsertTarget,
     column_types: &[PgTypeOid],
     snapshot: &PgCatalog,
@@ -40,12 +40,12 @@ pub(super) fn sure_row_violation(
     if !crate::resolve::executes() || returning_rewritten(snapshot, tgt.oid, &[DmlEvent::Insert]) {
         return None;
     }
-    let ctes: Vec<&protobuf::CommonTableExpr> = match with {
+    let ctes: Vec<&ast::CommonTableExpr> = match with {
         Some(w) if !w.recursive => w
             .ctes
             .iter()
-            .filter_map(|c| match c.node.as_ref() {
-                Some(node::Node::CommonTableExpr(c)) => Some(&**c),
+            .filter_map(|c| match c.as_ref() {
+                Some(ast::Node::CommonTableExpr(c)) => Some(&**c),
                 _ => None,
             })
             .collect(),
@@ -53,15 +53,8 @@ pub(super) fn sure_row_violation(
         None => Vec::new(),
     };
     let outputs = sure_row(sel, snapshot, &ctes, 0)?;
-    let items: Vec<protobuf::Node> = (0..column_types.len())
-        .map(|i| {
-            outputs
-                .get(i)
-                .copied()
-                .flatten()
-                .cloned()
-                .unwrap_or(protobuf::Node { node: None })
-        })
+    let items: Vec<Option<ast::Node>> = (0..column_types.len())
+        .map(|i| outputs.get(i).copied().flatten().cloned())
         .collect();
     let known_at = |i: usize| outputs.get(i).copied().flatten().is_some();
     let stored = |i: usize| {
@@ -113,21 +106,21 @@ pub(super) fn sure_row_violation(
 /// [`Outputs`]; `None` when it may yield none. `ctes` are the CTEs its
 /// table names may mean.
 fn sure_row<'a>(
-    sel: &'a protobuf::SelectStmt,
+    sel: &'a ast::SelectStmt,
     snapshot: &PgCatalog,
-    ctes: &[&'a protobuf::CommonTableExpr],
+    ctes: &[&'a ast::CommonTableExpr],
     depth: usize,
 ) -> Option<Outputs<'a>> {
     let inner = sure_level(sel, snapshot, ctes, depth)?;
     let mut out: Outputs<'a> = Vec::with_capacity(sel.target_list.len());
     for t in &sel.target_list {
-        let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = t.as_ref() else {
             return Some(Vec::new());
         };
-        let Some(val) = rt.val.as_deref() else {
+        let Some(val) = rt.val.as_ref() else {
             return Some(Vec::new());
         };
-        if let Some(node::Node::ColumnRef(cr)) = val.node.as_ref() {
+        if let ast::Node::ColumnRef(cr) = val {
             if is_star(cr) {
                 // `*` or `s.*` alone reads the subquery's columns as they
                 // are; beside other items, positions are not followed.
@@ -150,13 +143,13 @@ fn sure_row<'a>(
 /// whether the planner pushes it down into the subquery and folds it, or
 /// evaluates it over the row.
 fn sure_level<'a>(
-    sel: &'a protobuf::SelectStmt,
+    sel: &'a ast::SelectStmt,
     snapshot: &PgCatalog,
-    ctes: &[&'a protobuf::CommonTableExpr],
+    ctes: &[&'a ast::CommonTableExpr],
     depth: usize,
 ) -> Option<Option<Subquery<'a>>> {
     if depth > MAX_DEPTH
-        || sel.op != SetOperation::SetopNone as i32
+        || sel.op != SetOperation::SetopNone
         || !sel.values_lists.is_empty()
         || sel.with_clause.is_some()
         || sel.into_clause.is_some()
@@ -176,9 +169,9 @@ fn sure_level<'a>(
             [from] => inner = Some(from_subquery(from, snapshot, ctes, depth)?),
             _ => return None,
         }
-        if let Some(qual) = sel.where_clause.as_deref() {
-            let column = |cr: &protobuf::ColumnRef| column_value(inner.as_ref(), cr);
-            if crate::resolve::failing_rows::qual_truth(qual, &column) != Some(true) {
+        if sel.where_clause.is_some() {
+            let column = |cr: &ast::ColumnRef| column_value(inner.as_ref(), cr);
+            if crate::resolve::failing_rows::qual_truth(&sel.where_clause, &column) != Some(true) {
                 return None;
             }
         }
@@ -187,24 +180,21 @@ fn sure_level<'a>(
 }
 
 /// A `*` or `s.*` column reference.
-fn is_star(cr: &protobuf::ColumnRef) -> bool {
+fn is_star(cr: &ast::ColumnRef) -> bool {
     cr.fields
         .last()
-        .is_some_and(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+        .is_some_and(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
 }
 
 /// The constant the column `cr` reads of the subquery `inner` holds: one
 /// of its outputs, named once.
-fn column_value<'a>(
-    inner: Option<&Subquery<'a>>,
-    cr: &protobuf::ColumnRef,
-) -> Option<&'a protobuf::Node> {
+fn column_value<'a>(inner: Option<&Subquery<'a>>, cr: &ast::ColumnRef) -> Option<&'a ast::Node> {
     let (outputs, names, alias) = inner?;
     let fields: Vec<Option<&str>> = cr
         .fields
         .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+        .map(|f| match f.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect();
@@ -237,21 +227,22 @@ fn column_value<'a>(
 /// the query's analysis' to report.) The leftmost failing output, as
 /// ExecProject evaluates them in order.
 pub(in crate::resolve) fn sure_select_error(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Option<AnalyzeError> {
     if !crate::resolve::executes() {
         return None;
     }
     let inner = sure_level(sel, snapshot, &[], 0)??;
-    let columns = |cr: &protobuf::ColumnRef| {
+    let columns = |cr: &ast::ColumnRef| {
         column_value(Some(&inner), cr).map(|n| std::sync::Arc::new(n.clone()))
     };
     sel.target_list.iter().find_map(|t| {
-        let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+        let Some(ast::Node::ResTarget(rt)) = t.as_ref() else {
             return None;
         };
-        let val = rt.val.as_deref()?;
+        let val = &rt.val;
+        val.as_ref()?;
         crate::fold::error_in(val, snapshot, &columns).map(|e| e.at(val))
     })
 }
@@ -260,21 +251,21 @@ pub(in crate::resolve) fn sure_select_error(
 /// or a reference to one of `ctes` (inlined or materialized, a CTE yields
 /// its query's rows).
 fn from_subquery<'a>(
-    from: &'a protobuf::Node,
+    from: &'a Option<ast::Node>,
     snapshot: &PgCatalog,
-    ctes: &[&'a protobuf::CommonTableExpr],
+    ctes: &[&'a ast::CommonTableExpr],
     depth: usize,
 ) -> Option<Subquery<'a>> {
-    let (sub, renames, alias, visible) = match from.node.as_ref()? {
-        node::Node::RangeSubselect(rs) => {
-            (rs.subquery.as_deref()?, Vec::new(), rs.alias.as_ref(), ctes)
+    let (sub, renames, alias, visible) = match from.as_ref()? {
+        ast::Node::RangeSubselect(rs) => {
+            (rs.subquery.as_ref()?, Vec::new(), rs.alias.as_ref(), ctes)
         }
         // A schema-less name is the nearest CTE so named (a CTE's query
         // sees the CTEs before it).
-        node::Node::RangeVar(rv) if rv.schemaname.is_empty() && rv.inh => {
+        ast::Node::RangeVar(rv) if rv.schemaname.is_empty() && rv.inh => {
             let k = ctes.iter().rposition(|c| c.ctename == rv.relname)?;
             (
-                ctes[k].ctequery.as_deref()?,
+                ctes[k].ctequery.as_ref()?,
                 ctes[k].aliascolnames.iter().collect(),
                 rv.alias.as_ref(),
                 &ctes[..k],
@@ -282,7 +273,7 @@ fn from_subquery<'a>(
         }
         _ => return None,
     };
-    let Some(node::Node::SelectStmt(sub)) = sub.node.as_ref() else {
+    let ast::Node::SelectStmt(sub) = sub else {
         return None;
     };
     let outputs = sure_row(sub, snapshot, visible, depth + 1)?;
@@ -290,15 +281,15 @@ fn from_subquery<'a>(
     let alias_names = alias.map(|a| a.colnames.iter().collect::<Vec<_>>());
     for given in [Some(renames), alias_names].into_iter().flatten() {
         for (name, given) in names.iter_mut().zip(given) {
-            *name = match given.node.as_ref() {
-                Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            *name = match given.as_ref() {
+                Some(ast::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             };
         }
     }
-    let alias = match (alias, from.node.as_ref()) {
+    let alias = match (alias, from.as_ref()) {
         (Some(a), _) => Some(a.aliasname.as_str()),
-        (None, Some(node::Node::RangeVar(rv))) => Some(rv.relname.as_str()),
+        (None, Some(ast::Node::RangeVar(rv))) => Some(rv.relname.as_str()),
         (None, _) => None,
     };
     Some((outputs, names, alias))
@@ -307,8 +298,8 @@ fn from_subquery<'a>(
 /// Whether `sel` computes aggregates (without GROUP BY): one row,
 /// whatever its FROM and WHERE leave. Only a call whose every visible overload is
 /// an aggregate counts (`is_aggregate_call` takes any).
-fn aggregates(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
-    let surely_aggregate = |fc: &protobuf::FuncCall| {
+fn aggregates(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
+    let surely_aggregate = |fc: &ast::FuncCall| {
         let parts = expr::extract_string_fields(&fc.funcname);
         let (schema, name) = match parts.as_slice() {
             [n] => (None, n.as_str()),
@@ -325,7 +316,7 @@ fn aggregates(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
     let mut found = false;
     for t in &sel.target_list {
         crate::resolve::walk::visit_same_level(t, &mut |e| {
-            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
                 && surely_aggregate(fc)
             {
                 found = true;
@@ -336,48 +327,48 @@ fn aggregates(sel: &protobuf::SelectStmt, snapshot: &PgCatalog) -> bool {
 }
 
 /// `GROUP BY ()`: one group, even over no input.
-fn empty_grouping_set(n: &protobuf::Node) -> bool {
-    matches!(n.node.as_ref(), Some(node::Node::GroupingSet(gs))
-        if gs.kind == protobuf::GroupingSetKind::GroupingSetEmpty as i32)
+fn empty_grouping_set(n: &Option<ast::Node>) -> bool {
+    matches!(n.as_ref(), Some(ast::Node::GroupingSet(gs))
+        if gs.kind == ast::GroupingSetKind::GroupingSetEmpty)
 }
 
 /// Whether `sel`'s LIMIT / OFFSET keep its first row: no OFFSET (or
 /// `OFFSET 0`), no LIMIT (or one of a positive constant, or ALL / NULL).
-fn keeps_first_row(sel: &protobuf::SelectStmt) -> bool {
-    use typedpg_pg_query::protobuf::a_const::Val;
-    let count = |n: Option<&protobuf::Node>| -> Option<Option<i32>> {
-        match n.and_then(|n| n.node.as_ref()) {
+fn keeps_first_row(sel: &ast::SelectStmt) -> bool {
+    use typedpg_pg_query::ast::{self, AConstValue};
+    let count = |n: Option<&ast::Node>| -> Option<Option<i32>> {
+        match n {
             None => Some(None),
-            Some(node::Node::AConst(c)) if c.isnull => Some(None),
-            Some(node::Node::AConst(c)) => match &c.val {
-                Some(Val::Ival(i)) => Some(Some(i.ival)),
+            Some(ast::Node::AConst(c)) if c.isnull => Some(None),
+            Some(ast::Node::AConst(c)) => match &c.val {
+                Some(AConstValue::Integer(i)) => Some(Some(i.ival)),
                 _ => None,
             },
             _ => None,
         }
     };
-    matches!(count(sel.limit_offset.as_deref()), Some(None | Some(0)))
+    matches!(count(sel.limit_offset.as_ref()), Some(None | Some(0)))
         && matches!(
-            count(sel.limit_count.as_deref()),
+            count(sel.limit_count.as_ref()),
             Some(None) | Some(Some(1..))
         )
 }
 
 /// The names `sel`'s output columns are read by, when plain: an `AS`
 /// name, or a column reference's (FigureColname's other names aside).
-fn output_names(sel: &protobuf::SelectStmt) -> Vec<Option<&str>> {
+fn output_names(sel: &ast::SelectStmt) -> Vec<Option<&str>> {
     sel.target_list
         .iter()
         .map(|t| {
-            let Some(node::Node::ResTarget(rt)) = t.node.as_ref() else {
+            let Some(ast::Node::ResTarget(rt)) = t.as_ref() else {
                 return None;
             };
             if !rt.name.is_empty() {
                 return Some(rt.name.as_str());
             }
-            match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
-                Some(node::Node::ColumnRef(cr)) => match cr.fields.last()?.node.as_ref() {
-                    Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            match rt.val.as_ref() {
+                Some(ast::Node::ColumnRef(cr)) => match cr.fields.last()?.as_ref() {
+                    Some(ast::Node::String(s)) => Some(s.sval.as_str()),
                     _ => None,
                 },
                 _ => None,
@@ -387,16 +378,16 @@ fn output_names(sel: &protobuf::SelectStmt) -> Vec<Option<&str>> {
 }
 
 /// A constant: a literal, maybe cast.
-fn is_constant(e: &protobuf::Node) -> bool {
-    match e.node.as_ref() {
-        Some(node::Node::AConst(_)) => true,
-        Some(node::Node::TypeCast(tc)) => tc.arg.as_deref().is_some_and(is_constant),
+fn is_constant(e: &ast::Node) -> bool {
+    match e {
+        ast::Node::AConst(_) => true,
+        ast::Node::TypeCast(tc) => tc.arg.as_ref().is_some_and(is_constant),
         _ => false,
     }
 }
 
 /// An untyped string literal (`'abc'`, not `'abc'::text`).
-fn is_untyped_string(e: &protobuf::Node) -> bool {
-    matches!(e.node.as_ref(), Some(node::Node::AConst(c))
-        if matches!(c.val, Some(typedpg_pg_query::protobuf::a_const::Val::Sval(_))))
+fn is_untyped_string(e: &ast::Node) -> bool {
+    matches!(e, ast::Node::AConst(c)
+        if matches!(c.val, Some(typedpg_pg_query::ast::AConstValue::String(_))))
 }

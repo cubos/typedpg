@@ -7,7 +7,7 @@
 //! relation-drop path with tables and views). RENAME / SET SCHEMA flow
 //! through `ddl/alter.rs`.
 
-use typedpg_pg_query::protobuf::{AlterSeqStmt, CreateSeqStmt, node};
+use typedpg_pg_query::ast::{self, AlterSeqStmt, CreateSeqStmt};
 
 use super::DdlError;
 use super::util::{choose_relation_name, ensure_range_var, node_string, range_var_names};
@@ -89,7 +89,7 @@ pub(crate) fn create_owned_sequence(
     relid: PgClassOid,
     attnum: i16,
     deptype: DepType,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
     let Some(class) = interp.pg_class.get(&relid).cloned() else {
         return Err(DdlError::Internal(format!("relation oid {relid} missing")));
@@ -101,20 +101,18 @@ pub(crate) fn create_owned_sequence(
         .map(|a| a.attname.clone())
         .unwrap_or_default();
     // An identity's `SEQUENCE NAME` option names the sequence.
-    let explicit_name = options.iter().find_map(|o| match o.node.as_ref() {
-        Some(node::Node::DefElem(de)) if de.defname == "sequence_name" => {
-            match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                Some(node::Node::List(l)) => {
-                    let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
-                    match parts.as_slice() {
-                        [schema, name] => Some((Some((*schema).to_owned()), (*name).to_owned())),
-                        [.., name] => Some((None, (*name).to_owned())),
-                        [] => None,
-                    }
+    let explicit_name = options.iter().find_map(|o| match o.as_ref() {
+        Some(ast::Node::DefElem(de)) if de.defname == "sequence_name" => match de.arg.as_ref() {
+            Some(ast::Node::List(l)) => {
+                let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
+                match parts.as_slice() {
+                    [schema, name] => Some((Some((*schema).to_owned()), (*name).to_owned())),
+                    [.., name] => Some((None, (*name).to_owned())),
+                    [] => None,
                 }
-                _ => None,
             }
-        }
+            _ => None,
+        },
         _ => None,
     });
     // A serial / identity sequence has its column's integer type; its
@@ -124,10 +122,10 @@ pub(crate) fn create_owned_sequence(
         .iter()
         .find(|a| a.attnum == attnum)
         .map_or(oid::INT8, |a| a.atttypid);
-    let sequence_options: Vec<typedpg_pg_query::protobuf::Node> = options
+    let sequence_options: Vec<Option<typedpg_pg_query::ast::Node>> = options
         .iter()
         .filter(|o| {
-            !matches!(o.node.as_ref(), Some(node::Node::DefElem(de))
+            !matches!(o.as_ref(), Some(ast::Node::DefElem(de))
                 if matches!(de.defname.as_str(), "sequence_name" | "generated" | "logged" | "unlogged"))
         })
         .cloned()
@@ -233,16 +231,16 @@ fn owned_sequences_by(
 fn apply_owned_by(
     interp: &mut PgCatalog,
     seq_oid: PgClassOid,
-    opt: &typedpg_pg_query::protobuf::Node,
+    opt: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+    let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
         return Ok(());
     };
     if de.defname != "owned_by" {
         return Ok(());
     }
-    let parts: Vec<String> = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-        Some(node::Node::List(l)) => l
+    let parts: Vec<String> = match de.arg.as_ref() {
+        Some(ast::Node::List(l)) => l
             .items
             .iter()
             .filter_map(node_string)

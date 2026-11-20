@@ -671,7 +671,7 @@ fn char_to_contype(c: char) -> ConType {
 /// Export every `pg_index` row whose `indrelid` is a relation we already
 /// snapshotted. For each row we also need to recover `indexprs` and
 /// `indpred` as analyzer ASTs — PG stores them as `pg_node_tree` (its own
-/// serialization, not the protobuf shape we use), so we reach back through
+/// serialization, not the AST shape we use), so we reach back through
 /// `pg_get_indexdef(idx, slot, false)` and `pg_get_expr(indpred, indrelid)`
 /// to get the SQL text and feed it to the analyzer's `serialize_expression`
 /// / `serialize_predicate`. Indexes whose expressions don't round-trip

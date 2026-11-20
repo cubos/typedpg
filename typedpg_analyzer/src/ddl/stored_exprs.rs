@@ -7,18 +7,18 @@
 //! over the relation, a stored expression's column references are its
 //! columns whatever relation name qualifies them ([`over_own_row`]).
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::ast;
 
 use crate::ddl::tables::check_inherit::StoredExpr;
 use crate::oid::{PgClassOid, PgTypeOid};
 use crate::pg_catalog::{ConType, PgCatalog, TypType};
 
 /// Run `edit` over every node of `expr` (mutably).
-fn edit_nodes(expr: &mut protobuf::Node, edit: &mut dyn FnMut(typedpg_pg_query::NodeMut)) {
-    let mut tree = protobuf::ParseResult {
+fn edit_nodes(expr: &mut Option<ast::Node>, edit: &mut dyn FnMut(typedpg_pg_query::NodeMut)) {
+    let mut tree = ast::ParseResult {
         version: 0,
-        stmts: vec![protobuf::RawStmt {
-            stmt: Some(Box::new(std::mem::take(expr))),
+        stmts: vec![ast::RawStmt {
+            stmt: std::mem::take(expr),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -31,12 +31,7 @@ fn edit_nodes(expr: &mut protobuf::Node, edit: &mut dyn FnMut(typedpg_pg_query::
             edit(n);
         }
     }
-    *expr = tree
-        .stmts
-        .pop()
-        .and_then(|s| s.stmt)
-        .map(|b| *b)
-        .unwrap_or_default();
+    *expr = tree.stmts.pop().and_then(|s| s.stmt);
 }
 
 /// Which field of a column reference in an expression over the row of
@@ -66,7 +61,7 @@ fn column_field(fields: &[String], relname: &str, is_column: &dyn Fn(&str) -> bo
 /// `expr` with the column references to column `old` of the relation it
 /// is over (named `relname`, with columns `columns`) renamed `new`.
 fn rename_column_refs(
-    expr: &mut protobuf::Node,
+    expr: &mut Option<ast::Node>,
     relname: &str,
     columns: &[String],
     old: &str,
@@ -81,14 +76,14 @@ fn rename_column_refs(
         let fields = unsafe { &mut (*cr).fields };
         if fields
             .iter()
-            .any(|f| !matches!(f.node, Some(node::Node::String(_))))
+            .any(|f| !matches!(f, Some(ast::Node::String(_))))
         {
             return;
         }
         let names: Vec<String> = crate::expr::extract_string_fields(fields);
         let idx = column_field(&names, relname, &is_column);
         if names.get(idx).map(String::as_str) == Some(old)
-            && let Some(node::Node::String(s)) = fields[idx].node.as_mut()
+            && let Some(ast::Node::String(s)) = fields[idx].as_mut()
         {
             s.sval = new.to_owned();
         }
@@ -104,8 +99,8 @@ fn rename_column_refs(
 pub(crate) fn over_own_row(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &protobuf::Node,
-) -> protobuf::Node {
+    expr: &Option<ast::Node>,
+) -> Option<ast::Node> {
     let relname = interp
         .pg_class
         .get(&relid)
@@ -117,10 +112,10 @@ pub(crate) fn over_own_row(
         .map(|a| a.attname.clone())
         .collect();
     let is_column = |n: &str| columns.iter().any(|c| c == n);
-    let mut tree = protobuf::ParseResult {
+    let mut tree = ast::ParseResult {
         version: 0,
-        stmts: vec![protobuf::RawStmt {
-            stmt: Some(Box::new(expr.clone())),
+        stmts: vec![ast::RawStmt {
+            stmt: expr.clone(),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -142,7 +137,7 @@ pub(crate) fn over_own_row(
             let fields = &mut (*cr).fields;
             if fields
                 .iter()
-                .any(|f| !matches!(f.node, Some(node::Node::String(_))))
+                .any(|f| !matches!(f, Some(ast::Node::String(_))))
             {
                 continue;
             }
@@ -153,11 +148,7 @@ pub(crate) fn over_own_row(
             }
         }
     }
-    tree.stmts
-        .pop()
-        .and_then(|s| s.stmt)
-        .map(|b| *b)
-        .unwrap_or_default()
+    tree.stmts.pop().and_then(|s| s.stmt)
 }
 
 /// ALTER TABLE ... RENAME COLUMN `old` TO `new` of relation `relid`: the
@@ -265,7 +256,7 @@ pub(crate) fn rename_enum_label(interp: &mut PgCatalog, enum_oid: PgTypeOid, old
             // SAFETY: see `edit_nodes`; only the constant's string is
             // written.
             let c = unsafe { &mut *c };
-            let Some(protobuf::a_const::Val::Sval(s)) = c.val.as_mut() else {
+            let Some(ast::AConstValue::String(s)) = c.val.as_mut() else {
                 return;
             };
             let Some(&t) = trusted.literal_types.get(&c.location) else {
@@ -304,24 +295,24 @@ pub(crate) fn rename_enum_label(interp: &mut PgCatalog, enum_oid: PgTypeOid, old
         else {
             continue;
         };
-        let constant = match expr.node.as_mut() {
-            Some(node::Node::AConst(c)) => Some(c),
-            Some(node::Node::TypeCast(tc))
+        let constant = match expr.as_mut() {
+            Some(ast::Node::AConst(c)) => Some(c),
+            Some(ast::Node::TypeCast(tc))
                 if tc
                     .type_name
                     .as_ref()
                     .and_then(|t| crate::ddl::util::resolve_type_name(t, interp))
                     .is_some_and(|t| is_enum(interp, t)) =>
             {
-                match tc.arg.as_deref_mut().and_then(|a| a.node.as_mut()) {
-                    Some(node::Node::AConst(c)) => Some(c),
+                match tc.arg.as_mut() {
+                    Some(ast::Node::AConst(c)) => Some(c),
                     _ => None,
                 }
             }
             _ => None,
         };
         if let Some(c) = constant
-            && let Some(protobuf::a_const::Val::Sval(s)) = c.val.as_mut()
+            && let Some(ast::AConstValue::String(s)) = c.val.as_mut()
             && s.sval == old
         {
             s.sval = new.to_owned();

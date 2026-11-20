@@ -3,8 +3,8 @@
 //! resolution of index columns (ResolveOpClass / GetDefaultOpClass,
 //! indexcmds.c).
 
-use typedpg_pg_query::protobuf::{
-    AlterOpFamilyStmt, CreateAmStmt, CreateOpClassItem, CreateOpClassStmt, CreateOpFamilyStmt, node,
+use typedpg_pg_query::ast::{
+    self, AlterOpFamilyStmt, CreateAmStmt, CreateOpClassItem, CreateOpClassStmt, CreateOpFamilyStmt,
 };
 
 use super::DdlError;
@@ -143,7 +143,7 @@ fn am_must_exist(interp: &PgCatalog, amname: &str) -> Result<(), DdlError> {
 }
 
 /// `(schema, name)` of a possibly qualified name list.
-fn split_name(names: &[typedpg_pg_query::protobuf::Node]) -> (Option<String>, String) {
+fn split_name(names: &[Option<typedpg_pg_query::ast::Node>]) -> (Option<String>, String) {
     let parts: Vec<&str> = names.iter().filter_map(node_string).collect();
     match parts.as_slice() {
         [schema, name] => (Some((*schema).to_owned()), (*name).to_owned()),
@@ -442,13 +442,13 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
 fn storage_type(
     interp: &PgCatalog,
     am: &str,
-    items: &[typedpg_pg_query::protobuf::Node],
+    items: &[Option<typedpg_pg_query::ast::Node>],
     intype: PgTypeOid,
 ) -> Result<Option<PgTypeOid>, DdlError> {
     let mut storage = None;
     for item in items {
         // OPCLASS_ITEM_STORAGETYPE.
-        let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
+        let Some(ast::Node::CreateOpClassItem(item)) = item.as_ref() else {
             continue;
         };
         if item.itemtype != 3 {
@@ -549,9 +549,7 @@ fn family_operator(
         (opr, left, right)
     } else {
         // LookupOperWithArgs; then assignOperTypes: a binary one.
-        let wrapped = typedpg_pg_query::protobuf::Node {
-            node: Some(node::Node::ObjectWithArgs(owa.clone())),
-        };
+        let wrapped = Some(typedpg_pg_query::ast::Node::ObjectWithArgs(owa.clone()));
         let Some(opr) = super::drop::lookup_operator(interp, &wrapped)? else {
             return Ok(None);
         };
@@ -612,12 +610,12 @@ fn family_operators(
     family: &str,
     family_ns: PgNamespaceOid,
     am: &str,
-    items: &[typedpg_pg_query::protobuf::Node],
+    items: &[Option<typedpg_pg_query::ast::Node>],
     intype: Option<PgTypeOid>,
 ) -> Result<Vec<PgAmop>, DdlError> {
     let mut ops: Vec<PgAmop> = Vec::new();
     for item in items {
-        let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
+        let Some(ast::Node::CreateOpClassItem(item)) = item.as_ref() else {
             continue;
         };
         let Some(op) = family_operator(interp, family, family_ns, am, item, intype)? else {
@@ -637,7 +635,7 @@ fn family_operators(
 }
 
 /// The name list as written (NameListToString).
-fn written(names: &[typedpg_pg_query::protobuf::Node]) -> String {
+fn written(names: &[Option<typedpg_pg_query::ast::Node>]) -> String {
     names
         .iter()
         .filter_map(node_string)
@@ -668,8 +666,8 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
         // AlterOpFamilyAdd checks the items in order: a STORAGE one is
         // rejected once those before it passed.
         let storage = stmt.items.iter().position(|item| {
-            matches!(item.node.as_ref(),
-                Some(node::Node::CreateOpClassItem(i)) if i.itemtype == 3)
+            matches!(item.as_ref(),
+                Some(ast::Node::CreateOpClassItem(i)) if i.itemtype == 3)
         });
         if let Some(at) = storage {
             let before = &stmt.items[..at];
@@ -725,7 +723,7 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
     // right)` items.
     let mut dropped: Vec<(bool, i16, PgTypeOid, PgTypeOid)> = Vec::new();
     for item in &stmt.items {
-        let Some(node::Node::CreateOpClassItem(item)) = item.node.as_ref() else {
+        let Some(ast::Node::CreateOpClassItem(item)) = item.as_ref() else {
             continue;
         };
         let is_func = match item.itemtype {
@@ -736,8 +734,8 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
         let types: Vec<Option<PgTypeOid>> = item
             .class_args
             .iter()
-            .map(|n| match n.node.as_ref() {
-                Some(node::Node::TypeName(tn)) => super::util::resolve_type_name(tn, interp),
+            .map(|n| match n.as_ref() {
+                Some(ast::Node::TypeName(tn)) => super::util::resolve_type_name(tn, interp),
                 _ => None,
             })
             .collect();
@@ -804,12 +802,12 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
 /// DROP ACCESS METHOD / OPERATOR CLASS / OPERATOR FAMILY.
 pub(crate) fn drop_am_object(
     interp: &mut PgCatalog,
-    objtype: typedpg_pg_query::protobuf::ObjectType,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    objtype: typedpg_pg_query::ast::ObjectType,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    use typedpg_pg_query::protobuf::ObjectType;
+    use typedpg_pg_query::ast::ObjectType;
     match objtype {
         ObjectType::ObjectAccessMethod => {
             let Some(name) = node_string(obj_node).map(str::to_owned) else {
@@ -860,11 +858,11 @@ pub(crate) fn drop_am_object(
 fn resolve_am_object(
     interp: &PgCatalog,
     is_class: bool,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<Option<super::depend::NamedObject>, DdlError> {
     use super::depend::NamedObject;
-    let Some(node::Node::List(l)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::List(l)) = obj_node.as_ref() else {
         return Ok(None);
     };
     let Some((am, names)) = l.items.split_first() else {
@@ -917,7 +915,7 @@ fn resolve_am_object(
 pub(crate) fn rename_or_move_am_object(
     interp: &mut PgCatalog,
     is_class: bool,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     new_name: Option<&str>,
     new_schema: Option<&str>,
 ) -> Result<(), DdlError> {
@@ -1088,7 +1086,7 @@ fn default_opclass<'a>(
 /// for an unknown-typed column.
 pub(crate) fn resolve_index_opclass(
     interp: &PgCatalog,
-    opclass: &[typedpg_pg_query::protobuf::Node],
+    opclass: &[Option<typedpg_pg_query::ast::Node>],
     typ: PgTypeOid,
     am: &str,
 ) -> Result<Option<PgOpclassOid>, DdlError> {
@@ -1103,7 +1101,7 @@ pub(crate) fn resolve_index_opclass(
 /// …`, or the one named `does not accept data type unknown`.
 pub(crate) fn resolve_opclass(
     interp: &PgCatalog,
-    opclass: &[typedpg_pg_query::protobuf::Node],
+    opclass: &[Option<typedpg_pg_query::ast::Node>],
     typ: PgTypeOid,
     am: &str,
 ) -> Result<PgOpclassOid, DdlError> {

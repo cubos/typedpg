@@ -67,8 +67,8 @@
 //! when none of the subquery's FROM items can capture `x`'s columns.
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{
-    BoolExprType, ColumnRef, Node, SelectStmt, SetOperation, SubLinkType, Token, node::Node as N,
+use typedpg_pg_query::ast::{
+    BoolExprType, ColumnRef, Node, Node as N, SelectStmt, SetOperation, SubLinkType, Token,
 };
 
 use super::proof::{
@@ -88,7 +88,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     // Most queries have no `IN (SELECT …)` at all: nothing to scan for.
     let has_site = ctx.tree.nodes().iter().any(|(n, _)| {
         matches!(n, NodeRef::SubLink(s)
-            if s.sub_link_type() == SubLinkType::AnySublink && s.oper_name.is_empty())
+            if s.sub_link_type == SubLinkType::AnySublink && s.oper_name.is_empty())
     });
     // The guard is on the names of the SQL as written (decoded: a
     // `U&"…"` identifier too): the current SQL may hold the aliases of
@@ -104,12 +104,12 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
     let tokens: Vec<Tok> = scanned
         .tokens
         .iter()
-        .filter(|t| !matches!(t.token(), Token::SqlComment | Token::CComment))
+        .filter(|t| !matches!(t.token, Token::SqlComment | Token::CComment))
         .filter_map(|t| {
             Some(Tok {
                 start: usize::try_from(t.start).ok()?,
                 end: usize::try_from(t.end).ok()?,
-                token: t.token(),
+                token: t.token,
             })
         })
         .collect();
@@ -120,7 +120,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         next_alias: std::cell::Cell::new(next_alias(ctx.sql)),
     };
     for stmt in &ctx.tree.stmts {
-        if let Some(node) = stmt.stmt.as_deref() {
+        if let Some(node) = stmt.stmt.as_ref() {
             walker.statement(node, None);
         }
     }
@@ -161,28 +161,28 @@ impl Walker<'_, '_> {
     /// A statement nested at `parent`'s level: a SELECT, or a DML whose
     /// WHERE has a known scope.
     fn statement(&mut self, node: &Node, parent: Option<&FromScope<'_>>) {
-        match node.node.as_ref() {
-            Some(N::SelectStmt(s)) => self.select(s, parent),
-            Some(N::InsertStmt(i)) => {
-                self.ctes(i.with_clause.as_ref(), parent);
-                if let Some(s) = i.select_stmt.as_deref() {
+        match node {
+            N::SelectStmt(s) => self.select(s, parent),
+            N::InsertStmt(i) => {
+                self.ctes(i.with_clause.as_deref(), parent);
+                if let Some(s) = i.select_stmt.as_ref() {
                     self.statement(s, parent);
                 }
             }
-            Some(N::UpdateStmt(u)) => {
-                self.ctes(u.with_clause.as_ref(), parent);
+            N::UpdateStmt(u) => {
+                self.ctes(u.with_clause.as_deref(), parent);
                 self.walk_from_subqueries(&u.from_clause, parent);
                 let scope =
-                    FromScope::of_dml(self.ctx, u.relation.as_ref(), &u.from_clause, parent);
+                    FromScope::of_dml(self.ctx, u.relation.as_deref(), &u.from_clause, parent);
                 self.values(&u.target_list, &scope);
-                self.qual(u.where_clause.as_deref(), &scope);
+                self.qual(u.where_clause.as_ref(), &scope);
             }
-            Some(N::DeleteStmt(d)) => {
-                self.ctes(d.with_clause.as_ref(), parent);
+            N::DeleteStmt(d) => {
+                self.ctes(d.with_clause.as_deref(), parent);
                 self.walk_from_subqueries(&d.using_clause, parent);
                 let scope =
-                    FromScope::of_dml(self.ctx, d.relation.as_ref(), &d.using_clause, parent);
-                self.qual(d.where_clause.as_deref(), &scope);
+                    FromScope::of_dml(self.ctx, d.relation.as_deref(), &d.using_clause, parent);
+                self.qual(d.where_clause.as_ref(), &scope);
             }
             _ => {}
         }
@@ -190,12 +190,12 @@ impl Walker<'_, '_> {
 
     fn ctes(
         &mut self,
-        with: Option<&typedpg_pg_query::protobuf::WithClause>,
+        with: Option<&typedpg_pg_query::ast::WithClause>,
         parent: Option<&FromScope<'_>>,
     ) {
         for cte in with.map(|w| w.ctes.as_slice()).unwrap_or_default() {
-            if let Some(N::CommonTableExpr(c)) = cte.node.as_ref()
-                && let Some(q) = c.ctequery.as_deref()
+            if let Some(N::CommonTableExpr(c)) = cte.as_ref()
+                && let Some(q) = c.ctequery.as_ref()
             {
                 self.statement(q, parent);
             }
@@ -204,17 +204,17 @@ impl Walker<'_, '_> {
 
     /// The non-LATERAL subqueries of a FROM list (in joins too), which see
     /// the levels around the FROM's, not its own.
-    fn walk_from_subqueries(&mut self, from: &[Node], parent: Option<&FromScope<'_>>) {
+    fn walk_from_subqueries(&mut self, from: &[Option<Node>], parent: Option<&FromScope<'_>>) {
         for item in from {
-            match item.node.as_ref() {
+            match item.as_ref() {
                 Some(N::RangeSubselect(s)) if !s.lateral => {
-                    if let Some(q) = s.subquery.as_deref() {
+                    if let Some(q) = s.subquery.as_ref() {
                         self.statement(q, parent);
                     }
                 }
                 Some(N::JoinExpr(j)) => {
-                    for side in [&j.larg, &j.rarg].into_iter().flatten() {
-                        self.walk_from_subqueries(std::slice::from_ref(&**side), parent);
+                    for side in [&j.larg, &j.rarg] {
+                        self.walk_from_subqueries(std::slice::from_ref(side), parent);
                     }
                 }
                 _ => {}
@@ -223,8 +223,8 @@ impl Walker<'_, '_> {
     }
 
     fn select(&mut self, s: &SelectStmt, parent: Option<&FromScope<'_>>) {
-        self.ctes(s.with_clause.as_ref(), parent);
-        if s.op != SetOperation::SetopNone as i32 {
+        self.ctes(s.with_clause.as_deref(), parent);
+        if s.op != SetOperation::SetopNone {
             for side in [&s.larg, &s.rarg].into_iter().flatten() {
                 self.select(side, parent);
             }
@@ -232,7 +232,7 @@ impl Walker<'_, '_> {
         }
         self.walk_from_subqueries(&s.from_clause, parent);
         let scope = FromScope::of_select(self.ctx, s, parent);
-        self.qual(s.where_clause.as_deref(), &scope);
+        self.qual(s.where_clause.as_ref(), &scope);
         // A GROUP BY, ORDER BY or DISTINCT ON expression is matched against
         // the target list's: rewriting one side only would break that.
         let matched = [&s.group_clause, &s.sort_clause, &s.distinct_clause]
@@ -241,7 +241,7 @@ impl Walker<'_, '_> {
             .any(contains_sublink);
         if !matched {
             self.values(&s.target_list, &scope);
-            self.qual(s.having_clause.as_deref(), &scope);
+            self.qual(s.having_clause.as_ref(), &scope);
         }
     }
 
@@ -251,19 +251,19 @@ impl Walker<'_, '_> {
     }
 
     /// Walk a target list or SET list.
-    fn values(&mut self, nodes: &[Node], scope: &FromScope<'_>) {
+    fn values(&mut self, nodes: &[Option<Node>], scope: &FromScope<'_>) {
         self.expr_list(nodes, scope);
     }
 
     fn expr_opt(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
-        if let Some(n) = node.and_then(|n| n.node.as_ref()) {
+        if let Some(n) = node {
             self.expr(n.to_ref(), scope);
         }
     }
 
-    fn expr_list(&mut self, nodes: &[Node], scope: &FromScope<'_>) {
+    fn expr_list(&mut self, nodes: &[Option<Node>], scope: &FromScope<'_>) {
         for n in nodes {
-            self.expr_opt(Some(n), scope);
+            self.expr_opt(n.as_ref(), scope);
         }
     }
 
@@ -271,15 +271,15 @@ impl Walker<'_, '_> {
     fn expr(&mut self, node: NodeRef<'_>, scope: &FromScope<'_>) {
         match node {
             NodeRef::SubLink(s) => {
-                self.expr_opt(s.testexpr.as_deref(), scope);
-                if let Some(q) = s.subselect.as_deref() {
+                self.expr_opt(s.testexpr.as_ref(), scope);
+                if let Some(q) = s.subselect.as_ref() {
                     self.statement(q, Some(scope));
                 }
             }
             NodeRef::BoolExpr(b) => {
-                if b.boolop() == BoolExprType::NotExpr
+                if b.boolop == BoolExprType::NotExpr
                     && let [arg] = b.args.as_slice()
-                    && let Some(N::SubLink(s)) = arg.node.as_ref()
+                    && let Some(N::SubLink(s)) = arg.as_ref()
                     && let Some(edit) = self.site(b.location, s, scope)
                 {
                     self.out.push(Candidate {
@@ -304,23 +304,23 @@ impl Walker<'_, '_> {
     fn site(
         &self,
         not_at: i32,
-        s: &typedpg_pg_query::protobuf::SubLink,
+        s: &typedpg_pg_query::ast::SubLink,
         scope: &FromScope<'_>,
     ) -> Option<Edit> {
         let ctx = self.ctx;
         // `IN` syntax: an ANY sublink with no operator written, which PG
         // compares with `=`.
-        if s.sub_link_type() != SubLinkType::AnySublink || !s.oper_name.is_empty() {
+        if s.sub_link_type != SubLinkType::AnySublink || !s.oper_name.is_empty() {
             return None;
         }
-        let testexpr = s.testexpr.as_deref()?;
-        let (lhs, lhs_at): (Vec<&ColumnRef>, i32) = match testexpr.node.as_ref()? {
-            N::ColumnRef(c) => (vec![c], c.location),
+        let testexpr = s.testexpr.as_ref()?;
+        let (lhs, lhs_at): (Vec<&ColumnRef>, i32) = match testexpr {
+            N::ColumnRef(c) => (vec![&**c], c.location),
             N::RowExpr(r) => (
                 r.args
                     .iter()
-                    .map(|a| match a.node.as_ref() {
-                        Some(N::ColumnRef(c)) => Some(c),
+                    .map(|a| match a.as_ref() {
+                        Some(N::ColumnRef(c)) => Some(&**c),
                         _ => None,
                     })
                     .collect::<Option<_>>()?,
@@ -328,13 +328,13 @@ impl Walker<'_, '_> {
             ),
             _ => return None,
         };
-        let Some(N::SelectStmt(sub)) = s.subselect.as_deref()?.node.as_ref() else {
+        let Some(N::SelectStmt(sub)) = s.subselect.as_ref() else {
             return None;
         };
         // No LIMIT / OFFSET: the written SubPlan reads the subquery once,
         // the anti-join may rescan it per outer row, and a LIMIT — ordered
         // or not, ties — can return other rows on a rescan.
-        if sub.op != SetOperation::SetopNone as i32
+        if sub.op != SetOperation::SetopNone
             || !sub.values_lists.is_empty()
             || !sub.locking_clause.is_empty()
             || sub.into_clause.is_some()
@@ -346,13 +346,11 @@ impl Walker<'_, '_> {
         let rhs: Vec<&ColumnRef> = sub
             .target_list
             .iter()
-            .map(|t| match t.node.as_ref() {
-                Some(N::ResTarget(r)) if r.indirection.is_empty() => {
-                    match r.val.as_deref()?.node.as_ref() {
-                        Some(N::ColumnRef(c)) => Some(c),
-                        _ => None,
-                    }
-                }
+            .map(|t| match t.as_ref() {
+                Some(N::ResTarget(r)) if r.indirection.is_empty() => match r.val.as_ref() {
+                    Some(N::ColumnRef(c)) => Some(&**c),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect::<Option<_>>()?;
@@ -361,9 +359,8 @@ impl Walker<'_, '_> {
         }
         // Neither side can be NULL.
         let sub_scope = FromScope::of_select(ctx, sub, Some(scope));
-        let col_node = |c: &ColumnRef| Node {
-            node: Some(N::ColumnRef(c.clone())),
-        };
+        let col_node =
+            |c: &ColumnRef| Some(N::ColumnRef(typedpg_pg_query::NodeBox::new(c.clone())));
         if !lhs
             .iter()
             .all(|c| strictly_not_null(ctx, &col_node(c), scope))
@@ -380,9 +377,9 @@ impl Walker<'_, '_> {
             return None;
         }
         // Nothing volatile, no row security.
-        let sub_node = s.subselect.as_deref()?;
+        let sub_node = &s.subselect;
         if has_volatile(ctx, sub_node)
-            || has_volatile(ctx, testexpr)
+            || has_volatile(ctx, &s.testexpr)
             || reads_row_security(ctx, sub_node)
         {
             return None;
@@ -590,7 +587,7 @@ fn render(c: &ColumnRef) -> Option<String> {
     let parts: Vec<String> = c
         .fields
         .iter()
-        .map(|f| match f.node.as_ref() {
+        .map(|f| match f.as_ref() {
             Some(N::String(s)) => Some(typedpg_core::quote_identifier(&s.sval)),
             _ => None,
         })
@@ -599,8 +596,8 @@ fn render(c: &ColumnRef) -> Option<String> {
 }
 
 /// Whether `node` holds a sublink.
-fn contains_sublink(node: &Node) -> bool {
-    node.node.as_ref().is_some_and(|n| {
+fn contains_sublink(node: &Option<Node>) -> bool {
+    node.as_ref().is_some_and(|n| {
         n.nodes()
             .iter()
             .any(|(n, _)| matches!(n, NodeRef::SubLink(_)))
@@ -608,8 +605,8 @@ fn contains_sublink(node: &Node) -> bool {
 }
 
 /// Whether a relation `node` reads (by name) has row security.
-fn reads_row_security(ctx: &Ctx<'_>, node: &Node) -> bool {
-    node.node.as_ref().is_some_and(|n| {
+fn reads_row_security(ctx: &Ctx<'_>, node: &Option<Node>) -> bool {
+    node.as_ref().is_some_and(|n| {
         n.nodes().iter().any(|(n, _)| match n {
             NodeRef::RangeVar(rv) => {
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());

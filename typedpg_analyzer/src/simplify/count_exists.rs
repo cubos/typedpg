@@ -77,10 +77,10 @@
 //!   table may do anything): how many times it runs may change.
 //! - Row security on a read table (its policies run per row, too).
 
-use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::protobuf::{
-    self, AExprKind, Node, ResTarget, SelectStmt, SetOperation, SubLinkType, Token, node,
+use typedpg_pg_query::ast::{
+    self, AExprKind, Node, ResTarget, SelectStmt, SetOperation, SubLinkType, Token,
 };
+use typedpg_pg_query::{NodeBox, NodeRef};
 
 use super::proof::{
     self, FromScope, cannot_error, error_free_select, has_volatile, strictly_not_null,
@@ -154,12 +154,12 @@ fn count_right(op: &str, lit: i32) -> Option<(Test, u32)> {
 struct Tok {
     start: usize,
     end: usize,
-    kind: i32,
+    kind: Token,
 }
 
 impl Tok {
     fn is(self, t: Token) -> bool {
-        self.kind == t as i32
+        self.kind == t
     }
 }
 
@@ -174,7 +174,7 @@ impl<'a> Text<'a> {
         let toks = scan
             .tokens
             .iter()
-            .filter(|t| t.token != Token::SqlComment as i32 && t.token != Token::CComment as i32)
+            .filter(|t| t.token != Token::SqlComment && t.token != Token::CComment)
             .map(|t| {
                 Some(Tok {
                     start: usize::try_from(t.start).ok()?,
@@ -326,16 +326,14 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         .iter()
         .flat_map(|(n, _)| match n {
             NodeRef::SelectStmt(s) => s.target_list.iter().collect::<Vec<_>>(),
-            NodeRef::InsertStmt(s) => returning(s.returning_clause.as_ref()),
-            NodeRef::UpdateStmt(s) => returning(s.returning_clause.as_ref()),
-            NodeRef::DeleteStmt(s) => returning(s.returning_clause.as_ref()),
-            NodeRef::MergeStmt(s) => returning(s.returning_clause.as_ref()),
+            NodeRef::InsertStmt(s) => returning(s.returning_clause.as_deref()),
+            NodeRef::UpdateStmt(s) => returning(s.returning_clause.as_deref()),
+            NodeRef::DeleteStmt(s) => returning(s.returning_clause.as_deref()),
+            NodeRef::MergeStmt(s) => returning(s.returning_clause.as_deref()),
             _ => Vec::new(),
         })
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) if rt.name.is_empty() && rt.val.is_some() => {
-                Some(&**rt)
-            }
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::ResTarget(rt)) if rt.name.is_empty() && rt.val.is_some() => Some(&**rt),
             _ => None,
         })
         .collect();
@@ -347,7 +345,7 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         unnamed: &unnamed,
         out: Vec::new(),
     };
-    if let Some(node) = stmt.stmt.as_deref().and_then(|n| n.node.as_ref()) {
+    if let Some(node) = stmt.stmt.as_ref() {
         walker.statement(node.to_ref(), None);
     }
     let mut out = walker.out;
@@ -379,31 +377,31 @@ impl Walker<'_, '_> {
         match node {
             NodeRef::SelectStmt(s) => self.select(s, parent),
             NodeRef::InsertStmt(i) => {
-                self.ctes(i.with_clause.as_ref(), parent);
-                if let Some(s) = i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                self.ctes(i.with_clause.as_deref(), parent);
+                if let Some(s) = i.select_stmt.as_ref() {
                     self.statement(s.to_ref(), parent);
                 }
-                let scope = FromScope::of_dml(ctx, i.relation.as_ref(), &[], parent);
+                let scope = FromScope::of_dml(ctx, i.relation.as_deref(), &[], parent);
                 let opaque = FromScope::opaque(parent);
                 if let Some(c) = i.on_conflict_clause.as_deref() {
                     self.children(NodeRef::OnConflictClause(c), &opaque);
                 }
-                self.returning(i.returning_clause.as_ref(), &scope);
+                self.returning(i.returning_clause.as_deref(), &scope);
             }
             NodeRef::UpdateStmt(u) => {
-                self.ctes(u.with_clause.as_ref(), parent);
+                self.ctes(u.with_clause.as_deref(), parent);
                 self.walk_from_subqueries(&u.from_clause, parent);
-                let scope = FromScope::of_dml(ctx, u.relation.as_ref(), &u.from_clause, parent);
+                let scope = FromScope::of_dml(ctx, u.relation.as_deref(), &u.from_clause, parent);
                 self.list(&u.target_list, &scope);
-                self.opt(u.where_clause.as_deref(), &scope);
-                self.returning(u.returning_clause.as_ref(), &scope);
+                self.opt(u.where_clause.as_ref(), &scope);
+                self.returning(u.returning_clause.as_deref(), &scope);
             }
             NodeRef::DeleteStmt(d) => {
-                self.ctes(d.with_clause.as_ref(), parent);
+                self.ctes(d.with_clause.as_deref(), parent);
                 self.walk_from_subqueries(&d.using_clause, parent);
-                let scope = FromScope::of_dml(ctx, d.relation.as_ref(), &d.using_clause, parent);
-                self.opt(d.where_clause.as_deref(), &scope);
-                self.returning(d.returning_clause.as_ref(), &scope);
+                let scope = FromScope::of_dml(ctx, d.relation.as_deref(), &d.using_clause, parent);
+                self.opt(d.where_clause.as_ref(), &scope);
+                self.returning(d.returning_clause.as_deref(), &scope);
             }
             // Anything else (MERGE, utility statements): no known scope.
             other => {
@@ -413,10 +411,10 @@ impl Walker<'_, '_> {
         }
     }
 
-    fn ctes(&mut self, with: Option<&protobuf::WithClause>, parent: Option<&FromScope<'_>>) {
+    fn ctes(&mut self, with: Option<&ast::WithClause>, parent: Option<&FromScope<'_>>) {
         for cte in with.map(|w| w.ctes.as_slice()).unwrap_or_default() {
-            if let Some(node::Node::CommonTableExpr(c)) = cte.node.as_ref()
-                && let Some(q) = c.ctequery.as_deref().and_then(|q| q.node.as_ref())
+            if let Some(ast::Node::CommonTableExpr(c)) = cte.as_ref()
+                && let Some(q) = c.ctequery.as_ref()
             {
                 self.statement(q.to_ref(), parent);
             }
@@ -425,17 +423,17 @@ impl Walker<'_, '_> {
 
     /// The non-LATERAL subqueries of a FROM list (in joins too), which see
     /// the levels around the FROM's, not its own.
-    fn walk_from_subqueries(&mut self, from: &[Node], parent: Option<&FromScope<'_>>) {
+    fn walk_from_subqueries(&mut self, from: &[Option<Node>], parent: Option<&FromScope<'_>>) {
         for item in from {
-            match item.node.as_ref() {
-                Some(node::Node::RangeSubselect(s)) if !s.lateral => {
-                    if let Some(q) = s.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+            match item.as_ref() {
+                Some(ast::Node::RangeSubselect(s)) if !s.lateral => {
+                    if let Some(q) = s.subquery.as_ref() {
                         self.statement(q.to_ref(), parent);
                     }
                 }
-                Some(node::Node::JoinExpr(j)) => {
-                    for side in [&j.larg, &j.rarg].into_iter().flatten() {
-                        self.walk_from_subqueries(std::slice::from_ref(&**side), parent);
+                Some(ast::Node::JoinExpr(j)) => {
+                    for side in [&j.larg, &j.rarg] {
+                        self.walk_from_subqueries(std::slice::from_ref(side), parent);
                     }
                 }
                 _ => {}
@@ -448,8 +446,8 @@ impl Walker<'_, '_> {
     /// its own join's two sides, a LATERAL item (a FROM function is one)
     /// the items to its left; both see the levels around (`parent`), never
     /// the rest of the FROM, whose names may shadow an outer one.
-    fn walk_from_rest(&mut self, from: &[Node], parent: Option<&FromScope<'_>>) {
-        let mut left: Vec<Node> = Vec::new();
+    fn walk_from_rest(&mut self, from: &[Option<Node>], parent: Option<&FromScope<'_>>) {
+        let mut left: Vec<Option<Node>> = Vec::new();
         for item in from {
             self.walk_from_item(item, &mut left, parent);
         }
@@ -458,36 +456,36 @@ impl Walker<'_, '_> {
     /// One FROM item, `left` holding the items before it (and getting it).
     fn walk_from_item(
         &mut self,
-        item: &Node,
-        left: &mut Vec<Node>,
+        item: &Option<Node>,
+        left: &mut Vec<Option<Node>>,
         parent: Option<&FromScope<'_>>,
     ) {
-        match item.node.as_ref() {
-            Some(node::Node::RangeSubselect(s)) => {
+        match item.as_ref() {
+            Some(ast::Node::RangeSubselect(s)) => {
                 if s.lateral
-                    && let Some(q) = s.subquery.as_deref().and_then(|q| q.node.as_ref())
+                    && let Some(q) = s.subquery.as_ref()
                 {
                     let scope = FromScope::of_items(self.ctx, left, parent);
                     self.statement(q.to_ref(), Some(&scope));
                 }
             }
-            Some(node::Node::JoinExpr(j)) => {
+            Some(ast::Node::JoinExpr(j)) => {
                 let mark = left.len();
                 // The right side sees the left one (and what precedes the
                 // join): a LATERAL there may read it.
-                for side in [&j.larg, &j.rarg].into_iter().flatten() {
+                for side in [&j.larg, &j.rarg].into_iter().filter(|s| s.is_some()) {
                     self.walk_from_item(side, left, parent);
                 }
-                let sides: Vec<Node> = [&j.larg, &j.rarg]
+                let sides: Vec<Option<Node>> = [&j.larg, &j.rarg]
                     .into_iter()
-                    .flatten()
-                    .map(|s| (**s).clone())
+                    .filter(|s| s.is_some())
+                    .cloned()
                     .collect();
                 let scope = FromScope::of_items(self.ctx, &sides, parent);
-                self.opt(j.quals.as_deref(), &scope);
+                self.opt(j.quals.as_ref(), &scope);
                 left.truncate(mark);
             }
-            Some(node::Node::RangeVar(_)) => {}
+            Some(ast::Node::RangeVar(_)) => {}
             Some(n) => {
                 let scope = FromScope::of_items(self.ctx, left, parent);
                 self.children(n.to_ref(), &scope);
@@ -498,8 +496,8 @@ impl Walker<'_, '_> {
     }
 
     fn select(&mut self, s: &SelectStmt, parent: Option<&FromScope<'_>>) {
-        self.ctes(s.with_clause.as_ref(), parent);
-        if s.op != SetOperation::SetopNone as i32 {
+        self.ctes(s.with_clause.as_deref(), parent);
+        if s.op != SetOperation::SetopNone {
             for side in [&s.larg, &s.rarg].into_iter().flatten() {
                 self.select(side, parent);
             }
@@ -519,27 +517,27 @@ impl Walker<'_, '_> {
             self.list(list, &scope);
         }
         for n in [&s.limit_count, &s.limit_offset] {
-            self.opt(n.as_deref(), &scope);
+            self.opt(n.as_ref(), &scope);
         }
-        self.opt(s.where_clause.as_deref(), &scope);
-        self.opt(s.having_clause.as_deref(), &scope);
+        self.opt(s.where_clause.as_ref(), &scope);
+        self.opt(s.having_clause.as_ref(), &scope);
     }
 
-    fn returning(&mut self, clause: Option<&protobuf::ReturningClause>, scope: &FromScope<'_>) {
+    fn returning(&mut self, clause: Option<&ast::ReturningClause>, scope: &FromScope<'_>) {
         if let Some(c) = clause {
             self.list(&c.exprs, scope);
         }
     }
 
     fn opt(&mut self, node: Option<&Node>, scope: &FromScope<'_>) {
-        if let Some(n) = node.and_then(|n| n.node.as_ref()) {
+        if let Some(n) = node {
             self.expr(n.to_ref(), scope);
         }
     }
 
-    fn list(&mut self, nodes: &[Node], scope: &FromScope<'_>) {
+    fn list(&mut self, nodes: &[Option<Node>], scope: &FromScope<'_>) {
         for n in nodes {
-            self.opt(Some(n), scope);
+            self.opt(n.as_ref(), scope);
         }
     }
 
@@ -594,18 +592,14 @@ impl Walker<'_, '_> {
 /// error-free too).
 fn counted_error_free(ctx: &Ctx<'_>, select: &SelectStmt, scope: &FromScope<'_>) -> bool {
     let mut without_count = select.clone();
-    without_count.target_list = vec![Node {
-        node: Some(node::Node::ResTarget(Box::new(ResTarget {
-            val: Some(Box::new(Node {
-                node: Some(node::Node::AConst(protobuf::AConst {
-                    isnull: false,
-                    location: -1,
-                    val: Some(protobuf::a_const::Val::Ival(protobuf::Integer { ival: 1 })),
-                })),
-            })),
-            ..Default::default()
+    without_count.target_list = vec![Some(ast::Node::ResTarget(NodeBox::new(ResTarget {
+        val: Some(ast::Node::AConst(NodeBox::new(ast::AConst {
+            isnull: false,
+            location: -1,
+            val: Some(ast::AConstValue::Integer(ast::Integer { ival: 1 })),
         }))),
-    }];
+        ..Default::default()
+    })))];
     error_free_select(ctx, &without_count, scope)
 }
 
@@ -616,31 +610,30 @@ struct Comparison<'a> {
     test: Test,
     /// The count side is the left operand.
     count_left: bool,
-    count: &'a Node,
+    count: &'a Option<Node>,
     /// The literal's location.
     lit_at: i32,
 }
 
-fn comparison<'a>(
-    ctx: &Ctx<'_>,
-    text: &Text<'_>,
-    e: &'a protobuf::AExpr,
-) -> Option<Comparison<'a>> {
-    if e.kind != AExprKind::AexprOp as i32 {
+fn comparison<'a>(ctx: &Ctx<'_>, text: &Text<'_>, e: &'a ast::AExpr) -> Option<Comparison<'a>> {
+    if e.kind != AExprKind::AexprOp {
         return None;
     }
     // A qualified `OPERATOR(schema.op)` is left alone.
     let [name] = e.name.as_slice() else {
         return None;
     };
-    let Some(node::Node::String(op)) = name.node.as_ref() else {
+    let Some(ast::Node::String(op)) = name.as_ref() else {
         return None;
     };
     let op = op.sval.as_str();
-    let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
-    let literal = |n: &Node| match n.node.as_ref() {
-        Some(node::Node::AConst(c))
-            if !c.isnull && matches!(c.val, Some(protobuf::a_const::Val::Ival(_))) =>
+    let (l, r) = (&e.lexpr, &e.rexpr);
+    if l.is_none() || r.is_none() {
+        return None;
+    }
+    let literal = |n: &Option<Node>| match n.as_ref() {
+        Some(ast::Node::AConst(c))
+            if !c.isnull && matches!(c.val, Some(ast::AConstValue::Integer(_))) =>
         {
             text.digit(c.location).map(|d| (d, c.location))
         }
@@ -679,16 +672,16 @@ fn plain_count(
     ctx: &Ctx<'_>,
     text: &Text<'_>,
     select: &SelectStmt,
-    n: &Node,
+    n: &Option<Node>,
 ) -> Option<std::ops::Range<usize>> {
-    let Some(node::Node::FuncCall(fc)) = n.node.as_ref() else {
+    let Some(ast::Node::FuncCall(fc)) = n.as_ref() else {
         return None;
     };
     let names: Option<Vec<&str>> = fc
         .funcname
         .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(node::Node::String(s)) => Some(s.sval.as_str()),
+        .map(|f| match f.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect();
@@ -736,7 +729,7 @@ fn plain_count(
 /// Whether `select` is a plain query of one row per evaluation: no
 /// clause that changes how many rows an aggregate-only target list gives.
 fn one_row_aggregate(select: &SelectStmt) -> bool {
-    select.op == SetOperation::SetopNone as i32
+    select.op == SetOperation::SetopNone
         && select.larg.is_none()
         && select.rarg.is_none()
         && select.distinct_clause.is_empty()
@@ -757,11 +750,11 @@ fn one_row_aggregate(select: &SelectStmt) -> bool {
 /// (whose policies run per row). A CTE read from inside `node` is refused
 /// too: [`has_volatile`] doesn't look into one declared outside it, and
 /// `EXISTS` reads a materialized CTE's rows only as far as it needs them.
-fn pure(ctx: &Ctx<'_>, cte_names: &[&str], node: &Node) -> bool {
+fn pure(ctx: &Ctx<'_>, cte_names: &[&str], node: &Option<Node>) -> bool {
     if has_volatile(ctx, node) {
         return false;
     }
-    let Some(inner) = node.node.as_ref() else {
+    let Some(inner) = node.as_ref() else {
         return true;
     };
     inner.nodes().iter().all(|(n, _)| match n {
@@ -789,18 +782,18 @@ fn sublink_form(
     text: &Text<'_>,
     cte_names: &[&str],
     unnamed: &[&ResTarget],
-    e: &protobuf::AExpr,
+    e: &ast::AExpr,
     scope: &FromScope<'_>,
     in_where: bool,
 ) -> Option<Vec<Edit>> {
     let cmp = comparison(ctx, text, e)?;
-    let Some(node::Node::SubLink(sub)) = cmp.count.node.as_ref() else {
+    let Some(ast::Node::SubLink(sub)) = cmp.count.as_ref() else {
         return None;
     };
-    if sub.sub_link_type != SubLinkType::ExprSublink as i32 || sub.testexpr.is_some() {
+    if sub.sub_link_type != SubLinkType::ExprSublink || sub.testexpr.is_some() {
         return None;
     }
-    let Some(node::Node::SelectStmt(select)) = sub.subselect.as_deref()?.node.as_ref() else {
+    let Some(ast::Node::SelectStmt(select)) = sub.subselect.as_ref() else {
         return None;
     };
     if !one_row_aggregate(select) {
@@ -809,13 +802,13 @@ fn sublink_form(
     let [target] = select.target_list.as_slice() else {
         return None;
     };
-    let Some(node::Node::ResTarget(target)) = target.node.as_ref() else {
+    let Some(ast::Node::ResTarget(target)) = target.as_ref() else {
         return None;
     };
     if !target.indirection.is_empty() {
         return None;
     }
-    let call = plain_count(ctx, text, select, target.val.as_deref()?)?;
+    let call = plain_count(ctx, text, select, &target.val)?;
     // The planner may pull `EXISTS` up into a semi- or anti-join and run
     // the subquery's conditions over rows the correlated count never
     // reached (`1 / s.z > 0` on every row of `s`, not just those with
@@ -907,12 +900,12 @@ fn sublink_form(
         if site >= end {
             continue;
         }
-        let val = rt.val.as_deref()?;
+        let val = rt.val.as_ref()?;
         // A `*` FigureColname would name after a column of what it expands
         // to: not a name this level alone tells.
-        if val.node.as_ref()?.nodes().iter().any(|(n, _)| {
+        if val.nodes().iter().any(|(n, _)| {
             matches!(n, NodeRef::ColumnRef(c)
-                if c.fields.iter().any(|f| matches!(f.node, Some(node::Node::AStar(_)))))
+                if c.fields.iter().any(|f| matches!(f, Some(ast::Node::AStar(_)))))
         }) {
             return None;
         }
@@ -958,7 +951,7 @@ fn named_as_before(sql: &str, edits: &[Edit], names: &[(usize, String)]) -> bool
         return false;
     };
     let targets: Vec<(i32, &str)> = tree
-        .protobuf
+        .tree
         .nodes()
         .into_iter()
         .filter_map(|(n, _)| match n {
@@ -980,10 +973,10 @@ fn top_level_form(
     ctx: &Ctx<'_>,
     text: &Text<'_>,
     cte_names: &[&str],
-    stmt: &protobuf::RawStmt,
+    stmt: &ast::RawStmt,
 ) -> Option<Vec<Edit>> {
-    let stmt_node = stmt.stmt.as_deref()?;
-    let Some(node::Node::SelectStmt(select)) = stmt_node.node.as_ref() else {
+    let stmt_node = &stmt.stmt;
+    let Some(ast::Node::SelectStmt(select)) = stmt_node.as_ref() else {
         return None;
     };
     if !one_row_aggregate(select) || !single_table(select) {
@@ -992,10 +985,10 @@ fn top_level_form(
     let [target] = select.target_list.as_slice() else {
         return None;
     };
-    let Some(node::Node::ResTarget(target)) = target.node.as_ref() else {
+    let Some(ast::Node::ResTarget(target)) = target.as_ref() else {
         return None;
     };
-    let Some(node::Node::AExpr(e)) = target.val.as_deref()?.node.as_ref() else {
+    let Some(ast::Node::AExpr(e)) = target.val.as_ref() else {
         return None;
     };
     let cmp = comparison(ctx, text, e)?;
@@ -1065,9 +1058,7 @@ fn top_level_form(
 fn single_table(select: &SelectStmt) -> bool {
     matches!(
         select.from_clause.as_slice(),
-        [Node {
-            node: Some(node::Node::RangeVar(_))
-        }]
+        [Some(ast::Node::RangeVar(_))]
     )
 }
 
@@ -1079,12 +1070,12 @@ fn single_table(select: &SelectStmt) -> bool {
 /// index per row (1.0 ms → 14.8 ms for 20 rows of `t` over a 200k-row `u`).
 fn uncorrelated(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     let scope = FromScope::of_select(ctx, select, None);
-    [select.where_clause.as_deref(), select.target_list.first()]
+    [Some(&select.where_clause), select.target_list.first()]
         .into_iter()
         .flatten()
         .chain(select.from_clause.iter())
         .all(|n| {
-            n.node.as_ref().is_none_or(|n| {
+            n.as_ref().is_none_or(|n| {
                 n.nodes().iter().all(|(n, _)| match n {
                     NodeRef::ColumnRef(c) => scope.resolve(ctx, c).is_some(),
                     NodeRef::SubLink(_) => false,
@@ -1109,18 +1100,16 @@ fn in_top_level_where(ctx: &Ctx<'_>, location: i32) -> bool {
     let [stmt] = ctx.tree.stmts.as_slice() else {
         return false;
     };
-    let where_clause = match stmt.stmt.as_deref().and_then(|n| n.node.as_ref()) {
-        Some(node::Node::SelectStmt(s)) => s.where_clause.as_deref(),
-        Some(node::Node::UpdateStmt(u)) => u.where_clause.as_deref(),
-        Some(node::Node::DeleteStmt(d)) => d.where_clause.as_deref(),
+    let where_clause = match stmt.stmt.as_ref() {
+        Some(ast::Node::SelectStmt(s)) => s.where_clause.as_ref(),
+        Some(ast::Node::UpdateStmt(u)) => u.where_clause.as_ref(),
+        Some(ast::Node::DeleteStmt(d)) => d.where_clause.as_ref(),
         _ => None,
     };
-    where_clause
-        .and_then(|w| w.node.as_ref())
-        .is_some_and(|w| reaches(w.to_ref(), location))
+    where_clause.is_some_and(|w| reaches(w.to_ref(), location))
 }
 
 /// A DML statement's RETURNING entries.
-fn returning(clause: Option<&protobuf::ReturningClause>) -> Vec<&Node> {
+fn returning(clause: Option<&ast::ReturningClause>) -> Vec<&Option<Node>> {
     clause.map_or_else(Vec::new, |c| c.exprs.iter().collect())
 }

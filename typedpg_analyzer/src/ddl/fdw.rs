@@ -3,9 +3,9 @@
 //! IMPORT FOREIGN SCHEMA name a server that must exist, and PG keeps the
 //! names unique and the dependencies between them.
 
-use typedpg_pg_query::protobuf::{
-    CreateFdwStmt, CreateForeignServerStmt, CreateUserMappingStmt, DropUserMappingStmt,
-    ImportForeignSchemaStmt, RoleSpec, RoleSpecType, node,
+use typedpg_pg_query::ast::{
+    self, CreateFdwStmt, CreateForeignServerStmt, CreateUserMappingStmt, DropUserMappingStmt,
+    ImportForeignSchemaStmt, RoleSpec, RoleSpecType,
 };
 
 use super::DdlError;
@@ -136,13 +136,13 @@ pub(crate) fn check_fdw(interp: &PgCatalog, name: &str) -> Result<(), DdlError> 
 /// lookup_fdw_validator_func).
 fn check_functions(
     interp: &PgCatalog,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
     for opt in options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
-        let Some(node::Node::List(l)) = de.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        let Some(ast::Node::List(l)) = de.arg.as_ref() else {
             continue;
         };
         let parts: Vec<&str> = l.items.iter().filter_map(node_string).collect();
@@ -194,9 +194,9 @@ fn check_functions(
 pub(crate) fn apply_generic_options(
     interp: &mut PgCatalog,
     owner: OptionsOwner,
-    options: &[typedpg_pg_query::protobuf::Node],
+    options: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<(), DdlError> {
-    use typedpg_pg_query::protobuf::DefElemAction;
+    use typedpg_pg_query::ast::DefElemAction;
     let mut result = interp
         .foreign_data
         .options
@@ -204,17 +204,17 @@ pub(crate) fn apply_generic_options(
         .cloned()
         .unwrap_or_default();
     for opt in options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         let name = &de.defname;
         let found = result.iter().position(|n| n == name);
-        match (DefElemAction::try_from(de.defaction), found) {
-            (Ok(DefElemAction::DefelemDrop), Some(i)) => {
+        match (de.defaction, found) {
+            (DefElemAction::DefelemDrop, Some(i)) => {
                 result.remove(i);
             }
-            (Ok(DefElemAction::DefelemSet), Some(_)) => {}
-            (Ok(DefElemAction::DefelemDrop | DefElemAction::DefelemSet), None) => {
+            (DefElemAction::DefelemSet, Some(_)) => {}
+            (DefElemAction::DefelemDrop | DefElemAction::DefelemSet, None) => {
                 return Err(DdlError::TypeNotFound(format!(
                     "option \"{name}\" not found"
                 )));
@@ -255,7 +255,7 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
 
 pub fn alter_fdw(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterFdwStmt,
+    stmt: &typedpg_pg_query::ast::AlterFdwStmt,
 ) -> Result<(), DdlError> {
     check_fdw(interp, &stmt.fdwname)?;
     check_functions(interp, &stmt.func_options)?;
@@ -299,7 +299,7 @@ pub fn create_server(
 
 pub fn alter_server(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterForeignServerStmt,
+    stmt: &typedpg_pg_query::ast::AlterForeignServerStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)?;
     apply_generic_options(
@@ -311,11 +311,9 @@ pub fn alter_server(
 
 /// The role a user mapping is for, as PG names it in messages.
 fn role_name(role: Option<&RoleSpec>) -> String {
-    match role.map(|r| RoleSpecType::try_from(r.roletype)) {
-        Some(Ok(RoleSpecType::RolespecPublic)) | None => "public".to_owned(),
-        Some(Ok(RoleSpecType::RolespecCstring)) => {
-            role.map(|r| r.rolename.clone()).unwrap_or_default()
-        }
+    match role.map(|r| r.roletype) {
+        Some(RoleSpecType::RolespecPublic) | None => "public".to_owned(),
+        Some(RoleSpecType::RolespecCstring) => role.map(|r| r.rolename.clone()).unwrap_or_default(),
         Some(_) => "current_user".to_owned(),
     }
 }
@@ -325,7 +323,7 @@ pub fn create_user_mapping(
     stmt: &CreateUserMappingStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)?;
-    let user = role_name(stmt.user.as_ref());
+    let user = role_name(stmt.user.as_deref());
     let key = (user.clone(), stmt.servername.clone());
     if interp.foreign_data.user_mappings.contains(&key) {
         if stmt.if_not_exists {
@@ -347,10 +345,10 @@ pub fn create_user_mapping(
 
 pub fn alter_user_mapping(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterUserMappingStmt,
+    stmt: &typedpg_pg_query::ast::AlterUserMappingStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)?;
-    let user = role_name(stmt.user.as_ref());
+    let user = role_name(stmt.user.as_deref());
     if !interp
         .foreign_data
         .user_mappings
@@ -378,7 +376,7 @@ pub fn drop_user_mapping(
         }
         return Err(server_missing(&stmt.servername));
     }
-    let user = role_name(stmt.user.as_ref());
+    let user = role_name(stmt.user.as_deref());
     let key = (user.clone(), stmt.servername.clone());
     let before = interp.foreign_data.user_mappings.len();
     interp.foreign_data.user_mappings.retain(|m| *m != key);
@@ -416,7 +414,7 @@ pub fn import_foreign_schema(
 pub(crate) fn drop_foreign_object(
     interp: &mut PgCatalog,
     wrapper: bool,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
@@ -516,14 +514,9 @@ pub(crate) fn drop_servers(
 pub(crate) fn rename_foreign_object(
     interp: &mut PgCatalog,
     wrapper: bool,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = stmt
-        .object
-        .as_deref()
-        .and_then(node_string)
-        .map(str::to_owned)
-    else {
+    let Some(old) = node_string(&stmt.object).map(str::to_owned) else {
         return Ok(());
     };
     let new = stmt.newname.clone();

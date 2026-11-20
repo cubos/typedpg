@@ -3,8 +3,9 @@
 //! named by [`PG_VERSION`].
 //!
 //! - [`parse`] / [`parse_type_name`] / [`scan`] call into the C parser;
-//! - [`protobuf`] holds the AST types, generated from PostgreSQL's headers
-//!   (the name is historical: they are plain Rust records, not protobuf);
+//! - [`ast`] holds the AST types, generated from PostgreSQL's headers: a
+//!   struct per node type and [`ast::Node`], the enum over all of them, each
+//!   kind in a [`NodeBox`];
 //! - [`NodeRef`] / [`NodeMut`] view a node by kind, and `nodes()` /
 //!   `nodes_mut()` list a tree's nodes.
 //!
@@ -17,13 +18,14 @@
 //! their types, schemas and relations against a [`Catalog`] instead of only
 //! the built-in `pg_catalog` rows.
 
+#[allow(clippy::all, missing_docs)]
+pub mod ast;
 mod bindings;
 mod catalog;
 mod convert;
 mod equal;
 mod node;
-#[allow(clippy::all, missing_docs)]
-pub mod protobuf;
+mod node_box;
 mod stack;
 
 use std::collections::VecDeque;
@@ -34,8 +36,7 @@ use catalog::CatalogFns;
 pub use catalog::{Catalog, CatalogAttribute, CatalogType};
 pub use equal::Equal;
 pub use node::{NodeMut, NodeRef};
-/// The `oneof` of every node kind — what [`protobuf::Node::node`] holds.
-pub use protobuf::node::Node as NodeEnum;
+pub use node_box::NodeBox;
 
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
 
@@ -75,7 +76,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseResult {
     /// The parse tree.
-    pub protobuf: protobuf::ParseResult,
+    pub tree: ast::ParseResult,
     /// Whatever the parser wrote to stderr (warnings).
     pub stderr: String,
 }
@@ -222,7 +223,7 @@ fn parse_with_options(sql: &str, mode: c_int) -> Result<ParseResult> {
                 Err(stack_depth_error())
             } else {
                 Ok(ParseResult {
-                    protobuf: protobuf::ParseResult {
+                    tree: ast::ParseResult {
                         version: PG_VERSION_NUM,
                         stmts,
                     },
@@ -238,7 +239,7 @@ fn parse_with_options(sql: &str, mode: c_int) -> Result<ParseResult> {
 }
 
 /// Split `sql` into PostgreSQL's lexical tokens.
-pub fn scan(sql: &str) -> Result<protobuf::ScanResult> {
+pub fn scan(sql: &str) -> Result<ast::ScanResult> {
     let input = CString::new(sql)?;
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stack::with_stack(|| {
@@ -247,19 +248,24 @@ pub fn scan(sql: &str) -> Result<protobuf::ScanResult> {
             let raw = unsafe {
                 std::slice::from_raw_parts(result.tokens, result.ntokens.max(0) as usize)
             };
-            let tokens = raw
-                .iter()
-                .map(|t| protobuf::ScanToken {
-                    start: t.start,
-                    end: t.end,
-                    token: t.token,
-                    keyword_kind: t.keyword_kind,
+            raw.iter()
+                .map(|t| {
+                    Ok(ast::ScanToken {
+                        start: t.start,
+                        end: t.end,
+                        token: convert::token(t.token).ok_or_else(|| {
+                            Error::Scan(format!("unknown token number {}", t.token))
+                        })?,
+                        keyword_kind: convert::keyword_kind(t.keyword_kind).ok_or_else(|| {
+                            Error::Scan(format!("unknown keyword kind {}", t.keyword_kind))
+                        })?,
+                    })
                 })
-                .collect();
-            Ok(protobuf::ScanResult {
-                version: PG_VERSION_NUM,
-                tokens: with_comments(sql, tokens),
-            })
+                .collect::<Result<Vec<_>>>()
+                .map(|tokens| ast::ScanResult {
+                    version: PG_VERSION_NUM,
+                    tokens: with_comments(sql, tokens),
+                })
         } else {
             Err(Error::Scan(unsafe { take_string((*result.error).message) }))
         };
@@ -274,18 +280,18 @@ pub fn scan(sql: &str) -> Result<protobuf::ScanResult> {
 /// splitting a query must know where comments are). Rebuild them from the
 /// text between the tokens: `--` up to but excluding the newline, and
 /// `/* … */` with its nesting.
-fn with_comments(sql: &str, tokens: Vec<protobuf::ScanToken>) -> Vec<protobuf::ScanToken> {
-    fn comment(token: protobuf::Token, start: usize, end: usize) -> protobuf::ScanToken {
-        protobuf::ScanToken {
+fn with_comments(sql: &str, tokens: Vec<ast::ScanToken>) -> Vec<ast::ScanToken> {
+    fn comment(token: ast::Token, start: usize, end: usize) -> ast::ScanToken {
+        ast::ScanToken {
             start: i32::try_from(start).unwrap_or(i32::MAX),
             end: i32::try_from(end).unwrap_or(i32::MAX),
-            token: token as i32,
-            keyword_kind: protobuf::KeywordKind::NoKeyword as i32,
+            token,
+            keyword_kind: ast::KeywordKind::NoKeyword,
         }
     }
 
     /// Push the comments of `text` (which starts at `base` in the SQL).
-    fn push_comments(text: &str, base: usize, out: &mut Vec<protobuf::ScanToken>) {
+    fn push_comments(text: &str, base: usize, out: &mut Vec<ast::ScanToken>) {
         let bytes = text.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -294,7 +300,7 @@ fn with_comments(sql: &str, tokens: Vec<protobuf::ScanToken>) -> Vec<protobuf::S
                 while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
                     i += 1;
                 }
-                out.push(comment(protobuf::Token::SqlComment, base + start, base + i));
+                out.push(comment(ast::Token::SqlComment, base + start, base + i));
             } else if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
                 let start = i;
                 i += 2;
@@ -310,7 +316,7 @@ fn with_comments(sql: &str, tokens: Vec<protobuf::ScanToken>) -> Vec<protobuf::S
                         i += 1;
                     }
                 }
-                out.push(comment(protobuf::Token::CComment, base + start, base + i));
+                out.push(comment(ast::Token::CComment, base + start, base + i));
             } else {
                 i += 1;
             }
@@ -391,7 +397,7 @@ fn walk(roots: Vec<NodeRef<'_>>) -> Vec<(NodeRef<'_>, usize)> {
 /// [`walk`] over raw pointers.
 ///
 /// # Safety
-/// See [`protobuf::ParseResult::nodes_mut`].
+/// See [`ast::ParseResult::nodes_mut`].
 unsafe fn walk_mut(roots: Vec<NodeMut>) -> Vec<(NodeMut, usize)> {
     let mut queue: VecDeque<(NodeMut, usize)> = roots.into_iter().map(|n| (n, 0)).collect();
     let mut out = Vec::new();
@@ -402,14 +408,14 @@ unsafe fn walk_mut(roots: Vec<NodeMut>) -> Vec<(NodeMut, usize)> {
     out
 }
 
-impl protobuf::ParseResult {
+impl ast::ParseResult {
     /// Every node of every statement, breadth-first, with its depth.
     pub fn nodes(&self) -> Vec<(NodeRef<'_>, usize)> {
         walk(
             self.stmts
                 .iter()
-                .filter_map(|s| s.stmt.as_ref()?.node.as_ref())
-                .map(NodeEnum::to_ref)
+                .filter_map(|s| s.stmt.as_ref())
+                .map(ast::Node::to_ref)
                 .collect(),
         )
     }
@@ -425,8 +431,8 @@ impl protobuf::ParseResult {
         let roots = self
             .stmts
             .iter_mut()
-            .filter_map(|s| s.stmt.as_mut()?.node.as_mut())
-            .map(NodeEnum::to_mut)
+            .filter_map(|s| s.stmt.as_mut())
+            .map(ast::Node::to_mut)
             .collect();
         unsafe { walk_mut(roots) }
     }
@@ -443,29 +449,25 @@ impl<'a> NodeRef<'a> {
     }
 }
 
-impl NodeEnum {
+impl ast::Node {
     /// This node and every node below it, breadth-first, with its depth
     /// (this node at 0).
     pub fn nodes(&self) -> Vec<(NodeRef<'_>, usize)> {
         walk(vec![self.to_ref()])
     }
-}
 
-impl protobuf::Node {
     /// Rewrite this tree bottom-up: `f` sees each node once the nodes below
     /// it are rewritten, and may replace it with a node of any kind. The
     /// subtree below a node `descend` refuses is left as it is.
     pub fn rewrite(
         &mut self,
-        descend: &mut dyn FnMut(&protobuf::Node) -> bool,
-        f: &mut dyn FnMut(&mut protobuf::Node),
+        descend: &mut dyn FnMut(&ast::Node) -> bool,
+        f: &mut dyn FnMut(&mut ast::Node),
     ) {
-        if descend(self)
-            && let Some(e) = &mut self.node
-        {
-            // SAFETY: `e` is borrowed mutably for the whole walk, and the
+        if descend(self) {
+            // SAFETY: `self` is borrowed mutably for the whole walk, and the
             // slots handed out are disjoint fields below it.
-            unsafe { node::child_slots_mut(e.to_mut(), &mut |slot| slot.rewrite(descend, f)) };
+            unsafe { node::child_slots_mut(self.to_mut(), &mut |slot| slot.rewrite(descend, f)) };
         }
         f(self);
     }

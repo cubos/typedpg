@@ -17,7 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use typedpg_pg_query::Equal;
-use typedpg_pg_query::protobuf::{self, GroupingSetKind, JoinType, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast::{self, GroupingSetKind, JoinType};
 
 use crate::error::AnalyzeError;
 use crate::expr;
@@ -64,7 +65,7 @@ type GroupItem = (Option<usize>, (String, String));
 /// projection references them by the inner column anyway, and that column
 /// might or might not be in scope.
 pub(crate) fn expand_grouping_sets(
-    group_clause: &[protobuf::Node],
+    group_clause: &[Option<ast::Node>],
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
@@ -170,13 +171,13 @@ const MAX_GROUPING_SETS: u64 = 4096;
 /// The number of grouping sets `group_clause` expands to — the product of
 /// its entries' alternatives, as PG's expand_grouping_sets counts them
 /// (saturating).
-fn grouping_set_count(group_clause: &[protobuf::Node]) -> u64 {
-    fn alternatives(node: &protobuf::Node) -> u64 {
-        let Some(node::Node::GroupingSet(gs)) = node.node.as_ref() else {
+fn grouping_set_count(group_clause: &[Option<ast::Node>]) -> u64 {
+    fn alternatives(node: &Option<ast::Node>) -> u64 {
+        let Some(ast::Node::GroupingSet(gs)) = node.as_ref() else {
             return 1;
         };
         let n = gs.content.len() as u64;
-        match GroupingSetKind::try_from(gs.kind).unwrap_or(GroupingSetKind::Undefined) {
+        match gs.kind {
             GroupingSetKind::GroupingSetRollup => n + 1,
             GroupingSetKind::GroupingSetCube => 1u64.checked_shl(n as u32).unwrap_or(u64::MAX),
             GroupingSetKind::GroupingSetSets => gs
@@ -194,14 +195,14 @@ fn grouping_set_count(group_clause: &[protobuf::Node]) -> u64 {
 
 /// Alternatives contributed by one node in the top-level `group_clause`.
 fn alternatives_for(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
     saw_grouping_set: &mut bool,
 ) -> Vec<HashSet<GroupItem>> {
-    match node.node.as_ref() {
-        Some(node::Node::GroupingSet(gs)) => {
+    match node.as_ref() {
+        Some(ast::Node::GroupingSet(gs)) => {
             *saw_grouping_set = true;
             alternatives_for_grouping_set(gs, scope, targets, snapshot, saw_grouping_set)
         }
@@ -210,13 +211,13 @@ fn alternatives_for(
 }
 
 fn alternatives_for_grouping_set(
-    gs: &protobuf::GroupingSet,
+    gs: &ast::GroupingSet,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
     saw_grouping_set: &mut bool,
 ) -> Vec<HashSet<GroupItem>> {
-    let kind = GroupingSetKind::try_from(gs.kind).unwrap_or(GroupingSetKind::Undefined);
+    let kind = gs.kind;
     match kind {
         GroupingSetKind::GroupingSetEmpty => vec![HashSet::new()],
         GroupingSetKind::GroupingSetSimple => {
@@ -284,7 +285,6 @@ fn alternatives_for_grouping_set(
                 alts
             }
         }
-        GroupingSetKind::Undefined => vec![HashSet::new()],
     }
 }
 
@@ -293,11 +293,9 @@ fn alternatives_for_grouping_set(
 /// expressions (`GROUP BY (a, b)` is `GROUP BY a, b`; `ROLLUP((a, b))`
 /// rolls the pair up as one unit). An explicit `ROW(a, b)` stays one
 /// composite expression.
-pub(crate) fn implicit_row_items(node: &protobuf::Node) -> Option<&Vec<protobuf::Node>> {
-    match node.node.as_ref() {
-        Some(node::Node::RowExpr(r))
-            if r.row_format == protobuf::CoercionForm::CoerceImplicitCast as i32 =>
-        {
+pub(crate) fn implicit_row_items(node: &Option<ast::Node>) -> Option<&Vec<Option<ast::Node>>> {
+    match node.as_ref() {
+        Some(ast::Node::RowExpr(r)) if r.row_format == ast::CoercionForm::CoerceImplicitCast => {
             Some(&r.args)
         }
         _ => None,
@@ -310,7 +308,7 @@ pub(crate) fn implicit_row_items(node: &protobuf::Node) -> Option<&Vec<protobuf:
 /// ([`group_leaf`]) — or an empty set otherwise (does not drive
 /// nullability promotion).
 fn singleton_set(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
@@ -350,24 +348,24 @@ enum GroupLeaf {
 /// the first target-list entry equal to it. Returns what the leaf denotes
 /// and the position of the entry it is, if any.
 fn group_leaf(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
 ) -> (GroupLeaf, Option<usize>) {
-    let target_column = |rt: &protobuf::ResTarget| match rt.val.as_deref() {
-        Some(v) => match resolve_group_column(v, scope, snapshot) {
+    let target_column = |rt: &ast::ResTarget| match rt.val.as_ref() {
+        Some(v) => match resolve_group_column(Some(v), scope, snapshot) {
             Some(key) => GroupLeaf::Column(key),
-            None => GroupLeaf::Expr(expr_key(v, scope, snapshot)),
+            None => GroupLeaf::Expr(expr_key(&rt.val, scope, snapshot)),
         },
         None => GroupLeaf::Other,
     };
     // findTargetlistEntrySQL99: the first entry equal to the expression.
-    let equal_target = |node: &protobuf::Node, column: Option<&ColKey>| {
+    let equal_target = |node: &Option<ast::Node>, column: Option<&ColKey>| {
         targets.iter().position(|t| match t {
-            ExpandedTarget::Expr(rt) => rt.val.as_deref().is_some_and(|v| match column {
-                Some(key) => resolve_group_column(v, scope, snapshot).as_ref() == Some(key),
-                None => same_level_exprs_equal(v, node, scope, snapshot),
+            ExpandedTarget::Expr(rt) => rt.val.as_ref().is_some_and(|v| match column {
+                Some(key) => resolve_group_column(Some(v), scope, snapshot).as_ref() == Some(key),
+                None => same_level_exprs_equal(&rt.val, node, scope, snapshot),
             }),
             ExpandedTarget::StarColumn {
                 column: Some((alias, col)),
@@ -376,19 +374,20 @@ fn group_leaf(
             ExpandedTarget::StarColumn { column: None, .. } => false,
         })
     };
-    let expression = |node: &protobuf::Node| match resolve_group_column(node, scope, snapshot) {
-        Some(key) => {
-            let target = equal_target(node, Some(&key));
-            (GroupLeaf::Column(key), target)
-        }
-        None => (
-            GroupLeaf::Expr(expr_key(node, scope, snapshot)),
-            equal_target(node, None),
-        ),
-    };
-    match node.node.as_ref() {
-        Some(node::Node::AConst(ac)) => match &ac.val {
-            Some(protobuf::a_const::Val::Ival(i)) => {
+    let expression =
+        |node: &Option<ast::Node>| match resolve_group_column(node.as_ref(), scope, snapshot) {
+            Some(key) => {
+                let target = equal_target(node, Some(&key));
+                (GroupLeaf::Column(key), target)
+            }
+            None => (
+                GroupLeaf::Expr(expr_key(node, scope, snapshot)),
+                equal_target(node, None),
+            ),
+        };
+    match node.as_ref() {
+        Some(ast::Node::AConst(ac)) => match &ac.val {
+            Some(ast::AConstValue::Integer(i)) => {
                 let position = (i.ival as usize).wrapping_sub(1);
                 match targets.get(position) {
                     Some(ExpandedTarget::Expr(rt)) => (target_column(rt), Some(position)),
@@ -404,13 +403,13 @@ fn group_leaf(
             }
             _ => (GroupLeaf::Other, None),
         },
-        Some(node::Node::ColumnRef(cr)) => {
-            if resolve_group_column(node, scope, snapshot).is_some() {
+        Some(ast::Node::ColumnRef(cr)) => {
+            if resolve_group_column(node.as_ref(), scope, snapshot).is_some() {
                 return expression(node);
             }
             let alias = match cr.fields.as_slice() {
-                [f] => match f.node.as_ref() {
-                    Some(node::Node::String(s)) => Some(s.sval.as_str()),
+                [f] => match f.as_ref() {
+                    Some(ast::Node::String(s)) => Some(s.sval.as_str()),
                     _ => None,
                 },
                 _ => None,
@@ -444,13 +443,12 @@ pub(crate) const EXPR_KEY: &str = "\u{0}expr";
 /// as the columns they are ([`whole_row_fields`]: `(t).g` is `t.g`) and its
 /// type names resolved as the GROUP BY check compares them
 /// ([`resolve_type_names`]: `CAST(g AS bigint)` is `g::int8`).
-pub(crate) fn expr_key(node: &protobuf::Node, scope: &Scope, snapshot: &PgCatalog) -> String {
-    let node = strip_noop_casts(&own_whole_row_fields(node, scope), scope, snapshot, &|_| {
-        true
-    });
-    crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(&resolve_type_names(
-        &node, snapshot,
-    )))
+pub(crate) fn expr_key(node: &Option<ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> String {
+    let node = own_whole_row_fields(node.as_ref(), scope);
+    let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
+    crate::resolve::node_fingerprint(&crate::resolve::predtest_unqualify(
+        resolve_type_names(&node, snapshot).as_ref(),
+    ))
 }
 
 /// [`crate::resolve::node_fingerprint`] of `node` with its casts that are
@@ -458,14 +456,9 @@ pub(crate) fn expr_key(node: &protobuf::Node, scope: &Scope, snapshot: &PgCatalo
 /// selections written as columns ([`whole_row_fields`]) and its type names
 /// resolved ([`resolve_type_names`]) — the same for two expressions PG's
 /// `equal()` finds equal once transformed, up to how columns are spelled.
-pub(crate) fn typed_fingerprint(
-    node: &protobuf::Node,
-    scope: &Scope,
-    snapshot: &PgCatalog,
-) -> String {
-    let node = strip_noop_casts(&own_whole_row_fields(node, scope), scope, snapshot, &|_| {
-        true
-    });
+pub(crate) fn typed_fingerprint(node: &ast::Node, scope: &Scope, snapshot: &PgCatalog) -> String {
+    let node = own_whole_row_fields(Some(node), scope);
+    let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
     crate::resolve::node_fingerprint(&resolve_type_names(&node, snapshot))
 }
 
@@ -475,12 +468,15 @@ pub(crate) fn typed_fingerprint(
 /// and `x::int[]`: the name gives way to the type's OID (with the array
 /// bounds it accounts for; a typmod stays). A name that doesn't resolve
 /// stays as written.
-pub(crate) fn resolve_type_names(node: &protobuf::Node, snapshot: &PgCatalog) -> protobuf::Node {
+pub(crate) fn resolve_type_names(
+    node: &Option<ast::Node>,
+    snapshot: &PgCatalog,
+) -> Option<ast::Node> {
     use typedpg_pg_query::NodeMut;
-    let mut tree = protobuf::ParseResult {
+    let mut tree = ast::ParseResult {
         version: 0,
-        stmts: vec![protobuf::RawStmt {
-            stmt: Some(Box::new(node.clone())),
+        stmts: vec![ast::RawStmt {
+            stmt: node.clone(),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -501,11 +497,7 @@ pub(crate) fn resolve_type_names(node: &protobuf::Node, snapshot: &PgCatalog) ->
             }
         }
     }
-    tree.stmts
-        .pop()
-        .and_then(|s| s.stmt)
-        .map(|b| *b)
-        .unwrap_or_default()
+    tree.stmts.pop().and_then(|s| s.stmt)
 }
 
 /// Resolve a `GROUP BY` entry as a single column against `scope`. Returns the
@@ -514,14 +506,13 @@ pub(crate) fn resolve_type_names(node: &protobuf::Node, snapshot: &PgCatalog) ->
 /// whole row, [`whole_row_fields`]), or `None` for any other shape
 /// (expression, grouping set, select-list alias, …).
 fn resolve_group_column(
-    node: &protobuf::Node,
+    node: Option<&ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> Option<ColKey> {
-    let node = strip_noop_casts(&own_whole_row_fields(node, scope), scope, snapshot, &|_| {
-        true
-    });
-    let node::Node::ColumnRef(cr) = node.node.as_ref()? else {
+    let node = own_whole_row_fields(node, scope);
+    let node = strip_noop_casts(node.as_ref(), scope, snapshot, &|_| true);
+    let ast::Node::ColumnRef(cr) = node.as_ref()? else {
         return None;
     };
     let parts = expr::extract_string_fields(&cr.fields);
@@ -549,26 +540,26 @@ fn resolve_group_column(
 /// references, only those `own` accepts are looked at; subqueries are left
 /// as they are.
 fn strip_noop_casts(
-    node: &protobuf::Node,
+    node: Option<&ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
-    own: &dyn Fn(&protobuf::ColumnRef) -> bool,
-) -> protobuf::Node {
-    let mut out = node.clone();
-    out.rewrite(
-        &mut |n| !matches!(n.node, Some(node::Node::SelectStmt(_))),
-        &mut |n| {
-            if let Some(node::Node::TypeCast(tc)) = n.node.as_mut()
-                && let Some(arg) = tc.arg.as_deref_mut()
+    own: &dyn Fn(&ast::ColumnRef) -> bool,
+) -> Option<ast::Node> {
+    let mut out = node.cloned();
+    if let Some(out) = out.as_mut() {
+        out.rewrite(&mut |n| !matches!(n, ast::Node::SelectStmt(_)), &mut |n| {
+            if let ast::Node::TypeCast(tc) = n
+                && tc.arg.is_some()
                 && tc
                     .type_name
                     .as_ref()
-                    .is_some_and(|tn| is_noop_cast(arg, tn, scope, snapshot, own))
+                    .is_some_and(|tn| is_noop_cast(&tc.arg, tn, scope, snapshot, own))
+                && let Some(arg) = tc.arg.take()
             {
-                *n = std::mem::take(arg);
+                *n = arg;
             }
-        },
-    );
+        });
+    }
     out
 }
 
@@ -578,16 +569,16 @@ fn strip_noop_casts(
 /// a subquery or a column `own` refuses isn't typed here: neither is
 /// reported.
 fn is_noop_cast(
-    arg: &protobuf::Node,
-    tn: &protobuf::TypeName,
+    arg: &Option<ast::Node>,
+    tn: &ast::TypeName,
     scope: &Scope,
     snapshot: &PgCatalog,
-    own: &dyn Fn(&protobuf::ColumnRef) -> bool,
+    own: &dyn Fn(&ast::ColumnRef) -> bool,
 ) -> bool {
     use typedpg_pg_query::NodeRef;
-    let (type_oid, typmod) = match arg.node.as_ref() {
-        None | Some(node::Node::AConst(_) | node::Node::ParamRef(_)) => return false,
-        Some(node::Node::ColumnRef(cr)) => {
+    let (type_oid, typmod) = match arg.as_ref() {
+        None | Some(ast::Node::AConst(_) | ast::Node::ParamRef(_)) => return false,
+        Some(ast::Node::ColumnRef(cr)) => {
             if !own(cr) {
                 return false;
             }
@@ -789,7 +780,7 @@ impl Namespace {
 /// when the sides share a name) and aliased joins (whose inner entries are
 /// gone) make that correspondence unsure: no flattening then.
 fn join_flattening(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     sources: &[TableSource],
     shadowed: &[TableSource],
 ) -> HashMap<ColKey, Flat> {
@@ -814,29 +805,27 @@ fn join_flattening(
 
     /// How many scope entries a FROM item yields (an aliased join is one);
     /// `None` when unsure.
-    fn count(n: &protobuf::Node) -> Option<usize> {
-        match n.node.as_ref()? {
-            node::Node::JoinExpr(j) if j.alias.is_some() => Some(1),
-            node::Node::JoinExpr(j) => Some(
-                count(j.larg.as_deref()?)?
-                    + count(j.rarg.as_deref()?)?
-                    + usize::from(!j.using_clause.is_empty()),
-            ),
+    fn count(n: &Option<ast::Node>) -> Option<usize> {
+        match n.as_ref()? {
+            ast::Node::JoinExpr(j) if j.alias.is_some() => Some(1),
+            ast::Node::JoinExpr(j) => {
+                Some(count(&j.larg)? + count(&j.rarg)? + usize::from(!j.using_clause.is_empty()))
+            }
             _ => Some(1),
         }
     }
 
     /// The name PG gives a FROM item's entry.
-    fn entry_name(n: &protobuf::Node) -> Option<String> {
-        match n.node.as_ref()? {
-            node::Node::RangeVar(rv) => Some(
+    fn entry_name(n: &Option<ast::Node>) -> Option<String> {
+        match n.as_ref()? {
+            ast::Node::RangeVar(rv) => Some(
                 rv.alias
                     .as_ref()
                     .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone()),
             ),
-            node::Node::RangeSubselect(rs) => rs.alias.as_ref().map(|a| a.aliasname.clone()),
-            node::Node::RangeFunction(rf) => rf.alias.as_ref().map(|a| a.aliasname.clone()),
-            node::Node::RangeTableSample(ts) => entry_name(ts.relation.as_deref()?),
+            ast::Node::RangeSubselect(rs) => rs.alias.as_ref().map(|a| a.aliasname.clone()),
+            ast::Node::RangeFunction(rf) => rf.alias.as_ref().map(|a| a.aliasname.clone()),
+            ast::Node::RangeTableSample(ts) => entry_name(&ts.relation),
             _ => None,
         }
     }
@@ -844,7 +833,11 @@ fn join_flattening(
     /// The output columns of FROM item `n` (PG's join output order: the
     /// USING columns, then the left side's others, then the right side's),
     /// recording what the USING and aliased-join columns stand for.
-    fn item<'a>(n: &protobuf::Node, place: Place<'a>, cx: &mut Ctx<'a>) -> Option<Vec<OutColumn>> {
+    fn item<'a>(
+        n: &Option<ast::Node>,
+        place: Place<'a>,
+        cx: &mut Ctx<'a>,
+    ) -> Option<Vec<OutColumn>> {
         let hidden = |shadowed: &'a [TableSource], join: &str, name: &str| {
             shadowed.iter().find(|s| {
                 s.hidden
@@ -852,7 +845,7 @@ fn join_flattening(
                     .is_some_and(|h| h.join == join && h.name == name)
             })
         };
-        let node::Node::JoinExpr(j) = n.node.as_ref()? else {
+        let ast::Node::JoinExpr(j) = n.as_ref()? else {
             let source = match place {
                 Place::Span(start) => cx.sources.get(start)?,
                 Place::Shadowed(join) => hidden(cx.shadowed, join, &entry_name(n)?)?,
@@ -874,7 +867,10 @@ fn join_flattening(
         if j.is_natural {
             return None;
         }
-        let (larg, rarg) = (j.larg.as_deref()?, j.rarg.as_deref()?);
+        if j.larg.is_none() || j.rarg.is_none() {
+            return None;
+        }
+        let (larg, rarg) = (&j.larg, &j.rarg);
         let using = crate::expr::extract_string_fields(&j.using_clause);
         // An aliased join's entries are behind its alias; its own entry is
         // where the join is.
@@ -921,10 +917,10 @@ fn join_flattening(
             };
             // buildMergedJoinVar: an INNER join prefers whichever side
             // needs no coercion.
-            let flat = match JoinType::try_from(j.jointype) {
-                Ok(JoinType::JoinRight) => var(r, rt),
-                Ok(JoinType::JoinFull) => Flat::Coalesce(plain(&l)?, plain(&r)?),
-                Ok(JoinType::JoinInner) if lt != merged_type && rt == merged_type => r,
+            let flat = match j.jointype {
+                JoinType::JoinRight => var(r, rt),
+                JoinType::JoinFull => Flat::Coalesce(plain(&l)?, plain(&r)?),
+                JoinType::JoinInner if lt != merged_type && rt == merged_type => r,
                 _ => var(l, lt),
             };
             if let Some(m) = merged_entry {
@@ -1038,12 +1034,12 @@ impl Chain {
     /// column of the nearest level exposing it (else a whole-row reference
     /// to the nearest entry of that name); a qualified one belongs to the
     /// nearest level with an entry of that name.
-    fn resolve(&self, cr: &protobuf::ColumnRef) -> Option<RefTarget> {
+    fn resolve(&self, cr: &ast::ColumnRef) -> Option<RefTarget> {
         let parts: Vec<Option<&str>> = cr
             .fields
             .iter()
-            .map(|f| match f.node.as_ref() {
-                Some(node::Node::String(s)) => Some(s.sval.as_str()),
+            .map(|f| match f.as_ref() {
+                Some(ast::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             })
             .collect();
@@ -1113,12 +1109,12 @@ impl Chain {
     /// function `f` it calls on the entry's whole row (column notation, as
     /// the expression analysis resolved it) and that whole-row reference
     /// (`t.*`).
-    fn column_notation(&self, cr: &protobuf::ColumnRef) -> Option<(String, protobuf::Node)> {
+    fn column_notation(&self, cr: &ast::ColumnRef) -> Option<(String, ast::Node)> {
         let (last, prefix) = cr.fields.split_last()?;
-        let Some(node::Node::String(f)) = last.node.as_ref() else {
+        let Some(ast::Node::String(f)) = last.as_ref() else {
             return None;
         };
-        let Some(node::Node::String(table)) = prefix.last()?.node.as_ref() else {
+        let Some(ast::Node::String(table)) = prefix.last()?.as_ref() else {
             return None;
         };
         let RefTarget {
@@ -1133,15 +1129,11 @@ impl Chain {
             return None;
         }
         let mut fields = prefix.to_vec();
-        fields.push(protobuf::Node {
-            node: Some(node::Node::AStar(protobuf::AStar {})),
-        });
-        let whole_row = protobuf::Node {
-            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                fields,
-                location: cr.location,
-            })),
-        };
+        fields.push(Some(ast::Node::AStar(NodeBox::new(ast::AStar {}))));
+        let whole_row = ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+            fields,
+            location: cr.location,
+        }));
         Some((f.sval.clone(), whole_row))
     }
 
@@ -1150,12 +1142,12 @@ impl Chain {
     /// `t.f` (any further indirection kept on it): ParseComplexProjection
     /// makes it that column's Var (scanNSItemForColumn), so both spellings
     /// are PG-`equal()` once transformed.
-    fn whole_row_field(&self, ind: &protobuf::AIndirection) -> Option<protobuf::Node> {
+    fn whole_row_field(&self, ind: &ast::AIndirection) -> Option<ast::Node> {
         let (first, rest) = ind.indirection.split_first()?;
-        let Some(node::Node::String(field)) = first.node.as_ref() else {
+        let Some(ast::Node::String(field)) = first.as_ref() else {
             return None;
         };
-        let Some(node::Node::ColumnRef(cr)) = ind.arg.as_deref()?.node.as_ref() else {
+        let Some(ast::Node::ColumnRef(cr)) = ind.arg.as_ref() else {
             return None;
         };
         let RefTarget {
@@ -1168,21 +1160,17 @@ impl Chain {
         if !self.namespace(level)?.has_column(&alias, &field.sval) {
             return None;
         }
-        let column = protobuf::Node {
-            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                fields: vec![string_node(&alias), first.clone()],
-                location: cr.location,
-            })),
-        };
+        let column = ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+            fields: vec![Some(string_node(&alias)), first.clone()],
+            location: cr.location,
+        }));
         Some(if rest.is_empty() {
             column
         } else {
-            protobuf::Node {
-                node: Some(node::Node::AIndirection(Box::new(protobuf::AIndirection {
-                    arg: Some(Box::new(column)),
-                    indirection: rest.to_vec(),
-                }))),
-            }
+            ast::Node::AIndirection(NodeBox::new(ast::AIndirection {
+                arg: Some(column),
+                indirection: rest.to_vec(),
+            }))
         })
     }
 
@@ -1214,7 +1202,7 @@ struct Frame {
     /// Arguments of the `GROUPING(…)` calls in sublinks that belong to this
     /// level, canonicalized against it (see [`canonical`]), with their
     /// locations.
-    outer_grouping: Vec<(Vec<protobuf::Node>, i32)>,
+    outer_grouping: Vec<(Vec<Option<ast::Node>>, i32)>,
 }
 
 /// What an analyzed SELECT level exposes to the walks of enclosing levels.
@@ -1268,8 +1256,8 @@ fn expanded_whole_row(location: i32, alias: &str) -> Option<Vec<String>> {
     })
 }
 
-fn level_key(sel: &protobuf::SelectStmt) -> usize {
-    sel as *const protobuf::SelectStmt as usize
+fn level_key(sel: &ast::SelectStmt) -> usize {
+    sel as *const ast::SelectStmt as usize
 }
 
 /// A query level starts (`QueryLevel::enter`).
@@ -1292,7 +1280,7 @@ pub(crate) fn leave_query_level() {
 
 /// The current level is SELECT `sel`, whose FROM clause exposes `sources`.
 pub(crate) fn register_level(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     sources: &[TableSource],
     shadowed: &[TableSource],
 ) {
@@ -1319,17 +1307,13 @@ pub(crate) fn register_level(
 }
 
 /// What the analysis of SELECT `sel` recorded, if it was analyzed.
-pub(crate) fn level_info(sel: &protobuf::SelectStmt) -> Option<LevelInfo> {
+pub(crate) fn level_info(sel: &ast::SelectStmt) -> Option<LevelInfo> {
     LEVELS.with(|l| l.borrow().get(&level_key(sel)).cloned())
 }
 
 /// Record SELECT `sel`'s output column names and which of its columns
 /// have an explicit collation.
-pub(crate) fn set_output_columns(
-    sel: &protobuf::SelectStmt,
-    names: Vec<String>,
-    explicit: Vec<bool>,
-) {
+pub(crate) fn set_output_columns(sel: &ast::SelectStmt, names: Vec<String>, explicit: Vec<bool>) {
     LEVELS.with(|l| {
         if let Some(info) = l.borrow_mut().get_mut(&level_key(sel)) {
             info.output_names = names;
@@ -1411,30 +1395,35 @@ fn current_chain(scope: &Scope) -> Chain {
     })
 }
 
+/// `n` itself when it holds a node: an absent field yields nothing.
+fn present(n: &Option<ast::Node>) -> Option<&Option<ast::Node>> {
+    n.as_ref().map(|_| n)
+}
+
 /// An aggregate, `GROUPING(…)` or window call written at some level.
 enum Call<'a> {
     /// Its aggregated arguments (ORDER BY and FILTER included), which decide
     /// its level, and its direct arguments (an ordered-set aggregate's),
     /// which are evaluated once per group like any grouped expression.
     Aggregate {
-        aggregated: Vec<&'a protobuf::Node>,
-        direct: Vec<&'a protobuf::Node>,
+        aggregated: Vec<&'a Option<ast::Node>>,
+        direct: Vec<&'a Option<ast::Node>>,
         location: i32,
     },
-    Grouping(&'a protobuf::GroupingFunc),
+    Grouping(&'a ast::GroupingFunc),
     Window(i32),
 }
 
-fn call_of<'a>(node: &'a protobuf::Node, snapshot: &PgCatalog) -> Option<Call<'a>> {
-    fn sort_exprs(order: &[protobuf::Node]) -> impl Iterator<Item = &protobuf::Node> {
-        order.iter().filter_map(|o| match o.node.as_ref() {
-            Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+fn call_of<'a>(node: &'a Option<ast::Node>, snapshot: &PgCatalog) -> Option<Call<'a>> {
+    fn sort_exprs(order: &[Option<ast::Node>]) -> impl Iterator<Item = &Option<ast::Node>> {
+        order.iter().filter_map(|o| match o.as_ref() {
+            Some(ast::Node::SortBy(sb)) => present(&sb.node),
             _ => Some(o),
         })
     }
-    match node.node.as_ref()? {
-        node::Node::FuncCall(fc) if fc.over.is_some() => Some(Call::Window(fc.location)),
-        node::Node::FuncCall(fc) if crate::resolve::is_aggregate_call(fc, snapshot) => {
+    match node.as_ref()? {
+        ast::Node::FuncCall(fc) if fc.over.is_some() => Some(Call::Window(fc.location)),
+        ast::Node::FuncCall(fc) if crate::resolve::is_aggregate_call(fc, snapshot) => {
             let (mut aggregated, direct): (Vec<_>, Vec<_>) = if fc.agg_within_group {
                 (
                     sort_exprs(&fc.agg_order).collect(),
@@ -1446,17 +1435,17 @@ fn call_of<'a>(node: &'a protobuf::Node, snapshot: &PgCatalog) -> Option<Call<'a
                     Vec::new(),
                 )
             };
-            aggregated.extend(fc.agg_filter.as_deref());
+            aggregated.extend(present(&fc.agg_filter));
             Some(Call::Aggregate {
                 aggregated,
                 direct,
                 location: fc.location,
             })
         }
-        node::Node::JsonObjectAgg(_) | node::Node::JsonArrayAgg(_) => {
-            let ctor = match node.node.as_ref()? {
-                node::Node::JsonObjectAgg(a) => a.constructor.as_deref(),
-                node::Node::JsonArrayAgg(a) => a.constructor.as_deref(),
+        ast::Node::JsonObjectAgg(_) | ast::Node::JsonArrayAgg(_) => {
+            let ctor = match node.as_ref()? {
+                ast::Node::JsonObjectAgg(a) => a.constructor.as_deref(),
+                ast::Node::JsonArrayAgg(a) => a.constructor.as_deref(),
                 _ => None,
             };
             let location = ctor.map_or(-1, |c| c.location);
@@ -1469,40 +1458,38 @@ fn call_of<'a>(node: &'a protobuf::Node, snapshot: &PgCatalog) -> Option<Call<'a
                 location,
             })
         }
-        node::Node::GroupingFunc(g) => Some(Call::Grouping(g)),
+        ast::Node::GroupingFunc(g) => Some(Call::Grouping(g)),
         _ => None,
     }
 }
 
 /// The PARTITION BY / ORDER BY expressions of a window definition.
-fn window_key_exprs(wd: &protobuf::WindowDef) -> impl Iterator<Item = &protobuf::Node> {
-    wd.partition_clause.iter().chain(
-        wd.order_clause
-            .iter()
-            .filter_map(|o| match o.node.as_ref() {
-                Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
-                _ => None,
-            }),
-    )
+fn window_key_exprs(wd: &ast::WindowDef) -> impl Iterator<Item = &Option<ast::Node>> {
+    wd.partition_clause
+        .iter()
+        .chain(wd.order_clause.iter().filter_map(|o| match o.as_ref() {
+            Some(ast::Node::SortBy(sb)) => present(&sb.node),
+            _ => None,
+        }))
 }
 
 /// The expressions of a window definition, frame offsets included.
-fn window_def_exprs(wd: &protobuf::WindowDef) -> impl Iterator<Item = &protobuf::Node> {
+fn window_def_exprs(wd: &ast::WindowDef) -> impl Iterator<Item = &Option<ast::Node>> {
     window_key_exprs(wd)
-        .chain(wd.start_offset.as_deref())
-        .chain(wd.end_offset.as_deref())
+        .chain(present(&wd.start_offset))
+        .chain(present(&wd.end_offset))
 }
 
 /// The direct sub-expressions of `node` at its own query level — a window
 /// call's window definition included.
-fn level_children(node: &protobuf::Node) -> Vec<&protobuf::Node> {
+fn level_children(node: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
     let mut out = crate::resolve::expr_children(node);
-    let over = match node.node.as_ref() {
-        Some(node::Node::FuncCall(fc)) => fc.over.as_deref(),
-        Some(node::Node::JsonObjectAgg(a)) => {
+    let over = match node.as_ref() {
+        Some(ast::Node::FuncCall(fc)) => fc.over.as_deref(),
+        Some(ast::Node::JsonObjectAgg(a)) => {
             a.constructor.as_deref().and_then(|c| c.over.as_deref())
         }
-        Some(node::Node::JsonArrayAgg(a)) => {
+        Some(ast::Node::JsonArrayAgg(a)) => {
             a.constructor.as_deref().and_then(|c| c.over.as_deref())
         }
         _ => None,
@@ -1514,59 +1501,59 @@ fn level_children(node: &protobuf::Node) -> Vec<&protobuf::Node> {
 /// Every expression SELECT `sel` evaluates at its own level: its clauses,
 /// its FROM items' join conditions and function arguments; not the
 /// subqueries it contains.
-fn select_level_exprs(sel: &protobuf::SelectStmt) -> Vec<&protobuf::Node> {
-    fn from_item<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
-        match n.node.as_ref() {
-            Some(node::Node::JoinExpr(j)) => {
-                for side in [&j.larg, &j.rarg].into_iter().flatten() {
+fn select_level_exprs(sel: &ast::SelectStmt) -> Vec<&Option<ast::Node>> {
+    fn from_item<'a>(n: &'a Option<ast::Node>, out: &mut Vec<&'a Option<ast::Node>>) {
+        match n.as_ref() {
+            Some(ast::Node::JoinExpr(j)) => {
+                for side in [&j.larg, &j.rarg].into_iter().filter_map(present) {
                     from_item(side, out);
                 }
-                out.extend(j.quals.as_deref());
+                out.extend(present(&j.quals));
             }
-            Some(node::Node::RangeFunction(rf)) => {
+            Some(ast::Node::RangeFunction(rf)) => {
                 for f in &rf.functions {
-                    if let Some(node::Node::List(pair)) = f.node.as_ref() {
+                    if let Some(ast::Node::List(pair)) = f.as_ref() {
                         out.extend(pair.items.first());
                     }
                 }
             }
-            Some(node::Node::RangeTableSample(ts)) => {
-                if let Some(r) = ts.relation.as_deref() {
-                    from_item(r, out);
+            Some(ast::Node::RangeTableSample(ts)) => {
+                if ts.relation.is_some() {
+                    from_item(&ts.relation, out);
                 }
                 out.extend(ts.args.iter());
-                out.extend(ts.repeatable.as_deref());
+                out.extend(present(&ts.repeatable));
             }
             _ => {}
         }
     }
-    let mut out: Vec<&protobuf::Node> = Vec::new();
+    let mut out: Vec<&Option<ast::Node>> = Vec::new();
     for t in &sel.target_list {
-        if let Some(node::Node::ResTarget(rt)) = t.node.as_ref() {
-            out.extend(rt.val.as_deref());
+        if let Some(ast::Node::ResTarget(rt)) = t.as_ref() {
+            out.extend(present(&rt.val));
         }
     }
     for f in &sel.from_clause {
         from_item(f, &mut out);
     }
-    out.extend(sel.where_clause.as_deref());
+    out.extend(present(&sel.where_clause));
     out.extend(sel.group_clause.iter());
-    out.extend(sel.having_clause.as_deref());
+    out.extend(present(&sel.having_clause));
     for w in &sel.window_clause {
-        if let Some(node::Node::WindowDef(wd)) = w.node.as_ref() {
+        if let Some(ast::Node::WindowDef(wd)) = w.as_ref() {
             out.extend(window_def_exprs(wd));
         }
     }
-    out.extend(sel.distinct_clause.iter().filter(|n| n.node.is_some()));
+    out.extend(sel.distinct_clause.iter().filter(|n| n.is_some()));
     for s in &sel.sort_clause {
-        if let Some(node::Node::SortBy(sb)) = s.node.as_ref() {
-            out.extend(sb.node.as_deref());
+        if let Some(ast::Node::SortBy(sb)) = s.as_ref() {
+            out.extend(present(&sb.node));
         }
     }
-    out.extend(sel.limit_offset.as_deref());
-    out.extend(sel.limit_count.as_deref());
+    out.extend(present(&sel.limit_offset));
+    out.extend(present(&sel.limit_count));
     for row in &sel.values_lists {
-        if let Some(node::Node::List(l)) = row.node.as_ref() {
+        if let Some(ast::Node::List(l)) = row.as_ref() {
             out.extend(l.items.iter());
         }
     }
@@ -1575,7 +1562,7 @@ fn select_level_exprs(sel: &protobuf::SelectStmt) -> Vec<&protobuf::Node> {
 
 /// Post-order visit of `node` and its same-level sub-expressions: PG's
 /// order of transforming the calls, each after its arguments.
-fn visit_level_post<'a>(node: &'a protobuf::Node, f: &mut dyn FnMut(&'a protobuf::Node)) {
+fn visit_level_post<'a>(node: &'a Option<ast::Node>, f: &mut dyn FnMut(&'a Option<ast::Node>)) {
     for c in level_children(node) {
         visit_level_post(c, f);
     }
@@ -1588,30 +1575,30 @@ fn visit_level_post<'a>(node: &'a protobuf::Node, f: &mut dyn FnMut(&'a protobuf
 /// expressions are `f`'s business). Levels the analysis never registered
 /// are skipped.
 fn visit_select(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     depth: usize,
     chain: &mut Chain,
-    f: &mut dyn FnMut(&protobuf::Node, usize, &mut Chain),
+    f: &mut dyn FnMut(&Option<ast::Node>, usize, &mut Chain),
 ) {
-    if let Some(node::Node::SelectStmt(sel)) = node.node.as_ref() {
+    if let Some(ast::Node::SelectStmt(sel)) = node.as_ref() {
         visit_select_stmt(sel, depth, chain, f);
     }
 }
 
 fn visit_select_stmt(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     depth: usize,
     chain: &mut Chain,
-    f: &mut dyn FnMut(&protobuf::Node, usize, &mut Chain),
+    f: &mut dyn FnMut(&Option<ast::Node>, usize, &mut Chain),
 ) {
-    fn from_subqueries<'a>(n: &'a protobuf::Node, out: &mut Vec<&'a protobuf::Node>) {
-        match n.node.as_ref() {
-            Some(node::Node::JoinExpr(j)) => {
-                for side in [&j.larg, &j.rarg].into_iter().flatten() {
+    fn from_subqueries<'a>(n: &'a Option<ast::Node>, out: &mut Vec<&'a Option<ast::Node>>) {
+        match n.as_ref() {
+            Some(ast::Node::JoinExpr(j)) => {
+                for side in [&j.larg, &j.rarg].into_iter().filter_map(present) {
                     from_subqueries(side, out);
                 }
             }
-            Some(node::Node::RangeSubselect(rs)) => out.extend(rs.subquery.as_deref()),
+            Some(ast::Node::RangeSubselect(rs)) => out.extend(present(&rs.subquery)),
             _ => {}
         }
     }
@@ -1624,10 +1611,8 @@ fn visit_select_stmt(
     }
     if let Some(with) = &sel.with_clause {
         for cte in &with.ctes {
-            if let Some(node::Node::CommonTableExpr(c)) = cte.node.as_ref()
-                && let Some(q) = c.ctequery.as_deref()
-            {
-                visit_select(q, depth + 1, chain, f);
+            if let Some(ast::Node::CommonTableExpr(c)) = cte.as_ref() {
+                visit_select(&c.ctequery, depth + 1, chain, f);
             }
         }
     }
@@ -1648,10 +1633,10 @@ fn visit_select_stmt(
 /// from the innermost level of `chain` a call with these arguments belongs
 /// to — the nearest level any column reference in them reaches (a
 /// sublink's references to its own levels aside), or 0 without any.
-fn call_level(args: &[&protobuf::Node], chain: &mut Chain) -> usize {
-    fn walk(node: &protobuf::Node, depth: usize, chain: &mut Chain, min: &mut Option<usize>) {
-        match node.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => {
+fn call_level(args: &[&Option<ast::Node>], chain: &mut Chain) -> usize {
+    fn walk(node: &Option<ast::Node>, depth: usize, chain: &mut Chain, min: &mut Option<usize>) {
+        match node.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) => {
                 if let Some(t) = chain.resolve(cr)
                     && t.level >= depth
                 {
@@ -1659,17 +1644,21 @@ fn call_level(args: &[&protobuf::Node], chain: &mut Chain) -> usize {
                     *min = Some(min.map_or(up, |m| m.min(up)));
                 }
             }
-            Some(node::Node::SubLink(sl)) => {
-                if let Some(t) = sl.testexpr.as_deref() {
-                    walk(t, depth, chain, min);
+            Some(ast::Node::SubLink(sl)) => {
+                if sl.testexpr.is_some() {
+                    walk(&sl.testexpr, depth, chain, min);
                 }
-                if let Some(sub) = sl.subselect.as_deref() {
-                    visit_select(sub, depth + 1, chain, &mut |e, d, c| walk(e, d, c, min));
+                if sl.subselect.is_some() {
+                    visit_select(&sl.subselect, depth + 1, chain, &mut |e, d, c| {
+                        walk(e, d, c, min)
+                    });
                 }
             }
-            Some(node::Node::JsonArrayQueryConstructor(q)) => {
-                if let Some(sub) = q.query.as_deref() {
-                    visit_select(sub, depth + 1, chain, &mut |e, d, c| walk(e, d, c, min));
+            Some(ast::Node::JsonArrayQueryConstructor(q)) => {
+                if q.query.is_some() {
+                    visit_select(&q.query, depth + 1, chain, &mut |e, d, c| {
+                        walk(e, d, c, min)
+                    });
                 }
             }
             _ => {
@@ -1696,21 +1685,21 @@ struct ArgLevels {
     agg: Option<(usize, i32)>,
 }
 
-fn arg_levels(args: &[&protobuf::Node], chain: &mut Chain, snapshot: &PgCatalog) -> ArgLevels {
+fn arg_levels(args: &[&Option<ast::Node>], chain: &mut Chain, snapshot: &PgCatalog) -> ArgLevels {
     fn lower(slot: &mut Option<(usize, i32)>, level: usize, location: i32) {
         if slot.is_none_or(|(l, _)| level < l) {
             *slot = Some((level, location));
         }
     }
     fn walk(
-        node: &protobuf::Node,
+        node: &Option<ast::Node>,
         depth: usize,
         chain: &mut Chain,
         snapshot: &PgCatalog,
         out: &mut ArgLevels,
     ) {
-        match node.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => {
+        match node.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) => {
                 if let Some(t) = chain.resolve(cr)
                     && t.level >= depth
                 {
@@ -1718,20 +1707,20 @@ fn arg_levels(args: &[&protobuf::Node], chain: &mut Chain, snapshot: &PgCatalog)
                 }
                 return;
             }
-            Some(node::Node::SubLink(sl)) => {
-                if let Some(t) = sl.testexpr.as_deref() {
-                    walk(t, depth, chain, snapshot, out);
+            Some(ast::Node::SubLink(sl)) => {
+                if sl.testexpr.is_some() {
+                    walk(&sl.testexpr, depth, chain, snapshot, out);
                 }
-                if let Some(sub) = sl.subselect.as_deref() {
-                    visit_select(sub, depth + 1, chain, &mut |e, d, c| {
+                if sl.subselect.is_some() {
+                    visit_select(&sl.subselect, depth + 1, chain, &mut |e, d, c| {
                         walk(e, d, c, snapshot, out)
                     });
                 }
                 return;
             }
-            Some(node::Node::JsonArrayQueryConstructor(q)) => {
-                if let Some(sub) = q.query.as_deref() {
-                    visit_select(sub, depth + 1, chain, &mut |e, d, c| {
+            Some(ast::Node::JsonArrayQueryConstructor(q)) => {
+                if q.query.is_some() {
+                    visit_select(&q.query, depth + 1, chain, &mut |e, d, c| {
                         walk(e, d, c, snapshot, out)
                     });
                 }
@@ -1748,7 +1737,7 @@ fn arg_levels(args: &[&protobuf::Node], chain: &mut Chain, snapshot: &PgCatalog)
                 ..
             }) => Some((call_level(&aggregated, chain), location)),
             Some(Call::Grouping(g)) => {
-                let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
                 Some((call_level(&args, chain), g.location))
             }
             Some(Call::Window(_)) | None => None,
@@ -1776,8 +1765,8 @@ fn arg_levels(args: &[&protobuf::Node], chain: &mut Chain, snapshot: &PgCatalog)
 /// sublinks included (`avg((SELECT count(t.x) FROM u))` nests `t`'s
 /// aggregates).
 fn check_agg_arguments(
-    aggregated: &[&protobuf::Node],
-    direct: &[&protobuf::Node],
+    aggregated: &[&Option<ast::Node>],
+    direct: &[&Option<ast::Node>],
     level: usize,
     chain: &mut Chain,
     snapshot: &PgCatalog,
@@ -1819,28 +1808,28 @@ fn check_agg_arguments(
 /// that are no coercion are dropped too ([`strip_noop_casts`]), as PG's
 /// transformation drops them.
 fn canonical(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     chain: &Chain,
     level: usize,
     scope: Option<&Scope>,
     snapshot: &PgCatalog,
-) -> protobuf::Node {
+) -> Option<ast::Node> {
     use typedpg_pg_query::{NodeMut, NodeRef};
-    let node = &column_notation_calls(&whole_row_fields(node, chain), chain);
+    let node = &column_notation_calls(whole_row_fields(node.as_ref(), chain).as_ref(), chain);
     let stripped;
     let node = match scope {
         Some(scope) => {
-            stripped = strip_noop_casts(node, scope, snapshot, &|cr| {
+            stripped = strip_noop_casts(node.as_ref(), scope, snapshot, &|cr| {
                 chain.resolve(cr).is_some_and(|t| t.level == level)
             });
             &stripped
         }
         None => node,
     };
-    let mut tree = protobuf::ParseResult {
+    let mut tree = ast::ParseResult {
         version: 0,
-        stmts: vec![protobuf::RawStmt {
-            stmt: Some(Box::new(resolve_type_names(node, snapshot))),
+        stmts: vec![ast::RawStmt {
+            stmt: resolve_type_names(node, snapshot),
             stmt_location: 0,
             stmt_len: 0,
         }],
@@ -1849,21 +1838,21 @@ fn canonical(
     let mut resolved: HashMap<usize, String> = HashMap::new();
     for (n, _) in tree.nodes() {
         let sub = match n {
-            NodeRef::SubLink(sl) => sl.subselect.as_deref(),
-            NodeRef::JsonArrayQueryConstructor(q) => q.query.as_deref(),
+            NodeRef::SubLink(sl) => sl.subselect.as_ref(),
+            NodeRef::JsonArrayQueryConstructor(q) => q.query.as_ref(),
             _ => None,
         };
-        if let Some(sub) = sub.and_then(|s| s.node.as_ref()) {
+        if let Some(sub) = sub {
             for (m, _) in sub.nodes() {
                 if let NodeRef::ColumnRef(cr) = m {
-                    inner.insert(cr as *const protobuf::ColumnRef as usize);
+                    inner.insert(cr as *const ast::ColumnRef as usize);
                 }
             }
         }
     }
     for (n, _) in tree.nodes() {
         if let NodeRef::ColumnRef(cr) = n {
-            let key = cr as *const protobuf::ColumnRef as usize;
+            let key = cr as *const ast::ColumnRef as usize;
             if !inner.contains(&key)
                 && let Some(RefTarget {
                     level: l,
@@ -1888,37 +1877,32 @@ fn canonical(
             if let NodeMut::ColumnRef(cr) = n
                 && let Some(name) = resolved.get(&(cr as usize))
             {
-                (*cr).fields = vec![string_node(name)];
+                (*cr).fields = vec![Some(string_node(name))];
             }
         }
     }
-    tree.stmts
-        .pop()
-        .and_then(|s| s.stmt)
-        .map(|b| *b)
-        .unwrap_or_default()
+    tree.stmts.pop().and_then(|s| s.stmt)
 }
 
 /// `node` with each field selection `(t).f` on an entry's whole row (not
 /// inside its sublinks) that names a column of the entry written `t.f`
 /// ([`Chain::whole_row_field`]).
-fn whole_row_fields(node: &protobuf::Node, chain: &Chain) -> protobuf::Node {
-    let mut out = node.clone();
-    out.rewrite(
-        &mut |n| !matches!(n.node, Some(node::Node::SelectStmt(_))),
-        &mut |n| {
-            if let Some(node::Node::AIndirection(ind)) = n.node.as_ref()
+fn whole_row_fields(node: Option<&ast::Node>, chain: &Chain) -> Option<ast::Node> {
+    let mut out = node.cloned();
+    if let Some(out) = out.as_mut() {
+        out.rewrite(&mut |n| !matches!(n, ast::Node::SelectStmt(_)), &mut |n| {
+            if let ast::Node::AIndirection(ind) = n
                 && let Some(column) = chain.whole_row_field(ind)
             {
                 *n = column;
             }
-        },
-    );
+        });
+    }
     out
 }
 
 /// [`whole_row_fields`] against the entries of `scope`'s own level.
-fn own_whole_row_fields(node: &protobuf::Node, scope: &Scope) -> protobuf::Node {
+fn own_whole_row_fields(node: Option<&ast::Node>, scope: &Scope) -> Option<ast::Node> {
     whole_row_fields(
         node,
         &Chain::single(Some(Rc::new(Namespace::of(&scope.sources)))),
@@ -1928,25 +1912,24 @@ fn own_whole_row_fields(node: &protobuf::Node, scope: &Scope) -> protobuf::Node 
 /// `node` with each column notation `t.f` of its level (not inside its
 /// sublinks) written as the call `f(t.*)` it stands for, so both spellings
 /// compare equal.
-fn column_notation_calls(node: &protobuf::Node, chain: &Chain) -> protobuf::Node {
-    let mut out = node.clone();
-    out.rewrite(
-        &mut |n| !matches!(n.node, Some(node::Node::SelectStmt(_))),
-        &mut |n| {
-            if let Some(node::Node::ColumnRef(cr)) = n.node.as_ref()
+fn column_notation_calls(node: Option<&ast::Node>, chain: &Chain) -> Option<ast::Node> {
+    let mut out = node.cloned();
+    if let Some(out) = out.as_mut() {
+        out.rewrite(&mut |n| !matches!(n, ast::Node::SelectStmt(_)), &mut |n| {
+            if let ast::Node::ColumnRef(cr) = n
                 && let Some((name, whole_row)) = chain.column_notation(cr)
             {
-                let call = protobuf::FuncCall {
-                    funcname: vec![string_node(&name)],
-                    args: vec![whole_row],
-                    funcformat: protobuf::CoercionForm::CoerceExplicitCall as i32,
+                let call = ast::FuncCall {
+                    funcname: vec![Some(string_node(&name))],
+                    args: vec![Some(whole_row)],
+                    funcformat: ast::CoercionForm::CoerceExplicitCall,
                     location: cr.location,
                     ..Default::default()
                 };
-                n.node = Some(node::Node::FuncCall(Box::new(call)));
+                *n = ast::Node::FuncCall(NodeBox::new(call));
             }
-        },
-    );
+        });
+    }
     out
 }
 
@@ -1955,17 +1938,15 @@ fn column_key(alias: &str, column: &str) -> String {
     format!("\u{1}{alias}\u{1}{column}")
 }
 
-fn string_node(s: &str) -> protobuf::Node {
-    protobuf::Node {
-        node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
-    }
+fn string_node(s: &str) -> ast::Node {
+    ast::Node::String(NodeBox::new(ast::String { sval: s.to_owned() }))
 }
 
 /// Whether two expressions of the current level are PG-`equal()` (up to
 /// how their column references are spelled).
 pub(crate) fn same_level_exprs_equal(
-    a: &protobuf::Node,
-    b: &protobuf::Node,
+    a: &Option<ast::Node>,
+    b: &Option<ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
@@ -1993,7 +1974,7 @@ pub(crate) struct LevelCalls {
 }
 
 pub(crate) fn level_calls(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> LevelCalls {
@@ -2013,7 +1994,7 @@ pub(crate) fn level_calls(
                 }
             }
             Call::Grouping(g) => {
-                let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
                 if out.grouping.is_none() && call_level(&args, &mut chain) == 0 {
                     out.grouping = Some(g.location);
                 }
@@ -2029,23 +2010,23 @@ pub(crate) fn level_calls(
 /// How many levels out aggregate call `fc`, written at the current level,
 /// belongs: the innermost level of the columns its aggregated arguments
 /// (ORDER BY and FILTER included) read — `0` for this level's own.
-pub(crate) fn aggregate_levels_up(fc: &protobuf::FuncCall, scope: &Scope) -> usize {
-    let sort_exprs = fc.agg_order.iter().filter_map(|o| match o.node.as_ref() {
-        Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+pub(crate) fn aggregate_levels_up(fc: &ast::FuncCall, scope: &Scope) -> usize {
+    let sort_exprs = fc.agg_order.iter().filter_map(|o| match o.as_ref() {
+        Some(ast::Node::SortBy(sb)) => present(&sb.node),
         _ => Some(o),
     });
-    let mut aggregated: Vec<&protobuf::Node> = if fc.agg_within_group {
+    let mut aggregated: Vec<&Option<ast::Node>> = if fc.agg_within_group {
         sort_exprs.collect()
     } else {
         fc.args.iter().chain(sort_exprs).collect()
     };
-    aggregated.extend(fc.agg_filter.as_deref());
+    aggregated.extend(present(&fc.agg_filter));
     levels_up_of(&aggregated, scope)
 }
 
 /// How many levels out an aggregate whose aggregated expressions are
 /// `aggregated`, written at the current level, belongs.
-pub(crate) fn levels_up_of(aggregated: &[&protobuf::Node], scope: &Scope) -> usize {
+pub(crate) fn levels_up_of(aggregated: &[&Option<ast::Node>], scope: &Scope) -> usize {
     call_level(aggregated, &mut current_chain(scope))
 }
 
@@ -2055,7 +2036,7 @@ pub(crate) fn levels_up_of(aggregated: &[&protobuf::Node], scope: &Scope) -> usi
 /// `GROUPING(…)` call's arguments, canonicalized against its level.
 fn attribute_outer(
     levels_up: usize,
-    grouping: Option<Vec<protobuf::Node>>,
+    grouping: Option<Vec<Option<ast::Node>>>,
     location: i32,
 ) -> Result<(), AnalyzeError> {
     let is_grouping = grouping.is_some();
@@ -2102,7 +2083,7 @@ fn attribute_outer(
 /// Expressions are compared the way PG's `equal()` compares transformed
 /// trees, up to how column references are spelled (see [`canonical`]).
 pub(crate) fn finish_select_level(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     scope: &Scope,
     targets: &[ExpandedTarget<'_>],
     snapshot: &PgCatalog,
@@ -2110,7 +2091,7 @@ pub(crate) fn finish_select_level(
     let mut chain = current_chain(scope);
 
     let mut own_aggs = false;
-    let mut own_grouping: Vec<&protobuf::GroupingFunc> = Vec::new();
+    let mut own_grouping: Vec<&ast::GroupingFunc> = Vec::new();
     let mut calls: Vec<Call<'_>> = Vec::new();
     // In PG's transform order, a call after its arguments: in
     // `max(sum(y))`, `sum` (an outer level's) meets that level's clause
@@ -2139,7 +2120,7 @@ pub(crate) fn finish_select_level(
                     )
                     .finalize_implicit());
                 }
-                let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
                 match call_level(&args, &mut chain) {
                     0 => own_grouping.push(g),
                     up => {
@@ -2266,9 +2247,9 @@ pub(crate) fn finish_select_level(
             _ => None,
         })
         .collect();
-    let names_target = |n: &protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::AConst(_)) => true,
-        Some(node::Node::ColumnRef(cr)) => matches!(
+    let names_target = |n: &Option<ast::Node>| match n.as_ref() {
+        Some(ast::Node::AConst(_)) => true,
+        Some(ast::Node::ColumnRef(cr)) => matches!(
             expr::extract_string_fields(&cr.fields).as_slice(),
             [name] if output_names.contains(name)
         ),
@@ -2277,8 +2258,8 @@ pub(crate) fn finish_select_level(
     for t in targets {
         match *t {
             ExpandedTarget::Expr(rt) => {
-                if let Some(v) = rt.val.as_deref() {
-                    check.expr(v, 0, &mut own)?;
+                if rt.val.is_some() {
+                    check.expr(&rt.val, 0, &mut own)?;
                 }
             }
             ExpandedTarget::StarColumn {
@@ -2293,27 +2274,27 @@ pub(crate) fn finish_select_level(
         }
     }
     for s in &sel.sort_clause {
-        if let Some(node::Node::SortBy(sb)) = s.node.as_ref()
-            && let Some(inner) = sb.node.as_deref()
-            && !names_target(inner)
+        if let Some(ast::Node::SortBy(sb)) = s.as_ref()
+            && sb.node.is_some()
+            && !names_target(&sb.node)
         {
-            check.expr(inner, 0, &mut own)?;
+            check.expr(&sb.node, 0, &mut own)?;
         }
     }
-    for d in sel.distinct_clause.iter().filter(|n| n.node.is_some()) {
+    for d in sel.distinct_clause.iter().filter(|n| n.is_some()) {
         if !names_target(d) {
             check.expr(d, 0, &mut own)?;
         }
     }
     for w in &sel.window_clause {
-        if let Some(node::Node::WindowDef(wd)) = w.node.as_ref() {
+        if let Some(ast::Node::WindowDef(wd)) = w.as_ref() {
             for e in window_key_exprs(wd) {
                 check.expr(e, 0, &mut own)?;
             }
         }
     }
-    if let Some(h) = sel.having_clause.as_deref() {
-        check.expr(h, 0, &mut own)?;
+    if sel.having_clause.is_some() {
+        check.expr(&sel.having_clause, 0, &mut own)?;
     }
     Ok(())
 }
@@ -2355,7 +2336,7 @@ pub(crate) fn clear_values_sort_calls() {
 }
 
 /// The call of VALUES `sel`'s ORDER BY its execution fails on, if any.
-pub(crate) fn values_sort_call(sel: &protobuf::SelectStmt) -> Option<(UnplannedCall, i32)> {
+pub(crate) fn values_sort_call(sel: &ast::SelectStmt) -> Option<(UnplannedCall, i32)> {
     VALUES_SORT_CALLS.with(|v| v.borrow().get(&level_key(sel)).copied())
 }
 
@@ -2382,7 +2363,7 @@ pub(crate) fn with_own_namespace<R>(sources: &[TableSource], f: impl FnOnce() ->
 /// level in the ORDER BY — directly, or an aggregate in a sublink there —
 /// is recorded for [`values_sort_call`].
 pub(crate) fn finish_values_level(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     rows_scope: &Scope,
     sort_sources: &[TableSource],
     snapshot: &PgCatalog,
@@ -2390,20 +2371,20 @@ pub(crate) fn finish_values_level(
     let rows_chain = current_chain(rows_scope);
     let mut sort_chain = rows_chain.clone();
     sort_chain.levels[0] = Some(Rc::new(Namespace::of(sort_sources)));
-    let rows: Vec<&protobuf::Node> = sel
+    let rows: Vec<&Option<ast::Node>> = sel
         .values_lists
         .iter()
-        .filter_map(|row| match row.node.as_ref() {
-            Some(node::Node::List(l)) => Some(l.items.iter()),
+        .filter_map(|row| match row.as_ref() {
+            Some(ast::Node::List(l)) => Some(l.items.iter()),
             _ => None,
         })
         .flatten()
         .collect();
-    let sort: Vec<&protobuf::Node> = sel
+    let sort: Vec<&Option<ast::Node>> = sel
         .sort_clause
         .iter()
-        .filter_map(|s| match s.node.as_ref() {
-            Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+        .filter_map(|s| match s.as_ref() {
+            Some(ast::Node::SortBy(sb)) => present(&sb.node),
             _ => None,
         })
         .collect();
@@ -2426,7 +2407,7 @@ pub(crate) fn finish_values_level(
                     }
                 }
                 Call::Grouping(g) => {
-                    let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                    let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
                     let up = call_level(&args, &mut chain);
                     if up > 0 {
                         let canon = g
@@ -2443,7 +2424,7 @@ pub(crate) fn finish_values_level(
     }
     // The executor initializes the sort keys in order, each top-down.
     fn first(
-        node: &protobuf::Node,
+        node: &Option<ast::Node>,
         chain: &mut Chain,
         snapshot: &PgCatalog,
     ) -> Option<(UnplannedCall, i32)> {
@@ -2456,7 +2437,7 @@ pub(crate) fn finish_values_level(
             }) => (call_level(&aggregated, chain) == 0)
                 .then_some((UnplannedCall::Aggregate, location)),
             Some(Call::Grouping(g)) => {
-                let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
                 (call_level(&args, chain) == 0).then_some((UnplannedCall::Grouping, g.location))
             }
             None => None,
@@ -2493,13 +2474,13 @@ pub(crate) fn finish_values_level(
 /// columns it groups by, and every grouping expression canonicalized.
 struct GroupExprs {
     vars: HashSet<ColKey>,
-    exprs: Vec<protobuf::Node>,
+    exprs: Vec<Option<ast::Node>>,
     have_non_var: bool,
 }
 
 impl GroupExprs {
     fn collect(
-        sel: &protobuf::SelectStmt,
+        sel: &ast::SelectStmt,
         scope: &Scope,
         targets: &[ExpandedTarget<'_>],
         own: &Chain,
@@ -2516,9 +2497,9 @@ impl GroupExprs {
             .first()
             .and_then(|n| n.as_deref())
             .unwrap_or(&empty);
-        let mut stack: Vec<&protobuf::Node> = sel.group_clause.iter().rev().collect();
+        let mut stack: Vec<&Option<ast::Node>> = sel.group_clause.iter().rev().collect();
         while let Some(g) = stack.pop() {
-            if let Some(node::Node::GroupingSet(gs)) = g.node.as_ref() {
+            if let Some(ast::Node::GroupingSet(gs)) = g.as_ref() {
                 stack.extend(gs.content.iter().rev());
                 continue;
             }
@@ -2529,15 +2510,15 @@ impl GroupExprs {
             // findTargetlistEntrySQL92: a position, or a name that is no
             // input column but an output column, stands for that
             // select-list entry.
-            let target = match g.node.as_ref() {
-                Some(node::Node::AConst(ac)) => match &ac.val {
-                    Some(protobuf::a_const::Val::Ival(i)) => {
+            let target = match g.as_ref() {
+                Some(ast::Node::AConst(ac)) => match &ac.val {
+                    Some(ast::AConstValue::Integer(i)) => {
                         targets.get((i.ival as usize).wrapping_sub(1)).copied()
                     }
                     _ => None,
                 },
-                Some(node::Node::ColumnRef(cr))
-                    if resolve_group_column(g, scope, snapshot).is_none() =>
+                Some(ast::Node::ColumnRef(cr))
+                    if resolve_group_column(g.as_ref(), scope, snapshot).is_none() =>
                 {
                     match expr::extract_string_fields(&cr.fields).as_slice() {
                         [name] => targets
@@ -2553,8 +2534,8 @@ impl GroupExprs {
                 _ => None,
             };
             let expr = match target {
-                Some(ExpandedTarget::Expr(rt)) => match rt.val.as_deref() {
-                    Some(v) => v,
+                Some(ExpandedTarget::Expr(rt)) => match rt.val.as_ref() {
+                    Some(_) => &rt.val,
                     None => continue,
                 },
                 Some(ExpandedTarget::StarColumn {
@@ -2569,11 +2550,11 @@ impl GroupExprs {
             };
             // A cast that is no coercion is the column itself, and so is a
             // field selected from the whole row.
-            let expr = &whole_row_fields(expr, own);
-            let expr = &strip_noop_casts(expr, scope, snapshot, &|cr| {
+            let expr = &whole_row_fields(expr.as_ref(), own);
+            let expr = &strip_noop_casts(expr.as_ref(), scope, snapshot, &|cr| {
                 matches!(own.resolve(cr), Some(RefTarget { level: 0, .. }))
             });
-            if let Some(node::Node::ColumnRef(cr)) = expr.node.as_ref()
+            if let Some(ast::Node::ColumnRef(cr)) = expr.as_ref()
                 && let Some(RefTarget {
                     level: 0,
                     target: Some((alias, Some(col))),
@@ -2602,15 +2583,14 @@ impl GroupExprs {
             }
             Some(_) => self.have_non_var = true,
         }
-        self.exprs.push(protobuf::Node {
-            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                fields: vec![string_node(&ns.canonical_name(&key))],
+        self.exprs
+            .push(Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+                fields: vec![Some(string_node(&ns.canonical_name(&key)))],
                 location: 0,
-            })),
-        });
+            }))));
     }
 
-    fn contains(&self, canonical_expr: &protobuf::Node) -> bool {
+    fn contains(&self, canonical_expr: &Option<ast::Node>) -> bool {
         self.exprs.iter().any(|e| e.equal(canonical_expr))
     }
 }
@@ -2628,12 +2608,12 @@ impl UngroupedCheck<'_> {
     /// `chain` starts at `node`'s level and ends at the grouped one.
     fn expr(
         &self,
-        node: &protobuf::Node,
+        node: &Option<ast::Node>,
         depth: usize,
         chain: &mut Chain,
     ) -> Result<(), AnalyzeError> {
-        match node.node.as_ref() {
-            None | Some(node::Node::AConst(_)) | Some(node::Node::ParamRef(_)) => {
+        match node.as_ref() {
+            None | Some(ast::Node::AConst(_)) | Some(ast::Node::ParamRef(_)) => {
                 return Ok(());
             }
             _ => {}
@@ -2656,7 +2636,7 @@ impl UngroupedCheck<'_> {
                 }
             }
             Some(Call::Grouping(g)) => {
-                let args: Vec<&protobuf::Node> = g.args.iter().collect();
+                let args: Vec<&Option<ast::Node>> = g.args.iter().collect();
                 if call_level(&args, chain) == depth {
                     return Ok(());
                 }
@@ -2665,8 +2645,8 @@ impl UngroupedCheck<'_> {
         }
         // A whole row coerced to a composite is no longer the whole-row
         // reference a `GROUP BY s` groups by, but its columns (below).
-        let expanded_row = match node.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => matches!(
+        let expanded_row = match node.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) => matches!(
                 chain.resolve(cr),
                 Some(RefTarget { target: Some((alias, None)), .. })
                     if expanded_whole_row(cr.location, &alias).is_some()
@@ -2682,8 +2662,8 @@ impl UngroupedCheck<'_> {
         {
             return Ok(());
         }
-        match node.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) => {
+        match node.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) => {
                 if let Some(RefTarget {
                     level,
                     target: Some((alias, col)),
@@ -2693,7 +2673,7 @@ impl UngroupedCheck<'_> {
                     // Column notation `t.f` is the call `f(t.*)`: it reads
                     // the whole row.
                     if let Some((_, whole_row)) = chain.column_notation(cr) {
-                        return self.expr(&whole_row, depth, chain);
+                        return self.expr(&Some(whole_row), depth, chain);
                     }
                     let named = match col {
                         Some(col) => vec![col],
@@ -2718,21 +2698,21 @@ impl UngroupedCheck<'_> {
                 Ok(())
             }
             // A field selected from a whole row reads that column only.
-            Some(node::Node::AIndirection(ind)) if chain.whole_row_field(ind).is_some() => {
+            Some(ast::Node::AIndirection(ind)) if chain.whole_row_field(ind).is_some() => {
                 let column = chain.whole_row_field(ind).expect("checked above");
-                self.expr(&column, depth, chain)
+                self.expr(&Some(column), depth, chain)
             }
-            Some(node::Node::SubLink(sl)) => {
-                if let Some(t) = sl.testexpr.as_deref() {
-                    self.expr(t, depth, chain)?;
+            Some(ast::Node::SubLink(sl)) => {
+                if sl.testexpr.is_some() {
+                    self.expr(&sl.testexpr, depth, chain)?;
                 }
-                match sl.subselect.as_deref() {
-                    Some(sub) => self.select(sub, depth + 1, chain),
+                match sl.subselect.as_ref() {
+                    Some(_) => self.select(&sl.subselect, depth + 1, chain),
                     None => Ok(()),
                 }
             }
-            Some(node::Node::JsonArrayQueryConstructor(q)) => match q.query.as_deref() {
-                Some(sub) => self.select(sub, depth + 1, chain),
+            Some(ast::Node::JsonArrayQueryConstructor(q)) => match q.query.as_ref() {
+                Some(_) => self.select(&q.query, depth + 1, chain),
                 None => Ok(()),
             },
             _ => {
@@ -2747,7 +2727,7 @@ impl UngroupedCheck<'_> {
     /// Check every expression of the sublink query `node`.
     fn select(
         &self,
-        node: &protobuf::Node,
+        node: &Option<ast::Node>,
         depth: usize,
         chain: &mut Chain,
     ) -> Result<(), AnalyzeError> {

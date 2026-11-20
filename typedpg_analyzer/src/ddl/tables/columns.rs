@@ -1,11 +1,13 @@
 use super::*;
 use crate::ddl::depend::ObjectAddress;
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 /// The integer type behind a `smallserial` / `serial` / `bigserial` column
 /// type, or `None` for any other type name. Mirrors the check at the top of
 /// `transformColumnDefinition` (`parse_utilcmd.c`): the name must be
 /// unqualified or `pg_catalog`-qualified, with no array bounds.
-pub(crate) fn serial_base_type(tn: &typedpg_pg_query::protobuf::TypeName) -> Option<PgTypeOid> {
+pub(crate) fn serial_base_type(tn: &typedpg_pg_query::ast::TypeName) -> Option<PgTypeOid> {
     use crate::pg_catalog::oid;
     if !tn.array_bounds.is_empty() || tn.pct_type {
         return None;
@@ -400,7 +402,7 @@ fn missing_composite_dependencies(
 fn expression_is_volatile(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
 ) -> bool {
     let used = std::cell::RefCell::new(Vec::new());
     let _ = crate::ddl::volatile::infer_over_relation(interp, relid, expr, Some(&used));
@@ -432,7 +434,7 @@ pub(crate) fn alter_type_rewrites(
     attr: &PgAttribute,
     new_type: PgTypeOid,
     new_typmod: Option<i32>,
-    using: Option<&typedpg_pg_query::protobuf::Node>,
+    using: Option<&typedpg_pg_query::ast::Node>,
 ) -> bool {
     if attr.attgenerated == Some(AttGenerated::Virtual) {
         return false;
@@ -453,19 +455,19 @@ pub(crate) fn alter_type_rewrites(
 fn using_source(
     interp: &PgCatalog,
     attr: &PgAttribute,
-    using: &typedpg_pg_query::protobuf::Node,
+    using: &typedpg_pg_query::ast::Node,
 ) -> Option<(PgTypeOid, i32)> {
-    match using.node.as_ref()? {
-        node::Node::ColumnRef(cr)
+    match using {
+        ast::Node::ColumnRef(cr)
             if cr.fields.last().and_then(crate::ddl::util::node_string)
                 == Some(attr.attname.as_str()) =>
         {
             Some((attr.atttypid, attr.atttypmod.unwrap_or(-1)))
         }
         // eval_const_expressions turns a CollateExpr into a RelabelType.
-        node::Node::CollateClause(c) => using_source(interp, attr, c.arg.as_deref()?),
-        node::Node::TypeCast(tc) => {
-            let (from, from_typmod) = using_source(interp, attr, tc.arg.as_deref()?)?;
+        ast::Node::CollateClause(c) => using_source(interp, attr, c.arg.as_ref()?),
+        ast::Node::TypeCast(tc) => {
+            let (from, from_typmod) = using_source(interp, attr, tc.arg.as_ref()?)?;
             let tn = tc.type_name.as_ref()?;
             let to = crate::ddl::util::resolve_type_name(tn, interp)?;
             let to_typmod = crate::typmod::encode(interp, to, tn)
@@ -636,16 +638,19 @@ fn in_partition_key(interp: &PgCatalog, relid: PgClassOid, attnum: i16) -> bool 
 
 /// The DEFAULT expression written on a column definition, if any.
 pub(crate) fn column_default_expr(
-    cd: &typedpg_pg_query::protobuf::ColumnDef,
-) -> Option<&typedpg_pg_query::protobuf::Node> {
-    cd.raw_default.as_deref().or_else(|| {
-        cd.constraints.iter().find_map(|n| match n.node.as_ref()? {
-            node::Node::Constraint(c) if c.contype == ConstrType::ConstrDefault as i32 => {
-                c.raw_expr.as_deref()
-            }
-            _ => None,
+    cd: &typedpg_pg_query::ast::ColumnDef,
+) -> Option<&Option<typedpg_pg_query::ast::Node>> {
+    cd.raw_default
+        .is_some()
+        .then_some(&cd.raw_default)
+        .or_else(|| {
+            cd.constraints.iter().find_map(|n| match n.as_ref()? {
+                ast::Node::Constraint(c) if c.contype == ConstrType::ConstrDefault => {
+                    c.raw_expr.is_some().then_some(&c.raw_expr)
+                }
+                _ => None,
+            })
         })
-    })
 }
 
 /// Where a column definition is being transformed
@@ -666,18 +671,18 @@ pub(crate) struct ColumnContext {
 pub(crate) fn parse_column_def(
     interp: &PgCatalog,
     relname: &str,
-    cd: &typedpg_pg_query::protobuf::ColumnDef,
+    cd: &typedpg_pg_query::ast::ColumnDef,
     pk_columns: &[String],
     cx: ColumnContext,
 ) -> Result<ParsedColumn, DdlError> {
     use crate::pg_catalog::oid;
     // Detect SERIAL/BIGSERIAL/SMALLSERIAL from type name — typedpg_pg_query keeps the
     // original name and does NOT rewrite to int4 + nextval(...).
-    let serial_type = cd.type_name.as_ref().and_then(serial_base_type);
+    let serial_type = cd.type_name.as_deref().and_then(serial_base_type);
     let is_serial = serial_type.is_some();
-    if let Some(tn) = cd.type_name.as_ref()
+    if let Some(tn) = cd.type_name.as_deref()
         && !tn.array_bounds.is_empty()
-        && serial_base_type(&typedpg_pg_query::protobuf::TypeName {
+        && serial_base_type(&typedpg_pg_query::ast::TypeName {
             array_bounds: Vec::new(),
             ..tn.clone()
         })
@@ -708,8 +713,8 @@ pub(crate) fn parse_column_def(
     let mut need_notnull = false;
     let mut disallow_noinherit_notnull = false;
     if is_serial {
-        constraints.push(typedpg_pg_query::protobuf::Constraint {
-            contype: ConstrType::ConstrDefault as i32,
+        constraints.push(typedpg_pg_query::ast::Constraint {
+            contype: ConstrType::ConstrDefault,
             ..Default::default()
         });
         need_notnull = true;
@@ -717,8 +722,8 @@ pub(crate) fn parse_column_def(
     }
     if constraints.iter().any(|c| {
         matches!(
-            ConstrType::try_from(c.contype),
-            Ok(ConstrType::ConstrIdentity | ConstrType::ConstrPrimary)
+            c.contype,
+            ConstrType::ConstrIdentity | ConstrType::ConstrPrimary
         )
     }) {
         disallow_noinherit_notnull = true;
@@ -752,15 +757,15 @@ pub(crate) fn parse_column_def(
     let mut generated: Option<AttGenerated> = None;
     let mut identity_options = Vec::new();
     for c in &constraints {
-        match ConstrType::try_from(c.contype) {
-            Ok(ConstrType::ConstrNull) => {
+        match c.contype {
+            ConstrType::ConstrNull => {
                 if (saw_nullable && is_not_null) || need_notnull {
                     return Err(conflicting_null());
                 }
                 is_not_null = false;
                 saw_nullable = true;
             }
-            Ok(ConstrType::ConstrNotnull) => {
+            ConstrType::ConstrNotnull => {
                 if cx.partitioned && c.is_no_inherit {
                     return Err(DdlError::UnsupportedDdl(
                         "not-null constraints on partitioned tables cannot be NO INHERIT".into(),
@@ -797,7 +802,7 @@ pub(crate) fn parse_column_def(
                     }
                 }
             }
-            Ok(ConstrType::ConstrDefault) => {
+            ConstrType::ConstrDefault => {
                 if saw_default {
                     return Err(DdlError::Parse(format!(
                         "multiple default values specified for column \"{colname}\" of table \"{relname}\""
@@ -805,7 +810,7 @@ pub(crate) fn parse_column_def(
                 }
                 saw_default = true;
             }
-            Ok(ConstrType::ConstrIdentity) => {
+            ConstrType::ConstrIdentity => {
                 if cx.of_type {
                     return Err(DdlError::UnsupportedDdl(
                         "identity columns are not supported on typed tables".into(),
@@ -841,7 +846,7 @@ pub(crate) fn parse_column_def(
                     return Err(conflicting_null());
                 }
             }
-            Ok(ConstrType::ConstrGenerated) => {
+            ConstrType::ConstrGenerated => {
                 if cx.of_type {
                     return Err(DdlError::UnsupportedDdl(
                         "generated columns are not supported on typed tables".into(),
@@ -858,16 +863,16 @@ pub(crate) fn parse_column_def(
                 } else {
                     AttGenerated::Virtual
                 });
-                if let Some(expr) = c.raw_expr.as_deref() {
+                if c.raw_expr.is_some() {
                     crate::ddl::volatile::check_no_volatile(
-                        expr,
+                        &c.raw_expr,
                         crate::ddl::volatile::ExprLocation::Generated,
                         interp,
                     )?;
                 }
                 saw_generated = true;
             }
-            Ok(ConstrType::ConstrPrimary) => {
+            ConstrType::ConstrPrimary => {
                 if saw_nullable && !is_not_null {
                     return Err(conflicting_null());
                 }
@@ -979,10 +984,10 @@ pub(crate) fn set_identity(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let Some(def) = cmd.def.as_deref() else {
+    let Some(def) = cmd.def.as_ref() else {
         return Ok(());
     };
-    if matches!(def.node.as_ref(), Some(node::Node::Constraint(_))) {
+    if matches!(def, ast::Node::Constraint(_)) {
         check_identity_recursion(
             interp,
             relid,
@@ -1004,21 +1009,20 @@ pub(crate) fn set_identity(
     // `def = Constraint{contype=Identity, generated_when=…}`. The
     // `SET GENERATED <kind>` form parses with `def = List<DefElem>` where
     // one DefElem has `defname = "generated"` and `arg = Integer('a' | 'd')`.
-    let new_identity = match def.node.as_ref() {
-        Some(node::Node::Constraint(c)) if c.contype == ConstrType::ConstrIdentity as i32 => {
+    let new_identity = match def {
+        ast::Node::Constraint(c) if c.contype == ConstrType::ConstrIdentity => {
             match c.generated_when.as_str() {
                 "a" => Some(AttIdentity::Always),
                 "d" => Some(AttIdentity::ByDefault),
                 _ => Some(AttIdentity::ByDefault),
             }
         }
-        Some(node::Node::List(list)) => {
+        ast::Node::List(list) => {
             let mut found = None;
             for item in &list.items {
-                if let Some(node::Node::DefElem(de)) = item.node.as_ref()
+                if let Some(ast::Node::DefElem(de)) = item.as_ref()
                     && de.defname == "generated"
-                    && let Some(arg) = de.arg.as_deref()
-                    && let Some(node::Node::Integer(i)) = arg.node.as_ref()
+                    && let Some(ast::Node::Integer(i)) = de.arg.as_ref()
                 {
                     found = Some(match i.ival as u8 as char {
                         'a' => AttIdentity::Always,
@@ -1032,7 +1036,7 @@ pub(crate) fn set_identity(
         _ => return Ok(()),
     };
 
-    let is_add = matches!(def.node.as_ref(), Some(node::Node::Constraint(_)));
+    let is_add = matches!(def, ast::Node::Constraint(_));
     // transformAlterTableStmt checks an added identity's type (a system
     // column's is never an integer) before ATExecAddIdentity sees the
     // column.
@@ -1108,12 +1112,12 @@ pub(crate) fn set_identity(
     }
     // ATExecSetIdentity: the other options alter the identity sequence
     // (AlterSequence's init_params).
-    if let Some(node::Node::List(list)) = def.node.as_ref() {
-        let options: Vec<typedpg_pg_query::protobuf::Node> = list
+    if let ast::Node::List(list) = def {
+        let options: Vec<Option<typedpg_pg_query::ast::Node>> = list
             .items
             .iter()
             .filter(|o| {
-                !matches!(o.node.as_ref(), Some(node::Node::DefElem(de)) if de.defname == "generated")
+                !matches!(o.as_ref(), Some(ast::Node::DefElem(de)) if de.defname == "generated")
             })
             .cloned()
             .collect();
@@ -1132,8 +1136,8 @@ pub(crate) fn set_identity(
         }
     }
     if is_add && !rec.recursing {
-        let options = match def.node.as_ref() {
-            Some(node::Node::Constraint(c)) => c.options.clone(),
+        let options = match def {
+            ast::Node::Constraint(c) => c.options.clone(),
             _ => Vec::new(),
         };
         crate::ddl::sequences::create_owned_sequence(
@@ -1219,10 +1223,10 @@ fn add_column_to(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let Some(def) = cmd.def.as_deref() else {
+    let Some(def) = cmd.def.as_ref() else {
         return Ok(());
     };
-    let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
+    let ast::Node::ColumnDef(cd) = def else {
         return Ok(());
     };
     // ATExecAddColumn: a partition's columns are its parent's.
@@ -1237,7 +1241,7 @@ fn add_column_to(
     // DefineIndex, for a column constraint's USING INDEX TABLESPACE (of a
     // column IF NOT EXISTS didn't skip).
     for c in &cd.constraints {
-        if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+        if let Some(ast::Node::Constraint(c)) = c.as_ref() {
             super::check_tablespace_placement(&c.indexspace)?;
         }
     }
@@ -1295,7 +1299,7 @@ fn add_column_to(
         && interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::ForeignTable)
     {
         for c in &cd.constraints {
-            if let Some(node::Node::Constraint(c)) = c.node.as_ref() {
+            if let Some(ast::Node::Constraint(c)) = c.as_ref() {
                 check_foreign_table_constraint(c)?;
             }
         }
@@ -1408,7 +1412,9 @@ fn add_column_to(
         interp,
         relid,
         next_attnum,
-        column_default_expr(cd).filter(|_| !null_default),
+        column_default_expr(cd)
+            .filter(|_| !null_default)
+            .and_then(|e| e.as_ref()),
     );
     if !rec.recursing
         && let Some(deptype) = col.owned_sequence
@@ -1423,9 +1429,9 @@ fn add_column_to(
     }
     // The generation expression, now that the column exists.
     for c_node in &cd.constraints {
-        if let Some(node::Node::Constraint(c)) = c_node.node.as_ref()
-            && c.contype == ConstrType::ConstrGenerated as i32
-            && let Some(expr) = c.raw_expr.as_deref()
+        if let Some(ast::Node::Constraint(c)) = c_node.as_ref()
+            && c.contype == ConstrType::ConstrGenerated
+            && c.raw_expr.is_some()
             && let Some(kind) = col.generated
         {
             let cooked = super::generated::cook_generation_expr(
@@ -1434,7 +1440,7 @@ fn add_column_to(
                 &col.name,
                 col.type_oid,
                 kind,
-                expr,
+                &c.raw_expr,
             )?;
             cooked.record(interp, relid, next_attnum);
         }
@@ -1535,10 +1541,7 @@ pub(crate) fn drop_column(
         ));
     }
 
-    let cascade = matches!(
-        DropBehavior::try_from(cmd.behavior),
-        Ok(DropBehavior::DropCascade)
-    );
+    let cascade = matches!(cmd.behavior, DropBehavior::DropCascade);
 
     // Find dependent views from pg_depend.
     let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
@@ -1805,7 +1808,7 @@ pub(crate) fn set_default(
     }
     // ATExecColumnDefault → AddRelationNewConstraints: a default cooking
     // to a null constant is stored as none (the column's default is NULL).
-    let mut stored = cmd.def.as_deref();
+    let mut stored = cmd.def.is_some().then_some(&cmd.def);
     if let Some(attr) = &attr {
         if let Some(expr) = stored {
             let default_type =
@@ -1826,7 +1829,12 @@ pub(crate) fn set_default(
             interp.attr_default_types.remove(&(relid, attr.attnum));
             interp.attr_default_exprs.remove(&(relid, attr.attnum));
         }
-        crate::ddl::defaults::record_default_dependencies(interp, relid, attr.attnum, stored);
+        crate::ddl::defaults::record_default_dependencies(
+            interp,
+            relid,
+            attr.attnum,
+            stored.and_then(|e| e.as_ref()),
+        );
     }
     if rec.recurse {
         for child in inherit::children_of(interp, relid) {
@@ -1860,10 +1868,10 @@ pub(crate) fn alter_column_type(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    let Some(def) = cmd.def.as_deref() else {
+    let Some(def) = cmd.def.as_ref() else {
         return Ok(());
     };
-    let Some(node::Node::ColumnDef(cd)) = def.node.as_ref() else {
+    let ast::Node::ColumnDef(cd) = def else {
         return Ok(());
     };
     super::check_not_system_column(interp, relid, &cmd.name)?;
@@ -1883,17 +1891,13 @@ pub(crate) fn alter_column_type(
                 "identity column type must be smallint, integer, or bigint".into(),
             ));
         }
-        let as_type = typedpg_pg_query::protobuf::Node {
-            node: Some(node::Node::DefElem(Box::new(
-                typedpg_pg_query::protobuf::DefElem {
-                    defname: "as".into(),
-                    arg: Some(Box::new(typedpg_pg_query::protobuf::Node {
-                        node: Some(node::Node::TypeName(tn.clone())),
-                    })),
-                    ..Default::default()
-                },
-            ))),
-        };
+        let as_type = Some(typedpg_pg_query::ast::Node::DefElem(NodeBox::new(
+            typedpg_pg_query::ast::DefElem {
+                defname: "as".into(),
+                arg: Some(typedpg_pg_query::ast::Node::TypeName(tn.clone())),
+                ..Default::default()
+            },
+        )));
         for seq in crate::ddl::sequences::identity_sequences(interp, relid, attr.attnum) {
             let current = interp.sequence_params.get(&seq).copied();
             let params = crate::ddl::seqparams::init_params(
@@ -2154,7 +2158,7 @@ pub(crate) fn alter_column_type(
             &attr,
             new_type_oid,
             new_typmod,
-            cd.raw_default.as_deref(),
+            cd.raw_default.as_ref(),
         )
     {
         crate::ddl::indexes::table_rewritten(interp, relid);
@@ -2186,8 +2190,8 @@ fn recheck_dependents_of_retyped_column(
 ) -> Result<(), DdlError> {
     use crate::expr::{TypeGoal, infer_expr};
     use crate::pg_catalog::oid;
-    let reads_column = |expr: &typedpg_pg_query::protobuf::Node| {
-        expr.node.as_ref().is_some_and(|inner| {
+    let reads_column = |expr: &Option<typedpg_pg_query::ast::Node>| {
+        expr.as_ref().is_some_and(|inner| {
             inner.nodes().into_iter().any(|(n, ..)| {
                 matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
                     if cr.fields.last().and_then(super::super::util::node_string)
@@ -2211,7 +2215,7 @@ fn recheck_dependents_of_retyped_column(
         &attrs,
     );
     let null_ctx = crate::nullability::NullabilityContext::default();
-    let infer_bool = |expr: &typedpg_pg_query::protobuf::Node, clause: &str| {
+    let infer_bool = |expr: &Option<typedpg_pg_query::ast::Node>, clause: &str| {
         let mut params = crate::param_collector::ParamCollector::default();
         let found = infer_expr(
             expr,
@@ -2337,12 +2341,13 @@ pub(crate) fn prep_alter_column_using(
     relid: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ColumnDef(cd)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+    let Some(ast::Node::ColumnDef(cd)) = cmd.def.as_ref() else {
         return Ok(());
     };
-    let (Some(using), Some(tn)) = (cd.raw_default.as_deref(), cd.type_name.as_ref()) else {
+    let (Some(_), Some(tn)) = (cd.raw_default.as_ref(), cd.type_name.as_ref()) else {
         return Ok(());
     };
+    let using = &cd.raw_default;
     if !matches!(
         interp.pg_class.get(&relid).map(|c| c.relkind),
         Some(RelKind::Table | RelKind::Partitioned)
@@ -2375,7 +2380,7 @@ fn check_using_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
     attr: &PgAttribute,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
     new_type: PgTypeOid,
     new_typmod: Option<i32>,
 ) -> Result<(), DdlError> {
@@ -2476,7 +2481,7 @@ pub(crate) fn type_collation(
 /// type's default.
 pub(crate) fn column_collation(
     interp: &PgCatalog,
-    cd: &typedpg_pg_query::protobuf::ColumnDef,
+    cd: &typedpg_pg_query::ast::ColumnDef,
     type_oid: PgTypeOid,
 ) -> Result<Option<crate::oid::PgCollationOid>, DdlError> {
     let Some(coll) = cd.coll_clause.as_deref() else {
@@ -2485,8 +2490,8 @@ pub(crate) fn column_collation(
     let parts: Vec<&str> = coll
         .collname
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.as_str()),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.as_str()),
             _ => None,
         })
         .collect();
@@ -2649,14 +2654,14 @@ pub(crate) fn set_expression(
     {
         find_composite_type_dependencies(interp, row_type, relid)?;
     }
-    if let Some(expr) = cmd.def.as_deref() {
+    if cmd.def.is_some() {
         let cooked = super::generated::cook_generation_expr(
             interp,
             relid,
             &attr.attname,
             attr.atttypid,
             kind,
-            expr,
+            &cmd.def,
         )?;
         cooked.record(interp, relid, attr.attnum);
     }

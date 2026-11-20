@@ -11,7 +11,7 @@
 //! analyzer can tell.
 
 use super::*;
-use typedpg_pg_query::protobuf::PartitionBoundSpec;
+use typedpg_pg_query::ast::{self, PartitionBoundSpec};
 
 /// A partitioned table's strategy and key (`pg_partitioned_table`).
 #[derive(Clone, Debug)]
@@ -57,7 +57,7 @@ struct PartKey {
 /// The collation a `COLLATE` clause names.
 pub(crate) fn collation_clause(
     interp: &PgCatalog,
-    names: &[typedpg_pg_query::protobuf::Node],
+    names: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Option<crate::oid::PgCollationOid> {
     let names: Vec<&str> = names
         .iter()
@@ -181,12 +181,12 @@ pub(crate) enum Bound {
 pub(super) fn record_partition_spec(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    spec: &typedpg_pg_query::protobuf::PartitionSpec,
+    spec: &typedpg_pg_query::ast::PartitionSpec,
 ) {
-    use typedpg_pg_query::protobuf::PartitionStrategy as Ps;
-    let strategy = match Ps::try_from(spec.strategy) {
-        Ok(Ps::List) => Strategy::List,
-        Ok(Ps::Hash) => Strategy::Hash,
+    use typedpg_pg_query::ast::PartitionStrategy as Ps;
+    let strategy = match spec.strategy {
+        Ps::List => Strategy::List,
+        Ps::Hash => Strategy::Hash,
         _ => Strategy::Range,
     };
     let am = if strategy == Strategy::Hash {
@@ -196,14 +196,14 @@ pub(super) fn record_partition_spec(
     };
     // ComputePartitionAttrs: the key's operator class, as written or the
     // type's default (its errors were reported when the key was checked).
-    let opclass_of = |typ: PgTypeOid, pe: &typedpg_pg_query::protobuf::PartitionElem| {
+    let opclass_of = |typ: PgTypeOid, pe: &typedpg_pg_query::ast::PartitionElem| {
         crate::ddl::opclass::resolve_index_opclass(interp, &pe.opclass, typ, am)
             .ok()
             .flatten()
     };
     let mut keys = Vec::new();
     for elem in &spec.part_params {
-        let Some(node::Node::PartitionElem(pe)) = elem.node.as_ref() else {
+        let Some(ast::Node::PartitionElem(pe)) = elem.as_ref() else {
             continue;
         };
         // The key's collation: its COLLATE clause, else the column's.
@@ -223,7 +223,8 @@ pub(super) fn record_partition_spec(
                 strict_attnums: attr.map(|a| a.attnum).into_iter().collect(),
                 typmod: attr.and_then(|a| interp.effective_typmod(a.atttypid, a.atttypmod)),
             });
-        } else if let Some(expr) = pe.expr.as_deref() {
+        } else if pe.expr.is_some() {
+            let expr = &pe.expr;
             let (typ, expr_collation) =
                 match crate::ddl::volatile::infer_over_relation(interp, relid, expr, None) {
                     // The expression's collation (exprCollation), else its
@@ -368,13 +369,13 @@ fn transform_bound(
 /// transformPartitionRangeBounds + validateInfiniteBounds.
 fn range_datums(
     interp: &PgCatalog,
-    values: &[typedpg_pg_query::protobuf::Node],
+    values: &[Option<typedpg_pg_query::ast::Node>],
     keys: &[PartKey],
 ) -> Result<Vec<RangeDatum>, DdlError> {
     let mut out = Vec::new();
     for (v, key) in values.iter().zip(keys) {
-        let infinite = match v.node.as_ref() {
-            Some(node::Node::ColumnRef(cr)) if cr.fields.len() == 1 => {
+        let infinite = match v.as_ref() {
+            Some(ast::Node::ColumnRef(cr)) if cr.fields.len() == 1 => {
                 match cr.fields.first().and_then(super::super::util::node_string) {
                     Some(n) if n.eq_ignore_ascii_case("minvalue") => Some(RangeDatum::MinValue),
                     Some(n) if n.eq_ignore_ascii_case("maxvalue") => Some(RangeDatum::MaxValue),
@@ -423,7 +424,7 @@ fn range_datums(
 /// type. `None` is NULL.
 fn bound_value(
     interp: &PgCatalog,
-    v: &typedpg_pg_query::protobuf::Node,
+    v: &Option<typedpg_pg_query::ast::Node>,
     key: &PartKey,
 ) -> Result<Option<Datum>, DdlError> {
     let (key_type, key_name) = (&key.type_oid, &key.name);
@@ -431,8 +432,8 @@ fn bound_value(
     use crate::expr::{TypeGoal, infer_expr};
     use crate::pg_catalog::oid;
 
-    if let Some(inner) = v.node.as_ref()
-        && (matches!(inner, node::Node::ColumnRef(_))
+    if let Some(inner) = v.as_ref()
+        && (matches!(inner, ast::Node::ColumnRef(_))
             || inner
                 .nodes()
                 .into_iter()
@@ -447,7 +448,7 @@ fn bound_value(
         v,
         crate::ddl::expr_kind::ExprKind::PartitionBound,
     )?;
-    if let Some(node::Node::AConst(c)) = v.node.as_ref()
+    if let Some(ast::Node::AConst(c)) = v.as_ref()
         && c.isnull
     {
         return Ok(None);
@@ -479,7 +480,9 @@ fn bound_value(
         infer_expr(v, ctx(), &mut params, TypeGoal::assignment(*key_type))
             .map_err(|e| DdlError::Parse(e.to_string()))?;
     }
-    let datum = normalize(interp, v, key);
+    let datum = v
+        .as_ref()
+        .map_or(Datum::Opaque, |v| normalize(interp, v, key));
     // The value coerced to a `varchar(n)` / `char(n)` key: too long is an
     // error unless the excess is blanks, which go.
     if let Datum::Text(t) | Datum::CodePoints(t) = &datum
@@ -513,11 +516,7 @@ fn bound_value(
 }
 
 /// The comparable form of a bound constant.
-fn normalize(
-    interp: &PgCatalog,
-    v: &typedpg_pg_query::protobuf::Node,
-    part_key: &PartKey,
-) -> Datum {
+fn normalize(interp: &PgCatalog, v: &typedpg_pg_query::ast::Node, part_key: &PartKey) -> Datum {
     use crate::pg_catalog::oid;
     let key = interp.unwrap_domain(part_key.type_oid);
     let integer_key = [oid::INT2, oid::INT4, oid::INT8].contains(&key);
@@ -533,7 +532,7 @@ fn normalize(
     // modifier (`'bc'::char(1)` is `'b'`, `15::numeric(1,-1)` is 20), nor
     // through `bpchar` (whose trailing blanks a text key loses) or a date
     // (a timestamp key's time of day).
-    let keeps_value = |tc: &typedpg_pg_query::protobuf::TypeCast| {
+    let keeps_value = |tc: &typedpg_pg_query::ast::TypeCast| {
         let Some(t) = crate::nonnull::cast_target(tc, interp).map(|t| interp.unwrap_domain(t))
         else {
             return false;
@@ -543,14 +542,12 @@ fn normalize(
             || (integer_key && [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t))
             || (texts.contains(&key) && texts.contains(&t))
     };
-    let literal = match v.node.as_ref() {
-        Some(node::Node::AConst(c)) => c.val.as_ref(),
-        Some(node::Node::TypeCast(tc)) if keeps_value(tc) => {
-            match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
-                Some(node::Node::AConst(c)) => c.val.as_ref(),
-                _ => None,
-            }
-        }
+    let literal = match v {
+        ast::Node::AConst(c) => c.val.as_ref(),
+        ast::Node::TypeCast(tc) if keeps_value(tc) => match tc.arg.as_ref() {
+            Some(ast::Node::AConst(c)) => c.val.as_ref(),
+            _ => None,
+        },
         _ => None,
     };
     // The key's typmod: a `varchar(n)` / `char(n)` value loses the blanks
@@ -579,28 +576,28 @@ fn normalize(
     if integer_key && let Some(i) = fold_integer(v) {
         return Datum::Int(i);
     }
-    use typedpg_pg_query::protobuf::a_const::Val;
+    use typedpg_pg_query::ast::AConstValue;
     match literal {
-        Some(Val::Ival(i)) if integer_key => Datum::Int(i128::from(i.ival)),
+        Some(AConstValue::Integer(i)) if integer_key => Datum::Int(i128::from(i.ival)),
         // int2in / int4in / int8in.
-        Some(Val::Sval(s)) if integer_key => {
+        Some(AConstValue::String(s)) if integer_key => {
             crate::literal_input::parse_pg_integer(&s.sval).map_or(Datum::Opaque, Datum::Int)
         }
         // A numeric constant cast to an integer rounds half away from zero.
-        Some(Val::Fval(f)) if integer_key => {
+        Some(AConstValue::Float(f)) if integer_key => {
             round_numeric(&f.fval).map_or(Datum::Opaque, Datum::Int)
         }
         // boolin: the values of one truth are one bound value.
-        Some(Val::Boolval(b)) if bool_key => Datum::Int(i128::from(b.boolval)),
-        Some(Val::Sval(s)) if bool_key => crate::ddl::reloptions::parse_bool(&s.sval)
+        Some(AConstValue::Boolean(b)) if bool_key => Datum::Int(i128::from(b.boolval)),
+        Some(AConstValue::String(s)) if bool_key => crate::ddl::reloptions::parse_bool(&s.sval)
             .map_or(Datum::Opaque, |b| Datum::Int(i128::from(b))),
-        Some(Val::Sval(s)) if datetime_key => {
+        Some(AConstValue::String(s)) if datetime_key => {
             iso_datetime(&s.sval).map_or(Datum::Opaque, Datum::Stamp)
         }
-        Some(Val::Sval(s)) if text_key && part_key.code_point_order => {
+        Some(AConstValue::String(s)) if text_key && part_key.code_point_order => {
             Datum::CodePoints(fitted(&s.sval))
         }
-        Some(Val::Sval(s)) if text_key => Datum::Text(fitted(&s.sval)),
+        Some(AConstValue::String(s)) if text_key => Datum::Text(fitted(&s.sval)),
         _ => Datum::Opaque,
     }
 }
@@ -642,18 +639,18 @@ fn round_numeric(text: &str) -> Option<i128> {
 
 /// Evaluate an integer constant expression of `+`, `-`, `*` over integer
 /// literals (evaluate_expr for the common case).
-fn fold_integer(v: &typedpg_pg_query::protobuf::Node) -> Option<i128> {
-    use typedpg_pg_query::protobuf::a_const::Val;
-    match v.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            Val::Ival(i) => Some(i128::from(i.ival)),
-            Val::Fval(f) if !f.fval.contains(['.', 'e', 'E']) => f.fval.parse().ok(),
+fn fold_integer(v: &typedpg_pg_query::ast::Node) -> Option<i128> {
+    use typedpg_pg_query::ast::AConstValue;
+    match v {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            AConstValue::Integer(i) => Some(i128::from(i.ival)),
+            AConstValue::Float(f) if !f.fval.contains(['.', 'e', 'E']) => f.fval.parse().ok(),
             _ => None,
         },
-        node::Node::AExpr(e) if e.kind == typedpg_pg_query::protobuf::AExprKind::AexprOp as i32 => {
+        ast::Node::AExpr(e) if e.kind == typedpg_pg_query::ast::AExprKind::AexprOp => {
             let op = e.name.first().and_then(super::super::util::node_string)?;
-            let r = fold_integer(e.rexpr.as_deref()?)?;
-            match e.lexpr.as_deref() {
+            let r = fold_integer(e.rexpr.as_ref()?)?;
+            match e.lexpr.as_ref() {
                 None if op == "-" => Some(-r),
                 None if op == "+" => Some(r),
                 Some(l) => {
@@ -862,7 +859,7 @@ pub(crate) fn partition_constraint_check(
     interp: &PgCatalog,
     parent: PgClassOid,
     part: PgClassOid,
-) -> Option<(typedpg_pg_query::protobuf::Node, Vec<String>)> {
+) -> Option<(typedpg_pg_query::ast::Node, Vec<String>)> {
     let spec = interp.partition_specs.get(&parent)?;
     let bound = interp.partition_bounds.get(&part)?;
     let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
@@ -951,14 +948,14 @@ pub(crate) fn partition_constraint_check(
     }
     let sql = format!("SELECT {}", conjuncts.join(" AND "));
     let parsed = typedpg_pg_query::parse(&sql).ok()?;
-    let stmt = parsed.protobuf.stmts.into_iter().next()?.stmt?;
-    let node::Node::SelectStmt(sel) = stmt.node? else {
+    let stmt = parsed.tree.stmts.into_iter().next()?.stmt?;
+    let ast::Node::SelectStmt(sel) = stmt else {
         return None;
     };
-    let node::Node::ResTarget(rt) = sel.target_list.into_iter().next()?.node? else {
+    let ast::Node::ResTarget(rt) = sel.into_inner().target_list.into_iter().next()?? else {
         return None;
     };
-    Some((*rt.val?, vars))
+    Some((rt.into_inner().val?, vars))
 }
 
 /// What the partition constraint of `part` (get_qual_from_partbound) says
@@ -1083,7 +1080,7 @@ impl Route {
 pub(crate) fn route_row<'a>(
     interp: &PgCatalog,
     relid: PgClassOid,
-    value_of: &dyn Fn(&str) -> Option<Option<&'a typedpg_pg_query::protobuf::Node>>,
+    value_of: &dyn Fn(&str) -> Option<Option<&'a typedpg_pg_query::ast::Node>>,
 ) -> Route {
     route_row_opt(interp, relid, value_of).unwrap_or(Route::Unknown)
 }
@@ -1092,7 +1089,7 @@ pub(crate) fn route_row<'a>(
 fn route_row_opt<'a>(
     interp: &PgCatalog,
     relid: PgClassOid,
-    value_of: &dyn Fn(&str) -> Option<Option<&'a typedpg_pg_query::protobuf::Node>>,
+    value_of: &dyn Fn(&str) -> Option<Option<&'a typedpg_pg_query::ast::Node>>,
 ) -> Option<Route> {
     let Some(spec) = interp.partition_specs.get(&relid) else {
         return Some(Route::Leaf(relid));
@@ -1202,11 +1199,11 @@ fn route_row_opt<'a>(
 /// [`fold_integer`]) stays within `integer`'s range — the type of its
 /// literals' arithmetic, which overflows (`integer out of range`) past it.
 /// A plain constant does; so does anything that isn't arithmetic.
-fn folds_within_int4(v: &typedpg_pg_query::protobuf::Node) -> bool {
-    match v.node.as_ref() {
-        Some(node::Node::AExpr(e)) => {
+fn folds_within_int4(v: &typedpg_pg_query::ast::Node) -> bool {
+    match v {
+        ast::Node::AExpr(e) => {
             fold_integer(v).is_some_and(|i| i32::try_from(i).is_ok())
-                && [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                && [e.lexpr.as_ref(), e.rexpr.as_ref()]
                     .into_iter()
                     .flatten()
                     .all(folds_within_int4)

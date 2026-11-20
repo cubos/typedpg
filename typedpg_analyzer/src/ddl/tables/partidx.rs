@@ -7,6 +7,7 @@
 //! detach with the partition.
 
 use super::*;
+use typedpg_pg_query::ast;
 
 /// The constraint an index backs, if any (the constraint shares its name).
 pub(crate) fn backing_constraint(interp: &PgCatalog, index: PgClassOid) -> Option<PgConstraint> {
@@ -434,8 +435,7 @@ pub(crate) fn attach_partition_index(
     parent_index: PgClassOid,
     cmd: &AlterTableCmd,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::PartitionCmd(pc)) = cmd.def.as_deref().and_then(|d| d.node.as_ref())
-    else {
+    let Some(ast::Node::PartitionCmd(pc)) = cmd.def.as_ref() else {
         return Ok(());
     };
     let Some(rv) = pc.name.as_ref() else {

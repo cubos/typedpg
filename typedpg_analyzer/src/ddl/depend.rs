@@ -2,7 +2,7 @@
 //! and pg_depend.c): recording what an object depends on, and the checks a
 //! DROP makes against what depends on its targets.
 
-use typedpg_pg_query::protobuf::{ObjectType, node};
+use typedpg_pg_query::ast::{self, ObjectType};
 
 use crate::oid::{PgCastOid, PgClassOid, PgGenericOid, PgOperatorOid, PgProcOid, PgTypeOid};
 use crate::pg_catalog::{
@@ -17,10 +17,10 @@ use crate::pg_catalog::{
 pub(crate) fn drop_target_identity(
     interp: &PgCatalog,
     obj_type: ObjectType,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
 ) -> Option<(i32, u32)> {
     let kind = obj_type as i32;
-    match (obj_type, obj_node.node.as_ref()?) {
+    match (obj_type, obj_node.as_ref()?) {
         (
             ObjectType::ObjectTable
             | ObjectType::ObjectView
@@ -28,14 +28,14 @@ pub(crate) fn drop_target_identity(
             | ObjectType::ObjectSequence
             | ObjectType::ObjectForeignTable
             | ObjectType::ObjectIndex,
-            node::Node::List(list),
+            ast::Node::List(list),
         ) => {
             let (schema, name) = super::util::extract_names(&list.items, interp);
             let nsoid = interp.namespace_oid(&schema)?;
             let oid = interp.class_by_qname.get(&(nsoid, name))?;
             Some((kind, oid.get()))
         }
-        (ObjectType::ObjectType | ObjectType::ObjectDomain, node::Node::TypeName(tn)) => {
+        (ObjectType::ObjectType | ObjectType::ObjectDomain, ast::Node::TypeName(tn)) => {
             let oid = super::util::resolve_type_name(tn, interp)?;
             Some((kind, oid.get()))
         }
@@ -44,14 +44,14 @@ pub(crate) fn drop_target_identity(
             | ObjectType::ObjectProcedure
             | ObjectType::ObjectRoutine
             | ObjectType::ObjectAggregate,
-            node::Node::ObjectWithArgs(owa),
+            ast::Node::ObjectWithArgs(owa),
         ) => {
             let oid = super::functions::lookup_func_with_args(interp, obj_type, owa, true)
                 .ok()
                 .flatten()?;
             Some((kind, oid.get()))
         }
-        (ObjectType::ObjectCollation, node::Node::List(list)) => {
+        (ObjectType::ObjectCollation, ast::Node::List(list)) => {
             let names: Vec<&str> = list
                 .items
                 .iter()
@@ -65,15 +65,15 @@ pub(crate) fn drop_target_identity(
             let oid = interp.resolve_collation(schema, name)?.oid;
             Some((kind, oid.get()))
         }
-        (ObjectType::ObjectOperator, node::Node::ObjectWithArgs(_)) => {
+        (ObjectType::ObjectOperator, ast::Node::ObjectWithArgs(_)) => {
             let oid = super::drop::operator_target(interp, obj_node)?;
             Some((kind, oid.get()))
         }
-        (ObjectType::ObjectExtension, node::Node::String(s)) => {
+        (ObjectType::ObjectExtension, ast::Node::String(s)) => {
             let oid = interp.extension_by_name.get(&s.sval)?;
             Some((kind, oid.get()))
         }
-        (ObjectType::ObjectSchema, node::Node::String(s)) => {
+        (ObjectType::ObjectSchema, ast::Node::String(s)) => {
             let oid = interp.namespace_oid(&s.sval)?;
             Some((kind, oid.get()))
         }
@@ -82,7 +82,7 @@ pub(crate) fn drop_target_identity(
             | ObjectType::ObjectTsdictionary
             | ObjectType::ObjectTsparser
             | ObjectType::ObjectTstemplate,
-            node::Node::List(list),
+            ast::Node::List(list),
         ) => {
             let ts_kind = match obj_type {
                 ObjectType::ObjectTsconfiguration => "c",
@@ -93,25 +93,25 @@ pub(crate) fn drop_target_identity(
             let oid = super::text_search::drop_target_oid(interp, ts_kind, &list.items)?;
             Some((kind, oid.get()))
         }
-        (ObjectType::ObjectFdw, node::Node::String(s)) => {
+        (ObjectType::ObjectFdw, ast::Node::String(s)) => {
             let oid = interp.foreign_data.wrapper_oid(&s.sval)?;
             Some((kind, oid.get()))
         }
-        (ObjectType::ObjectAccessMethod, node::Node::String(s)) => {
+        (ObjectType::ObjectAccessMethod, ast::Node::String(s)) => {
             let oid = interp.access_method_oids.get(&s.sval)?;
             Some((kind, oid.get()))
         }
         // Objects the analyzer keeps by name only: an identity stable within
         // the statement, which no address resolves (`of_drop_target`).
-        (ObjectType::ObjectForeignServer, node::Node::String(s)) => {
+        (ObjectType::ObjectForeignServer, ast::Node::String(s)) => {
             super::fdw::check_server(interp, &s.sval).ok()?;
             Some((kind, name_identity(&s.sval)))
         }
-        (ObjectType::ObjectPublication, node::Node::String(s)) => {
+        (ObjectType::ObjectPublication, ast::Node::String(s)) => {
             interp.publications.iter().find(|p| p.name == s.sval)?;
             Some((kind, name_identity(&s.sval)))
         }
-        (ObjectType::ObjectConversion | ObjectType::ObjectStatisticExt, node::Node::List(list)) => {
+        (ObjectType::ObjectConversion | ObjectType::ObjectStatisticExt, ast::Node::List(list)) => {
             let names: Vec<&str> = list
                 .items
                 .iter()
@@ -1975,7 +1975,7 @@ pub(crate) fn drop_column_dependents(
 /// nothing the analyzer can tell.
 pub(crate) fn expression_references(
     interp: &PgCatalog,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
     relid: Option<PgClassOid>,
 ) -> Vec<Reference> {
     let mut scope = crate::scope::Scope::default();
@@ -2012,16 +2012,16 @@ pub(crate) fn expression_references(
 /// becomes a constant naming its object.
 pub(crate) fn coerced_expression_references(
     interp: &PgCatalog,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
     relid: Option<PgClassOid>,
     target: Option<crate::oid::PgTypeOid>,
 ) -> Vec<Reference> {
-    use typedpg_pg_query::protobuf::a_const;
+    use typedpg_pg_query::ast;
     let mut refs = expression_references(interp, expr, relid);
     if let Some(target) = target
-        && let Some(node::Node::AConst(ac)) = expr.node.as_ref()
+        && let Some(ast::Node::AConst(ac)) = expr.as_ref()
         && !ac.isnull
-        && let Some(a_const::Val::Sval(sv)) = &ac.val
+        && let Some(ast::AConstValue::String(sv)) = &ac.val
     {
         let (_, literal) =
             collect(|| crate::literal_input::validate_with_typmod(&sv.sval, target, None, interp));
@@ -2068,13 +2068,13 @@ pub(crate) fn note_expr_type_use(interp: &mut PgCatalog, addr: ObjectAddress, us
 /// target's base type, wrapped in a CoerceToDomain for each domain over it.
 pub(crate) fn literal_coercion_references(
     interp: &PgCatalog,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
     target: crate::oid::PgTypeOid,
 ) -> Vec<Reference> {
-    use typedpg_pg_query::protobuf::a_const;
+    use typedpg_pg_query::ast;
     let literal = matches!(
-        expr.node.as_ref(),
-        Some(node::Node::AConst(ac)) if !ac.isnull && matches!(ac.val, Some(a_const::Val::Sval(_)))
+        expr.as_ref(),
+        Some(ast::Node::AConst(ac)) if !ac.isnull && matches!(ac.val, Some(ast::AConstValue::String(_)))
     );
     let mut refs = Vec::new();
     let mut t = Some(target);
@@ -2089,7 +2089,7 @@ pub(crate) fn literal_coercion_references(
 /// analyzer can type).
 fn result_types(
     interp: &PgCatalog,
-    exprs: &[&typedpg_pg_query::protobuf::Node],
+    exprs: &[&Option<typedpg_pg_query::ast::Node>],
     relid: PgClassOid,
 ) -> Vec<crate::oid::PgTypeOid> {
     exprs
@@ -2107,7 +2107,7 @@ fn result_types(
 fn record_expressions(
     interp: &mut PgCatalog,
     depender: ObjectAddress,
-    exprs: &[&typedpg_pg_query::protobuf::Node],
+    exprs: &[&Option<typedpg_pg_query::ast::Node>],
     relid: Option<PgClassOid>,
     results: &[crate::oid::PgTypeOid],
 ) {
@@ -2119,7 +2119,7 @@ fn record_expressions(
 fn record_coerced_expressions(
     interp: &mut PgCatalog,
     depender: ObjectAddress,
-    exprs: &[&typedpg_pg_query::protobuf::Node],
+    exprs: &[&Option<typedpg_pg_query::ast::Node>],
     relid: Option<PgClassOid>,
     target: Option<crate::oid::PgTypeOid>,
     results: &[crate::oid::PgTypeOid],
@@ -2198,7 +2198,7 @@ pub(crate) fn record_column_expression(interp: &mut PgCatalog, relid: PgClassOid
 pub(crate) fn record_partition_key_expressions(
     interp: &mut PgCatalog,
     relid: PgClassOid,
-    exprs: &[&typedpg_pg_query::protobuf::Node],
+    exprs: &[&Option<typedpg_pg_query::ast::Node>],
 ) {
     let results = result_types(interp, exprs, relid);
     let refers = type_references(
@@ -2228,14 +2228,14 @@ pub(crate) fn record_index_expressions(interp: &mut PgCatalog, index: PgClassOid
         return;
     };
     let relid = row.indrelid;
-    let key_exprs: Vec<typedpg_pg_query::protobuf::Node> =
+    let key_exprs: Vec<Option<typedpg_pg_query::ast::Node>> =
         row.indexprs.iter().map(|e| e.ast.clone()).collect();
-    let exprs: Vec<typedpg_pg_query::protobuf::Node> = key_exprs
+    let exprs: Vec<Option<typedpg_pg_query::ast::Node>> = key_exprs
         .iter()
         .cloned()
         .chain(row.indpred.iter().map(|e| e.ast.clone()))
         .collect();
-    let refs: Vec<&typedpg_pg_query::protobuf::Node> = exprs.iter().collect();
+    let refs: Vec<&Option<typedpg_pg_query::ast::Node>> = exprs.iter().collect();
     // The key expressions produce the index's column types (the predicate
     // a boolean, pinned).
     let results = result_types(interp, &key_exprs.iter().collect::<Vec<_>>(), relid);
@@ -2276,7 +2276,7 @@ pub(crate) fn record_publication_rel(
     interp: &mut PgCatalog,
     publication: &str,
     relid: PgClassOid,
-    table: &typedpg_pg_query::protobuf::PublicationTable,
+    table: &typedpg_pg_query::ast::PublicationTable,
 ) -> Result<(), super::DdlError> {
     let mut refs: Vec<Reference> = table
         .columns
@@ -2284,8 +2284,12 @@ pub(crate) fn record_publication_rel(
         .filter_map(super::util::node_string)
         .map(|c| Reference::Column(relid, c.to_owned()))
         .collect();
-    if let Some(filter) = table.where_clause.as_deref() {
-        refs.extend(expression_references(interp, filter, Some(relid)));
+    if table.where_clause.is_some() {
+        refs.extend(expression_references(
+            interp,
+            &table.where_clause,
+            Some(relid),
+        ));
     }
     let addr = named_object(
         interp,

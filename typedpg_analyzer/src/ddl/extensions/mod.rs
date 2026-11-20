@@ -10,7 +10,7 @@
 //! 2. Add an `ExtensionDef` entry to the `REGISTRY` array below
 //! 3. Run `./update_extensions.sh` to fetch from PG upstream
 
-use typedpg_pg_query::protobuf::{AlterExtensionStmt, CreateExtensionStmt, node};
+use typedpg_pg_query::ast::{self, AlterExtensionStmt, CreateExtensionStmt};
 
 use super::DdlError;
 use super::util::ensure_namespace;
@@ -91,7 +91,7 @@ pub fn create_extension(
     // get_required_extension: required extensions must be installed, or
     // are installed first with CASCADE.
     let cascade = stmt.options.iter().any(|o| {
-        matches!(o.node.as_ref(), Some(typedpg_pg_query::protobuf::node::Node::DefElem(de))
+        matches!(o.as_ref(), Some(typedpg_pg_query::ast::Node::DefElem(de))
             if de.defname == "cascade")
     });
     for required in requires(name) {
@@ -108,7 +108,7 @@ pub fn create_extension(
         sub.extname = (*required).to_owned();
         sub.if_not_exists = true;
         sub.options.retain(|o| {
-            !matches!(o.node.as_ref(), Some(typedpg_pg_query::protobuf::node::Node::DefElem(de))
+            !matches!(o.as_ref(), Some(typedpg_pg_query::ast::Node::DefElem(de))
                 if de.defname == "new_version")
         });
         create_extension(interp, &sub)?;
@@ -603,12 +603,11 @@ fn substitute_extschema(
 }
 
 /// Extract a string option from CREATE/ALTER EXTENSION options.
-fn extract_option(options: &[typedpg_pg_query::protobuf::Node], name: &str) -> Option<String> {
+fn extract_option(options: &[Option<typedpg_pg_query::ast::Node>], name: &str) -> Option<String> {
     for opt in options {
-        if let Some(typedpg_pg_query::protobuf::node::Node::DefElem(de)) = opt.node.as_ref()
+        if let Some(typedpg_pg_query::ast::Node::DefElem(de)) = opt.as_ref()
             && de.defname == name
-            && let Some(arg) = de.arg.as_deref()
-            && let Some(typedpg_pg_query::protobuf::node::Node::String(s)) = arg.node.as_ref()
+            && let Some(typedpg_pg_query::ast::Node::String(s)) = de.arg.as_ref()
         {
             return Some(s.sval.clone());
         }
@@ -633,18 +632,18 @@ fn extension_oid(interp: &PgCatalog, name: &str) -> Result<PgExtensionOid, DdlEr
 /// going along with a DROP EXTENSION, or no longer.
 pub fn alter_object_depends(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterObjectDependsStmt,
+    stmt: &typedpg_pg_query::ast::AlterObjectDependsStmt,
 ) -> Result<(), DdlError> {
     use super::depend::ObjectAddress;
-    use typedpg_pg_query::protobuf::{List, Node, ObjectType};
-    let objtype = ObjectType::try_from(stmt.object_type).unwrap_or(ObjectType::Undefined);
-    let string = |s: &str| Node {
-        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
-            sval: s.to_owned(),
-        })),
+    use typedpg_pg_query::ast::{List, ObjectType};
+    let objtype = stmt.object_type;
+    let string = |s: &str| {
+        Some(ast::Node::String(
+            typedpg_pg_query::ast::String { sval: s.to_owned() }.into(),
+        ))
     };
     // get_object_address_rv: the relation's name heads the object's.
-    let object = stmt.object.as_deref().and_then(|o| o.node.clone());
+    let object = stmt.object.clone();
     let object = match (stmt.relation.as_ref(), object) {
         (Some(rv), object) => {
             let mut items = Vec::new();
@@ -652,10 +651,10 @@ pub fn alter_object_depends(
                 items.push(string(&rv.schemaname));
             }
             items.push(string(&rv.relname));
-            if let Some(node::Node::List(l)) = object {
-                items.extend(l.items);
+            if let Some(ast::Node::List(l)) = object {
+                items.extend(l.into_inner().items);
             }
-            node::Node::List(List { items })
+            ast::Node::List(List { items }.into())
         }
         (None, Some(object)) => object,
         (None, None) => return Ok(()),
@@ -672,7 +671,7 @@ pub fn alter_object_depends(
         interp.resolve_table(schema, &rv.relname).map(|c| c.oid)
     };
     let address = match (objtype, &object) {
-        (ObjectType::ObjectTrigger, node::Node::List(l)) => {
+        (ObjectType::ObjectTrigger, ast::Node::List(l)) => {
             let name = l.items.last().and_then(super::util::node_string);
             relation(interp).and_then(|relid| {
                 let trigger = interp
@@ -690,7 +689,7 @@ pub fn alter_object_depends(
         (ObjectType::ObjectIndex | ObjectType::ObjectMatview, _) => {
             relation(interp).map(ObjectAddress::relation)
         }
-        (_, node::Node::ObjectWithArgs(owa)) => {
+        (_, ast::Node::ObjectWithArgs(owa)) => {
             super::functions::lookup_func_with_args(interp, objtype, owa, false)?
                 .map(ObjectAddress::proc)
         }
@@ -706,11 +705,11 @@ pub fn alter_object_depends(
 /// with PG's description of it (getObjectDescription).
 fn member_object(
     interp: &PgCatalog,
-    objtype: typedpg_pg_query::protobuf::ObjectType,
-    object: &typedpg_pg_query::protobuf::node::Node,
+    objtype: typedpg_pg_query::ast::ObjectType,
+    object: &typedpg_pg_query::ast::Node,
 ) -> Result<Option<(PgClassOid, PgGenericOid, String)>, DdlError> {
-    use typedpg_pg_query::protobuf::ObjectType;
-    use typedpg_pg_query::protobuf::node::Node;
+    use typedpg_pg_query::ast::Node;
+    use typedpg_pg_query::ast::ObjectType;
     super::comment::resolve_object(interp, objtype, object)?;
     let names = |n: &Node| -> Vec<String> {
         match n {
@@ -764,10 +763,8 @@ fn member_object(
             ))
         }
         ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine => {
-            let boxed = Some(Box::new(typedpg_pg_query::protobuf::Node {
-                node: Some(object.clone()),
-            }));
-            let Some((schema, name, args)) = super::alter::extract_func_target(&boxed, interp)
+            let wrapped = Some(object.clone());
+            let Some((schema, name, args)) = super::alter::extract_func_target(&wrapped, interp)
             else {
                 return Ok(None);
             };
@@ -788,9 +785,7 @@ fn member_object(
             ))
         }
         ObjectType::ObjectOperator => {
-            let wrapped = typedpg_pg_query::protobuf::Node {
-                node: Some(object.clone()),
-            };
+            let wrapped = Some(object.clone());
             let Some(oid) = super::drop::lookup_operator(interp, &wrapped)? else {
                 return Ok(None);
             };
@@ -809,7 +804,7 @@ fn member_object(
 /// (ExecAlterExtensionContentsRecurse).
 pub fn alter_extension_contents(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::AlterExtensionContentsStmt,
+    stmt: &typedpg_pg_query::ast::AlterExtensionContentsStmt,
 ) -> Result<(), DdlError> {
     // The extension's own scripts add and drop members while its
     // membership is still being recorded.
@@ -817,11 +812,10 @@ pub fn alter_extension_contents(
         return Ok(());
     }
     let ext = extension_oid(interp, &stmt.extname)?;
-    let Some(object) = stmt.object.as_deref().and_then(|o| o.node.as_ref()) else {
+    let Some(object) = stmt.object.as_ref() else {
         return Ok(());
     };
-    let objtype = typedpg_pg_query::protobuf::ObjectType::try_from(stmt.objtype)
-        .unwrap_or(typedpg_pg_query::protobuf::ObjectType::Undefined);
+    let objtype = stmt.objtype;
     let Some((classid, objid, description)) = member_object(interp, objtype, object)? else {
         return Ok(());
     };
@@ -977,8 +971,8 @@ const BRIN_BLOOM_OPTIONS: &[(&str, OpclassOption)] = &[
 /// column's operator class must be the class's own, in range.
 pub(crate) fn check_opclass_options(
     interp: &PgCatalog,
-    opclass: &[typedpg_pg_query::protobuf::Node],
-    options: &[typedpg_pg_query::protobuf::Node],
+    opclass: &[Option<typedpg_pg_query::ast::Node>],
+    options: &[Option<typedpg_pg_query::ast::Node>],
     am: &str,
 ) -> Result<(), DdlError> {
     if options.is_empty() {
@@ -1020,7 +1014,7 @@ pub(crate) fn check_opclass_options(
         )));
     };
     for opt in options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         let Some(&(option, kind)) = spec.iter().find(|(o, _)| *o == de.defname) else {
@@ -1030,11 +1024,11 @@ pub(crate) fn check_opclass_options(
             )));
         };
         // transformRelOptions: an option written without a value is `true`.
-        let text = match de.arg.as_deref().and_then(|a| a.node.as_ref()) {
-            Some(node::Node::Integer(i)) => i.ival.to_string(),
-            Some(node::Node::String(s)) => s.sval.clone(),
-            Some(node::Node::Float(f)) => f.fval.clone(),
-            Some(node::Node::TypeName(tn)) => super::util::type_name_to_string(tn),
+        let text = match de.arg.as_ref() {
+            Some(ast::Node::Integer(i)) => i.ival.to_string(),
+            Some(ast::Node::String(s)) => s.sval.clone(),
+            Some(ast::Node::Float(f)) => f.fval.clone(),
+            Some(ast::Node::TypeName(tn)) => super::util::type_name_to_string(tn),
             None => "true".to_owned(),
             _ => String::new(),
         };

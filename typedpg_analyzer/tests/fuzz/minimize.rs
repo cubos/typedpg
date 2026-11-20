@@ -1,4 +1,5 @@
 use super::*;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Minimization — shrink a failing query while preserving the divergence kind.
@@ -11,18 +12,18 @@ pub(crate) fn reductions(sql: &str) -> Vec<String> {
     let Ok(parsed) = typedpg_pg_query::parse(&named_to_positional(sql)) else {
         return Vec::new();
     };
-    // The wrapper `ParseResult` isn't `Clone`, but the inner protobuf message
+    // The wrapper `ParseResult` isn't `Clone`, but the inner AST
     // is — work on it and print it with the fuzzer's printer.
-    let proto = parsed.protobuf;
+    let proto = parsed.tree;
     let mut out = Vec::new();
 
     // Work on a fresh clone per reduction so edits don't compound.
     for stmt_idx in 0..proto.stmts.len() {
-        let make = |edit: &dyn Fn(&mut protobuf::SelectStmt)| -> Option<String> {
+        let make = |edit: &dyn Fn(&mut ast::SelectStmt)| -> Option<String> {
             let mut clone = proto.clone();
             let raw = clone.stmts.get_mut(stmt_idx)?;
-            let node = raw.stmt.as_mut()?.node.as_mut()?;
-            if let NodeEnum::SelectStmt(sel) = node {
+            let node = raw.stmt.as_mut()?;
+            if let Node::SelectStmt(sel) = node {
                 edit(sel.as_mut());
             } else {
                 return None;
@@ -40,8 +41,7 @@ pub(crate) fn reductions(sql: &str) -> Vec<String> {
         }
         // Clear each optional clause independently.
         for clear in [
-            (|sel: &mut protobuf::SelectStmt| sel.where_clause = None)
-                as fn(&mut protobuf::SelectStmt),
+            (|sel: &mut ast::SelectStmt| sel.where_clause = None) as fn(&mut ast::SelectStmt),
             |sel| sel.having_clause = None,
             |sel| sel.group_clause.clear(),
             |sel| sel.sort_clause.clear(),

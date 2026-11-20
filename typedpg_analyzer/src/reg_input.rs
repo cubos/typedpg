@@ -314,7 +314,7 @@ fn deconstruct(names: &[String]) -> Result<(Option<&str>, &str), String> {
 /// name (the grammar's own errors otherwise), not `SETOF`, and name an
 /// existing type with a valid modifier — whose OID is returned.
 fn parse_type_string(content: &str, snapshot: &PgCatalog) -> Result<PgTypeOid, String> {
-    use typedpg_pg_query::protobuf::node;
+    use typedpg_pg_query::ast;
     // typeStringToTypeName fails an empty / all-whitespace value before
     // the grammar sees it.
     if content
@@ -338,18 +338,18 @@ fn parse_type_string(content: &str, snapshot: &PgCatalog) -> Result<PgTypeOid, S
     };
     // Anything but exactly `NULL::<type>` there (`setof int` reads as a
     // cast to a type `setof` aliased `int`) is a SETOF type name.
-    let tn = match parsed.protobuf.stmts.as_slice() {
-        [stmt] => match stmt.stmt.as_deref().and_then(|n| n.node.as_ref()) {
-            Some(node::Node::SelectStmt(sel))
+    let tn = match parsed.tree.stmts.as_slice() {
+        [stmt] => match stmt.stmt.as_ref() {
+            Some(ast::Node::SelectStmt(sel))
                 if sel.from_clause.is_empty()
                     && sel.where_clause.is_none()
                     && sel.into_clause.is_none() =>
             {
                 match sel.target_list.as_slice() {
-                    [t] => match t.node.as_ref() {
-                        Some(node::Node::ResTarget(rt)) if rt.name.is_empty() => {
-                            match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
-                                Some(node::Node::TypeCast(c)) => c.type_name.as_ref(),
+                    [t] => match t.as_ref() {
+                        Some(ast::Node::ResTarget(rt)) if rt.name.is_empty() => {
+                            match rt.val.as_ref() {
+                                Some(ast::Node::TypeCast(c)) => c.type_name.as_ref(),
                                 _ => None,
                             }
                         }

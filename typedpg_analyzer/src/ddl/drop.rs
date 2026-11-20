@@ -1,6 +1,6 @@
 //! DROP statement handler.
 
-use typedpg_pg_query::protobuf::{DropBehavior, DropStmt, ObjectType, node};
+use typedpg_pg_query::ast::{self, DropBehavior, DropStmt, ObjectType};
 
 use super::DdlError;
 use super::util::{extract_names, format_type_for_message, node_string, resolve_type_name};
@@ -16,11 +16,8 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
     // A TOAST table outlives the columns that needed it, which a CASCADE
     // can drop.
     super::tables::toast::note_toast_tables(interp);
-    let obj_type = ObjectType::try_from(stmt.remove_type).unwrap_or(ObjectType::Undefined);
-    let cascade = matches!(
-        DropBehavior::try_from(stmt.behavior),
-        Ok(DropBehavior::DropCascade)
-    );
+    let obj_type = stmt.remove_type;
+    let cascade = matches!(stmt.behavior, DropBehavior::DropCascade);
     if stmt.concurrent {
         super::indexes::check_drop_concurrently(interp, stmt)?;
     }
@@ -30,8 +27,8 @@ pub fn drop_objects(interp: &mut PgCatalog, stmt: &DropStmt) -> Result<(), DdlEr
     let named_relations: Vec<PgClassOid> = stmt
         .objects
         .iter()
-        .filter_map(|obj_node| match obj_node.node.as_ref() {
-            Some(node::Node::List(list)) => {
+        .filter_map(|obj_node| match obj_node.as_ref() {
+            Some(ast::Node::List(list)) => {
                 let (schema, name) = extract_names(&list.items, interp);
                 let nsoid = interp.namespace_oid(&schema)?;
                 interp.class_by_qname.get(&(nsoid, name)).copied()
@@ -99,7 +96,7 @@ fn drop_each(
             }
             ObjectType::ObjectType | ObjectType::ObjectDomain => {
                 if obj_type == ObjectType::ObjectDomain
-                    && let Some(node::Node::TypeName(tn)) = obj_node.node.as_ref()
+                    && let Some(ast::Node::TypeName(tn)) = obj_node.as_ref()
                 {
                     // get_object_address_type: `"d[]" is not a domain`.
                     if let Ok(oid) = super::util::lookup_type_name(tn, interp)
@@ -204,14 +201,14 @@ fn drop_each(
 
 fn drop_relation(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
     requested: ObjectType,
     named_relations: &[PgClassOid],
 ) -> Result<(), DdlError> {
-    let names = match obj_node.node.as_ref() {
-        Some(node::Node::List(list)) => &list.items,
+    let names = match obj_node.as_ref() {
+        Some(ast::Node::List(list)) => &list.items,
         _ => return Ok(()),
     };
 
@@ -542,19 +539,20 @@ fn drop_relation_oid(
             .namespace_name(typ.typnamespace)
             .unwrap_or_default()
             .to_owned();
-        let type_name = typedpg_pg_query::protobuf::Node {
-            node: Some(node::Node::TypeName(typedpg_pg_query::protobuf::TypeName {
+        let type_name = Some(typedpg_pg_query::ast::Node::TypeName(
+            typedpg_pg_query::ast::TypeName {
                 names: [schema, typ.typname.clone()]
                     .into_iter()
-                    .map(|s| typedpg_pg_query::protobuf::Node {
-                        node: Some(node::Node::String(typedpg_pg_query::protobuf::String {
-                            sval: s,
-                        })),
+                    .map(|s| {
+                        Some(typedpg_pg_query::ast::Node::String(
+                            typedpg_pg_query::ast::String { sval: s }.into(),
+                        ))
                     })
                     .collect(),
                 ..Default::default()
-            })),
-        };
+            }
+            .into(),
+        ));
         drop_type(interp, &type_name, true, true)?;
     }
     for (relid, attnum) in dependent_defaults {
@@ -721,12 +719,12 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
 /// `CREATE UNIQUE INDEX` may have synthesized for ON CONFLICT matching.
 fn drop_index(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let names = match obj_node.node.as_ref() {
-        Some(node::Node::List(list)) => &list.items,
+    let names = match obj_node.as_ref() {
+        Some(ast::Node::List(list)) => &list.items,
         _ => return Ok(()),
     };
     let (schema, name) = extract_names(names, interp);
@@ -917,19 +915,19 @@ fn drop_index(
 
 fn drop_type(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let names: &[typedpg_pg_query::protobuf::Node] = match obj_node.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => &tn.names,
-        Some(node::Node::List(list)) => &list.items,
+    let names: &[Option<typedpg_pg_query::ast::Node>] = match obj_node.as_ref() {
+        Some(ast::Node::TypeName(tn)) => &tn.names,
+        Some(ast::Node::List(list)) => &list.items,
         _ => return Ok(()),
     };
 
-    let type_oid = match obj_node.node.as_ref() {
+    let type_oid = match obj_node.as_ref() {
         // LookupTypeNameOid: `e[]` names e's array type.
-        Some(node::Node::TypeName(tn)) => match super::util::lookup_type_name(tn, interp) {
+        Some(ast::Node::TypeName(tn)) => match super::util::lookup_type_name(tn, interp) {
             Ok(oid) => oid,
             Err(_) if missing_ok => return Ok(()),
             Err(e) => return Err(e),
@@ -1230,12 +1228,12 @@ fn drop_type_oid(interp: &mut PgCatalog, type_oid: PgTypeOid, deps: TypeDependen
 
 fn drop_extension(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let name = match obj_node.node.as_ref() {
-        Some(node::Node::String(s)) => s.sval.clone(),
+    let name = match obj_node.as_ref() {
+        Some(ast::Node::String(s)) => s.sval.clone(),
         _ => return Ok(()),
     };
 
@@ -1438,12 +1436,12 @@ pub(crate) fn drop_extension_oid(
 /// `DROP FUNCTION` / `DROP PROCEDURE` / `DROP ROUTINE`.
 fn drop_function(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
     expected_kind: ObjectType,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::ObjectWithArgs(owa)) = obj_node.as_ref() else {
         return Ok(());
     };
 
@@ -1575,11 +1573,11 @@ pub(crate) fn view_dependent_detail(interp: &PgCatalog, view: PgClassOid, target
 /// DROP AGGREGATE.
 fn drop_aggregate(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::ObjectWithArgs(owa)) = obj_node.as_ref() else {
         return Ok(());
     };
 
@@ -1636,11 +1634,11 @@ fn drop_aggregate(
 /// DROP OPERATOR name(lefttype, righttype).
 fn drop_operator(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::ObjectWithArgs(owa)) = obj_node.as_ref() else {
         return Ok(());
     };
 
@@ -1689,9 +1687,9 @@ fn drop_operator(
 /// The operator a `DROP OPERATOR name(left, right)` names, if it exists.
 pub(crate) fn operator_target(
     interp: &PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
 ) -> Option<PgOperatorOid> {
-    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::ObjectWithArgs(owa)) = obj_node.as_ref() else {
         return None;
     };
     let parts: Vec<&str> = owa.objname.iter().filter_map(node_string).collect();
@@ -1711,12 +1709,12 @@ pub(crate) fn operator_target(
 /// it doesn't exist.
 pub(crate) fn lookup_operator(
     interp: &PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<Option<PgOperatorOid>, DdlError> {
     if let Some(oid) = operator_target(interp, obj_node) {
         return Ok(Some(oid));
     }
-    let Some(node::Node::ObjectWithArgs(owa)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::ObjectWithArgs(owa)) = obj_node.as_ref() else {
         return Ok(None);
     };
     if let Some(missing) = missing_operand_type(&owa.objargs, interp) {
@@ -1733,7 +1731,7 @@ pub(crate) fn lookup_operator(
 /// infix operator only.
 fn operator_not_found(
     interp: &PgCatalog,
-    owa: &typedpg_pg_query::protobuf::ObjectWithArgs,
+    owa: &typedpg_pg_query::ast::ObjectWithArgs,
     left: Option<PgTypeOid>,
     right: Option<PgTypeOid>,
 ) -> DdlError {
@@ -1780,11 +1778,11 @@ pub(crate) fn find_operator(
 /// The `type "x" does not exist` error for an operand type of a DROP /
 /// ALTER OPERATOR that names no type (`NONE` aside).
 fn missing_operand_type(
-    objargs: &[typedpg_pg_query::protobuf::Node],
+    objargs: &[Option<typedpg_pg_query::ast::Node>],
     snapshot: &PgCatalog,
 ) -> Option<DdlError> {
-    objargs.iter().find_map(|n| match n.node.as_ref() {
-        Some(node::Node::TypeName(tn))
+    objargs.iter().find_map(|n| match n.as_ref() {
+        Some(ast::Node::TypeName(tn))
             if !tn.names.is_empty() && resolve_type_name(tn, snapshot).is_none() =>
         {
             // LookupTypeNameOid: a missing schema is reported as such.
@@ -1804,11 +1802,11 @@ fn missing_operand_type(
 }
 
 fn parse_operator_arg_types(
-    objargs: &[typedpg_pg_query::protobuf::Node],
+    objargs: &[Option<typedpg_pg_query::ast::Node>],
     snapshot: &PgCatalog,
 ) -> (Option<PgTypeOid>, Option<PgTypeOid>) {
-    let resolve = |n: &typedpg_pg_query::protobuf::Node| -> Option<PgTypeOid> {
-        if let Some(node::Node::TypeName(tn)) = n.node.as_ref() {
+    let resolve = |n: &Option<typedpg_pg_query::ast::Node>| -> Option<PgTypeOid> {
+        if let Some(ast::Node::TypeName(tn)) = n.as_ref() {
             if tn.names.is_empty() {
                 return None;
             }
@@ -1827,12 +1825,12 @@ fn parse_operator_arg_types(
 /// DROP CAST (source AS target).
 fn drop_cast(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let items = match obj_node.node.as_ref() {
-        Some(node::Node::List(list)) => &list.items,
+    let items = match obj_node.as_ref() {
+        Some(ast::Node::List(list)) => &list.items,
         _ => return Ok(()),
     };
 
@@ -1843,8 +1841,8 @@ fn drop_cast(
 
     // get_object_address_type: typenameTypeId, whose error names the type
     // as written.
-    let lookup = |n: &typedpg_pg_query::protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::TypeName(tn)) => super::util::lookup_type_name(tn, interp).map(Some),
+    let lookup = |n: &Option<typedpg_pg_query::ast::Node>| match n.as_ref() {
+        Some(ast::Node::TypeName(tn)) => super::util::lookup_type_name(tn, interp).map(Some),
         _ => Ok(None),
     };
     let (src_oid, tgt_oid) = match (lookup(src_node), lookup(tgt_node)) {
@@ -1961,12 +1959,12 @@ fn schema_objects(interp: &PgCatalog, nsoid: PgNamespaceOid) -> Vec<super::depen
 
 fn drop_schema(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
     cascade: bool,
 ) -> Result<(), DdlError> {
-    let name = match obj_node.node.as_ref() {
-        Some(node::Node::String(s)) => s.sval.clone(),
+    let name = match obj_node.as_ref() {
+        Some(ast::Node::String(s)) => s.sval.clone(),
         _ => return Ok(()),
     };
 

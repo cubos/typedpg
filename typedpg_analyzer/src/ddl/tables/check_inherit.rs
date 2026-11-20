@@ -70,13 +70,13 @@ impl CheckFlags {
 /// locations aside), so different spellings of one tree match.
 #[derive(Clone, Debug)]
 pub(crate) enum StoredExpr {
-    Written(Box<typedpg_pg_query::protobuf::Node>),
+    Written(Box<Option<typedpg_pg_query::ast::Node>>),
     /// A serial column's `nextval()` of its own sequence.
     Serial(PgClassOid, i16),
 }
 
 impl StoredExpr {
-    pub(crate) fn written(expr: &typedpg_pg_query::protobuf::Node) -> Self {
+    pub(crate) fn written(expr: &Option<typedpg_pg_query::ast::Node>) -> Self {
         StoredExpr::Written(Box::new(expr.clone()))
     }
 }
@@ -334,7 +334,7 @@ pub(super) fn add_check(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     name: &str,
-    expr: &typedpg_pg_query::protobuf::Node,
+    expr: &Option<typedpg_pg_query::ast::Node>,
     no_inherit: bool,
     rec: super::inherit::Recursion,
     conkey: Vec<i16>,

@@ -1093,10 +1093,7 @@ impl NullabilityContext {
 
     /// The frame options a window call's `OVER` clause runs over: its own,
     /// or — for `OVER w` — those of the named window (`None` when unknown).
-    pub fn window_frame_options(
-        &self,
-        over: &typedpg_pg_query::protobuf::WindowDef,
-    ) -> Option<i32> {
+    pub fn window_frame_options(&self, over: &typedpg_pg_query::ast::WindowDef) -> Option<i32> {
         if over.name.is_empty() {
             Some(over.frame_options)
         } else {

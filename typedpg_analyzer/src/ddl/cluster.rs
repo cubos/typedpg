@@ -3,9 +3,9 @@
 //! GRANT and DROP look them up (get_object_address), so the catalog keeps
 //! the ones the migrations create next to the built-in tablespaces.
 
-use typedpg_pg_query::protobuf::{
-    CreateSubscriptionStmt, CreateTableSpaceStmt, DropSubscriptionStmt, DropTableSpaceStmt,
-    FuncCall, a_const, node,
+use typedpg_pg_query::ast::{
+    self, CreateSubscriptionStmt, CreateTableSpaceStmt, DropSubscriptionStmt, DropTableSpaceStmt,
+    FuncCall,
 };
 
 use super::DdlError;
@@ -131,10 +131,10 @@ pub(crate) fn large_object_calls(interp: &mut PgCatalog, fc: &FuncCall) {
         [name] | ["pg_catalog", name] => *name,
         _ => return,
     };
-    let constant = |n: Option<&typedpg_pg_query::protobuf::Node>| match n?.node.as_ref()? {
-        node::Node::AConst(c) => match c.val.as_ref()? {
-            a_const::Val::Ival(i) => u32::try_from(i.ival).ok().filter(|&v| v != 0),
-            a_const::Val::Fval(f) => f.fval.parse::<u32>().ok().filter(|&v| v != 0),
+    let constant = |n: Option<&Option<typedpg_pg_query::ast::Node>>| match n?.as_ref()? {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => u32::try_from(i.ival).ok().filter(|&v| v != 0),
+            ast::AConstValue::Float(f) => f.fval.parse::<u32>().ok().filter(|&v| v != 0),
             _ => None,
         },
         _ => None,

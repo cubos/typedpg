@@ -1,4 +1,5 @@
 use super::*;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Column references
@@ -8,15 +9,15 @@ use super::*;
 /// `db.schema.table.column` (or `.*`), valid only when `db` is the current
 /// database (see [`crate::pgmsg::cross_database_reference`]); more is
 /// never a valid reference. Also applies to select-list `db.s.t.*`.
-pub(crate) fn check_column_ref_length(col_ref: &protobuf::ColumnRef) -> Result<(), AnalyzeError> {
+pub(crate) fn check_column_ref_length(col_ref: &ast::ColumnRef) -> Result<(), AnalyzeError> {
     if col_ref.fields.len() < 4 {
         return Ok(());
     }
     let written = col_ref
         .fields
         .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(node::Node::String(s)) => s.sval.clone(),
+        .map(|f| match f.as_ref() {
+            Some(ast::Node::String(s)) => s.sval.clone(),
             _ => "*".to_owned(),
         })
         .collect::<Vec<_>>()
@@ -59,7 +60,7 @@ fn column_refinement(col: &crate::scope::ScopeColumn, ctx: Ctx<'_>) -> crate::re
 }
 
 pub(crate) fn infer_column_ref(
-    col_ref: &protobuf::ColumnRef,
+    col_ref: &ast::ColumnRef,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -77,7 +78,7 @@ pub(crate) fn infer_column_ref(
     let has_star = col_ref
         .fields
         .iter()
-        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))));
+        .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))));
     if has_star {
         return infer_star_ref(col_ref, scope, null_ctx, snapshot);
     }
@@ -151,15 +152,11 @@ pub(crate) fn infer_column_ref(
                 && scope.find_source(table).is_some()
             {
                 let mut fields = col_ref.fields[..col_ref.fields.len() - 1].to_vec();
-                fields.push(protobuf::Node {
-                    node: Some(node::Node::AStar(protobuf::AStar {})),
-                });
-                let whole_row = protobuf::Node {
-                    node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                        fields,
-                        location: col_ref.location,
-                    })),
-                };
+                fields.push(Some(ast::Node::AStar(NodeBox::new(ast::AStar {}))));
+                let whole_row = Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+                    fields,
+                    location: col_ref.location,
+                })));
                 if let Some(call) = super::func_call::infer_column_notation_call(
                     column,
                     whole_row,
@@ -236,15 +233,15 @@ fn sql_function_param(parts: &[String], snapshot: &PgCatalog) -> Option<ExprType
 /// `v.fld.*` for parameter `v` — whose fields the star then stands for
 /// (`ExpandRowReference`). Returns that as the equivalent `(v).*`.
 pub(crate) fn sql_function_param_star(
-    col_ref: &protobuf::ColumnRef,
+    col_ref: &ast::ColumnRef,
     scope: &Scope,
     snapshot: &PgCatalog,
-) -> Option<protobuf::AIndirection> {
+) -> Option<ast::AIndirection> {
     let (star, names) = col_ref.fields.split_last()?;
-    if !matches!(star.node.as_ref(), Some(node::Node::AStar(_)))
+    if !matches!(star.as_ref(), Some(ast::Node::AStar(_)))
         || !names
             .iter()
-            .all(|f| matches!(f.node.as_ref(), Some(node::Node::String(_))))
+            .all(|f| matches!(f.as_ref(), Some(ast::Node::String(_))))
     {
         return None;
     }
@@ -253,13 +250,11 @@ pub(crate) fn sql_function_param_star(
         return None;
     }
     sql_function_param(&names_str, snapshot)?;
-    Some(protobuf::AIndirection {
-        arg: Some(Box::new(protobuf::Node {
-            node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                fields: names.to_vec(),
-                location: col_ref.location,
-            })),
-        })),
+    Some(ast::AIndirection {
+        arg: Some(ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+            fields: names.to_vec(),
+            location: col_ref.location,
+        }))),
         indirection: vec![star.clone()],
     })
 }
@@ -275,7 +270,7 @@ fn whole_row_nullable(src: &crate::scope::TableSource, null_ctx: &NullabilityCon
 }
 
 fn infer_star_ref(
-    col_ref: &protobuf::ColumnRef,
+    col_ref: &ast::ColumnRef,
     scope: &Scope,
     null_ctx: &NullabilityContext,
     snapshot: &PgCatalog,
@@ -286,10 +281,10 @@ fn infer_star_ref(
         .fields
         .iter()
         .rev()
-        .skip_while(|f| !matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+        .skip_while(|f| !matches!(f.as_ref(), Some(ast::Node::AStar(_))))
         .nth(1)
-        .and_then(|f| match f.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.as_str()),
+        .and_then(|f| match f.as_ref()? {
+            ast::Node::String(s) => Some(s.sval.as_str()),
             _ => None,
         })
         .ok_or_else(|| {

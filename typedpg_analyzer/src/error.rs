@@ -810,7 +810,7 @@ impl SourceSpan {
 /// The kind of a parse-tree node, as the parser names it (`RangeTableFunc`,
 /// `XmlSerialize`): for "typedpg does not support … yet" messages, which
 /// must not dump the node.
-pub(crate) fn node_kind(node: &typedpg_pg_query::protobuf::node::Node) -> String {
+pub(crate) fn node_kind(node: &typedpg_pg_query::ast::Node) -> String {
     // The `Debug` rendering starts with the variant's name.
     let debug = format!("{node:?}");
     debug
@@ -822,7 +822,7 @@ pub(crate) fn node_kind(node: &typedpg_pg_query::protobuf::node::Node) -> String
 
 /// A statement's name for messages: its command tag (`CREATE
 /// TABLESPACE`), or its node kind when the tag table has none.
-pub(crate) fn statement_name(stmt: &typedpg_pg_query::protobuf::node::Node) -> String {
+pub(crate) fn statement_name(stmt: &typedpg_pg_query::ast::Node) -> String {
     match crate::ddl::cmdtag::command_tag(stmt) {
         "???" => node_kind(stmt),
         tag => tag.to_owned(),
@@ -903,9 +903,9 @@ pub(crate) fn naming_param(message: String, num: i32) -> String {
 /// Extract the `location` byte offset (post-lex SQL) from any AST node
 /// variant that carries one. Returns `None` for nodes without location
 /// info (e.g. `BoolExpr` — `typedpg_pg_query` doesn't track its position).
-pub(crate) fn node_location(node: &typedpg_pg_query::protobuf::Node) -> Option<i32> {
-    use typedpg_pg_query::protobuf::node::Node;
-    let inner = node.node.as_ref()?;
+pub(crate) fn node_location(node: &Option<typedpg_pg_query::ast::Node>) -> Option<i32> {
+    use typedpg_pg_query::ast::Node;
+    let inner = node.as_ref()?;
     let loc = match inner {
         Node::ColumnRef(n) => n.location,
         Node::AConst(n) => n.location,
@@ -929,12 +929,12 @@ pub(crate) fn node_location(node: &typedpg_pg_query::protobuf::Node) -> Option<i
 /// `node` at: its leftmost token — for `'x'::text` the literal, not the
 /// `::` the cast's own location points at; for `a + b`, `a`. A `ResTarget`
 /// stands for its value. `None` when no part of it has a location.
-pub(crate) fn expr_span(node: &typedpg_pg_query::protobuf::Node) -> Option<SourceSpan> {
-    use typedpg_pg_query::protobuf::node::Node;
-    let leftmost = match node.node.as_ref()? {
-        Node::TypeCast(tc) => tc.arg.as_deref().and_then(expr_span),
-        Node::AExpr(e) => e.lexpr.as_deref().and_then(expr_span),
-        Node::ResTarget(rt) => rt.val.as_deref().and_then(expr_span),
+pub(crate) fn expr_span(node: &Option<typedpg_pg_query::ast::Node>) -> Option<SourceSpan> {
+    use typedpg_pg_query::ast::Node;
+    let leftmost = match node.as_ref()? {
+        Node::TypeCast(tc) => expr_span(&tc.arg),
+        Node::AExpr(e) => expr_span(&e.lexpr),
+        Node::ResTarget(rt) => expr_span(&rt.val),
         _ => None,
     };
     leftmost.or_else(|| {
@@ -1483,12 +1483,9 @@ impl std::error::Error for RawError {}
 mod tests {
     use super::*;
 
-    fn first_stmt(sql: &str) -> typedpg_pg_query::protobuf::node::Node {
-        typedpg_pg_query::parse(sql).unwrap().protobuf.stmts[0]
+    fn first_stmt(sql: &str) -> typedpg_pg_query::ast::Node {
+        typedpg_pg_query::parse(sql).unwrap().tree.stmts[0]
             .stmt
-            .as_ref()
-            .unwrap()
-            .node
             .clone()
             .unwrap()
     }

@@ -9,6 +9,7 @@
 //! the parse-time errors, with PG's wording.
 
 use super::*;
+use typedpg_pg_query::ast;
 
 const JSON: PgTypeOid = PgTypeOid::from_raw(114);
 const JSONB: PgTypeOid = PgTypeOid::from_raw(3802);
@@ -28,19 +29,14 @@ fn is_string_category(snapshot: &PgCatalog, t: PgTypeOid) -> bool {
         .is_some_and(|e| e.typcategory == TypCategory::String)
 }
 
-fn format_type_of(format: Option<&protobuf::JsonFormat>) -> protobuf::JsonFormatType {
+fn format_type_of(format: Option<&ast::JsonFormat>) -> ast::JsonFormatType {
     format
-        .and_then(|f| protobuf::JsonFormatType::try_from(f.format_type).ok())
-        .unwrap_or(protobuf::JsonFormatType::JsFormatDefault)
+        .map(|f| f.format_type)
+        .unwrap_or(ast::JsonFormatType::JsFormatDefault)
 }
 
-fn has_encoding(format: Option<&protobuf::JsonFormat>) -> bool {
-    format.is_some_and(|f| {
-        !matches!(
-            protobuf::JsonEncoding::try_from(f.encoding),
-            Ok(protobuf::JsonEncoding::JsEncDefault | protobuf::JsonEncoding::Undefined) | Err(_)
-        )
-    })
+fn has_encoding(format: Option<&ast::JsonFormat>) -> bool {
+    format.is_some_and(|f| !matches!(f.encoding, ast::JsonEncoding::JsEncDefault))
 }
 
 /// `transformJsonOutput`: the `RETURNING type [FORMAT JSON …]` clause, or
@@ -48,16 +44,16 @@ fn has_encoding(format: Option<&protobuf::JsonFormat>) -> bool {
 /// `allow_format_for_non_strings` is checkJsonOutputFormat's flag: false
 /// for JSON_QUERY, whose `FORMAT JSON` needs a string / json / bytea result.
 fn json_output(
-    output: Option<&protobuf::JsonOutput>,
+    output: Option<&ast::JsonOutput>,
     snapshot: &PgCatalog,
     allow_format_for_non_strings: bool,
 ) -> Result<Option<Returning>, AnalyzeError> {
-    let Some(tn) = output.and_then(|o| o.type_name.as_ref()) else {
+    let Some(tn) = output.and_then(|o| o.type_name.as_deref()) else {
         return Ok(None);
     };
     let format = output
-        .and_then(|o| o.returning.as_ref())
-        .and_then(|r| r.format.as_ref());
+        .and_then(|o| o.returning.as_deref())
+        .and_then(|r| r.format.as_deref());
     if tn.setof {
         return Err(AnalyzeError::Invalid(
             "returning SETOF types is not supported in SQL/JSON functions".into(),
@@ -77,7 +73,7 @@ fn json_output(
     // checkJsonOutputFormat.
     let explicit = format_type_of(format);
     if !allow_format_for_non_strings
-        && explicit != protobuf::JsonFormatType::JsFormatDefault
+        && explicit != ast::JsonFormatType::JsFormatDefault
         && t != BYTEA
         && t != JSON
         && t != JSONB
@@ -87,13 +83,13 @@ fn json_output(
             "cannot use JSON format with non-string output types".into(),
         ));
     }
-    if explicit == protobuf::JsonFormatType::JsFormatJson && has_encoding(format) {
+    if explicit == ast::JsonFormatType::JsFormatJson && has_encoding(format) {
         if t != BYTEA {
             return Err(AnalyzeError::Invalid(
                 "cannot set JSON encoding for non-bytea output types".into(),
             ));
         }
-        if !format.is_some_and(|f| f.encoding == protobuf::JsonEncoding::JsEncUtf8 as i32) {
+        if !format.is_some_and(|f| f.encoding == ast::JsonEncoding::JsEncUtf8) {
             return Err(AnalyzeError::Invalid("unsupported JSON encoding".into()));
         }
     }
@@ -109,18 +105,17 @@ fn json_output(
 /// `cannot cast type X to Y`. PASSING arguments (`is_arg`) of the types a
 /// jsonpath variable can hold are passed through as they are.
 fn json_value_expr(
-    ve: &protobuf::JsonValueExpr,
+    ve: &ast::JsonValueExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
-    default_format: protobuf::JsonFormatType,
+    default_format: ast::JsonFormatType,
     target: Option<PgTypeOid>,
     is_arg: bool,
 ) -> Result<ExprType, AnalyzeError> {
-    use protobuf::JsonFormatType as F;
+    use ast::JsonFormatType as F;
     let snapshot = ctx.snapshot;
-    let raw = ve
-        .raw_expr
-        .as_deref()
+    let raw = &ve.raw_expr;
+    raw.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("JSON value expression without expr".into()))?;
     let mut t = infer_expr(raw, ctx, params, TypeGoal::NONE)?;
     if t.type_oid == oid::UNKNOWN {
@@ -128,9 +123,9 @@ fn json_value_expr(
         t.type_oid = oid::TEXT;
     }
     let ty = snapshot.unwrap_domain(t.type_oid);
-    let explicit = format_type_of(ve.format.as_ref());
+    let explicit = format_type_of(ve.format.as_deref());
     let format = if explicit != F::JsFormatDefault {
-        if has_encoding(ve.format.as_ref()) && ty != BYTEA {
+        if has_encoding(ve.format.as_deref()) && ty != BYTEA {
             return Err(AnalyzeError::DatatypeMismatch(
                 "JSON ENCODING clause is only allowed for bytea input type".into(),
             ));
@@ -215,7 +210,7 @@ fn json_value_expr(
 /// constructor builds json or jsonb and is then coerced to T, which must
 /// have an explicit cast from it (bytea goes through convert_to).
 fn constructor_result(
-    output: Option<&protobuf::JsonOutput>,
+    output: Option<&ast::JsonOutput>,
     args: &[PgTypeOid],
     nullable: bool,
     snapshot: &PgCatalog,
@@ -239,7 +234,7 @@ fn constructor_result(
 /// no coercion — it is an `"any"` argument of the builder — so a bare `$N`
 /// stays untypable.
 fn object_key(
-    key: &protobuf::Node,
+    key: &Option<ast::Node>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -252,16 +247,16 @@ fn object_key(
 
 /// `JSON_OBJECT(k VALUE v, …)` — `transformJsonObjectConstructor`.
 pub(crate) fn infer_json_object(
-    c: &protobuf::JsonObjectConstructor,
+    c: &ast::JsonObjectConstructor,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let mut args = Vec::new();
     for kv in &c.exprs {
-        let Some(node::Node::JsonKeyValue(kv)) = kv.node.as_ref() else {
+        let Some(ast::Node::JsonKeyValue(kv)) = kv.as_ref() else {
             continue;
         };
-        if let Some(key) = kv.key.as_deref() {
+        if let key @ Some(_) = &kv.key {
             args.push(object_key(key, ctx, params)?.type_oid);
         }
         if let Some(v) = kv.value.as_deref() {
@@ -269,49 +264,49 @@ pub(crate) fn infer_json_object(
                 v,
                 ctx,
                 params,
-                protobuf::JsonFormatType::JsFormatDefault,
+                ast::JsonFormatType::JsFormatDefault,
                 None,
                 false,
             )?;
             args.push(t.type_oid);
         }
     }
-    constructor_result(c.output.as_ref(), &args, false, ctx.snapshot)
+    constructor_result(c.output.as_deref(), &args, false, ctx.snapshot)
 }
 
 /// `JSON_ARRAY(v, …)` — `transformJsonArrayConstructor`.
 pub(crate) fn infer_json_array(
-    c: &protobuf::JsonArrayConstructor,
+    c: &ast::JsonArrayConstructor,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let mut args = Vec::new();
     for e in &c.exprs {
-        if let Some(node::Node::JsonValueExpr(v)) = e.node.as_ref() {
+        if let Some(ast::Node::JsonValueExpr(v)) = e.as_ref() {
             let t = json_value_expr(
                 v,
                 ctx,
                 params,
-                protobuf::JsonFormatType::JsFormatDefault,
+                ast::JsonFormatType::JsFormatDefault,
                 None,
                 false,
             )?;
             args.push(t.type_oid);
         }
     }
-    constructor_result(c.output.as_ref(), &args, false, ctx.snapshot)
+    constructor_result(c.output.as_deref(), &args, false, ctx.snapshot)
 }
 
 /// `JSON_ARRAY(SELECT …)` — `transformJsonArrayQueryConstructor` rewrites
 /// it into `(SELECT JSON_ARRAYAGG(a) FROM (query) q(a))`: the query needs
 /// exactly one column, and the result is NULL when it returns no rows.
 pub(crate) fn infer_json_array_query(
-    c: &protobuf::JsonArrayQueryConstructor,
+    c: &ast::JsonArrayQueryConstructor,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let mut args = Vec::new();
-    if let Some(node::Node::SelectStmt(sel)) = c.query.as_deref().and_then(|q| q.node.as_ref()) {
+    if let Some(ast::Node::SelectStmt(sel)) = c.query.as_ref() {
         let (cols, _) = crate::resolve::analyze_correlated_select(
             sel,
             ctx.snapshot,
@@ -327,22 +322,22 @@ pub(crate) fn infer_json_array_query(
         }
         args.push(cols[0].type_oid);
     }
-    constructor_result(c.output.as_ref(), &args, true, ctx.snapshot)
+    constructor_result(c.output.as_deref(), &args, true, ctx.snapshot)
 }
 
 /// FILTER / ORDER BY / OVER of a JSON aggregate, walked like a regular
 /// aggregate call's modifiers.
 fn json_agg_modifiers(
-    ac: &protobuf::JsonAggConstructor,
+    ac: &ast::JsonAggConstructor,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    if let Some(filter) = ac.agg_filter.as_deref() {
+    if let filter @ Some(_) = &ac.agg_filter {
         crate::clause::coerce_clause_expr(filter, ctx, params, crate::clause::ClauseKind::Filter)?;
     }
     for item in &ac.agg_order {
-        if let Some(node::Node::SortBy(sb)) = item.node.as_ref()
-            && let Some(inner) = sb.node.as_deref()
+        if let Some(ast::Node::SortBy(sb)) = item.as_ref()
+            && let inner @ Some(_) = &sb.node
         {
             infer_expr(inner, ctx, params, TypeGoal::NONE)?;
             // transformJsonAggConstructor's transformSortClause.
@@ -360,19 +355,19 @@ fn json_agg_modifiers(
 /// One of an outer level (over its columns only) reads that level's rows,
 /// which this level knows nothing of.
 fn json_agg_nullable(
-    ac: Option<&protobuf::JsonAggConstructor>,
-    values: &[&protobuf::Node],
+    ac: Option<&ast::JsonAggConstructor>,
+    values: &[&Option<ast::Node>],
     ctx: Ctx<'_>,
 ) -> bool {
     let over = ac.and_then(|c| c.over.as_deref());
     if over.is_none() {
         let mut aggregated = values.to_vec();
         if let Some(ac) = ac {
-            aggregated.extend(ac.agg_order.iter().filter_map(|o| match o.node.as_ref() {
-                Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+            aggregated.extend(ac.agg_order.iter().filter_map(|o| match o.as_ref() {
+                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
                 _ => Some(o),
             }));
-            aggregated.extend(ac.agg_filter.as_deref());
+            aggregated.extend(ac.agg_filter.is_some().then_some(&ac.agg_filter));
         }
         if crate::grouping::levels_up_of(&aggregated, ctx.scope) > 0 {
             return true;
@@ -388,13 +383,13 @@ fn json_agg_nullable(
 /// `JSON_OBJECTAGG(k VALUE v)` — `transformJsonObjectAgg`. NULL over an
 /// empty input.
 pub(crate) fn infer_json_objectagg(
-    a: &protobuf::JsonObjectAgg,
+    a: &ast::JsonObjectAgg,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let mut args = Vec::new();
     if let Some(kv) = a.arg.as_deref() {
-        if let Some(key) = kv.key.as_deref() {
+        if let key @ Some(_) = &kv.key {
             args.push(object_key(key, ctx, params)?.type_oid);
         }
         if let Some(v) = kv.value.as_deref() {
@@ -402,7 +397,7 @@ pub(crate) fn infer_json_objectagg(
                 v,
                 ctx,
                 params,
-                protobuf::JsonFormatType::JsFormatDefault,
+                ast::JsonFormatType::JsFormatDefault,
                 None,
                 false,
             )?;
@@ -413,19 +408,21 @@ pub(crate) fn infer_json_objectagg(
     if let Some(ac) = ac {
         json_agg_modifiers(ac, ctx, params)?;
     }
-    let values: Vec<&protobuf::Node> = a
+    let values: Vec<&Option<ast::Node>> = a
         .arg
         .as_deref()
         .into_iter()
         .flat_map(|kv| {
-            kv.key
-                .as_deref()
-                .into_iter()
-                .chain(kv.value.as_deref().and_then(|v| v.raw_expr.as_deref()))
+            std::iter::once(&kv.key).filter(|k| k.is_some()).chain(
+                kv.value
+                    .as_deref()
+                    .map(|v| &v.raw_expr)
+                    .filter(|e| e.is_some()),
+            )
         })
         .collect();
     constructor_result(
-        ac.and_then(|c| c.output.as_ref()),
+        ac.and_then(|c| c.output.as_deref()),
         &args,
         json_agg_nullable(ac, &values, ctx),
         ctx.snapshot,
@@ -434,7 +431,7 @@ pub(crate) fn infer_json_objectagg(
 
 /// `JSON_ARRAYAGG(v)` — `transformJsonArrayAgg`. NULL over an empty input.
 pub(crate) fn infer_json_arrayagg(
-    a: &protobuf::JsonArrayAgg,
+    a: &ast::JsonArrayAgg,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -444,7 +441,7 @@ pub(crate) fn infer_json_arrayagg(
             v,
             ctx,
             params,
-            protobuf::JsonFormatType::JsFormatDefault,
+            ast::JsonFormatType::JsFormatDefault,
             None,
             false,
         )?;
@@ -454,14 +451,15 @@ pub(crate) fn infer_json_arrayagg(
     if let Some(ac) = ac {
         json_agg_modifiers(ac, ctx, params)?;
     }
-    let values: Vec<&protobuf::Node> = a
+    let values: Vec<&Option<ast::Node>> = a
         .arg
         .as_deref()
-        .and_then(|v| v.raw_expr.as_deref())
+        .map(|v| &v.raw_expr)
+        .filter(|e| e.is_some())
         .into_iter()
         .collect();
     constructor_result(
-        ac.and_then(|c| c.output.as_ref()),
+        ac.and_then(|c| c.output.as_deref()),
         &args,
         json_agg_nullable(ac, &values, ctx),
         ctx.snapshot,
@@ -474,7 +472,7 @@ pub(crate) fn infer_json_arrayagg(
 /// it must be a string, bytea or untyped (`transformJsonParseArg`), so a
 /// json / jsonb input is rejected too. NULL in, NULL out.
 pub(crate) fn infer_json_parse(
-    p: &protobuf::JsonParseExpr,
+    p: &ast::JsonParseExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -482,13 +480,12 @@ pub(crate) fn infer_json_parse(
         .expr
         .as_deref()
         .ok_or_else(|| AnalyzeError::Internal("JSON() without argument".into()))?;
-    let returning = json_output(p.output.as_ref(), ctx.snapshot, true)?;
+    let returning = json_output(p.output.as_deref(), ctx.snapshot, true)?;
     let arg = if p.unique_keys {
-        let raw = ve
-            .raw_expr
-            .as_deref()
+        let raw = &ve.raw_expr;
+        raw.as_ref()
             .ok_or_else(|| AnalyzeError::Internal("JSON value expression without expr".into()))?;
-        let (ty, t) = json_parse_arg(raw, ve.format.as_ref(), ctx, params)?;
+        let (ty, t) = json_parse_arg(raw, ve.format.as_deref(), ctx, params)?;
         if ty != oid::TEXT {
             return Err(AnalyzeError::DatatypeMismatch(
                 "cannot use non-string types with WITH UNIQUE KEYS clause".into(),
@@ -500,7 +497,7 @@ pub(crate) fn infer_json_parse(
             ve,
             ctx,
             params,
-            protobuf::JsonFormatType::JsFormatJson,
+            ast::JsonFormatType::JsFormatJson,
             Some(JSON),
             false,
         )?
@@ -514,19 +511,18 @@ pub(crate) fn infer_json_parse(
 /// `JSON_SCALAR(expr)` — `transformJsonScalarExpr`: any input (an untyped
 /// one is text) becomes a json scalar. NULL in, NULL out.
 pub(crate) fn infer_json_scalar(
-    s: &protobuf::JsonScalarExpr,
+    s: &ast::JsonScalarExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    let e = s
-        .expr
-        .as_deref()
+    let e = &s.expr;
+    e.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("JSON_SCALAR() without argument".into()))?;
     let t = infer_expr(e, ctx, params, TypeGoal::NONE)?;
     if t.type_oid == oid::UNKNOWN {
         coerce_unknown_to(e, ctx, params, oid::TEXT)?;
     }
-    match json_output(s.output.as_ref(), ctx.snapshot, true)? {
+    match json_output(s.output.as_deref(), ctx.snapshot, true)? {
         Some((ty, typmod)) => Ok(ExprType::scalar_with_typmod(ty, t.nullable, typmod)),
         None => Ok(ExprType::scalar(JSON, t.nullable)),
     }
@@ -536,7 +532,7 @@ pub(crate) fn infer_json_scalar(
 /// input takes the JSON format (non-string, non-json inputs are rejected);
 /// the result is text unless RETURNING names a string type or bytea.
 pub(crate) fn infer_json_serialize(
-    s: &protobuf::JsonSerializeExpr,
+    s: &ast::JsonSerializeExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -549,11 +545,11 @@ pub(crate) fn infer_json_serialize(
         ve,
         ctx,
         params,
-        protobuf::JsonFormatType::JsFormatJson,
+        ast::JsonFormatType::JsFormatJson,
         None,
         false,
     )?;
-    match json_output(s.output.as_ref(), snapshot, true)? {
+    match json_output(s.output.as_deref(), snapshot, true)? {
         Some((t, typmod)) => {
             if t != BYTEA && !is_string_category(snapshot, t) {
                 return Err(crate::error::RawError::new(
@@ -577,16 +573,15 @@ pub(crate) fn infer_json_serialize(
 /// inputs (an untyped one included) are read as text; anything but text,
 /// json and jsonb is rejected.
 pub(crate) fn infer_json_is_predicate(
-    p: &protobuf::JsonIsPredicate,
+    p: &ast::JsonIsPredicate,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let snapshot = ctx.snapshot;
-    let e = p
-        .expr
-        .as_deref()
+    let e = &p.expr;
+    e.as_ref()
         .ok_or_else(|| AnalyzeError::Internal("IS JSON without operand".into()))?;
-    let (ty, t) = json_parse_arg(e, p.format.as_ref(), ctx, params)?;
+    let (ty, t) = json_parse_arg(e, p.format.as_deref(), ctx, params)?;
     if ty != oid::TEXT && ty != JSON && ty != JSONB {
         return Err(AnalyzeError::DatatypeMismatch(format!(
             "cannot use type {} in IS JSON predicate",
@@ -602,8 +597,8 @@ pub(crate) fn infer_json_is_predicate(
 /// returned as its base type, for the caller to judge. Returns that type
 /// and the input's own inference.
 fn json_parse_arg(
-    e: &protobuf::Node,
-    format: Option<&protobuf::JsonFormat>,
+    e: &Option<ast::Node>,
+    format: Option<&ast::JsonFormat>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(PgTypeOid, ExprType), AnalyzeError> {
@@ -638,13 +633,13 @@ fn json_parse_arg(
 /// function allows, and a DEFAULT expression must be a constant, function or
 /// operator expression without column references, cast to the result type.
 pub(crate) fn infer_json_func_expr(
-    f: &protobuf::JsonFuncExpr,
+    f: &ast::JsonFuncExpr,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
-    use protobuf::JsonExprOp as Op;
+    use ast::JsonExprOp as Op;
     let snapshot = ctx.snapshot;
-    let op = protobuf::JsonExprOp::try_from(f.op).unwrap_or(Op::Undefined);
+    let op = f.op;
     if !matches!(op, Op::JsonExistsOp | Op::JsonQueryOp | Op::JsonValueOp) {
         return Err(AnalyzeError::Unsupported(
             "JSON_TABLE is only valid in FROM".into(),
@@ -659,13 +654,13 @@ pub(crate) fn infer_json_func_expr(
         context,
         ctx,
         params,
-        protobuf::JsonFormatType::JsFormatJsonb,
+        ast::JsonFormatType::JsFormatJsonb,
         Some(JSONB),
         false,
     )?;
 
     let mut path_nullable = false;
-    if let Some(path) = f.pathspec.as_deref() {
+    if let path @ Some(_) = &f.pathspec {
         let t = infer_expr(path, ctx, params, TypeGoal::NONE)?;
         path_nullable = t.nullable;
         if t.type_oid == oid::UNKNOWN {
@@ -681,14 +676,14 @@ pub(crate) fn infer_json_func_expr(
     }
 
     for arg in &f.passing {
-        if let Some(node::Node::JsonArgument(a)) = arg.node.as_ref()
+        if let Some(ast::Node::JsonArgument(a)) = arg.as_ref()
             && let Some(v) = a.val.as_deref()
         {
             json_value_expr(
                 v,
                 ctx,
                 params,
-                protobuf::JsonFormatType::JsFormatJson,
+                ast::JsonFormatType::JsFormatJson,
                 None,
                 true,
             )?;
@@ -699,28 +694,27 @@ pub(crate) fn infer_json_func_expr(
     if op == Op::JsonValueOp
         && format_type_of(
             f.output
-                .as_ref()
-                .and_then(|o| o.returning.as_ref())
-                .and_then(|r| r.format.as_ref()),
-        ) != protobuf::JsonFormatType::JsFormatDefault
+                .as_deref()
+                .and_then(|o| o.returning.as_deref())
+                .and_then(|r| r.format.as_deref()),
+        ) != ast::JsonFormatType::JsFormatDefault
     {
         return Err(AnalyzeError::SyntaxError(
             "cannot specify FORMAT JSON in RETURNING clause of JSON_VALUE()".into(),
         ));
     }
     // A wrapper already quotes scalars; OMIT QUOTES can't apply.
-    if matches!(
-        protobuf::JsonQuotes::try_from(f.quotes),
-        Ok(protobuf::JsonQuotes::JsQuotesOmit)
-    ) && matches!(
-        protobuf::JsonWrapper::try_from(f.wrapper),
-        Ok(protobuf::JsonWrapper::JswConditional | protobuf::JsonWrapper::JswUnconditional)
-    ) {
+    if matches!(f.quotes, ast::JsonQuotes::JsQuotesOmit)
+        && matches!(
+            f.wrapper,
+            ast::JsonWrapper::JswConditional | ast::JsonWrapper::JswUnconditional
+        )
+    {
         return Err(AnalyzeError::SyntaxError(
             "SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used".into(),
         ));
     }
-    let (ret, typmod) = match json_output(f.output.as_ref(), snapshot, op != Op::JsonQueryOp)? {
+    let (ret, typmod) = match json_output(f.output.as_deref(), snapshot, op != Op::JsonQueryOp)? {
         Some(r) => r,
         None => match op {
             Op::JsonExistsOp => (oid::BOOL, None),
@@ -752,22 +746,22 @@ pub(crate) fn infer_json_func_expr(
 /// a column's message names it — and a DEFAULT expression must be coercible
 /// to `ret`. Returns whether ON ERROR is UNKNOWN (JSON_EXISTS's NULL).
 pub(crate) fn json_behaviors(
-    op: protobuf::JsonExprOp,
-    on_empty: Option<&protobuf::JsonBehavior>,
-    on_error: Option<&protobuf::JsonBehavior>,
+    op: ast::JsonExprOp,
+    on_empty: Option<&ast::JsonBehavior>,
+    on_error: Option<&ast::JsonBehavior>,
     column: Option<&str>,
     ret: PgTypeOid,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<bool, AnalyzeError> {
-    use protobuf::JsonBehaviorType as B;
-    use protobuf::JsonExprOp as Op;
+    use ast::JsonBehaviorType as B;
+    use ast::JsonExprOp as Op;
     let mut unknown_on_error = false;
     for (behavior, when) in [(on_empty, "ON EMPTY"), (on_error, "ON ERROR")] {
         let Some(b) = behavior else {
             continue;
         };
-        let btype = protobuf::JsonBehaviorType::try_from(b.btype).unwrap_or(B::Undefined);
+        let btype = b.btype;
         let (allowed, list, fname, columns): (&[B], &str, &str, &str) = match op {
             Op::JsonExistsOp => (
                 &[
@@ -830,7 +824,7 @@ pub(crate) fn json_behaviors(
             unknown_on_error = true;
         }
         if btype == B::JsonBehaviorDefault
-            && let Some(e) = b.expr.as_deref()
+            && let e @ Some(_) = &b.expr
         {
             json_behavior_default(e, ret, ctx, params)?;
         }
@@ -842,7 +836,7 @@ pub(crate) fn json_behaviors(
 /// a (non-aggregate) function or an operator expression, with no column
 /// references, cast (explicitly) to the function's result type.
 fn json_behavior_default(
-    e: &protobuf::Node,
+    e: &Option<ast::Node>,
     ret: PgTypeOid,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -850,16 +844,16 @@ fn json_behavior_default(
     let snapshot = ctx.snapshot;
     // The transformed node PG checks: a cast of a constant is a constant,
     // any other cast (of a column / parameter) is not.
-    let shape_ok = |n: &protobuf::Node| -> bool {
-        fn go(n: &protobuf::Node, snapshot: &PgCatalog) -> bool {
-            match n.node.as_ref() {
-                Some(node::Node::AConst(_) | node::Node::AExpr(_)) => true,
+    let shape_ok = |n: &Option<ast::Node>| -> bool {
+        fn go(n: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
+            match n.as_ref() {
+                Some(ast::Node::AConst(_) | ast::Node::AExpr(_)) => true,
                 // An aggregate / window call is not a FuncExpr.
-                Some(node::Node::FuncCall(_)) => {
+                Some(ast::Node::FuncCall(_)) => {
                     let kinds = detect_func_kinds(n, snapshot);
                     !kinds.has_aggregate && !kinds.has_window
                 }
-                Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(|a| go(a, snapshot)),
+                Some(ast::Node::TypeCast(c)) => go(&c.arg, snapshot),
                 _ => false,
             }
         }
@@ -887,10 +881,10 @@ fn json_behavior_default(
     // jsonb value and a boolean — unless the result is (a domain over)
     // integer, which has a cast from boolean — are coerced at run time,
     // by json_populate_type.
-    fn null_const(n: &protobuf::Node) -> bool {
-        match n.node.as_ref() {
-            Some(node::Node::AConst(c)) => c.isnull,
-            Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(null_const),
+    fn null_const(n: &Option<ast::Node>) -> bool {
+        match n.as_ref() {
+            Some(ast::Node::AConst(c)) => c.isnull,
+            Some(ast::Node::TypeCast(c)) => null_const(&c.arg),
             _ => false,
         }
     }

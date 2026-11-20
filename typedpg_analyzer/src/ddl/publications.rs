@@ -2,9 +2,9 @@
 //! affect typing, but PG resolves the tables, columns, row filters and
 //! schemas they name, validates their options and keeps membership.
 
-use typedpg_pg_query::protobuf::{
-    AlterPublicationAction, AlterPublicationStmt, CreatePublicationStmt, PublicationObjSpecType,
-    PublicationTable, node,
+use typedpg_pg_query::ast::{
+    self, AlterPublicationAction, AlterPublicationStmt, CreatePublicationStmt,
+    PublicationObjSpecType, PublicationTable,
 };
 
 use super::DdlError;
@@ -54,15 +54,15 @@ struct Options {
 
 /// defGetBoolean (define.c): no value means true; otherwise 0 / 1 or,
 /// case-insensitively, true / false / on / off.
-fn def_get_boolean(name: &str, arg: Option<&node::Node>) -> Result<bool, DdlError> {
+fn def_get_boolean(name: &str, arg: Option<&ast::Node>) -> Result<bool, DdlError> {
     let value = match arg {
         None => return Ok(true),
-        Some(node::Node::Integer(i)) => match i.ival {
+        Some(ast::Node::Integer(i)) => match i.ival {
             0 => Some(false),
             1 => Some(true),
             _ => None,
         },
-        Some(node::Node::Boolean(b)) => Some(b.boolval),
+        Some(ast::Node::Boolean(b)) => Some(b.boolval),
         Some(other) => match def_get_string(Some(other)).map(|s| s.to_ascii_lowercase()) {
             Some(s) if s == "true" || s == "on" => Some(true),
             Some(s) if s == "false" || s == "off" => Some(false),
@@ -74,13 +74,13 @@ fn def_get_boolean(name: &str, arg: Option<&node::Node>) -> Result<bool, DdlErro
 
 /// defGetString (define.c): an option value as text — a bare word such as
 /// `off` arrives as a type name.
-fn def_get_string(arg: Option<&node::Node>) -> Option<String> {
+fn def_get_string(arg: Option<&ast::Node>) -> Option<String> {
     match arg? {
-        node::Node::String(s) => Some(s.sval.clone()),
-        node::Node::Integer(i) => Some(i.ival.to_string()),
-        node::Node::Float(f) => Some(f.fval.clone()),
-        node::Node::Boolean(b) => Some(b.boolval.to_string()),
-        node::Node::TypeName(tn) => Some(
+        ast::Node::String(s) => Some(s.sval.clone()),
+        ast::Node::Integer(i) => Some(i.ival.to_string()),
+        ast::Node::Float(f) => Some(f.fval.clone()),
+        ast::Node::Boolean(b) => Some(b.boolval.to_string()),
+        ast::Node::TypeName(tn) => Some(
             tn.names
                 .iter()
                 .filter_map(super::util::node_string)
@@ -92,11 +92,11 @@ fn def_get_string(arg: Option<&node::Node>) -> Option<String> {
 }
 
 /// parse_publication_options.
-fn check_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result<Options, DdlError> {
+fn check_options(options: &[Option<typedpg_pg_query::ast::Node>]) -> Result<Options, DdlError> {
     let mut out = Options::default();
     let mut seen: Vec<&str> = Vec::new();
     for opt in options {
-        let Some(node::Node::DefElem(de)) = opt.node.as_ref() else {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
         // errorConflictingDefElem.
@@ -104,7 +104,7 @@ fn check_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result<Options
             return Err(DdlError::Parse("conflicting or redundant options".into()));
         }
         seen.push(&de.defname);
-        let arg = de.arg.as_deref().and_then(|a| a.node.as_ref());
+        let arg = de.arg.as_ref();
         let value = def_get_string(arg);
         match de.defname.as_str() {
             "publish" => {
@@ -153,16 +153,15 @@ fn check_options(options: &[typedpg_pg_query::protobuf::Node]) -> Result<Options
 /// either mention has a row filter or a column list.
 fn resolve_objects<'a>(
     interp: &PgCatalog,
-    objects: &'a [typedpg_pg_query::protobuf::Node],
+    objects: &'a [Option<typedpg_pg_query::ast::Node>],
 ) -> Result<Vec<Object<'a>>, DdlError> {
     let mut out: Vec<Object<'a>> = Vec::new();
     let mut kind = PublicationObjSpecType::PublicationobjTable;
     for obj in objects {
-        let Some(node::Node::PublicationObjSpec(spec)) = obj.node.as_ref() else {
+        let Some(ast::Node::PublicationObjSpec(spec)) = obj.as_ref() else {
             continue;
         };
-        let t = PublicationObjSpecType::try_from(spec.pubobjtype)
-            .unwrap_or(PublicationObjSpecType::Undefined);
+        let t = spec.pubobjtype;
         if t != PublicationObjSpecType::PublicationobjContinuation {
             kind = t;
         }
@@ -255,9 +254,10 @@ fn check_tables_to_add(
         })
     };
     for (relid, pt) in tables() {
-        let Some(filter) = pt.where_clause.as_deref() else {
+        if pt.where_clause.is_none() {
             continue;
-        };
+        }
+        let filter = &pt.where_clause;
         if !via_root && is_partitioned(interp, relid) {
             return Err(DdlError::Parse(format!(
                 "cannot use publication WHERE clause for relation \"{}\" (WHERE clause cannot be \
@@ -413,7 +413,7 @@ fn check_alter_all_tables(
 fn check_row_filter(
     interp: &PgCatalog,
     relid: PgClassOid,
-    filter: &typedpg_pg_query::protobuf::Node,
+    filter: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     let unsupported = |e: crate::error::AnalyzeError| DdlError::UnsupportedDdl(e.to_string());
     let used = std::cell::RefCell::new(Vec::new());
@@ -473,27 +473,25 @@ fn invalid_row_filter(detail: &str) -> DdlError {
 fn check_simple_rowfilter_expr(
     interp: &PgCatalog,
     relid: PgClassOid,
-    node: &typedpg_pg_query::protobuf::Node,
+    node: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
     const ONLY_SIMPLE: &str = "Only columns, constants, built-in operators, built-in data types, \
                                built-in collations, and immutable built-in functions are allowed.";
-    let Some(inner) = node.node.as_ref() else {
+    let Some(inner) = node.as_ref() else {
         return Ok(());
     };
-    let type_of = |n: &typedpg_pg_query::protobuf::Node| {
+    let type_of = |n: &Option<typedpg_pg_query::ast::Node>| {
         super::volatile::infer_over_relation(interp, relid, n, None)
             .and_then(Result::ok)
             .map(|t| t.type_oid)
     };
     let user_type =
         |t: Option<crate::oid::PgTypeOid>| t.is_some_and(|t| t.get() >= FIRST_NORMAL_OBJECT_ID);
-    fn opt(
-        n: &Option<Box<typedpg_pg_query::protobuf::Node>>,
-    ) -> Vec<&typedpg_pg_query::protobuf::Node> {
-        n.as_deref().into_iter().collect()
+    fn opt(n: &Option<typedpg_pg_query::ast::Node>) -> Vec<&Option<typedpg_pg_query::ast::Node>> {
+        if n.is_some() { vec![n] } else { Vec::new() }
     }
-    let children: Vec<&typedpg_pg_query::protobuf::Node> = match inner {
-        node::Node::ColumnRef(cr) => {
+    let children: Vec<&Option<typedpg_pg_query::ast::Node>> = match inner {
+        ast::Node::ColumnRef(cr) => {
             let Some(name) = cr.fields.last().and_then(super::util::node_string) else {
                 return Err(invalid_row_filter(ONLY_SIMPLE));
             };
@@ -506,9 +504,9 @@ fn check_simple_rowfilter_expr(
             }
             Vec::new()
         }
-        node::Node::AConst(_) => Vec::new(),
-        node::Node::TypeCast(tc) => {
-            let arg = tc.arg.as_deref();
+        ast::Node::AConst(_) => Vec::new(),
+        ast::Node::TypeCast(tc) => {
+            let arg = &tc.arg;
             let target = type_of(node);
             // The walker judges the node kind before its type: a cast to a
             // domain is a CoerceToDomain (a literal's too), which is not
@@ -522,15 +520,16 @@ fn check_simple_rowfilter_expr(
             // A cast literal folds into a Const, and a cast `ARRAY[…]`
             // constructor is built with the target type directly
             // (transformTypeCast) — neither leaves a coercion node.
-            let literal = match arg.and_then(|a| a.node.as_ref()) {
-                Some(node::Node::AConst(_)) => true,
-                Some(node::Node::AArrayExpr(_)) => target
+            let literal = match arg.as_ref() {
+                Some(ast::Node::AConst(_)) => true,
+                Some(ast::Node::AArrayExpr(_)) => target
                     .and_then(|t| interp.get_type(t))
                     .is_some_and(|t| t.typcategory == crate::pg_catalog::TypCategory::Array),
                 _ => false,
             };
             if !literal
-                && let (Some(target), Some(source)) = (target, arg.and_then(type_of))
+                && let (Some(target), Some(source)) =
+                    (target, arg.as_ref().and_then(|_| type_of(arg)))
                 && !matches!(
                     crate::coerce::coercion_pathway(
                         target,
@@ -546,48 +545,48 @@ fn check_simple_rowfilter_expr(
             if user_type(target) {
                 return Err(invalid_row_filter("User-defined types are not allowed."));
             }
-            arg.into_iter().collect()
+            opt(arg)
         }
-        node::Node::AExpr(e) => {
+        ast::Node::AExpr(e) => {
             let mut c: Vec<_> = opt(&e.lexpr);
             c.extend(opt(&e.rexpr));
             c
         }
-        node::Node::List(l) => l.items.iter().collect(),
-        node::Node::BoolExpr(b) => b.args.iter().collect(),
-        node::Node::NullTest(t) => opt(&t.arg),
-        node::Node::BooleanTest(t) => opt(&t.arg),
-        node::Node::CaseExpr(c) => {
+        ast::Node::List(l) => l.items.iter().collect(),
+        ast::Node::BoolExpr(b) => b.args.iter().collect(),
+        ast::Node::NullTest(t) => opt(&t.arg),
+        ast::Node::BooleanTest(t) => opt(&t.arg),
+        ast::Node::CaseExpr(c) => {
             let mut out: Vec<_> = opt(&c.arg);
             out.extend(c.args.iter());
             out.extend(opt(&c.defresult));
             out
         }
-        node::Node::CaseWhen(w) => {
+        ast::Node::CaseWhen(w) => {
             let mut out: Vec<_> = opt(&w.expr);
             out.extend(opt(&w.result));
             out
         }
-        node::Node::CoalesceExpr(c) => c.args.iter().collect(),
-        node::Node::MinMaxExpr(m) => m.args.iter().collect(),
-        node::Node::RowExpr(r) => r.args.iter().collect(),
-        node::Node::AArrayExpr(a) => a.elements.iter().collect(),
-        node::Node::XmlExpr(x) => x.named_args.iter().chain(x.args.iter()).collect(),
-        node::Node::CollateClause(c) => opt(&c.arg),
-        node::Node::FuncCall(f) => f.args.iter().collect(),
-        node::Node::NamedArgExpr(n) => opt(&n.arg),
+        ast::Node::CoalesceExpr(c) => c.args.iter().collect(),
+        ast::Node::MinMaxExpr(m) => m.args.iter().collect(),
+        ast::Node::RowExpr(r) => r.args.iter().collect(),
+        ast::Node::AArrayExpr(a) => a.elements.iter().collect(),
+        ast::Node::XmlExpr(x) => x.named_args.iter().chain(x.args.iter()).collect(),
+        ast::Node::CollateClause(c) => opt(&c.arg),
+        ast::Node::FuncCall(f) => f.args.iter().collect(),
+        ast::Node::NamedArgExpr(n) => opt(&n.arg),
         // ResTarget: an XMLELEMENT / XMLFOREST named argument.
-        node::Node::ResTarget(r) => opt(&r.val),
+        ast::Node::ResTarget(r) => opt(&r.val),
         _ => return Err(invalid_row_filter(ONLY_SIMPLE)),
     };
     if matches!(
         inner,
-        node::Node::ColumnRef(_)
-            | node::Node::AExpr(_)
-            | node::Node::FuncCall(_)
-            | node::Node::CaseExpr(_)
-            | node::Node::CoalesceExpr(_)
-            | node::Node::MinMaxExpr(_)
+        ast::Node::ColumnRef(_)
+            | ast::Node::AExpr(_)
+            | ast::Node::FuncCall(_)
+            | ast::Node::CaseExpr(_)
+            | ast::Node::CoalesceExpr(_)
+            | ast::Node::MinMaxExpr(_)
     ) && user_type(type_of(node))
     {
         return Err(invalid_row_filter("User-defined types are not allowed."));
@@ -697,8 +696,7 @@ pub fn alter_publication(
     if let Some(via_root) = options.via_root {
         interp.publications[index].via_root = via_root;
     }
-    let action =
-        AlterPublicationAction::try_from(stmt.action).unwrap_or(AlterPublicationAction::Undefined);
+    let action = stmt.action;
     let objects = resolve_objects(interp, &stmt.pubobjects)?;
     let adds_schemas = objects.iter().any(|o| matches!(o, Object::Schema(_)));
     let publication = &interp.publications[index];
@@ -810,7 +808,6 @@ pub fn alter_publication(
                 }
             }
         }
-        AlterPublicationAction::Undefined => {}
     }
     register_tables(interp, &stmt.pubname, &added)
 }
@@ -827,7 +824,7 @@ pub(crate) fn relation_in_publication(interp: &PgCatalog, relid: PgClassOid) -> 
 
 pub(crate) fn drop_publication(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
     let Some(name) = super::util::node_string(obj_node).map(str::to_owned) else {
@@ -853,9 +850,9 @@ pub(crate) fn drop_publication(
 /// ALTER PUBLICATION name RENAME TO new.
 pub(crate) fn rename_publication(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
-    let Some(old) = stmt.object.as_deref().and_then(super::util::node_string) else {
+    let Some(old) = super::util::node_string(&stmt.object) else {
         return Ok(());
     };
     let old = old.to_owned();

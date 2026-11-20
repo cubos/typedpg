@@ -4,7 +4,7 @@
 //! USING / WITH CHECK expressions over the table's row (`CreatePolicy`,
 //! policy.c) and records their dependencies on the columns they read.
 
-use typedpg_pg_query::protobuf::{AlterPolicyStmt, CreatePolicyStmt, RangeVar, node};
+use typedpg_pg_query::ast::{self, AlterPolicyStmt, CreatePolicyStmt, RangeVar};
 
 use super::DdlError;
 use crate::oid::PgClassOid;
@@ -65,8 +65,8 @@ pub fn create_policy(interp: &mut PgCatalog, stmt: &CreatePolicyStmt) -> Result<
         ));
     }
     let relid = policy_table(interp, rv)?;
-    check_policy_expression(interp, relid, stmt.qual.as_deref())?;
-    check_policy_expression(interp, relid, stmt.with_check.as_deref())?;
+    check_policy_expression(interp, relid, &stmt.qual)?;
+    check_policy_expression(interp, relid, &stmt.with_check)?;
     if interp
         .policies
         .get(&relid)
@@ -92,8 +92,8 @@ pub fn alter_policy(interp: &mut PgCatalog, stmt: &AlterPolicyStmt) -> Result<()
     };
     let relid = policy_table(interp, rv)?;
     // AlterPolicy transforms the new expressions, then finds the policy.
-    check_policy_expression(interp, relid, stmt.qual.as_deref())?;
-    check_policy_expression(interp, relid, stmt.with_check.as_deref())?;
+    check_policy_expression(interp, relid, &stmt.qual)?;
+    check_policy_expression(interp, relid, &stmt.with_check)?;
     let relname = interp
         .pg_class
         .get(&relid)
@@ -125,10 +125,10 @@ pub fn alter_policy(interp: &mut PgCatalog, stmt: &AlterPolicyStmt) -> Result<()
 /// `DROP POLICY [IF EXISTS] name ON table`.
 pub(crate) fn drop_policy(
     interp: &mut PgCatalog,
-    obj_node: &typedpg_pg_query::protobuf::Node,
+    obj_node: &Option<typedpg_pg_query::ast::Node>,
     missing_ok: bool,
 ) -> Result<(), DdlError> {
-    let Some(node::Node::List(list)) = obj_node.node.as_ref() else {
+    let Some(ast::Node::List(list)) = obj_node.as_ref() else {
         return Ok(());
     };
     let parts: Vec<String> = list
@@ -177,7 +177,7 @@ pub(crate) fn drop_policy(
 /// `ALTER POLICY name ON table RENAME TO new` (rename_policy).
 pub(crate) fn rename_policy(
     interp: &mut PgCatalog,
-    stmt: &typedpg_pg_query::protobuf::RenameStmt,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -205,11 +205,11 @@ pub(crate) fn rename_policy(
 fn check_policy_expression(
     interp: &PgCatalog,
     relid: PgClassOid,
-    expr: Option<&typedpg_pg_query::protobuf::Node>,
+    expr: &Option<typedpg_pg_query::ast::Node>,
 ) -> Result<(), DdlError> {
-    let Some(expr) = expr else {
+    if expr.is_none() {
         return Ok(());
-    };
+    }
     use crate::expr::{TypeGoal, infer_expr};
     use crate::nullability::NullabilityContext;
     use crate::param_collector::ParamCollector;

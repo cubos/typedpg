@@ -13,7 +13,8 @@
 use super::*;
 use crate::ddl::triggers::{TRIGGER_TYPE_DELETE, TRIGGER_TYPE_INSERT, TRIGGER_TYPE_UPDATE};
 use crate::pg_catalog::RelKind;
-use typedpg_pg_query::protobuf::CmdType;
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast::{self, CmdType};
 
 /// A data-modifying event (`CMD_INSERT` / `CMD_UPDATE` / `CMD_DELETE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,11 +57,11 @@ pub(crate) enum Overriding {
 
 impl Overriding {
     /// The parse tree's `OverridingKind`.
-    pub(crate) fn from_kind(kind: i32) -> Self {
-        match protobuf::OverridingKind::try_from(kind) {
-            Ok(protobuf::OverridingKind::OverridingUserValue) => Overriding::UserValue,
-            Ok(protobuf::OverridingKind::OverridingSystemValue) => Overriding::SystemValue,
-            _ => Overriding::NotSet,
+    pub(crate) fn from_kind(kind: ast::OverridingKind) -> Self {
+        match kind {
+            ast::OverridingKind::OverridingUserValue => Overriding::UserValue,
+            ast::OverridingKind::OverridingSystemValue => Overriding::SystemValue,
+            ast::OverridingKind::OverridingNotSet => Overriding::NotSet,
         }
     }
 }
@@ -124,40 +125,37 @@ impl Rewrite {
 }
 
 /// Whether a RETURNING clause returns anything.
-pub(crate) fn has_returning(clause: &Option<protobuf::ReturningClause>) -> bool {
-    clause.as_ref().is_some_and(|c| !c.exprs.is_empty())
+pub(crate) fn has_returning(clause: &Option<NodeBox<ast::ReturningClause>>) -> bool {
+    clause.as_deref().is_some_and(|c| !c.exprs.is_empty())
 }
 
 /// The assignments of an UPDATE-style SET list (`col = v`, `col[i] = v`,
 /// `(a, b) = (v, w)`): a whole-column `DEFAULT` keeps the column's default.
-pub(crate) fn set_list_assigns(target_list: &[protobuf::Node]) -> Vec<Assign> {
+pub(crate) fn set_list_assigns(target_list: &[Option<ast::Node>]) -> Vec<Assign> {
     target_list
         .iter()
-        .filter_map(|t| match t.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => Some(rt),
+        .filter_map(|t| match t.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => Some(rt),
             _ => None,
         })
         .map(|rt| {
             let default = rt.indirection.is_empty()
-                && match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
-                    Some(node::Node::SetToDefault(_)) => true,
+                && match rt.val.as_ref() {
+                    Some(ast::Node::SetToDefault(_)) => true,
                     // `(a, b) = (DEFAULT, …)`: the row's element.
-                    Some(node::Node::MultiAssignRef(m)) => {
-                        match m.source.as_deref().and_then(|s| s.node.as_ref()) {
-                            Some(node::Node::RowExpr(row)) => row
-                                .args
-                                .get((m.colno as usize).wrapping_sub(1))
-                                .is_some_and(is_set_to_default),
-                            _ => false,
-                        }
-                    }
+                    Some(ast::Node::MultiAssignRef(m)) => match m.source.as_ref() {
+                        Some(ast::Node::RowExpr(row)) => row
+                            .args
+                            .get((m.colno as usize).wrapping_sub(1))
+                            .is_some_and(is_set_to_default),
+                        _ => false,
+                    },
                     _ => false,
                 };
             Assign {
                 column: rt.name.clone(),
                 default,
-                null: rt.indirection.is_empty()
-                    && rt.val.as_deref().is_some_and(is_sql_null_literal),
+                null: rt.indirection.is_empty() && is_sql_null_literal(&rt.val),
             }
         })
         .collect()

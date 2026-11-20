@@ -8,86 +8,85 @@
 //! separate level and is never entered (only its `testexpr` is).
 
 use super::*;
+use typedpg_pg_query::{NodeBox, ast};
 
 /// The direct sub-expressions of `node` that belong to the same query level.
-pub(crate) fn expr_children(node: &protobuf::Node) -> Vec<&protobuf::Node> {
-    let mut out: Vec<&protobuf::Node> = Vec::new();
-    let Some(inner) = node.node.as_ref() else {
+pub(crate) fn expr_children(node: &Option<ast::Node>) -> Vec<&Option<ast::Node>> {
+    let mut out: Vec<&Option<ast::Node>> = Vec::new();
+    let Some(inner) = node.as_ref() else {
         return out;
     };
-    fn push<'a>(out: &mut Vec<&'a protobuf::Node>, n: &'a Option<Box<protobuf::Node>>) {
-        if let Some(n) = n.as_deref() {
+    fn push<'a>(out: &mut Vec<&'a Option<ast::Node>>, n: &'a Option<ast::Node>) {
+        if n.is_some() {
             out.push(n);
         }
     }
     match inner {
-        node::Node::FuncCall(fc) => {
+        ast::Node::FuncCall(fc) => {
             out.extend(fc.args.iter());
             out.extend(fc.agg_order.iter());
-            if let Some(f) = fc.agg_filter.as_deref() {
-                out.push(f);
-            }
+            push(&mut out, &fc.agg_filter);
         }
-        node::Node::NamedArgExpr(na) => push(&mut out, &na.arg),
-        node::Node::AExpr(e) => {
+        ast::Node::NamedArgExpr(na) => push(&mut out, &na.arg),
+        ast::Node::AExpr(e) => {
             push(&mut out, &e.lexpr);
             push(&mut out, &e.rexpr);
         }
-        node::Node::BoolExpr(b) => out.extend(b.args.iter()),
-        node::Node::NullTest(t) => push(&mut out, &t.arg),
-        node::Node::BooleanTest(t) => push(&mut out, &t.arg),
-        node::Node::CoalesceExpr(c) => out.extend(c.args.iter()),
-        node::Node::MinMaxExpr(m) => out.extend(m.args.iter()),
-        node::Node::CaseExpr(c) => {
+        ast::Node::BoolExpr(b) => out.extend(b.args.iter()),
+        ast::Node::NullTest(t) => push(&mut out, &t.arg),
+        ast::Node::BooleanTest(t) => push(&mut out, &t.arg),
+        ast::Node::CoalesceExpr(c) => out.extend(c.args.iter()),
+        ast::Node::MinMaxExpr(m) => out.extend(m.args.iter()),
+        ast::Node::CaseExpr(c) => {
             push(&mut out, &c.arg);
             out.extend(c.args.iter());
             push(&mut out, &c.defresult);
         }
-        node::Node::CaseWhen(w) => {
+        ast::Node::CaseWhen(w) => {
             push(&mut out, &w.expr);
             push(&mut out, &w.result);
         }
-        node::Node::TypeCast(c) => push(&mut out, &c.arg),
-        node::Node::CollateClause(c) => push(&mut out, &c.arg),
-        node::Node::AIndirection(i) => {
+        ast::Node::TypeCast(c) => push(&mut out, &c.arg),
+        ast::Node::CollateClause(c) => push(&mut out, &c.arg),
+        ast::Node::AIndirection(i) => {
             push(&mut out, &i.arg);
             out.extend(i.indirection.iter());
         }
-        node::Node::AIndices(i) => {
+        ast::Node::AIndices(i) => {
             push(&mut out, &i.lidx);
             push(&mut out, &i.uidx);
         }
-        node::Node::AArrayExpr(a) => out.extend(a.elements.iter()),
-        node::Node::RowExpr(r) => out.extend(r.args.iter()),
-        node::Node::List(l) => out.extend(l.items.iter()),
-        node::Node::SortBy(s) => push(&mut out, &s.node),
-        node::Node::ResTarget(rt) => push(&mut out, &rt.val),
-        node::Node::GroupingFunc(g) => out.extend(g.args.iter()),
-        node::Node::GroupingSet(g) => out.extend(g.content.iter()),
-        node::Node::SubLink(sl) => push(&mut out, &sl.testexpr),
-        node::Node::XmlExpr(x) => {
+        ast::Node::AArrayExpr(a) => out.extend(a.elements.iter()),
+        ast::Node::RowExpr(r) => out.extend(r.args.iter()),
+        ast::Node::List(l) => out.extend(l.items.iter()),
+        ast::Node::SortBy(s) => push(&mut out, &s.node),
+        ast::Node::ResTarget(rt) => push(&mut out, &rt.val),
+        ast::Node::GroupingFunc(g) => out.extend(g.args.iter()),
+        ast::Node::GroupingSet(g) => out.extend(g.content.iter()),
+        ast::Node::SubLink(sl) => push(&mut out, &sl.testexpr),
+        ast::Node::XmlExpr(x) => {
             out.extend(x.named_args.iter());
             out.extend(x.args.iter());
         }
-        node::Node::MultiAssignRef(m) => push(&mut out, &m.source),
-        node::Node::XmlSerialize(x) => push(&mut out, &x.expr),
+        ast::Node::MultiAssignRef(m) => push(&mut out, &m.source),
+        ast::Node::XmlSerialize(x) => push(&mut out, &x.expr),
         // SQL/JSON constructors: a `JsonValueExpr` wraps its raw expression.
-        node::Node::JsonValueExpr(v) => push(&mut out, &v.raw_expr),
-        node::Node::JsonKeyValue(kv) => {
+        ast::Node::JsonValueExpr(v) => push(&mut out, &v.raw_expr),
+        ast::Node::JsonKeyValue(kv) => {
             push(&mut out, &kv.key);
             push_json_value(&mut out, &kv.value);
         }
-        node::Node::JsonObjectConstructor(c) => out.extend(c.exprs.iter()),
-        node::Node::JsonArrayConstructor(c) => out.extend(c.exprs.iter()),
-        node::Node::JsonScalarExpr(s) => push(&mut out, &s.expr),
-        node::Node::JsonSerializeExpr(s) => push_json_value(&mut out, &s.expr),
-        node::Node::JsonParseExpr(p) => push_json_value(&mut out, &p.expr),
-        node::Node::JsonIsPredicate(p) => push(&mut out, &p.expr),
-        node::Node::JsonFuncExpr(f) => {
+        ast::Node::JsonObjectConstructor(c) => out.extend(c.exprs.iter()),
+        ast::Node::JsonArrayConstructor(c) => out.extend(c.exprs.iter()),
+        ast::Node::JsonScalarExpr(s) => push(&mut out, &s.expr),
+        ast::Node::JsonSerializeExpr(s) => push_json_value(&mut out, &s.expr),
+        ast::Node::JsonParseExpr(p) => push_json_value(&mut out, &p.expr),
+        ast::Node::JsonIsPredicate(p) => push(&mut out, &p.expr),
+        ast::Node::JsonFuncExpr(f) => {
             push_json_value(&mut out, &f.context_item);
             push(&mut out, &f.pathspec);
             for p in &f.passing {
-                if let Some(node::Node::JsonArgument(a)) = p.node.as_ref() {
+                if let Some(ast::Node::JsonArgument(a)) = p.as_ref() {
                     push_json_value(&mut out, &a.val);
                 }
             }
@@ -95,14 +94,14 @@ pub(crate) fn expr_children(node: &protobuf::Node) -> Vec<&protobuf::Node> {
                 push(&mut out, &b.expr);
             }
         }
-        node::Node::JsonObjectAgg(a) => {
+        ast::Node::JsonObjectAgg(a) => {
             if let Some(kv) = a.arg.as_deref() {
                 push(&mut out, &kv.key);
                 push_json_value(&mut out, &kv.value);
             }
             push_json_agg(&mut out, &a.constructor);
         }
-        node::Node::JsonArrayAgg(a) => {
+        ast::Node::JsonArrayAgg(a) => {
             push_json_value(&mut out, &a.arg);
             push_json_agg(&mut out, &a.constructor);
         }
@@ -113,32 +112,34 @@ pub(crate) fn expr_children(node: &protobuf::Node) -> Vec<&protobuf::Node> {
 
 /// The raw expression of a `JsonValueExpr` field.
 fn push_json_value<'a>(
-    out: &mut Vec<&'a protobuf::Node>,
-    v: &'a Option<Box<protobuf::JsonValueExpr>>,
+    out: &mut Vec<&'a Option<ast::Node>>,
+    v: &'a Option<NodeBox<ast::JsonValueExpr>>,
 ) {
-    if let Some(e) = v.as_deref().and_then(|v| v.raw_expr.as_deref()) {
-        out.push(e);
+    if let Some(v) = v.as_deref()
+        && v.raw_expr.is_some()
+    {
+        out.push(&v.raw_expr);
     }
 }
 
 /// A JSON aggregate's ORDER BY and FILTER (its window, like a `FuncCall`'s
 /// `OVER`, is not an argument).
 fn push_json_agg<'a>(
-    out: &mut Vec<&'a protobuf::Node>,
-    c: &'a Option<Box<protobuf::JsonAggConstructor>>,
+    out: &mut Vec<&'a Option<ast::Node>>,
+    c: &'a Option<NodeBox<ast::JsonAggConstructor>>,
 ) {
     if let Some(c) = c.as_deref() {
         out.extend(c.agg_order.iter());
-        if let Some(f) = c.agg_filter.as_deref() {
-            out.push(f);
+        if c.agg_filter.is_some() {
+            out.push(&c.agg_filter);
         }
     }
 }
 
 /// Pre-order visit of `node` and every same-level sub-expression.
 pub(crate) fn visit_same_level<'a>(
-    node: &'a protobuf::Node,
-    f: &mut dyn FnMut(&'a protobuf::Node),
+    node: &'a Option<ast::Node>,
+    f: &mut dyn FnMut(&'a Option<ast::Node>),
 ) {
     f(node);
     for child in expr_children(node) {
@@ -149,7 +150,7 @@ pub(crate) fn visit_same_level<'a>(
 /// True when `fc` names a set-returning function. Decided by name like the
 /// aggregate probe in `expr::detect_func_kinds`: any visible overload with
 /// `proretset` counts, since the raw tree carries no resolved signature.
-pub(crate) fn is_srf_call(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+pub(crate) fn is_srf_call(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
     let parts = expr::extract_string_fields(&fc.funcname);
     let (schema, name) = match parts.as_slice() {
         [n] => (None, n.as_str()),
@@ -164,11 +165,11 @@ pub(crate) fn is_srf_call(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool
 }
 
 /// Number of set-returning function calls in `nodes` at this query level.
-pub(crate) fn count_srf_calls(nodes: &[protobuf::Node], snapshot: &PgCatalog) -> usize {
+pub(crate) fn count_srf_calls(nodes: &[Option<ast::Node>], snapshot: &PgCatalog) -> usize {
     let mut n = 0;
     for node in nodes {
         visit_same_level(node, &mut |e| {
-            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
                 && is_srf_call(fc, snapshot)
             {
                 n += 1;
@@ -186,22 +187,22 @@ pub(crate) fn count_srf_calls(nodes: &[protobuf::Node], snapshot: &PgCatalog) ->
 /// shorter ones padded with NULL), and leaving no row when they all yield
 /// none — `SELECT 1 ORDER BY generate_series(1, 0)` is empty.
 pub(crate) fn level_srf_calls<'a>(
-    sel: &'a protobuf::SelectStmt,
+    sel: &'a ast::SelectStmt,
     snapshot: &PgCatalog,
-) -> Vec<&'a protobuf::FuncCall> {
+) -> Vec<&'a ast::FuncCall> {
     let targets: Vec<String> = sel
         .target_list
         .iter()
-        .filter_map(|t| match t.node.as_ref()? {
-            node::Node::ResTarget(rt) => rt.val.as_deref().map(node_fingerprint),
+        .filter_map(|t| match t.as_ref()? {
+            ast::Node::ResTarget(rt) => rt.val.is_some().then(|| node_fingerprint(&rt.val)),
             _ => None,
         })
         .collect();
     let extra = sel
         .sort_clause
         .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::SortBy(sb) => sb.node.as_deref(),
+        .filter_map(|n| match n.as_ref()? {
+            ast::Node::SortBy(sb) => sb.node.is_some().then_some(&sb.node),
             _ => Some(n),
         })
         .chain(&sel.group_clause)
@@ -210,7 +211,7 @@ pub(crate) fn level_srf_calls<'a>(
     let mut out = Vec::new();
     for n in sel.target_list.iter().chain(extra) {
         visit_same_level(n, &mut |e| {
-            if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+            if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
                 && is_srf_call(fc, snapshot)
             {
                 out.push(&**fc);
@@ -222,10 +223,10 @@ pub(crate) fn level_srf_calls<'a>(
 
 /// True when `node` contains a set-returning function call at this query
 /// level (itself included).
-fn contains_srf(node: &protobuf::Node, snapshot: &PgCatalog) -> bool {
+fn contains_srf(node: &Option<ast::Node>, snapshot: &PgCatalog) -> bool {
     let mut found = false;
     visit_same_level(node, &mut |e| {
-        if let Some(node::Node::FuncCall(fc)) = e.node.as_ref()
+        if let Some(ast::Node::FuncCall(fc)) = e.as_ref()
             && is_srf_call(fc, snapshot)
         {
             found = true;
@@ -249,7 +250,7 @@ fn srf_error(msg: String, hint: bool) -> AnalyzeError {
 /// PG's `check_srf_call_placement` for a clause that forbids set-returning
 /// functions (0A000 `set-returning functions are not allowed in WHERE`, …).
 pub(crate) fn check_no_srf_in_clause(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     snapshot: &PgCatalog,
     clause: &str,
 ) -> Result<(), AnalyzeError> {
@@ -268,7 +269,7 @@ pub(crate) fn check_no_srf_in_clause(
 /// function arguments (`check_agg_arguments_walker` / `ParseFuncOrColumn`)
 /// and an aggregate's FILTER.
 pub(crate) fn check_srf_nesting(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     let mut err: Option<AnalyzeError> = None;
@@ -277,9 +278,9 @@ pub(crate) fn check_srf_nesting(
             return;
         }
         let inner_has_srf =
-            |nodes: Vec<&protobuf::Node>| nodes.into_iter().any(|n| contains_srf(n, snapshot));
-        match e.node.as_ref() {
-            Some(node::Node::CaseExpr(_)) => {
+            |nodes: Vec<&Option<ast::Node>>| nodes.into_iter().any(|n| contains_srf(n, snapshot));
+        match e.as_ref() {
+            Some(ast::Node::CaseExpr(_)) => {
                 if inner_has_srf(expr_children(e)) {
                     err = Some(srf_error(
                         "set-returning functions are not allowed in CASE".into(),
@@ -287,7 +288,7 @@ pub(crate) fn check_srf_nesting(
                     ));
                 }
             }
-            Some(node::Node::CoalesceExpr(_)) => {
+            Some(ast::Node::CoalesceExpr(_)) => {
                 if inner_has_srf(expr_children(e)) {
                     err = Some(srf_error(
                         "set-returning functions are not allowed in COALESCE".into(),
@@ -295,17 +296,15 @@ pub(crate) fn check_srf_nesting(
                     ));
                 }
             }
-            Some(node::Node::FuncCall(fc)) => {
-                if let Some(f) = fc.agg_filter.as_deref()
-                    && contains_srf(f, snapshot)
-                {
+            Some(ast::Node::FuncCall(fc)) => {
+                if fc.agg_filter.is_some() && contains_srf(&fc.agg_filter, snapshot) {
                     err = Some(srf_error(
                         "set-returning functions are not allowed in FILTER".into(),
                         false,
                     ));
                     return;
                 }
-                let args: Vec<&protobuf::Node> =
+                let args: Vec<&Option<ast::Node>> =
                     fc.args.iter().chain(fc.agg_order.iter()).collect();
                 if fc.over.is_some() {
                     if inner_has_srf(args) {
@@ -330,7 +329,7 @@ pub(crate) fn check_srf_nesting(
 }
 
 /// True when `fc` names an aggregate (by name, like `detect_func_kinds`).
-pub(crate) fn is_aggregate_call(fc: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+pub(crate) fn is_aggregate_call(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
     let parts = expr::extract_string_fields(&fc.funcname);
     let (schema, name) = match parts.as_slice() {
         [n] => (None, n.as_str()),

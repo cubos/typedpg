@@ -41,7 +41,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use typedpg_pg_query::protobuf::{self, node};
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast;
 
 use super::{CmpOp, Col, Facts, LitKind, Literal, StrictNode, Trust, TrustedNodes, ValPred};
 use crate::oid::{PgClassOid, PgTypeOid};
@@ -545,49 +546,41 @@ impl Subject {
 
     /// The expression as the parser makes it, its column qualified by
     /// `qualifier` (or bare): what a query reading it writes.
-    pub(crate) fn node(&self, qualifier: Option<&str>) -> protobuf::Node {
-        let string = |s: &str| protobuf::Node {
-            node: Some(node::Node::String(protobuf::String { sval: s.to_owned() })),
+    pub(crate) fn node(&self, qualifier: Option<&str>) -> ast::Node {
+        let string = |s: &str| {
+            Some(ast::Node::String(NodeBox::new(ast::String {
+                sval: s.to_owned(),
+            })))
         };
         match self {
-            Subject::Column(c) => protobuf::Node {
-                node: Some(node::Node::ColumnRef(protobuf::ColumnRef {
-                    fields: qualifier
-                        .into_iter()
-                        .chain([c.as_str()])
-                        .map(string)
-                        .collect(),
-                    location: -1,
-                })),
-            },
-            Subject::Field(x, k, text) => protobuf::Node {
-                node: Some(node::Node::AExpr(Box::new(protobuf::AExpr {
-                    kind: protobuf::AExprKind::AexprOp as i32,
-                    name: vec![string(if *text { "->>" } else { "->" })],
-                    lexpr: Some(Box::new(x.node(qualifier))),
-                    rexpr: Some(Box::new(protobuf::Node {
-                        node: Some(node::Node::AConst(protobuf::AConst {
-                            isnull: false,
-                            val: Some(protobuf::a_const::Val::Sval(protobuf::String {
-                                sval: k.clone(),
-                            })),
-                            location: -1,
-                        })),
-                    })),
-                    rexpr_list_start: -1,
-                    rexpr_list_end: -1,
+            Subject::Column(c) => ast::Node::ColumnRef(NodeBox::new(ast::ColumnRef {
+                fields: qualifier
+                    .into_iter()
+                    .chain([c.as_str()])
+                    .map(string)
+                    .collect(),
+                location: -1,
+            })),
+            Subject::Field(x, k, text) => ast::Node::AExpr(NodeBox::new(ast::AExpr {
+                kind: ast::AExprKind::AexprOp,
+                name: vec![string(if *text { "->>" } else { "->" })],
+                lexpr: Some(x.node(qualifier)),
+                rexpr: Some(ast::Node::AConst(NodeBox::new(ast::AConst {
+                    isnull: false,
+                    val: Some(ast::AConstValue::String(ast::String { sval: k.clone() })),
                     location: -1,
                 }))),
-            },
-            Subject::Typeof(x) => protobuf::Node {
-                node: Some(node::Node::FuncCall(Box::new(protobuf::FuncCall {
-                    funcname: vec![string("jsonb_typeof")],
-                    args: vec![x.node(qualifier)],
-                    funcformat: protobuf::CoercionForm::CoerceExplicitCall as i32,
-                    location: -1,
-                    ..Default::default()
-                }))),
-            },
+                rexpr_list_start: -1,
+                rexpr_list_end: -1,
+                location: -1,
+            })),
+            Subject::Typeof(x) => ast::Node::FuncCall(NodeBox::new(ast::FuncCall {
+                funcname: vec![string("jsonb_typeof")],
+                args: vec![Some(x.node(qualifier))],
+                funcformat: ast::CoercionForm::CoerceExplicitCall,
+                location: -1,
+                ..Default::default()
+            })),
         }
     }
 }
@@ -595,11 +588,11 @@ impl Subject {
 impl Cx<'_> {
     /// What `n` is about, when a literal can be: a column, a parameter
     /// standing for one, or a key / JSON type of one.
-    fn subject_of(&self, n: &protobuf::Node) -> Option<Subject> {
+    fn subject_of(&self, n: &Option<ast::Node>) -> Option<Subject> {
         use crate::nonnull::{JsonbBuiltin as J, StrictNode as S};
-        match n.node.as_ref()? {
-            node::Node::ColumnRef(_) => {
-                let c = column_name(n)?;
+        match n.as_ref()? {
+            ast::Node::ColumnRef(_) => {
+                let c = column_name(n.as_ref())?;
                 match self.env {
                     // A body's names are its parameters.
                     Some(env) => env.get(&c).cloned(),
@@ -607,11 +600,11 @@ impl Cx<'_> {
                         .then_some(Subject::Column(c)),
                 }
             }
-            node::Node::ParamRef(p) => self.env?.get(&format!("${}", p.number)).cloned(),
+            ast::Node::ParamRef(p) => self.env?.get(&format!("${}", p.number)).cloned(),
             // A conversion of a jsonb value (of a domain over jsonb) to
             // jsonb changes nothing.
-            node::Node::TypeCast(tc) => {
-                let inner = self.subject_of(tc.arg.as_deref()?)?;
+            ast::Node::TypeCast(tc) => {
+                let inner = self.subject_of(&tc.arg)?;
                 let target =
                     crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)?;
                 let jsonb = crate::pg_catalog::oid::JSONB;
@@ -621,18 +614,18 @@ impl Cx<'_> {
                         .is_some_and(|t| self.snapshot.unwrap_domain(t) == jsonb))
                 .then_some(inner)
             }
-            node::Node::AExpr(e) => {
+            ast::Node::AExpr(e) => {
                 let op = crate::expr::extract_string_fields(&e.name).join(".");
                 let text = match op.as_str() {
                     "->" if self.trust.trusts(e.location, S::Jsonb(J::Field)) => false,
                     "->>" if self.trust.trusts(e.location, S::Jsonb(J::FieldText)) => true,
                     _ => return None,
                 };
-                let x = self.subject_of(e.lexpr.as_deref()?)?;
-                let key = string_constant(e.rexpr.as_deref()?)?;
+                let x = self.subject_of(&e.lexpr)?;
+                let key = string_constant(&e.rexpr)?;
                 Some(Subject::Field(Box::new(x), key, text))
             }
-            node::Node::FuncCall(f) if self.trust.trusts(f.location, S::Jsonb(J::Typeof)) => {
+            ast::Node::FuncCall(f) if self.trust.trusts(f.location, S::Jsonb(J::Typeof)) => {
                 let [arg] = f.args.as_slice() else {
                     return None;
                 };
@@ -643,7 +636,7 @@ impl Cx<'_> {
     }
 
     /// The name of what `n` is about (see [`Cx::subject_of`]), registered.
-    fn subject(&self, n: &protobuf::Node) -> Option<String> {
+    fn subject(&self, n: &Option<ast::Node>) -> Option<String> {
         let s = self.subject_of(n)?;
         let name = s.name();
         if !matches!(s, Subject::Column(_)) {
@@ -686,10 +679,10 @@ fn typeof_of(subjects: &HashMap<String, Subject>) -> HashMap<String, String> {
 }
 
 /// A string constant (`'k'`).
-fn string_constant(n: &protobuf::Node) -> Option<String> {
-    match n.node.as_ref()? {
-        node::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
-            protobuf::a_const::Val::Sval(s) => Some(s.sval.clone()),
+fn string_constant(n: &Option<ast::Node>) -> Option<String> {
+    match n.as_ref()? {
+        ast::Node::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::String(s) => Some(s.sval.clone()),
             _ => None,
         },
         _ => None,
@@ -788,7 +781,7 @@ impl RelationChecks {
                 env: None,
                 depth: 0,
             };
-            for conjunct in conjuncts(expr) {
+            for conjunct in conjuncts((**expr).as_ref()) {
                 for arms in cnf(conjunct, &cx) {
                     if arms
                         .iter()
@@ -1127,7 +1120,7 @@ impl RelationChecks {
     fn expression_facts(&self, alias: &str, k: &Knowledge<'_>, s: &Solved) -> HashSet<String> {
         let keys = |subject: &Subject| {
             [Some(alias), None]
-                .map(|q| super::exprs::key(&subject.node(q)))
+                .map(|q| super::exprs::key(&Some(subject.node(q))))
                 .into_iter()
         };
         let mut out = HashSet::new();
@@ -1333,7 +1326,7 @@ fn learn(s: &mut Solved, l: &Lit) -> bool {
 fn binding_conjuncts(
     snapshot: &PgCatalog,
     relid: PgClassOid,
-) -> Vec<(&protobuf::Node, &TrustedNodes)> {
+) -> Vec<(Option<&ast::Node>, &TrustedNodes)> {
     static UNTRUSTED: std::sync::LazyLock<TrustedNodes> =
         std::sync::LazyLock::new(TrustedNodes::default);
     let has_children = snapshot.pg_inherits.iter().any(|i| i.inhparent == relid);
@@ -1351,7 +1344,7 @@ fn binding_conjuncts(
             continue;
         };
         let trust = def.trusted.as_ref().unwrap_or(&UNTRUSTED);
-        out.extend(conjuncts(expr).into_iter().map(|c| (c, trust)));
+        out.extend(conjuncts((**expr).as_ref()).into_iter().map(|c| (c, trust)));
     }
     out
 }
@@ -1377,8 +1370,8 @@ pub(crate) fn finite_columns(snapshot: &PgCatalog, relid: PgClassOid) -> HashSet
 /// The column a constraint conjunct keeps finite: `isfinite(c)`, with the
 /// built-in `isfinite`. Not FALSE, it is TRUE (`c` is finite) or NULL (`c`
 /// is NULL).
-pub(crate) fn finite_column(n: &protobuf::Node, trust: &impl Trust) -> Option<String> {
-    let Some(node::Node::FuncCall(f)) = n.node.as_ref() else {
+pub(crate) fn finite_column(n: Option<&ast::Node>, trust: &impl Trust) -> Option<String> {
+    let Some(ast::Node::FuncCall(f)) = n else {
         return None;
     };
     let [arg] = f.args.as_slice() else {
@@ -1386,7 +1379,7 @@ pub(crate) fn finite_column(n: &protobuf::Node, trust: &impl Trust) -> Option<St
     };
     trust
         .trusts(f.location, StrictNode::IsFinite)
-        .then(|| column_name(arg))
+        .then(|| column_name(arg.as_ref()))
         .flatten()
 }
 
@@ -1397,7 +1390,7 @@ pub(crate) fn finite_column(n: &protobuf::Node, trust: &impl Trust) -> Option<St
 /// when the type doesn't print values as they compare
 /// ([`crate::refine::Exact`]).
 pub(crate) fn allowed_values(
-    expr: &protobuf::Node,
+    expr: &Option<ast::Node>,
     c: &str,
     t: PgTypeOid,
     collation: Option<crate::oid::PgCollationOid>,
@@ -1419,7 +1412,7 @@ pub(crate) fn allowed_values(
     };
     let space = Space::of(t, collation, snapshot);
     let mut preds = Vec::new();
-    for conjunct in conjuncts(expr) {
+    for conjunct in conjuncts(expr.as_ref()) {
         let Some(arms) = dnf(conjunct, true, &cx) else {
             continue;
         };
@@ -1458,8 +1451,8 @@ pub(crate) fn allowed_values(
 }
 
 /// The columns a constraint expression keeps finite (see [`finite_column`]).
-pub(crate) fn finite_columns_of(expr: &protobuf::Node, trust: &impl Trust) -> Vec<String> {
-    conjuncts(expr)
+pub(crate) fn finite_columns_of(expr: &Option<ast::Node>, trust: &impl Trust) -> Vec<String> {
+    conjuncts(expr.as_ref())
         .into_iter()
         .filter_map(|c| finite_column(c, trust))
         .collect()
@@ -1467,8 +1460,8 @@ pub(crate) fn finite_columns_of(expr: &protobuf::Node, trust: &impl Trust) -> Ve
 
 /// The columns a constraint expression says hold no NULL element (see
 /// [`null_free_array`]).
-pub(crate) fn null_free_arrays(expr: &protobuf::Node, trust: &impl Trust) -> Vec<String> {
-    conjuncts(expr)
+pub(crate) fn null_free_arrays(expr: &Option<ast::Node>, trust: &impl Trust) -> Vec<String> {
+    conjuncts(expr.as_ref())
         .into_iter()
         .filter_map(|c| null_free_array(c, trust))
         .collect()
@@ -1479,30 +1472,29 @@ pub(crate) fn null_free_arrays(expr: &protobuf::Node, trust: &impl Trust) -> Vec
 /// The test is never NULL, so not FALSE is TRUE: the search found no NULL
 /// — `c` is NULL, or a one-dimensional array (a multidimensional one fails
 /// the search) none of whose elements is.
-fn null_free_array(n: &protobuf::Node, trust: &impl Trust) -> Option<String> {
-    let is_null_const = |n: &protobuf::Node| match n.node.as_ref() {
-        Some(node::Node::AConst(c)) => c.isnull,
-        Some(node::Node::TypeCast(tc)) => tc
+fn null_free_array(n: Option<&ast::Node>, trust: &impl Trust) -> Option<String> {
+    let is_null_const = |n: &Option<ast::Node>| match n.as_ref() {
+        Some(ast::Node::AConst(c)) => c.isnull,
+        Some(ast::Node::TypeCast(tc)) => tc
             .arg
-            .as_deref()
-            .and_then(|a| a.node.as_ref())
-            .is_some_and(|a| matches!(a, node::Node::AConst(c) if c.isnull)),
+            .as_ref()
+            .is_some_and(|a| matches!(a, ast::Node::AConst(c) if c.isnull)),
         _ => false,
     };
-    let Some(node::Node::NullTest(t)) = n.node.as_ref() else {
+    let Some(ast::Node::NullTest(t)) = n else {
         return None;
     };
-    if protobuf::NullTestType::try_from(t.nulltesttype) != Ok(protobuf::NullTestType::IsNull) {
+    if t.nulltesttype != ast::NullTestType::IsNull {
         return None;
     }
-    let Some(node::Node::FuncCall(f)) = t.arg.as_deref()?.node.as_ref() else {
+    let Some(ast::Node::FuncCall(f)) = t.arg.as_ref() else {
         return None;
     };
     let [array, needle] = f.args.as_slice() else {
         return None;
     };
     (trust.trusts(f.location, StrictNode::ArrayPosition) && is_null_const(needle))
-        .then(|| column_name(array))
+        .then(|| column_name(array.as_ref()))
         .flatten()
 }
 
@@ -1638,13 +1630,10 @@ fn match_full_clauses(snapshot: &PgCatalog, relid: PgClassOid) -> Vec<Clause> {
 }
 
 /// The top-level conjuncts of `n`.
-fn conjuncts(n: &protobuf::Node) -> Vec<&protobuf::Node> {
-    match n.node.as_ref() {
-        Some(node::Node::BoolExpr(b))
-            if protobuf::BoolExprType::try_from(b.boolop)
-                == Ok(protobuf::BoolExprType::AndExpr) =>
-        {
-            b.args.iter().flat_map(conjuncts).collect()
+fn conjuncts(n: Option<&ast::Node>) -> Vec<Option<&ast::Node>> {
+    match n {
+        Some(ast::Node::BoolExpr(b)) if b.boolop == ast::BoolExprType::AndExpr => {
+            b.args.iter().flat_map(|a| conjuncts(a.as_ref())).collect()
         }
         _ => vec![n],
     }
@@ -1656,16 +1645,16 @@ fn conjuncts(n: &protobuf::Node) -> Vec<&protobuf::Node> {
 /// `Q` the other ways — so `(P OR Q) AND (R1 OR Q) AND (R2 OR Q)`; a call
 /// of a `LANGUAGE sql` function, its body. What doesn't split is one
 /// clause, as [`dnf`] reads it (none, past its size).
-fn cnf(n: &protobuf::Node, cx: &Cx<'_>) -> Vec<Vec<Vec<Lit>>> {
-    use protobuf::BoolExprType as B;
-    match n.node.as_ref() {
-        Some(node::Node::BoolExpr(b)) if B::try_from(b.boolop) == Ok(B::AndExpr) => {
-            b.args.iter().flat_map(|a| cnf(a, cx)).collect()
+fn cnf(n: Option<&ast::Node>, cx: &Cx<'_>) -> Vec<Vec<Vec<Lit>>> {
+    use ast::BoolExprType as B;
+    match n {
+        Some(ast::Node::BoolExpr(b)) if b.boolop == B::AndExpr => {
+            b.args.iter().flat_map(|a| cnf(a.as_ref(), cx)).collect()
         }
-        Some(node::Node::CaseExpr(c)) if c.arg.is_none() => {
+        Some(ast::Node::CaseExpr(c)) if c.arg.is_none() => {
             case_cnf(c, cx).unwrap_or_else(|| dnf(n, true, cx).into_iter().collect())
         }
-        Some(node::Node::FuncCall(f)) => match inline_cnf(f, cx) {
+        Some(ast::Node::FuncCall(f)) => match inline_cnf(f, cx) {
             Some(clauses) => clauses,
             None => dnf(n, true, cx).into_iter().collect(),
         },
@@ -1674,16 +1663,16 @@ fn cnf(n: &protobuf::Node, cx: &Cx<'_>) -> Vec<Vec<Vec<Lit>>> {
 }
 
 /// A searched CASE with one result that isn't a constant (see [`cnf`]).
-fn case_cnf(c: &protobuf::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
-    let constant = |n: &protobuf::Node| matches!(n.node.as_ref(), Some(node::Node::AConst(_)));
+fn case_cnf(c: &ast::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
+    let constant = |n: &ast::Node| matches!(n, ast::Node::AConst(_));
     let mut whens = Vec::new();
     for arg in &c.args {
-        let Some(node::Node::CaseWhen(w)) = arg.node.as_ref() else {
+        let Some(ast::Node::CaseWhen(w)) = arg.as_ref() else {
             return None;
         };
-        whens.push((w.expr.as_deref()?, w.result.as_deref()?));
+        whens.push((w.expr.as_ref()?, w.result.as_ref()?));
     }
-    let default = c.defresult.as_deref();
+    let default = c.defresult.as_ref();
     let open: Vec<usize> = whens
         .iter()
         .enumerate()
@@ -1697,17 +1686,17 @@ fn case_cnf(c: &protobuf::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
             let mut none_before = vec![Vec::new()];
             let mut q: Vec<Vec<Lit>> = Vec::new();
             let mut p = None;
-            for (j, (w, r)) in whens.iter().enumerate() {
-                let taken = product(&none_before, &dnf(w, true, cx)?)?;
+            for (j, &(w, r)) in whens.iter().enumerate() {
+                let taken = product(&none_before, &dnf(Some(w), true, cx)?)?;
                 if j == *i {
                     p = Some(taken);
                 } else {
-                    q = either(q, product(&taken, &dnf(r, true, cx)?)?)?;
+                    q = either(q, product(&taken, &dnf(Some(r), true, cx)?)?)?;
                 }
-                none_before = product(&none_before, &dnf(w, false, cx)?)?;
+                none_before = product(&none_before, &dnf(Some(w), false, cx)?)?;
             }
             let d = match default {
-                Some(d) => dnf(d, true, cx)?,
+                Some(d) => dnf(Some(d), true, cx)?,
                 None => vec![Vec::new()],
             };
             q = either(q, product(&none_before, &d)?)?;
@@ -1716,17 +1705,17 @@ fn case_cnf(c: &protobuf::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
         ([], true) => {
             let mut none_before = vec![Vec::new()];
             let mut q: Vec<Vec<Lit>> = Vec::new();
-            for (w, r) in &whens {
-                let taken = product(&none_before, &dnf(w, true, cx)?)?;
-                q = either(q, product(&taken, &dnf(r, true, cx)?)?)?;
-                none_before = product(&none_before, &dnf(w, false, cx)?)?;
+            for &(w, r) in &whens {
+                let taken = product(&none_before, &dnf(Some(w), true, cx)?)?;
+                q = either(q, product(&taken, &dnf(Some(r), true, cx)?)?)?;
+                none_before = product(&none_before, &dnf(Some(w), false, cx)?)?;
             }
             (none_before, q, default?)
         }
         _ => return None,
     };
     let mut out = vec![either(guard, rest.clone())?];
-    for clause in cnf(result, cx) {
+    for clause in cnf(Some(result), cx) {
         out.push(either(clause, rest.clone())?);
     }
     Some(out)
@@ -1738,7 +1727,7 @@ fn case_cnf(c: &protobuf::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
 /// resolves to, as clauses. A STRICT one is also NULL — neither FALSE nor
 /// TRUE — for a NULL argument. `None` when the call isn't one, or past a
 /// depth.
-fn inline_cnf(f: &protobuf::FuncCall, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
+fn inline_cnf(f: &ast::FuncCall, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
     let snapshot = cx.snapshot;
     if cx.depth >= MAX_INLINE_DEPTH {
         return None;
@@ -1753,7 +1742,7 @@ fn inline_cnf(f: &protobuf::FuncCall, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>>
     if f.args.len() != proc.proargtypes.len()
         || f.args
             .iter()
-            .any(|a| matches!(a.node.as_ref(), Some(node::Node::NamedArgExpr(_))))
+            .any(|a| matches!(a.as_ref(), Some(ast::Node::NamedArgExpr(_))))
     {
         return None;
     }
@@ -1804,7 +1793,7 @@ fn inline_cnf(f: &protobuf::FuncCall, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>>
         env: Some(&env),
         depth: cx.depth + 1,
     };
-    let mut clauses = cnf(body, &sub);
+    let mut clauses = cnf(body.as_ref(), &sub);
     if !strict_nulls.is_empty() {
         clauses = clauses
             .into_iter()
@@ -1840,20 +1829,20 @@ fn one(l: Lit) -> Vec<Vec<Lit>> {
 /// `n` not FALSE (`positive`) or not TRUE, as an OR of AND-arms — or a
 /// weaker one, allowing more rows; `None` past [`MAX_ARMS`]. No arm: never;
 /// one empty arm: always.
-fn dnf(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
-    use protobuf::BoolExprType as B;
-    match n.node.as_ref() {
-        Some(node::Node::BoolExpr(b)) => match B::try_from(b.boolop) {
+fn dnf(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
+    use ast::BoolExprType as B;
+    match n {
+        Some(ast::Node::BoolExpr(b)) => match b.boolop {
             // Not FALSE: every arm not FALSE. Not TRUE: some arm not TRUE.
-            Ok(B::AndExpr) | Ok(B::OrExpr) => {
-                let and = B::try_from(b.boolop) == Ok(B::AndExpr);
+            B::AndExpr | B::OrExpr => {
+                let and = b.boolop == B::AndExpr;
                 let mut arms: Vec<Vec<Lit>> = if and == positive {
                     vec![Vec::new()]
                 } else {
                     Vec::new()
                 };
                 for a in &b.args {
-                    let sub = dnf(a, positive, cx)?;
+                    let sub = dnf(a.as_ref(), positive, cx)?;
                     arms = if and == positive {
                         product(&arms, &sub)?
                     } else {
@@ -1862,46 +1851,45 @@ fn dnf(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>>
                 }
                 Some(arms)
             }
-            Ok(B::NotExpr) => match b.args.as_slice() {
-                [inner] => dnf(inner, !positive, cx),
+            B::NotExpr => match b.args.as_slice() {
+                [inner] => dnf(inner.as_ref(), !positive, cx),
                 _ => Some(one(Lit::Other)),
             },
-            _ => Some(one(Lit::Other)),
         },
-        Some(node::Node::AConst(c)) => {
-            use typedpg_pg_query::protobuf::a_const::Val;
+        Some(ast::Node::AConst(c)) => {
+            use typedpg_pg_query::ast::AConstValue;
             match c.val.as_ref() {
                 // NULL is neither FALSE nor TRUE.
                 _ if c.isnull => Some(vec![Vec::new()]),
-                Some(Val::Boolval(v)) if v.boolval == positive => Some(vec![Vec::new()]),
-                Some(Val::Boolval(_)) => Some(Vec::new()),
+                Some(AConstValue::Boolean(v)) if v.boolval == positive => Some(vec![Vec::new()]),
+                Some(AConstValue::Boolean(_)) => Some(Vec::new()),
                 _ => Some(one(Lit::Other)),
             }
         }
-        Some(node::Node::CaseExpr(c)) => case_dnf(c, positive, cx),
-        Some(node::Node::BooleanTest(t)) => {
-            use protobuf::BoolTestType as T;
-            let Some(arg) = t.arg.as_deref() else {
+        Some(ast::Node::CaseExpr(c)) => case_dnf(c, positive, cx),
+        Some(ast::Node::BooleanTest(t)) => {
+            use ast::BoolTestType as T;
+            let Some(arg) = t.arg.as_ref() else {
                 return Some(one(Lit::Other));
             };
             // `P IS TRUE` FALSE is `P` not TRUE, exactly; TRUE is `P`
             // TRUE, which `P` not FALSE stands in for.
-            match T::try_from(t.booltesttype) {
-                Ok(T::IsTrue | T::IsNotFalse) => dnf(arg, positive, cx),
-                Ok(T::IsFalse | T::IsNotTrue) => dnf(arg, !positive, cx),
+            match t.booltesttype {
+                T::IsTrue | T::IsNotFalse => dnf(Some(arg), positive, cx),
+                T::IsFalse | T::IsNotTrue => dnf(Some(arg), !positive, cx),
                 _ => Some(one(Lit::Other)),
             }
         }
-        Some(node::Node::AExpr(e)) if boolean_equality(e, cx) => {
-            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+        Some(ast::Node::AExpr(e)) if boolean_equality(e, cx) => {
+            let (Some(l), Some(r)) = (e.lexpr.as_ref(), e.rexpr.as_ref()) else {
                 return Some(one(Lit::Other));
             };
             // `P = Q` is NULL when either side is, else TRUE when they
             // agree: not FALSE when both are not FALSE or both not TRUE
             // (a NULL side is both), not TRUE when one is not FALSE and the
             // other not TRUE.
-            let (lt, lf) = (dnf(l, true, cx)?, dnf(l, false, cx)?);
-            let (rt, rf) = (dnf(r, true, cx)?, dnf(r, false, cx)?);
+            let (lt, lf) = (dnf(Some(l), true, cx)?, dnf(Some(l), false, cx)?);
+            let (rt, rf) = (dnf(Some(r), true, cx)?, dnf(Some(r), false, cx)?);
             let agree = either(product(&lt, &rt)?, product(&lf, &rf)?)?;
             let differ = either(product(&lt, &rf)?, product(&lf, &rt)?)?;
             let eq = crate::expr::extract_string_fields(&e.name).join(".") == "=";
@@ -1912,43 +1900,39 @@ fn dnf(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>>
 }
 
 /// `P = Q` / `P <> Q` between two conditions (the built-in `bool` ones).
-fn boolean_equality(e: &protobuf::AExpr, cx: &Cx<'_>) -> bool {
+fn boolean_equality(e: &ast::AExpr, cx: &Cx<'_>) -> bool {
     let op = crate::expr::extract_string_fields(&e.name).join(".");
-    protobuf::AExprKind::try_from(e.kind) == Ok(protobuf::AExprKind::AexprOp)
+    e.kind == ast::AExprKind::AexprOp
         && (op == "=" || op == "<>")
         && cx.trust.trusts(e.location, StrictNode::BuiltinCompare)
-        && e.lexpr.as_deref().is_some_and(|n| is_condition(n, cx))
-        && e.rexpr.as_deref().is_some_and(|n| is_condition(n, cx))
+        && e.lexpr.as_ref().is_some_and(|n| is_condition(n, cx))
+        && e.rexpr.as_ref().is_some_and(|n| is_condition(n, cx))
 }
 
 /// A boolean-valued expression: a test, a comparison, a boolean column.
-fn is_condition(n: &protobuf::Node, cx: &Cx<'_>) -> bool {
-    use typedpg_pg_query::protobuf::a_const::Val;
-    match n.node.as_ref() {
-        Some(node::Node::BoolExpr(_) | node::Node::NullTest(_) | node::Node::BooleanTest(_)) => {
-            true
-        }
-        Some(node::Node::AConst(c)) => matches!(c.val, Some(Val::Boolval(_))),
-        Some(node::Node::AExpr(e)) => {
-            use protobuf::AExprKind as K;
-            match K::try_from(e.kind) {
-                Ok(K::AexprOp) => {
+fn is_condition(n: &ast::Node, cx: &Cx<'_>) -> bool {
+    use typedpg_pg_query::ast::AConstValue;
+    match n {
+        ast::Node::BoolExpr(_) | ast::Node::NullTest(_) | ast::Node::BooleanTest(_) => true,
+        ast::Node::AConst(c) => matches!(c.val, Some(AConstValue::Boolean(_))),
+        ast::Node::AExpr(e) => {
+            use ast::AExprKind as K;
+            match e.kind {
+                K::AexprOp => {
                     let op = crate::expr::extract_string_fields(&e.name).join(".");
                     matches!(op.as_str(), "=" | "<>" | "<" | "<=" | ">" | ">=")
                 }
-                Ok(
-                    K::AexprIn
-                    | K::AexprOpAny
-                    | K::AexprOpAll
-                    | K::AexprDistinct
-                    | K::AexprNotDistinct
-                    | K::AexprBetween
-                    | K::AexprNotBetween,
-                ) => true,
+                K::AexprIn
+                | K::AexprOpAny
+                | K::AexprOpAll
+                | K::AexprDistinct
+                | K::AexprNotDistinct
+                | K::AexprBetween
+                | K::AexprNotBetween => true,
                 _ => false,
             }
         }
-        Some(node::Node::ColumnRef(_)) => column_name(n)
+        ast::Node::ColumnRef(_) => column_name(Some(n))
             .and_then(|c| (cx.column_type)(&c))
             .is_some_and(|t| cx.snapshot.unwrap_domain(t) == crate::pg_catalog::oid::BOOL),
         _ => false,
@@ -1959,11 +1943,11 @@ fn is_condition(n: &protobuf::Node, cx: &Cx<'_>) -> bool {
 /// results: the first WHEN that is TRUE picks its result, the ELSE (an
 /// omitted one is NULL) applies when none is. A WHEN being TRUE is read as
 /// it being not FALSE (more rows).
-fn case_dnf(c: &protobuf::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
-    let test = c.arg.as_deref().map(|t| cx.subject(t));
-    let when_dnf = |when: &protobuf::CaseWhen, w: &protobuf::Node, pos: bool| {
+fn case_dnf(c: &ast::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
+    let test = c.arg.is_some().then(|| cx.subject(&c.arg));
+    let when_dnf = |when: &ast::CaseWhen, w: &Option<ast::Node>, pos: bool| {
         match &test {
-            None => dnf(w, pos, cx),
+            None => dnf(w.as_ref(), pos, cx),
             Some(None) => Some(one(Lit::Other)),
             // `test = value`, by the built-in `=` (resolved at the WHEN).
             Some(Some(_)) if !cx.trust.trusts(when.location, StrictNode::BuiltinCompare) => {
@@ -1986,31 +1970,32 @@ fn case_dnf(c: &protobuf::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<V
     let mut none_before: Vec<Vec<Lit>> = vec![Vec::new()];
     let mut out: Vec<Vec<Lit>> = Vec::new();
     for arg in &c.args {
-        let Some(node::Node::CaseWhen(w)) = arg.node.as_ref() else {
+        let Some(ast::Node::CaseWhen(w)) = arg.as_ref() else {
             return Some(one(Lit::Other));
         };
-        let (Some(cond), Some(result)) = (w.expr.as_deref(), w.result.as_deref()) else {
+        if w.expr.is_none() || w.result.is_none() {
             return Some(one(Lit::Other));
-        };
+        }
+        let (cond, result) = (&w.expr, &w.result);
         let taken = product(&none_before, &when_dnf(w, cond, true)?)?;
-        out = either(out, product(&taken, &dnf(result, positive, cx)?)?)?;
+        out = either(out, product(&taken, &dnf(result.as_ref(), positive, cx)?)?)?;
         none_before = product(&none_before, &when_dnf(w, cond, false)?)?;
     }
-    let default = match c.defresult.as_deref() {
-        Some(d) => dnf(d, positive, cx)?,
+    let default = match c.defresult.as_ref() {
+        Some(d) => dnf(Some(d), positive, cx)?,
         None => vec![Vec::new()],
     };
     either(out, product(&none_before, &default)?)
 }
 
 /// A column a constraint names (bare, or qualified by its table).
-fn column_name(n: &protobuf::Node) -> Option<String> {
-    let Some(node::Node::ColumnRef(c)) = n.node.as_ref() else {
+fn column_name(n: Option<&ast::Node>) -> Option<String> {
+    let Some(ast::Node::ColumnRef(c)) = n else {
         return None;
     };
     if c.fields
         .iter()
-        .any(|f| matches!(f.node.as_ref(), Some(node::Node::AStar(_))))
+        .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
     {
         return None;
     }
@@ -2025,10 +2010,10 @@ fn column_name(n: &protobuf::Node) -> Option<String> {
 /// `x` is NULL, not an object, or has the keys; not TRUE (one key): `x`
 /// is NULL, not an object, or hasn't it.
 fn json_key_atom(
-    e: &protobuf::AExpr,
+    e: &ast::AExpr,
     op: &str,
-    l: &protobuf::Node,
-    r: &protobuf::Node,
+    l: &Option<ast::Node>,
+    r: &Option<ast::Node>,
     positive: bool,
     cx: &Cx<'_>,
 ) -> Option<Vec<Vec<Lit>>> {
@@ -2072,19 +2057,19 @@ fn json_type(t: &str) -> Literal {
 }
 
 /// `ARRAY['a', 'b']` (maybe cast to `text[]`) of string constants.
-fn string_array_constant(n: &protobuf::Node) -> Option<Vec<String>> {
-    match n.node.as_ref()? {
-        node::Node::TypeCast(tc) => string_array_constant(tc.arg.as_deref()?),
-        node::Node::AArrayExpr(a) => a.elements.iter().map(string_constant).collect(),
+fn string_array_constant(n: &Option<ast::Node>) -> Option<Vec<String>> {
+    match n.as_ref()? {
+        ast::Node::TypeCast(tc) => string_array_constant(&tc.arg),
+        ast::Node::AArrayExpr(a) => a.elements.iter().map(string_constant).collect(),
         _ => None,
     }
 }
 
 /// A literal (or arms of literals) for `n`, not FALSE (`positive`) or not
 /// TRUE.
-fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
-    let scalar = |a: &protobuf::Node| cx.subject(a);
-    let lit = |n: &protobuf::Node, c: &str| {
+fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
+    let scalar = |a: &Option<ast::Node>| cx.subject(a);
+    let lit = |n: &Option<ast::Node>, c: &str| {
         cx.subject_type(c)
             .and_then(|t| super::literal_for(n, t, cx.snapshot))
     };
@@ -2096,20 +2081,20 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
         vec![cols.iter().map(|c| Lit::IsNull(c.clone())).collect()]
     };
     let other = one(Lit::Other);
-    match n.node.as_ref() {
+    match n {
         // A boolean column used as a condition: `done` is `done = true`.
-        Some(node::Node::ColumnRef(_)) => match column_name(n) {
+        Some(ast::Node::ColumnRef(_)) => match column_name(n) {
             Some(c) => val(c, ValPred::In(vec![Literal::boolean(true)])),
             None => other,
         },
-        Some(node::Node::NullTest(t)) => {
-            let Some(arg) = t.arg.as_deref() else {
+        Some(ast::Node::NullTest(t)) => {
+            if t.arg.is_none() {
                 return other;
-            };
-            let is_null = match protobuf::NullTestType::try_from(t.nulltesttype) {
-                Ok(protobuf::NullTestType::IsNull) => true,
-                Ok(protobuf::NullTestType::IsNotNull) => false,
-                _ => return other,
+            }
+            let arg = &t.arg;
+            let is_null = match t.nulltesttype {
+                ast::NullTestType::IsNull => true,
+                ast::NullTestType::IsNotNull => false,
             };
             // `x IS NULL` is never NULL: not FALSE is TRUE, not TRUE FALSE.
             let null_wanted = is_null == positive;
@@ -2121,7 +2106,7 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 });
             }
             // `coalesce(a, b) IS NOT NULL`: one of them is non-NULL.
-            if let Some(node::Node::CoalesceExpr(co)) = arg.node.as_ref() {
+            if let Some(ast::Node::CoalesceExpr(co)) = arg.as_ref() {
                 let cols: Option<BTreeSet<String>> = co.args.iter().map(scalar).collect();
                 if let Some(cols) = cols.filter(|c| !c.is_empty()) {
                     return if null_wanted {
@@ -2133,10 +2118,11 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             }
             other
         }
-        Some(node::Node::AExpr(e)) => {
-            use protobuf::AExprKind as K;
+        Some(ast::Node::AExpr(e)) => {
+            use ast::AExprKind as K;
             if let Some((args, lo, hi)) = super::null_count_bounds(e, cx.trust) {
-                let cols: Option<BTreeSet<String>> = args.iter().map(column_name).collect();
+                let cols: Option<BTreeSet<String>> =
+                    args.iter().map(|a| column_name(a.as_ref())).collect();
                 let Some(cols) = cols.filter(|c| !c.is_empty()) else {
                     return other;
                 };
@@ -2165,9 +2151,10 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 };
             }
             let op = crate::expr::extract_string_fields(&e.name).join(".");
-            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+            if e.lexpr.is_none() || e.rexpr.is_none() {
                 return other;
-            };
+            }
+            let (l, r) = (&e.lexpr, &e.rexpr);
             if let Some(arms) = json_key_atom(e, &op, l, r, positive, cx) {
                 return arms;
             }
@@ -2176,8 +2163,8 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
             if !cx.trust.trusts(e.location, StrictNode::BuiltinCompare) {
                 return other;
             }
-            match K::try_from(e.kind) {
-                Ok(K::AexprOp) => {
+            match e.kind {
+                K::AexprOp => {
                     let (c, v, flipped) = match (scalar(l), scalar(r)) {
                         (Some(c), None) => match lit(r, &c) {
                             Some(v) => (c, v, false),
@@ -2201,9 +2188,8 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 }
                 // A NULL in the list makes `IN` NULL rather than FALSE:
                 // such a list says nothing.
-                Ok(K::AexprIn) => {
-                    let (Some(c), Some(node::Node::List(list))) = (scalar(l), r.node.as_ref())
-                    else {
+                K::AexprIn => {
+                    let (Some(c), Some(ast::Node::List(list))) = (scalar(l), r.as_ref()) else {
                         return other;
                     };
                     let Some(t) = cx.subject_type(&c) else {
@@ -2218,7 +2204,7 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                         _ => other,
                     }
                 }
-                Ok(kind @ (K::AexprOpAny | K::AexprOpAll)) => {
+                kind @ (K::AexprOpAny | K::AexprOpAll) => {
                     let Some(c) = scalar(l) else {
                         return other;
                     };
@@ -2237,7 +2223,7 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                 }
                 // `c IS DISTINCT FROM v` (never NULL): `c` is NULL, or
                 // non-NULL and not `v`.
-                Ok(kind @ (K::AexprDistinct | K::AexprNotDistinct)) => {
+                kind @ (K::AexprDistinct | K::AexprNotDistinct) => {
                     let (c, v) = match (scalar(l), scalar(r)) {
                         (Some(c), None) => match lit(r, &c) {
                             Some(v) => (c, v),
@@ -2266,9 +2252,8 @@ fn atom(n: &protobuf::Node, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                     }
                 }
                 // `c BETWEEN a AND b` is `c >= a AND c <= b`.
-                Ok(kind @ (K::AexprBetween | K::AexprNotBetween)) => {
-                    let (Some(c), Some(node::Node::List(list))) = (scalar(l), r.node.as_ref())
-                    else {
+                kind @ (K::AexprBetween | K::AexprNotBetween) => {
+                    let (Some(c), Some(ast::Node::List(list))) = (scalar(l), r.as_ref()) else {
                         return other;
                     };
                     let (Some(a), Some(b)) = (

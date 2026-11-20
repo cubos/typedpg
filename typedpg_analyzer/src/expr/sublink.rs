@@ -1,30 +1,28 @@
 use super::*;
+use typedpg_pg_query::ast;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Subqueries (SubLink)
 // ──────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn infer_sublink(
-    sub: &protobuf::SubLink,
+    sub: &ast::SubLink,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let Ctx {
         scope, snapshot, ..
     } = ctx;
-    let sub_type = protobuf::SubLinkType::try_from(sub.sub_link_type)
-        .unwrap_or(protobuf::SubLinkType::ExprSublink);
+    let sub_type = sub.sub_link_type;
 
     match sub_type {
-        protobuf::SubLinkType::ExistsSublink => {
+        ast::SubLinkType::ExistsSublink => {
             // Walk the subselect to collect any params referenced inside —
             // without this, `EXISTS(SELECT 1 FROM t WHERE x = $p1)` would
             // drop `$p1` from the param list entirely. Outer scope is
             // seeded so correlated refs (`outer.col`) resolve correctly
             // and feed types into the param resolver.
-            if let Some(subselect) = &sub.subselect
-                && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
-            {
+            if let Some(ast::Node::SelectStmt(sel)) = &sub.subselect {
                 // What the subquery's WHERE proves of this level's columns
                 // holds whenever EXISTS is TRUE (see `capture_correlation`).
                 // `simplify_EXISTS_query` discards the target list, ORDER
@@ -48,10 +46,8 @@ pub(crate) fn infer_sublink(
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }
-        protobuf::SubLinkType::ExprSublink => {
-            if let Some(subselect) = &sub.subselect
-                && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
-            {
+        ast::SubLinkType::ExprSublink => {
+            if let Some(ast::Node::SelectStmt(sel)) = &sub.subselect {
                 let (first, min_one_row) = single_sublink_column(sub, sel, ctx, params)?;
                 // A row always comes back (more than one is an error): the
                 // value is NULL only when the column is.
@@ -69,12 +65,10 @@ pub(crate) fn infer_sublink(
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))
         }
-        protobuf::SubLinkType::AnySublink | protobuf::SubLinkType::AllSublink => {
+        ast::SubLinkType::AnySublink | ast::SubLinkType::AllSublink => {
             // Walk the subselect so params inside `col = ANY(SELECT …)` /
             // `col = ALL(SELECT …)` are collected with the right types.
-            if let Some(subselect) = &sub.subselect
-                && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
-            {
+            if let Some(ast::Node::SelectStmt(sel)) = &sub.subselect {
                 let (analyzed, own) = crate::nonnull::capture_own(sel, || {
                     crate::resolve::analyze_correlated_select(
                         sel,
@@ -92,11 +86,9 @@ pub(crate) fn infer_sublink(
                 // or `subquery has too few columns`.
                 // A ROW's arguments go through transformExpressionList,
                 // which expands `t.*` / `(expr).*` into their columns.
-                let lhs_row: Option<std::borrow::Cow<'_, [protobuf::Node]>> =
-                    match sub.testexpr.as_deref().and_then(|n| n.node.as_ref()) {
-                        Some(node::Node::RowExpr(r)) => {
-                            Some(expand_row_args(&r.args, ctx, params)?)
-                        }
+                let lhs_row: Option<std::borrow::Cow<'_, [Option<ast::Node>]>> =
+                    match sub.testexpr.as_ref() {
+                        Some(ast::Node::RowExpr(r)) => Some(expand_row_args(&r.args, ctx, params)?),
                         _ => None,
                     };
                 let lhs_arity = lhs_row.as_ref().map_or(1, |r| r.len());
@@ -119,9 +111,11 @@ pub(crate) fn infer_sublink(
                 // `operator does not exist: integer = text`. The LHS lives in
                 // `testexpr` and is *only* reachable through this SubLink, so we
                 // must walk it here — that also pins LHS params/columns.
-                let lhs_nodes: Vec<&protobuf::Node> = match &lhs_row {
+                let lhs_nodes: Vec<&Option<ast::Node>> = match &lhs_row {
                     Some(r) => r.iter().collect(),
-                    None => sub.testexpr.as_deref().into_iter().collect(),
+                    None => std::iter::once(&sub.testexpr)
+                        .filter(|t| t.is_some())
+                        .collect(),
                 };
                 // `oper_name` is `=` for `IN`, or the written operator for
                 // `<op> ANY/ALL`. Default to `=` if the parser left it empty.
@@ -133,7 +127,7 @@ pub(crate) fn infer_sublink(
                         joined
                     }
                 };
-                if sub_type == protobuf::SubLinkType::AnySublink
+                if sub_type == ast::SubLinkType::AnySublink
                     && op_name == "="
                     && let (Some(own), Some(log)) = (own, ctx.strict_log)
                     && let Some(facts) = same_row_facts(sub, sel, &own, scope, snapshot)
@@ -143,7 +137,7 @@ pub(crate) fn infer_sublink(
                 // `x op ANY (SELECT …)` is NULL or FALSE for a NULL `x` when
                 // every comparison is strict (a row's `=` is an AND of its
                 // fields' comparisons, never TRUE with a NULL field).
-                let mut strict = sub_type == protobuf::SubLinkType::AnySublink
+                let mut strict = sub_type == ast::SubLinkType::AnySublink
                     && (lhs_row.is_none() || op_name == "=");
                 // ExecScanSubPlan: ANY / ALL is NULL only when some
                 // comparison is and none decides the result — never when
@@ -234,7 +228,7 @@ pub(crate) fn infer_sublink(
                 if lhs_row.is_some() {
                     check_row_comparison_interpretation(snapshot, &op_name, &ops, sub.location)?;
                 }
-                if sub_type == protobuf::SubLinkType::AnySublink && op_name == "=" {
+                if sub_type == ast::SubLinkType::AnySublink && op_name == "=" {
                     crate::pg_catalog::note_sublink_nullability(
                         sub.location,
                         lhs_nullable,
@@ -246,7 +240,7 @@ pub(crate) fn infer_sublink(
             }
             Ok(ExprType::scalar(oid::BOOL, true))
         }
-        protobuf::SubLinkType::ArraySublink => {
+        ast::SubLinkType::ArraySublink => {
             // `ARRAY(SELECT expr FROM …)` — returns an array of the subquery's
             // single output column. The array itself is always NOT NULL (an
             // empty result produces `{}`, not NULL), even though individual
@@ -260,9 +254,7 @@ pub(crate) fn infer_sublink(
             let mut collation = super::DerivedCollation::default();
             let mut elem_nullable = None;
             let mut planned = super::Planned::AsParsed;
-            if let Some(subselect) = &sub.subselect
-                && let Some(node::Node::SelectStmt(sel)) = subselect.node.as_ref()
-            {
+            if let Some(ast::Node::SelectStmt(sel)) = &sub.subselect {
                 let (first, _) = single_sublink_column(sub, sel, ctx, params)?;
                 // The array carries the column's typmod (exprTypmod of an
                 // ARRAY sublink is its subquery column's) and, implicitly,
@@ -294,7 +286,7 @@ pub(crate) fn infer_sublink(
         _ => Err(crate::error::RawError::unsupported(
             format!(
                 "typedpg does not support {} subqueries yet",
-                sub_type.as_str_name()
+                sub_type.c_name()
             ),
             crate::error::SourceSpan::from_location(sub.location),
             None,
@@ -312,8 +304,8 @@ pub(crate) fn infer_sublink(
 /// Also tells whether the subquery always yields a row (see
 /// [`crate::resolve::LevelSummary::min_one_row`]).
 fn single_sublink_column(
-    sub: &protobuf::SubLink,
-    sel: &protobuf::SelectStmt,
+    sub: &ast::SubLink,
+    sel: &ast::SelectStmt,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(crate::resolve::RawColumn, bool), AnalyzeError> {
@@ -344,8 +336,8 @@ fn single_sublink_column(
     }
     if first.type_oid == oid::UNKNOWN {
         if let [target] = sel.target_list.as_slice()
-            && let Some(node::Node::ResTarget(rt)) = target.node.as_ref()
-            && let Some(node::Node::ParamRef(p)) = rt.val.as_deref().and_then(|v| v.node.as_ref())
+            && let Some(ast::Node::ResTarget(rt)) = target.as_ref()
+            && let Some(ast::Node::ParamRef(p)) = rt.val.as_ref()
             && params.get(p.number) == oid::UNKNOWN
         {
             params.record(p.number, oid::TEXT);
@@ -374,14 +366,14 @@ fn single_sublink_column(
 ///   its WHERE on the row's newest version keeps that version until the
 ///   transaction ends.
 fn same_row_facts(
-    sub: &protobuf::SubLink,
-    sel: &protobuf::SelectStmt,
+    sub: &ast::SubLink,
+    sel: &ast::SelectStmt,
     own: &crate::nonnull::OwnRows,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> Option<crate::nonnull::Facts> {
-    use protobuf::LockClauseStrength as S;
-    let ((outer, column), _) = crate::nonnull::plain_column(sub.testexpr.as_deref()?, scope)?;
+    use ast::LockClauseStrength as S;
+    let ((outer, column), _) = crate::nonnull::plain_column(sub.testexpr.as_ref()?, scope)?;
     let [(inner, Some(relid))] = own.sources.as_slice() else {
         return None;
     };
@@ -415,17 +407,16 @@ fn same_row_facts(
             && idx.indcollation.first().copied().flatten() == attr.attcollation
             && !snapshot.invalid_indexes.contains(&idx.indexrelid)
     });
-    let locked = sel.locking_clause.iter().any(|l| match l.node.as_ref() {
-        Some(node::Node::LockingClause(lc)) => {
-            matches!(
-                S::try_from(lc.strength),
-                Ok(S::LcsForupdate | S::LcsFornokeyupdate | S::LcsForshare)
+    let locked =
+        sel.locking_clause.iter().any(|l| match l.as_ref() {
+            Some(ast::Node::LockingClause(lc)) => matches!(
+                lc.strength,
+                S::LcsForupdate | S::LcsFornokeyupdate | S::LcsForshare
             ) && (lc.locked_rels.is_empty()
-                || lc.locked_rels.iter().any(|r| {
-                    matches!(r.node.as_ref(), Some(node::Node::RangeVar(rv)) if rv.relname == *inner)
-                }))
-        }
-        _ => false,
-    });
+                || lc.locked_rels.iter().any(
+                    |r| matches!(r.as_ref(), Some(ast::Node::RangeVar(rv)) if rv.relname == *inner),
+                )),
+            _ => false,
+        });
     (keyed && locked).then(|| own.facts.moved(inner, &outer))
 }

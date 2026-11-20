@@ -31,7 +31,7 @@ struct FuncArgs {
 /// match: the caller then reports its own missing-column error, as PG does.
 pub(crate) fn infer_column_notation_call(
     name: &str,
-    arg: protobuf::Node,
+    arg: Option<ast::Node>,
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -41,7 +41,7 @@ pub(crate) fn infer_column_notation_call(
 
 fn column_notation_call(
     name: &str,
-    arg: protobuf::Node,
+    arg: Option<ast::Node>,
     location: i32,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -50,14 +50,12 @@ fn column_notation_call(
     let arg_type = infer_expr(&arg, ctx, &mut scratch, TypeGoal::NONE)
         .ok()?
         .type_oid;
-    let call = protobuf::FuncCall {
-        funcname: vec![protobuf::Node {
-            node: Some(node::Node::String(protobuf::String {
-                sval: name.to_owned(),
-            })),
-        }],
+    let call = ast::FuncCall {
+        funcname: vec![Some(ast::Node::String(NodeBox::new(ast::String {
+            sval: name.to_owned(),
+        })))],
         args: vec![arg],
-        funcformat: protobuf::CoercionForm::CoerceExplicitCall as i32,
+        funcformat: ast::CoercionForm::CoerceExplicitCall,
         location,
         ..Default::default()
     };
@@ -84,16 +82,14 @@ fn column_notation_call(
             ))))
         }
         Ok(_) => {
-            let node = protobuf::Node {
-                node: Some(node::Node::FuncCall(Box::new(call))),
-            };
+            let node = Some(ast::Node::FuncCall(NodeBox::new(call)));
             Some(infer_expr(&node, ctx, params, TypeGoal::NONE))
         }
     }
 }
 
 pub(crate) fn infer_func_call(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
@@ -140,8 +136,8 @@ pub(crate) fn infer_func_call(
     // an untyped literal argument always makes it one.
     let unknown_const = args.types.first() == Some(&oid::UNKNOWN)
         && matches!(
-            func.args.first().and_then(|a| a.node.as_ref()),
-            Some(node::Node::AConst(_))
+            func.args.first().and_then(|a| a.as_ref()),
+            Some(ast::Node::AConst(_))
         );
     let detail = functions::func_get_detail(
         snapshot,
@@ -163,9 +159,9 @@ pub(crate) fn infer_func_call(
         functions::FuncDetail::Coercion(target) => {
             check_call_shape(func, None, &args, &notation, ctx)?;
             // Same literal-content validation an explicit cast performs.
-            if let Some(node::Node::AConst(ac)) = func.args[0].node.as_ref()
+            if let Some(ast::Node::AConst(ac)) = func.args[0].as_ref()
                 && !ac.isnull
-                && let Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)) = &ac.val
+                && let Some(typedpg_pg_query::ast::AConstValue::String(sv)) = &ac.val
                 // A function-style cast carries no typmod.
                 && let Err(msg) =
                     crate::literal_input::validate_with_typmod(&sv.sval, target, None, snapshot)
@@ -321,7 +317,7 @@ pub(crate) fn infer_func_call(
     // A parameter the call typed: finite when its type is one the
     // generator binds finite (see `PgCatalog::assume_finite_parameters`).
     for (arg, t) in func.args.iter().zip(args.exprs.iter_mut()) {
-        if let Some(node::Node::ParamRef(p)) = arg.node.as_ref()
+        if let Some(ast::Node::ParamRef(p)) = arg.as_ref()
             && snapshot.finite_param(params.get(p.number))
         {
             t.refine.finite = true;
@@ -361,7 +357,7 @@ pub(crate) fn infer_func_call(
     let written_args = func.args.len();
     // The rules below read arguments by parameter position.
     let (func, args) = in_declared_order(func, args, &resolved);
-    let func: &protobuf::FuncCall = &func;
+    let func: &ast::FuncCall = &func;
     let nullable = resolve_func_nullability(func, name, &resolved, ctx, params, &args);
 
     // SRFs / OUT-arg functions carry a static row shape — propagate it as
@@ -502,24 +498,24 @@ const LENGTH_COERCIONS: &[&str] = &[
 /// named one is an empty node (matching no rule), its default taken as
 /// non-NULL as an omitted trailing one is.
 fn in_declared_order<'a>(
-    func: &'a protobuf::FuncCall,
+    func: &'a ast::FuncCall,
     args: FuncArgs,
     resolved: &functions::ResolvedFunction,
-) -> (std::borrow::Cow<'a, protobuf::FuncCall>, FuncArgs) {
+) -> (std::borrow::Cow<'a, ast::FuncCall>, FuncArgs) {
     if !func
         .args
         .iter()
-        .any(|a| matches!(a.node.as_ref(), Some(node::Node::NamedArgExpr(_))))
+        .any(|a| matches!(a.as_ref(), Some(ast::Node::NamedArgExpr(_))))
     {
         return (std::borrow::Cow::Borrowed(func), args);
     }
-    let values: Vec<protobuf::Node> = func
+    let values: Vec<Option<ast::Node>> = func
         .args
         .iter()
         .map(|a| functions::call_arg_value(a).clone())
         .collect();
     let mut positional = func.clone();
-    positional.args = resolved.in_declared_order(&values, protobuf::Node::default());
+    positional.args = resolved.in_declared_order(&values, None);
     let args = FuncArgs {
         types: resolved.in_declared_order(&args.types, oid::UNKNOWN),
         nullable: resolved.in_declared_order(&args.nullable, false),
@@ -536,7 +532,7 @@ fn in_declared_order<'a>(
 /// aggregate or constructor of values has NULL elements exactly when a
 /// value is NULL, an array transformed element-wise keeps its input's.
 fn builtin_array_elem_nullable(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     resolved: &functions::ResolvedFunction,
     args: &FuncArgs,
 ) -> Option<bool> {
@@ -547,8 +543,8 @@ fn builtin_array_elem_nullable(
     let elems = |i: usize| args.exprs.get(i).and_then(|e| e.elem_nullable);
     let is_null_const = |i: usize| {
         matches!(
-            func.args.get(i).and_then(|a| a.node.as_ref()),
-            Some(node::Node::AConst(c)) if c.isnull
+            func.args.get(i).and_then(|a| a.as_ref()),
+            Some(ast::Node::AConst(c)) if c.isnull
         )
     };
     match resolved.signature.as_str() {
@@ -599,7 +595,7 @@ fn builtin_array_elem_nullable(
 /// `None` for a function-style cast. Names render as written (PG's
 /// `NameListToString`).
 fn check_call_shape(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     resolved: Option<&functions::ResolvedFunction>,
     args: &FuncArgs,
     notation: &functions::CallNotation,
@@ -617,7 +613,7 @@ fn check_call_shape(
     // reported at the offending call. Only this level's aggregates and
     // GROUPING(…) count: an outer query's (`FILTER (WHERE sum(outer.x) >
     // 0)`) is a value here.
-    if let Some(filter) = &func.agg_filter {
+    if let filter @ Some(_) = &func.agg_filter {
         crate::clause::check_level_calls(filter, ctx, "FILTER", true)?;
     }
 
@@ -732,8 +728,8 @@ fn check_call_shape(
         // must be one of the arguments.
         if func.agg_distinct && !func.agg_within_group {
             for item in &func.agg_order {
-                if let Some(node::Node::SortBy(sb)) = item.node.as_ref()
-                    && let Some(inner) = sb.node.as_deref()
+                if let Some(ast::Node::SortBy(sb)) = item.as_ref()
+                    && let inner @ Some(_) = &sb.node
                     && !func.args.iter().any(|a| same_expression(a, inner, ctx))
                 {
                     return fail(pgmsg::distinct_aggregate_order_by_not_in_args(
@@ -767,11 +763,11 @@ fn check_call_shape(
 /// transformed trees with `equal()`): structurally equal ignoring source
 /// locations and type-name spellings, or column references resolving to
 /// the same column.
-fn same_expression(a: &protobuf::Node, b: &protobuf::Node, ctx: Ctx<'_>) -> bool {
-    if let (Some(node::Node::ColumnRef(ca)), Some(node::Node::ColumnRef(cb))) =
-        (a.node.as_ref(), b.node.as_ref())
+fn same_expression(a: &Option<ast::Node>, b: &Option<ast::Node>, ctx: Ctx<'_>) -> bool {
+    if let (Some(ast::Node::ColumnRef(ca)), Some(ast::Node::ColumnRef(cb))) =
+        (a.as_ref(), b.as_ref())
     {
-        let resolve = |cr: &protobuf::ColumnRef| {
+        let resolve = |cr: &ast::ColumnRef| {
             let parts = extract_string_fields(&cr.fields);
             let (table, col) = match parts.as_slice() {
                 [c] => (None, c.as_str()),
@@ -787,8 +783,13 @@ fn same_expression(a: &protobuf::Node, b: &protobuf::Node, ctx: Ctx<'_>) -> bool
             return x == y;
         }
     }
-    crate::grouping::typed_fingerprint(a, ctx.scope, ctx.snapshot)
-        == crate::grouping::typed_fingerprint(b, ctx.scope, ctx.snapshot)
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            crate::grouping::typed_fingerprint(a, ctx.scope, ctx.snapshot)
+                == crate::grouping::typed_fingerprint(b, ctx.scope, ctx.snapshot)
+        }
+        (a, b) => a.is_none() && b.is_none(),
+    }
 }
 
 /// PG's `unify_hypothetical_args` (parse_func.c): each hypothetical direct
@@ -796,7 +797,7 @@ fn same_expression(a: &protobuf::Node, b: &protobuf::Node, ctx: Ctx<'_>) -> bool
 /// coerced to their common type — `rank($1) WITHIN GROUP (ORDER BY
 /// int_col)` types `$1` as integer, `rank('a') …` validates `'a'` as one.
 fn unify_hypothetical_args(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     args: &FuncArgs,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
@@ -841,7 +842,7 @@ fn unify_hypothetical_args(
 /// collations are `collation mismatch between explicit collations`, two
 /// implicit non-default ones `… implicit collations` (42P21 both).
 fn within_group_collation_inputs(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     args: &FuncArgs,
     kind: crate::pg_catalog::AggKind,
     resolved: &functions::ResolvedFunction,
@@ -851,8 +852,8 @@ fn within_group_collation_inputs(
     let snapshot = ctx.snapshot;
     let mut aggregated = Vec::new();
     for item in &func.agg_order {
-        let inner = match item.node.as_ref() {
-            Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+        let inner = match item.as_ref() {
+            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
             _ => Some(item),
         };
         if let Some(inner) = inner {
@@ -915,7 +916,7 @@ fn within_group_collation_inputs(
 /// points at the actual conflict instead of a misleading overload-resolution
 /// failure. (`OVER` is rejected after resolution, by [`check_call_shape`],
 /// with the wording that depends on what the call resolved to.)
-fn validate_within_group(func: &protobuf::FuncCall) -> Result<(), AnalyzeError> {
+fn validate_within_group(func: &ast::FuncCall) -> Result<(), AnalyzeError> {
     if func.agg_within_group && func.agg_distinct {
         return Err(AnalyzeError::Invalid(
             "DISTINCT is not implemented for ordered-set aggregates".into(),
@@ -930,7 +931,7 @@ fn validate_within_group(func: &protobuf::FuncCall) -> Result<(), AnalyzeError> 
 /// and ordered args in `pg_proc.proargtypes`.
 /// `first`: the first argument's type, when already inferred.
 fn collect_arg_types(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     mut first: Option<ExprType>,
@@ -954,8 +955,8 @@ fn collect_arg_types(
     if func.agg_within_group {
         for order_item in &func.agg_order {
             // Each item is a `SortBy` wrapping the actual sort expression.
-            let sort_inner = match order_item.node.as_ref() {
-                Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+            let sort_inner = match order_item.as_ref() {
+                Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
                 _ => Some(order_item),
             };
             if let Some(inner) = sort_inner {
@@ -1026,13 +1027,13 @@ fn coerce_call_args(
 /// before the FILTER, as PG does; their nullability is read again under
 /// its facts, on a scratch copy of the parameters (the types are settled).
 fn narrow_by_filter(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     args: &mut FuncArgs,
     ctx: Ctx<'_>,
     params: &ParamCollector,
     log: &crate::nonnull::StrictLog,
 ) {
-    let Some(filter) = func.agg_filter.as_deref() else {
+    let filter @ Some(_) = &func.agg_filter else {
         return;
     };
     let facts = crate::nonnull::nonnullable(filter, true, ctx.scope, log, ctx.snapshot)
@@ -1042,11 +1043,11 @@ fn narrow_by_filter(
     };
     let narrowed_ctx = ctx.with_null_ctx(&narrowed);
     let mut scratch = params.clone();
-    let sort_exprs = func.agg_order.iter().filter_map(|o| match o.node.as_ref() {
-        Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+    let sort_exprs = func.agg_order.iter().filter_map(|o| match o.as_ref() {
+        Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
         _ => Some(o),
     });
-    let inputs: Vec<&protobuf::Node> = if func.agg_within_group {
+    let inputs: Vec<&Option<ast::Node>> = if func.agg_within_group {
         func.args.iter().chain(sort_exprs).collect()
     } else {
         func.args.iter().collect()
@@ -1071,10 +1072,7 @@ fn narrow_by_filter(
 /// A window function's arguments may hold aggregates — `sum(sum(x)) OVER
 /// (…)` aggregates the grouped rows first — but not another window
 /// function (PG's `transformWindowFuncCall`, SQLSTATE 42P20).
-fn check_no_nested_windows(
-    func: &protobuf::FuncCall,
-    snapshot: &PgCatalog,
-) -> Result<(), AnalyzeError> {
+fn check_no_nested_windows(func: &ast::FuncCall, snapshot: &PgCatalog) -> Result<(), AnalyzeError> {
     if func
         .args
         .iter()
@@ -1094,7 +1092,7 @@ fn check_no_nested_windows(
 /// outer query's — which `grouping::finish_select_level` settles, after the
 /// inner call has met its own level's clause rule, as PG checks them.
 fn check_no_windows_in_aggregate(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     snapshot: &PgCatalog,
 ) -> Result<(), AnalyzeError> {
     for arg in &func.args {
@@ -1112,7 +1110,7 @@ fn check_no_windows_in_aggregate(
 /// and validates `FROM generate_series(1, 'a')` exactly like the SELECT
 /// list does). `arg_types` are the bottom-up types of `func.args`.
 pub(crate) fn backfill_call_args(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     arg_types: &[PgTypeOid],
     resolved: &functions::ResolvedFunction,
     ctx: Ctx<'_>,
@@ -1134,7 +1132,7 @@ pub(crate) fn backfill_call_args(
 /// args correspond to `func.args`; ordered args (`agg_within_group`) come from
 /// `func.agg_order` and are handled by [`walk_func_modifiers`].
 fn backfill_func_args(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     args: &FuncArgs,
     resolved: &functions::ResolvedFunction,
     ctx: Ctx<'_>,
@@ -1188,12 +1186,12 @@ fn backfill_func_args(
 /// positions can reference a select-list alias — they're all row-level — so
 /// propagating errors here matches PG.
 fn walk_func_modifiers(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
     filter_log: &crate::nonnull::StrictLog,
 ) -> Result<(), AnalyzeError> {
-    if let Some(filter) = &func.agg_filter {
+    if let filter @ Some(_) = &func.agg_filter {
         // FILTER is a boolean clause like WHERE — wording and ordering live
         // in the shared clause walker.
         crate::clause::coerce_clause_expr(
@@ -1210,8 +1208,8 @@ fn walk_func_modifiers(
     // to the inner expression before inferring.
     if !func.agg_within_group {
         for order_item in &func.agg_order {
-            if let Some(node::Node::SortBy(sb)) = order_item.node.as_ref()
-                && let Some(inner) = sb.node.as_deref()
+            if let Some(ast::Node::SortBy(sb)) = order_item.as_ref()
+                && let inner @ Some(_) = &sb.node
             {
                 infer_expr(inner, ctx, params, TypeGoal::NONE)?;
                 // transformAggregateCall's transformSortClause.
@@ -1237,7 +1235,7 @@ fn walk_func_modifiers(
 /// (checked spelling by spelling on PostgreSQL 18). With such a literal
 /// field the call is NULL exactly when an argument is.
 fn extract_unit_is_infinite_safe(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     resolved: &functions::ResolvedFunction,
 ) -> bool {
     const INTERVAL_INFINITE_FIELDS: &[&str] = &[
@@ -1303,11 +1301,14 @@ fn extract_unit_is_infinite_safe(
         _ => return false,
     };
     matches!(
-        func.args.first().and_then(|a| a.node.as_ref()),
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(sv)),
-            ..
-        })) if fields.contains(&sv.sval.to_lowercase().as_str())
+        func.args.first().and_then(|a| a.as_ref()),
+        Some(ast::Node::AConst(ac)) if matches!(
+            &**ac,
+            ast::AConst {
+                val: Some(typedpg_pg_query::ast::AConstValue::String(sv)),
+                ..
+            } if fields.contains(&sv.sval.to_lowercase().as_str())
+        )
     )
 }
 
@@ -1317,12 +1318,12 @@ fn extract_unit_is_infinite_safe(
 /// `[1]` is the first value, `array_length(…, 1)` is defined. (Over
 /// arrays, `array_agg(anyarray)` stacks a dimension: `[1]` is NULL.)
 pub(crate) fn is_nonempty_1d_array_agg(
-    node: &protobuf::Node,
+    node: &Option<ast::Node>,
     t: &ExprType,
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> bool {
-    let Some(node::Node::FuncCall(fc)) = node.node.as_ref() else {
+    let Some(ast::Node::FuncCall(fc)) = node.as_ref() else {
         return false;
     };
     if t.nullable
@@ -1343,7 +1344,7 @@ pub(crate) fn is_nonempty_1d_array_agg(
 /// GROUP BY group has rows, the empty grouping set's has them when the
 /// input does (`input_not_empty`: a constant source, or HAVING proving it).
 /// Every function the call's name may resolve to is an aggregate.
-fn only_aggregates_named(func: &protobuf::FuncCall, snapshot: &PgCatalog) -> bool {
+fn only_aggregates_named(func: &ast::FuncCall, snapshot: &PgCatalog) -> bool {
     let parts = extract_string_fields(&func.funcname);
     let (schema, name) = match parts.as_slice() {
         [n] => (None, n.as_str()),
@@ -1359,7 +1360,7 @@ fn only_aggregates_named(func: &protobuf::FuncCall, snapshot: &PgCatalog) -> boo
 
 pub(crate) fn aggregate_reads_rows(
     has_filter: bool,
-    over: Option<&protobuf::WindowDef>,
+    over: Option<&ast::WindowDef>,
     null_ctx: &NullabilityContext,
 ) -> bool {
     if has_filter {
@@ -1378,7 +1379,7 @@ pub(crate) fn aggregate_reads_rows(
 /// The frame options a window call runs over (see
 /// [`effective_frame_options`]): its own, or — for `OVER w` — those of
 /// the WINDOW clause's `w` (`None` when unknown).
-fn window_frame(over: &protobuf::WindowDef, null_ctx: &NullabilityContext) -> Option<i32> {
+fn window_frame(over: &ast::WindowDef, null_ctx: &NullabilityContext) -> Option<i32> {
     if over.name.is_empty() {
         Some(effective_frame_options(over))
     } else {
@@ -1390,44 +1391,47 @@ fn window_frame(over: &protobuf::WindowDef, null_ctx: &NullabilityContext) -> Op
 /// (`0 PRECEDING`, `0 FOLLOWING`, `INTERVAL '0 day' PRECEDING`) read as
 /// CURRENT ROW, which it is in every mode: the current row (ROWS), its
 /// peer group (GROUPS), the rows whose key is the current one's (RANGE).
-pub(crate) fn effective_frame_options(wd: &protobuf::WindowDef) -> i32 {
+pub(crate) fn effective_frame_options(wd: &ast::WindowDef) -> i32 {
     const START_CURRENT_ROW: i32 = 0x200;
     const END_CURRENT_ROW: i32 = 0x400;
     const START_OFFSET: i32 = 0x800 | 0x2000;
     const END_OFFSET: i32 = 0x1000 | 0x4000;
     let mut options = wd.frame_options;
-    if options & START_OFFSET != 0 && wd.start_offset.as_deref().is_some_and(is_zero_offset) {
+    if options & START_OFFSET != 0 && is_zero_offset(&wd.start_offset) {
         options = (options & !START_OFFSET) | START_CURRENT_ROW;
     }
-    if options & END_OFFSET != 0 && wd.end_offset.as_deref().is_some_and(is_zero_offset) {
+    if options & END_OFFSET != 0 && is_zero_offset(&wd.end_offset) {
         options = (options & !END_OFFSET) | END_CURRENT_ROW;
     }
     options
 }
 
 /// The integer literal `0`.
-fn is_zero_constant(n: &protobuf::Node) -> bool {
+fn is_zero_constant(n: &Option<ast::Node>) -> bool {
     matches!(
-        n.node.as_ref(),
-        Some(node::Node::AConst(protobuf::AConst {
-            val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
-            ..
-        })) if i.ival == 0
+        n.as_ref(),
+        Some(ast::Node::AConst(ac)) if matches!(
+            &**ac,
+            ast::AConst {
+                val: Some(typedpg_pg_query::ast::AConstValue::Integer(i)),
+                ..
+            } if i.ival == 0
+        )
     )
 }
 
 /// A frame offset that is the constant zero: `0`, `0.0`, or a literal
 /// such as `'0'` / `'0 day'` cast to the offset type.
-fn is_zero_offset(n: &protobuf::Node) -> bool {
-    use typedpg_pg_query::protobuf::a_const::Val;
-    match n.node.as_ref() {
-        Some(node::Node::AConst(c)) if !c.isnull => match &c.val {
-            Some(Val::Ival(i)) => i.ival == 0,
-            Some(Val::Fval(f)) => is_zero_decimal(&f.fval),
-            Some(Val::Sval(s)) => is_zero_string(&s.sval),
+fn is_zero_offset(n: &Option<ast::Node>) -> bool {
+    use typedpg_pg_query::ast::{self, AConstValue};
+    match n.as_ref() {
+        Some(ast::Node::AConst(c)) if !c.isnull => match &c.val {
+            Some(AConstValue::Integer(i)) => i.ival == 0,
+            Some(AConstValue::Float(f)) => is_zero_decimal(&f.fval),
+            Some(AConstValue::String(s)) => is_zero_string(&s.sval),
             _ => false,
         },
-        Some(node::Node::TypeCast(c)) => c.arg.as_deref().is_some_and(is_zero_offset),
+        Some(ast::Node::TypeCast(c)) => is_zero_offset(&c.arg),
         _ => false,
     }
 }
@@ -1526,7 +1530,7 @@ fn is_zero_string(s: &str) -> bool {
 ///   `array_ndims` and `array_dims` of a non-empty `ARRAY[…]` of scalars,
 ///   a one-dimensional array.
 fn value_gated_non_null(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     resolved: &functions::ResolvedFunction,
     args: &FuncArgs,
     ctx: Ctx<'_>,
@@ -1534,7 +1538,7 @@ fn value_gated_non_null(
 ) -> bool {
     let proname = resolved.signature.split('(').next().unwrap_or_default();
     // (In positional notation: see [`in_declared_order`].)
-    let positional: Vec<&protobuf::Node> = func.args.iter().collect();
+    let positional: Vec<&Option<ast::Node>> = func.args.iter().collect();
     let declared_types = resolved.in_declared_order(&resolved.arg_types, oid::UNKNOWN);
     let first_type = declared_types.first().copied();
     match proname {
@@ -1542,23 +1546,29 @@ fn value_gated_non_null(
             let silent = positional.get(3).copied();
             silent.is_none_or(|s| {
                 matches!(
-                    s.node.as_ref(),
-                    Some(node::Node::AConst(protobuf::AConst {
-                        isnull: false,
-                        val: Some(typedpg_pg_query::protobuf::a_const::Val::Boolval(b)),
-                        ..
-                    })) if !b.boolval
+                    s.as_ref(),
+                    Some(ast::Node::AConst(ac)) if matches!(
+                        &**ac,
+                        ast::AConst {
+                            isnull: false,
+                            val: Some(typedpg_pg_query::ast::AConstValue::Boolean(b)),
+                            ..
+                        } if !b.boolval
+                    )
                 )
             })
         }
         "to_char" if func.args.len() == 2 && positional.len() == 2 => {
             let fmt_non_empty = matches!(
-                positional[1].node.as_ref(),
-                Some(node::Node::AConst(protobuf::AConst {
-                    isnull: false,
-                    val: Some(typedpg_pg_query::protobuf::a_const::Val::Sval(s)),
-                    ..
-                })) if !s.sval.is_empty()
+                positional[1].as_ref(),
+                Some(ast::Node::AConst(ac)) if matches!(
+                    &**ac,
+                    ast::AConst {
+                        isnull: false,
+                        val: Some(typedpg_pg_query::ast::AConstValue::String(s)),
+                        ..
+                    } if !s.sval.is_empty()
+                )
             );
             let source_finite = matches!(first_type, Some(t)
                 if t == oid::TIMESTAMP || t == oid::TIMESTAMPTZ || t == INTERVAL)
@@ -1582,12 +1592,15 @@ fn value_gated_non_null(
             if func.args.len() == 2 && positional.len() == 2 =>
         {
             matches!(
-                positional[1].node.as_ref(),
-                Some(node::Node::AConst(protobuf::AConst {
-                    isnull: false,
-                    val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
-                    ..
-                })) if i.ival == 1
+                positional[1].as_ref(),
+                Some(ast::Node::AConst(ac)) if matches!(
+                    &**ac,
+                    ast::AConst {
+                        isnull: false,
+                        val: Some(typedpg_pg_query::ast::AConstValue::Integer(i)),
+                        ..
+                    } if i.ival == 1
+                )
             ) && scalar_array_constructor(positional[0], ctx, params)
         }
         "array_ndims" | "array_dims" if func.args.len() == 1 && positional.len() == 1 => {
@@ -1603,16 +1616,13 @@ const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
 /// `ARRAY[e1, …, en]` (n ≥ 1, possibly cast to an array type) over
 /// scalar elements: a one-dimensional array of n elements. The elements
 /// are re-inferred on a throwaway collector.
-fn scalar_array_constructor(n: &protobuf::Node, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
-    match n.node.as_ref() {
-        Some(node::Node::TypeCast(tc)) => tc
-            .arg
-            .as_deref()
-            .is_some_and(|a| scalar_array_constructor(a, ctx, params)),
-        Some(node::Node::AArrayExpr(arr)) => {
+fn scalar_array_constructor(n: &Option<ast::Node>, ctx: Ctx<'_>, params: &ParamCollector) -> bool {
+    match n.as_ref() {
+        Some(ast::Node::TypeCast(tc)) => scalar_array_constructor(&tc.arg, ctx, params),
+        Some(ast::Node::AArrayExpr(arr)) => {
             !arr.elements.is_empty()
                 && arr.elements.iter().all(|e| {
-                    !matches!(e.node.as_ref(), Some(node::Node::AArrayExpr(_)))
+                    !matches!(e.as_ref(), Some(ast::Node::AArrayExpr(_)))
                         && infer_expr(e, ctx, &mut params.clone(), TypeGoal::NONE).is_ok_and(|t| {
                             t.type_oid != oid::UNKNOWN
                                 && array_element_type(ctx.snapshot, t.type_oid).is_none()
@@ -1665,11 +1675,11 @@ const FRAME_OFFSET: i32 = 0x800 | 0x1000 | 0x2000 | 0x4000;
 const FRAME_DEFAULTS: i32 = 0x2 | 0x20 | 0x400;
 
 /// The expressions of a window's `ORDER BY` items.
-fn window_order_exprs(wd: &protobuf::WindowDef) -> Vec<&protobuf::Node> {
+fn window_order_exprs(wd: &ast::WindowDef) -> Vec<&Option<ast::Node>> {
     wd.order_clause
         .iter()
-        .filter_map(|o| match o.node.as_ref() {
-            Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+        .filter_map(|o| match o.as_ref() {
+            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
             _ => None,
         })
         .collect()
@@ -1680,7 +1690,7 @@ fn window_order_exprs(wd: &protobuf::WindowDef) -> Vec<&protobuf::Node> {
 /// references validated; each key still `unknown` is resolved as text
 /// right after it, as transformSortClause / transformGroupClause do.
 fn infer_window_exprs(
-    wd: &protobuf::WindowDef,
+    wd: &ast::WindowDef,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
@@ -1711,19 +1721,17 @@ fn infer_window_exprs(
 /// - GROUPS needs an ORDER BY (42P20); ROWS / GROUPS offsets are bigint;
 /// - no offset may reference a column (42P10).
 fn transform_window_def(
-    wd: &protobuf::WindowDef,
-    base: Option<&protobuf::WindowDef>,
+    wd: &ast::WindowDef,
+    base: Option<&ast::WindowDef>,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
     use crate::pgmsg;
     let span = crate::error::SourceSpan::from_node_qname(wd.location);
     let fail = |e: crate::error::RawError| Err(e.finalize_implicit());
-    let offsets: Vec<&protobuf::Node> = wd
-        .start_offset
-        .as_deref()
+    let offsets: Vec<&Option<ast::Node>> = [&wd.start_offset, &wd.end_offset]
         .into_iter()
-        .chain(wd.end_offset.as_deref())
+        .filter(|o| o.is_some())
         .collect();
     let own_exprs = wd
         .partition_clause
@@ -1815,10 +1823,10 @@ fn transform_window_def(
         }
         // checkExprIsVarFree: only a Var of this query level counts — a
         // SQL function's parameter or an outer reference is fine.
-        let mut var: Option<&protobuf::Node> = None;
+        let mut var: Option<&Option<ast::Node>> = None;
         crate::resolve::visit_same_level(offset, &mut |e| {
             if var.is_none()
-                && let Some(node::Node::ColumnRef(cr)) = e.node.as_ref()
+                && let Some(ast::Node::ColumnRef(cr)) = e.as_ref()
                 && crate::resolve::references_local_column(cr, ctx.scope)
             {
                 var = Some(e);
@@ -1849,7 +1857,7 @@ fn transform_window_def(
 fn in_range_offset_type(
     key: PgTypeOid,
     offset_type: PgTypeOid,
-    offset: &protobuf::Node,
+    offset: &Option<ast::Node>,
     ctx: Ctx<'_>,
 ) -> Result<PgTypeOid, AnalyzeError> {
     let snapshot = ctx.snapshot;
@@ -1914,15 +1922,15 @@ fn in_range_offset_type(
 /// with the calls: a `$N` first met in one is typed here, after every
 /// clause PG transforms before.
 pub(crate) fn check_window_clause(
-    sel: &protobuf::SelectStmt,
+    sel: &ast::SelectStmt,
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<(), AnalyzeError> {
-    let defs: Vec<&protobuf::WindowDef> = sel
+    let defs: Vec<&ast::WindowDef> = sel
         .window_clause
         .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(node::Node::WindowDef(w)) => Some(&**w),
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::WindowDef(w)) => Some(&**w),
             _ => None,
         })
         .collect();
@@ -1955,22 +1963,18 @@ pub(crate) fn check_window_clause(
 
     // Then the inline windows, in the order their calls were transformed:
     // the target list's, then ORDER BY's, then DISTINCT ON's.
-    let mut inline: Vec<&protobuf::WindowDef> = Vec::new();
+    let mut inline: Vec<&ast::WindowDef> = Vec::new();
     let exprs = sel
         .target_list
         .iter()
-        .filter_map(|t| match t.node.as_ref() {
-            Some(node::Node::ResTarget(rt)) => rt.val.as_deref(),
+        .filter_map(|t| match t.as_ref() {
+            Some(ast::Node::ResTarget(rt)) => rt.val.is_some().then_some(&rt.val),
             _ => None,
         })
-        .chain(
-            sel.sort_clause
-                .iter()
-                .filter_map(|s| match s.node.as_ref() {
-                    Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
-                    _ => None,
-                }),
-        )
+        .chain(sel.sort_clause.iter().filter_map(|s| match s.as_ref() {
+            Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
+            _ => None,
+        }))
         .chain(&sel.distinct_clause);
     for e in exprs {
         crate::resolve::visit_same_level(e, &mut |n| {
@@ -1991,11 +1995,11 @@ pub(crate) fn check_window_clause(
 
 /// The inline `OVER (…)` window of a window call (a function's or a JSON
 /// aggregate's).
-fn inline_window(node: &protobuf::Node) -> Option<&protobuf::WindowDef> {
-    let over = match node.node.as_ref()? {
-        node::Node::FuncCall(f) => f.over.as_deref(),
-        node::Node::JsonObjectAgg(a) => a.constructor.as_deref()?.over.as_deref(),
-        node::Node::JsonArrayAgg(a) => a.constructor.as_deref()?.over.as_deref(),
+fn inline_window(node: &Option<ast::Node>) -> Option<&ast::WindowDef> {
+    let over = match node.as_ref()? {
+        ast::Node::FuncCall(f) => f.over.as_deref(),
+        ast::Node::JsonObjectAgg(a) => a.constructor.as_deref()?.over.as_deref(),
+        ast::Node::JsonArrayAgg(a) => a.constructor.as_deref()?.over.as_deref(),
         _ => None,
     }?;
     over.name.is_empty().then_some(over)
@@ -2007,7 +2011,7 @@ fn inline_window(node: &protobuf::Node) -> Option<&protobuf::WindowDef> {
 /// (FILTER, empty grouping sets, GROUP BY presence), strict-function
 /// propagation, and the `concat_ws` separator special case.
 fn resolve_func_nullability(
-    func: &protobuf::FuncCall,
+    func: &ast::FuncCall,
     name: &str,
     resolved: &functions::ResolvedFunction,
     ctx: Ctx<'_>,
@@ -2062,11 +2066,14 @@ fn resolve_func_nullability(
             "nth_value"
                 if func.args.get(1).is_some_and(|n| {
                     matches!(
-                        n.node.as_ref(),
-                        Some(node::Node::AConst(protobuf::AConst {
-                            val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
-                            ..
-                        })) if i.ival == 1
+                        n.as_ref(),
+                        Some(ast::Node::AConst(ac)) if matches!(
+                            &**ac,
+                            ast::AConst {
+                                val: Some(typedpg_pg_query::ast::AConstValue::Integer(i)),
+                                ..
+                            } if i.ival == 1
+                        )
                     )
                 }) =>
             {
@@ -2098,8 +2105,8 @@ fn resolve_func_nullability(
             } else {
                 func.agg_order
                     .get(i - args.direct_count)
-                    .and_then(|o| match o.node.as_ref() {
-                        Some(node::Node::SortBy(sb)) => sb.node.as_deref(),
+                    .and_then(|o| match o.as_ref() {
+                        Some(ast::Node::SortBy(sb)) => sb.node.is_some().then_some(&sb.node),
                         _ => None,
                     })
             };
@@ -2177,11 +2184,14 @@ fn resolve_func_nullability(
         )
         && func.args.get(1).is_some_and(|n| {
             matches!(
-                n.node.as_ref(),
-                Some(node::Node::AConst(protobuf::AConst {
-                    val: Some(typedpg_pg_query::protobuf::a_const::Val::Ival(i)),
-                    ..
-                })) if i.ival == 1
+                n.as_ref(),
+                Some(ast::Node::AConst(ac)) if matches!(
+                    &**ac,
+                    ast::AConst {
+                        val: Some(typedpg_pg_query::ast::AConstValue::Integer(i)),
+                        ..
+                    } if i.ival == 1
+                )
             )
         })
         && args

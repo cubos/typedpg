@@ -9,8 +9,8 @@
 //! places, with different methods — while a fix edits the analyzed SQL text.
 
 use typedpg_analyzer::statement_at_most_one_row;
-use typedpg_pg_query::protobuf::RawStmt;
-use typedpg_pg_query::protobuf::node::Node;
+use typedpg_pg_query::ast::Node;
+use typedpg_pg_query::ast::RawStmt;
 
 use crate::{Call, CallMethod, Ctx, Language, RawFinding, Rule, SqlEdit};
 
@@ -114,7 +114,7 @@ fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     let Some(raw) = ctx.view.tree.stmts.first() else {
         return Vec::new();
     };
-    let Some(statement) = raw.stmt.as_deref().and_then(|node| node.node.as_ref()) else {
+    let Some(statement) = raw.stmt.as_ref() else {
         return Vec::new();
     };
     let returning = match statement {
@@ -225,12 +225,12 @@ fn whitespace_start(sql: &str, at: usize) -> usize {
 /// could still change what the statement does.
 ///
 /// A returning target is a `ResTarget`; its `val` is the expression.
-fn is_plain_returning_target(node: &typedpg_pg_query::protobuf::Node) -> bool {
-    let Some(Node::ResTarget(target)) = node.node.as_ref() else {
+fn is_plain_returning_target(node: &Option<typedpg_pg_query::ast::Node>) -> bool {
+    let Some(Node::ResTarget(target)) = node.as_ref() else {
         return false;
     };
     matches!(
-        target.val.as_deref().and_then(|val| val.node.as_ref()),
+        target.val.as_ref(),
         Some(Node::ColumnRef(_) | Node::AConst(_))
     )
 }
@@ -255,7 +255,7 @@ fn is_plain_returning_target(node: &typedpg_pg_query::protobuf::Node) -> bool {
 /// join inside one) to be an ordinary table without row security or
 /// rewrite rules, and no `WITH` clause at all.
 fn returning_target_is_safe(ctx: &Ctx<'_>, statement: &Node) -> bool {
-    let (relation, with, items): (_, _, &[typedpg_pg_query::protobuf::Node]) = match statement {
+    let (relation, with, items): (_, _, &[Option<typedpg_pg_query::ast::Node>]) = match statement {
         Node::InsertStmt(stmt) => (stmt.relation.as_ref(), stmt.with_clause.as_ref(), &[][..]),
         Node::UpdateStmt(stmt) => (
             stmt.relation.as_ref(),
@@ -281,7 +281,7 @@ fn returning_target_is_safe(ctx: &Ctx<'_>, statement: &Node) -> bool {
 /// Whether `relation` is an ordinary table without row security or rewrite
 /// rules, so reading or writing it cannot make `RETURNING` part of the
 /// statement's effect.
-fn relation_is_safe(ctx: &Ctx<'_>, relation: &typedpg_pg_query::protobuf::RangeVar) -> bool {
+fn relation_is_safe(ctx: &Ctx<'_>, relation: &typedpg_pg_query::ast::RangeVar) -> bool {
     let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
     let Some(class) = ctx.catalog.resolve_table(schema, &relation.relname) else {
         return false;
@@ -293,17 +293,11 @@ fn relation_is_safe(ctx: &Ctx<'_>, relation: &typedpg_pg_query::protobuf::RangeV
 
 /// Whether a `FROM` / `USING` item is an ordinary table (or a join of them)
 /// without row security or rewrite rules.
-fn from_item_is_safe(ctx: &Ctx<'_>, item: &typedpg_pg_query::protobuf::Node) -> bool {
-    match item.node.as_ref() {
+fn from_item_is_safe(ctx: &Ctx<'_>, item: &Option<typedpg_pg_query::ast::Node>) -> bool {
+    match item.as_ref() {
         Some(Node::RangeVar(relation)) => relation_is_safe(ctx, relation),
         Some(Node::JoinExpr(join)) => {
-            join.larg
-                .as_deref()
-                .is_some_and(|left| from_item_is_safe(ctx, left))
-                && join
-                    .rarg
-                    .as_deref()
-                    .is_some_and(|right| from_item_is_safe(ctx, right))
+            from_item_is_safe(ctx, &join.larg) && from_item_is_safe(ctx, &join.rarg)
         }
         _ => false,
     }
@@ -316,7 +310,7 @@ fn from_item_is_safe(ctx: &Ctx<'_>, item: &typedpg_pg_query::protobuf::Node) -> 
 /// any schema), and any `FROM` / `USING` item that is not a plain table
 /// (or a MERGE, whose source can be anything), count.
 fn may_read_virtual_columns(ctx: &Ctx<'_>, statement: &Node) -> bool {
-    let (target, from): (_, &[typedpg_pg_query::protobuf::Node]) = match statement {
+    let (target, from): (_, &[Option<typedpg_pg_query::ast::Node>]) = match statement {
         Node::InsertStmt(stmt) => (stmt.relation.as_ref(), &[]),
         Node::UpdateStmt(stmt) => (stmt.relation.as_ref(), &stmt.from_clause),
         Node::DeleteStmt(stmt) => (stmt.relation.as_ref(), &stmt.using_clause),
@@ -326,13 +320,13 @@ fn may_read_virtual_columns(ctx: &Ctx<'_>, statement: &Node) -> bool {
         return true;
     };
     let mut names = vec![target.relname.as_str()];
-    let mut items: Vec<&typedpg_pg_query::protobuf::Node> = from.iter().collect();
+    let mut items: Vec<Option<&Node>> = from.iter().map(Option::as_ref).collect();
     while let Some(item) = items.pop() {
-        match item.node.as_ref() {
+        match item {
             Some(Node::RangeVar(range)) => names.push(range.relname.as_str()),
             Some(Node::JoinExpr(join)) => {
-                items.extend(join.larg.as_deref());
-                items.extend(join.rarg.as_deref());
+                items.extend(join.larg.as_ref().map(Some));
+                items.extend(join.rarg.as_ref().map(Some));
             }
             _ => return true,
         }
