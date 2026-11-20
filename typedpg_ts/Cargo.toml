@@ -2,7 +2,7 @@
 name = "typedpg_ts"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.97"
+rust-version = "1.98"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -35,12 +35,12 @@ clap = { version = "4", features = ["derive"] }
 sha2 = "0.11"
 notify = "8"
 globset = "0.4"
-oxc_parser = "0.158"
-oxc_ast = "0.158"
-oxc_ast_visit = "0.158"
-oxc_semantic = "0.158"
-oxc_allocator = "0.158"
-oxc_span = "0.158"
+oxc_parser = "0.159"
+oxc_ast = "0.159"
+oxc_ast_visit = "0.159"
+oxc_semantic = "0.159"
+oxc_allocator = "0.159"
+oxc_span = "0.159"
 oxc_resolver = "11.24"
 
 [dev-dependencies]
