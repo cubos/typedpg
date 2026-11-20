@@ -256,14 +256,19 @@ pub(crate) fn expand_multi_assign_rows<'a>(
         let std::borrow::Cow::Owned(args) = expr::expand_row_args(&row.args, ctx, params)? else {
             return Ok(None);
         };
-        let mut rt = rt.clone();
-        let mut mar = mar.clone();
-        mar.source = Some(ast::Node::RowExpr(NodeBox::new(ast::RowExpr {
-            args,
-            ..(**row).clone()
-        })));
-        rt.val = Some(ast::Node::MultiAssignRef(mar));
-        Ok(Some(ast::Node::ResTarget(rt)))
+        let mar = ast::MultiAssignRef {
+            source: Some(ast::Node::RowExpr(NodeBox::new(expr::row_with_args(
+                row, args,
+            )))),
+            colno: mar.colno,
+            ncolumns: mar.ncolumns,
+        };
+        Ok(Some(ast::Node::ResTarget(NodeBox::new(ast::ResTarget {
+            name: rt.name.clone(),
+            indirection: rt.indirection.clone(),
+            val: Some(ast::Node::MultiAssignRef(NodeBox::new(mar))),
+            location: rt.location,
+        }))))
     };
     let expanded: Vec<Option<ast::Node>> = target_list
         .iter()

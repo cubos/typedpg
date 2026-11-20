@@ -2451,6 +2451,13 @@ pub(crate) fn view_locks_rows(snapshot: &PgCatalog, relid: PgClassOid) -> bool {
 
 /// The stored SELECT of view `relid`.
 pub(crate) fn view_query(interp: &PgCatalog, relid: crate::oid::PgClassOid) -> Option<ast::Node> {
-    let body = interp.view_body(relid)?;
-    body.ast.clone()
+    stored_view_query(interp, relid).cloned()
+}
+
+/// [`view_query`], borrowed from the catalog.
+pub(crate) fn stored_view_query(
+    interp: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+) -> Option<&ast::Node> {
+    interp.view_body(relid)?.ast.as_ref()
 }

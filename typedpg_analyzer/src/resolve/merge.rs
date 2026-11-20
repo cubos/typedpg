@@ -271,8 +271,12 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                 let whens = expanded_whens.get_or_insert_with(|| merge.merge_when_clauses.clone());
                 whens[i] = Some(ast::Node::MergeWhenClause(NodeBox::new(
                     ast::MergeWhenClause {
+                        match_kind: when.match_kind,
+                        command_type: when.command_type,
+                        r#override: when.r#override,
+                        condition: when.condition.clone(),
                         target_list,
-                        ..(**when).clone()
+                        values: when.values.clone(),
                     },
                 )));
             }
@@ -286,17 +290,9 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         }
     }
     // What follows reads the SET lists as expanded.
-    let expanded_merge;
-    let merge = match expanded_whens {
-        Some(merge_when_clauses) => {
-            expanded_merge = ast::MergeStmt {
-                merge_when_clauses,
-                ..merge.clone()
-            };
-            &expanded_merge
-        }
-        None => merge,
-    };
+    let whens = expanded_whens
+        .as_deref()
+        .unwrap_or(&merge.merge_when_clauses);
 
     // RETURNING sees the source and the target (plus the OLD / NEW rows).
     // The target columns are the inserted / updated / deleted row, so they
@@ -322,7 +318,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             Default::default()
         };
         let arms = MergeArms {
-            merge,
+            whens,
             wt: &wt,
             target_alias: &target_alias,
             table_attrs: &table_attrs,
@@ -363,7 +359,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     let columns = columns?;
 
     let mut actions = Vec::new();
-    for when_node in &merge.merge_when_clauses {
+    for when_node in whens {
         let Some(ast::Node::MergeWhenClause(when)) = when_node.as_ref() else {
             continue;
         };
@@ -795,7 +791,8 @@ fn from_item_refname(item: Option<&ast::Node>) -> Option<String> {
 /// MATCHED one, the ON condition — held. What is known of every returned
 /// row is what every action that returns one knows.
 struct MergeArms<'a> {
-    merge: &'a ast::MergeStmt,
+    /// The WHEN clauses, their SET lists expanded.
+    whens: &'a [Option<ast::Node>],
     wt: &'a WriteTarget,
     target_alias: &'a str,
     table_attrs: &'a [crate::pg_catalog::PgAttribute],
@@ -830,14 +827,10 @@ impl MergeArms<'_> {
         let (mut target, mut old, mut new): (Option<Set>, Option<Set>, Option<Set>) =
             (None, None, None);
         let mut source: Option<std::collections::HashSet<(String, String)>> = None;
-        let whens = self
-            .merge
-            .merge_when_clauses
-            .iter()
-            .filter_map(|n| match n.as_ref() {
-                Some(ast::Node::MergeWhenClause(w)) => Some(w.as_ref()),
-                _ => None,
-            });
+        let whens = self.whens.iter().filter_map(|n| match n.as_ref() {
+            Some(ast::Node::MergeWhenClause(w)) => Some(w.as_ref()),
+            _ => None,
+        });
         for (when, when_facts) in whens.zip(self.when_facts) {
             let cmd = when.command_type;
             if !matches!(
