@@ -22,7 +22,7 @@
     "postgres-3": "npm:postgres@^3.4.9",
     "rollup": "^4.68.2",
     "typescript": "^7.0.2",
-    "typescript-6": "npm:typescript@6.0",
+    "typescript-6": "npm:typescript@7.0",
     "typescript-7.1": "npm:typescript@^7.1.0-dev.20261110.1"
   }
 }
