@@ -39,11 +39,16 @@
 //! compile still fails. A `-- typedpg-lint: allow(rule)` comment suppresses
 //! a rule in the query or migration statement it is in.
 //!
+//! `roles` lists the database roles every query is checked against, in
+//! addition to the schema's owner: `gen`, `check`, `build` and `serve`
+//! report PostgreSQL's `permission denied` when one of them may not run a
+//! query. Only roles the migrations create can be checked. Empty by default.
+//!
 //! `migrations` is the directory, or an object with it and the runner's
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",
 //! "embed" }`. Several databases go under `databases`, each with the
 //! per-database keys (`out`, `sql`, `migrations`, `extraMigrations`,
-//! `types`); the top level then carries none of them.
+//! `types`, `roles`); the top level then carries none of them.
 //!
 //! `sql` takes the queries of `.sql` files, each a `/* @name x */` block
 //! (see [`crate::sqlfile`]):
@@ -88,6 +93,7 @@ struct RawConfig {
     migrations: Option<RawMigrations>,
     extra_migrations: Option<Vec<PathBuf>>,
     types: Option<BTreeMap<String, String>>,
+    roles: Option<Vec<String>>,
     databases: Option<BTreeMap<String, RawDatabase>>,
     simplify: Option<RawSimplify>,
     lint: Option<RawLint>,
@@ -218,6 +224,9 @@ struct RawDatabase {
     #[allow(dead_code)]
     extra_migrations: Option<Vec<PathBuf>>,
     types: Option<BTreeMap<String, String>>,
+    /// The roles every query of this database is checked against, in
+    /// addition to the schema's owner (see `PgCatalog::analyze_as`).
+    roles: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +443,9 @@ pub struct DatabaseConfig {
     pub types: HashMap<QualifiedName, TypeOverride>,
     /// The query simplifications (the top-level `simplify`).
     pub simplify: SimplifyConfig,
+    /// The roles every query of this database is checked against, in
+    /// addition to the schema's owner. Empty: nothing is checked.
+    pub roles: Vec<String>,
 }
 
 impl DatabaseConfig {
@@ -485,6 +497,7 @@ impl Config {
             migrations: raw.migrations,
             extra_migrations: raw.extra_migrations,
             types: raw.types,
+            roles: raw.roles,
         };
         // The databases' names and migration directories are also the `.sql`
         // loaders' cache recipe: `loader_cache::databases` is the one
@@ -643,6 +656,7 @@ fn database(
         embed_migrations,
         types,
         simplify: simplify.clone(),
+        roles: raw.roles.unwrap_or_default(),
     })
 }
 
@@ -862,6 +876,69 @@ mod tests {
         let databases = typedpg_core::loader_cache::databases(text).unwrap();
         assert_eq!(databases.len(), 1);
         assert_eq!(databases[0].name, "default");
+    }
+
+    #[test]
+    fn roles_are_read_per_database() {
+        let c = Config::parse(
+            r#"{ "out": "db.ts", "roles": ["app_role", "reporting"] }"#,
+            Path::new("/p"),
+        )
+        .unwrap();
+        assert_eq!(c.databases[0].roles, ["app_role", "reporting"]);
+        assert!(
+            Config::parse(r#"{ "out": "db.ts" }"#, Path::new("/p"))
+                .unwrap()
+                .databases[0]
+                .roles
+                .is_empty()
+        );
+
+        let c = Config::parse(
+            r#"{ "databases": {
+                     "main": { "out": "a.ts", "roles": ["main_role"] },
+                     "wh": { "out": "b.ts" }
+                 } }"#,
+            Path::new("/p"),
+        )
+        .unwrap();
+        assert_eq!(c.database(Some("main")).unwrap().roles, ["main_role"]);
+        assert!(c.database(Some("wh")).unwrap().roles.is_empty());
+
+        // Roles are per database: a top-level one beside `databases` is an
+        // error, like `out` and `types`.
+        let err = Config::parse(
+            r#"{ "roles": ["app_role"], "databases": { "main": { "out": "a.ts" } } }"#,
+            Path::new("/p"),
+        )
+        .unwrap_err();
+        assert!(err.contains("go in each entry"), "{err}");
+        assert!(err.contains("`roles`"), "{err}");
+
+        // The strings are role names, never read as SQL.
+        let err = Config::parse(
+            r#"{ "out": "db.ts", "roles": "app_role" }"#,
+            Path::new("/p"),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid type: string \"app_role\""), "{err}");
+        let err = Config::parse(
+            r#"{ "out": "db.ts", "roles": ["app", 1] }"#,
+            Path::new("/p"),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid type: integer `1`"), "{err}");
+    }
+
+    #[test]
+    fn roles_are_accepted_by_the_loader_cache() {
+        for text in [
+            r#"{ "out": "db.ts", "roles": ["app_role"] }"#,
+            r#"{ "databases": { "main": { "out": "db.ts", "roles": ["app_role"] } } }"#,
+        ] {
+            let databases = typedpg_core::loader_cache::databases(text).unwrap();
+            assert_eq!(databases.len(), 1);
+        }
     }
 
     #[test]

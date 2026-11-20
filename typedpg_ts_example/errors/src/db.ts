@@ -62,6 +62,7 @@ export interface Queries {
     value: Temporal.Duration;
   };
   "SELECT u.id, p.id FROM users u JOIN posts p ON p.author_id = u.id": { error: "duplicate column name \"id\" in the query's output: a row object has one property per name, so give the columns distinct names (`AS ...`)" };
+  "UPDATE users SET name = 'x' WHERE id = 1": { error: "permission denied for table users" };
 }
 
 export interface CopyTargets {

@@ -2810,7 +2810,7 @@ fn check_locking_clause(
                 // subquery: its relations are locked too.
                 SourceKind::Subquery { .. } => {
                     for item in &sel.from_clause {
-                        note_subquery_locks(item, Some(&source.alias), scope, snapshot);
+                        note_subquery_locks(item.as_ref(), Some(&source.alias), scope, snapshot);
                     }
                 }
                 _ => {}
@@ -3134,12 +3134,12 @@ fn check_distinct_on_matches_order_by(
 /// transformLockingClause applies it to each relation of the subquery's
 /// range table and recurses into its own subqueries, joins included.
 fn note_subquery_locks(
-    item: &Option<ast::Node>,
+    item: Option<&ast::Node>,
     alias: Option<&str>,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) {
-    match item.as_ref() {
+    match item {
         Some(ast::Node::RangeSubselect(rs)) => {
             let name = rs.alias.as_ref().map(|a| a.aliasname.as_str());
             if alias.is_some() && name != alias {
@@ -3147,12 +3147,12 @@ fn note_subquery_locks(
             }
             if let Some(ast::Node::SelectStmt(inner)) = rs.subquery.as_ref() {
                 for item in &inner.from_clause {
-                    note_locks_below(item, inner, scope, snapshot);
+                    note_locks_below(item.as_ref(), inner, scope, snapshot);
                 }
             }
         }
         Some(ast::Node::JoinExpr(j)) => {
-            for side in [&j.larg, &j.rarg] {
+            for side in [j.larg.as_ref(), j.rarg.as_ref()] {
                 note_subquery_locks(side, alias, scope, snapshot);
             }
         }
@@ -3164,12 +3164,12 @@ fn note_subquery_locks(
 /// is locked, a join or subquery passes the lock on. A WITH query's name
 /// (the subquery's own, or the statement's) is no relation.
 fn note_locks_below(
-    item: &Option<ast::Node>,
+    item: Option<&ast::Node>,
     sel: &ast::SelectStmt,
     scope: &Scope,
     snapshot: &PgCatalog,
 ) {
-    match item.as_ref() {
+    match item {
         Some(ast::Node::RangeVar(rv)) => {
             let own_cte = sel.with_clause.as_ref().is_some_and(|w| {
                 w.ctes.iter().any(|c| {
@@ -3185,7 +3185,7 @@ fn note_locks_below(
             }
         }
         Some(ast::Node::JoinExpr(j)) => {
-            for side in [&j.larg, &j.rarg] {
+            for side in [j.larg.as_ref(), j.rarg.as_ref()] {
                 note_locks_below(side, sel, scope, snapshot);
             }
         }

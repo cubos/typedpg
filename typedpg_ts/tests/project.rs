@@ -247,6 +247,68 @@ fn a_missing_migrations_directory_is_noted() {
 }
 
 #[test]
+fn a_query_a_configured_role_cannot_run_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "include": ["src"], "out": "src/db.ts", "roles": ["app_role"] }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE ROLE app_role;\n\
+         CREATE TABLE users (id int4 PRIMARY KEY, name text NOT NULL);\n\
+         GRANT SELECT (name) ON users TO app_role;\n",
+    );
+    write(
+        &root.join("src/a.ts"),
+        "import { sql } from './db.ts';\n\
+         sql('SELECT name FROM users');\n\
+         sql('SELECT id FROM users');\n",
+    );
+    let r = project(root, false).sync(false);
+    let rendered: Vec<String> = r.diagnostics.iter().map(|d| d.render(root)).collect();
+    assert_eq!(rendered.len(), 1, "{rendered:?}");
+    assert!(
+        rendered[0].starts_with("src/a.ts:3:5: error: permission denied for table users\n"),
+        "{}",
+        rendered[0]
+    );
+    assert!(
+        rendered[0].contains(
+            "help: grant it in a migration: GRANT SELECT (id) ON public.users TO app_role;"
+        ),
+        "{}",
+        rendered[0]
+    );
+    // The allowed query is generated as usual.
+    assert!(read(&root.join("src/db.ts")).contains("\"SELECT name FROM users\""));
+
+    // A role the migrations do not create is the analyzer's error too.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "include": ["src"], "out": "src/db.ts", "roles": ["nobody"] }"#,
+    );
+    write(&root.join("migrations/0001.sql"), USERS);
+    write(
+        &root.join("src/a.ts"),
+        "import { sql } from './db.ts';\nsql('SELECT id FROM users');\n",
+    );
+    let r = project(root, false).sync(false);
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
+    assert!(
+        r.diagnostics[0].message.starts_with(
+            "role \"nobody\" does not exist (typedpg can check only the roles the migrations \
+             create)"
+        ),
+        "{}",
+        r.diagnostics[0].message
+    );
+}
+
+#[test]
 fn type_overrides_are_imported_once_per_module() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

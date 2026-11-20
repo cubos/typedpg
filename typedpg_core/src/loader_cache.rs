@@ -74,6 +74,7 @@ pub fn databases(config_json: &str) -> Result<Vec<Database>, String> {
         sql,
         migrations,
         extra_migrations,
+        roles,
         types,
     }) = serde_json::from_str(config_json)
         .map_err(|error| format!("invalid config JSON: {error}"))?;
@@ -83,11 +84,12 @@ pub fn databases(config_json: &str) -> Result<Vec<Database>, String> {
                 || sql.is_some()
                 || migrations.is_some()
                 || extra_migrations.is_some()
+                || roles.is_some()
                 || types.is_some()
             {
                 return Err(
-                    "`out`, `sql`, `migrations`, `extraMigrations` and `types` go in each entry \
-                     of `databases` when it is set"
+                    "`out`, `sql`, `migrations`, `extraMigrations`, `roles` and `types` go in \
+                     each entry of `databases` when it is set"
                         .to_owned(),
                 );
             }
@@ -208,6 +210,9 @@ struct Config {
     sql: Option<IgnoredAny>,
     migrations: Option<Migrations>,
     extra_migrations: Option<Vec<String>>,
+    /// The roles a database is checked against: not part of the cache recipe
+    /// (the whole config text is hashed), so only its place is validated.
+    roles: Option<IgnoredAny>,
     types: Option<IgnoredAny>,
 }
 
@@ -333,6 +338,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dbs[0].dirs, ["migrations"]);
+    }
+
+    /// `roles` is not part of the cache recipe either (the whole config text
+    /// is hashed): it must parse wherever it belongs, and a top-level one
+    /// beside `databases` must be rejected as the other per-database keys
+    /// are.
+    #[test]
+    fn roles_are_not_part_of_the_recipe() {
+        let dbs = databases(r#"{ "out": "db.ts", "roles": ["app_role"] }"#).unwrap();
+        assert_eq!(dbs[0].dirs, ["migrations"]);
+
+        let dbs = databases(
+            r#"{ "databases": {
+                     "main": { "out": "a.ts", "roles": ["app_role", "reporting"] }
+                 } }"#,
+        )
+        .unwrap();
+        assert_eq!(dbs[0].dirs, ["migrations"]);
+
+        let err =
+            databases(r#"{ "roles": ["app_role"], "databases": { "x": { "out": "a.ts" } } }"#)
+                .unwrap_err();
+        assert!(err.contains("go in each entry"), "{err}");
+        assert!(err.contains("`roles`"), "{err}");
     }
 
     #[test]

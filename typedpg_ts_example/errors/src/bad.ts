@@ -46,4 +46,6 @@ export async function cases() {
   await copyIn("users (name, email)").execute(pool, [{ name: 1, email: null }]);
   // @ts-expect-error: a template tag, not a function call
   await sql`SELECT 1`.fetchAll(pool);
+  // @ts-expect-error: the role may read but not write
+  await sql("UPDATE users SET name = 'x' WHERE id = 1").execute(pool);
 }
