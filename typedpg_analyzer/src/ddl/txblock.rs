@@ -454,7 +454,6 @@ fn forbidden_in_block(stmt: &ast::Node) -> Option<&'static str> {
                 _ => None,
             }
         }
-        ast::Node::ClusterStmt(c) if c.relation.is_none() => Some("CLUSTER"),
         ast::Node::AlterTableStmt(a) => a.cmds.iter().find_map(|c| match c.as_ref() {
             Some(ast::Node::AlterTableCmd(cmd)) => match cmd.def.as_ref() {
                 Some(ast::Node::PartitionCmd(pc)) if pc.concurrent => {

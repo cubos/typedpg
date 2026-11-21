@@ -979,14 +979,14 @@ pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<ast::Node> {
         bindings::NodeTag_T_AlterSystemStmt => ast::Node::AlterSystemStmt(NodeBox::new(unsafe {
             alter_system_stmt(p as *const bindings::AlterSystemStmt)
         })),
-        bindings::NodeTag_T_ClusterStmt => ast::Node::ClusterStmt(NodeBox::new(unsafe {
-            cluster_stmt(p as *const bindings::ClusterStmt)
-        })),
         bindings::NodeTag_T_VacuumStmt => ast::Node::VacuumStmt(NodeBox::new(unsafe {
             vacuum_stmt(p as *const bindings::VacuumStmt)
         })),
         bindings::NodeTag_T_VacuumRelation => ast::Node::VacuumRelation(NodeBox::new(unsafe {
             vacuum_relation(p as *const bindings::VacuumRelation)
+        })),
+        bindings::NodeTag_T_RepackStmt => ast::Node::RepackStmt(NodeBox::new(unsafe {
+            repack_stmt(p as *const bindings::RepackStmt)
         })),
         bindings::NodeTag_T_ExplainStmt => ast::Node::ExplainStmt(NodeBox::new(unsafe {
             explain_stmt(p as *const bindings::ExplainStmt)
@@ -1066,6 +1066,11 @@ pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<ast::Node> {
                 publication_obj_spec(p as *const bindings::PublicationObjSpec)
             }))
         }
+        bindings::NodeTag_T_PublicationAllObjSpec => {
+            ast::Node::PublicationAllObjSpec(NodeBox::new(unsafe {
+                publication_all_obj_spec(p as *const bindings::PublicationAllObjSpec)
+            }))
+        }
         bindings::NodeTag_T_CreatePublicationStmt => {
             ast::Node::CreatePublicationStmt(NodeBox::new(unsafe {
                 create_publication_stmt(p as *const bindings::CreatePublicationStmt)
@@ -1091,6 +1096,9 @@ pub(crate) unsafe fn node(p: *const bindings::Node) -> Option<ast::Node> {
                 drop_subscription_stmt(p as *const bindings::DropSubscriptionStmt)
             }))
         }
+        bindings::NodeTag_T_WaitStmt => ast::Node::WaitStmt(NodeBox::new(unsafe {
+            wait_stmt(p as *const bindings::WaitStmt)
+        })),
         bindings::NodeTag_T_Integer => ast::Node::Integer(NodeBox::new(unsafe {
             integer(p as *const bindings::Integer)
         })),
@@ -1486,6 +1494,7 @@ pub(crate) unsafe fn window_func(p: *const bindings::WindowFunc) -> ast::WindowF
         out.winref = unsafe { (*p).winref as u32 };
         out.winstar = unsafe { (*p).winstar };
         out.winagg = unsafe { (*p).winagg };
+        out.ignore_nulls = unsafe { (*p).ignore_nulls as i32 };
         out.location = unsafe { (*p).location as i32 };
         out
     })
@@ -1739,12 +1748,14 @@ pub(crate) unsafe fn sub_plan(p: *const bindings::SubPlan) -> ast::SubPlan {
         out.first_col_type = unsafe { (*p).firstColType as u32 };
         out.first_col_typmod = unsafe { (*p).firstColTypmod as i32 };
         out.first_col_collation = unsafe { (*p).firstColCollation as u32 };
+        out.is_init_plan = unsafe { (*p).isInitPlan };
         out.use_hash_table = unsafe { (*p).useHashTable };
         out.unknown_eq_false = unsafe { (*p).unknownEqFalse };
         out.parallel_safe = unsafe { (*p).parallel_safe };
         out.set_param = unsafe { list_items((*p).setParam) };
         out.par_param = unsafe { list_items((*p).parParam) };
         out.args = unsafe { list_items((*p).args) };
+        out.disabled_nodes = unsafe { (*p).disabled_nodes as i32 };
         out.startup_cost = unsafe { (*p).startup_cost as f64 };
         out.per_call_cost = unsafe { (*p).per_call_cost as f64 };
         out
@@ -2223,6 +2234,22 @@ pub(crate) unsafe fn json_constructor_expr(
                 )))
             }
         };
+        out.orig_query = unsafe {
+            if (*p).orig_query.is_null() {
+                None
+            } else {
+                node((*p).orig_query as *const bindings::Node)
+            }
+        };
+        out.format = unsafe {
+            if (*p).format.is_null() {
+                None
+            } else {
+                Some(NodeBox::new(json_format(
+                    (*p).format as *const bindings::JsonFormat,
+                )))
+            }
+        };
         out.absent_on_null = unsafe { (*p).absent_on_null };
         out.unique = unsafe { (*p).unique };
         out.location = unsafe { (*p).location as i32 };
@@ -2257,6 +2284,7 @@ pub(crate) unsafe fn json_is_predicate(
         };
         out.item_type = unsafe { convert_json_value_type((*p).item_type) };
         out.unique_keys = unsafe { (*p).unique_keys };
+        out.expr_base_type = unsafe { (*p).exprBaseType as u32 };
         out.location = unsafe { (*p).location as i32 };
         out
     })
@@ -2735,6 +2763,7 @@ pub(crate) unsafe fn on_conflict_expr(p: *const bindings::OnConflictExpr) -> ast
             }
         };
         out.constraint = unsafe { (*p).constraint as u32 };
+        out.lock_strength = unsafe { convert_lock_clause_strength((*p).lockStrength) };
         out.on_conflict_set = unsafe { list_items((*p).onConflictSet) };
         out.on_conflict_where = unsafe {
             if (*p).onConflictWhere.is_null() {
@@ -3020,6 +3049,7 @@ pub(crate) unsafe fn func_call(p: *const bindings::FuncCall) -> ast::FuncCall {
                 )))
             }
         };
+        out.ignore_nulls = unsafe { (*p).ignore_nulls as i32 };
         out.agg_within_group = unsafe { (*p).agg_within_group };
         out.agg_star = unsafe { (*p).agg_star };
         out.agg_distinct = unsafe { (*p).agg_distinct };
@@ -3461,6 +3491,7 @@ pub(crate) unsafe fn index_elem(p: *const bindings::IndexElem) -> ast::IndexElem
         out.opclassopts = unsafe { list_items((*p).opclassopts) };
         out.ordering = unsafe { convert_sort_by_dir((*p).ordering) };
         out.nulls_ordering = unsafe { convert_sort_by_nulls((*p).nulls_ordering) };
+        out.location = unsafe { (*p).location as i32 };
         out
     })
 }
@@ -3957,6 +3988,7 @@ pub(crate) unsafe fn on_conflict_clause(
                 )))
             }
         };
+        out.lock_strength = unsafe { convert_lock_clause_strength((*p).lockStrength) };
         out.target_list = unsafe { list_items((*p).targetList) };
         out.where_clause = unsafe {
             if (*p).whereClause.is_null() {
@@ -5216,7 +5248,7 @@ pub(crate) unsafe fn alter_domain_stmt(
     let _depth = DepthGuard::new();
     grow(|| {
         let mut out = ast::AlterDomainStmt::default();
-        out.subtype = unsafe { c_char_string((*p).subtype) };
+        out.subtype = unsafe { convert_alter_domain_type((*p).subtype) };
         out.type_name = unsafe { list_items((*p).typeName) };
         out.name = unsafe { c_string((*p).name) };
         out.def = unsafe {
@@ -6412,6 +6444,8 @@ pub(crate) unsafe fn fetch_stmt(p: *const bindings::FetchStmt) -> ast::FetchStmt
         out.how_many = unsafe { (*p).howMany as i64 };
         out.portalname = unsafe { c_string((*p).portalname) };
         out.ismove = unsafe { (*p).ismove };
+        out.direction_keyword = unsafe { convert_fetch_direction_keywords((*p).direction_keyword) };
+        out.location = unsafe { (*p).location as i32 };
         out
     })
 }
@@ -7163,28 +7197,6 @@ pub(crate) unsafe fn alter_system_stmt(
     })
 }
 
-pub(crate) unsafe fn cluster_stmt(p: *const bindings::ClusterStmt) -> ast::ClusterStmt {
-    if too_deep() {
-        return ast::ClusterStmt::default();
-    }
-    let _depth = DepthGuard::new();
-    grow(|| {
-        let mut out = ast::ClusterStmt::default();
-        out.relation = unsafe {
-            if (*p).relation.is_null() {
-                None
-            } else {
-                Some(NodeBox::new(range_var(
-                    (*p).relation as *const bindings::RangeVar,
-                )))
-            }
-        };
-        out.indexname = unsafe { c_string((*p).indexname) };
-        out.params = unsafe { list_items((*p).params) };
-        out
-    })
-}
-
 pub(crate) unsafe fn vacuum_stmt(p: *const bindings::VacuumStmt) -> ast::VacuumStmt {
     if too_deep() {
         return ast::VacuumStmt::default();
@@ -7217,6 +7229,30 @@ pub(crate) unsafe fn vacuum_relation(p: *const bindings::VacuumRelation) -> ast:
         };
         out.oid = unsafe { (*p).oid as u32 };
         out.va_cols = unsafe { list_items((*p).va_cols) };
+        out
+    })
+}
+
+pub(crate) unsafe fn repack_stmt(p: *const bindings::RepackStmt) -> ast::RepackStmt {
+    if too_deep() {
+        return ast::RepackStmt::default();
+    }
+    let _depth = DepthGuard::new();
+    grow(|| {
+        let mut out = ast::RepackStmt::default();
+        out.command = unsafe { convert_repack_command((*p).command) };
+        out.relation = unsafe {
+            if (*p).relation.is_null() {
+                None
+            } else {
+                Some(NodeBox::new(vacuum_relation(
+                    (*p).relation as *const bindings::VacuumRelation,
+                )))
+            }
+        };
+        out.indexname = unsafe { c_string((*p).indexname) };
+        out.usingindex = unsafe { (*p).usingindex };
+        out.params = unsafe { list_items((*p).params) };
         out
     })
 }
@@ -7302,7 +7338,8 @@ pub(crate) unsafe fn check_point_stmt(p: *const bindings::CheckPointStmt) -> ast
     }
     let _depth = DepthGuard::new();
     grow(|| {
-        let out = ast::CheckPointStmt::default();
+        let mut out = ast::CheckPointStmt::default();
+        out.options = unsafe { list_items((*p).options) };
         out
     })
 }
@@ -7615,6 +7652,7 @@ pub(crate) unsafe fn publication_table(
             }
         };
         out.columns = unsafe { list_items((*p).columns) };
+        out.except = unsafe { (*p).except };
         out
     })
 }
@@ -7644,6 +7682,22 @@ pub(crate) unsafe fn publication_obj_spec(
     })
 }
 
+pub(crate) unsafe fn publication_all_obj_spec(
+    p: *const bindings::PublicationAllObjSpec,
+) -> ast::PublicationAllObjSpec {
+    if too_deep() {
+        return ast::PublicationAllObjSpec::default();
+    }
+    let _depth = DepthGuard::new();
+    grow(|| {
+        let mut out = ast::PublicationAllObjSpec::default();
+        out.pubobjtype = unsafe { convert_publication_all_obj_type((*p).pubobjtype) };
+        out.except_tables = unsafe { list_items((*p).except_tables) };
+        out.location = unsafe { (*p).location as i32 };
+        out
+    })
+}
+
 pub(crate) unsafe fn create_publication_stmt(
     p: *const bindings::CreatePublicationStmt,
 ) -> ast::CreatePublicationStmt {
@@ -7657,6 +7711,7 @@ pub(crate) unsafe fn create_publication_stmt(
         out.options = unsafe { list_items((*p).options) };
         out.pubobjects = unsafe { list_items((*p).pubobjects) };
         out.for_all_tables = unsafe { (*p).for_all_tables };
+        out.for_all_sequences = unsafe { (*p).for_all_sequences };
         out
     })
 }
@@ -7673,8 +7728,9 @@ pub(crate) unsafe fn alter_publication_stmt(
         out.pubname = unsafe { c_string((*p).pubname) };
         out.options = unsafe { list_items((*p).options) };
         out.pubobjects = unsafe { list_items((*p).pubobjects) };
-        out.for_all_tables = unsafe { (*p).for_all_tables };
         out.action = unsafe { convert_alter_publication_action((*p).action) };
+        out.for_all_tables = unsafe { (*p).for_all_tables };
+        out.for_all_sequences = unsafe { (*p).for_all_sequences };
         out
     })
 }
@@ -7689,6 +7745,7 @@ pub(crate) unsafe fn create_subscription_stmt(
     grow(|| {
         let mut out = ast::CreateSubscriptionStmt::default();
         out.subname = unsafe { c_string((*p).subname) };
+        out.servername = unsafe { c_string((*p).servername) };
         out.conninfo = unsafe { c_string((*p).conninfo) };
         out.publication = unsafe { list_items((*p).publication) };
         out.options = unsafe { list_items((*p).options) };
@@ -7707,6 +7764,7 @@ pub(crate) unsafe fn alter_subscription_stmt(
         let mut out = ast::AlterSubscriptionStmt::default();
         out.kind = unsafe { convert_alter_subscription_type((*p).kind) };
         out.subname = unsafe { c_string((*p).subname) };
+        out.servername = unsafe { c_string((*p).servername) };
         out.conninfo = unsafe { c_string((*p).conninfo) };
         out.publication = unsafe { list_items((*p).publication) };
         out.options = unsafe { list_items((*p).options) };
@@ -7726,6 +7784,20 @@ pub(crate) unsafe fn drop_subscription_stmt(
         out.subname = unsafe { c_string((*p).subname) };
         out.missing_ok = unsafe { (*p).missing_ok };
         out.behavior = unsafe { convert_drop_behavior((*p).behavior) };
+        out
+    })
+}
+
+pub(crate) unsafe fn wait_stmt(p: *const bindings::WaitStmt) -> ast::WaitStmt {
+    if too_deep() {
+        return ast::WaitStmt::default();
+    }
+    let _depth = DepthGuard::new();
+    grow(|| {
+        let mut out = ast::WaitStmt::default();
+        out.lsn_literal = unsafe { c_string((*p).lsn_literal) };
+        out.options = unsafe { list_items((*p).options) };
+        out.lsn_location = unsafe { (*p).lsn_location as i32 };
         out
     })
 }
@@ -7797,6 +7869,46 @@ const _: () = {
     );
 };
 
+fn convert_alter_domain_type(value: bindings::AlterDomainType) -> ast::AlterDomainType {
+    match value {
+        bindings::AlterDomainType_AD_AlterDefault => ast::AlterDomainType::AdAlterDefault,
+        bindings::AlterDomainType_AD_DropNotNull => ast::AlterDomainType::AdDropNotNull,
+        bindings::AlterDomainType_AD_SetNotNull => ast::AlterDomainType::AdSetNotNull,
+        bindings::AlterDomainType_AD_AddConstraint => ast::AlterDomainType::AdAddConstraint,
+        bindings::AlterDomainType_AD_DropConstraint => ast::AlterDomainType::AdDropConstraint,
+        bindings::AlterDomainType_AD_ValidateConstraint => {
+            ast::AlterDomainType::AdValidateConstraint
+        }
+        other => unreachable!("{other} is not a AlterDomainType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::AlterDomainType_AD_AlterDefault as i64
+            == ast::AlterDomainType::AdAlterDefault as i64
+    );
+    assert!(
+        bindings::AlterDomainType_AD_DropNotNull as i64
+            == ast::AlterDomainType::AdDropNotNull as i64
+    );
+    assert!(
+        bindings::AlterDomainType_AD_SetNotNull as i64 == ast::AlterDomainType::AdSetNotNull as i64
+    );
+    assert!(
+        bindings::AlterDomainType_AD_AddConstraint as i64
+            == ast::AlterDomainType::AdAddConstraint as i64
+    );
+    assert!(
+        bindings::AlterDomainType_AD_DropConstraint as i64
+            == ast::AlterDomainType::AdDropConstraint as i64
+    );
+    assert!(
+        bindings::AlterDomainType_AD_ValidateConstraint as i64
+            == ast::AlterDomainType::AdValidateConstraint as i64
+    );
+};
+
 fn convert_alter_publication_action(
     value: bindings::AlterPublicationAction,
 ) -> ast::AlterPublicationAction {
@@ -7832,6 +7944,9 @@ fn convert_alter_subscription_type(
         bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_OPTIONS => {
             ast::AlterSubscriptionType::AlterSubscriptionOptions
         }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SERVER => {
+            ast::AlterSubscriptionType::AlterSubscriptionServer
+        }
         bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_CONNECTION => {
             ast::AlterSubscriptionType::AlterSubscriptionConnection
         }
@@ -7844,8 +7959,11 @@ fn convert_alter_subscription_type(
         bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_DROP_PUBLICATION => {
             ast::AlterSubscriptionType::AlterSubscriptionDropPublication
         }
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH => {
-            ast::AlterSubscriptionType::AlterSubscriptionRefresh
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH_PUBLICATION => {
+            ast::AlterSubscriptionType::AlterSubscriptionRefreshPublication
+        }
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH_SEQUENCES => {
+            ast::AlterSubscriptionType::AlterSubscriptionRefreshSequences
         }
         bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ENABLED => {
             ast::AlterSubscriptionType::AlterSubscriptionEnabled
@@ -7861,6 +7979,10 @@ const _: () = {
     assert!(
         bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_OPTIONS as i64
             == ast::AlterSubscriptionType::AlterSubscriptionOptions as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_SERVER as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionServer as i64
     );
     assert!(
         bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_CONNECTION as i64
@@ -7879,8 +8001,12 @@ const _: () = {
             == ast::AlterSubscriptionType::AlterSubscriptionDropPublication as i64
     );
     assert!(
-        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH as i64
-            == ast::AlterSubscriptionType::AlterSubscriptionRefresh as i64
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH_PUBLICATION as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionRefreshPublication as i64
+    );
+    assert!(
+        bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_REFRESH_SEQUENCES as i64
+            == ast::AlterSubscriptionType::AlterSubscriptionRefreshSequences as i64
     );
     assert!(
         bindings::AlterSubscriptionType_ALTER_SUBSCRIPTION_ENABLED as i64
@@ -8565,6 +8691,101 @@ const _: () = {
     );
 };
 
+fn convert_fetch_direction_keywords(
+    value: bindings::FetchDirectionKeywords,
+) -> ast::FetchDirectionKeywords {
+    match value {
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_NONE => {
+            ast::FetchDirectionKeywords::FetchKeywordNone
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_NEXT => {
+            ast::FetchDirectionKeywords::FetchKeywordNext
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_PRIOR => {
+            ast::FetchDirectionKeywords::FetchKeywordPrior
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_FIRST => {
+            ast::FetchDirectionKeywords::FetchKeywordFirst
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_LAST => {
+            ast::FetchDirectionKeywords::FetchKeywordLast
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_ABSOLUTE => {
+            ast::FetchDirectionKeywords::FetchKeywordAbsolute
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_RELATIVE => {
+            ast::FetchDirectionKeywords::FetchKeywordRelative
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_ALL => {
+            ast::FetchDirectionKeywords::FetchKeywordAll
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_FORWARD => {
+            ast::FetchDirectionKeywords::FetchKeywordForward
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_FORWARD_ALL => {
+            ast::FetchDirectionKeywords::FetchKeywordForwardAll
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_BACKWARD => {
+            ast::FetchDirectionKeywords::FetchKeywordBackward
+        }
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_BACKWARD_ALL => {
+            ast::FetchDirectionKeywords::FetchKeywordBackwardAll
+        }
+        other => unreachable!("{other} is not a FetchDirectionKeywords"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_NONE as i64
+            == ast::FetchDirectionKeywords::FetchKeywordNone as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_NEXT as i64
+            == ast::FetchDirectionKeywords::FetchKeywordNext as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_PRIOR as i64
+            == ast::FetchDirectionKeywords::FetchKeywordPrior as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_FIRST as i64
+            == ast::FetchDirectionKeywords::FetchKeywordFirst as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_LAST as i64
+            == ast::FetchDirectionKeywords::FetchKeywordLast as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_ABSOLUTE as i64
+            == ast::FetchDirectionKeywords::FetchKeywordAbsolute as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_RELATIVE as i64
+            == ast::FetchDirectionKeywords::FetchKeywordRelative as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_ALL as i64
+            == ast::FetchDirectionKeywords::FetchKeywordAll as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_FORWARD as i64
+            == ast::FetchDirectionKeywords::FetchKeywordForward as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_FORWARD_ALL as i64
+            == ast::FetchDirectionKeywords::FetchKeywordForwardAll as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_BACKWARD as i64
+            == ast::FetchDirectionKeywords::FetchKeywordBackward as i64
+    );
+    assert!(
+        bindings::FetchDirectionKeywords_FETCH_KEYWORD_BACKWARD_ALL as i64
+            == ast::FetchDirectionKeywords::FetchKeywordBackwardAll as i64
+    );
+};
+
 fn convert_function_parameter_mode(
     value: bindings::FunctionParameterMode,
 ) -> ast::FunctionParameterMode {
@@ -8805,6 +9026,9 @@ fn convert_json_constructor_type(value: bindings::JsonConstructorType) -> ast::J
         bindings::JsonConstructorType_JSCTOR_JSON_ARRAY => {
             ast::JsonConstructorType::JsctorJsonArray
         }
+        bindings::JsonConstructorType_JSCTOR_JSON_ARRAY_QUERY => {
+            ast::JsonConstructorType::JsctorJsonArrayQuery
+        }
         bindings::JsonConstructorType_JSCTOR_JSON_OBJECTAGG => {
             ast::JsonConstructorType::JsctorJsonObjectagg
         }
@@ -8832,6 +9056,10 @@ const _: () = {
     assert!(
         bindings::JsonConstructorType_JSCTOR_JSON_ARRAY as i64
             == ast::JsonConstructorType::JsctorJsonArray as i64
+    );
+    assert!(
+        bindings::JsonConstructorType_JSCTOR_JSON_ARRAY_QUERY as i64
+            == ast::JsonConstructorType::JsctorJsonArrayQuery as i64
     );
     assert!(
         bindings::JsonConstructorType_JSCTOR_JSON_OBJECTAGG as i64
@@ -9165,6 +9393,9 @@ fn convert_object_type(value: bindings::ObjectType) -> ast::ObjectType {
         bindings::ObjectType_OBJECT_POLICY => ast::ObjectType::ObjectPolicy,
         bindings::ObjectType_OBJECT_PROCEDURE => ast::ObjectType::ObjectProcedure,
         bindings::ObjectType_OBJECT_PUBLICATION => ast::ObjectType::ObjectPublication,
+        bindings::ObjectType_OBJECT_PUBLICATION_EXCLUDED_REL => {
+            ast::ObjectType::ObjectPublicationExcludedRel
+        }
         bindings::ObjectType_OBJECT_PUBLICATION_NAMESPACE => {
             ast::ObjectType::ObjectPublicationNamespace
         }
@@ -9259,6 +9490,10 @@ const _: () = {
         bindings::ObjectType_OBJECT_PUBLICATION as i64 == ast::ObjectType::ObjectPublication as i64
     );
     assert!(
+        bindings::ObjectType_OBJECT_PUBLICATION_EXCLUDED_REL as i64
+            == ast::ObjectType::ObjectPublicationExcludedRel as i64
+    );
+    assert!(
         bindings::ObjectType_OBJECT_PUBLICATION_NAMESPACE as i64
             == ast::ObjectType::ObjectPublicationNamespace as i64
     );
@@ -9345,6 +9580,7 @@ fn convert_on_conflict_action(value: bindings::OnConflictAction) -> ast::OnConfl
         bindings::OnConflictAction_ONCONFLICT_NONE => ast::OnConflictAction::OnconflictNone,
         bindings::OnConflictAction_ONCONFLICT_NOTHING => ast::OnConflictAction::OnconflictNothing,
         bindings::OnConflictAction_ONCONFLICT_UPDATE => ast::OnConflictAction::OnconflictUpdate,
+        bindings::OnConflictAction_ONCONFLICT_SELECT => ast::OnConflictAction::OnconflictSelect,
         other => unreachable!("{other} is not a OnConflictAction"),
     }
 }
@@ -9361,6 +9597,10 @@ const _: () = {
     assert!(
         bindings::OnConflictAction_ONCONFLICT_UPDATE as i64
             == ast::OnConflictAction::OnconflictUpdate as i64
+    );
+    assert!(
+        bindings::OnConflictAction_ONCONFLICT_SELECT as i64
+            == ast::OnConflictAction::OnconflictSelect as i64
     );
 };
 
@@ -9463,12 +9703,40 @@ const _: () = {
     );
 };
 
+fn convert_publication_all_obj_type(
+    value: bindings::PublicationAllObjType,
+) -> ast::PublicationAllObjType {
+    match value {
+        bindings::PublicationAllObjType_PUBLICATION_ALL_TABLES => {
+            ast::PublicationAllObjType::PublicationAllTables
+        }
+        bindings::PublicationAllObjType_PUBLICATION_ALL_SEQUENCES => {
+            ast::PublicationAllObjType::PublicationAllSequences
+        }
+        other => unreachable!("{other} is not a PublicationAllObjType"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::PublicationAllObjType_PUBLICATION_ALL_TABLES as i64
+            == ast::PublicationAllObjType::PublicationAllTables as i64
+    );
+    assert!(
+        bindings::PublicationAllObjType_PUBLICATION_ALL_SEQUENCES as i64
+            == ast::PublicationAllObjType::PublicationAllSequences as i64
+    );
+};
+
 fn convert_publication_obj_spec_type(
     value: bindings::PublicationObjSpecType,
 ) -> ast::PublicationObjSpecType {
     match value {
         bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLE => {
             ast::PublicationObjSpecType::PublicationobjTable
+        }
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_EXCEPT_TABLE => {
+            ast::PublicationObjSpecType::PublicationobjExceptTable
         }
         bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_SCHEMA => {
             ast::PublicationObjSpecType::PublicationobjTablesInSchema
@@ -9487,6 +9755,10 @@ const _: () = {
     assert!(
         bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLE as i64
             == ast::PublicationObjSpecType::PublicationobjTable as i64
+    );
+    assert!(
+        bindings::PublicationObjSpecType_PUBLICATIONOBJ_EXCEPT_TABLE as i64
+            == ast::PublicationObjSpecType::PublicationobjExceptTable as i64
     );
     assert!(
         bindings::PublicationObjSpecType_PUBLICATIONOBJ_TABLES_IN_SCHEMA as i64
@@ -9601,6 +9873,28 @@ const _: () = {
     assert!(
         bindings::ReindexObjectType_REINDEX_OBJECT_DATABASE as i64
             == ast::ReindexObjectType::ReindexObjectDatabase as i64
+    );
+};
+
+fn convert_repack_command(value: bindings::RepackCommand) -> ast::RepackCommand {
+    match value {
+        bindings::RepackCommand_REPACK_COMMAND_CLUSTER => ast::RepackCommand::Cluster,
+        bindings::RepackCommand_REPACK_COMMAND_REPACK => ast::RepackCommand::Repack,
+        bindings::RepackCommand_REPACK_COMMAND_VACUUMFULL => ast::RepackCommand::Vacuumfull,
+        other => unreachable!("{other} is not a RepackCommand"),
+    }
+}
+
+const _: () = {
+    assert!(
+        bindings::RepackCommand_REPACK_COMMAND_CLUSTER as i64 == ast::RepackCommand::Cluster as i64
+    );
+    assert!(
+        bindings::RepackCommand_REPACK_COMMAND_REPACK as i64 == ast::RepackCommand::Repack as i64
+    );
+    assert!(
+        bindings::RepackCommand_REPACK_COMMAND_VACUUMFULL as i64
+            == ast::RepackCommand::Vacuumfull as i64
     );
 };
 
@@ -10169,8 +10463,8 @@ pub(crate) fn token(value: i32) -> Option<ast::Token> {
         272 => ast::Token::LessEquals,
         273 => ast::Token::GreaterEquals,
         274 => ast::Token::NotEquals,
-        780 => ast::Token::SqlComment,
-        781 => ast::Token::CComment,
+        785 => ast::Token::SqlComment,
+        786 => ast::Token::CComment,
         275 => ast::Token::AbortP,
         276 => ast::Token::Absent,
         277 => ast::Token::AbsoluteP,
@@ -10348,334 +10642,339 @@ pub(crate) fn token(value: i32) -> Option<ast::Token> {
         449 => ast::Token::HourP,
         450 => ast::Token::IdentityP,
         451 => ast::Token::IfP,
-        452 => ast::Token::Ilike,
-        453 => ast::Token::Immediate,
-        454 => ast::Token::Immutable,
-        455 => ast::Token::ImplicitP,
-        456 => ast::Token::ImportP,
-        457 => ast::Token::InP,
-        458 => ast::Token::Include,
-        459 => ast::Token::Including,
-        460 => ast::Token::Increment,
-        461 => ast::Token::Indent,
-        462 => ast::Token::Index,
-        463 => ast::Token::Indexes,
-        464 => ast::Token::Inherit,
-        465 => ast::Token::Inherits,
-        466 => ast::Token::Initially,
-        467 => ast::Token::InlineP,
-        468 => ast::Token::InnerP,
-        469 => ast::Token::Inout,
-        470 => ast::Token::InputP,
-        471 => ast::Token::Insensitive,
-        472 => ast::Token::Insert,
-        473 => ast::Token::Instead,
-        474 => ast::Token::IntP,
-        475 => ast::Token::Integer,
-        476 => ast::Token::Intersect,
-        477 => ast::Token::Interval,
-        478 => ast::Token::Into,
-        479 => ast::Token::Invoker,
-        480 => ast::Token::Is,
-        481 => ast::Token::Isnull,
-        482 => ast::Token::Isolation,
-        483 => ast::Token::Join,
-        484 => ast::Token::Json,
-        485 => ast::Token::JsonArray,
-        486 => ast::Token::JsonArrayagg,
-        487 => ast::Token::JsonExists,
-        488 => ast::Token::JsonObject,
-        489 => ast::Token::JsonObjectagg,
-        490 => ast::Token::JsonQuery,
-        491 => ast::Token::JsonScalar,
-        492 => ast::Token::JsonSerialize,
-        493 => ast::Token::JsonTable,
-        494 => ast::Token::JsonValue,
-        495 => ast::Token::Keep,
-        496 => ast::Token::Key,
-        497 => ast::Token::Keys,
-        498 => ast::Token::Label,
-        499 => ast::Token::Language,
-        500 => ast::Token::LargeP,
-        501 => ast::Token::LastP,
-        502 => ast::Token::LateralP,
-        503 => ast::Token::Leading,
-        504 => ast::Token::Leakproof,
-        505 => ast::Token::Least,
-        506 => ast::Token::Left,
-        507 => ast::Token::Level,
-        508 => ast::Token::Like,
-        509 => ast::Token::Limit,
-        510 => ast::Token::Listen,
-        511 => ast::Token::Load,
-        512 => ast::Token::Local,
-        513 => ast::Token::Localtime,
-        514 => ast::Token::Localtimestamp,
-        515 => ast::Token::Location,
-        516 => ast::Token::LockP,
-        517 => ast::Token::Locked,
-        518 => ast::Token::Logged,
-        519 => ast::Token::Mapping,
-        520 => ast::Token::Match,
-        521 => ast::Token::Matched,
-        522 => ast::Token::Materialized,
-        523 => ast::Token::Maxvalue,
-        524 => ast::Token::Merge,
-        525 => ast::Token::MergeAction,
-        526 => ast::Token::Method,
-        527 => ast::Token::MinuteP,
-        528 => ast::Token::Minvalue,
-        529 => ast::Token::Mode,
-        530 => ast::Token::MonthP,
-        531 => ast::Token::Move,
-        532 => ast::Token::NameP,
-        533 => ast::Token::Names,
-        534 => ast::Token::National,
-        535 => ast::Token::Natural,
-        536 => ast::Token::Nchar,
-        537 => ast::Token::Nested,
-        538 => ast::Token::New,
-        539 => ast::Token::Next,
-        540 => ast::Token::Nfc,
-        541 => ast::Token::Nfd,
-        542 => ast::Token::Nfkc,
-        543 => ast::Token::Nfkd,
-        544 => ast::Token::No,
-        545 => ast::Token::None,
-        546 => ast::Token::Normalize,
-        547 => ast::Token::Normalized,
-        548 => ast::Token::Not,
-        549 => ast::Token::Nothing,
-        550 => ast::Token::Notify,
-        551 => ast::Token::Notnull,
-        552 => ast::Token::Nowait,
-        553 => ast::Token::NullP,
-        554 => ast::Token::Nullif,
-        555 => ast::Token::NullsP,
-        556 => ast::Token::Numeric,
-        557 => ast::Token::ObjectP,
-        558 => ast::Token::ObjectsP,
-        559 => ast::Token::Of,
-        560 => ast::Token::Off,
-        561 => ast::Token::Offset,
-        562 => ast::Token::Oids,
-        563 => ast::Token::Old,
-        564 => ast::Token::Omit,
-        565 => ast::Token::On,
-        566 => ast::Token::Only,
-        567 => ast::Token::Operator,
-        568 => ast::Token::Option,
-        569 => ast::Token::Options,
-        570 => ast::Token::Or,
-        571 => ast::Token::Order,
-        572 => ast::Token::Ordinality,
-        573 => ast::Token::Others,
-        574 => ast::Token::OutP,
-        575 => ast::Token::OuterP,
-        576 => ast::Token::Over,
-        577 => ast::Token::Overlaps,
-        578 => ast::Token::Overlay,
-        579 => ast::Token::Overriding,
-        580 => ast::Token::Owned,
-        581 => ast::Token::Owner,
-        582 => ast::Token::Parallel,
-        583 => ast::Token::Parameter,
-        584 => ast::Token::Parser,
-        585 => ast::Token::Partial,
-        586 => ast::Token::Partition,
-        587 => ast::Token::Passing,
-        588 => ast::Token::Password,
-        589 => ast::Token::Path,
-        590 => ast::Token::Period,
-        591 => ast::Token::Placing,
-        592 => ast::Token::Plan,
-        593 => ast::Token::Plans,
-        594 => ast::Token::Policy,
-        595 => ast::Token::Position,
-        596 => ast::Token::Preceding,
-        597 => ast::Token::Precision,
-        598 => ast::Token::Preserve,
-        599 => ast::Token::Prepare,
-        600 => ast::Token::Prepared,
-        601 => ast::Token::Primary,
-        602 => ast::Token::Prior,
-        603 => ast::Token::Privileges,
-        604 => ast::Token::Procedural,
-        605 => ast::Token::Procedure,
-        606 => ast::Token::Procedures,
-        607 => ast::Token::Program,
-        608 => ast::Token::Publication,
-        609 => ast::Token::Quote,
-        610 => ast::Token::Quotes,
-        611 => ast::Token::Range,
-        612 => ast::Token::Read,
-        613 => ast::Token::Real,
-        614 => ast::Token::Reassign,
-        615 => ast::Token::Recursive,
-        616 => ast::Token::RefP,
-        617 => ast::Token::References,
-        618 => ast::Token::Referencing,
-        619 => ast::Token::Refresh,
-        620 => ast::Token::Reindex,
-        621 => ast::Token::RelativeP,
-        622 => ast::Token::Release,
-        623 => ast::Token::Rename,
-        624 => ast::Token::Repeatable,
-        625 => ast::Token::Replace,
-        626 => ast::Token::Replica,
-        627 => ast::Token::Reset,
-        628 => ast::Token::Restart,
-        629 => ast::Token::Restrict,
-        630 => ast::Token::Return,
-        631 => ast::Token::Returning,
-        632 => ast::Token::Returns,
-        633 => ast::Token::Revoke,
-        634 => ast::Token::Right,
-        635 => ast::Token::Role,
-        636 => ast::Token::Rollback,
-        637 => ast::Token::Rollup,
-        638 => ast::Token::Routine,
-        639 => ast::Token::Routines,
-        640 => ast::Token::Row,
-        641 => ast::Token::Rows,
-        642 => ast::Token::Rule,
-        643 => ast::Token::Savepoint,
-        644 => ast::Token::Scalar,
-        645 => ast::Token::Schema,
-        646 => ast::Token::Schemas,
-        647 => ast::Token::Scroll,
-        648 => ast::Token::Search,
-        649 => ast::Token::SecondP,
-        650 => ast::Token::Security,
-        651 => ast::Token::Select,
-        652 => ast::Token::Sequence,
-        653 => ast::Token::Sequences,
-        654 => ast::Token::Serializable,
-        655 => ast::Token::Server,
-        656 => ast::Token::Session,
-        657 => ast::Token::SessionUser,
-        658 => ast::Token::Set,
-        659 => ast::Token::Sets,
-        660 => ast::Token::Setof,
-        661 => ast::Token::Share,
-        662 => ast::Token::Show,
-        663 => ast::Token::Similar,
-        664 => ast::Token::Simple,
-        665 => ast::Token::Skip,
-        666 => ast::Token::Smallint,
-        667 => ast::Token::Snapshot,
-        668 => ast::Token::Some,
-        669 => ast::Token::Source,
-        670 => ast::Token::SqlP,
-        671 => ast::Token::Stable,
-        672 => ast::Token::StandaloneP,
-        673 => ast::Token::Start,
-        674 => ast::Token::Statement,
-        675 => ast::Token::Statistics,
-        676 => ast::Token::Stdin,
-        677 => ast::Token::Stdout,
-        678 => ast::Token::Storage,
-        679 => ast::Token::Stored,
-        680 => ast::Token::StrictP,
-        681 => ast::Token::StringP,
-        682 => ast::Token::StripP,
-        683 => ast::Token::Subscription,
-        684 => ast::Token::Substring,
-        685 => ast::Token::Support,
-        686 => ast::Token::Symmetric,
-        687 => ast::Token::Sysid,
-        688 => ast::Token::SystemP,
-        689 => ast::Token::SystemUser,
-        690 => ast::Token::Table,
-        691 => ast::Token::Tables,
-        692 => ast::Token::Tablesample,
-        693 => ast::Token::Tablespace,
-        694 => ast::Token::Target,
-        695 => ast::Token::Temp,
-        696 => ast::Token::Template,
-        697 => ast::Token::Temporary,
-        698 => ast::Token::TextP,
-        699 => ast::Token::Then,
-        700 => ast::Token::Ties,
-        701 => ast::Token::Time,
-        702 => ast::Token::Timestamp,
-        703 => ast::Token::To,
-        704 => ast::Token::Trailing,
-        705 => ast::Token::Transaction,
-        706 => ast::Token::Transform,
-        707 => ast::Token::Treat,
-        708 => ast::Token::Trigger,
-        709 => ast::Token::Trim,
-        710 => ast::Token::TrueP,
-        711 => ast::Token::Truncate,
-        712 => ast::Token::Trusted,
-        713 => ast::Token::TypeP,
-        714 => ast::Token::TypesP,
-        715 => ast::Token::Uescape,
-        716 => ast::Token::Unbounded,
-        717 => ast::Token::Unconditional,
-        718 => ast::Token::Uncommitted,
-        719 => ast::Token::Unencrypted,
-        720 => ast::Token::Union,
-        721 => ast::Token::Unique,
-        722 => ast::Token::Unknown,
-        723 => ast::Token::Unlisten,
-        724 => ast::Token::Unlogged,
-        725 => ast::Token::Until,
-        726 => ast::Token::Update,
-        727 => ast::Token::User,
-        728 => ast::Token::Using,
-        729 => ast::Token::Vacuum,
-        730 => ast::Token::Valid,
-        731 => ast::Token::Validate,
-        732 => ast::Token::Validator,
-        733 => ast::Token::ValueP,
-        734 => ast::Token::Values,
-        735 => ast::Token::Varchar,
-        736 => ast::Token::Variadic,
-        737 => ast::Token::Varying,
-        738 => ast::Token::Verbose,
-        739 => ast::Token::VersionP,
-        740 => ast::Token::View,
-        741 => ast::Token::Views,
-        742 => ast::Token::Virtual,
-        743 => ast::Token::Volatile,
-        744 => ast::Token::When,
-        745 => ast::Token::Where,
-        746 => ast::Token::WhitespaceP,
-        747 => ast::Token::Window,
-        748 => ast::Token::With,
-        749 => ast::Token::Within,
-        750 => ast::Token::Without,
-        751 => ast::Token::Work,
-        752 => ast::Token::Wrapper,
-        753 => ast::Token::Write,
-        754 => ast::Token::XmlP,
-        755 => ast::Token::Xmlattributes,
-        756 => ast::Token::Xmlconcat,
-        757 => ast::Token::Xmlelement,
-        758 => ast::Token::Xmlexists,
-        759 => ast::Token::Xmlforest,
-        760 => ast::Token::Xmlnamespaces,
-        761 => ast::Token::Xmlparse,
-        762 => ast::Token::Xmlpi,
-        763 => ast::Token::Xmlroot,
-        764 => ast::Token::Xmlserialize,
-        765 => ast::Token::Xmltable,
-        766 => ast::Token::YearP,
-        767 => ast::Token::YesP,
-        768 => ast::Token::Zone,
-        769 => ast::Token::FormatLa,
-        770 => ast::Token::NotLa,
-        771 => ast::Token::NullsLa,
-        772 => ast::Token::WithLa,
-        773 => ast::Token::WithoutLa,
-        774 => ast::Token::ModeTypeName,
-        775 => ast::Token::ModePlpgsqlExpr,
-        776 => ast::Token::ModePlpgsqlAssign1,
-        777 => ast::Token::ModePlpgsqlAssign2,
-        778 => ast::Token::ModePlpgsqlAssign3,
-        779 => ast::Token::Uminus,
+        452 => ast::Token::IgnoreP,
+        453 => ast::Token::Ilike,
+        454 => ast::Token::Immediate,
+        455 => ast::Token::Immutable,
+        456 => ast::Token::ImplicitP,
+        457 => ast::Token::ImportP,
+        458 => ast::Token::InP,
+        459 => ast::Token::Include,
+        460 => ast::Token::Including,
+        461 => ast::Token::Increment,
+        462 => ast::Token::Indent,
+        463 => ast::Token::Index,
+        464 => ast::Token::Indexes,
+        465 => ast::Token::Inherit,
+        466 => ast::Token::Inherits,
+        467 => ast::Token::Initially,
+        468 => ast::Token::InlineP,
+        469 => ast::Token::InnerP,
+        470 => ast::Token::Inout,
+        471 => ast::Token::InputP,
+        472 => ast::Token::Insensitive,
+        473 => ast::Token::Insert,
+        474 => ast::Token::Instead,
+        475 => ast::Token::IntP,
+        476 => ast::Token::Integer,
+        477 => ast::Token::Intersect,
+        478 => ast::Token::Interval,
+        479 => ast::Token::Into,
+        480 => ast::Token::Invoker,
+        481 => ast::Token::Is,
+        482 => ast::Token::Isnull,
+        483 => ast::Token::Isolation,
+        484 => ast::Token::Join,
+        485 => ast::Token::Json,
+        486 => ast::Token::JsonArray,
+        487 => ast::Token::JsonArrayagg,
+        488 => ast::Token::JsonExists,
+        489 => ast::Token::JsonObject,
+        490 => ast::Token::JsonObjectagg,
+        491 => ast::Token::JsonQuery,
+        492 => ast::Token::JsonScalar,
+        493 => ast::Token::JsonSerialize,
+        494 => ast::Token::JsonTable,
+        495 => ast::Token::JsonValue,
+        496 => ast::Token::Keep,
+        497 => ast::Token::Key,
+        498 => ast::Token::Keys,
+        499 => ast::Token::Label,
+        500 => ast::Token::Language,
+        501 => ast::Token::LargeP,
+        502 => ast::Token::LastP,
+        503 => ast::Token::LateralP,
+        504 => ast::Token::Leading,
+        505 => ast::Token::Leakproof,
+        506 => ast::Token::Least,
+        507 => ast::Token::Left,
+        508 => ast::Token::Level,
+        509 => ast::Token::Like,
+        510 => ast::Token::Limit,
+        511 => ast::Token::Listen,
+        512 => ast::Token::Load,
+        513 => ast::Token::Local,
+        514 => ast::Token::Localtime,
+        515 => ast::Token::Localtimestamp,
+        516 => ast::Token::Location,
+        517 => ast::Token::LockP,
+        518 => ast::Token::Locked,
+        519 => ast::Token::Logged,
+        520 => ast::Token::LsnP,
+        521 => ast::Token::Mapping,
+        522 => ast::Token::Match,
+        523 => ast::Token::Matched,
+        524 => ast::Token::Materialized,
+        525 => ast::Token::Maxvalue,
+        526 => ast::Token::Merge,
+        527 => ast::Token::MergeAction,
+        528 => ast::Token::Method,
+        529 => ast::Token::MinuteP,
+        530 => ast::Token::Minvalue,
+        531 => ast::Token::Mode,
+        532 => ast::Token::MonthP,
+        533 => ast::Token::Move,
+        534 => ast::Token::NameP,
+        535 => ast::Token::Names,
+        536 => ast::Token::National,
+        537 => ast::Token::Natural,
+        538 => ast::Token::Nchar,
+        539 => ast::Token::Nested,
+        540 => ast::Token::New,
+        541 => ast::Token::Next,
+        542 => ast::Token::Nfc,
+        543 => ast::Token::Nfd,
+        544 => ast::Token::Nfkc,
+        545 => ast::Token::Nfkd,
+        546 => ast::Token::No,
+        547 => ast::Token::None,
+        548 => ast::Token::Normalize,
+        549 => ast::Token::Normalized,
+        550 => ast::Token::Not,
+        551 => ast::Token::Nothing,
+        552 => ast::Token::Notify,
+        553 => ast::Token::Notnull,
+        554 => ast::Token::Nowait,
+        555 => ast::Token::NullP,
+        556 => ast::Token::Nullif,
+        557 => ast::Token::NullsP,
+        558 => ast::Token::Numeric,
+        559 => ast::Token::ObjectP,
+        560 => ast::Token::ObjectsP,
+        561 => ast::Token::Of,
+        562 => ast::Token::Off,
+        563 => ast::Token::Offset,
+        564 => ast::Token::Oids,
+        565 => ast::Token::Old,
+        566 => ast::Token::Omit,
+        567 => ast::Token::On,
+        568 => ast::Token::Only,
+        569 => ast::Token::Operator,
+        570 => ast::Token::Option,
+        571 => ast::Token::Options,
+        572 => ast::Token::Or,
+        573 => ast::Token::Order,
+        574 => ast::Token::Ordinality,
+        575 => ast::Token::Others,
+        576 => ast::Token::OutP,
+        577 => ast::Token::OuterP,
+        578 => ast::Token::Over,
+        579 => ast::Token::Overlaps,
+        580 => ast::Token::Overlay,
+        581 => ast::Token::Overriding,
+        582 => ast::Token::Owned,
+        583 => ast::Token::Owner,
+        584 => ast::Token::Parallel,
+        585 => ast::Token::Parameter,
+        586 => ast::Token::Parser,
+        587 => ast::Token::Partial,
+        588 => ast::Token::Partition,
+        589 => ast::Token::Passing,
+        590 => ast::Token::Password,
+        591 => ast::Token::Path,
+        592 => ast::Token::Period,
+        593 => ast::Token::Placing,
+        594 => ast::Token::Plan,
+        595 => ast::Token::Plans,
+        596 => ast::Token::Policy,
+        597 => ast::Token::Position,
+        598 => ast::Token::Preceding,
+        599 => ast::Token::Precision,
+        600 => ast::Token::Preserve,
+        601 => ast::Token::Prepare,
+        602 => ast::Token::Prepared,
+        603 => ast::Token::Primary,
+        604 => ast::Token::Prior,
+        605 => ast::Token::Privileges,
+        606 => ast::Token::Procedural,
+        607 => ast::Token::Procedure,
+        608 => ast::Token::Procedures,
+        609 => ast::Token::Program,
+        610 => ast::Token::Publication,
+        611 => ast::Token::Quote,
+        612 => ast::Token::Quotes,
+        613 => ast::Token::Range,
+        614 => ast::Token::Read,
+        615 => ast::Token::Real,
+        616 => ast::Token::Reassign,
+        617 => ast::Token::Recursive,
+        618 => ast::Token::RefP,
+        619 => ast::Token::References,
+        620 => ast::Token::Referencing,
+        621 => ast::Token::Refresh,
+        622 => ast::Token::Reindex,
+        623 => ast::Token::RelativeP,
+        624 => ast::Token::Release,
+        625 => ast::Token::Rename,
+        626 => ast::Token::Repack,
+        627 => ast::Token::Repeatable,
+        628 => ast::Token::Replace,
+        629 => ast::Token::Replica,
+        630 => ast::Token::Reset,
+        631 => ast::Token::RespectP,
+        632 => ast::Token::Restart,
+        633 => ast::Token::Restrict,
+        634 => ast::Token::Return,
+        635 => ast::Token::Returning,
+        636 => ast::Token::Returns,
+        637 => ast::Token::Revoke,
+        638 => ast::Token::Right,
+        639 => ast::Token::Role,
+        640 => ast::Token::Rollback,
+        641 => ast::Token::Rollup,
+        642 => ast::Token::Routine,
+        643 => ast::Token::Routines,
+        644 => ast::Token::Row,
+        645 => ast::Token::Rows,
+        646 => ast::Token::Rule,
+        647 => ast::Token::Savepoint,
+        648 => ast::Token::Scalar,
+        649 => ast::Token::Schema,
+        650 => ast::Token::Schemas,
+        651 => ast::Token::Scroll,
+        652 => ast::Token::Search,
+        653 => ast::Token::SecondP,
+        654 => ast::Token::Security,
+        655 => ast::Token::Select,
+        656 => ast::Token::Sequence,
+        657 => ast::Token::Sequences,
+        658 => ast::Token::Serializable,
+        659 => ast::Token::Server,
+        660 => ast::Token::Session,
+        661 => ast::Token::SessionUser,
+        662 => ast::Token::Set,
+        663 => ast::Token::Sets,
+        664 => ast::Token::Setof,
+        665 => ast::Token::Share,
+        666 => ast::Token::Show,
+        667 => ast::Token::Similar,
+        668 => ast::Token::Simple,
+        669 => ast::Token::Skip,
+        670 => ast::Token::Smallint,
+        671 => ast::Token::Snapshot,
+        672 => ast::Token::Some,
+        673 => ast::Token::Source,
+        674 => ast::Token::SqlP,
+        675 => ast::Token::Stable,
+        676 => ast::Token::StandaloneP,
+        677 => ast::Token::Start,
+        678 => ast::Token::Statement,
+        679 => ast::Token::Statistics,
+        680 => ast::Token::Stdin,
+        681 => ast::Token::Stdout,
+        682 => ast::Token::Storage,
+        683 => ast::Token::Stored,
+        684 => ast::Token::StrictP,
+        685 => ast::Token::StringP,
+        686 => ast::Token::StripP,
+        687 => ast::Token::Subscription,
+        688 => ast::Token::Substring,
+        689 => ast::Token::Support,
+        690 => ast::Token::Symmetric,
+        691 => ast::Token::Sysid,
+        692 => ast::Token::SystemP,
+        693 => ast::Token::SystemUser,
+        694 => ast::Token::Table,
+        695 => ast::Token::Tables,
+        696 => ast::Token::Tablesample,
+        697 => ast::Token::Tablespace,
+        698 => ast::Token::Target,
+        699 => ast::Token::Temp,
+        700 => ast::Token::Template,
+        701 => ast::Token::Temporary,
+        702 => ast::Token::TextP,
+        703 => ast::Token::Then,
+        704 => ast::Token::Ties,
+        705 => ast::Token::Time,
+        706 => ast::Token::Timestamp,
+        707 => ast::Token::To,
+        708 => ast::Token::Trailing,
+        709 => ast::Token::Transaction,
+        710 => ast::Token::Transform,
+        711 => ast::Token::Treat,
+        712 => ast::Token::Trigger,
+        713 => ast::Token::Trim,
+        714 => ast::Token::TrueP,
+        715 => ast::Token::Truncate,
+        716 => ast::Token::Trusted,
+        717 => ast::Token::TypeP,
+        718 => ast::Token::TypesP,
+        719 => ast::Token::Uescape,
+        720 => ast::Token::Unbounded,
+        721 => ast::Token::Unconditional,
+        722 => ast::Token::Uncommitted,
+        723 => ast::Token::Unencrypted,
+        724 => ast::Token::Union,
+        725 => ast::Token::Unique,
+        726 => ast::Token::Unknown,
+        727 => ast::Token::Unlisten,
+        728 => ast::Token::Unlogged,
+        729 => ast::Token::Until,
+        730 => ast::Token::Update,
+        731 => ast::Token::User,
+        732 => ast::Token::Using,
+        733 => ast::Token::Vacuum,
+        734 => ast::Token::Valid,
+        735 => ast::Token::Validate,
+        736 => ast::Token::Validator,
+        737 => ast::Token::ValueP,
+        738 => ast::Token::Values,
+        739 => ast::Token::Varchar,
+        740 => ast::Token::Variadic,
+        741 => ast::Token::Varying,
+        742 => ast::Token::Verbose,
+        743 => ast::Token::VersionP,
+        744 => ast::Token::View,
+        745 => ast::Token::Views,
+        746 => ast::Token::Virtual,
+        747 => ast::Token::Volatile,
+        748 => ast::Token::Wait,
+        749 => ast::Token::When,
+        750 => ast::Token::Where,
+        751 => ast::Token::WhitespaceP,
+        752 => ast::Token::Window,
+        753 => ast::Token::With,
+        754 => ast::Token::Within,
+        755 => ast::Token::Without,
+        756 => ast::Token::Work,
+        757 => ast::Token::Wrapper,
+        758 => ast::Token::Write,
+        759 => ast::Token::XmlP,
+        760 => ast::Token::Xmlattributes,
+        761 => ast::Token::Xmlconcat,
+        762 => ast::Token::Xmlelement,
+        763 => ast::Token::Xmlexists,
+        764 => ast::Token::Xmlforest,
+        765 => ast::Token::Xmlnamespaces,
+        766 => ast::Token::Xmlparse,
+        767 => ast::Token::Xmlpi,
+        768 => ast::Token::Xmlroot,
+        769 => ast::Token::Xmlserialize,
+        770 => ast::Token::Xmltable,
+        771 => ast::Token::YearP,
+        772 => ast::Token::YesP,
+        773 => ast::Token::Zone,
+        774 => ast::Token::FormatLa,
+        775 => ast::Token::NotLa,
+        776 => ast::Token::NullsLa,
+        777 => ast::Token::WithLa,
+        778 => ast::Token::WithoutLa,
+        779 => ast::Token::ModeTypeName,
+        780 => ast::Token::ModePlpgsqlExpr,
+        781 => ast::Token::ModePlpgsqlAssign1,
+        782 => ast::Token::ModePlpgsqlAssign2,
+        783 => ast::Token::ModePlpgsqlAssign3,
+        784 => ast::Token::Uminus,
         _ => return None,
     })
 }

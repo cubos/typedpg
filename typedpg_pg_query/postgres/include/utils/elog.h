@@ -4,7 +4,7 @@
  *	  POSTGRES error reporting/logging definitions.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/elog.h
@@ -23,6 +23,7 @@ struct Node;
 
 
 /* Error level codes */
+#define LOG_NEVER	0			/* Never emit this message */
 #define DEBUG5		10			/* Debugging messages, in categories of
 								 * decreasing detail. */
 #define DEBUG4		11
@@ -53,7 +54,8 @@ struct Node;
 								 * known state */
 #define PGERROR		21			/* Must equal ERROR; see NOTE below. */
 #define FATAL		22			/* fatal error - abort process */
-#define PANIC		23			/* take down the other backends with me */
+#define FATAL_CLIENT_ONLY 23	/* fatal version of WARNING_CLIENT_ONLY */
+#define PANIC		24			/* take down the other backends with me */
 
 /*
  * NOTE: the alternate names PGWARNING and PGERROR are useful for dealing
@@ -119,36 +121,37 @@ struct Node;
  * ereport_domain() directly, or preferably they can override the TEXTDOMAIN
  * macro.
  *
- * When __builtin_constant_p is available and elevel >= ERROR we make a call
- * to errstart_cold() instead of errstart().  This version of the function is
- * marked with pg_attribute_cold which will coax supporting compilers into
- * generating code which is more optimized towards non-ERROR cases.  Because
- * we use __builtin_constant_p() in the condition, when elevel is not a
- * compile-time constant, or if it is, but it's < ERROR, the compiler has no
- * need to generate any code for this branch.  It can simply call errstart()
- * unconditionally.
+ * When pg_integer_constant_p is available and elevel >= ERROR we make
+ * a call to errstart_cold() instead of errstart().  This version of the
+ * function is marked with pg_attribute_cold which will coax supporting
+ * compilers into generating code which is more optimized towards non-ERROR
+ * cases.  Because we use pg_integer_constant_p() in the condition,
+ * when elevel is not a compile-time constant, or if it is, but it's < ERROR,
+ * the compiler has no need to generate any code for this branch.  It can
+ * simply call errstart() unconditionally.
  *
  * If elevel >= ERROR, the call will not return; we try to inform the compiler
  * of that via pg_unreachable().  However, no useful optimization effect is
  * obtained unless the compiler sees elevel as a compile-time constant, else
- * we're just adding code bloat.  So, if __builtin_constant_p is available,
- * use that to cause the second if() to vanish completely for non-constant
- * cases.  We avoid using a local variable because it's not necessary and
- * prevents gcc from making the unreachability deduction at optlevel -O0.
+ * we're just adding code bloat.  So, if pg_integer_constant_p is
+ * available, use that to cause the second if() to vanish completely for
+ * non-constant cases.  We avoid using a local variable because it's not
+ * necessary and prevents gcc from making the unreachability deduction at
+ * optlevel -O0.
  *----------
  */
-#ifdef HAVE__BUILTIN_CONSTANT_P
+#ifdef HAVE_PG_INTEGER_CONSTANT_P
 #define ereport_domain(elevel, domain, ...)	\
 	do { \
 		pg_prevent_errno_in_scope(); \
-		if (__builtin_constant_p(elevel) && (elevel) >= ERROR ? \
+		if (pg_integer_constant_p(elevel) && (elevel) >= ERROR ? \
 			errstart_cold(elevel, domain) : \
 			errstart(elevel, domain)) \
 			__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
-		if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
+		if (pg_integer_constant_p(elevel) && (elevel) >= ERROR) \
 			pg_unreachable(); \
 	} while(0)
-#else							/* !HAVE__BUILTIN_CONSTANT_P */
+#else							/* !HAVE_PG_INTEGER_CONSTANT_P */
 #define ereport_domain(elevel, domain, ...)	\
 	do { \
 		const int elevel_ = (elevel); \
@@ -158,7 +161,7 @@ struct Node;
 		if (elevel_ >= ERROR) \
 			pg_unreachable(); \
 	} while(0)
-#endif							/* HAVE__BUILTIN_CONSTANT_P */
+#endif							/* HAVE_PG_INTEGER_CONSTANT_P */
 
 #define ereport(elevel, ...)	\
 	ereport_domain(elevel, TEXTDOMAIN, __VA_ARGS__)
@@ -176,29 +179,29 @@ extern int	errcode(int sqlerrcode);
 extern int	errcode_for_file_access(void);
 extern int	errcode_for_socket_access(void);
 
-extern int	errmsg(const char *fmt,...) pg_attribute_printf(1, 2);
-extern int	errmsg_internal(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errmsg(const char *fmt, ...) pg_attribute_printf(1, 2);
+extern int	errmsg_internal(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 extern int	errmsg_plural(const char *fmt_singular, const char *fmt_plural,
-						  unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+						  unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
-extern int	errdetail(const char *fmt,...) pg_attribute_printf(1, 2);
-extern int	errdetail_internal(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errdetail(const char *fmt, ...) pg_attribute_printf(1, 2);
+extern int	errdetail_internal(const char *fmt, ...) pg_attribute_printf(1, 2);
 
-extern int	errdetail_log(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errdetail_log(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 extern int	errdetail_log_plural(const char *fmt_singular,
 								 const char *fmt_plural,
-								 unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+								 unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
 extern int	errdetail_plural(const char *fmt_singular, const char *fmt_plural,
-							 unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+							 unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
-extern int	errhint(const char *fmt,...) pg_attribute_printf(1, 2);
-extern int	errhint_internal(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errhint(const char *fmt, ...) pg_attribute_printf(1, 2);
+extern int	errhint_internal(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 extern int	errhint_plural(const char *fmt_singular, const char *fmt_plural,
-						   unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+						   unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
 /*
  * errcontext() is typically called in error context callback functions, not
@@ -212,7 +215,7 @@ extern int	errhint_plural(const char *fmt_singular, const char *fmt_plural,
 
 extern int	set_errcontext_domain(const char *domain);
 
-extern int	errcontext_msg(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errcontext_msg(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 extern int	errhidestmt(bool hide_stmt);
 extern int	errhidecontext(bool hide_ctx);
@@ -300,7 +303,7 @@ extern void errsave_finish(struct Node *context,
 /* Support for constructing error strings separately from ereport() calls */
 
 extern void pre_format_elog_string(int errnumber, const char *domain);
-extern char *format_elog_string(const char *fmt,...) pg_attribute_printf(1, 2);
+extern char *format_elog_string(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 
 /* Support for attaching context information to error reports */
@@ -530,7 +533,7 @@ extern void write_jsonlog(ErrorData *edata);
  * not available). Used before ereport/elog can be used
  * safely (memory context, GUC load etc)
  */
-extern void write_stderr(const char *fmt,...) pg_attribute_printf(1, 2);
+extern void write_stderr(const char *fmt, ...) pg_attribute_printf(1, 2);
 extern void vwrite_stderr(const char *fmt, va_list ap) pg_attribute_printf(1, 0);
 
 #endif							/* ELOG_H */

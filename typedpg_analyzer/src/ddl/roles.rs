@@ -533,8 +533,20 @@ pub(crate) fn current_role(interp: &mut PgCatalog) -> RoleId {
 /// A role name a `CREATE ROLE`-family statement may take: PG's
 /// `IsReservedName` refuses `public`, `none` and the `pg_` prefix.
 fn check_new_role_name(name: &str) -> Result<(), DdlError> {
+    check_role_name_chars(name)?;
     if name == "public" || name == "none" || name.starts_with("pg_") {
         return Err(DdlError::Parse(format!("role name \"{name}\" is reserved")));
+    }
+    Ok(())
+}
+
+/// CreateRole / RenameRole (PostgreSQL 19): no newline or carriage return
+/// in a role name.
+fn check_role_name_chars(name: &str) -> Result<(), DdlError> {
+    if name.contains(['\n', '\r']) {
+        return Err(DdlError::Parse(format!(
+            "role name \"{name}\" contains a newline or carriage return character"
+        )));
     }
     Ok(())
 }
@@ -1209,6 +1221,7 @@ pub fn drop_role(
 
 /// `ALTER ROLE ... RENAME TO` (a `RenameStmt` with `OBJECT_ROLE`).
 pub fn rename_role(interp: &mut PgCatalog, old: &str, new_name: &str) -> Result<(), DdlError> {
+    check_role_name_chars(new_name)?;
     let old = if old.is_empty() {
         interp
             .session_identity

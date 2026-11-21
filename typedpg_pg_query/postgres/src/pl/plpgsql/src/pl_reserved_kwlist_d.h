@@ -3,7 +3,7 @@
  * pl_reserved_kwlist_d.h
  *    List of keywords represented as a ScanKeywordList.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -29,7 +29,6 @@ static const char ReservedPLKeywords_kw_string[] =
 	"declare\0"
 	"else\0"
 	"end\0"
-	"execute\0"
 	"for\0"
 	"foreach\0"
 	"from\0"
@@ -40,7 +39,6 @@ static const char ReservedPLKeywords_kw_string[] =
 	"not\0"
 	"null\0"
 	"or\0"
-	"strict\0"
 	"then\0"
 	"to\0"
 	"using\0"
@@ -56,51 +54,48 @@ static const uint16 ReservedPLKeywords_kw_offsets[] = {
 	26,
 	31,
 	35,
-	43,
+	39,
 	47,
+	52,
 	55,
-	60,
+	58,
 	63,
-	66,
-	71,
-	76,
+	68,
+	72,
+	77,
 	80,
 	85,
 	88,
-	95,
-	100,
-	103,
-	109,
-	114,
+	94,
+	99,
 };
 
-#define RESERVEDPLKEYWORDS_NUM_KEYWORDS 24
+#define RESERVEDPLKEYWORDS_NUM_KEYWORDS 22
 
 static int
 ReservedPLKeywords_hash_func(const void *key, size_t keylen)
 {
-	static const int8 h[49] = {
-		127,   7,     127,   127,   -2,    127,   13,    127,
-		127,   5,     0,     23,    0,     2,     127,   0,
-		17,    0,     127,   19,    5,     127,   6,     2,
-		-3,    17,    0,     6,     127,   8,     18,    127,
-		-6,    3,     -5,    0,     127,   0,     0,     11,
-		15,    127,   127,   127,   13,    127,   0,     17,
-		127
+	static const int8 h[45] = {
+		-7,    127,   -19,   127,   127,   11,    127,   -1,
+		127,   2,     127,   127,   7,     -14,   127,   127,
+		127,   0,     127,   127,   127,   23,    14,    127,
+		0,     15,    -6,    0,     15,    27,    127,   -6,
+		127,   13,    2,     0,     127,   -1,    16,    4,
+		127,   4,     10,    18,    127
 	};
 
 	const unsigned char *k = (const unsigned char *) key;
 	uint32		a = 0;
-	uint32		b = 1;
+	uint32		b = 0;
 
 	while (keylen--)
 	{
 		unsigned char c = *k++ | 0x20;
 
 		a = a * 257 + c;
-		b = b * 8191 + c;
+		b = b * 31 + c;
 	}
-	return h[a % 49] + h[b % 49];
+	return h[a % 45] + h[b % 45];
 }
 
 static const ScanKeywordList ReservedPLKeywords = {

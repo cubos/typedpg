@@ -3,7 +3,7 @@
  * syscache_ids.h
  *    SysCache identifiers
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -15,9 +15,13 @@
  *
  *-------------------------------------------------------------------------
  */
-enum SysCacheIdentifier
+#ifndef SYSCACHE_IDS_H
+#define SYSCACHE_IDS_H
+
+typedef enum SysCacheIdentifier
 {
-	AGGFNOID,
+	SYSCACHEID_INVALID = -1,
+	AGGFNOID = 0,
 	AMNAME,
 	AMOID,
 	AMOPOPID,
@@ -102,5 +106,7 @@ enum SysCacheIdentifier
 	TYPEOID,
 	USERMAPPINGOID,
 	USERMAPPINGUSERSERVER,
-};
+} SysCacheIdentifier;
 #define SysCacheSize (USERMAPPINGUSERSERVER + 1)
+
+#endif							/* SYSCACHE_IDS_H */

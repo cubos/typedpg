@@ -3,7 +3,7 @@
  * datum.c
  *	  POSTGRES Datum (abstract data type) manipulation routines.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,7 +26,7 @@
  * The number of significant bytes are always equal to the typlen.
  *
  * C) if a type is not "byVal" and has typlen == -1,
- * then the "Datum" always points to a "struct varlena".
+ * then the "Datum" always points to a "varlena".
  * This varlena structure has information about the actual length of this
  * particular instance of the type and about its value.
  *
@@ -43,7 +43,6 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
-#include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
 #include "utils/datum.h"
@@ -83,9 +82,9 @@ datumGetSize(Datum value, bool typByVal, int typLen)
 		else if (typLen == -1)
 		{
 			/* It is a varlena datatype */
-			struct varlena *s = (struct varlena *) DatumGetPointer(value);
+			varlena    *s = (varlena *) DatumGetPointer(value);
 
-			if (!PointerIsValid(s))
+			if (!s)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("invalid Datum pointer")));
@@ -97,7 +96,7 @@ datumGetSize(Datum value, bool typByVal, int typLen)
 			/* It is a cstring datatype */
 			char	   *s = (char *) DatumGetPointer(value);
 
-			if (!PointerIsValid(s))
+			if (!s)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("invalid Datum pointer")));
@@ -139,7 +138,7 @@ datumCopy(Datum value, bool typByVal, int typLen)
 	else if (typLen == -1)
 	{
 		/* It is a varlena datatype */
-		struct varlena *vl = (struct varlena *) DatumGetPointer(value);
+		varlena    *vl = (varlena *) DatumGetPointer(value);
 
 		if (VARATT_IS_EXTERNAL_EXPANDED(vl))
 		{
@@ -308,8 +307,8 @@ datum_image_eq(Datum value1, Datum value2, bool typByVal, int typLen)
 			result = false;
 		else
 		{
-			struct varlena *arg1val;
-			struct varlena *arg2val;
+			varlena    *arg1val;
+			varlena    *arg2val;
 
 			arg1val = PG_DETOAST_DATUM_PACKED(value1);
 			arg2val = PG_DETOAST_DATUM_PACKED(value2);
@@ -319,9 +318,9 @@ datum_image_eq(Datum value1, Datum value2, bool typByVal, int typLen)
 							 len1 - VARHDRSZ) == 0);
 
 			/* Only free memory if it's a copy made here. */
-			if ((Pointer) arg1val != (Pointer) value1)
+			if (arg1val != DatumGetPointer(value1))
 				pfree(arg1val);
-			if ((Pointer) arg2val != (Pointer) value2)
+			if (arg2val != DatumGetPointer(value2))
 				pfree(arg2val);
 		}
 	}
@@ -383,7 +382,7 @@ datum_image_hash(Datum value, bool typByVal, int typLen)
 		result = hash_bytes((unsigned char *) DatumGetPointer(value), typLen);
 	else if (typLen == -1)
 	{
-		struct varlena *val;
+		varlena    *val;
 
 		len = toast_raw_datum_size(value);
 
@@ -392,7 +391,7 @@ datum_image_hash(Datum value, bool typByVal, int typLen)
 		result = hash_bytes((unsigned char *) VARDATA_ANY(val), len - VARHDRSZ);
 
 		/* Only free memory if it's a copy made here. */
-		if ((Pointer) val != (Pointer) value)
+		if (val != DatumGetPointer(value))
 			pfree(val);
 	}
 	else if (typLen == -2)
@@ -422,17 +421,22 @@ datum_image_hash(Datum value, bool typByVal, int typLen)
  * datum_image_eq() in all cases can use this as their "equalimage" support
  * function.
  *
- * Earlier minor releases erroneously associated this function with
- * bpchar_pattern_ops.  Detect that case to rescind deduplication support,
- * without requiring initdb.
+ * Currently, we unconditionally assume that any B-Tree operator class that
+ * registers btequalimage as its support function 4 must be able to safely use
+ * optimizations like deduplication (i.e. we return true unconditionally).  If
+ * it ever proved necessary to rescind support for an operator class, we could
+ * do that in a targeted fashion by doing something with the opcintype
+ * argument.
  *-------------------------------------------------------------------------
  */
 Datum
 btequalimage(PG_FUNCTION_ARGS)
 {
+#ifdef NOT_USED
 	Oid			opcintype = PG_GETARG_OID(0);
+#endif
 
-	PG_RETURN_BOOL(opcintype != BPCHAROID);
+	PG_RETURN_BOOL(true);
 }
 
 /*-------------------------------------------------------------------------

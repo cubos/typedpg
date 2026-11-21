@@ -607,7 +607,7 @@ pub(crate) fn fold_qual(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
 
 /// [`fold_qual`] of a node held by reference.
 fn fold_qual_node(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
-    qual_with(n, snapshot, &|_| Folded::Var, false)
+    qual_with(n, snapshot, &|_| Folded::Var, &|_| false, false)
 }
 
 /// [`fold_qual`] for a part of a qual's AND / OR / NOT tree, under an odd
@@ -615,7 +615,13 @@ fn fold_qual_node(n: Option<&ast::Node>, snapshot: &PgCatalog) -> Folded {
 /// planner replaces by a pulled-up subquery's output is what that folds to
 /// (see [`crate::scope::Substitution`]).
 pub(crate) fn fold_qual_in(n: Option<&ast::Node>, ctx: super::Ctx<'_>, negated: bool) -> Folded {
-    qual_with(n, ctx.snapshot, &|cr| column_in(cr, ctx), negated)
+    qual_with(
+        n,
+        ctx.snapshot,
+        &|cr| column_in(cr, ctx),
+        &|e| super::foldable::planner_nonnullable(e, ctx),
+        negated,
+    )
 }
 
 /// `eval_const_expressions` pushes a NOT down an AND / OR (`negate_clause`,
@@ -623,25 +629,37 @@ pub(crate) fn fold_qual_in(n: Option<&ast::Node>, ctx: super::Ctx<'_>, negated: 
 /// any depth of the AND / OR tree, reduces an AND with a FALSE or NULL
 /// argument to FALSE and drops a FALSE or NULL argument of an OR: in a
 /// qual, the NULL constant is FALSE (`rt.s ~ '(' AND NULL` is FALSE, its
-/// regex never estimated). Never [`Folded::Null`].
+/// regex never estimated). Never [`Folded::Null`]. PostgreSQL 19 also
+/// folds `x IS [NOT] NULL` of an `x` proven non-NULL (`nonnull`, see
+/// [`super::foldable::planner_nonnullable`]): `t.id IS NULL` over a
+/// primary key is FALSE.
 fn qual_with(
     n: Option<&ast::Node>,
     snapshot: &PgCatalog,
     col: &dyn Fn(&ast::ColumnRef) -> Folded,
+    nonnull: &dyn Fn(Option<&ast::Node>) -> bool,
     negated: bool,
 ) -> Folded {
+    if let Some(ast::Node::NullTest(t)) = n
+        && !matches!(t.arg.as_ref(), Some(ast::Node::RowExpr(_)))
+        && fold_with(t.arg.as_ref(), snapshot, col) == Folded::Var
+        && nonnull(t.arg.as_ref())
+    {
+        let is_null = t.nulltesttype == ast::NullTestType::IsNull;
+        return Folded::Bool(!is_null != negated);
+    }
     if let Some(ast::Node::BoolExpr(b)) = n {
         match b.boolop {
             ast::BoolExprType::NotExpr => {
                 if let Some(a) = b.args.first() {
-                    return qual_with(a.as_ref(), snapshot, col, !negated);
+                    return qual_with(a.as_ref(), snapshot, col, nonnull, !negated);
                 }
             }
             op => {
                 let or = (op == ast::BoolExprType::OrExpr) != negated;
                 let (mut var, mut unknown) = (false, false);
                 for a in &b.args {
-                    match qual_with(a.as_ref(), snapshot, col, negated) {
+                    match qual_with(a.as_ref(), snapshot, col, nonnull, negated) {
                         Folded::Bool(v) if v == or => return Folded::Bool(or),
                         Folded::Bool(_) => {}
                         Folded::Const => unknown = true,
@@ -2436,6 +2454,13 @@ struct Group<'a> {
     aliases: Vec<String>,
     /// The tables among them.
     tables: Vec<crate::oid::PgClassOid>,
+    /// The level's own tables by alias, and whether the scan also reads
+    /// inheritance children (of a table that isn't partitioned).
+    table_aliases: Vec<(String, crate::oid::PgClassOid, bool)>,
+    /// The outputs of the level's own pulled-up subqueries (inlined CTEs,
+    /// views) that pass a table's column through, by `(alias, output)`:
+    /// the planner reads that table column instead.
+    passthrough: Vec<((String, String), crate::oid::PgClassOid, String)>,
     /// Some quals of a subquery or CTE the planner may pull up are unknown.
     unknown_quals: bool,
     /// A reference to a column may be replaced by an expression, maybe a
@@ -2566,6 +2591,40 @@ impl<'a> Group<'a> {
         }
         match crate::resolve::plan_of(sel, snapshot) {
             crate::resolve::Plan::PulledUp => {
+                // An output passing a column of its one table through.
+                if let Owner::Item { alias, .. } = owner
+                    && let [Some(ast::Node::RangeVar(rv))] = sel.from_clause.as_slice()
+                    && let Some(class) = snapshot.resolve_table(
+                        (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str()),
+                        &rv.relname,
+                    )
+                    && (class.relkind == RelKind::Partitioned
+                        || !rv.inh
+                        || crate::ddl::tables::inherit::children_of(snapshot, class.oid).is_empty())
+                {
+                    for t in &sel.target_list {
+                        let Some(ast::Node::ResTarget(rt)) = t.as_ref() else {
+                            continue;
+                        };
+                        let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref() else {
+                            continue;
+                        };
+                        let names = extract_names(&cr.fields);
+                        if names.len() != cr.fields.len() {
+                            continue;
+                        }
+                        let Some(column) = names.last() else {
+                            continue;
+                        };
+                        let output = if rt.name.is_empty() {
+                            column.clone()
+                        } else {
+                            rt.name.clone()
+                        };
+                        self.passthrough
+                            .push(((alias.clone(), output), class.oid, column.clone()));
+                    }
+                }
                 // Only an output that is no column of its own may fold.
                 self.substitutes |= !sel.values_lists.is_empty()
                     || sel.target_list.iter().any(|t| {
@@ -2671,6 +2730,15 @@ impl<'a> Group<'a> {
                     | RelKind::ForeignTable => {
                         if level_own {
                             self.tables.push(class.oid);
+                            let alias = rv
+                                .alias
+                                .as_ref()
+                                .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+                            let children = rv.inh
+                                && class.relkind != RelKind::Partitioned
+                                && !crate::ddl::tables::inherit::children_of(snapshot, class.oid)
+                                    .is_empty();
+                            self.table_aliases.push((alias, class.oid, children));
                         }
                         // Self-join elimination may merge two scans of
                         // one table.
@@ -2767,11 +2835,16 @@ impl<'a> Group<'a> {
         // attached to that join (`distribute_qual_to_rels`, `ojscope`):
         // a constant there gates the join, never the level's relations.
         let level_wide = |owner: &Owner, top: bool| top || matches!(owner, Owner::SemiJoin);
+        // PostgreSQL 19 folds `col IS NULL` over a column proven non-NULL
+        // to FALSE (expr_is_nonnullable) before distributing the quals: a
+        // constant like any other, no relation's restriction.
         let constant = self.unknown_quals
             || (self.substitutes && self.quals.iter().any(|(_, o, top)| level_wide(o, *top)))
             || self.quals.iter().any(|(q, o, top)| {
                 let folded = fold_qual(*q, snapshot);
-                level_wide(o, *top) && folded.may_be_const() && folded != Folded::Bool(true)
+                level_wide(o, *top)
+                    && ((folded.may_be_const() && folded != Folded::Bool(true))
+                        || self.folded_null_test(*q, snapshot))
             });
         let column_quals: Vec<(Option<&ast::Node>, &Owner, bool)> = self
             .quals
@@ -2783,9 +2856,15 @@ impl<'a> Group<'a> {
         let mut equalities = Vec::new();
         for (q, owner, top) in &column_quals {
             match q.as_ref() {
+                // `col IS NULL` over a column proven non-NULL is folded
+                // (above). One the folding left alone — on an outer join's
+                // nullable side — proves its table empty
+                // (`restriction_is_always_false`) once another qual reduces
+                // the join to an inner one.
                 Some(ast::Node::NullTest(t))
                     if t.nulltesttype == ast::NullTestType::IsNull
-                        && matches!(t.arg.as_ref(), Some(ast::Node::ColumnRef(_))) =>
+                        && !self.folded_null_test(*q, snapshot)
+                        && self.not_null_table_column(t, snapshot) =>
                 {
                     if !(*top && matches!(owner, Owner::Level) && self.null_extended(t)) {
                         self.prove_about(*q, owner, &mut proven);
@@ -2814,6 +2893,75 @@ impl<'a> Group<'a> {
         }
         proven.whole |= constant && rels < 2;
         proven
+    }
+
+    /// Whether qual `q` is `col IS NULL` over a column PostgreSQL 19's
+    /// constant folding proves non-NULL (`var_is_nonnullable`): of one of
+    /// the level's tables (not an inheritance parent scanning children),
+    /// with NOT NULL, and on no outer join's nullable side.
+    fn folded_null_test(&self, q: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
+        let Some(ast::Node::NullTest(t)) = q else {
+            return false;
+        };
+        t.nulltesttype == ast::NullTestType::IsNull && self.null_test_column(t, snapshot, false)
+    }
+
+    /// Whether NullTest `t` tests a NOT NULL column of one of the level's
+    /// tables (not an inheritance parent scanning children), wherever it
+    /// is (`restriction_is_always_false`'s `NOTNULL_SOURCE_RELOPT`).
+    fn not_null_table_column(&self, t: &ast::NullTest, snapshot: &PgCatalog) -> bool {
+        self.null_test_column(t, snapshot, true)
+    }
+
+    /// [`Self::folded_null_test`] / [`Self::not_null_table_column`]: the
+    /// column NullTest `t` tests is a NOT NULL one of the level's tables,
+    /// on no outer join's nullable side unless `nullable_ok`.
+    fn null_test_column(&self, t: &ast::NullTest, snapshot: &PgCatalog, nullable_ok: bool) -> bool {
+        let Some(ast::Node::ColumnRef(cr)) = t.arg.as_ref() else {
+            return false;
+        };
+        let names = extract_names(&cr.fields);
+        if names.len() != cr.fields.len() {
+            return false;
+        }
+        let not_null = |relid: crate::oid::PgClassOid, col: &str| {
+            snapshot
+                .attributes_of(relid)
+                .iter()
+                .any(|a| a.attname == col && a.attnum > 0 && a.attnotnull)
+        };
+        match names.as_slice() {
+            [alias, col] => {
+                (nullable_ok || !self.nullable.contains(alias))
+                    && (self
+                        .table_aliases
+                        .iter()
+                        .find(|(a, ..)| a == alias)
+                        .is_some_and(|(_, relid, children)| !children && not_null(*relid, col))
+                        || self
+                            .passthrough
+                            .iter()
+                            .find(|((a, o), ..)| a == alias && o == col)
+                            .is_some_and(|(_, relid, column)| not_null(*relid, column)))
+            }
+            [col] => {
+                let mut owners = self.table_aliases.iter().filter(|(_, relid, _)| {
+                    snapshot
+                        .attributes_of(*relid)
+                        .iter()
+                        .any(|a| &a.attname == col && a.attnum > 0)
+                });
+                match (owners.next(), owners.next()) {
+                    (Some((alias, relid, children)), None) => {
+                        (nullable_ok || !self.nullable.contains(alias))
+                            && !children
+                            && not_null(*relid, col)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Whether `t`, an `alias.col IS NULL` qual of the level's top join

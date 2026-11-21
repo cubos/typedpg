@@ -138,6 +138,53 @@ fn lag_with_nullable_default_stays_nullable() {
 }
 
 #[test]
+fn null_treatment_of_value_window_functions() {
+    // PostgreSQL 19: IGNORE NULLS skips NULL values, so lag / lead with a
+    // non-NULL default never return NULL, even over a nullable column.
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE notes (id int PRIMARY KEY, body text);")
+        .unwrap();
+    let s = db
+        .analyze(
+            "SELECT lag(body, 1, '') IGNORE NULLS OVER (ORDER BY id) AS a, \
+             lag(body, 1, '') RESPECT NULLS OVER (ORDER BY id) AS b, \
+             lead(body) IGNORE NULLS OVER (ORDER BY id) AS c, \
+             first_value(body) IGNORE NULLS OVER (ORDER BY id) AS d, \
+             nth_value(body, 2) IGNORE NULLS OVER (ORDER BY id) AS e, \
+             lag(body, 0, '') IGNORE NULLS OVER (ORDER BY id) AS f \
+             FROM notes",
+        )
+        .unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("a", text()),
+            cn("b", text()),
+            cn("c", text()),
+            cn("d", text()),
+            cn("e", text()),
+            // An offset of 0 is the current row, NULL or not.
+            cn("f", text()),
+        ],
+    );
+}
+
+#[test]
+fn null_treatment_is_for_window_functions_only() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("SELECT length(title) IGNORE NULLS FROM posts"),
+        AnalyzeError::WrongObjectType(_),
+        "RESPECT/IGNORE NULLS specified, but length is not a window function"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT sum(views) RESPECT NULLS OVER () FROM posts"),
+        AnalyzeError::WrongObjectType(_),
+        "aggregate functions do not accept RESPECT/IGNORE NULLS"
+    );
+}
+
+#[test]
 fn lead_over_not_null_column_is_nullable() {
     let db = setup();
     let s = db

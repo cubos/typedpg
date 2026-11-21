@@ -234,6 +234,28 @@ fn create_aggregate_registers_function() {
 }
 
 #[test]
+fn create_aggregate_takes_a_support_function() {
+    // PG 19 DefineAggregate: SUPPORT names a `(internal) RETURNS internal`
+    // planner support function.
+    build(&[(
+        "0001.sql",
+        "CREATE FUNCTION sup(internal) RETURNS internal LANGUAGE internal
+             AS 'textlike_support';
+         CREATE AGGREGATE ag(int) (sfunc = int4pl, stype = int, support = sup);",
+    )]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE AGGREGATE ag(int) (sfunc = int4pl, stype = int, support = nosuch);",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("function nosuch(internal) does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn create_aggregate_with_finalfunc_uses_final_return_type() {
     let snap = build(&[(
         "0001.sql",

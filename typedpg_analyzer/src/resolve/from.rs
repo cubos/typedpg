@@ -447,10 +447,6 @@ pub(crate) fn process_from_item(
                                 c.deferred.expr = view_exprs.next().flatten();
                             }
                             match (plan, rc.planned) {
-                                (
-                                    super::deferred::Plan::PulledUp,
-                                    p @ crate::expr::Planned::Folded { .. },
-                                ) => c.deferred.planned = p,
                                 (super::deferred::Plan::Separate, _)
                                 | (_, crate::expr::Planned::AsParsed) => {}
                                 _ => c.planned_unknown = true,
@@ -685,13 +681,7 @@ pub(crate) fn process_from_item(
                             // A pulled-up subquery's output replaces the
                             // reference, as planned; otherwise the
                             // reference stays a Var, collated as parsed.
-                            planned: match (plan, rc.planned) {
-                                (
-                                    super::deferred::Plan::PulledUp,
-                                    p @ crate::expr::Planned::Folded { .. },
-                                ) => p,
-                                _ => crate::expr::Planned::AsParsed,
-                            },
+                            planned: crate::expr::Planned::AsParsed,
                             substitution: match plan {
                                 _ if pulled_up => crate::scope::Substitution::Certain,
                                 super::deferred::Plan::Uncertain => {
@@ -720,14 +710,7 @@ pub(crate) fn process_from_item(
                         typmod: rc.typmod,
                         collation: rc.collation,
                         no_collation: rc.no_collation.is_some(),
-                        planned_unknown: !matches!(
-                            (plan, rc.planned),
-                            (_, crate::expr::Planned::AsParsed)
-                                | (
-                                    super::deferred::Plan::PulledUp,
-                                    crate::expr::Planned::Folded { .. }
-                                )
-                        ),
+                        planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
                         refine: rc.refine.clone(),

@@ -378,6 +378,26 @@ pub(super) fn attach_partition(
             "cannot attach a typed table as partition".into(),
         ));
     }
+    // PostgreSQL 19: a table a publication's EXCEPT clause names stays a
+    // root table.
+    let excluding = crate::ddl::publications::publications_excluding(interp, attach);
+    if !excluding.is_empty() {
+        let names = excluding
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if excluding.len() == 1 {
+            "publication"
+        } else {
+            "publications"
+        };
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot attach table \"{attach_name}\" as partition because it is referenced in \
+             {noun} {names} EXCEPT clause (The publication EXCEPT clause cannot contain tables \
+             that are partitions.)"
+        )));
+    }
     if interp.pg_inherits.iter().any(|i| i.inhrelid == attach) {
         return Err(DdlError::Parse(
             "cannot attach inheritance child as partition".into(),
@@ -496,18 +516,9 @@ pub(super) fn detach_partition(
         ));
     }
     let part = super::super::util::lookup_table(interp, rv)?.1;
-    // DetachAddConstraintIfNeeded: a partition detached concurrently keeps
-    // its partition constraint as a CHECK constraint.
-    let partition_check = if pc.concurrent
-        && interp
-            .pg_inherits
-            .iter()
-            .any(|i| i.inhrelid == part && i.inhparent == parent)
-    {
-        super::partbound::partition_constraint_check(interp, parent, part)
-    } else {
-        None
-    };
+    // PostgreSQL 19 no longer gives a partition detached concurrently its
+    // partition constraint as a CHECK constraint (DetachAddConstraintIfNeeded
+    // is gone).
     remove_inheritance(interp, part, parent, "partition")?;
     // DetachPartitionFinalize runs once the partition has left: the rows
     // its keys get no longer include it as a referenced partition.
@@ -536,63 +547,6 @@ pub(super) fn detach_partition(
             a.atthasdef = false;
         }
     }
-    if let Some((expr, vars)) = partition_check {
-        // The constraint is parsed from SQL built for it.
-        let _barrier = crate::error::DiagContextGuard::barrier();
-        add_detached_partition_check(interp, part, expr, &vars)?;
-    }
-    Ok(())
-}
-
-/// DetachAddConstraintIfNeeded: the partition constraint becomes a CHECK
-/// constraint (named as AddRelationNewConstraints names one: after its one
-/// column, if it reads one), unless the partition already has it.
-fn add_detached_partition_check(
-    interp: &mut PgCatalog,
-    part: PgClassOid,
-    expr: typedpg_pg_query::ast::Node,
-    vars: &[String],
-) -> Result<(), DdlError> {
-    let stored = super::check_inherit::StoredExpr::Written(Box::new(Some(expr)));
-    if interp.pg_constraint.values().any(|c| {
-        c.conrelid == part
-            && c.contype == ConType::Check
-            && interp
-                .check_defs
-                .get(&c.oid)
-                .is_some_and(|d| d.expr == stored)
-    }) {
-        return Ok(());
-    }
-    let addition = match vars {
-        [one] => one.clone(),
-        _ => String::new(),
-    };
-    let name = inherit::choose_constraint_name(interp, part, &addition, "check");
-    let mut conkey: Vec<i16> = vars
-        .iter()
-        .filter_map(|v| interp.attribute_by_name(part, v).map(|a| a.attnum))
-        .collect();
-    conkey.sort_unstable();
-    let oid = PgConstraintOid::from_nonzero(interp.alloc_oid()?);
-    interp.insert_pg_constraint(PgConstraint {
-        oid,
-        conname: name,
-        conrelid: part,
-        contype: ConType::Check,
-        conkey,
-        confrelid: None,
-        confkey: Vec::new(),
-        conislocal: true,
-        coninhcount: 0,
-        conenforced: true,
-        convalidated: true,
-        connoinherit: false,
-        conperiod: false,
-    });
-    let mut def = super::check_inherit::CheckDef::new(stored, false);
-    def.cook(interp, part);
-    interp.check_defs.insert(oid, def);
     Ok(())
 }
 

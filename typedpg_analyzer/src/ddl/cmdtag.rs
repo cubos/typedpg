@@ -178,6 +178,7 @@ const COMMAND_TAGS: &[(&str, bool, bool)] = &[
     ("REFRESH MATERIALIZED VIEW", true, false),
     ("REINDEX", true, false),
     ("RELEASE", false, false),
+    ("REPACK", false, false),
     ("RESET", false, false),
     ("REVOKE", true, false),
     ("REVOKE ROLE", false, false),
@@ -199,6 +200,7 @@ const COMMAND_TAGS: &[(&str, bool, bool)] = &[
     ("UNLISTEN", false, false),
     ("UPDATE", false, false),
     ("VACUUM", false, false),
+    ("WAIT", false, false),
 ];
 
 /// A known command tag, as `(event_trigger_ok, table_rewrite_ok)`:
@@ -411,7 +413,11 @@ pub(crate) fn command_tag(stmt: &ast::Node) -> &'static str {
         N::UnlistenStmt(_) => "UNLISTEN",
         N::LoadStmt(_) => "LOAD",
         N::CallStmt(_) => "CALL",
-        N::ClusterStmt(_) => "CLUSTER",
+        // CreateCommandTag: CLUSTER keeps its tag; REPACK and VACUUM FULL
+        // spelled as REPACK are REPACK.
+        N::RepackStmt(r) if r.command == ast::RepackCommand::Cluster => "CLUSTER",
+        N::RepackStmt(_) => "REPACK",
+        N::WaitStmt(_) => "WAIT",
         N::VacuumStmt(v) if v.is_vacuumcmd => "VACUUM",
         N::VacuumStmt(_) => "ANALYZE",
         N::ExplainStmt(_) => "EXPLAIN",

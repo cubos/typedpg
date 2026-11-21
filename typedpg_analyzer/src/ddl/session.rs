@@ -26,7 +26,7 @@ use super::reloptions::parse_bool;
 use crate::error::AnalyzeError;
 use crate::pg_catalog::PgCatalog;
 
-/// PG 18's predefined roles (`pg_authid` rows every cluster has). Any other
+/// PG 19's predefined roles (`pg_authid` rows every cluster has). Any other
 /// `pg_*` name can't be a role: CREATE ROLE reserves the prefix.
 pub(crate) const PREDEFINED_ROLES: &[&str] = &[
     "pg_checkpoint",
@@ -1155,7 +1155,7 @@ pub(crate) fn explain_options(
 }
 
 /// defGetString of an option value.
-fn string_arg(n: &ast::Node) -> Option<String> {
+pub(crate) fn string_arg(n: &ast::Node) -> Option<String> {
     match n {
         ast::Node::String(s) => Some(s.sval.clone()),
         ast::Node::Integer(i) => Some(i.ival.to_string()),

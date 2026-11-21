@@ -875,6 +875,13 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
             false,
             true,
         )?;
+        crate::ddl::reloptions::note_user_catalog_table(
+            interp,
+            class_oid,
+            &stmt.options,
+            false,
+            false,
+        );
     }
 
     // Type-check CHECK and `GENERATED ... STORED` expressions against the
@@ -1607,6 +1614,19 @@ fn apply_alter_subtype(
         | AlterTableType::AtResetRelOptions
         | AlterTableType::AtReplaceRelOptions => {
             set_reloptions(interp, relid, cmd, subtype)?;
+            if matches!(
+                interp.pg_class.get(&relid).map(|c| c.relkind),
+                Some(RelKind::Table | RelKind::MaterializedView)
+            ) && let Some(ast::Node::List(list)) = cmd.def.as_ref()
+            {
+                crate::ddl::reloptions::note_user_catalog_table(
+                    interp,
+                    relid,
+                    &list.items,
+                    subtype == AlterTableType::AtReplaceRelOptions,
+                    subtype == AlterTableType::AtResetRelOptions,
+                );
+            }
             if interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::View)
                 && let Some(ast::Node::List(list)) = cmd.def.as_ref()
             {
@@ -1780,10 +1800,11 @@ fn set_persistence(
         'u' if !to_logged => return Ok(()),
         _ => {}
     }
-    if !to_logged && crate::ddl::publications::relation_in_publication(interp, relid) {
+    if !to_logged && crate::ddl::publications::relation_has_publication(interp, relid) {
         return Err(DdlError::Parse(format!(
-            "cannot change table \"{relname}\" to unlogged because it is part of a publication \
-             (Unlogged relations cannot be replicated.)"
+            "cannot change table \"{relname}\" to unlogged because it is referenced by a \
+             publication (Unlogged relations cannot be published or excluded via an EXCEPT \
+             clause.)"
         )));
     }
     for con in interp.pg_constraint.values() {
@@ -1959,7 +1980,11 @@ fn check_alter_target(
             ),
             "SET ACCESS METHOD",
         ),
-        At::AtAddInherit => (table_like, "INHERIT"),
+        // PostgreSQL 19: ATT_TABLE | ATT_FOREIGN_TABLE.
+        At::AtAddInherit => (
+            matches!(class.relkind, RelKind::Table | RelKind::ForeignTable),
+            "INHERIT",
+        ),
         At::AtAttachPartition => (
             class.relkind == RelKind::Partitioned || partidx::is_partitioned_index(interp, relid),
             "ATTACH PARTITION",
@@ -1969,7 +1994,10 @@ fn check_alter_target(
             class.relkind == RelKind::Partitioned,
             "DETACH PARTITION ... FINALIZE",
         ),
-        At::AtDropInherit => (table_like, "NO INHERIT"),
+        At::AtDropInherit => (
+            matches!(class.relkind, RelKind::Table | RelKind::ForeignTable),
+            "NO INHERIT",
+        ),
         At::AtDropOf => (
             matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
             "NOT OF",
@@ -2028,18 +2056,13 @@ fn check_alter_target(
             matches!(class.relkind, RelKind::Table | RelKind::Partitioned),
             "ALTER CONSTRAINT",
         ),
+        // PostgreSQL 19: not a partitioned table's (ATT_TABLE | ATT_MATVIEW).
         At::AtClusterOn => (
-            matches!(
-                class.relkind,
-                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
-            ),
+            matches!(class.relkind, RelKind::Table | RelKind::MaterializedView),
             "CLUSTER ON",
         ),
         At::AtDropCluster => (
-            matches!(
-                class.relkind,
-                RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
-            ),
+            matches!(class.relkind, RelKind::Table | RelKind::MaterializedView),
             "SET WITHOUT CLUSTER",
         ),
         At::AtDropOids => (table_like, "SET WITHOUT OIDS"),
@@ -2126,15 +2149,15 @@ mod inherit_cmd;
 mod merge;
 mod object_refs;
 pub(crate) mod toast;
-pub(crate) use object_refs::check_clusterable_index;
+pub(crate) use object_refs::{check_clusterable_index, check_clusterable_index_oid};
 pub(crate) mod partbound;
 pub(crate) mod partidx;
 pub(crate) mod typed;
 
 use columns::*;
 pub(crate) use columns::{column_collation, drop_column, type_collation};
-pub(crate) use constraints::check_unique_covers_partition_key;
 use constraints::*;
+pub(crate) use constraints::{check_unique_covers_partition_key, fold_constraint_attrs};
 
 /// [`columns::alter_type_rewrites`] for the lint crate (see
 /// [`crate::pg_catalog::PgCatalog::column_type_rewrites`]).

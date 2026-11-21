@@ -1,4 +1,4 @@
-//! A port of PostgreSQL 18's `inet` / `cidr` input (network.c
+//! A port of PostgreSQL 19's `inet` / `cidr` input (network.c
 //! `network_in` + `addressOK`, and inet_net_pton.c's
 //! `inet_net_pton_ipv4`, `inet_cidr_pton_ipv4`, `inet_cidr_pton_ipv6`,
 //! `getbits`, `getv4`), used by [`crate::literal_input`].

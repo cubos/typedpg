@@ -559,11 +559,13 @@ fn grant_options_direct(role: RoleId, owner: RoleId, acl: &[AclItem], bits: u32)
 }
 
 /// `select_best_grantor` (acl.c): the role the GRANT / REVOKE is recorded
-/// as made by, and the grant options it holds over it. The owner and a
-/// superuser act as the owner; otherwise the first role in the current
-/// role's inheritable membership chain (the role itself first, closest
-/// ancestors first) that directly holds every requested grant option — or,
-/// failing that, the one holding the most of them.
+/// as made by, and the grant options it holds over it. A `GRANTED BY`
+/// role is used as is, with the grant options it holds directly (all of
+/// them as the owner). Otherwise the owner and a superuser act as the
+/// owner; any other role takes the first role in its inheritable
+/// membership chain (the role itself first, closest ancestors first) that
+/// directly holds every requested grant option — or, failing that, the one
+/// holding the most of them.
 fn select_best_grantor(
     db: &PgCatalog,
     role: RoleId,
@@ -571,6 +573,15 @@ fn select_best_grantor(
     owner: RoleId,
     privileges: u32,
 ) -> (RoleId, u32) {
+    if let Some(grantor) = GRANTED_BY.with(std::cell::Cell::get) {
+        if db.roles.same_real_role(grantor, owner) {
+            return (owner, privileges);
+        }
+        return (
+            grantor,
+            grant_options_direct(grantor, owner, acl, privileges),
+        );
+    }
     if role == owner || db.roles.is_superuser(role) {
         return (owner, privileges);
     }
@@ -1162,17 +1173,6 @@ enum Target {
 }
 
 pub fn grant(interp: &mut PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
-    // ExecuteGrantStmt: `GRANTED BY` is only for SQL compatibility — the
-    // grantor must be the current user.
-    if let Some(spec) = stmt.grantor.as_ref() {
-        let grantor = resolve_role_spec(interp, spec)?;
-        let current = current_role(interp);
-        if !interp.roles.same_real_role(grantor, current) {
-            return Err(DdlError::UnsupportedDdl(
-                "grantor must be current user".into(),
-            ));
-        }
-    }
     let targtype = stmt.targtype;
     let objtype = stmt.objtype;
     // The target objects (objectNamesToOids / objectsInSchemaToOids).
@@ -1209,6 +1209,23 @@ pub fn grant(interp: &mut PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
     check_grant_option(stmt, &grantees)?;
     let behavior = stmt.behavior;
     let current = current_role(interp);
+    // select_best_grantor (PostgreSQL 19): `GRANTED BY` names the grantor,
+    // whose privileges the current user must have; the grant is then made
+    // with exactly the grant options that role holds.
+    let granted_by = match stmt.grantor.as_ref() {
+        Some(spec) if !targets.is_empty() => {
+            let grantor = resolve_role_spec(interp, spec)?;
+            if !interp.roles.has_privs_of_role(current, grantor) {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "must inherit privileges of role \"{}\"",
+                    interp.roles.display_name(grantor)
+                )));
+            }
+            Some(grantor)
+        }
+        _ => None,
+    };
+    let _granted_by = GrantedBy::set(granted_by);
     for target in &targets {
         apply_target_grant(
             interp,
@@ -1221,6 +1238,26 @@ pub fn grant(interp: &mut PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
         )?;
     }
     Ok(())
+}
+
+thread_local! {
+    /// The `GRANTED BY` role of the GRANT / REVOKE being applied.
+    static GRANTED_BY: std::cell::Cell<Option<RoleId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets [`GRANTED_BY`] for the lifetime of the guard.
+struct GrantedBy(Option<RoleId>);
+
+impl GrantedBy {
+    fn set(role: Option<RoleId>) -> Self {
+        GrantedBy(GRANTED_BY.with(|g| g.replace(role)))
+    }
+}
+
+impl Drop for GrantedBy {
+    fn drop(&mut self) {
+        GRANTED_BY.with(|g| g.set(self.0));
+    }
 }
 
 /// getRelationsInNamespace / objectsInSchemaToOids.
@@ -1561,6 +1598,44 @@ fn apply_parameter_grant(
     Ok(())
 }
 
+/// What `aclcheck_error` names an object: its kind and unqualified name
+/// (`table t`, `view v`, `function f`, `schema s`).
+fn object_word_and_name(interp: &PgCatalog, object: AclObject) -> String {
+    match object {
+        AclObject::Relation(relid) => match interp.pg_class.get(&relid) {
+            Some(c) => {
+                let word = match c.relkind {
+                    RelKind::View => "view",
+                    RelKind::MaterializedView => "materialized view",
+                    RelKind::Sequence => "sequence",
+                    RelKind::ForeignTable => "foreign table",
+                    _ => "table",
+                };
+                format!("{word} {}", c.relname)
+            }
+            None => "relation".into(),
+        },
+        AclObject::Function(oid) => match interp.pg_proc.get(&oid) {
+            Some(p) if p.prokind == crate::pg_catalog::ProKind::Procedure => {
+                format!("procedure {}", p.proname)
+            }
+            Some(p) => format!("function {}", p.proname),
+            None => "function".into(),
+        },
+        AclObject::Schema(ns) => {
+            format!("schema {}", interp.namespace_name(ns).unwrap_or_default())
+        }
+        AclObject::Type(t) => match interp.pg_type.get(&t) {
+            Some(ty) => format!("type {}", ty.typname),
+            None => "type".into(),
+        },
+        AclObject::Language(l) => match interp.pg_language.get(&l) {
+            Some(lang) => format!("language {}", lang.lanname),
+            None => "language".into(),
+        },
+    }
+}
+
 /// Apply one GRANT / REVOKE to one target: `ExecGrant_*`.
 fn apply_target_grant(
     interp: &mut PgCatalog,
@@ -1606,6 +1681,20 @@ fn apply_target_grant(
     // privileges the grantor holds no options for are not granted / revoked
     // (`restrict_and_check_grant`).
     let (grantor, available) = select_best_grantor(interp, current, &old_acl, owner, mask);
+    // restrict_and_check_grant: a grantor without any grant option must
+    // at least hold some privilege (or grant option) on the object.
+    let all = object.kind(interp).all_rights();
+    if available == 0
+        && !interp.roles.same_real_role(grantor, owner)
+        && !interp.roles.is_superuser(grantor)
+        && aclmask_privileges(interp, grantor, owner, &old_acl, all) == 0
+        && grant_options_direct(grantor, owner, &old_acl, all) == 0
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "permission denied for {}",
+            object_word_and_name(interp, object)
+        )));
+    }
     let relation_mask = mask & available;
     if relation_mask != 0 {
         let new_acl = merge_acl_with_grant(

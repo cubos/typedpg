@@ -504,12 +504,12 @@ fn a_created_language_depends_on_its_handler_and_holds_its_routines() {
     assert!(db.find_functions(None, "mf").is_empty());
 }
 
-// ── The contrib extensions PostgreSQL 18 ships ──────────────────────────────
+// ── The contrib extensions PostgreSQL 19 ships ──────────────────────────────
 
-/// Every extension the `postgres:18` image ships a control file for
-/// (`/usr/share/postgresql/18/extension/*.control`), but `plpgsql`, which
+/// Every extension the `postgres:19` image ships a control file for
+/// (`/usr/share/postgresql/19/extension/*.control`), but `plpgsql`, which
 /// initdb already installs.
-const PG18_CONTRIB: &[&str] = &[
+const PG19_CONTRIB: &[&str] = &[
     "amcheck",
     "autoinc",
     "bloom",
@@ -536,6 +536,7 @@ const PG18_CONTRIB: &[&str] = &[
     "pg_freespacemap",
     "pg_logicalinspect",
     "pg_prewarm",
+    "pg_stash_advice",
     "pg_stat_statements",
     "pg_surgery",
     "pg_trgm",
@@ -558,10 +559,10 @@ const PG18_CONTRIB: &[&str] = &[
 ];
 
 #[test]
-fn every_pg18_contrib_extension_installs() {
-    // PG 18 installs each of these at its default version (CASCADE brings
+fn every_pg19_contrib_extension_installs() {
+    // PG 19 installs each of these at its default version (CASCADE brings
     // earthdistance's cube); the oracle runs every statement on the server.
-    let failures: Vec<String> = PG18_CONTRIB
+    let failures: Vec<String> = PG19_CONTRIB
         .iter()
         .filter_map(|name| {
             let sql = format!("CREATE EXTENSION \"{name}\" CASCADE;");
@@ -575,8 +576,8 @@ fn every_pg18_contrib_extension_installs() {
 
 #[test]
 fn create_extension_postgres_fdw() {
-    // PG 18's postgres_fdw stops at 1.2; 1.3's script (`ALTER FOREIGN DATA
-    // WRAPPER ... CONNECTION`) is PostgreSQL 19 grammar.
+    // PG 19's postgres_fdw 1.3 gives the wrapper a connection function
+    // (`ALTER FOREIGN DATA WRAPPER ... CONNECTION`).
     let snap = build(&[("0001.sql", "CREATE EXTENSION postgres_fdw;")]);
     assert!(!snap.find_functions(None, "postgres_fdw_handler").is_empty());
     // From the 1.1 -> 1.2 upgrade.
@@ -585,32 +586,28 @@ fn create_extension_postgres_fdw() {
             .find_functions(None, "postgres_fdw_get_connections")
             .is_empty()
     );
+    // From the 1.2 -> 1.3 upgrade.
     assert!(
-        snap.find_functions(None, "postgres_fdw_connection")
+        !snap
+            .find_functions(None, "postgres_fdw_connection")
             .is_empty()
     );
 }
 
 #[test]
-fn postgresql_19_extension_versions_are_not_available() {
-    // Versions only PostgreSQL 19 ships: PG 18 has neither their scripts
-    // nor an update path to them.
+fn versions_without_a_script_or_path_are_not_available() {
+    // PG 19 ships btree_gist 1.9's installation script alone: the update
+    // scripts from 1.2 serve only databases upgraded from an older release,
+    // so no older version can be installed. No release ships postgres_fdw
+    // 1.4 yet.
     for (sql, message) in [
         (
-            "CREATE EXTENSION postgres_fdw VERSION '1.3';",
-            "extension \"postgres_fdw\" has no installation script nor update path for version \"1.3\"",
+            "CREATE EXTENSION btree_gist VERSION '1.8';",
+            "extension \"btree_gist\" has no installation script nor update path for version \"1.8\"",
         ),
         (
-            "CREATE EXTENSION btree_gist VERSION '1.9';",
-            "extension \"btree_gist\" has no installation script nor update path for version \"1.9\"",
-        ),
-        (
-            "CREATE EXTENSION pg_stat_statements VERSION '1.13';",
-            "extension \"pg_stat_statements\" has no installation script nor update path for version \"1.13\"",
-        ),
-        (
-            "CREATE EXTENSION pg_stash_advice;",
-            "extension \"pg_stash_advice\" is not available",
+            "CREATE EXTENSION postgres_fdw VERSION '1.4';",
+            "extension \"postgres_fdw\" has no installation script nor update path for version \"1.4\"",
         ),
     ] {
         let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
@@ -619,26 +616,22 @@ fn postgresql_19_extension_versions_are_not_available() {
 }
 
 #[test]
-fn btree_gist_installs_through_its_upgrade_chain() {
-    // PG 18 installs btree_gist 1.2 and upgrades it to 1.8; an older
-    // version stops before the later scripts' objects.
+fn btree_gist_installs_its_latest_version() {
+    // PG 19 installs btree_gist 1.9 from its own script, with what the
+    // former upgrades added (1.7's gbt_bool_union, 1.8's sortsupport).
     let snap = build(&[("0001.sql", "CREATE EXTENSION btree_gist;")]);
-    // From the 1.6 -> 1.7 upgrade.
     assert!(!snap.find_functions(None, "gbt_bool_union").is_empty());
-    // From the 1.7 -> 1.8 upgrade.
     assert!(!snap.find_functions(None, "gbt_bool_sortsupport").is_empty());
-    let snap = build(&[("0001.sql", "CREATE EXTENSION btree_gist VERSION '1.6';")]);
-    assert!(snap.find_functions(None, "gbt_bool_union").is_empty());
 }
 
 // ── The extension lifecycle: DROP, upgrades, SET SCHEMA ─────────────────────
 
 #[test]
-fn every_pg18_contrib_extension_drops_with_all_its_members() {
+fn every_pg19_contrib_extension_drops_with_all_its_members() {
     // DROP EXTENSION takes every member along — access methods, foreign-data
     // wrappers, text search templates included — so creating it again
     // succeeds.
-    let failures: Vec<String> = PG18_CONTRIB
+    let failures: Vec<String> = PG19_CONTRIB
         .iter()
         .filter_map(|name| {
             let create = format!("CREATE EXTENSION \"{name}\" CASCADE;");
@@ -655,13 +648,12 @@ fn every_pg18_contrib_extension_drops_with_all_its_members() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Every version of the PG 18 contrib extensions but the default one that
+/// Every version of the PG 19 contrib extensions but the default one that
 /// `CREATE EXTENSION ... VERSION` can install (one with an installation
 /// script, or reached from one).
-const PG18_OLDER_VERSIONS: &[(&str, &[&str])] = &[
+const PG19_OLDER_VERSIONS: &[(&str, &[&str])] = &[
     ("amcheck", &["1.0", "1.1", "1.2", "1.3", "1.4"]),
-    ("btree_gin", &["1.0", "1.1", "1.2"]),
-    ("btree_gist", &["1.2", "1.3", "1.4", "1.5", "1.6", "1.7"]),
+    ("btree_gin", &["1.0", "1.1", "1.2", "1.3"]),
     ("citext", &["1.4", "1.5", "1.6", "1.7"]),
     ("cube", &["1.2", "1.3", "1.4"]),
     ("earthdistance", &["1.1"]),
@@ -675,19 +667,21 @@ const PG18_OLDER_VERSIONS: &[(&str, &[&str])] = &[
         "pageinspect",
         &["1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12"],
     ),
-    ("pg_buffercache", &["1.2", "1.3", "1.4", "1.5"]),
+    ("pg_buffercache", &["1.2", "1.3", "1.4", "1.5", "1.6"]),
     ("pg_freespacemap", &["1.1", "1.2"]),
     ("pg_prewarm", &["1.1"]),
     (
         "pg_stat_statements",
-        &["1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11"],
+        &[
+            "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12",
+        ],
     ),
     ("pg_trgm", &["1.3", "1.4", "1.5"]),
     ("pg_visibility", &["1.1"]),
     ("pg_walinspect", &["1.0"]),
     ("pgcrypto", &["1.3"]),
     ("pgstattuple", &["1.4"]),
-    ("postgres_fdw", &["1.0", "1.1"]),
+    ("postgres_fdw", &["1.0", "1.1", "1.2"]),
     ("seg", &["1.1", "1.2", "1.3"]),
     ("xml2", &["1.1"]),
 ];
@@ -697,7 +691,7 @@ fn every_upgrade_chain_updates_to_the_default_version() {
     // An upgrade script may drop the extension's own members (cube 1.2 ->
     // 1.3 drops g_cube_compress(internal)): PG lets the extension being
     // altered drop them.
-    let failures: Vec<String> = PG18_OLDER_VERSIONS
+    let failures: Vec<String> = PG19_OLDER_VERSIONS
         .iter()
         .flat_map(|(name, versions)| versions.iter().map(move |v| (*name, *v)))
         .filter_map(|(name, version)| {

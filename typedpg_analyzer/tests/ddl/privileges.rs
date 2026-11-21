@@ -1089,6 +1089,14 @@ fn role_ddl_errors_match_postgres() {
         ("CREATE ROLE public;", "role name \"public\" is reserved"),
         ("CREATE ROLE none;", "role name \"none\" is reserved"),
         (
+            "CREATE ROLE \"a\nb\";",
+            "role name \"a\nb\" contains a newline or carriage return character",
+        ),
+        (
+            "CREATE ROLE acl_err_crlf; ALTER ROLE acl_err_crlf RENAME TO \"x\ry\";",
+            "role name \"x\ry\" contains a newline or carriage return character",
+        ),
+        (
             "DROP ROLE pg_acl_err_missing;",
             "role \"pg_acl_err_missing\" does not exist",
         ),
@@ -2428,7 +2436,35 @@ fn do_block_create_role_if_not_exists_creates_the_role() {
 }
 
 #[test]
-fn object_grants_require_the_grantor_to_be_the_current_user() {
+fn object_grants_are_made_by_the_granted_by_role() {
+    // PostgreSQL 19: GRANTED BY names the grantor, whose privileges the
+    // current user must have, and the grant is made with exactly the grant
+    // options that role holds: none at all is `permission denied`, some
+    // but not those asked for grants nothing (a WARNING).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl_gb_a;
+         CREATE ROLE acl_gb_b;
+         CREATE ROLE acl_gb_c;
+         CREATE TABLE acl_gb_t (id int);
+         GRANT SELECT ON acl_gb_t TO acl_gb_b WITH GRANT OPTION;
+         GRANT SELECT ON acl_gb_t TO acl_gb_c GRANTED BY acl_gb_b;
+         GRANT INSERT ON acl_gb_t TO acl_gb_c GRANTED BY acl_gb_b;",
+    )]);
+    assert!(table_has(
+        &db,
+        "acl_gb_c",
+        "public",
+        "acl_gb_t",
+        Privilege::Select
+    ));
+    assert!(!table_has(
+        &db,
+        "acl_gb_c",
+        "public",
+        "acl_gb_t",
+        Privilege::Insert
+    ));
     let result = try_apply(&[(
         "0001.sql",
         "CREATE ROLE acl_grantby_other;
@@ -2439,9 +2475,23 @@ fn object_grants_require_the_grantor_to_be_the_current_user() {
     assert_err_prefix!(
         result,
         DdlError::UnsupportedDdl(_),
-        "grantor must be current user"
+        "permission denied for table acl_grantby_t"
     );
-    // `GRANTED BY` the current user is accepted.
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_gb2_a;
+         CREATE ROLE acl_gb2_b;
+         CREATE TABLE acl_gb2_t (id int);
+         GRANT SELECT ON acl_gb2_t TO acl_gb2_b WITH GRANT OPTION;
+         SET ROLE acl_gb2_a;
+         GRANT SELECT ON acl_gb2_t TO acl_gb2_a GRANTED BY acl_gb2_b;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::UnsupportedDdl(_),
+        "must inherit privileges of role \"acl_gb2_b\""
+    );
+    // `GRANTED BY` the current user (the owner) is accepted.
     let db = build_db(&[(
         "0001.sql",
         "CREATE ROLE acl_grantby_app;

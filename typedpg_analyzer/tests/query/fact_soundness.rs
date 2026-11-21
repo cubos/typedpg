@@ -300,8 +300,9 @@ fn a_renamed_column_keeps_its_constraints_and_generation() {
     assert_nullable(&db, "SELECT c, v FROM g", &[("c", true), ("v", true)]);
     assert_nullable(&db, "SELECT c FROM g2", &[("c", false)]);
     assert_nullable(&db, "SELECT a, x FROM p1", &[("a", true), ("x", false)]);
-    // The detached partition's CHECK is over the key column's new name.
-    assert_nullable(&db, "SELECT a, x FROM pc1", &[("a", true), ("x", false)]);
+    // PostgreSQL 19 gives a partition detached concurrently no CHECK of
+    // its partition constraint: nothing keeps its key column non-NULL.
+    assert_nullable(&db, "SELECT a, x FROM pc1", &[("a", true), ("x", true)]);
 }
 
 #[test]

@@ -1,11 +1,11 @@
 //! Maintenance and utility statements that don't change the schema the
-//! analyzer reads — TRUNCATE, CLUSTER, REINDEX, VACUUM / ANALYZE, LOCK,
+//! analyzer reads — TRUNCATE, REPACK / CLUSTER, REINDEX, VACUUM / ANALYZE, LOCK,
 //! SECURITY LABEL, ALTER DEFAULT PRIVILEGES — but that PG runs against
 //! named objects which must exist and suit the command.
 
 use typedpg_pg_query::ast::{
-    self, ClusterStmt, DropBehavior, LockStmt, ReindexObjectType, ReindexStmt, SecLabelStmt,
-    TruncateStmt, VacuumStmt,
+    self, DropBehavior, LockStmt, ReindexObjectType, ReindexStmt, RepackCommand, RepackStmt,
+    SecLabelStmt, TruncateStmt, VacuumStmt,
 };
 
 use super::DdlError;
@@ -112,7 +112,7 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
     Ok(())
 }
 
-/// CLUSTER / VACUUM FULL of `relid`: its heap is rewritten (make_new_heap),
+/// REPACK / CLUSTER / VACUUM FULL of `relid`: its heap is rewritten (make_new_heap),
 /// its indexes rebuilt with it and its TOAST table made anew — for a
 /// partitioned table, its leaf partitions'; with `inheritors` (VACUUM),
 /// its inheritance children's too. cluster_rel / vacuum_rel skip a
@@ -164,50 +164,323 @@ fn maintained_table(
     Ok(relid)
 }
 
-/// CLUSTER table [USING index]: the index must be clusterable; without
-/// one, the table must have been clustered before.
-pub fn cluster(interp: &mut PgCatalog, stmt: &ClusterStmt) -> Result<(), DdlError> {
-    let Some(rv) = stmt.relation.as_ref() else {
-        // Bare CLUSTER (get_tables_to_cluster): every table with an index
-        // marked clustered is clustered again.
-        let tables: Vec<PgClassOid> = interp.clustered_indexes.keys().copied().collect();
-        for table in tables {
-            heap_rewrites(interp, table, false);
-        }
-        return Ok(());
-    };
-    let relid = maintained_table(interp, rv)?;
-    if stmt.indexname.is_empty() {
-        if !interp.clustered_indexes.contains_key(&relid) {
-            return Err(DdlError::TypeNotFound(format!(
-                "there is no previously clustered index for table \"{}\"",
-                rv.relname
-            )));
-        }
-        heap_rewrites(interp, relid, false);
-        return Ok(());
+/// RepackCommandAsString.
+fn repack_command_name(command: RepackCommand) -> &'static str {
+    match command {
+        RepackCommand::Repack => "REPACK",
+        RepackCommand::Vacuumfull => "VACUUM",
+        RepackCommand::Cluster => "CLUSTER",
     }
-    // cluster_rel refuses a shared catalog once the index is found by name
-    // (get_relname_relid, in the table's schema), before checking it.
-    let named_index_exists = interp.pg_class.get(&relid).is_some_and(|c| {
-        interp
-            .class_by_qname
-            .contains_key(&(c.relnamespace, stmt.indexname.clone()))
-    });
-    if named_index_exists && interp.is_shared_relation(relid) {
+}
+
+/// REPACK and CLUSTER (ExecRepack, PostgreSQL 19): rewrite a table, in the
+/// order of an index when one is named (or, with USING INDEX alone, the one
+/// marked clustered), a partitioned table's leaf partitions, or — without a
+/// table — every table (with USING INDEX or CLUSTER, those with a clustered
+/// index).
+pub fn repack(interp: &mut PgCatalog, stmt: &RepackStmt) -> Result<(), DdlError> {
+    use super::session::def_get_boolean;
+    let command = repack_command_name(stmt.command);
+    let (mut analyze, mut concurrently) = (false, false);
+    for opt in &stmt.params {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        match de.defname.as_str() {
+            "verbose" => {
+                def_get_boolean(de)?;
+            }
+            "analyze" | "analyse" | "concurrently" if stmt.command != RepackCommand::Repack => {
+                let option = if de.defname == "concurrently" {
+                    "CONCURRENTLY"
+                } else {
+                    "ANALYZE"
+                };
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "{option} option not supported for {command}"
+                )));
+            }
+            "analyze" | "analyse" => analyze = def_get_boolean(de)?,
+            "concurrently" => concurrently = def_get_boolean(de)?,
+            name => {
+                return Err(DdlError::Parse(format!(
+                    "unrecognized {command} option \"{name}\""
+                )));
+            }
+        }
+    }
+    if concurrently {
+        prevent_in_transaction_block(interp, "REPACK (CONCURRENTLY)")?;
+    } else if analyze {
+        prevent_in_transaction_block(interp, "REPACK (ANALYZE)")?;
+    }
+    let mut partitioned = None;
+    if let Some(vr) = stmt.relation.as_ref() {
+        let Some(rv) = vr.relation.as_ref() else {
+            return Ok(());
+        };
+        // process_single_relation.
+        if !analyze && !vr.va_cols.is_empty() {
+            return Err(DdlError::UnsupportedDdl(
+                "ANALYZE option must be specified when a column list is provided".into(),
+            ));
+        }
+        let relid = maintained_table(interp, rv)?;
+        if relkind(interp, relid) == Some(RelKind::Partitioned) {
+            partitioned = Some((relid, rv.relname.clone()));
+        } else {
+            let index = clustered_index(interp, relid, stmt)?;
+            if let Some(index) = index {
+                super::tables::check_clusterable_index_oid(interp, relid, index)?;
+            }
+            repack_rel(interp, stmt.command, relid, index, concurrently)?;
+            if analyze {
+                for col in vr
+                    .va_cols
+                    .iter()
+                    .filter_map(|n| super::util::node_string(n.as_ref()))
+                {
+                    if interp.attribute_by_name(relid, col).is_none() {
+                        return Err(DdlError::Parse(format!(
+                            "column \"{col}\" of relation \"{}\" does not exist",
+                            rv.relname
+                        )));
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+    // Several tables.
+    if analyze {
         return Err(DdlError::UnsupportedDdl(
-            "cannot cluster a shared catalog".into(),
+            "cannot execute REPACK (ANALYZE) on multiple tables".into(),
         ));
     }
-    let index = super::tables::check_clusterable_index(interp, relid, &stmt.indexname)?;
-    // cluster(): a partitioned table's partitions are clustered each in a
-    // transaction of its own.
-    if relkind(interp, relid) == Some(RelKind::Partitioned) {
-        prevent_in_transaction_block(interp, "CLUSTER")?;
+    if concurrently {
+        return Err(DdlError::UnsupportedDdl(if partitioned.is_some() {
+            "REPACK (CONCURRENTLY) is not supported for partitioned tables (Consider running the \
+             command on individual partitions.)"
+                .into()
+        } else {
+            "REPACK (CONCURRENTLY) requires an explicit table name".into()
+        }));
     }
-    interp.clustered_indexes.insert(relid, index);
+    prevent_in_transaction_block(interp, command)?;
+    let targets: Vec<(PgClassOid, Option<PgClassOid>)> = match partitioned {
+        // get_tables_to_repack.
+        None if stmt.usingindex => interp
+            .clustered_indexes
+            .iter()
+            .map(|(&table, &index)| (table, Some(index)))
+            .collect(),
+        None => interp
+            .pg_class
+            .values()
+            .filter(|c| matches!(c.relkind, RelKind::Table | RelKind::MaterializedView))
+            .map(|c| (c.oid, None))
+            .collect(),
+        // get_tables_to_repack_partitioned: the leaf partitions, with the
+        // leaf indexes of the partitioned index named.
+        Some((relid, relname)) if stmt.usingindex => {
+            if stmt.indexname.is_empty() {
+                return Err(DdlError::Parse(if stmt.command == RepackCommand::Cluster {
+                    format!("there is no previously clustered index for table \"{relname}\"")
+                } else {
+                    format!(
+                        "cannot execute {command} on partitioned table \"{relname}\" USING \
+                         INDEX with no index name"
+                    )
+                }));
+            }
+            let index = super::tables::check_clusterable_index(interp, relid, &stmt.indexname)?;
+            super::indexes::all_index_inheritors(interp, index)
+                .into_iter()
+                .filter(|&i| relkind(interp, i) == Some(RelKind::Index))
+                .filter_map(|i| interp.pg_index.get(&i).map(|ix| (ix.indrelid, Some(i))))
+                .collect()
+        }
+        Some((relid, _)) => super::tables::inherit::all_inheritors(interp, relid)
+            .into_iter()
+            .filter(|&t| relkind(interp, t) == Some(RelKind::Table))
+            .map(|t| (t, None))
+            .collect(),
+    };
+    for (table, index) in targets {
+        // cluster_rel_recheck, then cluster_rel.
+        if matches!(
+            relkind(interp, table),
+            Some(RelKind::Table | RelKind::MaterializedView)
+        ) {
+            repack_rel(interp, stmt.command, table, index, false)?;
+        }
+    }
+    Ok(())
+}
+
+/// determine_clustered_index: the index named, or with USING INDEX alone
+/// the one marked clustered.
+fn clustered_index(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    stmt: &RepackStmt,
+) -> Result<Option<PgClassOid>, DdlError> {
+    if !stmt.indexname.is_empty() {
+        let nsoid = interp.pg_class.get(&relid).map(|c| c.relnamespace);
+        let found = nsoid.and_then(|ns| {
+            interp
+                .class_by_qname
+                .get(&(ns, stmt.indexname.clone()))
+                .copied()
+        });
+        return match found {
+            Some(index) => Ok(Some(index)),
+            None => Err(DdlError::TypeNotFound(format!(
+                "index \"{}\" for table \"{}\" does not exist",
+                stmt.indexname,
+                relname(interp, relid)
+            ))),
+        };
+    }
+    if !stmt.usingindex {
+        return Ok(None);
+    }
+    match interp.clustered_indexes.get(&relid) {
+        Some(&index) => Ok(Some(index)),
+        None => Err(DdlError::TypeNotFound(format!(
+            "there is no previously clustered index for table \"{}\"",
+            relname(interp, relid)
+        ))),
+    }
+}
+
+/// cluster_rel: rewrite `relid` (in the order of `index`, which it marks
+/// clustered).
+fn repack_rel(
+    interp: &mut PgCatalog,
+    command: RepackCommand,
+    relid: PgClassOid,
+    index: Option<PgClassOid>,
+    concurrently: bool,
+) -> Result<(), DdlError> {
+    let name = repack_command_name(command);
+    if concurrently {
+        check_concurrent_repack(interp, relid)?;
+    }
+    // check_index_requirements: REPACK refuses a table with an invalid
+    // index.
+    if command == RepackCommand::Repack {
+        let mut invalid: Vec<PgClassOid> = interp
+            .pg_index
+            .values()
+            .filter(|i| i.indrelid == relid && interp.invalid_indexes.contains(&i.indexrelid))
+            .map(|i| i.indexrelid)
+            .collect();
+        invalid.sort();
+        if !invalid.is_empty() {
+            let names: Vec<String> = invalid
+                .iter()
+                .map(|&i| format!("\"{}\"", relname(interp, i)))
+                .collect();
+            let detail = if names.len() == 1 {
+                "An invalid index cannot be processed correctly"
+            } else {
+                "Some invalid indexes cannot be processed correctly"
+            };
+            return Err(DdlError::Parse(format!(
+                "cannot execute {name} on relation \"{}\" ({detail}: {}.)",
+                relname(interp, relid),
+                names.join(", ")
+            )));
+        }
+    }
+    if index.is_some() && interp.is_shared_relation(relid) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot execute {} on a shared catalog (Marking an index as clustered on a shared \
+             catalog would only take effect in the current database.)",
+            if command == RepackCommand::Repack {
+                "REPACK ... USING INDEX"
+            } else {
+                "CLUSTER"
+            }
+        )));
+    }
+    if let Some(index) = index {
+        // REPACK may follow a system catalog's index only if it is the one
+        // already clustered (CLUSTER historically may).
+        if command != RepackCommand::Cluster
+            && !interp.allow_system_table_mods.get()
+            && relid.get() < FIRST_UNPINNED_OBJECT_ID
+            && interp.clustered_indexes.get(&relid) != Some(&index)
+        {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "permission denied: \"{}\" is a system catalog",
+                relname(interp, relid)
+            )));
+        }
+    }
+    if interp.unpopulated_matviews.contains(&relid) {
+        return Ok(());
+    }
+    if let Some(index) = index {
+        // rebuild_relation: mark_index_clustered.
+        interp.clustered_indexes.insert(relid, index);
+    }
     heap_rewrites(interp, relid, false);
     Ok(())
+}
+
+/// check_concurrent_repack_requirements (with the default `wal_level`,
+/// `replica`, and every table on heap).
+fn check_concurrent_repack(interp: &mut PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+    let name = relname(interp, relid);
+    let refuse = |detail: &str| {
+        Err(DdlError::UnsupportedDdl(format!(
+            "cannot execute REPACK (CONCURRENTLY) on relation \"{name}\" ({detail})"
+        )))
+    };
+    if relid.get() < FIRST_UNPINNED_OBJECT_ID {
+        return refuse("This operation is not supported for system catalogs.");
+    }
+    if interp.user_catalog_tables.contains(&relid) {
+        return refuse("This operation is not supported for user catalog tables.");
+    }
+    super::tables::toast::note_toast_tables(interp);
+    if relkind(interp, relid) == Some(RelKind::ToastTable) {
+        return refuse("This operation is not supported for TOAST tables.");
+    }
+    if interp.relpersistence.contains_key(&relid) {
+        return refuse("This operation is only supported for permanent relations.");
+    }
+    if relkind(interp, relid) == Some(RelKind::MaterializedView) {
+        return refuse("This operation is not supported for materialized views.");
+    }
+    match interp.replica_identity_kinds.get(&relid) {
+        Some('n') => {
+            return refuse("This operation does not support tables with REPLICA IDENTITY NOTHING.");
+        }
+        Some('f') => {
+            return refuse("This operation does not support tables with REPLICA IDENTITY FULL.");
+        }
+        _ => {}
+    }
+    // RelationGetReplicaIndex: the REPLICA IDENTITY USING INDEX one, or the
+    // primary key unless it is deferrable.
+    if interp.replica_identity_indexes.contains_key(&relid) {
+        return Ok(());
+    }
+    let pkey = interp
+        .pg_index
+        .values()
+        .find(|i| i.indisprimary && i.indrelid == relid)
+        .map(|i| i.indexrelid);
+    match pkey {
+        Some(index) if interp.nonimmediate_indexes.contains(&index) => {
+            refuse("This operation does not support deferrable primary keys.")
+        }
+        Some(_) => Ok(()),
+        None => refuse(&format!("Relation \"{name}\" has no identity index.")),
+    }
 }
 
 /// PreventInTransactionBlock: `what` can't run inside a transaction block.
@@ -494,19 +767,14 @@ fn vacuum_options(stmt: &VacuumStmt) -> Result<bool, DdlError> {
                 vacopt_from_boolean(de)?;
                 truncate = true;
             }
+            // defGetInt32 (PostgreSQL 19): an integer literal only.
             "parallel" => {
-                let Some(value) = string(de) else {
-                    return Err(DdlError::Parse(
-                        "parallel option requires a value between 0 and 1024".into(),
-                    ));
-                };
-                let Ok(n) = value.parse::<i64>() else {
+                let Some(ast::Node::Integer(i)) = de.arg.as_ref() else {
                     return syntax("parallel requires an integer value".into());
                 };
+                let n = i64::from(i.ival);
                 if !(0..=1024).contains(&n) {
-                    return Err(DdlError::Parse(
-                        "parallel workers for vacuum must be between 0 and 1024".into(),
-                    ));
+                    return syntax("PARALLEL option must be between 0 and 1024".into());
                 }
                 nworkers = n;
             }
@@ -655,7 +923,15 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
         "on_error",
         "reject_limit",
         "log_verbosity",
+        "force_array",
     ];
+    // The options ProcessCopyOptions (PostgreSQL 19) checks against the
+    // format: JSON (COPY TO only, which FORCE_ARRAY needs) and BINARY take
+    // no DELIMITER, NULL, DEFAULT or HEADER; HEADER is a Boolean, "match"
+    // or a line count (one at most for COPY TO).
+    let mut format = "text".to_owned();
+    let (mut delimiter, mut null, mut default, mut header, mut force_array) =
+        (false, false, false, false, false);
     for opt in &stmt.options {
         let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
@@ -668,16 +944,48 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
         }
         if de.defname == "format"
             && let Some(ast::Node::String(s)) = de.arg.as_ref()
-            && !matches!(
-                s.sval.to_ascii_lowercase().as_str(),
-                "text" | "csv" | "binary"
-            )
         {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "COPY format \"{}\" not recognized",
-                s.sval
-            )));
+            if !matches!(s.sval.as_str(), "text" | "csv" | "binary" | "json") {
+                return Err(DdlError::UnsupportedDdl(format!(
+                    "COPY format \"{}\" not recognized",
+                    s.sval
+                )));
+            }
+            format.clone_from(&s.sval);
         }
+        match de.defname.as_str() {
+            "delimiter" => delimiter = true,
+            "null" => null = true,
+            "default" => default = true,
+            "force_array" => force_array = super::session::def_get_boolean(de)?,
+            "header" => header = copy_header(de, stmt.is_from)?,
+            _ => {}
+        }
+    }
+    if matches!(format.as_str(), "binary" | "json") {
+        let mode = format.to_ascii_uppercase();
+        for (given, option) in [
+            (delimiter, "DELIMITER"),
+            (null, "NULL"),
+            (default, "DEFAULT"),
+            (header, "HEADER"),
+        ] {
+            if given {
+                return Err(DdlError::Parse(format!(
+                    "cannot specify {option} in {mode} mode"
+                )));
+            }
+        }
+    }
+    if format == "json" && stmt.is_from {
+        return Err(DdlError::Parse(
+            "COPY FORMAT JSON is not supported for COPY FROM".into(),
+        ));
+    }
+    if format != "json" && force_array {
+        return Err(DdlError::Parse(
+            "COPY FORCE_ARRAY can only be used with JSON mode".into(),
+        ));
     }
     // `COPY (query) TO` runs the query.
     if let Some(query) = stmt.query.as_ref() {
@@ -714,10 +1022,6 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
                 " (Try the COPY (SELECT ...) TO variant.)",
             )),
             Some(RelKind::Sequence) => Some(("cannot copy from sequence", "")),
-            Some(RelKind::Partitioned) => Some((
-                "cannot copy from partitioned table",
-                " (Try the COPY (SELECT ...) TO variant.)",
-            )),
             Some(RelKind::ForeignTable) => Some((
                 "cannot copy from foreign table",
                 " (Try the COPY (SELECT ...) TO variant.)",
@@ -727,6 +1031,45 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
     };
     if let Some((msg, hint)) = refused {
         return Err(DdlError::Parse(format!("{msg} \"{}\"{hint}", rv.relname)));
+    }
+    // BeginCopyTo (PostgreSQL 19): a partitioned table is copied from its
+    // partitions, none of which may be a foreign table.
+    if !stmt.is_from && kind == Some(RelKind::Partitioned) {
+        let mut parts = super::tables::inherit::all_inheritors(interp, relid);
+        parts.sort();
+        if let Some(foreign) = parts
+            .into_iter()
+            .find(|&p| relkind(interp, p) == Some(RelKind::ForeignTable))
+        {
+            let name = relname(interp, foreign);
+            return Err(DdlError::Parse(format!(
+                "cannot copy from foreign table \"{name}\" (Partition \"{name}\" is a foreign table \
+                 in partitioned table \"{}\". Try the COPY (SELECT ...) TO variant.)",
+                rv.relname
+            )));
+        }
+    }
+    // DoCopy: COPY FROM's WHERE reads no system column.
+    if stmt.is_from
+        && let Some(w) = stmt.where_clause.as_ref()
+    {
+        for (n, _) in w.nodes() {
+            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
+                && let Some(col) = cr
+                    .fields
+                    .last()
+                    .and_then(|f| super::util::node_string(f.as_ref()))
+                && interp.attribute_by_name(relid, col).is_none()
+                && crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .any(|(s, ..)| *s == col)
+            {
+                return Err(DdlError::Parse(format!(
+                    "system columns are not supported in COPY FROM WHERE conditions (Column \
+                     \"{col}\" is a system column.)"
+                )));
+            }
+        }
     }
     let mut seen: Vec<&str> = Vec::new();
     for col in stmt
@@ -758,4 +1101,183 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
         seen.push(col);
     }
     Ok(())
+}
+
+/// A utility option's value as defGetString renders it.
+fn def_string(de: &typedpg_pg_query::ast::DefElem) -> Option<String> {
+    match de.arg.as_ref()? {
+        ast::Node::String(s) => Some(s.sval.clone()),
+        ast::Node::Integer(i) => Some(i.ival.to_string()),
+        ast::Node::Float(f) => Some(f.fval.clone()),
+        ast::Node::Boolean(b) => Some(if b.boolval { "true" } else { "false" }.into()),
+        _ => None,
+    }
+}
+
+/// CHECKPOINT [( options )] (ExecCheckpoint, PostgreSQL 19): MODE FAST or
+/// SPREAD and FLUSH_UNLOGGED, then the privileges of `pg_checkpoint`.
+pub fn checkpoint(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::ast::CheckPointStmt,
+) -> Result<(), DdlError> {
+    for opt in &stmt.options {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        match de.defname.as_str() {
+            "mode" => {
+                let Some(mode) = def_string(de) else {
+                    return Err(DdlError::Parse("mode requires a parameter".into()));
+                };
+                if mode != "fast" && mode != "spread" {
+                    return Err(DdlError::Parse(format!(
+                        "unrecognized value for CHECKPOINT option \"mode\": \"{mode}\""
+                    )));
+                }
+            }
+            "flush_unlogged" => {
+                super::session::def_get_boolean(de)?;
+            }
+            name => {
+                return Err(DdlError::Parse(format!(
+                    "unrecognized CHECKPOINT option \"{name}\""
+                )));
+            }
+        }
+    }
+    let current = super::roles::current_role(interp);
+    let allowed = interp
+        .roles
+        .id("pg_checkpoint")
+        .is_none_or(|role| interp.roles.has_privs_of_role(current, role));
+    if !allowed && !interp.roles.is_superuser(current) {
+        return Err(DdlError::UnsupportedDdl(
+            "permission denied to execute CHECKPOINT command (Only roles with privileges of \
+             the \"pg_checkpoint\" role may execute this command.)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// WAIT FOR LSN 'lsn' [WITH ( options )] (ExecWaitStmt, PostgreSQL 19), as
+/// a migration runs it — on a primary: the LSN and the options are checked;
+/// a standby mode (the default) finds no recovery in progress, which is an
+/// error unless NO_THROW; PRIMARY_FLUSH waits for the WAL to be flushed.
+pub fn wait_for_lsn(stmt: &typedpg_pg_query::ast::WaitStmt) -> Result<(), DdlError> {
+    crate::literal_input::validate_pg_lsn(&stmt.lsn_literal).map_err(DdlError::Parse)?;
+    let conflicting = || DdlError::Parse("conflicting or redundant options".into());
+    let (mut mode, mut timeout, mut no_throw) = (None::<String>, false, None::<bool>);
+    for opt in &stmt.options {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        match de.defname.as_str() {
+            "mode" => {
+                if mode.is_some() {
+                    return Err(conflicting());
+                }
+                let Some(value) = def_string(de) else {
+                    return Err(DdlError::Parse("mode requires a parameter".into()));
+                };
+                let lowered = value.to_ascii_lowercase();
+                if !matches!(
+                    lowered.as_str(),
+                    "standby_replay" | "standby_write" | "standby_flush" | "primary_flush"
+                ) {
+                    return Err(DdlError::Parse(format!(
+                        "unrecognized value for WAIT option \"mode\": \"{value}\""
+                    )));
+                }
+                mode = Some(lowered);
+            }
+            "timeout" => {
+                if timeout {
+                    return Err(conflicting());
+                }
+                timeout = true;
+                let Some(value) = def_string(de) else {
+                    return Err(DdlError::Parse("timeout requires a parameter".into()));
+                };
+                let Some(ms) = super::guc::parse_with_unit(&value, "ms") else {
+                    return Err(DdlError::Parse(format!(
+                        "invalid timeout value: \"{value}\""
+                    )));
+                };
+                if ms.round() > f64::from(i32::MAX) || ms.round() < f64::from(i32::MIN) {
+                    return Err(DdlError::Parse(format!(
+                        "invalid timeout value: \"{value}\""
+                    )));
+                }
+                if ms.round() < 0.0 {
+                    return Err(DdlError::Parse("timeout cannot be negative".into()));
+                }
+            }
+            "no_throw" => {
+                if no_throw.is_some() {
+                    return Err(conflicting());
+                }
+                no_throw = Some(super::session::def_get_boolean(de)?);
+            }
+            name => {
+                return Err(DdlError::Parse(format!("option \"{name}\" not recognized")));
+            }
+        }
+    }
+    if mode.as_deref() != Some("primary_flush") && no_throw != Some(true) {
+        return Err(DdlError::UnsupportedDdl(
+            "recovery is not in progress".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// defGetCopyHeaderOption (PostgreSQL 19): whether COPY's HEADER option is
+/// on — a Boolean, "match" (COPY FROM only), or a number of lines to skip
+/// (zero or more; one at most for COPY TO).
+fn copy_header(de: &typedpg_pg_query::ast::DefElem, is_from: bool) -> Result<bool, DdlError> {
+    let lines: i64 = match de.arg.as_ref() {
+        None => 1,
+        Some(ast::Node::Integer(i)) => i64::from(i.ival),
+        Some(ast::Node::Boolean(b)) => i64::from(b.boolval),
+        Some(other) => {
+            let Some(s) = super::session::string_arg(other) else {
+                return Ok(true);
+            };
+            let s = s.as_str();
+            if let Some(v) = super::reloptions::parse_bool(s) {
+                i64::from(v)
+            } else if s.eq_ignore_ascii_case("match") {
+                if !is_from {
+                    return Err(DdlError::Parse(
+                        "cannot use \"match\" with HEADER in COPY TO".into(),
+                    ));
+                }
+                return Ok(true);
+            } else {
+                match s.trim().parse::<i32>() {
+                    Ok(n) => i64::from(n),
+                    Err(_) => {
+                        return Err(DdlError::Parse(format!(
+                            "{} requires a Boolean value, an integer value greater than or \
+                             equal to zero, or the string \"match\"",
+                            de.defname
+                        )));
+                    }
+                }
+            }
+        }
+    };
+    if lines < 0 {
+        return Err(DdlError::Parse(format!(
+            "a negative integer value cannot be specified for {}",
+            de.defname
+        )));
+    }
+    if !is_from && lines > 1 {
+        return Err(DdlError::UnsupportedDdl(
+            "cannot use multi-line header in COPY TO".into(),
+        ));
+    }
+    Ok(lines != 0)
 }

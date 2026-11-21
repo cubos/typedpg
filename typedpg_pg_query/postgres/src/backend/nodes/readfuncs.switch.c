@@ -3,7 +3,7 @@
  * readfuncs.switch.c
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -483,12 +483,12 @@
 		return (Node *) _readDropdbStmt();
 	if (MATCH("ALTERSYSTEMSTMT", 15))
 		return (Node *) _readAlterSystemStmt();
-	if (MATCH("CLUSTERSTMT", 11))
-		return (Node *) _readClusterStmt();
 	if (MATCH("VACUUMSTMT", 10))
 		return (Node *) _readVacuumStmt();
 	if (MATCH("VACUUMRELATION", 14))
 		return (Node *) _readVacuumRelation();
+	if (MATCH("REPACKSTMT", 10))
+		return (Node *) _readRepackStmt();
 	if (MATCH("EXPLAINSTMT", 11))
 		return (Node *) _readExplainStmt();
 	if (MATCH("CREATETABLEASSTMT", 17))
@@ -529,6 +529,8 @@
 		return (Node *) _readPublicationTable();
 	if (MATCH("PUBLICATIONOBJSPEC", 18))
 		return (Node *) _readPublicationObjSpec();
+	if (MATCH("PUBLICATIONALLOBJSPEC", 21))
+		return (Node *) _readPublicationAllObjSpec();
 	if (MATCH("CREATEPUBLICATIONSTMT", 21))
 		return (Node *) _readCreatePublicationStmt();
 	if (MATCH("ALTERPUBLICATIONSTMT", 20))
@@ -539,6 +541,8 @@
 		return (Node *) _readAlterSubscriptionStmt();
 	if (MATCH("DROPSUBSCRIPTIONSTMT", 20))
 		return (Node *) _readDropSubscriptionStmt();
+	if (MATCH("WAITSTMT", 8))
+		return (Node *) _readWaitStmt();
 	if (MATCH("GROUPBYORDERING", 15))
 		return (Node *) _readGroupByOrdering();
 	if (MATCH("PLACEHOLDERVAR", 14))
@@ -645,5 +649,9 @@
 		return (Node *) _readPartitionPruneStepCombine();
 	if (MATCH("PLANINVALITEM", 13))
 		return (Node *) _readPlanInvalItem();
+	if (MATCH("SUBPLANRTINFO", 13))
+		return (Node *) _readSubPlanRTInfo();
+	if (MATCH("ELIDEDNODE", 10))
+		return (Node *) _readElidedNode();
 	if (MATCH("EXTENSIBLENODE", 14))
 		return (Node *) _readExtensibleNode();

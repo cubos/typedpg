@@ -1,8 +1,9 @@
 //! CREATE TYPE / CREATE DOMAIN / ALTER TYPE DDL handlers.
 
 use typedpg_pg_query::ast::{
-    self, AlterEnumStmt, CoercionContext, CompositeTypeStmt, ConstrType, CreateCastStmt,
-    CreateDomainStmt, CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType, TypeName,
+    self, AlterDomainType, AlterEnumStmt, CoercionContext, CompositeTypeStmt, ConstrType,
+    CreateCastStmt, CreateDomainStmt, CreateEnumStmt, CreateRangeStmt, DefineStmt, ObjectType,
+    TypeName,
 };
 
 use crate::oid::{PgCastOid, PgClassOid, PgEnumOid, PgNamespaceOid, PgProcOid, PgTypeOid};
@@ -575,29 +576,31 @@ pub fn alter_domain(
         .cloned()
         .unwrap_or_default();
 
-    match stmt.subtype.as_str() {
+    match stmt.subtype {
         // SET NOT NULL / DROP NOT NULL
-        "O" => {
+        AlterDomainType::AdSetNotNull => {
             let nn = typedpg_pg_query::ast::Constraint {
                 contype: ConstrType::ConstrNotnull,
                 ..Default::default()
             };
             add_domain_constraint(interp, name, base_type, &nn, &mut constraints)?;
         }
-        "N" => constraints.retain(|c| c.kind != DomainConstraintKind::NotNull),
+        AlterDomainType::AdDropNotNull => {
+            constraints.retain(|c| c.kind != DomainConstraintKind::NotNull)
+        }
         // ADD constraint
-        "C" => {
+        AlterDomainType::AdAddConstraint => {
             if let Some(ast::Node::Constraint(c)) = stmt.def.as_ref() {
                 add_domain_constraint(interp, name, base_type, c, &mut constraints)?;
             }
         }
         // DROP CONSTRAINT / VALIDATE CONSTRAINT name
-        "X" | "V" => {
+        AlterDomainType::AdDropConstraint | AlterDomainType::AdValidateConstraint => {
             let before = constraints.len();
-            if stmt.subtype == "X" {
+            if stmt.subtype == AlterDomainType::AdDropConstraint {
                 constraints.retain(|c| c.name != stmt.name);
             }
-            let found = if stmt.subtype == "X" {
+            let found = if stmt.subtype == AlterDomainType::AdDropConstraint {
                 constraints.len() != before
             } else {
                 constraints.iter().any(|c| c.name == stmt.name)
@@ -611,7 +614,7 @@ pub fn alter_domain(
         }
         // SET DEFAULT: cooked like the domain's own DEFAULT
         // (AlterDomainDefault). DROP DEFAULT has no effect on typing.
-        "T" => {
+        AlterDomainType::AdAlterDefault => {
             let mut default_refs = Vec::new();
             if stmt.def.is_some() {
                 let expr = &stmt.def;
@@ -679,7 +682,6 @@ pub fn alter_domain(
                 }
             }
         }
-        _ => {}
     }
 
     let typnotnull = constraints
@@ -730,15 +732,14 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         .iter()
         .filter_map(|n| node_string(n.as_ref()).map(|s| s.to_owned()))
         .collect();
-    // EnumValuesCreate inserts the labels one by one; a repeat trips
-    // pg_enum's unique index.
+    // EnumValuesCreate (PostgreSQL 19) checks each label against the
+    // earlier ones.
     for (i, label) in labels.iter().enumerate() {
         check_enum_label(label)?;
         if labels[..i].contains(label) {
-            return Err(DdlError::DuplicateObject(
-                "duplicate key value violates unique constraint \"pg_enum_typid_label_index\""
-                    .into(),
-            ));
+            return Err(DdlError::DuplicateObject(format!(
+                "enum label \"{label}\" used more than once"
+            )));
         }
     }
 

@@ -3,7 +3,7 @@
  * pl_comp.c		- Compiler part of the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -177,6 +177,7 @@ plpgsql_compile_callback(FunctionCallInfo fcinfo,
 	yyscan_t	scanner;
 	Datum		prosrcdatum;
 	char	   *proc_source;
+	char	   *proc_signature;
 	HeapTuple	typeTup;
 	Form_pg_type typeStruct;
 	PLpgSQL_variable *var;
@@ -223,6 +224,9 @@ plpgsql_compile_callback(FunctionCallInfo fcinfo,
 	plpgsql_check_syntax = forValidator;
 	plpgsql_curr_compile = function;
 
+	/* format_procedure leaks memory, so run it in temp context */
+	proc_signature = format_procedure(fcinfo->flinfo->fn_oid);
+
 	/*
 	 * All the permanent output of compilation (e.g. parse tree) is kept in a
 	 * per-function memory context, so it can be reclaimed easily.
@@ -237,7 +241,7 @@ plpgsql_compile_callback(FunctionCallInfo fcinfo,
 									 ALLOCSET_DEFAULT_SIZES);
 	plpgsql_compile_tmp_cxt = MemoryContextSwitchTo(func_cxt);
 
-	function->fn_signature = format_procedure(fcinfo->flinfo->fn_oid);
+	function->fn_signature = pstrdup(proc_signature);
 	MemoryContextSetIdentifier(func_cxt, function->fn_signature);
 	function->fn_oid = fcinfo->flinfo->fn_oid;
 	function->fn_input_collation = fcinfo->fncollation;
@@ -294,8 +298,8 @@ plpgsql_compile_callback(FunctionCallInfo fcinfo,
 											   forValidator,
 											   plpgsql_error_funcname);
 
-			in_arg_varnos = (int *) palloc(numargs * sizeof(int));
-			out_arg_variables = (PLpgSQL_variable **) palloc(numargs * sizeof(PLpgSQL_variable *));
+			in_arg_varnos = palloc_array(int, numargs);
+			out_arg_variables = palloc_array(PLpgSQL_variable *, numargs);
 
 			MemoryContextSwitchTo(func_cxt);
 
@@ -769,7 +773,7 @@ plpgsql_compile_inline(char *proc_source)
 	plpgsql_check_syntax = check_function_bodies;
 
 	/* Function struct does not live past current statement */
-	function = (PLpgSQL_function *) palloc0(sizeof(PLpgSQL_function));
+	function = palloc0_object(PLpgSQL_function);
 
 	plpgsql_curr_compile = function;
 
@@ -951,7 +955,7 @@ add_dummy_return(PLpgSQL_function *function)
 	{
 		PLpgSQL_stmt_block *new;
 
-		new = palloc0(sizeof(PLpgSQL_stmt_block));
+		new = palloc0_object(PLpgSQL_stmt_block);
 		new->cmd_type = PLPGSQL_STMT_BLOCK;
 		new->stmtid = ++function->nstatements;
 		new->body = list_make1(function->action);
@@ -963,7 +967,7 @@ add_dummy_return(PLpgSQL_function *function)
 	{
 		PLpgSQL_stmt_return *new;
 
-		new = palloc0(sizeof(PLpgSQL_stmt_return));
+		new = palloc0_object(PLpgSQL_stmt_return);
 		new->cmd_type = PLPGSQL_STMT_RETURN;
 		new->stmtid = ++function->nstatements;
 		new->expr = NULL;
@@ -1212,17 +1216,22 @@ resolve_column_ref(ParseState *pstate, PLpgSQL_expr *expr,
 				}
 
 				/*
-				 * We should not get here, because a RECFIELD datum should
-				 * have been built at parse time for every possible qualified
-				 * reference to fields of this record.  But if we do, handle
-				 * it like field-not-found: throw error or return NULL.
+				 * Ideally we'd never get here, because a RECFIELD datum
+				 * should have been built at parse time for every qualified
+				 * reference to a field of this record that appears in the
+				 * source text.  However, plpgsql_yylex will not build such a
+				 * datum unless the field name lexes as token type IDENT.
+				 * Hence, if the would-be field name is a PL/pgSQL reserved
+				 * word, we lose.  Assume that that's what happened and tell
+				 * the user to quote it, unless the caller prefers we just
+				 * return NULL.
 				 */
 				if (error_if_no_field)
 					ereport(ERROR,
-							(errcode(ERRCODE_UNDEFINED_COLUMN),
-							 errmsg("record \"%s\" has no field \"%s\"",
-									(nnames_field == 1) ? name1 : name2,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("field name \"%s\" is a reserved key word",
 									colname),
+							 errhint("Use double quotes to quote it."),
 							 parser_errposition(pstate, cref->location)));
 			}
 			break;
@@ -1669,6 +1678,11 @@ plpgsql_parse_wordrowtype(char *ident)
 {
 	Oid			classOid;
 	Oid			typOid;
+	TypeName   *typName;
+	MemoryContext oldCxt;
+
+	/* Avoid memory leaks in long-term function context */
+	oldCxt = MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
 
 	/*
 	 * Look up the relation.  Note that because relation rowtypes have the
@@ -1691,9 +1705,12 @@ plpgsql_parse_wordrowtype(char *ident)
 				 errmsg("relation \"%s\" does not have a composite type",
 						ident)));
 
+	typName = makeTypeName(ident);
+
+	MemoryContextSwitchTo(oldCxt);
+
 	/* Build and return the row type struct */
-	return plpgsql_build_datatype(typOid, -1, InvalidOid,
-								  makeTypeName(ident));
+	return plpgsql_build_datatype(typOid, -1, InvalidOid, typName);
 }
 
 /* ----------
@@ -1707,6 +1724,7 @@ plpgsql_parse_cwordrowtype(List *idents)
 	Oid			classOid;
 	Oid			typOid;
 	RangeVar   *relvar;
+	TypeName   *typName;
 	MemoryContext oldCxt;
 
 	/*
@@ -1729,11 +1747,12 @@ plpgsql_parse_cwordrowtype(List *idents)
 				 errmsg("relation \"%s\" does not have a composite type",
 						relvar->relname)));
 
+	typName = makeTypeNameFromNameList(idents);
+
 	MemoryContextSwitchTo(oldCxt);
 
 	/* Build and return the row type struct */
-	return plpgsql_build_datatype(typOid, -1, InvalidOid,
-								  makeTypeNameFromNameList(idents));
+	return plpgsql_build_datatype(typOid, -1, InvalidOid, typName);
 }
 
 /*
@@ -1758,7 +1777,7 @@ plpgsql_build_variable(const char *refname, int lineno, PLpgSQL_type *dtype,
 				/* Ordinary scalar datatype */
 				PLpgSQL_var *var;
 
-				var = palloc0(sizeof(PLpgSQL_var));
+				var = palloc0_object(PLpgSQL_var);
 				var->dtype = PLPGSQL_DTYPE_VAR;
 				var->refname = pstrdup(refname);
 				var->lineno = lineno;
@@ -1815,7 +1834,7 @@ plpgsql_build_record(const char *refname, int lineno,
 {
 	PLpgSQL_rec *rec;
 
-	rec = palloc0(sizeof(PLpgSQL_rec));
+	rec = palloc0_object(PLpgSQL_rec);
 	rec->dtype = PLPGSQL_DTYPE_REC;
 	rec->refname = pstrdup(refname);
 	rec->lineno = lineno;
@@ -1841,14 +1860,14 @@ build_row_from_vars(PLpgSQL_variable **vars, int numvars)
 	PLpgSQL_row *row;
 	int			i;
 
-	row = palloc0(sizeof(PLpgSQL_row));
+	row = palloc0_object(PLpgSQL_row);
 	row->dtype = PLPGSQL_DTYPE_ROW;
 	row->refname = "(unnamed row)";
 	row->lineno = -1;
 	row->rowtupdesc = CreateTemplateTupleDesc(numvars);
 	row->nfields = numvars;
-	row->fieldnames = palloc(numvars * sizeof(char *));
-	row->varnos = palloc(numvars * sizeof(int));
+	row->fieldnames = palloc_array(char *, numvars);
+	row->varnos = palloc_array(int, numvars);
 
 	for (i = 0; i < numvars; i++)
 	{
@@ -1894,6 +1913,8 @@ build_row_from_vars(PLpgSQL_variable **vars, int numvars)
 		TupleDescInitEntryCollation(row->rowtupdesc, i + 1, typcoll);
 	}
 
+	TupleDescFinalize(row->rowtupdesc);
+
 	return row;
 }
 
@@ -1922,7 +1943,7 @@ plpgsql_build_recfield(PLpgSQL_rec *rec, const char *fldname)
 	}
 
 	/* nope, so make a new one */
-	recfield = palloc0(sizeof(PLpgSQL_recfield));
+	recfield = palloc0_object(PLpgSQL_recfield);
 	recfield->dtype = PLPGSQL_DTYPE_RECFIELD;
 	recfield->fieldname = pstrdup(fldname);
 	recfield->recparentno = rec->dno;
@@ -1948,6 +1969,8 @@ plpgsql_build_recfield(PLpgSQL_rec *rec, const char *fldname)
  * origtypname is the parsed form of what the user wrote as the type name.
  * It can be NULL if the type could not be a composite type, or if it was
  * identified by OID to begin with (e.g., it's a function argument type).
+ * origtypname is in short-lived storage and must be copied if we choose
+ * to incorporate it into the function's parse tree.
  */
 PLpgSQL_type *
 plpgsql_build_datatype(Oid typeOid, int32 typmod,
@@ -1984,7 +2007,7 @@ build_datatype(HeapTuple typeTup, int32 typmod,
 				 errmsg("type \"%s\" is only a shell",
 						NameStr(typeStruct->typname))));
 
-	typ = (PLpgSQL_type *) palloc(sizeof(PLpgSQL_type));
+	typ = palloc_object(PLpgSQL_type);
 
 	typ->typname = pstrdup(NameStr(typeStruct->typname));
 	typ->typoid = typeStruct->oid;
@@ -2066,7 +2089,7 @@ build_datatype(HeapTuple typeTup, int32 typmod,
 					 errmsg("type %s is not composite",
 							format_type_be(typ->typoid))));
 
-		typ->origtypname = origtypname;
+		typ->origtypname = copyObject(origtypname);
 		typ->tcache = typentry;
 		typ->tupdesc_id = typentry->tupDesc_identifier;
 	}
@@ -2164,7 +2187,7 @@ plpgsql_parse_err_condition(char *condname)
 
 	if (strcmp(condname, "others") == 0)
 	{
-		new = palloc(sizeof(PLpgSQL_condition));
+		new = palloc_object(PLpgSQL_condition);
 		new->sqlerrstate = PLPGSQL_OTHERS;
 		new->condname = condname;
 		new->next = NULL;
@@ -2176,7 +2199,7 @@ plpgsql_parse_err_condition(char *condname)
 	{
 		if (strcmp(condname, exception_label_map[i].label) == 0)
 		{
-			new = palloc(sizeof(PLpgSQL_condition));
+			new = palloc_object(PLpgSQL_condition);
 			new->sqlerrstate = exception_label_map[i].sqlerrstate;
 			new->condname = condname;
 			new->next = prev;
@@ -2238,7 +2261,7 @@ plpgsql_finish_datums(PLpgSQL_function *function)
 	int			i;
 
 	function->ndatums = plpgsql_nDatums;
-	function->datums = palloc(sizeof(PLpgSQL_datum *) * plpgsql_nDatums);
+	function->datums = palloc_array(PLpgSQL_datum *, plpgsql_nDatums);
 	for (i = 0; i < plpgsql_nDatums; i++)
 	{
 		function->datums[i] = plpgsql_Datums[i];
@@ -2303,7 +2326,7 @@ plpgsql_add_initdatums(int **varnos)
 	{
 		if (n > 0)
 		{
-			*varnos = (int *) palloc(sizeof(int) * n);
+			*varnos = palloc_array(int, n);
 
 			n = 0;
 			for (i = datums_last; i < plpgsql_nDatums; i++)
@@ -2313,6 +2336,7 @@ plpgsql_add_initdatums(int **varnos)
 					case PLPGSQL_DTYPE_VAR:
 					case PLPGSQL_DTYPE_REC:
 						(*varnos)[n++] = plpgsql_Datums[i]->dno;
+						break;
 
 					default:
 						break;

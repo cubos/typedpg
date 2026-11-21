@@ -205,7 +205,7 @@ const DEFAULT_PARSER_TOKENS: &[&str] = &[
     "entity",
 ];
 
-/// The files a stock PostgreSQL 18 server has in `tsearch_data`, as
+/// The files a stock PostgreSQL 19 server has in `tsearch_data`, as
 /// `(basename, extension)`. Nothing tells the analyzer about files added to
 /// a server, so it assumes the stock set.
 const TSEARCH_DATA_FILES: &[(&str, &str)] = &[
@@ -237,7 +237,7 @@ const TSEARCH_DATA_FILES: &[(&str, &str)] = &[
 
 /// The server's `tsearch_data` directory (get_share_path), as the stock
 /// Debian / PGDG packages and the official image install it.
-const TSEARCH_DATA_DIR: &str = "/usr/share/postgresql/18/tsearch_data";
+const TSEARCH_DATA_DIR: &str = "/usr/share/postgresql/19/tsearch_data";
 
 /// The Snowball stemmers for a UTF8 database (dict_snowball.c
 /// `stemmer_modules`).

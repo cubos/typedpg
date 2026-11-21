@@ -172,7 +172,7 @@ attribute_tuple(Oid relid, const char *name, const TypedpgAttribute *a)
 }
 
 static HeapTuple
-lookup_catalog(int cacheId, Datum k1, Datum k2)
+lookup_catalog(SysCacheIdentifier cacheId, Datum k1, Datum k2)
 {
 	const TypedpgCatalog *catalog = typedpg_catalog();
 
@@ -271,7 +271,7 @@ lookup_catalog(int cacheId, Datum k1, Datum k2)
 /* --- built-in rows -------------------------------------------------------- */
 
 static HeapTuple
-lookup_builtin(int cacheId, Datum k1, Datum k2, Datum k3)
+lookup_builtin(SysCacheIdentifier cacheId, Datum k1, Datum k2, Datum k3)
 {
 	init_builtin();
 	switch (cacheId)
@@ -318,7 +318,7 @@ lookup_builtin(int cacheId, Datum k1, Datum k2, Datum k3)
 }
 
 static HeapTuple
-lookup(int cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
+lookup(SysCacheIdentifier cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
 {
 	/* The fake pg_proc row a compilation registered answers either way. */
 	if (cacheId == PROCOID)
@@ -345,31 +345,31 @@ lookup(int cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
 }
 
 HeapTuple
-SearchSysCache(int cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
+SearchSysCache(SysCacheIdentifier cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
 {
 	return lookup(cacheId, k1, k2, k3, k4);
 }
 
 HeapTuple
-SearchSysCache1(int cacheId, Datum k1)
+SearchSysCache1(SysCacheIdentifier cacheId, Datum k1)
 {
 	return lookup(cacheId, k1, 0, 0, 0);
 }
 
 HeapTuple
-SearchSysCache2(int cacheId, Datum k1, Datum k2)
+SearchSysCache2(SysCacheIdentifier cacheId, Datum k1, Datum k2)
 {
 	return lookup(cacheId, k1, k2, 0, 0);
 }
 
 HeapTuple
-SearchSysCache3(int cacheId, Datum k1, Datum k2, Datum k3)
+SearchSysCache3(SysCacheIdentifier cacheId, Datum k1, Datum k2, Datum k3)
 {
 	return lookup(cacheId, k1, k2, k3, 0);
 }
 
 HeapTuple
-SearchSysCache4(int cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
+SearchSysCache4(SysCacheIdentifier cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
 {
 	return lookup(cacheId, k1, k2, k3, k4);
 }
@@ -380,13 +380,13 @@ ReleaseSysCache(HeapTuple tuple)
 }
 
 bool
-SearchSysCacheExists(int cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
+SearchSysCacheExists(SysCacheIdentifier cacheId, Datum k1, Datum k2, Datum k3, Datum k4)
 {
 	return lookup(cacheId, k1, k2, k3, k4) != NULL;
 }
 
 Oid
-GetSysCacheOid(int cacheId, AttrNumber oidcol, Datum k1, Datum k2,
+GetSysCacheOid(SysCacheIdentifier cacheId, AttrNumber oidcol, Datum k1, Datum k2,
 			   Datum k3, Datum k4)
 {
 	HeapTuple	tup = lookup(cacheId, k1, k2, k3, k4);
@@ -398,14 +398,14 @@ GetSysCacheOid(int cacheId, AttrNumber oidcol, Datum k1, Datum k2,
 }
 
 Datum
-SysCacheGetAttr(int cacheId, HeapTuple tup, AttrNumber attributeNumber,
+SysCacheGetAttr(SysCacheIdentifier cacheId, HeapTuple tup, AttrNumber attributeNumber,
 				bool *isNull)
 {
 	return typedpg_tuple_get_attr(tup, attributeNumber, isNull);
 }
 
 Datum
-SysCacheGetAttrNotNull(int cacheId, HeapTuple tup, AttrNumber attributeNumber)
+SysCacheGetAttrNotNull(SysCacheIdentifier cacheId, HeapTuple tup, AttrNumber attributeNumber)
 {
 	bool		isnull;
 	Datum		attr = SysCacheGetAttr(cacheId, tup, attributeNumber, &isnull);
@@ -448,7 +448,7 @@ empty_catclist(void)
 }
 
 CatCList *
-SearchSysCacheList(int cacheId, int nkeys, Datum k1, Datum k2, Datum k3)
+SearchSysCacheList(SysCacheIdentifier cacheId, int nkeys, Datum k1, Datum k2, Datum k3)
 {
 	if (cacheId == PROCNAMEARGSNSP && nkeys == 1)
 	{

@@ -433,13 +433,10 @@ pub fn alter_sequence(interp: &mut PgCatalog, stmt: &AlterSeqStmt) -> Result<(),
             "relation \"{name}\" does not exist"
         )));
     };
-    // validate_relation_kind (sequence.c).
+    // validate_relation_as_sequence (sequence.c, PostgreSQL 19).
     let relkind = interp.pg_class.get(&seq_oid).map(|c| c.relkind);
     if relkind != Some(RelKind::Sequence) {
-        let kinds = relkind.map_or("this relation", RelKind::plural);
-        return Err(DdlError::Parse(format!(
-            "cannot open relation \"{name}\" (This operation is not supported for {kinds}.)"
-        )));
+        return Err(DdlError::Parse(format!("\"{name}\" is not a sequence")));
     }
     let current = interp
         .sequence_params

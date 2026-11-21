@@ -29,21 +29,44 @@ fn table_index<'a>(
     }
 }
 
-/// check_index_is_clusterable: `name` must be a non-partial index of
-/// `relid`. Returns the index.
+/// check_index_is_clusterable, on the index of `relid` named `name`.
+/// Returns the index.
 pub(crate) fn check_clusterable_index(
     interp: &PgCatalog,
     relid: PgClassOid,
     name: &str,
 ) -> Result<PgClassOid, DdlError> {
-    let index = table_index(interp, relid, name)?;
-    crate::ddl::indexes::check_am_clusterable(interp, index.indexrelid, name)?;
-    if index.indpred.is_some() {
+    let index = table_index(interp, relid, name)?.indexrelid;
+    check_clusterable_index_oid(interp, relid, index)?;
+    Ok(index)
+}
+
+/// check_index_is_clusterable: `index` must be a complete, valid index of
+/// `relid` whose access method can cluster.
+pub(crate) fn check_clusterable_index_oid(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    index: PgClassOid,
+) -> Result<(), DdlError> {
+    let name = relname_of(interp, index);
+    let Some(row) = interp.pg_index.get(&index).filter(|i| i.indrelid == relid) else {
+        return Err(DdlError::Parse(format!(
+            "\"{name}\" is not an index for table \"{}\"",
+            relname_of(interp, relid)
+        )));
+    };
+    crate::ddl::indexes::check_am_clusterable(interp, index, &name)?;
+    if row.indpred.is_some() {
         return Err(DdlError::UnsupportedDdl(format!(
             "cannot cluster on partial index \"{name}\""
         )));
     }
-    Ok(index.indexrelid)
+    if interp.invalid_indexes.contains(&index) {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot cluster on invalid index \"{name}\""
+        )));
+    }
+    Ok(())
 }
 
 /// `ALTER TABLE ... CLUSTER ON index` (ATExecClusterOn): marks the index
@@ -86,6 +109,16 @@ pub(super) fn replica_identity(
     // REPLICA_IDENTITY_INDEX.
     if ri.identity_type != "i" {
         interp.replica_identity_indexes.remove(&relid);
+        match ri.identity_type.as_str() {
+            kind @ ("n" | "f") => {
+                interp
+                    .replica_identity_kinds
+                    .insert(relid, kind.chars().next().unwrap_or('d'));
+            }
+            _ => {
+                interp.replica_identity_kinds.remove(&relid);
+            }
+        }
         return Ok(());
     }
     let name = &ri.name;
@@ -191,9 +224,10 @@ pub(super) fn alter_constraint(
             alter.conname
         )));
     }
-    if alter.alter_enforceability && con.contype != ConType::ForeignKey {
+    if alter.alter_enforceability && !matches!(con.contype, ConType::ForeignKey | ConType::Check) {
         return Err(DdlError::Parse(format!(
-            "cannot alter enforceability of constraint \"{}\" of relation \"{relname}\"",
+            "cannot alter enforceability of constraint \"{}\" of relation \"{relname}\" (Only \
+             foreign key and check constraints can change enforceability.)",
             alter.conname
         )));
     }
@@ -228,6 +262,12 @@ pub(super) fn alter_constraint(
             "cannot alter inherited constraint \"{}\" on relation \"{relname}\"",
             alter.conname
         )));
+    }
+    // PostgreSQL 19: a CHECK constraint's enforceability changes too, on
+    // every descendant.
+    if alter.alter_enforceability && con.contype == ConType::Check {
+        alter_check_enforceability(interp, &con, alter.is_enforced, rec.recurse, false, &[])?;
+        return Ok(());
     }
     // ATExecAlterConstraintInternal: a change of enforceability, or else
     // one of deferrability, rewrites the row (AlterConstrUpdateConstraintEntry)
@@ -271,6 +311,135 @@ pub(super) fn alter_constraint(
         inherit::alter_not_null_inheritability(interp, &con, alter.noinherit)?;
     }
     Ok(())
+}
+
+/// ATExecAlterCheckConstrEnforceability (PostgreSQL 19): `con` becomes
+/// [NOT] ENFORCED (and valid only when enforced), then — unless NO INHERIT —
+/// so does the same-named constraint of every descendant. A constraint
+/// still inherited from an enforced parent stays enforced; ALTERed directly
+/// to NOT ENFORCED it is an error. `changing` holds the constraints a NOT
+/// ENFORCED change visits. Returns whether `con` changed.
+fn alter_check_enforceability(
+    interp: &mut PgCatalog,
+    con: &PgConstraint,
+    is_enforced: bool,
+    recurse: bool,
+    recursing: bool,
+    changing: &[PgConstraintOid],
+) -> Result<bool, DdlError> {
+    let rel = con.conrelid;
+    let relname = relname_of(interp, rel);
+    let partition = super::inherit_cmd::is_partition(interp, rel);
+    let mut target = is_enforced;
+    if !is_enforced
+        && (!recursing || !partition)
+        && let Some(parent) = enforced_check_parent(interp, con, changing)
+    {
+        if !recursing {
+            return Err(DdlError::Parse(format!(
+                "cannot mark inherited constraint \"{}\" as NOT ENFORCED (The matching \
+                 constraint on parent table \"{}\" is ENFORCED.)",
+                con.conname,
+                relname_of(interp, parent)
+            )));
+        }
+        target = true;
+    }
+    // The constraint is about to be marked validated: an enforced but not
+    // valid descendant conflicts with it.
+    if recursing && is_enforced && con.conenforced && !con.convalidated {
+        return Err(DdlError::Parse(format!(
+            "constraint \"{}\" conflicts with NOT VALID constraint on child table \"{relname}\" \
+             (You may need to use ALTER TABLE ... VALIDATE CONSTRAINT on table \"{relname}\" \
+             first.)",
+            con.conname
+        )));
+    }
+    let changed = con.conenforced != target;
+    if changed && let Some(c) = interp.pg_constraint.get_mut(&con.oid) {
+        c.conenforced = target;
+        c.convalidated = target;
+    }
+    if !is_enforced || changed {
+        let mut children: Vec<PgClassOid> = Vec::new();
+        let mut changing = changing.to_vec();
+        if !recursing && !con.connoinherit {
+            children = inherit::all_inheritors(interp, rel)
+                .into_iter()
+                .filter(|&c| c != rel)
+                .collect();
+            if !is_enforced {
+                changing = vec![con.oid];
+            }
+            for &child in &children {
+                if !recurse {
+                    return Err(DdlError::Parse(
+                        "constraint must be altered on child tables too (Do not specify the \
+                         ONLY keyword.)"
+                            .into(),
+                    ));
+                }
+                if !is_enforced {
+                    let child_con =
+                        table_constraint(interp, child, &con.conname).map_err(|_| {
+                            DdlError::TypeNotFound(format!(
+                                "constraint \"{}\" for table \"{}\" does not exist",
+                                con.conname,
+                                relname_of(interp, child)
+                            ))
+                        })?;
+                    if !changing.contains(&child_con.oid) {
+                        changing.push(child_con.oid);
+                    }
+                }
+            }
+        }
+        for child in children {
+            let child_con = table_constraint(interp, child, &con.conname)?.clone();
+            alter_check_enforceability(interp, &child_con, is_enforced, false, true, &changing)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// ATCheckCheckConstrHasEnforcedParent: a parent of `con`'s table whose
+/// same-named CHECK constraint is inheritable and enforced — through a
+/// parent `changing` is about to change only when that one in turn has
+/// such a parent (regular inheritance only: a partition has one parent).
+fn enforced_check_parent(
+    interp: &PgCatalog,
+    con: &PgConstraint,
+    changing: &[PgConstraintOid],
+) -> Option<PgClassOid> {
+    if con.coninhcount <= 0 {
+        return None;
+    }
+    let partition = super::inherit_cmd::is_partition(interp, con.conrelid);
+    let mut parents: Vec<_> = interp
+        .pg_inherits
+        .iter()
+        .filter(|i| i.inhrelid == con.conrelid)
+        .collect();
+    parents.sort_by_key(|i| i.inhseqno);
+    for inh in parents {
+        let Some(parent_con) = interp.pg_constraint.values().find(|c| {
+            c.conrelid == inh.inhparent
+                && c.conname == con.conname
+                && c.contype == ConType::Check
+                && !c.connoinherit
+                && c.conenforced
+        }) else {
+            continue;
+        };
+        if !partition
+            && changing.contains(&parent_con.oid)
+            && enforced_check_parent(interp, parent_con, changing).is_none()
+        {
+            continue;
+        }
+        return Some(inh.inhparent);
+    }
+    None
 }
 
 /// `ALTER TABLE ... VALIDATE CONSTRAINT name` (ATExecValidateConstraint):

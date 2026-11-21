@@ -3,7 +3,7 @@
  * queryjumblefuncs.funcs.c
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -137,6 +137,7 @@ _jumbleWindowFunc(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(args);
 	JUMBLE_NODE(aggfilter);
 	JUMBLE_FIELD(winref);
+	JUMBLE_FIELD(ignore_nulls);
 }
 
 static void
@@ -437,6 +438,8 @@ _jumbleJsonConstructorExpr(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(func);
 	JUMBLE_NODE(coercion);
 	JUMBLE_NODE(returning);
+	JUMBLE_NODE(orig_query);
+	JUMBLE_NODE(format);
 	JUMBLE_FIELD(absent_on_null);
 	JUMBLE_FIELD(unique);
 }
@@ -450,6 +453,7 @@ _jumbleJsonIsPredicate(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(format);
 	JUMBLE_FIELD(item_type);
 	JUMBLE_FIELD(unique_keys);
+	JUMBLE_FIELD(exprBaseType);
 }
 
 static void
@@ -656,6 +660,7 @@ _jumbleOnConflictExpr(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(arbiterElems);
 	JUMBLE_NODE(arbiterWhere);
 	JUMBLE_FIELD(constraint);
+	JUMBLE_FIELD(lockStrength);
 	JUMBLE_NODE(onConflictSet);
 	JUMBLE_NODE(onConflictWhere);
 	JUMBLE_FIELD(exclRelIndex);
@@ -769,6 +774,7 @@ _jumbleFuncCall(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(agg_order);
 	JUMBLE_NODE(agg_filter);
 	JUMBLE_NODE(over);
+	JUMBLE_FIELD(ignore_nulls);
 	JUMBLE_FIELD(agg_within_group);
 	JUMBLE_FIELD(agg_star);
 	JUMBLE_FIELD(agg_distinct);
@@ -1186,6 +1192,7 @@ _jumbleOnConflictClause(JumbleState *jstate, Node *node)
 
 	JUMBLE_FIELD(action);
 	JUMBLE_NODE(infer);
+	JUMBLE_FIELD(lockStrength);
 	JUMBLE_NODE(targetList);
 	JUMBLE_NODE(whereClause);
 }
@@ -2249,9 +2256,10 @@ _jumbleFetchStmt(JumbleState *jstate, Node *node)
 	FetchStmt *expr = (FetchStmt *) node;
 
 	JUMBLE_FIELD(direction);
-	JUMBLE_FIELD(howMany);
 	JUMBLE_STRING(portalname);
 	JUMBLE_FIELD(ismove);
+	JUMBLE_FIELD(direction_keyword);
+	JUMBLE_LOCATION(location);
 }
 
 static void
@@ -2605,16 +2613,6 @@ _jumbleAlterSystemStmt(JumbleState *jstate, Node *node)
 }
 
 static void
-_jumbleClusterStmt(JumbleState *jstate, Node *node)
-{
-	ClusterStmt *expr = (ClusterStmt *) node;
-
-	JUMBLE_NODE(relation);
-	JUMBLE_STRING(indexname);
-	JUMBLE_NODE(params);
-}
-
-static void
 _jumbleVacuumStmt(JumbleState *jstate, Node *node)
 {
 	VacuumStmt *expr = (VacuumStmt *) node;
@@ -2632,6 +2630,18 @@ _jumbleVacuumRelation(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(relation);
 	JUMBLE_FIELD(oid);
 	JUMBLE_NODE(va_cols);
+}
+
+static void
+_jumbleRepackStmt(JumbleState *jstate, Node *node)
+{
+	RepackStmt *expr = (RepackStmt *) node;
+
+	JUMBLE_FIELD(command);
+	JUMBLE_NODE(relation);
+	JUMBLE_STRING(indexname);
+	JUMBLE_FIELD(usingindex);
+	JUMBLE_NODE(params);
 }
 
 static void
@@ -2670,7 +2680,7 @@ _jumbleCheckPointStmt(JumbleState *jstate, Node *node)
 {
 	CheckPointStmt *expr = (CheckPointStmt *) node;
 
-	(void) expr;
+	JUMBLE_NODE(options);
 }
 
 static void
@@ -2824,6 +2834,7 @@ _jumblePublicationTable(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(relation);
 	JUMBLE_NODE(whereClause);
 	JUMBLE_NODE(columns);
+	JUMBLE_FIELD(except);
 }
 
 static void
@@ -2837,6 +2848,15 @@ _jumblePublicationObjSpec(JumbleState *jstate, Node *node)
 }
 
 static void
+_jumblePublicationAllObjSpec(JumbleState *jstate, Node *node)
+{
+	PublicationAllObjSpec *expr = (PublicationAllObjSpec *) node;
+
+	JUMBLE_FIELD(pubobjtype);
+	JUMBLE_NODE(except_tables);
+}
+
+static void
 _jumbleCreatePublicationStmt(JumbleState *jstate, Node *node)
 {
 	CreatePublicationStmt *expr = (CreatePublicationStmt *) node;
@@ -2845,6 +2865,7 @@ _jumbleCreatePublicationStmt(JumbleState *jstate, Node *node)
 	JUMBLE_NODE(options);
 	JUMBLE_NODE(pubobjects);
 	JUMBLE_FIELD(for_all_tables);
+	JUMBLE_FIELD(for_all_sequences);
 }
 
 static void
@@ -2855,8 +2876,9 @@ _jumbleAlterPublicationStmt(JumbleState *jstate, Node *node)
 	JUMBLE_STRING(pubname);
 	JUMBLE_NODE(options);
 	JUMBLE_NODE(pubobjects);
-	JUMBLE_FIELD(for_all_tables);
 	JUMBLE_FIELD(action);
+	JUMBLE_FIELD(for_all_tables);
+	JUMBLE_FIELD(for_all_sequences);
 }
 
 static void
@@ -2865,6 +2887,7 @@ _jumbleCreateSubscriptionStmt(JumbleState *jstate, Node *node)
 	CreateSubscriptionStmt *expr = (CreateSubscriptionStmt *) node;
 
 	JUMBLE_STRING(subname);
+	JUMBLE_STRING(servername);
 	JUMBLE_STRING(conninfo);
 	JUMBLE_NODE(publication);
 	JUMBLE_NODE(options);
@@ -2877,6 +2900,7 @@ _jumbleAlterSubscriptionStmt(JumbleState *jstate, Node *node)
 
 	JUMBLE_FIELD(kind);
 	JUMBLE_STRING(subname);
+	JUMBLE_STRING(servername);
 	JUMBLE_STRING(conninfo);
 	JUMBLE_NODE(publication);
 	JUMBLE_NODE(options);
@@ -2893,12 +2917,42 @@ _jumbleDropSubscriptionStmt(JumbleState *jstate, Node *node)
 }
 
 static void
+_jumbleWaitStmt(JumbleState *jstate, Node *node)
+{
+	WaitStmt *expr = (WaitStmt *) node;
+
+	JUMBLE_NODE(options);
+	JUMBLE_LOCATION(lsn_location);
+}
+
+static void
 _jumbleGroupByOrdering(JumbleState *jstate, Node *node)
 {
 	GroupByOrdering *expr = (GroupByOrdering *) node;
 
 	JUMBLE_NODE(pathkeys);
 	JUMBLE_NODE(clauses);
+}
+
+static void
+_jumbleSubPlanRTInfo(JumbleState *jstate, Node *node)
+{
+	SubPlanRTInfo *expr = (SubPlanRTInfo *) node;
+
+	JUMBLE_STRING(plan_name);
+	JUMBLE_FIELD(rtoffset);
+	JUMBLE_FIELD(dummy);
+}
+
+static void
+_jumbleElidedNode(JumbleState *jstate, Node *node)
+{
+	ElidedNode *expr = (ElidedNode *) node;
+
+	JUMBLE_FIELD(plan_node_id);
+	JUMBLE_FIELD(elided_type);
+	JUMBLE_NODE(relids);
+	JUMBLE_NODE(child_append_relid_sets);
 }
 
 static void

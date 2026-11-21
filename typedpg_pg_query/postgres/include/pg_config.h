@@ -13,9 +13,6 @@
 /* The normal alignment of `int64_t', in bytes. */
 #define ALIGNOF_INT64_T 8
 
-/* The normal alignment of `long', in bytes. */
-#define ALIGNOF_LONG 8
-
 /* The normal alignment of `PG_INT128_TYPE', in bytes. */
 #define ALIGNOF_PG_INT128_TYPE 16
 
@@ -55,9 +52,6 @@
 /* Define to 1 if you have the `append_history' function. */
 /* #undef HAVE_APPEND_HISTORY */
 
-/* Define to 1 if you have the <atomic.h> header file. */
-/* #undef HAVE_ATOMIC_H */
-
 /* Define to 1 if you have the `backtrace_symbols' function. */
 #define HAVE_BACKTRACE_SYMBOLS 1
 
@@ -76,6 +70,14 @@
 /* Define to 1 if you have the <crtdefs.h> header file. */
 /* #undef HAVE_CRTDEFS_H */
 
+/* Define to 1 if your C++ compiler understands `typeof' or something similar.
+   */
+#define HAVE_CXX_TYPEOF 1
+
+/* Define to 1 if your C++ compiler understands `typeof_unqual' or something
+   similar. */
+/* #undef HAVE_CXX_TYPEOF_UNQUAL */
+
 /* Define to 1 if you have the declaration of `fdatasync', and to 0 if you
    don't. */
 #define HAVE_DECL_FDATASYNC 1
@@ -83,14 +85,6 @@
 /* Define to 1 if you have the declaration of `F_FULLFSYNC', and to 0 if you
    don't. */
 #define HAVE_DECL_F_FULLFSYNC 0
-
-/* Define to 1 if you have the declaration of
-   `LLVMCreateGDBRegistrationListener', and to 0 if you don't. */
-/* #undef HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER */
-
-/* Define to 1 if you have the declaration of
-   `LLVMCreatePerfJITEventListener', and to 0 if you don't. */
-/* #undef HAVE_DECL_LLVMCREATEPERFJITEVENTLISTENER */
 
 /* Define to 1 if you have the declaration of `memset_s', and to 0 if you
    don't. */
@@ -120,10 +114,6 @@
    don't. */
 #define HAVE_DECL_STRLCPY 1
 
-/* Define to 1 if you have the declaration of `strnlen', and to 0 if you
-   don't. */
-#define HAVE_DECL_STRNLEN 1
-
 /* Define to 1 if you have the declaration of `strsep', and to 0 if you don't.
    */
 #define HAVE_DECL_STRSEP 1
@@ -146,6 +136,9 @@
 
 /* Define to 1 if you have the `explicit_bzero' function. */
 #define HAVE_EXPLICIT_BZERO 1
+
+/* Define to 1 if you have the `explicit_memset' function. */
+/* #undef HAVE_EXPLICIT_MEMSET */
 
 /* Define to 1 if fseeko (and presumably ftello) exists and is declared. */
 #define HAVE_FSEEKO 1
@@ -290,14 +283,14 @@
 /* Define to 1 if you have the `localeconv_l' function. */
 /* #undef HAVE_LOCALECONV_L */
 
-/* Define to 1 if you have the <mbarrier.h> header file. */
-/* #undef HAVE_MBARRIER_H */
-
 /* Define to 1 if you have the `mbstowcs_l' function. */
 /* #undef HAVE_MBSTOWCS_L */
 
 /* Define to 1 if you have the <memory.h> header file. */
 #define HAVE_MEMORY_H 1
+
+/* Define to 1 if you have the `memset_explicit' function. */
+#define HAVE_MEMSET_EXPLICIT 1
 
 /* Define to 1 if you have the `mkdtemp' function. */
 #define HAVE_MKDTEMP 1
@@ -362,6 +355,9 @@
 /* Define to 1 if you have the `rl_variable_bind' function. */
 /* #undef HAVE_RL_VARIABLE_BIND */
 
+/* Define to 1 if you have SA_SIGINFO available. */
+#define HAVE_SA_SIGINFO 1
+
 /* Define to 1 if you have the <security/pam_appl.h> header file. */
 /* #undef HAVE_SECURITY_PAM_APPL_H */
 
@@ -379,6 +375,9 @@
 
 /* Define to 1 if you have the `SSL_CTX_set_ciphersuites' function. */
 /* #undef HAVE_SSL_CTX_SET_CIPHERSUITES */
+
+/* Define to 1 if you have the `SSL_CTX_set_client_hello_cb' function. */
+/* #undef HAVE_SSL_CTX_SET_CLIENT_HELLO_CB */
 
 /* Define to 1 if you have the `SSL_CTX_set_keylog_callback' function. */
 /* #undef HAVE_SSL_CTX_SET_KEYLOG_CALLBACK */
@@ -406,9 +405,6 @@
 
 /* Define to 1 if you have the `strlcpy' function. */
 #define HAVE_STRLCPY 1
-
-/* Define to 1 if you have the `strnlen' function. */
-#define HAVE_STRNLEN 1
 
 /* Define to 1 if you have the `strsep' function. */
 #define HAVE_STRSEP 1
@@ -472,6 +468,13 @@
 
 /* Define to 1 if your compiler understands `typeof' or something similar. */
 #define HAVE_TYPEOF 1
+
+/* Define to 1 if your compiler understands `typeof_unqual' or something
+   similar. */
+#define HAVE_TYPEOF_UNQUAL 1
+
+/* Define to 1 if you have the <uchar.h> header file. */
+#define HAVE_UCHAR_H 1
 
 /* Define to 1 if you have the <ucred.h> header file. */
 /* #undef HAVE_UCRED_H */
@@ -542,9 +545,6 @@
 /* Define to 1 if your compiler understands __builtin_$op_overflow. */
 #define HAVE__BUILTIN_OP_OVERFLOW 1
 
-/* Define to 1 if your compiler understands __builtin_popcount. */
-#define HAVE__BUILTIN_POPCOUNT 1
-
 /* Define to 1 if your compiler understands __builtin_types_compatible_p. */
 #define HAVE__BUILTIN_TYPES_COMPATIBLE_P 1
 
@@ -555,16 +555,13 @@
 /* #undef HAVE__CPUID */
 
 /* Define to 1 if you have __cpuidex. */
-/* #undef HAVE__CPUIDEX */
+#define HAVE__CPUIDEX 1
 
 /* Define to 1 if you have __get_cpuid. */
 #define HAVE__GET_CPUID 1
 
 /* Define to 1 if you have __get_cpuid_count. */
 #define HAVE__GET_CPUID_COUNT 1
-
-/* Define to 1 if your compiler understands _Static_assert. */
-#define HAVE__STATIC_ASSERT 1
 
 /* Define as the maximum alignment requirement of any C data type. */
 #define MAXIMUM_ALIGNOF 8
@@ -583,7 +580,7 @@
 #define PACKAGE_NAME "PostgreSQL"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "PostgreSQL 18.7"
+#define PACKAGE_STRING "PostgreSQL 19.0"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "postgresql"
@@ -592,7 +589,7 @@
 #define PACKAGE_URL "https://www.postgresql.org/"
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "18.7"
+#define PACKAGE_VERSION "19.0"
 
 /* Define to best C++ printf format archetype, usually gnu_printf if
    available. */
@@ -610,22 +607,22 @@
 #define PG_KRB_SRVNAM "postgres"
 
 /* PostgreSQL major version as a string */
-#define PG_MAJORVERSION "18"
+#define PG_MAJORVERSION "19"
 
 /* PostgreSQL major version number */
-#define PG_MAJORVERSION_NUM 18
+#define PG_MAJORVERSION_NUM 19
 
 /* PostgreSQL minor version number */
-#define PG_MINORVERSION_NUM 7
+#define PG_MINORVERSION_NUM 0
 
 /* PostgreSQL version as a string */
-#define PG_VERSION "18.7"
+#define PG_VERSION "19.0"
 
 /* PostgreSQL version as a number */
-#define PG_VERSION_NUM 180007
+#define PG_VERSION_NUM 190000
 
 /* A string containing the version number, platform, and C compiler */
-#define PG_VERSION_STR "PostgreSQL 18.7 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 16.2.0, 64-bit"
+#define PG_VERSION_STR "PostgreSQL 19.0 on x86_64-pc-linux-gnu, compiled by gcc (GCC) 16.2.0, 64-bit"
 
 /* Define to 1 to allow profiling output to be saved separately for each
    process. */
@@ -647,6 +644,9 @@
    save a few cycles in md.c, but is not absolutely required. Changing
    RELSEG_SIZE requires an initdb. */
 #define RELSEG_SIZE 131072
+
+/* The size of `intmax_t', as computed by sizeof. */
+#define SIZEOF_INTMAX_T 8
 
 /* The size of `long', as computed by sizeof. */
 #define SIZEOF_LONG 8
@@ -677,6 +677,9 @@
 
 /* Define to 1 to build with assertion checks. (--enable-cassert) */
 /* #undef USE_ASSERT_CHECKING */
+
+/* Define to 1 to use AVX2 instructions with a runtime check. */
+#define USE_AVX2_WITH_RUNTIME_CHECK 1
 
 /* Define to 1 to use AVX-512 CRC algorithms with a runtime check. */
 #define USE_AVX512_CRC32C_WITH_RUNTIME_CHECK 1
@@ -732,6 +735,9 @@
 
 /* Define to 1 to build with PAM support. (--with-pam) */
 /* #undef USE_PAM */
+
+/* Define to 1 to use Arm PMULL CRC algorithms with a runtime check. */
+/* #undef USE_PMULL_CRC32C_WITH_RUNTIME_CHECK */
 
 /* Define to 1 to use software CRC-32C implementation (slicing-by-8). */
 /* #undef USE_SLICING_BY_8_CRC32C */
@@ -796,11 +802,11 @@
 /* Define for large files, on AIX-style hosts. */
 /* #undef _LARGE_FILES */
 
-/* Define to `__inline__' or `__inline' if that's what the C compiler
-   calls it, or to nothing if 'inline' is not supported under any name.  */
-#ifndef __cplusplus
-/* #undef inline */
-#endif
+/* Define to how the C++ compiler spells `typeof'. */
+/* #undef pg_cxx_typeof */
+
+/* Define to how the C++ compiler spells `typeof_unqual'. */
+/* #undef pg_cxx_typeof_unqual */
 
 /* Define to keyword to use for C99 restrict support, or to nothing if not
    supported */
@@ -822,6 +828,9 @@
 
 /* Define to how the compiler spells `typeof'. */
 /* #undef typeof */
+
+/* Define to how the compiler spells `typeof_unqual'. */
+/* #undef typeof_unqual */
 /*
  * Portable overrides for postgres/include/pg_config.h.
  *
@@ -831,7 +840,7 @@
  * typedpg ships (glibc and musl Linux on x86_64 and aarch64, macOS on x86_64
  * and aarch64, and MSVC on Windows x64).  Each block below restores what
  * PostgreSQL's own configure/meson would have found on that target; the
- * reference for the answers is PostgreSQL 18.7's meson.build (the checks are
+ * reference for the answers is PostgreSQL 19.0's meson.build (the checks are
  * the same ones configure runs) and libpg_query's hand-maintained
  * pg_config.h, whose builds already cover these platforms.
  *
@@ -934,11 +943,14 @@
  * Headers that do not exist on every target.  MSVC has no <strings.h>,
  * <syslog.h>, <termios.h> or <unistd.h>; PostgreSQL ships stand-ins for the
  * few unistd symbols its code needs under port/win32_msvc/, which build.rs
- * puts on the include path.  <xlocale.h> and <copyfile.h> are macOS-only.
+ * puts on the include path.  <xlocale.h> and <copyfile.h> are macOS-only;
+ * <uchar.h> (C11, read by c.h since PostgreSQL 19) is the one macOS lacks,
+ * where c.h falls back to its own char16_t/char32_t typedefs.
  */
 #undef HAVE_XLOCALE_H
 #undef HAVE_COPYFILE
 #undef HAVE_COPYFILE_H
+#undef HAVE_UCHAR_H
 #undef HAVE_STRINGS_H
 #undef HAVE_SYSLOG
 #undef HAVE_TERMIOS_H
@@ -947,6 +959,9 @@
 #define HAVE_XLOCALE_H 1
 #define HAVE_COPYFILE 1
 #define HAVE_COPYFILE_H 1
+#endif
+#ifndef __APPLE__
+#define HAVE_UCHAR_H 1
 #endif
 #ifndef _WIN32
 #define HAVE_STRINGS_H 1
@@ -1020,9 +1035,19 @@
  * PostgreSQL's meson.build reaches the same answers because its checks use
  * GNU syntax that cl rejects; libpg_query's pg_config.h has the same list.
  * MSVC does provide <intrin.h>'s __cpuid/__cpuidex, <immintrin.h>'s _xgetbv
- * and the AVX-512 intrinsics, which pg_bitutils.c and pg_popcount_avx512.c
+ * and the AVX-512 intrinsics, which pg_cpu_x86.c and pg_popcount_x86.c
  * use instead, so those checks (which compile with cl) stay defined.
  */
+
+/*
+ * configure finds C23's typeof_unqual keyword when the import machine's
+ * compiler defaults to C23 (GCC 15 and later), but the crate compiles the
+ * tree as gnu11/c11, where the keyword does not exist, and with older
+ * compilers on some targets.  Only nodes.h's copyObject() uses it, to cast
+ * copyObjectImpl()'s result; without it, copyObject() returns void *.
+ */
+#undef HAVE_TYPEOF_UNQUAL
+
 #ifdef _MSC_VER
 #undef HAVE_COMPUTED_GOTO
 #undef HAVE_TYPEOF
@@ -1071,9 +1096,9 @@
  * ------------------------------------------------------------------------- */
 
 /*
- * x86-64-only code.  pg_bitutils.c's cpuid-driven POPCNT path requires
+ * x86-64-only code.  pg_cpu_x86.c's cpuid-driven feature checks require
  * <cpuid.h> (GCC/Clang on x86) or <intrin.h> (MSVC on x86), and
- * pg_popcount_avx512.c is compiled only with USE_AVX512_POPCNT_WITH_RUNTIME_CHECK.
+ * pg_popcount_x86.c uses AVX-512 only with USE_AVX512_POPCNT_WITH_RUNTIME_CHECK.
  * aarch64 uses src/port/pg_popcount_aarch64.c (Neon) instead; the CRC
  * sources those USE_*_CRC32C defines select are not imported at all, so
  * leaving them set on arm would misdescribe nothing but is still wrong.

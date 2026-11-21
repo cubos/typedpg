@@ -3,7 +3,7 @@
  * equalfuncs.switch.c
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -717,14 +717,14 @@
 		case T_AlterSystemStmt:
 			retval = _equalAlterSystemStmt(a, b);
 			break;
-		case T_ClusterStmt:
-			retval = _equalClusterStmt(a, b);
-			break;
 		case T_VacuumStmt:
 			retval = _equalVacuumStmt(a, b);
 			break;
 		case T_VacuumRelation:
 			retval = _equalVacuumRelation(a, b);
+			break;
+		case T_RepackStmt:
+			retval = _equalRepackStmt(a, b);
 			break;
 		case T_ExplainStmt:
 			retval = _equalExplainStmt(a, b);
@@ -786,6 +786,9 @@
 		case T_PublicationObjSpec:
 			retval = _equalPublicationObjSpec(a, b);
 			break;
+		case T_PublicationAllObjSpec:
+			retval = _equalPublicationAllObjSpec(a, b);
+			break;
 		case T_CreatePublicationStmt:
 			retval = _equalCreatePublicationStmt(a, b);
 			break;
@@ -800,6 +803,9 @@
 			break;
 		case T_DropSubscriptionStmt:
 			retval = _equalDropSubscriptionStmt(a, b);
+			break;
+		case T_WaitStmt:
+			retval = _equalWaitStmt(a, b);
 			break;
 		case T_PathKey:
 			retval = _equalPathKey(a, b);
@@ -821,6 +827,18 @@
 			break;
 		case T_PlaceHolderInfo:
 			retval = _equalPlaceHolderInfo(a, b);
+			break;
+		case T_AggClauseInfo:
+			retval = _equalAggClauseInfo(a, b);
+			break;
+		case T_GroupingExprInfo:
+			retval = _equalGroupingExprInfo(a, b);
+			break;
+		case T_SubPlanRTInfo:
+			retval = _equalSubPlanRTInfo(a, b);
+			break;
+		case T_ElidedNode:
+			retval = _equalElidedNode(a, b);
 			break;
 		case T_Bitmapset:
 			retval = _equalBitmapset(a, b);

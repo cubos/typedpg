@@ -594,6 +594,15 @@ fn srf_placement_rules() {
             "SELECT * FROM coalesce(generate_series(1,2))",
             "set-returning functions are not allowed in COALESCE",
         ),
+        // PostgreSQL 19: no longer in a window's PARTITION BY / ORDER BY.
+        (
+            "SELECT row_number() OVER (PARTITION BY generate_series(1,2))",
+            "set-returning functions are not allowed in window definitions",
+        ),
+        (
+            "SELECT row_number() OVER (ORDER BY generate_series(1,2))",
+            "set-returning functions are not allowed in window definitions",
+        ),
     ];
     for (sql, msg) in cases {
         let err = db.analyze(sql).unwrap_err();
@@ -604,7 +613,6 @@ fn srf_placement_rules() {
         assert!(err.to_string().starts_with(msg), "{sql}: {err}");
     }
     for sql in [
-        "SELECT row_number() OVER (PARTITION BY generate_series(1,2))",
         "SELECT id FROM t GROUP BY generate_series(1,2), id",
         "INSERT INTO n VALUES (generate_series(1,2), 1)",
         "SELECT generate_series(1, generate_series(1, 2))",

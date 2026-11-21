@@ -2,7 +2,7 @@
 
 PostgreSQL parser bindings for typedpg, built on PostgreSQL's own, unmodified
 sources: the parser, the grammar and the scanner of the release named by
-`POSTGRES_VERSION` (PostgreSQL 18.7), imported into [`postgres/`](postgres)
+`POSTGRES_VERSION` (PostgreSQL 19.0), imported into [`postgres/`](postgres)
 by [`import/`](import).
 
 The crate exposes:

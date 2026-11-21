@@ -7,7 +7,7 @@
  * declare them all here to avoid having to propagate guc.h into
  * a lot of unrelated header files.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *	  src/include/utils/guc_hooks.h
  *
@@ -61,6 +61,7 @@ extern bool check_default_text_search_config(char **newval, void **extra, GucSou
 extern void assign_default_text_search_config(const char *newval, void *extra);
 extern bool check_default_with_oids(bool *newval, void **extra,
 									GucSource source);
+extern const char *show_effective_wal_level(void);
 extern bool check_huge_page_size(int *newval, void **extra, GucSource source);
 extern void assign_io_method(int newval, void *extra);
 extern bool check_io_max_concurrency(int *newval, void **extra, GucSource source);
@@ -134,7 +135,10 @@ extern void assign_session_authorization(const char *newval, void *extra);
 extern void assign_session_replication_role(int newval, void *extra);
 extern void assign_stats_fetch_consistency(int newval, void *extra);
 extern bool check_ssl(bool *newval, void **extra, GucSource source);
+extern bool check_ssl_sni(bool *newval, void **extra, GucSource source);
 extern bool check_stage_log_stats(bool *newval, void **extra, GucSource source);
+extern bool check_standard_conforming_strings(bool *newval, void **extra,
+											  GucSource source);
 extern bool check_subtrans_buffers(int *newval, void **extra,
 								   GucSource source);
 extern bool check_synchronous_standby_names(char **newval, void **extra,
@@ -161,6 +165,9 @@ extern const char *show_timezone(void);
 extern bool check_timezone_abbreviations(char **newval, void **extra,
 										 GucSource source);
 extern void assign_timezone_abbreviations(const char *newval, void *extra);
+extern void assign_timing_clock_source(int newval, void *extra);
+extern bool check_timing_clock_source(int *newval, void **extra, GucSource source);
+extern const char *show_timing_clock_source(void);
 extern bool check_transaction_buffers(int *newval, void **extra, GucSource source);
 extern bool check_transaction_deferrable(bool *newval, void **extra, GucSource source);
 extern bool check_transaction_isolation(int *newval, void **extra, GucSource source);
@@ -176,5 +183,7 @@ extern void assign_wal_sync_method(int new_wal_sync_method, void *extra);
 extern bool check_synchronized_standby_slots(char **newval, void **extra,
 											 GucSource source);
 extern void assign_synchronized_standby_slots(const char *newval, void *extra);
+extern bool check_log_min_messages(char **newval, void **extra, GucSource source);
+extern void assign_log_min_messages(const char *newval, void *extra);
 
 #endif							/* GUC_HOOKS_H */

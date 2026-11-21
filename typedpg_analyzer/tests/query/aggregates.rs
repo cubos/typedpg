@@ -703,7 +703,7 @@ fn max_over_scalar_without_overload_rejected() {
             "          max(inet)\n",
             "          max(integer)\n",
             "          max(interval)\n",
-            "          … and 14 more\n",
+            "          … and 15 more\n",
         ),
     );
     assert_analyze_err!(
@@ -728,7 +728,7 @@ fn max_over_scalar_without_overload_rejected() {
             "          max(inet)\n",
             "          max(integer)\n",
             "          max(interval)\n",
-            "          … and 14 more\n",
+            "          … and 15 more\n",
         ),
     );
 }
@@ -1199,6 +1199,12 @@ fn sublink_in_grouped_query_uses_only_grouped_outer_columns() {
             "t.w",
         ),
         ("SELECT count(*) FROM t HAVING (SELECT t.v) > 0", "t.v"),
+        // The grouped expression, not its column, is grouped.
+        ("SELECT (SELECT t.v) + 1 FROM t GROUP BY v + 1", "t.v"),
+        (
+            "SELECT (SELECT a.x FROM a WHERE a.x = t.v + t.n) FROM t GROUP BY v + 1",
+            "t.v",
+        ),
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -1212,6 +1218,11 @@ fn sublink_in_grouped_query_uses_only_grouped_outer_columns() {
         "SELECT (SELECT max(a.x) FROM a GROUP BY a.id HAVING a.id = t.v LIMIT 1) FROM t \
          GROUP BY t.v",
         "SELECT (SELECT t.w) FROM t GROUP BY id",
+        // PG 19 matches a grouping expression inside a sublink too.
+        "SELECT (SELECT t.v + 1) FROM t GROUP BY v + 1",
+        "SELECT (SELECT (SELECT t.v + 1)) FROM t GROUP BY v + 1",
+        "SELECT (SELECT a.x FROM a WHERE a.x = t.v + 1) FROM t GROUP BY v + 1",
+        "SELECT (SELECT x.v + 1 FROM t x) FROM t GROUP BY v + 1",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

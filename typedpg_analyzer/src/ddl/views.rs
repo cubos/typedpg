@@ -145,14 +145,9 @@ pub fn create_view(interp: &mut PgCatalog, stmt: &ViewStmt) -> Result<(), DdlErr
         return Ok(());
     }
 
-    // DefineView: a view reading a temporary relation is temporary
-    // ("view ... will be a temporary view").
-    let reads_temp = resolved
-        .deps
-        .relation_refs
-        .iter()
-        .chain(resolved.deps.column_refs.iter().map(|(r, _)| r))
-        .any(|&r| super::util::is_temp_relation(interp, r));
+    // DefineView: a view using a temporary object is temporary ("view ...
+    // will be a temporary view").
+    let reads_temp = temp_dependency(interp, &resolved.deps).is_some();
     let nsoid = if reads_temp && rv.schemaname.is_empty() {
         super::util::temp_namespace(interp)?
     } else if reads_temp && Some(nsoid) != interp.temp_namespace {
@@ -414,16 +409,11 @@ fn create_relation_as(
                 "materialized views must not use data-modifying statements in WITH".into(),
             ));
         }
-        let reads_temp = resolved
-            .deps
-            .relation_refs
-            .iter()
-            .chain(resolved.deps.column_refs.iter().map(|(r, _)| r))
-            .any(|&r| super::util::is_temp_relation(interp, r));
-        if reads_temp {
-            return Err(DdlError::UnsupportedDdl(
-                "materialized views must not use temporary tables or views".into(),
-            ));
+        if let Some(object) = temp_dependency(interp, &resolved.deps) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "materialized views must not use temporary objects (This view depends on \
+                 temporary {object}.)"
+            )));
         }
     }
     if aliases.len() > resolved.columns.len() {
@@ -453,14 +443,6 @@ fn create_relation_as(
                         col.collation = Some(crate::expr::DEFAULT_COLLATION);
                         col.uncertain_collation = true;
                     }
-                }
-                crate::expr::Planned::Folded { collation, missing } => {
-                    col.no_collation = missing;
-                    col.collation = if missing {
-                        None
-                    } else {
-                        collation.or_else(|| interp_type_collation(interp, col.type_oid))
-                    };
                 }
             }
         }
@@ -756,7 +738,8 @@ pub fn refresh_materialized_view(
                 }
                 if stmt.skip_data {
                     return Err(DdlError::Parse(
-                        "CONCURRENTLY and WITH NO DATA options cannot be used together".into(),
+                        "REFRESH options CONCURRENTLY and WITH NO DATA cannot be used together"
+                            .into(),
                     ));
                 }
                 // is_usable_unique_index: unique, immediate, valid, not
@@ -1071,6 +1054,56 @@ struct ResolvedColumn {
     /// The analyzer doesn't know the collation PG stores (see
     /// [`PgCatalog::uncertain_collations`]).
     uncertain_collation: bool,
+}
+
+/// query_uses_temp_object (dependency.c, PostgreSQL 19): the first object
+/// a view's query depends on that lives in a temporary schema — a
+/// relation, a function, a type or an operator — described as
+/// getObjectDescription does.
+fn temp_dependency(interp: &PgCatalog, deps: &ViewDeps) -> Option<String> {
+    use super::depend::{ObjectAddress, Reference};
+    let temp = interp.temp_namespace?;
+    let relations = deps
+        .relation_refs
+        .iter()
+        .chain(deps.column_refs.iter().map(|(r, _)| r))
+        .copied()
+        .map(ObjectAddress::relation);
+    let functions = deps.function_refs.iter().copied().map(ObjectAddress::proc);
+    let types = deps.type_refs.iter().copied().map(ObjectAddress::type_);
+    let others = deps.references.iter().filter_map(|r| match r {
+        Reference::Object(addr) => Some(*addr),
+        Reference::Column(relid, _) => Some(ObjectAddress::relation(*relid)),
+        Reference::Named(_) => None,
+    });
+    let namespace = |addr: &ObjectAddress| {
+        let oid = addr.objid.get();
+        if addr.classid == crate::pg_catalog::PG_CLASS_RELID {
+            crate::oid::PgClassOid::new(oid)
+                .and_then(|o| interp.pg_class.get(&o))
+                .map(|c| c.relnamespace)
+        } else if addr.classid == crate::pg_catalog::PG_PROC_RELID {
+            crate::oid::PgProcOid::new(oid)
+                .and_then(|o| interp.pg_proc.get(&o))
+                .map(|p| p.pronamespace)
+        } else if addr.classid == crate::pg_catalog::PG_TYPE_RELID {
+            crate::oid::PgTypeOid::new(oid)
+                .and_then(|o| interp.pg_type.get(&o))
+                .map(|t| t.typnamespace)
+        } else if addr.classid == crate::pg_catalog::PG_OPERATOR_RELID {
+            crate::oid::PgOperatorOid::new(oid)
+                .and_then(|o| interp.pg_operator.get(&o))
+                .map(|o| o.oprnamespace)
+        } else {
+            None
+        }
+    };
+    relations
+        .chain(functions)
+        .chain(types)
+        .chain(others)
+        .find(|addr| namespace(addr) == Some(temp))
+        .map(|addr| super::depend::describe(interp, addr))
 }
 
 #[derive(Default, Clone)]

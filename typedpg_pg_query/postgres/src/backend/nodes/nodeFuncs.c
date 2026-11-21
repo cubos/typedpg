@@ -3,7 +3,7 @@
  * nodeFuncs.c
  *		Various general-purpose manipulations of Node trees
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -997,8 +997,16 @@ exprCollation(const Node *expr)
 			{
 				const JsonConstructorExpr *ctor = (const JsonConstructorExpr *) expr;
 
+				/*
+				 * Collation comes from coercion if present, otherwise from
+				 * func.  The func fallback is needed in cases where func
+				 * already produces the final output type and no coercion is
+				 * needed (cf. the JSCTOR_JSON_ARRAY_QUERY case).
+				 */
 				if (ctor->coercion)
 					coll = exprCollation((Node *) ctor->coercion);
+				else if (ctor->func)
+					coll = exprCollation((Node *) ctor->func);
 				else
 					coll = InvalidOid;
 			}
@@ -1009,14 +1017,14 @@ exprCollation(const Node *expr)
 			break;
 		case T_JsonExpr:
 			{
-				const JsonExpr *jsexpr = (JsonExpr *) expr;
+				const JsonExpr *jsexpr = (const JsonExpr *) expr;
 
 				coll = jsexpr->collation;
 			}
 			break;
 		case T_JsonBehavior:
 			{
-				const JsonBehavior *behavior = (JsonBehavior *) expr;
+				const JsonBehavior *behavior = (const JsonBehavior *) expr;
 
 				if (behavior->expr)
 					coll = exprCollation(behavior->expr);
@@ -1256,8 +1264,11 @@ exprSetCollation(Node *expr, Oid collation)
 			{
 				JsonConstructorExpr *ctor = (JsonConstructorExpr *) expr;
 
+				/* See comment in exprCollation() */
 				if (ctor->coercion)
 					exprSetCollation((Node *) ctor->coercion, collation);
+				else if (ctor->func)
+					exprSetCollation((Node *) ctor->func, collation);
 				else
 					Assert(!OidIsValid(collation)); /* result is always a
 													 * json[b] type */
@@ -1593,7 +1604,7 @@ exprLocation(const Node *expr)
 			}
 			break;
 		case T_JsonBehavior:
-			loc = exprLocation(((JsonBehavior *) expr)->expr);
+			loc = exprLocation(((const JsonBehavior *) expr)->expr);
 			break;
 		case T_NullTest:
 			{
@@ -1725,6 +1736,9 @@ exprLocation(const Node *expr)
 			break;
 		case T_ColumnDef:
 			loc = ((const ColumnDef *) expr)->location;
+			break;
+		case T_IndexElem:
+			loc = ((const IndexElem *) expr)->location;
 			break;
 		case T_Constraint:
 			loc = ((const Constraint *) expr)->location;
@@ -2953,7 +2967,7 @@ expression_tree_mutator_impl(Node *node,
 	 */
 
 #define FLATCOPY(newnode, node, nodetype)  \
-	( (newnode) = (nodetype *) palloc(sizeof(nodetype)), \
+	( (newnode) = palloc_object(nodetype), \
 	  memcpy((newnode), (node), sizeof(nodetype)) )
 
 #define MUTATE(newfield, oldfield, fieldtype)  \
@@ -4826,9 +4840,7 @@ planstate_walk_members(PlanState **planstates, int nplans,
 					   planstate_tree_walker_callback walker,
 					   void *context)
 {
-	int			j;
-
-	for (j = 0; j < nplans; j++)
+	for (int j = 0; j < nplans; j++)
 	{
 		if (PSWALK(planstates[j]))
 			return true;

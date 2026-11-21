@@ -2668,12 +2668,14 @@ impl UngroupedCheck<'_> {
             ),
             _ => false,
         };
-        if depth == 0
-            && !expanded_row
+        // A grouping expression matches in a sublink too (PostgreSQL 19:
+        // the grouping clauses are compared at each sublevel), its columns
+        // being the grouped level's.
+        if !expanded_row
             && self.group.have_non_var
             && self
                 .group
-                .contains(canonical(node, chain, 0, Some(self.scope), self.snapshot).as_ref())
+                .contains(canonical(node, chain, depth, Some(self.scope), self.snapshot).as_ref())
         {
             return Ok(());
         }
