@@ -129,7 +129,8 @@ tree this directory produces. configure runs only once, on the import machine
   (they include Windows SDK headers). The symbols those sources reference, and
   the few Windows-only references in the imported code (`pg_signal_queue`,
   `pgwin32_dispatch_queued_signals`, `pgwin32_is_service`, `pg_usleep`,
-  `pg_codepage_to_encoding`, `event_source`), are defined in
+  `pg_codepage_to_encoding`, `event_source`, and `on_proc_exit` /
+  `wchar2char` from `elog.c`'s Windows backtrace), are defined in
   [`csrc/pg/win32.c`](../csrc/pg/win32.c) and
   [`csrc/pg/vars.c`](../csrc/pg/vars.c); they are absent or unused on the other
   targets, and the generated stubs run on Linux and cannot see them.
