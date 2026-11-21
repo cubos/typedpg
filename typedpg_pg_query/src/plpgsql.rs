@@ -1,6 +1,6 @@
 //! PL/pgSQL functions as PostgreSQL's PL/pgSQL compiler builds them.
 //!
-//! These types mirror the parse-time structs of PostgreSQL 18's
+//! These types mirror the parse-time structs of PostgreSQL 19's
 //! `src/pl/plpgsql/src/plpgsql.h` (the release named by
 //! [`PG_VERSION`](crate::PG_VERSION)): a [`Function`] per compiled
 //! `CREATE FUNCTION` / `DO`, its [`Datum`]s (variables, rows, records, record

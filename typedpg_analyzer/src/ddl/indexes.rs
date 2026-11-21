@@ -1050,7 +1050,7 @@ fn check_exclusion_covers_partition_key(
         }
         if !found {
             return Err(DdlError::UnsupportedDdl(format!(
-                "unique constraint on partitioned table must include all partitioning columns \
+                "EXCLUDE constraint on partitioned table must include all partitioning columns \
                  (EXCLUDE constraint on table \"{}\" lacks column \"{}\" which is part of the \
                  partition key.)",
                 db.pg_class
@@ -1520,4 +1520,27 @@ pub(crate) fn serialize_node(node: Option<&typedpg_pg_query::ast::Node>) -> Seri
         ast: node.cloned(),
         bindings: Vec::<AstBinding>::new(),
     }
+}
+
+/// find_all_inheritors over an index: `index` and the partition indexes
+/// attached to it, at every level.
+pub(crate) fn all_index_inheritors(interp: &PgCatalog, index: PgClassOid) -> Vec<PgClassOid> {
+    let mut tree = vec![index];
+    let mut i = 0;
+    while i < tree.len() {
+        let mut children: Vec<PgClassOid> = interp
+            .index_parents
+            .iter()
+            .filter(|&(_, &parent)| parent == tree[i])
+            .map(|(&child, _)| child)
+            .collect();
+        children.sort();
+        for child in children {
+            if !tree.contains(&child) {
+                tree.push(child);
+            }
+        }
+        i += 1;
+    }
+    tree
 }

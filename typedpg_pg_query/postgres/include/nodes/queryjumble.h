@@ -3,7 +3,7 @@
  * queryjumble.h
  *	  Query normalization and fingerprinting.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -91,6 +91,9 @@ extern PGDLLIMPORT int compute_query_id;
 
 
 extern const char *CleanQuerytext(const char *query, int *location, int *len);
+extern LocationLen *ComputeConstantLengths(const JumbleState *jstate,
+										   const char *query,
+										   int query_loc);
 extern JumbleState *JumbleQuery(Query *query);
 extern void EnableQueryId(void);
 

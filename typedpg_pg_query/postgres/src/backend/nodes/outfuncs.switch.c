@@ -3,7 +3,7 @@
  * outfuncs.switch.c
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -717,14 +717,14 @@
 			case T_AlterSystemStmt:
 				_outAlterSystemStmt(str, obj);
 				break;
-			case T_ClusterStmt:
-				_outClusterStmt(str, obj);
-				break;
 			case T_VacuumStmt:
 				_outVacuumStmt(str, obj);
 				break;
 			case T_VacuumRelation:
 				_outVacuumRelation(str, obj);
+				break;
+			case T_RepackStmt:
+				_outRepackStmt(str, obj);
 				break;
 			case T_ExplainStmt:
 				_outExplainStmt(str, obj);
@@ -786,6 +786,9 @@
 			case T_PublicationObjSpec:
 				_outPublicationObjSpec(str, obj);
 				break;
+			case T_PublicationAllObjSpec:
+				_outPublicationAllObjSpec(str, obj);
+				break;
 			case T_CreatePublicationStmt:
 				_outCreatePublicationStmt(str, obj);
 				break;
@@ -801,6 +804,9 @@
 			case T_DropSubscriptionStmt:
 				_outDropSubscriptionStmt(str, obj);
 				break;
+			case T_WaitStmt:
+				_outWaitStmt(str, obj);
+				break;
 			case T_PlannerGlobal:
 				_outPlannerGlobal(str, obj);
 				break;
@@ -809,6 +815,9 @@
 				break;
 			case T_RelOptInfo:
 				_outRelOptInfo(str, obj);
+				break;
+			case T_RelAggInfo:
+				_outRelAggInfo(str, obj);
 				break;
 			case T_IndexOptInfo:
 				_outIndexOptInfo(str, obj);
@@ -888,9 +897,6 @@
 			case T_MemoizePath:
 				_outMemoizePath(str, obj);
 				break;
-			case T_UniquePath:
-				_outUniquePath(str, obj);
-				break;
 			case T_GatherPath:
 				_outGatherPath(str, obj);
 				break;
@@ -921,8 +927,8 @@
 			case T_GroupPath:
 				_outGroupPath(str, obj);
 				break;
-			case T_UpperUniquePath:
-				_outUpperUniquePath(str, obj);
+			case T_UniquePath:
+				_outUniquePath(str, obj);
 				break;
 			case T_AggPath:
 				_outAggPath(str, obj);
@@ -980,6 +986,12 @@
 				break;
 			case T_MinMaxAggInfo:
 				_outMinMaxAggInfo(str, obj);
+				break;
+			case T_AggClauseInfo:
+				_outAggClauseInfo(str, obj);
+				break;
+			case T_GroupingExprInfo:
+				_outGroupingExprInfo(str, obj);
 				break;
 			case T_PlannerParamItem:
 				_outPlannerParamItem(str, obj);
@@ -1142,6 +1154,12 @@
 				break;
 			case T_PlanInvalItem:
 				_outPlanInvalItem(str, obj);
+				break;
+			case T_SubPlanRTInfo:
+				_outSubPlanRTInfo(str, obj);
+				break;
+			case T_ElidedNode:
+				_outElidedNode(str, obj);
 				break;
 			case T_ExtensibleNode:
 				_outExtensibleNode(str, obj);

@@ -194,6 +194,19 @@ fn analyze_insert_here(
         return Err(v.error);
     }
 
+    // transformInsertStmt: ON CONFLICT DO SELECT returns the conflicting
+    // row through RETURNING, which it requires.
+    if let Some(oc) = &ins.on_conflict_clause
+        && oc.action == ast::OnConflictAction::OnconflictSelect
+        && !has_returning(ins.returning_clause.as_deref())
+    {
+        return Err(crate::error::RawError::new(
+            AnalyzeError::SyntaxError("ON CONFLICT DO SELECT requires a RETURNING clause".into()),
+            crate::error::SourceSpan::from_node_token(oc.location),
+            None,
+        )
+        .finalize_implicit());
+    }
     let (arbiter, conflict_set_list) = match &ins.on_conflict_clause {
         Some(on_conflict) => {
             analyze_insert_on_conflict(on_conflict, relation, &tgt, snapshot, params, &cte_scopes)?
@@ -232,22 +245,24 @@ fn analyze_insert_here(
         &tgt.attrs,
         &events,
     );
-    // ON CONFLICT DO UPDATE's EXCLUDED is in the range table but not the
-    // namespace RETURNING sees: referencing it is PG's `invalid reference
-    // to FROM-clause entry`, and it does not mask a RETURNING OLD / NEW
-    // alias.
-    if ins
-        .on_conflict_clause
-        .as_ref()
-        .is_some_and(|oc| oc.action == ast::OnConflictAction::OnconflictUpdate)
-    {
+    // ON CONFLICT DO UPDATE / SELECT's EXCLUDED is in the range table but
+    // not the namespace RETURNING sees: referencing it is PG's `invalid
+    // reference to FROM-clause entry`, and it does not mask a RETURNING
+    // OLD / NEW alias.
+    if ins.on_conflict_clause.as_ref().is_some_and(|oc| {
+        matches!(
+            oc.action,
+            ast::OnConflictAction::OnconflictUpdate | ast::OnConflictAction::OnconflictSelect
+        )
+    }) {
         let mut holder = Scope::default();
         holder.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
         ret_scope.shadowed_sources.extend(holder.sources);
     }
 
     // No returned row of an INSERT has an old version, except the ones
-    // ON CONFLICT DO UPDATE updated.
+    // ON CONFLICT DO UPDATE updated (or DO SELECT returned: their OLD and
+    // NEW are both the existing row).
     let mut rows = ReturningRows {
         old_may_be_null: true,
         new_may_be_null: false,
@@ -281,6 +296,22 @@ fn analyze_insert_here(
             );
             not_null.retain(|c| update_arm.contains(c));
         }
+        if let Some(oc) = &ins.on_conflict_clause
+            && oc.action == ast::OnConflictAction::OnconflictSelect
+        {
+            let select_arm = on_conflict_select_arm(
+                oc,
+                relation,
+                &tgt,
+                &wt,
+                &not_null,
+                arbiter.as_ref(),
+                snapshot,
+                params,
+                &cte_scopes,
+            );
+            not_null.retain(|c| select_arm.contains(c));
+        }
         prove_columns(&mut ret_null_ctx, insert_target_alias(relation), &not_null);
         rows.new_proven = not_null;
     }
@@ -295,18 +326,19 @@ fn analyze_insert_here(
     let mut rw = Rewrite::single(DmlEvent::Insert, assigns, tgt.overriding);
     rw.row_error = row_error;
     rw.returning = has_returning(ins.returning_clause.as_deref());
-    rw.on_conflict = ins
-        .on_conflict_clause
-        .as_ref()
-        .and_then(|oc| match oc.action {
-            ast::OnConflictAction::OnconflictUpdate => {
-                let set = set_list_assigns(&conflict_set_list);
-                rw.listed.extend(set.iter().map(|a| a.column.clone()));
-                Some(Some(set))
-            }
-            ast::OnConflictAction::OnconflictNothing => Some(None),
-            _ => None,
-        });
+    rw.on_conflict =
+        ins.on_conflict_clause
+            .as_ref()
+            .and_then(|oc| match oc.action {
+                ast::OnConflictAction::OnconflictUpdate => {
+                    let set = set_list_assigns(&conflict_set_list);
+                    rw.listed.extend(set.iter().map(|a| a.column.clone()));
+                    Some(Some(set))
+                }
+                ast::OnConflictAction::OnconflictNothing
+                | ast::OnConflictAction::OnconflictSelect => Some(None),
+                _ => None,
+            });
     check_rewrite(snapshot, tgt.oid, &rw)?;
     // The planner infers the arbiter index after the rewriter ran.
     if let (Some(on_conflict), Some(arbiter)) = (&ins.on_conflict_clause, &arbiter) {
@@ -508,6 +540,83 @@ fn on_conflict_update_arm(
     }
     for a in tgt.attrs.iter().filter(|a| a.attgenerated.is_some()) {
         k.write(&a.attname, &ValueInfo::default());
+    }
+    wt.row_not_null(snapshot, &k)
+}
+
+/// The columns non-NULL in every row ON CONFLICT DO SELECT returns from
+/// the table: an existing row, which the DO SELECT WHERE (over it and
+/// EXCLUDED) let through and whose arbiter key equals the proposed row's.
+#[allow(clippy::too_many_arguments)]
+fn on_conflict_select_arm(
+    oc: &ast::OnConflictClause,
+    relation: &ast::RangeVar,
+    tgt: &InsertTarget,
+    wt: &WriteTarget,
+    insert_not_null: &std::collections::HashSet<String>,
+    arbiter: Option<&Arbiter>,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+    cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
+) -> std::collections::HashSet<String> {
+    // Through a view, only what holds of any row is used.
+    if wt.relid != wt.base {
+        return wt.row_not_null(snapshot, &RowKnowledge::default());
+    }
+    let alias = insert_target_alias(relation);
+    let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
+    let mut scope = Scope {
+        ctes: cte_scopes.clone(),
+        ..Scope::default()
+    };
+    scope.add_dml_target(snapshot, alias, target_qn.clone(), &tgt.attrs);
+    let mut holder = Scope::default();
+    holder.add_dml_target(snapshot, "excluded", target_qn, &tgt.attrs);
+    for s in &mut holder.sources {
+        s.system_columns.clear();
+        s.dml_target = false;
+        for c in &mut s.columns {
+            c.base_not_null |= insert_not_null.contains(&c.name);
+        }
+    }
+    scope.sources.extend(holder.sources);
+    let mut k = RowKnowledge::default();
+    if let w @ Some(_) = &oc.where_clause {
+        let log = crate::nonnull::StrictLog::default();
+        let mut scratch = params.clone();
+        let null_ctx = NullabilityContext::default();
+        let typed = expr::infer_expr(
+            w.as_ref(),
+            expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+            &mut scratch,
+            TypeGoal::implicit(oid::BOOL),
+        );
+        if typed.is_ok() {
+            params.absorb_non_null_reads(&scratch);
+            let facts = crate::nonnull::nonnullable(w.as_ref(), true, &scope, &log, snapshot)
+                .restricted_to(&crate::nonnull::own_aliases(&scope));
+            k = RowKnowledge::from_facts(&facts, alias, |c| Some(c.to_owned()));
+        }
+    }
+    let mut key: Vec<i16> = arbiter
+        .map(|a| a.cols.iter().copied().filter(|&n| n > 0).collect())
+        .unwrap_or_default();
+    if let Some(infer) = oc.infer.as_deref()
+        && !infer.conname.is_empty()
+        && let Some(con) = snapshot.pg_constraint_values().find(|c| {
+            c.conrelid == tgt.oid
+                && c.conname == infer.conname
+                && matches!(c.contype, ConType::Unique | ConType::PrimaryKey)
+        })
+    {
+        key.extend(con.conkey.iter().copied());
+    }
+    for attnum in key {
+        if let Some(a) = tgt.attrs.iter().find(|a| a.attnum == attnum)
+            && insert_not_null.contains(&a.attname)
+        {
+            k.not_null.insert(a.attname.clone());
+        }
     }
     wt.row_not_null(snapshot, &k)
 }
@@ -1996,6 +2105,9 @@ fn analyze_insert_on_conflict(
     cte_scopes: &HashMap<String, Vec<ScopeColumn>>,
 ) -> Result<(Option<Arbiter>, Vec<Option<ast::Node>>), AnalyzeError> {
     let update = on_conflict.action == ast::OnConflictAction::OnconflictUpdate;
+    // DO SELECT (PostgreSQL 19) sees EXCLUDED like DO UPDATE, without a SET
+    // list.
+    let select = on_conflict.action == ast::OnConflictAction::OnconflictSelect;
     let target_qn = crate::qualified_name::QualifiedName::new(&tgt.nsname, &tgt.relname);
     let mut target_scope = Scope {
         ctes: cte_scopes.clone(),
@@ -2019,11 +2131,12 @@ fn analyze_insert_on_conflict(
     }
 
     // transformOnConflictArbiter.
-    if update && on_conflict.infer.is_none() {
+    if (update || select) && on_conflict.infer.is_none() {
         return Err(crate::error::RawError::new(
-            AnalyzeError::SyntaxError(
-                "ON CONFLICT DO UPDATE requires inference specification or constraint name".into(),
-            ),
+            AnalyzeError::SyntaxError(format!(
+                "ON CONFLICT DO {} requires inference specification or constraint name",
+                if update { "UPDATE" } else { "SELECT" }
+            )),
             None,
             Some("For example, ON CONFLICT (column_name).".into()),
         )
@@ -2033,7 +2146,7 @@ fn analyze_insert_on_conflict(
         None => None,
         Some(infer) => {
             let mut arbiter_scope = target_scope.clone();
-            if update {
+            if update || select {
                 arbiter_scope
                     .shadowed_sources
                     .extend(excluded_holder.sources.iter().cloned());
@@ -2048,14 +2161,44 @@ fn analyze_insert_on_conflict(
         }
     };
 
-    if !update {
+    if !update && !select {
         return Ok((arbiter, Vec::new()));
     }
     // transformOnConflictClause builds the EXCLUDED pseudo-relation's
     // target list (exclRelTlist) of a Var per column of the target: a
-    // stored INSERT ... ON CONFLICT DO UPDATE depends on every column.
+    // stored INSERT ... ON CONFLICT DO UPDATE / SELECT depends on every
+    // column.
     for a in tgt.attrs.iter().filter(|a| a.attnum > 0) {
         crate::ddl::depend::note_column(tgt.oid, &a.attname);
+    }
+    if select {
+        // transformInsertStmt: DO SELECT FOR UPDATE / SHARE locks the row
+        // it returns, which requires UPDATE on the target. It fires no
+        // UPDATE trigger; the target's SELECT policies (and, locking, its
+        // UPDATE ones) check the conflicting row.
+        let locks = on_conflict.lock_strength != ast::LockClauseStrength::LcsNone;
+        if locks {
+            crate::privileges::note_relation(tgt.oid, crate::ddl::acl::bits::UPDATE);
+        }
+        crate::privileges::note_conflict_select(tgt.oid, locks);
+        let mut conflict_scope = target_scope;
+        conflict_scope.sources.extend(excluded_holder.sources);
+        if let where_clause @ Some(_) = &on_conflict.where_clause {
+            let conflict_null_ctx = NullabilityContext::default();
+            expr::infer_expr(
+                where_clause.as_ref(),
+                expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
+                params,
+                TypeGoal::implicit(oid::BOOL),
+            )?;
+            crate::clause::check_no_aggregates_or_windows(
+                where_clause.as_ref(),
+                snapshot,
+                "WHERE",
+            )?;
+            check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;
+        }
+        return Ok((arbiter, Vec::new()));
     }
     // DO UPDATE requires UPDATE of the columns its SET list writes, and
     // fires the UPDATE triggers. Its auxiliary UPDATE also applies the

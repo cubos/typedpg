@@ -3,7 +3,7 @@
  * readfuncs.funcs.c
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -202,6 +202,7 @@ _readWindowFunc(void)
 	READ_UINT_FIELD(winref);
 	READ_BOOL_FIELD(winstar);
 	READ_BOOL_FIELD(winagg);
+	READ_INT_FIELD(ignore_nulls);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -377,12 +378,14 @@ _readSubPlan(void)
 	READ_OID_FIELD(firstColType);
 	READ_INT_FIELD(firstColTypmod);
 	READ_OID_FIELD(firstColCollation);
+	READ_BOOL_FIELD(isInitPlan);
 	READ_BOOL_FIELD(useHashTable);
 	READ_BOOL_FIELD(unknownEqFalse);
 	READ_BOOL_FIELD(parallel_safe);
 	READ_NODE_FIELD(setParam);
 	READ_NODE_FIELD(parParam);
 	READ_NODE_FIELD(args);
+	READ_INT_FIELD(disabled_nodes);
 	READ_FLOAT_FIELD(startup_cost);
 	READ_FLOAT_FIELD(per_call_cost);
 
@@ -687,6 +690,8 @@ _readJsonConstructorExpr(void)
 	READ_NODE_FIELD(func);
 	READ_NODE_FIELD(coercion);
 	READ_NODE_FIELD(returning);
+	READ_NODE_FIELD(orig_query);
+	READ_NODE_FIELD(format);
 	READ_BOOL_FIELD(absent_on_null);
 	READ_BOOL_FIELD(unique);
 	READ_LOCATION_FIELD(location);
@@ -703,6 +708,7 @@ _readJsonIsPredicate(void)
 	READ_NODE_FIELD(format);
 	READ_ENUM_FIELD(item_type, JsonValueType);
 	READ_BOOL_FIELD(unique_keys);
+	READ_OID_FIELD(exprBaseType);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -974,6 +980,7 @@ _readOnConflictExpr(void)
 	READ_NODE_FIELD(arbiterElems);
 	READ_NODE_FIELD(arbiterWhere);
 	READ_OID_FIELD(constraint);
+	READ_ENUM_FIELD(lockStrength, LockClauseStrength);
 	READ_NODE_FIELD(onConflictSet);
 	READ_NODE_FIELD(onConflictWhere);
 	READ_INT_FIELD(exclRelIndex);
@@ -1122,6 +1129,7 @@ _readFuncCall(void)
 	READ_NODE_FIELD(agg_order);
 	READ_NODE_FIELD(agg_filter);
 	READ_NODE_FIELD(over);
+	READ_INT_FIELD(ignore_nulls);
 	READ_BOOL_FIELD(agg_within_group);
 	READ_BOOL_FIELD(agg_star);
 	READ_BOOL_FIELD(agg_distinct);
@@ -1359,6 +1367,7 @@ _readIndexElem(void)
 	READ_NODE_FIELD(opclassopts);
 	READ_ENUM_FIELD(ordering, SortByDir);
 	READ_ENUM_FIELD(nulls_ordering, SortByNulls);
+	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
 }
@@ -1623,6 +1632,7 @@ _readOnConflictClause(void)
 
 	READ_ENUM_FIELD(action, OnConflictAction);
 	READ_NODE_FIELD(infer);
+	READ_ENUM_FIELD(lockStrength, LockClauseStrength);
 	READ_NODE_FIELD(targetList);
 	READ_NODE_FIELD(whereClause);
 	READ_LOCATION_FIELD(location);
@@ -2182,7 +2192,7 @@ _readAlterDomainStmt(void)
 {
 	READ_LOCALS(AlterDomainStmt);
 
-	READ_CHAR_FIELD(subtype);
+	READ_ENUM_FIELD(subtype, AlterDomainType);
 	READ_NODE_FIELD(typeName);
 	READ_STRING_FIELD(name);
 	READ_NODE_FIELD(def);
@@ -2926,6 +2936,8 @@ _readFetchStmt(void)
 	READ_LONG_FIELD(howMany);
 	READ_STRING_FIELD(portalname);
 	READ_BOOL_FIELD(ismove);
+	READ_ENUM_FIELD(direction_keyword, FetchDirectionKeywords);
+	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
 }
@@ -3348,18 +3360,6 @@ _readAlterSystemStmt(void)
 	READ_DONE();
 }
 
-static ClusterStmt *
-_readClusterStmt(void)
-{
-	READ_LOCALS(ClusterStmt);
-
-	READ_NODE_FIELD(relation);
-	READ_STRING_FIELD(indexname);
-	READ_NODE_FIELD(params);
-
-	READ_DONE();
-}
-
 static VacuumStmt *
 _readVacuumStmt(void)
 {
@@ -3380,6 +3380,20 @@ _readVacuumRelation(void)
 	READ_NODE_FIELD(relation);
 	READ_OID_FIELD(oid);
 	READ_NODE_FIELD(va_cols);
+
+	READ_DONE();
+}
+
+static RepackStmt *
+_readRepackStmt(void)
+{
+	READ_LOCALS(RepackStmt);
+
+	READ_ENUM_FIELD(command, RepackCommand);
+	READ_NODE_FIELD(relation);
+	READ_STRING_FIELD(indexname);
+	READ_BOOL_FIELD(usingindex);
+	READ_NODE_FIELD(params);
 
 	READ_DONE();
 }
@@ -3424,8 +3438,9 @@ _readRefreshMatViewStmt(void)
 static CheckPointStmt *
 _readCheckPointStmt(void)
 {
-	READ_LOCALS_NO_FIELDS(CheckPointStmt);
+	READ_LOCALS(CheckPointStmt);
 
+	READ_NODE_FIELD(options);
 
 	READ_DONE();
 }
@@ -3610,6 +3625,7 @@ _readPublicationTable(void)
 	READ_NODE_FIELD(relation);
 	READ_NODE_FIELD(whereClause);
 	READ_NODE_FIELD(columns);
+	READ_BOOL_FIELD(except);
 
 	READ_DONE();
 }
@@ -3627,6 +3643,18 @@ _readPublicationObjSpec(void)
 	READ_DONE();
 }
 
+static PublicationAllObjSpec *
+_readPublicationAllObjSpec(void)
+{
+	READ_LOCALS(PublicationAllObjSpec);
+
+	READ_ENUM_FIELD(pubobjtype, PublicationAllObjType);
+	READ_NODE_FIELD(except_tables);
+	READ_LOCATION_FIELD(location);
+
+	READ_DONE();
+}
+
 static CreatePublicationStmt *
 _readCreatePublicationStmt(void)
 {
@@ -3636,6 +3664,7 @@ _readCreatePublicationStmt(void)
 	READ_NODE_FIELD(options);
 	READ_NODE_FIELD(pubobjects);
 	READ_BOOL_FIELD(for_all_tables);
+	READ_BOOL_FIELD(for_all_sequences);
 
 	READ_DONE();
 }
@@ -3648,8 +3677,9 @@ _readAlterPublicationStmt(void)
 	READ_STRING_FIELD(pubname);
 	READ_NODE_FIELD(options);
 	READ_NODE_FIELD(pubobjects);
-	READ_BOOL_FIELD(for_all_tables);
 	READ_ENUM_FIELD(action, AlterPublicationAction);
+	READ_BOOL_FIELD(for_all_tables);
+	READ_BOOL_FIELD(for_all_sequences);
 
 	READ_DONE();
 }
@@ -3660,6 +3690,7 @@ _readCreateSubscriptionStmt(void)
 	READ_LOCALS(CreateSubscriptionStmt);
 
 	READ_STRING_FIELD(subname);
+	READ_STRING_FIELD(servername);
 	READ_STRING_FIELD(conninfo);
 	READ_NODE_FIELD(publication);
 	READ_NODE_FIELD(options);
@@ -3674,6 +3705,7 @@ _readAlterSubscriptionStmt(void)
 
 	READ_ENUM_FIELD(kind, AlterSubscriptionType);
 	READ_STRING_FIELD(subname);
+	READ_STRING_FIELD(servername);
 	READ_STRING_FIELD(conninfo);
 	READ_NODE_FIELD(publication);
 	READ_NODE_FIELD(options);
@@ -3689,6 +3721,18 @@ _readDropSubscriptionStmt(void)
 	READ_STRING_FIELD(subname);
 	READ_BOOL_FIELD(missing_ok);
 	READ_ENUM_FIELD(behavior, DropBehavior);
+
+	READ_DONE();
+}
+
+static WaitStmt *
+_readWaitStmt(void)
+{
+	READ_LOCALS(WaitStmt);
+
+	READ_STRING_FIELD(lsn_literal);
+	READ_NODE_FIELD(options);
+	READ_LOCATION_FIELD(lsn_location);
 
 	READ_DONE();
 }
@@ -3743,6 +3787,7 @@ _readPlannedStmt(void)
 	READ_ENUM_FIELD(commandType, CmdType);
 	READ_INT64_FIELD(queryId);
 	READ_INT64_FIELD(planId);
+	READ_ENUM_FIELD(planOrigin, PlannedStmtOrigin);
 	READ_BOOL_FIELD(hasReturning);
 	READ_BOOL_FIELD(hasModifyingCTE);
 	READ_BOOL_FIELD(canSetTag);
@@ -3755,15 +3800,19 @@ _readPlannedStmt(void)
 	READ_NODE_FIELD(rtable);
 	READ_BITMAPSET_FIELD(unprunableRelids);
 	READ_NODE_FIELD(permInfos);
-	READ_NODE_FIELD(resultRelations);
+	READ_BITMAPSET_FIELD(resultRelationRelids);
 	READ_NODE_FIELD(appendRelations);
 	READ_NODE_FIELD(subplans);
+	READ_NODE_FIELD(subrtinfos);
 	READ_BITMAPSET_FIELD(rewindPlanIDs);
 	READ_NODE_FIELD(rowMarks);
+	READ_BITMAPSET_FIELD(rowMarkRelids);
 	READ_NODE_FIELD(relationOids);
 	READ_NODE_FIELD(invalItems);
 	READ_NODE_FIELD(paramExecTypes);
 	READ_NODE_FIELD(utilityStmt);
+	READ_NODE_FIELD(elidedNodes);
+	READ_NODE_FIELD(extension_state);
 	READ_LOCATION_FIELD(stmt_location);
 	READ_LOCATION_FIELD(stmt_len);
 
@@ -3791,7 +3840,9 @@ _readResult(void)
 	READ_NODE_FIELD(plan.initPlan);
 	READ_BITMAPSET_FIELD(plan.extParam);
 	READ_BITMAPSET_FIELD(plan.allParam);
+	READ_ENUM_FIELD(result_type, ResultType);
 	READ_NODE_FIELD(resconstantqual);
+	READ_BITMAPSET_FIELD(relids);
 
 	READ_DONE();
 }
@@ -3846,7 +3897,6 @@ _readModifyTable(void)
 	READ_BOOL_FIELD(canSetTag);
 	READ_UINT_FIELD(nominalRelation);
 	READ_UINT_FIELD(rootRelation);
-	READ_BOOL_FIELD(partColsUpdated);
 	READ_NODE_FIELD(resultRelations);
 	READ_NODE_FIELD(updateColnosLists);
 	READ_NODE_FIELD(withCheckOptionLists);
@@ -3859,6 +3909,7 @@ _readModifyTable(void)
 	READ_INT_FIELD(epqParam);
 	READ_ENUM_FIELD(onConflictAction, OnConflictAction);
 	READ_NODE_FIELD(arbiterIndexes);
+	READ_ENUM_FIELD(onConflictLockStrength, LockClauseStrength);
 	READ_NODE_FIELD(onConflictSet);
 	READ_NODE_FIELD(onConflictCols);
 	READ_NODE_FIELD(onConflictWhere);
@@ -3892,6 +3943,7 @@ _readAppend(void)
 	READ_BITMAPSET_FIELD(plan.extParam);
 	READ_BITMAPSET_FIELD(plan.allParam);
 	READ_BITMAPSET_FIELD(apprelids);
+	READ_NODE_FIELD(child_append_relid_sets);
 	READ_NODE_FIELD(appendplans);
 	READ_INT_FIELD(nasyncplans);
 	READ_INT_FIELD(first_partial_plan);
@@ -3922,6 +3974,7 @@ _readMergeAppend(void)
 	READ_BITMAPSET_FIELD(plan.extParam);
 	READ_BITMAPSET_FIELD(plan.allParam);
 	READ_BITMAPSET_FIELD(apprelids);
+	READ_NODE_FIELD(child_append_relid_sets);
 	READ_NODE_FIELD(mergeplans);
 	READ_INT_FIELD(numCols);
 	READ_ATTRNUMBER_ARRAY(sortColIdx, local_node->numCols);
@@ -3959,7 +4012,7 @@ _readRecursiveUnion(void)
 	READ_ATTRNUMBER_ARRAY(dupColIdx, local_node->numCols);
 	READ_OID_ARRAY(dupOperators, local_node->numCols);
 	READ_OID_ARRAY(dupCollations, local_node->numCols);
-	READ_LONG_FIELD(numGroups);
+	READ_FLOAT_FIELD(numGroups);
 
 	READ_DONE();
 }
@@ -4678,6 +4731,9 @@ _readMemoize(void)
 	READ_BOOL_FIELD(binary_mode);
 	READ_UINT_FIELD(est_entries);
 	READ_BITMAPSET_FIELD(keyparamids);
+	READ_FLOAT_FIELD(est_calls);
+	READ_FLOAT_FIELD(est_unique_keys);
+	READ_FLOAT_FIELD(est_hit_ratio);
 
 	READ_DONE();
 }
@@ -4799,7 +4855,7 @@ _readAgg(void)
 	READ_ATTRNUMBER_ARRAY(grpColIdx, local_node->numCols);
 	READ_OID_ARRAY(grpOperators, local_node->numCols);
 	READ_OID_ARRAY(grpCollations, local_node->numCols);
-	READ_LONG_FIELD(numGroups);
+	READ_FLOAT_FIELD(numGroups);
 	READ_UINT64_FIELD(transitionSpace);
 	READ_BITMAPSET_FIELD(aggParams);
 	READ_NODE_FIELD(groupingSets);
@@ -5004,7 +5060,7 @@ _readSetOp(void)
 	READ_OID_ARRAY(cmpOperators, local_node->numCols);
 	READ_OID_ARRAY(cmpCollations, local_node->numCols);
 	READ_BOOL_ARRAY(cmpNullsFirst, local_node->numCols);
-	READ_LONG_FIELD(numGroups);
+	READ_FLOAT_FIELD(numGroups);
 
 	READ_DONE();
 }
@@ -5149,6 +5205,31 @@ _readPlanInvalItem(void)
 
 	READ_INT_FIELD(cacheId);
 	READ_UINT_FIELD(hashValue);
+
+	READ_DONE();
+}
+
+static SubPlanRTInfo *
+_readSubPlanRTInfo(void)
+{
+	READ_LOCALS(SubPlanRTInfo);
+
+	READ_STRING_FIELD(plan_name);
+	READ_UINT_FIELD(rtoffset);
+	READ_BOOL_FIELD(dummy);
+
+	READ_DONE();
+}
+
+static ElidedNode *
+_readElidedNode(void)
+{
+	READ_LOCALS(ElidedNode);
+
+	READ_INT_FIELD(plan_node_id);
+	READ_ENUM_FIELD(elided_type, NodeTag);
+	READ_BITMAPSET_FIELD(relids);
+	READ_NODE_FIELD(child_append_relid_sets);
 
 	READ_DONE();
 }

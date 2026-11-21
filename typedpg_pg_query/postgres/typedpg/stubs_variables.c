@@ -10,12 +10,16 @@
 #include "executor/spi.h"
 #include "utils/resowner.h"
 Portal ActivePortal;
+TransactionId CheckXidAlive;
 ResourceOwner CurrentResourceOwner;
 int MyXactFlags;
 uint64 SPI_processed;
 SPITupleTable *SPI_tuptable;
 uint64 SharedInvalidMessageCounter;
 const TupleTableSlotOps TTSOpsHeapTuple;
+bool bsysscan;
 object_access_hook_type object_access_hook;
+const struct config_enum_entry server_message_level_options[];
 pg_tz *session_timezone;
+bool syslogger_setup_done;
 bool trace_sort;

@@ -5,7 +5,7 @@
  *	  Routines for CREATE and DROP FUNCTION commands and CREATE and DROP
  *	  CAST commands.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -34,6 +34,7 @@
 
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -165,6 +166,8 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 		address = TypeShellMake(typname, namespaceId, GetUserId());
 		rettype = address.objectId;
 		Assert(OidIsValid(rettype));
+		/* Ensure the new shell type is visible to ProcedureCreate */
+		CommandCounterIncrement();
 	}
 
 	aclresult = object_aclcheck(TypeRelationId, rettype, GetUserId(), ACL_USAGE);
@@ -319,6 +322,9 @@ interpret_function_parameter_list(ParseState *pstate,
 			isinput = true;
 			if (parameterTypes_list)
 				*parameterTypes_list = lappend_oid(*parameterTypes_list, toid);
+			if (inParameterNames_list)
+				*inParameterNames_list = lappend(*inParameterNames_list,
+												 makeString(fp->name ? fp->name : pstrdup("")));
 		}
 
 		/* handle output parameters */
@@ -414,9 +420,6 @@ interpret_function_parameter_list(ParseState *pstate,
 			paramNames[i] = CStringGetTextDatum(fp->name);
 			have_names = true;
 		}
-
-		if (inParameterNames_list)
-			*inParameterNames_list = lappend(*inParameterNames_list, makeString(fp->name ? fp->name : pstrdup("")));
 
 		if (fp->defexpr)
 		{
@@ -923,13 +926,14 @@ interpret_AS_clause(Oid languageOid, const char *languageName,
 	{
 		SQLFunctionParseInfoPtr pinfo;
 
-		pinfo = (SQLFunctionParseInfoPtr) palloc0(sizeof(SQLFunctionParseInfo));
+		pinfo = palloc0_object(SQLFunctionParseInfo);
 
 		pinfo->fname = funcname;
 		pinfo->nargs = list_length(parameterTypes);
+		Assert(pinfo->nargs == list_length(inParameterNames));
 		pinfo->argtypes = (Oid *) palloc(pinfo->nargs * sizeof(Oid));
 		pinfo->argnames = (char **) palloc(pinfo->nargs * sizeof(char *));
-		for (int i = 0; i < list_length(parameterTypes); i++)
+		for (int i = 0; i < pinfo->nargs; i++)
 		{
 			char	   *s = strVal(list_nth(inParameterNames, i));
 
@@ -2433,6 +2437,7 @@ CallStmtResultDesc(CallStmt *stmt)
 							   -1,
 							   0);
 		}
+		TupleDescFinalize(tupdesc);
 	}
 
 	return tupdesc;

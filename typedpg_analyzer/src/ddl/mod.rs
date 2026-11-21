@@ -639,7 +639,7 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         ast::Node::AlterOpFamilyStmt(s) => opclass::alter_opfamily(db, s),
         ast::Node::TruncateStmt(s) => maintenance::truncate(db, s),
         ast::Node::CopyStmt(s) => maintenance::copy(db, s),
-        ast::Node::ClusterStmt(s) => maintenance::cluster(db, s),
+        ast::Node::RepackStmt(s) => maintenance::repack(db, s),
         ast::Node::ReindexStmt(s) => maintenance::reindex(db, s),
         ast::Node::VacuumStmt(s) => maintenance::vacuum(db, s),
         ast::Node::LockStmt(s) => maintenance::lock(db, s),
@@ -650,7 +650,7 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         ast::Node::CreateTableSpaceStmt(s) => cluster::create_tablespace(db, s),
         ast::Node::DropTableSpaceStmt(s) => cluster::drop_tablespace(db, s),
         ast::Node::CreateSubscriptionStmt(s) => cluster::create_subscription(db, s),
-        ast::Node::AlterSubscriptionStmt(s) => cluster::alter_subscription(db, &s.subname),
+        ast::Node::AlterSubscriptionStmt(s) => cluster::alter_subscription(db, s),
         ast::Node::DropSubscriptionStmt(s) => cluster::drop_subscription(db, s),
         ast::Node::AlterOperatorStmt(s) => operators::alter_operator(db, s),
         ast::Node::VariableShowStmt(_)
@@ -665,12 +665,13 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         // wrappers / servers / user mappings,
         // tablespaces, conversions, languages, transforms, security labels,
         // and type property changes (`ALTER TYPE t SET (...)`).
-        | ast::Node::CheckPointStmt(_)
         | ast::Node::LoadStmt(_)
         | ast::Node::AlterDatabaseStmt(_)
         | ast::Node::AlterDatabaseRefreshCollStmt(_)
         | ast::Node::AlterSystemStmt(_)
         | ast::Node::AlterTableSpaceOptionsStmt(_) => Ok(()),
+        ast::Node::CheckPointStmt(s) => maintenance::checkpoint(db, s),
+        ast::Node::WaitStmt(s) => maintenance::wait_for_lsn(s),
         ast::Node::AlterObjectDependsStmt(s) => extensions::alter_object_depends(db, s),
         // `ALTER COLLATION name REFRESH VERSION`: only the name matters.
         ast::Node::AlterCollationStmt(s) => collations::refresh_version(db, s),

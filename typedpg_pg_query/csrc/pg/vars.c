@@ -26,7 +26,13 @@ bool		ClientAuthInProgress = false;
 int			client_min_messages = NOTICE;
 const char *debug_query_string = NULL;
 int			log_min_error_statement = ERROR;
-int			log_min_messages = WARNING;
+/* Indexed by BackendType since PostgreSQL 19; guc_tables.c's initializer. */
+int			log_min_messages[] = {
+#define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach) \
+	[bktype] = WARNING,
+#include "postmaster/proctypelist.h"
+#undef PG_PROCTYPE
+};
 pg_tz	   *log_timezone = NULL;
 BackendType MyBackendType = B_INVALID;
 BackgroundWorker *MyBgworkerEntry = NULL;

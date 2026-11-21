@@ -2,7 +2,7 @@
  *	fe_memutils.h
  *		memory management support for frontend code
  *
- *	Copyright (c) 2003-2025, PostgreSQL Global Development Group
+ *	Copyright (c) 2003-2026, PostgreSQL Global Development Group
  *
  *	src/include/common/fe_memutils.h
  */
@@ -95,7 +95,7 @@ extern void *repalloc_mul(void *p, Size s1, Size s2);
 #define repalloc_array(pointer, type, count) ((type *) repalloc_mul(pointer, sizeof(type), count))
 
 /* sprintf into a palloc'd buffer --- these are in psprintf.c */
-extern char *psprintf(const char *fmt,...) pg_attribute_printf(1, 2);
+extern char *psprintf(const char *fmt, ...) pg_attribute_printf(1, 2);
 extern size_t pvsnprintf(char *buf, size_t len, const char *fmt, va_list args) pg_attribute_printf(3, 0);
 
 #endif							/* FE_MEMUTILS_H */

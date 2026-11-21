@@ -2,7 +2,7 @@
  * conflict.h
  *	   Exports for conflicts logging.
  *
- * Copyright (c) 2024-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -10,13 +10,13 @@
 #define CONFLICT_H
 
 #include "access/xlogdefs.h"
+#include "datatype/timestamp.h"
 #include "nodes/pg_list.h"
-#include "utils/timestamp.h"
 
 /* Avoid including execnodes.h here */
-struct EState;
-struct ResultRelInfo;
-struct TupleTableSlot;
+typedef struct EState EState;
+typedef struct ResultRelInfo ResultRelInfo;
+typedef struct TupleTableSlot TupleTableSlot;
 
 
 /*
@@ -38,6 +38,9 @@ typedef enum
 
 	/* The updated row value violates unique constraint */
 	CT_UPDATE_EXISTS,
+
+	/* The row to be updated was concurrently deleted by a different origin */
+	CT_UPDATE_DELETED,
 
 	/* The row to be updated is missing */
 	CT_UPDATE_MISSING,
@@ -61,30 +64,29 @@ typedef enum
 #define CONFLICT_NUM_TYPES (CT_MULTIPLE_UNIQUE_CONFLICTS + 1)
 
 /*
- * Information for the existing local row that caused the conflict.
+ * Information for the local row that caused the conflict.
  */
 typedef struct ConflictTupleInfo
 {
-	struct TupleTableSlot *slot;	/* tuple slot holding the conflicting
-									 * local tuple */
+	TupleTableSlot *slot;		/* tuple slot holding the conflicting local
+								 * tuple */
 	Oid			indexoid;		/* OID of the index where the conflict
 								 * occurred */
 	TransactionId xmin;			/* transaction ID of the modification causing
 								 * the conflict */
-	RepOriginId origin;			/* origin identifier of the modification */
+	ReplOriginId origin;		/* origin identifier of the modification */
 	TimestampTz ts;				/* timestamp of when the modification on the
 								 * conflicting local row occurred */
 } ConflictTupleInfo;
 
-extern bool GetTupleTransactionInfo(struct TupleTableSlot *localslot,
+extern bool GetTupleTransactionInfo(TupleTableSlot *localslot,
 									TransactionId *xmin,
-									RepOriginId *localorigin,
+									ReplOriginId *localorigin,
 									TimestampTz *localts);
-extern void ReportApplyConflict(struct EState *estate, struct ResultRelInfo *relinfo,
+extern void ReportApplyConflict(EState *estate, ResultRelInfo *relinfo,
 								int elevel, ConflictType type,
-								struct TupleTableSlot *searchslot,
-								struct TupleTableSlot *remoteslot,
+								TupleTableSlot *searchslot,
+								TupleTableSlot *remoteslot,
 								List *conflicttuples);
-extern void InitConflictIndexes(struct ResultRelInfo *relInfo);
-
+extern void InitConflictIndexes(ResultRelInfo *relInfo);
 #endif

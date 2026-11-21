@@ -1101,6 +1101,37 @@ impl NullabilityContext {
         }
     }
 
+    /// What `flatten_join_alias_vars` replaces column `col` of an aliased
+    /// join, or a `JOIN USING` merged column, by: the column of the entry
+    /// inside it — a merged column's left constituent in an inner or LEFT
+    /// join, its right one in a RIGHT join. `None` for a FULL join's (a
+    /// COALESCE of both, each null-extended) or any other column.
+    /// Returns that column and its own NOT NULL.
+    pub fn join_alias_target(&self, col: &Col) -> Option<(Col, bool)> {
+        if let Some(m) = self.merged.get(col) {
+            return match self.joins.get(m.join)?.kind {
+                JoinKind::Inner | JoinKind::Left => Some(m.left.clone()),
+                JoinKind::Right => Some(m.right.clone()),
+                JoinKind::Full => None,
+            };
+        }
+        self.aliased.get(col).cloned()
+    }
+
+    /// Whether a Var of `table_alias` read here has `varnullingrels`: the
+    /// entry is on the nullable side of an outer join of this level already
+    /// recorded, before any reduction (`reduce_outer_joins` runs after the
+    /// planner folds the expressions) — or marked nullable outright.
+    pub fn syntactically_nulled(&self, table_alias: &str) -> bool {
+        self.nullable_aliases.contains(table_alias)
+            || self.joins.iter().any(|j| match j.kind {
+                JoinKind::Inner => false,
+                JoinKind::Left => j.right.contains(table_alias),
+                JoinKind::Right => j.left.contains(table_alias),
+                JoinKind::Full => j.left.contains(table_alias) || j.right.contains(table_alias),
+            })
+    }
+
     /// Whether the source `table_alias` is on the nullable side of an outer
     /// join — a whole-row reference to it (`SELECT u FROM a LEFT JOIN u …`)
     /// is then NULL for the null-extended rows.

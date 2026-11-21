@@ -1298,16 +1298,19 @@ fn string_partition_bounds_order_under_code_point_collations() {
     let keyed = "CREATE TABLE u (k text) PARTITION BY LIST (k COLLATE \"C\");
                  CREATE UNIQUE INDEX ON u (k COLLATE \"C\");";
     build_db(&[("0001.sql", keyed)]);
-    for sql in [
-        "ALTER TABLE u ADD PRIMARY KEY (k);",
-        "CREATE UNIQUE INDEX ON u (k);",
-        "CREATE TABLE u2 (k text PRIMARY KEY) PARTITION BY LIST (k COLLATE \"C\");",
+    for (sql, kind) in [
+        ("ALTER TABLE u ADD PRIMARY KEY (k);", "PRIMARY KEY"),
+        ("CREATE UNIQUE INDEX ON u (k);", "UNIQUE"),
+        (
+            "CREATE TABLE u2 (k text PRIMARY KEY) PARTITION BY LIST (k COLLATE \"C\");",
+            "PRIMARY KEY",
+        ),
     ] {
         let err = try_apply(&[("0001.sql", keyed), ("0002.sql", sql)]).expect_err(sql);
         assert!(
-            err.to_string().starts_with(
-                "unique constraint on partitioned table must include all partitioning columns"
-            ),
+            err.to_string().starts_with(&format!(
+                "{kind} constraint on partitioned table must include all partitioning columns"
+            )),
             "{sql}\n  got: {err}"
         );
     }

@@ -17,17 +17,25 @@ fn body(function: &plpgsql::Function) -> &[Stmt] {
 }
 
 #[test]
-fn parses_with_postgres_18_grammar() {
-    assert!(typedpg_pg_query::PG_VERSION.starts_with("18."));
-    // RETURNING OLD / NEW is PostgreSQL 18 syntax.
-    let parsed =
-        typedpg_pg_query::parse("UPDATE t SET a = 1 RETURNING WITH (OLD AS o, NEW AS n) o.a, n.a")
-            .unwrap();
+fn parses_with_postgres_19_grammar() {
+    assert!(typedpg_pg_query::PG_VERSION.starts_with("19."));
+    // ON CONFLICT DO SELECT is PostgreSQL 19 syntax.
+    let parsed = typedpg_pg_query::parse(
+        "INSERT INTO t VALUES (1) ON CONFLICT (a) DO SELECT FOR UPDATE RETURNING *",
+    )
+    .unwrap();
     assert_eq!(parsed.tree.version, typedpg_pg_query::PG_VERSION_NUM);
     assert!(matches!(
         parsed.tree.nodes().next(),
-        Some((NodeRef::UpdateStmt(_), 0))
+        Some((NodeRef::InsertStmt(_), 0))
     ));
+    // So are IGNORE NULLS and REPACK.
+    for sql in [
+        "SELECT lag(a) IGNORE NULLS OVER (ORDER BY b) FROM t",
+        "REPACK (CONCURRENTLY) t USING INDEX t_pkey",
+    ] {
+        typedpg_pg_query::parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
 }
 
 #[test]

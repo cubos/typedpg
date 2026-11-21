@@ -81,7 +81,7 @@ const BODY_MARKERS: &[&str] = &[
 /// Built-ins that run SQL given as text (`ts_rewrite(tsquery, text)` runs
 /// its second argument; the `query_to_xml` family and `ts_stat` their
 /// first; the `cursor_to_xml` ones fetch from a cursor whatever it runs) —
-/// the `pg_proc` functions of PG 18 taking a query.
+/// the `pg_proc` functions of PG 19 taking a query.
 const SQL_RUNNING_BUILTINS: &[&str] = &[
     "query_to_xml",
     "query_to_xmlschema",
@@ -92,7 +92,7 @@ const SQL_RUNNING_BUILTINS: &[&str] = &[
     "ts_rewrite",
 ];
 
-/// The C symbols (`pg_proc.prosrc`, PG 18.6) of [`SQL_RUNNING_BUILTINS`]:
+/// The C symbols (`pg_proc.prosrc`, PG 19.0) of [`SQL_RUNNING_BUILTINS`]:
 /// a `LANGUAGE internal` or `c` routine naming one is an alias of it under
 /// another name (`ts_rewrite(tsquery, text)` is `tsquery_rewrite_query`).
 const SQL_RUNNING_SYMBOLS: &[&str] = &[

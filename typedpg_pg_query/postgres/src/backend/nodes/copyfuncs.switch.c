@@ -3,7 +3,7 @@
  * copyfuncs.switch.c
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -717,14 +717,14 @@
 		case T_AlterSystemStmt:
 			retval = _copyAlterSystemStmt(from);
 			break;
-		case T_ClusterStmt:
-			retval = _copyClusterStmt(from);
-			break;
 		case T_VacuumStmt:
 			retval = _copyVacuumStmt(from);
 			break;
 		case T_VacuumRelation:
 			retval = _copyVacuumRelation(from);
+			break;
+		case T_RepackStmt:
+			retval = _copyRepackStmt(from);
 			break;
 		case T_ExplainStmt:
 			retval = _copyExplainStmt(from);
@@ -786,6 +786,9 @@
 		case T_PublicationObjSpec:
 			retval = _copyPublicationObjSpec(from);
 			break;
+		case T_PublicationAllObjSpec:
+			retval = _copyPublicationAllObjSpec(from);
+			break;
 		case T_CreatePublicationStmt:
 			retval = _copyCreatePublicationStmt(from);
 			break;
@@ -800,6 +803,9 @@
 			break;
 		case T_DropSubscriptionStmt:
 			retval = _copyDropSubscriptionStmt(from);
+			break;
+		case T_WaitStmt:
+			retval = _copyWaitStmt(from);
 			break;
 		case T_PathKey:
 			retval = _copyPathKey(from);
@@ -821,6 +827,12 @@
 			break;
 		case T_PlaceHolderInfo:
 			retval = _copyPlaceHolderInfo(from);
+			break;
+		case T_AggClauseInfo:
+			retval = _copyAggClauseInfo(from);
+			break;
+		case T_GroupingExprInfo:
+			retval = _copyGroupingExprInfo(from);
 			break;
 		case T_PlannedStmt:
 			retval = _copyPlannedStmt(from);
@@ -971,6 +983,12 @@
 			break;
 		case T_PlanInvalItem:
 			retval = _copyPlanInvalItem(from);
+			break;
+		case T_SubPlanRTInfo:
+			retval = _copySubPlanRTInfo(from);
+			break;
+		case T_ElidedNode:
+			retval = _copyElidedNode(from);
 			break;
 		case T_Bitmapset:
 			retval = _copyBitmapset(from);

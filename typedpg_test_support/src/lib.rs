@@ -31,10 +31,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-/// pgvector 0.8.7's image of PostgreSQL 18.7: a pgvector release's tags
+/// pgvector 0.8.7's image of PostgreSQL 19.0: a pgvector release's tags
 /// are built once, on the PostgreSQL release of the day, so they stay on
-/// it (`pg18` alone follows every new minor release).
-const IMAGE: &str = "pgvector/pgvector:0.8.7-pg18-trixie";
+/// it (`pg19` alone follows every new minor release).
+const IMAGE: &str = "pgvector/pgvector:0.8.7-pg19-trixie";
 /// The PostgreSQL release typedpg targets, which [`IMAGE`] must run.
 const POSTGRES_VERSION: &str = include_str!("../../typedpg_pg_query/POSTGRES_VERSION");
 const USER: &str = "postgres";
@@ -192,7 +192,7 @@ fn start_or_reuse() -> PgServer {
         spawn_watchdog(&name);
     }
     wait_ready(&name);
-    // `postgres (PostgreSQL) 18.7 (Debian 18.7-1.pgdg13+2)`.
+    // `postgres (PostgreSQL) 19.0 (Debian 19.0-1.pgdg13+1)`.
     let out = docker(&["exec", &name, "postgres", "--version"]);
     let version = String::from_utf8_lossy(&out.stdout);
     assert_eq!(

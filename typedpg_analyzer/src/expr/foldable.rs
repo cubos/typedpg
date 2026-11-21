@@ -128,6 +128,23 @@ fn shape_here(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
             {
                 return Foldable::ANY;
             }
+            // `x IS [NOT] DISTINCT FROM NULL` of a non-NULL `x` is a
+            // constant (PostgreSQL 19).
+            if matches!(
+                e.kind,
+                ast::AExprKind::AexprDistinct | ast::AExprKind::AexprNotDistinct
+            ) {
+                let sides = [e.lexpr.as_ref(), e.rexpr.as_ref()];
+                let null_const =
+                    |n: Option<&ast::Node>| matches!(n, Some(ast::Node::AConst(c)) if c.isnull);
+                if sides.iter().any(|s| null_const(*s))
+                    && sides
+                        .iter()
+                        .any(|s| !null_const(*s) && planner_nonnullable(*s, ctx))
+                {
+                    return Foldable::VALUE;
+                }
+            }
             // The operands, a list's items each (`IN (…)`, `BETWEEN`); a
             // row comparison compares field by field, an AND / OR of
             // strict comparisons — a row with a field that may fold may
@@ -157,13 +174,41 @@ fn shape_here(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
                 }
             }
         }
+        // PostgreSQL 19 also folds a test of an expression proven
+        // non-NULL (expr_is_nonnullable): `a IS NULL` over a NOT NULL
+        // column is FALSE. A row's fields are tested one by one: one proven
+        // non-NULL makes IS NULL FALSE, all of them IS NOT NULL TRUE.
         ast::Node::NullTest(t) => match t.arg.as_ref() {
             Some(arg) if shape(Some(arg), ctx).may_fold() => Foldable::VALUE,
+            Some(ast::Node::RowExpr(r)) => {
+                let mut fields = r.args.iter().map(|f| planner_nonnullable(f.as_ref(), ctx));
+                let folds = if t.nulltesttype == ast::NullTestType::IsNull {
+                    fields.any(|n| n)
+                } else {
+                    fields.all(|n| n)
+                };
+                if folds {
+                    Foldable::VALUE
+                } else {
+                    Foldable::NEVER
+                }
+            }
+            Some(arg) if planner_nonnullable(Some(arg), ctx) => Foldable::VALUE,
             Some(_) => Foldable::NEVER,
             None => Foldable::VALUE,
         },
+        // IS [NOT] UNKNOWN of a non-NULL expression is a constant; IS TRUE
+        // / FALSE becomes the expression (or its negation).
         ast::Node::BooleanTest(t) => match t.arg.as_ref() {
             Some(arg) if shape(Some(arg), ctx).may_fold() => Foldable::VALUE,
+            Some(arg)
+                if matches!(
+                    t.booltesttype,
+                    ast::BoolTestType::IsUnknown | ast::BoolTestType::IsNotUnknown
+                ) && planner_nonnullable(Some(arg), ctx) =>
+            {
+                Foldable::VALUE
+            }
             Some(_) => Foldable::NEVER,
             None => Foldable::VALUE,
         },
@@ -243,6 +288,137 @@ fn shape_here(node: Option<&ast::Node>, ctx: Ctx<'_>) -> Foldable {
         ast::Node::MinMaxExpr(m) => strict(m.args.iter().map(|n| shape(n.as_ref(), ctx))),
         // Anything else (a SQL/JSON or XML construct, …) may.
         _ => Foldable::ANY,
+    }
+}
+
+/// `expr_is_nonnullable` (clauses.c, PostgreSQL 19), as the planner's
+/// constant folding asks it (`NOTNULL_SOURCE_HASHTABLE`): a column of this
+/// level's table with a valid NOT NULL constraint that no outer join nulls
+/// (`varnullingrels`) — not an inheritance parent's that also scans its
+/// children, not RETURNING's OLD / NEW —, a system column, a non-NULL
+/// constant, a COALESCE or GREATEST / LEAST with such an argument, a CASE
+/// whose results and ELSE all are, an ARRAY[...], a NULL or boolean test.
+/// It errs towards `true`: proving more only makes the analyzer assume
+/// less is folded, never report an error PG doesn't raise.
+pub(crate) fn planner_nonnullable(node: Option<&ast::Node>, ctx: Ctx<'_>) -> bool {
+    crate::stack::step(|| match node {
+        None => false,
+        Some(ast::Node::ColumnRef(cr)) => column_nonnullable(cr, ctx),
+        Some(ast::Node::AConst(c)) => !c.isnull,
+        Some(ast::Node::CoalesceExpr(c)) => {
+            c.args.iter().any(|a| planner_nonnullable(a.as_ref(), ctx))
+        }
+        Some(ast::Node::MinMaxExpr(m)) => {
+            m.args.iter().any(|a| planner_nonnullable(a.as_ref(), ctx))
+        }
+        Some(ast::Node::CaseExpr(c)) => {
+            c.defresult
+                .as_ref()
+                .is_some_and(|d| planner_nonnullable(Some(d), ctx))
+                && c.args.iter().all(|w| match w.as_ref() {
+                    Some(ast::Node::CaseWhen(w)) => planner_nonnullable(w.result.as_ref(), ctx),
+                    _ => false,
+                })
+        }
+        Some(ast::Node::AArrayExpr(_) | ast::Node::NullTest(_) | ast::Node::BooleanTest(_)) => true,
+        // A binary-coercible cast is a RelabelType over its argument.
+        Some(ast::Node::TypeCast(tc)) => planner_nonnullable(tc.arg.as_ref(), ctx),
+        Some(ast::Node::CollateClause(c)) => planner_nonnullable(c.arg.as_ref(), ctx),
+        _ => false,
+    })
+}
+
+/// [`planner_nonnullable`] of a column reference.
+fn column_nonnullable(cr: &ast::ColumnRef, ctx: Ctx<'_>) -> bool {
+    let parts: Vec<&str> = cr
+        .fields
+        .iter()
+        .map(|f| match f.as_ref() {
+            Some(ast::Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .unwrap_or_default();
+    let (table, name) = match parts.as_slice() {
+        [name] => (None, *name),
+        [table, name] | [_, table, name] => (Some(*table), *name),
+        _ => return false,
+    };
+    column_name_nonnullable(table, name, ctx, 0)
+}
+
+/// [`column_nonnullable`] of the column a join alias stands for: an entry
+/// of the scope, or one hidden inside the join (another join's merged
+/// column, or a base column known by its own NOT NULL).
+fn join_target_nonnullable(target: ((String, String), bool), ctx: Ctx<'_>, depth: u32) -> bool {
+    let ((alias, column), not_null) = target;
+    if ctx.scope.sources.iter().any(|s| s.alias == alias) {
+        return column_name_nonnullable(Some(&alias), &column, ctx, depth);
+    }
+    if depth < 8
+        && let Some(next) = ctx
+            .null_ctx
+            .join_alias_target(&(alias.clone(), column.clone()))
+    {
+        return join_target_nonnullable(next, ctx, depth + 1);
+    }
+    not_null && !ctx.null_ctx.syntactically_nulled(&alias)
+}
+
+/// [`column_nonnullable`] of the column `name` (of FROM item `table`).
+/// `depth` > 0 follows a join alias into the entry it hides, by name.
+fn column_name_nonnullable(table: Option<&str>, name: &str, ctx: Ctx<'_>, depth: u32) -> bool {
+    let scope = ctx.scope;
+    let col = if depth > 0 {
+        let Some(c) = scope
+            .sources
+            .iter()
+            .filter(|s| table.is_some_and(|t| s.alias == t))
+            .find_map(|s| s.columns.iter().find(|c| c.name == name))
+        else {
+            return false;
+        };
+        c
+    } else {
+        let Ok(c) = scope.resolve_column(table, name, None) else {
+            return false;
+        };
+        c
+    };
+    // This level's entry only (varlevelsup = 0).
+    let Some(source) = scope.sources.iter().find(|s| {
+        s.columns
+            .iter()
+            .chain(s.system_columns.iter())
+            .any(|c| std::ptr::eq(c, col))
+    }) else {
+        return false;
+    };
+    // An aliased join's column, or a merged one, is flattened into the
+    // column it stands for.
+    if depth < 8
+        && let Some(target) = ctx
+            .null_ctx
+            .join_alias_target(&(source.alias.clone(), name.to_owned()))
+    {
+        return join_target_nonnullable(target, ctx, depth + 1);
+    }
+    if source.table_only || source.null_row {
+        return false;
+    }
+    if ctx.null_ctx.syntactically_nulled(&source.alias) {
+        return false;
+    }
+    if source.system_columns.iter().any(|c| std::ptr::eq(c, col)) {
+        return true;
+    }
+    match &col.origin {
+        Some(origin) => {
+            let partitioned = ctx.snapshot.pg_class.get(&origin.relid).map(|c| c.relkind)
+                == Some(crate::pg_catalog::RelKind::Partitioned);
+            origin.base_not_null && (!origin.with_children || partitioned)
+        }
+        None => false,
     }
 }
 

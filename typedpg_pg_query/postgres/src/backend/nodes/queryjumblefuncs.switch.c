@@ -3,7 +3,7 @@
  * queryjumblefuncs.switch.c
  *    Generated node infrastructure code
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -708,14 +708,14 @@
 			case T_AlterSystemStmt:
 				_jumbleAlterSystemStmt(jstate, expr);
 				break;
-			case T_ClusterStmt:
-				_jumbleClusterStmt(jstate, expr);
-				break;
 			case T_VacuumStmt:
 				_jumbleVacuumStmt(jstate, expr);
 				break;
 			case T_VacuumRelation:
 				_jumbleVacuumRelation(jstate, expr);
+				break;
+			case T_RepackStmt:
+				_jumbleRepackStmt(jstate, expr);
 				break;
 			case T_ExplainStmt:
 				_jumbleExplainStmt(jstate, expr);
@@ -777,6 +777,9 @@
 			case T_PublicationObjSpec:
 				_jumblePublicationObjSpec(jstate, expr);
 				break;
+			case T_PublicationAllObjSpec:
+				_jumblePublicationAllObjSpec(jstate, expr);
+				break;
 			case T_CreatePublicationStmt:
 				_jumbleCreatePublicationStmt(jstate, expr);
 				break;
@@ -792,8 +795,17 @@
 			case T_DropSubscriptionStmt:
 				_jumbleDropSubscriptionStmt(jstate, expr);
 				break;
+			case T_WaitStmt:
+				_jumbleWaitStmt(jstate, expr);
+				break;
 			case T_GroupByOrdering:
 				_jumbleGroupByOrdering(jstate, expr);
+				break;
+			case T_SubPlanRTInfo:
+				_jumbleSubPlanRTInfo(jstate, expr);
+				break;
+			case T_ElidedNode:
+				_jumbleElidedNode(jstate, expr);
 				break;
 			case T_ExtensibleNode:
 				_jumbleExtensibleNode(jstate, expr);

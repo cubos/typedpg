@@ -554,7 +554,7 @@ fn enum_label_changes_follow_pg() {
         ),
         (
             "CREATE TYPE e2 AS ENUM ('a', 'a');",
-            "duplicate key value violates unique constraint \"pg_enum_typid_label_index\"",
+            "enum label \"a\" used more than once",
         ),
     ] {
         let err = try_apply(&[

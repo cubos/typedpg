@@ -309,7 +309,7 @@ fn refresh_reports_what_every_execution_raises() {
     assert_err_prefix!(
         db.analyze("REFRESH MATERIALIZED VIEW CONCURRENTLY ut_mv_unique WITH NO DATA"),
         AnalyzeError::SyntaxError(_),
-        "CONCURRENTLY and WITH NO DATA options cannot be used together"
+        "REFRESH options CONCURRENTLY and WITH NO DATA cannot be used together"
     );
 }
 

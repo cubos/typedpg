@@ -95,7 +95,7 @@ fn main() {
         format!(
             "/// The PostgreSQL release this parser implements (POSTGRES_VERSION).\n\
              pub const PG_VERSION: &str = \"{postgres_version}\";\n\
-             /// [`PG_VERSION`] as `PG_VERSION_NUM` (`180007` for 18.7).\n\
+             /// [`PG_VERSION`] as `PG_VERSION_NUM` (`190000` for 19.0).\n\
              pub const PG_VERSION_NUM: i32 = {num};\n",
         ),
     )

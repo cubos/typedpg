@@ -45,6 +45,18 @@ pub(crate) fn create_tablespace(
     interp: &mut PgCatalog,
     stmt: &CreateTableSpaceStmt,
 ) -> Result<(), DdlError> {
+    // CreateTableSpace (PostgreSQL 19).
+    if stmt.location.contains('\'') {
+        return Err(DdlError::Parse(
+            "tablespace location cannot contain single quotes".into(),
+        ));
+    }
+    if stmt.tablespacename.contains(['\n', '\r']) {
+        return Err(DdlError::Parse(format!(
+            "tablespace name \"{}\" contains a newline or carriage return character",
+            stmt.tablespacename
+        )));
+    }
     if tablespace_exists(interp, &stmt.tablespacename) {
         return Err(DdlError::DuplicateObject(format!(
             "tablespace \"{}\" already exists",
@@ -84,6 +96,10 @@ pub(crate) fn create_subscription(
             stmt.subname
         )));
     }
+    // PostgreSQL 19's `SERVER name`.
+    if !stmt.servername.is_empty() {
+        super::fdw::check_subscription_server(interp, &stmt.servername)?;
+    }
     interp
         .cluster_objects
         .subscriptions
@@ -91,7 +107,8 @@ pub(crate) fn create_subscription(
     Ok(())
 }
 
-pub(crate) fn alter_subscription(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
+/// get_subscription_oid.
+pub(crate) fn check_subscription(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
     if subscription_exists(interp, name) {
         Ok(())
     } else {
@@ -99,6 +116,18 @@ pub(crate) fn alter_subscription(interp: &PgCatalog, name: &str) -> Result<(), D
             "subscription \"{name}\" does not exist"
         )))
     }
+}
+
+pub(crate) fn alter_subscription(
+    interp: &PgCatalog,
+    stmt: &typedpg_pg_query::ast::AlterSubscriptionStmt,
+) -> Result<(), DdlError> {
+    check_subscription(interp, &stmt.subname)?;
+    // PostgreSQL 19's `ALTER SUBSCRIPTION ... SERVER name`.
+    if stmt.kind == typedpg_pg_query::ast::AlterSubscriptionType::AlterSubscriptionServer {
+        super::fdw::check_subscription_server(interp, &stmt.servername)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn drop_subscription(

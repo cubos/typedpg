@@ -1141,9 +1141,29 @@ fn set_op_rows(
     if sel.with_clause.is_some() {
         return None;
     }
+    // generate_nonunion_paths (PostgreSQL 19): an INTERSECT with an input
+    // proven empty, or an EXCEPT whose left one is, is a dummy relation —
+    // neither input runs.
+    let dummy = [&sel.larg, &sel.rarg].map(|arm| arm.as_deref().is_some_and(dummy_leaf));
+    let width = leftmost(sel).target_list.len();
+    if (sel.op == Op::SetopIntersect && (dummy[0] || dummy[1]))
+        || (sel.op == Op::SetopExcept && dummy[0])
+    {
+        let none = Errors {
+            columns: vec![None; width],
+            always: None,
+        };
+        return Some(Rows::unknown_values(
+            none.clone(),
+            none,
+            Count {
+                at_least_one: false,
+                at_most_one: true,
+            },
+        ));
+    }
     let arms = [&sel.larg, &sel.rarg]
         .map(|arm| query_rows(arm.as_deref()?, snapshot, ctes, depth + 1, stored));
-    let width = leftmost(sel).target_list.len();
     let [left, right] = &arms;
     let (all, first, sorted, count) = match sel.op {
         Op::SetopUnion => {
@@ -1418,6 +1438,20 @@ fn pushdown_unsafe_tree(sel: &ast::SelectStmt) -> bool {
             } else {
                 arm.op != ast::SetOperation::SetopNone
             }
+        })
+}
+
+/// A set operation's leaf the planner proves empty (a dummy relation): a
+/// select over one FROM item whose WHERE folds to FALSE or NULL. (One over
+/// no FROM item is a Result with a One-Time Filter, not a dummy relation.)
+fn dummy_leaf(s: &ast::SelectStmt) -> bool {
+    s.op == ast::SetOperation::SetopNone
+        && s.from_clause.len() == 1
+        && s.group_clause.is_empty()
+        && s.having_clause.is_none()
+        && s.where_clause.as_ref().is_some_and(|w| {
+            matches!(w, ast::Node::AConst(c) if c.isnull)
+                || truth_with(Some(w), &literal_value) == Some(false)
         })
 }
 
@@ -2445,6 +2479,7 @@ fn substitute(
                 agg_distinct: fc.agg_distinct,
                 func_variadic: fc.func_variadic,
                 funcformat: fc.funcformat,
+                ignore_nulls: fc.ignore_nulls,
                 location: fc.location,
             })))
         }

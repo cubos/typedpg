@@ -25,7 +25,7 @@
 
 static SyscacheCallbackFunction syscache_callbacks[MAX_SYSCACHE_CALLBACKS];
 static Datum syscache_callback_args[MAX_SYSCACHE_CALLBACKS];
-static int	syscache_callback_cacheids[MAX_SYSCACHE_CALLBACKS];
+static SysCacheIdentifier syscache_callback_cacheids[MAX_SYSCACHE_CALLBACKS];
 static int	nsyscache_callbacks = 0;
 
 Oid
@@ -54,7 +54,7 @@ object_aclcheck(Oid classid, Oid objectid, Oid roleid, AclMode mode)
 }
 
 void
-CacheRegisterSyscacheCallback(int cacheid, SyscacheCallbackFunction func, Datum arg)
+CacheRegisterSyscacheCallback(SysCacheIdentifier cacheid, SyscacheCallbackFunction func, Datum arg)
 {
 	if (nsyscache_callbacks >= MAX_SYSCACHE_CALLBACKS)
 		elog(ERROR, "typedpg: too many syscache callbacks");

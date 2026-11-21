@@ -3,7 +3,7 @@
  * spi.h
  *				Server Programming Interface public declarations
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/spi.h
@@ -111,7 +111,7 @@ extern int	SPI_finish(void);
 extern int	SPI_execute(const char *src, bool read_only, long tcount);
 extern int	SPI_execute_extended(const char *src,
 								 const SPIExecuteOptions *options);
-extern int	SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
+extern int	SPI_execute_plan(SPIPlanPtr plan, const Datum *Values, const char *Nulls,
 							 bool read_only, long tcount);
 extern int	SPI_execute_plan_extended(SPIPlanPtr plan,
 									  const SPIExecuteOptions *options);
@@ -119,16 +119,16 @@ extern int	SPI_execute_plan_with_paramlist(SPIPlanPtr plan,
 											ParamListInfo params,
 											bool read_only, long tcount);
 extern int	SPI_exec(const char *src, long tcount);
-extern int	SPI_execp(SPIPlanPtr plan, Datum *Values, const char *Nulls,
+extern int	SPI_execp(SPIPlanPtr plan, const Datum *Values, const char *Nulls,
 					  long tcount);
 extern int	SPI_execute_snapshot(SPIPlanPtr plan,
-								 Datum *Values, const char *Nulls,
+								 const Datum *Values, const char *Nulls,
 								 Snapshot snapshot,
 								 Snapshot crosscheck_snapshot,
 								 bool read_only, bool fire_triggers, long tcount);
 extern int	SPI_execute_with_args(const char *src,
 								  int nargs, Oid *argtypes,
-								  Datum *Values, const char *Nulls,
+								  const Datum *Values, const char *Nulls,
 								  bool read_only, long tcount);
 extern SPIPlanPtr SPI_prepare(const char *src, int nargs, Oid *argtypes);
 extern SPIPlanPtr SPI_prepare_cursor(const char *src, int nargs, Oid *argtypes,
@@ -155,7 +155,7 @@ extern CachedPlan *SPI_plan_get_cached_plan(SPIPlanPtr plan);
 extern HeapTuple SPI_copytuple(HeapTuple tuple);
 extern HeapTupleHeader SPI_returntuple(HeapTuple tuple, TupleDesc tupdesc);
 extern HeapTuple SPI_modifytuple(Relation rel, HeapTuple tuple, int natts,
-								 int *attnum, Datum *Values, const char *Nulls);
+								 int *attnum, const Datum *Values, const char *Nulls);
 extern int	SPI_fnumber(TupleDesc tupdesc, const char *fname);
 extern char *SPI_fname(TupleDesc tupdesc, int fnumber);
 extern char *SPI_getvalue(HeapTuple tuple, TupleDesc tupdesc, int fnumber);
@@ -172,11 +172,11 @@ extern void SPI_freetuple(HeapTuple tuple);
 extern void SPI_freetuptable(SPITupleTable *tuptable);
 
 extern Portal SPI_cursor_open(const char *name, SPIPlanPtr plan,
-							  Datum *Values, const char *Nulls, bool read_only);
+							  const Datum *Values, const char *Nulls, bool read_only);
 extern Portal SPI_cursor_open_with_args(const char *name,
 										const char *src,
 										int nargs, Oid *argtypes,
-										Datum *Values, const char *Nulls,
+										const Datum *Values, const char *Nulls,
 										bool read_only, int cursorOptions);
 extern Portal SPI_cursor_open_with_paramlist(const char *name, SPIPlanPtr plan,
 											 ParamListInfo params, bool read_only);

@@ -775,6 +775,17 @@ fn check_call_shape(
                 None,
             ));
         }
+        // PostgreSQL 19's null treatment (`IGNORE NULLS` / `RESPECT NULLS`)
+        // is for window functions only.
+        if func.ignore_nulls != 0 {
+            return fail(crate::error::RawError::new(
+                AnalyzeError::WrongObjectType(format!(
+                    "RESPECT/IGNORE NULLS specified, but {w} is not a window function"
+                )),
+                span,
+                None,
+            ));
+        }
         return Ok(());
     }
     let Some(resolved) = resolved else {
@@ -842,6 +853,15 @@ fn check_call_shape(
             }
         } else if func.agg_within_group {
             return fail(pgmsg::not_an_ordered_set_aggregate(&w, span));
+        }
+        if func.ignore_nulls != 0 {
+            return fail(crate::error::RawError::new(
+                AnalyzeError::WrongObjectType(
+                    "aggregate functions do not accept RESPECT/IGNORE NULLS".into(),
+                ),
+                span,
+                None,
+            ));
         }
     }
 
@@ -2056,6 +2076,9 @@ fn transform_window_def(
         if detect_func_kinds(e, ctx.snapshot).has_window {
             return fail(pgmsg::window_in_window_definition(span));
         }
+        // check_srf_call_placement (PostgreSQL 19): no set-returning
+        // function in PARTITION BY or ORDER BY either.
+        crate::resolve::check_no_srf_in_clause(e, ctx.snapshot, "window definitions")?;
     }
     infer_window_exprs(wd, ctx, params)?;
 
@@ -2377,6 +2400,11 @@ fn resolve_func_nullability(
                     .is_some_and(|n| is_zero_constant(n.as_ref())) =>
             {
                 arg_is_nullable(0)
+            }
+            // PostgreSQL 19's IGNORE NULLS (PARSER_IGNORE_NULLS) skips the
+            // NULL values: the result is a non-NULL one, or the default.
+            "lag" | "lead" if func.args.len() >= 3 && func.ignore_nulls == 1 => {
+                arg_is_nullable(1) || arg_is_nullable(2)
             }
             "lag" | "lead" if func.args.len() >= 3 => {
                 arg_is_nullable(0) || arg_is_nullable(1) || arg_is_nullable(2)

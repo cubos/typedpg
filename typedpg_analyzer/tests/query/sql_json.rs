@@ -93,7 +93,7 @@ fn constructors_and_parse_functions_result_types() {
             c("o3", json()),
             c("o4", text()),
             c("a1", json()),
-            cn("a2", json()),
+            c("a2", json()),
             c("a3", json()),
             c("a4", jsonb()),
         ],
@@ -137,7 +137,7 @@ fn constructors_return_jsonb_when_an_argument_is_jsonb() {
             c("b", jsonb()),
             c("c", jsonb()),
             c("d", jsonb()),
-            cn("e", jsonb()),
+            c("e", jsonb()),
             c("g", jsonb()),
             c("h", json()),
         ],
@@ -265,6 +265,13 @@ fn sql_json_errors_match_pg() {
     ] {
         assert_err_prefix!(db.analyze(sql), AnalyzeError::DatatypeMismatch(_), msg);
     }
+    // The input's own type is named: the domain, not its base type.
+    let with_domain = build_db(&[("0001.sql", "CREATE DOMAIN di AS int;")]);
+    assert_err_prefix!(
+        with_domain.analyze("SELECT 1::di IS JSON"),
+        AnalyzeError::DatatypeMismatch(_),
+        "cannot use type di in IS JSON predicate"
+    );
     for (sql, msg) in [
         (
             "SELECT JSON_VALUE(j, '$.a' EMPTY ARRAY ON ERROR) FROM t",

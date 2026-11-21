@@ -23,6 +23,8 @@ pub(crate) struct Publication {
     via_root: bool,
     /// `puballtables`: FOR ALL TABLES.
     all_tables: bool,
+    /// `puballsequences`: FOR ALL SEQUENCES (PostgreSQL 19).
+    all_sequences: bool,
 }
 
 /// A `pg_publication_rel` row: whether it has a row filter (`prqual`) and
@@ -35,6 +37,9 @@ struct PubRel {
     relid: PgClassOid,
     has_filter: bool,
     has_columns: bool,
+    /// `prexcept` (PostgreSQL 19): a FOR ALL TABLES publication's EXCEPT
+    /// entry, not a published table.
+    except: bool,
 }
 
 enum Object<'a> {
@@ -150,7 +155,9 @@ fn check_options(options: &[Option<typedpg_pg_query::ast::Node>]) -> Result<Opti
 /// ObjectsInPublicationToOids + OpenTableList: resolve the objects, with
 /// continuation entries taking the kind of the one before
 /// (preprocess_pubobj_list). A table named twice is kept once, unless
-/// either mention has a row filter or a column list.
+/// either mention has a row filter or a column list; a table named without
+/// ONLY brings its inheritance children along (not a partitioned table's
+/// partitions), with its row filter and column list.
 fn resolve_objects<'a>(
     interp: &PgCatalog,
     objects: &'a [Option<typedpg_pg_query::ast::Node>],
@@ -166,7 +173,8 @@ fn resolve_objects<'a>(
             kind = t;
         }
         match kind {
-            PublicationObjSpecType::PublicationobjTable => {
+            PublicationObjSpecType::PublicationobjTable
+            | PublicationObjSpecType::PublicationobjExceptTable => {
                 let Some(pt) = spec.pubtable.as_deref() else {
                     continue;
                 };
@@ -180,27 +188,54 @@ fn resolve_objects<'a>(
                     relid,
                     has_filter: pt.where_clause.is_some(),
                     has_columns: !pt.columns.is_empty(),
+                    except: kind == PublicationObjSpecType::PublicationobjExceptTable,
                 };
-                let earlier = out.iter().find_map(|o| match o {
-                    Object::Table(r, _) if r.relid == relid => Some(*r),
-                    _ => None,
-                });
-                if let Some(earlier) = earlier {
+                let earlier = |out: &[Object<'_>], relid: PgClassOid| {
+                    out.iter().find_map(|o| match o {
+                        Object::Table(r, _) if r.relid == relid => Some(*r),
+                        _ => None,
+                    })
+                };
+                let conflict = |what: &str, name: &str| {
+                    DdlError::DuplicateObject(format!(
+                        "conflicting or redundant {what} for table \"{name}\""
+                    ))
+                };
+                if let Some(earlier) = earlier(&out, relid) {
                     if rel.has_filter || earlier.has_filter {
-                        return Err(DdlError::DuplicateObject(format!(
-                            "conflicting or redundant WHERE clauses for table \"{}\"",
-                            rv.relname
-                        )));
+                        return Err(conflict("WHERE clauses", &relname(interp, relid)));
                     }
                     if rel.has_columns || earlier.has_columns {
-                        return Err(DdlError::DuplicateObject(format!(
-                            "conflicting or redundant column lists for table \"{}\"",
-                            rv.relname
-                        )));
+                        return Err(conflict("column lists", &relname(interp, relid)));
                     }
                     continue;
                 }
                 out.push(Object::Table(rel, pt));
+                if !rv.inh || is_partitioned(interp, relid) {
+                    continue;
+                }
+                // The error names the relation opened last — the parent, or
+                // the child added before (OpenTableList reuses `rel`).
+                let mut opened = relid;
+                for child in super::tables::inherit::all_inheritors(interp, relid) {
+                    if let Some(earlier) = earlier(&out, child) {
+                        if child != relid && (rel.has_filter || earlier.has_filter) {
+                            return Err(conflict("WHERE clauses", &relname(interp, opened)));
+                        }
+                        if child != relid && (rel.has_columns || earlier.has_columns) {
+                            return Err(conflict("column lists", &relname(interp, opened)));
+                        }
+                        continue;
+                    }
+                    opened = child;
+                    out.push(Object::Table(
+                        PubRel {
+                            relid: child,
+                            ..rel
+                        },
+                        pt,
+                    ));
+                }
             }
             PublicationObjSpecType::PublicationobjTablesInSchema => {
                 let Some(ns) = interp.namespace_oid(&spec.name) else {
@@ -233,6 +268,14 @@ fn relname(interp: &PgCatalog, relid: PgClassOid) -> String {
 
 fn is_partitioned(interp: &PgCatalog, relid: PgClassOid) -> bool {
     interp.pg_class.get(&relid).map(|c| c.relkind) == Some(RelKind::Partitioned)
+}
+
+/// `relispartition`.
+fn is_partition(interp: &PgCatalog, relid: PgClassOid) -> bool {
+    interp
+        .pg_inherits
+        .iter()
+        .any(|i| i.inhrelid == relid && is_partitioned(interp, i.inhparent))
 }
 
 /// The checks tables being added to publication `pubname` go through:
@@ -288,9 +331,35 @@ fn check_tables_to_add(
             "cannot use column list for relation \"{qn}\" in publication \"{pubname}\" ({detail})"
         )));
     }
-    for (relid, pt) in tables() {
-        let relname = relname(interp, relid);
-        // check_publication_add_relation.
+    for object in objects {
+        let Object::Table(rel, pt) = object else {
+            continue;
+        };
+        let relid = rel.relid;
+        // check_publication_add_relation: an EXCEPT entry is named with its
+        // schema (unquoted, the message quotes the whole name), and must be
+        // a root table.
+        let cannot = if rel.except {
+            let class = interp.pg_class.get(&relid);
+            let name = format!(
+                "{}.{}",
+                class
+                    .and_then(|c| interp.namespace_name(c.relnamespace))
+                    .unwrap_or_default(),
+                class.map(|c| c.relname.as_str()).unwrap_or_default()
+            );
+            format!("cannot specify relation \"{name}\" in the publication EXCEPT clause")
+        } else {
+            format!(
+                "cannot add relation \"{}\" to publication",
+                relname(interp, relid)
+            )
+        };
+        if rel.except && is_partition(interp, relid) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "{cannot} (This operation is not supported for individual partitions.)"
+            )));
+        }
         let kinds = match interp.pg_class.get(&relid).map(|c| c.relkind) {
             Some(RelKind::Table | RelKind::Partitioned) => None,
             Some(RelKind::View) => Some("views"),
@@ -301,8 +370,7 @@ fn check_tables_to_add(
         };
         if let Some(kinds) = kinds {
             return Err(DdlError::UnsupportedDdl(format!(
-                "cannot add relation \"{relname}\" to publication (This operation is not \
-                 supported for {kinds}.)"
+                "{cannot} (This operation is not supported for {kinds}.)"
             )));
         }
         // Not a system table (IsCatalogRelation), nor a temporary or
@@ -317,10 +385,9 @@ fn check_tables_to_add(
             }
         };
         if let Some(detail) = detail {
-            return Err(DdlError::UnsupportedDdl(format!(
-                "cannot add relation \"{relname}\" to publication ({detail})"
-            )));
+            return Err(DdlError::UnsupportedDdl(format!("{cannot} ({detail})")));
         }
+        let relname = self::relname(interp, relid);
         // pub_collist_validate.
         let mut seen: Vec<&str> = Vec::new();
         for col in pt
@@ -389,26 +456,54 @@ fn check_schemas_to_add(interp: &PgCatalog, objects: &[Object<'_>]) -> Result<()
     Ok(())
 }
 
-/// CheckAlterPublication: a FOR ALL TABLES publication gains or loses no
-/// tables or schemas.
-fn check_alter_all_tables(
+/// CheckAlterPublication: a FOR ALL TABLES / ALL SEQUENCES publication
+/// gains or loses no tables (its EXCEPT entries aside) or schemas, and only
+/// one with neither switches to SET ALL TABLES / ALL SEQUENCES.
+fn check_alter_publication(
     publication: &Publication,
+    stmt: &AlterPublicationStmt,
     objects: &[Object<'_>],
 ) -> Result<(), DdlError> {
-    if !publication.all_tables {
-        return Ok(());
-    }
-    let detail = if objects.iter().any(|o| matches!(o, Object::Schema(_))) {
-        "Schemas cannot be added to or dropped from FOR ALL TABLES publications."
-    } else if objects.iter().any(|o| matches!(o, Object::Table(..))) {
-        "Tables cannot be added to or dropped from FOR ALL TABLES publications."
-    } else {
-        return Ok(());
+    let kind = match (publication.all_tables, publication.all_sequences) {
+        (true, true) => Some("ALL TABLES, ALL SEQUENCES"),
+        (true, false) => Some("ALL TABLES"),
+        (false, true) => Some("ALL SEQUENCES"),
+        (false, false) => None,
     };
-    Err(DdlError::Parse(format!(
-        "publication \"{}\" is defined as FOR ALL TABLES ({detail})",
-        publication.name
-    )))
+    if let Some(kind) = kind {
+        let detail = if objects.iter().any(|o| matches!(o, Object::Schema(_))) {
+            "Schemas cannot be added to or dropped from"
+        } else if objects
+            .iter()
+            .any(|o| matches!(o, Object::Table(rel, _) if !rel.except))
+        {
+            "Tables or sequences cannot be added to or dropped from"
+        } else {
+            ""
+        };
+        if !detail.is_empty() {
+            return Err(DdlError::Parse(format!(
+                "publication \"{}\" is defined as FOR {kind} ({detail} FOR {kind} \
+                 publications.)",
+                publication.name
+            )));
+        }
+    }
+    if (stmt.for_all_tables || stmt.for_all_sequences)
+        && (publication.tables.iter().any(|t| !t.except) || !publication.schemas.is_empty())
+    {
+        return Err(DdlError::Parse(format!(
+            "publication \"{}\" does not support {} operations (This operation requires the \
+             publication to be defined as FOR ALL TABLES/SEQUENCES or to be empty.)",
+            publication.name,
+            if stmt.for_all_tables {
+                "ALL TABLES"
+            } else {
+                "ALL SEQUENCES"
+            }
+        )));
+    }
+    Ok(())
 }
 
 /// TransformPubWhereClauses: the row filter is transformed as a WHERE
@@ -623,15 +718,20 @@ pub fn create_publication(
     let options = check_options(&stmt.options)?;
     let via_root = options.via_root.unwrap_or(false);
     let objects = resolve_objects(interp, &stmt.pubobjects)?;
-    let with_schemas = objects.iter().any(|o| matches!(o, Object::Schema(_)));
-    check_tables_to_add(interp, &stmt.pubname, &objects, via_root, with_schemas)?;
-    check_schemas_to_add(interp, &objects)?;
+    // FOR ALL TABLES only adds its EXCEPT entries, FOR ALL SEQUENCES alone
+    // nothing (the grammar gives neither anything else).
+    if stmt.for_all_tables || !stmt.for_all_sequences {
+        let with_schemas = objects.iter().any(|o| matches!(o, Object::Schema(_)));
+        check_tables_to_add(interp, &stmt.pubname, &objects, via_root, with_schemas)?;
+        check_schemas_to_add(interp, &objects)?;
+    }
     let mut publication = Publication {
         name: stmt.pubname.clone(),
         tables: Vec::new(),
         schemas: Vec::new(),
         via_root,
         all_tables: stmt.for_all_tables,
+        all_sequences: stmt.for_all_sequences,
     };
     let mut tables = Vec::new();
     for object in objects {
@@ -713,7 +813,8 @@ pub fn alter_publication(
     let objects = resolve_objects(interp, &stmt.pubobjects)?;
     let adds_schemas = objects.iter().any(|o| matches!(o, Object::Schema(_)));
     let publication = &interp.publications[index];
-    check_alter_all_tables(publication, &objects)?;
+    check_alter_publication(publication, stmt, &objects)?;
+    let set_all = stmt.for_all_tables || stmt.for_all_sequences;
     match action {
         AlterPublicationAction::ApAddObjects => {
             let with_schemas = adds_schemas || !publication.schemas.is_empty();
@@ -820,21 +921,47 @@ pub fn alter_publication(
                     Object::Schema(ns) => publication.schemas.push(ns),
                 }
             }
+            // AlterPublicationAllFlags.
+            if set_all {
+                publication.all_tables = stmt.for_all_tables;
+                publication.all_sequences = stmt.for_all_sequences;
+            }
         }
     }
     register_tables(interp, &stmt.pubname, &added)
 }
 
-/// DROP PUBLICATION [IF EXISTS] name.
-/// GetRelationPublications (pg_publication.c): whether a publication lists
-/// the table itself (`pg_publication_rel`).
+/// GetRelationIncludedPublications (pg_publication.c): whether a
+/// publication lists the table itself (`pg_publication_rel`, not an EXCEPT
+/// entry).
 pub(crate) fn relation_in_publication(interp: &PgCatalog, relid: PgClassOid) -> bool {
+    interp
+        .publications
+        .iter()
+        .any(|p| p.tables.iter().any(|t| t.relid == relid && !t.except))
+}
+
+/// RelationHasPublication (PostgreSQL 19): whether any publication lists
+/// the table, published or in its EXCEPT clause.
+pub(crate) fn relation_has_publication(interp: &PgCatalog, relid: PgClassOid) -> bool {
     interp
         .publications
         .iter()
         .any(|p| p.tables.iter().any(|t| t.relid == relid))
 }
 
+/// GetRelationExcludedPublications (PostgreSQL 19): the publications whose
+/// EXCEPT clause names the table, in creation order.
+pub(crate) fn publications_excluding(interp: &PgCatalog, relid: PgClassOid) -> Vec<String> {
+    interp
+        .publications
+        .iter()
+        .filter(|p| p.tables.iter().any(|t| t.relid == relid && t.except))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// DROP PUBLICATION [IF EXISTS] name.
 pub(crate) fn drop_publication(
     interp: &mut PgCatalog,
     obj_node: Option<&typedpg_pg_query::ast::Node>,

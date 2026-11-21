@@ -544,7 +544,8 @@ impl Run {
 
 /// Statements a PL/pgSQL block can't run the way a migration does: those
 /// PreventInTransactionBlock / RequireTransactionBlock refuse from a
-/// function, and transaction control (only a non-atomic DO may commit).
+/// function, WAIT (top level only, PostgreSQL 19), and transaction control
+/// (only a non-atomic DO may commit).
 fn runs_in_a_function(sql: &str) -> bool {
     let Ok(parsed) = typedpg_pg_query::parse(sql) else {
         return true;
@@ -556,7 +557,8 @@ fn runs_in_a_function(sql: &str) -> bool {
                 ast::Node::TransactionStmt(_)
                     | ast::Node::VacuumStmt(_)
                     | ast::Node::ReindexStmt(_)
-                    | ast::Node::ClusterStmt(_)
+                    | ast::Node::RepackStmt(_)
+                    | ast::Node::WaitStmt(_)
                     | ast::Node::CreatedbStmt(_)
                     | ast::Node::DropdbStmt(_)
                     | ast::Node::CreateTableSpaceStmt(_)

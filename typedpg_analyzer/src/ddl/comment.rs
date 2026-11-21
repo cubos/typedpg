@@ -515,7 +515,7 @@ pub(crate) fn resolve_object(
         }
         ObjectType::ObjectSubscription => {
             if let ast::Node::String(s) = object {
-                super::cluster::alter_subscription(interp, &s.sval)?;
+                super::cluster::check_subscription(interp, &s.sval)?;
             }
         }
         ObjectType::ObjectPublication => {

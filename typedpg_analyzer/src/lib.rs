@@ -12,7 +12,7 @@
 //!
 //! | Item | Role |
 //! |------|------|
-//! | [`PgCatalog`] | Mutable catalog: seed the PG18 catalog, then apply DDL and analyze queries against it. |
+//! | [`PgCatalog`] | Mutable catalog: seed the PG19 catalog, then apply DDL and analyze queries against it. |
 //! | [`QueryView`] | A query's analyzed text, parse tree and offset map, before the simplifications. |
 //! | [`SublinkNullability`] | What the analyzer proved about the two sides of an `= ANY` / `IN` sublink. |
 //! | [`MigrationObserver`] | Watches each statement of a migration as [`PgCatalog::apply_migration_observed`] applies it. |

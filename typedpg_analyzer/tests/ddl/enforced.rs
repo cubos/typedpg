@@ -182,11 +182,6 @@ fn alter_constraint_changes_foreign_key_enforceability() {
     db.apply_sql("ALTER TABLE fk2 ALTER CONSTRAINT f NOT ENFORCED NOT DEFERRABLE;")
         .unwrap();
     assert_eq!(f(&db), row("f", ConType::ForeignKey, false, false));
-    assert_err(
-        &setup,
-        "ALTER TABLE fk2 ALTER CONSTRAINT ck ENFORCED;",
-        "cannot alter enforceability of constraint \"ck\" of relation \"fk2\"",
-    );
     for name in ["f", "ck"] {
         assert_err(
             &setup,
@@ -194,6 +189,55 @@ fn alter_constraint_changes_foreign_key_enforceability() {
             "cannot validate NOT ENFORCED constraint",
         );
     }
+}
+
+#[test]
+fn alter_constraint_changes_check_enforceability() {
+    // PostgreSQL 19: a CHECK constraint's enforceability changes too, on
+    // every descendant; ENFORCED makes it valid, NOT ENFORCED not valid.
+    let ck =
+        |db: &PgCatalog, table: &str| flags(db, table).into_iter().find(|r| r.0 == "ck").unwrap();
+    let setup = "CREATE TABLE ckp (a int, CONSTRAINT ck CHECK (a > 0) NOT ENFORCED);
+                 CREATE TABLE ckc () INHERITS (ckp);";
+    let mut db = build_db(&[(
+        "0001.sql",
+        &format!("{setup} ALTER TABLE ckp ALTER CONSTRAINT ck ENFORCED;"),
+    )]);
+    assert_eq!(ck(&db, "ckp"), row("ck", ConType::Check, true, true));
+    assert_eq!(ck(&db, "ckc"), row("ck", ConType::Check, true, true));
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE ckc ALTER CONSTRAINT ck NOT ENFORCED;",
+            "cannot mark inherited constraint \"ck\" as NOT ENFORCED",
+        ),
+        (
+            "ALTER TABLE ONLY ckp ALTER CONSTRAINT ck NOT ENFORCED;",
+            "constraint must be altered on child tables too",
+        ),
+    ] {
+        let err = db.apply_sql(stmt).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    db.apply_sql("ALTER TABLE ckp ALTER CONSTRAINT ck NOT ENFORCED;")
+        .unwrap();
+    assert_eq!(ck(&db, "ckp"), row("ck", ConType::Check, false, false));
+    assert_eq!(ck(&db, "ckc"), row("ck", ConType::Check, false, false));
+    // A child that also inherits the constraint from another, enforced,
+    // parent keeps it enforced.
+    db.apply_sql(
+        "ALTER TABLE ckp ALTER CONSTRAINT ck ENFORCED;
+         CREATE TABLE ckq (a int, CONSTRAINT ck CHECK (a > 0));
+         CREATE TABLE ckd () INHERITS (ckp, ckq);
+         ALTER TABLE ckp ALTER CONSTRAINT ck NOT ENFORCED;",
+    )
+    .unwrap();
+    assert_eq!(ck(&db, "ckc"), row("ck", ConType::Check, false, false));
+    assert_eq!(ck(&db, "ckd"), row("ck", ConType::Check, true, true));
+    assert_err(
+        "CREATE TABLE nn (a int NOT NULL);",
+        "ALTER TABLE nn ALTER CONSTRAINT nn_a_not_null NOT ENFORCED;",
+        "cannot alter enforceability of constraint \"nn_a_not_null\" of relation \"nn\"",
+    );
 }
 
 #[test]

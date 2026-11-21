@@ -970,7 +970,7 @@ fn interpret_as_clause(
 
 /// The C function names of the built-in (`LANGUAGE internal`) functions,
 /// sorted (`SELECT DISTINCT prosrc FROM pg_proc WHERE prolang = 12` on
-/// PostgreSQL 18.7 — the entries of `fmgr_builtins`).
+/// PostgreSQL 19.0 — the entries of `fmgr_builtins`).
 const BUILTIN_PROSRC: &str = include_str!("builtin_prosrc.txt");
 
 /// `fmgr_internal_validator` (pg_proc.c): a `LANGUAGE internal` function's

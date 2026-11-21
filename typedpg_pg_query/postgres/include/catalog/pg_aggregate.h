@@ -4,7 +4,7 @@
  *	  definition of the "aggregate" system catalog (pg_aggregate)
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_aggregate.h
@@ -29,6 +29,8 @@
  *		cpp turns this into typedef struct FormData_pg_aggregate
  * ----------------------------------------------------------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_aggregate,2600,AggregateRelationId)
 {
 	/* pg_proc OID of the aggregate itself */
@@ -101,6 +103,8 @@ CATALOG(pg_aggregate,2600,AggregateRelationId)
 #endif
 } FormData_pg_aggregate;
 
+END_CATALOG_STRUCT
+
 /* ----------------
  *		Form_pg_aggregate corresponds to a pointer to a tuple with
  *		the format of pg_aggregate relation.
@@ -171,6 +175,7 @@ extern ObjectAddress AggregateCreate(const char *aggName,
 									 char finalfnModify,
 									 char mfinalfnModify,
 									 List *aggsortopName,
+									 List *aggsupportfuncName,
 									 Oid aggTransType,
 									 int32 aggTransSpace,
 									 Oid aggmTransType,

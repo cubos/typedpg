@@ -509,7 +509,7 @@ pub(super) fn analyze_refresh(
     if stmt.concurrent && stmt.skip_data {
         return Err(RawError::new(
             AnalyzeError::SyntaxError(
-                "CONCURRENTLY and WITH NO DATA options cannot be used together".to_owned(),
+                "REFRESH options CONCURRENTLY and WITH NO DATA cannot be used together".to_owned(),
             ),
             None,
             None,

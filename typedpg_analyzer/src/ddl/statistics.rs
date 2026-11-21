@@ -135,12 +135,13 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
         )));
     }
 
-    // The columns and expressions.
-    let virtual_column = || {
-        DdlError::UnsupportedDdl(
-            "statistics creation on virtual generated columns is not supported".into(),
-        )
-    };
+    // The columns and expressions (CreateStatistics, PostgreSQL 19).
+    let numcols = stmt.exprs.len();
+    if numcols > MAX_DIMENSIONS {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot have more than {MAX_DIMENSIONS} columns in statistics"
+        )));
+    }
     let system_column = || {
         DdlError::UnsupportedDdl("statistics creation on system columns is not supported".into())
     };
@@ -150,8 +151,8 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
     let mut name_parts: Vec<String> = Vec::new();
     let no_btree_opclass = |name: &str, typ| {
         DdlError::UnsupportedDdl(format!(
-            "column \"{name}\" cannot be used in statistics because its type {} has no default \
-             btree operator class",
+            "cannot create multivariate statistics on column \"{name}\" (The type {} has no \
+             default btree operator class.)",
             super::util::format_type_for_message(interp, typ)
         ))
     };
@@ -183,17 +184,32 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                     "column \"{column}\" does not exist"
                 )));
             };
-            if attr.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
-                return Err(virtual_column());
-            }
             // lookup_type_cache(TYPECACHE_LT_OPR): the `<` of the type's
             // default btree operator class, element- / field-wise for an
-            // array or a composite.
-            if !crate::clause::has_ordering_operator(interp, attr.atttypid) {
+            // array or a composite — for multivariate statistics only.
+            if numcols > 1 && !crate::clause::has_ordering_operator(interp, attr.atttypid) {
                 return Err(no_btree_opclass(&attr.attname, attr.atttypid));
             }
-            columns.push(attr.attnum);
             attnums.push(attr.attnum);
+            if attr.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
+                // A virtual generated column is treated as an expression
+                // (its Var).
+                let var = ast::Node::ColumnRef(typedpg_pg_query::NodeBox::new(
+                    typedpg_pg_query::ast::ColumnRef {
+                        fields: vec![Some(ast::Node::String(typedpg_pg_query::NodeBox::new(
+                            typedpg_pg_query::ast::String {
+                                sval: attr.attname.clone(),
+                            },
+                        )))],
+                        location: -1,
+                    },
+                ));
+                exprs.push(super::tables::check_inherit::StoredExpr::written(Some(
+                    &var,
+                )));
+            } else {
+                columns.push(attr.attnum);
+            }
             name_parts.push(if se.name.is_empty() {
                 "expr".into()
             } else {
@@ -237,11 +253,8 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                     };
                     if let Some((col, bare)) = col {
                         // pull_varattnos: no system column (nor the
-                        // whole row), no virtual generated column.
+                        // whole row).
                         if let Some(a) = interp.attribute_by_name(relid, col) {
-                            if a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual) {
-                                return Err(virtual_column());
-                            }
                             attnums.push(a.attnum);
                         } else if SYSTEM_COLUMNS.iter().any(|(n, ..)| *n == col)
                             || (bare && col == class.relname)
@@ -275,15 +288,15 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             }
             // A type without `<` — but only when there are several
             // columns: a single expression gets the regular statistics.
-            if stmt.exprs.len() > 1
+            if numcols > 1
                 && let Some(t) = typ.as_ref()
                 && (super::indexes::certainly_unknown(expr.as_ref(), t)
                     || (t.type_oid != crate::pg_catalog::oid::UNKNOWN
                         && !crate::clause::has_ordering_operator(interp, t.type_oid)))
             {
                 return Err(DdlError::UnsupportedDdl(format!(
-                    "expression cannot be used in multivariate statistics because its type {} \
-                     has no default btree operator class",
+                    "cannot create multivariate statistics on this expression (The type {} has \
+                     no default btree operator class.)",
                     super::util::format_type_for_message(interp, t.type_oid)
                 )));
             }
@@ -299,10 +312,19 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             name_parts.push("expr".into());
         }
     }
-    if columns.len() + exprs.len() > MAX_DIMENSIONS {
-        return Err(DdlError::UnsupportedDdl(format!(
-            "cannot have more than {MAX_DIMENSIONS} columns in statistics"
-        )));
+    // At least two columns, or a single expression (or virtual generated
+    // column).
+    if numcols < 2 && exprs.len() != 1 {
+        return Err(DdlError::Parse(
+            "cannot create extended statistics on a single non-virtual column (Univariate \
+             statistics are already built for each individual non-virtual table column.)"
+                .into(),
+        ));
+    }
+    if numcols == 1 && !stmt.stat_types.is_empty() {
+        return Err(DdlError::UnsupportedDdl(
+            "cannot specify statistics kinds when building univariate statistics".into(),
+        ));
     }
     // Statistic kinds.
     for kind in stmt
@@ -315,19 +337,6 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
                 "unrecognized statistics kind \"{kind}\""
             )));
         }
-    }
-    let single_expression = columns.is_empty() && exprs.len() == 1;
-    if single_expression && !stmt.stat_types.is_empty() {
-        return Err(DdlError::UnsupportedDdl(
-            "when building statistics on a single expression, statistics kinds may not be \
-             specified"
-                .into(),
-        ));
-    }
-    if !single_expression && columns.len() + exprs.len() < 2 {
-        return Err(DdlError::Parse(
-            "extended statistics require at least 2 columns".into(),
-        ));
     }
     let mut sorted = columns.clone();
     sorted.sort_unstable();

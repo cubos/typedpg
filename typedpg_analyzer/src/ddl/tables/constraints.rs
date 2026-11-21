@@ -479,7 +479,7 @@ fn include_attnums(
 /// before them; a lone INITIALLY DEFERRED implies DEFERRABLE, and a NOT
 /// ENFORCED constraint is also NOT VALID. Deferrability only suits a key or
 /// foreign-key constraint, enforceability a CHECK or foreign key.
-pub(super) fn fold_constraint_attrs(
+pub(crate) fn fold_constraint_attrs(
     constraints: &[Option<typedpg_pg_query::ast::Node>],
 ) -> Result<Vec<typedpg_pg_query::ast::Constraint>, DdlError> {
     use ConstrType as C;
@@ -875,7 +875,7 @@ pub(crate) fn check_unique_covers_partition_key(
             .map(|a| a.attname.clone())
             .unwrap_or_default();
         return Err(DdlError::Parse(format!(
-            "unique constraint on partitioned table must include all partitioning columns \
+            "{label} constraint on partitioned table must include all partitioning columns \
              ({label} constraint on table \"{}\" lacks column \"{column}\" which is part of the \
              partition key.)",
             relname_of(interp, relid)

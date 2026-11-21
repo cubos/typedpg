@@ -1,4 +1,4 @@
-//! Ports of PostgreSQL 18's `tsvector` and `tsquery` input functions
+//! Ports of PostgreSQL 19's `tsvector` and `tsquery` input functions
 //! (tsvector_parser.c `gettoken_tsvector`, tsvector.c `tsvectorin`,
 //! tsquery.c `gettoken_query_standard` / `parse_phrase_operator` /
 //! `get_modifiers` / `makepol` / `pushValue`), used by

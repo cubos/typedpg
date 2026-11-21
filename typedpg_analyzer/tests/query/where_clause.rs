@@ -834,18 +834,22 @@ fn in_and_exists_sublinks_become_joins_before_the_where_clause_is_folded() {
 #[test]
 fn a_column_proof_excludes_only_its_own_relation() {
     // `relation_excluded_by_constraints` reads a relation's own
-    // restrictions: `t.id IS NULL` (t.id NOT NULL) proves t empty, and
-    // every other relation is still estimated.
+    // restrictions, and every other relation is still estimated. Since
+    // PostgreSQL 19, `t.id IS NULL` (t.id NOT NULL) is FALSE already when
+    // the quals are folded: it takes its whole AND along, but elsewhere —
+    // a pulled-up subquery's or LATERAL item's WHERE — it is just a gating
+    // qual, which proves no relation empty.
     let db = planner_setup();
     for sql in [
-        "SELECT 1 FROM t, u, rt WHERE rt.s ~ '(' AND t.id IS NULL",
-        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND t.id IS NULL",
         "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND t.x = 1 AND t.x = 2",
         "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(') q WHERE t.id IS NULL",
         "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(' OFFSET 0) q WHERE t.id IS NULL",
         "SELECT 1 FROM t JOIN rt ON rt.s ~ '(' LEFT JOIN u ON t.id IS NULL",
         "SELECT 1 FROM rt2 LEFT JOIN (SELECT 1 AS q FROM rt WHERE s ~ '(' OFFSET 0) x ON true \
          WHERE rt2.id IS NULL",
+        "SELECT 1 FROM t, (SELECT * FROM rt WHERE id IS NULL) q WHERE q.s ~ '('",
+        "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(' OFFSET 0) q WHERE q.id IS NULL",
+        "SELECT 1 FROM t, LATERAL (SELECT * FROM rt WHERE t.id IS NULL) q WHERE t.s ~ '('",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -853,13 +857,12 @@ fn a_column_proof_excludes_only_its_own_relation() {
             "invalid regular expression: parentheses () not balanced"
         );
     }
-    // The relation proven empty itself — or one that can't be told apart
-    // (an unqualified column, a join's alias, a LATERAL subquery's qual).
+    // The folded FALSE takes the AND it is in along (a join alias's
+    // column is the column it stands for), the relation's regex included.
     for sql in [
+        "SELECT 1 FROM t, u, rt WHERE rt.s ~ '(' AND t.id IS NULL",
+        "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND t.id IS NULL",
         "SELECT 1 FROM t, rt WHERE rt.s ~ '(' AND rt.id IS NULL",
-        "SELECT 1 FROM t, (SELECT * FROM rt WHERE id IS NULL) q WHERE q.s ~ '('",
-        "SELECT 1 FROM t, (SELECT * FROM rt WHERE s ~ '(' OFFSET 0) q WHERE q.id IS NULL",
-        "SELECT 1 FROM t, LATERAL (SELECT * FROM rt WHERE t.id IS NULL) q WHERE t.s ~ '('",
         "SELECT 1 FROM (t JOIN u USING (id)) j, rt WHERE j.id IS NULL AND rt.s ~ '('",
         "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' AND rt.id IS NULL",
     ] {
@@ -1240,6 +1243,12 @@ fn an_inlined_cte_is_estimated_as_the_from_item_it_is_pulled_up_as() {
         "WITH rt2 AS (SELECT 1 AS k WHERE false) UPDATE rt2 SET s = 'x' WHERE rt2.s ~ '('",
         // Referenced twice: scanned, planned whole.
         "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM c, c c2",
+        // PostgreSQL 19 folds `c.id IS NULL` (rt.id) to FALSE: beside
+        // another relation, a gating qual, which proves none empty.
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
+         SELECT 1 FROM rt2 JOIN c ON c.id = rt2.id WHERE c.id IS NULL",
+        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
+         UPDATE rt2 SET s = 'x' FROM c WHERE c.id = rt2.id AND c.id IS NULL",
     ] {
         assert_err_prefix!(
             db.analyze(sql),
@@ -1250,11 +1259,7 @@ fn an_inlined_cte_is_estimated_as_the_from_item_it_is_pulled_up_as() {
     for sql in [
         "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM c WHERE false",
         "WITH c AS (SELECT id FROM rt WHERE s ~ '(') SELECT 1 FROM c WHERE c.id IS NULL",
-        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
-         SELECT 1 FROM rt2 JOIN c ON c.id = rt2.id WHERE c.id IS NULL",
         "WITH c AS (SELECT s FROM rt) SELECT 1 FROM c WHERE c.s ~ '(' AND false",
-        "WITH c AS (SELECT id FROM rt WHERE s ~ '(') \
-         UPDATE rt2 SET s = 'x' FROM c WHERE c.id = rt2.id AND c.id IS NULL",
         // Pulled up, its constant FALSE qual proves the single relation
         // beside it empty.
         "WITH c AS (SELECT 1 AS k WHERE false) SELECT 1 FROM rt2, c WHERE rt2.s ~ '('",
@@ -1527,12 +1532,6 @@ fn a_nullable_side_certainly_kept_has_its_restrictions_estimated() {
         "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = rt.id AND u.x IS NULL \
          WHERE rt.id = t.id AND rt.s ~ '(') AND false"
             .to_owned(),
-        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = rt.id \
-         WHERE u.id IS NULL AND rt.id = t.id AND rt.s ~ '(') AND false"
-            .to_owned(),
-        "SELECT 1 FROM t WHERE t.x IN (SELECT rt.id FROM rt JOIN u ON u.id = rt.id \
-         WHERE rt.s ~ '(' AND u.id IS NULL)"
-            .to_owned(),
         "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND rt.s ~ '(') \
          AND t.id IS NULL"
             .to_owned(),
@@ -1553,6 +1552,14 @@ fn a_nullable_side_certainly_kept_has_its_restrictions_estimated() {
         "SELECT 1 FROM t LEFT JOIN rt ON rt.s ~ '(' WHERE rt.id IS NULL AND rt.s = 'x'".to_owned(),
         "SELECT 1 FROM (SELECT rt.id FROM t LEFT JOIN rt ON rt.s ~ '(' WHERE rt.id IS NULL) q \
          WHERE q.id = 5"
+            .to_owned(),
+        // PostgreSQL 19: `u.id IS NULL` (an inner join's, never
+        // null-extended) folds to FALSE with the semi-join's whole qual.
+        "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt JOIN u ON u.id = rt.id \
+         WHERE u.id IS NULL AND rt.id = t.id AND rt.s ~ '(') AND false"
+            .to_owned(),
+        "SELECT 1 FROM t WHERE t.x IN (SELECT rt.id FROM rt JOIN u ON u.id = rt.id \
+         WHERE rt.s ~ '(' AND u.id IS NULL)"
             .to_owned(),
         // In the semi-join, the qual restricts the very relation.
         "SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM rt WHERE rt.id = t.id AND rt.s ~ '(' \
