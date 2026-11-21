@@ -462,8 +462,10 @@ pub fn alter_role_set(
     }
     // The parameter must exist and be settable, and a new value valid, as
     // for SET.
+    let null = kind == VariableSetKind::VarSetValue && super::guc::null_arg(&set.name, &set.args)?;
     if let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned()
         && kind == VariableSetKind::VarSetValue
+        && !null
         && let [arg] = set.args.as_slice()
         && let Some(value) = session::const_arg_string(arg.as_ref())
     {

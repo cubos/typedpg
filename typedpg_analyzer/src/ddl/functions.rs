@@ -320,6 +320,9 @@ fn check_set_item(interp: &PgCatalog, item: &ast::Node) -> Result<(), DdlError> 
     if matches!(kind, VariableSetKind::VarResetAll) {
         return Ok(());
     }
+    if kind == VariableSetKind::VarSetValue && super::guc::null_arg(&set.name, &set.args)? {
+        return super::guc::check_settable(interp, &set.name).map(|_| ());
+    }
     let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned() else {
         return Ok(());
     };

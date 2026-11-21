@@ -596,11 +596,14 @@ pub(super) fn analyze_set(
     }
     match stmt.kind {
         K::VarSetValue | K::VarSetDefault | K::VarSetCurrent | K::VarReset => {
+            let null = stmt.kind == K::VarSetValue
+                && crate::ddl::guc::null_arg(&stmt.name, &stmt.args).map_err(ddl_error)?;
             let setting = crate::ddl::guc::check_settable(snapshot, &stmt.name)
                 .map_err(ddl_error)?
                 .cloned();
             if let Some(setting) = setting {
                 if stmt.kind == K::VarSetValue
+                    && !null
                     && let Some(value) = value(stmt)
                 {
                     crate::ddl::guc::check_value(snapshot, &setting, &value).map_err(ddl_error)?;

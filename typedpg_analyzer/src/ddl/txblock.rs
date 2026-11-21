@@ -96,7 +96,7 @@ impl Transaction {
     /// The rules the transaction state imposes on `stmt`, before it runs.
     pub(crate) fn check(&self, db: &PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
         if self.block != Block::Started
-            && let Some(what) = forbidden_in_block(stmt)
+            && let Some(what) = forbidden_in_block(db, stmt)
         {
             return Err(DdlError::UnsupportedDdl(format!(
                 "{what} cannot run inside a transaction block"
@@ -435,7 +435,7 @@ pub(crate) fn reindex_tablespace(params: &[Option<typedpg_pg_query::ast::Node>])
 
 /// PreventInTransactionBlock callers. (A REINDEX whose options are invalid
 /// fails on them first, in [`super::maintenance::reindex`].)
-fn forbidden_in_block(stmt: &ast::Node) -> Option<&'static str> {
+fn forbidden_in_block(db: &PgCatalog, stmt: &ast::Node) -> Option<&'static str> {
     match stmt {
         ast::Node::VacuumStmt(v) if v.is_vacuumcmd => Some("VACUUM"),
         ast::Node::IndexStmt(i) if i.concurrent => Some("CREATE INDEX CONCURRENTLY"),
@@ -469,6 +469,17 @@ fn forbidden_in_block(stmt: &ast::Node) -> Option<&'static str> {
         ast::Node::CreateTableSpaceStmt(_) => Some("CREATE TABLESPACE"),
         ast::Node::DropTableSpaceStmt(_) => Some("DROP TABLESPACE"),
         ast::Node::AlterSystemStmt(_) => Some("ALTER SYSTEM"),
+        // CreateSubscription / DropSubscription: creating or dropping a
+        // replication slot can't be rolled back. (Invalid options, or a
+        // subscription that doesn't exist, fail first.)
+        ast::Node::CreateSubscriptionStmt(c) if super::cluster::creates_slot(c) == Some(true) => {
+            Some("CREATE SUBSCRIPTION ... WITH (create_slot = true)")
+        }
+        ast::Node::DropSubscriptionStmt(d)
+            if super::cluster::subscription_has_slot(db, &d.subname) =>
+        {
+            Some("DROP SUBSCRIPTION")
+        }
         ast::Node::TransactionStmt(t) => match t.kind {
             TransactionStmtKind::TransStmtCommitPrepared => Some("COMMIT PREPARED"),
             TransactionStmtKind::TransStmtRollbackPrepared => Some("ROLLBACK PREPARED"),

@@ -547,6 +547,7 @@ pub(crate) fn drop_servers(
     cascade: bool,
     dropped_desc: &str,
 ) -> Result<(), DdlError> {
+    super::cluster::check_no_subscription_on(interp, servers)?;
     let tables: Vec<PgClassOid> = interp
         .foreign_data
         .table_servers
@@ -636,6 +637,7 @@ pub(crate) fn rename_foreign_object(
             }
             _ => None,
         });
+        super::cluster::rename_subscription_server(interp, &old, &new);
     }
     Ok(())
 }

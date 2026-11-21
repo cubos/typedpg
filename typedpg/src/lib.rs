@@ -403,6 +403,7 @@
 //! | `macaddr` | `eui48::MacAddress` (crate `eui48` 1) |
 //! | `oid`, `xid`, `cid`, `regclass` and the other `reg*` types | `u32` |
 //! | `xid8` | [`types::Xid8`] |
+//! | `oid8` | [`types::Oid8`] |
 //! | `pg_lsn` | [`types::PgLsn`] |
 //! | ranges (`int4range`, `tstzrange`, …) | [`types::Range<T>`] |
 //! | built-in multiranges (`int4multirange`, …) | [`types::MultiRange<T>`] |

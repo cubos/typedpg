@@ -25,6 +25,49 @@ fn invalid(err: String) -> Result<(), DdlError> {
     Err(DdlError::UnsupportedDdl(err))
 }
 
+/// The parameters PostgreSQL 19 declares `GUC_LIST_INPUT`
+/// (`guc_parameters.dat`).
+const LIST_INPUT: &[&str] = &[
+    "createrole_self_grant",
+    "DateStyle",
+    "debug_io_direct",
+    "listen_addresses",
+    "local_preload_libraries",
+    "log_connections",
+    "log_destination",
+    "log_min_messages",
+    "oauth_validator_libraries",
+    "output_plugin_libraries",
+    "restrict_nonsystem_relation_kind",
+    "search_path",
+    "session_preload_libraries",
+    "shared_preload_libraries",
+    "synchronized_standby_slots",
+    "synchronous_standby_names",
+    "temp_tablespaces",
+    "unix_socket_directories",
+    "wal_consistency_checking",
+];
+
+/// flatten_set_variable_args (PostgreSQL 19): `SET name TO NULL` sets a list
+/// parameter to the empty list and is an error for any other parameter —
+/// before the name is even looked up. Returns whether `args` is that NULL.
+pub(crate) fn null_arg(
+    name: &str,
+    args: &[Option<typedpg_pg_query::ast::Node>],
+) -> Result<bool, DdlError> {
+    let [Some(typedpg_pg_query::ast::Node::AConst(c))] = args else {
+        return Ok(false);
+    };
+    if !c.isnull {
+        return Ok(false);
+    }
+    if !LIST_INPUT.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+        invalid(format!("NULL is an invalid value for {name}"))?;
+    }
+    Ok(true)
+}
+
 /// The parameter must exist (or be a custom `prefix.name` one) and be
 /// changeable in a session. Returns it when known.
 pub(crate) fn check_settable<'a>(

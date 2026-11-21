@@ -8,6 +8,7 @@
 //! | `timetz` | [`TimeTz`] |
 //! | `pg_lsn` | [`PgLsn`] |
 //! | `xid8` | [`Xid8`] |
+//! | `oid8` | [`Oid8`] |
 //! | `int4range`, `int8range`, `numrange`, `daterange`, `tsrange`, `tstzrange` (and any `CREATE TYPE ... AS RANGE`) | [`Range<T>`] |
 //! | `int4multirange`, … (the built-in multiranges) | [`MultiRange<T>`] |
 //!
@@ -169,6 +170,50 @@ impl ToSql for Xid8 {
 
     fn accepts(ty: &Type) -> bool {
         *ty == Type::XID8
+    }
+
+    to_sql_checked!();
+}
+
+/// `oid8`'s OID (PostgreSQL 19's `pg_type.dat`). `tokio_postgres` has no
+/// constant for it: it builds the type from the catalog, under this OID.
+const OID8_OID: u32 = 6437;
+
+/// A PostgreSQL 19 `oid8`: an unsigned 64-bit object identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Oid8(pub u64);
+
+impl From<u64> for Oid8 {
+    fn from(v: u64) -> Self {
+        Oid8(v)
+    }
+}
+
+impl From<Oid8> for u64 {
+    fn from(v: Oid8) -> Self {
+        v.0
+    }
+}
+
+impl<'a> FromSql<'a> for Oid8 {
+    fn from_sql(_: &Type, mut raw: &'a [u8]) -> Result<Self, BoxError> {
+        expect_len(raw, 8, "oid8")?;
+        Ok(Oid8(raw.get_u64()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.oid() == OID8_OID
+    }
+}
+
+impl ToSql for Oid8 {
+    fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, BoxError> {
+        out.put_u64(self.0);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.oid() == OID8_OID
     }
 
     to_sql_checked!();
@@ -418,5 +463,12 @@ mod tests {
     #[test]
     fn xid8_roundtrips() {
         assert_eq!(roundtrip(&Type::XID8, &Xid8(u64::MAX)), Xid8(u64::MAX));
+    }
+
+    #[test]
+    fn oid8_roundtrips() {
+        let ty = Type::new("oid8".into(), OID8_OID, Kind::Simple, "pg_catalog".into());
+        assert_eq!(roundtrip(&ty, &Oid8(u64::MAX)), Oid8(u64::MAX));
+        assert!(!<Oid8 as FromSql>::accepts(&Type::INT8));
     }
 }

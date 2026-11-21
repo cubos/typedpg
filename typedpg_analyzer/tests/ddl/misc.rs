@@ -5185,6 +5185,251 @@ fn subscriptions_connect_through_a_wrapper_connection_function() {
 }
 
 #[test]
+fn a_subscription_keeps_its_server_from_being_dropped() {
+    // PG 19 CREATE / ALTER SUBSCRIPTION ... SERVER record a pg_depend
+    // entry; findDependentObjects refuses to drop the server while the
+    // subscription — in a shared catalog — depends on it, CASCADE or not.
+    let setup = "CREATE FUNCTION cf(oid, oid, internal) RETURNS text LANGUAGE internal
+                     AS 'textlike_support';
+                 CREATE FOREIGN DATA WRAPPER w CONNECTION cf;
+                 CREATE SERVER sv FOREIGN DATA WRAPPER w;
+                 CREATE USER MAPPING FOR public SERVER sv;
+                 CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);";
+    for (stmt, msg) in [
+        (
+            "DROP SERVER sv;",
+            "cannot drop server sv because subscription s depends on it",
+        ),
+        (
+            "DROP SERVER sv CASCADE;",
+            "cannot drop server sv because subscription s depends on it",
+        ),
+        (
+            "DROP FOREIGN DATA WRAPPER w CASCADE;",
+            "cannot drop server sv because subscription s depends on it",
+        ),
+        (
+            "ALTER SERVER sv RENAME TO sv2; DROP SERVER sv2 CASCADE;",
+            "cannot drop server sv2 because subscription s depends on it",
+        ),
+        (
+            "ALTER SUBSCRIPTION s RENAME TO s2; DROP SERVER sv CASCADE;",
+            "cannot drop server sv because subscription s2 depends on it",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false);
+             ALTER SUBSCRIPTION s2 RENAME TO s;",
+            "subscription \"s\" already exists",
+        ),
+        (
+            "ALTER SUBSCRIPTION nosuch RENAME TO s2;",
+            "subscription \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER SUBSCRIPTION s RENAME TO s2; DROP SUBSCRIPTION s;",
+            "subscription \"s\" does not exist",
+        ),
+        // Its replication slot (named after it) keeps it in the cluster
+        // until `slot_name = NONE`, outside any transaction block.
+        (
+            "SELECT 1; DROP SUBSCRIPTION s;",
+            "DROP SUBSCRIPTION cannot run inside a transaction block",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // Without the subscription, or once it connects without the server,
+    // the server goes (its user mapping with CASCADE).
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER SUBSCRIPTION s RENAME TO s2;
+             ALTER SUBSCRIPTION s2 SET (slot_name = NONE);
+             DROP SUBSCRIPTION s2;
+             DROP SERVER sv CASCADE;",
+        ),
+    ]);
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER SUBSCRIPTION s CONNECTION 'dbname=x';
+             DROP FOREIGN DATA WRAPPER w CASCADE;",
+        ),
+    ]);
+}
+
+#[test]
+fn subscription_options_and_replication_slots() {
+    // PG 19 parse_subscription_options, and the replication slot a
+    // subscription creates (CREATE) or drops (DROP) unless `slot_name =
+    // NONE`, which can't run inside a transaction block — a migration of
+    // several statements runs in an implicit one.
+    let setup = "CREATE SUBSCRIPTION s CONNECTION 'dbname=x' PUBLICATION p
+                     WITH (connect = false);";
+    for (stmt, msg) in [
+        (
+            "SELECT 1; CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p;",
+            "CREATE SUBSCRIPTION ... WITH (create_slot = true) cannot run inside a transaction \
+             block",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, connect = false);",
+            "conflicting or redundant options",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, enabled = true);",
+            "connect = false and enabled = true are mutually exclusive options",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, create_slot = maybe);",
+            "create_slot requires a Boolean value",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (slot_name = NONE);",
+            "subscription with slot_name = NONE must also set enabled = false",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (slot_name = NONE, enabled = false);",
+            "subscription with slot_name = NONE must also set create_slot = false",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, slot_name = 'Slot');",
+            "replication slot name \"Slot\" contains invalid character",
+        ),
+        (
+            "CREATE SUBSCRIPTION s CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false);",
+            "subscription \"s\" already exists",
+        ),
+        (
+            "ALTER SUBSCRIPTION s SET (slot_name = NONE); ALTER SUBSCRIPTION s ENABLE;",
+            "cannot enable subscription that does not have a slot name",
+        ),
+        (
+            "ALTER SUBSCRIPTION nosuch SET (slot_name = 'Bad');",
+            "subscription \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER SUBSCRIPTION s SET (slot_name = NONE);
+             ALTER SUBSCRIPTION s SET (slot_name = 's_slot');
+             DROP SUBSCRIPTION s;",
+            "DROP SUBSCRIPTION cannot run inside a transaction block",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, slot_name = NONE);
+             DROP SUBSCRIPTION s2;
+             ALTER SUBSCRIPTION s SET (slot_name = NONE);
+             ALTER SUBSCRIPTION s DISABLE;
+             DROP SUBSCRIPTION s;
+             DROP SUBSCRIPTION IF EXISTS s;",
+        ),
+    ]);
+}
+
+#[test]
+fn a_subscription_moved_to_another_server_depends_on_that_one() {
+    // ALTER SUBSCRIPTION ... SERVER moves the pg_depend entry. Moving runs
+    // the wrapper's connection function, which a stand-in like the test
+    // above's can't be on a live server, so the mirror sits this one out.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION cf(oid, oid, internal) RETURNS text LANGUAGE internal
+             AS 'textlike_support';
+         CREATE FOREIGN DATA WRAPPER w CONNECTION cf;
+         CREATE SERVER sv FOREIGN DATA WRAPPER w;
+         CREATE SERVER sv2 FOREIGN DATA WRAPPER w;
+         CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);",
+    )]);
+    db.skip_pg_sanity();
+    db.apply_sql("ALTER SUBSCRIPTION s SERVER sv2; DROP SERVER sv;")
+        .unwrap();
+    let err = db.apply_sql("DROP SERVER sv2;").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop server sv2 because subscription s depends on it"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn set_to_null_empties_a_list_parameter() {
+    // PG 19 flatten_set_variable_args: `SET name TO NULL` is the empty list
+    // for a GUC_LIST_INPUT parameter, an error for any other — reported
+    // before the name is looked up.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "SET search_path TO NULL; CREATE TABLE u (a int);",
+            "no schema has been selected to create in",
+        ),
+        (
+            "SET search_path = NULL; CREATE VIEW public.v AS SELECT a FROM t;",
+            "relation \"t\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql SET search_path TO NULL
+                 AS 'SELECT count(*) FROM t';",
+            "relation \"t\" does not exist",
+        ),
+        (
+            "SET work_mem TO NULL;",
+            "NULL is an invalid value for work_mem",
+        ),
+        (
+            "SET nosuch_param TO NULL;",
+            "NULL is an invalid value for nosuch_param",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql SET work_mem TO NULL
+                 AS 'SELECT 1';",
+            "NULL is an invalid value for work_mem",
+        ),
+        (
+            "CREATE ROLE r; ALTER ROLE r SET work_mem TO NULL;",
+            "NULL is an invalid value for work_mem",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "SET search_path TO NULL;
+             CREATE TABLE public.u (a int);
+             SET search_path TO DEFAULT;
+             SELECT a FROM u;
+             SET LOCAL search_path TO NULL;
+             SET temp_tablespaces TO NULL;
+             SET DateStyle TO NULL;
+             CREATE ROLE r;
+             ALTER ROLE r SET search_path TO NULL;
+             CREATE FUNCTION public.g() RETURNS int LANGUAGE sql SET search_path TO NULL
+                 AS 'SELECT 1';",
+        ),
+    ]);
+}
+
+#[test]
 fn foreign_data_wrappers_servers_and_user_mappings() {
     // PG 18 foreigncmds.c / get_foreign_server_oid.
     let setup = "CREATE FOREIGN DATA WRAPPER w;

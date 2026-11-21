@@ -330,8 +330,19 @@ fn set_reports_what_every_execution_raises() {
             "SET shared_buffers = '1MB'",
             "parameter \"shared_buffers\" cannot be changed without restarting the server",
         ),
+        // PostgreSQL 19's flatten_set_variable_args: NULL empties a list
+        // parameter only, and is refused before the name is looked up.
+        (
+            "SET work_mem TO NULL",
+            "NULL is an invalid value for work_mem",
+        ),
+        (
+            "SET ut_nope TO NULL",
+            "NULL is an invalid value for ut_nope",
+        ),
     ] {
         let e = db.analyze(sql).unwrap_err().to_string();
         assert!(e.starts_with(message), "{sql}: {e}");
     }
+    db.analyze("SET search_path TO NULL").unwrap();
 }
