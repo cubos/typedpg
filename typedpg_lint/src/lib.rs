@@ -335,6 +335,15 @@ impl Rule {
 
     /// A one-line description of what the rule reports, used by the SARIF
     /// rule metadata.
+    /// The page documenting the rule: `docs/lint/<name>.md` in the
+    /// repository.
+    pub fn docs_url(self) -> String {
+        format!(
+            "https://github.com/cubos/typedpg/blob/main/docs/lint/{}.md",
+            self.name()
+        )
+    }
+
     pub fn description(self) -> &'static str {
         match self {
             Rule::NullComparison => "comparison with NULL is never true",
@@ -1128,6 +1137,26 @@ mod tests {
     use super::*;
     use typedpg_analyzer::PgCatalog;
     use typedpg_core::config::{LINT_RULES, LintLevel, LintSeverity, RUST_LINT_RULES};
+
+    /// Every rule has its page, `docs/lint/<name>.md`, which the SARIF
+    /// report links to, and the index lists it.
+    #[test]
+    fn every_rule_is_documented() {
+        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/lint");
+        let index = std::fs::read_to_string(docs.join("README.md")).expect("docs/lint/README.md");
+        for rule in Rule::ALL
+            .into_iter()
+            .chain([Rule::InvalidAllow, Rule::InternalError])
+        {
+            let page = format!("{}.md", rule.name());
+            assert!(docs.join(&page).is_file(), "docs/lint/{page} is missing");
+            assert!(
+                index.contains(&format!("({page})")),
+                "docs/lint/README.md doesn't link {page}"
+            );
+            assert!(rule.docs_url().ends_with(&format!("/docs/lint/{page}")));
+        }
+    }
 
     fn catalog() -> PgCatalog {
         let mut catalog = PgCatalog::new().unwrap();

@@ -99,64 +99,66 @@ sql!(pool, "UPDATE users SET age = $flag").execute().await?;
 
 `cargo typedpg lint` analyzes every `sql!` in the crate's `src/`, `tests/`,
 `examples/` and `benches/` against the migrations it is compiled against,
-and lints the migrations themselves:
+and lints the migrations themselves. Each rule has a page in
+[`docs/lint`](docs/lint/README.md) with its motivation, what it proves,
+examples and configuration:
 
 | Rule | Default | What it reports |
 |---|---|---|
-| `null_comparison` | error | A comparison with a `NULL` literal, which is never true. |
-| `unbounded_write` | error | An `UPDATE` or `DELETE` with no `WHERE`. |
-| `not_in_nullable` | warning | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
-| `create_index_blocking` | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
-| `constraint_validating` | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
-| `set_not_null_scan` | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
-| `table_rewrite` | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
-| `fk_without_index` | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
-| `redundant_index` | info | An index another index on the table already covers. |
-| `redundant_binding` | warning | A `sql!` binding `x = x` (or a bare `x`): the parameter captures the variable without it. |
-| `renaming_binding` | info | A `sql!` binding `p = v` that only renames the variable `v`; write `$v` in the SQL instead. |
-| `redundant_null_check` | warning | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
-| `limit_without_order` | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
-| `redundant_limit` | info | A `LIMIT` on a query that returns at most one row. |
-| `redundant_distinct` | info | A `DISTINCT` on rows that are already distinct. |
-| `constant_condition` | warning | A `WHERE`, `JOIN … ON`, `HAVING` or `FILTER` condition — or an `AND` / `OR` / `NOT` part of one, or of a `CASE WHEN` — that is always true or never true: one the planner folds to a constant (`1 = 1`), or one what the analyzer knows decides — a column's `CHECK` constraints, domain or enum and the conditions before it (`status = 'actve'` when `status` is `CHECK (status IN ('active', 'inactive'))`, `n < 0` under `CHECK (n >= 0)`, `a = 2` after `a = 1 AND`, `x = x` on a column never NULL, an `EXISTS` whose subquery always returns a row). The message says why; a column of a table with a `NOT VALID` `CHECK` is not judged. The fix removes a `WHERE` the planner folds to true from a `SELECT`. |
-| `unreachable_case_branch` | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is — folded by the planner, or decided by what the analyzer knows there (the constraints, the conditions around the `CASE`, the `WHEN`s before it). |
-| `case_without_else` | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
-| `redundant_cast` | info | A cast to the type (and type modifier) its operand already has. |
-| `redundant_alias` | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
-| `outer_reference_in_subquery` | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
-| `cartesian_join` | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
-| `insert_without_columns` | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
-| `self_assignment` | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
-| `unused_cte` | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
-| `simplifiable_case` | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
-| `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
-| `redundant_join` | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
-| `scalar_subquery_may_return_many` | warning | A subquery used as a value (`(SELECT x FROM t WHERE …)` in a select list, a comparison, a `SET`, a function argument) that may return more than one row, which fails at run time with "more than one row returned by a subquery used as an expression". A subquery proven to return at most one row (an aggregate without `GROUP BY`, a unique key pinned by its `WHERE`, outer references included, `LIMIT 1`) is not reported, nor are `IN`, `EXISTS`, `ANY` / `ALL` and `ARRAY(…)` subqueries, nor a subquery over a view, a CTE, a function, a FROM subquery or a table with an expression or partial unique index, which the proof can't see through. |
-| `timestamp_timezone_mix` | warning | An implicit conversion between `timestamp` (or `date`) and `timestamptz` — a comparison (`created_at > now()` over a `timestamp` column), arithmetic, a function argument, a `CASE` / `COALESCE` / `UNION` type resolution, a value assigned to a column of the other type — whose result depends on the session's `TimeZone`. An explicit cast or `AT TIME ZONE`, a parameter and an untyped literal are not reported. |
-| `integer_division` | warning | An integer division, which truncates, whose result is then used as a `numeric` or floating-point value: `(done / total)::numeric`, `done / total * 100.0`, `done / total > 0.5`, `round(done / total, 2)`, or an integer product of it so used (`(done / total * 100)::numeric`). Convert an operand first: `done::numeric / total`. |
-| `left_join_nullified` | warning | A `WHERE` condition never true for the null-extended rows of an outer join's nullable side (`LEFT JOIN b … WHERE b.status = 'x'`, `b.id IS NOT NULL`), so the join behaves as an inner join; `b.id IS NULL` (the anti-join), non-strict tests like `COALESCE(b.x, 0) = 0`, an `OR` with an arm keeping the rows and a join that never null-extends (a foreign key's parent) are not reported. |
-| `check_violation` | warning | An `INSERT … VALUES`, `UPDATE … SET` or `ON CONFLICT DO UPDATE SET` storing a constant a `CHECK` constraint (`NOT VALID` ones included) or the column's domain rejects whatever the rest of the row, so the statement fails for every row it writes; not reported when a `BEFORE` row trigger or a rule may change the row. |
-| `unstable_order` | warning | An `ORDER BY` under `LIMIT`, `OFFSET` / `FETCH` or `DISTINCT ON` whose keys don't determine a unique row — no unique key (NOT NULL, or `NULLS NOT DISTINCT`) of every table is covered, counting columns `WHERE` pins to a constant, tables joined on their key and grouping keys — so tied rows come back in an arbitrary order and pages may skip or repeat rows. The help names the primary key to add as a tiebreaker. Queries returning at most one row, `WITH TIES`, `SKIP LOCKED` queues and FROM clauses the proof can't see through (subqueries, CTEs, partial or expression unique indexes) are not reported. |
-| `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
-| `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
-| `drop_index_blocking` | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
-| `blocking_rebuild` | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
-| `detach_partition_blocking` | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
-| `validate_in_same_transaction` | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
-| `attach_partition_scan` | warning | `ATTACH PARTITION` of an existing table with no valid `CHECK` on the partition key, so PostgreSQL scans it under lock to check the bound. A `CHECK` that reads a key column is taken to imply the bound (the lint does not prove it does). |
-| `missing_primary_key` | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
-| `rls_policy_not_enforced` | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
-| `rls_no_policy` | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
-| `security_definer_search_path` | warning | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
-| `prefer_timestamptz` | off | A `timestamp without time zone` column. |
-| `prefer_identity` | off | A `serial` column instead of an identity column. |
-| `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
-| `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
-| `prefer_jsonb` | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
-| `fetch_may_return_many` | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
-| `fetch_all_single_row` | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
-| `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
-| `breaks_deployed_queries` | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
+| [`null_comparison`](docs/lint/null_comparison.md) | error | A comparison with a `NULL` literal, which is never true. |
+| [`unbounded_write`](docs/lint/unbounded_write.md) | error | An `UPDATE` or `DELETE` with no `WHERE`. |
+| [`not_in_nullable`](docs/lint/not_in_nullable.md) | warning | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
+| [`create_index_blocking`](docs/lint/create_index_blocking.md) | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
+| [`constraint_validating`](docs/lint/constraint_validating.md) | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
+| [`set_not_null_scan`](docs/lint/set_not_null_scan.md) | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
+| [`table_rewrite`](docs/lint/table_rewrite.md) | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
+| [`fk_without_index`](docs/lint/fk_without_index.md) | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
+| [`redundant_index`](docs/lint/redundant_index.md) | info | An index another index on the table already covers. |
+| [`redundant_binding`](docs/lint/redundant_binding.md) | warning | A `sql!` binding `x = x` (or a bare `x`): the parameter captures the variable without it. |
+| [`renaming_binding`](docs/lint/renaming_binding.md) | info | A `sql!` binding `p = v` that only renames the variable `v`; write `$v` in the SQL instead. |
+| [`redundant_null_check`](docs/lint/redundant_null_check.md) | warning | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
+| [`limit_without_order`](docs/lint/limit_without_order.md) | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
+| [`redundant_limit`](docs/lint/redundant_limit.md) | info | A `LIMIT` on a query that returns at most one row. |
+| [`redundant_distinct`](docs/lint/redundant_distinct.md) | info | A `DISTINCT` on rows that are already distinct. |
+| [`constant_condition`](docs/lint/constant_condition.md) | warning | A `WHERE`, `JOIN … ON`, `HAVING` or `FILTER` condition — or an `AND` / `OR` / `NOT` part of one, or of a `CASE WHEN` — that is always true or never true: one the planner folds to a constant (`1 = 1`), or one what the analyzer knows decides — a column's `CHECK` constraints, domain or enum and the conditions before it (`status = 'actve'` when `status` is `CHECK (status IN ('active', 'inactive'))`, `n < 0` under `CHECK (n >= 0)`, `a = 2` after `a = 1 AND`, `x = x` on a column never NULL, an `EXISTS` whose subquery always returns a row). The message says why; a column of a table with a `NOT VALID` `CHECK` is not judged. The fix removes a `WHERE` the planner folds to true from a `SELECT`. |
+| [`unreachable_case_branch`](docs/lint/unreachable_case_branch.md) | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is — folded by the planner, or decided by what the analyzer knows there (the constraints, the conditions around the `CASE`, the `WHEN`s before it). |
+| [`case_without_else`](docs/lint/case_without_else.md) | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
+| [`redundant_cast`](docs/lint/redundant_cast.md) | info | A cast to the type (and type modifier) its operand already has. |
+| [`redundant_alias`](docs/lint/redundant_alias.md) | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
+| [`outer_reference_in_subquery`](docs/lint/outer_reference_in_subquery.md) | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
+| [`cartesian_join`](docs/lint/cartesian_join.md) | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
+| [`insert_without_columns`](docs/lint/insert_without_columns.md) | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
+| [`self_assignment`](docs/lint/self_assignment.md) | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
+| [`unused_cte`](docs/lint/unused_cte.md) | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
+| [`simplifiable_case`](docs/lint/simplifiable_case.md) | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
+| [`like_unescaped_param`](docs/lint/like_unescaped_param.md) | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
+| [`redundant_join`](docs/lint/redundant_join.md) | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
+| [`scalar_subquery_may_return_many`](docs/lint/scalar_subquery_may_return_many.md) | warning | A subquery used as a value (`(SELECT x FROM t WHERE …)` in a select list, a comparison, a `SET`, a function argument) that may return more than one row, which fails at run time with "more than one row returned by a subquery used as an expression". A subquery proven to return at most one row (an aggregate without `GROUP BY`, a unique key pinned by its `WHERE`, outer references included, `LIMIT 1`) is not reported, nor are `IN`, `EXISTS`, `ANY` / `ALL` and `ARRAY(…)` subqueries, nor a subquery over a view, a CTE, a function, a FROM subquery or a table with an expression or partial unique index, which the proof can't see through. |
+| [`timestamp_timezone_mix`](docs/lint/timestamp_timezone_mix.md) | warning | An implicit conversion between `timestamp` (or `date`) and `timestamptz` — a comparison (`created_at > now()` over a `timestamp` column), arithmetic, a function argument, a `CASE` / `COALESCE` / `UNION` type resolution, a value assigned to a column of the other type — whose result depends on the session's `TimeZone`. An explicit cast or `AT TIME ZONE`, a parameter and an untyped literal are not reported. |
+| [`integer_division`](docs/lint/integer_division.md) | warning | An integer division, which truncates, whose result is then used as a `numeric` or floating-point value: `(done / total)::numeric`, `done / total * 100.0`, `done / total > 0.5`, `round(done / total, 2)`, or an integer product of it so used (`(done / total * 100)::numeric`). Convert an operand first: `done::numeric / total`. |
+| [`left_join_nullified`](docs/lint/left_join_nullified.md) | warning | A `WHERE` condition never true for the null-extended rows of an outer join's nullable side (`LEFT JOIN b … WHERE b.status = 'x'`, `b.id IS NOT NULL`), so the join behaves as an inner join; `b.id IS NULL` (the anti-join), non-strict tests like `COALESCE(b.x, 0) = 0`, an `OR` with an arm keeping the rows and a join that never null-extends (a foreign key's parent) are not reported. |
+| [`check_violation`](docs/lint/check_violation.md) | warning | An `INSERT … VALUES`, `UPDATE … SET` or `ON CONFLICT DO UPDATE SET` storing a constant a `CHECK` constraint (`NOT VALID` ones included) or the column's domain rejects whatever the rest of the row, so the statement fails for every row it writes; not reported when a `BEFORE` row trigger or a rule may change the row. |
+| [`unstable_order`](docs/lint/unstable_order.md) | warning | An `ORDER BY` under `LIMIT`, `OFFSET` / `FETCH` or `DISTINCT ON` whose keys don't determine a unique row — no unique key (NOT NULL, or `NULLS NOT DISTINCT`) of every table is covered, counting columns `WHERE` pins to a constant, tables joined on their key and grouping keys — so tied rows come back in an arbitrary order and pages may skip or repeat rows. The help names the primary key to add as a tiebreaker. Queries returning at most one row, `WITH TIES`, `SKIP LOCKED` queues and FROM clauses the proof can't see through (subqueries, CTEs, partial or expression unique indexes) are not reported. |
+| [`fk_type_mismatch`](docs/lint/fk_type_mismatch.md) | warning | A foreign key whose column types differ from the referenced columns. |
+| [`missing_lock_timeout`](docs/lint/missing_lock_timeout.md) | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| [`drop_index_blocking`](docs/lint/drop_index_blocking.md) | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
+| [`blocking_rebuild`](docs/lint/blocking_rebuild.md) | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
+| [`detach_partition_blocking`](docs/lint/detach_partition_blocking.md) | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
+| [`validate_in_same_transaction`](docs/lint/validate_in_same_transaction.md) | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
+| [`attach_partition_scan`](docs/lint/attach_partition_scan.md) | warning | `ATTACH PARTITION` of an existing table with no valid `CHECK` on the partition key, so PostgreSQL scans it under lock to check the bound. A `CHECK` that reads a key column is taken to imply the bound (the lint does not prove it does). |
+| [`missing_primary_key`](docs/lint/missing_primary_key.md) | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
+| [`rls_policy_not_enforced`](docs/lint/rls_policy_not_enforced.md) | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
+| [`rls_no_policy`](docs/lint/rls_no_policy.md) | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
+| [`security_definer_search_path`](docs/lint/security_definer_search_path.md) | warning | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
+| [`prefer_timestamptz`](docs/lint/prefer_timestamptz.md) | off | A `timestamp without time zone` column. |
+| [`prefer_identity`](docs/lint/prefer_identity.md) | off | A `serial` column instead of an identity column. |
+| [`prefer_text`](docs/lint/prefer_text.md) | off | A `varchar(n)` or `char(n)` column instead of `text`. |
+| [`prefer_bigint_pk`](docs/lint/prefer_bigint_pk.md) | off | An `int2` or `int4` primary key. |
+| [`prefer_jsonb`](docs/lint/prefer_jsonb.md) | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
+| [`fetch_may_return_many`](docs/lint/fetch_may_return_many.md) | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
+| [`fetch_all_single_row`](docs/lint/fetch_all_single_row.md) | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
+| [`unused_returning`](docs/lint/unused_returning.md) | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
+| [`breaks_deployed_queries`](docs/lint/breaks_deployed_queries.md) | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
 
 The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
 `unused_returning`) run in both CLIs: a query can be called directly on the

@@ -346,6 +346,7 @@ impl Report {
             rules.push(serde_json::json!({
                 "id": rule.name(),
                 "shortDescription": { "text": rule.description() },
+                "helpUri": rule.docs_url(),
                 "defaultConfiguration": {
                     "level": rule.default_level().map_or("none", sarif_level)
                 },
@@ -1099,6 +1100,7 @@ mod tests {
                 rule.description(),
                 "{rule}"
             );
+            assert_eq!(rule_json["helpUri"], rule.docs_url(), "{rule}");
             assert_eq!(
                 rule_json["defaultConfiguration"]["level"],
                 rule.default_level().map_or("none", sarif_level),
