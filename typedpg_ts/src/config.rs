@@ -26,7 +26,8 @@
 //! `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`,
 //! `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `scalarSubqueryMayReturnMany`,
 //! `timestampTimezoneMix`, `integerDivision`, `leftJoinNullified`, `checkViolation`,
-//! `unstableOrder` and the call-site rules `fetchMayReturnMany`,
+//! `unstableOrder`, `redundantOrderBy`, `redundantGroupBy`, `countNotNull`,
+//! `nonSargablePredicate`, `floatEquality` and the call-site rules `fetchMayReturnMany`,
 //! `fetchAllSingleRow` and `unusedReturning`; the migration rules
 //! `createIndexBlocking`, `constraintValidating`, `setNotNullScan`,
 //! `tableRewrite`, `missingLockTimeout`, `dropIndexBlocking`,

@@ -478,6 +478,9 @@ pub(crate) fn infer_func_call(
     };
     let derived = derive_collation(collation_inputs.iter(), resolved.return_type_oid, snapshot)?;
     coerce_call_args(&mut args, &resolved, snapshot);
+    if crate::pg_catalog::collecting_column_ref_bindings() {
+        note_count_arg(func, &resolved, &args, snapshot);
+    }
     // Over the arguments as written: the defaults of the functions it
     // knows are finite constants (`lag`'s offset 1 and default NULL,
     // `make_interval`'s zeros). A function declared to return a domain:
@@ -1385,6 +1388,44 @@ fn inline_parameter_usage(
         }
     }
     Some(counts.into_iter().map(|c| c > 0).collect())
+}
+
+/// Record, for the lint's `count_not_null` rule, whether the argument of a
+/// `pg_catalog.count("any")` call may be NULL — read over the rows its
+/// `FILTER` passes. A `DISTINCT` or `*` call records nothing, nor does a
+/// row / composite argument (whose NULL test differs from its null flag);
+/// a parameter anywhere in it may be passed NULL.
+fn note_count_arg(
+    func: &ast::FuncCall,
+    resolved: &functions::ResolvedFunction,
+    args: &FuncArgs,
+    snapshot: &PgCatalog,
+) {
+    if func.agg_star || func.agg_distinct || func.agg_within_group || func.args.len() != 1 {
+        return;
+    }
+    let Some(proc) = snapshot.pg_proc.get(&resolved.oid) else {
+        return;
+    };
+    if proc.proname != "count"
+        || proc.prokind != crate::pg_catalog::ProKind::Aggregate
+        || snapshot.namespace_name(proc.pronamespace) != Some("pg_catalog")
+    {
+        return;
+    }
+    let (Some(arg), Some(&nullable)) = (args.exprs.first(), args.nullable.first()) else {
+        return;
+    };
+    let composite = arg.type_oid == oid::RECORD
+        || arg.record_fields.is_some()
+        || crate::coerce::is_complex(arg.type_oid, snapshot);
+    if composite {
+        return;
+    }
+    crate::pg_catalog::note_count_arg_nullable(
+        func.location,
+        nullable || super::has_param_ref(func.args[0].as_ref()),
+    );
 }
 
 fn collect_arg_types(

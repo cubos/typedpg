@@ -153,6 +153,20 @@ pub enum Rule {
     /// An `ORDER BY` whose keys can tie under `LIMIT` / `OFFSET` / `DISTINCT
     /// ON`: which of the tied rows come back is arbitrary.
     UnstableOrder,
+    /// `ORDER BY` keys that can't change the order: after keys that already
+    /// determine a unique row, pinned to a constant by `WHERE`, repeated, or
+    /// in a query or subquery whose order nothing observes.
+    RedundantOrderBy,
+    /// `GROUP BY` keys determined by the other keys (a unique key of their
+    /// table) or pinned to a constant by `WHERE`.
+    RedundantGroupBy,
+    /// `count(expr)` over a value that is never NULL: it is `count(*)`.
+    CountNotNull,
+    /// A comparison that wraps an indexed column in a cast, function or
+    /// arithmetic (or converts it implicitly), so its index can't serve it.
+    NonSargablePredicate,
+    /// An `=` / `<>` / `IN` comparison of floating-point values.
+    FloatEquality,
     /// A foreign key whose column types differ from the referenced columns.
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
@@ -208,7 +222,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 54] = [
+    pub const ALL: [Rule; 59] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -243,6 +257,11 @@ impl Rule {
         Rule::LeftJoinNullified,
         Rule::CheckViolation,
         Rule::UnstableOrder,
+        Rule::RedundantOrderBy,
+        Rule::RedundantGroupBy,
+        Rule::CountNotNull,
+        Rule::NonSargablePredicate,
+        Rule::FloatEquality,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
         Rule::DropIndexBlocking,
@@ -303,6 +322,11 @@ impl Rule {
             Rule::LeftJoinNullified => "left_join_nullified",
             Rule::CheckViolation => "check_violation",
             Rule::UnstableOrder => "unstable_order",
+            Rule::RedundantOrderBy => "redundant_order_by",
+            Rule::RedundantGroupBy => "redundant_group_by",
+            Rule::CountNotNull => "count_not_null",
+            Rule::NonSargablePredicate => "non_sargable_predicate",
+            Rule::FloatEquality => "float_equality",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
             Rule::DropIndexBlocking => "drop_index_blocking",
@@ -409,6 +433,15 @@ impl Rule {
             Rule::UnstableOrder => {
                 "an ORDER BY with LIMIT, OFFSET or DISTINCT ON whose keys can tie"
             }
+            Rule::RedundantOrderBy => "ORDER BY keys that can't change the order of the rows",
+            Rule::RedundantGroupBy => {
+                "GROUP BY keys determined by the other keys or pinned to a constant"
+            }
+            Rule::CountNotNull => "count(expr) over a value that is never NULL, which is count(*)",
+            Rule::NonSargablePredicate => {
+                "a comparison wrapping an indexed column so its index can't serve it"
+            }
+            Rule::FloatEquality => "an equality comparison of floating-point values",
             Rule::FkTypeMismatch => {
                 "a foreign key whose column types differ from the referenced columns"
             }
@@ -502,7 +535,8 @@ impl Rule {
             | Rule::IntegerDivision
             | Rule::LeftJoinNullified
             | Rule::CheckViolation
-            | Rule::UnstableOrder => Some(Severity::Warning),
+            | Rule::UnstableOrder
+            | Rule::FloatEquality => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit
@@ -513,7 +547,11 @@ impl Rule {
             | Rule::RedundantJoin
             | Rule::FetchAllSingleRow
             | Rule::RlsNoPolicy
-            | Rule::UnusedReturning => Some(Severity::Info),
+            | Rule::UnusedReturning
+            | Rule::RedundantOrderBy
+            | Rule::RedundantGroupBy
+            | Rule::CountNotNull
+            | Rule::NonSargablePredicate => Some(Severity::Info),
             // Off by default: enabled with a level, they report at info.
             Rule::LikeUnescapedParam
             | Rule::PreferTimestamptz

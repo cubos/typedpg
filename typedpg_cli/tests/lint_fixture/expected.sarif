@@ -350,6 +350,51 @@
               }
             },
             {
+              "id": "redundant_order_by",
+              "shortDescription": {
+                "text": "ORDER BY keys that can't change the order of the rows"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "redundant_group_by",
+              "shortDescription": {
+                "text": "GROUP BY keys determined by the other keys or pinned to a constant"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "count_not_null",
+              "shortDescription": {
+                "text": "count(expr) over a value that is never NULL, which is count(*)"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "non_sargable_predicate",
+              "shortDescription": {
+                "text": "a comparison wrapping an indexed column so its index can't serve it"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "float_equality",
+              "shortDescription": {
+                "text": "an equality comparison of floating-point values"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
               "id": "fk_type_mismatch",
               "shortDescription": {
                 "text": "a foreign key whose column types differ from the referenced columns"

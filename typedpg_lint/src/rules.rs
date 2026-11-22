@@ -15,18 +15,23 @@ mod cartesian_join;
 mod case_without_else;
 mod check_violation;
 mod constant_condition;
+mod count_not_null;
+mod float_equality;
 mod insert_without_columns;
 mod integer_division;
 mod left_join_nullified;
 mod like_unescaped_param;
 mod limit_without_order;
+mod non_sargable_predicate;
 mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;
 mod redundant_distinct;
+mod redundant_group_by;
 mod redundant_join;
 mod redundant_limit;
 mod redundant_null_check;
+mod redundant_order_by;
 mod scalar_subquery_may_return_many;
 mod self_assignment;
 mod simplifiable_case;
@@ -69,6 +74,11 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::LeftJoinNullified => left_join_nullified::findings(ctx),
         Rule::CheckViolation => check_violation::findings(ctx),
         Rule::UnstableOrder => unstable_order::findings(ctx),
+        Rule::RedundantOrderBy => redundant_order_by::findings(ctx),
+        Rule::RedundantGroupBy => redundant_group_by::findings(ctx),
+        Rule::CountNotNull => count_not_null::findings(ctx),
+        Rule::NonSargablePredicate => non_sargable_predicate::findings(ctx),
+        Rule::FloatEquality => float_equality::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking
@@ -537,6 +547,43 @@ pub(super) fn condition_span(
                 && (text.eq_ignore_ascii_case("AND") || (!or && text.eq_ignore_ascii_case("OR"))))
     });
     Some(start..end.max(start + 1))
+}
+
+/// The spans of the items of an `ORDER BY` or `GROUP BY` list, given each
+/// item's expression node: from its first token to the `,` after it, or
+/// to the clause or parenthesis that ends the list (the last item), so an
+/// item's `ASC` / `DESC`, `NULLS …` and `USING` are its own.
+pub(super) fn clause_item_spans(
+    ctx: &Ctx<'_>,
+    items: &[Option<&Node>],
+) -> Option<Vec<std::ops::Range<usize>>> {
+    items
+        .iter()
+        .map(|item| {
+            let start = node_span(ctx, (*item)?.to_ref())?.start;
+            let (end, _) = scan_until(ctx, start, |text| {
+                text == "," || (starts_clause(text) && !text.eq_ignore_ascii_case("USING"))
+            });
+            Some(start..end.max(start + 1))
+        })
+        .collect()
+}
+
+/// The edit removing item `index` of a comma-separated list whose items
+/// span `spans`, when `removed` (sorted) are the items going and some item
+/// stays: from the end of the item before it when one before it stays
+/// (`a, b` → `a`), else up to the start of the next one (`a, b` → `b`).
+/// Each item's edit is valid alone and together with the others.
+pub(super) fn list_item_removal(
+    spans: &[std::ops::Range<usize>],
+    removed: &[usize],
+    index: usize,
+) -> Option<std::ops::Range<usize>> {
+    if (0..index).any(|before| !removed.contains(&before)) {
+        Some(spans[index - 1].end..spans[index].end)
+    } else {
+        Some(spans[index].start..spans.get(index + 1)?.start)
+    }
 }
 
 pub(super) fn starts_clause(text: &str) -> bool {

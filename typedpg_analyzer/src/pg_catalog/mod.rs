@@ -1730,6 +1730,7 @@ impl PgCatalog {
                 .collect(),
             case_when_reached: lint_facts.case_when_reached,
             case_when_passed: lint_facts.case_when_passed,
+            count_arg_nullable: lint_facts.count_arg_nullable,
         })
     }
 
@@ -2935,6 +2936,20 @@ struct LintFacts {
     nullified_joins: HashMap<i32, Option<Vec<NullifiedJoin>>>,
     case_when_reached: HashMap<i32, bool>,
     case_when_passed: HashMap<i32, bool>,
+    count_arg_nullable: HashMap<i32, bool>,
+}
+
+/// Record whether the argument of the `count(x)` call at `location` (the
+/// call's) may be NULL. OR-merged with a fact already recorded there.
+pub(crate) fn note_count_arg_nullable(location: i32, nullable: bool) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.count_arg_nullable.entry(location).or_insert(false) |= nullable;
+        }
+    });
 }
 
 /// Record whether a row may take the branch of the searched `CASE` `WHEN`
@@ -3300,6 +3315,9 @@ pub struct QueryView {
     /// Whether a row may get past each searched `CASE` `WHEN`, by its
     /// location in [`Self::sql`].
     case_when_passed: HashMap<i32, bool>,
+    /// Whether the argument of each `count(x)` call may be NULL, by the
+    /// call's location in [`Self::sql`].
+    count_arg_nullable: HashMap<i32, bool>,
 }
 
 impl QueryView {
@@ -3417,6 +3435,16 @@ impl QueryView {
     /// condition was inferred there.
     pub fn case_condition_not_null(&self, location: i32) -> Option<bool> {
         self.case_condition_not_null.get(&location).copied()
+    }
+
+    /// Whether the argument of the `count(x)` call at `location` (a byte
+    /// offset in [`Self::sql`]: the `FuncCall`'s location) may be NULL: a
+    /// call the analyzer resolved to `pg_catalog.count("any")`, without `*`
+    /// or `DISTINCT`, over a value that is not a row / composite one. A
+    /// parameter anywhere in the argument makes it nullable (the caller may
+    /// pass NULL). `None` when no such call was inferred there.
+    pub fn count_arg_nullable(&self, location: i32) -> Option<bool> {
+        self.count_arg_nullable.get(&location).copied()
     }
 
     /// The byte offset in the original query text of `offset_in_sql`, a
