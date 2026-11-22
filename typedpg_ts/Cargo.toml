@@ -32,7 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.11"
-notify = "8"
+notify = "9"
 globset = "0.4"
 oxc_parser = "0.159"
 oxc_ast = "0.159"
