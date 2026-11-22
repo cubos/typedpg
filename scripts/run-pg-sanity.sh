@@ -129,9 +129,17 @@ awk -F'\t' '
     $1 == "count" { n[$2] += $3 }
     $1 == "skip"  { skips[$2] = 1 }
     $1 == "error" { errors[$2] += $3 }
+    $1 == "scenario" { runs[$2] += $3 }
+    $1 == "seeded" { seeded[$2] += $3 }
     END {
         printf "  queries executed over adversarial data: %d (%d scenario runs, %d failed at runtime)\n",
             n["checked"], n["executions"], n["exec_errors"]
+        line = ""
+        for (s in runs) line = line sprintf(" %s=%d", s, runs[s])
+        printf "    successful runs per scenario:%s\n", line
+        line = ""
+        for (s in seeded) line = line sprintf(" %s=%d", s, seeded[s])
+        printf "    rows seeded per scenario (summed over queries):%s\n", line
         for (c in errors) printf "    SQLSTATE %s: %d\n", c, errors[c]
         printf "  not executed: %d with no NOT NULL promise, %d not SELECT/DML, %d calling unsafe functions, %d lacking a parameter sample\n",
             n["no_promise"], n["not_executable"], n["unsafe_calls"], n["no_param_sample"]
