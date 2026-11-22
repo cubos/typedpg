@@ -29,23 +29,38 @@ pub(crate) struct AnalyzedCte {
 /// Every nullability flag of `columns` (their own, their array elements',
 /// their record fields') and their refinements, to tell when a recursive
 /// CTE's have settled.
-fn nullability_signature(
-    columns: &[ScopeColumn],
-) -> Vec<(Option<bool>, Option<bool>, crate::refine::Refinement)> {
-    type Signature = Vec<(Option<bool>, Option<bool>, crate::refine::Refinement)>;
+fn nullability_signature(columns: &[ScopeColumn]) -> Signature {
     fn shape(out: &mut Signature, s: Option<&crate::expr::RecordShape>) {
         for f in s.into_iter().flat_map(|s| s.iter()) {
-            out.push((Some(f.ty.nullable), f.ty.elem_nullable, f.ty.refine.clone()));
+            out.push((
+                Some(f.ty.nullable),
+                f.ty.elem_nullable,
+                f.ty.refine.clone(),
+                f.ty.elem_refine.clone(),
+            ));
             shape(out, f.ty.record_fields.as_ref());
         }
     }
     let mut out = Vec::new();
     for c in columns {
-        out.push((Some(c.base_not_null), c.elem_nullable, c.refine.clone()));
+        out.push((
+            Some(c.base_not_null),
+            c.elem_nullable,
+            c.refine.clone(),
+            c.elem_refine.clone(),
+        ));
         shape(&mut out, c.record_fields.as_ref());
     }
     out
 }
+
+/// See [`nullability_signature`].
+type Signature = Vec<(
+    Option<bool>,
+    Option<bool>,
+    crate::refine::Refinement,
+    crate::refine::Refinement,
+)>;
 
 pub(crate) fn analyze_cte(
     cte: &ast::CommonTableExpr,
@@ -112,6 +127,7 @@ pub(crate) fn analyze_cte(
         planned_unknown: planned_in(rc.planned).is_none(),
         record_fields: rc.record_fields,
         elem_nullable: rc.elem_nullable,
+        elem_refine: rc.elem_refine.clone(),
         refine: rc.refine.clone(),
         origin: rc.origin,
         output: None,
@@ -308,6 +324,20 @@ pub(crate) fn analyze_cte(
                                 &s.refine.converted(s.type_oid, type_oid, snapshot),
                                 &r.refine.converted(r.type_oid, type_oid, snapshot),
                             ]),
+                            elem_refine: crate::refine::Refinement::either([
+                                &crate::expr::elem_refine_converted(
+                                    &s.elem_refine,
+                                    s.type_oid,
+                                    type_oid,
+                                    snapshot,
+                                ),
+                                &crate::expr::elem_refine_converted(
+                                    &r.elem_refine,
+                                    r.type_oid,
+                                    type_oid,
+                                    snapshot,
+                                ),
+                            ]),
                             origin: None,
                             output: None,
                         }
@@ -340,9 +370,11 @@ pub(crate) fn analyze_cte(
                     keeping_unknown_outputs(|| analyze_body(rarg, params, &scopes))?;
                 let mut next = merge(&rec_cols);
                 for ((n, c), widened) in next.iter_mut().zip(&columns).zip(&mut widened) {
-                    *widened |= step >= 3 && n.refine != c.refine;
+                    *widened |=
+                        step >= 3 && (n.refine != c.refine || n.elem_refine != c.elem_refine);
                     if *widened {
                         n.refine = crate::refine::Refinement::NONE;
+                        n.elem_refine = crate::refine::Refinement::NONE;
                     }
                 }
                 if nullability_signature(&next) == nullability_signature(&columns) {
@@ -356,6 +388,7 @@ pub(crate) fn analyze_cte(
                     c.base_not_null = false;
                     c.elem_nullable = Some(true);
                     c.refine = crate::refine::Refinement::NONE;
+                    c.elem_refine = crate::refine::Refinement::NONE;
                     c.record_fields = None;
                 }
             }
@@ -485,6 +518,7 @@ fn search_cycle_columns(
         planned_unknown: false,
         record_fields: None,
         elem_nullable: None,
+        elem_refine: crate::refine::Refinement::NONE,
         refine: crate::refine::Refinement::NONE,
         origin: None,
         output: None,

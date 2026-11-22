@@ -2045,8 +2045,10 @@ fn build_output_struct(
     for col in columns {
         let field_name = make_field_ident(&col.name);
         let field_type = column_rust_type(col, config, registry)?;
+        let doc = crate::refinement_doc::field_doc(col);
 
         fields.extend(quote! {
+            #doc
             pub #field_name: #field_type,
         });
     }

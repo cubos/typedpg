@@ -209,6 +209,7 @@ impl PgCatalog {
                 )?,
                 nullable: !(attr.attnotnull || self.type_is_not_null(attr.atttypid)),
                 refinement: crate::refine::Refinement::NONE,
+                elem_refinement: crate::refine::Refinement::NONE,
             });
         }
 

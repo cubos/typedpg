@@ -1361,3 +1361,243 @@ fn an_or_of_conditions_on_a_column_bounds_it_by_their_hull() {
         &[("n", true, None, None)],
     );
 }
+
+// ── Array elements ──────────────────────────────────────────────────────────
+
+/// Each column's (name, value set of its array's elements).
+#[track_caller]
+fn assert_elem_values(db: &PgCatalog, sql: &str, expected: &[(&str, Option<&[&str]>)]) {
+    let s = db.analyze(sql).unwrap();
+    let actual: Vec<(&str, Option<Vec<&str>>)> = s
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.elem_refinement
+                    .values
+                    .as_ref()
+                    .map(|vs| vs.iter().map(String::as_str).collect()),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Option<Vec<&str>>)> = expected
+        .iter()
+        .map(|(n, v)| (*n, v.map(<[&str]>::to_vec)))
+        .collect();
+    assert_eq!(actual, expected, "element value sets mismatch for `{sql}`");
+}
+
+#[test]
+fn array_constructors_and_literals_have_their_elements_values() {
+    let db = values_setup();
+    assert_elem_values(
+        &db,
+        "SELECT ARRAY['a', 'b'] AS a, ARRAY[1, 2, NULL] AS b, ARRAY[kind] AS c,
+                ARRAY[ARRAY[1], ARRAY[3]] AS d, '{x,y}'::text[] AS e, '{1, 2}'::int8[] AS f,
+                '{a,NULL}'::text[] AS g, ARRAY[n]::text[] AS h, ARRAY[free] AS i,
+                '{abc}'::varchar(2)[] AS j, ARRAY[free]::ab[] AS k, ARRAY[true] AS l,
+                ARRAY[]::int[] AS m, ARRAY[1.5] AS n
+         FROM v",
+        &[
+            ("a", Some(&["a", "b"])),
+            ("b", Some(&["1", "2"])),
+            ("c", Some(&["a", "b"])),
+            ("d", Some(&["1", "3"])),
+            ("e", Some(&["x", "y"])),
+            ("f", Some(&["1", "2"])),
+            ("g", Some(&["a"])),
+            ("h", Some(&["1", "2"])),
+            ("i", None),
+            // varchar(2) truncates.
+            ("j", None),
+            // Each element passed the domain's CHECK.
+            ("k", Some(&["a", "b"])),
+            ("l", Some(&["true"])),
+            ("m", None),
+            ("n", None),
+        ],
+    );
+}
+
+#[test]
+fn aggregates_and_array_functions_carry_element_values() {
+    let db = values_setup();
+    assert_elem_values(
+        &db,
+        "SELECT array_agg(kind) AS a, array_agg(DISTINCT n) AS b,
+                array_agg(kind) FILTER (WHERE kind = 'a') AS c,
+                array_agg(ARRAY[n]) AS d, array_agg(free) AS i
+         FROM v",
+        &[
+            ("a", Some(&["a", "b"])),
+            ("b", Some(&["1", "2"])),
+            // Only the rows the FILTER passes.
+            ("c", Some(&["a"])),
+            ("d", Some(&["1", "2"])),
+            ("i", None),
+        ],
+    );
+    assert_elem_values(
+        &db,
+        "SELECT array_append(ARRAY[kind], 'z') AS e,
+                array_prepend(3, ARRAY[n]) AS f, array_cat(ARRAY[n], ARRAY[5]) AS g,
+                array_remove(ARRAY[kind], 'a') AS h,
+                array_positions(ARRAY[1], 1) AS j, array_append(ARRAY[kind], NULL) AS k
+         FROM v",
+        &[
+            ("e", Some(&["a", "b", "z"])),
+            ("f", Some(&["1", "2", "3"])),
+            ("g", Some(&["1", "2", "5"])),
+            ("h", Some(&["a", "b"])),
+            ("j", None),
+            ("k", Some(&["a", "b"])),
+        ],
+    );
+    assert_elem_values(
+        &db,
+        "SELECT ARRAY[kind] || 'z'::text AS a, 'y'::text || ARRAY[kind] AS b,
+                ARRAY[n] || ARRAY[7] AS c, ARRAY[n] || '{ 8, 9}' AS d, ARRAY[n] || NULL AS e,
+                ARRAY[kind] || free AS f, ARRAY[n] || 6 AS g
+         FROM v",
+        &[
+            ("a", Some(&["a", "b", "z"])),
+            ("b", Some(&["a", "b", "y"])),
+            ("c", Some(&["1", "2", "7"])),
+            // `int4in` reads ' 8' as 8.
+            ("d", Some(&["1", "2", "8", "9"])),
+            ("e", Some(&["1", "2"])),
+            ("f", None),
+            ("g", Some(&["1", "2", "6"])),
+        ],
+    );
+}
+
+#[test]
+fn array_positions_are_at_least_one() {
+    let db = values_setup();
+    let s = db
+        .analyze("SELECT array_positions(ARRAY[1, 2], 1) AS p")
+        .unwrap();
+    let r = s.columns[0].elem_refinement.int_bounds().unwrap();
+    assert_eq!((r.lo, r.hi), (Some(1), None));
+}
+
+#[test]
+fn element_values_travel_through_queries_and_conditionals() {
+    let db = values_setup();
+    assert_elem_values(
+        &db,
+        "WITH c AS (SELECT ARRAY[kind] AS k FROM v)
+         SELECT k, (SELECT k FROM c LIMIT 1) AS s, ARRAY(SELECT kind FROM v) AS a,
+                ARRAY(SELECT ARRAY[n] FROM v) AS m,
+                CASE WHEN random() > 0.5 THEN k ELSE ARRAY['c'] END AS w,
+                COALESCE(k, '{d}') AS x, COALESCE(k, NULL) AS y,
+                CASE WHEN random() > 0.5 THEN k ELSE ARRAY[free] END AS z
+         FROM c, v",
+        &[
+            ("k", Some(&["a", "b"])),
+            ("s", Some(&["a", "b"])),
+            ("a", Some(&["a", "b"])),
+            ("m", Some(&["1", "2"])),
+            ("w", Some(&["a", "b", "c"])),
+            ("x", Some(&["a", "b", "d"])),
+            ("y", Some(&["a", "b"])),
+            ("z", None),
+        ],
+    );
+    assert_elem_values(
+        &db,
+        "SELECT ARRAY[kind] AS k FROM v UNION ALL SELECT ARRAY['q']",
+        &[("k", Some(&["a", "b", "q"]))],
+    );
+    assert_elem_values(
+        &db,
+        "SELECT ARRAY[kind] AS k FROM v UNION ALL SELECT ARRAY[free] FROM v",
+        &[("k", None)],
+    );
+    assert_elem_values(
+        &db,
+        "SELECT k FROM (SELECT ARRAY[n] AS k FROM v) s",
+        &[("k", Some(&["1", "2"]))],
+    );
+}
+
+#[test]
+fn reading_an_element_gives_its_values() {
+    let db = values_setup();
+    assert_values(
+        &db,
+        "SELECT unnest(ARRAY[kind]) AS a, (ARRAY['x', 'y'])[1] AS b, u AS c,
+                (ARRAY[ARRAY[1, 2]])[1][2] AS d, ((ARRAY[n, 3])[1:1])[1] AS e,
+                unnest(ARRAY[free]) AS f
+         FROM v, unnest(ARRAY[n, 4]) AS u",
+        &[
+            ("a", Some(&["a", "b"])),
+            ("b", Some(&["x", "y"])),
+            ("c", Some(&["1", "2", "4"])),
+            ("d", Some(&["1", "2"])),
+            ("e", Some(&["1", "2", "3"])),
+            ("f", None),
+        ],
+    );
+    assert_values(
+        &db,
+        "SELECT x, y FROM unnest(ARRAY['p'], ARRAY[7]) AS r(x, y)",
+        &[("x", Some(&["p"])), ("y", Some(&["7"]))],
+    );
+}
+
+#[test]
+fn an_array_of_a_domain_has_its_values() {
+    let mut db = values_setup();
+    db.apply_sql("CREATE TABLE w (tags ab[] NOT NULL, moods mood[]);")
+        .unwrap();
+    assert_elem_values(
+        &db,
+        "SELECT tags, tags[1:2] AS s, moods FROM w",
+        &[
+            ("tags", Some(&["a", "b"])),
+            ("s", Some(&["a", "b"])),
+            ("moods", None),
+        ],
+    );
+    assert_values(
+        &db,
+        "SELECT tags[1] AS t FROM w",
+        &[("t", Some(&["a", "b"]))],
+    );
+}
+
+#[test]
+fn element_bounds_and_finiteness() {
+    let db = bounds_setup();
+    let s = db
+        .analyze(
+            "SELECT array_agg(d) AS a, ARRAY[now()] AS b, ARRAY['infinity'::date] AS c,
+                    '{2020-01-01,2020-01-03}'::date[] AS e, array_agg(r) AS f
+             FROM b",
+        )
+        .unwrap();
+    let got: Vec<(&str, Option<String>, bool)> = s
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                render_bounds(&c.elem_refinement.bounds),
+                c.elem_refinement.finite,
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("a", Some("[7305, 11322]".to_owned()), true),
+            ("b", None, true),
+            ("c", Some("[inf, inf]".to_owned()), false),
+            ("e", Some("[7305, 7307]".to_owned()), true),
+            ("f", Some("[7305, 11322]".to_owned()), true),
+        ]
+    );
+}

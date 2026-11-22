@@ -236,7 +236,8 @@ impl Soundness {
         let has_promise = ours.columns.iter().zip(&checked).any(|(c, &on)| {
             on && (!c.nullable
                 || has_inner_promise(&c.pg_type)
-                || c.refinement != crate::refine::Refinement::NONE)
+                || c.refinement != crate::refine::Refinement::NONE
+                || c.elem_refinement != crate::refine::Refinement::NONE)
         });
         if !has_promise {
             self.stats.no_promise += 1;
@@ -398,6 +399,10 @@ impl Soundness {
                             .map(|p| (Unsound::Nullability, p))
                             .or_else(|| {
                                 refinement_violation(col, bytes).map(|p| (Unsound::Refinement, p))
+                            })
+                            .or_else(|| {
+                                elem_refinement_violation(col, bytes)
+                                    .map(|p| (Unsound::Refinement, p))
                             }),
                     };
                     if let Some((what, problem)) = problem {
@@ -1016,6 +1021,37 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
         _ => false,
     };
     infinite.then(|| "the value is infinite (refinement: finite)".to_string())
+}
+
+/// What an element of the binary array `bytes` of column `col` isn't of
+/// what its element refinement says every non-NULL element is (at any
+/// depth: the elements of a multidimensional array are all listed).
+fn elem_refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<String> {
+    if col.elem_refinement == crate::refine::Refinement::NONE {
+        return None;
+    }
+    let mut ty = &col.pg_type;
+    while let Type::Domain { base, .. } = ty {
+        ty = base;
+    }
+    let Type::Array { element, .. } = ty else {
+        return None;
+    };
+    // The element read as a column of the element type so refined.
+    let as_column = crate::AnalyzedColumn {
+        name: col.name.clone(),
+        pg_type: (**element).clone(),
+        nullable: true,
+        refinement: col.elem_refinement.clone(),
+        elem_refinement: crate::refine::Refinement::NONE,
+    };
+    array_elements(bytes)?
+        .into_iter()
+        .enumerate()
+        .find_map(|(k, elem)| {
+            let found = refinement_violation(&as_column, elem?)?;
+            Some(format!("element [{}]: {found} (elem_refinement)", k + 1))
+        })
 }
 
 /// Find a NULL inside the binary value `bytes` of type `ty` where `ty`

@@ -43,6 +43,10 @@ pub(crate) fn build_column(
             values: rc.refine.enumerated(),
             ..rc.refine
         },
+        elem_refinement: crate::refine::Refinement {
+            values: rc.elem_refine.enumerated(),
+            ..rc.elem_refine
+        },
     })
 }
 

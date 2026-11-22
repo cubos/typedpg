@@ -138,6 +138,7 @@ pub(crate) fn infer_column_ref(
                 // see through to the field types.
                 record_fields: col.record_fields.clone(),
                 elem_nullable: col.elem_nullable,
+                elem_refine: col.elem_refine.clone(),
                 // (No relation has an `unknown` column: a function in FROM
                 // returning it is rejected.)
                 unknown_value: false,
@@ -475,6 +476,7 @@ fn whole_row_ref(
                     planned: c.planned(),
                     record_fields: c.record_fields.clone(),
                     elem_nullable: c.elem_nullable,
+                    elem_refine: c.elem_refine.clone(),
                     refine: c.refine.clone(),
                     unknown_value: false,
                 });
@@ -493,6 +495,7 @@ fn whole_row_ref(
         planned: super::Planned::AsParsed,
         record_fields: Some(shape_of_columns(&source.columns).into()),
         elem_nullable: None,
+        elem_refine: crate::refine::Refinement::NONE,
         refine: crate::refine::Refinement::NONE,
         unknown_value: false,
     })
@@ -515,6 +518,7 @@ fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
                 planned: c.planned(),
                 record_fields: c.record_fields.clone(),
                 elem_nullable: c.elem_nullable,
+                elem_refine: c.elem_refine.clone(),
                 refine: c.refine.clone(),
                 unknown_value: false,
             },

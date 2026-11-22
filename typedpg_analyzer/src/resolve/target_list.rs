@@ -202,6 +202,7 @@ pub(crate) fn resolve_target_list_explicit(
                     scan_var: None,
                     record_fields: col.record_fields.clone(),
                     elem_nullable: col.elem_nullable,
+                    elem_refine: col.elem_refine.clone(),
                     refine: col.refine.clone(),
                     origin: col.origin.clone(),
                     unknown_value: false,
@@ -237,6 +238,7 @@ pub(crate) fn resolve_target_list_explicit(
                     scan_stays: false,
                     scan_var: None,
                     elem_nullable: t.elem_nullable,
+                    elem_refine: t.elem_refine.clone(),
                     refine: t.refine.clone(),
                     record_fields: t.record_fields,
                     origin: None,
@@ -316,6 +318,7 @@ pub(crate) fn resolve_target_list_explicit(
             scan_var: None,
             record_fields,
             elem_nullable: expr_type.elem_nullable,
+            elem_refine: expr_type.elem_refine.clone(),
             refine: expr_type.refine.clone(),
             // A plain column reference passes its column through as is.
             origin: val
@@ -534,6 +537,7 @@ pub(crate) fn analyze_values_lists(
             scan_var: None,
             record_fields: None,
             elem_nullable: None,
+            elem_refine: crate::refine::Refinement::NONE,
             refine: crate::refine::Refinement::NONE,
             origin: None,
             unknown_value: false,

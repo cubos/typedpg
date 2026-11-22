@@ -76,6 +76,7 @@ pub(crate) fn analyze_call(
             scan_var: None,
             record_fields: None,
             elem_nullable: None,
+            elem_refine: crate::refine::Refinement::NONE,
             refine: crate::refine::Refinement::NONE,
             origin: None,
             unknown_value: false,
