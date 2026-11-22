@@ -213,6 +213,35 @@ impl PgCatalog {
         crate::ddl::tables::partbound::key_column_names(self, relid)
     }
 
+    /// Whether `ALTER TABLE parent ATTACH PARTITION part FOR VALUES …`
+    /// (`bound`) makes PostgreSQL scan `part` to check that its rows fit:
+    /// `false` only when `part`'s validated CHECK and NOT NULL constraints
+    /// provably imply the partition constraint, as PostgreSQL's own proof
+    /// (`PartConstraintImpliedByRelConstraint`) would find.
+    pub fn lint_attach_partition_scans(
+        &self,
+        parent: PgClassOid,
+        part: PgClassOid,
+        bound: &typedpg_pg_query::ast::PartitionBoundSpec,
+    ) -> bool {
+        crate::ddl::tables::partbound::attach_scans(self, parent, part, bound)
+    }
+
+    /// The default partition of the partitioned table `relid`, if it has
+    /// one.
+    pub fn lint_default_partition(&self, relid: PgClassOid) -> Option<PgClassOid> {
+        self.pg_inherits
+            .iter()
+            .find(|inherits| {
+                inherits.inhparent == relid
+                    && matches!(
+                        self.partition_bounds.get(&inherits.inhrelid),
+                        Some(crate::ddl::tables::partbound::Bound::Default)
+                    )
+            })
+            .map(|inherits| inherits.inhrelid)
+    }
+
     /// Whether the partitioned table `relid` has a default partition.
     pub fn lint_has_default_partition(&self, relid: PgClassOid) -> bool {
         self.pg_inherits.iter().any(|inherits| {

@@ -150,7 +150,7 @@ examples and configuration:
 | [`blocking_rebuild`](docs/lint/blocking_rebuild.md) | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
 | [`detach_partition_blocking`](docs/lint/detach_partition_blocking.md) | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
 | [`validate_in_same_transaction`](docs/lint/validate_in_same_transaction.md) | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
-| [`attach_partition_scan`](docs/lint/attach_partition_scan.md) | warning | `ATTACH PARTITION` of an existing table with no valid `CHECK` on the partition key, so PostgreSQL scans it under lock to check the bound. A `CHECK` that reads a key column is taken to imply the bound (the lint does not prove it does). |
+| [`attach_partition_scan`](docs/lint/attach_partition_scan.md) | warning | `ATTACH PARTITION` of an existing table whose validated `CHECK` and `NOT NULL` constraints don't imply the partition bound (proven as PostgreSQL proves it; a `CHECK` alone doesn't make the key `NOT NULL`), so PostgreSQL scans it under lock to check the bound; also the scan of an existing default partition. |
 | [`missing_primary_key`](docs/lint/missing_primary_key.md) | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
 | [`rls_policy_not_enforced`](docs/lint/rls_policy_not_enforced.md) | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
 | [`rls_no_policy`](docs/lint/rls_no_policy.md) | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
@@ -160,7 +160,7 @@ examples and configuration:
 | [`prefer_text`](docs/lint/prefer_text.md) | off | A `varchar(n)` or `char(n)` column instead of `text`. |
 | [`prefer_bigint_pk`](docs/lint/prefer_bigint_pk.md) | off | An `int2` or `int4` primary key. |
 | [`prefer_jsonb`](docs/lint/prefer_jsonb.md) | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
-| [`fetch_may_return_many`](docs/lint/fetch_may_return_many.md) | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
+| [`fetch_may_return_many`](docs/lint/fetch_may_return_many.md) | warning | `fetch_one` / `fetch_one_as` / `fetch_value` / `fetch_optional` / `fetch_optional_as` / `fetch_value_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
 | [`fetch_all_single_row`](docs/lint/fetch_all_single_row.md) | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
 | [`unused_returning`](docs/lint/unused_returning.md) | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
 | [`breaks_deployed_queries`](docs/lint/breaks_deployed_queries.md) | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |

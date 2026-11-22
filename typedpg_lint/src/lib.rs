@@ -461,7 +461,8 @@ impl Rule {
                 "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
             }
             Rule::AttachPartitionScan => {
-                "ATTACH PARTITION scanning the partition because no CHECK implies its bound"
+                "ATTACH PARTITION scanning the partition because its constraints don't imply its \
+                 bound, or scanning the default partition"
             }
             Rule::MissingPrimaryKey => "a table without a primary key",
             Rule::RlsPolicyNotEnforced => {
@@ -603,15 +604,22 @@ pub struct Call {
 /// The method a query result's call has, independent of its spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallMethod {
-    /// `fetch_one()` / `fetch_one_as()` (Rust), `fetchOne()` / `fetchValue()`
-    /// (TypeScript): fails with `TooManyRows` on a second row.
+    /// `fetch_one()` / `fetch_one_as()` / `fetch_value()` (Rust),
+    /// `fetchOne()` / `fetchValue()` (TypeScript): fails with `TooManyRows`
+    /// on a second row.
     FetchOne,
-    /// `fetch_optional()` / `fetch_optional_as()` (Rust),
-    /// `fetchOptional()` / `fetchValueOptional()` (TypeScript): fails with
-    /// `TooManyRows` on a second row.
+    /// `fetch_optional()` / `fetch_optional_as()` /
+    /// `fetch_value_optional()` (Rust), `fetchOptional()` /
+    /// `fetchValueOptional()` (TypeScript): fails with `TooManyRows` on a
+    /// second row.
     FetchOptional,
     /// `fetch_all()` / `fetch_all_as()` (Rust), `fetchAll()` (TypeScript).
     FetchAll,
+    /// `fetch_stream()` / `fetch_stream_as()` (Rust), `fetchStream()`
+    /// (TypeScript): reads every row, one at a time. Streaming is a choice
+    /// about memory, not about how many rows to expect, so
+    /// `fetch_all_single_row` does not report it.
+    FetchStream,
     /// `execute()`: runs the statement and discards its `RETURNING` rows.
     Execute,
 }

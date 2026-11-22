@@ -225,6 +225,88 @@ fn fix_removes_returning_of_a_direct_execute() {
 }
 
 #[test]
+fn inline_calls_are_linted_before_the_module_is_generated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "include": ["src"], "out": "src/generated/db.ts" }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TABLE users (id int4 PRIMARY KEY, org_id int4, name text NOT NULL);\n",
+    );
+    write(
+        &root.join("src/app/users.ts"),
+        "import { sql } from '../generated/db.js';\n\
+         sql(`INSERT INTO users (id, name) VALUES ($id, $name) RETURNING id`).execute(pool, { id, name });\n\
+         sql(`SELECT id FROM users WHERE org_id = $org`).fetchOne(pool, { org });\n",
+    );
+    write(
+        &root.join("src/app/broken.ts"),
+        "import { sql } from '../generated/db';\nsql(`SELECT nope FROM users`);\n",
+    );
+
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The module doesn't exist, and lint doesn't write it ...
+    assert!(!root.join("src/generated").exists());
+    // ... but the calls on `sql()` imported from it are linted all the same.
+    assert!(stderr.contains("checked 3 queries"), "{stderr}");
+    assert!(stdout.contains("src/app/users.ts:2:70]"), "{stdout}");
+    assert!(stdout.contains("info[unused_returning]"), "{stdout}");
+    assert!(stdout.contains("src/app/users.ts:3:49]"), "{stdout}");
+    assert!(
+        stdout.contains("warning[fetch_may_return_many]"),
+        "{stdout}"
+    );
+    // A query that doesn't analyze fails the run, as it fails `gen`.
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("column \"nope\" does not exist"),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn an_invalid_lint_key_fails_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "include": ["src"], "out": "src/db.ts", "lint": { "bogusRule": "error" } }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TABLE t (id int4);\n",
+    );
+    for format in ["human", "json", "sarif"] {
+        let output = run(root, &["lint", "--format", format]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{format}: {stdout}\n{stderr}"
+        );
+        assert!(
+            format!("{stdout}{stderr}").contains("unknown rule `bogusRule` in `lint`"),
+            "{format}: {stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("typedpg lint: invalid configuration, nothing was checked"),
+            "{format}: {stderr}"
+        );
+        assert!(!stderr.contains("passed"), "{format}: {stderr}");
+    }
+    // The JSON document carries the error as its failure.
+    let output = run(root, &["lint", "--format", "json"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["failures"][0]["path"], "typedpg.config.json");
+}
+
+#[test]
 fn a_sql_file_imported_directly_is_linted_at_the_calls() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

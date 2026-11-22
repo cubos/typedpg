@@ -222,10 +222,43 @@ fn build_lint(
     previous_deployment: Option<&str>,
     start: Instant,
 ) -> Result<(Report, LintOptions, Vec<PendingFix>, PathBuf), String> {
-    let config = Config::load(config_path)?;
+    // A configuration that can't be read is the run's one failure, in every
+    // format: nothing was checked, and the run fails.
+    let config_error = |error: String| {
+        let shown = config_path.display().to_string().replace('\\', "/");
+        let message = error
+            .strip_prefix(&format!("{}: ", config_path.display()))
+            .map_or_else(|| error.clone(), str::to_owned);
+        let report = Report {
+            failures: vec![Failure {
+                path: shown,
+                start: None,
+                message,
+            }],
+            elapsed: start.elapsed(),
+            config_error: true,
+            ..Report::default()
+        };
+        (
+            report,
+            LintOptions::default(),
+            Vec::new(),
+            PathBuf::from("."),
+        )
+    };
+    let config = match Config::load(config_path) {
+        Ok(config) => config,
+        Err(error) => return Ok(config_error(error)),
+    };
     let options = LintOptions::from_config(&config.lint);
-    let ignore = IgnoreSet::new(&config.lint.ignore)?;
-    let mut project = Project::for_lint(config)?;
+    let ignore = match IgnoreSet::new(&config.lint.ignore) {
+        Ok(ignore) => ignore,
+        Err(error) => return Ok(config_error(error)),
+    };
+    let mut project = match Project::for_lint(config) {
+        Ok(project) => project,
+        Err(error) => return Ok(config_error(error)),
+    };
     let root = project.config.root.clone();
     // The check `cargo build` would run: every diagnostic it reports is a
     // failure here too (a query or COPY target that does not analyze, a

@@ -25,7 +25,7 @@ Off by default: a length limit in the type is a legitimate choice.
 
 Every column of an ordinary or partitioned table in a user schema of the final schema whose type is `varchar(n)` or `char(n)` — including a bare `char`, which is `char(1)` — directly, through a domain, or as an array element type; the length is read through domains and arrays. An unbounded `varchar` is fine and not reported. Partitions and inheritance children are skipped.
 
-For an array column the message shows the element type (`is varchar(20)`), and the suggested `CHECK` applies `char_length` to the column itself, which doesn't fit an array: check each element instead (for example with a domain over `text` as the element type).
+For an array column the message shows the array type (`is varchar(20)[]`) and the help suggests `text[]` alone: `char_length` takes one string, so there is no `CHECK` on the column as simple to offer (a domain over `text` with the check, as the element type, keeps a limit).
 
 ### Placement and `--previous-deployment`
 
@@ -72,7 +72,7 @@ info[prefer_text]: public.users.country is char(2): char pads with spaces
    ╰────
   help: use text, with a CHECK (char_length(country) <= 2) if the limit matters
 
-info[prefer_text]: public.users.tags is varchar(20)
+info[prefer_text]: public.users.tags is varchar(20)[]
    ╭─[migrations/0001_init.sql:1:1]
  1 │ CREATE TABLE users (
    · ────────────────────
@@ -82,7 +82,7 @@ info[prefer_text]: public.users.tags is varchar(20)
    · ────────────────────────────────
    · …
    ╰────
-  help: use text, with a CHECK (char_length(tags) <= 20) if the limit matters
+  help: use text[]
 ```
 
 ### Good

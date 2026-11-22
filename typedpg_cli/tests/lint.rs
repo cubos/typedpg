@@ -850,3 +850,130 @@ fn breaks_deployed_queries_analyzes_a_query_as_its_roles() {
         assert!(stdout.contains(expected), "{expected}\n{stdout}");
     }
 }
+
+/// A crate in a temporary directory: `Cargo.toml` with `metadata` appended,
+/// one migration and `src/main.rs`.
+fn small_crate(metadata: &str, migration: &str, main: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "small_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+{metadata}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("migrations/0001_init.sql"), migration).unwrap();
+    std::fs::write(root.join("src/main.rs"), main).unwrap();
+    dir
+}
+
+#[test]
+fn fetch_value_calls_are_checked_like_fetch_one() {
+    let dir = small_crate(
+        "",
+        "CREATE TABLE users (id integer PRIMARY KEY, org_id integer, name text);\n",
+        r#"use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool, org: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = sql!(pool, "SELECT id FROM users WHERE org_id = $org", org = &org).fetch_value().await?;
+    let _ = sql!(pool, "SELECT name FROM users WHERE org_id = $org", org = &org)
+        .fetch_value_optional()
+        .await?;
+    let _ = sql!(pool, "SELECT name FROM users WHERE id = $org", org = &org).fetch_value().await?;
+    Ok(())
+}
+"#,
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(
+        stdout.matches("warning[fetch_may_return_many]").count(),
+        2,
+        "{stdout}"
+    );
+    for expected in [
+        "`.fetch_value()` fails with TooManyRows",
+        "`.fetch_value_optional()` fails with TooManyRows",
+    ] {
+        assert!(stdout.contains(expected), "{expected}\n{stdout}");
+    }
+}
+
+#[test]
+fn a_fetch_value_or_stream_call_is_a_known_use_of_a_bound_query() {
+    // Every use is a method the rules know: the query does not escape, so
+    // `unused_returning` judges it — and stays quiet, because the rows are
+    // read.
+    let dir = small_crate(
+        "",
+        "CREATE TABLE users (id integer PRIMARY KEY, name text);\n",
+        r#"use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool, cond: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let insert = sql!(pool, "INSERT INTO users (id, name) VALUES (1, 'a') RETURNING id");
+    if cond {
+        insert.execute().await?;
+    } else {
+        let _ = insert.fetch_value().await?;
+    }
+    let only_execute = sql!(pool, "INSERT INTO users (id, name) VALUES (2, 'b') RETURNING id");
+    only_execute.execute().await?;
+    let streamed = sql!(pool, "SELECT id FROM users WHERE id = 1");
+    let _ = streamed.fetch_stream().await?;
+    Ok(())
+}
+"#,
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    // Only the query whose every call is `execute()` reports its RETURNING.
+    assert_eq!(
+        stdout.matches("info[unused_returning]").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stdout.contains("src/main.rs:11:18]"), "{stdout}");
+    // Streaming a single-row query is not `fetch_all_single_row`'s concern.
+    assert!(!stdout.contains("fetch_all_single_row"), "{stdout}");
+}
+
+#[test]
+fn an_invalid_lint_key_fails_the_run() {
+    let dir = small_crate(
+        "\n[package.metadata.typedpg.lint]\nbogus_rule = \"error\"\n",
+        "CREATE TABLE users (id integer PRIMARY KEY);\n",
+        "fn main() {}\n",
+    );
+    for format in ["human", "json", "sarif"] {
+        let (code, stdout, stderr) = lint_crate(dir.path(), &["--format", format]);
+        assert_eq!(code, Some(1), "{format}: {stderr}\n{stdout}");
+        assert!(
+            format!("{stdout}{stderr}")
+                .contains("unknown key `bogus_rule` in [package.metadata.typedpg.lint]"),
+            "{format}: {stderr}\n{stdout}"
+        );
+        assert!(!stderr.contains("no findings"), "{format}: {stderr}");
+        assert!(!stderr.contains("doesn't compile"), "{format}: {stderr}");
+        assert!(
+            stderr.contains("typedpg lint: invalid configuration, nothing was checked"),
+            "{format}: {stderr}"
+        );
+        assert!(
+            stderr.contains("✖ failed: the configuration is invalid"),
+            "{format}: {stderr}"
+        );
+    }
+}

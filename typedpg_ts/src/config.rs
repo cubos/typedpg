@@ -775,6 +775,37 @@ pub fn declaration_path(out: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// The npm README documents every `lint` key, in `LINT_RULES`' order,
+    /// and every rule in its rule table.
+    #[test]
+    fn the_npm_readme_lists_every_lint_key() {
+        let readme = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../typedpg_npm/README.md"),
+        )
+        .expect("typedpg_npm/README.md");
+        let row = readme
+            .lines()
+            .find(|line| line.starts_with("| `lint` |"))
+            .expect("the config table's `lint` row");
+        let levels = row
+            .split_once("each rule's level — ")
+            .and_then(|(_, rest)| rest.split_once(" — as"))
+            .map(|(levels, _)| levels)
+            .expect("the `lint` row lists the rule keys");
+        let keys: Vec<&str> = levels
+            .split(", ")
+            .map(|key| key.trim_matches('`'))
+            .collect();
+        let expected: Vec<String> = LINT_RULES.iter().map(|rule| camel_key(rule)).collect();
+        assert_eq!(keys, expected, "{row}");
+        for rule in LINT_RULES {
+            assert!(
+                readme.contains(&format!("| [`{rule}`](")),
+                "the npm README's rule table has no row for {rule}"
+            );
+        }
+    }
+
     #[test]
     fn single_database() {
         let c = Config::parse(

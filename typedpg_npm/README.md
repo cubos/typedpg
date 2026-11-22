@@ -607,7 +607,7 @@ with its motivation, what it proves, examples and configuration:
 | [`blocking_rebuild`](https://github.com/cubos/typedpg/blob/main/docs/lint/blocking_rebuild.md) | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
 | [`detach_partition_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/detach_partition_blocking.md) | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
 | [`validate_in_same_transaction`](https://github.com/cubos/typedpg/blob/main/docs/lint/validate_in_same_transaction.md) | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
-| [`attach_partition_scan`](https://github.com/cubos/typedpg/blob/main/docs/lint/attach_partition_scan.md) | warning | `ATTACH PARTITION` of an existing table with no valid `CHECK` on the partition key, so PostgreSQL scans it under lock to check the bound. A `CHECK` that reads a key column is taken to imply the bound (the lint does not prove it does). |
+| [`attach_partition_scan`](https://github.com/cubos/typedpg/blob/main/docs/lint/attach_partition_scan.md) | warning | `ATTACH PARTITION` of an existing table whose validated `CHECK` and `NOT NULL` constraints don't imply the partition bound (proven as PostgreSQL proves it; a `CHECK` alone doesn't make the key `NOT NULL`), so PostgreSQL scans it under lock to check the bound; also the scan of an existing default partition. |
 | [`missing_primary_key`](https://github.com/cubos/typedpg/blob/main/docs/lint/missing_primary_key.md) | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
 | [`rls_policy_not_enforced`](https://github.com/cubos/typedpg/blob/main/docs/lint/rls_policy_not_enforced.md) | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
 | [`rls_no_policy`](https://github.com/cubos/typedpg/blob/main/docs/lint/rls_no_policy.md) | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
@@ -623,12 +623,16 @@ with its motivation, what it proves, examples and configuration:
 | [`breaks_deployed_queries`](https://github.com/cubos/typedpg/blob/main/docs/lint/breaks_deployed_queries.md) | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
 
 A call-site finding is placed at the method identifier in the calling file,
-which may be a different file from the `.sql` query; `unused_returning`'s fix
-edits the SQL. The rules see calls directly on `sql(…)`, through a local
-`const`/`let` binding, and through an exported `.sql` query or an exported
-TypeScript `sql(…)` binding imported by name, alias or namespace. They stay
-quiet when the query may be used in a way the scan cannot see (exported, or a
-binding passed to a function), except for the per-call fetch checks.
+which may be a different file from the `.sql` query. The fetch checks
+(`fetch_may_return_many`, `fetch_all_single_row`) see calls directly on
+`sql(…)`, through a local `const`/`let` binding, and through an exported `.sql`
+query or an exported TypeScript `sql(…)` binding imported by name, alias or
+namespace, and judge each call on its own. `unused_returning` needs every use
+of the query, so it only reports an inline `sql(…).execute(…)` or a local
+binding whose every use is an `execute`: a `.sql` query and an exported
+`sql(…)` binding can be called from anywhere, so they are never reported, nor
+is a binding passed to a function. Its fix deletes the `RETURNING` clause from
+that inline SQL.
 
 The `lint` object sets each rule's level — `"error"`, `"warning"`, `"info"`
 or `"off"` — and `failOn`, the severity the run fails on (default `"error"`).
@@ -1026,7 +1030,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 | `simplify` | The query simplifications, on by default: `false` turns them all off, or an object sets one rule to `false` — `notIn`, `countExists`, `distinct`, `unionAll`, `fkJoin`. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent: `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS` when neither side can be NULL, `count(…) > 0` as `EXISTS`, a `DISTINCT` that can't remove a row, a `UNION` whose branches can't share a row as `UNION ALL`, or a join a foreign key proves matches exactly one row none of whose columns are read. The generated module's doc comments show the SQL sent. For every database. |
-| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`, `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`, `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`, `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `fkTypeMismatch`, `missingLockTimeout`, `dropIndexBlocking`, `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`, `attachPartitionScan`, `missingPrimaryKey`, `rlsPolicyNotEnforced`, `rlsNoPolicy`, `securityDefinerSearchPath`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `preferJsonb`, `fetchMayReturnMany`, `fetchAllSingleRow`, `unusedReturning` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
+| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`, `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`, `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`, `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `scalarSubqueryMayReturnMany`, `timestampTimezoneMix`, `integerDivision`, `leftJoinNullified`, `checkViolation`, `unstableOrder`, `redundantOrderBy`, `redundantGroupBy`, `countNotNull`, `nonSargablePredicate`, `floatEquality`, `fkTypeMismatch`, `missingLockTimeout`, `dropIndexBlocking`, `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`, `attachPartitionScan`, `missingPrimaryKey`, `rlsPolicyNotEnforced`, `rlsNoPolicy`, `securityDefinerSearchPath`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `preferJsonb`, `fetchMayReturnMany`, `fetchAllSingleRow`, `unusedReturning`, `breaksDeployedQueries` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
 
 Unknown keys are errors.
 

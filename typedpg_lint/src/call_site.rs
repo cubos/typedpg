@@ -809,6 +809,39 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_is_neither_a_fetch_all_nor_an_execute() {
+        let db = catalog();
+        let single = "SELECT id, name FROM users WHERE id = $1";
+        for call in [
+            rust(CallMethod::FetchStream, "fetch_stream"),
+            ts(CallMethod::FetchStream, "fetchStream"),
+        ] {
+            let findings = lint(&db, single, std::slice::from_ref(&call));
+            assert!(
+                only(findings.clone(), Rule::FetchAllSingleRow).is_empty(),
+                "{findings:?}"
+            );
+            assert!(
+                only(findings.clone(), Rule::FetchMayReturnMany).is_empty(),
+                "{findings:?}"
+            );
+        }
+        let insert = "INSERT INTO users (id, name) VALUES (1, 'x') RETURNING id";
+        let findings = lint(
+            &db,
+            insert,
+            &[
+                rust(CallMethod::Execute, "execute"),
+                rust(CallMethod::FetchStream, "fetch_stream"),
+            ],
+        );
+        assert!(
+            only(findings.clone(), Rule::UnusedReturning).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
     fn execute_on_a_returning_insert_reports_and_fixes() {
         let db = catalog();
         let sql = "INSERT INTO users (id, name) VALUES (1, 'x') RETURNING id";

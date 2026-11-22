@@ -1,8 +1,8 @@
 # `fetch_may_return_many`
 
-`fetch_one` / `fetch_optional` (`fetchOne` / `fetchOptional` / `fetchValue`
-/ `fetchValueOptional` in TypeScript) on a query the schema does not limit
-to one row.
+`fetch_one` / `fetch_optional` / `fetch_value` / `fetch_value_optional`
+(`fetchOne` / `fetchOptional` / `fetchValue` / `fetchValueOptional` in
+TypeScript) on a query the schema does not limit to one row.
 
 | | |
 |---|---|
@@ -33,8 +33,11 @@ the statement returns at most one row:
 
 | Rust (`cargo typedpg lint`) | TypeScript (`typedpg lint`) |
 |---|---|
-| `fetch_one()`, `fetch_one_as()` | `fetchOne()`, `fetchValue()` |
-| `fetch_optional()`, `fetch_optional_as()` | `fetchOptional()`, `fetchValueOptional()` |
+| `fetch_one()`, `fetch_one_as()`, `fetch_value()` | `fetchOne()`, `fetchValue()` |
+| `fetch_optional()`, `fetch_optional_as()`, `fetch_value_optional()` | `fetchOptional()`, `fetchValueOptional()` |
+
+`fetch_value()` and `fetch_value_optional()` call `fetch_one()` and
+`fetch_optional()` and fail the same way on a second row.
 
 The proof accepts a statement that:
 
@@ -167,10 +170,9 @@ constraint, or switch to `fetch_all` depends on what the code means.
 ## When it stays silent
 
 - The proof shows at most one row (see above).
-- The method is not one of the four per language above: `fetch_all`,
-  `execute`, `fetch_stream` / `fetchStream`, and, in Rust,
-  `fetch_value()` / `fetch_value_optional()` are not checked by this rule
-  (the TypeScript `fetchValue` / `fetchValueOptional` are).
+- The method is not one of those above: `fetch_all` / `fetchAll`,
+  `fetch_stream` / `fetchStream` and `execute` are not checked by this
+  rule.
 - The query is not called where the scan can see it: Rust calls are found
   directly on the `sql!(…)` expression or on a local `let` binding of it;
   TypeScript calls on `sql(…)`, a local binding, or an exported query

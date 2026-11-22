@@ -1,6 +1,6 @@
 # `missing_lock_timeout`
 
-A migration takes a lock that blocks writes on an existing table without first setting `lock_timeout`, so while it waits for the lock it blocks every other query on the table.
+A migration takes a lock that blocks writes on an existing table without first setting `lock_timeout`, so while it waits for the lock every write to the table — and, for an `ACCESS EXCLUSIVE` lock, every query — queues behind it.
 
 | | |
 |---|---|
@@ -11,6 +11,8 @@ A migration takes a lock that blocks writes on an existing table without first s
 ## Why
 
 Even an `ALTER TABLE` that finishes in a millisecond, like adding a nullable column, needs an `ACCESS EXCLUSIVE` lock first. If a long transaction is holding any lock on the table — a report, a stuck worker, an idle-in-transaction session — the migration waits behind it. PostgreSQL's lock queue is first-come, first-served: every query that arrives after the migration, even a plain `SELECT`, queues behind the migration's pending request. One slow transaction plus one quick DDL statement becomes a full outage on the table, for as long as the slow transaction lasts.
+
+A weaker lock queues fewer queries: the `SHARE` lock of `CREATE INDEX` and `REINDEX`, or the `SHARE ROW EXCLUSIVE` lock of `CREATE TRIGGER`, of enabling or disabling triggers and of a foreign key (on both tables), conflicts with writers only, so reads keep running while writes pile up. The message says which: `it blocks every query on the table` for `ACCESS EXCLUSIVE`, `it blocks every write to the table` otherwise.
 
 `lock_timeout` bounds the wait: when the lock is not granted in time, the statement fails, the queue behind it drains, and the migration can be retried later. PostgreSQL's default, `0`, waits forever.
 
@@ -28,7 +30,7 @@ The statements that take such a lock:
 - `LOCK TABLE` in `SHARE` mode or stronger (or with no mode, which is `ACCESS EXCLUSIVE`); `ACCESS SHARE`, `ROW SHARE`, `ROW EXCLUSIVE` and `SHARE UPDATE EXCLUSIVE` do not block writers.
 - `REFRESH MATERIALIZED VIEW` without `CONCURRENTLY`, `CLUSTER` / `REPACK` without `CONCURRENTLY`, `VACUUM FULL`, `REINDEX` without `CONCURRENTLY`.
 
-The message names the relation the statement waits on — for `DROP INDEX` and `REINDEX INDEX`, the index.
+The message names the relation the statement waits on. `DROP INDEX` and `REINDEX INDEX` lock the index's table (`ACCESS EXCLUSIVE` and `SHARE`), so the message names the table, and the index after it: `DROP INDEX waits for a lock on public.users (the table of public.users_email_idx)`.
 
 ### How typedpg follows `lock_timeout`
 

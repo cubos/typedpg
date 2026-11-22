@@ -57,7 +57,7 @@ Rules over how a query's result is used — `fetch_one`, `fetchOne`, `execute`, 
 
 | Rule | Default | Reports |
 |---|---|---|
-| [`fetch_may_return_many`](fetch_may_return_many.md) | warning | `fetch_one` / `fetch_optional` on a query not proven to return at most one row. |
+| [`fetch_may_return_many`](fetch_may_return_many.md) | warning | `fetch_one` / `fetch_optional` / `fetch_value` / `fetch_value_optional` on a query not proven to return at most one row. |
 | [`fetch_all_single_row`](fetch_all_single_row.md) | info | `fetch_all` on a query that returns at most one row. |
 | [`unused_returning`](unused_returning.md) | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
 
@@ -76,7 +76,7 @@ Rules over each migration statement, on tables that already existed when its fil
 | [`blocking_rebuild`](blocking_rebuild.md) | warning | `REINDEX`, `VACUUM FULL`, `CLUSTER` or `REPACK` holding a blocking lock for the whole rebuild. |
 | [`detach_partition_blocking`](detach_partition_blocking.md) | warning | `DETACH PARTITION` without `CONCURRENTLY` on a table that already has rows. |
 | [`validate_in_same_transaction`](validate_in_same_transaction.md) | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`. |
-| [`attach_partition_scan`](attach_partition_scan.md) | warning | `ATTACH PARTITION` scanning the partition because no `CHECK` implies its bound. |
+| [`attach_partition_scan`](attach_partition_scan.md) | warning | `ATTACH PARTITION` scanning the partition because its constraints don't imply its bound, or scanning the default partition. |
 | [`breaks_deployed_queries`](breaks_deployed_queries.md) | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code deployed at that ref. |
 
 ## Final schema

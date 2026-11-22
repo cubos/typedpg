@@ -323,9 +323,9 @@ fn build(
                     });
                     call_sites.push(call);
                 }
-                // A method the rules do not know still uses the query: it
-                // may be a `fetch_stream()`, so `unused_returning` cannot
-                // be sure every use is an `execute()`.
+                // A method the rules do not know still uses the query, so
+                // `unused_returning` cannot be sure every use is an
+                // `execute()`.
                 None => escapes = true,
             }
         }
@@ -440,6 +440,7 @@ fn config_error_report(
 ) -> Report {
     let mut report = Report {
         elapsed: start.elapsed(),
+        config_error: true,
         ..Report::default()
     };
     report.failures.push(Failure {
@@ -615,13 +616,19 @@ fn relative(path: &Path, base: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// The call-site rule's view of a scanned method: only the seven methods the
-/// rules know are calls; anything else acts like a query with no call site.
+/// The call-site rule's view of a scanned method: every method the `sql!`
+/// query has (`typedpg_macros`' codegen) is a call; anything else acts like
+/// a query with no call site. `fetch_value()` / `fetch_value_optional()`
+/// call `fetch_one()` / `fetch_optional()` and fail the same way on a second
+/// row.
 fn call_method(name: &str) -> Option<CallMethod> {
     match name {
-        "fetch_one" | "fetch_one_as" => Some(CallMethod::FetchOne),
-        "fetch_optional" | "fetch_optional_as" => Some(CallMethod::FetchOptional),
+        "fetch_one" | "fetch_one_as" | "fetch_value" => Some(CallMethod::FetchOne),
+        "fetch_optional" | "fetch_optional_as" | "fetch_value_optional" => {
+            Some(CallMethod::FetchOptional)
+        }
         "fetch_all" | "fetch_all_as" => Some(CallMethod::FetchAll),
+        "fetch_stream" | "fetch_stream_as" => Some(CallMethod::FetchStream),
         "execute" => Some(CallMethod::Execute),
         _ => None,
     }

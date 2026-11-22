@@ -14,7 +14,7 @@ A plain `CREATE INDEX` takes a `SHARE` lock on the table. `SELECT` keeps working
 
 `CREATE INDEX CONCURRENTLY` takes a `SHARE UPDATE EXCLUSIVE` lock instead, which does not conflict with reads or writes. It scans the table twice and waits for running transactions, so it is slower, and PostgreSQL refuses to run it inside a transaction block. A typedpg migration whose first line is `-- no-transaction` runs without the runner's transaction.
 
-Adding a `PRIMARY KEY`, `UNIQUE` or `EXCLUDE` constraint builds the same kind of index, under an even stronger lock (`ALTER TABLE ADD CONSTRAINT` takes `ACCESS EXCLUSIVE`, which blocks reads too). The rule reports that case as well.
+Adding a `PRIMARY KEY`, `UNIQUE` or `EXCLUDE` constraint builds the same kind of index, under an even stronger lock (`ALTER TABLE ADD CONSTRAINT` takes `ACCESS EXCLUSIVE`, which blocks reads too: PostgreSQL's `AlterTableGetLockLevel`). The rule reports that case as well, and its help suggests building the unique index concurrently first and adopting it with `ADD CONSTRAINT … UNIQUE / PRIMARY KEY USING INDEX`. An `EXCLUDE` constraint cannot adopt an index, so for it the help only says to add it while the table is small or can be locked for the whole build.
 
 ## What it reports
 
@@ -48,12 +48,12 @@ warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes 
    ╰────
   help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
 
-warning[create_index_blocking]: adding the constraint builds its index, blocking writes on public.users for the whole build
+warning[create_index_blocking]: adding the constraint builds its index under an ACCESS EXCLUSIVE lock, blocking reads and writes on public.users for the whole build
    ╭─[migrations/0002_index_email.sql:2:1]
  2 │ ALTER TABLE users ADD CONSTRAINT users_name_key UNIQUE (name);
    · ─────────────────────────────────────────────────────────────
    ╰────
-  help: CREATE UNIQUE INDEX CONCURRENTLY first (in a migration whose first line is -- no-transaction), then ADD CONSTRAINT … USING INDEX
+  help: CREATE UNIQUE INDEX CONCURRENTLY first (in a migration whose first line is -- no-transaction), then ADD CONSTRAINT … UNIQUE / PRIMARY KEY USING INDEX, which only takes the lock briefly
 ```
 
 The first statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md) finding (not shown).

@@ -462,7 +462,7 @@
             {
               "id": "attach_partition_scan",
               "shortDescription": {
-                "text": "ATTACH PARTITION scanning the partition because no CHECK implies its bound"
+                "text": "ATTACH PARTITION scanning the partition because its constraints don't imply its bound, or scanning the default partition"
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/attach_partition_scan.md",
               "defaultConfiguration": {

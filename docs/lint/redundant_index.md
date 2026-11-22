@@ -21,7 +21,7 @@ Index `A` is reported as redundant with index `B` on the same table when all of 
 - `A` adds nothing: it is not unique and has no `INCLUDE` columns — unless the two indexes are identical;
 - both are immediate, or both are deferrable (a `DEFERRABLE` unique constraint checks at commit, an immediate unique index at each statement: neither replaces the other).
 
-A unique index is also reported when an otherwise identical unique `NULLS NOT DISTINCT` index exists: the stricter index enforces everything it does. Of two exact duplicates, the one created later is reported. An index that backs a constraint (a primary key, unique or exclusion constraint) is never the one reported, since it cannot be dropped with `DROP INDEX` and `ON CONFLICT ON CONSTRAINT` depends on it: when it duplicates a standalone index, the standalone index is reported, even if it came first.
+A unique index is also reported when an otherwise identical unique `NULLS NOT DISTINCT` index exists: the stricter index enforces everything it does. Of two exact duplicates, the one created later is reported (and the earlier one too, when a third index covers both). An index that backs a constraint (a primary key, unique or exclusion constraint) is never the one reported, since it cannot be dropped with `DROP INDEX` and `ON CONFLICT ON CONSTRAINT` depends on it: when it duplicates a standalone index, the standalone index is reported, even if it came first.
 
 Only indexes created by your migrations are reported; an index from `extra_migrations` can make one of yours redundant, but is never reported itself.
 
@@ -63,7 +63,7 @@ info[redundant_index]: index users_id_idx is redundant with users_pkey
    ╰────
 ```
 
-When an index is redundant with several others, one finding names one of them. With two exact duplicates and a wider index (`(email)`, `(email)` again, `(email, name)`), only the later duplicate is reported at first; once it is dropped, the remaining `(email)` index is reported as redundant with `(email, name)`.
+Every redundant index is reported in one run, and each finding names an index that is not reported itself, so dropping every reported index leaves one that covers them all. With two exact duplicates and a wider index (`(email)`, `(email)` again, `(email, name)`), both `(email)` indexes are reported as redundant with `(email, name)`; with `(a)`, `(a, b)` and `(a, b, c)`, both narrower ones name `(a, b, c)`. When several indexes would do, the finding names an exact duplicate first, then the oldest.
 
 ### Good
 

@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
+use oxc_resolver::{
+    FileMetadata, FileSystem, FileSystemOs, ResolveError, ResolveOptions, ResolverGeneric,
+    TsconfigDiscovery,
+};
 use typedpg_analyzer::PgCatalog;
 use typedpg_core::QualifiedName;
 use typedpg_lint::{Language, MigrationLint, SqlEdit};
@@ -64,7 +67,7 @@ pub struct SyncReport {
 pub struct Project {
     pub config: Config,
     dbs: Vec<Database>,
-    resolver: Resolver,
+    resolver: ResolverGeneric<ProjectFs>,
     files: BTreeMap<PathBuf, FileScan>,
     /// The re-exports of each module a source imports from, parsed once.
     modules: RefCell<HashMap<PathBuf, Option<ModuleExports>>>,
@@ -353,27 +356,43 @@ impl Project {
                 cache: HashMap::new(),
             });
         }
-        let resolver = Resolver::new(ResolveOptions {
-            extensions: [
-                ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".js", ".jsx", ".mjs", ".cjs",
-            ]
-            .map(String::from)
-            .to_vec(),
-            // TypeScript's own rule: `./db.js` names `./db.ts`.
-            extension_alias: vec![
-                (
-                    ".js".into(),
-                    vec![".ts".into(), ".tsx".into(), ".js".into()],
-                ),
-                (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
-                (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
-            ],
-            condition_names: ["types", "import", "require", "node", "default"]
+        // The generated modules resolve whether or not they exist yet: a
+        // project that never wrote them (`typedpg lint`, `typedpg check`
+        // before the first `gen`) still recognizes `sql()` imported from
+        // one.
+        let generated: Vec<PathBuf> = dbs
+            .iter()
+            .filter_map(|db| db.config.out.as_deref())
+            .flat_map(|out| std::iter::once(out.to_path_buf()).chain(declaration_path(out)))
+            .map(|path| canonical(&path))
+            .collect();
+        let resolver = ResolverGeneric::new_with_file_system(
+            ProjectFs {
+                os: FileSystemOs::new(),
+                generated,
+            },
+            ResolveOptions {
+                extensions: [
+                    ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".js", ".jsx", ".mjs", ".cjs",
+                ]
                 .map(String::from)
                 .to_vec(),
-            tsconfig: Some(TsconfigDiscovery::Auto),
-            ..ResolveOptions::default()
-        });
+                // TypeScript's own rule: `./db.js` names `./db.ts`.
+                extension_alias: vec![
+                    (
+                        ".js".into(),
+                        vec![".ts".into(), ".tsx".into(), ".js".into()],
+                    ),
+                    (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
+                    (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
+                ],
+                condition_names: ["types", "import", "require", "node", "default"]
+                    .map(String::from)
+                    .to_vec(),
+                tsconfig: Some(TsconfigDiscovery::Auto),
+                ..ResolveOptions::default()
+            },
+        );
         let mut project = Project {
             config,
             dbs,
@@ -1286,14 +1305,15 @@ fn lint_call<'a>(
     })
 }
 
-/// The call-site rule's view of a TypeScript method: the ones the rules
-/// know; `fetchStream` and anything else is ignored.
+/// The call-site rule's view of a TypeScript method: every method a query
+/// has; anything else is ignored.
 pub fn call_method(name: &str) -> Option<typedpg_lint::CallMethod> {
     use typedpg_lint::CallMethod;
     match name {
         "fetchOne" | "fetchValue" => Some(CallMethod::FetchOne),
         "fetchOptional" | "fetchValueOptional" => Some(CallMethod::FetchOptional),
         "fetchAll" => Some(CallMethod::FetchAll),
+        "fetchStream" => Some(CallMethod::FetchStream),
         "execute" => Some(CallMethod::Execute),
         _ => None,
     }
@@ -1439,7 +1459,121 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// `path` as the resolver reports it: canonical when it exists.
 fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| normalize(path))
+    path.canonicalize().unwrap_or_else(|_| anchored(path))
+}
+
+/// A path that may not exist, as the resolver would report it if it did:
+/// absolute and normalized, its deepest existing ancestor canonical.
+fn anchored(path: &Path) -> PathBuf {
+    let path = normalize(&std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
+    let mut missing = Vec::new();
+    let mut ancestor = path.as_path();
+    loop {
+        if let Ok(existing) = ancestor.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(existing, |path, name| path.join(name));
+        }
+        match (ancestor.parent(), ancestor.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_owned());
+                ancestor = parent;
+            }
+            _ => return path.clone(),
+        }
+    }
+}
+
+/// The file system the resolver reads: the real one, where the generated
+/// modules (and the directories holding them) exist even before `typedpg
+/// gen` writes them, as empty files. Whatever is on disk wins.
+struct ProjectFs {
+    os: FileSystemOs,
+    /// Each generated module, [`canonical`].
+    generated: Vec<PathBuf>,
+}
+
+impl ProjectFs {
+    /// The metadata a missing `path` has as a generated module or one of
+    /// its directories.
+    fn pending(&self, path: &Path) -> Option<FileMetadata> {
+        // Most missing paths are the resolver's probes (other extensions,
+        // `node_modules` directories): only one named like a generated file
+        // or one of its directories is worth anchoring.
+        let name = path.file_name()?;
+        if !self
+            .generated
+            .iter()
+            .any(|file| file.iter().any(|component| component == name))
+        {
+            return None;
+        }
+        let path = anchored(path);
+        if self.generated.contains(&path) {
+            Some(FileMetadata::new(true, false, false))
+        } else if self
+            .generated
+            .iter()
+            .any(|file| file.starts_with(&path) && *file != path)
+        {
+            Some(FileMetadata::new(false, true, false))
+        } else {
+            None
+        }
+    }
+
+    /// `result`, or for a missing path what [`Self::pending`] says it is.
+    fn or_pending<T>(
+        &self,
+        path: &Path,
+        result: std::io::Result<T>,
+        pending: impl FnOnce(FileMetadata) -> Option<T>,
+    ) -> std::io::Result<T> {
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.pending(path).and_then(pending).ok_or(error)
+            }
+            result => result,
+        }
+    }
+}
+
+impl FileSystem for ProjectFs {
+    fn new() -> Self {
+        ProjectFs {
+            os: FileSystemOs::new(),
+            generated: Vec::new(),
+        }
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.or_pending(path, self.os.read(path), |meta| {
+            meta.is_file().then(Vec::new)
+        })
+    }
+
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        self.or_pending(path, self.os.read_to_string(path), |meta| {
+            meta.is_file().then(String::new)
+        })
+    }
+
+    fn metadata(&self, path: &Path) -> std::io::Result<FileMetadata> {
+        self.or_pending(path, self.os.metadata(path), Some)
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<FileMetadata> {
+        self.or_pending(path, self.os.symlink_metadata(path), Some)
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, ResolveError> {
+        self.os.read_link(path)
+    }
+
+    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.or_pending(path, self.os.canonicalize(path), |_| Some(anchored(path)))
+    }
 }
 
 fn write_file(path: &Path, content: &str) -> std::io::Result<()> {

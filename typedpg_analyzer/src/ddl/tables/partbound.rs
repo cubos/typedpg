@@ -13,6 +13,9 @@
 use super::*;
 use typedpg_pg_query::ast::{self, PartitionBoundSpec};
 
+mod attach_scan;
+pub(crate) use attach_scan::attach_scans;
+
 /// A partitioned table's strategy and key (`pg_partitioned_table`).
 #[derive(Clone, Debug)]
 pub(crate) struct PartSpec {

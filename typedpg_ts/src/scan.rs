@@ -547,7 +547,13 @@ fn member_call<'a>(
 fn mapped_method(name: &str) -> Option<()> {
     matches!(
         name,
-        "fetchOne" | "fetchValue" | "fetchOptional" | "fetchValueOptional" | "fetchAll" | "execute"
+        "fetchOne"
+            | "fetchValue"
+            | "fetchOptional"
+            | "fetchValueOptional"
+            | "fetchAll"
+            | "fetchStream"
+            | "execute"
     )
     .then_some(())
 }
@@ -748,8 +754,8 @@ impl Finder<'_, '_> {
             span: span.start as usize..span.end as usize,
         });
         query.uses += 1;
-        // `fetchStream` (and anything not mapped to a rule) is still a use:
-        // `unused_returning` cannot be sure every use is an `execute()`.
+        // A method not mapped to a rule is still a use: `unused_returning`
+        // cannot be sure every use is an `execute()`.
         if mapped_method(method).is_none() {
             query.escapes = true;
         }

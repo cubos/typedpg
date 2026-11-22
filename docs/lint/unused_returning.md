@@ -30,8 +30,9 @@ it cannot:
 - Rust: the query is called directly on the `sql!(…)` expression or through
   a local `let` binding, and every use of that binding is a method call the
   scan recognizes. Passing the query to a function (`run(q)`), borrowing it,
-  or calling any other method on it (`fetch_stream`, `fetch_value`, …)
-  silences the rule.
+  or calling a method that is not one of the query's own silences the rule;
+  a binding also called with `fetch_one`, `fetch_value`, `fetch_stream` or
+  any other method that reads the rows is not reported either.
 - TypeScript: a `.sql` query is always an export that can be used anywhere,
   so this rule never reports it; neither does it report an exported `sql(…)`
   binding, or a binding passed to a function. Inline `sql(…).execute(…)` and

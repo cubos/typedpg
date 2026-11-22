@@ -1,6 +1,6 @@
 # `attach_partition_scan`
 
-`ALTER TABLE … ATTACH PARTITION` of an existing table with no `CHECK` constraint on the partition key makes PostgreSQL scan the whole table under an `ACCESS EXCLUSIVE` lock to check that every row fits the partition bound.
+`ALTER TABLE … ATTACH PARTITION` of an existing table whose constraints don't imply the partition bound makes PostgreSQL scan the whole table under an `ACCESS EXCLUSIVE` lock to check that every row fits it.
 
 | | |
 |---|---|
@@ -12,15 +12,22 @@
 
 Attaching a table as a partition takes `SHARE UPDATE EXCLUSIVE` on the partitioned table but `ACCESS EXCLUSIVE` on the table being attached, and PostgreSQL must prove that every row of that table satisfies the partition's bound (`FOR VALUES FROM (1000) TO (2000)`). Unless the table's own constraints already imply the bound, it reads every row while holding that lock. Loading a big table first and attaching it afterwards is the usual way to add a partition, so this scan hits exactly the tables that are large.
 
-PostgreSQL skips the scan when a valid `CHECK` constraint implies the partition constraint. Add one that matches the bound `NOT VALID`, validate it in an earlier migration (no blocking lock), and the attach is a catalog change.
+PostgreSQL skips the scan when the table's constraints imply the partition constraint. Add a `CHECK` that matches the bound `NOT VALID`, validate it in an earlier migration (no blocking lock), make the key columns `NOT NULL`, and the attach is a catalog change.
 
 ## What it reports
 
-An `ATTACH PARTITION` of a table (or partitioned table) that existed before the current file started, when that table has no `CHECK` constraint that is validated, enforced and reads one of the partition key's columns.
+An `ATTACH PARTITION` of a table (or partitioned table) that existed before the current file started, unless its constraints imply the partition constraint the way PostgreSQL proves it (`PartConstraintImpliedByRelConstraint`):
 
-typedpg does not build the partition constraint from the bound to prove the implication: any valid, enforced `CHECK` that reads a key column counts. A `CHECK (id > 0)` on a partition bound to `FROM (1000) TO (2000)` silences the rule although PostgreSQL will still scan. A `NOT VALID` or `NOT ENFORCED` check, or one on another column, does not count.
+- The partition constraint is built from the bound as PostgreSQL builds it. A range bound `FROM (1000) TO (2000)` on `id` is `id IS NOT NULL AND id >= 1000 AND id < 2000` (several key columns give the `OR` form PostgreSQL uses; `MINVALUE` / `MAXVALUE` leave a side out); a list bound `IN ('eu', 'br')` is `region IS NOT NULL AND region IN ('eu', 'br')` (`region IS NULL OR …` when the list has `NULL`). When the partitioned table is itself a partition, its own bound is added.
+- It must follow from the table's validated, enforced `CHECK` constraints and from `NOT NULL` (a valid NOT NULL constraint, not a `NOT VALID` one). A `CHECK` passes when its value is NULL, so **a `CHECK` does not prove `id IS NOT NULL`**: the key column needs a NOT NULL constraint, or the `CHECK` must say `id IS NOT NULL` itself.
+- The proof is PostgreSQL's: a `CHECK (id >= 1000 AND id < 2000)`, `CHECK (id > 1200 AND id < 1500)`, `CHECK (id BETWEEN 1000 AND 1999)` or `CHECK (id IN (1000, 1001))` implies the range above; `CHECK (id > 0)`, `CHECK (id <= 2000)` or `CHECK (id::bigint >= 1000)` doesn't. Comparisons with `<`, `<=`, `=`, `>=`, `>`, `IN`, `= ANY (ARRAY[…])` and `BETWEEN`, combined with `AND` / `OR`, are read; anything else in a `CHECK` proves nothing.
+- A partitioned table whose own constraints don't imply the bound is fine when each of its partitions' do (PostgreSQL then checks the partitions), and has nothing to scan when it has no partitions.
 
-When the partitioned table has a default partition, PostgreSQL also scans the default partition (under lock) for rows that belong to the new one; the rule does not model that.
+A hash bound is always reported: no `CHECK` constraint implies `satisfies_hash_partition(…)`. A `DEFAULT` bound is reported when the table has other partitions: its constraint is the negation of all of theirs, which the rule doesn't try to prove.
+
+Where the rule can't compare a `CHECK`'s constants with the bound's, it reports: strings under a collation that doesn't order by code point (equal constants still compare: a `CHECK (s >= 'a' AND s < 'm')` for `FROM ('a') TO ('m')` is proven), a constant cast to another type than the key's (other than between integer types), a key with a non-default operator class or a collation other than the column's (PostgreSQL then compares with other operators, and doesn't prove it either), an expression key.
+
+When the partitioned table has a default partition (that existed before the file), PostgreSQL also scans it under an `ACCESS EXCLUSIVE` lock, for rows that belong to the new partition; that is reported as a second finding. Only a `CHECK` on the default partition that refutes the new bound (and every other partition's) would let PostgreSQL skip it, which the rule doesn't try to prove.
 
 ## Examples
 
@@ -52,7 +59,7 @@ warning[attach_partition_scan]: ATTACH PARTITION scans every row of public.measu
  2 │     FOR VALUES FROM (1000) TO (2000);
    · ────────────────────────────────────
    ╰────
-  help: first add a CHECK constraint on public.measurements_2 that matches the bound (NOT VALID, then VALIDATE CONSTRAINT in an earlier migration): PostgreSQL then skips the scan
+  help: first add a CHECK constraint on public.measurements_2 that implies the bound, with NOT NULL on the key columns (NOT VALID, then VALIDATE CONSTRAINT in an earlier migration): PostgreSQL then skips the scan
 ```
 
 The statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md) finding on `measurements_2` (not shown).
@@ -76,11 +83,30 @@ ALTER TABLE measurements ATTACH PARTITION measurements_2
 ALTER TABLE measurements_2 DROP CONSTRAINT measurements_2_bound;
 ```
 
-Not reported either: attaching a table created in the same file.
+`id` is `NOT NULL` already (it is the primary key), so the `CHECK` is enough. Not reported either: attaching a table created in the same file.
+
+Still reported: a `CHECK` that doesn't imply the bound.
+
+```sql
+-- migrations/0005_measurements_3.sql
+CREATE TABLE measurements_3 (id bigint NOT NULL PRIMARY KEY, taken_at timestamptz NOT NULL);
+
+-- migrations/0006_positive.sql
+SET LOCAL lock_timeout = '5s';
+-- Rows below 2000 would pass it.
+ALTER TABLE measurements_3 ADD CONSTRAINT positive CHECK (id > 0);  -- (also constraint_validating)
+
+-- migrations/0007_attach.sql
+SET LOCAL lock_timeout = '5s';
+ALTER TABLE measurements ATTACH PARTITION measurements_3 FOR VALUES FROM (2000) TO (3000);
+```
+
+The same `CHECK (id >= 2000 AND id < 3000)` on a table whose `id` is nullable is reported too: the `CHECK` passes on NULL, so PostgreSQL would have to read every row to rule NULLs out.
 
 ## When it stays silent
 
-- The table to attach has a valid, enforced `CHECK` reading a key column — whether or not it implies the bound (see above).
+- The table's validated `CHECK` and `NOT NULL` constraints imply the partition constraint (see above), or, for a partitioned table, each of its partitions' do.
+- A `DEFAULT` partition attached to a table without other partitions.
 - The table was created in the same file, or the file is unchanged from `--previous-deployment`, matches `lint.ignore`, or belongs to `extra_migrations`.
 
 ## Configuration
