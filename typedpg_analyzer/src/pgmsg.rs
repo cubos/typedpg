@@ -535,6 +535,16 @@ pub(crate) fn check_constraint_violation(relname: &str, conname: &str) -> Analyz
     ))
 }
 
+/// `new row for relation "p" violates partition constraint` — SQLSTATE
+/// 23514 (`ExecPartitionCheckEmitError`): `relname` is the partition the
+/// row is inserted into, unqualified and unquoted. PG's errdetail
+/// (`Failing row contains …`) is not reproduced.
+pub(crate) fn partition_constraint_violation(relname: &str) -> AnalyzeError {
+    AnalyzeError::CheckViolation(format!(
+        "new row for relation \"{relname}\" violates partition constraint"
+    ))
+}
+
 /// `new row violates check option for view "v"` — SQLSTATE 44000
 /// (`ExecWithCheckOptions`, WCO_VIEW_CHECK). PG's errdetail (`Failing row
 /// contains …`) is not reproduced.

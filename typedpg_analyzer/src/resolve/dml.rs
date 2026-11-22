@@ -1168,11 +1168,14 @@ fn analyze_insert_values(
 }
 
 /// An error a row of an INSERT raises every time: a NULL it would store
-/// into a NOT NULL column or domain, or no partition taking it.
+/// into a NOT NULL column or domain, a constant its column's domain
+/// rejects, no partition taking it, a CHECK, partition constraint or
+/// check option it fails.
 struct RowViolation {
-    /// When PG reports it: NOT NULL domains while the row is built, then
-    /// routing (ExecFindPartition), then the columns' NOT NULL in attnum
-    /// order (ExecConstraints, on the partition the row landed in).
+    /// When PG reports it: domains (NOT NULL, CHECKs) while the row is
+    /// built, then routing (ExecFindPartition), then the columns' NOT NULL
+    /// in attnum order (ExecConstraints, on the partition the row landed
+    /// in) — see the constants below for the rest.
     order: (bool, i16),
     error: AnalyzeError,
 }
@@ -1180,10 +1183,16 @@ struct RowViolation {
 impl RowViolation {
     /// A CHECK constraint's: after every column's NOT NULL
     /// (ExecConstraints).
-    const CHECK: (bool, i16) = (true, i16::MAX - 1);
+    const CHECK: (bool, i16) = (true, i16::MAX - 2);
+    /// A leaf partition's partition constraint: after ExecConstraints
+    /// (ExecInsert's ExecPartitionCheck).
+    const PARTITION: (bool, i16) = (true, i16::MAX - 1);
     /// A view's WITH CHECK OPTION: once the row is stored
     /// (ExecWithCheckOptions after ExecInsert's ExecConstraints).
     const VIEW_CHECK: (bool, i16) = (true, i16::MAX);
+    /// A partitioned partition's partition constraint: before the row is
+    /// routed (ExecFindPartition checks the root's first).
+    const PARTITION_ROUTED: (bool, i16) = (true, i16::MIN);
 
     /// Column `tc`'s violation, in the order of the relation `rel` the row
     /// lands in (a partition's columns may be ordered differently).
@@ -1208,7 +1217,7 @@ impl RowViolation {
     fn no_partition(parent: crate::oid::PgClassOid, snapshot: &PgCatalog) -> Option<Self> {
         let relname = &snapshot.pg_class.get(&parent)?.relname;
         Some(Self {
-            order: (true, i16::MIN),
+            order: (true, i16::MIN + 1),
             error: crate::pgmsg::no_partition_for_row(relname),
         })
     }
@@ -1285,15 +1294,22 @@ fn row_violation<'a>(
                 }
             }
             // `NULL::d`, for a domain `d` rejecting NULL, fails as the row
-            // is built, whatever the column.
-            Known::Value(_) | Known::Unknown => {
-                if let Some(msg) = null_domain_cast(*val, snapshot) {
+            // is built, whatever the column; so does a constant coerced to
+            // the column's domain when one of its CHECKs is FALSE for it.
+            known @ (Known::Value(_) | Known::Unknown) => {
+                let error = null_domain_cast(*val, snapshot)
+                    .map(AnalyzeError::Invalid)
+                    .or_else(|| match known {
+                        Known::Value(v) => domain_check_violation(v, tc, snapshot),
+                        _ => None,
+                    });
+                if let Some(error) = error {
                     let attnum = snapshot
                         .attribute_by_name(lands_in.0, &tc.attname)
                         .map_or(tc.attnum, |a| a.attnum);
                     violations.push(RowViolation {
                         order: (false, attnum),
-                        error: AnalyzeError::Invalid(msg),
+                        error,
                     });
                 }
             }
@@ -1316,6 +1332,7 @@ fn row_violation<'a>(
         statement_target,
         &lands_in,
     ));
+    violations.extend(partition_violation(tgt, items, known, snapshot));
     violations.into_iter().min_by_key(|v| v.order)
 }
 
@@ -1523,7 +1540,8 @@ fn row_value<'a>(
 /// constraints, in name order, surely FALSE for it (ExecConstraints →
 /// ExecRelCheck; a NULL result passes), else the first WITH CHECK OPTION
 /// of the views `statement_target` writes it through, inner view first,
-/// surely FALSE for it (ExecWithCheckOptions, once the row is stored).
+/// surely FALSE or NULL for it (ExecWithCheckOptions, once the row is
+/// stored).
 /// A column's value counts only when it is stored as written (see
 /// [`known_literal`]). None when the statement isn't run, or a BEFORE
 /// ROW trigger may change the row — on the table or a partition the row
@@ -1632,8 +1650,10 @@ fn check_violation<'a>(
         let trust = crate::privileges::suspended(|| {
             crate::ddl::volatile::trusted_over_relation(snapshot, base, qual)
         });
+        // ExecWithCheckOptions evaluates the qual with ExecQual: NULL
+        // fails it as FALSE does.
         if let Some(trust) = trust
-            && RelationChecks::surely_false(snapshot, base, qual, &trust, &k)
+            && RelationChecks::surely_not_true(snapshot, base, qual, &trust, &k)
         {
             let relname = &snapshot.pg_class.get(&view)?.relname;
             return Some(RowViolation {
@@ -1649,19 +1669,102 @@ fn check_violation<'a>(
 /// compares it: a literal (or one cast to the column's type, see
 /// [`crate::nonnull::literal_for`]) stored as written — not into a column
 /// with a type modifier (`numeric(2,-1)` rounds, `varchar(2)` drops
-/// trailing spaces), nor of a domain with CHECKs (which could reject it
-/// first).
+/// trailing spaces). A domain's CHECKs don't change the value: one that
+/// rejects it fails the row first, as it is built (see
+/// [`domain_check_violation`]), an error all the same.
 fn known_literal(
     v: &ast::Node,
     c: &crate::pg_catalog::PgAttribute,
     snapshot: &PgCatalog,
 ) -> Option<crate::nonnull::Literal> {
-    if snapshot.effective_typmod(c.atttypid, c.atttypmod).is_some()
-        || snapshot.domain_has_checks(c.atttypid)
-    {
+    if snapshot.effective_typmod(c.atttypid, c.atttypmod).is_some() {
         return None;
     }
     crate::nonnull::literal_for(Some(v), c.atttypid, snapshot)
+}
+
+/// The error storing the value `v` into column `tc` raises every time: a
+/// bare literal coerced to the column's domain, one of whose CHECKs is
+/// FALSE for it (ExecEvalConstraintCheck, while the row is built — before
+/// any trigger), or an `ARRAY[…]` of constants coerced to an array of a
+/// domain, one of which it rejects (see
+/// [`super::failing_rows::array_elements_domain_error`]). None when the
+/// statement isn't run.
+fn domain_check_violation(
+    v: Option<&ast::Node>,
+    tc: &crate::pg_catalog::PgAttribute,
+    snapshot: &PgCatalog,
+) -> Option<AnalyzeError> {
+    if !super::executes() {
+        return None;
+    }
+    if let Some(ast::Node::AArrayExpr(arr)) = v {
+        return super::failing_rows::array_elements_domain_error(arr, tc.atttypid, snapshot)
+            .map(AnalyzeError::Invalid);
+    }
+    let literal = crate::nonnull::literal(v)?;
+    snapshot
+        .domain_value_violation_at_execution(tc.atttypid, &literal)
+        .map(AnalyzeError::CheckViolation)
+}
+
+/// The partition constraint the row `items` of `tgt` surely fails when
+/// `tgt` is a partition the row is inserted into directly: the row isn't
+/// one its own bound and its ancestors' take (RelationGetPartitionQual) —
+/// routed from the root, it reaches a relation that is neither `tgt` nor
+/// below it (see `partbound::route_row`). `new row for relation "…"
+/// violates partition constraint`: for a leaf, after its CHECKs (ExecInsert's
+/// ExecPartitionCheck, which a BEFORE ROW trigger on it runs before, and
+/// a row-level security policy's checks too); for a partitioned table,
+/// before the row is routed (ExecFindPartition), whatever the triggers.
+/// None when the statement isn't run, or the route is unknown.
+fn partition_violation<'a>(
+    tgt: &InsertTarget,
+    items: &[Option<&'a ast::Node>],
+    known: &dyn Fn(usize) -> Known<'a>,
+    snapshot: &PgCatalog,
+) -> Option<RowViolation> {
+    use crate::ddl::tables::partbound::{Route, route_row};
+    use crate::nonnull::checks::partition_parent;
+    use crate::pg_catalog::RelKind;
+    if !super::executes() {
+        return None;
+    }
+    let mut root = partition_parent(snapshot, tgt.oid)?;
+    let order = match snapshot.pg_class.get(&tgt.oid)?.relkind {
+        RelKind::Partitioned => RowViolation::PARTITION_ROUTED,
+        RelKind::Table
+            if !before_row_trigger_rewrites(snapshot, tgt.oid, DmlEvent::Insert)
+                && !snapshot.row_security.contains(&tgt.oid) =>
+        {
+            RowViolation::PARTITION
+        }
+        _ => return None,
+    };
+    for _ in 0..64 {
+        match partition_parent(snapshot, root) {
+            Some(p) => root = p,
+            None => break,
+        }
+    }
+    let value_of = |name: &str| row_value(tgt, items, known, snapshot, name);
+    let mut reached = match route_row(snapshot, root, &value_of) {
+        Route::Leaf(rel) | Route::NoPartition(rel) => rel,
+        Route::Unknown => return None,
+    };
+    for _ in 0..64 {
+        if reached == tgt.oid {
+            return None;
+        }
+        match partition_parent(snapshot, reached) {
+            Some(p) => reached = p,
+            None => break,
+        }
+    }
+    Some(RowViolation {
+        order,
+        error: crate::pgmsg::partition_constraint_violation(&tgt.relname),
+    })
 }
 
 /// The views whose WITH CHECK OPTION an INSERT into view `top` checks

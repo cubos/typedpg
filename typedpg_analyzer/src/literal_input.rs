@@ -1733,7 +1733,10 @@ fn validate_record(
             }
         }
         if matches!(b.get(p), Some(b',' | b')')) {
-            continue; // NULL
+            // NULL: still handed to the column's input function, and
+            // `domain_in` is not strict.
+            check_domain_accepts_null(*column_type, snapshot)?;
+            continue;
         }
         let mut field: Vec<u8> = Vec::new();
         let mut inquote = false;
@@ -1767,6 +1770,7 @@ fn validate_record(
         if let Some(msg) = crate::typmod::char_length_violation(snapshot, base, *typmod, &field) {
             return Err(msg);
         }
+        check_domain_accepts_value(*column_type, &field, snapshot)?;
     }
     if b.get(p) != Some(&b')') {
         return Err(malformed("Too many columns."));
@@ -2148,9 +2152,30 @@ fn validate_array(content: &str, elem: PgTypeOid, snapshot: &PgCatalog) -> Resul
         return Err(format!("malformed array literal: \"{content}\""));
     };
     crate::array_input::parse_array(content, delim, &mut |e| match e {
-        Some(value) => validate(value, elem, snapshot),
+        Some(value) => {
+            validate(value, elem, snapshot)?;
+            check_domain_accepts_value(elem, value, snapshot)
+        }
         None => check_domain_accepts_null(elem, snapshot),
     })
+}
+
+/// `domain_in` on the non-NULL input `value` of type `ty`, once the base
+/// type's input took it: a CHECK of a domain of its chain FALSE for it
+/// fails (`domain_check_input`).
+fn check_domain_accepts_value(
+    ty: PgTypeOid,
+    value: &str,
+    snapshot: &PgCatalog,
+) -> Result<(), String> {
+    let literal = crate::nonnull::Literal {
+        text: value.to_owned(),
+        kind: crate::nonnull::LitKind::String,
+    };
+    match snapshot.domain_value_violation(ty, &literal) {
+        Some(msg) => Err(msg),
+        None => Ok(()),
+    }
 }
 
 /// The `typdelim` `array_in` splits an array of `elem` on: `;` for `box`,

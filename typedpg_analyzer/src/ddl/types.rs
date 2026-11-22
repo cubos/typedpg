@@ -282,6 +282,9 @@ pub(crate) struct DomainConstraint {
     /// A CHECK's expression as written, which `expression_planner` folds
     /// before it runs (a dead CASE branch needs no EXECUTE).
     pub(crate) expr: Option<crate::ddl::tables::check_inherit::StoredExpr>,
+    /// What a CHECK's operators and functions resolved to when it was
+    /// created (PG keeps them by OID).
+    pub(crate) trusted: Option<crate::nonnull::TrustedNodes>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,6 +311,7 @@ fn add_domain_constraint(
     let mut finite = false;
     let mut allowed = None;
     let mut expr = None;
+    let mut trusted = None;
     let kind = match c.contype {
         ConstrType::ConstrNotnull => {
             rejects_null = true;
@@ -323,6 +327,7 @@ fn add_domain_constraint(
                     checked.finite,
                     checked.allowed,
                 );
+                trusted = Some(checked.trusted);
                 expr = Some(crate::ddl::tables::check_inherit::StoredExpr::written(
                     Some(raw),
                 ));
@@ -377,6 +382,7 @@ fn add_domain_constraint(
         finite,
         allowed,
         expr,
+        trusted,
     });
     Ok(())
 }
@@ -419,6 +425,8 @@ struct DomainCheck {
     /// The values and bounds it allows `VALUE` (see
     /// [`crate::nonnull::checks::allowed_values`]).
     allowed: Option<crate::refine::Refinement>,
+    /// What its operators and functions resolved to.
+    trusted: crate::nonnull::TrustedNodes,
 }
 
 /// A domain CHECK expression sees `VALUE` as a value of the base type and
@@ -515,13 +523,9 @@ fn check_domain_check_expression(
         .iter()
         .any(|c| c == "value");
     let collation = interp.pg_type.get(&base_type).and_then(|t| t.typcollation);
+    let trusted = log.trusted();
     let allowed = crate::nonnull::checks::allowed_values(
-        expr,
-        "value",
-        base_type,
-        collation,
-        interp,
-        &log.trusted(),
+        expr, "value", base_type, collation, interp, &trusted,
     );
     Ok(DomainCheck {
         refs,
@@ -529,6 +533,7 @@ fn check_domain_check_expression(
         null_free_elements,
         finite,
         allowed,
+        trusted,
     })
 }
 

@@ -1,5 +1,7 @@
 //! A NULL cast to a domain that rejects it (`SELECT NULL::d` of a NOT NULL
-//! domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`) that
+//! domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`), or a
+//! constant cast to a domain one of whose CHECKs is FALSE for it (`0::d` of
+//! one with `CHECK (VALUE > 0)`), that
 //! every execution of a statement evaluates: the coercion fails when
 //! evaluated (`ExecEvalConstraintNotNull` / `ExecEvalConstraintCheck`),
 //! naming the domain cast to, so the statement is rejected. So is a call to
@@ -1561,7 +1563,7 @@ impl Level<'_> {
     fn error(&self, n: Option<&ast::Node>) -> Option<Failure> {
         match n? {
             ast::Node::TypeCast(tc) => {
-                if let Some(e) = self.null_cast(tc) {
+                if let Some(e) = self.null_cast(tc).or_else(|| self.check_cast(tc)) {
                     return Some(e);
                 }
                 // A cast evaluates its argument where no cast into the
@@ -1870,6 +1872,35 @@ impl Level<'_> {
         }
         let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, self.snapshot)?;
         let message = self.snapshot.domain_null_violation_at_execution(target)?;
+        Some(Failure {
+            message,
+            domain: true,
+            unsupported: false,
+        })
+    }
+
+    /// `0::d` — a non-NULL literal cast to a domain `d` one of whose
+    /// CHECKs is FALSE for it. The planner doesn't fold the CoerceToDomain
+    /// (eval_const_expressions keeps it while the domain has constraints),
+    /// so it fails when evaluated (ExecEvalConstraintCheck), not when
+    /// planned.
+    /// So is `ARRAY[0]::d[]`, whose elements are coerced to `d` one by one
+    /// (see [`array_elements_domain_error`]).
+    fn check_cast(&self, tc: &ast::TypeCast) -> Option<Failure> {
+        let type_name = tc.type_name.as_ref()?;
+        if !type_name.typmods.is_empty() {
+            return None;
+        }
+        let target = crate::ddl::util::resolve_type_name(type_name, self.snapshot)?;
+        let message = match tc.arg.as_ref()? {
+            ast::Node::AArrayExpr(arr) => array_elements_domain_error(arr, target, self.snapshot)?,
+            arg if type_name.array_bounds.is_empty() => {
+                let literal = crate::nonnull::literal(Some(arg))?;
+                self.snapshot
+                    .domain_value_violation_at_execution(target, &literal)?
+            }
+            _ => return None,
+        };
         Some(Failure {
             message,
             domain: true,
@@ -2594,6 +2625,49 @@ fn keeps_arguments(snapshot: &PgCatalog, p: &crate::pg_catalog::PgProc) -> bool 
 
 /// FirstNormalObjectId (transam.h): below, what initdb made.
 const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+/// The error coercing `ARRAY[…]` `arr` to `target`, an array of a domain,
+/// raises when evaluated: each element is coerced to the domain in turn
+/// (transformArrayExpr pushes a cast down into the elements; array_map
+/// runs an ArrayCoerceExpr over every element, NULLs included), and the
+/// first one the domain surely rejects — a NULL it doesn't allow, a
+/// constant one of its CHECKs is FALSE for — fails. None when an element
+/// before it isn't a constant.
+pub(super) fn array_elements_domain_error(
+    arr: &ast::AArrayExpr,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<String> {
+    let elem = snapshot.pg_type.get(&target)?.typelem?;
+    if snapshot.array_type_of(elem) != Some(target) || snapshot.domain_chain(elem).is_empty() {
+        return None;
+    }
+    fn walk(
+        arr: &ast::AArrayExpr,
+        elem: PgTypeOid,
+        snapshot: &PgCatalog,
+    ) -> Result<(), Option<String>> {
+        for e in arr.elements.iter().map(Option::as_ref) {
+            match e {
+                Some(ast::Node::AArrayExpr(sub)) => walk(sub, elem, snapshot)?,
+                Some(ast::Node::AConst(c)) if c.isnull => {
+                    if let Some(msg) = snapshot.domain_null_violation_at_execution(elem) {
+                        return Err(Some(msg));
+                    }
+                }
+                e => {
+                    let literal = crate::nonnull::literal(e).ok_or(None)?;
+                    if let Some(msg) = snapshot.domain_value_violation_at_execution(elem, &literal)
+                    {
+                        return Err(Some(msg));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    walk(arr, elem, snapshot).err().flatten()
+}
 
 /// Every cast into `target` (its base type, for a domain) is built in, or
 /// needs no function: a cast of a non-NULL constant, folded by the

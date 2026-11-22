@@ -324,6 +324,101 @@ impl PgCatalog {
         self.domain_null_violation_with(oid, crate::ddl::util::format_type_at_execution)
     }
 
+    /// The error a statement's execution raises coercing the non-NULL
+    /// constant `v` to type `oid`: a CHECK of a domain of its chain is
+    /// surely FALSE for it (ExecEvalConstraintCheck). The CHECKs run from
+    /// the base domain out, by name within one (`load_domaintype_info`);
+    /// the first one surely FALSE is reported (one before it the analyzer
+    /// can't decide may fail first, with its own message — an error all
+    /// the same). The message names `oid` as the statement's `search_path`
+    /// shows it. None when the base type's input may reject `v` first (an
+    /// integer out of its range) or a type modifier may change it.
+    pub(crate) fn domain_value_violation_at_execution(
+        &self,
+        oid: PgTypeOid,
+        v: &crate::nonnull::Literal,
+    ) -> Option<String> {
+        self.domain_value_violation_with(oid, v, crate::ddl::util::format_type_at_execution)
+    }
+
+    /// [`Self::domain_value_violation_at_execution`] raised while the
+    /// statement is parsed: `domain_in`, called by `array_in` for each
+    /// element of an array literal of a domain (and by `record_in` for a
+    /// field), checks the domain's constraints on the spot.
+    pub(crate) fn domain_value_violation(
+        &self,
+        oid: PgTypeOid,
+        v: &crate::nonnull::Literal,
+    ) -> Option<String> {
+        self.domain_value_violation_with(oid, v, crate::ddl::util::format_type_for_message)
+    }
+
+    fn domain_value_violation_with(
+        &self,
+        oid: PgTypeOid,
+        v: &crate::nonnull::Literal,
+        format: fn(&PgCatalog, PgTypeOid) -> String,
+    ) -> Option<String> {
+        use crate::nonnull::LitKind;
+        use crate::pg_catalog::oid;
+        let chain = self.domain_chain(oid);
+        if chain.is_empty() || self.effective_typmod(oid, None).is_some() {
+            return None;
+        }
+        let base = self.unwrap_domain(oid);
+        if [oid::INT2, oid::INT4, oid::INT8].contains(&base) {
+            let i = match v.kind {
+                LitKind::Integer => v.text.parse::<i128>().ok()?,
+                LitKind::String => crate::literal_input::parse_pg_integer(&v.text)?,
+                _ => return None,
+            };
+            let fits = match base {
+                oid::INT2 => i16::try_from(i).is_ok(),
+                oid::INT4 => i32::try_from(i).is_ok(),
+                _ => i64::try_from(i).is_ok(),
+            };
+            if !fits {
+                return None;
+            }
+        }
+        for d in chain.iter().rev() {
+            let t = self.pg_type.get(d)?;
+            let value_type = t.typbasetype?;
+            let mut checks: Vec<&crate::ddl::types::DomainConstraint> = self
+                .domain_constraints
+                .get(d)
+                .into_iter()
+                .flatten()
+                .filter(|c| c.kind == crate::ddl::types::DomainConstraintKind::Check)
+                .collect();
+            checks.sort_by(|a, b| a.name.cmp(&b.name));
+            for c in checks {
+                let (
+                    Some(crate::ddl::tables::check_inherit::StoredExpr::Written(expr)),
+                    Some(trust),
+                ) = (&c.expr, &c.trusted)
+                else {
+                    continue;
+                };
+                if crate::nonnull::checks::RelationChecks::domain_check_surely_false(
+                    self,
+                    value_type,
+                    t.typcollation,
+                    (**expr).as_ref(),
+                    trust,
+                    v,
+                ) {
+                    return Some(format!(
+                        "value for domain {} violates check constraint \"{}\"",
+                        format(self, oid),
+                        c.name
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     fn domain_null_violation_with(
         &self,
         oid: PgTypeOid,
