@@ -183,6 +183,45 @@ mod tests {
     }
 
     #[test]
+    fn the_where_decides_a_select_list_branch() {
+        let db = catalog();
+        for (sql, reported, because) in [
+            (
+                "SELECT CASE WHEN name = 'b' THEN 1 ELSE 2 END AS v FROM users WHERE name = 'a'",
+                "WHEN name = 'b' THEN 1",
+                "never taken: its condition is never true (`name` is always 'a' where this is \
+                 evaluated)",
+            ),
+            (
+                "SELECT CASE WHEN name = 'a' THEN 1 ELSE 2 END AS v FROM users WHERE name = 'a'",
+                "ELSE 2",
+                "after an always-true WHEN",
+            ),
+            (
+                "SELECT CASE WHEN name = 'a' THEN 1 WHEN name <> 'b' THEN 2 ELSE 3 END AS v \
+                 FROM users WHERE name IN ('a', 'b')",
+                "WHEN name <> 'b' THEN 2",
+                "with the WHENs before it not taken",
+            ),
+            (
+                "SELECT CASE WHEN name = 'a' THEN 1 WHEN name = 'b' THEN 2 ELSE 3 END AS v \
+                 FROM users WHERE name IN ('a', 'b')",
+                "ELSE 3",
+                "after this WHEN are never taken",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], reported, "{sql}");
+            assert!(
+                findings[0].message.contains(because),
+                "{sql}: {}",
+                findings[0].message
+            );
+        }
+    }
+
+    #[test]
     fn branches_that_may_be_taken_are_not_reported() {
         let db = catalog();
         for sql in [
@@ -211,6 +250,12 @@ mod tests {
                 "WHEN s = 'c' THEN 1",
                 "never taken: its condition is never true (`s` is always one of 'a', 'b' \
                  (CHECK constraint \"t_s_check\")",
+            ),
+            // The reason quotes a named parameter as written.
+            (
+                "SELECT CASE WHEN abs($d::int) < 0 THEN 1 ELSE 2 END FROM t",
+                "WHEN abs($d::int) < 0 THEN 1",
+                "(`abs($d::int)` is always at least 0 where this is evaluated)",
             ),
             (
                 "SELECT CASE WHEN s IN ('a', 'b') THEN 1 ELSE 2 END FROM t",

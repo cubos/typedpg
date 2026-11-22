@@ -170,6 +170,8 @@ withheld (the finding stays) when:
   never evaluated (`COALESCE(1, max(v))` is one row, `1` is one per row);
 - a dropped argument contains a `COLLATE` clause or a column reference,
   either of which can decide the result's collation;
+- a dropped argument contains a parameter: dropping it would remove the
+  parameter from the query, or what types it (`COALESCE(id, $fallback)`);
 - the `COALESCE` is a whole output column with no alias, named `coalesce`.
 
 Every fix is also re-analyzed before it is offered and must keep the result

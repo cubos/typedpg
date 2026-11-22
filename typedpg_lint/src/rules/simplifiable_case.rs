@@ -262,6 +262,12 @@ mod tests {
                 "SELECT id FROM users WHERE CASE WHEN email = 'x' THEN true ELSE false END",
                 "SELECT id FROM users WHERE (email = 'x')",
             ),
+            // The WHERE proves the condition non-NULL in the select list.
+            (
+                "SELECT CASE WHEN name = 'x' THEN true ELSE false END AS b FROM users \
+                 WHERE name IS NOT NULL",
+                "SELECT (name = 'x') AS b FROM users WHERE name IS NOT NULL",
+            ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
@@ -282,6 +288,26 @@ mod tests {
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(findings[0].fix.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_help_quotes_parameters_and_spreads_as_written() {
+        let db = catalog();
+        for (sql, help) in [
+            (
+                "SELECT CASE WHEN id = $id THEN true ELSE false END AS b FROM users",
+                "write (id = $id) IS TRUE: the CASE is false where the condition is NULL",
+            ),
+            (
+                "SELECT CASE WHEN id IN $..ids THEN true ELSE false END AS b FROM users",
+                "write (id IN $..ids) IS TRUE: the CASE is false where the condition is NULL",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(findings[0].help.as_deref(), Some(help), "{sql}");
             assert!(findings[0].fix.is_empty(), "{sql}");
         }
     }

@@ -49,9 +49,7 @@ use typedpg_pg_query::ast::{
     SetOperation, SubLinkType,
 };
 
-use super::{
-    condition_span, expression_end, leftmost_start, operator_name, scan_until, starts_clause,
-};
+use super::{condition_span, leftmost_start, node_span, operator_name, scan_until, starts_clause};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 /// The clause a condition is in.
@@ -372,11 +370,10 @@ pub(super) fn condition_value(ctx: &Ctx<'_>, node: &Node) -> Option<(bool, Optio
     }
 }
 
-/// The text of an operand, for a message: as written, in backquotes.
+/// The text of an operand, for a message: as written (a `$name`
+/// parameter stays `$name`), in backquotes.
 fn operand_text(ctx: &Ctx<'_>, node: &Node) -> Option<String> {
-    let start = leftmost_start(node)?;
-    let end = expression_end(ctx, start);
-    let text = ctx.sql.get(start..end)?.trim();
+    let text = ctx.written(node_span(ctx, node.to_ref())?);
     (!text.is_empty()).then(|| format!("`{text}`"))
 }
 
@@ -937,6 +934,32 @@ mod tests {
             assert!(findings.is_empty(), "{sql}: {findings:?}");
             let branch = lint_rule(&db, sql, Rule::UnreachableCaseBranch);
             assert_eq!(branch.len(), 1, "{sql}: {branch:?}");
+        }
+    }
+
+    #[test]
+    fn messages_quote_named_parameters_as_written() {
+        let db = refined();
+        for (sql, message) in [
+            (
+                "SELECT id FROM orders WHERE abs($d::int) < 0",
+                "`abs($d::int)` is always at least 0 where this is evaluated, so this condition \
+                 is never true",
+            ),
+            // The whole operand, not its first token.
+            (
+                "SELECT id FROM orders WHERE CASE WHEN $f::bool THEN 1 ELSE 2 END = 3",
+                "`CASE WHEN $f::bool THEN 1 ELSE 2 END` is always one of 1, 2 where this is \
+                 evaluated, so this condition is never true",
+            ),
+            (
+                "SELECT id FROM orders WHERE greatest(qty, $d::int) < 0",
+                "`greatest(qty, $d::int)` is always at least 0 where this is evaluated, so this \
+                 condition is never true",
+            ),
+        ] {
+            let (_, msg) = one(&db, sql);
+            assert_eq!(msg, message, "{sql}");
         }
     }
 }

@@ -3071,11 +3071,22 @@ pub(crate) fn note_null_test_settled(location: i32, settled: bool) {
     });
 }
 
+/// Whether a fact that reads what holds where an expression is evaluated
+/// (its values' nullability and refinements) must not be recorded: the
+/// select-list replay ([`crate::expr::in_target_replay`]) runs right
+/// after FROM, before the `WHERE`'s facts are known, so what it reads is
+/// weaker than the final pass's — which analyzes the same expressions
+/// again, under those facts, and records them.
+fn replaying_targets() -> bool {
+    crate::expr::in_target_replay()
+}
+
 /// Record whether a row may take the branch of the `CASE` `WHEN` at
 /// `location`: the `WHEN`s before it not TRUE and it TRUE, with what
-/// holds there. OR-merged with a fact already recorded there.
+/// holds there. OR-merged with a fact already recorded there; nothing is
+/// recorded during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -3086,9 +3097,10 @@ pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
 }
 
 /// Record whether a row may get past the `CASE` `WHEN` at `location`: it and every `WHEN` before it not TRUE, with what holds
-/// there. OR-merged with a fact already recorded there.
+/// there. OR-merged with a fact already recorded there; nothing is
+/// recorded during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_case_when_passed(location: i32, passed: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -3114,9 +3126,10 @@ pub struct NullifiedJoin {
 
 /// Record what the comparison or `IN` list at `location` was decided to
 /// be (`None`: nothing), AND-merged with a fact already recorded there:
-/// two inferences that disagree decide nothing.
+/// two inferences that disagree decide nothing. Nothing is recorded
+/// during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_condition_fact(location: i32, fact: Option<crate::condition::ConditionFact>) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -3211,9 +3224,10 @@ pub(crate) fn note_column_ref_binding(location: i32, outer: bool, source: &str) 
 
 /// Record whether the `WHEN` condition at `location` (the `WHEN`
 /// keyword's) of a searched `CASE` is of type `boolean` itself and never
-/// NULL. AND-merged with a fact already recorded there.
+/// NULL. AND-merged with a fact already recorded there; nothing is
+/// recorded during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_case_condition_not_null(location: i32, not_null: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -3246,9 +3260,10 @@ fn collecting_redundant_casts<R>(
 /// Record whether the omitted ELSE of the `CASE` at `location` may be its
 /// result: no WHEN certainly folds to TRUE, and the constraints and the
 /// conditions around it don't prove some WHEN true for every row.
-/// OR-merged with a fact already recorded there.
+/// OR-merged with a fact already recorded there; nothing is recorded
+/// during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_case_else_reachable(location: i32, reachable: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     CASE_ELSE_REACHABLE.with(|facts| {
@@ -3306,14 +3321,15 @@ fn collecting_null_check_facts<R>(
 
 /// Record what an `= ANY` / `IN` or `<> ALL` sublink at `location`
 /// compared, merging with any fact already recorded for it (a sublink may
-/// be inferred more than once).
+/// be inferred more than once). Nothing is recorded during the select-list
+/// replay ([`replaying_targets`]).
 pub(crate) fn note_sublink_nullability(
     location: i32,
     lhs_nullable: bool,
     subquery_nullable: bool,
     operators_strict: bool,
 ) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     SUBLINK_NULLABILITY.with(|facts| {
@@ -3332,9 +3348,10 @@ pub(crate) fn note_sublink_nullability(
 
 /// Record whether the argument of the `IS [NOT] NULL` test at `location`
 /// may be NULL, OR-merged with a fact already recorded there (a site may be
-/// inferred more than once).
+/// inferred more than once). Nothing is recorded during the select-list
+/// replay ([`replaying_targets`]).
 pub(crate) fn note_null_test_arg_nullable(location: i32, nullable: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     NULL_TEST_ARG_NULLABLE.with(|facts| {
@@ -3346,14 +3363,15 @@ pub(crate) fn note_null_test_arg_nullable(location: i32, nullable: bool) {
 
 /// Record the facts of the `COALESCE` at `location`, merging with any
 /// already recorded for it: argument nullability OR-merged per index, the
-/// shared result type AND-merged.
+/// shared result type AND-merged. Nothing is recorded during the
+/// select-list replay ([`replaying_targets`]).
 pub(crate) fn note_coalesce_fact(
     location: i32,
     args_nullable: &[bool],
     args_typed_as_result: &[bool],
     args_share_result_type: bool,
 ) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     COALESCE_FACTS.with(|facts| {

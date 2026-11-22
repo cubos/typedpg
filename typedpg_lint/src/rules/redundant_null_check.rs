@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{BoolExprType, CoalesceExpr, Node, Node as N, NullTest, NullTestType};
 
-use super::{expression_end, location, operand_start};
+use super::{location, node_span, operand_start};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
@@ -206,10 +206,13 @@ fn coalesce(
     // - a `COLLATE` clause or a column reference can decide the result's
     //   collation (`COALESCE('x'::text, 'y'::text COLLATE "C")`);
     // - an unaliased direct target column is named `coalesce`; any rewrite
-    //   risks its output name (dropping the call renames it outright).
+    //   risks its output name (dropping the call renames it outright);
+    // - a parameter is part of the query's signature: dropping it removes
+    //   the parameter, or what typed it (`COALESCE(id, $d::bigint)`).
     let dropped = &expr.args[index + 1..];
     let structural = dropped.iter().any(|n| has_call_outside_sublink(n.as_ref()));
     let collation = dropped.iter().any(|n| has_collation_or_column(n.as_ref()));
+    let parameter = dropped.iter().any(|n| has_param(n.as_ref()));
     let unaliased_target = unaliased.contains(&expr.location);
     if fact.args_share_result_type
         && fact.args_typed_as_result.get(index) == Some(&true)
@@ -217,6 +220,7 @@ fn coalesce(
         && args.len() == expr.args.len()
         && !structural
         && !collation
+        && !parameter
         && !unaliased_target
     {
         let close_start = ctx.tokens[close].start;
@@ -377,6 +381,15 @@ fn call_outside_sublink(node: NodeRef<'_>) -> bool {
 /// Whether a dropped argument holds a `COLLATE` clause or a column reference:
 /// either can decide the `COALESCE`'s collation, even though the argument is
 /// never evaluated.
+/// Whether a dropped argument holds a parameter (`$1`, or a `$name` it was
+/// rewritten from).
+fn has_param(node: Option<&Node>) -> bool {
+    fn walk(node: NodeRef<'_>) -> bool {
+        matches!(node, NodeRef::ParamRef(_)) || node.children().into_iter().any(walk)
+    }
+    node.is_some_and(|node| walk(node.to_ref()))
+}
+
 fn has_collation_or_column(node: Option<&Node>) -> bool {
     node.is_some_and(|node| collation_or_column(node.to_ref()))
 }
@@ -423,12 +436,14 @@ fn argument_start(node: Option<&Node>) -> Option<usize> {
 /// The expression as the message shows it, on one line; `None` when it is
 /// too long to quote.
 fn argument_text(ctx: &Ctx<'_>, node: Option<&Node>) -> Option<String> {
-    let start = argument_start(node)?;
-    short_text(ctx, start, expression_end(ctx, start))
+    let span = node_span(ctx, node?.to_ref())?;
+    short_text(ctx, span.start, span.end)
 }
 
+/// The text from `start` to `end` as written (a `$name` parameter stays
+/// `$name`), on one line; `None` when it is too long to quote.
 fn short_text(ctx: &Ctx<'_>, start: usize, end: usize) -> Option<String> {
-    let text = ctx.sql.get(start..end).unwrap_or_default();
+    let text = ctx.written(start..end);
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (!text.is_empty() && text.len() <= 40).then_some(text)
 }
@@ -518,6 +533,47 @@ mod tests {
             );
             assert!(finding.fix.is_empty());
         }
+    }
+
+    #[test]
+    fn the_where_proves_a_select_list_value_non_null() {
+        let db = catalog();
+        let sql = "SELECT nullable IS NULL AS b FROM checks WHERE nullable IS NOT NULL";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            only(&findings).message,
+            "`nullable` IS NULL is never true: it is never NULL"
+        );
+        let sql = "SELECT COALESCE(nullable, 0) AS v FROM checks WHERE nullable > 0";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            fixed(sql, only(&findings)),
+            "SELECT nullable AS v FROM checks WHERE nullable > 0"
+        );
+    }
+
+    #[test]
+    fn messages_quote_named_parameters_as_written() {
+        let db = catalog();
+        // Only a settled test can quote one: a parameter makes a value
+        // nullable, so a test or COALESCE argument holding one is never
+        // proven non-NULL.
+        let sql = "SELECT id FROM checks WHERE abs(nullable + $n) > 0 \
+                   AND abs(nullable + $n) IS NOT NULL";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            only(&findings).message,
+            "`abs(nullable + $n)` IS NOT NULL changes nothing: the rest of the condition is \
+             never true when `abs(nullable + $n)` is NULL"
+        );
+        // The whole argument, not its first operand.
+        let sql = "SELECT id FROM checks WHERE nullable + $n > 0 AND nullable + $n IS NOT NULL";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            only(&findings).message,
+            "`nullable + $n` IS NOT NULL changes nothing: the rest of the condition is never \
+             true when `nullable + $n` is NULL"
+        );
     }
 
     #[test]
@@ -826,6 +882,22 @@ mod tests {
         for sql in [
             "SELECT COALESCE(name, 'y'::text COLLATE \"C\") AS x FROM checks",
             "SELECT COALESCE(name, note) AS x FROM checks",
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert!(finding.fix.is_empty(), "{sql}: {finding:?}");
+        }
+    }
+
+    #[test]
+    fn coalesce_dropping_a_parameter_has_no_fix() {
+        let db = catalog();
+        // Dropping the argument would remove the parameter (or what typed
+        // it) from the query.
+        for sql in [
+            "SELECT COALESCE(nn, $d::int) AS x FROM checks",
+            "SELECT COALESCE(nn, $1::int) AS x FROM checks",
+            "SELECT COALESCE(nn, $d::int + 1) AS x FROM checks WHERE id = $d",
         ] {
             let findings = lint(&db, sql);
             let finding = only(&findings);

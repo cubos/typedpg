@@ -2003,6 +2003,17 @@ mod tests {
             let findings = not_in_findings(&db, sql);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
         }
+        // The WHERE proves a select-list left side non-NULL, whether or not
+        // the subquery holds a parameter.
+        for sql in [
+            "SELECT email NOT IN (SELECT title FROM posts WHERE title IS NOT NULL) AS b \
+             FROM users WHERE email IS NOT NULL",
+            "SELECT email NOT IN (SELECT title FROM posts WHERE title IS NOT NULL AND id = $p) \
+             AS b FROM users WHERE email IS NOT NULL",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
         // The left side may still be NULL.
         let sql = "SELECT id FROM users WHERE email NOT IN (SELECT 'x')";
         assert_eq!(

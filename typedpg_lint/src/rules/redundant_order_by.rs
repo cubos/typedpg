@@ -110,7 +110,8 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             continue;
         }
         for &i in &removed {
-            let text = ctx.sql[spans[i].clone()].trim();
+            // Quoted as written: a `$name` parameter stays `$name`.
+            let text = ctx.written(spans[i].clone());
             let fix = if safe[i] {
                 list_item_removal(&spans, &removed, i)
                     .map(|range| {
@@ -409,5 +410,21 @@ mod tests {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
         }
+    }
+
+    #[test]
+    fn messages_quote_named_parameters_as_written() {
+        let db = catalog();
+        let findings = lint_rule(
+            &db,
+            "SELECT id FROM users WHERE name = $n ORDER BY id, name || $n",
+            RULE,
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(
+            findings[0].message,
+            "the ORDER BY key name || $n can't change the order: the keys before it already \
+             determine a unique row, so it never breaks a tie"
+        );
     }
 }
