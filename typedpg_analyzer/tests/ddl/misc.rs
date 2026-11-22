@@ -4848,6 +4848,14 @@ fn configuration_parameters_are_validated() {
             "unrecognized configuration parameter \"nosuch\"",
         ),
         (
+            "SELECT current_setting('nosuch');",
+            "unrecognized configuration parameter \"nosuch\"",
+        ),
+        (
+            "SELECT set_config('standard_conforming_strings', 'off', false);",
+            "non-standard string literals are not supported",
+        ),
+        (
             "SET statement_timeout = 'abc';",
             "invalid value for parameter \"statement_timeout\": \"abc\"",
         ),
@@ -4917,6 +4925,9 @@ fn configuration_parameters_are_validated() {
              SET statement_timeout = '5s';
              SET work_mem = '1TB';
              SET work_mem = '64MB';
+             SET sort_mem = '64MB';
+             SET seed = 0.5;
+             SELECT current_setting('vacuum_mem');
              SET TIME ZONE 'UTC';
              SET timezone = 'UTC';
              SET datestyle = 'ISO, MDY';

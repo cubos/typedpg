@@ -313,6 +313,79 @@ fn refresh_reports_what_every_execution_raises() {
     );
 }
 
+/// `current_setting` and `set_config` over constants fail every time they
+/// are evaluated when `SHOW` / `SET` of the same would (show_config_by_name,
+/// set_config_by_name): reported for a statement that runs, not for one
+/// only planned (EXPLAIN), since the executor raises them.
+#[test]
+fn configuration_function_calls_report_what_every_evaluation_raises() {
+    let db = utility_setup();
+    for (sql, message) in [
+        (
+            "SELECT current_setting('nosuch')",
+            "unrecognized configuration parameter \"nosuch\"",
+        ),
+        (
+            "SELECT current_setting('nosuch', false)",
+            "unrecognized configuration parameter \"nosuch\"",
+        ),
+        // PostgreSQL 19 removed escape_string_warning.
+        (
+            "SELECT current_setting('escape_string_warning')",
+            "unrecognized configuration parameter \"escape_string_warning\"",
+        ),
+        (
+            "SELECT set_config('nosuch', '1', false)",
+            "unrecognized configuration parameter \"nosuch\"",
+        ),
+        (
+            "SELECT set_config('standard_conforming_strings', 'off', false)",
+            "non-standard string literals are not supported",
+        ),
+        (
+            "SELECT set_config('work_mem', 'abc', true)",
+            "invalid value for parameter \"work_mem\": \"abc\"",
+        ),
+        (
+            "SELECT pg_catalog.set_config('server_version', '1', false)",
+            "parameter \"server_version\" cannot be changed",
+        ),
+        (
+            "SELECT set_config(NULL, '1', false)",
+            "SET requires parameter name",
+        ),
+    ] {
+        let e = db.analyze(sql).unwrap_err().to_string();
+        assert!(e.starts_with(message), "{sql}: {e}");
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT current_setting('nosuch')"),
+        AnalyzeError::UndefinedObject(_),
+        "unrecognized configuration parameter \"nosuch\"",
+    );
+    // `missing_ok` makes an unknown name NULL; a custom `prefix.name` one
+    // may have been set; obsolete names (map_old_guc_names) and the
+    // parameters pg_settings doesn't show resolve; a NULL value resets; a
+    // strict call over NULL is NULL.
+    let s = db
+        .analyze(
+            "SELECT current_setting('nosuch', true) AS a, current_setting('sort_mem') AS b, \
+             current_setting('seed') AS c, set_config('x.y', 'z', true) AS d, \
+             set_config('work_mem', NULL, true) AS e, current_setting(NULL) AS f",
+        )
+        .unwrap();
+    assert!(
+        s.columns[0].nullable,
+        "current_setting(..., true) can be NULL"
+    );
+    for sql in [
+        "EXPLAIN SELECT current_setting('nosuch')",
+        "SELECT set_config('seed', '0.5', true)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 #[test]
 fn set_reports_what_every_execution_raises() {
     let db = utility_setup();

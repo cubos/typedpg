@@ -255,6 +255,42 @@ fn char_length_ignores_excess_spaces() {
     );
 }
 
+/// A domain over a length- or precision-constrained type coerces an
+/// assigned constant through the base type's typmod (CoerceToDomain over
+/// the length coercion), which the planner folds: every execution fails,
+/// exactly as for a column of the base type itself. Likewise `bit(n)`
+/// (bit(): the length must match exactly).
+#[test]
+fn literal_assignment_through_domain_and_bit_typmods_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN vc3 AS varchar(3);
+         CREATE DOMAIN amt AS numeric(4,2);
+         CREATE TABLE t (id int, v vc3, a amt, bt bit(3), vb varbit(2));",
+    )
+    .unwrap();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO t (id, v) VALUES (1, 'abcd')"),
+        AnalyzeError::Invalid(_),
+        "value too long for type character varying(3)",
+    );
+    assert_err_prefix!(
+        db.analyze("INSERT INTO t (id, a) VALUES (1, 12345.67)"),
+        AnalyzeError::NumericValueOutOfRange(_),
+        "numeric field overflow",
+    );
+    assert_err_prefix!(
+        db.analyze("INSERT INTO t (id, bt) VALUES (1, B'1111')"),
+        _,
+        "bit string length 4 does not match type bit(3)",
+    );
+    assert_err_prefix!(
+        db.analyze("INSERT INTO t (id, vb) VALUES (1, B'1111')"),
+        _,
+        "bit string too long for type bit varying(2)",
+    );
+}
+
 #[test]
 fn update_numeric_overflow_rejected() {
     // Compile-time guard: PG only catches numeric overflow at execution

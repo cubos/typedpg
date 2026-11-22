@@ -226,7 +226,9 @@ fn lookup_by_names(
                 _ => Err(format!("more than one operator named {content}")),
             }
         }
-        "regnamespace" | "regrole" => {
+        // regdatabasein, like regnamespacein and regrolein, takes a single
+        // unqualified name.
+        "regnamespace" | "regrole" | "regdatabase" => {
             let [name] = names else {
                 return Err(invalid_name_syntax());
             };
@@ -243,7 +245,7 @@ fn lookup_by_names(
                     None => {}
                 }
             }
-            // Roles are not modelled.
+            // Roles and databases are not modelled.
             Ok(())
         }
         "regcollation" => {

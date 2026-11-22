@@ -76,7 +76,7 @@ pub(crate) fn validate_with_typmod(
         oid::INT2 => return validate_int(content, i16::MIN as i128, i16::MAX as i128, "smallint"),
         oid::INT4 => return validate_int(content, i32::MIN as i128, i32::MAX as i128, "integer"),
         oid::INT8 => return validate_int(content, i64::MIN as i128, i64::MAX as i128, "bigint"),
-        oid::OID => return validate_oid(content),
+        oid::OID => return validate_uint_subr(content, "oid", false),
         oid::FLOAT4 => return validate_float(content, "real"),
         oid::FLOAT8 => return validate_float(content, "double precision"),
         oid::NUMERIC => return validate_numeric(content),
@@ -159,7 +159,8 @@ pub(crate) fn validate_with_typmod(
         // The object-resolving reg* family: an OID, or a name looked up at
         // parse time — see `reg_input`.
         name @ ("regproc" | "regprocedure" | "regoper" | "regoperator" | "regclass" | "regtype"
-        | "regcollation" | "regconfig" | "regdictionary" | "regnamespace" | "regrole") => {
+        | "regcollation" | "regconfig" | "regdictionary" | "regnamespace" | "regrole"
+        | "regdatabase") => {
             crate::reg_input::validate(name, content, snapshot)
         }
         // Datetime family: a port of PG's datetime input decoder — see
@@ -224,7 +225,9 @@ pub(crate) fn validate_with_typmod(
         "tid" => validate_tid(content),
         "pg_lsn" => validate_pg_lsn(content),
         "pg_snapshot" | "txid_snapshot" => validate_pg_snapshot(content),
-        name @ ("xid" | "xid8" | "cid") => validate_xid(content, name),
+        // oidin, xidin, cidin: uint32in_subr; oid8in, xid8in: uint64in_subr.
+        name @ ("xid" | "cid") => validate_uint_subr(content, name, false),
+        name @ ("oid8" | "xid8") => validate_uint_subr(content, name, true),
         "oidvector" => validate_oidvector(content),
         "aclitem" => validate_aclitem(content),
         "int2vector" => validate_int2vector(content),
@@ -419,14 +422,17 @@ fn strtoul_base0(s: &str) -> Option<(u32, &str)> {
     (!digits.is_empty() && digits.chars().all(|c| c.is_digit(radix))).then_some((radix, digits))
 }
 
-/// Mirrors `uint32in_subr` (numutils.c): `strtoul` semantics — optional
-/// whitespace and sign, then a digit run read with base 0 (see
-/// [`strtoul_base0`]). The range check follows strtoul's wrap-around acceptance:
-/// a value is in range when it fits `uint32`, or when it's negative and its
-/// magnitude fits `int32` (so `'-1'::oid` is 4294967295 but
-/// `'-4294967295'::oid` is out of range) — verified against PG 18.
-fn validate_oid(content: &str) -> Result<(), String> {
-    let syntax_err = || crate::pgmsg::invalid_input_syntax_for_type("oid", content);
+/// Mirrors `uint32in_subr` (`wide == false`) and `uint64in_subr`
+/// (`wide == true`, PG 19's oid8 and xid8) in numutils.c: `strtoul` /
+/// `strtou64` semantics — optional whitespace and sign, then a digit run
+/// read with base 0 (see [`strtoul_base0`]), then only whitespace. A
+/// negative value wraps like strtoul's: for `uint64in_subr` any magnitude
+/// that fits `uint64` is accepted (`'-1'::oid8` is 18446744073709551615);
+/// `uint32in_subr` accepts a value that fits `uint32`, or a negative one
+/// whose magnitude fits `int32` (so `'-1'::oid` is 4294967295 but
+/// `'-4294967295'::oid` is out of range).
+fn validate_uint_subr(content: &str, typname: &str, wide: bool) -> Result<(), String> {
+    let syntax_err = || crate::pgmsg::invalid_input_syntax_for_type(typname, content);
     let mut s = content.trim_matches(|c: char| c.is_ascii_whitespace());
     let negative = match s.strip_prefix(['+', '-']) {
         Some(rest) => {
@@ -440,12 +446,15 @@ fn validate_oid(content: &str) -> Result<(), String> {
         return Err(syntax_err());
     };
     let in_range = match u64::from_str_radix(digits, radix) {
+        Ok(_) if wide => true,
         Ok(v) if negative => v <= i32::MAX as u64 + 1,
         Ok(v) => v <= u32::MAX as u64,
-        Err(_) => false, // > u64 digits — far out of range
+        Err(_) => false, // > u64 digits — ERANGE
     };
     if !in_range {
-        return Err(format!("value \"{content}\" is out of range for type oid"));
+        return Err(format!(
+            "value \"{content}\" is out of range for type {typname}"
+        ));
     }
     Ok(())
 }
@@ -2062,20 +2071,6 @@ pub(crate) fn validate_pg_lsn(content: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `xid` / `xid8` / `cid` parse via strtoul-style rules on PG 18: an
-/// optional sign, then a base-0 digit run (see [`strtoul_base0`]; bare hex
-/// like `ff` is rejected). The parse wraps like strtoul: no range check.
-fn validate_xid(content: &str, name: &str) -> Result<(), String> {
-    let s = content.trim_matches(|c: char| c.is_ascii_whitespace());
-    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if strtoul_base0(digits).is_none() {
-        return Err(format!(
-            "invalid input syntax for type {name}: \"{content}\""
-        ));
-    }
-    Ok(())
-}
-
 // ─── bytea ──────────────────────────────────────────────────────────────────
 
 /// Mirrors `byteain` (varlena.c): `\x` selects hex format
@@ -2623,9 +2618,9 @@ mod tests {
         assert!(validate_pg_lsn("AB/CDEF1234").is_ok());
         assert!(validate_pg_lsn("0").is_err());
         assert!(validate_pg_lsn("X/Y").is_err());
-        assert!(validate_xid("42", "xid").is_ok());
-        assert!(validate_xid("0x10", "xid").is_ok());
-        assert!(validate_xid("ff", "xid").is_err());
+        assert!(validate_uint_subr("42", "xid", false).is_ok());
+        assert!(validate_uint_subr("0x10", "xid", false).is_ok());
+        assert!(validate_uint_subr("ff", "xid", false).is_err());
     }
 
     #[test]
@@ -2743,19 +2738,31 @@ mod tests {
         // strtoul base 0: hex, octal (leading 0) and, on glibc 2.38+,
         // binary — '0b101' is 5, '017' is 15 on PG 18.
         for ok in [" 42 ", "-1", "0x10", "+7", "017", "0", "0b101", "0B1"] {
-            assert!(validate_oid(ok).is_ok(), "{ok:?} should be valid");
+            assert!(
+                validate_uint_subr(ok, "oid", false).is_ok(),
+                "{ok:?} should be valid"
+            );
         }
         for bad in ["", "1_0", "42x", "0x", "hello", "08", "0b", "0b2", "0o17"] {
-            assert!(validate_oid(bad).is_err(), "{bad:?} should be invalid");
-        }
-        for ok in ["017", "0b101", "-0x1F"] {
-            assert!(validate_xid(ok, "xid8").is_ok(), "{ok:?} should be valid");
-        }
-        for bad in ["09", "0b", "0o1"] {
             assert!(
-                validate_xid(bad, "xid").is_err(),
+                validate_uint_subr(bad, "oid", false).is_err(),
                 "{bad:?} should be invalid"
             );
         }
+        for ok in ["017", "0b101", "-0x1F"] {
+            assert!(
+                validate_uint_subr(ok, "xid8", true).is_ok(),
+                "{ok:?} should be valid"
+            );
+        }
+        for bad in ["09", "0b", "0o1", "4294967296", "-2147483649"] {
+            assert!(
+                validate_uint_subr(bad, "xid", false).is_err(),
+                "{bad:?} should be invalid"
+            );
+        }
+        // uint64in_subr: any magnitude fitting uint64 wraps.
+        assert!(validate_uint_subr("-18446744073709551615", "oid8", true).is_ok());
+        assert!(validate_uint_subr("18446744073709551616", "oid8", true).is_err());
     }
 }
