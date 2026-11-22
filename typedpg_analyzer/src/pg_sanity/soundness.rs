@@ -43,7 +43,8 @@
 //! A column's [`crate::Refinement`] is a promise too: one refined finite
 //! never comes back an infinite date, timestamp or interval, one refined
 //! to a set of values never comes back another, and an integer never
-//! comes back out of its range.
+//! comes back out of its range, nor a `numeric`, date or timestamp out of
+//! its bounds.
 //!
 //! Only SELECT / INSERT / UPDATE / DELETE / MERGE statements run; queries
 //! calling server-administration functions with effects that outlive a
@@ -911,6 +912,15 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
             ));
         }
     }
+    if let Some(bounds) = &col.refinement.bounds
+        && schema == "pg_catalog"
+        && let Some(v) = ordered_point(name, bytes)
+        && !bounds.contains(v)
+    {
+        return Some(format!(
+            "the value is {v:?}, out of {bounds:?} (refinement: bounds)"
+        ));
+    }
     if !col.refinement.finite || schema != "pg_catalog" {
         return None;
     }
@@ -978,6 +988,59 @@ fn inner_violation(ty: &Type, bytes: &[u8]) -> Option<String> {
             None
         }
         Type::Basic { .. } | Type::Enum { .. } | Type::Range { .. } => None,
+    }
+}
+
+/// The binary value `bytes` of a `numeric`, `date`, `timestamp` or
+/// `timestamptz` (type `name`) as a point of its order
+/// ([`crate::refine_bounds::OrdPoint`]): `date_send` / `timestamp_send`
+/// send the count from 2000-01-01 (the extremes being the infinities),
+/// `numeric_send` its base-10000 digits.
+fn ordered_point(name: &str, bytes: &[u8]) -> Option<crate::refine_bounds::OrdPoint> {
+    use crate::refine_bounds::{Num, OrdPoint};
+    let point = |v: i128, min: i128, max: i128| {
+        if v == min {
+            OrdPoint::NegInfinity
+        } else if v == max {
+            OrdPoint::Infinity
+        } else {
+            OrdPoint::Finite(Num::int(v))
+        }
+    };
+    match name {
+        "date" => Some(point(
+            read_i32(bytes, 0)?.into(),
+            i32::MIN.into(),
+            i32::MAX.into(),
+        )),
+        "timestamp" | "timestamptz" => Some(point(
+            i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?).into(),
+            i64::MIN.into(),
+            i64::MAX.into(),
+        )),
+        "numeric" => {
+            let u16_at = |at: usize| -> Option<u16> {
+                Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+            };
+            let (ndigits, weight, sign) = (u16_at(0)?, u16_at(2)? as i16, u16_at(4)?);
+            match sign {
+                0xC000 => return Some(OrdPoint::NaN),
+                0xD000 => return Some(OrdPoint::Infinity),
+                0xF000 => return Some(OrdPoint::NegInfinity),
+                _ => {}
+            }
+            if ndigits == 0 {
+                return Some(OrdPoint::Finite(Num::int(0)));
+            }
+            let mut digits = String::new();
+            for i in 0..usize::from(ndigits) {
+                digits.push_str(&format!("{:04}", u16_at(8 + 2 * i)?));
+            }
+            let exp = 4 * (i32::from(weight) - i32::from(ndigits) + 1);
+            let minus = if sign == 0x4000 { "-" } else { "" };
+            Num::parse(&format!("{minus}{digits}e{exp}")).map(OrdPoint::Finite)
+        }
+        _ => None,
     }
 }
 

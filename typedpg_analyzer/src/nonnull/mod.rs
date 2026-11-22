@@ -385,6 +385,10 @@ pub(crate) enum LitKind {
     String,
     /// `true` / `false` (or a bare boolean column, which is `col = true`).
     Boolean,
+    /// A number with a fraction or an exponent, or too large for an
+    /// `int4` (`1.5`, `1e3`, `3000000000`: a `numeric` or `int8`
+    /// constant, as the lexer leaves it).
+    Numeric,
 }
 
 /// A constant a column is compared with: its text and how it was written.
@@ -1475,6 +1479,10 @@ pub(crate) fn literal(n: Option<&ast::Node>) -> Option<Literal> {
                 kind: LitKind::String,
             }),
             AConstValue::Boolean(b) => Some(Literal::boolean(b.boolval)),
+            AConstValue::Float(f) => Some(Literal {
+                text: f.fval.clone(),
+                kind: LitKind::Numeric,
+            }),
             _ => None,
         },
         _ => None,

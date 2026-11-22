@@ -49,6 +49,15 @@ pub(crate) fn infer_a_const(a_const: &ast::AConst) -> Result<ExprType, AnalyzeEr
             values: Some([b.boolval.to_string()].into()),
             ..crate::refine::Refinement::FINITE
         },
+        // A `numeric` constant is the number it spells.
+        Some(ast::AConstValue::Float(f)) => crate::refine::Refinement::FINITE.with_bounds(
+            crate::refine_bounds::Num::parse(&f.fval).map(|n| {
+                crate::refine_bounds::OrdRange::exactly(
+                    crate::refine_bounds::OrdKind::Numeric,
+                    crate::refine_bounds::OrdPoint::Finite(n),
+                )
+            }),
+        ),
         _ => crate::refine::Refinement::FINITE,
     };
 
@@ -504,14 +513,18 @@ pub(crate) fn infer_type_cast(
             .with_collation(state)
             .with_elem_nullable(elem_nullable)
             .with_refine({
-                let mut refine = inner_type
-                    .refine
-                    .converted(inner_type.type_oid, target_oid, snapshot)
-                    .and(&snapshot.domain_refinement(target_oid));
-                // An explicit cast to `varchar(n)` truncates.
+                let mut refine =
+                    inner_type
+                        .refine
+                        .converted(inner_type.type_oid, target_oid, snapshot);
+                // An explicit cast to `varchar(n)` truncates, one to
+                // `numeric(p,s)` or `timestamp(p)` rounds.
                 if cast_typmod.is_some() {
                     refine.values = None;
+                    refine.bounds = None;
                 }
+                let mut refine = refine.and(&snapshot.domain_refinement(target_oid));
+
                 // A parameter cast to a type the generator binds finite
                 // (`$at::timestamptz`) is of that type.
                 if matches!(inner, Some(ast::Node::ParamRef(_)))

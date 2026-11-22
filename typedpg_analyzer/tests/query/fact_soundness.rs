@@ -92,7 +92,7 @@ fn a_user_defined_equality_proves_no_value() {
         &[("x", false)],
     );
     // The built-in `numeric = numeric` (the constant written as one).
-    assert_nullable(&db, "SELECT d AS x FROM tn WHERE n = 1.0", &[("x", true)]);
+    assert_nullable(&db, "SELECT d AS x FROM tn WHERE n = 1.0", &[("x", false)]);
     assert_nullable(
         &db,
         "SELECT d AS x FROM tn WHERE n = 1::numeric",
