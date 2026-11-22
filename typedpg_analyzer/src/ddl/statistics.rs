@@ -345,11 +345,12 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             "duplicate column name in statistics definition".into(),
         ));
     }
-    if exprs
-        .iter()
-        .enumerate()
-        .any(|(i, e)| exprs[..i].contains(e))
-    {
+    // CreateStatistics compares the transformed expressions (`equal()`).
+    if exprs.iter().enumerate().any(|(i, e)| {
+        exprs[..i].iter().any(|prev| {
+            super::tables::check_inherit::same_stored(interp, (relid, prev), (relid, e), None)
+        })
+    }) {
         return Err(DdlError::DuplicateObject(
             "duplicate expression in statistics definition".into(),
         ));

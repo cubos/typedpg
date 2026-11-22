@@ -382,6 +382,18 @@ pub(crate) fn row_security_off(relation: &str, owner: bool) -> RawError {
     )
 }
 
+/// DoCopy (copy.c): row security applies to a `COPY ... FROM` target —
+/// SQLSTATE 0A000.
+pub(crate) fn copy_from_row_security() -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(
+            "COPY FROM not supported with row-level security".to_owned(),
+        ),
+        None,
+        Some("Use INSERT statements instead.".to_owned()),
+    )
+}
+
 /// `fireRIRrules` (rewriteHandler.c): a policy's subquery reaches its own
 /// relation (directly or through other relations' policies), so the
 /// rewriter would expand it forever — SQLSTATE 42P17.
@@ -522,6 +534,35 @@ pub(crate) fn row_comparison_operator_not_boolean(type_name: &str) -> AnalyzeErr
 pub(crate) fn no_partition_for_row(relname: &str) -> AnalyzeError {
     AnalyzeError::CheckViolation(format!(
         "no partition of relation \"{relname}\" found for row"
+    ))
+}
+
+/// `new row for relation "t" violates check constraint "c"` — SQLSTATE
+/// 23514 (`ExecConstraints`): `relname` is the relation the row is stored
+/// in (a partition, when routed), unqualified and unquoted. PG's errdetail
+/// (`Failing row contains …`) is not reproduced.
+pub(crate) fn check_constraint_violation(relname: &str, conname: &str) -> AnalyzeError {
+    AnalyzeError::CheckViolation(format!(
+        "new row for relation \"{relname}\" violates check constraint \"{conname}\""
+    ))
+}
+
+/// `new row for relation "p" violates partition constraint` — SQLSTATE
+/// 23514 (`ExecPartitionCheckEmitError`): `relname` is the partition the
+/// row is inserted into, unqualified and unquoted. PG's errdetail
+/// (`Failing row contains …`) is not reproduced.
+pub(crate) fn partition_constraint_violation(relname: &str) -> AnalyzeError {
+    AnalyzeError::CheckViolation(format!(
+        "new row for relation \"{relname}\" violates partition constraint"
+    ))
+}
+
+/// `new row violates check option for view "v"` — SQLSTATE 44000
+/// (`ExecWithCheckOptions`, WCO_VIEW_CHECK). PG's errdetail (`Failing row
+/// contains …`) is not reproduced.
+pub(crate) fn view_check_option_violation(viewname: &str) -> AnalyzeError {
+    AnalyzeError::WithCheckOptionViolation(format!(
+        "new row violates check option for view \"{viewname}\""
     ))
 }
 

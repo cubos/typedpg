@@ -875,10 +875,12 @@ fn insert_row_routing_uncertain_is_accepted() {
     for sql in [
         // A parameter key: the partition depends on its value.
         "INSERT INTO nodef VALUES ($1, 'x')",
-        // A key that is not a constant.
-        "INSERT INTO nodef VALUES (length('ab'), 'x')",
-        // A domain's CHECK may reject the key first.
-        "INSERT INTO dk VALUES (-5)",
+        // A key that is not a constant (`length('ab')` is: the planner
+        // folds it to 2, and every execution fails).
+        "INSERT INTO nodef VALUES ((random() * 10)::int, 'x')",
+        // A key of a domain with a CHECK, which may reject it first (`-5`
+        // does, see below; `5` doesn't, and no partition takes it).
+        "INSERT INTO dk VALUES (5)",
         // A timestamptz literal reads in the session's time zone.
         "INSERT INTO tz VALUES ('2025-02-01')",
         // A key left to a non-NULL default.
@@ -914,6 +916,13 @@ fn insert_row_routing_uncertain_is_accepted() {
             msg
         );
     }
+    // The domain's CHECK rejects the key as the row is built, before it is
+    // routed.
+    assert_err_prefix!(
+        db.analyze("INSERT INTO dk VALUES (-5)"),
+        AnalyzeError::CheckViolation(_),
+        r#"value for domain pos violates check constraint "pos_check""#
+    );
 }
 
 /// A VALUES with ORDER BY, LIMIT / OFFSET or its own WITH is analyzed as
@@ -2881,4 +2890,473 @@ fn insert_values_with_select_clauses_types_params_like_pg() {
         .unwrap();
     assert_params(&s, vec![p(int8())]);
     assert_cols(&s, vec![c("x", int4())]);
+}
+
+/// A constant row that fails a CHECK constraint (ExecConstraints) or a
+/// view's WITH CHECK OPTION (ExecWithCheckOptions) fails every execution:
+/// PREPARE succeeds, EXECUTE always raises. No trigger can change the row.
+#[test]
+fn insert_of_a_constant_row_failing_a_check_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ck (id int PRIMARY KEY, v int NOT NULL CHECK (v > 0));
+         CREATE VIEW vck AS SELECT id, v FROM ck WHERE v > 10 WITH CHECK OPTION;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "INSERT INTO ck VALUES (1, 0)",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO vck VALUES (1, 5)",
+            "new row violates check option for view \"vck\"",
+        ),
+    ] {
+        match db.analyze(sql) {
+            Ok(a) => panic!("{sql}: expected {msg:?}, got Ok: {a:?}"),
+            Err(e) => assert!(e.to_string().starts_with(msg), "{sql}\n  got: {e}"),
+        }
+    }
+}
+
+/// The CHECK reported is the one ExecConstraints evaluates first: every
+/// NOT NULL before any CHECK, the CHECKs in name order, those of the
+/// partition the row is routed to; then the views' check options, inner
+/// view first, a CASCADED one checking the views below. ON CONFLICT
+/// doesn't spare the CHECK (checked before the conflict is), and each
+/// row of a VALUES list is checked.
+#[test]
+fn constant_row_check_violations_follow_execution_order() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ck (id int PRIMARY KEY, v int NOT NULL CHECK (v > 0));
+         CREATE TABLE two (a int, CONSTRAINT zz CHECK (a > 0),
+             CONSTRAINT aa CHECK (a > 5), CONSTRAINT b CHECK (a > 3));
+         CREATE TABLE nn (a int NOT NULL, b int CHECK (b > 0));
+         CREATE TABLE pt (k int, v int CHECK (v > 0)) PARTITION BY LIST (k);
+         CREATE TABLE pt1 PARTITION OF pt (CONSTRAINT p1c CHECK (v > 100))
+             FOR VALUES IN (1);
+         CREATE TABLE st (s text CHECK (s IN ('a', 'b')));
+         CREATE TABLE b (a int, c int);
+         CREATE VIEW v1 AS SELECT * FROM b WHERE a > 0;
+         CREATE VIEW v2 AS SELECT * FROM v1 WHERE c > 0 WITH CASCADED CHECK OPTION;
+         CREATE VIEW v4 AS SELECT * FROM b WHERE a > 0 WITH LOCAL CHECK OPTION;
+         CREATE VIEW v5 AS SELECT * FROM v4 WHERE c > 0 WITH LOCAL CHECK OPTION;
+         CREATE VIEW v6 AS SELECT * FROM v4 WHERE c > 0;
+         CREATE VIEW v7 AS SELECT c AS x, a AS y FROM v1 WHERE c > 0 WITH CHECK OPTION;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "INSERT INTO two VALUES (0)",
+            "new row for relation \"two\" violates check constraint \"aa\"",
+        ),
+        (
+            "INSERT INTO nn VALUES (NULL, 0)",
+            "null value in column \"a\" of relation \"nn\" violates not-null constraint",
+        ),
+        (
+            "INSERT INTO pt VALUES (1, 50)",
+            "new row for relation \"pt1\" violates check constraint \"p1c\"",
+        ),
+        (
+            "INSERT INTO pt1 VALUES (1, 0)",
+            "new row for relation \"pt1\" violates check constraint \"p1c\"",
+        ),
+        (
+            "INSERT INTO st VALUES ('c')",
+            "new row for relation \"st\" violates check constraint \"st_s_check\"",
+        ),
+        (
+            "INSERT INTO ck VALUES (10, 5), (11, 0)",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO ck VALUES (1, 0) ON CONFLICT DO NOTHING",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO ck (v, id) SELECT 0, 1",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO v2 VALUES (-1, 5)",
+            "new row violates check option for view \"v1\"",
+        ),
+        (
+            "INSERT INTO v2 VALUES (1, -5)",
+            "new row violates check option for view \"v2\"",
+        ),
+        (
+            "INSERT INTO v5 VALUES (-1, -1)",
+            "new row violates check option for view \"v4\"",
+        ),
+        (
+            "INSERT INTO v5 VALUES (1, -1)",
+            "new row violates check option for view \"v5\"",
+        ),
+        (
+            "INSERT INTO v6 VALUES (-1, 1)",
+            "new row violates check option for view \"v4\"",
+        ),
+        (
+            "INSERT INTO v7 VALUES (-1, 1)",
+            "new row violates check option for view \"v7\"",
+        ),
+    ] {
+        match db.analyze(sql) {
+            Ok(a) => panic!("{sql}: expected {msg:?}, got Ok: {a:?}"),
+            Err(e) => assert!(e.to_string().starts_with(msg), "{sql}\n  got: {e}"),
+        }
+    }
+}
+
+/// Neighbours PG accepts, or that fail only on some executions: a CHECK
+/// is NULL (so passes) for a NULL; a BEFORE ROW trigger (on the table, or
+/// a partition the row may land in) may change the row; an INSTEAD OF
+/// trigger or a DO INSTEAD rule takes the row instead; a NOT ENFORCED
+/// constraint isn't checked; a view's check option isn't checked of a
+/// row ON CONFLICT skips, nor of one inserted through a LOCAL check
+/// option above a view without one; UPDATE and MERGE change only the
+/// rows they match; a parameter or an unknown partition say nothing.
+#[test]
+fn constant_row_check_violations_are_accepted_where_they_may_succeed() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ck (id int PRIMARY KEY, v int CHECK (v > 0));
+         CREATE VIEW vck AS SELECT id, v FROM ck WHERE v > 10 WITH CHECK OPTION;
+         CREATE TABLE tr (v int CHECK (v > 0));
+         CREATE FUNCTION fix() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN NEW.v := 1; RETURN NEW; END$$;
+         CREATE TRIGGER t BEFORE INSERT ON tr FOR EACH ROW EXECUTE FUNCTION fix();
+         CREATE TABLE ptr (k int, v int CHECK (v > 0)) PARTITION BY LIST (k);
+         CREATE TABLE ptr1 PARTITION OF ptr FOR VALUES IN (1);
+         CREATE TRIGGER t BEFORE INSERT ON ptr1 FOR EACH ROW EXECUTE FUNCTION fix();
+         CREATE TABLE pu (k int, v int) PARTITION BY LIST (k);
+         CREATE TABLE pu1 PARTITION OF pu (CHECK (v > 0)) FOR VALUES IN (1);
+         CREATE TABLE pu2 PARTITION OF pu FOR VALUES IN (2);
+         CREATE VIEW vi AS SELECT id, v FROM ck WHERE v > 10 WITH CHECK OPTION;
+         CREATE FUNCTION ins() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN RETURN NEW; END$$;
+         CREATE TRIGGER t INSTEAD OF INSERT ON vi FOR EACH ROW EXECUTE FUNCTION ins();
+         CREATE TABLE ru (v int CHECK (v > 0));
+         CREATE TABLE sink (v int);
+         CREATE RULE r AS ON INSERT TO ru DO INSTEAD INSERT INTO sink VALUES (NEW.v);
+         CREATE TABLE ne (a int, CONSTRAINT c CHECK (a > 0) NOT ENFORCED);
+         CREATE TABLE b (a int, c int);
+         CREATE VIEW v1 AS SELECT * FROM b WHERE a > 0;
+         CREATE VIEW v3 AS SELECT * FROM v1 WHERE c > 0 WITH LOCAL CHECK OPTION;
+         CREATE TABLE src (id int, v int);",
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO ck VALUES (1, NULL)",
+        "INSERT INTO ck (id) VALUES (1)",
+        "INSERT INTO tr VALUES (0)",
+        "INSERT INTO ptr VALUES (1, 0)",
+        "INSERT INTO pu VALUES ($1, 0)",
+        "INSERT INTO vi VALUES (1, 5)",
+        "INSERT INTO ru VALUES (0)",
+        "INSERT INTO ne VALUES (0)",
+        "INSERT INTO vck VALUES (1, 5) ON CONFLICT DO NOTHING",
+        "INSERT INTO vck VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = 50",
+        "INSERT INTO v3 VALUES (-1, 5)",
+        "INSERT INTO ck VALUES ($1, $2)",
+        "UPDATE ck SET v = 0",
+        "MERGE INTO ck USING src ON src.id = ck.id WHEN NOT MATCHED THEN INSERT VALUES (1, 0)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// Asserts each statement is rejected with an error starting with its
+/// message.
+fn assert_rejected(db: &PgCatalog, cases: &[(&str, &str)]) {
+    for (sql, msg) in cases {
+        match db.analyze(sql) {
+            Ok(a) => panic!("{sql}: expected {msg:?}, got Ok: {a:?}"),
+            Err(e) => assert!(e.to_string().starts_with(msg), "{sql}\n  got: {e}"),
+        }
+    }
+}
+
+/// A view's WITH CHECK OPTION fails a row its qualification is NULL for,
+/// not only FALSE (ExecWithCheckOptions: ExecQual, unlike a CHECK
+/// constraint's ExecCheck): `v > 10` of a NULL `v`, given or defaulted.
+/// A qualification TRUE or never NULL for it passes.
+#[test]
+fn constant_row_check_option_fails_on_null() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, v int, w int);
+         CREATE VIEW vn AS SELECT id, v FROM t WHERE v > 10 WITH CHECK OPTION;
+         CREATE VIEW vnot AS SELECT id, v FROM t WHERE NOT (v > 10) WITH CHECK OPTION;
+         CREATE VIEW vand AS SELECT id, v, w FROM t WHERE w = 1 AND v > 10 WITH CHECK OPTION;
+         CREATE VIEW vb AS SELECT id, v FROM t WHERE v IS NULL OR v > 10 WITH CHECK OPTION;
+         CREATE VIEW vd AS SELECT id, v FROM t WHERE v IS DISTINCT FROM 5 WITH CHECK OPTION;
+         CREATE VIEW vnf AS SELECT id, v FROM t WHERE (v > 10) IS NOT FALSE WITH CHECK OPTION;
+         CREATE VIEW vor AS SELECT id, v, w FROM t WHERE v > 10 OR w = 1 WITH CHECK OPTION;
+         CREATE TABLE tf (id int, v int, f bool);
+         CREATE VIEW va AS SELECT * FROM tf WHERE v <> ALL ('{}'::int[]) WITH CHECK OPTION;
+         CREATE VIEW vf AS SELECT * FROM tf WHERE f WITH CHECK OPTION;
+         CREATE VIEW vc1 AS SELECT * FROM tf
+             WHERE CASE WHEN v > 0 THEN true ELSE false END WITH CHECK OPTION;
+         CREATE VIEW vc2 AS SELECT * FROM tf
+             WHERE CASE WHEN v > 0 THEN false ELSE true END WITH CHECK OPTION;
+         CREATE VIEW vbt AS SELECT * FROM tf WHERE v BETWEEN 1 AND 5 WITH CHECK OPTION;
+         CREATE VIEW vnbt AS SELECT * FROM tf WHERE v NOT BETWEEN 1 AND 5 WITH CHECK OPTION;
+         CREATE VIEW vin AS SELECT * FROM tf WHERE v IN (1, 2) WITH CHECK OPTION;
+         CREATE VIEW vnt AS SELECT * FROM tf WHERE (v > 10) IS NOT TRUE WITH CHECK OPTION;
+         CREATE VIEW vit AS SELECT * FROM tf WHERE (v > 10) IS TRUE WITH CHECK OPTION;
+         CREATE VIEW veq AS SELECT * FROM tf WHERE (v > 10) = (f IS NULL) WITH CHECK OPTION;
+         CREATE VIEW vnull AS SELECT * FROM tf WHERE NULL WITH CHECK OPTION;
+         CREATE VIEW vfalse AS SELECT * FROM tf WHERE false WITH CHECK OPTION;
+         CREATE TABLE cf (a int, CONSTRAINT never CHECK (false));",
+    )
+    .unwrap();
+    let fails = |v: &str| format!("new row violates check option for view \"{v}\"");
+    assert_rejected(
+        &db,
+        &[
+            // A qualification FALSE (or, for a check option, NULL)
+            // whatever the row.
+            ("INSERT INTO vnull VALUES (1, 1)", &fails("vnull")),
+            ("INSERT INTO vfalse VALUES (1, 1)", &fails("vfalse")),
+            (
+                "INSERT INTO cf VALUES (1)",
+                "new row for relation \"cf\" violates check constraint \"never\"",
+            ),
+            ("INSERT INTO vn VALUES (1, NULL)", &fails("vn")),
+            ("INSERT INTO vn (id) VALUES (1)", &fails("vn")),
+            ("INSERT INTO vnot VALUES (1, NULL)", &fails("vnot")),
+            ("INSERT INTO vand VALUES (1, NULL, 1)", &fails("vand")),
+            ("INSERT INTO vand VALUES (1, 50, NULL)", &fails("vand")),
+            ("INSERT INTO vor VALUES (1, NULL, NULL)", &fails("vor")),
+            ("INSERT INTO vor VALUES (1, 5, NULL)", &fails("vor")),
+            ("INSERT INTO vf VALUES (1, 1, NULL)", &fails("vf")),
+            ("INSERT INTO vc1 VALUES (1, NULL)", &fails("vc1")),
+            ("INSERT INTO vbt VALUES (1, NULL)", &fails("vbt")),
+            ("INSERT INTO vnbt VALUES (1, NULL)", &fails("vnbt")),
+            ("INSERT INTO vin VALUES (1, NULL)", &fails("vin")),
+            ("INSERT INTO vit VALUES (1, NULL)", &fails("vit")),
+            ("INSERT INTO veq VALUES (1, NULL, NULL)", &fails("veq")),
+        ],
+    );
+    for sql in [
+        "INSERT INTO vb VALUES (1, NULL)",
+        "INSERT INTO vd VALUES (1, NULL)",
+        "INSERT INTO vnf VALUES (1, NULL)",
+        "INSERT INTO vor VALUES (1, NULL, 1)",
+        "INSERT INTO va VALUES (1, NULL)",
+        "INSERT INTO vc2 VALUES (1, NULL)",
+        "INSERT INTO vnbt VALUES (1, 6)",
+        "INSERT INTO vnt VALUES (1, NULL)",
+        "INSERT INTO vn VALUES (1, NULL) ON CONFLICT DO NOTHING",
+        "INSERT INTO vn VALUES (1, $1)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// A non-NULL constant a domain's CHECK is FALSE for fails its coercion
+/// every time it is evaluated (ExecEvalConstraintCheck; the planner
+/// doesn't fold a CoerceToDomain, so PREPARE succeeds): a cast in a
+/// query, or a value stored into a column of the domain — as the row is
+/// built, before any BEFORE ROW trigger could change it. The domains of a
+/// chain check from the base one out, by name within one; the message
+/// names the type coerced to.
+#[test]
+fn constant_failing_a_domain_check_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+         CREATE DOMAIN pos2 AS pos CHECK (VALUE < 100);
+         CREATE DOMAIN ne AS text CHECK (VALUE <> '');
+         CREATE DOMAIN two AS int CONSTRAINT b CHECK (VALUE > 10) CONSTRAINT a CHECK (VALUE > 5);
+         CREATE TABLE dt (id int, c pos);
+         CREATE TABLE dt2 (c pos2);
+         CREATE TABLE plain (c int);
+         CREATE TABLE trg (c pos);
+         CREATE FUNCTION fix() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN NEW.c := 5; RETURN NEW; END$$;
+         CREATE TRIGGER t BEFORE INSERT ON trg FOR EACH ROW EXECUTE FUNCTION fix();
+         CREATE SCHEMA s;
+         CREATE DOMAIN s.sp AS int CHECK (VALUE > 0);
+         CREATE DOMAIN nn AS int NOT NULL;
+         CREATE TABLE da (a pos[]);",
+    )
+    .unwrap();
+    let pos = r#"value for domain pos violates check constraint "pos_check""#;
+    assert_rejected(
+        &db,
+        &[
+            ("SELECT 0::pos", pos),
+            ("SELECT '0'::pos", pos),
+            ("SELECT CAST(-3 AS pos)", pos),
+            ("SELECT 0::pos IS NULL", pos),
+            (
+                "SELECT 0::pos2",
+                r#"value for domain pos2 violates check constraint "pos_check""#,
+            ),
+            (
+                "SELECT 200::pos2",
+                r#"value for domain pos2 violates check constraint "pos2_check""#,
+            ),
+            (
+                "SELECT ''::ne",
+                r#"value for domain ne violates check constraint "ne_check""#,
+            ),
+            (
+                "SELECT 0::two",
+                r#"value for domain two violates check constraint "a""#,
+            ),
+            ("INSERT INTO dt VALUES (1, 0)", pos),
+            ("INSERT INTO dt VALUES (1, '0')", pos),
+            ("INSERT INTO dt VALUES (1, 5), (2, 0)", pos),
+            ("INSERT INTO trg VALUES (0)", pos),
+            ("INSERT INTO plain VALUES (0::pos)", pos),
+            (
+                "INSERT INTO dt2 VALUES (200)",
+                r#"value for domain pos2 violates check constraint "pos2_check""#,
+            ),
+            (
+                "SELECT 0::s.sp",
+                r#"value for domain s.sp violates check constraint "sp_check""#,
+            ),
+            // Each element of an ARRAY[…] is coerced to the domain.
+            ("SELECT ARRAY[0]::pos[]", pos),
+            ("SELECT ARRAY[1, 0]::pos[]", pos),
+            ("INSERT INTO da VALUES (ARRAY[0])", pos),
+            (
+                "SELECT ARRAY[1, NULL]::nn[]",
+                "domain nn does not allow null values",
+            ),
+        ],
+    );
+    for sql in [
+        "SELECT 1::pos",
+        "SELECT 'x'::ne",
+        "SELECT 50::pos2",
+        "SELECT NULL::pos",
+        "SELECT $1::pos",
+        "SELECT 0::pos FROM dt",
+        "EXPLAIN SELECT 0::pos",
+        "INSERT INTO dt VALUES (1, 1)",
+        "INSERT INTO dt VALUES (1, NULL)",
+        "INSERT INTO dt VALUES (1, $1)",
+        "INSERT INTO dt2 VALUES (50)",
+        "SELECT ARRAY[1, NULL]::pos[]",
+        "SELECT ARRAY[$1, 0]::pos[]",
+        "INSERT INTO da VALUES (ARRAY[1])",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// `domain_in` checks a domain's constraints as the statement is parsed
+/// when an input function calls it: `array_in` for each element of an
+/// array literal of a domain, `record_in` for each field of a composite
+/// literal (a NULL one included). PREPARE fails.
+#[test]
+fn domain_elements_of_a_literal_are_checked_as_it_is_parsed() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN pos AS int CHECK (VALUE > 0);
+         CREATE DOMAIN nn AS int NOT NULL;
+         CREATE TYPE cp AS (a pos);
+         CREATE TYPE cn AS (a nn);
+         CREATE TABLE da (a pos[]);",
+    )
+    .unwrap();
+    let pos = r#"value for domain pos violates check constraint "pos_check""#;
+    for (sql, msg) in [
+        ("SELECT '{0}'::pos[]", pos),
+        ("SELECT '{1,\"0\"}'::pos[]", pos),
+        ("INSERT INTO da VALUES ('{0}')", pos),
+        ("EXPLAIN SELECT '{0}'::pos[]", pos),
+        ("SELECT '(0)'::cp", pos),
+        ("SELECT '()'::cn", "domain nn does not allow null values"),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::InvalidLiteral(_), msg);
+    }
+    for sql in [
+        "SELECT '{1,NULL}'::pos[]",
+        "SELECT '(1)'::cp",
+        "SELECT '()'::cp",
+        "SELECT '(1)'::cn",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// A row inserted into a partition directly must satisfy its partition
+/// constraint — its own bound and its ancestors' (ExecPartitionCheck,
+/// after the CHECKs; before routing when the partition is itself
+/// partitioned). A BEFORE ROW trigger on a leaf partition may change the
+/// row first; on a partitioned one it runs only after routing.
+#[test]
+fn constant_row_outside_its_partition_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE p (k int, v int CHECK (v > -100)) PARTITION BY RANGE (k);
+         CREATE TABLE p1 PARTITION OF p (CONSTRAINT p1c CHECK (v <> 0))
+             FOR VALUES FROM (1) TO (10);
+         CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20);
+         CREATE TABLE p3 PARTITION OF p FOR VALUES FROM (20) TO (30) PARTITION BY LIST (v);
+         CREATE TABLE p3a PARTITION OF p3 FOR VALUES IN (1);
+         CREATE TABLE pd PARTITION OF p DEFAULT;
+         CREATE VIEW vp1 AS SELECT * FROM p1;
+         CREATE FUNCTION fixk() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN NEW.k := 5; RETURN NEW; END$$;
+         CREATE TABLE q (k int) PARTITION BY LIST (k);
+         CREATE TABLE q1 PARTITION OF q FOR VALUES IN (5);
+         CREATE TRIGGER t BEFORE INSERT ON q1 FOR EACH ROW EXECUTE FUNCTION fixk();
+         CREATE TABLE r (k int, j int) PARTITION BY LIST (k);
+         CREATE TABLE r1 PARTITION OF r FOR VALUES IN (1) PARTITION BY LIST (j);
+         CREATE TABLE r1a PARTITION OF r1 FOR VALUES IN (5);
+         CREATE TRIGGER t BEFORE INSERT ON r1 FOR EACH ROW EXECUTE FUNCTION fixk();
+         CREATE TABLE h (k int) PARTITION BY HASH (k);
+         CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+         CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 1);",
+    )
+    .unwrap();
+    let outside = |r: &str| format!("new row for relation \"{r}\" violates partition constraint");
+    assert_rejected(
+        &db,
+        &[
+            ("INSERT INTO p1 VALUES (15, 1)", &outside("p1")),
+            ("INSERT INTO p1 VALUES (NULL, 1)", &outside("p1")),
+            ("INSERT INTO p1 (v) VALUES (1)", &outside("p1")),
+            (
+                "INSERT INTO p1 VALUES (15, 0)",
+                "new row for relation \"p1\" violates check constraint \"p1c\"",
+            ),
+            ("INSERT INTO p3a VALUES (5, 1)", &outside("p3a")),
+            ("INSERT INTO p3a VALUES (25, 2)", &outside("p3a")),
+            ("INSERT INTO p3 VALUES (5, 7)", &outside("p3")),
+            (
+                "INSERT INTO p3 VALUES (25, 7)",
+                "no partition of relation \"p3\" found for row",
+            ),
+            ("INSERT INTO pd VALUES (5, 1)", &outside("pd")),
+            (
+                "INSERT INTO p1 VALUES (15, 1) ON CONFLICT DO NOTHING",
+                &outside("p1"),
+            ),
+            ("INSERT INTO vp1 VALUES (15, 1)", &outside("p1")),
+            ("INSERT INTO r1 VALUES (7, 5)", &outside("r1")),
+        ],
+    );
+    for sql in [
+        "INSERT INTO p1 VALUES (5, 1)",
+        "INSERT INTO p3a VALUES (25, 1)",
+        "INSERT INTO pd VALUES (NULL, 1)",
+        "INSERT INTO pd VALUES (50, 1)",
+        "INSERT INTO p1 VALUES ($1, 1)",
+        "INSERT INTO q1 VALUES (7)",
+        "INSERT INTO h0 VALUES (1)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
 }

@@ -7,18 +7,142 @@
 use super::DdlError;
 use crate::pg_catalog::{PgCatalog, PgSetting};
 
+/// `map_old_guc_names` (guc.c): obsolete names find_option still resolves.
+const OLD_NAMES: &[(&str, &str)] = &[
+    ("sort_mem", "work_mem"),
+    ("vacuum_mem", "maintenance_work_mem"),
+    ("ssl_ecdh_curve", "ssl_groups"),
+];
+
+/// The parameters PostgreSQL 19 declares `GUC_NO_SHOW_ALL`
+/// (`guc_parameters.dat`), which `pg_settings` — and so the seed — leaves
+/// out. Known, but not modelled: any value is accepted, except that
+/// `is_superuser` is `PGC_INTERNAL`.
+const NOT_SHOWN: &[&str] = &[
+    "default_with_oids",
+    "is_superuser",
+    "role",
+    "seed",
+    "session_authorization",
+    "ssl_renegotiation_limit",
+];
+
 fn find<'a>(interp: &'a PgCatalog, name: &str) -> Option<&'a PgSetting> {
+    let name = OLD_NAMES
+        .iter()
+        .find(|(old, _)| old.eq_ignore_ascii_case(name))
+        .map_or(name, |&(_, new)| new);
     interp
         .pg_settings
         .iter()
         .find(|s| s.name.eq_ignore_ascii_case(name))
 }
 
+fn not_shown(name: &str) -> bool {
+    NOT_SHOWN.iter().any(|n| n.eq_ignore_ascii_case(name))
+}
+
 /// Whether `name` is a parameter a GRANT ... ON PARAMETER may name
 /// (check_GUC_name_for_parameter_acl): a known one, or a custom
 /// `prefix.name` one.
 pub(crate) fn exists(interp: &PgCatalog, name: &str) -> bool {
-    find(interp, name).is_some() || name.contains('.')
+    find(interp, name).is_some() || not_shown(name) || name.contains('.')
+}
+
+/// find_option without placeholders, as `current_setting(name)` runs it
+/// (GetConfigOptionByName with `missing_ok` false): an unknown name is an
+/// error. A custom `prefix.name` one exists once something set it (a
+/// `SET`, the server's configuration, `ALTER ROLE ... SET`), which can't be
+/// known statically: accepted.
+fn check_known(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
+    if find(interp, name).is_some() || not_shown(name) || name.contains('.') {
+        return Ok(());
+    }
+    Err(unrecognized(name))
+}
+
+fn unrecognized(name: &str) -> DdlError {
+    DdlError::TypeNotFound(format!("unrecognized configuration parameter \"{name}\""))
+}
+
+/// The error every evaluation of a `pg_catalog` configuration function
+/// over these constant arguments raises (`None` for an argument that
+/// isn't a constant, `Some(None)` for a NULL one):
+///
+/// - `current_setting(name [, missing_ok])` (show_config_by_name[_missing_ok]):
+///   an unknown name, unless `missing_ok` is true (the result is then NULL);
+/// - `set_config(name, value, is_local)` (set_config_by_name): a NULL name,
+///   then what `SET name TO value` would refuse (set_config_option) — a
+///   NULL value is a reset, which only needs a settable parameter.
+///
+/// A NULL argument of the strict `current_setting` makes the call NULL
+/// before it runs: the caller doesn't get here.
+pub(crate) fn constant_call_error(
+    interp: &PgCatalog,
+    proname: &str,
+    args: &[Option<Option<ConstArg<'_>>>],
+) -> Result<(), DdlError> {
+    match (proname, args) {
+        ("current_setting", [Some(Some(ConstArg::Str(name)))]) => check_known(interp, name),
+        (
+            "current_setting",
+            [
+                Some(Some(ConstArg::Str(name))),
+                Some(Some(ConstArg::Bool(false))),
+            ],
+        ) => check_known(interp, name),
+        ("set_config", [Some(None), _, _]) => invalid("SET requires parameter name".to_string()),
+        ("set_config", [Some(Some(ConstArg::Str(name))), value, _]) => {
+            let Some(setting) = check_settable(interp, name)?.cloned() else {
+                return Ok(());
+            };
+            match value {
+                Some(Some(ConstArg::Str(value))) => check_value(interp, &setting, value),
+                _ => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The parameter a `set_config` call over a constant name sets, when only
+/// a superuser may set it (`PGC_SUSET`) unless granted SET on it.
+pub(crate) fn superuser_set_config(
+    interp: &PgCatalog,
+    proname: &str,
+    args: &[Option<Option<ConstArg<'_>>>],
+) -> Option<String> {
+    let ("set_config", [Some(Some(ConstArg::Str(name))), _, _]) = (proname, args) else {
+        return None;
+    };
+    let setting = check_settable(interp, name).ok()??;
+    (setting.context == "superuser").then(|| setting.name.clone())
+}
+
+/// A constant argument of a configuration function (see
+/// [`constant_call_error`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ConstArg<'a> {
+    Str(&'a str),
+    Bool(bool),
+}
+
+impl<'a> ConstArg<'a> {
+    /// `None` when `node` isn't a constant, `Some(None)` for `NULL`.
+    pub(crate) fn of(node: Option<&'a typedpg_pg_query::ast::Node>) -> Option<Option<Self>> {
+        use typedpg_pg_query::ast::{AConstValue, Node};
+        let Some(Node::AConst(c)) = node else {
+            return None;
+        };
+        if c.isnull {
+            return Some(None);
+        }
+        match c.val.as_ref()? {
+            AConstValue::String(s) => Some(Some(ConstArg::Str(&s.sval))),
+            AConstValue::Boolean(b) => Some(Some(ConstArg::Bool(b.boolval))),
+            _ => None,
+        }
+    }
 }
 
 fn invalid(err: String) -> Result<(), DdlError> {
@@ -75,12 +199,15 @@ pub(crate) fn check_settable<'a>(
     name: &str,
 ) -> Result<Option<&'a PgSetting>, DdlError> {
     let Some(setting) = find(interp, name) else {
-        if name.contains('.') {
+        if name.eq_ignore_ascii_case("is_superuser") {
+            return Err(DdlError::UnsupportedDdl(
+                "parameter \"is_superuser\" cannot be changed".to_string(),
+            ));
+        }
+        if name.contains('.') || not_shown(name) {
             return Ok(None);
         }
-        return Err(DdlError::TypeNotFound(format!(
-            "unrecognized configuration parameter \"{name}\""
-        )));
+        return Err(unrecognized(name));
     };
     let n = &setting.name;
     let refused = match setting.context.as_str() {

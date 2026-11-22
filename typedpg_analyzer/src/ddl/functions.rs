@@ -41,6 +41,18 @@ pub(crate) struct RoutineBody {
     /// has one. `None`: the caller's session search path.
     pub(crate) search_path: Option<Vec<String>>,
     pub(crate) source: RoutineSource,
+    /// A procedure's SQL-standard body, as `CALL` runs it
+    /// ([`super::do_block::call`]).
+    pub(crate) atomic_body: Option<std::sync::Arc<AtomicBody>>,
+}
+
+/// The statements of a procedure's `BEGIN ATOMIC` body, and the search
+/// path they were resolved along at CREATE PROCEDURE (PG stores them
+/// resolved, by OID).
+#[derive(Debug)]
+pub(crate) struct AtomicBody {
+    pub(crate) statements: Vec<ast::Node>,
+    pub(crate) search_path: Vec<PgNamespaceOid>,
 }
 
 /// Where a routine's body text lives.
@@ -816,10 +828,17 @@ fn record_routine_body(
 ) {
     let security_definer = attrs.common.security.and_then(def_bool).unwrap_or(false);
     let search_path = routine_search_path(interp, &attrs.common.set_items, None);
+    let mut atomic_body = None;
     let source = if let Some(body) = stmt.sql_body.as_ref() {
         // PG stores an SQL-standard body analyzed (`prosqlbody`): what it
         // runs is what the creation `search_path` resolved now.
         let statements = super::function_body::atomic_body_statements(body);
+        if proc.prokind == ProKind::Procedure {
+            atomic_body = Some(std::sync::Arc::new(AtomicBody {
+                statements: statements.clone(),
+                search_path: interp.search_path.clone(),
+            }));
+        }
         Some(RoutineSource::SqlStandard(Box::new(
             crate::privileges::resolve_sql_standard_body(interp, &statements, proc),
         )))
@@ -850,6 +869,7 @@ fn record_routine_body(
                     security_definer,
                     search_path,
                     source,
+                    atomic_body,
                 },
             );
         }

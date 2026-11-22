@@ -74,6 +74,65 @@ fn alter_enum_add_value_before() {
     assert_eq!(labels, vec!["anxious", "sad", "ok", "happy"]);
 }
 
+#[test]
+fn alter_enum_add_value_renumbers_when_the_midpoint_rounds() {
+    // AddEnumLabel takes the float4 midpoint between the neighbours; when
+    // it rounds to one of them, RenumberEnumType renumbers the members 1..n
+    // first. Thirty labels BEFORE 'z' renumber once, at b24: PG 19.0's
+    // pg_enum then reads 1, 2, …, 24, 24.5, 24.75, …, 24.992188, 25.
+    let mut owned = vec!["CREATE TYPE e AS ENUM ('a', 'z');".to_owned()];
+    for i in 1..=30 {
+        owned.push(format!("ALTER TYPE e ADD VALUE 'b{i}' BEFORE 'z';"));
+    }
+    let migrations: Vec<(&str, &str)> = owned.iter().map(|s| ("0001.sql", s.as_str())).collect();
+    let snap = build(&migrations);
+    let te = snap.resolve_type_by_name(None, "e").unwrap();
+    let mut expected: Vec<(String, f32)> = vec![("a".to_owned(), 1.0)];
+    for i in 1..=23 {
+        expected.push((format!("b{i}"), (i + 1) as f32));
+    }
+    let mut order = 24.0_f32;
+    for i in 24..=30 {
+        order = (order + 25.0) / 2.0;
+        expected.push((format!("b{i}"), order));
+    }
+    expected.push(("z".to_owned(), 25.0));
+    let mut rows: Vec<(String, f32)> = snap
+        .to_seed()
+        .pg_enum
+        .into_iter()
+        .filter(|e| e.enumtypid == te.oid)
+        .map(|e| (e.enumlabel, e.enumsortorder))
+        .collect();
+    rows.sort_by(|a, b| a.1.total_cmp(&b.1));
+    assert_eq!(rows, expected);
+    assert_eq!(rows[30], ("b30".to_owned(), 24.992_188));
+
+    // The order is enum_cmp's: b29 < b30, so a partition from b29 overlaps
+    // one up to b30 (PG 19.0 rejects c2), and one from b30 doesn't.
+    let partitions = "CREATE TABLE t (k e) PARTITION BY RANGE (k);
+         CREATE TABLE c1 PARTITION OF t FOR VALUES FROM ('a') TO ('b30');";
+    let mut with_overlap = migrations.clone();
+    with_overlap.push(("0002.sql", partitions));
+    with_overlap.push((
+        "0003.sql",
+        "CREATE TABLE c2 PARTITION OF t FOR VALUES FROM ('b29') TO ('z');",
+    ));
+    let err = try_apply(&with_overlap).expect_err("c2 overlaps c1");
+    assert!(
+        err.to_string()
+            .starts_with("partition \"c2\" would overlap partition \"c1\""),
+        "got: {err}"
+    );
+    let mut disjoint = migrations.clone();
+    disjoint.push(("0002.sql", partitions));
+    disjoint.push((
+        "0003.sql",
+        "CREATE TABLE c3 PARTITION OF t FOR VALUES FROM ('b30') TO ('z');",
+    ));
+    build(&disjoint);
+}
+
 // ── CREATE TYPE AS (composite) ──────────────────────────────────────────────
 
 #[test]

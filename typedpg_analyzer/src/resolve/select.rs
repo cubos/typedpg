@@ -52,16 +52,19 @@ pub(crate) fn analyze_correlated_select(
     outer_tiers.extend(outer_scope.outer_tiers.iter().cloned());
     let mut analyze = || {
         grouping::with_visible_entries(&outer_scope.sources, || {
-            analyze_select_with_ctes_and_outer(
-                sel,
-                snapshot,
-                params,
-                &outer_scope.ctes,
-                &outer_tiers,
-                // Unreferencable entries stay so inside the sublink
-                // (errorMissingRTE searches every enclosing range table).
-                &outer_scope.shadowed_sources,
-            )
+            expr::with_outer_grouping(outer_scope, outer_null_ctx, || {
+                analyze_select_with_ctes_and_outer(
+                    sel,
+                    snapshot,
+                    params,
+                    &outer_scope.ctes,
+                    &outer_tiers,
+                    // Unreferencable entries stay so inside the sublink
+                    // (errorMissingRTE searches every enclosing range
+                    // table).
+                    &outer_scope.shadowed_sources,
+                )
+            })
         })
     };
     let (mut cols, p) = match semijoin {
@@ -456,11 +459,11 @@ fn analyze_select_here(
         null_ctx.input_not_empty = true;
     }
 
-    // Collect the select list's output-column names so GROUP BY / ORDER BY
-    // can fall back to them when a bare identifier doesn't resolve against
-    // the FROM scope. PG accepts `SELECT name AS n FROM t GROUP BY n ORDER
-    // BY n`; without this fallback, propagating errors from those walks
-    // would regress legitimate queries. PG matches the target entry's
+    // Collect the select list's output-column names so GROUP BY can fall
+    // back to them when a bare identifier doesn't resolve against the FROM
+    // scope. PG accepts `SELECT name AS n FROM t GROUP BY n`; without this
+    // fallback, propagating errors from that walk would regress legitimate
+    // queries. PG matches the target entry's
     // `resname`, which for an unaliased expression is the name it derives
     // (`count` for `count(*)`); a `*` column is one the FROM scope
     // resolves.
@@ -471,6 +474,14 @@ fn analyze_select_here(
             ExpandedTarget::StarColumn { .. } => None,
         })
         .collect();
+    // Every output column's name, as ORDER BY and DISTINCT ON match a bare
+    // name against them (`*` columns included).
+    let output_names = output_column_names(
+        &targets,
+        &sel.target_list,
+        expr::Ctx::new(&scope, &null_ctx, snapshot),
+        params,
+    );
 
     // Process HAVING clause — same boolean goal as WHERE, but aggregates
     // are of course allowed there.
@@ -499,9 +510,8 @@ fn analyze_select_here(
     // — we walk the inner expression so parameters referenced there (e.g.
     // `ORDER BY embedding <=> $embedding`) get their types inferred from
     // operator context and any column refs are validated. A bare
-    // identifier may name a select-list alias that isn't in the FROM
-    // scope (PG resolution rule); suppress `UndefinedColumn` only in that
-    // exact shape so typos still surface. Integer literals are *ordinals*:
+    // identifier naming an output column is that column, before any input
+    // column (findTargetlistEntrySQL92). Integer literals are *ordinals*:
     // they reference a projection position and must be in range (42P10).
     let n_targets = targets.len();
     // `SELECT DISTINCT` (the plain form parses as one empty node) restricts
@@ -531,30 +541,30 @@ fn analyze_select_here(
             }
             continue;
         }
-        if let Err(e) = expr::infer_expr(
+        // A bare name of an output column is that column, whatever the
+        // FROM scope holds; addTargetToSortList resolves its entry still
+        // `unknown` as text, before the next key is transformed.
+        if let Some(i) = named_output_column(
+            inner.as_ref(),
+            "ORDER BY",
+            &targets,
+            &output_names,
+            &scope,
+            snapshot,
+        )? {
+            if let ExpandedTarget::Expr(rt) = targets[i] {
+                resolve_unknown_target(rt, snapshot, params)?;
+            }
+            continue;
+        }
+        expr::infer_expr(
             inner.as_ref(),
             expr::Ctx::new(&scope, &null_ctx, snapshot),
             params,
             TypeGoal::NONE,
-        ) && !is_select_alias_reference(inner.as_ref(), &select_aliases, &e)
-        {
-            return Err(e);
-        }
-        // addTargetToSortList resolves the key's entry still `unknown` as
-        // text, before the next key is transformed.
-        match aliased_target(inner.as_ref(), &targets) {
-            Some(rt) => resolve_unknown_target(rt, snapshot, params)?,
-            None => expr::resolve_unknown_key(inner.as_ref(), snapshot, params)?,
-        }
-        if plain_distinct
-            && !sort_expr_in_select_list(
-                inner.as_ref(),
-                &sel.target_list,
-                &select_aliases,
-                &scope,
-                snapshot,
-            )
-        {
+        )?;
+        expr::resolve_unknown_key(inner.as_ref(), snapshot, params)?;
+        if plain_distinct && !sort_expr_in_select_list(inner.as_ref(), &targets, &scope, snapshot) {
             return Err(crate::pgmsg::distinct_order_by_not_in_select_list(
                 crate::error::node_location(inner.as_ref())
                     .and_then(crate::error::SourceSpan::from_node_qname),
@@ -610,24 +620,32 @@ fn analyze_select_here(
             }
             continue;
         }
-        if let Some(rt) = aliased_target(distinct_node.as_ref(), &targets) {
-            unknown_keys.push(Ok(rt));
-        } else if let Some(p) = expr::bare_param(distinct_node.as_ref(), snapshot)
+        if let Some(i) = named_output_column(
+            distinct_node.as_ref(),
+            "DISTINCT ON",
+            &targets,
+            &output_names,
+            &scope,
+            snapshot,
+        )? {
+            if let ExpandedTarget::Expr(rt) = targets[i] {
+                unknown_keys.push(Ok(rt));
+            }
+            continue;
+        }
+        if let Some(p) = expr::bare_param(distinct_node.as_ref(), snapshot)
             && params.bound_arg(p.number).is_none()
             && params.get(p.number) == oid::UNKNOWN
         {
             unknown_keys.push(Err(p));
         }
-        if distinct_node.is_some()
-            && let Err(e) = expr::infer_expr(
+        if distinct_node.is_some() {
+            expr::infer_expr(
                 distinct_node.as_ref(),
                 expr::Ctx::new(&scope, &null_ctx, snapshot),
                 params,
                 TypeGoal::NONE,
-            )
-            && !is_select_alias_reference(distinct_node.as_ref(), &select_aliases, &e)
-        {
-            return Err(e);
+            )?;
         }
     }
     for key in unknown_keys {
@@ -2014,14 +2032,112 @@ fn sql92_key<'a>(
     {
         return Ok(KeyRef::Expr(node));
     }
-    let matches: Vec<usize> = columns
+    let names: Vec<Option<&str>> = columns.iter().map(|c| Some(c.name.as_str())).collect();
+    Ok(
+        match named_output_column(node, clause, targets, &names, scope, snapshot)? {
+            Some(i) => KeyRef::Target(i),
+            None => KeyRef::Expr(node),
+        },
+    )
+}
+
+/// The name of each output column of the expanded target list (`targets`,
+/// `target_list` expanded), as findTargetlistEntrySQL92 matches a bare name
+/// against them: an entry's `resname` ([`target_resname`]), a `*` column's
+/// own name, a `(row).*` field's name (`None` where it doesn't resolve).
+fn output_column_names<'a>(
+    targets: &[ExpandedTarget<'a>],
+    target_list: &[Option<ast::Node>],
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> Vec<Option<std::borrow::Cow<'a, str>>> {
+    use std::borrow::Cow;
+    let mut out = Vec::with_capacity(targets.len());
+    // Each entry contributes the next columns of `targets`: a `(row).*` its
+    // fields, which only resolving it names (its columns carry no location
+    // to tell them apart by).
+    for t in target_list {
+        let Some(ast::Node::ResTarget(rt)) = t.as_ref() else {
+            continue;
+        };
+        if rt.val.is_none() || out.len() >= targets.len() {
+            continue;
+        }
+        let rest = &targets[out.len()..];
+        // `*` / `t.*`: its columns, maybe none.
+        if let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref()
+            && cr
+                .fields
+                .iter()
+                .any(|f| matches!(f.as_ref(), Some(ast::Node::AStar(_))))
+        {
+            out.extend(rest.iter().map_while(|t| match *t {
+                ExpandedTarget::StarColumn {
+                    column: Some((_, name)),
+                    location,
+                } if location == cr.location => Some(Some(Cow::Borrowed(name))),
+                _ => None,
+            }));
+            continue;
+        }
+        let run = rest
+            .iter()
+            .take_while(|t| matches!(t, ExpandedTarget::StarColumn { column: None, .. }))
+            .count();
+        if run == 0 {
+            out.push(Some(Cow::Owned(target_resname(rt))));
+            continue;
+        }
+        let fields = match rt.val.as_ref() {
+            Some(ast::Node::AIndirection(ind)) => {
+                expr::expand_indirection_star(ind, ctx, &mut params.clone())
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        };
+        match fields {
+            Some(fields) if fields.len() <= run => {
+                out.extend(fields.into_iter().map(|(name, _)| Some(Cow::Owned(name))));
+            }
+            _ => out.extend((0..run).map(|_| None)),
+        }
+    }
+    out.resize(targets.len(), None);
+    out
+}
+
+/// findTargetlistEntrySQL92's match of a bare name (an ORDER BY, DISTINCT
+/// ON or GROUP BY key that is a one-field column reference) against the
+/// output columns' `names`, before — for ORDER BY and DISTINCT ON — any
+/// input column: the output column of that name, `{clause} "a" is
+/// ambiguous` (42702) when several of that name have differing
+/// expressions, `None` when none has it (or the key is no bare name).
+fn named_output_column<S: AsRef<str>>(
+    node: Option<&ast::Node>,
+    clause: &str,
+    targets: &[ExpandedTarget<'_>],
+    names: &[Option<S>],
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Result<Option<usize>, AnalyzeError> {
+    let Some(ast::Node::ColumnRef(cr)) = node else {
+        return Ok(None);
+    };
+    let [field] = cr.fields.as_slice() else {
+        return Ok(None);
+    };
+    let Some(ast::Node::String(name)) = field.as_ref() else {
+        return Ok(None);
+    };
+    let matches: Vec<usize> = names
         .iter()
         .enumerate()
-        .filter(|(_, c)| &c.name == name)
+        .filter(|(_, n)| n.as_ref().is_some_and(|n| n.as_ref() == name.sval))
         .map(|(i, _)| i)
         .collect();
     let Some(&first) = matches.first() else {
-        return Ok(KeyRef::Expr(node));
+        return Ok(None);
     };
     let first_expr = target_expr(targets, first);
     for &other in &matches[1..] {
@@ -2034,13 +2150,13 @@ fn sql92_key<'a>(
         if !same {
             return Err(crate::pgmsg::clause_name_ambiguous(
                 clause,
-                name,
+                &name.sval,
                 crate::error::SourceSpan::from_node_qname(cr.location),
             )
             .finalize_implicit());
         }
     }
-    Ok(KeyRef::Target(first))
+    Ok(Some(first))
 }
 
 /// The operator and collation requirements on the sort / group keys of a
@@ -2417,36 +2533,25 @@ pub(crate) fn node_fingerprint(node: Option<&ast::Node>) -> String {
 }
 
 /// PG's SELECT DISTINCT rule: an ORDER BY expression must appear in the
-/// select list — as a structurally equal expression or as a select-list
-/// alias (ordinals are handled by the caller).
+/// select list (findTargetlistEntrySQL99) — equal to one of its expanded
+/// entries, a `*` column included (a key naming an output column, or its
+/// position, is handled by the caller).
 fn sort_expr_in_select_list(
     inner: Option<&ast::Node>,
-    target_list: &[Option<ast::Node>],
-    select_aliases: &std::collections::HashSet<String>,
+    targets: &[ExpandedTarget<'_>],
     scope: &Scope,
     snapshot: &PgCatalog,
 ) -> bool {
-    if let Some(ast::Node::ColumnRef(cr)) = inner {
-        let parts = expr::extract_string_fields(&cr.fields);
-        if let [single] = parts.as_slice()
-            && select_aliases.contains(single)
-        {
-            return true;
-        }
-    }
     // Callers pass a present key.
     let Some(inner) = inner else {
         return false;
     };
     let want = grouping::typed_fingerprint(inner, scope, snapshot);
-    target_list.iter().any(|t| {
-        if let Some(ast::Node::ResTarget(rt)) = t.as_ref()
-            && let Some(val) = &rt.val
-        {
-            grouping::typed_fingerprint(val, scope, snapshot) == want
-        } else {
-            false
-        }
+    (0..targets.len()).any(|i| {
+        target_expr(targets, i).is_some_and(|val| {
+            grouping::typed_fingerprint(&val, scope, snapshot) == want
+                || grouping::same_level_exprs_equal(Some(&val), Some(inner), scope, snapshot)
+        })
     })
 }
 
@@ -2571,28 +2676,6 @@ fn walk_group_clause_node(
     // addTargetToGroupList resolves the key still `unknown` as text,
     // before the next key is transformed.
     expr::resolve_unknown_key(group_node, snapshot, params)
-}
-
-/// The select-list entry an ORDER BY or DISTINCT ON key names by its
-/// output name — a bare name, which findTargetlistEntrySQL92 matches
-/// against the output names before the input columns.
-fn aliased_target<'a>(
-    key: Option<&ast::Node>,
-    targets: &[ExpandedTarget<'a>],
-) -> Option<&'a ast::ResTarget> {
-    let Some(ast::Node::ColumnRef(cr)) = key else {
-        return None;
-    };
-    let [field] = cr.fields.as_slice() else {
-        return None;
-    };
-    let Some(ast::Node::String(name)) = field.as_ref() else {
-        return None;
-    };
-    targets.iter().find_map(|t| match t {
-        ExpandedTarget::Expr(rt) if rt.name == name.sval => Some(*rt),
-        _ => None,
-    })
 }
 
 /// addTargetToSortList / addTargetToGroupList on a key naming a

@@ -6,11 +6,15 @@ use syn::punctuated::Punctuated;
 use syn::{Expr, Ident, LitStr, Token};
 
 use crate::codegen;
-use crate::query_macro::{catalog_for, load_config};
+use crate::query_macro::{catalog_for, load_config, parse_prefixes};
 
-/// `copy_in!([db = name,] executor, "table (columns)", source { field, ... })`.
+/// `copy_in!([db = name,] [role = "role",] executor, "table (columns)",
+/// source { field, ... })`.
 pub struct CopyInInput {
     db_name: Option<Ident>,
+    /// The role the COPY is checked against, replacing the database's
+    /// configured `roles`, as `sql!`'s.
+    role: Option<LitStr>,
     executor: Expr,
     target: LitStr,
     source: Expr,
@@ -20,20 +24,7 @@ pub struct CopyInInput {
 
 impl Parse for CopyInInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let db_name = if input.peek(Ident) && input.peek2(Token![=]) {
-            let ident: Ident = input.fork().parse()?;
-            if ident == "db" {
-                input.parse::<Ident>()?;
-                input.parse::<Token![=]>()?;
-                let name: Ident = input.parse()?;
-                input.parse::<Token![,]>()?;
-                Some(name)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let (db_name, role) = parse_prefixes(input)?;
         let executor: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
         let target: LitStr = input.parse()?;
@@ -67,6 +58,7 @@ impl Parse for CopyInInput {
             syn::parse::Parser::parse2(Punctuated::parse_terminated, group.stream())?;
         Ok(CopyInInput {
             db_name,
+            role,
             executor,
             target,
             source,
@@ -80,9 +72,48 @@ pub fn expand(input: CopyInInput) -> Result<TokenStream, syn::Error> {
     let config = load_config()?;
     let built = catalog_for(&config, input.db_name.as_ref())?;
     let (catalog, resolved) = (&built.catalog, &built.resolved);
-    let target = catalog
-        .analyze_copy_in(&input.target.value())
-        .map_err(|e| syn::Error::new(input.target.span(), built.annotate(e.to_string())))?;
+    // As `sql!`: checked against the call site's role, or the database's
+    // configured ones, each of which must resolve the target to the same
+    // table.
+    let roles: Vec<String> = match &input.role {
+        Some(role) => vec![role.value()],
+        None => resolved.roles().to_vec(),
+    };
+    let target_text = input.target.value();
+    let target = if roles.is_empty() {
+        catalog
+            .analyze_copy_in(&target_text)
+            .map_err(|e| syn::Error::new(input.target.span(), built.annotate(e.to_string())))?
+    } else {
+        let mut first: Option<(String, typedpg_analyzer::AnalyzedCopyIn)> = None;
+        for role in &roles {
+            let analyzed = catalog
+                .analyze_copy_in_as(&target_text, role)
+                .map_err(|e| {
+                    let span = match &input.role {
+                        Some(literal) if !catalog.role_exists(role) => literal.span(),
+                        _ => input.target.span(),
+                    };
+                    syn::Error::new(span, built.annotate(e.to_string()))
+                })?;
+            match &first {
+                None => first = Some((role.clone(), analyzed)),
+                Some((first_role, first)) if first.copy_sql != analyzed.copy_sql => {
+                    return Err(syn::Error::new(
+                        input.target.span(),
+                        format!(
+                            "copy target resolves differently for roles {first_role:?} and \
+                             {role:?}: `{}` for the first and `{}` for the second (the roles' \
+                             search_path settings differ)",
+                            first.copy_sql, analyzed.copy_sql
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        first.expect("at least one role").1
+    };
 
     if input.fields.len() != target.columns.len() {
         let columns: Vec<&str> = target.columns.iter().map(|c| c.name.as_str()).collect();

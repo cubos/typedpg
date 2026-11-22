@@ -75,6 +75,22 @@ fn truncate_check_rel(
         )
         .finalize_implicit());
     }
+    // A foreign table's wrapper must have a handler supporting TRUNCATE.
+    if let Some((wrapper, routine)) = crate::ddl::fdw::table_routine(snapshot, class.oid) {
+        use crate::ddl::fdw::FdwRoutine;
+        let error = match routine {
+            FdwRoutine::NoHandler => Some(AnalyzeError::ObjectNotInPrerequisiteState(
+                crate::ddl::fdw::no_handler_message(&wrapper),
+            )),
+            FdwRoutine::Known(r) if !r.truncate => Some(AnalyzeError::FeatureNotSupported(
+                format!("cannot truncate foreign table \"{}\"", class.relname),
+            )),
+            _ => None,
+        };
+        if let Some(error) = error {
+            return Err(RawError::new(error, None, None).finalize_implicit());
+        }
+    }
     if snapshot.is_system_class(class.oid) {
         return Err(RawError::new(
             AnalyzeError::InsufficientPrivilege(format!(
@@ -405,49 +421,21 @@ pub(super) fn analyze_vacuum(
             continue;
         };
         let class = lookup(rv, snapshot)?;
-        // analyze_rel skips (with a WARNING) what it can't analyze and what
-        // the role may not; do_analyze_rel then checks the column list.
-        if !matches!(
-            class.relkind,
-            RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
-        ) {
-            // A foreign table is analyzed only by a wrapper that can: which
-            // one serves it is the server's.
-            continue;
-        }
-        let mut seen: Vec<i16> = Vec::new();
-        for col in &vrel.va_cols {
-            let Some(name) = crate::ddl::util::node_string(col.as_ref()) else {
-                continue;
+        // analyze_rel checks the column list before the relation's kind
+        // (skipping, with a WARNING, what it can't analyze).
+        use crate::ddl::maintenance::{AnalyzeColumnError, analyze_columns};
+        if let Err(e) = analyze_columns(snapshot, class.oid, &vrel.va_cols) {
+            let error = match e {
+                AnalyzeColumnError::Undefined(msg) => AnalyzeError::UndefinedColumn(msg),
+                AnalyzeColumnError::Duplicate(msg) => AnalyzeError::DuplicateColumn(msg),
             };
-            let attnum = snapshot
-                .attribute_by_name(class.oid, name)
-                .filter(|a| a.attnum > 0)
-                .map(|a| a.attnum);
-            let Some(attnum) = attnum else {
-                return Err(RawError::new(
-                    AnalyzeError::UndefinedColumn(format!(
-                        "column \"{name}\" of relation \"{}\" does not exist",
-                        class.relname
-                    )),
-                    None,
-                    None,
-                )
-                .finalize_implicit());
-            };
-            if seen.contains(&attnum) {
-                return Err(RawError::new(
-                    AnalyzeError::DuplicateColumn(format!(
-                        "column \"{name}\" of relation \"{}\" appears more than once",
-                        class.relname
-                    )),
-                    None,
-                    None,
-                )
-                .finalize_implicit());
-            }
-            seen.push(attnum);
+            return Err(RawError::new(error, None, None).finalize_implicit());
         }
+        // Whether analyze_rel reaches a missing handler depends on the
+        // role running it: checked against it.
+        crate::privileges::note_utility(crate::privileges::UtilityCheck::AnalyzeHandler {
+            relid: class.oid,
+        });
     }
     Ok(())
 }

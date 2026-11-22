@@ -370,17 +370,20 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         actions.push(match when.command_type {
             CmdType::CmdInsert => {
                 // `INSERT (cols) VALUES (…)`, or the leading columns.
-                let names: Vec<String> = if when.target_list.is_empty() {
+                // Each target column, and whether it assigns into the column.
+                let names: Vec<(String, bool)> = if when.target_list.is_empty() {
                     table_attrs
                         .iter()
                         .take(when.values.len())
-                        .map(|a| a.attname.clone())
+                        .map(|a| (a.attname.clone(), false))
                         .collect()
                 } else {
                     when.target_list
                         .iter()
                         .filter_map(|t| match t.as_ref() {
-                            Some(ast::Node::ResTarget(rt)) => Some(rt.name.clone()),
+                            Some(ast::Node::ResTarget(rt)) => {
+                                Some((rt.name.clone(), !rt.indirection.is_empty()))
+                            }
                             _ => None,
                         })
                         .collect()
@@ -390,10 +393,11 @@ pub(crate) fn analyze_merge_with_outer_ctes(
                     assigns: names
                         .into_iter()
                         .zip(&when.values)
-                        .map(|(column, v)| Assign {
+                        .map(|((column, indirected), v)| Assign {
                             column,
-                            default: is_set_to_default(v.as_ref()),
-                            null: is_sql_null_literal(v.as_ref()),
+                            default: !indirected && is_set_to_default(v.as_ref()),
+                            null: !indirected && is_sql_null_literal(v.as_ref()),
+                            indirected,
                         })
                         .collect(),
                     overriding: Overriding::from_kind(when.r#override),
@@ -584,6 +588,9 @@ fn merge_when_insert(
             })
             .collect::<Result<_, _>>()?
     };
+    // transformMergeStmt runs checkInsertTargets over the action's column
+    // list, as transformInsertStmt does.
+    super::assign::check_insert_target_duplicates(&when.target_list)?;
     // OVERRIDING USER VALUE discards the values given for identity columns.
     let discards = |c: &crate::pg_catalog::PgAttribute| {
         Overriding::from_kind(when.r#override) == Overriding::UserValue && c.attidentity.is_some()

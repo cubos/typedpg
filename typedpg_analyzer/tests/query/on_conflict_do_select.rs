@@ -122,3 +122,20 @@ fn exclusion_constraints_cannot_arbitrate() {
         "ON CONFLICT DO SELECT not supported with exclusion constraints"
     );
 }
+
+#[test]
+fn where_clause_names_its_clause_when_not_boolean() {
+    // transformOnConflictClause transforms the DO SELECT / DO UPDATE WHERE
+    // with transformWhereClause, which coerces it as WHERE.
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("INSERT INTO t VALUES (1, 9) ON CONFLICT (id) DO SELECT WHERE 1 RETURNING id"),
+        AnalyzeError::DatatypeMismatch(_),
+        "argument of WHERE must be type boolean, not type integer"
+    );
+    assert_err_prefix!(
+        db.analyze("INSERT INTO t VALUES (1, 9) ON CONFLICT (id) DO UPDATE SET v = 2 WHERE 1"),
+        AnalyzeError::DatatypeMismatch(_),
+        "argument of WHERE must be type boolean, not type integer"
+    );
+}

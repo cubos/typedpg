@@ -487,3 +487,30 @@ fn the_deepest_plpgsql_converts_and_drops_on_a_small_stack() {
         assert_eq!(depth, max, "{open}");
     }
 }
+
+#[test]
+fn option_dump_prints_nothing() {
+    // `#option dump` asks PL/pgSQL's compiler to print the function's tree
+    // to stdout (plpgsql_dumptree) — the stdout of whatever runs the
+    // analyzer. The option is accepted and prints nothing. Checked in a
+    // child process: the test harness captures only what Rust prints.
+    const CHILD: &str = "TYPEDPG_OPTION_DUMP_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        for sql in [
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$\n#option dump\nBEGIN RETURN 1; END $$",
+            "DO $$\n#option dump\nBEGIN NULL; END $$",
+        ] {
+            compile_one(sql);
+        }
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "option_dump_prints_nothing", "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("1 passed"), "{stdout}");
+    assert!(!stdout.contains("Execution tree"), "{stdout}");
+}

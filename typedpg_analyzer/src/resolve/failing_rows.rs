@@ -1,8 +1,13 @@
 //! A NULL cast to a domain that rejects it (`SELECT NULL::d` of a NOT NULL
-//! domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`) that
+//! domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`), or a
+//! constant cast to a domain one of whose CHECKs is FALSE for it (`0::d` of
+//! one with `CHECK (VALUE > 0)`), that
 //! every execution of a statement evaluates: the coercion fails when
 //! evaluated (`ExecEvalConstraintNotNull` / `ExecEvalConstraintCheck`),
-//! naming the domain cast to, so the statement is rejected.
+//! naming the domain cast to, so the statement is rejected. So is a call to
+//! a built-in window function with a null treatment it doesn't take
+//! (`row_number() IGNORE NULLS OVER ()`), which fails for each row the
+//! WindowAgg computes it for.
 //!
 //! A query is followed only where it surely evaluates a row: a select list
 //! over no FROM item (one row, one group if grouped) or over a single
@@ -91,6 +96,7 @@ fn check_rows(
             .or(r.projection)
             .or(r.fail_after.map(|(_, f)| f))
     }) {
+        Some(f) if f.unsupported => Err(AnalyzeError::FeatureNotSupported(f.message)),
         Some(f) => Err(AnalyzeError::Invalid(f.message)),
         None => Ok(()),
     }
@@ -131,6 +137,9 @@ struct Failure {
     /// parallel worker: an Append over it is no Parallel Append, and runs
     /// its children in order.
     domain: bool,
+    /// A feature_not_supported error (SQLSTATE 0A000), not one of the
+    /// codes [`AnalyzeError::Invalid`] stands for.
+    unsupported: bool,
 }
 
 /// The errors reading some of a query's rows surely raises.
@@ -1554,7 +1563,7 @@ impl Level<'_> {
     fn error(&self, n: Option<&ast::Node>) -> Option<Failure> {
         match n? {
             ast::Node::TypeCast(tc) => {
-                if let Some(e) = self.null_cast(tc) {
+                if let Some(e) = self.null_cast(tc).or_else(|| self.check_cast(tc)) {
                     return Some(e);
                 }
                 // A cast evaluates its argument where no cast into the
@@ -1610,6 +1619,11 @@ impl Level<'_> {
                     return Some(f);
                 }
             }
+            ast::Node::FuncCall(fc) => {
+                if let Some(f) = self.null_treatment_error(fc) {
+                    return Some(f);
+                }
+            }
             _ => {}
         }
         if !self.standalone {
@@ -1631,6 +1645,7 @@ impl Level<'_> {
         infer().err().map(|e| Failure {
             message: e.to_string(),
             domain: false,
+            unsupported: false,
         })
     }
 
@@ -1860,6 +1875,79 @@ impl Level<'_> {
         Some(Failure {
             message,
             domain: true,
+            unsupported: false,
+        })
+    }
+
+    /// `0::d` — a non-NULL literal cast to a domain `d` one of whose
+    /// CHECKs is FALSE for it. The planner doesn't fold the CoerceToDomain
+    /// (eval_const_expressions keeps it while the domain has constraints),
+    /// so it fails when evaluated (ExecEvalConstraintCheck), not when
+    /// planned.
+    /// So is `ARRAY[0]::d[]`, whose elements are coerced to `d` one by one
+    /// (see [`array_elements_domain_error`]).
+    fn check_cast(&self, tc: &ast::TypeCast) -> Option<Failure> {
+        let type_name = tc.type_name.as_ref()?;
+        if !type_name.typmods.is_empty() {
+            return None;
+        }
+        let target = crate::ddl::util::resolve_type_name(type_name, self.snapshot)?;
+        let message = match tc.arg.as_ref()? {
+            ast::Node::AArrayExpr(arr) => array_elements_domain_error(arr, target, self.snapshot)?,
+            arg if type_name.array_bounds.is_empty() => {
+                let literal = crate::nonnull::literal(Some(arg))?;
+                self.snapshot
+                    .domain_value_violation_at_execution(target, &literal)?
+            }
+            _ => return None,
+        };
+        Some(Failure {
+            message,
+            domain: true,
+            unsupported: false,
+        })
+    }
+
+    /// A built-in window function that takes no null treatment called with
+    /// one (`row_number() IGNORE NULLS OVER ()`): the WindowAgg calls it for
+    /// each row, and WinCheckAndInitializeNullTreatment rejects every call
+    /// to `window_row_number` … `window_ntile` (PG 19.0 `pg_proc` OIDs
+    /// 3100–3105) made so. No row, no call: over an empty input the query
+    /// succeeds.
+    fn null_treatment_error(&self, fc: &ast::FuncCall) -> Option<Failure> {
+        if fc.over.is_none() || fc.ignore_nulls == 0 {
+            return None;
+        }
+        let parts = expr::extract_string_fields(&fc.funcname);
+        let (schema, name) = match parts.as_slice() {
+            [n] => (None, n.as_str()),
+            [s, n] => (Some(s.as_str()), n.as_str()),
+            _ => return None,
+        };
+        let arg_types: Vec<PgTypeOid> = fc
+            .args
+            .iter()
+            .map(|a| self.type_of(a.as_ref()))
+            .collect::<Option<_>>()?;
+        let notation = crate::functions::CallNotation::of(fc).ok()?;
+        let f = crate::functions::resolve_function(
+            self.snapshot,
+            schema,
+            name,
+            &arg_types,
+            &notation,
+            false,
+            None,
+        )
+        .ok()?;
+        if !(3100..=3105).contains(&f.oid.get()) {
+            return None;
+        }
+        let p = self.snapshot.pg_proc.get(&f.oid)?;
+        Some(Failure {
+            message: format!("function {} does not allow RESPECT/IGNORE NULLS", p.proname),
+            domain: false,
+            unsupported: true,
         })
     }
 
@@ -2537,6 +2625,49 @@ fn keeps_arguments(snapshot: &PgCatalog, p: &crate::pg_catalog::PgProc) -> bool 
 
 /// FirstNormalObjectId (transam.h): below, what initdb made.
 const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+/// The error coercing `ARRAY[…]` `arr` to `target`, an array of a domain,
+/// raises when evaluated: each element is coerced to the domain in turn
+/// (transformArrayExpr pushes a cast down into the elements; array_map
+/// runs an ArrayCoerceExpr over every element, NULLs included), and the
+/// first one the domain surely rejects — a NULL it doesn't allow, a
+/// constant one of its CHECKs is FALSE for — fails. None when an element
+/// before it isn't a constant.
+pub(super) fn array_elements_domain_error(
+    arr: &ast::AArrayExpr,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<String> {
+    let elem = snapshot.pg_type.get(&target)?.typelem?;
+    if snapshot.array_type_of(elem) != Some(target) || snapshot.domain_chain(elem).is_empty() {
+        return None;
+    }
+    fn walk(
+        arr: &ast::AArrayExpr,
+        elem: PgTypeOid,
+        snapshot: &PgCatalog,
+    ) -> Result<(), Option<String>> {
+        for e in arr.elements.iter().map(Option::as_ref) {
+            match e {
+                Some(ast::Node::AArrayExpr(sub)) => walk(sub, elem, snapshot)?,
+                Some(ast::Node::AConst(c)) if c.isnull => {
+                    if let Some(msg) = snapshot.domain_null_violation_at_execution(elem) {
+                        return Err(Some(msg));
+                    }
+                }
+                e => {
+                    let literal = crate::nonnull::literal(e).ok_or(None)?;
+                    if let Some(msg) = snapshot.domain_value_violation_at_execution(elem, &literal)
+                    {
+                        return Err(Some(msg));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    walk(arr, elem, snapshot).err().flatten()
+}
 
 /// Every cast into `target` (its base type, for a domain) is built in, or
 /// needs no function: a cast of a non-NULL constant, folded by the

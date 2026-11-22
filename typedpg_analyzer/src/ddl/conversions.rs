@@ -95,8 +95,13 @@ const ENCODING_NAMES: &[(&str, &str)] = &[
 ];
 
 /// pg_char_to_encoding: the canonical name of the encoding `name` spells
-/// (clean_encoding_name keeps the lowercased alphanumerics).
-fn encoding(name: &str) -> Option<&'static str> {
+/// (clean_encoding_name keeps the lowercased alphanumerics). A name of
+/// NAMEDATALEN (64) bytes or more is none ("it's certainly not in the
+/// table").
+pub(crate) fn encoding(name: &str) -> Option<&'static str> {
+    if name.len() >= 64 {
+        return None;
+    }
     let clean: String = name
         .chars()
         .filter(char::is_ascii_alphanumeric)

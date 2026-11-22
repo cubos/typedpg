@@ -608,7 +608,7 @@ fn base_type_and_typmod(interp: &PgCatalog, typ: PgTypeOid) -> (PgTypeOid, i32) 
 
 /// DomainHasConstraints: a domain in `typ`'s chain carries a CHECK or NOT
 /// NULL constraint.
-fn domain_has_constraints(interp: &PgCatalog, typ: PgTypeOid) -> bool {
+pub(crate) fn domain_has_constraints(interp: &PgCatalog, typ: PgTypeOid) -> bool {
     let mut current = typ;
     while let Some(t) = interp.pg_type.get(&current) {
         if t.typtype != TypType::Domain {
@@ -1021,17 +1021,19 @@ pub(crate) fn set_identity(
             }
         }
         ast::Node::List(list) => {
+            // ATExecSetIdentity: SET GENERATED once.
             let mut found = None;
             for item in &list.items {
                 if let Some(ast::Node::DefElem(de)) = item.as_ref()
                     && de.defname == "generated"
-                    && let Some(ast::Node::Integer(i)) = de.arg.as_ref()
                 {
-                    found = Some(match i.ival as u8 as char {
-                        'a' => AttIdentity::Always,
+                    if found.is_some() {
+                        return Err(DdlError::Parse("conflicting or redundant options".into()));
+                    }
+                    found = Some(match de.arg.as_ref() {
+                        Some(ast::Node::Integer(i)) if i.ival as u8 == b'a' => AttIdentity::Always,
                         _ => AttIdentity::ByDefault,
                     });
-                    break;
                 }
             }
             found

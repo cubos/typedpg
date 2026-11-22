@@ -390,9 +390,10 @@ fn disabled_triggers_of_a_partition_stop_its_foreign_keys() {
         for sql in matched {
             assert_nullable(&db, sql, &[("x", true)]);
         }
+        // Enabling them again checks none of the rows taken in meanwhile.
         db.apply_sql(&disable.replace("DISABLE", "ENABLE")).unwrap();
         for sql in matched {
-            assert_nullable(&db, sql, &[("x", false)]);
+            assert_nullable(&db, sql, &[("x", true)]);
         }
     }
     // A partition of the referenced table losing its triggers loses the

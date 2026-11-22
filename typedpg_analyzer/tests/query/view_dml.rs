@@ -644,3 +644,91 @@ fn where_current_of_on_a_view() {
     }
     assert_ok(&db, "DELETE FROM t WHERE CURRENT OF c");
 }
+
+/// rewriteTargetView maps the view's columns to the base relation's, then
+/// rewriteTargetListIU (process_matched_tle) rejects two assignments to one
+/// base column — here through two view columns exposing `id`.
+#[test]
+fn two_view_columns_of_one_base_column_cannot_both_be_written() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE vb (id int PRIMARY KEY, v int NOT NULL);
+         CREATE TABLE src (id int, v int);
+         CREATE VIEW vd AS SELECT id, id AS id2, v FROM vb;",
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO vd (id, id2, v) VALUES (1, 2, 3)",
+        "UPDATE vd SET id = 1, id2 = 2",
+        "MERGE INTO vd USING src ON src.id = vd.id \
+         WHEN NOT MATCHED THEN INSERT (id, id2, v) VALUES (1, 2, 3)",
+        "MERGE INTO vd USING src ON src.id = vd.id \
+         WHEN MATCHED THEN UPDATE SET id = 1, id2 = 2",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::SyntaxError(_),
+            "multiple assignments to same column \"id\""
+        );
+    }
+    // Writing just one of them is fine.
+    assert_ok(&db, "INSERT INTO vd (id2, v) VALUES (1, 2)");
+    assert_ok(&db, "UPDATE vd SET id2 = 5");
+}
+
+/// The same through ON CONFLICT DO UPDATE and down nested views; assigning
+/// *into* one base column through two view columns merges, as
+/// process_matched_tle merges several such assignments to one column.
+#[test]
+fn two_view_columns_of_one_base_column_through_conflicts_and_nested_views() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE vb (id int PRIMARY KEY, v int NOT NULL, arr int[]);
+         CREATE VIEW vd AS SELECT id, id AS id2, v, arr, arr AS arr2 FROM vb;
+         CREATE VIEW vdd AS SELECT id AS x, id2 AS y, v FROM vd;",
+    )
+    .unwrap();
+    for (sql, column) in [
+        (
+            "INSERT INTO vd (id, v) VALUES (1, 3) ON CONFLICT (id) DO UPDATE SET id = 1, id2 = 2",
+            "id",
+        ),
+        ("INSERT INTO vdd (x, y, v) VALUES (1, 2, 3)", "id"),
+        ("UPDATE vdd SET x = 1, y = 2", "id"),
+        ("UPDATE vd SET arr[1] = 1, arr2 = '{2}'", "arr"),
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::SyntaxError(_),
+            &format!("multiple assignments to same column \"{column}\"")
+        );
+    }
+    assert_ok(&db, "UPDATE vd SET arr[1] = 1, arr2[2] = 2");
+    assert_ok(
+        &db,
+        "INSERT INTO vd (id, v, arr[1], arr2[2]) VALUES (5, 1, 1, 2)",
+    );
+    assert_ok(&db, "INSERT INTO vdd (y, v) VALUES (1, 2)");
+}
+
+/// A MERGE INSERT action's NULL assigned *into* a NOT NULL column
+/// (`arr[1]`) leaves it non-NULL (`{NULL}`), through a view too.
+#[test]
+fn merge_insert_of_null_into_an_element_through_a_view() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE na (id int, arr int[] NOT NULL);
+         CREATE VIEW nav AS SELECT * FROM na;
+         CREATE TABLE src (id int);",
+    )
+    .unwrap();
+    for target in ["na", "nav"] {
+        assert_ok(
+            &db,
+            &format!(
+                "MERGE INTO {target} USING src ON false \
+                 WHEN NOT MATCHED THEN INSERT (id, arr[1]) VALUES (1, NULL)"
+            ),
+        );
+    }
+}

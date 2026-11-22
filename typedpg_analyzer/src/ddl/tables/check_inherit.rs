@@ -65,9 +65,8 @@ impl CheckFlags {
 }
 
 /// An expression kept from the DDL that wrote it: a CHECK constraint, a
-/// column default or generation expression, a statistics expression. Two
-/// compare equal when PG's `equal()` says their parse trees are (source
-/// locations aside), so different spellings of one tree match.
+/// column default or generation expression, a statistics expression. PG
+/// compares two of them on their transformed trees: see [`same_stored`].
 #[derive(Clone, Debug)]
 pub(crate) enum StoredExpr {
     Written(Box<Option<typedpg_pg_query::ast::Node>>),
@@ -79,16 +78,37 @@ impl StoredExpr {
     pub(crate) fn written(expr: Option<&typedpg_pg_query::ast::Node>) -> Self {
         StoredExpr::Written(Box::new(expr.cloned()))
     }
-}
 
-impl PartialEq for StoredExpr {
-    fn eq(&self, other: &Self) -> bool {
+    /// Whether `other` is this expression as written (`equal()` on the
+    /// parse trees, source locations aside): a verbatim copy.
+    pub(crate) fn same_as_written(&self, other: &StoredExpr) -> bool {
         use typedpg_pg_query::Equal;
         match (self, other) {
             (StoredExpr::Written(a), StoredExpr::Written(b)) => a.equal(b),
             (StoredExpr::Serial(r1, a1), StoredExpr::Serial(r2, a2)) => r1 == r2 && a1 == a2,
             _ => false,
         }
+    }
+}
+
+/// Whether two stored expressions, over relations `rel_a` and `rel_b`, are
+/// `equal()` once transformed (see [`crate::ddl::cooked`]) — coerced to
+/// `target` (a column default's type) when given.
+pub(crate) fn same_stored(
+    interp: &PgCatalog,
+    (rel_a, a): (PgClassOid, &StoredExpr),
+    (rel_b, b): (PgClassOid, &StoredExpr),
+    target: Option<PgTypeOid>,
+) -> bool {
+    match (a, b) {
+        (StoredExpr::Written(a), StoredExpr::Written(b)) => crate::ddl::cooked::same_written(
+            interp,
+            (rel_a, (**a).as_ref()),
+            (rel_b, (**b).as_ref()),
+            target,
+        ),
+        (StoredExpr::Serial(r1, a1), StoredExpr::Serial(r2, a2)) => r1 == r2 && a1 == a2,
+        _ => false,
     }
 }
 
@@ -131,9 +151,15 @@ pub(crate) fn recook_checks_reading(interp: &mut PgCatalog, relid: PgClassOid, a
     }
 }
 
-fn same_expr(a: Option<&CheckDef>, b: Option<&CheckDef>) -> bool {
+/// Whether two CHECK constraints, of relations `rel_a` and `rel_b`, have
+/// the same expression (`equal()` on the cooked trees).
+pub(crate) fn same_expr(
+    interp: &PgCatalog,
+    (rel_a, a): (PgClassOid, Option<&CheckDef>),
+    (rel_b, b): (PgClassOid, Option<&CheckDef>),
+) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) => a.expr == b.expr,
+        (Some(a), Some(b)) => same_stored(interp, (rel_a, &a.expr), (rel_b, &b.expr), None),
         // A seeded constraint carries no expression: nothing to compare.
         _ => true,
     }
@@ -227,8 +253,8 @@ fn insert_check(
 
 /// A CHECK constraint the parents give a new table: (name, conkey on the
 /// table, definition, how many parents contribute it, enforced by any of
-/// them).
-type InheritedCheck = (String, Vec<i16>, Option<CheckDef>, i16, bool);
+/// them, the first parent giving it).
+type InheritedCheck = (String, Vec<i16>, Option<CheckDef>, i16, bool, PgClassOid);
 
 /// CREATE TABLE ... INHERITS / PARTITION OF: the parents' inheritable CHECK
 /// constraints, merged by name (MergeCheckConstraint), then merged with the
@@ -261,7 +287,7 @@ pub(super) fn inherit_parent_checks(
             }
             match inherited.iter_mut().find(|e| e.0 == con.conname) {
                 Some(e) => {
-                    if !same_expr(e.2.as_ref(), def.as_ref()) {
+                    if !same_expr(interp, (e.5, e.2.as_ref()), (parent, def.as_ref())) {
                         return Err(DdlError::DuplicateObject(format!(
                             "check constraint name \"{}\" appears multiple times but with \
                              different expressions",
@@ -274,7 +300,7 @@ pub(super) fn inherit_parent_checks(
                 }
                 None => {
                     let conkey = map_conkey(interp, parent, relid, &con.conkey);
-                    inherited.push((con.conname.clone(), conkey, def, 1, con.conenforced));
+                    inherited.push((con.conname.clone(), conkey, def, 1, con.conenforced, parent));
                 }
             }
         }
@@ -282,7 +308,7 @@ pub(super) fn inherit_parent_checks(
 
     let relname = relname_of(interp, relid);
     let partition = is_partition(interp, relid);
-    for (name, conkey, def, count, enforced) in inherited {
+    for (name, conkey, def, count, enforced, parent) in inherited {
         let Some(local) = constraint_named(interp, relid, &name) else {
             insert_check(
                 interp,
@@ -297,7 +323,9 @@ pub(super) fn inherit_parent_checks(
             continue;
         };
         let local_def = interp.check_defs.get(&local.oid);
-        if local.contype != ConType::Check || !same_expr(local_def, def.as_ref()) {
+        if local.contype != ConType::Check
+            || !same_expr(interp, (relid, local_def), (parent, def.as_ref()))
+        {
             return Err(DdlError::DuplicateObject(format!(
                 "constraint \"{name}\" for relation \"{relname}\" already exists"
             )));
@@ -345,8 +373,8 @@ pub(super) fn add_check(
     if let Some(existing) = constraint_named(interp, relid, name) {
         // A local constraint merges only into a purely inherited one.
         let existing_def = interp.check_defs.get(&existing.oid).cloned();
-        let same =
-            existing.contype == ConType::Check && same_expr(existing_def.as_ref(), Some(&def));
+        let same = existing.contype == ConType::Check
+            && same_expr(interp, (relid, existing_def.as_ref()), (relid, Some(&def)));
         if !same || existing.conislocal || is_partition(interp, relid) {
             return Err(DdlError::DuplicateObject(format!(
                 "constraint \"{name}\" for relation \"{relname}\" already exists"
@@ -435,7 +463,9 @@ fn add_inherited_check(
     let relname = relname_of(interp, relid);
     if let Some(existing) = constraint_named(interp, relid, name) {
         let existing_def = interp.check_defs.get(&existing.oid).cloned();
-        if existing.contype != ConType::Check || !same_expr(existing_def.as_ref(), Some(def)) {
+        if existing.contype != ConType::Check
+            || !same_expr(interp, (relid, existing_def.as_ref()), (relid, Some(def)))
+        {
             return Err(DdlError::DuplicateObject(format!(
                 "constraint \"{name}\" for relation \"{relname}\" already exists"
             )));

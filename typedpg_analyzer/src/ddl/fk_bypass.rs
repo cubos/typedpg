@@ -3,6 +3,14 @@
 //! ([`PgCatalog::fk_checks_bypassed`]). Only the foreign-key join removal
 //! (`simplify::fk_join`) reads it, and gives up.
 //!
+//! Nullability inference trusts declared constraints (CLAUDE.md, "Declared
+//! constraints are trusted"), short of what a migration statement itself
+//! does to the checks: `DISABLE TRIGGER ALL` (`ri_triggers_ever_disabled`),
+//! or explicitly setting `session_replication_role` to `replica` — or to a
+//! value it doesn't state — which [`PgCatalog::fk_replica_role_set`]
+//! records ([`sets_replica_role`]). What routines' bodies, catalog writes,
+//! subscriptions or extensions might do is beyond that.
+//!
 //! **Threat model.** The detection covers the ordinary ways a migration
 //! skips foreign-key checks: `session_replication_role`, `DISABLE TRIGGER`
 //! (and replica / always trigger modes), writes to the system catalogs,
@@ -116,6 +124,9 @@ const ROLE: &str = "session_replication_role";
 /// Note what statement `stmt` (the one being applied, whose text is
 /// [`PgCatalog::statement_sql`]) does to foreign-key checks.
 pub(crate) fn note(db: &mut PgCatalog, stmt: &ast::Node) {
+    if !db.fk_replica_role_set && sets_replica_role(stmt) {
+        db.fk_replica_role_set = true;
+    }
     if db.fk_checks_bypassed {
         return;
     }
@@ -128,6 +139,75 @@ pub(crate) fn note(db: &mut PgCatalog, stmt: &ast::Node) {
     if forms.iter().any(|t| markers.iter().any(|m| t.contains(m))) || bypasses(stmt) {
         db.fk_checks_bypassed = true;
     }
+}
+
+/// Whether migration statement `stmt` explicitly sets
+/// `session_replication_role` to `replica`, under which no RI trigger
+/// fires (an `ENABLE TRIGGER`'s trigger fires in `origin` and `local`
+/// mode only, `TriggerEnabled` in trigger.c), or to a value it doesn't
+/// state: `SET [LOCAL]`, `ALTER ROLE / DATABASE / SYSTEM ... SET`, a
+/// routine's `SET` clause (not its body), or a `set_config` call the
+/// statement runs (`SELECT`, DML, `CALL`, ...; not one a view, default or
+/// routine stores) whose setting name is that one or not a constant.
+fn sets_replica_role(stmt: &ast::Node) -> bool {
+    // A constant other than `origin` or `local` (which the setting
+    // rejects, failing the statement, unless it is `replica`).
+    let replica = |n: Option<&ast::Node>| match n {
+        Some(ast::Node::AConst(c)) => match &c.val {
+            Some(ast::AConstValue::String(s)) => {
+                !s.sval.eq_ignore_ascii_case("origin") && !s.sval.eq_ignore_ascii_case("local")
+            }
+            _ => !c.isnull,
+        },
+        _ => true,
+    };
+    let set_stmt = |v: &ast::VariableSetStmt| {
+        v.name.eq_ignore_ascii_case(ROLE)
+            && v.kind == ast::VariableSetKind::VarSetValue
+            && v.args.iter().any(|a| replica(a.as_ref()))
+    };
+    let runs_now = matches!(
+        stmt,
+        ast::Node::SelectStmt(_)
+            | ast::Node::InsertStmt(_)
+            | ast::Node::UpdateStmt(_)
+            | ast::Node::DeleteStmt(_)
+            | ast::Node::MergeStmt(_)
+            | ast::Node::CallStmt(_)
+            | ast::Node::ExplainStmt(_)
+            | ast::Node::CreateTableAsStmt(_)
+            | ast::Node::PrepareStmt(_)
+            | ast::Node::ExecuteStmt(_)
+            | ast::Node::CopyStmt(_)
+    );
+    if let ast::Node::CreateFunctionStmt(f) = stmt {
+        return f.options.iter().any(|o| {
+            matches!(o.as_ref(), Some(ast::Node::DefElem(d))
+                if d.defname == "set"
+                    && matches!(d.arg.as_ref(), Some(ast::Node::VariableSetStmt(v)) if set_stmt(v)))
+        });
+    }
+    stmt.nodes().any(|(n, _)| match n {
+        NodeRef::VariableSetStmt(v) => set_stmt(v),
+        NodeRef::FuncCall(fc) if runs_now => {
+            let name: Vec<&str> = fc
+                .funcname
+                .iter()
+                .filter_map(|n| super::util::node_string(n.as_ref()))
+                .collect();
+            matches!(
+                name.as_slice(),
+                ["set_config"] | ["pg_catalog", "set_config"]
+            ) && match fc.args.first().and_then(|a| a.as_ref()) {
+                Some(ast::Node::AConst(c)) => matches!(
+                    &c.val,
+                    Some(ast::AConstValue::String(s)) if s.sval.trim().eq_ignore_ascii_case(ROLE)
+                ),
+                _ => true,
+            } && replica(fc.args.get(1).and_then(|a| a.as_ref()))
+        }
+        _ => false,
+    })
 }
 
 /// The statement's text with every decoded identifier, setting name and

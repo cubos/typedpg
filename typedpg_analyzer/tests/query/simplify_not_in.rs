@@ -496,8 +496,8 @@ fn foreign_tables_in_a_tree_are_not_trusted() {
     // or an inheritance child of a table that has one.
     let mut db = setup();
     db.apply_sql(
-        "CREATE FOREIGN DATA WRAPPER dummy;
-         CREATE SERVER nowhere FOREIGN DATA WRAPPER dummy;
+        "CREATE EXTENSION postgres_fdw;
+         CREATE SERVER nowhere FOREIGN DATA WRAPPER postgres_fdw;
          CREATE TABLE pt (id int NOT NULL, n int NOT NULL) PARTITION BY LIST (id);
          CREATE FOREIGN TABLE pt1 PARTITION OF pt FOR VALUES IN (1) SERVER nowhere;
          CREATE TABLE ip (n int NOT NULL);

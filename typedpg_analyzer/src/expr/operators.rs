@@ -346,9 +346,15 @@ fn handle_between(
         ],
     };
     let mut nullable = false;
+    let mut ops = Vec::new();
     for &(op, bound) in comparisons {
-        let t = infer_synthetic_op(op, a.as_ref(), bound, expr.location, ctx, params)?;
+        let (t, resolved) =
+            infer_synthetic_op_resolved(op, a.as_ref(), bound, expr.location, ctx, params)?;
         nullable |= t.nullable;
+        ops.push(resolved);
+    }
+    if let Some(ops) = ops.into_iter().collect::<Option<Vec<_>>>() {
+        ctx.note_cooked_between(expr, ops);
     }
     Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
 }
@@ -390,6 +396,11 @@ fn handle_in_list(
 
     let nonvars: Vec<usize> = (0..items.len()).filter(|&i| !items[i].2).collect();
     let mut folded = vec![false; items.len()];
+    // What the list became, for [`Ctx::cooking`]: the folded `= ANY`, then
+    // each remaining item's comparison (`None`: a row comparison, or an
+    // operator not recorded).
+    let mut fold = None;
+    let mut comparisons = Vec::new();
     if nonvars.len() > 1 {
         let mut all = vec![left.type_oid];
         all.extend(nonvars.iter().map(|&i| items[i].1.type_oid));
@@ -422,6 +433,7 @@ fn handle_in_list(
                 left.type_oid
             };
             if let Some(o) = snapshot.find_operator(op, Some(left_oid), common) {
+                fold = Some((o.oid, common));
                 nullable |= operator_call_nullable(snapshot, op, &o, Some(left_oid), common);
                 // The folded `a op ANY(ARRAY[…])` is a `ScalarArrayOpExpr`
                 // whose comparison function runs while planning when `a` is
@@ -476,16 +488,25 @@ fn handle_in_list(
             let r = row_expr_node(item_args, item_location);
             nullable |= infer_synthetic_op(op, l.as_ref(), r.as_ref(), expr.location, ctx, params)?
                 .nullable;
+            comparisons.push(None);
             continue;
         }
         // Each remaining comparison is an operator call: NULL-able when it
         // can yield NULL (on top of its operands being so).
         let Some(p) = untyped_param else {
-            nullable |=
-                infer_synthetic_op(op, a.as_ref(), item.as_ref(), expr.location, ctx, params)?
-                    .nullable;
+            let (t, resolved) = infer_synthetic_op_resolved(
+                op,
+                a.as_ref(),
+                item.as_ref(),
+                expr.location,
+                ctx,
+                params,
+            )?;
+            nullable |= t.nullable;
+            comparisons.push(resolved.map(|o| (i, o)));
             continue;
         };
+        comparisons.push(None);
         let (r, deduced) = params.with_param_untyped(p.number, |scratch| {
             infer_synthetic_op(op, a.as_ref(), item.as_ref(), expr.location, ctx, scratch)
         });
@@ -501,6 +522,11 @@ fn handle_in_list(
                 ctx.snapshot,
             ));
         }
+    }
+    if let Some(comparisons) = comparisons.into_iter().collect::<Option<Vec<_>>>()
+        && folded.iter().any(|&f| f) == fold.is_some()
+    {
+        ctx.note_cooked_in_list(expr, fold, comparisons);
     }
     Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
 }
@@ -632,6 +658,19 @@ pub(crate) fn infer_synthetic_op(
     ctx: Ctx<'_>,
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
+    Ok(infer_synthetic_op_resolved(op, l, r, location, ctx, params)?.0)
+}
+
+/// [`infer_synthetic_op`], with the operator it resolved to when the
+/// context records it ([`Ctx::cooking`]).
+fn infer_synthetic_op_resolved(
+    op: &str,
+    l: Option<&ast::Node>,
+    r: Option<&ast::Node>,
+    location: i32,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+) -> Result<(ExprType, Option<crate::oid::PgOperatorOid>), AnalyzeError> {
     let e = ast::AExpr {
         kind: ast::AExprKind::AexprOp,
         name: vec![Some(ast::Node::String(NodeBox::new(ast::String {
@@ -644,7 +683,8 @@ pub(crate) fn infer_synthetic_op(
         rexpr_list_end: -1,
         location,
     };
-    infer_a_expr(&e, ctx, params)
+    let t = infer_a_expr(&e, ctx, params)?;
+    Ok((t, ctx.cook_log.and_then(|log| log.take_operator(&e))))
 }
 
 /// Resolve `l op r` as PG's `make_op` does on already-transformed operands:
@@ -793,6 +833,7 @@ fn handle_any_all(
         let op = match snapshot.find_operator_detailed(&op_name, Some(left_oid), rtype) {
             crate::lookup::OperatorMatch::Found(op) => {
                 crate::ddl::policies::note_operator_ref(expr.location, op.oid);
+                ctx.note_cooked_operator(expr, op.oid);
                 op
             }
             crate::lookup::OperatorMatch::NotFound => {
@@ -1260,6 +1301,7 @@ fn infer_generic_binary_op(
     match matched {
         crate::lookup::OperatorMatch::Found(op) => {
             crate::ddl::policies::note_operator_ref(expr.location, op.oid);
+            ctx.note_cooked_operator(expr, op.oid);
             ctx.note_proc(op.code);
             // The operator is a call of its function, which the executor
             // initializes like a `FuncExpr`'s — and a STRICT one with a

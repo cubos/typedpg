@@ -274,6 +274,29 @@ pub(crate) fn process_from_item(
                     aliased: rv.alias.is_some(),
                 },
             )?;
+            // A foreign table the planner plans (the relation, or an
+            // inheritor it expands): get_relation_info opens its wrapper's
+            // routine (GetFdwRoutineForRelation), which fails when the
+            // wrapper has no handler — however few rows the scan would
+            // read. Not recorded for a rule's actions, planned with the
+            // statements firing it: the wrapper may get a handler by then.
+            if crate::expr::plan_time_checks()
+                && !super::rewrite::collecting_rule_actions()
+                && let Some(class) = snapshot.resolve_table(schema, &rv.relname)
+                && let Some(msg) =
+                    crate::ddl::fdw::scan_no_handler_error(snapshot, class.oid, rv.inh)
+                && let Some(e) = crate::expr::plan_time_error(
+                    Some(rv.location),
+                    crate::error::RawError::new(
+                        AnalyzeError::ObjectNotInPrerequisiteState(msg),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit(),
+                )
+            {
+                return Err(e);
+            }
             // A view the planner pulls up raises what its query does, like
             // a FROM subquery (see `deferred`).
             if crate::expr::plan_time_checks()
@@ -494,12 +517,17 @@ pub(crate) fn process_from_item(
 
                 // Every row of a table satisfies its CHECK constraints
                 // (named by the table's own column names: not with an
-                // alias list renaming them).
+                // alias list renaming them). A foreign table's are not
+                // enforced, but the planner trusts them (constraint
+                // exclusion, relation_excluded_by_constraints), and so do
+                // we.
                 let renamed = rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty());
                 if !renamed
                     && matches!(
                         class.relkind,
-                        crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+                        crate::pg_catalog::RelKind::Table
+                            | crate::pg_catalog::RelKind::Partitioned
+                            | crate::pg_catalog::RelKind::ForeignTable
                     )
                     && let Some(checks) =
                         crate::nonnull::checks::RelationChecks::of(snapshot, class.oid)

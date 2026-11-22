@@ -866,6 +866,32 @@ fn ambiguous_output_column_name_in_sort_and_group_clauses() {
     assert!(matches!(err, AnalyzeError::GroupingError(_)), "{err:?}");
 }
 
+/// findTargetlistEntrySQL92: a bare ORDER BY / DISTINCT ON name is looked
+/// up among the output columns *first* — whatever their origin (a plain
+/// column reference, a `t.*` expansion), not only `AS` aliases — and only
+/// falls back to the FROM scope when no output column has it. So a name
+/// two FROM items share is fine when the select list projects it once,
+/// and is `ORDER BY "id" is ambiguous` (not `column reference … is
+/// ambiguous`) when it projects it twice from different columns.
+#[test]
+fn sort_keys_match_unaliased_output_columns_before_from_scope() {
+    let db = setup();
+    for sql in [
+        "SELECT u.id FROM t, u ORDER BY id",
+        "SELECT t.* FROM t, u ORDER BY id",
+        "SELECT DISTINCT ON (id) u.id FROM t, u",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "SELECT t.id, u.id FROM t, u ORDER BY id",
+        "SELECT * FROM t, u ORDER BY id",
+    ] {
+        let err = assert_err_prefix(&db, sql, "ORDER BY \"id\" is ambiguous");
+        assert!(matches!(err, AnalyzeError::AmbiguousColumn(_)), "{err:?}");
+    }
+}
+
 /// transformLimitClause: WITH TIES needs a row count — a NULL constant is
 /// 2201W.
 #[test]
@@ -993,6 +1019,25 @@ fn sort_and_group_keys_need_ordering_and_equality_operators() {
         "SELECT DISTINCT x FROM tj",
         "SELECT id FROM tj ORDER BY p <-> point '(0,0)'",
         "SELECT DISTINCT ROW(id, p) FROM tj",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// An output column a `(row).*` contributes is named after its field, and
+/// one a `t.*` contributes is in the select list for SELECT DISTINCT's
+/// ORDER BY (findTargetlistEntrySQL99 compares it with the expanded
+/// entries); PG 19.0 runs each query.
+#[test]
+fn sort_keys_match_columns_stars_contribute() {
+    let mut db = setup();
+    db.apply_sql("CREATE TYPE pair AS (f1 int, f2 int);")
+        .unwrap();
+    for sql in [
+        "SELECT (r).* FROM (SELECT ROW(1, 2)::pair AS r) q ORDER BY f1",
+        "SELECT DISTINCT ON (f2) (r).* FROM (SELECT ROW(1, 2)::pair AS r) q",
+        "SELECT DISTINCT t.* FROM t ORDER BY t.id",
+        "SELECT DISTINCT t.* FROM t, u ORDER BY id",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

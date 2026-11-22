@@ -502,7 +502,17 @@ fn inherited_columns(
                 if let Some(this_default) = parent_default {
                     match existing.inherited_default.as_ref() {
                         None => existing.inherited_default = Some(this_default),
-                        Some(prev) if *prev != this_default => existing.bogus_default = true,
+                        // MergeAttributes compares the cooked defaults.
+                        Some(prev)
+                            if !super::check_inherit::same_stored(
+                                interp,
+                                (parent, prev),
+                                (parent, &this_default),
+                                Some(attr.atttypid),
+                            ) =>
+                        {
+                            existing.bogus_default = true
+                        }
                         Some(_) => {}
                     }
                 }

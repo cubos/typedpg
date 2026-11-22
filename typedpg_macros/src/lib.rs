@@ -461,7 +461,10 @@ pub fn embed_migrations(input: proc_macro::TokenStream) -> proc_macro::TokenStre
 /// - It evaluates to a future of the number of rows copied. On error the
 ///   COPY is aborted and no row is kept.
 ///
-/// Accepts the same `db = name,` prefix as [`sql!`].
+/// Accepts the same `db = name,` and `role = "role",` prefixes as
+/// [`sql!`], and is checked against the roles as a statement is: INSERT on
+/// the columns, the defaults and INSERT triggers the COPY runs, and no
+/// row-level security on the table (PostgreSQL refuses `COPY FROM` there).
 #[proc_macro]
 pub fn copy_in(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as copy_in_macro::CopyInInput);

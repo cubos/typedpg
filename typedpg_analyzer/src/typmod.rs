@@ -466,12 +466,27 @@ fn assignment_error_here(
     if let Some(e) = crate::fold::conversion_error(value, type_oid, typmod, snapshot) {
         return Some(e.raw(span()).finalize_implicit());
     }
+    // coerce_to_domain applies the base type's typmod (the domain's
+    // typtypmod) with the base type's length coercion function, under the
+    // same coercion context: a domain over `varchar(3)` fails like a
+    // `varchar(3)` column.
+    let base = snapshot.unwrap_domain(type_oid);
+    let typmod = if base == type_oid {
+        typmod
+    } else {
+        snapshot.effective_typmod(type_oid, None)
+    };
+    let type_oid = base;
     match decode(snapshot, type_oid, typmod) {
         DecodedTypmod::Length(_)
             if matches!(type_oid, builtin_oid::VARCHAR | builtin_oid::BPCHAR) =>
         {
             let s = assigned_string(value, snapshot)?;
             char_length_violation(snapshot, type_oid, typmod, s).map(AnalyzeError::Invalid)
+        }
+        DecodedTypmod::Length(n) if matches!(type_oid, BIT | VARBIT) => {
+            let len = assigned_bit_length(value)?;
+            bit_length_violation(type_oid == BIT, n, len).map(AnalyzeError::Invalid)
         }
         DecodedTypmod::VectorDim(n) => {
             let count = vector_literal_dim_count(value)?;
@@ -484,6 +499,47 @@ fn assignment_error_here(
             }
         }
         _ => None,
+    }
+}
+
+const BIT: PgTypeOid = PgTypeOid::from_raw(1560);
+const VARBIT: PgTypeOid = PgTypeOid::from_raw(1562);
+
+/// The length in bits of the bit string constant `node` assigns: a `B'…'`
+/// / `X'…'` constant, or an untyped literal read by `bit_in` (a `b` / `x`
+/// prefix selects binary / hexadecimal, four bits per hex digit). Not a
+/// cast, which may have truncated or padded it already.
+fn assigned_bit_length(node: Option<&Node>) -> Option<usize> {
+    let ast::Node::AConst(c) = node? else {
+        return None;
+    };
+    let text = match c.val.as_ref()? {
+        typedpg_pg_query::ast::AConstValue::BitString(b) => b.bsval.as_str(),
+        typedpg_pg_query::ast::AConstValue::String(s) => s.sval.as_str(),
+        _ => return None,
+    };
+    crate::literal_input::validate_bit(text).ok()?;
+    Some(match text.as_bytes().first() {
+        Some(b'b' | b'B') => text.len() - 1,
+        Some(b'x' | b'X') => (text.len() - 1) * 4,
+        _ => text.len(),
+    })
+}
+
+/// The implicit (assignment) length coercion of `bit(n)` / `varbit(n)`
+/// (varbit.c's `bit` and `varbit` functions, `isExplicit` false): a
+/// `bit(n)` value must be exactly `n` bits long, a `varbit(n)` one at most
+/// `n`. (An explicit cast pads or truncates instead.)
+fn bit_length_violation(fixed: bool, n: i32, len: usize) -> Option<String> {
+    let n_len = usize::try_from(n).ok()?;
+    if fixed && len != n_len {
+        Some(format!(
+            "bit string length {len} does not match type bit({n})"
+        ))
+    } else if !fixed && len > n_len {
+        Some(format!("bit string too long for type bit varying({n})"))
+    } else {
+        None
     }
 }
 

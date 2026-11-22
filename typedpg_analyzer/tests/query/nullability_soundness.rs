@@ -92,9 +92,13 @@ fn disabled_triggers_stop_enforcing_foreign_keys() {
     .unwrap();
     let q = "SELECT a.v FROM b LEFT JOIN a ON a.id = b.a_id";
     assert_eq!(nullable(&db, q), [true]);
+    // Enabling them again checks none of the rows written meanwhile.
     db.apply_sql("ALTER TABLE b ENABLE TRIGGER ALL;").unwrap();
-    assert_eq!(nullable(&db, q), [false]);
+    assert_eq!(nullable(&db, q), [true]);
     // The parent's triggers enforce its side (a referenced row can't go).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(PARENT_CHILD).unwrap();
+    assert_eq!(nullable(&db, q), [false]);
     db.apply_sql("ALTER TABLE a DISABLE TRIGGER ALL;").unwrap();
     assert_eq!(nullable(&db, q), [true]);
 }
@@ -328,4 +332,159 @@ fn a_strict_sql_operator_can_still_return_null() {
     )
     .unwrap();
     assert_eq!(nullable(&db, "SELECT a %% a AS v FROM t"), [true]);
+}
+
+#[test]
+fn rows_written_while_triggers_were_disabled_stay_unchecked() {
+    // Re-enabling the triggers doesn't check the rows written meanwhile:
+    // PG 19.0 returns (NULL) for both queries.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(&format!(
+        "{PARENT_CHILD}
+         ALTER TABLE b DISABLE TRIGGER ALL;
+         INSERT INTO b VALUES (1, 999, 1);
+         ALTER TABLE b ENABLE TRIGGER ALL;"
+    ))
+    .unwrap();
+    assert_eq!(
+        nullable(&db, "SELECT a.v FROM b LEFT JOIN a ON a.id = b.a_id"),
+        [true]
+    );
+    assert_eq!(
+        nullable(&db, "SELECT (SELECT a.v FROM a WHERE a.id = b.a_id) FROM b"),
+        [true]
+    );
+}
+
+#[test]
+fn a_materialized_view_keeps_its_rows_until_refreshed() {
+    // A matview stores the rows its query returned at CREATE / REFRESH
+    // time: a NOT NULL set on the base table afterwards (once its NULLs
+    // were updated away) says nothing of them. On PG 19.0, with a row
+    // (1, NULL) in t before the matview is created, `SELECT a FROM mv`
+    // returns NULL.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, a int);
+         CREATE MATERIALIZED VIEW mv AS SELECT id, a FROM t;
+         UPDATE t SET a = 0 WHERE a IS NULL;
+         ALTER TABLE t ALTER COLUMN a SET NOT NULL;",
+    )
+    .unwrap();
+    assert_eq!(nullable(&db, "SELECT a FROM mv"), [true]);
+}
+
+#[test]
+fn rows_written_under_replica_role_stay_unchecked() {
+    // `session_replication_role = replica` fires no RI trigger: PG 19.0
+    // returns (NULL) for the orphan row written meanwhile.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(&format!(
+        "{PARENT_CHILD}
+         SET session_replication_role = replica;
+         INSERT INTO b VALUES (1, 999, 1);
+         RESET session_replication_role;"
+    ))
+    .unwrap();
+    assert_eq!(
+        nullable(&db, "SELECT a.v FROM b LEFT JOIN a ON a.id = b.a_id"),
+        [true]
+    );
+    // Any way a migration sets it to `replica`, or to a value it doesn't
+    // state. (Not mirrored on the oracle: the setting would outlive the
+    // test — on its connection, its role, its cluster's database.)
+    for setting in [
+        "SET LOCAL session_replication_role = 'replica';",
+        "SELECT set_config('session_replication_role', 'replica', false);",
+        "SELECT set_config('session_replication_role', v, false) FROM (VALUES ('origin')) s (v);",
+        "SELECT set_config(n, 'replica', false) FROM (VALUES ('x.y')) s (n);",
+        "ALTER DATABASE appdb SET session_replication_role = replica;",
+        "CREATE ROLE app; ALTER ROLE app SET session_replication_role = replica;",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+         SET session_replication_role = replica AS 'SELECT 1';",
+        "CREATE PROCEDURE pr() LANGUAGE sql AS 'SELECT 1'; \
+         ALTER PROCEDURE pr() SET session_replication_role = replica;",
+    ] {
+        let mut db = PgCatalog::new().unwrap();
+        db.skip_pg_sanity();
+        db.apply_sql(&format!("{PARENT_CHILD} {setting}")).unwrap();
+        assert_eq!(
+            nullable(&db, "SELECT a.v FROM b LEFT JOIN a ON a.id = b.a_id"),
+            [true],
+            "{setting}"
+        );
+    }
+    // Setting it to `origin` or `local`, RI triggers fire.
+    for setting in [
+        "SET session_replication_role = origin;",
+        "SET session_replication_role = local;",
+        "SELECT set_config('session_replication_role', 'origin', false);",
+    ] {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(&format!("{PARENT_CHILD} {setting}")).unwrap();
+        assert_eq!(
+            nullable(&db, "SELECT a.v FROM b LEFT JOIN a ON a.id = b.a_id"),
+            [false],
+            "{setting}"
+        );
+    }
+}
+
+/// What a routine's body might do to the checks — dynamic SQL, `DISABLE
+/// TRIGGER`, a catalog write — doesn't void a foreign key for nullability
+/// (declared constraints are trusted), while the foreign-key join removal,
+/// which would return wrong rows, still gives up.
+#[test]
+fn a_routine_body_that_may_turn_checks_off_leaves_the_foreign_key_trusted() {
+    for routine in [
+        "CREATE FUNCTION off() RETURNS void LANGUAGE plpgsql AS $$ \
+         BEGIN IF false THEN EXECUTE 'ALTER TABLE b DISABLE TRIGGER ALL'; END IF; END $$;",
+        "DO $$ BEGIN IF false THEN EXECUTE 'SET session_replication_role = replica'; \
+         END IF; END $$;",
+        "CREATE FUNCTION n() RETURNS bigint LANGUAGE sql \
+         BEGIN ATOMIC SELECT count(*) FROM pg_catalog.pg_constraint; END;",
+    ] {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(&format!("{PARENT_CHILD} {routine}")).unwrap();
+        assert_eq!(
+            nullable(&db, "SELECT a.v FROM b LEFT JOIN a ON a.id = b.a_id"),
+            [false],
+            "{routine}"
+        );
+        let join = db
+            .analyze("SELECT b.id FROM b JOIN a ON a.id = b.a_id")
+            .unwrap();
+        assert!(join.simplifications.is_empty(), "{routine}");
+    }
+    // Without it, the join is dropped.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(PARENT_CHILD).unwrap();
+    let join = db
+        .analyze("SELECT b.id FROM b JOIN a ON a.id = b.a_id")
+        .unwrap();
+    assert!(!join.simplifications.is_empty());
+}
+
+#[test]
+fn refreshing_a_materialized_view_stores_rows_of_its_query_as_it_stands() {
+    // REFRESH replaces the rows: on PG 19.0 `SELECT a FROM mv` returns 0
+    // after it. A relaxed base column reaches the matview at once (the
+    // application may refresh it at any time), and views over it follow.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id int PRIMARY KEY, a int);
+         CREATE MATERIALIZED VIEW mv AS SELECT id, a FROM t;
+         CREATE VIEW v AS SELECT a FROM mv;
+         UPDATE t SET a = 0 WHERE a IS NULL;
+         ALTER TABLE t ALTER COLUMN a SET NOT NULL;",
+    )
+    .unwrap();
+    assert_eq!(nullable(&db, "SELECT a FROM v"), [true]);
+    db.apply_sql("REFRESH MATERIALIZED VIEW mv;").unwrap();
+    assert_eq!(nullable(&db, "SELECT a FROM mv"), [false]);
+    assert_eq!(nullable(&db, "SELECT a FROM v"), [false]);
+    db.apply_sql("ALTER TABLE t ALTER COLUMN a DROP NOT NULL;")
+        .unwrap();
+    assert_eq!(nullable(&db, "SELECT a FROM mv"), [true]);
+    assert_eq!(nullable(&db, "SELECT a FROM v"), [true]);
 }

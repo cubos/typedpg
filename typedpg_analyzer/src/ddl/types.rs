@@ -282,6 +282,9 @@ pub(crate) struct DomainConstraint {
     /// A CHECK's expression as written, which `expression_planner` folds
     /// before it runs (a dead CASE branch needs no EXECUTE).
     pub(crate) expr: Option<crate::ddl::tables::check_inherit::StoredExpr>,
+    /// What a CHECK's operators and functions resolved to when it was
+    /// created (PG keeps them by OID).
+    pub(crate) trusted: Option<crate::nonnull::TrustedNodes>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,6 +311,7 @@ fn add_domain_constraint(
     let mut finite = false;
     let mut allowed = None;
     let mut expr = None;
+    let mut trusted = None;
     let kind = match c.contype {
         ConstrType::ConstrNotnull => {
             rejects_null = true;
@@ -323,6 +327,7 @@ fn add_domain_constraint(
                     checked.finite,
                     checked.allowed,
                 );
+                trusted = Some(checked.trusted);
                 expr = Some(crate::ddl::tables::check_inherit::StoredExpr::written(
                     Some(raw),
                 ));
@@ -377,6 +382,7 @@ fn add_domain_constraint(
         finite,
         allowed,
         expr,
+        trusted,
     });
     Ok(())
 }
@@ -419,6 +425,8 @@ struct DomainCheck {
     /// The values and bounds it allows `VALUE` (see
     /// [`crate::nonnull::checks::allowed_values`]).
     allowed: Option<crate::refine::Refinement>,
+    /// What its operators and functions resolved to.
+    trusted: crate::nonnull::TrustedNodes,
 }
 
 /// A domain CHECK expression sees `VALUE` as a value of the base type and
@@ -515,13 +523,9 @@ fn check_domain_check_expression(
         .iter()
         .any(|c| c == "value");
     let collation = interp.pg_type.get(&base_type).and_then(|t| t.typcollation);
+    let trusted = log.trusted();
     let allowed = crate::nonnull::checks::allowed_values(
-        expr,
-        "value",
-        base_type,
-        collation,
-        interp,
-        &log.trusted(),
+        expr, "value", base_type, collation, interp, &trusted,
     );
     Ok(DomainCheck {
         refs,
@@ -529,6 +533,7 @@ fn check_domain_check_expression(
         null_free_elements,
         finite,
         allowed,
+        trusted,
     })
 }
 
@@ -1361,43 +1366,48 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
         )));
     }
 
+    // AddEnumLabel: `labels` is ordered by enumsortorder.
     let new_sortorder = if stmt.new_val_neighbor.is_empty() {
-        labels
+        // The end of the list: one more than the last member, or 1.
+        labels.last().map_or(1.0, |e| e.enumsortorder + 1.0)
+    } else {
+        let Some(nbr_index) = labels
             .iter()
-            .map(|e| e.enumsortorder)
-            .fold(0.0_f32, f32::max)
-            + 1.0
-    } else if let Some(neighbor) = labels.iter().find(|e| e.enumlabel == stmt.new_val_neighbor) {
-        let neighbor_order = neighbor.enumsortorder;
-        if stmt.new_val_is_after {
-            // Insert immediately after: midpoint with the next-higher
-            // sortorder, or neighbor + 1 if neighbor is last.
-            let next = labels
-                .iter()
-                .filter(|e| e.enumsortorder > neighbor_order)
-                .map(|e| e.enumsortorder)
-                .fold(f32::INFINITY, f32::min);
-            if next.is_finite() {
-                (neighbor_order + next) / 2.0
-            } else {
-                neighbor_order + 1.0
-            }
+            .position(|e| e.enumlabel == stmt.new_val_neighbor)
+        else {
+            return Err(not_a_label(&stmt.new_val_neighbor));
+        };
+        let other_nbr_index = if stmt.new_val_is_after {
+            nbr_index.checked_add(1)
         } else {
-            // Insert immediately before: midpoint with the previous-lower
-            // sortorder, or neighbor - 1 if neighbor is first.
-            let prev = labels
-                .iter()
-                .filter(|e| e.enumsortorder < neighbor_order)
-                .map(|e| e.enumsortorder)
-                .fold(f32::NEG_INFINITY, f32::max);
-            if prev.is_finite() {
-                (neighbor_order + prev) / 2.0
-            } else {
-                neighbor_order - 1.0
+            nbr_index.checked_sub(1)
+        };
+        match other_nbr_index.filter(|&i| i < labels.len()) {
+            None if stmt.new_val_is_after => labels[nbr_index].enumsortorder + 1.0,
+            None => labels[nbr_index].enumsortorder - 1.0,
+            Some(other_nbr_index) => {
+                // Halfway between the neighbours, in float4: when that
+                // rounds to one of them, PG renumbers the members 1..n
+                // (RenumberEnumType) and computes the midpoint again.
+                let midpoint = |labels: &[PgEnum]| {
+                    let (a, b) = (
+                        labels[nbr_index].enumsortorder,
+                        labels[other_nbr_index].enumsortorder,
+                    );
+                    let m = (a + b) / 2.0;
+                    (m != a && m != b).then_some(m)
+                };
+                match midpoint(labels) {
+                    Some(m) => m,
+                    None => {
+                        for (i, e) in labels.iter_mut().enumerate() {
+                            e.enumsortorder = (i + 1) as f32;
+                        }
+                        midpoint(labels).expect("consecutive integers have a float4 midpoint")
+                    }
+                }
             }
         }
-    } else {
-        return Err(not_a_label(&stmt.new_val_neighbor));
     };
 
     // check_safe_enum_use: until the transaction commits, the new label

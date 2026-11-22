@@ -163,6 +163,14 @@ enum Kw {
     Timestamp,
     LikeRegex,
     TimestampTz,
+    StrLower,
+    StrUpper,
+    StrInitcap,
+    StrReplace,
+    StrSplitPart,
+    StrLtrim,
+    StrRtrim,
+    StrBtrim,
 }
 
 /// `keywords[]` of jsonpath_scan.l: `(word, must_be_lowercase, token)`.
@@ -201,6 +209,15 @@ const KEYWORDS: &[(&str, bool, Kw)] = &[
     ("timestamp", false, Kw::Timestamp),
     ("like_regex", false, Kw::LikeRegex),
     ("timestamp_tz", false, Kw::TimestampTz),
+    // PostgreSQL 19's string methods.
+    ("btrim", false, Kw::StrBtrim),
+    ("lower", false, Kw::StrLower),
+    ("ltrim", false, Kw::StrLtrim),
+    ("rtrim", false, Kw::StrRtrim),
+    ("upper", false, Kw::StrUpper),
+    ("initcap", false, Kw::StrInitcap),
+    ("replace", false, Kw::StrReplace),
+    ("split_part", false, Kw::StrSplitPart),
 ];
 
 /// `checkKeyword`: the scanned unquoted word is a keyword or an identifier.
@@ -1111,11 +1128,15 @@ impl Parser {
             | Kw::Date
             | Kw::Integer
             | Kw::Number
-            | Kw::StringFunc => {
+            | Kw::StringFunc
+            | Kw::StrLower
+            | Kw::StrUpper
+            | Kw::StrInitcap => {
                 self.bump();
                 self.expect(K::Char(b')'))?;
             }
-            Kw::Datetime => {
+            // `opt_str_arg`.
+            Kw::Datetime | Kw::StrLtrim | Kw::StrRtrim | Kw::StrBtrim => {
                 self.bump();
                 if self.kind() == K::Str {
                     self.bump();
@@ -1129,6 +1150,22 @@ impl Parser {
                 if self.kind() != K::Char(b')') {
                     self.expect(K::Int)?;
                 }
+                self.expect(K::Char(b')'))?;
+            }
+            // `str_str_args: str_elem ',' str_elem`.
+            Kw::StrReplace => {
+                self.bump();
+                self.expect(K::Str)?;
+                self.expect(K::Char(b','))?;
+                self.expect(K::Str)?;
+                self.expect(K::Char(b')'))?;
+            }
+            // `str_int_args: str_elem ',' int_elem`.
+            Kw::StrSplitPart => {
+                self.bump();
+                self.expect(K::Str)?;
+                self.expect(K::Char(b','))?;
+                self.parse_int_elem()?;
                 self.expect(K::Char(b')'))?;
             }
             Kw::Decimal => {
@@ -1195,6 +1232,10 @@ mod tests {
             "$ /* comment */",
             "$ ? ((@.a == 1).type() == \"boolean\")",
             "$.Size()",
+            "$.lower",
+            "$.Split_Part(\"a\", +2)",
+            "$.btrim()",
+            "$ ? (@.upper() == \"A\")",
         ] {
             let r = validate(p);
             assert!(
@@ -1268,6 +1309,26 @@ mod tests {
             (
                 "$.timestamp_tz(+1)",
                 "syntax error at or near \"+\" of jsonpath input",
+            ),
+            (
+                "$.ltrim(1)",
+                "syntax error at or near \"1\" of jsonpath input",
+            ),
+            (
+                "$.split_part(\"a\")",
+                "syntax error at or near \")\" of jsonpath input",
+            ),
+            (
+                "$.replace(\"a\",)",
+                "syntax error at or near \")\" of jsonpath input",
+            ),
+            (
+                "$.initcap(\"x\")",
+                "syntax error at or near \"\"\" of jsonpath input",
+            ),
+            (
+                "$.split_part(\"a\", $x)",
+                "syntax error at or near \"$x\" of jsonpath input",
             ),
             (
                 "$ like_regex \"(\" flag \"x\"",

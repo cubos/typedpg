@@ -278,8 +278,15 @@ fn merge_constraints_into_existing(
                 )));
             };
             let child_def = interp.check_defs.get(&con.oid);
-            if let (Some(p), Some(c)) = (parent_def.as_ref(), child_def)
-                && p.expr != c.expr
+            // constraints_equivalent compares the deparsed cooked
+            // expressions.
+            if parent_def.is_some()
+                && child_def.is_some()
+                && !super::check_inherit::same_expr(
+                    interp,
+                    (parent, parent_def.as_ref()),
+                    (child, child_def),
+                )
             {
                 return Err(DdlError::Parse(format!(
                     "child table \"{child_name}\" has different definition for check \

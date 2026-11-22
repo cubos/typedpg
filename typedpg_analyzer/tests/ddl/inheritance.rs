@@ -765,3 +765,238 @@ fn inherited_expressions_compare_as_parse_trees() {
         assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
     }
 }
+
+#[test]
+fn inherited_expressions_match_once_transformed() {
+    // MergeWithExistingConstraint / MergeConstraintsIntoExisting /
+    // MergeCheckConstraint compare the *cooked* CHECK expressions
+    // (conbin), MergeAttributes the cooked defaults: '0' coerced to
+    // integer is the constant 0, 'x'::text is 'x', IN (1, 2) is
+    // = ANY (ARRAY[1, 2]), OPERATOR(pg_catalog.>) is >. PG 19.0 accepts
+    // every one of these.
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE TABLE p (a int, CONSTRAINT ck CHECK (a > 0));
+             CREATE TABLE c2 (a int, CONSTRAINT ck CHECK (a > '0'));
+             CREATE TABLE c3 (a int, CONSTRAINT ck CHECK (a > 0::int));",
+        ),
+        ("0002.sql", "ALTER TABLE c2 INHERIT p;"),
+        ("0003.sql", "ALTER TABLE c3 INHERIT p;"),
+        (
+            "0004.sql",
+            "CREATE TABLE c10 (a int, CONSTRAINT ck CHECK (a OPERATOR(pg_catalog.>) 0)) INHERITS (p);",
+        ),
+        (
+            "0005.sql",
+            "CREATE TABLE q (a int, s text, CONSTRAINT ck CHECK (s <> 'x'),
+                 CONSTRAINT ck2 CHECK (a IN (1, 2))) PARTITION BY LIST (a);
+             CREATE TABLE q1 (a int, s text, CONSTRAINT ck CHECK (s <> 'x'::text),
+                 CONSTRAINT ck2 CHECK (a = ANY (ARRAY[1, 2])));
+             ALTER TABLE q ATTACH PARTITION q1 FOR VALUES IN (1);",
+        ),
+        (
+            "0006.sql",
+            "CREATE TABLE p1 (a int DEFAULT 0, CONSTRAINT c CHECK (a > 0));
+             CREATE TABLE p2 (a int DEFAULT '0', CONSTRAINT c CHECK (a > '0'));
+             CREATE TABLE m () INHERITS (p1, p2);",
+        ),
+    ]);
+    // And the same expression twice is a duplicate.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE s1 (a int); CREATE STATISTICS s ON (a+1), (a+'1') FROM s1;",
+    )])
+    .expect_err("duplicate statistics expression");
+    assert!(
+        err.to_string()
+            .starts_with("duplicate expression in statistics definition"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn partition_indexes_match_once_transformed() {
+    // CompareIndexInfo compares the cooked expressions and predicates:
+    // ci is pi's (PG 19.0 attaches it, and then won't drop it alone).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, s text) PARTITION BY LIST (a);
+         CREATE INDEX pi ON p ((s || 'x')) WHERE a > 0;
+         CREATE TABLE c (a int, s text);
+         CREATE INDEX ci ON c ((s || 'x'::text)) WHERE a > '0';
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);",
+    )]);
+    let err = db
+        .apply_sql("DROP INDEX ci;")
+        .expect_err("ci is attached to pi");
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop index ci because index pi requires it"),
+        "got: {err}"
+    );
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, s text) PARTITION BY LIST (a);
+         CREATE TABLE c PARTITION OF p FOR VALUES IN (1);
+         CREATE INDEX pi ON ONLY p ((s || 'x'));
+         CREATE INDEX ci ON c ((s || 'x'::text));",
+    )]);
+    db.apply_sql("ALTER INDEX pi ATTACH PARTITION ci;")
+        .expect("the definitions match");
+}
+
+#[test]
+fn partition_indexes_match_once_folded() {
+    // CompareIndexInfo reads both indexes from the relcache, whose
+    // expressions and predicate are constant-folded
+    // (RelationGetIndexExpressions / RelationGetIndexPredicate): PG 19.0
+    // attaches the child index of each pair, and rejects the third column.
+    let setup = "CREATE DOMAIN dc AS int CHECK (VALUE > 0);
+         CREATE DOMAIN df AS int;
+         CREATE DOMAIN dv AS varchar;
+         CREATE TABLE p (a int, n numeric, v varchar(5)) PARTITION BY RANGE (a);
+         CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);";
+    for (parent, same, different) in [
+        ("((a + 2))", "((a + (1 + 1)))", Some("((a + 3))")),
+        ("(a) WHERE a > 2", "(a) WHERE a > 1 + 1", None),
+        // A predicate folding to TRUE is none.
+        ("(a)", "(a) WHERE true", Some("(a) WHERE false")),
+        ("(a) WHERE a > 0 OR 1 = 1", "(a)", None),
+        ("(a) WHERE array[a] IS NOT NULL", "(a)", None),
+        ("(a) WHERE a > 0", "(a) WHERE a > 0 AND 2 < 3", None),
+        // negate_clause and simplify_boolean_equality.
+        ("(a) WHERE a <= 0", "(a) WHERE NOT (a > 0)", None),
+        ("(a) WHERE (a > 0) = true", "(a) WHERE a > 0", None),
+        ("(a) WHERE (a > 0) = false", "(a) WHERE a <= 0", None),
+        // A strict operator over NULL is NULL.
+        ("(a) WHERE a > NULL", "(a) WHERE NULL::bool", None),
+        // Casts of constants; a domain without constraints is a
+        // relabeling, one with constraints stays a CoerceToDomain.
+        (
+            "((a::bigint + 5::bigint))",
+            "((a::bigint + '5'::bigint))",
+            // int84pl, not int8pl.
+            Some("((a::bigint + 5))"),
+        ),
+        ("((n + 1))", "((n + 1::numeric))", None),
+        ("((n + 1))", "((n + '1'))", None),
+        ("((a + 1))", "((a + 1::df))", Some("((a + 1::dc))")),
+        // Relabelings over a relabeling are one (applyRelabelType).
+        ("((a + 1))", "((a::df + 1))", Some("((a::dc + 1))")),
+        (
+            "((v || 'x'))",
+            "((v::dv || 'x'))",
+            Some("((v::text || 'y'))"),
+        ),
+        // An ARRAY of constants is the array constant.
+        (
+            "(a) WHERE a = ANY (ARRAY[1, 2])",
+            "(a) WHERE a = ANY ('{1,2}')",
+            Some("(a) WHERE a = ANY ('{1,3}')"),
+        ),
+    ] {
+        let parent_index = format!("CREATE INDEX pi ON ONLY p {parent};");
+        let attach = |child: &str| {
+            try_apply(&[
+                ("0001.sql", setup),
+                ("0002.sql", &parent_index),
+                ("0003.sql", &format!("CREATE INDEX ci ON c {child};")),
+                ("0004.sql", "ALTER INDEX pi ATTACH PARTITION ci;"),
+            ])
+        };
+        attach(same).unwrap_or_else(|e| panic!("{parent} | {same}: {e}"));
+        if let Some(different) = different {
+            let err = attach(different).expect_err(different);
+            assert!(
+                err.to_string()
+                    .starts_with("cannot attach index \"ci\" as a partition of index \"pi\""),
+                "{parent} | {different}\n  got: {err}"
+            );
+        }
+    }
+
+    // ATTACH PARTITION and CREATE INDEX on the partitioned table attach a
+    // matching index (PG 19.0: ci to pi, di to qi), and create one for a
+    // different definition (cj and dj stay unattached).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+         CREATE INDEX pi ON p ((a + 2)) WHERE a > 2;
+         CREATE INDEX pj ON p ((a + 3));
+         CREATE TABLE c (a int);
+         CREATE INDEX ci ON c ((a + (1 + 1))) WHERE a > 1 + 1;
+         CREATE INDEX cj ON c ((a + (1 + 1)));
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+         CREATE TABLE q (a bigint) PARTITION BY RANGE (a);
+         CREATE TABLE d PARTITION OF q FOR VALUES FROM (0) TO (10);
+         CREATE INDEX di ON d ((a + '5'::bigint));
+         CREATE INDEX dj ON d ((a + 6::bigint));
+         CREATE INDEX qi ON q ((a + 5::bigint));
+         CREATE INDEX qj ON q ((a + 6));",
+    )]);
+    for (index, parent) in [("ci", "pi"), ("di", "qi")] {
+        let err = db
+            .apply_sql(&format!("DROP INDEX {index};"))
+            .expect_err("attached");
+        assert!(
+            err.to_string().starts_with(&format!(
+                "cannot drop index {index} because index {parent} requires it"
+            )),
+            "got: {err}"
+        );
+    }
+    db.apply_sql("DROP INDEX cj; DROP INDEX dj;")
+        .expect("not attached");
+}
+
+#[test]
+fn inherited_expressions_compare_as_transformed() {
+    // MergeWithExistingConstraint compares the cooked trees, which parse
+    // analysis builds without folding constants: PG 19.0 merges the first
+    // of each pair and rejects the second.
+    let parent = "CREATE TABLE q (a int, n numeric, v varchar(5), i8 int8, CONSTRAINT ck CHECK (";
+    for (written, same, different) in [
+        // [NOT] BETWEEN is the two comparisons.
+        (
+            "a BETWEEN 1 AND 2",
+            "a >= 1 AND a <= '2'",
+            "a <= 2 AND a >= 1",
+        ),
+        // `1 + 1` is a call of int4pl, not 2.
+        ("a > 2", "a > '2'::int", "a > 1 + 1"),
+        // A cast to the column's own type is no node; to another one is.
+        ("a > 0", "a::int > 0", "a::bigint > 0"),
+        // The items with no column become one `= ANY (ARRAY[…])`, the
+        // others comparisons ORed to it in turn.
+        (
+            "a IN (a, 1, 2)",
+            "a = ANY (ARRAY[1, 2]) OR a = a",
+            "a = a OR a = ANY (ARRAY[1, 2])",
+        ),
+        ("a IN (1, 2)", "a IN ('1', 2)", "a = 1 OR a = 2"),
+        // The items are coerced to their common type with the left side.
+        (
+            "i8 IN (1, 2)",
+            "i8 = ANY (ARRAY[1, 2]::int8[])",
+            "i8 = ANY (ARRAY[1, 2])",
+        ),
+        // An implicit coercion is one as written; an untyped literal is a
+        // constant of the type.
+        ("n > 1", "n > 1::numeric", "n > '1'"),
+        // `v::varchar` drops the typmod (a RelabelType).
+        ("v = 'x'", "v::text = 'x'", "v::varchar = 'x'"),
+    ] {
+        let setup = format!("{parent}{written}));");
+        let child = |e: &str| format!("CREATE TABLE c (CONSTRAINT ck CHECK ({e})) INHERITS (q);");
+        try_apply(&[("0001.sql", &setup), ("0002.sql", &child(same))])
+            .unwrap_or_else(|e| panic!("{written} | {same}: {e}"));
+        let err = try_apply(&[("0001.sql", &setup), ("0002.sql", &child(different))])
+            .expect_err(different);
+        assert!(
+            err.to_string()
+                .starts_with("constraint \"ck\" for relation \"c\" already exists"),
+            "{written} | {different}\n  got: {err}"
+        );
+    }
+}

@@ -488,6 +488,7 @@ pub(crate) struct Knowledge<'a> {
 
 /// What reading a constraint needs to know of the relation's columns, and
 /// what its operators and functions resolved to when it was created.
+#[derive(Clone, Copy)]
 struct Cx<'a> {
     is_composite: &'a dyn Fn(&str) -> bool,
     column_type: &'a dyn Fn(&str) -> Option<PgTypeOid>,
@@ -500,6 +501,22 @@ struct Cx<'a> {
     env: Option<&'a HashMap<String, Subject>>,
     /// How many function bodies deep the reading is.
     depth: usize,
+    /// The readings are exact about NULL: [`dnf`]'s positive reading is
+    /// TRUE (not merely not FALSE) and its negative one FALSE (not merely
+    /// not TRUE) — or, as ever, weaker ones allowing more rows. What
+    /// needs the plain readings (a WHEN not taken is not TRUE) drops it
+    /// ([`Cx::plain`]).
+    exact: bool,
+}
+
+impl Cx<'_> {
+    /// The same, reading not FALSE / not TRUE.
+    fn plain(&self) -> Self {
+        Cx {
+            exact: false,
+            ..*self
+        }
+    }
 }
 
 /// How many function bodies deep a constraint is read.
@@ -780,6 +797,7 @@ impl RelationChecks {
                 subjects: &subjects,
                 env: None,
                 depth: 0,
+                exact: false,
             };
             for conjunct in conjuncts((**expr).as_ref()) {
                 for arms in cnf(conjunct, &cx) {
@@ -799,7 +817,24 @@ impl RelationChecks {
         if clauses.is_empty() {
             return None;
         }
-        let subjects = subjects.into_inner();
+        Some(Self::assemble(
+            snapshot,
+            attrs,
+            &column_type,
+            clauses,
+            subjects.into_inner(),
+        ))
+    }
+
+    /// The checks `clauses` (over the columns `attrs` and the expression
+    /// `subjects` they name) make up.
+    fn assemble(
+        snapshot: &PgCatalog,
+        attrs: &[crate::pg_catalog::PgAttribute],
+        column_type: &dyn Fn(&str) -> Option<PgTypeOid>,
+        clauses: Vec<Clause>,
+        subjects: HashMap<String, Subject>,
+    ) -> RelationChecks {
         let mut spaces: HashMap<String, Space> = attrs
             .iter()
             .map(|a| {
@@ -810,7 +845,7 @@ impl RelationChecks {
             })
             .collect();
         for (name, s) in &subjects {
-            if let Some(t) = s.ty(&column_type) {
+            if let Some(t) = s.ty(column_type) {
                 spaces.insert(name.clone(), Space::of(t, None, snapshot));
             }
         }
@@ -819,13 +854,164 @@ impl RelationChecks {
         let (expr_clauses, clauses): (Vec<Clause>, Vec<Clause>) = clauses
             .into_iter()
             .partition(|c| c.names().any(|n| subjects.contains_key(n)));
-        Some(RelationChecks {
+        RelationChecks {
             clauses,
             expr_clauses,
             spaces,
             subjects,
             typeof_of,
-        })
+        }
+    }
+
+    /// Whether `expr` — a CHECK constraint's expression, or a view's WHERE,
+    /// over the row of relation `relid`, its operators and functions as
+    /// `trust` says they resolved — is surely FALSE (not NULL) for the row
+    /// `k` describes: the constraints it alone makes up can't hold of it.
+    /// What can't be read refutes nothing.
+    pub(crate) fn surely_false(
+        snapshot: &PgCatalog,
+        relid: PgClassOid,
+        expr: Option<&ast::Node>,
+        trust: &TrustedNodes,
+        k: &Knowledge<'_>,
+    ) -> bool {
+        Self::refuted_expr(
+            snapshot,
+            snapshot.attributes_of(relid),
+            expr,
+            trust,
+            k,
+            false,
+        )
+    }
+
+    /// Whether `expr`, as [`Self::surely_false`] reads it, is surely not
+    /// TRUE — FALSE or NULL — for the row `k` describes: what fails a
+    /// view's WITH CHECK OPTION (ExecWithCheckOptions runs ExecQual, which
+    /// takes NULL for FALSE).
+    pub(crate) fn surely_not_true(
+        snapshot: &PgCatalog,
+        relid: PgClassOid,
+        expr: Option<&ast::Node>,
+        trust: &TrustedNodes,
+        k: &Knowledge<'_>,
+    ) -> bool {
+        Self::refuted_expr(
+            snapshot,
+            snapshot.attributes_of(relid),
+            expr,
+            trust,
+            k,
+            true,
+        )
+    }
+
+    /// Whether a domain's CHECK `expr` — over `VALUE`, of type
+    /// `value_type` under `collation`, its operators and functions as
+    /// `trust` says they resolved — is surely FALSE for the non-NULL
+    /// constant `v`: coercing `v` to the domain fails
+    /// (ExecEvalConstraintCheck; a NULL result passes).
+    pub(crate) fn domain_check_surely_false(
+        snapshot: &PgCatalog,
+        value_type: PgTypeOid,
+        collation: Option<crate::oid::PgCollationOid>,
+        expr: Option<&ast::Node>,
+        trust: &TrustedNodes,
+        v: &Literal,
+    ) -> bool {
+        // domainAddCheckConstraint reads `VALUE` as a column of this name.
+        let value = crate::pg_catalog::PgAttribute {
+            attrelid: crate::pg_catalog::PG_CLASS_RELID,
+            attname: "value".to_owned(),
+            atttypid: value_type,
+            attnum: 1,
+            attnotnull: false,
+            atthasdef: false,
+            attgenerated: None,
+            atttypmod: None,
+            attidentity: None,
+            attcollation: collation,
+            attislocal: true,
+            attinhcount: 0,
+        };
+        let is_value = |c: &str| c == "value";
+        let not_null = |_: &str| false;
+        let equals = |c: &str| is_value(c).then(|| v.clone());
+        let no_preds = |_: &str| Vec::new();
+        let k = Knowledge {
+            non_null: &is_value,
+            null: &not_null,
+            equals: &equals,
+            preds: &no_preds,
+        };
+        Self::refuted_expr(
+            snapshot,
+            std::slice::from_ref(&value),
+            expr,
+            trust,
+            &k,
+            false,
+        )
+    }
+
+    /// Whether `expr`, over the columns `attrs`, is surely FALSE for the
+    /// row `k` describes — or, `exact`, surely not TRUE (see [`Cx::exact`]).
+    fn refuted_expr(
+        snapshot: &PgCatalog,
+        attrs: &[crate::pg_catalog::PgAttribute],
+        expr: Option<&ast::Node>,
+        trust: &TrustedNodes,
+        k: &Knowledge<'_>,
+        exact: bool,
+    ) -> bool {
+        let is_composite = |name: &str| {
+            attrs
+                .iter()
+                .find(|a| a.attname == name)
+                .is_none_or(|a| crate::coerce::is_complex(a.atttypid, snapshot))
+        };
+        let column_type = |name: &str| attrs.iter().find(|a| a.attname == name).map(|a| a.atttypid);
+        let subjects = std::cell::RefCell::new(HashMap::new());
+        let cx = Cx {
+            is_composite: &is_composite,
+            column_type: &column_type,
+            snapshot,
+            trust,
+            subjects: &subjects,
+            env: None,
+            depth: 0,
+            exact,
+        };
+        let mut clauses = Vec::new();
+        for conjunct in conjuncts(expr) {
+            for arms in cnf(conjunct, &cx) {
+                // No arm: FALSE (exact: not TRUE) whatever the row.
+                if arms.is_empty()
+                    || arms
+                        .iter()
+                        .any(|arm| arm.iter().any(|l| !matches!(l, Lit::Other)))
+                {
+                    clauses.push(Clause { arms });
+                }
+            }
+        }
+        if clauses.is_empty() {
+            return false;
+        }
+        let checks = Self::assemble(
+            snapshot,
+            attrs,
+            &column_type,
+            clauses,
+            subjects.into_inner(),
+        );
+        // A row no value can be (an enum column given no label of it) is
+        // rejected before any constraint is evaluated.
+        let nothing = RelationChecks {
+            clauses: Vec::new(),
+            ..checks.clone()
+        };
+        !nothing.contradicts(k) && checks.contradicts(k)
     }
 
     /// The constraints over the columns of a relation exposing column `c`
@@ -1409,6 +1595,7 @@ pub(crate) fn allowed_values(
         subjects: &subjects,
         env: None,
         depth: 0,
+        exact: false,
     };
     let space = Space::of(t, collation, snapshot);
     let mut preds = Vec::new();
@@ -1543,7 +1730,7 @@ fn partition_clauses(snapshot: &PgCatalog, relid: PgClassOid) -> Vec<Clause> {
 }
 
 /// The partitioned table `part` is a partition of.
-fn partition_parent(snapshot: &PgCatalog, part: PgClassOid) -> Option<PgClassOid> {
+pub(crate) fn partition_parent(snapshot: &PgCatalog, part: PgClassOid) -> Option<PgClassOid> {
     if !snapshot.partition_bounds.contains_key(&part) {
         return None;
     }
@@ -1693,7 +1880,7 @@ fn case_cnf(c: &ast::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
                 } else {
                     q = either(q, product(&taken, &dnf(Some(r), true, cx)?)?)?;
                 }
-                none_before = product(&none_before, &dnf(Some(w), false, cx)?)?;
+                none_before = product(&none_before, &dnf(Some(w), false, &cx.plain())?)?;
             }
             let d = match default {
                 Some(d) => dnf(Some(d), true, cx)?,
@@ -1708,7 +1895,7 @@ fn case_cnf(c: &ast::CaseExpr, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
             for &(w, r) in &whens {
                 let taken = product(&none_before, &dnf(Some(w), true, cx)?)?;
                 q = either(q, product(&taken, &dnf(Some(r), true, cx)?)?)?;
-                none_before = product(&none_before, &dnf(Some(w), false, cx)?)?;
+                none_before = product(&none_before, &dnf(Some(w), false, &cx.plain())?)?;
             }
             (none_before, q, default?)
         }
@@ -1792,6 +1979,7 @@ fn inline_cnf(f: &ast::FuncCall, cx: &Cx<'_>) -> Option<Vec<Vec<Vec<Lit>>>> {
         subjects: cx.subjects,
         env: Some(&env),
         depth: cx.depth + 1,
+        exact: cx.exact,
     };
     let mut clauses = cnf(body.as_ref(), &sub);
     if !strict_nulls.is_empty() {
@@ -1860,6 +2048,7 @@ fn dnf(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit
             use typedpg_pg_query::ast::AConstValue;
             match c.val.as_ref() {
                 // NULL is neither FALSE nor TRUE.
+                _ if c.isnull && cx.exact => Some(Vec::new()),
                 _ if c.isnull => Some(vec![Vec::new()]),
                 Some(AConstValue::Boolean(v)) if v.boolval == positive => Some(vec![Vec::new()]),
                 Some(AConstValue::Boolean(_)) => Some(Vec::new()),
@@ -1873,7 +2062,11 @@ fn dnf(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit
                 return Some(one(Lit::Other));
             };
             // `P IS TRUE` FALSE is `P` not TRUE, exactly; TRUE is `P`
-            // TRUE, which `P` not FALSE stands in for.
+            // TRUE, which `P` not FALSE stands in for (an exact reading
+            // keeps TRUE; `P IS NOT FALSE` TRUE is `P` not FALSE, which it
+            // doesn't).
+            let keeps = matches!(t.booltesttype, T::IsTrue | T::IsFalse) == positive;
+            let cx = &if keeps { *cx } else { cx.plain() };
             match t.booltesttype {
                 T::IsTrue | T::IsNotFalse => dnf(Some(arg), positive, cx),
                 T::IsFalse | T::IsNotTrue => dnf(Some(arg), !positive, cx),
@@ -1945,7 +2138,9 @@ fn is_condition(n: &ast::Node, cx: &Cx<'_>) -> bool {
 /// it being not FALSE (more rows).
 fn case_dnf(c: &ast::CaseExpr, positive: bool, cx: &Cx<'_>) -> Option<Vec<Vec<Lit>>> {
     let test = c.arg.is_some().then(|| cx.subject(c.arg.as_ref()));
+    // A WHEN taken is TRUE (read as `cx` reads), one not taken not TRUE.
     let when_dnf = |when: &ast::CaseWhen, w: Option<&ast::Node>, pos: bool| {
+        let cx = &if pos { *cx } else { cx.plain() };
         match &test {
             None => dnf(w, pos, cx),
             Some(None) => Some(one(Lit::Other)),
@@ -2077,7 +2272,17 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
         cx.subject_type(c)
             .and_then(|t| super::literal_for(n, t, cx.snapshot))
     };
-    let val = |c: String, p: ValPred| one(Lit::Val(c, if positive { p } else { p.negated() }));
+    // The literals of comparison `p` of `c` with constants as read: it is
+    // NULL for a NULL `c`, so an exact reading also says `c` is non-NULL —
+    // but `c <> ALL ('{}')` is TRUE even then.
+    let cmp = |c: String, p: ValPred| -> Vec<Lit> {
+        if cx.exact && !matches!(&p, ValPred::NotIn(vs) if vs.is_empty()) {
+            vec![Lit::NotNull(c.clone()), Lit::Val(c, p)]
+        } else {
+            vec![Lit::Val(c, p)]
+        }
+    };
+    let val = |c: String, p: ValPred| vec![cmp(c, if positive { p } else { p.negated() })];
     let all_null = |cols: &BTreeSet<String>| -> Vec<Vec<Lit>> {
         if cols.iter().any(|c| (cx.is_composite)(c)) {
             return one(Lit::Other);
@@ -2274,14 +2479,14 @@ fn atom(n: Option<&ast::Node>, positive: bool, cx: &Cx<'_>) -> Vec<Vec<Lit>> {
                     ) else {
                         return other;
                     };
-                    let ge = Lit::Val(c.clone(), ValPred::Cmp(CmpOp::Ge, a.clone()));
-                    let le = Lit::Val(c.clone(), ValPred::Cmp(CmpOp::Le, b.clone()));
                     if (kind == K::AexprBetween) == positive {
-                        vec![vec![ge, le]]
+                        let mut arm = cmp(c.clone(), ValPred::Cmp(CmpOp::Ge, a));
+                        arm.extend(cmp(c, ValPred::Cmp(CmpOp::Le, b)));
+                        vec![arm]
                     } else {
                         vec![
-                            vec![Lit::Val(c.clone(), ValPred::Cmp(CmpOp::Lt, a))],
-                            vec![Lit::Val(c, ValPred::Cmp(CmpOp::Gt, b))],
+                            cmp(c.clone(), ValPred::Cmp(CmpOp::Lt, a)),
+                            cmp(c, ValPred::Cmp(CmpOp::Gt, b)),
                         ]
                     }
                 }

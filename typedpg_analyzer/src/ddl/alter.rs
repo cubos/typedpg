@@ -75,6 +75,8 @@ pub fn rename(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlError>
             crate::ddl::fdw::rename_foreign_object(interp, false, stmt)
         }
         ObjectType::ObjectSubscription => crate::ddl::cluster::rename_subscription(interp, stmt),
+        ObjectType::ObjectTablespace => crate::ddl::cluster::rename_tablespace(interp, stmt),
+        ObjectType::ObjectDatabase => crate::ddl::cluster::rename_database(stmt),
         ObjectType::ObjectTsconfiguration
         | ObjectType::ObjectTsdictionary
         | ObjectType::ObjectTsparser

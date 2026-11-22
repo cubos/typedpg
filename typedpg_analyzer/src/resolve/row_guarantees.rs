@@ -104,8 +104,10 @@ pub(crate) fn fk_parent_ok(snapshot: &PgCatalog, rel: crate::oid::PgClassOid) ->
 
 /// Whether table `child_rel` has an enforced foreign key into `parent_rel`
 /// over exactly the `(child column, parent column)` pairs `wanted`, which
-/// the migrations leave in force (no `DISABLE TRIGGER ALL` on either
-/// table). The constraint is assumed to hold as declared, `NOT VALID` or
+/// the migrations never let rows skip (no `DISABLE TRIGGER ALL` on either
+/// table, even one enabled again since, nor `session_replication_role`
+/// set to `replica`: [`crate::ddl::tables::inherit::fk_triggers_disabled`]).
+/// The constraint is assumed to hold as declared, `NOT VALID` or
 /// deferrable as it may be.
 pub(crate) fn fk_follows(
     snapshot: &PgCatalog,

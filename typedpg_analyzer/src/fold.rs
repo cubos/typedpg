@@ -216,8 +216,65 @@ fn fold_here(node: Option<&ast::Node>, snapshot: &PgCatalog, columns: &Columns<'
             convert(&value, target, typmod, snapshot)
         }
         ast::Node::AExpr(e) => fold_operator(e, snapshot, columns),
+        ast::Node::FuncCall(fc) => fold_length(fc, snapshot),
         _ => None,
     }
+}
+
+/// `length` / `char_length` / `character_length` / `octet_length` of a
+/// constant ASCII string, untyped or `text` / `varchar` (`textlen`,
+/// `textoctetlen`, IMMUTABLE: the planner folds them) — when every routine
+/// of that name is the built-in one.
+fn fold_length(fc: &ast::FuncCall, snapshot: &PgCatalog) -> Folded {
+    if fc.args.len() != 1
+        || fc.agg_star
+        || fc.agg_distinct
+        || fc.func_variadic
+        || fc.over.is_some()
+        || fc.agg_filter.is_some()
+        || !fc.agg_order.is_empty()
+    {
+        return None;
+    }
+    let names = crate::expr::extract_string_fields(&fc.funcname);
+    let (schema, name) = match names.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] if s == "pg_catalog" => (Some("pg_catalog"), n.as_str()),
+        _ => return None,
+    };
+    if !matches!(
+        name,
+        "length" | "char_length" | "character_length" | "octet_length"
+    ) || !snapshot
+        .find_functions(schema, name)
+        .iter()
+        .all(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+    {
+        return None;
+    }
+    let literal = |n: &ast::Node| match n {
+        ast::Node::AConst(c) if !c.isnull => match &c.val {
+            Some(ast::AConstValue::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let text = match fc.args.first()?.as_ref()? {
+        ast::Node::TypeCast(tc) => {
+            let tn = tc.type_name.as_ref()?;
+            let t = crate::ddl::util::resolve_type_name(tn, snapshot)?;
+            if !tn.typmods.is_empty()
+                || !tn.array_bounds.is_empty()
+                || ![oid::TEXT, oid::VARCHAR].contains(&t)
+            {
+                return None;
+            }
+            literal(tc.arg.as_ref()?)?
+        }
+        n => literal(n)?,
+    };
+    text.is_ascii()
+        .then_some(Ok(Value::Int(text.len() as i128, IntType::Int4)))
 }
 
 /// An untyped literal read as type `base` (`int4in`, `numeric_in`, …);
@@ -395,22 +452,8 @@ fn fold_operator(e: &ast::AExpr, snapshot: &PgCatalog, columns: &Columns<'_>) ->
         return None;
     }
     match (&l, &r) {
-        (Value::Int(a, ta), Value::Int(b, tb)) => {
-            // `int24pl` & co.: the wider type.
-            let t = (*ta).max(*tb);
-            let (a, b) = (*a, *b);
-            let v = match op {
-                "+" => a + b,
-                "-" => a - b,
-                "*" => a * b,
-                "/" | "%" if b == 0 => return Some(Err(FoldError::DivisionByZero)),
-                "/" => a / b,
-                // `int4mod`: `INT_MIN % -1` is 0, not an overflow.
-                _ if b == -1 => 0,
-                _ => a % b,
-            };
-            Some(t.checked(v))
-        }
+        // `int24pl` & co.: the wider type.
+        (Value::Int(a, ta), Value::Int(b, tb)) => int_arith(op, *a, *b, (*ta).max(*tb)),
         // `numeric_div` / `numeric_mod` (an integer side is converted to
         // `numeric`): a zero divisor fails unless the dividend is NaN.
         _ if matches!(op, "/" | "%") => {
@@ -426,6 +469,75 @@ fn fold_operator(e: &ast::AExpr, snapshot: &PgCatalog, columns: &Columns<'_>) ->
         }
         _ => None,
     }
+}
+
+/// `a op b` (`+`, `-`, `*`, `/`, `%`) by the built-in integer arithmetic
+/// returning `t` (`int4pl`, `int48div`, `int8mod`, …). `None` for another
+/// operator.
+fn int_arith(op: &str, a: i128, b: i128, t: IntType) -> Folded {
+    let v = match op {
+        "+" => a + b,
+        "-" => a - b,
+        "*" => a * b,
+        "/" | "%" if b == 0 => return Some(Err(FoldError::DivisionByZero)),
+        "/" => a / b,
+        // `int4mod`: `INT_MIN % -1` is 0, not an overflow.
+        "%" if b == -1 => 0,
+        "%" => a % b,
+        _ => return None,
+    };
+    Some(t.checked(v))
+}
+
+/// What the built-in integer arithmetic function `proname` (`int4pl`,
+/// `int48mi`, `int2um`, `int8up`, `int4mod`, …) returns for `args`, as
+/// `result` (its return type): the planner evaluates these IMMUTABLE
+/// functions over constants (evaluate_function). `None` for any other
+/// function.
+pub(crate) fn int_function(proname: &str, args: &[i128], result: IntType) -> Folded {
+    let rest = proname.strip_prefix("int")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (types, suffix) = rest.split_at(digits);
+    let single = matches!(types, "2" | "4" | "8");
+    let mixed = matches!(types, "24" | "42" | "28" | "82" | "48" | "84");
+    match (suffix, args) {
+        ("um", [a]) if single => Some(result.checked(-a)),
+        ("up", [a]) if single => Some(result.checked(*a)),
+        ("mod", [a, b]) if single => int_arith("%", *a, *b, result),
+        ("pl" | "mi" | "mul" | "div", [a, b]) if single || mixed => {
+            let op = match suffix {
+                "pl" => "+",
+                "mi" => "-",
+                "mul" => "*",
+                _ => "/",
+            };
+            int_arith(op, *a, *b, result)
+        }
+        _ => None,
+    }
+}
+
+/// What the built-in integer comparison `proname` (`int4eq`, `int48lt`,
+/// `int2ge`, …) returns for `a` and `b`. `None` for any other function.
+pub(crate) fn int_comparison(proname: &str, a: i128, b: i128) -> Option<bool> {
+    let rest = proname.strip_prefix("int")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (types, suffix) = rest.split_at(digits);
+    if !matches!(
+        types,
+        "2" | "4" | "8" | "24" | "42" | "28" | "82" | "48" | "84"
+    ) {
+        return None;
+    }
+    Some(match suffix {
+        "eq" => a == b,
+        "ne" => a != b,
+        "lt" => a < b,
+        "le" => a <= b,
+        "gt" => a > b,
+        "ge" => a >= b,
+        _ => return None,
+    })
 }
 
 /// Untyped literal `text` read as the type of `other`, the operator's

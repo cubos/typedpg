@@ -14,6 +14,7 @@ pub mod collations;
 mod comment;
 mod conversion_procs;
 pub(crate) mod conversions;
+pub(crate) mod cooked;
 pub(crate) mod cursors;
 pub(crate) mod defaults;
 pub(crate) mod depend;
@@ -481,7 +482,7 @@ fn with_statement_sql(
 
 /// The statement being applied defines or runs user code, which may open
 /// or close cursors ([`cursors::Cursors::note_user_code`]).
-fn note_user_code(db: &mut PgCatalog) {
+pub(super) fn note_user_code(db: &mut PgCatalog) {
     if let Some(text) = db.statement_sql.as_deref() {
         let text = text.to_owned();
         db.cursors.note_user_code(&text);
@@ -577,8 +578,9 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         ast::Node::InsertStmt(_)
         | ast::Node::UpdateStmt(_)
         | ast::Node::DeleteStmt(_)
-        | ast::Node::MergeStmt(_)
-        | ast::Node::CallStmt(_) => dml::check_executed(db, stmt),
+        | ast::Node::MergeStmt(_) => dml::check_executed(db, stmt),
+        // Checked, then the procedure's body runs (ExecuteCallStmt).
+        ast::Node::CallStmt(_) => do_block::call(db, stmt),
 
         // ── Indexes ─────────────────────────────────────────────────
         // Indexes don't change query result types, but expression indexes

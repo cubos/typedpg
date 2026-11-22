@@ -284,6 +284,9 @@ pub(crate) fn infer_func_call(
     };
     check_call_shape(func, Some(&resolved), &args, &notation, ctx)?;
     check_not_internal(&resolved, snapshot, func.location)?;
+    if !null_call && crate::resolve::executes() {
+        check_config_call(func, &resolved, snapshot)?;
+    }
     ctx.note_proc(Some(resolved.oid));
     // ExecInitFunc / ExecInitAgg / ExecInitWindowAgg: EXECUTE, and the
     // parameter DEFAULT expressions the call is expanded with run too — the
@@ -364,6 +367,7 @@ pub(crate) fn infer_func_call(
     if !resolved.is_aggregate && !resolved.is_window && func.over.is_none() && resolved.nvargs == 0
     {
         ctx.note_call(func.location, resolved.oid);
+        ctx.note_cooked_call(func, resolved.oid);
     }
     // What a stored policy expression's call names, whatever its kind: an
     // `ALTER FUNCTION` / `SET SCHEMA` rewrites it.
@@ -578,6 +582,53 @@ pub(crate) fn infer_func_call(
         };
     }
     Ok(out)
+}
+
+/// `current_setting` / `set_config` over constants that fail every time
+/// they are evaluated (`current_setting('nosuch')`, `set_config(
+/// 'standard_conforming_strings', 'off', false)`, see
+/// [`crate::ddl::guc::constant_call_error`]). They are stable / volatile,
+/// so the planner doesn't fold them: the error is the executor's, reported
+/// for a statement that runs — like an expression failing whenever it is
+/// evaluated, even where no row may reach it.
+fn check_config_call(
+    func: &ast::FuncCall,
+    resolved: &functions::ResolvedFunction,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    let Some(proc) = snapshot.pg_proc.get(&resolved.oid) else {
+        return Ok(());
+    };
+    if !matches!(proc.proname.as_str(), "current_setting" | "set_config")
+        || snapshot.namespace_name(proc.pronamespace) != Some("pg_catalog")
+        || func.over.is_some()
+        || func.args.len() != proc.proargtypes.len()
+        || func
+            .args
+            .iter()
+            .any(|a| matches!(a, Some(ast::Node::NamedArgExpr(_))))
+    {
+        return Ok(());
+    }
+    let args: Vec<_> = func
+        .args
+        .iter()
+        .map(|a| crate::ddl::guc::ConstArg::of(a.as_ref()))
+        .collect();
+    crate::ddl::guc::constant_call_error(snapshot, &proc.proname, &args).map_err(|e| {
+        let message = e.to_string();
+        let kind = match e {
+            crate::ddl::DdlError::TypeNotFound(_) => AnalyzeError::UndefinedObject(message),
+            _ => AnalyzeError::Invalid(message),
+        };
+        crate::error::RawError::new(kind, None, None).finalize_implicit()
+    })?;
+    // Setting a parameter only a superuser may set needs SET on it: checked
+    // against the role running the statement.
+    if let Some(name) = crate::ddl::guc::superuser_set_config(snapshot, &proc.proname, &args) {
+        crate::privileges::note_utility(crate::privileges::UtilityCheck::SetConfig { name });
+    }
+    Ok(())
 }
 
 /// ParseFuncOrColumn: a function taking or returning the pseudo-type

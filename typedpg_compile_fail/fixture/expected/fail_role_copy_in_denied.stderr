@@ -1,0 +1,9 @@
+error: permission denied for table machines
+         help: grant it in a migration: GRANT INSERT (id, name) ON public.machines TO fixture_app;
+         note: role fixture_app has no INSERT on column(s) id, name of public.machines
+       
+  --> src/bin/fail_role_copy_in_denied.rs:14:39
+   |
+14 |     typedpg::copy_in!(db = roles, db, "machines (id, name)", rows { id, name }).await?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^^
+

@@ -4,11 +4,11 @@
 //! (`check_new_partition_bound`: overlaps, one default partition, hash
 //! moduli dividing each other).
 //!
-//! Values are compared only when their order is known without a PG
-//! runtime: integer keys, date / timestamp keys written in ISO form, and
-//! string keys under a collation that orders by code point (for LIST also
-//! any string key, by equality). Other values never overlap as far as the
-//! analyzer can tell.
+//! A bound is a constant expression, evaluated (transformPartitionBoundValue
+//! → evaluate_expr) and compared with the key's btree comparison. The
+//! analyzer compares the values it can compute and order exactly as that
+//! comparison does (see [`normalize`]); any other value is [`Datum::Opaque`]
+//! and never overlaps, nor bounds an empty range, as far as it can tell.
 
 use super::*;
 use typedpg_pg_query::ast::{self, PartitionBoundSpec};
@@ -46,6 +46,9 @@ struct PartKey {
     /// the key's notion of equality). `None` when the key's type is
     /// unknown to the analyzer.
     opclass: Option<crate::oid::PgOpclassOid>,
+    /// The operator class is a built-in one: the key compares as its
+    /// type's own comparison does (a user's may order values any way).
+    builtin_order: bool,
     /// The attnums of the columns the key is strict in: the key column
     /// itself, or those a key expression is NULL for when they are.
     strict_attnums: Vec<i16>,
@@ -116,6 +119,14 @@ fn compares_bytes(interp: &PgCatalog, opclass: Option<crate::oid::PgOpclassOid>)
         })
 }
 
+/// Whether `opclass` is one of `pg_catalog`'s: it compares as the type's
+/// own comparison functions do.
+fn builtin_opclass(interp: &PgCatalog, opclass: Option<crate::oid::PgOpclassOid>) -> bool {
+    opclass
+        .and_then(|oid| crate::ddl::opclass::opclass_by_oid(interp, oid))
+        .is_some_and(|c| interp.namespace_name(c.opcnamespace) == Some("pg_catalog"))
+}
+
 /// The collations whose order is the strings' code point order: C / POSIX
 /// (byte order, which for UTF-8 is code point order), `ucs_basic`, and the
 /// builtin provider's `pg_c_utf8` / `pg_unicode_fast`.
@@ -138,12 +149,19 @@ enum Strategy {
     Hash,
 }
 
-/// A bound value, as far as the analyzer can order it.
+/// A bound value, as far as the analyzer can order it. The values of one
+/// key are all of one kind.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Datum {
+    /// A value whose order is that of an integer: an integer, a boolean,
+    /// a date (days), a timestamp (microseconds), an interval
+    /// (interval_cmp_value), an enum label (its sort order), a uuid.
     Int(i128),
-    /// A normalized ISO date / timestamp: its text order is its time order.
-    Stamp(String),
+    /// A `numeric` value.
+    Numeric(NumericKey),
+    /// A `float4` / `float8` value, as an unsigned key in float8_cmp's
+    /// order: -0 is 0, NaN is above everything and equal to itself.
+    Float(u64),
     /// A string key value under a collation that orders by code point.
     CodePoints(String),
     /// A string key value, compared by equality only (its order depends
@@ -151,6 +169,118 @@ pub(crate) enum Datum {
     Text(String),
     /// Anything else: equal to nothing, ordered against nothing.
     Opaque,
+}
+
+/// A `numeric` value in numeric_cmp's order: NaN above +Infinity, and
+/// equal whatever the display scale (`1.0` = `1.00`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumericKey {
+    NegInfinity,
+    /// `m × 10^-scale`, without trailing zeros; small enough for two to
+    /// be aligned exactly (see [`NumericKey::parse`]).
+    Finite {
+        m: i128,
+        scale: u32,
+    },
+    Infinity,
+    NaN,
+}
+
+impl NumericKey {
+    /// The value of a `numeric` constant's text (`numeric_in`), when the
+    /// analyzer can compare it exactly: up to 18 significant digits and
+    /// 18 decimal places.
+    fn parse(raw: &str) -> Option<NumericKey> {
+        let t = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+        let (negative, unsigned) = match t.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        match unsigned.to_ascii_lowercase().as_str() {
+            "nan" if unsigned.len() == t.len() => return Some(NumericKey::NaN),
+            "inf" | "infinity" if negative => return Some(NumericKey::NegInfinity),
+            "inf" | "infinity" => return Some(NumericKey::Infinity),
+            _ => {}
+        }
+        let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+            Some((m, e)) => (m, e.parse::<i64>().ok()?),
+            None => (unsigned, 0),
+        };
+        let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        let mut m: i128 = 0;
+        for c in int_part.chars().chain(frac_part.chars()) {
+            m = m
+                .checked_mul(10)?
+                .checked_add(i128::from(c.to_digit(10)?))?;
+        }
+        let mut scale = i64::try_from(frac_part.len()).ok()? - exponent;
+        while scale < 0 {
+            m = m.checked_mul(10)?;
+            scale += 1;
+        }
+        while scale > 0 && m % 10 == 0 {
+            m /= 10;
+            scale -= 1;
+        }
+        if m.unsigned_abs() >= 10u128.pow(18) || scale > 18 {
+            return None;
+        }
+        Some(NumericKey::Finite {
+            m: if negative { -m } else { m },
+            scale: u32::try_from(scale).ok()?,
+        })
+    }
+
+    fn of(value: &crate::fold::Value) -> Option<NumericKey> {
+        match value {
+            crate::fold::Value::Int(i, _) => NumericKey::parse(&i.to_string()),
+            crate::fold::Value::Numeric(raw) => NumericKey::parse(raw),
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            NumericKey::NegInfinity => 0,
+            NumericKey::Finite { .. } => 1,
+            NumericKey::Infinity => 2,
+            NumericKey::NaN => 3,
+        }
+    }
+}
+
+impl Ord for NumericKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (NumericKey::Finite { m: a, scale: sa }, NumericKey::Finite { m: b, scale: sb }) => {
+                // Both below 10^18 at 18 places at most: aligned, below 10^36.
+                let scale = (*sa).max(*sb);
+                (a * 10i128.pow(scale - sa)).cmp(&(b * 10i128.pow(scale - sb)))
+            }
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+impl PartialOrd for NumericKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `x` as an unsigned key in float8_cmp's order (see [`Datum::Float`]).
+fn float_key(x: f64) -> u64 {
+    if x.is_nan() {
+        return u64::MAX;
+    }
+    let bits = if x == 0.0 { 0 } else { x.to_bits() };
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | 1 << 63
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +349,7 @@ pub(super) fn record_partition_spec(
                 collation,
                 code_point_order: collation.is_some_and(|c| orders_by_code_point(interp, c))
                     || compares_bytes(interp, opclass),
+                builtin_order: builtin_opclass(interp, opclass),
                 opclass,
                 strict_attnums: attr.map(|a| a.attnum).into_iter().collect(),
                 typmod: attr.and_then(|a| interp.effective_typmod(a.atttypid, a.atttypmod)),
@@ -239,6 +370,7 @@ pub(super) fn record_partition_spec(
                 };
             let collation = explicit.unwrap_or(expr_collation);
             let opclass = opclass_of(typ, pe);
+            let builtin_order = builtin_opclass(interp, opclass);
             let strict_attnums =
                 crate::ddl::volatile::strict_columns_over_relation(interp, relid, expr.as_ref())
                     .iter()
@@ -250,6 +382,7 @@ pub(super) fn record_partition_spec(
                 collation,
                 code_point_order: collation.is_some_and(|c| orders_by_code_point(interp, c))
                     || compares_bytes(interp, opclass),
+                builtin_order,
                 opclass,
                 strict_attnums,
                 typmod: None,
@@ -332,6 +465,7 @@ fn transform_bound(
                 name: None,
                 collation: None,
                 code_point_order: false,
+                builtin_order: false,
                 opclass: None,
                 strict_attnums: Vec::new(),
                 typmod: None,
@@ -484,9 +618,19 @@ fn bound_value(
         infer_expr(v, ctx(), &mut params, TypeGoal::assignment(*key_type))
             .map_err(|e| DdlError::Parse(e.to_string()))?;
     }
-    let datum = v
-        .as_ref()
-        .map_or(Datum::Opaque, |v| normalize(interp, v, key));
+    // evaluate_expr runs the expression coerced to the key's type: what
+    // fails there (`2147483647 + 1`, `1 / 0`) fails the statement.
+    if *key_type != oid::UNKNOWN
+        && let Some(err) = crate::fold::error(v, interp)
+            .or_else(|| crate::fold::conversion_error(v, *key_type, key.typmod, interp))
+    {
+        return Err(DdlError::Parse(
+            err.raw(None).finalize_implicit().to_string(),
+        ));
+    }
+    let datum = v.as_ref().map_or(Datum::Opaque, |v| {
+        normalize(interp, v, key, interp.timezone_utc.get())
+    });
     // The value coerced to a `varchar(n)` / `char(n)` key: too long is an
     // error unless the excess is blanks, which go.
     if let Datum::Text(t) | Datum::CodePoints(t) = &datum
@@ -519,32 +663,231 @@ fn bound_value(
     Ok(Some(datum))
 }
 
-/// The comparable form of a bound constant.
-fn normalize(interp: &PgCatalog, v: &typedpg_pg_query::ast::Node, part_key: &PartKey) -> Datum {
+// Built-in type OIDs beyond `pg_catalog::oid` (fixed by PG's `pg_type.dat`).
+const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
+const UUID: PgTypeOid = PgTypeOid::from_raw(2950);
+
+/// The comparable form of a bound constant (or of a row's value, read as
+/// the key's type): the value evaluate_expr gives the expression coerced
+/// to the key's type, where the analyzer computes it exactly.
+/// `session_utc`: the session reading the value has TimeZone UTC — the
+/// migration's, creating a bound (`PgCatalog::timezone_utc`); never an
+/// application's, whose zone the analyzer can't know.
+fn normalize(
+    interp: &PgCatalog,
+    v: &typedpg_pg_query::ast::Node,
+    part_key: &PartKey,
+    session_utc: bool,
+) -> Datum {
     use crate::pg_catalog::oid;
+    if !part_key.builtin_order {
+        return Datum::Opaque;
+    }
     let key = interp.unwrap_domain(part_key.type_oid);
-    let integer_key = [oid::INT2, oid::INT4, oid::INT8].contains(&key);
-    let datetime_key = [oid::DATE, oid::TIMESTAMP, oid::TIMESTAMPTZ].contains(&key);
-    let text_key = matches!(
-        interp.pg_type.get(&key).map(|t| t.typcategory),
-        Some(crate::pg_catalog::TypCategory::String)
-    );
-    let bool_key = key == oid::BOOL;
-    // A constant cast to a type that keeps its value as the key's: the
-    // key's own type, another integer type (or numeric) for an integer
-    // key, text / varchar for a text or varchar one. Not through a type
-    // modifier (`'bc'::char(1)` is `'b'`, `15::numeric(1,-1)` is 20), nor
-    // through `bpchar` (whose trailing blanks a text key loses) or a date
-    // (a timestamp key's time of day).
+    let value = match key {
+        oid::INT2 | oid::INT4 | oid::INT8 => integer_value(interp, v).map(Datum::Int),
+        oid::NUMERIC => numeric_value(interp, v, part_key).map(Datum::Numeric),
+        oid::FLOAT4 | oid::FLOAT8 => float_value(interp, v, key).map(Datum::Float),
+        oid::BOOL => bool_value(interp, v, key).map(|b| Datum::Int(i128::from(b))),
+        // date_in drops the time of day; timestamp(p) rounds the
+        // fraction (AdjustTimestampForTypmod); timestamptz_in reads a
+        // value without a zone in the session's TimeZone, known only
+        // while it is UTC (`session_utc`). What
+        // `now` / `today` read depends on when the migration runs: never
+        // known.
+        oid::DATE => key_literal(interp, v, key)
+            .and_then(|s| crate::datetime_input::datetime_value(s, None, false))
+            .map(Datum::Int),
+        oid::TIMESTAMP | oid::TIMESTAMPTZ => key_literal(interp, v, key)
+            .and_then(|s| {
+                crate::datetime_input::datetime_value(s, Some(key == oid::TIMESTAMPTZ), session_utc)
+            })
+            .map(|t| match part_key.typmod {
+                Some(p) => crate::datetime_input::round_timestamp(t, p),
+                None => t,
+            })
+            .map(Datum::Int),
+        // interval_cmp_value: a month is 30 days, a day 24 hours. A typmod
+        // truncates the value (AdjustIntervalForTypmod).
+        INTERVAL if part_key.typmod.is_none() => key_literal(interp, v, key)
+            .and_then(crate::datetime_input::finite_interval)
+            .map(|(months, days, time)| {
+                Datum::Int(
+                    i128::from(time)
+                        + (i128::from(months) * 30 + i128::from(days)) * 86_400_000_000,
+                )
+            }),
+        UUID => key_literal(interp, v, key)
+            .and_then(uuid_value)
+            .map(Datum::Int),
+        _ if interp
+            .get_type(key)
+            .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Enum) =>
+        {
+            key_literal(interp, v, key)
+                .and_then(|label| enum_value(interp, key, label))
+                .map(Datum::Int)
+        }
+        _ if matches!(
+            interp.pg_type.get(&key).map(|t| t.typcategory),
+            Some(crate::pg_catalog::TypCategory::String)
+        ) =>
+        {
+            string_value(interp, v, part_key, key)
+        }
+        _ => None,
+    };
+    value.unwrap_or(Datum::Opaque)
+}
+
+/// The text of an untyped string literal, or of one cast to the key's
+/// own type (`'…'::date` for a date key) without a type modifier: what
+/// the key type's input function reads.
+fn key_literal<'a>(interp: &PgCatalog, v: &'a ast::Node, key: PgTypeOid) -> Option<&'a str> {
+    let literal = |n: &'a ast::Node| match n {
+        ast::Node::AConst(c) if !c.isnull => match &c.val {
+            Some(ast::AConstValue::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match v {
+        ast::Node::TypeCast(tc)
+            if crate::nonnull::cast_target(tc, interp).map(|t| interp.unwrap_domain(t))
+                == Some(key) =>
+        {
+            literal(tc.arg.as_ref()?)
+        }
+        _ => literal(v),
+    }
+}
+
+/// An integer key's value: an untyped literal read by int2in / int4in /
+/// int8in, or the constant expression folded ([`crate::fold`]) — a
+/// `numeric` one rounded, halves away from zero, as numeric_int4 does.
+/// The key type's range is checked by the caller.
+fn integer_value(interp: &PgCatalog, v: &ast::Node) -> Option<i128> {
+    if let ast::Node::AConst(c) = v
+        && let Some(ast::AConstValue::String(s)) = &c.val
+    {
+        return crate::literal_input::parse_pg_integer(&s.sval);
+    }
+    match crate::fold::fold(Some(v), interp)?.ok()? {
+        crate::fold::Value::Int(i, _) => Some(i),
+        crate::fold::Value::Numeric(raw) => round_numeric(&raw),
+    }
+}
+
+/// A `numeric` key's value, under the key's type modifier.
+fn numeric_value(interp: &PgCatalog, v: &ast::Node, key: &PartKey) -> Option<NumericKey> {
+    let value = match v {
+        ast::Node::AConst(c) if matches!(c.val, Some(ast::AConstValue::String(_))) => {
+            let Some(ast::AConstValue::String(s)) = &c.val else {
+                return None;
+            };
+            crate::literal_input::validate_numeric(&s.sval).ok()?;
+            crate::fold::Value::Numeric(s.sval.clone())
+        }
+        _ => crate::fold::fold(Some(v), interp)?.ok()?,
+    };
+    let value = crate::fold::convert(&value, key.type_oid, key.typmod, interp)?.ok()?;
+    NumericKey::of(&value)
+}
+
+/// A `float4` / `float8` key's value: an untyped literal read by float4in /
+/// float8in, or an integer or `numeric` constant converted (int4_float8,
+/// numeric_float8 — which reads the numeric's text).
+fn float_value(interp: &PgCatalog, v: &ast::Node, key: PgTypeOid) -> Option<u64> {
+    let single = key == crate::pg_catalog::oid::FLOAT4;
+    let read = |s: &str| -> Option<f64> {
+        let s = s.trim_matches(|c: char| c.is_ascii_whitespace());
+        if single {
+            s.parse::<f32>().ok().map(f64::from)
+        } else {
+            s.parse::<f64>().ok()
+        }
+    };
+    let x = match key_literal(interp, v, key) {
+        Some(s) => read(s)?,
+        None => match crate::fold::fold(Some(v), interp)?.ok()? {
+            crate::fold::Value::Int(i, _) => {
+                let i = i64::try_from(i).ok()?;
+                if single {
+                    f64::from(i as f32)
+                } else {
+                    i as f64
+                }
+            }
+            crate::fold::Value::Numeric(raw) => read(&raw)?,
+        },
+    };
+    Some(float_key(x))
+}
+
+/// A boolean key's value: TRUE / FALSE, or a string boolin reads.
+fn bool_value(interp: &PgCatalog, v: &ast::Node, key: PgTypeOid) -> Option<bool> {
+    if let ast::Node::AConst(c) = v
+        && let Some(ast::AConstValue::Boolean(b)) = &c.val
+    {
+        return Some(b.boolval);
+    }
+    crate::ddl::reloptions::parse_bool(key_literal(interp, v, key)?)
+}
+
+/// uuid_in: 32 hex digits, a hyphen allowed after each group of four,
+/// optionally in braces — as an integer in uuid_cmp's (byte) order.
+fn uuid_value(s: &str) -> Option<i128> {
+    let b = s.as_bytes();
+    let (mut i, braces) = if b.first() == Some(&b'{') {
+        (1, true)
+    } else {
+        (0, false)
+    };
+    let mut value: u128 = 0;
+    for byte in 0..16 {
+        let hi = char::from(*b.get(i)?).to_digit(16)?;
+        let lo = char::from(*b.get(i + 1)?).to_digit(16)?;
+        value = value << 8 | u128::from(hi << 4 | lo);
+        i += 2;
+        if b.get(i) == Some(&b'-') && byte % 2 == 1 && byte < 15 {
+            i += 1;
+        }
+    }
+    if braces {
+        (b.get(i) == Some(&b'}')).then_some(())?;
+        i += 1;
+    }
+    (i == b.len()).then_some((value ^ 1 << 127) as i128)
+}
+
+/// An enum key's value: its label's sort order (enum_cmp). AddEnumLabel
+/// renumbers rather than tie two labels, but a tie is still treated as
+/// opaque, as a guard.
+fn enum_value(interp: &PgCatalog, key: PgTypeOid, label: &str) -> Option<i128> {
+    let labels = interp.pg_enum.get(&key)?;
+    let order = labels.iter().find(|e| e.enumlabel == label)?.enumsortorder;
+    (labels.iter().filter(|e| e.enumsortorder == order).count() == 1)
+        .then(|| i128::from(float_key(f64::from(order))))
+}
+
+/// A string key's value: an untyped literal, or one cast to a type that
+/// keeps it as the key's (the key's own type, text / varchar for a text
+/// or varchar key — not through a type modifier, nor through `bpchar`,
+/// whose trailing blanks a text key loses) — fitted to the key's typmod.
+fn string_value(
+    interp: &PgCatalog,
+    v: &ast::Node,
+    part_key: &PartKey,
+    key: PgTypeOid,
+) -> Option<Datum> {
+    use crate::pg_catalog::oid;
     let keeps_value = |tc: &typedpg_pg_query::ast::TypeCast| {
         let Some(t) = crate::nonnull::cast_target(tc, interp).map(|t| interp.unwrap_domain(t))
         else {
             return false;
         };
         let texts = [oid::TEXT, oid::VARCHAR];
-        t == key
-            || (integer_key && [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&t))
-            || (texts.contains(&key) && texts.contains(&t))
+        t == key || (texts.contains(&key) && texts.contains(&t))
     };
     let literal = match v {
         ast::Node::AConst(c) => c.val.as_ref(),
@@ -554,56 +897,35 @@ fn normalize(interp: &PgCatalog, v: &typedpg_pg_query::ast::Node, part_key: &Par
         },
         _ => None,
     };
+    let Some(ast::AConstValue::String(s)) = literal else {
+        return None;
+    };
     // The key's typmod: a `varchar(n)` / `char(n)` value loses the blanks
     // past its `n`th character (more is an error, see `bound_value`); a
     // `char(n)` value compares without its trailing blanks.
-    let fitted = |s: &str| -> String {
-        let n = match crate::typmod::decode(interp, key, part_key.typmod) {
-            crate::typmod::DecodedTypmod::Length(n) => usize::try_from(n).ok(),
-            _ => None,
-        };
-        let fit: String = match n {
-            Some(n)
-                if crate::typmod::char_length_violation(interp, key, part_key.typmod, s)
-                    .is_none() =>
-            {
-                s.chars().take(n).collect()
-            }
-            _ => s.to_owned(),
-        };
-        if key == oid::BPCHAR {
-            fit.trim_end_matches(' ').to_owned()
-        } else {
-            fit
-        }
+    let s = &s.sval;
+    let n = match crate::typmod::decode(interp, key, part_key.typmod) {
+        crate::typmod::DecodedTypmod::Length(n) => usize::try_from(n).ok(),
+        _ => None,
     };
-    if integer_key && let Some(i) = fold_integer(v) {
-        return Datum::Int(i);
-    }
-    use typedpg_pg_query::ast::AConstValue;
-    match literal {
-        Some(AConstValue::Integer(i)) if integer_key => Datum::Int(i128::from(i.ival)),
-        // int2in / int4in / int8in.
-        Some(AConstValue::String(s)) if integer_key => {
-            crate::literal_input::parse_pg_integer(&s.sval).map_or(Datum::Opaque, Datum::Int)
+    let fit: String = match n {
+        Some(n)
+            if crate::typmod::char_length_violation(interp, key, part_key.typmod, s).is_none() =>
+        {
+            s.chars().take(n).collect()
         }
-        // A numeric constant cast to an integer rounds half away from zero.
-        Some(AConstValue::Float(f)) if integer_key => {
-            round_numeric(&f.fval).map_or(Datum::Opaque, Datum::Int)
-        }
-        // boolin: the values of one truth are one bound value.
-        Some(AConstValue::Boolean(b)) if bool_key => Datum::Int(i128::from(b.boolval)),
-        Some(AConstValue::String(s)) if bool_key => crate::ddl::reloptions::parse_bool(&s.sval)
-            .map_or(Datum::Opaque, |b| Datum::Int(i128::from(b))),
-        Some(AConstValue::String(s)) if datetime_key => {
-            iso_datetime(&s.sval).map_or(Datum::Opaque, Datum::Stamp)
-        }
-        Some(AConstValue::String(s)) if text_key && part_key.code_point_order => {
-            Datum::CodePoints(fitted(&s.sval))
-        }
-        Some(AConstValue::String(s)) if text_key => Datum::Text(fitted(&s.sval)),
-        _ => Datum::Opaque,
-    }
+        _ => s.to_owned(),
+    };
+    let fit = if key == oid::BPCHAR {
+        fit.trim_end_matches(' ').to_owned()
+    } else {
+        fit
+    };
+    Some(if part_key.code_point_order {
+        Datum::CodePoints(fit)
+    } else {
+        Datum::Text(fit)
+    })
 }
 
 /// A numeric constant (`1.5`, `-2.49`, `12e3`) rounded to an integer, half
@@ -641,69 +963,14 @@ fn round_numeric(text: &str) -> Option<i128> {
     Some(if negative { -value } else { value })
 }
 
-/// Evaluate an integer constant expression of `+`, `-`, `*` over integer
-/// literals (evaluate_expr for the common case).
-fn fold_integer(v: &typedpg_pg_query::ast::Node) -> Option<i128> {
-    use typedpg_pg_query::ast::AConstValue;
-    match v {
-        ast::Node::AConst(c) => match c.val.as_ref()? {
-            AConstValue::Integer(i) => Some(i128::from(i.ival)),
-            AConstValue::Float(f) if !f.fval.contains(['.', 'e', 'E']) => f.fval.parse().ok(),
-            _ => None,
-        },
-        ast::Node::AExpr(e) if e.kind == typedpg_pg_query::ast::AExprKind::AexprOp => {
-            let op = e
-                .name
-                .first()
-                .and_then(|n| super::super::util::node_string(n.as_ref()))?;
-            let r = fold_integer(e.rexpr.as_ref()?)?;
-            match e.lexpr.as_ref() {
-                None if op == "-" => Some(-r),
-                None if op == "+" => Some(r),
-                Some(l) => {
-                    let l = fold_integer(l)?;
-                    match op {
-                        "+" => l.checked_add(r),
-                        "-" => l.checked_sub(r),
-                        "*" => l.checked_mul(r),
-                        _ => None,
-                    }
-                }
-                None => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// `YYYY-MM-DD[( |T)HH:MM[:SS]]`, normalized to `YYYY-MM-DD HH:MM:SS` so
-/// the text order is the time order.
-fn iso_datetime(s: &str) -> Option<String> {
-    let s = s.trim();
-    let digits = |p: &str, n: usize| p.len() == n && p.bytes().all(|b| b.is_ascii_digit());
-    let (date, time) = match s.split_once([' ', 'T']) {
-        Some((d, t)) => (d, Some(t)),
-        None => (s, None),
-    };
-    let mut dparts = date.split('-');
-    let (y, m, d) = (dparts.next()?, dparts.next()?, dparts.next()?);
-    if dparts.next().is_some() || !digits(y, 4) || !digits(m, 2) || !digits(d, 2) {
-        return None;
-    }
-    let time = match time {
-        None => "00:00:00".to_owned(),
-        Some(t) => {
-            let parts: Vec<&str> = t.split(':').collect();
-            match parts.as_slice() {
-                [h, mi] if digits(h, 2) && digits(mi, 2) => format!("{h}:{mi}:00"),
-                [h, mi, se] if digits(h, 2) && digits(mi, 2) && digits(se, 2) => {
-                    format!("{h}:{mi}:{se}")
-                }
-                _ => return None,
-            }
-        }
-    };
-    Some(format!("{y}-{m}-{d} {time}"))
+/// Whether two values of one key are ordered by the analyzer (a string
+/// under a collation not ordering by code point is compared for equality
+/// only).
+fn orderable(d: &Datum) -> bool {
+    matches!(
+        d,
+        Datum::Int(_) | Datum::Numeric(_) | Datum::Float(_) | Datum::CodePoints(_)
+    )
 }
 
 /// Compare two range bound tuples: `None` when some value can't be
@@ -720,15 +987,15 @@ fn cmp_range(a: &[RangeDatum], b: &[RangeDatum]) -> Option<std::cmp::Ordering> {
             (RangeDatum::Value(Datum::Opaque), _) | (_, RangeDatum::Value(Datum::Opaque)) => {
                 return None;
             }
-            (RangeDatum::Value(p), RangeDatum::Value(q)) => match (p, q) {
-                (Datum::Int(_), Datum::Int(_))
-                | (Datum::Stamp(_), Datum::Stamp(_))
-                | (Datum::CodePoints(_), Datum::CodePoints(_)) => match p.cmp(q) {
+            (RangeDatum::Value(p), RangeDatum::Value(q)) => {
+                if !orderable(p) || std::mem::discriminant(p) != std::mem::discriminant(q) {
+                    return None;
+                }
+                match p.cmp(q) {
                     Ordering::Equal => continue,
                     o => return Some(o),
-                },
-                _ => return None,
-            },
+                }
+            }
             _ => match rank(x).cmp(&rank(y)) {
                 // Two equal infinities end the comparison.
                 Ordering::Equal => return Some(Ordering::Equal),
@@ -995,25 +1262,14 @@ fn route_row_opt<'a>(
     for key in &spec.keys {
         let value = match value_of(key.name.as_deref()?)? {
             None => None,
-            // A domain's CHECK may reject the value as the row is built,
-            // and a `timestamptz` literal without a zone reads in the
-            // session's TimeZone, which may not be the one the bounds were
-            // read in.
-            Some(_)
-                if interp.domain_has_checks(key.type_oid)
-                    || interp.unwrap_domain(key.type_oid)
-                        == crate::pg_catalog::oid::TIMESTAMPTZ =>
-            {
-                return None;
-            }
-            Some(v) => match normalize(interp, v, key) {
+            // A domain's CHECK may reject the value as the row is built.
+            Some(_) if interp.domain_has_checks(key.type_oid) => return None,
+            // A row's value is read in the application session's TimeZone.
+            Some(v) => match normalize(interp, v, key, false) {
                 Datum::Opaque => return None,
                 // Out of the key type's range: PG fails on that first
                 // (`integer out of range`).
-                Datum::Int(i)
-                    if !int_fits(interp.unwrap_domain(key.type_oid), i)
-                        || !folds_within_int4(v) =>
-                {
+                Datum::Int(i) if !int_fits(interp.unwrap_domain(key.type_oid), i) => {
                     return None;
                 }
                 // Equality of strings is byte equality under a deterministic
@@ -1092,23 +1348,6 @@ fn route_row_opt<'a>(
     route_row_opt(interp, target, value_of)
 }
 
-/// Whether every operation of an integer constant expression `v` (see
-/// [`fold_integer`]) stays within `integer`'s range — the type of its
-/// literals' arithmetic, which overflows (`integer out of range`) past it.
-/// A plain constant does; so does anything that isn't arithmetic.
-fn folds_within_int4(v: &typedpg_pg_query::ast::Node) -> bool {
-    match v {
-        ast::Node::AExpr(e) => {
-            fold_integer(v).is_some_and(|i| i32::try_from(i).is_ok())
-                && [e.lexpr.as_ref(), e.rexpr.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .all(folds_within_int4)
-        }
-        _ => true,
-    }
-}
-
 /// Whether integer `i` is a value of integer type `ty` (any other type:
 /// true — its values are not integers).
 fn int_fits(ty: PgTypeOid, i: i128) -> bool {
@@ -1130,8 +1369,6 @@ fn int_fits(ty: PgTypeOid, i: i128) -> bool {
 pub(crate) fn partition_desc_order(interp: &PgCatalog, parent: PgClassOid) -> Vec<PgClassOid> {
     // A total order: (group, orderable key, creation order).
     let key = |p: &PgClassOid| -> (u8, Option<Vec<(u8, Datum)>>, PgClassOid) {
-        let orderable =
-            |d: &Datum| matches!(d, Datum::Int(_) | Datum::Stamp(_) | Datum::CodePoints(_));
         match interp.partition_bounds.get(p) {
             Some(Bound::Default) => (3, None, *p),
             Some(Bound::List(values)) if values.iter().all(Option::is_none) => (2, None, *p),

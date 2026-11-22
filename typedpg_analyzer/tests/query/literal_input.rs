@@ -1390,6 +1390,81 @@ fn jsonpath_rejects_unpaired_surrogates() {
         .unwrap();
 }
 
+/// PostgreSQL 19's jsonpath string methods (jsonpath_scan.l keywords
+/// `lower`, `upper`, `initcap`, `replace`, `split_part`, `ltrim`, `rtrim`,
+/// `btrim`; case-insensitive like the other method keywords) and their
+/// argument grammar.
+#[test]
+fn jsonpath_string_methods_of_postgresql_19() {
+    let db = setup();
+    for sql in [
+        "SELECT jsonb_path_query('\"a\"', '$.lower()') AS v",
+        "SELECT '$.upper()'::jsonpath AS v, '$.initcap()'::jsonpath AS w",
+        "SELECT '$.replace(\"a\", \"b\")'::jsonpath AS v",
+        "SELECT '$.split_part(\",\", 2)'::jsonpath AS v, '$.split_part(\",\", -1)'::jsonpath AS w",
+        "SELECT '$.ltrim()'::jsonpath AS v, '$.rtrim(\"x\")'::jsonpath AS w, '$.btrim(\"x\")'::jsonpath AS x",
+        "SELECT '$.LOWER()'::jsonpath AS v",
+        "SELECT JSON_VALUE('\"a\"', '$.upper()') AS v",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, msg) in [
+        (
+            "SELECT '$.lower(1)'::jsonpath",
+            "syntax error at or near \"1\" of jsonpath input",
+        ),
+        (
+            "SELECT '$.replace(\"a\")'::jsonpath",
+            "syntax error at or near \")\" of jsonpath input",
+        ),
+        (
+            "SELECT '$.split_part(\",\", 2.5)'::jsonpath",
+            "syntax error at or near \"2.5\" of jsonpath input",
+        ),
+    ] {
+        assert_first_line!(db.analyze(sql), msg);
+    }
+}
+
+/// PostgreSQL 19's `oid8` (oid8in: an unsigned 64-bit integer, strtou64
+/// with base 0, wrapping negatives like oidin) and `regdatabase`
+/// (parseDashOrOid, then a single unqualified name) input.
+#[test]
+fn oid8_and_regdatabase_input_of_postgresql_19() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT 'abc'::oid8",
+            "invalid input syntax for type oid8: \"abc\"",
+        ),
+        (
+            "SELECT ''::oid8",
+            "invalid input syntax for type oid8: \"\"",
+        ),
+        (
+            "SELECT '12abc'::oid8",
+            "invalid input syntax for type oid8: \"12abc\"",
+        ),
+        (
+            "SELECT '18446744073709551616'::oid8",
+            "value \"18446744073709551616\" is out of range for type oid8",
+        ),
+        ("SELECT 'a.b'::regdatabase", "invalid name syntax"),
+        (
+            "SELECT '99999999999'::regdatabase",
+            "value \"99999999999\" is out of range for type oid",
+        ),
+    ] {
+        assert_first_line!(db.analyze(sql), msg);
+    }
+    for sql in [
+        "SELECT '18446744073709551615'::oid8 AS v, ' 12 '::oid8 AS w, '0x10'::oid8 AS x, '-1'::oid8 AS y",
+        "SELECT '-'::regdatabase AS v, '1'::regdatabase AS w",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 /// `.time()` and its siblings take an unsigned `INT_P` precision (unlike
 /// `.decimal()`'s signed arguments).
 #[test]

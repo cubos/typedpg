@@ -292,6 +292,9 @@ pub enum AnalyzeError {
     /// SQLSTATE 23514 (`check_violation`).
     #[error("{0}")]
     CheckViolation(String),
+    /// SQLSTATE 44000 (`with_check_option_violation`).
+    #[error("{0}")]
+    WithCheckOptionViolation(String),
     /// SQLSTATE 22003 (`numeric_value_out_of_range`): a constant the
     /// planner folds overflows its type (`smallint out of range`,
     /// `numeric field overflow`).
@@ -351,6 +354,7 @@ impl Clone for AnalyzeError {
             TooManyArguments(m) => TooManyArguments(m.clone()),
             NumericValueOutOfRange(m) => NumericValueOutOfRange(m.clone()),
             CheckViolation(m) => CheckViolation(m.clone()),
+            WithCheckOptionViolation(m) => WithCheckOptionViolation(m.clone()),
             DivisionByZero(m) => DivisionByZero(m.clone()),
             TypeMismatch {
                 actual,
@@ -419,6 +423,7 @@ impl AnalyzeError {
             StatementTooComplex(_) => Some("54001"),
             TooManyArguments(_) => Some("54023"),
             CheckViolation(_) => Some("23514"),
+            WithCheckOptionViolation(_) => Some("44000"),
             NumericValueOutOfRange(_) => Some("22003"),
             DivisionByZero(_) => Some("22012"),
             TypeMismatch { .. }
@@ -1446,6 +1451,9 @@ fn replace_message(e: AnalyzeError, rendered: String) -> AnalyzeError {
         AnalyzeError::StatementTooComplex(_) => AnalyzeError::StatementTooComplex(rendered),
         AnalyzeError::TooManyArguments(_) => AnalyzeError::TooManyArguments(rendered),
         AnalyzeError::CheckViolation(_) => AnalyzeError::CheckViolation(rendered),
+        AnalyzeError::WithCheckOptionViolation(_) => {
+            AnalyzeError::WithCheckOptionViolation(rendered)
+        }
         AnalyzeError::NumericValueOutOfRange(_) => AnalyzeError::NumericValueOutOfRange(rendered),
         AnalyzeError::DivisionByZero(_) => AnalyzeError::DivisionByZero(rendered),
         AnalyzeError::TypeMismatch {

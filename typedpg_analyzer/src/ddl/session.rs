@@ -50,10 +50,13 @@ pub(crate) const PREDEFINED_ROLES: &[&str] = &[
 /// Whether role `name` exists, as far as the catalog can tell. Roles are
 /// cluster objects the analyzer doesn't see, so a name is assumed to exist
 /// unless no role can bear it: `public` and `none` are reserved role names,
-/// and so is every `pg_` name but the predefined roles.
+/// and so is every `pg_` name but the predefined roles. Nor can a name with
+/// a newline or carriage return: CreateRole and RenameRole (PostgreSQL 19)
+/// refuse one.
 pub(crate) fn role_may_exist(name: &str) -> bool {
     match name {
         "public" | "none" => false,
+        _ if name.contains(['\n', '\r']) => false,
         _ if name.starts_with("pg_") => PREDEFINED_ROLES.contains(&name),
         _ => true,
     }
@@ -360,6 +363,7 @@ impl PgCatalog {
         // Relcache entries are rebuilt from the catalogs again.
         self.relcache_index_attnames.clear();
         self.indexes_with_new_relfilenode.clear();
+        self.tables_with_new_relfilenode.clear();
         self.transaction_oid_floor = self.next_oid_value();
         // ON COMMIT DROP temporary tables go.
         for table in std::mem::take(&mut self.on_commit_drop).into_inner() {
@@ -676,10 +680,22 @@ pub(crate) fn select_side_effects(
             set_identity(interp, &setting, Some(&value), is_local)?;
             continue;
         }
-        if let Some((setting, value)) = constant_set_config(fc)
-            && let Some(known) = super::guc::check_settable(interp, &setting)?.cloned()
+        // What every evaluation of `set_config` / `current_setting` over
+        // constants raises.
+        let name: Vec<&str> = fc
+            .funcname
+            .iter()
+            .filter_map(|n| super::util::node_string(n.as_ref()))
+            .collect();
+        if let [proname @ ("set_config" | "current_setting")]
+        | ["pg_catalog", proname @ ("set_config" | "current_setting")] = name.as_slice()
         {
-            super::guc::check_value(interp, &known, &value)?;
+            let args: Vec<_> = fc
+                .args
+                .iter()
+                .map(|a| super::guc::ConstArg::of(a.as_ref()))
+                .collect();
+            super::guc::constant_call_error(interp, proname, &args)?;
         }
         if let Some((value, is_local)) = constant_named_set_config(fc, "search_path") {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
@@ -783,32 +799,6 @@ pub(crate) fn const_arg_string(arg: Option<&typedpg_pg_query::ast::Node>) -> Opt
         },
         _ => None,
     }
-}
-
-/// `set_config('<name>', '<value>', ...)` with constant name and value.
-fn constant_set_config(fc: &FuncCall) -> Option<(String, String)> {
-    let name: Vec<&str> = fc
-        .funcname
-        .iter()
-        .filter_map(|n| super::util::node_string(n.as_ref()))
-        .collect();
-    if !matches!(
-        name.as_slice(),
-        ["set_config"] | ["pg_catalog", "set_config"]
-    ) {
-        return None;
-    }
-    let [setting, value, _] = fc.args.as_slice() else {
-        return None;
-    };
-    let as_str = |n: Option<&typedpg_pg_query::ast::Node>| match n {
-        Some(ast::Node::AConst(c)) => match c.val.as_ref() {
-            Some(ast::AConstValue::String(s)) => Some(s.sval.clone()),
-            _ => None,
-        },
-        _ => None,
-    };
-    Some((as_str(setting.as_ref())?, as_str(value.as_ref())?))
 }
 
 /// `set_config('role' | 'session_authorization', '<name>', <is_local>)`

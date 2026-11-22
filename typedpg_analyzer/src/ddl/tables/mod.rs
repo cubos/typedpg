@@ -1316,6 +1316,14 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
             rv.relname
         )));
     }
+    // Any ALTER TABLE may give the relation, its inheritors and (ALTER TYPE
+    // ... CASCADE) the typed tables new storage — a rewrite, SET TABLESPACE,
+    // SET ACCESS METHOD — which COPY FREEZE then takes; not tracked finer.
+    let mut altered = super::tables::inherit::all_inheritors(interp, class_oid);
+    if via_alter_type {
+        altered.extend(interp.typed_tables.keys().copied());
+    }
+    interp.tables_with_new_relfilenode.extend(altered);
 
     // ATPrepSetTableSpace: one new tablespace per relation.
     let set_tablespaces = stmt
@@ -1718,7 +1726,6 @@ fn apply_alter_subtype(
             };
             for rel in targets {
                 if subtype == AlterTableType::AtDisableTrigAll {
-                    interp.ri_triggers_disabled.insert(rel);
                     interp.ri_triggers_ever_disabled.insert(rel);
                     crate::ddl::triggers::set_all_triggers_state(
                         interp,
@@ -1726,7 +1733,6 @@ fn apply_alter_subtype(
                         crate::ddl::triggers::TriggerState::Disabled,
                     );
                 } else {
-                    interp.ri_triggers_disabled.remove(&rel);
                     crate::ddl::triggers::set_all_triggers_state(
                         interp,
                         rel,
@@ -2155,7 +2161,7 @@ pub(crate) mod partidx;
 pub(crate) mod typed;
 
 use columns::*;
-pub(crate) use columns::{column_collation, drop_column, type_collation};
+pub(crate) use columns::{column_collation, domain_has_constraints, drop_column, type_collation};
 use constraints::*;
 pub(crate) use constraints::{check_unique_covers_partition_key, fold_constraint_attrs};
 

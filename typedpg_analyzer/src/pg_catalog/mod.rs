@@ -417,18 +417,20 @@ pub struct PgCatalog {
     /// Tables with `FORCE ROW LEVEL SECURITY` (`relforcerowsecurity`): row
     /// security applies to the table's owner too (`check_enable_rls`).
     pub(crate) force_row_security: Shared<std::collections::HashSet<PgClassOid>>,
-    /// Tables whose triggers were all disabled (`DISABLE TRIGGER ALL`),
-    /// the internal ones enforcing foreign keys included: a foreign key
-    /// from or to one no longer promises anything.
-    pub(crate) ri_triggers_disabled: Shared<std::collections::HashSet<PgClassOid>>,
-    /// Tables whose triggers were all disabled at some point of the
-    /// migrations, even if enabled again since: rows written meanwhile
-    /// were never checked against their foreign keys.
+    /// Tables whose triggers were all disabled (`DISABLE TRIGGER ALL`), the
+    /// internal ones enforcing foreign keys included, at some point of the
+    /// migrations, even if enabled again since: rows written meanwhile were
+    /// never checked against their foreign keys, so a foreign key from or
+    /// to one no longer promises anything.
     pub(crate) ri_triggers_ever_disabled: Shared<std::collections::HashSet<PgClassOid>>,
     /// The migrations set `session_replication_role`, which turns off the
     /// triggers enforcing foreign keys (in `replica` mode) for whatever
     /// they wrote meanwhile.
     pub(crate) fk_checks_bypassed: bool,
+    /// A migration statement explicitly set `session_replication_role` to
+    /// `replica` (or to a value it doesn't state): rows it wrote meanwhile
+    /// skipped every foreign key's check (`ddl::fk_bypass`).
+    pub(crate) fk_replica_role_set: bool,
     /// Foreign keys (and clones) PG marked validated without checking the
     /// rows: `ALTER CONSTRAINT ... ENFORCED` together with a change of
     /// deferrability rewrites an enforced NOT VALID key's row as validated
@@ -472,6 +474,10 @@ pub struct PgCatalog {
     pub(crate) relcache_index_attnames: Shared<HashMap<PgClassOid, Vec<String>>>,
     /// The indexes given a new relfilenode in the current transaction.
     pub(crate) indexes_with_new_relfilenode: Shared<std::collections::HashSet<PgClassOid>>,
+    /// The tables that may have been given new storage in the current
+    /// transaction (`rd_newRelfilelocatorSubid`): truncated, rewritten, or
+    /// named by any ALTER TABLE. COPY FREEZE takes them.
+    pub(crate) tables_with_new_relfilenode: Shared<std::collections::HashSet<PgClassOid>>,
     /// The OID PG gives an index rebuilt by ALTER COLUMN TYPE (a new
     /// object), where the analyzer keeps the old one: what orders indexes
     /// as PG's OID order does (see `ddl::indexes::index_order`).
@@ -965,9 +971,9 @@ impl PgCatalog {
             typed_tables: Shared::default(),
             row_security: Shared::default(),
             force_row_security: Shared::default(),
-            ri_triggers_disabled: Shared::default(),
             ri_triggers_ever_disabled: Shared::default(),
             fk_checks_bypassed: false,
+            fk_replica_role_set: false,
             fk_validity_unproven: Shared::default(),
             clustered_indexes: Shared::default(),
             statistics: Shared::default(),
@@ -979,6 +985,7 @@ impl PgCatalog {
             index_attnames: Shared::default(),
             relcache_index_attnames: Shared::default(),
             indexes_with_new_relfilenode: Shared::default(),
+            tables_with_new_relfilenode: Shared::default(),
             rebuilt_index_oids: Shared::default(),
             transaction_oid_floor: USER_OID_START_NZ.get(),
             in_transaction_block: false,
@@ -1613,20 +1620,22 @@ impl PgCatalog {
         self.analyze_as(sql, role).map_err(LocatedError::new)
     }
 
+    /// A role the migrations don't create: check_role's wording for SET
+    /// ROLE.
+    pub(crate) fn unknown_role(role: &str) -> AnalyzeError {
+        AnalyzeError::UndefinedObject(format!(
+            "role \"{role}\" does not exist (typedpg can check only the roles the migrations \
+             create)"
+        ))
+    }
+
     fn analyze_as_with_sql(
         &self,
         sql: &str,
         role: &str,
     ) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
         if !self.role_exists(role) {
-            // check_role's wording for SET ROLE.
-            return (
-                sql.to_owned(),
-                Err(AnalyzeError::UndefinedObject(format!(
-                    "role \"{role}\" does not exist (typedpg can check only the roles the \
-                     migrations create)"
-                ))),
-            );
+            return (sql.to_owned(), Err(Self::unknown_role(role)));
         }
         let path = self.role_search_path(role);
         crate::privileges::as_role(role, || {
@@ -2379,7 +2388,6 @@ impl PgCatalog {
         self.typed_tables.remove(&oid);
         self.row_security.remove(&oid);
         self.force_row_security.remove(&oid);
-        self.ri_triggers_disabled.remove(&oid);
         self.ri_triggers_ever_disabled.remove(&oid);
         self.clustered_indexes.remove(&oid);
         self.clustered_indexes.retain(|_, index| *index != oid);
