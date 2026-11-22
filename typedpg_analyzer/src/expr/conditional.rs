@@ -498,6 +498,32 @@ pub(crate) fn infer_case(
     let own = crate::nonnull::own_aliases(ctx.scope);
     let mut not_taken = crate::nonnull::Facts::default();
     let mut results: Vec<(Option<&ast::Node>, ExprType)> = Vec::new();
+    // Parallel to `results`: whether the branch can be the result — its
+    // WHEN can be TRUE for some row, given the earlier WHENs not TRUE,
+    // the conditions around the CASE and the constraints.
+    let mut reached: Vec<bool> = Vec::new();
+    // Whether no row can be what `facts` (this level's, added to what
+    // holds around the CASE) say: only a proven contradiction counts.
+    let unreachable = |facts: crate::nonnull::Facts| {
+        let narrowed = ctx.null_ctx.with_local_facts(facts.restricted_to(&own));
+        let null_ctx = narrowed.as_ref().unwrap_or(ctx.null_ctx);
+        let column = |c: &crate::nonnull::Col| {
+            let col = ctx
+                .scope
+                .find_source(&c.0)?
+                .columns
+                .iter()
+                .find(|sc| sc.name == c.1)?;
+            // A column refined to a few values (a CTE's `CASE … THEN 'a'
+            // … THEN 'b' END`) holds no other.
+            Some((
+                col.base_not_null,
+                crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot)
+                    .with_values(col.refine.enumerated().as_ref()),
+            ))
+        };
+        null_ctx.unreachable(&column)
+    };
     // Folding skips a branch whose WHEN is FALSE or NULL, and stops at one
     // that is TRUE: the planner never reaches what it drops.
     let test_fold = expr
@@ -636,6 +662,10 @@ pub(crate) fn infer_case(
         // are validated under the resolved common type in pass 2.
         if let result @ Some(_) = &when.result {
             let _skipped = super::skipped_if(may_be_skipped);
+            // A WHEN the facts refute is never TRUE: its result is still
+            // analyzed and takes part in the result type, but is never the
+            // CASE's value.
+            reached.push(!unreachable(not_taken.clone().union(taken.clone())));
             let facts = not_taken.clone().union(taken).restricted_to(&own);
             let mut narrowed = ctx.null_ctx.with_local_facts(facts);
             // `WHEN grouping(g) = 0`: the row's grouping set holds `g`.
@@ -679,27 +709,7 @@ pub(crate) fn infer_case(
     }
     // No WHEN being TRUE may be impossible: then the ELSE (or the
     // implicit NULL) is never the result.
-    let else_unreachable = {
-        let facts = not_taken.clone().restricted_to(&own);
-        let narrowed = ctx.null_ctx.with_local_facts(facts);
-        let null_ctx = narrowed.as_ref().unwrap_or(ctx.null_ctx);
-        let column = |c: &crate::nonnull::Col| {
-            let col = ctx
-                .scope
-                .find_source(&c.0)?
-                .columns
-                .iter()
-                .find(|sc| sc.name == c.1)?;
-            // A column refined to a few values (a CTE's `CASE … THEN 'a'
-            // … THEN 'b' END`) holds no other.
-            Some((
-                col.base_not_null,
-                crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot)
-                    .with_values(col.refine.enumerated().as_ref()),
-            ))
-        };
-        null_ctx.unreachable(&column)
-    };
+    let else_unreachable = unreachable(not_taken.clone());
     // Whether an omitted ELSE may be the result: the `case_without_else`
     // lint rule reads it.
     if expr.defresult.is_none() {
@@ -755,18 +765,26 @@ pub(crate) fn infer_case(
     // Each result is coerced to the common type, which may map it to NULL.
     coerce_branches(&mut inputs, type_oid, snapshot);
 
-    // The ELSE (input 0) counts only when it can be the result.
+    // Which inputs can be the result: the ELSE (input 0) unless no row
+    // reaches it, each THEN unless its WHEN is refuted. The others still
+    // take part in the result type, typmod and collation, as in PG.
+    let can_be_result: Vec<bool> = std::iter::once(!else_unreachable)
+        .chain(reached.iter().copied())
+        .collect();
     let nullable = inputs
         .iter()
-        .enumerate()
-        .any(|(i, t)| t.nullable && !(i == 0 && else_unreachable));
+        .zip(&can_be_result)
+        .any(|(t, &can)| t.nullable && can);
     // Collations merge in tree order: THEN results, then ELSE.
     let collation = derive_collation(inputs[1..].iter().chain(&inputs[..1]), type_oid, snapshot)?;
     // (The implicit ELSE NULL is never a non-NULL array.)
+    // (Nor is a branch that can't be the result.)
     let branches: Vec<(Option<&ast::Node>, &ExprType)> = default
         .iter()
-        .chain(results.iter())
-        .map(|(n, t)| (*n, t))
+        .map(|d| (d, !else_unreachable))
+        .chain(results.iter().zip(reached.iter().copied()))
+        .filter(|(_, can)| *can)
+        .map(|((n, t), _)| (*n, t))
         .collect();
     let out = ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
         .with_collation(collation)

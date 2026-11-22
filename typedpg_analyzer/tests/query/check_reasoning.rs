@@ -421,3 +421,130 @@ fn a_foreign_tables_checks_are_trusted_on_reads_only() {
     nullable(&db, "SELECT a FROM f AS g(a2, a)");
     db.analyze("INSERT INTO f (a) VALUES (NULL)").unwrap();
 }
+
+// ── CASE branches the facts refute ───────────────────────────────────────────
+
+#[test]
+fn a_case_branch_whose_when_is_refuted_is_never_the_result() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE k (id int PRIMARY KEY, kind text NOT NULL CHECK (kind IN ('a', 'b')),
+             lvl int NOT NULL CHECK (lvl BETWEEN 1 AND 3), x int);
+         CREATE TABLE kn (id int PRIMARY KEY, kind text NOT NULL);
+         ALTER TABLE kn ADD CONSTRAINT kn_kind CHECK (kind IN ('a', 'b')) NOT VALID;
+         CREATE TABLE ke (id int PRIMARY KEY, kind text NOT NULL,
+             CONSTRAINT ke_kind CHECK (kind IN ('a', 'b')) NOT ENFORCED);
+         CREATE TABLE o (id int PRIMARY KEY);",
+    )
+    .unwrap();
+    // A WHEN no row the CHECK allows satisfies: its NULL never counts.
+    nn(
+        &db,
+        "SELECT CASE WHEN kind = 'z' THEN NULL ELSE 'x' END AS r FROM k",
+    );
+    nn(
+        &db,
+        "SELECT CASE WHEN kind = 'a' THEN 'A' WHEN kind = 'b' THEN 'B' \
+         WHEN kind = 'c' THEN NULL END AS r FROM k",
+    );
+    nn(
+        &db,
+        "SELECT CASE WHEN lvl > 5 THEN x ELSE 0 END AS r FROM k",
+    );
+    // Nor one the earlier WHENs not being TRUE refute: no kind is left
+    // once both values are handled.
+    nn(
+        &db,
+        "SELECT CASE WHEN kind = 'a' THEN 1 WHEN kind = 'b' THEN 2 \
+         WHEN kind = 'a' THEN x ELSE 3 END AS r FROM k",
+    );
+    // Nor one the WHERE refutes.
+    nn(
+        &db,
+        "SELECT CASE WHEN x > 10 THEN NULL ELSE 1 END AS r FROM k WHERE x < 5",
+    );
+    // The simple form compares the subject with each value.
+    nn(
+        &db,
+        "SELECT CASE kind WHEN 'z' THEN NULL ELSE 'x' END AS r FROM k",
+    );
+    nn(
+        &db,
+        "SELECT CASE kind WHEN 'a' THEN 'A' WHEN 'b' THEN 'B' WHEN 'c' THEN NULL END AS r FROM k",
+    );
+    // A WHEN some row satisfies still counts.
+    nullable(
+        &db,
+        "SELECT CASE WHEN kind = 'a' THEN NULL ELSE 'x' END AS r FROM k",
+    );
+    nullable(
+        &db,
+        "SELECT CASE kind WHEN 'b' THEN x ELSE 0 END AS r FROM k",
+    );
+    nullable(
+        &db,
+        "SELECT CASE WHEN lvl > 2 THEN x ELSE 0 END AS r FROM k",
+    );
+    // A NOT VALID constraint is trusted, a NOT ENFORCED one isn't.
+    nn(
+        &db,
+        "SELECT CASE WHEN kind = 'z' THEN NULL ELSE 'x' END AS r FROM kn",
+    );
+    nullable(
+        &db,
+        "SELECT CASE WHEN kind = 'z' THEN NULL ELSE 'x' END AS r FROM ke",
+    );
+    // A NULL-extended row makes `kind = 'z'` not TRUE (it reaches the
+    // ELSE), and no row with a kind holds 'z'.
+    nn(
+        &db,
+        "SELECT CASE WHEN k.kind = 'z' THEN NULL ELSE 'x' END AS r \
+         FROM o LEFT JOIN k ON k.id = o.id",
+    );
+    nn(
+        &db,
+        "SELECT CASE k.kind WHEN 'z' THEN NULL ELSE 'x' END AS r \
+         FROM o LEFT JOIN k ON k.id = o.id",
+    );
+    // … but it gets past every WHEN, so the implicit ELSE is reached; and
+    // `kind = 'a'` can be TRUE.
+    nullable(
+        &db,
+        "SELECT CASE WHEN k.kind = 'a' THEN 'A' WHEN k.kind = 'b' THEN 'B' \
+         WHEN k.kind = 'z' THEN 'Z' END AS r FROM o LEFT JOIN k ON k.id = o.id",
+    );
+    nullable(
+        &db,
+        "SELECT CASE WHEN k.kind = 'a' THEN NULL ELSE 'x' END AS r \
+         FROM o LEFT JOIN k ON k.id = o.id",
+    );
+    // A refuted branch is no part of the value set or range, though it
+    // still takes part in the result type.
+    let s = db
+        .analyze(
+            "SELECT CASE WHEN kind = 'a' THEN 'A' WHEN kind = 'b' THEN 'B' \
+             WHEN kind = 'c' THEN 'C' END AS v, \
+             CASE kind WHEN 'a' THEN 1 WHEN 'z' THEN 100 ELSE 2 END AS n, \
+             CASE WHEN kind = 'z' THEN 1.5 ELSE 1 END AS t, \
+             CASE WHEN kind = 'a' THEN 'A' WHEN kind = 'c' THEN 'C' ELSE 'B' END AS w \
+             FROM k",
+        )
+        .unwrap();
+    let values: Vec<Option<Vec<&str>>> = s
+        .columns
+        .iter()
+        .map(|c| {
+            c.refinement
+                .values
+                .as_ref()
+                .map(|vs| vs.iter().map(String::as_str).collect())
+        })
+        .collect();
+    assert_eq!(values[0], Some(vec!["A", "B"]));
+    assert_eq!(values[1], Some(vec!["1", "2"]));
+    assert_eq!(values[3], Some(vec!["A", "B"]));
+    let range = s.columns[1].refinement.range.unwrap_or_default();
+    assert_eq!((range.lo, range.hi), (Some(1), Some(2)));
+    assert!(matches!(&s.columns[2].pg_type, Type::Basic { name, .. } if name == "numeric"));
+    assert!(s.columns.iter().all(|c| !c.nullable));
+}
