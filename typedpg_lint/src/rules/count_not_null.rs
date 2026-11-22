@@ -1,14 +1,14 @@
 //! The `count_not_null` rule: reports `count(expr)` over a value the
 //! analyzer proves is never NULL — a NOT NULL column of a table no outer
 //! join null-extends, a literal (`count(1)`), a column the call's own
-//! `FILTER` proves non-NULL — which counts every row, as
-//! `count(*)` does more plainly (and without evaluating `expr`).
+//! `FILTER` or the query's `WHERE` proves non-NULL — which counts every
+//! row, as `count(*)` does more plainly (and without evaluating `expr`).
 //!
 //! Only `pg_catalog.count("any")` is judged, without `DISTINCT` (which
 //! counts distinct values) and not over a row or composite value; a
 //! parameter in the argument may be NULL. Every inference of the call
-//! must prove the argument non-NULL; one that doesn't see a `WHERE`'s
-//! facts makes the rule miss `count(x) … WHERE x IS NOT NULL`. The fix
+//! must prove the argument non-NULL (the select-list replay the analyzer
+//! runs before `WHERE` records nothing). The fix
 //! rewrites the argument to `*` — `FILTER` and `OVER` stay — when it is a
 //! plain column or a constant, whose evaluation can't raise or have an
 //! effect.
@@ -188,6 +188,64 @@ mod tests {
             "SELECT count(u.id) FROM users u LEFT JOIN posts p ON p.user_id = u.id",
             "SELECT count(*) FROM users u LEFT JOIN posts p ON p.user_id = u.id",
         );
+    }
+
+    #[test]
+    fn a_where_proving_the_argument_non_null_is_read() {
+        let db = catalog();
+        check(
+            &db,
+            "SELECT count(name) FROM users WHERE name IS NOT NULL",
+            "SELECT count(*) FROM users WHERE name IS NOT NULL",
+        );
+        check(
+            &db,
+            "SELECT count(name) FROM users WHERE name = 'x'",
+            "SELECT count(*) FROM users WHERE name = 'x'",
+        );
+        check(
+            &db,
+            "SELECT count(name) OVER () FROM users WHERE name > $1",
+            "SELECT count(*) OVER () FROM users WHERE name > $1",
+        );
+        // WHERE filters the joined rows, null-extended ones included.
+        check(
+            &db,
+            "SELECT count(p.title) FROM users u LEFT JOIN posts p ON p.user_id = u.id \
+             WHERE p.title IS NOT NULL",
+            "SELECT count(*) FROM users u LEFT JOIN posts p ON p.user_id = u.id \
+             WHERE p.title IS NOT NULL",
+        );
+        // An inner join's ON filters the rows as a WHERE does.
+        check(
+            &db,
+            "SELECT count(p.title) FROM users u JOIN posts p ON p.user_id = u.id \
+             AND p.title IS NOT NULL",
+            "SELECT count(*) FROM users u JOIN posts p ON p.user_id = u.id \
+             AND p.title IS NOT NULL",
+        );
+    }
+
+    #[test]
+    fn a_condition_that_leaves_a_null_argument_is_not_read() {
+        let db = catalog();
+        for sql in [
+            // An outer join's ON doesn't filter its null-extended rows.
+            "SELECT count(p.title) FROM users u LEFT JOIN posts p ON p.user_id = u.id \
+             AND p.title IS NOT NULL",
+            // Not every row satisfies it.
+            "SELECT count(name) FROM users WHERE name IS NOT NULL OR id > 0",
+            // HAVING filters groups, not the rows the aggregate reads.
+            "SELECT count(name) FROM users GROUP BY id HAVING max(name) IS NOT NULL",
+            // Another query level's condition.
+            "SELECT id FROM users u WHERE u.name IS NOT NULL \
+             AND (SELECT count(name) FROM users) > 0",
+            "SELECT u.name IS NOT NULL, (SELECT count(v.name) FROM users v) FROM users u \
+             WHERE u.name IS NOT NULL",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
     }
 
     #[test]

@@ -33,7 +33,10 @@ NULL:
 - a non-NULL literal (`count(1)`, `count('x')`);
 - an expression of those that can't produce NULL (`count(id / 2)`);
 - a nullable column the call's own `FILTER (WHERE … IS NOT NULL)` proves
-  non-NULL.
+  non-NULL;
+- a nullable column the query's `WHERE` (or an inner join's `ON`) proves
+  non-NULL: `SELECT count(name) FROM users WHERE name IS NOT NULL`. The
+  aggregate reads only the rows the condition passes.
 
 The argument must not be a row or composite value, and must not contain a
 parameter (it may be bound to NULL). The aggregate must belong to the query
@@ -156,10 +159,11 @@ parameters, unchanged; a fix that doesn't is withheld and reported as an
 - A row or composite argument (`count(t)` over a table alias, a composite
   column).
 - An aggregate of an outer query's columns written in a subquery.
-- A `WHERE` condition doesn't count: `SELECT count(name) FROM users WHERE
-  name IS NOT NULL` is not reported, because the analyzer's nullability
-  inference of the call doesn't see the `WHERE` clause's facts. Only the
-  call's own `FILTER` does.
+- A condition that doesn't filter the rows the aggregate reads: an outer
+  join's `ON` (`LEFT JOIN posts p ON … AND p.title IS NOT NULL` still
+  null-extends `p`), a `HAVING` (it filters groups), another query level's
+  `WHERE`, or a `WHERE` that doesn't hold the value non-NULL on every row
+  (`WHERE name IS NOT NULL OR id > 0`).
 - A `count` in another schema than `pg_catalog`.
 
 ## Configuration

@@ -2365,10 +2365,36 @@ fn replay_targets(
         // The replay is the same expression's analysis again: what it runs
         // belongs to the same output column.
         crate::privileges::collect_output(i, || {
-            infer_expr(val.as_ref(), ctx, scratch, TypeGoal::NONE)
+            in_replay(|| infer_expr(val.as_ref(), ctx, scratch, TypeGoal::NONE))
         })?;
     }
     Ok(())
+}
+
+thread_local! {
+    /// How many select-list replays ([`note_untyped_output_params`]) are
+    /// running.
+    static IN_TARGET_REPLAY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` as part of a select-list replay.
+fn in_replay<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_TARGET_REPLAY.with(|r| r.set(r.get() - 1));
+        }
+    }
+    IN_TARGET_REPLAY.with(|r| r.set(r.get() + 1));
+    let _restore = Restore;
+    f()
+}
+
+/// Whether the analysis is inside a select-list replay: it runs right
+/// after FROM, before WHERE's facts are known, so what it reads of a
+/// value's nullability is weaker than the final pass's.
+pub(crate) fn in_target_replay() -> bool {
+    IN_TARGET_REPLAY.with(|r| r.get() > 0)
 }
 
 /// PG transforms a whole expression list before coercing any of it to its

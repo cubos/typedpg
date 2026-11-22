@@ -252,13 +252,14 @@ fn finding(
     wrapped: &Wrapped<'_>,
     equality: bool,
 ) -> RawFinding {
+    // Quoted as written: a `$day` parameter stays `$day`.
     let text = |node: &Node| {
         node_span(ctx, node.to_ref())
-            .map(|span| ctx.sql[span].trim().to_owned())
+            .map(|span| ctx.written(span).to_owned())
             .unwrap_or_default()
     };
     let column = node_span(ctx, NodeRef::ColumnRef(wrapped.column))
-        .map(|span| ctx.sql[span].trim().to_owned())
+        .map(|span| ctx.written(span).to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| wrapped_column_name(wrapped.column));
     let type_name = |oid: PgTypeOid| {
@@ -562,6 +563,19 @@ mod tests {
             (
                 "SELECT id FROM users WHERE created_at::date = $1",
                 "created_at >= $1 AND created_at < $1 + 1",
+            ),
+            // Quoted as written: named parameters keep their names.
+            (
+                "SELECT id FROM users WHERE created_at::date = $day",
+                "created_at >= $day AND created_at < $day + 1",
+            ),
+            (
+                "SELECT id FROM posts WHERE date_trunc('day', posted_on) = $day",
+                "posted_on >= $day AND posted_on < $day + interval '1 day'",
+            ),
+            (
+                "SELECT id FROM users WHERE lower(email) = $email AND name = $name",
+                "expression index on (lower(email))",
             ),
             (
                 "SELECT id FROM posts WHERE date_trunc('day', posted_on) = $1",

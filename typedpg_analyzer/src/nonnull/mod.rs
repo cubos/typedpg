@@ -1730,7 +1730,9 @@ pub(crate) fn literal(n: Option<&ast::Node>) -> Option<Literal> {
 /// another type's or collation's (`'A'::citext`, a nondeterministic
 /// collation make `'A'` equal `'a'`), and its equality says nothing a
 /// CHECK on the column can use. Nor one cast with a type modifier
-/// ([`cast_target`]): `'abc'::varchar(2)` is `'ab'`.
+/// ([`cast_target`]): `'abc'::varchar(2)` is `'ab'`. A cast of a numeric
+/// or boolean literal to the type it already has is the bare literal:
+/// `coerce_type` hands the constant back, so `5::int` is `5`.
 pub(crate) fn literal_for(
     n: Option<&ast::Node>,
     column_type: crate::oid::PgTypeOid,
@@ -1739,7 +1741,15 @@ pub(crate) fn literal_for(
     match n? {
         ast::Node::TypeCast(tc) => {
             let target = cast_target(tc, snapshot)?;
-            (target == column_type)
+            let no_op = match tc.arg.as_ref() {
+                Some(ast::Node::AConst(c)) => {
+                    crate::expr::literals::infer_a_const(c).is_ok_and(|t| {
+                        t.type_oid == target && t.type_oid != crate::pg_catalog::oid::UNKNOWN
+                    })
+                }
+                _ => false,
+            };
+            (target == column_type || no_op)
                 .then(|| literal(tc.arg.as_ref()))
                 .flatten()
         }
@@ -2003,7 +2013,7 @@ fn between_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCa
     if !log.trusts(e.location, StrictNode::BuiltinCompare) {
         return Facts::default();
     }
-    let (Some((c, t)), ast::Node::List(list)) = (plain_column(l, scope), r) else {
+    let (Some((c, t)), ast::Node::List(list)) = (compared_column(l, scope, snapshot), r) else {
         return Facts::default();
     };
     let bound = |i: usize| {
@@ -2016,6 +2026,32 @@ fn between_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCa
     };
     Facts::pred(c.clone(), ValPred::Cmp(CmpOp::Ge, a))
         .union(Facts::pred(c, ValPred::Cmp(CmpOp::Le, b)))
+}
+
+/// A plain column ([`plain_column`]), or one cast to the type and typmod
+/// it already has: coerce_type adds no node for that cast, so
+/// `name::text = 'x'` compares `name` itself.
+fn compared_column(
+    n: &ast::Node,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<(Col, crate::oid::PgTypeOid)> {
+    let ast::Node::TypeCast(tc) = n else {
+        return plain_column(n, scope);
+    };
+    let (col, t) = plain_column(tc.arg.as_ref()?, scope)?;
+    let type_name = tc.type_name.as_ref()?;
+    let target = crate::ddl::util::resolve_type_name(type_name, snapshot)?;
+    let written = if type_name.typmods.is_empty() {
+        None
+    } else {
+        crate::typmod::encode(snapshot, target, type_name).ok()?
+    };
+    let typmod = scope
+        .resolve_column(Some(&col.0), &col.1, None)
+        .ok()?
+        .typmod;
+    (target == t && written.filter(|m| *m >= 0) == typmod.filter(|m| *m >= 0)).then_some((col, t))
 }
 
 /// What a comparison of a plain column with constants, TRUE, says of the
@@ -2041,7 +2077,10 @@ pub(crate) fn column_pred(
     let (l, r) = (e.lexpr.as_ref()?, e.rexpr.as_ref()?);
     match e.kind {
         K::AexprOp => {
-            let (c, v, flipped) = match (plain_column(l, scope), plain_column(r, scope)) {
+            let (c, v, flipped) = match (
+                compared_column(l, scope, snapshot),
+                compared_column(r, scope, snapshot),
+            ) {
                 (Some((c, t)), None) => (c, literal_for(e.rexpr.as_ref(), t, snapshot)?, false),
                 (None, Some((c, t))) => (c, literal_for(e.lexpr.as_ref(), t, snapshot)?, true),
                 _ => return None,
@@ -2057,7 +2096,7 @@ pub(crate) fn column_pred(
             Some((c, p))
         }
         K::AexprIn => {
-            let (c, t) = plain_column(l, scope)?;
+            let (c, t) = compared_column(l, scope, snapshot)?;
             let ast::Node::List(list) = r else {
                 return None;
             };
@@ -2082,7 +2121,7 @@ pub(crate) fn column_pred(
         // element is NULL. An empty array makes ANY FALSE and ALL TRUE, as
         // an empty OR and an empty AND are.
         kind @ (K::AexprOpAny | K::AexprOpAll) => {
-            let (c, t) = plain_column(l, scope)?;
+            let (c, t) = compared_column(l, scope, snapshot)?;
             let any = kind == K::AexprOpAny;
             let cmp = match op.as_str() {
                 "=" | "<>" => None,

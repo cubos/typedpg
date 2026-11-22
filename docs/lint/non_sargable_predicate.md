@@ -103,14 +103,14 @@ info[non_sargable_predicate]: this comparison can't use the index users_created_
  2 │ SELECT id FROM users WHERE created_at::date = $day;
    ·                            ───────────────────────
    ╰────
-  help: compare a range on the column itself: created_at >= $1 AND created_at < $1 + 1
+  help: compare a range on the column itself: created_at >= $day AND created_at < $day + 1
 
 info[non_sargable_predicate]: this comparison can't use the index users_created_at_idx on created_at: the column is an argument of date_trunc()
    ╭─[queries.sql:5:28]
  5 │ SELECT id FROM users WHERE date_trunc('day', created_at) = $day;
    ·                            ────────────────────────────────────
    ╰────
-  help: compare a range on the column itself: created_at >= $1 AND created_at < $1 + interval '1 day'
+  help: compare a range on the column itself: created_at >= $day AND created_at < $day + interval '1 day'
 
 info[non_sargable_predicate]: this comparison can't use the index products_sku_idx on sku: the column is an argument of lower()
    ╭─[queries.sql:8:31]
@@ -147,9 +147,6 @@ info[non_sargable_predicate]: this comparison can't use the index posts_user_id_
     ╰────
    help: compare the column itself, converting the other side to int8 instead
 ```
-
-The help quotes the query as typedpg analyzes it, after named parameters
-become positional: `$1` there is `$day`.
 
 ### Good
 

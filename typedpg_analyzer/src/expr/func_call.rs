@@ -1422,6 +1422,11 @@ fn note_count_arg(
     if composite {
         return;
     }
+    // The select-list replay runs before WHERE's facts are known: the
+    // final pass over the same call reads the argument under them.
+    if super::in_target_replay() {
+        return;
+    }
     crate::pg_catalog::note_count_arg_nullable(
         func.location,
         nullable || super::has_param_ref(func.args[0].as_ref()),

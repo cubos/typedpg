@@ -36,7 +36,7 @@ Not redundant, and never reported:
 - a cast that types its operand (`ROW(…)::users`, `ARRAY[id::int]::bigint[]`).
 
 An integer literal is not untyped: `1` already is an `integer`, so `1::int`
-is reported.
+is reported, and so is `WHERE id = 5::int` (fixed to `WHERE id = 5`).
 
 ## Examples
 

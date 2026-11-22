@@ -735,6 +735,8 @@ pub(crate) struct Tok {
 pub(crate) struct Ctx<'a> {
     /// The analyzed text (the [`typedpg_analyzer::QueryView`]'s SQL).
     pub sql: &'a str,
+    /// The query as written: `$name` parameters as the user named them.
+    pub original: &'a str,
     pub tree: &'a typedpg_pg_query::ast::ParseResult,
     /// The non-comment tokens of `sql`, in order.
     pub tokens: &'a [Tok],
@@ -743,6 +745,16 @@ pub(crate) struct Ctx<'a> {
     pub view: &'a typedpg_analyzer::QueryView,
     /// The catalog the query was analyzed against.
     pub catalog: &'a PgCatalog,
+}
+
+impl Ctx<'_> {
+    /// The text of `span` (in [`Self::sql`]) as the query was written:
+    /// what a message quoting the query shows, `$day` rather than the
+    /// `$1` it was rewritten to.
+    pub(crate) fn written(&self, span: std::ops::Range<usize>) -> &str {
+        let span = self.view.original_span(span);
+        self.original.get(span).unwrap_or_default().trim()
+    }
 }
 
 /// Lint `sql` against `catalog`, without a call site.
@@ -799,6 +811,7 @@ pub fn lint_query_called(
     let (suppressed, mut findings) = suppressions(&view.sql);
     let ctx = Ctx {
         sql: &view.sql,
+        original: sql,
         tree: &view.tree,
         tokens: &tokens,
         view: &view,

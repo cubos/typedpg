@@ -188,6 +188,28 @@ mod tests {
                 "SELECT (id::bigint + 1)::bigint AS n FROM users",
                 "SELECT (id + 1) AS n FROM users",
             ),
+            // The WHERE pins the output column to the constant with the
+            // cast as without it: the fix keeps that narrowing.
+            (
+                "SELECT id FROM users WHERE id = 5::int",
+                "SELECT id FROM users WHERE id = 5",
+            ),
+            (
+                "SELECT id FROM users WHERE id IN (5::int, 6)",
+                "SELECT id FROM users WHERE id IN (5, 6)",
+            ),
+            (
+                "SELECT name FROM users WHERE name::text = 'x'",
+                "SELECT name FROM users WHERE name = 'x'",
+            ),
+            (
+                "SELECT email FROM users WHERE email::varchar(100) = 'a'",
+                "SELECT email FROM users WHERE email = 'a'",
+            ),
+            (
+                "SELECT id FROM users WHERE id::bigint BETWEEN 2 AND 4",
+                "SELECT id FROM users WHERE id BETWEEN 2 AND 4",
+            ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(!findings.is_empty(), "{sql}: no finding");
