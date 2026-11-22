@@ -589,3 +589,55 @@ fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
 }
+
+#[test]
+fn queries_are_linted_as_the_databases_roles() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "roles": ["app"],
+            "sql": { "include": ["queries/*.sql"], "emit": "none" }
+        }"#,
+    );
+    // `app`'s search path finds `app_data.t`, whose `name` may be NULL:
+    // the check is not redundant for it.
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE ROLE app;\n\
+         CREATE SCHEMA app_data;\n\
+         CREATE TABLE t (id int4 PRIMARY KEY, name text NOT NULL);\n\
+         CREATE TABLE app_data.t (id int4 PRIMARY KEY, name text);\n\
+         GRANT USAGE ON SCHEMA app_data TO app;\n\
+         GRANT SELECT ON t, app_data.t TO app;\n\
+         ALTER ROLE app SET search_path = app_data, public;\n",
+    );
+    write(
+        &root.join("queries/named.sql"),
+        "/* @name named */\nSELECT id FROM t WHERE name IS NOT NULL;\n",
+    );
+    write(&root.join("src/app.ts"), "export {};\n");
+    generate(root);
+
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("redundant_null_check"), "{stdout}");
+
+    // Without the role, the plain analysis reads `public.t`.
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["queries/*.sql"], "emit": "none" }
+        }"#,
+    );
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("redundant_null_check"), "{stdout}");
+}

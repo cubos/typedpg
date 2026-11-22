@@ -977,3 +977,66 @@ fn an_invalid_lint_key_fails_the_run() {
         );
     }
 }
+
+#[test]
+fn breaks_deployed_queries_checks_a_deployed_copy_in() {
+    let dir = deployed_crate_with(
+        "",
+        "",
+        &[
+            r#"copy_in!(pool, "users (id, email, name, status, age)", rows { id, email, name, status, age })"#
+                .to_owned(),
+        ],
+        "ALTER TABLE users ADD CONSTRAINT users_age_positive CHECK (age > 0);\n",
+        &[],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(
+        stdout.matches("warning[breaks_deployed_queries]").count(),
+        1,
+        "{stdout}"
+    );
+    let expected = "this migration breaks the deployed query at src/lib.rs:4 (HEAD): its COPY into \
+                    users writes column age, which CHECK constraint \"users_age_positive\" now \
+                    limits it to at least 1: writing another value fails";
+    assert!(stdout.contains(expected), "{expected}\n{stdout}");
+}
+
+#[test]
+fn lint_analyzes_each_query_as_its_roles() {
+    let dir = deployed_crate_with(
+        "roles = [\"app\"]\n",
+        "CREATE ROLE app;\n\
+         CREATE ROLE reporting;\n\
+         GRANT SELECT ON users TO reporting;\n",
+        &[],
+        "",
+        &[
+            // As the database's configured role, which may not read it.
+            r#"sql!(pool, "SELECT id FROM users")"#.to_owned(),
+            // As the call site's, which may.
+            r#"sql!(role = "reporting", pool, "SELECT name FROM users")"#.to_owned(),
+            r#"copy_in!(pool, "users (id, email, name, status)", rows { id, email, name, status })"#
+                .to_owned(),
+            r#"copy_in!(role = "nobody", pool, "users (id)", rows { id })"#.to_owned(),
+        ],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &[]);
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
+    let all = format!("{stdout}{stderr}");
+    for expected in [
+        "error: permission denied for table users\n   ╭─[src/lib.rs:4:17]",
+        "help: grant it in a migration: GRANT SELECT (id) ON public.users TO app;",
+        "error: permission denied for table users\n   ╭─[src/lib.rs:6:21]",
+        "help: grant it in a migration: GRANT INSERT (id, email, name, status) ON public.users \
+         TO app;",
+        "error: role \"nobody\" does not exist (typedpg can check only the roles the migrations \
+         create)\n   ╭─[src/lib.rs:7:38]",
+        "failed: 3 analysis errors",
+    ] {
+        assert!(all.contains(expected), "{expected}\n{all}");
+    }
+    // The call site's role may read it.
+    assert!(!all.contains("src/lib.rs:5:"), "{all}");
+}

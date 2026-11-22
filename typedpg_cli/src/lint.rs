@@ -26,9 +26,9 @@ use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
 use typedpg_lint::{
-    Call as LintCall, CallFinding, CallMethod, DeployedQuery, Deployment, Finding, IgnoreSet,
-    Language, LintOptions, MigrationFile, MigrationLint, NewSchema, Rule, breaks_deployed_queries,
-    lint_migrations, lint_query_called,
+    Call as LintCall, CallFinding, CallMethod, DeployedKind, DeployedQuery, Deployment, Finding,
+    IgnoreSet, Language, LintOptions, MigrationFile, MigrationLint, NewSchema, Rule,
+    breaks_deployed_queries, lint_migrations, lint_query_called_as,
 };
 
 /// The directories under the manifest's directory that hold Rust sources.
@@ -70,6 +70,8 @@ struct CopySite {
     path: PathBuf,
     file: String,
     db: Option<String>,
+    /// The call site's `role = "name"`.
+    role: Option<String>,
     target: String,
     literal: scan::Literal,
 }
@@ -282,8 +284,8 @@ fn build(
     }
 
     let mut pending = Vec::new();
-    let mut cache: HashMap<(Option<String>, String, Vec<LintCall>, bool), LintResult> =
-        HashMap::new();
+    type CacheKey = (Option<String>, Vec<String>, String, Vec<LintCall>, bool);
+    let mut cache: HashMap<CacheKey, LintResult> = HashMap::new();
     for site in &sites {
         let path = relative(&site.path, &base);
         report.sources.insert(path.clone(), site.file.clone());
@@ -333,10 +335,18 @@ fn build(
         if escapes {
             site_options = site_options.with_rule_off(Rule::UnusedReturning);
         }
+        // Analyzed as the roles it runs as, as the macro analyzes it.
+        let roles = roles_of(&config, site.db.as_deref(), site.role.as_deref());
         let result = cache
-            .entry((site.db.clone(), site.sql.clone(), calls.clone(), escapes))
+            .entry((
+                site.db.clone(),
+                roles.clone(),
+                site.sql.clone(),
+                calls.clone(),
+                escapes,
+            ))
             .or_insert_with(|| {
-                lint_query_called(catalog, &site.sql, &calls, &site_options)
+                lint_query_called_as(catalog, &site.sql, &calls, &roles, &site_options)
                     .map_err(|error| (error.error.to_string(), error.offset))
             });
         match result {
@@ -389,21 +399,17 @@ fn build(
         }
     }
 
-    let mut copy_cache: HashMap<(Option<String>, String), CopyResult> = HashMap::new();
+    let mut copy_cache: HashMap<(Option<String>, Vec<String>, String), CopyResult> = HashMap::new();
     for copy in &copies {
         let path = relative(&copy.path, &base);
         report.sources.insert(path.clone(), copy.file.clone());
         let Ok(catalog) = catalogs.get(&copy.db).expect("every database was built") else {
             continue;
         };
+        let roles = roles_of(&config, copy.db.as_deref(), copy.role.as_deref());
         let result = copy_cache
-            .entry((copy.db.clone(), copy.target.clone()))
-            .or_insert_with(|| {
-                catalog
-                    .analyze_copy_in_located(&copy.target)
-                    .map(|_| ())
-                    .map_err(|error| (error.error.to_string(), error.offset))
-            });
+            .entry((copy.db.clone(), roles.clone(), copy.target.clone()))
+            .or_insert_with(|| analyze_copy_in(catalog, &copy.target, &roles));
         if let Err((message, offset)) = result {
             report.failures.push(Failure {
                 path: path.clone(),
@@ -429,6 +435,54 @@ fn build(
     report.sort();
     report.elapsed = start.elapsed();
     (report, options, pending)
+}
+
+/// The roles a call site's statement runs as, as the macro checks it: the
+/// call site's `role = "…"`, or database `db`'s configured `roles` (none:
+/// the plain analysis).
+fn roles_of(config: &Config, db: Option<&str>, role: Option<&str>) -> Vec<String> {
+    match role {
+        Some(role) => vec![role.to_owned()],
+        None => config
+            .resolve(db)
+            .map(|resolved| resolved.roles().to_vec())
+            .unwrap_or_default(),
+    }
+}
+
+/// A `copy_in!` target analyzed as the macro analyzes it: as each of
+/// `roles`, each resolving the target to the same table and columns (or
+/// plainly, without roles).
+fn analyze_copy_in(catalog: &PgCatalog, target: &str, roles: &[String]) -> CopyResult {
+    let located = |error: typedpg_analyzer::LocatedError| (error.error.to_string(), error.offset);
+    if roles.is_empty() {
+        return catalog
+            .analyze_copy_in_located(target)
+            .map(|_| ())
+            .map_err(located);
+    }
+    let mut first: Option<(&str, String)> = None;
+    for role in roles {
+        let analyzed = catalog
+            .analyze_copy_in_as(target, role)
+            .map_err(|error| (error.to_string(), None))?;
+        match &first {
+            None => first = Some((role, analyzed.copy_sql)),
+            Some((first_role, first_sql)) if *first_sql != analyzed.copy_sql => {
+                return Err((
+                    format!(
+                        "copy target resolves differently for roles {first_role:?} and {role:?}: \
+                         `{first_sql}` for the first and `{}` for the second (the roles' \
+                         search_path settings differ)",
+                        analyzed.copy_sql
+                    ),
+                    None,
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// The report of a configuration that could not be read: one failure.
@@ -695,6 +749,7 @@ fn scan_sources(base: &Path) -> Sources {
                 path: path.clone(),
                 file: file.clone(),
                 db: copy.db,
+                role: copy.role,
                 target: copy.target,
                 literal: copy.literal,
             });
@@ -765,31 +820,51 @@ fn deployed(reference: &str, manifest: &Path, options: &LintOptions) -> Result<D
             deployed.catalogs.insert(db, catalog);
         }
     }
-    for site in scan_sources(&base).sites {
+    let sources = scan_sources(&base);
+    let statements = sources
+        .sites
+        .into_iter()
+        .map(|site| {
+            (
+                site.path,
+                site.file,
+                site.db,
+                site.role,
+                site.sql,
+                site.literal,
+                DeployedKind::Query,
+            )
+        })
+        .chain(sources.copies.into_iter().map(|copy| {
+            (
+                copy.path,
+                copy.file,
+                copy.db,
+                copy.role,
+                copy.target,
+                copy.literal,
+                DeployedKind::CopyIn,
+            )
+        }));
+    for (path, file, db, role, sql, literal, kind) in statements {
         let location = format!(
             "{}:{}",
-            relative(&site.path, &base),
-            position(&site.file, site.literal.source_offset(0)).line
+            relative(&path, &base),
+            position(&file, literal.source_offset(0)).line
         );
-        // The roles it runs as, as the macro checks it: the call site's,
-        // or the database's configured ones.
-        let roles = match site.role {
-            Some(role) => vec![role],
-            None => config
-                .resolve(site.db.as_deref())
-                .map(|resolved| resolved.roles().to_vec())
-                .unwrap_or_default(),
-        };
-        let queries = deployed.queries.entry(site.db).or_default();
+        // The roles it runs as, as the macro checks it.
+        let roles = roles_of(&config, db.as_deref(), role.as_deref());
+        let queries = deployed.queries.entry(db).or_default();
         match queries
             .iter_mut()
-            .find(|query| query.sql == site.sql && query.roles == roles)
+            .find(|query| query.sql == sql && query.roles == roles && query.kind == kind)
         {
             Some(query) => query.locations.push(location),
             None => queries.push(DeployedQuery {
-                sql: site.sql,
+                sql,
                 locations: vec![location],
                 roles,
+                kind,
             }),
         }
     }

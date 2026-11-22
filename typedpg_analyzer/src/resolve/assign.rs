@@ -499,6 +499,14 @@ pub(crate) fn analyze_set_clause<'a>(
                 let value = crate::grouping::with_clause(Some("UPDATE"), || {
                     target.infer_value(val, goal, ctx, params)
                 })?;
+                note_written(
+                    tc.attrelid,
+                    &tc.attname,
+                    true,
+                    target.indirected,
+                    val,
+                    Some(&value),
+                );
                 // `coerce_type` leaves a value already of the column's type
                 // unchanged: its domain constraints don't run. (A parameter
                 // is received through the domain's input function, which
@@ -550,6 +558,18 @@ pub(crate) fn analyze_set_clause<'a>(
                         Some(col.type_oid),
                     );
                 }
+                let value = expr::ExprType {
+                    typmod: col.typmod,
+                    ..expr::ExprType::scalar(col.type_oid, col.nullable)
+                };
+                note_written(
+                    tc.attrelid,
+                    &tc.attname,
+                    true,
+                    target.indirected,
+                    None,
+                    Some(&value),
+                );
             }
         }
     }

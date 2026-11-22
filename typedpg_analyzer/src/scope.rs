@@ -942,6 +942,7 @@ impl Scope {
             // addRangeTableEntry: a relation read in FROM requires SELECT.
             crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::SELECT);
             crate::privileges::note_scan(table_oid);
+            crate::pg_catalog::note_relation_use(table_oid, 'r');
             if crate::privileges::from_item_is_empty(alias) {
                 crate::privileges::note_proven_empty(table_oid);
             }

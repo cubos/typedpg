@@ -27,7 +27,7 @@ mod migrations;
 pub mod report;
 mod rules;
 
-pub use deployed::{DeployedQuery, Deployment, NewSchema, breaks_deployed_queries};
+pub use deployed::{DeployedKind, DeployedQuery, Deployment, NewSchema, breaks_deployed_queries};
 pub use ignore::IgnoreSet;
 pub use migrations::{
     LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,
@@ -800,7 +800,41 @@ pub fn lint_query_called(
     calls: &[Call],
     options: &LintOptions,
 ) -> Result<Vec<CallFinding>, LocatedError> {
-    let view = catalog.query_view(sql)?;
+    lint_query_called_as(catalog, sql, calls, &[], options)
+}
+
+/// [`lint_query_called`], for a query the code runs as `roles` (a call
+/// site's `role = "…"`, or the database's configured `roles`), as
+/// `typedpg check` and the `sql!` macro analyze it: the analysis as each
+/// role must succeed — a role may lack a privilege, or not exist — and
+/// resolve the query to the same types, and the rules read the analysis as
+/// the first role, whose search path decides what its unqualified names
+/// are. No roles: the plain analysis (the schema owner's).
+pub fn lint_query_called_as(
+    catalog: &PgCatalog,
+    sql: &str,
+    calls: &[Call],
+    roles: &[String],
+    options: &LintOptions,
+) -> Result<Vec<CallFinding>, LocatedError> {
+    let view = match roles {
+        [] => catalog.query_view(sql)?,
+        [first, rest @ ..] => {
+            let analysis = catalog.analyze_as_located(sql, first)?;
+            for role in rest {
+                let other = catalog.analyze_as_located(sql, role)?;
+                if let Some(difference) = typedpg_analyzer::first_difference(&analysis, &other) {
+                    return Err(LocatedError {
+                        error: typedpg_analyzer::AnalyzeError::Invalid(
+                            difference.message(first, role),
+                        ),
+                        offset: None,
+                    });
+                }
+            }
+            catalog.query_view_as(sql, first)?
+        }
+    };
     let tokens: Vec<Tok> = typedpg_pg_query::scan(&view.sql)
         .map(|scanned| {
             scanned
@@ -2983,5 +3017,49 @@ mod tests {
         ] {
             assert_eq!(rule.default_severity(), severity, "{rule}");
         }
+    }
+
+    #[test]
+    fn a_query_is_linted_as_its_roles() {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE ROLE app; CREATE ROLE reporting; CREATE ROLE other;
+                 CREATE SCHEMA app_data;
+                 CREATE TABLE t (id integer PRIMARY KEY, name text NOT NULL);
+                 CREATE TABLE app_data.t (id integer PRIMARY KEY, name text);
+                 GRANT USAGE ON SCHEMA app_data TO app;
+                 GRANT SELECT ON t, app_data.t TO app, reporting;
+                 ALTER ROLE app SET search_path = app_data, public;",
+            )
+            .unwrap();
+        let sql = "SELECT id FROM t WHERE name IS NOT NULL";
+        let options = LintOptions::default();
+        let rules_of = |sql: &str, roles: &[&str]| -> Result<Vec<Rule>, String> {
+            let roles: Vec<String> = roles.iter().map(|r| (*r).to_owned()).collect();
+            lint_query_called_as(&catalog, sql, &[], &roles, &options)
+                .map(|findings| findings.iter().map(|f| f.finding.rule).collect())
+                .map_err(|error| error.error.to_string())
+        };
+        let rules = |roles: &[&str]| rules_of(sql, roles);
+        // `public.t.name` is NOT NULL: the plain analysis finds the check
+        // redundant, and so does `reporting`'s, whose search path is the
+        // default one.
+        assert_eq!(rules(&[]), Ok(vec![Rule::RedundantNullCheck]));
+        assert_eq!(rules(&["reporting"]), Ok(vec![Rule::RedundantNullCheck]));
+        // `app`'s search path finds `app_data.t`, whose `name` may be NULL.
+        assert_eq!(rules(&["app"]), Ok(vec![]));
+        // A role that may not read the table fails, as the macro does.
+        let error = rules(&["other"]).unwrap_err();
+        assert!(
+            error.starts_with("permission denied for table t"),
+            "{error}"
+        );
+        // Roles resolving the query differently fail too.
+        let error = rules_of("SELECT name FROM t", &["reporting", "app"]).unwrap_err();
+        assert!(
+            error.starts_with("query resolves differently for roles"),
+            "{error}"
+        );
     }
 }

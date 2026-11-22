@@ -376,6 +376,7 @@ fn build_lint(
                             // Every query of the database runs as each of
                             // its configured roles.
                             roles: deployed.config.databases[query.db].roles.clone(),
+                            kind: typedpg_lint::DeployedKind::Query,
                         }),
                     }
                 }
@@ -451,8 +452,16 @@ fn build_lint(
         let result = cache
             .entry((query.db, query.text.clone(), calls.clone(), query.escapes))
             .or_insert_with(|| {
-                typedpg_lint::lint_query_called(catalog, &query.text, &calls, &query_options)
-                    .map_err(|error| (error.error.to_string(), error.offset))
+                // As `typedpg check` analyzes it: as each of the database's
+                // roles, the rules reading the first one's analysis.
+                typedpg_lint::lint_query_called_as(
+                    catalog,
+                    &query.text,
+                    &calls,
+                    &project.config.databases[query.db].roles,
+                    &query_options,
+                )
+                .map_err(|error| (error.error.to_string(), error.offset))
             });
         if let Ok(findings) = result {
             for placed in findings {

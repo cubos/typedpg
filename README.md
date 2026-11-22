@@ -98,7 +98,9 @@ sql!(pool, "UPDATE users SET age = $flag").execute().await?;
 ## Linting
 
 `cargo typedpg lint` analyzes every `sql!` in the crate's `src/`, `tests/`,
-`examples/` and `benches/` against the migrations it is compiled against,
+`examples/` and `benches/` against the migrations it is compiled against —
+as the roles it runs as, the call site's `role = "…"` or the database's
+`roles`, exactly as the macro checks it (see [Role checks](#role-checks)) —
 and lints the migrations themselves. Each rule has a page in
 [`docs/lint`](docs/lint/README.md) with its motivation, what it proves,
 examples and configuration:
@@ -235,16 +237,25 @@ parameter changes type or no longer accepts NULL, an `INSERT … SELECT` leaves
 out a column that is now `NOT NULL` without a default, or a result value may
 now be one the code doesn't know (a new enum label, a `CHECK` that admits
 more values or a wider range). An `INSERT` (its `ON CONFLICT DO UPDATE SET`
-too) or `UPDATE` breaks when a column it writes accepts fewer values: a
-shorter `varchar(n)`, `char(n)` or `bit(n)`, a `numeric` with fewer digits
-before the decimal point (or after it: the value is rounded), or a `CHECK` of
-the table or the column's domain that is new or narrower, `NOT VALID` ones
-included; a new `CHECK` over several columns that it writes may reject its
-rows. A new `UNIQUE` constraint is not reported (it depends on the data), nor
-is a length or precision change of a column it only reads. Each query is
-analyzed as the roles it runs as — the call site's `role = "…"`, or the
-database's `roles` — so a revoked privilege, or row-level security that now
-leaves the role no policy, is reported too. The finding is placed on the migration
+too), `UPDATE`, `MERGE` or `copy_in!` breaks when a column it writes accepts
+fewer values than the value it writes may be: a shorter `varchar(n)`,
+`char(n)` or `bit(n)`, a `numeric` with fewer digits before the decimal point
+(or after it: the value is rounded), a new `NOT NULL`, or a `CHECK` of the
+table or the column's domain that is new or narrower, `NOT VALID` ones
+included. A parameter or a copied field may be any value; a constant, a
+`CASE` of constants or a column whose own type or `CHECK`s keep it in range
+is reported only when it may not fit. A `CHECK` conjunct the analyzer can't
+read of one column (`length(name) > 1`, `lo <= hi`) may reject the rows
+writing the columns it reads. Constraints are compared by what they check, so
+renaming one, or dropping and adding it back as it was, changes nothing. A
+`copy_in!` also breaks when the columns it copies change, change type or no
+longer accept NULL. A new `UNIQUE` constraint is not reported (it depends on
+the data), nor is a length or precision change of a column it only reads.
+Each query is analyzed as the roles it runs as — the call site's `role =
+"…"`, or the database's `roles` — so a revoked privilege, or row-level
+security that now denies the role the rows (no policy for it, or only ones
+that are never true, `USING (false)`), is reported too; its tables are the
+ones the analysis resolves, along the role's search path. The finding is placed on the migration
 statement that makes the change and names the query's file and line at the
 ref. The fix is expand/contract: first deploy code that works with both
 schemas, then the migration. A `-- typedpg-lint:

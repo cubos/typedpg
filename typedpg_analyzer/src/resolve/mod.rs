@@ -1310,6 +1310,36 @@ fn is_set_to_default(node: Option<&ast::Node>) -> bool {
     matches!(node, Some(ast::Node::SetToDefault(_)))
 }
 
+/// For the lint (see [`crate::QueryView::writes`]): record that the latest
+/// data-modifying statement on `relid` writes `val`, typed `t` (`None`:
+/// not inferred), into its column `column` — inside it when `indirected`.
+fn note_written(
+    relid: crate::oid::PgClassOid,
+    column: &str,
+    update: bool,
+    indirected: bool,
+    val: Option<&ast::Node>,
+    t: Option<&expr::ExprType>,
+) {
+    use crate::condition::WrittenValue;
+    if !crate::pg_catalog::collecting_column_ref_bindings() {
+        return;
+    }
+    let value = match (val, t) {
+        _ if indirected => WrittenValue::Inside,
+        _ if is_set_to_default(val) => WrittenValue::Default,
+        (Some(ast::Node::ParamRef(p)), _) => WrittenValue::Parameter(p.number),
+        (_, Some(t)) => WrittenValue::Expression {
+            type_oid: t.type_oid,
+            typmod: t.typmod,
+            nullable: t.nullable,
+            refinement: Box::new(t.refine.clone()),
+        },
+        (_, None) => return,
+    };
+    crate::pg_catalog::note_written(relid, column, update, value);
+}
+
 /// The ON CONFLICT arbiter specification after parse analysis
 /// (`transformOnConflictArbiter`), ready for the planner's inference.
 pub(crate) struct Arbiter {

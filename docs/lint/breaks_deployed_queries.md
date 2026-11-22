@@ -30,7 +30,7 @@ cargo typedpg lint --previous-deployment origin/main
 npx typedpg lint --previous-deployment origin/main
 ```
 
-typedpg checks out the ref into a temporary snapshot and reads the project there exactly as it reads it now: its configuration, its migrations (which build the deployed schema, per database) and its queries (`sql!` invocations, or the TypeScript sources and `.sql` files). Queries come from the ref, so a query your branch changed or deleted is still checked — the deployed code still runs it. A migration file identical to its version at the ref is an applied migration; the first file that is absent from the ref or differs from it is the first new one. With no new migration, nothing is reported.
+typedpg checks out the ref into a temporary snapshot and reads the project there exactly as it reads it now: its configuration, its migrations (which build the deployed schema, per database) and its queries (`sql!` and `copy_in!` invocations, or the TypeScript sources and `.sql` files). Queries come from the ref, so a query your branch changed or deleted is still checked — the deployed code still runs it. A migration file identical to its version at the ref is an applied migration; the first file that is absent from the ref or differs from it is the first new one. With no new migration, nothing is reported.
 
 Each deployed query that analyzes against the deployed schema is analyzed again against the new one. It is reported when, against the new schema:
 
@@ -40,9 +40,27 @@ Each deployed query that analyzes against the deployed schema is analyzed again 
 - a result value may now be one the deployed code doesn't know: a new enum label, or a `CHECK` that admits more values or a wider range (also for array elements and the fields of a composite or record);
 - the elements of an array result may now be NULL, or a field of a record result may now be NULL;
 - a parameter (or a field of a `$..spread`) changes type, no longer accepts NULL, or no longer accepts an enum label it used to;
-- an `INSERT` leaves out a column that the new schema makes `NOT NULL` without a default, identity or generation expression, where the old schema let it be left out. (With `VALUES`, the analysis itself already fails with PostgreSQL's not-null error; with `INSERT … SELECT` this check reports it.)
+- an `INSERT` (or a `copy_in!`) leaves out a column that the new schema makes `NOT NULL` without a default, identity or generation expression, where the old schema let it be left out. (With `VALUES`, the analysis itself already fails with PostgreSQL's not-null error; with `INSERT … SELECT` this check reports it.)
+- an `INSERT` (its `ON CONFLICT DO UPDATE SET` too), `UPDATE`, `MERGE` or `copy_in!` writes a column whose new definition accepts fewer values than the value it writes may be (see below);
+- a `copy_in!` copies other columns (a target without a column list copies every column, so a new one changes what the deployed code must send), or a column it copies changes type or no longer accepts NULL;
+- it runs as a role (see below) that may no longer run it, or that row-level security now denies the rows it reads or writes.
 
 A query that does not analyze against its own deployed schema was already broken there, and is skipped.
+
+### Writes
+
+A column the deployed code writes breaks when its new definition rejects a value the deployed one accepted: a shorter `varchar(n)`, `char(n)` or `bit(n)` / `varbit(n)` (a `bit(n)` of another length, longer too), a `numeric` with fewer digits before the decimal point (a value fails) or after it (a value is rounded), a new `NOT NULL`, or a `CHECK` of the table or of the column's domain that is new or narrower — `NOT VALID` ones included, since they bind the rows written. The value written decides:
+
+- A parameter, or a field a `copy_in!` sends, may be anything its type allows: it is reported. (A parameter written into a column whose type changes is reported as the parameter's type change, and one the new schema no longer lets be NULL as that.)
+- A value the query computes is checked against the new definition with what the analyzer knows of it: a constant, a `CASE` of constants, a column of an `INSERT … SELECT` whose own type or `CHECK`s keep it in range. It is reported only when it may not fit: `SET name = 'anonymous'` fits a `varchar(40)`, `SET status = 'blocked'` breaks a new `CHECK (status = 'active')`.
+
+A `CHECK` is read conjunct by conjunct (the arms of its top-level `AND`). One the analyzer reads exactly of the column alone — comparisons with constants (`n > 0 AND n <= 10`), a list of values (`kind IN ('a', 'b')`), `isfinite(at)`, `c IS NOT NULL` — is checked against the value as above. One it can't read that way (`length(name) > 1`, `lo <= hi`) is reported as one that *may* reject the deployed code's rows, for the written columns it reads, whatever the value. Constraints are compared by what they check, not by name: a `RENAME CONSTRAINT`, or a constraint dropped and added again as it was, changes nothing; one added again under the same name with another expression is new.
+
+Not reported: a column a new `UNIQUE`, primary key or exclusion constraint covers (whether a row breaks it depends on the data), a timestamp, time or interval precision (it rounds), and a length or precision change of a column the query only reads (the deployed code decodes the same wire type).
+
+### Roles
+
+Each deployed query is analyzed as the roles it runs as — the call site's `role = "…"`, or the database's configured `roles` — so a privilege a migration revokes is reported, and so is a table whose row-level security now denies the role the command it runs on it: a table that enables row-level security with no policy for the role, a dropped policy, or one whose clause the planner folds to FALSE (`USING (false)`) — a restrictive one too, which then denies whatever the others allow. The query still analyzes; a `SELECT` sees no row, an `UPDATE` or a `DELETE` changes none, and an `INSERT` fails. The tables a query reads and writes are the ones the analysis resolved, as the role: along its search path, and never a CTE that happens to share a table's name.
 
 ### Where the finding goes
 
@@ -169,15 +187,60 @@ Run the same migration while the deployed code still reads `email`, and it is re
 warning[breaks_deployed_queries]: this migration breaks the deployed query at src/lib.rs:4 (HEAD): it no longer runs: column "email" does not exist
 ```
 
+### Writes the deployed code makes
+
+The deployed code at `HEAD` writes `users.name`, a `varchar(80)`, and `users.status`, an enum:
+
+```rust
+// src/lib.rs at HEAD
+sql!(pool, "UPDATE users SET name = $name WHERE id = $id").execute().await?;                                // line 4
+sql!(pool, "UPDATE users SET name = 'anonymous', status = 'blocked' WHERE id = $id").execute().await?;     // line 5
+copy_in!(pool, "users (email, name)", rows { email, name }).await?;                                        // line 6
+```
+
+```sql
+-- migrations/0002_users.sql
+SET LOCAL lock_timeout = '5s';
+ALTER TABLE users ALTER COLUMN name TYPE varchar(40);
+ALTER TABLE users ADD CONSTRAINT users_status_active CHECK (status = 'active') NOT VALID;
+```
+
+The parameter and the copied field may be longer than 40 characters; `'anonymous'` is not, so line 5 is reported for its `status` alone:
+
+```text
+warning[breaks_deployed_queries]: this migration breaks the deployed query at src/lib.rs:4 (HEAD): its UPDATE of users writes column name, now character varying(40) instead of character varying(80): a longer value fails
+   ╭─[migrations/0002_users.sql:2:1]
+ 2 │ ALTER TABLE users ALTER COLUMN name TYPE varchar(40);
+   · ────────────────────────────────────────────────────
+   ╰────
+  help: the code deployed at HEAD keeps running while the migration is applied and during the rollout: first deploy code that works with both schemas, then the migration (expand/contract)
+
+warning[breaks_deployed_queries]: this migration breaks the deployed query at src/lib.rs:6 (HEAD): its COPY into users writes column name, now character varying(40) instead of character varying(80): a longer value fails
+   ╭─[migrations/0002_users.sql:2:1]
+ 2 │ ALTER TABLE users ALTER COLUMN name TYPE varchar(40);
+   · ────────────────────────────────────────────────────
+   ╰────
+  help: the code deployed at HEAD keeps running while the migration is applied and during the rollout: first deploy code that works with both schemas, then the migration (expand/contract)
+
+warning[breaks_deployed_queries]: this migration breaks the deployed query at src/lib.rs:5 (HEAD): its UPDATE of users writes column status, which CHECK constraint "users_status_active" now limits it to 'active': writing another value fails
+   ╭─[migrations/0002_users.sql:3:1]
+ 3 │ ALTER TABLE users ADD CONSTRAINT users_status_active CHECK (status = 'active') NOT VALID;
+   · ────────────────────────────────────────────────────────────────────────────────────────
+   ╰────
+  help: the code deployed at HEAD keeps running while the migration is applied and during the rollout: first deploy code that works with both schemas, then the migration (expand/contract)
+```
+
 ## When it stays silent
 
 - Without `--previous-deployment`, or when every migration file is identical to the ref.
 - A deployed query that does not analyze against the deployed schema.
 - A change that does not affect what the deployed code sends or receives: a new nullable column it does not select, a new table, an index, a parameter that now accepts more values.
+- A narrower column the value written certainly fits — a constant, a `CASE` of constants, a column whose type or `CHECK`s keep it in range — and a `CHECK` renamed, or dropped and added again with the same expression.
+- A new `UNIQUE`, primary key or exclusion constraint.
 - An allow comment on the migration statement, or in the deployed query's SQL (see below).
 - A ref where the project has no typedpg configuration, or a database whose migrations don't build at the ref: there is nothing deployed to compare with.
 
-The rule sees the queries typedpg analyzes. SQL built at run time, queries in other services and ad-hoc scripts are outside its view.
+The rule sees the queries typedpg analyzes. SQL built at run time, queries in other services and ad-hoc scripts are outside its view. The TypeScript CLI checks the deployed queries, not yet its `copyIn` targets.
 
 ## Configuration
 

@@ -88,6 +88,9 @@ pub(crate) enum BindingValue {
 pub(crate) struct FoundCopyIn {
     /// The named database (`db = name`), or `None` for the default one.
     pub db: Option<String>,
+    /// The role the call site runs it as (`role = "name"`), replacing the
+    /// database's configured `roles`.
+    pub role: Option<String>,
     /// The literal's cooked value: the `table (columns)` the macro analyzes.
     pub target: String,
     /// Where the literal is in the file.
@@ -204,7 +207,7 @@ impl Finder<'_> {
         if !self.seen.insert(start) {
             return;
         }
-        let Some(((db, _), target)) = parse_copy_in_arguments(mac.tokens.clone()) else {
+        let Some(((db, role), target)) = parse_copy_in_arguments(mac.tokens.clone()) else {
             return;
         };
         let Some(literal) = literal(self.text, target.span(), &target) else {
@@ -212,6 +215,7 @@ impl Finder<'_> {
         };
         self.scan.copies.push(FoundCopyIn {
             db,
+            role,
             target: literal.value.clone(),
             literal,
         });

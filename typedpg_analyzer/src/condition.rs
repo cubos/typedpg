@@ -742,6 +742,107 @@ pub struct WriteConstraint {
     /// 0)`); `None` for a constraint that says nothing it can read of the
     /// column by itself (`CHECK (a < b)`, `CHECK (length(name) > 2)`).
     pub allowed: Option<Refinement>,
+    /// Its top-level AND conjuncts, each read for the column.
+    pub parts: Vec<CheckPart>,
+}
+
+/// One top-level AND conjunct of a [`WriteConstraint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckPart {
+    /// The conjunct, normalized: the same for two conjuncts PostgreSQL's
+    /// `equal()` finds equal (source locations aside), whatever constraint
+    /// they are in or its name — a domain's apart from a relation's.
+    pub key: String,
+    /// The relation's columns it reads (a domain's: the column alone).
+    pub columns: Vec<String>,
+    /// What it says of the column.
+    pub reading: CheckReading,
+}
+
+/// What a [`CheckPart`] says of the column a value is written into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckReading {
+    /// Exactly: the value is NULL or one this refinement allows
+    /// (`kind IN ('a', 'b')`, `n > 0 AND n <= 10`, `isfinite(at)`).
+    Allows(Box<Refinement>),
+    /// Exactly: the value is not NULL (`c IS NOT NULL`).
+    NotNull,
+    /// Something the analyzer can't read exactly of the column alone
+    /// (`length(name) > 2`, `lo <= hi`).
+    Other,
+}
+
+/// What a data-modifying statement of a query writes (see
+/// [`crate::QueryView::writes`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteStatement {
+    pub command: WriteCommand,
+    /// The relation it writes, as the analyzer resolved it.
+    pub relid: crate::oid::PgClassOid,
+    /// The values it writes into the relation's columns, in the order they
+    /// were analyzed: one per VALUES row and per assignment.
+    pub columns: Vec<WrittenColumn>,
+}
+
+/// The command of a [`WriteStatement`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteCommand {
+    Insert,
+    Update,
+    Merge,
+}
+
+/// A value a [`WriteStatement`] writes into a column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WrittenColumn {
+    pub column: String,
+    /// Written by an UPDATE: an UPDATE's SET, an `ON CONFLICT DO UPDATE
+    /// SET`, a MERGE's `UPDATE SET`. Otherwise an inserted row's.
+    pub update: bool,
+    pub value: WrittenValue,
+}
+
+/// How a [`WrittenColumn`]'s value is given.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WrittenValue {
+    /// A bare parameter: its number in [`crate::QueryView::sql`] (`$n`).
+    Parameter(i32),
+    /// `DEFAULT`.
+    Default,
+    /// A value stored inside the column (`arr[1] = …`, `p.x = …`).
+    Inside,
+    /// Any other expression: its type and type modifier, whether it may be
+    /// NULL, and what each non-NULL value is.
+    Expression {
+        type_oid: PgTypeOid,
+        typmod: Option<i32>,
+        nullable: bool,
+        refinement: Box<Refinement>,
+    },
+}
+
+/// The column names `n` reads (bare or qualified), those `known` accepts,
+/// each once.
+fn read_columns(n: Option<&ast::Node>, known: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (node, _) in n.into_iter().flat_map(ast::Node::nodes) {
+        if let typedpg_pg_query::NodeRef::ColumnRef(c) = node
+            && let Some(name) = crate::expr::extract_string_fields(&c.fields).last()
+            && known(name)
+            && !out.contains(name)
+        {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+/// The normalized key of `n` (see [`CheckPart::key`]), prefixed by `kind`.
+fn node_key(kind: &str, n: Option<&ast::Node>) -> String {
+    use typedpg_pg_query::Equal;
+    let mut key = kind.to_owned();
+    n.cloned().equal_key(&mut key);
+    key
 }
 
 impl PgCatalog {
@@ -771,6 +872,7 @@ impl PgCatalog {
             })
             .collect();
         constraints.sort_by(|a, b| a.conname.cmp(&b.conname));
+        let is_column = |name: &str| attrs.iter().any(|a| a.attnum > 0 && a.attname == name);
         let mut out = Vec::new();
         for con in constraints {
             let columns = con
@@ -779,14 +881,19 @@ impl PgCatalog {
                 .filter_map(|n| attrs.iter().find(|a| a.attnum == *n))
                 .map(|a| a.attname.clone())
                 .collect();
-            let allowed = self.check_defs.get(&con.oid).and_then(|def| {
-                let (crate::ddl::tables::check_inherit::StoredExpr::Written(expr), Some(trust)) =
-                    (&def.expr, &def.trusted)
-                else {
-                    return None;
-                };
+            let written =
+                self.check_defs
+                    .get(&con.oid)
+                    .and_then(|def| match (&def.expr, &def.trusted) {
+                        (
+                            crate::ddl::tables::check_inherit::StoredExpr::Written(expr),
+                            Some(trust),
+                        ) => Some(((**expr).as_ref(), trust)),
+                        _ => None,
+                    });
+            let allowed = written.and_then(|(expr, trust)| {
                 let mut r = crate::nonnull::checks::allowed_values(
-                    (**expr).as_ref(),
+                    expr,
                     column,
                     attr.atttypid,
                     attr.attcollation,
@@ -794,7 +901,7 @@ impl PgCatalog {
                     trust,
                 )
                 .unwrap_or_default();
-                if crate::nonnull::checks::finite_columns_of((**expr).as_ref(), trust)
+                if crate::nonnull::checks::finite_columns_of(expr, trust)
                     .iter()
                     .any(|c| c == column)
                 {
@@ -802,10 +909,35 @@ impl PgCatalog {
                 }
                 (r != Refinement::NONE).then_some(r)
             });
+            let parts = match written {
+                Some((expr, trust)) => crate::nonnull::checks::check_conjuncts(expr)
+                    .into_iter()
+                    .map(|n| CheckPart {
+                        key: node_key("relation:", n),
+                        columns: read_columns(n, is_column),
+                        reading: crate::nonnull::checks::read_conjunct(
+                            n,
+                            column,
+                            attr.atttypid,
+                            attr.attcollation,
+                            self,
+                            trust,
+                        ),
+                    })
+                    .collect(),
+                // Not resolved: one part nothing can be read of, known by
+                // the constraint's name.
+                None => vec![CheckPart {
+                    key: format!("unread:{}", con.conname),
+                    columns: vec![column.to_owned()],
+                    reading: CheckReading::Other,
+                }],
+            };
             out.push(WriteConstraint {
                 source: format!("CHECK constraint \"{}\"", con.conname),
                 columns,
                 allowed,
+                parts,
             });
         }
         for domain in self.domain_chain(attr.atttypid) {
@@ -814,6 +946,8 @@ impl PgCatalog {
                 .get(&domain)
                 .map(|t| t.typname.clone())
                 .unwrap_or_default();
+            let base = self.unwrap_domain(domain);
+            let collation = self.pg_type.get(&base).and_then(|t| t.typcollation);
             let mut checks: Vec<&crate::ddl::types::DomainConstraint> = self
                 .domain_constraints
                 .get(&domain)
@@ -825,10 +959,33 @@ impl PgCatalog {
             for check in checks {
                 let mut r = check.allowed.clone().unwrap_or_default();
                 r.finite |= check.finite;
+                let parts = match (&check.expr, &check.trusted) {
+                    (
+                        Some(crate::ddl::tables::check_inherit::StoredExpr::Written(expr)),
+                        Some(trust),
+                    ) => crate::nonnull::checks::check_conjuncts((**expr).as_ref())
+                        .into_iter()
+                        .map(|n| CheckPart {
+                            key: node_key("domain:", n),
+                            columns: vec![column.to_owned()],
+                            // domainAddCheckConstraint reads `VALUE` as a
+                            // column of this name.
+                            reading: crate::nonnull::checks::read_conjunct(
+                                n, "value", base, collation, self, trust,
+                            ),
+                        })
+                        .collect(),
+                    _ => vec![CheckPart {
+                        key: format!("unread-domain:{name}.{}", check.name),
+                        columns: vec![column.to_owned()],
+                        reading: CheckReading::Other,
+                    }],
+                };
                 out.push(WriteConstraint {
                     source: format!("CHECK constraint \"{}\" of domain \"{name}\"", check.name),
                     columns: vec![column.to_owned()],
                     allowed: (r != Refinement::NONE).then_some(r),
+                    parts,
                 });
             }
         }

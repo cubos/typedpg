@@ -1668,6 +1668,21 @@ impl PgCatalog {
         self.analyze_copy_in(target).map_err(LocatedError::new)
     }
 
+    /// [`Self::query_view`] as role `role`, as [`Self::analyze_as`]
+    /// analyzes a statement: the role must be allowed to run it, and its
+    /// search path resolves the query's names.
+    pub fn query_view_as(&self, sql: &str, role: &str) -> Result<QueryView, LocatedError> {
+        self.analyze_as_located(sql, role)?;
+        let path = self.role_search_path(role);
+        if path == self.search_path {
+            self.query_view(sql)
+        } else {
+            let mut catalog = self.clone();
+            catalog.search_path = path;
+            catalog.query_view(sql)
+        }
+    }
+
     /// Analyze `sql` for a tool that reads its parse tree, without applying
     /// the query simplifications.
     ///
@@ -1732,6 +1747,8 @@ impl PgCatalog {
             case_when_passed: lint_facts.case_when_passed,
             count_arg_nullable: lint_facts.count_arg_nullable,
             null_test_settled: lint_facts.null_test_settled,
+            writes: lint_facts.writes,
+            relation_uses: lint_facts.relation_uses,
         })
     }
 
@@ -2943,6 +2960,87 @@ struct LintFacts {
     case_when_passed: HashMap<i32, bool>,
     count_arg_nullable: HashMap<i32, bool>,
     null_test_settled: HashMap<i32, bool>,
+    writes: Vec<crate::condition::WriteStatement>,
+    /// The indexes in `writes` of the statements being analyzed, innermost
+    /// last.
+    open_writes: Vec<usize>,
+    relation_uses: Vec<(PgClassOid, char)>,
+}
+
+/// While alive, the data-modifying statement [`note_write_statement`]
+/// recorded is being analyzed: the values written go to it.
+pub(crate) struct WriteStatementGuard(bool);
+
+impl Drop for WriteStatementGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            LINT_FACTS.with(|facts| {
+                if let Some(facts) = facts.borrow_mut().as_mut() {
+                    facts.open_writes.pop();
+                }
+            });
+        }
+    }
+}
+
+/// Record that the query has a data-modifying statement, `command` on
+/// relation `relid` (as the analyzer resolved it): while the guard lives,
+/// the values written go to it (see [`note_written`]) — but those of a
+/// data-modifying statement nested in it (a CTE), which go to that one.
+#[must_use]
+pub(crate) fn note_write_statement(
+    command: crate::condition::WriteCommand,
+    relid: PgClassOid,
+) -> WriteStatementGuard {
+    LINT_FACTS.with(|facts| {
+        let mut facts = facts.borrow_mut();
+        let Some(facts) = facts.as_mut() else {
+            return WriteStatementGuard(false);
+        };
+        facts.open_writes.push(facts.writes.len());
+        facts.writes.push(crate::condition::WriteStatement {
+            command,
+            relid,
+            columns: Vec::new(),
+        });
+        WriteStatementGuard(true)
+    })
+}
+
+/// Record that the data-modifying statement being analyzed writes
+/// `value` into its column `column` (`update`: as an UPDATE's SET, an
+/// `ON CONFLICT DO UPDATE SET` or a MERGE's `UPDATE SET`).
+pub(crate) fn note_written(
+    relid: PgClassOid,
+    column: &str,
+    update: bool,
+    value: crate::condition::WrittenValue,
+) {
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut()
+            && let Some(&open) = facts.open_writes.last()
+            && let Some(statement) = facts.writes.get_mut(open)
+            && statement.relid == relid
+        {
+            statement.columns.push(crate::condition::WrittenColumn {
+                column: column.to_owned(),
+                update,
+                value,
+            });
+        }
+    });
+}
+
+/// Record that the query runs command `cmd` on the rows of relation `relid`
+/// (`r` reads them in FROM, `a` INSERT, `w` UPDATE, `d` DELETE).
+pub(crate) fn note_relation_use(relid: PgClassOid, cmd: char) {
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut()
+            && !facts.relation_uses.contains(&(relid, cmd))
+        {
+            facts.relation_uses.push((relid, cmd));
+        }
+    });
 }
 
 /// Record whether the argument of the `count(x)` call at `location` (the
@@ -3348,6 +3446,10 @@ pub struct QueryView {
     /// Whether the other `AND` arguments of its condition settle each
     /// `IS [NOT] NULL` test, by the test's location in [`Self::sql`].
     null_test_settled: HashMap<i32, bool>,
+    /// The data-modifying statements, in the order they were analyzed.
+    writes: Vec<crate::condition::WriteStatement>,
+    /// The relations whose rows the query reads or writes, with the command.
+    relation_uses: Vec<(PgClassOid, char)>,
 }
 
 impl QueryView {
@@ -3359,6 +3461,23 @@ impl QueryView {
     /// when the test is not such an argument.
     pub fn null_test_settled(&self, location: i32) -> Option<bool> {
         self.null_test_settled.get(&location).copied()
+    }
+
+    /// The query's data-modifying statements — its INSERTs (`ON CONFLICT DO
+    /// UPDATE SET` included), UPDATEs and MERGEs, data-modifying CTEs too —
+    /// each with the relation it writes as the analyzer resolved it (a CTE
+    /// of the same name or the search path can't mislead it) and the values
+    /// it writes into the relation's columns: one entry per VALUES row and
+    /// assignment.
+    pub fn writes(&self) -> &[crate::condition::WriteStatement] {
+        &self.writes
+    }
+
+    /// The relations whose rows the query reads in FROM (`r`) or writes as
+    /// a statement's target (`a` INSERT, `w` UPDATE, `d` DELETE; a MERGE
+    /// each command it has an action of), as the analyzer resolved them.
+    pub fn relation_uses(&self) -> &[(PgClassOid, char)] {
+        &self.relation_uses
     }
 
     /// Whether a row may take the branch of the `CASE` `WHEN` at

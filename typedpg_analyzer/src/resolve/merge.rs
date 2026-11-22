@@ -130,6 +130,9 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         ..Scope::default()
     };
     target_scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
+    // The values its actions write, until it is analyzed.
+    let _write =
+        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Merge, table_oid);
     note_merge_privileges(merge, table_oid, &table_attrs);
     let mut source_scope = Scope {
         ctes: cte_scopes.clone(),
@@ -702,7 +705,17 @@ fn merge_when_insert(
         match (target_col, &target) {
             (Some(tc), Some(t)) => {
                 let goal = TypeGoal::assignment(t.type_oid).with_source_column(&tc.attname);
-                t.infer_value(val.as_ref(), goal, ctx, params)?;
+                let value = t.infer_value(val.as_ref(), goal, ctx, params)?;
+                if !discards(tc) {
+                    note_written(
+                        tc.attrelid,
+                        &tc.attname,
+                        false,
+                        t.indirected,
+                        val.as_ref(),
+                        Some(&value),
+                    );
+                }
             }
             _ if is_set_to_default(val.as_ref()) => {}
             _ => {
@@ -1007,6 +1020,7 @@ fn note_merge_privileges(
         };
         match when.command_type {
             CmdType::CmdInsert => {
+                crate::pg_catalog::note_relation_use(table_oid, 'a');
                 note_relation(table_oid, bits::INSERT);
                 crate::privileges::note_write(
                     table_oid,
@@ -1046,6 +1060,7 @@ fn note_merge_privileges(
                 }
             }
             CmdType::CmdUpdate => {
+                crate::pg_catalog::note_relation_use(table_oid, 'w');
                 note_relation(table_oid, bits::UPDATE);
                 crate::privileges::note_write(
                     table_oid,
@@ -1066,6 +1081,7 @@ fn note_merge_privileges(
                 }
             }
             CmdType::CmdDelete => {
+                crate::pg_catalog::note_relation_use(table_oid, 'd');
                 note_relation(table_oid, bits::DELETE);
                 crate::privileges::note_write(
                     table_oid,

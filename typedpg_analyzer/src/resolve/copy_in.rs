@@ -24,6 +24,8 @@ pub struct AnalyzedCopyIn {
     /// is whether a value may be NULL: false for a NOT NULL column (even a
     /// NOT VALID constraint checks new rows) or a NOT NULL domain.
     pub columns: Vec<AnalyzedColumn>,
+    /// The table the target names, as the analyzer resolved it.
+    pub relid: crate::oid::PgClassOid,
 }
 
 /// A grammar error in the `COPY <target> FROM STDIN` built around a
@@ -237,6 +239,7 @@ impl PgCatalog {
                 column_list.join(", ")
             ),
             columns,
+            relid,
         })
     }
 }

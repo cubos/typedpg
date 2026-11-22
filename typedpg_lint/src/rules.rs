@@ -40,8 +40,6 @@ mod unreachable_case_branch;
 mod unstable_order;
 mod unused_cte;
 
-pub(crate) use insert_without_columns::width as insert_width;
-
 /// The operators `null_comparison` reports: the ordinary comparisons, not
 /// `IS [NOT] DISTINCT FROM` or the pattern operators.
 const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];

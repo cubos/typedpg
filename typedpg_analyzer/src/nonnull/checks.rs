@@ -1914,6 +1914,83 @@ pub(crate) fn allowed_values(
     )
 }
 
+/// The top-level AND conjuncts of a CHECK expression.
+pub(crate) fn check_conjuncts(expr: Option<&ast::Node>) -> Vec<Option<&ast::Node>> {
+    conjuncts(expr)
+}
+
+/// How conjunct `n` of a CHECK expression constrains column `c`, of type
+/// `t` under `collation`: exactly `c IS NOT NULL`; exactly what a
+/// refinement says — a conjunction of comparisons of `c` with constants
+/// (`c > 0 AND c <= 10`), an OR of `c = v` / `c IN (…)` of a type whose
+/// equal values print the same, `isfinite(c)` — or anything else. What
+/// [`allowed_values`] reads of a conjunct it reads only in part (`c IN
+/// ('a') OR length(c) > 3`, a comparison with another column) is `Other`:
+/// the refinement then allows values the conjunct rejects.
+pub(crate) fn read_conjunct(
+    n: Option<&ast::Node>,
+    c: &str,
+    t: PgTypeOid,
+    collation: Option<crate::oid::PgCollationOid>,
+    snapshot: &PgCatalog,
+    trust: &TrustedNodes,
+) -> crate::condition::CheckReading {
+    if finite_column(n, trust).is_some_and(|col| col == c) {
+        return crate::condition::CheckReading::Allows(Box::new(crate::refine::Refinement {
+            finite: true,
+            ..crate::refine::Refinement::NONE
+        }));
+    }
+    let is_composite = |_: &str| false;
+    let column_type = |name: &str| (name == c).then_some(t);
+    let subjects = std::cell::RefCell::new(HashMap::new());
+    let cx = Cx {
+        is_composite: &is_composite,
+        column_type: &column_type,
+        snapshot,
+        trust,
+        subjects: &subjects,
+        env: None,
+        depth: 0,
+        exact: false,
+    };
+    let Some(arms) = dnf(n, true, &cx) else {
+        return crate::condition::CheckReading::Other;
+    };
+    if let [arm] = arms.as_slice()
+        && let [Lit::NotNull(col)] = arm.as_slice()
+        && col == c
+    {
+        return crate::condition::CheckReading::NotNull;
+    }
+    let comparisons = !arms.is_empty()
+        && arms
+            .iter()
+            .flatten()
+            .all(|l| matches!(l, Lit::Val(col, ValPred::In(_) | ValPred::Cmp(..)) if col == c));
+    // One conjunction of comparisons, or an OR of value lists.
+    let shaped = arms.len() == 1
+        || arms
+            .iter()
+            .all(|arm| matches!(arm.as_slice(), [Lit::Val(_, ValPred::In(_))]));
+    if !comparisons || !shaped {
+        return crate::condition::CheckReading::Other;
+    }
+    let lists = arms
+        .iter()
+        .flatten()
+        .any(|l| matches!(l, Lit::Val(_, ValPred::In(_))));
+    match allowed_values(n, c, t, collation, snapshot, trust) {
+        // A value list kept only as bounds (of a type whose equal values
+        // print differently) allows more than it.
+        Some(r) if lists && r.values.is_none() => crate::condition::CheckReading::Other,
+        Some(r) if r != crate::refine::Refinement::NONE => {
+            crate::condition::CheckReading::Allows(Box::new(r))
+        }
+        _ => crate::condition::CheckReading::Other,
+    }
+}
+
 /// The columns a constraint expression keeps finite (see [`finite_column`]).
 pub(crate) fn finite_columns_of(expr: Option<&ast::Node>, trust: &impl Trust) -> Vec<String> {
     conjuncts(expr)

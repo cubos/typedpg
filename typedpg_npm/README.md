@@ -557,8 +557,9 @@ npx typedpg lint --fix     # apply the findings' SQL fixes, then lint again
 npx typedpg build          # compile the .sql files into the loaders' cache
 ```
 
-`lint` runs these rules over the queries and the database's migrations. Each
-rule has a page in
+`lint` runs these rules over the queries — analyzed as the database's
+`roles`, as `typedpg check` analyzes them, the first role's analysis read by
+the rules — and the database's migrations. Each rule has a page in
 [`docs/lint`](https://github.com/cubos/typedpg/blob/main/docs/lint/README.md)
 with its motivation, what it proves, examples and configuration:
 
@@ -671,14 +672,19 @@ analyzes, a result column is gone, changes type or may now be NULL, the column
 list changes, a parameter changes type or no longer accepts NULL, an `INSERT
 … SELECT` leaves out a new `NOT NULL` column without a default, or a result
 may now be a value the code doesn't know (a new enum label, a wider `CHECK`).
-An `INSERT` or `UPDATE` breaks when a column it writes accepts fewer values:
-a shorter `varchar(n)`, a `numeric` with fewer digits (a value fails, or is
-rounded when it has fewer after the decimal point), a new or narrower `CHECK`
-of the table or the column's domain (`NOT VALID` ones too); a new `CHECK`
-over several columns it writes may reject its rows. A new `UNIQUE` constraint
-is not reported. Each query is analyzed as the database's `roles`, so a
-revoked privilege, or row-level security that leaves a role no policy, is
-reported too.
+An `INSERT`, `UPDATE` or `MERGE` breaks when a column it writes accepts fewer
+values than the value it writes may be: a shorter `varchar(n)`, a `numeric`
+with fewer digits (a value fails, or is rounded when it has fewer after the
+decimal point), a new `NOT NULL`, a new or narrower `CHECK` of the table or
+the column's domain (`NOT VALID` ones too). A parameter may be any value; a
+constant, a `CASE` of constants or a column whose own type or `CHECK`s keep
+it in range is reported only when it may not fit. A `CHECK` conjunct the
+analyzer can't read of one column (`length(name) > 1`) may reject the rows
+writing the columns it reads; constraints are compared by what they check,
+not their name. A new `UNIQUE` constraint is not reported. Each query is
+analyzed as the database's `roles`, so a revoked privilege, or row-level
+security that denies a role the rows (no policy for it, or only ones that are
+never true), is reported too.
 Deploy code that works with both schemas first, then the migration
 (expand/contract).
 `--fix` writes the SQL fixes findings carry (the ones that have them; migration

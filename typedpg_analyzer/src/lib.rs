@@ -113,7 +113,10 @@ pub use pg_catalog::{
 };
 
 pub use analysis_diff::{AnalysisDifference, first_difference};
-pub use condition::{AssignmentViolation, ConditionFact, ConditionReason, WriteConstraint};
+pub use condition::{
+    AssignmentViolation, CheckPart, CheckReading, ConditionFact, ConditionReason, WriteCommand,
+    WriteConstraint, WriteStatement, WrittenColumn, WrittenValue,
+};
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{
