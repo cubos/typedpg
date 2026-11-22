@@ -25,6 +25,19 @@
 //!    mixing NULL and filled nullable columns (one NULL, or one filled,
 //!    under either variant), so rows on each side of a constraint tying
 //!    columns together (`kind <> 'a' OR a_id IS NOT NULL`) exist.
+//! 5. `bounds` — plus rows holding, one column at a time (the others
+//!    filled), the values a refinement may hinge on: each literal of the
+//!    column's CHECK constraints and domains with its neighbours (b - 1,
+//!    b, b + 1 of an integer; b ± 0.001 of a numeric; b ± a day and a
+//!    microsecond of a date or timestamp), every label of an enum, and
+//!    the query's own literals with their neighbours.
+//! 6. `extremes` — plus rows holding each type's special values the same
+//!    way: integer extremes, numeric and float NaN and infinities, date
+//!    and timestamp infinities, the empty string.
+//!
+//! Scenarios 5 and 6 come last because their values make more queries
+//! fail at runtime (an overflow, an infinity a function rejects), which
+//! skips only that scenario.
 //!
 //! The rows come from `seed.sql`'s `typedpg_seed`, which introspects the
 //! scratch database and builds INSERTs that respect NOT NULL, defaults,
@@ -114,7 +127,20 @@ const UNSAFE_CALLS: &[&str] = &[
 ];
 
 /// The cumulative scenarios, in order: name and seeding mode (0 = none).
-const SCENARIOS: [(&str, i32); 4] = [("as-is", 0), ("nulls", 1), ("full", 2), ("mixed", 3)];
+const SCENARIOS: [(&str, i32); 6] = [
+    ("as-is", 0),
+    ("nulls", 1),
+    ("full", 2),
+    ("mixed", 3),
+    ("bounds", 4),
+    ("extremes", 5),
+];
+
+/// The seeding mode that also takes the query's literals.
+const BOUNDS_MODE: i32 = 4;
+
+/// The query's literals `bounds` tries at most.
+const MAX_LITERALS: usize = 12;
 
 /// What `typedpg_seed(mode)` did: the INSERTs that succeeded, in order,
 /// and the tables it skipped (`table: reason`).
@@ -148,6 +174,10 @@ struct Stats {
     equivalence_checked: u64,
     /// Scenarios in which both ran and their results were compared.
     equivalence_compared: u64,
+    /// Rows each seeding scenario inserted, summed over the checks.
+    seeded_rows: BTreeMap<String, u64>,
+    /// Successful executions per scenario.
+    scenario_executions: BTreeMap<String, u64>,
 }
 
 /// Per-server oracle state.
@@ -157,7 +187,9 @@ pub(super) struct Soundness {
     /// Bumped on every DDL batch: seeding plans and parameter samples are
     /// valid for one schema generation only.
     schema_gen: u64,
-    plans: HashMap<(u64, i32), SeedPlan>,
+    /// Per (generation, mode, literals): only the `bounds` mode's plan
+    /// depends on the query's literals; the other modes' key has none.
+    plans: HashMap<(u64, i32, Vec<String>), SeedPlan>,
     param_texts: HashMap<(u64, u32, i32), Option<String>>,
     stats: Stats,
 }
@@ -229,12 +261,20 @@ impl Soundness {
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
+        let literals = query_literals(sql);
         let mut tx = client
             .transaction()
             .unwrap_or_else(|e| panic!("pg_sanity: BEGIN failed in the nullability check: {e}"));
         tx.batch_execute("SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '1s'")
             .unwrap_or_else(|e| panic!("pg_sanity: SET LOCAL failed: {e}"));
-        self.check_scenarios(&mut tx, sql, ours, stmt, &checked, &values, &param_refs)
+        let run = ScenarioRun {
+            sql,
+            stmt,
+            checked: &checked,
+            values: &values,
+            literals: &literals,
+        };
+        self.check_scenarios(&mut tx, ours, &run, &param_refs)
     }
 
     /// Parameter values: NULL where the analyzer allows it, a sample of the
@@ -277,27 +317,35 @@ impl Soundness {
     }
 
     /// The scenarios of [`Self::check`].
-    #[allow(clippy::too_many_arguments)]
     fn check_scenarios(
         &mut self,
         tx: &mut Transaction<'_>,
-        sql: &str,
         ours: &AnalyzedQuery,
-        stmt: &Statement,
-        checked: &[bool],
-        values: &[Option<String>],
+        run: &ScenarioRun<'_>,
         param_refs: &[&(dyn ToSql + Sync)],
     ) -> Option<Divergence> {
+        let ScenarioRun {
+            sql,
+            stmt,
+            checked,
+            values,
+            literals,
+        } = *run;
         let mut seeded: Vec<(&str, SeedPlan)> = Vec::new();
         for (scenario, mode) in SCENARIOS {
             if mode > 0 {
-                let plan = self.seed(tx, mode);
+                let plan = self.seed(tx, mode, literals);
                 for skip in &plan.skips {
                     *self.stats.seed_skips.entry(skip.clone()).or_default() += 1;
                 }
-                // Nothing added (no table has mixed rows): the data is the
-                // previous scenario's, already checked.
-                let unchanged = mode == 3 && plan.inserts.is_empty();
+                *self
+                    .stats
+                    .seeded_rows
+                    .entry(scenario.to_owned())
+                    .or_default() += plan.inserts.len() as u64;
+                // Nothing added (no table has mixed or boundary rows): the
+                // data is the previous scenario's, already checked.
+                let unchanged = mode >= 3 && plan.inserts.is_empty();
                 seeded.push((scenario, plan));
                 if unchanged {
                     continue;
@@ -328,6 +376,11 @@ impl Soundness {
                 }
             };
             self.stats.executions += 1;
+            *self
+                .stats
+                .scenario_executions
+                .entry(scenario.to_owned())
+                .or_default() += 1;
             for (r, row) in rows.iter().enumerate() {
                 for (i, col) in ours.columns.iter().enumerate() {
                     if !checked.get(i).copied().unwrap_or(false) {
@@ -337,13 +390,19 @@ impl Soundness {
                         continue;
                     };
                     let problem = match raw {
-                        None if !col.nullable => Some("the value is NULL".to_string()),
+                        None if !col.nullable => {
+                            Some((Unsound::Nullability, "the value is NULL".to_string()))
+                        }
                         None => None,
                         Some(bytes) => inner_violation(&col.pg_type, bytes)
-                            .or_else(|| refinement_violation(col, bytes)),
+                            .map(|p| (Unsound::Nullability, p))
+                            .or_else(|| {
+                                refinement_violation(col, bytes).map(|p| (Unsound::Refinement, p))
+                            }),
                     };
-                    if let Some(problem) = problem {
-                        let message = render(sql, ours, i, r, &problem, scenario, values, &seeded);
+                    if let Some((what, problem)) = problem {
+                        let message =
+                            render(sql, ours, i, r, what, &problem, scenario, values, &seeded);
                         return Some(Divergence {
                             kind: DivergenceKind::Nullability,
                             message,
@@ -385,6 +444,7 @@ impl Soundness {
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         let order_keys = order_keys(original.0, ours);
         let targets = written_tables(original.0);
+        let literals = query_literals(original.0);
 
         let mut tx = client
             .transaction()
@@ -394,8 +454,8 @@ impl Soundness {
         let mut seeded: Vec<(&str, SeedPlan)> = Vec::new();
         for (scenario, mode) in SCENARIOS {
             if mode > 0 {
-                let plan = self.seed(&mut tx, mode);
-                let unchanged = mode == 3 && plan.inserts.is_empty();
+                let plan = self.seed(&mut tx, mode, &literals);
+                let unchanged = mode >= 3 && plan.inserts.is_empty();
                 seeded.push((scenario, plan));
                 if unchanged {
                     continue;
@@ -492,13 +552,18 @@ impl Soundness {
         if !self.enabled {
             return false;
         }
-        !self.seed(tx, 2).inserts.is_empty()
+        !self.seed(tx, 2, &[]).inserts.is_empty()
     }
 
-    /// Seed one row per table for `mode`, replaying this generation's plan
-    /// when there is one.
-    fn seed(&mut self, tx: &mut Transaction<'_>, mode: i32) -> SeedPlan {
-        let key = (self.schema_gen, mode);
+    /// Seed the rows of `mode` (the `bounds` mode trying the query's
+    /// `literals` too), replaying this generation's plan when there is one.
+    fn seed(&mut self, tx: &mut Transaction<'_>, mode: i32, literals: &[String]) -> SeedPlan {
+        let literals: Vec<String> = if mode == BOUNDS_MODE {
+            literals.to_vec()
+        } else {
+            Vec::new()
+        };
+        let key = (self.schema_gen, mode, literals);
         if let Some(plan) = self.plans.get(&key) {
             if plan.inserts.is_empty() {
                 return plan.clone();
@@ -518,8 +583,8 @@ impl Soundness {
             .transaction()
             .unwrap_or_else(|e| panic!("pg_sanity: SAVEPOINT failed: {e}"));
         let plan = match sp.query(
-            "SELECT kind, detail FROM pg_temp.typedpg_seed($1)",
-            &[&mode],
+            "SELECT kind, detail FROM pg_temp.typedpg_seed($1, $2)",
+            &[&mode, &key.2],
         ) {
             Ok(rows) => {
                 let mut plan = SeedPlan::default();
@@ -605,6 +670,12 @@ impl Soundness {
             ("equivalence_compared", s.equivalence_compared),
         ] {
             out.push_str(&format!("count\t{name}\t{n}\n"));
+        }
+        for (scenario, n) in &s.scenario_executions {
+            out.push_str(&format!("scenario\t{scenario}\t{n}\n"));
+        }
+        for (scenario, n) in &s.seeded_rows {
+            out.push_str(&format!("seeded\t{scenario}\t{n}\n"));
         }
         for (code, n) in &s.exec_error_codes {
             out.push_str(&format!("error\t{code}\t{n}\n"));
@@ -1093,6 +1164,7 @@ fn render(
     ours: &AnalyzedQuery,
     col: usize,
     row: usize,
+    what: Unsound,
     problem: &str,
     scenario: &str,
     values: &[Option<String>],
@@ -1125,16 +1197,68 @@ fn render(
             seeding.push_str(&format!("    skipped {skip}\n"));
         }
     }
+    let (kind, inferred) = match what {
+        Unsound::Nullability => (
+            "nullability",
+            if c.nullable { "nullable" } else { "NOT NULL" }.to_owned(),
+        ),
+        Unsound::Refinement => ("refinement", format!("{:?}", c.refinement)),
+    };
     format!(
-        "pg_sanity: nullability unsound: column {col} '{}' ({}) inferred {}, but in a result row \
-         {problem}.\n\
+        "pg_sanity: {kind} unsound: column {col} '{}' ({}) inferred {inferred}, but in result \
+         row {} of scenario `{scenario}` {problem}.\n\
          SQL:\n---\n{sql}\n---\n\
-         scenario: {scenario} (row {})\nparams: {params}\nseeding:\n{seeding}",
+         params: {params}\nseeding (cumulative, up to `{scenario}`):\n{seeding}",
         c.name,
         super::qualified_type_name_for_compare(&c.pg_type),
-        if c.nullable { "nullable" } else { "NOT NULL" },
         row + 1,
     )
+}
+
+/// Which promise a result value broke.
+#[derive(Debug, Clone, Copy)]
+enum Unsound {
+    Nullability,
+    Refinement,
+}
+
+/// What [`Soundness::check_scenarios`] runs, besides the parameters.
+#[derive(Clone, Copy)]
+struct ScenarioRun<'a> {
+    sql: &'a str,
+    stmt: &'a Statement,
+    checked: &'a [bool],
+    values: &'a [Option<String>],
+    literals: &'a [String],
+}
+
+/// The constants written in `sql` (numbers as written, strings unquoted),
+/// sorted, distinct, at most [`MAX_LITERALS`]: the `bounds` scenario
+/// seeds them and their neighbours, since a refinement often hinges on a
+/// value the query compares with.
+fn query_literals(sql: &str) -> Vec<String> {
+    use typedpg_pg_query::NodeRef;
+    use typedpg_pg_query::ast::AConstValue;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = parsed
+        .tree
+        .nodes()
+        .filter_map(|(n, _)| match n {
+            NodeRef::AConst(c) => match c.val.as_ref()? {
+                AConstValue::Integer(i) => Some(i.ival.to_string()),
+                AConstValue::Float(f) => Some(f.fval.clone()),
+                AConstValue::String(s) => Some(s.sval.clone()),
+                AConstValue::Boolean(_) | AConstValue::BitString(_) => None,
+            },
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_LITERALS);
+    out
 }
 
 /// A result value as raw binary bytes (`None` for NULL), whatever its type.
