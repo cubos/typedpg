@@ -1090,3 +1090,274 @@ fn a_constant_out_of_a_domains_bounds_fails() {
         db.analyze(sql).unwrap();
     }
 }
+
+// ── Column equalities and ORs of conditions ──────────────────────────────────
+
+fn equalities_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TABLE p (id int PRIMARY KEY, kind text NOT NULL CHECK (kind IN ('a', 'b')),
+                         n int NOT NULL CHECK (n BETWEEN 1 AND 10),
+                         num numeric NOT NULL CHECK (num BETWEEN 1 AND 2),
+                         d date NOT NULL CHECK (d BETWEEN '2020-01-01' AND '2020-12-31'),
+                         ts timestamp NOT NULL, ci text COLLATE ci CHECK (ci IN ('a', 'b')),
+                         pad char(1) NOT NULL CHECK (pad IN ('a', 'b')));
+         CREATE TABLE c (id int PRIMARY KEY, kind text, n int, small int2, big int8,
+                         num numeric, f float8, d date, ts timestamp, label varchar,
+                         ci text COLLATE ci);
+         CREATE TABLE g (id int PRIMARY KEY, kind text, n int);
+         CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS
+             $$BEGIN NEW.kind := 'z'; RETURN NEW; END$$;
+         CREATE TABLE trg (id int PRIMARY KEY, kind text, n int);
+         CREATE TRIGGER touch BEFORE UPDATE ON trg FOR EACH ROW EXECUTE FUNCTION touch();",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn an_equality_with_another_column_carries_its_values() {
+    let db = equalities_setup();
+    // Across an inner join's ON: `p`'s CHECK constraints bound `c`'s columns.
+    assert_values(
+        &db,
+        "SELECT c.kind, c.label FROM p JOIN c ON c.kind = p.kind AND c.label = p.kind",
+        &[("kind", Some(&["a", "b"])), ("label", Some(&["a", "b"]))],
+    );
+    assert_ranges(
+        &db,
+        "SELECT c.n, c.small, c.big FROM p JOIN c ON c.n = p.n AND p.n = c.small AND c.big = c.n",
+        &[
+            ("n", false, Some(1), Some(10)),
+            ("small", false, Some(1), Some(10)),
+            ("big", false, Some(1), Some(10)),
+        ],
+    );
+    // Transitively, through WHERE: `g.kind = c.kind = p.kind = 'a'`.
+    assert_values(
+        &db,
+        "SELECT g.kind, c.kind AS ck FROM p, c, g
+         WHERE g.kind = c.kind AND c.kind = p.kind AND p.kind = 'a'",
+        &[("kind", Some(&["a"])), ("ck", Some(&["a"]))],
+    );
+    assert_ranges(
+        &db,
+        "SELECT g.n FROM p, c, g WHERE g.n = c.n AND c.n = p.n AND p.n < 4",
+        &[("n", false, Some(1), Some(3))],
+    );
+    assert_bounds(
+        &db,
+        "SELECT c.num, c.d FROM p JOIN c ON c.num = p.num AND c.d = p.d",
+        &[("num", Some("[1, 2]")), ("d", Some("[7305, 7670]"))],
+    );
+    // The other column's values refute a CASE branch.
+    let s = db
+        .analyze(
+            "SELECT CASE WHEN c.kind = 'x' THEN NULL ELSE 1 END AS x
+             FROM p JOIN c ON c.kind = p.kind",
+        )
+        .unwrap();
+    assert!(!s.columns[0].nullable);
+}
+
+#[test]
+fn an_outer_joins_on_narrows_only_its_nullable_side() {
+    let db = equalities_setup();
+    // The preserved side keeps every row, whether the ON holds or not.
+    assert_values(
+        &db,
+        "SELECT c.kind FROM c LEFT JOIN p ON c.kind = p.kind",
+        &[("kind", None)],
+    );
+    assert_values(
+        &db,
+        "SELECT c.kind FROM p RIGHT JOIN c ON p.kind = c.kind",
+        &[("kind", None)],
+    );
+    assert_ranges(
+        &db,
+        "SELECT c.n FROM c LEFT JOIN p ON p.n = c.n",
+        &[("n", true, None, None)],
+    );
+    // The nullable side is there only where the ON holds (or NULL).
+    assert_values(
+        &db,
+        "SELECT g.kind FROM p LEFT JOIN g ON g.kind = p.kind",
+        &[("kind", Some(&["a", "b"]))],
+    );
+    assert_values(
+        &db,
+        "SELECT g.kind FROM c LEFT JOIN g ON g.kind = c.kind WHERE c.kind IN ('x', 'y')",
+        &[("kind", Some(&["x", "y"]))],
+    );
+    // A FULL join narrows neither side.
+    assert_values(
+        &db,
+        "SELECT g.kind FROM p FULL JOIN g ON g.kind = p.kind",
+        &[("kind", None)],
+    );
+    // WHERE narrows both (and reduces the outer join).
+    assert_values(
+        &db,
+        "SELECT c.kind FROM c LEFT JOIN p ON true WHERE c.kind = p.kind",
+        &[("kind", Some(&["a", "b"]))],
+    );
+}
+
+#[test]
+fn equalities_across_types_and_collations_carry_nothing() {
+    let db = equalities_setup();
+    // `numeric = int4` compares numerics, `float8 = numeric` floats;
+    // `date = timestamp` timestamps; `bpchar = text` trims the padding.
+    assert_bounds(
+        &db,
+        "SELECT c.num, c.ts FROM p JOIN c ON c.num = p.n AND c.ts = p.d",
+        &[("num", None), ("ts", None)],
+    );
+    assert_bounds(
+        &db,
+        "SELECT p.num FROM c JOIN p ON c.f = p.num AND c.n = p.n",
+        &[("num", Some("[1, 2]"))],
+    );
+    assert_values(
+        &db,
+        "SELECT c.kind FROM p JOIN c ON c.kind = p.pad",
+        &[("kind", None)],
+    );
+    // Under a nondeterministic collation `'A'` equals `'a'`.
+    assert_values(
+        &db,
+        "SELECT c.ci FROM p JOIN c ON c.ci = p.ci",
+        &[("ci", None)],
+    );
+    // A column compared with an expression is not narrowed.
+    assert_values(
+        &db,
+        "SELECT c.kind FROM p JOIN c ON c.kind = p.kind || ''",
+        &[("kind", None)],
+    );
+    // A subquery's `b` is not the outer `b`.
+    assert_values(
+        &db,
+        "SELECT a.kind, b.kind AS bk FROM c a, g b
+         WHERE EXISTS (SELECT 1 FROM p b WHERE b.kind = a.kind)",
+        &[("kind", None), ("bk", None)],
+    );
+}
+
+#[test]
+fn returning_after_set_is_not_narrowed_by_where() {
+    let db = equalities_setup();
+    // RETURNING reads the new row: `kind` is what SET wrote, not `'a'`.
+    assert_values(
+        &db,
+        "UPDATE p SET kind = 'b' WHERE kind = 'a' RETURNING kind",
+        &[("kind", None)],
+    );
+    assert_values(
+        &db,
+        "UPDATE g SET kind = 'z' FROM p WHERE g.kind = p.kind AND p.kind = 'a'
+         RETURNING g.kind, p.kind AS pk",
+        &[("kind", None), ("pk", Some(&["a"]))],
+    );
+    // A column SET leaves alone keeps the equality.
+    assert_values(
+        &db,
+        "UPDATE g SET n = 1 FROM p WHERE g.kind = p.kind AND p.kind = 'a' RETURNING g.kind",
+        &[("kind", Some(&["a"]))],
+    );
+    // Unless a BEFORE ROW trigger may rewrite it.
+    assert_values(
+        &db,
+        "UPDATE trg SET n = 1 FROM p WHERE trg.kind = p.kind AND p.kind = 'a'
+         RETURNING trg.kind",
+        &[("kind", None)],
+    );
+    // A DELETE returns the row WHERE saw.
+    assert_values(
+        &db,
+        "DELETE FROM g USING p WHERE g.kind = p.kind RETURNING g.kind",
+        &[("kind", Some(&["a", "b"]))],
+    );
+}
+
+#[test]
+fn an_or_of_conditions_on_a_column_bounds_it_by_their_hull() {
+    let db = equalities_setup();
+    assert_ranges(
+        &db,
+        "SELECT n FROM c WHERE n BETWEEN 1 AND 3 OR n BETWEEN 7 AND 9",
+        &[("n", false, Some(1), Some(9))],
+    );
+    assert_values(
+        &db,
+        "SELECT n FROM c WHERE n BETWEEN 1 AND 3 OR n BETWEEN 7 AND 9",
+        &[("n", Some(&["1", "2", "3", "7", "8", "9"]))],
+    );
+    // An IN list and a range: within the hull of both.
+    assert_values(
+        &db,
+        "SELECT n FROM c WHERE n IN (20, 30) OR (n > 0 AND n < 3)",
+        &[("n", Some(&["1", "2", "20", "30"]))],
+    );
+    assert_ranges(
+        &db,
+        "SELECT n FROM c WHERE n IN (20, 30) OR (n > 0 AND n < 3)",
+        &[("n", false, Some(1), Some(30))],
+    );
+    assert_values(
+        &db,
+        "SELECT n FROM c WHERE n = 12 OR n IN (5, 6) OR n BETWEEN 1 AND 2",
+        &[("n", Some(&["1", "12", "2", "5", "6"]))],
+    );
+    // One side unbounded: no hull on that side.
+    assert_ranges(
+        &db,
+        "SELECT n FROM c WHERE n < 0 OR n BETWEEN 5 AND 7",
+        &[("n", false, None, Some(7))],
+    );
+    assert_bounds(
+        &db,
+        "SELECT d FROM c WHERE d < '2020-01-01' OR d BETWEEN '2024-01-01' AND '2024-12-31'",
+        &[("d", Some("(, 9131]"))],
+    );
+    // An arm another condition rules out leaves the hull.
+    assert_ranges(
+        &db,
+        "SELECT n FROM c WHERE (n < 0 OR n BETWEEN 5 AND 7) AND n >= 0",
+        &[("n", false, Some(5), Some(7))],
+    );
+    // A range is one interval: `n < 0 OR n > 10` bounds nothing, but its
+    // gap still refutes a branch (and the NOT of it is the gap).
+    assert_ranges(
+        &db,
+        "SELECT n FROM c WHERE n < 0 OR n > 10",
+        &[("n", false, None, None)],
+    );
+    let s = db
+        .analyze(
+            "SELECT CASE WHEN n BETWEEN 0 AND 10 THEN NULL ELSE 1 END AS x,
+                    CASE WHEN d >= '2021-01-01' AND d < '2022-01-01' THEN NULL ELSE 1 END AS y
+             FROM c WHERE (n < 0 OR n > 10)
+               AND (d < '2020-01-01' OR d BETWEEN '2024-01-01' AND '2024-12-31')",
+        )
+        .unwrap();
+    assert!(!s.columns[0].nullable && !s.columns[1].nullable);
+    assert_ranges(
+        &db,
+        "SELECT n FROM c WHERE NOT (n < 0 OR n > 10)",
+        &[("n", false, Some(0), Some(10))],
+    );
+    assert_ranges(
+        &db,
+        "SELECT CASE WHEN n < 0 OR n > 10 THEN 0 ELSE n END AS n FROM c WHERE n IS NOT NULL",
+        &[("n", false, Some(0), Some(10))],
+    );
+    // An arm saying nothing of the column: nothing is known.
+    assert_ranges(
+        &db,
+        "SELECT n FROM c WHERE n BETWEEN 1 AND 3 OR kind = 'a'",
+        &[("n", true, None, None)],
+    );
+}

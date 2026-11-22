@@ -465,18 +465,40 @@ pub(crate) enum ValPred {
     NotIn(Vec<Literal>),
     /// `c op v`.
     Cmp(CmpOp, Literal),
+    /// Every predicate of one of the arms (an OR of conditions on the
+    /// column: `n < 0 OR n BETWEEN 5 AND 7 OR n IN (20, 30)`). A
+    /// [`checks::Space`] reads it exactly where it tests a value, and as
+    /// the hull of its arms where it computes bounds (a refinement's range
+    /// is a single interval). One arm is a conjunction.
+    AnyOf(Vec<Vec<ValPred>>),
 }
 
 impl ValPred {
-    /// What the comparison not being TRUE says of a non-NULL column.
+    /// What the comparison not being TRUE says of a non-NULL column. For
+    /// [`ValPred::AnyOf`], De Morgan's laws: a non-NULL column compared
+    /// with non-NULL constants makes every comparison TRUE or FALSE.
     pub fn negated(&self) -> ValPred {
         match self {
             ValPred::In(vs) => ValPred::NotIn(vs.clone()),
             ValPred::NotIn(vs) => ValPred::In(vs.clone()),
             ValPred::Cmp(op, v) => ValPred::Cmp(op.negated(), v.clone()),
+            // NOT (A1 OR A2): NOT A1 AND NOT A2, one arm; NOT (p AND q):
+            // NOT p OR NOT q.
+            ValPred::AnyOf(arms) => ValPred::AnyOf(vec![
+                arms.iter()
+                    .map(|arm| match arm.as_slice() {
+                        [p] => p.negated(),
+                        _ => ValPred::AnyOf(arm.iter().map(|p| vec![p.negated()]).collect()),
+                    })
+                    .collect(),
+            ]),
         }
     }
 }
+
+/// The most arms a [`ValPred::AnyOf`] an OR merges into keeps (beyond, the
+/// OR says nothing of the column but the value set its arms' `IN`s make).
+const MAX_ARMS: usize = 32;
 
 /// What a condition proves:
 ///
@@ -492,7 +514,12 @@ impl ValPred {
 /// - `exprs`: expressions other than a column proven non-NULL, by
 ///   [`exprs::key`] (`j ->> 'k' IS NOT NULL`, `max(b) > 0` in HAVING) —
 ///   only ones that give the same value wherever they are evaluated for
-///   a row (see [`exprs::reusable`]).
+///   a row (see [`exprs::reusable`]);
+/// - `same`: `(target, source)` pairs of columns, where `target`
+///   non-NULL means `source` is non-NULL and equal to it under the
+///   built-in equality (`a.x = b.y`: both ways; an outer join's ON, only
+///   from the nullable side's column to the preserved one's). What holds
+///   of `source`'s value holds of `target`'s ([`equivalence_facts`]).
 ///
 /// The last four feed the reasoning with CHECK constraints and
 /// COALESCE / GREATEST / LEAST (see [`checks`]).
@@ -505,6 +532,7 @@ pub(crate) struct Facts {
     pub equals: HashMap<Col, Literal>,
     pub preds: Vec<(Col, ValPred)>,
     pub exprs: HashSet<String>,
+    pub same: Vec<(Col, Col)>,
 }
 
 impl Facts {
@@ -516,6 +544,7 @@ impl Facts {
             && self.equals.is_empty()
             && self.preds.is_empty()
             && self.exprs.is_empty()
+            && self.same.is_empty()
     }
 
     fn pred(col: Col, pred: ValPred) -> Facts {
@@ -575,7 +604,30 @@ impl Facts {
             }
         }
         self.exprs.extend(other.exprs);
+        for e in other.same {
+            if !self.same.contains(&e) {
+                self.same.push(e);
+            }
+        }
         self
+    }
+
+    /// Everything these facts say of column `c`'s value if it is
+    /// non-NULL: its predicates, and its constant.
+    pub(crate) fn preds_of(&self, c: &Col) -> Vec<ValPred> {
+        let mut out: Vec<ValPred> = self
+            .preds
+            .iter()
+            .filter(|(pc, _)| pc == c)
+            .map(|(_, p)| p.clone())
+            .collect();
+        if let Some(v) = self.equals.get(c) {
+            let p = ValPred::In(vec![v.clone()]);
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
     }
 
     /// The constants a column is known to be one of (if non-NULL).
@@ -646,6 +698,12 @@ impl Facts {
                 .filter(|e| other.exprs.contains(*e))
                 .cloned()
                 .collect(),
+            same: self
+                .same
+                .iter()
+                .filter(|e| other.same.contains(e))
+                .cloned()
+                .collect(),
         };
         // `kind = 'a' OR kind = 'b'`: one of the constants either side
         // allows.
@@ -667,6 +725,32 @@ impl Facts {
                 if !out.preds.contains(&p) {
                     out.preds.push(p);
                 }
+            }
+            // `n < 0 OR n BETWEEN 5 AND 7`: what one side or the other says
+            // of the column (beyond a plain union of value sets, above).
+            let (a, b) = (self.preds_of(c), other.preds_of(c));
+            let plain = |ps: &[ValPred]| matches!(ps, [ValPred::In(_)]);
+            if a.is_empty() || b.is_empty() || (plain(&a) && plain(&b)) {
+                continue;
+            }
+            // An arm that is itself an OR of arms is spliced in.
+            let arms_of = |ps: Vec<ValPred>| match <[ValPred; 1]>::try_from(ps) {
+                Ok([ValPred::AnyOf(arms)]) => arms,
+                Ok([p]) => vec![vec![p]],
+                Err(ps) => vec![ps],
+            };
+            let mut arms = arms_of(a);
+            for arm in arms_of(b) {
+                if !arms.contains(&arm) {
+                    arms.push(arm);
+                }
+            }
+            if arms.len() > MAX_ARMS {
+                continue;
+            }
+            let p = (c.clone(), ValPred::AnyOf(arms));
+            if !out.preds.contains(&p) {
+                out.preds.push(p);
             }
         }
         if let Some(d) = either
@@ -696,6 +780,7 @@ impl Facts {
             .collect();
         f.equals = f.equals.iter().map(|(c, l)| (mv(c), l.clone())).collect();
         f.preds = f.preds.iter().map(|(c, p)| (mv(c), p.clone())).collect();
+        f.same = f.same.iter().map(|(a, b)| (mv(a), mv(b))).collect();
         f.exprs.clear();
         f
     }
@@ -719,6 +804,7 @@ impl Facts {
             .collect();
         self.equals = self.equals.into_iter().map(|(c, l)| (mv(c), l)).collect();
         self.preds = self.preds.into_iter().map(|(c, p)| (mv(c), p)).collect();
+        self.same = self.same.into_iter().map(|(a, b)| (mv(a), mv(b))).collect();
         if !keep_exprs {
             self.exprs.clear();
         }
@@ -733,6 +819,8 @@ impl Facts {
             .retain(|d| d.iter().all(|(a, _)| aliases.contains(a)));
         self.equals.retain(|(a, _), _| aliases.contains(a));
         self.preds.retain(|((a, _), _)| aliases.contains(a));
+        self.same
+            .retain(|((a, _), (b, _))| aliases.contains(a) && aliases.contains(b));
         self
     }
 }
@@ -1029,7 +1117,9 @@ fn nonnullable_node(
                     let strict =
                         walk_opt(e.lexpr.as_ref(), false).union(walk_opt(e.rexpr.as_ref(), false));
                     if top_level {
-                        strict.union(comparison_facts(e, scope, log, snapshot))
+                        strict
+                            .union(comparison_facts(e, scope, log, snapshot))
+                            .union(equivalence_facts(e, scope, log, snapshot))
                     } else {
                         strict
                     }
@@ -1551,6 +1641,59 @@ fn comparison_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &P
         f.equals.insert(c.clone(), v.clone());
     }
     f.preds.push((c, p));
+    f
+}
+
+/// `a.x = b.y` over two plain columns, TRUE: each is the other's value
+/// (both ways, see [`Facts::same`]) — when the `=` is the built-in one
+/// (`trust`), the columns are of one type (domains read as their base
+/// type) or both integers (`int2`, `int4`, `int8`: compared exactly) or
+/// both `text` / `varchar` (`texteq`; not `char(n)`, whose `bpchar = text`
+/// compares the value with its padding trimmed), and
+/// equal values of the type are the same value wherever a column's
+/// predicates read it: not under a nondeterministic collation (`'a'` equal
+/// to `'A'`) on either column. Values of other types are compared by the
+/// [`checks::Space`] of the column read, which knows its type's equality
+/// (`numeric` `1` and `1.0`: only bounds, never a value set). Not a
+/// column compared with a parameter or an expression.
+fn equivalence_facts(
+    e: &ast::AExpr,
+    scope: &Scope,
+    trust: &dyn Trust,
+    snapshot: &PgCatalog,
+) -> Facts {
+    use crate::pg_catalog::oid;
+    let mut f = Facts::default();
+    if e.kind != ast::AExprKind::AexprOp
+        || !trust.trusts(e.location, StrictNode::BuiltinCompare)
+        || crate::expr::extract_string_fields(&e.name).join(".") != "="
+    {
+        return f;
+    }
+    let column = |n: Option<&ast::Node>| {
+        let (col, t) = plain_column(n?, scope)?;
+        let collation = scope
+            .resolve_column(Some(&col.0), &col.1, None)
+            .ok()
+            .and_then(|c| c.collation);
+        Some((col, snapshot.unwrap_domain(t), collation))
+    };
+    let (Some((a, ta, ca)), Some((b, tb, cb))) =
+        (column(e.lexpr.as_ref()), column(e.rexpr.as_ref()))
+    else {
+        return f;
+    };
+    let int = |t| [oid::INT2, oid::INT4, oid::INT8].contains(&t);
+    let string = |t| [oid::TEXT, oid::VARCHAR].contains(&t);
+    if a == b
+        || !(ta == tb || (int(ta) && int(tb)) || (string(ta) && string(tb)))
+        || !crate::refine::deterministic(ca, snapshot)
+        || !crate::refine::deterministic(cb, snapshot)
+    {
+        return f;
+    }
+    f.same.push((a.clone(), b.clone()));
+    f.same.push((b, a));
     f
 }
 

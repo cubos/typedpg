@@ -180,6 +180,60 @@ enum Value {
     Ord(crate::refine_bounds::OrdPoint),
 }
 
+/// `preds` with the ORs of conditions ([`ValPred::AnyOf`]) last: each of
+/// their arms is read within what the others leave.
+fn or_last(preds: &[ValPred]) -> impl Iterator<Item = &ValPred> {
+    let or = |p: &&ValPred| matches!(p, ValPred::AnyOf(_));
+    preds
+        .iter()
+        .filter(move |p| !or(p))
+        .chain(preds.iter().filter(or))
+}
+
+/// An interval of an ordered space: its lower and upper bounds, each
+/// `(value, inclusive)` (`None`: unbounded).
+#[derive(Debug, Clone)]
+struct Interval(Option<(Value, bool)>, Option<(Value, bool)>);
+
+impl Interval {
+    /// Bounded below by `b` too.
+    fn raise(&mut self, b: (Value, bool)) {
+        self.0 = Some(match self.0.take() {
+            Some(l) if l.0 > b.0 || (l.0 == b.0 && !l.1) => l,
+            _ => b,
+        });
+    }
+
+    /// Bounded above by `b` too.
+    fn lower(&mut self, b: (Value, bool)) {
+        self.1 = Some(match self.1.take() {
+            Some(h) if h.0 < b.0 || (h.0 == b.0 && !h.1) => h,
+            _ => b,
+        });
+    }
+
+    /// The smallest interval holding both.
+    fn hull(self, other: Interval) -> Interval {
+        let lo = match (self.0, other.0) {
+            (Some(a), Some(b)) => Some(if a.0 < b.0 || (a.0 == b.0 && a.1) {
+                a
+            } else {
+                b
+            }),
+            _ => None,
+        };
+        let hi = match (self.1, other.1) {
+            (Some(a), Some(b)) => Some(if a.0 > b.0 || (a.0 == b.0 && a.1) {
+                a
+            } else {
+                b
+            }),
+            _ => None,
+        };
+        Interval(lo, hi)
+    }
+}
+
 impl Space {
     /// The space of a column of type `t` under `collation`.
     pub(crate) fn of(
@@ -390,6 +444,8 @@ impl Space {
                 },
                 _ => false,
             },
+            // Every arm has a predicate `x` fails.
+            ValPred::AnyOf(arms) => arms.iter().all(|arm| arm.iter().any(|q| self.fails(q, x))),
         }
     }
 
@@ -416,15 +472,32 @@ impl Space {
             );
         }
         for p in preds {
-            if let ValPred::In(vs) = p {
-                cands = Some(match cands {
-                    None => vs.clone(),
-                    Some(cs) => cs
-                        .into_iter()
-                        .filter(|x| vs.iter().any(|v| !self.distinct(x, v)))
-                        .collect(),
-                });
-            }
+            // One of the arms' values, when each arm has few.
+            let any_of;
+            let vs = match p {
+                ValPred::In(vs) => vs,
+                ValPred::AnyOf(arms) => {
+                    let per_arm: Option<Vec<Vec<Literal>>> =
+                        arms.iter().map(|arm| self.candidates(arm)).collect();
+                    let Some(per_arm) = per_arm else { continue };
+                    let mut all: Vec<Literal> = Vec::new();
+                    for v in per_arm.into_iter().flatten() {
+                        if !all.contains(&v) {
+                            all.push(v);
+                        }
+                    }
+                    any_of = all;
+                    &any_of
+                }
+                _ => continue,
+            };
+            cands = Some(match cands {
+                None => vs.clone(),
+                Some(cs) => cs
+                    .into_iter()
+                    .filter(|x| vs.iter().any(|v| !self.distinct(x, v)))
+                    .collect(),
+            });
         }
         cands.map(|cs| {
             cs.into_iter()
@@ -440,7 +513,7 @@ impl Space {
             return None;
         }
         let mut r = crate::refine::IntRange::default();
-        for p in preds {
+        for p in or_last(preds) {
             let b = match p {
                 ValPred::Cmp(op, v) => {
                     let Some(v) = self.int(v) else { continue };
@@ -466,6 +539,20 @@ impl Space {
                     }
                 }
                 ValPred::NotIn(_) => continue,
+                // The hull of what each arm leaves of the bounds so far.
+                ValPred::AnyOf(arms) => {
+                    let empty = |r: &crate::refine::IntRange| matches!(r, crate::refine::IntRange { lo: Some(l), hi: Some(h) } if l > h);
+                    let mut live = arms
+                        .iter()
+                        .filter_map(|arm| self.bounds(arm))
+                        .map(|b| b.meet(&r))
+                        .filter(|r| !empty(r));
+                    let Some(first) = live.next() else {
+                        // No arm can hold: no row is there to bound.
+                        continue;
+                    };
+                    live.fold(first, |a, b| a.hull(&b))
+                }
             };
             r = r.meet(&b);
         }
@@ -485,7 +572,7 @@ impl Space {
             _ => None,
         };
         let mut r = OrdRange::unbounded(kind);
-        for p in preds {
+        for p in or_last(preds) {
             let b = match p {
                 ValPred::Cmp(op, v) => {
                     let Some(v) = point(v) else { continue };
@@ -520,6 +607,22 @@ impl Space {
                     hull
                 }
                 ValPred::NotIn(_) => continue,
+                // The hull of what each arm leaves of the bounds so far.
+                ValPred::AnyOf(arms) => {
+                    let mut live = arms
+                        .iter()
+                        .filter_map(|arm| self.ord_bounds(arm))
+                        .map(|b| b.meet(&r))
+                        .filter(|r| !r.is_empty());
+                    let Some(first) = live.next() else {
+                        // No arm can hold: no row is there to bound.
+                        continue;
+                    };
+                    let Some(hull) = live.try_fold(first, |a, b| a.hull(&b)) else {
+                        continue;
+                    };
+                    hull
+                }
             };
             r = r.meet(&b);
         }
@@ -533,31 +636,60 @@ impl Space {
         if !matches!(self.kind, SpaceKind::Int | SpaceKind::Ord(_)) {
             return false;
         }
-        // (value, inclusive)
-        let mut lo: Option<(Value, bool)> = self.known_lo.clone();
-        let mut hi: Option<(Value, bool)> = self.known_hi.clone();
+        self.interval(preds).is_none()
+    }
+
+    /// The interval the ordering comparisons among `preds` leave a
+    /// non-NULL column of an ordered space, within its known bounds, as
+    /// its `(lower, upper)` bounds; `None` when it is surely empty. An OR
+    /// of conditions ([`ValPred::AnyOf`]) leaves the hull of what each of
+    /// its arms leaves of that interval.
+    fn interval<'p>(&self, preds: impl IntoIterator<Item = &'p ValPred>) -> Option<Interval> {
+        let mut acc = Interval(self.known_lo.clone(), self.known_hi.clone());
+        let mut ors: Vec<&Vec<Vec<ValPred>>> = Vec::new();
         for p in preds {
-            let ValPred::Cmp(op, v) = p else { continue };
-            let Some(v) = self.ordered(v) else { continue };
-            match op {
-                CmpOp::Gt | CmpOp::Ge => {
-                    let b = (v, *op == CmpOp::Ge);
-                    lo = Some(match lo {
-                        Some(l) if l.0 > b.0 || (l.0 == b.0 && !l.1) => l,
-                        _ => b,
-                    });
+            match p {
+                ValPred::Cmp(op, v) => {
+                    let Some(v) = self.ordered(v) else { continue };
+                    match op {
+                        CmpOp::Gt | CmpOp::Ge => acc.raise((v, *op == CmpOp::Ge)),
+                        CmpOp::Lt | CmpOp::Le => acc.lower((v, *op == CmpOp::Le)),
+                    }
                 }
-                CmpOp::Lt | CmpOp::Le => {
-                    let b = (v, *op == CmpOp::Le);
-                    hi = Some(match hi {
-                        Some(h) if h.0 < b.0 || (h.0 == b.0 && !h.1) => h,
-                        _ => b,
-                    });
-                }
+                ValPred::AnyOf(arms) => ors.push(arms),
+                ValPred::In(_) | ValPred::NotIn(_) => {}
             }
         }
-        // An integer column holds no value strictly between two
-        // consecutive integers.
+        let mut acc = self.normalized(acc)?;
+        for arms in ors {
+            let mut hull: Option<Interval> = None;
+            for arm in arms {
+                let Some(mut i) = self.interval(arm) else {
+                    continue;
+                };
+                if let Some(l) = acc.0.clone() {
+                    i.raise(l);
+                }
+                if let Some(h) = acc.1.clone() {
+                    i.lower(h);
+                }
+                let Some(i) = self.normalized(i) else {
+                    continue;
+                };
+                hull = Some(match hull {
+                    None => i,
+                    Some(h) => h.hull(i),
+                });
+            }
+            // No arm can hold.
+            acc = hull?;
+        }
+        Some(acc)
+    }
+
+    /// `i` with an integer space's open bounds closed (no value lies
+    /// strictly between two consecutive integers); `None` when empty.
+    fn normalized(&self, Interval(mut lo, mut hi): Interval) -> Option<Interval> {
         if self.integral {
             let step = |b: Option<(Value, bool)>, d: i128| match b {
                 Some((Value::Int(v), false)) => v.checked_add(d).map(|v| (Value::Int(v), true)),
@@ -566,9 +698,9 @@ impl Space {
             lo = step(lo, 1);
             hi = step(hi, -1);
         }
-        match (lo, hi) {
-            (Some(l), Some(h)) => l.0 > h.0 || (l.0 == h.0 && !(l.1 && h.1)),
-            _ => false,
+        match (&lo, &hi) {
+            (Some(l), Some(h)) if l.0 > h.0 || (l.0 == h.0 && !(l.1 && h.1)) => None,
+            _ => Some(Interval(lo, hi)),
         }
     }
 
@@ -590,6 +722,12 @@ impl Space {
 
             ValPred::NotIn(_) => false,
             ValPred::Cmp(..) => self.interval_empty(preds.iter().chain([p])),
+            // Every arm is refuted.
+            ValPred::AnyOf(arms) => arms.iter().all(|arm| {
+                let mut all = preds.to_vec();
+                all.extend(arm.iter().cloned());
+                self.contradictory(&all)
+            }),
         }
     }
 }

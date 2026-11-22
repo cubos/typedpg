@@ -631,9 +631,17 @@ impl NullabilityContext {
                 Some(side) => side.clone(),
                 None => j.left.union(&j.right).cloned().collect(),
             };
-            let on = self
-                .translated(j.on.clone())
-                .restricted_to(&side_with_inner(&side, &self.aliased));
+            let side = side_with_inner(&side, &self.aliased);
+            let all_on = self.translated(j.on.clone());
+            let mut on = all_on.clone().restricted_to(&side);
+            // `a LEFT JOIN b ON a.x = b.y`: a row of `b` is there only with
+            // `b.y = a.x`, so `b.y` holds what `a.x` does — never the other
+            // way round (the preserved row stays when the ON fails).
+            for e in &all_on.same {
+                if side.contains(&e.0.0) && !on.same.contains(e) {
+                    on.same.push(e.clone());
+                }
+            }
             forced.extend(on.rels.iter().cloned());
             matched = matched.union(on);
         }
@@ -802,8 +810,8 @@ impl NullabilityContext {
         sources.into_iter().find_map(|f| f.equals.get(c).cloned())
     }
 
-    /// What holds of column `c`'s value at `level`, if it is non-NULL.
-    fn preds_at(&self, level: Level, c: &Col) -> Vec<ValPred> {
+    /// The facts that hold at `level`.
+    fn facts_at(&self, level: Level) -> Vec<&Facts> {
         let mut sources = vec![&self.matched_facts];
         if level != Level::Matched {
             sources.push(&self.where_facts);
@@ -811,17 +819,63 @@ impl NullabilityContext {
         if level == Level::Local {
             sources.push(&self.local_facts);
         }
-        let mut out: Vec<ValPred> = sources
-            .into_iter()
-            .flat_map(|f| {
-                f.preds
+        sources
+    }
+
+    /// Column `c` and every column whose value it is wherever it is
+    /// non-NULL at `level`: the columns an equality with another column
+    /// ties it to ([`Facts::same`]), transitively, and an aliased join's
+    /// column and the one inside it. Under grouping sets, only `c`: a
+    /// column read after grouping may be NULL where the row's isn't.
+    fn class_at(&self, level: Level, c: &Col) -> Vec<Col> {
+        let mut class = vec![c.clone()];
+        if !self.grouping_omitted.is_empty() {
+            return class;
+        }
+        let facts = self.facts_at(level);
+        let edges: Vec<(&Col, &Col)> = facts
+            .iter()
+            .flat_map(|f| f.same.iter().map(|(t, s)| (t, s)))
+            .chain(
+                self.aliased
                     .iter()
-                    .filter(|(pc, _)| pc == c)
-                    .map(|(_, p)| p.clone())
-            })
+                    .flat_map(|(outer, (inner, _))| [(outer, inner), (inner, outer)]),
+            )
             .collect();
-        if let Some(v) = self.equals_at(level, c) {
-            out.push(ValPred::In(vec![v]));
+        if edges.is_empty() {
+            return class;
+        }
+        let mut i = 0;
+        while let Some(x) = class.get(i).cloned() {
+            for (t, s) in &edges {
+                if **t == x && !class.contains(s) {
+                    class.push((*s).clone());
+                }
+            }
+            i += 1;
+        }
+        class
+    }
+
+    /// What holds of column `c`'s value at `level`, if it is non-NULL —
+    /// and of the value of every column of its class ([`Self::class_at`]).
+    fn preds_at(&self, level: Level, c: &Col) -> Vec<ValPred> {
+        let facts = self.facts_at(level);
+        let mut out: Vec<ValPred> = Vec::new();
+        for m in self.class_at(level, c) {
+            for f in &facts {
+                for (pc, p) in &f.preds {
+                    if *pc == m && !out.contains(p) {
+                        out.push(p.clone());
+                    }
+                }
+            }
+            if let Some(v) = self.equals_at(level, &m) {
+                let p = ValPred::In(vec![v]);
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
         }
         out
     }
@@ -852,19 +906,26 @@ impl NullabilityContext {
     /// conditions on it (`WHERE kind IN ('a', 'b')`, a CASE branch's WHEN,
     /// an ON) and its table's CHECK constraints — from which a [`Space`]
     /// tells the values or bounds it is left.
+    ///
+    /// A column another one is equal to ([`Self::class_at`]) holds what
+    /// that one's conditions and CHECK constraints say too.
     pub fn column_preds(&self, c: &Col) -> Vec<ValPred> {
-        let mut preds = if crate::nonnull::disabled() {
-            Vec::new()
-        } else {
-            self.preds_at(Level::Local, c)
-        };
-        if !crate::nonnull::disabled()
-            && let Some(entry) = self.checks.iter().find(|e| e.alias == c.0)
-            && !entry.checks.contradict_alone(&entry.base_not_null)
-            && let Some(more) =
-                self.with_local_knowledge(entry, |k| entry.checks.column_preds(&c.1, k))
-        {
-            preds.extend(more);
+        if crate::nonnull::disabled() {
+            return Vec::new();
+        }
+        let mut preds = self.preds_at(Level::Local, c);
+        for m in self.class_at(Level::Local, c) {
+            if let Some(entry) = self.checks.iter().find(|e| e.alias == m.0)
+                && !entry.checks.contradict_alone(&entry.base_not_null)
+                && let Some(more) =
+                    self.with_local_knowledge(entry, |k| entry.checks.column_preds(&m.1, k))
+            {
+                for p in more {
+                    if !preds.contains(&p) {
+                        preds.push(p);
+                    }
+                }
+            }
         }
         preds
     }
