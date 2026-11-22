@@ -2632,6 +2632,22 @@ fn partition_bounds_compare_as_the_key_type_does() {
                  FOR VALUES FROM ('2020-01-01 00:00+00') TO ('2020-01-01 03:00+05');",
             "empty range bound specified for partition \"c1\"",
         ),
+        // No zone: read in the session's TimeZone, UTC (the server's is
+        // taken as UTC).
+        (
+            "CREATE TABLE p (k timestamptz) PARTITION BY RANGE (k);",
+            "CREATE TABLE c1 PARTITION OF p
+                 FOR VALUES FROM ('2020-01-01 00:00') TO ('2020-01-01 03:00+05');",
+            "empty range bound specified for partition \"c1\"",
+        ),
+        (
+            "CREATE TABLE p (k timestamptz) PARTITION BY RANGE (k);
+             SET TIME ZONE 'UTC';
+             CREATE TABLE c1 PARTITION OF p FOR VALUES FROM ('2020-01-01') TO ('2020-02-01');",
+            "CREATE TABLE c2 PARTITION OF p
+                 FOR VALUES FROM ('2020-01-31 22:00-01') TO ('2020-03-01');",
+            "partition \"c2\" would overlap partition \"c1\"",
+        ),
         (
             "CREATE TABLE p (k uuid) PARTITION BY LIST (k);
              CREATE TABLE c1 PARTITION OF p
@@ -2661,6 +2677,16 @@ fn partition_bounds_compare_as_the_key_type_does() {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
     }
+    // Another session TimeZone: a bound without a zone is not known (in
+    // Tokyo the lower bound is 2019-12-31 15:00 UTC, below the upper one).
+    try_apply(&[(
+        "0001.sql",
+        "SET TIME ZONE 'Asia/Tokyo';
+         CREATE TABLE p (k timestamptz) PARTITION BY RANGE (k);
+         CREATE TABLE c1 PARTITION OF p
+             FOR VALUES FROM ('2020-01-01 00:00') TO ('2020-01-01 03:00+05');",
+    )])
+    .unwrap();
     // A label added BEFORE another sorts before it.
     let err = try_apply(&[
         ("0001.sql", "CREATE TYPE e AS ENUM ('a', 'c');"),

@@ -1240,6 +1240,9 @@ struct Decoded {
     /// PG's `*tzp` (seconds west of UTC) when known exactly; `None` when it
     /// comes from a named zone, a dynamic abbreviation or the session zone.
     tz: Option<i32>,
+    /// The value names no zone: `timestamptz_in` reads it in the session's
+    /// TimeZone (DetermineTimeZoneOffset over `session_timezone`).
+    session_zone: bool,
     /// Read relative to the current date or time (`now`, `today`,
     /// `tomorrow`, `yesterday`): `tm` holds a stand-in.
     relative: bool,
@@ -1553,6 +1556,7 @@ fn decode_date_time_inner(fields: &[Field], unsure: &mut bool) -> DtResult<Decod
     if ptype != 0 {
         return Err(Dterr::BadFormat);
     }
+    let session_zone = fmask & dtk_m(TZ) == 0;
     if dtype == DTK_DATE_V {
         validate_date(fmask, isjulian, is2digits, bc, &mut tm)?;
         if mer != HR24 && now_used {
@@ -1588,6 +1592,7 @@ fn decode_date_time_inner(fields: &[Field], unsure: &mut bool) -> DtResult<Decod
         tm,
         fsec,
         tz,
+        session_zone,
         relative: relative || now_used,
     })
 }
@@ -1597,9 +1602,15 @@ fn decode_date_time_inner(fields: &[Field], unsure: &mut bool) -> DtResult<Decod
 /// `timestamptz`), since 2000-01-01, `±infinity` as the extremes — when the
 /// value doesn't depend on the session: a date written year first
 /// (`YYYY-MM-DD…`, the same under every `DateStyle`), or `epoch` /
-/// `±infinity`; for `timestamptz` with an explicit zone offset. A `date`
-/// drops the time of day. `None` otherwise.
-pub(crate) fn datetime_value(content: &str, with_time: Option<bool>) -> Option<i128> {
+/// `±infinity`; for `timestamptz` with an explicit zone offset, or with
+/// none when `session_utc` (the session's TimeZone is UTC, see
+/// `PgCatalog::timezone_utc`). A `date` drops the time of day. `None`
+/// otherwise.
+pub(crate) fn datetime_value(
+    content: &str,
+    with_time: Option<bool>,
+    session_utc: bool,
+) -> Option<i128> {
     let buflen = match with_time {
         None => MAXDATELEN + 1,
         Some(_) => MAXDATELEN + MAXDATEFIELDS,
@@ -1643,8 +1654,14 @@ pub(crate) fn datetime_value(content: &str, with_time: Option<bool>) -> Option<i
         + i64::from(d.fsec);
     let mut t = date.checked_mul(USECS_PER_DAY)?.checked_add(time)?;
     if with_tz {
-        // dt2local(result, -tz): only a known offset.
-        t = t.checked_add(i64::from(d.tz?) * USECS_PER_SEC)?;
+        // dt2local(result, -tz): only a known offset — the session's,
+        // when the value names no zone, only under UTC (offset 0).
+        let tz = match d.tz {
+            Some(tz) => tz,
+            None if d.session_zone && session_utc => 0,
+            None => return None,
+        };
+        t = t.checked_add(i64::from(tz) * USECS_PER_SEC)?;
     }
     (MIN_TIMESTAMP..END_TIMESTAMP)
         .contains(&t)

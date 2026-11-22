@@ -683,13 +683,21 @@ fn normalize(interp: &PgCatalog, v: &typedpg_pg_query::ast::Node, part_key: &Par
         oid::BOOL => bool_value(interp, v, key).map(|b| Datum::Int(i128::from(b))),
         // date_in drops the time of day; timestamp(p) rounds the
         // fraction (AdjustTimestampForTypmod); timestamptz_in reads a
-        // value without a zone in the session's TimeZone, which isn't
+        // value without a zone in the session's TimeZone, known only
+        // while it is UTC (taken as the server's, `timezone_utc`). What
+        // `now` / `today` read depends on when the migration runs: never
         // known.
         oid::DATE => key_literal(interp, v, key)
-            .and_then(|s| crate::datetime_input::datetime_value(s, None))
+            .and_then(|s| crate::datetime_input::datetime_value(s, None, false))
             .map(Datum::Int),
         oid::TIMESTAMP | oid::TIMESTAMPTZ => key_literal(interp, v, key)
-            .and_then(|s| crate::datetime_input::datetime_value(s, Some(key == oid::TIMESTAMPTZ)))
+            .and_then(|s| {
+                crate::datetime_input::datetime_value(
+                    s,
+                    Some(key == oid::TIMESTAMPTZ),
+                    interp.timezone_utc.get(),
+                )
+            })
             .map(|t| match part_key.typmod {
                 Some(p) => crate::datetime_input::round_timestamp(t, p),
                 None => t,
