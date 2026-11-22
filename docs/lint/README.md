@@ -36,6 +36,11 @@ Rules over the SQL of each query (`sql!` in Rust, `sql` / `.sql` files in TypeSc
 | [`left_join_nullified`](left_join_nullified.md) | warning | An outer join the `WHERE` clause turns into an inner join by rejecting its null-extended rows. |
 | [`check_violation`](check_violation.md) | warning | An `INSERT` or `UPDATE` storing a constant a `CHECK` constraint rejects. |
 | [`unstable_order`](unstable_order.md) | warning | An `ORDER BY` with `LIMIT`, `OFFSET` or `DISTINCT ON` whose keys can tie. |
+| [`redundant_order_by`](redundant_order_by.md) | info | `ORDER BY` keys that can't change the order of the rows. |
+| [`redundant_group_by`](redundant_group_by.md) | info | `GROUP BY` keys determined by the other keys or pinned to a constant. |
+| [`count_not_null`](count_not_null.md) | info | `count(expr)` over a value that is never NULL, which is `count(*)`. |
+| [`non_sargable_predicate`](non_sargable_predicate.md) | info | A comparison wrapping an indexed column so its index can't serve it. |
+| [`float_equality`](float_equality.md) | warning | An equality comparison of floating-point values. |
 
 ## `sql!` bindings
 
@@ -177,7 +182,7 @@ The comment must be exactly `typedpg-lint: allow(` followed by comma-separated r
 
 ### `--fix`
 
-`--fix` applies the fixes findings carry, writes the files, then lints again and reports what remains. In Rust it deletes `redundant_binding` bindings, rewrites `renaming_binding` parameters, and applies SQL edits; in TypeScript it writes SQL edits into the sources and `.sql` files. The SQL fixes come from `redundant_null_check` (its `COALESCE`), `redundant_limit`, `redundant_distinct`, `constant_condition`, `case_without_else`, `redundant_cast`, `redundant_alias`, `insert_without_columns`, `self_assignment`, `unused_cte`, `simplifiable_case`, `redundant_join` and `unused_returning`. Migration findings never have fixes.
+`--fix` applies the fixes findings carry, writes the files, then lints again and reports what remains. In Rust it deletes `redundant_binding` bindings, rewrites `renaming_binding` parameters, and applies SQL edits; in TypeScript it writes SQL edits into the sources and `.sql` files. The SQL fixes come from `redundant_null_check` (its `COALESCE`), `redundant_limit`, `redundant_distinct`, `constant_condition`, `case_without_else`, `redundant_cast`, `redundant_alias`, `insert_without_columns`, `self_assignment`, `unused_cte`, `simplifiable_case`, `redundant_join`, `redundant_order_by`, `redundant_group_by`, `count_not_null` and `unused_returning`. Migration findings never have fixes.
 
 A fix is only offered when its rule proves it keeps the query's meaning, and every fix is checked again before it is offered: the edited query must analyze to the same output columns (names, types, nullability, known values), the same parameters and the same ability to run as a subquery (`unused_returning`'s must have no output columns). A fix that fails that check is withheld and reported as [`internal_error`](internal_error.md).
 

@@ -188,3 +188,5 @@ SELECT id FROM posts WHERE title IS NOT NULL;
   outer join's null-extended rows.
 - [`simplifiable_case`](simplifiable_case.md): a `CASE` that is a
   `COALESCE`.
+- [`count_not_null`](count_not_null.md): `count(expr)` over a value that is
+  never NULL, which is `count(*)`.

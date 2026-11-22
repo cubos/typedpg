@@ -180,3 +180,5 @@ SELECT id, title FROM posts ORDER BY created_at DESC LIMIT 20;
   `DISTINCT ON` with no `ORDER BY` at all.
 - [`scalar_subquery_may_return_many`](scalar_subquery_may_return_many.md):
   its help suggests `ORDER BY … LIMIT 1`, which this rule then checks.
+- [`redundant_order_by`](redundant_order_by.md): the opposite — `ORDER BY`
+  keys after keys that already determine a unique row.

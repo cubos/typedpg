@@ -164,3 +164,5 @@ SELECT DISTINCT id, name FROM users;
 - [`redundant_limit`](redundant_limit.md): a `LIMIT` on a query that returns
   at most one row.
 - [`redundant_join`](redundant_join.md): a join that can't change the rows.
+- [`redundant_group_by`](redundant_group_by.md): `GROUP BY` keys a unique key
+  among the other keys already determines.

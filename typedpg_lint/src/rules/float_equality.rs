@@ -8,8 +8,10 @@
 //!
 //! Comparisons against a value that is exact in binary floating point are
 //! not reported, as testing for one is well defined and common: an integer
-//! literal (`score = 0`, `rating = 5`), a decimal literal whose value the
-//! type holds exactly (`0.5`, `2.25`, `1e3`, but not `0.1`), and the
+//! literal the type holds exactly (`score = 0`, `rating = 5`; every integer
+//! up to 2^24 in magnitude for `real`, 2^53 for `double precision`, but not
+//! `16777217` for `real`), a decimal literal whose value the type holds
+//! exactly (`0.5`, `2.25`, `1e3`, but not `0.1`), and the
 //! special values `'NaN'`, `'Infinity'` and `'-Infinity'`. An `IN` list is
 //! reported unless every item is such a value. A column, a parameter or a
 //! computed value on both sides — a join `a.f = b.f` included — is
@@ -108,12 +110,14 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr) -> Option<RawFinding> {
 }
 
 /// Whether `node` is a literal whose value a float of `bits` mantissa bits
-/// holds exactly: an integer, a decimal such as `0.5` or `1e3` (possibly
-/// negated or cast), or `'NaN'` / `'Infinity'` / `'-Infinity'`.
+/// holds exactly: an integer or a decimal such as `0.5` or `1e3` that fits
+/// (possibly negated or cast), or `'NaN'` / `'Infinity'` / `'-Infinity'`.
 fn exact_value(node: &Node, bits: u32) -> bool {
     match node {
         Node::AConst(value) => match &value.val {
-            Some(AConstValue::Integer(_)) => true,
+            // Every `int4` literal fits a `double precision` mantissa, but
+            // one above 2^24 in magnitude doesn't fit a `real` one.
+            Some(AConstValue::Integer(i)) => exactly_representable(&i.ival.to_string(), bits),
             Some(AConstValue::Float(f)) => exactly_representable(&f.fval, bits),
             Some(AConstValue::String(s)) => {
                 let text = s.sval.trim();
@@ -233,6 +237,13 @@ mod tests {
             "SELECT i.id FROM items i JOIN prices p ON p.price = i.price",
             "SELECT price = qty / 3.0 FROM items",
             "SELECT id FROM items WHERE weight = 0.1",
+            // Integers a real (24 mantissa bits) or a double precision (53)
+            // can't hold.
+            "SELECT id FROM items WHERE weight = 16777217",
+            "SELECT id FROM items WHERE weight = -16777217",
+            "SELECT id FROM items WHERE weight = 2147483647",
+            "SELECT id FROM items WHERE weight IN (0, 16777217)",
+            "SELECT id FROM items WHERE price = 9007199254740993",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
@@ -258,6 +269,12 @@ mod tests {
             "SELECT id FROM items WHERE amount = 0.1",
             "SELECT id FROM items WHERE qty = 3",
             "SELECT id FROM items WHERE price IS DISTINCT FROM 0.1",
+            // Integers the type holds exactly.
+            "SELECT id FROM items WHERE weight = 16777216",
+            "SELECT id FROM items WHERE weight = -16777216",
+            "SELECT id FROM items WHERE weight = 33554432",
+            "SELECT id FROM items WHERE price = 2147483647",
+            "SELECT id FROM items WHERE price = 9007199254740992",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
