@@ -132,10 +132,20 @@ and lints the migrations themselves:
 | `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
 | `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
 | `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| `drop_index_blocking` | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
+| `blocking_rebuild` | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
+| `detach_partition_blocking` | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
+| `validate_in_same_transaction` | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
+| `attach_partition_scan` | warning | `ATTACH PARTITION` of an existing table with no valid `CHECK` on the partition key, so PostgreSQL scans it under lock to check the bound. A `CHECK` that reads a key column is taken to imply the bound (the lint does not prove it does). |
+| `missing_primary_key` | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
+| `rls_policy_not_enforced` | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
+| `rls_no_policy` | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
+| `security_definer_search_path` | warning | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
 | `prefer_timestamptz` | off | A `timestamp without time zone` column. |
 | `prefer_identity` | off | A `serial` column instead of an identity column. |
 | `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
 | `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
+| `prefer_jsonb` | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
 | `fetch_may_return_many` | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
 | `fetch_all_single_row` | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
 | `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded. |

@@ -271,6 +271,87 @@
               }
             },
             {
+              "id": "drop_index_blocking",
+              "shortDescription": {
+                "text": "DROP INDEX without CONCURRENTLY on a table that already has rows"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "blocking_rebuild",
+              "shortDescription": {
+                "text": "REINDEX, VACUUM FULL, CLUSTER or REPACK holding a blocking lock for the whole rebuild"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "detach_partition_blocking",
+              "shortDescription": {
+                "text": "DETACH PARTITION without CONCURRENTLY on a table that already has rows"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "validate_in_same_transaction",
+              "shortDescription": {
+                "text": "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "attach_partition_scan",
+              "shortDescription": {
+                "text": "ATTACH PARTITION scanning the partition because no CHECK implies its bound"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "missing_primary_key",
+              "shortDescription": {
+                "text": "a table without a primary key"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "rls_policy_not_enforced",
+              "shortDescription": {
+                "text": "row-level security policies on a table that does not enable row-level security"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            },
+            {
+              "id": "rls_no_policy",
+              "shortDescription": {
+                "text": "row-level security enabled on a table with no policy"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "security_definer_search_path",
+              "shortDescription": {
+                "text": "a SECURITY DEFINER routine without SET search_path"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
               "id": "prefer_timestamptz",
               "shortDescription": {
                 "text": "a timestamp without time zone column"
@@ -301,6 +382,15 @@
               "id": "prefer_bigint_pk",
               "shortDescription": {
                 "text": "an int2 or int4 primary key"
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              }
+            },
+            {
+              "id": "prefer_jsonb",
+              "shortDescription": {
+                "text": "a json column instead of jsonb"
               },
               "defaultConfiguration": {
                 "level": "none"

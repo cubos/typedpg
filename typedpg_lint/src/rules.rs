@@ -63,10 +63,20 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         | Rule::RedundantIndex
         | Rule::FkTypeMismatch
         | Rule::MissingLockTimeout
+        | Rule::DropIndexBlocking
+        | Rule::BlockingRebuild
+        | Rule::DetachPartitionBlocking
+        | Rule::ValidateInSameTransaction
+        | Rule::AttachPartitionScan
+        | Rule::MissingPrimaryKey
+        | Rule::RlsPolicyNotEnforced
+        | Rule::RlsNoPolicy
+        | Rule::SecurityDefinerSearchPath
         | Rule::PreferTimestamptz
         | Rule::PreferIdentity
         | Rule::PreferText
         | Rule::PreferBigintPk
+        | Rule::PreferJsonb
         // The binding and call-site rules run over the Rust source of the
         // invocation, in `typedpg_cli`, which alone sees it.
         | Rule::RedundantBinding

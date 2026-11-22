@@ -7,7 +7,7 @@
 //! and arrays, and whether a relation has row security or rewrite rules.
 //! Everything else they read is already public.
 
-use crate::oid::{PgClassOid, PgOperatorOid, PgTypeOid};
+use crate::oid::{PgClassOid, PgOperatorOid, PgProcOid, PgTypeOid};
 
 use super::PgCatalog;
 
@@ -108,5 +108,68 @@ impl PgCatalog {
     /// arrays, exactly as the analyzer resolves it.
     pub fn lint_effective_typmod(&self, oid: PgTypeOid, typmod: Option<i32>) -> Option<i32> {
         self.effective_typmod(oid, typmod)
+    }
+
+    /// Whether `FORCE ROW LEVEL SECURITY` is set on `relid`
+    /// (`pg_class.relforcerowsecurity`): row security applies to the
+    /// table's owner too.
+    pub fn lint_relation_forces_row_security(&self, relid: PgClassOid) -> bool {
+        self.force_row_security.contains(&relid)
+    }
+
+    /// The names of the row-level security policies on `relid`
+    /// (`pg_policy.polname`), in creation order.
+    pub fn lint_relation_policies(&self, relid: PgClassOid) -> Vec<&str> {
+        self.policies
+            .get(&relid)
+            .map(|policies| policies.iter().map(|p| p.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `pg_class.relpersistence` of `relid`: `p` (permanent), `u`
+    /// (unlogged) or `t` (temporary).
+    pub fn lint_relation_persistence(&self, relid: PgClassOid) -> char {
+        self.relpersistence.get(&relid).copied().unwrap_or('p')
+    }
+
+    /// The routines with a body the migrations created (built-in ones
+    /// excluded), each with whether it is `SECURITY DEFINER` (`prosecdef`)
+    /// and whether its names resolve along the caller's search path: no
+    /// `SET search_path` in its `proconfig`, and a body resolved when it
+    /// runs (a SQL-standard `BEGIN ATOMIC` / `RETURN` body is resolved at
+    /// `CREATE`, so it is not). Sorted by OID.
+    pub fn lint_routine_security(&self) -> Vec<(PgProcOid, bool, bool)> {
+        let mut out: Vec<_> = self
+            .routine_bodies
+            .iter()
+            .map(|(oid, body)| {
+                let resolves_at_run_time = body.search_path.is_none()
+                    && !matches!(
+                        body.source,
+                        crate::ddl::functions::RoutineSource::SqlStandard(_)
+                    );
+                (*oid, body.security_definer, resolves_at_run_time)
+            })
+            .collect();
+        out.sort_by_key(|(oid, _, _)| *oid);
+        out
+    }
+
+    /// The column names a partitioned table's key reads: each key column,
+    /// and the columns each key expression is strict in. `None` when
+    /// `relid` is not a partitioned table the analyzer knows the key of.
+    pub fn lint_partition_key_columns(&self, relid: PgClassOid) -> Option<Vec<String>> {
+        crate::ddl::tables::partbound::key_column_names(self, relid)
+    }
+
+    /// Whether the partitioned table `relid` has a default partition.
+    pub fn lint_has_default_partition(&self, relid: PgClassOid) -> bool {
+        self.pg_inherits.iter().any(|inherits| {
+            inherits.inhparent == relid
+                && matches!(
+                    self.partition_bounds.get(&inherits.inhrelid),
+                    Some(crate::ddl::tables::partbound::Bound::Default)
+                )
+        })
     }
 }
