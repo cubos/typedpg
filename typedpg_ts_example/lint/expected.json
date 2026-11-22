@@ -109,6 +109,17 @@
       "severity": "warning",
       "message": "UPDATE without WHERE changes every row of users",
       "help": "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
+    },
+    {
+      "path": "src/writes.sql",
+      "line": 12,
+      "column": 18,
+      "endLine": 12,
+      "endColumn": 29,
+      "rule": "self_assignment",
+      "severity": "warning",
+      "message": "assigning name its own value changes nothing",
+      "help": "remove the assignment, or assign the value meant"
     }
   ],
   "failures": [
@@ -127,7 +138,7 @@
   ],
   "summary": {
     "errors": 1,
-    "warnings": 8,
+    "warnings": 9,
     "infos": 1,
     "queries": 10,
     "migrations": 2,
