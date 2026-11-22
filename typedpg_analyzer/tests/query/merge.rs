@@ -462,3 +462,21 @@ fn merge_insert_value_of_the_wrong_type() {
         );
     }
 }
+
+#[test]
+fn insert_action_rejects_a_column_named_twice() {
+    // transformMergeStmt runs checkInsertTargets over the INSERT action's
+    // column list, as a plain INSERT does.
+    let db = setup();
+    for sql in [
+        "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+        "MERGE INTO t USING s ON t.id = s.id \
+         WHEN NOT MATCHED THEN INSERT (id, v, id) VALUES (1, 2, 3)",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::DuplicateColumn(_),
+            "column \"id\" specified more than once"
+        );
+    }
+}

@@ -2882,3 +2882,181 @@ fn insert_values_with_select_clauses_types_params_like_pg() {
     assert_params(&s, vec![p(int8())]);
     assert_cols(&s, vec![c("x", int4())]);
 }
+
+/// A constant row that fails a CHECK constraint (ExecConstraints) or a
+/// view's WITH CHECK OPTION (ExecWithCheckOptions) fails every execution:
+/// PREPARE succeeds, EXECUTE always raises. No trigger can change the row.
+#[test]
+fn insert_of_a_constant_row_failing_a_check_is_rejected() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ck (id int PRIMARY KEY, v int NOT NULL CHECK (v > 0));
+         CREATE VIEW vck AS SELECT id, v FROM ck WHERE v > 10 WITH CHECK OPTION;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "INSERT INTO ck VALUES (1, 0)",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO vck VALUES (1, 5)",
+            "new row violates check option for view \"vck\"",
+        ),
+    ] {
+        match db.analyze(sql) {
+            Ok(a) => panic!("{sql}: expected {msg:?}, got Ok: {a:?}"),
+            Err(e) => assert!(e.to_string().starts_with(msg), "{sql}\n  got: {e}"),
+        }
+    }
+}
+
+/// The CHECK reported is the one ExecConstraints evaluates first: every
+/// NOT NULL before any CHECK, the CHECKs in name order, those of the
+/// partition the row is routed to; then the views' check options, inner
+/// view first, a CASCADED one checking the views below. ON CONFLICT
+/// doesn't spare the CHECK (checked before the conflict is), and each
+/// row of a VALUES list is checked.
+#[test]
+fn constant_row_check_violations_follow_execution_order() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ck (id int PRIMARY KEY, v int NOT NULL CHECK (v > 0));
+         CREATE TABLE two (a int, CONSTRAINT zz CHECK (a > 0),
+             CONSTRAINT aa CHECK (a > 5), CONSTRAINT b CHECK (a > 3));
+         CREATE TABLE nn (a int NOT NULL, b int CHECK (b > 0));
+         CREATE TABLE pt (k int, v int CHECK (v > 0)) PARTITION BY LIST (k);
+         CREATE TABLE pt1 PARTITION OF pt (CONSTRAINT p1c CHECK (v > 100))
+             FOR VALUES IN (1);
+         CREATE TABLE st (s text CHECK (s IN ('a', 'b')));
+         CREATE TABLE b (a int, c int);
+         CREATE VIEW v1 AS SELECT * FROM b WHERE a > 0;
+         CREATE VIEW v2 AS SELECT * FROM v1 WHERE c > 0 WITH CASCADED CHECK OPTION;
+         CREATE VIEW v4 AS SELECT * FROM b WHERE a > 0 WITH LOCAL CHECK OPTION;
+         CREATE VIEW v5 AS SELECT * FROM v4 WHERE c > 0 WITH LOCAL CHECK OPTION;
+         CREATE VIEW v6 AS SELECT * FROM v4 WHERE c > 0;
+         CREATE VIEW v7 AS SELECT c AS x, a AS y FROM v1 WHERE c > 0 WITH CHECK OPTION;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "INSERT INTO two VALUES (0)",
+            "new row for relation \"two\" violates check constraint \"aa\"",
+        ),
+        (
+            "INSERT INTO nn VALUES (NULL, 0)",
+            "null value in column \"a\" of relation \"nn\" violates not-null constraint",
+        ),
+        (
+            "INSERT INTO pt VALUES (1, 50)",
+            "new row for relation \"pt1\" violates check constraint \"p1c\"",
+        ),
+        (
+            "INSERT INTO pt1 VALUES (1, 0)",
+            "new row for relation \"pt1\" violates check constraint \"p1c\"",
+        ),
+        (
+            "INSERT INTO st VALUES ('c')",
+            "new row for relation \"st\" violates check constraint \"st_s_check\"",
+        ),
+        (
+            "INSERT INTO ck VALUES (10, 5), (11, 0)",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO ck VALUES (1, 0) ON CONFLICT DO NOTHING",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO ck (v, id) SELECT 0, 1",
+            "new row for relation \"ck\" violates check constraint \"ck_v_check\"",
+        ),
+        (
+            "INSERT INTO v2 VALUES (-1, 5)",
+            "new row violates check option for view \"v1\"",
+        ),
+        (
+            "INSERT INTO v2 VALUES (1, -5)",
+            "new row violates check option for view \"v2\"",
+        ),
+        (
+            "INSERT INTO v5 VALUES (-1, -1)",
+            "new row violates check option for view \"v4\"",
+        ),
+        (
+            "INSERT INTO v5 VALUES (1, -1)",
+            "new row violates check option for view \"v5\"",
+        ),
+        (
+            "INSERT INTO v6 VALUES (-1, 1)",
+            "new row violates check option for view \"v4\"",
+        ),
+        (
+            "INSERT INTO v7 VALUES (-1, 1)",
+            "new row violates check option for view \"v7\"",
+        ),
+    ] {
+        match db.analyze(sql) {
+            Ok(a) => panic!("{sql}: expected {msg:?}, got Ok: {a:?}"),
+            Err(e) => assert!(e.to_string().starts_with(msg), "{sql}\n  got: {e}"),
+        }
+    }
+}
+
+/// Neighbours PG accepts, or that fail only on some executions: a CHECK
+/// is NULL (so passes) for a NULL; a BEFORE ROW trigger (on the table, or
+/// a partition the row may land in) may change the row; an INSTEAD OF
+/// trigger or a DO INSTEAD rule takes the row instead; a NOT ENFORCED
+/// constraint isn't checked; a view's check option isn't checked of a
+/// row ON CONFLICT skips, nor of one inserted through a LOCAL check
+/// option above a view without one; UPDATE and MERGE change only the
+/// rows they match; a parameter or an unknown partition say nothing.
+#[test]
+fn constant_row_check_violations_are_accepted_where_they_may_succeed() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ck (id int PRIMARY KEY, v int CHECK (v > 0));
+         CREATE VIEW vck AS SELECT id, v FROM ck WHERE v > 10 WITH CHECK OPTION;
+         CREATE TABLE tr (v int CHECK (v > 0));
+         CREATE FUNCTION fix() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN NEW.v := 1; RETURN NEW; END$$;
+         CREATE TRIGGER t BEFORE INSERT ON tr FOR EACH ROW EXECUTE FUNCTION fix();
+         CREATE TABLE ptr (k int, v int CHECK (v > 0)) PARTITION BY LIST (k);
+         CREATE TABLE ptr1 PARTITION OF ptr FOR VALUES IN (1);
+         CREATE TRIGGER t BEFORE INSERT ON ptr1 FOR EACH ROW EXECUTE FUNCTION fix();
+         CREATE TABLE pu (k int, v int) PARTITION BY LIST (k);
+         CREATE TABLE pu1 PARTITION OF pu (CHECK (v > 0)) FOR VALUES IN (1);
+         CREATE TABLE pu2 PARTITION OF pu FOR VALUES IN (2);
+         CREATE VIEW vi AS SELECT id, v FROM ck WHERE v > 10 WITH CHECK OPTION;
+         CREATE FUNCTION ins() RETURNS trigger LANGUAGE plpgsql
+             AS $$BEGIN RETURN NEW; END$$;
+         CREATE TRIGGER t INSTEAD OF INSERT ON vi FOR EACH ROW EXECUTE FUNCTION ins();
+         CREATE TABLE ru (v int CHECK (v > 0));
+         CREATE TABLE sink (v int);
+         CREATE RULE r AS ON INSERT TO ru DO INSTEAD INSERT INTO sink VALUES (NEW.v);
+         CREATE TABLE ne (a int, CONSTRAINT c CHECK (a > 0) NOT ENFORCED);
+         CREATE TABLE b (a int, c int);
+         CREATE VIEW v1 AS SELECT * FROM b WHERE a > 0;
+         CREATE VIEW v3 AS SELECT * FROM v1 WHERE c > 0 WITH LOCAL CHECK OPTION;
+         CREATE TABLE src (id int, v int);",
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO ck VALUES (1, NULL)",
+        "INSERT INTO ck (id) VALUES (1)",
+        "INSERT INTO tr VALUES (0)",
+        "INSERT INTO ptr VALUES (1, 0)",
+        "INSERT INTO pu VALUES ($1, 0)",
+        "INSERT INTO vi VALUES (1, 5)",
+        "INSERT INTO ru VALUES (0)",
+        "INSERT INTO ne VALUES (0)",
+        "INSERT INTO vck VALUES (1, 5) ON CONFLICT DO NOTHING",
+        "INSERT INTO vck VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = 50",
+        "INSERT INTO v3 VALUES (-1, 5)",
+        "INSERT INTO ck VALUES ($1, $2)",
+        "UPDATE ck SET v = 0",
+        "MERGE INTO ck USING src ON src.id = ck.id WHEN NOT MATCHED THEN INSERT VALUES (1, 0)",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

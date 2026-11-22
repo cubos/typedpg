@@ -74,6 +74,9 @@ pub(crate) struct Assign {
     pub(crate) default: bool,
     /// Some value is a bare `NULL` written to the whole column.
     pub(crate) null: bool,
+    /// The value is assigned into the column (`col[i]`, `col.f`):
+    /// process_matched_tle merges several such assignments to one column.
+    pub(crate) indirected: bool,
 }
 
 /// An INSERT / UPDATE / DELETE, or one MERGE action (`None` = DO NOTHING).
@@ -156,6 +159,7 @@ pub(crate) fn set_list_assigns(target_list: &[Option<ast::Node>]) -> Vec<Assign>
                 column: rt.name.clone(),
                 default,
                 null: rt.indirection.is_empty() && is_sql_null_literal(rt.val.as_ref()),
+                indirected: !rt.indirection.is_empty(),
             }
         })
         .collect()
@@ -525,6 +529,26 @@ fn target_list_iu(
     overriding: Overriding,
     is_view: bool,
 ) -> Result<Vec<Assign>, AnalyzeError> {
+    // process_matched_tle, over the target list in order: several
+    // assignments to one column merge only when each assigns into it. Two
+    // columns of a view mapped onto one base column meet here, one level
+    // below the view (the parser rejects a column named twice).
+    for (i, a) in assigns.iter().enumerate() {
+        if assigns[..i]
+            .iter()
+            .any(|prev| prev.column == a.column && !(prev.indirected && a.indirected))
+        {
+            return Err(crate::error::RawError::new(
+                AnalyzeError::SyntaxError(format!(
+                    "multiple assignments to same column \"{}\"",
+                    a.column
+                )),
+                None,
+                None,
+            )
+            .finalize_implicit());
+        }
+    }
     let mut out = Vec::new();
     for att in attrs {
         let Some(assigned) = assigns.iter().find(|a| a.column == att.attname) else {
@@ -535,6 +559,7 @@ fn target_list_iu(
                     column: att.attname.clone(),
                     default: false,
                     null: false,
+                    indirected: false,
                 });
             }
             continue;
@@ -549,6 +574,7 @@ fn target_list_iu(
                 column: att.attname.clone(),
                 default: false,
                 null: false,
+                indirected: false,
             });
             continue;
         }
@@ -591,6 +617,7 @@ fn target_list_iu(
                 column: att.attname.clone(),
                 default: false,
                 null: !(is_view && att.atthasdef),
+                indirected: false,
             });
         }
     }

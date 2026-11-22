@@ -114,6 +114,10 @@ fn analyze_insert_here(
                             && rows
                                 .iter()
                                 .any(|r| r.get(i).is_some_and(|n| is_sql_null_literal(n.as_ref()))),
+                        indirected: tgt
+                            .col_indirection
+                            .get(i)
+                            .is_some_and(|ind| !ind.is_empty()),
                     })
                 })
                 .collect();
@@ -145,6 +149,10 @@ fn analyze_insert_here(
                         column: target_col_at(&tgt, i)?.attname.clone(),
                         default: false,
                         null: false,
+                        indirected: tgt
+                            .col_indirection
+                            .get(i)
+                            .is_some_and(|ind| !ind.is_empty()),
                     })
                 })
                 .collect();
@@ -653,6 +661,9 @@ struct InsertTarget {
     /// The columns of a view target that are identity columns of the
     /// relation the row is stored in (see [`view_identity_columns`]).
     view_identity: Vec<String>,
+    /// The INSERT has an ON CONFLICT clause: a conflicting row is not
+    /// inserted, so no view's WITH CHECK OPTION checks it.
+    on_conflict: bool,
 }
 
 impl InsertTarget {
@@ -798,6 +809,7 @@ fn resolve_insert_target(
         col_indirection,
         overriding: Overriding::from_kind(ins.r#override),
         view_identity: view_identity_columns(snapshot, table_oid),
+        on_conflict: ins.on_conflict_clause.is_some(),
     })
 }
 
@@ -1166,6 +1178,13 @@ struct RowViolation {
 }
 
 impl RowViolation {
+    /// A CHECK constraint's: after every column's NOT NULL
+    /// (ExecConstraints).
+    const CHECK: (bool, i16) = (true, i16::MAX - 1);
+    /// A view's WITH CHECK OPTION: once the row is stored
+    /// (ExecWithCheckOptions after ExecInsert's ExecConstraints).
+    const VIEW_CHECK: (bool, i16) = (true, i16::MAX);
+
     /// Column `tc`'s violation, in the order of the relation `rel` the row
     /// lands in (a partition's columns may be ordered differently).
     fn of(
@@ -1289,6 +1308,14 @@ fn row_violation<'a>(
         snapshot,
         &lands_in,
     ));
+    violations.extend(check_violation(
+        tgt,
+        items,
+        known,
+        snapshot,
+        statement_target,
+        &lands_in,
+    ));
     violations.into_iter().min_by_key(|v| v.order)
 }
 
@@ -1370,6 +1397,7 @@ fn through_view<'a>(
         col_indirection,
         overriding: tgt.overriding,
         view_identity: view_identity_columns(snapshot, base_oid),
+        on_conflict: tgt.on_conflict,
     };
     Some((base, base_items, opaque))
 }
@@ -1436,24 +1464,7 @@ fn row_relation<'a>(
     snapshot: &PgCatalog,
     statement_target: crate::oid::PgClassOid,
 ) -> ((crate::oid::PgClassOid, String), Option<RowViolation>) {
-    // A column's value in the row: given, or its default when that is NULL
-    // (`Some(None)` for NULL); `None` when unknown.
-    let value_of = |name: &str| -> Option<Option<&ast::Node>> {
-        let c = tgt.attrs.iter().find(|c| c.attname == name)?;
-        let given =
-            (0..items.len()).find(|&i| target_col_at(tgt, i).is_some_and(|t| t.attname == name));
-        match given {
-            Some(i) if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) || tgt.discards(c) => {
-                None
-            }
-            Some(i) if !is_set_to_default(items[i]) => match known(i) {
-                Known::Null => Some(None),
-                Known::Value(v) => v.map(Some),
-                Known::Unknown => None,
-            },
-            _ => null_default(c, snapshot).then_some(None),
-        }
-    };
+    let value_of = |name: &str| row_value(tgt, items, known, snapshot, name);
     use crate::ddl::tables::partbound::Route;
     let route = crate::ddl::tables::partbound::route_row(snapshot, tgt.oid, &value_of);
     // The planner prunes the result relations the rows certainly reach:
@@ -1481,6 +1492,253 @@ fn row_relation<'a>(
         _ => None,
     };
     (lands_in, unrouted)
+}
+
+/// Column `name`'s value in the INSERT row `items` of `tgt` (see
+/// [`row_violation`]): given, or its default when that is NULL
+/// (`Some(None)` for NULL); `None` when unknown.
+fn row_value<'a>(
+    tgt: &InsertTarget,
+    items: &[Option<&'a ast::Node>],
+    known: &dyn Fn(usize) -> Known<'a>,
+    snapshot: &PgCatalog,
+    name: &str,
+) -> Option<Option<&'a ast::Node>> {
+    let c = tgt.attrs.iter().find(|c| c.attname == name)?;
+    let given =
+        (0..items.len()).find(|&i| target_col_at(tgt, i).is_some_and(|t| t.attname == name));
+    match given {
+        Some(i) if !tgt.col_indirection.get(i).is_none_or(Vec::is_empty) || tgt.discards(c) => None,
+        Some(i) if !is_set_to_default(items[i]) => match known(i) {
+            Known::Null => Some(None),
+            Known::Value(v) => v.map(Some),
+            Known::Unknown => None,
+        },
+        _ => null_default(c, snapshot).then_some(None),
+    }
+}
+
+/// The CHECK the row `items` of `tgt` (a table, not a view) surely fails
+/// once it lands in `lands_in`: the first of the relation's enforced CHECK
+/// constraints, in name order, surely FALSE for it (ExecConstraints →
+/// ExecRelCheck; a NULL result passes), else the first WITH CHECK OPTION
+/// of the views `statement_target` writes it through, inner view first,
+/// surely FALSE for it (ExecWithCheckOptions, once the row is stored).
+/// A column's value counts only when it is stored as written (see
+/// [`known_literal`]). None when the statement isn't run, or a BEFORE
+/// ROW trigger may change the row — on the table or a partition the row
+/// may be routed to — or a row-level security policy may reject it first,
+/// or the row's partition is unknown, or (for the check options) ON
+/// CONFLICT may skip the row. (A DO INSTEAD rule or INSTEAD OF trigger
+/// was ruled out by [`row_violation`].)
+fn check_violation<'a>(
+    tgt: &InsertTarget,
+    items: &[Option<&'a ast::Node>],
+    known: &dyn Fn(usize) -> Known<'a>,
+    snapshot: &PgCatalog,
+    statement_target: crate::oid::PgClassOid,
+    lands_in: &(crate::oid::PgClassOid, String),
+) -> Option<RowViolation> {
+    use crate::nonnull::checks::{Knowledge, RelationChecks};
+    use crate::nonnull::{Literal, ValPred};
+    if !super::executes()
+        || before_row_trigger_rewrites(snapshot, tgt.oid, DmlEvent::Insert)
+        || [tgt.oid, lands_in.0]
+            .iter()
+            .any(|r| snapshot.row_security.contains(r))
+        || snapshot
+            .pg_class
+            .get(&lands_in.0)
+            .is_none_or(|c| c.relkind != crate::pg_catalog::RelKind::Table)
+    {
+        return None;
+    }
+    // Each column's value by name: `Some(None)` for NULL.
+    let value = |name: &str| -> Option<Option<Literal>> {
+        let c = tgt.attrs.iter().find(|c| c.attname == name)?;
+        match row_value(tgt, items, known, snapshot, name)? {
+            None => Some(None),
+            Some(v) => known_literal(v, c, snapshot).map(Some),
+        }
+    };
+    let no_preds = |_: &str| Vec::<ValPred>::new();
+    // ExecConstraints checked the NOT NULL columns first.
+    let lands_attrs = snapshot.attributes_of(lands_in.0);
+    let non_null = |c: &str| {
+        matches!(value(c), Some(Some(_)))
+            || lands_attrs.iter().any(|a| a.attname == c && a.attnotnull)
+    };
+    let null = |c: &str| matches!(value(c), Some(None));
+    let equals = |c: &str| value(c).flatten();
+    let k = Knowledge {
+        non_null: &non_null,
+        null: &null,
+        equals: &equals,
+        preds: &no_preds,
+    };
+    let mut constraints: Vec<&crate::pg_catalog::PgConstraint> = snapshot
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.conrelid == lands_in.0
+                && c.contype == crate::pg_catalog::ConType::Check
+                && c.conenforced
+        })
+        .collect();
+    // CheckNNConstraintFetch sorts them by name (strcmp).
+    constraints.sort_by(|a, b| a.conname.cmp(&b.conname));
+    for con in constraints {
+        let Some(def) = snapshot.check_defs.get(&con.oid) else {
+            continue;
+        };
+        let crate::ddl::tables::check_inherit::StoredExpr::Written(expr) = &def.expr else {
+            continue;
+        };
+        let Some(trust) = &def.trusted else {
+            continue;
+        };
+        if RelationChecks::surely_false(snapshot, lands_in.0, (**expr).as_ref(), trust, &k) {
+            return Some(RowViolation {
+                order: RowViolation::CHECK,
+                error: crate::pgmsg::check_constraint_violation(&lands_in.1, &con.conname),
+            });
+        }
+    }
+    if tgt.on_conflict {
+        return None;
+    }
+    for (view, base) in insert_check_options(snapshot, statement_target) {
+        // The view's WHERE reads its base relation's columns: each the
+        // table's column it stores into (through the views below), if any.
+        let Some(column) = stored_columns(snapshot, base, tgt.oid) else {
+            continue;
+        };
+        let value = |c: &str| column.get(c).and_then(|t| value(t));
+        let non_null = |c: &str| matches!(value(c), Some(Some(_)));
+        let null = |c: &str| matches!(value(c), Some(None));
+        let equals = |c: &str| value(c).flatten();
+        let k = Knowledge {
+            non_null: &non_null,
+            null: &null,
+            equals: &equals,
+            preds: &no_preds,
+        };
+        let Some(ast::Node::SelectStmt(query)) =
+            crate::ddl::views::stored_view_query(snapshot, view)
+        else {
+            continue;
+        };
+        let qual = query.where_clause.as_ref();
+        let trust = crate::privileges::suspended(|| {
+            crate::ddl::volatile::trusted_over_relation(snapshot, base, qual)
+        });
+        if let Some(trust) = trust
+            && RelationChecks::surely_false(snapshot, base, qual, &trust, &k)
+        {
+            let relname = &snapshot.pg_class.get(&view)?.relname;
+            return Some(RowViolation {
+                order: RowViolation::VIEW_CHECK,
+                error: crate::pgmsg::view_check_option_violation(relname),
+            });
+        }
+    }
+    None
+}
+
+/// The constant column `c` stores for the value `v` given it, as a CHECK
+/// compares it: a literal (or one cast to the column's type, see
+/// [`crate::nonnull::literal_for`]) stored as written — not into a column
+/// with a type modifier (`numeric(2,-1)` rounds, `varchar(2)` drops
+/// trailing spaces), nor of a domain with CHECKs (which could reject it
+/// first).
+fn known_literal(
+    v: &ast::Node,
+    c: &crate::pg_catalog::PgAttribute,
+    snapshot: &PgCatalog,
+) -> Option<crate::nonnull::Literal> {
+    if snapshot.effective_typmod(c.atttypid, c.atttypmod).is_some()
+        || snapshot.domain_has_checks(c.atttypid)
+    {
+        return None;
+    }
+    crate::nonnull::literal_for(Some(v), c.atttypid, snapshot)
+}
+
+/// The views whose WITH CHECK OPTION an INSERT into view `top` checks
+/// (rewriteTargetView, down the chain of automatically updatable views),
+/// each with its base relation, in the order ExecWithCheckOptions checks
+/// them: inner views first. A view checks when it has a check option, or
+/// a CASCADED one checks above it; one without a WHERE checks nothing,
+/// but its own CASCADED option still reaches the views below.
+fn insert_check_options(
+    snapshot: &PgCatalog,
+    top: crate::oid::PgClassOid,
+) -> Vec<(crate::oid::PgClassOid, crate::oid::PgClassOid)> {
+    let mut out = Vec::new();
+    // The `cascaded` flag of the check option added last (the head of
+    // withCheckOptions).
+    let mut head_cascaded = false;
+    let mut cur = top;
+    for _ in 0..16 {
+        let Some(class) = snapshot.pg_class.get(&cur) else {
+            break;
+        };
+        if class.relkind != crate::pg_catalog::RelKind::View {
+            break;
+        }
+        let Some(base) = snapshot.view_updatability.get(&cur).and_then(|u| u.base) else {
+            break;
+        };
+        let has_wco = snapshot.check_option_views.contains(&cur) || head_cascaded;
+        let cascaded = snapshot.cascaded_check_option_views.contains(&cur) || head_cascaded;
+        let has_quals = matches!(
+            crate::ddl::views::stored_view_query(snapshot, cur),
+            Some(ast::Node::SelectStmt(q)) if q.where_clause.is_some()
+        );
+        if has_wco && (cascaded || has_quals) {
+            head_cascaded = cascaded;
+            if has_quals {
+                out.push((cur, base));
+            }
+        }
+        cur = base;
+    }
+    out.reverse();
+    out
+}
+
+/// The column of table `table` each column of relation `rel` (the table
+/// itself, or an automatically updatable view down to it) stores into,
+/// by name; a view column computed by an expression stores into none.
+fn stored_columns(
+    snapshot: &PgCatalog,
+    rel: crate::oid::PgClassOid,
+    table: crate::oid::PgClassOid,
+) -> Option<HashMap<String, String>> {
+    let attrs = snapshot.attributes_of(rel);
+    if rel == table {
+        return Some(
+            attrs
+                .iter()
+                .map(|a| (a.attname.clone(), a.attname.clone()))
+                .collect(),
+        );
+    }
+    let upd = snapshot.view_updatability.get(&rel)?;
+    let base = upd.base?;
+    let below = stored_columns(snapshot, base, table)?;
+    let base_attrs = snapshot.attributes_of(base);
+    Some(
+        attrs
+            .iter()
+            .zip(&upd.columns)
+            .filter_map(|(a, col)| {
+                let attnum = *col.as_ref().ok()?;
+                let base_att = base_attrs.iter().find(|b| b.attnum == attnum)?;
+                Some((a.attname.clone(), below.get(&base_att.attname)?.clone()))
+            })
+            .collect(),
+    )
 }
 
 /// The error the planner raises folding column `c`'s default (of table
@@ -2185,11 +2443,13 @@ fn analyze_insert_on_conflict(
         conflict_scope.sources.extend(excluded_holder.sources);
         if let where_clause @ Some(_) = &on_conflict.where_clause {
             let conflict_null_ctx = NullabilityContext::default();
-            expr::infer_expr(
+            // transformOnConflictClause: transformWhereClause, coerced as
+            // WHERE (coerce_to_boolean).
+            crate::clause::coerce_clause_expr(
                 where_clause.as_ref(),
                 expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
                 params,
-                TypeGoal::implicit(oid::BOOL),
+                crate::clause::ClauseKind::Where,
             )?;
             crate::clause::check_no_aggregates_or_windows(
                 where_clause.as_ref(),
@@ -2228,11 +2488,13 @@ fn analyze_insert_on_conflict(
     )?
     .into_owned();
     if let where_clause @ Some(_) = &on_conflict.where_clause {
-        expr::infer_expr(
+        // transformOnConflictClause: transformWhereClause, coerced as WHERE
+        // (coerce_to_boolean).
+        crate::clause::coerce_clause_expr(
             where_clause.as_ref(),
             expr::Ctx::new(&conflict_scope, &conflict_null_ctx, snapshot),
             params,
-            TypeGoal::implicit(oid::BOOL),
+            crate::clause::ClauseKind::Where,
         )?;
         crate::clause::check_no_aggregates_or_windows(where_clause.as_ref(), snapshot, "WHERE")?;
         check_no_srf_in_clause(where_clause.as_ref(), snapshot, "WHERE")?;

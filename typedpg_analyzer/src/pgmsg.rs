@@ -525,6 +525,25 @@ pub(crate) fn no_partition_for_row(relname: &str) -> AnalyzeError {
     ))
 }
 
+/// `new row for relation "t" violates check constraint "c"` — SQLSTATE
+/// 23514 (`ExecConstraints`): `relname` is the relation the row is stored
+/// in (a partition, when routed), unqualified and unquoted. PG's errdetail
+/// (`Failing row contains …`) is not reproduced.
+pub(crate) fn check_constraint_violation(relname: &str, conname: &str) -> AnalyzeError {
+    AnalyzeError::CheckViolation(format!(
+        "new row for relation \"{relname}\" violates check constraint \"{conname}\""
+    ))
+}
+
+/// `new row violates check option for view "v"` — SQLSTATE 44000
+/// (`ExecWithCheckOptions`, WCO_VIEW_CHECK). PG's errdetail (`Failing row
+/// contains …`) is not reproduced.
+pub(crate) fn view_check_option_violation(viewname: &str) -> AnalyzeError {
+    AnalyzeError::WithCheckOptionViolation(format!(
+        "new row violates check option for view \"{viewname}\""
+    ))
+}
+
 /// `functions returning type "internal" cannot be called explicitly` (or
 /// `accepting`) — SQLSTATE 0A000 (`ParseFuncOrColumn`).
 pub(crate) fn internal_function_call(returning: bool, span: Option<SourceSpan>) -> RawError {

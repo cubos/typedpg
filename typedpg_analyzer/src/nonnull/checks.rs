@@ -799,7 +799,24 @@ impl RelationChecks {
         if clauses.is_empty() {
             return None;
         }
-        let subjects = subjects.into_inner();
+        Some(Self::assemble(
+            snapshot,
+            attrs,
+            &column_type,
+            clauses,
+            subjects.into_inner(),
+        ))
+    }
+
+    /// The checks `clauses` (over the columns `attrs` and the expression
+    /// `subjects` they name) make up.
+    fn assemble(
+        snapshot: &PgCatalog,
+        attrs: &[crate::pg_catalog::PgAttribute],
+        column_type: &dyn Fn(&str) -> Option<PgTypeOid>,
+        clauses: Vec<Clause>,
+        subjects: HashMap<String, Subject>,
+    ) -> RelationChecks {
         let mut spaces: HashMap<String, Space> = attrs
             .iter()
             .map(|a| {
@@ -810,7 +827,7 @@ impl RelationChecks {
             })
             .collect();
         for (name, s) in &subjects {
-            if let Some(t) = s.ty(&column_type) {
+            if let Some(t) = s.ty(column_type) {
                 spaces.insert(name.clone(), Space::of(t, None, snapshot));
             }
         }
@@ -819,13 +836,73 @@ impl RelationChecks {
         let (expr_clauses, clauses): (Vec<Clause>, Vec<Clause>) = clauses
             .into_iter()
             .partition(|c| c.names().any(|n| subjects.contains_key(n)));
-        Some(RelationChecks {
+        RelationChecks {
             clauses,
             expr_clauses,
             spaces,
             subjects,
             typeof_of,
-        })
+        }
+    }
+
+    /// Whether `expr` — a CHECK constraint's expression, or a view's WHERE,
+    /// over the row of relation `relid`, its operators and functions as
+    /// `trust` says they resolved — is surely FALSE (not NULL) for the row
+    /// `k` describes: the constraints it alone makes up can't hold of it.
+    /// What can't be read refutes nothing.
+    pub(crate) fn surely_false(
+        snapshot: &PgCatalog,
+        relid: PgClassOid,
+        expr: Option<&ast::Node>,
+        trust: &TrustedNodes,
+        k: &Knowledge<'_>,
+    ) -> bool {
+        let attrs = snapshot.attributes_of(relid);
+        let is_composite = |name: &str| {
+            attrs
+                .iter()
+                .find(|a| a.attname == name)
+                .is_none_or(|a| crate::coerce::is_complex(a.atttypid, snapshot))
+        };
+        let column_type = |name: &str| attrs.iter().find(|a| a.attname == name).map(|a| a.atttypid);
+        let subjects = std::cell::RefCell::new(HashMap::new());
+        let cx = Cx {
+            is_composite: &is_composite,
+            column_type: &column_type,
+            snapshot,
+            trust,
+            subjects: &subjects,
+            env: None,
+            depth: 0,
+        };
+        let mut clauses = Vec::new();
+        for conjunct in conjuncts(expr) {
+            for arms in cnf(conjunct, &cx) {
+                if arms
+                    .iter()
+                    .any(|arm| arm.iter().any(|l| !matches!(l, Lit::Other)))
+                {
+                    clauses.push(Clause { arms });
+                }
+            }
+        }
+        if clauses.is_empty() {
+            return false;
+        }
+        let checks = Self::assemble(
+            snapshot,
+            attrs,
+            &column_type,
+            clauses,
+            subjects.into_inner(),
+        );
+        // A row no value can be (an enum column given no label of it) is
+        // rejected before any constraint is evaluated.
+        let nothing = RelationChecks {
+            clauses: Vec::new(),
+            ..checks.clone()
+        };
+        !nothing.contradicts(k) && checks.contradicts(k)
     }
 
     /// The constraints over the columns of a relation exposing column `c`
