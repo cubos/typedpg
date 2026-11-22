@@ -518,6 +518,7 @@ pub(crate) fn new_relfilenode(db: &mut PgCatalog, index: PgClassOid) {
 /// LOGGED / UNLOGGED): finish_heap_swap rebuilds every index of it, each
 /// in a new relfilenode.
 pub(crate) fn table_rewritten(db: &mut PgCatalog, relid: PgClassOid) {
+    db.tables_with_new_relfilenode.insert(relid);
     let indexes: Vec<PgClassOid> = db
         .pg_index
         .values()

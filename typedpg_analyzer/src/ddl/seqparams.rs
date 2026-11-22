@@ -86,15 +86,11 @@ pub(crate) fn numeric_arg(de: &typedpg_pg_query::ast::DefElem) -> Result<Option<
         Some(ast::Node::String(s)) => s.sval.as_str(),
         _ => return Ok(None),
     };
-    match crate::literal_input::parse_pg_integer(text) {
-        Some(v) if i64::try_from(v).is_ok() => Ok(Some(v)),
-        Some(_) => Err(DdlError::UnsupportedDdl(format!(
-            "value \"{text}\" is out of range for type bigint"
-        ))),
-        None => Err(DdlError::UnsupportedDdl(
-            crate::pgmsg::invalid_input_syntax_for_type("bigint", text),
-        )),
-    }
+    // int8in / pg_strtoint64: a syntax error, else out of range — however
+    // many digits the value has.
+    crate::literal_input::validate_int(text, i128::from(i64::MIN), i128::from(i64::MAX), "bigint")
+        .map_err(DdlError::UnsupportedDdl)?;
+    Ok(crate::literal_input::parse_pg_integer(text))
 }
 
 /// init_params: apply `options` to `current` (a new sequence when `None`).

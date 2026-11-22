@@ -32,6 +32,8 @@ pub(crate) enum ExprKind {
     TriggerWhen,
     /// EXPR_KIND_ALTER_COL_TRANSFORM: ALTER COLUMN TYPE's USING.
     AlterColTransform,
+    /// EXPR_KIND_COPY_WHERE: COPY FROM's WHERE.
+    CopyWhere,
 }
 
 impl ExprKind {
@@ -48,6 +50,7 @@ impl ExprKind {
             ExprKind::PartitionExpression => "partition key expressions",
             ExprKind::TriggerWhen => "trigger WHEN conditions",
             ExprKind::AlterColTransform => "transform expressions",
+            ExprKind::CopyWhere => "COPY FROM WHERE conditions",
         }
     }
 
@@ -64,6 +67,7 @@ impl ExprKind {
             ExprKind::PartitionExpression => Some("partition key expression"),
             ExprKind::TriggerWhen => Some("trigger WHEN condition"),
             ExprKind::AlterColTransform => Some("transform expression"),
+            ExprKind::CopyWhere => Some("COPY FROM WHERE condition"),
         }
     }
 }

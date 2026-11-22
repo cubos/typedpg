@@ -948,124 +948,443 @@ pub fn security_label(stmt: &SecLabelStmt) -> Result<(), DdlError> {
     )))
 }
 
-/// COPY (DoCopy / ProcessCopyOptions / BeginCopyTo / BeginCopyFrom): the
-/// options must be known, the relation must suit the direction and the
-/// column list name its columns once; COPY (query) TO analyzes the query.
-/// The data itself (files, STDIN) isn't modeled.
+/// COPY, in PG 19's order: DoCopy opens the relation, analyzes COPY FROM's
+/// WHERE and reads the column list (CopyGetAttnums); BeginCopyTo refuses
+/// a relation it can't copy from, then reads the options
+/// (ProcessCopyOptions) and the FORCE_QUOTE columns; BeginCopyFrom reads
+/// the options and the columns they name, and CopyFrom then refuses a
+/// relation it can't copy to and checks FREEZE. COPY (query) TO reads the
+/// options, then analyzes the query. The data itself (files, STDIN) isn't
+/// modeled.
 pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Result<(), DdlError> {
-    process_copy_options(stmt.is_from, &stmt.options)?;
-    // `COPY (query) TO` runs the query.
-    if let Some(query) = stmt.query.as_ref() {
-        return super::dml::check_executed(interp, query);
-    }
     let Some(rv) = stmt.relation.as_ref() else {
+        let opts = process_copy_options(stmt.is_from, &stmt.options)?;
+        let Some(query) = stmt.query.as_ref() else {
+            return Ok(());
+        };
+        // BeginCopyTo: the query runs, and FORCE_QUOTE names its columns
+        // (CopyGetAttnums without a relation), every one of which is
+        // copied.
+        let Some(columns) =
+            super::dml::verdict(crate::resolve::analyze_executed(interp, query, || {
+                crate::resolve::analyze_raw_node(interp, query, &[])
+            }))?
+        else {
+            return Ok(());
+        };
+        copy_query_shape(interp, query)?;
+        if let CopyColumns::Names(names) = &opts.force_quote {
+            let columns: Vec<CopyColumn> = columns
+                .iter()
+                .zip(1..)
+                .map(|(c, attnum)| CopyColumn {
+                    name: &c.name,
+                    attnum,
+                    generated: false,
+                })
+                .collect();
+            copy_get_attnums(&columns, None, names)?;
+        }
         return Ok(());
     };
-    let (_, relid) = super::util::lookup_relation(interp, rv)?;
+    let (_, relid) = super::util::lookup_table(interp, rv)?;
     let kind = relkind(interp, relid);
-    let refused = if stmt.is_from {
+    // DoCopy: COPY FROM's WHERE (the grammar takes none for COPY TO).
+    if let Some(w) = stmt.where_clause.as_ref() {
+        copy_where(interp, relid, w)?;
+    }
+    let attrs = interp.attributes_of(relid);
+    let columns: Vec<CopyColumn> = attrs
+        .iter()
+        .map(|a| CopyColumn {
+            name: &a.attname,
+            attnum: a.attnum,
+            generated: a.attgenerated.is_some(),
+        })
+        .collect();
+    let attlist: Vec<String> = stmt
+        .attlist
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .map(str::to_owned)
+        .collect();
+    let relname = rv.relname.as_str();
+    let copied = copy_get_attnums(&columns, Some(relname), &attlist)?;
+    let refuse = |msg: &str, hint: &str| Err(DdlError::Parse(format!("{msg} \"{relname}\"{hint}")));
+
+    if !stmt.is_from {
+        // BeginCopyTo: a table, a populated materialized view, or a
+        // partitioned table — copied from its partitions, none of which
+        // may be a foreign table.
         match kind {
-            // CopyFrom: a view takes rows through an INSTEAD OF INSERT
-            // trigger.
-            Some(RelKind::View)
-                if !interp.triggers.get(&relid).is_some_and(|ts| {
-                    ts.iter()
-                        .any(|t| t.is_instead_row_for(crate::ddl::triggers::TRIGGER_TYPE_INSERT))
-                }) =>
-            {
-                Some((
-                    "cannot copy to view",
-                    " (To enable copying to a view, provide an INSTEAD OF INSERT trigger.)",
-                ))
+            Some(RelKind::Table) => {}
+            Some(RelKind::View) => {
+                return refuse(
+                    "cannot copy from view",
+                    " (Try the COPY (SELECT ...) TO variant.)",
+                );
             }
-            Some(RelKind::MaterializedView) => Some(("cannot copy to materialized view", "")),
-            Some(RelKind::Sequence) => Some(("cannot copy to sequence", "")),
-            _ => None,
+            Some(RelKind::MaterializedView) => {
+                if interp.unpopulated_matviews.contains(&relid) {
+                    return refuse(
+                        "cannot copy from unpopulated materialized view",
+                        " (Use the REFRESH MATERIALIZED VIEW command.)",
+                    );
+                }
+            }
+            Some(RelKind::ForeignTable) => {
+                return refuse(
+                    "cannot copy from foreign table",
+                    " (Try the COPY (SELECT ...) TO variant.)",
+                );
+            }
+            Some(RelKind::Sequence) => return refuse("cannot copy from sequence", ""),
+            Some(RelKind::Partitioned) => {
+                let mut parts = super::tables::inherit::all_inheritors(interp, relid);
+                parts.sort();
+                if let Some(foreign) = parts
+                    .into_iter()
+                    .find(|&p| relkind(interp, p) == Some(RelKind::ForeignTable))
+                {
+                    let name = self::relname(interp, foreign);
+                    return Err(DdlError::Parse(format!(
+                        "cannot copy from foreign table \"{name}\" (Partition \"{name}\" is a \
+                         foreign table in partitioned table \"{relname}\". Try the COPY \
+                         (SELECT ...) TO variant.)"
+                    )));
+                }
+            }
+            _ => return refuse("cannot copy from non-table relation", ""),
         }
-    } else {
-        match kind {
-            Some(RelKind::View) => Some((
-                "cannot copy from view",
-                " (Try the COPY (SELECT ...) TO variant.)",
-            )),
-            Some(RelKind::Sequence) => Some(("cannot copy from sequence", "")),
-            Some(RelKind::ForeignTable) => Some((
-                "cannot copy from foreign table",
-                " (Try the COPY (SELECT ...) TO variant.)",
-            )),
-            _ => None,
-        }
-    };
-    if let Some((msg, hint)) = refused {
-        return Err(DdlError::Parse(format!("{msg} \"{}\"{hint}", rv.relname)));
+        let opts = process_copy_options(false, &stmt.options)?;
+        return check_copied(&columns, relname, &opts.force_quote, "FORCE_QUOTE", &copied);
     }
-    // BeginCopyTo (PostgreSQL 19): a partitioned table is copied from its
-    // partitions, none of which may be a foreign table.
-    if !stmt.is_from && kind == Some(RelKind::Partitioned) {
-        let mut parts = super::tables::inherit::all_inheritors(interp, relid);
-        parts.sort();
-        if let Some(foreign) = parts
-            .into_iter()
-            .find(|&p| relkind(interp, p) == Some(RelKind::ForeignTable))
-        {
-            let name = relname(interp, foreign);
-            return Err(DdlError::Parse(format!(
-                "cannot copy from foreign table \"{name}\" (Partition \"{name}\" is a foreign table \
-                 in partitioned table \"{}\". Try the COPY (SELECT ...) TO variant.)",
-                rv.relname
-            )));
-        }
-    }
-    // DoCopy: COPY FROM's WHERE reads no system column.
-    if stmt.is_from
-        && let Some(w) = stmt.where_clause.as_ref()
-    {
-        for (n, _) in w.nodes() {
-            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
-                && let Some(col) = cr
-                    .fields
-                    .last()
-                    .and_then(|f| super::util::node_string(f.as_ref()))
-                && interp.attribute_by_name(relid, col).is_none()
-                && crate::pg_catalog::SYSTEM_COLUMNS
-                    .iter()
-                    .any(|(s, ..)| *s == col)
-            {
+
+    // BeginCopyFrom: the options, then the columns they name.
+    let opts = process_copy_options(true, &stmt.options)?;
+    check_copied(
+        &columns,
+        relname,
+        &opts.force_notnull,
+        "FORCE_NOT_NULL",
+        &copied,
+    )?;
+    check_copied(&columns, relname, &opts.force_null, "FORCE_NULL", &copied)?;
+    if let Some(names) = &opts.convert_select {
+        for attnum in copy_get_attnums(&columns, Some(relname), names)? {
+            if !copied.contains(&attnum) {
                 return Err(DdlError::Parse(format!(
-                    "system columns are not supported in COPY FROM WHERE conditions (Column \
-                     \"{col}\" is a system column.)"
+                    "selected column \"{}\" not referenced by COPY",
+                    column_name(&columns, attnum)
                 )));
             }
         }
     }
-    let mut seen: Vec<&str> = Vec::new();
-    for col in stmt
-        .attlist
-        .iter()
-        .filter_map(|n| super::util::node_string(n.as_ref()))
-    {
-        if interp.attribute_by_name(relid, col).is_none() {
-            return Err(DdlError::Parse(format!(
-                "column \"{col}\" of relation \"{}\" does not exist",
-                rv.relname
-            )));
+    // CopyFrom: a table, a foreign or partitioned table, or a relation with
+    // an INSTEAD OF INSERT row trigger (only a view can have one).
+    let instead_of_insert = interp.triggers.get(&relid).is_some_and(|ts| {
+        ts.iter()
+            .any(|t| t.is_instead_row_for(crate::ddl::triggers::TRIGGER_TYPE_INSERT))
+    });
+    match kind {
+        Some(RelKind::Table | RelKind::ForeignTable | RelKind::Partitioned) => {}
+        _ if instead_of_insert => {}
+        Some(RelKind::View) => {
+            return refuse(
+                "cannot copy to view",
+                " (To enable copying to a view, provide an INSTEAD OF INSERT trigger.)",
+            );
         }
-        // CopyGetAttnums: generated columns take no input.
-        if interp
-            .attribute_by_name(relid, col)
-            .is_some_and(|a| a.attgenerated.is_some())
-        {
+        Some(RelKind::MaterializedView) => return refuse("cannot copy to materialized view", ""),
+        Some(RelKind::Sequence) => return refuse("cannot copy to sequence", ""),
+        _ => return refuse("cannot copy to non-table relation", ""),
+    }
+    if opts.freeze {
+        copy_freeze(interp, relid, kind)?;
+    }
+    Ok(())
+}
+
+/// BeginCopyTo's checks of an analyzed COPY query: no SELECT INTO, and a
+/// data-modifying statement must have a RETURNING clause. A statement on
+/// a relation with rules is left alone: the rewriter may turn it into
+/// none or several queries, which BeginCopyTo refuses first.
+fn copy_query_shape(interp: &PgCatalog, query: &ast::Node) -> Result<(), DdlError> {
+    let (relation, returning) = match query {
+        ast::Node::SelectStmt(select) => {
+            // The grammar leaves INTO on the leftmost SELECT of a set
+            // operation.
+            let mut leftmost = select.as_ref();
+            while let Some(larg) = leftmost.larg.as_deref() {
+                leftmost = larg;
+            }
+            if leftmost.into_clause.is_some() {
+                return Err(DdlError::UnsupportedDdl(
+                    "COPY (SELECT INTO) is not supported".into(),
+                ));
+            }
+            return Ok(());
+        }
+        ast::Node::InsertStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
+        ast::Node::UpdateStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
+        ast::Node::DeleteStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
+        ast::Node::MergeStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
+        _ => return Ok(()),
+    };
+    if returning.is_some_and(|r| !r.exprs.is_empty()) {
+        return Ok(());
+    }
+    let has_rules = relation
+        .and_then(|rv| super::util::lookup_relation(interp, rv).ok())
+        .is_none_or(|(_, relid)| interp.rules.get(&relid).is_some_and(|r| !r.is_empty()));
+    if has_rules {
+        return Ok(());
+    }
+    Err(DdlError::UnsupportedDdl(
+        "COPY query must have a RETURNING clause".into(),
+    ))
+}
+
+/// A column CopyGetAttnums can name: a relation's, or a COPY query's.
+struct CopyColumn<'a> {
+    name: &'a str,
+    attnum: i16,
+    generated: bool,
+}
+
+/// The name of column `attnum` of `columns`.
+fn column_name<'a>(columns: &[CopyColumn<'a>], attnum: i16) -> &'a str {
+    columns
+        .iter()
+        .find(|c| c.attnum == attnum)
+        .map_or("", |c| c.name)
+}
+
+/// CopyGetAttnums: the columns `names` names — each one existing, not
+/// generated, and named once — or, for no names, every column but the
+/// generated ones. `relname` is the relation's name, `None` for a query's
+/// columns.
+fn copy_get_attnums(
+    columns: &[CopyColumn],
+    relname: Option<&str>,
+    names: &[String],
+) -> Result<Vec<i16>, DdlError> {
+    if names.is_empty() {
+        return Ok(columns
+            .iter()
+            .filter(|c| !c.generated)
+            .map(|c| c.attnum)
+            .collect());
+    }
+    let mut attnums = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(column) = columns.iter().find(|c| c.name == name) else {
+            return Err(DdlError::Parse(match relname {
+                Some(rel) => format!("column \"{name}\" of relation \"{rel}\" does not exist"),
+                None => format!("column \"{name}\" does not exist"),
+            }));
+        };
+        if column.generated {
             return Err(DdlError::Parse(format!(
-                "column \"{col}\" is a generated column (Generated columns cannot be used in \
+                "column \"{name}\" is a generated column (Generated columns cannot be used in \
                  COPY.)"
             )));
         }
-        if seen.contains(&col) {
+        if attnums.contains(&column.attnum) {
             return Err(DdlError::DuplicateObject(format!(
-                "column \"{col}\" specified more than once"
+                "column \"{name}\" specified more than once"
             )));
         }
-        seen.push(col);
+        attnums.push(column.attnum);
+    }
+    Ok(attnums)
+}
+
+/// BeginCopyTo / BeginCopyFrom: the columns a FORCE_* `option` names
+/// (CopyGetAttnums) must each be one the COPY copies.
+fn check_copied(
+    columns: &[CopyColumn],
+    relname: &str,
+    columns_option: &CopyColumns,
+    option: &str,
+    copied: &[i16],
+) -> Result<(), DdlError> {
+    let CopyColumns::Names(names) = columns_option else {
+        return Ok(());
+    };
+    for attnum in copy_get_attnums(columns, Some(relname), names)? {
+        if !copied.contains(&attnum) {
+            return Err(DdlError::Parse(format!(
+                "{option} column \"{}\" not referenced by COPY",
+                column_name(columns, attnum)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// DoCopy's WHERE of COPY FROM: transformed over the table's row in
+/// EXPR_KIND_COPY_WHERE and coerced to boolean, then every column it reads
+/// (pull_varattnos, a whole-row reference reading all of them), in attnum
+/// order, must be neither a system column nor a generated one.
+fn copy_where(interp: &PgCatalog, relid: PgClassOid, expr: &ast::Node) -> Result<(), DdlError> {
+    use crate::error::AnalyzeError;
+    super::expr_kind::check_expr_kind(interp, Some(expr), super::expr_kind::ExprKind::CopyWhere)?;
+    // DoCopy's ParseState has no parameters.
+    if let Some(number) = expr.nodes().find_map(|(n, _)| match n {
+        typedpg_pg_query::NodeRef::ParamRef(p) => Some(p.number),
+        _ => None,
+    }) {
+        return Err(DdlError::Parse(format!("there is no parameter ${number}")));
+    }
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return Ok(());
+    };
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or_default();
+    let attrs = interp.attributes_of(relid);
+    // The relation, as addNSItemToQuery puts it in the namespace, and
+    // coerce_to_boolean's "argument of WHERE".
+    let mut scope = crate::scope::Scope::default();
+    scope.add_dml_target(
+        interp,
+        &class.relname,
+        crate::qualified_name::QualifiedName::new(nspname.to_owned(), class.relname.clone()),
+        attrs,
+    );
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    let mut params = crate::param_collector::ParamCollector::default();
+    let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp);
+    match crate::clause::coerce_clause_expr(
+        Some(expr),
+        ctx,
+        &mut params,
+        crate::clause::ClauseKind::Where,
+    ) {
+        Ok(_)
+        // The analyzer's own gaps leave the expression unchecked.
+        | Err(
+            AnalyzeError::Unsupported(_)
+            | AnalyzeError::UnsupportedJoinType(_)
+            | AnalyzeError::Internal(_)
+            | AnalyzeError::Lex(_)
+            | AnalyzeError::Serde(_)
+            | AnalyzeError::Io(_),
+        ) => {}
+        Err(e) => return Err(DdlError::UnsupportedDdl(e.to_string())),
+    }
+    let mut read: std::collections::BTreeSet<i16> = std::collections::BTreeSet::new();
+    for (n, _) in expr.nodes() {
+        let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
+            continue;
+        };
+        // transformColumnRef: the fields naming the relation, then the
+        // column (`*` for the whole row; `None` here).
+        let fields: Vec<Option<&str>> = cr
+            .fields
+            .iter()
+            .map(|f| super::util::node_string(f.as_ref()))
+            .collect();
+        let is = |i: usize, name: &str| fields.get(i).copied().flatten() == Some(name);
+        let qualifiers = match fields.len() {
+            1 => 0,
+            2 if is(0, &class.relname) => 1,
+            3 if is(0, nspname) && is(1, &class.relname) => 2,
+            3 if is(0, &class.relname) => 1,
+            n if n >= 4 && is(n - 2, &class.relname) => n - 1,
+            _ => 0,
+        };
+        let whole_row = || attrs.iter().map(|a| a.attnum).collect::<Vec<_>>();
+        match fields.get(qualifiers).copied().flatten() {
+            None => read.extend(whole_row()),
+            Some(name) => {
+                if let Some(a) = attrs.iter().find(|a| a.attname == name) {
+                    read.insert(a.attnum);
+                } else if let Some((_, _, attnum)) = crate::pg_catalog::SYSTEM_COLUMNS
+                    .iter()
+                    .find(|(s, ..)| *s == name)
+                {
+                    read.insert(*attnum);
+                } else if fields.len() == 1 && name == class.relname {
+                    read.extend(whole_row());
+                }
+            }
+        }
+    }
+    for attnum in read {
+        if attnum < 0 {
+            let name = crate::pg_catalog::SYSTEM_COLUMNS
+                .iter()
+                .find(|(.., n)| *n == attnum)
+                .map_or("", |(s, ..)| *s);
+            return Err(DdlError::Parse(format!(
+                "system columns are not supported in COPY FROM WHERE conditions (Column \
+                 \"{name}\" is a system column.)"
+            )));
+        }
+        if let Some(a) = attrs
+            .iter()
+            .find(|a| a.attnum == attnum && a.attgenerated.is_some())
+        {
+            return Err(DdlError::Parse(format!(
+                "generated columns are not supported in COPY FROM WHERE conditions (Column \
+                 \"{}\" is a generated column.)",
+                a.attname
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// CopyFrom's FREEZE checks, in order: not a partitioned table, not a
+/// foreign table; no snapshot or open cursor of the transaction's but
+/// its first (ThereAreNoPriorRegisteredSnapshots, ThereAreNoReadyPortals:
+/// "prior transaction activity"); then a relation created or given new
+/// storage in the current subtransaction. The last two are reported only
+/// where certain: not inside a running body (a DO block, a procedure),
+/// whose executor holds snapshots of its own, nor while user code may have
+/// opened or closed cursors; and as savepoints aren't followed, only a
+/// relation that predates the transaction and got no new storage in it
+/// (TRUNCATE, a rewrite — any ALTER TABLE counts) certainly fails.
+fn copy_freeze(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    kind: Option<RelKind>,
+) -> Result<(), DdlError> {
+    match kind {
+        Some(RelKind::Partitioned) => {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot perform COPY FREEZE on a partitioned table".into(),
+            ));
+        }
+        Some(RelKind::ForeignTable) => {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot perform COPY FREEZE on a foreign table".into(),
+            ));
+        }
+        _ => {}
+    }
+    if super::do_block::running_body() {
+        return Ok(());
+    }
+    match interp.cursors.any_open() {
+        Some(true) => {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot perform COPY FREEZE because of prior transaction activity".into(),
+            ));
+        }
+        Some(false) => {}
+        None => return Ok(()),
+    }
+    if relid.get() < interp.transaction_oid_floor
+        && !interp.tables_with_new_relfilenode.contains(&relid)
+    {
+        return Err(DdlError::UnsupportedDdl(
+            "cannot perform COPY FREEZE because the table was not created or truncated in the \
+             current subtransaction"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -1226,13 +1545,47 @@ enum CopyOnError {
     SetNull,
 }
 
+/// The columns a FORCE_QUOTE / FORCE_NOT_NULL / FORCE_NULL option names
+/// (`force_*_all` / the `force_*` list).
+#[derive(Default)]
+enum CopyColumns {
+    #[default]
+    Unset,
+    All,
+    Names(Vec<String>),
+}
+
+/// What the checks after ProcessCopyOptions read of the options.
+#[derive(Default)]
+struct CopyOptions {
+    freeze: bool,
+    force_quote: CopyColumns,
+    force_notnull: CopyColumns,
+    force_null: CopyColumns,
+    /// CONVERT_SELECTIVELY's list (`convert_select`), when given.
+    convert_select: Option<Vec<String>>,
+}
+
+/// The column names of a FORCE_* / CONVERT_SELECTIVELY list.
+fn copy_column_names(arg: Option<&ast::Node>) -> Vec<String> {
+    match arg {
+        Some(ast::Node::List(l)) => l
+            .items
+            .iter()
+            .filter_map(|n| super::util::node_string(n.as_ref()))
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// ProcessCopyOptions (copy.c, PostgreSQL 19), in its order: each option
 /// once and with a value it takes, then the options against each other,
 /// the format and the direction.
 fn process_copy_options(
     is_from: bool,
     options: &[Option<typedpg_pg_query::ast::Node>],
-) -> Result<(), DdlError> {
+) -> Result<CopyOptions, DdlError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Format {
         Text,
@@ -1261,6 +1614,7 @@ fn process_copy_options(
     let (mut convert_selectively, mut encoding) = (false, false);
     let mut on_error = CopyOnError::Stop;
     let mut reject_limit = 0;
+    let mut parsed = CopyOptions::default();
     for opt in options {
         let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
@@ -1320,10 +1674,19 @@ fn process_copy_options(
                 if *slot {
                     return Err(conflicting());
                 }
-                if !matches!(de.arg, Some(ast::Node::AStar(_) | ast::Node::List(_))) {
-                    return Err(column_list(de));
-                }
+                let columns = match de.arg {
+                    Some(ast::Node::AStar(_)) => CopyColumns::All,
+                    Some(ast::Node::List(_)) => {
+                        CopyColumns::Names(copy_column_names(de.arg.as_ref()))
+                    }
+                    _ => return Err(column_list(de)),
+                };
                 *slot = true;
+                match de.defname.as_str() {
+                    "force_quote" => parsed.force_quote = columns,
+                    "force_not_null" => parsed.force_notnull = columns,
+                    _ => parsed.force_null = columns,
+                }
             }
             "convert_selectively" => {
                 if convert_selectively {
@@ -1333,15 +1696,14 @@ fn process_copy_options(
                 if !matches!(de.arg, None | Some(ast::Node::List(_))) {
                     return Err(column_list(de));
                 }
+                parsed.convert_select = Some(copy_column_names(de.arg.as_ref()));
             }
             "encoding" => {
                 if encoding {
                     return Err(conflicting());
                 }
-                // pg_char_to_encoding: a name of NAMEDATALEN bytes or more
-                // is none.
                 let name = copy_string(de)?;
-                if name.len() >= 64 || super::conversions::encoding(&name).is_none() {
+                if super::conversions::encoding(&name).is_none() {
                     return Err(DdlError::Parse(format!(
                         "argument to option \"{}\" must be a valid encoding name",
                         de.defname
@@ -1583,7 +1945,8 @@ fn process_copy_options(
             "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE".into(),
         ));
     }
-    Ok(())
+    parsed.freeze = freeze;
+    Ok(parsed)
 }
 
 /// defGetCopyHeaderOption (PostgreSQL 19): whether COPY's HEADER option is

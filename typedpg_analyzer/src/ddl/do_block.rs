@@ -73,11 +73,45 @@ struct Run {
     arguments: bool,
 }
 
-/// Run the PL/pgSQL `DO` block `code` against the catalog.
+/// Run the `DO` statement `stmt` of a migration: ExecuteDoStmt runs the
+/// block non-atomically only as a top-level statement outside a
+/// transaction block (standard_ProcessUtility's isAtomicContext; the
+/// implicit block of a multi-statement query counts).
 pub(crate) fn execute(
     interp: &mut PgCatalog,
     stmt: &typedpg_pg_query::ast::DoStmt,
 ) -> Result<(), DdlError> {
+    let start = interp.snapshot();
+    let atomic = interp.in_transaction_block;
+    if let Flow::Unknown = run_do_block(interp, stmt, atomic)? {
+        interp.roll_back_to(&start);
+    }
+    Ok(())
+}
+
+/// A `DO` statement a running body executes — a PL/pgSQL `DO`
+/// (exec_stmt_call with `is_call` false), an `EXECUTE`d one, a SQL
+/// procedure's — as standard_ProcessUtility runs it: compiled
+/// (function_body::do_block), then run, atomically when `atomic`.
+fn run_nested_do(interp: &mut PgCatalog, stmt: &ast::Node, atomic: bool) -> Result<Flow, DdlError> {
+    let ast::Node::DoStmt(do_stmt) = stmt else {
+        return Ok(Flow::Unknown);
+    };
+    super::fk_bypass::note(interp, stmt);
+    super::function_body::do_block(interp, do_stmt)?;
+    super::note_user_code(interp);
+    run_do_block(interp, do_stmt, atomic)
+}
+
+/// Run the PL/pgSQL block of `DO` statement `stmt`
+/// (plpgsql_inline_handler), atomically when `atomic`, unless that would
+/// nest too deep (see [`enter_body`]). A block in another language, or
+/// one that doesn't compile, is unknowable.
+fn run_do_block(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::ast::DoStmt,
+    atomic: bool,
+) -> Result<Flow, DdlError> {
     // The block's statements are parsed from its code, not the migration.
     let _barrier = crate::error::DiagContextGuard::barrier();
     let mut code = None;
@@ -96,7 +130,7 @@ pub(crate) fn execute(
         }
     }
     let (Some(code), "plpgsql") = (code, language.as_str()) else {
-        return Ok(());
+        return Ok(Flow::Unknown);
     };
     // The block as the body of a function, as function_body::do_block
     // compiles it.
@@ -108,28 +142,27 @@ pub(crate) fn execute(
         "CREATE FUNCTION inline_code_block() RETURNS void LANGUAGE plpgsql AS ${tag}${code}${tag}$"
     );
     let Ok(parsed) = typedpg_pg_query::parse_plpgsql_with_catalog(&sql, &*interp) else {
-        return Ok(());
+        return Ok(Flow::Unknown);
     };
     let Some(function) = parsed.first() else {
-        return Ok(());
-    };
-    // ExecuteDoStmt runs the block non-atomically only as a top-level
-    // statement outside a transaction block (standard_ProcessUtility's
-    // isAtomicContext; the implicit block of a multi-statement query
-    // counts).
-    let mut run = Run {
-        variables: variables(function),
-        atomic: interp.in_transaction_block,
-        arguments: false,
+        return Ok(Flow::Unknown);
     };
     let Some(action) = &function.action else {
-        return Ok(());
+        return Ok(Flow::Unknown);
     };
-    let start = interp.snapshot();
-    if let Flow::Unknown = run.block(interp, action)? {
-        interp.roll_back_to(&start);
-    }
-    Ok(())
+    let Some(_leave) = enter_body(None) else {
+        return Ok(Flow::Unknown);
+    };
+    let mut run = Run {
+        variables: variables(function),
+        atomic,
+        arguments: false,
+    };
+    // The block's RETURN ends the block, not its caller.
+    Ok(match run.block(interp, action)? {
+        Flow::Unknown => Flow::Unknown,
+        Flow::Done | Flow::Return => Flow::Done,
+    })
 }
 
 /// The function's datums, by varno.
@@ -274,6 +307,11 @@ impl Run {
                 let Some(query) = expr_query(s.sqlstmt.as_ref()) else {
                     return Ok(Flow::Unknown);
                 };
+                if let Ok(parsed) = typedpg_pg_query::parse(query) {
+                    for raw in &parsed.tree.stmts {
+                        refuse_copy_to_or_from_client(raw.stmt.as_ref())?;
+                    }
+                }
                 if self.reads_variables(query) {
                     return Ok(Flow::Unknown);
                 }
@@ -321,7 +359,7 @@ impl Run {
             Stmt::Raise(s) => self.raise(s),
             Stmt::Return(_) => Ok(Flow::Return),
             Stmt::If(s) => self.if_statement(interp, s),
-            Stmt::Call(s) if s.is_call => self.call(interp, s),
+            Stmt::Call(s) => self.call(interp, s),
             // _SPI_commit / _SPI_rollback: an atomic context can't end its
             // transaction. Otherwise the transaction ends here, which the
             // simulation doesn't follow.
@@ -332,10 +370,11 @@ impl Run {
         }
     }
 
-    /// `CALL proc(...)` (exec_stmt_call): the procedure runs
-    /// ([`run_call`]), non-atomically only when the block is; its INOUT and
-    /// OUT arguments' values go to the target variables. Arguments reading
-    /// the block's variables make the call unknowable.
+    /// `CALL proc(...)` or `DO ...` (exec_stmt_call): the procedure or the
+    /// block runs ([`run_sql`]), non-atomically only when this block is;
+    /// a CALL's INOUT and OUT arguments' values go to the target
+    /// variables. Arguments reading the block's variables make the call
+    /// unknowable (a DO's code is a string constant, which reads none).
     fn call(&mut self, interp: &mut PgCatalog, s: &plpgsql::StmtCall) -> Result<Flow, DdlError> {
         let Some(query) = expr_query(s.expr.as_ref()) else {
             return Ok(Flow::Unknown);
@@ -594,22 +633,58 @@ impl Run {
 
 // ─── CALL ───────────────────────────────────────────────────────────────────
 
-/// How deep `CALL`s nest before the analyzer stops following them: a
-/// deeper call is unknowable (a server runs out of `max_stack_depth` at a
-/// depth its configuration decides).
+/// How deep `CALL`s and `DO` blocks nest before the analyzer stops
+/// following them: a deeper one is unknowable (a server runs out of
+/// `max_stack_depth` at a depth its configuration decides).
 const MAX_CALL_DEPTH: usize = 16;
 
-/// How many procedure bodies one top-level statement may run before the
-/// rest of them become unknowable — a bound on procedures calling several
-/// others each, whatever the depth.
+/// How many procedure bodies and `DO` blocks one top-level statement may
+/// run before the rest of them become unknowable — a bound on bodies
+/// running several others each, whatever the depth.
 const MAX_CALLS: u32 = 1000;
 
 thread_local! {
-    /// The procedures whose bodies are running, outermost first.
-    static CALL_STACK: std::cell::RefCell<Vec<PgProcOid>> =
+    /// The bodies running, outermost first: a procedure's, or a `DO`
+    /// block's (`None`).
+    static CALL_STACK: std::cell::RefCell<Vec<Option<PgProcOid>>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// The procedure bodies run since the outermost call began.
+    /// The bodies run since the outermost one began.
     static CALLS_RUN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Leaves the body [`enter_body`] entered.
+struct Leave;
+
+impl Drop for Leave {
+    fn drop(&mut self) {
+        CALL_STACK.with_borrow_mut(|stack| stack.pop());
+    }
+}
+
+/// Enter a body — procedure `proc`'s, or a `DO` block's for `None` —
+/// unless that would recurse into a procedure already running, nest too
+/// deep or run too many: such a body is unknowable.
+fn enter_body(proc: Option<PgProcOid>) -> Option<Leave> {
+    CALL_STACK.with_borrow_mut(|stack| {
+        if stack.is_empty() {
+            CALLS_RUN.set(0);
+        }
+        if stack.len() >= MAX_CALL_DEPTH
+            || (proc.is_some() && stack.contains(&proc))
+            || CALLS_RUN.get() >= MAX_CALLS
+        {
+            return None;
+        }
+        CALLS_RUN.set(CALLS_RUN.get() + 1);
+        stack.push(proc);
+        Some(Leave)
+    })
+}
+
+/// Whether a `DO` block or a procedure's body is running: a statement runs
+/// from inside user code, under the executor state of the code running it.
+pub(crate) fn running_body() -> bool {
+    CALL_STACK.with_borrow(|stack| !stack.is_empty())
 }
 
 /// A procedure body the analyzer can run.
@@ -687,30 +762,9 @@ fn run_body(
     body: &Body,
     atomic: bool,
 ) -> Result<Flow, DdlError> {
-    struct Leave;
-    impl Drop for Leave {
-        fn drop(&mut self) {
-            CALL_STACK.with_borrow_mut(|stack| stack.pop());
-        }
-    }
-    let entered = CALL_STACK.with_borrow_mut(|stack| {
-        if stack.is_empty() {
-            CALLS_RUN.set(0);
-        }
-        if stack.len() >= MAX_CALL_DEPTH
-            || stack.contains(&proc.oid)
-            || CALLS_RUN.get() >= MAX_CALLS
-        {
-            return false;
-        }
-        CALLS_RUN.set(CALLS_RUN.get() + 1);
-        stack.push(proc.oid);
-        true
-    });
-    if !entered {
+    let Some(_leave) = enter_body(Some(proc.oid)) else {
         return Ok(Flow::Unknown);
-    }
-    let _leave = Leave;
+    };
     // The body's statements are parsed from its own text, not the
     // migration.
     let _barrier = crate::error::DiagContextGuard::barrier();
@@ -759,9 +813,10 @@ fn run_plpgsql_body(
     run.block(interp, action)
 }
 
-/// SQL `sql` a running body executes (a constant `EXECUTE`, a PL/pgSQL
-/// `CALL`): its statements apply as a migration's do, a `CALL` running its
-/// procedure.
+/// SQL `sql` a running PL/pgSQL body executes through SPI (a constant
+/// `EXECUTE`, a `CALL` or `DO`): its statements apply as a migration's
+/// do, a `CALL` running its procedure and a `DO` its block, atomically
+/// when `atomic`.
 fn run_sql(interp: &mut PgCatalog, sql: &str, atomic: bool) -> Result<Flow, DdlError> {
     // The statements' locations are offsets into `sql`, not the migration.
     let _barrier = crate::error::DiagContextGuard::barrier();
@@ -770,10 +825,12 @@ fn run_sql(interp: &mut PgCatalog, sql: &str, atomic: bool) -> Result<Flow, DdlE
         let Some(stmt) = raw.stmt.as_ref() else {
             continue;
         };
+        refuse_copy_to_or_from_client(Some(stmt))?;
         let mut flow = Flow::Done;
         super::with_statement_sql(interp, sql, raw, |interp| {
             match stmt {
                 ast::Node::CallStmt(_) => flow = run_call(interp, stmt, atomic)?,
+                ast::Node::DoStmt(_) => flow = run_nested_do(interp, stmt, atomic)?,
                 _ => super::apply_statement(interp, stmt)?,
             }
             Ok(())
@@ -840,6 +897,7 @@ fn sql_body_statement(
     match stmt {
         // A SQL function's statements run atomically.
         ast::Node::CallStmt(_) => run_call(interp, stmt, true),
+        ast::Node::DoStmt(_) => run_nested_do(interp, stmt, true),
         _ if !statement_runs_in_a_function(stmt) => Ok(Flow::Unknown),
         _ => {
             super::apply_statement(interp, stmt)?;
@@ -973,6 +1031,17 @@ fn runs_in_a_function(sql: &str) -> bool {
         .all(|raw| raw.stmt.as_ref().is_none_or(statement_runs_in_a_function))
 }
 
+/// _SPI_execute_plan: a COPY to or from the client (no file name) is
+/// SPI_ERROR_COPY, which PL/pgSQL reports before the COPY runs.
+fn refuse_copy_to_or_from_client(stmt: Option<&ast::Node>) -> Result<(), DdlError> {
+    match stmt {
+        Some(ast::Node::CopyStmt(copy)) if copy.filename.is_empty() => Err(
+            DdlError::UnsupportedDdl("cannot COPY to/from client in PL/pgSQL".into()),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// [`runs_in_a_function`] for one parsed statement.
 fn statement_runs_in_a_function(stmt: &ast::Node) -> bool {
     !(matches!(
@@ -990,7 +1059,6 @@ fn statement_runs_in_a_function(stmt: &ast::Node) -> bool {
             | ast::Node::DiscardStmt(_)
             | ast::Node::LockStmt(_)
             | ast::Node::DeclareCursorStmt(_)
-            | ast::Node::DoStmt(_)
     ) || matches!(stmt, ast::Node::IndexStmt(i) if i.concurrent))
 }
 

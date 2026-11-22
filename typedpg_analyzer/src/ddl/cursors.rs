@@ -69,6 +69,11 @@ impl Cursors {
             .retain(|_, c| c.opened.is_none_or(|n| n < savepoint.next));
     }
 
+    /// Whether a cursor is open (`!ThereAreNoReadyPortals`), when certain.
+    pub(crate) fn any_open(&self) -> Option<bool> {
+        (!self.uncertain).then_some(!self.open.is_empty())
+    }
+
     /// `CLOSE ALL`, `DISCARD ALL` (PortalHashTableDeleteAll).
     pub(crate) fn close_all(&mut self) {
         self.open.clear();

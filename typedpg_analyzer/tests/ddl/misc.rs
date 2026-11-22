@@ -7817,6 +7817,24 @@ fn conversion_encodings_must_exist() {
             "CREATE CONVERSION c FOR 'LATIN1' TO 'sql-ascii' FROM iso8859_1_to_utf8;",
             "encoding conversion to or from \"SQL_ASCII\" is not supported",
         ),
+        // pg_char_to_encoding: a name of NAMEDATALEN (64) bytes or more is
+        // no encoding, whatever its alphanumerics spell.
+        (
+            format!(
+                "CREATE CONVERSION c FOR 'UTF8{}' TO 'LATIN1' FROM utf8_to_iso8859_1;",
+                "-".repeat(60)
+            )
+            .as_str(),
+            "source encoding \"UTF8------",
+        ),
+        (
+            format!(
+                "CREATE CONVERSION c FOR 'UTF8' TO 'LATIN1{}' FROM utf8_to_iso8859_1;",
+                "-".repeat(58)
+            )
+            .as_str(),
+            "destination encoding \"LATIN1------",
+        ),
     ] {
         let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
         assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
@@ -7826,6 +7844,14 @@ fn conversion_encodings_must_exist() {
         "CREATE CONVERSION c1 FOR 'latin-1' TO 'utf-8' FROM iso8859_1_to_utf8;
          CREATE CONVERSION c2 FOR 'ISO_8859_1' TO 'unicode' FROM iso8859_1_to_utf8;
          CREATE CONVERSION c3 FOR 'Windows1252' TO 'UTF8' FROM win_to_utf8;",
+    )]);
+    // 63 bytes is still a name.
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "CREATE CONVERSION c4 FOR 'UTF8{}' TO 'LATIN1' FROM utf8_to_iso8859_1;",
+            "-".repeat(59)
+        ),
     )]);
 }
 
@@ -9056,6 +9082,26 @@ fn copy_options_follow_process_copy_options() {
             "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 'abc');",
             "invalid input syntax for type bigint: \"abc\"",
         ),
+        // defGetInt64 (int8in) / pg_strtoint64: too large is out of range,
+        // even beyond 128 bits.
+        (
+            "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 9223372036854775808);",
+            "value \"9223372036854775808\" is out of range for type bigint",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT \
+             999999999999999999999999999999999999999999);",
+            "value \"999999999999999999999999999999999999999999\" is out of range for type bigint",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT \
+             '999999999999999999999999999999999999999999');",
+            "value \"999999999999999999999999999999999999999999\" is out of range for type bigint",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 1.5);",
+            "invalid input syntax for type bigint: \"1.5\"",
+        ),
         (
             "COPY t TO STDOUT (DELIMITER E'\\n');",
             "COPY delimiter cannot be newline or carriage return",
@@ -9163,6 +9209,292 @@ fn copy_options_follow_process_copy_options() {
              COPY t TO STDOUT (FORMAT binary);",
         ),
     ]);
+}
+
+#[test]
+fn copy_checks_its_column_options_against_the_columns_copied() {
+    // PG 19 BeginCopyTo / BeginCopyFrom: FORCE_QUOTE, FORCE_NOT_NULL,
+    // FORCE_NULL and CONVERT_SELECTIVELY name columns as CopyGetAttnums
+    // reads a column list — existing, not generated, each once — and each
+    // must be one the COPY copies. COPY (query) TO names the query's
+    // columns.
+    let setup = "CREATE TABLE t (a int, b text, g int GENERATED ALWAYS AS (a * 2) STORED);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "COPY t (a) TO STDOUT (FORMAT csv, FORCE_QUOTE (b));",
+            "FORCE_QUOTE column \"b\" not referenced by COPY",
+        ),
+        (
+            setup,
+            "COPY t (a) TO STDOUT (FORMAT csv, FORCE_QUOTE (zz));",
+            "column \"zz\" of relation \"t\" does not exist",
+        ),
+        (
+            setup,
+            "COPY t TO STDOUT (FORMAT csv, FORCE_QUOTE (g));",
+            "column \"g\" is a generated column (Generated columns cannot be used in COPY.)",
+        ),
+        (
+            setup,
+            "COPY t (a) FROM STDIN (FORMAT csv, FORCE_NOT_NULL (b));",
+            "FORCE_NOT_NULL column \"b\" not referenced by COPY",
+        ),
+        (
+            setup,
+            "COPY t (a) FROM STDIN (FORMAT csv, FORCE_NULL (b));",
+            "FORCE_NULL column \"b\" not referenced by COPY",
+        ),
+        (
+            setup,
+            "COPY t (a) FROM STDIN (FORMAT csv, FORCE_NULL (a, a));",
+            "column \"a\" specified more than once",
+        ),
+        (
+            setup,
+            "COPY t (a) FROM STDIN (CONVERT_SELECTIVELY (b));",
+            "selected column \"b\" not referenced by COPY",
+        ),
+        (
+            setup,
+            "COPY t (a) FROM STDIN (CONVERT_SELECTIVELY (zz));",
+            "column \"zz\" of relation \"t\" does not exist",
+        ),
+        (
+            "",
+            "COPY (SELECT 1 AS a) TO STDOUT (FORMAT csv, FORCE_QUOTE (zz));",
+            "column \"zz\" does not exist",
+        ),
+        (
+            "",
+            "COPY (SELECT 1 AS a) TO STDOUT (FORMAT csv, FORCE_QUOTE (a, a));",
+            "column \"a\" specified more than once",
+        ),
+    ]);
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "COPY t (a, b) TO STDOUT (FORMAT csv, FORCE_QUOTE (b));
+             COPY t (a) TO STDOUT (FORMAT csv, FORCE_QUOTE *);
+             COPY (SELECT 1 AS a, 2 AS b) TO STDOUT (FORMAT csv, FORCE_QUOTE (b));",
+        ),
+    ]);
+}
+
+#[test]
+fn copy_checks_the_relation_in_postgres_order() {
+    // PG 19 DoCopy: BeginCopyTo refuses the relation before
+    // ProcessCopyOptions reads the options; BeginCopyFrom reads them
+    // first, and CopyFrom refuses the relation after. A materialized view
+    // never populated has nothing to copy.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a WITH NO DATA;";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "COPY v TO STDOUT (FORMAT nosuch);",
+            "cannot copy from view \"v\"",
+        ),
+        (
+            setup,
+            "COPY v FROM STDIN (FORMAT nosuch);",
+            "COPY format \"nosuch\" not recognized",
+        ),
+        (
+            setup,
+            "COPY mv TO STDOUT;",
+            "cannot copy from unpopulated materialized view \"mv\" (Use the REFRESH \
+             MATERIALIZED VIEW command.)",
+        ),
+        (
+            "CREATE TABLE t (a int PRIMARY KEY);",
+            "COPY t_pkey TO STDOUT;",
+            "cannot open relation \"t_pkey\"",
+        ),
+        (
+            "CREATE TYPE ct AS (a int);",
+            "COPY ct FROM STDIN;",
+            "cannot open relation \"ct\"",
+        ),
+    ]);
+}
+
+#[test]
+fn copy_from_where_follows_expr_kind_copy_where() {
+    // PG 19 DoCopy: the WHERE of COPY FROM is a boolean over the table's
+    // row (EXPR_KIND_COPY_WHERE: no aggregate, window function,
+    // set-returning function or subquery), reading no system column and no
+    // generated column — a whole-row reference reads them all.
+    let setup = "CREATE TABLE t (a int, g int GENERATED ALWAYS AS (a * 2) STORED,
+                                 v int GENERATED ALWAYS AS (a * 3) VIRTUAL);";
+    let generated = |col: &str| {
+        format!(
+            "generated columns are not supported in COPY FROM WHERE conditions (Column \"{col}\" \
+             is a generated column.)"
+        )
+    };
+    let (g, v) = (generated("g"), generated("v"));
+    assert_ddl_rejections(&[
+        (setup, "COPY t FROM STDIN WHERE g > 1;", &g),
+        (setup, "COPY t FROM STDIN WHERE v > 1;", &v),
+        (setup, "COPY t FROM STDIN WHERE t IS NULL;", &g),
+        (setup, "COPY t FROM STDIN WHERE t.* IS NULL;", &g),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE a;",
+            "argument of WHERE must be type boolean, not type integer",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE count(*) > 1;",
+            "aggregate functions are not allowed in COPY FROM WHERE conditions",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE a > sum(a) OVER ();",
+            "window functions are not allowed in COPY FROM WHERE conditions",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE generate_series(1, 2) > 1;",
+            "set-returning functions are not allowed in COPY FROM WHERE conditions",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE a > (SELECT 1);",
+            "cannot use subquery in COPY FROM WHERE condition",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE zz > 1;",
+            "column \"zz\" does not exist",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE x.a > 1;",
+            "missing FROM-clause entry for table \"x\"",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE a > $1;",
+            "there is no parameter $1",
+        ),
+        (
+            setup,
+            "COPY t FROM STDIN WHERE 'x';",
+            "invalid input syntax for type boolean: \"x\"",
+        ),
+    ]);
+}
+
+#[test]
+fn copy_query_must_be_a_query_returning_rows() {
+    // PG 19 BeginCopyTo, after analyzing the query: no SELECT INTO, and a
+    // data-modifying statement must return rows (RETURNING).
+    let setup = "CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t;";
+    let returning = "COPY query must have a RETURNING clause";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "COPY (SELECT 1 INTO x) TO STDOUT;",
+            "COPY (SELECT INTO) is not supported",
+        ),
+        (
+            setup,
+            "COPY (SELECT nosuch INTO x) TO STDOUT;",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO t VALUES (1)) TO STDOUT;",
+            returning,
+        ),
+        (
+            setup,
+            "COPY (WITH w AS (SELECT 1) INSERT INTO t SELECT * FROM w) TO STDOUT;",
+            returning,
+        ),
+        (setup, "COPY (UPDATE t SET a = 1) TO STDOUT;", returning),
+        (setup, "COPY (DELETE FROM t) TO STDOUT;", returning),
+        (
+            setup,
+            "COPY (MERGE INTO t USING t s ON true WHEN MATCHED THEN DELETE) TO STDOUT;",
+            returning,
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO v VALUES (1)) TO STDOUT;",
+            returning,
+        ),
+    ]);
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "COPY (INSERT INTO t VALUES (1) RETURNING a) TO STDOUT;
+             COPY (SELECT 1 UNION SELECT 2) TO STDOUT;",
+        ),
+    ]);
+}
+
+#[test]
+fn copy_freeze_needs_a_table_new_in_the_transaction() {
+    // PG 19 CopyFrom: FREEZE takes neither a partitioned nor a foreign
+    // table, nor any once a cursor is open (prior transaction activity),
+    // and only a table created or truncated in the current subtransaction
+    // — certain for one that predates the transaction and got no new
+    // storage in it.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE p (a int) PARTITION BY LIST (a);
+                 CREATE FOREIGN DATA WRAPPER w;
+                 CREATE SERVER s FOREIGN DATA WRAPPER w;
+                 CREATE FOREIGN TABLE ft (a int) SERVER s;";
+    let not_new = "cannot perform COPY FREEZE because the table was not created or truncated \
+                   in the current subtransaction";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "COPY p FROM STDIN (FREEZE);",
+            "cannot perform COPY FREEZE on a partitioned table",
+        ),
+        (
+            setup,
+            "COPY ft FROM STDIN (FREEZE);",
+            "cannot perform COPY FREEZE on a foreign table",
+        ),
+        (setup, "COPY t FROM STDIN (FREEZE);", not_new),
+        (setup, "BEGIN; COPY t FROM STDIN (FREEZE);", not_new),
+        (
+            setup,
+            "BEGIN; TRUNCATE t; ROLLBACK; COPY t FROM STDIN (FREEZE);",
+            not_new,
+        ),
+        (
+            setup,
+            "BEGIN; CREATE TABLE n (a int); DECLARE c CURSOR FOR SELECT 1;
+             COPY n FROM STDIN (FREEZE);",
+            "cannot perform COPY FREEZE because of prior transaction activity",
+        ),
+    ]);
+}
+
+#[test]
+fn copy_freeze_takes_a_table_created_or_truncated_in_the_transaction() {
+    // CopyFrom's rd_createSubid / rd_newRelfilelocatorSubid test passes for
+    // a table created, truncated or rewritten in the transaction. (COPY
+    // FROM STDIN takes data the mirror doesn't send.)
+    let mut db = PgCatalog::new().unwrap();
+    db.skip_pg_sanity();
+    db.apply_sql("CREATE TABLE t (a int);").unwrap();
+    for sql in [
+        "CREATE TABLE n (a int); COPY n FROM STDIN (FREEZE);",
+        "BEGIN; TRUNCATE t; COPY t FROM STDIN (FREEZE); COMMIT;",
+        "BEGIN; ALTER TABLE t ALTER a TYPE bigint; COPY t FROM STDIN (FREEZE); COMMIT;",
+    ] {
+        db.apply_sql(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
 }
 
 #[test]
@@ -9512,6 +9844,96 @@ fn call_forbids_transaction_control_inside_a_transaction_block() {
             "",
             "DO $$ BEGIN COMMIT; END $$; SELECT 1;",
             "invalid transaction termination",
+        ),
+    ]);
+}
+
+#[test]
+fn a_do_inside_plpgsql_runs_as_a_do_block() {
+    // exec_stmt_call runs a PL/pgSQL `DO` (is_call false) through SPI, as
+    // it runs a CALL: the block runs, non-atomically only when its caller
+    // is; an EXECUTEd DO (no allow_nonatomic) and a SQL procedure's DO run
+    // atomically. What it creates exists afterwards, and what it raises
+    // fails the statement — unless an EXCEPTION clause catches it.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "DO $$ BEGIN DO $i$ BEGIN CREATE TABLE x (a int); END $i$; END $$;",
+        ),
+        (
+            "0002.sql",
+            "DO $$ BEGIN EXECUTE 'DO $i$ BEGIN CREATE TABLE y (a int); END $i$'; END $$;",
+        ),
+        (
+            "0003.sql",
+            "CREATE PROCEDURE mk() LANGUAGE sql AS $p$ DO $i$ BEGIN CREATE TABLE z (a int); END $i$ $p$;
+             CREATE PROCEDURE mk_pl() LANGUAGE plpgsql AS $p$ BEGIN DO 'BEGIN CREATE TABLE r (a int); END'; END $p$;",
+        ),
+        ("0004.sql", "CALL mk();"),
+        ("0005.sql", "CALL mk_pl();"),
+        (
+            "0006.sql",
+            "DO $$ BEGIN
+               BEGIN
+                 DO $i$ BEGIN RAISE EXCEPTION 'boom'; END $i$;
+               EXCEPTION WHEN OTHERS THEN
+                 CREATE TABLE w (a int);
+               END;
+             END $$;",
+        ),
+    ]);
+    for sql in [
+        "SELECT a FROM x",
+        "SELECT a FROM y",
+        "SELECT a FROM z",
+        "SELECT a FROM r",
+        "SELECT a FROM w",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("DO $$ BEGIN DO $i$ BEGIN COMMIT; END $i$; END $$;")
+        .unwrap();
+    let ends = "CREATE PROCEDURE ends() LANGUAGE sql AS $p$ DO $i$ BEGIN COMMIT; END $i$ $p$;";
+    assert_ddl_rejections(&[
+        (
+            "",
+            "DO $$ BEGIN DO $i$ BEGIN RAISE EXCEPTION 'boom'; END $i$; END $$;",
+            "boom",
+        ),
+        (
+            "",
+            "BEGIN; DO $$ BEGIN DO $i$ BEGIN COMMIT; END $i$; END $$;",
+            "invalid transaction termination",
+        ),
+        (
+            "",
+            "DO $$ BEGIN EXECUTE 'DO $i$ BEGIN COMMIT; END $i$'; END $$;",
+            "invalid transaction termination",
+        ),
+        (ends, "CALL ends();", "invalid transaction termination"),
+        (
+            "",
+            "DO $$ BEGIN DO $i$ BEGIN CREATE TABLE q (a int); END $i$ LANGUAGE sql; END $$;",
+            "language \"sql\" does not support inline code execution",
+        ),
+    ]);
+}
+
+#[test]
+fn plpgsql_cannot_copy_to_or_from_the_client() {
+    // _SPI_execute_plan: a COPY to or from the client (no file name)
+    // returns SPI_ERROR_COPY, which PL/pgSQL reports before the COPY runs.
+    let setup = "CREATE TABLE t (a int);";
+    let msg = "cannot COPY to/from client in PL/pgSQL";
+    assert_ddl_rejections(&[
+        (setup, "DO $$ BEGIN COPY t FROM STDIN; END $$;", msg),
+        (setup, "DO $$ BEGIN COPY t TO STDOUT; END $$;", msg),
+        (setup, "DO $$ BEGIN COPY t (zz) TO STDOUT; END $$;", msg),
+        (
+            setup,
+            "DO $$ BEGIN EXECUTE 'COPY t TO STDOUT'; END $$;",
+            msg,
         ),
     ]);
 }

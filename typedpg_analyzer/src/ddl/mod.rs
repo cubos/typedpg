@@ -482,7 +482,7 @@ fn with_statement_sql(
 
 /// The statement being applied defines or runs user code, which may open
 /// or close cursors ([`cursors::Cursors::note_user_code`]).
-fn note_user_code(db: &mut PgCatalog) {
+pub(super) fn note_user_code(db: &mut PgCatalog) {
     if let Some(text) = db.statement_sql.as_deref() {
         let text = text.to_owned();
         db.cursors.note_user_code(&text);

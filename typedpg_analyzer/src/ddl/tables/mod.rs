@@ -1316,6 +1316,14 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
             rv.relname
         )));
     }
+    // Any ALTER TABLE may give the relation, its inheritors and (ALTER TYPE
+    // ... CASCADE) the typed tables new storage — a rewrite, SET TABLESPACE,
+    // SET ACCESS METHOD — which COPY FREEZE then takes; not tracked finer.
+    let mut altered = super::tables::inherit::all_inheritors(interp, class_oid);
+    if via_alter_type {
+        altered.extend(interp.typed_tables.keys().copied());
+    }
+    interp.tables_with_new_relfilenode.extend(altered);
 
     // ATPrepSetTableSpace: one new tablespace per relation.
     let set_tablespaces = stmt
