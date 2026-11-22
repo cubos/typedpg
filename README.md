@@ -229,7 +229,17 @@ changes type or may now be NULL, the result's column list changes, a
 parameter changes type or no longer accepts NULL, an `INSERT … SELECT` leaves
 out a column that is now `NOT NULL` without a default, or a result value may
 now be one the code doesn't know (a new enum label, a `CHECK` that admits
-more values or a wider range). The finding is placed on the migration
+more values or a wider range). An `INSERT` (its `ON CONFLICT DO UPDATE SET`
+too) or `UPDATE` breaks when a column it writes accepts fewer values: a
+shorter `varchar(n)`, `char(n)` or `bit(n)`, a `numeric` with fewer digits
+before the decimal point (or after it: the value is rounded), or a `CHECK` of
+the table or the column's domain that is new or narrower, `NOT VALID` ones
+included; a new `CHECK` over several columns that it writes may reject its
+rows. A new `UNIQUE` constraint is not reported (it depends on the data), nor
+is a length or precision change of a column it only reads. Each query is
+analyzed as the roles it runs as — the call site's `role = "…"`, or the
+database's `roles` — so a revoked privilege, or row-level security that now
+leaves the role no policy, is reported too. The finding is placed on the migration
 statement that makes the change and names the query's file and line at the
 ref. The fix is expand/contract: first deploy code that works with both
 schemas, then the migration. A `-- typedpg-lint:

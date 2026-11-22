@@ -13,6 +13,28 @@
 //! `NOT NULL` without a default, and a result value that may now be one the
 //! deployed code does not know (a new enum label, a CHECK that admits more).
 //!
+//! What the deployed code writes is checked too: an `INSERT` (its `ON
+//! CONFLICT DO UPDATE SET` included) or `UPDATE` writing a column whose new
+//! definition accepts fewer values — a shorter `varchar(n)` / `char(n)` /
+//! `bit(n)` / `varbit(n)`, a `numeric` with fewer digits before the decimal
+//! point (a value fails) or after it (a value is rounded), a CHECK of the
+//! table or the column's domain that is new or narrower, `NOT VALID` ones
+//! included (they bind the rows written). A new CHECK the analyzer can't
+//! reduce to the columns written (`CHECK (lo <= hi)`) is reported as one
+//! that may reject the deployed code's rows. Not reported: a column a new
+//! UNIQUE, primary key or exclusion constraint covers (whether a row breaks
+//! it depends on the data), a column whose type changes (its parameter's
+//! type change says so), and a timestamp, time or interval precision (it
+//! rounds). A result column's type modifier changing is not reported
+//! either: the deployed code decodes the same wire type whatever its
+//! length or precision.
+//!
+//! A query runs as the roles the deployed code runs it as (a call site's
+//! `role = "..."`, or the database's configured `roles`): it is analyzed as
+//! each, so a privilege a migration revokes is reported, and so is a table
+//! whose row-level security now denies the role every row (no policy for
+//! it). A query without a role has no privileges checked.
+//!
 //! Each finding is placed on the migration statement that makes the change:
 //! the new migrations are applied again one statement at a time, for the
 //! queries that break only.
@@ -39,6 +61,10 @@ pub struct DeployedQuery {
     /// Where the deployed code has it, as the message names it
     /// (`src/users.rs:12`): every place the same text is written.
     pub locations: Vec<String>,
+    /// The roles the deployed code runs it as (a call site's `role =`, or
+    /// the database's configured `roles`): it is analyzed as each. Empty
+    /// for none: the plain analysis.
+    pub roles: Vec<String>,
 }
 
 /// The deployment the new migrations are applied under.
@@ -65,6 +91,14 @@ pub struct NewSchema<'a> {
     /// CLI set up `catalog` (the parameter types assumed finite, …).
     pub prepare: &'a dyn Fn(&mut PgCatalog) -> Result<(), String>,
 }
+
+/// A deployed query's analysis against the deployed schema, as one of the
+/// roles it runs as (`None`: no role).
+type RoleAnalysis<'q> = (Option<&'q str>, AnalyzedQuery);
+
+/// A deployed query that breaks: its analyses against the deployed schema
+/// and what changes.
+type Broken<'q> = (&'q DeployedQuery, Vec<RoleAnalysis<'q>>, Vec<Change>);
 
 /// One thing that changes for a deployed query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,19 +127,32 @@ pub fn breaks_deployed_queries(
     }
     // The queries that break, with their analysis against the deployed
     // schema and what changes.
-    let mut broken: Vec<(&DeployedQuery, AnalyzedQuery, Vec<Change>)> = Vec::new();
+    let mut broken: Vec<Broken<'_>> = Vec::new();
     for query in deployment.queries {
         if allowed_rules(&query.sql).contains(&rule) {
             continue;
         }
-        // A query that doesn't analyze against its own schema fails there
-        // already; the migration doesn't break it.
-        let Ok(old) = deployment.catalog.analyze(&query.sql) else {
-            continue;
+        let roles: Vec<Option<&str>> = if query.roles.is_empty() {
+            vec![None]
+        } else {
+            query.roles.iter().map(|role| Some(role.as_str())).collect()
         };
-        let changes = changes(&query.sql, &old, deployment.catalog, schema.catalog);
+        // A query that doesn't analyze against its own schema (as a role)
+        // fails there already; the migration doesn't break it.
+        let olds: Vec<RoleAnalysis<'_>> = roles
+            .into_iter()
+            .filter_map(|role| {
+                analyze(deployment.catalog, &query.sql, role)
+                    .ok()
+                    .map(|old| (role, old))
+            })
+            .collect();
+        if olds.is_empty() {
+            continue;
+        }
+        let changes = query_changes(&query.sql, &olds, deployment.catalog, schema.catalog);
         if !changes.is_empty() {
-            broken.push((query, old, changes));
+            broken.push((query, olds, changes));
         }
     }
     if broken.is_empty() {
@@ -205,7 +252,7 @@ fn fallback_placement(schema: &NewSchema<'_>) -> Placement {
 fn place(
     deployment: &Deployment<'_>,
     schema: &NewSchema<'_>,
-    broken: &[(&DeployedQuery, AnalyzedQuery, Vec<Change>)],
+    broken: &[Broken<'_>],
 ) -> HashMap<(usize, String), Placement> {
     let mut placements = HashMap::new();
     let Ok(mut catalog) = PgCatalog::new() else {
@@ -245,7 +292,7 @@ fn place(
 struct Replay<'a, 'b> {
     deployment: &'a Deployment<'a>,
     schema: &'a NewSchema<'a>,
-    broken: &'a [(&'a DeployedQuery, AnalyzedQuery, Vec<Change>)],
+    broken: &'a [Broken<'a>],
     /// The file being applied.
     file: usize,
     /// Its allow comments: their byte range and the rules they name.
@@ -293,7 +340,7 @@ impl MigrationObserver for Replay<'_, '_> {
             span: statement.span.clone(),
             suppressed,
         };
-        for (index, (query, old, changes)) in self.broken.iter().enumerate() {
+        for (index, (query, olds, changes)) in self.broken.iter().enumerate() {
             let unplaced: Vec<&Change> = changes
                 .iter()
                 .filter(|change| {
@@ -306,7 +353,7 @@ impl MigrationObserver for Replay<'_, '_> {
                 continue;
             }
             let now: HashSet<String> =
-                self::changes(&query.sql, old, self.deployment.catalog, &state)
+                query_changes(&query.sql, olds, self.deployment.catalog, &state)
                     .into_iter()
                     .map(|change| change.subject)
                     .collect();
@@ -349,22 +396,70 @@ fn allow_comments(sql: &str) -> Vec<(Range<usize>, HashSet<Rule>)> {
     out
 }
 
-/// What changes for a deployed query analyzed as `old` against `old_catalog`
-/// when it runs against `new_catalog`.
+/// `sql` analyzed against `catalog` as `role` (`None`: the plain analysis).
+fn analyze(
+    catalog: &PgCatalog,
+    sql: &str,
+    role: Option<&str>,
+) -> Result<AnalyzedQuery, typedpg_analyzer::LocatedError> {
+    match role {
+        Some(role) => catalog.analyze_as_located(sql, role),
+        None => catalog.analyze_located(sql),
+    }
+}
+
+/// What changes for a deployed query analyzed as `olds` (one analysis per
+/// role it runs as) against `old_catalog` when it runs against
+/// `new_catalog`: the changes for every role, each subject once.
+fn query_changes(
+    sql: &str,
+    olds: &[RoleAnalysis<'_>],
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+) -> Vec<Change> {
+    let mut out: Vec<Change> = Vec::new();
+    for (role, old) in olds {
+        for change in changes(sql, *role, old, old_catalog, new_catalog) {
+            if !out.iter().any(|c| c.subject == change.subject) {
+                out.push(change);
+            }
+        }
+    }
+    out
+}
+
+/// What changes for a deployed query analyzed as `old` against `old_catalog`,
+/// as `role`, when it runs against `new_catalog`.
 fn changes(
     sql: &str,
+    role: Option<&str>,
     old: &AnalyzedQuery,
     old_catalog: &PgCatalog,
     new_catalog: &PgCatalog,
 ) -> Vec<Change> {
-    let new = match new_catalog.analyze_located(sql) {
+    let new = match analyze(new_catalog, sql, role) {
         Ok(new) => new,
         Err(error) => {
-            let message = error.error.to_string();
-            let message = message.lines().next().unwrap_or_default().trim();
+            let first_line = |error: &typedpg_analyzer::LocatedError| {
+                let message = error.error.to_string();
+                message.lines().next().unwrap_or_default().trim().to_owned()
+            };
+            // What fails for the role alone (a privilege it lost, a policy
+            // it lacks) is said of the role; what fails for anyone is not.
+            if let Some(role) = role
+                && new_catalog.analyze_located(sql).is_ok()
+            {
+                return vec![Change {
+                    subject: format!("analysis as {role}"),
+                    text: format!(
+                        "it no longer runs as role \"{role}\": {}",
+                        first_line(&error)
+                    ),
+                }];
+            }
             return vec![Change {
                 subject: "analysis".to_owned(),
-                text: format!("it no longer runs: {message}"),
+                text: format!("it no longer runs: {}", first_line(&error)),
             }];
         }
     };
@@ -398,8 +493,72 @@ fn changes(
             );
         }
     }
-    inserts(sql, old_catalog, new_catalog, &mut out);
+    writes(sql, old_catalog, new_catalog, &mut out);
+    if let Some(role) = role {
+        row_security(sql, role, old_catalog, new_catalog, &mut out);
+    }
     out
+}
+
+/// The tables the query reads or writes whose rows row-level security now
+/// denies `role` the command it runs on them, where the deployed schema
+/// didn't: a table that enables it without a policy for the role, a policy
+/// dropped. The query still analyzes — a SELECT then sees no row, an
+/// UPDATE or a DELETE changes none, and an INSERT fails.
+fn row_security(
+    sql: &str,
+    role: &str,
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    out: &mut Vec<Change>,
+) {
+    let Ok(view) = new_catalog.query_view(sql) else {
+        return;
+    };
+    // Each table the query uses, with the command it runs on it.
+    let mut uses: Vec<(&typedpg_pg_query::ast::RangeVar, char)> = Vec::new();
+    for (node, _) in view.tree.nodes() {
+        let target = match node {
+            NodeRef::InsertStmt(stmt) => stmt.relation.as_deref().map(|r| (r, 'a')),
+            NodeRef::UpdateStmt(stmt) => stmt.relation.as_deref().map(|r| (r, 'w')),
+            NodeRef::DeleteStmt(stmt) => stmt.relation.as_deref().map(|r| (r, 'd')),
+            _ => None,
+        };
+        uses.extend(target);
+    }
+    for (node, _) in view.tree.nodes() {
+        if let NodeRef::RangeVar(relation) = node
+            && !uses.iter().any(|(r, _)| r.location == relation.location)
+        {
+            uses.push((relation, 'r'));
+        }
+    }
+    for (relation, command) in uses {
+        let (Some(old_table), Some(new_table)) =
+            (table(old_catalog, relation), table(new_catalog, relation))
+        else {
+            continue;
+        };
+        if !new_catalog.row_security_denies(new_table.oid, role, command)
+            || old_catalog.row_security_denies(old_table.oid, role, command)
+        {
+            continue;
+        }
+        let name = crate::rules::table_name(relation);
+        let (verb, outcome) = match command {
+            'a' => ("INSERT", format!("its INSERT into {name} fails")),
+            'w' => ("UPDATE", format!("its UPDATE of {name} changes no row")),
+            'd' => ("DELETE", format!("its DELETE from {name} removes no row")),
+            _ => ("SELECT", format!("it sees no row of {name}")),
+        };
+        out.push(Change {
+            subject: format!("row security {name} {command} {role}"),
+            text: format!(
+                "{outcome} as role \"{role}\": row-level security applies to the role and no \
+                 policy lets it {verb}"
+            ),
+        });
+    }
 }
 
 /// What changes in the result columns the deployed code reads.
@@ -569,41 +728,103 @@ fn input(what: &str, old: (&Type, bool), new: (&Type, bool), out: &mut Vec<Chang
     }
 }
 
-/// An `INSERT` of the query that leaves out a column the new schema makes
-/// `NOT NULL` without a default, where the deployed schema let it be
-/// omitted: PostgreSQL fails every row at runtime, which no analysis of the
-/// statement shows.
-fn inserts(sql: &str, old_catalog: &PgCatalog, new_catalog: &PgCatalog, out: &mut Vec<Change>) {
-    if !sql.to_ascii_lowercase().contains("insert") {
+/// What the query's `INSERT`s and `UPDATE`s write that the new schema
+/// rejects where the deployed one didn't: an `INSERT` that leaves out a
+/// column now `NOT NULL` without a default, and a column written whose new
+/// definition accepts fewer values (see [`narrowed`]).
+fn writes(sql: &str, old_catalog: &PgCatalog, new_catalog: &PgCatalog, out: &mut Vec<Change>) {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("insert") && !lower.contains("update") {
         return;
     }
     let Ok(view) = new_catalog.query_view(sql) else {
         return;
     };
+    let names = |targets: &[Option<N>]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for target in targets {
+            if let Some(N::ResTarget(target)) = target
+                && !out.contains(&target.name)
+            {
+                out.push(target.name.clone());
+            }
+        }
+        out
+    };
     for (node, _) in view.tree.nodes() {
-        if let NodeRef::InsertStmt(stmt) = node {
-            insert(stmt, old_catalog, new_catalog, out);
+        match node {
+            NodeRef::InsertStmt(stmt) => {
+                let Some(relation) = stmt.relation.as_deref() else {
+                    continue;
+                };
+                let Some(mut written) = insert(stmt, relation, old_catalog, new_catalog, out)
+                else {
+                    continue;
+                };
+                // `ON CONFLICT DO UPDATE SET` writes its columns too.
+                if let Some(clause) = stmt.on_conflict_clause.as_deref() {
+                    for name in names(&clause.target_list) {
+                        if !written.contains(&name) {
+                            written.push(name);
+                        }
+                    }
+                }
+                let statement = format!("its INSERT into {}", crate::rules::table_name(relation));
+                narrowed(
+                    &statement,
+                    relation,
+                    &written,
+                    old_catalog,
+                    new_catalog,
+                    out,
+                );
+            }
+            NodeRef::UpdateStmt(stmt) => {
+                let Some(relation) = stmt.relation.as_deref() else {
+                    continue;
+                };
+                let written = names(&stmt.target_list);
+                let statement = format!("its UPDATE of {}", crate::rules::table_name(relation));
+                narrowed(
+                    &statement,
+                    relation,
+                    &written,
+                    old_catalog,
+                    new_catalog,
+                    out,
+                );
+            }
+            _ => {}
         }
     }
 }
 
+/// The table `relation` names in `catalog`.
+fn table<'c>(
+    catalog: &'c PgCatalog,
+    relation: &typedpg_pg_query::ast::RangeVar,
+) -> Option<&'c typedpg_analyzer::PgClass> {
+    if !relation.catalogname.is_empty() {
+        return None;
+    }
+    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+    catalog.resolve_table(schema, &relation.relname)
+}
+
+/// The columns an `INSERT` gives a value, in table order for one without a
+/// column list; reporting those it leaves out that the new schema makes
+/// `NOT NULL` without a default, where the deployed schema let them be
+/// omitted: PostgreSQL fails every row at runtime, which no analysis of the
+/// statement shows. `None` when the columns can't be told.
 fn insert(
     stmt: &InsertStmt,
+    relation: &typedpg_pg_query::ast::RangeVar,
     old_catalog: &PgCatalog,
     new_catalog: &PgCatalog,
     out: &mut Vec<Change>,
-) {
-    let Some(relation) = stmt.relation.as_deref() else {
-        return;
-    };
-    if !relation.catalogname.is_empty() {
-        return;
-    }
-    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-    let Some(new_table) = new_catalog.resolve_table(schema, &relation.relname) else {
-        return;
-    };
-    let old_table = old_catalog.resolve_table(schema, &relation.relname);
+) -> Option<Vec<String>> {
+    let new_table = table(new_catalog, relation)?;
+    let old_table = table(old_catalog, relation);
     let attributes: Vec<_> = new_catalog
         .attributes_of(new_table.oid)
         .iter()
@@ -611,28 +832,26 @@ fn insert(
         .collect();
     // The columns the statement gives a value: its column list, or the
     // table's first N for N values per row (none for DEFAULT VALUES).
-    let given: HashSet<&str> = if !stmt.cols.is_empty() {
+    let given: Vec<String> = if !stmt.cols.is_empty() {
         stmt.cols
             .iter()
             .filter_map(|col| match col {
-                Some(N::ResTarget(target)) => Some(target.name.as_str()),
+                Some(N::ResTarget(target)) => Some(target.name.clone()),
                 _ => None,
             })
             .collect()
     } else {
         match stmt.select_stmt.as_ref() {
-            None => HashSet::new(),
+            None => Vec::new(),
             Some(N::SelectStmt(select)) => {
-                let Some(width) = crate::rules::insert_width(select) else {
-                    return;
-                };
+                let width = crate::rules::insert_width(select)?;
                 attributes
                     .iter()
                     .take(width)
-                    .map(|attribute| attribute.attname.as_str())
+                    .map(|attribute| attribute.attname.clone())
                     .collect()
             }
-            Some(_) => return,
+            Some(_) => return None,
         }
     };
     let required = |attribute: &typedpg_analyzer::PgAttribute| {
@@ -642,7 +861,7 @@ fn insert(
             && attribute.attgenerated.is_none()
     };
     for attribute in attributes {
-        if given.contains(attribute.attname.as_str()) || !required(attribute) {
+        if given.contains(&attribute.attname) || !required(attribute) {
             continue;
         }
         // Omitted before too: the deployed code already fails there.
@@ -669,6 +888,194 @@ fn insert(
                 quote_identifier(&attribute.attname)
             ),
         });
+    }
+    Some(given)
+}
+
+/// The columns `written` of `relation` (by `statement`: `its INSERT into
+/// t`) whose new definition accepts fewer values than the deployed one: a
+/// narrower type modifier (a shorter `varchar(n)`, `char(n)`, `bit(n)`,
+/// `varbit(n)`; fewer digits before a `numeric`'s decimal point, which
+/// fail, or after it, which round), a CHECK constraint of the table or the
+/// column's domain that is new or narrower (`NOT VALID` ones too: they bind
+/// the rows written), and a new CHECK the analyzer can't reduce to the
+/// columns written, which may reject the deployed code's rows. A column
+/// whose type changes is left to its parameter's type change; one a new
+/// UNIQUE, primary key or exclusion constraint covers is not reported (it
+/// depends on the data).
+fn narrowed(
+    statement: &str,
+    relation: &typedpg_pg_query::ast::RangeVar,
+    written: &[String],
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    out: &mut Vec<Change>,
+) {
+    let (Some(old_table), Some(new_table)) =
+        (table(old_catalog, relation), table(new_catalog, relation))
+    else {
+        return;
+    };
+    let name = crate::rules::table_name(relation);
+    // The new constraints the analyzer can't reduce to a written column,
+    // with the written columns they read.
+    let mut unreduced: Vec<(String, Vec<String>)> = Vec::new();
+    let mut reduced: HashSet<String> = HashSet::new();
+    for column in written {
+        let attribute = |catalog: &PgCatalog, relid| {
+            catalog
+                .attributes_of(relid)
+                .iter()
+                .find(|a| a.attnum > 0 && a.attname == *column)
+                .cloned()
+        };
+        let (Some(old), Some(new)) = (
+            attribute(old_catalog, old_table.oid),
+            attribute(new_catalog, new_table.oid),
+        ) else {
+            continue;
+        };
+        if old.atttypid != new.atttypid {
+            continue;
+        }
+        let subject = |what: &str| format!("write {name} {column} {what}");
+        let column_text = format!("{statement} writes column {}", quote_identifier(column));
+        if let Some(text) = narrower_type(
+            old_catalog.lint_value_limit(old.atttypid, old.atttypmod),
+            new_catalog.lint_value_limit(new.atttypid, new.atttypmod),
+        ) {
+            out.push(Change {
+                subject: subject("typmod"),
+                text: format!(
+                    "{column_text}, now {} instead of {}: {text}",
+                    new_catalog.lint_format_type(new.atttypid, new.atttypmod),
+                    old_catalog.lint_format_type(old.atttypid, old.atttypmod),
+                ),
+            });
+        }
+
+        let old_constraints = old_catalog.column_write_constraints(old_table.oid, column);
+        let new_constraints = new_catalog.column_write_constraints(new_table.oid, column);
+        let all = |constraints: &[typedpg_analyzer::WriteConstraint]| {
+            constraints
+                .iter()
+                .filter_map(|c| c.allowed.as_ref())
+                .fold(Refinement::NONE, |all, allowed| all.and(allowed))
+        };
+        let (old_allowed, new_allowed) = (all(&old_constraints), all(&new_constraints));
+        if new_allowed.widenings(&old_allowed).any() {
+            // The constraints that make the difference: those the deployed
+            // schema doesn't have as they are.
+            let sources: Vec<&str> = new_constraints
+                .iter()
+                .filter(|c| c.allowed.is_some() && !old_constraints.contains(c))
+                .map(|c| c.source.as_str())
+                .collect();
+            let now = new_catalog
+                .describe_column_values(new_table.oid, column, &new_allowed)
+                .unwrap_or_else(|| "fewer values".to_owned());
+            let before = old_catalog
+                .describe_column_values(old_table.oid, column, &old_allowed)
+                .map(|before| format!(" instead of {before}"))
+                .unwrap_or_default();
+            out.push(Change {
+                subject: subject("check"),
+                text: format!(
+                    "{column_text}, which {} now {} to {now}{before}: writing another value fails",
+                    if sources.is_empty() {
+                        "its constraints".to_owned()
+                    } else {
+                        sources.join(" and ")
+                    },
+                    if sources.len() == 1 {
+                        "limits it"
+                    } else {
+                        "limit it"
+                    },
+                ),
+            });
+        }
+        for constraint in &new_constraints {
+            if constraint.allowed.is_some() {
+                reduced.insert(constraint.source.clone());
+                continue;
+            }
+            if old_constraints
+                .iter()
+                .any(|c| c.source == constraint.source)
+            {
+                continue;
+            }
+            match unreduced.iter_mut().find(|(s, _)| *s == constraint.source) {
+                Some((_, columns)) => columns.push(column.clone()),
+                None => unreduced.push((constraint.source.clone(), vec![column.clone()])),
+            }
+        }
+    }
+    for (source, columns) in unreduced {
+        if reduced.contains(&source) {
+            continue;
+        }
+        let columns: Vec<String> = columns.iter().map(|c| quote_identifier(c)).collect();
+        out.push(Change {
+            subject: format!("write {name} {source}"),
+            text: format!(
+                "{statement} writes {} {}, which the new {source} reads: it may reject the rows \
+                 the deployed code writes",
+                if columns.len() == 1 {
+                    "column"
+                } else {
+                    "columns"
+                },
+                columns.join(", ")
+            ),
+        });
+    }
+}
+
+/// What a column's type modifier going from `old` to `new` rejects or
+/// changes in the values written into it; `None` when every value `old`
+/// accepts, `new` keeps as is.
+fn narrower_type(
+    old: Option<typedpg_analyzer::ValueLimit>,
+    new: Option<typedpg_analyzer::ValueLimit>,
+) -> Option<String> {
+    use typedpg_analyzer::ValueLimit::{ExactLength, Length, Numeric};
+    match (old, new?) {
+        (None, Length(_)) => Some("a longer value fails".to_owned()),
+        (Some(Length(a)), Length(b)) if b < a => Some("a longer value fails".to_owned()),
+        // A bit string of the old length no longer fits, longer or shorter.
+        (Some(ExactLength(a)), ExactLength(b)) if a != b => {
+            Some("a value of the old length fails".to_owned())
+        }
+        (old, Numeric { precision, scale }) => {
+            let (old_digits, old_scale) = match old {
+                Some(Numeric {
+                    precision: p,
+                    scale: s,
+                }) => (Some(p - s), Some(s)),
+                _ => (None, None),
+            };
+            let digits = precision - scale;
+            let plural = |n: i32| if n == 1 { "digit" } else { "digits" };
+            let mut parts = Vec::new();
+            if old_digits.is_none_or(|old| digits < old) {
+                parts.push(format!(
+                    "a value with more than {} {} before the decimal point fails",
+                    digits.max(0),
+                    plural(digits)
+                ));
+            }
+            if old_scale.is_none_or(|old| scale < old) {
+                parts.push(format!(
+                    "one with more than {} {} after it is rounded",
+                    scale.max(0),
+                    plural(scale)
+                ));
+            }
+            (!parts.is_empty()).then(|| parts.join(", and "))
+        }
+        _ => None,
     }
 }
 
@@ -861,6 +1268,16 @@ mod tests {
 
     /// The findings for `queries` when `new` is applied after `old`.
     fn check(old: &[&str], new: &[&str], queries: &[&str]) -> Vec<MigrationFinding> {
+        check_as(old, new, queries, &[])
+    }
+
+    /// [`check`], for queries the deployed code runs as `roles`.
+    fn check_as(
+        old: &[&str],
+        new: &[&str],
+        queries: &[&str],
+        roles: &[&str],
+    ) -> Vec<MigrationFinding> {
         let old_catalog = catalog(old);
         let all: Vec<&str> = old.iter().chain(new).copied().collect();
         let new_catalog = catalog(&all);
@@ -879,6 +1296,7 @@ mod tests {
             .map(|(i, sql)| DeployedQuery {
                 sql: (*sql).to_owned(),
                 locations: vec![format!("src/q.rs:{}", i + 1)],
+                roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             })
             .collect();
         breaks_deployed_queries(
@@ -1090,7 +1508,7 @@ mod tests {
             &[USERS],
             &["ALTER TABLE users ADD COLUMN bio text;
                CREATE INDEX users_email_idx ON users (email);
-               ALTER TABLE users ADD CONSTRAINT users_kind_a CHECK (kind = 'a');
+               ALTER TABLE users ADD CONSTRAINT users_kind_c CHECK (kind IN ('a', 'b', 'c'));
                CREATE TABLE posts (id integer PRIMARY KEY);"],
             &[
                 "SELECT id, email, name, status, kind, age, tags FROM users WHERE id = $id",
@@ -1152,6 +1570,296 @@ mod tests {
                  \"kind\" of result column \"r\" may now be another value than 'a', 'b'; field \
                  \"n\" of result column \"r\" may now be NULL"
             ]
+        );
+    }
+
+    /// The one message of `findings`, without what every message starts
+    /// with.
+    fn only(findings: &[MigrationFinding]) -> String {
+        let messages = messages(findings);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        messages[0]
+            .split_once("(origin/main): ")
+            .map(|(_, text)| text.to_owned())
+            .unwrap()
+    }
+
+    const LIMITS: &str = "CREATE TABLE t (
+            id integer PRIMARY KEY,
+            name varchar(20),
+            code char(4),
+            flags bit varying(8),
+            n numeric(10, 2),
+            m numeric(10, 2),
+            at timestamp(6),
+            lo integer,
+            hi integer,
+            age integer
+        );";
+
+    #[test]
+    fn a_narrower_length_breaks_a_write() {
+        let findings = check(
+            &[LIMITS],
+            &["ALTER TABLE t ALTER COLUMN name TYPE varchar(10);"],
+            &[
+                "INSERT INTO t (id, name) VALUES ($id, $name)",
+                "UPDATE t SET name = $name WHERE id = $id",
+                // Reading it doesn't break: the type modifier doesn't
+                // change the decoding.
+                "SELECT name FROM t",
+            ],
+        );
+        assert_eq!(
+            messages(&findings),
+            [
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): its INSERT \
+                 into t writes column name, now character varying(10) instead of character \
+                 varying(20): a longer value fails",
+                "this migration breaks the deployed query at src/q.rs:2 (origin/main): its UPDATE \
+                 of t writes column name, now character varying(10) instead of character \
+                 varying(20): a longer value fails",
+            ]
+        );
+        // Newly limited, char(n) and bit strings, an ON CONFLICT DO UPDATE.
+        for (new, sql) in [
+            (
+                "ALTER TABLE t ALTER COLUMN code TYPE char(2);",
+                "UPDATE t SET code = $code",
+            ),
+            (
+                "ALTER TABLE t ALTER COLUMN flags TYPE bit varying(4);",
+                "UPDATE t SET flags = $flags",
+            ),
+            (
+                "ALTER TABLE t ALTER COLUMN name TYPE varchar(10);",
+                "INSERT INTO t (id) VALUES ($id) ON CONFLICT (id) DO UPDATE SET name = $name",
+            ),
+        ] {
+            let text = only(&check(&[LIMITS], &[new], &[sql]));
+            assert!(text.ends_with(": a longer value fails"), "{sql}: {text}");
+        }
+        let text = only(&check(
+            &["CREATE TABLE u (id integer, name varchar);"],
+            &["ALTER TABLE u ALTER COLUMN name TYPE varchar(5);"],
+            &["INSERT INTO u VALUES ($id, $name)"],
+        ));
+        assert_eq!(
+            text,
+            "its INSERT into u writes column name, now character varying(5) instead of \
+             character varying: a longer value fails"
+        );
+        // A bit(n) takes exactly n bits: a wider one breaks too.
+        let text = only(&check(
+            &["CREATE TABLE b (id integer, mask bit(4));"],
+            &["ALTER TABLE b ALTER COLUMN mask TYPE bit(8);"],
+            &["UPDATE b SET mask = $mask"],
+        ));
+        assert_eq!(
+            text,
+            "its UPDATE of b writes column mask, now bit(8) instead of bit(4): a value of the old \
+             length fails"
+        );
+        // A wider one, a timestamp's precision, more digits: nothing.
+        for new in [
+            "ALTER TABLE t ALTER COLUMN name TYPE varchar(40);",
+            "ALTER TABLE t ALTER COLUMN at TYPE timestamp(3);",
+            "ALTER TABLE t ALTER COLUMN n TYPE numeric(12, 2);",
+        ] {
+            let findings = check(
+                &[LIMITS],
+                &[new],
+                &["UPDATE t SET name = $name, at = $at, n = $n"],
+            );
+            assert!(findings.is_empty(), "{new}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn a_narrower_numeric_overflows_or_rounds() {
+        let findings = check(
+            &[LIMITS],
+            &[
+                "ALTER TABLE t ALTER COLUMN n TYPE numeric(8, 2);",
+                "ALTER TABLE t ALTER COLUMN m TYPE numeric(10, 1);",
+            ],
+            &["UPDATE t SET n = $n, m = $m WHERE id = $id"],
+        );
+        assert_eq!(
+            messages(&findings),
+            [
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): its UPDATE \
+                 of t writes column n, now numeric(8,2) instead of numeric(10,2): a value with \
+                 more than 6 digits before the decimal point fails",
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): its UPDATE \
+                 of t writes column m, now numeric(10,1) instead of numeric(10,2): one with more \
+                 than 1 digit after it is rounded",
+            ]
+        );
+        assert_eq!(findings[0].file, 1);
+        assert_eq!(findings[1].file, 2);
+    }
+
+    #[test]
+    fn a_new_check_on_a_written_column() {
+        let findings = check(
+            &[USERS],
+            &["ALTER TABLE users ADD CONSTRAINT users_kind_a CHECK (kind = 'a');"],
+            &[
+                "INSERT INTO users (id, email, name, status, kind, age, tags) \
+                 VALUES ($id, $email, $name, $status, $kind, $age, $tags)",
+                // It doesn't write the column.
+                "UPDATE users SET name = $name WHERE id = $id",
+            ],
+        );
+        assert_eq!(
+            messages(&findings),
+            [
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): its INSERT \
+                 into users writes column kind, which CHECK constraint \"users_kind_a\" now limits \
+                 it to 'a' instead of one of 'a', 'b': writing another value fails"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_narrowed_check() {
+        let migration = "ALTER TABLE users DROP CONSTRAINT users_kind_check;\n\
+                         ALTER TABLE users ADD CONSTRAINT users_kind_check CHECK (kind IN ('b'));";
+        let findings = check(&[USERS], &[migration], &["UPDATE users SET kind = $kind"]);
+        assert_eq!(
+            only(&findings),
+            "its UPDATE of users writes column kind, which CHECK constraint \"users_kind_check\" \
+             now limits it to 'b' instead of one of 'a', 'b': writing another value fails"
+        );
+        // Placed on the statement that narrows it.
+        assert_eq!(
+            &migration[findings[0].finding.span.clone()],
+            "ALTER TABLE users ADD CONSTRAINT users_kind_check CHECK (kind IN ('b'))"
+        );
+    }
+
+    #[test]
+    fn a_not_valid_check_binds_the_rows_written() {
+        let findings = check(
+            &[LIMITS],
+            &["ALTER TABLE t ADD CONSTRAINT t_age_positive CHECK (age > 0) NOT VALID;"],
+            &["UPDATE t SET age = $age WHERE id = $id"],
+        );
+        assert_eq!(
+            only(&findings),
+            "its UPDATE of t writes column age, which CHECK constraint \"t_age_positive\" now \
+             limits it to at least 1: writing another value fails"
+        );
+    }
+
+    #[test]
+    fn a_domain_check() {
+        let findings = check(
+            &["CREATE DOMAIN score AS integer CHECK (VALUE >= 0);
+               CREATE TABLE s (id integer, v score);"],
+            &["ALTER DOMAIN score ADD CONSTRAINT score_max CHECK (VALUE <= 100);"],
+            // No column list: it writes every column.
+            &["INSERT INTO s VALUES ($id, $v)"],
+        );
+        assert_eq!(
+            only(&findings),
+            "its INSERT into s writes column v, which CHECK constraint \"score_max\" of domain \
+             \"score\" now limits it to between 0 and 100 instead of at least 0: writing another \
+             value fails"
+        );
+    }
+
+    #[test]
+    fn a_new_multi_column_check_may_reject_the_rows() {
+        let findings = check(
+            &[LIMITS],
+            &["ALTER TABLE t ADD CONSTRAINT t_lo_hi CHECK (lo <= hi);"],
+            &[
+                "INSERT INTO t (id, lo, hi) VALUES ($id, $lo, $hi)",
+                "UPDATE t SET lo = $lo WHERE id = $id",
+                // It writes neither column.
+                "UPDATE t SET name = $name WHERE id = $id",
+            ],
+        );
+        assert_eq!(
+            messages(&findings),
+            [
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): its INSERT \
+                 into t writes columns lo, hi, which the new CHECK constraint \"t_lo_hi\" reads: \
+                 it may reject the rows the deployed code writes",
+                "this migration breaks the deployed query at src/q.rs:2 (origin/main): its UPDATE \
+                 of t writes column lo, which the new CHECK constraint \"t_lo_hi\" reads: it may \
+                 reject the rows the deployed code writes",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_unique_constraint_is_not_reported() {
+        let findings = check(
+            &[USERS],
+            &[
+                "ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
+               CREATE UNIQUE INDEX users_name_key ON users (name);",
+            ],
+            &[
+                "INSERT INTO users (id, email, name, status, kind, age, tags) \
+                 VALUES ($id, $email, $name, $status, $kind, $age, $tags)",
+            ],
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_query_is_analyzed_as_its_roles() {
+        let old = "CREATE ROLE app; CREATE ROLE reporting;
+                   CREATE TABLE t (id integer PRIMARY KEY, secret text);
+                   GRANT SELECT, UPDATE ON t TO app, reporting;";
+        let revoke = ["REVOKE SELECT ON t FROM app;"];
+        let sql = "SELECT id FROM t";
+        // A revoked privilege breaks the query for the role that runs it...
+        assert_eq!(
+            only(&check_as(&[old], &revoke, &[sql], &["app"])),
+            "it no longer runs as role \"app\": permission denied for table t"
+        );
+        assert_eq!(
+            only(&check_as(&[old], &revoke, &[sql], &["reporting", "app"])),
+            "it no longer runs as role \"app\": permission denied for table t"
+        );
+        // ...not for another role, nor without one.
+        assert!(check_as(&[old], &revoke, &[sql], &["reporting"]).is_empty());
+        assert!(check(&[old], &revoke, &[sql]).is_empty());
+        // Row security without a policy for the role: the query still
+        // analyzes, but sees no row, or changes none.
+        let rls = ["ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY t_reporting ON t FOR SELECT TO reporting USING (true);"];
+        assert_eq!(
+            only(&check_as(
+                &[old],
+                &rls,
+                &["UPDATE t SET secret = $secret WHERE id = $id RETURNING id"],
+                &["app"],
+            )),
+            "its UPDATE of t changes no row as role \"app\": row-level security applies to the \
+             role and no policy lets it UPDATE"
+        );
+        let findings = check_as(&[old], &rls, &[sql], &["app", "reporting"]);
+        assert_eq!(
+            only(&findings),
+            "it sees no row of t as role \"app\": row-level security applies to the role and no \
+             policy lets it SELECT"
+        );
+        assert!(check_as(&[old], &rls, &[sql], &["reporting"]).is_empty());
+        // A schema change breaks every role alike: said once, of no role.
+        assert_eq!(
+            only(&check_as(
+                &[old],
+                &["ALTER TABLE t DROP COLUMN secret;"],
+                &["SELECT secret FROM t"],
+                &["app", "reporting"],
+            )),
+            "it no longer runs: column \"secret\" does not exist"
         );
     }
 }

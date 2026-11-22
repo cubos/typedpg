@@ -340,6 +340,9 @@ fn build_lint(
                         None => queries.push(typedpg_lint::DeployedQuery {
                             sql: query.text,
                             locations: vec![location],
+                            // Every query of the database runs as each of
+                            // its configured roles.
+                            roles: deployed.config.databases[query.db].roles.clone(),
                         }),
                     }
                 }

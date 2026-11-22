@@ -113,12 +113,12 @@ pub use pg_catalog::{
 };
 
 pub use analysis_diff::{AnalysisDifference, first_difference};
-pub use condition::{AssignmentViolation, ConditionFact, ConditionReason};
+pub use condition::{AssignmentViolation, ConditionFact, ConditionReason, WriteConstraint};
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{
     CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement,
-    NullifiedJoin, PgCatalog, QueryView, SublinkNullability, UserObjectCounts,
+    NullifiedJoin, PgCatalog, QueryView, SublinkNullability, UserObjectCounts, ValueLimit,
 };
 pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};

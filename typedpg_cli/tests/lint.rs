@@ -618,6 +618,26 @@ fn commit_all(dir: &Path, message: &str) {
 /// `src/lib.rs` and `0001_init.sql`, and whose branch adds `migration` as
 /// `0002_change.sql` and replaces the queries with `new_queries`.
 fn deployed_crate(queries: &[&str], migration: &str, new_queries: &[&str]) -> tempfile::TempDir {
+    let call = |query: &&str| format!("sql!(pool, {query:?})");
+    deployed_crate_with(
+        "",
+        "",
+        &queries.iter().map(call).collect::<Vec<_>>(),
+        migration,
+        &new_queries.iter().map(call).collect::<Vec<_>>(),
+    )
+}
+
+/// [`deployed_crate`], with `config` appended to the database's
+/// configuration, `init` to `0001_init.sql`, and the `sql!` invocations
+/// written out.
+fn deployed_crate_with(
+    config: &str,
+    init: &str,
+    calls: &[String],
+    migration: &str,
+    new_calls: &[String],
+) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -634,21 +654,23 @@ publish = false
 
 [package.metadata.typedpg.database]
 migrations = "./migrations"
-"#,
+"#
+        .to_owned()
+            + config,
     )
     .unwrap();
-    let source = |queries: &[&str]| {
+    let source = |calls: &[String]| {
         let mut source = String::from(
             "use typedpg::sql;\n\npub async fn run(pool: &typedpg::Pool) -> \
              Result<(), typedpg::Error> {\n",
         );
-        for query in queries {
-            source.push_str(&format!("    sql!(pool, {query:?}).execute().await?;\n"));
+        for call in calls {
+            source.push_str(&format!("    {call}.execute().await?;\n"));
         }
         source.push_str("    Ok(())\n}\n");
         source
     };
-    std::fs::write(root.join("src/lib.rs"), source(queries)).unwrap();
+    std::fs::write(root.join("src/lib.rs"), source(calls)).unwrap();
     std::fs::write(
         root.join("migrations/0001_init.sql"),
         "CREATE TYPE status AS ENUM ('active', 'blocked');\n\
@@ -658,13 +680,15 @@ migrations = "./migrations"
              name text NOT NULL,\n\
              status status NOT NULL,\n\
              age integer\n\
-         );\n",
+         );\n"
+            .to_owned()
+            + init,
     )
     .unwrap();
     git(root, &["init", "-q"]);
     commit_all(root, "deployed");
     std::fs::write(root.join("migrations/0002_change.sql"), migration).unwrap();
-    std::fs::write(root.join("src/lib.rs"), source(new_queries)).unwrap();
+    std::fs::write(root.join("src/lib.rs"), source(new_calls)).unwrap();
     dir
 }
 
@@ -789,4 +813,40 @@ fn breaks_deployed_queries_accepts_a_compatible_migration() {
     let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
     assert_eq!(code, Some(0), "{stderr}\n{stdout}");
     assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+}
+
+#[test]
+fn breaks_deployed_queries_analyzes_a_query_as_its_roles() {
+    let dir = deployed_crate_with(
+        "roles = [\"app\"]\n",
+        "CREATE ROLE app;\n\
+         CREATE ROLE reporting;\n\
+         GRANT SELECT ON users TO app, reporting;\n",
+        &[
+            // As the database's configured role.
+            r#"sql!(pool, "SELECT id FROM users")"#.to_owned(),
+            // As the call site's.
+            r#"sql!(role = "reporting", pool, "SELECT name FROM users")"#.to_owned(),
+        ],
+        "REVOKE SELECT ON users FROM reporting;\n\
+         ALTER TABLE users ENABLE ROW LEVEL SECURITY;\n",
+        &[],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(
+        stdout.matches("warning[breaks_deployed_queries]").count(),
+        2,
+        "{stdout}"
+    );
+    for expected in [
+        "migrations/0002_change.sql:1:1",
+        "this migration breaks the deployed query at src/lib.rs:5 (HEAD): it no longer runs as \
+         role \"reporting\": permission denied for table users",
+        "migrations/0002_change.sql:2:1",
+        "this migration breaks the deployed query at src/lib.rs:4 (HEAD): it sees no row of users \
+         as role \"app\": row-level security applies to the role and no policy lets it SELECT",
+    ] {
+        assert!(stdout.contains(expected), "{expected}\n{stdout}");
+    }
 }

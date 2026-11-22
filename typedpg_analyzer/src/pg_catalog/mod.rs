@@ -97,6 +97,7 @@ pub const C_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(13);
 pub const SQL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(14);
 
 mod lint_access;
+pub use lint_access::ValueLimit;
 mod shared;
 pub use shared::Shared;
 pub(crate) mod pg_query_catalog;

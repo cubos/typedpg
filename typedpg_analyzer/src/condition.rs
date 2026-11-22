@@ -726,3 +726,140 @@ impl PgCatalog {
         })
     }
 }
+
+/// A constraint every value written into a column must satisfy: a CHECK
+/// constraint of its relation that reads it, or a CHECK of its domain (see
+/// [`PgCatalog::column_write_constraints`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteConstraint {
+    /// The constraint, as a message names it: `CHECK constraint "c"`, or
+    /// `CHECK constraint "c" of domain "d"`.
+    pub source: String,
+    /// The relation's columns it reads (a domain's: the column alone).
+    pub columns: Vec<String>,
+    /// What it allows the column when non-NULL, when the analyzer reduces
+    /// it to the column alone (`CHECK (kind IN ('a', 'b'))`, `CHECK (n >
+    /// 0)`); `None` for a constraint that says nothing it can read of the
+    /// column by itself (`CHECK (a < b)`, `CHECK (length(name) > 2)`).
+    pub allowed: Option<Refinement>,
+}
+
+impl PgCatalog {
+    /// The constraints a value an INSERT or UPDATE stores into column
+    /// `column` of relation `relid` must satisfy: its enforced CHECK
+    /// constraints that read the column — `NOT VALID` and `NO INHERIT` ones
+    /// included, they bind the rows written into the relation itself — and
+    /// the CHECK constraints of the column's domain (and of the domains it
+    /// is over). In name order, the relation's first.
+    pub fn column_write_constraints(
+        &self,
+        relid: crate::oid::PgClassOid,
+        column: &str,
+    ) -> Vec<WriteConstraint> {
+        let attrs = self.attributes_of(relid);
+        let Some(attr) = attrs.iter().find(|a| a.attname == column && a.attnum > 0) else {
+            return Vec::new();
+        };
+        let mut constraints: Vec<&crate::pg_catalog::PgConstraint> = self
+            .pg_constraint
+            .values()
+            .filter(|c| {
+                c.conrelid == relid
+                    && c.contype == crate::pg_catalog::ConType::Check
+                    && c.conenforced
+                    && c.conkey.contains(&attr.attnum)
+            })
+            .collect();
+        constraints.sort_by(|a, b| a.conname.cmp(&b.conname));
+        let mut out = Vec::new();
+        for con in constraints {
+            let columns = con
+                .conkey
+                .iter()
+                .filter_map(|n| attrs.iter().find(|a| a.attnum == *n))
+                .map(|a| a.attname.clone())
+                .collect();
+            let allowed = self.check_defs.get(&con.oid).and_then(|def| {
+                let (crate::ddl::tables::check_inherit::StoredExpr::Written(expr), Some(trust)) =
+                    (&def.expr, &def.trusted)
+                else {
+                    return None;
+                };
+                let mut r = crate::nonnull::checks::allowed_values(
+                    (**expr).as_ref(),
+                    column,
+                    attr.atttypid,
+                    attr.attcollation,
+                    self,
+                    trust,
+                )
+                .unwrap_or_default();
+                if crate::nonnull::checks::finite_columns_of((**expr).as_ref(), trust)
+                    .iter()
+                    .any(|c| c == column)
+                {
+                    r.finite = true;
+                }
+                (r != Refinement::NONE).then_some(r)
+            });
+            out.push(WriteConstraint {
+                source: format!("CHECK constraint \"{}\"", con.conname),
+                columns,
+                allowed,
+            });
+        }
+        for domain in self.domain_chain(attr.atttypid) {
+            let name = self
+                .pg_type
+                .get(&domain)
+                .map(|t| t.typname.clone())
+                .unwrap_or_default();
+            let mut checks: Vec<&crate::ddl::types::DomainConstraint> = self
+                .domain_constraints
+                .get(&domain)
+                .into_iter()
+                .flatten()
+                .filter(|c| c.kind == crate::ddl::types::DomainConstraintKind::Check)
+                .collect();
+            checks.sort_by(|a, b| a.name.cmp(&b.name));
+            for check in checks {
+                let mut r = check.allowed.clone().unwrap_or_default();
+                r.finite |= check.finite;
+                out.push(WriteConstraint {
+                    source: format!("CHECK constraint \"{}\" of domain \"{name}\"", check.name),
+                    columns: vec![column.to_owned()],
+                    allowed: (r != Refinement::NONE).then_some(r),
+                });
+            }
+        }
+        out
+    }
+
+    /// What `r` allows column `column` of relation `relid`, in words (`one
+    /// of 'a', 'b'`, `at least 0`, `finite`); `None` when it says nothing
+    /// the words can tell.
+    pub fn describe_column_values(
+        &self,
+        relid: crate::oid::PgClassOid,
+        column: &str,
+        r: &Refinement,
+    ) -> Option<String> {
+        let attr = self
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attname == column)?;
+        let kind = match Exact::of(attr.atttypid, attr.attcollation, self) {
+            Some(e) => Some(Kind::Exact(e)),
+            None => OrdKind::of(attr.atttypid, self).map(Kind::Ord),
+        };
+        let text = kind
+            .and_then(|kind| describe(r, kind, Cmp::Eq))
+            .filter(|text| text != "unbounded")
+            .map(|text| text.strip_prefix("always ").unwrap_or(&text).to_owned());
+        match text {
+            Some(text) if r.finite => Some(format!("finite and {text}")),
+            Some(text) => Some(text),
+            None => r.finite.then(|| "finite".to_owned()),
+        }
+    }
+}

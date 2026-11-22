@@ -39,6 +39,8 @@ struct Site {
     path: PathBuf,
     file: String,
     db: Option<String>,
+    /// The call site's `role = "name"`.
+    role: Option<String>,
     sql: String,
     literal: scan::Literal,
     bindings: Vec<scan::Binding>,
@@ -673,6 +675,7 @@ fn scan_sources(base: &Path) -> Sources {
                 path: path.clone(),
                 file: file.clone(),
                 db: query.db,
+                role: query.role,
                 sql: query.text,
                 literal: query.literal,
                 bindings: query.bindings,
@@ -761,12 +764,25 @@ fn deployed(reference: &str, manifest: &Path, options: &LintOptions) -> Result<D
             relative(&site.path, &base),
             position(&site.file, site.literal.source_offset(0)).line
         );
+        // The roles it runs as, as the macro checks it: the call site's,
+        // or the database's configured ones.
+        let roles = match site.role {
+            Some(role) => vec![role],
+            None => config
+                .resolve(site.db.as_deref())
+                .map(|resolved| resolved.roles().to_vec())
+                .unwrap_or_default(),
+        };
         let queries = deployed.queries.entry(site.db).or_default();
-        match queries.iter_mut().find(|query| query.sql == site.sql) {
+        match queries
+            .iter_mut()
+            .find(|query| query.sql == site.sql && query.roles == roles)
+        {
             Some(query) => query.locations.push(location),
             None => queries.push(DeployedQuery {
                 sql: site.sql,
                 locations: vec![location],
+                roles,
             }),
         }
     }

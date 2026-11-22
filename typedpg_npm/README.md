@@ -662,6 +662,14 @@ analyzes, a result column is gone, changes type or may now be NULL, the column
 list changes, a parameter changes type or no longer accepts NULL, an `INSERT
 … SELECT` leaves out a new `NOT NULL` column without a default, or a result
 may now be a value the code doesn't know (a new enum label, a wider `CHECK`).
+An `INSERT` or `UPDATE` breaks when a column it writes accepts fewer values:
+a shorter `varchar(n)`, a `numeric` with fewer digits (a value fails, or is
+rounded when it has fewer after the decimal point), a new or narrower `CHECK`
+of the table or the column's domain (`NOT VALID` ones too); a new `CHECK`
+over several columns it writes may reject its rows. A new `UNIQUE` constraint
+is not reported. Each query is analyzed as the database's `roles`, so a
+revoked privilege, or row-level security that leaves a role no policy, is
+reported too.
 Deploy code that works with both schemas first, then the migration
 (expand/contract).
 `--fix` writes the SQL fixes findings carry (the ones that have them; migration

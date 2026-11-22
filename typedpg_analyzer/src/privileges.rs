@@ -6109,6 +6109,26 @@ impl PgCatalog {
         !(self.roles.has_privs_of_role(who, owner) && !self.force_row_security.contains(&relid))
     }
 
+    /// Whether row-level security denies role `role` every row of relation
+    /// `relid` for command `cmd` (`r` SELECT, `a` INSERT, `w` UPDATE, `d`
+    /// DELETE): it applies to the role ([`Self::row_security_applies`])
+    /// and no permissive policy with a clause for the command is addressed
+    /// to it, so the default-deny `false` filters every row (an INSERT
+    /// fails). `false` for a role the catalog doesn't know.
+    pub fn row_security_denies(&self, relid: PgClassOid, role: &str, cmd: char) -> bool {
+        let Some(who) = self.roles.id(role) else {
+            return false;
+        };
+        if !self.row_security_applies(relid, who) {
+            return false;
+        }
+        let (permissive, _) = self.policies_for(relid, cmd, who);
+        !permissive.iter().any(|policy| {
+            let (using, with_check) = self.policy_qual(relid, policy);
+            using.is_some() || with_check.is_some()
+        })
+    }
+
     /// The policies of `relid` that apply to command `cmd` for `who`
     /// (`get_policies_for_relation`): the command's own or `ALL` policies,
     /// addressed to PUBLIC or to a role `who` has the privileges of, split

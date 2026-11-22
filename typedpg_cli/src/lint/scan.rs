@@ -26,6 +26,9 @@ use syn::{
 pub(crate) struct FoundQuery {
     /// The named database (`db = name`), or `None` for the default one.
     pub db: Option<String>,
+    /// The role the call site runs it as (`role = "name"`), replacing the
+    /// database's configured `roles`.
+    pub role: Option<String>,
     /// The literal's cooked value: the SQL the macro analyzes.
     pub text: String,
     /// Where the literal is in the file.
@@ -168,7 +171,7 @@ impl Finder<'_> {
         if !self.seen.insert(start) {
             return;
         }
-        let Some((db, sql, rest)) = parse_sql_arguments(mac.tokens.clone()) else {
+        let Some(((db, role), sql, rest)) = parse_sql_arguments(mac.tokens.clone()) else {
             return;
         };
         match sql {
@@ -180,6 +183,7 @@ impl Finder<'_> {
                 self.queries.insert(start, self.scan.queries.len());
                 self.scan.queries.push(FoundQuery {
                     db,
+                    role,
                     text: literal.value.clone(),
                     literal,
                     bindings,
@@ -200,7 +204,7 @@ impl Finder<'_> {
         if !self.seen.insert(start) {
             return;
         }
-        let Some((db, target)) = parse_copy_in_arguments(mac.tokens.clone()) else {
+        let Some(((db, _), target)) = parse_copy_in_arguments(mac.tokens.clone()) else {
             return;
         };
         let Some(literal) = literal(self.text, target.span(), &target) else {
@@ -602,37 +606,53 @@ fn receiver_macro(expr: &Expr) -> Option<&Macro> {
     }
 }
 
-/// `[db = name,]` from the macro arguments.
-fn parse_db(input: ParseStream<'_>) -> syn::Result<Option<String>> {
-    if input.peek(Ident) {
+/// The `db = name` and `role = "name"` prefixes of a macro's arguments.
+type Prefixes = (Option<String>, Option<String>);
+
+/// `[db = name,] [role = "name",]` (in either order) from the macro
+/// arguments, as the macro's `parse_prefixes` reads them.
+fn parse_prefixes(input: ParseStream<'_>) -> syn::Result<Prefixes> {
+    let (mut db, mut role) = (None, None);
+    while input.peek(Ident) {
         let fork = input.fork();
         let ident: Ident = fork.parse()?;
-        if ident == "db" && fork.peek(Token![=]) {
+        if !fork.peek(Token![=]) {
+            break;
+        }
+        if ident == "db" {
             let _: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
             let name: Ident = input.parse()?;
             input.parse::<Token![,]>()?;
-            return Ok(Some(name.to_string()));
+            db = Some(name.to_string());
+        } else if ident == "role" {
+            let _: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let name: LitStr = input.parse()?;
+            input.parse::<Token![,]>()?;
+            role = Some(name.value());
+        } else {
+            break;
         }
     }
-    Ok(None)
+    Ok((db, role))
 }
 
-/// `(db, sql, rest)` from `[db = name,] executor, "SQL", …`: the literal,
-/// and the tokens after it. The literal is an error when the argument is not
-/// a string literal: the macro rejects it.
+/// `(prefixes, sql, rest)` from `[db = name,] [role = "name",] executor,
+/// "SQL", …`: the literal, and the tokens after it. The literal is an error
+/// when the argument is not a string literal: the macro rejects it.
 fn parse_sql_arguments(
     tokens: TokenStream,
-) -> Option<(Option<String>, syn::Result<LitStr>, TokenStream)> {
+) -> Option<(Prefixes, syn::Result<LitStr>, TokenStream)> {
     let parser =
-        |input: ParseStream<'_>| -> syn::Result<(Option<String>, syn::Result<LitStr>, TokenStream)> {
-            let db = parse_db(input)?;
+        |input: ParseStream<'_>| -> syn::Result<(Prefixes, syn::Result<LitStr>, TokenStream)> {
+            let prefixes = parse_prefixes(input)?;
             let _: Expr = input.parse()?;
             input.parse::<Token![,]>()?;
             let sql = input.parse::<LitStr>();
             // Whatever follows the literal: the `sql!` bindings.
             let rest: TokenStream = input.parse()?;
-            Ok((db, sql, rest))
+            Ok((prefixes, sql, rest))
         };
     parser.parse2(tokens).ok()
 }
@@ -697,17 +717,17 @@ fn binding_value(expr: &Expr) -> BindingValue {
     BindingValue::Variable(name)
 }
 
-/// `(db, target)` from `[db = name,] executor, "table (columns)", …`, the
-/// same grammar as the macro's `CopyInInput`.
-fn parse_copy_in_arguments(tokens: TokenStream) -> Option<(Option<String>, LitStr)> {
-    let parser = |input: ParseStream<'_>| -> syn::Result<(Option<String>, LitStr)> {
-        let db = parse_db(input)?;
+/// `(prefixes, target)` from `[db = name,] [role = "name",] executor,
+/// "table (columns)", …`, the same grammar as the macro's `CopyInInput`.
+fn parse_copy_in_arguments(tokens: TokenStream) -> Option<(Prefixes, LitStr)> {
+    let parser = |input: ParseStream<'_>| -> syn::Result<(Prefixes, LitStr)> {
+        let prefixes = parse_prefixes(input)?;
         let _: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
         let target: LitStr = input.parse()?;
         // The source and its `{ fields }` are irrelevant here.
         let _: TokenStream = input.parse()?;
-        Ok((db, target))
+        Ok((prefixes, target))
     };
     parser.parse2(tokens).ok()
 }
@@ -909,16 +929,36 @@ fn main() {
     let _ = sql!(db = other, pool, "SELECT 3");
     assert!(sql!(pool, "SELECT 4") == sql!(pool, "SELECT 5"));
     let _ = vec![sql!(pool, "SELECT 6")];
+    let _ = sql!(role = "app", pool, "SELECT 7");
+    let _ = sql!(role = "app", db = other, pool, "SELECT 8");
 }
 "#;
         let found = queries(source);
         let db: Vec<Option<&str>> = found.iter().map(|query| query.db.as_deref()).collect();
+        let role: Vec<Option<&str>> = found.iter().map(|query| query.role.as_deref()).collect();
         let sql: Vec<&str> = found.iter().map(|query| query.text.as_str()).collect();
-        assert_eq!(db, [None, None, Some("other"), None, None, None]);
+        assert_eq!(
+            db,
+            [
+                None,
+                None,
+                Some("other"),
+                None,
+                None,
+                None,
+                None,
+                Some("other")
+            ]
+        );
+        assert_eq!(
+            role,
+            [None, None, None, None, None, None, Some("app"), Some("app")]
+        );
         assert_eq!(
             sql,
             [
-                "SELECT 1", "SELECT 2", "SELECT 3", "SELECT 4", "SELECT 5", "SELECT 6"
+                "SELECT 1", "SELECT 2", "SELECT 3", "SELECT 4", "SELECT 5", "SELECT 6", "SELECT 7",
+                "SELECT 8"
             ]
         );
     }
