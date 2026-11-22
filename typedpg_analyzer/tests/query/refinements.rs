@@ -1907,3 +1907,196 @@ fn ordered_against_any_or_all_elements() {
         &[("d", Some("(0, )")), ("f", Some("(, 730]"))],
     );
 }
+
+// ── Record fields ───────────────────────────────────────────────────────────
+
+/// The fields of the record `ty` is (or, of an array, its elements are).
+fn record_fields_of(mut ty: &Type) -> &[RecordField] {
+    loop {
+        match ty {
+            Type::Domain { base, .. } => ty = base,
+            Type::Array { element, .. } => ty = element,
+            Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => return fields,
+            _ => return &[],
+        }
+    }
+}
+
+/// A field's (name, value set).
+type FieldValues<'a> = (&'a str, Option<&'a [&'a str]>);
+type OwnedFieldValues<'a> = (&'a str, Option<Vec<&'a str>>);
+
+/// Each column's (name, each of its record's fields' (name, value set)).
+#[track_caller]
+fn assert_field_values(db: &PgCatalog, sql: &str, expected: &[(&str, &[FieldValues<'_>])]) {
+    let s = db.analyze(sql).unwrap();
+    let actual: Vec<(&str, Vec<OwnedFieldValues<'_>>)> = s
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                record_fields_of(&c.pg_type)
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name.as_str(),
+                            f.refinement
+                                .values
+                                .as_ref()
+                                .map(|vs| vs.iter().map(String::as_str).collect()),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Vec<OwnedFieldValues<'_>>)> = expected
+        .iter()
+        .map(|(n, fs)| {
+            (
+                *n,
+                fs.iter()
+                    .map(|(f, v)| (*f, v.map(<[&str]>::to_vec)))
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected, "field value sets mismatch for `{sql}`");
+}
+
+#[test]
+fn row_constructors_refine_each_field_by_its_expression() {
+    let db = values_setup();
+    assert_field_values(
+        &db,
+        "SELECT ROW('a', kind, n, free) AS r,
+                ROW(CASE WHEN n = 1 THEN 'x' ELSE 'y' END, d) AS c
+         FROM v",
+        &[
+            (
+                "r",
+                &[
+                    // An `unknown` field: the literal as written.
+                    ("f1", Some(&["a"])),
+                    ("f2", Some(&["a", "b"])),
+                    ("f3", Some(&["1", "2"])),
+                    ("f4", None),
+                ],
+            ),
+            ("c", &[("f1", Some(&["x", "y"])), ("f2", Some(&["a", "b"]))]),
+        ],
+    );
+    // The query's conditions hold of the row's values too.
+    assert_field_values(
+        &db,
+        "SELECT ROW(kind, n) AS r FROM v WHERE kind = 'a' AND n <> 1",
+        &[("r", &[("f1", Some(&["a"])), ("f2", Some(&["2"]))])],
+    );
+    // A nested record's fields, and an array field's elements.
+    let s = db
+        .analyze("SELECT ROW(ROW(kind), ARRAY[n]) AS r FROM v")
+        .unwrap();
+    let [outer, array] = record_fields_of(&s.columns[0].pg_type) else {
+        panic!("{:?}", s.columns[0].pg_type);
+    };
+    let [inner] = record_fields_of(&outer.ty) else {
+        panic!("{:?}", outer.ty);
+    };
+    assert_eq!(
+        inner.refinement.values,
+        Some(["a", "b"].map(str::to_owned).into())
+    );
+    assert_eq!(
+        array.elem_refinement.values,
+        Some(["1", "2"].map(str::to_owned).into())
+    );
+}
+
+#[test]
+fn field_values_travel_through_queries() {
+    let db = values_setup();
+    assert_field_values(
+        &db,
+        "SELECT ROW('a') AS r UNION ALL SELECT ROW('b')",
+        &[("r", &[("f1", Some(&["a", "b"]))])],
+    );
+    assert_field_values(
+        &db,
+        "SELECT ROW(kind) AS r FROM v UNION ALL SELECT ROW(free) FROM v",
+        &[("r", &[("f1", None)])],
+    );
+    assert_field_values(
+        &db,
+        "WITH c AS (SELECT ROW(kind, n) AS r FROM v) SELECT r FROM c",
+        &[("r", &[("f1", Some(&["a", "b"])), ("f2", Some(&["1", "2"]))])],
+    );
+    assert_field_values(
+        &db,
+        "SELECT r FROM (SELECT ROW(kind) AS r FROM v WHERE kind = 'b') s",
+        &[("r", &[("f1", Some(&["b"]))])],
+    );
+}
+
+#[test]
+fn a_whole_row_reference_has_its_columns_values() {
+    let db = values_setup();
+    assert_field_values(
+        &db,
+        "SELECT w FROM v AS w WHERE kind = 'a' AND n = 2",
+        &[(
+            "w",
+            &[
+                ("id", None),
+                ("kind", Some(&["a"])),
+                ("m", Some(&["happy", "ok", "sad"])),
+                ("n", Some(&["2"])),
+                ("flag", Some(&["false", "true"])),
+                ("free", None),
+                ("padded", None),
+                ("amount", None),
+                ("d", Some(&["a", "b"])),
+                ("e", Some(&["a"])),
+            ],
+        )],
+    );
+    assert_field_values(
+        &db,
+        "SELECT s FROM (SELECT kind, n, free FROM v) s",
+        &[(
+            "s",
+            &[
+                ("kind", Some(&["a", "b"])),
+                ("n", Some(&["1", "2"])),
+                ("free", None),
+            ],
+        )],
+    );
+}
+
+#[test]
+fn a_composite_types_fields_have_their_domains_values() {
+    let mut db = values_setup();
+    db.apply_sql(
+        "CREATE TYPE pair AS (k ab, m mood, x int, tags ab[]);
+         CREATE TABLE cp (p pair NOT NULL, ps pair[]);",
+    )
+    .unwrap();
+    let fields: &[FieldValues<'_>] = &[
+        ("k", Some(&["a", "b"])),
+        ("m", None),
+        ("x", None),
+        ("tags", None),
+    ];
+    assert_field_values(
+        &db,
+        "SELECT p, ps, ROW('a', 'ok', 1, '{a}')::pair AS c FROM cp",
+        &[("p", fields), ("ps", fields), ("c", fields)],
+    );
+    let s = db.analyze("SELECT p FROM cp").unwrap();
+    let tags = &record_fields_of(&s.columns[0].pg_type)[3];
+    assert_eq!(
+        tags.elem_refinement.values,
+        Some(["a", "b"].map(str::to_owned).into())
+    );
+}

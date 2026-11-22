@@ -931,7 +931,7 @@ fn union_keeps_a_shape_both_arms_agree_on() {
         )
         .unwrap();
     assert_eq!(
-        col(&s, "r").pg_type,
+        without_field_refinements(col(&s, "r").pg_type.clone()),
         anon_record(vec![rf("f1", int4()), rfn("f2", text())])
     );
     // PG reads the shape off the left arm (`expandRecordVariable`), so a
@@ -1189,7 +1189,7 @@ fn deep_nested_row_indirection_is_rejected() {
         .analyze("SELECT (ROW(1::int4, ROW('a'::text, 2::int4))).f2 AS r")
         .unwrap();
     assert_eq!(
-        col(&s, "r").pg_type,
+        without_field_refinements(col(&s, "r").pg_type.clone()),
         anon_record(vec![rf("f1", text()), rf("f2", int4())])
     );
 }
@@ -1567,7 +1567,7 @@ fn nested_anonymous_records_via_subquery_pipeline_is_rejected() {
         .analyze("SELECT (t.r).f2 AS x FROM (SELECT ROW(1::int4, ROW('a'::text, 2::int4)) AS r) t")
         .unwrap();
     assert_eq!(
-        col(&s, "x").pg_type,
+        without_field_refinements(col(&s, "x").pg_type.clone()),
         anon_record(vec![rf("f1", text()), rf("f2", int4())])
     );
 }

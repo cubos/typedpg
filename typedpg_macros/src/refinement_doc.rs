@@ -1,12 +1,15 @@
 //! The doc comment on a generated output field saying what the analysis
 //! knows of its values beyond their type: `/// One of "a", "b".`,
 //! `/// Between 1 and 10.`, `/// From 2020-01-01 to 2030-12-31.`,
-//! `/// Never infinite.` — and, of an array, of its elements. The field's
-//! Rust type is never narrowed: the comment only documents.
+//! `/// Never infinite.` — and, of an array, of its elements. The same on
+//! the fields of a generated record struct, of each record field. The
+//! field's Rust type is never narrowed: the comment only documents.
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use typedpg_analyzer::{AnalyzedColumn, OrdKind, OrdPoint, OrdRange, Refinement, Type};
+use typedpg_analyzer::{
+    AnalyzedColumn, OrdKind, OrdPoint, OrdRange, RecordField, Refinement, Type,
+};
 
 /// The `#[doc]` attributes for `col`'s output field (none when nothing is
 /// known).
@@ -15,15 +18,28 @@ pub(crate) fn field_doc(col: &AnalyzedColumn) -> TokenStream {
     quote! { #( #[doc = #lines] )* }
 }
 
+/// The `#[doc]` attributes for the field of a generated record struct
+/// standing for `field` (none when nothing is known).
+pub(crate) fn record_field_doc(field: &RecordField) -> TokenStream {
+    let lines = value_lines(&field.ty, &field.refinement, &field.elem_refinement);
+    quote! { #( #[doc = #lines] )* }
+}
+
 /// The doc comment's lines, each a sentence.
 pub(crate) fn doc_lines(col: &AnalyzedColumn) -> Vec<String> {
-    let mut lines: Vec<String> = facts(&col.pg_type, &col.refinement)
+    value_lines(&col.pg_type, &col.refinement, &col.elem_refinement)
+}
+
+/// The lines saying what a value of `ty` is known to be: `refinement`, and
+/// of an array, `elements` of each element.
+fn value_lines(ty: &Type, refinement: &Refinement, elements: &Refinement) -> Vec<String> {
+    let mut lines: Vec<String> = facts(ty, refinement)
         .into_iter()
         .map(|f| format!("{}.", capitalized(&f)))
         .collect();
-    if let Some(element) = array_element(&col.pg_type) {
+    if let Some(element) = array_element(ty) {
         lines.extend(
-            facts(element, &col.elem_refinement)
+            facts(element, elements)
                 .into_iter()
                 .map(|f| format!("Each element is {f}.")),
         );
@@ -45,7 +61,7 @@ fn facts(ty: &Type, refinement: &Refinement) -> Vec<String> {
         };
         if !whole {
             let quoted = matches!(inner, Type::Enum { .. })
-                || matches!(inner, Type::Basic { name, .. } if name == "text" || name == "varchar");
+                || matches!(inner, Type::Basic { name, .. } if matches!(name.as_str(), "text" | "varchar" | "unknown"));
             let mut values: Vec<&String> = values.iter().collect();
             // Integers in numeric order.
             values.sort_by_key(|v| (v.parse::<i128>().ok(), (*v).clone()));
@@ -288,6 +304,30 @@ mod tests {
                     lines(&["Each element is from 2020-01-01 to 2030-12-31."])
                 ),
                 ("c".into(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn record_fields_are_documented() {
+        let a = catalog()
+            .analyze("SELECT ROW(kind, n, free, 'x', array_agg(kind)) AS r FROM t GROUP BY kind, n, free")
+            .unwrap();
+        let Type::AnonymousRecord { fields } = &a.columns[0].pg_type else {
+            panic!("not a record: {:?}", a.columns[0].pg_type);
+        };
+        let docs: Vec<String> = fields
+            .iter()
+            .map(|f| record_field_doc(f).to_string())
+            .collect();
+        assert_eq!(
+            docs,
+            vec![
+                r#"# [doc = "One of \"a\", \"b\"."]"#.to_owned(),
+                r#"# [doc = "Between 1 and 100."]"#.to_owned(),
+                String::new(),
+                r#"# [doc = "Always \"x\"."]"#.to_owned(),
+                r#"# [doc = "Each element is one of \"a\", \"b\"."]"#.to_owned(),
             ]
         );
     }

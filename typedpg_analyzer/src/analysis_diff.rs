@@ -264,7 +264,7 @@ fn columns_differ(
             });
         }
         let subject = format!("column \"{}\"", a.name);
-        if a.pg_type != b.pg_type {
+        if a.pg_type.without_refinements() != b.pg_type.without_refinements() {
             return Some(AnalysisDifference {
                 subject,
                 first: a.pg_type.describe(),
@@ -285,8 +285,55 @@ fn columns_differ(
                 second: refinement(&b.refinement),
             });
         }
+        if a.elem_refinement != b.elem_refinement {
+            return Some(AnalysisDifference {
+                subject: format!("the set of values of {subject}'s elements"),
+                first: refinement(&a.elem_refinement),
+                second: refinement(&b.elem_refinement),
+            });
+        }
+        if a.pg_type != b.pg_type {
+            return Some(AnalysisDifference {
+                subject: format!("the set of values of {subject}'s fields"),
+                first: field_refinements(&a.pg_type),
+                second: field_refinements(&b.pg_type),
+            });
+        }
     }
     None
+}
+
+/// What every non-NULL value of each field of the record `ty` is (or, of
+/// an array, its elements are), nested records in braces: `{ a: one of x,
+/// y; b: any value }`.
+fn field_refinements(ty: &crate::Type) -> String {
+    use crate::Type;
+    match ty {
+        Type::Domain { base, .. } => field_refinements(base),
+        Type::Array { element, .. } => field_refinements(element),
+        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => {
+            let listed: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    let mut out = format!("{}: {}", f.name, refinement(&f.refinement));
+                    if f.elem_refinement != crate::Refinement::NONE {
+                        out.push_str(&format!(
+                            ", each element {}",
+                            refinement(&f.elem_refinement)
+                        ));
+                    }
+                    let nested = field_refinements(&f.ty);
+                    if !nested.is_empty() {
+                        out.push(' ');
+                        out.push_str(&nested);
+                    }
+                    out
+                })
+                .collect();
+            format!("{{ {} }}", listed.join("; "))
+        }
+        Type::Basic { .. } | Type::Enum { .. } | Type::Range { .. } => String::new(),
+    }
 }
 
 fn nullability(nullable: bool) -> String {
@@ -393,5 +440,44 @@ mod tests {
         assert_eq!(d.subject, "column \"x\"'s nullability");
         assert_eq!(d.first, "not nullable");
         assert_eq!(d.second, "nullable");
+    }
+
+    #[test]
+    fn element_and_field_value_differences_are_reported() {
+        let mut c = PgCatalog::new().unwrap();
+        c.apply_migration(
+            "0001.sql",
+            "CREATE ROLE vals_role_a;
+             CREATE ROLE vals_role_b;
+             CREATE SCHEMA alternate;
+             CREATE TABLE public.t (x text NOT NULL CHECK (x IN ('a', 'b')));
+             CREATE TABLE alternate.t (x text NOT NULL CHECK (x IN ('a')));
+             GRANT USAGE ON SCHEMA alternate TO vals_role_a;
+             GRANT SELECT ON public.t TO vals_role_a, vals_role_b;
+             GRANT SELECT ON alternate.t TO vals_role_a;
+             ALTER ROLE vals_role_a SET search_path = alternate, public;
+             ALTER ROLE vals_role_b SET search_path = public;",
+        )
+        .unwrap();
+        let differ = |sql: &str| {
+            let a = c.analyze_as(sql, "vals_role_a").unwrap();
+            let b = c.analyze_as(sql, "vals_role_b").unwrap();
+            first_difference(&a, &b).expect("x has other values for one role")
+        };
+        let d = differ("SELECT ARRAY[x] AS r FROM t");
+        assert_eq!(d.subject, "the set of values of column \"r\"'s elements");
+        assert_eq!(
+            (d.first.as_str(), d.second.as_str()),
+            ("one of a", "one of a, b")
+        );
+        let d = differ("SELECT ROW(x, 1) AS r FROM t");
+        assert_eq!(d.subject, "the set of values of column \"r\"'s fields");
+        assert_eq!(
+            (d.first.as_str(), d.second.as_str()),
+            (
+                "{ f1: one of a; f2: one of 1 }",
+                "{ f1: one of a, b; f2: one of 1 }"
+            )
+        );
     }
 }

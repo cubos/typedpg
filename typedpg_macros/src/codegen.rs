@@ -864,7 +864,8 @@ fn emit_one_record(
         } else {
             mapping.rust_type.clone()
         };
-        struct_fields.extend(quote! { pub #fname: #field_ty, });
+        let doc = crate::refinement_doc::record_field_doc(field);
+        struct_fields.extend(quote! { #doc pub #fname: #field_ty, });
 
         let decode = decode_value(
             &mapping,

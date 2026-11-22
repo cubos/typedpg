@@ -398,10 +398,15 @@ impl Soundness {
                         Some(bytes) => inner_violation(&col.pg_type, bytes)
                             .map(|p| (Unsound::Nullability, p))
                             .or_else(|| {
-                                refinement_violation(col, bytes).map(|p| (Unsound::Refinement, p))
-                            })
-                            .or_else(|| {
-                                elem_refinement_violation(col, bytes)
+                                refinement_violation(&col.pg_type, &col.refinement, bytes)
+                                    .or_else(|| {
+                                        elem_refinement_violation(
+                                            &col.pg_type,
+                                            &col.elem_refinement,
+                                            bytes,
+                                        )
+                                    })
+                                    .or_else(|| field_refinement_violation(&col.pg_type, bytes))
                                     .map(|p| (Unsound::Refinement, p))
                             }),
                     };
@@ -866,9 +871,14 @@ fn has_inner_promise(ty: &Type) -> bool {
             element,
             element_nullable,
         } => *element_nullable == Some(false) || has_inner_promise(element),
-        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => fields
-            .iter()
-            .any(|f| !f.nullable || has_inner_promise(&f.ty)),
+        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => {
+            fields.iter().any(|f| {
+                !f.nullable
+                    || f.refinement != crate::refine::Refinement::NONE
+                    || f.elem_refinement != crate::refine::Refinement::NONE
+                    || has_inner_promise(&f.ty)
+            })
+        }
         Type::Basic { .. } | Type::Enum { .. } | Type::Range { .. } => false,
     }
 }
@@ -938,14 +948,17 @@ fn is_executable(sql: &str) -> bool {
     )
 }
 
-/// What the binary value `bytes` of column `col` isn't of what its
-/// refinement says it is.
-fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<String> {
-    let mut ty = &col.pg_type;
+/// What the binary value `bytes` of type `ty` isn't of what `refinement`
+/// says it is.
+fn refinement_violation(
+    mut ty: &Type,
+    refinement: &crate::refine::Refinement,
+    bytes: &[u8],
+) -> Option<String> {
     while let Type::Domain { base, .. } = ty {
         ty = base;
     }
-    if let Some(values) = &col.refinement.values {
+    if let Some(values) = &refinement.values {
         // `int2send` / … big-endian, `boolsend` a byte, `textsend` /
         // `enum_send` the text.
         let printed = match ty {
@@ -955,7 +968,9 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
                 "int4" => Some(i32::from_be_bytes(bytes.try_into().ok()?).to_string()),
                 "int8" => Some(i64::from_be_bytes(bytes.try_into().ok()?).to_string()),
                 "bool" => Some((bytes.first()? != &0).to_string()),
-                "text" | "varchar" => std::str::from_utf8(bytes).ok().map(str::to_owned),
+                "text" | "varchar" | "unknown" => {
+                    std::str::from_utf8(bytes).ok().map(str::to_owned)
+                }
                 _ => None,
             },
             _ => None,
@@ -971,7 +986,7 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
     let Type::Basic { schema, name, .. } = ty else {
         return None;
     };
-    if let Some(range) = &col.refinement.range
+    if let Some(range) = &refinement.range
         && schema == "pg_catalog"
     {
         let int: Option<i128> = match name.as_str() {
@@ -988,7 +1003,7 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
             ));
         }
     }
-    if let Some(bounds) = &col.refinement.bounds
+    if let Some(bounds) = &refinement.bounds
         && schema == "pg_catalog"
         && let Some(v) = ordered_point(name, bytes)
         && !bounds.contains(v)
@@ -997,7 +1012,7 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
             "the value is {v:?}, out of {bounds:?} (refinement: bounds)"
         ));
     }
-    if !col.refinement.finite || schema != "pg_catalog" {
+    if !refinement.finite || schema != "pg_catalog" {
         return None;
     }
     // `date_send` / `timestamp_send` / `interval_send`: the infinities are
@@ -1023,35 +1038,66 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
     infinite.then(|| "the value is infinite (refinement: finite)".to_string())
 }
 
-/// What an element of the binary array `bytes` of column `col` isn't of
-/// what its element refinement says every non-NULL element is (at any
-/// depth: the elements of a multidimensional array are all listed).
-fn elem_refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<String> {
-    if col.elem_refinement == crate::refine::Refinement::NONE {
+/// What an element of the binary array `bytes` of type `ty` isn't of what
+/// `elements` says every non-NULL element is (at any depth: the elements
+/// of a multidimensional array are all listed).
+fn elem_refinement_violation(
+    mut ty: &Type,
+    elements: &crate::refine::Refinement,
+    bytes: &[u8],
+) -> Option<String> {
+    if *elements == crate::refine::Refinement::NONE {
         return None;
     }
-    let mut ty = &col.pg_type;
     while let Type::Domain { base, .. } = ty {
         ty = base;
     }
     let Type::Array { element, .. } = ty else {
         return None;
     };
-    // The element read as a column of the element type so refined.
-    let as_column = crate::AnalyzedColumn {
-        name: col.name.clone(),
-        pg_type: (**element).clone(),
-        nullable: true,
-        refinement: col.elem_refinement.clone(),
-        elem_refinement: crate::refine::Refinement::NONE,
-    };
     array_elements(bytes)?
         .into_iter()
         .enumerate()
         .find_map(|(k, elem)| {
-            let found = refinement_violation(&as_column, elem?)?;
+            let found = refinement_violation(element, elements, elem?)?;
             Some(format!("element [{}]: {found} (elem_refinement)", k + 1))
         })
+}
+
+/// What a field of a record inside the binary value `bytes` of type `ty`
+/// (the value itself, an array's element, a field's record, at any depth)
+/// isn't of what the field's refinements say it is, as a path from the
+/// value (`element [2] field "a": …`).
+fn field_refinement_violation(ty: &Type, bytes: &[u8]) -> Option<String> {
+    match ty {
+        Type::Domain { base, .. } => field_refinement_violation(base, bytes),
+        Type::Array { element, .. } => {
+            if !has_inner_promise(element) {
+                return None;
+            }
+            array_elements(bytes)?
+                .into_iter()
+                .enumerate()
+                .find_map(|(k, elem)| {
+                    let found = field_refinement_violation(element, elem?)?;
+                    Some(format!("element [{}] {found}", k + 1))
+                })
+        }
+        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => {
+            let values = record_fields(bytes)?;
+            if values.len() != fields.len() {
+                return None;
+            }
+            fields.iter().zip(values).find_map(|(field, value)| {
+                let b = value?;
+                let found = refinement_violation(&field.ty, &field.refinement, b)
+                    .or_else(|| elem_refinement_violation(&field.ty, &field.elem_refinement, b))
+                    .or_else(|| field_refinement_violation(&field.ty, b))?;
+                Some(format!("field \"{}\": {found}", field.name))
+            })
+        }
+        Type::Basic { .. } | Type::Enum { .. } | Type::Range { .. } => None,
+    }
 }
 
 /// Find a NULL inside the binary value `bytes` of type `ty` where `ty`
