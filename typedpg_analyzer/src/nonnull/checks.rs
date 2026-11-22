@@ -381,6 +381,7 @@ impl Space {
                 Num::parse(&l.text).map(|n| Value::Ord(OrdPoint::Finite(n)))
             }
             (SpaceKind::Ord(kind), LitKind::String) => kind.read(&l.text).map(Value::Ord),
+            (SpaceKind::Ord(kind), LitKind::Point(_)) => l.as_point(kind).map(Value::Ord),
             (SpaceKind::Bool, LitKind::Boolean) => Some(Value::Bool(l.text == "true")),
             (SpaceKind::Str, LitKind::String) => Some(Value::Str(l.text.clone())),
             _ => None,

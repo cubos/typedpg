@@ -677,6 +677,16 @@ mod tests {
     }
 
     #[test]
+    fn equal_to_any_of_an_array_is_one_of_its_elements() {
+        let g = ok(
+            "SELECT name, big FROM users WHERE name = ANY(ARRAY['a', 'b']) \
+                    AND big = ANY('{1,2}')",
+        );
+        assert!(g.types.contains(r#"name: "a" | "b";"#), "{}", g.types);
+        assert!(g.types.contains("big: 1n | 2n;"), "{}", g.types);
+    }
+
+    #[test]
     fn spreads() {
         let g = ok(
             "INSERT INTO users (id, name, big, tags) VALUES $..rows { id, name, big, tags } \

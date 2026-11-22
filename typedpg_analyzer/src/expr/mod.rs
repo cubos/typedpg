@@ -103,6 +103,14 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record what the elements of the array the `op ANY / ALL (array)` at
+    /// `location` reads are.
+    pub fn note_array_elements(&self, location: i32, elems: crate::nonnull::ArrayElements) {
+        if let Some(log) = self.strict_log {
+            log.note_array_elements(location, elems);
+        }
+    }
+
     /// Record that the plain function call at `location` resolved to
     /// `proc`.
     pub fn note_call(&self, location: i32, proc: crate::oid::PgProcOid) {
