@@ -296,7 +296,7 @@ impl Refinement {
 
     /// Of a value that is both (a column CHECKed `isfinite` whose domain
     /// says more): what either is.
-    pub(crate) fn and(&self, other: &Refinement) -> Refinement {
+    pub fn and(&self, other: &Refinement) -> Refinement {
         Refinement {
             finite: self.finite || other.finite,
             values: match (&self.values, &other.values) {

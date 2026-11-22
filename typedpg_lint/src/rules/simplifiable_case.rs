@@ -90,7 +90,7 @@ fn simplifiable(ctx: &Ctx<'_>, case: &CaseExpr, names_column: bool, out: &mut Ve
             return;
         };
         let (cond_end, _) = scan_until(ctx, cond_start, |text| text.eq_ignore_ascii_case("THEN"));
-        let written = &ctx.sql[cond_start..cond_end];
+        let written = ctx.written(cond_start..cond_end);
         let not_null = ctx.view.case_condition_not_null(when.location) == Some(true);
         let fix = if not_null && !names_column && cond_end > cond_start {
             let text = if matches!(condition, N::ColumnRef(_) | N::FuncCall(_) | N::AConst(_)) {
@@ -175,8 +175,8 @@ fn coalesce(
         }
     }
     let result_text = text_until(ctx, result_start, "ELSE");
-    let x = &ctx.sql[tested_text];
-    let y = &ctx.sql[result_text];
+    let x = ctx.written(tested_text);
+    let y = ctx.written(result_text);
     let fix = if case.names_column {
         Vec::new()
     } else {
@@ -238,6 +238,11 @@ mod tests {
                 "SELECT CASE WHEN $1::text IS NULL THEN 'a' ELSE $1::text END AS v",
                 "SELECT COALESCE($1::text, 'a') AS v",
             ),
+            // Named parameters are written back as named.
+            (
+                "SELECT CASE WHEN $v::text IS NULL THEN $d::text ELSE $v::text END AS v",
+                "SELECT COALESCE($v::text, $d::text) AS v",
+            ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
@@ -256,6 +261,12 @@ mod tests {
             (
                 "SELECT id FROM users WHERE CASE WHEN email = 'x' THEN true ELSE false END",
                 "SELECT id FROM users WHERE (email = 'x')",
+            ),
+            // The WHERE proves the condition non-NULL in the select list.
+            (
+                "SELECT CASE WHEN name = 'x' THEN true ELSE false END AS b FROM users \
+                 WHERE name IS NOT NULL",
+                "SELECT (name = 'x') AS b FROM users WHERE name IS NOT NULL",
             ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
@@ -277,6 +288,26 @@ mod tests {
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(findings[0].fix.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_help_quotes_parameters_and_spreads_as_written() {
+        let db = catalog();
+        for (sql, help) in [
+            (
+                "SELECT CASE WHEN id = $id THEN true ELSE false END AS b FROM users",
+                "write (id = $id) IS TRUE: the CASE is false where the condition is NULL",
+            ),
+            (
+                "SELECT CASE WHEN id IN $..ids THEN true ELSE false END AS b FROM users",
+                "write (id IN $..ids) IS TRUE: the CASE is false where the condition is NULL",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(findings[0].help.as_deref(), Some(help), "{sql}");
             assert!(findings[0].fix.is_empty(), "{sql}");
         }
     }

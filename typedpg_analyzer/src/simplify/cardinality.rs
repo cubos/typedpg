@@ -112,6 +112,68 @@ pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) ->
     dedup::order_ties(&ctx, &dedup::cte_names(&view.tree), select)
 }
 
+/// What each `ORDER BY` item of `select` — a node borrowed from `view.tree`
+/// at any nesting depth — sorts by (see [`dedup::OrderKey`]). `None` for a
+/// query with spreads, or a FROM clause the proof can't see through.
+pub fn order_keys(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    select: &SelectStmt,
+) -> Option<Vec<dedup::OrderKey>> {
+    if !view.analyzed.spreads.is_empty() {
+        return None;
+    }
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    dedup::order_keys(&ctx, &dedup::cte_names(&view.tree), select)
+}
+
+/// The fewest leading `ORDER BY` items of `select` that already determine
+/// a unique row, when fewer than all of them do ([`order_ties`] proves the
+/// prefix unique): the items after them can't order any two rows. `None`
+/// for a query with spreads.
+pub fn unique_order_prefix(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    select: &SelectStmt,
+) -> Option<usize> {
+    if !view.analyzed.spreads.is_empty() {
+        return None;
+    }
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    dedup::unique_order_prefix(&ctx, &dedup::cte_names(&view.tree), select)
+}
+
+/// The positions of `select`'s `GROUP BY` items that are functionally
+/// dependent on the others, or pinned to one value by `WHERE`, and that
+/// PostgreSQL still accepts the query without (see
+/// [`dedup::redundant_group_keys`]). Empty for a query with spreads.
+pub fn redundant_group_keys(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    select: &SelectStmt,
+) -> Vec<usize> {
+    if !view.analyzed.spreads.is_empty() {
+        return Vec::new();
+    }
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    dedup::redundant_group_keys(&ctx, &dedup::cte_names(&view.tree), select)
+}
+
 /// Whether `select`, a node borrowed from `view.tree` at any nesting depth,
 /// provably yields at most one row per evaluation.
 ///

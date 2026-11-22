@@ -425,6 +425,7 @@ fn analyze_select_here(
             // evaluated after it, and reducing outer joins PG would reduce.
             let facts =
                 crate::nonnull::nonnullable(Some(where_clause), true, &scope, &log, snapshot);
+            crate::nonnull::note_settled_null_tests(where_clause, &scope, &log, snapshot);
             let own = crate::nonnull::own_aliases(&scope);
             // An EXISTS / LATERAL subquery hands what it proves of the levels
             // around it up (see `nonnull::capture_correlation`).
@@ -502,6 +503,9 @@ fn analyze_select_here(
         // omits (those groups are the ones HAVING drops).
         let facts = crate::nonnull::nonnullable(having.as_ref(), true, &scope, &log, snapshot)
             .restricted_to(&crate::nonnull::own_aliases(&scope));
+        if let Some(qual) = having.as_ref() {
+            crate::nonnull::note_settled_null_tests(qual, &scope, &log, snapshot);
+        }
         null_ctx.add_having_facts(facts);
         // What the groups left must hold: rows, non-NULL aggregated values.
         let facts = crate::having::having_facts(having.as_ref(), &scope, snapshot);

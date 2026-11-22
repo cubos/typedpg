@@ -12,8 +12,12 @@
 //! No fix is offered: every branch's result takes part in the `CASE`'s
 //! result type (`select_common_type`), so dropping one can change it, and
 //! what the dead branch was meant to do is for its author to decide.
-//! A simple `CASE x WHEN v …` compares `x` with each value and is not
-//! judged.
+//!
+//! A simple `CASE x WHEN v …` compares `x = v` — the operator resolved as
+//! the written comparison would be, after the same coercions — and its
+//! `WHEN`s are judged by what the analyzer knows there, as a searched
+//! `CASE WHEN x = v …` is; its values are no conditions, so the planner's
+//! folding of a condition is not asked.
 
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{CaseExpr, Node as N};
@@ -25,9 +29,7 @@ use crate::{Ctx, RawFinding};
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
-        if let NodeRef::CaseExpr(case) = node
-            && case.arg.is_none()
-        {
+        if let NodeRef::CaseExpr(case) = node {
             case_expr(ctx, case, &mut out);
         }
     }
@@ -43,6 +45,14 @@ fn case_expr(ctx: &Ctx<'_>, case: &CaseExpr, out: &mut Vec<RawFinding>) {
             _ => None,
         })
         .collect();
+    let simple = case.arg.is_some();
+    let never_matches = if simple {
+        "CASE branch is never taken: with the WHENs before it not taken, the CASE operand \
+         never equals its value"
+    } else {
+        "CASE branch is never taken: with the WHENs before it not taken, its condition is never \
+         true"
+    };
     for (i, when) in whens.iter().enumerate() {
         let Some(start) = location(when.location) else {
             return;
@@ -50,6 +60,7 @@ fn case_expr(ctx: &Ctx<'_>, case: &CaseExpr, out: &mut Vec<RawFinding>) {
         let decided = when
             .expr
             .as_ref()
+            .filter(|_| !simple)
             .and_then(|condition| condition_value(ctx, condition));
         let (value, never, after) = match decided {
             Some((value, reason)) => {
@@ -62,13 +73,9 @@ fn case_expr(ctx: &Ctx<'_>, case: &CaseExpr, out: &mut Vec<RawFinding>) {
             }
             // What the analyzer knows where the CASE is evaluated, with the
             // WHENs before this one not taken.
-            None if ctx.view.case_when_reached(when.location) == Some(false) => (
-                false,
-                "CASE branch is never taken: with the WHENs before it not taken, its condition \
-                 is never true"
-                    .to_owned(),
-                String::new(),
-            ),
+            None if ctx.view.case_when_reached(when.location) == Some(false) => {
+                (false, never_matches.to_owned(), String::new())
+            }
             None if ctx.view.case_when_passed(when.location) == Some(false) => (
                 true,
                 String::new(),
@@ -176,6 +183,45 @@ mod tests {
     }
 
     #[test]
+    fn the_where_decides_a_select_list_branch() {
+        let db = catalog();
+        for (sql, reported, because) in [
+            (
+                "SELECT CASE WHEN name = 'b' THEN 1 ELSE 2 END AS v FROM users WHERE name = 'a'",
+                "WHEN name = 'b' THEN 1",
+                "never taken: its condition is never true (`name` is always 'a' where this is \
+                 evaluated)",
+            ),
+            (
+                "SELECT CASE WHEN name = 'a' THEN 1 ELSE 2 END AS v FROM users WHERE name = 'a'",
+                "ELSE 2",
+                "after an always-true WHEN",
+            ),
+            (
+                "SELECT CASE WHEN name = 'a' THEN 1 WHEN name <> 'b' THEN 2 ELSE 3 END AS v \
+                 FROM users WHERE name IN ('a', 'b')",
+                "WHEN name <> 'b' THEN 2",
+                "with the WHENs before it not taken",
+            ),
+            (
+                "SELECT CASE WHEN name = 'a' THEN 1 WHEN name = 'b' THEN 2 ELSE 3 END AS v \
+                 FROM users WHERE name IN ('a', 'b')",
+                "ELSE 3",
+                "after this WHEN are never taken",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], reported, "{sql}");
+            assert!(
+                findings[0].message.contains(because),
+                "{sql}: {}",
+                findings[0].message
+            );
+        }
+    }
+
+    #[test]
     fn branches_that_may_be_taken_are_not_reported() {
         let db = catalog();
         for sql in [
@@ -204,6 +250,12 @@ mod tests {
                 "WHEN s = 'c' THEN 1",
                 "never taken: its condition is never true (`s` is always one of 'a', 'b' \
                  (CHECK constraint \"t_s_check\")",
+            ),
+            // The reason quotes a named parameter as written.
+            (
+                "SELECT CASE WHEN abs($d::int) < 0 THEN 1 ELSE 2 END FROM t",
+                "WHEN abs($d::int) < 0 THEN 1",
+                "(`abs($d::int)` is always at least 0 where this is evaluated)",
             ),
             (
                 "SELECT CASE WHEN s IN ('a', 'b') THEN 1 ELSE 2 END FROM t",
@@ -234,6 +286,74 @@ mod tests {
         for sql in [
             "SELECT CASE WHEN s = 'a' THEN 1 ELSE 2 END FROM t",
             "SELECT CASE WHEN id > 3 THEN 1 ELSE 2 END FROM t",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn a_simple_case_value_the_operand_never_equals_is_reported() {
+        let mut db = typedpg_analyzer::PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE t (
+                id int PRIMARY KEY,
+                s text NOT NULL CHECK (s IN ('a', 'b')),
+                n int CHECK (n BETWEEN 1 AND 3)
+             );
+             CREATE COLLATION nd (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+             CREATE TABLE u (s text COLLATE nd NOT NULL CHECK (s IN ('a', 'b')));",
+        )
+        .unwrap();
+        for (sql, reported, message) in [
+            (
+                "SELECT CASE s WHEN 'c' THEN 1 ELSE 2 END FROM t",
+                "WHEN 'c' THEN 1",
+                "CASE branch is never taken: with the WHENs before it not taken, the CASE \
+                 operand never equals its value",
+            ),
+            (
+                "SELECT CASE n WHEN 1 THEN 'x' WHEN 7 THEN 'y' END FROM t",
+                "WHEN 7 THEN 'y'",
+                "never equals its value",
+            ),
+            // The WHENs before it took the value.
+            (
+                "SELECT CASE s WHEN 'a' THEN 1 WHEN 'a' THEN 2 ELSE 3 END FROM t",
+                "WHEN 'a' THEN 2",
+                "never equals its value",
+            ),
+            (
+                "SELECT CASE s WHEN 'a' THEN 1 WHEN 'b' THEN 2 ELSE 3 END FROM t",
+                "ELSE 3",
+                "CASE branches after this WHEN are never taken",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], reported, "{sql}");
+            assert!(
+                findings[0].message.contains(message),
+                "{sql}: {}",
+                findings[0].message
+            );
+            assert!(findings[0].fix.is_empty());
+        }
+        for sql in [
+            "SELECT CASE s WHEN 'a' THEN 1 ELSE 2 END FROM t",
+            "SELECT CASE s WHEN 'a' THEN 1 WHEN 'b' THEN 2 END FROM t",
+            // A NULL n takes the ELSE.
+            "SELECT CASE n WHEN 1 THEN 'x' WHEN 2 THEN 'y' WHEN 3 THEN 'z' ELSE 'w' END FROM t",
+            // Compared under another collation, or as another type: the
+            // CHECK's values say nothing of that comparison.
+            "SELECT CASE s COLLATE \"C\" WHEN 'c' THEN 1 ELSE 2 END FROM t",
+            "SELECT CASE s WHEN 'c' COLLATE \"C\" THEN 1 ELSE 2 END FROM t",
+            "SELECT CASE s::varchar(1) WHEN 'c' THEN 1 ELSE 2 END FROM t",
+            // Under a nondeterministic collation `'A'` equals `'a'`.
+            "SELECT CASE s WHEN 'A' THEN 1 ELSE 2 END FROM u",
+            // Not a column.
+            "SELECT CASE id + 1 WHEN 0 THEN 1 ELSE 2 END FROM t",
+            "SELECT CASE $1::text WHEN 'c' THEN 1 ELSE 2 END FROM t",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");

@@ -69,6 +69,9 @@ fn analyze_insert_here(
 
     let tgt = resolve_insert_target(ins, relation, snapshot)?;
     let cte_scopes = build_insert_cte_scopes(ins, snapshot, params, outer_ctes)?;
+    let _write =
+        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Insert, tgt.oid);
+    crate::pg_catalog::note_relation_use(tgt.oid, 'a');
 
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
     // The rewriter later sees one target list entry per supplied column.
@@ -1135,6 +1138,18 @@ fn analyze_insert_values(
                     .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Domain)
             {
                 crate::privileges::note_domain_coercion(inferred.type_oid);
+            }
+            if let Some(tc) = target_col
+                && !tgt.discards(tc)
+            {
+                note_written(
+                    tgt.oid,
+                    &tc.attname,
+                    false,
+                    indirected,
+                    val.as_ref(),
+                    Some(&inferred),
+                );
             }
             row_written.push(match target_col {
                 _ if is_set_to_default(val.as_ref()) => None,
@@ -2346,6 +2361,30 @@ fn analyze_insert_select(
             }
         }
     }
+    for (i, c) in sel_cols.iter().enumerate() {
+        let Some(tc) = target_col_at(tgt, i) else {
+            continue;
+        };
+        if tgt.discards(tc) {
+            continue;
+        }
+        let indirected = tgt
+            .col_indirection
+            .get(i)
+            .is_some_and(|ind| !ind.is_empty());
+        let val = match direct_targets.get(i).and_then(|t| t.as_ref()) {
+            Some(ast::Node::ResTarget(rt)) => rt.val.as_ref(),
+            _ => None,
+        };
+        let value = expr::ExprType {
+            typmod: c.typmod,
+            refine: c.refine.clone(),
+            ..expr::ExprType::scalar(c.type_oid, c.nullable)
+        };
+        // A bare parameter is one only as the SELECT's direct output.
+        let val = val.filter(|v| matches!(v, ast::Node::ParamRef(_)));
+        note_written(tgt.oid, &tc.attname, false, indirected, val, Some(&value));
+    }
     // What each output column writes, once coerced to its column's type
     // (nothing known of a value stored inside its column).
     let written = sel_cols
@@ -2893,6 +2932,9 @@ fn analyze_update_here(
         .unwrap_or_default();
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
     // The columns the UPDATE writes.
+    let _write =
+        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Update, table_oid);
+    crate::pg_catalog::note_relation_use(table_oid, 'w');
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::UPDATE);
     crate::privileges::note_write(
         table_oid,
@@ -3174,6 +3216,7 @@ fn analyze_delete_here(
 
     let table_oid = table.oid;
     // transformDeleteStmt: the target requires DELETE.
+    crate::pg_catalog::note_relation_use(table_oid, 'd');
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
     crate::privileges::note_write(
         table_oid,
@@ -3475,6 +3518,9 @@ fn where_facts(
     old_as_is: bool,
     target_keeps: impl Fn(&str) -> bool,
 ) -> (crate::nonnull::Facts, crate::nonnull::Facts) {
+    if let Some(qual) = where_clause {
+        crate::nonnull::note_settled_null_tests(qual, ctx.scope, log, ctx.snapshot);
+    }
     let mut all = crate::nonnull::nonnullable(where_clause, true, ctx.scope, log, ctx.snapshot)
         .restricted_to(&crate::nonnull::own_aliases(ctx.scope));
     // RETURNING may read the row as rewritten (SET, triggers): no

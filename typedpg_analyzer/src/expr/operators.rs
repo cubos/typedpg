@@ -962,6 +962,12 @@ fn handle_any_all(
                 && ctx.coercion_is_strict(left_type, op.left_type_oid.unwrap_or(left_type))
                 && ctx.coercion_is_strict(elem, op.right_type_oid),
         );
+        crate::type_facts::note_operator_nonvolatile(
+            expr.location,
+            !(ctx.proc_may_vary(op.code)
+                || ctx.coercion_may_vary(left_type, op.left_type_oid.unwrap_or(left_type))
+                || ctx.coercion_may_vary(elem, op.right_type_oid)),
+        );
         op_nullable = operator_call_nullable(snapshot, &op_name, &op, Some(left_type), elem);
     }
 
@@ -1379,6 +1385,14 @@ fn infer_generic_binary_op(
                         .zip(op.left_type_oid)
                         .is_none_or(|(a, d)| ctx.coercion_is_strict(a, d))
                     && ctx.coercion_is_strict(right_oid_resolved, op.right_type_oid),
+            );
+            crate::type_facts::note_operator_nonvolatile(
+                expr.location,
+                !(ctx.proc_may_vary(op.code)
+                    || left_oid_resolved
+                        .zip(op.left_type_oid)
+                        .is_some_and(|(a, d)| ctx.coercion_may_vary(a, d))
+                    || ctx.coercion_may_vary(right_oid_resolved, op.right_type_oid)),
             );
             if ctx.strict_log.is_some() {
                 note_std_compare(expr.location, op_name, &op, &left, &right, ctx);

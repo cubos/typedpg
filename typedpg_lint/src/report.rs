@@ -112,6 +112,9 @@ pub struct Report {
     pub schemas: Vec<(String, UserObjectCounts)>,
     /// How long the run took, for the summary block.
     pub elapsed: Duration,
+    /// The configuration could not be read: [`Self::failures`] holds the
+    /// error, nothing was checked, and the run fails.
+    pub config_error: bool,
 }
 
 impl Report {
@@ -145,7 +148,8 @@ impl Report {
     /// Whether the run fails: any analysis or migration failure does, and
     /// so does any finding at or above the configured `fail_on` severity.
     pub fn fails(&self, options: &LintOptions) -> bool {
-        !self.failures.is_empty()
+        self.config_error
+            || !self.failures.is_empty()
             || self
                 .entries
                 .iter()
@@ -176,6 +180,13 @@ impl Report {
     /// The summary block printed to stderr: the counts, the elapsed time,
     /// the schema, and whether the run passed.
     pub fn summary_with(&self, options: &LintOptions, colors: bool) -> String {
+        if self.config_error {
+            return format!(
+                "typedpg lint: invalid configuration, nothing was checked\n  {} failed: the \
+                 configuration is invalid",
+                paint("1;31", "✖", colors)
+            );
+        }
         let count = |severity| {
             self.entries
                 .iter()
@@ -346,6 +357,7 @@ impl Report {
             rules.push(serde_json::json!({
                 "id": rule.name(),
                 "shortDescription": { "text": rule.description() },
+                "helpUri": rule.docs_url(),
                 "defaultConfiguration": {
                     "level": rule.default_level().map_or("none", sarif_level)
                 },
@@ -1099,6 +1111,7 @@ mod tests {
                 rule.description(),
                 "{rule}"
             );
+            assert_eq!(rule_json["helpUri"], rule.docs_url(), "{rule}");
             assert_eq!(
                 rule_json["defaultConfiguration"]["level"],
                 rule.default_level().map_or("none", sarif_level),
@@ -1461,6 +1474,31 @@ mod tests {
         }
         assert!(Format::from_name("xml").is_none());
         assert!("xml".parse::<Format>().is_err());
+    }
+
+    #[test]
+    fn a_configuration_error_fails_without_claiming_a_check() {
+        let report = Report {
+            failures: vec![Failure {
+                path: "Cargo.toml".to_owned(),
+                start: None,
+                message: "unknown key `bogus`".to_owned(),
+            }],
+            config_error: true,
+            ..Report::default()
+        };
+        assert!(report.fails(&LintOptions::default()));
+        assert_eq!(
+            report.summary(),
+            "typedpg lint: invalid configuration, nothing was checked\n  ✖ failed: the \
+             configuration is invalid"
+        );
+        // The SARIF run is not successful either.
+        let sarif: serde_json::Value = serde_json::from_str(&report.render(Format::Sarif)).unwrap();
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
     }
 
     #[test]

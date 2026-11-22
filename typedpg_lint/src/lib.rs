@@ -27,13 +27,13 @@ mod migrations;
 pub mod report;
 mod rules;
 
-pub use deployed::{DeployedQuery, Deployment, NewSchema, breaks_deployed_queries};
+pub use deployed::{DeployedKind, DeployedQuery, Deployment, NewSchema, breaks_deployed_queries};
 pub use ignore::IgnoreSet;
 pub use migrations::{
     LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
@@ -153,6 +153,20 @@ pub enum Rule {
     /// An `ORDER BY` whose keys can tie under `LIMIT` / `OFFSET` / `DISTINCT
     /// ON`: which of the tied rows come back is arbitrary.
     UnstableOrder,
+    /// `ORDER BY` keys that can't change the order: after keys that already
+    /// determine a unique row, pinned to a constant by `WHERE`, repeated, or
+    /// in a query or subquery whose order nothing observes.
+    RedundantOrderBy,
+    /// `GROUP BY` keys determined by the other keys (a unique key of their
+    /// table) or pinned to a constant by `WHERE`.
+    RedundantGroupBy,
+    /// `count(expr)` over a value that is never NULL: it is `count(*)`.
+    CountNotNull,
+    /// A comparison that wraps an indexed column in a cast, function or
+    /// arithmetic (or converts it implicitly), so its index can't serve it.
+    NonSargablePredicate,
+    /// An `=` / `<>` / `IN` comparison of floating-point values.
+    FloatEquality,
     /// A foreign key whose column types differ from the referenced columns.
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
@@ -208,7 +222,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 54] = [
+    pub const ALL: [Rule; 59] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -243,6 +257,11 @@ impl Rule {
         Rule::LeftJoinNullified,
         Rule::CheckViolation,
         Rule::UnstableOrder,
+        Rule::RedundantOrderBy,
+        Rule::RedundantGroupBy,
+        Rule::CountNotNull,
+        Rule::NonSargablePredicate,
+        Rule::FloatEquality,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
         Rule::DropIndexBlocking,
@@ -303,6 +322,11 @@ impl Rule {
             Rule::LeftJoinNullified => "left_join_nullified",
             Rule::CheckViolation => "check_violation",
             Rule::UnstableOrder => "unstable_order",
+            Rule::RedundantOrderBy => "redundant_order_by",
+            Rule::RedundantGroupBy => "redundant_group_by",
+            Rule::CountNotNull => "count_not_null",
+            Rule::NonSargablePredicate => "non_sargable_predicate",
+            Rule::FloatEquality => "float_equality",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
             Rule::DropIndexBlocking => "drop_index_blocking",
@@ -335,6 +359,15 @@ impl Rule {
 
     /// A one-line description of what the rule reports, used by the SARIF
     /// rule metadata.
+    /// The page documenting the rule: `docs/lint/<name>.md` in the
+    /// repository.
+    pub fn docs_url(self) -> String {
+        format!(
+            "https://github.com/cubos/typedpg/blob/main/docs/lint/{}.md",
+            self.name()
+        )
+    }
+
     pub fn description(self) -> &'static str {
         match self {
             Rule::NullComparison => "comparison with NULL is never true",
@@ -400,6 +433,15 @@ impl Rule {
             Rule::UnstableOrder => {
                 "an ORDER BY with LIMIT, OFFSET or DISTINCT ON whose keys can tie"
             }
+            Rule::RedundantOrderBy => "ORDER BY keys that can't change the order of the rows",
+            Rule::RedundantGroupBy => {
+                "GROUP BY keys determined by the other keys or pinned to a constant"
+            }
+            Rule::CountNotNull => "count(expr) over a value that is never NULL, which is count(*)",
+            Rule::NonSargablePredicate => {
+                "a comparison wrapping an indexed column so its index can't serve it"
+            }
+            Rule::FloatEquality => "an equality comparison of floating-point values",
             Rule::FkTypeMismatch => {
                 "a foreign key whose column types differ from the referenced columns"
             }
@@ -419,7 +461,8 @@ impl Rule {
                 "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
             }
             Rule::AttachPartitionScan => {
-                "ATTACH PARTITION scanning the partition because no CHECK implies its bound"
+                "ATTACH PARTITION scanning the partition because its constraints don't imply its \
+                 bound, or scanning the default partition"
             }
             Rule::MissingPrimaryKey => "a table without a primary key",
             Rule::RlsPolicyNotEnforced => {
@@ -493,7 +536,8 @@ impl Rule {
             | Rule::IntegerDivision
             | Rule::LeftJoinNullified
             | Rule::CheckViolation
-            | Rule::UnstableOrder => Some(Severity::Warning),
+            | Rule::UnstableOrder
+            | Rule::FloatEquality => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit
@@ -504,7 +548,11 @@ impl Rule {
             | Rule::RedundantJoin
             | Rule::FetchAllSingleRow
             | Rule::RlsNoPolicy
-            | Rule::UnusedReturning => Some(Severity::Info),
+            | Rule::UnusedReturning
+            | Rule::RedundantOrderBy
+            | Rule::RedundantGroupBy
+            | Rule::CountNotNull
+            | Rule::NonSargablePredicate => Some(Severity::Info),
             // Off by default: enabled with a level, they report at info.
             Rule::LikeUnescapedParam
             | Rule::PreferTimestamptz
@@ -556,15 +604,22 @@ pub struct Call {
 /// The method a query result's call has, independent of its spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallMethod {
-    /// `fetch_one()` / `fetch_one_as()` (Rust), `fetchOne()` / `fetchValue()`
-    /// (TypeScript): fails with `TooManyRows` on a second row.
+    /// `fetch_one()` / `fetch_one_as()` / `fetch_value()` (Rust),
+    /// `fetchOne()` / `fetchValue()` (TypeScript): fails with `TooManyRows`
+    /// on a second row.
     FetchOne,
-    /// `fetch_optional()` / `fetch_optional_as()` (Rust),
-    /// `fetchOptional()` / `fetchValueOptional()` (TypeScript): fails with
-    /// `TooManyRows` on a second row.
+    /// `fetch_optional()` / `fetch_optional_as()` /
+    /// `fetch_value_optional()` (Rust), `fetchOptional()` /
+    /// `fetchValueOptional()` (TypeScript): fails with `TooManyRows` on a
+    /// second row.
     FetchOptional,
     /// `fetch_all()` / `fetch_all_as()` (Rust), `fetchAll()` (TypeScript).
     FetchAll,
+    /// `fetch_stream()` / `fetch_stream_as()` (Rust), `fetchStream()`
+    /// (TypeScript): reads every row, one at a time. Streaming is a choice
+    /// about memory, not about how many rows to expect, so
+    /// `fetch_all_single_row` does not report it.
+    FetchStream,
     /// `execute()`: runs the statement and discards its `RETURNING` rows.
     Execute,
 }
@@ -688,17 +743,26 @@ pub(crate) struct Tok {
 pub(crate) struct Ctx<'a> {
     /// The analyzed text (the [`typedpg_analyzer::QueryView`]'s SQL).
     pub sql: &'a str,
+    /// The query as written: `$name` parameters as the user named them.
+    pub original: &'a str,
     pub tree: &'a typedpg_pg_query::ast::ParseResult,
     /// The non-comment tokens of `sql`, in order.
     pub tokens: &'a [Tok],
-    /// The names of operators with a non-strict implementation: comparing
-    /// with `NULL` through one may be meaningful.
-    pub non_strict_operators: &'a HashSet<String>,
     /// The analyzed view, for the facts the analyzer proved (the sublink
     /// nullability the `not_in_nullable` rule reads).
     pub view: &'a typedpg_analyzer::QueryView,
     /// The catalog the query was analyzed against.
     pub catalog: &'a PgCatalog,
+}
+
+impl Ctx<'_> {
+    /// The text of `span` (in [`Self::sql`]) as the query was written:
+    /// what a message quoting the query shows, `$day` rather than the
+    /// `$1` it was rewritten to.
+    pub(crate) fn written(&self, span: std::ops::Range<usize>) -> &str {
+        let span = self.view.original_span(span);
+        self.original.get(span).unwrap_or_default().trim()
+    }
 }
 
 /// Lint `sql` against `catalog`, without a call site.
@@ -736,7 +800,41 @@ pub fn lint_query_called(
     calls: &[Call],
     options: &LintOptions,
 ) -> Result<Vec<CallFinding>, LocatedError> {
-    let view = catalog.query_view(sql)?;
+    lint_query_called_as(catalog, sql, calls, &[], options)
+}
+
+/// [`lint_query_called`], for a query the code runs as `roles` (a call
+/// site's `role = "…"`, or the database's configured `roles`), as
+/// `typedpg check` and the `sql!` macro analyze it: the analysis as each
+/// role must succeed — a role may lack a privilege, or not exist — and
+/// resolve the query to the same types, and the rules read the analysis as
+/// the first role, whose search path decides what its unqualified names
+/// are. No roles: the plain analysis (the schema owner's).
+pub fn lint_query_called_as(
+    catalog: &PgCatalog,
+    sql: &str,
+    calls: &[Call],
+    roles: &[String],
+    options: &LintOptions,
+) -> Result<Vec<CallFinding>, LocatedError> {
+    let view = match roles {
+        [] => catalog.query_view(sql)?,
+        [first, rest @ ..] => {
+            let analysis = catalog.analyze_as_located(sql, first)?;
+            for role in rest {
+                let other = catalog.analyze_as_located(sql, role)?;
+                if let Some(difference) = typedpg_analyzer::first_difference(&analysis, &other) {
+                    return Err(LocatedError {
+                        error: typedpg_analyzer::AnalyzeError::Invalid(
+                            difference.message(first, role),
+                        ),
+                        offset: None,
+                    });
+                }
+            }
+            catalog.query_view_as(sql, first)?
+        }
+    };
     let tokens: Vec<Tok> = typedpg_pg_query::scan(&view.sql)
         .map(|scanned| {
             scanned
@@ -753,12 +851,11 @@ pub fn lint_query_called(
         })
         .unwrap_or_default();
     let (suppressed, mut findings) = suppressions(&view.sql);
-    let non_strict_operators = non_strict_operators(catalog);
     let ctx = Ctx {
         sql: &view.sql,
+        original: sql,
         tree: &view.tree,
         tokens: &tokens,
-        non_strict_operators: &non_strict_operators,
         view: &view,
         catalog,
     };
@@ -971,24 +1068,6 @@ pub fn fails(findings: &[Finding], options: &LintOptions) -> bool {
         .any(|finding| finding.severity >= options.fail_on)
 }
 
-/// The operator names with an implementation that is not strict
-/// (`proisstrict = false`): a comparison through one may accept `NULL`.
-fn non_strict_operators(catalog: &PgCatalog) -> HashSet<String> {
-    let strict: HashMap<_, bool> = catalog
-        .iter_procs()
-        .map(|proc| (proc.oid, proc.proisstrict))
-        .collect();
-    catalog
-        .iter_operators()
-        .filter(|operator| {
-            operator
-                .oprcode
-                .is_some_and(|code| strict.get(&code).is_some_and(|strict| !strict))
-        })
-        .map(|operator| operator.oprname.clone())
-        .collect()
-}
-
 /// Find the allow comments of `sql`, returning the rules they suppress and
 /// the error findings for unknown rule names.
 fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
@@ -1128,6 +1207,26 @@ mod tests {
     use super::*;
     use typedpg_analyzer::PgCatalog;
     use typedpg_core::config::{LINT_RULES, LintLevel, LintSeverity, RUST_LINT_RULES};
+
+    /// Every rule has its page, `docs/lint/<name>.md`, which the SARIF
+    /// report links to, and the index lists it.
+    #[test]
+    fn every_rule_is_documented() {
+        let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/lint");
+        let index = std::fs::read_to_string(docs.join("README.md")).expect("docs/lint/README.md");
+        for rule in Rule::ALL
+            .into_iter()
+            .chain([Rule::InvalidAllow, Rule::InternalError])
+        {
+            let page = format!("{}.md", rule.name());
+            assert!(docs.join(&page).is_file(), "docs/lint/{page} is missing");
+            assert!(
+                index.contains(&format!("({page})")),
+                "docs/lint/README.md doesn't link {page}"
+            );
+            assert!(rule.docs_url().ends_with(&format!("/docs/lint/{page}")));
+        }
+    }
 
     fn catalog() -> PgCatalog {
         let mut catalog = PgCatalog::new().unwrap();
@@ -1513,6 +1612,60 @@ mod tests {
                 .all(|finding| finding.rule != Rule::NullComparison),
             "{findings:?}"
         );
+        // The user-defined `=` is for `weird` alone: a comparison that
+        // resolves to the built-in strict `=` is still never true, and one
+        // through the user's `<>`-less type (`NOT IN`) or a simple CASE over
+        // integers too.
+        for sql in [
+            "SELECT 1 = NULL",
+            "SELECT 1 WHERE 1 NOT IN (2, NULL)",
+            "SELECT CASE 1 WHEN NULL THEN 1 ELSE 0 END",
+        ] {
+            let findings = lint(&db, sql);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule == Rule::NullComparison),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A simple CASE over `weird` compares with the non-strict `=`.
+        let findings = lint(&db, "SELECT CASE NULL::weird WHEN NULL THEN 1 ELSE 0 END");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule != Rule::NullComparison),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_strict_user_not_equal_is_not_flagged_in_not_in() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TYPE weird AS (v integer);
+             CREATE FUNCTION weird_ne(weird, weird) RETURNS boolean
+                 LANGUAGE sql AS 'SELECT true';
+             CREATE OPERATOR <> (LEFTARG = weird, RIGHTARG = weird, FUNCTION = weird_ne);",
+        )
+        .unwrap();
+        let findings = lint(
+            &db,
+            "SELECT 1 WHERE ROW(1)::weird NOT IN (ROW(2)::weird, NULL)",
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule != Rule::NullComparison),
+            "{findings:?}"
+        );
+        let findings = lint(&db, "SELECT 1 WHERE 1 NOT IN (2, NULL)");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule == Rule::NullComparison),
+            "{findings:?}"
+        );
     }
 
     // ── unbounded_write ────────────────────────────────────────────────────
@@ -1850,6 +2003,17 @@ mod tests {
             let findings = not_in_findings(&db, sql);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
         }
+        // The WHERE proves a select-list left side non-NULL, whether or not
+        // the subquery holds a parameter.
+        for sql in [
+            "SELECT email NOT IN (SELECT title FROM posts WHERE title IS NOT NULL) AS b \
+             FROM users WHERE email IS NOT NULL",
+            "SELECT email NOT IN (SELECT title FROM posts WHERE title IS NOT NULL AND id = $p) \
+             AS b FROM users WHERE email IS NOT NULL",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
         // The left side may still be NULL.
         let sql = "SELECT id FROM users WHERE email NOT IN (SELECT 'x')";
         assert_eq!(
@@ -1885,6 +2049,82 @@ mod tests {
                 "{sql}: {:?}",
                 not_in_findings(&db, sql)
             );
+        }
+    }
+
+    #[test]
+    fn not_equal_all_has_the_not_in_trap() {
+        let db = catalog();
+        let cases = [
+            (
+                "SELECT id FROM users WHERE id <> ALL (SELECT author_id FROM posts)",
+                "<> ALL (SELECT …) returns no rows when the subquery returns a NULL",
+                "id <> ALL (SELECT author_id FROM posts)",
+            ),
+            (
+                "SELECT id FROM users WHERE lower(email) != ALL (SELECT title FROM posts)",
+                "<> ALL (SELECT …) returns no rows for a NULL left side when the subquery \
+                 returns any row, or when the subquery returns a NULL",
+                "lower(email) != ALL (SELECT title FROM posts)",
+            ),
+        ];
+        for (sql, message, span) in cases {
+            let findings = not_in_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(findings[0].message, message);
+            assert_eq!(&sql[findings[0].span.clone()], span);
+        }
+        for sql in [
+            // Both sides NOT NULL.
+            "SELECT id FROM users WHERE id <> ALL (SELECT id FROM posts)",
+            // `NOT (x <> ALL …)` is TRUE when some comparison is FALSE.
+            "SELECT id FROM users WHERE NOT (id <> ALL (SELECT author_id FROM posts))",
+            // Other operators and quantifiers.
+            "SELECT id FROM users WHERE id < ALL (SELECT author_id FROM posts)",
+            "SELECT id FROM users WHERE id <> ANY (SELECT author_id FROM posts)",
+            "SELECT id FROM users WHERE id = ALL (SELECT author_id FROM posts)",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn not_in_nullable_ignores_non_strict_comparisons() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TYPE weird AS (v integer);
+             CREATE FUNCTION weird_eq(weird, weird) RETURNS boolean
+                 LANGUAGE sql AS 'SELECT coalesce($1 = $2, false)';
+             CREATE FUNCTION weird_ne(weird, weird) RETURNS boolean
+                 LANGUAGE sql AS 'SELECT coalesce($1 <> $2, true)';
+             CREATE OPERATOR = (LEFTARG = weird, RIGHTARG = weird, FUNCTION = weird_eq);
+             CREATE OPERATOR <> (LEFTARG = weird, RIGHTARG = weird, FUNCTION = weird_ne);
+             CREATE TABLE things (w weird);
+             CREATE TYPE plain AS (v integer);
+             CREATE FUNCTION plain_eq(plain, plain) RETURNS boolean
+                 LANGUAGE sql STRICT AS 'SELECT $1.v = $2.v';
+             CREATE FUNCTION plain_ne(plain, plain) RETURNS boolean
+                 LANGUAGE sql STRICT AS 'SELECT $1.v <> $2.v';
+             CREATE OPERATOR = (LEFTARG = plain, RIGHTARG = plain, FUNCTION = plain_eq);
+             CREATE OPERATOR <> (LEFTARG = plain, RIGHTARG = plain, FUNCTION = plain_ne);
+             CREATE TABLE others (p plain);",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT 1 FROM things WHERE w NOT IN (SELECT w FROM things)",
+            "SELECT 1 FROM things WHERE w <> ALL (SELECT w FROM things)",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // The same over STRICT operators is the trap.
+        for sql in [
+            "SELECT 1 FROM others WHERE p NOT IN (SELECT p FROM others)",
+            "SELECT 1 FROM others WHERE p <> ALL (SELECT p FROM others)",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
         }
     }
 
@@ -2788,5 +3028,49 @@ mod tests {
         ] {
             assert_eq!(rule.default_severity(), severity, "{rule}");
         }
+    }
+
+    #[test]
+    fn a_query_is_linted_as_its_roles() {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE ROLE app; CREATE ROLE reporting; CREATE ROLE other;
+                 CREATE SCHEMA app_data;
+                 CREATE TABLE t (id integer PRIMARY KEY, name text NOT NULL);
+                 CREATE TABLE app_data.t (id integer PRIMARY KEY, name text);
+                 GRANT USAGE ON SCHEMA app_data TO app;
+                 GRANT SELECT ON t, app_data.t TO app, reporting;
+                 ALTER ROLE app SET search_path = app_data, public;",
+            )
+            .unwrap();
+        let sql = "SELECT id FROM t WHERE name IS NOT NULL";
+        let options = LintOptions::default();
+        let rules_of = |sql: &str, roles: &[&str]| -> Result<Vec<Rule>, String> {
+            let roles: Vec<String> = roles.iter().map(|r| (*r).to_owned()).collect();
+            lint_query_called_as(&catalog, sql, &[], &roles, &options)
+                .map(|findings| findings.iter().map(|f| f.finding.rule).collect())
+                .map_err(|error| error.error.to_string())
+        };
+        let rules = |roles: &[&str]| rules_of(sql, roles);
+        // `public.t.name` is NOT NULL: the plain analysis finds the check
+        // redundant, and so does `reporting`'s, whose search path is the
+        // default one.
+        assert_eq!(rules(&[]), Ok(vec![Rule::RedundantNullCheck]));
+        assert_eq!(rules(&["reporting"]), Ok(vec![Rule::RedundantNullCheck]));
+        // `app`'s search path finds `app_data.t`, whose `name` may be NULL.
+        assert_eq!(rules(&["app"]), Ok(vec![]));
+        // A role that may not read the table fails, as the macro does.
+        let error = rules(&["other"]).unwrap_err();
+        assert!(
+            error.starts_with("permission denied for table t"),
+            "{error}"
+        );
+        // Roles resolving the query differently fail too.
+        let error = rules_of("SELECT name FROM t", &["reporting", "app"]).unwrap_err();
+        assert!(
+            error.starts_with("query resolves differently for roles"),
+            "{error}"
+        );
     }
 }

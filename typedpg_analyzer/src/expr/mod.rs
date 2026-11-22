@@ -98,6 +98,11 @@ impl<'a> Ctx<'a> {
 
     /// Record the strictness of the node of `kind` at `location`.
     pub fn note_strict(&self, location: i32, kind: crate::nonnull::StrictNode, strict: bool) {
+        if kind == crate::nonnull::StrictNode::Op {
+            // Whether or not a qual's log is kept here: the lint rules read
+            // the operator's strictness wherever it is.
+            crate::type_facts::note_operator_strict(location, strict);
+        }
         if let Some(log) = self.strict_log {
             log.note(location, kind, strict);
         }
@@ -166,6 +171,33 @@ impl<'a> Ctx<'a> {
         if let Some(log) = self.cook_log {
             log.note_literal(literal, type_oid);
         }
+    }
+
+    /// Whether `proc` may give another value on each call within one
+    /// statement: it is VOLATILE or returns a set (or is unknown).
+    pub fn proc_may_vary(&self, proc: Option<crate::oid::PgProcOid>) -> bool {
+        proc.and_then(|p| self.snapshot.pg_proc.get(&p))
+            .is_none_or(|p| {
+                p.proretset || p.provolatile == crate::pg_catalog::ProVolatile::Volatile
+            })
+    }
+
+    /// Whether the implicit coercion from `from` to `to` runs a cast
+    /// function that [may vary](Self::proc_may_vary).
+    pub fn coercion_may_vary(&self, from: PgTypeOid, to: PgTypeOid) -> bool {
+        if from == to || from == oid::UNKNOWN {
+            return false;
+        }
+        let key = (
+            self.snapshot.unwrap_domain(from),
+            self.snapshot.unwrap_domain(to),
+        );
+        self.snapshot
+            .cast_by_pair
+            .get(&key)
+            .and_then(|oid| self.snapshot.pg_cast.get(oid))
+            .and_then(|c| c.castfunc)
+            .is_some_and(|f| self.proc_may_vary(Some(f)))
     }
 
     /// Whether `proc` is strict.
@@ -2333,10 +2365,36 @@ fn replay_targets(
         // The replay is the same expression's analysis again: what it runs
         // belongs to the same output column.
         crate::privileges::collect_output(i, || {
-            infer_expr(val.as_ref(), ctx, scratch, TypeGoal::NONE)
+            in_replay(|| infer_expr(val.as_ref(), ctx, scratch, TypeGoal::NONE))
         })?;
     }
     Ok(())
+}
+
+thread_local! {
+    /// How many select-list replays ([`note_untyped_output_params`]) are
+    /// running.
+    static IN_TARGET_REPLAY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` as part of a select-list replay.
+fn in_replay<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_TARGET_REPLAY.with(|r| r.set(r.get() - 1));
+        }
+    }
+    IN_TARGET_REPLAY.with(|r| r.set(r.get() + 1));
+    let _restore = Restore;
+    f()
+}
+
+/// Whether the analysis is inside a select-list replay: it runs right
+/// after FROM, before WHERE's facts are known, so what it reads of a
+/// value's nullability is weaker than the final pass's.
+pub(crate) fn in_target_replay() -> bool {
+    IN_TARGET_REPLAY.with(|r| r.get() > 0)
 }
 
 /// PG transforms a whole expression list before coercing any of it to its

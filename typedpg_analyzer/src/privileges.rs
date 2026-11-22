@@ -6109,6 +6109,44 @@ impl PgCatalog {
         !(self.roles.has_privs_of_role(who, owner) && !self.force_row_security.contains(&relid))
     }
 
+    /// Whether row-level security denies role `role` every row of relation
+    /// `relid` for command `cmd` (`r` SELECT, `a` INSERT, `w` UPDATE, `d`
+    /// DELETE): it applies to the role ([`Self::row_security_applies`])
+    /// and no permissive policy addressed to it has a clause for the
+    /// command that may be TRUE, so the default-deny `false` filters every
+    /// row (an INSERT fails) — or a restrictive one's clause is never TRUE.
+    /// A clause is never TRUE when the planner certainly folds it to FALSE
+    /// or NULL (`USING (false)`). The clause read is the command's: an
+    /// INSERT's WITH CHECK (its USING without one), the USING of the others
+    /// (their WITH CHECK without one). `false` for a role the catalog
+    /// doesn't know.
+    pub fn row_security_denies(&self, relid: PgClassOid, role: &str, cmd: char) -> bool {
+        let Some(who) = self.roles.id(role) else {
+            return false;
+        };
+        if !self.row_security_applies(relid, who) {
+            return false;
+        }
+        let clause = |policy: &Policy| {
+            let (using, with_check) = self.policy_qual(relid, policy);
+            if cmd == 'a' {
+                with_check.or(using)
+            } else {
+                using.or(with_check)
+            }
+        };
+        let never_true = |clause: &Node| {
+            crate::expr::plan_fold::certainly_true(Some(clause), self) == Some(false)
+        };
+        let (permissive, restrictive) = self.policies_for(relid, cmd, who);
+        !permissive
+            .iter()
+            .any(|policy| clause(policy).is_some_and(|c| !never_true(&c)))
+            || restrictive
+                .iter()
+                .any(|policy| clause(policy).is_some_and(|c| never_true(&c)))
+    }
+
     /// The policies of `relid` that apply to command `cmd` for `who`
     /// (`get_policies_for_relation`): the command's own or `ALL` policies,
     /// addressed to PUBLIC or to a role `who` has the privileges of, split

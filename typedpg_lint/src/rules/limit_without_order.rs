@@ -300,7 +300,10 @@ pub(super) fn constant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
 
 /// Whether every output row carries the same values: the expression reads
 /// no column (anywhere, sublinks included) and calls nothing that may vary
-/// per row.
+/// per row — no function any of whose overloads is VOLATILE or returns a
+/// set, no operator that resolved to one (or whose operands' implicit
+/// coercions run one), no explicit cast through a VOLATILE cast function.
+/// `1 + 1`, `now()` and `'a' || 'b'` are the same on every row.
 fn constant_expression(ctx: &Ctx<'_>, expression: Option<&ast::Node>) -> bool {
     let Some(root) = expression else {
         return false;
@@ -311,8 +314,22 @@ fn constant_expression(ctx: &Ctx<'_>, expression: Option<&ast::Node>) -> bool {
             // A star is a column reference too, and any column makes the
             // output depend on the row.
             NodeRef::ColumnRef(_) => return false,
-            // An operator may be a volatile user-defined function: give up.
-            NodeRef::AExpr(_) => return false,
+            // The operator the analyzer resolved there: a user-defined one
+            // may run a volatile function. Not resolved (a kind the
+            // analyzer doesn't record): give up.
+            NodeRef::AExpr(expr) => {
+                if ctx.view.operator_is_nonvolatile(expr.location) != Some(true) {
+                    return false;
+                }
+            }
+            NodeRef::TypeCast(cast) => {
+                if let Some(arg) = cast.arg.as_ref()
+                    && let Some(conversion) = ctx.view.value_conversion(arg.to_ref())
+                    && cast_may_vary(ctx, conversion.from, conversion.to)
+                {
+                    return false;
+                }
+            }
             NodeRef::FuncCall(call) => {
                 let names: Vec<&str> = call
                     .funcname
@@ -344,6 +361,25 @@ fn constant_expression(ctx: &Ctx<'_>, expression: Option<&ast::Node>) -> bool {
         stack.extend(node.children());
     }
     true
+}
+
+/// Whether the cast from `from` to `to` runs a cast function that is
+/// VOLATILE or returns a set.
+fn cast_may_vary(
+    ctx: &Ctx<'_>,
+    from: typedpg_analyzer::PgTypeOid,
+    to: typedpg_analyzer::PgTypeOid,
+) -> bool {
+    ctx.catalog
+        .iter_casts()
+        .find(|cast| cast.castsource == from && cast.casttarget == to)
+        .and_then(|cast| cast.castfunc)
+        .is_some_and(|function| {
+            ctx.catalog
+                .pg_proc()
+                .get(&function)
+                .is_none_or(|proc| proc.proretset || proc.provolatile == ProVolatile::Volatile)
+        })
 }
 
 /// Whether every output row carries the same values because each target
@@ -1003,6 +1039,13 @@ mod tests {
             // A call that is stable within the statement keeps the output
             // the same too.
             "SELECT now() FROM users LIMIT 1",
+            // So do operators over constants.
+            "SELECT 1 + 1 FROM users LIMIT 1",
+            "SELECT 'a' || 'b', 2 * 3 = 6 FROM users LIMIT 1",
+            "SELECT now() - interval '1 day' FROM users LIMIT 1",
+            "SELECT 1 = ANY (ARRAY[1, 2]) FROM users OFFSET 1",
+            "SELECT 1 IN (1, 2), 2 BETWEEN 1 AND 3 FROM users LIMIT 1",
+            "SELECT $1::int + 1 FROM users LIMIT 1",
         ] {
             let findings: Vec<Finding> = lint(&db, sql)
                 .into_iter()
@@ -1015,6 +1058,9 @@ mod tests {
             "SELECT name FROM users OFFSET 10",
             // A set-returning call returns a different value per row.
             "SELECT generate_series(1, 3) FROM users LIMIT 1",
+            // A column under an operator.
+            "SELECT id + 1 FROM users LIMIT 1",
+            "SELECT 1 + random() FROM users LIMIT 1",
         ] {
             let findings: Vec<Finding> = lint(&db, sql)
                 .into_iter()
@@ -1022,6 +1068,40 @@ mod tests {
                 .collect();
             assert!(!findings.is_empty(), "{sql}");
         }
+    }
+
+    #[test]
+    fn a_volatile_operator_or_cast_keeps_the_report() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE FUNCTION jitter(int, int) RETURNS int VOLATILE LANGUAGE sql
+                 AS 'SELECT $1 + $2 + (random() * 10)::int';
+             CREATE OPERATOR <+> (LEFTARG = int, RIGHTARG = int, FUNCTION = jitter);
+             CREATE FUNCTION steady(int, int) RETURNS int IMMUTABLE LANGUAGE sql
+                 AS 'SELECT $1 + $2';
+             CREATE OPERATOR ### (LEFTARG = int, RIGHTARG = int, FUNCTION = steady);
+             CREATE TYPE token AS (v int);
+             CREATE FUNCTION token_of(int) RETURNS token VOLATILE LANGUAGE sql
+                 AS 'SELECT ROW((random() * $1)::int)::token';
+             CREATE CAST (int AS token) WITH FUNCTION token_of(int);",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT 1 <+> 2 FROM users LIMIT 1",
+            "SELECT 1::token FROM users LIMIT 1",
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+                .collect();
+            assert!(!findings.is_empty(), "{sql}");
+        }
+        let sql = "SELECT 1 ### 2 FROM users LIMIT 1";
+        let findings: Vec<Finding> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+            .collect();
+        assert!(findings.is_empty(), "{sql}: {findings:?}");
     }
 
     #[test]

@@ -3908,3 +3908,271 @@ fn primary_key_columns(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+// ── Redundant ORDER BY and GROUP BY keys ────────────────────────────────────
+
+/// One `ORDER BY` item of a `SELECT`, as [`crate::order_keys`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderKey {
+    /// The FROM relation (by position among the FROM clause's relations)
+    /// and attnum of the plain column the item sorts by — written as a
+    /// column, an output column's name or an ordinal — or `None` for any
+    /// other key, or one sorted `USING` an operator.
+    pub column: Option<(usize, i16)>,
+    /// `WHERE` equates that column to a constant, a parameter or an outer
+    /// value through the column type's default btree equality, under a
+    /// deterministic collation: every row sorts it the same, so the item
+    /// can't order any two rows.
+    pub pinned: bool,
+}
+
+/// The [`OrderKey`]s of `s`'s `ORDER BY`, or `None` when the FROM clause is
+/// one the proof can't see through (see [`order_ties`]) or `s` is a set
+/// operation.
+pub(super) fn order_keys(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    s: &ast::SelectStmt,
+) -> Option<Vec<OrderKey>> {
+    if s.op != SetOperation::SetopNone
+        || s.into_clause.is_some()
+        || s.sort_clause.is_empty()
+        || s.from_clause.is_empty()
+        || !s.values_lists.is_empty()
+    {
+        return None;
+    }
+    let scope = Scope::build(ctx, ctes, &s.from_clause)?;
+    if scope.rels.is_empty() || scope.rels.len() > MAX_RELATIONS {
+        return None;
+    }
+    let where_facts = conjuncts(s.where_clause.as_ref())
+        .into_iter()
+        .flat_map(|c| scope.equality_facts(ctx, c, None))
+        .collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(s.sort_clause.len());
+    for item in &s.sort_clause {
+        let Some(Node::SortBy(sort)) = item else {
+            return None;
+        };
+        let mut column = None;
+        if sort.sortby_dir != ast::SortByDir::SortbyUsing
+            && let Some(Node::ColumnRef(cr)) = sort_key(s, sort.node.as_ref())
+            && let Fields::Names(names) = column_ref_fields(cr)
+        {
+            match scope.resolve(&names) {
+                Col::Rel(r, attnum) => column = Some((r, attnum)),
+                Col::Opaque => return None,
+                Col::Other => {}
+            }
+        }
+        let pinned = column.is_some_and(|(r, attnum)| {
+            scope.column_fixed_by_facts(ctx, r, attnum, &where_facts, 0)
+        });
+        out.push(OrderKey { column, pinned });
+    }
+    Some(out)
+}
+
+/// The fewest leading `ORDER BY` items of `s` that already determine a
+/// unique row ([`order_ties`] proves them [`OrderTies::Unique`]), when
+/// fewer than all of them do: the items after them can't order any two
+/// rows.
+pub(super) fn unique_order_prefix(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    s: &ast::SelectStmt,
+) -> Option<usize> {
+    (1..s.sort_clause.len()).find(|&k| {
+        let mut prefix = s.clone();
+        prefix.sort_clause.truncate(k);
+        order_ties(ctx, ctes, &prefix) == OrderTies::Unique
+    })
+}
+
+/// The positions of `s`'s `GROUP BY` items that can be dropped without
+/// changing its groups or making it invalid:
+///
+/// - a plain column of a relation whose other `GROUP BY` columns cover a
+///   unique key of it — NOT NULL, or `NULLS NOT DISTINCT` on a relation
+///   never null-extended — compared under the column type's default btree
+///   equality and a deterministic collation: within a group the relation's
+///   row (or its null extension) is one, so the column has one value;
+/// - a plain column `WHERE` equates to a constant, a parameter or an outer
+///   value (see [`Scope::column_fixed_by_facts`]).
+///
+/// One item always stays: dropping the last would turn an empty input's
+/// no groups into one group.
+///
+/// PostgreSQL only accepts an ungrouped column in the select list,
+/// `HAVING`, `ORDER BY`, `DISTINCT ON` or a window when its table's primary
+/// key is grouped (`check_functional_grouping`): an item referenced there
+/// — by any column reference spelling its name or its relation's, or a `*`
+/// — is only dropped when the remaining items hold every column of its
+/// relation's immediate, non-temporal primary key. Items are tried from
+/// the last one, against those still kept, so two columns that determine
+/// each other never both go.
+///
+/// Nothing is dropped from `GROUPING SETS`, `ROLLUP`, `CUBE`, `GROUP BY ()`
+/// or `GROUP BY DISTINCT`, nor when the FROM clause is one the proof can't
+/// see through.
+pub(super) fn redundant_group_keys(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    s: &ast::SelectStmt,
+) -> Vec<usize> {
+    if s.op != SetOperation::SetopNone
+        || s.group_clause.len() < 2
+        || s.group_distinct
+        || s.from_clause.is_empty()
+        || s.into_clause.is_some()
+    {
+        return Vec::new();
+    }
+    let Some(scope) = Scope::build(ctx, ctes, &s.from_clause) else {
+        return Vec::new();
+    };
+    if scope.rels.is_empty() || scope.rels.len() > MAX_RELATIONS {
+        return Vec::new();
+    }
+    // Each item's plain column, when it is one.
+    let mut items: Vec<Option<(usize, i16)>> = Vec::with_capacity(s.group_clause.len());
+    for item in &s.group_clause {
+        match item {
+            Some(Node::ColumnRef(cr)) => {
+                let Fields::Names(names) = column_ref_fields(cr) else {
+                    return Vec::new();
+                };
+                match scope.resolve(&names) {
+                    Col::Rel(r, attnum) => items.push(Some((r, attnum))),
+                    Col::Opaque => return Vec::new(),
+                    // An output column's name, or an outer column.
+                    Col::Other => items.push(None),
+                }
+            }
+            // A grouping set, `ROLLUP`, `CUBE` or `()`.
+            Some(Node::GroupingSet(_)) | None => return Vec::new(),
+            Some(_) => items.push(None),
+        }
+    }
+    let where_facts = conjuncts(s.where_clause.as_ref())
+        .into_iter()
+        .flat_map(|c| scope.equality_facts(ctx, c, None))
+        .collect::<Vec<_>>();
+    let referenced = grouped_query_references(s);
+    let mut kept: Vec<bool> = vec![true; items.len()];
+    let mut removed = Vec::new();
+    for i in (0..items.len()).rev() {
+        let Some((r, attnum)) = items[i] else {
+            continue;
+        };
+        if !kept.iter().enumerate().any(|(j, &k)| j != i && k) {
+            continue;
+        }
+        let others: Vec<(usize, i16)> = items
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i && kept[j])
+            .filter_map(|(_, item)| *item)
+            .collect();
+        let rel = &scope.rels[r];
+        let Some(oid) = rel.oid else {
+            continue;
+        };
+        let determined = unique_keys(ctx, oid).iter().any(|key| {
+            key.predicate.is_none()
+                && key.columns.iter().all(|c| {
+                    c.deterministic
+                        && c.default_family
+                        && c.attnum != attnum
+                        && others.contains(&(r, c.attnum))
+                })
+                && (key.columns.iter().all(|c| c.notnull)
+                    || (key.nulls_not_distinct && !rel.nullable))
+        });
+        if !determined && !scope.column_fixed_by_facts(ctx, r, attnum, &where_facts, 0) {
+            continue;
+        }
+        let name = ctx
+            .catalog
+            .attributes_of(oid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .map(|a| a.attname.clone());
+        let is_referenced = name.is_none_or(|name| {
+            referenced.stars
+                || referenced.names.contains(name.as_str())
+                || referenced.names.contains(rel.refname.as_str())
+        });
+        if is_referenced {
+            let pk = primary_key_attnums(ctx, oid);
+            let pk_grouped = !pk.is_empty()
+                && !pk.contains(&attnum)
+                && pk.iter().all(|k| others.contains(&(r, *k)));
+            if !pk_grouped {
+                continue;
+            }
+        }
+        kept[i] = false;
+        removed.push(i);
+    }
+    removed.reverse();
+    removed
+}
+
+/// The names a grouped query reads after grouping — in its select list,
+/// `HAVING`, `ORDER BY`, `DISTINCT ON` and windows, nested queries
+/// included: the last field of each column reference (a column's name, or
+/// a whole-row reference's relation), and whether a `*` is among them.
+struct GroupedReferences<'a> {
+    names: HashSet<&'a str>,
+    stars: bool,
+}
+
+fn grouped_query_references(s: &ast::SelectStmt) -> GroupedReferences<'_> {
+    let mut out = GroupedReferences {
+        names: HashSet::new(),
+        stars: false,
+    };
+    let mut stack: Vec<NodeRef<'_>> = Vec::new();
+    stack.extend(s.target_list.iter().flatten().map(Node::to_ref));
+    stack.extend(s.having_clause.iter().map(Node::to_ref));
+    stack.extend(s.sort_clause.iter().flatten().map(Node::to_ref));
+    stack.extend(s.distinct_clause.iter().flatten().map(Node::to_ref));
+    stack.extend(s.window_clause.iter().flatten().map(Node::to_ref));
+    while let Some(n) = stack.pop() {
+        if let NodeRef::ColumnRef(cr) = n {
+            match cr.fields.last() {
+                Some(Some(Node::String(name))) => {
+                    out.names.insert(name.sval.as_str());
+                }
+                _ => out.stars = true,
+            }
+        }
+        stack.extend(n.children());
+    }
+    out
+}
+
+/// The attnums of relation `relid`'s primary key when PostgreSQL's
+/// functional-dependency check accepts it (an immediate, non-temporal
+/// one), else empty.
+fn primary_key_attnums(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<i16> {
+    let Some(constraint) = ctx
+        .catalog
+        .pg_constraint
+        .values()
+        .find(|c| c.conrelid == relid && c.contype == ConType::PrimaryKey)
+    else {
+        return Vec::new();
+    };
+    let deferrable = ctx.catalog.pg_index.values().any(|i| {
+        i.indrelid == relid
+            && i.indisprimary
+            && ctx.catalog.nonimmediate_indexes.contains(&i.indexrelid)
+    });
+    if constraint.conperiod || deferrable {
+        return Vec::new();
+    }
+    constraint.conkey.clone()
+}

@@ -99,6 +99,10 @@ mod tests {
              FROM users",
             // An always-true WHEN.
             "SELECT CASE WHEN id > 1 THEN 1 WHEN true THEN 2 END AS n FROM users",
+            // The WHERE makes a WHEN true for every row.
+            "SELECT CASE WHEN name = 'a' THEN 1 END AS n FROM users WHERE name = 'a'",
+            "SELECT CASE WHEN name = 'a' THEN 1 WHEN name = 'b' THEN 2 END AS n FROM users \
+             WHERE name IN ('a', 'b')",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");

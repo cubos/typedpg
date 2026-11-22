@@ -618,6 +618,26 @@ fn commit_all(dir: &Path, message: &str) {
 /// `src/lib.rs` and `0001_init.sql`, and whose branch adds `migration` as
 /// `0002_change.sql` and replaces the queries with `new_queries`.
 fn deployed_crate(queries: &[&str], migration: &str, new_queries: &[&str]) -> tempfile::TempDir {
+    let call = |query: &&str| format!("sql!(pool, {query:?})");
+    deployed_crate_with(
+        "",
+        "",
+        &queries.iter().map(call).collect::<Vec<_>>(),
+        migration,
+        &new_queries.iter().map(call).collect::<Vec<_>>(),
+    )
+}
+
+/// [`deployed_crate`], with `config` appended to the database's
+/// configuration, `init` to `0001_init.sql`, and the `sql!` invocations
+/// written out.
+fn deployed_crate_with(
+    config: &str,
+    init: &str,
+    calls: &[String],
+    migration: &str,
+    new_calls: &[String],
+) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -634,21 +654,23 @@ publish = false
 
 [package.metadata.typedpg.database]
 migrations = "./migrations"
-"#,
+"#
+        .to_owned()
+            + config,
     )
     .unwrap();
-    let source = |queries: &[&str]| {
+    let source = |calls: &[String]| {
         let mut source = String::from(
             "use typedpg::sql;\n\npub async fn run(pool: &typedpg::Pool) -> \
              Result<(), typedpg::Error> {\n",
         );
-        for query in queries {
-            source.push_str(&format!("    sql!(pool, {query:?}).execute().await?;\n"));
+        for call in calls {
+            source.push_str(&format!("    {call}.execute().await?;\n"));
         }
         source.push_str("    Ok(())\n}\n");
         source
     };
-    std::fs::write(root.join("src/lib.rs"), source(queries)).unwrap();
+    std::fs::write(root.join("src/lib.rs"), source(calls)).unwrap();
     std::fs::write(
         root.join("migrations/0001_init.sql"),
         "CREATE TYPE status AS ENUM ('active', 'blocked');\n\
@@ -658,13 +680,15 @@ migrations = "./migrations"
              name text NOT NULL,\n\
              status status NOT NULL,\n\
              age integer\n\
-         );\n",
+         );\n"
+            .to_owned()
+            + init,
     )
     .unwrap();
     git(root, &["init", "-q"]);
     commit_all(root, "deployed");
     std::fs::write(root.join("migrations/0002_change.sql"), migration).unwrap();
-    std::fs::write(root.join("src/lib.rs"), source(new_queries)).unwrap();
+    std::fs::write(root.join("src/lib.rs"), source(new_calls)).unwrap();
     dir
 }
 
@@ -789,4 +813,230 @@ fn breaks_deployed_queries_accepts_a_compatible_migration() {
     let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
     assert_eq!(code, Some(0), "{stderr}\n{stdout}");
     assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+}
+
+#[test]
+fn breaks_deployed_queries_analyzes_a_query_as_its_roles() {
+    let dir = deployed_crate_with(
+        "roles = [\"app\"]\n",
+        "CREATE ROLE app;\n\
+         CREATE ROLE reporting;\n\
+         GRANT SELECT ON users TO app, reporting;\n",
+        &[
+            // As the database's configured role.
+            r#"sql!(pool, "SELECT id FROM users")"#.to_owned(),
+            // As the call site's.
+            r#"sql!(role = "reporting", pool, "SELECT name FROM users")"#.to_owned(),
+        ],
+        "REVOKE SELECT ON users FROM reporting;\n\
+         ALTER TABLE users ENABLE ROW LEVEL SECURITY;\n",
+        &[],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(
+        stdout.matches("warning[breaks_deployed_queries]").count(),
+        2,
+        "{stdout}"
+    );
+    for expected in [
+        "migrations/0002_change.sql:1:1",
+        "this migration breaks the deployed query at src/lib.rs:5 (HEAD): it no longer runs as \
+         role \"reporting\": permission denied for table users",
+        "migrations/0002_change.sql:2:1",
+        "this migration breaks the deployed query at src/lib.rs:4 (HEAD): it sees no row of users \
+         as role \"app\": row-level security applies to the role and no policy lets it SELECT",
+    ] {
+        assert!(stdout.contains(expected), "{expected}\n{stdout}");
+    }
+}
+
+/// A crate in a temporary directory: `Cargo.toml` with `metadata` appended,
+/// one migration and `src/main.rs`.
+fn small_crate(metadata: &str, migration: &str, main: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "small_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+{metadata}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("migrations/0001_init.sql"), migration).unwrap();
+    std::fs::write(root.join("src/main.rs"), main).unwrap();
+    dir
+}
+
+#[test]
+fn fetch_value_calls_are_checked_like_fetch_one() {
+    let dir = small_crate(
+        "",
+        "CREATE TABLE users (id integer PRIMARY KEY, org_id integer, name text);\n",
+        r#"use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool, org: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = sql!(pool, "SELECT id FROM users WHERE org_id = $org", org = &org).fetch_value().await?;
+    let _ = sql!(pool, "SELECT name FROM users WHERE org_id = $org", org = &org)
+        .fetch_value_optional()
+        .await?;
+    let _ = sql!(pool, "SELECT name FROM users WHERE id = $org", org = &org).fetch_value().await?;
+    Ok(())
+}
+"#,
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(
+        stdout.matches("warning[fetch_may_return_many]").count(),
+        2,
+        "{stdout}"
+    );
+    for expected in [
+        "`.fetch_value()` fails with TooManyRows",
+        "`.fetch_value_optional()` fails with TooManyRows",
+    ] {
+        assert!(stdout.contains(expected), "{expected}\n{stdout}");
+    }
+}
+
+#[test]
+fn a_fetch_value_or_stream_call_is_a_known_use_of_a_bound_query() {
+    // Every use is a method the rules know: the query does not escape, so
+    // `unused_returning` judges it — and stays quiet, because the rows are
+    // read.
+    let dir = small_crate(
+        "",
+        "CREATE TABLE users (id integer PRIMARY KEY, name text);\n",
+        r#"use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool, cond: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let insert = sql!(pool, "INSERT INTO users (id, name) VALUES (1, 'a') RETURNING id");
+    if cond {
+        insert.execute().await?;
+    } else {
+        let _ = insert.fetch_value().await?;
+    }
+    let only_execute = sql!(pool, "INSERT INTO users (id, name) VALUES (2, 'b') RETURNING id");
+    only_execute.execute().await?;
+    let streamed = sql!(pool, "SELECT id FROM users WHERE id = 1");
+    let _ = streamed.fetch_stream().await?;
+    Ok(())
+}
+"#,
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    // Only the query whose every call is `execute()` reports its RETURNING.
+    assert_eq!(
+        stdout.matches("info[unused_returning]").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stdout.contains("src/main.rs:11:18]"), "{stdout}");
+    // Streaming a single-row query is not `fetch_all_single_row`'s concern.
+    assert!(!stdout.contains("fetch_all_single_row"), "{stdout}");
+}
+
+#[test]
+fn an_invalid_lint_key_fails_the_run() {
+    let dir = small_crate(
+        "\n[package.metadata.typedpg.lint]\nbogus_rule = \"error\"\n",
+        "CREATE TABLE users (id integer PRIMARY KEY);\n",
+        "fn main() {}\n",
+    );
+    for format in ["human", "json", "sarif"] {
+        let (code, stdout, stderr) = lint_crate(dir.path(), &["--format", format]);
+        assert_eq!(code, Some(1), "{format}: {stderr}\n{stdout}");
+        assert!(
+            format!("{stdout}{stderr}")
+                .contains("unknown key `bogus_rule` in [package.metadata.typedpg.lint]"),
+            "{format}: {stderr}\n{stdout}"
+        );
+        assert!(!stderr.contains("no findings"), "{format}: {stderr}");
+        assert!(!stderr.contains("doesn't compile"), "{format}: {stderr}");
+        assert!(
+            stderr.contains("typedpg lint: invalid configuration, nothing was checked"),
+            "{format}: {stderr}"
+        );
+        assert!(
+            stderr.contains("✖ failed: the configuration is invalid"),
+            "{format}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn breaks_deployed_queries_checks_a_deployed_copy_in() {
+    let dir = deployed_crate_with(
+        "",
+        "",
+        &[
+            r#"copy_in!(pool, "users (id, email, name, status, age)", rows { id, email, name, status, age })"#
+                .to_owned(),
+        ],
+        "ALTER TABLE users ADD CONSTRAINT users_age_positive CHECK (age > 0);\n",
+        &[],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(
+        stdout.matches("warning[breaks_deployed_queries]").count(),
+        1,
+        "{stdout}"
+    );
+    let expected = "this migration breaks the deployed query at src/lib.rs:4 (HEAD): its COPY into \
+                    users writes column age, which CHECK constraint \"users_age_positive\" now \
+                    limits it to at least 1: writing another value fails";
+    assert!(stdout.contains(expected), "{expected}\n{stdout}");
+}
+
+#[test]
+fn lint_analyzes_each_query_as_its_roles() {
+    let dir = deployed_crate_with(
+        "roles = [\"app\"]\n",
+        "CREATE ROLE app;\n\
+         CREATE ROLE reporting;\n\
+         GRANT SELECT ON users TO reporting;\n",
+        &[],
+        "",
+        &[
+            // As the database's configured role, which may not read it.
+            r#"sql!(pool, "SELECT id FROM users")"#.to_owned(),
+            // As the call site's, which may.
+            r#"sql!(role = "reporting", pool, "SELECT name FROM users")"#.to_owned(),
+            r#"copy_in!(pool, "users (id, email, name, status)", rows { id, email, name, status })"#
+                .to_owned(),
+            r#"copy_in!(role = "nobody", pool, "users (id)", rows { id })"#.to_owned(),
+        ],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &[]);
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
+    let all = format!("{stdout}{stderr}");
+    for expected in [
+        "error: permission denied for table users\n   ╭─[src/lib.rs:4:17]",
+        "help: grant it in a migration: GRANT SELECT (id) ON public.users TO app;",
+        "error: permission denied for table users\n   ╭─[src/lib.rs:6:21]",
+        "help: grant it in a migration: GRANT INSERT (id, email, name, status) ON public.users \
+         TO app;",
+        "error: role \"nobody\" does not exist (typedpg can check only the roles the migrations \
+         create)\n   ╭─[src/lib.rs:7:38]",
+        "failed: 3 analysis errors",
+    ] {
+        assert!(all.contains(expected), "{expected}\n{all}");
+    }
+    // The call site's role may read it.
+    assert!(!all.contains("src/lib.rs:5:"), "{all}");
 }

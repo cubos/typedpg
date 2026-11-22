@@ -6,7 +6,7 @@ use typedpg_analyzer::{CastMethod, PgTypeOid, TypType};
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{
-    AExpr, AExprKind, BoolExpr, BoolExprType, CaseWhen, Node, Node as N, RangeVar, SubLinkType,
+    AExpr, AExprKind, BoolExprType, CaseWhen, Node, Node as N, RangeVar, SubLink, SubLinkType,
 };
 
 use crate::{Ctx, RawFinding, Rule};
@@ -15,18 +15,23 @@ mod cartesian_join;
 mod case_without_else;
 mod check_violation;
 mod constant_condition;
+mod count_not_null;
+mod float_equality;
 mod insert_without_columns;
 mod integer_division;
 mod left_join_nullified;
 mod like_unescaped_param;
 mod limit_without_order;
+mod non_sargable_predicate;
 mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;
 mod redundant_distinct;
+mod redundant_group_by;
 mod redundant_join;
 mod redundant_limit;
 mod redundant_null_check;
+mod redundant_order_by;
 mod scalar_subquery_may_return_many;
 mod self_assignment;
 mod simplifiable_case;
@@ -34,8 +39,6 @@ mod timestamp_timezone_mix;
 mod unreachable_case_branch;
 mod unstable_order;
 mod unused_cte;
-
-pub(crate) use insert_without_columns::width as insert_width;
 
 /// The operators `null_comparison` reports: the ordinary comparisons, not
 /// `IS [NOT] DISTINCT FROM` or the pattern operators.
@@ -69,6 +72,11 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::LeftJoinNullified => left_join_nullified::findings(ctx),
         Rule::CheckViolation => check_violation::findings(ctx),
         Rule::UnstableOrder => unstable_order::findings(ctx),
+        Rule::RedundantOrderBy => redundant_order_by::findings(ctx),
+        Rule::RedundantGroupBy => redundant_group_by::findings(ctx),
+        Rule::CountNotNull => count_not_null::findings(ctx),
+        Rule::NonSargablePredicate => non_sargable_predicate::findings(ctx),
+        Rule::FloatEquality => float_equality::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking
@@ -128,7 +136,10 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
             let Some(operator) = operator_name(expr) else {
                 return;
             };
-            if !COMPARISONS.contains(&operator) || ctx.non_strict_operators.contains(operator) {
+            // The operator the comparison resolved to, not every operator of
+            // its name: a user-defined `=` CALLED ON NULL INPUT on some
+            // other type says nothing of this one.
+            if !COMPARISONS.contains(&operator) || !resolves_strict(ctx, expr.location) {
                 return;
             }
             let left_null = expr
@@ -165,9 +176,9 @@ fn comparison(ctx: &Ctx<'_>, expr: &AExpr, out: &mut Vec<RawFinding>) {
             });
         }
         AExprKind::AexprIn if operator_name(expr) == Some("<>") => {
-            // `NOT IN` compares with `=` internally; a user-defined
-            // non-strict `=` may accept NULL.
-            if ctx.non_strict_operators.contains("=") {
+            // `NOT IN` compares with `<>` item by item; the `<>` it
+            // resolved to may be a user-defined one that accepts NULL.
+            if !resolves_strict(ctx, expr.location) {
                 return;
             }
             let Some(right) = expr.rexpr.as_ref() else {
@@ -209,7 +220,9 @@ fn case_when(ctx: &Ctx<'_>, when: &CaseWhen, out: &mut Vec<RawFinding>) {
     let Some(expr) = when.expr.as_ref() else {
         return;
     };
-    if !is_null_literal(ctx, expr) || ctx.non_strict_operators.contains("=") {
+    // A simple CASE compares `test = value`, its operator recorded at the
+    // WHEN.
+    if !is_null_literal(ctx, expr) || !resolves_strict(ctx, when.location) {
         return;
     }
     let expr_start = operand_start(expr).unwrap_or(0);
@@ -227,6 +240,12 @@ fn case_when(ctx: &Ctx<'_>, when: &CaseWhen, out: &mut Vec<RawFinding>) {
         help: Some("use CASE WHEN x IS NULL".to_owned()),
         fix: Vec::new(),
     });
+}
+
+/// Whether every operator resolved at `location` is strict, a NULL operand
+/// making its result NULL. Unknown (the site was never analyzed) is not.
+fn resolves_strict(ctx: &Ctx<'_>, location: i32) -> bool {
+    ctx.view.operator_is_strict(location) == Some(true)
 }
 
 /// The operator's name without its schema: `OPERATOR(pg_catalog.=)` is
@@ -539,6 +558,43 @@ pub(super) fn condition_span(
     Some(start..end.max(start + 1))
 }
 
+/// The spans of the items of an `ORDER BY` or `GROUP BY` list, given each
+/// item's expression node: from its first token to the `,` after it, or
+/// to the clause or parenthesis that ends the list (the last item), so an
+/// item's `ASC` / `DESC`, `NULLS …` and `USING` are its own.
+pub(super) fn clause_item_spans(
+    ctx: &Ctx<'_>,
+    items: &[Option<&Node>],
+) -> Option<Vec<std::ops::Range<usize>>> {
+    items
+        .iter()
+        .map(|item| {
+            let start = node_span(ctx, (*item)?.to_ref())?.start;
+            let (end, _) = scan_until(ctx, start, |text| {
+                text == "," || (starts_clause(text) && !text.eq_ignore_ascii_case("USING"))
+            });
+            Some(start..end.max(start + 1))
+        })
+        .collect()
+}
+
+/// The edit removing item `index` of a comma-separated list whose items
+/// span `spans`, when `removed` (sorted) are the items going and some item
+/// stays: from the end of the item before it when one before it stays
+/// (`a, b` → `a`), else up to the start of the next one (`a, b` → `b`).
+/// Each item's edit is valid alone and together with the others.
+pub(super) fn list_item_removal(
+    spans: &[std::ops::Range<usize>],
+    removed: &[usize],
+    index: usize,
+) -> Option<std::ops::Range<usize>> {
+    if (0..index).any(|before| !removed.contains(&before)) {
+        Some(spans[index - 1].end..spans[index].end)
+    } else {
+        Some(spans[index].start..spans.get(index + 1)?.start)
+    }
+}
+
 pub(super) fn starts_clause(text: &str) -> bool {
     [
         "FROM",
@@ -644,26 +700,53 @@ pub(super) fn is_terminator(text: &str) -> bool {
 // ── not_in_nullable ────────────────────────────────────────────────────────
 
 fn not_in_nullable(ctx: &Ctx<'_>) -> Vec<RawFinding> {
+    // The sublinks a `NOT` applies to directly: `x NOT IN (SELECT …)` is
+    // `NOT (x = ANY (SELECT …))`.
+    let negated: std::collections::HashSet<i32> = ctx
+        .tree
+        .nodes()
+        .filter_map(|(node, _)| match node {
+            NodeRef::BoolExpr(expr) if expr.boolop == BoolExprType::NotExpr => {
+                match expr.args.as_slice() {
+                    [Some(N::SubLink(sub))] => Some(sub.location),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
-        let NodeRef::BoolExpr(expr) = node else {
+        let NodeRef::SubLink(sub) = node else {
             continue;
         };
-        not_in(ctx, expr, &mut out);
+        not_in(ctx, sub, negated.contains(&sub.location), &mut out);
     }
     out
 }
 
-fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
-    if expr.boolop != BoolExprType::NotExpr || expr.args.len() != 1 {
-        return;
-    }
-    let Some(Some(N::SubLink(sub))) = expr.args.first() else {
-        return;
+/// `x NOT IN (SELECT …)` (a negated `x = ANY (SELECT …)`) and `x <> ALL
+/// (SELECT …)` — the same comparison, `x <> y1 AND x <> y2 AND …` — with
+/// a NULL on either side.
+fn not_in(ctx: &Ctx<'_>, sub: &SubLink, negated: bool, out: &mut Vec<RawFinding>) {
+    let operator = sub
+        .oper_name
+        .iter()
+        .filter_map(|node| match node {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let form = match sub.sub_link_type {
+        SubLinkType::AnySublink if negated && (operator.is_empty() || operator == "=") => {
+            "NOT IN (SELECT …)"
+        }
+        // A negated `<> ALL` may be TRUE (`NOT NULL` is NULL, but `NOT
+        // FALSE` is TRUE): only the plain form keeps no rows.
+        SubLinkType::AllSublink if !negated && operator == "<>" => "<> ALL (SELECT …)",
+        _ => return,
     };
-    if sub.sub_link_type != SubLinkType::AnySublink {
-        return;
-    }
     // A row-valued `(a, b) NOT IN (SELECT …)` compares field by field, and
     // one NULL output column only makes the fields it is compared with
     // unknown: `(1, 2) NOT IN (SELECT 2, NULL)` still returns the row
@@ -675,35 +758,26 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
     {
         return;
     }
-    let operator = sub
-        .oper_name
-        .iter()
-        .filter_map(|node| match node {
-            Some(N::String(s)) => Some(s.sval.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(".");
-    if !operator.is_empty() && operator != "=" {
-        return;
-    }
     // The analyzer's facts: without one, we don't know either side's
-    // nullability, and never guess.
+    // nullability, and never guess. A comparison that is not strict (a
+    // user-defined operator CALLED ON NULL INPUT) may decide a NULL.
     let Some(fact) = ctx.view.sublink_nullability(sub.location) else {
         return;
     };
+    if !fact.operators_strict {
+        return;
+    }
     let message = match (fact.lhs_nullable, fact.subquery_nullable) {
         // A NULL left side against an empty subquery returns the row: the
         // "no rows" claim only holds once the subquery returns one.
-        (true, true) => {
-            "NOT IN (SELECT …) returns no rows for a NULL left side when the \
-                        subquery returns any row, or when the subquery returns a NULL"
-        }
+        (true, true) => format!(
+            "{form} returns no rows for a NULL left side when the subquery returns any row, \
+             or when the subquery returns a NULL"
+        ),
         (true, false) => {
-            "NOT IN (SELECT …) returns no rows for a NULL left side when the \
-                          subquery returns any row"
+            format!("{form} returns no rows for a NULL left side when the subquery returns any row")
         }
-        (false, true) => "NOT IN (SELECT …) returns no rows when the subquery returns a NULL",
+        (false, true) => format!("{form} returns no rows when the subquery returns a NULL"),
         (false, false) => return,
     };
     let start = sub
@@ -711,10 +785,10 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
         .as_ref()
         .and_then(operand_start)
         .or_else(|| location(sub.location))
-        .or_else(|| location(expr.location))
         .unwrap_or(0);
     // Scan from the subquery's opening parenthesis: the `NOT` and `IN`
-    // before it are terminators when scanning the left expression.
+    // (or the operator) before it are terminators when scanning the left
+    // expression.
     let sub_start = location(sub.location).unwrap_or(start);
     let end = ctx
         .tokens
@@ -725,7 +799,7 @@ fn not_in(ctx: &Ctx<'_>, expr: &BoolExpr, out: &mut Vec<RawFinding>) {
         .unwrap_or_else(|| expression_end(ctx, start));
     out.push(RawFinding {
         span: start..end.max(start + 1),
-        message: message.to_owned(),
+        message,
         help: Some(
             "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL".to_owned(),
         ),

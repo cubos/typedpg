@@ -545,43 +545,58 @@ impl MigrationLinter<'_> {
         let Some((_, table)) = self.table(catalog, relation) else {
             return Vec::new();
         };
-        let builds_index = |constraint: &typedpg_pg_query::ast::Constraint| {
-            matches!(
-                constraint.contype,
-                ConstrType::ConstrPrimary | ConstrType::ConstrUnique | ConstrType::ConstrExclusion
-            ) && constraint.indexname.is_empty()
+        // The constraints that build an index: a UNIQUE / PRIMARY KEY one
+        // (`true`), which can adopt an index built concurrently instead, or
+        // an EXCLUDE one (`false`), which can't.
+        let builds_index = |constraint: &typedpg_pg_query::ast::Constraint| match constraint.contype
+        {
+            _ if !constraint.indexname.is_empty() => None,
+            ConstrType::ConstrPrimary | ConstrType::ConstrUnique => Some(true),
+            ConstrType::ConstrExclusion => Some(false),
+            _ => None,
         };
-        let mut found = false;
+        let mut built = Vec::new();
         for command in &alter.cmds {
             let Some(command) = alter_command(command.as_ref()) else {
                 continue;
             };
             match (command.subtype, command.def.as_ref()) {
                 (AlterTableType::AtAddConstraint, Some(N::Constraint(constraint))) => {
-                    found |= builds_index(constraint);
+                    built.extend(builds_index(constraint));
                 }
                 (AlterTableType::AtAddColumn, Some(N::ColumnDef(column))) => {
-                    found |= column.constraints.iter().any(
-                        |node| matches!(node.as_ref(), Some(N::Constraint(c)) if builds_index(c)),
-                    );
+                    built.extend(column.constraints.iter().filter_map(
+                        |node| match node.as_ref() {
+                            Some(N::Constraint(constraint)) => builds_index(constraint),
+                            _ => None,
+                        },
+                    ));
                 }
                 _ => {}
             }
         }
-        if !found {
+        if built.is_empty() {
             return Vec::new();
         }
+        // Unlike CREATE INDEX (SHARE), ALTER TABLE builds a constraint's
+        // index under ACCESS EXCLUSIVE (`AlterTableGetLockLevel`: PRIMARY
+        // KEY, UNIQUE and EXCLUDE constraints, and ADD COLUMN), so reads
+        // wait too.
+        let help = if built.contains(&true) {
+            "CREATE UNIQUE INDEX CONCURRENTLY first (in a migration whose first line is \
+             -- no-transaction), then ADD CONSTRAINT … UNIQUE / PRIMARY KEY USING INDEX, which \
+             only takes the lock briefly"
+        } else {
+            "an EXCLUDE constraint can't adopt an index built CONCURRENTLY: add it while the \
+             table is small, or when the table can be locked for the whole build"
+        };
         vec![RawFinding {
             span: 0..0,
             message: format!(
-                "adding the constraint builds its index, blocking writes on {table} for the whole \
-                 build"
+                "adding the constraint builds its index under an ACCESS EXCLUSIVE lock, blocking \
+                 reads and writes on {table} for the whole build"
             ),
-            help: Some(
-                "CREATE UNIQUE INDEX CONCURRENTLY first (in a migration whose first line is \
-                 -- no-transaction), then ADD CONSTRAINT … USING INDEX"
-                    .to_owned(),
-            ),
+            help: Some(help.to_owned()),
             fix: Vec::new(),
         }]
     }
@@ -1211,9 +1226,9 @@ impl MigrationLinter<'_> {
         else {
             return Vec::new();
         };
-        let Some(keys) = catalog.lint_partition_key_columns(parent.oid) else {
+        if catalog.lint_partition_key_columns(parent.oid).is_none() {
             return Vec::new();
-        };
+        }
         for command in &alter.cmds {
             let Some(command) = alter_command(command.as_ref()) else {
                 continue;
@@ -1224,11 +1239,13 @@ impl MigrationLinter<'_> {
             let Some(N::PartitionCmd(partition)) = command.def.as_ref() else {
                 continue;
             };
-            let Some(class) = partition
-                .name
-                .as_ref()
-                .and_then(|relation| resolve_relation(catalog, relation))
-            else {
+            let (Some(class), Some(bound)) = (
+                partition
+                    .name
+                    .as_ref()
+                    .and_then(|relation| resolve_relation(catalog, relation)),
+                partition.bound.as_ref(),
+            ) else {
                 continue;
             };
             if !self.pre_existing.contains(&class.oid)
@@ -1236,32 +1253,66 @@ impl MigrationLinter<'_> {
             {
                 continue;
             }
-            let checked = catalog.iter_constraints().any(|constraint| {
-                constraint.conrelid == class.oid
-                    && constraint.contype == ConType::Check
-                    && constraint.convalidated
-                    && constraint.conenforced
-                    && catalog
-                        .check_expression(constraint.oid)
-                        .is_some_and(|expr| reads_any_column(expr, &keys))
-            });
-            if checked {
-                continue;
-            }
             let name = qualified_name(catalog, class);
-            return vec![RawFinding {
-                span: 0..0,
-                message: format!(
-                    "ATTACH PARTITION scans every row of {name} under an ACCESS EXCLUSIVE lock to \
-                     check it fits the partition bound"
-                ),
-                help: Some(format!(
-                    "first add a CHECK constraint on {name} that matches the bound (NOT VALID, \
-                     then VALIDATE CONSTRAINT in an earlier migration): PostgreSQL then skips the \
-                     scan"
-                )),
-                fix: Vec::new(),
-            }];
+            let mut found = Vec::new();
+            if catalog.lint_attach_partition_scans(parent.oid, class.oid, bound) {
+                let help = if bound.strategy == "h" {
+                    format!(
+                        "no CHECK constraint can imply a hash partition's bound: attach \
+                         {name} while it is empty, or create the partition with PARTITION OF \
+                         and copy the rows into it"
+                    )
+                } else if bound.is_default {
+                    format!(
+                        "the default partition's constraint (no other partition's bound) is not \
+                         one a CHECK constraint on {name} usually implies: attach it while it is \
+                         empty"
+                    )
+                } else {
+                    format!(
+                        "first add a CHECK constraint on {name} that implies the bound, with \
+                         NOT NULL on the key columns (NOT VALID, then VALIDATE CONSTRAINT in an \
+                         earlier migration): PostgreSQL then skips the scan"
+                    )
+                };
+                found.push(RawFinding {
+                    span: 0..0,
+                    message: format!(
+                        "ATTACH PARTITION scans every row of {name} under an ACCESS EXCLUSIVE \
+                         lock to check it fits the partition bound"
+                    ),
+                    help: Some(help),
+                    fix: Vec::new(),
+                });
+            }
+            // A default partition holds the rows no other partition takes:
+            // PostgreSQL scans it, under the same lock, for rows that belong
+            // to the new partition (`get_proposed_default_constraint`, which
+            // its CHECK constraints would have to refute).
+            if !bound.is_default
+                && let Some(default) = catalog
+                    .lint_default_partition(parent.oid)
+                    .filter(|default| self.pre_existing.contains(default))
+                    .and_then(|default| catalog.class_row(default))
+            {
+                let default_name = qualified_name(catalog, default);
+                found.push(RawFinding {
+                    span: 0..0,
+                    message: format!(
+                        "ATTACH PARTITION scans every row of the default partition \
+                         {default_name} under an ACCESS EXCLUSIVE lock, for rows that belong to \
+                         {name}"
+                    ),
+                    help: Some(format!(
+                        "keep the default partition small: move rows out of {default_name} \
+                         before attaching partitions for them"
+                    )),
+                    fix: Vec::new(),
+                });
+            }
+            if !found.is_empty() {
+                return found;
+            }
         }
         Vec::new()
     }
@@ -1272,14 +1323,27 @@ impl MigrationLinter<'_> {
         if self.lock_timeout_effective() || self.lock_timeout_reported {
             return Vec::new();
         }
-        let Some((kind, relid)) = lock_target(catalog, &self.pre_existing, node) else {
+        let Some(target) = lock_target(catalog, &self.pre_existing, node) else {
             return Vec::new();
         };
-        let Some(class) = catalog.class_row(relid) else {
+        let Some(class) = catalog.class_row(target.relation) else {
             return Vec::new();
         };
         self.lock_timeout_reported = true;
-        let table = qualified_name(catalog, class);
+        let kind = target.kind;
+        let table = match target.index.and_then(|index| catalog.class_row(index)) {
+            Some(index) => format!(
+                "{} (the table of {})",
+                qualified_name(catalog, class),
+                qualified_name(catalog, index)
+            ),
+            None => qualified_name(catalog, class),
+        };
+        let blocked = if target.blocks_reads {
+            "every query on the table"
+        } else {
+            "every write to the table"
+        };
         let help = if self.file_runs_in_transaction() {
             "start the migration with SET LOCAL lock_timeout = '5s' and retry on timeout"
         } else {
@@ -1289,7 +1353,7 @@ impl MigrationLinter<'_> {
             span: 0..0,
             message: format!(
                 "{kind} waits for a lock on {table} with no lock_timeout: queued behind a long \
-                 transaction, it blocks every query on the table"
+                 transaction, it blocks {blocked}"
             ),
             help: Some(help.to_owned()),
             fix: Vec::new(),
@@ -1917,14 +1981,25 @@ impl MigrationLinter<'_> {
                     continue;
                 }
                 let column = quote_identifier(&attribute.attname);
+                let array = catalog
+                    .type_row(base_type(catalog, attribute.atttypid))
+                    .is_some_and(|ty| ty.typcategory == TypCategory::Array);
+                let brackets = if array { "[]" } else { "" };
                 let message = if kind == "varchar" {
-                    format!("{table}.{column} is varchar({length})")
+                    format!("{table}.{column} is varchar({length}){brackets}")
                 } else {
-                    format!("{table}.{column} is char({length}): char pads with spaces")
+                    format!("{table}.{column} is char({length}){brackets}: char pads with spaces")
                 };
-                let help = format!(
-                    "use text, with a CHECK (char_length({column}) <= {length}) if the limit matters"
-                );
+                // `char_length` takes one string: an array's elements have no
+                // CHECK as simple to offer.
+                let help = if array {
+                    "use text[]".to_owned()
+                } else {
+                    format!(
+                        "use text, with a CHECK (char_length({column}) <= {length}) if the limit \
+                         matters"
+                    )
+                };
                 out.push(SchemaFinding {
                     object: CreatedObject::Column(class.oid, attribute.attnum),
                     raw: RawFinding {
@@ -2203,58 +2278,105 @@ impl MigrationLinter<'_> {
     fn redundant_index(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut indexes: Vec<&PgIndex> = catalog.iter_indexes().collect();
         indexes.sort_by_key(|index| index.indexrelid);
-        let mut out = Vec::new();
+        // The indexes each one is redundant with, exact duplicates first,
+        // then in OID order.
+        let mut covered_by: HashMap<PgClassOid, Vec<&PgIndex>> = HashMap::new();
         for index in &indexes {
-            let Some(creator) = self.created_indexes.get(&index.indexrelid) else {
+            // A constraint's index cannot be dropped with DROP INDEX, and ON
+            // CONFLICT ON CONSTRAINT depends on it: never report it as the
+            // redundant one. When it duplicates a standalone index, that
+            // standalone index is the one to drop.
+            if catalog.index_backs_constraint(index.indexrelid) {
                 continue;
-            };
-            if let Some((other, exact)) = redundant_with(catalog, &self.orderings, &indexes, index)
-            {
-                // A constraint's index cannot be dropped with DROP INDEX,
-                // and ON CONFLICT ON CONSTRAINT depends on it: never report
-                // it as the redundant one. When it duplicates a standalone
-                // index, that standalone index is the one to drop (and its
-                // own turn below reports it).
-                if catalog.index_backs_constraint(index.indexrelid) {
-                    continue;
-                }
-                // Two standalone exact duplicates: only the one created
+            }
+            let mut covers_it: Vec<(&PgIndex, bool)> = indexes
+                .iter()
+                .filter_map(|other| {
+                    let exact = covers(catalog, &self.orderings, index, other)?;
+                    Some((*other, exact))
+                })
+                // Of two standalone exact duplicates, only the one created
                 // later is redundant with the one already there.
-                if exact
-                    && !catalog.index_backs_constraint(other.indexrelid)
-                    && let Some(other_creator) = self.created_indexes.get(&other.indexrelid)
-                    && (other_creator.file, other_creator.span.start)
-                        > (creator.file, creator.span.start)
-                {
-                    continue;
-                }
-                let (Some(name), Some(other_name)) = (
-                    catalog.class_row(index.indexrelid),
-                    catalog.class_row(other.indexrelid),
-                ) else {
-                    continue;
-                };
-                out.push(SchemaFinding {
-                    object: CreatedObject::Index(index.indexrelid),
-                    raw: RawFinding {
-                        span: 0..0,
-                        message: format!(
-                            "index {} is redundant with {}",
-                            quote_identifier(&name.relname),
-                            quote_identifier(&other_name.relname)
-                        ),
-                        help: None,
-                        fix: Vec::new(),
-                    },
-                    help_in_new_migration: Some(format!(
-                        "DROP INDEX CONCURRENTLY {}, in a new migration whose first line is \
-                         -- no-transaction",
-                        quote_identifier(&name.relname)
-                    )),
-                });
+                .filter(|(other, exact)| {
+                    !(*exact
+                        && !catalog.index_backs_constraint(other.indexrelid)
+                        && self.created_later(other.indexrelid, index.indexrelid))
+                })
+                .collect();
+            covers_it.sort_by_key(|(_, exact)| !exact);
+            if !covers_it.is_empty() {
+                covered_by.insert(
+                    index.indexrelid,
+                    covers_it.into_iter().map(|(other, _)| other).collect(),
+                );
             }
         }
+        // Every one of ours that something covers is reported, so each
+        // finding names an index that stays: a cover that is not reported
+        // itself, or, through the reported ones, the one that covers them
+        // (covering is transitive). With `(email)`, `(email)` again and
+        // `(email, name)`, both `(email)` indexes name `(email, name)`.
+        let reported = |oid: PgClassOid| {
+            covered_by.contains_key(&oid) && self.created_indexes.contains_key(&oid)
+        };
+        let survivor = |index: PgClassOid| -> Option<PgClassOid> {
+            let mut current = index;
+            let mut seen = HashSet::from([index]);
+            loop {
+                let covers_it = covered_by.get(&current)?;
+                let next = covers_it
+                    .iter()
+                    .find(|other| !reported(other.indexrelid))
+                    .or_else(|| covers_it.first())?
+                    .indexrelid;
+                if !reported(next) || !seen.insert(next) {
+                    return Some(next);
+                }
+                current = next;
+            }
+        };
+        let mut out = Vec::new();
+        for index in &indexes {
+            if !reported(index.indexrelid) {
+                continue;
+            }
+            let Some(other) = survivor(index.indexrelid) else {
+                continue;
+            };
+            let (Some(name), Some(other_name)) = (
+                catalog.class_row(index.indexrelid),
+                catalog.class_row(other),
+            ) else {
+                continue;
+            };
+            out.push(SchemaFinding {
+                object: CreatedObject::Index(index.indexrelid),
+                raw: RawFinding {
+                    span: 0..0,
+                    message: format!(
+                        "index {} is redundant with {}",
+                        quote_identifier(&name.relname),
+                        quote_identifier(&other_name.relname)
+                    ),
+                    help: None,
+                    fix: Vec::new(),
+                },
+                help_in_new_migration: Some(format!(
+                    "DROP INDEX CONCURRENTLY {}, in a new migration whose first line is \
+                     -- no-transaction",
+                    quote_identifier(&name.relname)
+                )),
+            });
+        }
         out
+    }
+
+    /// Whether our migrations created index `a` after index `b`.
+    fn created_later(&self, a: PgClassOid, b: PgClassOid) -> bool {
+        match (self.created_indexes.get(&a), self.created_indexes.get(&b)) {
+            (Some(a), Some(b)) => (a.file, a.span.start) > (b.file, b.span.start),
+            _ => false,
+        }
     }
 }
 
@@ -2919,57 +3041,92 @@ fn parse_pg_number(value: &str) -> Option<f64> {
     Some(if negative { -parsed } else { parsed })
 }
 
+/// What a statement waits to lock: the table whose queries queue behind it.
+struct LockTarget {
+    /// The statement's kind, as the message names it.
+    kind: &'static str,
+    /// The table (or other relation) locked.
+    relation: PgClassOid,
+    /// The index the statement is about, when it names one: a `DROP INDEX`
+    /// or `REINDEX INDEX` locks the index's table.
+    index: Option<PgClassOid>,
+    /// The lock conflicts with `ACCESS SHARE` (it is `ACCESS EXCLUSIVE`), so
+    /// even a plain `SELECT` queues behind it; otherwise only writers do.
+    blocks_reads: bool,
+}
+
+impl LockTarget {
+    fn new((kind, relation): (&'static str, PgClassOid), blocks_reads: bool) -> LockTarget {
+        LockTarget {
+            kind,
+            relation,
+            index: None,
+            blocks_reads,
+        }
+    }
+}
+
 /// The first statement that takes a write-blocking lock on a relation that
-/// existed when the file started, the statement's kind and the relation.
+/// existed when the file started: what it locks, and how strongly (each
+/// lock level as PostgreSQL 19 takes it: `AlterTableGetLockLevel`,
+/// `RangeVarCallbackForDropRelation`, `ReindexIndex` / `ReindexTable`,
+/// `DefineIndex`, `CreateTrigger`, `CreatePolicy`, `DefineQueryRewrite`).
 fn lock_target(
     catalog: &PgCatalog,
     pre_existing: &HashSet<PgClassOid>,
     node: &N,
-) -> Option<(&'static str, PgClassOid)> {
+) -> Option<LockTarget> {
+    let exclusive = |target| Some(LockTarget::new(target, true));
     match node {
         N::AlterTableStmt(alter) => alter_table_lock_target(catalog, pre_existing, alter),
-        N::CreateStmt(create) => {
-            create_table_foreign_keys(create)
-                .into_iter()
-                .find_map(|relation| {
-                    existing_relation(catalog, pre_existing, relation, "CREATE TABLE")
-                })
-        }
+        // A foreign key's referenced table gets SHARE ROW EXCLUSIVE.
+        N::CreateStmt(create) => create_table_foreign_keys(create)
+            .into_iter()
+            .find_map(|relation| existing_relation(catalog, pre_existing, relation, "CREATE TABLE"))
+            .map(|target| LockTarget::new(target, false)),
+        // SHARE.
         N::IndexStmt(index) => {
             let relation = index.relation.as_ref()?;
             if index.concurrent {
                 return None;
             }
             existing_relation(catalog, pre_existing, relation, "CREATE INDEX")
+                .map(|target| LockTarget::new(target, false))
         }
         N::DropStmt(drop) => drop_lock_target(catalog, pre_existing, drop),
         N::TruncateStmt(truncate) => {
             first_relation(catalog, pre_existing, &truncate.relations, "TRUNCATE")
+                .and_then(exclusive)
         }
+        // SHARE ROW EXCLUSIVE.
         N::CreateTrigStmt(trigger) => existing_relation(
             catalog,
             pre_existing,
             trigger.relation.as_ref()?,
             "CREATE TRIGGER",
-        ),
+        )
+        .map(|target| LockTarget::new(target, false)),
         N::CreatePolicyStmt(policy) => existing_relation(
             catalog,
             pre_existing,
             policy.table.as_ref()?,
             "CREATE POLICY",
-        ),
+        )
+        .and_then(exclusive),
         N::AlterPolicyStmt(policy) => existing_relation(
             catalog,
             pre_existing,
             policy.table.as_ref()?,
             "ALTER POLICY",
-        ),
+        )
+        .and_then(exclusive),
         N::RuleStmt(rule) => existing_relation(
             catalog,
             pre_existing,
             rule.relation.as_ref()?,
             "CREATE RULE",
-        ),
+        )
+        .and_then(exclusive),
         N::RenameStmt(rename) => {
             if !matches!(
                 rename.rename_type,
@@ -2983,10 +3140,12 @@ fn lock_target(
                 rename.relation.as_ref()?,
                 "ALTER TABLE",
             )
+            .and_then(exclusive)
         }
         N::LockStmt(lock) => {
             if lock_mode_blocks_writes(lock.mode) {
                 first_relation(catalog, pre_existing, &lock.relations, "LOCK TABLE")
+                    .map(|target| LockTarget::new(target, lock_mode_blocks_reads(lock.mode)))
             } else {
                 None
             }
@@ -3001,6 +3160,7 @@ fn lock_target(
                 refresh.relation.as_ref()?,
                 "REFRESH MATERIALIZED VIEW",
             )
+            .and_then(exclusive)
         }
         N::RepackStmt(repack) => {
             // REPACK (CONCURRENTLY) holds ShareUpdateExclusiveLock until
@@ -3019,31 +3179,65 @@ fn lock_target(
                 repack.relation.as_ref()?.relation.as_ref()?,
                 command,
             )
+            .and_then(exclusive)
         }
         N::VacuumStmt(vacuum) => {
             if !vacuum.is_vacuumcmd || !option_enabled(&vacuum.options, "full") {
                 return None;
             }
-            vacuum.rels.iter().find_map(|relation| {
-                let N::VacuumRelation(relation) = relation.as_ref()? else {
-                    return None;
-                };
-                existing_relation(
-                    catalog,
-                    pre_existing,
-                    relation.relation.as_ref()?,
-                    "VACUUM FULL",
-                )
-            })
+            vacuum
+                .rels
+                .iter()
+                .find_map(|relation| {
+                    let N::VacuumRelation(relation) = relation.as_ref()? else {
+                        return None;
+                    };
+                    existing_relation(
+                        catalog,
+                        pre_existing,
+                        relation.relation.as_ref()?,
+                        "VACUUM FULL",
+                    )
+                })
+                .and_then(exclusive)
         }
+        // SHARE on the table (and, once granted, ACCESS EXCLUSIVE on each
+        // index it rebuilds).
         N::ReindexStmt(reindex) => {
             if option_enabled(&reindex.params, "concurrently") {
                 return None;
             }
-            existing_relation(catalog, pre_existing, reindex.relation.as_ref()?, "REINDEX")
+            let relation = reindex.relation.as_ref()?;
+            if reindex.kind == typedpg_pg_query::ast::ReindexObjectType::ReindexObjectIndex {
+                let (_, index) =
+                    existing_relation(catalog, pre_existing, relation, "REINDEX INDEX")?;
+                return index_lock_target("REINDEX INDEX", catalog, pre_existing, index, false);
+            }
+            existing_relation(catalog, pre_existing, relation, "REINDEX")
+                .map(|target| LockTarget::new(target, false))
         }
         _ => None,
     }
+}
+
+/// The lock a statement about `index` takes on the index's table.
+fn index_lock_target(
+    kind: &'static str,
+    catalog: &PgCatalog,
+    pre_existing: &HashSet<PgClassOid>,
+    index: PgClassOid,
+    blocks_reads: bool,
+) -> Option<LockTarget> {
+    let table = catalog
+        .iter_indexes()
+        .find(|row| row.indexrelid == index)?
+        .indrelid;
+    pre_existing.contains(&table).then_some(LockTarget {
+        kind,
+        relation: table,
+        index: Some(index),
+        blocks_reads,
+    })
 }
 
 fn existing_relation(
@@ -3077,15 +3271,19 @@ fn alter_table_lock_target(
     catalog: &PgCatalog,
     pre_existing: &HashSet<PgClassOid>,
     alter: &typedpg_pg_query::ast::AlterTableStmt,
-) -> Option<(&'static str, PgClassOid)> {
+) -> Option<LockTarget> {
     let mut strong = false;
+    let mut exclusive = false;
     let mut referenced = Vec::new();
     let mut attached = Vec::new();
     for node in &alter.cmds {
         let Some(command) = alter_command(node.as_ref()) else {
             continue;
         };
-        strong |= !only_share_update_exclusive(command);
+        if !only_share_update_exclusive(command) {
+            strong = true;
+            exclusive |= !share_row_exclusive(command);
+        }
         if let Some(foreign_key) = added_foreign_key(command)
             && let Some(table) = foreign_key.pktable.as_ref()
         {
@@ -3107,16 +3305,43 @@ fn alter_table_lock_target(
         && let Some(relation) = alter.relation.as_ref()
         && let Some(target) = existing_relation(catalog, pre_existing, relation, "ALTER TABLE")
     {
-        return Some(target);
+        return Some(LockTarget::new(target, exclusive));
     }
     attached
         .into_iter()
         .find_map(|relation| existing_relation(catalog, pre_existing, relation, "ALTER TABLE"))
+        .map(|target| LockTarget::new(target, true))
         .or_else(|| {
-            referenced.into_iter().find_map(|relation| {
-                existing_relation(catalog, pre_existing, relation, "ALTER TABLE")
-            })
+            // The referenced table of a foreign key gets SHARE ROW
+            // EXCLUSIVE.
+            referenced
+                .into_iter()
+                .find_map(|relation| {
+                    existing_relation(catalog, pre_existing, relation, "ALTER TABLE")
+                })
+                .map(|target| LockTarget::new(target, false))
         })
+}
+
+/// Whether an `ALTER TABLE` subcommand takes `SHARE ROW EXCLUSIVE`, which
+/// blocks writers but not readers (`AlterTableGetLockLevel`): enabling or
+/// disabling triggers, and adding a foreign key.
+fn share_row_exclusive(command: &typedpg_pg_query::ast::AlterTableCmd) -> bool {
+    match command.subtype {
+        AlterTableType::AtEnableTrig
+        | AlterTableType::AtEnableAlwaysTrig
+        | AlterTableType::AtEnableReplicaTrig
+        | AlterTableType::AtEnableTrigAll
+        | AlterTableType::AtEnableTrigUser
+        | AlterTableType::AtDisableTrig
+        | AlterTableType::AtDisableTrigAll
+        | AlterTableType::AtDisableTrigUser => true,
+        AlterTableType::AtAddConstraint => matches!(
+            command.def.as_ref(),
+            Some(N::Constraint(constraint)) if constraint_is_foreign_key(constraint)
+        ),
+        _ => false,
+    }
 }
 
 /// `LOCK TABLE` takes the mode it names. `SHARE` is the weakest mode that
@@ -3128,6 +3353,13 @@ fn alter_table_lock_target(
 fn lock_mode_blocks_writes(mode: i32) -> bool {
     const SHARE: i32 = 5;
     mode == 0 || mode >= SHARE
+}
+
+/// Whether a `LOCK TABLE` mode conflicts with a reader's `ACCESS SHARE`:
+/// only `ACCESS EXCLUSIVE` (8, the default) does.
+fn lock_mode_blocks_reads(mode: i32) -> bool {
+    const ACCESS_EXCLUSIVE: i32 = 8;
+    mode == 0 || mode == ACCESS_EXCLUSIVE
 }
 
 /// Whether an `ALTER TABLE` subcommand only takes `SHARE UPDATE EXCLUSIVE`
@@ -3225,31 +3457,27 @@ fn drop_lock_target(
     catalog: &PgCatalog,
     pre_existing: &HashSet<PgClassOid>,
     drop: &typedpg_pg_query::ast::DropStmt,
-) -> Option<(&'static str, PgClassOid)> {
-    let kind = match drop.remove_type {
-        ObjectType::ObjectTable | ObjectType::ObjectForeignTable => "DROP TABLE",
-        ObjectType::ObjectIndex if !drop.concurrent => "DROP INDEX",
+) -> Option<LockTarget> {
+    let index = match drop.remove_type {
+        ObjectType::ObjectTable | ObjectType::ObjectForeignTable => false,
+        ObjectType::ObjectIndex if !drop.concurrent => true,
         _ => return None,
     };
     for object in &drop.objects {
-        let Some(N::List(list)) = object.as_ref() else {
+        let Some(class) = object_relation(catalog, object.as_ref()) else {
             continue;
         };
-        let names: Vec<&str> = list
-            .items
-            .iter()
-            .filter_map(|n| string_node(n.as_ref()))
-            .collect();
-        let (schema, name) = match names.as_slice() {
-            [name] => (None, *name),
-            [schema, name] => (Some(*schema), *name),
-            _ => continue,
-        };
-        let Some(class) = catalog.resolve_table(schema, name) else {
+        if !pre_existing.contains(&class.oid) {
             continue;
-        };
-        if pre_existing.contains(&class.oid) {
-            return Some((kind, class.oid));
+        }
+        // Either way the table gets ACCESS EXCLUSIVE.
+        if !index {
+            return Some(LockTarget::new(("DROP TABLE", class.oid), true));
+        }
+        if let Some(target) =
+            index_lock_target("DROP INDEX", catalog, pre_existing, class.oid, true)
+        {
+            return Some(target);
         }
     }
     None
@@ -3270,18 +3498,6 @@ fn object_relation<'a>(catalog: &'a PgCatalog, object: Option<&Node>) -> Option<
         [schema, name] => catalog.resolve_table(Some(schema), name),
         _ => None,
     }
-}
-
-/// Whether `node` references one of `columns`.
-fn reads_any_column(node: &Node, columns: &[String]) -> bool {
-    node.nodes().any(|(node, _)| match node {
-        typedpg_pg_query::NodeRef::ColumnRef(column) => column
-            .fields
-            .last()
-            .and_then(|field| string_node(field.as_ref()))
-            .is_some_and(|name| columns.iter().any(|column| column == name)),
-        _ => false,
-    })
 }
 
 fn string_node(node: Option<&Node>) -> Option<&str> {
@@ -3412,26 +3628,25 @@ fn column_name(node: &Node) -> Option<&str> {
     }
 }
 
-/// Another index `index` is redundant with, and whether the two are exact
+/// Whether `other` covers `index`, and if so whether the two are exact
 /// duplicates.
 ///
-/// `index` is redundant when `other` leads with the same key columns, in the
+/// `other` covers `index` when it leads with the same key columns, in the
 /// same order and with the same operator classes, collations and sort
 /// orders, and `index` adds nothing: no uniqueness `other` lacks, and no
 /// `INCLUDE` columns (a covering index serves index-only scans `other` may
 /// not), unless the two are identical.
-fn redundant_with<'a>(
+fn covers(
     catalog: &PgCatalog,
     orderings: &HashMap<PgClassOid, Vec<(bool, bool)>>,
-    indexes: &[&'a PgIndex],
     index: &PgIndex,
-) -> Option<(&'a PgIndex, bool)> {
+    other: &PgIndex,
+) -> Option<bool> {
     let key_count = usize::try_from(index.indnkeyatts).unwrap_or(0);
     if !keys_plain(index) || key_count == 0 || index.indkey.len() < key_count {
         return None;
     }
     let covering = index.indkey.len() > key_count;
-    let method = catalog.index_access_method(index.indexrelid);
     let nulls_not_distinct =
         |index: &PgIndex| catalog.lint_index_nulls_not_distinct(index.indexrelid);
     let deferrable = |index: &PgIndex| catalog.lint_index_is_deferrable(index.indexrelid);
@@ -3444,61 +3659,53 @@ fn redundant_with<'a>(
         order.truncate(n);
         order
     };
-    let mut best: Option<(&PgIndex, bool)> = None;
-    for other in indexes {
-        if other.indexrelid == index.indexrelid
-            || other.indrelid != index.indrelid
-            || !keys_plain(other)
-            || catalog.index_access_method(other.indexrelid) != method
-            // An immediate unique index enforces its uniqueness at each
-            // statement, a deferrable one only at commit: neither replaces
-            // the other.
-            || deferrable(index) != deferrable(other)
-        {
-            continue;
-        }
-        let other_keys = usize::try_from(other.indnkeyatts).unwrap_or(0);
-        if other_keys < key_count || other.indkey.len() < key_count {
-            continue;
-        }
-        if index.indkey[..key_count] != other.indkey[..key_count]
-            || index.indclass.get(..key_count) != other.indclass.get(..key_count)
-            || index.indcollation.get(..key_count) != other.indcollation.get(..key_count)
-            || order(index, key_count) != order(other, key_count)
-        {
-            continue;
-        }
-        let index_nulls = nulls_not_distinct(index);
-        let other_nulls = nulls_not_distinct(other);
-        let exact = other_keys == key_count
-            && other.indkey == index.indkey
-            && other.indisunique == index.indisunique
-            && other_nulls == index_nulls;
-        if exact {
-            return Some((other, true));
-        }
-        if index.indisunique || covering {
-            // A unique NULLS DISTINCT index adds nothing over a unique NULLS
-            // NOT DISTINCT index on the same columns: the latter enforces
-            // strictly more (it also rejects duplicate NULLs) and serves the
-            // same equality lookups. The reverse is not true.
-            if !covering
-                && index.indisunique
-                && other.indisunique
-                && other_keys == key_count
-                && other.indkey == index.indkey
-                && !index_nulls
-                && other_nulls
-            {
-                return Some((other, false));
-            }
-            continue;
-        }
-        if best.is_none() {
-            best = Some((other, false));
-        }
+    if other.indexrelid == index.indexrelid
+        || other.indrelid != index.indrelid
+        || !keys_plain(other)
+        || catalog.index_access_method(other.indexrelid)
+            != catalog.index_access_method(index.indexrelid)
+        // An immediate unique index enforces its uniqueness at each
+        // statement, a deferrable one only at commit: neither replaces the
+        // other.
+        || deferrable(index) != deferrable(other)
+    {
+        return None;
     }
-    best
+    let other_keys = usize::try_from(other.indnkeyatts).unwrap_or(0);
+    if other_keys < key_count || other.indkey.len() < key_count {
+        return None;
+    }
+    if index.indkey[..key_count] != other.indkey[..key_count]
+        || index.indclass.get(..key_count) != other.indclass.get(..key_count)
+        || index.indcollation.get(..key_count) != other.indcollation.get(..key_count)
+        || order(index, key_count) != order(other, key_count)
+    {
+        return None;
+    }
+    let index_nulls = nulls_not_distinct(index);
+    let other_nulls = nulls_not_distinct(other);
+    if other_keys == key_count
+        && other.indkey == index.indkey
+        && other.indisunique == index.indisunique
+        && other_nulls == index_nulls
+    {
+        return Some(true);
+    }
+    if index.indisunique || covering {
+        // A unique NULLS DISTINCT index adds nothing over a unique NULLS NOT
+        // DISTINCT index on the same columns: the latter enforces strictly
+        // more (it also rejects duplicate NULLs) and serves the same
+        // equality lookups. The reverse is not true.
+        return (!covering
+            && index.indisunique
+            && other.indisunique
+            && other_keys == key_count
+            && other.indkey == index.indkey
+            && !index_nulls
+            && other_nulls)
+            .then_some(false);
+    }
+    Some(false)
 }
 
 /// `stmt`'s key columns' order: `(descending, nulls first)` each, nulls
@@ -4266,6 +4473,185 @@ mod tests {
     }
 
     #[test]
+    fn missing_lock_timeout_names_the_table_and_what_queues_behind_it() {
+        let reads = "queued behind a long transaction, it blocks every query on the table";
+        let writes = "queued behind a long transaction, it blocks every write to the table";
+        for (sql, message) in [
+            // DROP INDEX locks its table ACCESS EXCLUSIVE.
+            (
+                "DROP INDEX users_email_idx;",
+                format!(
+                    "DROP INDEX waits for a lock on public.users (the table of \
+                     public.users_email_idx) with no lock_timeout: {reads}"
+                ),
+            ),
+            // REINDEX INDEX waits for SHARE on the table.
+            (
+                "REINDEX INDEX users_email_idx;",
+                format!(
+                    "REINDEX INDEX waits for a lock on public.users (the table of \
+                     public.users_email_idx) with no lock_timeout: {writes}"
+                ),
+            ),
+            (
+                "REINDEX TABLE users;",
+                format!("REINDEX waits for a lock on public.users with no lock_timeout: {writes}"),
+            ),
+            (
+                "CREATE INDEX users_id_email_idx ON users (id, email);",
+                format!(
+                    "CREATE INDEX waits for a lock on public.users with no lock_timeout: {writes}"
+                ),
+            ),
+            (
+                "CREATE TRIGGER t BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION \
+                 suppress_redundant_updates_trigger();",
+                format!(
+                    "CREATE TRIGGER waits for a lock on public.users with no lock_timeout: {writes}"
+                ),
+            ),
+            (
+                "ALTER TABLE users DISABLE TRIGGER ALL;",
+                format!(
+                    "ALTER TABLE waits for a lock on public.users with no lock_timeout: {writes}"
+                ),
+            ),
+            (
+                "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) \
+                 REFERENCES users (id) NOT VALID;",
+                format!(
+                    "ALTER TABLE waits for a lock on public.posts with no lock_timeout: {writes}"
+                ),
+            ),
+            // One ACCESS EXCLUSIVE subcommand makes the whole statement's.
+            (
+                "ALTER TABLE users DISABLE TRIGGER ALL, ADD COLUMN nickname text;",
+                format!(
+                    "ALTER TABLE waits for a lock on public.users with no lock_timeout: {reads}"
+                ),
+            ),
+            (
+                "LOCK TABLE users IN EXCLUSIVE MODE;",
+                format!(
+                    "LOCK TABLE waits for a lock on public.users with no lock_timeout: {writes}"
+                ),
+            ),
+            (
+                "LOCK TABLE users;",
+                format!(
+                    "LOCK TABLE waits for a lock on public.users with no lock_timeout: {reads}"
+                ),
+            ),
+            (
+                "TRUNCATE users;",
+                format!("TRUNCATE waits for a lock on public.users with no lock_timeout: {reads}"),
+            ),
+        ] {
+            let findings = second(sql);
+            let found = only(&findings, Rule::MissingLockTimeout);
+            assert_eq!(found.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(found[0].finding.message, message, "{sql}");
+        }
+    }
+
+    #[test]
+    fn redundant_index_reports_every_redundant_index_in_one_run() {
+        let messages = |sql: &str| -> Vec<String> {
+            let findings = lint(
+                &[("001_all.sql", sql, MigrationLint::All)],
+                true,
+                &LintOptions::default(),
+            );
+            only(&findings, Rule::RedundantIndex)
+                .iter()
+                .map(|found| found.finding.message.clone())
+                .collect()
+        };
+        // Both `(email)` indexes go, and each names the index that stays.
+        assert_eq!(
+            messages(
+                "CREATE TABLE users (id integer PRIMARY KEY, email text, name text);
+                 CREATE INDEX users_email_a ON users (email);
+                 CREATE INDEX users_email_b ON users (email);
+                 CREATE INDEX users_email_name ON users (email, name);"
+            ),
+            [
+                "index users_email_a is redundant with users_email_name",
+                "index users_email_b is redundant with users_email_name",
+            ]
+        );
+        // A chain: each one's survivor is the widest index.
+        assert_eq!(
+            messages(
+                "CREATE TABLE t (a integer, b integer, c integer);
+                 CREATE INDEX t_a ON t (a);
+                 CREATE INDEX t_ab ON t (a, b);
+                 CREATE INDEX t_abc ON t (a, b, c);"
+            ),
+            [
+                "index t_a is redundant with t_abc",
+                "index t_ab is redundant with t_abc",
+            ]
+        );
+        // Without a wider index, only the later duplicate goes.
+        assert_eq!(
+            messages(
+                "CREATE TABLE users (id integer PRIMARY KEY, email text);
+                 CREATE INDEX users_email_a ON users (email);
+                 CREATE INDEX users_email_b ON users (email);"
+            ),
+            ["index users_email_b is redundant with users_email_a"]
+        );
+        // A unique index stays (it enforces something); the plain ones it
+        // covers name it.
+        assert_eq!(
+            messages(
+                "CREATE TABLE users (id integer PRIMARY KEY, email text, name text);
+                 CREATE INDEX users_email_a ON users (email);
+                 CREATE INDEX users_email_b ON users (email);
+                 CREATE UNIQUE INDEX users_email_name ON users (email, name);"
+            ),
+            [
+                "index users_email_a is redundant with users_email_name",
+                "index users_email_b is redundant with users_email_name",
+            ]
+        );
+    }
+
+    #[test]
+    fn create_index_blocking_says_add_constraint_blocks_reads_too() {
+        let findings = second("ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);");
+        let found = only(&findings, Rule::CreateIndexBlocking);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "adding the constraint builds its index under an ACCESS EXCLUSIVE lock, blocking \
+             reads and writes on public.users for the whole build"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "CREATE UNIQUE INDEX CONCURRENTLY first (in a migration whose first line is \
+                 -- no-transaction), then ADD CONSTRAINT … UNIQUE / PRIMARY KEY USING INDEX, \
+                 which only takes the lock briefly"
+            )
+        );
+        // An exclusion constraint can't adopt a concurrently built index.
+        let findings = second(
+            "ALTER TABLE users ADD CONSTRAINT users_id_excl EXCLUDE USING btree (id WITH =);",
+        );
+        let found = only(&findings, Rule::CreateIndexBlocking);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "an EXCLUDE constraint can't adopt an index built CONCURRENTLY: add it while \
+                 the table is small, or when the table can be locked for the whole build"
+            )
+        );
+    }
+
+    #[test]
     fn missing_lock_timeout_ignores_concurrent_operations() {
         let findings = lint(
             &[
@@ -4445,11 +4831,13 @@ mod tests {
         );
         let found = only(&findings, Rule::PreferText);
         assert_eq!(found.len(), 2, "{found:?}");
-        assert_eq!(found[0].finding.message, "public.texts.a is varchar(10)");
+        assert_eq!(found[0].finding.message, "public.texts.a is varchar(10)[]");
+        assert_eq!(found[0].finding.help.as_deref(), Some("use text[]"));
         assert_eq!(
             found[1].finding.message,
-            "public.texts.d is char(2): char pads with spaces"
+            "public.texts.d is char(2)[]: char pads with spaces"
         );
+        assert_eq!(found[1].finding.help.as_deref(), Some("use text[]"));
     }
 
     #[test]
@@ -5269,14 +5657,535 @@ mod tests {
                 "{check}: {findings:?}"
             );
         }
-        // A validated CHECK on the key lets PostgreSQL skip the scan.
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "first add a CHECK constraint on public.measurements_new that implies the bound, \
+                 with NOT NULL on the key columns (NOT VALID, then VALIDATE CONSTRAINT in an \
+                 earlier migration): PostgreSQL then skips the scan"
+            )
+        );
+        // A CHECK that matches the bound but leaves the key nullable: the
+        // partition constraint's `id IS NOT NULL` is not implied (a CHECK
+        // passes on NULL), so PostgreSQL still scans.
         let findings = attach_with(
             "ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id >= 100 AND id < 200);",
+        );
+        assert_eq!(
+            only(&findings, Rule::AttachPartitionScan).len(),
+            1,
+            "{findings:?}"
+        );
+        // With the key NOT NULL (or IS NOT NULL in the check), it is
+        // implied.
+        for before in [
+            "ALTER TABLE measurements_new ALTER COLUMN id SET NOT NULL;
+             ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id >= 100 AND id < 200);",
+            "ALTER TABLE measurements_new ADD CONSTRAINT bound
+                 CHECK (id IS NOT NULL AND id >= 100 AND id < 200);",
+        ] {
+            let findings = attach_with(before);
+            assert!(
+                only(&findings, Rule::AttachPartitionScan).is_empty(),
+                "{before}: {findings:?}"
+            );
+        }
+    }
+
+    /// The `attach_partition_scan` findings of attaching `measurements_new`
+    /// with `bound` to a table partitioned by `key`, after `before`.
+    fn attach_scans(key: &str, columns: &str, before: &str, bound: &str) -> Vec<String> {
+        let base = format!(
+            "CREATE TABLE measurements ({columns}) PARTITION BY {key};
+             CREATE TABLE measurements_new ({columns});"
+        );
+        let attach = format!("ALTER TABLE measurements ATTACH PARTITION measurements_new {bound};");
+        let findings = lint(
+            &[
+                ("001_base.sql", &base, MigrationLint::All),
+                ("002_before.sql", before, MigrationLint::All),
+                ("003_attach.sql", &attach, MigrationLint::All),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        only(&findings, Rule::AttachPartitionScan)
+            .iter()
+            .map(|found| found.finding.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn attach_partition_scan_proves_range_bounds_from_checks() {
+        let columns = "id integer NOT NULL, at timestamp";
+        let range = "FOR VALUES FROM (1000) TO (2000)";
+        for (check, scans) in [
+            // A CHECK on the key that doesn't imply the bound.
+            ("CHECK (id > 0)", true),
+            ("CHECK (id >= 1000)", true),
+            ("CHECK (id >= 1000 AND id <= 2000)", true),
+            ("CHECK (id >= 999 AND id < 2000)", true),
+            ("CHECK (id >= 1000 OR id < 2000)", true),
+            ("CHECK (id <> 5)", true),
+            ("CHECK (id::bigint >= 1000 AND id::bigint < 2000)", true),
+            ("CHECK (id >= 1000.5 AND id < 2000)", true),
+            // Ones that do.
+            ("CHECK (id >= 1000 AND id < 2000)", false),
+            ("CHECK (id > 1000 AND id < 1500)", false),
+            ("CHECK (id BETWEEN 1000 AND 1999)", false),
+            ("CHECK (1000 <= id AND 2000 > id)", false),
+            ("CHECK (id IN (1000, 1500, 1999))", false),
+            ("CHECK (id = ANY (ARRAY[1000, 1001]))", false),
+            ("CHECK (id >= '1000' AND id < '2000')", false),
+        ] {
+            let before = format!("ALTER TABLE measurements_new ADD CONSTRAINT bound {check};");
+            assert_eq!(
+                !attach_scans("RANGE (id)", columns, &before, range).is_empty(),
+                scans,
+                "{check}"
+            );
+        }
+        // Two CHECKs together.
+        assert!(
+            attach_scans(
+                "RANGE (id)",
+                columns,
+                "ALTER TABLE measurements_new ADD CONSTRAINT low CHECK (id >= 1000);
+                 ALTER TABLE measurements_new ADD CONSTRAINT high CHECK (id < 2000);",
+                range,
+            )
+            .is_empty()
+        );
+        // MINVALUE / MAXVALUE leave that side unchecked.
+        assert!(
+            attach_scans(
+                "RANGE (id)",
+                columns,
+                "ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id < 2000);",
+                "FOR VALUES FROM (MINVALUE) TO (2000)",
+            )
+            .is_empty()
+        );
+        // A timestamp key, its bound and check written alike.
+        assert!(
+            attach_scans(
+                "RANGE (at)",
+                "id integer, at timestamp NOT NULL",
+                "ALTER TABLE measurements_new ADD CONSTRAINT bound
+                     CHECK (at >= '2024-01-01' AND at < '2024-02-01');",
+                "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            attach_scans(
+                "RANGE (at)",
+                "id integer, at timestamp NOT NULL",
+                "ALTER TABLE measurements_new ADD CONSTRAINT bound
+                     CHECK (at >= '2024-01-01' AND at < '2024-03-01');",
+                "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')",
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// Each case's `pg` is what PostgreSQL 19.0 did (its DEBUG1 "partition
+    /// constraint for table … is implied by existing constraints" message,
+    /// or its absence), measured with the same tables; `lint` is what the
+    /// rule reports, which differs only where it can't tell and reports.
+    #[test]
+    fn attach_partition_scan_agrees_with_postgresql() {
+        let one_to_three = "FOR VALUES FROM (1) TO (3)";
+        let january = "FOR VALUES FROM ('2024-01-01') TO ('2024-02-01')";
+        for (columns, key, check, bound, pg, lint) in [
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1.0 AND n < 3.0)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1.5 AND n < 2.5)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= '1.5' AND n < '2.5')",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1 AND n <= 3)",
+                one_to_three,
+                true,
+                true,
+            ),
+            (
+                "n numeric(5,2) NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1.001 AND n < 2.999)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n float8 NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1 AND n < 3)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n bigint NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1 AND n < 2)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n smallint NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1 AND n < 2)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n bigint NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 3000000000 AND n < 3100000000)",
+                "FOR VALUES FROM (3000000000) TO (3500000000)",
+                false,
+                false,
+            ),
+            (
+                "n integer NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1::bigint AND n < 3)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n integer NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1.5 AND n < 3)",
+                one_to_three,
+                true,
+                true,
+            ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= '2024-01-02' AND d < '2024-01-20')",
+                january,
+                false,
+                false,
+            ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= DATE '2024-01-01' AND d < DATE '2024-02-01')",
+                january,
+                false,
+                false,
+            ),
+            (
+                "at timestamptz NOT NULL",
+                "RANGE (at)",
+                "CHECK (at >= '2024-01-02' AND at < '2024-01-20')",
+                january,
+                false,
+                false,
+            ),
+            (
+                "s text COLLATE \"C\" NOT NULL",
+                "RANGE (s)",
+                "CHECK (s >= 'b' AND s < 'c')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                false,
+                false,
+            ),
+            (
+                "s text NOT NULL",
+                "RANGE (s)",
+                "CHECK (s >= 'a' AND s < 'm')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                false,
+                false,
+            ),
+            // The key's collation is not the column's: the CHECK compares
+            // under another one.
+            (
+                "s text NOT NULL",
+                "RANGE (s COLLATE \"C\")",
+                "CHECK (s >= 'a' AND s < 'm')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                true,
+                true,
+            ),
+            (
+                "code varchar(5) NOT NULL",
+                "LIST (code)",
+                "CHECK (code IN ('a', 'b'))",
+                "FOR VALUES IN ('a', 'b', 'c')",
+                false,
+                false,
+            ),
+            (
+                "u uuid NOT NULL",
+                "LIST (u)",
+                "CHECK (u = '00000000-0000-0000-0000-000000000001')",
+                "FOR VALUES IN ('00000000-0000-0000-0000-000000000001')",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b = true)",
+                "FOR VALUES IN (true)",
+                false,
+                false,
+            ),
+            // Where the rule can't tell, it reports: strings it can't order
+            // under the database's default collation, a constant of another
+            // type than the key's, a bare boolean column.
+            (
+                "s text NOT NULL",
+                "RANGE (s)",
+                "CHECK (s >= 'b' AND s < 'c')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                false,
+                true,
+            ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= '2024-01-01'::timestamp AND d < '2024-02-01'::timestamp)",
+                january,
+                false,
+                true,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b)",
+                "FOR VALUES IN (true)",
+                false,
+                true,
+            ),
+        ] {
+            let before = format!("ALTER TABLE measurements_new ADD CONSTRAINT bound {check};");
+            let reported = !attach_scans(key, columns, &before, bound).is_empty();
+            assert_eq!(
+                reported, lint,
+                "{columns} / {key} / {check} / {bound} (pg: {pg})"
+            );
+            // A report where PostgreSQL scans is never missing.
+            assert!(!pg || reported, "{check}");
+        }
+        // A NOT NULL constraint that is NOT VALID proves nothing.
+        assert_eq!(
+            attach_scans(
+                "RANGE (id)",
+                "id integer",
+                "ALTER TABLE measurements_new ADD CONSTRAINT nn NOT NULL id NOT VALID;
+                 ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id >= 1000 AND id < 2000);",
+                "FOR VALUES FROM (1000) TO (2000)",
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn attach_partition_scan_proves_multi_column_ranges() {
+        let columns = "a integer NOT NULL, b integer NOT NULL";
+        // FROM (1, 0) TO (2, 0): (a > 1 OR (a = 1 AND b >= 0)) AND
+        // (a < 2 OR (a = 2 AND b < 0)).
+        for (check, scans) in [
+            ("CHECK (a = 1 AND b >= 0)", false),
+            ("CHECK (a = 1)", true),
+            ("CHECK (a > 1 AND a < 2)", false),
+            ("CHECK (a >= 1 AND a < 2)", true),
+        ] {
+            let before = format!("ALTER TABLE measurements_new ADD CONSTRAINT bound {check};");
+            assert_eq!(
+                !attach_scans(
+                    "RANGE (a, b)",
+                    columns,
+                    &before,
+                    "FOR VALUES FROM (1, 0) TO (2, 0)"
+                )
+                .is_empty(),
+                scans,
+                "{check}"
+            );
+        }
+        // FROM (1, 10) TO (1, 20): a = 1 AND b >= 10 AND b < 20.
+        assert!(
+            attach_scans(
+                "RANGE (a, b)",
+                columns,
+                "ALTER TABLE measurements_new ADD CONSTRAINT bound
+                     CHECK (a = 1 AND b >= 10 AND b < 20);",
+                "FOR VALUES FROM (1, 10) TO (1, 20)",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn attach_partition_scan_proves_list_bounds_and_reports_hash() {
+        let columns = "region text NOT NULL, id integer";
+        for (check, scans) in [
+            ("CHECK (region IN ('eu', 'us'))", true),
+            ("CHECK (region = 'eu')", false),
+            ("CHECK (region IN ('eu'))", false),
+            ("CHECK (region <> 'us')", true),
+        ] {
+            let before = format!("ALTER TABLE measurements_new ADD CONSTRAINT bound {check};");
+            assert_eq!(
+                !attach_scans(
+                    "LIST (region)",
+                    columns,
+                    &before,
+                    "FOR VALUES IN ('eu', 'br')"
+                )
+                .is_empty(),
+                scans,
+                "{check}"
+            );
+        }
+        // A list with NULL: `region IS NULL OR region = ANY (…)`.
+        assert!(
+            attach_scans(
+                "LIST (id)",
+                "id integer",
+                "ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id IN (1, 2));",
+                "FOR VALUES IN (1, 2, NULL)",
+            )
+            .is_empty()
+        );
+        // No CHECK implies a hash bound.
+        let found = attach_scans(
+            "HASH (id)",
+            "id integer NOT NULL",
+            "ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id >= 0);",
+            "FOR VALUES WITH (MODULUS 2, REMAINDER 0)",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn attach_partition_scan_reports_the_default_partition_scan() {
+        let findings = lint(
+            &[
+                (
+                    "001_base.sql",
+                    "CREATE TABLE measurements (id integer NOT NULL) PARTITION BY RANGE (id);
+                     CREATE TABLE measurements_other PARTITION OF measurements DEFAULT;
+                     CREATE TABLE measurements_new (id integer NOT NULL
+                         CHECK (id >= 1000 AND id < 2000));",
+                    MigrationLint::All,
+                ),
+                (
+                    "002_attach.sql",
+                    "ALTER TABLE measurements ATTACH PARTITION measurements_new \
+                     FOR VALUES FROM (1000) TO (2000);",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::AttachPartitionScan);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "ATTACH PARTITION scans every row of the default partition \
+             public.measurements_other under an ACCESS EXCLUSIVE lock, for rows that belong to \
+             public.measurements_new"
+        );
+    }
+
+    #[test]
+    fn attach_partition_scan_follows_partitioned_tables_and_ancestors() {
+        // A partitioned table to attach, whose partitions each carry the
+        // check: PostgreSQL checks the partitions, and each is implied.
+        let findings = lint(
+            &[
+                (
+                    "001_base.sql",
+                    "CREATE TABLE measurements (id integer NOT NULL, at date) PARTITION BY RANGE (id);
+                     CREATE TABLE measurements_new (id integer NOT NULL, at date)
+                         PARTITION BY RANGE (at);
+                     CREATE TABLE measurements_new_1 PARTITION OF measurements_new
+                         FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+                     ALTER TABLE measurements_new_1 ADD CONSTRAINT bound
+                         CHECK (id >= 1000 AND id < 2000);",
+                    MigrationLint::All,
+                ),
+                (
+                    "002_attach.sql",
+                    "ALTER TABLE measurements ATTACH PARTITION measurements_new \
+                     FOR VALUES FROM (1000) TO (2000);",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
         );
         assert!(
             only(&findings, Rule::AttachPartitionScan).is_empty(),
             "{findings:?}"
         );
+        // A sub-partition must also satisfy its parent's own bound.
+        let base = "CREATE TABLE m (id integer NOT NULL, kind text NOT NULL)
+                        PARTITION BY RANGE (id);
+                    CREATE TABLE m_1 PARTITION OF m FOR VALUES FROM (0) TO (100)
+                        PARTITION BY LIST (kind);
+                    CREATE TABLE m_1_new (id integer NOT NULL, kind text NOT NULL);";
+        for (check, scans) in [
+            ("CHECK (kind = 'a')", true),
+            ("CHECK (kind = 'a' AND id >= 0 AND id < 100)", false),
+        ] {
+            let findings = lint(
+                &[
+                    (
+                        "001_base.sql",
+                        &format!("{base} ALTER TABLE m_1_new ADD CONSTRAINT bound {check};"),
+                        MigrationLint::All,
+                    ),
+                    (
+                        "002_attach.sql",
+                        "ALTER TABLE m_1 ATTACH PARTITION m_1_new FOR VALUES IN ('a');",
+                        MigrationLint::All,
+                    ),
+                ],
+                true,
+                &LintOptions::default(),
+            );
+            assert_eq!(
+                !only(&findings, Rule::AttachPartitionScan).is_empty(),
+                scans,
+                "{check}: {findings:?}"
+            );
+        }
     }
 
     #[test]

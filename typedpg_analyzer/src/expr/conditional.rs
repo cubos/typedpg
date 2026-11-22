@@ -715,9 +715,9 @@ pub(crate) fn infer_case(
             // analyzed and takes part in the result type, but is never the
             // CASE's value.
             let when_reached = !unreachable(not_taken.clone().union(taken.clone()));
-            if expr.arg.is_none() {
-                crate::pg_catalog::note_case_when_reached(when.location, when_reached);
-            }
+            // A simple CASE's `test = value` says of a column test what the
+            // same comparison written in a searched CASE does.
+            crate::pg_catalog::note_case_when_reached(when.location, when_reached);
             reached.push(when_reached);
             let facts = not_taken.clone().union(taken).restricted_to(&own);
             let mut narrowed = ctx.null_ctx.with_local_facts(facts);
@@ -765,6 +765,12 @@ pub(crate) fn infer_case(
             outer.absorb(&log);
         }
         not_taken = not_taken.union(simple_not_taken);
+        if expr.arg.is_some() && crate::pg_catalog::collecting_column_ref_bindings() {
+            crate::pg_catalog::note_case_when_passed(
+                when.location,
+                !unreachable(not_taken.clone()),
+            );
+        }
     }
     // No WHEN being TRUE may be impossible: then the ELSE (or the
     // implicit NULL) is never the result.

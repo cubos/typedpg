@@ -1,15 +1,24 @@
 //! The `redundant_null_check` rule: reports an `IS [NOT] NULL` test or a
-//! `COALESCE` on a value the analysis proves is never NULL. A `COALESCE`
-//! finding comes with a fix dropping the arguments it never uses, when every
-//! argument has the call's result type; an `IS [NOT] NULL` test has none
-//! (removing it from a `WHERE` changes which rows are kept).
+//! `COALESCE` on a value the analysis proves is never NULL, and an `IS
+//! [NOT] NULL` test that is an `AND` argument of a `WHERE`, `JOIN … ON` or
+//! `HAVING` whose other arguments already drop the rows where the value is
+//! NULL (`WHERE n > 0 AND n IS NOT NULL`: a NULL `n` makes `n > 0` NULL,
+//! and the row is dropped either way; see
+//! [`typedpg_analyzer::QueryView::null_test_settled`]). Only a condition
+//! is read so: in a select list, NULL and FALSE are different values.
+//!
+//! A `COALESCE` finding comes with a fix dropping the arguments it never
+//! uses, when every argument has the call's result type; an `IS [NOT]
+//! NULL` test has none (removing it from a `WHERE` changes which rows are
+//! kept, or, when the other arguments settle it, leaves what they meant
+//! to the author).
 
 use std::collections::HashSet;
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::ast::{CoalesceExpr, Node, Node as N, NullTest, NullTestType};
+use typedpg_pg_query::ast::{BoolExprType, CoalesceExpr, Node, Node as N, NullTest, NullTestType};
 
-use super::{expression_end, location, operand_start};
+use super::{location, node_span, operand_start};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
@@ -26,9 +35,12 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             unaliased.insert(expr.location);
         }
     }
+    let conjuncts = condition_conjuncts(ctx);
     for (node, _) in ctx.tree.nodes() {
         match node {
-            NodeRef::NullTest(test) => null_test(ctx, test, &mut out),
+            NodeRef::NullTest(test) => {
+                null_test(ctx, test, conjuncts.contains(&test.location), &mut out);
+            }
             NodeRef::CoalesceExpr(expr) => coalesce(ctx, expr, &unaliased, &mut out),
             _ => {}
         }
@@ -38,7 +50,41 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
 
 // ── IS [NOT] NULL ──────────────────────────────────────────────────────────
 
-fn null_test(ctx: &Ctx<'_>, test: &NullTest, out: &mut Vec<RawFinding>) {
+/// The locations of the `IS [NOT] NULL` tests that are top-level `AND`
+/// arguments of a `WHERE` (of a `SELECT`, `UPDATE` or `DELETE`), `JOIN …
+/// ON` or `HAVING`: the only places the analyzer's
+/// [`typedpg_analyzer::QueryView::null_test_settled`] is about.
+fn condition_conjuncts(ctx: &Ctx<'_>) -> HashSet<i32> {
+    fn walk(node: Option<&Node>, out: &mut HashSet<i32>) {
+        match node {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr => {
+                for arg in &b.args {
+                    walk(arg.as_ref(), out);
+                }
+            }
+            Some(N::NullTest(test)) => {
+                out.insert(test.location);
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashSet::new();
+    for (node, _) in ctx.tree.nodes() {
+        match node {
+            NodeRef::SelectStmt(sel) => {
+                walk(sel.where_clause.as_ref(), &mut out);
+                walk(sel.having_clause.as_ref(), &mut out);
+            }
+            NodeRef::UpdateStmt(stmt) => walk(stmt.where_clause.as_ref(), &mut out),
+            NodeRef::DeleteStmt(stmt) => walk(stmt.where_clause.as_ref(), &mut out),
+            NodeRef::JoinExpr(join) => walk(join.quals.as_ref(), &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn null_test(ctx: &Ctx<'_>, test: &NullTest, conjunct: bool, out: &mut Vec<RawFinding>) {
     let arg = &test.arg;
     if arg.is_none() {
         return;
@@ -46,9 +92,15 @@ fn null_test(ctx: &Ctx<'_>, test: &NullTest, out: &mut Vec<RawFinding>) {
     // The analyzer's fact: without one, it didn't prove the argument's
     // nullability (a row / composite value, or a site it never inferred),
     // and the rule never guesses.
-    if ctx.view.null_test_arg_nullable(test.location) != Some(false) {
-        return;
-    }
+    let settled = match ctx.view.null_test_arg_nullable(test.location) {
+        Some(false) => false,
+        // Nullable, but the other AND arguments of its condition drop the
+        // rows where it is NULL. (Checked to be such an argument here too:
+        // a fact of another text's node at the same offset — a view or
+        // function body the analysis read — is not this test's.)
+        Some(true) if conjunct && ctx.view.null_test_settled(test.location) == Some(true) => true,
+        _ => return,
+    };
     let Some(start) = argument_start(arg.as_ref()).or_else(|| location(test.location)) else {
         return;
     };
@@ -56,19 +108,45 @@ fn null_test(ctx: &Ctx<'_>, test: &NullTest, out: &mut Vec<RawFinding>) {
         return;
     };
     let is_null = test.nulltesttype == NullTestType::IsNull;
-    let message = match (argument_text(ctx, arg.as_ref()), is_null) {
-        (Some(text), true) => format!("`{text}` IS NULL is never true: it is never NULL"),
-        (Some(text), false) => format!("`{text}` IS NOT NULL is always true: it is never NULL"),
-        (None, true) => "IS NULL is never true here: the value is never NULL".to_owned(),
-        (None, false) => "IS NOT NULL is always true here: the value is never NULL".to_owned(),
+    let text = argument_text(ctx, arg.as_ref());
+    let (message, help) = if settled {
+        let value = text.map_or_else(|| "the value".to_owned(), |text| format!("`{text}`"));
+        if is_null {
+            (
+                format!(
+                    "{value} IS NULL makes the condition never true: the rest of it is never \
+                     true when {value} is NULL"
+                ),
+                "the condition keeps no row: fix the test or the rest of the condition",
+            )
+        } else {
+            (
+                format!(
+                    "{value} IS NOT NULL changes nothing: the rest of the condition is never \
+                     true when {value} is NULL"
+                ),
+                "remove the check",
+            )
+        }
+    } else {
+        (
+            match (text, is_null) {
+                (Some(text), true) => format!("`{text}` IS NULL is never true: it is never NULL"),
+                (Some(text), false) => {
+                    format!("`{text}` IS NOT NULL is always true: it is never NULL")
+                }
+                (None, true) => "IS NULL is never true here: the value is never NULL".to_owned(),
+                (None, false) => {
+                    "IS NOT NULL is always true here: the value is never NULL".to_owned()
+                }
+            },
+            "remove the check, or find why the value was expected to be NULL (an outer join?)",
+        )
     };
     out.push(RawFinding {
         span: start..end,
         message,
-        help: Some(
-            "remove the check, or find why the value was expected to be NULL (an outer join?)"
-                .to_owned(),
-        ),
+        help: Some(help.to_owned()),
         fix: Vec::new(),
     });
 }
@@ -128,10 +206,13 @@ fn coalesce(
     // - a `COLLATE` clause or a column reference can decide the result's
     //   collation (`COALESCE('x'::text, 'y'::text COLLATE "C")`);
     // - an unaliased direct target column is named `coalesce`; any rewrite
-    //   risks its output name (dropping the call renames it outright).
+    //   risks its output name (dropping the call renames it outright);
+    // - a parameter is part of the query's signature: dropping it removes
+    //   the parameter, or what typed it (`COALESCE(id, $d::bigint)`).
     let dropped = &expr.args[index + 1..];
     let structural = dropped.iter().any(|n| has_call_outside_sublink(n.as_ref()));
     let collation = dropped.iter().any(|n| has_collation_or_column(n.as_ref()));
+    let parameter = dropped.iter().any(|n| has_param(n.as_ref()));
     let unaliased_target = unaliased.contains(&expr.location);
     if fact.args_share_result_type
         && fact.args_typed_as_result.get(index) == Some(&true)
@@ -139,6 +220,7 @@ fn coalesce(
         && args.len() == expr.args.len()
         && !structural
         && !collation
+        && !parameter
         && !unaliased_target
     {
         let close_start = ctx.tokens[close].start;
@@ -299,6 +381,15 @@ fn call_outside_sublink(node: NodeRef<'_>) -> bool {
 /// Whether a dropped argument holds a `COLLATE` clause or a column reference:
 /// either can decide the `COALESCE`'s collation, even though the argument is
 /// never evaluated.
+/// Whether a dropped argument holds a parameter (`$1`, or a `$name` it was
+/// rewritten from).
+fn has_param(node: Option<&Node>) -> bool {
+    fn walk(node: NodeRef<'_>) -> bool {
+        matches!(node, NodeRef::ParamRef(_)) || node.children().into_iter().any(walk)
+    }
+    node.is_some_and(|node| walk(node.to_ref()))
+}
+
 fn has_collation_or_column(node: Option<&Node>) -> bool {
     node.is_some_and(|node| collation_or_column(node.to_ref()))
 }
@@ -345,12 +436,14 @@ fn argument_start(node: Option<&Node>) -> Option<usize> {
 /// The expression as the message shows it, on one line; `None` when it is
 /// too long to quote.
 fn argument_text(ctx: &Ctx<'_>, node: Option<&Node>) -> Option<String> {
-    let start = argument_start(node)?;
-    short_text(ctx, start, expression_end(ctx, start))
+    let span = node_span(ctx, node?.to_ref())?;
+    short_text(ctx, span.start, span.end)
 }
 
+/// The text from `start` to `end` as written (a `$name` parameter stays
+/// `$name`), on one line; `None` when it is too long to quote.
 fn short_text(ctx: &Ctx<'_>, start: usize, end: usize) -> Option<String> {
-    let text = ctx.sql.get(start..end).unwrap_or_default();
+    let text = ctx.written(start..end);
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (!text.is_empty() && text.len() <= 40).then_some(text)
 }
@@ -443,6 +536,47 @@ mod tests {
     }
 
     #[test]
+    fn the_where_proves_a_select_list_value_non_null() {
+        let db = catalog();
+        let sql = "SELECT nullable IS NULL AS b FROM checks WHERE nullable IS NOT NULL";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            only(&findings).message,
+            "`nullable` IS NULL is never true: it is never NULL"
+        );
+        let sql = "SELECT COALESCE(nullable, 0) AS v FROM checks WHERE nullable > 0";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            fixed(sql, only(&findings)),
+            "SELECT nullable AS v FROM checks WHERE nullable > 0"
+        );
+    }
+
+    #[test]
+    fn messages_quote_named_parameters_as_written() {
+        let db = catalog();
+        // Only a settled test can quote one: a parameter makes a value
+        // nullable, so a test or COALESCE argument holding one is never
+        // proven non-NULL.
+        let sql = "SELECT id FROM checks WHERE abs(nullable + $n) > 0 \
+                   AND abs(nullable + $n) IS NOT NULL";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            only(&findings).message,
+            "`abs(nullable + $n)` IS NOT NULL changes nothing: the rest of the condition is \
+             never true when `abs(nullable + $n)` is NULL"
+        );
+        // The whole argument, not its first operand.
+        let sql = "SELECT id FROM checks WHERE nullable + $n > 0 AND nullable + $n IS NOT NULL";
+        let findings = lint(&db, sql);
+        assert_eq!(
+            only(&findings).message,
+            "`nullable + $n` IS NOT NULL changes nothing: the rest of the condition is never \
+             true when `nullable + $n` is NULL"
+        );
+    }
+
+    #[test]
     fn is_null_span_covers_the_argument_and_the_null_keyword() {
         let db = catalog();
         let sql = "SELECT nn IS NOT NULL FROM checks";
@@ -476,11 +610,26 @@ mod tests {
         let db = catalog();
         // `nullable` may be NULL even past the check: the analyzer records
         // the argument's own nullability, before the predicate proves
-        // anything.
+        // anything — the test is not its own proof, nor is a later test of
+        // the value (each would settle the other, and removing both changes
+        // the rows; the later one is reported, as an earlier AND argument
+        // not FALSE proves the value non-NULL there).
         for sql in [
             "SELECT id FROM checks WHERE nullable IS NOT NULL",
             "SELECT id FROM checks WHERE nullable IS NULL",
-            "SELECT id FROM checks WHERE nullable > 0 AND nullable IS NOT NULL",
+            "SELECT id FROM checks WHERE nullable IS NOT NULL AND id > 0",
+            // Not an AND argument of the condition: under OR or NOT, or in a
+            // select list, NULL and FALSE differ.
+            "SELECT id FROM checks WHERE nullable > 0 OR nullable IS NOT NULL",
+            "SELECT id FROM checks WHERE NOT (nullable > 0 AND nullable IS NOT NULL)",
+            "SELECT nullable > 0 AND nullable IS NOT NULL FROM checks",
+            "SELECT CASE WHEN nullable > 0 AND nullable IS NOT NULL THEN 1 END FROM checks",
+            // `IS DISTINCT FROM` and `coalesce` are not NULL for a NULL
+            // operand: they don't drop the row.
+            "SELECT id FROM checks WHERE nullable IS DISTINCT FROM 0 AND nullable IS NOT NULL",
+            "SELECT id FROM checks WHERE coalesce(nullable, 0) = 0 AND nullable IS NOT NULL",
+            // A parameter may be NULL: `$1 > 0` drops nothing of `nullable`.
+            "SELECT id FROM checks WHERE $1::int > 0 AND nullable IS NOT NULL",
         ] {
             let findings = lint(&db, sql);
             assert!(
@@ -489,6 +638,80 @@ mod tests {
                     .all(|finding| finding.rule != Rule::RedundantNullCheck),
                 "{sql}: {findings:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_test_the_other_and_arguments_settle_is_reported() {
+        let db = catalog();
+        // The second of two tests: the first, not FALSE, proves it.
+        let sql = "SELECT id FROM checks WHERE nullable IS NOT NULL AND nullable IS NOT NULL";
+        let findings: Vec<Finding> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::RedundantNullCheck)
+            .collect();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].span.start, sql.rfind("nullable IS").unwrap());
+        for (sql, span, message) in [
+            (
+                "SELECT id FROM checks WHERE nullable > 0 AND nullable IS NOT NULL",
+                "nullable IS NOT NULL",
+                "`nullable` IS NOT NULL changes nothing: the rest of the condition is never \
+                 true when `nullable` is NULL",
+            ),
+            (
+                "SELECT id FROM checks WHERE nullable IS NOT NULL AND id = 1 AND nullable < 3",
+                "nullable IS NOT NULL",
+                "`nullable` IS NOT NULL changes nothing",
+            ),
+            (
+                "SELECT id FROM checks WHERE (id > 0 AND note = 'x') AND note IS NOT NULL",
+                "note IS NOT NULL",
+                "`note` IS NOT NULL changes nothing",
+            ),
+            (
+                "SELECT id FROM checks WHERE nullable = 1 AND nullable IS NULL",
+                "nullable IS NULL",
+                "`nullable` IS NULL makes the condition never true: the rest of it is never \
+                 true when `nullable` is NULL",
+            ),
+            (
+                "SELECT l.id FROM checks l JOIN checks r ON r.nullable = l.id \
+                 AND r.nullable IS NOT NULL",
+                "r.nullable IS NOT NULL",
+                "`r.nullable` IS NOT NULL changes nothing",
+            ),
+            (
+                "SELECT nullable FROM checks GROUP BY nullable \
+                 HAVING nullable > 0 AND nullable IS NOT NULL",
+                "nullable IS NOT NULL",
+                "`nullable` IS NOT NULL changes nothing",
+            ),
+            (
+                "UPDATE checks SET nn = 1 WHERE nullable <> 2 AND nullable IS NOT NULL",
+                "nullable IS NOT NULL",
+                "`nullable` IS NOT NULL changes nothing",
+            ),
+            (
+                "DELETE FROM checks WHERE nullable IS NOT NULL AND lower(note) = 'x' \
+                 AND note IS NOT NULL AND nullable IN (1, 2)",
+                "nullable IS NOT NULL",
+                "`nullable` IS NOT NULL changes nothing",
+            ),
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::RedundantNullCheck)
+                .collect();
+            assert!(!findings.is_empty(), "{sql}");
+            let finding = &findings[0];
+            assert_eq!(&sql[finding.span.clone()], span, "{sql}");
+            assert!(
+                finding.message.contains(message),
+                "{sql}: {}",
+                finding.message
+            );
+            assert!(finding.fix.is_empty(), "{sql}");
         }
     }
 
@@ -659,6 +882,22 @@ mod tests {
         for sql in [
             "SELECT COALESCE(name, 'y'::text COLLATE \"C\") AS x FROM checks",
             "SELECT COALESCE(name, note) AS x FROM checks",
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert!(finding.fix.is_empty(), "{sql}: {finding:?}");
+        }
+    }
+
+    #[test]
+    fn coalesce_dropping_a_parameter_has_no_fix() {
+        let db = catalog();
+        // Dropping the argument would remove the parameter (or what typed
+        // it) from the query.
+        for sql in [
+            "SELECT COALESCE(nn, $d::int) AS x FROM checks",
+            "SELECT COALESCE(nn, $1::int) AS x FROM checks",
+            "SELECT COALESCE(nn, $d::int + 1) AS x FROM checks WHERE id = $d",
         ] {
             let findings = lint(&db, sql);
             let finding = only(&findings);

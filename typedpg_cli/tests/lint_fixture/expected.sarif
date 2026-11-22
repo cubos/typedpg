@@ -14,6 +14,7 @@
               "shortDescription": {
                 "text": "comparison with NULL is never true"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/null_comparison.md",
               "defaultConfiguration": {
                 "level": "error"
               }
@@ -23,6 +24,7 @@
               "shortDescription": {
                 "text": "UPDATE or DELETE without a WHERE clause"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unbounded_write.md",
               "defaultConfiguration": {
                 "level": "error"
               }
@@ -32,6 +34,7 @@
               "shortDescription": {
                 "text": "NOT IN (SELECT …) that returns no rows because a side may be NULL"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/not_in_nullable.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -41,6 +44,7 @@
               "shortDescription": {
                 "text": "CREATE INDEX without CONCURRENTLY on a table that already has rows"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/create_index_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -50,6 +54,7 @@
               "shortDescription": {
                 "text": "a constraint that validates existing rows under a lock"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/constraint_validating.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -59,6 +64,7 @@
               "shortDescription": {
                 "text": "SET NOT NULL that scans every row of the table"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/set_not_null_scan.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -68,6 +74,7 @@
               "shortDescription": {
                 "text": "ALTER TABLE that rewrites every row under a lock"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/table_rewrite.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -77,6 +84,7 @@
               "shortDescription": {
                 "text": "a foreign key whose referencing columns have no index"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fk_without_index.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -86,6 +94,7 @@
               "shortDescription": {
                 "text": "an index another index on the table already covers"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_index.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -95,6 +104,7 @@
               "shortDescription": {
                 "text": "a `sql!` binding the parameter would capture without it"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_binding.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -104,6 +114,7 @@
               "shortDescription": {
                 "text": "a `sql!` binding that only renames a variable"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/renaming_binding.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -113,6 +124,7 @@
               "shortDescription": {
                 "text": "IS [NOT] NULL or COALESCE on a value that is never NULL"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_null_check.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -122,6 +134,7 @@
               "shortDescription": {
                 "text": "LIMIT, OFFSET or DISTINCT ON without ORDER BY picks arbitrary rows"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/limit_without_order.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -131,6 +144,7 @@
               "shortDescription": {
                 "text": "a LIMIT on a query that returns at most one row"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_limit.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -140,6 +154,7 @@
               "shortDescription": {
                 "text": "a DISTINCT on rows that are already distinct"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_distinct.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -149,6 +164,7 @@
               "shortDescription": {
                 "text": "a condition that is always true or never true"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/constant_condition.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -158,6 +174,7 @@
               "shortDescription": {
                 "text": "a CASE branch that is never taken"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unreachable_case_branch.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -167,6 +184,7 @@
               "shortDescription": {
                 "text": "a CASE without ELSE whose WHENs may all be false, which makes it NULL"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/case_without_else.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -176,6 +194,7 @@
               "shortDescription": {
                 "text": "a cast to the type its operand already has"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_cast.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -185,6 +204,7 @@
               "shortDescription": {
                 "text": "an output column alias that names the column what it already is"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_alias.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -194,6 +214,7 @@
               "shortDescription": {
                 "text": "an unqualified column reference in a subquery that resolves to an outer query"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/outer_reference_in_subquery.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -203,6 +224,7 @@
               "shortDescription": {
                 "text": "FROM items joined with no condition connecting them"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/cartesian_join.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -212,6 +234,7 @@
               "shortDescription": {
                 "text": "an INSERT without a column list"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/insert_without_columns.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -221,6 +244,7 @@
               "shortDescription": {
                 "text": "an UPDATE that assigns a column its own value"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/self_assignment.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -230,6 +254,7 @@
               "shortDescription": {
                 "text": "a WITH query nothing references"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unused_cte.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -239,6 +264,7 @@
               "shortDescription": {
                 "text": "a CASE that is a COALESCE or its own condition"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/simplifiable_case.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -248,6 +274,7 @@
               "shortDescription": {
                 "text": "a LIKE pattern built from a parameter whose % and _ are not escaped"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/like_unescaped_param.md",
               "defaultConfiguration": {
                 "level": "none"
               }
@@ -257,6 +284,7 @@
               "shortDescription": {
                 "text": "a join that can't change the rows and whose table nothing else reads"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_join.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -266,6 +294,7 @@
               "shortDescription": {
                 "text": "a scalar subquery used as a value that may return more than one row"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/scalar_subquery_may_return_many.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -275,6 +304,7 @@
               "shortDescription": {
                 "text": "an implicit timestamp/timestamptz conversion that depends on the session's TimeZone"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/timestamp_timezone_mix.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -284,6 +314,7 @@
               "shortDescription": {
                 "text": "an integer division whose truncated result is used as a non-integer value"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/integer_division.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -293,6 +324,7 @@
               "shortDescription": {
                 "text": "an outer join the WHERE clause turns into an inner join by rejecting its null-extended rows"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/left_join_nullified.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -302,6 +334,7 @@
               "shortDescription": {
                 "text": "an INSERT or UPDATE storing a constant a CHECK constraint rejects"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/check_violation.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -311,6 +344,57 @@
               "shortDescription": {
                 "text": "an ORDER BY with LIMIT, OFFSET or DISTINCT ON whose keys can tie"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unstable_order.md",
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "redundant_order_by",
+              "shortDescription": {
+                "text": "ORDER BY keys that can't change the order of the rows"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_order_by.md",
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "redundant_group_by",
+              "shortDescription": {
+                "text": "GROUP BY keys determined by the other keys or pinned to a constant"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_group_by.md",
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "count_not_null",
+              "shortDescription": {
+                "text": "count(expr) over a value that is never NULL, which is count(*)"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/count_not_null.md",
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "non_sargable_predicate",
+              "shortDescription": {
+                "text": "a comparison wrapping an indexed column so its index can't serve it"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/non_sargable_predicate.md",
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "float_equality",
+              "shortDescription": {
+                "text": "an equality comparison of floating-point values"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/float_equality.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -320,6 +404,7 @@
               "shortDescription": {
                 "text": "a foreign key whose column types differ from the referenced columns"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fk_type_mismatch.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -329,6 +414,7 @@
               "shortDescription": {
                 "text": "a migration taking a blocking lock on an existing table without SET lock_timeout"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/missing_lock_timeout.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -338,6 +424,7 @@
               "shortDescription": {
                 "text": "DROP INDEX without CONCURRENTLY on a table that already has rows"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/drop_index_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -347,6 +434,7 @@
               "shortDescription": {
                 "text": "REINDEX, VACUUM FULL, CLUSTER or REPACK holding a blocking lock for the whole rebuild"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/blocking_rebuild.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -356,6 +444,7 @@
               "shortDescription": {
                 "text": "DETACH PARTITION without CONCURRENTLY on a table that already has rows"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/detach_partition_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -365,6 +454,7 @@
               "shortDescription": {
                 "text": "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/validate_in_same_transaction.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -372,8 +462,9 @@
             {
               "id": "attach_partition_scan",
               "shortDescription": {
-                "text": "ATTACH PARTITION scanning the partition because no CHECK implies its bound"
+                "text": "ATTACH PARTITION scanning the partition because its constraints don't imply its bound, or scanning the default partition"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/attach_partition_scan.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -383,6 +474,7 @@
               "shortDescription": {
                 "text": "a table without a primary key"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/missing_primary_key.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -392,6 +484,7 @@
               "shortDescription": {
                 "text": "row-level security policies on a table that does not enable row-level security"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/rls_policy_not_enforced.md",
               "defaultConfiguration": {
                 "level": "error"
               }
@@ -401,6 +494,7 @@
               "shortDescription": {
                 "text": "row-level security enabled on a table with no policy"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/rls_no_policy.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -410,6 +504,7 @@
               "shortDescription": {
                 "text": "a SECURITY DEFINER routine without SET search_path"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/security_definer_search_path.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -419,6 +514,7 @@
               "shortDescription": {
                 "text": "a timestamp without time zone column"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_timestamptz.md",
               "defaultConfiguration": {
                 "level": "none"
               }
@@ -428,6 +524,7 @@
               "shortDescription": {
                 "text": "a serial column instead of an identity column"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_identity.md",
               "defaultConfiguration": {
                 "level": "none"
               }
@@ -437,6 +534,7 @@
               "shortDescription": {
                 "text": "a varchar(n) or char(n) column instead of text"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_text.md",
               "defaultConfiguration": {
                 "level": "none"
               }
@@ -446,6 +544,7 @@
               "shortDescription": {
                 "text": "an int2 or int4 primary key"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_bigint_pk.md",
               "defaultConfiguration": {
                 "level": "none"
               }
@@ -455,6 +554,7 @@
               "shortDescription": {
                 "text": "a json column instead of jsonb"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_jsonb.md",
               "defaultConfiguration": {
                 "level": "none"
               }
@@ -464,6 +564,7 @@
               "shortDescription": {
                 "text": "fetch_one / fetch_optional on a query not proven to return at most one row"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_may_return_many.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -473,6 +574,7 @@
               "shortDescription": {
                 "text": "fetch_all on a query that returns at most one row"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_all_single_row.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -482,6 +584,7 @@
               "shortDescription": {
                 "text": "execute() on a statement whose RETURNING rows are discarded"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unused_returning.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -491,6 +594,7 @@
               "shortDescription": {
                 "text": "a migration that breaks a query of the code deployed at --previous-deployment"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/breaks_deployed_queries.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
@@ -500,6 +604,7 @@
               "shortDescription": {
                 "text": "a malformed or unknown rule name in a typedpg-lint comment"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/invalid_allow.md",
               "defaultConfiguration": {
                 "level": "error"
               }
@@ -509,6 +614,7 @@
               "shortDescription": {
                 "text": "a typedpg bug: a fix that would have changed the query"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/internal_error.md",
               "defaultConfiguration": {
                 "level": "warning"
               }

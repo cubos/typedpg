@@ -97,6 +97,7 @@ pub const C_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(13);
 pub const SQL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(14);
 
 mod lint_access;
+pub use lint_access::ValueLimit;
 mod shared;
 pub use shared::Shared;
 pub(crate) mod pg_query_catalog;
@@ -1667,6 +1668,21 @@ impl PgCatalog {
         self.analyze_copy_in(target).map_err(LocatedError::new)
     }
 
+    /// [`Self::query_view`] as role `role`, as [`Self::analyze_as`]
+    /// analyzes a statement: the role must be allowed to run it, and its
+    /// search path resolves the query's names.
+    pub fn query_view_as(&self, sql: &str, role: &str) -> Result<QueryView, LocatedError> {
+        self.analyze_as_located(sql, role)?;
+        let path = self.role_search_path(role);
+        if path == self.search_path {
+            self.query_view(sql)
+        } else {
+            let mut catalog = self.clone();
+            catalog.search_path = path;
+            catalog.query_view(sql)
+        }
+    }
+
     /// Analyze `sql` for a tool that reads its parse tree, without applying
     /// the query simplifications.
     ///
@@ -1729,6 +1745,10 @@ impl PgCatalog {
                 .collect(),
             case_when_reached: lint_facts.case_when_reached,
             case_when_passed: lint_facts.case_when_passed,
+            count_arg_nullable: lint_facts.count_arg_nullable,
+            null_test_settled: lint_facts.null_test_settled,
+            writes: lint_facts.writes,
+            relation_uses: lint_facts.relation_uses,
         })
     }
 
@@ -2856,14 +2876,18 @@ pub trait MigrationObserver {
     }
 }
 
-/// What the analyzer proved about the two sides of one `= ANY` / `IN`
-/// sublink (the `location` is an offset in [`QueryView::sql`]).
+/// What the analyzer proved about the two sides of one `= ANY` / `IN` or
+/// `<> ALL` sublink (the `location` is an offset in [`QueryView::sql`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SublinkNullability {
     /// Some left-hand expression may be NULL.
     pub lhs_nullable: bool,
     /// Some output column of the subquery may be NULL.
     pub subquery_nullable: bool,
+    /// Every comparison operator it resolved to is strict on the operands
+    /// as written (its function and the implicit coercions of its
+    /// operands): a NULL on either side makes that comparison NULL.
+    pub operators_strict: bool,
 }
 
 /// What the analyzer proved about one `COALESCE` call (the `location` is an
@@ -2934,13 +2958,135 @@ struct LintFacts {
     nullified_joins: HashMap<i32, Option<Vec<NullifiedJoin>>>,
     case_when_reached: HashMap<i32, bool>,
     case_when_passed: HashMap<i32, bool>,
+    count_arg_nullable: HashMap<i32, bool>,
+    null_test_settled: HashMap<i32, bool>,
+    writes: Vec<crate::condition::WriteStatement>,
+    /// The indexes in `writes` of the statements being analyzed, innermost
+    /// last.
+    open_writes: Vec<usize>,
+    relation_uses: Vec<(PgClassOid, char)>,
 }
 
-/// Record whether a row may take the branch of the searched `CASE` `WHEN`
-/// at `location`: the `WHEN`s before it not TRUE and it TRUE, with what
-/// holds there. OR-merged with a fact already recorded there.
-pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
+/// While alive, the data-modifying statement [`note_write_statement`]
+/// recorded is being analyzed: the values written go to it.
+pub(crate) struct WriteStatementGuard(bool);
+
+impl Drop for WriteStatementGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            LINT_FACTS.with(|facts| {
+                if let Some(facts) = facts.borrow_mut().as_mut() {
+                    facts.open_writes.pop();
+                }
+            });
+        }
+    }
+}
+
+/// Record that the query has a data-modifying statement, `command` on
+/// relation `relid` (as the analyzer resolved it): while the guard lives,
+/// the values written go to it (see [`note_written`]) — but those of a
+/// data-modifying statement nested in it (a CTE), which go to that one.
+#[must_use]
+pub(crate) fn note_write_statement(
+    command: crate::condition::WriteCommand,
+    relid: PgClassOid,
+) -> WriteStatementGuard {
+    LINT_FACTS.with(|facts| {
+        let mut facts = facts.borrow_mut();
+        let Some(facts) = facts.as_mut() else {
+            return WriteStatementGuard(false);
+        };
+        facts.open_writes.push(facts.writes.len());
+        facts.writes.push(crate::condition::WriteStatement {
+            command,
+            relid,
+            columns: Vec::new(),
+        });
+        WriteStatementGuard(true)
+    })
+}
+
+/// Record that the data-modifying statement being analyzed writes
+/// `value` into its column `column` (`update`: as an UPDATE's SET, an
+/// `ON CONFLICT DO UPDATE SET` or a MERGE's `UPDATE SET`).
+pub(crate) fn note_written(
+    relid: PgClassOid,
+    column: &str,
+    update: bool,
+    value: crate::condition::WrittenValue,
+) {
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut()
+            && let Some(&open) = facts.open_writes.last()
+            && let Some(statement) = facts.writes.get_mut(open)
+            && statement.relid == relid
+        {
+            statement.columns.push(crate::condition::WrittenColumn {
+                column: column.to_owned(),
+                update,
+                value,
+            });
+        }
+    });
+}
+
+/// Record that the query runs command `cmd` on the rows of relation `relid`
+/// (`r` reads them in FROM, `a` INSERT, `w` UPDATE, `d` DELETE).
+pub(crate) fn note_relation_use(relid: PgClassOid, cmd: char) {
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut()
+            && !facts.relation_uses.contains(&(relid, cmd))
+        {
+            facts.relation_uses.push((relid, cmd));
+        }
+    });
+}
+
+/// Record whether the argument of the `count(x)` call at `location` (the
+/// call's) may be NULL. OR-merged with a fact already recorded there.
+pub(crate) fn note_count_arg_nullable(location: i32, nullable: bool) {
     if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.count_arg_nullable.entry(location).or_insert(false) |= nullable;
+        }
+    });
+}
+
+/// Record whether the other `AND` arguments of the `WHERE`, `JOIN … ON` or
+/// `HAVING` the `IS [NOT] NULL` test at `location` is an argument of prove
+/// its argument non-NULL (see [`crate::nonnull::note_settled_null_tests`]).
+/// AND-merged with a fact already recorded there.
+pub(crate) fn note_null_test_settled(location: i32, settled: bool) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.null_test_settled.entry(location).or_insert(true) &= settled;
+        }
+    });
+}
+
+/// Whether a fact that reads what holds where an expression is evaluated
+/// (its values' nullability and refinements) must not be recorded: the
+/// select-list replay ([`crate::expr::in_target_replay`]) runs right
+/// after FROM, before the `WHERE`'s facts are known, so what it reads is
+/// weaker than the final pass's — which analyzes the same expressions
+/// again, under those facts, and records them.
+fn replaying_targets() -> bool {
+    crate::expr::in_target_replay()
+}
+
+/// Record whether a row may take the branch of the `CASE` `WHEN` at
+/// `location`: the `WHEN`s before it not TRUE and it TRUE, with what
+/// holds there. OR-merged with a fact already recorded there; nothing is
+/// recorded during the select-list replay ([`replaying_targets`]).
+pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -2950,11 +3096,11 @@ pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
     });
 }
 
-/// Record whether a row may get past the searched `CASE` `WHEN` at
-/// `location`: it and every `WHEN` before it not TRUE, with what holds
-/// there. OR-merged with a fact already recorded there.
+/// Record whether a row may get past the `CASE` `WHEN` at `location`: it and every `WHEN` before it not TRUE, with what holds
+/// there. OR-merged with a fact already recorded there; nothing is
+/// recorded during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_case_when_passed(location: i32, passed: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -2980,9 +3126,10 @@ pub struct NullifiedJoin {
 
 /// Record what the comparison or `IN` list at `location` was decided to
 /// be (`None`: nothing), AND-merged with a fact already recorded there:
-/// two inferences that disagree decide nothing.
+/// two inferences that disagree decide nothing. Nothing is recorded
+/// during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_condition_fact(location: i32, fact: Option<crate::condition::ConditionFact>) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -3077,9 +3224,10 @@ pub(crate) fn note_column_ref_binding(location: i32, outer: bool, source: &str) 
 
 /// Record whether the `WHEN` condition at `location` (the `WHEN`
 /// keyword's) of a searched `CASE` is of type `boolean` itself and never
-/// NULL. AND-merged with a fact already recorded there.
+/// NULL. AND-merged with a fact already recorded there; nothing is
+/// recorded during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_case_condition_not_null(location: i32, not_null: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     LINT_FACTS.with(|facts| {
@@ -3112,9 +3260,10 @@ fn collecting_redundant_casts<R>(
 /// Record whether the omitted ELSE of the `CASE` at `location` may be its
 /// result: no WHEN certainly folds to TRUE, and the constraints and the
 /// conditions around it don't prove some WHEN true for every row.
-/// OR-merged with a fact already recorded there.
+/// OR-merged with a fact already recorded there; nothing is recorded
+/// during the select-list replay ([`replaying_targets`]).
 pub(crate) fn note_case_else_reachable(location: i32, reachable: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     CASE_ELSE_REACHABLE.with(|facts| {
@@ -3170,11 +3319,17 @@ fn collecting_null_check_facts<R>(
     (out, null_test, coalesce)
 }
 
-/// Record what an `= ANY` / `IN` sublink at `location` compared, merging
-/// with any fact already recorded for it (a sublink may be inferred more
-/// than once).
-pub(crate) fn note_sublink_nullability(location: i32, lhs_nullable: bool, subquery_nullable: bool) {
-    if location < 0 {
+/// Record what an `= ANY` / `IN` or `<> ALL` sublink at `location`
+/// compared, merging with any fact already recorded for it (a sublink may
+/// be inferred more than once). Nothing is recorded during the select-list
+/// replay ([`replaying_targets`]).
+pub(crate) fn note_sublink_nullability(
+    location: i32,
+    lhs_nullable: bool,
+    subquery_nullable: bool,
+    operators_strict: bool,
+) {
+    if location < 0 || replaying_targets() {
         return;
     }
     SUBLINK_NULLABILITY.with(|facts| {
@@ -3182,18 +3337,21 @@ pub(crate) fn note_sublink_nullability(location: i32, lhs_nullable: bool, subque
             let fact = facts.entry(location).or_insert(SublinkNullability {
                 lhs_nullable: false,
                 subquery_nullable: false,
+                operators_strict: true,
             });
             fact.lhs_nullable |= lhs_nullable;
             fact.subquery_nullable |= subquery_nullable;
+            fact.operators_strict &= operators_strict;
         }
     });
 }
 
 /// Record whether the argument of the `IS [NOT] NULL` test at `location`
 /// may be NULL, OR-merged with a fact already recorded there (a site may be
-/// inferred more than once).
+/// inferred more than once). Nothing is recorded during the select-list
+/// replay ([`replaying_targets`]).
 pub(crate) fn note_null_test_arg_nullable(location: i32, nullable: bool) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     NULL_TEST_ARG_NULLABLE.with(|facts| {
@@ -3205,14 +3363,15 @@ pub(crate) fn note_null_test_arg_nullable(location: i32, nullable: bool) {
 
 /// Record the facts of the `COALESCE` at `location`, merging with any
 /// already recorded for it: argument nullability OR-merged per index, the
-/// shared result type AND-merged.
+/// shared result type AND-merged. Nothing is recorded during the
+/// select-list replay ([`replaying_targets`]).
 pub(crate) fn note_coalesce_fact(
     location: i32,
     args_nullable: &[bool],
     args_typed_as_result: &[bool],
     args_share_result_type: bool,
 ) {
-    if location < 0 {
+    if location < 0 || replaying_targets() {
         return;
     }
     COALESCE_FACTS.with(|facts| {
@@ -3293,25 +3452,63 @@ pub struct QueryView {
     /// The outer joins each `WHERE` conjunct makes inner ones, by the
     /// conjunct's location in [`Self::sql`].
     nullified_joins: HashMap<i32, Vec<NullifiedJoin>>,
-    /// Whether a row may take each searched `CASE` branch, by its `WHEN`'s
+    /// Whether a row may take each `CASE` branch, by its `WHEN`'s
     /// location in [`Self::sql`].
     case_when_reached: HashMap<i32, bool>,
-    /// Whether a row may get past each searched `CASE` `WHEN`, by its
+    /// Whether a row may get past each `CASE` `WHEN`, by its
     /// location in [`Self::sql`].
     case_when_passed: HashMap<i32, bool>,
+    /// Whether the argument of each `count(x)` call may be NULL, by the
+    /// call's location in [`Self::sql`].
+    count_arg_nullable: HashMap<i32, bool>,
+    /// Whether the other `AND` arguments of its condition settle each
+    /// `IS [NOT] NULL` test, by the test's location in [`Self::sql`].
+    null_test_settled: HashMap<i32, bool>,
+    /// The data-modifying statements, in the order they were analyzed.
+    writes: Vec<crate::condition::WriteStatement>,
+    /// The relations whose rows the query reads or writes, with the command.
+    relation_uses: Vec<(PgClassOid, char)>,
 }
 
 impl QueryView {
-    /// Whether a row may take the branch of the searched `CASE` `WHEN` at
+    /// Whether the `IS [NOT] NULL` test at `location` (a byte offset in
+    /// [`Self::sql`]: the `NullTest`'s location), a top-level `AND`
+    /// argument of a `WHERE`, `JOIN … ON` or `HAVING`, tests a value the
+    /// other arguments (not `IS [NOT] NULL` tests themselves) being TRUE
+    /// prove non-NULL: a row where it is NULL is dropped by them. `None`
+    /// when the test is not such an argument.
+    pub fn null_test_settled(&self, location: i32) -> Option<bool> {
+        self.null_test_settled.get(&location).copied()
+    }
+
+    /// The query's data-modifying statements — its INSERTs (`ON CONFLICT DO
+    /// UPDATE SET` included), UPDATEs and MERGEs, data-modifying CTEs too —
+    /// each with the relation it writes as the analyzer resolved it (a CTE
+    /// of the same name or the search path can't mislead it) and the values
+    /// it writes into the relation's columns: one entry per VALUES row and
+    /// assignment.
+    pub fn writes(&self) -> &[crate::condition::WriteStatement] {
+        &self.writes
+    }
+
+    /// The relations whose rows the query reads in FROM (`r`) or writes as
+    /// a statement's target (`a` INSERT, `w` UPDATE, `d` DELETE; a MERGE
+    /// each command it has an action of), as the analyzer resolved them.
+    pub fn relation_uses(&self) -> &[(PgClassOid, char)] {
+        &self.relation_uses
+    }
+
+    /// Whether a row may take the branch of the `CASE` `WHEN` at
     /// `location` (a byte offset in [`Self::sql`]: the `CaseWhen`'s
     /// location): with what holds there — the `WHEN`s before it not TRUE,
     /// the conditions around the `CASE`, the CHECK constraints — the
-    /// `WHEN` can be TRUE. `None` when no such `WHEN` was inferred there.
+    /// `WHEN` can be TRUE (for a simple `CASE x WHEN v`, `x = v`). `None`
+    /// when no such `WHEN` was inferred there.
     pub fn case_when_reached(&self, location: i32) -> Option<bool> {
         self.case_when_reached.get(&location).copied()
     }
 
-    /// Whether a row may get past the searched `CASE` `WHEN` at `location`
+    /// Whether a row may get past the `CASE` `WHEN` at `location`
     /// (see [`Self::case_when_reached`]): it and every `WHEN` before it can
     /// all be not TRUE. `false`: the branches after it are never taken.
     pub fn case_when_passed(&self, location: i32) -> Option<bool> {
@@ -3337,7 +3534,7 @@ impl QueryView {
         self.nullified_joins.get(&location).map(Vec::as_slice)
     }
 
-    /// What the analyzer proved about the `= ANY` / `IN` sublink at
+    /// What the analyzer proved about the `= ANY` / `IN` or `<> ALL` sublink at
     /// `location` (a byte offset in [`Self::sql`]): whether some left-hand
     /// expression and whether some subquery output column may be NULL.
     /// `None` when no such sublink was inferred there.
@@ -3409,6 +3606,27 @@ impl QueryView {
         self.type_facts.operator(location)
     }
 
+    /// Whether every operator the operator call at `location` (a byte
+    /// offset in [`Self::sql`]: an `A_Expr`'s own location, or a simple
+    /// `CASE`'s `WHEN` for its `test = value`) resolved to is strict on its
+    /// operands as written: its function is `STRICT` and so is each
+    /// implicit coercion of an operand to the operator's declared argument
+    /// type, so a NULL operand makes the result NULL. `None` when no
+    /// operator was resolved there.
+    pub fn operator_is_strict(&self, location: i32) -> Option<bool> {
+        self.type_facts.operator_strict(location)
+    }
+
+    /// Whether every operator the operator call at `location` (as for
+    /// [`Self::operator_is_strict`]) resolved to runs only functions that
+    /// give one value for given arguments within the statement: its
+    /// function and the implicit coercions of its operands are neither
+    /// VOLATILE nor set-returning. `None` when no operator was resolved
+    /// there.
+    pub fn operator_is_nonvolatile(&self, location: i32) -> Option<bool> {
+        self.type_facts.operator_nonvolatile(location)
+    }
+
     /// Whether the `WHEN` condition of a searched `CASE`, at `location` (a
     /// byte offset in [`Self::sql`]: the `CaseWhen`'s location), is of type
     /// `boolean` (not a domain over it) and never NULL: it holds no
@@ -3416,6 +3634,16 @@ impl QueryView {
     /// condition was inferred there.
     pub fn case_condition_not_null(&self, location: i32) -> Option<bool> {
         self.case_condition_not_null.get(&location).copied()
+    }
+
+    /// Whether the argument of the `count(x)` call at `location` (a byte
+    /// offset in [`Self::sql`]: the `FuncCall`'s location) may be NULL: a
+    /// call the analyzer resolved to `pg_catalog.count("any")`, without `*`
+    /// or `DISTINCT`, over a value that is not a row / composite one. A
+    /// parameter anywhere in the argument makes it nullable (the caller may
+    /// pass NULL). `None` when no such call was inferred there.
+    pub fn count_arg_nullable(&self, location: i32) -> Option<bool> {
+        self.count_arg_nullable.get(&location).copied()
     }
 
     /// The byte offset in the original query text of `offset_in_sql`, a
