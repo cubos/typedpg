@@ -224,6 +224,26 @@ impl Refinement {
         }
     }
 
+    /// The same, without what every value of type `t` is: values listing
+    /// all of them (`true` and `false` of a boolean), and finiteness of a
+    /// type without infinities. That says nothing, and the same value known
+    /// to be any value of its type must read the same however it was
+    /// written (`CASE WHEN c THEN true ELSE false END` and `c`).
+    pub(crate) fn normalized(mut self, t: PgTypeOid, snapshot: &PgCatalog) -> Refinement {
+        if Exact::of(t, None, snapshot) == Some(Exact::Bool)
+            && self
+                .values
+                .as_ref()
+                .is_some_and(|vs| vs.contains("true") && vs.contains("false"))
+        {
+            self.values = None;
+        }
+        if !may_be_infinite(t, snapshot) {
+            self.finite = false;
+        }
+        self
+    }
+
     /// Its values, or those of a range of at most [`ENUMERATED`] integers.
     pub fn enumerated(&self) -> Option<BTreeSet<String>> {
         if let Some(vs) = &self.values {
@@ -523,19 +543,25 @@ const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
 /// that has none (only the date / time ones, the floats and `numeric` do —
 /// and an untyped literal or parameter may be read as one of them).
 pub(crate) fn finite_value(t: &crate::expr::ExprType, snapshot: &PgCatalog) -> bool {
+    t.refine.finite || !may_be_infinite(t.type_oid, snapshot)
+}
+
+/// Whether a value of type `t` may be an infinity: only the date / time
+/// types, the floats and `numeric` have one (and an untyped literal or
+/// parameter may be read as one of them).
+fn may_be_infinite(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
     use crate::pg_catalog::oid;
-    t.refine.finite
-        || ![
-            oid::DATE,
-            oid::TIMESTAMP,
-            oid::TIMESTAMPTZ,
-            INTERVAL,
-            oid::FLOAT4,
-            oid::FLOAT8,
-            oid::NUMERIC,
-            oid::UNKNOWN,
-        ]
-        .contains(&snapshot.unwrap_domain(t.type_oid))
+    [
+        oid::DATE,
+        oid::TIMESTAMP,
+        oid::TIMESTAMPTZ,
+        INTERVAL,
+        oid::FLOAT4,
+        oid::FLOAT8,
+        oid::NUMERIC,
+        oid::UNKNOWN,
+    ]
+    .contains(&snapshot.unwrap_domain(t))
 }
 
 /// The `pg_catalog` functions (called, or run by an operator) whose result

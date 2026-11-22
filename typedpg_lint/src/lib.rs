@@ -827,7 +827,8 @@ pub fn lint_query_called(
 }
 
 /// Whether `sql` with `fix` applied still analyzes to the same query shape
-/// as `original`: the same output columns (name, type, nullability), the
+/// as `original`: the same output columns (name, type, nullability, and
+/// the values they are known to take, which the generated types show), the
 /// same parameters (name, type, nullability) and the same embeddability.
 /// The error says what would have changed.
 ///
@@ -855,7 +856,11 @@ fn fix_keeps_shape(
                     .iter()
                     .zip(&original.columns)
                     .all(|(a, b)| {
-                        a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable
+                        a.name == b.name
+                            && a.pg_type == b.pg_type
+                            && a.nullable == b.nullable
+                            && a.refinement == b.refinement
+                            && a.elem_refinement == b.elem_refinement
                     })
         }
     };

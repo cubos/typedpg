@@ -300,8 +300,21 @@ pub(crate) fn infer_coalesce(
             .all(|t| t.type_oid == type_oid || t.type_oid == oid::UNKNOWN),
     );
 
-    let branches: Vec<(Option<&ast::Node>, &ExprType)> =
-        expr.args.iter().map(Option::as_ref).zip(&args).collect();
+    // The arguments the result can come from: none after the first that is
+    // never NULL (its coercion to the common type included), which is
+    // never reached.
+    let reached = args_nullable
+        .iter()
+        .zip(&kept)
+        .position(|(&nullable, &kept)| !nullable && kept)
+        .map_or(args.len(), |i| i + 1);
+    let branches: Vec<(Option<&ast::Node>, &ExprType)> = expr
+        .args
+        .iter()
+        .map(Option::as_ref)
+        .zip(&args)
+        .take(reached)
+        .collect();
     let typmod = agreed_typmod(&args, type_oid);
     ctx.note_strict(
         expr.location,
