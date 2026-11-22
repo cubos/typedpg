@@ -19,12 +19,22 @@
 //! handler, while a specific condition makes the block unknowable (the
 //! analyzer's errors don't carry the SQLSTATE the condition is matched
 //! against).
+//!
+//! `CALL` runs a procedure's body the same way ([`call`]): a PL/pgSQL body
+//! through this simulation, its arguments values the analyzer doesn't know;
+//! a `LANGUAGE sql` body statement by statement, through the migration's
+//! own interpreter, a query reading the arguments analyzed with them as
+//! parameters. Bodies in other languages, or run under `SECURITY DEFINER`
+//! or `SET` clauses, are not followed.
 
 use typedpg_pg_query::ast::{self, KeywordKind, Token};
 use typedpg_pg_query::plpgsql::{self, Datum, Stmt};
 
 use super::DdlError;
-use crate::pg_catalog::PgCatalog;
+use super::functions::{AtomicBody, RoutineSource};
+use crate::error::AnalyzeError;
+use crate::oid::{PgProcOid, PgTypeOid};
+use crate::pg_catalog::{PgCatalog, PgProc, ProKind, TypType};
 
 /// A block variable (`PLpgSQL_var`, `_rec`, `_row` datum).
 struct Variable {
@@ -55,6 +65,12 @@ enum Flow {
 
 struct Run {
     variables: Vec<Variable>,
+    /// The block runs in an atomic context: transaction control fails
+    /// (`_SPI_commit` / `_SPI_rollback`: "invalid transaction
+    /// termination").
+    atomic: bool,
+    /// A procedure's body: `$n` reads an argument.
+    arguments: bool,
 }
 
 /// Run the PL/pgSQL `DO` block `code` against the catalog.
@@ -97,8 +113,14 @@ pub(crate) fn execute(
     let Some(function) = parsed.first() else {
         return Ok(());
     };
+    // ExecuteDoStmt runs the block non-atomically only as a top-level
+    // statement outside a transaction block (standard_ProcessUtility's
+    // isAtomicContext; the implicit block of a multi-statement query
+    // counts).
     let mut run = Run {
         variables: variables(function),
+        atomic: interp.in_transaction_block,
+        arguments: false,
     };
     let Some(action) = &function.action else {
         return Ok(());
@@ -216,6 +238,10 @@ impl Run {
             return true;
         };
         scan.tokens.iter().any(|t| {
+            // `$n`: an argument, by position.
+            if t.token == Token::Param && self.arguments {
+                return true;
+            }
             let identifier = t.token == Token::Ident
                 || matches!(
                     t.keyword_kind,
@@ -277,8 +303,9 @@ impl Run {
                 if !runs_in_a_function(&sql) {
                     return Ok(Flow::Unknown);
                 }
-                super::apply_sql_to(interp, &sql)?;
-                Ok(Flow::Done)
+                // exec_stmt_dynexecute runs it atomically (SPI_execute_extended
+                // without allow_nonatomic).
+                run_sql(interp, &sql, true)
             }
             Stmt::Perform(s) => {
                 let Some(query) = expr_query(s.expr.as_ref()) else {
@@ -294,8 +321,31 @@ impl Run {
             Stmt::Raise(s) => self.raise(s),
             Stmt::Return(_) => Ok(Flow::Return),
             Stmt::If(s) => self.if_statement(interp, s),
+            Stmt::Call(s) if s.is_call => self.call(interp, s),
+            // _SPI_commit / _SPI_rollback: an atomic context can't end its
+            // transaction. Otherwise the transaction ends here, which the
+            // simulation doesn't follow.
+            Stmt::Commit(_) | Stmt::Rollback(_) if self.atomic => Err(DdlError::UnsupportedDdl(
+                "invalid transaction termination".into(),
+            )),
             _ => Ok(Flow::Unknown),
         }
+    }
+
+    /// `CALL proc(...)` (exec_stmt_call): the procedure runs
+    /// ([`run_call`]), non-atomically only when the block is; its INOUT and
+    /// OUT arguments' values go to the target variables. Arguments reading
+    /// the block's variables make the call unknowable.
+    fn call(&mut self, interp: &mut PgCatalog, s: &plpgsql::StmtCall) -> Result<Flow, DdlError> {
+        let Some(query) = expr_query(s.expr.as_ref()) else {
+            return Ok(Flow::Unknown);
+        };
+        if self.reads_variables(query) {
+            return Ok(Flow::Unknown);
+        }
+        let flow = run_sql(interp, query, self.atomic)?;
+        self.forget_targets(s.target);
+        Ok(flow)
     }
 
     /// `IF condition THEN ... END IF` (exec_stmt_if). The common
@@ -542,6 +592,372 @@ impl Run {
     }
 }
 
+// ─── CALL ───────────────────────────────────────────────────────────────────
+
+/// How deep `CALL`s nest before the analyzer stops following them: a
+/// deeper call is unknowable (a server runs out of `max_stack_depth` at a
+/// depth its configuration decides).
+const MAX_CALL_DEPTH: usize = 16;
+
+/// How many procedure bodies one top-level statement may run before the
+/// rest of them become unknowable — a bound on procedures calling several
+/// others each, whatever the depth.
+const MAX_CALLS: u32 = 1000;
+
+thread_local! {
+    /// The procedures whose bodies are running, outermost first.
+    static CALL_STACK: std::cell::RefCell<Vec<PgProcOid>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The procedure bodies run since the outermost call began.
+    static CALLS_RUN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A procedure body the analyzer can run.
+enum Body {
+    /// `LANGUAGE sql AS '...'`.
+    SqlText(String),
+    /// `LANGUAGE sql BEGIN ATOMIC ... END`.
+    Atomic(std::sync::Arc<AtomicBody>),
+    /// `LANGUAGE plpgsql`: the `CREATE PROCEDURE` statement it was compiled
+    /// from.
+    Plpgsql(String),
+}
+
+/// `CALL proc(...)` in a migration (ExecuteCallStmt): the call is checked,
+/// then the procedure's body runs as far as it can be known — non-atomically
+/// only as a top-level statement outside a transaction block
+/// (standard_ProcessUtility's isAtomicContext). A body whose effect can't
+/// be known statically leaves the catalog as it was, like an unknowable
+/// `DO` block.
+pub(crate) fn call(interp: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
+    super::dml::check_executed(interp, stmt)?;
+    let Some((proc, body)) = procedure_body(interp, stmt) else {
+        return Ok(());
+    };
+    let start = interp.snapshot();
+    let atomic = interp.in_transaction_block;
+    if let Flow::Unknown = run_body(interp, &proc, &body, atomic)? {
+        interp.roll_back_to(&start);
+    }
+    Ok(())
+}
+
+/// A `CALL` inside a running body (a PL/pgSQL `CALL`, a SQL body's
+/// statement): checked, then run. A procedure the analyzer can't run is
+/// unknowable.
+fn run_call(interp: &mut PgCatalog, stmt: &ast::Node, atomic: bool) -> Result<Flow, DdlError> {
+    super::dml::check_executed(interp, stmt)?;
+    match procedure_body(interp, stmt) {
+        Some((proc, body)) => run_body(interp, &proc, &body, atomic),
+        None => Ok(Flow::Unknown),
+    }
+}
+
+/// The procedure `stmt` calls and its body, when the analyzer can run it: a
+/// `LANGUAGE sql` or `plpgsql` procedure the migrations created, without
+/// `SECURITY DEFINER` or `SET` clauses (fmgr_security_definer runs those
+/// under another identity or settings, atomically).
+fn procedure_body(interp: &PgCatalog, stmt: &ast::Node) -> Option<(PgProc, Body)> {
+    let ast::Node::CallStmt(call) = stmt else {
+        return None;
+    };
+    let oid = crate::resolve::call_target(call, interp)?;
+    let proc = interp.pg_proc.get(&oid)?;
+    if proc.prokind != ProKind::Procedure || interp.procs_with_config.contains(&oid) {
+        return None;
+    }
+    let routine = interp.routine_bodies.get(&oid)?;
+    if routine.security_definer {
+        return None;
+    }
+    let body = match (routine.language.as_str(), &routine.source) {
+        ("sql", RoutineSource::SqlText(text)) => Body::SqlText(text.clone()),
+        ("sql", RoutineSource::SqlStandard(_)) => Body::Atomic(routine.atomic_body.clone()?),
+        ("plpgsql", RoutineSource::Plpgsql { create_sql }) => Body::Plpgsql(create_sql.clone()),
+        _ => return None,
+    };
+    Some((proc.clone(), body))
+}
+
+/// Run a procedure's body, unless that would recurse into a procedure
+/// already running or nest too deep: such a call is unknowable.
+fn run_body(
+    interp: &mut PgCatalog,
+    proc: &PgProc,
+    body: &Body,
+    atomic: bool,
+) -> Result<Flow, DdlError> {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            CALL_STACK.with_borrow_mut(|stack| stack.pop());
+        }
+    }
+    let entered = CALL_STACK.with_borrow_mut(|stack| {
+        if stack.is_empty() {
+            CALLS_RUN.set(0);
+        }
+        if stack.len() >= MAX_CALL_DEPTH
+            || stack.contains(&proc.oid)
+            || CALLS_RUN.get() >= MAX_CALLS
+        {
+            return false;
+        }
+        CALLS_RUN.set(CALLS_RUN.get() + 1);
+        stack.push(proc.oid);
+        true
+    });
+    if !entered {
+        return Ok(Flow::Unknown);
+    }
+    let _leave = Leave;
+    // The body's statements are parsed from its own text, not the
+    // migration.
+    let _barrier = crate::error::DiagContextGuard::barrier();
+    let flow = match body {
+        Body::SqlText(text) => run_sql_body(interp, proc, text)?,
+        Body::Atomic(atomic_body) => run_atomic_body(interp, proc, atomic_body)?,
+        Body::Plpgsql(create_sql) => run_plpgsql_body(interp, create_sql, atomic)?,
+    };
+    // The body's RETURN ends the procedure, not its caller.
+    Ok(match flow {
+        Flow::Unknown => Flow::Unknown,
+        Flow::Done | Flow::Return => Flow::Done,
+    })
+}
+
+/// A PL/pgSQL procedure's body, as a `DO` block runs (plpgsql_exec_function):
+/// its arguments — OUT ones included, which a procedure takes too — are
+/// values the analyzer doesn't know, so what reads them is unknowable.
+fn run_plpgsql_body(
+    interp: &mut PgCatalog,
+    create_sql: &str,
+    atomic: bool,
+) -> Result<Flow, DdlError> {
+    let Ok(parsed) = typedpg_pg_query::parse_plpgsql_with_catalog(create_sql, &*interp) else {
+        return Ok(Flow::Unknown);
+    };
+    let Some(function) = parsed.first() else {
+        return Ok(Flow::Unknown);
+    };
+    let Some(action) = &function.action else {
+        return Ok(Flow::Unknown);
+    };
+    let mut run = Run {
+        variables: variables(function),
+        atomic,
+        arguments: true,
+    };
+    for &varno in &function.fn_argvarnos {
+        if let Some(v) = usize::try_from(varno)
+            .ok()
+            .and_then(|i| run.variables.get_mut(i))
+        {
+            v.value = None;
+        }
+    }
+    run.block(interp, action)
+}
+
+/// SQL `sql` a running body executes (a constant `EXECUTE`, a PL/pgSQL
+/// `CALL`): its statements apply as a migration's do, a `CALL` running its
+/// procedure.
+fn run_sql(interp: &mut PgCatalog, sql: &str, atomic: bool) -> Result<Flow, DdlError> {
+    // The statements' locations are offsets into `sql`, not the migration.
+    let _barrier = crate::error::DiagContextGuard::barrier();
+    let parsed = super::parse(sql)?;
+    for raw in &parsed.tree.stmts {
+        let Some(stmt) = raw.stmt.as_ref() else {
+            continue;
+        };
+        let mut flow = Flow::Done;
+        super::with_statement_sql(interp, sql, raw, |interp| {
+            match stmt {
+                ast::Node::CallStmt(_) => flow = run_call(interp, stmt, atomic)?,
+                _ => super::apply_statement(interp, stmt)?,
+            }
+            Ok(())
+        })?;
+        if let Flow::Unknown = flow {
+            return Ok(Flow::Unknown);
+        }
+    }
+    Ok(Flow::Done)
+}
+
+/// A `LANGUAGE sql` procedure's string body: its statements run in order,
+/// each parsed and analyzed once the ones before it ran
+/// (prepare_next_query), so one sees what they created.
+fn run_sql_body(interp: &mut PgCatalog, proc: &PgProc, text: &str) -> Result<Flow, DdlError> {
+    let parsed = super::parse(text)?;
+    let params = Params::of(interp, proc);
+    for raw in &parsed.tree.stmts {
+        let Some(stmt) = raw.stmt.as_ref() else {
+            continue;
+        };
+        let mut flow = Flow::Done;
+        super::with_statement_sql(interp, text, raw, |interp| {
+            flow = sql_body_statement(interp, stmt, &params)?;
+            Ok(())
+        })?;
+        if let Flow::Unknown = flow {
+            return Ok(Flow::Unknown);
+        }
+    }
+    Ok(Flow::Done)
+}
+
+/// One statement of a SQL procedure's string body.
+fn sql_body_statement(
+    interp: &mut PgCatalog,
+    stmt: &ast::Node,
+    params: &Params,
+) -> Result<Flow, DdlError> {
+    // init_execution_state's checks of each statement.
+    match stmt {
+        ast::Node::TransactionStmt(_) => {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "{} is not allowed in an SQL function",
+                super::cmdtag::command_tag(stmt)
+            )));
+        }
+        ast::Node::CopyStmt(copy) if copy.filename.is_empty() => {
+            return Err(DdlError::UnsupportedDdl(
+                "cannot COPY to/from client in an SQL function".into(),
+            ));
+        }
+        _ => {}
+    }
+    if params.read_by(stmt) {
+        // A query reading the arguments is analyzed with them as values of
+        // their types; anything else reading them is unknowable.
+        if !is_query(stmt) || params.polymorphic {
+            return Ok(Flow::Unknown);
+        }
+        super::dml::verdict(params.check_executed(interp, stmt))?;
+        return Ok(Flow::Done);
+    }
+    match stmt {
+        // A SQL function's statements run atomically.
+        ast::Node::CallStmt(_) => run_call(interp, stmt, true),
+        _ if !statement_runs_in_a_function(stmt) => Ok(Flow::Unknown),
+        _ => {
+            super::apply_statement(interp, stmt)?;
+            Ok(Flow::Done)
+        }
+    }
+}
+
+/// A procedure's `BEGIN ATOMIC` body: queries PG stored resolved at
+/// CREATE PROCEDURE (interpret_AS_clause takes no other statement),
+/// analyzed again along the search path they were resolved with. A name
+/// that no longer resolves, or resolves differently, says nothing about
+/// the stored statement (it names its objects by OID): only an error
+/// outside the name-resolution classes (SQLSTATE classes 42 and 3F) is
+/// certain; the others make the body unknowable.
+fn run_atomic_body(
+    interp: &mut PgCatalog,
+    proc: &PgProc,
+    body: &AtomicBody,
+) -> Result<Flow, DdlError> {
+    let params = Params::of(interp, proc);
+    for stmt in &body.statements {
+        if !is_query(stmt) || (params.polymorphic && params.read_by(stmt)) {
+            return Ok(Flow::Unknown);
+        }
+        let session = std::mem::replace(&mut interp.search_path, body.search_path.clone());
+        let analyzed = params.check_executed(interp, stmt);
+        interp.search_path = session;
+        if let Err(e) = &analyzed
+            && e.sqlstate()
+                .is_none_or(|code| code.starts_with("42") || code.starts_with("3F"))
+        {
+            return Ok(Flow::Unknown);
+        }
+        super::dml::verdict(analyzed)?;
+    }
+    Ok(Flow::Done)
+}
+
+/// A query: what a SQL function's statements are analyzed as.
+fn is_query(stmt: &ast::Node) -> bool {
+    matches!(
+        stmt,
+        ast::Node::SelectStmt(_)
+            | ast::Node::InsertStmt(_)
+            | ast::Node::UpdateStmt(_)
+            | ast::Node::DeleteStmt(_)
+            | ast::Node::MergeStmt(_)
+    )
+}
+
+/// A SQL procedure's input parameters, as its body's statements see them
+/// (sql_fn_parser_setup): `$n`, or the name, also qualified by the
+/// procedure's.
+struct Params {
+    procedure: String,
+    inputs: Vec<(String, PgTypeOid)>,
+    /// A parameter of a polymorphic type: its type is the call's.
+    polymorphic: bool,
+}
+
+impl Params {
+    fn of(interp: &PgCatalog, proc: &PgProc) -> Self {
+        let inputs = super::function_body::input_params(proc);
+        let polymorphic = inputs.iter().any(|(_, t)| {
+            interp
+                .pg_type
+                .get(t)
+                .is_some_and(|ty| ty.typtype == TypType::Pseudo)
+        });
+        Params {
+            procedure: proc.proname.clone(),
+            inputs,
+            polymorphic,
+        }
+    }
+
+    /// Whether `stmt` may read a parameter: a `$n`, or a column reference
+    /// spelling a parameter's (or the procedure's) name.
+    fn read_by(&self, stmt: &ast::Node) -> bool {
+        stmt.nodes().any(|(node, _)| match node {
+            typedpg_pg_query::NodeRef::ParamRef(_) => true,
+            typedpg_pg_query::NodeRef::ColumnRef(c) => c.fields.iter().any(|f| {
+                matches!(f, Some(ast::Node::String(s))
+                    if s.sval == self.procedure
+                        || self.inputs.iter().any(|(name, _)| *name == s.sval))
+            }),
+            _ => false,
+        })
+    }
+
+    /// [`super::dml::check_executed`] with the parameters bound as values of
+    /// their types the analyzer doesn't know.
+    fn check_executed(
+        &self,
+        interp: &PgCatalog,
+        stmt: &ast::Node,
+    ) -> Result<
+        (
+            Vec<crate::resolve::RawColumn>,
+            Vec<crate::resolve::RawParam>,
+        ),
+        AnalyzeError,
+    > {
+        let types: Vec<PgTypeOid> = self.inputs.iter().map(|(_, t)| *t).collect();
+        let namespace = crate::expr::SqlFunctionParams {
+            name: self.procedure.clone(),
+            params: self.inputs.clone(),
+            locals: Vec::new(),
+        };
+        crate::resolve::analyze_executed(interp, stmt, || {
+            crate::expr::with_sql_function_params(namespace, || {
+                crate::resolve::analyze_raw_node_with_param_types(interp, stmt, &types)
+            })
+        })
+    }
+}
+
 /// Statements a PL/pgSQL block can't run the way a migration does: those
 /// PreventInTransactionBlock / RequireTransactionBlock refuse from a
 /// function, WAIT (top level only, PostgreSQL 19), and transaction control
@@ -550,30 +966,32 @@ fn runs_in_a_function(sql: &str) -> bool {
     let Ok(parsed) = typedpg_pg_query::parse(sql) else {
         return true;
     };
-    !parsed.tree.stmts.iter().any(|raw| {
-        matches!(
-            raw.stmt.as_ref(),
-            Some(
-                ast::Node::TransactionStmt(_)
-                    | ast::Node::VacuumStmt(_)
-                    | ast::Node::ReindexStmt(_)
-                    | ast::Node::RepackStmt(_)
-                    | ast::Node::WaitStmt(_)
-                    | ast::Node::CreatedbStmt(_)
-                    | ast::Node::DropdbStmt(_)
-                    | ast::Node::CreateTableSpaceStmt(_)
-                    | ast::Node::DropTableSpaceStmt(_)
-                    | ast::Node::AlterSystemStmt(_)
-                    | ast::Node::DiscardStmt(_)
-                    | ast::Node::LockStmt(_)
-                    | ast::Node::DeclareCursorStmt(_)
-                    | ast::Node::DoStmt(_)
-            )
-        ) || matches!(
-            raw.stmt.as_ref(),
-            Some(ast::Node::IndexStmt(i)) if i.concurrent
-        )
-    })
+    parsed
+        .tree
+        .stmts
+        .iter()
+        .all(|raw| raw.stmt.as_ref().is_none_or(statement_runs_in_a_function))
+}
+
+/// [`runs_in_a_function`] for one parsed statement.
+fn statement_runs_in_a_function(stmt: &ast::Node) -> bool {
+    !(matches!(
+        stmt,
+        ast::Node::TransactionStmt(_)
+            | ast::Node::VacuumStmt(_)
+            | ast::Node::ReindexStmt(_)
+            | ast::Node::RepackStmt(_)
+            | ast::Node::WaitStmt(_)
+            | ast::Node::CreatedbStmt(_)
+            | ast::Node::DropdbStmt(_)
+            | ast::Node::CreateTableSpaceStmt(_)
+            | ast::Node::DropTableSpaceStmt(_)
+            | ast::Node::AlterSystemStmt(_)
+            | ast::Node::DiscardStmt(_)
+            | ast::Node::LockStmt(_)
+            | ast::Node::DeclareCursorStmt(_)
+            | ast::Node::DoStmt(_)
+    ) || matches!(stmt, ast::Node::IndexStmt(i) if i.concurrent))
 }
 
 /// The role a `NOT EXISTS (...)` condition checks for, when it is the common

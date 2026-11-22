@@ -18,40 +18,10 @@ pub(crate) fn analyze_call(
     params: &mut ParamCollector,
 ) -> AnalyzeResult {
     let _level = QueryLevel::enter();
-    let fc = call
-        .funccall
-        .as_deref()
-        .ok_or_else(|| AnalyzeError::Unsupported("CALL without a procedure call".into()))?;
-    let parts = expr::extract_string_fields(&fc.funcname);
-    let (schema, name) = expr::deconstruct_qualified_name(
-        &parts,
-        crate::error::SourceSpan::from_node_qname(fc.location),
-    )?;
-
+    let (fc, arg_types, resolved) = resolve_procedure(call, snapshot, params)?;
     let scope = Scope::default();
     let null_ctx = NullabilityContext::default();
     let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
-    let mut arg_types = Vec::with_capacity(fc.args.len());
-    for a in &fc.args {
-        check_call_argument(a.as_ref(), snapshot)?;
-        arg_types.push(expr::infer_expr(a.as_ref(), ctx, params, TypeGoal::NONE)?.type_oid);
-    }
-    let notation = functions::CallNotation {
-        proc_call: true,
-        ..functions::CallNotation::of(fc)?
-    };
-    let resolved = match functions::func_get_detail(
-        snapshot,
-        schema,
-        name,
-        &arg_types,
-        &notation,
-        None,
-        crate::error::SourceSpan::from_node_qname(fc.location),
-    )? {
-        functions::FuncDetail::Routine(r) => r,
-        functions::FuncDetail::Coercion(_) => unreachable!("coercion interpretation not requested"),
-    };
     ctx.note_proc(Some(resolved.oid));
     // ExecuteCallStmt: EXECUTE on the procedure, and the parameter DEFAULT
     // expressions the call is expanded with — those of the parameters it
@@ -112,6 +82,70 @@ pub(crate) fn analyze_call(
         })
         .collect();
     Ok((columns, None))
+}
+
+/// The procedure `CALL` runs (ExecuteCallStmt's `fexpr->funcid`), when
+/// the call resolves.
+pub(crate) fn call_target(
+    call: &ast::CallStmt,
+    snapshot: &PgCatalog,
+) -> Option<crate::oid::PgProcOid> {
+    let _level = QueryLevel::enter();
+    let mut params = ParamCollector::default();
+    resolve_procedure(call, snapshot, &mut params)
+        .ok()
+        .map(|(_, _, resolved)| resolved.oid)
+}
+
+/// transformCallStmt's resolution: the arguments' types, and the routine
+/// `ParseFuncOrColumn` picks for them.
+fn resolve_procedure<'a>(
+    call: &'a ast::CallStmt,
+    snapshot: &PgCatalog,
+    params: &mut ParamCollector,
+) -> Result<
+    (
+        &'a ast::FuncCall,
+        Vec<PgTypeOid>,
+        functions::ResolvedFunction,
+    ),
+    AnalyzeError,
+> {
+    let fc = call
+        .funccall
+        .as_deref()
+        .ok_or_else(|| AnalyzeError::Unsupported("CALL without a procedure call".into()))?;
+    let parts = expr::extract_string_fields(&fc.funcname);
+    let (schema, name) = expr::deconstruct_qualified_name(
+        &parts,
+        crate::error::SourceSpan::from_node_qname(fc.location),
+    )?;
+
+    let scope = Scope::default();
+    let null_ctx = NullabilityContext::default();
+    let ctx = expr::Ctx::new(&scope, &null_ctx, snapshot);
+    let mut arg_types = Vec::with_capacity(fc.args.len());
+    for a in &fc.args {
+        check_call_argument(a.as_ref(), snapshot)?;
+        arg_types.push(expr::infer_expr(a.as_ref(), ctx, params, TypeGoal::NONE)?.type_oid);
+    }
+    let notation = functions::CallNotation {
+        proc_call: true,
+        ..functions::CallNotation::of(fc)?
+    };
+    let resolved = match functions::func_get_detail(
+        snapshot,
+        schema,
+        name,
+        &arg_types,
+        &notation,
+        None,
+        crate::error::SourceSpan::from_node_qname(fc.location),
+    )? {
+        functions::FuncDetail::Routine(r) => r,
+        functions::FuncDetail::Coercion(_) => unreachable!("coercion interpretation not requested"),
+    };
+    Ok((fc, arg_types, resolved))
 }
 
 /// EXPR_KIND_CALL_ARGUMENT: no sub-select (transformSubLink, 0A000), no

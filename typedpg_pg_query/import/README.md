@@ -7,8 +7,12 @@ so a re-import reproduces it byte for byte.
 
 The crate's `build.rs` compiles `import/FILES`, `postgres/typedpg/*.c`,
 `csrc/*.c`, `csrc/pg/*.c` and `csrc/plpgsql/*.c` for every target, plus the
-`import/FILES.windows` sources on Windows. Nothing comes from libpg_query any
-more, and the repository no longer carries it as a submodule.
+`import/FILES.windows` sources on Windows. One file gets a define of its own:
+`pl_comp.c` is compiled with `plpgsql_dumptree` renamed to
+`typedpg_plpgsql_dumptree` (`csrc/pg/plpgsql_dump.c`, a no-op), so a
+PL/pgSQL body's `#option dump` prints nothing to the analyzer's stdout; the
+imported source stays unmodified. Nothing comes from libpg_query any more, and
+the repository no longer carries it as a submodule.
 
 ## Prerequisites
 

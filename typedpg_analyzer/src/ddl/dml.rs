@@ -54,7 +54,7 @@ fn analyze_parsed(
 
 /// The migration's verdict on an analysis: PG's errors fail it, the
 /// analyzer's own gaps leave the statement unchecked (`Ok(None)`).
-fn verdict(
+pub(super) fn verdict(
     analyzed: Result<
         (
             Vec<crate::resolve::RawColumn>,

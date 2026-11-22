@@ -1830,6 +1830,7 @@ type AnalyzeResult = Result<(Vec<RawColumn>, Option<Vec<(i32, PgTypeOid, bool)>>
 
 mod assign;
 mod call;
+pub(crate) use call::call_target;
 mod copy_in;
 mod cte;
 mod deferred;

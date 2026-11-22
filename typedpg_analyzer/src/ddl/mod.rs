@@ -577,8 +577,9 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         ast::Node::InsertStmt(_)
         | ast::Node::UpdateStmt(_)
         | ast::Node::DeleteStmt(_)
-        | ast::Node::MergeStmt(_)
-        | ast::Node::CallStmt(_) => dml::check_executed(db, stmt),
+        | ast::Node::MergeStmt(_) => dml::check_executed(db, stmt),
+        // Checked, then the procedure's body runs (ExecuteCallStmt).
+        ast::Node::CallStmt(_) => do_block::call(db, stmt),
 
         // ── Indexes ─────────────────────────────────────────────────
         // Indexes don't change query result types, but expression indexes

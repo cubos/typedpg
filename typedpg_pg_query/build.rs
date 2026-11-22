@@ -42,9 +42,30 @@ fn main() {
     }
     pg_sources.extend(c_sources(&postgres.join("typedpg")));
 
+    // `#option dump` in a PL/pgSQL body makes the compiler print the
+    // function's tree to stdout (pl_comp.c → plpgsql_dumptree), which here
+    // is the process running the analyzer. pl_comp.c is compiled with that
+    // call renamed to typedpg_plpgsql_dumptree (csrc/pg/plpgsql_dump.c),
+    // which prints nothing: the option is still accepted.
+    let pl_comp = plpgsql.join("pl_comp.c");
+    let before = pg_sources.len();
+    pg_sources.retain(|source| source != &pl_comp);
+    assert_eq!(before - 1, pg_sources.len(), "import/FILES names pl_comp.c");
+    let mut quiet = cc::Build::new();
+    quiet
+        .file(&pl_comp)
+        .include(&include)
+        .include(&parser)
+        .include(&plpgsql)
+        .define("plpgsql_dumptree", "typedpg_plpgsql_dumptree")
+        .warnings(false);
+    configure(&mut quiet, &target);
+    let pl_comp_objects = quiet.compile_intermediates();
+
     let mut build = cc::Build::new();
     build
         .files(&pg_sources)
+        .objects(&pl_comp_objects)
         .include(&include)
         .include(&parser)
         .include(&plpgsql)

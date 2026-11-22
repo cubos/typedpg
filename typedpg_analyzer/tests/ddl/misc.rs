@@ -9358,3 +9358,160 @@ fn tablespace_names_and_locations_follow_create_and_rename() {
         db.apply_sql(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }
+
+#[test]
+fn call_runs_the_procedure_body() {
+    // ExecuteCallStmt runs the procedure: what its SQL body creates exists
+    // afterwards, and what its body raises fails the CALL — in a DO block
+    // too (exec_stmt_call), where a missing procedure fails as well.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE PROCEDURE p() LANGUAGE sql AS $$ CREATE TABLE z (a int) $$;",
+        ),
+        ("0002.sql", "CALL p();"),
+    ]);
+    db.analyze("SELECT a FROM z").unwrap();
+    assert_ddl_rejections(&[
+        (
+            "CREATE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1/0 $$;",
+            "CALL p();",
+            "division by zero",
+        ),
+        (
+            "",
+            "DO $$ BEGIN CALL nosuch(); END $$;",
+            "procedure nosuch() does not exist",
+        ),
+    ]);
+}
+
+#[test]
+fn call_runs_a_plpgsql_procedure_as_a_do_block() {
+    // plpgsql_exec_function runs the body the way a DO block runs: what it
+    // creates exists afterwards — also when the CALL is in a DO block, or
+    // in another procedure's body.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE PROCEDURE mk(name text) LANGUAGE plpgsql AS $$
+             BEGIN
+               CREATE TABLE z (a int);
+               RAISE NOTICE 'made %', name;
+             END $$;
+             CREATE PROCEDURE outer_sql() LANGUAGE sql AS $$ CALL mk('y') $$;
+             CREATE PROCEDURE outer_pl() LANGUAGE plpgsql AS $$ BEGIN CALL outer_sql(); END $$;",
+        ),
+        ("0002.sql", "CALL mk('x');"),
+        ("0003.sql", "ALTER TABLE z RENAME TO z1;"),
+        ("0004.sql", "DO $$ BEGIN CALL mk('x'); END $$;"),
+        ("0005.sql", "ALTER TABLE z RENAME TO z2;"),
+        ("0006.sql", "CALL outer_pl();"),
+    ]);
+    for sql in ["SELECT a FROM z", "SELECT a FROM z1", "SELECT a FROM z2"] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
+fn call_fails_with_what_the_body_always_raises() {
+    // exec_stmt_raise, a SQL body's statement every execution of which
+    // fails, or one a SQL function refuses (init_execution_state): the
+    // CALL fails with it, whatever the arguments.
+    let setup = "CREATE TABLE t (a int NOT NULL);
+         CREATE PROCEDURE boom(x int) LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'boom %', 1; END $$;
+         CREATE PROCEDURE ins_null(x int) LANGUAGE sql AS $$ INSERT INTO t VALUES (NULL) $$;
+         CREATE PROCEDURE atomic_div(x int) LANGUAGE sql BEGIN ATOMIC SELECT 1/0; END;
+         CREATE PROCEDURE ends() LANGUAGE sql AS $$ COMMIT $$;
+         CREATE PROCEDURE nested() LANGUAGE plpgsql AS $$ BEGIN CALL boom(2); END $$;";
+    assert_ddl_rejections(&[
+        (setup, "CALL boom(1);", "boom 1"),
+        (setup, "DO $$ BEGIN CALL boom(1); END $$;", "boom 1"),
+        (setup, "CALL nested();", "boom 1"),
+        (
+            setup,
+            "CALL ins_null(1);",
+            "null value in column \"a\" of relation \"t\" violates not-null constraint",
+        ),
+        (setup, "CALL atomic_div(1);", "division by zero"),
+        (
+            setup,
+            "CALL ends();",
+            "COMMIT is not allowed in an SQL function",
+        ),
+    ]);
+}
+
+#[test]
+fn call_treats_the_arguments_as_unknown_values() {
+    // The arguments are values only running the CALL gives: a statement
+    // reading them is checked as a query with parameters, and a PL/pgSQL
+    // statement depending on them stops the simulation — like an IF on a
+    // value in a DO block, which leaves the catalog as it was. Nothing
+    // that may not run fails the CALL.
+    let db = build_db(&[
+        (
+            "0001.sql",
+            "CREATE TABLE t (a int NOT NULL);
+             CREATE PROCEDURE ins(x int) LANGUAGE sql AS $$ INSERT INTO t VALUES (x) $$;
+             CREATE PROCEDURE ins_pl(x int) LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO t VALUES (x); INSERT INTO t VALUES ($1); END $$;
+             CREATE PROCEDURE maybe(x int) LANGUAGE plpgsql AS $$
+             BEGIN
+               IF x > 0 THEN
+                 CREATE TABLE z (a int);
+                 RAISE EXCEPTION 'positive';
+               END IF;
+             END $$;",
+        ),
+        ("0002.sql", "CALL ins(1);"),
+        ("0003.sql", "CALL ins_pl(1);"),
+        ("0004.sql", "CALL maybe(0);"),
+        ("0005.sql", "CREATE TABLE z (b int);"),
+    ]);
+    db.analyze("SELECT b FROM z").unwrap();
+}
+
+#[test]
+fn call_of_a_recursive_procedure_ends() {
+    // A procedure calling itself: the analyzer stops following the calls
+    // (PG runs out of max_stack_depth, at a depth its configuration
+    // decides — not compared).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE PROCEDURE r() LANGUAGE plpgsql AS $$ BEGIN CALL r(); END $$;
+         CREATE PROCEDURE b() LANGUAGE plpgsql AS $$ BEGIN CALL a(); END $$;
+         CREATE PROCEDURE a() LANGUAGE sql AS $$ CALL b() $$;",
+    )
+    .unwrap();
+    db.skip_pg_sanity();
+    db.apply_sql("CALL r();").unwrap();
+    db.apply_sql("CALL a();").unwrap();
+}
+
+#[test]
+fn call_forbids_transaction_control_inside_a_transaction_block() {
+    // ExecuteCallStmt / ExecuteDoStmt run atomically inside a transaction
+    // block — the implicit one of a multi-statement query included — where
+    // COMMIT and ROLLBACK fail (_SPI_commit: "invalid transaction
+    // termination"). Alone, the call may end its transaction.
+    let setup = "CREATE PROCEDURE c() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$;";
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(setup).unwrap();
+    db.apply_sql("CALL c();").unwrap();
+    db.apply_sql("DO $$ BEGIN ROLLBACK; END $$;").unwrap();
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "CALL c(); SELECT 1;",
+            "invalid transaction termination",
+        ),
+        (setup, "BEGIN; CALL c();", "invalid transaction termination"),
+        (
+            "",
+            "DO $$ BEGIN COMMIT; END $$; SELECT 1;",
+            "invalid transaction termination",
+        ),
+    ]);
+}
