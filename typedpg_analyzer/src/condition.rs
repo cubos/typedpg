@@ -782,6 +782,29 @@ pub struct WriteStatement {
     /// The values it writes into the relation's columns, in the order they
     /// were analyzed: one per VALUES row and per assignment.
     pub columns: Vec<WrittenColumn>,
+    /// When `relid` is an automatically updatable view (through a chain of
+    /// them): the table the rows are stored in. `None` for a table, and
+    /// for a view whose writes are something else — one with rules or an
+    /// INSTEAD OF trigger, or over a table with rules.
+    pub base: Option<WriteBase>,
+}
+
+/// The table a write through an automatically updatable view stores its
+/// rows in (see [`WriteStatement::base`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteBase {
+    /// The base table.
+    pub relid: crate::oid::PgClassOid,
+    /// Each column of the view the base table stores as is, with the base
+    /// column it stores it in: `(view column, base column)`, in the view's
+    /// column order.
+    pub columns: Vec<(String, String)>,
+    /// The base columns an INSERT giving no value for gets a value from a
+    /// view of the chain instead of the base column's own default: a view
+    /// column storing it has a default, or is of a domain type (whose
+    /// default isn't modeled) — PostgreSQL's rewriteTargetListIU fills each
+    /// view's defaults in on the way down.
+    pub defaulted: Vec<String>,
 }
 
 /// The command of a [`WriteStatement`].

@@ -56,6 +56,8 @@ A column the deployed code writes breaks when its new definition rejects a value
 
 A `CHECK` is read conjunct by conjunct (the arms of its top-level `AND`). One the analyzer reads exactly of the column alone — comparisons with constants (`n > 0 AND n <= 10`), a list of values (`kind IN ('a', 'b')`), `isfinite(at)`, `c IS NOT NULL` — is checked against the value as above. One it can't read that way (`length(name) > 1`, `lo <= hi`) is reported as one that *may* reject the deployed code's rows, for the written columns it reads, whatever the value. Constraints are compared by what they check, not by name: a `RENAME CONSTRAINT`, or a constraint dropped and added again as it was, changes nothing; one added again under the same name with another expression is new.
 
+A write into an automatically updatable view — or a view of one, down to the table — is a write into the table its rows are stored in, and is checked against that table: each view column as the table column it stores (a `CHECK`, `NOT NULL` or narrower type of the table's column breaks a write through the view), and an `INSERT` through the view leaves out every table column the view doesn't expose. A table column made `NOT NULL` without a default breaks every insert through a view that leaves it out, unless a view on the way down has a default for it (each view's defaults are filled in before the table's).
+
 Not reported: a column a new `UNIQUE`, primary key or exclusion constraint covers (whether a row breaks it depends on the data), a timestamp, time or interval precision (it rounds), and a length or precision change of a column the query only reads (the deployed code decodes the same wire type).
 
 ### Roles
@@ -237,6 +239,7 @@ warning[breaks_deployed_queries]: this migration breaks the deployed query at sr
 - A change that does not affect what the deployed code sends or receives: a new nullable column it does not select, a new table, an index, a parameter that now accepts more values.
 - A narrower column the value written certainly fits — a constant, a `CASE` of constants, a column whose type or `CHECK`s keep it in range — and a `CHECK` renamed, or dropped and added again with the same expression.
 - A new `UNIQUE`, primary key or exclusion constraint.
+- A write into a view whose writes are not the table's: one with an `INSTEAD OF` trigger or a rule (on it, on a view below it, or on the table), or that is not automatically updatable. What its trigger or rule writes is not followed; only the view's own column types are checked.
 - An allow comment on the migration statement, or in the deployed query's SQL (see below).
 - A ref where the project has no typedpg configuration, or a database whose migrations don't build at the ref: there is nothing deployed to compare with.
 

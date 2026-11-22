@@ -131,8 +131,11 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     };
     target_scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
     // The values its actions write, until it is analyzed.
-    let _write =
-        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Merge, table_oid);
+    let _write = crate::pg_catalog::note_write_statement(
+        crate::condition::WriteCommand::Merge,
+        table_oid,
+        || super::dml::write_base(snapshot, table_oid),
+    );
     note_merge_privileges(merge, table_oid, &table_attrs);
     let mut source_scope = Scope {
         ctes: cte_scopes.clone(),

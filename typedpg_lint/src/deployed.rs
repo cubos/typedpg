@@ -28,11 +28,15 @@
 //! column (`CHECK (lo <= hi)`, `length(name) > 1`) is reported as one that
 //! may reject the deployed code's rows. Constraints are compared by what
 //! they check, not their name. The tables written are the ones the analysis
-//! resolved ([`QueryView::writes`]). Not reported: a column a new UNIQUE,
-//! primary key or exclusion constraint covers (whether a row breaks it
-//! depends on the data), a parameter written into a column whose type
-//! changes (its type change says so), and a timestamp, time or interval
-//! precision (it rounds). A result column's type modifier changing is not
+//! resolved ([`QueryView::writes`]); a write into an automatically
+//! updatable view (or a chain of them) is checked against the table its
+//! rows are stored in, each view column as the table column it stores, and
+//! an `INSERT` through it leaves out the table columns the view doesn't
+//! expose (unless a view's default fills them in). Not reported: a column
+//! a new UNIQUE, primary key or exclusion constraint covers (whether a row
+//! breaks it depends on the data), a parameter written into a column whose
+//! type changes (its type change says so), and a timestamp, time or
+//! interval precision (it rounds). A result column's type modifier changing is not
 //! reported either: the deployed code decodes the same wire type whatever
 //! its length or precision. A deployed `copy_in!` is also checked for the
 //! columns it copies, their types and nullability.
@@ -635,12 +639,15 @@ fn copy_changes(
     let Some(old_table) = old_catalog.resolve_table(Some(&schema), &relname) else {
         return;
     };
-    let given: Vec<String> = new.columns.iter().map(|c| c.name.clone()).collect();
+    let inserted = Inserted {
+        given: new.columns.iter().map(|c| c.name.clone()).collect(),
+        exposed: None,
+    };
     omitted(
         &statement,
         &name,
         (old_table.oid, new.relid),
-        &given,
+        &inserted,
         old_catalog,
         new_catalog,
         out,
@@ -1047,7 +1054,17 @@ fn parameter_nullable(analyzed: &AnalyzedQuery, number: i32) -> bool {
 /// [`omitted`]), and a column written whose new definition accepts fewer
 /// values than the value written can be (see [`narrowed`]).
 ///
+/// A write into an automatically updatable view (through a chain of them)
+/// is checked against the table its rows are stored in, each view column
+/// as the base column it stores ([`WriteStatement::base`]); the base
+/// columns the view doesn't expose, unless a view's default fills them in,
+/// are ones an `INSERT` leaves out. A write into any other view (one with
+/// rules or an INSTEAD OF trigger) is not the base table's: it is checked
+/// against the view's own columns alone (their types, which the values
+/// written are coerced to).
+///
 /// [`QueryView::writes`]: typedpg_analyzer::QueryView::writes
+/// [`WriteStatement::base`]: typedpg_analyzer::WriteStatement::base
 fn writes(
     view: &QueryView,
     old_catalog: &PgCatalog,
@@ -1058,18 +1075,47 @@ fn writes(
         let Some((schema, relname)) = relation_name(new_catalog, statement.relid) else {
             continue;
         };
-        let Some(old_table) = old_catalog.resolve_table(Some(&schema), &relname) else {
+        let target = display_name(&schema, &relname);
+        // The relation the rows are stored in: its schema, name and OID.
+        let stored = match &statement.base {
+            Some(base) => {
+                let Some((schema, relname)) = relation_name(new_catalog, base.relid) else {
+                    continue;
+                };
+                (schema, relname, base.relid)
+            }
+            None => (schema, relname, statement.relid),
+        };
+        // The name a target column has in the stored relation.
+        let to_base = |column: &str| -> Option<String> {
+            match &statement.base {
+                Some(base) => base
+                    .columns
+                    .iter()
+                    .find(|(v, _)| v == column)
+                    .map(|(_, b)| b.clone()),
+                None => Some(column.to_owned()),
+            }
+        };
+        let Some(old_table) = old_catalog.resolve_table(Some(&stored.0), &stored.1) else {
             continue;
         };
-        let name = display_name(&schema, &relname);
-        let text = match statement.command {
-            WriteCommand::Insert => format!("its INSERT into {name}"),
-            WriteCommand::Update => format!("its UPDATE of {name}"),
-            WriteCommand::Merge => format!("its MERGE into {name}"),
+        let name = display_name(&stored.0, &stored.1);
+        let into = match &statement.base {
+            Some(_) => format!("{target} (a view of {name})"),
+            None => target.clone(),
         };
-        let relids = (old_table.oid, statement.relid);
+        let text = match statement.command {
+            WriteCommand::Insert => format!("its INSERT into {into}"),
+            WriteCommand::Update => format!("its UPDATE of {into}"),
+            WriteCommand::Merge => format!("its MERGE into {into}"),
+        };
+        let relids = (old_table.oid, stored.2);
         let mut written: Vec<(String, Vec<Value<'_>>)> = Vec::new();
         for column in &statement.columns {
+            let Some(base_column) = to_base(&column.column) else {
+                continue;
+            };
             let value = match &column.value {
                 // The column's default: what the deployed code doesn't
                 // send, as a column it leaves out.
@@ -1090,19 +1136,44 @@ fn writes(
                     refinement,
                 },
             };
-            match written.iter_mut().find(|(c, _)| *c == column.column) {
+            match written.iter_mut().find(|(c, _)| *c == base_column) {
                 Some((_, values)) => values.push(value),
-                None => written.push((column.column.clone(), vec![value])),
+                None => written.push((base_column, vec![value])),
             }
         }
         if statement.command == WriteCommand::Insert {
-            let mut given: Vec<String> = Vec::new();
+            let mut inserted = Inserted {
+                given: Vec::new(),
+                exposed: None,
+            };
             for column in statement.columns.iter().filter(|c| !c.update) {
-                if !given.contains(&column.column) {
-                    given.push(column.column.clone());
+                if let Some(base_column) = to_base(&column.column)
+                    && !inserted.given.contains(&base_column)
+                {
+                    inserted.given.push(base_column);
                 }
             }
-            omitted(&text, &name, relids, &given, old_catalog, new_catalog, out);
+            if let Some(base) = &statement.base {
+                // What a view's default fills in is given.
+                for column in &base.defaulted {
+                    if !inserted.given.contains(column) {
+                        inserted.given.push(column.clone());
+                    }
+                }
+                inserted.exposed = Some((
+                    target.clone(),
+                    base.columns.iter().map(|(_, b)| b.clone()).collect(),
+                ));
+            }
+            omitted(
+                &text,
+                &name,
+                relids,
+                &inserted,
+                old_catalog,
+                new_catalog,
+                out,
+            );
         }
         narrowed(
             &text,
@@ -1114,6 +1185,18 @@ fn writes(
             out,
         );
     }
+}
+
+/// The columns an `INSERT` (or a COPY) gives a value for, by the name the
+/// relation storing its rows has for them (see [`omitted`]).
+struct Inserted {
+    /// Given a value (`DEFAULT` included: the analysis rejects one that
+    /// stores NULL into a NOT NULL column), or filled in by a view's
+    /// default.
+    given: Vec<String>,
+    /// Through a view: its name, as the message says it, and the stored
+    /// columns it exposes. `None` for a table.
+    exposed: Option<(String, Vec<String>)>,
 }
 
 /// A column of relation `relid` of `catalog`, by name.
@@ -1132,14 +1215,16 @@ fn attribute(
 /// The columns of the relation `statement` (`its INSERT into t`, `its COPY
 /// into t`) inserts rows into — `relids`: its OID in the old and the new
 /// catalog, `name` as the message says it — that it leaves out (gives no
-/// value: not one of `given`) and the new schema makes `NOT NULL` without
-/// a default, where the deployed schema let them be omitted: PostgreSQL
-/// fails every row at runtime, which no analysis of the statement shows.
+/// value: not one of `inserted.given`; one the view it inserts through
+/// doesn't expose is, unless a view's default fills it in) and the new
+/// schema makes `NOT NULL` without a default, where the deployed schema
+/// let them be omitted: PostgreSQL fails every row at runtime, which no
+/// analysis of the statement shows.
 fn omitted(
     statement: &str,
     name: &str,
     relids: (PgClassOid, PgClassOid),
-    given: &[String],
+    inserted: &Inserted,
     old_catalog: &PgCatalog,
     new_catalog: &PgCatalog,
     out: &mut Vec<Change>,
@@ -1151,20 +1236,33 @@ fn omitted(
             && attribute.attgenerated.is_none()
     };
     for attribute in new_catalog.attributes_of(relids.1) {
-        if attribute.attnum <= 0 || given.contains(&attribute.attname) || !required(attribute) {
+        if attribute.attnum <= 0
+            || inserted.given.contains(&attribute.attname)
+            || !required(attribute)
+        {
             continue;
         }
         // Omitted before too: the deployed code already fails there.
         if attribute_required(old_catalog, relids.0, &attribute.attname, required) {
             continue;
         }
+        let column = quote_identifier(&attribute.attname);
+        let text = if let Some((view, exposed)) = &inserted.exposed
+            && !exposed.contains(&attribute.attname)
+        {
+            format!(
+                "{statement} leaves out column {column}, which {view} doesn't expose, now NOT \
+                 NULL without a default, so inserting any row fails"
+            )
+        } else {
+            format!(
+                "{statement} leaves out column {column}, now NOT NULL without a default, so \
+                 inserting any row fails"
+            )
+        };
         out.push(Change {
             subject: format!("omit {name} {}", attribute.attname),
-            text: format!(
-                "{statement} leaves out column {}, now NOT NULL without a default, so \
-                 inserting any row fails",
-                quote_identifier(&attribute.attname)
-            ),
+            text,
         });
     }
 }
@@ -2634,5 +2732,166 @@ mod tests {
             "its UPDATE of t writes column name, now character varying(10) instead of character \
              varying(20): a longer value fails"
         );
+    }
+
+    /// A table, an automatically updatable view of it renaming a column
+    /// and leaving one out, and a view of that view.
+    const VIEWS: &str = "CREATE TABLE t (id integer NOT NULL, kind text, name varchar(20), \
+                                         note text);
+        CREATE TABLE u (x integer NOT NULL);
+        CREATE VIEW v AS SELECT id, kind AS k, name FROM t;
+        CREATE VIEW w AS SELECT k AS kk, id FROM v;";
+
+    #[test]
+    fn a_write_through_a_view_meets_the_base_tables_constraints() {
+        let new = "ALTER TABLE t ADD CONSTRAINT t_kind CHECK (kind IN ('a', 'b'));";
+        let limits = "limits it to one of 'a', 'b': writing another value fails";
+        for (sql, statement) in [
+            (
+                "INSERT INTO v (id, k) VALUES ($id, $k)",
+                "its INSERT into v (a view of t)",
+            ),
+            (
+                "UPDATE v SET k = $k WHERE id = $id",
+                "its UPDATE of v (a view of t)",
+            ),
+            (
+                "MERGE INTO v USING u ON v.id = u.x WHEN MATCHED THEN UPDATE SET k = $k",
+                "its MERGE into v (a view of t)",
+            ),
+            (
+                "INSERT INTO v (id, k) VALUES ($id, $k) ON CONFLICT DO NOTHING",
+                "its INSERT into v (a view of t)",
+            ),
+            // Through a chain of views.
+            (
+                "INSERT INTO w (id, kk) VALUES ($id, $kk)",
+                "its INSERT into w (a view of t)",
+            ),
+        ] {
+            assert_eq!(
+                only(&check(&[VIEWS], &[new], &[sql])),
+                format!(
+                    "{statement} writes column kind, which CHECK constraint \"t_kind\" now \
+                     {limits}"
+                ),
+                "{sql}"
+            );
+        }
+        // A narrower base column (the views are dropped and created again
+        // around it).
+        assert_eq!(
+            only(&check(
+                &[VIEWS],
+                &["DROP VIEW w; DROP VIEW v;
+                   ALTER TABLE t ALTER COLUMN name TYPE varchar(10);
+                   CREATE VIEW v AS SELECT id, kind AS k, name FROM t;"],
+                &["UPDATE v SET name = $name WHERE id = $id"],
+            )),
+            "its UPDATE of v (a view of t) writes column name, now character varying(10) \
+             instead of character varying(20): a longer value fails"
+        );
+        // A view column storing a column the new constraint doesn't read,
+        // and a constant that fits: no finding.
+        assert!(
+            check(
+                &[VIEWS],
+                &[new],
+                &[
+                    "UPDATE v SET name = $name WHERE id = $id",
+                    "INSERT INTO v (id, k) VALUES ($id, 'a')",
+                ],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_insert_through_a_view_leaving_out_a_new_not_null_column() {
+        // A base column the view doesn't expose: every insert through the
+        // view leaves it out.
+        assert_eq!(
+            only(&check(
+                &[VIEWS],
+                &["ALTER TABLE t ALTER COLUMN note SET NOT NULL;"],
+                &["INSERT INTO v (id, k, name) SELECT x, 'a', 'n' FROM u"],
+            )),
+            "its INSERT into v (a view of t) leaves out column note, which v doesn't expose, now \
+             NOT NULL without a default, so inserting any row fails"
+        );
+        // One it exposes (renamed) that the INSERT doesn't give.
+        assert_eq!(
+            only(&check(
+                &[VIEWS],
+                &["ALTER TABLE t ALTER COLUMN kind SET NOT NULL;"],
+                &["INSERT INTO w (id) SELECT x FROM u"],
+            )),
+            "its INSERT into w (a view of t) leaves out column kind, now NOT NULL without a \
+             default, so inserting any row fails"
+        );
+        // Given through the view, a default of the base column, or of a
+        // view of the chain (on the way down, each view fills its own
+        // defaults in): no finding.
+        for (new, sql) in [
+            (
+                "ALTER TABLE t ALTER COLUMN kind SET NOT NULL;",
+                "INSERT INTO w (id, kk) SELECT x, 'a' FROM u",
+            ),
+            (
+                "ALTER TABLE t ALTER COLUMN note SET DEFAULT ''; \
+                 ALTER TABLE t ALTER COLUMN note SET NOT NULL;",
+                "INSERT INTO v (id) SELECT x FROM u",
+            ),
+            (
+                "ALTER VIEW v ALTER COLUMN k SET DEFAULT 'a'; \
+                 ALTER TABLE t ALTER COLUMN kind SET NOT NULL;",
+                "INSERT INTO w (id) SELECT x FROM u",
+            ),
+            (
+                "ALTER VIEW w ALTER COLUMN kk SET DEFAULT 'a'; \
+                 ALTER TABLE t ALTER COLUMN kind SET NOT NULL;",
+                "INSERT INTO w (id) SELECT x FROM u",
+            ),
+        ] {
+            let findings = check(&[VIEWS], &[new], &[sql]);
+            assert!(findings.is_empty(), "{new} / {sql}: {findings:?}");
+        }
+        // `DEFAULT` into a view column without a default leaves it out:
+        // the view below fills its own default in.
+        let findings = check(
+            &[VIEWS],
+            &["ALTER VIEW v ALTER COLUMN k SET DEFAULT 'a'; \
+               ALTER TABLE t ALTER COLUMN kind SET NOT NULL;"],
+            &["INSERT INTO w (id, kk) VALUES ($id, DEFAULT)"],
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_write_through_a_view_that_isnt_the_base_tables_is_not_checked() {
+        let new = "ALTER TABLE t ADD CONSTRAINT t_kind CHECK (kind IN ('a', 'b')); \
+                   ALTER TABLE t ALTER COLUMN note SET NOT NULL;";
+        // An INSTEAD OF trigger: the trigger decides what is written.
+        let trigger = "CREATE FUNCTION v_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+                       BEGIN RETURN NEW; END $$;
+                       CREATE TRIGGER v_insert INSTEAD OF INSERT OR UPDATE ON v
+                           FOR EACH ROW EXECUTE FUNCTION v_insert();";
+        // A rule: it rewrites the statement.
+        let rule = "CREATE RULE v_insert AS ON INSERT TO v DO ALSO NOTIFY v_inserted;
+                    CREATE RULE v_update AS ON UPDATE TO v DO ALSO NOTIFY v_updated;";
+        let queries = [
+            "INSERT INTO v (id, k, name) SELECT x, $k, 'n' FROM u",
+            "UPDATE v SET k = $k WHERE id = $id",
+        ];
+        for setup in [trigger, rule] {
+            // (They analyze: the silence is the rule's.)
+            let all = [VIEWS, setup, new];
+            for sql in queries {
+                let view = catalog(&all).query_view(sql);
+                assert!(view.is_ok_and(|v| !v.writes().is_empty()), "{sql}");
+            }
+            let findings = check(&[VIEWS, setup], &[new], &queries);
+            assert!(findings.is_empty(), "{setup}: {findings:?}");
+        }
     }
 }

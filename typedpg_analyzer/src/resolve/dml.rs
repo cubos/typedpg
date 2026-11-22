@@ -55,6 +55,58 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     }
 }
 
+/// For the lint (see [`crate::condition::WriteStatement::base`]): the
+/// table a write into view `relid` stores its rows in, when the view is
+/// automatically updatable down to it ([`WriteTarget::resolve`]: no rules
+/// or INSTEAD OF triggers on the way); `None` for a table, or a view
+/// whose writes are something else.
+pub(super) fn write_base(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+) -> Option<crate::condition::WriteBase> {
+    let is_view = |rel| {
+        snapshot
+            .pg_class
+            .get(&rel)
+            .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View)
+    };
+    if !is_view(relid) {
+        return None;
+    }
+    let target = WriteTarget::resolve(snapshot, relid)?;
+    let columns = snapshot
+        .attributes_of(relid)
+        .iter()
+        .filter_map(|a| {
+            let base = target.to_base.get(&a.attname)?;
+            Some((a.attname.clone(), base.clone()))
+        })
+        .collect();
+    // Each view of the chain fills its defaults in (rewriteTargetListIU);
+    // a domain-typed column's default isn't modeled (as in
+    // `WriteTarget::omitted`): taken as one that may give a value.
+    let mut defaulted: Vec<String> = Vec::new();
+    let mut cur = relid;
+    while is_view(cur) {
+        let level = WriteTarget::resolve(snapshot, cur)?;
+        for a in snapshot.attributes_of(cur) {
+            if a.attnum > 0
+                && (a.atthasdef || snapshot.unwrap_domain(a.atttypid) != a.atttypid)
+                && let Some(base) = level.to_base.get(&a.attname)
+                && !defaulted.contains(base)
+            {
+                defaulted.push(base.clone());
+            }
+        }
+        cur = snapshot.view_updatability.get(&cur)?.base?;
+    }
+    Some(crate::condition::WriteBase {
+        relid: target.base,
+        columns,
+        defaulted,
+    })
+}
+
 fn analyze_insert_here(
     ins: &ast::InsertStmt,
     snapshot: &PgCatalog,
@@ -69,8 +121,11 @@ fn analyze_insert_here(
 
     let tgt = resolve_insert_target(ins, relation, snapshot)?;
     let cte_scopes = build_insert_cte_scopes(ins, snapshot, params, outer_ctes)?;
-    let _write =
-        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Insert, tgt.oid);
+    let _write = crate::pg_catalog::note_write_statement(
+        crate::condition::WriteCommand::Insert,
+        tgt.oid,
+        || write_base(snapshot, tgt.oid),
+    );
     crate::pg_catalog::note_relation_use(tgt.oid, 'a');
 
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
@@ -2932,8 +2987,11 @@ fn analyze_update_here(
         .unwrap_or_default();
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
     // The columns the UPDATE writes.
-    let _write =
-        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Update, table_oid);
+    let _write = crate::pg_catalog::note_write_statement(
+        crate::condition::WriteCommand::Update,
+        table_oid,
+        || write_base(snapshot, table_oid),
+    );
     crate::pg_catalog::note_relation_use(table_oid, 'w');
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::UPDATE);
     crate::privileges::note_write(

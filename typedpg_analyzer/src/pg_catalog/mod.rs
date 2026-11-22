@@ -3003,11 +3003,20 @@ impl Drop for WriteStatementGuard {
 /// relation `relid` (as the analyzer resolved it): while the guard lives,
 /// the values written go to it (see [`note_written`]) — but those of a
 /// data-modifying statement nested in it (a CTE), which go to that one.
+/// `base`: the table a write through an automatically updatable view
+/// stores its rows in (see [`crate::condition::WriteStatement::base`]),
+/// computed only while the facts are collected.
 #[must_use]
 pub(crate) fn note_write_statement(
     command: crate::condition::WriteCommand,
     relid: PgClassOid,
+    base: impl FnOnce() -> Option<crate::condition::WriteBase>,
 ) -> WriteStatementGuard {
+    if !LINT_FACTS.with(|facts| facts.borrow().is_some()) {
+        return WriteStatementGuard(false);
+    }
+    // (Before borrowing the facts: following the view may note some.)
+    let base = base();
     LINT_FACTS.with(|facts| {
         let mut facts = facts.borrow_mut();
         let Some(facts) = facts.as_mut() else {
@@ -3018,6 +3027,7 @@ pub(crate) fn note_write_statement(
             command,
             relid,
             columns: Vec::new(),
+            base,
         });
         WriteStatementGuard(true)
     })
