@@ -690,6 +690,14 @@ pub(crate) fn infer_case(
         };
         null_ctx.unreachable(&column)
     };
+    // Whether an omitted ELSE may be the result: the `case_without_else`
+    // lint rule reads it.
+    if expr.defresult.is_none() {
+        crate::pg_catalog::note_case_else_reachable(
+            expr.location,
+            !(else_unreachable || literal_else_dropped),
+        );
+    }
     // The ELSE result (or PG's implicit `ELSE NULL`) leads the list.
     let default = match &expr.defresult {
         d @ Some(_) => {

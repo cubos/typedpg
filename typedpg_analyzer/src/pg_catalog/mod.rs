@@ -1679,12 +1679,19 @@ impl PgCatalog {
     /// wrote rather than one a simplification rewrote.
     pub fn query_view(&self, sql: &str) -> Result<QueryView, LocatedError> {
         crate::diagnostic::clear_last_primary();
-        let (((analysis, result), sublink_nullability), null_test_arg_nullable, coalesce_facts) =
+        let (
+            (
+                (((analysis, result), sublink_nullability), null_test_arg_nullable, coalesce_facts),
+                redundant_casts,
+            ),
+            case_else_reachable,
+        ) = collecting_redundant_casts(|| {
             collecting_null_check_facts(|| {
                 collecting_sublink_nullability(|| {
                     crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
                 })
-            });
+            })
+        });
         let analyzed = result.map_err(LocatedError::new)?;
         let tree = analysis.tree.map(|tree| tree.tree).ok_or_else(|| {
             LocatedError::new(AnalyzeError::Internal(format!(
@@ -1700,7 +1707,20 @@ impl PgCatalog {
             sublink_nullability,
             null_test_arg_nullable,
             coalesce_facts,
+            redundant_casts,
+            case_else_reachable,
         })
+    }
+
+    /// Whether the planner certainly folds condition `node` — a WHERE, JOIN
+    /// ON or HAVING qual, an AND argument of one, a CASE WHEN — to a
+    /// constant (`eval_const_expressions` over immutable operators and
+    /// functions of constants): `Some(true)`, or `Some(false)` for FALSE or
+    /// NULL (neither is true). `None` when it may depend on the row, a
+    /// parameter or the session. Names resolve along this catalog's search
+    /// path.
+    pub fn condition_constant(&self, node: &typedpg_pg_query::ast::Node) -> Option<bool> {
+        crate::expr::plan_fold::certainly_true(Some(node), self)
     }
 
     /// Inner analyze that also returns the rewritten SQL handed to the
@@ -2857,6 +2877,64 @@ thread_local! {
     /// each `COALESCE` call, by its location. `None` outside `query_view`.
     static COALESCE_FACTS: std::cell::RefCell<Option<HashMap<i32, CoalesceFact>>> =
         const { std::cell::RefCell::new(None) };
+    /// Set while [`PgCatalog::query_view`] analyzes a query: whether each
+    /// explicit cast, by its location, changes nothing (see
+    /// [`note_cast_redundant`]). `None` outside `query_view`.
+    static REDUNDANT_CASTS: std::cell::RefCell<Option<HashMap<i32, bool>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set while [`PgCatalog::query_view`] analyzes a query: whether the
+    /// omitted ELSE of each `CASE`, by its location, may be the result
+    /// (see [`note_case_else_reachable`]). `None` outside `query_view`.
+    static CASE_ELSE_REACHABLE: std::cell::RefCell<Option<HashMap<i32, bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, collecting the redundant-cast and omitted-ELSE facts it
+/// records.
+fn collecting_redundant_casts<R>(
+    f: impl FnOnce() -> R,
+) -> ((R, HashMap<i32, bool>), HashMap<i32, bool>) {
+    let before = REDUNDANT_CASTS.with(|facts| facts.replace(Some(HashMap::new())));
+    let before_else = CASE_ELSE_REACHABLE.with(|facts| facts.replace(Some(HashMap::new())));
+    let out = f();
+    let collected = REDUNDANT_CASTS
+        .with(|facts| facts.replace(before))
+        .unwrap_or_default();
+    let else_reachable = CASE_ELSE_REACHABLE
+        .with(|facts| facts.replace(before_else))
+        .unwrap_or_default();
+    ((out, collected), else_reachable)
+}
+
+/// Record whether the omitted ELSE of the `CASE` at `location` may be its
+/// result: no WHEN certainly folds to TRUE, and the constraints and the
+/// conditions around it don't prove some WHEN true for every row.
+/// OR-merged with a fact already recorded there.
+pub(crate) fn note_case_else_reachable(location: i32, reachable: bool) {
+    if location < 0 {
+        return;
+    }
+    CASE_ELSE_REACHABLE.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.entry(location).or_insert(false) |= reachable;
+        }
+    });
+}
+
+/// Record whether the explicit cast at `location` changes nothing: its
+/// operand already has the target type and type modifier, so coerce_type
+/// adds no node and the result is the operand itself. AND-merged with a
+/// fact already recorded there (a site may be inferred more than once, and
+/// a stored body's cast may share the offset).
+pub(crate) fn note_cast_redundant(location: i32, redundant: bool) {
+    if location < 0 {
+        return;
+    }
+    REDUNDANT_CASTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.entry(location).or_insert(true) &= redundant;
+        }
+    });
 }
 
 /// Run `f`, collecting the sublink nullability facts it records.
@@ -2992,6 +3070,12 @@ pub struct QueryView {
     null_test_arg_nullable: HashMap<i32, bool>,
     /// The facts of each `COALESCE` call, by its location in [`Self::sql`].
     coalesce_facts: HashMap<i32, CoalesceFact>,
+    /// Whether each explicit cast changes nothing, by its location in
+    /// [`Self::sql`].
+    redundant_casts: HashMap<i32, bool>,
+    /// Whether the omitted ELSE of each `CASE` may be its result, by its
+    /// location in [`Self::sql`].
+    case_else_reachable: HashMap<i32, bool>,
 }
 
 impl QueryView {
@@ -3015,6 +3099,25 @@ impl QueryView {
     /// [`Self::sql`]), or `None` when none was inferred there.
     pub fn coalesce_fact(&self, location: i32) -> Option<CoalesceFact> {
         self.coalesce_facts.get(&location).cloned()
+    }
+
+    /// Whether the explicit cast at `location` (a byte offset in
+    /// [`Self::sql`]: a `TypeCast`'s own location) changes nothing — its
+    /// operand, neither an untyped literal nor a parameter, already has the
+    /// target type and type modifier. `None` when no cast was inferred
+    /// there.
+    pub fn cast_is_redundant(&self, location: i32) -> Option<bool> {
+        self.redundant_casts.get(&location).copied()
+    }
+
+    /// Whether the `CASE` at `location` (a byte offset in [`Self::sql`]),
+    /// which has no ELSE, may result in its implicit NULL: no WHEN
+    /// certainly folds to TRUE and the analyzer doesn't prove the WHENs
+    /// cover every row (`CASE WHEN active THEN … WHEN NOT active THEN …`
+    /// over a NOT NULL column does). `None` when no such `CASE` was
+    /// inferred there.
+    pub fn case_else_reachable(&self, location: i32) -> Option<bool> {
+        self.case_else_reachable.get(&location).copied()
     }
 
     /// The byte offset in the original query text of `offset_in_sql`, a

@@ -145,6 +145,51 @@
               }
             },
             {
+              "id": "constant_condition",
+              "shortDescription": {
+                "text": "a condition that is always true or never true"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "unreachable_case_branch",
+              "shortDescription": {
+                "text": "a CASE branch that is never taken"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "case_without_else",
+              "shortDescription": {
+                "text": "a CASE without ELSE whose WHENs may all be false, which makes it NULL"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "redundant_cast",
+              "shortDescription": {
+                "text": "a cast to the type its operand already has"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "redundant_alias",
+              "shortDescription": {
+                "text": "an output column alias that names the column what it already is"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
               "id": "like_unescaped_param",
               "shortDescription": {
                 "text": "a LIKE pattern built from a parameter whose % and _ are not escaped"

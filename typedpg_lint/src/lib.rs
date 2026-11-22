@@ -105,6 +105,17 @@ pub enum Rule {
     RedundantLimit,
     /// A `DISTINCT` on rows that are already distinct.
     RedundantDistinct,
+    /// A `WHERE`, `JOIN … ON` or `HAVING` condition (or an `AND` argument of
+    /// one) that is always true or never true.
+    ConstantCondition,
+    /// A `CASE` branch that is never taken.
+    UnreachableCaseBranch,
+    /// A `CASE` without `ELSE` whose `WHEN`s may all fail: it is NULL then.
+    CaseWithoutElse,
+    /// A cast to the type its operand already has.
+    RedundantCast,
+    /// An output column alias naming the column what it already is.
+    RedundantAlias,
     /// A `LIKE` pattern built from a parameter whose `%` and `_` are not
     /// escaped.
     LikeUnescapedParam,
@@ -138,7 +149,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 25] = [
+    pub const ALL: [Rule; 30] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -154,6 +165,11 @@ impl Rule {
         Rule::LimitWithoutOrder,
         Rule::RedundantLimit,
         Rule::RedundantDistinct,
+        Rule::ConstantCondition,
+        Rule::UnreachableCaseBranch,
+        Rule::CaseWithoutElse,
+        Rule::RedundantCast,
+        Rule::RedundantAlias,
         Rule::LikeUnescapedParam,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
@@ -185,6 +201,11 @@ impl Rule {
             Rule::LimitWithoutOrder => "limit_without_order",
             Rule::RedundantLimit => "redundant_limit",
             Rule::RedundantDistinct => "redundant_distinct",
+            Rule::ConstantCondition => "constant_condition",
+            Rule::UnreachableCaseBranch => "unreachable_case_branch",
+            Rule::CaseWithoutElse => "case_without_else",
+            Rule::RedundantCast => "redundant_cast",
+            Rule::RedundantAlias => "redundant_alias",
             Rule::LikeUnescapedParam => "like_unescaped_param",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
@@ -230,6 +251,15 @@ impl Rule {
             }
             Rule::RedundantLimit => "a LIMIT on a query that returns at most one row",
             Rule::RedundantDistinct => "a DISTINCT on rows that are already distinct",
+            Rule::ConstantCondition => "a condition that is always true or never true",
+            Rule::UnreachableCaseBranch => "a CASE branch that is never taken",
+            Rule::CaseWithoutElse => {
+                "a CASE without ELSE whose WHENs may all be false, which makes it NULL"
+            }
+            Rule::RedundantCast => "a cast to the type its operand already has",
+            Rule::RedundantAlias => {
+                "an output column alias that names the column what it already is"
+            }
             Rule::LikeUnescapedParam => {
                 "a LIKE pattern built from a parameter whose % and _ are not escaped"
             }
@@ -278,11 +308,16 @@ impl Rule {
             | Rule::LimitWithoutOrder
             | Rule::FkTypeMismatch
             | Rule::MissingLockTimeout
-            | Rule::FetchMayReturnMany => Some(Severity::Warning),
+            | Rule::FetchMayReturnMany
+            | Rule::ConstantCondition
+            | Rule::UnreachableCaseBranch
+            | Rule::CaseWithoutElse => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit
             | Rule::RedundantDistinct
+            | Rule::RedundantCast
+            | Rule::RedundantAlias
             | Rule::FetchAllSingleRow
             | Rule::UnusedReturning => Some(Severity::Info),
             // Off by default: enabled with a level, they report at info.

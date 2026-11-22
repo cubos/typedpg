@@ -573,6 +573,11 @@ npx typedpg build          # compile the .sql files into the loaders' cache
 | `limit_without_order` | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
 | `redundant_limit` | info | A `LIMIT` on a query that returns at most one row. |
 | `redundant_distinct` | info | A `DISTINCT` on rows that are already distinct. |
+| `constant_condition` | warning | A `WHERE`, `JOIN … ON` or `HAVING` condition (or an `AND` argument of one) that is always true or never true. The fix removes a `WHERE` that is always true from a `SELECT`. |
+| `unreachable_case_branch` | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is. |
+| `case_without_else` | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
+| `redundant_cast` | info | A cast to the type (and type modifier) its operand already has. |
+| `redundant_alias` | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
 | `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
 | `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
 | `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |

@@ -11,11 +11,16 @@ use typedpg_pg_query::ast::{
 
 use crate::{Ctx, RawFinding, Rule};
 
+mod case_without_else;
+mod constant_condition;
 mod like_unescaped_param;
 mod limit_without_order;
+mod redundant_alias;
+mod redundant_cast;
 mod redundant_distinct;
 mod redundant_limit;
 mod redundant_null_check;
+mod unreachable_case_branch;
 
 /// The operators `null_comparison` reports: the ordinary comparisons, not
 /// `IS [NOT] DISTINCT FROM` or the pattern operators.
@@ -30,6 +35,11 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::LimitWithoutOrder => limit_without_order::findings(ctx),
         Rule::RedundantLimit => redundant_limit::findings(ctx),
         Rule::RedundantDistinct => redundant_distinct::findings(ctx),
+        Rule::ConstantCondition => constant_condition::findings(ctx),
+        Rule::UnreachableCaseBranch => unreachable_case_branch::findings(ctx),
+        Rule::CaseWithoutElse => case_without_else::findings(ctx),
+        Rule::RedundantCast => redundant_cast::findings(ctx),
+        Rule::RedundantAlias => redundant_alias::findings(ctx),
         Rule::LikeUnescapedParam => like_unescaped_param::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
@@ -324,6 +334,109 @@ pub(super) fn expression_end(ctx: &Ctx<'_>, start: usize) -> usize {
     end
 }
 
+/// The start of `node`'s first token: an operator expression starts at its
+/// left operand (`A_Expr`'s own location is its operator), a boolean
+/// expression at its first argument, a cast or test at its operand.
+pub(super) fn leftmost_start(node: &Node) -> Option<usize> {
+    match node {
+        N::AExpr(expr) => expr
+            .lexpr
+            .as_ref()
+            .and_then(leftmost_start)
+            .or_else(|| location(expr.location)),
+        N::BoolExpr(expr) if expr.boolop != BoolExprType::NotExpr => expr
+            .args
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(leftmost_start)
+            .or_else(|| location(expr.location)),
+        N::TypeCast(cast) => cast
+            .arg
+            .as_ref()
+            .and_then(leftmost_start)
+            .or_else(|| node_start(node)),
+        N::NullTest(test) => test
+            .arg
+            .as_ref()
+            .and_then(leftmost_start)
+            .or_else(|| location(test.location)),
+        N::BooleanTest(test) => test
+            .arg
+            .as_ref()
+            .and_then(leftmost_start)
+            .or_else(|| location(test.location)),
+        _ => node_start(node),
+    }
+}
+
+/// Scan the tokens starting at byte `from`, keeping track of parentheses,
+/// brackets and `CASE … END`: stop at the first token at nesting depth zero
+/// that `stop` accepts, or that closes a level opened before `from`.
+/// Returns the end of the last token before it (`from` when none) and its
+/// index in [`Ctx::tokens`] (`None` at the end of the text).
+pub(super) fn scan_until(
+    ctx: &Ctx<'_>,
+    from: usize,
+    mut stop: impl FnMut(&str) -> bool,
+) -> (usize, Option<usize>) {
+    let mut depth = 0usize;
+    let mut end = from;
+    for (index, token) in ctx.tokens.iter().enumerate() {
+        if token.start < from {
+            continue;
+        }
+        let text = &ctx.sql[token.start..token.end];
+        let opens = text == "(" || text == "[" || text.eq_ignore_ascii_case("CASE");
+        let closes = text == ")" || text == "]" || text.eq_ignore_ascii_case("END");
+        if depth == 0 && (closes || stop(text)) {
+            return (end, Some(index));
+        }
+        if opens {
+            depth += 1;
+        } else if closes {
+            depth -= 1;
+        }
+        end = token.end;
+    }
+    (end, None)
+}
+
+/// Whether `text` is a keyword that starts a clause after a select list, a
+/// condition or a `RETURNING` list.
+pub(super) fn starts_clause(text: &str) -> bool {
+    [
+        "FROM",
+        "INTO",
+        "WHERE",
+        "GROUP",
+        "HAVING",
+        "WINDOW",
+        "ORDER",
+        "LIMIT",
+        "OFFSET",
+        "FETCH",
+        "FOR",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "RETURNING",
+        "ON",
+        "USING",
+        "JOIN",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "NATURAL",
+        "WHEN",
+        "THEN",
+    ]
+    .iter()
+    .any(|keyword| text.eq_ignore_ascii_case(keyword))
+        || text == ";"
+}
+
 pub(super) fn is_terminator(text: &str) -> bool {
     if matches!(
         text,
@@ -561,5 +674,61 @@ pub(super) fn table_name(relation: &RangeVar) -> String {
         quote_identifier(&relation.relname)
     } else {
         QualifiedName::new(relation.schemaname.clone(), relation.relname.clone()).to_string()
+    }
+}
+
+/// What the rules' own tests share.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use typedpg_analyzer::PgCatalog;
+
+    use crate::{Finding, LintOptions, Rule, SqlEdit, lint_query};
+
+    /// A small schema: `users` and `posts`.
+    pub(crate) fn catalog() -> PgCatalog {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE TABLE users (
+                    id bigint PRIMARY KEY,
+                    name text,
+                    email varchar(100) NOT NULL UNIQUE,
+                    code char(3)
+                 );
+                 CREATE TABLE posts (
+                    id bigint PRIMARY KEY,
+                    user_id bigint NOT NULL REFERENCES users,
+                    title text NOT NULL
+                 );",
+            )
+            .unwrap();
+        catalog
+    }
+
+    /// The findings of `rule` alone (every rule at its default level).
+    pub(crate) fn lint_rule(catalog: &PgCatalog, sql: &str, rule: Rule) -> Vec<Finding> {
+        lint_query(catalog, sql, &LintOptions::default())
+            .unwrap_or_else(|e| panic!("{sql}: {}", e.error))
+            .into_iter()
+            .filter(|finding| finding.rule == rule)
+            .collect()
+    }
+
+    /// `sql` with every finding's fix applied, in the original text.
+    pub(crate) fn fixed(sql: &str, findings: &[Finding]) -> String {
+        let mut edits: Vec<SqlEdit> = findings
+            .iter()
+            .flat_map(|finding| finding.fix.clone())
+            .collect();
+        edits.sort_by_key(|edit| edit.range.start);
+        let mut out = String::with_capacity(sql.len());
+        let mut last = 0;
+        for edit in edits {
+            out.push_str(&sql[last..edit.range.start]);
+            out.push_str(&edit.text);
+            last = edit.range.end;
+        }
+        out.push_str(&sql[last..]);
+        out
     }
 }
