@@ -452,22 +452,8 @@ fn fold_operator(e: &ast::AExpr, snapshot: &PgCatalog, columns: &Columns<'_>) ->
         return None;
     }
     match (&l, &r) {
-        (Value::Int(a, ta), Value::Int(b, tb)) => {
-            // `int24pl` & co.: the wider type.
-            let t = (*ta).max(*tb);
-            let (a, b) = (*a, *b);
-            let v = match op {
-                "+" => a + b,
-                "-" => a - b,
-                "*" => a * b,
-                "/" | "%" if b == 0 => return Some(Err(FoldError::DivisionByZero)),
-                "/" => a / b,
-                // `int4mod`: `INT_MIN % -1` is 0, not an overflow.
-                _ if b == -1 => 0,
-                _ => a % b,
-            };
-            Some(t.checked(v))
-        }
+        // `int24pl` & co.: the wider type.
+        (Value::Int(a, ta), Value::Int(b, tb)) => int_arith(op, *a, *b, (*ta).max(*tb)),
         // `numeric_div` / `numeric_mod` (an integer side is converted to
         // `numeric`): a zero divisor fails unless the dividend is NaN.
         _ if matches!(op, "/" | "%") => {
@@ -483,6 +469,75 @@ fn fold_operator(e: &ast::AExpr, snapshot: &PgCatalog, columns: &Columns<'_>) ->
         }
         _ => None,
     }
+}
+
+/// `a op b` (`+`, `-`, `*`, `/`, `%`) by the built-in integer arithmetic
+/// returning `t` (`int4pl`, `int48div`, `int8mod`, …). `None` for another
+/// operator.
+fn int_arith(op: &str, a: i128, b: i128, t: IntType) -> Folded {
+    let v = match op {
+        "+" => a + b,
+        "-" => a - b,
+        "*" => a * b,
+        "/" | "%" if b == 0 => return Some(Err(FoldError::DivisionByZero)),
+        "/" => a / b,
+        // `int4mod`: `INT_MIN % -1` is 0, not an overflow.
+        "%" if b == -1 => 0,
+        "%" => a % b,
+        _ => return None,
+    };
+    Some(t.checked(v))
+}
+
+/// What the built-in integer arithmetic function `proname` (`int4pl`,
+/// `int48mi`, `int2um`, `int8up`, `int4mod`, …) returns for `args`, as
+/// `result` (its return type): the planner evaluates these IMMUTABLE
+/// functions over constants (evaluate_function). `None` for any other
+/// function.
+pub(crate) fn int_function(proname: &str, args: &[i128], result: IntType) -> Folded {
+    let rest = proname.strip_prefix("int")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (types, suffix) = rest.split_at(digits);
+    let single = matches!(types, "2" | "4" | "8");
+    let mixed = matches!(types, "24" | "42" | "28" | "82" | "48" | "84");
+    match (suffix, args) {
+        ("um", [a]) if single => Some(result.checked(-a)),
+        ("up", [a]) if single => Some(result.checked(*a)),
+        ("mod", [a, b]) if single => int_arith("%", *a, *b, result),
+        ("pl" | "mi" | "mul" | "div", [a, b]) if single || mixed => {
+            let op = match suffix {
+                "pl" => "+",
+                "mi" => "-",
+                "mul" => "*",
+                _ => "/",
+            };
+            int_arith(op, *a, *b, result)
+        }
+        _ => None,
+    }
+}
+
+/// What the built-in integer comparison `proname` (`int4eq`, `int48lt`,
+/// `int2ge`, …) returns for `a` and `b`. `None` for any other function.
+pub(crate) fn int_comparison(proname: &str, a: i128, b: i128) -> Option<bool> {
+    let rest = proname.strip_prefix("int")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (types, suffix) = rest.split_at(digits);
+    if !matches!(
+        types,
+        "2" | "4" | "8" | "24" | "42" | "28" | "82" | "48" | "84"
+    ) {
+        return None;
+    }
+    Some(match suffix {
+        "eq" => a == b,
+        "ne" => a != b,
+        "lt" => a < b,
+        "le" => a <= b,
+        "gt" => a > b,
+        "ge" => a >= b,
+        _ => return None,
+    })
 }
 
 /// Untyped literal `text` read as the type of `other`, the operator's

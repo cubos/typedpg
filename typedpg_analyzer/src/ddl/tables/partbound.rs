@@ -848,8 +848,9 @@ fn uuid_value(s: &str) -> Option<i128> {
     (i == b.len()).then_some((value ^ 1 << 127) as i128)
 }
 
-/// An enum key's value: its label's sort order (enum_cmp) — unless another
-/// label shares it, which the analyzer's sort orders can't tell apart.
+/// An enum key's value: its label's sort order (enum_cmp). AddEnumLabel
+/// renumbers rather than tie two labels, but a tie is still treated as
+/// opaque, as a guard.
 fn enum_value(interp: &PgCatalog, key: PgTypeOid, label: &str) -> Option<i128> {
     let labels = interp.pg_enum.get(&key)?;
     let order = labels.iter().find(|e| e.enumlabel == label)?.enumsortorder;

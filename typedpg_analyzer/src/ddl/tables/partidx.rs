@@ -407,16 +407,17 @@ fn index_definitions_match(interp: &PgCatalog, parent: &PgIndex, child: &PgIndex
             (child.indrelid, &child.indexprs),
             (parent.indrelid, &parent.indexprs),
         )
-        && same_exprs(
+        && same_predicate(
             interp,
-            (child.indrelid, child.indpred.as_slice()),
-            (parent.indrelid, parent.indpred.as_slice()),
+            (child.indrelid, child.indpred.as_ref()),
+            (parent.indrelid, parent.indpred.as_ref()),
         )
         && access_method(interp, child.indexrelid) == access_method(interp, parent.indexrelid)
 }
 
-/// CompareIndexInfo: two indexes' expressions (or predicates), over their
-/// tables, are `equal()` once transformed (see [`crate::ddl::cooked`]).
+/// CompareIndexInfo: two indexes' expressions, over their tables, are
+/// `equal()` once transformed and folded (see
+/// [`crate::ddl::cooked::same_index_expr`]).
 fn same_exprs(
     interp: &PgCatalog,
     (rel_a, a): (PgClassOid, &[crate::pg_catalog::SerializedAst]),
@@ -424,13 +425,30 @@ fn same_exprs(
 ) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(a, b)| {
-            crate::ddl::cooked::same_written(
+            crate::ddl::cooked::same_index_expr(
                 interp,
                 (rel_a, a.ast.as_ref()),
                 (rel_b, b.ast.as_ref()),
-                None,
             )
         })
+}
+
+/// CompareIndexInfo: two indexes' predicates, likewise — one folding to
+/// TRUE is no predicate (RelationGetIndexPredicate).
+fn same_predicate(
+    interp: &PgCatalog,
+    (rel_a, a): (PgClassOid, Option<&crate::pg_catalog::SerializedAst>),
+    (rel_b, b): (PgClassOid, Option<&crate::pg_catalog::SerializedAst>),
+) -> bool {
+    use crate::ddl::cooked::{index_predicate_is_true, same_index_expr};
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            same_index_expr(interp, (rel_a, a.ast.as_ref()), (rel_b, b.ast.as_ref()))
+        }
+        (Some(p), None) => index_predicate_is_true(interp, rel_a, p.ast.as_ref()),
+        (None, Some(p)) => index_predicate_is_true(interp, rel_b, p.ast.as_ref()),
+        (None, None) => true,
+    }
 }
 
 /// An index's access method (`relam`; btree unless recorded otherwise).

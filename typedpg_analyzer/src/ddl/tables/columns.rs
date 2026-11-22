@@ -608,7 +608,7 @@ fn base_type_and_typmod(interp: &PgCatalog, typ: PgTypeOid) -> (PgTypeOid, i32) 
 
 /// DomainHasConstraints: a domain in `typ`'s chain carries a CHECK or NOT
 /// NULL constraint.
-fn domain_has_constraints(interp: &PgCatalog, typ: PgTypeOid) -> bool {
+pub(crate) fn domain_has_constraints(interp: &PgCatalog, typ: PgTypeOid) -> bool {
     let mut current = typ;
     while let Some(t) = interp.pg_type.get(&current) {
         if t.typtype != TypType::Domain {

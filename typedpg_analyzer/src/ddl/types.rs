@@ -1366,43 +1366,48 @@ pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), Dd
         )));
     }
 
+    // AddEnumLabel: `labels` is ordered by enumsortorder.
     let new_sortorder = if stmt.new_val_neighbor.is_empty() {
-        labels
+        // The end of the list: one more than the last member, or 1.
+        labels.last().map_or(1.0, |e| e.enumsortorder + 1.0)
+    } else {
+        let Some(nbr_index) = labels
             .iter()
-            .map(|e| e.enumsortorder)
-            .fold(0.0_f32, f32::max)
-            + 1.0
-    } else if let Some(neighbor) = labels.iter().find(|e| e.enumlabel == stmt.new_val_neighbor) {
-        let neighbor_order = neighbor.enumsortorder;
-        if stmt.new_val_is_after {
-            // Insert immediately after: midpoint with the next-higher
-            // sortorder, or neighbor + 1 if neighbor is last.
-            let next = labels
-                .iter()
-                .filter(|e| e.enumsortorder > neighbor_order)
-                .map(|e| e.enumsortorder)
-                .fold(f32::INFINITY, f32::min);
-            if next.is_finite() {
-                (neighbor_order + next) / 2.0
-            } else {
-                neighbor_order + 1.0
-            }
+            .position(|e| e.enumlabel == stmt.new_val_neighbor)
+        else {
+            return Err(not_a_label(&stmt.new_val_neighbor));
+        };
+        let other_nbr_index = if stmt.new_val_is_after {
+            nbr_index.checked_add(1)
         } else {
-            // Insert immediately before: midpoint with the previous-lower
-            // sortorder, or neighbor - 1 if neighbor is first.
-            let prev = labels
-                .iter()
-                .filter(|e| e.enumsortorder < neighbor_order)
-                .map(|e| e.enumsortorder)
-                .fold(f32::NEG_INFINITY, f32::max);
-            if prev.is_finite() {
-                (neighbor_order + prev) / 2.0
-            } else {
-                neighbor_order - 1.0
+            nbr_index.checked_sub(1)
+        };
+        match other_nbr_index.filter(|&i| i < labels.len()) {
+            None if stmt.new_val_is_after => labels[nbr_index].enumsortorder + 1.0,
+            None => labels[nbr_index].enumsortorder - 1.0,
+            Some(other_nbr_index) => {
+                // Halfway between the neighbours, in float4: when that
+                // rounds to one of them, PG renumbers the members 1..n
+                // (RenumberEnumType) and computes the midpoint again.
+                let midpoint = |labels: &[PgEnum]| {
+                    let (a, b) = (
+                        labels[nbr_index].enumsortorder,
+                        labels[other_nbr_index].enumsortorder,
+                    );
+                    let m = (a + b) / 2.0;
+                    (m != a && m != b).then_some(m)
+                };
+                match midpoint(labels) {
+                    Some(m) => m,
+                    None => {
+                        for (i, e) in labels.iter_mut().enumerate() {
+                            e.enumsortorder = (i + 1) as f32;
+                        }
+                        midpoint(labels).expect("consecutive integers have a float4 midpoint")
+                    }
+                }
             }
         }
-    } else {
-        return Err(not_a_label(&stmt.new_val_neighbor));
     };
 
     // check_safe_enum_use: until the transaction commits, the new label
