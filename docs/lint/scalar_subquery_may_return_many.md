@@ -1,161 +1,92 @@
 # `scalar_subquery_may_return_many`
 
-A subquery used as a single value that may return more than one row, which
-makes PostgreSQL fail the whole statement at run time.
+A subquery used as a single value that may return more than one row.
 
-| | |
-|---|---|
-| Default level | warning |
-| Applies to | queries |
-| Fix | no |
+| Level | Applies to | Fix |
+|---|---|---|
+| warning | queries | — |
 
-## Why
-
-A parenthesized `SELECT` used where a value goes — in a select list, a
-comparison, a `SET`, a function argument, `(a, b) = (SELECT …)` — must return
-at most one row. When it returns zero rows the value is NULL; when it returns
-two, PostgreSQL aborts the statement:
-
-```
-ERROR:  more than one row returned by a subquery used as an expression
-```
-
-The failure depends on the data, so it passes every test where each user
-happens to have one post and breaks in production the day someone writes a
-second. typedpg checks the subquery against the schema's unique keys at
-build time instead.
-
-## What it reports
-
-A subquery used as an expression (`(SELECT …)`), in a row comparison
-(`(a, b) = (SELECT …)`) or as the source of a multi-column `SET (a, b) =
-(SELECT …)`, when typedpg cannot prove it returns at most one row.
-
-The proof (the same one behind
-[`fetch_may_return_many`](fetch_may_return_many.md)) accepts a subquery that:
-
-- aggregates without `GROUP BY` (`SELECT count(*) …`), or groups by values
-  its `WHERE` pins;
-- pins every column of a unique key to a constant, a parameter or an outer
-  column (`WHERE u.id = p.user_id` for a correlated lookup);
-- has `LIMIT 1` or `LIMIT 0` (`FETCH FIRST 1 ROW ONLY` too);
-- has no `FROM`, or is a single-row `VALUES`;
-- has a `WHERE` that is never true.
-
-A `VALUES` list of two rows or more without a `LIMIT` is always reported.
-
-## Examples
+## Example
 
 ```sql
-CREATE TABLE users (
-    id bigint PRIMARY KEY,
-    email text NOT NULL UNIQUE,
-    name text,
-    created_at timestamptz NOT NULL
-);
-
+CREATE TABLE users (id bigint PRIMARY KEY, name text);
 CREATE TABLE posts (
     id bigint PRIMARY KEY,
     user_id bigint NOT NULL REFERENCES users,
     title text NOT NULL,
     created_at timestamptz NOT NULL
 );
-```
 
-### Bad
-
-A user can have many posts:
-
-```sql
-SELECT u.id,
-       (SELECT p.title FROM posts p WHERE p.user_id = u.id) AS title
-FROM users u;
+SELECT u.id, (SELECT p.title FROM posts p WHERE p.user_id = u.id) AS title FROM users u;
+UPDATE users SET name = (SELECT title FROM posts WHERE user_id = $id) WHERE id = $id;
 ```
 
 ```
 warning[scalar_subquery_may_return_many]: this subquery is used as a value but may return more than one row: PostgreSQL then fails with "more than one row returned by a subquery used as an expression"
-   ╭─[queries.sql:2:8]
- 2 │        (SELECT p.title FROM posts p WHERE p.user_id = u.id) AS title
-   ·        ────────────────────────────────────────────────────
+   ╭─[queries.sql:2:14]
+ 2 │ SELECT u.id, (SELECT p.title FROM posts p WHERE p.user_id = u.id) AS title FROM users u;
+   ·              ────────────────────────────────────────────────────
    ╰────
   help: make it return at most one row: filter on a unique key, aggregate, or add ORDER BY … LIMIT 1
 ```
 
-### Good
+## Why
 
-```sql
--- Pick one row explicitly.
-SELECT u.id,
-       (SELECT p.title FROM posts p WHERE p.user_id = u.id
-        ORDER BY p.created_at DESC, p.id DESC LIMIT 1) AS title
-FROM users u;
+PostgreSQL aborts the statement when such a subquery returns two rows. It
+depends on the data: the query passes while every user has one post and
+fails the day one writes a second.
 
--- A correlated lookup on the parent's primary key: at most one row.
-SELECT p.id, (SELECT u.name FROM users u WHERE u.id = p.user_id) AS author
-FROM posts p;
+## Reported when
 
--- An aggregate without GROUP BY returns exactly one row.
-SELECT u.id, (SELECT count(*) FROM posts p WHERE p.user_id = u.id) AS n
-FROM users u;
+A `(SELECT …)` used as a value (select list, comparison, `SET`, function
+argument), in a row comparison `(a, b) = (SELECT …)` or in
+`SET (a, b) = (SELECT …)`, unless it returns at most one row because it:
 
--- ARRAY(…) takes any number of rows.
-SELECT u.id, ARRAY(SELECT p.title FROM posts p WHERE p.user_id = u.id) AS titles
-FROM users u;
-```
+- equates every column of a primary or unique key to constants, parameters
+  or outer columns (`WHERE u.id = p.user_id`);
+- aggregates without `GROUP BY`, or groups by columns its `WHERE` pins;
+- has `LIMIT 0` or `LIMIT 1` (or `FETCH FIRST 1 ROW ONLY`);
+- has no `FROM`, or a `WHERE` that is never true.
 
-`IN (SELECT …)`, `EXISTS (…)`, `= ANY (SELECT …)` / `ALL` and `ARRAY(…)`
-accept any number of rows and are never reported.
+A `VALUES` list of two or more rows without `LIMIT` is always reported:
+`SELECT (VALUES (1), (2)) AS x`.
 
-## Fix
+## Not reported
 
-None: which row to keep (or whether to aggregate) is a decision about what
-the query means.
-
-## When it stays silent
-
-A finding is only reported where the proof's limits cannot be hiding a
-single-row subquery. Nothing is reported when:
-
-- a `FROM` item is anything but a plain or partitioned table: a view, a CTE,
-  a set-returning function, a subquery;
-- a table in `FROM` has a unique index on an expression, a partial unique
-  index or an exclusion constraint (a key the proof cannot use);
-- the select list calls a set-returning function, the subquery is a set
-  operation (`UNION`, …), it uses `GROUPING SETS`, or `FETCH … WITH TIES`;
-- the `LIMIT` is a parameter or another expression (only a constant of 2 or
-  more counts as "may return many");
-- it is `SELECT DISTINCT` over values that come only from the outer query;
-- the statement has a `$..spread` parameter.
+- `IN (SELECT …)`, `EXISTS`, `= ANY (SELECT …)` / `ALL`, `ARRAY(SELECT …)`:
+  they accept any number of rows.
+- Explicitly picking one row:
+  `(SELECT p.title FROM posts p WHERE p.user_id = u.id ORDER BY p.created_at DESC, p.id DESC LIMIT 1)`.
+- Subqueries reading a view, a CTE, a function or a nested subquery in
+  `FROM`, or a table with an expression or partial unique index or an
+  exclusion constraint.
+- A set-returning function in the select list, `UNION` and other set
+  operations, `GROUPING SETS`, `FETCH … WITH TIES`.
+- A `LIMIT` that is a parameter or an expression.
+- `SELECT DISTINCT` over values that come only from the outer query.
+- Queries with a `$..spread` parameter.
 
 ## Configuration
 
 ```toml
+# Cargo.toml
 [package.metadata.typedpg.lint]
-scalar_subquery_may_return_many = "error"   # "error", "warning", "info" or "off"
+scalar_subquery_may_return_many = "error"   # error | warning | info | off
 ```
-
 ```json
-{
-  "lint": { "scalarSubqueryMayReturnMany": "error" }
-}
+// typedpg.config.json
+{ "lint": { "scalarSubqueryMayReturnMany": "error" } }
 ```
 
-`fail_on` / `failOn` sets the severity that fails the run (default `error`),
-and `ignore` lists glob patterns of files whose query findings are dropped.
-When you know the data better than the schema does:
+Allow one query with
+`-- typedpg-lint: allow(scalar_subquery_may_return_many)` in its text. A
+unique constraint stating what you know about the data is better: it clears
+the finding and enforces it. See
+[Configuring rules](README.md#configuring-rules).
 
-```sql
--- typedpg-lint: allow(scalar_subquery_may_return_many)
-SELECT u.id, (SELECT p.title FROM posts p WHERE p.user_id = u.id) AS title
-FROM users u;
-```
+## Related
 
-A unique constraint that states that knowledge is better: it makes the
-finding go away and protects the data too.
-
-## Related rules
-
-- [`fetch_may_return_many`](fetch_may_return_many.md): the same proof,
-  applied to `fetch_one` / `fetchOne` call sites.
-- [`unstable_order`](unstable_order.md): an `ORDER BY … LIMIT 1` whose keys
-  can tie picks an arbitrary row.
+- [`fetch_may_return_many`](fetch_may_return_many.md): `fetch_one` /
+  `fetchOne` on a query that may return many rows.
+- [`unstable_order`](unstable_order.md): `ORDER BY … LIMIT 1` whose keys can
+  tie.

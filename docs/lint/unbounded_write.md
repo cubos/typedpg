@@ -1,53 +1,19 @@
 # `unbounded_write`
 
-Reports an `UPDATE` or `DELETE` with no `WHERE` clause.
+An `UPDATE` or `DELETE` without a `WHERE` clause.
 
-| | |
-|---|---|
-| Default level | error |
-| Applies to | queries |
-| Fix | no |
+| Level | Applies to | Fix |
+|---|---|---|
+| error | queries | — |
 
-## Why
-
-An `UPDATE` or `DELETE` without `WHERE` writes every row of the table. It is
-almost always a mistake: a condition that was forgotten, lost in a refactor,
-or left in a string that was never concatenated. PostgreSQL runs it without
-complaint, and the damage is done in one statement. Requiring the intent to be
-written down (an allow comment) makes the rare deliberate case visible in
-review.
-
-## What it reports
-
-Every `UPDATE` and `DELETE` statement in the query whose `WHERE` clause is
-absent, including one inside a data-modifying CTE
-(`WITH gone AS (DELETE FROM posts RETURNING id) SELECT …`). The message names
-the table as written (`users`, `public.users`, `"My Users"`).
-
-This is a syntactic check: it looks only at whether a `WHERE` is present, not
-at what it says.
-
-## Examples
-
-### Bad
+## Example
 
 ```sql
-CREATE TABLE users (
-    id bigint PRIMARY KEY,
-    email text NOT NULL UNIQUE,
-    name text,
-    deleted_at timestamptz
-);
-CREATE TABLE posts (
-    id bigint PRIMARY KEY,
-    user_id bigint REFERENCES users,
-    title text NOT NULL,
-    status text NOT NULL CHECK (status IN ('draft', 'published', 'archived')),
-    views integer NOT NULL DEFAULT 0 CHECK (views >= 0)
-);
+CREATE TABLE users (id bigint PRIMARY KEY, deleted_at timestamptz);
+CREATE TABLE posts (id bigint PRIMARY KEY, user_id bigint REFERENCES users);
 
 UPDATE users SET deleted_at = now();
-DELETE FROM posts;
+WITH gone AS (DELETE FROM posts RETURNING id) SELECT count(*) AS n FROM gone;
 ```
 
 ```
@@ -59,75 +25,49 @@ error[unbounded_write]: UPDATE without WHERE changes every row of users
   help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
 
 error[unbounded_write]: DELETE without WHERE removes every row of posts
-   ╭─[queries.sql:5:1]
- 5 │ DELETE FROM posts;
-   · ─────────────────
+   ╭─[queries.sql:4:15]
+ 4 │ WITH gone AS (DELETE FROM posts RETURNING id) SELECT count(*) AS n FROM gone;
+   ·               ─────────────────
    ╰────
   help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
 ```
 
-### Good
+## Why
 
-```sql
-UPDATE users SET deleted_at = now() WHERE id = $id;
+Writing every row is almost always a lost or forgotten condition, and the
+damage is done in one statement. Requiring an allow comment makes the rare
+deliberate case visible in review.
 
--- DELETE … USING still needs its WHERE, and has one.
-DELETE FROM posts USING users
-WHERE posts.user_id = users.id AND users.deleted_at IS NOT NULL;
+## Reported when
 
--- Writing every row on purpose: say so.
--- typedpg-lint: allow(unbounded_write)
-DELETE FROM posts;
-```
+Any `UPDATE` or `DELETE` without `WHERE`, including one inside a CTE. Only
+the presence of `WHERE` is checked, not what it says.
 
-`UPDATE … WHERE CURRENT OF cursor` has a `WHERE` and is not reported either.
+## Not reported
 
-## When it stays silent
-
-- Any `WHERE` silences it, even one that is always true. `WHERE true` or
-  `WHERE 1 = 1` is reported by
-  [`constant_condition`](constant_condition.md) instead, whose help points
-  back to this rule's allow comment.
-- `TRUNCATE`, `MERGE` and `INSERT … ON CONFLICT DO UPDATE` are not read.
-- Migrations are not read: this rule runs over queries only.
+- Any `WHERE`, including `WHERE CURRENT OF`, `DELETE … USING … WHERE …`, and
+  conditions that are always true: `WHERE true` is reported by
+  [`constant_condition`](constant_condition.md) instead.
+- `TRUNCATE`, `MERGE`, `INSERT … ON CONFLICT DO UPDATE`.
+- Migrations.
 
 ## Configuration
 
-Rust (`Cargo.toml`):
-
 ```toml
+# Cargo.toml
 [package.metadata.typedpg.lint]
-unbounded_write = "warning"   # "error" (default), "warning", "info" or "off"
-fail_on = "error"             # the severity the run fails on (default)
-ignore = ["tests/**"]         # query files whose findings are dropped
+unbounded_write = "warning"   # error | warning | info | off
 ```
-
-TypeScript (`typedpg.config.json`):
-
 ```json
-{
-  "lint": {
-    "unboundedWrite": "warning",
-    "failOn": "error",
-    "ignore": ["tests/**"]
-  }
-}
+// typedpg.config.json
+{ "lint": { "unboundedWrite": "warning" } }
 ```
 
-At the default `fail_on` / `failOn` of `"error"`, a finding of this rule fails
-the run unless you lower its level.
+Write every row on purpose with `-- typedpg-lint: allow(unbounded_write)` in
+the query's text. See [Configuring rules](README.md#configuring-rules).
 
-To allow one statement, put the comment in the query text (the `sql!` /
-`sql()` string, or the statement in a `.sql` file, after its `/* @name */`
-block):
-
-```sql
--- typedpg-lint: allow(unbounded_write)
-DELETE FROM posts;
-```
-
-## Related rules
+## Related
 
 - [`constant_condition`](constant_condition.md): a `WHERE` that is always
-  true, which writes every row just the same.
-- [`self_assignment`](self_assignment.md): an `UPDATE … SET a = a`.
+  true.
+- [`self_assignment`](self_assignment.md): `SET a = a`.
