@@ -1,6 +1,9 @@
 //! CREATE SCHEMA handler.
 
-use typedpg_pg_query::ast::{self, CreateSchemaStmt};
+use std::borrow::Cow;
+
+use typedpg_pg_query::NodeBox;
+use typedpg_pg_query::ast::{self, AlterTableType, ConstrType, CreateSchemaStmt, ObjectType};
 
 use super::DdlError;
 use super::util::ensure_namespace;
@@ -108,12 +111,22 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
         ast::Node::CreateTrigStmt(_) => 4,
         _ => 5,
     };
-    let mut elements: Vec<&ast::Node> = stmt
-        .schema_elts
-        .iter()
-        .filter_map(|elt| elt.as_ref())
-        .collect();
+    let mut elements: Vec<Cow<'_, ast::Node>> = Vec::new();
+    let mut foreign_keys: Vec<Cow<'_, ast::Node>> = Vec::new();
+    for node in stmt.schema_elts.iter().filter_map(|elt| elt.as_ref()) {
+        match node {
+            ast::Node::CreateStmt(create) => {
+                let (create, fks) = split_foreign_keys(node, create)?;
+                elements.push(create);
+                foreign_keys.extend(fks.into_iter().map(Cow::Owned));
+            }
+            _ => elements.push(Cow::Borrowed(node)),
+        }
+    }
     elements.sort_by_key(|node| rank(node));
+    // PostgreSQL 19 runs the tables' foreign keys last, as ALTER TABLE ...
+    // ADD CONSTRAINT, so a table may reference one created after it.
+    elements.extend(foreign_keys);
     let saved = interp.push_search_path_front(&name);
     // If the requested authorization is different from the current user,
     // temporarily set the current user so that the elements are created with
@@ -134,7 +147,7 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     }
     let mut result = Ok(());
     for node in elements {
-        result = super::apply_statement(interp, node);
+        result = super::apply_statement(interp, &node);
         if result.is_err() {
             break;
         }
@@ -143,4 +156,96 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
     interp.refresh_search_path();
     interp.restore_search_path(saved);
     result
+}
+
+/// transformCreateSchemaCreateTable (parse_utilcmd.c): a CREATE TABLE
+/// inside CREATE SCHEMA loses its foreign keys — table-level ones, and a
+/// column's `REFERENCES` with the attribute clauses right after it — which
+/// become `ALTER TABLE ... ADD CONSTRAINT` statements run after every other
+/// element. The table is cloned only when it has one.
+fn split_foreign_keys<'a>(
+    node: &'a ast::Node,
+    create: &NodeBox<ast::CreateStmt>,
+) -> Result<(Cow<'a, ast::Node>, Vec<ast::Node>), DdlError> {
+    let is_fk = |n: &Option<ast::Node>| matches!(n, Some(ast::Node::Constraint(c)) if c.contype == ConstrType::ConstrForeign);
+    let has_fk = create.table_elts.iter().any(|elt| match elt {
+        Some(ast::Node::ColumnDef(cd)) => cd.constraints.iter().any(is_fk),
+        other => is_fk(other),
+    });
+    if !has_fk {
+        return Ok((Cow::Borrowed(node), Vec::new()));
+    }
+    let add_constraint = |constr: ast::Constraint| {
+        ast::Node::AlterTableStmt(NodeBox::new(ast::AlterTableStmt {
+            relation: create.relation.clone(),
+            cmds: vec![Some(ast::Node::AlterTableCmd(NodeBox::new(
+                ast::AlterTableCmd {
+                    subtype: AlterTableType::AtAddConstraint,
+                    def: Some(ast::Node::Constraint(NodeBox::new(constr))),
+                    ..Default::default()
+                },
+            )))],
+            objtype: ObjectType::ObjectTable,
+            missing_ok: false,
+        }))
+    };
+    let mut fks = Vec::new();
+    let mut new_stmt = (**create).clone();
+    let mut new_elts = Vec::with_capacity(create.table_elts.len());
+    for elt in &create.table_elts {
+        match elt {
+            Some(ast::Node::Constraint(c)) if c.contype == ConstrType::ConstrForeign => {
+                fks.push(add_constraint((**c).clone()));
+            }
+            Some(ast::Node::ColumnDef(cd)) if cd.constraints.iter().any(is_fk) => {
+                // The attribute clauses fold into the constraint before them
+                // (transformConstraintAttrs), so the k-th non-attribute node
+                // is `folded[k]`.
+                let mut folded = super::tables::fold_constraint_attrs(&cd.constraints)?.into_iter();
+                let mut kept = Vec::with_capacity(cd.constraints.len());
+                let mut after_fk = false;
+                for n in &cd.constraints {
+                    let Some(ast::Node::Constraint(c)) = n else {
+                        kept.push(n.clone());
+                        continue;
+                    };
+                    match c.contype {
+                        ConstrType::ConstrAttrDeferrable
+                        | ConstrType::ConstrAttrNotDeferrable
+                        | ConstrType::ConstrAttrDeferred
+                        | ConstrType::ConstrAttrImmediate
+                        | ConstrType::ConstrAttrEnforced
+                        | ConstrType::ConstrAttrNotEnforced => {
+                            if !after_fk {
+                                kept.push(n.clone());
+                            }
+                        }
+                        ConstrType::ConstrForeign => {
+                            let mut fk = folded.next().expect("one folded node per constraint");
+                            fk.fk_attrs =
+                                vec![Some(ast::Node::String(NodeBox::new(ast::String {
+                                    sval: cd.colname.clone(),
+                                })))];
+                            fks.push(add_constraint(fk));
+                            after_fk = true;
+                        }
+                        _ => {
+                            folded.next();
+                            kept.push(n.clone());
+                            after_fk = false;
+                        }
+                    }
+                }
+                let mut new_cd = (**cd).clone();
+                new_cd.constraints = kept;
+                new_elts.push(Some(ast::Node::ColumnDef(NodeBox::new(new_cd))));
+            }
+            other => new_elts.push(other.clone()),
+        }
+    }
+    new_stmt.table_elts = new_elts;
+    Ok((
+        Cow::Owned(ast::Node::CreateStmt(NodeBox::new(new_stmt))),
+        fks,
+    ))
 }

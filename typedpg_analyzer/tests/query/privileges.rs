@@ -488,6 +488,35 @@ fn insert_on_conflict_arbiters_and_do_update() {
 }
 
 #[test]
+fn insert_on_conflict_do_select_locking_needs_update() {
+    // PostgreSQL 19: DO SELECT reads the conflicting row (SELECT on what
+    // RETURNING and the arbiter read); FOR UPDATE / SHARE locks it, which
+    // requires UPDATE on the table (any column of it).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_dosel_app;
+         CREATE ROLE qp_dosel_lock;
+         CREATE TABLE qp_dosel_t (id int PRIMARY KEY, a int);
+         GRANT INSERT, SELECT ON qp_dosel_t TO qp_dosel_app;
+         GRANT INSERT, SELECT, UPDATE (a) ON qp_dosel_t TO qp_dosel_lock;",
+    )]);
+    let select = "INSERT INTO qp_dosel_t VALUES (1, 1) ON CONFLICT (id) DO SELECT RETURNING a";
+    allowed(&db, "qp_dosel_app", select);
+    for sql in [
+        "INSERT INTO qp_dosel_t VALUES (1, 1) ON CONFLICT (id) DO SELECT FOR UPDATE RETURNING a",
+        "INSERT INTO qp_dosel_t VALUES (1, 1) ON CONFLICT (id) DO SELECT FOR KEY SHARE RETURNING a",
+    ] {
+        denied_with(
+            &db,
+            "qp_dosel_app",
+            sql,
+            "permission denied for table qp_dosel_t",
+        );
+        allowed(&db, "qp_dosel_lock", sql);
+    }
+}
+
+#[test]
 fn merge_target_privileges() {
     let db = build_db(&[(
         "0001.sql",

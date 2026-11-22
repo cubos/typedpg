@@ -23,6 +23,8 @@
 #if defined(_WIN32)
 
 #include "postgres.h"
+#include "storage/ipc.h"
+#include "utils/pg_locale.h"
 
 /* The error hook the generated stubs raise (csrc/pg/vars.c defines it). */
 extern void typedpg_unavailable(const char *name);
@@ -35,6 +37,26 @@ void
 pgwin32_dispatch_queued_signals(void)
 {
 	/* No signal handlers are installed, so the queue is always empty. */
+}
+
+/*
+ * elog.c's set_backtrace (PostgreSQL 19) has a Windows branch, invisible to
+ * the generated stubs, that registers a cleanup callback and converts the
+ * DbgHelp symbol names.  It runs only for the functions backtrace_functions
+ * names, which typedpg never sets: raise as the generated stubs do.
+ */
+void
+on_proc_exit(pg_on_exit_callback function, Datum arg)
+{
+	typedpg_unavailable("on_proc_exit");
+	pg_unreachable();
+}
+
+size_t
+wchar2char(char *to, const wchar_t *from, size_t tolen, locale_t loc)
+{
+	typedpg_unavailable("wchar2char");
+	pg_unreachable();
 }
 
 /* typedpg is a library, never a service. */

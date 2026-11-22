@@ -1,4 +1,4 @@
-//! Ports of PostgreSQL 18's range and multirange input functions
+//! Ports of PostgreSQL 19's range and multirange input functions
 //! (rangetypes.c `range_in` / `range_parse` / `range_parse_bound` /
 //! `range_serialize` and the built-in `*_canonical` functions;
 //! multirangetypes.c `multirange_in`), used by [`crate::literal_input`].

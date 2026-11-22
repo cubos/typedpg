@@ -3,7 +3,7 @@
  * pg_statistic_d.h
  *    Macro definitions for pg_statistic
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -155,6 +155,10 @@
  * which holds the frequency of null elements (expressed in the same terms:
  * the fraction of non-null rows that contain at least one null element).  If
  * this member is omitted, the column is presumed to contain no null elements.
+ *
+ * Starting in v19, the first extra member can be smaller than the smallest
+ * frequency of any stored MCE, indicating that it's known that no element
+ * not present in the MCE array has frequency greater than that value.
  *
  * Note: in current usage for tsvector columns, the stavalues elements are of
  * type text, even though their representation within tsvector is not

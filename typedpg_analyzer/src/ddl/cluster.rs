@@ -16,9 +16,30 @@ pub(crate) struct ClusterObjects {
     /// Tablespaces created by migrations (`pg_default` and `pg_global`
     /// always exist).
     tablespaces: Vec<String>,
-    subscriptions: Vec<String>,
+    subscriptions: Vec<Subscription>,
     /// Large objects created with a constant OID (`lo_create(1234)`).
     large_objects: Vec<u32>,
+}
+
+/// What the analyzer keeps of a `pg_subscription` row.
+#[derive(Clone, Debug)]
+struct Subscription {
+    name: String,
+    /// The foreign server it connects through (PostgreSQL 19's `SERVER`):
+    /// pg_depend records the dependency, so the server can't be dropped
+    /// before the subscription.
+    server: Option<String>,
+    /// Whether `subslotname` is set (not `slot_name = NONE`).
+    slot: bool,
+    enabled: bool,
+}
+
+fn subscription_mut<'a>(interp: &'a mut PgCatalog, name: &str) -> Option<&'a mut Subscription> {
+    interp
+        .cluster_objects
+        .subscriptions
+        .iter_mut()
+        .find(|s| s.name == name)
 }
 
 /// get_tablespace_oid.
@@ -33,7 +54,219 @@ pub(crate) fn subscription_exists(interp: &PgCatalog, name: &str) -> bool {
         .cluster_objects
         .subscriptions
         .iter()
-        .any(|s| s == name)
+        .any(|s| s.name == name)
+}
+
+/// DROP SUBSCRIPTION's PreventInTransactionBlock: a subscription with a
+/// replication slot drops the slot too, which can't be rolled back.
+pub(crate) fn subscription_has_slot(interp: &PgCatalog, name: &str) -> bool {
+    interp
+        .cluster_objects
+        .subscriptions
+        .iter()
+        .any(|s| s.name == name && s.slot)
+}
+
+/// findDependentObjects (PostgreSQL 19): a subscription connecting through
+/// one of `servers` stops any DROP reaching it, CASCADE or not — it lives in
+/// a shared catalog, which doDeletion can't delete from. The error names the
+/// first such server and subscription.
+pub(crate) fn check_no_subscription_on(
+    interp: &PgCatalog,
+    servers: &[String],
+) -> Result<(), DdlError> {
+    let found = interp.cluster_objects.subscriptions.iter().find_map(|sub| {
+        let server = sub.server.as_ref().filter(|s| servers.contains(s))?;
+        Some((&sub.name, server))
+    });
+    match found {
+        Some((sub, server)) => Err(DdlError::DependencyError(format!(
+            "cannot drop server {server} because subscription {sub} depends on it \
+             (Drop subscription {sub} first.)"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// ALTER SERVER ... RENAME TO: the subscriptions follow it.
+pub(crate) fn rename_subscription_server(interp: &mut PgCatalog, old: &str, new: &str) {
+    for sub in &mut interp.cluster_objects.subscriptions {
+        if sub.server.as_deref() == Some(old) {
+            sub.server = Some(new.to_owned());
+        }
+    }
+}
+
+/// ALTER SUBSCRIPTION ... RENAME TO (AlterObjectRename_internal).
+pub(crate) fn rename_subscription(
+    interp: &mut PgCatalog,
+    stmt: &ast::RenameStmt,
+) -> Result<(), DdlError> {
+    let Some(old) = super::util::node_string(stmt.object.as_ref()).map(str::to_owned) else {
+        return Ok(());
+    };
+    check_subscription(interp, &old)?;
+    if subscription_exists(interp, &stmt.newname) {
+        return Err(DdlError::DuplicateObject(format!(
+            "subscription \"{}\" already exists",
+            stmt.newname
+        )));
+    }
+    if let Some(sub) = subscription_mut(interp, &old) {
+        sub.name.clone_from(&stmt.newname);
+    }
+    Ok(())
+}
+
+/// The options parse_subscription_options reads that the analyzer keeps
+/// track of — every other one is left to PostgreSQL.
+#[derive(Default)]
+pub(crate) struct SubOpts {
+    connect: Option<bool>,
+    enabled: Option<bool>,
+    create_slot: Option<bool>,
+    copy_data: Option<bool>,
+    /// `Some(None)`: `slot_name = NONE`.
+    slot_name: Option<Option<String>>,
+}
+
+impl SubOpts {
+    /// The defaults CREATE SUBSCRIPTION applies (`connect = false` turns
+    /// enabled, create_slot and copy_data off): `(enabled, create_slot,
+    /// has a slot name)`.
+    fn resolved(&self) -> (bool, bool, bool) {
+        let connect = self.connect.unwrap_or(true);
+        let enabled = self.enabled.unwrap_or(true) && connect;
+        let create_slot = self.create_slot.unwrap_or(true) && connect;
+        let slot = !matches!(self.slot_name, Some(None));
+        (enabled, create_slot, slot)
+    }
+}
+
+/// parse_subscription_options for the options in `supported` (by name):
+/// repeated ones, Boolean values, slot names and the combinations it
+/// refuses.
+pub(crate) fn parse_subscription_options(
+    options: &[Option<ast::Node>],
+    supported: &[&str],
+) -> Result<SubOpts, DdlError> {
+    let mut opts = SubOpts::default();
+    for opt in options {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        let name = de.defname.as_str();
+        if !supported.contains(&name) {
+            continue;
+        }
+        let slot = match name {
+            "connect" => &mut opts.connect,
+            "enabled" => &mut opts.enabled,
+            "create_slot" => &mut opts.create_slot,
+            "copy_data" => &mut opts.copy_data,
+            "slot_name" => {
+                if opts.slot_name.is_some() {
+                    return Err(DdlError::Parse("conflicting or redundant options".into()));
+                }
+                let value = de
+                    .arg
+                    .as_ref()
+                    .and_then(super::session::string_arg)
+                    .unwrap_or_default();
+                opts.slot_name = Some(if value == "none" {
+                    None
+                } else {
+                    validate_slot_name(&value)?;
+                    Some(value)
+                });
+                continue;
+            }
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(DdlError::Parse("conflicting or redundant options".into()));
+        }
+        *slot = Some(super::session::def_get_boolean(de)?);
+    }
+    let exclusive = |a: &str, b: &str| {
+        Err(DdlError::Parse(format!(
+            "{a} and {b} are mutually exclusive options"
+        )))
+    };
+    if supported.contains(&"connect") && opts.connect == Some(false) {
+        if opts.enabled == Some(true) {
+            return exclusive("connect = false", "enabled = true");
+        }
+        if opts.create_slot == Some(true) {
+            return exclusive("connect = false", "create_slot = true");
+        }
+        if opts.copy_data == Some(true) {
+            return exclusive("connect = false", "copy_data = true");
+        }
+    }
+    if matches!(opts.slot_name, Some(None)) {
+        let connect = !supported.contains(&"connect") || opts.connect != Some(false);
+        let default_on = |o: Option<bool>, supported: bool| supported && connect && o.is_none();
+        if opts.enabled == Some(true) {
+            return exclusive("slot_name = NONE", "enabled = true");
+        }
+        if default_on(opts.enabled, supported.contains(&"enabled")) {
+            return Err(DdlError::Parse(
+                "subscription with slot_name = NONE must also set enabled = false".into(),
+            ));
+        }
+        if opts.create_slot == Some(true) {
+            return exclusive("slot_name = NONE", "create_slot = true");
+        }
+        if default_on(opts.create_slot, supported.contains(&"create_slot")) {
+            return Err(DdlError::Parse(
+                "subscription with slot_name = NONE must also set create_slot = false".into(),
+            ));
+        }
+    }
+    Ok(opts)
+}
+
+/// The options CREATE SUBSCRIPTION reads, as far as the analyzer does.
+const CREATE_OPTIONS: &[&str] = &[
+    "connect",
+    "enabled",
+    "create_slot",
+    "copy_data",
+    "slot_name",
+];
+
+/// CREATE SUBSCRIPTION's PreventInTransactionBlock: creating the slot can't
+/// be rolled back. `None` when the options are invalid (the statement fails
+/// on them first).
+pub(crate) fn creates_slot(stmt: &CreateSubscriptionStmt) -> Option<bool> {
+    let opts = parse_subscription_options(&stmt.options, CREATE_OPTIONS).ok()?;
+    Some(opts.resolved().1)
+}
+
+/// ReplicationSlotValidateName.
+fn validate_slot_name(name: &str) -> Result<(), DdlError> {
+    let msg = if name.is_empty() {
+        format!("replication slot name \"{name}\" is too short")
+    } else if name.len() >= 64 {
+        format!("replication slot name \"{name}\" is too long")
+    } else if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        format!(
+            "replication slot name \"{name}\" contains invalid character (Replication slot \
+             names may only contain lower case letters, numbers, and the underscore character.)"
+        )
+    } else if name == "pg_conflict_detection" {
+        format!(
+            "replication slot name \"{name}\" is reserved (The name \"pg_conflict_detection\" \
+             is reserved for the conflict detection slot.)"
+        )
+    } else {
+        return Ok(());
+    };
+    Err(DdlError::Parse(msg))
 }
 
 /// LargeObjectExists.
@@ -45,6 +278,18 @@ pub(crate) fn create_tablespace(
     interp: &mut PgCatalog,
     stmt: &CreateTableSpaceStmt,
 ) -> Result<(), DdlError> {
+    // CreateTableSpace (PostgreSQL 19).
+    if stmt.location.contains('\'') {
+        return Err(DdlError::Parse(
+            "tablespace location cannot contain single quotes".into(),
+        ));
+    }
+    if stmt.tablespacename.contains(['\n', '\r']) {
+        return Err(DdlError::Parse(format!(
+            "tablespace name \"{}\" contains a newline or carriage return character",
+            stmt.tablespacename
+        )));
+    }
     if tablespace_exists(interp, &stmt.tablespacename) {
         return Err(DdlError::DuplicateObject(format!(
             "tablespace \"{}\" already exists",
@@ -78,20 +323,29 @@ pub(crate) fn create_subscription(
     interp: &mut PgCatalog,
     stmt: &CreateSubscriptionStmt,
 ) -> Result<(), DdlError> {
+    let opts = parse_subscription_options(&stmt.options, CREATE_OPTIONS)?;
     if subscription_exists(interp, &stmt.subname) {
         return Err(DdlError::DuplicateObject(format!(
             "subscription \"{}\" already exists",
             stmt.subname
         )));
     }
-    interp
-        .cluster_objects
-        .subscriptions
-        .push(stmt.subname.clone());
+    // PostgreSQL 19's `SERVER name`.
+    if !stmt.servername.is_empty() {
+        super::fdw::check_subscription_server(interp, &stmt.servername)?;
+    }
+    let (enabled, _, slot) = opts.resolved();
+    interp.cluster_objects.subscriptions.push(Subscription {
+        name: stmt.subname.clone(),
+        server: (!stmt.servername.is_empty()).then(|| stmt.servername.clone()),
+        slot,
+        enabled,
+    });
     Ok(())
 }
 
-pub(crate) fn alter_subscription(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
+/// get_subscription_oid.
+pub(crate) fn check_subscription(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
     if subscription_exists(interp, name) {
         Ok(())
     } else {
@@ -101,13 +355,66 @@ pub(crate) fn alter_subscription(interp: &PgCatalog, name: &str) -> Result<(), D
     }
 }
 
+pub(crate) fn alter_subscription(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::ast::AlterSubscriptionStmt,
+) -> Result<(), DdlError> {
+    use typedpg_pg_query::ast::AlterSubscriptionType as Kind;
+    let supported: &[&str] = match stmt.kind {
+        Kind::AlterSubscriptionOptions => &["slot_name"],
+        Kind::AlterSubscriptionEnabled => &["enabled"],
+        Kind::AlterSubscriptionSetPublication
+        | Kind::AlterSubscriptionAddPublication
+        | Kind::AlterSubscriptionDropPublication
+        | Kind::AlterSubscriptionRefreshPublication => &["copy_data"],
+        _ => &[],
+    };
+    check_subscription(interp, &stmt.subname)?;
+    let opts = parse_subscription_options(&stmt.options, supported)?;
+    let Some(sub) = subscription_mut(interp, &stmt.subname) else {
+        return Ok(());
+    };
+    match stmt.kind {
+        Kind::AlterSubscriptionOptions => {
+            if let Some(slot_name) = &opts.slot_name {
+                if sub.enabled && slot_name.is_none() {
+                    return Err(DdlError::UnsupportedDdl(
+                        "cannot set slot_name = NONE for enabled subscription".into(),
+                    ));
+                }
+                sub.slot = slot_name.is_some();
+            }
+        }
+        Kind::AlterSubscriptionEnabled => {
+            let enabled = opts.enabled.unwrap_or(true);
+            if enabled && !sub.slot {
+                return Err(DdlError::UnsupportedDdl(
+                    "cannot enable subscription that does not have a slot name".into(),
+                ));
+            }
+            sub.enabled = enabled;
+        }
+        // PostgreSQL 19's `ALTER SUBSCRIPTION ... SERVER name` moves the
+        // dependency to the new server; `CONNECTION` removes it.
+        Kind::AlterSubscriptionServer => {
+            super::fdw::check_subscription_server(interp, &stmt.servername)?;
+            if let Some(sub) = subscription_mut(interp, &stmt.subname) {
+                sub.server = Some(stmt.servername.clone());
+            }
+        }
+        Kind::AlterSubscriptionConnection => sub.server = None,
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn drop_subscription(
     interp: &mut PgCatalog,
     stmt: &DropSubscriptionStmt,
 ) -> Result<(), DdlError> {
     let objects = &mut interp.cluster_objects.subscriptions;
     let before = objects.len();
-    objects.retain(|s| *s != stmt.subname);
+    objects.retain(|s| s.name != stmt.subname);
     if objects.len() == before && !stmt.missing_ok {
         return Err(DdlError::TypeNotFound(format!(
             "subscription \"{}\" does not exist",

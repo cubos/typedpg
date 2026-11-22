@@ -4,7 +4,7 @@
  *	  POSTGRES heap tuple header definitions.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/htup_details.h
@@ -199,7 +199,7 @@ struct HeapTupleHeaderData
 	/* ^ - 23 bytes - ^ */
 
 #define FIELDNO_HEAPTUPLEHEADERDATA_BITS 5
-	bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
+	uint8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
 
 	/* MORE DATA FOLLOWS AT END OF STRUCT */
 };
@@ -296,19 +296,19 @@ HEAP_LOCKED_UPGRADED(uint16 infomask)
  * Use these to test whether a particular lock is applied to a tuple
  */
 static inline bool
-HEAP_XMAX_IS_SHR_LOCKED(int16 infomask)
+HEAP_XMAX_IS_SHR_LOCKED(uint16 infomask)
 {
 	return (infomask & HEAP_LOCK_MASK) == HEAP_XMAX_SHR_LOCK;
 }
 
 static inline bool
-HEAP_XMAX_IS_EXCL_LOCKED(int16 infomask)
+HEAP_XMAX_IS_EXCL_LOCKED(uint16 infomask)
 {
 	return (infomask & HEAP_LOCK_MASK) == HEAP_XMAX_EXCL_LOCK;
 }
 
 static inline bool
-HEAP_XMAX_IS_KEYSHR_LOCKED(int16 infomask)
+HEAP_XMAX_IS_KEYSHR_LOCKED(uint16 infomask)
 {
 	return (infomask & HEAP_LOCK_MASK) == HEAP_XMAX_KEYSHR_LOCK;
 }
@@ -387,20 +387,6 @@ static inline bool
 HeapTupleHeaderXminFrozen(const HeapTupleHeaderData *tup)
 {
 	return (tup->t_infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN;
-}
-
-static inline void
-HeapTupleHeaderSetXminCommitted(HeapTupleHeaderData *tup)
-{
-	Assert(!HeapTupleHeaderXminInvalid(tup));
-	tup->t_infomask |= HEAP_XMIN_COMMITTED;
-}
-
-static inline void
-HeapTupleHeaderSetXminInvalid(HeapTupleHeaderData *tup)
-{
-	Assert(!HeapTupleHeaderXminCommitted(tup));
-	tup->t_infomask |= HEAP_XMIN_INVALID;
 }
 
 static inline void
@@ -788,7 +774,7 @@ BITMAPLEN(int NATTS)
  * MaxAttrSize is a somewhat arbitrary upper limit on the declared size of
  * data fields of char(n) and similar types.  It need not have anything
  * directly to do with the *actual* upper limit of varlena values, which
- * is currently 1Gb (see TOAST structures in postgres.h).  I've set it
+ * is currently 1Gb (see TOAST structures in varatt.h).  I've set it
  * at 10Mb which seems like a reasonable number --- tgl 8/6/00.
  */
 #define MaxAttrSize		(10 * 1024 * 1024)
@@ -848,7 +834,7 @@ struct MinimalTupleData
 
 	/* ^ - 23 bytes - ^ */
 
-	bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
+	uint8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
 
 	/* MORE DATA FOLLOWS AT END OF STRUCT */
 };
@@ -980,7 +966,7 @@ extern Size heap_compute_data_size_ext(TupleDesc tupleDesc,
 extern void heap_fill_tuple(TupleDesc tupleDesc,
 							const Datum *values, const bool *isnull,
 							char *data, Size data_size,
-							uint16 *infomask, bits8 *bit);
+							uint16 *infomask, uint8 *bit);
 extern void heap_tuple_set_datum(HeapTupleHeader tup, TupleDesc tupleDesc, uint32 len);
 extern void heap_datum_update_type(HeapTupleHeader tup, TupleDesc tupleDesc);
 extern bool heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc);
@@ -1081,7 +1067,7 @@ fastgetattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 		if (att_isnull(attnum - 1, tup->t_data->t_bits))
 		{
 			*isnull = true;
-			return (Datum) NULL;
+			return (Datum) 0;
 		}
 		else
 			return nocachegetattr(tup, attnum, tupleDesc);

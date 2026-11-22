@@ -32,7 +32,7 @@ pub enum Codec {
     /// Integers and floats that fit a JS `number` (`NaN` and the
     /// infinities included).
     Number,
-    /// `int8` / `xid8` ↔ `bigint`.
+    /// `int8` / `xid8` / `oid8` ↔ `bigint`.
     BigInt,
     /// `json` / `jsonb`, parsed / stringified.
     Json,
@@ -398,7 +398,7 @@ impl TypeMapper<'_> {
                 codec: Codec::BigInt,
             },
             // Unsigned 64-bit: only a bigint holds every value.
-            "xid8" => TsType {
+            "xid8" | "oid8" => TsType {
                 output: "bigint".into(),
                 input: "bigint | number".into(),
                 codec: Codec::BigInt,
@@ -524,6 +524,7 @@ mod tests {
             assert_eq!(m.map(&basic_ty("int8")).output, "bigint");
             assert_eq!(m.map(&basic_ty("int8")).input, "bigint | number | string");
             assert_eq!(m.map(&basic_ty("xid8")).output, "bigint");
+            assert_eq!(m.map(&basic_ty("oid8")).output, "bigint");
             assert_eq!(m.map(&basic_ty("numeric")).output, "string");
             assert_eq!(m.map(&basic_ty("tsvector")).output, "string");
             assert_eq!(m.map(&basic_ty("timestamptz")).codec, Codec::Timestamptz);

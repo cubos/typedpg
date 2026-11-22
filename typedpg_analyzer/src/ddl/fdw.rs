@@ -21,6 +21,9 @@ pub(crate) struct ForeignData {
     /// Each wrapper's OID (`pg_foreign_data_wrapper.oid`): the identity
     /// `pg_depend` rows name, which no rename changes.
     wrapper_oids: std::collections::HashMap<String, crate::oid::PgGenericOid>,
+    /// The wrappers, by OID, with a CONNECTION function
+    /// (`fdwconnection`, PostgreSQL 19).
+    with_connection: std::collections::HashSet<crate::oid::PgGenericOid>,
     /// `(server, wrapper)`.
     servers: Vec<(String, String)>,
     /// `(user, server)`.
@@ -74,7 +77,9 @@ impl ForeignData {
     /// Forget wrapper `name` and its options (it has no servers left).
     pub(crate) fn forget_wrapper(&mut self, name: &str) {
         self.wrappers.retain(|w| w != name);
-        self.wrapper_oids.remove(name);
+        if let Some(oid) = self.wrapper_oids.remove(name) {
+            self.with_connection.remove(&oid);
+        }
         self.options
             .retain(|owner, _| !matches!(owner, OptionsOwner::Wrapper(w) if w == name));
     }
@@ -115,6 +120,26 @@ fn server_missing(name: &str) -> DdlError {
     DdlError::TypeNotFound(format!("server \"{name}\" does not exist"))
 }
 
+/// CreateSubscription's `SERVER name` (PostgreSQL 19): the server must
+/// exist and its wrapper have a CONNECTION function
+/// (ForeignServerConnectionString).
+pub(crate) fn check_subscription_server(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
+    let data = &interp.foreign_data;
+    let Some((_, wrapper)) = data.servers.iter().find(|(s, _)| s == name) else {
+        return Err(server_missing(name));
+    };
+    if data
+        .wrapper_oid(wrapper)
+        .is_none_or(|oid| !data.with_connection.contains(&oid))
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "foreign-data wrapper \"{wrapper}\" does not support subscription connections \
+             (Foreign-data wrapper must be defined with CONNECTION specified.)"
+        )));
+    }
+    Ok(())
+}
+
 /// get_foreign_server_oid.
 pub(crate) fn check_server(interp: &PgCatalog, name: &str) -> Result<(), DdlError> {
     if interp.foreign_data.servers.iter().any(|(s, _)| s == name) {
@@ -132,16 +157,22 @@ pub(crate) fn check_fdw(interp: &PgCatalog, name: &str) -> Result<(), DdlError> 
     }
 }
 
-/// The HANDLER / VALIDATOR functions (lookup_fdw_handler_func /
-/// lookup_fdw_validator_func).
+/// The HANDLER / VALIDATOR / CONNECTION functions (lookup_fdw_handler_func
+/// / lookup_fdw_validator_func / lookup_fdw_connection_func). Returns
+/// whether the wrapper now has a connection function, when the options
+/// say (`[NO] CONNECTION`).
 fn check_functions(
     interp: &PgCatalog,
     options: &[Option<typedpg_pg_query::ast::Node>],
-) -> Result<(), DdlError> {
+) -> Result<Option<bool>, DdlError> {
+    let mut connection = None;
     for opt in options {
         let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
+        if de.defname == "connection" {
+            connection = Some(de.arg.is_some());
+        }
         let Some(ast::Node::List(l)) = de.arg.as_ref() else {
             continue;
         };
@@ -186,10 +217,30 @@ fn check_functions(
                     )));
                 }
             }
+            "connection" => {
+                // lookup_fdw_connection_func (PostgreSQL 19): (oid, oid,
+                // internal) returning text.
+                let wanted = [
+                    crate::pg_catalog::oid::OID,
+                    crate::pg_catalog::oid::OID,
+                    crate::oid::PgTypeOid::from_raw(2281), // internal
+                ];
+                let Some(p) = candidates.iter().find(|p| p.proargtypes == wanted) else {
+                    return Err(DdlError::TypeNotFound(format!(
+                        "function {name}(oid, oid, internal) does not exist"
+                    )));
+                };
+                if p.prorettype != crate::pg_catalog::oid::TEXT {
+                    return Err(DdlError::Parse(format!(
+                        "function {} must return type text",
+                        parts.join(".")
+                    )));
+                }
+            }
             _ => {}
         }
     }
-    Ok(())
+    Ok(connection)
 }
 
 /// transformGenericOptions: `options` (an `OPTIONS (...)` list) applied
@@ -242,7 +293,7 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
             stmt.fdwname
         )));
     }
-    check_functions(interp, &stmt.func_options)?;
+    let connection = check_functions(interp, &stmt.func_options)?;
     apply_generic_options(
         interp,
         OptionsOwner::Wrapper(stmt.fdwname.clone()),
@@ -254,6 +305,9 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
         .foreign_data
         .wrapper_oids
         .insert(stmt.fdwname.clone(), oid);
+    if connection == Some(true) {
+        interp.foreign_data.with_connection.insert(oid);
+    }
     Ok(())
 }
 
@@ -262,12 +316,22 @@ pub fn alter_fdw(
     stmt: &typedpg_pg_query::ast::AlterFdwStmt,
 ) -> Result<(), DdlError> {
     check_fdw(interp, &stmt.fdwname)?;
-    check_functions(interp, &stmt.func_options)?;
+    let connection = check_functions(interp, &stmt.func_options)?;
     apply_generic_options(
         interp,
         OptionsOwner::Wrapper(stmt.fdwname.clone()),
         &stmt.options,
-    )
+    )?;
+    if let (Some(connection), Some(oid)) =
+        (connection, interp.foreign_data.wrapper_oid(&stmt.fdwname))
+    {
+        if connection {
+            interp.foreign_data.with_connection.insert(oid);
+        } else {
+            interp.foreign_data.with_connection.remove(&oid);
+        }
+    }
+    Ok(())
 }
 
 pub fn create_server(
@@ -483,6 +547,7 @@ pub(crate) fn drop_servers(
     cascade: bool,
     dropped_desc: &str,
 ) -> Result<(), DdlError> {
+    super::cluster::check_no_subscription_on(interp, servers)?;
     let tables: Vec<PgClassOid> = interp
         .foreign_data
         .table_servers
@@ -572,6 +637,7 @@ pub(crate) fn rename_foreign_object(
             }
             _ => None,
         });
+        super::cluster::rename_subscription_server(interp, &old, &new);
     }
     Ok(())
 }

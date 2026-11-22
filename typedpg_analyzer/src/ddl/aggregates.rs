@@ -39,6 +39,8 @@ struct AggregateOptions<'a> {
     finalfn_extra: bool,
     mfinalfn_extra: bool,
     sortop: Option<Vec<String>>,
+    /// SUPPORT (PostgreSQL 19): the planner support function.
+    support: Option<Vec<String>>,
     base_type: Option<TypeName>,
     trans_type: Option<TypeName>,
     mtrans_type: Option<TypeName>,
@@ -161,6 +163,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
             "mfinalfunc_extra" => opts.mfinalfn_extra = def_bool(de),
             "finalfunc_modify" | "mfinalfunc_modify" => check_modify(de)?,
             "sortop" => opts.sortop = Some(def_qualified_name(de)),
+            "support" => opts.support = Some(def_qualified_name(de)),
             "basetype" => opts.base_type = def_type_name(de),
             "hypothetical" => {
                 if def_bool(de) {
@@ -515,6 +518,18 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
             )));
         };
         referenced.push(ObjectAddress::operator(op));
+    }
+    // AggregateCreate (PostgreSQL 19): the support function takes and
+    // returns internal.
+    if let Some(sname) = opts.support.as_ref() {
+        let (oid, rettype) = lookup_agg_function(interp, sname, &[INTERNAL], None)?;
+        referenced.push(ObjectAddress::proc(oid));
+        if rettype != INTERNAL {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "return type of support function {} is not internal",
+                sname.join(".")
+            )));
+        }
     }
 
     let existing_kind = interp

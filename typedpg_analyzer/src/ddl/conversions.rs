@@ -51,7 +51,6 @@ const ENCODING_NAMES: &[(&str, &str)] = &[
     ("latin8", "LATIN8"),
     ("latin9", "LATIN9"),
     ("mskanji", "SJIS"),
-    ("muleinternal", "MULE_INTERNAL"),
     ("shiftjis", "SJIS"),
     ("shiftjis2004", "SHIFT_JIS_2004"),
     ("sjis", "SJIS"),

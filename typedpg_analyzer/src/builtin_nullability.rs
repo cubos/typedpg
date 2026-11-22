@@ -23,6 +23,11 @@
 //! cases were confirmed on a live PostgreSQL 18 (`lower('empty'::int4range)`,
 //! `to_regclass('nope')`, `current_setting('x.y', true)`, …).
 //!
+//! Brought to PostgreSQL 19.0 the same way: its new routines were
+//! classified, and every routine whose C body changed since 18.7 was
+//! scanned again (the NULL returns 19 added to casts like `int4(numeric)`
+//! or `date(timestamp)` follow a soft error, which a SQL call never has).
+//!
 //! Regenerate the same way when moving to a new PostgreSQL major.
 
 /// Strict functions that can return NULL even when every argument is
@@ -35,6 +40,7 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "array_lower(anyarray,int4)",
     "array_ndims(anyarray)",
     "array_upper(anyarray,int4)",
+    "binary_upgrade_check_logical_slot_pending_wal(name,pg_lsn)",
     "bool(jsonb)",
     "box_intersect(box,box)",
     "close_ls(line,lseg)",
@@ -195,6 +201,7 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "pg_get_aios()",
     "pg_get_constraintdef(oid)",
     "pg_get_constraintdef(oid,bool)",
+    "pg_get_dsm_registry_allocations()",
     "pg_get_expr(pg_node_tree,oid)",
     "pg_get_expr(pg_node_tree,oid,bool)",
     "pg_get_function_arg_default(oid,int4)",
@@ -206,9 +213,11 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "pg_get_indexdef(oid)",
     "pg_get_indexdef(oid,int4,bool)",
     "pg_get_loaded_modules()",
+    "pg_get_multixact_stats()",
     "pg_get_partition_constraintdef(oid)",
     "pg_get_partkeydef(oid)",
     "pg_get_publication_tables(_text)",
+    "pg_get_publication_tables(_text,oid)",
     "pg_get_replica_identity_index(regclass)",
     "pg_get_ruledef(oid)",
     "pg_get_ruledef(oid,bool)",
@@ -285,6 +294,7 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "pg_stat_get_db_stat_reset_time(oid)",
     "pg_stat_get_function_calls(oid)",
     "pg_stat_get_function_self_time(oid)",
+    "pg_stat_get_function_stat_reset_time(oid)",
     "pg_stat_get_function_total_time(oid)",
     "pg_stat_get_last_analyze_time(oid)",
     "pg_stat_get_last_autoanalyze_time(oid)",
@@ -294,6 +304,7 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "pg_stat_get_progress_info(text)",
     "pg_stat_get_replication_slot(text)",
     "pg_stat_get_snapshot_timestamp()",
+    "pg_stat_get_stat_reset_time(oid)",
     "pg_stat_get_subscription_stats(oid)",
     "pg_stat_get_xact_function_calls(oid)",
     "pg_stat_get_xact_function_self_time(oid)",
@@ -334,6 +345,7 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "to_number(text,text)",
     "to_regclass(text)",
     "to_regcollation(text)",
+    "to_regdatabase(text)",
     "to_regnamespace(text)",
     "to_regoper(text)",
     "to_regoperator(text)",
@@ -366,6 +378,7 @@ pub(crate) const NEVER_NULL_NONSTRICT: &[&str] = &[
     "enum_last(anyenum)",
     "enum_range(anyenum)",
     "enum_range(anyenum,anyenum)",
+    "error_on_null(anyelement)",
     "int4range(int4,int4)",
     "int4range(int4,int4,text)",
     "int8range(int8,int8)",

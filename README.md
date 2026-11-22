@@ -1084,8 +1084,8 @@ For projects with more than one database see the [Multiple databases](#multiple-
 The `sql!` macro performs **fully static analysis** at compile time:
 
 1. Reads your migration files from the configured path
-2. Parses the DDL statements with PostgreSQL 18's own parser (its sources bundled via `typedpg_pg_query`)
-3. Builds an in-memory schema snapshot by applying each migration's DDL on top of a built-in PostgreSQL 18 catalog seed
+2. Parses the DDL statements with PostgreSQL 19's own parser (its sources bundled via `typedpg_pg_query`)
+3. Builds an in-memory schema snapshot by applying each migration's DDL on top of a built-in PostgreSQL 19 catalog seed
 4. Parses your SQL query and resolves column types, parameter types, and nullability against the snapshot
 5. Generates a concrete Rust struct with correctly typed fields
 

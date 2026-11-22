@@ -10,7 +10,7 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::json;
 use typedpg::sql;
-use typedpg::types::{Interval, MultiRange, PgLsn, Range, TimeTz, Xid8};
+use typedpg::types::{Interval, MultiRange, Oid8, PgLsn, Range, TimeTz, Xid8};
 
 /// One value of every mapped type, as the Rust type `sql!` maps it to.
 #[allow(clippy::type_complexity)]
@@ -475,4 +475,20 @@ async fn void_reads_as_unit() {
         .await
         .expect("void column");
     let () = row.slept;
+}
+
+#[tokio::test]
+async fn oid8_roundtrips_as_param_column_and_array() {
+    // PostgreSQL 19's oid8, which tokio_postgres knows only from the
+    // catalog: every bit of the unsigned 64-bit value survives.
+    let pool = common::setup().await;
+    let v = Oid8(u64::MAX - 1);
+    let vs = vec![v, Oid8(0)];
+    let expected = vs.clone();
+    let row = sql!(&pool, "SELECT $v::oid8 AS v, $vs::oid8[] AS vs")
+        .fetch_one()
+        .await
+        .expect("oid8 round trip");
+    assert_eq!(row.v, v);
+    assert_eq!(row.vs, expected);
 }

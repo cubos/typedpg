@@ -3,7 +3,7 @@
  * arrayfuncs.c
  *	  Support functions for arrays.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 #include <ctype.h>
 #include <math.h>
 
+#include "access/transam.h"
 #include "catalog/pg_type.h"
 #include "common/int.h"
 #include "funcapi.h"
@@ -69,11 +70,12 @@ typedef struct ArrayIteratorData
 {
 	/* basic info about the array, set up during array_create_iterator() */
 	ArrayType  *arr;			/* array we're iterating through */
-	bits8	   *nullbitmap;		/* its null bitmap, if any */
+	uint8	   *nullbitmap;		/* its null bitmap, if any */
 	int			nitems;			/* total number of elements in array */
 	int16		typlen;			/* element type's length */
 	bool		typbyval;		/* element type's byval property */
 	char		typalign;		/* element type's align property */
+	uint8		typalignby;		/* typalign mapped to numeric alignment */
 
 	/* information about the requested slice size */
 	int			slice_ndim;		/* slice dimension, or 0 if not slicing */
@@ -86,7 +88,7 @@ typedef struct ArrayIteratorData
 	/* current position information, updated on each iteration */
 	char	   *data_ptr;		/* our current position in the array */
 	int			current_item;	/* the item # we're at in the array */
-}			ArrayIteratorData;
+} ArrayIteratorData;
 
 static bool ReadArrayDimensions(char **srcptr, int *ndim_p,
 								int *dim, int *lBound,
@@ -118,26 +120,26 @@ static Datum array_set_element_expanded(Datum arraydatum,
 										Datum dataValue, bool isNull,
 										int arraytyplen,
 										int elmlen, bool elmbyval, char elmalign);
-static bool array_get_isnull(const bits8 *nullbitmap, int offset);
-static void array_set_isnull(bits8 *nullbitmap, int offset, bool isNull);
+static bool array_get_isnull(const uint8 *nullbitmap, int offset);
+static void array_set_isnull(uint8 *nullbitmap, int offset, bool isNull);
 static Datum ArrayCast(char *value, bool byval, int len);
 static int	ArrayCastAndSet(Datum src,
-							int typlen, bool typbyval, char typalign,
+							int typlen, bool typbyval, uint8 typalignby,
 							char *dest);
-static char *array_seek(char *ptr, int offset, bits8 *nullbitmap, int nitems,
+static char *array_seek(char *ptr, int offset, uint8 *nullbitmap, int nitems,
 						int typlen, bool typbyval, char typalign);
-static int	array_nelems_size(char *ptr, int offset, bits8 *nullbitmap,
+static int	array_nelems_size(char *ptr, int offset, uint8 *nullbitmap,
 							  int nitems, int typlen, bool typbyval, char typalign);
 static int	array_copy(char *destptr, int nitems,
-					   char *srcptr, int offset, bits8 *nullbitmap,
+					   char *srcptr, int offset, uint8 *nullbitmap,
 					   int typlen, bool typbyval, char typalign);
-static int	array_slice_size(char *arraydataptr, bits8 *arraynullsptr,
+static int	array_slice_size(char *arraydataptr, uint8 *arraynullsptr,
 							 int ndim, int *dim, int *lb,
 							 int *st, int *endp,
 							 int typlen, bool typbyval, char typalign);
 static void array_extract_slice(ArrayType *newarray,
 								int ndim, int *dim, int *lb,
-								char *arraydataptr, bits8 *arraynullsptr,
+								char *arraydataptr, uint8 *arraynullsptr,
 								int *st, int *endp,
 								int typlen, bool typbyval, char typalign);
 static void array_insert_slice(ArrayType *destArray, ArrayType *origArray,
@@ -186,6 +188,7 @@ array_in(PG_FUNCTION_ARGS)
 	int			typlen;
 	bool		typbyval;
 	char		typalign;
+	uint8		typalignby;
 	char		typdelim;
 	Oid			typioparam;
 	char	   *p;
@@ -231,6 +234,7 @@ array_in(PG_FUNCTION_ARGS)
 	typlen = my_extra->typlen;
 	typbyval = my_extra->typbyval;
 	typalign = my_extra->typalign;
+	typalignby = typalign_to_alignby(typalign);
 	typdelim = my_extra->typdelim;
 	typioparam = my_extra->typioparam;
 
@@ -327,13 +331,13 @@ array_in(PG_FUNCTION_ARGS)
 			if (typlen == -1)
 				values[i] = PointerGetDatum(PG_DETOAST_DATUM(values[i]));
 			nbytes = att_addlength_datum(nbytes, typlen, values[i]);
-			nbytes = att_align_nominal(nbytes, typalign);
+			nbytes = att_nominal_alignby(nbytes, typalignby);
 			/* check for overflow of total request */
 			if (!AllocSizeIsValid(nbytes))
 				ereturn(escontext, (Datum) 0,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxAllocSize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxAllocSize)));
 		}
 	}
 	if (hasnulls)
@@ -491,8 +495,8 @@ ReadArrayDimensions(char **srcptr, int *ndim_p, int *dim, int *lBound,
 			pg_add_s32_overflow(ub, 1, &ub))
 			ereturn(escontext, false,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
-							(int) MaxArraySize)));
+					 errmsg("array size exceeds the maximum allowed (%zu)",
+							MaxArraySize)));
 
 		dim[ndim] = ub;
 		ndim++;
@@ -724,8 +728,8 @@ ReadArrayStr(char **srcptr,
 					if (maxitems >= MaxArraySize)
 						ereturn(escontext, false,
 								(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-								 errmsg("array size exceeds the maximum allowed (%d)",
-										(int) MaxArraySize)));
+								 errmsg("array size exceeds the maximum allowed (%zu)",
+										MaxArraySize)));
 					maxitems = Min(maxitems * 2, MaxArraySize);
 					values = repalloc_array(values, Datum, maxitems);
 					nulls = repalloc_array(nulls, bool, maxitems);
@@ -959,8 +963,8 @@ ending_error:
  */
 void
 CopyArrayEls(ArrayType *array,
-			 Datum *values,
-			 bool *nulls,
+			 const Datum *values,
+			 const bool *nulls,
 			 int nitems,
 			 int typlen,
 			 bool typbyval,
@@ -968,9 +972,10 @@ CopyArrayEls(ArrayType *array,
 			 bool freedata)
 {
 	char	   *p = ARR_DATA_PTR(array);
-	bits8	   *bitmap = ARR_NULLBITMAP(array);
+	uint8	   *bitmap = ARR_NULLBITMAP(array);
 	int			bitval = 0;
 	int			bitmask = 1;
+	uint8		typalignby = typalign_to_alignby(typalign);
 	int			i;
 
 	if (typbyval)
@@ -987,7 +992,7 @@ CopyArrayEls(ArrayType *array,
 		else
 		{
 			bitval |= bitmask;
-			p += ArrayCastAndSet(values[i], typlen, typbyval, typalign, p);
+			p += ArrayCastAndSet(values[i], typlen, typbyval, typalignby, p);
 			if (freedata)
 				pfree(DatumGetPointer(values[i]));
 		}
@@ -1111,7 +1116,7 @@ array_out(PG_FUNCTION_ARGS)
 	needquotes = (bool *) palloc(nitems * sizeof(bool));
 	overall_length = 0;
 
-	array_iter_setup(&iter, v);
+	array_iter_setup(&iter, v, typlen, typbyval, typalign);
 
 	for (i = 0; i < nitems; i++)
 	{
@@ -1120,8 +1125,7 @@ array_out(PG_FUNCTION_ARGS)
 		bool		needquote;
 
 		/* Get source element, checking for NULL */
-		itemvalue = array_iter_next(&iter, &isnull, i,
-									typlen, typbyval, typalign);
+		itemvalue = array_iter_next(&iter, &isnull, i);
 
 		if (isnull)
 		{
@@ -1467,6 +1471,7 @@ ReadArrayBinary(StringInfo buf,
 	int			i;
 	bool		hasnull;
 	int32		totbytes;
+	uint8		typalignby = typalign_to_alignby(typalign);
 
 	for (i = 0; i < nitems; i++)
 	{
@@ -1525,13 +1530,13 @@ ReadArrayBinary(StringInfo buf,
 			if (typlen == -1)
 				values[i] = PointerGetDatum(PG_DETOAST_DATUM(values[i]));
 			totbytes = att_addlength_datum(totbytes, typlen, values[i]);
-			totbytes = att_align_nominal(totbytes, typalign);
+			totbytes = att_nominal_alignby(totbytes, typalignby);
 			/* check for overflow of total request */
 			if (!AllocSizeIsValid(totbytes))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxAllocSize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxAllocSize)));
 		}
 	}
 	*hasnulls = hasnull;
@@ -1613,7 +1618,7 @@ array_send(PG_FUNCTION_ARGS)
 	}
 
 	/* Send the array elements using the element's own sendproc */
-	array_iter_setup(&iter, v);
+	array_iter_setup(&iter, v, typlen, typbyval, typalign);
 
 	for (i = 0; i < nitems; i++)
 	{
@@ -1621,8 +1626,7 @@ array_send(PG_FUNCTION_ARGS)
 		bool		isnull;
 
 		/* Get source element, checking for NULL */
-		itemvalue = array_iter_next(&iter, &isnull, i,
-									typlen, typbyval, typalign);
+		itemvalue = array_iter_next(&iter, &isnull, i);
 
 		if (isnull)
 		{
@@ -1835,7 +1839,7 @@ array_get_element(Datum arraydatum,
 				fixedLb[1];
 	char	   *arraydataptr,
 			   *retptr;
-	bits8	   *arraynullsptr;
+	uint8	   *arraynullsptr;
 
 	if (arraytyplen > 0)
 	{
@@ -2049,7 +2053,7 @@ array_get_slice(Datum arraydatum,
 				fixedLb[1];
 	Oid			elemtype;
 	char	   *arraydataptr;
-	bits8	   *arraynullsptr;
+	uint8	   *arraynullsptr;
 	int32		dataoffset;
 	int			bytes,
 				span[MAXDIM];
@@ -2217,7 +2221,7 @@ array_set_element(Datum arraydatum,
 				offset;
 	char	   *elt_ptr;
 	bool		newhasnulls;
-	bits8	   *oldnullbitmap;
+	uint8	   *oldnullbitmap;
 	int			oldnitems,
 				newnitems,
 				olddatasize,
@@ -2230,6 +2234,7 @@ array_set_element(Datum arraydatum,
 				addedafter,
 				lenbefore,
 				lenafter;
+	uint8		elmalignby = typalign_to_alignby(elmalign);
 
 	if (arraytyplen > 0)
 	{
@@ -2273,8 +2278,8 @@ array_set_element(Datum arraydatum,
 
 		resultarray = (char *) palloc(arraytyplen);
 		memcpy(resultarray, DatumGetPointer(arraydatum), arraytyplen);
-		elt_ptr = (char *) resultarray + indx[0] * elmlen;
-		ArrayCastAndSet(dataValue, elmlen, elmbyval, elmalign, elt_ptr);
+		elt_ptr = resultarray + indx[0] * elmlen;
+		ArrayCastAndSet(dataValue, elmlen, elmbyval, elmalignby, elt_ptr);
 
 		/*
 		 * Another problem with allowing element assignment for type "name" is
@@ -2363,8 +2368,8 @@ array_set_element(Datum arraydatum,
 				pg_add_s32_overflow(dim[0], addedbefore, &dim[0]))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxArraySize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxArraySize)));
 			lb[0] = indx[0];
 			if (addedbefore > 1)
 				newhasnulls = true; /* will insert nulls */
@@ -2378,8 +2383,8 @@ array_set_element(Datum arraydatum,
 				pg_add_s32_overflow(dim[0], addedafter, &dim[0]))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxArraySize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxArraySize)));
 			if (addedafter > 1)
 				newhasnulls = true; /* will insert nulls */
 		}
@@ -2440,9 +2445,9 @@ array_set_element(Datum arraydatum,
 		else
 		{
 			olditemlen = att_addlength_pointer(0, elmlen, elt_ptr);
-			olditemlen = att_align_nominal(olditemlen, elmalign);
+			olditemlen = att_nominal_alignby(olditemlen, elmalignby);
 		}
-		lenafter = (int) (olddatasize - lenbefore - olditemlen);
+		lenafter = olddatasize - lenbefore - olditemlen;
 	}
 
 	if (isNull)
@@ -2450,7 +2455,7 @@ array_set_element(Datum arraydatum,
 	else
 	{
 		newitemlen = att_addlength_datum(0, elmlen, dataValue);
-		newitemlen = att_align_nominal(newitemlen, elmalign);
+		newitemlen = att_nominal_alignby(newitemlen, elmalignby);
 	}
 
 	newsize = overheadlen + lenbefore + newitemlen + lenafter;
@@ -2473,7 +2478,7 @@ array_set_element(Datum arraydatum,
 		   (char *) array + oldoverheadlen,
 		   lenbefore);
 	if (!isNull)
-		ArrayCastAndSet(dataValue, elmlen, elmbyval, elmalign,
+		ArrayCastAndSet(dataValue, elmlen, elmbyval, elmalignby,
 						(char *) newarray + overheadlen + lenbefore);
 	memcpy((char *) newarray + overheadlen + lenbefore + newitemlen,
 		   (char *) array + oldoverheadlen + lenbefore + olditemlen,
@@ -2487,7 +2492,7 @@ array_set_element(Datum arraydatum,
 	 */
 	if (newhasnulls)
 	{
-		bits8	   *newnullbitmap = ARR_NULLBITMAP(newarray);
+		uint8	   *newnullbitmap = ARR_NULLBITMAP(newarray);
 
 		/* palloc0 above already marked any inserted positions as nulls */
 		/* Fix the inserted value */
@@ -2640,8 +2645,8 @@ array_set_element_expanded(Datum arraydatum,
 				pg_add_s32_overflow(dim[0], addedbefore, &dim[0]))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxArraySize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxArraySize)));
 			lb[0] = indx[0];
 			dimschanged = true;
 			if (addedbefore > 1)
@@ -2656,8 +2661,8 @@ array_set_element_expanded(Datum arraydatum,
 				pg_add_s32_overflow(dim[0], addedafter, &dim[0]))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxArraySize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxArraySize)));
 			dimschanged = true;
 			if (addedafter > 1)
 				newhasnulls = true; /* will insert nulls */
@@ -2920,8 +2925,8 @@ array_set_slice(Datum arraydatum,
 				pg_add_s32_overflow(dim[i], 1, &dim[i]))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxArraySize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxArraySize)));
 
 			lb[i] = lowerIndx[i];
 		}
@@ -2974,8 +2979,8 @@ array_set_slice(Datum arraydatum,
 				pg_add_s32_overflow(dim[0], addedbefore, &dim[0]))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxArraySize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxArraySize)));
 			lb[0] = lowerIndx[0];
 			if (addedbefore > 1)
 				newhasnulls = true; /* will insert nulls */
@@ -2989,8 +2994,8 @@ array_set_slice(Datum arraydatum,
 				pg_add_s32_overflow(dim[0], addedafter, &dim[0]))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxArraySize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxArraySize)));
 			if (addedafter > 1)
 				newhasnulls = true; /* will insert nulls */
 		}
@@ -3082,7 +3087,7 @@ array_set_slice(Datum arraydatum,
 		int			slicelb = Max(oldlb, lowerIndx[0]);
 		int			sliceub = Min(oldub, upperIndx[0]);
 		char	   *oldarraydata = ARR_DATA_PTR(array);
-		bits8	   *oldarraybitmap = ARR_NULLBITMAP(array);
+		uint8	   *oldarraybitmap = ARR_NULLBITMAP(array);
 
 		/* count/size of old array entries that will go before the slice */
 		itemsbefore = Min(slicelb, oldub + 1) - oldlb;
@@ -3144,8 +3149,8 @@ array_set_slice(Datum arraydatum,
 		/* fill in nulls bitmap if needed */
 		if (newhasnulls)
 		{
-			bits8	   *newnullbitmap = ARR_NULLBITMAP(newarray);
-			bits8	   *oldnullbitmap = ARR_NULLBITMAP(array);
+			uint8	   *newnullbitmap = ARR_NULLBITMAP(newarray);
+			uint8	   *oldnullbitmap = ARR_NULLBITMAP(array);
 
 			/* palloc0 above already marked any inserted positions as nulls */
 			array_bitmap_copy(newnullbitmap, addedbefore,
@@ -3248,6 +3253,7 @@ array_map(Datum arrayd,
 	int			typlen;
 	bool		typbyval;
 	char		typalign;
+	uint8		typalignby;
 	array_iter	iter;
 	ArrayMetaState *inp_extra;
 	ArrayMetaState *ret_extra;
@@ -3297,21 +3303,21 @@ array_map(Datum arrayd,
 	typlen = ret_extra->typlen;
 	typbyval = ret_extra->typbyval;
 	typalign = ret_extra->typalign;
+	typalignby = typalign_to_alignby(typalign);
 
 	/* Allocate temporary arrays for new values */
 	values = (Datum *) palloc(nitems * sizeof(Datum));
 	nulls = (bool *) palloc(nitems * sizeof(bool));
 
 	/* Loop over source data */
-	array_iter_setup(&iter, v);
+	array_iter_setup(&iter, v, inp_typlen, inp_typbyval, inp_typalign);
 	hasnulls = false;
 
 	for (i = 0; i < nitems; i++)
 	{
 		/* Get source element, checking for NULL */
 		*transform_source =
-			array_iter_next(&iter, transform_source_isnull, i,
-							inp_typlen, inp_typbyval, inp_typalign);
+			array_iter_next(&iter, transform_source_isnull, i);
 
 		/* Apply the given expression to source element */
 		values[i] = ExecEvalExpr(exprstate, econtext, &nulls[i]);
@@ -3325,13 +3331,13 @@ array_map(Datum arrayd,
 				values[i] = PointerGetDatum(PG_DETOAST_DATUM(values[i]));
 			/* Update total result size */
 			nbytes = att_addlength_datum(nbytes, typlen, values[i]);
-			nbytes = att_align_nominal(nbytes, typalign);
+			nbytes = att_nominal_alignby(nbytes, typalignby);
 			/* check for overflow of total request */
 			if (!AllocSizeIsValid(nbytes))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
-								(int) MaxAllocSize)));
+						 errmsg("array size exceeds the maximum allowed (%zu)",
+								MaxAllocSize)));
 		}
 	}
 
@@ -3434,7 +3440,7 @@ construct_array_builtin(Datum *elems, int nelems, Oid elmtype)
 
 		case FLOAT8OID:
 			elmlen = sizeof(float8);
-			elmbyval = FLOAT8PASSBYVAL;
+			elmbyval = true;
 			elmalign = TYPALIGN_DOUBLE;
 			break;
 
@@ -3452,7 +3458,7 @@ construct_array_builtin(Datum *elems, int nelems, Oid elmtype)
 
 		case INT8OID:
 			elmlen = sizeof(int64);
-			elmbyval = FLOAT8PASSBYVAL;
+			elmbyval = true;
 			elmalign = TYPALIGN_DOUBLE;
 			break;
 
@@ -3532,6 +3538,7 @@ construct_md_array(Datum *elems,
 	int32		dataoffset;
 	int			i;
 	int			nelems;
+	uint8		elmalignby = typalign_to_alignby(elmalign);
 
 	if (ndims < 0)				/* we do allow zero-dimension arrays */
 		ereport(ERROR,
@@ -3565,13 +3572,13 @@ construct_md_array(Datum *elems,
 		if (elmlen == -1)
 			elems[i] = PointerGetDatum(PG_DETOAST_DATUM(elems[i]));
 		nbytes = att_addlength_datum(nbytes, elmlen, elems[i]);
-		nbytes = att_align_nominal(nbytes, elmalign);
+		nbytes = att_nominal_alignby(nbytes, elmalignby);
 		/* check for overflow of total request */
 		if (!AllocSizeIsValid(nbytes))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
-							(int) MaxAllocSize)));
+					 errmsg("array size exceeds the maximum allowed (%zu)",
+							MaxAllocSize)));
 	}
 
 	/* Allocate and initialize result array */
@@ -3609,7 +3616,7 @@ construct_empty_array(Oid elmtype)
 {
 	ArrayType  *result;
 
-	result = (ArrayType *) palloc0(sizeof(ArrayType));
+	result = palloc0_object(ArrayType);
 	SET_VARSIZE(result, sizeof(ArrayType));
 	result->ndim = 0;
 	result->dataoffset = 0;
@@ -3656,7 +3663,7 @@ construct_empty_expanded_array(Oid element_type,
  * to hard-wire values if the element type is hard-wired.
  */
 void
-deconstruct_array(ArrayType *array,
+deconstruct_array(const ArrayType *array,
 				  Oid elmtype,
 				  int elmlen, bool elmbyval, char elmalign,
 				  Datum **elemsp, bool **nullsp, int *nelemsp)
@@ -3665,16 +3672,17 @@ deconstruct_array(ArrayType *array,
 	bool	   *nulls;
 	int			nelems;
 	char	   *p;
-	bits8	   *bitmap;
+	uint8	   *bitmap;
 	int			bitmask;
 	int			i;
+	uint8		elmalignby = typalign_to_alignby(elmalign);
 
 	Assert(ARR_ELEMTYPE(array) == elmtype);
 
 	nelems = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
-	*elemsp = elems = (Datum *) palloc(nelems * sizeof(Datum));
+	*elemsp = elems = palloc_array(Datum, nelems);
 	if (nullsp)
-		*nullsp = nulls = (bool *) palloc0(nelems * sizeof(bool));
+		*nullsp = nulls = palloc0_array(bool, nelems);
 	else
 		nulls = NULL;
 	*nelemsp = nelems;
@@ -3700,7 +3708,7 @@ deconstruct_array(ArrayType *array,
 		{
 			elems[i] = fetch_att(p, elmbyval, elmlen);
 			p = att_addlength_pointer(p, elmlen, p);
-			p = (char *) att_align_nominal(p, elmalign);
+			p = (char *) att_nominal_alignby(p, elmalignby);
 		}
 
 		/* advance bitmap pointer if any */
@@ -3722,7 +3730,7 @@ deconstruct_array(ArrayType *array,
  * useful when manipulating arrays from/for system catalogs.
  */
 void
-deconstruct_array_builtin(ArrayType *array,
+deconstruct_array_builtin(const ArrayType *array,
 						  Oid elmtype,
 						  Datum **elemsp, bool **nullsp, int *nelemsp)
 {
@@ -3746,7 +3754,7 @@ deconstruct_array_builtin(ArrayType *array,
 
 		case FLOAT8OID:
 			elmlen = sizeof(float8);
-			elmbyval = FLOAT8PASSBYVAL;
+			elmbyval = true;
 			elmalign = TYPALIGN_DOUBLE;
 			break;
 
@@ -3798,10 +3806,10 @@ deconstruct_array_builtin(ArrayType *array,
  * if the array *might* contain a null.
  */
 bool
-array_contains_nulls(ArrayType *array)
+array_contains_nulls(const ArrayType *array)
 {
 	int			nelems;
-	bits8	   *bitmap;
+	uint8	   *bitmap;
 	int			bitmask;
 
 	/* Easy answer if there's no null bitmap */
@@ -3911,8 +3919,8 @@ array_eq(PG_FUNCTION_ARGS)
 
 		/* Loop over source data */
 		nitems = ArrayGetNItems(ndims1, dims1);
-		array_iter_setup(&it1, array1);
-		array_iter_setup(&it2, array2);
+		array_iter_setup(&it1, array1, typlen, typbyval, typalign);
+		array_iter_setup(&it2, array2, typlen, typbyval, typalign);
 
 		for (i = 0; i < nitems; i++)
 		{
@@ -3923,10 +3931,8 @@ array_eq(PG_FUNCTION_ARGS)
 			bool		oprresult;
 
 			/* Get elements, checking for NULL */
-			elt1 = array_iter_next(&it1, &isnull1, i,
-								   typlen, typbyval, typalign);
-			elt2 = array_iter_next(&it2, &isnull2, i,
-								   typlen, typbyval, typalign);
+			elt1 = array_iter_next(&it1, &isnull1, i);
+			elt2 = array_iter_next(&it2, &isnull2, i);
 
 			/*
 			 * We consider two NULLs equal; NULL and not-NULL are unequal.
@@ -4075,8 +4081,8 @@ array_cmp(FunctionCallInfo fcinfo)
 
 	/* Loop over source data */
 	min_nitems = Min(nitems1, nitems2);
-	array_iter_setup(&it1, array1);
-	array_iter_setup(&it2, array2);
+	array_iter_setup(&it1, array1, typlen, typbyval, typalign);
+	array_iter_setup(&it2, array2, typlen, typbyval, typalign);
 
 	for (i = 0; i < min_nitems; i++)
 	{
@@ -4087,8 +4093,8 @@ array_cmp(FunctionCallInfo fcinfo)
 		int32		cmpresult;
 
 		/* Get elements, checking for NULL */
-		elt1 = array_iter_next(&it1, &isnull1, i, typlen, typbyval, typalign);
-		elt2 = array_iter_next(&it2, &isnull2, i, typlen, typbyval, typalign);
+		elt1 = array_iter_next(&it1, &isnull1, i);
+		elt2 = array_iter_next(&it2, &isnull2, i);
 
 		/*
 		 * We consider two NULLs equal; NULL > not-NULL.
@@ -4242,7 +4248,7 @@ hash_array(PG_FUNCTION_ARGS)
 			 * modify typentry, since that points directly into the type
 			 * cache.
 			 */
-			record_typentry = palloc0(sizeof(*record_typentry));
+			record_typentry = palloc0_object(TypeCacheEntry);
 			record_typentry->type_id = element_type;
 
 			/* fill in what we need below */
@@ -4271,7 +4277,7 @@ hash_array(PG_FUNCTION_ARGS)
 
 	/* Loop over source data */
 	nitems = ArrayGetNItems(ndims, dims);
-	array_iter_setup(&iter, array);
+	array_iter_setup(&iter, array, typlen, typbyval, typalign);
 
 	for (i = 0; i < nitems; i++)
 	{
@@ -4280,7 +4286,7 @@ hash_array(PG_FUNCTION_ARGS)
 		uint32		elthash;
 
 		/* Get element, checking for NULL */
-		elt = array_iter_next(&iter, &isnull, i, typlen, typbyval, typalign);
+		elt = array_iter_next(&iter, &isnull, i);
 
 		if (isnull)
 		{
@@ -4361,7 +4367,7 @@ hash_array_extended(PG_FUNCTION_ARGS)
 
 	/* Loop over source data */
 	nitems = ArrayGetNItems(ndims, dims);
-	array_iter_setup(&iter, array);
+	array_iter_setup(&iter, array, typlen, typbyval, typalign);
 
 	for (i = 0; i < nitems; i++)
 	{
@@ -4370,7 +4376,7 @@ hash_array_extended(PG_FUNCTION_ARGS)
 		uint64		elthash;
 
 		/* Get element, checking for NULL */
-		elt = array_iter_next(&iter, &isnull, i, typlen, typbyval, typalign);
+		elt = array_iter_next(&iter, &isnull, i);
 
 		if (isnull)
 		{
@@ -4484,7 +4490,7 @@ array_contain_compare(AnyArrayType *array1, AnyArrayType *array2, Oid collation,
 
 	/* Loop over source data */
 	nelems1 = ArrayGetNItems(AARR_NDIM(array1), AARR_DIMS(array1));
-	array_iter_setup(&it1, array1);
+	array_iter_setup(&it1, array1, typlen, typbyval, typalign);
 
 	for (i = 0; i < nelems1; i++)
 	{
@@ -4492,7 +4498,7 @@ array_contain_compare(AnyArrayType *array1, AnyArrayType *array2, Oid collation,
 		bool		isnull1;
 
 		/* Get element, checking for NULL */
-		elt1 = array_iter_next(&it1, &isnull1, i, typlen, typbyval, typalign);
+		elt1 = array_iter_next(&it1, &isnull1, i);
 
 		/*
 		 * We assume that the comparison operator is strict, so a NULL can't
@@ -4630,12 +4636,12 @@ arraycontained(PG_FUNCTION_ARGS)
 ArrayIterator
 array_create_iterator(ArrayType *arr, int slice_ndim, ArrayMetaState *mstate)
 {
-	ArrayIterator iterator = palloc0(sizeof(ArrayIteratorData));
+	ArrayIterator iterator = palloc0_object(ArrayIteratorData);
 
 	/*
 	 * Sanity-check inputs --- caller should have got this right already
 	 */
-	Assert(PointerIsValid(arr));
+	Assert(arr);
 	if (slice_ndim < 0 || slice_ndim > ARR_NDIM(arr))
 		elog(ERROR, "invalid arguments to array_create_iterator");
 
@@ -4659,6 +4665,7 @@ array_create_iterator(ArrayType *arr, int slice_ndim, ArrayMetaState *mstate)
 							 &iterator->typlen,
 							 &iterator->typbyval,
 							 &iterator->typalign);
+	iterator->typalignby = typalign_to_alignby(iterator->typalign);
 
 	/*
 	 * Remember the slicing parameters.
@@ -4733,7 +4740,7 @@ array_iterate(ArrayIterator iterator, Datum *value, bool *isnull)
 
 			/* Move our data pointer forward to the next element */
 			p = att_addlength_pointer(p, iterator->typlen, p);
-			p = (char *) att_align_nominal(p, iterator->typalign);
+			p = (char *) att_nominal_alignby(p, iterator->typalignby);
 			iterator->data_ptr = p;
 		}
 	}
@@ -4763,7 +4770,7 @@ array_iterate(ArrayIterator iterator, Datum *value, bool *isnull)
 
 				/* Move our data pointer forward to the next element */
 				p = att_addlength_pointer(p, iterator->typlen, p);
-				p = (char *) att_align_nominal(p, iterator->typalign);
+				p = (char *) att_nominal_alignby(p, iterator->typalignby);
 			}
 		}
 
@@ -4812,7 +4819,7 @@ array_free_iterator(ArrayIterator iterator)
  * offset: 0-based linear element number of array element
  */
 static bool
-array_get_isnull(const bits8 *nullbitmap, int offset)
+array_get_isnull(const uint8 *nullbitmap, int offset)
 {
 	if (nullbitmap == NULL)
 		return false;			/* assume not null */
@@ -4829,7 +4836,7 @@ array_get_isnull(const bits8 *nullbitmap, int offset)
  * isNull: null status to set
  */
 static void
-array_set_isnull(bits8 *nullbitmap, int offset, bool isNull)
+array_set_isnull(uint8 *nullbitmap, int offset, bool isNull)
 {
 	int			bitmask;
 
@@ -4861,7 +4868,7 @@ static int
 ArrayCastAndSet(Datum src,
 				int typlen,
 				bool typbyval,
-				char typalign,
+				uint8 typalignby,
 				char *dest)
 {
 	int			inc;
@@ -4872,14 +4879,14 @@ ArrayCastAndSet(Datum src,
 			store_att_byval(dest, src, typlen);
 		else
 			memmove(dest, DatumGetPointer(src), typlen);
-		inc = att_align_nominal(typlen, typalign);
+		inc = att_nominal_alignby(typlen, typalignby);
 	}
 	else
 	{
 		Assert(!typbyval);
 		inc = att_addlength_datum(0, typlen, src);
 		memmove(dest, DatumGetPointer(src), inc);
-		inc = att_align_nominal(inc, typalign);
+		inc = att_nominal_alignby(inc, typalignby);
 	}
 
 	return inc;
@@ -4897,15 +4904,16 @@ ArrayCastAndSet(Datum src,
  * It is caller's responsibility to ensure that nitems is within range
  */
 static char *
-array_seek(char *ptr, int offset, bits8 *nullbitmap, int nitems,
+array_seek(char *ptr, int offset, uint8 *nullbitmap, int nitems,
 		   int typlen, bool typbyval, char typalign)
 {
+	uint8		typalignby = typalign_to_alignby(typalign);
 	int			bitmask;
 	int			i;
 
 	/* easy if fixed-size elements and no NULLs */
 	if (typlen > 0 && !nullbitmap)
-		return ptr + nitems * ((Size) att_align_nominal(typlen, typalign));
+		return ptr + nitems * ((Size) att_nominal_alignby(typlen, typalignby));
 
 	/* seems worth having separate loops for NULL and no-NULLs cases */
 	if (nullbitmap)
@@ -4918,7 +4926,7 @@ array_seek(char *ptr, int offset, bits8 *nullbitmap, int nitems,
 			if (*nullbitmap & bitmask)
 			{
 				ptr = att_addlength_pointer(ptr, typlen, ptr);
-				ptr = (char *) att_align_nominal(ptr, typalign);
+				ptr = (char *) att_nominal_alignby(ptr, typalignby);
 			}
 			bitmask <<= 1;
 			if (bitmask == 0x100)
@@ -4933,7 +4941,7 @@ array_seek(char *ptr, int offset, bits8 *nullbitmap, int nitems,
 		for (i = 0; i < nitems; i++)
 		{
 			ptr = att_addlength_pointer(ptr, typlen, ptr);
-			ptr = (char *) att_align_nominal(ptr, typalign);
+			ptr = (char *) att_nominal_alignby(ptr, typalignby);
 		}
 	}
 	return ptr;
@@ -4945,7 +4953,7 @@ array_seek(char *ptr, int offset, bits8 *nullbitmap, int nitems,
  * Parameters same as for array_seek
  */
 static int
-array_nelems_size(char *ptr, int offset, bits8 *nullbitmap, int nitems,
+array_nelems_size(char *ptr, int offset, uint8 *nullbitmap, int nitems,
 				  int typlen, bool typbyval, char typalign)
 {
 	return array_seek(ptr, offset, nullbitmap, nitems,
@@ -4968,7 +4976,7 @@ array_nelems_size(char *ptr, int offset, bits8 *nullbitmap, int nitems,
  */
 static int
 array_copy(char *destptr, int nitems,
-		   char *srcptr, int offset, bits8 *nullbitmap,
+		   char *srcptr, int offset, uint8 *nullbitmap,
 		   int typlen, bool typbyval, char typalign)
 {
 	int			numbytes;
@@ -4997,8 +5005,8 @@ array_copy(char *destptr, int nitems,
  * to make it worth worrying too much.  For the moment, KISS.
  */
 void
-array_bitmap_copy(bits8 *destbitmap, int destoffset,
-				  const bits8 *srcbitmap, int srcoffset,
+array_bitmap_copy(uint8 *destbitmap, int destoffset,
+				  const uint8 *srcbitmap, int srcoffset,
 				  int nitems)
 {
 	int			destbitmask,
@@ -5068,7 +5076,7 @@ array_bitmap_copy(bits8 *destbitmap, int destoffset,
  * We assume the caller has verified that the slice coordinates are valid.
  */
 static int
-array_slice_size(char *arraydataptr, bits8 *arraynullsptr,
+array_slice_size(char *arraydataptr, uint8 *arraynullsptr,
 				 int ndim, int *dim, int *lb,
 				 int *st, int *endp,
 				 int typlen, bool typbyval, char typalign)
@@ -5083,12 +5091,13 @@ array_slice_size(char *arraydataptr, bits8 *arraynullsptr,
 				j,
 				inc;
 	int			count = 0;
+	uint8		typalignby = typalign_to_alignby(typalign);
 
 	mda_get_range(ndim, span, st, endp);
 
 	/* Pretty easy for fixed element length without nulls ... */
 	if (typlen > 0 && !arraynullsptr)
-		return ArrayGetNItems(ndim, span) * att_align_nominal(typlen, typalign);
+		return ArrayGetNItems(ndim, span) * att_nominal_alignby(typlen, typalignby);
 
 	/* Else gotta do it the hard way */
 	src_offset = ArrayGetOffset(ndim, dim, lb, st);
@@ -5110,7 +5119,7 @@ array_slice_size(char *arraydataptr, bits8 *arraynullsptr,
 		if (!array_get_isnull(arraynullsptr, src_offset))
 		{
 			inc = att_addlength_pointer(0, typlen, ptr);
-			inc = att_align_nominal(inc, typalign);
+			inc = att_nominal_alignby(inc, typalignby);
 			ptr += inc;
 			count += inc;
 		}
@@ -5133,7 +5142,7 @@ array_extract_slice(ArrayType *newarray,
 					int *dim,
 					int *lb,
 					char *arraydataptr,
-					bits8 *arraynullsptr,
+					uint8 *arraynullsptr,
 					int *st,
 					int *endp,
 					int typlen,
@@ -5141,7 +5150,7 @@ array_extract_slice(ArrayType *newarray,
 					char typalign)
 {
 	char	   *destdataptr = ARR_DATA_PTR(newarray);
-	bits8	   *destnullsptr = ARR_NULLBITMAP(newarray);
+	uint8	   *destnullsptr = ARR_NULLBITMAP(newarray);
 	char	   *srcdataptr;
 	int			src_offset,
 				dest_offset,
@@ -5216,9 +5225,9 @@ array_insert_slice(ArrayType *destArray,
 	char	   *destPtr = ARR_DATA_PTR(destArray);
 	char	   *origPtr = ARR_DATA_PTR(origArray);
 	char	   *srcPtr = ARR_DATA_PTR(srcArray);
-	bits8	   *destBitmap = ARR_NULLBITMAP(destArray);
-	bits8	   *origBitmap = ARR_NULLBITMAP(origArray);
-	bits8	   *srcBitmap = ARR_NULLBITMAP(srcArray);
+	uint8	   *destBitmap = ARR_NULLBITMAP(destArray);
+	uint8	   *origBitmap = ARR_NULLBITMAP(origArray);
+	uint8	   *srcBitmap = ARR_NULLBITMAP(srcArray);
 	int			orignitems = ArrayGetNItems(ARR_NDIM(origArray),
 											ARR_DIMS(origArray));
 	int			dest_offset,
@@ -5408,8 +5417,8 @@ accumArrayResult(ArrayBuildState *astate,
 		if (!AllocSizeIsValid(astate->alen * sizeof(Datum)))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
-							(int) MaxAllocSize)));
+					 errmsg("array size exceeds the maximum allowed (%zu)",
+							MaxAllocSize)));
 		astate->dvalues = (Datum *)
 			repalloc(astate->dvalues, astate->alen * sizeof(Datum));
 		astate->dnulls = (bool *)
@@ -5705,7 +5714,7 @@ accumArrayResultArr(ArrayBuildStateArr *astate,
 			 * previous inputs by marking all their items non-null.
 			 */
 			astate->aitems = pg_nextpower2_32(Max(256, newnitems + 1));
-			astate->nullbitmap = (bits8 *) palloc((astate->aitems + 7) / 8);
+			astate->nullbitmap = (uint8 *) palloc((astate->aitems + 7) / 8);
 			array_bitmap_copy(astate->nullbitmap, 0,
 							  NULL, 0,
 							  astate->nitems);
@@ -5713,7 +5722,7 @@ accumArrayResultArr(ArrayBuildStateArr *astate,
 		else if (newnitems > astate->aitems)
 		{
 			astate->aitems = Max(astate->aitems * 2, newnitems);
-			astate->nullbitmap = (bits8 *)
+			astate->nullbitmap = (uint8 *)
 				repalloc(astate->nullbitmap, (astate->aitems + 7) / 8);
 		}
 		array_bitmap_copy(astate->nullbitmap, astate->nitems,
@@ -5727,7 +5736,7 @@ accumArrayResultArr(ArrayBuildStateArr *astate,
 	MemoryContextSwitchTo(oldcontext);
 
 	/* Release detoasted copy if any */
-	if ((Pointer) arg != DatumGetPointer(dvalue))
+	if (arg != DatumGetPointer(dvalue))
 		pfree(arg);
 
 	return astate;
@@ -5984,7 +5993,7 @@ generate_subscripts(PG_FUNCTION_ARGS)
 		 * switch to memory context appropriate for multiple function calls
 		 */
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-		fctx = (generate_subscripts_fctx *) palloc(sizeof(generate_subscripts_fctx));
+		fctx = palloc_object(generate_subscripts_fctx);
 
 		lb = AARR_LBOUND(v);
 		dimv = AARR_DIMS(v);
@@ -6136,6 +6145,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 	int16		elmlen;
 	bool		elmbyval;
 	char		elmalign;
+	uint8		elmalignby;
 	ArrayMetaState *my_extra;
 
 	/*
@@ -6230,6 +6240,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 	elmlen = my_extra->typlen;
 	elmbyval = my_extra->typbyval;
 	elmalign = my_extra->typalign;
+	elmalignby = typalign_to_alignby(elmalign);
 
 	/* compute required space */
 	if (!isnull)
@@ -6244,7 +6255,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 			value = PointerGetDatum(PG_DETOAST_DATUM(value));
 
 		nbytes = att_addlength_datum(0, elmlen, value);
-		nbytes = att_align_nominal(nbytes, elmalign);
+		nbytes = att_nominal_alignby(nbytes, elmalignby);
 		Assert(nbytes > 0);
 
 		totbytes = nbytes * nitems;
@@ -6254,8 +6265,8 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 			!AllocSizeIsValid(totbytes))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
-							(int) MaxAllocSize)));
+					 errmsg("array size exceeds the maximum allowed (%zu)",
+							MaxAllocSize)));
 
 		/*
 		 * This addition can't overflow, but it might cause us to go past
@@ -6268,7 +6279,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 
 		p = ARR_DATA_PTR(result);
 		for (i = 0; i < nitems; i++)
-			p += ArrayCastAndSet(value, elmlen, elmbyval, elmalign, p);
+			p += ArrayCastAndSet(value, elmlen, elmbyval, elmalignby, p);
 	}
 	else
 	{
@@ -6299,9 +6310,6 @@ array_unnest(PG_FUNCTION_ARGS)
 		array_iter	iter;
 		int			nextelem;
 		int			numelems;
-		int16		elmlen;
-		bool		elmbyval;
-		char		elmalign;
 	} array_unnest_fctx;
 
 	FuncCallContext *funcctx;
@@ -6312,6 +6320,9 @@ array_unnest(PG_FUNCTION_ARGS)
 	if (SRF_IS_FIRSTCALL())
 	{
 		AnyArrayType *arr;
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
 
 		/* create a function context for cross-call persistence */
 		funcctx = SRF_FIRSTCALL_INIT();
@@ -6331,25 +6342,26 @@ array_unnest(PG_FUNCTION_ARGS)
 		arr = PG_GETARG_ANY_ARRAY_P(0);
 
 		/* allocate memory for user context */
-		fctx = (array_unnest_fctx *) palloc(sizeof(array_unnest_fctx));
+		fctx = palloc_object(array_unnest_fctx);
 
-		/* initialize state */
-		array_iter_setup(&fctx->iter, arr);
-		fctx->nextelem = 0;
-		fctx->numelems = ArrayGetNItems(AARR_NDIM(arr), AARR_DIMS(arr));
-
+		/* get element-type data */
 		if (VARATT_IS_EXPANDED_HEADER(arr))
 		{
 			/* we can just grab the type data from expanded array */
-			fctx->elmlen = arr->xpn.typlen;
-			fctx->elmbyval = arr->xpn.typbyval;
-			fctx->elmalign = arr->xpn.typalign;
+			elmlen = arr->xpn.typlen;
+			elmbyval = arr->xpn.typbyval;
+			elmalign = arr->xpn.typalign;
 		}
 		else
 			get_typlenbyvalalign(AARR_ELEMTYPE(arr),
-								 &fctx->elmlen,
-								 &fctx->elmbyval,
-								 &fctx->elmalign);
+								 &elmlen,
+								 &elmbyval,
+								 &elmalign);
+
+		/* initialize state */
+		array_iter_setup(&fctx->iter, arr, elmlen, elmbyval, elmalign);
+		fctx->nextelem = 0;
+		fctx->numelems = ArrayGetNItems(AARR_NDIM(arr), AARR_DIMS(arr));
 
 		funcctx->user_fctx = fctx;
 		MemoryContextSwitchTo(oldcontext);
@@ -6364,8 +6376,7 @@ array_unnest(PG_FUNCTION_ARGS)
 		int			offset = fctx->nextelem++;
 		Datum		elem;
 
-		elem = array_iter_next(&fctx->iter, &fcinfo->isnull, offset,
-							   fctx->elmlen, fctx->elmbyval, fctx->elmalign);
+		elem = array_iter_next(&fctx->iter, &fcinfo->isnull, offset);
 
 		SRF_RETURN_NEXT(funcctx, elem);
 	}
@@ -6441,8 +6452,9 @@ array_replace_internal(ArrayType *array,
 	int			typlen;
 	bool		typbyval;
 	char		typalign;
+	uint8		typalignby;
 	char	   *arraydataptr;
-	bits8	   *bitmap;
+	uint8	   *bitmap;
 	int			bitmask;
 	bool		changed = false;
 	TypeCacheEntry *typentry;
@@ -6485,6 +6497,7 @@ array_replace_internal(ArrayType *array,
 	typlen = typentry->typlen;
 	typbyval = typentry->typbyval;
 	typalign = typentry->typalign;
+	typalignby = typalign_to_alignby(typalign);
 
 	/*
 	 * Detoast values if they are toasted.  The replacement value must be
@@ -6546,7 +6559,7 @@ array_replace_internal(ArrayType *array,
 			isNull = false;
 			elt = fetch_att(arraydataptr, typbyval, typlen);
 			arraydataptr = att_addlength_datum(arraydataptr, typlen, elt);
-			arraydataptr = (char *) att_align_nominal(arraydataptr, typalign);
+			arraydataptr = (char *) att_nominal_alignby(arraydataptr, typalignby);
 
 			if (search_isnull)
 			{
@@ -6593,13 +6606,13 @@ array_replace_internal(ArrayType *array,
 			{
 				/* Update total result size */
 				nbytes = att_addlength_datum(nbytes, typlen, values[nresult]);
-				nbytes = att_align_nominal(nbytes, typalign);
+				nbytes = att_nominal_alignby(nbytes, typalignby);
 				/* check for overflow of total request */
 				if (!AllocSizeIsValid(nbytes))
 					ereport(ERROR,
 							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							 errmsg("array size exceeds the maximum allowed (%d)",
-									(int) MaxAllocSize)));
+							 errmsg("array size exceeds the maximum allowed (%zu)",
+									MaxAllocSize)));
 			}
 			nresult++;
 		}
@@ -6900,6 +6913,7 @@ width_bucket_array_variable(Datum operand,
 	int			typlen = typentry->typlen;
 	bool		typbyval = typentry->typbyval;
 	char		typalign = typentry->typalign;
+	uint8		typalignby = typalign_to_alignby(typalign);
 	int			left;
 	int			right;
 
@@ -6923,7 +6937,7 @@ width_bucket_array_variable(Datum operand,
 		for (i = left; i < mid; i++)
 		{
 			ptr = att_addlength_pointer(ptr, typlen, ptr);
-			ptr = (char *) att_align_nominal(ptr, typalign);
+			ptr = (char *) att_nominal_alignby(ptr, typalignby);
 		}
 
 		locfcinfo->args[0].value = operand;
@@ -6948,7 +6962,7 @@ width_bucket_array_variable(Datum operand,
 			 * ensures we do only O(N) array indexing work, not O(N^2).
 			 */
 			ptr = att_addlength_pointer(ptr, typlen, ptr);
-			thresholds_data = (char *) att_align_nominal(ptr, typalign);
+			thresholds_data = (char *) att_nominal_alignby(ptr, typalignby);
 		}
 	}
 

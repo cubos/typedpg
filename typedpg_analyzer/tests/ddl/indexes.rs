@@ -1244,7 +1244,7 @@ fn exclusion_on_a_partitioned_table_compares_the_partition_key_with_equality() {
             (
                 "CREATE TABLE t (a int, b int, EXCLUDE USING btree (b WITH =)) \
                  PARTITION BY RANGE (a);",
-                "unique constraint on partitioned table must include all partitioning columns",
+                "EXCLUDE constraint on partitioned table must include all partitioning columns",
             ),
             (
                 "CREATE TABLE t (a int4range, EXCLUDE USING gist (a WITH &&)) \
@@ -1753,23 +1753,30 @@ fn unique_constraints_cover_every_level_of_partition_keys() {
                  CREATE TABLE kp (a int, b int) PARTITION BY RANGE (a);
                  CREATE TABLE kp1 PARTITION OF kp FOR VALUES FROM (0) TO (10) \
                      PARTITION BY LIST ((b + 1));";
-    let lacks = "unique constraint on partitioned table must include all partitioning columns";
+    let lacks = "PRIMARY KEY constraint on partitioned table must include all partitioning columns";
+    let lacks_unique =
+        "UNIQUE constraint on partitioned table must include all partitioning columns";
+    let lacks_exclude =
+        "EXCLUDE constraint on partitioned table must include all partitioning columns";
     assert_rejected(
         setup,
         &[
             ("ALTER TABLE ip ADD PRIMARY KEY (a);", lacks),
-            ("ALTER TABLE ip ADD UNIQUE (a);", lacks),
-            ("CREATE UNIQUE INDEX ON ip (a);", lacks),
-            ("ALTER TABLE ip ADD EXCLUDE USING gist (a WITH =);", lacks),
+            ("ALTER TABLE ip ADD UNIQUE (a);", lacks_unique),
+            ("CREATE UNIQUE INDEX ON ip (a);", lacks_unique),
+            (
+                "ALTER TABLE ip ADD EXCLUDE USING gist (a WITH =);",
+                lacks_exclude,
+            ),
             (
                 "CREATE TABLE jp2 PARTITION OF jp FOR VALUES FROM (10) TO (20) \
                  PARTITION BY LIST (b);",
-                lacks,
+                lacks_unique,
             ),
             (
                 "CREATE TABLE ip3 (a int, b int) PARTITION BY LIST (b);
                  ALTER TABLE jp ATTACH PARTITION ip3 FOR VALUES FROM (0) TO (10);",
-                lacks,
+                lacks_unique,
             ),
             (
                 "ALTER TABLE kp ADD PRIMARY KEY (a);",
@@ -1799,7 +1806,7 @@ fn unique_index_covers_the_partition_key_only_with_its_equality() {
         setup,
         &[(
             "CREATE UNIQUE INDEX ON t (a record_image_ops);",
-            "unique constraint on partitioned table must include all partitioning columns",
+            "UNIQUE constraint on partitioned table must include all partitioning columns",
         )],
     );
     assert_accepted(

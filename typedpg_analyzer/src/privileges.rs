@@ -352,6 +352,10 @@ struct RelationRequirement {
     /// `INSERT ... ON CONFLICT DO UPDATE`: the auxiliary UPDATE applies
     /// that command's policies too.
     conflict_update: bool,
+    /// `INSERT ... ON CONFLICT DO SELECT` (PostgreSQL 19): the conflicting
+    /// row it returns passes the SELECT policies, and the UPDATE ones'
+    /// USING clauses when it locks the row.
+    conflict_select: bool,
     /// A `MERGE` target: PG checks the INSERT, UPDATE and DELETE policies
     /// whichever action a row takes.
     merge_target: bool,
@@ -617,6 +621,7 @@ impl Requirements {
             entry.scanned |= rel.scanned;
             entry.only |= rel.only;
             entry.conflict_update |= rel.conflict_update;
+            entry.conflict_select |= rel.conflict_select;
             entry.merge_target |= rel.merge_target;
             entry.target_select |= rel.target_select;
             entry.view_owner |= rel.view_owner;
@@ -717,6 +722,7 @@ impl Requirements {
                     perms: 0,
                     target: None,
                     conflict_update: false,
+                    conflict_select: false,
                     merge_target: false,
                     target_select: false,
                     view_owner: false,
@@ -1989,6 +1995,16 @@ pub(crate) fn note_relation(relid: PgClassOid, perms: u32) {
         } else if perms & bits::UPDATE != 0 && rel.target != Some(TargetCommand::Insert) {
             rel.target = Some(TargetCommand::Update);
         }
+    });
+}
+
+/// The statement's INSERT target takes the SELECT path of an `ON CONFLICT
+/// DO SELECT` (PostgreSQL 19): PG checks the conflicting row against the
+/// SELECT policies, and against the UPDATE ones' USING clauses when the
+/// row is locked (the lock's UPDATE privilege is noted on its own).
+pub(crate) fn note_conflict_select(relid: PgClassOid, _locks: bool) {
+    with_relation(current_level_is_sublink(), |req| {
+        req.relation(relid).conflict_select = true;
     });
 }
 
@@ -4448,6 +4464,7 @@ impl PgCatalog {
                                     perms: bits::SELECT | if rel.locked { bits::UPDATE } else { 0 },
                                     target: None,
                                     conflict_update: false,
+                                    conflict_select: false,
                                     merge_target: false,
                                     target_select: false,
                                     view_owner: inner_as.is_some(),
@@ -4619,6 +4636,7 @@ impl PgCatalog {
                             None
                         },
                         conflict_update: rel.conflict_update,
+                        conflict_select: rel.conflict_select,
                         merge_target: false,
                         // rewriteTargetView gives the base RTE the view
                         // RTE's requiredPerms: the SELECT an outer RETURNING
@@ -4666,6 +4684,7 @@ impl PgCatalog {
                     existing.perms |= rel.perms;
                     existing.only |= rel.only;
                     existing.conflict_update |= rel.conflict_update;
+                    existing.conflict_select |= rel.conflict_select;
                     existing.merge_target |= rel.merge_target;
                     existing.target_select |= rel.target_select;
                     existing.view_owner |= rel.view_owner;
@@ -6264,6 +6283,17 @@ impl PgCatalog {
                     if target_select {
                         add(self.policy_expressions(rel.relid, 'r', who, true, true));
                     }
+                    // ON CONFLICT DO SELECT: the UPDATE policies' USING
+                    // clauses (when it locks the row) and the SELECT ones
+                    // check the conflicting row (rowsecurity.c).
+                    if rel.conflict_select {
+                        if rel.perms & bits::UPDATE != 0 {
+                            add(self.policy_expressions(rel.relid, 'w', who, true, true));
+                        }
+                        if target_select {
+                            add(self.policy_expressions(rel.relid, 'r', who, true, true));
+                        }
+                    }
                     if rel.conflict_update {
                         add(self.policy_expressions(rel.relid, 'w', who, true, true));
                         if target_select {
@@ -6475,6 +6505,7 @@ impl PgCatalog {
                         perms: bits::SELECT,
                         target: None,
                         conflict_update: false,
+                        conflict_select: false,
                         merge_target: false,
                         target_select: false,
                         view_owner: rel.check_as.is_some(),

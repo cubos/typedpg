@@ -234,9 +234,12 @@ pub(crate) fn infer_coalesce(
             })
         })?);
         let folded = super::plan_fold::fold(arg.as_ref(), snapshot);
+        // PostgreSQL 19 also drops the arguments after one proven non-NULL
+        // (expr_is_nonnullable), unfolded.
         dead = dead
             || super::plan_fold::coalesce_stops_after(folded)
-            || (!folded.known() && super::foldable::foldable(arg.as_ref(), ctx).value);
+            || (!folded.known() && super::foldable::foldable(arg.as_ref(), ctx).value)
+            || super::foldable::planner_nonnullable(arg.as_ref(), ctx);
     }
 
     // Resolve over the *full* arg list (unknowns included): the
@@ -310,11 +313,12 @@ pub(crate) fn infer_coalesce(
         crate::nonnull::StrictNode::FloatFold,
         crate::nonnull::subst::folds_as_float(type_oid, snapshot),
     );
-    let mut out = ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
+    let out = ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
         .with_collation(derive_collation(&args, type_oid, snapshot)?)
         .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
         .with_refine(branches_refine(&branches, type_oid, snapshot));
-    out.planned = super::folding::coalesce_planned(expr, &args, type_oid, ctx);
+    // PostgreSQL 19 relabels a COALESCE it folds to expose its collation
+    // (applyRelabelType): planning keeps the parsed one.
     Ok(out)
 }
 
@@ -746,18 +750,11 @@ pub(crate) fn infer_case(
         .chain(results.iter())
         .map(|(n, t)| (*n, t))
         .collect();
-    let mut out =
-        ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
-            .with_collation(collation)
-            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
-            .with_refine(branches_refine(&branches, type_oid, snapshot));
-    let result_types: Vec<ExprType> = results.iter().map(|(_, t)| t.clone()).collect();
-    out.planned = super::folding::case_planned(
-        expr,
-        &result_types,
-        default.as_ref().map(|(_, t)| t),
-        type_oid,
-        ctx,
-    );
+    let out = ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
+        .with_collation(collation)
+        .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
+        .with_refine(branches_refine(&branches, type_oid, snapshot));
+    // PostgreSQL 19 relabels a CASE it folds to expose its collation
+    // (applyRelabelType): planning keeps the parsed one.
     Ok(out)
 }

@@ -1074,7 +1074,7 @@ fn persistence_changes_follow_at_prep_change_persistence() {
         ),
         (
             "ALTER TABLE p SET UNLOGGED;",
-            "cannot change table \"p\" to unlogged because it is part of a publication",
+            "cannot change table \"p\" to unlogged because it is referenced by a publication",
         ),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
@@ -1126,8 +1126,9 @@ fn attach_partition_keeps_persistence_consistent() {
 fn detach_concurrently_and_finalize() {
     // ATExecDetachPartition refuses a concurrent detach while a default
     // partition exists; a concurrent detach always completes in a
-    // migration, so FINALIZE finds nothing pending; the detached partition
-    // keeps its partition constraint as a CHECK (none for a hash one).
+    // migration, so FINALIZE finds nothing pending. Since PostgreSQL 19 the
+    // detached partition no longer keeps its partition constraint as a
+    // CHECK.
     let setup = "CREATE TABLE p (a int) PARTITION BY RANGE (a);
                  CREATE TABLE c PARTITION OF p DEFAULT;
                  CREATE TABLE c2 PARTITION OF p FOR VALUES FROM (1) TO (2);
@@ -1183,9 +1184,9 @@ fn detach_concurrently_and_finalize() {
         ),
         (
             "0006.sql",
-            "ALTER TABLE q1 DROP CONSTRAINT q1_a_check;
-             ALTER TABLE r1 DROP CONSTRAINT r1_check;
-             ALTER TABLE l1 DROP CONSTRAINT l1_a_check;
+            "ALTER TABLE q1 ADD CONSTRAINT q1_a_check CHECK (a > 0);
+             ALTER TABLE r1 ADD CONSTRAINT r1_check CHECK (a > b);
+             ALTER TABLE l1 ADD CONSTRAINT l1_a_check CHECK (a > 0);
              ALTER TABLE h1 ADD CONSTRAINT h1_a_check CHECK (a > 0);",
         ),
     ]);
@@ -1937,11 +1938,11 @@ const RELKIND_CASES: &[(&str, Option<&str>)] = &[
     ),
     (
         "alter table pt cluster on ti",
-        Some("\"ti\" is not an index for table \"pt\""),
+        Some("ALTER action CLUSTER ON cannot be performed on relation \"pt\""),
     ),
     (
         "alter table pt set without cluster",
-        Some("cannot mark index clustered in partitioned table"),
+        Some("ALTER action SET WITHOUT CLUSTER cannot be performed on relation \"pt\""),
     ),
     (
         "alter table pt set logged",
@@ -1997,11 +1998,11 @@ const RELKIND_CASES: &[(&str, Option<&str>)] = &[
     ("alter table pt no force row level security", None),
     (
         "alter table pt inherit tt",
-        Some("cannot change inheritance of partitioned table"),
+        Some("ALTER action INHERIT cannot be performed on relation \"pt\""),
     ),
     (
         "alter table pt no inherit tt",
-        Some("relation \"tt\" is not a parent of relation \"pt\""),
+        Some("ALTER action NO INHERIT cannot be performed on relation \"pt\""),
     ),
     ("alter table pt of ct", None),
     ("alter table pt not of", Some("\"pt\" is not a typed table")),
@@ -4506,7 +4507,7 @@ const RELKIND_CASES: &[(&str, Option<&str>)] = &[
     ),
     (
         "alter table pt cluster on pti",
-        Some("cannot mark index clustered in partitioned table"),
+        Some("ALTER action CLUSTER ON cannot be performed on relation \"pt\""),
     ),
     ("alter table pt of ct", None),
     ("alter table pt not of", Some("\"pt\" is not a typed table")),
@@ -4587,11 +4588,11 @@ const RELKIND_CASES: &[(&str, Option<&str>)] = &[
     ("alter index ti owner to postgres", None),
     (
         "alter table pt set without cluster",
-        Some("cannot mark index clustered in partitioned table"),
+        Some("ALTER action SET WITHOUT CLUSTER cannot be performed on relation \"pt\""),
     ),
     (
         "alter table pt cluster on pti",
-        Some("cannot mark index clustered in partitioned table"),
+        Some("ALTER action CLUSTER ON cannot be performed on relation \"pt\""),
     ),
     (
         "create table r partition of pti for values in (1)",
@@ -4692,7 +4693,7 @@ fn a_foreign_table_refuses_index_constraints_only_where_it_is_named() {
         ),
         (
             "ALTER TABLE pp ADD COLUMN z int PRIMARY KEY;",
-            "unique constraint on partitioned table must include all partitioning columns",
+            "PRIMARY KEY constraint on partitioned table must include all partitioning columns",
         ),
         (
             "ALTER TABLE ONLY q ADD COLUMN z int REFERENCES ref (a);",
@@ -5314,37 +5315,37 @@ const TOAST_AND_ADD_COLUMN_CASES: &[(&str, Option<&str>)] = &[
     (
         "alter table pk add unique (b)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+            "UNIQUE constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
         "alter table pk add primary key (b)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+            "PRIMARY KEY constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
         "create unique index on pk (b)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+            "UNIQUE constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
         "alter table pk add constraint x exclude (b with =)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+            "EXCLUDE constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
         "create table pk2 (a int, b int, unique (b)) partition by list (a)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
+            "UNIQUE constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
         "create table pk2 (a int, b int, primary key (b)) partition by list (a)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
+            "PRIMARY KEY constraint on partitioned table must include all partitioning columns (PRIMARY KEY constraint on table \"pk2\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
@@ -5491,11 +5492,11 @@ const REWRITE_CASES: &[(&str, Option<&str>)] = &[
     ("vacuum (foo) t", Some("unrecognized VACUUM option \"foo\"")),
     (
         "vacuum (parallel) t",
-        Some("parallel option requires a value between 0 and 1024"),
+        Some("parallel requires an integer value"),
     ),
     (
         "vacuum (parallel 2000) t",
-        Some("parallel workers for vacuum must be between 0 and 1024"),
+        Some("PARALLEL option must be between 0 and 1024"),
     ),
     (
         "vacuum (parallel 'x') t",
@@ -5577,7 +5578,7 @@ const REWRITE_CASES: &[(&str, Option<&str>)] = &[
     (
         "alter table pk add unique (b)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+            "UNIQUE constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
@@ -5595,7 +5596,7 @@ const REWRITE_CASES: &[(&str, Option<&str>)] = &[
     (
         "create unique index on pk (b)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+            "UNIQUE constraint on partitioned table must include all partitioning columns (UNIQUE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
@@ -5607,7 +5608,7 @@ const REWRITE_CASES: &[(&str, Option<&str>)] = &[
     (
         "alter table pk add constraint x exclude (b with =)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
+            "EXCLUDE constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pk\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (
@@ -5625,7 +5626,7 @@ const REWRITE_CASES: &[(&str, Option<&str>)] = &[
     (
         "create table pke (a int, b int) partition by range (a); alter table pke add constraint x exclude (b with =)",
         Some(
-            "unique constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pke\" lacks column \"a\" which is part of the partition key.",
+            "EXCLUDE constraint on partitioned table must include all partitioning columns (EXCLUDE constraint on table \"pke\" lacks column \"a\" which is part of the partition key.",
         ),
     ),
     (

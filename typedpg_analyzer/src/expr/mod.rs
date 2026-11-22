@@ -532,18 +532,6 @@ impl ExprType {
         self
     }
 
-    /// What a node the planner replaces with this value ends up with: the
-    /// collation this value has once planned.
-    pub(crate) fn planned_replacement(&self) -> Planned {
-        match self.planned {
-            Planned::AsParsed => Planned::Folded {
-                collation: self.collation,
-                missing: self.no_collation.is_some(),
-            },
-            other => other,
-        }
-    }
-
     /// This value's own collation state, as a leaf node (`Var`, `Param`,
     /// `SubLink`) reading it carries it: its collation implicitly, or none
     /// at all — a conflict below it is no longer one, just `InvalidOid`.
@@ -631,13 +619,11 @@ pub(crate) enum NoCollation {
 /// What planning makes of a node's collation. CREATE TABLE AS and SELECT
 /// INTO with data (`intorel_startup`, createas.c) — unlike a view, a
 /// materialized view or WITH NO DATA, which read the parsed query — take
-/// their columns' collations from the *planned* query: by then
-/// `eval_const_expressions` has replaced a CASE whose conditions are
-/// constant by the result it picks (`CASE WHEN true THEN c1.b ELSE c2.b
-/// END` is `c1.b`, collated like it, although the CASE has no collation),
-/// subqueries have been pulled up into their Vars and SQL functions
-/// inlined. The planner never re-derives a node's collation, so only a
-/// node it replaces can change.
+/// their columns' collations from the *planned* query: by then subqueries
+/// have been pulled up into their Vars and SQL functions inlined. The
+/// planner never re-derives a node's collation, so only a node it replaces
+/// can change — and PostgreSQL 19 relabels a CASE, COALESCE or NULLIF it
+/// folds to keep the parsed one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Planned {
     /// Planning keeps the node, and the collation parse analysis gave it.
@@ -645,15 +631,8 @@ pub(crate) enum Planned {
     AsParsed,
     /// Planning may replace the node by one whose collation the analyzer
     /// doesn't know (a pulled-up subquery's expression it folds, an inlined
-    /// SQL function's body, a condition PG may fold that the analyzer
-    /// can't evaluate).
+    /// SQL function's body).
     Unknown,
-    /// Planning replaces the node by one with this collation (`None` for
-    /// its type's default), or none at all (`missing`).
-    Folded {
-        collation: Option<crate::oid::PgCollationOid>,
-        missing: bool,
-    },
 }
 
 /// The collation state [`derive_collation`] assigns a node: its collation
@@ -2861,7 +2840,6 @@ pub(crate) fn unknown_literal_as_text(
 mod column_refs;
 mod conditional;
 pub(crate) mod foldable;
-mod folding;
 mod func_call;
 mod indirection;
 pub(crate) mod inline;

@@ -320,3 +320,42 @@ pub(crate) fn check_reloptions(
     }
     Ok(())
 }
+
+/// Records the `user_catalog_table` storage parameter of a table among
+/// `options` (CREATE TABLE ... WITH, ALTER TABLE ... SET / RESET; a
+/// replacement list without it turns it off).
+pub(crate) fn note_user_catalog_table(
+    interp: &mut crate::pg_catalog::PgCatalog,
+    relid: crate::oid::PgClassOid,
+    options: &[Option<typedpg_pg_query::ast::Node>],
+    replace: bool,
+    reset: bool,
+) {
+    use typedpg_pg_query::ast::Node;
+    let given = options.iter().find_map(|o| match o.as_ref() {
+        Some(Node::DefElem(de))
+            if de.defname == "user_catalog_table" && de.defnamespace.is_empty() =>
+        {
+            Some(
+                !reset
+                    && match de.arg.as_ref() {
+                        None => true,
+                        Some(Node::String(s)) => parse_bool(&s.sval).unwrap_or(false),
+                        Some(Node::Boolean(b)) => b.boolval,
+                        Some(Node::Integer(i)) => i.ival != 0,
+                        _ => false,
+                    },
+            )
+        }
+        _ => None,
+    });
+    match given.or(replace.then_some(false)) {
+        Some(true) => {
+            interp.user_catalog_tables.insert(relid);
+        }
+        Some(false) => {
+            interp.user_catalog_tables.remove(&relid);
+        }
+        None => {}
+    }
+}

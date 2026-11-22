@@ -32,7 +32,6 @@ port/win32ntdll.h
 port/atomics/arch-arm.h
 port/atomics/arch-ppc.h
 port/atomics/generic-msvc.h
-port/atomics/generic-sunpro.h
 port/win32/arpa/inet.h
 port/win32/dlfcn.h
 port/win32/grp.h

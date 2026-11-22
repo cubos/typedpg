@@ -210,19 +210,35 @@ fn foreign_keys_over_generated_columns_restrict_their_actions() {
 }
 
 #[test]
-fn statistics_on_virtual_columns_are_rejected() {
-    let msg = "statistics creation on virtual generated columns is not supported";
-    assert_err(T, "CREATE STATISTICS s1 ON a, b FROM t;", msg);
-    assert_err(T, "CREATE STATISTICS s3 ON (b + 1), a FROM t;", msg);
+fn statistics_on_virtual_columns_are_built_as_expressions() {
+    // PostgreSQL 19 builds extended statistics on a virtual generated
+    // column as on an expression: alone too, as univariate statistics.
+    build_db(&[
+        ("0001.sql", T),
+        (
+            "0002.sql",
+            "CREATE STATISTICS s1 ON a, b FROM t;
+             CREATE STATISTICS s3 ON (b + 1), a FROM t;
+             CREATE STATISTICS s4 ON b FROM t;
+             CREATE STATISTICS s5 ON (b) FROM t;
+             CREATE STATISTICS s2 ON a, c FROM t;",
+        ),
+    ]);
+    assert_err(
+        T,
+        "CREATE STATISTICS s6 (ndistinct) ON b FROM t;",
+        "cannot specify statistics kinds when building univariate statistics",
+    );
+    assert_err(
+        T,
+        "CREATE STATISTICS s7 ON b, b FROM t;",
+        "duplicate expression in statistics definition",
+    );
     assert_err(
         T,
         "ALTER TABLE t ALTER COLUMN b SET STATISTICS 10;",
         "cannot alter statistics on virtual generated column \"b\"",
     );
-    build_db(&[
-        ("0001.sql", T),
-        ("0002.sql", "CREATE STATISTICS s2 ON a, c FROM t;"),
-    ]);
 }
 
 #[test]
@@ -485,13 +501,7 @@ fn drop_expression_reaches_the_children() {
 }
 
 #[test]
-fn set_expression_of_a_virtual_column_needs_a_table_without_checks_or_publications() {
-    assert_err(
-        "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) VIRTUAL CHECK (b < 50));",
-        "ALTER TABLE t ALTER COLUMN b SET EXPRESSION AS (a * 2);",
-        "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in \
-         tables with check constraints",
-    );
+fn set_expression_of_a_virtual_column_needs_a_table_without_publications() {
     assert_err(
         "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) VIRTUAL);
          CREATE PUBLICATION p FOR TABLE t;",
@@ -504,16 +514,22 @@ fn set_expression_of_a_virtual_column_needs_a_table_without_checks_or_publicatio
         "ALTER TABLE t ALTER COLUMN xmin SET EXPRESSION AS (1);",
         "cannot alter system column \"xmin\"",
     );
-    build_db(&[
-        (
-            "0001.sql",
-            "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) STORED CHECK (b < 50));",
-        ),
-        (
-            "0002.sql",
-            "ALTER TABLE t ALTER COLUMN b SET EXPRESSION AS (a * 2);",
-        ),
-    ]);
+    // PostgreSQL 19 rebuilds the CHECK constraints of a virtual column
+    // given a new expression, as it does a stored one's.
+    for kind in ["STORED", "VIRTUAL"] {
+        build_db(&[
+            (
+                "0001.sql",
+                &format!(
+                    "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a) {kind} CHECK (b < 50));"
+                ),
+            ),
+            (
+                "0002.sql",
+                "ALTER TABLE t ALTER COLUMN b SET EXPRESSION AS (a * 2);",
+            ),
+        ]);
+    }
 }
 
 #[test]

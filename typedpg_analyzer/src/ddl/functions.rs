@@ -320,6 +320,9 @@ fn check_set_item(interp: &PgCatalog, item: &ast::Node) -> Result<(), DdlError> 
     if matches!(kind, VariableSetKind::VarResetAll) {
         return Ok(());
     }
+    if kind == VariableSetKind::VarSetValue && super::guc::null_arg(&set.name, &set.args)? {
+        return super::guc::check_settable(interp, &set.name).map(|_| ());
+    }
     let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned() else {
         return Ok(());
     };
@@ -970,7 +973,7 @@ fn interpret_as_clause(
 
 /// The C function names of the built-in (`LANGUAGE internal`) functions,
 /// sorted (`SELECT DISTINCT prosrc FROM pg_proc WHERE prolang = 12` on
-/// PostgreSQL 18.7 — the entries of `fmgr_builtins`).
+/// PostgreSQL 19.0 — the entries of `fmgr_builtins`).
 const BUILTIN_PROSRC: &str = include_str!("builtin_prosrc.txt");
 
 /// `fmgr_internal_validator` (pg_proc.c): a `LANGUAGE internal` function's

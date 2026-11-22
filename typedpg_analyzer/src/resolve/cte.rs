@@ -77,12 +77,9 @@ pub(crate) fn analyze_cte(
     let pulled_up = inlined == Some(true)
         && matches!(cte_query, ast::Node::SelectStmt(sel)
             if super::deferred::plan_of(sel, snapshot) == super::deferred::Plan::PulledUp);
-    let planned_in = |p: crate::expr::Planned| match p {
-        crate::expr::Planned::Folded { .. } if pulled_up => Some(p),
-        _ if p == crate::expr::Planned::AsParsed || inlined == Some(false) => {
-            Some(crate::expr::Planned::AsParsed)
-        }
-        _ => None,
+    let planned_in = |p: crate::expr::Planned| {
+        (p == crate::expr::Planned::AsParsed || inlined == Some(false))
+            .then_some(crate::expr::Planned::AsParsed)
     };
     // An inlined CTE is a subquery: a trivial scan over it may be removed
     // (`removable`: its level summary says it is, when planned on its own).

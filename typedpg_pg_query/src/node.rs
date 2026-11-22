@@ -245,9 +245,9 @@ pub enum NodeRef<'a> {
     AlterDatabaseSetStmt(&'a ast::AlterDatabaseSetStmt),
     DropdbStmt(&'a ast::DropdbStmt),
     AlterSystemStmt(&'a ast::AlterSystemStmt),
-    ClusterStmt(&'a ast::ClusterStmt),
     VacuumStmt(&'a ast::VacuumStmt),
     VacuumRelation(&'a ast::VacuumRelation),
+    RepackStmt(&'a ast::RepackStmt),
     ExplainStmt(&'a ast::ExplainStmt),
     CreateTableAsStmt(&'a ast::CreateTableAsStmt),
     RefreshMatViewStmt(&'a ast::RefreshMatViewStmt),
@@ -268,11 +268,13 @@ pub enum NodeRef<'a> {
     AlterTsConfigurationStmt(&'a ast::AlterTsConfigurationStmt),
     PublicationTable(&'a ast::PublicationTable),
     PublicationObjSpec(&'a ast::PublicationObjSpec),
+    PublicationAllObjSpec(&'a ast::PublicationAllObjSpec),
     CreatePublicationStmt(&'a ast::CreatePublicationStmt),
     AlterPublicationStmt(&'a ast::AlterPublicationStmt),
     CreateSubscriptionStmt(&'a ast::CreateSubscriptionStmt),
     AlterSubscriptionStmt(&'a ast::AlterSubscriptionStmt),
     DropSubscriptionStmt(&'a ast::DropSubscriptionStmt),
+    WaitStmt(&'a ast::WaitStmt),
     Integer(&'a ast::Integer),
     Float(&'a ast::Float),
     Boolean(&'a ast::Boolean),
@@ -522,9 +524,9 @@ pub enum NodeMut<'a> {
     AlterDatabaseSetStmt(&'a mut ast::AlterDatabaseSetStmt),
     DropdbStmt(&'a mut ast::DropdbStmt),
     AlterSystemStmt(&'a mut ast::AlterSystemStmt),
-    ClusterStmt(&'a mut ast::ClusterStmt),
     VacuumStmt(&'a mut ast::VacuumStmt),
     VacuumRelation(&'a mut ast::VacuumRelation),
+    RepackStmt(&'a mut ast::RepackStmt),
     ExplainStmt(&'a mut ast::ExplainStmt),
     CreateTableAsStmt(&'a mut ast::CreateTableAsStmt),
     RefreshMatViewStmt(&'a mut ast::RefreshMatViewStmt),
@@ -545,11 +547,13 @@ pub enum NodeMut<'a> {
     AlterTsConfigurationStmt(&'a mut ast::AlterTsConfigurationStmt),
     PublicationTable(&'a mut ast::PublicationTable),
     PublicationObjSpec(&'a mut ast::PublicationObjSpec),
+    PublicationAllObjSpec(&'a mut ast::PublicationAllObjSpec),
     CreatePublicationStmt(&'a mut ast::CreatePublicationStmt),
     AlterPublicationStmt(&'a mut ast::AlterPublicationStmt),
     CreateSubscriptionStmt(&'a mut ast::CreateSubscriptionStmt),
     AlterSubscriptionStmt(&'a mut ast::AlterSubscriptionStmt),
     DropSubscriptionStmt(&'a mut ast::DropSubscriptionStmt),
+    WaitStmt(&'a mut ast::WaitStmt),
     Integer(&'a mut ast::Integer),
     Float(&'a mut ast::Float),
     Boolean(&'a mut ast::Boolean),
@@ -799,9 +803,9 @@ impl ast::Node {
             Self::AlterDatabaseSetStmt(x) => NodeRef::AlterDatabaseSetStmt(x),
             Self::DropdbStmt(x) => NodeRef::DropdbStmt(x),
             Self::AlterSystemStmt(x) => NodeRef::AlterSystemStmt(x),
-            Self::ClusterStmt(x) => NodeRef::ClusterStmt(x),
             Self::VacuumStmt(x) => NodeRef::VacuumStmt(x),
             Self::VacuumRelation(x) => NodeRef::VacuumRelation(x),
+            Self::RepackStmt(x) => NodeRef::RepackStmt(x),
             Self::ExplainStmt(x) => NodeRef::ExplainStmt(x),
             Self::CreateTableAsStmt(x) => NodeRef::CreateTableAsStmt(x),
             Self::RefreshMatViewStmt(x) => NodeRef::RefreshMatViewStmt(x),
@@ -822,11 +826,13 @@ impl ast::Node {
             Self::AlterTsConfigurationStmt(x) => NodeRef::AlterTsConfigurationStmt(x),
             Self::PublicationTable(x) => NodeRef::PublicationTable(x),
             Self::PublicationObjSpec(x) => NodeRef::PublicationObjSpec(x),
+            Self::PublicationAllObjSpec(x) => NodeRef::PublicationAllObjSpec(x),
             Self::CreatePublicationStmt(x) => NodeRef::CreatePublicationStmt(x),
             Self::AlterPublicationStmt(x) => NodeRef::AlterPublicationStmt(x),
             Self::CreateSubscriptionStmt(x) => NodeRef::CreateSubscriptionStmt(x),
             Self::AlterSubscriptionStmt(x) => NodeRef::AlterSubscriptionStmt(x),
             Self::DropSubscriptionStmt(x) => NodeRef::DropSubscriptionStmt(x),
+            Self::WaitStmt(x) => NodeRef::WaitStmt(x),
             Self::Integer(x) => NodeRef::Integer(x),
             Self::Float(x) => NodeRef::Float(x),
             Self::Boolean(x) => NodeRef::Boolean(x),
@@ -1078,9 +1084,9 @@ impl ast::Node {
             Self::AlterDatabaseSetStmt(x) => NodeMut::AlterDatabaseSetStmt(&mut **x),
             Self::DropdbStmt(x) => NodeMut::DropdbStmt(&mut **x),
             Self::AlterSystemStmt(x) => NodeMut::AlterSystemStmt(&mut **x),
-            Self::ClusterStmt(x) => NodeMut::ClusterStmt(&mut **x),
             Self::VacuumStmt(x) => NodeMut::VacuumStmt(&mut **x),
             Self::VacuumRelation(x) => NodeMut::VacuumRelation(&mut **x),
+            Self::RepackStmt(x) => NodeMut::RepackStmt(&mut **x),
             Self::ExplainStmt(x) => NodeMut::ExplainStmt(&mut **x),
             Self::CreateTableAsStmt(x) => NodeMut::CreateTableAsStmt(&mut **x),
             Self::RefreshMatViewStmt(x) => NodeMut::RefreshMatViewStmt(&mut **x),
@@ -1101,11 +1107,13 @@ impl ast::Node {
             Self::AlterTsConfigurationStmt(x) => NodeMut::AlterTsConfigurationStmt(&mut **x),
             Self::PublicationTable(x) => NodeMut::PublicationTable(&mut **x),
             Self::PublicationObjSpec(x) => NodeMut::PublicationObjSpec(&mut **x),
+            Self::PublicationAllObjSpec(x) => NodeMut::PublicationAllObjSpec(&mut **x),
             Self::CreatePublicationStmt(x) => NodeMut::CreatePublicationStmt(&mut **x),
             Self::AlterPublicationStmt(x) => NodeMut::AlterPublicationStmt(&mut **x),
             Self::CreateSubscriptionStmt(x) => NodeMut::CreateSubscriptionStmt(&mut **x),
             Self::AlterSubscriptionStmt(x) => NodeMut::AlterSubscriptionStmt(&mut **x),
             Self::DropSubscriptionStmt(x) => NodeMut::DropSubscriptionStmt(&mut **x),
+            Self::WaitStmt(x) => NodeMut::WaitStmt(&mut **x),
             Self::Integer(x) => NodeMut::Integer(&mut **x),
             Self::Float(x) => NodeMut::Float(&mut **x),
             Self::Boolean(x) => NodeMut::Boolean(&mut **x),
@@ -1360,9 +1368,9 @@ impl NodeMut<'_> {
             NodeMut::AlterDatabaseSetStmt(x) => NodeMut::AlterDatabaseSetStmt(&mut **x),
             NodeMut::DropdbStmt(x) => NodeMut::DropdbStmt(&mut **x),
             NodeMut::AlterSystemStmt(x) => NodeMut::AlterSystemStmt(&mut **x),
-            NodeMut::ClusterStmt(x) => NodeMut::ClusterStmt(&mut **x),
             NodeMut::VacuumStmt(x) => NodeMut::VacuumStmt(&mut **x),
             NodeMut::VacuumRelation(x) => NodeMut::VacuumRelation(&mut **x),
+            NodeMut::RepackStmt(x) => NodeMut::RepackStmt(&mut **x),
             NodeMut::ExplainStmt(x) => NodeMut::ExplainStmt(&mut **x),
             NodeMut::CreateTableAsStmt(x) => NodeMut::CreateTableAsStmt(&mut **x),
             NodeMut::RefreshMatViewStmt(x) => NodeMut::RefreshMatViewStmt(&mut **x),
@@ -1383,11 +1391,13 @@ impl NodeMut<'_> {
             NodeMut::AlterTsConfigurationStmt(x) => NodeMut::AlterTsConfigurationStmt(&mut **x),
             NodeMut::PublicationTable(x) => NodeMut::PublicationTable(&mut **x),
             NodeMut::PublicationObjSpec(x) => NodeMut::PublicationObjSpec(&mut **x),
+            NodeMut::PublicationAllObjSpec(x) => NodeMut::PublicationAllObjSpec(&mut **x),
             NodeMut::CreatePublicationStmt(x) => NodeMut::CreatePublicationStmt(&mut **x),
             NodeMut::AlterPublicationStmt(x) => NodeMut::AlterPublicationStmt(&mut **x),
             NodeMut::CreateSubscriptionStmt(x) => NodeMut::CreateSubscriptionStmt(&mut **x),
             NodeMut::AlterSubscriptionStmt(x) => NodeMut::AlterSubscriptionStmt(&mut **x),
             NodeMut::DropSubscriptionStmt(x) => NodeMut::DropSubscriptionStmt(&mut **x),
+            NodeMut::WaitStmt(x) => NodeMut::WaitStmt(&mut **x),
             NodeMut::Integer(x) => NodeMut::Integer(&mut **x),
             NodeMut::Float(x) => NodeMut::Float(&mut **x),
             NodeMut::Boolean(x) => NodeMut::Boolean(&mut **x),
@@ -1461,6 +1471,7 @@ impl NodeRef<'_> {
             NodeRef::RangeTableFuncCol(m) => (m.location >= 0).then_some(m.location),
             NodeRef::RangeTableSample(m) => (m.location >= 0).then_some(m.location),
             NodeRef::ColumnDef(m) => (m.location >= 0).then_some(m.location),
+            NodeRef::IndexElem(m) => (m.location >= 0).then_some(m.location),
             NodeRef::DefElem(m) => (m.location >= 0).then_some(m.location),
             NodeRef::XmlSerialize(m) => (m.location >= 0).then_some(m.location),
             NodeRef::PartitionElem(m) => (m.location >= 0).then_some(m.location),
@@ -1489,10 +1500,12 @@ impl NodeRef<'_> {
             NodeRef::PlAssignStmt(m) => (m.location >= 0).then_some(m.location),
             NodeRef::VariableSetStmt(m) => (m.location >= 0).then_some(m.location),
             NodeRef::Constraint(m) => (m.location >= 0).then_some(m.location),
+            NodeRef::FetchStmt(m) => (m.location >= 0).then_some(m.location),
             NodeRef::FunctionParameter(m) => (m.location >= 0).then_some(m.location),
             NodeRef::TransactionStmt(m) => (m.location >= 0).then_some(m.location),
             NodeRef::DeallocateStmt(m) => (m.location >= 0).then_some(m.location),
             NodeRef::PublicationObjSpec(m) => (m.location >= 0).then_some(m.location),
+            NodeRef::PublicationAllObjSpec(m) => (m.location >= 0).then_some(m.location),
             NodeRef::AConst(m) => (m.location >= 0).then_some(m.location),
             _ => None,
         }
@@ -1736,9 +1749,9 @@ pub(crate) fn children<'a>(node: NodeRef<'a>, out: &mut dyn FnMut(NodeRef<'a>)) 
         NodeRef::AlterDatabaseSetStmt(m) => walk_alter_database_set_stmt(m, out),
         NodeRef::DropdbStmt(m) => walk_dropdb_stmt(m, out),
         NodeRef::AlterSystemStmt(m) => walk_alter_system_stmt(m, out),
-        NodeRef::ClusterStmt(m) => walk_cluster_stmt(m, out),
         NodeRef::VacuumStmt(m) => walk_vacuum_stmt(m, out),
         NodeRef::VacuumRelation(m) => walk_vacuum_relation(m, out),
+        NodeRef::RepackStmt(m) => walk_repack_stmt(m, out),
         NodeRef::ExplainStmt(m) => walk_explain_stmt(m, out),
         NodeRef::CreateTableAsStmt(m) => walk_create_table_as_stmt(m, out),
         NodeRef::RefreshMatViewStmt(m) => walk_refresh_mat_view_stmt(m, out),
@@ -1759,11 +1772,13 @@ pub(crate) fn children<'a>(node: NodeRef<'a>, out: &mut dyn FnMut(NodeRef<'a>)) 
         NodeRef::AlterTsConfigurationStmt(m) => walk_alter_ts_configuration_stmt(m, out),
         NodeRef::PublicationTable(m) => walk_publication_table(m, out),
         NodeRef::PublicationObjSpec(m) => walk_publication_obj_spec(m, out),
+        NodeRef::PublicationAllObjSpec(m) => walk_publication_all_obj_spec(m, out),
         NodeRef::CreatePublicationStmt(m) => walk_create_publication_stmt(m, out),
         NodeRef::AlterPublicationStmt(m) => walk_alter_publication_stmt(m, out),
         NodeRef::CreateSubscriptionStmt(m) => walk_create_subscription_stmt(m, out),
         NodeRef::AlterSubscriptionStmt(m) => walk_alter_subscription_stmt(m, out),
         NodeRef::DropSubscriptionStmt(m) => walk_drop_subscription_stmt(m, out),
+        NodeRef::WaitStmt(m) => walk_wait_stmt(m, out),
         NodeRef::Integer(m) => walk_integer(m, out),
         NodeRef::Float(m) => walk_float(m, out),
         NodeRef::Boolean(m) => walk_boolean(m, out),
@@ -2023,9 +2038,9 @@ fn walk_mut<'a>(node: NodeMut<'a>, out: &mut dyn MutVisitor<'a>) {
         NodeMut::AlterDatabaseSetStmt(m) => walk_mut_alter_database_set_stmt(m, out),
         NodeMut::DropdbStmt(m) => walk_mut_dropdb_stmt(m, out),
         NodeMut::AlterSystemStmt(m) => walk_mut_alter_system_stmt(m, out),
-        NodeMut::ClusterStmt(m) => walk_mut_cluster_stmt(m, out),
         NodeMut::VacuumStmt(m) => walk_mut_vacuum_stmt(m, out),
         NodeMut::VacuumRelation(m) => walk_mut_vacuum_relation(m, out),
+        NodeMut::RepackStmt(m) => walk_mut_repack_stmt(m, out),
         NodeMut::ExplainStmt(m) => walk_mut_explain_stmt(m, out),
         NodeMut::CreateTableAsStmt(m) => walk_mut_create_table_as_stmt(m, out),
         NodeMut::RefreshMatViewStmt(m) => walk_mut_refresh_mat_view_stmt(m, out),
@@ -2046,11 +2061,13 @@ fn walk_mut<'a>(node: NodeMut<'a>, out: &mut dyn MutVisitor<'a>) {
         NodeMut::AlterTsConfigurationStmt(m) => walk_mut_alter_ts_configuration_stmt(m, out),
         NodeMut::PublicationTable(m) => walk_mut_publication_table(m, out),
         NodeMut::PublicationObjSpec(m) => walk_mut_publication_obj_spec(m, out),
+        NodeMut::PublicationAllObjSpec(m) => walk_mut_publication_all_obj_spec(m, out),
         NodeMut::CreatePublicationStmt(m) => walk_mut_create_publication_stmt(m, out),
         NodeMut::AlterPublicationStmt(m) => walk_mut_alter_publication_stmt(m, out),
         NodeMut::CreateSubscriptionStmt(m) => walk_mut_create_subscription_stmt(m, out),
         NodeMut::AlterSubscriptionStmt(m) => walk_mut_alter_subscription_stmt(m, out),
         NodeMut::DropSubscriptionStmt(m) => walk_mut_drop_subscription_stmt(m, out),
+        NodeMut::WaitStmt(m) => walk_mut_wait_stmt(m, out),
         NodeMut::Integer(m) => walk_mut_integer(m, out),
         NodeMut::Float(m) => walk_mut_float(m, out),
         NodeMut::Boolean(m) => walk_mut_boolean(m, out),
@@ -3016,6 +3033,13 @@ fn walk_json_constructor_expr<'a>(
         let x: &'a ast::JsonReturning = x;
         out(NodeRef::JsonReturning(x));
     }
+    if let Some(x) = &m.orig_query {
+        out(x.to_ref());
+    }
+    if let Some(x) = &m.format {
+        let x: &'a ast::JsonFormat = x;
+        out(NodeRef::JsonFormat(x));
+    }
 }
 
 fn walk_mut_json_constructor_expr<'a>(
@@ -3034,6 +3058,13 @@ fn walk_mut_json_constructor_expr<'a>(
     if let Some(x) = &mut m.returning {
         let x: &'a mut ast::JsonReturning = x;
         out.node(NodeMut::JsonReturning(x));
+    }
+    if let Some(x) = &mut m.orig_query {
+        out.slot(x);
+    }
+    if let Some(x) = &mut m.format {
+        let x: &'a mut ast::JsonFormat = x;
+        out.node(NodeMut::JsonFormat(x));
     }
 }
 
@@ -7420,26 +7451,6 @@ fn walk_mut_alter_system_stmt<'a>(m: &'a mut ast::AlterSystemStmt, out: &mut dyn
     }
 }
 
-fn walk_cluster_stmt<'a>(m: &'a ast::ClusterStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
-    if let Some(x) = &m.relation {
-        let x: &'a ast::RangeVar = x;
-        out(NodeRef::RangeVar(x));
-    }
-    for x in m.params.iter().flatten() {
-        out(x.to_ref());
-    }
-}
-
-fn walk_mut_cluster_stmt<'a>(m: &'a mut ast::ClusterStmt, out: &mut dyn MutVisitor<'a>) {
-    if let Some(x) = &mut m.relation {
-        let x: &'a mut ast::RangeVar = x;
-        out.node(NodeMut::RangeVar(x));
-    }
-    for x in m.params.iter_mut().flatten() {
-        out.slot(x);
-    }
-}
-
 fn walk_vacuum_stmt<'a>(m: &'a ast::VacuumStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
     for x in m.options.iter().flatten() {
         out(x.to_ref());
@@ -7474,6 +7485,26 @@ fn walk_mut_vacuum_relation<'a>(m: &'a mut ast::VacuumRelation, out: &mut dyn Mu
         out.node(NodeMut::RangeVar(x));
     }
     for x in m.va_cols.iter_mut().flatten() {
+        out.slot(x);
+    }
+}
+
+fn walk_repack_stmt<'a>(m: &'a ast::RepackStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
+    if let Some(x) = &m.relation {
+        let x: &'a ast::VacuumRelation = x;
+        out(NodeRef::VacuumRelation(x));
+    }
+    for x in m.params.iter().flatten() {
+        out(x.to_ref());
+    }
+}
+
+fn walk_mut_repack_stmt<'a>(m: &'a mut ast::RepackStmt, out: &mut dyn MutVisitor<'a>) {
+    if let Some(x) = &mut m.relation {
+        let x: &'a mut ast::VacuumRelation = x;
+        out.node(NodeMut::VacuumRelation(x));
+    }
+    for x in m.params.iter_mut().flatten() {
         out.slot(x);
     }
 }
@@ -7539,9 +7570,17 @@ fn walk_mut_refresh_mat_view_stmt<'a>(
     }
 }
 
-fn walk_check_point_stmt<'a>(m: &'a ast::CheckPointStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
+fn walk_check_point_stmt<'a>(m: &'a ast::CheckPointStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
+    for x in m.options.iter().flatten() {
+        out(x.to_ref());
+    }
+}
 
-fn walk_mut_check_point_stmt<'a>(m: &'a mut ast::CheckPointStmt, out: &mut dyn MutVisitor<'a>) {}
+fn walk_mut_check_point_stmt<'a>(m: &'a mut ast::CheckPointStmt, out: &mut dyn MutVisitor<'a>) {
+    for x in m.options.iter_mut().flatten() {
+        out.slot(x);
+    }
+}
 
 fn walk_discard_stmt<'a>(m: &'a ast::DiscardStmt, out: &mut dyn FnMut(NodeRef<'a>)) {}
 
@@ -7850,6 +7889,24 @@ fn walk_mut_publication_obj_spec<'a>(
     }
 }
 
+fn walk_publication_all_obj_spec<'a>(
+    m: &'a ast::PublicationAllObjSpec,
+    out: &mut dyn FnMut(NodeRef<'a>),
+) {
+    for x in m.except_tables.iter().flatten() {
+        out(x.to_ref());
+    }
+}
+
+fn walk_mut_publication_all_obj_spec<'a>(
+    m: &'a mut ast::PublicationAllObjSpec,
+    out: &mut dyn MutVisitor<'a>,
+) {
+    for x in m.except_tables.iter_mut().flatten() {
+        out.slot(x);
+    }
+}
+
 fn walk_create_publication_stmt<'a>(
     m: &'a ast::CreatePublicationStmt,
     out: &mut dyn FnMut(NodeRef<'a>),
@@ -7956,6 +8013,18 @@ fn walk_mut_drop_subscription_stmt<'a>(
     m: &'a mut ast::DropSubscriptionStmt,
     out: &mut dyn MutVisitor<'a>,
 ) {
+}
+
+fn walk_wait_stmt<'a>(m: &'a ast::WaitStmt, out: &mut dyn FnMut(NodeRef<'a>)) {
+    for x in m.options.iter().flatten() {
+        out(x.to_ref());
+    }
+}
+
+fn walk_mut_wait_stmt<'a>(m: &'a mut ast::WaitStmt, out: &mut dyn MutVisitor<'a>) {
+    for x in m.options.iter_mut().flatten() {
+        out.slot(x);
+    }
 }
 
 fn walk_scan_token<'a>(m: &'a ast::ScanToken, out: &mut dyn FnMut(NodeRef<'a>)) {}

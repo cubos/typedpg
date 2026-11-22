@@ -4,9 +4,9 @@
 //! function rejects encodings it doesn't implement (`CHECK_ENCODING_CONVERSION_ARGS`,
 //! or the ISO 8859 / WIN family lookups). The analyzer can't run the C code,
 //! so this table records, per `pg_catalog` conversion function, the
-//! `(source, destination)` pairs PG 18 accepts. It was derived by running
-//! `CREATE CONVERSION` on a live PG 18 for every conversion function and every
-//! pair of non-`SQL_ASCII` encodings (141,204 attempts, 128 accepted); the
+//! `(source, destination)` pairs PG 19 accepts. It was derived by running
+//! `CREATE CONVERSION` on a live PG 19 for every conversion function and every
+//! pair of non-`SQL_ASCII` encodings (86,400 attempts, 98 accepted); the
 //! error rule in [`super::conversions`] reproduces every rejection message
 //! of that run.
 
@@ -19,7 +19,6 @@ pub(super) const ENCODING_IDS: &[(&str, u32)] = &[
     ("EUC_TW", 4),
     ("EUC_JIS_2004", 5),
     ("UTF8", 6),
-    ("MULE_INTERNAL", 7),
     ("LATIN1", 8),
     ("LATIN2", 9),
     ("LATIN3", 10),
@@ -59,22 +58,17 @@ pub(super) const ENCODING_IDS: &[(&str, u32)] = &[
 /// Built-in conversion function → the `(source, destination)` pairs it accepts.
 pub(super) const ACCEPTED_PAIRS: &[(&str, &[(&str, &str)])] = &[
     ("big5_to_euc_tw", &[("BIG5", "EUC_TW")]),
-    ("big5_to_mic", &[("BIG5", "MULE_INTERNAL")]),
     ("big5_to_utf8", &[("BIG5", "UTF8")]),
-    ("euc_cn_to_mic", &[("EUC_CN", "MULE_INTERNAL")]),
     ("euc_cn_to_utf8", &[("EUC_CN", "UTF8")]),
     (
         "euc_jis_2004_to_shift_jis_2004",
         &[("EUC_JIS_2004", "SHIFT_JIS_2004")],
     ),
     ("euc_jis_2004_to_utf8", &[("EUC_JIS_2004", "UTF8")]),
-    ("euc_jp_to_mic", &[("EUC_JP", "MULE_INTERNAL")]),
     ("euc_jp_to_sjis", &[("EUC_JP", "SJIS")]),
     ("euc_jp_to_utf8", &[("EUC_JP", "UTF8")]),
-    ("euc_kr_to_mic", &[("EUC_KR", "MULE_INTERNAL")]),
     ("euc_kr_to_utf8", &[("EUC_KR", "UTF8")]),
     ("euc_tw_to_big5", &[("EUC_TW", "BIG5")]),
-    ("euc_tw_to_mic", &[("EUC_TW", "MULE_INTERNAL")]),
     ("euc_tw_to_utf8", &[("EUC_TW", "UTF8")]),
     ("gb18030_to_utf8", &[("GB18030", "UTF8")]),
     ("gbk_to_utf8", &[("GBK", "UTF8")]),
@@ -98,43 +92,21 @@ pub(super) const ACCEPTED_PAIRS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("iso_to_koi8r", &[("ISO_8859_5", "KOI8R")]),
-    ("iso_to_mic", &[("ISO_8859_5", "MULE_INTERNAL")]),
     ("iso_to_win1251", &[("ISO_8859_5", "WIN1251")]),
     ("iso_to_win866", &[("ISO_8859_5", "WIN866")]),
     ("johab_to_utf8", &[("JOHAB", "UTF8")]),
     ("koi8r_to_iso", &[("KOI8R", "ISO_8859_5")]),
-    ("koi8r_to_mic", &[("KOI8R", "MULE_INTERNAL")]),
     ("koi8r_to_utf8", &[("KOI8R", "UTF8")]),
     ("koi8r_to_win1251", &[("KOI8R", "WIN1251")]),
     ("koi8r_to_win866", &[("KOI8R", "WIN866")]),
     ("koi8u_to_utf8", &[("KOI8U", "UTF8")]),
-    ("latin1_to_mic", &[("LATIN1", "MULE_INTERNAL")]),
-    ("latin2_to_mic", &[("LATIN2", "MULE_INTERNAL")]),
     ("latin2_to_win1250", &[("LATIN2", "WIN1250")]),
-    ("latin3_to_mic", &[("LATIN3", "MULE_INTERNAL")]),
-    ("latin4_to_mic", &[("LATIN4", "MULE_INTERNAL")]),
-    ("mic_to_big5", &[("MULE_INTERNAL", "BIG5")]),
-    ("mic_to_euc_cn", &[("MULE_INTERNAL", "EUC_CN")]),
-    ("mic_to_euc_jp", &[("MULE_INTERNAL", "EUC_JP")]),
-    ("mic_to_euc_kr", &[("MULE_INTERNAL", "EUC_KR")]),
-    ("mic_to_euc_tw", &[("MULE_INTERNAL", "EUC_TW")]),
-    ("mic_to_iso", &[("MULE_INTERNAL", "ISO_8859_5")]),
-    ("mic_to_koi8r", &[("MULE_INTERNAL", "KOI8R")]),
-    ("mic_to_latin1", &[("MULE_INTERNAL", "LATIN1")]),
-    ("mic_to_latin2", &[("MULE_INTERNAL", "LATIN2")]),
-    ("mic_to_latin3", &[("MULE_INTERNAL", "LATIN3")]),
-    ("mic_to_latin4", &[("MULE_INTERNAL", "LATIN4")]),
-    ("mic_to_sjis", &[("MULE_INTERNAL", "SJIS")]),
-    ("mic_to_win1250", &[("MULE_INTERNAL", "WIN1250")]),
-    ("mic_to_win1251", &[("MULE_INTERNAL", "WIN1251")]),
-    ("mic_to_win866", &[("MULE_INTERNAL", "WIN866")]),
     (
         "shift_jis_2004_to_euc_jis_2004",
         &[("SHIFT_JIS_2004", "EUC_JIS_2004")],
     ),
     ("shift_jis_2004_to_utf8", &[("SHIFT_JIS_2004", "UTF8")]),
     ("sjis_to_euc_jp", &[("SJIS", "EUC_JP")]),
-    ("sjis_to_mic", &[("SJIS", "MULE_INTERNAL")]),
     ("sjis_to_utf8", &[("SJIS", "UTF8")]),
     ("uhc_to_utf8", &[("UHC", "UTF8")]),
     ("utf8_to_big5", &[("UTF8", "BIG5")]),
@@ -187,14 +159,11 @@ pub(super) const ACCEPTED_PAIRS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("win1250_to_latin2", &[("WIN1250", "LATIN2")]),
-    ("win1250_to_mic", &[("WIN1250", "MULE_INTERNAL")]),
     ("win1251_to_iso", &[("WIN1251", "ISO_8859_5")]),
     ("win1251_to_koi8r", &[("WIN1251", "KOI8R")]),
-    ("win1251_to_mic", &[("WIN1251", "MULE_INTERNAL")]),
     ("win1251_to_win866", &[("WIN1251", "WIN866")]),
     ("win866_to_iso", &[("WIN866", "ISO_8859_5")]),
     ("win866_to_koi8r", &[("WIN866", "KOI8R")]),
-    ("win866_to_mic", &[("WIN866", "MULE_INTERNAL")]),
     ("win866_to_win1251", &[("WIN866", "WIN1251")]),
     (
         "win_to_utf8",

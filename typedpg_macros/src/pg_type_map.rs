@@ -42,6 +42,7 @@ static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     ("pg_catalog", "xid", "u32"),
     ("pg_catalog", "cid", "u32"),
     ("pg_catalog", "xid8", "::typedpg::types::Xid8"),
+    ("pg_catalog", "oid8", "::typedpg::types::Oid8"),
     ("pg_catalog", "json", "::serde_json::Value"),
     ("pg_catalog", "jsonb", "::serde_json::Value"),
     ("pg_catalog", "cidr", "::cidr::IpCidr"),

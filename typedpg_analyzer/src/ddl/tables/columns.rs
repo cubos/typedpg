@@ -2641,18 +2641,8 @@ pub(crate) fn set_expression(
             cmd.name
         )
     };
-    if kind == AttGenerated::Virtual
-        && interp
-            .pg_constraint
-            .values()
-            .any(|c| c.conrelid == relid && c.contype == ConType::Check)
-    {
-        return Err(DdlError::UnsupportedDdl(format!(
-            "ALTER TABLE / SET EXPRESSION is not supported for virtual generated columns in \
-             tables with check constraints {}",
-            virtual_detail()
-        )));
-    }
+    // PostgreSQL 19 lifted the restriction for tables with CHECK
+    // constraints: they are rebuilt with the column.
     if kind == AttGenerated::Virtual
         && crate::ddl::publications::relation_in_publication(interp, relid)
     {

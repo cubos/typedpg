@@ -1433,13 +1433,18 @@ fn validate_on_conflict_target(
             ));
         }
         // An exclusion constraint's index — an EXCLUDE one, or PG 18's
-        // WITHOUT OVERLAPS key — can't arbitrate an update.
-        if on_conflict.action == ast::OnConflictAction::OnconflictUpdate
+        // WITHOUT OVERLAPS key — can't arbitrate an update or a select.
+        let action = match on_conflict.action {
+            ast::OnConflictAction::OnconflictUpdate => Some("ON CONFLICT DO UPDATE"),
+            ast::OnConflictAction::OnconflictSelect => Some("ON CONFLICT DO SELECT"),
+            _ => None,
+        };
+        if let Some(action) = action
             && (found.contype == ConType::Exclusion || found.conperiod)
         {
-            return Err(AnalyzeError::WrongObjectType(
-                "ON CONFLICT DO UPDATE not supported with exclusion constraints".into(),
-            ));
+            return Err(AnalyzeError::WrongObjectType(format!(
+                "{action} not supported with exclusion constraints"
+            )));
         }
         return Ok(());
     }

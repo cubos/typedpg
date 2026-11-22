@@ -1,4 +1,4 @@
-//! A port of PostgreSQL 18's `array_in` grammar (arrayfuncs.c:
+//! A port of PostgreSQL 19's `array_in` grammar (arrayfuncs.c:
 //! `ReadArrayDimensions`, `ReadDimensionInt`, `ReadArrayStr`,
 //! `ReadArrayToken`), used by [`crate::literal_input`] to validate array
 //! literals element by element.

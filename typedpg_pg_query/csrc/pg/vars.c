@@ -26,7 +26,35 @@ bool		ClientAuthInProgress = false;
 int			client_min_messages = NOTICE;
 const char *debug_query_string = NULL;
 int			log_min_error_statement = ERROR;
-int			log_min_messages = WARNING;
+/* Indexed by BackendType since PostgreSQL 19; guc_tables.c's initializer. */
+int			log_min_messages[] = {
+#define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach) \
+	[bktype] = WARNING,
+#include "postmaster/proctypelist.h"
+#undef PG_PROCTYPE
+};
+/*
+ * elog.c's check_log_min_messages (PostgreSQL 19) parses with it;
+ * guc_tables.c's table.  A stub can't stand in: its incomplete-array
+ * tentative definition is a definition to gcc but only a declaration to
+ * MSVC, which then fails to link.
+ */
+const struct config_enum_entry server_message_level_options[] = {
+	{"debug5", DEBUG5, false},
+	{"debug4", DEBUG4, false},
+	{"debug3", DEBUG3, false},
+	{"debug2", DEBUG2, false},
+	{"debug1", DEBUG1, false},
+	{"debug", DEBUG2, true},
+	{"info", INFO, false},
+	{"notice", NOTICE, false},
+	{"warning", WARNING, false},
+	{"error", ERROR, false},
+	{"log", LOG, false},
+	{"fatal", FATAL, false},
+	{"panic", PANIC, false},
+	{NULL, 0, false}
+};
 pg_tz	   *log_timezone = NULL;
 BackendType MyBackendType = B_INVALID;
 BackgroundWorker *MyBgworkerEntry = NULL;

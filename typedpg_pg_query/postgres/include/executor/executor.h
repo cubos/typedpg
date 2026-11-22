@@ -4,7 +4,7 @@
  *	  support for the POSTGRES executor module
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/executor.h
@@ -14,6 +14,8 @@
 #ifndef EXECUTOR_H
 #define EXECUTOR_H
 
+#include "access/xlogdefs.h"
+#include "datatype/timestamp.h"
 #include "executor/execdesc.h"
 #include "fmgr.h"
 #include "nodes/lockoptions.h"
@@ -99,12 +101,12 @@ extern PGDLLIMPORT ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook;
 /*
  * prototypes from functions in execAmi.c
  */
-struct Path;					/* avoid including pathnodes.h here */
+typedef struct Path Path;		/* avoid including pathnodes.h here */
 
 extern void ExecReScan(PlanState *node);
 extern void ExecMarkPos(PlanState *node);
 extern void ExecRestrPos(PlanState *node);
-extern bool ExecSupportsMarkRestore(struct Path *pathnode);
+extern bool ExecSupportsMarkRestore(Path *pathnode);
 extern bool ExecSupportsBackwardScan(Plan *node);
 extern bool ExecMaterializesOutput(NodeTag plantype);
 
@@ -137,10 +139,10 @@ extern TupleHashTable BuildTupleHashTable(PlanState *parent,
 										  const Oid *eqfuncoids,
 										  FmgrInfo *hashfunctions,
 										  Oid *collations,
-										  long nbuckets,
+										  double nelements,
 										  Size additionalsize,
 										  MemoryContext metacxt,
-										  MemoryContext tablecxt,
+										  MemoryContext tuplescxt,
 										  MemoryContext tempcxt,
 										  bool use_variable_hash_iv);
 extern TupleHashEntry LookupTupleHashEntry(TupleHashTable hashtable,
@@ -156,6 +158,9 @@ extern TupleHashEntry FindTupleHashEntry(TupleHashTable hashtable,
 										 ExprState *eqcomp,
 										 ExprState *hashexpr);
 extern void ResetTupleHashTable(TupleHashTable hashtable);
+extern Size EstimateTupleHashTableSpace(double nentries,
+										Size tupleWidth,
+										Size additionalsize);
 
 #ifndef FRONTEND
 /*
@@ -298,6 +303,13 @@ extern void ExecEndNode(PlanState *node);
 extern void ExecShutdownNode(PlanState *node);
 extern void ExecSetTupleBound(int64 tuples_needed, PlanState *child_node);
 
+/*
+ * ExecProcNodeInstr() is implemented in instrument.c, as that allows for
+ * inlining of the instrumentation functions, but thematically it ought to be
+ * in execProcnode.c.
+ */
+extern TupleTableSlot *ExecProcNodeInstr(PlanState *node);
+
 
 /* ----------------------------------------------------------------
  *		ExecProcNode
@@ -340,7 +352,7 @@ extern ExprState *ExecBuildHash32Expr(TupleDesc desc,
 									  const List *collations,
 									  const List *hash_exprs,
 									  const bool *opstrict, PlanState *parent,
-									  uint32 init_value, bool keep_nulls);
+									  uint32 init_value);
 extern ExprState *ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 										 const TupleTableSlotOps *lops, const TupleTableSlotOps *rops,
 										 int numCols,
@@ -400,7 +412,7 @@ ExecEvalExpr(ExprState *state,
  * Like ExecEvalExpr(), but for cases where no return value is expected,
  * because the side-effects of expression evaluation are what's desired. This
  * is e.g. used for projection and aggregate transition computation.
-
+ *
  * Evaluate expression identified by "state" in the execution context
  * given by "econtext".
  *
@@ -591,7 +603,8 @@ extern void ExecInitResultTupleSlotTL(PlanState *planstate,
 									  const TupleTableSlotOps *tts_ops);
 extern void ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 								  TupleDesc tupledesc,
-								  const TupleTableSlotOps *tts_ops);
+								  const TupleTableSlotOps *tts_ops,
+								  uint16 flags);
 extern TupleTableSlot *ExecInitExtraTupleSlot(EState *estate,
 											  TupleDesc tupledesc,
 											  const TupleTableSlotOps *tts_ops);
@@ -682,6 +695,8 @@ extern void ExecCreateScanSlotFromOuterPlan(EState *estate,
 
 extern bool ExecRelationIsTargetRelation(EState *estate, Index scanrelid);
 
+extern bool ScanRelIsReadOnly(ScanState *ss);
+
 extern Relation ExecOpenScanRelation(EState *estate, Index scanrelid, int eflags);
 
 extern void ExecInitRangeTable(EState *estate, List *rangeTable, List *permInfos,
@@ -736,20 +751,23 @@ extern Bitmapset *ExecGetAllUpdatedCols(ResultRelInfo *relinfo, EState *estate);
  */
 extern void ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative);
 extern void ExecCloseIndices(ResultRelInfo *resultRelInfo);
-extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
-								   TupleTableSlot *slot, EState *estate,
-								   bool update,
-								   bool noDupErr,
-								   bool *specConflict, List *arbiterIndexes,
-								   bool onlySummarizing);
+
+/* flags for ExecInsertIndexTuples */
+#define		EIIT_IS_UPDATE			(1<<0)
+#define		EIIT_NO_DUPE_ERROR		(1<<1)
+#define		EIIT_ONLY_SUMMARIZING	(1<<2)
+extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo, EState *estate,
+								   uint32 flags, TupleTableSlot *slot,
+								   List *arbiterIndexes,
+								   bool *specConflict);
 extern bool ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo,
 									  TupleTableSlot *slot,
 									  EState *estate, ItemPointer conflictTid,
-									  ItemPointer tupleid,
+									  const ItemPointerData *tupleid,
 									  List *arbiterIndexes);
 extern void check_exclusion_constraint(Relation heap, Relation index,
 									   IndexInfo *indexInfo,
-									   ItemPointer tupleid,
+									   const ItemPointerData *tupleid,
 									   const Datum *values, const bool *isnull,
 									   EState *estate, bool newIndex);
 
@@ -757,17 +775,25 @@ extern void check_exclusion_constraint(Relation heap, Relation index,
  * prototypes from functions in execReplication.c
  */
 extern bool RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
+										 bool skipduplicates,
 										 LockTupleMode lockmode,
 										 TupleTableSlot *searchslot,
 										 TupleTableSlot *outslot);
-extern bool RelationFindReplTupleByIndexExt(Relation rel, Oid idxoid,
-											bool skipduplicates,
-											LockTupleMode lockmode,
-											TupleTableSlot *searchslot,
-											TupleTableSlot *outslot);
 extern bool RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode,
 									 TupleTableSlot *searchslot, TupleTableSlot *outslot);
-
+extern bool RelationFindDeletedTupleInfoSeq(Relation rel, Oid identidxoid,
+											TupleTableSlot *searchslot,
+											TransactionId oldestxmin,
+											TransactionId *delete_xid,
+											ReplOriginId *delete_origin,
+											TimestampTz *delete_time);
+extern bool RelationFindDeletedTupleInfoByIndex(Relation rel, Oid idxoid,
+												bool skipduplicates,
+												TupleTableSlot *searchslot,
+												TransactionId oldestxmin,
+												TransactionId *delete_xid,
+												ReplOriginId *delete_origin,
+												TimestampTz *delete_time);
 extern void ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 									 EState *estate, TupleTableSlot *slot);
 extern void ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
@@ -778,9 +804,8 @@ extern void ExecSimpleRelationDelete(ResultRelInfo *resultRelInfo,
 									 TupleTableSlot *searchslot);
 extern void CheckCmdReplicaIdentity(Relation rel, CmdType cmd);
 
-extern void CheckSubscriptionRelkind(char relkind, const char *nspname,
-									 const char *relname);
-extern void CheckSubscriptionTargetRel(Oid relid, const char *nspname,
+extern void CheckSubscriptionTargetRel(Oid relid, char remoterelkind,
+									   const char *nspname,
 									   const char *relname);
 
 /*

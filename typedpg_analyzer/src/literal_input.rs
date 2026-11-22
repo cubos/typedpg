@@ -2051,7 +2051,7 @@ fn strtoul10(s: &[u8]) -> Option<(u64, usize)> {
 
 /// Mirrors `pg_lsn_in`: `XXX/XXX` with 1–8 hex digits on each side, and
 /// nothing else — no surrounding whitespace.
-fn validate_pg_lsn(content: &str) -> Result<(), String> {
+pub(crate) fn validate_pg_lsn(content: &str) -> Result<(), String> {
     let err = || format!("invalid input syntax for type pg_lsn: \"{content}\"");
     let (hi, lo) = content.split_once('/').ok_or_else(err)?;
     for part in [hi, lo] {

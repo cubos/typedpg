@@ -361,6 +361,39 @@ fn system_schemas_and_catalogs_are_protected() {
 }
 
 #[test]
+fn create_schema_runs_foreign_keys_last() {
+    // PG 19 transformCreateSchemaCreateTable: the tables' foreign keys
+    // become ALTER TABLE ... ADD CONSTRAINT run after every other element,
+    // so a table may reference one created after it; a column's attribute
+    // clauses go with its REFERENCES.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE SCHEMA s1
+             CREATE TABLE a (b_id int REFERENCES b DEFERRABLE INITIALLY DEFERRED NOT NULL)
+             CREATE TABLE b (id int PRIMARY KEY);
+         CREATE SCHEMA s2
+             CREATE TABLE a (x int, FOREIGN KEY (x) REFERENCES b)
+             CREATE TABLE b (id int PRIMARY KEY);
+         CREATE SCHEMA s3
+             CREATE TABLE a (x int REFERENCES b NOT ENFORCED)
+             CREATE TABLE b (id int PRIMARY KEY);",
+    )]);
+    // NOT NULL stayed on the column.
+    assert_cols(
+        &db.analyze("SELECT b_id FROM s1.a").unwrap(),
+        vec![c("b_id", int4())],
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE SCHEMA s1 CREATE TABLE a (x int REFERENCES nosuch);"
+        )]),
+        DdlError::TableNotFound(_),
+        "relation \"nosuch\" does not exist (referenced by foreign key constraint \"a_x_fkey\")",
+    );
+}
+
+#[test]
 fn create_schema_errors() {
     // PG 18: 42P06 schema "s" already exists; 42P15 for a mismatched element.
     assert_ddl_err!(

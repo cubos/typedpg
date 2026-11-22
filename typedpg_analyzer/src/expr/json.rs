@@ -299,8 +299,9 @@ pub(crate) fn infer_json_array(
 }
 
 /// `JSON_ARRAY(SELECT …)` — `transformJsonArrayQueryConstructor` rewrites
-/// it into `(SELECT JSON_ARRAYAGG(a) FROM (query) q(a))`: the query needs
-/// exactly one column, and the result is NULL when it returns no rows.
+/// it into `COALESCE((SELECT JSON_ARRAYAGG(a) FROM (query) q(a)), '[]')`:
+/// the query needs exactly one column, and the result is never NULL — `[]`
+/// when it returns no rows (PostgreSQL 19; 18 returned NULL).
 pub(crate) fn infer_json_array_query(
     c: &ast::JsonArrayQueryConstructor,
     ctx: Ctx<'_>,
@@ -323,7 +324,7 @@ pub(crate) fn infer_json_array_query(
         }
         args.push(cols[0].type_oid);
     }
-    constructor_result(c.output.as_deref(), &args, true, ctx.snapshot)
+    constructor_result(c.output.as_deref(), &args, false, ctx.snapshot)
 }
 
 /// FILTER / ORDER BY / OVER of a JSON aggregate, walked like a regular
@@ -598,9 +599,11 @@ pub(crate) fn infer_json_is_predicate(
         .ok_or_else(|| AnalyzeError::Internal("IS JSON without operand".into()))?;
     let (ty, t) = json_parse_arg(e.as_ref(), p.format.as_deref(), ctx, params)?;
     if ty != oid::TEXT && ty != JSON && ty != JSONB {
+        // format_type_be(exprType(expr)): the input's own type, a domain's
+        // name rather than its base type's.
         return Err(AnalyzeError::DatatypeMismatch(format!(
             "cannot use type {} in IS JSON predicate",
-            type_name(snapshot, ty)
+            type_name(snapshot, t.type_oid)
         )));
     }
     Ok(ExprType::scalar(oid::BOOL, t.nullable))

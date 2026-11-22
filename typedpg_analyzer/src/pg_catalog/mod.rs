@@ -183,7 +183,7 @@ pub struct PgCatalogSeed {
 
 /// Mutable in-memory PostgreSQL catalog.
 ///
-/// Starts from the embedded PG18 seed and evolves by applying DDL via
+/// Starts from the embedded PG19 seed and evolves by applying DDL via
 /// [`PgCatalog::apply_sql`]. Each catalog table is stored as a HashMap keyed
 /// by primary OID (or by FK in the case of `pg_attribute`/`pg_enum`/
 /// `pg_range`); name-keyed indexes are rebuilt at construction time and kept
@@ -498,6 +498,11 @@ pub struct PgCatalog {
     /// The index of each table's `REPLICA IDENTITY USING INDEX`
     /// (`relreplident = 'i'`).
     pub(crate) replica_identity_indexes: Shared<HashMap<PgClassOid, PgClassOid>>,
+    /// `relreplident` of the tables set to REPLICA IDENTITY NOTHING (`n`)
+    /// or FULL (`f`); absent means DEFAULT, or USING INDEX (above).
+    pub(crate) replica_identity_kinds: Shared<HashMap<PgClassOid, char>>,
+    /// Tables with the `user_catalog_table` storage parameter on.
+    pub(crate) user_catalog_tables: Shared<std::collections::HashSet<PgClassOid>>,
     /// Logical-replication publications.
     pub(crate) publications: Shared<Vec<crate::ddl::publications::Publication>>,
     /// `relpersistence` of unlogged (`u`) and temporary (`t`) relations;
@@ -693,7 +698,7 @@ impl PgCatalog {
     /// The `has_*_privilege` queries accept it where they accept a role name.
     pub const MIGRATIONS_USER: &'static str = "pg_typedpg_migrations_user";
 
-    /// Create a catalog seeded with the embedded PG18 snapshot.
+    /// Create a catalog seeded with the embedded PG19 snapshot.
     ///
     /// Returns an [`AnalyzeError`] only if the embedded `seed.json` fails to
     /// deserialize — a build-time invariant of the analyzer crate that would
@@ -718,7 +723,7 @@ impl PgCatalog {
 
     /// Build a catalog from a serialized seed. `next_oid` is set to one past
     /// the max OID seen in the seed (or [`USER_OID_START`] if higher), so
-    /// freshly allocated user objects can never collide with PG18's
+    /// freshly allocated user objects can never collide with PG19's
     /// information_schema tables (which sit above 100k).
     pub fn from_seed(seed: PgCatalogSeed) -> Self {
         let mut cat = Self::empty();
@@ -983,6 +988,8 @@ impl PgCatalog {
             family_members: Vec::new(),
             installing_extension: None,
             replica_identity_indexes: Shared::default(),
+            replica_identity_kinds: Shared::default(),
+            user_catalog_tables: Shared::default(),
             publications: Shared::default(),
             event_triggers: Shared::default(),
             relpersistence: Shared::default(),
@@ -2361,6 +2368,8 @@ impl PgCatalog {
             .retain(|(relid, _), _| *relid != oid);
         self.replica_identity_indexes
             .retain(|table, index| *table != oid && *index != oid);
+        self.replica_identity_kinds.remove(&oid);
+        self.user_catalog_tables.remove(&oid);
         self.partition_keys.remove(&oid);
         self.triggers.remove(&oid);
         self.policies.remove(&oid);

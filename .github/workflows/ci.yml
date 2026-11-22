@@ -45,7 +45,7 @@ jobs:
       - run: cargo test --doc --workspace
 
   pg-sanity:
-    name: pg_sanity oracle (postgres:18)
+    name: pg_sanity oracle (postgres:19)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -63,7 +63,7 @@ jobs:
           FUZZ_STRICT: single
 
   typescript:
-    name: TypeScript (generator, runtime, CLI, e2e on postgres:18)
+    name: TypeScript (generator, runtime, CLI, e2e on postgres:19)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

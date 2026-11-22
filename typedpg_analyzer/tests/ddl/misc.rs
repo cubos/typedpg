@@ -1698,7 +1698,7 @@ fn alter_table_inherit_and_no_inherit() {
         ),
         (
             "ALTER TABLE pt INHERIT c1;",
-            "cannot change inheritance of partitioned table",
+            "ALTER action INHERIT cannot be performed on relation \"pt\"",
         ),
         (
             "ALTER TABLE c7 INHERIT part;",
@@ -3455,10 +3455,11 @@ fn statements_a_migration_runs_get_the_checks_of_a_query_that_runs() {
 
 #[test]
 fn plan_time_checks_follow_what_the_planner_reaches() {
-    // PG 18: eval_const_expressions stops at an AND argument folding to
-    // FALSE, an OR one folding to TRUE, the COALESCE arguments after a
-    // non-NULL constant, and skips the CASE branches it proves unused —
-    // what it drops is never folded. A relation the planner proves empty
+    // eval_const_expressions stops at an AND argument folding to FALSE, an
+    // OR one folding to TRUE, the COALESCE arguments after a non-NULL
+    // constant (or, PostgreSQL 19, an argument proven non-NULL), and skips
+    // the CASE branches it proves unused — what it drops is never folded;
+    // PostgreSQL 19 folds `IS NULL` over a NOT NULL column to FALSE. A relation the planner proves empty
     // (a constant FALSE / NULL qual, two constants equated, `IS NULL` over
     // a NOT NULL column, pruned partitions, no partition at all, ONLY a
     // partitioned table) or removes (a useless LEFT JOIN) never has its
@@ -3484,7 +3485,7 @@ fn plan_time_checks_follow_what_the_planner_reaches() {
         "SELECT * FROM t WHERE (false AND s = 'x') OR 'a' ~ '(';",
         "SELECT * FROM t WHERE random() > 2 AND 'a' ~ '(';",
         "SELECT * FROM t WHERE now() < '2000-01-01' AND 'a' ~ '(';",
-        "SELECT * FROM tn WHERE a IS NULL AND 'x' ~ '(';",
+        "SELECT * FROM t WHERE a IS NULL AND 'x' ~ '(';",
         "SELECT * FROM t WHERE s ~ '(' AND random() > 2;",
         "UPDATE t SET s = 'x' WHERE a = 1 AND a = 1 AND s ~ '(';",
         "SELECT 1 FROM t WHERE s ~ '(' AND a < 0 AND a > 0;",
@@ -3515,6 +3516,8 @@ fn plan_time_checks_follow_what_the_planner_reaches() {
         "SELECT CASE WHEN 1 = 1 THEN true WHEN 'a' ~ '(' THEN false END;",
         "SELECT CASE 1 WHEN NULL THEN 'a' ~ '(' ELSE true END;",
         "SELECT coalesce(true, 'a' ~ '(');",
+        "SELECT * FROM tn WHERE a IS NULL AND 'x' ~ '(';",
+        "SELECT coalesce(tn.a, ('a' ~ '(')::int) FROM tn;",
         "INSERT INTO t SELECT 1, 'a' WHERE false AND 'a' ~ '(';",
         "SELECT 1 WHERE false AND EXISTS (SELECT 1 WHERE 'a' ~ '(');",
         "SELECT * FROM t WHERE 1 = 0 AND s ~ '(';",
@@ -4274,25 +4277,27 @@ fn access_methods_and_operator_classes() {
 
 #[test]
 fn extended_statistics_need_an_ordering_operator() {
-    // CreateStatistics: a column — by name or in parentheses, a Var — needs
-    // its type's `<` (lookup_type_cache's TYPECACHE_LT_OPR, which an array
-    // or a composite has only if its element / every field has one); an
-    // expression needs it too, unless it is the only one.
+    // CreateStatistics (PostgreSQL 19): with several elements, a column —
+    // by name or in parentheses, a Var — needs its type's `<`
+    // (lookup_type_cache's TYPECACHE_LT_OPR, which an array or a composite
+    // has only if its element / every field has one), and so does an
+    // expression; a single column is refused anyway, unless virtual.
     let setup = "CREATE TYPE pc AS (x point);
                  CREATE TABLE t (a int, b text, p point[], q pc, pt point,
                                  g int GENERATED ALWAYS AS (a) VIRTUAL);";
     let expression = |typ: &str| {
         format!(
-            "expression cannot be used in multivariate statistics because its type {typ} has \
-             no default btree operator class"
+            "cannot create multivariate statistics on this expression (The type {typ} has no \
+             default btree operator class.)"
         )
     };
     let column = |name: &str, typ: &str| {
         format!(
-            "column \"{name}\" cannot be used in statistics because its type {typ} has no \
-             default btree operator class"
+            "cannot create multivariate statistics on column \"{name}\" (The type {typ} has no \
+             default btree operator class.)"
         )
     };
+    let single = "cannot create extended statistics on a single non-virtual column";
     // PostgreSQL 18.7 checks an expression's type as a column's first
     // (CheckAttributeType): no pseudo-type.
     let pseudo = |typ: &str| format!("expression has pseudo-type {typ}");
@@ -4328,7 +4333,7 @@ fn extended_statistics_need_an_ordering_operator() {
             column("pt", "point"),
         ),
         ("CREATE STATISTICS ON (q), a FROM t;", column("q", "pc")),
-        ("CREATE STATISTICS ON (pt) FROM t;", column("pt", "point")),
+        ("CREATE STATISTICS ON (pt) FROM t;", single.into()),
         (
             "CREATE STATISTICS ON (pt::text), (pt) FROM t;",
             column("pt", "point"),
@@ -4342,17 +4347,10 @@ fn extended_statistics_need_an_ordering_operator() {
             "CREATE STATISTICS ON (t.a), (a) FROM t;",
             "duplicate column name in statistics definition".into(),
         ),
-        (
-            "CREATE STATISTICS ON (a) FROM t;",
-            "extended statistics require at least 2 columns".into(),
-        ),
+        ("CREATE STATISTICS ON (a) FROM t;", single.into()),
         (
             "CREATE STATISTICS (ndistinct) ON (a) FROM t;",
-            "extended statistics require at least 2 columns".into(),
-        ),
-        (
-            "CREATE STATISTICS ON (g), a FROM t;",
-            "statistics creation on virtual generated columns is not supported".into(),
+            single.into(),
         ),
         ("CREATE STATISTICS ON (ctid), a FROM t;", system.into()),
         ("CREATE STATISTICS ON (t.ctid), a FROM t;", system.into()),
@@ -4382,6 +4380,9 @@ fn extended_statistics_need_an_ordering_operator() {
         "CREATE STATISTICS ON (pt::text) FROM t;",
         "CREATE STATISTICS ON (a), b FROM t;",
         "CREATE STATISTICS ON (public.t.a), b FROM t;",
+        // A virtual generated column is an expression.
+        "CREATE STATISTICS ON (g), a FROM t;",
+        "CREATE STATISTICS ON (g) FROM t;",
     ] {
         if let Err(err) = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]) {
             panic!("{stmt}\n  rejected: {err}");
@@ -4404,13 +4405,15 @@ fn extended_statistics_field_selection_on_the_whole_row() {
         "CREATE STATISTICS ON (((t).co).f), b FROM t;",
         "CREATE STATISTICS ON (((t).co).f), (co) FROM t;",
         "CREATE STATISTICS ON ((t).co), b FROM t;",
+        // A virtual generated column is an expression (PostgreSQL 19).
+        "CREATE STATISTICS ON ((t).v), b FROM t;",
+        "CREATE STATISTICS ON ((t).v + 1), b FROM t;",
     ] {
         if let Err(err) = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]) {
             panic!("{stmt}\n  rejected: {err}");
         }
     }
     let system = "statistics creation on system columns is not supported";
-    let virt = "statistics creation on virtual generated columns is not supported";
     for (stmt, msg) in [
         // In parentheses, it is a column.
         (
@@ -4419,12 +4422,12 @@ fn extended_statistics_field_selection_on_the_whole_row() {
         ),
         (
             "CREATE STATISTICS ON ((t).a) FROM t;",
-            "extended statistics require at least 2 columns",
+            "cannot create extended statistics on a single non-virtual column",
         ),
         (
             "CREATE STATISTICS ON ((t).x), b FROM t;",
-            "column \"x\" cannot be used in statistics because its type point has no default \
-             btree operator class",
+            "cannot create multivariate statistics on column \"x\" (The type point has no \
+             default btree operator class.)",
         ),
         ("CREATE STATISTICS ON ((t).ctid), b FROM t;", system),
         // Within an expression, a system column of the whole row too.
@@ -4433,8 +4436,6 @@ fn extended_statistics_field_selection_on_the_whole_row() {
             "CREATE STATISTICS ON ((t).xmin::text || b), a FROM t;",
             system,
         ),
-        ("CREATE STATISTICS ON ((t).v), b FROM t;", virt),
-        ("CREATE STATISTICS ON ((t).v + 1), b FROM t;", virt),
         (
             "CREATE STATISTICS ON ((t).nope), b FROM t;",
             "column t.nope does not exist",
@@ -4490,8 +4491,8 @@ fn extended_statistics_are_validated_and_tracked() {
         ),
         (
             "CREATE STATISTICS s5 ON a, j FROM t;",
-            "column \"j\" cannot be used in statistics because its type json has no default btree \
-             operator class",
+            "cannot create multivariate statistics on column \"j\" (The type json has no default \
+             btree operator class.)",
         ),
         (
             "CREATE STATISTICS s6 (nosuch) ON a, b FROM t;",
@@ -4499,11 +4500,15 @@ fn extended_statistics_are_validated_and_tracked() {
         ),
         (
             "CREATE STATISTICS s8 (ndistinct) ON (a + 1) FROM t;",
-            "when building statistics on a single expression, statistics kinds may not be specified",
+            "cannot specify statistics kinds when building univariate statistics",
         ),
         (
             "CREATE STATISTICS s9 ON a FROM t;",
-            "extended statistics require at least 2 columns",
+            "cannot create extended statistics on a single non-virtual column",
+        ),
+        (
+            "CREATE STATISTICS s10 (nosuch) ON a FROM t;",
+            "cannot create extended statistics on a single non-virtual column",
         ),
         // ProcessUtilitySlow: one FROM item, then a plain relation name.
         (
@@ -5084,7 +5089,7 @@ fn sequence_parameters_are_validated() {
             "ALTER SEQUENCE t_a_seq MAXVALUE 100000;",
             "MAXVALUE (100000) is out of range for sequence data type smallint",
         ),
-        ("ALTER SEQUENCE t MAXVALUE 5;", "cannot open relation \"t\""),
+        ("ALTER SEQUENCE t MAXVALUE 5;", "\"t\" is not a sequence"),
         (
             "ALTER SEQUENCE s10 START 0;",
             "START value (0) cannot be less than MINVALUE (1)",
@@ -5105,6 +5110,321 @@ fn sequence_parameters_are_validated() {
              ALTER SEQUENCE s13 RESTART;
              ALTER SEQUENCE s13 NO MAXVALUE;
              ALTER SEQUENCE t_a_seq MAXVALUE 1000;",
+        ),
+    ]);
+}
+
+#[test]
+fn subscriptions_connect_through_a_wrapper_connection_function() {
+    // PG 19 lookup_fdw_connection_func and CREATE SUBSCRIPTION ... SERVER
+    // (ForeignServerConnectionString).
+    let setup = "CREATE FUNCTION cf(oid, oid, internal) RETURNS text LANGUAGE internal
+                     AS 'textlike_support';
+                 CREATE FUNCTION cfi(oid, oid, internal) RETURNS int LANGUAGE internal
+                     AS 'int4in';
+                 CREATE FOREIGN DATA WRAPPER w;
+                 CREATE SERVER sv FOREIGN DATA WRAPPER w;";
+    for (stmt, msg) in [
+        (
+            "CREATE FOREIGN DATA WRAPPER w2 CONNECTION nosuch;",
+            "function nosuch(oid, oid, internal) does not exist",
+        ),
+        (
+            "CREATE FOREIGN DATA WRAPPER w2 CONNECTION cfi;",
+            "function cfi must return type text",
+        ),
+        (
+            "CREATE SUBSCRIPTION s SERVER nosuch PUBLICATION p WITH (connect = false);",
+            "server \"nosuch\" does not exist",
+        ),
+        (
+            "CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);",
+            "foreign-data wrapper \"w\" does not support subscription connections",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        ("0002.sql", "ALTER FOREIGN DATA WRAPPER w CONNECTION cf;"),
+        ("0003.sql", "ALTER FOREIGN DATA WRAPPER w NO CONNECTION;"),
+        (
+            "0004.sql",
+            "CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);",
+        ),
+    ])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("foreign-data wrapper \"w\" does not support subscription connections"),
+        "got: {err}"
+    );
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "ALTER FOREIGN DATA WRAPPER w CONNECTION cf;"),
+        (
+            "0003.sql",
+            "CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);",
+        ),
+    ]);
+    let err = try_apply(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE SUBSCRIPTION s CONNECTION 'dbname=x' PUBLICATION p WITH (connect = false);",
+        ),
+        ("0003.sql", "ALTER SUBSCRIPTION s SERVER nosuch;"),
+    ])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("server \"nosuch\" does not exist"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn a_subscription_keeps_its_server_from_being_dropped() {
+    // PG 19 CREATE / ALTER SUBSCRIPTION ... SERVER record a pg_depend
+    // entry; findDependentObjects refuses to drop the server while the
+    // subscription — in a shared catalog — depends on it, CASCADE or not.
+    let setup = "CREATE FUNCTION cf(oid, oid, internal) RETURNS text LANGUAGE internal
+                     AS 'textlike_support';
+                 CREATE FOREIGN DATA WRAPPER w CONNECTION cf;
+                 CREATE SERVER sv FOREIGN DATA WRAPPER w;
+                 CREATE USER MAPPING FOR public SERVER sv;
+                 CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);";
+    for (stmt, msg) in [
+        (
+            "DROP SERVER sv;",
+            "cannot drop server sv because subscription s depends on it",
+        ),
+        (
+            "DROP SERVER sv CASCADE;",
+            "cannot drop server sv because subscription s depends on it",
+        ),
+        (
+            "DROP FOREIGN DATA WRAPPER w CASCADE;",
+            "cannot drop server sv because subscription s depends on it",
+        ),
+        (
+            "ALTER SERVER sv RENAME TO sv2; DROP SERVER sv2 CASCADE;",
+            "cannot drop server sv2 because subscription s depends on it",
+        ),
+        (
+            "ALTER SUBSCRIPTION s RENAME TO s2; DROP SERVER sv CASCADE;",
+            "cannot drop server sv because subscription s2 depends on it",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false);
+             ALTER SUBSCRIPTION s2 RENAME TO s;",
+            "subscription \"s\" already exists",
+        ),
+        (
+            "ALTER SUBSCRIPTION nosuch RENAME TO s2;",
+            "subscription \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER SUBSCRIPTION s RENAME TO s2; DROP SUBSCRIPTION s;",
+            "subscription \"s\" does not exist",
+        ),
+        // Its replication slot (named after it) keeps it in the cluster
+        // until `slot_name = NONE`, outside any transaction block.
+        (
+            "SELECT 1; DROP SUBSCRIPTION s;",
+            "DROP SUBSCRIPTION cannot run inside a transaction block",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // Without the subscription, or once it connects without the server,
+    // the server goes (its user mapping with CASCADE).
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER SUBSCRIPTION s RENAME TO s2;
+             ALTER SUBSCRIPTION s2 SET (slot_name = NONE);
+             DROP SUBSCRIPTION s2;
+             DROP SERVER sv CASCADE;",
+        ),
+    ]);
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER SUBSCRIPTION s CONNECTION 'dbname=x';
+             DROP FOREIGN DATA WRAPPER w CASCADE;",
+        ),
+    ]);
+}
+
+#[test]
+fn subscription_options_and_replication_slots() {
+    // PG 19 parse_subscription_options, and the replication slot a
+    // subscription creates (CREATE) or drops (DROP) unless `slot_name =
+    // NONE`, which can't run inside a transaction block — a migration of
+    // several statements runs in an implicit one.
+    let setup = "CREATE SUBSCRIPTION s CONNECTION 'dbname=x' PUBLICATION p
+                     WITH (connect = false);";
+    for (stmt, msg) in [
+        (
+            "SELECT 1; CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p;",
+            "CREATE SUBSCRIPTION ... WITH (create_slot = true) cannot run inside a transaction \
+             block",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, connect = false);",
+            "conflicting or redundant options",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, enabled = true);",
+            "connect = false and enabled = true are mutually exclusive options",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, create_slot = maybe);",
+            "create_slot requires a Boolean value",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (slot_name = NONE);",
+            "subscription with slot_name = NONE must also set enabled = false",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (slot_name = NONE, enabled = false);",
+            "subscription with slot_name = NONE must also set create_slot = false",
+        ),
+        (
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, slot_name = 'Slot');",
+            "replication slot name \"Slot\" contains invalid character",
+        ),
+        (
+            "CREATE SUBSCRIPTION s CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false);",
+            "subscription \"s\" already exists",
+        ),
+        (
+            "ALTER SUBSCRIPTION s SET (slot_name = NONE); ALTER SUBSCRIPTION s ENABLE;",
+            "cannot enable subscription that does not have a slot name",
+        ),
+        (
+            "ALTER SUBSCRIPTION nosuch SET (slot_name = 'Bad');",
+            "subscription \"nosuch\" does not exist",
+        ),
+        (
+            "ALTER SUBSCRIPTION s SET (slot_name = NONE);
+             ALTER SUBSCRIPTION s SET (slot_name = 's_slot');
+             DROP SUBSCRIPTION s;",
+            "DROP SUBSCRIPTION cannot run inside a transaction block",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE SUBSCRIPTION s2 CONNECTION 'dbname=x' PUBLICATION p
+                 WITH (connect = false, slot_name = NONE);
+             DROP SUBSCRIPTION s2;
+             ALTER SUBSCRIPTION s SET (slot_name = NONE);
+             ALTER SUBSCRIPTION s DISABLE;
+             DROP SUBSCRIPTION s;
+             DROP SUBSCRIPTION IF EXISTS s;",
+        ),
+    ]);
+}
+
+#[test]
+fn a_subscription_moved_to_another_server_depends_on_that_one() {
+    // ALTER SUBSCRIPTION ... SERVER moves the pg_depend entry. Moving runs
+    // the wrapper's connection function, which a stand-in like the test
+    // above's can't be on a live server, so the mirror sits this one out.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION cf(oid, oid, internal) RETURNS text LANGUAGE internal
+             AS 'textlike_support';
+         CREATE FOREIGN DATA WRAPPER w CONNECTION cf;
+         CREATE SERVER sv FOREIGN DATA WRAPPER w;
+         CREATE SERVER sv2 FOREIGN DATA WRAPPER w;
+         CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);",
+    )]);
+    db.skip_pg_sanity();
+    db.apply_sql("ALTER SUBSCRIPTION s SERVER sv2; DROP SERVER sv;")
+        .unwrap();
+    let err = db.apply_sql("DROP SERVER sv2;").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop server sv2 because subscription s depends on it"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn set_to_null_empties_a_list_parameter() {
+    // PG 19 flatten_set_variable_args: `SET name TO NULL` is the empty list
+    // for a GUC_LIST_INPUT parameter, an error for any other — reported
+    // before the name is looked up.
+    let setup = "CREATE TABLE t (a int);";
+    for (stmt, msg) in [
+        (
+            "SET search_path TO NULL; CREATE TABLE u (a int);",
+            "no schema has been selected to create in",
+        ),
+        (
+            "SET search_path = NULL; CREATE VIEW public.v AS SELECT a FROM t;",
+            "relation \"t\" does not exist",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql SET search_path TO NULL
+                 AS 'SELECT count(*) FROM t';",
+            "relation \"t\" does not exist",
+        ),
+        (
+            "SET work_mem TO NULL;",
+            "NULL is an invalid value for work_mem",
+        ),
+        (
+            "SET nosuch_param TO NULL;",
+            "NULL is an invalid value for nosuch_param",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql SET work_mem TO NULL
+                 AS 'SELECT 1';",
+            "NULL is an invalid value for work_mem",
+        ),
+        (
+            "CREATE ROLE r; ALTER ROLE r SET work_mem TO NULL;",
+            "NULL is an invalid value for work_mem",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "SET search_path TO NULL;
+             CREATE TABLE public.u (a int);
+             SET search_path TO DEFAULT;
+             SELECT a FROM u;
+             SET LOCAL search_path TO NULL;
+             SET temp_tablespaces TO NULL;
+             SET DateStyle TO NULL;
+             CREATE ROLE r;
+             ALTER ROLE r SET search_path TO NULL;
+             CREATE FUNCTION public.g() RETURNS int LANGUAGE sql SET search_path TO NULL
+                 AS 'SELECT 1';",
         ),
     ]);
 }
@@ -5711,10 +6031,6 @@ fn copy_resolves_its_relation_and_options() {
         ("COPY v TO STDOUT;", "cannot copy from view \"v\""),
         ("COPY s TO STDOUT;", "cannot copy from sequence \"s\""),
         (
-            "COPY p TO STDOUT;",
-            "cannot copy from partitioned table \"p\"",
-        ),
-        (
             "COPY t (a, a) TO STDOUT;",
             "column \"a\" specified more than once",
         ),
@@ -5749,8 +6065,149 @@ fn copy_resolves_its_relation_and_options() {
             "COPY t TO STDOUT;
              COPY t (a) TO STDOUT (FORMAT csv, HEADER);
              COPY mv TO STDOUT;
+             COPY p TO STDOUT;
              COPY (SELECT * FROM v) TO STDOUT;",
         ),
+    ]);
+}
+
+#[test]
+fn copy_takes_the_postgres_19_options() {
+    // PG 19 ProcessCopyOptions: FORMAT json (COPY TO only) with FORCE_ARRAY,
+    // a number of HEADER lines to skip (COPY FROM only), no system columns
+    // in COPY FROM's WHERE, and partitioned tables as COPY TO sources.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE p (a int) PARTITION BY LIST (a);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1);";
+    for (stmt, msg) in [
+        (
+            "COPY t FROM STDIN (FORMAT json);",
+            "COPY FORMAT JSON is not supported for COPY FROM",
+        ),
+        (
+            "COPY t TO STDOUT (FORCE_ARRAY);",
+            "COPY FORCE_ARRAY can only be used with JSON mode",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT json, HEADER);",
+            "cannot specify HEADER in JSON mode",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT csv, HEADER 2);",
+            "cannot use multi-line header in COPY TO",
+        ),
+        (
+            "COPY t FROM STDIN WHERE ctid IS NULL;",
+            "system columns are not supported in COPY FROM WHERE conditions",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "COPY t TO STDOUT (FORMAT json);
+             COPY t TO STDOUT (FORMAT json, FORCE_ARRAY);
+             COPY p TO STDOUT;",
+        ),
+    ]);
+}
+
+#[test]
+fn checkpoint_and_wait_for_lsn_check_their_options() {
+    // PG 19 ExecCheckpoint and ExecWaitStmt. The server a migration runs on
+    // is never in recovery, so WAIT FOR LSN in the default standby_replay
+    // mode fails unless NO_THROW is given.
+    for (stmt, msg) in [
+        (
+            "CHECKPOINT (MODE nosuch);",
+            "unrecognized value for CHECKPOINT option \"mode\": \"nosuch\"",
+        ),
+        (
+            "CHECKPOINT (nosuch);",
+            "unrecognized CHECKPOINT option \"nosuch\"",
+        ),
+        ("WAIT FOR LSN '0/0';", "recovery is not in progress"),
+        (
+            "WAIT FOR LSN 'zz';",
+            "invalid input syntax for type pg_lsn: \"zz\"",
+        ),
+        (
+            "WAIT FOR LSN '0/0' WITH (nosuch 1);",
+            "option \"nosuch\" not recognized",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[(
+        "0001.sql",
+        "CHECKPOINT;
+         CHECKPOINT (MODE FAST);
+         CHECKPOINT (FLUSH_UNLOGGED);
+         WAIT FOR LSN '0/0' WITH (TIMEOUT '1s', NO_THROW);",
+    )]);
+}
+
+#[test]
+fn repack_checks_its_relation_and_index() {
+    // PG 19 ExecRepack: REPACK replaces CLUSTER and VACUUM FULL.
+    let setup = "CREATE TABLE t (a int PRIMARY KEY);
+                 CREATE TABLE u (a int);
+                 CREATE INDEX ui ON u (a);
+                 CREATE TABLE p (a int PRIMARY KEY) PARTITION BY LIST (a);";
+    for (stmt, msg) in [
+        (
+            "REPACK t USING INDEX;",
+            "there is no previously clustered index for table \"t\"",
+        ),
+        (
+            "REPACK (CONCURRENTLY) u;",
+            "cannot execute REPACK (CONCURRENTLY) on relation \"u\"",
+        ),
+        (
+            "REPACK (nosuch) t;",
+            "unrecognized REPACK option \"nosuch\"",
+        ),
+        (
+            "REPACK t USING INDEX nosuch;",
+            "index \"nosuch\" for table \"t\" does not exist",
+        ),
+        (
+            "REPACK t USING INDEX ui;",
+            "\"ui\" is not an index for table \"t\"",
+        ),
+        (
+            "BEGIN; REPACK p; COMMIT;",
+            "REPACK cannot run inside a transaction block",
+        ),
+        (
+            "BEGIN; REPACK; COMMIT;",
+            "REPACK cannot run inside a transaction block",
+        ),
+        (
+            "REPACK (CONCURRENTLY) p;",
+            "REPACK (CONCURRENTLY) is not supported for partitioned tables",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "REPACK t;
+             REPACK t USING INDEX t_pkey;
+             REPACK t USING INDEX;
+             REPACK (VERBOSE) t;
+             BEGIN; REPACK t; COMMIT;",
+        ),
+        ("0003.sql", "REPACK (CONCURRENTLY) t;"),
+        ("0004.sql", "REPACK p;"),
+        ("0005.sql", "REPACK;"),
     ]);
 }
 
@@ -6361,7 +6818,7 @@ fn text_search_options_are_validated() {
         ),
         (
             "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, STOPWORDS = nosuchfile);",
-            "could not open stop-word file \"/usr/share/postgresql/18/tsearch_data/nosuchfile.stop\"",
+            "could not open stop-word file \"/usr/share/postgresql/19/tsearch_data/nosuchfile.stop\"",
         ),
         (
             "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = simple, STOPWORDS = 'English');",
@@ -6389,7 +6846,7 @@ fn text_search_options_are_validated() {
         ),
         (
             "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = ispell, DICTFILE = nosuch, AFFFILE = ispell_sample);",
-            "could not open dictionary file \"/usr/share/postgresql/18/tsearch_data/nosuch.dict\"",
+            "could not open dictionary file \"/usr/share/postgresql/19/tsearch_data/nosuch.dict\"",
         ),
         (
             "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = synonym);",
@@ -6397,7 +6854,7 @@ fn text_search_options_are_validated() {
         ),
         (
             "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = synonym, SYNONYMS = nosuch);",
-            "could not open synonym file \"/usr/share/postgresql/18/tsearch_data/nosuch.syn\"",
+            "could not open synonym file \"/usr/share/postgresql/19/tsearch_data/nosuch.syn\"",
         ),
         (
             "CREATE TEXT SEARCH DICTIONARY d2 (TEMPLATE = thesaurus, DICTFILE = thesaurus_sample);",
@@ -6888,6 +7345,149 @@ fn publications_take_only_publishable_tables_and_schemas() {
             "ALTER PUBLICATION pall SET (publish = 'insert');
              ALTER PUBLICATION p ADD TABLE t;
              ALTER PUBLICATION p ADD TABLES IN SCHEMA public;",
+        ),
+    ]);
+}
+
+#[test]
+fn all_tables_publications_take_an_except_list_and_all_sequences() {
+    // PG 19 preprocess_pub_all_objtype_list, check_publication_add_relation
+    // (EXCEPT entries), CheckAlterPublication, AlterPublicationTables /
+    // AlterPublicationAllFlags for SET ALL, ATExecSetRelationPersistence
+    // (RelationHasPublication), attachPartitionTable
+    // (GetRelationExcludedPublications) and OpenTableList's inheritance
+    // children.
+    let setup = "CREATE TABLE t (a int PRIMARY KEY);
+                 CREATE TABLE u (a int);
+                 CREATE TABLE p (a int) PARTITION BY LIST (a);
+                 CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1);
+                 CREATE TABLE ih (a int);
+                 CREATE TABLE ihc () INHERITS (ih);
+                 CREATE VIEW v AS SELECT 1 AS a;
+                 CREATE UNLOGGED TABLE ul (a int);
+                 CREATE TABLE lone (a int);
+                 CREATE TABLE \"My T\" (a int) PARTITION BY LIST (a);
+                 CREATE TABLE \"Part\" PARTITION OF \"My T\" FOR VALUES IN (1);";
+    for (stmt, msg) in [
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE p1);",
+            "cannot specify relation \"public.p1\" in the publication EXCEPT clause (This \
+             operation is not supported for individual partitions.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE \"Part\");",
+            "cannot specify relation \"public.Part\" in the publication EXCEPT clause",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE v);",
+            "cannot specify relation \"public.v\" in the publication EXCEPT clause (This \
+             operation is not supported for views.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE ul);",
+            "cannot specify relation \"public.ul\" in the publication EXCEPT clause (This \
+             operation is not supported for unlogged tables.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES, ALL TABLES;",
+            "invalid publication object list",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL SEQUENCES; ALTER PUBLICATION x ADD TABLE t;",
+            "publication \"x\" is defined as FOR ALL SEQUENCES (Tables or sequences cannot be \
+             added to or dropped from FOR ALL SEQUENCES publications.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES, ALL SEQUENCES;
+             ALTER PUBLICATION x ADD TABLES IN SCHEMA public;",
+            "publication \"x\" is defined as FOR ALL TABLES, ALL SEQUENCES (Schemas cannot be \
+             added to or dropped from FOR ALL TABLES, ALL SEQUENCES publications.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES; ALTER PUBLICATION x DROP TABLE t;",
+            "publication \"x\" is defined as FOR ALL TABLES (Tables or sequences cannot be \
+             added to or dropped from FOR ALL TABLES publications.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR TABLE t; ALTER PUBLICATION x SET ALL TABLES;",
+            "publication \"x\" does not support ALL TABLES operations (This operation requires \
+             the publication to be defined as FOR ALL TABLES/SEQUENCES or to be empty.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR TABLES IN SCHEMA public; ALTER PUBLICATION x SET ALL SEQUENCES;",
+            "publication \"x\" does not support ALL SEQUENCES operations",
+        ),
+        (
+            "CREATE PUBLICATION x;
+             ALTER PUBLICATION x SET ALL TABLES EXCEPT (TABLE t);
+             ALTER PUBLICATION x SET ALL SEQUENCES;
+             ALTER PUBLICATION x ADD TABLE t;",
+            "publication \"x\" is defined as FOR ALL SEQUENCES",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE lone);
+             ALTER TABLE p ATTACH PARTITION lone FOR VALUES IN (2);",
+            "cannot attach table \"lone\" as partition because it is referenced in publication \
+             \"x\" EXCEPT clause (The publication EXCEPT clause cannot contain tables that are \
+             partitions.)",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE lone);
+             CREATE PUBLICATION y FOR ALL TABLES EXCEPT (TABLE lone);
+             ALTER TABLE p ATTACH PARTITION lone FOR VALUES IN (2);",
+            "cannot attach table \"lone\" as partition because it is referenced in publications \
+             \"x\", \"y\" EXCEPT clause",
+        ),
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE lone);
+             ALTER TABLE lone SET UNLOGGED;",
+            "cannot change table \"lone\" to unlogged because it is referenced by a publication",
+        ),
+        // An inheritance parent's children come along, in the EXCEPT
+        // clause too.
+        (
+            "CREATE PUBLICATION x FOR ALL TABLES EXCEPT (TABLE ih); ALTER TABLE ihc SET UNLOGGED;",
+            "cannot change table \"ihc\" to unlogged because it is referenced by a publication",
+        ),
+        (
+            "CREATE PUBLICATION x FOR TABLE ih; ALTER TABLE ihc SET UNLOGGED;",
+            "cannot change table \"ihc\" to unlogged because it is referenced by a publication",
+        ),
+        (
+            "CREATE PUBLICATION x FOR TABLE ih WHERE (a > 0), ihc;",
+            "conflicting or redundant WHERE clauses for table \"ihc\"",
+        ),
+        (
+            "CREATE PUBLICATION x FOR TABLE ihc, ih WHERE (a > 0);",
+            "conflicting or redundant WHERE clauses for table \"ih\"",
+        ),
+        // The relation opened last is named: ihc, added before ihc2 is met.
+        (
+            "CREATE TABLE ihc2 () INHERITS (ih); CREATE PUBLICATION x FOR TABLE ihc2, ih (a);",
+            "conflicting or redundant column lists for table \"ihc\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE PUBLICATION p_a FOR ALL TABLES EXCEPT (TABLE t, u);
+             CREATE PUBLICATION p_s FOR ALL SEQUENCES;
+             CREATE PUBLICATION p_ts FOR ALL TABLES, ALL SEQUENCES;
+             CREATE PUBLICATION p_e FOR ALL TABLES EXCEPT (TABLE p);
+             CREATE PUBLICATION p_o FOR TABLE ONLY ih WHERE (a > 0), ihc;
+             CREATE PUBLICATION x;
+             ALTER PUBLICATION x SET ALL TABLES EXCEPT (TABLE t);
+             ALTER PUBLICATION x SET ALL TABLES EXCEPT (TABLE lone);
+             ALTER PUBLICATION x SET (publish_via_partition_root = false);
+             ALTER PUBLICATION x SET ALL TABLES;
+             ALTER TABLE lone SET UNLOGGED;
+             DROP PUBLICATION p_o;
+             CREATE PUBLICATION y FOR ALL TABLES EXCEPT (TABLE ONLY ih);
+             ALTER TABLE ihc SET UNLOGGED;",
         ),
     ]);
 }
@@ -7413,8 +8013,8 @@ fn conversion_function_must_handle_the_encoding_pair() {
             "expected source encoding \"UTF8\", but got \"LATIN1\"",
         ),
         (
-            "CREATE CONVERSION c FOR 'KOI8R' TO 'EUC_JP' FROM koi8r_to_mic;",
-            "expected destination encoding \"MULE_INTERNAL\", but got \"EUC_JP\"",
+            "CREATE CONVERSION c FOR 'KOI8R' TO 'EUC_JP' FROM koi8r_to_utf8;",
+            "expected destination encoding \"UTF8\", but got \"EUC_JP\"",
         ),
         (
             "CREATE CONVERSION c FOR 'UTF8' TO 'EUC_JP' FROM utf8_to_iso8859;",
@@ -7460,18 +8060,12 @@ fn unsupported_relation_kinds_are_named_like_pg() {
     let setup = "CREATE TABLE pt (a int) PARTITION BY RANGE (a);
                  CREATE INDEX pti ON pt (a);";
     for (sql, message) in [
-        (
-            "ALTER SEQUENCE pti RESTART;",
-            "cannot open relation \"pti\" (This operation is not supported for partitioned indexes.)",
-        ),
+        ("ALTER SEQUENCE pti RESTART;", "\"pti\" is not a sequence"),
         (
             "SELECT 1; LOCK TABLE pti;",
             "cannot lock relation \"pti\" (This operation is not supported for partitioned indexes.)",
         ),
-        (
-            "ALTER SEQUENCE pt RESTART;",
-            "cannot open relation \"pt\" (This operation is not supported for partitioned tables.)",
-        ),
+        ("ALTER SEQUENCE pt RESTART;", "\"pt\" is not a sequence"),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", sql)]).expect_err(sql);
         assert_eq!(err.to_string(), message, "{sql}");
@@ -8077,11 +8671,11 @@ fn cluster_and_reindex_take_a_toast_table() {
         ),
         (
             "CLUSTER pg_database USING pg_database_oid_index;",
-            "cannot cluster a shared catalog",
+            "cannot execute CLUSTER on a shared catalog",
         ),
         (
             "CLUSTER pg_database USING pg_class_oid_index;",
-            "cannot cluster a shared catalog",
+            "\"pg_class_oid_index\" is not an index for table \"pg_database\"",
         ),
         (
             "CLUSTER pg_database USING nosuch;",
@@ -8089,7 +8683,7 @@ fn cluster_and_reindex_take_a_toast_table() {
         ),
         (
             "CLUSTER pg_toast.pg_toast_1262 USING pg_toast_1262_index;",
-            "cannot cluster a shared catalog",
+            "cannot execute CLUSTER on a shared catalog",
         ),
         (
             "CLUSTER t_b;",

@@ -363,10 +363,9 @@ fn a_failing_first_row_of_a_set_operation_fails_every_execution() {
             ("SELECT NULL::d INTERSECT SELECT 1 LIMIT 1", domain),
             ("SELECT 1 INTERSECT SELECT NULL::d LIMIT 1", domain),
             ("SELECT NULL::d INTERSECT SELECT a FROM t", domain),
-            (
-                "SELECT NULL::d INTERSECT SELECT a FROM t WHERE false",
-                domain,
-            ),
+            // An EXCEPT whose right input is proven empty still reads its
+            // left one.
+            ("SELECT NULL::d EXCEPT SELECT a FROM t WHERE false", domain),
             ("SELECT x FROM v INTERSECT SELECT 1 WHERE false", domain),
             // Past the first row, or an arm that may not be read.
             ("SELECT 1 UNION ALL SELECT NULL::d LIMIT 1", None),
@@ -379,6 +378,13 @@ fn a_failing_first_row_of_a_set_operation_fails_every_execution() {
             ("SELECT 1 WHERE false EXCEPT SELECT NULL::d", None),
             ("SELECT a FROM t EXCEPT SELECT NULL::d", None),
             ("SELECT a FROM t WHERE false INTERSECT SELECT NULL::d", None),
+            // PostgreSQL 19: an INTERSECT with an input proven empty (a
+            // dummy relation) runs neither.
+            ("SELECT NULL::d INTERSECT SELECT a FROM t WHERE false", None),
+            (
+                "SELECT NULL::d INTERSECT ALL SELECT a FROM t WHERE NULL",
+                None,
+            ),
             ("SELECT 1 WHERE false INTERSECT SELECT x FROM v", None),
             (
                 "(SELECT 1 UNION ALL SELECT NULL::d) INTERSECT SELECT 1 WHERE false",

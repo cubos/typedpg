@@ -121,19 +121,23 @@ enums!(
     ObjectType,
     DropBehavior,
     AlterTableType,
+    AlterDomainType,
     GrantTargetType,
     VariableSetKind,
     ConstrType,
     ImportForeignSchemaType,
     RoleStmtType,
     FetchDirection,
+    FetchDirectionKeywords,
     FunctionParameterMode,
     TransactionStmtKind,
     ViewCheckOption,
+    RepackCommand,
     DiscardMode,
     ReindexObjectType,
     AlterTsConfigType,
     PublicationObjSpecType,
+    PublicationAllObjType,
     AlterPublicationAction,
     AlterSubscriptionType,
     OverridingKind,
@@ -420,9 +424,9 @@ impl Equal for ast::Node {
             (Self::AlterDatabaseSetStmt(a), Self::AlterDatabaseSetStmt(b)) => a.equal(b),
             (Self::DropdbStmt(a), Self::DropdbStmt(b)) => a.equal(b),
             (Self::AlterSystemStmt(a), Self::AlterSystemStmt(b)) => a.equal(b),
-            (Self::ClusterStmt(a), Self::ClusterStmt(b)) => a.equal(b),
             (Self::VacuumStmt(a), Self::VacuumStmt(b)) => a.equal(b),
             (Self::VacuumRelation(a), Self::VacuumRelation(b)) => a.equal(b),
+            (Self::RepackStmt(a), Self::RepackStmt(b)) => a.equal(b),
             (Self::ExplainStmt(a), Self::ExplainStmt(b)) => a.equal(b),
             (Self::CreateTableAsStmt(a), Self::CreateTableAsStmt(b)) => a.equal(b),
             (Self::RefreshMatViewStmt(a), Self::RefreshMatViewStmt(b)) => a.equal(b),
@@ -443,11 +447,13 @@ impl Equal for ast::Node {
             (Self::AlterTsConfigurationStmt(a), Self::AlterTsConfigurationStmt(b)) => a.equal(b),
             (Self::PublicationTable(a), Self::PublicationTable(b)) => a.equal(b),
             (Self::PublicationObjSpec(a), Self::PublicationObjSpec(b)) => a.equal(b),
+            (Self::PublicationAllObjSpec(a), Self::PublicationAllObjSpec(b)) => a.equal(b),
             (Self::CreatePublicationStmt(a), Self::CreatePublicationStmt(b)) => a.equal(b),
             (Self::AlterPublicationStmt(a), Self::AlterPublicationStmt(b)) => a.equal(b),
             (Self::CreateSubscriptionStmt(a), Self::CreateSubscriptionStmt(b)) => a.equal(b),
             (Self::AlterSubscriptionStmt(a), Self::AlterSubscriptionStmt(b)) => a.equal(b),
             (Self::DropSubscriptionStmt(a), Self::DropSubscriptionStmt(b)) => a.equal(b),
+            (Self::WaitStmt(a), Self::WaitStmt(b)) => a.equal(b),
             (Self::Integer(a), Self::Integer(b)) => a.equal(b),
             (Self::Float(a), Self::Float(b)) => a.equal(b),
             (Self::Boolean(a), Self::Boolean(b)) => a.equal(b),
@@ -1633,11 +1639,6 @@ impl Equal for ast::Node {
                 a.equal_key(out);
                 out.push(')');
             }
-            Self::ClusterStmt(a) => {
-                out.push_str("ClusterStmt(");
-                a.equal_key(out);
-                out.push(')');
-            }
             Self::VacuumStmt(a) => {
                 out.push_str("VacuumStmt(");
                 a.equal_key(out);
@@ -1645,6 +1646,11 @@ impl Equal for ast::Node {
             }
             Self::VacuumRelation(a) => {
                 out.push_str("VacuumRelation(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::RepackStmt(a) => {
+                out.push_str("RepackStmt(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -1748,6 +1754,11 @@ impl Equal for ast::Node {
                 a.equal_key(out);
                 out.push(')');
             }
+            Self::PublicationAllObjSpec(a) => {
+                out.push_str("PublicationAllObjSpec(");
+                a.equal_key(out);
+                out.push(')');
+            }
             Self::CreatePublicationStmt(a) => {
                 out.push_str("CreatePublicationStmt(");
                 a.equal_key(out);
@@ -1770,6 +1781,11 @@ impl Equal for ast::Node {
             }
             Self::DropSubscriptionStmt(a) => {
                 out.push_str("DropSubscriptionStmt(");
+                a.equal_key(out);
+                out.push(')');
+            }
+            Self::WaitStmt(a) => {
+                out.push_str("WaitStmt(");
                 a.equal_key(out);
                 out.push(')');
             }
@@ -2218,6 +2234,7 @@ impl Equal for ast::WindowFunc {
             && self.winref.equal(&other.winref)
             && self.winstar.equal(&other.winstar)
             && self.winagg.equal(&other.winagg)
+            && self.ignore_nulls.equal(&other.ignore_nulls)
     }
 
     fn equal_key(&self, out: &mut String) {
@@ -2232,6 +2249,7 @@ impl Equal for ast::WindowFunc {
         self.winref.equal_key(out);
         self.winstar.equal_key(out);
         self.winagg.equal_key(out);
+        self.ignore_nulls.equal_key(out);
         out.push('}');
     }
 }
@@ -2468,12 +2486,14 @@ impl Equal for ast::SubPlan {
             && self.first_col_type.equal(&other.first_col_type)
             && self.first_col_typmod.equal(&other.first_col_typmod)
             && self.first_col_collation.equal(&other.first_col_collation)
+            && self.is_init_plan.equal(&other.is_init_plan)
             && self.use_hash_table.equal(&other.use_hash_table)
             && self.unknown_eq_false.equal(&other.unknown_eq_false)
             && self.parallel_safe.equal(&other.parallel_safe)
             && self.set_param.equal(&other.set_param)
             && self.par_param.equal(&other.par_param)
             && self.args.equal(&other.args)
+            && self.disabled_nodes.equal(&other.disabled_nodes)
             && self.startup_cost.equal(&other.startup_cost)
             && self.per_call_cost.equal(&other.per_call_cost)
     }
@@ -2488,12 +2508,14 @@ impl Equal for ast::SubPlan {
         self.first_col_type.equal_key(out);
         self.first_col_typmod.equal_key(out);
         self.first_col_collation.equal_key(out);
+        self.is_init_plan.equal_key(out);
         self.use_hash_table.equal_key(out);
         self.unknown_eq_false.equal_key(out);
         self.parallel_safe.equal_key(out);
         self.set_param.equal_key(out);
         self.par_param.equal_key(out);
         self.args.equal_key(out);
+        self.disabled_nodes.equal_key(out);
         self.startup_cost.equal_key(out);
         self.per_call_cost.equal_key(out);
         out.push('}');
@@ -2880,6 +2902,8 @@ impl Equal for ast::JsonConstructorExpr {
             && self.func.equal(&other.func)
             && self.coercion.equal(&other.coercion)
             && self.returning.equal(&other.returning)
+            && self.orig_query.equal(&other.orig_query)
+            && self.format.equal(&other.format)
             && self.absent_on_null.equal(&other.absent_on_null)
             && self.unique.equal(&other.unique)
     }
@@ -2891,6 +2915,8 @@ impl Equal for ast::JsonConstructorExpr {
         self.func.equal_key(out);
         self.coercion.equal_key(out);
         self.returning.equal_key(out);
+        self.orig_query.equal_key(out);
+        self.format.equal_key(out);
         self.absent_on_null.equal_key(out);
         self.unique.equal_key(out);
         out.push('}');
@@ -2903,6 +2929,7 @@ impl Equal for ast::JsonIsPredicate {
             && self.format.equal(&other.format)
             && self.item_type.equal(&other.item_type)
             && self.unique_keys.equal(&other.unique_keys)
+            && self.expr_base_type.equal(&other.expr_base_type)
     }
 
     fn equal_key(&self, out: &mut String) {
@@ -2911,6 +2938,7 @@ impl Equal for ast::JsonIsPredicate {
         self.format.equal_key(out);
         self.item_type.equal_key(out);
         self.unique_keys.equal_key(out);
+        self.expr_base_type.equal_key(out);
         out.push('}');
     }
 }
@@ -3263,6 +3291,7 @@ impl Equal for ast::OnConflictExpr {
             && self.arbiter_elems.equal(&other.arbiter_elems)
             && self.arbiter_where.equal(&other.arbiter_where)
             && self.constraint.equal(&other.constraint)
+            && self.lock_strength.equal(&other.lock_strength)
             && self.on_conflict_set.equal(&other.on_conflict_set)
             && self.on_conflict_where.equal(&other.on_conflict_where)
             && self.excl_rel_index.equal(&other.excl_rel_index)
@@ -3275,6 +3304,7 @@ impl Equal for ast::OnConflictExpr {
         self.arbiter_elems.equal_key(out);
         self.arbiter_where.equal_key(out);
         self.constraint.equal_key(out);
+        self.lock_strength.equal_key(out);
         self.on_conflict_set.equal_key(out);
         self.on_conflict_where.equal_key(out);
         self.excl_rel_index.equal_key(out);
@@ -3493,6 +3523,7 @@ impl Equal for ast::FuncCall {
             && self.agg_order.equal(&other.agg_order)
             && self.agg_filter.equal(&other.agg_filter)
             && self.over.equal(&other.over)
+            && self.ignore_nulls.equal(&other.ignore_nulls)
             && self.agg_within_group.equal(&other.agg_within_group)
             && self.agg_star.equal(&other.agg_star)
             && self.agg_distinct.equal(&other.agg_distinct)
@@ -3507,6 +3538,7 @@ impl Equal for ast::FuncCall {
         self.agg_order.equal_key(out);
         self.agg_filter.equal_key(out);
         self.over.equal_key(out);
+        self.ignore_nulls.equal_key(out);
         self.agg_within_group.equal_key(out);
         self.agg_star.equal_key(out);
         self.agg_distinct.equal_key(out);
@@ -4252,6 +4284,7 @@ impl Equal for ast::OnConflictClause {
     fn equal(&self, other: &Self) -> bool {
         self.action.equal(&other.action)
             && self.infer.equal(&other.infer)
+            && self.lock_strength.equal(&other.lock_strength)
             && self.target_list.equal(&other.target_list)
             && self.where_clause.equal(&other.where_clause)
     }
@@ -4260,6 +4293,7 @@ impl Equal for ast::OnConflictClause {
         out.push('{');
         self.action.equal_key(out);
         self.infer.equal_key(out);
+        self.lock_strength.equal_key(out);
         self.target_list.equal_key(out);
         self.where_clause.equal_key(out);
         out.push('}');
@@ -6044,6 +6078,7 @@ impl Equal for ast::FetchStmt {
             && self.how_many.equal(&other.how_many)
             && self.portalname.equal(&other.portalname)
             && self.ismove.equal(&other.ismove)
+            && self.direction_keyword.equal(&other.direction_keyword)
     }
 
     fn equal_key(&self, out: &mut String) {
@@ -6052,6 +6087,7 @@ impl Equal for ast::FetchStmt {
         self.how_many.equal_key(out);
         self.portalname.equal_key(out);
         self.ismove.equal_key(out);
+        self.direction_keyword.equal_key(out);
         out.push('}');
     }
 }
@@ -6658,22 +6694,6 @@ impl Equal for ast::AlterSystemStmt {
     }
 }
 
-impl Equal for ast::ClusterStmt {
-    fn equal(&self, other: &Self) -> bool {
-        self.relation.equal(&other.relation)
-            && self.indexname.equal(&other.indexname)
-            && self.params.equal(&other.params)
-    }
-
-    fn equal_key(&self, out: &mut String) {
-        out.push('{');
-        self.relation.equal_key(out);
-        self.indexname.equal_key(out);
-        self.params.equal_key(out);
-        out.push('}');
-    }
-}
-
 impl Equal for ast::VacuumStmt {
     fn equal(&self, other: &Self) -> bool {
         self.options.equal(&other.options)
@@ -6702,6 +6722,26 @@ impl Equal for ast::VacuumRelation {
         self.relation.equal_key(out);
         self.oid.equal_key(out);
         self.va_cols.equal_key(out);
+        out.push('}');
+    }
+}
+
+impl Equal for ast::RepackStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.command.equal(&other.command)
+            && self.relation.equal(&other.relation)
+            && self.indexname.equal(&other.indexname)
+            && self.usingindex.equal(&other.usingindex)
+            && self.params.equal(&other.params)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.command.equal_key(out);
+        self.relation.equal_key(out);
+        self.indexname.equal_key(out);
+        self.usingindex.equal_key(out);
+        self.params.equal_key(out);
         out.push('}');
     }
 }
@@ -6757,11 +6797,12 @@ impl Equal for ast::RefreshMatViewStmt {
 
 impl Equal for ast::CheckPointStmt {
     fn equal(&self, other: &Self) -> bool {
-        true
+        self.options.equal(&other.options)
     }
 
     fn equal_key(&self, out: &mut String) {
         out.push('{');
+        self.options.equal_key(out);
         out.push('}');
     }
 }
@@ -6995,6 +7036,7 @@ impl Equal for ast::PublicationTable {
         self.relation.equal(&other.relation)
             && self.where_clause.equal(&other.where_clause)
             && self.columns.equal(&other.columns)
+            && self.except.equal(&other.except)
     }
 
     fn equal_key(&self, out: &mut String) {
@@ -7002,6 +7044,7 @@ impl Equal for ast::PublicationTable {
         self.relation.equal_key(out);
         self.where_clause.equal_key(out);
         self.columns.equal_key(out);
+        self.except.equal_key(out);
         out.push('}');
     }
 }
@@ -7022,12 +7065,26 @@ impl Equal for ast::PublicationObjSpec {
     }
 }
 
+impl Equal for ast::PublicationAllObjSpec {
+    fn equal(&self, other: &Self) -> bool {
+        self.pubobjtype.equal(&other.pubobjtype) && self.except_tables.equal(&other.except_tables)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.pubobjtype.equal_key(out);
+        self.except_tables.equal_key(out);
+        out.push('}');
+    }
+}
+
 impl Equal for ast::CreatePublicationStmt {
     fn equal(&self, other: &Self) -> bool {
         self.pubname.equal(&other.pubname)
             && self.options.equal(&other.options)
             && self.pubobjects.equal(&other.pubobjects)
             && self.for_all_tables.equal(&other.for_all_tables)
+            && self.for_all_sequences.equal(&other.for_all_sequences)
     }
 
     fn equal_key(&self, out: &mut String) {
@@ -7036,6 +7093,7 @@ impl Equal for ast::CreatePublicationStmt {
         self.options.equal_key(out);
         self.pubobjects.equal_key(out);
         self.for_all_tables.equal_key(out);
+        self.for_all_sequences.equal_key(out);
         out.push('}');
     }
 }
@@ -7045,8 +7103,9 @@ impl Equal for ast::AlterPublicationStmt {
         self.pubname.equal(&other.pubname)
             && self.options.equal(&other.options)
             && self.pubobjects.equal(&other.pubobjects)
-            && self.for_all_tables.equal(&other.for_all_tables)
             && self.action.equal(&other.action)
+            && self.for_all_tables.equal(&other.for_all_tables)
+            && self.for_all_sequences.equal(&other.for_all_sequences)
     }
 
     fn equal_key(&self, out: &mut String) {
@@ -7054,8 +7113,9 @@ impl Equal for ast::AlterPublicationStmt {
         self.pubname.equal_key(out);
         self.options.equal_key(out);
         self.pubobjects.equal_key(out);
-        self.for_all_tables.equal_key(out);
         self.action.equal_key(out);
+        self.for_all_tables.equal_key(out);
+        self.for_all_sequences.equal_key(out);
         out.push('}');
     }
 }
@@ -7063,6 +7123,7 @@ impl Equal for ast::AlterPublicationStmt {
 impl Equal for ast::CreateSubscriptionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.subname.equal(&other.subname)
+            && self.servername.equal(&other.servername)
             && self.conninfo.equal(&other.conninfo)
             && self.publication.equal(&other.publication)
             && self.options.equal(&other.options)
@@ -7071,6 +7132,7 @@ impl Equal for ast::CreateSubscriptionStmt {
     fn equal_key(&self, out: &mut String) {
         out.push('{');
         self.subname.equal_key(out);
+        self.servername.equal_key(out);
         self.conninfo.equal_key(out);
         self.publication.equal_key(out);
         self.options.equal_key(out);
@@ -7082,6 +7144,7 @@ impl Equal for ast::AlterSubscriptionStmt {
     fn equal(&self, other: &Self) -> bool {
         self.kind.equal(&other.kind)
             && self.subname.equal(&other.subname)
+            && self.servername.equal(&other.servername)
             && self.conninfo.equal(&other.conninfo)
             && self.publication.equal(&other.publication)
             && self.options.equal(&other.options)
@@ -7091,6 +7154,7 @@ impl Equal for ast::AlterSubscriptionStmt {
         out.push('{');
         self.kind.equal_key(out);
         self.subname.equal_key(out);
+        self.servername.equal_key(out);
         self.conninfo.equal_key(out);
         self.publication.equal_key(out);
         self.options.equal_key(out);
@@ -7110,6 +7174,19 @@ impl Equal for ast::DropSubscriptionStmt {
         self.subname.equal_key(out);
         self.missing_ok.equal_key(out);
         self.behavior.equal_key(out);
+        out.push('}');
+    }
+}
+
+impl Equal for ast::WaitStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.lsn_literal.equal(&other.lsn_literal) && self.options.equal(&other.options)
+    }
+
+    fn equal_key(&self, out: &mut String) {
+        out.push('{');
+        self.lsn_literal.equal_key(out);
+        self.options.equal_key(out);
         out.push('}');
     }
 }

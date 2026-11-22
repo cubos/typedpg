@@ -6,7 +6,7 @@
  * Note this is read in MinGW as well as native Windows builds,
  * but not in Cygwin builds.
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port/win32_port.h
@@ -194,7 +194,7 @@ extern DWORD pgwin32_get_file_type(HANDLE hFile);
  * with 64-bit offsets.  Also, fseek() might not give an error for unseekable
  * streams, so harden that function with our version.
  */
-#define pgoff_t __int64
+typedef __int64 pgoff_t;
 
 #ifdef _MSC_VER
 extern int	_pgfseeko64(FILE *stream, pgoff_t offset, int origin);
@@ -341,9 +341,9 @@ extern int	_pglstat64(const char *name, struct stat *buf);
  * converts these to the equivalent CreateFile() flags, along with the ones
  * from fcntl.h.
  */
-#define	O_CLOEXEC	0x04000000
+#define	O_CLOEXEC	_O_NOINHERIT
 #define	O_DIRECT	0x80000000
-#define	O_DSYNC		_O_NOINHERIT
+#define	O_DSYNC		0x04000000
 
 /*
  * Supplement to <errno.h>.
@@ -505,7 +505,7 @@ extern SOCKET pgwin32_socket(int af, int type, int protocol);
 extern int	pgwin32_bind(SOCKET s, struct sockaddr *addr, int addrlen);
 extern int	pgwin32_listen(SOCKET s, int backlog);
 extern SOCKET pgwin32_accept(SOCKET s, struct sockaddr *addr, int *addrlen);
-extern int	pgwin32_connect(SOCKET s, const struct sockaddr *name, int namelen);
+extern int	pgwin32_connect(SOCKET s, const struct sockaddr *addr, int addrlen);
 extern int	pgwin32_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, const struct timeval *timeout);
 extern int	pgwin32_recv(SOCKET s, char *buf, int len, int flags);
 extern int	pgwin32_send(SOCKET s, const void *buf, int len, int flags);
@@ -581,9 +581,9 @@ typedef unsigned short mode_t;
 #endif
 
 /* in port/win32pread.c */
-extern ssize_t pg_pread(int fd, void *buf, size_t nbyte, off_t offset);
+extern ssize_t pg_pread(int fd, void *buf, size_t size, pgoff_t offset);
 
 /* in port/win32pwrite.c */
-extern ssize_t pg_pwrite(int fd, const void *buf, size_t nbyte, off_t offset);
+extern ssize_t pg_pwrite(int fd, const void *buf, size_t size, pgoff_t offset);
 
 #endif							/* PG_WIN32_PORT_H */

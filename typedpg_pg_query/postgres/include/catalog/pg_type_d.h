@@ -3,7 +3,7 @@
  * pg_type_d.h
  *    Macro definitions for pg_type
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -197,6 +197,7 @@
 #define REGTYPEOID 2206
 #define REGROLEOID 4096
 #define REGNAMESPACEOID 4089
+#define REGDATABASEOID 6490
 #define UUIDOID 2950
 #define PG_LSNOID 3220
 #define TSVECTOROID 3614
@@ -246,6 +247,7 @@
 #define ANYCOMPATIBLEMULTIRANGEOID 4538
 #define PG_BRIN_BLOOM_SUMMARYOID 4600
 #define PG_BRIN_MINMAX_MULTI_SUMMARYOID 4601
+#define OID8OID 6437
 #define BOOLARRAYOID 1000
 #define BYTEAARRAYOID 1001
 #define CHARARRAYOID 1002
@@ -303,6 +305,7 @@
 #define REGTYPEARRAYOID 2211
 #define REGROLEARRAYOID 4097
 #define REGNAMESPACEARRAYOID 4090
+#define REGDATABASEARRAYOID 6491
 #define UUIDARRAYOID 2951
 #define PG_LSNARRAYOID 3221
 #define TSVECTORARRAYOID 3643
@@ -327,5 +330,6 @@
 #define DATEMULTIRANGEARRAYOID 6155
 #define INT8MULTIRANGEARRAYOID 6157
 #define CSTRINGARRAYOID 1263
+#define OID8ARRAYOID 6442
 
 #endif							/* PG_TYPE_D_H */

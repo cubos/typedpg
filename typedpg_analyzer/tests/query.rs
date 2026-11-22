@@ -78,6 +78,8 @@ mod named_args;
 mod null_narrowing;
 #[path = "query/nullability_soundness.rs"]
 mod nullability_soundness;
+#[path = "query/on_conflict_do_select.rs"]
+mod on_conflict_do_select;
 #[path = "query/params.rs"]
 mod params;
 #[path = "query/query_view.rs"]

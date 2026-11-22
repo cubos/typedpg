@@ -7,7 +7,7 @@
  * typedpg ships (glibc and musl Linux on x86_64 and aarch64, macOS on x86_64
  * and aarch64, and MSVC on Windows x64).  Each block below restores what
  * PostgreSQL's own configure/meson would have found on that target; the
- * reference for the answers is PostgreSQL 18.7's meson.build (the checks are
+ * reference for the answers is PostgreSQL 19.0's meson.build (the checks are
  * the same ones configure runs) and libpg_query's hand-maintained
  * pg_config.h, whose builds already cover these platforms.
  *
@@ -110,11 +110,14 @@
  * Headers that do not exist on every target.  MSVC has no <strings.h>,
  * <syslog.h>, <termios.h> or <unistd.h>; PostgreSQL ships stand-ins for the
  * few unistd symbols its code needs under port/win32_msvc/, which build.rs
- * puts on the include path.  <xlocale.h> and <copyfile.h> are macOS-only.
+ * puts on the include path.  <xlocale.h> and <copyfile.h> are macOS-only;
+ * <uchar.h> (C11, read by c.h since PostgreSQL 19) is the one macOS lacks,
+ * where c.h falls back to its own char16_t/char32_t typedefs.
  */
 #undef HAVE_XLOCALE_H
 #undef HAVE_COPYFILE
 #undef HAVE_COPYFILE_H
+#undef HAVE_UCHAR_H
 #undef HAVE_STRINGS_H
 #undef HAVE_SYSLOG
 #undef HAVE_TERMIOS_H
@@ -123,6 +126,9 @@
 #define HAVE_XLOCALE_H 1
 #define HAVE_COPYFILE 1
 #define HAVE_COPYFILE_H 1
+#endif
+#ifndef __APPLE__
+#define HAVE_UCHAR_H 1
 #endif
 #ifndef _WIN32
 #define HAVE_STRINGS_H 1
@@ -196,9 +202,19 @@
  * PostgreSQL's meson.build reaches the same answers because its checks use
  * GNU syntax that cl rejects; libpg_query's pg_config.h has the same list.
  * MSVC does provide <intrin.h>'s __cpuid/__cpuidex, <immintrin.h>'s _xgetbv
- * and the AVX-512 intrinsics, which pg_bitutils.c and pg_popcount_avx512.c
+ * and the AVX-512 intrinsics, which pg_cpu_x86.c and pg_popcount_x86.c
  * use instead, so those checks (which compile with cl) stay defined.
  */
+
+/*
+ * configure finds C23's typeof_unqual keyword when the import machine's
+ * compiler defaults to C23 (GCC 15 and later), but the crate compiles the
+ * tree as gnu11/c11, where the keyword does not exist, and with older
+ * compilers on some targets.  Only nodes.h's copyObject() uses it, to cast
+ * copyObjectImpl()'s result; without it, copyObject() returns void *.
+ */
+#undef HAVE_TYPEOF_UNQUAL
+
 #ifdef _MSC_VER
 #undef HAVE_COMPUTED_GOTO
 #undef HAVE_TYPEOF
@@ -247,9 +263,9 @@
  * ------------------------------------------------------------------------- */
 
 /*
- * x86-64-only code.  pg_bitutils.c's cpuid-driven POPCNT path requires
+ * x86-64-only code.  pg_cpu_x86.c's cpuid-driven feature checks require
  * <cpuid.h> (GCC/Clang on x86) or <intrin.h> (MSVC on x86), and
- * pg_popcount_avx512.c is compiled only with USE_AVX512_POPCNT_WITH_RUNTIME_CHECK.
+ * pg_popcount_x86.c uses AVX-512 only with USE_AVX512_POPCNT_WITH_RUNTIME_CHECK.
  * aarch64 uses src/port/pg_popcount_aarch64.c (Neon) instead; the CRC
  * sources those USE_*_CRC32C defines select are not imported at all, so
  * leaving them set on arm would misdescribe nothing but is still wrong.

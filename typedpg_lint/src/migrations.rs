@@ -2110,8 +2110,23 @@ fn lock_target(
                 "REFRESH MATERIALIZED VIEW",
             )
         }
-        N::ClusterStmt(cluster) => {
-            existing_relation(catalog, pre_existing, cluster.relation.as_ref()?, "CLUSTER")
+        N::RepackStmt(repack) => {
+            // REPACK (CONCURRENTLY) holds ShareUpdateExclusiveLock until
+            // its final swap.
+            if option_enabled(&repack.params, "concurrently") {
+                return None;
+            }
+            let command = if repack.command == typedpg_pg_query::ast::RepackCommand::Cluster {
+                "CLUSTER"
+            } else {
+                "REPACK"
+            };
+            existing_relation(
+                catalog,
+                pre_existing,
+                repack.relation.as_ref()?.relation.as_ref()?,
+                command,
+            )
         }
         N::VacuumStmt(vacuum) => {
             if !vacuum.is_vacuumcmd || !option_enabled(&vacuum.options, "full") {

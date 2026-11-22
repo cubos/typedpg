@@ -1406,7 +1406,7 @@ fn view_and_materialized_view_ddl_follows_postgres_checks() {
         (
             "CREATE TEMP TABLE tt (a int);",
             "CREATE MATERIALIZED VIEW mv AS SELECT a FROM tt;",
-            "materialized views must not use temporary tables or views",
+            "materialized views must not use temporary objects",
         ),
         (
             "",

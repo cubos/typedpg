@@ -1261,23 +1261,33 @@ fn create_table_as_needs_a_derived_collation() {
 }
 
 #[test]
-fn create_table_as_with_data_takes_the_planned_collation() {
-    // PG 18 (ExecCreateTableAs): CREATE TABLE AS / SELECT INTO with data,
-    // and CREATE TABLE AS EXECUTE, take their columns from the *planned*
-    // query, where eval_const_expressions has replaced a CASE with constant
-    // conditions by the result it picks, a COALESCE by its leading
-    // constant, a sublink by a Param of the planned subquery's collation —
-    // and a node over them keeps its parsed collation. A view, a
-    // materialized view and WITH NO DATA read the parsed query.
+fn create_table_as_takes_the_parsed_collation() {
+    // CREATE TABLE AS / SELECT INTO with data take their columns from the
+    // planned query (ExecCreateTableAs), but since PostgreSQL 19 the
+    // planner relabels a CASE, COALESCE or NULLIF it folds to keep its
+    // parsed collation (applyRelabelType): a column is collated as parse
+    // analysis derived it, with data or WITH NO DATA, as a view or a
+    // materialized view is.
     let setup = r#"CREATE TABLE c1 (b text COLLATE "C", v varchar(20) COLLATE "C");
-                   CREATE TABLE c2 (b text COLLATE "POSIX");
-                   CREATE FUNCTION f(a text, b text) RETURNS text LANGUAGE sql AS 'SELECT a';"#;
+                   CREATE TABLE c2 (b text COLLATE "POSIX");"#;
     let fold = "CASE WHEN true THEN c1.b ELSE c2.b END";
     let no_collation =
         |ty: &str| format!(r#"no collation was derived for column "x" with collatable type {ty}"#);
     for (stmt, msg) in [
         (
+            format!("CREATE TABLE t AS SELECT {fold} AS x FROM c1, c2;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT {fold} AS x FROM c1, c2 WITH DATA;"),
+            no_collation("text"),
+        ),
+        (
             format!("CREATE TABLE t AS SELECT {fold} AS x FROM c1, c2 WITH NO DATA;"),
+            no_collation("text"),
+        ),
+        (
+            format!("SELECT {fold} AS x INTO t FROM c1, c2;"),
             no_collation("text"),
         ),
         (
@@ -1285,64 +1295,58 @@ fn create_table_as_with_data_takes_the_planned_collation() {
             no_collation("text"),
         ),
         (
-            format!("CREATE MATERIALIZED VIEW t AS SELECT {fold} AS x FROM c1, c2 WITH NO DATA;"),
-            no_collation("text"),
-        ),
-        (
             format!("CREATE VIEW t AS SELECT {fold} AS x FROM c1, c2;"),
             r#"could not determine which collation to use for view column "x""#.into(),
         ),
-        // The folded CASE is a subquery's column that has none.
         (
-            "CREATE TABLE t AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x \
-             FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s;"
+            "CREATE TABLE t AS SELECT CASE WHEN false THEN c1.b ELSE c2.b END AS x FROM c1, c2;"
                 .into(),
             no_collation("text"),
         ),
         (
-            "CREATE TABLE t AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x \
-             FROM (SELECT b FROM c1 UNION ALL SELECT b FROM c2) s;"
-                .into(),
-            no_collation("text"),
-        ),
-        // Conditions that aren't constant keep the CASE.
-        (
-            "CREATE TABLE t AS SELECT CASE WHEN c1.b = 'a' THEN c1.b WHEN true THEN c2.b END \
-             AS x FROM c1, c2;"
-                .into(),
-            no_collation("text"),
-        ),
-        (
-            "CREATE TABLE t AS SELECT CASE WHEN c1.b IS NULL THEN c1.b ELSE c2.b END AS x \
+            "CREATE TABLE t AS SELECT CASE WHEN NULL THEN c1.b WHEN true THEN c2.b END AS x \
              FROM c1, c2;"
                 .into(),
             no_collation("text"),
         ),
         (
-            "CREATE TABLE t AS SELECT CASE WHEN length(c1.b) > 1 THEN c1.b ELSE c2.b END AS x \
-             FROM c1, c2;"
+            "CREATE TABLE t AS SELECT CASE WHEN false THEN c1.b || c2.b END AS x FROM c1, c2;"
                 .into(),
             no_collation("text"),
         ),
         (
-            "CREATE TABLE t AS SELECT CASE c1.b WHEN 'a' THEN c1.b ELSE c2.b END AS x \
-             FROM c1, c2;"
+            "CREATE TABLE t AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE c2.b END AS x FROM c1, c2;"
                 .into(),
             no_collation("text"),
         ),
-        // COALESCE stays unless a constant leads it.
+        (
+            "CREATE TABLE t AS SELECT CASE WHEN true THEN c1.v ELSE c2.b END AS x FROM c1, c2;"
+                .into(),
+            no_collation("text"),
+        ),
+        (
+            "CREATE TABLE t AS SELECT COALESCE('a', c1.b, c2.b) AS x FROM c1, c2;".into(),
+            no_collation("text"),
+        ),
         (
             "CREATE TABLE t AS SELECT COALESCE(NULL, c1.b, c2.b) AS x FROM c1, c2;".into(),
-            no_collation("text"),
-        ),
-        // A node over a folded one keeps its own collation.
-        (
-            "CREATE TABLE t AS SELECT COALESCE(NULL, c1.b) || c2.b AS x FROM c1, c2;".into(),
             no_collation("text"),
         ),
         (
             format!("CREATE TABLE t AS SELECT ({fold})::varchar AS x FROM c1, c2;"),
             no_collation("character varying"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT ({fold})::text AS x FROM c1, c2;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT (SELECT {fold} FROM c1, c2) AS x;"),
+            no_collation("text"),
+        ),
+        (
+            format!("CREATE TABLE t AS SELECT ARRAY(SELECT {fold} FROM c1, c2) AS x;"),
+            no_collation("text[]"),
         ),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
@@ -1352,34 +1356,17 @@ fn create_table_as_with_data_takes_the_planned_collation() {
         ("0001.sql", setup),
         (
             "0002.sql",
-            &format!(
-                r#"CREATE TABLE a1 AS SELECT {fold} AS x FROM c1, c2;
-                   CREATE TABLE a2 AS SELECT {fold} AS x FROM c1, c2 WITH DATA;
-                   SELECT {fold} AS x INTO a3 FROM c1, c2;
-                   PREPARE p AS SELECT {fold} AS x FROM c1, c2;
-                   CREATE TABLE a4 AS EXECUTE p WITH NO DATA;
-                   CREATE TABLE a5 AS SELECT CASE WHEN false THEN c1.b ELSE c2.b END AS x
-                                      FROM c1, c2;
-                   CREATE TABLE a6 AS SELECT CASE WHEN NULL THEN c1.b WHEN true THEN c2.b END AS x
-                                      FROM c1, c2;
-                   CREATE TABLE a7 AS SELECT CASE WHEN false THEN c1.b || c2.b END AS x
-                                      FROM c1, c2;
-                   CREATE TABLE a8 AS SELECT CASE WHEN false THEN c1.b ELSE 'x' END AS x FROM c1;
-                   CREATE TABLE a9 AS SELECT COALESCE('a', c1.b, c2.b) AS x FROM c1, c2;
-                   CREATE TABLE a10 AS SELECT COALESCE(NULL, 'a', c1.b) AS x FROM c1, c2;
-                   CREATE TABLE a11 AS SELECT ({fold})::text AS x FROM c1, c2;
-                   CREATE TABLE a12 AS SELECT (SELECT {fold} FROM c1, c2) AS x;
-                   CREATE TABLE a13 AS SELECT CASE WHEN true THEN c1.v ELSE c2.b END AS x
-                                       FROM c1, c2;
-                   CREATE TABLE a14 AS SELECT CASE WHEN NOT (false AND c1.b = 'a') THEN c1.b
-                                       ELSE c2.b END AS x FROM c1, c2;
-                   CREATE TABLE a15 AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x
-                                       FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s
-                                       WITH NO DATA;
-                   CREATE TABLE a16 AS SELECT CASE WHEN true OR c1.b = 'a' THEN c1.b ELSE c2.b END
-                                      AS x FROM c1, c2;
-                   CREATE TABLE a17 AS SELECT ARRAY(SELECT {fold} FROM c1, c2) AS x;"#
-            ),
+            r#"CREATE TABLE a1 AS SELECT CASE WHEN false THEN c1.b ELSE 'x' END AS x FROM c1;
+               CREATE TABLE a2 AS SELECT COALESCE(NULL, 'a', c1.b) AS x FROM c1, c2;
+               CREATE TABLE a3 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;
+               CREATE TABLE a4 AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
+               CREATE TABLE a5 AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x
+                                  FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s;
+               CREATE TABLE a6 AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x
+                                  FROM (SELECT b FROM c1 UNION ALL SELECT b FROM c2) s;
+               CREATE TABLE a7 AS SELECT CASE WHEN true THEN s.b ELSE 'x' END AS x
+                                  FROM (SELECT c1.b || c2.b AS b FROM c1, c2) s
+                                  WITH NO DATA;"#,
         ),
     ]);
     let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
@@ -1388,555 +1375,66 @@ fn create_table_as_with_data_takes_the_planned_collation() {
         ("a2", collated("C")),
         ("a3", collated("C")),
         ("a4", collated("C")),
-        ("a5", collated("POSIX")),
-        ("a6", collated("POSIX")),
+        ("a5", text()),
+        ("a6", text()),
         ("a7", text()),
-        ("a8", text()),
-        ("a9", text()),
-        ("a10", text()),
-        ("a11", collated("C")),
-        ("a12", collated("C")),
-        ("a13", collated("C")),
-        ("a14", collated("C")),
-        ("a15", text()),
-        ("a16", collated("C")),
     ] {
         let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
         assert_cols(&info, vec![cn("x", ty)]);
     }
-    let info = db.analyze("SELECT x FROM a17").unwrap();
-    assert_cols(&info, vec![cn("x", array_of(collated("C")))]);
-    // An integer comparison of constants folds; a pulled-up subquery's
-    // output, or an inlined CTE's, is the expression it planned to.
+}
+
+#[test]
+fn create_table_as_over_a_subquery_takes_the_parsed_collation() {
+    // A pulled-up subquery's or inlined CTE's output, or a trivial
+    // subquery scan the planner removes, is collated as the subquery's
+    // target list was parsed (PostgreSQL 19 keeps a folded CASE's
+    // collation); an outer node over it derives its own.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");"#;
+    let fold = "CASE WHEN true THEN c1.b ELSE c2.b END";
+    let no_collation = r#"no collation was derived for column "x" with collatable type text"#;
+    for stmt in [
+        format!("CREATE TABLE t AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2 OFFSET 0) s;"),
+        format!("CREATE TABLE t AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2) s;"),
+        format!("CREATE TABLE t AS WITH s AS (SELECT {fold} AS x FROM c1, c2) SELECT x FROM s;"),
+        format!("CREATE TABLE t AS SELECT (s).x FROM (SELECT {fold} AS x FROM c1, c2) s;"),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
+        assert!(
+            err.to_string().starts_with(no_collation),
+            "{stmt}\n  got: {err}"
+        );
+    }
     let db = build_db(&[
         ("0001.sql", setup),
         (
             "0002.sql",
             &format!(
-                r#"CREATE TABLE b1 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE c2.b END AS x
-                                      FROM c1, c2;
-                   CREATE TABLE b2 AS SELECT CASE WHEN 2 < 1 THEN c1.b ELSE c2.b END AS x
-                                      FROM c1, c2;
-                   CREATE TABLE b3 AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2) s;
-                   CREATE TABLE b4 AS WITH s AS (SELECT {fold} AS x FROM c1, c2) SELECT x FROM s;
-                   CREATE TABLE b5 AS SELECT (s).x FROM (SELECT {fold} AS x FROM c1, c2) s;
-                   CREATE TABLE b7 AS SELECT x FROM (SELECT x FROM (SELECT {fold} AS x
-                                      FROM c1, c2) s1) s2;
-                   CREATE TABLE b8 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x FROM c1;
-                   CREATE TABLE b9 AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
-                   CREATE TABLE b10 AS SELECT CASE WHEN NULL::int > 0 THEN c1.b ELSE c2.b END
-                                       AS x FROM c1, c2;"#
+                "CREATE TABLE a1 AS SELECT CASE WHEN true THEN x END AS x
+                                   FROM (SELECT {fold} AS x FROM c1, c2 OFFSET 0) s;"
             ),
         ),
     ]);
-    for (table, ty) in [
-        ("b1", collated("C")),
-        ("b2", collated("POSIX")),
-        ("b3", collated("C")),
-        ("b4", collated("C")),
-        // A field of the subquery's row is its column (ParseComplexProjection).
-        ("b5", collated("C")),
-        ("b7", collated("C")),
-        ("b8", collated("C")),
-        ("b9", text()),
-        ("b10", collated("POSIX")),
-    ] {
-        let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
-        assert_cols(&info, vec![cn("x", ty)]);
-    }
-    // Which a view combining it with another collation can't settle.
-    for (stmt, msg) in [
-        (
-            "CREATE VIEW w AS SELECT b3.x || c2.b AS y FROM b3, c2;",
-            r#"could not determine which collation to use for view column "y""#,
-        ),
-        (
-            "CREATE VIEW w AS SELECT b4.x || c2.b AS y FROM b4, c2;",
-            r#"could not determine which collation to use for view column "y""#,
-        ),
-        (
-            "CREATE VIEW w AS SELECT b1.x || c2.b AS y FROM b1, c2;",
-            r#"could not determine which collation to use for view column "y""#,
-        ),
-        (
-            "CREATE VIEW w AS SELECT b8.x || c2.b AS y FROM b8, c2;",
-            r#"could not determine which collation to use for view column "y""#,
-        ),
-        (
-            "CREATE TABLE ch (x text COLLATE \"C\") INHERITS (b9);",
-            r#"column "x" has a collation conflict"#,
-        ),
-    ] {
-        let migrations = [
-            ("0001.sql", setup),
-            (
-                "0002.sql",
-                &format!(
-                    r#"CREATE TABLE b1 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE c2.b END AS x
-                                          FROM c1, c2;
-                       CREATE TABLE b3 AS SELECT x FROM (SELECT {fold} AS x FROM c1, c2) s;
-                       CREATE TABLE b4 AS WITH s AS (SELECT {fold} AS x FROM c1, c2)
-                                          SELECT x FROM s;
-                       CREATE TABLE b8 AS SELECT CASE WHEN 1 = 1 THEN c1.b ELSE 'x' END AS x
-                                          FROM c1;
-                       CREATE TABLE b9 AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x
-                                          FROM c1;"#
-                ),
-            ),
-            ("0003.sql", stmt),
-        ];
-        let err = try_apply(&migrations).expect_err(stmt);
-        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
-    }
-    // A CTE scanned on its own (MATERIALIZED, or read twice) keeps the
-    // parsed query's collations: the CASE has none.
-    for stmt in [
-        format!(
-            "CREATE TABLE t AS WITH s AS MATERIALIZED (SELECT {fold} AS x FROM c1, c2) \
-             SELECT x FROM s;"
-        ),
-        format!(
-            "CREATE TABLE t AS WITH s AS (SELECT {fold} AS x FROM c1, c2) \
-             SELECT s.x FROM s, s s2;"
-        ),
-    ] {
-        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
-        assert!(
-            err.to_string().starts_with(&no_collation("text")),
-            "{stmt}\n  got: {err}"
-        );
-    }
-    // Where PG folds what the analyzer doesn't follow — an inlined SQL
-    // function — PG accepts this (collated "C"), and so does the analyzer.
-    build_db(&[
-        ("0001.sql", setup),
-        (
-            "0002.sql",
-            "CREATE TABLE b6 AS SELECT f(c1.b, c2.b) AS x FROM c1, c2;",
-        ),
-    ]);
+    let info = db.analyze("SELECT x FROM a1").unwrap();
+    assert_cols(&info, vec![cn("x", text())]);
 }
 
 #[test]
-fn create_table_as_through_a_trivial_subquery_scan_takes_the_subquerys_planned_collation() {
-    // PG 18 (set_subqueryscan_references, trivial_subqueryscan): a
-    // SubqueryScan whose target list is just the Vars of the subquery it
-    // scans, in order, with no qual or node above it, is removed, and the
-    // subquery's plan — its own target list, with the collations planning
-    // gave it — is the statement's. CREATE TABLE AS takes its columns from
-    // there. Where the scan stays, its Vars keep the parsed collation.
-    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
-                   CREATE TABLE c2 (b text COLLATE "POSIX");
-                   CREATE TABLE c3 (b text COLLATE "C", p text COLLATE "POSIX");
-                   CREATE INDEX ON c3 (b);
-                   CREATE TABLE c4 (b text COLLATE "C", p text COLLATE "POSIX");
-                   CREATE TABLE cp (b text COLLATE "C") PARTITION BY LIST (b);
-                   CREATE TABLE cq (b text COLLATE "C") PARTITION BY LIST (b);
-                   CREATE TABLE cq1 PARTITION OF cq FOR VALUES IN ('a') PARTITION BY LIST (b);
-                   CREATE TABLE cr (b text COLLATE "C") PARTITION BY LIST (b);
-                   CREATE TABLE cr1 PARTITION OF cr FOR VALUES IN ('a');
-                   CREATE TABLE u1 (id int PRIMARY KEY, b text COLLATE "C");
-                   CREATE VIEW vp AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x FROM c1;
-                   CREATE VIEW vs AS SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x
-                                     FROM c1 OFFSET 0;"#;
-    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
-    // Planned on its own (OFFSET 0), the subquery's CASE folds to c1.b.
-    let s = "(SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x FROM c1, c2 OFFSET 0) s";
-    let tables = [
-        (format!("SELECT x FROM {s}"), collated("C")),
-        (format!("SELECT * FROM {s}"), collated("C")),
-        (format!("SELECT s.* FROM {s}"), collated("C")),
-        // No Limit node.
-        (format!("SELECT x FROM {s} OFFSET 0"), collated("C")),
-        (format!("SELECT x FROM {s} LIMIT ALL"), collated("C")),
-        // Each level's trivial scan is removed.
-        (
-            format!("SELECT x FROM (SELECT x FROM {s} OFFSET 0) s2"),
-            collated("C"),
-        ),
-        (
-            format!("SELECT x FROM (SELECT x FROM {s}) s2"),
-            collated("C"),
-        ),
-        (
-            "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-             FROM c1, c2 WHERE c1.b = 'a' OFFSET 0) s"
-                .into(),
-            collated("C"),
-        ),
-        // Sort keys among the outputs add no resjunk entry.
-        (
-            "SELECT x, k FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, c1.b AS k \
-             FROM c1 LEFT JOIN c2 ON true ORDER BY 2 LIMIT 5) s"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x, k FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, c1.b AS k \
-             FROM c1 LEFT JOIN c2 ON true ORDER BY k LIMIT 5) s"
-                .into(),
-            collated("C"),
-        ),
-        // An inlined CTE is a subquery.
-        (
-            "WITH s AS (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x FROM c1, c2 OFFSET 0) \
-             SELECT x FROM s"
-                .into(),
-            collated("C"),
-        ),
-        // A window call with no PARTITION BY or ORDER BY adds no resjunk
-        // key.
-        (
-            "SELECT x, n FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, \
-             count(*) OVER () AS n FROM c1, c2) s"
-                .into(),
-            collated("C"),
-        ),
-        // Parse analysis drops a same-type cast; planning folds the CASE:
-        // both leave the Var.
-        (format!("SELECT x::text AS x FROM {s}"), collated("C")),
-        (
-            format!("SELECT CASE WHEN true THEN x END AS x FROM {s}"),
-            collated("C"),
-        ),
-        (
-            format!("SELECT CASE WHEN false THEN 'a' WHEN NULL THEN 'b' ELSE x END AS x FROM {s}"),
-            collated("C"),
-        ),
-        // Pulled up, s2 leaves the level reading s alone, its target list
-        // just s's x.
-        (
-            format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2"),
-            collated("C"),
-        ),
-        (
-            format!("SELECT x FROM (SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2) s3"),
-            collated("C"),
-        ),
-        // Pulled up, a dummy subquery's folded CASE is the Result's.
-        (
-            "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c4 WHERE false) s"
-                .into(),
-            collated("C"),
-        ),
-        // A WHERE folding to TRUE is dropped.
-        (format!("SELECT x FROM {s} WHERE true"), collated("C")),
-        (
-            format!("SELECT x FROM {s} WHERE x IS NOT NULL OR true"),
-            collated("C"),
-        ),
-        // A WINDOW clause no call uses doesn't keep the subquery from
-        // being pulled up (is_simple_subquery checks hasWindowFuncs): its
-        // CASE folds to c1.b, whatever the outer target list.
-        (
-            "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-             FROM c1, c2 WINDOW w AS (ORDER BY 1)) s"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x, 1 AS k FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-             FROM c1, c2 WINDOW w AS (ORDER BY 1)) s"
-                .into(),
-            collated("C"),
-        ),
-        // A view too: pulled up, its CASE folds to the default-collated 'x';
-        // planned on its own, its plan is the statement's.
-        ("SELECT x FROM vp".into(), text()),
-        ("SELECT x FROM vs".into(), text()),
-        ("SELECT * FROM vs".into(), text()),
-        // The scan stays: its Var has the view column's collation.
-        ("SELECT x, 1 AS k FROM vs".into(), collated("C")),
-        ("SELECT x FROM vs, c2".into(), collated("C")),
-        // A qual no pushdown takes, a Sort, a join, a dummy relation or a
-        // row mark keeps the parsed "C" of a CASE planning folds to the
-        // default-collated 'x'.
-        (
-            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-             FROM c1 OFFSET 0) s WHERE x IS NOT NULL"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-             FROM c1 OFFSET 0) s WHERE x = 'x'"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-             FROM c1 OFFSET 0) s ORDER BY 1"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-             FROM c1 OFFSET 0) s, c2"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-             FROM c1 WHERE false OFFSET 0) s"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-             FROM c1 FOR UPDATE) s"
-                .into(),
-            collated("C"),
-        ),
-        (
-            "SELECT x, 1 AS k FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-             FROM c1 OFFSET 0) s"
-                .into(),
-            collated("C"),
-        ),
-    ];
-    for (query, ty) in &tables {
-        let stmt = format!("CREATE TABLE t AS {query};");
-        let db = build_db(&[("0001.sql", setup), ("0002.sql", &stmt)]);
-        let info = db.analyze("SELECT x FROM t").unwrap();
-        assert_cols(&info, vec![cn("x", ty.clone())]);
-    }
-    // Which a view combining it with another collation can't settle — or
-    // can, where it is the default one.
-    let migrations = |ctas: &str, stmt: &str| {
-        try_apply(&[
-            ("0001.sql", setup),
-            ("0002.sql", &format!("CREATE TABLE t AS {ctas};")),
-            ("0003.sql", stmt),
-        ])
-    };
-    let view = "CREATE VIEW w AS SELECT t.x || c2.b AS y FROM t, c2;";
-    for ctas in [
-        format!("SELECT x FROM {s}"),
-        "SELECT x, 1 AS k FROM vs".into(),
-        "SELECT x, n FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, \
-         count(*) OVER () AS n FROM c1, c2) s"
-            .into(),
-        format!("SELECT x::text AS x FROM {s}"),
-        format!("SELECT CASE WHEN true THEN x END AS x FROM {s}"),
-        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2"),
-    ] {
-        let err = migrations(&ctas, view).expect_err(&ctas);
-        assert!(
-            err.to_string()
-                .starts_with(r#"could not determine which collation to use for view column "y""#),
-            "{ctas}\n  got: {err}"
-        );
-    }
-    for ctas in ["SELECT x FROM vp", "SELECT x FROM vs"] {
-        migrations(ctas, view).unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
-    }
-    // And a query combining it with a "POSIX" column fails as PG's does.
-    let db = build_db(&[
-        ("0001.sql", setup),
-        ("0002.sql", &format!("CREATE TABLE t AS SELECT x FROM {s};")),
-    ]);
-    let err = db
-        .analyze("SELECT x FROM t UNION SELECT b FROM c2")
-        .expect_err("UNION of C and POSIX");
-    assert!(
-        err.to_string()
-            .starts_with(r#"collation mismatch between implicit collations "C" and "POSIX""#),
-        "got: {err}"
-    );
-    // The scan stays — the target list isn't the subquery's; a Limit,
-    // LockRows or Sort node is above it; a qual no pushdown takes is on
-    // it; the subquery's target list has a resjunk entry (a row mark, a
-    // sort key no output is); the relation is a dummy one (a Result over
-    // the Vars); a join is above it; or a CTE is scanned on its own — and
-    // the CASE's parsed collation, none, is the column's.
-    for query in [
-        format!("SELECT x, 1 AS k FROM {s}"),
-        format!("SELECT x FROM {s} LIMIT 5"),
-        format!("SELECT x FROM {s} OFFSET 1"),
-        format!("SELECT x FROM {s} FOR UPDATE"),
-        format!("SELECT x FROM {s} WHERE x IS NOT NULL"),
-        format!("SELECT x FROM {s} WHERE false"),
-        format!("SELECT x FROM {s} ORDER BY 1"),
-        format!("SELECT x FROM {s} ORDER BY x"),
-        format!("SELECT x, 1 AS k FROM {s} ORDER BY 1"),
-        format!("SELECT x FROM {s}, c1"),
-        format!("SELECT x FROM {s} JOIN c1 ON true"),
-        format!("SELECT x FROM c1 LEFT JOIN {s} ON true"),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 WHERE false OFFSET 0) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2, c4 WHERE NULL OFFSET 0) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c4 WHERE false OFFSET 0) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 ORDER BY c1.b OFFSET 0) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 ORDER BY c2.b DESC OFFSET 0) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 FOR UPDATE) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 FOR UPDATE OF c1) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 LIMIT ALL) s WHERE x IS NOT NULL"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c4 OFFSET 0) s \
-         ORDER BY 1"
-            .into(),
-        // A key with no collation: no path of the subquery is sorted on
-        // it (an index's keys have the index's collation), whatever the
-        // indexes — a Sort, or an Incremental Sort, is above the scan.
-        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 OFFSET 0) s \
-         ORDER BY 1"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 OFFSET 0) s \
-         ORDER BY s.x DESC"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 WHERE b > 'a' \
-         OFFSET 0) s ORDER BY x"
-            .into(),
-        "SELECT y, x FROM (SELECT b AS y, CASE WHEN true THEN b ELSE p END AS x FROM c3 \
-         OFFSET 0) s ORDER BY y, x"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2, c3 OFFSET 0) s ORDER BY 1"
-            .into(),
-        // An outer join's nullable side `join_is_removable` can't drop:
-        // no unique index, one no clause equates, a column of it read
-        // above the join, or two tables.
-        format!("SELECT x FROM {s} LEFT JOIN c1 ON true"),
-        format!("SELECT x FROM {s} LEFT JOIN c1 ON false"),
-        format!("SELECT x FROM {s} LEFT JOIN cp ON true"),
-        format!("SELECT x FROM c1 RIGHT JOIN {s} ON true"),
-        format!("SELECT x FROM {s} LEFT JOIN u1 ON true"),
-        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.b = 'a'"),
-        format!("SELECT x, u1.b FROM {s} LEFT JOIN u1 ON u1.id = 1"),
-        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.id = 1 WHERE u1.b IS NULL"),
-        format!("SELECT x FROM {s} LEFT JOIN (c1 JOIN c2 ON true) ON true"),
-        // Pulled up, s2 leaves the qual on s's scan.
-        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2 WHERE x IS NOT NULL"),
-        // A partitioned table with no partition to scan is a dummy relation.
-        "SELECT x FROM (SELECT CASE WHEN true THEN cp.b ELSE c2.b END AS x \
-         FROM cp, c2 OFFSET 0) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN cq.b ELSE c2.b END AS x \
-         FROM cq, c2 OFFSET 0) s"
-            .into(),
-        "WITH s AS MATERIALIZED (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 OFFSET 0) SELECT x FROM s"
-            .into(),
-    ] {
-        let stmt = format!("CREATE TABLE t AS {query};");
-        let err = try_apply(&[("0001.sql", setup), ("0002.sql", &stmt)]).expect_err(&stmt);
-        assert!(
-            err.to_string().starts_with(
-                r#"no collation was derived for column "x" with collatable type text"#
-            ),
-            "{stmt}\n  got: {err}"
-        );
-    }
-    // A "C" child of a table storing x as "C" agrees with it.
-    for query in [
-        "SELECT x, n FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x, \
-         count(*) OVER () AS n FROM c1, c2) s"
-            .to_string(),
-        format!("SELECT x::text AS x FROM {s}"),
-        format!("SELECT CASE WHEN true THEN x END AS x FROM {s}"),
-        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2"),
-    ] {
-        build_db(&[
-            ("0001.sql", setup),
-            ("0002.sql", &format!("CREATE TABLE t AS {query};")),
-            (
-                "0003.sql",
-                r#"CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
-            ),
-        ]);
-    }
-    // Where the analyzer can't tell whether the scan stays — an entry the
-    // planner may drop beside it, a Limit node over a dummy subquery, a
-    // subquery whose index may already sort it — it accepts (PG stores
-    // "C" for these).
-    for query in [
-        format!("SELECT x FROM {s}, (SELECT) q"),
-        // Pulled up, s2's k is the constant: the qual folds to TRUE.
-        format!("SELECT x FROM (SELECT x, 1 AS k FROM {s}) s2 WHERE k = 1"),
-        "SELECT x FROM (SELECT CASE WHEN true THEN c1.b ELSE c2.b END AS x \
-         FROM c1, c2 WHERE false OFFSET 1) s"
-            .into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN b ELSE p END AS x FROM c3 OFFSET 0) s".into(),
-        "SELECT x FROM (SELECT CASE WHEN true THEN cr.b ELSE c2.b END AS x \
-         FROM cr, c2 OFFSET 0) s"
-            .into(),
-        // Pulled up, the dummy relation's Result has the folded CASE.
-        "SELECT x FROM (SELECT CASE WHEN true THEN cp.b ELSE c2.b END AS x FROM cp, c2) s".into(),
-        // A nullable side proven unique (u1's key equated to a constant)
-        // and read nowhere above the join is removed, and so is the scan.
-        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.id = 1"),
-        format!("SELECT x FROM {s} LEFT JOIN u1 ON u1.id = 1 AND u1.b > 'a'"),
-    ] {
-        build_db(&[
-            ("0001.sql", setup),
-            ("0002.sql", &format!("CREATE TABLE t AS {query};")),
-        ]);
-    }
-    // A pulled-up subquery (or inlined CTE) over one planned on its own:
-    // whether the scan stays is up to the target list the pull-up leaves
-    // (the reading level's), not the pulled-up one's. Here that is just
-    // vs's column, the scan is removed, and PG stores vs's planned,
-    // default, collation; with another output beside it (the last one),
-    // the scan stays and PG stores "C". The analyzer can't tell, and
-    // accepts what either allows.
-    let defaults = [
-        "SELECT x FROM (SELECT x, 1 AS k FROM vs) q",
-        "SELECT x FROM (SELECT y, x FROM (SELECT x, 'a'::text y FROM vs) z) q",
-        "WITH q AS (SELECT x, 1 AS k FROM vs) SELECT x FROM q",
-        "SELECT x FROM (SELECT x, 1 AS k FROM (SELECT CASE WHEN 1 = 1 THEN 'x' ELSE c1.b END AS x \
-         FROM c1 OFFSET 0) s) q",
-    ];
-    for ctas in defaults {
-        migrations(ctas, view).unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
-        migrations(ctas, "CREATE TABLE ch (x text) INHERITS (t);")
-            .unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
-    }
-    let ctas = "SELECT x, 2 AS j FROM (SELECT x, 1 AS k FROM vs) q";
-    migrations(
-        ctas,
-        r#"CREATE TABLE ch (x text COLLATE "C") INHERITS (t);"#,
-    )
-    .unwrap_or_else(|e| panic!("{ctas}\n  got: {e}"));
-}
-
-#[test]
-fn create_table_as_with_data_folds_virtual_generated_columns() {
-    // PG 18 (expand_virtual_generated_columns): the planner replaces a
-    // virtual generated column by its expression, then folds it — a CASE
-    // conditioned on one whose expression is constant becomes the branch it
-    // picks. A stored generated column, or a virtual one reading a stored
-    // column, stays a Var.
+fn create_table_as_over_virtual_generated_columns_takes_the_parsed_collation() {
+    // The planner replaces a virtual generated column by its expression
+    // (expand_virtual_generated_columns) and folds what reads it, but a
+    // folded CASE or COALESCE keeps its parsed collation (PostgreSQL 19).
     let setup = r#"CREATE TABLE g (s int, b text COLLATE "C",
                                    k bool GENERATED ALWAYS AS (true) VIRTUAL,
-                                   k2 bool GENERATED ALWAYS AS (s > 0) VIRTUAL,
-                                   ks bool GENERATED ALWAYS AS (true) STORED,
-                                   m int GENERATED ALWAYS AS (length(b)) VIRTUAL,
                                    w text GENERATED ALWAYS AS ('k') VIRTUAL,
                                    z int GENERATED ALWAYS AS (NULL::int) VIRTUAL);
                    CREATE TABLE c2 (b text COLLATE "POSIX");"#;
     let no_collation = r#"no collation was derived for column "x" with collatable type text"#;
     for stmt in [
-        "CREATE TABLE t AS SELECT CASE WHEN g.k2 THEN g.b ELSE c2.b END AS x FROM g, c2;",
-        "CREATE TABLE t AS SELECT CASE WHEN g.ks THEN g.b ELSE c2.b END AS x FROM g, c2;",
-        "CREATE TABLE t AS SELECT CASE WHEN g.m > 0 THEN g.b ELSE c2.b END AS x FROM g, c2;",
-        "CREATE TABLE t AS SELECT CASE WHEN g.k AND g.s > 0 THEN g.b ELSE c2.b END AS x \
-         FROM g, c2;",
-        // A view and WITH NO DATA read the parsed query.
-        "CREATE TABLE t AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2 \
-         WITH NO DATA;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT CASE WHEN g.z > 0 THEN g.b ELSE c2.b END AS x FROM g, c2;",
+        "CREATE TABLE t AS SELECT COALESCE(g.w, g.b, c2.b) AS x FROM g, c2;",
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
         assert!(
@@ -1944,86 +1442,64 @@ fn create_table_as_with_data_folds_virtual_generated_columns() {
             "{stmt}\n  got: {err}"
         );
     }
-    let stmt = "CREATE VIEW t AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2;";
-    let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
-    assert!(
-        err.to_string()
-            .starts_with(r#"could not determine which collation to use for view column "x""#),
-        "{stmt}\n  got: {err}"
-    );
     let db = build_db(&[
         ("0001.sql", setup),
         (
             "0002.sql",
-            r#"CREATE TABLE a1 AS SELECT CASE WHEN g.k THEN g.b ELSE c2.b END AS x FROM g, c2;
-               CREATE TABLE a2 AS SELECT CASE WHEN NOT g.k THEN c2.b ELSE g.b END AS x
-                                  FROM g, c2;
-               CREATE TABLE a3 AS SELECT COALESCE(g.k::text, g.b, c2.b) AS x FROM g, c2;
-               -- `z > 0`, a strict operator over the NULL constant, folds
-               -- to NULL: the ELSE.
-               CREATE TABLE a4 AS SELECT CASE WHEN g.z > 0 THEN g.b ELSE c2.b END AS x
-                                  FROM g, c2;
-               CREATE TABLE a5 AS SELECT CASE WHEN g.k OR g.s > 0 THEN g.b ELSE c2.b END AS x
-                                  FROM g, c2;
-               CREATE TABLE a6 AS SELECT COALESCE(g.w, g.b, c2.b) AS x FROM g, c2;"#,
+            "CREATE TABLE a1 AS SELECT COALESCE(g.k::text, g.b) AS x FROM g;
+             CREATE TABLE a2 AS SELECT CASE WHEN g.k THEN g.b ELSE 'x' END AS x FROM g;",
         ),
     ]);
-    let collated = |c: &str| basic_with_collation("pg_catalog", "text", c);
-    for (table, ty) in [
-        ("a1", collated("C")),
-        ("a2", collated("C")),
-        ("a3", text()),
-        ("a4", collated("POSIX")),
-        ("a5", collated("C")),
-        ("a6", text()),
-    ] {
+    let collated = basic_with_collation("pg_catalog", "text", "C");
+    for table in ["a1", "a2"] {
         let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
-        assert_cols(&info, vec![cn("x", ty)]);
+        assert_cols(&info, vec![cn("x", collated.clone())]);
     }
 }
 
 #[test]
-fn a_column_whose_planned_collation_is_unknown_conflicts_with_none() {
-    // PG 18: where the planner may fold what the analyzer can't evaluate
-    // (`'a' = 'a'`), it doesn't know the collation CREATE TABLE AS stores: here
-    // PG folds the first CASE into 'x' (the default collation, although the
-    // parsed CASE has "C") and the second into c1.b ("C"). Such a column
-    // conflicts with no other collation — in a later query, an inheritance
-    // child or LIKE copy of it, ALTER TABLE INHERIT or OF — so what PG
-    // accepts, the analyzer accepts.
-    build_db(&[
-        (
-            "0001.sql",
-            r#"CREATE TABLE c1 (b text COLLATE "C");
-               CREATE TABLE c2 (b text COLLATE "POSIX");
-               CREATE TABLE t AS SELECT CASE WHEN 'a' = 'a' THEN 'x' ELSE c1.b END AS x FROM c1;
-               CREATE TABLE t4 AS SELECT CASE WHEN 'a' = 'a' THEN c1.b ELSE 'x' END AS x FROM c1;"#,
-        ),
+fn a_folded_case_column_keeps_its_parsed_collation() {
+    // PostgreSQL 19: CREATE TABLE AS stores a CASE the planner folds with
+    // its parsed collation ("C" here, whichever branch it picks), which
+    // then conflicts with another implicit collation like any other.
+    let setup = r#"CREATE TABLE c1 (b text COLLATE "C");
+                   CREATE TABLE c2 (b text COLLATE "POSIX");
+                   CREATE TABLE t AS SELECT CASE WHEN 'a' = 'a' THEN 'x' ELSE c1.b END AS x FROM c1;
+                   CREATE TABLE t4 AS SELECT CASE WHEN 'a' = 'a' THEN c1.b ELSE 'x' END AS x FROM c1;"#;
+    let db = build_db(&[("0001.sql", setup)]);
+    let collated = basic_with_collation("pg_catalog", "text", "C");
+    for table in ["t", "t4"] {
+        let info = db.analyze(&format!("SELECT x FROM {table}")).unwrap();
+        assert_cols(&info, vec![cn("x", collated.clone())]);
+    }
+    let err = try_apply(&[
+        ("0001.sql", setup),
         (
             "0002.sql",
-            r#"CREATE VIEW v AS SELECT t.x || c2.b AS y FROM t, c2;
-               CREATE TABLE u AS SELECT t.x || c2.b AS y FROM t, c2;
-               CREATE TABLE u2 AS SELECT t.x || c2.b AS y FROM t, c2 WITH NO DATA;
-               CREATE MATERIALIZED VIEW m AS SELECT t.x || c2.b AS y FROM t, c2;
-               CREATE TABLE t5 AS SELECT x FROM t;
-               CREATE VIEW v5 AS SELECT t5.x || c2.b AS y FROM t5, c2;
-               CREATE TABLE ch4 (x text COLLATE "C") INHERITS (t4);
+            "CREATE VIEW v AS SELECT t.x || c2.b AS y FROM t, c2;",
+        ),
+    ])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(r#"could not determine which collation to use for view column "y""#),
+        "got: {err}"
+    );
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            r#"CREATE TABLE ch4 (x text COLLATE "C") INHERITS (t4);
                CREATE TABLE l4 (LIKE t4);
                CREATE TABLE ch6 (x text COLLATE "C") INHERITS (l4);
-               CREATE TABLE ch7 () INHERITS (t4);
                CREATE TABLE p (x text COLLATE "C");
                ALTER TABLE t4 INHERIT p;
                CREATE TYPE ct AS (x text COLLATE "C");
                CREATE TABLE t8 AS SELECT CASE WHEN 'a' = 'a' THEN c1.b ELSE 'x' END AS x FROM c1;
-               ALTER TABLE t8 OF ct;
-               CREATE VIEW vv AS SELECT x FROM t4;
-               CREATE OR REPLACE VIEW vv AS SELECT x COLLATE "C" AS x FROM t4;
-               CREATE TABLE pt (x text COLLATE "C") PARTITION BY LIST (x);
-               CREATE TABLE t9 AS SELECT CASE WHEN 'a' = 'a' THEN c1.b ELSE 'x' END AS x FROM c1;
-               ALTER TABLE pt ATTACH PARTITION t9 FOR VALUES IN ('b');"#,
+               ALTER TABLE t8 OF ct;"#,
         ),
     ]);
-    // ALTER COLUMN TYPE gives the column a known collation again.
+    // ALTER COLUMN TYPE gives the column its type's default collation.
     let err = try_apply(&[(
         "0001.sql",
         r#"CREATE TABLE c1 (b text COLLATE "C");
@@ -2619,21 +2095,21 @@ fn create_table_column_definition_conflicts_are_rejected() {
         ),
         (
             "CREATE TABLE m (id int PRIMARY KEY, d date) PARTITION BY RANGE (d);",
-            "unique constraint on partitioned table must include all partitioning columns",
+            "PRIMARY KEY constraint on partitioned table must include all partitioning columns",
         ),
         (
             "CREATE TABLE m2 (id int, d date, UNIQUE (id)) PARTITION BY RANGE (d);",
-            "unique constraint on partitioned table must include all partitioning columns",
+            "UNIQUE constraint on partitioned table must include all partitioning columns",
         ),
         (
             "CREATE TABLE m4 (id int, d date) PARTITION BY RANGE (d);
              CREATE UNIQUE INDEX ON m4 (id);",
-            "unique constraint on partitioned table must include all partitioning columns",
+            "UNIQUE constraint on partitioned table must include all partitioning columns",
         ),
         (
             "CREATE TABLE m5 (id int, d date) PARTITION BY RANGE (d);
              ALTER TABLE m5 ADD PRIMARY KEY (id);",
-            "unique constraint on partitioned table must include all partitioning columns",
+            "PRIMARY KEY constraint on partitioned table must include all partitioning columns",
         ),
     ] {
         let err = try_apply(&[("0001.sql", sql)]).expect_err(sql);
@@ -3007,30 +2483,39 @@ fn a_partition_keys_operator_class_is_its_notion_of_equality_and_order() {
                  CREATE TABLE q (a c) PARTITION BY RANGE (a);
                  CREATE TABLE r (t text) PARTITION BY RANGE (t text_pattern_ops);
                  CREATE TABLE r1 PARTITION OF r FOR VALUES FROM ('a') TO ('c');";
-    let uncovered = "unique constraint on partitioned table must include all partitioning columns";
+    let uncovered = |kind: &str| {
+        format!("{kind} constraint on partitioned table must include all partitioning columns")
+    };
     for (stmt, msg) in [
-        ("CREATE UNIQUE INDEX ON p (a);", uncovered),
-        ("ALTER TABLE p ADD PRIMARY KEY (a);", uncovered),
-        ("CREATE UNIQUE INDEX ON q (a record_image_ops);", uncovered),
+        ("CREATE UNIQUE INDEX ON p (a);", uncovered("UNIQUE")),
+        (
+            "ALTER TABLE p ADD PRIMARY KEY (a);",
+            uncovered("PRIMARY KEY"),
+        ),
+        (
+            "CREATE UNIQUE INDEX ON q (a record_image_ops);",
+            uncovered("UNIQUE"),
+        ),
         (
             "CREATE TABLE p2 (a c, UNIQUE (a)) PARTITION BY RANGE (a record_image_ops);",
-            uncovered,
+            uncovered("UNIQUE"),
         ),
         (
             "ALTER TABLE p ADD CONSTRAINT e EXCLUDE USING btree (a WITH =);",
-            "cannot match partition key to index on column \"a\" using non-equal operator \"=\"",
+            "cannot match partition key to index on column \"a\" using non-equal operator \"=\""
+                .into(),
         ),
         (
             "CREATE TABLE r2 PARTITION OF r FOR VALUES FROM ('b') TO ('d');",
-            "partition \"r2\" would overlap partition \"r1\"",
+            "partition \"r2\" would overlap partition \"r1\"".into(),
         ),
         (
             "CREATE TABLE r3 PARTITION OF r FOR VALUES FROM ('e') TO ('d');",
-            "empty range bound specified for partition \"r3\"",
+            "empty range bound specified for partition \"r3\"".into(),
         ),
     ] {
         let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
-        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+        assert!(err.to_string().starts_with(&msg), "{stmt}\n  got: {err}");
     }
     build_db(&[
         ("0001.sql", setup),

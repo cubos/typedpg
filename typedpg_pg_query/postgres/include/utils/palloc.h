@@ -18,7 +18,7 @@
  * everything that should be freed.  See utils/mmgr/README for more info.
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/palloc.h
@@ -147,6 +147,8 @@ MemoryContextSwitchTo(MemoryContext context)
 /* Registration of memory context reset/delete callbacks */
 extern void MemoryContextRegisterResetCallback(MemoryContext context,
 											   MemoryContextCallback *cb);
+extern void MemoryContextUnregisterResetCallback(MemoryContext context,
+												 MemoryContextCallback *cb);
 
 /*
  * These are like standard strdup() except the copied string is
@@ -159,7 +161,7 @@ extern char *pnstrdup(const char *in, Size len);
 extern char *pchomp(const char *in);
 
 /* sprintf into a palloc'd buffer --- these are in psprintf.c */
-extern char *psprintf(const char *fmt,...) pg_attribute_printf(1, 2);
+extern char *psprintf(const char *fmt, ...) pg_attribute_printf(1, 2);
 extern size_t pvsnprintf(char *buf, size_t len, const char *fmt, va_list args) pg_attribute_printf(3, 0);
 
 #endif							/* PALLOC_H */

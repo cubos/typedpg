@@ -25,9 +25,11 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 	find "$pg/typedpg" -type f -name '*.c' | sort
 } >"$work/sources"
 
-# Symbols the crate's Rust side defines (src/stack.rs); this check has no
-# Rust, so stand in for it.
-printf '#include <stddef.h>\nsize_t typedpg_remaining_stack(void) { return 0; }\n' \
+# Symbols the crate's Rust side defines (src/stack.rs, src/lib.rs); this
+# check has no Rust, so stand in for them.
+printf '%s\n' '#include <stddef.h>' \
+	'size_t typedpg_remaining_stack(void) { return 0; }' \
+	'void typedpg_plpgsql_convert(void *state, const void *func) {}' \
 	>"$work/rust_symbols.c"
 printf '%s\n' "$work/rust_symbols.c" >>"$work/sources"
 

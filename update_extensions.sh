@@ -15,14 +15,13 @@
 #
 # The scripts must come from the PostgreSQL release typedpg targets
 # (typedpg_pg_query/POSTGRES_VERSION), the parser's and the seed's: a newer branch ships extension versions
-# whose scripts use grammar that release's parser rejects (postgres_fdw 1.3's
-# `ALTER FOREIGN DATA WRAPPER ... CONNECTION` is PostgreSQL 19), and objects
-# its server doesn't have. The file lists below follow that release's
+# whose scripts use grammar that release's parser rejects, and objects its
+# server doesn't have. The file lists below follow that release's
 # contrib/ too.
 #
 # Usage:
 #   ./update_extensions.sh              # the release typedpg targets (default)
-#   ./update_extensions.sh REL_18_6     # use a specific tag/branch
+#   ./update_extensions.sh REL_19_0     # use a specific tag/branch
 #
 # Output: typedpg_analyzer/src/extensions/*.sql. Every file is downloaded
 # into a temporary directory first; the bundled files are replaced only once
@@ -43,7 +42,7 @@ cd "$(dirname "$0")"
 if [[ $# -ge 1 ]]; then
     BRANCH="$1"
 else
-    # `18.7` -> REL_18_7, the tag format of every release since
+    # `19.0` -> REL_19_0, the tag format of every release since
     # PostgreSQL 10 (REL_<major>_<minor>).
     PG_VERSION=$(tr -d '[:space:]' < typedpg_pg_query/POSTGRES_VERSION)
     if [[ ! "$PG_VERSION" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
@@ -114,22 +113,19 @@ echo -e "\n--- bool_plperlu (1.0) ---"
 download_ext "bool_plperl" \
     "bool_plperlu--1.0.sql"
 
-echo -e "\n--- btree_gin (1.0 → 1.3) ---"
+echo -e "\n--- btree_gin (1.0 → 1.4) ---"
 download_ext "btree_gin" \
     "btree_gin--1.0.sql" \
     "btree_gin--1.0--1.1.sql" \
     "btree_gin--1.1--1.2.sql" \
-    "btree_gin--1.2--1.3.sql"
+    "btree_gin--1.2--1.3.sql" \
+    "btree_gin--1.3--1.4.sql"
 
-echo -e "\n--- btree_gist (1.2 → 1.8) ---"
+# PostgreSQL 19 ships btree_gist 1.9's installation script alone: the update
+# scripts from 1.2 only serve databases upgraded from an older release.
+echo -e "\n--- btree_gist (1.9) ---"
 download_ext "btree_gist" \
-    "btree_gist--1.2.sql" \
-    "btree_gist--1.2--1.3.sql" \
-    "btree_gist--1.3--1.4.sql" \
-    "btree_gist--1.4--1.5.sql" \
-    "btree_gist--1.5--1.6.sql" \
-    "btree_gist--1.6--1.7.sql" \
-    "btree_gist--1.7--1.8.sql"
+    "btree_gist--1.9.sql"
 
 echo -e "\n--- citext (1.4 → 1.8) ---"
 download_ext "citext" \
@@ -256,13 +252,14 @@ download_ext "pageinspect" \
     "pageinspect--1.11--1.12.sql" \
     "pageinspect--1.12--1.13.sql"
 
-echo -e "\n--- pg_buffercache (1.2 → 1.6) ---"
+echo -e "\n--- pg_buffercache (1.2 → 1.7) ---"
 download_ext "pg_buffercache" \
     "pg_buffercache--1.2.sql" \
     "pg_buffercache--1.2--1.3.sql" \
     "pg_buffercache--1.3--1.4.sql" \
     "pg_buffercache--1.4--1.5.sql" \
-    "pg_buffercache--1.5--1.6.sql"
+    "pg_buffercache--1.5--1.6.sql" \
+    "pg_buffercache--1.6--1.7.sql"
 
 echo -e "\n--- pg_freespacemap (1.1 → 1.3) ---"
 download_ext "pg_freespacemap" \
@@ -279,7 +276,11 @@ download_ext "pg_prewarm" \
     "pg_prewarm--1.1.sql" \
     "pg_prewarm--1.1--1.2.sql"
 
-echo -e "\n--- pg_stat_statements (1.4 → 1.12) ---"
+echo -e "\n--- pg_stash_advice (1.0) ---"
+download_ext "pg_stash_advice" \
+    "pg_stash_advice--1.0.sql"
+
+echo -e "\n--- pg_stat_statements (1.4 → 1.13) ---"
 download_ext "pg_stat_statements" \
     "pg_stat_statements--1.4.sql" \
     "pg_stat_statements--1.4--1.5.sql" \
@@ -289,7 +290,8 @@ download_ext "pg_stat_statements" \
     "pg_stat_statements--1.8--1.9.sql" \
     "pg_stat_statements--1.9--1.10.sql" \
     "pg_stat_statements--1.10--1.11.sql" \
-    "pg_stat_statements--1.11--1.12.sql"
+    "pg_stat_statements--1.11--1.12.sql" \
+    "pg_stat_statements--1.12--1.13.sql"
 
 echo -e "\n--- pg_surgery (1.0) ---"
 download_ext "pg_surgery" \
@@ -326,11 +328,12 @@ download_ext "pgstattuple" \
     "pgstattuple--1.4.sql" \
     "pgstattuple--1.4--1.5.sql"
 
-echo -e "\n--- postgres_fdw (1.0 → 1.2) ---"
+echo -e "\n--- postgres_fdw (1.0 → 1.3) ---"
 download_ext "postgres_fdw" \
     "postgres_fdw--1.0.sql" \
     "postgres_fdw--1.0--1.1.sql" \
-    "postgres_fdw--1.1--1.2.sql"
+    "postgres_fdw--1.1--1.2.sql" \
+    "postgres_fdw--1.2--1.3.sql"
 
 echo -e "\n--- refint (1.0) ---"
 download_ext "spi" \

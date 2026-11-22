@@ -43,7 +43,7 @@
  * overflow.)
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -66,6 +66,10 @@
 #include <execinfo.h>
 #endif
 
+#ifdef _MSC_VER
+#include <dbghelp.h>
+#endif
+
 #include "access/xact.h"
 #include "common/ip.h"
 #include "libpq/libpq.h"
@@ -82,6 +86,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
+#include "utils/pg_locale.h"
 #include "utils/ps_status.h"
 #include "utils/varlena.h"
 
@@ -140,6 +145,11 @@ static void write_syslog(int level, const char *line);
 static void write_eventlog(int level, const char *line, int len);
 #endif
 
+#ifdef _MSC_VER
+static bool backtrace_symbols_initialized = false;
+static HANDLE backtrace_process = NULL;
+#endif
+
 /* We provide a small stack of ErrorData records for re-entrant cases */
 #define ERRORDATA_STACK_SIZE  5
 
@@ -183,8 +193,10 @@ static void set_stack_entry_location(ErrorData *edata,
 									 const char *funcname);
 static bool matches_backtrace_functions(const char *funcname);
 static pg_noinline void set_backtrace(ErrorData *edata, int num_skip);
+static void backtrace_cleanup(int code, Datum arg);
 static void set_errdata_field(MemoryContextData *cxt, char **ptr, const char *str);
 static void FreeErrorDataContents(ErrorData *edata);
+static int	log_min_messages_cmp(const ListCell *a, const ListCell *b);
 static void write_console(const char *line, int len);
 static const char *process_log_prefix_padding(const char *p, int *ppadding);
 static void log_line_prefix(StringInfo buf, ErrorData *edata);
@@ -209,7 +221,7 @@ is_log_level_output(int elevel, int log_min_level)
 		if (log_min_level == LOG || log_min_level <= ERROR)
 			return true;
 	}
-	else if (elevel == WARNING_CLIENT_ONLY)
+	else if (elevel == WARNING_CLIENT_ONLY || elevel == FATAL_CLIENT_ONLY)
 	{
 		/* never sent to log, regardless of log_min_level */
 		return false;
@@ -238,7 +250,7 @@ is_log_level_output(int elevel, int log_min_level)
 static inline bool
 should_output_to_server(int elevel)
 {
-	return is_log_level_output(elevel, log_min_messages);
+	return is_log_level_output(elevel, log_min_messages[MyBackendType]);
 }
 
 /*
@@ -548,18 +560,27 @@ errfinish(const char *filename, int lineno, const char *funcname)
 	/* Emit the message to the right places */
 	EmitErrorReport();
 
-	/* Now free up subsidiary data attached to stack entry, and release it */
-	FreeErrorDataContents(edata);
-	errordata_stack_depth--;
+	/*
+	 * If this is the outermost recursion level, we can clean up by resetting
+	 * ErrorContext altogether (compare FlushErrorState), which is good
+	 * because it cleans up any random leakages that might have occurred in
+	 * places such as context callback functions.  If we're nested, we can
+	 * only safely remove the subsidiary data of the current stack entry.
+	 */
+	if (errordata_stack_depth == 0 && recursion_depth == 1)
+		MemoryContextReset(ErrorContext);
+	else
+		FreeErrorDataContents(edata);
 
-	/* Exit error-handling context */
+	/* Release stack entry and exit error-handling context */
+	errordata_stack_depth--;
 	MemoryContextSwitchTo(oldcontext);
 	recursion_depth--;
 
 	/*
 	 * Perform error recovery action as specified by elevel.
 	 */
-	if (elevel == FATAL)
+	if (elevel == FATAL || elevel == FATAL_CLIENT_ONLY)
 	{
 		/*
 		 * For a FATAL error, we let proc_exit clean up and exit.
@@ -912,7 +933,9 @@ errcode_for_file_access(void)
 			/* Wrong object type or state */
 		case ENOTDIR:			/* Not a directory */
 		case EISDIR:			/* Is a directory */
+#if defined(ENOTEMPTY) && (ENOTEMPTY != EEXIST) /* same code on AIX */
 		case ENOTEMPTY:			/* Directory not empty */
+#endif
 			edata->sqlerrcode = ERRCODE_WRONG_OBJECT_TYPE;
 			break;
 
@@ -1075,7 +1098,7 @@ errcode_for_socket_access(void)
  * ereport will provide one for the output methods that need it.
  */
 int
-errmsg(const char *fmt,...)
+errmsg(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1119,6 +1142,13 @@ errbacktrace(void)
  * specifies how many inner frames to skip.  Use this to avoid showing the
  * internal backtrace support functions in the backtrace.  This requires that
  * this and related functions are not inlined.
+ *
+ * The implementation is, unsurprisingly, platform-specific:
+ * - GNU libc and copycats: Uses backtrace() and backtrace_symbols()
+ * - Windows: Uses CaptureStackBackTrace() with DbgHelp for symbol resolution
+ * 	 (requires PDB files; falls back to exported functions/raw addresses if
+ * 	 unavailable)
+ * - Others (musl libc): unsupported
  */
 static void
 set_backtrace(ErrorData *edata, int num_skip)
@@ -1129,18 +1159,159 @@ set_backtrace(ErrorData *edata, int num_skip)
 
 #ifdef HAVE_BACKTRACE_SYMBOLS
 	{
-		void	   *buf[100];
+		void	   *frames[100];
 		int			nframes;
 		char	  **strfrms;
 
-		nframes = backtrace(buf, lengthof(buf));
-		strfrms = backtrace_symbols(buf, nframes);
-		if (strfrms == NULL)
+		nframes = backtrace(frames, lengthof(frames));
+		strfrms = backtrace_symbols(frames, nframes);
+		if (strfrms != NULL)
+		{
+			for (int i = num_skip; i < nframes; i++)
+				appendStringInfo(&errtrace, "\n%s", strfrms[i]);
+			free(strfrms);
+		}
+		else
+			appendStringInfoString(&errtrace,
+								   "insufficient memory for backtrace generation");
+	}
+#elif defined(_MSC_VER)
+	{
+		void	   *frames[100];
+		int			nframes;
+		char		buffer[sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(wchar_t)];
+		PSYMBOL_INFOW psymbol;
+
+		/*
+		 * This is arranged so that we don't retry if we happen to fail to
+		 * initialize state on the first attempt in any one process.
+		 */
+		if (!backtrace_symbols_initialized)
+		{
+			backtrace_symbols_initialized = true;
+
+			if (DuplicateHandle(GetCurrentProcess(),
+								GetCurrentProcess(),
+								GetCurrentProcess(),
+								&backtrace_process,
+								0,
+								FALSE,
+								DUPLICATE_SAME_ACCESS) == 0)
+			{
+				appendStringInfo(&errtrace,
+								 "could not get process handle for backtrace: error code %lu",
+								 GetLastError());
+				edata->backtrace = errtrace.data;
+				return;
+			}
+
+			SymSetOptions(SYMOPT_DEFERRED_LOADS |
+						  SYMOPT_FAIL_CRITICAL_ERRORS |
+						  SYMOPT_LOAD_LINES |
+						  SYMOPT_UNDNAME);
+
+			if (!SymInitialize(backtrace_process, NULL, TRUE))
+			{
+				CloseHandle(backtrace_process);
+				backtrace_process = NULL;
+				appendStringInfo(&errtrace,
+								 "could not initialize symbol handler: error code %lu",
+								 GetLastError());
+				edata->backtrace = errtrace.data;
+				return;
+			}
+
+			on_proc_exit(backtrace_cleanup, 0);
+		}
+
+		if (backtrace_process == NULL)
 			return;
 
-		for (int i = num_skip; i < nframes; i++)
-			appendStringInfo(&errtrace, "\n%s", strfrms[i]);
-		free(strfrms);
+		nframes = CaptureStackBackTrace(num_skip, lengthof(frames), frames, NULL);
+
+		if (nframes == 0)
+		{
+			appendStringInfoString(&errtrace, "zero stack frames captured");
+			edata->backtrace = errtrace.data;
+			return;
+		}
+
+		psymbol = (PSYMBOL_INFOW) buffer;
+		psymbol->MaxNameLen = MAX_SYM_NAME;
+		psymbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+
+		for (int i = 0; i < nframes; i++)
+		{
+			DWORD64		address = (DWORD64) frames[i];
+			DWORD64		displacement = 0;
+			BOOL		sym_result;
+
+			sym_result = SymFromAddrW(backtrace_process,
+									  address,
+									  &displacement,
+									  psymbol);
+			if (sym_result == TRUE)
+			{
+				char		symbol_name[MAX_SYM_NAME];
+				size_t		result;
+
+				/*
+				 * Convert symbol name from UTF-16 to database encoding using
+				 * wchar2char(), which handles both UTF-8 and non-UTF-8
+				 * databases correctly on Windows.
+				 */
+				result = wchar2char(symbol_name, (const wchar_t *) psymbol->Name,
+									sizeof(symbol_name), NULL);
+
+				if (result == (size_t) -1 || result == sizeof(symbol_name))
+				{
+					/* Conversion failed, use address only */
+					appendStringInfo(&errtrace,
+									 "\n[0x%llx]",
+									 (unsigned long long) address);
+				}
+				else
+				{
+					IMAGEHLP_LINEW64 line;
+					DWORD		line_displacement = 0;
+					char		filename[MAX_PATH];
+
+					line.SizeOfStruct = sizeof(IMAGEHLP_LINEW64);
+
+					/* Start with the common part: symbol+offset [address] */
+					appendStringInfo(&errtrace,
+									 "\n%s+0x%llx [0x%llx]",
+									 symbol_name,
+									 (unsigned long long) displacement,
+									 (unsigned long long) address);
+
+					/* Try to append line info if available */
+					if (SymGetLineFromAddrW64(backtrace_process,
+											  address,
+											  &line_displacement,
+											  &line))
+					{
+						result = wchar2char(filename, (const wchar_t *) line.FileName,
+											sizeof(filename), NULL);
+
+						if (result != (size_t) -1 && result != sizeof(filename))
+						{
+							appendStringInfo(&errtrace,
+											 " [%s:%lu]",
+											 filename,
+											 (unsigned long) line.LineNumber);
+						}
+					}
+				}
+			}
+			else
+			{
+				appendStringInfo(&errtrace,
+								 "\n[0x%llx] (symbol lookup failed: error code %lu)",
+								 (unsigned long long) address,
+								 GetLastError());
+			}
+		}
 	}
 #else
 	appendStringInfoString(&errtrace,
@@ -1148,6 +1319,26 @@ set_backtrace(ErrorData *edata, int num_skip)
 #endif
 
 	edata->backtrace = errtrace.data;
+}
+
+/*
+ * Cleanup function for set_backtrace().
+ */
+pg_attribute_unused()
+static void
+backtrace_cleanup(int code, Datum arg)
+{
+#ifdef _MSC_VER
+	/*
+	 * Currently only used to clean up after SymInitialize.  We shouldn't ever
+	 * be called if backtrace_process is NULL, but better be safe.
+	 */
+	if (backtrace_process)
+	{
+		SymCleanup(backtrace_process);
+		backtrace_process = NULL;
+	}
+#endif
 }
 
 /*
@@ -1162,7 +1353,7 @@ set_backtrace(ErrorData *edata, int num_skip)
  * error recursion.
  */
 int
-errmsg_internal(const char *fmt,...)
+errmsg_internal(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1186,7 +1377,7 @@ errmsg_internal(const char *fmt,...)
  */
 int
 errmsg_plural(const char *fmt_singular, const char *fmt_plural,
-			  unsigned long n,...)
+			  unsigned long n, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1208,7 +1399,7 @@ errmsg_plural(const char *fmt_singular, const char *fmt_plural,
  * errdetail --- add a detail error message text to the current error
  */
 int
-errdetail(const char *fmt,...)
+errdetail(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1235,7 +1426,7 @@ errdetail(const char *fmt,...)
  * (typically, that they don't seem to be useful to average users).
  */
 int
-errdetail_internal(const char *fmt,...)
+errdetail_internal(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1256,7 +1447,7 @@ errdetail_internal(const char *fmt,...)
  * errdetail_log --- add a detail_log error message text to the current error
  */
 int
-errdetail_log(const char *fmt,...)
+errdetail_log(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1278,7 +1469,7 @@ errdetail_log(const char *fmt,...)
  */
 int
 errdetail_log_plural(const char *fmt_singular, const char *fmt_plural,
-					 unsigned long n,...)
+					 unsigned long n, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1301,7 +1492,7 @@ errdetail_log_plural(const char *fmt_singular, const char *fmt_plural,
  */
 int
 errdetail_plural(const char *fmt_singular, const char *fmt_plural,
-				 unsigned long n,...)
+				 unsigned long n, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1322,7 +1513,7 @@ errdetail_plural(const char *fmt_singular, const char *fmt_plural,
  * errhint --- add a hint error message text to the current error
  */
 int
-errhint(const char *fmt,...)
+errhint(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1344,7 +1535,7 @@ errhint(const char *fmt,...)
  * Non-translated version of errhint(), see also errmsg_internal().
  */
 int
-errhint_internal(const char *fmt,...)
+errhint_internal(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1366,7 +1557,7 @@ errhint_internal(const char *fmt,...)
  */
 int
 errhint_plural(const char *fmt_singular, const char *fmt_plural,
-			   unsigned long n,...)
+			   unsigned long n, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1391,7 +1582,7 @@ errhint_plural(const char *fmt_singular, const char *fmt_plural,
  * states.
  */
 int
-errcontext_msg(const char *fmt,...)
+errcontext_msg(const char *fmt, ...)
 {
 	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
@@ -1663,7 +1854,7 @@ pre_format_elog_string(int errnumber, const char *domain)
 }
 
 char *
-format_elog_string(const char *fmt,...)
+format_elog_string(const char *fmt, ...)
 {
 	ErrorData	errdata;
 	ErrorData  *edata;
@@ -1769,7 +1960,7 @@ CopyErrorData(void)
 	Assert(CurrentMemoryContext != ErrorContext);
 
 	/* Copy the struct itself */
-	newedata = (ErrorData *) palloc(sizeof(ErrorData));
+	newedata = palloc_object(ErrorData);
 	memcpy(newedata, edata, sizeof(ErrorData));
 
 	/*
@@ -2181,6 +2372,251 @@ DebugFileOpen(void)
 
 
 /*
+ * GUC check_hook for log_min_messages
+ *
+ * This value is parsed as a comma-separated list of zero or more TYPE:LEVEL
+ * elements.  For each element, TYPE corresponds to a bkcategory value (see
+ * postmaster/proctypelist.h); LEVEL is one of server_message_level_options.
+ *
+ * In addition, there must be a single LEVEL element (with no TYPE part)
+ * which sets the default level for process types that aren't specified.
+ */
+bool
+check_log_min_messages(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	StringInfoData buf;
+	char	   *result;
+	int			newlevel[BACKEND_NUM_TYPES];
+	bool		assigned[BACKEND_NUM_TYPES] = {0};
+	int			defaultlevel = -1;	/* -1 means not assigned */
+
+	const char *const process_types[] = {
+#define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach) \
+		[bktype] = bkcategory,
+#include "postmaster/proctypelist.h"
+#undef PG_PROCTYPE
+	};
+
+	/* Need a modifiable copy of string. */
+	rawstring = guc_strdup(LOG, *newval);
+	if (rawstring == NULL)
+		return false;
+
+	/* Parse the string into a list. */
+	if (!SplitGUCList(rawstring, ',', &elemlist))
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("List syntax is invalid.");
+		list_free(elemlist);
+		guc_free(rawstring);
+		return false;
+	}
+
+	/* Validate and assign log level and process type. */
+	foreach_ptr(char, elem, elemlist)
+	{
+		char	   *sep = strchr(elem, ':');
+
+		/*
+		 * If there's no ':' separator in the entry, this is the default log
+		 * level.  Otherwise it's a process type-specific entry.
+		 */
+		if (sep == NULL)
+		{
+			const struct config_enum_entry *entry;
+			bool		found;
+
+			/* Reject duplicates for default log level. */
+			if (defaultlevel != -1)
+			{
+				GUC_check_errdetail("Redundant specification of default log level.");
+				goto lmm_fail;
+			}
+
+			/* Validate the log level */
+			found = false;
+			for (entry = server_message_level_options; entry && entry->name; entry++)
+			{
+				if (pg_strcasecmp(entry->name, elem) == 0)
+				{
+					defaultlevel = entry->val;
+					found = true;
+					break;
+				}
+			}
+
+			if (!found)
+			{
+				GUC_check_errdetail("Unrecognized log level: \"%s\".", elem);
+				goto lmm_fail;
+			}
+		}
+		else
+		{
+			char	   *loglevel = sep + 1;
+			char	   *ptype = elem;
+			bool		found;
+			int			level;
+			const struct config_enum_entry *entry;
+
+			/*
+			 * Temporarily clobber the ':' with a string terminator, so that
+			 * we can validate it.  We restore this at the bottom.
+			 */
+			*sep = '\0';
+
+			/* Validate the log level */
+			found = false;
+			for (entry = server_message_level_options; entry && entry->name; entry++)
+			{
+				if (pg_strcasecmp(entry->name, loglevel) == 0)
+				{
+					level = entry->val;
+					found = true;
+					break;
+				}
+			}
+
+			if (!found)
+			{
+				GUC_check_errdetail("Unrecognized log level for process type \"%s\": \"%s\".",
+									ptype, loglevel);
+				goto lmm_fail;
+			}
+
+			/* Is the process type name valid and unique? */
+			found = false;
+			for (int i = 0; i < BACKEND_NUM_TYPES; i++)
+			{
+				if (pg_strcasecmp(process_types[i], ptype) == 0)
+				{
+					/* Reject duplicates for a process type. */
+					if (assigned[i])
+					{
+						GUC_check_errdetail("Redundant log level specification for process type \"%s\".",
+											ptype);
+						goto lmm_fail;
+					}
+
+					newlevel[i] = level;
+					assigned[i] = true;
+					found = true;
+
+					/*
+					 * note: we must keep looking! some process types appear
+					 * multiple times in proctypelist.h.
+					 */
+				}
+			}
+
+			if (!found)
+			{
+				GUC_check_errdetail("Unrecognized process type \"%s\".", ptype);
+				goto lmm_fail;
+			}
+
+			/* Put the separator back in place */
+			*sep = ':';
+		}
+
+		/* all good */
+		continue;
+
+lmm_fail:
+		guc_free(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	/*
+	 * The default log level must be specified. It is the fallback value.
+	 */
+	if (defaultlevel == -1)
+	{
+		GUC_check_errdetail("Default log level was not defined.");
+		guc_free(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	/* Apply the default log level to all processes not listed. */
+	for (int i = 0; i < BACKEND_NUM_TYPES; i++)
+	{
+		if (!assigned[i])
+			newlevel[i] = defaultlevel;
+	}
+
+	/*
+	 * Save an ordered representation of the user-specified string, for the
+	 * show_hook.
+	 */
+	list_sort(elemlist, log_min_messages_cmp);
+
+	initStringInfoExt(&buf, strlen(rawstring) + 1);
+	foreach_ptr(char, elem, elemlist)
+	{
+		if (foreach_current_index(elem) == 0)
+			appendStringInfoString(&buf, elem);
+		else
+			appendStringInfo(&buf, ", %s", elem);
+	}
+
+	result = guc_strdup(LOG, buf.data);
+	if (!result)
+	{
+		pfree(buf.data);
+		return false;
+	}
+
+	guc_free(*newval);
+	*newval = result;
+
+	guc_free(rawstring);
+	list_free(elemlist);
+	pfree(buf.data);
+
+	/*
+	 * Pass back data for assign_log_min_messages to use.
+	 */
+	*extra = guc_malloc(LOG, BACKEND_NUM_TYPES * sizeof(int));
+	if (!*extra)
+		return false;
+	memcpy(*extra, newlevel, BACKEND_NUM_TYPES * sizeof(int));
+
+	return true;
+}
+
+/*
+ * list_sort() callback for check_log_min_messages.  The default element
+ * goes first; the rest are ordered by strcmp() of the process type.
+ */
+static int
+log_min_messages_cmp(const ListCell *a, const ListCell *b)
+{
+	const char *s = lfirst(a);
+	const char *t = lfirst(b);
+
+	if (strchr(s, ':') == NULL)
+		return -1;
+	else if (strchr(t, ':') == NULL)
+		return 1;
+	else
+		return strcmp(s, t);
+}
+
+/*
+ * GUC assign_hook for log_min_messages
+ */
+void
+assign_log_min_messages(const char *newval, void *extra)
+{
+	for (int i = 0; i < BACKEND_NUM_TYPES; i++)
+		log_min_messages[i] = ((int *) extra)[i];
+}
+
+/*
  * GUC check_hook for backtrace_functions
  *
  * We split the input string, where commas separate function names
@@ -2214,7 +2650,7 @@ check_backtrace_functions(char **newval, void **extra, GucSource source)
 		return false;
 	}
 
-	if (*newval[0] == '\0')
+	if ((*newval)[0] == '\0')
 	{
 		*extra = NULL;
 		return true;
@@ -2519,7 +2955,6 @@ GetACPEncoding(void)
 static void
 write_eventlog(int level, const char *line, int len)
 {
-	WCHAR	   *utf16;
 	int			eventlevel = EVENTLOG_ERROR_TYPE;
 	static HANDLE evtHandle = INVALID_HANDLE_VALUE;
 
@@ -2553,6 +2988,7 @@ write_eventlog(int level, const char *line, int len)
 			break;
 		case ERROR:
 		case FATAL:
+		case FATAL_CLIENT_ONLY:
 		case PANIC:
 		default:
 			eventlevel = EVENTLOG_ERROR_TYPE;
@@ -2576,9 +3012,13 @@ write_eventlog(int level, const char *line, int len)
 		CurrentMemoryContext != NULL &&
 		GetMessageEncoding() != GetACPEncoding())
 	{
+		WCHAR	   *utf16;
+
 		utf16 = pgwin32_message_to_UTF16(line, len, NULL);
 		if (utf16)
 		{
+			const WCHAR *utf16_const = utf16;
+
 			ReportEventW(evtHandle,
 						 eventlevel,
 						 0,
@@ -2586,7 +3026,7 @@ write_eventlog(int level, const char *line, int len)
 						 NULL,
 						 1,
 						 0,
-						 (LPCWSTR *) &utf16,
+						 &utf16_const,
 						 NULL);
 			/* XXX Try ReportEventA() when ReportEventW() fails? */
 
@@ -2789,7 +3229,12 @@ get_backend_type_for_log(void)
 	if (MyProcPid == PostmasterPid)
 		backend_type_str = "postmaster";
 	else if (MyBackendType == B_BG_WORKER)
-		backend_type_str = MyBgworkerEntry->bgw_type;
+	{
+		if (MyBgworkerEntry)
+			backend_type_str = MyBgworkerEntry->bgw_type;
+		else
+			backend_type_str = "early bgworker";
+	}
 	else
 		backend_type_str = GetBackendTypeDesc(MyBackendType);
 
@@ -3379,6 +3824,7 @@ send_message_to_server_log(ErrorData *edata)
 				syslog_level = LOG_WARNING;
 				break;
 			case FATAL:
+			case FATAL_CLIENT_ONLY:
 				syslog_level = LOG_ERR;
 				break;
 			case PANIC:
@@ -3407,7 +3853,7 @@ send_message_to_server_log(ErrorData *edata)
 		 * pipe).  If this is not possible, fallback to an entry written to
 		 * stderr.
 		 */
-		if (redirection_done || MyBackendType == B_LOGGER)
+		if (redirection_done || syslogger_setup_done)
 			write_csvlog(edata);
 		else
 			fallback_to_stderr = true;
@@ -3421,7 +3867,7 @@ send_message_to_server_log(ErrorData *edata)
 		 * pipe).  If this is not possible, fallback to an entry written to
 		 * stderr.
 		 */
-		if (redirection_done || MyBackendType == B_LOGGER)
+		if (redirection_done || syslogger_setup_done)
 		{
 			write_jsonlog(edata);
 		}
@@ -3461,7 +3907,7 @@ send_message_to_server_log(ErrorData *edata)
 	}
 
 	/* If in the syslogger process, try to write messages direct to file */
-	if (MyBackendType == B_LOGGER)
+	if (syslogger_setup_done)
 		write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_STDERR);
 
 	/* No more need of the message formatted for stderr */
@@ -3761,6 +4207,7 @@ error_severity(int elevel)
 			prefix = gettext_noop("ERROR");
 			break;
 		case FATAL:
+		case FATAL_CLIENT_ONLY:
 			prefix = gettext_noop("FATAL");
 			break;
 		case PANIC:
@@ -3801,7 +4248,7 @@ append_with_tabs(StringInfo buf, const char *str)
  * safely (memory context, GUC load etc)
  */
 void
-write_stderr(const char *fmt,...)
+write_stderr(const char *fmt, ...)
 {
 	va_list		ap;
 

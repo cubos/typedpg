@@ -1,4 +1,4 @@
-//! PostgreSQL 18's keywords that an identifier can't be written as without
+//! PostgreSQL 19's keywords that an identifier can't be written as without
 //! quotes: every keyword of `kwlist.h` whose category isn't
 //! `UNRESERVED_KEYWORD` (reserved, column-name and type/function-name
 //! keywords), as PG's `quote_identifier` checks them. Sorted, for binary

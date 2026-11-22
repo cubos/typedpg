@@ -3,7 +3,7 @@
  * pg_range_d.h
  *    Macro definitions for pg_range
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -29,10 +29,15 @@
 #define Anum_pg_range_rngmultitypid 3
 #define Anum_pg_range_rngcollation 4
 #define Anum_pg_range_rngsubopc 5
-#define Anum_pg_range_rngcanonical 6
-#define Anum_pg_range_rngsubdiff 7
+#define Anum_pg_range_rngconstruct2 6
+#define Anum_pg_range_rngconstruct3 7
+#define Anum_pg_range_rngmltconstruct0 8
+#define Anum_pg_range_rngmltconstruct1 9
+#define Anum_pg_range_rngmltconstruct2 10
+#define Anum_pg_range_rngcanonical 11
+#define Anum_pg_range_rngsubdiff 12
 
-#define Natts_pg_range 7
+#define Natts_pg_range 12
 
 /* Definitions copied from pg_range.h */
 

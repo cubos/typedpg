@@ -26,7 +26,7 @@ use super::reloptions::parse_bool;
 use crate::error::AnalyzeError;
 use crate::pg_catalog::PgCatalog;
 
-/// PG 18's predefined roles (`pg_authid` rows every cluster has). Any other
+/// PG 19's predefined roles (`pg_authid` rows every cluster has). Any other
 /// `pg_*` name can't be a role: CREATE ROLE reserves the prefix.
 pub(crate) const PREDEFINED_ROLES: &[&str] = &[
     "pg_checkpoint",
@@ -474,6 +474,8 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         return Ok(());
     }
     // The parameter must exist and be settable, and a new value valid.
+    let null =
+        kind == VariableSetKind::VarSetValue && super::guc::null_arg(&stmt.name, &stmt.args)?;
     if matches!(
         kind,
         VariableSetKind::VarSetValue
@@ -482,6 +484,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
             | VariableSetKind::VarReset
     ) && let Some(setting) = super::guc::check_settable(interp, &stmt.name)?.cloned()
         && kind == VariableSetKind::VarSetValue
+        && !null
         && let [arg] = stmt.args.as_slice()
         && let Some(value) = const_arg_string(arg.as_ref())
     {
@@ -565,8 +568,10 @@ pub(crate) fn alter_database_set(
     }
     // The parameter must exist and be settable, and a new value valid, as
     // for SET.
+    let null = kind == VariableSetKind::VarSetValue && super::guc::null_arg(&set.name, &set.args)?;
     if let Some(setting) = super::guc::check_settable(interp, &set.name)?.cloned()
         && kind == VariableSetKind::VarSetValue
+        && !null
         && let [arg] = set.args.as_slice()
         && let Some(value) = const_arg_string(arg.as_ref())
     {
@@ -607,7 +612,13 @@ pub(crate) fn search_path_args(stmt: &VariableSetStmt) -> Option<Vec<String>> {
     // Each argument is one schema name: the grammar hands identifiers and
     // string literals over alike, and `flatten_set_variable_args` quotes
     // every one of them (search_path is GUC_LIST_QUOTE), so `SET
-    // search_path = 'a, b'` names a single schema `a, b`.
+    // search_path = 'a, b'` names a single schema `a, b`. PostgreSQL 19's
+    // `SET search_path TO NULL` empties it.
+    if let [Some(ast::Node::AConst(c))] = stmt.args.as_slice()
+        && c.isnull
+    {
+        return Some(Vec::new());
+    }
     stmt.args
         .iter()
         .map(|arg| match arg.as_ref() {
@@ -1155,7 +1166,7 @@ pub(crate) fn explain_options(
 }
 
 /// defGetString of an option value.
-fn string_arg(n: &ast::Node) -> Option<String> {
+pub(crate) fn string_arg(n: &ast::Node) -> Option<String> {
     match n {
         ast::Node::String(s) => Some(s.sval.clone()),
         ast::Node::Integer(i) => Some(i.ival.to_string()),

@@ -4,7 +4,7 @@
  *		sprintf into an allocated-on-demand buffer
  *
  *
- * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -40,7 +40,7 @@
  * One should therefore think twice about using this in libpq.
  */
 char *
-psprintf(const char *fmt,...)
+psprintf(const char *fmt, ...)
 {
 	int			save_errno = errno;
 	size_t		len = 128;		/* initial assumption about buffer size */

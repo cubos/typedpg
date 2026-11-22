@@ -3,7 +3,7 @@
 Typed PostgreSQL queries for TypeScript, checked against your migrations —
 no database needed at build time. Write plain SQL; `typedpg gen` analyzes
 every query with the same engine as [typedpg for Rust](https://github.com/cubos/typedpg)
-(PostgreSQL 18's own parser, an in-memory catalog built from your
+(PostgreSQL 19's own parser, an in-memory catalog built from your
 migrations, nullability inference through joins, aggregates and
 conditions) and generates the module that types and runs them.
 

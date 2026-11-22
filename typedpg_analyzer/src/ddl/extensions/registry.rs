@@ -96,7 +96,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
     // ── btree_gin ──────────────────────────────────────────────────────
     ExtensionDef {
         name: "btree_gin",
-        default_version: "1.3",
+        default_version: "1.4",
         versions: &[
             ExtensionVersion {
                 version: "1.0",
@@ -118,49 +118,22 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 from: Some("1.2"),
                 sql: include_str!("../../extensions/btree_gin--1.2--1.3.sql"),
             },
-        ],
-    },
-    // ── btree_gist ─────────────────────────────────────────────────────
-    ExtensionDef {
-        name: "btree_gist",
-        default_version: "1.8",
-        versions: &[
-            ExtensionVersion {
-                version: "1.2",
-                from: None,
-                sql: include_str!("../../extensions/btree_gist--1.2.sql"),
-            },
-            ExtensionVersion {
-                version: "1.3",
-                from: Some("1.2"),
-                sql: include_str!("../../extensions/btree_gist--1.2--1.3.sql"),
-            },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/btree_gist--1.3--1.4.sql"),
-            },
-            ExtensionVersion {
-                version: "1.5",
-                from: Some("1.4"),
-                sql: include_str!("../../extensions/btree_gist--1.4--1.5.sql"),
-            },
-            ExtensionVersion {
-                version: "1.6",
-                from: Some("1.5"),
-                sql: include_str!("../../extensions/btree_gist--1.5--1.6.sql"),
-            },
-            ExtensionVersion {
-                version: "1.7",
-                from: Some("1.6"),
-                sql: include_str!("../../extensions/btree_gist--1.6--1.7.sql"),
-            },
-            ExtensionVersion {
-                version: "1.8",
-                from: Some("1.7"),
-                sql: include_str!("../../extensions/btree_gist--1.7--1.8.sql"),
+                sql: include_str!("../../extensions/btree_gin--1.3--1.4.sql"),
             },
         ],
+    },
+    // ── btree_gist (PostgreSQL 19 installs 1.9 directly) ───────────────
+    ExtensionDef {
+        name: "btree_gist",
+        default_version: "1.9",
+        versions: &[ExtensionVersion {
+            version: "1.9",
+            from: None,
+            sql: include_str!("../../extensions/btree_gist--1.9.sql"),
+        }],
     },
     // ── citext ─────────────────────────────────────────────────────────
     ExtensionDef {
@@ -570,7 +543,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
     // ── pg_buffercache ─────────────────────────────────────────────────
     ExtensionDef {
         name: "pg_buffercache",
-        default_version: "1.6",
+        default_version: "1.7",
         versions: &[
             ExtensionVersion {
                 version: "1.2",
@@ -596,6 +569,11 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 version: "1.6",
                 from: Some("1.5"),
                 sql: include_str!("../../extensions/pg_buffercache--1.5--1.6.sql"),
+            },
+            ExtensionVersion {
+                version: "1.7",
+                from: Some("1.6"),
+                sql: include_str!("../../extensions/pg_buffercache--1.6--1.7.sql"),
             },
         ],
     },
@@ -648,10 +626,20 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             },
         ],
     },
+    // ── pg_stash_advice ────────────────────────────────────────────────
+    ExtensionDef {
+        name: "pg_stash_advice",
+        default_version: "1.0",
+        versions: &[ExtensionVersion {
+            version: "1.0",
+            from: None,
+            sql: include_str!("../../extensions/pg_stash_advice--1.0.sql"),
+        }],
+    },
     // ── pg_stat_statements ─────────────────────────────────────────────
     ExtensionDef {
         name: "pg_stat_statements",
-        default_version: "1.12",
+        default_version: "1.13",
         versions: &[
             ExtensionVersion {
                 version: "1.4",
@@ -697,6 +685,11 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 version: "1.12",
                 from: Some("1.11"),
                 sql: include_str!("../../extensions/pg_stat_statements--1.11--1.12.sql"),
+            },
+            ExtensionVersion {
+                version: "1.13",
+                from: Some("1.12"),
+                sql: include_str!("../../extensions/pg_stat_statements--1.12--1.13.sql"),
             },
         ],
     },
@@ -828,7 +821,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
     // ── postgres_fdw ───────────────────────────────────────────────────
     ExtensionDef {
         name: "postgres_fdw",
-        default_version: "1.2",
+        default_version: "1.3",
         versions: &[
             ExtensionVersion {
                 version: "1.0",
@@ -844,6 +837,11 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 version: "1.2",
                 from: Some("1.1"),
                 sql: include_str!("../../extensions/postgres_fdw--1.1--1.2.sql"),
+            },
+            ExtensionVersion {
+                version: "1.3",
+                from: Some("1.2"),
+                sql: include_str!("../../extensions/postgres_fdw--1.2--1.3.sql"),
             },
         ],
     },
