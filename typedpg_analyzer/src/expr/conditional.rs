@@ -316,7 +316,8 @@ pub(crate) fn infer_coalesce(
     let out = ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
         .with_collation(derive_collation(&args, type_oid, snapshot)?)
         .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
-        .with_refine(branches_refine(&branches, type_oid, snapshot));
+        .with_refine(branches_refine(&branches, type_oid, snapshot))
+        .with_elem_refine(branches_elem_refine(&branches, type_oid, snapshot));
     // PostgreSQL 19 relabels a COALESCE it folds to expose its collation
     // (applyRelabelType): planning keeps the parsed one.
     Ok(out)
@@ -440,6 +441,35 @@ pub(crate) fn branches_elem_nullable(
         return None;
     }
     merge_elem_nullable(parts)
+}
+
+/// What every non-NULL element of a COALESCE / CASE over `branches` is,
+/// when its result is an array of type `common`: what every branch that
+/// can be the result says of its elements, converted to `common`'s. A
+/// NULL constant never is the result, an untyped array literal says by
+/// its content.
+pub(crate) fn branches_elem_refine(
+    branches: &[(Option<&ast::Node>, &ExprType)],
+    common: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> crate::refine::Refinement {
+    let Some(elem) = super::array_element_type(snapshot, common) else {
+        return crate::refine::Refinement::NONE;
+    };
+    let parts: Vec<crate::refine::Refinement> = branches
+        .iter()
+        .filter_map(|(node, t)| match node.as_ref() {
+            Some(ast::Node::AConst(c)) if c.isnull => None,
+            Some(ast::Node::AConst(c)) if t.type_oid == oid::UNKNOWN => Some(match &c.val {
+                Some(ast::AConstValue::String(sv)) => {
+                    super::array_literal_elem_refine(&sv.sval, elem, snapshot)
+                }
+                _ => crate::refine::Refinement::NONE,
+            }),
+            _ => Some(t.elem_refine_converted(common, snapshot)),
+        })
+        .collect();
+    crate::refine::Refinement::either(&parts)
 }
 
 /// The refinement of a COALESCE / CASE / GREATEST / LEAST over `branches`,
@@ -789,7 +819,8 @@ pub(crate) fn infer_case(
     let out = ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
         .with_collation(collation)
         .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
-        .with_refine(branches_refine(&branches, type_oid, snapshot));
+        .with_refine(branches_refine(&branches, type_oid, snapshot))
+        .with_elem_refine(branches_elem_refine(&branches, type_oid, snapshot));
     // PostgreSQL 19 relabels a CASE it folds to expose its collation
     // (applyRelabelType): planning keeps the parsed one.
     Ok(out)

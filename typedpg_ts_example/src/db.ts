@@ -72,7 +72,7 @@ export interface Queries {
     row: {
       r: { f1: number; f2: string; f3: string | null };
       arr_of_row: Point2[];
-      strings: (string | null)[];
+      strings: ("" | " a " | "\"" | "," | "NULL" | "\\" | "{}" | "é" | null)[];
       discrete: typedpg.Range<number>;
       unbounded: typedpg.Range<string>;
       nothing: typedpg.Range<number>;

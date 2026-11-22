@@ -360,6 +360,9 @@ pub(crate) struct ExprType {
     pub elem_nullable: Option<bool>,
     /// What every non-NULL value is (see [`crate::refine`]).
     pub refine: crate::refine::Refinement,
+    /// For an array value, what every non-NULL element is, at any depth
+    /// (nothing known otherwise).
+    pub elem_refine: crate::refine::Refinement,
     /// An `unknown` value that is neither an untyped literal nor a
     /// parameter — a cast to `unknown` (`'a'::text::unknown`), a field
     /// selected from a record over a literal, `unknownin(…)`. PG's
@@ -422,6 +425,8 @@ pub(crate) fn merge_set_op_shapes(
             ty.nullable |= r.ty.nullable;
             ty.elem_nullable = merge_elem_nullable([l.ty.elem_nullable, r.ty.elem_nullable]);
             ty.refine = crate::refine::Refinement::either([&l.ty.refine, &r.ty.refine]);
+            ty.elem_refine =
+                crate::refine::Refinement::either([&l.ty.elem_refine, &r.ty.elem_refine]);
             ty.record_fields = match (&l.ty.record_fields, &r.ty.record_fields) {
                 (None, None) => None,
                 (l, r) => merge_set_op_shapes(l.as_ref(), r.as_ref(), true),
@@ -499,6 +504,7 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            elem_refine: crate::refine::Refinement::NONE,
             unknown_value: false,
         }
     }
@@ -518,6 +524,7 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            elem_refine: crate::refine::Refinement::NONE,
             unknown_value: false,
         }
     }
@@ -543,6 +550,7 @@ impl ExprType {
             record_fields: None,
             elem_nullable: None,
             refine: crate::refine::Refinement::NONE,
+            elem_refine: crate::refine::Refinement::NONE,
             unknown_value: false,
         }
     }
@@ -567,6 +575,12 @@ impl ExprType {
     /// The same value, refined.
     pub fn with_refine(mut self, refine: crate::refine::Refinement) -> Self {
         self.refine = refine;
+        self
+    }
+
+    /// The same value, with what its array elements are.
+    pub fn with_elem_refine(mut self, elem_refine: crate::refine::Refinement) -> Self {
+        self.elem_refine = elem_refine;
         self
     }
 
@@ -619,8 +633,80 @@ impl ExprType {
         if literals::coercion_can_null_elements(self.type_oid, to, snapshot) {
             self.elem_nullable = Some(true);
         }
+        self.elem_refine = self.elem_refine_converted(to, snapshot);
         self.refine = self.refine.converted(self.type_oid, to, snapshot);
     }
+
+    /// What is left of its elements' refinement once this array is
+    /// converted to type `to` element by element (see
+    /// [`crate::refine::Refinement::converted`]): an element coerced to a
+    /// domain passed its CHECKs too. Nothing for a value that isn't an
+    /// array or a conversion to a non-array type.
+    pub(crate) fn elem_refine_converted(
+        &self,
+        to: PgTypeOid,
+        snapshot: &PgCatalog,
+    ) -> crate::refine::Refinement {
+        elem_refine_converted(&self.elem_refine, self.type_oid, to, snapshot)
+    }
+}
+
+/// [`ExprType::elem_refine_converted`] of an array of type `from` whose
+/// elements are `elem_refine`.
+pub(crate) fn elem_refine_converted(
+    elem_refine: &crate::refine::Refinement,
+    from: PgTypeOid,
+    to: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> crate::refine::Refinement {
+    let pseudo = snapshot
+        .pg_type
+        .get(&to)
+        .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Pseudo);
+    if from == to || pseudo {
+        return elem_refine.clone();
+    }
+    match (
+        array_element_type(snapshot, from),
+        array_element_type(snapshot, to),
+    ) {
+        (Some(from), Some(to)) => elem_refine
+            .converted(from, to, snapshot)
+            .and(&snapshot.domain_refinement(to)),
+        _ => crate::refine::Refinement::NONE,
+    }
+}
+
+/// The refinement of every non-NULL element of the array literal
+/// `content` read as an array of `elem` (`array_in`, each element through
+/// the element type's input function): what the literal elements are,
+/// each read like an untyped literal of that type. Nothing for a literal
+/// that doesn't parse, or of no element.
+pub(crate) fn array_literal_elem_refine(
+    content: &str,
+    elem: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> crate::refine::Refinement {
+    let Some(delim) = crate::literal_input::array_delimiter(elem, snapshot) else {
+        return crate::refine::Refinement::NONE;
+    };
+    let mut parts = Vec::new();
+    let parsed = crate::array_input::parse_array(content, delim, &mut |e| {
+        if let Some(text) = e {
+            parts.push(
+                crate::refine::Refinement::of_string_literal(text).converted(
+                    oid::UNKNOWN,
+                    elem,
+                    snapshot,
+                ),
+            );
+        }
+        Ok(())
+    });
+    if parsed.is_err() {
+        return crate::refine::Refinement::NONE;
+    }
+    crate::refine::Refinement::either(&parts).and(&snapshot.domain_refinement(elem))
 }
 
 /// The element nullability of an array built from parts whose element (or
@@ -1777,6 +1863,7 @@ fn infer_expr_unlocated(
                 planned: Planned::AsParsed,
                 record_fields: Some(fields.into()),
                 elem_nullable: None,
+                elem_refine: crate::refine::Refinement::NONE,
                 refine: crate::refine::Refinement::NONE,
                 unknown_value: false,
             })
@@ -3027,8 +3114,8 @@ pub(crate) use conditional::failing_input_span;
 use conditional::*;
 use func_call::*;
 pub(crate) use func_call::{
-    aggregate_reads_rows, arg_coercions_nullable, backfill_call_args, check_window_clause,
-    effective_frame_options,
+    aggregate_reads_rows, arg_coercions_nullable, backfill_call_args,
+    builtin_element_result_refine, check_window_clause, effective_frame_options,
 };
 use indirection::*;
 pub(crate) use indirection::{

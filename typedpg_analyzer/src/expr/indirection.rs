@@ -324,6 +324,7 @@ pub(super) fn resolve_composite_field(
             },
             record_fields,
             elem_nullable: field.ty.elem_nullable,
+            elem_refine: field.ty.elem_refine.clone(),
             refine: field.ty.refine.clone(),
             // A FieldSelect: an `unknown` field (over an untyped literal,
             // `(ROW(1, 'x')).f2`) is no literal any more.
@@ -661,9 +662,28 @@ pub(crate) fn transform_array_expr(
                     ))
         })
     });
+    // What its non-NULL elements are: each listed value's (a sub-array's
+    // elements'), converted to the element type; a NULL constant is none.
+    let parts: Vec<crate::refine::Refinement> = arr
+        .elements
+        .iter()
+        .zip(&elems)
+        .filter(|(e, _)| !matches!(e.as_ref(), Some(ast::Node::AConst(c)) if c.isnull))
+        .map(|(_, t)| {
+            if multidims {
+                t.elem_refine_converted(coerce_type, snapshot)
+            } else {
+                t.refine
+                    .converted(t.type_oid, coerce_type, snapshot)
+                    .and(&snapshot.domain_refinement(coerce_type))
+            }
+        })
+        .collect();
+    let elem_refine = crate::refine::Refinement::either(&parts);
     Ok(ExprType::scalar_with_typmod(array_type, false, typmod)
         .with_collation(state)
-        .with_elem_nullable(elem_nullable))
+        .with_elem_nullable(elem_nullable)
+        .with_elem_refine(elem_refine))
 }
 
 /// Whether an `ARRAY[…]` element of type `t` is a sub-array, making the
@@ -1188,17 +1208,16 @@ pub(crate) fn transform_container_subscripts(
         // bound is NULL — out-of-range bounds yield an empty array.
         Ok(
             ExprType::scalar_with_typmod(base, container.nullable || any_bound_nullable, typmod)
-                .with_collation(derive_collation([container], base, snapshot)?),
+                .with_collation(derive_collation([container], base, snapshot)?)
+                // Some of its elements.
+                .with_elem_refine(container.elem_refine.clone()),
         )
     } else {
         // `arr[i]` is always nullable (out-of-bounds → NULL, even with a
         // non-null array and index).
-        Ok(
-            ExprType::scalar_with_typmod(elem, true, typmod).with_collation(derive_collation(
-                [container],
-                elem,
-                snapshot,
-            )?),
-        )
+        Ok(ExprType::scalar_with_typmod(elem, true, typmod)
+            .with_collation(derive_collation([container], elem, snapshot)?)
+            // One of its elements.
+            .with_refine(container.elem_refine.clone()))
     }
 }

@@ -39,6 +39,8 @@ pub struct AnalyzedColumn {
     pub nullable: bool,
     /// What every non-NULL value of the column is.
     pub refinement: crate::refine::Refinement,
+    /// Of an array column, what every non-NULL element is (at any depth).
+    pub elem_refinement: crate::refine::Refinement,
 }
 
 /// A named query parameter (`$name`) with lexer position plus inferred type.
@@ -1218,6 +1220,7 @@ fn analyze_raw_node_once(
                     scan_var: None,
                     record_fields: None,
                     elem_nullable: None,
+                    elem_refine: crate::refine::Refinement::NONE,
                     refine: crate::refine::Refinement::NONE,
                     origin: None,
                     unknown_value: false,
@@ -1801,6 +1804,8 @@ pub(crate) struct RawColumn {
     pub elem_nullable: Option<bool>,
     /// What every non-NULL value is (see [`crate::refine`]).
     pub refine: crate::refine::Refinement,
+    /// For an array column, what every non-NULL element is.
+    pub elem_refine: crate::refine::Refinement,
     /// The base-table column the value is passed through from, if any.
     pub origin: Option<crate::scope::Origin>,
     /// An `unknown` output that is no literal nor parameter

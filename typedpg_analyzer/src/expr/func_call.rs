@@ -485,7 +485,8 @@ pub(crate) fn infer_func_call(
             crate::refine::of_builtin_call(p, &args.exprs.iter().collect::<Vec<_>>(), snapshot)
                 .and(&declared)
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .and(&builtin_element_result_refine(&resolved, &args.exprs));
 
     // Parameters the call leaves to their defaults (see `inline_call`).
     let written_args = func.args.len();
@@ -558,6 +559,7 @@ pub(crate) fn infer_func_call(
         } else {
             builtin_array_elem_nullable(func, &resolved, &args)
         },
+        elem_refine: builtin_array_elem_refine(func, &resolved, &args),
         refine,
         // `unknownin(…)`: a call, no literal.
         unknown_value: resolved.return_type_oid == oid::UNKNOWN,
@@ -576,6 +578,7 @@ pub(crate) fn infer_func_call(
     {
         out.nullable &= body.nullable;
         out.refine = out.refine.and(&body.refine);
+        out.elem_refine = out.elem_refine.and(&body.elem_refine);
         out.elem_nullable = match (out.elem_nullable, body.elem_nullable) {
             (Some(false), _) | (_, Some(false)) => Some(false),
             (a, b) => a.or(b),
@@ -768,6 +771,90 @@ fn builtin_array_elem_nullable(
         | "regexp_matches(text,text)"
         | "regexp_matches(text,text,text)" => Some(true),
         _ => None,
+    }
+}
+
+/// What every non-NULL element of the array a `pg_catalog` routine
+/// returns is, for the routines whose result says (nothing for the rest):
+/// an aggregate or constructor of values has them as elements, an array
+/// rearranged or added to keeps its own elements, and a position is at
+/// least 1. The values are the arguments' as coerced to the call.
+fn builtin_array_elem_refine(
+    func: &ast::FuncCall,
+    resolved: &functions::ResolvedFunction,
+    args: &FuncArgs,
+) -> crate::refine::Refinement {
+    use crate::refine::Refinement;
+    if resolved.schema != "pg_catalog" {
+        return Refinement::NONE;
+    }
+    let is_null_const = |i: usize| {
+        matches!(
+            func.args.get(i).and_then(|a| a.as_ref()),
+            Some(ast::Node::AConst(c)) if c.isnull
+        )
+    };
+    // A value that becomes an element: a NULL one is no non-NULL element.
+    let value = |i: usize| -> Option<Refinement> {
+        if is_null_const(i) {
+            return None;
+        }
+        Some(
+            args.exprs
+                .get(i)
+                .map(|e| e.refine.clone())
+                .unwrap_or_default(),
+        )
+    };
+    let elems = |i: usize| -> Option<Refinement> {
+        Some(
+            args.exprs
+                .get(i)
+                .map(|e| e.elem_refine.clone())
+                .unwrap_or_default(),
+        )
+    };
+    let either = |parts: &[Option<Refinement>]| {
+        Refinement::either(parts.iter().flatten().collect::<Vec<_>>())
+    };
+    match resolved.signature.as_str() {
+        "array_agg(anynonarray)"
+        | "array_fill(anyelement,_int4)"
+        | "array_fill(anyelement,_int4,_int4)" => either(&[value(0)]),
+        // A multidimensional array of the arrays' elements.
+        "array_agg(anyarray)" => either(&[elems(0)]),
+        "array_append(anycompatiblearray,anycompatible)" => either(&[elems(0), value(1)]),
+        "array_prepend(anycompatible,anycompatiblearray)" => either(&[value(0), elems(1)]),
+        "array_cat(anycompatiblearray,anycompatiblearray)" => either(&[elems(0), elems(1)]),
+        "array_replace(anycompatiblearray,anycompatible,anycompatible)" => {
+            either(&[elems(0), value(2)])
+        }
+        "array_remove(anycompatiblearray,anycompatible)"
+        | "array_reverse(anyarray)"
+        | "array_shuffle(anyarray)"
+        | "array_sample(anyarray,int4)"
+        | "array_sort(anyarray)"
+        | "array_sort(anyarray,bool)"
+        | "array_sort(anyarray,bool,bool)"
+        | "trim_array(anyarray,int4)" => either(&[elems(0)]),
+        "array_positions(anycompatiblearray,anycompatible)" => Refinement {
+            range: Some(crate::refine::IntRange::at_least(1)),
+            ..Refinement::FINITE
+        },
+        _ => Refinement::NONE,
+    }
+}
+
+/// What the value a `pg_catalog` routine returns is, for the routines
+/// returning an element of an array argument: `unnest(anyarray)` (of a
+/// multidimensional array too, every element).
+pub(crate) fn builtin_element_result_refine(
+    resolved: &functions::ResolvedFunction,
+    args: &[ExprType],
+) -> crate::refine::Refinement {
+    match (resolved.schema.as_str(), resolved.signature.as_str(), args) {
+        ("pg_catalog", "unnest(anyarray)", [arr]) => arr.elem_refine.clone(),
+        _ => crate::refine::Refinement::NONE,
     }
 }
 
@@ -1396,9 +1483,11 @@ fn coerce_call_args(
 
 /// An aggregate reads its arguments only over the rows its FILTER passes:
 /// what the FILTER proves non-NULL is so in them (`array_agg(x) FILTER
-/// (WHERE x IS NOT NULL)` has no NULL element). The arguments were typed
-/// before the FILTER, as PG does; their nullability is read again under
-/// its facts, on a scratch copy of the parameters (the types are settled).
+/// (WHERE x IS NOT NULL)` has no NULL element), and so are the values it
+/// leaves them (`array_agg(x) FILTER (WHERE x IN (1, 2))`). The arguments
+/// were typed before the FILTER, as PG does; their nullability and values
+/// are read again under its facts, on a scratch copy of the parameters
+/// (the types are settled).
 fn narrow_by_filter(
     func: &ast::FuncCall,
     args: &mut FuncArgs,
@@ -1438,6 +1527,10 @@ fn narrow_by_filter(
         }
         if let Some(e) = args.exprs.get_mut(i) {
             e.nullable &= t.nullable;
+            if e.type_oid == t.type_oid {
+                e.refine = e.refine.and(&t.refine);
+                e.elem_refine = e.elem_refine.and(&t.elem_refine);
+            }
             if let (Some(old), Some(new)) = (e.elem_nullable, t.elem_nullable) {
                 e.elem_nullable = Some(old && new);
             }

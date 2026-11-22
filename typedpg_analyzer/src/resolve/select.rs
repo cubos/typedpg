@@ -2385,6 +2385,7 @@ fn values_sort_and_limit(
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,
+            elem_refine: c.elem_refine.clone(),
             refine: c.refine.clone(),
             origin: None,
             output: None,

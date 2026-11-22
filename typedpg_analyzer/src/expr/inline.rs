@@ -157,6 +157,7 @@ fn body_scope(proc: &crate::pg_catalog::PgProc, bound: &[ExprType]) -> Option<cr
             table_alias: alias.clone(),
             record_fields: t.record_fields.clone(),
             elem_nullable: t.elem_nullable,
+            elem_refine: t.elem_refine.clone(),
             refine: t.refine.clone(),
             origin: None,
             output: None,

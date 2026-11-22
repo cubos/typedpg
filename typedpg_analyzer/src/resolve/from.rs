@@ -498,6 +498,7 @@ pub(crate) fn process_from_item(
                                 (a, b) => a.or(b),
                             };
                             c.refine = c.refine.and(&rc.refine);
+                            c.elem_refine = c.elem_refine.and(&rc.elem_refine);
                         }
                     }
                 } else {
@@ -741,6 +742,7 @@ pub(crate) fn process_from_item(
                         planned_unknown: rc.planned != crate::expr::Planned::AsParsed,
                         record_fields: rc.record_fields,
                         elem_nullable: rc.elem_nullable,
+                        elem_refine: rc.elem_refine.clone(),
                         refine: rc.refine.clone(),
                         origin: rc.origin,
                         output: output_group
@@ -1051,6 +1053,7 @@ fn process_range_function(
             planned_unknown: false,
             record_fields: None,
             elem_nullable: None,
+            elem_refine: crate::refine::Refinement::NONE,
             refine: crate::refine::Refinement::NONE,
             origin: None,
             output: None,
@@ -2074,6 +2077,10 @@ fn merge_using_columns(
                 &l.refine.converted(l.type_oid, type_oid, snapshot),
                 &r.refine.converted(r.type_oid, type_oid, snapshot),
             ]),
+            elem_refine: crate::refine::Refinement::either([
+                &crate::expr::elem_refine_converted(&l.elem_refine, l.type_oid, type_oid, snapshot),
+                &crate::expr::elem_refine_converted(&r.elem_refine, r.type_oid, type_oid, snapshot),
+            ]),
             origin: None,
             output: None,
         });
@@ -2656,6 +2663,7 @@ fn function_rte_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                elem_refine: crate::refine::Refinement::NONE,
                 refine: crate::refine::Refinement::NONE,
                 origin: None,
                 output: None,
@@ -2727,6 +2735,7 @@ fn function_rte_columns(
         planned_unknown: sql_function,
         record_fields: None,
         elem_nullable: None,
+        elem_refine: crate::refine::Refinement::NONE,
         // `generate_series` of finite bounds and step (see
         // `refine::of_builtin_call`).
         refine: snapshot
@@ -2735,7 +2744,9 @@ fn function_rte_columns(
             .map(|p| {
                 crate::refine::of_builtin_call(p, &arg_exprs.iter().collect::<Vec<_>>(), snapshot)
             })
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            // `unnest(arr)`: the array's elements.
+            .and(&expr::builtin_element_result_refine(&resolved, &arg_exprs)),
         origin: None,
         output: None,
     }])
@@ -2810,6 +2821,7 @@ fn expr_rte_columns(
         planned_unknown: false,
         record_fields: None,
         elem_nullable: value.elem_nullable,
+        elem_refine: value.elem_refine.clone(),
         refine: value.refine,
         origin: None,
         output: None,
@@ -2888,6 +2900,7 @@ fn composite_rte_columns(
                 table_alias: alias.to_owned(),
                 record_fields: None,
                 elem_nullable: None,
+                elem_refine: crate::refine::Refinement::NONE,
                 refine: crate::refine::Refinement::NONE,
                 origin: None,
                 output: None,
@@ -3027,6 +3040,7 @@ fn coldeflist_columns(
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            elem_refine: crate::refine::Refinement::NONE,
             refine: crate::refine::Refinement::NONE,
             origin: None,
             output: None,
@@ -3418,6 +3432,7 @@ fn json_table_columns(
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            elem_refine: crate::refine::Refinement::NONE,
             refine: crate::refine::Refinement::NONE,
             origin: None,
             output: None,
