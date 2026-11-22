@@ -3232,9 +3232,14 @@ pub struct NullifiedJoin {
     /// The FROM entry on the join's nullable side the condition proves is
     /// never null-extended (its alias, or the relation's name).
     pub entry: String,
-    /// The join's kind as it would behave without the condition: `"LEFT"`,
-    /// `"RIGHT"` or `"FULL"`.
+    /// The join's kind as written: `"LEFT"`, `"RIGHT"` or `"FULL"`.
     pub written: &'static str,
+    /// The join's kind as it would behave without the condition: `"LEFT"`,
+    /// `"RIGHT"` or `"FULL"` — `written`, unless a foreign key, an `ON
+    /// true` to a row always there or a join above already reduced it (a
+    /// `FULL JOIN` whose one side always finds a match behaves as a `LEFT`
+    /// or `RIGHT` one).
+    pub before: &'static str,
     /// What the condition leaves of it: `"INNER"`, `"LEFT"` or `"RIGHT"`.
     pub reduced: &'static str,
 }

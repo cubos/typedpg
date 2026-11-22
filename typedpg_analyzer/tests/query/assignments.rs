@@ -26,7 +26,9 @@ fn multi_column_update_forms() {
         .unwrap();
     db.analyze("UPDATE t SET (a, b) = ROW(1, 'x')").unwrap();
     db.analyze("UPDATE t SET (a, b) = (1, 'x')").unwrap();
-    db.analyze("UPDATE t SET (a, b) = (DEFAULT, 'x')").unwrap();
+    db.analyze("UPDATE t SET (a, b) = (1, DEFAULT)").unwrap();
+    // (`SET (a, b) = (DEFAULT, 'x')` writes NULL into NOT NULL `a`: see
+    // dml.rs's update_set_default_null_into_not_null_column_rejected.)
     db.analyze(
         "INSERT INTO k VALUES (1,2,'x') ON CONFLICT (c) DO UPDATE SET (a, b) = (excluded.a, excluded.b)",
     )

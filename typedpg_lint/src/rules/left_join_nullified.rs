@@ -53,15 +53,26 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
                 continue;
             };
             let entry = typedpg_core::quote_identifier(&join.entry);
+            let article = |kind: &str| if kind == "INNER" { "an" } else { "a" };
+            // The join as written, and what it already behaves as when a
+            // foreign key (or a join above) keeps one side of it from
+            // being NULL-extended: a `FULL JOIN` whose other side always
+            // finds a match is a `LEFT` or `RIGHT` one.
+            let side = if join.before == join.written {
+                format!("{} JOIN", join.written)
+            } else {
+                format!(
+                    "{} JOIN, which already behaves as {} {} JOIN",
+                    join.written,
+                    article(join.before),
+                    join.before
+                )
+            };
             let message = format!(
                 "this condition is never true for the NULL-extended rows of {entry}, on the \
-                 nullable side of a {} JOIN: the join behaves as {} JOIN",
-                join.written,
-                if join.reduced == "INNER" {
-                    "an INNER"
-                } else {
-                    join.reduced
-                },
+                 nullable side of a {side}: the join behaves as {} {} JOIN",
+                article(join.reduced),
+                join.reduced,
             );
             let help = if is_not_null_test(conjunct) {
                 format!(
@@ -147,7 +158,7 @@ mod tests {
                  WHERE p.score = 1",
                 "p.score = 1",
                 "FULL",
-                "RIGHT",
+                "a RIGHT",
             ),
             (
                 "SELECT u.id FROM users u LEFT JOIN posts p ON p.user_id = u.id \
@@ -178,6 +189,38 @@ mod tests {
             assert!(findings[0].help.as_ref().unwrap().contains("ON clause"));
             assert!(findings[0].fix.is_empty());
         }
+    }
+
+    #[test]
+    fn a_full_join_a_foreign_key_already_reduces_is_named_as_written() {
+        let db = catalog();
+        // `owner_id` is a NOT NULL foreign key: every post finds its user,
+        // so `u` is never NULL-extended and the FULL JOIN is a LEFT one
+        // before the WHERE makes it an inner join.
+        let sql = "SELECT u.id FROM users u FULL JOIN posts p ON p.owner_id = u.id \
+                   WHERE p.score > 0";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(&sql[findings[0].span.clone()], "p.score > 0");
+        assert_eq!(
+            findings[0].message,
+            "this condition is never true for the NULL-extended rows of p, on the nullable \
+             side of a FULL JOIN, which already behaves as a LEFT JOIN: the join behaves as an \
+             INNER JOIN"
+        );
+        // The same from the other side: a RIGHT JOIN already.
+        let sql = "SELECT u.id FROM posts p FULL JOIN users u ON p.owner_id = u.id \
+                   WHERE p.score > 0";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].message.contains(
+                "nullable side of a FULL JOIN, which already behaves as a RIGHT JOIN: the join \
+                 behaves as an INNER JOIN"
+            ),
+            "{}",
+            findings[0].message
+        );
     }
 
     #[test]

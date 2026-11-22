@@ -188,11 +188,19 @@ The text must be exactly `typedpg-lint: allow(` + comma-separated rule names
 + `)`, with nothing after it. Anything else starting with `typedpg-lint:`,
 or an unknown rule name, is an [`invalid_allow`](invalid_allow.md) error.
 
+A comment after a statement's `;`, on the line the statement ends on,
+belongs to that statement, not the next one:
+
+```sql
+DELETE FROM sessions; -- typedpg-lint: allow(unbounded_write)
+```
+
 | Finding | Where the comment goes |
 |---|---|
 | query and call-site rules | anywhere in the query's SQL; covers the whole query |
+| query and call-site rules, `.sql` file | inside the query, between its `/* @name */` comment and its statement, after its `;` on the statement's last line, or on the lines before its `/* @name */` comment (after the previous query's last line); comments after the file's last query are its |
 | `sql!` binding rules | in the `sql!` template's SQL |
-| migration rules | inside the statement, or just before it; covers that statement only |
+| migration rules | inside the statement, just before it, or after its `;` on the statement's last line; covers that statement only |
 | schema rules | on the statement the finding is placed on (the `CREATE` of the object); covers everything it creates |
 | [`breaks_deployed_queries`](breaks_deployed_queries.md) | on the breaking migration statement, or in the deployed query |
 

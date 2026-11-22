@@ -780,3 +780,70 @@ fn queries_imported_through_tsconfig_paths_are_linted() {
     );
     check("after gen");
 }
+
+/// Every comment of a `.sql` file belongs to a query, for its allow comments
+/// to suppress and be checked: the comments on the line a statement ends
+/// on, after it (and its `;`), are that statement's; the others lead into
+/// the next query; those after the last query are its.
+#[test]
+fn allow_comments_around_sql_file_queries_belong_to_a_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["queries/*.sql"], "emit": "none" }
+        }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TABLE posts (id int4 PRIMARY KEY);\n",
+    );
+    write(
+        &root.join("queries/posts.sql"),
+        "-- typedpg-lint: allow(header_rule)\n\
+         /* @name a */\n\
+         SELECT id AS id FROM posts; -- typedpg-lint: allow(redundant_alias)\n\
+         \n\
+         /* @name b */\n\
+         SELECT id AS id FROM posts; -- typedpg-lint: allow(trailing_rule)\n\
+         \n\
+         -- typedpg-lint: allow(redundant_alias)\n\
+         /* @name c */\n\
+         SELECT id AS id FROM posts;\n\
+         \n\
+         /* @name d */\n\
+         SELECT id AS id FROM posts /* typedpg-lint: allow(redundant_alias) */\n\
+         -- typedpg-lint: allow(last_rule)\n",
+    );
+    write(&root.join("src/app.ts"), "export {};\n");
+    generate(root);
+
+    let output = run(root, &["lint", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut found: Vec<(String, u64)> = json["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stdout}"))
+        .iter()
+        .map(|finding| {
+            (
+                finding["rule"].as_str().unwrap().to_owned(),
+                finding["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("invalid_allow".to_owned(), 1),
+            ("invalid_allow".to_owned(), 6),
+            ("invalid_allow".to_owned(), 14),
+            ("redundant_alias".to_owned(), 6),
+        ],
+        "{stdout}"
+    );
+}

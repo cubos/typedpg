@@ -56,7 +56,12 @@ when the nullable side is NULL-extended:
 - an `OR` whose every arm rejects: `p.score = 1 OR p.score = 2`.
 
 On a `FULL JOIN`, a condition on one side makes it behave as a `LEFT` or
-`RIGHT` join, and the message says which.
+`RIGHT` join, and the message says which. The message names the join as
+written; when a foreign key already keeps one side from being NULL-extended
+(`users u FULL JOIN posts p ON p.user_id = u.id` with `user_id` a `NOT NULL`
+foreign key is a `LEFT JOIN`), it also says what the join behaves as before
+the condition: `on the nullable side of a FULL JOIN, which already behaves as
+a LEFT JOIN: the join behaves as an INNER JOIN`.
 
 ## Not reported
 

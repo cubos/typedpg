@@ -1198,8 +1198,7 @@ impl Project {
         }
         for (path, (db, file)) in &self.sql_files {
             for query in &file.queries {
-                let start = query.after_name;
-                let end = query.start + query.text.len();
+                let (start, text) = file.lint_text(query);
                 let calls = remote
                     .get(&(canonical(path), query.name.clone()))
                     .cloned()
@@ -1207,7 +1206,7 @@ impl Project {
                 out.push(LintQuery {
                     db: *db,
                     file: path,
-                    text: file.source[start..end].to_owned(),
+                    text,
                     source: QuerySource::File { start },
                     pos: query.pos,
                     lines: &file.lines,

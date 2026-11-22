@@ -19,7 +19,10 @@ use typedpg_pg_query::ast::{
     ObjectType, SortByDir, SortByNulls, TransactionStmtKind, VariableSetKind,
 };
 
-use crate::{AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment};
+use crate::{
+    AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment,
+    trailing_comments_end,
+};
 
 /// What [`lint_migrations`] reports for a migration file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2395,7 +2398,10 @@ impl MigrationObserver for MigrationLinter<'_> {
             return;
         }
         self.current_span = self.trimmed(&statement.span);
-        self.current_suppressed = self.suppressions(&statement.span);
+        // The comments on the statement's last line, after its `;`, are
+        // its own too.
+        let tail = trailing_comments_end(&self.files[self.current].sql, statement.span.end);
+        self.current_suppressed = self.suppressions(&(statement.span.start..tail));
         self.before_relation = None;
         self.before_columns.clear();
         if let N::AlterTableStmt(alter) = statement.node
@@ -2425,7 +2431,7 @@ impl MigrationObserver for MigrationLinter<'_> {
         if self.files[self.current].lint == MigrationLint::All {
             self.statement_rules(catalog, statement);
         }
-        self.last_statement_end = statement.span.end;
+        self.last_statement_end = tail;
     }
 
     fn after(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {

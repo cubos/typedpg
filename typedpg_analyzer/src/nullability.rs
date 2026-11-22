@@ -541,7 +541,8 @@ impl NullabilityContext {
                 if let Some(entry) = entry {
                     out.push(crate::pg_catalog::NullifiedJoin {
                         entry,
-                        written: name(kind),
+                        written: name(j.kind),
+                        before: name(kind),
                         reduced: name(reduced),
                     });
                 }

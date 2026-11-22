@@ -1179,6 +1179,55 @@ pub fn allowed_rules(sql: &str) -> HashSet<Rule> {
     suppressions(sql).0
 }
 
+/// Where the comments that trail the statement ending at byte `end` of
+/// `sql` end: past its `;` (one) and the comments that start on the line
+/// the statement ends on, after it — `DELETE FROM t; -- typedpg-lint:
+/// allow(unbounded_write)`. Those comments are the statement's, not the
+/// next one's. `end` itself when no comment trails it.
+pub fn trailing_comments_end(sql: &str, end: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut i = end;
+    let mut tail = end;
+    let mut semicolon = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\x0c' => i += 1,
+            b';' if !semicolon => {
+                semicolon = true;
+                i += 1;
+            }
+            // scan.l's `non_newline` is `[^\n\r]`.
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+                return i;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                // Block comments nest.
+                let mut depth = 0usize;
+                while i < bytes.len() {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                tail = i;
+            }
+            _ => break,
+        }
+    }
+    tail
+}
+
 /// What a comment says to the linter.
 enum AllowComment {
     /// Not a `typedpg-lint:` comment.
@@ -2901,6 +2950,58 @@ mod tests {
             &text[blocking[0].finding.span.clone()],
             "CREATE INDEX users_email_idx ON users (email)"
         );
+    }
+
+    #[test]
+    fn a_comment_after_a_migration_statement_on_its_line_is_its_own() {
+        // After the `;`, on the statement's last line: the statement's, not
+        // the next one's.
+        let text = "CREATE INDEX users_name_idx ON users (name); \
+                    -- typedpg-lint: allow(create_index_blocking)\n\
+                    CREATE INDEX users_email_idx ON users (email);";
+        let findings = second(text);
+        let blocking = only(&findings, Rule::CreateIndexBlocking);
+        assert_eq!(blocking.len(), 1, "{findings:?}");
+        assert_eq!(
+            &text[blocking[0].finding.span.clone()],
+            "CREATE INDEX users_email_idx ON users (email)"
+        );
+        // On the file's last statement too, and an invalid one there is
+        // reported once.
+        let text = "CREATE INDEX users_email_idx ON users (email); \
+                    /* typedpg-lint: allow(create_index_blocking) */";
+        assert!(only(&second(text), Rule::CreateIndexBlocking).is_empty());
+        let text = "CREATE INDEX users_email_idx ON users (email); \
+                    -- typedpg-lint: allow(no_such_rule)\n";
+        let findings = second(text);
+        assert_eq!(only(&findings, Rule::InvalidAllow).len(), 1, "{findings:?}");
+        assert_eq!(only(&findings, Rule::CreateIndexBlocking).len(), 1);
+        // A comment on the next line leads into the next statement.
+        let text = "CREATE INDEX users_name_idx ON users (name);\n\
+                    -- typedpg-lint: allow(create_index_blocking)\n\
+                    CREATE INDEX users_email_idx ON users (email);";
+        let findings = second(text);
+        let blocking = only(&findings, Rule::CreateIndexBlocking);
+        assert_eq!(blocking.len(), 1, "{findings:?}");
+        assert_eq!(
+            &text[blocking[0].finding.span.clone()],
+            "CREATE INDEX users_name_idx ON users (name)"
+        );
+    }
+
+    #[test]
+    fn trailing_comments_end_at_the_statements_line() {
+        fn end_of(sql: &str) -> &str {
+            let end = sql.find(" ;").or_else(|| sql.find(';')).unwrap_or(8);
+            &sql[trailing_comments_end(sql, end)..]
+        }
+        assert_eq!(end_of("SELECT 1; -- a\nSELECT 2"), "\nSELECT 2");
+        assert_eq!(end_of("SELECT 1 ; /* a */ /* b */\nx"), "\nx");
+        assert_eq!(end_of("SELECT 1 -- a\nx"), "\nx");
+        assert_eq!(end_of("SELECT 1; /* a /* nested */ */ -- b\rx"), "\rx");
+        // Nothing trails: the statement's end.
+        assert_eq!(end_of("SELECT 1;\n-- a"), ";\n-- a");
+        assert_eq!(end_of("SELECT 1; SELECT 2; -- a"), "; SELECT 2; -- a");
     }
 
     #[test]

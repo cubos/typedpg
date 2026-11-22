@@ -29,7 +29,7 @@ info[non_sargable_predicate]: this comparison can't use the index users_created_
  2 │ SELECT id FROM users WHERE created_at::date = $day;
    ·                            ───────────────────────
    ╰────
-  help: compare a range on the column itself: created_at >= $day AND created_at < $day + 1
+  help: compare a range on the column itself: `created_at >= $day::date::timestamptz AND created_at < ($day::date + 1)::timestamptz` reads days in the session's TimeZone as the cast does, and selects the same rows but around a daylight-saving change at midnight; for days of a fixed zone instead (other rows, unless the session is in that zone), convert each bound with `::timestamp AT TIME ZONE 'UTC'`
 
 info[non_sargable_predicate]: this comparison can't use the index products_sku_idx on sku: the column is an argument of lower()
    ╭─[queries.sql:6:31]
@@ -43,12 +43,36 @@ info[non_sargable_predicate]: this comparison can't use the index products_pkey 
  12 │ SELECT sku FROM products WHERE id = 1.5;
     ·                                ────────
     ╰────
-   help: cast the other side to int4 so the column is compared as stored
+   help: cast the other side to int4 so the column is compared as stored (the same rows only where that cast is exact: a value it rounds or truncates compares differently)
 ```
 
 The help names the rewrite: a range on the bare column (`::date`,
 `date_trunc`), converting the other side (a cast or implicit conversion), an
 expression index (a function), or moving the computation (arithmetic).
+
+A range is named only where one selects the same rows, and it is one no
+other rule reports:
+
+- `timestamp` column, `col::date` compared with a `date`: the date's
+  midnight is the bound (`col >= $day::date AND col < $day::date + 1`),
+  exactly the same rows. `<`, `<=`, `>`, `>=` get their one bound,
+  `BETWEEN` its two (`col < $to::date + 1` for the upper one).
+- `timestamptz` column: `::date` reads the day in the session's `TimeZone`,
+  and so do the bounds, converted explicitly (`$day::date::timestamptz`)
+  rather than compared as a `date`, which
+  [`timestamp_timezone_mix`](timestamp_timezone_mix.md) reports. The rows
+  differ only around a daylight-saving change at midnight (a skipped or
+  repeated midnight). Days of a fixed zone
+  (`$day::date::timestamp AT TIME ZONE 'UTC'`) stop depending on the
+  session, but select other rows unless the session is in that zone.
+- `date_trunc('unit', col) = $t`: `col >= $t AND col < $t + interval '1
+  unit'`, the same rows when `$t` is itself truncated (`date_trunc` never
+  equals anything else).
+- A `date_trunc` with a time zone argument, a unit with no interval, or the
+  other side of another type (`col::date = localtimestamp`) gets no range;
+  a `::date` cast compared with a list (`IN`, `= ANY`) gets the advice to
+  compare each day as a range, not to convert the other side (which would
+  compare instants with each day's midnight).
 
 ## Why
 
@@ -110,8 +134,9 @@ text. See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`timestamp_timezone_mix`](timestamp_timezone_mix.md): the `::date` range
-  rewrite with a `date` value on a `timestamptz` column depends on the
-  session's `TimeZone`.
+- [`timestamp_timezone_mix`](timestamp_timezone_mix.md): a range on a
+  `timestamptz` column with bare `date` bounds converts them in the
+  session's `TimeZone` implicitly; the suggested range converts them
+  explicitly.
 - [`fk_without_index`](fk_without_index.md): a foreign key with no index at
   all.

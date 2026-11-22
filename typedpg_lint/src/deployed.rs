@@ -347,8 +347,12 @@ struct Replay<'a, 'b> {
 
 impl MigrationObserver for Replay<'_, '_> {
     fn after(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
-        let lead_in = self.previous_end..statement.span.end;
-        self.previous_end = statement.span.end;
+        // The comments on the statement's last line, after its `;`, are
+        // its own too.
+        let tail =
+            crate::trailing_comments_end(&self.schema.files[self.file].sql, statement.span.end);
+        let lead_in = self.previous_end..tail;
+        self.previous_end = tail;
         // A statement of somebody else's schema (`extra_migrations`) is not
         // reported on: its changes go to the first new migration.
         if self.schema.files[self.file].lint == MigrationLint::None {
@@ -3565,16 +3569,19 @@ mod tests {
 
     #[test]
     fn set_to_default_without_a_default_writes_null() {
-        let old = "CREATE TABLE t (id integer, note text, label text NOT NULL DEFAULT '');
+        let old = "CREATE TABLE t (id integer PRIMARY KEY, note text, \
+                   label text NOT NULL DEFAULT '');
                    CREATE VIEW v AS SELECT id, label FROM t;";
+        // An UPDATE's: the analysis itself rejects it, as it does a literal
+        // NULL there.
         assert_eq!(
             only(&check(
                 &[old],
                 &["ALTER TABLE t ALTER COLUMN note SET NOT NULL;"],
                 &["UPDATE t SET note = DEFAULT WHERE id = $id"],
             )),
-            "its UPDATE of t writes column note, now NOT NULL, as DEFAULT, which is NULL, the \
-             column having no default: writing NULL fails"
+            "it no longer runs: null value in column \"note\" of relation \"t\" violates \
+             not-null constraint (cannot assign NULL to NOT NULL column `t.note`)"
         );
         assert_eq!(
             only(&check(
@@ -3582,7 +3589,29 @@ mod tests {
                 &["ALTER TABLE t ALTER COLUMN label DROP DEFAULT;"],
                 &["UPDATE t SET label = DEFAULT WHERE id = $id"],
             )),
-            "its UPDATE of t writes column label as DEFAULT, which is now NULL, the column \
+            "it no longer runs: null value in column \"label\" of relation \"t\" violates \
+             not-null constraint (cannot assign NULL to NOT NULL column `t.label`)"
+        );
+        // ON CONFLICT DO UPDATE's, which the analysis accepts (it runs only
+        // on a conflict).
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE t ALTER COLUMN note SET NOT NULL;"],
+                &["INSERT INTO t (id, note) VALUES ($id, 'x') \
+                   ON CONFLICT (id) DO UPDATE SET note = DEFAULT"],
+            )),
+            "its INSERT into t writes column note, now NOT NULL, as DEFAULT, which is NULL, the \
+             column having no default: writing NULL fails"
+        );
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE t ALTER COLUMN label DROP DEFAULT;"],
+                &["INSERT INTO t (id, label) VALUES ($id, 'x') \
+                   ON CONFLICT (id) DO UPDATE SET label = DEFAULT"],
+            )),
+            "its INSERT into t writes column label as DEFAULT, which is now NULL, the column \
              having no default, while it is NOT NULL: writing NULL fails"
         );
         // Through a view, the view's default is written, NULL without one
