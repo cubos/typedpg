@@ -3052,10 +3052,31 @@ pub(crate) fn note_write_statement(
             command,
             relid,
             columns: Vec::new(),
+            rows: 1,
             base,
         });
         WriteStatementGuard(true)
     })
+}
+
+/// Record that the data-modifying statement being analyzed on `relid`
+/// starts another target list (see [`crate::condition::WrittenColumn::row`]):
+/// a VALUES row, an `INSERT … SELECT`'s output, a SET list, a MERGE
+/// action's.
+pub(crate) fn note_write_row(relid: PgClassOid) {
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut()
+            && let Some(&open) = facts.open_writes.last()
+            && let Some(statement) = facts.writes.get_mut(open)
+            && statement.relid == relid
+            && statement
+                .columns
+                .last()
+                .is_some_and(|c| c.row + 1 == statement.rows)
+        {
+            statement.rows += 1;
+        }
+    });
 }
 
 /// Record that the data-modifying statement being analyzed writes
@@ -3076,6 +3097,7 @@ pub(crate) fn note_written(
             statement.columns.push(crate::condition::WrittenColumn {
                 column: column.to_owned(),
                 update,
+                row: statement.rows - 1,
                 value,
             });
         }

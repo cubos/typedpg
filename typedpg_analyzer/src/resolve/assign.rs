@@ -416,6 +416,9 @@ pub(crate) fn analyze_set_clause<'a>(
     null_check: bool,
 ) -> Result<std::borrow::Cow<'a, [Option<ast::Node>]>, AnalyzeError> {
     let snapshot = ctx.snapshot;
+    if let Some(a) = table_attrs.first() {
+        crate::pg_catalog::note_write_row(a.attrelid);
+    }
     let target_list = expand_multi_assign_rows(target_list, ctx, params)?;
     let items = expand_set_items(&target_list, ctx, params)?;
     // `(column, indirected)` of every assignment, for the rewriter's

@@ -161,11 +161,20 @@ impl JsonbBuiltin {
 /// created ([`TrustedNodes`]).
 pub(crate) trait Trust {
     fn trusts(&self, location: i32, kind: StrictNode) -> bool;
+
+    /// The routine the plain function call at `location` resolved to.
+    fn call(&self, _location: i32) -> Option<crate::oid::PgProcOid> {
+        None
+    }
 }
 
 impl Trust for StrictLog {
     fn trusts(&self, location: i32, kind: StrictNode) -> bool {
         self.is_strict(location, kind)
+    }
+
+    fn call(&self, location: i32) -> Option<crate::oid::PgProcOid> {
+        self.3.borrow().get(&location).copied()
     }
 }
 
@@ -191,6 +200,10 @@ impl TrustedNodes {
 impl Trust for TrustedNodes {
     fn trusts(&self, location: i32, kind: StrictNode) -> bool {
         location >= 0 && self.nodes.contains(&(location, kind))
+    }
+
+    fn call(&self, location: i32) -> Option<crate::oid::PgProcOid> {
+        TrustedNodes::call(self, location)
     }
 }
 

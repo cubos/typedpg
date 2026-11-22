@@ -24,15 +24,23 @@
 //! A parameter or a COPY field may be any value; a value the query computes
 //! (a constant, a `CASE` of them, a column of an `INSERT … SELECT`) is
 //! checked with what the analyzer knows of it, and is reported only when it
-//! may not fit. A CHECK conjunct the analyzer can't read exactly of one
-//! column (`CHECK (lo <= hi)`, `length(name) > 1`) is reported as one that
-//! may reject the deployed code's rows. Constraints are compared by what
+//! may not fit, compared as the column stores it (an untyped literal read
+//! as its type, an integer as a `numeric`, a `date` as a `timestamp`;
+//! numeric bounds against a narrower precision with exact decimals). A
+//! CHECK conjunct the analyzer can't read exactly of one column (`CHECK
+//! (lo <= hi)`, `length(name) > 1`) is evaluated over the constants each
+//! row writes: silent when TRUE or NULL for every row, reported as
+//! rejecting the rows when FALSE for one, and as one that may reject them
+//! otherwise. `SET c = DEFAULT` writes NULL where the column (through a
+//! view, the view's) has no default. Constraints are compared by what
 //! they check, not their name. The tables written are the ones the analysis
 //! resolved ([`QueryView::writes`]); a write into an automatically
-//! updatable view (or a chain of them) is checked against the table its
-//! rows are stored in, each view column as the table column it stores, and
-//! an `INSERT` through it leaves out the table columns the view doesn't
-//! expose (unless a view's default fills them in). Not reported: a column
+//! updatable view (or a chain of them, with no DO INSTEAD rule or INSTEAD
+//! OF trigger for the command) is checked against the table its rows are
+//! stored in, each view column as the table column it stores, and an
+//! `INSERT` through it leaves out the table columns the view doesn't
+//! expose (unless a view's default, its own or its domain's, fills them
+//! in). Not reported: a column
 //! a new UNIQUE, primary key or exclusion constraint covers (whether a row
 //! breaks it depends on the data), a parameter written into a column whose
 //! type changes (its type change says so), and a timestamp, time or
@@ -59,8 +67,8 @@ use std::ops::Range;
 
 use typedpg_analyzer::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedQuery, CheckReading, IntRange, MigrationObserver,
-    MigrationStatement, PgCatalog, PgClassOid, QualifiedName, QueryView, Refinement, Type,
-    WriteCommand, WrittenValue,
+    MigrationStatement, PartOutcome, PgCatalog, PgClassOid, QualifiedName, QueryView, Refinement,
+    Type, WriteCommand, WrittenValue,
 };
 use typedpg_core::quote_identifier;
 
@@ -583,7 +591,11 @@ fn statement_changes(
     let Ok(view) = view else {
         return;
     };
-    writes(&view, old_catalog, new_catalog, out);
+    let old_view = match role {
+        Some(role) => old_catalog.query_view_as(sql, role),
+        None => old_catalog.query_view(sql),
+    };
+    writes(&view, old_view.as_ref().ok(), old_catalog, new_catalog, out);
     if let Some(role) = role {
         row_security(&view, role, old_catalog, new_catalog, out);
     }
@@ -648,6 +660,7 @@ fn copy_changes(
         &name,
         (old_table.oid, new.relid),
         &inserted,
+        None,
         old_catalog,
         new_catalog,
         out,
@@ -669,6 +682,7 @@ fn copy_changes(
         &name,
         (old_table.oid, new.relid),
         &written,
+        &[],
         old_catalog,
         new_catalog,
         out,
@@ -916,6 +930,10 @@ enum Value<'a> {
     /// whether the new schema still lets it be NULL (a parameter that no
     /// longer may be is reported on its own).
     Input { may_be_null: bool },
+    /// NULL: a bare `NULL`, or an UPDATE's `SET c = DEFAULT` of a column
+    /// the new schema gives no default — `default`: whether the deployed
+    /// schema gave it none either (`None` for a bare `NULL`, NULL in both).
+    Null { default: Option<bool> },
     /// An expression the query computes (a constant, a `CASE` of them, a
     /// column of an `INSERT … SELECT`): its type and type modifier, whether
     /// it may be NULL, and what each non-NULL value is.
@@ -931,21 +949,62 @@ impl Value<'_> {
     fn may_be_null(&self) -> bool {
         match self {
             Value::Input { may_be_null } => *may_be_null,
+            Value::Null { .. } => true,
             Value::Expression { nullable, .. } => *nullable,
         }
     }
 
-    /// Whether each non-NULL value is certainly one `allowed` allows.
-    fn within(&self, allowed: &Refinement) -> bool {
+    /// Whether it may be NULL where the deployed schema wrote no NULL into
+    /// the column: `SET c = DEFAULT` of a column whose default is gone.
+    fn null_only_now(&self) -> bool {
+        matches!(
+            self,
+            Value::Null {
+                default: Some(false)
+            }
+        )
+    }
+
+    /// What each non-NULL value is once stored into a column of type `to`
+    /// (an untyped literal read by the type's input function, an integer
+    /// as a `numeric`, a `date` as a `timestamp`); `None` for an input.
+    fn stored(&self, to: typedpg_analyzer::PgTypeOid, catalog: &PgCatalog) -> Option<Refinement> {
         match self {
-            Value::Input { .. } => false,
-            Value::Expression { refinement, .. } => !allowed.widenings(refinement).any(),
+            Value::Expression {
+                type_oid,
+                refinement,
+                ..
+            } => Some(catalog.lint_converted_refinement(refinement, *type_oid, to)),
+            Value::Input { .. } | Value::Null { .. } => None,
         }
     }
 
-    /// Whether each value certainly fits a column limited to `limit`, as
-    /// is: its own type is no wider, or each value it can be fits.
-    fn fits(&self, limit: typedpg_analyzer::ValueLimit, catalog: &PgCatalog) -> bool {
+    /// Whether each non-NULL value, stored into a column of type `to`, is
+    /// certainly one `allowed` allows.
+    fn within(
+        &self,
+        allowed: &Refinement,
+        to: typedpg_analyzer::PgTypeOid,
+        catalog: &PgCatalog,
+    ) -> bool {
+        match self {
+            Value::Input { .. } => false,
+            Value::Null { .. } => true,
+            Value::Expression { .. } => self
+                .stored(to, catalog)
+                .is_some_and(|stored| !allowed.widenings(&stored).any()),
+        }
+    }
+
+    /// Whether each value certainly fits a column of type `to` limited to
+    /// `limit`, as is: its own type is no wider, or each value it can be
+    /// fits.
+    fn fits(
+        &self,
+        limit: typedpg_analyzer::ValueLimit,
+        to: typedpg_analyzer::PgTypeOid,
+        catalog: &PgCatalog,
+    ) -> bool {
         let Value::Expression {
             type_oid,
             typmod,
@@ -953,9 +1012,10 @@ impl Value<'_> {
             ..
         } = self
         else {
-            return false;
+            return matches!(self, Value::Null { .. });
         };
-        if narrower_type(catalog.lint_value_limit(*type_oid, *typmod), Some(limit)).is_none() {
+        let own = catalog.lint_value_limit(*type_oid, *typmod);
+        if narrower_type(own, Some(limit)).is_none() {
             return true;
         }
         if let Some(values) = &refinement.values {
@@ -971,25 +1031,75 @@ impl Value<'_> {
             let digits = lo.unsigned_abs().max(hi.unsigned_abs()).to_string().len();
             return digits <= usize::try_from(precision - scale).unwrap_or(0) || lo == 0 && hi == 0;
         }
-        // One number (a `numeric` literal).
-        if let Some(bounds) = refinement.bounds
-            && bounds.kind == typedpg_analyzer::OrdKind::Numeric
-            && let (Some(lo), Some(hi)) = (bounds.lo, bounds.hi)
-            && lo == hi
-            && let typedpg_analyzer::OrdPoint::Finite(number) = lo.point
-        {
-            let digits = number.mantissa().unsigned_abs().to_string();
-            let scale_digits = usize::try_from(number.scale()).unwrap_or(usize::MAX);
-            let printed = if digits.len() > scale_digits {
-                let (whole, fraction) = digits.split_at(digits.len() - scale_digits);
-                format!("{whole}.{fraction}")
-            } else {
-                format!("0.{digits:0>scale_digits$}")
-            };
-            return fits_limit(&printed, limit);
-        }
-        false
+        // Numbers within bounds, as a `numeric`: each fits when no digit
+        // after the decimal point is lost — its own type's scale (or the
+        // one number's digits) is no larger — and the bounds, rounded to
+        // the column's scale as `numeric` rounds (half away from zero),
+        // have no more digits before it than the column allows.
+        let Some(bounds) = self.stored(to, catalog).and_then(|stored| stored.bounds) else {
+            return false;
+        };
+        let (
+            typedpg_analyzer::OrdKind::Numeric,
+            Some(typedpg_analyzer::OrdBound {
+                point: typedpg_analyzer::OrdPoint::Finite(lo),
+                ..
+            }),
+            Some(typedpg_analyzer::OrdBound {
+                point: typedpg_analyzer::OrdPoint::Finite(hi),
+                ..
+            }),
+        ) = (bounds.kind, bounds.lo, bounds.hi)
+        else {
+            return false;
+        };
+        let fraction = match own {
+            Some(typedpg_analyzer::ValueLimit::Numeric { scale, .. }) => Some(scale),
+            _ if lo == hi => i32::try_from(lo.scale()).ok(),
+            _ => None,
+        };
+        fraction.is_some_and(|f| f <= scale)
+            && numeric_fits(lo, precision, scale)
+            && numeric_fits(hi, precision, scale)
     }
+}
+
+/// Whether the number `n`, rounded to `scale` digits after the decimal
+/// point as `numeric` rounds (half away from zero), has at most `precision
+/// - scale` digits before it: `apply_typmod` accepts it in a
+/// `numeric(precision, scale)`. Only for `0 <= scale <= precision`.
+fn numeric_fits(n: typedpg_analyzer::Num, precision: i32, scale: i32) -> bool {
+    let (Ok(scale), Ok(precision)) = (u32::try_from(scale), u32::try_from(precision)) else {
+        return false;
+    };
+    if scale > precision {
+        return false;
+    }
+    let (mantissa, digits) = (n.mantissa(), n.scale());
+    // The digits at the column's scale.
+    let rounded = if digits > scale {
+        let Some(unit) = 10i128.checked_pow(digits - scale) else {
+            return false;
+        };
+        let (q, r) = (mantissa / unit, (mantissa % unit).abs());
+        if r * 2 >= unit {
+            q + mantissa.signum()
+        } else {
+            q
+        }
+    } else {
+        match 10i128
+            .checked_pow(scale - digits)
+            .and_then(|unit| mantissa.checked_mul(unit))
+        {
+            Some(m) => m,
+            None => return false,
+        }
+    };
+    // Below 10^precision at that scale: below 10^(precision - scale).
+    10i128
+        .checked_pow(precision)
+        .is_none_or(|limit| rounded.unsigned_abs() < limit.unsigned_abs())
 }
 
 /// Whether the value printed as `value` fits a column limited to `limit`
@@ -1052,30 +1162,43 @@ fn parameter_nullable(analyzed: &AnalyzedQuery, number: i32) -> bool {
 /// — write that the new schema rejects where the deployed one didn't: an
 /// `INSERT` that leaves out a column now `NOT NULL` without a default (see
 /// [`omitted`]), and a column written whose new definition accepts fewer
-/// values than the value written can be (see [`narrowed`]).
+/// values than the value written can be (see [`narrowed`]). `SET c =
+/// DEFAULT` writes the target column's default, NULL when the new schema
+/// gives it none (through a view, the view's: PostgreSQL's
+/// `rewriteTargetListIU` doesn't look below it for an UPDATE).
 ///
 /// A write into an automatically updatable view (through a chain of them)
 /// is checked against the table its rows are stored in, each view column
 /// as the base column it stores ([`WriteStatement::base`]); the base
 /// columns the view doesn't expose, unless a view's default fills them in,
 /// are ones an `INSERT` leaves out. A write into any other view (one with
-/// rules or an INSTEAD OF trigger) is not the base table's: it is checked
-/// against the view's own columns alone (their types, which the values
-/// written are coerced to).
+/// a DO INSTEAD rule or an INSTEAD OF trigger for the command) is not the
+/// base table's: it is checked against the view's own columns alone
+/// (their types, which the values written are coerced to).
+///
+/// `old_view`: the same query's analysis against the deployed schema,
+/// whose statements are `view`'s in the same order — what an `INSERT` gave
+/// there (a view's default it no longer has included) decides whether it
+/// left a column out already.
 ///
 /// [`QueryView::writes`]: typedpg_analyzer::QueryView::writes
 /// [`WriteStatement::base`]: typedpg_analyzer::WriteStatement::base
 fn writes(
     view: &QueryView,
+    old_view: Option<&QueryView>,
     old_catalog: &PgCatalog,
     new_catalog: &PgCatalog,
     out: &mut Vec<Change>,
 ) {
-    for statement in view.writes() {
+    for (index, statement) in view.writes().iter().enumerate() {
         let Some((schema, relname)) = relation_name(new_catalog, statement.relid) else {
             continue;
         };
         let target = display_name(&schema, &relname);
+        // The target as the deployed schema has it.
+        let old_target = old_catalog
+            .resolve_table(Some(&schema), &relname)
+            .map(|t| t.oid);
         // The relation the rows are stored in: its schema, name and OID.
         let stored = match &statement.base {
             Some(base) => {
@@ -1112,18 +1235,46 @@ fn writes(
         };
         let relids = (old_table.oid, stored.2);
         let mut written: Vec<(String, Vec<Value<'_>>)> = Vec::new();
+        // Each target list's values, by stored column, and whether it is
+        // an UPDATE's.
+        let mut rows: Vec<Row<'_>> = (0..statement.rows)
+            .map(|_| (false, HashMap::new()))
+            .collect();
         for column in &statement.columns {
             let Some(base_column) = to_base(&column.column) else {
                 continue;
             };
+            if let Some((update, values)) = rows.get_mut(column.row) {
+                *update = column.update;
+                values.insert(base_column.clone(), &column.value);
+            }
             let value = match &column.value {
-                // The column's default: what the deployed code doesn't
+                // `SET c = DEFAULT`: the target column's default, NULL
+                // without one.
+                WrittenValue::Default if column.update => {
+                    if new_catalog.lint_column_has_default(statement.relid, &column.column) {
+                        continue;
+                    }
+                    Value::Null {
+                        default: old_target
+                            .map(|old| !old_catalog.lint_column_has_default(old, &column.column)),
+                    }
+                }
+                // An inserted row's default: what the deployed code doesn't
                 // send, as a column it leaves out.
                 WrittenValue::Default => continue,
                 WrittenValue::Parameter(number) => Value::Input {
                     may_be_null: parameter_nullable(&view.analyzed, *number),
                 },
                 WrittenValue::Inside => Value::Input { may_be_null: false },
+                WrittenValue::Expression {
+                    type_oid,
+                    refinement,
+                    ..
+                } if *type_oid == UNKNOWN && refinement.values.is_none() => {
+                    // An untyped value of no known contents: a bare NULL.
+                    Value::Null { default: None }
+                }
                 WrittenValue::Expression {
                     type_oid,
                     typmod,
@@ -1165,11 +1316,17 @@ fn writes(
                     base.columns.iter().map(|(_, b)| b.clone()).collect(),
                 ));
             }
+            // What the same INSERT gave against the deployed schema.
+            let old_given = old_view
+                .and_then(|old| old.writes().get(index))
+                .filter(|old| old.command == statement.command)
+                .map(given_columns);
             omitted(
                 &text,
                 &name,
                 relids,
                 &inserted,
+                old_given.as_deref(),
                 old_catalog,
                 new_catalog,
                 out,
@@ -1180,11 +1337,50 @@ fn writes(
             &name,
             relids,
             &written,
+            &rows,
             old_catalog,
             new_catalog,
             out,
         );
     }
+}
+
+/// The `unknown` pseudo-type: the type of an untyped literal.
+const UNKNOWN: typedpg_analyzer::PgTypeOid = typedpg_analyzer::PgTypeOid::from_raw(705);
+
+/// The values one target list of a statement writes (a VALUES row, a SET
+/// list, …), by the column of the relation storing its rows, and whether
+/// it is an UPDATE's.
+type Row<'a> = (bool, HashMap<String, &'a WrittenValue>);
+
+/// The columns an `INSERT` `statement` gives a value for, by the name the
+/// relation storing its rows has for them, with those a view's default
+/// fills in.
+fn given_columns(statement: &typedpg_analyzer::WriteStatement) -> Vec<String> {
+    let mut given: Vec<String> = Vec::new();
+    for column in statement.columns.iter().filter(|c| !c.update) {
+        let base_column = match &statement.base {
+            Some(base) => base
+                .columns
+                .iter()
+                .find(|(v, _)| *v == column.column)
+                .map(|(_, b)| b.clone()),
+            None => Some(column.column.clone()),
+        };
+        if let Some(base_column) = base_column
+            && !given.contains(&base_column)
+        {
+            given.push(base_column);
+        }
+    }
+    if let Some(base) = &statement.base {
+        for column in &base.defaulted {
+            if !given.contains(column) {
+                given.push(column.clone());
+            }
+        }
+    }
+    given
 }
 
 /// The columns an `INSERT` (or a COPY) gives a value for, by the name the
@@ -1217,33 +1413,42 @@ fn attribute(
 /// catalog, `name` as the message says it — that it leaves out (gives no
 /// value: not one of `inserted.given`; one the view it inserts through
 /// doesn't expose is, unless a view's default fills it in) and the new
-/// schema makes `NOT NULL` without a default, where the deployed schema
-/// let them be omitted: PostgreSQL fails every row at runtime, which no
-/// analysis of the statement shows.
+/// schema makes `NOT NULL` without a default (its own, an identity or
+/// generation expression, or its domain's), where the deployed schema let
+/// them be omitted — had a default for them, or the deployed statement
+/// gave them (`old_given`: the columns it gave against the deployed
+/// schema, a view's default included; `None` when not known, the same as
+/// now): PostgreSQL fails every row at runtime, which no analysis of the
+/// statement shows.
+#[allow(clippy::too_many_arguments)]
 fn omitted(
     statement: &str,
     name: &str,
     relids: (PgClassOid, PgClassOid),
     inserted: &Inserted,
+    old_given: Option<&[String]>,
     old_catalog: &PgCatalog,
     new_catalog: &PgCatalog,
     out: &mut Vec<Change>,
 ) {
-    let required = |attribute: &typedpg_analyzer::PgAttribute| {
-        attribute.attnotnull
-            && !attribute.atthasdef
-            && attribute.attidentity.is_none()
-            && attribute.attgenerated.is_none()
+    let required = |catalog: &PgCatalog, relid: PgClassOid, column: &str| {
+        attribute(catalog, relid, column)
+            .is_some_and(|a| a.attnotnull && !catalog.lint_column_has_default(relid, column))
     };
     for attribute in new_catalog.attributes_of(relids.1) {
         if attribute.attnum <= 0
             || inserted.given.contains(&attribute.attname)
-            || !required(attribute)
+            || !required(new_catalog, relids.1, &attribute.attname)
         {
             continue;
         }
-        // Omitted before too: the deployed code already fails there.
-        if attribute_required(old_catalog, relids.0, &attribute.attname, required) {
+        // Left out before too: the deployed code already fails there.
+        if old_given
+            .unwrap_or(&inserted.given)
+            .iter()
+            .all(|c| *c != attribute.attname)
+            && required(old_catalog, relids.0, &attribute.attname)
+        {
             continue;
         }
         let column = quote_identifier(&attribute.attname);
@@ -1267,16 +1472,6 @@ fn omitted(
     }
 }
 
-/// Whether column `column` of `relid` is one `required` accepts.
-fn attribute_required(
-    catalog: &PgCatalog,
-    relid: PgClassOid,
-    column: &str,
-    required: impl Fn(&typedpg_analyzer::PgAttribute) -> bool,
-) -> bool {
-    attribute(catalog, relid, column).is_some_and(|a| required(&a))
-}
-
 /// The columns `written` (each with the values written into it) of the
 /// relation `statement` (`its INSERT into t`) writes — `relids`: its OID in
 /// the old and the new catalog, `name` as the message says it — whose new
@@ -1288,27 +1483,37 @@ fn attribute_required(
 /// of the table or the column's domain (`NOT VALID` ones too: they bind
 /// the rows written) with a conjunct the deployed schema doesn't have —
 /// constraints are told apart by what they check, not their name, so one
-/// renamed or dropped and added again as it was changes nothing. A new
-/// conjunct the analyzer reads exactly of the column alone (`kind IN ('a',
-/// 'b')`, `n > 0`, `n IS NOT NULL`) is reported when the value written may
-/// break it — a parameter, or a computed value it doesn't prove fits; one
-/// it can't read (`length(name) > 1`, `lo <= hi`) is one that may reject
-/// the deployed code's rows. A parameter written into a column whose type
+/// renamed or dropped and added again as it was changes nothing. A value
+/// is compared as the column stores it (an untyped literal read as the
+/// column's type, an integer as a `numeric`, a `date` as a `timestamp`).
+/// A new conjunct the analyzer reads exactly of the column alone (`kind IN
+/// ('a', 'b')`, `n > 0`, `n IS NOT NULL`) is reported when the value
+/// written may break it — a parameter, or a computed value it doesn't
+/// prove fits. One it can't read so (`length(name) > 1`, `lo <= hi`) is
+/// evaluated over each target list of `rows` that writes a column it
+/// reads ([`PgCatalog::check_part_outcome`]): silent when TRUE or NULL for
+/// every one, reported as rejecting the rows when FALSE for one (a
+/// constant every row is written), else as one that may reject the
+/// deployed code's rows. A parameter written into a column whose type
 /// changes is left to its own type change; a column a new UNIQUE, primary
 /// key or exclusion constraint covers is not reported (it depends on the
 /// data).
+#[allow(clippy::too_many_arguments)]
 fn narrowed(
     statement: &str,
     name: &str,
     relids: (PgClassOid, PgClassOid),
     written: &[(String, Vec<Value<'_>>)],
+    rows: &[Row<'_>],
     old_catalog: &PgCatalog,
     new_catalog: &PgCatalog,
     out: &mut Vec<Change>,
 ) {
     // The new conjuncts the analyzer can't read exactly of a written
-    // column, by constraint, with the written columns they read.
-    let mut unreduced: Vec<(String, Vec<String>)> = Vec::new();
+    // column, by constraint: each conjunct's key, with the written columns
+    // it reads.
+    type Conjuncts = Vec<(String, Vec<String>)>;
+    let mut unreduced: Vec<(String, Conjuncts)> = Vec::new();
     for (column, values) in written {
         let (Some(old), Some(new)) = (
             attribute(old_catalog, relids.0, column),
@@ -1331,7 +1536,9 @@ fn narrowed(
                 old_catalog.lint_value_limit(old.atttypid, old.atttypmod),
                 new_limit,
             )
-            && values.iter().any(|value| !value.fits(limit, new_catalog))
+            && values
+                .iter()
+                .any(|value| !value.fits(limit, new.atttypid, new_catalog))
         {
             out.push(Change {
                 subject: subject("typmod"),
@@ -1343,19 +1550,42 @@ fn narrowed(
             });
         }
         // A NOT NULL a parameter breaks is its own change.
-        if new.attnotnull
-            && !old.attnotnull
-            && values
+        if new.attnotnull {
+            let default_dropped = values.iter().any(|value| value.null_only_now());
+            let text = if default_dropped {
+                Some(format!(
+                    "{column_text} as DEFAULT, which is now NULL, the column having no default, \
+                     while it is NOT NULL: writing NULL fails"
+                ))
+            } else if old.attnotnull {
+                None
+            } else if values
                 .iter()
-                .any(|value| matches!(value, Value::Expression { nullable: true, .. }))
-        {
-            out.push(Change {
-                subject: subject("not null"),
-                text: format!(
+                .any(|value| matches!(value, Value::Null { default: Some(_) }))
+            {
+                Some(format!(
+                    "{column_text}, now NOT NULL, as DEFAULT, which is NULL, the column having \
+                     no default: writing NULL fails"
+                ))
+            } else if values.iter().any(|value| {
+                matches!(
+                    value,
+                    Value::Expression { nullable: true, .. } | Value::Null { .. }
+                )
+            }) {
+                Some(format!(
                     "{column_text}, now NOT NULL, with a value that may be NULL: writing NULL \
                      fails"
-                ),
-            });
+                ))
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                out.push(Change {
+                    subject: subject("not null"),
+                    text,
+                });
+            }
         }
 
         let old_constraints = old_catalog.column_write_constraints(relids.0, column);
@@ -1396,12 +1626,18 @@ fn narrowed(
                     // A conjunct of the constraint that reads other columns
                     // only is theirs.
                     CheckReading::Other if part.columns.contains(column) => {
-                        match unreduced.iter_mut().find(|(s, _)| *s == constraint.source) {
+                        let parts =
+                            match unreduced.iter().position(|(s, _)| *s == constraint.source) {
+                                Some(i) => &mut unreduced[i].1,
+                                None => {
+                                    unreduced.push((constraint.source.clone(), Vec::new()));
+                                    &mut unreduced.last_mut().expect("just pushed").1
+                                }
+                            };
+                        match parts.iter_mut().find(|(key, _)| *key == part.key) {
                             Some((_, columns)) if columns.contains(column) => {}
                             Some((_, columns)) => columns.push(column.clone()),
-                            None => {
-                                unreduced.push((constraint.source.clone(), vec![column.clone()]));
-                            }
+                            None => parts.push((part.key.clone(), vec![column.clone()])),
                         }
                     }
                     CheckReading::Other => {}
@@ -1410,7 +1646,9 @@ fn narrowed(
         }
         if !limiting.is_empty()
             && allowed.widenings(&old_allowed).any()
-            && values.iter().any(|value| !value.within(&allowed))
+            && values
+                .iter()
+                .any(|value| !value.within(&allowed, new.atttypid, new_catalog))
         {
             let now = new_catalog
                 .describe_column_values(relids.1, column, &new_allowed)
@@ -1448,22 +1686,80 @@ fn narrowed(
             });
         }
     }
-    for (source, columns) in unreduced {
-        let columns: Vec<String> = columns.iter().map(|c| quote_identifier(c)).collect();
+    for (source, parts) in unreduced {
+        // What each conjunct makes of the rows: rejected when one rejects
+        // a row, silent when every one passes every row.
+        let mut rejects = false;
+        let mut unknown = false;
+        let mut columns: Vec<&str> = Vec::new();
+        for (key, part_columns) in &parts {
+            for column in part_columns {
+                if !columns.contains(&column.as_str()) {
+                    columns.push(column);
+                }
+            }
+            match part_outcome(relids.1, key, part_columns, rows, new_catalog) {
+                PartOutcome::Fails => rejects = true,
+                PartOutcome::Unknown => unknown = true,
+                PartOutcome::Passes => {}
+            }
+        }
+        if !rejects && !unknown {
+            continue;
+        }
+        let one = columns.len() == 1;
+        let list: Vec<String> = columns.iter().map(|c| quote_identifier(c)).collect();
+        let list = format!(
+            "{} {}",
+            if one { "column" } else { "columns" },
+            list.join(", ")
+        );
         out.push(Change {
             subject: format!("write {name} {source}"),
-            text: format!(
-                "{statement} writes {} {}, which the new {source} reads: it may reject the rows \
-                 the deployed code writes",
-                if columns.len() == 1 {
-                    "column"
-                } else {
-                    "columns"
-                },
-                columns.join(", ")
-            ),
+            text: if rejects {
+                format!(
+                    "{statement} writes {list} with {} the new {source} rejects: writing {} fails",
+                    if one { "a value" } else { "values" },
+                    if one { "it" } else { "them" },
+                )
+            } else {
+                format!(
+                    "{statement} writes {list}, which the new {source} reads: it may reject the \
+                     rows the deployed code writes"
+                )
+            },
         });
     }
+}
+
+/// What the CHECK conjunct `key` of relation `relid` (of `catalog`), which
+/// reads the written columns `columns`, makes of the target lists `rows`
+/// writing one of them: `Fails` when one of them fails it, `Passes` when
+/// every one passes it, else `Unknown` (and when none writes them).
+fn part_outcome(
+    relid: PgClassOid,
+    key: &str,
+    columns: &[String],
+    rows: &[Row<'_>],
+    catalog: &PgCatalog,
+) -> PartOutcome {
+    let Some(column) = columns.first() else {
+        return PartOutcome::Unknown;
+    };
+    let mut outcome = None;
+    for (update, values) in rows {
+        if !columns.iter().any(|c| values.contains_key(c)) {
+            continue;
+        }
+        match catalog.check_part_outcome(relid, column, key, values, *update) {
+            PartOutcome::Fails => return PartOutcome::Fails,
+            PartOutcome::Unknown => outcome = Some(PartOutcome::Unknown),
+            PartOutcome::Passes => {
+                outcome.get_or_insert(PartOutcome::Passes);
+            }
+        }
+    }
+    outcome.unwrap_or(PartOutcome::Unknown)
 }
 
 /// What a column's type modifier going from `old` to `new` rejects or
@@ -2876,9 +3172,9 @@ mod tests {
                        BEGIN RETURN NEW; END $$;
                        CREATE TRIGGER v_insert INSTEAD OF INSERT OR UPDATE ON v
                            FOR EACH ROW EXECUTE FUNCTION v_insert();";
-        // A rule: it rewrites the statement.
-        let rule = "CREATE RULE v_insert AS ON INSERT TO v DO ALSO NOTIFY v_inserted;
-                    CREATE RULE v_update AS ON UPDATE TO v DO ALSO NOTIFY v_updated;";
+        // A DO INSTEAD rule: it replaces the statement.
+        let rule = "CREATE RULE v_insert AS ON INSERT TO v DO INSTEAD NOTIFY v_inserted;
+                    CREATE RULE v_update AS ON UPDATE TO v DO INSTEAD NOTIFY v_updated;";
         let queries = [
             "INSERT INTO v (id, k, name) SELECT x, $k, 'n' FROM u",
             "UPDATE v SET k = $k WHERE id = $id",
@@ -2893,5 +3189,479 @@ mod tests {
             let findings = check(&[VIEWS, setup], &[new], &queries);
             assert!(findings.is_empty(), "{setup}: {findings:?}");
         }
+    }
+
+    #[test]
+    fn only_the_rules_and_triggers_of_the_command_stop_a_write_through_a_view() {
+        let new = "ALTER TABLE t ADD CONSTRAINT t_kind CHECK (kind IN ('a', 'b'));";
+        let function = "CREATE FUNCTION v_row() RETURNS trigger LANGUAGE plpgsql AS $$
+                        BEGIN RETURN NEW; END $$;";
+        let insert = "INSERT INTO v (id, k) VALUES ($id, $k)";
+        let update = "UPDATE v SET k = $k WHERE id = $id";
+        let reported = |statement: &str| {
+            format!(
+                "{statement} writes column kind, which CHECK constraint \"t_kind\" now limits it \
+                 to one of 'a', 'b': writing another value fails"
+            )
+        };
+        // PostgreSQL rewrites the statement into the base table unless a
+        // DO INSTEAD rule or an INSTEAD OF trigger for its own command is
+        // on the way (checked against PostgreSQL 19: an INSERT through a
+        // view with an INSTEAD OF DELETE trigger, a rule ON DELETE DO
+        // INSTEAD NOTHING or a rule ON INSERT DO ALSO, on the view or on
+        // the table, inserts into the table).
+        for (setup, sql, statement) in [
+            (
+                format!(
+                    "{function} CREATE TRIGGER v_delete INSTEAD OF DELETE ON v
+                         FOR EACH ROW EXECUTE FUNCTION v_row();"
+                ),
+                insert,
+                "its INSERT into v (a view of t)",
+            ),
+            (
+                format!(
+                    "{function} CREATE TRIGGER v_insert INSTEAD OF INSERT ON v
+                         FOR EACH ROW EXECUTE FUNCTION v_row();"
+                ),
+                update,
+                "its UPDATE of v (a view of t)",
+            ),
+            (
+                "CREATE RULE v_delete AS ON DELETE TO v DO INSTEAD NOTHING;".to_owned(),
+                insert,
+                "its INSERT into v (a view of t)",
+            ),
+            (
+                "CREATE RULE v_insert AS ON INSERT TO v DO ALSO NOTIFY v_inserted;".to_owned(),
+                insert,
+                "its INSERT into v (a view of t)",
+            ),
+            (
+                "CREATE RULE t_delete AS ON DELETE TO t DO INSTEAD NOTHING;".to_owned(),
+                update,
+                "its UPDATE of v (a view of t)",
+            ),
+        ] {
+            assert_eq!(
+                only(&check(&[VIEWS, &setup], &[new], &[sql])),
+                reported(statement),
+                "{setup} / {sql}"
+            );
+        }
+        // One for the command: what is written is the trigger's or the
+        // rule's.
+        for (setup, sql) in [
+            (
+                format!(
+                    "{function} CREATE TRIGGER v_insert INSTEAD OF INSERT ON v
+                         FOR EACH ROW EXECUTE FUNCTION v_row();"
+                ),
+                insert,
+            ),
+            (
+                "CREATE RULE t_insert AS ON INSERT TO t DO INSTEAD NOTHING;".to_owned(),
+                insert,
+            ),
+        ] {
+            let findings = check(&[VIEWS, &setup], &[new], &[sql]);
+            assert!(findings.is_empty(), "{setup} / {sql}: {findings:?}");
+        }
+    }
+
+    const PAIRS: &str = "CREATE TABLE p (
+            id integer PRIMARY KEY,
+            name text,
+            code text,
+            lo integer,
+            hi integer
+        );
+        CREATE TABLE u (x integer NOT NULL);";
+
+    #[test]
+    fn a_check_conjunct_evaluated_over_the_constants_written() {
+        let rejects = |what: &str, check: &str| {
+            format!(
+                "{what} with values the new CHECK constraint \"{check}\" rejects: writing them \
+                 fails"
+            )
+        };
+        let may_reject = |what: &str, check: &str| {
+            format!(
+                "{what}, which the new CHECK constraint \"{check}\" reads: it may reject the rows \
+                 the deployed code writes"
+            )
+        };
+        let lo_hi = "ALTER TABLE p ADD CONSTRAINT p_lo_hi CHECK (lo <= hi);";
+        // Every row is evaluated with the constants it holds — each VALUES
+        // row on its own; a NULL passes a CHECK; a CASE of constants is
+        // evaluated for each.
+        for sql in [
+            "INSERT INTO p (id, lo, hi) VALUES (1, 1, 2)",
+            "INSERT INTO p (id, lo, hi) VALUES (1, 1, 2), (2, 3, 4)",
+            "INSERT INTO p (id, lo, hi) VALUES (1, NULL, 2)",
+            "INSERT INTO p (id, lo, hi) SELECT x, 1, 1 FROM u",
+            "UPDATE p SET lo = 1, hi = CASE WHEN $big THEN 10 ELSE 2 END WHERE id = $id",
+        ] {
+            let findings = check(&[PAIRS], &[lo_hi], &[sql]);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        for (sql, text) in [
+            (
+                "INSERT INTO p (id, lo, hi) VALUES (1, 3, 2)",
+                rejects("its INSERT into p writes columns lo, hi", "p_lo_hi"),
+            ),
+            // One row that fails fails the statement.
+            (
+                "INSERT INTO p (id, lo, hi) VALUES (1, 1, 2), (2, 5, 4)",
+                rejects("its INSERT into p writes columns lo, hi", "p_lo_hi"),
+            ),
+            (
+                "UPDATE p SET lo = 3, hi = 2 WHERE id = $id",
+                rejects("its UPDATE of p writes columns lo, hi", "p_lo_hi"),
+            ),
+            // A column the UPDATE doesn't set keeps any value.
+            (
+                "UPDATE p SET lo = 1 WHERE id = $id",
+                may_reject("its UPDATE of p writes column lo", "p_lo_hi"),
+            ),
+            // A column the INSERT leaves out is its default.
+            (
+                "INSERT INTO p (id, lo) VALUES (1, 1)",
+                may_reject("its INSERT into p writes column lo", "p_lo_hi"),
+            ),
+            (
+                "INSERT INTO p (id, lo, hi) VALUES (1, $lo, 2)",
+                may_reject("its INSERT into p writes columns lo, hi", "p_lo_hi"),
+            ),
+            // Each MERGE action writes its own rows: the UPDATE's `hi` and
+            // the INSERT's `lo` are not known.
+            (
+                "MERGE INTO p USING u ON p.id = u.x WHEN MATCHED THEN UPDATE SET lo = 5 \
+                 WHEN NOT MATCHED THEN INSERT (id, hi) VALUES (u.x, 1)",
+                may_reject("its MERGE into p writes columns lo, hi", "p_lo_hi"),
+            ),
+            // So does ON CONFLICT DO UPDATE.
+            (
+                "INSERT INTO p (id, lo, hi) VALUES (1, 1, 2) ON CONFLICT (id) DO UPDATE SET lo = 5",
+                may_reject("its INSERT into p writes columns lo, hi", "p_lo_hi"),
+            ),
+        ] {
+            assert_eq!(only(&check(&[PAIRS], &[lo_hi], &[sql])), text, "{sql}");
+        }
+
+        // Built-in functions of text: `length`, and `upper` over letters
+        // every locale maps the same.
+        let name = "ALTER TABLE p ADD CONSTRAINT p_name CHECK (length(name) > 1);";
+        let code = "ALTER TABLE p ADD CONSTRAINT p_code CHECK (upper(code) = code);";
+        for (new, sql) in [
+            (name, "INSERT INTO p (id, name) VALUES (1, 'ab')"),
+            (name, "UPDATE p SET name = 'été' WHERE id = $id"),
+            (code, "INSERT INTO p (id, code) VALUES (1, 'ABC')"),
+            (code, "UPDATE p SET code = 'X-1' WHERE id = $id"),
+        ] {
+            let findings = check(&[PAIRS], &[new], &[sql]);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        for (new, sql, text) in [
+            (
+                name,
+                "INSERT INTO p (id, name) VALUES (1, 'a')",
+                "its INSERT into p writes column name with a value the new CHECK constraint \
+                 \"p_name\" rejects: writing it fails"
+                    .to_owned(),
+            ),
+            (
+                code,
+                "UPDATE p SET code = 'abc' WHERE id = $id",
+                "its UPDATE of p writes column code with a value the new CHECK constraint \
+                 \"p_code\" rejects: writing it fails"
+                    .to_owned(),
+            ),
+            // `i` is upper-cased to `İ` under a Turkish locale: not known.
+            (
+                code,
+                "UPDATE p SET code = 'XIZ' WHERE id = $id",
+                may_reject("its UPDATE of p writes column code", "p_code"),
+            ),
+            (
+                name,
+                "UPDATE p SET name = $name WHERE id = $id",
+                may_reject("its UPDATE of p writes column name", "p_name"),
+            ),
+        ] {
+            assert_eq!(only(&check(&[PAIRS], &[new], &[sql])), text, "{sql}");
+        }
+
+        // A domain's CHECK.
+        let domain = "CREATE DOMAIN code3 AS text; CREATE TABLE d (id integer, c code3);";
+        let new = "ALTER DOMAIN code3 ADD CONSTRAINT code3_length CHECK (length(VALUE) = 3);";
+        assert!(check(&[domain], &[new], &["INSERT INTO d VALUES (1, 'abc')"]).is_empty());
+        assert_eq!(
+            only(&check(
+                &[domain],
+                &[new],
+                &["INSERT INTO d VALUES (1, 'ab')"]
+            )),
+            "its INSERT into d writes column c with a value the new CHECK constraint \
+             \"code3_length\" of domain \"code3\" rejects: writing it fails"
+        );
+
+        // A BEFORE ROW trigger may change the row before it is checked.
+        let trigger = "CREATE FUNCTION p_row() RETURNS trigger LANGUAGE plpgsql AS $$
+                       BEGIN RETURN NEW; END $$;
+                       CREATE TRIGGER p_row BEFORE INSERT ON p
+                           FOR EACH ROW EXECUTE FUNCTION p_row();";
+        for sql in [
+            "INSERT INTO p (id, lo, hi) VALUES (1, 1, 2)",
+            "INSERT INTO p (id, lo, hi) VALUES (1, 3, 2)",
+        ] {
+            assert_eq!(
+                only(&check(&[PAIRS, trigger], &[lo_hi], &[sql])),
+                may_reject("its INSERT into p writes columns lo, hi", "p_lo_hi"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_and_datetime_values_fit_by_their_bounds() {
+        let old = "CREATE TABLE src (
+                p numeric(10, 2) CHECK (p >= 0 AND p <= 99.99),
+                q numeric CHECK (q BETWEEN 0 AND 1),
+                i integer CHECK (i BETWEEN 1 AND 10),
+                d date CHECK (d >= '2020-01-01'),
+                tz timestamptz CHECK (tz >= '2020-01-01 00:00+00')
+            );
+            CREATE TABLE t (id integer, price numeric(10, 2), d date, ts timestamp,
+                            tz timestamptz);";
+        for (new, sql) in [
+            // Up to 99.99: two digits before the point, two after.
+            (
+                "ALTER TABLE t ALTER COLUMN price TYPE numeric(4, 2);",
+                "INSERT INTO t (id, price) SELECT 1, p FROM src",
+            ),
+            (
+                "ALTER TABLE t ALTER COLUMN price TYPE numeric(3, 1);",
+                "INSERT INTO t (id, price) SELECT 1, i FROM src",
+            ),
+            (
+                "ALTER TABLE t ADD CHECK (price >= 0 AND price < 1000);",
+                "INSERT INTO t (id, price) SELECT 1, p FROM src",
+            ),
+            // An integer is the same number as a `numeric`.
+            (
+                "ALTER TABLE t ADD CHECK (price > 0.5);",
+                "INSERT INTO t (id, price) SELECT 1, i FROM src",
+            ),
+            (
+                "ALTER TABLE t ADD CHECK (price <= 10);",
+                "INSERT INTO t (id, price) VALUES (1, 5)",
+            ),
+            // A literal read as the column's type.
+            (
+                "ALTER TABLE t ADD CHECK (d >= '2000-01-01');",
+                "INSERT INTO t (id, d) VALUES (1, '2021-05-05')",
+            ),
+            (
+                "ALTER TABLE t ADD CHECK (d >= '2000-01-01');",
+                "INSERT INTO t (id, d) SELECT 1, d FROM src",
+            ),
+            // A date as the midnight of its day.
+            (
+                "ALTER TABLE t ADD CHECK (ts >= '2020-01-01');",
+                "INSERT INTO t (id, ts) SELECT 1, d FROM src",
+            ),
+            (
+                "ALTER TABLE t ADD CHECK (tz >= '2000-01-01 00:00+00');",
+                "INSERT INTO t (id, tz) SELECT 1, tz FROM src",
+            ),
+            (
+                "ALTER TABLE t ADD CHECK (tz >= '2000-01-01 00:00+00');",
+                "INSERT INTO t (id, tz) VALUES (1, '2021-05-05 10:00+02')",
+            ),
+        ] {
+            let findings = check(&[old], &[new], &[sql]);
+            assert!(findings.is_empty(), "{new} / {sql}: {findings:?}");
+        }
+        for (new, sql, text) in [
+            // Rounded to one digit after the point.
+            (
+                "ALTER TABLE t ALTER COLUMN price TYPE numeric(3, 1);",
+                "INSERT INTO t (id, price) SELECT 1, p FROM src",
+                "its INSERT into t writes column price, now numeric(3,1) instead of \
+                 numeric(10,2): a value with more than 2 digits before the decimal point fails, \
+                 and one with more than 1 digit after it is rounded",
+            ),
+            // 99.99 has two digits before the point.
+            (
+                "ALTER TABLE t ALTER COLUMN price TYPE numeric(3, 2);",
+                "INSERT INTO t (id, price) SELECT 1, p FROM src",
+                "its INSERT into t writes column price, now numeric(3,2) instead of \
+                 numeric(10,2): a value with more than 1 digit before the decimal point fails",
+            ),
+            // Any number of digits after the point.
+            (
+                "ALTER TABLE t ALTER COLUMN price TYPE numeric(4, 2);",
+                "INSERT INTO t (id, price) SELECT 1, q FROM src",
+                "its INSERT into t writes column price, now numeric(4,2) instead of \
+                 numeric(10,2): a value with more than 2 digits before the decimal point fails",
+            ),
+            (
+                "ALTER TABLE t ADD CONSTRAINT t_price CHECK (price > 1);",
+                "INSERT INTO t (id, price) SELECT 1, i FROM src",
+                "its INSERT into t writes column price, which CHECK constraint \"t_price\" now \
+                 limits it to above 1: writing another value fails",
+            ),
+            (
+                "ALTER TABLE t ADD CONSTRAINT t_d CHECK (d >= '2022-01-01');",
+                "INSERT INTO t (id, d) SELECT 1, d FROM src",
+                "its INSERT into t writes column d, which CHECK constraint \"t_d\" now limits it \
+                 to at least 2022-01-01: writing another value fails",
+            ),
+            // Without a zone, the session's time zone decides.
+            (
+                "ALTER TABLE t ADD CONSTRAINT t_tz CHECK (tz >= '2000-01-01 00:00+00');",
+                "INSERT INTO t (id, tz) VALUES (1, '2021-05-05 10:00')",
+                "its INSERT into t writes column tz, which CHECK constraint \"t_tz\" now limits \
+                 it to at least 2000-01-01 00:00:00+00: writing another value fails",
+            ),
+            (
+                "ALTER TABLE t ADD CONSTRAINT t_tz CHECK (tz >= '2000-01-01 00:00+00');",
+                "INSERT INTO t (id, tz) SELECT 1, d FROM src",
+                "its INSERT into t writes column tz, which CHECK constraint \"t_tz\" now limits \
+                 it to at least 2000-01-01 00:00:00+00: writing another value fails",
+            ),
+        ] {
+            assert_eq!(only(&check(&[old], &[new], &[sql])), text, "{new} / {sql}");
+        }
+    }
+
+    #[test]
+    fn an_insert_through_a_view_whose_default_is_dropped() {
+        // The deployed INSERT gets `kind` from the view's default.
+        let old = [
+            VIEWS,
+            "ALTER VIEW v ALTER COLUMN k SET DEFAULT 'a';
+                           ALTER TABLE t ALTER COLUMN kind SET NOT NULL;",
+        ];
+        assert_eq!(
+            only(&check(
+                &old,
+                &["ALTER VIEW v ALTER COLUMN k DROP DEFAULT;"],
+                &["INSERT INTO v (id) SELECT x FROM u"],
+            )),
+            "its INSERT into v (a view of t) leaves out column kind, now NOT NULL without a \
+             default, so inserting any row fails"
+        );
+        // Left out before as well: it already fails.
+        let findings = check(
+            &[VIEWS, "ALTER TABLE t ALTER COLUMN kind SET NOT NULL;"],
+            &["ALTER TABLE t ADD COLUMN extra integer;"],
+            &["INSERT INTO v (id) SELECT x FROM u"],
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn set_to_default_without_a_default_writes_null() {
+        let old = "CREATE TABLE t (id integer, note text, label text NOT NULL DEFAULT '');
+                   CREATE VIEW v AS SELECT id, label FROM t;";
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE t ALTER COLUMN note SET NOT NULL;"],
+                &["UPDATE t SET note = DEFAULT WHERE id = $id"],
+            )),
+            "its UPDATE of t writes column note, now NOT NULL, as DEFAULT, which is NULL, the \
+             column having no default: writing NULL fails"
+        );
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE t ALTER COLUMN label DROP DEFAULT;"],
+                &["UPDATE t SET label = DEFAULT WHERE id = $id"],
+            )),
+            "its UPDATE of t writes column label as DEFAULT, which is now NULL, the column \
+             having no default, while it is NOT NULL: writing NULL fails"
+        );
+        // Through a view, the view's default is written, NULL without one
+        // (rewriteTargetListIU; checked against PostgreSQL 19), whatever
+        // the table's — which the analysis itself rejects.
+        assert_eq!(
+            only(&check(
+                &[old, "ALTER VIEW v ALTER COLUMN label SET DEFAULT 'v';"],
+                &["ALTER VIEW v ALTER COLUMN label DROP DEFAULT;"],
+                &["UPDATE v SET label = DEFAULT WHERE id = $id"],
+            )),
+            "it no longer runs: null value in column \"label\" of relation \"t\" violates \
+             not-null constraint (cannot assign NULL to NOT NULL column `t.label`)"
+        );
+        // A default, of the column or of its domain: no finding.
+        for (new, sql) in [
+            (
+                "ALTER TABLE t ALTER COLUMN note SET DEFAULT ''; \
+                 ALTER TABLE t ALTER COLUMN note SET NOT NULL;",
+                "UPDATE t SET note = DEFAULT WHERE id = $id",
+            ),
+            (
+                "ALTER TABLE t ALTER COLUMN note SET NOT NULL;",
+                "UPDATE t SET note = 'x' WHERE id = $id",
+            ),
+        ] {
+            let findings = check(&[old], &[new], &[sql]);
+            assert!(findings.is_empty(), "{new} / {sql}: {findings:?}");
+        }
+        let domain = "CREATE DOMAIN filled AS text DEFAULT 'x';
+                      CREATE TABLE f (id integer, c filled);";
+        let findings = check(
+            &[domain],
+            &["ALTER TABLE f ALTER COLUMN c SET NOT NULL;"],
+            &["UPDATE f SET c = DEFAULT WHERE id = $id"],
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_domain_default_fills_a_column_left_out() {
+        let old = "CREATE DOMAIN filled AS text DEFAULT 'x';
+                   CREATE DOMAIN empty AS text;
+                   CREATE TABLE f (id integer, a filled, b empty);
+                   CREATE VIEW fv AS SELECT id, a, b FROM f;
+                   CREATE TABLE u (x integer NOT NULL);";
+        // PostgreSQL stores the domain's default in a column without one
+        // of its own (checked against PostgreSQL 19): no finding.
+        for sql in [
+            "INSERT INTO f (id, b) VALUES (1, 'b')",
+            "INSERT INTO fv (id, b) VALUES (1, 'b')",
+        ] {
+            let findings = check(
+                &[old],
+                &["ALTER TABLE f ALTER COLUMN a SET NOT NULL;"],
+                &[sql],
+            );
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // A domain without a default gives none.
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE f ALTER COLUMN b SET NOT NULL;"],
+                &["INSERT INTO f (id, a) SELECT x, 'a' FROM u"],
+            )),
+            "its INSERT into f leaves out column b, now NOT NULL without a default, so \
+             inserting any row fails"
+        );
+        // Through a view, `b`'s domain gives no default either: the
+        // table's column decides.
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE f ALTER COLUMN b SET NOT NULL;"],
+                &["INSERT INTO fv (id, a) SELECT x, 'a' FROM u"],
+            )),
+            "its INSERT into fv (a view of f) leaves out column b, now NOT NULL without a \
+             default, so inserting any row fails"
+        );
     }
 }

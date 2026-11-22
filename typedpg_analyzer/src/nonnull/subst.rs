@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use typedpg_pg_query::ast::{self, AConstValue};
 
-use super::{Col, StrictLog, StrictNode, plain_column};
+use super::{Col, StrictLog, StrictNode, Trust, plain_column};
 use crate::pg_catalog::PgCatalog;
 use crate::scope::Scope;
 
@@ -159,14 +159,38 @@ fn collect(
 
 impl Subst<'_> {
     pub(crate) fn eval(&self, n: Option<&ast::Node>) -> Val {
+        let column = |c: &ast::Node| match plain_column(c, self.scope) {
+            Some((c, _)) if &c == self.null => Val::Null,
+            _ => Val::Unknown,
+        };
+        Eval {
+            column: &column,
+            trust: self.log,
+            snapshot: self.snapshot,
+        }
+        .eval(n)
+    }
+}
+
+/// An expression evaluated with what `column` says each column reference
+/// is ([`Val::Unknown`] when nothing is known of it), its operators and
+/// functions as `trust` says they resolved: the abstract evaluation
+/// [`Subst`] runs with one column NULL, and the lint runs over the
+/// constants a statement writes into a row (see
+/// [`crate::PgCatalog::check_part_outcome`]).
+pub(crate) struct Eval<'a> {
+    pub column: &'a dyn Fn(&ast::Node) -> Val,
+    pub trust: &'a dyn Trust,
+    pub snapshot: &'a PgCatalog,
+}
+
+impl Eval<'_> {
+    pub(crate) fn eval(&self, n: Option<&ast::Node>) -> Val {
         let Some(inner) = n else {
             return Val::Unknown;
         };
         match inner {
-            ast::Node::ColumnRef(_) => match plain_column(inner, self.scope) {
-                Some((c, _)) if &c == self.null => Val::Null,
-                _ => Val::Unknown,
-            },
+            ast::Node::ColumnRef(_) => (self.column)(inner),
             ast::Node::AConst(c) => {
                 if c.isnull {
                     return Val::Null;
@@ -183,7 +207,7 @@ impl Subst<'_> {
                 let v = self.eval(tc.arg.as_ref());
                 if v == Val::Null {
                     // A strict cast (or one with no function) of NULL.
-                    return if self.log.is_strict(tc.location, StrictNode::Cast) {
+                    return if self.trust.trusts(tc.location, StrictNode::Cast) {
                         Val::Null
                     } else {
                         Val::Unknown
@@ -301,13 +325,12 @@ impl Subst<'_> {
     /// yields it, converted to its common type: as is when the conversion
     /// keeps it ([`folds_exactly`]), else just some non-NULL value.
     fn converted(&self, location: i32, v: Val) -> Val {
-        if self.log.is_strict(location, StrictNode::ExactFold) {
+        if self.trust.trusts(location, StrictNode::ExactFold) {
             return v;
         }
         match v {
             Val::Int(i)
-                if i.abs() <= FLOAT_EXACT
-                    && self.log.is_strict(location, StrictNode::FloatFold) =>
+                if i.abs() <= FLOAT_EXACT && self.trust.trusts(location, StrictNode::FloatFold) =>
             {
                 v
             }
@@ -320,8 +343,8 @@ impl Subst<'_> {
     /// comparison at `location`: a built-in one over exact types, or over
     /// a float type with both within its precision.
     fn ints_compare(&self, location: i32, a: i64, b: i64) -> bool {
-        self.log.is_strict(location, StrictNode::StdCompare)
-            || (self.log.is_strict(location, StrictNode::FloatCompare)
+        self.trust.trusts(location, StrictNode::StdCompare)
+            || (self.trust.trusts(location, StrictNode::FloatCompare)
                 && a.abs() <= FLOAT_EXACT
                 && b.abs() <= FLOAT_EXACT)
     }
@@ -330,7 +353,7 @@ impl Subst<'_> {
         use ast::AExprKind as K;
         let l = e.lexpr.is_some().then(|| self.eval(e.lexpr.as_ref()));
         let r = e.rexpr.is_some().then(|| self.eval(e.rexpr.as_ref()));
-        let strict = self.log.is_strict(e.location, StrictNode::Op);
+        let strict = self.trust.trusts(e.location, StrictNode::Op);
         match e.kind {
             K::AexprOp => {
                 if !strict {
@@ -383,9 +406,7 @@ impl Subst<'_> {
                     {
                         a == b
                     }
-                    (Some(a), Some(b))
-                        if self.log.is_strict(e.location, StrictNode::StdCompare) =>
-                    {
+                    (Some(a), Some(b)) if self.trust.trusts(e.location, StrictNode::StdCompare) => {
                         match equal_values(&a, &b) {
                             Some(eq) => eq,
                             None => return Val::Unknown,
@@ -402,8 +423,8 @@ impl Subst<'_> {
     /// `l op r` over two non-NULL operands, for a built-in comparison.
     fn compare(&self, location: i32, op: &str, l: &Val, r: &Val) -> Val {
         if l.known_non_null() && r.known_non_null() {
-            let numeric = self.log.is_strict(location, StrictNode::StdCompare);
-            let text = self.log.is_strict(location, StrictNode::TextEquality);
+            let numeric = self.trust.trusts(location, StrictNode::StdCompare);
+            let text = self.trust.trusts(location, StrictNode::TextEquality);
             let ord = match (l, r) {
                 (Val::Int(a), Val::Int(b)) if self.ints_compare(location, *a, *b) => Some(a.cmp(b)),
                 (Val::Bool(a), Val::Bool(b)) if numeric && matches!(op, "=" | "<>") => {
@@ -430,11 +451,11 @@ impl Subst<'_> {
 
     fn eval_func(&self, f: &ast::FuncCall) -> Val {
         let vals: Vec<Val> = f.args.iter().map(|a| self.eval(a.as_ref())).collect();
-        if self.log.is_strict(f.location, StrictNode::Func) {
+        if self.trust.trusts(f.location, StrictNode::Func) {
             return if vals.contains(&Val::Null) {
                 Val::Null
             } else {
-                Val::Unknown
+                self.builtin_text_function(f.location, &vals)
             };
         }
         if f.func_variadic || f.agg_filter.is_some() || f.over.is_some() || !f.agg_order.is_empty()
@@ -490,6 +511,44 @@ impl Subst<'_> {
                 }
                 Val::Text(out)
             }
+        }
+    }
+}
+
+impl Eval<'_> {
+    /// The value of the strict call at `location` over the non-NULL
+    /// `vals`, when it resolved to one of the built-in text functions
+    /// computed here: `length` / `char_length` / `character_length` of
+    /// `text` (characters, the database being UTF-8 as everywhere in the
+    /// analyzer: `varchar(n)` counts them too), and `upper` / `lower` of
+    /// `text` over ASCII without `i` / `I` — the letters whose case
+    /// mapping a locale may change (Turkish `i` → `İ`); other letters map
+    /// the same under every collation. Anything else is unknown.
+    fn builtin_text_function(&self, location: i32, vals: &[Val]) -> Val {
+        use crate::pg_catalog::oid;
+        let Some(proc) = self
+            .trust
+            .call(location)
+            .and_then(|p| self.snapshot.pg_proc.get(&p))
+        else {
+            return Val::Unknown;
+        };
+        if self.snapshot.namespace_name(proc.pronamespace) != Some("pg_catalog")
+            || proc.proargtypes.as_slice() != [oid::TEXT]
+        {
+            return Val::Unknown;
+        }
+        let [Val::Text(s)] = vals else {
+            return Val::Unknown;
+        };
+        let case_mapped = s.is_ascii() && !s.contains(['i', 'I']);
+        match proc.proname.as_str() {
+            "length" | "char_length" | "character_length" => {
+                i64::try_from(s.chars().count()).map_or(Val::Unknown, Val::Int)
+            }
+            "upper" if case_mapped => Val::Text(s.to_ascii_uppercase()),
+            "lower" if case_mapped => Val::Text(s.to_ascii_lowercase()),
+            _ => Val::Unknown,
         }
     }
 }

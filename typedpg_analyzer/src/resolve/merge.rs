@@ -135,7 +135,22 @@ pub(crate) fn analyze_merge_with_outer_ctes(
     let _write = crate::pg_catalog::note_write_statement(
         crate::condition::WriteCommand::Merge,
         table_oid,
-        || super::dml::write_base(snapshot, table_oid),
+        || {
+            let events: Vec<DmlEvent> = merge
+                .merge_when_clauses
+                .iter()
+                .filter_map(|n| match n.as_ref() {
+                    Some(ast::Node::MergeWhenClause(w)) => match w.command_type {
+                        CmdType::CmdInsert => Some(DmlEvent::Insert),
+                        CmdType::CmdUpdate => Some(DmlEvent::Update),
+                        CmdType::CmdDelete => Some(DmlEvent::Delete),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            super::dml::write_base(snapshot, table_oid, &events, true)
+        },
     );
     note_merge_privileges(merge, table_oid, &table_attrs);
     let mut source_scope = Scope {
@@ -567,6 +582,9 @@ fn merge_when_insert(
     table_relname: &str,
 ) -> Result<(), AnalyzeError> {
     let snapshot = ctx.snapshot;
+    if let Some(a) = table_attrs.first() {
+        crate::pg_catalog::note_write_row(a.attrelid);
+    }
     let res_targets: Vec<&ast::ResTarget> = when
         .target_list
         .iter()
