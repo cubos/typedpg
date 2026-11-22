@@ -14,6 +14,7 @@ pub mod collations;
 mod comment;
 mod conversion_procs;
 pub(crate) mod conversions;
+pub(crate) mod cooked;
 pub(crate) mod cursors;
 pub(crate) mod defaults;
 pub(crate) mod depend;

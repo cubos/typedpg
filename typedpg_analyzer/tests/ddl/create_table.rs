@@ -2529,3 +2529,194 @@ fn a_partition_keys_operator_class_is_its_notion_of_equality_and_order() {
         ),
     ]);
 }
+
+#[test]
+fn partition_bound_dates_drop_the_time_of_day() {
+    // date_in reads '2020-01-01 10:00' as 2020-01-01: c2's upper bound is
+    // c1's lower one, so the two don't overlap, and a row on 2020-01-01
+    // lands in c1 (PG 19.0 accepts all of it).
+    let setup = "CREATE TABLE p (d date, x int) PARTITION BY RANGE (d);
+                 CREATE TABLE c1 PARTITION OF p FOR VALUES FROM ('2020-01-01 05:00') TO ('2020-01-02');";
+    let db = build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "CREATE TABLE c2 PARTITION OF p FOR VALUES FROM ('2019-12-01') TO ('2020-01-01 10:00');",
+        ),
+    ]);
+    db.analyze("INSERT INTO p VALUES ('2020-01-01', 1)")
+        .expect("2020-01-01 is in c1");
+    // And one date written twice is one list value.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE l (d date) PARTITION BY LIST (d);
+         CREATE TABLE l1 PARTITION OF l FOR VALUES IN ('2020-01-01');
+         CREATE TABLE l2 PARTITION OF l FOR VALUES IN ('2020-01-01 10:00');",
+    )])
+    .expect_err("l2 overlaps l1");
+    assert!(
+        err.to_string()
+            .starts_with("partition \"l2\" would overlap partition \"l1\""),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn partition_bound_overlaps_are_found_for_every_key_type() {
+    // check_new_partition_bound compares bounds with the key's btree
+    // comparison, whatever the type, after evaluating them: PG 19.0 rejects
+    // each of these.
+    for (setup, stmt, msg) in [
+        // An expression bound is evaluated (length('abcdef') is 6).
+        (
+            "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+             CREATE TABLE c1 PARTITION OF p FOR VALUES FROM (2) TO (length('abcdef'));",
+            "CREATE TABLE c3 PARTITION OF p FOR VALUES FROM (5) TO (7);",
+            "partition \"c3\" would overlap partition \"c1\"",
+        ),
+        // '1 day' = '24 hours' for interval_cmp.
+        (
+            "CREATE TABLE p (i interval) PARTITION BY LIST (i);
+             CREATE TABLE c1 PARTITION OF p FOR VALUES IN ('1 day');",
+            "CREATE TABLE c2 PARTITION OF p FOR VALUES IN ('24 hours');",
+            "partition \"c2\" would overlap partition \"c1\"",
+        ),
+        (
+            "CREATE TABLE r (i interval) PARTITION BY RANGE (i);",
+            "CREATE TABLE r1 PARTITION OF r FOR VALUES FROM ('1 day') TO ('24 hours');",
+            "empty range bound specified for partition \"r1\"",
+        ),
+        // Enum values order by their sort order, not their labels.
+        (
+            "CREATE TYPE e AS ENUM ('z', 'a', 'm');
+             CREATE TABLE p (x e) PARTITION BY RANGE (x);
+             CREATE TABLE c1 PARTITION OF p FOR VALUES FROM ('z') TO ('a');",
+            "CREATE TABLE c3 PARTITION OF p FOR VALUES FROM ('z') TO ('m');",
+            "partition \"c3\" would overlap partition \"c1\"",
+        ),
+        // 1.0 = 1.00 for numeric_cmp, 0 = -0 for float8.
+        (
+            "CREATE TABLE n (x numeric) PARTITION BY RANGE (x);",
+            "CREATE TABLE n1 PARTITION OF n FOR VALUES FROM (1.0) TO (1.00);",
+            "empty range bound specified for partition \"n1\"",
+        ),
+        (
+            "CREATE TABLE f (x float8) PARTITION BY LIST (x);
+             CREATE TABLE f1 PARTITION OF f FOR VALUES IN (0);",
+            "CREATE TABLE f2 PARTITION OF f FOR VALUES IN ('-0');",
+            "partition \"f2\" would overlap partition \"f1\"",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
+fn partition_bounds_compare_as_the_key_type_does() {
+    // Each bound is read by the key type's input function, under its
+    // typmod, and compared with its btree comparison: PG 19.0 rejects each
+    // of these.
+    for (setup, stmt, msg) in [
+        // timestamp(0) rounds both bounds to 00:00:01.
+        (
+            "CREATE TABLE p (k timestamp(0)) PARTITION BY RANGE (k);",
+            "CREATE TABLE c1 PARTITION OF p
+                 FOR VALUES FROM ('2020-01-01 00:00:00.6') TO ('2020-01-01 00:00:01.4');",
+            "empty range bound specified for partition \"c1\"",
+        ),
+        // Explicit offsets: the upper bound is 2019-12-31 22:00 UTC.
+        (
+            "CREATE TABLE p (k timestamptz) PARTITION BY RANGE (k);",
+            "CREATE TABLE c1 PARTITION OF p
+                 FOR VALUES FROM ('2020-01-01 00:00+00') TO ('2020-01-01 03:00+05');",
+            "empty range bound specified for partition \"c1\"",
+        ),
+        (
+            "CREATE TABLE p (k uuid) PARTITION BY LIST (k);
+             CREATE TABLE c1 PARTITION OF p
+                 FOR VALUES IN ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11');",
+            "CREATE TABLE c2 PARTITION OF p FOR VALUES IN ('{a0eebc999c0b4ef8bb6d6bb9bd380a11}');",
+            "partition \"c2\" would overlap partition \"c1\"",
+        ),
+        // NaN sorts above Infinity.
+        (
+            "CREATE TABLE p (k float8) PARTITION BY RANGE (k);",
+            "CREATE TABLE c1 PARTITION OF p FOR VALUES FROM ('NaN') TO ('Infinity');",
+            "empty range bound specified for partition \"c1\"",
+        ),
+        (
+            "CREATE TABLE p (k bool) PARTITION BY LIST (k);
+             CREATE TABLE c1 PARTITION OF p FOR VALUES IN (true);",
+            "CREATE TABLE c2 PARTITION OF p FOR VALUES IN ('yes');",
+            "partition \"c2\" would overlap partition \"c1\"",
+        ),
+        // evaluate_expr fails on the overflow.
+        (
+            "CREATE TABLE p (k int8) PARTITION BY RANGE (k);",
+            "CREATE TABLE c1 PARTITION OF p FOR VALUES FROM (2147483647 + 1) TO (MAXVALUE);",
+            "integer out of range",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    // A label added BEFORE another sorts before it.
+    let err = try_apply(&[
+        ("0001.sql", "CREATE TYPE e AS ENUM ('a', 'c');"),
+        ("0002.sql", "ALTER TYPE e ADD VALUE 'b' BEFORE 'c';"),
+        (
+            "0003.sql",
+            "CREATE TABLE p (k e) PARTITION BY RANGE (k);
+             CREATE TABLE c1 PARTITION OF p FOR VALUES FROM ('a') TO ('c');",
+        ),
+        (
+            "0004.sql",
+            "CREATE TABLE c2 PARTITION OF p FOR VALUES FROM ('b') TO ('c');",
+        ),
+    ])
+    .expect_err("c2 overlaps c1");
+    assert!(
+        err.to_string()
+            .starts_with("partition \"c2\" would overlap partition \"c1\""),
+        "got: {err}"
+    );
+    // And these are distinct values (PG 19.0 accepts them): no rounding
+    // without a typmod, two float4 values, NaN above any number.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (k timestamp) PARTITION BY RANGE (k);
+         CREATE TABLE t1 PARTITION OF t
+             FOR VALUES FROM ('2020-01-01 00:00:00.6') TO ('2020-01-01 00:00:01.4');
+         CREATE TABLE f (k float4) PARTITION BY LIST (k);
+         CREATE TABLE f1 PARTITION OF f FOR VALUES IN (0.1);
+         CREATE TABLE f2 PARTITION OF f FOR VALUES IN (0.1000001);
+         CREATE TABLE n (k numeric) PARTITION BY RANGE (k);
+         CREATE TABLE n1 PARTITION OF n FOR VALUES FROM (1) TO ('NaN');",
+    )]);
+}
+
+#[test]
+fn rows_route_by_the_key_types_values() {
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE d (k date) PARTITION BY RANGE (k);
+         CREATE TABLE d1 PARTITION OF d FOR VALUES FROM ('2020-01-01') TO ('2020-01-02');
+         CREATE TABLE f (k float8) PARTITION BY RANGE (k);
+         CREATE TABLE f1 PARTITION OF f FOR VALUES FROM (0) TO ('Infinity');",
+    )]);
+    // date_in drops the time of day; -0 is 0.
+    db.analyze("INSERT INTO d VALUES ('2020-01-01 23:00')")
+        .expect("lands in d1");
+    db.analyze("INSERT INTO f VALUES ('-0')")
+        .expect("lands in f1");
+    // NaN is above Infinity: no partition takes it.
+    let err = db
+        .analyze("INSERT INTO f VALUES ('NaN')")
+        .expect_err("no partition");
+    assert!(
+        err.to_string()
+            .starts_with("no partition of relation \"f\" found for row"),
+        "got: {err}"
+    );
+}

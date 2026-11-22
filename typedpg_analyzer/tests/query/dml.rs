@@ -875,8 +875,9 @@ fn insert_row_routing_uncertain_is_accepted() {
     for sql in [
         // A parameter key: the partition depends on its value.
         "INSERT INTO nodef VALUES ($1, 'x')",
-        // A key that is not a constant.
-        "INSERT INTO nodef VALUES (length('ab'), 'x')",
+        // A key that is not a constant (`length('ab')` is: the planner
+        // folds it to 2, and every execution fails).
+        "INSERT INTO nodef VALUES ((random() * 10)::int, 'x')",
         // A domain's CHECK may reject the key first.
         "INSERT INTO dk VALUES (-5)",
         // A timestamptz literal reads in the session's time zone.

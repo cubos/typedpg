@@ -367,6 +367,7 @@ pub(crate) fn infer_func_call(
     if !resolved.is_aggregate && !resolved.is_window && func.over.is_none() && resolved.nvargs == 0
     {
         ctx.note_call(func.location, resolved.oid);
+        ctx.note_cooked_call(func, resolved.oid);
     }
     // What a stored policy expression's call names, whatever its kind: an
     // `ALTER FUNCTION` / `SET SCHEMA` rewrites it.

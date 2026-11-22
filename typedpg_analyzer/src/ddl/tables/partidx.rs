@@ -88,8 +88,12 @@ pub(crate) fn ensure_partition_index(
             i.indrelid == part
                 && i.indisunique == pi.indisunique
                 && i.indkey == indkey
-                && same_exprs(&i.indexprs, &pi.indexprs)
-                && same_exprs(i.indpred.as_slice(), pi.indpred.as_slice())
+                && same_exprs(interp, (i.indrelid, &i.indexprs), (pi.indrelid, &pi.indexprs))
+                && same_exprs(
+                    interp,
+                    (i.indrelid, i.indpred.as_slice()),
+                    (pi.indrelid, pi.indpred.as_slice()),
+                )
                 && same_key_classes(interp, &pi, i)
                 && access_method(interp, i.indexrelid) == access_method(interp, parent_index)
                 && !interp.index_parents.contains_key(&i.indexrelid)
@@ -398,19 +402,35 @@ fn index_definitions_match(interp: &PgCatalog, parent: &PgIndex, child: &PgIndex
         && child.indnatts == parent.indnatts
         && child.indnkeyatts == parent.indnkeyatts
         && child.indkey == map_attnums(interp, parent.indrelid, child.indrelid, &parent.indkey)
-        && same_exprs(&child.indexprs, &parent.indexprs)
-        && same_exprs(child.indpred.as_slice(), parent.indpred.as_slice())
+        && same_exprs(
+            interp,
+            (child.indrelid, &child.indexprs),
+            (parent.indrelid, &parent.indexprs),
+        )
+        && same_exprs(
+            interp,
+            (child.indrelid, child.indpred.as_slice()),
+            (parent.indrelid, parent.indpred.as_slice()),
+        )
         && access_method(interp, child.indexrelid) == access_method(interp, parent.indexrelid)
 }
 
-/// CompareIndexInfo: two indexes' expressions (or predicates) are equal
-/// parse trees, source locations aside.
+/// CompareIndexInfo: two indexes' expressions (or predicates), over their
+/// tables, are `equal()` once transformed (see [`crate::ddl::cooked`]).
 fn same_exprs(
-    a: &[crate::pg_catalog::SerializedAst],
-    b: &[crate::pg_catalog::SerializedAst],
+    interp: &PgCatalog,
+    (rel_a, a): (PgClassOid, &[crate::pg_catalog::SerializedAst]),
+    (rel_b, b): (PgClassOid, &[crate::pg_catalog::SerializedAst]),
 ) -> bool {
-    use typedpg_pg_query::Equal;
-    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.ast.equal(&b.ast))
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            crate::ddl::cooked::same_written(
+                interp,
+                (rel_a, a.ast.as_ref()),
+                (rel_b, b.ast.as_ref()),
+                None,
+            )
+        })
 }
 
 /// An index's access method (`relam`; btree unless recorded otherwise).

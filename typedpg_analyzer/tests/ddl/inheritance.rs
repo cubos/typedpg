@@ -765,3 +765,134 @@ fn inherited_expressions_compare_as_parse_trees() {
         assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
     }
 }
+
+#[test]
+fn inherited_expressions_match_once_transformed() {
+    // MergeWithExistingConstraint / MergeConstraintsIntoExisting /
+    // MergeCheckConstraint compare the *cooked* CHECK expressions
+    // (conbin), MergeAttributes the cooked defaults: '0' coerced to
+    // integer is the constant 0, 'x'::text is 'x', IN (1, 2) is
+    // = ANY (ARRAY[1, 2]), OPERATOR(pg_catalog.>) is >. PG 19.0 accepts
+    // every one of these.
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE TABLE p (a int, CONSTRAINT ck CHECK (a > 0));
+             CREATE TABLE c2 (a int, CONSTRAINT ck CHECK (a > '0'));
+             CREATE TABLE c3 (a int, CONSTRAINT ck CHECK (a > 0::int));",
+        ),
+        ("0002.sql", "ALTER TABLE c2 INHERIT p;"),
+        ("0003.sql", "ALTER TABLE c3 INHERIT p;"),
+        (
+            "0004.sql",
+            "CREATE TABLE c10 (a int, CONSTRAINT ck CHECK (a OPERATOR(pg_catalog.>) 0)) INHERITS (p);",
+        ),
+        (
+            "0005.sql",
+            "CREATE TABLE q (a int, s text, CONSTRAINT ck CHECK (s <> 'x'),
+                 CONSTRAINT ck2 CHECK (a IN (1, 2))) PARTITION BY LIST (a);
+             CREATE TABLE q1 (a int, s text, CONSTRAINT ck CHECK (s <> 'x'::text),
+                 CONSTRAINT ck2 CHECK (a = ANY (ARRAY[1, 2])));
+             ALTER TABLE q ATTACH PARTITION q1 FOR VALUES IN (1);",
+        ),
+        (
+            "0006.sql",
+            "CREATE TABLE p1 (a int DEFAULT 0, CONSTRAINT c CHECK (a > 0));
+             CREATE TABLE p2 (a int DEFAULT '0', CONSTRAINT c CHECK (a > '0'));
+             CREATE TABLE m () INHERITS (p1, p2);",
+        ),
+    ]);
+    // And the same expression twice is a duplicate.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE s1 (a int); CREATE STATISTICS s ON (a+1), (a+'1') FROM s1;",
+    )])
+    .expect_err("duplicate statistics expression");
+    assert!(
+        err.to_string()
+            .starts_with("duplicate expression in statistics definition"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn partition_indexes_match_once_transformed() {
+    // CompareIndexInfo compares the cooked expressions and predicates:
+    // ci is pi's (PG 19.0 attaches it, and then won't drop it alone).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, s text) PARTITION BY LIST (a);
+         CREATE INDEX pi ON p ((s || 'x')) WHERE a > 0;
+         CREATE TABLE c (a int, s text);
+         CREATE INDEX ci ON c ((s || 'x'::text)) WHERE a > '0';
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);",
+    )]);
+    let err = db
+        .apply_sql("DROP INDEX ci;")
+        .expect_err("ci is attached to pi");
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop index ci because index pi requires it"),
+        "got: {err}"
+    );
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, s text) PARTITION BY LIST (a);
+         CREATE TABLE c PARTITION OF p FOR VALUES IN (1);
+         CREATE INDEX pi ON ONLY p ((s || 'x'));
+         CREATE INDEX ci ON c ((s || 'x'::text));",
+    )]);
+    db.apply_sql("ALTER INDEX pi ATTACH PARTITION ci;")
+        .expect("the definitions match");
+}
+
+#[test]
+fn inherited_expressions_compare_as_transformed() {
+    // MergeWithExistingConstraint compares the cooked trees, which parse
+    // analysis builds without folding constants: PG 19.0 merges the first
+    // of each pair and rejects the second.
+    let parent = "CREATE TABLE q (a int, n numeric, v varchar(5), i8 int8, CONSTRAINT ck CHECK (";
+    for (written, same, different) in [
+        // [NOT] BETWEEN is the two comparisons.
+        (
+            "a BETWEEN 1 AND 2",
+            "a >= 1 AND a <= '2'",
+            "a <= 2 AND a >= 1",
+        ),
+        // `1 + 1` is a call of int4pl, not 2.
+        ("a > 2", "a > '2'::int", "a > 1 + 1"),
+        // A cast to the column's own type is no node; to another one is.
+        ("a > 0", "a::int > 0", "a::bigint > 0"),
+        // The items with no column become one `= ANY (ARRAY[…])`, the
+        // others comparisons ORed to it in turn.
+        (
+            "a IN (a, 1, 2)",
+            "a = ANY (ARRAY[1, 2]) OR a = a",
+            "a = a OR a = ANY (ARRAY[1, 2])",
+        ),
+        ("a IN (1, 2)", "a IN ('1', 2)", "a = 1 OR a = 2"),
+        // The items are coerced to their common type with the left side.
+        (
+            "i8 IN (1, 2)",
+            "i8 = ANY (ARRAY[1, 2]::int8[])",
+            "i8 = ANY (ARRAY[1, 2])",
+        ),
+        // An implicit coercion is one as written; an untyped literal is a
+        // constant of the type.
+        ("n > 1", "n > 1::numeric", "n > '1'"),
+        // `v::varchar` drops the typmod (a RelabelType).
+        ("v = 'x'", "v::text = 'x'", "v::varchar = 'x'"),
+    ] {
+        let setup = format!("{parent}{written}));");
+        let child = |e: &str| format!("CREATE TABLE c (CONSTRAINT ck CHECK ({e})) INHERITS (q);");
+        try_apply(&[("0001.sql", &setup), ("0002.sql", &child(same))])
+            .unwrap_or_else(|e| panic!("{written} | {same}: {e}"));
+        let err = try_apply(&[("0001.sql", &setup), ("0002.sql", &child(different))])
+            .expect_err(different);
+        assert!(
+            err.to_string()
+                .starts_with("constraint \"ck\" for relation \"c\" already exists"),
+            "{written} | {different}\n  got: {err}"
+        );
+    }
+}

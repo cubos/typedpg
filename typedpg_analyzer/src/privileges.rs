@@ -3866,7 +3866,11 @@ impl PgCatalog {
             let Some(pa) = self.attribute_by_name(parent, &name) else {
                 break;
             };
-            if self.attr_default_exprs.get(&(parent, pa.attnum)) != Some(expr) {
+            if !self
+                .attr_default_exprs
+                .get(&(parent, pa.attnum))
+                .is_some_and(|e| e.same_as_written(expr))
+            {
                 break;
             }
             source = (parent, pa.attnum);

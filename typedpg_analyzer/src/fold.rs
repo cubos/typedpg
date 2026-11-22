@@ -216,8 +216,65 @@ fn fold_here(node: Option<&ast::Node>, snapshot: &PgCatalog, columns: &Columns<'
             convert(&value, target, typmod, snapshot)
         }
         ast::Node::AExpr(e) => fold_operator(e, snapshot, columns),
+        ast::Node::FuncCall(fc) => fold_length(fc, snapshot),
         _ => None,
     }
+}
+
+/// `length` / `char_length` / `character_length` / `octet_length` of a
+/// constant ASCII string, untyped or `text` / `varchar` (`textlen`,
+/// `textoctetlen`, IMMUTABLE: the planner folds them) — when every routine
+/// of that name is the built-in one.
+fn fold_length(fc: &ast::FuncCall, snapshot: &PgCatalog) -> Folded {
+    if fc.args.len() != 1
+        || fc.agg_star
+        || fc.agg_distinct
+        || fc.func_variadic
+        || fc.over.is_some()
+        || fc.agg_filter.is_some()
+        || !fc.agg_order.is_empty()
+    {
+        return None;
+    }
+    let names = crate::expr::extract_string_fields(&fc.funcname);
+    let (schema, name) = match names.as_slice() {
+        [n] => (None, n.as_str()),
+        [s, n] if s == "pg_catalog" => (Some("pg_catalog"), n.as_str()),
+        _ => return None,
+    };
+    if !matches!(
+        name,
+        "length" | "char_length" | "character_length" | "octet_length"
+    ) || !snapshot
+        .find_functions(schema, name)
+        .iter()
+        .all(|p| snapshot.namespace_name(p.pronamespace) == Some("pg_catalog"))
+    {
+        return None;
+    }
+    let literal = |n: &ast::Node| match n {
+        ast::Node::AConst(c) if !c.isnull => match &c.val {
+            Some(ast::AConstValue::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let text = match fc.args.first()?.as_ref()? {
+        ast::Node::TypeCast(tc) => {
+            let tn = tc.type_name.as_ref()?;
+            let t = crate::ddl::util::resolve_type_name(tn, snapshot)?;
+            if !tn.typmods.is_empty()
+                || !tn.array_bounds.is_empty()
+                || ![oid::TEXT, oid::VARCHAR].contains(&t)
+            {
+                return None;
+            }
+            literal(tc.arg.as_ref()?)?
+        }
+        n => literal(n)?,
+    };
+    text.is_ascii()
+        .then_some(Ok(Value::Int(text.len() as i128, IntType::Int4)))
 }
 
 /// An untyped literal read as type `base` (`int4in`, `numeric_in`, …);

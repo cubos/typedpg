@@ -52,6 +52,10 @@ pub(crate) struct Ctx<'a> {
     /// expression resolves is recorded — what [`crate::nonnull`] needs to
     /// tell what a qual proves non-NULL.
     pub strict_log: Option<&'a crate::nonnull::StrictLog>,
+    /// When set, what each node resolved to — its type, operator, routine,
+    /// a literal's type — is recorded: what [`crate::ddl::cooked`] needs
+    /// to compare two expressions as PG compares their transformed trees.
+    pub cook_log: Option<&'a crate::ddl::cooked::CookLog>,
 }
 
 impl<'a> Ctx<'a> {
@@ -67,6 +71,15 @@ impl<'a> Ctx<'a> {
             snapshot,
             used_procs: None,
             strict_log: None,
+            cook_log: None,
+        }
+    }
+
+    /// The same context, recording what each node resolves to into `log`.
+    pub fn cooking(self, log: &'a crate::ddl::cooked::CookLog) -> Self {
+        Ctx {
+            cook_log: Some(log),
+            ..self
         }
     }
 
@@ -98,11 +111,52 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record that `expr` resolved to operator `op` (for [`crate::ddl::cooked`]).
+    pub fn note_cooked_operator(&self, expr: &ast::AExpr, op: crate::oid::PgOperatorOid) {
+        if let Some(log) = self.cook_log {
+            log.note_operator(expr, op);
+        }
+    }
+
+    /// Record what the IN list `expr` became (for [`crate::ddl::cooked`]):
+    /// `left op ANY (ARRAY[…])` over the items without columns coerced to
+    /// `common` when they were folded (`fold`), then a comparison by each
+    /// remaining item (by index) and its operator.
+    pub fn note_cooked_in_list(
+        &self,
+        expr: &ast::AExpr,
+        fold: Option<(crate::oid::PgOperatorOid, PgTypeOid)>,
+        comparisons: Vec<(usize, crate::oid::PgOperatorOid)>,
+    ) {
+        if let Some(log) = self.cook_log {
+            log.note_in_list(expr, fold, comparisons);
+        }
+    }
+
+    /// Record the operators of the comparisons `[NOT] BETWEEN [SYMMETRIC]`
+    /// `expr` makes, in order (for [`crate::ddl::cooked`]).
+    pub fn note_cooked_between(&self, expr: &ast::AExpr, ops: Vec<crate::oid::PgOperatorOid>) {
+        if let Some(log) = self.cook_log {
+            log.note_between(expr, ops);
+        }
+    }
+
+    /// Record that the plain call `func` resolved to `proc` (for
+    /// [`crate::ddl::cooked`]).
+    pub fn note_cooked_call(&self, func: &ast::FuncCall, proc: crate::oid::PgProcOid) {
+        if let Some(log) = self.cook_log {
+            log.note_call(func, proc);
+        }
+    }
+
     /// Record that the untyped string literal at `location` was coerced to
     /// `type_oid`.
-    pub fn note_literal_type(&self, location: i32, type_oid: PgTypeOid) {
+    pub fn note_literal_type(&self, literal: &ast::AConst, type_oid: PgTypeOid) {
         if let Some(log) = self.strict_log {
-            log.note_literal_type(location, type_oid);
+            log.note_literal_type(literal.location, type_oid);
+        }
+        if let Some(log) = self.cook_log {
+            log.note_literal(literal, type_oid);
         }
     }
 
@@ -1018,7 +1072,11 @@ pub(crate) fn infer_expr(
     // A side of a restriction the planner estimates: a STABLE call over
     // constants in it runs while planning (`estimate_expression_value`).
     let _estimated = plan_fold::enter_estimated(node);
-    crate::stack::step(|| infer_expr_here(node, ctx, params, goal))
+    let inferred = crate::stack::step(|| infer_expr_here(node, ctx, params, goal));
+    if let (Some(log), Some(node), Ok(t)) = (ctx.cook_log, node, &inferred) {
+        log.note_type(node, t.type_oid, t.typmod);
+    }
+    inferred
 }
 
 thread_local! {
@@ -1910,7 +1968,7 @@ fn infer_expr_unlocated(
         && !ac.isnull
         && matches!(ac.val, Some(ast::AConstValue::String(_)))
     {
-        ctx.note_literal_type(ac.location, goal.type_oid);
+        ctx.note_literal_type(ac, goal.type_oid);
     }
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN

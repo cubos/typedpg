@@ -201,7 +201,7 @@ pub(crate) fn infer_type_cast(
         && !ac.isnull
         && matches!(ac.val, Some(ast::AConstValue::String(_)))
     {
-        ctx.note_literal_type(ac.location, target_oid);
+        ctx.note_literal_type(ac, target_oid);
     }
     // stringTypeDatum runs the target's input function on an untyped
     // literal, which a pseudo-type with a dummy one refuses — on NULL too
