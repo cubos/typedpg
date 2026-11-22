@@ -297,10 +297,14 @@ pub(crate) fn infer_type_cast(
         }
         _ => None,
     };
+    let goal_typed = inner_goal.type_oid != TypeGoal::NONE.type_oid;
     let built_for_target = array_target.is_some();
-    let inner_type = match array_target {
-        Some((arr, target)) => transform_array_expr(arr, ctx, params, Some(target))?,
-        None => infer_expr(inner, ctx, params, inner_goal)?,
+    // Whether the operand is of the target's type without the cast too.
+    let (inner_type, typed_alone) = match array_target {
+        Some((arr, target)) => {
+            super::indirection::transform_array_expr_typed(arr, ctx, params, Some(target))?
+        }
+        None => (infer_expr(inner, ctx, params, inner_goal)?, !goal_typed),
     };
     // coerce_type: any other `record` cast to a composite is rebuilt field
     // by field from the row it names (a whole-row reference to a subquery,
@@ -507,7 +511,9 @@ pub(crate) fn infer_type_cast(
     // collation.
     // A cast to the type and typmod its operand already has adds no node:
     // the `redundant_cast` lint rule reads it. A parameter's cast types the
-    // parameter, and an untyped operand has no type of its own.
+    // parameter, and an untyped operand has no type of its own. Nor does
+    // an operand the cast types (`ROW(…)::pair`, `ARRAY[1]::int8[]`):
+    // without it, it is a `record`, or an array of another type.
     let typmod_of = |t: Option<i32>| t.filter(|t| *t >= 0);
     crate::type_facts::note_conversion(inner, inner_type.type_oid, target_oid, true, snapshot);
     crate::pg_catalog::note_cast_redundant(
@@ -515,6 +521,7 @@ pub(crate) fn infer_type_cast(
         inner_type.type_oid == target_oid
             && typmod_of(written_typmod) == typmod_of(inner_type.typmod)
             && !inner_type.unknown_value
+            && typed_alone
             && !matches!(inner, Some(ast::Node::ParamRef(_))),
     );
     let planned = if inner_type.type_oid == target_oid

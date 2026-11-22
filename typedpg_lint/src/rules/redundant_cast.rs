@@ -229,6 +229,10 @@ mod tests {
             "SELECT 'x'::text",
             "SELECT NULL::text",
             "SELECT date '2020-01-01'",
+            // An operand the cast types: a `record` or an `integer[]`
+            // without it.
+            "SELECT ARRAY[ROW(id, name, email, code)::users] FROM users",
+            "SELECT ARRAY[id::int]::bigint[] FROM users",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
